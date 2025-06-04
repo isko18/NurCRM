@@ -8,9 +8,9 @@ from .views import (
 )
 
 urlpatterns = [
-    path('register/', RegisterAPIView.as_view(), name='user-register'),
-    path('login/', CustomTokenObtainPairView.as_view(), name='token_obtain_pair'),
+    path('auth/register/', RegisterAPIView.as_view(), name='user-register'),
+    path('auth/login/', CustomTokenObtainPairView.as_view(), name='token_obtain_pair'),
     path('refresh/', TokenRefreshView.as_view(), name='token_refresh'),
     path('users/', UserListAPIView.as_view(), name='user-list'),
-    path('me/', CurrentUserAPIView.as_view(), name='user-me'),
+    path('profile/', CurrentUserAPIView.as_view(), name='user-me'),
 ]

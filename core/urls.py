@@ -39,14 +39,14 @@ schema_view = get_schema_view(
 
 # Пути для включения различных приложений
 apps_includes = [
-    # path('main/', include('apps.main.urls')),  
+    path('main/', include('apps.main.urls')),  
     path('users/', include('apps.users.urls')),  
     # path('billing/', include('apps.billing.urls')),  
 ]
 
 # API-роуты
 api_urlpatterns = [
-    path('api/v1/', include(apps_includes)),
+    path('api/', include(apps_includes)),
 ]
 
 # Основные пути проекта
