@@ -26,5 +26,8 @@ class UserAdmin(BaseUserAdmin):
 
     def get_form(self, request, obj=None, **kwargs):
         form = super().get_form(request, obj, **kwargs)
-        form.base_fields['password'].required = False
+        # Только если редактируем существующего пользователя
+        if obj is not None and 'password' in form.base_fields:
+            form.base_fields['password'].required = False
         return form
+
