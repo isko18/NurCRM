@@ -214,3 +214,17 @@ class Review(models.Model):
         return f"{self.user.email} — {self.rating}★"
     
     
+class Notification(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='notifications', verbose_name='Получатель')
+    message = models.TextField(verbose_name='Сообщение')
+    is_read = models.BooleanField(default=False, verbose_name='Прочитано')
+    created_at = models.DateTimeField(auto_now_add=True, verbose_name='Создано')
+
+    class Meta:
+        verbose_name = 'Уведомление'
+        verbose_name_plural = 'Уведомления'
+        ordering = ['-created_at']
+
+    def __str__(self):
+        return f"{self.user.email}: {self.message[:30]}..."

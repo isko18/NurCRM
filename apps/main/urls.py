@@ -1,7 +1,7 @@
 from django.urls import path
 from .views import (
     ContactListCreateAPIView,
-    ContactRetrieveUpdateDestroyAPIView, PipelineListCreateAPIView, PipelineRetrieveUpdateDestroyAPIView, DealListCreateAPIView, DealRetrieveUpdateDestroyAPIView, TaskListCreateAPIView, TaskRetrieveUpdateDestroyAPIView, IntegrationListCreateAPIView, IntegrationRetrieveUpdateDestroyAPIView, AnalyticsListAPIView, OrderListCreateAPIView, OrderRetrieveUpdateDestroyAPIView, ProductListCreateAPIView, ProductRetrieveUpdateDestroyAPIView, ReviewListCreateAPIView, ReviewRetrieveUpdateDestroyAPIView
+    ContactRetrieveUpdateDestroyAPIView, PipelineListCreateAPIView, PipelineRetrieveUpdateDestroyAPIView, DealListCreateAPIView, DealRetrieveUpdateDestroyAPIView, TaskListCreateAPIView, TaskRetrieveUpdateDestroyAPIView, IntegrationListCreateAPIView, IntegrationRetrieveUpdateDestroyAPIView, AnalyticsListAPIView, OrderListCreateAPIView, OrderRetrieveUpdateDestroyAPIView, ProductListCreateAPIView, ProductRetrieveUpdateDestroyAPIView, ReviewListCreateAPIView, ReviewRetrieveUpdateDestroyAPIView, NotificationDetailView, MarkAllNotificationsReadView, NotificationListView
 )
 
 urlpatterns = [
@@ -20,7 +20,10 @@ urlpatterns = [
     path('orders/<uuid:pk>/', OrderRetrieveUpdateDestroyAPIView.as_view(), name='order-detail'),
     path('products/', ProductListCreateAPIView.as_view(), name='product-list-create'),
     path('products/<uuid:pk>/', ProductRetrieveUpdateDestroyAPIView.as_view(), name='product-detail'),
-    path('api/reviews/', ReviewListCreateAPIView.as_view(), name='review-list-create'),
-    path('api/reviews/<uuid:pk>/', ReviewRetrieveUpdateDestroyAPIView.as_view(), name='review-detail'),
+    path('reviews/', ReviewListCreateAPIView.as_view(), name='review-list-create'),
+    path('reviews/<uuid:pk>/', ReviewRetrieveUpdateDestroyAPIView.as_view(), name='review-detail'),
+    path('notifications/', NotificationListView.as_view(), name='notification-list'),
+    path('notifications/<uuid:uuid>/', NotificationDetailView.as_view(), name='notification-detail'),
+    path('notifications/mark-all-read/', MarkAllNotificationsReadView.as_view(), name='mark-all-notifications-read'),
 ]
 

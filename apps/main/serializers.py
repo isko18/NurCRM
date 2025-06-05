@@ -1,5 +1,5 @@
 from rest_framework import serializers
-from apps.main.models import Contact, Pipeline, Deal, Task, Integration, Analytics, Order, Product, Review
+from apps.main.models import Contact, Pipeline, Deal, Task, Integration, Analytics, Order, Product, Review, Notification
 from apps.users.models import User
 
 
@@ -122,3 +122,8 @@ class ReviewSerializer(serializers.ModelSerializer):
             'created_at', 'updated_at'
         ]
         read_only_fields = ['id', 'user', 'created_at', 'updated_at']
+        
+class NotificationSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Notification
+        fields = ['id', 'message', 'is_read', 'created_at']

@@ -2,7 +2,7 @@ from django.contrib import admin
 from apps.main.models import (
     Contact, Pipeline, Deal, Task,
     Integration, Analytics, Order,
-    Product, Review
+    Product, Review, Notification
 )
 
 
@@ -64,3 +64,10 @@ class ReviewAdmin(admin.ModelAdmin):
     list_display = ('user', 'rating', 'created_at')
     list_filter = ('rating',)
     search_fields = ('user__email', 'comment')
+
+
+@admin.register(Notification)
+class NotificationAdmin(admin.ModelAdmin):
+    list_display = ('user', 'message', 'is_read', 'created_at')
+    list_filter = ('is_read', 'created_at')
+    search_fields = ('message', 'user__email')

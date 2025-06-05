@@ -1,6 +1,8 @@
-from rest_framework import generics, permissions
-from apps.main.models import Contact, Pipeline, Deal, Task, Integration, Analytics, Order, Product, Review
-from apps.main.serializers import ContactSerializer, PipelineSerializer, DealSerializer, TaskSerializer, IntegrationSerializer, AnalyticsSerializer, OrderSerializer, ProductSerializer, ReviewSerializer
+from rest_framework import generics, permissions, status
+from rest_framework.views import APIView
+from rest_framework.response import Response
+from apps.main.models import Contact, Pipeline, Deal, Task, Integration, Analytics, Order, Product, Review, Notification
+from apps.main.serializers import ContactSerializer, PipelineSerializer, DealSerializer, TaskSerializer, IntegrationSerializer, AnalyticsSerializer, OrderSerializer, ProductSerializer, ReviewSerializer, NotificationSerializer
 from apps.utils import get_filtered_contacts  
 
 
@@ -243,3 +245,32 @@ class ReviewRetrieveUpdateDestroyAPIView(generics.RetrieveUpdateDestroyAPIView):
 
     def get_queryset(self):
         return Review.objects.filter(user=self.request.user)
+    
+class NotificationListView(generics.ListAPIView):
+    serializer_class = NotificationSerializer
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get_queryset(self):
+        return Notification.objects.filter(user=self.request.user)
+
+class NotificationListView(generics.ListAPIView):
+    serializer_class = NotificationSerializer
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get_queryset(self):
+        return Notification.objects.filter(user=self.request.user).order_by('-created_at')
+    
+class NotificationDetailView(generics.RetrieveAPIView):
+    serializer_class = NotificationSerializer
+    permission_classes = [permissions.IsAuthenticated]
+    lookup_field = 'uuid'  # Используем UUID вместо id
+
+    def get_queryset(self):
+        return Notification.objects.filter(user=self.request.user)
+    
+class MarkAllNotificationsReadView(APIView):
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request, *args, **kwargs):
+        Notification.objects.filter(user=request.user, is_read=False).update(is_read=True)
+        return Response({'status': 'Все уведомления помечены как прочитанные'}, status=status.HTTP_200_OK)
