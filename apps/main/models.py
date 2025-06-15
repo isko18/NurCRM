@@ -1,22 +1,23 @@
 from django.db import models
 import uuid
-from apps.users.models import User  # Убедитесь, что путь к модели User указан корректно
+from apps.users.models import User, Company
 
-
+# Контакты
 class Contact(models.Model):
-    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False, verbose_name='ID')
-    name = models.CharField(max_length=128, verbose_name='Имя')
-    email = models.EmailField(verbose_name='Email')
-    phone = models.CharField(max_length=32, verbose_name='Телефон')
-    address = models.CharField(max_length=256, verbose_name='Адрес')
-    company = models.CharField(max_length=128, verbose_name='Компания')
-    notes = models.TextField(blank=True, null=True, verbose_name='Заметки')
-    department = models.CharField(max_length=64, blank=True, null=True, verbose_name='Отдел')
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    company = models.ForeignKey(Company, on_delete=models.CASCADE, related_name='contacts')
+    owner = models.ForeignKey(User, on_delete=models.CASCADE, related_name='contacts')
 
-    created_at = models.DateTimeField(auto_now_add=True, verbose_name='Дата создания')
-    updated_at = models.DateTimeField(auto_now=True, verbose_name='Дата обновления')
+    name = models.CharField(max_length=128)
+    email = models.EmailField()
+    phone = models.CharField(max_length=32)
+    address = models.CharField(max_length=256)
+    client_company = models.CharField(max_length=128)
+    notes = models.TextField(blank=True, null=True)
+    department = models.CharField(max_length=64, blank=True, null=True)
 
-    owner = models.ForeignKey(User, on_delete=models.CASCADE, related_name='contacts', verbose_name='Владелец')
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
 
     class Meta:
         verbose_name = 'Контакт'
@@ -24,16 +25,20 @@ class Contact(models.Model):
         ordering = ['-created_at']
 
     def __str__(self):
-        return f"{self.name} ({self.company})"
-    
-    
+        return f"{self.name} ({self.client_company})"
+
+
+# Воронка продаж
 class Pipeline(models.Model):
-    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False, verbose_name='ID')
-    name = models.CharField(max_length=128, verbose_name='Название воронки')
-    stages = models.JSONField(verbose_name='Этапы воронки')  # JSONB
-    created_at = models.DateTimeField(auto_now_add=True, verbose_name='Дата создания')
-    updated_at = models.DateTimeField(auto_now=True, verbose_name='Дата обновления')
-    owner = models.ForeignKey(User, on_delete=models.CASCADE, related_name='pipelines', verbose_name='Владелец')
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    company = models.ForeignKey(Company, on_delete=models.CASCADE, related_name='pipelines')
+    owner = models.ForeignKey(User, on_delete=models.CASCADE, related_name='pipelines')
+
+    name = models.CharField(max_length=128)
+    stages = models.JSONField()
+
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
 
     class Meta:
         verbose_name = 'Воронка продаж'
@@ -42,8 +47,9 @@ class Pipeline(models.Model):
 
     def __str__(self):
         return self.name
-    
-    
+
+
+# Сделки
 class Deal(models.Model):
     STATUS_CHOICES = [
         ('lead', 'Лид'),
@@ -53,17 +59,19 @@ class Deal(models.Model):
         ('lost', 'Потеряна'),
     ]
 
-    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False, verbose_name='ID')
-    title = models.CharField(max_length=255, verbose_name='Название сделки')
-    value = models.DecimalField(max_digits=12, decimal_places=2, verbose_name='Сумма сделки')
-    status = models.CharField(max_length=20, choices=STATUS_CHOICES, verbose_name='Статус')
-    pipeline = models.ForeignKey(Pipeline, on_delete=models.CASCADE, related_name='deals', verbose_name='Воронка')
-    stage = models.CharField(max_length=128, verbose_name='Текущий этап')
-    contact = models.ForeignKey(Contact, on_delete=models.CASCADE, related_name='deals', verbose_name='Контакт')
-    assigned_to = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, blank=True, related_name='assigned_deals', verbose_name='Ответственный')
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    company = models.ForeignKey(Company, on_delete=models.CASCADE, related_name='deals')
+    pipeline = models.ForeignKey(Pipeline, on_delete=models.CASCADE, related_name='deals')
+    contact = models.ForeignKey(Contact, on_delete=models.CASCADE, related_name='deals')
+    assigned_to = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, blank=True, related_name='assigned_deals')
 
-    created_at = models.DateTimeField(auto_now_add=True, verbose_name='Дата создания')
-    updated_at = models.DateTimeField(auto_now=True, verbose_name='Дата обновления')
+    title = models.CharField(max_length=255)
+    value = models.DecimalField(max_digits=12, decimal_places=2)
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES)
+    stage = models.CharField(max_length=128)
+
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
 
     class Meta:
         verbose_name = 'Сделка'
@@ -72,7 +80,9 @@ class Deal(models.Model):
 
     def __str__(self):
         return f"{self.title} ({self.status})"
-    
+
+
+# Задачи
 class Task(models.Model):
     STATUS_CHOICES = [
         ('pending', 'В ожидании'),
@@ -81,16 +91,17 @@ class Task(models.Model):
     ]
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    title = models.CharField(max_length=255, verbose_name='Заголовок задачи')
-    description = models.TextField(blank=True, verbose_name='Описание')
-    due_date = models.DateTimeField(verbose_name='Срок выполнения')
-    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='pending', verbose_name='Статус')
+    company = models.ForeignKey(Company, on_delete=models.CASCADE, related_name='tasks')
+    assigned_to = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, blank=True, related_name='tasks')
+    deal = models.ForeignKey(Deal, on_delete=models.SET_NULL, null=True, blank=True, related_name='tasks')
 
-    assigned_to = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, blank=True, related_name='tasks', verbose_name='Ответственный')
-    deal = models.ForeignKey(Deal, on_delete=models.SET_NULL, null=True, blank=True, related_name='tasks', verbose_name='Сделка (необязательно)')
+    title = models.CharField(max_length=255)
+    description = models.TextField(blank=True)
+    due_date = models.DateTimeField()
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='pending')
 
-    created_at = models.DateTimeField(auto_now_add=True, verbose_name='Создано')
-    updated_at = models.DateTimeField(auto_now=True, verbose_name='Обновлено')
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
 
     class Meta:
         verbose_name = 'Задача'
@@ -99,8 +110,104 @@ class Task(models.Model):
 
     def __str__(self):
         return f"{self.title} — {self.status}"
-    
-    
+
+
+# Заказы
+class Order(models.Model):
+    STATUS_CHOICES = [
+        ('new', 'Новый'),
+        ('pending', 'В процессе'),
+        ('completed', 'Завершён'),
+    ]
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    company = models.ForeignKey(Company, on_delete=models.CASCADE, related_name='orders')
+
+    order_number = models.CharField(max_length=50)
+    customer_name = models.CharField(max_length=128)
+    date_ordered = models.DateField()
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='new')
+    phone = models.CharField(max_length=32)
+    department = models.CharField(max_length=64)
+    total = models.DecimalField(max_digits=12, decimal_places=2)
+    quantity = models.PositiveIntegerField()
+
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = 'Заказ'
+        verbose_name_plural = 'Заказы'
+        ordering = ['-date_ordered']
+
+    def __str__(self):
+        return f"{self.order_number} — {self.customer_name}"
+
+
+# Товары
+class Product(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    company = models.ForeignKey(Company, on_delete=models.CASCADE, related_name='products')
+
+    name = models.CharField(max_length=128)
+    article = models.CharField(max_length=64)
+    brand = models.CharField(max_length=64)
+    category = models.CharField(max_length=64)
+    quantity = models.PositiveIntegerField()
+    price = models.DecimalField(max_digits=10, decimal_places=2)
+
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = 'Товар'
+        verbose_name_plural = 'Товары'
+        ordering = ['-created_at']
+
+    def __str__(self):
+        return f"{self.name} ({self.article})"
+
+
+# Отзывы
+class Review(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    company = models.ForeignKey(Company, on_delete=models.CASCADE, related_name='reviews')
+    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='reviews')
+
+    rating = models.PositiveSmallIntegerField()
+    comment = models.TextField()
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = 'Отзыв'
+        verbose_name_plural = 'Отзывы'
+        ordering = ['-created_at']
+
+    def __str__(self):
+        return f"{self.user.email} — {self.rating}★"
+
+
+# Уведомления
+class Notification(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    company = models.ForeignKey(Company, on_delete=models.CASCADE, related_name='notifications')
+    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='notifications')
+
+    message = models.TextField()
+    is_read = models.BooleanField(default=False)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        verbose_name = 'Уведомление'
+        verbose_name_plural = 'Уведомления'
+        ordering = ['-created_at']
+
+    def __str__(self):
+        return f"{self.user.email}: {self.message[:30]}..."
+
+
+# Интеграции
 class Integration(models.Model):
     TYPE_CHOICES = [
         ('telephony', 'Телефония'),
@@ -114,9 +221,11 @@ class Integration(models.Model):
     ]
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    type = models.CharField(max_length=20, choices=TYPE_CHOICES, verbose_name='Тип интеграции')
-    config = models.JSONField(verbose_name='Конфигурация')  # JSONB в PostgreSQL
-    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='inactive', verbose_name='Статус')
+    company = models.ForeignKey(Company, on_delete=models.CASCADE, related_name='integrations')
+
+    type = models.CharField(max_length=20, choices=TYPE_CHOICES)
+    config = models.JSONField()
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='inactive')
 
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
@@ -128,7 +237,9 @@ class Integration(models.Model):
 
     def __str__(self):
         return f"{self.type} — {self.status}"
-    
+
+
+# Аналитика
 class Analytics(models.Model):
     TYPE_CHOICES = [
         ('sales', 'Продажи'),
@@ -136,9 +247,12 @@ class Analytics(models.Model):
     ]
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    type = models.CharField(max_length=20, choices=TYPE_CHOICES, verbose_name='Тип аналитики')
-    data = models.JSONField(verbose_name='Данные')  # Пример: {"metric": "total_sales", "value": 150000, "date": "2025-06-01"}
-    created_at = models.DateTimeField(auto_now_add=True, verbose_name='Дата создания')
+    company = models.ForeignKey(Company, on_delete=models.CASCADE, related_name='analytics')
+
+    type = models.CharField(max_length=20, choices=TYPE_CHOICES)
+    data = models.JSONField()  # Пример: {"metric": "total_sales", "value": 150000, "date": "2025-06-01"}
+
+    created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
         verbose_name = 'Аналитика'
@@ -147,84 +261,3 @@ class Analytics(models.Model):
 
     def __str__(self):
         return f"{self.type} — {self.data.get('metric', '')}"
-    
-class Order(models.Model):
-    STATUS_CHOICES = [
-        ('new', 'Новый'),
-        ('pending', 'В процессе'),
-        ('completed', 'Завершён'),
-    ]
-
-    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    order_number = models.CharField(max_length=50, verbose_name='Номер заказа')
-    customer_name = models.CharField(max_length=128, verbose_name='Имя клиента')
-    date_ordered = models.DateField(verbose_name='Дата заказа')
-    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='new', verbose_name='Статус')
-    phone = models.CharField(max_length=32, verbose_name='Телефон')
-    department = models.CharField(max_length=64, verbose_name='Отдел')
-    total = models.DecimalField(max_digits=12, decimal_places=2, verbose_name='Сумма')
-    quantity = models.PositiveIntegerField(verbose_name='Количество')
-
-    created_at = models.DateTimeField(auto_now_add=True)
-    updated_at = models.DateTimeField(auto_now=True)
-
-    class Meta:
-        verbose_name = 'Заказ'
-        verbose_name_plural = 'Заказы'
-        ordering = ['-date_ordered']
-
-    def __str__(self):
-        return f"{self.order_number} — {self.customer_name}"
-    
-class Product(models.Model):
-    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    name = models.CharField(max_length=128, verbose_name='Название')
-    article = models.CharField(max_length=64, verbose_name='Артикул')
-    brand = models.CharField(max_length=64, verbose_name='Бренд')
-    category = models.CharField(max_length=64, verbose_name='Категория')
-    quantity = models.PositiveIntegerField(verbose_name='Остаток')
-    price = models.DecimalField(max_digits=10, decimal_places=2, verbose_name='Цена')
-
-    created_at = models.DateTimeField(auto_now_add=True)
-    updated_at = models.DateTimeField(auto_now=True)
-
-    class Meta:
-        verbose_name = 'Товар'
-        verbose_name_plural = 'Товары'
-        ordering = ['-created_at']
-
-    def __str__(self):
-        return f"{self.name} ({self.article})"
-    
-    
-class Review(models.Model):
-    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='reviews', verbose_name='Пользователь')
-    rating = models.PositiveSmallIntegerField(verbose_name='Оценка (1-5)')
-    comment = models.TextField(verbose_name='Комментарий')
-    created_at = models.DateTimeField(auto_now_add=True, verbose_name='Дата создания')
-    updated_at = models.DateTimeField(auto_now=True, verbose_name='Дата обновления')
-
-    class Meta:
-        verbose_name = 'Отзыв'
-        verbose_name_plural = 'Отзывы'
-        ordering = ['-created_at']
-
-    def __str__(self):
-        return f"{self.user.email} — {self.rating}★"
-    
-    
-class Notification(models.Model):
-    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='notifications', verbose_name='Получатель')
-    message = models.TextField(verbose_name='Сообщение')
-    is_read = models.BooleanField(default=False, verbose_name='Прочитано')
-    created_at = models.DateTimeField(auto_now_add=True, verbose_name='Создано')
-
-    class Meta:
-        verbose_name = 'Уведомление'
-        verbose_name_plural = 'Уведомления'
-        ordering = ['-created_at']
-
-    def __str__(self):
-        return f"{self.user.email}: {self.message[:30]}..."

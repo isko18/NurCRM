@@ -1,10 +1,12 @@
 from rest_framework import serializers
 from rest_framework_simplejwt.tokens import RefreshToken
 from rest_framework_simplejwt.serializers import TokenObtainPairSerializer
-from apps.users.models import User
+from apps.users.models import User, Company, Roles
 from rest_framework.validators import UniqueValidator
-
-
+from django.core.mail import send_mail
+from django.conf import settings
+import string
+import secrets
 
 # ✅ JWT авторизация с дополнительными данными пользователя
 class CustomTokenObtainPairSerializer(TokenObtainPairSerializer):
@@ -15,26 +17,26 @@ class CustomTokenObtainPairSerializer(TokenObtainPairSerializer):
             'email': self.user.email,
             'first_name': self.user.first_name,
             'last_name': self.user.last_name,
-            'role': self.user.role,
             'avatar': self.user.avatar,
+            'company': self.user.company.name if self.user.company else None,
+            'role': self.user.role
         })
         return data
-
 
 # 👤 Полный сериализатор пользователя
 class UserSerializer(serializers.ModelSerializer):
     password = serializers.CharField(write_only=True, required=False, min_length=8, style={'input_type': 'password'})
-    role = serializers.ChoiceField(choices=User.ROLE_CHOICES)
 
     class Meta:
         model = User
         fields = [
             'id', 'email', 'password',
             'first_name', 'last_name',
-            'role', 'avatar',
+            'avatar',
+            'company', 'role',
             'created_at', 'updated_at',
         ]
-        read_only_fields = ['id', 'created_at', 'updated_at']
+        read_only_fields = ['id', 'created_at', 'updated_at', 'company']
 
     def validate_email(self, value):
         if self.instance and self.instance.email == value:
@@ -57,35 +59,25 @@ class UserSerializer(serializers.ModelSerializer):
         instance.save()
         return instance
 
-
-# 📝 Регистрация
-class UserCreateSerializer(serializers.ModelSerializer):
+# 📝 Регистрация владельца компании
+class OwnerRegisterSerializer(serializers.ModelSerializer):
     email = serializers.EmailField(
         required=True,
         validators=[UniqueValidator(queryset=User.objects.all(), message="Этот email уже используется.")]
     )
-    password = serializers.CharField(
-        write_only=True, required=True, min_length=8,
-        style={'input_type': 'password'}
-    )
-    password2 = serializers.CharField(
-        write_only=True, required=True,
-        style={'input_type': 'password'}
-    )
-    role = serializers.ChoiceField(choices=User.ROLE_CHOICES, required=True)
+    password = serializers.CharField(write_only=True, min_length=8, style={'input_type': 'password'})
+    password2 = serializers.CharField(write_only=True, style={'input_type': 'password'})
+    company_name = serializers.CharField(write_only=True, required=True)
+    company_industry = serializers.CharField(write_only=True, required=True)
 
     class Meta:
         model = User
         fields = [
             'email', 'password', 'password2',
             'first_name', 'last_name',
-            'role', 'avatar'
+            'avatar',
+            'company_name', 'company_industry'
         ]
-
-    def validate_avatar(self, value):
-        if value and not value.startswith(('http://', 'https://')):
-            raise serializers.ValidationError("Ссылка на аватар должна начинаться с http:// или https://")
-        return value
 
     def validate(self, data):
         if data['password'] != data['password2']:
@@ -93,31 +85,89 @@ class UserCreateSerializer(serializers.ModelSerializer):
         return data
 
     def create(self, validated_data):
-        validated_data.pop('password2')  # удаляем перед созданием
-        validated_data['is_active'] = True
-        return User.objects.create_user(**validated_data)
+        company_name = validated_data.pop('company_name')
+        company_industry = validated_data.pop('company_industry')
+        validated_data.pop('password2')
 
+        # Создаем владельца без компании
+        user = User.objects.create(
+            email=validated_data['email'],
+            first_name=validated_data['first_name'],
+            last_name=validated_data['last_name'],
+            avatar=validated_data.get('avatar'),
+            role = 'owner',
+            is_active=True
+        )
+        user.set_password(validated_data['password'])
+        user.save()
 
-# 📋 Список пользователей
+        # Создаем компанию и привязываем владельца
+        company = Company.objects.create(
+            name=company_name,
+            industry=company_industry,
+            owner=user
+        )
+
+        # Присваиваем владельцу компанию
+        user.company = company
+        user.save()
+
+        return user
+
+# 📝 Создание сотрудника с авто-генерацией пароля + отправкой email
+class EmployeeCreateSerializer(serializers.ModelSerializer):
+    email = serializers.EmailField(
+        required=True,
+        validators=[UniqueValidator(queryset=User.objects.all(), message="Этот email уже используется.")]
+    )
+    role = serializers.ChoiceField(choices=Roles.choices)
+
+    class Meta:
+        model = User
+        fields = [
+            'email', 'first_name', 'last_name', 'avatar', 'role'
+        ]
+
+    def create(self, validated_data):
+        request = self.context['request']
+        owner = request.user
+        company = owner.owned_company
+
+        # Генерация случайного пароля
+        alphabet = string.ascii_letters + string.digits
+        generated_password = ''.join(secrets.choice(alphabet) for i in range(10))
+
+        # Создаем сотрудника
+        user = User.objects.create(
+            email=validated_data['email'],
+            first_name=validated_data['first_name'],
+            last_name=validated_data['last_name'],
+            avatar=validated_data.get('avatar'),
+            role=validated_data['role'],
+            company=company,
+            is_active=True
+        )
+        user.set_password(generated_password)
+        user.save()
+
+        # Отправляем email с данными сотруднику
+        send_mail(
+            subject="Добро пожаловать в CRM",
+            message=(
+                f"Здравствуйте, {user.first_name}!\n\n"
+                f"Ваш аккаунт создан в системе.\n"
+                f"Логин: {user.email}\n"
+                f"Пароль: {generated_password}\n\n"
+                "Рекомендуем сменить пароль после входа."
+            ),
+            from_email=settings.DEFAULT_FROM_EMAIL,
+            recipient_list=[user.email],
+            fail_silently=False,
+        )
+
+        return user
+
 class UserListSerializer(serializers.ModelSerializer):
     class Meta:
         model = User
         fields = ['id', 'email', 'first_name', 'last_name', 'role', 'avatar']
-
-
-# 🔐 (опционально) Пользователь с access/refresh токенами
-class UserWithTokensSerializer(serializers.ModelSerializer):
-    access = serializers.SerializerMethodField()
-    refresh = serializers.SerializerMethodField()
-
-    class Meta:
-        model = User
-        fields = ['id', 'email', 'first_name', 'last_name', 'role', 'avatar', 'access', 'refresh']
-
-    def get_access(self, obj):
-        refresh = RefreshToken.for_user(obj)
-        return str(refresh.access_token)
-
-    def get_refresh(self, obj):
-        refresh = RefreshToken.for_user(obj)
-        return str(refresh)

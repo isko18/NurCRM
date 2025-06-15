@@ -1,273 +1,204 @@
-from rest_framework import generics, permissions, status
+from rest_framework import generics, permissions, filters
+from django_filters.rest_framework import DjangoFilterBackend
 from rest_framework.views import APIView
 from rest_framework.response import Response
+from rest_framework import status
+
 from apps.main.models import Contact, Pipeline, Deal, Task, Integration, Analytics, Order, Product, Review, Notification
-from apps.main.serializers import ContactSerializer, PipelineSerializer, DealSerializer, TaskSerializer, IntegrationSerializer, AnalyticsSerializer, OrderSerializer, ProductSerializer, ReviewSerializer, NotificationSerializer
-from apps.utils import get_filtered_contacts  
+from apps.main.serializers import *
+from apps.utils import get_filtered_contacts
 
 
-class ContactListCreateAPIView(generics.ListCreateAPIView):
+# Универсальный Mixin для изоляции по компании
+class CompanyRestrictedMixin:
+    def get_queryset(self):
+        return super().get_queryset().filter(company=self.request.user.company)
+
+
+# Контакты
+class ContactListCreateAPIView(CompanyRestrictedMixin, generics.ListCreateAPIView):
     serializer_class = ContactSerializer
     permission_classes = [permissions.IsAuthenticated]
+    queryset = Contact.objects.all()
 
-    def get_queryset(self):
-        base_qs = Contact.objects.filter(owner=self.request.user)
-        return get_filtered_contacts(base_qs, self.request.query_params)
+    filter_backends = [DjangoFilterBackend, filters.SearchFilter]
+    search_fields = ['name', 'email', 'phone', 'client_company']
+    filterset_fields = ['department']
 
     def perform_create(self, serializer):
-        serializer.save(owner=self.request.user)
+        serializer.save(owner=self.request.user, company=self.request.user.company)
 
-# Получение, обновление, удаление конкретного контакта
-class ContactRetrieveUpdateDestroyAPIView(generics.RetrieveUpdateDestroyAPIView):
+
+class ContactRetrieveUpdateDestroyAPIView(CompanyRestrictedMixin, generics.RetrieveUpdateDestroyAPIView):
     serializer_class = ContactSerializer
     permission_classes = [permissions.IsAuthenticated]
-
-    def get_queryset(self):
-        return Contact.objects.filter(owner=self.request.user)
+    queryset = Contact.objects.all()
 
 
-class PipelineListCreateAPIView(generics.ListCreateAPIView):
+# Воронки
+class PipelineListCreateAPIView(CompanyRestrictedMixin, generics.ListCreateAPIView):
     serializer_class = PipelineSerializer
     permission_classes = [permissions.IsAuthenticated]
+    queryset = Pipeline.objects.all()
 
-    def get_queryset(self):
-        qs = Pipeline.objects.filter(owner=self.request.user)
-        name = self.request.query_params.get('name')
-        if name:
-            qs = qs.filter(name__icontains=name)
-        return qs
+    filter_backends = [filters.SearchFilter]
+    search_fields = ['name']
 
     def perform_create(self, serializer):
-        serializer.save(owner=self.request.user)
+        serializer.save(owner=self.request.user, company=self.request.user.company)
 
 
-class PipelineRetrieveUpdateDestroyAPIView(generics.RetrieveUpdateDestroyAPIView):
+class PipelineRetrieveUpdateDestroyAPIView(CompanyRestrictedMixin, generics.RetrieveUpdateDestroyAPIView):
     serializer_class = PipelineSerializer
     permission_classes = [permissions.IsAuthenticated]
+    queryset = Pipeline.objects.all()
 
-    def get_queryset(self):
-        return Pipeline.objects.filter(owner=self.request.user)
-    
-    
-class DealListCreateAPIView(generics.ListCreateAPIView):
+
+# Сделки
+class DealListCreateAPIView(CompanyRestrictedMixin, generics.ListCreateAPIView):
     serializer_class = DealSerializer
     permission_classes = [permissions.IsAuthenticated]
+    queryset = Deal.objects.all()
 
-    def get_queryset(self):
-        user = self.request.user
-        queryset = Deal.objects.filter(assigned_to=user)
-
-        # Фильтры
-        status = self.request.query_params.get('status')
-        pipeline = self.request.query_params.get('pipeline')
-        stage = self.request.query_params.get('stage')
-        assigned_to = self.request.query_params.get('assigned_to')
-
-        if status:
-            queryset = queryset.filter(status=status)
-        if pipeline:
-            queryset = queryset.filter(pipeline__id=pipeline)
-        if stage:
-            queryset = queryset.filter(stage__icontains=stage)
-        if assigned_to:
-            queryset = queryset.filter(assigned_to__id=assigned_to)
-
-        return queryset
+    filter_backends = [DjangoFilterBackend, filters.SearchFilter]
+    search_fields = ['title', 'stage']
+    filterset_fields = ['status', 'pipeline', 'assigned_to', 'contact']
 
     def perform_create(self, serializer):
-        serializer.save()
-        
+        serializer.save(company=self.request.user.company)
 
-class DealRetrieveUpdateDestroyAPIView(generics.RetrieveUpdateDestroyAPIView):
+
+class DealRetrieveUpdateDestroyAPIView(CompanyRestrictedMixin, generics.RetrieveUpdateDestroyAPIView):
     serializer_class = DealSerializer
     permission_classes = [permissions.IsAuthenticated]
+    queryset = Deal.objects.all()
 
-    def get_queryset(self):
-        return Deal.objects.filter(assigned_to=self.request.user)
-    
-    
-class TaskListCreateAPIView(generics.ListCreateAPIView):
+
+# Задачи
+class TaskListCreateAPIView(CompanyRestrictedMixin, generics.ListCreateAPIView):
     serializer_class = TaskSerializer
     permission_classes = [permissions.IsAuthenticated]
+    queryset = Task.objects.all()
 
-    def get_queryset(self):
-        queryset = Task.objects.filter(assigned_to=self.request.user)
-
-        # Фильтры
-        status = self.request.query_params.get('status')
-        due_date = self.request.query_params.get('due_date')
-        assigned_to = self.request.query_params.get('assigned_to')
-
-        if status:
-            queryset = queryset.filter(status=status)
-        if due_date:
-            queryset = queryset.filter(due_date__date=due_date)
-        if assigned_to:
-            queryset = queryset.filter(assigned_to__id=assigned_to)
-
-        return queryset
+    filter_backends = [DjangoFilterBackend, filters.SearchFilter]
+    search_fields = ['title', 'description']
+    filterset_fields = ['status', 'assigned_to', 'deal', 'due_date']
 
     def perform_create(self, serializer):
-        serializer.save()
+        serializer.save(company=self.request.user.company)
 
 
-class TaskRetrieveUpdateDestroyAPIView(generics.RetrieveUpdateDestroyAPIView):
+class TaskRetrieveUpdateDestroyAPIView(CompanyRestrictedMixin, generics.RetrieveUpdateDestroyAPIView):
     serializer_class = TaskSerializer
     permission_classes = [permissions.IsAuthenticated]
+    queryset = Task.objects.all()
 
-    def get_queryset(self):
-        return Task.objects.filter(assigned_to=self.request.user)
-    
-    
-class IntegrationListCreateAPIView(generics.ListCreateAPIView):
-    queryset = Integration.objects.all()
+
+# Интеграции
+class IntegrationListCreateAPIView(CompanyRestrictedMixin, generics.ListCreateAPIView):
     serializer_class = IntegrationSerializer
     permission_classes = [permissions.IsAuthenticated]
-
-    def get_queryset(self):
-        queryset = self.queryset
-        type_ = self.request.query_params.get('type')
-        status = self.request.query_params.get('status')
-
-        if type_:
-            queryset = queryset.filter(type=type_)
-        if status:
-            queryset = queryset.filter(status=status)
-
-        return queryset
-
-
-class IntegrationRetrieveUpdateDestroyAPIView(generics.RetrieveUpdateDestroyAPIView):
     queryset = Integration.objects.all()
+
+    filter_backends = [DjangoFilterBackend]
+    filterset_fields = ['type', 'status']
+
+    def perform_create(self, serializer):
+        serializer.save(company=self.request.user.company)
+
+
+class IntegrationRetrieveUpdateDestroyAPIView(CompanyRestrictedMixin, generics.RetrieveUpdateDestroyAPIView):
     serializer_class = IntegrationSerializer
     permission_classes = [permissions.IsAuthenticated]
-    
-class AnalyticsListAPIView(generics.ListAPIView):
+    queryset = Integration.objects.all()
+
+
+# Аналитика
+class AnalyticsListAPIView(CompanyRestrictedMixin, generics.ListAPIView):
     serializer_class = AnalyticsSerializer
     permission_classes = [permissions.IsAuthenticated]
+    queryset = Analytics.objects.all()
 
-    def get_queryset(self):
-        queryset = Analytics.objects.all()
+    filter_backends = [DjangoFilterBackend]
+    filterset_fields = ['type']
 
-        # Фильтры по типу и дате
-        type_ = self.request.query_params.get('type')
-        start_date = self.request.query_params.get('start_date')
-        end_date = self.request.query_params.get('end_date')
 
-        if type_:
-            queryset = queryset.filter(type=type_)
-
-        if start_date and end_date:
-            queryset = queryset.filter(data__date__gte=start_date, data__date__lte=end_date)
-
-        return queryset
-    
-    
-class OrderListCreateAPIView(generics.ListCreateAPIView):
+# Заказы
+class OrderListCreateAPIView(CompanyRestrictedMixin, generics.ListCreateAPIView):
     serializer_class = OrderSerializer
     permission_classes = [permissions.IsAuthenticated]
-
-    def get_queryset(self):
-        queryset = Order.objects.all()
-
-        # Фильтрация
-        status = self.request.query_params.get('status')
-        customer_name = self.request.query_params.get('customer_name')
-        department = self.request.query_params.get('department')
-
-        if status:
-            queryset = queryset.filter(status=status)
-        if customer_name:
-            queryset = queryset.filter(customer_name__icontains=customer_name)
-        if department:
-            queryset = queryset.filter(department__icontains=department)
-
-        return queryset
-
-
-class OrderRetrieveUpdateDestroyAPIView(generics.RetrieveUpdateDestroyAPIView):
     queryset = Order.objects.all()
-    serializer_class = OrderSerializer
-    permission_classes = [permissions.IsAuthenticated]
-    
-    
-class ProductListCreateAPIView(generics.ListCreateAPIView):
-    serializer_class = ProductSerializer
-    permission_classes = [permissions.IsAuthenticated]
 
-    def get_queryset(self):
-        queryset = Product.objects.all()
-
-        # Фильтрация
-        name = self.request.query_params.get('name')
-        brand = self.request.query_params.get('brand')
-        category = self.request.query_params.get('category')
-
-        if name:
-            queryset = queryset.filter(name__icontains=name)
-        if brand:
-            queryset = queryset.filter(brand__icontains=brand)
-        if category:
-            queryset = queryset.filter(category__icontains=category)
-
-        return queryset
-
-
-class ProductRetrieveUpdateDestroyAPIView(generics.RetrieveUpdateDestroyAPIView):
-    queryset = Product.objects.all()
-    serializer_class = ProductSerializer
-    permission_classes = [permissions.IsAuthenticated]
-    
-    
-class ReviewListCreateAPIView(generics.ListCreateAPIView):
-    serializer_class = ReviewSerializer
-    permission_classes = [permissions.IsAuthenticated]
-
-    def get_queryset(self):
-        queryset = Review.objects.all()
-        rating = self.request.query_params.get('rating')
-        user_id = self.request.query_params.get('user')
-
-        if rating:
-            queryset = queryset.filter(rating=rating)
-        if user_id:
-            queryset = queryset.filter(user__id=user_id)
-
-        return queryset
+    filter_backends = [DjangoFilterBackend, filters.SearchFilter]
+    search_fields = ['order_number', 'customer_name', 'department', 'phone']
+    filterset_fields = ['status', 'date_ordered']
 
     def perform_create(self, serializer):
-        serializer.save(user=self.request.user)
+        serializer.save(company=self.request.user.company)
 
 
-class ReviewRetrieveUpdateDestroyAPIView(generics.RetrieveUpdateDestroyAPIView):
+class OrderRetrieveUpdateDestroyAPIView(CompanyRestrictedMixin, generics.RetrieveUpdateDestroyAPIView):
+    serializer_class = OrderSerializer
+    permission_classes = [permissions.IsAuthenticated]
+    queryset = Order.objects.all()
+
+
+# Товары
+class ProductListCreateAPIView(CompanyRestrictedMixin, generics.ListCreateAPIView):
+    serializer_class = ProductSerializer
+    permission_classes = [permissions.IsAuthenticated]
+    queryset = Product.objects.all()
+
+    filter_backends = [DjangoFilterBackend, filters.SearchFilter]
+    search_fields = ['name', 'article', 'brand', 'category']
+    filterset_fields = ['category', 'brand']
+
+    def perform_create(self, serializer):
+        serializer.save(company=self.request.user.company)
+
+
+class ProductRetrieveUpdateDestroyAPIView(CompanyRestrictedMixin, generics.RetrieveUpdateDestroyAPIView):
+    serializer_class = ProductSerializer
+    permission_classes = [permissions.IsAuthenticated]
+    queryset = Product.objects.all()
+
+
+# Отзывы
+class ReviewListCreateAPIView(CompanyRestrictedMixin, generics.ListCreateAPIView):
     serializer_class = ReviewSerializer
     permission_classes = [permissions.IsAuthenticated]
+    queryset = Review.objects.all()
 
-    def get_queryset(self):
-        return Review.objects.filter(user=self.request.user)
-    
-class NotificationListView(generics.ListAPIView):
+    filter_backends = [DjangoFilterBackend]
+    filterset_fields = ['rating', 'user']
+
+    def perform_create(self, serializer):
+        serializer.save(user=self.request.user, company=self.request.user.company)
+
+
+class ReviewRetrieveUpdateDestroyAPIView(CompanyRestrictedMixin, generics.RetrieveUpdateDestroyAPIView):
+    serializer_class = ReviewSerializer
+    permission_classes = [permissions.IsAuthenticated]
+    queryset = Review.objects.all()
+
+
+# Уведомления
+class NotificationListView(CompanyRestrictedMixin, generics.ListAPIView):
     serializer_class = NotificationSerializer
     permission_classes = [permissions.IsAuthenticated]
+    queryset = Notification.objects.all()
 
-    def get_queryset(self):
-        return Notification.objects.filter(user=self.request.user)
+    filter_backends = [DjangoFilterBackend]
+    filterset_fields = ['is_read']
 
-class NotificationListView(generics.ListAPIView):
+
+class NotificationDetailView(CompanyRestrictedMixin, generics.RetrieveAPIView):
     serializer_class = NotificationSerializer
     permission_classes = [permissions.IsAuthenticated]
+    queryset = Notification.objects.all()
+    lookup_field = 'pk'
 
-    def get_queryset(self):
-        return Notification.objects.filter(user=self.request.user).order_by('-created_at')
-    
-class NotificationDetailView(generics.RetrieveAPIView):
-    serializer_class = NotificationSerializer
-    permission_classes = [permissions.IsAuthenticated]
-    lookup_field = 'uuid'  # Используем UUID вместо id
 
-    def get_queryset(self):
-        return Notification.objects.filter(user=self.request.user)
-    
 class MarkAllNotificationsReadView(APIView):
     permission_classes = [permissions.IsAuthenticated]
 

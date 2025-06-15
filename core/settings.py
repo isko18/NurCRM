@@ -158,7 +158,10 @@ REST_FRAMEWORK = {
     'DEFAULT_PERMISSION_CLASSES': [
         'rest_framework.permissions.IsAuthenticated',
     ],
-    'DEFAULT_FILTER_BACKENDS': ['django_filters.rest_framework.DjangoFilterBackend'],
+    'DEFAULT_FILTER_BACKENDS': [
+        'django_filters.rest_framework.DjangoFilterBackend',
+        'rest_framework.filters.SearchFilter',
+    ],
     'DEFAULT_PAGINATION_CLASS': 'rest_framework.pagination.PageNumberPagination',
     'PAGE_SIZE': 10,
     'DEFAULT_PARSER_CLASSES': [
@@ -167,6 +170,7 @@ REST_FRAMEWORK = {
         'rest_framework.parsers.MultiPartParser',
     ],
 }
+
 
 SIMPLE_JWT = {
     'ACCESS_TOKEN_LIFETIME': timedelta(days=3),
@@ -206,14 +210,14 @@ CORS_ORIGIN_ALLOW_ALL = True
 CORS_ALLOWED_ORIGINS = [
     "http://localhost:3000",
     'http://127.0.0.1:8000',
-    'https://nurcrm.kg/',
+    'https://nurcrm.kg',
     "http://app.nurcrm.kg",
 ]
 
 CORS_ORIGIN_WRITELIST = (
     'http://localhost:3000',
     'http://localhost:',
-    'https://nurcrm.kg/'
+    'https://nurcrm.kg'
 )
 
 CORS_ALLOW_HEADERS = (
@@ -230,3 +234,15 @@ CORS_ALLOW_METHODS = (
     "POST",
     "PUT",
 )
+
+EMAIL_BACKEND = 'django.core.mail.backends.smtp.EmailBackend'
+EMAIL_HOST = 'smtp.gmail.com'
+EMAIL_PORT = 587
+EMAIL_USE_TLS = True
+EMAIL_HOST_USER = 'nurcrm2025@gmail.com'
+EMAIL_HOST_PASSWORD = 'yljz yusd uzjd itmo'
+DEFAULT_FROM_EMAIL = 'nurcrm2025@gmail.com'
+
+
+
+

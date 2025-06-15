@@ -1,20 +1,23 @@
 from rest_framework import generics, permissions
 from rest_framework.permissions import IsAuthenticated
 from rest_framework_simplejwt.views import TokenObtainPairView
+from rest_framework.response import Response
+from rest_framework import status
 
 from .models import User
 from .serializers import (
     UserSerializer,
-    UserCreateSerializer,
+    OwnerRegisterSerializer,
     UserListSerializer,
+    EmployeeCreateSerializer,# <-- вот он
     CustomTokenObtainPairSerializer,
 )
+from .permissions import IsCompanyOwner
 
-
-# 👤 Регистрация пользователя
+# 👤 Регистрация владельца компании
 class RegisterAPIView(generics.CreateAPIView):
     queryset = User.objects.all()
-    serializer_class = UserCreateSerializer
+    serializer_class = OwnerRegisterSerializer
     permission_classes = [permissions.AllowAny]
 
 
@@ -24,17 +27,31 @@ class CustomTokenObtainPairView(TokenObtainPairView):
     permission_classes = [permissions.AllowAny]
 
 
-# 📋 Список пользователей (только для администратора)
-class UserListAPIView(generics.ListAPIView):
-    queryset = User.objects.all()
+# 📋 Список сотрудников своей компании (только для владельца компании)
+class EmployeeListAPIView(generics.ListAPIView):
     serializer_class = UserListSerializer
-    permission_classes = [permissions.AllowAny]
+    permission_classes = [IsAuthenticated]
+
+    def get_queryset(self):
+        user = self.request.user
+        company = user.owned_company  # владелец своей компании
+        return company.employees.all()
 
 
-# 👤 Текущий пользователь (просмотр/редактирование)
+# 👤 Текущий пользователь (просмотр/редактирование своего профиля)
 class CurrentUserAPIView(generics.RetrieveUpdateAPIView):
     serializer_class = UserSerializer
     permission_classes = [IsAuthenticated]
 
     def get_object(self):
         return self.request.user
+
+
+# ➕ Создание сотрудника (только владелец компании может создавать)
+class EmployeeCreateAPIView(generics.CreateAPIView):
+    queryset = User.objects.all()
+    serializer_class = EmployeeCreateSerializer
+    permission_classes = [IsAuthenticated, IsCompanyOwner]
+
+    def perform_create(self, serializer):
+        serializer.save()

@@ -1,23 +1,35 @@
 from django.db import models
-from django.contrib.auth.models import AbstractBaseUser, BaseUserManager, PermissionsMixin
+from django.contrib.auth.models import AbstractBaseUser, PermissionsMixin
 import uuid
 from apps.users.managers import UserManager
 
+# Роли сотрудников (только для работников)
+class Roles(models.TextChoices):
+    ADMIN = 'admin', 'Администратор'
+    MANAGER = 'manager', 'Менеджер'
+    USER = 'user', 'Сотрудник'
+    OWNER = 'owner', "Владелец"
 
 class User(AbstractBaseUser, PermissionsMixin):
-    ROLE_CHOICES = [
-        ('admin', 'Администратор'),
-        ('manager', 'Менеджер'),
-        ('user', 'Пользователь'),
-    ]
-
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False, verbose_name='ID')
     email = models.EmailField(unique=True, verbose_name='Email')
     password = models.CharField(max_length=128, verbose_name='Пароль')
     first_name = models.CharField(max_length=64, verbose_name='Имя')
     last_name = models.CharField(max_length=64, verbose_name='Фамилия')
-    role = models.CharField(max_length=10, choices=ROLE_CHOICES, verbose_name='Роль')
     avatar = models.URLField(blank=True, null=True, verbose_name='Аватар (URL)')
+
+    # Компания, в которой работает пользователь (пусто у владельца)
+    company = models.ForeignKey('Company', on_delete=models.CASCADE, null=True, blank=True, related_name='employees', verbose_name='Компания')
+
+    # Роль внутри компании (у владельца пусто)
+    role = models.CharField(
+        max_length=32,
+        choices=Roles.choices,
+        blank=True,
+        null=True,
+        verbose_name='Роль сотрудника'
+    )
+
     created_at = models.DateTimeField(auto_now_add=True, verbose_name='Дата создания')
     updated_at = models.DateTimeField(auto_now=True, verbose_name='Дата обновления')
 
@@ -34,4 +46,21 @@ class User(AbstractBaseUser, PermissionsMixin):
         verbose_name_plural = 'Пользователи'
 
     def __str__(self):
-        return f"{self.email} ({self.get_role_display()})"
+        return self.email
+
+class Company(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    name = models.CharField(max_length=255, verbose_name='Название компании')
+    industry = models.CharField(max_length=255, verbose_name='Вид деятельности')
+
+    # Владелец компании
+    owner = models.OneToOneField(User, on_delete=models.CASCADE, related_name='owned_company', verbose_name='Владелец компании')
+
+    created_at = models.DateTimeField(auto_now_add=True, verbose_name='Дата создания')
+
+    def __str__(self):
+        return self.name
+
+    class Meta:
+        verbose_name = "Компания"
+        verbose_name_plural = "Компании"
