@@ -156,22 +156,34 @@ class EmployeeCreateSerializer(serializers.ModelSerializer):
         user.set_password(generated_password)
         user.save()
 
-        # Отправляем email с данными сотруднику
-        send_mail(
-            subject="Добро пожаловать в CRM",
-            message=(
-                f"Здравствуйте, {user.first_name}!\n\n"
-                f"Ваш аккаунт создан в системе.\n"
-                f"Логин: {user.email}\n"
-                f"Пароль: {generated_password}\n\n"
-                "Рекомендуем сменить пароль после входа."
-            ),
-            from_email=settings.DEFAULT_FROM_EMAIL,
-            recipient_list=[user.email],
-            fail_silently=False,
-        )
+        # Безопасная отправка email — без падения сервера при ошибках
+        try:
+            send_mail(
+                subject="Добро пожаловать в CRM",
+                message=(
+                    f"Здравствуйте, {user.first_name}!\n\n"
+                    f"Ваш аккаунт создан в системе.\n"
+                    f"Логин: {user.email}\n"
+                    f"Пароль: {generated_password}\n\n"
+                    "Рекомендуем сменить пароль после входа."
+                ),
+                from_email=settings.DEFAULT_FROM_EMAIL,
+                recipient_list=[user.email],
+                fail_silently=False,  # оставляем True только если хотим совсем игнорировать
+            )
+        except Exception as e:
+            # Логируем ошибку (если хочешь — можно записывать в лог-файл)
+            print(f"Ошибка при отправке email сотруднику: {e}")
 
+        # Возвращаем дополнительные данные (email + пароль)
+        self._generated_password = generated_password
         return user
+
+    # Переопределяем to_representation чтобы добавить пароль в ответ
+    def to_representation(self, instance):
+        rep = super().to_representation(instance)
+        rep['generated_password'] = getattr(self, '_generated_password', None)
+        return rep
 
 # 🔍 Сериализатор для списка пользователей
 class UserListSerializer(serializers.ModelSerializer):
