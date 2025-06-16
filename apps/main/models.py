@@ -2,7 +2,6 @@ from django.db import models
 import uuid
 from apps.users.models import User, Company
 
-# Контакты
 class Contact(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     company = models.ForeignKey(Company, on_delete=models.CASCADE, related_name='contacts')
@@ -28,7 +27,6 @@ class Contact(models.Model):
         return f"{self.name} ({self.client_company})"
 
 
-# Воронка продаж
 class Pipeline(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     company = models.ForeignKey(Company, on_delete=models.CASCADE, related_name='pipelines')
@@ -49,7 +47,6 @@ class Pipeline(models.Model):
         return self.name
 
 
-# Сделки
 class Deal(models.Model):
     STATUS_CHOICES = [
         ('lead', 'Лид'),
@@ -82,7 +79,6 @@ class Deal(models.Model):
         return f"{self.title} ({self.status})"
 
 
-# Задачи
 class Task(models.Model):
     STATUS_CHOICES = [
         ('pending', 'В ожидании'),
@@ -112,7 +108,6 @@ class Task(models.Model):
         return f"{self.title} — {self.status}"
 
 
-# Заказы
 class Order(models.Model):
     STATUS_CHOICES = [
         ('new', 'Новый'),
@@ -143,8 +138,6 @@ class Order(models.Model):
     def __str__(self):
         return f"{self.order_number} — {self.customer_name}"
 
-
-# Товары
 class Product(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     company = models.ForeignKey(Company, on_delete=models.CASCADE, related_name='products')
@@ -167,8 +160,6 @@ class Product(models.Model):
     def __str__(self):
         return f"{self.name} ({self.article})"
 
-
-# Отзывы
 class Review(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     company = models.ForeignKey(Company, on_delete=models.CASCADE, related_name='reviews')
@@ -188,7 +179,6 @@ class Review(models.Model):
         return f"{self.user.email} — {self.rating}★"
 
 
-# Уведомления
 class Notification(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     company = models.ForeignKey(Company, on_delete=models.CASCADE, related_name='notifications')
@@ -207,7 +197,6 @@ class Notification(models.Model):
         return f"{self.user.email}: {self.message[:30]}..."
 
 
-# Интеграции
 class Integration(models.Model):
     TYPE_CHOICES = [
         ('telephony', 'Телефония'),
@@ -238,8 +227,6 @@ class Integration(models.Model):
     def __str__(self):
         return f"{self.type} — {self.status}"
 
-
-# Аналитика
 class Analytics(models.Model):
     TYPE_CHOICES = [
         ('sales', 'Продажи'),
@@ -261,3 +248,24 @@ class Analytics(models.Model):
 
     def __str__(self):
         return f"{self.type} — {self.data.get('metric', '')}"
+
+
+class Event(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    company = models.ForeignKey(Company, on_delete=models.CASCADE, related_name='events')
+    title = models.CharField(max_length=255)
+    datetime = models.DateTimeField()
+    participants = models.ManyToManyField(User, related_name='events')
+
+    notes = models.TextField(blank=True, null=True)
+
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = 'Событие'
+        verbose_name_plural = 'События'
+        ordering = ['-datetime']
+
+    def __str__(self):
+        return f"{self.title} — {self.datetime.strftime('%Y-%m-%d %H:%M')}"

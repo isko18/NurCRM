@@ -9,7 +9,7 @@ from .views import (
     OrderListCreateAPIView, OrderRetrieveUpdateDestroyAPIView,
     ProductListCreateAPIView, ProductRetrieveUpdateDestroyAPIView,
     ReviewListCreateAPIView, ReviewRetrieveUpdateDestroyAPIView,
-    NotificationListView, NotificationDetailView, MarkAllNotificationsReadView
+    NotificationListView, NotificationDetailView, MarkAllNotificationsReadView, EventListCreateAPIView, EventRetrieveUpdateDestroyAPIView
 )
 
 urlpatterns = [
@@ -42,4 +42,6 @@ urlpatterns = [
     path('notifications/', NotificationListView.as_view(), name='notification-list'),
     path('notifications/<uuid:pk>/', NotificationDetailView.as_view(), name='notification-detail'),
     path('notifications/mark-all-read/', MarkAllNotificationsReadView.as_view(), name='mark-all-notifications-read'),
+    path('events/', EventListCreateAPIView.as_view(), name='event-list-create'),
+    path('events/<uuid:pk>/', EventRetrieveUpdateDestroyAPIView.as_view(), name='event-detail'),
 ]

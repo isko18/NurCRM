@@ -2,7 +2,7 @@ from django.contrib import admin
 from apps.main.models import (
     Contact, Pipeline, Deal, Task,
     Integration, Analytics, Order,
-    Product, Review, Notification
+    Product, Review, Notification, Event  
 )
 
 
@@ -71,3 +71,11 @@ class NotificationAdmin(admin.ModelAdmin):
     list_display = ('user', 'message', 'is_read', 'created_at')
     list_filter = ('is_read', 'created_at')
     search_fields = ('message', 'user__email')
+
+
+@admin.register(Event)
+class EventAdmin(admin.ModelAdmin):
+    list_display = ('title', 'datetime', 'company', 'created_at')
+    list_filter = ('company', 'datetime')
+    search_fields = ('title', 'notes')
+    filter_horizontal = ('participants',)

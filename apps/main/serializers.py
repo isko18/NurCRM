@@ -1,8 +1,7 @@
 from rest_framework import serializers
-from apps.main.models import Contact, Pipeline, Deal, Task, Integration, Analytics, Order, Product, Review, Notification
+from apps.main.models import Contact, Pipeline, Deal, Task, Integration, Analytics, Order, Product, Review, Notification, Event
 from apps.users.models import User, Company
 
-# Контакты
 class ContactSerializer(serializers.ModelSerializer):
     owner = serializers.ReadOnlyField(source='owner.id')
     company = serializers.ReadOnlyField(source='company.id')
@@ -22,7 +21,6 @@ class ContactSerializer(serializers.ModelSerializer):
         return super().create(validated_data)
 
 
-# Воронка
 class PipelineSerializer(serializers.ModelSerializer):
     owner = serializers.ReadOnlyField(source='owner.id')
     company = serializers.ReadOnlyField(source='company.id')
@@ -38,7 +36,6 @@ class PipelineSerializer(serializers.ModelSerializer):
         return super().create(validated_data)
 
 
-# Сделка
 class DealSerializer(serializers.ModelSerializer):
     pipeline = serializers.PrimaryKeyRelatedField(queryset=Pipeline.objects.all())
     contact = serializers.PrimaryKeyRelatedField(queryset=Contact.objects.all())
@@ -71,8 +68,6 @@ class DealSerializer(serializers.ModelSerializer):
         validated_data['company'] = self.context['request'].user.company
         return super().create(validated_data)
 
-
-# Задача
 class TaskSerializer(serializers.ModelSerializer):
     assigned_to = serializers.PrimaryKeyRelatedField(queryset=User.objects.all(), allow_null=True)
     deal = serializers.PrimaryKeyRelatedField(queryset=Deal.objects.all(), allow_null=True, required=False)
@@ -91,8 +86,6 @@ class TaskSerializer(serializers.ModelSerializer):
         validated_data['company'] = self.context['request'].user.company
         return super().create(validated_data)
 
-
-# Интеграции
 class IntegrationSerializer(serializers.ModelSerializer):
     company = serializers.ReadOnlyField(source='company.id')
 
@@ -106,7 +99,6 @@ class IntegrationSerializer(serializers.ModelSerializer):
         return super().create(validated_data)
 
 
-# Аналитика
 class AnalyticsSerializer(serializers.ModelSerializer):
     company = serializers.ReadOnlyField(source='company.id')
 
@@ -120,7 +112,6 @@ class AnalyticsSerializer(serializers.ModelSerializer):
         return super().create(validated_data)
 
 
-# Заказы
 class OrderSerializer(serializers.ModelSerializer):
     company = serializers.ReadOnlyField(source='company.id')
 
@@ -138,7 +129,6 @@ class OrderSerializer(serializers.ModelSerializer):
         return super().create(validated_data)
 
 
-# Товары
 class ProductSerializer(serializers.ModelSerializer):
     company = serializers.ReadOnlyField(source='company.id')
 
@@ -155,7 +145,6 @@ class ProductSerializer(serializers.ModelSerializer):
         return super().create(validated_data)
 
 
-# Отзывы
 class ReviewSerializer(serializers.ModelSerializer):
     user = serializers.ReadOnlyField(source='user.id')
     company = serializers.ReadOnlyField(source='company.id')
@@ -171,7 +160,6 @@ class ReviewSerializer(serializers.ModelSerializer):
         return super().create(validated_data)
 
 
-# Уведомления
 class NotificationSerializer(serializers.ModelSerializer):
     company = serializers.ReadOnlyField(source='company.id')
 
@@ -183,3 +171,52 @@ class NotificationSerializer(serializers.ModelSerializer):
     def create(self, validated_data):
         validated_data['company'] = self.context['request'].user.company
         return super().create(validated_data)
+
+
+class UserShortSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = User
+        fields = ['id', 'first_name', 'last_name', 'email']
+
+
+class EventSerializer(serializers.ModelSerializer):
+    participants = serializers.PrimaryKeyRelatedField(
+        many=True,
+        queryset=User.objects.all()  # Теперь не ограничиваем здесь, валидируем вручную
+    )
+    participants_detail = UserShortSerializer(source='participants', many=True, read_only=True)
+
+    class Meta:
+        model = Event
+        fields = [
+            'id', 'company', 'title', 'datetime', 'participants',
+            'participants_detail', 'notes', 'created_at', 'updated_at'
+        ]
+        read_only_fields = ['id', 'company', 'created_at', 'updated_at', 'participants_detail']
+
+    def validate_participants(self, participants):
+        """
+        Проверяем, что все участники из компании текущего пользователя.
+        """
+        request = self.context['request']
+        company = request.user.company
+
+        for participant in participants:
+            if participant.company != company:
+                raise serializers.ValidationError(
+                    f"Пользователь {participant.email} не принадлежит вашей компании."
+                )
+        return participants
+
+    def create(self, validated_data):
+        participants = validated_data.pop('participants')
+        event = Event.objects.create(**validated_data)
+        event.participants.set(participants)
+        return event
+
+    def update(self, instance, validated_data):
+        participants = validated_data.pop('participants', None)
+        instance = super().update(instance, validated_data)
+        if participants is not None:
+            instance.participants.set(participants)
+        return instance
