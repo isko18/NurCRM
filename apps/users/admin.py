@@ -1,6 +1,6 @@
 from django.contrib import admin
 from django.contrib.auth.admin import UserAdmin as BaseUserAdmin
-from .models import User, Company
+from .models import User, Company, Industry
 
 @admin.register(User)
 class UserAdmin(BaseUserAdmin):
@@ -33,14 +33,17 @@ class UserAdmin(BaseUserAdmin):
 
 @admin.register(Company)
 class CompanyAdmin(admin.ModelAdmin):
-    list_display = ('name', 'industry', 'owner', 'employee_count', 'created_at')
-    search_fields = ('name', 'industry', 'owner__email')
+    list_display = ('name', 'get_industry_name', 'owner', 'employee_count', 'created_at')
+    search_fields = ('name', 'industry__name', 'owner__email')
     ordering = ('name',)
     readonly_fields = ('employees_list',)
 
+    def get_industry_name(self, obj):
+        return obj.industry.name if obj.industry else '-'
+    get_industry_name.short_description = 'Вид деятельности'
+
     def employee_count(self, obj):
         return obj.employees.count()
-
     employee_count.short_description = 'Кол-во сотрудников'
 
     def employees_list(self, obj):
@@ -51,5 +54,11 @@ class CompanyAdmin(admin.ModelAdmin):
             f'{e.first_name} {e.last_name} ({e.get_role_display()})'
             for e in employees
         ])
-
     employees_list.short_description = 'Сотрудники'
+
+
+@admin.register(Industry)
+class IndustryAdmin(admin.ModelAdmin):
+    list_display = ('name',)
+    search_fields = ('name',)
+    ordering = ('name',)

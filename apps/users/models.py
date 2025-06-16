@@ -10,6 +10,18 @@ class Roles(models.TextChoices):
     USER = 'user', 'Сотрудник'
     OWNER = 'owner', "Владелец"
 
+# Модель справочника видов деятельности
+class Industry(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    name = models.CharField(max_length=255, unique=True, verbose_name='Название вида деятельности')
+
+    def __str__(self):
+        return self.name
+
+    class Meta:
+        verbose_name = "Вид деятельности"
+        verbose_name_plural = "Виды деятельности"
+
 class User(AbstractBaseUser, PermissionsMixin):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False, verbose_name='ID')
     email = models.EmailField(unique=True, verbose_name='Email')
@@ -51,11 +63,17 @@ class User(AbstractBaseUser, PermissionsMixin):
 class Company(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     name = models.CharField(max_length=255, verbose_name='Название компании')
-    industry = models.CharField(max_length=255, verbose_name='Вид деятельности')
+    
+    # Теперь динамическое поле
+    industry = models.ForeignKey(
+        Industry,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        verbose_name='Вид деятельности'
+    )
 
-    # Владелец компании
     owner = models.OneToOneField(User, on_delete=models.CASCADE, related_name='owned_company', verbose_name='Владелец компании')
-
     created_at = models.DateTimeField(auto_now_add=True, verbose_name='Дата создания')
 
     def __str__(self):

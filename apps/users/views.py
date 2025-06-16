@@ -18,7 +18,6 @@ from .permissions import IsCompanyOwner
 class RegisterAPIView(generics.CreateAPIView):
     queryset = User.objects.all()
     serializer_class = OwnerRegisterSerializer
-    permission_classes = [permissions.AllowAny]
 
 
 # 🔐 JWT логин с дополнительной информацией о пользователе
