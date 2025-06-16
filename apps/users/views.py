@@ -3,14 +3,16 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework_simplejwt.views import TokenObtainPairView
 from rest_framework.response import Response
 from rest_framework import status
+from rest_framework.permissions import AllowAny
 
-from .models import User
+from .models import User, Industry
 from .serializers import (
     UserSerializer,
     OwnerRegisterSerializer,
     UserListSerializer,
     EmployeeCreateSerializer,# <-- вот он
     CustomTokenObtainPairSerializer,
+    IndustrySerializer
 )
 from .permissions import IsCompanyOwner
 
@@ -18,6 +20,8 @@ from .permissions import IsCompanyOwner
 class RegisterAPIView(generics.CreateAPIView):
     queryset = User.objects.all()
     serializer_class = OwnerRegisterSerializer
+    permission_classes = [AllowAny]
+    
 
 
 # 🔐 JWT логин с дополнительной информацией о пользователе
@@ -54,3 +58,8 @@ class EmployeeCreateAPIView(generics.CreateAPIView):
 
     def perform_create(self, serializer):
         serializer.save()
+        
+class IndustryListAPIView(generics.ListAPIView):
+    queryset = Industry.objects.all()
+    serializer_class = IndustrySerializer
+    permission_classes = [AllowAny]

@@ -6,6 +6,7 @@ from .views import (
     EmployeeListAPIView,
     EmployeeCreateAPIView,
     CurrentUserAPIView,
+    IndustryListAPIView  # <-- добавляем наш новый вью
 )
 
 urlpatterns = [
@@ -22,4 +23,7 @@ urlpatterns = [
 
     # Личный кабинет
     path('profile/', CurrentUserAPIView.as_view(), name='user-me'),
+
+    # Справочник индустрий (отраслей)
+    path('industries/', IndustryListAPIView.as_view(), name='industry-list'),
 ]
