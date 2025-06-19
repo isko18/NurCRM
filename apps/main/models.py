@@ -268,4 +268,51 @@ class Event(models.Model):
         ordering = ['-datetime']
 
     def __str__(self):
-        return f"{self.title} — {self.datetime.strftime('%Y-%m-%d %H:%M')}"
+        return f"{self.title} — {self.datetime.strftime('%Y-%m-%d %H:%M')}" 
+    
+class Warehouse(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False, verbose_name='ID склада')
+    name = models.CharField(max_length=255, verbose_name='Название склада')
+    location = models.CharField(max_length=255, blank=True, null=True, verbose_name='Местоположение')
+    company = models.ForeignKey(Company, on_delete=models.CASCADE, related_name='warehouses', verbose_name='Компания')
+    created_at = models.DateTimeField(auto_now_add=True, verbose_name='Дата создания')
+    updated_at = models.DateTimeField(auto_now=True, verbose_name='Дата обновления')
+
+    def __str__(self):
+        return self.name
+
+    class Meta:
+        verbose_name = 'Склад'
+        verbose_name_plural = 'Склады'
+        ordering = ['created_at']
+
+    
+class WarehouseEvent(models.Model):
+    STATUS_CHOICES = [
+        ('draf', 'Черновик'),
+        ('conducted', 'Проведен'),
+        ('cancelled', 'Отменен'),
+    ]
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False, verbose_name='ID события')
+    warehouse = models.ForeignKey(Warehouse, on_delete=models.CASCADE, related_name='events', verbose_name='Склад')
+    responsible_person = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, blank=True, related_name='responsible_warehouse_events', verbose_name='Ответственное лицо')
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, verbose_name='Статус события')
+    client_name = models.CharField(max_length=128, verbose_name='Имя клиента')
+    title = models.CharField(max_length=255, verbose_name='Название события')
+    description = models.TextField(blank=True, null=True, verbose_name='Описание события')
+    amount = models.DecimalField(max_digits=12, decimal_places=2, verbose_name='Сумма')
+    event_date = models.DateTimeField(verbose_name='Дата события')
+    participants = models.ManyToManyField(User, related_name='warehouse_events', verbose_name='Участники')
+
+    # Добавлены поля created_at и updated_at
+    created_at = models.DateTimeField(auto_now_add=True, verbose_name='Дата создания события')
+    updated_at = models.DateTimeField(auto_now=True, verbose_name='Дата обновления события')
+
+    def __str__(self):
+        return f"{self.title} — {self.event_date.strftime('%Y-%m-%d %H:%M')}"
+
+    class Meta:
+        verbose_name = 'Складское событие'
+        verbose_name_plural = 'Складские события'
+        ordering = ['event_date']

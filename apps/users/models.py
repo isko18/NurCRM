@@ -3,14 +3,44 @@ from django.contrib.auth.models import AbstractBaseUser, PermissionsMixin
 import uuid
 from apps.users.managers import UserManager
 
-# Роли сотрудников (только для работников)
+class Feature(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False, verbose_name='ID')
+    name = models.CharField(max_length=128)
+    description = models.TextField(blank=True, null=True)
+
+    def __str__(self):
+        return self.name
+
+    class Meta:
+        verbose_name = 'Функция'
+        verbose_name_plural = 'Функции'
+        
+class SubscriptionPlan(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False, verbose_name='ID')
+    name = models.CharField(max_length=128)
+    price = models.DecimalField(max_digits=10, decimal_places=2)
+    description = models.TextField(blank=True, null=True)
+    features = models.ManyToManyField(Feature, null=True, blank=True)  
+
+    def __str__(self):
+        return f"{self.name} - {self.price}₽"
+
+    class Meta:
+        verbose_name = 'Тариф'
+        verbose_name_plural = 'Тарифы'
+
+    def has_feature(self, feature_name):
+        """Проверка наличия функции в тарифе"""
+        return self.features.filter(name=feature_name).exists()
+
+
 class Roles(models.TextChoices):
     ADMIN = 'admin', 'Администратор'
     MANAGER = 'manager', 'Менеджер'
     USER = 'user', 'Сотрудник'
     OWNER = 'owner', "Владелец"
 
-# Модель справочника видов деятельности
+
 class Industry(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     name = models.CharField(max_length=255, unique=True, verbose_name='Название вида деятельности')
@@ -22,6 +52,7 @@ class Industry(models.Model):
         verbose_name = "Вид деятельности"
         verbose_name_plural = "Виды деятельности"
 
+
 class User(AbstractBaseUser, PermissionsMixin):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False, verbose_name='ID')
     email = models.EmailField(unique=True, verbose_name='Email')
@@ -30,10 +61,7 @@ class User(AbstractBaseUser, PermissionsMixin):
     last_name = models.CharField(max_length=64, verbose_name='Фамилия')
     avatar = models.URLField(blank=True, null=True, verbose_name='Аватар (URL)')
 
-    # Компания, в которой работает пользователь (пусто у владельца)
     company = models.ForeignKey('Company', on_delete=models.CASCADE, null=True, blank=True, related_name='employees', verbose_name='Компания')
-
-    # Роль внутри компании (у владельца пусто)
     role = models.CharField(
         max_length=32,
         choices=Roles.choices,
@@ -60,11 +88,12 @@ class User(AbstractBaseUser, PermissionsMixin):
     def __str__(self):
         return self.email
 
+
+# Модель Company (компания)
 class Company(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     name = models.CharField(max_length=255, verbose_name='Название компании')
-    
-    # Теперь динамическое поле
+    subscription_plan = models.ForeignKey(SubscriptionPlan, on_delete=models.SET_NULL, null=True, blank=True)
     industry = models.ForeignKey(
         Industry,
         on_delete=models.SET_NULL,
@@ -72,13 +101,13 @@ class Company(models.Model):
         blank=True,
         verbose_name='Вид деятельности'
     )
-
     owner = models.OneToOneField(User, on_delete=models.CASCADE, related_name='owned_company', verbose_name='Владелец компании')
     created_at = models.DateTimeField(auto_now_add=True, verbose_name='Дата создания')
 
     def __str__(self):
         return self.name
-
+    
+    
     class Meta:
-        verbose_name = "Компания"
-        verbose_name_plural = "Компании"
+        verbose_name = 'Компания'
+        verbose_name_plural = 'Компании'

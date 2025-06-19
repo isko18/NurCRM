@@ -187,3 +187,32 @@ class EventRetrieveUpdateDestroyAPIView(CompanyRestrictedMixin, generics.Retriev
     def get_serializer_context(self):
         return {'request': self.request}
 
+class WarehouseListCreateAPIView(CompanyRestrictedMixin, generics.ListCreateAPIView):
+    serializer_class = WarehouseSerializer
+    queryset = Warehouse.objects.all()
+    filter_backends = [DjangoFilterBackend, filters.SearchFilter]
+    search_fields = ['name', 'location']  # Для поиска по имени склада и его расположению
+
+    def perform_create(self, serializer):
+        serializer.save(company=self.request.user.company)  # Присваиваем склад компании текущего пользователя
+
+
+class WarehouseRetrieveUpdateDestroyAPIView(CompanyRestrictedMixin, generics.RetrieveUpdateDestroyAPIView):
+    serializer_class = WarehouseSerializer
+    queryset = Warehouse.objects.all()
+
+
+# Складское событие (WarehouseEvent)
+class WarehouseEventListCreateAPIView(CompanyRestrictedMixin, generics.ListCreateAPIView):
+    serializer_class = WarehouseEventSerializer
+    queryset = WarehouseEvent.objects.all()
+    filter_backends = [DjangoFilterBackend, filters.SearchFilter]
+    search_fields = ['title', 'client_name']  # Поиск по названию события и клиенту
+
+    def perform_create(self, serializer):
+        serializer.save(company=self.request.user.company)  # Присваиваем событие компании текущего пользователя
+
+
+class WarehouseEventRetrieveUpdateDestroyAPIView(CompanyRestrictedMixin, generics.RetrieveUpdateDestroyAPIView):
+    serializer_class = WarehouseEventSerializer
+    queryset = WarehouseEvent.objects.all()

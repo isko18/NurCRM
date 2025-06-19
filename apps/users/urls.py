@@ -6,7 +6,9 @@ from .views import (
     EmployeeListAPIView,
     EmployeeCreateAPIView,
     CurrentUserAPIView,
-    IndustryListAPIView  # <-- добавляем наш новый вью
+    IndustryListAPIView,
+    SubscriptionPlanListAPIView, 
+    FeatureListAPIView
 )
 
 urlpatterns = [
@@ -26,4 +28,6 @@ urlpatterns = [
 
     # Справочник индустрий (отраслей)
     path('industries/', IndustryListAPIView.as_view(), name='industry-list'),
+    path('subscription-plans/', SubscriptionPlanListAPIView.as_view(), name='subscription-plan-list'),
+    path('features/', FeatureListAPIView.as_view(), name='feature-list'),
 ]

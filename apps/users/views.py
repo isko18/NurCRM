@@ -5,14 +5,16 @@ from rest_framework.response import Response
 from rest_framework import status
 from rest_framework.permissions import AllowAny
 
-from .models import User, Industry
+from .models import User, Industry, SubscriptionPlan, Feature
 from .serializers import (
     UserSerializer,
     OwnerRegisterSerializer,
     UserListSerializer,
     EmployeeCreateSerializer,# <-- вот он
     CustomTokenObtainPairSerializer,
-    IndustrySerializer
+    IndustrySerializer,
+    SubscriptionPlanSerializer,
+    FeatureSerializer
 )
 from .permissions import IsCompanyOwner
 
@@ -21,7 +23,10 @@ class RegisterAPIView(generics.CreateAPIView):
     queryset = User.objects.all()
     serializer_class = OwnerRegisterSerializer
     permission_classes = [AllowAny]
-    
+
+    def perform_create(self, serializer):
+        user = serializer.save()
+        return user
 
 
 # 🔐 JWT логин с дополнительной информацией о пользователе
@@ -63,3 +68,13 @@ class IndustryListAPIView(generics.ListAPIView):
     queryset = Industry.objects.all()
     serializer_class = IndustrySerializer
     permission_classes = [AllowAny]
+    
+    
+class SubscriptionPlanListAPIView(generics.ListAPIView):
+    queryset = SubscriptionPlan.objects.all()  # Получаем все тарифы
+    serializer_class = SubscriptionPlanSerializer 
+    
+
+class FeatureListAPIView(generics.ListAPIView):
+    queryset = Feature.objects.all()
+    serializer_class = FeatureSerializer

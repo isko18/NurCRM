@@ -1,5 +1,5 @@
 from rest_framework import serializers
-from apps.main.models import Contact, Pipeline, Deal, Task, Integration, Analytics, Order, Product, Review, Notification, Event
+from apps.main.models import Contact, Pipeline, Deal, Task, Integration, Analytics, Order, Product, Review, Notification, Event, Warehouse, WarehouseEvent
 from apps.users.models import User, Company
 
 class ContactSerializer(serializers.ModelSerializer):
@@ -213,6 +213,72 @@ class EventSerializer(serializers.ModelSerializer):
         event = Event.objects.create(**validated_data)
         event.participants.set(participants)
         return event
+
+    def update(self, instance, validated_data):
+        participants = validated_data.pop('participants', None)
+        instance = super().update(instance, validated_data)
+        if participants is not None:
+            instance.participants.set(participants)
+        return instance
+
+
+class WarehouseSerializer(serializers.ModelSerializer):
+    company = serializers.ReadOnlyField(source='company.id')
+
+    class Meta:
+        model = Warehouse
+        fields = ['id', 'name', 'location', 'company', 'created_at', 'updated_at']
+        read_only_fields = ['id', 'created_at', 'updated_at', 'company']
+
+    def create(self, validated_data):
+        validated_data['company'] = self.context['request'].user.company
+        return super().create(validated_data)
+
+
+# Сериализатор для модели WarehouseEvent (Складское событие)
+class WarehouseEventSerializer(serializers.ModelSerializer):
+    STATUS_CHOICES = [
+        ('draf', 'Черновик'),
+        ('conducted', 'Проведен'),
+        ('cancelled', 'Отменен'),
+    ]
+
+    participants = serializers.PrimaryKeyRelatedField(
+        many=True,
+        queryset=User.objects.all()  # Здесь валидируем, что участники принадлежат компании текущего пользователя
+    )
+    participants_detail = serializers.StringRelatedField(source='participants', many=True, read_only=True)
+    
+    responsible_person = serializers.PrimaryKeyRelatedField(queryset=User.objects.all(), allow_null=True)
+
+    class Meta:
+        model = WarehouseEvent
+        fields = [
+            'id', 'warehouse', 'responsible_person', 'status', 'client_name',
+            'title', 'description', 'amount', 'event_date', 'participants',
+            'participants_detail', 'created_at', 'updated_at'
+        ]
+        read_only_fields = ['id', 'created_at', 'updated_at', 'participants_detail']
+
+    def validate_participants(self, participants):
+        """
+        Проверяем, что все участники из компании текущего пользователя.
+        """
+        request = self.context['request']
+        company = request.user.company
+
+        for participant in participants:
+            if participant.company != company:
+                raise serializers.ValidationError(
+                    f"Пользователь {participant.email} не принадлежит вашей компании."
+                )
+        return participants
+
+    def create(self, validated_data):
+        participants = validated_data.pop('participants')
+        warehouse_event = WarehouseEvent.objects.create(**validated_data)
+        warehouse_event.participants.set(participants)
+        return warehouse_event
 
     def update(self, instance, validated_data):
         participants = validated_data.pop('participants', None)

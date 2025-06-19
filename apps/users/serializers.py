@@ -1,7 +1,7 @@
 from rest_framework import serializers
 from rest_framework_simplejwt.tokens import RefreshToken
 from rest_framework_simplejwt.serializers import TokenObtainPairSerializer
-from apps.users.models import User, Company, Roles, Industry
+from apps.users.models import User, Company, Roles, Industry, SubscriptionPlan, Feature
 from rest_framework.validators import UniqueValidator
 from django.core.mail import send_mail
 from django.conf import settings
@@ -59,7 +59,6 @@ class UserSerializer(serializers.ModelSerializer):
         instance.save()
         return instance
 
-# 📝 Регистрация владельца компании
 class OwnerRegisterSerializer(serializers.ModelSerializer):
     email = serializers.EmailField(
         required=True,
@@ -69,6 +68,7 @@ class OwnerRegisterSerializer(serializers.ModelSerializer):
     password2 = serializers.CharField(write_only=True, style={'input_type': 'password'})
     company_name = serializers.CharField(write_only=True, required=True)
     company_industry_id = serializers.UUIDField(write_only=True, required=True)
+    subscription_plan_id = serializers.UUIDField(write_only=True, required=True)  # Добавляем поле для тарифа
 
     class Meta:
         model = User
@@ -76,10 +76,11 @@ class OwnerRegisterSerializer(serializers.ModelSerializer):
             'email', 'password', 'password2',
             'first_name', 'last_name',
             'avatar',
-            'company_name', 'company_industry_id'
+            'company_name', 'company_industry_id', 'subscription_plan_id'
         ]
 
     def validate(self, data):
+        # Проверка на совпадение паролей
         if data['password'] != data['password2']:
             raise serializers.ValidationError({"password2": "Пароли не совпадают."})
         return data
@@ -87,6 +88,7 @@ class OwnerRegisterSerializer(serializers.ModelSerializer):
     def create(self, validated_data):
         company_name = validated_data.pop('company_name')
         company_industry_id = validated_data.pop('company_industry_id')
+        subscription_plan_id = validated_data.pop('subscription_plan_id')
         validated_data.pop('password2')
 
         # Получаем объект индустрии
@@ -94,6 +96,12 @@ class OwnerRegisterSerializer(serializers.ModelSerializer):
             industry = Industry.objects.get(id=company_industry_id)
         except Industry.DoesNotExist:
             raise serializers.ValidationError({'company_industry_id': 'Выбранная отрасль не найдена.'})
+
+        # Получаем объект тарифа
+        try:
+            subscription_plan = SubscriptionPlan.objects.get(id=subscription_plan_id)
+        except SubscriptionPlan.DoesNotExist:
+            raise serializers.ValidationError({'subscription_plan_id': 'Выбранный тариф не найден.'})
 
         # Создаем владельца без компании
         user = User.objects.create(
@@ -107,10 +115,11 @@ class OwnerRegisterSerializer(serializers.ModelSerializer):
         user.set_password(validated_data['password'])
         user.save()
 
-        # Создаем компанию и привязываем владельца
+        # Создаем компанию и привязываем владельца и тариф
         company = Company.objects.create(
             name=company_name,
             industry=industry,
+            subscription_plan=subscription_plan,
             owner=user
         )
 
@@ -197,3 +206,16 @@ class IndustrySerializer(serializers.ModelSerializer):
     class Meta:
         model = Industry
         fields = ['id', 'name']
+
+        
+class FeatureSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Feature
+        fields = ['id', 'name', 'description']
+
+class SubscriptionPlanSerializer(serializers.ModelSerializer):
+    features = FeatureSerializer(many=True)  # Сериализатор для списка функций
+
+    class Meta:
+        model = SubscriptionPlan
+        fields = ['id', 'name', 'price', 'description', 'features']

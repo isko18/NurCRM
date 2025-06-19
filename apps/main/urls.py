@@ -9,7 +9,7 @@ from .views import (
     OrderListCreateAPIView, OrderRetrieveUpdateDestroyAPIView,
     ProductListCreateAPIView, ProductRetrieveUpdateDestroyAPIView,
     ReviewListCreateAPIView, ReviewRetrieveUpdateDestroyAPIView,
-    NotificationListView, NotificationDetailView, MarkAllNotificationsReadView, EventListCreateAPIView, EventRetrieveUpdateDestroyAPIView
+    NotificationListView, NotificationDetailView, MarkAllNotificationsReadView, EventListCreateAPIView, EventRetrieveUpdateDestroyAPIView, WarehouseEventListCreateAPIView, WarehouseEventRetrieveUpdateDestroyAPIView, WarehouseListCreateAPIView, WarehouseRetrieveUpdateDestroyAPIView
 )
 
 urlpatterns = [
@@ -44,4 +44,10 @@ urlpatterns = [
     path('notifications/mark-all-read/', MarkAllNotificationsReadView.as_view(), name='mark-all-notifications-read'),
     path('events/', EventListCreateAPIView.as_view(), name='event-list-create'),
     path('events/<uuid:pk>/', EventRetrieveUpdateDestroyAPIView.as_view(), name='event-detail'),
+    path('warehouses/', WarehouseListCreateAPIView.as_view(), name='warehouse-list-create'),
+    path('warehouses/<uuid:id>/', WarehouseRetrieveUpdateDestroyAPIView.as_view(), name='warehouse-retrieve-update-destroy'),
+
+    # URLs для WarehouseEvent (Складские события)
+    path('warehouse-events/', WarehouseEventListCreateAPIView.as_view(), name='warehouse-event-list-create'),
+    path('warehouse-events/<uuid:id>/', WarehouseEventRetrieveUpdateDestroyAPIView.as_view(), name='warehouse-event-retrieve-update-destroy'),
 ]
