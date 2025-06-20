@@ -125,7 +125,7 @@ class ProductListCreateAPIView(CompanyRestrictedMixin, generics.ListCreateAPIVie
     serializer_class = ProductSerializer
     queryset = Product.objects.all()
     filter_backends = [DjangoFilterBackend, filters.SearchFilter]
-    search_fields = ['name', 'article', 'brand', 'category']
+    search_fields = ['name', 'article', 'brand__name', 'category__name']
     filterset_fields = ['category', 'brand']
 
 
@@ -216,3 +216,26 @@ class WarehouseEventListCreateAPIView(CompanyRestrictedMixin, generics.ListCreat
 class WarehouseEventRetrieveUpdateDestroyAPIView(CompanyRestrictedMixin, generics.RetrieveUpdateDestroyAPIView):
     serializer_class = WarehouseEventSerializer
     queryset = WarehouseEvent.objects.all()
+    
+    
+class ProductCategoryListCreateAPIView(CompanyRestrictedMixin, generics.ListCreateAPIView):
+    serializer_class = ProductCategorySerializer
+    queryset = ProductCategory.objects.all()
+    filter_backends = [DjangoFilterBackend, filters.SearchFilter]
+    search_fields = ['name']
+
+class ProductCategoryRetrieveUpdateDestroyAPIView(CompanyRestrictedMixin, generics.RetrieveUpdateDestroyAPIView):
+    serializer_class = ProductCategorySerializer
+    queryset = ProductCategory.objects.all()
+
+
+# Бренды товаров
+class ProductBrandListCreateAPIView(CompanyRestrictedMixin, generics.ListCreateAPIView):
+    serializer_class = ProductBrandSerializer
+    queryset = ProductBrand.objects.all()
+    filter_backends = [DjangoFilterBackend, filters.SearchFilter]
+    search_fields = ['name']
+
+class ProductBrandRetrieveUpdateDestroyAPIView(CompanyRestrictedMixin, generics.RetrieveUpdateDestroyAPIView):
+    serializer_class = ProductBrandSerializer
+    queryset = ProductBrand.objects.all()

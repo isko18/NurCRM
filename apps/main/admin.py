@@ -1,9 +1,12 @@
 from django.contrib import admin
+from mptt.admin import DraggableMPTTAdmin
+
 from apps.main.models import (
     Contact, Pipeline, Deal, Task,
     Integration, Analytics, Order,
     Product, Review, Notification, Event,
-    Warehouse, WarehouseEvent
+    Warehouse, WarehouseEvent,
+    ProductCategory, ProductBrand  # ✅ добавлены новые модели
 )
 
 
@@ -11,7 +14,7 @@ from apps.main.models import (
 class ContactAdmin(admin.ModelAdmin):
     list_display = ('name', 'email', 'company', 'department', 'owner', 'created_at')
     list_filter = ('company', 'department')
-    search_fields = ('name', 'email', 'company')
+    search_fields = ('name', 'email', 'company__name')
     readonly_fields = ('created_at', 'updated_at')
 
 
@@ -68,6 +71,19 @@ class ProductAdmin(admin.ModelAdmin):
     readonly_fields = ('created_at', 'updated_at')
 
 
+@admin.register(ProductCategory)
+class ProductCategoryAdmin(DraggableMPTTAdmin):
+    mptt_indent_field = "name"
+    list_display = ('tree_actions', 'indented_title',)
+    search_fields = ('name',)
+
+@admin.register(ProductBrand)
+class ProductBrandAdmin(DraggableMPTTAdmin):
+    mptt_indent_field = "name"
+    list_display = ('tree_actions', 'indented_title',)
+    search_fields = ('name',)
+
+
 @admin.register(Review)
 class ReviewAdmin(admin.ModelAdmin):
     list_display = ('user', 'rating', 'created_at')
@@ -89,21 +105,20 @@ class EventAdmin(admin.ModelAdmin):
     list_display = ('title', 'datetime', 'company', 'created_at')
     list_filter = ('company', 'datetime')
     search_fields = ('title', 'notes')
-    filter_horizontal = ('participants',)  # Можно использовать filter_vertical для улучшенной видимости
+    filter_horizontal = ('participants',)
     readonly_fields = ('created_at', 'updated_at')
 
 
 @admin.register(Warehouse)
 class WarehouseAdmin(admin.ModelAdmin):
-    list_display = ('name', 'location', 'company_name', 'created_at')  # Используем company_name как метод
+    list_display = ('name', 'location', 'company_name', 'created_at')
     list_filter = ('company', 'location')
     search_fields = ('name', 'location')
-
-    readonly_fields = ('created_at', 'updated_at')  # Убедитесь, что в модели есть эти поля
+    readonly_fields = ('created_at', 'updated_at')
 
     def company_name(self, obj):
-        return obj.company.name  # Метод для отображения имени компании
-    company_name.admin_order_field = 'company__name'  # Для сортировки по полю
+        return obj.company.name
+    company_name.admin_order_field = 'company__name'
     company_name.short_description = 'Компания'
 
 
@@ -112,11 +127,10 @@ class WarehouseEventAdmin(admin.ModelAdmin):
     list_display = ('title', 'client_name', 'event_date', 'status', 'responsible_person', 'warehouse_name', 'created_at')
     list_filter = ('status', 'event_date', 'warehouse')
     search_fields = ('title', 'client_name', 'description')
-
     filter_horizontal = ('participants',)
     readonly_fields = ('created_at', 'updated_at')
 
     def warehouse_name(self, obj):
-        return obj.warehouse.name  # Метод для отображения названия склада
-    warehouse_name.admin_order_field = 'warehouse__name'  # Для сортировки по складу
+        return obj.warehouse.name
+    warehouse_name.admin_order_field = 'warehouse__name'
     warehouse_name.short_description = 'Склад'

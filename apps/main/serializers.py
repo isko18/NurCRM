@@ -1,7 +1,24 @@
 from rest_framework import serializers
-from apps.main.models import Contact, Pipeline, Deal, Task, Integration, Analytics, Order, Product, Review, Notification, Event, Warehouse, WarehouseEvent
+from apps.main.models import Contact, Pipeline, Deal, Task, Integration, Analytics, Order, Product, Review, Notification, Event, Warehouse, WarehouseEvent, ProductCategory, ProductBrand
 from apps.users.models import User, Company
 
+
+class ProductCategorySerializer(serializers.ModelSerializer):
+    parent = serializers.PrimaryKeyRelatedField(queryset=ProductCategory.objects.all(), allow_null=True)
+
+    class Meta:
+        model = ProductCategory
+        fields = ['id', 'name', 'parent']
+        read_only_fields = ['id']
+        
+class ProductBrandSerializer(serializers.ModelSerializer):
+    parent = serializers.PrimaryKeyRelatedField(queryset=ProductBrand.objects.all(), allow_null=True)
+
+    class Meta:
+        model = ProductBrand
+        fields = ['id', 'name', 'parent']
+        read_only_fields = ['id']
+        
 class ContactSerializer(serializers.ModelSerializer):
     owner = serializers.ReadOnlyField(source='owner.id')
     company = serializers.ReadOnlyField(source='company.id')
@@ -131,6 +148,8 @@ class OrderSerializer(serializers.ModelSerializer):
 
 class ProductSerializer(serializers.ModelSerializer):
     company = serializers.ReadOnlyField(source='company.id')
+    brand = serializers.PrimaryKeyRelatedField(queryset=ProductBrand.objects.all(), allow_null=True)
+    category = serializers.PrimaryKeyRelatedField(queryset=ProductCategory.objects.all(), allow_null=True)
 
     class Meta:
         model = Product
@@ -143,7 +162,7 @@ class ProductSerializer(serializers.ModelSerializer):
     def create(self, validated_data):
         validated_data['company'] = self.context['request'].user.company
         return super().create(validated_data)
-
+    
 
 class ReviewSerializer(serializers.ModelSerializer):
     user = serializers.ReadOnlyField(source='user.id')

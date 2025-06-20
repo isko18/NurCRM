@@ -1,16 +1,5 @@
 from django.urls import path
-from .views import (
-    ContactListCreateAPIView, ContactRetrieveUpdateDestroyAPIView,
-    PipelineListCreateAPIView, PipelineRetrieveUpdateDestroyAPIView,
-    DealListCreateAPIView, DealRetrieveUpdateDestroyAPIView,
-    TaskListCreateAPIView, TaskRetrieveUpdateDestroyAPIView,
-    IntegrationListCreateAPIView, IntegrationRetrieveUpdateDestroyAPIView,
-    AnalyticsListAPIView,
-    OrderListCreateAPIView, OrderRetrieveUpdateDestroyAPIView,
-    ProductListCreateAPIView, ProductRetrieveUpdateDestroyAPIView,
-    ReviewListCreateAPIView, ReviewRetrieveUpdateDestroyAPIView,
-    NotificationListView, NotificationDetailView, MarkAllNotificationsReadView, EventListCreateAPIView, EventRetrieveUpdateDestroyAPIView, WarehouseEventListCreateAPIView, WarehouseEventRetrieveUpdateDestroyAPIView, WarehouseListCreateAPIView, WarehouseRetrieveUpdateDestroyAPIView
-)
+from .views import *
 
 urlpatterns = [
     path('contacts/', ContactListCreateAPIView.as_view(), name='contact-list-create'),
@@ -50,4 +39,9 @@ urlpatterns = [
     # URLs для WarehouseEvent (Складские события)
     path('warehouse-events/', WarehouseEventListCreateAPIView.as_view(), name='warehouse-event-list-create'),
     path('warehouse-events/<uuid:id>/', WarehouseEventRetrieveUpdateDestroyAPIView.as_view(), name='warehouse-event-retrieve-update-destroy'),
+    path('categories/', ProductCategoryListCreateAPIView.as_view(), name='category-list'),
+    path('categories/<uuid:pk>/', ProductCategoryRetrieveUpdateDestroyAPIView.as_view(), name='category-detail'),
+
+    path('brands/', ProductBrandListCreateAPIView.as_view(), name='brand-list'),
+    path('brands/<uuid:pk>/', ProductBrandRetrieveUpdateDestroyAPIView.as_view(), name='brand-detail'),
 ]

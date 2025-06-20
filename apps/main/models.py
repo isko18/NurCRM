@@ -1,6 +1,53 @@
 from django.db import models
 import uuid
 from apps.users.models import User, Company
+from mptt.models import MPTTModel, TreeForeignKey
+from django.db import models
+from mptt.models import MPTTModel, TreeForeignKey
+
+class ProductCategory(MPTTModel):
+    name = models.CharField(max_length=128, unique=True, verbose_name='Название категории')
+    parent = TreeForeignKey(
+        'self',
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
+        related_name='children',
+        verbose_name='Родительская категория'
+    )
+
+    class MPTTMeta:
+        order_insertion_by = ['name']
+
+    class Meta:
+        verbose_name = 'Категория товара'
+        verbose_name_plural = 'Категории товаров'
+
+    def __str__(self):
+        return self.name
+
+
+class ProductBrand(MPTTModel):
+    name = models.CharField(max_length=128, unique=True, verbose_name='Название бренда')
+    parent = TreeForeignKey(
+        'self',
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
+        related_name='children',
+        verbose_name='Родительский бренд'
+    )
+
+    class MPTTMeta:
+        order_insertion_by = ['name']
+
+    class Meta:
+        verbose_name = 'Бренд'
+        verbose_name_plural = 'Бренды'
+
+    def __str__(self):
+        return self.name
+
 
 class Contact(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
@@ -144,8 +191,8 @@ class Product(models.Model):
 
     name = models.CharField(max_length=128)
     article = models.CharField(max_length=64)
-    brand = models.CharField(max_length=64)
-    category = models.CharField(max_length=64)
+    brand = models.ForeignKey(ProductBrand, on_delete=models.SET_NULL, null=True, blank=True, related_name='products', verbose_name='Бренд')
+    category = models.ForeignKey(ProductCategory, on_delete=models.SET_NULL, null=True, blank=True, related_name='products', verbose_name='Категория')
     quantity = models.PositiveIntegerField()
     price = models.DecimalField(max_digits=10, decimal_places=2)
 
@@ -316,3 +363,5 @@ class WarehouseEvent(models.Model):
         verbose_name = 'Складское событие'
         verbose_name_plural = 'Складские события'
         ordering = ['event_date']
+        
+        
