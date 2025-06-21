@@ -3,10 +3,10 @@ from mptt.admin import DraggableMPTTAdmin
 
 from apps.main.models import (
     Contact, Pipeline, Deal, Task,
-    Integration, Analytics, Order,
+    Integration, Analytics, Order, OrderItem,
     Product, Review, Notification, Event,
     Warehouse, WarehouseEvent,
-    ProductCategory, ProductBrand  # ✅ добавлены новые модели
+    ProductCategory, ProductBrand
 )
 
 
@@ -55,12 +55,44 @@ class AnalyticsAdmin(admin.ModelAdmin):
     readonly_fields = ('created_at',)
 
 
+class OrderItemInline(admin.TabularInline):
+    model = OrderItem
+    extra = 1
+    readonly_fields = ('total',)
+    autocomplete_fields = ('product',)
+
+    def save_new_objects(self, formset, commit=True):
+        instances = formset.save(commit=False)
+        for obj in instances:
+            # Установить цену, если не задана
+            obj.price = obj.product.price
+            obj.total = obj.price * obj.quantity
+
+            # Проверка на остаток
+            if obj.product.quantity < obj.quantity:
+                raise ValueError(f"Недостаточно товара '{obj.product.name}' на складе")
+
+            # Вычесть количество
+            obj.product.quantity -= obj.quantity
+            obj.product.save()
+
+            if commit:
+                obj.save()
+
+        formset.save_m2m()
+
+
 @admin.register(Order)
 class OrderAdmin(admin.ModelAdmin):
-    list_display = ('order_number', 'customer_name', 'status', 'total', 'quantity', 'department', 'date_ordered')
+    list_display = ('order_number', 'customer_name', 'status', 'total_display', 'total_quantity', 'department', 'date_ordered')
     list_filter = ('status', 'department')
     search_fields = ('order_number', 'customer_name')
     readonly_fields = ('created_at', 'updated_at')
+    inlines = [OrderItemInline]
+
+    def total_display(self, obj):
+        return f"{obj.total:.2f}"
+    total_display.short_description = 'Сумма'
 
 
 @admin.register(Product)
@@ -76,6 +108,7 @@ class ProductCategoryAdmin(DraggableMPTTAdmin):
     mptt_indent_field = "name"
     list_display = ('tree_actions', 'indented_title',)
     search_fields = ('name',)
+
 
 @admin.register(ProductBrand)
 class ProductBrandAdmin(DraggableMPTTAdmin):
@@ -134,3 +167,10 @@ class WarehouseEventAdmin(admin.ModelAdmin):
         return obj.warehouse.name
     warehouse_name.admin_order_field = 'warehouse__name'
     warehouse_name.short_description = 'Склад'
+
+
+@admin.register(OrderItem)
+class OrderItemAdmin(admin.ModelAdmin):
+    list_display = ('order', 'product', 'quantity', 'price', 'total')
+    search_fields = ('order__order_number', 'product__name')
+    readonly_fields = ('price', 'total')

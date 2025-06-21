@@ -154,7 +154,6 @@ class Task(models.Model):
     def __str__(self):
         return f"{self.title} — {self.status}"
 
-
 class Order(models.Model):
     STATUS_CHOICES = [
         ('new', 'Новый'),
@@ -171,8 +170,6 @@ class Order(models.Model):
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='new')
     phone = models.CharField(max_length=32)
     department = models.CharField(max_length=64)
-    total = models.DecimalField(max_digits=12, decimal_places=2)
-    quantity = models.PositiveIntegerField()
 
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
@@ -185,6 +182,17 @@ class Order(models.Model):
     def __str__(self):
         return f"{self.order_number} — {self.customer_name}"
 
+    @property
+    def total(self):
+        return sum(item.total for item in self.items.all())
+
+    @property
+    def total_quantity(self):
+        return sum(item.quantity for item in self.items.all())
+
+
+    
+    
 class Product(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     company = models.ForeignKey(Company, on_delete=models.CASCADE, related_name='products')
@@ -203,9 +211,26 @@ class Product(models.Model):
         verbose_name = 'Товар'
         verbose_name_plural = 'Товары'
         ordering = ['-created_at']
-
+        
     def __str__(self):
         return f"{self.name} ({self.article})"
+    
+class OrderItem(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    order = models.ForeignKey(Order, on_delete=models.CASCADE, related_name='items', verbose_name='Заказ')
+    product = models.ForeignKey(Product, on_delete=models.PROTECT, related_name='order_items', verbose_name='Товар')
+    quantity = models.PositiveIntegerField(verbose_name='Количество')
+    price = models.DecimalField(max_digits=10, decimal_places=2, verbose_name='Цена за единицу', editable=False)
+    total = models.DecimalField(max_digits=12, decimal_places=2, verbose_name='Итоговая сумма', editable=False)
+
+    class Meta:
+        verbose_name = 'Товар в заказе'
+        verbose_name_plural = 'Товары в заказе'
+
+    def __str__(self):
+        return f"{self.product.name} x {self.quantity}"
+
+
 
 class Review(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)

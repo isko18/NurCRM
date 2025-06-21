@@ -1,5 +1,5 @@
 from rest_framework import serializers
-from apps.main.models import Contact, Pipeline, Deal, Task, Integration, Analytics, Order, Product, Review, Notification, Event, Warehouse, WarehouseEvent, ProductCategory, ProductBrand
+from apps.main.models import Contact, Pipeline, Deal, Task, Integration, Analytics, Order, Product, Review, Notification, Event, Warehouse, WarehouseEvent, ProductCategory, ProductBrand, OrderItem
 from apps.users.models import User, Company
 
 
@@ -128,22 +128,74 @@ class AnalyticsSerializer(serializers.ModelSerializer):
         validated_data['company'] = self.context['request'].user.company
         return super().create(validated_data)
 
+class OrderItemSerializer(serializers.ModelSerializer):
+    price = serializers.DecimalField(max_digits=10, decimal_places=2, read_only=True)
+    total = serializers.DecimalField(max_digits=12, decimal_places=2, read_only=True)
 
+    class Meta:
+        model = OrderItem
+        fields = ['id', 'product', 'quantity', 'price', 'total']
+
+    def validate(self, data):
+        product = data['product']
+        quantity = data['quantity']
+        if product.quantity < quantity:
+            raise serializers.ValidationError(
+                f"Недостаточно товара на складе для '{product.name}'. Доступно: {product.quantity}"
+            )
+        return data
+
+    def create(self, validated_data):
+        product = validated_data['product']
+        quantity = validated_data['quantity']
+        price = product.price
+        total = price * quantity
+
+        # Списание товара
+        product.quantity -= quantity
+        product.save()
+
+        return OrderItem.objects.create(
+            **validated_data,
+            price=price,
+            total=total
+        )
 class OrderSerializer(serializers.ModelSerializer):
     company = serializers.ReadOnlyField(source='company.id')
+    items = OrderItemSerializer(many=True)
+
+    total = serializers.SerializerMethodField()
+    total_quantity = serializers.SerializerMethodField()
 
     class Meta:
         model = Order
         fields = [
             'id', 'order_number', 'customer_name', 'date_ordered',
-            'status', 'phone', 'department', 'total', 'quantity',
-            'company', 'created_at', 'updated_at'
+            'status', 'phone', 'department',
+            'company', 'created_at', 'updated_at',
+            'items', 'total', 'total_quantity'
         ]
-        read_only_fields = ['id', 'created_at', 'updated_at', 'company']
+        read_only_fields = ['id', 'created_at', 'updated_at', 'company', 'total', 'total_quantity']
+
+    def get_total(self, obj):
+        return obj.total
+
+    def get_total_quantity(self, obj):
+        return obj.total_quantity
 
     def create(self, validated_data):
-        validated_data['company'] = self.context['request'].user.company
-        return super().create(validated_data)
+        request = self.context['request']
+        validated_data['company'] = request.user.company
+
+        items_data = validated_data.pop('items')
+        order = Order.objects.create(**validated_data)
+
+        for item_data in items_data:
+            item_data['order'] = order
+            OrderItemSerializer(context=self.context).create(item_data)
+
+        return order
+
 
 
 class ProductSerializer(serializers.ModelSerializer):

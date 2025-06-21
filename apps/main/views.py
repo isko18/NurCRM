@@ -6,9 +6,17 @@ from rest_framework import status
 
 from apps.main.models import (
     Contact, Pipeline, Deal, Task, Integration, Analytics,
-    Order, Product, Review, Notification, Event
+    Order, Product, Review, Notification, Event, ProductBrand, ProductCategory, Warehouse, WarehouseEvent
 )
-from apps.main.serializers import *
+from apps.main.serializers import (
+    ContactSerializer, PipelineSerializer, DealSerializer, TaskSerializer,
+    IntegrationSerializer, AnalyticsSerializer, OrderSerializer, ProductSerializer,
+    ReviewSerializer, NotificationSerializer, EventSerializer,
+    WarehouseSerializer, WarehouseEventSerializer,
+    ProductCategorySerializer, ProductBrandSerializer,
+    OrderItemSerializer
+)
+
 
 # Универсальный миксин для всех вьюх
 class CompanyRestrictedMixin:
@@ -109,15 +117,18 @@ class AnalyticsListAPIView(CompanyRestrictedMixin, generics.ListAPIView):
 # Заказы
 class OrderListCreateAPIView(CompanyRestrictedMixin, generics.ListCreateAPIView):
     serializer_class = OrderSerializer
-    queryset = Order.objects.all()
+    queryset = Order.objects.all().prefetch_related('items__product')  # 🔍 подтягиваем товары
     filter_backends = [DjangoFilterBackend, filters.SearchFilter]
     search_fields = ['order_number', 'customer_name', 'department', 'phone']
     filterset_fields = ['status', 'date_ordered']
 
+    def perform_create(self, serializer):
+        # company уже устанавливается в сериализаторе
+        serializer.save()
 
 class OrderRetrieveUpdateDestroyAPIView(CompanyRestrictedMixin, generics.RetrieveUpdateDestroyAPIView):
     serializer_class = OrderSerializer
-    queryset = Order.objects.all()
+    queryset = Order.objects.all().prefetch_related('items__product')
 
 
 # Продукты
