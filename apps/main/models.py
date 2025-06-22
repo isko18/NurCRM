@@ -7,6 +7,7 @@ from mptt.models import MPTTModel, TreeForeignKey
 
 class ProductCategory(MPTTModel):
     name = models.CharField(max_length=128, unique=True, verbose_name='Название категории')
+    company = models.ForeignKey(Company, on_delete=models.CASCADE, related_name='categories', verbose_name='Компания')
     parent = TreeForeignKey(
         'self',
         on_delete=models.CASCADE,
@@ -29,6 +30,7 @@ class ProductCategory(MPTTModel):
 
 class ProductBrand(MPTTModel):
     name = models.CharField(max_length=128, unique=True, verbose_name='Название бренда')
+    company = models.ForeignKey(Company, on_delete=models.CASCADE, related_name='brands', verbose_name='Компания')  # 👈 добавлено поле
     parent = TreeForeignKey(
         'self',
         on_delete=models.CASCADE,
@@ -47,7 +49,6 @@ class ProductBrand(MPTTModel):
 
     def __str__(self):
         return self.name
-
 
 class Contact(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)

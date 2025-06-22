@@ -8,5 +8,4 @@ from apps.main.tasks import create_task_notification
 @receiver(post_save, sender=Task)
 def notify_assigned_user_async(sender, instance, created, **kwargs):
     if created and instance.assigned_to:
-        # Мы вызываем задачу только после того, как задача была сохранена
         create_task_notification.delay(str(instance.id))
