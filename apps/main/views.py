@@ -3,6 +3,10 @@ from django_filters.rest_framework import DjangoFilterBackend
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework import status
+from rest_framework.permissions import IsAuthenticated
+
+from django.utils.dateparse import parse_date
+from django.db.models import Sum, Count, Avg
 
 from apps.main.models import (
     Contact, Pipeline, Deal, Task, Integration, Analytics,
@@ -240,3 +244,53 @@ class ProductBrandListCreateAPIView(CompanyRestrictedMixin, generics.ListCreateA
 class ProductBrandRetrieveUpdateDestroyAPIView(CompanyRestrictedMixin, generics.RetrieveUpdateDestroyAPIView):
     serializer_class = ProductBrandSerializer
     queryset = ProductBrand.objects.all()
+
+
+class OrderAnalyticsView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, *args, **kwargs):
+        company = request.user.company
+        start_date = request.query_params.get('start')
+        end_date = request.query_params.get('end')
+        status_filter = request.query_params.get('status')
+
+        orders = Order.objects.filter(company=company)
+
+        if start_date:
+            start_date = parse_date(start_date)
+            orders = orders.filter(date_ordered__gte=start_date)
+
+        if end_date:
+            end_date = parse_date(end_date)
+            orders = orders.filter(date_ordered__lte=end_date)
+
+        if status_filter:
+            orders = orders.filter(status=status_filter)
+
+        total_orders = orders.count()
+        total_amount = orders.aggregate(total=Sum('items__total'))['total'] or 0
+        average_amount = orders.aggregate(avg=Avg('items__total'))['avg'] or 0
+
+        # Группировка по статусу
+        orders_by_status = orders.values('status').annotate(
+            order_count=Count('id'),
+            total_amount=Sum('items__total'),
+            average_amount=Avg('items__total')
+        )
+
+        response_data = {
+            'filters': {
+                'start_date': start_date,
+                'end_date': end_date,
+                'status': status_filter,
+            },
+            'summary': {
+                'total_orders': total_orders,
+                'total_amount': total_amount,
+                'average_order_amount': average_amount,
+            },
+            'orders_by_status': list(orders_by_status)
+        }
+
+        return Response(response_data)

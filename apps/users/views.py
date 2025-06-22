@@ -78,3 +78,18 @@ class SubscriptionPlanListAPIView(generics.ListAPIView):
 class FeatureListAPIView(generics.ListAPIView):
     queryset = Feature.objects.all()
     serializer_class = FeatureSerializer
+    
+    
+class EmployeeDestroyAPIView(generics.DestroyAPIView):
+    queryset = User.objects.all()
+    serializer_class = UserListSerializer
+    permission_classes = [permissions.IsAuthenticated, IsCompanyOwner]
+
+    def get_queryset(self):
+        return self.request.user.owned_company.employees.all()
+
+    def delete(self, request, *args, **kwargs):
+        employee = self.get_object()
+        if employee == request.user:
+            return Response({'detail': 'Вы не можете удалить самого себя.'}, status=status.HTTP_400_BAD_REQUEST)
+        return super().delete(request, *args, **kwargs)

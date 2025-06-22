@@ -8,7 +8,8 @@ from .views import (
     CurrentUserAPIView,
     IndustryListAPIView,
     SubscriptionPlanListAPIView, 
-    FeatureListAPIView
+    FeatureListAPIView,
+    EmployeeDestroyAPIView
 )
 
 urlpatterns = [
@@ -18,10 +19,12 @@ urlpatterns = [
     # JWT авторизация
     path('auth/login/', CustomTokenObtainPairView.as_view(), name='token_obtain_pair'),
     path('auth/refresh/', TokenRefreshView.as_view(), name='token_refresh'),
+    
 
     # Работа со своими сотрудниками
     path('employees/', EmployeeListAPIView.as_view(), name='employee-list'),
     path('employees/create/', EmployeeCreateAPIView.as_view(), name='employee-create'),
+    path('employees/<uuid:pk>/delete/', EmployeeDestroyAPIView.as_view(), name='employee-delete'),
 
     # Личный кабинет
     path('profile/', CurrentUserAPIView.as_view(), name='user-me'),
@@ -30,4 +33,5 @@ urlpatterns = [
     path('industries/', IndustryListAPIView.as_view(), name='industry-list'),
     path('subscription-plans/', SubscriptionPlanListAPIView.as_view(), name='subscription-plan-list'),
     path('features/', FeatureListAPIView.as_view(), name='feature-list'),
+    
 ]

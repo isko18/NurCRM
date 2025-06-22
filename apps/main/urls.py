@@ -60,4 +60,6 @@ urlpatterns = [
     # 🔹 События
     path('events/', EventListCreateAPIView.as_view(), name='event-list-create'),
     path('events/<uuid:pk>/', EventRetrieveUpdateDestroyAPIView.as_view(), name='event-detail'),
+    path('orders/analytics/', OrderAnalyticsView.as_view(), name='order-analytics'),
 ]
+
