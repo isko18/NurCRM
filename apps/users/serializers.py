@@ -219,3 +219,20 @@ class SubscriptionPlanSerializer(serializers.ModelSerializer):
     class Meta:
         model = SubscriptionPlan
         fields = ['id', 'name', 'price', 'description', 'features']
+        
+        
+class CompanySerializer(serializers.ModelSerializer):
+    industry = IndustrySerializer(read_only=True)
+    subscription_plan = SubscriptionPlanSerializer(read_only=True)
+    owner = UserListSerializer(read_only=True)  # Краткая информация о владельце
+
+    class Meta:
+        model = Company
+        fields = [
+            'id',
+            'name',
+            'industry',
+            'subscription_plan',
+            'owner',
+            'created_at',
+        ]

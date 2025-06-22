@@ -3,6 +3,7 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework_simplejwt.views import TokenObtainPairView
 from rest_framework.response import Response
 from rest_framework import status
+from rest_framework.exceptions import NotFound
 from rest_framework.permissions import AllowAny
 
 from .models import User, Industry, SubscriptionPlan, Feature
@@ -14,7 +15,8 @@ from .serializers import (
     CustomTokenObtainPairSerializer,
     IndustrySerializer,
     SubscriptionPlanSerializer,
-    FeatureSerializer
+    FeatureSerializer,
+    CompanySerializer
 )
 from .permissions import IsCompanyOwner
 
@@ -93,3 +95,14 @@ class EmployeeDestroyAPIView(generics.DestroyAPIView):
         if employee == request.user:
             return Response({'detail': 'Вы не можете удалить самого себя.'}, status=status.HTTP_400_BAD_REQUEST)
         return super().delete(request, *args, **kwargs)
+    
+    
+class CompanyDetailAPIView(generics.RetrieveAPIView):
+    serializer_class = CompanySerializer
+    permission_classes = [IsAuthenticated]
+
+    def get_object(self):
+        company = getattr(self.request.user, 'company', None)
+        if company is None:
+            raise NotFound("Вы не принадлежите ни к одной компании.")
+        return company
