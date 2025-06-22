@@ -42,7 +42,7 @@ class EmployeeListAPIView(generics.ListAPIView):
 
     def get_queryset(self):
         user = self.request.user
-        company = user.owned_company  # владелец своей компании
+        company = user.company  # компания, к которой принадлежит пользователь
         return company.employees.all()
 
 
