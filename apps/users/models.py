@@ -40,10 +40,21 @@ class Roles(models.TextChoices):
     USER = 'user', 'Сотрудник'
     OWNER = 'owner', "Владелец"
 
+class Sector(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    name = models.CharField(max_length=255, unique=True, verbose_name='Название отрасли')
 
+    def __str__(self):
+        return self.name
+
+    class Meta:
+        verbose_name = "Отрасль"
+        verbose_name_plural = "Отрасли"
+        
 class Industry(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     name = models.CharField(max_length=255, unique=True, verbose_name='Название вида деятельности')
+    sectors = models.ManyToManyField(Sector, blank=True, related_name='industries', verbose_name='Отрасли')
 
     def __str__(self):
         return self.name

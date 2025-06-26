@@ -1,7 +1,7 @@
 from rest_framework import serializers
 from rest_framework_simplejwt.tokens import RefreshToken
 from rest_framework_simplejwt.serializers import TokenObtainPairSerializer
-from apps.users.models import User, Company, Roles, Industry, SubscriptionPlan, Feature
+from apps.users.models import User, Company, Roles, Industry, SubscriptionPlan, Feature, Sector  
 from rest_framework.validators import UniqueValidator
 from django.core.mail import send_mail
 from django.conf import settings
@@ -200,12 +200,17 @@ class UserListSerializer(serializers.ModelSerializer):
         model = User
         fields = ['id', 'email', 'first_name', 'last_name', 'role', 'avatar']
 
-
+class SectorSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Sector
+        fields = ['id', 'name']
 # 🔧 Сериализатор для списка видов деятельности
 class IndustrySerializer(serializers.ModelSerializer):
+    sectors = SectorSerializer(many=True, read_only=True)
+
     class Meta:
         model = Industry
-        fields = ['id', 'name']
+        fields = ['id', 'name', 'sectors']
 
         
 class FeatureSerializer(serializers.ModelSerializer):

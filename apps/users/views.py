@@ -6,7 +6,7 @@ from rest_framework import status
 from rest_framework.exceptions import NotFound
 from rest_framework.permissions import AllowAny
 
-from .models import User, Industry, SubscriptionPlan, Feature
+from .models import User, Industry, SubscriptionPlan, Feature, Sector
 from .serializers import (
     UserSerializer,
     OwnerRegisterSerializer,
@@ -16,7 +16,8 @@ from .serializers import (
     IndustrySerializer,
     SubscriptionPlanSerializer,
     FeatureSerializer,
-    CompanySerializer
+    CompanySerializer,
+    SectorSerializer
 )
 from .permissions import IsCompanyOwner
 
@@ -66,6 +67,11 @@ class EmployeeCreateAPIView(generics.CreateAPIView):
     def perform_create(self, serializer):
         serializer.save()
         
+class SectorListAPIView(generics.ListAPIView):
+    queryset = Sector.objects.all()
+    serializer_class = SectorSerializer
+    permission_classes = [permissions.AllowAny]
+    
 class IndustryListAPIView(generics.ListAPIView):
     queryset = Industry.objects.all()
     serializer_class = IndustrySerializer

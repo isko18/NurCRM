@@ -1,6 +1,6 @@
 from django.contrib import admin
 from django.contrib.auth.admin import UserAdmin as BaseUserAdmin  # Импортируем BaseUserAdmin
-from .models import User, Company, Industry, SubscriptionPlan, Feature
+from .models import User, Company, Industry, SubscriptionPlan, Feature, Sector
 
 # Модель UserAdmin для настройки админки пользователя
 @admin.register(User)
@@ -55,13 +55,20 @@ class CompanyAdmin(admin.ModelAdmin):
         return ', '.join([f'{e.first_name} {e.last_name} ({e.get_role_display()})' for e in employees])
     employees_list.short_description = 'Сотрудники'
 
-
+class SectorInline(admin.TabularInline):
+    model = Industry.sectors.through
+    extra = 1
+    verbose_name = 'Отрасль'
+    verbose_name_plural = 'Отрасли'
+    
 # Модель IndustryAdmin для настройки админки видов деятельности
 @admin.register(Industry)
 class IndustryAdmin(admin.ModelAdmin):
     list_display = ('name',)
     search_fields = ('name',)
     ordering = ('name',)
+    inlines = [SectorInline]
+    exclude = ('sectors',) 
 
 
 # Модель SubscriptionPlan для настройки админки тарифов
@@ -78,3 +85,8 @@ class SubscriptionPlanAdmin(admin.ModelAdmin):
     filter_horizontal = ('features',)  # Для ManyToManyField features
 
     inlines = [FeatureInline]  # Добавляем inline для функций
+    
+@admin.register(Sector)
+class SectorAdmin(admin.ModelAdmin):
+    list_display = ('name',)
+    search_fields = ('name',)
