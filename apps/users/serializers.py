@@ -2,6 +2,7 @@ from rest_framework import serializers
 from rest_framework_simplejwt.tokens import RefreshToken
 from rest_framework_simplejwt.serializers import TokenObtainPairSerializer
 from apps.users.models import User, Company, Roles, Industry, SubscriptionPlan, Feature, Sector  
+from apps.construction.models import Cashbox, Department
 from rest_framework.validators import UniqueValidator
 from django.core.mail import send_mail
 from django.conf import settings
@@ -91,19 +92,17 @@ class OwnerRegisterSerializer(serializers.ModelSerializer):
         subscription_plan_id = validated_data.pop('subscription_plan_id')
         validated_data.pop('password2')
 
-        # Получаем объект индустрии
         try:
             industry = Industry.objects.get(id=company_industry_id)
         except Industry.DoesNotExist:
             raise serializers.ValidationError({'company_industry_id': 'Выбранная отрасль не найдена.'})
 
-        # Получаем объект тарифа
         try:
             subscription_plan = SubscriptionPlan.objects.get(id=subscription_plan_id)
         except SubscriptionPlan.DoesNotExist:
             raise serializers.ValidationError({'subscription_plan_id': 'Выбранный тариф не найден.'})
 
-        # Создаем владельца без компании
+        # Создаем владельца
         user = User.objects.create(
             email=validated_data['email'],
             first_name=validated_data['first_name'],
@@ -115,7 +114,7 @@ class OwnerRegisterSerializer(serializers.ModelSerializer):
         user.set_password(validated_data['password'])
         user.save()
 
-        # Создаем компанию и привязываем владельца и тариф
+        # Создаем компанию
         company = Company.objects.create(
             name=company_name,
             industry=industry,
@@ -123,9 +122,20 @@ class OwnerRegisterSerializer(serializers.ModelSerializer):
             owner=user
         )
 
-        # Присваиваем владельцу компанию
         user.company = company
         user.save()
+
+        # ✅ Автоматически создаем отделы и кассы, если отрасль — Строительная компания
+        if industry.name.lower() == "строительная компания":
+            default_departments = [
+                "Строительный отдел",
+                "Отдел ремонта",
+                "Архитектура и дизайн",
+                "Инженерные услуги"
+            ]
+            for dept_name in default_departments:
+                dept = Department.objects.create(company=company, name=dept_name)
+                Cashbox.objects.create(department=dept)
 
         return user
 
@@ -229,7 +239,8 @@ class SubscriptionPlanSerializer(serializers.ModelSerializer):
 class CompanySerializer(serializers.ModelSerializer):
     industry = IndustrySerializer(read_only=True)
     subscription_plan = SubscriptionPlanSerializer(read_only=True)
-    owner = UserListSerializer(read_only=True)  # Краткая информация о владельце
+    owner = UserListSerializer(read_only=True)
+    sector = SectorSerializer(read_only=True)
 
     class Meta:
         model = Company
@@ -237,6 +248,7 @@ class CompanySerializer(serializers.ModelSerializer):
             'id',
             'name',
             'industry',
+            'sector',
             'subscription_plan',
             'owner',
             'created_at',

@@ -41,7 +41,7 @@ schema_view = get_schema_view(
 apps_includes = [
     path('main/', include('apps.main.urls')),  
     path('users/', include('apps.users.urls')),  
-    # path('billing/', include('apps.billing.urls')),  
+    path('construction/', include('apps.construction.urls')),  
 ]
 
 # API-роуты

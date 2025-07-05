@@ -112,13 +112,19 @@ class Company(models.Model):
         blank=True,
         verbose_name='Вид деятельности'
     )
+    sector = models.ForeignKey(
+        Sector,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        verbose_name='Отрасль'
+    )
     owner = models.OneToOneField(User, on_delete=models.CASCADE, related_name='owned_company', verbose_name='Владелец компании')
     created_at = models.DateTimeField(auto_now_add=True, verbose_name='Дата создания')
 
     def __str__(self):
         return self.name
-    
-    
+
     class Meta:
         verbose_name = 'Компания'
         verbose_name_plural = 'Компании'

@@ -36,7 +36,7 @@ class UserAdmin(BaseUserAdmin):
 @admin.register(Company)
 class CompanyAdmin(admin.ModelAdmin):
     list_display = ('name', 'get_industry_name', 'owner', 'employee_count', 'created_at')
-    search_fields = ('name', 'industry__name', 'owner__email')
+    search_fields = ('name', 'industry__name', 'sector__name','owner__email')
     ordering = ('name',)
     readonly_fields = ('employees_list',)
 
