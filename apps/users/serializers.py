@@ -69,8 +69,7 @@ class OwnerRegisterSerializer(serializers.ModelSerializer):
     password = serializers.CharField(write_only=True, min_length=8, style={'input_type': 'password'})
     password2 = serializers.CharField(write_only=True, style={'input_type': 'password'})
     company_name = serializers.CharField(write_only=True, required=True)
-    company_industry_id = serializers.UUIDField(write_only=True, required=True)
-    company_sector_id = serializers.UUIDField(write_only=True, required=True)  # ✅ добавляем поле сектора
+    company_sector_id = serializers.UUIDField(write_only=True, required=True)
     subscription_plan_id = serializers.UUIDField(write_only=True, required=True)
 
     class Meta:
@@ -79,7 +78,7 @@ class OwnerRegisterSerializer(serializers.ModelSerializer):
             'email', 'password', 'password2',
             'first_name', 'last_name',
             'avatar',
-            'company_name', 'company_industry_id', 'company_sector_id', 'subscription_plan_id'
+            'company_name', 'company_sector_id', 'subscription_plan_id'
         ]
 
     def validate(self, data):
@@ -89,22 +88,24 @@ class OwnerRegisterSerializer(serializers.ModelSerializer):
 
     def create(self, validated_data):
         company_name = validated_data.pop('company_name')
-        company_industry_id = validated_data.pop('company_industry_id')
         company_sector_id = validated_data.pop('company_sector_id')
         subscription_plan_id = validated_data.pop('subscription_plan_id')
         validated_data.pop('password2')
-
-        # Проверка отрасли
-        try:
-            industry = Industry.objects.get(id=company_industry_id)
-        except Industry.DoesNotExist:
-            raise serializers.ValidationError({'company_industry_id': 'Выбранная отрасль не найдена.'})
 
         # Проверка сектора
         try:
             sector = Sector.objects.get(id=company_sector_id)
         except Sector.DoesNotExist:
             raise serializers.ValidationError({'company_sector_id': 'Выбранный сектор не найден.'})
+
+        # Получаем индустрию из сектора
+        industries = sector.industries.all()
+        if not industries.exists():
+            raise serializers.ValidationError({'company_sector_id': 'Для выбранного сектора не найдена индустрия.'})
+        if industries.count() > 1:
+            raise serializers.ValidationError({'company_sector_id': 'Для выбранного сектора найдено несколько индустрий. Уточните данные.'})
+
+        industry = industries.first()
 
         # Проверка тарифа
         try:
@@ -136,7 +137,7 @@ class OwnerRegisterSerializer(serializers.ModelSerializer):
         user.company = company
         user.save()
 
-        # Создание отделов и касс, если отрасль строительная
+        # Создание отделов и касс, если индустрия строительная
         if industry.name.lower() == "строительная компания":
             default_departments = [
                 "Строительный отдел",
