@@ -1,13 +1,16 @@
 from django.db import models
 import uuid
 from apps.users.models import Company, User
+
+
 class Department(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     name = models.CharField(max_length=255, verbose_name='Название отдела')
-    company = models.ForeignKey(Company, on_delete=models.CASCADE, related_name='departments', verbose_name='Компания')
-    manager = models.ForeignKey(
-        User, on_delete=models.SET_NULL, null=True, blank=True,
-        related_name='managed_departments', verbose_name='Ответственный сотрудник'
+    company = models.ForeignKey(
+        Company,
+        on_delete=models.CASCADE,
+        related_name='departments',
+        verbose_name='Компания'
     )
     employees = models.ManyToManyField(
         User,
@@ -24,11 +27,8 @@ class Department(models.Model):
         if hasattr(self, 'cashbox'):
             return self.cashbox.get_summary()
         return {
-            'income_total': 0,
-            'expense_total': 0,
-            'income_count': 0,
-            'expense_count': 0,
-            'balance': 0
+            'income': {'total': 0, 'count': 0},
+            'expense': {'total': 0, 'count': 0}
         }
 
     class Meta:
@@ -36,31 +36,34 @@ class Department(models.Model):
         verbose_name_plural = 'Отделы'
 
 
-
 class Cashbox(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    department = models.OneToOneField(Department, on_delete=models.CASCADE, related_name='cashbox')
-    balance = models.DecimalField(max_digits=12, decimal_places=2, default=0)
+    department = models.OneToOneField(
+        Department,
+        on_delete=models.CASCADE,
+        related_name='cashbox'
+    )
 
     def __str__(self):
         return f"Касса {self.department.name}"
 
     def get_summary(self):
-        """Аналитика по кассе"""
+        """Аналитика по кассе (без баланса)"""
         income = self.flows.filter(type='income')
         expense = self.flows.filter(type='expense')
 
         income_total = income.aggregate(total=models.Sum('amount'))['total'] or 0
         expense_total = expense.aggregate(total=models.Sum('amount'))['total'] or 0
-        income_count = income.count()
-        expense_count = expense.count()
 
         return {
-            'income_total': income_total,
-            'expense_total': expense_total,
-            'income_count': income_count,
-            'expense_count': expense_count,
-            'balance': self.balance
+            'income': {
+                'total': income_total,
+                'count': income.count()
+            },
+            'expense': {
+                'total': expense_total,
+                'count': expense.count()
+            }
         }
 
     class Meta:
@@ -75,7 +78,11 @@ class CashFlow(models.Model):
     ]
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    cashbox = models.ForeignKey(Cashbox, on_delete=models.CASCADE, related_name='flows')
+    cashbox = models.ForeignKey(
+        Cashbox,
+        on_delete=models.CASCADE,
+        related_name='flows'
+    )
     type = models.CharField(max_length=10, choices=TYPE_CHOICES, verbose_name='Тип')
     name = models.CharField(max_length=255, verbose_name='Наименование')
     amount = models.DecimalField(max_digits=12, decimal_places=2, verbose_name='Сумма')

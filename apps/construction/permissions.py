@@ -1,12 +1,16 @@
 from rest_framework.permissions import BasePermission
-from apps.construction.models import Department, Cashbox
+from apps.construction.models import Department, Cashbox, CashFlow
 
-class IsOwnerOrAdminOrDepartmentManager(BasePermission):
+class IsOwnerOrAdminOrDepartmentEmployee(BasePermission):
     def has_object_permission(self, request, view, obj):
         user = request.user
 
-        # Админ
+        # Суперпользователь
         if user.is_superuser:
+            return True
+
+        # Пользователь с ролью "admin"
+        if getattr(user, 'role', None) == 'admin':
             return True
 
         # Владелец компании
@@ -15,11 +19,16 @@ class IsOwnerOrAdminOrDepartmentManager(BasePermission):
                 return obj.company == user.owned_company
             if isinstance(obj, Cashbox):
                 return obj.department.company == user.owned_company
+            if isinstance(obj, CashFlow):
+                return obj.cashbox.department.company == user.owned_company
 
-        # Менеджер
+        # Сотрудник отдела
         if isinstance(obj, Department):
-            return obj.manager == user
+            return user in obj.employees.all()
         if isinstance(obj, Cashbox):
-            return obj.department.manager == user
+            return user in obj.department.employees.all()
+        if isinstance(obj, CashFlow):
+            return user in obj.cashbox.department.employees.all()
 
         return False
+

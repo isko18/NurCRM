@@ -3,10 +3,10 @@ from apps.construction.models import Department, Cashbox, CashFlow
 
 @admin.register(Department)
 class DepartmentAdmin(admin.ModelAdmin):
-    list_display = ('name', 'company', 'manager', 'employee_count', 'created_at')
+    list_display = ('name', 'company', 'employee_count', 'created_at')
     list_filter = ('company',)
-    search_fields = ('name', 'company__name', 'manager__email')
-    filter_horizontal = ('employees',)  # Удобный виджет для выбора сотрудников в админке
+    search_fields = ('name', 'company__name')
+    filter_horizontal = ('employees',)
 
     def employee_count(self, obj):
         return obj.employees.count()
@@ -15,7 +15,7 @@ class DepartmentAdmin(admin.ModelAdmin):
 
 @admin.register(Cashbox)
 class CashboxAdmin(admin.ModelAdmin):
-    list_display = ('department', 'balance')
+    list_display = ('department',)
     list_filter = ('department__company',)
     search_fields = ('department__name',)
 
