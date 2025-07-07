@@ -59,7 +59,8 @@ class UserSerializer(serializers.ModelSerializer):
             instance.set_password(password)
         instance.save()
         return instance
-
+    
+    
 class OwnerRegisterSerializer(serializers.ModelSerializer):
     email = serializers.EmailField(
         required=True,
@@ -69,7 +70,8 @@ class OwnerRegisterSerializer(serializers.ModelSerializer):
     password2 = serializers.CharField(write_only=True, style={'input_type': 'password'})
     company_name = serializers.CharField(write_only=True, required=True)
     company_industry_id = serializers.UUIDField(write_only=True, required=True)
-    subscription_plan_id = serializers.UUIDField(write_only=True, required=True)  # Добавляем поле для тарифа
+    company_sector_id = serializers.UUIDField(write_only=True, required=True)  # ✅ добавляем поле сектора
+    subscription_plan_id = serializers.UUIDField(write_only=True, required=True)
 
     class Meta:
         model = User
@@ -77,11 +79,10 @@ class OwnerRegisterSerializer(serializers.ModelSerializer):
             'email', 'password', 'password2',
             'first_name', 'last_name',
             'avatar',
-            'company_name', 'company_industry_id', 'subscription_plan_id'
+            'company_name', 'company_industry_id', 'company_sector_id', 'subscription_plan_id'
         ]
 
     def validate(self, data):
-        # Проверка на совпадение паролей
         if data['password'] != data['password2']:
             raise serializers.ValidationError({"password2": "Пароли не совпадают."})
         return data
@@ -89,20 +90,29 @@ class OwnerRegisterSerializer(serializers.ModelSerializer):
     def create(self, validated_data):
         company_name = validated_data.pop('company_name')
         company_industry_id = validated_data.pop('company_industry_id')
+        company_sector_id = validated_data.pop('company_sector_id')
         subscription_plan_id = validated_data.pop('subscription_plan_id')
         validated_data.pop('password2')
 
+        # Проверка отрасли
         try:
             industry = Industry.objects.get(id=company_industry_id)
         except Industry.DoesNotExist:
             raise serializers.ValidationError({'company_industry_id': 'Выбранная отрасль не найдена.'})
 
+        # Проверка сектора
+        try:
+            sector = Sector.objects.get(id=company_sector_id)
+        except Sector.DoesNotExist:
+            raise serializers.ValidationError({'company_sector_id': 'Выбранный сектор не найден.'})
+
+        # Проверка тарифа
         try:
             subscription_plan = SubscriptionPlan.objects.get(id=subscription_plan_id)
         except SubscriptionPlan.DoesNotExist:
             raise serializers.ValidationError({'subscription_plan_id': 'Выбранный тариф не найден.'})
 
-        # Создаем владельца
+        # Создание пользователя
         user = User.objects.create(
             email=validated_data['email'],
             first_name=validated_data['first_name'],
@@ -114,10 +124,11 @@ class OwnerRegisterSerializer(serializers.ModelSerializer):
         user.set_password(validated_data['password'])
         user.save()
 
-        # Создаем компанию
+        # Создание компании
         company = Company.objects.create(
             name=company_name,
             industry=industry,
+            sector=sector,
             subscription_plan=subscription_plan,
             owner=user
         )
@@ -125,7 +136,7 @@ class OwnerRegisterSerializer(serializers.ModelSerializer):
         user.company = company
         user.save()
 
-        # ✅ Автоматически создаем отделы и кассы, если отрасль — Строительная компания
+        # Создание отделов и касс, если отрасль строительная
         if industry.name.lower() == "строительная компания":
             default_departments = [
                 "Строительный отдел",
@@ -138,6 +149,7 @@ class OwnerRegisterSerializer(serializers.ModelSerializer):
                 Cashbox.objects.create(department=dept)
 
         return user
+
 
 # 📝 Создание сотрудника с авто-генерацией пароля + отправкой email
 class EmployeeCreateSerializer(serializers.ModelSerializer):
