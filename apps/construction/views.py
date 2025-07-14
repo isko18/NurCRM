@@ -16,24 +16,45 @@ from apps.construction.serializers import (
 from apps.construction.permissions import IsOwnerOrAdminOrDepartmentEmployee
 
 
-# ===== DEPARTMENTS =====
+# ─────────────────────────────────────────────────────────────────────────────
+# ВСПОМОГАТЕЛЬНАЯ МЕТОДИКА
+# ─────────────────────────────────────────────────────────────────────────────
+def _get_company(user):
+    """
+    Возвращает компанию, с которой сейчас работает пользователь:
+    • у superuser – любую (None, если не нужна);  
+    • у владельца – owned_company;  
+    • у обычного – company.
+    """
+    if user.is_superuser:
+        return None
+    return user.owned_company if hasattr(user, "owned_company") else user.company
+
+
+# ===== DEPARTMENTS ==========================================================
 class DepartmentListCreateView(generics.ListCreateAPIView):
     serializer_class = DepartmentSerializer
     permission_classes = [IsAuthenticated]
 
+    # GET
     def get_queryset(self):
         user = self.request.user
-        if user.is_superuser or hasattr(user, 'owned_company'):
-            company = user.owned_company if hasattr(user, 'owned_company') else user.company
+        company = _get_company(user)
+
+        # superuser – все отделы; в остальных случаях – по компании или сотруднику
+        if user.is_superuser:
+            return Department.objects.all()
+        if hasattr(user, "owned_company"):
             return Department.objects.filter(company=company)
         return Department.objects.filter(employees=user)
 
+    # POST
     def perform_create(self, serializer):
         user = self.request.user
-        if user.is_superuser:
+        # company теперь ставит сам сериализатор,
+        # поэтому проверяем только право создавать
+        if user.is_superuser or hasattr(user, "owned_company"):
             serializer.save()
-        elif hasattr(user, 'owned_company'):
-            serializer.save(company=user.owned_company)
         else:
             raise PermissionDenied("У вас нет прав создавать отделы.")
 
@@ -44,17 +65,20 @@ class DepartmentDetailView(generics.RetrieveUpdateDestroyAPIView):
     permission_classes = [IsOwnerOrAdminOrDepartmentEmployee]
 
 
-# ===== DEPARTMENT ANALYTICS =====
+# ===== DEPARTMENT ANALYTICS =================================================
 class DepartmentAnalyticsListView(generics.ListAPIView):
     serializer_class = DepartmentAnalyticsSerializer
     permission_classes = [IsAuthenticated]
 
     def get_queryset(self):
         user = self.request.user
-        if user.is_superuser or hasattr(user, 'owned_company'):
-            company = user.owned_company if hasattr(user, 'owned_company') else user.company
+        company = _get_company(user)
+
+        if user.is_superuser:
+            return Department.objects.all()
+        if company:
             return Department.objects.filter(company=company)
-        return Department.objects.filter(employees=user)
+        return Department.objects.none()  # не владелец и не superuser
 
 
 class DepartmentAnalyticsDetailView(generics.RetrieveAPIView):
@@ -63,15 +87,18 @@ class DepartmentAnalyticsDetailView(generics.RetrieveAPIView):
     permission_classes = [IsOwnerOrAdminOrDepartmentEmployee]
 
 
-# ===== CASHBOXES =====
+# ===== CASHBOXES ============================================================
 class CashboxListView(generics.ListAPIView):
     serializer_class = CashboxSerializer
     permission_classes = [IsAuthenticated]
 
     def get_queryset(self):
         user = self.request.user
-        if user.is_superuser or hasattr(user, 'owned_company'):
-            company = user.owned_company if hasattr(user, 'owned_company') else user.company
+        company = _get_company(user)
+
+        if user.is_superuser:
+            return Cashbox.objects.all()
+        if hasattr(user, "owned_company"):
             return Cashbox.objects.filter(department__company=company)
         return Cashbox.objects.filter(department__employees=user)
 
@@ -82,25 +109,28 @@ class CashboxDetailView(generics.RetrieveAPIView):
     permission_classes = [IsOwnerOrAdminOrDepartmentEmployee]
 
 
-# ===== CASHFLOWS =====
+# ===== CASHFLOWS ============================================================
 class CashFlowListCreateView(generics.ListCreateAPIView):
     serializer_class = CashFlowSerializer
     permission_classes = [IsAuthenticated]
 
     def get_queryset(self):
         user = self.request.user
-        if user.is_superuser or hasattr(user, 'owned_company'):
-            company = user.owned_company if hasattr(user, 'owned_company') else user.company
+        company = _get_company(user)
+
+        if user.is_superuser:
+            return CashFlow.objects.all()
+        if hasattr(user, "owned_company"):
             return CashFlow.objects.filter(cashbox__department__company=company)
         return CashFlow.objects.filter(cashbox__department__employees=user)
 
     def perform_create(self, serializer):
         user = self.request.user
-        cashbox = serializer.validated_data.get('cashbox')
+        cashbox = serializer.validated_data.get("cashbox")
 
         if user.is_superuser:
             serializer.save()
-        elif hasattr(user, 'owned_company') and cashbox.department.company == user.owned_company:
+        elif hasattr(user, "owned_company") and cashbox.department.company == user.owned_company:
             serializer.save()
         elif user in cashbox.department.employees.all():
             serializer.save()
@@ -114,21 +144,17 @@ class CashFlowDetailView(generics.RetrieveAPIView):
     permission_classes = [IsOwnerOrAdminOrDepartmentEmployee]
 
 
-# ===== ASSIGN EMPLOYEE TO DEPARTMENT =====
+# ===== ASSIGN / REMOVE EMPLOYEE =============================================
 class AssignEmployeeToDepartmentView(APIView):
     permission_classes = [IsAuthenticated]
 
     def post(self, request, department_id):
         user = request.user
         employee_id = request.data.get("employee_id")
-
         department = get_object_or_404(Department, id=department_id)
 
-        # Проверка доступа: superuser или владелец компании
-        if not (
-            user.is_superuser or
-            (hasattr(user, "owned_company") and department.company == user.owned_company)
-        ):
+        # доступ: суперпользователь или владелец
+        if not (user.is_superuser or (hasattr(user, "owned_company") and department.company == user.owned_company)):
             return Response({"detail": "Недостаточно прав для изменения сотрудников отдела."}, status=403)
 
         try:
@@ -140,38 +166,15 @@ class AssignEmployeeToDepartmentView(APIView):
         return Response({"detail": "Сотрудник успешно добавлен в отдел."}, status=200)
 
 
-class CompanyDepartmentAnalyticsView(generics.ListAPIView):
-    """
-    Только для владельцев компании и суперпользователей.
-    Возвращает список всех отделов компании с их аналитикой.
-    """
-    serializer_class = DepartmentAnalyticsSerializer
-    permission_classes = [IsAuthenticated]
-
-    def get_queryset(self):
-        user = self.request.user
-
-        if user.is_superuser or hasattr(user, 'owned_company'):
-            company = user.owned_company if hasattr(user, 'owned_company') else user.company
-            return Department.objects.filter(company=company)
-
-        raise PermissionDenied("Вы не являетесь владельцем компании или администратором.")
-    
-    
 class RemoveEmployeeFromDepartmentView(APIView):
     permission_classes = [IsAuthenticated]
 
     def post(self, request, department_id):
         user = request.user
         employee_id = request.data.get("employee_id")
-
         department = get_object_or_404(Department, id=department_id)
 
-        # ✅ Доступ разрешён владельцу компании или суперпользователю
-        if not (
-            user.is_superuser or
-            (hasattr(user, "owned_company") and department.company == user.owned_company)
-        ):
+        if not (user.is_superuser or (hasattr(user, "owned_company") and department.company == user.owned_company)):
             return Response({"detail": "Недостаточно прав для удаления сотрудников из отдела."}, status=403)
 
         try:
@@ -184,3 +187,24 @@ class RemoveEmployeeFromDepartmentView(APIView):
 
         department.employees.remove(employee)
         return Response({"detail": "Сотрудник успешно удалён из отдела."}, status=200)
+
+
+# ===== COMPANY-WIDE ANALYTICS ===============================================
+class CompanyDepartmentAnalyticsView(generics.ListAPIView):
+    """
+    Для владельцев компании и суперпользователей —
+    список всех отделов их компании с аналитикой.
+    """
+    serializer_class = DepartmentAnalyticsSerializer
+    permission_classes = [IsAuthenticated]
+
+    def get_queryset(self):
+        user = self.request.user
+        company = _get_company(user)
+
+        if user.is_superuser:
+            return Department.objects.all()
+        if company:
+            return Department.objects.filter(company=company)
+
+        raise PermissionDenied("Вы не являетесь владельцем компании или администратором.")
