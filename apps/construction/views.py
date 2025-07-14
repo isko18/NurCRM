@@ -243,3 +243,21 @@ class CashboxOwnerDetailView(generics.ListAPIView):
             return Cashbox.objects.filter(department__company=user.owned_company)
 
         raise PermissionDenied("Только владельцы компании или администраторы могут просматривать кассы.")
+    
+    
+class CashboxOwnerDetailSingleView(generics.RetrieveAPIView):
+    queryset = Cashbox.objects.all()
+    serializer_class = CashboxWithFlowsSerializer
+    permission_classes = [IsAuthenticated]
+
+    def get_object(self):
+        user = self.request.user
+        cashbox = super().get_object()
+
+        if user.is_superuser:
+            return cashbox
+
+        if hasattr(user, 'owned_company') and cashbox.department.company == user.owned_company:
+            return cashbox
+
+        raise PermissionDenied("Нет доступа к этой кассе.")
