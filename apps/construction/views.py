@@ -12,6 +12,7 @@ from apps.construction.serializers import (
     CashboxSerializer,
     CashFlowSerializer,
     DepartmentAnalyticsSerializer,
+    CashboxWithFlowsSerializer
 )
 from apps.construction.permissions import IsOwnerOrAdminOrDepartmentEmployee
 
@@ -226,3 +227,19 @@ class CompanyDepartmentAnalyticsView(generics.ListAPIView):
             return Department.objects.filter(company=company)
 
         raise PermissionDenied("Вы не являетесь владельцем компании или администратором.")
+
+
+class CashboxOwnerDetailView(generics.ListAPIView):
+    serializer_class = CashboxWithFlowsSerializer
+    permission_classes = [IsAuthenticated]
+
+    def get_queryset(self):
+        user = self.request.user
+
+        if user.is_superuser:
+            return Cashbox.objects.all()
+
+        if hasattr(user, "owned_company"):
+            return Cashbox.objects.filter(department__company=user.owned_company)
+
+        raise PermissionDenied("Только владельцы компании или администраторы могут просматривать кассы.")
