@@ -162,7 +162,11 @@ class CashFlowDetailView(generics.RetrieveDestroyAPIView):
 
 # ===== ASSIGN / REMOVE EMPLOYEE =============================================
 class AssignEmployeeToDepartmentView(APIView):
-    """Добавить сотрудника в отдел (только владелец компании или суперпользователь)."""
+    """
+    Добавить сотрудника в отдел.
+    Только суперпользователь или владелец компании может добавить,
+    при этом пользователь может быть только в одном отделе.
+    """
     permission_classes = [IsAuthenticated]
 
     def post(self, request, department_id):
@@ -170,7 +174,7 @@ class AssignEmployeeToDepartmentView(APIView):
         employee_id = request.data.get("employee_id")
         department = get_object_or_404(Department, id=department_id)
 
-        # проверка прав
+        # Проверка прав доступа
         if not (
             user.is_superuser or
             (hasattr(user, "owned_company") and department.company == user.owned_company)
@@ -179,10 +183,16 @@ class AssignEmployeeToDepartmentView(APIView):
 
         employee = get_object_or_404(User, id=employee_id)
 
-        # ⛔ сотрудник должен принадлежать той же компании
+        # ⛔ Проверка принадлежности к той же компании
         if employee.company != department.company:
             return Response({"detail": "Нельзя добавить сотрудника из другой компании."}, status=400)
 
+        # ⛔ Проверка: состоит ли уже в другом отделе
+        existing_departments = employee.departments.exclude(id=department.id)
+        if existing_departments.exists() and not user.is_superuser and not hasattr(user, "owned_company"):
+            return Response({"detail": "Пользователь уже прикреплён к другому отделу."}, status=400)
+
+        # ✅ Добавляем
         department.employees.add(employee)
         return Response({"detail": "Сотрудник успешно добавлен в отдел."}, status=200)
 
