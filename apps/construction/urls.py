@@ -11,7 +11,8 @@ from apps.construction.views import (
     AssignEmployeeToDepartmentView,
     RemoveEmployeeFromDepartmentView,
     CompanyDepartmentAnalyticsView,
-    CashboxOwnerDetailView
+    CashboxOwnerDetailView, 
+    CashboxOwnerDetailSingleView
 )
 
 urlpatterns = [
@@ -32,6 +33,7 @@ urlpatterns = [
     # CASHFLOWS
     path('cashflows/', CashFlowListCreateView.as_view(), name='cashflow-list-create'),
     path('cashflows/<uuid:pk>/', CashFlowDetailView.as_view(), name='cashflow-detail'),
-    path('cashboxes/detail/owner/', CashboxOwnerDetailView.as_view(), name='cashbox-owner-detail'),
+    path('cashboxes/detail/owner/', CashboxOwnerDetailView.as_view(), name='owner-cashboxes'),
+    path('cashboxes/<uuid:pk>/detail/owner/', CashboxOwnerDetailSingleView.as_view(), name='owner-cashbox-detail'),
 
 ]
