@@ -80,9 +80,14 @@ class DepartmentAnalyticsListView(generics.ListAPIView):
 
         if user.is_superuser:
             return Department.objects.all()
-        if company:
+
+        # владелец компании → все отделы своей компании
+        if company and hasattr(user, "owned_company"):
             return Department.objects.filter(company=company)
-        return Department.objects.none()  # не владелец и не superuser
+
+        # менеджер (или любой рядовой сотрудник) → только свой отдел
+        return Department.objects.filter(employees=user)
+
 
 
 class DepartmentAnalyticsDetailView(generics.RetrieveAPIView):
