@@ -14,8 +14,8 @@ class CashboxSerializer(serializers.ModelSerializer):
     def get_analytics(self, obj):
         return obj.get_summary()
 
-
 class DepartmentSerializer(serializers.ModelSerializer):
+    company = serializers.ReadOnlyField(source='company.id')  # ⬅️ company – только для чтения
     cashbox = CashboxSerializer(read_only=True)
     employees = UserListSerializer(many=True, read_only=True)
     employee_ids = serializers.ListField(
@@ -38,9 +38,12 @@ class DepartmentSerializer(serializers.ModelSerializer):
             'analytics',
             'created_at'
         ]
-        read_only_fields = ['id', 'created_at', 'cashbox', 'employees', 'analytics']
+        read_only_fields = ['id', 'created_at', 'company', 'cashbox', 'employees', 'analytics']
 
     def create(self, validated_data):
+        request = self.context.get('request')
+        validated_data['company'] = request.user.company  # ⬅️ автоматическое определение компании
+
         employee_ids = validated_data.pop('employee_ids', [])
         department = Department.objects.create(**validated_data)
 
@@ -50,6 +53,8 @@ class DepartmentSerializer(serializers.ModelSerializer):
         return department
 
     def update(self, instance, validated_data):
+        validated_data.pop('company', None)  # ⬅️ не даём изменить company
+
         employee_ids = validated_data.pop('employee_ids', None)
 
         for attr, value in validated_data.items():
@@ -64,6 +69,7 @@ class DepartmentSerializer(serializers.ModelSerializer):
 
     def get_analytics(self, obj):
         return obj.cashflow_summary()
+
 
 
 class CashFlowSerializer(serializers.ModelSerializer):
