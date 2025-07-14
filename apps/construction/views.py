@@ -107,7 +107,7 @@ class CashboxListView(generics.ListAPIView):
         return Cashbox.objects.filter(department__employees=user)
 
 
-class CashboxDetailView(generics.RetrieveAPIView):
+class CashboxDetailView(generics.RetrieveDestroyAPIView):
     queryset = Cashbox.objects.all()
     serializer_class = CashboxSerializer
     permission_classes = [IsOwnerOrAdminOrDepartmentEmployee]
