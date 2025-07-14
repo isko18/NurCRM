@@ -97,3 +97,17 @@ class DepartmentAnalyticsSerializer(serializers.ModelSerializer):
 
     def get_analytics(self, obj):
         return obj.cashflow_summary()
+
+
+class CashFlowInsideCashboxSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = CashFlow
+        fields = ['id', 'type', 'name', 'amount', 'created_at']
+
+class CashboxWithFlowsSerializer(serializers.ModelSerializer):
+    department_name = serializers.CharField(source='department.name', read_only=True)
+    cashflows = CashFlowInsideCashboxSerializer(source='flows', many=True, read_only=True)
+
+    class Meta:
+        model = Cashbox
+        fields = ['id', 'department', 'department_name', 'cashflows']
