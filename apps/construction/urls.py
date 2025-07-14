@@ -30,6 +30,7 @@ urlpatterns = [
     path('cashboxes/<uuid:pk>/', CashboxDetailView.as_view(), name='cashbox-detail'),
 
     # CASHFLOWS
-    path('cashboxes/<uuid:cashbox_id>/cashflows/', CashFlowListCreateView.as_view(), name='cashflow-list-create'),
+    path('cashflows/', CashFlowListCreateView.as_view(), name='cashflow-list-create'),
     path('cashflows/<uuid:pk>/', CashFlowDetailView.as_view(), name='cashflow-detail'),
+
 ]

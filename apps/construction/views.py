@@ -120,33 +120,36 @@ class CashFlowListCreateView(generics.ListCreateAPIView):
     def get_queryset(self):
         user = self.request.user
         company = _get_company(user)
-        cashbox_id = self.kwargs.get('cashbox_id')
-
-        queryset = CashFlow.objects.filter(cashbox__id=cashbox_id)
 
         if user.is_superuser:
-            return queryset
+            return CashFlow.objects.all()
         if company:
-            return queryset.filter(cashbox__department__company=company)
-        return queryset.filter(cashbox__department__employees=user)
+            return CashFlow.objects.filter(cashbox__department__company=company)
+        return CashFlow.objects.filter(cashbox__department__employees=user)
 
     def perform_create(self, serializer):
         user = self.request.user
-        cashbox_id = self.kwargs.get('cashbox_id')
-        cashbox = get_object_or_404(Cashbox, id=cashbox_id)
 
-        # проверка доступа
-        if user.is_superuser:
-            pass
-        elif hasattr(user, "owned_company") and cashbox.department.company == user.owned_company:
-            pass
-        elif user in cashbox.department.employees.all():
-            pass
-        else:
+        # Получаем отдел, к которому привязан пользователь
+        department = user.departments.first()
+        if not department:
+            raise PermissionDenied("Пользователь не прикреплён ни к одному отделу.")
+
+        try:
+            cashbox = department.cashbox
+        except Cashbox.DoesNotExist:
+            raise PermissionDenied("У отдела нет кассы.")
+
+        # Проверка прав
+        if not (
+            user.is_superuser or
+            (hasattr(user, "owned_company") and department.company == user.owned_company) or
+            (user in department.employees.all())
+        ):
             raise PermissionDenied("У вас нет прав добавлять приход/расход в эту кассу.")
 
+        # Сохраняем с подставленной кассой
         serializer.save(cashbox=cashbox)
-
 
 class CashFlowDetailView(generics.RetrieveAPIView):
     queryset = CashFlow.objects.all()
