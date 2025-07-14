@@ -4,20 +4,30 @@ from apps.users.models import User, Company
 
 
 class ProductCategorySerializer(serializers.ModelSerializer):
-    parent = serializers.PrimaryKeyRelatedField(queryset=ProductCategory.objects.all(), allow_null=True)
+    parent = serializers.PrimaryKeyRelatedField(
+        queryset=ProductCategory.objects.all(),
+        allow_null=True,
+        required=False  
+    )
 
     class Meta:
         model = ProductCategory
         fields = ['id', 'name', 'parent']
         read_only_fields = ['id']
+
         
 class ProductBrandSerializer(serializers.ModelSerializer):
-    parent = serializers.PrimaryKeyRelatedField(queryset=ProductBrand.objects.all(), allow_null=True)
+    parent = serializers.PrimaryKeyRelatedField(
+        queryset=ProductBrand.objects.all(),
+        allow_null=True,
+        required=False  
+    )
 
     class Meta:
         model = ProductBrand
         fields = ['id', 'name', 'parent']
         read_only_fields = ['id']
+
         
 class ContactSerializer(serializers.ModelSerializer):
     owner = serializers.ReadOnlyField(source='owner.id')
