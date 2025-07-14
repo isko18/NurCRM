@@ -70,6 +70,7 @@ class DepartmentSerializer(serializers.ModelSerializer):
             'id',
             'name',
             'company',
+            'color',  
             'employees',
             'employee_ids',
             'cashbox',

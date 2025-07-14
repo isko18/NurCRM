@@ -1,6 +1,7 @@
 from django.db import models
 import uuid
 from apps.users.models import Company, User
+import random 
 
 
 class Department(models.Model):
@@ -18,6 +19,13 @@ class Department(models.Model):
         related_name='departments',
         verbose_name='Сотрудники отдела'
     )
+    color = models.CharField(
+        max_length=7,
+        blank=True,
+        null=True,
+        default='',
+        verbose_name='Цвет отдела (RGB)'
+    )
     created_at = models.DateTimeField(auto_now_add=True)
 
     def __str__(self):
@@ -31,9 +39,18 @@ class Department(models.Model):
             'expense': {'total': 0, 'count': 0}
         }
 
+    def save(self, *args, **kwargs):
+        if not self.color:
+            self.color = self._generate_random_color()
+        super().save(*args, **kwargs)
+
+    def _generate_random_color(self):
+        return "#{:06x}".format(random.randint(0, 0xFFFFFF)).upper()
+
     class Meta:
         verbose_name = 'Отдел'
         verbose_name_plural = 'Отделы'
+
 
 
 class Cashbox(models.Model):

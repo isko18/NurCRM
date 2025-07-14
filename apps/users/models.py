@@ -2,7 +2,6 @@ from django.db import models
 from django.contrib.auth.models import AbstractBaseUser, PermissionsMixin
 import uuid
 from apps.users.managers import UserManager
-import random
 
 class Feature(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False, verbose_name='ID')
@@ -106,22 +105,22 @@ class Company(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     name = models.CharField(max_length=255, verbose_name='Название компании')
     subscription_plan = models.ForeignKey(SubscriptionPlan, on_delete=models.SET_NULL, null=True, blank=True)
-    industry = models.ForeignKey(Industry, on_delete=models.SET_NULL, null=True, blank=True, verbose_name='Вид деятельности')
-    sector = models.ForeignKey(Sector, on_delete=models.SET_NULL, null=True, blank=True, verbose_name='Отрасль')
+    industry = models.ForeignKey(
+        Industry,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        verbose_name='Вид деятельности'
+    )
+    sector = models.ForeignKey(
+        Sector,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        verbose_name='Отрасль'
+    )
     owner = models.OneToOneField(User, on_delete=models.CASCADE, related_name='owned_company', verbose_name='Владелец компании')
     created_at = models.DateTimeField(auto_now_add=True, verbose_name='Дата создания')
-
-    # 🎨 Новое поле для цвета
-    color = models.CharField(max_length=7, default='', blank=True, null= True, verbose_name='Цвет компании (RGB)')
-
-    def save(self, *args, **kwargs):
-        if not self.color:
-            self.color = self._generate_random_color()
-        super().save(*args, **kwargs)
-
-    def _generate_random_color(self):
-        """Генерирует случайный HEX-цвет, например: #A1B2C3"""
-        return "#{:06x}".format(random.randint(0, 0xFFFFFF)).upper()
 
     def __str__(self):
         return self.name
