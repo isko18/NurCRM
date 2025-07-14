@@ -78,7 +78,7 @@ class CashFlowSerializer(serializers.ModelSerializer):
         model = CashFlow
         fields = [
             'id',
-            'cashbox',          # отображается, но не передаётся
+            'cashbox',           # read-only (автоопределяется)
             'cashbox_name',
             'type',
             'name',
@@ -86,7 +86,8 @@ class CashFlowSerializer(serializers.ModelSerializer):
             'created_at'
         ]
         read_only_fields = ['id', 'created_at', 'cashbox', 'cashbox_name']
-
+        
+        
 class DepartmentAnalyticsSerializer(serializers.ModelSerializer):
     analytics = serializers.SerializerMethodField()
 
