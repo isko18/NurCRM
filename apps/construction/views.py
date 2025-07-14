@@ -120,25 +120,32 @@ class CashFlowListCreateView(generics.ListCreateAPIView):
     def get_queryset(self):
         user = self.request.user
         company = _get_company(user)
+        cashbox_id = self.kwargs.get('cashbox_id')
+
+        queryset = CashFlow.objects.filter(cashbox__id=cashbox_id)
 
         if user.is_superuser:
-            return CashFlow.objects.all()
+            return queryset
         if company:
-            return CashFlow.objects.filter(cashbox__department__company=company)
-        return CashFlow.objects.filter(cashbox__department__employees=user)
+            return queryset.filter(cashbox__department__company=company)
+        return queryset.filter(cashbox__department__employees=user)
 
     def perform_create(self, serializer):
         user = self.request.user
-        cashbox = serializer.validated_data.get("cashbox")
+        cashbox_id = self.kwargs.get('cashbox_id')
+        cashbox = get_object_or_404(Cashbox, id=cashbox_id)
 
+        # проверка доступа
         if user.is_superuser:
-            serializer.save()
+            pass
         elif hasattr(user, "owned_company") and cashbox.department.company == user.owned_company:
-            serializer.save()
+            pass
         elif user in cashbox.department.employees.all():
-            serializer.save()
+            pass
         else:
             raise PermissionDenied("У вас нет прав добавлять приход/расход в эту кассу.")
+
+        serializer.save(cashbox=cashbox)
 
 
 class CashFlowDetailView(generics.RetrieveAPIView):
