@@ -37,27 +37,24 @@ class DepartmentListCreateView(generics.ListCreateAPIView):
     serializer_class = DepartmentSerializer
     permission_classes = [IsAuthenticated]
 
-    # --- GET ---------------------------------------------------------------
     def get_queryset(self):
         user = self.request.user
-        company = _get_company(user)
 
         if user.is_superuser:
             return Department.objects.all()
-        if company:
-            return Department.objects.filter(company=company)
-        # обычный сотрудник — только свои отделы
+
+        if hasattr(user, "owned_company"):
+            return Department.objects.filter(company=user.owned_company)
+
+        # Менеджер или сотрудник — только свои отделы
         return Department.objects.filter(employees=user)
 
-    # --- POST --------------------------------------------------------------
     def perform_create(self, serializer):
         user = self.request.user
 
-        # право создавать отделы: суперпользователь или владелец
         if user.is_superuser:
             serializer.save()
         elif hasattr(user, "owned_company"):
-            # явно передаём company, чтобы гарантированно записалась owned_company
             serializer.save(company=user.owned_company)
         else:
             raise PermissionDenied("У вас нет прав создавать отделы.")
