@@ -151,7 +151,7 @@ class CashFlowListCreateView(generics.ListCreateAPIView):
         # Сохраняем с подставленной кассой
         serializer.save(cashbox=cashbox)
 
-class CashFlowDetailView(generics.RetrieveAPIView):
+class CashFlowDetailView(generics.RetrieveDestroyAPIView):
     queryset = CashFlow.objects.all()
     serializer_class = CashFlowSerializer
     permission_classes = [IsOwnerOrAdminOrDepartmentEmployee]
