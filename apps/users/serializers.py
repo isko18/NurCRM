@@ -265,5 +265,4 @@ class CompanySerializer(serializers.ModelSerializer):
             'subscription_plan',
             'owner',
             'created_at',
-            'color',
         ]
