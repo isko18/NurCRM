@@ -81,6 +81,15 @@ class User(AbstractBaseUser, PermissionsMixin):
         verbose_name='Роль сотрудника'
     )
 
+    # 📌 Новые поля доступа
+    can_view_dashboard = models.BooleanField(default=False, blank=True, null=True, verbose_name='Доступ к обзору')
+    can_view_cashbox = models.BooleanField(default=False, blank=True, null=True, verbose_name='Доступ к кассе')
+    can_view_departments = models.BooleanField(default=False, blank=True, null=True, verbose_name='Доступ к отделам')
+    can_view_orders = models.BooleanField(default=False, blank=True, null=True, verbose_name='Доступ к заказам')
+    can_view_analytics = models.BooleanField(default=False, blank=True, null=True, verbose_name='Доступ к аналитике')
+    can_view_products = models.BooleanField(default=False, blank=True, null=True, verbose_name='Доступ к товарам')
+    can_view_booking = models.BooleanField(default=False, blank=True, null=True, verbose_name='Доступ к бронированию')
+
     created_at = models.DateTimeField(auto_now_add=True, verbose_name='Дата создания')
     updated_at = models.DateTimeField(auto_now=True, verbose_name='Дата обновления')
 
@@ -98,7 +107,6 @@ class User(AbstractBaseUser, PermissionsMixin):
 
     def __str__(self):
         return self.email
-
 
 # Модель Company (компания)
 class Company(models.Model):
