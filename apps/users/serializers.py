@@ -23,8 +23,6 @@ class CustomTokenObtainPairSerializer(TokenObtainPairSerializer):
             'role': self.user.role
         })
         return data
-
-# 👤 Полный сериализатор пользователя
 class UserSerializer(serializers.ModelSerializer):
     password = serializers.CharField(write_only=True, required=False, min_length=8, style={'input_type': 'password'})
 
@@ -35,6 +33,8 @@ class UserSerializer(serializers.ModelSerializer):
             'first_name', 'last_name',
             'avatar',
             'company', 'role',
+            'can_view_dashboard', 'can_view_cashbox', 'can_view_departments',
+            'can_view_orders', 'can_view_analytics', 'can_view_products', 'can_view_booking',
             'created_at', 'updated_at',
         ]
         read_only_fields = ['id', 'created_at', 'updated_at', 'company']
@@ -59,7 +59,7 @@ class UserSerializer(serializers.ModelSerializer):
             instance.set_password(password)
         instance.save()
         return instance
-    
+
     
 class OwnerRegisterSerializer(serializers.ModelSerializer):
     email = serializers.EmailField(
