@@ -266,3 +266,10 @@ class CompanySerializer(serializers.ModelSerializer):
             'owner',
             'created_at',
         ]
+
+
+class EmployeeUpdateSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = User
+        fields = ['id', 'first_name', 'last_name', 'avatar', 'role']
+        read_only_fields = ['id']
