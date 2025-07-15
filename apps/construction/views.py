@@ -148,14 +148,13 @@ class CashFlowDetailView(generics.RetrieveDestroyAPIView):
     serializer_class = CashFlowSerializer
     permission_classes = [IsOwnerOrAdminOrDepartmentEmployee]
 
-
-# ===== ASSIGN / REMOVE EMPLOYEE =============================================
 class AssignEmployeeToDepartmentView(APIView):
     permission_classes = [IsAuthenticated]
 
     def post(self, request, department_id):
         user = request.user
-        employee_id = request.data.get("employee_id")
+        data = request.data
+        employee_id = data.get("employee_id")
         department = get_object_or_404(Department, id=department_id)
 
         if not (
@@ -172,8 +171,24 @@ class AssignEmployeeToDepartmentView(APIView):
         if employee.departments.exists():
             return Response({"detail": "Пользователь уже прикреплён к другому отделу."}, status=400)
 
+        # Добавляем сотрудника в отдел
         department.employees.add(employee)
-        return Response({"detail": "Сотрудник успешно добавлен в отдел."}, status=200)
+
+        # Проставляем права (если есть в запросе)
+        access_fields = [
+            'can_view_dashboard', 'can_view_cashbox', 'can_view_departments',
+            'can_view_orders', 'can_view_analytics', 'can_view_products', 'can_view_booking'
+        ]
+        updated = False
+        for field in access_fields:
+            if field in data:
+                setattr(employee, field, data[field])
+                updated = True
+
+        if updated:
+            employee.save()
+
+        return Response({"detail": "Сотрудник успешно добавлен в отдел и права обновлены."}, status=200)
 
 
 class RemoveEmployeeFromDepartmentView(APIView):
