@@ -17,9 +17,10 @@ from .serializers import (
     SubscriptionPlanSerializer,
     FeatureSerializer,
     CompanySerializer,
-    SectorSerializer
+    SectorSerializer, 
+    EmployeeUpdateSerializer
 )
-from .permissions import IsCompanyOwner
+from .permissions import IsCompanyOwner, IsCompanyOwnerOrAdmin
 
 # 👤 Регистрация владельца компании
 class RegisterAPIView(generics.CreateAPIView):
@@ -112,3 +113,18 @@ class CompanyDetailAPIView(generics.RetrieveAPIView):
         if company is None:
             raise NotFound("Вы не принадлежите ни к одной компании.")
         return company
+    
+class EmployeeDetailAPIView(generics.RetrieveUpdateDestroyAPIView):
+    queryset = User.objects.all()
+    serializer_class = EmployeeUpdateSerializer
+    permission_classes = [IsAuthenticated, IsCompanyOwnerOrAdmin]
+
+    def get_queryset(self):
+        # Исключаем самого себя
+        return self.request.user.company.employees.exclude(id=self.request.user.id)
+
+    def delete(self, request, *args, **kwargs):
+        employee = self.get_object()
+        if employee == request.user:
+            return Response({'detail': 'Вы не можете удалить самого себя.'}, status=status.HTTP_400_BAD_REQUEST)
+        return super().delete(request, *args, **kwargs)

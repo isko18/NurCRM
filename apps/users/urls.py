@@ -11,7 +11,8 @@ from .views import (
     FeatureListAPIView,
     EmployeeDestroyAPIView, 
     CompanyDetailAPIView,
-    SectorListAPIView
+    SectorListAPIView,
+    EmployeeDetailAPIView
 )
 
 urlpatterns = [
@@ -26,6 +27,7 @@ urlpatterns = [
     # Работа со своими сотрудниками
     path('employees/', EmployeeListAPIView.as_view(), name='employee-list'),
     path('employees/create/', EmployeeCreateAPIView.as_view(), name='employee-create'),
+    path('employees/<uuid:pk>/', EmployeeDetailAPIView.as_view(), name='employee-detail'),
     path('employees/<uuid:pk>/delete/', EmployeeDestroyAPIView.as_view(), name='employee-delete'),
 
     # Личный кабинет
