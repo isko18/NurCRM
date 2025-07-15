@@ -301,6 +301,15 @@ class UserListSerializer(serializers.ModelSerializer):
         model = User
         fields = ['id', 'email', 'first_name', 'last_name', 'role', 'avatar']
 
+class UserWithPermissionsSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = User
+        fields = [
+            'id', 'email', 'first_name', 'last_name', 'role', 'avatar',
+            'can_view_dashboard', 'can_view_cashbox', 'can_view_departments',
+            'can_view_orders', 'can_view_analytics', 'can_view_products', 'can_view_booking'
+        ]
+
 class SectorSerializer(serializers.ModelSerializer):
     class Meta:
         model = Sector
