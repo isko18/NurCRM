@@ -163,8 +163,29 @@ class EmployeeCreateSerializer(serializers.ModelSerializer):
     class Meta:
         model = User
         fields = [
-            'email', 'first_name', 'last_name', 'avatar', 'role'
+            'email', 'first_name', 'last_name', 'avatar', 'role',
+            'can_view_dashboard', 'can_view_cashbox', 'can_view_departments',
+            'can_view_orders', 'can_view_analytics', 'can_view_products', 'can_view_booking',
         ]
+        extra_kwargs = {
+            'can_view_dashboard': {'required': False},
+            'can_view_cashbox': {'required': False},
+            'can_view_departments': {'required': False},
+            'can_view_orders': {'required': False},
+            'can_view_analytics': {'required': False},
+            'can_view_products': {'required': False},
+            'can_view_booking': {'required': False},
+        }
+
+    def validate(self, data):
+        request = self.context['request']
+        current_user = request.user
+
+        # Запретить менеджеру создавать или редактировать других
+        if current_user.role == 'manager':
+            raise serializers.ValidationError("У вас нет прав для создания сотрудников.")
+
+        return data
 
     def create(self, validated_data):
         request = self.context['request']
@@ -173,9 +194,20 @@ class EmployeeCreateSerializer(serializers.ModelSerializer):
 
         # Генерация случайного пароля
         alphabet = string.ascii_letters + string.digits
-        generated_password = ''.join(secrets.choice(alphabet) for i in range(10))
+        generated_password = ''.join(secrets.choice(alphabet) for _ in range(10))
 
-        # Создаем сотрудника
+        # Извлекаем и удаляем флаги доступа (если переданы)
+        access_flags = {
+            'can_view_dashboard': validated_data.pop('can_view_dashboard', None),
+            'can_view_cashbox': validated_data.pop('can_view_cashbox', None),
+            'can_view_departments': validated_data.pop('can_view_departments', None),
+            'can_view_orders': validated_data.pop('can_view_orders', None),
+            'can_view_analytics': validated_data.pop('can_view_analytics', None),
+            'can_view_products': validated_data.pop('can_view_products', None),
+            'can_view_booking': validated_data.pop('can_view_booking', None),
+        }
+
+        # Создание пользователя
         user = User.objects.create(
             email=validated_data['email'],
             first_name=validated_data['first_name'],
@@ -186,9 +218,33 @@ class EmployeeCreateSerializer(serializers.ModelSerializer):
             is_active=True
         )
         user.set_password(generated_password)
+
+        # Назначение флагов доступа
+        if all(flag is None for flag in access_flags.values()):
+            # ⚙️ Автоматическое распределение по роли
+            if user.role == 'admin':
+                user.can_view_dashboard = True
+                user.can_view_cashbox = True
+                user.can_view_departments = True
+                user.can_view_orders = True
+                user.can_view_analytics = True
+                user.can_view_products = True
+                user.can_view_booking = True
+            elif user.role == 'manager':
+                user.can_view_cashbox = True
+                user.can_view_orders = True
+                user.can_view_products = True
+            else:
+                user.can_view_dashboard = True
+        else:
+            # Если явно переданы флаги — применяем их
+            for field, value in access_flags.items():
+                if value is not None:
+                    setattr(user, field, value)
+
         user.save()
 
-        # Безопасная отправка email — без падения сервера при ошибках
+        # Отправка email
         try:
             send_mail(
                 subject="Добро пожаловать в CRM",
@@ -201,17 +257,14 @@ class EmployeeCreateSerializer(serializers.ModelSerializer):
                 ),
                 from_email=settings.DEFAULT_FROM_EMAIL,
                 recipient_list=[user.email],
-                fail_silently=False,  # оставляем True только если хотим совсем игнорировать
+                fail_silently=False,
             )
         except Exception as e:
-            # Логируем ошибку (если хочешь — можно записывать в лог-файл)
             print(f"Ошибка при отправке email сотруднику: {e}")
 
-        # Возвращаем дополнительные данные (email + пароль)
         self._generated_password = generated_password
         return user
 
-    # Переопределяем to_representation чтобы добавить пароль в ответ
     def to_representation(self, instance):
         rep = super().to_representation(instance)
         rep['generated_password'] = getattr(self, '_generated_password', None)
@@ -271,5 +324,29 @@ class CompanySerializer(serializers.ModelSerializer):
 class EmployeeUpdateSerializer(serializers.ModelSerializer):
     class Meta:
         model = User
-        fields = ['id', 'first_name', 'last_name', 'avatar', 'role']
+        fields = [
+            'id', 'first_name', 'last_name', 'avatar', 'role',
+            'can_view_dashboard', 'can_view_cashbox', 'can_view_departments',
+            'can_view_orders', 'can_view_analytics', 'can_view_products', 'can_view_booking',
+        ]
         read_only_fields = ['id']
+
+    def validate(self, data):
+        request = self.context['request']
+        current_user = request.user
+        target_user = self.instance
+
+        # 🚫 Менеджер не может никого редактировать
+        if current_user.role == 'manager':
+            raise serializers.ValidationError("Менеджеру запрещено редактировать сотрудников.")
+
+        # 🚫 Нельзя менять себя
+        if current_user.id == target_user.id:
+            raise serializers.ValidationError("Вы не можете редактировать самого себя через этот интерфейс.")
+
+        # 🚫 Нельзя изменить роль владельца (если ты не суперпользователь)
+        if target_user.role == 'owner' and not current_user.is_superuser:
+            if 'role' in data and data['role'] != 'owner':
+                raise serializers.ValidationError("Вы не можете изменить роль владельца компании.")
+
+        return data

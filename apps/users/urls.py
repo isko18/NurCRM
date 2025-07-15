@@ -16,7 +16,6 @@ from .views import (
 )
 
 urlpatterns = [
-    # Регистрация владельца компании
     path('auth/register/', RegisterAPIView.as_view(), name='user-register'),
 
     # JWT авторизация
