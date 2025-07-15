@@ -25,7 +25,12 @@ class CustomTokenObtainPairSerializer(TokenObtainPairSerializer):
         return data
     
 class UserSerializer(serializers.ModelSerializer):
-    password = serializers.CharField(write_only=True, required=False, min_length=8, style={'input_type': 'password'})
+    password = serializers.CharField(
+        write_only=True,
+        required=False,
+        min_length=8,
+        style={'input_type': 'password'}
+    )
 
     class Meta:
         model = User
@@ -51,6 +56,25 @@ class UserSerializer(serializers.ModelSerializer):
         if value and not value.startswith(('http://', 'https://')):
             raise serializers.ValidationError("Некорректная ссылка на аватар.")
         return value
+
+    def validate(self, data):
+        request = self.context.get('request')
+        current_user = request.user if request else None
+
+        permission_fields = [
+            'can_view_dashboard', 'can_view_cashbox', 'can_view_departments',
+            'can_view_orders', 'can_view_analytics', 'can_view_products', 'can_view_booking'
+        ]
+
+        for field in permission_fields:
+            if field in data:
+                if not isinstance(data[field], bool):
+                    raise serializers.ValidationError({field: "Значение должно быть True или False."})
+
+                if current_user and current_user.role == 'manager':
+                    raise serializers.ValidationError({field: "Менеджеру запрещено изменять права доступа."})
+
+        return data
 
     def update(self, instance, validated_data):
         password = validated_data.pop('password', None)
