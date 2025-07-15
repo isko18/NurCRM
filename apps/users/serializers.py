@@ -221,12 +221,16 @@ class EmployeeCreateSerializer(serializers.ModelSerializer):
         alphabet = string.ascii_letters + string.digits
         generated_password = ''.join(secrets.choice(alphabet) for _ in range(10))
 
-        # Извлекаем флаги доступа (если не переданы — будет False)
-        access_fields = [
-            'can_view_dashboard', 'can_view_cashbox', 'can_view_departments',
-            'can_view_orders', 'can_view_analytics', 'can_view_products', 'can_view_booking',
-        ]
-        access_flags = {field: validated_data.pop(field, False) for field in access_fields}
+        # Извлекаем и удаляем флаги доступа (если переданы)
+        access_flags = {
+            'can_view_dashboard': validated_data.pop('can_view_dashboard', None),
+            'can_view_cashbox': validated_data.pop('can_view_cashbox', None),
+            'can_view_departments': validated_data.pop('can_view_departments', None),
+            'can_view_orders': validated_data.pop('can_view_orders', None),
+            'can_view_analytics': validated_data.pop('can_view_analytics', None),
+            'can_view_products': validated_data.pop('can_view_products', None),
+            'can_view_booking': validated_data.pop('can_view_booking', None),
+        }
 
         # Создание пользователя
         user = User.objects.create(
@@ -236,10 +240,33 @@ class EmployeeCreateSerializer(serializers.ModelSerializer):
             avatar=validated_data.get('avatar'),
             role=validated_data['role'],
             company=company,
-            is_active=True,
-            **access_flags  # передаём флаги сразу
+            is_active=True
         )
         user.set_password(generated_password)
+
+        # Назначение флагов доступа
+        if all(flag is None for flag in access_flags.values()):
+            # ⚙️ Автоматическое распределение по роли
+            if user.role == 'admin':
+                user.can_view_dashboard = True
+                user.can_view_cashbox = True
+                user.can_view_departments = True
+                user.can_view_orders = True
+                user.can_view_analytics = True
+                user.can_view_products = True
+                user.can_view_booking = True
+            elif user.role == 'manager':
+                user.can_view_cashbox = True
+                user.can_view_orders = True
+                user.can_view_products = True
+            else:
+                user.can_view_dashboard = True
+        else:
+            # Если явно переданы флаги — применяем их
+            for field, value in access_flags.items():
+                if value is not None:
+                    setattr(user, field, value)
+
         user.save()
 
         # Отправка email
@@ -263,8 +290,18 @@ class EmployeeCreateSerializer(serializers.ModelSerializer):
         self._generated_password = generated_password
         return user
 
+    def to_representation(self, instance):
+        rep = super().to_representation(instance)
+        rep['generated_password'] = getattr(self, '_generated_password', None)
+        return rep
+
 # 🔍 Сериализатор для списка пользователей
 class UserListSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = User
+        fields = ['id', 'email', 'first_name', 'last_name', 'role', 'avatar']
+
+class UserWithPermissionsSerializer(serializers.ModelSerializer):
     class Meta:
         model = User
         fields = [
@@ -272,7 +309,6 @@ class UserListSerializer(serializers.ModelSerializer):
             'can_view_dashboard', 'can_view_cashbox', 'can_view_departments',
             'can_view_orders', 'can_view_analytics', 'can_view_products', 'can_view_booking'
         ]
-
 
 class SectorSerializer(serializers.ModelSerializer):
     class Meta:

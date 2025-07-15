@@ -1,6 +1,6 @@
 from rest_framework import serializers
 from apps.construction.models import Department, Cashbox, CashFlow
-from apps.users.serializers import UserListSerializer  
+from apps.users.serializers import UserListSerializer, UserWithPermissionsSerializer
 
 
 # ─── CASHFLOW: внутри кассы ───────────────────────────────
@@ -55,7 +55,7 @@ class CashFlowSerializer(serializers.ModelSerializer):
 class DepartmentSerializer(serializers.ModelSerializer):
     company = serializers.ReadOnlyField(source='company.id')
     cashbox = CashboxSerializer(read_only=True)
-    employees = UserListSerializer(many=True, read_only=True)
+    employees = UserWithPermissionsSerializer(many=True, read_only=True)
 
     employees_data = serializers.ListField(
         child=serializers.DictField(),
