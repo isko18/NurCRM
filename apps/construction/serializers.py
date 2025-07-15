@@ -56,51 +56,66 @@ class DepartmentSerializer(serializers.ModelSerializer):
     company = serializers.ReadOnlyField(source='company.id')
     cashbox = CashboxSerializer(read_only=True)
     employees = UserListSerializer(many=True, read_only=True)
-    employee_ids = serializers.ListField(
-        child=serializers.UUIDField(),
+
+    employees_data = serializers.ListField(
+        child=serializers.DictField(),
         write_only=True,
-        required=False,
-        allow_empty=True
+        required=False
     )
+
     analytics = serializers.SerializerMethodField()
 
     class Meta:
         model = Department
         fields = [
-            'id',
-            'name',
-            'company',
-            'color',  
-            'employees',
-            'employee_ids',
-            'cashbox',
-            'analytics',
-            'created_at'
+            'id', 'name', 'company', 'color',
+            'employees', 'employees_data', 'cashbox',
+            'analytics', 'created_at'
         ]
         read_only_fields = ['id', 'created_at', 'company', 'cashbox', 'employees', 'analytics']
+
+    def _assign_employees_and_permissions(self, department, employees_data):
+        from apps.users.models import User  # локальный импорт во избежание циклов
+
+        for entry in employees_data:
+            user_id = entry.get("id")
+            try:
+                user = User.objects.get(id=user_id, company=department.company)
+            except User.DoesNotExist:
+                continue  # или raise serializers.ValidationError
+
+            department.employees.add(user)
+
+            # Обновляем права (если переданы)
+            for field in [
+                'can_view_dashboard', 'can_view_cashbox', 'can_view_departments',
+                'can_view_orders', 'can_view_analytics', 'can_view_products', 'can_view_booking'
+            ]:
+                if field in entry:
+                    setattr(user, field, entry[field])
+            user.save()
 
     def create(self, validated_data):
         request = self.context.get('request')
         validated_data['company'] = request.user.company
 
-        employee_ids = validated_data.pop('employee_ids', [])
+        employees_data = validated_data.pop('employees_data', [])
         department = Department.objects.create(**validated_data)
 
-        if employee_ids:
-            department.employees.set(employee_ids)
-
+        self._assign_employees_and_permissions(department, employees_data)
         return department
 
     def update(self, instance, validated_data):
         validated_data.pop('company', None)
-        employee_ids = validated_data.pop('employee_ids', None)
+        employees_data = validated_data.pop('employees_data', None)
 
         for attr, value in validated_data.items():
             setattr(instance, attr, value)
         instance.save()
 
-        if employee_ids is not None:
-            instance.employees.set(employee_ids)
+        if employees_data is not None:
+            instance.employees.clear()
+            self._assign_employees_and_permissions(instance, employees_data)
 
         return instance
 
