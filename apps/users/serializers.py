@@ -176,7 +176,6 @@ class OwnerRegisterSerializer(serializers.ModelSerializer):
 
         return user
 
-
 # 📝 Создание сотрудника с авто-генерацией пароля + отправкой email
 class EmployeeCreateSerializer(serializers.ModelSerializer):
     email = serializers.EmailField(
@@ -206,10 +205,8 @@ class EmployeeCreateSerializer(serializers.ModelSerializer):
         request = self.context['request']
         current_user = request.user
 
-        # Запретить менеджеру создавать или редактировать других
         if current_user.role == 'manager':
             raise serializers.ValidationError("У вас нет прав для создания сотрудников.")
-
         return data
 
     def create(self, validated_data):
@@ -221,7 +218,7 @@ class EmployeeCreateSerializer(serializers.ModelSerializer):
         alphabet = string.ascii_letters + string.digits
         generated_password = ''.join(secrets.choice(alphabet) for _ in range(10))
 
-        # Извлекаем и удаляем флаги доступа (если переданы)
+        # Извлекаем флаги
         access_flags = {
             'can_view_dashboard': validated_data.pop('can_view_dashboard', None),
             'can_view_cashbox': validated_data.pop('can_view_cashbox', None),
@@ -244,28 +241,10 @@ class EmployeeCreateSerializer(serializers.ModelSerializer):
         )
         user.set_password(generated_password)
 
-        # Назначение флагов доступа
-        if all(flag is None for flag in access_flags.values()):
-            # ⚙️ Автоматическое распределение по роли
-            if user.role == 'admin':
-                user.can_view_dashboard = True
-                user.can_view_cashbox = True
-                user.can_view_departments = True
-                user.can_view_orders = True
-                user.can_view_analytics = True
-                user.can_view_products = True
-                user.can_view_booking = True
-            elif user.role == 'manager':
-                user.can_view_cashbox = True
-                user.can_view_orders = True
-                user.can_view_products = True
-            else:
-                user.can_view_dashboard = True
-        else:
-            # Если явно переданы флаги — применяем их
-            for field, value in access_flags.items():
-                if value is not None:
-                    setattr(user, field, value)
+        # Установка прав доступа только если они переданы
+        for field, value in access_flags.items():
+            if value is not None:
+                setattr(user, field, value)
 
         user.save()
 
