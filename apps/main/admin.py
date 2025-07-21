@@ -6,7 +6,7 @@ from apps.main.models import (
     Integration, Analytics, Order, OrderItem,
     Product, Review, Notification, Event,
     Warehouse, WarehouseEvent,
-    ProductCategory, ProductBrand
+    ProductCategory, ProductBrand, Client
 )
 
 
@@ -174,3 +174,11 @@ class OrderItemAdmin(admin.ModelAdmin):
     list_display = ('order', 'product', 'quantity', 'price', 'total')
     search_fields = ('order__order_number', 'product__name')
     readonly_fields = ('price', 'total')
+
+
+@admin.register(Client)
+class ClientAdmin(admin.ModelAdmin):
+    list_display = ('full_name', 'phone', 'status', 'company', 'created_at')
+    list_filter = ('status', 'company', 'created_at')
+    search_fields = ('full_name', 'phone')
+    readonly_fields = ('created_at', 'updated_at')
