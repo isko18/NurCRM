@@ -10,7 +10,7 @@ from django.db.models import Sum, Count, Avg
 
 from apps.main.models import (
     Contact, Pipeline, Deal, Task, Integration, Analytics,
-    Order, Product, Review, Notification, Event, ProductBrand, ProductCategory, Warehouse, WarehouseEvent
+    Order, Product, Review, Notification, Event, ProductBrand, ProductCategory, Warehouse, WarehouseEvent, Client
 )
 from apps.main.serializers import (
     ContactSerializer, PipelineSerializer, DealSerializer, TaskSerializer,
@@ -18,7 +18,7 @@ from apps.main.serializers import (
     ReviewSerializer, NotificationSerializer, EventSerializer,
     WarehouseSerializer, WarehouseEventSerializer,
     ProductCategorySerializer, ProductBrandSerializer,
-    OrderItemSerializer
+    OrderItemSerializer, ClientSerializer
 )
 
 
@@ -294,3 +294,19 @@ class OrderAnalyticsView(APIView):
         }
 
         return Response(response_data)
+    
+    
+class ClientListCreateAPIView(CompanyRestrictedMixin, generics.ListCreateAPIView):
+    serializer_class = ClientSerializer
+    queryset = Client.objects.all()
+    filter_backends = [DjangoFilterBackend, filters.SearchFilter]
+    search_fields = ['full_name', 'phone']
+    filterset_fields = ['status']
+
+    def perform_create(self, serializer):
+        serializer.save(company=self.request.user.company)
+
+
+class ClientRetrieveUpdateDestroyAPIView(CompanyRestrictedMixin, generics.RetrieveUpdateDestroyAPIView):
+    serializer_class = ClientSerializer
+    queryset = Client.objects.all()

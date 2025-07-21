@@ -391,3 +391,29 @@ class WarehouseEvent(models.Model):
         ordering = ['event_date']
         
         
+class Client(models.Model):
+    STATUS_CHOICES = [
+        ('new', 'Новый'),
+        ('contacted', 'Связались'),
+        ('interested', 'Заинтересован'),
+        ('converted', 'Стал клиентом'),
+        ('inactive', 'Неактивный'),
+        ('lost', 'Потерян'),
+    ]
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False, verbose_name='ID клиента')
+    company = models.ForeignKey(Company, on_delete=models.CASCADE, related_name='clients', verbose_name='Компания')
+    full_name = models.CharField(max_length=255, verbose_name='ФИО')
+    phone = models.CharField(max_length=32, verbose_name='Номер телефона')
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, verbose_name='Статус клиента')
+
+    created_at = models.DateTimeField(auto_now_add=True, verbose_name='Дата создания')
+    updated_at = models.DateTimeField(auto_now=True, verbose_name='Дата обновления')
+
+    def __str__(self):
+        return f"{self.full_name} ({self.phone})"
+
+    class Meta:
+        verbose_name = 'Клиент'
+        verbose_name_plural = 'Клиенты'
+        ordering = ['-created_at']
