@@ -47,6 +47,7 @@ class Migration(migrations.Migration):
             fields=[
                 ('id', models.UUIDField(default=uuid.uuid4, editable=False, primary_key=True, serialize=False)),
                 ('name', models.CharField(max_length=255, verbose_name='Название отдела')),
+                ('color', models.CharField(blank=True, default='', max_length=7, null=True, verbose_name='Цвет отдела (RGB)')),
                 ('created_at', models.DateTimeField(auto_now_add=True)),
                 ('company', models.ForeignKey(on_delete=django.db.models.deletion.CASCADE, related_name='departments', to='users.company', verbose_name='Компания')),
                 ('employees', models.ManyToManyField(blank=True, related_name='departments', to=settings.AUTH_USER_MODEL, verbose_name='Сотрудники отдела')),

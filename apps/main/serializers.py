@@ -1,5 +1,5 @@
 from rest_framework import serializers
-from apps.main.models import Contact, Pipeline, Deal, Task, Integration, Analytics, Order, Product, Review, Notification, Event, Warehouse, WarehouseEvent, ProductCategory, ProductBrand, OrderItem
+from apps.main.models import Contact, Pipeline, Deal, Task, Integration, Analytics, Order, Product, Review, Notification, Event, Warehouse, WarehouseEvent, ProductCategory, ProductBrand, OrderItem, Client  
 from apps.users.models import User, Company
 
 
@@ -367,3 +367,15 @@ class WarehouseEventSerializer(serializers.ModelSerializer):
         if participants is not None:
             instance.participants.set(participants)
         return instance
+    
+class ClientSerializer(serializers.ModelSerializer):
+    company = serializers.ReadOnlyField(source='company.id')
+
+    class Meta:
+        model = Client
+        fields = ['id', 'full_name', 'phone', 'status', 'company', 'created_at', 'updated_at']
+        read_only_fields = ['id', 'company', 'created_at', 'updated_at']
+
+    def create(self, validated_data):
+        validated_data['company'] = self.context['request'].user.company
+        return super().create(validated_data)
