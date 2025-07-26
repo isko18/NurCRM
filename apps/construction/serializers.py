@@ -41,7 +41,7 @@ class CashFlowSerializer(serializers.ModelSerializer):
         model = CashFlow
         fields = [
             'id',
-            'cashbox',           # read-only (автоопределяется)
+            'cashbox',           
             'cashbox_name',
             'type',
             'name',
@@ -77,6 +77,14 @@ class DepartmentSerializer(serializers.ModelSerializer):
     def _assign_employees_and_permissions(self, department, employees_data):
         from apps.users.models import User  # локальный импорт во избежание циклов
 
+        permission_fields = [
+            'can_view_dashboard', 'can_view_cashbox', 'can_view_departments',
+            'can_view_orders', 'can_view_analytics', 'can_view_department_analytics',
+            'can_view_products', 'can_view_booking',
+            'can_view_employees', 'can_view_clients',
+            'can_view_brand_category', 'can_view_settings',
+        ]
+
         for entry in employees_data:
             user_id = entry.get("id")
             try:
@@ -86,15 +94,11 @@ class DepartmentSerializer(serializers.ModelSerializer):
 
             department.employees.add(user)
 
-            # Обновляем права (если переданы)
-            for field in [
-                'can_view_dashboard', 'can_view_cashbox', 'can_view_departments',
-                'can_view_orders', 'can_view_analytics', 'can_view_products', 'can_view_booking'
-            ]:
+            for field in permission_fields:
                 if field in entry:
                     setattr(user, field, entry[field])
             user.save()
-
+            
     def create(self, validated_data):
         request = self.context.get('request')
         validated_data['company'] = request.user.company

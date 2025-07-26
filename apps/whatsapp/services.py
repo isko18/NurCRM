@@ -1,7 +1,7 @@
 import requests
 import uuid
 
-WAZZUP_API_TOKEN = "5552d6a55720470da5499784609345ee"
+WAZZUP_API_TOKEN = "28ff3c3fcfd84435a9c6bee997acadce"
 BASE_URL = "https://api.wazzup24.com/v3"
 HEADERS = {
     "Authorization": f"Bearer {WAZZUP_API_TOKEN}",

@@ -89,7 +89,12 @@ class User(AbstractBaseUser, PermissionsMixin):
     can_view_analytics = models.BooleanField(default=False, blank=True, null=True, verbose_name='Доступ к аналитике')
     can_view_products = models.BooleanField(default=False, blank=True, null=True, verbose_name='Доступ к товарам')
     can_view_booking = models.BooleanField(default=False, blank=True, null=True, verbose_name='Доступ к бронированию')
-
+    can_view_department_analytics = models.BooleanField(default=False, blank=True, null=True, verbose_name='Доступ к аналитике отделов')
+    can_view_employees = models.BooleanField(default=False, blank=True, null=True, verbose_name='Доступ к сотрудникам')
+    can_view_clients = models.BooleanField(default=False, blank=True, null=True, verbose_name='Доступ к клиентам')
+    can_view_brand_category = models.BooleanField(default=False, blank=True, null=True, verbose_name='Доступ к брендам и категориям')
+    can_view_settings = models.BooleanField(default=False, blank=True, null=True, verbose_name='Доступ к настройкам')
+    
     created_at = models.DateTimeField(auto_now_add=True, verbose_name='Дата создания')
     updated_at = models.DateTimeField(auto_now=True, verbose_name='Дата обновления')
 
