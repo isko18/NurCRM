@@ -2,13 +2,13 @@ from django.contrib import admin
 from django.contrib.auth.admin import UserAdmin as BaseUserAdmin
 from .models import User, Company, Industry, SubscriptionPlan, Feature, Sector
 
-
-# 👤 Пользователь
 @admin.register(User)
 class UserAdmin(BaseUserAdmin):
     list_display = (
         'email', 'first_name', 'last_name', 'company', 'role',
-        'can_view_cashbox', 'can_view_orders', 'is_staff', 'is_active'
+        'can_view_cashbox', 'can_view_orders',
+        'can_view_clients', 'can_view_settings',
+        'is_staff', 'is_active'
     )
     list_filter = ('role', 'is_staff', 'is_active')
     search_fields = ('email', 'first_name', 'last_name')
@@ -23,7 +23,10 @@ class UserAdmin(BaseUserAdmin):
         ('Разрешения по разделам', {
             'fields': (
                 'can_view_dashboard', 'can_view_cashbox', 'can_view_departments',
-                'can_view_orders', 'can_view_analytics', 'can_view_products', 'can_view_booking'
+                'can_view_orders', 'can_view_analytics', 'can_view_department_analytics',
+                'can_view_products', 'can_view_booking',
+                'can_view_employees', 'can_view_clients',
+                'can_view_brand_category', 'can_view_settings',
             )
         }),
         ('Права доступа', {
@@ -42,6 +45,8 @@ class UserAdmin(BaseUserAdmin):
                 'email', 'password1', 'password2',
                 'first_name', 'last_name', 'avatar', 'company', 'role',
                 'can_view_dashboard', 'can_view_cashbox', 'can_view_orders',
+                'can_view_department_analytics', 'can_view_employees',
+                'can_view_clients', 'can_view_brand_category', 'can_view_settings',
                 'is_staff', 'is_superuser', 'is_active'
             ),
         }),
