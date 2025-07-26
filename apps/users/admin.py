@@ -58,6 +58,20 @@ class UserAdmin(BaseUserAdmin):
             form.base_fields['password'].required = False
         return form
 
+    def save_model(self, request, obj, form, change):
+        # Автоматически включаем все флаги, если роль — owner или admin
+        if obj.role in ['owner', 'admin']:
+            permission_fields = [
+                'can_view_dashboard', 'can_view_cashbox', 'can_view_departments',
+                'can_view_orders', 'can_view_analytics', 'can_view_department_analytics',
+                'can_view_products', 'can_view_booking',
+                'can_view_employees', 'can_view_clients',
+                'can_view_brand_category', 'can_view_settings',
+            ]
+            for field in permission_fields:
+                setattr(obj, field, True)
+        super().save_model(request, obj, form, change)
+
 
 # 🏢 Компания
 @admin.register(Company)
