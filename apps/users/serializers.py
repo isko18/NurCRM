@@ -91,7 +91,6 @@ class UserSerializer(serializers.ModelSerializer):
         instance.save()
         return instance
 
-    
 class OwnerRegisterSerializer(serializers.ModelSerializer):
     email = serializers.EmailField(
         required=True,
@@ -129,7 +128,6 @@ class OwnerRegisterSerializer(serializers.ModelSerializer):
         except Sector.DoesNotExist:
             raise serializers.ValidationError({'company_sector_id': 'Выбранный сектор не найден.'})
 
-        # Получаем индустрию из сектора
         industries = sector.industries.all()
         if not industries.exists():
             raise serializers.ValidationError({'company_sector_id': 'Для выбранного сектора не найдена индустрия.'})
@@ -138,13 +136,11 @@ class OwnerRegisterSerializer(serializers.ModelSerializer):
 
         industry = industries.first()
 
-        # Проверка тарифа
         try:
             subscription_plan = SubscriptionPlan.objects.get(id=subscription_plan_id)
         except SubscriptionPlan.DoesNotExist:
             raise serializers.ValidationError({'subscription_plan_id': 'Выбранный тариф не найден.'})
 
-        # Создание пользователя
         user = User.objects.create(
             email=validated_data['email'],
             first_name=validated_data['first_name'],
@@ -153,10 +149,21 @@ class OwnerRegisterSerializer(serializers.ModelSerializer):
             role='owner',
             is_active=True
         )
+
+        # 👉 Назначение всех флагов доступа владельцу
+        permission_fields = [
+            'can_view_dashboard', 'can_view_cashbox', 'can_view_departments',
+            'can_view_orders', 'can_view_analytics', 'can_view_department_analytics',
+            'can_view_products', 'can_view_booking',
+            'can_view_employees', 'can_view_clients',
+            'can_view_brand_category', 'can_view_settings',
+        ]
+        for field in permission_fields:
+            setattr(user, field, True)
+
         user.set_password(validated_data['password'])
         user.save()
 
-        # Создание компании
         company = Company.objects.create(
             name=company_name,
             industry=industry,
@@ -168,13 +175,10 @@ class OwnerRegisterSerializer(serializers.ModelSerializer):
         user.company = company
         user.save()
 
-        # Создание отделов и касс, если индустрия строительная
         if industry.name.lower() == "строительная компания":
             default_departments = [
-                "Строительный отдел",
-                "Отдел ремонта",
-                "Архитектура и дизайн",
-                "Инженерные услуги"
+                "Строительный отдел", "Отдел ремонта",
+                "Архитектура и дизайн", "Инженерные услуги"
             ]
             for dept_name in default_departments:
                 dept = Department.objects.create(company=company, name=dept_name)
@@ -182,8 +186,6 @@ class OwnerRegisterSerializer(serializers.ModelSerializer):
 
         return user
 
-
-# 📝 Создание сотрудника с авто-генерацией пароля + отправкой email
 class EmployeeCreateSerializer(serializers.ModelSerializer):
     email = serializers.EmailField(
         required=True,
@@ -201,30 +203,14 @@ class EmployeeCreateSerializer(serializers.ModelSerializer):
             'can_view_employees', 'can_view_clients',
             'can_view_brand_category', 'can_view_settings',
         ]
-
-        extra_kwargs = {
-            'can_view_dashboard': {'required': False},
-            'can_view_cashbox': {'required': False},
-            'can_view_departments': {'required': False},
-            'can_view_orders': {'required': False},
-            'can_view_analytics': {'required': False},
-            'can_view_department_analytics': {'required': False},
-            'can_view_products': {'required': False},
-            'can_view_booking': {'required': False},
-            'can_view_employees': {'required': False},
-            'can_view_clients': {'required': False},
-            'can_view_brand_category': {'required': False},
-            'can_view_settings': {'required': False},
-        }
+        extra_kwargs = {field: {'required': False} for field in fields if field.startswith('can_view_')}
 
     def validate(self, data):
         request = self.context['request']
         current_user = request.user
 
-        # Запретить менеджеру создавать или редактировать других
         if current_user.role == 'manager':
             raise serializers.ValidationError("У вас нет прав для создания сотрудников.")
-
         return data
 
     def create(self, validated_data):
@@ -232,25 +218,19 @@ class EmployeeCreateSerializer(serializers.ModelSerializer):
         owner = request.user
         company = owner.owned_company
 
-        # Генерация случайного пароля
+        # Случайный пароль
         alphabet = string.ascii_letters + string.digits
         generated_password = ''.join(secrets.choice(alphabet) for _ in range(10))
 
-        # Извлекаем и удаляем флаги доступа (если переданы)
-        access_flags = {
-            'can_view_dashboard': validated_data.pop('can_view_dashboard', None),
-            'can_view_cashbox': validated_data.pop('can_view_cashbox', None),
-            'can_view_departments': validated_data.pop('can_view_departments', None),
-            'can_view_orders': validated_data.pop('can_view_orders', None),
-            'can_view_analytics': validated_data.pop('can_view_analytics', None),
-            'can_view_department_analytics': validated_data.pop('can_view_department_analytics', None),
-            'can_view_products': validated_data.pop('can_view_products', None),
-            'can_view_booking': validated_data.pop('can_view_booking', None),
-            'can_view_employees': validated_data.pop('can_view_employees', None),
-            'can_view_clients': validated_data.pop('can_view_clients', None),
-            'can_view_brand_category': validated_data.pop('can_view_brand_category', None),
-            'can_view_settings': validated_data.pop('can_view_settings', None),
-        }
+        # Извлекаем флаги
+        access_fields = [
+            'can_view_dashboard', 'can_view_cashbox', 'can_view_departments',
+            'can_view_orders', 'can_view_analytics', 'can_view_department_analytics',
+            'can_view_products', 'can_view_booking',
+            'can_view_employees', 'can_view_clients',
+            'can_view_brand_category', 'can_view_settings',
+        ]
+        access_flags = {field: validated_data.pop(field, None) for field in access_fields}
 
         # Создание пользователя
         user = User.objects.create(
@@ -264,17 +244,11 @@ class EmployeeCreateSerializer(serializers.ModelSerializer):
         )
         user.set_password(generated_password)
 
-        # Назначение флагов доступа
-        if all(flag is None for flag in access_flags.values()):
-            # ⚙️ Автоматическое распределение по роли
-            if user.role == 'admin':
-                user.can_view_dashboard = True
-                user.can_view_cashbox = True
-                user.can_view_departments = True
-                user.can_view_orders = True
-                user.can_view_analytics = True
-                user.can_view_products = True
-                user.can_view_booking = True
+        # Авто-назначение флагов
+        if all(value is None for value in access_flags.values()):
+            if user.role in ['owner', 'admin']:
+                for field in access_flags:
+                    setattr(user, field, True)
             elif user.role == 'manager':
                 user.can_view_cashbox = True
                 user.can_view_orders = True
@@ -282,14 +256,13 @@ class EmployeeCreateSerializer(serializers.ModelSerializer):
             else:
                 user.can_view_dashboard = True
         else:
-            # Если явно переданы флаги — применяем их
             for field, value in access_flags.items():
                 if value is not None:
                     setattr(user, field, value)
 
         user.save()
 
-        # Отправка email
+        # Email уведомление
         try:
             send_mail(
                 subject="Добро пожаловать в CRM",
@@ -314,6 +287,7 @@ class EmployeeCreateSerializer(serializers.ModelSerializer):
         rep = super().to_representation(instance)
         rep['generated_password'] = getattr(self, '_generated_password', None)
         return rep
+
 
 # 🔍 Сериализатор для списка пользователей
 class UserListSerializer(serializers.ModelSerializer):
