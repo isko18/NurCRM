@@ -36,13 +36,16 @@ class UserSerializer(serializers.ModelSerializer):
         model = User
         fields = [
             'id', 'email', 'password',
-            'first_name', 'last_name',
-            'avatar',
+            'first_name', 'last_name', 'avatar',
             'company', 'role',
             'can_view_dashboard', 'can_view_cashbox', 'can_view_departments',
-            'can_view_orders', 'can_view_analytics', 'can_view_products', 'can_view_booking',
+            'can_view_orders', 'can_view_analytics', 'can_view_department_analytics',
+            'can_view_products', 'can_view_booking',
+            'can_view_employees', 'can_view_clients',
+            'can_view_brand_category', 'can_view_settings',
             'created_at', 'updated_at',
         ]
+
         read_only_fields = ['id', 'created_at', 'updated_at', 'company']
 
     def validate_email(self, value):
@@ -63,7 +66,10 @@ class UserSerializer(serializers.ModelSerializer):
 
         permission_fields = [
             'can_view_dashboard', 'can_view_cashbox', 'can_view_departments',
-            'can_view_orders', 'can_view_analytics', 'can_view_products', 'can_view_booking'
+            'can_view_orders', 'can_view_analytics', 'can_view_department_analytics',
+            'can_view_products', 'can_view_booking',
+            'can_view_employees', 'can_view_clients',
+            'can_view_brand_category', 'can_view_settings',
         ]
 
         for field in permission_fields:
@@ -190,16 +196,25 @@ class EmployeeCreateSerializer(serializers.ModelSerializer):
         fields = [
             'email', 'first_name', 'last_name', 'avatar', 'role',
             'can_view_dashboard', 'can_view_cashbox', 'can_view_departments',
-            'can_view_orders', 'can_view_analytics', 'can_view_products', 'can_view_booking',
+            'can_view_orders', 'can_view_analytics', 'can_view_department_analytics',
+            'can_view_products', 'can_view_booking',
+            'can_view_employees', 'can_view_clients',
+            'can_view_brand_category', 'can_view_settings',
         ]
+
         extra_kwargs = {
             'can_view_dashboard': {'required': False},
             'can_view_cashbox': {'required': False},
             'can_view_departments': {'required': False},
             'can_view_orders': {'required': False},
             'can_view_analytics': {'required': False},
+            'can_view_department_analytics': {'required': False},
             'can_view_products': {'required': False},
             'can_view_booking': {'required': False},
+            'can_view_employees': {'required': False},
+            'can_view_clients': {'required': False},
+            'can_view_brand_category': {'required': False},
+            'can_view_settings': {'required': False},
         }
 
     def validate(self, data):
@@ -228,8 +243,13 @@ class EmployeeCreateSerializer(serializers.ModelSerializer):
             'can_view_departments': validated_data.pop('can_view_departments', None),
             'can_view_orders': validated_data.pop('can_view_orders', None),
             'can_view_analytics': validated_data.pop('can_view_analytics', None),
+            'can_view_department_analytics': validated_data.pop('can_view_department_analytics', None),
             'can_view_products': validated_data.pop('can_view_products', None),
             'can_view_booking': validated_data.pop('can_view_booking', None),
+            'can_view_employees': validated_data.pop('can_view_employees', None),
+            'can_view_clients': validated_data.pop('can_view_clients', None),
+            'can_view_brand_category': validated_data.pop('can_view_brand_category', None),
+            'can_view_settings': validated_data.pop('can_view_settings', None),
         }
 
         # Создание пользователя
@@ -307,8 +327,12 @@ class UserWithPermissionsSerializer(serializers.ModelSerializer):
         fields = [
             'id', 'email', 'first_name', 'last_name', 'role', 'avatar',
             'can_view_dashboard', 'can_view_cashbox', 'can_view_departments',
-            'can_view_orders', 'can_view_analytics', 'can_view_products', 'can_view_booking'
+            'can_view_orders', 'can_view_analytics', 'can_view_department_analytics',
+            'can_view_products', 'can_view_booking',
+            'can_view_employees', 'can_view_clients',
+            'can_view_brand_category', 'can_view_settings',
         ]
+
 
 class SectorSerializer(serializers.ModelSerializer):
     class Meta:
@@ -361,8 +385,12 @@ class EmployeeUpdateSerializer(serializers.ModelSerializer):
         fields = [
             'id', 'first_name', 'last_name', 'avatar', 'role',
             'can_view_dashboard', 'can_view_cashbox', 'can_view_departments',
-            'can_view_orders', 'can_view_analytics', 'can_view_products', 'can_view_booking',
+            'can_view_orders', 'can_view_analytics', 'can_view_department_analytics',
+            'can_view_products', 'can_view_booking',
+            'can_view_employees', 'can_view_clients',
+            'can_view_brand_category', 'can_view_settings',
         ]
+
         read_only_fields = ['id']
 
     def validate(self, data):
