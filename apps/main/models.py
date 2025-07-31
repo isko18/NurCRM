@@ -389,8 +389,8 @@ class WarehouseEvent(models.Model):
         verbose_name = 'Складское событие'
         verbose_name_plural = 'Складские события'
         ordering = ['event_date']
-        
-        
+          
+
 class Client(models.Model):
     STATUS_CHOICES = [
         ('new', 'Новый'),
@@ -399,6 +399,10 @@ class Client(models.Model):
         ('converted', 'Стал клиентом'),
         ('inactive', 'Неактивный'),
         ('lost', 'Потерян'),
+        ('paid_for', 'Оплачено'),
+        ('awaiting', 'Ожидает'),
+        ('credit', 'Долг'),
+        ('rejection', 'Отказ'),
     ]
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False, verbose_name='ID клиента')
@@ -406,7 +410,7 @@ class Client(models.Model):
     full_name = models.CharField(max_length=255, verbose_name='ФИО')
     phone = models.CharField(max_length=32, verbose_name='Номер телефона')
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, verbose_name='Статус клиента')
-
+    price = models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True, verbose_name='Дата создания')
     updated_at = models.DateTimeField(auto_now=True, verbose_name='Дата обновления')
 
