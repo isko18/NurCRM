@@ -43,7 +43,7 @@ apps_includes = [
     path('users/', include('apps.users.urls')),  
     path('construction/', include('apps.construction.urls')),  
     path('booking/', include('apps.booking.urls')),  
-    path('barbershop/', include('apps.booking.urls')),  
+    path('barbershop/', include('apps.barber.urls')),  
     
     
 ]
