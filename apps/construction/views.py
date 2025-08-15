@@ -264,3 +264,4 @@ class CashboxOwnerDetailSingleView(generics.RetrieveAPIView):
             return cashbox
 
         raise PermissionDenied("Нет доступа к этой кассе.")
+    

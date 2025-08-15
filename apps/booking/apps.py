@@ -1,6 +1,6 @@
 from django.apps import AppConfig
 
 
-class WhatsappConfig(AppConfig):
+class BookingConfig(AppConfig):
     default_auto_field = 'django.db.models.BigAutoField'
-    name = 'apps.whatsapp'
+    name = 'apps.booking'
