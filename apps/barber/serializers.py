@@ -28,6 +28,7 @@ class ClientSerializer(serializers.ModelSerializer):
             'birth_date', 'status', 'notes', 'created_at'
         ]
         read_only_fields = ['id', 'created_at']
+        ref_name = 'BarberClient'
 
 
 class AppointmentSerializer(serializers.ModelSerializer):
