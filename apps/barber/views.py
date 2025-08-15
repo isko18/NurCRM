@@ -1,5 +1,6 @@
 # barber_crm/views.py
 from rest_framework import generics, permissions
+from django_filters.rest_framework import DjangoFilterBackend
 from .models import BarberProfile, Service, Client, Appointment
 from .serializers import (
     BarberProfileSerializer,
@@ -11,10 +12,13 @@ from .serializers import (
 
 class CompanyQuerysetMixin:
     """
-    Миксин для фильтрации по компании текущего пользователя
-    (ожидается, что у пользователя есть company или owned_company).
+    Миксин для фильтрации по компании текущего пользователя.
     """
     def get_queryset(self):
+        # Fix для drf_yasg
+        if getattr(self, 'swagger_fake_view', False):
+            return self.queryset.none()
+
         qs = super().get_queryset()
         company = getattr(self.request.user, 'company', None) or getattr(self.request.user, 'owned_company', None)
         return qs.filter(company=company) if company else qs
@@ -32,6 +36,8 @@ class BarberListCreateView(CompanyQuerysetMixin, generics.ListCreateAPIView):
     queryset = BarberProfile.objects.all()
     serializer_class = BarberProfileSerializer
     permission_classes = [permissions.IsAuthenticated]
+    filter_backends = [DjangoFilterBackend]
+    filterset_fields = [f.name for f in BarberProfile._meta.get_fields() if not f.is_relation or f.many_to_one]
 
 
 class BarberRetrieveUpdateDestroyView(CompanyQuerysetMixin, generics.RetrieveUpdateDestroyAPIView):
@@ -45,6 +51,8 @@ class ServiceListCreateView(CompanyQuerysetMixin, generics.ListCreateAPIView):
     queryset = Service.objects.all()
     serializer_class = ServiceSerializer
     permission_classes = [permissions.IsAuthenticated]
+    filter_backends = [DjangoFilterBackend]
+    filterset_fields = [f.name for f in Service._meta.get_fields() if not f.is_relation or f.many_to_one]
 
 
 class ServiceRetrieveUpdateDestroyView(CompanyQuerysetMixin, generics.RetrieveUpdateDestroyAPIView):
@@ -58,6 +66,8 @@ class ClientListCreateView(CompanyQuerysetMixin, generics.ListCreateAPIView):
     queryset = Client.objects.all()
     serializer_class = ClientSerializer
     permission_classes = [permissions.IsAuthenticated]
+    filter_backends = [DjangoFilterBackend]
+    filterset_fields = [f.name for f in Client._meta.get_fields() if not f.is_relation or f.many_to_one]
 
 
 class ClientRetrieveUpdateDestroyView(CompanyQuerysetMixin, generics.RetrieveUpdateDestroyAPIView):
@@ -71,6 +81,8 @@ class AppointmentListCreateView(CompanyQuerysetMixin, generics.ListCreateAPIView
     queryset = Appointment.objects.select_related('client', 'barber', 'service').all()
     serializer_class = AppointmentSerializer
     permission_classes = [permissions.IsAuthenticated]
+    filter_backends = [DjangoFilterBackend]
+    filterset_fields = [f.name for f in Appointment._meta.get_fields() if not f.is_relation or f.many_to_one]
 
 
 class AppointmentRetrieveUpdateDestroyView(CompanyQuerysetMixin, generics.RetrieveUpdateDestroyAPIView):
