@@ -6,7 +6,7 @@ from apps.main.models import (
     Integration, Analytics, Order, OrderItem,
     Product, Review, Notification, Event,
     Warehouse, WarehouseEvent,
-    ProductCategory, ProductBrand, Client
+    ProductCategory, ProductBrand, Client, GlobalProduct, GlobalBrand, GlobalCategory, CartItem, Cart, Sale, SaleItem
 )
 
 
@@ -82,40 +82,97 @@ class OrderItemInline(admin.TabularInline):
         formset.save_m2m()
 
 
-@admin.register(Order)
-class OrderAdmin(admin.ModelAdmin):
-    list_display = ('order_number', 'customer_name', 'status', 'total_display', 'total_quantity', 'department', 'date_ordered')
-    list_filter = ('status', 'department')
-    search_fields = ('order_number', 'customer_name')
-    readonly_fields = ('created_at', 'updated_at')
-    inlines = [OrderItemInline]
+# @admin.register(Order)
+# class OrderAdmin(admin.ModelAdmin):
+#     list_display = ('order_number', 'customer_name', 'status', 'total_display', 'total_quantity', 'department', 'date_ordered')
+#     list_filter = ('status', 'department')
+#     search_fields = ('order_number', 'customer_name')
+#     readonly_fields = ('created_at', 'updated_at')
+#     inlines = [OrderItemInline]
 
-    def total_display(self, obj):
-        return f"{obj.total:.2f}"
-    total_display.short_description = 'Сумма'
+#     def total_display(self, obj):
+#         return f"{obj.total:.2f}"
+#     total_display.short_description = 'Сумма'
 
 
 @admin.register(Product)
 class ProductAdmin(admin.ModelAdmin):
-    list_display = ('name', 'article', 'brand', 'category', 'quantity', 'price', 'created_at')
-    list_filter = ('brand', 'category')
-    search_fields = ('name', 'article')
-    readonly_fields = ('created_at', 'updated_at')
+    list_display = ('name', 'barcode', 'price', 'quantity', 'brand', 'category')
+    search_fields = ('name', 'barcode')
+    
+admin.site.register(GlobalProduct)
+admin.site.register(GlobalCategory)
+admin.site.register(GlobalBrand)
+admin.site.register(ProductBrand)
+admin.site.register(ProductCategory)
 
 
-@admin.register(ProductCategory)
-class ProductCategoryAdmin(DraggableMPTTAdmin):
-    mptt_indent_field = "name"
-    list_display = ('tree_actions', 'indented_title',)
-    search_fields = ('name',)
+class CartItemInline(admin.TabularInline):
+    model = CartItem
+    extra = 0
+    # Показываем только чтение; добавление позиций через POS, а не через админку
+    readonly_fields = ("product", "quantity", "unit_price", "line_total")
+    # НЕ добавляем 'line_total' в fields! Оставляем Django выбрать поля формы сам.
+    # fields = ("product", "quantity", "unit_price")  # <- можно явно указать, но без line_total
+
+    def line_total(self, obj):
+        if not obj or obj.unit_price is None or obj.quantity is None:
+            return "-"
+        try:
+            return obj.unit_price * obj.quantity
+        except Exception:
+            return "-"
+    line_total.short_description = "Сумма"
+
+@admin.register(Cart)
+class CartAdmin(admin.ModelAdmin):
+    list_display = (
+        "id", "company", "created_by", "status",
+        "subtotal", "discount_total", "tax_total", "total",
+        "created_at",
+    )
+    list_filter = ("company", "status", "created_at")
+    search_fields = ("id", "user__username", "user__email")
+    inlines = [CartItemInline]
+
+    def created_by(self, obj):
+        return obj.user
+    created_by.short_description = "Создал"
+    created_by.admin_order_field = "user"
 
 
-@admin.register(ProductBrand)
-class ProductBrandAdmin(DraggableMPTTAdmin):
-    mptt_indent_field = "name"
-    list_display = ('tree_actions', 'indented_title',)
-    search_fields = ('name',)
+# ===== SALE =====
+class SaleItemInline(admin.TabularInline):
+    model = SaleItem
+    extra = 0
+    can_delete = False
+    # Эти поля у нас снапшоты — делаем их read-only
+    readonly_fields = ("product", "name_snapshot", "barcode_snapshot", "unit_price", "quantity", "line_total")
+    # НЕ указываем 'line_total' в fields!
 
+    def line_total(self, obj):
+        if not obj or obj.unit_price is None or obj.quantity is None:
+            return "-"
+        try:
+            return obj.unit_price * obj.quantity
+        except Exception:
+            return "-"
+    line_total.short_description = "Сумма"
+
+@admin.register(Sale)
+class SaleAdmin(admin.ModelAdmin):
+    list_display = (
+        "id", "company", "user", "status",
+        "subtotal", "discount_total", "tax_total", "total",
+        "created_at", "paid_at",
+    )
+    list_filter = ("company", "status", "created_at", "paid_at")
+    search_fields = ("id", "user__username", "user__email")
+    inlines = [SaleItemInline]
+
+    # Если продажи создаются только через POS — можно запретить создание в админке:
+    # def has_add_permission(self, request):
+    #     return False
 
 @admin.register(Review)
 class ReviewAdmin(admin.ModelAdmin):

@@ -7,10 +7,13 @@ from rest_framework.permissions import IsAuthenticated
 
 from django.utils.dateparse import parse_date
 from django.db.models import Sum, Count, Avg
+from rest_framework.exceptions import NotFound
+from django.db import transaction
 
 from apps.main.models import (
     Contact, Pipeline, Deal, Task, Integration, Analytics,
-    Order, Product, Review, Notification, Event, ProductBrand, ProductCategory, Warehouse, WarehouseEvent, Client
+    Order, Product, Review, Notification, Event, ProductBrand, ProductCategory, Warehouse, WarehouseEvent, Client,
+    GlobalProduct, CartItem
 )
 from apps.main.serializers import (
     ContactSerializer, PipelineSerializer, DealSerializer, TaskSerializer,
@@ -128,17 +131,110 @@ class OrderRetrieveUpdateDestroyAPIView(CompanyRestrictedMixin, generics.Retriev
     queryset = Order.objects.all().prefetch_related('items__product')
 
 
-class ProductListCreateAPIView(CompanyRestrictedMixin, generics.ListCreateAPIView):
+class ProductCreateByBarcodeAPIView(generics.CreateAPIView):
+    """Создание товара только по штрих-коду (если найден в глобальной базе)"""
     serializer_class = ProductSerializer
-    queryset = Product.objects.all()
-    filter_backends = [DjangoFilterBackend, filters.SearchFilter]
-    search_fields = ['name', 'article', 'brand__name', 'category__name']
-    filterset_fields = '__all__'
+    permission_classes = [IsAuthenticated]
+
+    @transaction.atomic
+    def create(self, request, *args, **kwargs):
+        barcode = (request.data.get('barcode') or '').strip()
+        company = request.user.company
+
+        if not barcode:
+            return Response({"barcode": "Укажите штрих-код."}, status=status.HTTP_400_BAD_REQUEST)
+
+        # Проверка, что в компании нет такого товара
+        if Product.objects.filter(company=company, barcode=barcode).exists():
+            return Response({"barcode": "В вашей компании уже есть товар с таким штрих-кодом."},
+                            status=status.HTTP_400_BAD_REQUEST)
+
+        # Ищем в глобальной базе (связки brand/category уже FK)
+        gp = GlobalProduct.objects.select_related('brand', 'category').filter(barcode=barcode).first()
+        if not gp:
+            return Response({"barcode": "Товар с таким штрих-кодом не найден в глобальной базе. Заполните карточку вручную."},
+                            status=status.HTTP_404_NOT_FOUND)
+
+        # Создаём бренд и категорию в компании (если нет)
+        brand = ProductBrand.objects.get_or_create(company=company, name=gp.brand.name if gp.brand else None)[0] if gp.brand else None
+        category = ProductCategory.objects.get_or_create(company=company, name=gp.category.name if gp.category else None)[0] if gp.category else None
+
+        # Создаём товар в компании
+        product = Product.objects.create(
+            company=company,
+            name=gp.name,
+            barcode=gp.barcode,
+            brand=brand,
+            category=category,
+            price=request.data.get('price', 0),
+            quantity=request.data.get('quantity', 0)
+        )
+        serializer = self.get_serializer(product)
+        return Response(serializer.data, status=status.HTTP_201_CREATED)
+
+
+class ProductCreateManualAPIView(generics.CreateAPIView):
+    """Ручное создание товара + добавление в глобальную базу"""
+    serializer_class = ProductSerializer
+    permission_classes = [IsAuthenticated]
+
+    @transaction.atomic
+    def create(self, request, *args, **kwargs):
+        company = request.user.company
+        barcode = (request.data.get('barcode') or '').strip()
+
+        # Проверка уникальности в компании
+        if barcode and Product.objects.filter(company=company, barcode=barcode).exists():
+            return Response({"barcode": "В вашей компании уже есть товар с таким штрих-кодом."},
+                            status=status.HTTP_400_BAD_REQUEST)
+
+        # Локальный бренд
+        brand_name = request.data.get('brand_name', '').strip()
+        brand = ProductBrand.objects.get_or_create(company=company, name=brand_name)[0] if brand_name else None
+
+        # Локальная категория
+        category_name = request.data.get('category_name', '').strip()
+        category = ProductCategory.objects.get_or_create(company=company, name=category_name)[0] if category_name else None
+
+        # Создаём товар в компании
+        product = Product.objects.create(
+            company=company,
+            name=request.data.get('name'),
+            barcode=barcode or None,
+            brand=brand,
+            category=category,
+            price=request.data.get('price', 0),
+            quantity=request.data.get('quantity', 0)
+        )
+
+        # Если есть barcode — создаём в глобальной базе (если ещё нет)
+        if barcode and not GlobalProduct.objects.filter(barcode=barcode).exists():
+            # Создаём глобальные бренд/категорию
+            g_brand = None
+            if brand:
+                from apps.main.models import GlobalBrand
+                g_brand, _ = GlobalBrand.objects.get_or_create(name=brand.name)
+
+            g_category = None
+            if category:
+                from apps.main.models import GlobalCategory
+                g_category, _ = GlobalCategory.objects.get_or_create(name=category.name)
+
+            GlobalProduct.objects.create(
+                name=product.name,
+                barcode=product.barcode,
+                brand=g_brand,
+                category=g_category
+            )
+
+        serializer = self.get_serializer(product)
+        return Response(serializer.data, status=status.HTTP_201_CREATED)
 
 
 class ProductRetrieveUpdateDestroyAPIView(CompanyRestrictedMixin, generics.RetrieveUpdateDestroyAPIView):
     serializer_class = ProductSerializer
-    queryset = Product.objects.all()
+    queryset = Product.objects.select_related('brand', 'category').all()
+
 
 
 class ReviewListCreateAPIView(CompanyRestrictedMixin, generics.ListCreateAPIView):
@@ -244,8 +340,21 @@ class ProductBrandListCreateAPIView(CompanyRestrictedMixin, generics.ListCreateA
 class ProductBrandRetrieveUpdateDestroyAPIView(CompanyRestrictedMixin, generics.RetrieveUpdateDestroyAPIView):
     serializer_class = ProductBrandSerializer
     queryset = ProductBrand.objects.all()
+    
+class ProductByBarcodeAPIView(CompanyRestrictedMixin, generics.RetrieveAPIView):
+    serializer_class = ProductSerializer
+    lookup_field = 'barcode'
 
+    def get_object(self):
+        barcode = self.kwargs.get('barcode')
+        if not barcode:
+            raise NotFound(detail="Штрих-код не указан")
 
+        product = self.get_queryset().filter(barcode=barcode).first()
+        if not product:
+            raise NotFound(detail="Товар с таким штрих-кодом не найден")
+        return product
+        
 class OrderAnalyticsView(APIView):
     permission_classes = [IsAuthenticated]
 
@@ -310,3 +419,6 @@ class ClientListCreateAPIView(CompanyRestrictedMixin, generics.ListCreateAPIView
 class ClientRetrieveUpdateDestroyAPIView(CompanyRestrictedMixin, generics.RetrieveUpdateDestroyAPIView):
     serializer_class = ClientSerializer
     queryset = Client.objects.all()
+    
+    
+    

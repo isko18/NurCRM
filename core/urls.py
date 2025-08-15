@@ -42,6 +42,8 @@ apps_includes = [
     path('main/', include('apps.main.urls')),  
     path('users/', include('apps.users.urls')),  
     path('construction/', include('apps.construction.urls')),  
+    path('booking/', include('apps.booking.urls')),  
+    
 ]
 
 # API-роуты

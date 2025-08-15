@@ -1,54 +1,13 @@
 from django.db import models
-import uuid
+import uuid, secrets
 from apps.users.models import User, Company
+from django.conf import settings
 from mptt.models import MPTTModel, TreeForeignKey
 from django.db import models
+from decimal import Decimal
+from django.utils import timezone
 from mptt.models import MPTTModel, TreeForeignKey
 
-class ProductCategory(MPTTModel):
-    name = models.CharField(max_length=128, unique=True, verbose_name='Название категории')
-    company = models.ForeignKey(Company, on_delete=models.CASCADE, related_name='categories', verbose_name='Компания')
-    parent = TreeForeignKey(
-        'self',
-        on_delete=models.CASCADE,
-        null=True,
-        blank=True,
-        related_name='children',
-        verbose_name='Родительская категория'
-    )
-
-    class MPTTMeta:
-        order_insertion_by = ['name']
-
-    class Meta:
-        verbose_name = 'Категория товара'
-        verbose_name_plural = 'Категории товаров'
-
-    def __str__(self):
-        return self.name
-
-
-class ProductBrand(MPTTModel):
-    name = models.CharField(max_length=128, unique=True, verbose_name='Название бренда')
-    company = models.ForeignKey(Company, on_delete=models.CASCADE, related_name='brands', verbose_name='Компания')  # 👈 добавлено поле
-    parent = TreeForeignKey(
-        'self',
-        on_delete=models.CASCADE,
-        null=True,
-        blank=True,
-        related_name='children',
-        verbose_name='Родительский бренд'
-    )
-
-    class MPTTMeta:
-        order_insertion_by = ['name']
-
-    class Meta:
-        verbose_name = 'Бренд'
-        verbose_name_plural = 'Бренды'
-
-    def __str__(self):
-        return self.name
 
 class Contact(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
@@ -192,29 +151,297 @@ class Order(models.Model):
         return sum(item.quantity for item in self.items.all())
 
 
+class GlobalCategory(MPTTModel):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    name = models.CharField(max_length=128, unique=True, verbose_name='Название категории')
+    parent = TreeForeignKey(
+        'self',
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
+        related_name='children',
+        verbose_name='Родительская категория'
+    )
+
+    class MPTTMeta:
+        order_insertion_by = ['name']
+
+    class Meta:
+        verbose_name = 'Глобальная категория'
+        verbose_name_plural = 'Глобальные категории'
+
+    def __str__(self):
+        return self.name
+
+
+class GlobalBrand(MPTTModel):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     
+    name = models.CharField(max_length=128, unique=True, verbose_name='Название бренда')
+    parent = TreeForeignKey(
+        'self',
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
+        related_name='children',
+        verbose_name='Родительский бренд'
+    )
+
+    class MPTTMeta:
+        order_insertion_by = ['name']
+
+    class Meta:
+        verbose_name = 'Глобальный бренд'
+        verbose_name_plural = 'Глобальные бренды'
+
+    def __str__(self):
+        return self.name
+
+
+class GlobalProduct(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     
+    name = models.CharField(max_length=255)
+    barcode = models.CharField(max_length=64, unique=True)
+    brand = models.ForeignKey(GlobalBrand, on_delete=models.SET_NULL, null=True, blank=True, related_name='products')
+    category = models.ForeignKey(GlobalCategory, on_delete=models.SET_NULL, null=True, blank=True, related_name='products')
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        verbose_name = "Глобальный товар"
+        verbose_name_plural = "Глобальные товары"
+
+    def __str__(self):
+        return f"{self.name} ({self.barcode})"
+
+
+
+class ProductCategory(MPTTModel):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    
+    name = models.CharField(max_length=128, verbose_name='Название категории')
+    company = models.ForeignKey(Company, on_delete=models.CASCADE, related_name='categories', verbose_name='Компания')
+    parent = TreeForeignKey(
+        'self',
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
+        related_name='children',
+        verbose_name='Родительская категория'
+    )
+
+    class MPTTMeta:
+        order_insertion_by = ['name']
+
+    class Meta:
+        unique_together = ('name', 'company')
+        verbose_name = 'Категория товара'
+        verbose_name_plural = 'Категории товаров'
+
+    def __str__(self):
+        return self.name
+
+
+class ProductBrand(MPTTModel):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    
+    name = models.CharField(max_length=128, verbose_name='Название бренда')
+    company = models.ForeignKey(Company, on_delete=models.CASCADE, related_name='brands', verbose_name='Компания')
+    parent = TreeForeignKey(
+        'self',
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
+        related_name='children',
+        verbose_name='Родительский бренд'
+    )
+
+    class MPTTMeta:
+        order_insertion_by = ['name']
+
+    class Meta:
+        unique_together = ('name', 'company')
+        verbose_name = 'Бренд'
+        verbose_name_plural = 'Бренды'
+
+    def __str__(self):
+        return self.name
+
+
 class Product(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    company = models.ForeignKey(Company, on_delete=models.CASCADE, related_name='products')
-
-    name = models.CharField(max_length=128)
-    article = models.CharField(max_length=64)
-    brand = models.ForeignKey(ProductBrand, on_delete=models.SET_NULL, null=True, blank=True, related_name='products', verbose_name='Бренд')
-    category = models.ForeignKey(ProductCategory, on_delete=models.SET_NULL, null=True, blank=True, related_name='products', verbose_name='Категория')
-    quantity = models.PositiveIntegerField()
-    price = models.DecimalField(max_digits=10, decimal_places=2)
+    
+    company = models.ForeignKey(Company, on_delete=models.CASCADE, related_name='products', verbose_name='Компания')
+    name = models.CharField(max_length=255)
+    barcode = models.CharField(max_length=64, null=True, blank=True)
+    brand = models.ForeignKey(ProductBrand, on_delete=models.SET_NULL, null=True, blank=True)
+    category = models.ForeignKey(ProductCategory, on_delete=models.SET_NULL, null=True, blank=True)
+    quantity = models.PositiveIntegerField(default=0)
+    price = models.DecimalField(max_digits=10, decimal_places=2, default=0)
 
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
     class Meta:
+        unique_together = ('company', 'barcode')
         verbose_name = 'Товар'
         verbose_name_plural = 'Товары'
-        ordering = ['-created_at']
-        
+
     def __str__(self):
-        return f"{self.name} ({self.article})"
+        return self.name
+    
+    
+class Cart(models.Model):
+    class Status(models.TextChoices):
+        ACTIVE = "active", "Активна"
+        CHECKED_OUT = "checked_out", "Завершена"
+        ABANDONED = "abandoned", "Отменена"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False, verbose_name="ID")
+    company = models.ForeignKey(
+        Company, on_delete=models.CASCADE, related_name="carts",
+        verbose_name="Компания"
+    )
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL,
+        null=True, blank=True, related_name="carts",
+        verbose_name="Пользователь"
+    )
+    session_key = models.CharField(max_length=64, null=True, blank=True, verbose_name="Ключ сессии")
+    status = models.CharField(
+        max_length=16, choices=Status.choices, default=Status.ACTIVE,
+        verbose_name="Статус"
+    )
+
+    subtotal = models.DecimalField(max_digits=12, decimal_places=2, default=0, verbose_name="Сумма без скидок и налогов")
+    discount_total = models.DecimalField(max_digits=12, decimal_places=2, default=0, verbose_name="Сумма скидки")
+    tax_total = models.DecimalField(max_digits=12, decimal_places=2, default=0, verbose_name="Сумма налога")
+    total = models.DecimalField(max_digits=12, decimal_places=2, default=0, verbose_name="Итого")
+
+    created_at = models.DateTimeField(auto_now_add=True, verbose_name="Создана")
+    updated_at = models.DateTimeField(auto_now=True, verbose_name="Обновлена")
+
+    class Meta:
+        indexes = [
+            models.Index(fields=["company", "status"]),
+            models.Index(fields=["session_key"]),
+        ]
+        verbose_name = "Корзина"
+        verbose_name_plural = "Корзины"
+
+    def recalc(self):
+        items = self.items.all()
+        self.subtotal = sum((i.quantity * i.unit_price for i in items), Decimal("0"))
+        self.discount_total = Decimal("0")
+        self.tax_total = Decimal("0")
+        self.total = self.subtotal - self.discount_total + self.tax_total
+        self.save(update_fields=["subtotal", "discount_total", "tax_total", "total", "updated_at"])
+
+    def __str__(self):
+        return f"Корзина {self.id} ({self.get_status_display()})"
+
+
+class CartItem(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False, verbose_name="ID")
+    cart = models.ForeignKey(Cart, on_delete=models.CASCADE, related_name="items", verbose_name="Корзина")
+    product = models.ForeignKey(Product, on_delete=models.PROTECT, related_name="cart_items", verbose_name="Товар")
+    quantity = models.PositiveIntegerField(default=1, verbose_name="Количество")
+    unit_price = models.DecimalField(max_digits=12, decimal_places=2, verbose_name="Цена за единицу")
+
+    class Meta:
+        unique_together = ("cart", "product")
+        verbose_name = "Товар в корзине"
+        verbose_name_plural = "Товары в корзине"
+
+    def save(self, *args, **kwargs):
+        if not self.unit_price:
+            self.unit_price = self.product.price
+        super().save(*args, **kwargs)
+        self.cart.recalc()
+
+    def __str__(self):
+        return f"{self.product.name} x{self.quantity}"
+
+
+class Sale(models.Model):
+    class Status(models.TextChoices):
+        NEW = "new", "Новый"
+        PAID = "paid", "Оплачен"
+        CANCELED = "canceled", "Отменён"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False, verbose_name="ID")
+    company = models.ForeignKey(Company, on_delete=models.CASCADE, related_name="sales", verbose_name="Компания")
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL,
+        null=True, blank=True, related_name="sales",
+        verbose_name="Пользователь"
+    )
+
+    status = models.CharField(
+        max_length=16, choices=Status.choices, default=Status.NEW,
+        verbose_name="Статус"
+    )
+    subtotal = models.DecimalField(max_digits=12, decimal_places=2, default=0, verbose_name="Сумма без скидок и налогов")
+    discount_total = models.DecimalField(max_digits=12, decimal_places=2, default=0, verbose_name="Сумма скидки")
+    tax_total = models.DecimalField(max_digits=12, decimal_places=2, default=0, verbose_name="Сумма налога")
+    total = models.DecimalField(max_digits=12, decimal_places=2, default=0, verbose_name="Итого")
+
+    created_at = models.DateTimeField(auto_now_add=True, verbose_name="Создано")
+    paid_at = models.DateTimeField(null=True, blank=True, verbose_name="Дата оплаты")
+
+    class Meta:
+        verbose_name = "Продажа"
+        verbose_name_plural = "Продажи"
+
+    def mark_paid(self):
+        self.status = Sale.Status.PAID
+        self.paid_at = timezone.now()
+        self.save(update_fields=["status", "paid_at"])
+
+    def __str__(self):
+        return f"Продажа {self.id} ({self.get_status_display()})"
+
+
+class SaleItem(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False, verbose_name="ID")
+    sale = models.ForeignKey(Sale, on_delete=models.CASCADE, related_name="items", verbose_name="Продажа")
+    product = models.ForeignKey(Product, on_delete=models.PROTECT, related_name="sale_items", verbose_name="Товар")
+    name_snapshot = models.CharField(max_length=255, verbose_name="Название товара (снимок)")
+    barcode_snapshot = models.CharField(max_length=64, null=True, blank=True, verbose_name="Штрихкод (снимок)")
+    unit_price = models.DecimalField(max_digits=12, decimal_places=2, verbose_name="Цена за единицу")
+    quantity = models.PositiveIntegerField(verbose_name="Количество")
+
+    class Meta:
+        verbose_name = "Товар в продаже"
+        verbose_name_plural = "Товары в продаже"
+
+    def __str__(self):
+        return f"{self.name_snapshot} x{self.quantity}"
+
+
+class MobileScannerToken(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False, verbose_name="ID")
+    cart = models.ForeignKey(Cart, on_delete=models.CASCADE, related_name="mobile_tokens", verbose_name="Корзина")
+    token = models.CharField(max_length=64, unique=True, db_index=True, verbose_name="Токен")
+    expires_at = models.DateTimeField(verbose_name="Срок действия")
+
+    class Meta:
+        verbose_name = "Мобильный токен для сканера"
+        verbose_name_plural = "Мобильные токены для сканера"
+
+    @classmethod
+    def issue(cls, cart, ttl_minutes=10):
+        return cls.objects.create(
+            cart=cart,
+            token=secrets.token_urlsafe(32),
+            expires_at=timezone.now() + timezone.timedelta(minutes=ttl_minutes),
+        )
+
+    def is_valid(self):
+        return timezone.now() <= self.expires_at
+
+    def __str__(self):
+        return f"Токен для корзины {self.cart_id} (действует до {self.expires_at})"
     
 class OrderItem(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)

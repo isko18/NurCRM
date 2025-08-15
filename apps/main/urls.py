@@ -1,5 +1,7 @@
 from django.urls import path
 from .views import *
+from .pos_views import *
+
 
 urlpatterns = [
 
@@ -26,8 +28,10 @@ urlpatterns = [
     # path('order-items/<uuid:pk>/', OrderItemAPIView.as_view(), name='order-item-detail'),
 
     # 🔹 Продукты, категории, бренды
-    path('products/', ProductListCreateAPIView.as_view(), name='product-list-create'),
+    path('products/create-by-barcode/', ProductCreateByBarcodeAPIView.as_view(), name='product-create-by-barcode'),
+    path('products/create-manual/', ProductCreateManualAPIView.as_view(), name='product-create-manual'),
     path('products/<uuid:pk>/', ProductRetrieveUpdateDestroyAPIView.as_view(), name='product-detail'),
+    path('products/barcode/<str:barcode>/', ProductByBarcodeAPIView.as_view(), name='product-by-barcode'),
 
     path('categories/', ProductCategoryListCreateAPIView.as_view(), name='category-list'),
     path('categories/<uuid:pk>/', ProductCategoryRetrieveUpdateDestroyAPIView.as_view(), name='category-detail'),
@@ -64,5 +68,17 @@ urlpatterns = [
     
     path('clients/', ClientListCreateAPIView.as_view(), name='client-list-create'),
     path('clients/<uuid:pk>/', ClientRetrieveUpdateDestroyAPIView.as_view(), name='client-detail'),
+    
+    path("pos/sales/", SaleListAPIView.as_view(), name="pos-sale-list"),
+    path("pos/sales/start/", SaleStartAPIView.as_view(), name="pos-sale-start"),
+    path("pos/sales/<uuid:pk>/", SaleDetailAPIView.as_view(), name="pos-sale-detail"),
+    path("pos/sales/<uuid:pk>/scan/", SaleScanAPIView.as_view(), name="pos-sale-scan"),
+    path("pos/sales/<uuid:pk>/add-item/", SaleAddItemAPIView.as_view(), name="pos-sale-add-item"),
+    path("pos/sales/<uuid:pk>/checkout/", SaleCheckoutAPIView.as_view(), name="pos-sale-checkout"),
+    path("pos/sales/<uuid:pk>/mobile-scanner/", SaleMobileScannerTokenAPIView.as_view(), name="pos-sale-mobile-scanner"),
+
+    # Поиск и телефон-сканер
+    path("pos/products/find/", ProductFindByBarcodeAPIView.as_view(), name="pos-product-find"),
+    path("pos/mobile-scanner/<str:token>/scan/", MobileScannerIngestAPIView.as_view(), name="pos-mobile-scan"),
 ]
 

@@ -1,8 +1,12 @@
 from rest_framework import serializers
-from apps.main.models import Contact, Pipeline, Deal, Task, Integration, Analytics, Order, Product, Review, Notification, Event, Warehouse, WarehouseEvent, ProductCategory, ProductBrand, OrderItem, Client  
+from apps.main.models import Contact, Pipeline, Deal, Task, Integration, Analytics, Order, Product, Review, Notification, Event, Warehouse, WarehouseEvent, ProductCategory, ProductBrand, OrderItem, Client, GlobalProduct, CartItem
+
 from apps.users.models import User, Company
+from django.db import transaction
 
 
+
+    
 class ProductCategorySerializer(serializers.ModelSerializer):
     parent = serializers.PrimaryKeyRelatedField(
         queryset=ProductCategory.objects.all(),
@@ -206,26 +210,84 @@ class OrderSerializer(serializers.ModelSerializer):
 
         return order
 
-
-
 class ProductSerializer(serializers.ModelSerializer):
     company = serializers.ReadOnlyField(source='company.id')
-    brand = serializers.PrimaryKeyRelatedField(queryset=ProductBrand.objects.all(), allow_null=True)
-    category = serializers.PrimaryKeyRelatedField(queryset=ProductCategory.objects.all(), allow_null=True)
+
+    # бренд и категория только для чтения (локальные, маппятся из глобальной базы)
+    brand = serializers.PrimaryKeyRelatedField(read_only=True)
+    category = serializers.PrimaryKeyRelatedField(read_only=True)
+
+    # ручное создание/редактирование — только для сценария без barcode
+    brand_name = serializers.CharField(write_only=True, required=False, allow_blank=True)
+    category_name = serializers.CharField(write_only=True, required=False, allow_blank=True)
 
     class Meta:
         model = Product
         fields = [
-            'id', 'name', 'article', 'brand', 'category',
-            'quantity', 'price', 'company', 'created_at', 'updated_at'
+            'id', 'name', 'barcode',
+            'brand', 'brand_name',
+            'category', 'category_name',
+            'quantity', 'price', 'company',
+            'created_at', 'updated_at'
         ]
-        read_only_fields = ['id', 'created_at', 'updated_at', 'company']
+        read_only_fields = [
+            'id', 'created_at', 'updated_at',
+            'company', 'name', 'brand', 'category'
+        ]
+        extra_kwargs = {
+            'price': {'required': False, 'default': 0},
+            'quantity': {'required': False, 'default': 0},
+        }
 
+    def validate_barcode(self, value):
+        value = str(value).strip()
+        if not value:
+            raise serializers.ValidationError("Укажите штрих-код.")
+        company = self.context['request'].user.company
+        if Product.objects.filter(company=company, barcode=value).exists():
+            raise serializers.ValidationError("В вашей компании уже есть товар с таким штрих-кодом.")
+        return value
+
+    def _ensure_company_brand(self, company, global_brand):
+        """Создаёт/находит локальный бренд по глобальному бренду."""
+        if global_brand:
+            return ProductBrand.objects.get_or_create(company=company, name=global_brand.name)[0]
+        return None
+
+    def _ensure_company_category(self, company, global_category):
+        """Создаёт/находит локальную категорию по глобальной категории."""
+        if global_category:
+            return ProductCategory.objects.get_or_create(company=company, name=global_category.name)[0]
+        return None
+
+    @transaction.atomic
     def create(self, validated_data):
-        validated_data['company'] = self.context['request'].user.company
-        return super().create(validated_data)
-    
+        request = self.context['request']
+        company = request.user.company
+        barcode = validated_data['barcode']
 
+        # 1. Ищем товар в глобальной базе
+        gp = GlobalProduct.objects.select_related('brand', 'category').filter(barcode=barcode).first()
+        if not gp:
+            raise serializers.ValidationError({
+                "barcode": "Товар с таким штрих-кодом не найден в глобальной базе. Заполните карточку вручную."
+            })
+
+        # 2. Маппим бренд и категорию в локальную базу компании
+        brand = self._ensure_company_brand(company, gp.brand)
+        category = self._ensure_company_category(company, gp.category)
+
+        # 3. Создаём товар компании
+        return Product.objects.create(
+            company=company,
+            name=gp.name,
+            barcode=gp.barcode,
+            brand=brand,
+            category=category,
+            price=validated_data.get('price', 0),
+            quantity=validated_data.get('quantity', 0),
+        )
+        
 class ReviewSerializer(serializers.ModelSerializer):
     user = serializers.ReadOnlyField(source='user.id')
     company = serializers.ReadOnlyField(source='company.id')
@@ -379,3 +441,6 @@ class ClientSerializer(serializers.ModelSerializer):
     def create(self, validated_data):
         validated_data['company'] = self.context['request'].user.company
         return super().create(validated_data)
+    
+    
+    
