@@ -355,7 +355,7 @@ class ProductByBarcodeAPIView(CompanyRestrictedMixin, generics.RetrieveAPIView):
             raise NotFound(detail="Товар с таким штрих-кодом не найден")
         return product
         
-class ProductListView(generics.ListAPIView):
+class ProductListView(CompanyRestrictedMixin, generics.ListAPIView):
     serializer_class = ProductSerializer
     filter_backends = [filters.SearchFilter, filters.OrderingFilter]
     search_fields = ['name', 'barcode']
