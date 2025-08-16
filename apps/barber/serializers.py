@@ -4,15 +4,26 @@ from .models import BarberProfile, Service, Client, Appointment
 
 
 class CompanyReadOnlyMixin:
-    """Делает company read-only и проставляет её на create."""
+    """
+    Делает company read-only наружу и гарантированно проставляет её
+    из request.user.company на create/update.
+    """
     def create(self, validated_data):
         request = self.context.get('request')
-        if request and request.user and request.user.company_id:
+        if request and request.user and getattr(request.user, 'company_id', None):
             validated_data['company'] = request.user.company
         return super().create(validated_data)
 
+    def update(self, instance, validated_data):
+        # Не даём подменить компанию и поддерживаем единообразие.
+        request = self.context.get('request')
+        if request and request.user and getattr(request.user, 'company_id', None):
+            validated_data['company'] = request.user.company
+        return super().update(instance, validated_data)
+
 
 class BarberProfileSerializer(CompanyReadOnlyMixin, serializers.ModelSerializer):
+    # Показываем id компании в ответе, но не принимаем его на вход
     company = serializers.ReadOnlyField(source='company.id')
 
     class Meta:
@@ -43,6 +54,7 @@ class ClientSerializer(CompanyReadOnlyMixin, serializers.ModelSerializer):
             'birth_date', 'status', 'notes', 'created_at'
         ]
         read_only_fields = ['id', 'created_at', 'company']
+        # Чтобы не конфликтовать с другим ClientSerializer в проекте
         ref_name = 'BarberClient'
 
 
@@ -65,7 +77,11 @@ class AppointmentSerializer(CompanyReadOnlyMixin, serializers.ModelSerializer):
         read_only_fields = ['id', 'created_at', 'company']
 
     def validate(self, attrs):
-        """Проверки перед сохранением + принадлежность компании."""
+        """
+        Проверки перед сохранением:
+        - принадлежность client/barber/service той же компании, что и у пользователя;
+        - доменные проверки через model.clean()
+        """
         request = self.context.get('request')
         user_company = getattr(getattr(request, 'user', None), 'company', None)
 
@@ -77,12 +93,11 @@ class AppointmentSerializer(CompanyReadOnlyMixin, serializers.ModelSerializer):
             if obj and obj.company_id != getattr(user_company, 'id', None):
                 raise serializers.ValidationError({name: 'Объект не принадлежит вашей компании.'})
 
+        # Соберём временный инстанс для clean()
         instance = Appointment(**attrs)
-        # Если редактируем — надо передать id, чтобы не конфликтовал с самим собой
         if self.instance:
             instance.id = self.instance.id
 
-        # Вызовем clean() из модели (валидация пересечений и т.п.)
         try:
             instance.clean()
         except Exception as e:
