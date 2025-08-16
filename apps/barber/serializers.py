@@ -54,7 +54,10 @@ class ClientSerializer(CompanyReadOnlyMixin, serializers.ModelSerializer):
             'birth_date', 'status', 'notes', 'created_at'
         ]
         read_only_fields = ['id', 'created_at', 'company']
+<<<<<<< HEAD
         # Чтобы не конфликтовать с другим ClientSerializer в проекте
+=======
+>>>>>>> 074d580 (barber)
         ref_name = 'BarberClient'
 
 
@@ -77,11 +80,15 @@ class AppointmentSerializer(CompanyReadOnlyMixin, serializers.ModelSerializer):
         read_only_fields = ['id', 'created_at', 'company']
 
     def validate(self, attrs):
+<<<<<<< HEAD
         """
         Проверки перед сохранением:
         - принадлежность client/barber/service той же компании, что и у пользователя;
         - доменные проверки через model.clean()
         """
+=======
+        """Проверки перед сохранением + принадлежность компании."""
+>>>>>>> 074d580 (barber)
         request = self.context.get('request')
         user_company = getattr(getattr(request, 'user', None), 'company', None)
 
@@ -93,11 +100,20 @@ class AppointmentSerializer(CompanyReadOnlyMixin, serializers.ModelSerializer):
             if obj and obj.company_id != getattr(user_company, 'id', None):
                 raise serializers.ValidationError({name: 'Объект не принадлежит вашей компании.'})
 
+<<<<<<< HEAD
         # Соберём временный инстанс для clean()
         instance = Appointment(**attrs)
         if self.instance:
             instance.id = self.instance.id
 
+=======
+        instance = Appointment(**attrs)
+        # Если редактируем — надо передать id, чтобы не конфликтовал с самим собой
+        if self.instance:
+            instance.id = self.instance.id
+
+        # Вызовем clean() из модели (валидация пересечений и т.п.)
+>>>>>>> 074d580 (barber)
         try:
             instance.clean()
         except Exception as e:
