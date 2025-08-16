@@ -28,6 +28,7 @@ urlpatterns = [
     # path('order-items/<uuid:pk>/', OrderItemAPIView.as_view(), name='order-item-detail'),
 
     # 🔹 Продукты, категории, бренды
+    path('products/list/', ProductListView.as_view(), name='product-list'),
     path('products/create-by-barcode/', ProductCreateByBarcodeAPIView.as_view(), name='product-create-by-barcode'),
     path('products/create-manual/', ProductCreateManualAPIView.as_view(), name='product-create-manual'),
     path('products/<uuid:pk>/', ProductRetrieveUpdateDestroyAPIView.as_view(), name='product-detail'),

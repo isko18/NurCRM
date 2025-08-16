@@ -355,6 +355,15 @@ class ProductByBarcodeAPIView(CompanyRestrictedMixin, generics.RetrieveAPIView):
             raise NotFound(detail="Товар с таким штрих-кодом не найден")
         return product
         
+class ProductListView(generics.ListAPIView):
+    serializer_class = ProductSerializer
+    filter_backends = [filters.SearchFilter, filters.OrderingFilter]
+    search_fields = ['name', 'barcode']
+    ordering_fields = ['created_at', 'updated_at', 'price']
+
+    def get_queryset(self):
+        return Product.objects.filter(company=self.request.user.company)
+        
 class OrderAnalyticsView(APIView):
     permission_classes = [IsAuthenticated]
 
