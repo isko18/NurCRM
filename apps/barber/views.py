@@ -12,7 +12,7 @@ from .serializers import (
 
 class CompanyQuerysetMixin:
     """
-    Миксин для фильтрации по компании текущего пользователя.
+    Миксин для скоупа по компании текущего пользователя + защита company на update.
     """
     def get_queryset(self):
         # Fix для drf_yasg
@@ -25,10 +25,14 @@ class CompanyQuerysetMixin:
 
     def perform_create(self, serializer):
         company = getattr(self.request.user, 'company', None) or getattr(self.request.user, 'owned_company', None)
-        if company:
-            serializer.save(company=company)
-        else:
-            serializer.save()
+        serializer.save(company=company)
+
+    def perform_update(self, serializer):
+        """
+        Не даём сменить company при обновлении.
+        """
+        company = getattr(self.request.user, 'company', None) or getattr(self.request.user, 'owned_company', None)
+        serializer.save(company=company)
 
 
 # ==== Barber ====
@@ -78,7 +82,9 @@ class ClientRetrieveUpdateDestroyView(CompanyQuerysetMixin, generics.RetrieveUpd
 
 # ==== Appointment ====
 class AppointmentListCreateView(CompanyQuerysetMixin, generics.ListCreateAPIView):
-    queryset = Appointment.objects.select_related('client', 'barber', 'service').all()
+    queryset = (Appointment.objects
+                .select_related('client', 'barber', 'service')
+                .all())
     serializer_class = AppointmentSerializer
     permission_classes = [permissions.IsAuthenticated]
     filter_backends = [DjangoFilterBackend]
@@ -86,6 +92,8 @@ class AppointmentListCreateView(CompanyQuerysetMixin, generics.ListCreateAPIView
 
 
 class AppointmentRetrieveUpdateDestroyView(CompanyQuerysetMixin, generics.RetrieveUpdateDestroyAPIView):
-    queryset = Appointment.objects.select_related('client', 'barber', 'service').all()
+    queryset = (Appointment.objects
+                .select_related('client', 'barber', 'service')
+                .all())
     serializer_class = AppointmentSerializer
     permission_classes = [permissions.IsAuthenticated]
