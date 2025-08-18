@@ -1,6 +1,6 @@
 # barber_crm/serializers.py
 from rest_framework import serializers
-from .models import BarberProfile, Service, Client, Appointment
+from .models import BarberProfile, Service, Client, Appointment, Document
 
 
 class CompanyReadOnlyMixin:
@@ -104,3 +104,29 @@ class AppointmentSerializer(CompanyReadOnlyMixin, serializers.ModelSerializer):
             raise serializers.ValidationError(str(e))
 
         return attrs
+
+
+# ===== Documents =====
+class DocumentSerializer(CompanyReadOnlyMixin, serializers.ModelSerializer):
+    company = serializers.ReadOnlyField(source='company.id')
+    folder_name = serializers.CharField(source='folder.name', read_only=True)
+
+    class Meta:
+        model = Document
+        fields = [
+            'id', 'company', 'name', 'file',
+            'folder', 'folder_name',
+            'created_at', 'updated_at'
+        ]
+        read_only_fields = ['id', 'company', 'created_at', 'updated_at', 'folder_name']
+
+    def validate_folder(self, folder):
+        """
+        Если у папки есть company, она должна совпадать с company текущего пользователя.
+        """
+        request = self.context.get('request')
+        user_company_id = getattr(getattr(request, 'user', None), 'company_id', None)
+        folder_company_id = getattr(getattr(folder, 'company', None), 'id', None)
+        if folder_company_id and user_company_id and folder_company_id != user_company_id:
+            raise serializers.ValidationError('Папка принадлежит другой компании.')
+        return folder

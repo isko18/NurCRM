@@ -173,3 +173,55 @@ class Appointment(models.Model):
     def save(self, *args, **kwargs):
         self.full_clean()
         return super().save(*args, **kwargs)
+
+
+class Folder(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    company = models.ForeignKey(
+        Company, on_delete=models.CASCADE, related_name='folders', verbose_name='Компания'
+    )
+    name = models.CharField('Название папки', max_length=255)
+    parent = models.ForeignKey(
+        'self', on_delete=models.CASCADE, null=True, blank=True,
+        related_name='children', verbose_name='Родительская папка'
+    )
+
+    class Meta:
+        verbose_name = 'Папка'
+        verbose_name_plural = 'Папки'
+        unique_together = (('company', 'parent', 'name'),)
+        indexes = [models.Index(fields=['company', 'parent', 'name'])]
+
+    def __str__(self):
+        return self.name
+
+
+class Document(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)  # UUID PK
+    company = models.ForeignKey(
+        Company, on_delete=models.CASCADE, related_name="documents", verbose_name="Компания"
+    )
+
+    name = models.CharField("Название документа", max_length=255, blank=True)
+    file = models.FileField("Файл", upload_to="documents/")
+    folder = models.ForeignKey(
+        Folder, on_delete=models.CASCADE, related_name="documents", verbose_name="Папка"
+    )
+
+    created_at = models.DateTimeField("Создан", auto_now_add=True)
+    updated_at = models.DateTimeField("Обновлён", auto_now=True)
+
+    class Meta:
+        verbose_name = "Документ"
+        verbose_name_plural = "Документы"
+        ordering = ["name"]
+        indexes = [models.Index(fields=["company"])]
+
+    def __str__(self):
+        return self.name or self.file.name
+
+    def clean(self):
+        # Проверяем, что папка и документ одной компании (если у папки есть company)
+        folder_company_id = getattr(self.folder, 'company_id', None)
+        if folder_company_id and self.company_id and folder_company_id != self.company_id:
+            raise ValidationError({'folder': 'Папка принадлежит другой компании.'})
