@@ -169,6 +169,7 @@ class FolderSerializer(CompanyReadOnlyMixin, serializers.ModelSerializer):
         model = Folder
         fields = ['id', 'company', 'name', 'parent', 'parent_name']
         read_only_fields = ['id', 'company', 'parent_name']
+        ref_name = "EducationFolder"
 
     def validate_parent(self, parent):
         if parent is None:
@@ -193,6 +194,8 @@ class DocumentSerializer(CompanyReadOnlyMixin, serializers.ModelSerializer):
             'created_at', 'updated_at'
         ]
         read_only_fields = ['id', 'company', 'created_at', 'updated_at', 'folder_name']
+        ref_name = "EducationDocument"
+        
 
     def validate_folder(self, folder):
         request = self.context.get('request')
