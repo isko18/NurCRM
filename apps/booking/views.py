@@ -1,18 +1,24 @@
 # views.py
 from rest_framework import generics, permissions
-from django_filters.rest_framework import DjangoFilterBackend
-
-from .models import Hotel, ConferenceRoom, Booking, ManagerAssignment, Document, Folder
-from .serializers import (
-    HotelSerializer, RoomSerializer, BookingSerializer, ManagerAssignmentSerializer, FolderSerializer, DocumentSerializer
-)
-from .permissions import IsAdminOrReadOnly, IsManagerOrAdmin
 from rest_framework.parsers import MultiPartParser, FormParser
 from django_filters import rest_framework as filters
+from django_filters.rest_framework import DjangoFilterBackend
 
+from .models import (
+    Hotel, ConferenceRoom, Booking, ManagerAssignment,
+    Folder, Document,
+)
+from .serializers import (
+    HotelSerializer, RoomSerializer, BookingSerializer, ManagerAssignmentSerializer,
+    FolderSerializer, DocumentSerializer,
+)
+from .permissions import IsAdminOrReadOnly, IsManagerOrAdmin
+
+
+# ---- Кастомный фильтр для Document (не трогаем FileField напрямую) ----
 class DocumentFilter(filters.FilterSet):
     name = filters.CharFilter(lookup_expr='icontains')
-    folder = filters.UUIDFilter(field_name='folder__id')      # фильтр по UUID папки
+    folder = filters.UUIDFilter(field_name='folder__id')          # фильтр по UUID папки
     file_name = filters.CharFilter(field_name='file', lookup_expr='icontains')
     created_at = filters.DateTimeFromToRangeFilter()
     updated_at = filters.DateTimeFromToRangeFilter()
@@ -21,16 +27,16 @@ class DocumentFilter(filters.FilterSet):
         model = Document
         fields = ['name', 'folder', 'file_name', 'created_at', 'updated_at']
 
+
 class CompanyQuerysetMixin:
     """
-    Скоуп по компании текущего пользователя.
+    Скоуп по компании текущего пользователя + защита company на create/update.
     Безопасен для drf_yasg (swagger_fake_view) и AnonymousUser.
     """
     def _user_company(self):
         user = getattr(self.request, "user", None)
         if not user or not getattr(user, "is_authenticated", False):
             return None
-        # поддержка как user.company, так и user.owned_company (если есть)
         return getattr(user, "company", None) or getattr(user, "owned_company", None)
 
     def get_queryset(self):
@@ -42,7 +48,6 @@ class CompanyQuerysetMixin:
 
     def perform_create(self, serializer):
         company = self._user_company()
-        # сериалайзеры уже используют HiddenField(company), но дублируем для надёжности
         serializer.save(company=company) if company else serializer.save()
 
     def perform_update(self, serializer):
@@ -54,15 +59,16 @@ class CompanyQuerysetMixin:
 class HotelListCreateView(CompanyQuerysetMixin, generics.ListCreateAPIView):
     queryset = Hotel.objects.all()
     serializer_class = HotelSerializer
-    # permissions — используем глобальные настройки; в исходном ViewSet не было явного класса
+    permission_classes = [permissions.IsAuthenticated]
     filter_backends = [DjangoFilterBackend]
-    filterset_fields = [f.name for f in Hotel._meta.get_fields() if not f.is_relation or f.many_to_one]
+    filterset_fields = [f.name for f in Hotel._meta.get_fields()
+                        if not f.is_relation or f.many_to_one]
 
 
 class HotelRetrieveUpdateDestroyView(CompanyQuerysetMixin, generics.RetrieveUpdateDestroyAPIView):
     queryset = Hotel.objects.all()
     serializer_class = HotelSerializer
-    filter_backends = [DjangoFilterBackend]
+    permission_classes = [permissions.IsAuthenticated]
 
 
 # ========= ConferenceRoom (Room) =========
@@ -71,7 +77,8 @@ class RoomListCreateView(CompanyQuerysetMixin, generics.ListCreateAPIView):
     serializer_class = RoomSerializer
     permission_classes = [IsAdminOrReadOnly]
     filter_backends = [DjangoFilterBackend]
-    filterset_fields = [f.name for f in ConferenceRoom._meta.get_fields() if not f.is_relation or f.many_to_one]
+    filterset_fields = [f.name for f in ConferenceRoom._meta.get_fields()
+                        if not f.is_relation or f.many_to_one]
 
 
 class RoomRetrieveUpdateDestroyView(CompanyQuerysetMixin, generics.RetrieveUpdateDestroyAPIView):
@@ -86,7 +93,8 @@ class BookingListCreateView(CompanyQuerysetMixin, generics.ListCreateAPIView):
     serializer_class = BookingSerializer
     permission_classes = [permissions.IsAuthenticated]
     filter_backends = [DjangoFilterBackend]
-    filterset_fields = [f.name for f in Booking._meta.get_fields() if not f.is_relation or f.many_to_one]
+    filterset_fields = [f.name for f in Booking._meta.get_fields()
+                        if not f.is_relation or f.many_to_one]
 
 
 class BookingRetrieveUpdateDestroyView(CompanyQuerysetMixin, generics.RetrieveUpdateDestroyAPIView):
@@ -101,7 +109,8 @@ class ManagerAssignmentListCreateView(CompanyQuerysetMixin, generics.ListCreateA
     serializer_class = ManagerAssignmentSerializer
     permission_classes = [IsManagerOrAdmin]
     filter_backends = [DjangoFilterBackend]
-    filterset_fields = [f.name for f in ManagerAssignment._meta.get_fields() if not f.is_relation or f.many_to_one]
+    filterset_fields = [f.name for f in ManagerAssignment._meta.get_fields()
+                        if not f.is_relation or f.many_to_one]
 
 
 class ManagerAssignmentRetrieveUpdateDestroyView(CompanyQuerysetMixin, generics.RetrieveUpdateDestroyAPIView):
@@ -110,29 +119,32 @@ class ManagerAssignmentRetrieveUpdateDestroyView(CompanyQuerysetMixin, generics.
     permission_classes = [IsManagerOrAdmin]
 
 
+# ========= Folder =========
 class FolderListCreateView(CompanyQuerysetMixin, generics.ListCreateAPIView):
     queryset = Folder.objects.select_related('parent').all()
     serializer_class = FolderSerializer
     permission_classes = [permissions.IsAuthenticated]
     filter_backends = [DjangoFilterBackend]
-    # здесь FileField нет — автогенерация безопасна
     filterset_fields = [f.name for f in Folder._meta.get_fields()
                         if not f.is_relation or f.many_to_one]
     ordering = ['name']
+
 
 class FolderRetrieveUpdateDestroyView(CompanyQuerysetMixin, generics.RetrieveUpdateDestroyAPIView):
     queryset = Folder.objects.select_related('parent').all()
     serializer_class = FolderSerializer
     permission_classes = [permissions.IsAuthenticated]
 
-# ==== Document ====
+
+# ========= Document =========
 class DocumentListCreateView(CompanyQuerysetMixin, generics.ListCreateAPIView):
     queryset = Document.objects.select_related('folder').all()
     serializer_class = DocumentSerializer
     permission_classes = [permissions.IsAuthenticated]
     parser_classes = [MultiPartParser, FormParser]
     filter_backends = [DjangoFilterBackend]
-    filterset_class = DocumentFilter   # <-- вместо автогенерации по полям
+    filterset_class = DocumentFilter   # без автогенерации по FileField
+
 
 class DocumentRetrieveUpdateDestroyView(CompanyQuerysetMixin, generics.RetrieveUpdateDestroyAPIView):
     queryset = Document.objects.select_related('folder').all()
