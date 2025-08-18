@@ -178,7 +178,7 @@ class Appointment(models.Model):
 class Folder(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     company = models.ForeignKey(
-        Company, on_delete=models.CASCADE, related_name='folders', verbose_name='Компания'
+        Company, on_delete=models.CASCADE, related_name='barber_folders', verbose_name='Компания'
     )
     name = models.CharField('Название папки', max_length=255)
     parent = models.ForeignKey(
@@ -199,7 +199,7 @@ class Folder(models.Model):
 class Document(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)  # UUID PK
     company = models.ForeignKey(
-        Company, on_delete=models.CASCADE, related_name="documents", verbose_name="Компания"
+        Company, on_delete=models.CASCADE, related_name="barber_documents", verbose_name="Компания"
     )
 
     name = models.CharField("Название документа", max_length=255, blank=True)

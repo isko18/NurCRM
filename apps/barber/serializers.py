@@ -1,6 +1,6 @@
 # barber_crm/serializers.py
 from rest_framework import serializers
-from .models import BarberProfile, Service, Client, Appointment, Document
+from .models import BarberProfile, Service, Client, Appointment, Document, Folder
 
 
 class CompanyReadOnlyMixin:
@@ -104,6 +104,31 @@ class AppointmentSerializer(CompanyReadOnlyMixin, serializers.ModelSerializer):
             raise serializers.ValidationError(str(e))
 
         return attrs
+
+
+class FolderSerializer(CompanyReadOnlyMixin, serializers.ModelSerializer):
+    company = serializers.ReadOnlyField(source='company.id')
+    parent = serializers.PrimaryKeyRelatedField(
+        queryset=Folder.objects.all(), allow_null=True, required=False
+    )
+    parent_name = serializers.CharField(source='parent.name', read_only=True)
+
+    class Meta:
+        model = Folder
+        fields = ['id', 'company', 'name', 'parent', 'parent_name']
+        read_only_fields = ['id', 'company', 'parent_name']
+
+    def validate_parent(self, parent):
+        """
+        Родительская папка (если указана) должна принадлежать той же компании.
+        """
+        if parent is None:
+            return parent
+        request = self.context.get('request')
+        user_company_id = getattr(getattr(request, 'user', None), 'company_id', None)
+        if user_company_id and parent.company_id != user_company_id:
+            raise serializers.ValidationError('Родительская папка принадлежит другой компании.')
+        return parent
 
 
 # ===== Documents =====
