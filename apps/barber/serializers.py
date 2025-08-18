@@ -117,6 +117,8 @@ class FolderSerializer(CompanyReadOnlyMixin, serializers.ModelSerializer):
         model = Folder
         fields = ['id', 'company', 'name', 'parent', 'parent_name']
         read_only_fields = ['id', 'company', 'parent_name']
+        ref_name = 'BarberFolder'
+        
 
     def validate_parent(self, parent):
         """
@@ -135,8 +137,10 @@ class FolderSerializer(CompanyReadOnlyMixin, serializers.ModelSerializer):
 class DocumentSerializer(CompanyReadOnlyMixin, serializers.ModelSerializer):
     company = serializers.ReadOnlyField(source='company.id')
     folder_name = serializers.CharField(source='folder.name', read_only=True)
+    
 
     class Meta:
+        ref_name = 'BarberDocument'
         model = Document
         fields = [
             'id', 'company', 'name', 'file',
@@ -155,3 +159,4 @@ class DocumentSerializer(CompanyReadOnlyMixin, serializers.ModelSerializer):
         if folder_company_id and user_company_id and folder_company_id != user_company_id:
             raise serializers.ValidationError('Папка принадлежит другой компании.')
         return folder
+    
