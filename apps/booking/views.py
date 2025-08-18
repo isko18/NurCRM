@@ -8,6 +8,18 @@ from .serializers import (
 )
 from .permissions import IsAdminOrReadOnly, IsManagerOrAdmin
 from rest_framework.parsers import MultiPartParser, FormParser
+from django_filters import rest_framework as filters
+
+class DocumentFilter(filters.FilterSet):
+    name = filters.CharFilter(lookup_expr='icontains')
+    folder = filters.UUIDFilter(field_name='folder__id')      # фильтр по UUID папки
+    file_name = filters.CharFilter(field_name='file', lookup_expr='icontains')
+    created_at = filters.DateTimeFromToRangeFilter()
+    updated_at = filters.DateTimeFromToRangeFilter()
+
+    class Meta:
+        model = Document
+        fields = ['name', 'folder', 'file_name', 'created_at', 'updated_at']
 
 class CompanyQuerysetMixin:
     """
@@ -103,34 +115,27 @@ class FolderListCreateView(CompanyQuerysetMixin, generics.ListCreateAPIView):
     serializer_class = FolderSerializer
     permission_classes = [permissions.IsAuthenticated]
     filter_backends = [DjangoFilterBackend]
-    filterset_fields = [f.name for f in Folder._meta.get_fields() if not f.is_relation or f.many_to_one]
+    # здесь FileField нет — автогенерация безопасна
+    filterset_fields = [f.name for f in Folder._meta.get_fields()
+                        if not f.is_relation or f.many_to_one]
     ordering = ['name']
-
 
 class FolderRetrieveUpdateDestroyView(CompanyQuerysetMixin, generics.RetrieveUpdateDestroyAPIView):
     queryset = Folder.objects.select_related('parent').all()
     serializer_class = FolderSerializer
     permission_classes = [permissions.IsAuthenticated]
-    
+
+# ==== Document ====
 class DocumentListCreateView(CompanyQuerysetMixin, generics.ListCreateAPIView):
-    queryset = (
-        Document.objects
-        .select_related('folder')
-        .all()
-    )
+    queryset = Document.objects.select_related('folder').all()
     serializer_class = DocumentSerializer
     permission_classes = [permissions.IsAuthenticated]
     parser_classes = [MultiPartParser, FormParser]
     filter_backends = [DjangoFilterBackend]
-    filterset_fields = [f.name for f in Document._meta.get_fields() if not f.is_relation or f.many_to_one]
-
+    filterset_class = DocumentFilter   # <-- вместо автогенерации по полям
 
 class DocumentRetrieveUpdateDestroyView(CompanyQuerysetMixin, generics.RetrieveUpdateDestroyAPIView):
-    queryset = (
-        Document.objects
-        .select_related('folder')
-        .all()
-    )
+    queryset = Document.objects.select_related('folder').all()
     serializer_class = DocumentSerializer
     permission_classes = [permissions.IsAuthenticated]
     parser_classes = [MultiPartParser, FormParser]
