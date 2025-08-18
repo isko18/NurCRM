@@ -1,13 +1,26 @@
-from django.urls import path, include
-from rest_framework.routers import DefaultRouter
-from .views import RoomViewSet, BookingViewSet, ManagerAssignmentViewSet, HotelViewSet
-
-router = DefaultRouter()
-router.register('rooms', RoomViewSet)
-router.register('bookings', BookingViewSet)
-router.register('assignments', ManagerAssignmentViewSet)
-router.register('hotels', HotelViewSet)
+from django.urls import path
+from .views import (
+    HotelListCreateView, HotelRetrieveUpdateDestroyView,
+    RoomListCreateView, RoomRetrieveUpdateDestroyView,
+    BookingListCreateView, BookingRetrieveUpdateDestroyView,
+    ManagerAssignmentListCreateView, ManagerAssignmentRetrieveUpdateDestroyView, FolderListCreateView, FolderRetrieveUpdateDestroyView, DocumentListCreateView, DocumentRetrieveUpdateDestroyView
+)
 
 urlpatterns = [
-    path('', include(router.urls)),
+    path('hotels/', HotelListCreateView.as_view(), name='hotel-list'),
+    path('hotels/<uuid:pk>/', HotelRetrieveUpdateDestroyView.as_view(), name='hotel-detail'),
+
+    path('rooms/', RoomListCreateView.as_view(), name='room-list'),
+    path('rooms/<uuid:pk>/', RoomRetrieveUpdateDestroyView.as_view(), name='room-detail'),
+
+    path('bookings/', BookingListCreateView.as_view(), name='booking-list'),
+    path('bookings/<uuid:pk>/', BookingRetrieveUpdateDestroyView.as_view(), name='booking-detail'),
+
+    path('manager-assignments/', ManagerAssignmentListCreateView.as_view(), name='manager-assignment-list'),
+    path('manager-assignments/<uuid:pk>/', ManagerAssignmentRetrieveUpdateDestroyView.as_view(), name='manager-assignment-detail'),
+    
+    path('folders/', FolderListCreateView.as_view(), name='folder-list'),
+    path('folders/<uuid:pk>/', FolderRetrieveUpdateDestroyView.as_view(), name='folder-detail'),
+    path('documents/', DocumentListCreateView.as_view(), name='document-list'),
+    path('documents/<uuid:pk>/', DocumentRetrieveUpdateDestroyView.as_view(), name='document-detail'),
 ]

@@ -1,12 +1,13 @@
 # barber_crm/views.py
 from rest_framework import generics, permissions
 from django_filters.rest_framework import DjangoFilterBackend
-from .models import BarberProfile, Service, Client, Appointment, Document
+from .models import BarberProfile, Service, Client, Appointment, Document, Folder
 from .serializers import (
     BarberProfileSerializer,
     ServiceSerializer,
     ClientSerializer,
     AppointmentSerializer,
+    FolderSerializer,
     DocumentSerializer,
 )
 from rest_framework.parsers import MultiPartParser, FormParser
@@ -100,7 +101,20 @@ class AppointmentRetrieveUpdateDestroyView(CompanyQuerysetMixin, generics.Retrie
     serializer_class = AppointmentSerializer
     permission_classes = [permissions.IsAuthenticated]
 
+class FolderListCreateView(CompanyQuerysetMixin, generics.ListCreateAPIView):
+    queryset = Folder.objects.select_related('parent').all()
+    serializer_class = FolderSerializer
+    permission_classes = [permissions.IsAuthenticated]
+    filter_backends = [DjangoFilterBackend]
+    filterset_fields = [f.name for f in Folder._meta.get_fields() if not f.is_relation or f.many_to_one]
+    ordering = ['name']
 
+
+class FolderRetrieveUpdateDestroyView(CompanyQuerysetMixin, generics.RetrieveUpdateDestroyAPIView):
+    queryset = Folder.objects.select_related('parent').all()
+    serializer_class = FolderSerializer
+    permission_classes = [permissions.IsAuthenticated]
+    
 class DocumentListCreateView(CompanyQuerysetMixin, generics.ListCreateAPIView):
     queryset = (
         Document.objects

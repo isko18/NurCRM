@@ -18,6 +18,9 @@ urlpatterns = [
     # Записи
     path('appointments/', views.AppointmentListCreateView.as_view(), name='appointment-list'),
     path('appointments/<uuid:pk>/', views.AppointmentRetrieveUpdateDestroyView.as_view(), name='appointment-detail'),
+    
+    path('folders/', views.FolderListCreateView.as_view(), name='folder-list'),
+    path('folders/<uuid:pk>/', views.FolderRetrieveUpdateDestroyView.as_view(), name='folder-detail'),
     path('documents/', views.DocumentListCreateView.as_view(), name='document-list'),
     path('documents/<uuid:pk>/', views.DocumentRetrieveUpdateDestroyView.as_view(), name='document-detail'),
 ]
