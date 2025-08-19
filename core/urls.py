@@ -44,6 +44,9 @@ apps_includes = [
     path('construction/', include('apps.construction.urls')),  
     path('booking/', include('apps.booking.urls')),  
     path('barbershop/', include('apps.barber.urls')),  
+    path('educationa/', include('apps.educationa.urls')),  
+
+
     
     
 ]
