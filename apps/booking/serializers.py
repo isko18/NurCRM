@@ -69,6 +69,7 @@ class BookingSerializer(CompanyReadOnlyMixin, serializers.ModelSerializer):
     reserved_by = serializers.HiddenField(default=CurrentUserDefault())
 
     class Meta:
+        ref_name = 'BookingBooking'
         model = Booking
         fields = [
             "id", "company",

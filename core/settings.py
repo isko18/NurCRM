@@ -49,7 +49,8 @@ INSTALLED_APPS = [
     'apps.construction',
     'apps.booking',
     'apps.barber',
-    'apps.education'
+    'apps.education',
+    'apps.cafe',
     
 ]
 
