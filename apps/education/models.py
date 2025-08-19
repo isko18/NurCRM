@@ -24,11 +24,6 @@ class Lead(models.Model):
     note = models.TextField("Заметка", blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
 
-    student = models.OneToOneField(
-        "Student", on_delete=models.SET_NULL, null=True, blank=True,
-        related_name="lead", verbose_name="Студент"
-    )
-
     class Meta:
         verbose_name = "Лид"
         verbose_name_plural = "Лиды"

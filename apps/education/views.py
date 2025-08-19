@@ -56,17 +56,19 @@ class CompanyQuerysetMixin:
 
 # ===== Leads =====
 class LeadListCreateView(CompanyQuerysetMixin, generics.ListCreateAPIView):
-    queryset = Lead.objects.select_related('student').all()
+    queryset = Lead.objects.all()  # убрали select_related('student')
     serializer_class = LeadSerializer
     permission_classes = [permissions.IsAuthenticated]
     filter_backends = [DjangoFilterBackend]
-    filterset_fields = [f.name for f in Lead._meta.get_fields() if not f.is_relation or f.many_to_one]
+    # без student/*:
+    filterset_fields = ['id', 'company', 'name', 'phone', 'source', 'note', 'created_at']
 
 
 class LeadRetrieveUpdateDestroyView(CompanyQuerysetMixin, generics.RetrieveUpdateDestroyAPIView):
-    queryset = Lead.objects.select_related('student').all()
+    queryset = Lead.objects.all()  # убрали select_related('student')
     serializer_class = LeadSerializer
     permission_classes = [permissions.IsAuthenticated]
+
 
 
 # ===== Courses =====

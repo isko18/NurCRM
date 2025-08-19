@@ -23,33 +23,13 @@ class CompanyReadOnlyMixin:
 # ====== Lead ======
 class LeadSerializer(CompanyReadOnlyMixin, serializers.ModelSerializer):
     company = serializers.ReadOnlyField(source='company.id')
-    student = serializers.PrimaryKeyRelatedField(
-        queryset=Student.objects.all(), allow_null=True, required=False
-    )
-    # для удобного отображения
-    student_name = serializers.CharField(source='student.name', read_only=True)
 
     class Meta:
         model = Lead
         fields = [
-            'id', 'company', 'name', 'phone', 'source', 'note',
-            'created_at', 'student', 'student_name'
+            'id', 'company', 'name', 'phone', 'source', 'note', 'created_at'
         ]
-        read_only_fields = ['id', 'company', 'created_at', 'student_name']
-
-    def validate_student(self, student):
-        if student is None:
-            return student
-        request = self.context.get('request')
-        user_company_id = getattr(getattr(request, 'user', None), 'company_id', None)
-        if user_company_id and student.company_id != user_company_id:
-            raise serializers.ValidationError('Студент принадлежит другой компании.')
-        # запрет связывать студента, у которого уже есть лид (OneToOne)
-        inst = getattr(self, 'instance', None)
-        if hasattr(student, 'lead') and (inst is None or student.lead_id != getattr(inst, 'id', None)):
-            raise serializers.ValidationError('Этот студент уже связан с другим лидом.')
-        return student
-
+        read_only_fields = ['id', 'company', 'created_at']
 
 # ====== Course ======
 class CourseSerializer(CompanyReadOnlyMixin, serializers.ModelSerializer):
