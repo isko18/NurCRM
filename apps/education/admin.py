@@ -59,10 +59,9 @@ class CompanyScopedAdmin(admin.ModelAdmin):
 # ===== Lead =====
 @admin.register(Lead)
 class LeadAdmin(CompanyScopedAdmin):
-    list_display = ("name", "phone", "source", "student", "created_at")
+    list_display = ("name", "phone", "source", "created_at")
     list_filter = ("source", "created_at")
     search_fields = ("name", "phone", "note")
-    list_select_related = ("student",)
 
 
 # ===== Course =====
