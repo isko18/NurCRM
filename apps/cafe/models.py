@@ -61,7 +61,7 @@ class Booking(models.Model):
     phone = models.CharField('Телефон', max_length=32, blank=True)
     date = models.DateField('Дата')
     time = models.TimeField('Время')
-    guests = models.PositiveSmallIntegerField('Гостей', default=2)
+    guests = models.PositiveSmallIntegerField('Гостей', default=0)
     table = models.ForeignKey(
         Table, on_delete=models.PROTECT,
         related_name='bookings', verbose_name='Стол'
