@@ -290,3 +290,57 @@ class SaleRetrieveAPIView(generics.RetrieveAPIView):
             id=self.kwargs["pk"],
             company=self.request.user.company,
         )
+
+class CartItemUpdateDestroyAPIView(APIView):
+    """
+    PATCH /api/main/pos/carts/<uuid:cart_id>/items/<uuid:item_id>/
+        body: {"quantity": <int >= 0>}
+        quantity == 0  -> удалить позицию
+        quantity > 0   -> установить новое количество
+    DELETE /api/main/pos/carts/<uuid:cart_id>/items/<uuid:item_id>/
+        удалить позицию
+    Возвращает обновлённую корзину.
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    def _get_item(self, request, cart_id, item_id):
+        return get_object_or_404(
+            CartItem.objects.select_related("cart"),
+            id=item_id,
+            cart_id=cart_id,
+            cart__company=request.user.company,
+            cart__status=Cart.Status.ACTIVE,
+        )
+
+    @transaction.atomic
+    def patch(self, request, cart_id, item_id, *args, **kwargs):
+        item = self._get_item(request, cart_id, item_id)
+        cart = item.cart
+
+        # валидация количества
+        try:
+            qty = int(request.data.get("quantity", None))
+        except (TypeError, ValueError):
+            return Response({"quantity": "Укажите целое число >= 0."}, status=400)
+
+        if qty < 0:
+            return Response({"quantity": "Количество не может быть отрицательным."}, status=400)
+
+        if qty == 0:
+            item.delete()
+            cart.recalc()
+            return Response(SaleCartSerializer(cart).data, status=200)
+
+        # обновление количества
+        item.quantity = qty
+        item.save(update_fields=["quantity"])
+        cart.recalc()
+        return Response(SaleCartSerializer(cart).data, status=200)
+
+    @transaction.atomic
+    def delete(self, request, cart_id, item_id, *args, **kwargs):
+        item = self._get_item(request, cart_id, item_id)
+        cart = item.cart
+        item.delete()
+        cart.recalc()
+        return Response(SaleCartSerializer(cart).data, status=200)

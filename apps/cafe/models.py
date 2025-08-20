@@ -248,8 +248,25 @@ class Order(models.Model):
 
 class OrderItem(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    order = models.ForeignKey(Order, on_delete=models.CASCADE, related_name='cafe_items', verbose_name='Заказ')
-    menu_item = models.ForeignKey('MenuItem', on_delete=models.PROTECT, related_name='order_items', verbose_name='Позиция меню')
+
+    # ← добавили company (редактировать руками не нужно)
+    company = models.ForeignKey(
+        Company,
+        on_delete=models.CASCADE,
+        related_name='cafe_order_items',
+        verbose_name='Компания',
+        editable=False,
+    )
+
+    order = models.ForeignKey(
+        Order, on_delete=models.CASCADE,
+        related_name='items',  # как уже исправляли
+        verbose_name='Заказ'
+    )
+    menu_item = models.ForeignKey(
+        'MenuItem', on_delete=models.PROTECT,
+        related_name='order_items', verbose_name='Позиция меню'
+    )
     quantity = models.PositiveIntegerField('Кол-во', default=1)
 
     class Meta:
@@ -258,6 +275,18 @@ class OrderItem(models.Model):
         constraints = [
             models.UniqueConstraint(fields=['order', 'menu_item'], name='uniq_order_menuitem'),
         ]
+        indexes = [
+            models.Index(fields=['company']),
+            models.Index(fields=['order']),
+        ]
+
+    def save(self, *args, **kwargs):
+        # всегда синхронизируем с заказом
+        if self.order_id:
+            if self.company_id and self.company_id != self.order.company_id:
+                raise ValueError("company у позиции не совпадает с company заказа.")
+            self.company = self.order.company
+        super().save(*args, **kwargs)
 
     def __str__(self):
         return f'{self.menu_item.title} × {self.quantity}'
