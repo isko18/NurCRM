@@ -82,5 +82,10 @@ urlpatterns = [
     path("pos/sales/<uuid:pk>/add-item/", SaleAddItemAPIView.as_view(), name="pos-sale-add-item"),
     path("pos/sales/<uuid:pk>/checkout/", SaleCheckoutAPIView.as_view(), name="pos-sale-checkout"),
     path("pos/sales/<uuid:pk>/mobile-scanner/", SaleMobileScannerTokenAPIView.as_view(), name="pos-sale-mobile-scanner"),
+    path(
+        "pos/carts/<uuid:cart_id>/items/<uuid:item_id>/",
+        CartItemUpdateDestroyAPIView.as_view(),
+        name="pos-cart-item-update-destroy",
+    ),
 ]
 

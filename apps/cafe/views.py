@@ -29,10 +29,9 @@ class CompanyQuerysetMixin:
         if company is None:
             return qs.none()
         model = qs.model
-        # Если у модели есть прямое поле company
-        if hasattr(model, "company_id"):
-            return qs.select_related().filter(company=company)
-        # Иначе вернём как есть (переопределим в наследниках)
+        # проверяем, есть ли у модели поле company
+        if any(f.name == "company" for f in model._meta.fields):
+            return qs.filter(company=company)
         return qs
 
 
@@ -170,8 +169,6 @@ class IngredientListCreateView(CompanyQuerysetMixin, generics.ListCreateAPIView)
             return qs.none()
         return qs.filter(menu_item__company=company)
 
-    # безопасность: в create проверка компании для product/menu_item уже в сериализаторе
-
 
 class IngredientRetrieveUpdateDestroyView(CompanyQuerysetMixin, generics.RetrieveUpdateDestroyAPIView):
     serializer_class = IngredientInlineSerializer
@@ -186,7 +183,10 @@ class IngredientRetrieveUpdateDestroyView(CompanyQuerysetMixin, generics.Retriev
 
 # ==================== Order (с вложенными items) ====================
 class OrderListCreateView(CompanyQuerysetMixin, generics.ListCreateAPIView):
-    queryset = Order.objects.select_related("table", "waiter", "company").prefetch_related("items__menu_item").all()
+    # ВНИМАНИЕ: related_name у OrderItem — 'cafe_items'
+    queryset = Order.objects.select_related("table", "waiter", "company") \
+                            .prefetch_related("cafe_items__menu_item") \
+                            .all()
     serializer_class = OrderSerializer
     filter_backends = [DjangoFilterBackend, filters.OrderingFilter]
     filterset_fields = ["table", "waiter", "guests", "created_at"]
@@ -194,7 +194,9 @@ class OrderListCreateView(CompanyQuerysetMixin, generics.ListCreateAPIView):
 
 
 class OrderRetrieveUpdateDestroyView(CompanyQuerysetMixin, generics.RetrieveUpdateDestroyAPIView):
-    queryset = Order.objects.select_related("table", "waiter", "company").prefetch_related("items__menu_item").all()
+    queryset = Order.objects.select_related("table", "waiter", "company") \
+                            .prefetch_related("cafe_items__menu_item") \
+                            .all()
     serializer_class = OrderSerializer
 
 
