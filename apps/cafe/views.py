@@ -193,23 +193,26 @@ class OrderListCreateView(CompanyQuerysetMixin, generics.ListCreateAPIView):
     ordering_fields = ["created_at", "guests", "id"]
 
 
-# Order: список
-class OrderListCreateView(CompanyQuerysetMixin, generics.ListCreateAPIView):
-    queryset = (Order.objects
-        .select_related("table", "waiter", "company")
-        .prefetch_related("order_items__menu_item")   # <-- было cafe_items__menu_item / items__menu_item
-        .all())
-    serializer_class = OrderSerializer
-    filter_backends = [DjangoFilterBackend, filters.OrderingFilter]
-    filterset_fields = ["table", "waiter", "guests", "created_at"]
-    ordering_fields = ["created_at", "guests", "id"]
-
-# Order: детально
 class OrderRetrieveUpdateDestroyView(CompanyQuerysetMixin, generics.RetrieveUpdateDestroyAPIView):
-    queryset = (Order.objects
-        .select_related("table", "waiter", "company")
-        .prefetch_related("order_items__menu_item"))  # <-- то же
+    queryset = Order.objects.select_related("table", "waiter", "company") \
+                            .prefetch_related("cafe_items__menu_item") \
+                            .all()
     serializer_class = OrderSerializer
+
+
+# ==================== OrderItem (отдельный CRUD при необходимости) ====================
+class OrderItemListCreateView(CompanyQuerysetMixin, generics.ListCreateAPIView):
+    serializer_class = OrderItemInlineSerializer
+    filter_backends = [DjangoFilterBackend, filters.OrderingFilter]
+    filterset_fields = ["order", "menu_item"]
+    ordering_fields = ["id"]
+
+    def get_queryset(self):
+        company = self.get_company()
+        qs = OrderItem.objects.select_related("order", "menu_item")
+        if company is None:
+            return qs.none()
+        return qs.filter(order__company=company)
 
 
 class OrderItemRetrieveUpdateDestroyView(CompanyQuerysetMixin, generics.RetrieveUpdateDestroyAPIView):
