@@ -11,7 +11,8 @@ from apps.main.models import Cart, CartItem, Sale, Product, MobileScannerToken
 from .pos_serializers import (
     SaleCartSerializer, SaleItemSerializer,
     ScanRequestSerializer, AddItemSerializer,
-    CheckoutSerializer, MobileScannerTokenSerializer, SaleListSerializer,
+    CheckoutSerializer, MobileScannerTokenSerializer,
+    SaleListSerializer, SaleDetailSerializer,
 )
 from apps.main.services import checkout_cart, NotEnoughStock
 from apps.main.views import CompanyRestrictedMixin
@@ -47,9 +48,9 @@ class SaleStartAPIView(APIView):
         return Response(SaleCartSerializer(cart).data, status=status.HTTP_201_CREATED)
 
 
-class SaleDetailAPIView(generics.RetrieveAPIView):
+class CartDetailAPIView(generics.RetrieveAPIView):
     """
-    GET — получить корзину по id.
+    GET /api/main/pos/carts/<uuid:pk>/ — получить корзину по id.
     """
     serializer_class = SaleCartSerializer
     permission_classes = [permissions.IsAuthenticated]
@@ -244,7 +245,7 @@ class MobileScannerIngestAPIView(APIView):
 
 class SaleListAPIView(CompanyRestrictedMixin, generics.ListAPIView):
     """
-    GET /api/pos/sales?status=new|paid|canceled&start=2025-08-01&end=2025-08-10&user=<uuid>
+    GET /api/main/pos/sales/?status=&start=&end=&user=
     Возвращает список продаж по компании с простыми фильтрами.
     """
     serializer_class = SaleListSerializer
@@ -273,3 +274,19 @@ class SaleListAPIView(CompanyRestrictedMixin, generics.ListAPIView):
             qs = qs.filter(status=Sale.Status.PAID)
 
         return qs
+
+
+class SaleRetrieveAPIView(generics.RetrieveAPIView):
+    """
+    GET /api/main/pos/sales/<uuid:pk>/
+    Детальная продажа с её позициями.
+    """
+    serializer_class = SaleDetailSerializer
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get_object(self):
+        return get_object_or_404(
+            Sale.objects.select_related("user").prefetch_related("items__product"),
+            id=self.kwargs["pk"],
+            company=self.request.user.company,
+        )
