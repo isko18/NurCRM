@@ -183,10 +183,9 @@ class IngredientRetrieveUpdateDestroyView(CompanyQuerysetMixin, generics.Retriev
 
 # ==================== Order (с вложенными items) ====================
 class OrderListCreateView(CompanyQuerysetMixin, generics.ListCreateAPIView):
-    # ВНИМАНИЕ: related_name у OrderItem — 'cafe_items'
-    queryset = Order.objects.select_related("table", "waiter", "company") \
-                            .prefetch_related("cafe_items__menu_item") \
-                            .all()
+    queryset = (Order.objects
+                .select_related("table", "waiter", "company")
+                .prefetch_related("items__menu_item"))   # <-- items, не cafe_items
     serializer_class = OrderSerializer
     filter_backends = [DjangoFilterBackend, filters.OrderingFilter]
     filterset_fields = ["table", "waiter", "guests", "created_at"]
@@ -194,9 +193,9 @@ class OrderListCreateView(CompanyQuerysetMixin, generics.ListCreateAPIView):
 
 
 class OrderRetrieveUpdateDestroyView(CompanyQuerysetMixin, generics.RetrieveUpdateDestroyAPIView):
-    queryset = Order.objects.select_related("table", "waiter", "company") \
-                            .prefetch_related("cafe_items__menu_item") \
-                            .all()
+    queryset = (Order.objects
+                .select_related("table", "waiter", "company")
+                .prefetch_related("items__menu_item"))   # <-- items
     serializer_class = OrderSerializer
 
 
