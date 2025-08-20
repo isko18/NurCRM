@@ -176,7 +176,9 @@ class OrderItemInlineSerializer(serializers.ModelSerializer):
 class OrderSerializer(CompanyReadOnlyMixin):
     table = serializers.PrimaryKeyRelatedField(queryset=Table.objects.all())
     waiter = serializers.PrimaryKeyRelatedField(queryset=Staff.objects.all(), allow_null=True, required=False)
-    items = OrderItemInlineSerializer(many=True, required=False)
+
+    # ВАЖНО: источник — related_name у OrderItem: 'cafe_items'
+    items = OrderItemInlineSerializer(many=True, required=False, source="cafe_items")
 
     class Meta:
         ref_name = "CafeOrder"
@@ -188,7 +190,6 @@ class OrderSerializer(CompanyReadOnlyMixin):
         company = (self.instance.company if self.instance else self._get_company())
         table = attrs.get("table", getattr(self.instance, "table", None))
         waiter = attrs.get("waiter", getattr(self.instance, "waiter", None))
-
         if company and table and table.company_id != company.id:
             raise serializers.ValidationError({"table": "Стол принадлежит другой компании."})
         if company and waiter and waiter.company_id != company.id:
@@ -196,37 +197,36 @@ class OrderSerializer(CompanyReadOnlyMixin):
         return attrs
 
     def _upsert_items(self, order, items, company):
-        """
-        Если блюдо уже есть в заказе — увеличиваем количество.
-        Иначе создаём новую позицию. Требует, чтобы в модели OrderItem
-        был related_name='items' у ForeignKey(order=...).
-        """
         for it in items:
             menu_item = it["menu_item"]
             qty = it.get("quantity", 1)
             if company and menu_item.company_id != company.id:
                 raise serializers.ValidationError("Позиция меню принадлежит другой компании.")
-
-            existing = order.items.filter(menu_item=menu_item).first()
+            existing = order.cafe_items.filter(menu_item=menu_item).first()
             if existing:
-                existing.quantity += max(1, int(qty))
+                existing.quantity += qty
                 existing.save(update_fields=["quantity"])
             else:
-                OrderItem.objects.create(order=order, menu_item=menu_item, quantity=max(1, int(qty)))
+                # если у OrderItem есть поле company — заполняем
+                OrderItem.objects.create(
+                    order=order,
+                    menu_item=menu_item,
+                    quantity=qty,
+                    **({"company": order.company} if hasattr(OrderItem, "company") else {})
+                )
 
     def create(self, validated_data):
-        items = validated_data.pop("items", [])
-        obj = super().create(validated_data)  # company задаст миксин
+        items = validated_data.pop("cafe_items", [])  # из-за source="cafe_items"
+        obj = super().create(validated_data)          # company выставит миксин
         if items:
             self._upsert_items(obj, items, obj.company)
         return obj
 
     def update(self, instance, validated_data):
-        items = validated_data.pop("items", None)
+        items = validated_data.pop("cafe_items", None)
         obj = super().update(instance, validated_data)
         if items is not None:
-            # Полная пересборка позиций
-            instance.items.all().delete()
+            instance.cafe_items.all().delete()
             if items:
                 self._upsert_items(instance, items, instance.company)
         return obj
