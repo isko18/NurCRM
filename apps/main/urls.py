@@ -72,14 +72,11 @@ urlpatterns = [
     
     path("pos/sales/", SaleListAPIView.as_view(), name="pos-sale-list"),
     path("pos/sales/start/", SaleStartAPIView.as_view(), name="pos-sale-start"),
-    path("pos/sales/<uuid:pk>/", SaleDetailAPIView.as_view(), name="pos-sale-detail"),
+    path("pos/carts/<uuid:pk>/", CartDetailAPIView.as_view(), name="pos-cart-detail"),
+    path("pos/sales/<uuid:pk>/", SaleRetrieveAPIView.as_view(), name="pos-sale-detail"),
     path("pos/sales/<uuid:pk>/scan/", SaleScanAPIView.as_view(), name="pos-sale-scan"),
     path("pos/sales/<uuid:pk>/add-item/", SaleAddItemAPIView.as_view(), name="pos-sale-add-item"),
     path("pos/sales/<uuid:pk>/checkout/", SaleCheckoutAPIView.as_view(), name="pos-sale-checkout"),
     path("pos/sales/<uuid:pk>/mobile-scanner/", SaleMobileScannerTokenAPIView.as_view(), name="pos-sale-mobile-scanner"),
-
-    # Поиск и телефон-сканер
-    path("pos/products/find/", ProductFindByBarcodeAPIView.as_view(), name="pos-product-find"),
-    path("pos/mobile-scanner/<str:token>/scan/", MobileScannerIngestAPIView.as_view(), name="pos-mobile-scan"),
 ]
 
