@@ -4,30 +4,46 @@ from rest_framework.response import Response
 from django.db import transaction
 from django.shortcuts import get_object_or_404
 from django.utils.dateparse import parse_datetime, parse_date
+from django.utils import timezone
 from django_filters.rest_framework import DjangoFilterBackend
 
-from apps.main.models import Cart, CartItem, Sale, SaleItem, Product, MobileScannerToken
+from apps.main.models import Cart, CartItem, Sale, Product, MobileScannerToken
 from .pos_serializers import (
     SaleCartSerializer, SaleItemSerializer,
     ScanRequestSerializer, AddItemSerializer,
-    CheckoutSerializer, MobileScannerTokenSerializer,SaleListSerializer
+    CheckoutSerializer, MobileScannerTokenSerializer, SaleListSerializer,
 )
 from apps.main.services import checkout_cart, NotEnoughStock
 from apps.main.views import CompanyRestrictedMixin
 from apps.construction.models import Department
 
+
 class SaleStartAPIView(APIView):
     """
     POST — создать/получить активную корзину для текущего пользователя.
+    Если найдено несколько активных — оставим самую свежую, остальные закроем.
     """
     permission_classes = [permissions.IsAuthenticated]
 
+    @transaction.atomic
     def post(self, request, *args, **kwargs):
-        cart, _ = Cart.objects.get_or_create(
-            company=request.user.company,
-            user=request.user,
-            status=Cart.Status.ACTIVE
-        )
+        user = request.user
+        company = user.company
+
+        qs = (Cart.objects
+              .filter(company=company, user=user, status=Cart.Status.ACTIVE)
+              .order_by('-created_at'))
+        cart = qs.first()
+        if cart is None:
+            cart = Cart.objects.create(company=company, user=user, status=Cart.Status.ACTIVE)
+        else:
+            # закрыть дубликаты, если есть
+            extra_ids = list(qs.values_list('id', flat=True)[1:])
+            if extra_ids:
+                Cart.objects.filter(id__in=extra_ids).update(
+                    status=Cart.Status.CHECKED_OUT, updated_at=timezone.now()
+                )
+
         return Response(SaleCartSerializer(cart).data, status=status.HTTP_201_CREATED)
 
 
@@ -64,8 +80,9 @@ class SaleScanAPIView(APIView):
             return Response({"not_found": True, "message": "Товар не найден"}, status=404)
 
         item, created = CartItem.objects.get_or_create(
-            cart=cart, product=product,
-            defaults={"quantity": qty, "unit_price": product.price}
+            cart=cart,
+            product=product,
+            defaults={"company": cart.company, "quantity": qty, "unit_price": product.price},
         )
         if not created:
             item.quantity += qty
@@ -94,8 +111,9 @@ class SaleAddItemAPIView(APIView):
         qty = ser.validated_data["quantity"]
 
         item, created = CartItem.objects.get_or_create(
-            cart=cart, product=product,
-            defaults={"quantity": qty, "unit_price": product.price}
+            cart=cart,
+            product=product,
+            defaults={"company": cart.company, "quantity": qty, "unit_price": product.price},
         )
         if not created:
             item.quantity += qty
@@ -133,13 +151,10 @@ class SaleCheckoutAPIView(APIView):
             department = get_object_or_404(Department, id=department_id, company=request.user.company)
 
         try:
-            # checkout_cart теперь создаёт CashFlow(type='income', name='Продажа товара #...') сам,
-            # получая department (может быть None — тогда он попытается определить отдел по пользователю).
             sale = checkout_cart(cart, department=department)
         except NotEnoughStock as e:
             return Response({"detail": str(e)}, status=status.HTTP_400_BAD_REQUEST)
         except ValueError as e:
-            # например "Корзина пуста" или "Не удалось определить отдел" (если так запрограммируешь в сервисе)
             return Response({"detail": str(e)}, status=status.HTTP_400_BAD_REQUEST)
 
         payload = {
@@ -156,6 +171,7 @@ class SaleCheckoutAPIView(APIView):
             payload["receipt_text"] = "ЧЕК\n" + "\n".join(lines) + f"\nИТОГО: {sale.total:.2f}"
 
         return Response(payload, status=status.HTTP_201_CREATED)
+
 
 class SaleMobileScannerTokenAPIView(APIView):
     """
@@ -214,8 +230,9 @@ class MobileScannerIngestAPIView(APIView):
             return Response({"not_found": True, "message": "Товар не найден"}, status=404)
 
         item, created = CartItem.objects.get_or_create(
-            cart=cart, product=product,
-            defaults={"quantity": qty, "unit_price": product.price}
+            cart=cart,
+            product=product,
+            defaults={"company": cart.company, "quantity": qty, "unit_price": product.price},
         )
         if not created:
             item.quantity += qty
@@ -233,27 +250,24 @@ class SaleListAPIView(CompanyRestrictedMixin, generics.ListAPIView):
     serializer_class = SaleListSerializer
     queryset = Sale.objects.select_related("user").all()
     filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
-    # базовые фильтры по полям (пригодится для user/status), ordering
     filterset_fields = ("status", "user")
-    search_fields = ("id",)  # при желании добавь поиск по id
+    search_fields = ("id",)
     ordering_fields = ("created_at", "total", "status")
     ordering = ("-created_at",)
 
     def get_queryset(self):
         qs = super().get_queryset().filter(company=self.request.user.company)
 
-        # Фильтры по дате (достаточно YYYY-MM-DD). Можно передать и datetime — парсер съест.
+        # Фильтры по дате (поддерживаются YYYY-MM-DD и ISO datetime)
         start = self.request.query_params.get("start")
         end = self.request.query_params.get("end")
         if start:
-            # поддержим как дату, так и datetime
             dt = parse_datetime(start) or (parse_date(start) and f"{start} 00:00:00")
             qs = qs.filter(created_at__gte=dt)
         if end:
             dt = parse_datetime(end) or (parse_date(end) and f"{end} 23:59:59")
             qs = qs.filter(created_at__lte=dt)
 
-        # Быстрый фильтр отфильтровать только оплаченные
         paid_only = self.request.query_params.get("paid")
         if paid_only in ("1", "true", "True"):
             qs = qs.filter(status=Sale.Status.PAID)

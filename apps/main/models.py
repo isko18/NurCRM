@@ -153,6 +153,7 @@ class Order(models.Model):
 
 class GlobalCategory(MPTTModel):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    company = models.ForeignKey(Company, on_delete=models.CASCADE, related_name='global_categories', verbose_name='Компания')
     name = models.CharField(max_length=128, unique=True, verbose_name='Название категории')
     parent = TreeForeignKey(
         'self',
@@ -173,10 +174,9 @@ class GlobalCategory(MPTTModel):
     def __str__(self):
         return self.name
 
-
 class GlobalBrand(MPTTModel):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    
+    company = models.ForeignKey(Company, on_delete=models.CASCADE, related_name='global_brands', verbose_name='Компания')
     name = models.CharField(max_length=128, unique=True, verbose_name='Название бренда')
     parent = TreeForeignKey(
         'self',
@@ -200,7 +200,7 @@ class GlobalBrand(MPTTModel):
 
 class GlobalProduct(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    
+    company = models.ForeignKey(Company, on_delete=models.CASCADE, related_name='global_products', verbose_name='Компания')
     name = models.CharField(max_length=255)
     barcode = models.CharField(max_length=64, unique=True)
     brand = models.ForeignKey(GlobalBrand, on_delete=models.SET_NULL, null=True, blank=True, related_name='products')
@@ -343,6 +343,7 @@ class Cart(models.Model):
 
 class CartItem(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False, verbose_name="ID")
+    company = models.ForeignKey(Company, on_delete=models.CASCADE, related_name="cart_items", verbose_name="Компания")
     cart = models.ForeignKey(Cart, on_delete=models.CASCADE, related_name="items", verbose_name="Корзина")
     product = models.ForeignKey(Product, on_delete=models.PROTECT, related_name="cart_items", verbose_name="Товар")
     quantity = models.PositiveIntegerField(default=1, verbose_name="Количество")
@@ -361,6 +362,7 @@ class CartItem(models.Model):
 
     def __str__(self):
         return f"{self.product.name} x{self.quantity}"
+
 
 
 class Sale(models.Model):
@@ -404,6 +406,7 @@ class Sale(models.Model):
 
 class SaleItem(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False, verbose_name="ID")
+    company = models.ForeignKey(Company, on_delete=models.CASCADE, related_name="sale_items", verbose_name="Компания")
     sale = models.ForeignKey(Sale, on_delete=models.CASCADE, related_name="items", verbose_name="Продажа")
     product = models.ForeignKey(Product, on_delete=models.PROTECT, related_name="sale_items", verbose_name="Товар")
     name_snapshot = models.CharField(max_length=255, verbose_name="Название товара (снимок)")
@@ -421,6 +424,7 @@ class SaleItem(models.Model):
 
 class MobileScannerToken(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False, verbose_name="ID")
+    company = models.ForeignKey(Company, on_delete=models.CASCADE, related_name="mobile_tokens", verbose_name="Компания")
     cart = models.ForeignKey(Cart, on_delete=models.CASCADE, related_name="mobile_tokens", verbose_name="Корзина")
     token = models.CharField(max_length=64, unique=True, db_index=True, verbose_name="Токен")
     expires_at = models.DateTimeField(verbose_name="Срок действия")
@@ -432,6 +436,7 @@ class MobileScannerToken(models.Model):
     @classmethod
     def issue(cls, cart, ttl_minutes=10):
         return cls.objects.create(
+            company=cart.company,
             cart=cart,
             token=secrets.token_urlsafe(32),
             expires_at=timezone.now() + timezone.timedelta(minutes=ttl_minutes),
@@ -445,6 +450,7 @@ class MobileScannerToken(models.Model):
     
 class OrderItem(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    company = models.ForeignKey(Company, on_delete=models.CASCADE, related_name='order_items', verbose_name='Компания')
     order = models.ForeignKey(Order, on_delete=models.CASCADE, related_name='items', verbose_name='Заказ')
     product = models.ForeignKey(Product, on_delete=models.PROTECT, related_name='order_items', verbose_name='Товар')
     quantity = models.PositiveIntegerField(verbose_name='Количество')
@@ -457,7 +463,6 @@ class OrderItem(models.Model):
 
     def __str__(self):
         return f"{self.product.name} x {self.quantity}"
-
 
 
 class Review(models.Model):
