@@ -1,19 +1,22 @@
-from rest_framework import generics, permissions, filters
-from django_filters.rest_framework import DjangoFilterBackend
-from rest_framework.views import APIView
-from rest_framework.response import Response
-from rest_framework import status
-from rest_framework.permissions import IsAuthenticated
+from decimal import Decimal
 
-from django.utils.dateparse import parse_date
-from django.db.models import Sum, Count, Avg
-from rest_framework.exceptions import NotFound
 from django.db import transaction
+from django.db.models import Sum, Count, Avg
+from django.utils.dateparse import parse_date
+
+from rest_framework import generics, permissions, filters, status
+from rest_framework.permissions import IsAuthenticated
+from rest_framework.response import Response
+from rest_framework.views import APIView
+from rest_framework.exceptions import NotFound
+
+from django_filters.rest_framework import DjangoFilterBackend
 
 from apps.main.models import (
     Contact, Pipeline, Deal, Task, Integration, Analytics,
-    Order, Product, Review, Notification, Event, ProductBrand, ProductCategory, Warehouse, WarehouseEvent, Client,
-    GlobalProduct, CartItem
+    Order, Product, Review, Notification, Event,
+    ProductBrand, ProductCategory, Warehouse, WarehouseEvent, Client,
+    GlobalProduct, GlobalBrand, GlobalCategory,
 )
 from apps.main.serializers import (
     ContactSerializer, PipelineSerializer, DealSerializer, TaskSerializer,
@@ -21,7 +24,7 @@ from apps.main.serializers import (
     ReviewSerializer, NotificationSerializer, EventSerializer,
     WarehouseSerializer, WarehouseEventSerializer,
     ProductCategorySerializer, ProductBrandSerializer,
-    OrderItemSerializer, ClientSerializer
+    OrderItemSerializer, ClientSerializer,
 )
 
 
@@ -32,7 +35,7 @@ class CompanyRestrictedMixin:
         return self.queryset.filter(company=self.request.user.company)
 
     def get_serializer_context(self):
-        return {'request': self.request}
+        return {"request": self.request}
 
     def perform_create(self, serializer):
         serializer.save(company=self.request.user.company)
@@ -42,8 +45,8 @@ class ContactListCreateAPIView(CompanyRestrictedMixin, generics.ListCreateAPIVie
     serializer_class = ContactSerializer
     queryset = Contact.objects.all()
     filter_backends = [DjangoFilterBackend, filters.SearchFilter]
-    search_fields = ['name', 'email', 'phone', 'client_company']
-    filterset_fields = '__all__'
+    search_fields = ["name", "email", "phone", "client_company"]
+    filterset_fields = "__all__"
 
     def perform_create(self, serializer):
         serializer.save(owner=self.request.user, company=self.request.user.company)
@@ -58,8 +61,8 @@ class PipelineListCreateAPIView(CompanyRestrictedMixin, generics.ListCreateAPIVi
     serializer_class = PipelineSerializer
     queryset = Pipeline.objects.all()
     filter_backends = [filters.SearchFilter, DjangoFilterBackend]
-    search_fields = ['name']
-    filterset_fields = '__all__'
+    search_fields = ["name"]
+    filterset_fields = "__all__"
 
     def perform_create(self, serializer):
         serializer.save(owner=self.request.user, company=self.request.user.company)
@@ -74,8 +77,8 @@ class DealListCreateAPIView(CompanyRestrictedMixin, generics.ListCreateAPIView):
     serializer_class = DealSerializer
     queryset = Deal.objects.all()
     filter_backends = [DjangoFilterBackend, filters.SearchFilter]
-    search_fields = ['title', 'stage']
-    filterset_fields = '__all__'
+    search_fields = ["title", "stage"]
+    filterset_fields = "__all__"
 
 
 class DealRetrieveUpdateDestroyAPIView(CompanyRestrictedMixin, generics.RetrieveUpdateDestroyAPIView):
@@ -87,8 +90,8 @@ class TaskListCreateAPIView(CompanyRestrictedMixin, generics.ListCreateAPIView):
     serializer_class = TaskSerializer
     queryset = Task.objects.all()
     filter_backends = [DjangoFilterBackend, filters.SearchFilter]
-    search_fields = ['title', 'description']
-    filterset_fields = '__all__'
+    search_fields = ["title", "description"]
+    filterset_fields = "__all__"
 
 
 class TaskRetrieveUpdateDestroyAPIView(CompanyRestrictedMixin, generics.RetrieveUpdateDestroyAPIView):
@@ -100,7 +103,7 @@ class IntegrationListCreateAPIView(CompanyRestrictedMixin, generics.ListCreateAP
     serializer_class = IntegrationSerializer
     queryset = Integration.objects.all()
     filter_backends = [DjangoFilterBackend]
-    filterset_fields = '__all__'
+    filterset_fields = "__all__"
 
 
 class IntegrationRetrieveUpdateDestroyAPIView(CompanyRestrictedMixin, generics.RetrieveUpdateDestroyAPIView):
@@ -112,136 +115,181 @@ class AnalyticsListAPIView(CompanyRestrictedMixin, generics.ListAPIView):
     serializer_class = AnalyticsSerializer
     queryset = Analytics.objects.all()
     filter_backends = [DjangoFilterBackend]
-    filterset_fields = '__all__'
+    filterset_fields = "__all__"
 
 
 class OrderListCreateAPIView(CompanyRestrictedMixin, generics.ListCreateAPIView):
     serializer_class = OrderSerializer
-    queryset = Order.objects.all().prefetch_related('items__product')
+    queryset = Order.objects.all().prefetch_related("items__product")
     filter_backends = [DjangoFilterBackend, filters.SearchFilter]
-    search_fields = ['order_number', 'customer_name', 'department', 'phone']
-    filterset_fields = '__all__'
+    search_fields = ["order_number", "customer_name", "department", "phone"]
+    filterset_fields = "__all__"
 
     def perform_create(self, serializer):
-        serializer.save()
+        # важно не потерять company из миксина
+        super().perform_create(serializer)
 
 
 class OrderRetrieveUpdateDestroyAPIView(CompanyRestrictedMixin, generics.RetrieveUpdateDestroyAPIView):
     serializer_class = OrderSerializer
-    queryset = Order.objects.all().prefetch_related('items__product')
+    queryset = Order.objects.all().prefetch_related("items__product")
 
 
 class ProductCreateByBarcodeAPIView(generics.CreateAPIView):
-    """Создание товара только по штрих-коду (если найден в глобальной базе)"""
+    """Создание товара только по штрих-коду (если найден в «глобальной» базе компании)."""
     serializer_class = ProductSerializer
     permission_classes = [IsAuthenticated]
 
     @transaction.atomic
     def create(self, request, *args, **kwargs):
-        barcode = (request.data.get('barcode') or '').strip()
         company = request.user.company
+        barcode = (request.data.get("barcode") or "").strip()
 
         if not barcode:
             return Response({"barcode": "Укажите штрих-код."}, status=status.HTTP_400_BAD_REQUEST)
 
-        # Проверка, что в компании нет такого товара
+        # Дубликаты в компании
         if Product.objects.filter(company=company, barcode=barcode).exists():
-            return Response({"barcode": "В вашей компании уже есть товар с таким штрих-кодом."},
-                            status=status.HTTP_400_BAD_REQUEST)
+            return Response(
+                {"barcode": "В вашей компании уже есть товар с таким штрих-кодом."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
 
-        # Ищем в глобальной базе (связки brand/category уже FK)
-        gp = GlobalProduct.objects.select_related('brand', 'category').filter(barcode=barcode).first()
+        # Ищем в глобальной базе компании
+        gp = (
+            GlobalProduct.objects.select_related("brand", "category")
+            .filter(company=company, barcode=barcode)
+            .first()
+        )
         if not gp:
-            return Response({"barcode": "Товар с таким штрих-кодом не найден в глобальной базе. Заполните карточку вручную."},
-                            status=status.HTTP_404_NOT_FOUND)
+            return Response(
+                {"barcode": "Товар с таким штрих-кодом не найден в глобальной базе. Заполните карточку вручную."},
+                status=status.HTTP_404_NOT_FOUND,
+            )
 
-        # Создаём бренд и категорию в компании (если нет)
-        brand = ProductBrand.objects.get_or_create(company=company, name=gp.brand.name if gp.brand else None)[0] if gp.brand else None
-        category = ProductCategory.objects.get_or_create(company=company, name=gp.category.name if gp.category else None)[0] if gp.category else None
+        # Локальные справочники
+        brand = (
+            ProductBrand.objects.get_or_create(company=company, name=gp.brand.name)[0]
+            if gp.brand else None
+        )
+        category = (
+            ProductCategory.objects.get_or_create(company=company, name=gp.category.name)[0]
+            if gp.category else None
+        )
 
-        # Создаём товар в компании
+        # Парсинг цены/количества (опционально, можно оставить 0)
+        try:
+            price = Decimal(str(request.data.get("price", 0)))
+        except Exception:
+            return Response({"price": "Неверный формат цены."}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            quantity = int(request.data.get("quantity", 0))
+            if quantity < 0:
+                raise ValueError
+        except Exception:
+            return Response({"quantity": "Неверное количество."}, status=status.HTTP_400_BAD_REQUEST)
+
+        # Создаём товар
         product = Product.objects.create(
             company=company,
             name=gp.name,
             barcode=gp.barcode,
             brand=brand,
             category=category,
-            price=request.data.get('price', 0),
-            quantity=request.data.get('quantity', 0)
+            price=price,
+            quantity=quantity,
         )
-        serializer = self.get_serializer(product)
-        return Response(serializer.data, status=status.HTTP_201_CREATED)
+        return Response(self.get_serializer(product).data, status=status.HTTP_201_CREATED)
 
 
 class ProductCreateManualAPIView(generics.CreateAPIView):
-    """Ручное создание товара + добавление в глобальную базу"""
+    """Ручное создание товара + добавление в «глобальную» базу компании."""
     serializer_class = ProductSerializer
     permission_classes = [IsAuthenticated]
 
     @transaction.atomic
     def create(self, request, *args, **kwargs):
         company = request.user.company
-        barcode = (request.data.get('barcode') or '').strip()
+        data = request.data
+
+        name = (data.get("name") or "").strip()
+        if not name:
+            return Response({"name": "Обязательное поле."}, status=status.HTTP_400_BAD_REQUEST)
+
+        barcode = (data.get("barcode") or "").strip() or None
 
         # Проверка уникальности в компании
         if barcode and Product.objects.filter(company=company, barcode=barcode).exists():
-            return Response({"barcode": "В вашей компании уже есть товар с таким штрих-кодом."},
-                            status=status.HTTP_400_BAD_REQUEST)
-
-        # Локальный бренд
-        brand_name = request.data.get('brand_name', '').strip()
-        brand = ProductBrand.objects.get_or_create(company=company, name=brand_name)[0] if brand_name else None
-
-        # Локальная категория
-        category_name = request.data.get('category_name', '').strip()
-        category = ProductCategory.objects.get_or_create(company=company, name=category_name)[0] if category_name else None
-
-        # Создаём товар в компании
-        product = Product.objects.create(
-            company=company,
-            name=request.data.get('name'),
-            barcode=barcode or None,
-            brand=brand,
-            category=category,
-            price=request.data.get('price', 0),
-            quantity=request.data.get('quantity', 0)
-        )
-
-        # Если есть barcode — создаём в глобальной базе (если ещё нет)
-        if barcode and not GlobalProduct.objects.filter(barcode=barcode).exists():
-            # Создаём глобальные бренд/категорию
-            g_brand = None
-            if brand:
-                from apps.main.models import GlobalBrand
-                g_brand, _ = GlobalBrand.objects.get_or_create(name=brand.name)
-
-            g_category = None
-            if category:
-                from apps.main.models import GlobalCategory
-                g_category, _ = GlobalCategory.objects.get_or_create(name=category.name)
-
-            GlobalProduct.objects.create(
-                name=product.name,
-                barcode=product.barcode,
-                brand=g_brand,
-                category=g_category
+            return Response(
+                {"barcode": "В вашей компании уже есть товар с таким штрих-кодом."},
+                status=status.HTTP_400_BAD_REQUEST,
             )
 
-        serializer = self.get_serializer(product)
-        return Response(serializer.data, status=status.HTTP_201_CREATED)
+        # Нормализация price/quantity
+        try:
+            price = Decimal(str(data.get("price", 0)))
+        except Exception:
+            return Response({"price": "Неверный формат цены."}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            quantity = int(data.get("quantity", 0))
+            if quantity < 0:
+                raise ValueError
+        except Exception:
+            return Response({"quantity": "Неверное количество."}, status=status.HTTP_400_BAD_REQUEST)
+
+        # Локальный бренд/категория
+        brand = None
+        brand_name = (data.get("brand_name") or "").strip()
+        if brand_name:
+            brand, _ = ProductBrand.objects.get_or_create(company=company, name=brand_name)
+
+        category = None
+        category_name = (data.get("category_name") or "").strip()
+        if category_name:
+            category, _ = ProductCategory.objects.get_or_create(company=company, name=category_name)
+
+        # Создаём товар компании
+        product = Product.objects.create(
+            company=company,
+            name=name,
+            barcode=barcode,
+            brand=brand,
+            category=category,
+            price=price,
+            quantity=quantity,
+        )
+
+        # Синхронизация в «глобальную» базу компании
+        if barcode:
+            g_brand = None
+            if brand_name:
+                g_brand, _ = GlobalBrand.objects.get_or_create(company=company, name=brand_name)
+
+            g_category = None
+            if category_name:
+                g_category, _ = GlobalCategory.objects.get_or_create(company=company, name=category_name)
+
+            GlobalProduct.objects.get_or_create(
+                company=company,
+                barcode=barcode,
+                defaults={"name": name, "brand": g_brand, "category": g_category},
+            )
+
+        return Response(self.get_serializer(product).data, status=status.HTTP_201_CREATED)
 
 
 class ProductRetrieveUpdateDestroyAPIView(CompanyRestrictedMixin, generics.RetrieveUpdateDestroyAPIView):
     serializer_class = ProductSerializer
-    queryset = Product.objects.select_related('brand', 'category').all()
-
+    queryset = Product.objects.select_related("brand", "category").all()
 
 
 class ReviewListCreateAPIView(CompanyRestrictedMixin, generics.ListCreateAPIView):
     serializer_class = ReviewSerializer
     queryset = Review.objects.all()
     filter_backends = [DjangoFilterBackend]
-    filterset_fields = '__all__'
+    filterset_fields = "__all__"
 
     def perform_create(self, serializer):
         serializer.save(user=self.request.user, company=self.request.user.company)
@@ -256,7 +304,7 @@ class NotificationListView(CompanyRestrictedMixin, generics.ListAPIView):
     serializer_class = NotificationSerializer
     queryset = Notification.objects.all()
     filter_backends = [DjangoFilterBackend]
-    filterset_fields = '__all__'
+    filterset_fields = "__all__"
 
 
 class NotificationDetailView(CompanyRestrictedMixin, generics.RetrieveAPIView):
@@ -269,14 +317,14 @@ class MarkAllNotificationsReadView(APIView):
 
     def post(self, request, *args, **kwargs):
         Notification.objects.filter(user=request.user, is_read=False).update(is_read=True)
-        return Response({'status': 'Все уведомления прочитаны'}, status=status.HTTP_200_OK)
+        return Response({"status": "Все уведомления прочитаны"}, status=status.HTTP_200_OK)
 
 
 class EventListCreateAPIView(CompanyRestrictedMixin, generics.ListCreateAPIView):
     serializer_class = EventSerializer
     queryset = Event.objects.all()
     filter_backends = [DjangoFilterBackend]
-    filterset_fields = '__all__'
+    filterset_fields = "__all__"
 
 
 class EventRetrieveUpdateDestroyAPIView(CompanyRestrictedMixin, generics.RetrieveUpdateDestroyAPIView):
@@ -288,8 +336,8 @@ class WarehouseListCreateAPIView(CompanyRestrictedMixin, generics.ListCreateAPIV
     serializer_class = WarehouseSerializer
     queryset = Warehouse.objects.all()
     filter_backends = [DjangoFilterBackend, filters.SearchFilter]
-    search_fields = ['name', 'location']
-    filterset_fields = '__all__'
+    search_fields = ["name", "location"]
+    filterset_fields = "__all__"
 
     def perform_create(self, serializer):
         serializer.save(company=self.request.user.company)
@@ -304,8 +352,8 @@ class WarehouseEventListCreateAPIView(CompanyRestrictedMixin, generics.ListCreat
     serializer_class = WarehouseEventSerializer
     queryset = WarehouseEvent.objects.all()
     filter_backends = [DjangoFilterBackend, filters.SearchFilter]
-    search_fields = ['title', 'client_name']
-    filterset_fields = '__all__'
+    search_fields = ["title", "client_name"]
+    filterset_fields = "__all__"
 
     def perform_create(self, serializer):
         serializer.save(company=self.request.user.company)
@@ -320,8 +368,8 @@ class ProductCategoryListCreateAPIView(CompanyRestrictedMixin, generics.ListCrea
     serializer_class = ProductCategorySerializer
     queryset = ProductCategory.objects.all()
     filter_backends = [DjangoFilterBackend, filters.SearchFilter]
-    search_fields = ['name']
-    filterset_fields = '__all__'
+    search_fields = ["name"]
+    filterset_fields = "__all__"
 
 
 class ProductCategoryRetrieveUpdateDestroyAPIView(CompanyRestrictedMixin, generics.RetrieveUpdateDestroyAPIView):
@@ -333,20 +381,21 @@ class ProductBrandListCreateAPIView(CompanyRestrictedMixin, generics.ListCreateA
     serializer_class = ProductBrandSerializer
     queryset = ProductBrand.objects.all()
     filter_backends = [DjangoFilterBackend, filters.SearchFilter]
-    search_fields = ['name']
-    filterset_fields = '__all__'
+    search_fields = ["name"]
+    filterset_fields = "__all__"
 
 
 class ProductBrandRetrieveUpdateDestroyAPIView(CompanyRestrictedMixin, generics.RetrieveUpdateDestroyAPIView):
     serializer_class = ProductBrandSerializer
     queryset = ProductBrand.objects.all()
-    
+
+
 class ProductByBarcodeAPIView(CompanyRestrictedMixin, generics.RetrieveAPIView):
     serializer_class = ProductSerializer
-    lookup_field = 'barcode'
+    lookup_field = "barcode"
 
     def get_object(self):
-        barcode = self.kwargs.get('barcode')
+        barcode = self.kwargs.get("barcode")
         if not barcode:
             raise NotFound(detail="Штрих-код не указан")
 
@@ -354,24 +403,26 @@ class ProductByBarcodeAPIView(CompanyRestrictedMixin, generics.RetrieveAPIView):
         if not product:
             raise NotFound(detail="Товар с таким штрих-кодом не найден")
         return product
-        
+
+
 class ProductListView(CompanyRestrictedMixin, generics.ListAPIView):
     serializer_class = ProductSerializer
     filter_backends = [filters.SearchFilter, filters.OrderingFilter]
-    search_fields = ['name', 'barcode']
-    ordering_fields = ['created_at', 'updated_at', 'price']
+    search_fields = ["name", "barcode"]
+    ordering_fields = ["created_at", "updated_at", "price"]
 
     def get_queryset(self):
         return Product.objects.filter(company=self.request.user.company)
-        
+
+
 class OrderAnalyticsView(APIView):
     permission_classes = [IsAuthenticated]
 
     def get(self, request, *args, **kwargs):
         company = request.user.company
-        start_date = request.query_params.get('start')
-        end_date = request.query_params.get('end')
-        status_filter = request.query_params.get('status')
+        start_date = request.query_params.get("start")
+        end_date = request.query_params.get("end")
+        status_filter = request.query_params.get("status")
 
         orders = Order.objects.filter(company=company)
 
@@ -387,39 +438,38 @@ class OrderAnalyticsView(APIView):
             orders = orders.filter(status=status_filter)
 
         total_orders = orders.count()
-        total_amount = orders.aggregate(total=Sum('items__total'))['total'] or 0
-        average_amount = orders.aggregate(avg=Avg('items__total'))['avg'] or 0
+        total_amount = orders.aggregate(total=Sum("items__total"))["total"] or 0
+        average_amount = orders.aggregate(avg=Avg("items__total"))["avg"] or 0
 
-        # Группировка по статусу
-        orders_by_status = orders.values('status').annotate(
-            order_count=Count('id'),
-            total_amount=Sum('items__total'),
-            average_amount=Avg('items__total')
+        orders_by_status = orders.values("status").annotate(
+            order_count=Count("id"),
+            total_amount=Sum("items__total"),
+            average_amount=Avg("items__total"),
         )
 
         response_data = {
-            'filters': {
-                'start_date': start_date,
-                'end_date': end_date,
-                'status': status_filter,
+            "filters": {
+                "start_date": start_date,
+                "end_date": end_date,
+                "status": status_filter,
             },
-            'summary': {
-                'total_orders': total_orders,
-                'total_amount': total_amount,
-                'average_order_amount': average_amount,
+            "summary": {
+                "total_orders": total_orders,
+                "total_amount": total_amount,
+                "average_order_amount": average_amount,
             },
-            'orders_by_status': list(orders_by_status)
+            "orders_by_status": list(orders_by_status),
         }
 
         return Response(response_data)
-    
-    
+
+
 class ClientListCreateAPIView(CompanyRestrictedMixin, generics.ListCreateAPIView):
     serializer_class = ClientSerializer
     queryset = Client.objects.all()
     filter_backends = [DjangoFilterBackend, filters.SearchFilter]
-    search_fields = ['full_name', 'phone']
-    filterset_fields = ['status']
+    search_fields = ["full_name", "phone"]
+    filterset_fields = ["status"]
 
     def perform_create(self, serializer):
         serializer.save(company=self.request.user.company)
@@ -428,6 +478,3 @@ class ClientListCreateAPIView(CompanyRestrictedMixin, generics.ListCreateAPIView
 class ClientRetrieveUpdateDestroyAPIView(CompanyRestrictedMixin, generics.RetrieveUpdateDestroyAPIView):
     serializer_class = ClientSerializer
     queryset = Client.objects.all()
-    
-    
-    

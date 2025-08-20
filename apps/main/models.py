@@ -151,48 +151,37 @@ class Order(models.Model):
         return sum(item.quantity for item in self.items.all())
 
 
-class GlobalCategory(MPTTModel):
+class GlobalBrand(MPTTModel):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    company = models.ForeignKey(Company, on_delete=models.CASCADE, related_name='global_categories', verbose_name='Компания')
-    name = models.CharField(max_length=128, unique=True, verbose_name='Название категории')
-    parent = TreeForeignKey(
-        'self',
-        on_delete=models.CASCADE,
-        null=True,
-        blank=True,
-        related_name='children',
-        verbose_name='Родительская категория'
-    )
+    company = models.ForeignKey(Company, on_delete=models.CASCADE, related_name='global_brands', verbose_name='Компания')
+    name = models.CharField(max_length=128, verbose_name='Название бренда')
+    parent = TreeForeignKey('self', on_delete=models.CASCADE, null=True, blank=True, related_name='children', verbose_name='Родительский бренд')
 
     class MPTTMeta:
         order_insertion_by = ['name']
 
     class Meta:
-        verbose_name = 'Глобальная категория'
-        verbose_name_plural = 'Глобальные категории'
+        unique_together = ('company', 'name')  # а НЕ unique=True на name
+        verbose_name = 'Глобальный бренд'
+        verbose_name_plural = 'Глобальные бренды'
 
     def __str__(self):
         return self.name
 
-class GlobalBrand(MPTTModel):
+
+class GlobalCategory(MPTTModel):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    company = models.ForeignKey(Company, on_delete=models.CASCADE, related_name='global_brands', verbose_name='Компания')
-    name = models.CharField(max_length=128, unique=True, verbose_name='Название бренда')
-    parent = TreeForeignKey(
-        'self',
-        on_delete=models.CASCADE,
-        null=True,
-        blank=True,
-        related_name='children',
-        verbose_name='Родительский бренд'
-    )
+    company = models.ForeignKey(Company, on_delete=models.CASCADE, related_name='global_categories', verbose_name='Компания')
+    name = models.CharField(max_length=128, verbose_name='Название категории')
+    parent = TreeForeignKey('self', on_delete=models.CASCADE, null=True, blank=True, related_name='children', verbose_name='Родительская категория')
 
     class MPTTMeta:
         order_insertion_by = ['name']
 
     class Meta:
-        verbose_name = 'Глобальный бренд'
-        verbose_name_plural = 'Глобальные бренды'
+        unique_together = ('company', 'name')
+        verbose_name = 'Глобальная категория'
+        verbose_name_plural = 'Глобальные категории'
 
     def __str__(self):
         return self.name
@@ -202,12 +191,13 @@ class GlobalProduct(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     company = models.ForeignKey(Company, on_delete=models.CASCADE, related_name='global_products', verbose_name='Компания')
     name = models.CharField(max_length=255)
-    barcode = models.CharField(max_length=64, unique=True)
+    barcode = models.CharField(max_length=64, blank=True, null=True)
     brand = models.ForeignKey(GlobalBrand, on_delete=models.SET_NULL, null=True, blank=True, related_name='products')
     category = models.ForeignKey(GlobalCategory, on_delete=models.SET_NULL, null=True, blank=True, related_name='products')
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
+        unique_together = ('company', 'barcode')  # если хочется уникальность баркода в рамках компании
         verbose_name = "Глобальный товар"
         verbose_name_plural = "Глобальные товары"
 
