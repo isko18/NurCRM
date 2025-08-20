@@ -67,8 +67,12 @@ urlpatterns = [
     path('events/<uuid:pk>/', EventRetrieveUpdateDestroyAPIView.as_view(), name='event-detail'),
     path('orders/analytics/', OrderAnalyticsView.as_view(), name='order-analytics'),
     
-    path('clients/', ClientListCreateAPIView.as_view(), name='client-list-create'),
-    path('clients/<uuid:pk>/', ClientRetrieveUpdateDestroyAPIView.as_view(), name='client-detail'),
+    path("clients/", ClientListCreateAPIView.as_view(), name="client-list"),
+    path("clients/<uuid:pk>/", ClientRetrieveUpdateDestroyAPIView.as_view(), name="client-detail"),
+
+    # Сделки клиента (тип: продажа/долг/предоплата)
+    path("clients/<uuid:client_id>/deals/", ClientDealListCreateAPIView.as_view(), name="client-deal-list"),
+    path("client-deals/<uuid:pk>/", ClientDealRetrieveUpdateDestroyAPIView.as_view(), name="client-deal-detail"),
     
     path("pos/sales/", SaleListAPIView.as_view(), name="pos-sale-list"),
     path("pos/sales/start/", SaleStartAPIView.as_view(), name="pos-sale-start"),

@@ -1,5 +1,5 @@
 from rest_framework import serializers
-from apps.main.models import Contact, Pipeline, Deal, Task, Integration, Analytics, Order, Product, Review, Notification, Event, Warehouse, WarehouseEvent, ProductCategory, ProductBrand, OrderItem, Client, GlobalProduct, CartItem
+from apps.main.models import Contact, Pipeline, Deal, Task, Integration, Analytics, Order, Product, Review, Notification, Event, Warehouse, WarehouseEvent, ProductCategory, ProductBrand, OrderItem, Client, GlobalProduct, CartItem, ClientDeal
 
 from apps.users.models import User, Company
 from django.db import transaction
@@ -430,12 +430,16 @@ class WarehouseEventSerializer(serializers.ModelSerializer):
             instance.participants.set(participants)
         return instance
     
+    
 class ClientSerializer(serializers.ModelSerializer):
     company = serializers.ReadOnlyField(source='company.id')
 
     class Meta:
         model = Client
-        fields = ['id', 'full_name', 'phone', 'status', 'price', 'company', 'created_at', 'updated_at']
+        fields = [
+            'id', 'full_name', 'phone', 'email', 'date', 'status',
+            'company', 'created_at', 'updated_at'
+        ]
         read_only_fields = ['id', 'company', 'created_at', 'updated_at']
 
     def create(self, validated_data):
@@ -443,4 +447,35 @@ class ClientSerializer(serializers.ModelSerializer):
         return super().create(validated_data)
     
     
-    
+class ClientDealSerializer(serializers.ModelSerializer):
+    company = serializers.ReadOnlyField(source='company.id')
+    # КЛЮЧЕВОЕ: client не обязателен — при nested-роуте его задаёт view
+    client = serializers.PrimaryKeyRelatedField(
+        queryset=Client.objects.all(),
+        required=False
+    )
+    client_full_name = serializers.CharField(source='client.full_name', read_only=True)
+
+    class Meta:
+        model = ClientDeal
+        fields = [
+            'id', 'company', 'client', 'client_full_name',
+            'title', 'kind', 'amount', 'note',
+            'created_at', 'updated_at'
+        ]
+        read_only_fields = ['id', 'company', 'created_at', 'updated_at', 'client_full_name']
+
+    def validate(self, attrs):
+        # Если client придёт в теле запроса (плоский роут) — проверим компанию.
+        client = attrs.get('client')
+        if client:
+            company = self.context['request'].user.company
+            if client.company_id != company.id:
+                raise serializers.ValidationError({'client': 'Клиент принадлежит другой компании.'})
+        return attrs
+
+    def create(self, validated_data):
+        # company всегда от пользователя; client может быть не в validated_data —
+        # его добавит view через serializer.save(client=...)
+        validated_data['company'] = self.context['request'].user.company
+        return super().create(validated_data)

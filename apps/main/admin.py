@@ -6,9 +6,8 @@ from apps.main.models import (
     Integration, Analytics, Order, OrderItem,
     Product, Review, Notification, Event,
     Warehouse, WarehouseEvent,
-    ProductCategory, ProductBrand, Client, GlobalProduct, GlobalBrand, GlobalCategory, CartItem, Cart, Sale, SaleItem
+    ProductCategory, ProductBrand, Client, GlobalProduct, GlobalBrand, GlobalCategory, CartItem, Cart, Sale, SaleItem, ClientDeal
 )
-
 
 @admin.register(Contact)
 class ContactAdmin(admin.ModelAdmin):
@@ -233,9 +232,105 @@ class OrderItemAdmin(admin.ModelAdmin):
     readonly_fields = ('price', 'total')
 
 
+class CompanyFilteredAdmin(admin.ModelAdmin):
+    """
+    Ограничивает queryset записями компании пользователя (кроме суперпользователя)
+    и проставляет company при создании.
+    """
+    def get_queryset(self, request):
+        qs = super().get_queryset(request)
+        if request.user.is_superuser:
+            return qs
+        user_company_id = getattr(getattr(request, "user", None), "company_id", None)
+        if user_company_id:
+            qs = qs.filter(company_id=user_company_id)
+        return qs
+
+    def save_model(self, request, obj, form, change):
+        if not change and not getattr(obj, "company_id", None):
+            obj.company_id = getattr(getattr(request, "user", None), "company_id", None)
+        super().save_model(request, obj, form, change)
+
+    def get_readonly_fields(self, request, obj=None):
+        ro = list(super().get_readonly_fields(request, obj))
+        # company редактируем только суперпользователю
+        if not request.user.is_superuser:
+            ro.append("company")
+        return ro
+
+
+# --- Inline для сделок внутри клиента ---
+class ClientDealInline(admin.TabularInline):
+    model = ClientDeal
+    extra = 0
+    fields = ("title", "kind", "amount", "created_at")
+    readonly_fields = ("created_at",)
+    show_change_link = True
+
+    def get_queryset(self, request):
+        qs = super().get_queryset(request)
+        if request.user.is_superuser:
+            return qs
+        user_company_id = getattr(getattr(request, "user", None), "company_id", None)
+        if user_company_id:
+            qs = qs.filter(company_id=user_company_id)
+        return qs
+
+    def has_add_permission(self, request, obj=None):
+        return True
+
+    def save_new_instance(self, form, commit=True):
+        """
+        (используется Django >=5 для inline formset) — проставим company из родителя.
+        """
+        instance = super().save_new_instance(form, commit=False)
+        if not getattr(instance, "company_id", None) and instance.client_id:
+            instance.company_id = instance.client.company_id
+        if commit:
+            instance.save()
+        return instance
+
+    def save_formset(self, request, form, formset, change):
+        instances = formset.save(commit=False)
+        for inst in instances:
+            if not getattr(inst, "company_id", None):
+                inst.company_id = getattr(form.instance, "company_id", None)
+        super().save_formset(request, form, formset, change)
+
+
 @admin.register(Client)
-class ClientAdmin(admin.ModelAdmin):
-    list_display = ('full_name', 'phone', 'status', 'company', 'created_at')
-    list_filter = ('status', 'company', 'created_at')
-    search_fields = ('full_name', 'phone')
-    readonly_fields = ('created_at', 'updated_at')
+class ClientAdmin(CompanyFilteredAdmin):
+    list_display = ("full_name", "phone", "email", "date", "status", "created_at")
+    list_filter = ("status", ("date", admin.DateFieldListFilter), ("created_at", admin.DateFieldListFilter))
+    search_fields = ("full_name", "phone", "email")
+    readonly_fields = ("created_at", "updated_at")
+    date_hierarchy = "date"
+    ordering = ("-created_at",)
+    inlines = [ClientDealInline]
+    list_per_page = 50
+
+    # чтобы в форме нельзя было выбрать клиентов другой компании (на всякий случай для FK)
+    def formfield_for_foreignkey(self, db_field, request, **kwargs):
+        return super().formfield_for_foreignkey(db_field, request, **kwargs)
+
+
+@admin.register(ClientDeal)
+class ClientDealAdmin(CompanyFilteredAdmin):
+    list_display = ("title", "client", "kind", "amount", "created_at")
+    list_filter = ("kind", ("created_at", admin.DateFieldListFilter))
+    search_fields = ("title", "client__full_name", "client__phone")
+    readonly_fields = ("created_at", "updated_at")
+    ordering = ("-created_at",)
+    list_select_related = ("client",)
+    list_per_page = 50
+    autocomplete_fields = ("client",)
+
+    def formfield_for_foreignkey(self, db_field, request, **kwargs):
+        """
+        Фильтруем список клиентов по компании пользователя.
+        """
+        if db_field.name == "client" and not request.user.is_superuser:
+            user_company_id = getattr(getattr(request, "user", None), "company_id", None)
+            if user_company_id:
+                kwargs["queryset"] = Client.objects.filter(company_id=user_company_id)
+        return super().formfield_for_foreignkey(db_field, request, **kwargs)
