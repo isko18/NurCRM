@@ -9,6 +9,8 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 from rest_framework.exceptions import NotFound
+from django.shortcuts import get_object_or_404
+from rest_framework import serializers
 
 from django_filters.rest_framework import DjangoFilterBackend
 
@@ -16,7 +18,7 @@ from apps.main.models import (
     Contact, Pipeline, Deal, Task, Integration, Analytics,
     Order, Product, Review, Notification, Event,
     ProductBrand, ProductCategory, Warehouse, WarehouseEvent, Client,
-    GlobalProduct, GlobalBrand, GlobalCategory,
+    GlobalProduct, GlobalBrand, GlobalCategory, ClientDeal
 )
 from apps.main.serializers import (
     ContactSerializer, PipelineSerializer, DealSerializer, TaskSerializer,
@@ -24,7 +26,7 @@ from apps.main.serializers import (
     ReviewSerializer, NotificationSerializer, EventSerializer,
     WarehouseSerializer, WarehouseEventSerializer,
     ProductCategorySerializer, ProductBrandSerializer,
-    OrderItemSerializer, ClientSerializer,
+    OrderItemSerializer, ClientSerializer, ClientDealSerializer
 )
 
 
@@ -464,17 +466,102 @@ class OrderAnalyticsView(APIView):
         return Response(response_data)
 
 
-class ClientListCreateAPIView(CompanyRestrictedMixin, generics.ListCreateAPIView):
+class ClientListCreateAPIView(generics.ListCreateAPIView):
+    """
+    GET  /api/main/clients/
+    POST /api/main/clients/
+    """
+    permission_classes = [permissions.IsAuthenticated]
     serializer_class = ClientSerializer
-    queryset = Client.objects.all()
-    filter_backends = [DjangoFilterBackend, filters.SearchFilter]
-    search_fields = ["full_name", "phone"]
-    filterset_fields = ["status"]
+    filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
+    # фильтры и поиск по базе
+    filterset_fields = ["status", "date"]
+    search_fields = ["full_name", "phone", "email"]
+    ordering_fields = ["created_at", "updated_at", "date"]
+    ordering = ["-created_at"]
+
+    def get_queryset(self):
+        return Client.objects.filter(company=self.request.user.company)
 
     def perform_create(self, serializer):
         serializer.save(company=self.request.user.company)
 
 
-class ClientRetrieveUpdateDestroyAPIView(CompanyRestrictedMixin, generics.RetrieveUpdateDestroyAPIView):
+class ClientRetrieveUpdateDestroyAPIView(generics.RetrieveUpdateDestroyAPIView):
+    """
+    GET    /api/main/clients/<uuid:pk>/
+    PATCH  /api/main/clients/<uuid:pk>/
+    PUT    /api/main/clients/<uuid:pk>/
+    DELETE /api/main/clients/<uuid:pk>/
+    """
+    permission_classes = [permissions.IsAuthenticated]
     serializer_class = ClientSerializer
-    queryset = Client.objects.all()
+
+    def get_queryset(self):
+        return Client.objects.filter(company=self.request.user.company)
+
+
+# ---------- Сделки клиента ----------
+class ClientDealListCreateAPIView(generics.ListCreateAPIView):
+    """
+    Варианты:
+      GET  /api/main/deals/                      — все сделки компании
+      POST /api/main/deals/                      — создать сделку (client в теле)
+      GET  /api/main/clients/<client_id>/deals/  — сделки конкретного клиента
+      POST /api/main/clients/<client_id>/deals/  — создать сделку для клиента из URL
+    """
+    permission_classes = [permissions.IsAuthenticated]
+    serializer_class = ClientDealSerializer
+    filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
+    filterset_fields = ["kind", "client"]
+    search_fields = ["title", "note"]
+    ordering_fields = ["created_at", "amount", "kind"]
+    ordering = ["-created_at"]
+
+    def get_queryset(self):
+        qs = ClientDeal.objects.select_related("client").filter(company=self.request.user.company)
+        client_id = self.kwargs.get("client_id")
+        if client_id:
+            qs = qs.filter(client_id=client_id)
+        return qs
+
+    def perform_create(self, serializer):
+        company = self.request.user.company
+        client_id = self.kwargs.get("client_id")
+
+        if client_id:
+            # Вложенный маршрут: клиент берётся из URL, проверяем принадлежность компании
+            client = get_object_or_404(Client, id=client_id, company=company)
+            serializer.save(company=company, client=client)
+        else:
+            # Обычный маршрут: client приходит в теле запроса — дополнительно проверим компанию
+            client = serializer.validated_data.get("client")
+            if not client or client.company_id != company.id:
+                raise serializers.ValidationError({"client": "Клиент не найден в вашей компании."})
+            serializer.save(company=company)
+
+
+class ClientDealRetrieveUpdateDestroyAPIView(generics.RetrieveUpdateDestroyAPIView):
+    """
+    GET    /api/main/deals/<uuid:pk>/
+    PATCH  /api/main/deals/<uuid:pk>/
+    PUT    /api/main/deals/<uuid:pk>/
+    DELETE /api/main/deals/<uuid:pk>/
+    """
+    permission_classes = [permissions.IsAuthenticated]
+    serializer_class = ClientDealSerializer
+
+    def get_queryset(self):
+        # Ограничиваем сделки компанией текущего пользователя
+        return ClientDeal.objects.select_related("client").filter(company=self.request.user.company)
+
+    def perform_update(self, serializer):
+        """
+        Запрещаем «уход» сделки в другую компанию через смену client.
+        Разрешаем смену клиента только внутри своей компании.
+        """
+        company = self.request.user.company
+        new_client = serializer.validated_data.get("client")
+        if new_client and new_client.company_id != company.id:
+            raise serializers.ValidationError({"client": "Клиент принадлежит другой компании."})
+        serializer.save()

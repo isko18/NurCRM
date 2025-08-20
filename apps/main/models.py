@@ -614,32 +614,69 @@ class WarehouseEvent(models.Model):
           
 
 class Client(models.Model):
-    STATUS_CHOICES = [
-        ('new', 'Новый'),
-        ('contacted', 'Связались'),
-        ('interested', 'Заинтересован'),
-        ('converted', 'Стал клиентом'),
-        ('inactive', 'Неактивный'),
-        ('lost', 'Потерян'),
-        ('paid_for', 'Оплачено'),
-        ('awaiting', 'Ожидает'),
-        ('credit', 'Долг'),
-        ('rejection', 'Отказ'),
-    ]
+    class Status(models.TextChoices):
+        NEW = "new", "Новый"
 
-    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False, verbose_name='ID клиента')
-    company = models.ForeignKey(Company, on_delete=models.CASCADE, related_name='clients', verbose_name='Компания')
-    full_name = models.CharField(max_length=255, verbose_name='ФИО')
-    phone = models.CharField(max_length=32, verbose_name='Номер телефона')
-    status = models.CharField(max_length=20, choices=STATUS_CHOICES, verbose_name='Статус клиента')
-    price = models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
-    created_at = models.DateTimeField(auto_now_add=True, verbose_name='Дата создания')
-    updated_at = models.DateTimeField(auto_now=True, verbose_name='Дата обновления')
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False, verbose_name="ID клиента")
+    company = models.ForeignKey(
+        Company, on_delete=models.CASCADE, related_name="clients", verbose_name="Компания"
+    )
+
+    full_name = models.CharField("ФИО", max_length=255)
+    phone = models.CharField("Телефон", max_length=32)
+    email = models.EmailField("Почта", blank=True)          # по желанию
+    date = models.DateField("Дата", null=True, blank=True)
+    status = models.CharField(
+        "Статус", max_length=16, choices=Status.choices, default=Status.NEW
+    )
+
+    created_at = models.DateTimeField("Создано", auto_now_add=True)
+    updated_at = models.DateTimeField("Обновлено", auto_now=True)
+
+    class Meta:
+        verbose_name = "Клиент"
+        verbose_name_plural = "Клиенты"
+        ordering = ["-created_at"]
+        indexes = [
+            models.Index(fields=["company", "phone"]),
+            models.Index(fields=["company", "status"]),
+        ]
 
     def __str__(self):
         return f"{self.full_name} ({self.phone})"
+    
+    
+class ClientDeal(models.Model):
+    class Kind(models.TextChoices):
+        SALE = "sale", "Продажа"
+        DEBT = "debt", "Долг"
+        PREPAYMENT = "prepayment", "Предоплата"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    company = models.ForeignKey(
+        Company,
+        on_delete=models.CASCADE,
+        related_name="client_deals",   # <= было "deals"
+        verbose_name="Компания",
+    )
+    client = models.ForeignKey(
+        "Client",
+        on_delete=models.CASCADE,
+        related_name="deals",
+        verbose_name="Клиент",
+    )
+    title = models.CharField("Название сделки", max_length=255)
+    kind = models.CharField("Тип сделки", max_length=16, choices=Kind.choices, default=Kind.SALE)
+    amount = models.DecimalField("Сумма", max_digits=12, decimal_places=2, default=0)
+    note = models.TextField("Комментарий", blank=True)
+    created_at = models.DateTimeField("Создано", auto_now_add=True)
+    updated_at = models.DateTimeField("Обновлено", auto_now=True)
 
     class Meta:
-        verbose_name = 'Клиент'
-        verbose_name_plural = 'Клиенты'
-        ordering = ['-created_at']
+        verbose_name = "Сделка"
+        verbose_name_plural = "Сделки"
+        ordering = ["-created_at"]
+        indexes = [
+            models.Index(fields=["company", "client"]),
+            models.Index(fields=["company", "kind"]),
+        ]
