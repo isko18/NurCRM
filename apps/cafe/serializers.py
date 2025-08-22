@@ -177,8 +177,8 @@ class OrderSerializer(CompanyReadOnlyMixin):
     table = serializers.PrimaryKeyRelatedField(queryset=Table.objects.all())
     waiter = serializers.PrimaryKeyRelatedField(queryset=Staff.objects.all(), allow_null=True, required=False)
 
-    # ВАЖНО: источник — related_name у OrderItem: 'cafe_items'
-    items = OrderItemInlineSerializer(many=True, required=False, source="cafe_items")
+    # ВАЖНО: источник — related_name у OrderItem: 'cafe_order_items'
+    items = OrderItemInlineSerializer(many=True, required=False, source="cafe_order_items")
 
     class Meta:
         ref_name = "CafeOrder"
@@ -202,7 +202,7 @@ class OrderSerializer(CompanyReadOnlyMixin):
             qty = it.get("quantity", 1)
             if company and menu_item.company_id != company.id:
                 raise serializers.ValidationError("Позиция меню принадлежит другой компании.")
-            existing = order.cafe_items.filter(menu_item=menu_item).first()
+            existing = order.cafe_order_items.filter(menu_item=menu_item).first()
             if existing:
                 existing.quantity += qty
                 existing.save(update_fields=["quantity"])
@@ -216,17 +216,17 @@ class OrderSerializer(CompanyReadOnlyMixin):
                 )
 
     def create(self, validated_data):
-        items = validated_data.pop("cafe_items", [])  # из-за source="cafe_items"
+        items = validated_data.pop("cafe_order_items", [])  # из-за source="cafe_order_items"
         obj = super().create(validated_data)          # company выставит миксин
         if items:
             self._upsert_items(obj, items, obj.company)
         return obj
 
     def update(self, instance, validated_data):
-        items = validated_data.pop("cafe_items", None)
+        items = validated_data.pop("cafe_order_items", None)
         obj = super().update(instance, validated_data)
         if items is not None:
-            instance.cafe_items.all().delete()
+            instance.cafe_order_items.all().delete()
             if items:
                 self._upsert_items(instance, items, instance.company)
         return obj
