@@ -616,12 +616,19 @@ class WarehouseEvent(models.Model):
 class Client(models.Model):
     class Status(models.TextChoices):
         NEW = "new", "Новый"
+        
+    class StatusClient(models.TextChoices):
+        CLIENT = "client", "клиент"
+        SUPPLIERS = "suppliers", "Поставщики"
+        IMPLEMENTERS = "implementers", "Реализаторы"
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False, verbose_name="ID клиента")
     company = models.ForeignKey(
         Company, on_delete=models.CASCADE, related_name="clients", verbose_name="Компания"
     )
-
+    type = models.CharField(
+        "Тип клиента", max_length=16, choices=StatusClient.choices, default=StatusClient.CLIENT
+    )
     full_name = models.CharField("ФИО", max_length=255)
     phone = models.CharField("Телефон", max_length=32)
     email = models.EmailField("Почта", blank=True)          # по желанию
