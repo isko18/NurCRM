@@ -225,14 +225,19 @@ CELERY_TASK_SERIALIZER = 'json'
 
 
 CORS_ORIGIN_ALLOW_ALL = True
+CORS_ALLOW_CREDENTIALS = True  
 
 CORS_ALLOWED_ORIGINS = [
     "http://localhost:3000",
+    "http://localhost:5173",
     'http://127.0.0.1:8000',
     'https://nurcrm.kg',
     "http://app.nurcrm.kg",
 ]
-
+SESSION_COOKIE_SAMESITE = "None"
+SESSION_COOKIE_SECURE = True
+CSRF_COOKIE_SAMESITE   = "None"
+CSRF_COOKIE_SECURE     = True
 CORS_ORIGIN_WRITELIST = (
     'http://localhost:3000',
     'http://localhost:',
