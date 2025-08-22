@@ -18,7 +18,7 @@ from apps.main.models import (
     Contact, Pipeline, Deal, Task, Integration, Analytics,
     Order, Product, Review, Notification, Event,
     ProductBrand, ProductCategory, Warehouse, WarehouseEvent, Client,
-    GlobalProduct, GlobalBrand, GlobalCategory, ClientDeal
+    GlobalProduct, GlobalBrand, GlobalCategory, ClientDeal, Bid
 )
 from apps.main.serializers import (
     ContactSerializer, PipelineSerializer, DealSerializer, TaskSerializer,
@@ -26,7 +26,7 @@ from apps.main.serializers import (
     ReviewSerializer, NotificationSerializer, EventSerializer,
     WarehouseSerializer, WarehouseEventSerializer,
     ProductCategorySerializer, ProductBrandSerializer,
-    OrderItemSerializer, ClientSerializer, ClientDealSerializer
+    OrderItemSerializer, ClientSerializer, ClientDealSerializer, BidSerializers
 )
 
 
@@ -565,3 +565,16 @@ class ClientDealRetrieveUpdateDestroyAPIView(generics.RetrieveUpdateDestroyAPIVi
         if new_client and new_client.company_id != company.id:
             raise serializers.ValidationError({"client": "Клиент принадлежит другой компании."})
         serializer.save()
+        
+        
+class BidListCreateAPIView(generics.ListCreateAPIView):
+    serializer_class = BidSerializers
+    queryset = Bid.objects.all()
+    
+    
+class BidRetrieveUpdateDestroyAPIView(generics.RetrieveUpdateDestroyAPIView):
+    serializer_class = BidSerializers
+    queryset = Bid.objects.all()
+    # lookup_field = "uuid"
+    
+    

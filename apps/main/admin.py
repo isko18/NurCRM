@@ -6,8 +6,11 @@ from apps.main.models import (
     Integration, Analytics, Order, OrderItem,
     Product, Review, Notification, Event,
     Warehouse, WarehouseEvent,
-    ProductCategory, ProductBrand, Client, GlobalProduct, GlobalBrand, GlobalCategory, CartItem, Cart, Sale, SaleItem, ClientDeal
+    ProductCategory, ProductBrand, Client, GlobalProduct, GlobalBrand, GlobalCategory, CartItem, Cart, Sale, SaleItem, ClientDeal, Bid
 )
+
+
+admin.site.register(Bid)
 
 @admin.register(Contact)
 class ContactAdmin(admin.ModelAdmin):

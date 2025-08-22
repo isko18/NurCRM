@@ -1,10 +1,13 @@
 from rest_framework import serializers
-from apps.main.models import Contact, Pipeline, Deal, Task, Integration, Analytics, Order, Product, Review, Notification, Event, Warehouse, WarehouseEvent, ProductCategory, ProductBrand, OrderItem, Client, GlobalProduct, CartItem, ClientDeal
+from apps.main.models import Contact, Pipeline, Deal, Task, Integration, Analytics, Order, Product, Review, Notification, Event, Warehouse, WarehouseEvent, ProductCategory, ProductBrand, OrderItem, Client, GlobalProduct, CartItem, ClientDeal, Bid
 
 from apps.users.models import User, Company
 from django.db import transaction
 
-
+class BidSerializers(serializers.ModelSerializer):
+    class Meta:
+        model = Bid
+        fields = ['id', 'full_name', 'phone', 'text', 'status','created_at']
 
     
 class ProductCategorySerializer(serializers.ModelSerializer):
