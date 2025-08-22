@@ -177,8 +177,7 @@ class OrderSerializer(CompanyReadOnlyMixin):
     table = serializers.PrimaryKeyRelatedField(queryset=Table.objects.all())
     waiter = serializers.PrimaryKeyRelatedField(queryset=Staff.objects.all(), allow_null=True, required=False)
 
-    # ВАЖНО: источник — related_name у OrderItem: 'items'
-    items = OrderItemInlineSerializer(many=True, required=False, source="items")
+    items = OrderItemInlineSerializer(many=True, required=False)  # ← убираем source="items"
 
     class Meta:
         ref_name = "CafeOrder"
