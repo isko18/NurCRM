@@ -51,6 +51,7 @@ INSTALLED_APPS = [
     'apps.barber',
     'apps.education',
     'apps.cafe',
+    # 'apps.whatsapp',
     
 ]
 

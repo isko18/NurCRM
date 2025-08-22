@@ -1,39 +1,47 @@
 from django.db import models
+import uuid
+from apps.users.models import Company
 
-class Client(models.Model):
-    name = models.CharField(max_length=100, blank=True)
-    phone = models.CharField(max_length=20, unique=True)
-    created_at = models.DateTimeField(auto_now_add=True)
+
+class WhatsAppSession(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    company = models.OneToOneField(
+        Company,
+        on_delete=models.CASCADE,
+        related_name="whatsapp_session",
+        verbose_name="Компания"
+    )
+    session_name = models.CharField(max_length=255, unique=True)
+    is_ready = models.BooleanField(default=False)
+    last_qr = models.TextField(blank=True, null=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = "WhatsApp-сессия"
+        verbose_name_plural = "WhatsApp-сессии"
 
     def __str__(self):
-        return self.name or self.phone
+        return f"WA Session {self.company.name}"
 
 
 class Message(models.Model):
-    DIRECTION_CHOICES = [
-        ('in', 'Incoming'),
-        ('out', 'Outgoing'),
-    ]
+    DIRECTION_CHOICES = (
+        ("in", "Inbound"),
+        ("out", "Outbound"),
+    )
 
-    MESSAGE_TYPE_CHOICES = [
-        ('text', 'Text'),
-        ('file', 'File'),
-        ('template', 'Template'),
-        ('button_reply', 'Button Reply'),
-    ]
-
-    client = models.ForeignKey(Client, on_delete=models.CASCADE, related_name='messages')
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    company = models.ForeignKey(Company, on_delete=models.CASCADE, related_name="messages")
+    phone = models.CharField(max_length=32)
     text = models.TextField(blank=True, null=True)
-    type = models.CharField(max_length=20, choices=MESSAGE_TYPE_CHOICES, default='text')
+    type = models.CharField(max_length=20, default="text")  # text, image, video, document, audio
+    caption = models.TextField(blank=True, null=True)
     direction = models.CharField(max_length=3, choices=DIRECTION_CHOICES)
-    external_id = models.CharField(max_length=255, blank=True, null=True, unique=True)
-    channel_id = models.CharField(max_length=100, blank=True, null=True)
-    file_url = models.URLField(blank=True, null=True)
-    template_name = models.CharField(max_length=255, blank=True, null=True)
-    button_payload = models.CharField(max_length=255, blank=True, null=True)
-    button_text = models.CharField(max_length=100, blank=True, null=True)
-    created_at = models.DateTimeField(auto_now_add=True)
+    ts = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        verbose_name = "Сообщение"
+        verbose_name_plural = "Сообщения"
 
     def __str__(self):
-        preview = self.text if self.text else self.file_url or "..."
-        return f"[{self.direction}] {self.client.phone}: {preview[:30]}"
+        return f"[{self.direction}] {self.phone}: {self.text or self.type}"
