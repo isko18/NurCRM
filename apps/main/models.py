@@ -686,3 +686,28 @@ class ClientDeal(models.Model):
             models.Index(fields=["company", "client"]),
             models.Index(fields=["company", "kind"]),
         ]
+        
+        
+class Bid(models.Model):
+    class Status(models.TextChoices):
+        NEW = "new", "Новый"
+        PROCESSING = "processing", "В обработке"
+        REFUSAL = "refusal", "Отказ"
+        THINKS = "thinks", "Думает"
+        CONNECTED = "connected", "Подключено"
+        
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    full_name = models.CharField(max_length=255,verbose_name="ФИО")
+    phone = models.CharField(max_length=255, verbose_name="Номер телефона")
+    text = models.TextField(verbose_name="Обращение")
+    created_at = models.DateTimeField(auto_now_add=True, verbose_name="Дата создания")
+    status = models.CharField("Тип сделки", max_length=16, choices=Status.choices, default=Status.NEW)
+
+    
+    def __str__(self):
+        return f"{self.full_name} - {self.phone} - {self.text}"
+
+    class Meta:
+        verbose_name = "Сделка"
+        verbose_name_plural = "Сделки"
+        ordering = ["-created_at"]

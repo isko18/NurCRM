@@ -6,6 +6,9 @@ from .pos_views import *
 urlpatterns = [
 
     # 🔹 Контакты
+    path('applications/<uuid:pk>/', BidRetrieveUpdateDestroyAPIView.as_view(), name='applications-detail'),
+    path('applications/', BidListCreateAPIView.as_view(), name='applications-list-create'),
+
     path('contacts/', ContactListCreateAPIView.as_view(), name='contact-list-create'),
     path('contacts/<uuid:pk>/', ContactRetrieveUpdateDestroyAPIView.as_view(), name='contact-detail'),
 
