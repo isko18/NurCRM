@@ -257,7 +257,7 @@ class OrderItem(models.Model):
         verbose_name='Компания',
         editable=False,
     )
-
+    
     order = models.ForeignKey(
         Order, on_delete=models.CASCADE,
         related_name='items',  # как уже исправляли
