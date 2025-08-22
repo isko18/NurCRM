@@ -300,7 +300,7 @@ class ClientDealInline(admin.TabularInline):
 
 @admin.register(Client)
 class ClientAdmin(CompanyFilteredAdmin):
-    list_display = ("full_name", "phone", "email", "date", "status", "created_at")
+    list_display = ("full_name","type", "phone", "email", "date", "status", "created_at")
     list_filter = ("status", ("date", admin.DateFieldListFilter), ("created_at", admin.DateFieldListFilter))
     search_fields = ("full_name", "phone", "email")
     readonly_fields = ("created_at", "updated_at")
