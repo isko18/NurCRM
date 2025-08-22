@@ -235,10 +235,12 @@ CORS_ALLOWED_ORIGINS = [
     'https://nurcrm.kg',
     "http://app.nurcrm.kg",
 ]
+
 SESSION_COOKIE_SAMESITE = "None"
 SESSION_COOKIE_SECURE = True
 CSRF_COOKIE_SAMESITE   = "None"
 CSRF_COOKIE_SECURE     = True
+
 CORS_ORIGIN_WRITELIST = (
     'http://localhost:3000',
     'http://localhost:',
@@ -259,6 +261,7 @@ CORS_ALLOW_METHODS = (
     "POST",
     "PUT",
 )
+SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
 
 EMAIL_BACKEND = 'django.core.mail.backends.smtp.EmailBackend'
 EMAIL_HOST = 'smtp.gmail.com'
