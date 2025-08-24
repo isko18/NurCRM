@@ -134,6 +134,8 @@ class Company(models.Model):
     )
     owner = models.OneToOneField(User, on_delete=models.CASCADE, related_name='owned_company', verbose_name='Владелец компании')
     created_at = models.DateTimeField(auto_now_add=True, verbose_name='Дата создания')
+    start_date = models.DateTimeField(verbose_name='Дата начала', blank=True, null=True)
+    end_date = models.DateTimeField(verbose_name='Дата окончания', blank=True, null=True) 
 
     def __str__(self):
         return self.name
