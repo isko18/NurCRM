@@ -350,6 +350,8 @@ class CompanySerializer(serializers.ModelSerializer):
             'subscription_plan',
             'owner',
             'created_at',
+            'start_date',
+            'end_date'
         ]
 
 
