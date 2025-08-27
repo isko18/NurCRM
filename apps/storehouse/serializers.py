@@ -30,6 +30,7 @@ class CompanyReadOnlyMixin(serializers.ModelSerializer):
 # 📦 Склад
 class WarehouseSerializer(CompanyReadOnlyMixin):
     class Meta:
+        ref_name = "WarehouseProduct"
         model = Warehouse
         fields = "__all__"
 
@@ -47,6 +48,7 @@ class ProductSerializer(CompanyReadOnlyMixin):
     category_name = serializers.CharField(source="category.name", read_only=True)
 
     class Meta:
+        ref_name = "StorehouseProduct"
         model = Product
         fields = "__all__"
 
