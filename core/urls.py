@@ -49,6 +49,9 @@ apps_includes = [
     path('whatsapp/', include('apps.whatsapp.urls')),   
     path('instagram/', include('apps.instagram.urls')),   
     
+    path('logger/', include('logger.urls')),   
+    
+    
     
     
     

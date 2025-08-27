@@ -52,7 +52,9 @@ INSTALLED_APPS = [
     'apps.education',
     'apps.cafe',
     'apps.whatsapp',
-    'apps.instagram'
+    'apps.instagram',
+    
+    'logger'
     
 ]
 
