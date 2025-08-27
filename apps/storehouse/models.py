@@ -9,7 +9,7 @@ class Warehouse(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     company = models.ForeignKey(
         Company, on_delete=models.CASCADE,
-        related_name="warehouses", verbose_name="Компания"
+        related_name="storehouse_warehouses", verbose_name="Компания"
     )
     name = models.CharField(max_length=255, verbose_name="Название")
     address = models.CharField(max_length=500, verbose_name="Адрес", blank=True, null=True)
@@ -57,7 +57,7 @@ class Product(models.Model):
 
     company = models.ForeignKey(
         Company, on_delete=models.CASCADE,
-        related_name="products", verbose_name="Компания"
+        related_name="storehouse_products", verbose_name="Компания"
     )
     name = models.CharField(max_length=255, verbose_name="Название товара")
     barcode = models.CharField(max_length=64, blank=True, null=True, verbose_name="Штрих-код")
