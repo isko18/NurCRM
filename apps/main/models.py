@@ -708,6 +708,29 @@ class Bid(models.Model):
         return f"{self.full_name} - {self.phone} - {self.text}"
 
     class Meta:
-        verbose_name = "Сделка"
-        verbose_name_plural = "Сделки"
+        verbose_name = "Заявка на подключение"
+        verbose_name_plural = "Заявки на подключение"
+        ordering = ["-created_at"]
+        
+        
+        
+class SocialApplications(models.Model):
+    class Status(models.TextChoices):
+        NEW = "new", "Новый"
+        PROCESSING = "processing", "В обработке"
+        CONNECTED = "connected", "Подключено"
+        
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    company = models.CharField(max_length=255,verbose_name="Компания")
+    text = models.TextField(verbose_name="Обращение",)
+    created_at = models.DateTimeField(auto_now_add=True, verbose_name="Дата создания")
+    status = models.CharField("Тип сделки", max_length=16, choices=Status.choices, default=Status.NEW)
+
+    
+    def __str__(self):
+        return f"{self.full_name} - {self.phone} - {self.text}"
+
+    class Meta:
+        verbose_name = "Заявка на соц. сети"
+        verbose_name_plural = "Заявки на соц. сети"
         ordering = ["-created_at"]
