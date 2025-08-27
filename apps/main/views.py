@@ -18,7 +18,7 @@ from apps.main.models import (
     Contact, Pipeline, Deal, Task, Integration, Analytics,
     Order, Product, Review, Notification, Event,
     ProductBrand, ProductCategory, Warehouse, WarehouseEvent, Client,
-    GlobalProduct, GlobalBrand, GlobalCategory, ClientDeal, Bid
+    GlobalProduct, GlobalBrand, GlobalCategory, ClientDeal, Bid, SocialApplications
 )
 from apps.main.serializers import (
     ContactSerializer, PipelineSerializer, DealSerializer, TaskSerializer,
@@ -26,7 +26,7 @@ from apps.main.serializers import (
     ReviewSerializer, NotificationSerializer, EventSerializer,
     WarehouseSerializer, WarehouseEventSerializer,
     ProductCategorySerializer, ProductBrandSerializer,
-    OrderItemSerializer, ClientSerializer, ClientDealSerializer, BidSerializers
+    OrderItemSerializer, ClientSerializer, ClientDealSerializer, BidSerializers, SocialApplicationsSerializers
 )
 
 
@@ -576,5 +576,14 @@ class BidRetrieveUpdateDestroyAPIView(generics.RetrieveUpdateDestroyAPIView):
     serializer_class = BidSerializers
     queryset = Bid.objects.all()
     # lookup_field = "uuid"
+    
+class SocialApplicationsListCreateAPIView(generics.ListCreateAPIView):
+    serializer_class = SocialApplicationsSerializers
+    queryset = SocialApplications.objects.all()
+    
+    
+class SocialApplicationsRetrieveUpdateDestroyAPIView(generics.RetrieveUpdateDestroyAPIView):
+    serializer_class = SocialApplicationsSerializers
+    queryset = SocialApplications.objects.all()
     
     

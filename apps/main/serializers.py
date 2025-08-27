@@ -1,8 +1,14 @@
 from rest_framework import serializers
-from apps.main.models import Contact, Pipeline, Deal, Task, Integration, Analytics, Order, Product, Review, Notification, Event, Warehouse, WarehouseEvent, ProductCategory, ProductBrand, OrderItem, Client, GlobalProduct, CartItem, ClientDeal, Bid
+from apps.main.models import Contact, Pipeline, Deal, Task, Integration, Analytics, Order, Product, Review, Notification, Event, Warehouse, WarehouseEvent, ProductCategory, ProductBrand, OrderItem, Client, GlobalProduct, CartItem, ClientDeal, Bid, SocialApplications
 
 from apps.users.models import User, Company
 from django.db import transaction
+
+class SocialApplicationsSerializers(serializers.ModelSerializer):
+    class Meta:
+        model = SocialApplications
+        fields = ['id', 'company', 'text', 'status','created_at']
+
 
 class BidSerializers(serializers.ModelSerializer):
     class Meta:
