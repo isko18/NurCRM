@@ -352,6 +352,9 @@ class CompanySerializer(serializers.ModelSerializer):
             'created_at',
             'start_date',
             'end_date'
+            'can_view_whatsapp',
+            'can_view_instagram',
+            'can_view_telegram'
         ]
 
 

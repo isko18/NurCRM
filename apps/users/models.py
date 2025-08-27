@@ -136,6 +136,10 @@ class Company(models.Model):
     created_at = models.DateTimeField(auto_now_add=True, verbose_name='Дата создания')
     start_date = models.DateTimeField(verbose_name='Дата начала', blank=True, null=True)
     end_date = models.DateTimeField(verbose_name='Дата окончания', blank=True, null=True) 
+    can_view_whatsapp = models.BooleanField(default=False, blank=True, null=True, verbose_name='Доступ к whatsapp')
+    can_view_instagram = models.BooleanField(default=False, blank=True, null=True, verbose_name='Доступ к instagram')
+    can_view_telegram = models.BooleanField(default=False, blank=True, null=True, verbose_name='Доступ к telegram')
+    
 
     def __str__(self):
         return self.name
