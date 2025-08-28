@@ -6,6 +6,13 @@ from django.shortcuts import get_object_or_404
 from django.utils.dateparse import parse_datetime, parse_date
 from django.utils import timezone
 from django_filters.rest_framework import DjangoFilterBackend
+from reportlab.pdfgen import canvas
+from reportlab.lib.units import mm
+from django.http import FileResponse
+from reportlab.lib.utils import ImageReader
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
+import qrcode
 
 from apps.main.models import Cart, CartItem, Sale, Product, MobileScannerToken
 from .pos_serializers import (
@@ -18,8 +25,107 @@ from apps.main.services import checkout_cart, NotEnoughStock
 from apps.main.views import CompanyRestrictedMixin
 from apps.construction.models import Department
 from django.http import Http404
+import io,os
 
 
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# Путь к папке fonts внутри apps/main
+FONTS_DIR = os.path.join(BASE_DIR, "fonts")
+
+# Регистрируем шрифты
+pdfmetrics.registerFont(TTFont("DejaVu", os.path.join(FONTS_DIR, "DejaVuSans.ttf")))
+pdfmetrics.registerFont(TTFont("DejaVu-Bold", os.path.join(FONTS_DIR, "DejaVuSans-Bold.ttf")))
+
+class SaleReceiptDownloadAPIView(APIView):
+    """
+    GET /api/main/pos/sales/<uuid:pk>/receipt/
+    Скачивание PDF-чека в формате кассового аппарата
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request, pk, *args, **kwargs):
+        sale = get_object_or_404(
+            Sale.objects.prefetch_related("items"),
+            id=pk, company=request.user.company
+        )
+
+        # === Расчёт высоты под чек ===
+        base_height = 80   # шапка и отступы
+        per_item = 15      # место на строку товара
+        qr_block = 40      # блок под QR
+        page_height = (base_height + per_item * sale.items.count() + qr_block) * mm
+        page_width = 58 * mm
+
+        buffer = io.BytesIO()
+        p = canvas.Canvas(buffer, pagesize=(page_width, page_height))
+        y = page_height - 10 * mm
+
+        # === Заголовок ===
+        p.setFont("DejaVu-Bold", 12)
+        p.drawCentredString(page_width / 2, y, "ЧЕК ПРОДАЖИ")
+        y -= 10 * mm
+
+        p.setFont("DejaVu", 9)
+
+        # Номер чека и дата
+        p.drawString(5 * mm, y, f"Продажа № {sale.id}")
+        y -= 5 * mm
+        p.drawString(5 * mm, y, sale.created_at.strftime("%d.%m.%Y %H:%M"))
+        y -= 7 * mm
+
+        # Разделитель
+        p.drawCentredString(page_width / 2, y, "-" * 32)
+        y -= 6 * mm
+
+        # === Товары ===
+        for it in sale.items.all():
+            name = it.name_snapshot[:22]  # ограничиваем длину строки
+            qty_price = f"{it.quantity} x {it.unit_price:.2f}"
+            total = f"{(it.quantity * it.unit_price):.2f}"
+
+            # название
+            p.drawString(5 * mm, y, name)
+            y -= 4 * mm
+
+            # количество и сумма
+            p.drawString(5 * mm, y, qty_price)
+            p.drawRightString(page_width - 5 * mm, y, total)
+            y -= 6 * mm
+
+        # Разделитель
+        p.drawCentredString(page_width / 2, y, "-" * 32)
+        y -= 6 * mm
+
+        # === ИТОГО ===
+        p.setFont("DejaVu-Bold", 11)
+        p.drawRightString(page_width - 5 * mm, y, f"ИТОГО: {sale.total:.2f}")
+        y -= 12 * mm
+
+        # === QR-код (через Pillow/qrcode) ===
+        qr_img = qrcode.make(f"SALE:{sale.id};SUM:{sale.total}")
+        qr_size = 25 * mm
+        qr_img = qr_img.resize((int(qr_size), int(qr_size)))
+
+        p.drawImage(
+            ImageReader(qr_img),
+            (page_width - qr_size) / 2,  # центрируем по ширине
+            y - qr_size,                 # опускаем вниз
+            qr_size,
+            qr_size
+        )
+        y -= (qr_size + 10)
+
+        # === Подвал ===
+        p.setFont("DejaVu", 9)
+        p.drawCentredString(page_width / 2, y, "СПАСИБО ЗА ПОКУПКУ!")
+
+        p.showPage()
+        p.save()
+
+        buffer.seek(0)
+        return FileResponse(buffer, as_attachment=True, filename=f"receipt_{sale.id}.pdf")
+    
 class SaleStartAPIView(APIView):
     """
     POST — создать/получить активную корзину для текущего пользователя.
