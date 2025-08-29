@@ -2,6 +2,8 @@ from django.db import models
 from django.contrib.auth.models import AbstractBaseUser, PermissionsMixin
 import uuid
 from apps.users.managers import UserManager
+from datetime import timedelta
+from django.utils import timezone
 
 class Feature(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False, verbose_name='ID')
@@ -140,7 +142,13 @@ class Company(models.Model):
     can_view_instagram = models.BooleanField(default=False, blank=True, null=True, verbose_name='Доступ к instagram')
     can_view_telegram = models.BooleanField(default=False, blank=True, null=True, verbose_name='Доступ к telegram')
     
-
+    def save(self, *args, **kwargs):
+        if not self.start_date:  # если дата еще не задана
+            self.start_date = timezone.now()
+        if not self.end_date:  # если дата еще не задана
+            self.end_date = self.start_date + timedelta(days=10)
+        super().save(*args, **kwargs)
+        
     def __str__(self):
         return self.name
 
