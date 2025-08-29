@@ -178,11 +178,17 @@ class OrderItemSerializer(serializers.ModelSerializer):
         product.quantity -= quantity
         product.save()
 
+        # company подставляем из связанного заказа
+        order = validated_data['order']
+        company = order.company
+
         return OrderItem.objects.create(
             **validated_data,
+            company=company,
             price=price,
             total=total
         )
+
 class OrderSerializer(serializers.ModelSerializer):
     company = serializers.ReadOnlyField(source='company.id')
     items = OrderItemSerializer(many=True)
