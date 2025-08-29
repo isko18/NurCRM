@@ -12,17 +12,18 @@ from .views import (
     EmployeeDestroyAPIView, 
     CompanyDetailAPIView,
     SectorListAPIView,
-    EmployeeDetailAPIView
+    EmployeeDetailAPIView,
+    ChangePasswordView,
+    CompanyUpdateView
 )
 
 urlpatterns = [
     path('auth/register/', RegisterAPIView.as_view(), name='user-register'),
-
-    # JWT авторизация
     path('auth/login/', CustomTokenObtainPairView.as_view(), name='token_obtain_pair'),
     path('auth/refresh/', TokenRefreshView.as_view(), name='token_refresh'),
     
-
+    path('settings/change-password/', ChangePasswordView.as_view(), name='change-password'),
+    path('settings/company/', CompanyUpdateView.as_view(), name='company-update'),
     # Работа со своими сотрудниками
     path('employees/', EmployeeListAPIView.as_view(), name='employee-list'),
     path('employees/create/', EmployeeCreateAPIView.as_view(), name='employee-create'),
