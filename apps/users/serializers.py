@@ -8,6 +8,7 @@ from django.core.mail import send_mail
 from django.conf import settings
 import string
 import secrets
+from django.contrib.auth.password_validation import validate_password
 
 # ✅ JWT авторизация с дополнительными данными пользователя
 class CustomTokenObtainPairSerializer(TokenObtainPairSerializer):
@@ -392,3 +393,38 @@ class EmployeeUpdateSerializer(serializers.ModelSerializer):
                 raise serializers.ValidationError("Вы не можете изменить роль владельца компании.")
 
         return data
+
+
+class ChangePasswordSerializer(serializers.Serializer):
+    current_password = serializers.CharField(required=True, write_only=True)
+    new_password = serializers.CharField(required=True, write_only=True)
+    new_password2 = serializers.CharField(required=True, write_only=True)
+
+    def validate(self, data):
+        user = self.context['request'].user
+
+        if not user.check_password(data['current_password']):
+            raise serializers.ValidationError({"current_password": "Неверный текущий пароль."})
+
+        if data['new_password'] != data['new_password2']:
+            raise serializers.ValidationError({"new_password2": "Пароли не совпадают."})
+
+        validate_password(data['new_password'], user)
+        return data
+
+    def save(self, **kwargs):
+        user = self.context['request'].user
+        user.set_password(self.validated_data['new_password'])
+        user.save()
+        return user
+    
+    
+class CompanyUpdateSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Company
+        fields = ['name']
+
+    def validate_name(self, value):
+        if len(value) < 2:
+            raise serializers.ValidationError("Название компании слишком короткое.")
+        return value

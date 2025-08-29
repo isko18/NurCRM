@@ -134,19 +134,19 @@ class Company(models.Model):
         blank=True,
         verbose_name='Отрасль'
     )
-    owner = models.OneToOneField(User, on_delete=models.CASCADE, related_name='owned_company', verbose_name='Владелец компании')
+    owner = models.OneToOneField('User', on_delete=models.CASCADE, related_name='owned_company', verbose_name='Владелец компании')
     created_at = models.DateTimeField(auto_now_add=True, verbose_name='Дата создания')
     start_date = models.DateTimeField(verbose_name='Дата начала', blank=True, null=True)
     end_date = models.DateTimeField(verbose_name='Дата окончания', blank=True, null=True) 
-    can_view_documents = models.BooleanField(default=False, blank=True, null=True, verbose_name='Доступ к документам')
-    can_view_whatsapp = models.BooleanField(default=False, blank=True, null=True, verbose_name='Доступ к whatsapp')
-    can_view_instagram = models.BooleanField(default=False, blank=True, null=True, verbose_name='Доступ к instagram')
-    can_view_telegram = models.BooleanField(default=False, blank=True, null=True, verbose_name='Доступ к telegram')
+    can_view_documents = models.BooleanField(default=False, verbose_name='Доступ к документам')
+    can_view_whatsapp = models.BooleanField(default=False, verbose_name='Доступ к whatsapp')
+    can_view_instagram = models.BooleanField(default=False, verbose_name='Доступ к instagram')
+    can_view_telegram = models.BooleanField(default=False, verbose_name='Доступ к telegram')
     
     def save(self, *args, **kwargs):
-        if not self.start_date:  # если дата еще не задана
+        if not self.start_date:
             self.start_date = timezone.now()
-        if not self.end_date:  # если дата еще не задана
+        if not self.end_date and self.start_date:
             self.end_date = self.start_date + timedelta(days=10)
         super().save(*args, **kwargs)
         
