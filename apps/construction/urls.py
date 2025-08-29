@@ -4,7 +4,7 @@ from apps.construction.views import (
     DepartmentDetailView,
     DepartmentAnalyticsListView,
     DepartmentAnalyticsDetailView,
-    CashboxListView,
+    CashboxListCreateView,
     CashboxDetailView,
     CashFlowListCreateView,
     CashFlowDetailView,
@@ -27,7 +27,8 @@ urlpatterns = [
     path('analytics/departments/<uuid:pk>/', DepartmentAnalyticsDetailView.as_view(), name='department-analytics-detail'),
     path('company/departments/analytics/', CompanyDepartmentAnalyticsView.as_view(), name='company-department-analytics'),
 
-    path('cashboxes/', CashboxListView.as_view(), name='cashbox-list'),
+    path('cashboxes/', CashboxListCreateView.as_view(), name='cashbox-list-create'),
+
     path('cashboxes/<uuid:pk>/', CashboxDetailView.as_view(), name='cashbox-detail'),
 
     # CASHFLOWS

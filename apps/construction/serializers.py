@@ -12,30 +12,37 @@ class CashFlowInsideCashboxSerializer(serializers.ModelSerializer):
 
 # ─── CASHBOX: c вложенными CashFlow ────────────────────────
 class CashboxWithFlowsSerializer(serializers.ModelSerializer):
-    department_name = serializers.CharField(source='department.name', read_only=True)
+    department_name = serializers.SerializerMethodField()
     cashflows = CashFlowInsideCashboxSerializer(source='flows', many=True, read_only=True)
 
     class Meta:
         model = Cashbox
-        fields = ['id', 'department', 'department_name', 'cashflows']
+        fields = ['id', 'department', 'department_name', 'name', 'cashflows']
+
+    def get_department_name(self, obj):
+        return obj.department.name if obj.department else None
 
 
 # ─── CASHBOX: краткий (для Department) ─────────────────────
 class CashboxSerializer(serializers.ModelSerializer):
-    department_name = serializers.CharField(source='department.name', read_only=True)
+    department_name = serializers.SerializerMethodField()
     analytics = serializers.SerializerMethodField()
 
     class Meta:
         model = Cashbox
-        fields = ['id', 'department', 'department_name', 'analytics']
+        fields = ['id', 'department', 'department_name', 'name', 'analytics']
+
+    def get_department_name(self, obj):
+        return obj.department.name if obj.department else None
 
     def get_analytics(self, obj):
         return obj.get_summary()
 
 
+
 # ─── CASHFLOW: основной ────────────────────────────────────
 class CashFlowSerializer(serializers.ModelSerializer):
-    cashbox_name = serializers.CharField(source='cashbox.department.name', read_only=True)
+    cashbox_name = serializers.SerializerMethodField()
 
     class Meta:
         model = CashFlow
@@ -48,7 +55,13 @@ class CashFlowSerializer(serializers.ModelSerializer):
             'amount',
             'created_at'
         ]
-        read_only_fields = ['id', 'created_at', 'cashbox', 'cashbox_name']
+        read_only_fields = ['id', 'created_at', 'cashbox_name']
+
+    def get_cashbox_name(self, obj):
+        if obj.cashbox.department:
+            return obj.cashbox.department.name
+        return obj.cashbox.name or "Свободная касса"
+
 
 
 # ─── DEPARTMENT: основной ──────────────────────────────────
