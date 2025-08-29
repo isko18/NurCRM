@@ -1,3 +1,4 @@
+from django.db.models import Q
 from rest_framework import generics
 from rest_framework.views import APIView
 from rest_framework.response import Response
@@ -14,12 +15,11 @@ from apps.construction.serializers import (
     DepartmentAnalyticsSerializer,
     CashboxWithFlowsSerializer
 )
-from apps.construction.permissions import IsOwnerOrAdminOrDepartmentEmployee
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────
 # ВСПОМОГАТЕЛЬНАЯ ФУНКЦИЯ
-# ─────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────
 def _get_company(user):
     if user.is_superuser:
         return None
@@ -37,41 +37,42 @@ class DepartmentListCreateView(generics.ListCreateAPIView):
         if user.is_superuser:
             return Department.objects.all()
 
-        if hasattr(user, "owned_company") and user.owned_company:
-            return Department.objects.filter(company=user.owned_company)
+        company = _get_company(user)
+        if company:
+            return Department.objects.filter(company=company)
 
         return Department.objects.filter(employees=user)
 
     def perform_create(self, serializer):
         user = self.request.user
-
         if user.is_superuser:
             serializer.save()
-        elif hasattr(user, "owned_company") and user.owned_company:
-            serializer.save(company=user.owned_company)
         else:
-            raise PermissionDenied("У вас нет прав создавать отделы.")
+            company = _get_company(user)
+            if not company:
+                raise PermissionDenied("У вас нет прав создавать отделы.")
+            serializer.save(company=company)
 
 
 class DepartmentDetailView(generics.RetrieveUpdateDestroyAPIView):
     queryset = Department.objects.all()
     serializer_class = DepartmentSerializer
-    permission_classes = [IsOwnerOrAdminOrDepartmentEmployee]
+    permission_classes = [IsAuthenticated]
 
 
-# ===== DEPARTMENT ANALYTICS =================================================
+# ===== DEPARTMENT ANALYTICS =====================================
 class DepartmentAnalyticsListView(generics.ListAPIView):
     serializer_class = DepartmentAnalyticsSerializer
     permission_classes = [IsAuthenticated]
 
     def get_queryset(self):
         user = self.request.user
-
         if user.is_superuser:
             return Department.objects.all()
 
-        if hasattr(user, "owned_company") and user.owned_company:
-            return Department.objects.filter(company=user.owned_company)
+        company = _get_company(user)
+        if company:
+            return Department.objects.filter(company=company)
 
         return Department.objects.filter(employees=user)
 
@@ -79,75 +80,113 @@ class DepartmentAnalyticsListView(generics.ListAPIView):
 class DepartmentAnalyticsDetailView(generics.RetrieveAPIView):
     queryset = Department.objects.all()
     serializer_class = DepartmentAnalyticsSerializer
-    permission_classes = [IsOwnerOrAdminOrDepartmentEmployee]
+    permission_classes = [IsAuthenticated]
 
 
-# ===== CASHBOXES ============================================================
-class CashboxListView(generics.ListAPIView):
+# ===== CASHBOXES ================================================
+class CashboxListCreateView(generics.ListCreateAPIView):
     serializer_class = CashboxSerializer
     permission_classes = [IsAuthenticated]
 
     def get_queryset(self):
         user = self.request.user
-
         if user.is_superuser:
             return Cashbox.objects.all()
 
-        if hasattr(user, "owned_company") and user.owned_company:
-            return Cashbox.objects.filter(department__company=user.owned_company)
+        company = _get_company(user)
+        if company:
+            # свободные кассы и кассы отделов компании
+            return Cashbox.objects.filter(
+                Q(department__company=company) | Q(department__isnull=True)
+            )
 
         return Cashbox.objects.filter(department__employees=user)
 
+    def perform_create(self, serializer):
+        user = self.request.user
+        department = serializer.validated_data.get("department")
 
-class CashboxDetailView(generics.RetrieveDestroyAPIView):
+        if department:  # касса для отдела
+            if not (
+                user.is_superuser or
+                (department.company == _get_company(user))
+            ):
+                raise PermissionDenied("Нет прав для создания кассы у этого отдела.")
+            # защита от дублей
+            if hasattr(department, "cashbox"):
+                raise PermissionDenied("У отдела уже есть касса.")
+        else:  # свободная касса
+            if not (user.is_superuser or _get_company(user)):
+                raise PermissionDenied("Нет прав для создания свободной кассы.")
+
+        serializer.save()
+
+
+class CashboxDetailView(generics.RetrieveUpdateDestroyAPIView):
     queryset = Cashbox.objects.all()
-    serializer_class = CashboxSerializer
-    permission_classes = [IsOwnerOrAdminOrDepartmentEmployee]
+    serializer_class = CashboxWithFlowsSerializer
+    permission_classes = [IsAuthenticated]
 
 
-# ===== CASHFLOWS ============================================================
+# ===== CASHFLOWS ================================================
 class CashFlowListCreateView(generics.ListCreateAPIView):
     serializer_class = CashFlowSerializer
     permission_classes = [IsAuthenticated]
 
     def get_queryset(self):
         user = self.request.user
-
         if user.is_superuser:
             return CashFlow.objects.all()
 
-        if hasattr(user, "owned_company") and user.owned_company:
-            return CashFlow.objects.filter(cashbox__department__company=user.owned_company)
+        company = _get_company(user)
+        if company:
+            return CashFlow.objects.filter(
+                Q(cashbox__department__company=company) | Q(cashbox__department__isnull=True)
+            )
 
         return CashFlow.objects.filter(cashbox__department__employees=user)
 
     def perform_create(self, serializer):
         user = self.request.user
+        cashbox = serializer.validated_data.get("cashbox")
 
-        department = user.departments.first()
-        if not department:
-            raise PermissionDenied("Пользователь не прикреплён ни к одному отделу.")
+        if not cashbox:
+            raise PermissionDenied("Необходимо указать кассу.")
 
-        try:
-            cashbox = department.cashbox
-        except Cashbox.DoesNotExist:
-            raise PermissionDenied("У отдела нет кассы.")
+        company = _get_company(user)
 
-        if not (
-            user.is_superuser or
-            (hasattr(user, "owned_company") and department.company == user.owned_company) or
-            (user in department.employees.all())
+        # суперюзер — полный доступ
+        if user.is_superuser:
+            return serializer.save()
+
+        # владелец компании
+        if getattr(user, "owned_company", None) and (
+            (cashbox.department and cashbox.department.company == user.owned_company) or
+            (cashbox.department is None and company == user.owned_company)
         ):
-            raise PermissionDenied("У вас нет прав добавлять приход/расход в эту кассу.")
+            return serializer.save()
 
-        serializer.save(cashbox=cashbox)
+        # администратор компании (если есть флаг is_admin)
+        if getattr(user, "is_admin", False) and company and (
+            (cashbox.department and cashbox.department.company == company) or
+            (cashbox.department is None)
+        ):
+            return serializer.save()
+
+        # сотрудник отдела
+        if cashbox.department and user in cashbox.department.employees.all():
+            return serializer.save()
+
+        raise PermissionDenied("Нет прав добавлять движение в эту кассу.")
 
 
 class CashFlowDetailView(generics.RetrieveDestroyAPIView):
     queryset = CashFlow.objects.all()
     serializer_class = CashFlowSerializer
-    permission_classes = [IsOwnerOrAdminOrDepartmentEmployee]
+    permission_classes = [IsAuthenticated]
 
+
+# ===== ASSIGN / REMOVE EMPLOYEES =================================
 class AssignEmployeeToDepartmentView(APIView):
     permission_classes = [IsAuthenticated]
 
@@ -171,7 +210,6 @@ class AssignEmployeeToDepartmentView(APIView):
         if employee.departments.exists():
             return Response({"detail": "Пользователь уже прикреплён к другому отделу."}, status=400)
 
-        # Добавляем сотрудника в отдел
         department.employees.add(employee)
 
         # Проставляем права (если есть в запросе)
@@ -214,7 +252,7 @@ class RemoveEmployeeFromDepartmentView(APIView):
         return Response({"detail": "Сотрудник успешно удалён из отдела."}, status=200)
 
 
-# ===== COMPANY-WIDE ANALYTICS ===============================================
+# ===== COMPANY-WIDE ANALYTICS ===================================
 class CompanyDepartmentAnalyticsView(generics.ListAPIView):
     serializer_class = DepartmentAnalyticsSerializer
     permission_classes = [IsAuthenticated]
@@ -231,7 +269,7 @@ class CompanyDepartmentAnalyticsView(generics.ListAPIView):
         raise PermissionDenied("Вы не являетесь владельцем компании или администратором.")
 
 
-# ===== CASHBOX DETAIL WITH FLOWS ============================================
+# ===== CASHBOX DETAIL WITH FLOWS ================================
 class CashboxOwnerDetailView(generics.ListAPIView):
     serializer_class = CashboxWithFlowsSerializer
     permission_classes = [IsAuthenticated]
@@ -260,8 +298,7 @@ class CashboxOwnerDetailSingleView(generics.RetrieveAPIView):
         if user.is_superuser:
             return cashbox
 
-        if hasattr(user, 'owned_company') and cashbox.department.company == user.owned_company:
+        if hasattr(user, 'owned_company') and cashbox.department and cashbox.department.company == user.owned_company:
             return cashbox
 
         raise PermissionDenied("Нет доступа к этой кассе.")
-    

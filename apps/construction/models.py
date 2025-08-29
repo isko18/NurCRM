@@ -55,14 +55,18 @@ class Department(models.Model):
 
 class Cashbox(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    name = models.CharField(max_length=255, blank=True, null=True, verbose_name="Название кассы")
     department = models.OneToOneField(
         Department,
         on_delete=models.CASCADE,
-        related_name='cashbox'
+        related_name='cashbox',
+        null=True, blank=True
     )
 
     def __str__(self):
-        return f"Касса {self.department.name}"
+        if self.department:
+            return f"Касса отдела {self.department.name}"
+        return self.name or "Свободная касса"
 
     def get_summary(self):
         """Аналитика по кассе (без баланса)"""
@@ -106,7 +110,8 @@ class CashFlow(models.Model):
     created_at = models.DateTimeField(auto_now_add=True)
 
     def __str__(self):
-        return f"{self.get_type_display()} {self.amount} ₽ ({self.cashbox.department.name})"
+        department_name = self.cashbox.department.name if self.cashbox and self.cashbox.department else "Без отдела"
+        return f"{self.get_type_display()} {self.amount} ₽ ({department_name})"
 
     class Meta:
         verbose_name = 'Движение по кассе'
