@@ -46,7 +46,7 @@ class UserAdmin(BaseUserAdmin):
                 'first_name', 'last_name', 'avatar', 'company', 'role',
                 'can_view_dashboard', 'can_view_cashbox', 'can_view_orders',
                 'can_view_department_analytics', 'can_view_employees',
-                'can_view_clients', 'can_view_brand_category', 'can_view_settings','can_view_sale'
+                'can_view_clients', 'can_view_brand_category', 'can_view_settings','can_view_sale',
                 'is_staff', 'is_superuser', 'is_active'
             ),
         }),
