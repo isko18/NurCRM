@@ -7,7 +7,7 @@ class UserAdmin(BaseUserAdmin):
     list_display = (
         'email', 'first_name', 'last_name', 'company', 'role',
         'can_view_cashbox', 'can_view_orders',
-        'can_view_clients', 'can_view_settings',
+        'can_view_clients', 'can_view_settings','can_view_sale'
         'is_staff', 'is_active'
     )
     list_filter = ('role', 'is_staff', 'is_active')
@@ -26,7 +26,7 @@ class UserAdmin(BaseUserAdmin):
                 'can_view_orders', 'can_view_analytics', 'can_view_department_analytics',
                 'can_view_products', 'can_view_booking',
                 'can_view_employees', 'can_view_clients',
-                'can_view_brand_category', 'can_view_settings',
+                'can_view_brand_category', 'can_view_settings','can_view_sale'
             )
         }),
         ('Права доступа', {
@@ -46,7 +46,7 @@ class UserAdmin(BaseUserAdmin):
                 'first_name', 'last_name', 'avatar', 'company', 'role',
                 'can_view_dashboard', 'can_view_cashbox', 'can_view_orders',
                 'can_view_department_analytics', 'can_view_employees',
-                'can_view_clients', 'can_view_brand_category', 'can_view_settings',
+                'can_view_clients', 'can_view_brand_category', 'can_view_settings','can_view_sale'
                 'is_staff', 'is_superuser', 'is_active'
             ),
         }),
@@ -66,7 +66,7 @@ class UserAdmin(BaseUserAdmin):
                 'can_view_orders', 'can_view_analytics', 'can_view_department_analytics',
                 'can_view_products', 'can_view_booking',
                 'can_view_employees', 'can_view_clients',
-                'can_view_brand_category', 'can_view_settings',
+                'can_view_brand_category', 'can_view_settings','can_view_sale'
             ]
             for field in permission_fields:
                 setattr(obj, field, True)

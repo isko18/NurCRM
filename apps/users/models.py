@@ -96,6 +96,8 @@ class User(AbstractBaseUser, PermissionsMixin):
     can_view_clients = models.BooleanField(default=False, blank=True, null=True, verbose_name='Доступ к клиентам')
     can_view_brand_category = models.BooleanField(default=False, blank=True, null=True, verbose_name='Доступ к брендам и категориям')
     can_view_settings = models.BooleanField(default=False, blank=True, null=True, verbose_name='Доступ к настройкам')
+    can_view_sale = models.BooleanField(default=False, blank=True, null=True, verbose_name='Доступ к продажам')
+    
     
     created_at = models.DateTimeField(auto_now_add=True, verbose_name='Дата создания')
     updated_at = models.DateTimeField(auto_now=True, verbose_name='Дата обновления')
