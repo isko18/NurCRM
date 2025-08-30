@@ -43,7 +43,7 @@ class UserSerializer(serializers.ModelSerializer):
             'can_view_orders', 'can_view_analytics', 'can_view_department_analytics',
             'can_view_products', 'can_view_booking',
             'can_view_employees', 'can_view_clients',
-            'can_view_brand_category', 'can_view_settings',
+            'can_view_brand_category', 'can_view_settings','can_view_sale'
             'created_at', 'updated_at',
         ]
 
@@ -70,7 +70,7 @@ class UserSerializer(serializers.ModelSerializer):
             'can_view_orders', 'can_view_analytics', 'can_view_department_analytics',
             'can_view_products', 'can_view_booking',
             'can_view_employees', 'can_view_clients',
-            'can_view_brand_category', 'can_view_settings',
+            'can_view_brand_category', 'can_view_settings','can_view_sale'
         ]
 
         for field in permission_fields:
@@ -157,7 +157,7 @@ class OwnerRegisterSerializer(serializers.ModelSerializer):
             'can_view_orders', 'can_view_analytics', 'can_view_department_analytics',
             'can_view_products', 'can_view_booking',
             'can_view_employees', 'can_view_clients',
-            'can_view_brand_category', 'can_view_settings',
+            'can_view_brand_category', 'can_view_settings','can_view_sale'
         ]
         for field in permission_fields:
             setattr(user, field, True)
@@ -202,7 +202,7 @@ class EmployeeCreateSerializer(serializers.ModelSerializer):
             'can_view_orders', 'can_view_analytics', 'can_view_department_analytics',
             'can_view_products', 'can_view_booking',
             'can_view_employees', 'can_view_clients',
-            'can_view_brand_category', 'can_view_settings',
+            'can_view_brand_category', 'can_view_settings','can_view_sale'
         ]
         extra_kwargs = {field: {'required': False} for field in fields if field.startswith('can_view_')}
 
@@ -229,7 +229,7 @@ class EmployeeCreateSerializer(serializers.ModelSerializer):
             'can_view_orders', 'can_view_analytics', 'can_view_department_analytics',
             'can_view_products', 'can_view_booking',
             'can_view_employees', 'can_view_clients',
-            'can_view_brand_category', 'can_view_settings',
+            'can_view_brand_category', 'can_view_settings','can_view_sale'
         ]
         access_flags = {field: validated_data.pop(field, None) for field in access_fields}
 
@@ -305,7 +305,7 @@ class UserWithPermissionsSerializer(serializers.ModelSerializer):
             'can_view_orders', 'can_view_analytics', 'can_view_department_analytics',
             'can_view_products', 'can_view_booking',
             'can_view_employees', 'can_view_clients',
-            'can_view_brand_category', 'can_view_settings',
+            'can_view_brand_category', 'can_view_settings','can_view_sale'
         ]
 
 
@@ -369,7 +369,7 @@ class EmployeeUpdateSerializer(serializers.ModelSerializer):
             'can_view_orders', 'can_view_analytics', 'can_view_department_analytics',
             'can_view_products', 'can_view_booking',
             'can_view_employees', 'can_view_clients',
-            'can_view_brand_category', 'can_view_settings',
+            'can_view_brand_category', 'can_view_settings','can_view_sale'
         ]
 
         read_only_fields = ['id']

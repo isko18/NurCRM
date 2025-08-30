@@ -95,7 +95,7 @@ class DepartmentSerializer(serializers.ModelSerializer):
             'can_view_orders', 'can_view_analytics', 'can_view_department_analytics',
             'can_view_products', 'can_view_booking',
             'can_view_employees', 'can_view_clients',
-            'can_view_brand_category', 'can_view_settings',
+            'can_view_brand_category', 'can_view_settings','can_view_sale'
         ]
 
         for entry in employees_data:
