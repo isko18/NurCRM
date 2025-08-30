@@ -86,6 +86,7 @@ class Booking(models.Model):
 
     hotel = models.ForeignKey(Hotel, on_delete=models.CASCADE, null=True, blank=True, related_name='bookings')
     room = models.ForeignKey(ConferenceRoom, on_delete=models.CASCADE, null=True, blank=True, related_name='bookings')
+    bed = models.ForeignKey(Bed, on_delete=models.CASCADE, null=True, blank=True, related_name='bookings')  # ✅ добавлено
     reserved_by = models.ForeignKey(
         settings.AUTH_USER_MODEL,
         on_delete=models.SET_NULL,
@@ -105,9 +106,10 @@ class Booking(models.Model):
         ]
 
     def clean(self):
-        # 1) Выбран либо hotel, либо room (ровно один)
-        if (self.hotel and self.room) or (not self.hotel and not self.room):
-            raise ValidationError("Выберите либо гостиницу, либо комнату, но не обе одновременно.")
+        # 1) Выбран ровно один ресурс: hotel/room/bed
+        chosen = [x for x in [self.hotel, self.room, self.bed] if x]
+        if len(chosen) != 1:
+            raise ValidationError("Выберите либо гостиницу, либо комнату, либо койко-место (ровно одно).")
 
         # 2) Согласованность компаний
         if self.company_id:
@@ -115,6 +117,8 @@ class Booking(models.Model):
                 raise ValidationError({'hotel': 'Отель принадлежит другой компании.'})
             if self.room and self.room.company_id != self.company_id:
                 raise ValidationError({'room': 'Комната принадлежит другой компании.'})
+            if self.bed and self.bed.company_id != self.company_id:
+                raise ValidationError({'bed': 'Койка принадлежит другой компании.'})
             if self.reserved_by and getattr(self.reserved_by, 'company_id', None) \
                and self.reserved_by.company_id != self.company_id:
                 raise ValidationError({'reserved_by': 'Пользователь из другой компании.'})
@@ -126,8 +130,10 @@ class Booking(models.Model):
     def __str__(self):
         hotel_name = self.hotel.name if self.hotel else "No Hotel"
         room_name = self.room.name if self.room else "No Room"
+        bed_name = self.bed.name if self.bed else "No Bed"
         reserved_by_display = getattr(self.reserved_by, 'email', None) or "Unknown"
-        return f"{hotel_name} / {room_name} by {reserved_by_display}"
+        return f"{hotel_name} / {room_name} / {bed_name} by {reserved_by_display}"
+
 
 
 class ManagerAssignment(models.Model):
