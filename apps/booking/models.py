@@ -27,7 +27,29 @@ class Hotel(models.Model):
     def __str__(self):
         return self.name
 
+class Bed(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    company = models.ForeignKey(
+        'users.Company',
+        on_delete=models.CASCADE,
+        related_name='beds',
+        verbose_name='Компания',
+    )
 
+    name = models.CharField(max_length=200)
+    capacity = models.IntegerField()
+    description = models.TextField(blank=True)
+    price = models.DecimalField(max_digits=10, decimal_places=2)
+
+    class Meta:
+        verbose_name = 'Койко место'
+        verbose_name_plural = 'Койки места'
+        unique_together = (('company', 'name'),)
+        indexes = [models.Index(fields=['company', 'name'])]
+
+    def __str__(self):
+        return self.name
+    
 class ConferenceRoom(models.Model):  # ← Room
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     company = models.ForeignKey(
@@ -40,6 +62,8 @@ class ConferenceRoom(models.Model):  # ← Room
     name = models.CharField(max_length=100)
     capacity = models.IntegerField()
     location = models.CharField(max_length=255)
+    price = models.DecimalField(max_digits=10, decimal_places=2)
+    
 
     class Meta:
         verbose_name = 'Переговорная'

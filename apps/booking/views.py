@@ -5,17 +5,17 @@ from django_filters import rest_framework as filters
 from django_filters.rest_framework import DjangoFilterBackend
 
 from .models import (
-    Hotel, ConferenceRoom, Booking, ManagerAssignment,
+    Hotel, Bed, ConferenceRoom, Booking, ManagerAssignment,
     Folder, Document,
 )
 from .serializers import (
-    HotelSerializer, RoomSerializer, BookingSerializer, ManagerAssignmentSerializer,
-    FolderSerializer, DocumentSerializer,
+    HotelSerializer, BedSerializer, RoomSerializer, BookingSerializer,
+    ManagerAssignmentSerializer, FolderSerializer, DocumentSerializer,
 )
 from .permissions import IsAdminOrReadOnly, IsManagerOrAdmin
 
 
-# ---- Кастомный фильтр для Document (не трогаем FileField напрямую) ----
+# ---- Кастомные фильтры ----
 class DocumentFilter(filters.FilterSet):
     name = filters.CharFilter(lookup_expr='icontains')
     folder = filters.UUIDFilter(field_name='folder__id')          # фильтр по UUID папки
@@ -28,6 +28,19 @@ class DocumentFilter(filters.FilterSet):
         fields = ['name', 'folder', 'file_name', 'created_at', 'updated_at']
 
 
+class BookingFilter(filters.FilterSet):
+    start_time = filters.DateTimeFromToRangeFilter()
+    end_time = filters.DateTimeFromToRangeFilter()
+    hotel_name = filters.CharFilter(field_name='hotel__name', lookup_expr='icontains')
+    room_name = filters.CharFilter(field_name='room__name', lookup_expr='icontains')
+    bed_name = filters.CharFilter(field_name='bed__name', lookup_expr='icontains')
+
+    class Meta:
+        model = Booking
+        fields = ['hotel', 'room', 'bed', 'reserved_by', 'start_time', 'end_time']
+
+
+# ---- Миксин для компании ----
 class CompanyQuerysetMixin:
     """
     Скоуп по компании текущего пользователя + защита company на create/update.
@@ -59,7 +72,7 @@ class CompanyQuerysetMixin:
 class HotelListCreateView(CompanyQuerysetMixin, generics.ListCreateAPIView):
     queryset = Hotel.objects.all()
     serializer_class = HotelSerializer
-    permission_classes = [permissions.IsAuthenticated]
+    permission_classes = [IsAdminOrReadOnly]
     filter_backends = [DjangoFilterBackend]
     filterset_fields = [f.name for f in Hotel._meta.get_fields()
                         if not f.is_relation or f.many_to_one]
@@ -68,7 +81,23 @@ class HotelListCreateView(CompanyQuerysetMixin, generics.ListCreateAPIView):
 class HotelRetrieveUpdateDestroyView(CompanyQuerysetMixin, generics.RetrieveUpdateDestroyAPIView):
     queryset = Hotel.objects.all()
     serializer_class = HotelSerializer
-    permission_classes = [permissions.IsAuthenticated]
+    permission_classes = [IsAdminOrReadOnly]
+
+
+# ========= Bed =========
+class BedListCreateView(CompanyQuerysetMixin, generics.ListCreateAPIView):
+    queryset = Bed.objects.all()
+    serializer_class = BedSerializer
+    permission_classes = [IsAdminOrReadOnly]
+    filter_backends = [DjangoFilterBackend]
+    filterset_fields = [f.name for f in Bed._meta.get_fields()
+                        if not f.is_relation or f.many_to_one]
+
+
+class BedRetrieveUpdateDestroyView(CompanyQuerysetMixin, generics.RetrieveUpdateDestroyAPIView):
+    queryset = Bed.objects.all()
+    serializer_class = BedSerializer
+    permission_classes = [IsAdminOrReadOnly]
 
 
 # ========= ConferenceRoom (Room) =========
@@ -89,16 +118,15 @@ class RoomRetrieveUpdateDestroyView(CompanyQuerysetMixin, generics.RetrieveUpdat
 
 # ========= Booking =========
 class BookingListCreateView(CompanyQuerysetMixin, generics.ListCreateAPIView):
-    queryset = Booking.objects.select_related('hotel', 'room', 'reserved_by').all()
+    queryset = Booking.objects.select_related('hotel', 'room', 'bed', 'reserved_by').all()
     serializer_class = BookingSerializer
     permission_classes = [permissions.IsAuthenticated]
     filter_backends = [DjangoFilterBackend]
-    filterset_fields = [f.name for f in Booking._meta.get_fields()
-                        if not f.is_relation or f.many_to_one]
+    filterset_class = BookingFilter
 
 
 class BookingRetrieveUpdateDestroyView(CompanyQuerysetMixin, generics.RetrieveUpdateDestroyAPIView):
-    queryset = Booking.objects.select_related('hotel', 'room', 'reserved_by').all()
+    queryset = Booking.objects.select_related('hotel', 'room', 'bed', 'reserved_by').all()
     serializer_class = BookingSerializer
     permission_classes = [permissions.IsAuthenticated]
 
