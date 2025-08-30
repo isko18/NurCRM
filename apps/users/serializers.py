@@ -294,7 +294,11 @@ class EmployeeCreateSerializer(serializers.ModelSerializer):
 class UserListSerializer(serializers.ModelSerializer):
     class Meta:
         model = User
-        fields = ['id', 'email', 'first_name', 'last_name', 'role', 'avatar']
+        fields = ['id', 'email', 'first_name', 'last_name', 'role', 'avatar', 'can_view_dashboard', 'can_view_cashbox', 'can_view_departments',
+            'can_view_orders', 'can_view_analytics', 'can_view_department_analytics',
+            'can_view_products', 'can_view_booking',
+            'can_view_employees', 'can_view_clients',
+            'can_view_brand_category', 'can_view_settings','can_view_sale']
 
 class UserWithPermissionsSerializer(serializers.ModelSerializer):
     class Meta:
