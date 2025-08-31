@@ -448,3 +448,9 @@ class CompanyUpdateSerializer(serializers.ModelSerializer):
         if len(value) < 2:
             raise serializers.ValidationError("Название компании слишком короткое.")
         return value
+
+class CustomRoleSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = CustomRole
+        fields = ["id", "name", "code", "company"]
+        read_only_fields = ["id", "company"]
