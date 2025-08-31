@@ -1,15 +1,14 @@
-# views.py
 from rest_framework import generics, permissions
 from rest_framework.parsers import MultiPartParser, FormParser
 from django_filters import rest_framework as filters
 from django_filters.rest_framework import DjangoFilterBackend
 
 from .models import (
-    Lead, Course, Teacher, Group, Student, Lesson,
+    Lead, Course, Group, Student, Lesson,
     Folder, Document,
 )
 from .serializers import (
-    LeadSerializer, CourseSerializer, TeacherSerializer, GroupSerializer,
+    LeadSerializer, CourseSerializer, GroupSerializer,
     StudentSerializer, LessonSerializer, FolderSerializer, DocumentSerializer,
 )
 
@@ -17,7 +16,7 @@ from .serializers import (
 # ----- Кастомный фильтр для Document (не автофильтруем FileField) -----
 class DocumentFilter(filters.FilterSet):
     name = filters.CharFilter(lookup_expr='icontains')
-    folder = filters.UUIDFilter(field_name='folder__id')            # фильтр по UUID папки
+    folder = filters.UUIDFilter(field_name='folder__id')  # фильтр по UUID папки
     file_name = filters.CharFilter(field_name='file', lookup_expr='icontains')
     created_at = filters.DateTimeFromToRangeFilter()
     updated_at = filters.DateTimeFromToRangeFilter()
@@ -56,19 +55,17 @@ class CompanyQuerysetMixin:
 
 # ===== Leads =====
 class LeadListCreateView(CompanyQuerysetMixin, generics.ListCreateAPIView):
-    queryset = Lead.objects.all()  # убрали select_related('student')
+    queryset = Lead.objects.all()
     serializer_class = LeadSerializer
     permission_classes = [permissions.IsAuthenticated]
     filter_backends = [DjangoFilterBackend]
-    # без student/*:
     filterset_fields = ['id', 'company', 'name', 'phone', 'source', 'note', 'created_at']
 
 
 class LeadRetrieveUpdateDestroyView(CompanyQuerysetMixin, generics.RetrieveUpdateDestroyAPIView):
-    queryset = Lead.objects.all()  # убрали select_related('student')
+    queryset = Lead.objects.all()
     serializer_class = LeadSerializer
     permission_classes = [permissions.IsAuthenticated]
-
 
 
 # ===== Courses =====
@@ -86,24 +83,9 @@ class CourseRetrieveUpdateDestroyView(CompanyQuerysetMixin, generics.RetrieveUpd
     permission_classes = [permissions.IsAuthenticated]
 
 
-# ===== Teachers =====
-class TeacherListCreateView(CompanyQuerysetMixin, generics.ListCreateAPIView):
-    queryset = Teacher.objects.all()
-    serializer_class = TeacherSerializer
-    permission_classes = [permissions.IsAuthenticated]
-    filter_backends = [DjangoFilterBackend]
-    filterset_fields = [f.name for f in Teacher._meta.get_fields() if not f.is_relation or f.many_to_one]
-
-
-class TeacherRetrieveUpdateDestroyView(CompanyQuerysetMixin, generics.RetrieveUpdateDestroyAPIView):
-    queryset = Teacher.objects.all()
-    serializer_class = TeacherSerializer
-    permission_classes = [permissions.IsAuthenticated]
-
-
 # ===== Groups =====
 class GroupListCreateView(CompanyQuerysetMixin, generics.ListCreateAPIView):
-    queryset = Group.objects.select_related('course', 'teacher').all()
+    queryset = Group.objects.select_related('course').all()
     serializer_class = GroupSerializer
     permission_classes = [permissions.IsAuthenticated]
     filter_backends = [DjangoFilterBackend]
@@ -111,7 +93,7 @@ class GroupListCreateView(CompanyQuerysetMixin, generics.ListCreateAPIView):
 
 
 class GroupRetrieveUpdateDestroyView(CompanyQuerysetMixin, generics.RetrieveUpdateDestroyAPIView):
-    queryset = Group.objects.select_related('course', 'teacher').all()
+    queryset = Group.objects.select_related('course').all()
     serializer_class = GroupSerializer
     permission_classes = [permissions.IsAuthenticated]
 
@@ -169,7 +151,7 @@ class DocumentListCreateView(CompanyQuerysetMixin, generics.ListCreateAPIView):
     permission_classes = [permissions.IsAuthenticated]
     parser_classes = [MultiPartParser, FormParser]
     filter_backends = [DjangoFilterBackend]
-    filterset_class = DocumentFilter   # избегаем автогенерации фильтра по FileField
+    filterset_class = DocumentFilter
 
 
 class DocumentRetrieveUpdateDestroyView(CompanyQuerysetMixin, generics.RetrieveUpdateDestroyAPIView):

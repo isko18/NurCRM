@@ -7,9 +7,8 @@ from django.db.models.deletion import ProtectedError
 from django_filters import rest_framework as filters
 from django_filters.rest_framework import DjangoFilterBackend
 
-from .models import BarberProfile, Service, Client, Appointment, Document, Folder
+from .models import Service, Client, Appointment, Document, Folder
 from .serializers import (
-    BarberProfileSerializer,
     ServiceSerializer,
     ClientSerializer,
     AppointmentSerializer,
@@ -20,15 +19,15 @@ from .serializers import (
 
 # ---- Кастомный фильтр для Document (не трогаем FileField напрямую) ----
 class DocumentFilter(filters.FilterSet):
-    name = filters.CharFilter(lookup_expr='icontains')
-    folder = filters.UUIDFilter(field_name='folder__id')  # фильтр по UUID папки
-    file_name = filters.CharFilter(field_name='file', lookup_expr='icontains')
+    name = filters.CharFilter(lookup_expr="icontains")
+    folder = filters.UUIDFilter(field_name="folder__id")  # фильтр по UUID папки
+    file_name = filters.CharFilter(field_name="file", lookup_expr="icontains")
     created_at = filters.DateTimeFromToRangeFilter()
     updated_at = filters.DateTimeFromToRangeFilter()
 
     class Meta:
         model = Document
-        fields = ['name', 'folder', 'file_name', 'created_at', 'updated_at']
+        fields = ["name", "folder", "file_name", "created_at", "updated_at"]
 
 
 class CompanyQuerysetMixin:
@@ -36,6 +35,7 @@ class CompanyQuerysetMixin:
     Скоуп по компании текущего пользователя + защита company на create/update.
     Безопасен для drf_yasg (swagger_fake_view) и AnonymousUser.
     """
+
     def _user_company(self):
         user = getattr(self.request, "user", None)
         if not user or not getattr(user, "is_authenticated", False):
@@ -58,31 +58,20 @@ class CompanyQuerysetMixin:
         serializer.save(company=company) if company else serializer.save()
 
 
-# ==== Barber ====
-class BarberListCreateView(CompanyQuerysetMixin, generics.ListCreateAPIView):
-    queryset = BarberProfile.objects.all()
-    serializer_class = BarberProfileSerializer
-    permission_classes = [permissions.IsAuthenticated]
-    filter_backends = [DjangoFilterBackend]
-    filterset_fields = [f.name for f in BarberProfile._meta.get_fields() if not f.is_relation or f.many_to_one]
-
-
-class BarberRetrieveUpdateDestroyView(CompanyQuerysetMixin, generics.RetrieveUpdateDestroyAPIView):
-    queryset = BarberProfile.objects.all()
-    serializer_class = BarberProfileSerializer
-    permission_classes = [permissions.IsAuthenticated]
-
-
 # ==== Service ====
 class ServiceListCreateView(CompanyQuerysetMixin, generics.ListCreateAPIView):
     queryset = Service.objects.all()
     serializer_class = ServiceSerializer
     permission_classes = [permissions.IsAuthenticated]
     filter_backends = [DjangoFilterBackend]
-    filterset_fields = [f.name for f in Service._meta.get_fields() if not f.is_relation or f.many_to_one]
+    filterset_fields = [
+        f.name for f in Service._meta.get_fields() if not f.is_relation or f.many_to_one
+    ]
 
 
-class ServiceRetrieveUpdateDestroyView(CompanyQuerysetMixin, generics.RetrieveUpdateDestroyAPIView):
+class ServiceRetrieveUpdateDestroyView(
+    CompanyQuerysetMixin, generics.RetrieveUpdateDestroyAPIView
+):
     queryset = Service.objects.all()
     serializer_class = ServiceSerializer
     permission_classes = [permissions.IsAuthenticated]
@@ -94,10 +83,14 @@ class ClientListCreateView(CompanyQuerysetMixin, generics.ListCreateAPIView):
     serializer_class = ClientSerializer
     permission_classes = [permissions.IsAuthenticated]
     filter_backends = [DjangoFilterBackend]
-    filterset_fields = [f.name for f in Client._meta.get_fields() if not f.is_relation or f.many_to_one]
+    filterset_fields = [
+        f.name for f in Client._meta.get_fields() if not f.is_relation or f.many_to_one
+    ]
 
 
-class ClientRetrieveUpdateDestroyView(CompanyQuerysetMixin, generics.RetrieveUpdateDestroyAPIView):
+class ClientRetrieveUpdateDestroyView(
+    CompanyQuerysetMixin, generics.RetrieveUpdateDestroyAPIView
+):
     queryset = Client.objects.all()
     serializer_class = ClientSerializer
     permission_classes = [permissions.IsAuthenticated]
@@ -108,15 +101,27 @@ class ClientRetrieveUpdateDestroyView(CompanyQuerysetMixin, generics.RetrieveUpd
         try:
             return super().destroy(request, *args, **kwargs)
         except ProtectedError:
-            qs = Appointment.objects.filter(client=instance).select_related('service', 'barber').order_by('-start_at')
-            examples = [
-                {
-                    "start_at": a.start_at,
-                    "service": getattr(a.service, "name", None),
-                    "barber": getattr(a.barber, "full_name", None),
-                    "status": a.status,
-                } for a in qs[:3]
-            ]
+            qs = (
+                Appointment.objects.filter(client=instance)
+                .select_related("service", "barber")
+                .order_by("-start_at")
+            )
+            examples = []
+            for a in qs[:3]:
+                barber_name = None
+                if a.barber:
+                    if a.barber.first_name or a.barber.last_name:
+                        barber_name = f"{a.barber.first_name} {a.barber.last_name}".strip()
+                    else:
+                        barber_name = a.barber.email
+                examples.append(
+                    {
+                        "start_at": a.start_at,
+                        "service": getattr(a.service, "name", None),
+                        "barber": barber_name,
+                        "status": a.status,
+                    }
+                )
             return Response(
                 {
                     "detail": "Нельзя удалить клиента: есть связанные записи (appointments).",
@@ -124,7 +129,7 @@ class ClientRetrieveUpdateDestroyView(CompanyQuerysetMixin, generics.RetrieveUpd
                     "examples": examples,
                     "solutions": [
                         "Измените статус клиента на 'inactive' или 'blacklist' вместо удаления.",
-                        "Либо удалите/переназначьте связанные записи."
+                        "Либо удалите/переназначьте связанные записи.",
                     ],
                 },
                 status=status.HTTP_409_CONFLICT,
@@ -133,38 +138,46 @@ class ClientRetrieveUpdateDestroyView(CompanyQuerysetMixin, generics.RetrieveUpd
 
 # ==== Appointment ====
 class AppointmentListCreateView(CompanyQuerysetMixin, generics.ListCreateAPIView):
-    queryset = Appointment.objects.select_related('client', 'barber', 'service').all()
+    queryset = Appointment.objects.select_related("client", "barber", "service").all()
     serializer_class = AppointmentSerializer
     permission_classes = [permissions.IsAuthenticated]
     filter_backends = [DjangoFilterBackend]
-    filterset_fields = [f.name for f in Appointment._meta.get_fields() if not f.is_relation or f.many_to_one]
+    filterset_fields = [
+        f.name for f in Appointment._meta.get_fields() if not f.is_relation or f.many_to_one
+    ]
 
 
-class AppointmentRetrieveUpdateDestroyView(CompanyQuerysetMixin, generics.RetrieveUpdateDestroyAPIView):
-    queryset = Appointment.objects.select_related('client', 'barber', 'service').all()
+class AppointmentRetrieveUpdateDestroyView(
+    CompanyQuerysetMixin, generics.RetrieveUpdateDestroyAPIView
+):
+    queryset = Appointment.objects.select_related("client", "barber", "service").all()
     serializer_class = AppointmentSerializer
     permission_classes = [permissions.IsAuthenticated]
 
 
 # ==== Folder ====
 class FolderListCreateView(CompanyQuerysetMixin, generics.ListCreateAPIView):
-    queryset = Folder.objects.select_related('parent').all()
+    queryset = Folder.objects.select_related("parent").all()
     serializer_class = FolderSerializer
     permission_classes = [permissions.IsAuthenticated]
     filter_backends = [DjangoFilterBackend]
-    filterset_fields = [f.name for f in Folder._meta.get_fields() if not f.is_relation or f.many_to_one]
-    ordering = ['name']
+    filterset_fields = [
+        f.name for f in Folder._meta.get_fields() if not f.is_relation or f.many_to_one
+    ]
+    ordering = ["name"]
 
 
-class FolderRetrieveUpdateDestroyView(CompanyQuerysetMixin, generics.RetrieveUpdateDestroyAPIView):
-    queryset = Folder.objects.select_related('parent').all()
+class FolderRetrieveUpdateDestroyView(
+    CompanyQuerysetMixin, generics.RetrieveUpdateDestroyAPIView
+):
+    queryset = Folder.objects.select_related("parent").all()
     serializer_class = FolderSerializer
     permission_classes = [permissions.IsAuthenticated]
 
 
 # ==== Document ====
 class DocumentListCreateView(CompanyQuerysetMixin, generics.ListCreateAPIView):
-    queryset = Document.objects.select_related('folder').all()
+    queryset = Document.objects.select_related("folder").all()
     serializer_class = DocumentSerializer
     permission_classes = [permissions.IsAuthenticated]
     parser_classes = [MultiPartParser, FormParser]
@@ -172,8 +185,10 @@ class DocumentListCreateView(CompanyQuerysetMixin, generics.ListCreateAPIView):
     filterset_class = DocumentFilter  # без автогенерации по FileField
 
 
-class DocumentRetrieveUpdateDestroyView(CompanyQuerysetMixin, generics.RetrieveUpdateDestroyAPIView):
-    queryset = Document.objects.select_related('folder').all()
+class DocumentRetrieveUpdateDestroyView(
+    CompanyQuerysetMixin, generics.RetrieveUpdateDestroyAPIView
+):
+    queryset = Document.objects.select_related("folder").all()
     serializer_class = DocumentSerializer
     permission_classes = [permissions.IsAuthenticated]
     parser_classes = [MultiPartParser, FormParser]

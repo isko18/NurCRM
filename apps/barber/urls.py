@@ -3,11 +3,6 @@ from django.urls import path
 from . import views
 
 urlpatterns = [
-    # Мастера
-    path('barbers/', views.BarberListCreateView.as_view(), name='barber-list'),
-    path('barbers/<uuid:pk>/', views.BarberRetrieveUpdateDestroyView.as_view(), name='barber-detail'),
-
-    # Услуги
     path('services/', views.ServiceListCreateView.as_view(), name='service-list'),
     path('services/<uuid:pk>/', views.ServiceRetrieveUpdateDestroyView.as_view(), name='service-detail'),
 

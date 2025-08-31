@@ -135,6 +135,7 @@ class OrderListCreateAPIView(CompanyRestrictedMixin, generics.ListCreateAPIView)
 class OrderRetrieveUpdateDestroyAPIView(CompanyRestrictedMixin, generics.RetrieveUpdateDestroyAPIView):
     serializer_class = OrderSerializer
     queryset = Order.objects.all().prefetch_related("items__product")
+    
 class ProductCreateByBarcodeAPIView(generics.CreateAPIView):
     """
     Создание товара только по штрих-коду (если найден в глобальной базе).
