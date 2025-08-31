@@ -18,7 +18,7 @@ from .views import (
     # 👇 новые для ролей
     RoleListAPIView,
     CustomRoleCreateAPIView,
-    CustomRoleDestroyAPIView,
+    CustomRoleDetailAPIView,
 )
 
 urlpatterns = [
@@ -50,5 +50,5 @@ urlpatterns = [
     # 🎭 Роли
     path('roles/', RoleListAPIView.as_view(), name='role-list'),  # системные + кастомные
     path('roles/custom/', CustomRoleCreateAPIView.as_view(), name='custom-role-create'),
-    path('roles/custom/<uuid:pk>/', CustomRoleDestroyAPIView.as_view(), name='custom-role-delete'),
+    path('roles/custom/<uuid:pk>/', CustomRoleDetailAPIView.as_view(), name='custom-role-detail'),
 ]
