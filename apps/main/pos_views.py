@@ -37,6 +37,82 @@ FONTS_DIR = os.path.join(BASE_DIR, "fonts")
 pdfmetrics.registerFont(TTFont("DejaVu", os.path.join(FONTS_DIR, "DejaVuSans.ttf")))
 pdfmetrics.registerFont(TTFont("DejaVu-Bold", os.path.join(FONTS_DIR, "DejaVuSans-Bold.ttf")))
 
+
+# pos/views.py
+class SaleInvoiceDownloadAPIView(APIView):
+    """
+    GET /api/main/pos/sales/<uuid:pk>/invoice/
+    Скачивание PDF-накладной по продаже (А4).
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request, pk, *args, **kwargs):
+        sale = get_object_or_404(
+            Sale.objects.prefetch_related("items__product", "user"),
+            id=pk, company=request.user.company
+        )
+
+        buffer = io.BytesIO()
+        p = canvas.Canvas(buffer, pagesize=(210 * mm, 297 * mm))  # A4
+
+        # === Заголовок ===
+        p.setFont("DejaVu-Bold", 14)
+        p.drawCentredString(105 * mm, 280 * mm, "НАКЛАДНАЯ № {}".format(sale.id))
+        p.setFont("DejaVu", 10)
+        p.drawCentredString(105 * mm, 273 * mm, f"от {sale.created_at.strftime('%d.%m.%Y %H:%M')}")
+
+        # Продавец / покупатель
+        y = 260 * mm
+        p.setFont("DejaVu", 10)
+        p.drawString(20 * mm, y, f"Продавец: {sale.company.name}")
+        y -= 6 * mm
+        client = getattr(sale, "client", None)
+        if client:
+            p.drawString(20 * mm, y, f"Покупатель: {client.full_name}")
+            y -= 6 * mm
+
+        # === Таблица товаров ===
+        y -= 10
+        p.setFont("DejaVu-Bold", 10)
+        p.drawString(20 * mm, y, "Товар")
+        p.drawRightString(140 * mm, y, "Кол-во")
+        p.drawRightString(160 * mm, y, "Цена")
+        p.drawRightString(190 * mm, y, "Сумма")
+
+        y -= 5
+        p.line(20 * mm, y, 190 * mm, y)
+        y -= 10
+
+        p.setFont("DejaVu", 10)
+        for it in sale.items.all():
+            p.drawString(20 * mm, y, it.name_snapshot[:40])
+            p.drawRightString(140 * mm, y, str(it.quantity))
+            p.drawRightString(160 * mm, y, f"{it.unit_price:.2f}")
+            p.drawRightString(190 * mm, y, f"{(it.quantity * it.unit_price):.2f}")
+            y -= 7 * mm
+            if y < 50 * mm:
+                p.showPage()
+                y = 270 * mm
+                p.setFont("DejaVu", 10)
+
+        # === ИТОГ ===
+        y -= 10
+        p.setFont("DejaVu-Bold", 11)
+        p.drawRightString(190 * mm, y, f"ИТОГО: {sale.total:.2f}")
+
+        # === Подписи ===
+        y -= 20
+        p.setFont("DejaVu", 10)
+        p.drawString(20 * mm, y, "Продавец: _____________")
+        p.drawString(120 * mm, y, "Покупатель: _____________")
+
+        p.showPage()
+        p.save()
+
+        buffer.seek(0)
+        return FileResponse(buffer, as_attachment=True, filename=f"invoice_{sale.id}.pdf")
+
+
 class SaleReceiptDownloadAPIView(APIView):
     """
     GET /api/main/pos/sales/<uuid:pk>/receipt/
