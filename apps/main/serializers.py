@@ -251,7 +251,8 @@ class ProductSerializer(serializers.ModelSerializer):
             "id", "name", "barcode",
             "brand", "brand_name",
             "category", "category_name",
-            "quantity", "price", "company",
+            "quantity", "price", "purchase_price",  # ✅ добавлено
+            "company",
             "client", "client_name",
             "created_at", "updated_at"
         ]
@@ -261,6 +262,7 @@ class ProductSerializer(serializers.ModelSerializer):
         ]
         extra_kwargs = {
             "price": {"required": False, "default": 0},
+            "purchase_price": {"required": False, "default": 0},  # ✅ дефолт
             "quantity": {"required": False, "default": 0},
         }
 
@@ -310,8 +312,9 @@ class ProductSerializer(serializers.ModelSerializer):
             brand=brand,
             category=category,
             price=validated_data.get("price", 0),
+            purchase_price=validated_data.get("purchase_price", 0),  # ✅ сохраняем
             quantity=validated_data.get("quantity", 0),
-            client=client   # ✅ теперь точно сохраняется
+            client=client
         )
         return product
 

@@ -298,8 +298,22 @@ class Product(models.Model):
     barcode = models.CharField(max_length=64, null=True, blank=True)
     brand = models.ForeignKey(ProductBrand, on_delete=models.SET_NULL, null=True, blank=True)
     category = models.ForeignKey(ProductCategory, on_delete=models.SET_NULL, null=True, blank=True)
+
     quantity = models.PositiveIntegerField(default=0)
-    price = models.DecimalField(max_digits=10, decimal_places=2, default=0)
+
+    # 💰 цены
+    purchase_price = models.DecimalField(   # ✅ новая колонка
+        max_digits=10, 
+        decimal_places=2, 
+        default=0,
+        verbose_name="Закупочная цена"
+    )
+    price = models.DecimalField(            
+        max_digits=10, 
+        decimal_places=2, 
+        default=0,
+        verbose_name="Розничная цена"
+    )
 
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
@@ -311,7 +325,7 @@ class Product(models.Model):
 
     def __str__(self):
         return self.name
-    
+
     
 class Cart(models.Model):
     class Status(models.TextChoices):
