@@ -57,6 +57,7 @@ class AddItemSerializer(serializers.Serializer):
 
 class CheckoutSerializer(serializers.Serializer):
     print_receipt = serializers.BooleanField(default=False)
+    client_id = serializers.UUIDField(required=False, allow_null=True)
 
 
 class MobileScannerTokenSerializer(serializers.ModelSerializer):
@@ -70,12 +71,22 @@ class MobileScannerTokenSerializer(serializers.ModelSerializer):
 
 class SaleListSerializer(serializers.ModelSerializer):
     user_display = serializers.SerializerMethodField()
+    client_name = serializers.CharField(source="client.full_name", read_only=True)
 
     class Meta:
         model = Sale
         fields = (
-            "id", "status", "subtotal", "discount_total", "tax_total",
-            "total", "created_at", "paid_at", "user_display"
+            "id",
+            "status",
+            "subtotal",
+            "discount_total",
+            "tax_total",
+            "total",
+            "created_at",
+            "paid_at",
+            "user_display",
+            "client",        # id клиента
+            "client_name",   # имя клиента
         )
 
     def get_user_display(self, obj):
@@ -122,11 +133,9 @@ class SaleItemReadSerializer(serializers.ModelSerializer):
 
 
 class SaleDetailSerializer(serializers.ModelSerializer):
-    """
-    Детальная продажа с вложенными товарами (read-only).
-    """
     user_display = serializers.SerializerMethodField()
     items = SaleItemReadSerializer(many=True, read_only=True)
+    client_name = serializers.CharField(source="client.full_name", read_only=True)
 
     class Meta:
         model = Sale
@@ -140,6 +149,8 @@ class SaleDetailSerializer(serializers.ModelSerializer):
             "created_at",
             "paid_at",
             "user_display",
+            "client",        # id клиента
+            "client_name",   # имя клиента
             "items",
         )
         read_only_fields = fields

@@ -414,7 +414,14 @@ class Sale(models.Model):
         null=True, blank=True, related_name="sales",
         verbose_name="Пользователь"
     )
-
+    client = models.ForeignKey(  
+        "Client",
+        on_delete=models.SET_NULL, 
+        null=True,
+        blank=True,
+        related_name="sale",
+        verbose_name="Клиент"
+    )
     status = models.CharField(
         max_length=16, choices=Status.choices, default=Status.NEW,
         verbose_name="Статус"
