@@ -2,12 +2,14 @@ from django.contrib import admin
 from django.contrib.auth.admin import UserAdmin as BaseUserAdmin
 from .models import User, Company, Industry, SubscriptionPlan, Feature, Sector
 
+
+# 👤 Пользователь
 @admin.register(User)
 class UserAdmin(BaseUserAdmin):
     list_display = (
         'email', 'first_name', 'last_name', 'company', 'role',
         'can_view_cashbox', 'can_view_orders',
-        'can_view_clients', 'can_view_settings','can_view_sale',
+        'can_view_clients', 'can_view_settings', 'can_view_sale',
         'is_staff', 'is_active'
     )
     list_filter = ('role', 'is_staff', 'is_active')
@@ -26,7 +28,7 @@ class UserAdmin(BaseUserAdmin):
                 'can_view_orders', 'can_view_analytics', 'can_view_department_analytics',
                 'can_view_products', 'can_view_booking',
                 'can_view_employees', 'can_view_clients',
-                'can_view_brand_category', 'can_view_settings','can_view_sale',
+                'can_view_brand_category', 'can_view_settings', 'can_view_sale',
             )
         }),
         ('Права доступа', {
@@ -44,9 +46,11 @@ class UserAdmin(BaseUserAdmin):
             'fields': (
                 'email', 'password1', 'password2',
                 'first_name', 'last_name', 'avatar', 'company', 'role',
-                'can_view_dashboard', 'can_view_cashbox', 'can_view_orders',
-                'can_view_department_analytics', 'can_view_employees',
-                'can_view_clients', 'can_view_brand_category', 'can_view_settings','can_view_sale',
+                'can_view_dashboard', 'can_view_cashbox', 'can_view_departments',
+                'can_view_orders', 'can_view_analytics', 'can_view_department_analytics',
+                'can_view_products', 'can_view_booking',
+                'can_view_employees', 'can_view_clients',
+                'can_view_brand_category', 'can_view_settings', 'can_view_sale',
                 'is_staff', 'is_superuser', 'is_active'
             ),
         }),
@@ -59,14 +63,13 @@ class UserAdmin(BaseUserAdmin):
         return form
 
     def save_model(self, request, obj, form, change):
-        # Автоматически включаем все флаги, если роль — owner или admin
         if obj.role in ['owner', 'admin']:
             permission_fields = [
                 'can_view_dashboard', 'can_view_cashbox', 'can_view_departments',
                 'can_view_orders', 'can_view_analytics', 'can_view_department_analytics',
                 'can_view_products', 'can_view_booking',
                 'can_view_employees', 'can_view_clients',
-                'can_view_brand_category', 'can_view_settings','can_view_sale'
+                'can_view_brand_category', 'can_view_settings', 'can_view_sale'
             ]
             for field in permission_fields:
                 setattr(obj, field, True)
@@ -76,10 +79,16 @@ class UserAdmin(BaseUserAdmin):
 # 🏢 Компания
 @admin.register(Company)
 class CompanyAdmin(admin.ModelAdmin):
-    list_display = ('name', 'get_industry_name', 'owner', 'employee_count', 'created_at', 'start_date', 'end_date')
+    list_display = ('name', 'get_industry_name', 'sector', 'owner', 'employee_count', 'created_at', 'start_date', 'end_date')
     search_fields = ('name', 'industry__name', 'sector__name', 'owner__email')
     ordering = ('name',)
     readonly_fields = ('employees_list',)
+
+    fieldsets = (
+        (None, {'fields': ('name', 'industry', 'sector', 'subscription_plan', 'owner')}),
+        ('Сотрудники', {'fields': ('employees_list',)}),
+        ('Даты', {'fields': ('created_at', 'start_date', 'end_date')}),
+    )
 
     def get_industry_name(self, obj):
         return obj.industry.name if obj.industry else '-'
@@ -119,7 +128,7 @@ class IndustryAdmin(admin.ModelAdmin):
     exclude = ('sectors',)
 
 
-# ⭐ Фича (функциональность тарифа)
+# ⭐ Фича
 @admin.register(Feature)
 class FeatureAdmin(admin.ModelAdmin):
     list_display = ('name', 'description')
@@ -127,18 +136,13 @@ class FeatureAdmin(admin.ModelAdmin):
 
 
 # 📦 Тариф
-class FeatureInline(admin.TabularInline):
-    model = SubscriptionPlan.features.through
-    extra = 1
-
-
 @admin.register(SubscriptionPlan)
 class SubscriptionPlanAdmin(admin.ModelAdmin):
     list_display = ('name', 'price', 'description')
     search_fields = ('name',)
     fields = ('name', 'price', 'description', 'features')
     filter_horizontal = ('features',)
-    inlines = [FeatureInline]
+    readonly_fields = ('id',)
 
 
 # 📚 Сектор
