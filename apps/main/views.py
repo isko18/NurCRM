@@ -158,7 +158,7 @@ class ProductCreateByBarcodeAPIView(generics.CreateAPIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        # Ищем в глобальной базе (без company!)
+        # Ищем в глобальной базе
         gp = GlobalProduct.objects.select_related("brand", "category").filter(barcode=barcode).first()
         if not gp:
             return Response(
@@ -179,13 +179,22 @@ class ProductCreateByBarcodeAPIView(generics.CreateAPIView):
         except Exception:
             return Response({"quantity": "Неверное количество."}, status=status.HTTP_400_BAD_REQUEST)
 
+        # ✅ создаём или берём локальные справочники
+        brand = None
+        if gp.brand:
+            brand, _ = ProductBrand.objects.get_or_create(company=company, name=gp.brand.name)
+
+        category = None
+        if gp.category:
+            category, _ = ProductCategory.objects.get_or_create(company=company, name=gp.category.name)
+
         # Создаём локальный товар
         product = Product.objects.create(
             company=company,
             name=gp.name,
             barcode=gp.barcode,
-            brand=gp.brand,        # теперь сразу глобальная ссылка
-            category=gp.category,  # теперь сразу глобальная ссылка
+            brand=brand,          # ✅ теперь локальный ProductBrand
+            category=category,    # ✅ теперь локальная ProductCategory
             price=price,
             quantity=quantity,
         )
@@ -231,7 +240,7 @@ class ProductCreateManualAPIView(generics.CreateAPIView):
         except Exception:
             return Response({"quantity": "Неверное количество."}, status=status.HTTP_400_BAD_REQUEST)
 
-        # глобальный бренд / категория (или создаём при необходимости)
+        # ✅ глобальный бренд/категория
         g_brand = None
         brand_name = (data.get("brand_name") or "").strip()
         if brand_name:
@@ -242,13 +251,22 @@ class ProductCreateManualAPIView(generics.CreateAPIView):
         if category_name:
             g_category, _ = GlobalCategory.objects.get_or_create(name=category_name)
 
+        # ✅ локальные справочники
+        brand = None
+        if g_brand:
+            brand, _ = ProductBrand.objects.get_or_create(company=company, name=g_brand.name)
+
+        category = None
+        if g_category:
+            category, _ = ProductCategory.objects.get_or_create(company=company, name=g_category.name)
+
         # Создаём товар компании
         product = Product.objects.create(
             company=company,
             name=name,
             barcode=barcode,
-            brand=g_brand,
-            category=g_category,
+            brand=brand,          # ✅ локальная модель
+            category=category,    # ✅ локальная модель
             price=price,
             quantity=quantity,
         )
@@ -261,7 +279,6 @@ class ProductCreateManualAPIView(generics.CreateAPIView):
             )
 
         return Response(self.get_serializer(product).data, status=status.HTTP_201_CREATED)
-
 
 
 class ProductRetrieveUpdateDestroyAPIView(CompanyRestrictedMixin, generics.RetrieveUpdateDestroyAPIView):
