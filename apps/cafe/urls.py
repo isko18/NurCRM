@@ -6,7 +6,6 @@ from .views import (
     BookingListCreateView, BookingRetrieveUpdateDestroyView,
     WarehouseListCreateView, WarehouseRetrieveUpdateDestroyView,
     PurchaseListCreateView, PurchaseRetrieveUpdateDestroyView,
-    StaffListCreateView, StaffRetrieveUpdateDestroyView,
     CategoryListCreateView, CategoryRetrieveUpdateDestroyView,
     MenuItemListCreateView, MenuItemRetrieveUpdateDestroyView,
     IngredientListCreateView, IngredientRetrieveUpdateDestroyView,
@@ -37,11 +36,6 @@ urlpatterns = [
     path("purchases/", PurchaseListCreateView.as_view(), name="purchase-list"),
     path("purchases/<uuid:pk>/", PurchaseRetrieveUpdateDestroyView.as_view(), name="purchase-detail"),
 
-    # Staff
-    path("staff/", StaffListCreateView.as_view(), name="staff-list"),
-    path("staff/<uuid:pk>/", StaffRetrieveUpdateDestroyView.as_view(), name="staff-detail"),
-
-    # Categories
     path("categories/", CategoryListCreateView.as_view(), name="category-list"),
     path("categories/<uuid:pk>/", CategoryRetrieveUpdateDestroyView.as_view(), name="category-detail"),
 

@@ -1,15 +1,15 @@
-# views.py
+# apps/cafe/views.py
 from rest_framework import generics, permissions, filters
 from django_filters.rest_framework import DjangoFilterBackend
 
 from .models import (
-    Zone, Table, Booking, Warehouse, Purchase, Staff,
+    Zone, Table, Booking, Warehouse, Purchase,
     Category, MenuItem, Ingredient,
     Order, OrderItem,
 )
 from .serializers import (
     ZoneSerializer, TableSerializer, BookingSerializer,
-    WarehouseSerializer, PurchaseSerializer, StaffSerializer,
+    WarehouseSerializer, PurchaseSerializer,
     CategorySerializer, MenuItemSerializer, IngredientInlineSerializer,
     OrderSerializer, OrderItemInlineSerializer,
 )
@@ -29,7 +29,6 @@ class CompanyQuerysetMixin:
         if company is None:
             return qs.none()
         model = qs.model
-        # проверяем, есть ли у модели поле company
         if any(f.name == "company" for f in model._meta.fields):
             return qs.filter(company=company)
         return qs
@@ -110,21 +109,6 @@ class PurchaseRetrieveUpdateDestroyView(CompanyQuerysetMixin, generics.RetrieveU
     serializer_class = PurchaseSerializer
 
 
-# ==================== Staff ====================
-class StaffListCreateView(CompanyQuerysetMixin, generics.ListCreateAPIView):
-    queryset = Staff.objects.all()
-    serializer_class = StaffSerializer
-    filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
-    filterset_fields = ["role", "is_active"]
-    search_fields = ["name"]
-    ordering_fields = ["name", "role", "is_active", "id"]
-
-
-class StaffRetrieveUpdateDestroyView(CompanyQuerysetMixin, generics.RetrieveUpdateDestroyAPIView):
-    queryset = Staff.objects.all()
-    serializer_class = StaffSerializer
-
-
 # ==================== Category ====================
 class CategoryListCreateView(CompanyQuerysetMixin, generics.ListCreateAPIView):
     queryset = Category.objects.all()
@@ -155,7 +139,7 @@ class MenuItemRetrieveUpdateDestroyView(CompanyQuerysetMixin, generics.RetrieveU
     serializer_class = MenuItemSerializer
 
 
-# ==================== Ingredient (отдельный CRUD при необходимости) ====================
+# ==================== Ingredient ====================
 class IngredientListCreateView(CompanyQuerysetMixin, generics.ListCreateAPIView):
     serializer_class = IngredientInlineSerializer
     filter_backends = [DjangoFilterBackend, filters.OrderingFilter]
@@ -181,11 +165,11 @@ class IngredientRetrieveUpdateDestroyView(CompanyQuerysetMixin, generics.Retriev
         return qs.filter(menu_item__company=company)
 
 
-# ==================== Order (с вложенными items) ====================
+# ==================== Order ====================
 class OrderListCreateView(CompanyQuerysetMixin, generics.ListCreateAPIView):
     queryset = (Order.objects
                 .select_related("table", "waiter", "company")
-                .prefetch_related("items__menu_item"))   # <-- items, не cafe_items
+                .prefetch_related("items__menu_item"))
     serializer_class = OrderSerializer
     filter_backends = [DjangoFilterBackend, filters.OrderingFilter]
     filterset_fields = ["table", "waiter", "guests", "created_at"]
@@ -195,11 +179,11 @@ class OrderListCreateView(CompanyQuerysetMixin, generics.ListCreateAPIView):
 class OrderRetrieveUpdateDestroyView(CompanyQuerysetMixin, generics.RetrieveUpdateDestroyAPIView):
     queryset = (Order.objects
                 .select_related("table", "waiter", "company")
-                .prefetch_related("items__menu_item"))   # <-- items
+                .prefetch_related("items__menu_item"))
     serializer_class = OrderSerializer
 
 
-# ==================== OrderItem (отдельный CRUD при необходимости) ====================
+# ==================== OrderItem ====================
 class OrderItemListCreateView(CompanyQuerysetMixin, generics.ListCreateAPIView):
     serializer_class = OrderItemInlineSerializer
     filter_backends = [DjangoFilterBackend, filters.OrderingFilter]

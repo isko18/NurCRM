@@ -1,6 +1,8 @@
 from django.db import models
 from apps.users.models import Company
 import uuid
+from django.conf import settings
+
 # Create your models here.
 class Zone(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
@@ -130,37 +132,6 @@ class Purchase(models.Model):
         verbose_name = 'Закупка'
         verbose_name_plural = 'Закупки'
         
-class Staff(models.Model):
-    class Roles(models.TextChoices):
-        WAITER = "waiter", "Официант"
-        CHEF = "chef", "Шеф"
-        HOSTESS = "hostess", "Хостес"
-        BARTENDER = "bartender", "Бармен"
-        CASHIER = "cashier", "Кассир"
-        COOK = "cook", "Повар"
-        
-    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    company = models.ForeignKey(
-        Company, on_delete=models.CASCADE, related_name='cafe_staff', verbose_name='Компания'
-    )
-    name = models.CharField("Имя", max_length=100)
-    role = models.CharField(
-        "Роль",
-        max_length=20,
-        choices=Roles.choices,
-        default=Roles.WAITER,
-    )
-    is_active = models.BooleanField("Активен", default=True)
-
-    created_at = models.DateTimeField("Дата создания", auto_now_add=True)
-    updated_at = models.DateTimeField("Дата обновления", auto_now=True)
-
-    class Meta:
-        verbose_name = "Сотрудник"
-        verbose_name_plural = "Сотрудники"
-
-    def __str__(self):
-        return f"{self.name} ({self.get_role_display()})"
     
     
 class Category(models.Model):
@@ -229,8 +200,12 @@ class Order(models.Model):
         Table, on_delete=models.PROTECT, related_name='orders', verbose_name='Стол'
     )
     waiter = models.ForeignKey(
-        'Staff', on_delete=models.SET_NULL, null=True, blank=True,
-        related_name='orders', verbose_name='Официант'
+        settings.AUTH_USER_MODEL,  # ✅ теперь это User
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='served_orders',
+        verbose_name='Официант'
     )
     guests = models.PositiveIntegerField('Количество гостей', default=1)
     created_at = models.DateTimeField('Создано', auto_now_add=True)
@@ -245,7 +220,6 @@ class Order(models.Model):
 
     def __str__(self):
         return f'Order {str(self.id)[:8]} — {self.table}'
-
 
 class OrderItem(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
