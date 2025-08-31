@@ -136,9 +136,10 @@ class OrderRetrieveUpdateDestroyAPIView(CompanyRestrictedMixin, generics.Retriev
     serializer_class = OrderSerializer
     queryset = Order.objects.all().prefetch_related("items__product")
 
-
 class ProductCreateByBarcodeAPIView(generics.CreateAPIView):
-    """Создание товара только по штрих-коду (если найден в «глобальной» базе компании)."""
+    """
+    Создание товара только по штрих-коду (если найден в глобальной базе).
+    """
     serializer_class = ProductSerializer
     permission_classes = [IsAuthenticated]
 
@@ -150,36 +151,22 @@ class ProductCreateByBarcodeAPIView(generics.CreateAPIView):
         if not barcode:
             return Response({"barcode": "Укажите штрих-код."}, status=status.HTTP_400_BAD_REQUEST)
 
-        # Дубликаты в компании
+        # Проверка дубликатов внутри компании
         if Product.objects.filter(company=company, barcode=barcode).exists():
             return Response(
                 {"barcode": "В вашей компании уже есть товар с таким штрих-кодом."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        # Ищем в глобальной базе компании
-        gp = (
-            GlobalProduct.objects.select_related("brand", "category")
-            .filter(company=company, barcode=barcode)
-            .first()
-        )
+        # Ищем в глобальной базе (без company!)
+        gp = GlobalProduct.objects.select_related("brand", "category").filter(barcode=barcode).first()
         if not gp:
             return Response(
                 {"barcode": "Товар с таким штрих-кодом не найден в глобальной базе. Заполните карточку вручную."},
                 status=status.HTTP_404_NOT_FOUND,
             )
 
-        # Локальные справочники
-        brand = (
-            ProductBrand.objects.get_or_create(company=company, name=gp.brand.name)[0]
-            if gp.brand else None
-        )
-        category = (
-            ProductCategory.objects.get_or_create(company=company, name=gp.category.name)[0]
-            if gp.category else None
-        )
-
-        # Парсинг цены/количества (опционально, можно оставить 0)
+        # Парсим цену и количество
         try:
             price = Decimal(str(request.data.get("price", 0)))
         except Exception:
@@ -192,21 +179,24 @@ class ProductCreateByBarcodeAPIView(generics.CreateAPIView):
         except Exception:
             return Response({"quantity": "Неверное количество."}, status=status.HTTP_400_BAD_REQUEST)
 
-        # Создаём товар
+        # Создаём локальный товар
         product = Product.objects.create(
             company=company,
             name=gp.name,
             barcode=gp.barcode,
-            brand=brand,
-            category=category,
+            brand=gp.brand,        # теперь сразу глобальная ссылка
+            category=gp.category,  # теперь сразу глобальная ссылка
             price=price,
             quantity=quantity,
         )
+
         return Response(self.get_serializer(product).data, status=status.HTTP_201_CREATED)
 
 
 class ProductCreateManualAPIView(generics.CreateAPIView):
-    """Ручное создание товара + добавление в «глобальную» базу компании."""
+    """
+    Ручное создание товара + добавление в глобальную базу.
+    """
     serializer_class = ProductSerializer
     permission_classes = [IsAuthenticated]
 
@@ -228,7 +218,7 @@ class ProductCreateManualAPIView(generics.CreateAPIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        # Нормализация price/quantity
+        # price / quantity
         try:
             price = Decimal(str(data.get("price", 0)))
         except Exception:
@@ -241,45 +231,37 @@ class ProductCreateManualAPIView(generics.CreateAPIView):
         except Exception:
             return Response({"quantity": "Неверное количество."}, status=status.HTTP_400_BAD_REQUEST)
 
-        # Локальный бренд/категория
-        brand = None
+        # глобальный бренд / категория (или создаём при необходимости)
+        g_brand = None
         brand_name = (data.get("brand_name") or "").strip()
         if brand_name:
-            brand, _ = ProductBrand.objects.get_or_create(company=company, name=brand_name)
+            g_brand, _ = GlobalBrand.objects.get_or_create(name=brand_name)
 
-        category = None
+        g_category = None
         category_name = (data.get("category_name") or "").strip()
         if category_name:
-            category, _ = ProductCategory.objects.get_or_create(company=company, name=category_name)
+            g_category, _ = GlobalCategory.objects.get_or_create(name=category_name)
 
         # Создаём товар компании
         product = Product.objects.create(
             company=company,
             name=name,
             barcode=barcode,
-            brand=brand,
-            category=category,
+            brand=g_brand,
+            category=g_category,
             price=price,
             quantity=quantity,
         )
 
-        # Синхронизация в «глобальную» базу компании
+        # Если штрих-код есть — синхронизируем в глобальную базу
         if barcode:
-            g_brand = None
-            if brand_name:
-                g_brand, _ = GlobalBrand.objects.get_or_create(company=company, name=brand_name)
-
-            g_category = None
-            if category_name:
-                g_category, _ = GlobalCategory.objects.get_or_create(company=company, name=category_name)
-
             GlobalProduct.objects.get_or_create(
-                company=company,
                 barcode=barcode,
                 defaults={"name": name, "brand": g_brand, "category": g_category},
             )
 
         return Response(self.get_serializer(product).data, status=status.HTTP_201_CREATED)
+
 
 
 class ProductRetrieveUpdateDestroyAPIView(CompanyRestrictedMixin, generics.RetrieveUpdateDestroyAPIView):
