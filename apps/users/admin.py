@@ -1,18 +1,18 @@
 from django.contrib import admin
 from django.contrib.auth.admin import UserAdmin as BaseUserAdmin
-from .models import User, Company, Industry, SubscriptionPlan, Feature, Sector
+from .models import User, Company, Industry, SubscriptionPlan, Feature, Sector, CustomRole
 
 
 # 👤 Пользователь
 @admin.register(User)
 class UserAdmin(BaseUserAdmin):
     list_display = (
-        'email', 'first_name', 'last_name', 'company', 'role',
+        'email', 'first_name', 'last_name', 'company', 'role', 'custom_role',
         'can_view_cashbox', 'can_view_orders',
         'can_view_clients', 'can_view_settings', 'can_view_sale',
         'is_staff', 'is_active'
     )
-    list_filter = ('role', 'is_staff', 'is_active')
+    list_filter = ('role', 'custom_role', 'is_staff', 'is_active')
     search_fields = ('email', 'first_name', 'last_name')
     ordering = ('email',)
     readonly_fields = ('created_at', 'updated_at')
@@ -20,7 +20,7 @@ class UserAdmin(BaseUserAdmin):
     fieldsets = (
         (None, {'fields': ('email', 'password')}),
         ('Персональная информация', {
-            'fields': ('first_name', 'last_name', 'avatar', 'company', 'role')
+            'fields': ('first_name', 'last_name', 'avatar', 'company', 'role', 'custom_role')
         }),
         ('Разрешения по разделам', {
             'fields': (
@@ -45,7 +45,7 @@ class UserAdmin(BaseUserAdmin):
             'classes': ('wide',),
             'fields': (
                 'email', 'password1', 'password2',
-                'first_name', 'last_name', 'avatar', 'company', 'role',
+                'first_name', 'last_name', 'avatar', 'company', 'role', 'custom_role',
                 'can_view_dashboard', 'can_view_cashbox', 'can_view_departments',
                 'can_view_orders', 'can_view_analytics', 'can_view_department_analytics',
                 'can_view_products', 'can_view_booking',
@@ -102,11 +102,15 @@ class CompanyAdmin(admin.ModelAdmin):
         employees = obj.employees.all()[:5]
         if not employees:
             return "Нет сотрудников"
-        names = ', '.join([f'{e.first_name} {e.last_name} ({e.get_role_display()})' for e in employees])
+        names = []
+        for e in employees:
+            role_display = e.custom_role.name if e.custom_role else e.get_role_display()
+            names.append(f'{e.first_name} {e.last_name} ({role_display})')
+        result = ', '.join(names)
         total = obj.employees.count()
         if total > 5:
-            names += f" и ещё {total - 5}"
-        return names
+            result += f" и ещё {total - 5}"
+        return result
     employees_list.short_description = 'Сотрудники'
 
 
@@ -150,3 +154,11 @@ class SubscriptionPlanAdmin(admin.ModelAdmin):
 class SectorAdmin(admin.ModelAdmin):
     list_display = ('name',)
     search_fields = ('name',)
+
+
+# 🎭 Кастомные роли
+@admin.register(CustomRole)
+class CustomRoleAdmin(admin.ModelAdmin):
+    list_display = ('name', 'company')
+    search_fields = ('name', 'company__name')
+    ordering = ('name',)
