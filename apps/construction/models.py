@@ -65,7 +65,7 @@ class Cashbox(models.Model):
 
     def __str__(self):
         if self.department:
-            return f"Касса отдела {self.department.name}"
+            return f"Касса отдела{self.name} - {self.department.name}"
         return self.name or "Свободная касса"
 
     def get_summary(self):
