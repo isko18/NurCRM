@@ -23,6 +23,7 @@ from .pos_serializers import (
 )
 from apps.main.services import checkout_cart, NotEnoughStock
 from apps.main.views import CompanyRestrictedMixin
+from apps.main.models import Client
 from apps.construction.models import Department
 from django.http import Http404
 import io,os
@@ -308,14 +309,6 @@ class SaleAddItemAPIView(APIView):
 
 
 class SaleCheckoutAPIView(APIView):
-    """
-    POST — оформить продажу (печать чека / без чека) + создать приход по кассе.
-    body:
-    {
-      "print_receipt": true|false,
-      "department_id": "uuid"   # опционально; если не передан — попробуем взять отдел пользователя
-    }
-    """
     permission_classes = [permissions.IsAuthenticated]
 
     @transaction.atomic
@@ -327,6 +320,7 @@ class SaleCheckoutAPIView(APIView):
         ser = CheckoutSerializer(data=request.data)
         ser.is_valid(raise_exception=True)
         print_receipt = ser.validated_data["print_receipt"]
+        client_id = ser.validated_data.get("client_id")
 
         # Определяем отдел
         department_id = request.data.get("department_id")
@@ -341,10 +335,18 @@ class SaleCheckoutAPIView(APIView):
         except ValueError as e:
             return Response({"detail": str(e)}, status=status.HTTP_400_BAD_REQUEST)
 
+        # --- сохраняем клиента ---
+        if client_id:
+            client = get_object_or_404(Client, id=client_id, company=request.user.company)
+            sale.client = client
+            sale.save(update_fields=["client"])
+
         payload = {
             "sale_id": str(sale.id),
             "total": str(sale.total),
             "status": sale.status,
+            "client": str(sale.client_id) if sale.client_id else None,
+            "client_name": getattr(sale.client, "full_name", None) if sale.client else None,
         }
 
         if print_receipt:
