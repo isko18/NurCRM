@@ -82,12 +82,12 @@ class CompanyAdmin(admin.ModelAdmin):
     list_display = ('name', 'get_industry_name', 'sector', 'owner', 'employee_count', 'created_at', 'start_date', 'end_date')
     search_fields = ('name', 'industry__name', 'sector__name', 'owner__email')
     ordering = ('name',)
-    readonly_fields = ('employees_list',)
+    readonly_fields = ('employees_list', 'created_at')  # ✅ created_at только readonly
 
     fieldsets = (
         (None, {'fields': ('name', 'industry', 'sector', 'subscription_plan', 'owner')}),
         ('Сотрудники', {'fields': ('employees_list',)}),
-        ('Даты', {'fields': ('created_at', 'start_date', 'end_date')}),
+        ('Даты', {'fields': ('start_date', 'end_date')}),  # ❌ created_at убрали отсюда
     )
 
     def get_industry_name(self, obj):
