@@ -1,353 +1,41 @@
 from django.contrib import admin
-from mptt.admin import DraggableMPTTAdmin
-
 from apps.main.models import (
-    Contact, Pipeline, Deal, Task,
-    Integration, Analytics, Order, OrderItem,
-    Product, Review, Notification, Event,
+    Contact, Pipeline, Deal, Task, Client, ClientDeal, Bid, SocialApplications,
+    Product, ProductBrand, ProductCategory, GlobalProduct, GlobalBrand, GlobalCategory,
     Warehouse, WarehouseEvent,
-    ProductCategory, ProductBrand, Client, GlobalProduct, GlobalBrand, GlobalCategory,
-    CartItem, Cart, Sale, SaleItem, ClientDeal, Bid, SocialApplications
+    Order, OrderItem,
+    Cart, CartItem, Sale, SaleItem,
+    Review, Notification, Event,
+    Integration, Analytics
 )
 
 
-admin.site.register(Bid)
-
-
-# ===== CONTACT =====
-@admin.register(Contact)
-class ContactAdmin(admin.ModelAdmin):
-    list_display = ('name', 'email', 'company', 'department', 'owner', 'created_at')
-    list_filter = ('company', 'department')
-    search_fields = ('name', 'email', 'company__name')
-    readonly_fields = ('created_at', 'updated_at')
-
-
-# ===== PIPELINE =====
-@admin.register(Pipeline)
-class PipelineAdmin(admin.ModelAdmin):
-    list_display = ('name', 'owner', 'created_at')
-    search_fields = ('name',)
-    readonly_fields = ('created_at', 'updated_at')
-
-
-# ===== DEAL =====
-@admin.register(Deal)
-class DealAdmin(admin.ModelAdmin):
-    list_display = ('title', 'status', 'value', 'pipeline', 'stage', 'contact', 'assigned_to', 'created_at')
-    list_filter = ('status', 'pipeline')
-    search_fields = ('title', 'contact__name')
-    readonly_fields = ('created_at', 'updated_at')
-
-
-# ===== TASK =====
-@admin.register(Task)
-class TaskAdmin(admin.ModelAdmin):
-    list_display = ('title', 'status', 'due_date', 'assigned_to', 'deal')
-    list_filter = ('status', 'due_date')
-    search_fields = ('title', 'description')
-    readonly_fields = ('created_at', 'updated_at')
-
-
-# ===== INTEGRATION =====
-@admin.register(Integration)
-class IntegrationAdmin(admin.ModelAdmin):
-    list_display = ('type', 'status', 'created_at')
-    list_filter = ('type', 'status')
-    readonly_fields = ('created_at', 'updated_at')
-
-
-# ===== ANALYTICS =====
-@admin.register(Analytics)
-class AnalyticsAdmin(admin.ModelAdmin):
-    list_display = ('type', 'created_at')
-    search_fields = ('data',)
-    readonly_fields = ('created_at',)
-
-
-# ===== ORDER =====
-class OrderItemInline(admin.TabularInline):
-    model = OrderItem
-    extra = 1
-    readonly_fields = ('total',)
-    autocomplete_fields = ('product',)
-
-    def save_formset(self, request, form, formset, change):
-        instances = formset.save(commit=False)
-        for obj in instances:
-            obj.price = obj.product.price
-            obj.total = obj.price * obj.quantity
-
-            # Проверка остатка
-            if obj.product.quantity < obj.quantity:
-                raise ValueError(f"Недостаточно товара '{obj.product.name}' на складе")
-
-            # Обновляем остаток
-            obj.product.quantity -= obj.quantity
-            obj.product.save()
-            obj.save()
-        formset.save_m2m()
-
-
-@admin.register(Order)
-class OrderAdmin(admin.ModelAdmin):
-    list_display = ('order_number', 'customer_name', 'status', 'total_display', 'total_quantity', 'department', 'date_ordered')
-    list_filter = ('status', 'department')
-    search_fields = ('order_number', 'customer_name')
-    readonly_fields = ('created_at', 'updated_at')
-    inlines = [OrderItemInline]
-
-    def total_display(self, obj):
-        return f"{obj.total:.2f}"
-    total_display.short_description = 'Сумма'
-
-
-# ===== PRODUCT =====
-@admin.register(Product)
-class ProductAdmin(admin.ModelAdmin):
-    list_display = ('name', 'barcode', 'price', 'quantity', 'brand', 'category')
-    search_fields = ('name', 'barcode')
-
-
-admin.site.register(GlobalProduct)
-admin.site.register(GlobalCategory)
-admin.site.register(GlobalBrand)
-admin.site.register(ProductBrand)
-admin.site.register(ProductCategory)
-
-
-# ===== CART =====
-class CartItemInline(admin.TabularInline):
-    model = CartItem
-    extra = 0
-    readonly_fields = ("product", "quantity", "unit_price", "line_total")
-
-    def line_total(self, obj):
-        if not obj or obj.unit_price is None or obj.quantity is None:
-            return "-"
-        try:
-            return obj.unit_price * obj.quantity
-        except Exception:
-            return "-"
-    line_total.short_description = "Сумма"
-    line_total.admin_order_field = "unit_price"
-
-
-@admin.register(Cart)
-class CartAdmin(admin.ModelAdmin):
-    list_display = (
-        "id", "company", "created_by", "status",
-        "subtotal", "discount_total", "tax_total", "total",
-        "created_at",
-    )
-    list_filter = ("company", "status", "created_at")
-    search_fields = ("id", "user__username", "user__email")
-    inlines = [CartItemInline]
-
-    def created_by(self, obj):
-        return obj.user
-    created_by.short_description = "Создал"
-    created_by.admin_order_field = "user"
-
-
-# ===== SALE =====
-class SaleItemInline(admin.TabularInline):
-    model = SaleItem
-    extra = 0
-    can_delete = False
-    readonly_fields = ("product", "name_snapshot", "barcode_snapshot", "unit_price", "quantity", "line_total")
-
-    def line_total(self, obj):
-        if not obj or obj.unit_price is None or obj.quantity is None:
-            return "-"
-        try:
-            return obj.unit_price * obj.quantity
-        except Exception:
-            return "-"
-    line_total.short_description = "Сумма"
-    line_total.admin_order_field = "unit_price"
-
-
-@admin.register(Sale)
-class SaleAdmin(admin.ModelAdmin):
-    list_display = (
-        "id", "company", "user", "client", "status",
-        "subtotal", "discount_total", "tax_total", "total",
-        "created_at", "paid_at",
-    )
-    list_filter = ("company", "status", "created_at", "paid_at")
-    search_fields = ("id", "user__username", "user__email", "client__full_name", "client__phone")
-    inlines = [SaleItemInline]
-
-
-# ===== REVIEW =====
-@admin.register(Review)
-class ReviewAdmin(admin.ModelAdmin):
-    list_display = ('user', 'rating', 'created_at')
-    list_filter = ('rating',)
-    search_fields = ('user__email', 'comment')
-    readonly_fields = ('created_at', 'updated_at')
-
-
-# ===== NOTIFICATION =====
-@admin.register(Notification)
-class NotificationAdmin(admin.ModelAdmin):
-    list_display = ('user', 'message', 'is_read', 'created_at')
-    list_filter = ('is_read', 'created_at')
-    search_fields = ('message', 'user__email')
-    readonly_fields = ('created_at',)
-
-
-# ===== EVENT =====
-@admin.register(Event)
-class EventAdmin(admin.ModelAdmin):
-    list_display = ('title', 'datetime', 'company', 'created_at')
-    list_filter = ('company', 'datetime')
-    search_fields = ('title', 'notes')
-    filter_horizontal = ('participants',)
-    readonly_fields = ('created_at', 'updated_at')
-
-
-# ===== WAREHOUSE =====
-@admin.register(Warehouse)
-class WarehouseAdmin(admin.ModelAdmin):
-    list_display = ('name', 'location', 'company_name', 'created_at')
-    list_filter = ('company', 'location')
-    search_fields = ('name', 'location')
-    readonly_fields = ('created_at', 'updated_at')
-
-    def company_name(self, obj):
-        return obj.company.name
-    company_name.admin_order_field = 'company__name'
-    company_name.short_description = 'Компания'
-
-
-@admin.register(WarehouseEvent)
-class WarehouseEventAdmin(admin.ModelAdmin):
-    list_display = ('title', 'client_name', 'event_date', 'status', 'responsible_person', 'warehouse_name', 'created_at')
-    list_filter = ('status', 'event_date', 'warehouse')
-    search_fields = ('title', 'client_name', 'description')
-    filter_horizontal = ('participants',)
-    readonly_fields = ('created_at', 'updated_at')
-
-    def warehouse_name(self, obj):
-        return obj.warehouse.name
-    warehouse_name.admin_order_field = 'warehouse__name'
-    warehouse_name.short_description = 'Склад'
-
-
-# ===== ORDER ITEM =====
-@admin.register(OrderItem)
-class OrderItemAdmin(admin.ModelAdmin):
-    list_display = ('order', 'product', 'quantity', 'price', 'total')
-    search_fields = ('order__order_number', 'product__name')
-    readonly_fields = ('price', 'total')
-
-
-# ===== BASE COMPANY FILTERED =====
-class CompanyFilteredAdmin(admin.ModelAdmin):
-    def get_queryset(self, request):
-        qs = super().get_queryset(request)
-        if request.user.is_superuser:
-            return qs
-        user_company_id = getattr(getattr(request, "user", None), "company_id", None)
-        if user_company_id:
-            qs = qs.filter(company_id=user_company_id)
-        return qs
-
-    def save_model(self, request, obj, form, change):
-        if not change and not getattr(obj, "company_id", None):
-            obj.company_id = getattr(getattr(request, "user", None), "company_id", None)
-        super().save_model(request, obj, form, change)
-
-    def get_readonly_fields(self, request, obj=None):
-        ro = list(super().get_readonly_fields(request, obj))
-        if not request.user.is_superuser:
-            ro.append("company")
-        return ro
-
-    def has_change_permission(self, request, obj=None):
-        if not request.user.is_superuser and obj and obj.company_id != request.user.company_id:
-            return False
-        return super().has_change_permission(request, obj)
-
-    def has_delete_permission(self, request, obj=None):
-        if not request.user.is_superuser and obj and obj.company_id != request.user.company_id:
-            return False
-        return super().has_delete_permission(request, obj)
-
-
-# ===== CLIENT & DEAL =====
-class ClientDealInline(admin.TabularInline):
-    model = ClientDeal
-    extra = 0
-    fields = ("title", "kind", "amount", "created_at")
-    readonly_fields = ("created_at",)
-    show_change_link = True
-
-    def get_queryset(self, request):
-        qs = super().get_queryset(request)
-        if request.user.is_superuser:
-            return qs
-        user_company_id = getattr(getattr(request, "user", None), "company_id", None)
-        if user_company_id:
-            qs = qs.filter(company_id=user_company_id)
-        return qs
-
-    def has_add_permission(self, request, obj=None):
-        return True
-
-    def save_new_instance(self, form, commit=True):
-        instance = super().save_new_instance(form, commit=False)
-        if not getattr(instance, "company_id", None) and instance.client_id:
-            instance.company_id = instance.client.company_id
-        if commit:
-            instance.save()
-        return instance
-
-    def save_formset(self, request, form, formset, change):
-        instances = formset.save(commit=False)
-        for inst in instances:
-            if not getattr(inst, "company_id", None):
-                inst.company_id = getattr(form.instance, "company_id", None)
-        super().save_formset(request, form, formset, change)
-
-
-@admin.register(Client)
-class ClientAdmin(CompanyFilteredAdmin):
-    list_display = ("full_name", "type", "phone", "email", "date", "status", "created_at")
-    list_filter = ("status", ("date", admin.DateFieldListFilter), ("created_at", admin.DateFieldListFilter))
-    search_fields = ("full_name", "phone", "email")
-    readonly_fields = ("created_at", "updated_at")
-    date_hierarchy = "date"
-    ordering = ("-created_at",)
-    inlines = [ClientDealInline]
-    list_per_page = 50
-
-
-@admin.register(ClientDeal)
-class ClientDealAdmin(CompanyFilteredAdmin):
-    list_display = ("title", "client", "kind", "amount", "created_at")
-    list_filter = ("kind", ("created_at", admin.DateFieldListFilter))
-    search_fields = ("title", "client__full_name", "client__phone")
-    readonly_fields = ("created_at", "updated_at")
-    ordering = ("-created_at",)
-    list_select_related = ("client",)
-    list_per_page = 50
-    autocomplete_fields = ("client",)
-
-    def formfield_for_foreignkey(self, db_field, request, **kwargs):
-        if db_field.name == "client" and not request.user.is_superuser:
-            user_company_id = getattr(getattr(request, "user", None), "company_id", None)
-            if user_company_id:
-                kwargs["queryset"] = Client.objects.filter(company_id=user_company_id)
-        return super().formfield_for_foreignkey(db_field, request, **kwargs)
-
-
-# ===== SOCIAL APPLICATIONS =====
-@admin.register(SocialApplications)
-class SocialApplicationsAdmin(admin.ModelAdmin):
-    list_display = ("company", "status", "created_at")
-    list_filter = ("status",)
-    search_fields = ("company", "text")
-    readonly_fields = ("created_at",)
+# ==== ГРУППЫ ==== #
+CRM_MODELS = [Contact, Pipeline, Deal, Task, Client, ClientDeal, Bid, SocialApplications]
+PRODUCT_MODELS = [Product, ProductBrand, ProductCategory, GlobalProduct, GlobalBrand, GlobalCategory]
+WAREHOUSE_MODELS = [Warehouse, WarehouseEvent]
+SALES_MODELS = [Cart, CartItem, Sale, SaleItem, Order, OrderItem]
+SERVICE_MODELS = [Review, Notification, Event, Integration, Analytics]
+
+
+# ======== РЕГИСТРАЦИЯ С ГРУППИРОВКОЙ ======== #
+
+# 👥 CRM
+for model in CRM_MODELS:
+    admin.site.register(model)
+
+# 📦 Продукты
+for model in PRODUCT_MODELS:
+    admin.site.register(model)
+
+# 🏬 Склад
+for model in WAREHOUSE_MODELS:
+    admin.site.register(model)
+
+# 💰 Продажи
+for model in SALES_MODELS:
+    admin.site.register(model)
+
+# ⚙️ Сервисные
+for model in SERVICE_MODELS:
+    admin.site.register(model)

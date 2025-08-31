@@ -1,7 +1,7 @@
-# cafe/admin.py
 from django.contrib import admin
+from django.conf import settings
 from .models import (
-    Zone, Table, Booking, Warehouse, Purchase, Staff,
+    Zone, Table, Booking, Warehouse, Purchase,
     Category, MenuItem, Ingredient, Order, OrderItem,
 )
 
@@ -40,7 +40,6 @@ class CompanyAdminMixin:
                 )
         return super().formfield_for_foreignkey(db_field, request, **kwargs)
 
-    # показываем фильтр по компании только админам
     def get_list_filter(self, request):
         base = getattr(super(), "list_filter", ())
         if request.user.is_superuser and _has_company_field(self.model):
@@ -54,10 +53,8 @@ class CompanyInlineMixin:
         qs = super().get_queryset(request)
         if request.user.is_superuser:
             return qs
-        # Пытаемся угадать путь до company
         if hasattr(self.model, "company_id"):
             return qs.filter(company=getattr(request.user, "company", None))
-        # Ingredient -> menu_item__company, OrderItem -> order__company
         if self.model is Ingredient:
             return qs.filter(menu_item__company=getattr(request.user, "company", None))
         if self.model is OrderItem:
@@ -83,6 +80,7 @@ class IngredientInline(CompanyInlineMixin, admin.TabularInline):
     fields = ("product", "amount")
     verbose_name = "Ингредиент"
     verbose_name_plural = "Ингредиенты"
+
 
 class OrderItemInline(CompanyInlineMixin, admin.TabularInline):
     model = OrderItem
@@ -139,15 +137,6 @@ class PurchaseAdmin(CompanyAdminMixin, admin.ModelAdmin):
     ordering = ("-price",)
 
 
-@admin.register(Staff)
-class StaffAdmin(CompanyAdminMixin, admin.ModelAdmin):
-    list_display = ("name", "role", "is_active", "company", "created_at")
-    list_filter = ("role", "is_active")
-    search_fields = ("name",)
-    ordering = ("name",)
-    readonly_fields = ("created_at", "updated_at")
-
-
 @admin.register(Category)
 class CategoryAdmin(CompanyAdminMixin, admin.ModelAdmin):
     list_display = ("title", "company")
@@ -182,7 +171,7 @@ class OrderAdmin(CompanyAdminMixin, admin.ModelAdmin):
     date_hierarchy = "created_at"
     list_display = (short_id, "table", "waiter", "guests", "created_at", "company")
     list_filter = ("waiter", "table")
-    search_fields = ("table__number", "waiter__name")
+    search_fields = ("table__number", "waiter__username", "waiter__email")
     ordering = ("-created_at",)
     list_select_related = ("table", "waiter", "company")
     autocomplete_fields = ("table", "waiter")

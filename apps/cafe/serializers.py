@@ -1,7 +1,9 @@
 # apps/cafe/serializers.py
 from rest_framework import serializers
+from django.conf import settings
+from apps.users.models import User   # <-- берём настоящего пользователя
 from .models import (
-    Zone, Table, Booking, Warehouse, Purchase, Staff,
+    Zone, Table, Booking, Warehouse, Purchase,
     Category, MenuItem, Ingredient, Order, OrderItem,
 )
 
@@ -58,15 +60,6 @@ class PurchaseSerializer(CompanyReadOnlyMixin):
         fields = ["id", "company", "supplier", "positions", "price"]
 
 
-class StaffSerializer(CompanyReadOnlyMixin):
-    role_display = serializers.CharField(source="get_role_display", read_only=True)
-
-    class Meta:
-        model = Staff
-        fields = ["id", "company", "name", "role", "role_display", "is_active", "created_at", "updated_at"]
-        read_only_fields = ["created_at", "updated_at"]
-
-
 class CategorySerializer(CompanyReadOnlyMixin):
     class Meta:
         model = Category
@@ -84,7 +77,6 @@ class IngredientInlineSerializer(serializers.ModelSerializer):
         read_only_fields = ["id", "product_title", "product_unit"]
 
     def validate_product(self, product):
-        # защита на случай прямого использования вложенного сериализатора
         company = getattr(getattr(self.context.get("request"), "user", None), "company", None)
         if company and product.company_id != company.id:
             raise serializers.ValidationError("Товар склада принадлежит другой компании.")
@@ -122,7 +114,7 @@ class MenuItemSerializer(CompanyReadOnlyMixin):
 
     def create(self, validated_data):
         ingredients = validated_data.pop("ingredients", [])
-        obj = super().create(validated_data)  # company выставит миксин
+        obj = super().create(validated_data)
         if ingredients:
             self._upsert_ingredients(obj, ingredients, obj.company)
         return obj
@@ -175,9 +167,12 @@ class OrderItemInlineSerializer(serializers.ModelSerializer):
 
 class OrderSerializer(CompanyReadOnlyMixin):
     table = serializers.PrimaryKeyRelatedField(queryset=Table.objects.all())
-    waiter = serializers.PrimaryKeyRelatedField(queryset=Staff.objects.all(), allow_null=True, required=False)
-
-    items = OrderItemInlineSerializer(many=True, required=False)  # ← убираем source="items"
+    waiter = serializers.PrimaryKeyRelatedField(
+        queryset=User.objects.filter(role="waiter"),  # только пользователи с ролью официанта
+        allow_null=True,
+        required=False
+    )
+    items = OrderItemInlineSerializer(many=True, required=False)
 
     class Meta:
         ref_name = "CafeOrder"
@@ -191,8 +186,8 @@ class OrderSerializer(CompanyReadOnlyMixin):
         waiter = attrs.get("waiter", getattr(self.instance, "waiter", None))
         if company and table and table.company_id != company.id:
             raise serializers.ValidationError({"table": "Стол принадлежит другой компании."})
-        if company and waiter and waiter.company_id != company.id:
-            raise serializers.ValidationError({"waiter": "Сотрудник принадлежит другой компании."})
+        if company and waiter and getattr(waiter, "company_id", None) != company.id:
+            raise serializers.ValidationError({"waiter": "Официант принадлежит другой компании."})
         return attrs
 
     def _upsert_items(self, order, items, company):
@@ -206,7 +201,6 @@ class OrderSerializer(CompanyReadOnlyMixin):
                 existing.quantity += qty
                 existing.save(update_fields=["quantity"])
             else:
-                # если у OrderItem есть поле company — заполняем
                 OrderItem.objects.create(
                     order=order,
                     menu_item=menu_item,
@@ -215,8 +209,8 @@ class OrderSerializer(CompanyReadOnlyMixin):
                 )
 
     def create(self, validated_data):
-        items = validated_data.pop("items", [])  # из-за source="items"
-        obj = super().create(validated_data)          # company выставит миксин
+        items = validated_data.pop("items", [])
+        obj = super().create(validated_data)
         if items:
             self._upsert_items(obj, items, obj.company)
         return obj
