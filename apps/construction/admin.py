@@ -15,7 +15,7 @@ class DepartmentAdmin(admin.ModelAdmin):
 
 @admin.register(Cashbox)
 class CashboxAdmin(admin.ModelAdmin):
-    list_display = ('department',)
+    list_display = ('name', 'department',)
     list_filter = ('department__company',)
     search_fields = ('department__name',)
 
