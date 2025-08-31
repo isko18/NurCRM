@@ -726,6 +726,7 @@ class ClientDeal(models.Model):
     )
     title = models.CharField("Название сделки", max_length=255)
     kind = models.CharField("Тип сделки", max_length=16, choices=Kind.choices, default=Kind.SALE)
+    count_debt = models.CharField(max_length=255, verbose_name="На сколько делим")
     amount = models.DecimalField("Сумма", max_digits=12, decimal_places=2, default=0)
     note = models.TextField("Комментарий", blank=True)
     created_at = models.DateTimeField("Создано", auto_now_add=True)
