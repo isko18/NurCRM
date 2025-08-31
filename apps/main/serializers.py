@@ -491,7 +491,7 @@ class ClientDealSerializer(serializers.ModelSerializer):
         model = ClientDeal
         fields = [
             'id', 'company', 'client', 'client_full_name',
-            'title', 'kind', 'amount', 'note',
+            'title', 'kind', 'count_debt', 'amount', 'note',
             'created_at', 'updated_at'
         ]
         read_only_fields = ['id', 'company', 'created_at', 'updated_at', 'client_full_name']
