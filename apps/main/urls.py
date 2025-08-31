@@ -93,6 +93,8 @@ urlpatterns = [
         CartItemUpdateDestroyAPIView.as_view(),
         name="pos-cart-item-update-destroy",
     ),
-    path("api/main/pos/sales/<uuid:pk>/receipt/", SaleReceiptDownloadAPIView.as_view(), name="sale-receipt-download")
+    path("api/main/pos/sales/<uuid:pk>/receipt/", SaleReceiptDownloadAPIView.as_view(), name="sale-receipt-download"),
+    path("sales/<uuid:pk>/invoice/", SaleInvoiceDownloadAPIView.as_view()),
+
 ]
 
