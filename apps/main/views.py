@@ -201,6 +201,7 @@ class ProductCreateByBarcodeAPIView(generics.CreateAPIView):
 
         return Response(self.get_serializer(product).data, status=status.HTTP_201_CREATED)
 
+
 class ProductCreateManualAPIView(generics.CreateAPIView):
     """
     Ручное создание товара + добавление в глобальную базу.
@@ -239,7 +240,7 @@ class ProductCreateManualAPIView(generics.CreateAPIView):
         except Exception:
             return Response({"quantity": "Неверное количество."}, status=status.HTTP_400_BAD_REQUEST)
 
-        # глобальный бренд / категория
+        # ✅ глобальный бренд/категория
         g_brand = None
         brand_name = (data.get("brand_name") or "").strip()
         if brand_name:
@@ -250,9 +251,18 @@ class ProductCreateManualAPIView(generics.CreateAPIView):
         if category_name:
             g_category, _ = GlobalCategory.objects.get_or_create(name=category_name)
 
-        # клиент (если передан)
-        client_id = data.get("client")
+        # ✅ локальные справочники
+        brand = None
+        if g_brand:
+            brand, _ = ProductBrand.objects.get_or_create(company=company, name=g_brand.name)
+
+        category = None
+        if g_category:
+            category, _ = ProductCategory.objects.get_or_create(company=company, name=g_category.name)
+
+        # ✅ клиент (если передан)
         client = None
+        client_id = data.get("client")
         if client_id:
             client = get_object_or_404(Client, id=client_id, company=company)
 
@@ -261,11 +271,11 @@ class ProductCreateManualAPIView(generics.CreateAPIView):
             company=company,
             name=name,
             barcode=barcode,
-            brand=g_brand,
-            category=g_category,
+            brand=brand,          # локальная модель
+            category=category,    # локальная модель
             price=price,
             quantity=quantity,
-            client=client   # ✅ сохраняем клиента
+            client=client         # ✅ теперь сохраняем клиента
         )
 
         # Если штрих-код есть — синхронизируем в глобальную базу
