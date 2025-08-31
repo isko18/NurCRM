@@ -135,7 +135,6 @@ class OrderListCreateAPIView(CompanyRestrictedMixin, generics.ListCreateAPIView)
 class OrderRetrieveUpdateDestroyAPIView(CompanyRestrictedMixin, generics.RetrieveUpdateDestroyAPIView):
     serializer_class = OrderSerializer
     queryset = Order.objects.all().prefetch_related("items__product")
-
 class ProductCreateByBarcodeAPIView(generics.CreateAPIView):
     """
     Создание товара только по штрих-коду (если найден в глобальной базе).
@@ -166,11 +165,16 @@ class ProductCreateByBarcodeAPIView(generics.CreateAPIView):
                 status=status.HTTP_404_NOT_FOUND,
             )
 
-        # Парсим цену и количество
+        # Парсим цены и количество
         try:
             price = Decimal(str(request.data.get("price", 0)))
         except Exception:
             return Response({"price": "Неверный формат цены."}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            purchase_price = Decimal(str(request.data.get("purchase_price", 0)))
+        except Exception:
+            return Response({"purchase_price": "Неверный формат закупочной цены."}, status=status.HTTP_400_BAD_REQUEST)
 
         try:
             quantity = int(request.data.get("quantity", 0))
@@ -180,27 +184,22 @@ class ProductCreateByBarcodeAPIView(generics.CreateAPIView):
             return Response({"quantity": "Неверное количество."}, status=status.HTTP_400_BAD_REQUEST)
 
         # ✅ создаём или берём локальные справочники
-        brand = None
-        if gp.brand:
-            brand, _ = ProductBrand.objects.get_or_create(company=company, name=gp.brand.name)
-
-        category = None
-        if gp.category:
-            category, _ = ProductCategory.objects.get_or_create(company=company, name=gp.category.name)
+        brand = ProductBrand.objects.get_or_create(company=company, name=gp.brand.name)[0] if gp.brand else None
+        category = ProductCategory.objects.get_or_create(company=company, name=gp.category.name)[0] if gp.category else None
 
         # Создаём локальный товар
         product = Product.objects.create(
             company=company,
             name=gp.name,
             barcode=gp.barcode,
-            brand=brand,          # ✅ теперь локальный ProductBrand
-            category=category,    # ✅ теперь локальная ProductCategory
+            brand=brand,
+            category=category,
             price=price,
+            purchase_price=purchase_price,  # ✅ добавили закупочную цену
             quantity=quantity,
         )
 
         return Response(self.get_serializer(product).data, status=status.HTTP_201_CREATED)
-
 
 class ProductCreateManualAPIView(generics.CreateAPIView):
     """
@@ -227,11 +226,16 @@ class ProductCreateManualAPIView(generics.CreateAPIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        # price / quantity
+        # ✅ price / purchase_price / quantity
         try:
             price = Decimal(str(data.get("price", 0)))
         except Exception:
             return Response({"price": "Неверный формат цены."}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            purchase_price = Decimal(str(data.get("purchase_price", 0)))
+        except Exception:
+            return Response({"purchase_price": "Неверный формат закупочной цены."}, status=status.HTTP_400_BAD_REQUEST)
 
         try:
             quantity = int(data.get("quantity", 0))
@@ -241,24 +245,12 @@ class ProductCreateManualAPIView(generics.CreateAPIView):
             return Response({"quantity": "Неверное количество."}, status=status.HTTP_400_BAD_REQUEST)
 
         # ✅ глобальный бренд/категория
-        g_brand = None
-        brand_name = (data.get("brand_name") or "").strip()
-        if brand_name:
-            g_brand, _ = GlobalBrand.objects.get_or_create(name=brand_name)
-
-        g_category = None
-        category_name = (data.get("category_name") or "").strip()
-        if category_name:
-            g_category, _ = GlobalCategory.objects.get_or_create(name=category_name)
+        g_brand = GlobalBrand.objects.get_or_create(name=(data.get("brand_name") or "").strip())[0] if data.get("brand_name") else None
+        g_category = GlobalCategory.objects.get_or_create(name=(data.get("category_name") or "").strip())[0] if data.get("category_name") else None
 
         # ✅ локальные справочники
-        brand = None
-        if g_brand:
-            brand, _ = ProductBrand.objects.get_or_create(company=company, name=g_brand.name)
-
-        category = None
-        if g_category:
-            category, _ = ProductCategory.objects.get_or_create(company=company, name=g_category.name)
+        brand = ProductBrand.objects.get_or_create(company=company, name=g_brand.name)[0] if g_brand else None
+        category = ProductCategory.objects.get_or_create(company=company, name=g_category.name)[0] if g_category else None
 
         # ✅ клиент (если передан)
         client = None
@@ -271,11 +263,12 @@ class ProductCreateManualAPIView(generics.CreateAPIView):
             company=company,
             name=name,
             barcode=barcode,
-            brand=brand,          # локальная модель
-            category=category,    # локальная модель
+            brand=brand,
+            category=category,
             price=price,
+            purchase_price=purchase_price,  # ✅ новая закупочная цена
             quantity=quantity,
-            client=client         # ✅ теперь сохраняем клиента
+            client=client
         )
 
         # Если штрих-код есть — синхронизируем в глобальную базу
@@ -286,6 +279,7 @@ class ProductCreateManualAPIView(generics.CreateAPIView):
             )
 
         return Response(self.get_serializer(product).data, status=status.HTTP_201_CREATED)
+
 
 
 
