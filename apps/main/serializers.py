@@ -1,5 +1,5 @@
 from rest_framework import serializers
-from apps.main.models import Contact, Pipeline, Deal, Task, Integration, Analytics, Order, Product, Review, Notification, Event, Warehouse, WarehouseEvent, ProductCategory, ProductBrand, OrderItem, Client, GlobalProduct, CartItem, ClientDeal, Bid, SocialApplications, GlobalBrand, GlobalCategory
+from apps.main.models import Contact, Pipeline, Deal, Task, Integration, Analytics, Order, Product, Review, Notification, Event, Warehouse, WarehouseEvent, ProductCategory, ProductBrand, OrderItem, Client, GlobalProduct, CartItem, ClientDeal, Bid, SocialApplications
 
 from apps.users.models import User, Company
 from django.db import transaction
@@ -227,21 +227,15 @@ class OrderSerializer(serializers.ModelSerializer):
 class ProductSerializer(serializers.ModelSerializer):
     company = serializers.ReadOnlyField(source='company.id')
 
-    # глобальные справочники
-    brand = serializers.PrimaryKeyRelatedField(
-        queryset=GlobalBrand.objects.all(),
-        required=False,
-        allow_null=True
-    )
-    brand_name = serializers.CharField(source='brand.name', read_only=True)
+    # бренд и категория (только название для чтения)
+    brand = serializers.CharField(source='brand.name', read_only=True)
+    category = serializers.CharField(source='category.name', read_only=True)
 
-    category = serializers.PrimaryKeyRelatedField(
-        queryset=GlobalCategory.objects.all(),
-        required=False,
-        allow_null=True
-    )
-    category_name = serializers.CharField(source='category.name', read_only=True)
+    # ручное создание/редактирование — только для сценария без barcode
+    brand_name = serializers.CharField(write_only=True, required=False, allow_blank=True)
+    category_name = serializers.CharField(write_only=True, required=False, allow_blank=True)
 
+    # ✅ клиент (может быть пустым)
     client = serializers.PrimaryKeyRelatedField(
         queryset=Client.objects.all(),
         required=False,
@@ -256,10 +250,17 @@ class ProductSerializer(serializers.ModelSerializer):
             'brand', 'brand_name',
             'category', 'category_name',
             'quantity', 'price', 'company',
-            'client', 'client_name',
+            'client', 'client_name',   # ✅ добавили
             'created_at', 'updated_at'
         ]
-        read_only_fields = ['id', 'created_at', 'updated_at', 'company', 'brand_name', 'category_name', 'client_name']
+        read_only_fields = [
+            'id', 'created_at', 'updated_at',
+            'company', 'name', 'brand', 'category', 'client_name'
+        ]
+        extra_kwargs = {
+            'price': {'required': False, 'default': 0},
+            'quantity': {'required': False, 'default': 0},
+        }
 
     def validate_barcode(self, value):
         value = str(value).strip()
@@ -270,16 +271,42 @@ class ProductSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError("В вашей компании уже есть товар с таким штрих-кодом.")
         return value
 
+    def _ensure_company_brand(self, company, global_brand):
+        """Создать или взять локальный бренд по глобальному"""
+        if global_brand:
+            brand, _ = ProductBrand.objects.get_or_create(company=company, name=global_brand.name)
+            return brand
+        return None
+
+    def _ensure_company_category(self, company, global_category):
+        """Создать или взять локальную категорию по глобальной"""
+        if global_category:
+            category, _ = ProductCategory.objects.get_or_create(company=company, name=global_category.name)
+            return category
+        return None
+
     @transaction.atomic
     def create(self, validated_data):
-        company = self.context['request'].user.company
+        request = self.context['request']
+        company = request.user.company
+        barcode = validated_data['barcode']
+
+        gp = GlobalProduct.objects.select_related('brand', 'category').filter(barcode=barcode).first()
+        if not gp:
+            raise serializers.ValidationError({
+                "barcode": "Товар с таким штрих-кодом не найден в глобальной базе. Заполните карточку вручную."
+            })
+
+        # 🔑 конвертация Global → локальные
+        brand = self._ensure_company_brand(company, gp.brand)
+        category = self._ensure_company_category(company, gp.category)
 
         return Product.objects.create(
             company=company,
-            name=validated_data.get('name'),
-            barcode=validated_data.get('barcode'),
-            brand=validated_data.get('brand'),
-            category=validated_data.get('category'),
+            name=gp.name,
+            barcode=gp.barcode,
+            brand=brand,          # ✅ теперь ProductBrand
+            category=category,    # ✅ теперь ProductCategory
             price=validated_data.get('price', 0),
             quantity=validated_data.get('quantity', 0),
             client=validated_data.get('client')
