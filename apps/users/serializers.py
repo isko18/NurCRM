@@ -1,7 +1,7 @@
 from rest_framework import serializers
 from rest_framework_simplejwt.tokens import RefreshToken
 from rest_framework_simplejwt.serializers import TokenObtainPairSerializer
-from apps.users.models import User, Company, Roles, Industry, SubscriptionPlan, Feature, Sector  
+from apps.users.models import User, Company, Roles, Industry, SubscriptionPlan, Feature, Sector, CustomRole
 from apps.construction.models import Cashbox, Department
 from rest_framework.validators import UniqueValidator
 from django.core.mail import send_mail
@@ -9,6 +9,7 @@ from django.conf import settings
 import string
 import secrets
 from django.contrib.auth.password_validation import validate_password
+
 
 # ✅ JWT авторизация с дополнительными данными пользователя
 class CustomTokenObtainPairSerializer(TokenObtainPairSerializer):
@@ -21,10 +22,11 @@ class CustomTokenObtainPairSerializer(TokenObtainPairSerializer):
             'last_name': self.user.last_name,
             'avatar': self.user.avatar,
             'company': self.user.company.name if self.user.company else None,
-            'role': self.user.role
+            'role': self.user.role_display,   # 👈 всегда строковое название роли
         })
         return data
     
+
 class UserSerializer(serializers.ModelSerializer):
     password = serializers.CharField(
         write_only=True,
@@ -32,13 +34,14 @@ class UserSerializer(serializers.ModelSerializer):
         min_length=8,
         style={'input_type': 'password'}
     )
+    role_display = serializers.CharField(source="role_display", read_only=True)
 
     class Meta:
         model = User
         fields = [
             'id', 'email', 'password',
             'first_name', 'last_name', 'avatar',
-            'company', 'role',
+            'company', 'role', 'custom_role', 'role_display',
             'can_view_dashboard', 'can_view_cashbox', 'can_view_departments',
             'can_view_orders', 'can_view_analytics', 'can_view_department_analytics',
             'can_view_products', 'can_view_booking',
@@ -46,7 +49,6 @@ class UserSerializer(serializers.ModelSerializer):
             'can_view_brand_category', 'can_view_settings','can_view_sale',
             'created_at', 'updated_at',
         ]
-
         read_only_fields = ['id', 'created_at', 'updated_at', 'company']
 
     def validate_email(self, value):
@@ -77,7 +79,6 @@ class UserSerializer(serializers.ModelSerializer):
             if field in data:
                 if not isinstance(data[field], bool):
                     raise serializers.ValidationError({field: "Значение должно быть True или False."})
-
                 if current_user and current_user.role == 'manager':
                     raise serializers.ValidationError({field: "Менеджеру запрещено изменять права доступа."})
 
@@ -91,6 +92,7 @@ class UserSerializer(serializers.ModelSerializer):
             instance.set_password(password)
         instance.save()
         return instance
+
 
 class OwnerRegisterSerializer(serializers.ModelSerializer):
     email = serializers.EmailField(
@@ -147,7 +149,7 @@ class OwnerRegisterSerializer(serializers.ModelSerializer):
             first_name=validated_data['first_name'],
             last_name=validated_data['last_name'],
             avatar=validated_data.get('avatar'),
-            role='owner',
+            role=Roles.OWNER,
             is_active=True
         )
 
@@ -187,17 +189,19 @@ class OwnerRegisterSerializer(serializers.ModelSerializer):
 
         return user
 
+
 class EmployeeCreateSerializer(serializers.ModelSerializer):
     email = serializers.EmailField(
         required=True,
         validators=[UniqueValidator(queryset=User.objects.all(), message="Этот email уже используется.")]
     )
-    role = serializers.ChoiceField(choices=Roles.choices)
+    role_display = serializers.CharField(source="role_display", read_only=True)
 
     class Meta:
         model = User
         fields = [
-            'email', 'first_name', 'last_name', 'avatar', 'role',
+            'email', 'first_name', 'last_name', 'avatar',
+            'role', 'custom_role', 'role_display',
             'can_view_dashboard', 'can_view_cashbox', 'can_view_departments',
             'can_view_orders', 'can_view_analytics', 'can_view_department_analytics',
             'can_view_products', 'can_view_booking',
@@ -239,7 +243,8 @@ class EmployeeCreateSerializer(serializers.ModelSerializer):
             first_name=validated_data['first_name'],
             last_name=validated_data['last_name'],
             avatar=validated_data.get('avatar'),
-            role=validated_data['role'],
+            role=validated_data.get('role'),
+            custom_role=validated_data.get('custom_role'),
             company=company,
             is_active=True
         )
@@ -292,19 +297,25 @@ class EmployeeCreateSerializer(serializers.ModelSerializer):
 
 # 🔍 Сериализатор для списка пользователей
 class UserListSerializer(serializers.ModelSerializer):
+    role_display = serializers.CharField(source="role_display", read_only=True)
+
     class Meta:
         model = User
-        fields = ['id', 'email', 'first_name', 'last_name', 'role', 'avatar', 'can_view_dashboard', 'can_view_cashbox', 'can_view_departments',
-            'can_view_orders', 'can_view_analytics', 'can_view_department_analytics',
-            'can_view_products', 'can_view_booking',
-            'can_view_employees', 'can_view_clients',
-            'can_view_brand_category', 'can_view_settings','can_view_sale']
+        fields = ['id', 'email', 'first_name', 'last_name', 'role', 'custom_role', 'role_display', 'avatar',
+                  'can_view_dashboard', 'can_view_cashbox', 'can_view_departments',
+                  'can_view_orders', 'can_view_analytics', 'can_view_department_analytics',
+                  'can_view_products', 'can_view_booking',
+                  'can_view_employees', 'can_view_clients',
+                  'can_view_brand_category', 'can_view_settings','can_view_sale']
+
 
 class UserWithPermissionsSerializer(serializers.ModelSerializer):
+    role_display = serializers.CharField(source="role_display", read_only=True)
+
     class Meta:
         model = User
         fields = [
-            'id', 'email', 'first_name', 'last_name', 'role', 'avatar',
+            'id', 'email', 'first_name', 'last_name', 'role', 'custom_role', 'role_display', 'avatar',
             'can_view_dashboard', 'can_view_cashbox', 'can_view_departments',
             'can_view_orders', 'can_view_analytics', 'can_view_department_analytics',
             'can_view_products', 'can_view_booking',
@@ -317,6 +328,8 @@ class SectorSerializer(serializers.ModelSerializer):
     class Meta:
         model = Sector
         fields = ['id', 'name']
+
+
 # 🔧 Сериализатор для списка видов деятельности
 class IndustrySerializer(serializers.ModelSerializer):
     sectors = SectorSerializer(many=True, read_only=True)
@@ -325,11 +338,12 @@ class IndustrySerializer(serializers.ModelSerializer):
         model = Industry
         fields = ['id', 'name', 'sectors']
 
-        
+
 class FeatureSerializer(serializers.ModelSerializer):
     class Meta:
         model = Feature
         fields = ['id', 'name', 'description']
+
 
 class SubscriptionPlanSerializer(serializers.ModelSerializer):
     features = FeatureSerializer(many=True)  # Сериализатор для списка функций
@@ -365,17 +379,19 @@ class CompanySerializer(serializers.ModelSerializer):
 
 
 class EmployeeUpdateSerializer(serializers.ModelSerializer):
+    role_display = serializers.CharField(source="role_display", read_only=True)
+
     class Meta:
         model = User
         fields = [
-            'id', 'first_name', 'last_name', 'avatar', 'role',
+            'id', 'first_name', 'last_name', 'avatar',
+            'role', 'custom_role', 'role_display',
             'can_view_dashboard', 'can_view_cashbox', 'can_view_departments',
             'can_view_orders', 'can_view_analytics', 'can_view_department_analytics',
             'can_view_products', 'can_view_booking',
             'can_view_employees', 'can_view_clients',
             'can_view_brand_category', 'can_view_settings','can_view_sale'
         ]
-
         read_only_fields = ['id']
 
     def validate(self, data):

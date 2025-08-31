@@ -236,6 +236,14 @@ class ProductSerializer(serializers.ModelSerializer):
     brand_name = serializers.CharField(write_only=True, required=False, allow_blank=True)
     category_name = serializers.CharField(write_only=True, required=False, allow_blank=True)
 
+    # ✅ клиент (может быть пустым)
+    client = serializers.PrimaryKeyRelatedField(
+        queryset=Client.objects.all(),
+        required=False,
+        allow_null=True
+    )
+    client_name = serializers.CharField(source="client.full_name", read_only=True)
+
     class Meta:
         model = Product
         fields = [
@@ -243,11 +251,12 @@ class ProductSerializer(serializers.ModelSerializer):
             'brand', 'brand_name',
             'category', 'category_name',
             'quantity', 'price', 'company',
+            'client', 'client_name',   # ✅ добавили
             'created_at', 'updated_at'
         ]
         read_only_fields = [
             'id', 'created_at', 'updated_at',
-            'company', 'name', 'brand', 'category'
+            'company', 'name', 'brand', 'category', 'client_name'
         ]
         extra_kwargs = {
             'price': {'required': False, 'default': 0},
@@ -296,6 +305,7 @@ class ProductSerializer(serializers.ModelSerializer):
             category=category,
             price=validated_data.get('price', 0),
             quantity=validated_data.get('quantity', 0),
+            client=validated_data.get('client')   # ✅ сохраняем клиента, если передан
         )
 
 class ReviewSerializer(serializers.ModelSerializer):

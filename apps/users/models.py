@@ -37,10 +37,8 @@ class SubscriptionPlan(models.Model):
 
 
 class Roles(models.TextChoices):
-    ADMIN = 'admin', 'Администратор'
-    MANAGER = 'manager', 'Менеджер'
-    USER = 'user', 'Сотрудник'
-    OWNER = 'owner', "Владелец"
+    ADMIN = "admin", "Администратор"
+    OWNER = "owner", "Владелец"
 
 class Sector(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
@@ -65,7 +63,20 @@ class Industry(models.Model):
         verbose_name = "Вид деятельности"
         verbose_name_plural = "Виды деятельности"
 
+class CustomRole(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    company = models.ForeignKey('Company', on_delete=models.CASCADE, null=True, blank=True, related_name='custom_roles', verbose_name='Компания')
+    name = models.CharField(max_length=64, verbose_name="Название роли")
 
+    class Meta:
+        verbose_name = "Доп. роль"
+        verbose_name_plural = "Доп. роли"
+        unique_together = ("company", "name")
+
+    def __str__(self):
+        return self.name
+    
+    
 class User(AbstractBaseUser, PermissionsMixin):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False, verbose_name='ID')
     email = models.EmailField(unique=True, verbose_name='Email')
@@ -74,16 +85,34 @@ class User(AbstractBaseUser, PermissionsMixin):
     last_name = models.CharField(max_length=64, verbose_name='Фамилия')
     avatar = models.URLField(blank=True, null=True, verbose_name='Аватар (URL)')
 
-    company = models.ForeignKey('Company', on_delete=models.CASCADE, null=True, blank=True, related_name='employees', verbose_name='Компания')
+    company = models.ForeignKey(
+        "Company",
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
+        related_name="employees",
+        verbose_name="Компания"
+    )
+
+    # системная роль
     role = models.CharField(
         max_length=32,
         choices=Roles.choices,
         blank=True,
         null=True,
-        verbose_name='Роль сотрудника'
+        verbose_name='Системная роль'
+    )
+    # кастомная роль
+    custom_role = models.ForeignKey(
+        CustomRole,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="users",
+        verbose_name="Кастомная роль"
     )
 
-    # 📌 Новые поля доступа
+    # 📌 Права доступа
     can_view_dashboard = models.BooleanField(default=False, blank=True, null=True, verbose_name='Доступ к обзору')
     can_view_cashbox = models.BooleanField(default=False, blank=True, null=True, verbose_name='Доступ к кассе')
     can_view_departments = models.BooleanField(default=False, blank=True, null=True, verbose_name='Доступ к отделам')
@@ -97,8 +126,7 @@ class User(AbstractBaseUser, PermissionsMixin):
     can_view_brand_category = models.BooleanField(default=False, blank=True, null=True, verbose_name='Доступ к брендам и категориям')
     can_view_settings = models.BooleanField(default=False, blank=True, null=True, verbose_name='Доступ к настройкам')
     can_view_sale = models.BooleanField(default=False, blank=True, null=True, verbose_name='Доступ к продажам')
-    
-    
+
     created_at = models.DateTimeField(auto_now_add=True, verbose_name='Дата создания')
     updated_at = models.DateTimeField(auto_now=True, verbose_name='Дата обновления')
 
@@ -116,6 +144,20 @@ class User(AbstractBaseUser, PermissionsMixin):
 
     def __str__(self):
         return self.email
+
+    @property
+    def role_display(self) -> str:
+        """
+        Возвращает строковое представление роли:
+        - если системная (admin/owner) → её перевод
+        - если кастомная → её название
+        - иначе 'Без роли'
+        """
+        if self.role:
+            return self.get_role_display()
+        if self.custom_role:
+            return self.custom_role.name
+        return "Без роли"
 
 # Модель Company (компания)
 class Company(models.Model):

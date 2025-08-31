@@ -14,30 +14,41 @@ from .views import (
     SectorListAPIView,
     EmployeeDetailAPIView,
     ChangePasswordView,
-    CompanyUpdateView
+    CompanyUpdateView,
+    # 👇 новые для ролей
+    RoleListAPIView,
+    CustomRoleCreateAPIView,
+    CustomRoleDestroyAPIView,
 )
 
 urlpatterns = [
+    # 🔐 Авторизация / регистрация
     path('auth/register/', RegisterAPIView.as_view(), name='user-register'),
     path('auth/login/', CustomTokenObtainPairView.as_view(), name='token_obtain_pair'),
     path('auth/refresh/', TokenRefreshView.as_view(), name='token_refresh'),
-    
+
+    # ⚙️ Настройки
     path('settings/change-password/', ChangePasswordView.as_view(), name='change-password'),
     path('settings/company/', CompanyUpdateView.as_view(), name='company-update'),
-    # Работа со своими сотрудниками
+
+    # 👥 Работа с сотрудниками
     path('employees/', EmployeeListAPIView.as_view(), name='employee-list'),
     path('employees/create/', EmployeeCreateAPIView.as_view(), name='employee-create'),
     path('employees/<uuid:pk>/', EmployeeDetailAPIView.as_view(), name='employee-detail'),
     path('employees/<uuid:pk>/delete/', EmployeeDestroyAPIView.as_view(), name='employee-delete'),
 
-    # Личный кабинет
+    # 👤 Личный кабинет
     path('profile/', CurrentUserAPIView.as_view(), name='user-me'),
 
-    # Справочник индустрий (отраслей)
+    # 📚 Справочники
     path('industries/', IndustryListAPIView.as_view(), name='industry-list'),
     path('sectors/', SectorListAPIView.as_view(), name='sector-list'),
     path('subscription-plans/', SubscriptionPlanListAPIView.as_view(), name='subscription-plan-list'),
     path('features/', FeatureListAPIView.as_view(), name='feature-list'),
     path('company/', CompanyDetailAPIView.as_view(), name='company-detail'),
-    
+
+    # 🎭 Роли
+    path('roles/', RoleListAPIView.as_view(), name='role-list'),  # системные + кастомные
+    path('roles/custom/', CustomRoleCreateAPIView.as_view(), name='custom-role-create'),
+    path('roles/custom/<uuid:pk>/', CustomRoleDestroyAPIView.as_view(), name='custom-role-delete'),
 ]
