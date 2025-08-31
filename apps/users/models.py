@@ -94,7 +94,6 @@ class User(AbstractBaseUser, PermissionsMixin):
         verbose_name="Компания"
     )
 
-    # системная роль
     role = models.CharField(
         max_length=32,
         choices=Roles.choices,
