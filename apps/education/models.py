@@ -1,6 +1,6 @@
 import uuid
 from django.db import models
-from apps.users.models import Company
+from apps.users.models import Company, User
 from django.core.exceptions import ValidationError
 
 
@@ -50,25 +50,8 @@ class Course(models.Model):
         return self.title
 
 
-class Teacher(models.Model):
-    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    company = models.ForeignKey(
-        Company, on_delete=models.CASCADE, related_name='teachers', verbose_name='Организация'
-    )
-    name = models.CharField(max_length=255, verbose_name="Имя")
-    phone = models.CharField(max_length=20, blank=True, null=True, verbose_name="Телефон")
-    subject = models.CharField(max_length=255, blank=True, null=True, verbose_name="Предмет")
-
-    class Meta:
-        verbose_name = "Преподаватель"
-        verbose_name_plural = "Преподаватели"
-        ordering = ["name"]
-
-    def __str__(self):
-        return f"{self.name} ({self.subject})" if self.subject else self.name
-
-
 class Group(models.Model):
+    """Группа без привязки к учителю"""
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     company = models.ForeignKey(
         Company, on_delete=models.CASCADE, related_name='groups', verbose_name='Организация'
@@ -77,10 +60,6 @@ class Group(models.Model):
         Course, on_delete=models.CASCADE, related_name="groups", verbose_name="Курс"
     )
     name = models.CharField("Название группы", max_length=255)
-    teacher = models.ForeignKey(
-        Teacher, on_delete=models.SET_NULL, null=True, blank=True,
-        related_name="groups", verbose_name="Основной преподаватель"
-    )
 
     class Meta:
         verbose_name = "Группа"
@@ -134,7 +113,7 @@ class Lesson(models.Model):
         Group, on_delete=models.CASCADE, related_name="lessons", verbose_name="Группа"
     )
     teacher = models.ForeignKey(
-        Teacher, on_delete=models.SET_NULL, null=True, blank=True,
+        User, on_delete=models.SET_NULL, null=True, blank=True,
         related_name="lessons", verbose_name="Преподаватель"
     )
     date = models.DateField("Дата")

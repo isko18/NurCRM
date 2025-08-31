@@ -138,6 +138,7 @@ class Staff(models.Model):
         BARTENDER = "bartender", "Бармен"
         CASHIER = "cashier", "Кассир"
         COOK = "cook", "Повар"
+        
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     company = models.ForeignKey(
         Company, on_delete=models.CASCADE, related_name='cafe_staff', verbose_name='Компания'

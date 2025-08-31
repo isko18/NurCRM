@@ -1,9 +1,8 @@
-# admin.py
 from django.contrib import admin
 from django.utils.html import format_html
 
 from .models import (
-    Lead, Course, Teacher, Group, Student, Lesson,
+    Lead, Course, Group, Student, Lesson,
     Folder, Document,
 )
 
@@ -22,30 +21,22 @@ class CompanyScopedAdmin(admin.ModelAdmin):
         return qs.none()
 
     def save_model(self, request, obj, form, change):
-        # Проставляем компанию, если у пользователя она есть и объект ещё не привязан
         company = getattr(request.user, "company", None) or getattr(request.user, "owned_company", None)
         if company and not getattr(obj, "company_id", None):
             obj.company = company
         super().save_model(request, obj, form, change)
 
     def formfield_for_foreignkey(self, db_field, request, **kwargs):
-        """
-        Ограничиваем ForeignKey выбор записями своей компании, если у FK-модели есть поле company.
-        """
         user = request.user
         if not user.is_superuser:
             company = getattr(user, "company", None) or getattr(user, "owned_company", None)
             if company:
                 rel_model = db_field.remote_field.model
-                # у модели есть поле company?
                 if any(f.name == "company" for f in rel_model._meta.get_fields() if hasattr(f, "name")):
                     kwargs["queryset"] = rel_model.objects.filter(company=company)
         return super().formfield_for_foreignkey(db_field, request, **kwargs)
 
     def get_list_display(self, request):
-        """
-        Показываем колонку company только суперпользователю (удобно при поддержке).
-        """
         base = list(getattr(self, "list_display", ()))
         if request.user.is_superuser:
             if "company" not in base and hasattr(self.model, "company"):
@@ -69,25 +60,16 @@ class LeadAdmin(CompanyScopedAdmin):
 class CourseAdmin(CompanyScopedAdmin):
     list_display = ("title", "price_per_month")
     search_fields = ("title",)
-    list_filter = ()
-
-
-# ===== Teacher =====
-@admin.register(Teacher)
-class TeacherAdmin(CompanyScopedAdmin):
-    list_display = ("name", "subject", "phone")
-    search_fields = ("name", "subject", "phone")
-    list_filter = ("subject",)
 
 
 # ===== Group =====
 @admin.register(Group)
 class GroupAdmin(CompanyScopedAdmin):
-    list_display = ("name", "course", "teacher")
-    search_fields = ("name", "course__title", "teacher__name")
+    list_display = ("name", "course")
+    search_fields = ("name", "course__title")
     list_filter = ("course",)
-    list_select_related = ("course", "teacher")
-    autocomplete_fields = ("course", "teacher")
+    list_select_related = ("course",)
+    autocomplete_fields = ("course",)
 
 
 # ===== Student =====
@@ -104,8 +86,8 @@ class StudentAdmin(CompanyScopedAdmin):
 @admin.register(Lesson)
 class LessonAdmin(CompanyScopedAdmin):
     list_display = ("group", "teacher", "date", "time", "duration", "classroom")
-    list_filter = ("date", "teacher", "group")
-    search_fields = ("group__name", "teacher__name", "classroom")
+    list_filter = ("date", "group", "teacher")
+    search_fields = ("group__name", "teacher__first_name", "teacher__last_name", "classroom")
     list_select_related = ("group", "teacher")
     autocomplete_fields = ("group", "teacher")
     date_hierarchy = "date"

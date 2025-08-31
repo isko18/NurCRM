@@ -101,12 +101,11 @@ class AppointmentAdmin(CompanyScopedAdmin):
     list_filter = ("status", "barber")
     search_fields = (
         "client__full_name", "client__phone",
-        "barber__full_name",
+        "barber__first_name", "barber__last_name", "barber__email",
         "service__name", "comment",
     )
     list_select_related = ("client", "barber", "service", "company")
     autocomplete_fields = ("client", "barber", "service")
-
 
 # ===== Folder =====
 @admin.register(Folder)
