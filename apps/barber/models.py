@@ -3,6 +3,7 @@ from datetime import timedelta
 from django.core.exceptions import ValidationError
 from django.db import models
 from django.utils import timezone
+from django.conf import settings
 
 from apps.users.models import Company  # поправьте путь при необходимости
 
@@ -101,52 +102,67 @@ class Client(models.Model):
 
 class Appointment(models.Model):
     """Запись на услугу."""
+
     class Status(models.TextChoices):
-        BOOKED = 'booked', 'Забронировано'
-        CONFIRMED = 'confirmed', 'Подтверждено'
-        COMPLETED = 'completed', 'Завершено'
-        CANCELED = 'canceled', 'Отменено'
-        NO_SHOW = 'no_show', 'Не пришёл'
+        BOOKED = "booked", "Забронировано"
+        CONFIRMED = "confirmed", "Подтверждено"
+        COMPLETED = "completed", "Завершено"
+        CANCELED = "canceled", "Отменено"
+        NO_SHOW = "no_show", "Не пришёл"
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     company = models.ForeignKey(
-        Company, on_delete=models.CASCADE, related_name='appointments', verbose_name='Компания'
+        Company,
+        on_delete=models.CASCADE,
+        related_name="appointments",
+        verbose_name="Компания",
     )
     client = models.ForeignKey(
-        Client, on_delete=models.PROTECT, related_name='appointments', verbose_name='Клиент'
+        Client,
+        on_delete=models.PROTECT,
+        related_name="appointments",
+        verbose_name="Клиент",
     )
+    # 🔑 теперь мастер — это User
     barber = models.ForeignKey(
-        BarberProfile, on_delete=models.PROTECT, related_name='appointments', verbose_name='Мастер'
+        settings.AUTH_USER_MODEL,
+        on_delete=models.PROTECT,
+        related_name="appointments",
+        verbose_name="Мастер",
     )
     service = models.ForeignKey(
-        Service, on_delete=models.PROTECT, related_name='appointments', verbose_name='Услуга'
+        Service,
+        on_delete=models.PROTECT,
+        related_name="appointments",
+        verbose_name="Услуга",
     )
 
-    start_at = models.DateTimeField(verbose_name='Начало')
-    end_at = models.DateTimeField(verbose_name='Конец')
+    start_at = models.DateTimeField(verbose_name="Начало")
+    end_at = models.DateTimeField(verbose_name="Конец")
     status = models.CharField(
         max_length=16, choices=Status.choices, default=Status.BOOKED, db_index=True
     )
-    comment = models.TextField(blank=True, null=True, verbose_name='Комментарий')
+    comment = models.TextField(blank=True, null=True, verbose_name="Комментарий")
 
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
-        verbose_name = 'Запись'
-        verbose_name_plural = 'Записи'
+        verbose_name = "Запись"
+        verbose_name_plural = "Записи"
         indexes = [
-            models.Index(fields=['company', 'start_at']),
-            models.Index(fields=['status']),
-            models.Index(fields=['barber', 'start_at']),
+            models.Index(fields=["company", "start_at"]),
+            models.Index(fields=["status"]),
+            models.Index(fields=["barber", "start_at"]),
         ]
         constraints = [
             models.CheckConstraint(
-                check=models.Q(end_at__gt=models.F('start_at')), name='appointment_end_after_start'
+                check=models.Q(end_at__gt=models.F("start_at")),
+                name="appointment_end_after_start",
             ),
         ]
 
     def __str__(self):
-        return f'{self.client} → {self.service} ({self.start_at:%Y-%m-%d %H:%M})'
+        return f"{self.client} → {self.service} ({self.start_at:%Y-%m-%d %H:%M})"
 
     def clean(self):
         # проверка пересечений по мастеру
@@ -159,22 +175,21 @@ class Appointment(models.Model):
                 end_at__gt=self.start_at,
             )
             if overlaps.exists():
-                raise ValidationError('У мастера уже есть запись в это время.')
+                raise ValidationError("У мастера уже есть запись в это время.")
 
         # проверка совпадения компании
         if self.company_id:
             if self.client and self.client.company_id != self.company_id:
-                raise ValidationError('Клиент принадлежит другой компании.')
+                raise ValidationError("Клиент принадлежит другой компании.")
             if self.barber and self.barber.company_id != self.company_id:
-                raise ValidationError('Мастер принадлежит другой компании.')
+                raise ValidationError("Мастер принадлежит другой компании.")
             if self.service and self.service.company_id != self.company_id:
-                raise ValidationError('Услуга принадлежит другой компании.')
+                raise ValidationError("Услуга принадлежит другой компании.")
 
     def save(self, *args, **kwargs):
         self.full_clean()
         return super().save(*args, **kwargs)
-
-
+    
 class Folder(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     company = models.ForeignKey(

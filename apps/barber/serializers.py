@@ -63,7 +63,7 @@ class AppointmentSerializer(CompanyReadOnlyMixin, serializers.ModelSerializer):
 
     # Для удобного отображения
     client_name = serializers.CharField(source='client.full_name', read_only=True)
-    barber_name = serializers.CharField(source='barber.full_name', read_only=True)
+    barber_name = serializers.SerializerMethodField()
     service_name = serializers.CharField(source='service.name', read_only=True)
 
     class Meta:
@@ -76,11 +76,19 @@ class AppointmentSerializer(CompanyReadOnlyMixin, serializers.ModelSerializer):
         ]
         read_only_fields = ['id', 'created_at', 'company']
 
+    def get_barber_name(self, obj):
+        """Выводим красивое имя пользователя-барбера"""
+        if not obj.barber:
+            return None
+        if obj.barber.first_name or obj.barber.last_name:
+            return f"{obj.barber.first_name or ''} {obj.barber.last_name or ''}".strip()
+        return obj.barber.email  # fallback
+
     def validate(self, attrs):
         """
         Проверки перед сохранением:
-        - принадлежность client/barber/service той же компании, что и у пользователя;
-        - доменные проверки через model.clean()
+        - client/barber/service должны принадлежать той же компании, что и пользователь
+        - дополнительные проверки из model.clean()
         """
         request = self.context.get('request')
         user_company = getattr(getattr(request, 'user', None), 'company', None)
@@ -104,6 +112,7 @@ class AppointmentSerializer(CompanyReadOnlyMixin, serializers.ModelSerializer):
             raise serializers.ValidationError(str(e))
 
         return attrs
+
 
 
 class FolderSerializer(CompanyReadOnlyMixin, serializers.ModelSerializer):
