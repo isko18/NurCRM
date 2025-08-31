@@ -261,7 +261,20 @@ class ProductBrand(MPTTModel):
 class Product(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     
-    company = models.ForeignKey(Company, on_delete=models.CASCADE, related_name='products', verbose_name='Компания')
+    company = models.ForeignKey(
+        Company,
+        on_delete=models.CASCADE,
+        related_name='products',
+        verbose_name='Компания'
+    )
+    client = models.ForeignKey(  
+        "Client",
+        on_delete=models.SET_NULL, 
+        null=True,
+        blank=True,
+        related_name="products",
+        verbose_name="Клиент"
+    )
     name = models.CharField(max_length=255)
     barcode = models.CharField(max_length=64, null=True, blank=True)
     brand = models.ForeignKey(ProductBrand, on_delete=models.SET_NULL, null=True, blank=True)
