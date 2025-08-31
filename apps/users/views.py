@@ -216,7 +216,7 @@ class CustomRoleCreateAPIView(generics.CreateAPIView):
 
 
 # ❌ Удаление кастомной роли
-class CustomRoleDestroyAPIView(generics.DestroyAPIView):
+class CustomRoleDetailAPIView(generics.RetrieveUpdateDestroyAPIView):
     serializer_class = CustomRoleSerializer
     permission_classes = [IsAuthenticated, IsCompanyOwner]
 
@@ -224,5 +224,9 @@ class CustomRoleDestroyAPIView(generics.DestroyAPIView):
         if getattr(self, 'swagger_fake_view', False):
             return CustomRole.objects.none()
 
-        company = getattr(self.request.user, "owned_company", None) or self.request.user.company
+        user = self.request.user
+        company = getattr(user, "owned_company", None) or getattr(user, "company", None)
+        if not company:
+            return CustomRole.objects.none()
+
         return CustomRole.objects.filter(company=company)
