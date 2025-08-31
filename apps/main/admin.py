@@ -6,12 +6,15 @@ from apps.main.models import (
     Integration, Analytics, Order, OrderItem,
     Product, Review, Notification, Event,
     Warehouse, WarehouseEvent,
-    ProductCategory, ProductBrand, Client, GlobalProduct, GlobalBrand, GlobalCategory, CartItem, Cart, Sale, SaleItem, ClientDeal, Bid
+    ProductCategory, ProductBrand, Client, GlobalProduct, GlobalBrand, GlobalCategory,
+    CartItem, Cart, Sale, SaleItem, ClientDeal, Bid, SocialApplications
 )
 
 
 admin.site.register(Bid)
 
+
+# ===== CONTACT =====
 @admin.register(Contact)
 class ContactAdmin(admin.ModelAdmin):
     list_display = ('name', 'email', 'company', 'department', 'owner', 'created_at')
@@ -20,6 +23,7 @@ class ContactAdmin(admin.ModelAdmin):
     readonly_fields = ('created_at', 'updated_at')
 
 
+# ===== PIPELINE =====
 @admin.register(Pipeline)
 class PipelineAdmin(admin.ModelAdmin):
     list_display = ('name', 'owner', 'created_at')
@@ -27,6 +31,7 @@ class PipelineAdmin(admin.ModelAdmin):
     readonly_fields = ('created_at', 'updated_at')
 
 
+# ===== DEAL =====
 @admin.register(Deal)
 class DealAdmin(admin.ModelAdmin):
     list_display = ('title', 'status', 'value', 'pipeline', 'stage', 'contact', 'assigned_to', 'created_at')
@@ -35,6 +40,7 @@ class DealAdmin(admin.ModelAdmin):
     readonly_fields = ('created_at', 'updated_at')
 
 
+# ===== TASK =====
 @admin.register(Task)
 class TaskAdmin(admin.ModelAdmin):
     list_display = ('title', 'status', 'due_date', 'assigned_to', 'deal')
@@ -43,6 +49,7 @@ class TaskAdmin(admin.ModelAdmin):
     readonly_fields = ('created_at', 'updated_at')
 
 
+# ===== INTEGRATION =====
 @admin.register(Integration)
 class IntegrationAdmin(admin.ModelAdmin):
     list_display = ('type', 'status', 'created_at')
@@ -50,6 +57,7 @@ class IntegrationAdmin(admin.ModelAdmin):
     readonly_fields = ('created_at', 'updated_at')
 
 
+# ===== ANALYTICS =====
 @admin.register(Analytics)
 class AnalyticsAdmin(admin.ModelAdmin):
     list_display = ('type', 'created_at')
@@ -57,51 +65,50 @@ class AnalyticsAdmin(admin.ModelAdmin):
     readonly_fields = ('created_at',)
 
 
+# ===== ORDER =====
 class OrderItemInline(admin.TabularInline):
     model = OrderItem
     extra = 1
     readonly_fields = ('total',)
     autocomplete_fields = ('product',)
 
-    def save_new_objects(self, formset, commit=True):
+    def save_formset(self, request, form, formset, change):
         instances = formset.save(commit=False)
         for obj in instances:
-            # Установить цену, если не задана
             obj.price = obj.product.price
             obj.total = obj.price * obj.quantity
 
-            # Проверка на остаток
+            # Проверка остатка
             if obj.product.quantity < obj.quantity:
                 raise ValueError(f"Недостаточно товара '{obj.product.name}' на складе")
 
-            # Вычесть количество
+            # Обновляем остаток
             obj.product.quantity -= obj.quantity
             obj.product.save()
-
-            if commit:
-                obj.save()
-
+            obj.save()
         formset.save_m2m()
 
 
-# @admin.register(Order)
-# class OrderAdmin(admin.ModelAdmin):
-#     list_display = ('order_number', 'customer_name', 'status', 'total_display', 'total_quantity', 'department', 'date_ordered')
-#     list_filter = ('status', 'department')
-#     search_fields = ('order_number', 'customer_name')
-#     readonly_fields = ('created_at', 'updated_at')
-#     inlines = [OrderItemInline]
+@admin.register(Order)
+class OrderAdmin(admin.ModelAdmin):
+    list_display = ('order_number', 'customer_name', 'status', 'total_display', 'total_quantity', 'department', 'date_ordered')
+    list_filter = ('status', 'department')
+    search_fields = ('order_number', 'customer_name')
+    readonly_fields = ('created_at', 'updated_at')
+    inlines = [OrderItemInline]
 
-#     def total_display(self, obj):
-#         return f"{obj.total:.2f}"
-#     total_display.short_description = 'Сумма'
+    def total_display(self, obj):
+        return f"{obj.total:.2f}"
+    total_display.short_description = 'Сумма'
 
 
+# ===== PRODUCT =====
 @admin.register(Product)
 class ProductAdmin(admin.ModelAdmin):
     list_display = ('name', 'barcode', 'price', 'quantity', 'brand', 'category')
     search_fields = ('name', 'barcode')
-    
+
+
 admin.site.register(GlobalProduct)
 admin.site.register(GlobalCategory)
 admin.site.register(GlobalBrand)
@@ -109,13 +116,11 @@ admin.site.register(ProductBrand)
 admin.site.register(ProductCategory)
 
 
+# ===== CART =====
 class CartItemInline(admin.TabularInline):
     model = CartItem
     extra = 0
-    # Показываем только чтение; добавление позиций через POS, а не через админку
     readonly_fields = ("product", "quantity", "unit_price", "line_total")
-    # НЕ добавляем 'line_total' в fields! Оставляем Django выбрать поля формы сам.
-    # fields = ("product", "quantity", "unit_price")  # <- можно явно указать, но без line_total
 
     def line_total(self, obj):
         if not obj or obj.unit_price is None or obj.quantity is None:
@@ -125,6 +130,8 @@ class CartItemInline(admin.TabularInline):
         except Exception:
             return "-"
     line_total.short_description = "Сумма"
+    line_total.admin_order_field = "unit_price"
+
 
 @admin.register(Cart)
 class CartAdmin(admin.ModelAdmin):
@@ -148,9 +155,7 @@ class SaleItemInline(admin.TabularInline):
     model = SaleItem
     extra = 0
     can_delete = False
-    # Эти поля у нас снапшоты — делаем их read-only
     readonly_fields = ("product", "name_snapshot", "barcode_snapshot", "unit_price", "quantity", "line_total")
-    # НЕ указываем 'line_total' в fields!
 
     def line_total(self, obj):
         if not obj or obj.unit_price is None or obj.quantity is None:
@@ -160,22 +165,22 @@ class SaleItemInline(admin.TabularInline):
         except Exception:
             return "-"
     line_total.short_description = "Сумма"
+    line_total.admin_order_field = "unit_price"
+
 
 @admin.register(Sale)
 class SaleAdmin(admin.ModelAdmin):
     list_display = (
-        "id", "company", "user", "status",
+        "id", "company", "user", "client", "status",
         "subtotal", "discount_total", "tax_total", "total",
         "created_at", "paid_at",
     )
     list_filter = ("company", "status", "created_at", "paid_at")
-    search_fields = ("id", "user__username", "user__email")
+    search_fields = ("id", "user__username", "user__email", "client__full_name", "client__phone")
     inlines = [SaleItemInline]
 
-    # Если продажи создаются только через POS — можно запретить создание в админке:
-    # def has_add_permission(self, request):
-    #     return False
 
+# ===== REVIEW =====
 @admin.register(Review)
 class ReviewAdmin(admin.ModelAdmin):
     list_display = ('user', 'rating', 'created_at')
@@ -184,6 +189,7 @@ class ReviewAdmin(admin.ModelAdmin):
     readonly_fields = ('created_at', 'updated_at')
 
 
+# ===== NOTIFICATION =====
 @admin.register(Notification)
 class NotificationAdmin(admin.ModelAdmin):
     list_display = ('user', 'message', 'is_read', 'created_at')
@@ -192,6 +198,7 @@ class NotificationAdmin(admin.ModelAdmin):
     readonly_fields = ('created_at',)
 
 
+# ===== EVENT =====
 @admin.register(Event)
 class EventAdmin(admin.ModelAdmin):
     list_display = ('title', 'datetime', 'company', 'created_at')
@@ -201,6 +208,7 @@ class EventAdmin(admin.ModelAdmin):
     readonly_fields = ('created_at', 'updated_at')
 
 
+# ===== WAREHOUSE =====
 @admin.register(Warehouse)
 class WarehouseAdmin(admin.ModelAdmin):
     list_display = ('name', 'location', 'company_name', 'created_at')
@@ -228,6 +236,7 @@ class WarehouseEventAdmin(admin.ModelAdmin):
     warehouse_name.short_description = 'Склад'
 
 
+# ===== ORDER ITEM =====
 @admin.register(OrderItem)
 class OrderItemAdmin(admin.ModelAdmin):
     list_display = ('order', 'product', 'quantity', 'price', 'total')
@@ -235,11 +244,8 @@ class OrderItemAdmin(admin.ModelAdmin):
     readonly_fields = ('price', 'total')
 
 
+# ===== BASE COMPANY FILTERED =====
 class CompanyFilteredAdmin(admin.ModelAdmin):
-    """
-    Ограничивает queryset записями компании пользователя (кроме суперпользователя)
-    и проставляет company при создании.
-    """
     def get_queryset(self, request):
         qs = super().get_queryset(request)
         if request.user.is_superuser:
@@ -256,13 +262,22 @@ class CompanyFilteredAdmin(admin.ModelAdmin):
 
     def get_readonly_fields(self, request, obj=None):
         ro = list(super().get_readonly_fields(request, obj))
-        # company редактируем только суперпользователю
         if not request.user.is_superuser:
             ro.append("company")
         return ro
 
+    def has_change_permission(self, request, obj=None):
+        if not request.user.is_superuser and obj and obj.company_id != request.user.company_id:
+            return False
+        return super().has_change_permission(request, obj)
 
-# --- Inline для сделок внутри клиента ---
+    def has_delete_permission(self, request, obj=None):
+        if not request.user.is_superuser and obj and obj.company_id != request.user.company_id:
+            return False
+        return super().has_delete_permission(request, obj)
+
+
+# ===== CLIENT & DEAL =====
 class ClientDealInline(admin.TabularInline):
     model = ClientDeal
     extra = 0
@@ -283,9 +298,6 @@ class ClientDealInline(admin.TabularInline):
         return True
 
     def save_new_instance(self, form, commit=True):
-        """
-        (используется Django >=5 для inline formset) — проставим company из родителя.
-        """
         instance = super().save_new_instance(form, commit=False)
         if not getattr(instance, "company_id", None) and instance.client_id:
             instance.company_id = instance.client.company_id
@@ -303,7 +315,7 @@ class ClientDealInline(admin.TabularInline):
 
 @admin.register(Client)
 class ClientAdmin(CompanyFilteredAdmin):
-    list_display = ("full_name","type", "phone", "email", "date", "status", "created_at")
+    list_display = ("full_name", "type", "phone", "email", "date", "status", "created_at")
     list_filter = ("status", ("date", admin.DateFieldListFilter), ("created_at", admin.DateFieldListFilter))
     search_fields = ("full_name", "phone", "email")
     readonly_fields = ("created_at", "updated_at")
@@ -311,10 +323,6 @@ class ClientAdmin(CompanyFilteredAdmin):
     ordering = ("-created_at",)
     inlines = [ClientDealInline]
     list_per_page = 50
-
-    # чтобы в форме нельзя было выбрать клиентов другой компании (на всякий случай для FK)
-    def formfield_for_foreignkey(self, db_field, request, **kwargs):
-        return super().formfield_for_foreignkey(db_field, request, **kwargs)
 
 
 @admin.register(ClientDeal)
@@ -329,11 +337,17 @@ class ClientDealAdmin(CompanyFilteredAdmin):
     autocomplete_fields = ("client",)
 
     def formfield_for_foreignkey(self, db_field, request, **kwargs):
-        """
-        Фильтруем список клиентов по компании пользователя.
-        """
         if db_field.name == "client" and not request.user.is_superuser:
             user_company_id = getattr(getattr(request, "user", None), "company_id", None)
             if user_company_id:
                 kwargs["queryset"] = Client.objects.filter(company_id=user_company_id)
         return super().formfield_for_foreignkey(db_field, request, **kwargs)
+
+
+# ===== SOCIAL APPLICATIONS =====
+@admin.register(SocialApplications)
+class SocialApplicationsAdmin(admin.ModelAdmin):
+    list_display = ("company", "status", "created_at")
+    list_filter = ("status",)
+    search_fields = ("company", "text")
+    readonly_fields = ("created_at",)
