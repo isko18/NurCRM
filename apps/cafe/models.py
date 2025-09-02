@@ -2,8 +2,36 @@ from django.db import models
 from apps.users.models import Company
 import uuid
 from django.conf import settings
+from django.core.exceptions import ValidationError
+
 
 # Create your models here.
+class CafeClient(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    company = models.ForeignKey(
+        Company,
+        on_delete=models.CASCADE,
+        related_name='cafe_clients',          # уникальное имя обратной связи, чтобы не конфликтовать
+        related_query_name='cafe_client',
+        verbose_name='Компания',
+    )
+    name = models.CharField('Имя', max_length=255, blank=True)
+    phone = models.CharField('Телефон', max_length=32, blank=True)
+    notes = models.TextField('Заметки', blank=True)
+
+    class Meta:
+        verbose_name = 'Клиент кафе'
+        verbose_name_plural = 'Клиенты кафе'
+        unique_together = (('company', 'phone'),)   # в пределах компании телефон уникален
+        indexes = [
+            models.Index(fields=['company', 'phone']),
+            models.Index(fields=['company', 'name']),
+        ]
+
+    def __str__(self):
+        return self.name or self.phone or f'Клиент {str(self.id)[:8]}'
+
+
 class Zone(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
 
@@ -190,7 +218,6 @@ class Ingredient(models.Model):
         return f"{self.product.title} ({self.amount} {self.product.unit})"
     
     
-    
 class Order(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     company = models.ForeignKey(
@@ -199,8 +226,17 @@ class Order(models.Model):
     table = models.ForeignKey(
         Table, on_delete=models.PROTECT, related_name='orders', verbose_name='Стол'
     )
+    # ↓↓↓ НОВОЕ ПОЛЕ: клиент заказа
+    client = models.ForeignKey(
+        CafeClient,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='orders',
+        verbose_name='Клиент',
+    )
     waiter = models.ForeignKey(
-        settings.AUTH_USER_MODEL,  # ✅ теперь это User
+        settings.AUTH_USER_MODEL,
         on_delete=models.SET_NULL,
         null=True,
         blank=True,
@@ -216,10 +252,19 @@ class Order(models.Model):
         ordering = ['-created_at']
         indexes = [
             models.Index(fields=['company', 'created_at']),
+            models.Index(fields=['client', 'created_at']),  # ускоряет выборки по клиенту
         ]
 
     def __str__(self):
         return f'Order {str(self.id)[:8]} — {self.table}'
+
+    def clean(self):
+        # согласованность компании у связанных сущностей
+        if self.company_id:
+            if self.table and self.table.company_id != self.company_id:
+                raise ValidationError({'table': 'Стол принадлежит другой компании.'})
+            if self.client and self.client.company_id != self.company_id:
+                raise ValidationError({'client': 'Клиент принадлежит другой компании.'})
 
 class OrderItem(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
