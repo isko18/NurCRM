@@ -1,9 +1,11 @@
 # serializers.py
-from django.conf import settings
 from django.contrib.auth import get_user_model
 from rest_framework import serializers
 
-from .models import Hotel, ConferenceRoom, Booking, ManagerAssignment, Folder, Document, Bed
+from .models import (
+    Hotel, ConferenceRoom, Booking, ManagerAssignment,
+    Folder, Document, Bed, BookingClient
+)
 
 User = get_user_model()
 
@@ -11,12 +13,12 @@ User = get_user_model()
 # ===== Общие миксины и defaults =====
 class CompanyReadOnlyMixin:
     """
-    Делает company read-only наружу и гарантированно проставляет её
-    из request.user.company / request.user.owned_company на create/update.
+    Проставляет company из request.user.company / request.user.owned_company
+    на create/update и делает поле company "скрытым" наружу (вместе с HiddenField ниже).
     """
     def create(self, validated_data):
         request = self.context.get('request')
-        if request and request.user:
+        if request and request.user and getattr(request.user, "is_authenticated", False):
             user_company = getattr(request.user, "company", None) \
                            or getattr(request.user, "owned_company", None)
             if user_company:
@@ -25,7 +27,7 @@ class CompanyReadOnlyMixin:
 
     def update(self, instance, validated_data):
         request = self.context.get('request')
-        if request and request.user:
+        if request and request.user and getattr(request.user, "is_authenticated", False):
             user_company = getattr(request.user, "company", None) \
                            or getattr(request.user, "owned_company", None)
             if user_company:
@@ -34,7 +36,7 @@ class CompanyReadOnlyMixin:
 
 
 class CurrentCompanyDefault:
-    """Автоматически подставляет компанию текущего пользователя"""
+    """Автоматически подставляет компанию текущего пользователя в HiddenField."""
     requires_context = True
     def __call__(self, serializer_field):
         request = serializer_field.context.get("request")
@@ -42,15 +44,6 @@ class CurrentCompanyDefault:
         if user and getattr(user, "is_authenticated", False):
             return getattr(user, "company", None) or getattr(user, "owned_company", None)
         return None
-
-
-class CurrentUserDefault:
-    """Автоматически подставляет текущего пользователя"""
-    requires_context = True
-    def __call__(self, serializer_field):
-        request = serializer_field.context.get("request")
-        user = getattr(request, "user", None)
-        return user if (user and getattr(user, "is_authenticated", False)) else None
 
 
 # ===== Hotel / Bed / Room =====
@@ -78,25 +71,48 @@ class RoomSerializer(CompanyReadOnlyMixin, serializers.ModelSerializer):
         fields = ["id", "company", "name", "capacity", "location", "price"]
 
 
+# ===== Booking (короткая карточка для вложенного чтения у клиента) =====
+class BookingBriefSerializer(serializers.ModelSerializer):
+    resource = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Booking
+        fields = ["id", "resource", "start_time", "end_time", "purpose"]
+
+    def get_resource(self, obj):
+        if obj.hotel:
+            return f"Hotel: {obj.hotel.name}"
+        if obj.room:
+            return f"Room: {obj.room.name}"
+        if obj.bed:
+            return f"Bed: {obj.bed.name}"
+        return "—"
+
+
 # ===== Booking =====
 class BookingSerializer(CompanyReadOnlyMixin, serializers.ModelSerializer):
     company = serializers.HiddenField(default=CurrentCompanyDefault())
-    reserved_by = serializers.HiddenField(default=CurrentUserDefault())
+    # client можем передавать PK; при POST на /clients/<id>/bookings/ он будет установлен во viewset
+    client = serializers.PrimaryKeyRelatedField(
+        queryset=BookingClient.objects.all(),
+        required=False,
+        allow_null=True
+    )
 
     class Meta:
+        # ref_name — чтобы не конфликтовать с возможными дублями в схемах
         ref_name = 'BookingBooking'
         model = Booking
         fields = [
             "id", "company",
-            "hotel", "room", "bed",   # ✅ добавлен bed
-            "reserved_by",
+            "hotel", "room", "bed",
+            "client",
             "start_time", "end_time",
             "purpose",
         ]
 
     def validate(self, attrs):
         """
-        Дополнительные проверки:
         - выбран ровно один из hotel/room/bed;
         - все связанные объекты принадлежат компании пользователя;
         - корректный временной интервал.
@@ -106,15 +122,17 @@ class BookingSerializer(CompanyReadOnlyMixin, serializers.ModelSerializer):
                        or getattr(getattr(request, "user", None), "owned_company", None)
         company_id = getattr(user_company, "id", None)
 
-        hotel = attrs.get("hotel") or getattr(self.instance, "hotel", None)
-        room = attrs.get("room") or getattr(self.instance, "room", None)
-        bed = attrs.get("bed") or getattr(self.instance, "bed", None)
-        reserved_by = attrs.get("reserved_by") or getattr(self.instance, "reserved_by", None)
+        hotel  = attrs.get("hotel")  or getattr(self.instance, "hotel", None)
+        room   = attrs.get("room")   or getattr(self.instance, "room", None)
+        bed    = attrs.get("bed")    or getattr(self.instance, "bed", None)
+        client = attrs.get("client") or getattr(self.instance, "client", None)
 
         # --- Ровно один из hotel/room/bed ---
-        chosen = [x for x in [hotel, room, bed] if x]
+        chosen = [x for x in (hotel, room, bed) if x]
         if len(chosen) != 1:
-            raise serializers.ValidationError("Выберите либо гостиницу, либо комнату, либо койко-место, но не несколько сразу.")
+            raise serializers.ValidationError(
+                "Выберите либо гостиницу, либо комнату, либо койко-место, но не несколько сразу."
+            )
 
         # --- Компания должна совпадать ---
         if company_id:
@@ -124,16 +142,26 @@ class BookingSerializer(CompanyReadOnlyMixin, serializers.ModelSerializer):
                 raise serializers.ValidationError({"room": "Комната принадлежит другой компании."})
             if bed and bed.company_id != company_id:
                 raise serializers.ValidationError({"bed": "Койка принадлежит другой компании."})
-            if reserved_by and getattr(reserved_by, "company_id", None) and reserved_by.company_id != company_id:
-                raise serializers.ValidationError({"reserved_by": "Пользователь из другой компании."})
+            if client and client.company_id != company_id:
+                raise serializers.ValidationError({"client": "Клиент из другой компании."})
 
         # --- Интервал времени ---
         start = attrs.get("start_time") or getattr(self.instance, "start_time", None)
-        end = attrs.get("end_time") or getattr(self.instance, "end_time", None)
+        end   = attrs.get("end_time")   or getattr(self.instance, "end_time", None)
         if start and end and end <= start:
             raise serializers.ValidationError({"end_time": "Время окончания должно быть позже времени начала."})
 
         return attrs
+
+
+# ===== BookingClient (с вложенными бронированиями для просмотра) =====
+class BookingClientSerializer(CompanyReadOnlyMixin, serializers.ModelSerializer):
+    company = serializers.HiddenField(default=CurrentCompanyDefault())
+    bookings = BookingBriefSerializer(many=True, read_only=True)
+
+    class Meta:
+        model = BookingClient
+        fields = ["id", "company", "phone", "name", "text", "bookings"]
 
 
 # ===== ManagerAssignment =====
@@ -163,6 +191,7 @@ class ManagerAssignmentSerializer(CompanyReadOnlyMixin, serializers.ModelSeriali
 
 # ===== Folder =====
 class FolderSerializer(CompanyReadOnlyMixin, serializers.ModelSerializer):
+    # можно и HiddenField(default=CurrentCompanyDefault()), но оставим id для удобства чтения
     company = serializers.ReadOnlyField(source='company.id')
     parent = serializers.PrimaryKeyRelatedField(
         queryset=Folder.objects.all(), allow_null=True, required=False

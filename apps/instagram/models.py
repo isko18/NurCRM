@@ -65,91 +65,50 @@ class CompanyIGAccount(models.Model):
         self.save(update_fields=['is_logged_in', 'updated_at'])
 
 
-# -------------------------------
-# 2) Тред (диалог) в Instagram DM
-# -------------------------------
-
 class IGThread(models.Model):
-    """
-    Отражение треда Direct. Один и тот же thread_id уникален в рамках IG-аккаунта.
-    """
-    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False, verbose_name="ID")
-    ig_account = models.ForeignKey(
-        CompanyIGAccount,
-        on_delete=models.CASCADE,
-        related_name='threads',
-        verbose_name='IG аккаунт'
-    )
-    thread_id = models.CharField(max_length=64, db_index=True, verbose_name='ID треда (Instagram)')
-    title = models.CharField(max_length=255, blank=True, verbose_name='Заголовок треда')
-    users = models.JSONField(default=list, blank=True, verbose_name='Участники (pk/username)')
-    last_activity = models.DateTimeField(null=True, blank=True, verbose_name='Последняя активность')
+    ig_account = models.ForeignKey("CompanyIGAccount", on_delete=models.CASCADE)
+    thread_id = models.CharField(max_length=100, db_index=True)
+    title = models.CharField(max_length=255, blank=True)
+    users = models.JSONField(default=list)  # [{pk, username}]
+    last_activity = models.DateTimeField(default=timezone.now, null=True, blank=True)
 
-    created_at = models.DateTimeField(auto_now_add=True, verbose_name='Дата создания')
-    updated_at = models.DateTimeField(auto_now=True, verbose_name='Дата обновления')
+
 
     class Meta:
-        verbose_name = 'Тред Instagram'
-        verbose_name_plural = 'Треды Instagram'
-        unique_together = (('ig_account', 'thread_id'),)
+        unique_together = ("ig_account", "thread_id")
         indexes = [
-            models.Index(fields=['ig_account', 'thread_id']),
-            models.Index(fields=['-last_activity']),
+            models.Index(fields=["ig_account", "last_activity"]),
         ]
 
-    def __str__(self) -> str:
-        return f'{self.thread_id} ({self.ig_account.username})'
+    def as_dict(self):
+        return {
+            "thread_id": self.thread_id,
+            "title": self.title,
+            "users": self.users,
+            "last_activity": self.last_activity.isoformat() if self.last_activity else None,
+        }
 
-
-# -------------------------------
-# 3) Сообщение в треде
-# -------------------------------
 
 class IGMessage(models.Model):
-    """
-    Сообщение из Direct. mid — уникальный id сообщения.
-    direction:
-        - 'in'  — входящее от клиента
-        - 'out' — исходящее от нас
-    """
-    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False, verbose_name="ID")
-    thread = models.ForeignKey(
-        IGThread,
-        on_delete=models.CASCADE,
-        related_name='messages',
-        verbose_name='Тред'
-    )
-    mid = models.CharField(max_length=128, unique=True, verbose_name='ID сообщения (Instagram или локальный)')
-    sender_pk = models.CharField(max_length=64, verbose_name='PK отправителя')
-    text = models.TextField(blank=True, verbose_name='Текст')
-    attachments = models.JSONField(default=list, blank=True, verbose_name='Вложения (опционально)')
-
-    created_at = models.DateTimeField(verbose_name='Когда отправлено')
-    delivered_at = models.DateTimeField(null=True, blank=True, verbose_name='Доставлено')
-    read_at = models.DateTimeField(null=True, blank=True, verbose_name='Прочитано')
-
-    DIRECTION_IN = 'in'
-    DIRECTION_OUT = 'out'
-    DIRECTIONS = (
-        (DIRECTION_IN, 'Входящее'),
-        (DIRECTION_OUT, 'Исходящее'),
-    )
-    direction = models.CharField(max_length=3, choices=DIRECTIONS, verbose_name='Направление')
-
-    created_local_at = models.DateTimeField(auto_now_add=True, verbose_name='Записано в БД')
+    thread = models.ForeignKey(IGThread, on_delete=models.CASCADE)
+    mid = models.CharField(max_length=100, unique=True)
+    sender_pk = models.CharField(max_length=100)
+    text = models.TextField(blank=True)
+    attachments = models.JSONField(default=list)
+    created_at = models.DateTimeField()
+    direction = models.CharField(max_length=5, choices=(("in", "in"), ("out", "out")))
 
     class Meta:
-        verbose_name = 'Сообщение Instagram'
-        verbose_name_plural = 'Сообщения Instagram'
-        ordering = ('-created_at',)
         indexes = [
-            models.Index(fields=['thread']),
-            models.Index(fields=['-created_at']),
-            models.Index(fields=['direction']),
+            models.Index(fields=["thread", "created_at"]),
         ]
 
-    def __str__(self) -> str:
-        short = (self.text or '').strip().replace('\n', ' ')
-        if len(short) > 40:
-            short = short[:37] + '...'
-        return f'{self.direction} | {self.thread.thread_id} | {short}'
+    def as_dict(self):
+        return {
+            "mid": self.mid,
+            "text": self.text,
+            "sender_pk": self.sender_pk,
+            "username": None,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "direction": self.direction,
+        }
