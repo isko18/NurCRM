@@ -39,23 +39,22 @@ class DirectConsumer(AsyncJsonWebsocketConsumer):
     - .values() для списков тредов/истории (меньше ORM-накладных расходов)
     - thread_sensitive=False для read-only sync_to_async
     - .update() вместо save() для last_activity
+    - Этап 1: watch_init + incoming_batch (меньше WS-фреймов)
     """
 
-        # --- быстрый JSON-энкодер ---
+    # --- быстрый JSON-энкодер ---
     @staticmethod
     def _default(obj):
         if isinstance(obj, datetime):
             return obj.isoformat()
         raise TypeError
 
-    # стало
     async def encode_json(self, content):
         if orjson:
             # orjson возвращает bytes → превращаем в str
             return orjson.dumps(content, default=self._default).decode("utf-8")
         # стандартный json — ок
         return json.dumps(content, default=self._default, separators=(",", ":"))
-
 
     async def connect(self):
         self.account_id = self.scope["url_route"]["kwargs"]["account_id"]
@@ -156,15 +155,11 @@ class DirectConsumer(AsyncJsonWebsocketConsumer):
                         # новый тред → участников подтянем и закешируем
                         users = t.get("users")
                         if not users:
-                            users = await sync_to_async(self.svc.fetch_thread_users)(
-                                tid
-                            )
+                            users = await sync_to_async(self.svc.fetch_thread_users)(tid)
                         u_map = {u["pk"]: u["username"] for u in users}
                         self._thread_users_cache[tid] = u_map
 
-                        preview = await sync_to_async(self.svc.fetch_last_text)(
-                            tid, user_map=u_map
-                        )
+                        preview = await sync_to_async(self.svc.fetch_last_text)(tid, user_map=u_map)
 
                         # синкаем предпросмотр в БД, чтобы не потерять
                         if preview:
@@ -174,10 +169,10 @@ class DirectConsumer(AsyncJsonWebsocketConsumer):
                             **t,
                             "last_activity": serialize_dt(t.get("last_activity")),
                             "users": users,
-                            "preview": {
+                            "preview": ({
                                 **preview,
                                 "created_at": serialize_dt(preview["created_at"]),
-                            } if preview else None,
+                            } if preview else None),
                         }
                         await self.send_json({"type": "thread_new", "thread": payload})
 
@@ -273,6 +268,7 @@ class DirectConsumer(AsyncJsonWebsocketConsumer):
             return
 
         if t == "history":
+            # Оставлено для обратной совместимости; новый клиент получает историю через watch_init.
             thread_id = str(content.get("thread_id") or "").strip()
             limit = int(content.get("limit") or 50)
             offset = int(content.get("offset") or 0)
@@ -280,8 +276,6 @@ class DirectConsumer(AsyncJsonWebsocketConsumer):
                 await self.send_json({"type": "error", "detail": "thread_id required"})
                 return
 
-            # Берём только нужные поля через .values() и сразу в правильном порядке
-            # (сначала последние N по убыванию, потом разворачиваем)
             base_qs = (
                 IGMessage.objects
                 .filter(thread__ig_account=self.account, thread__thread_id=thread_id)
@@ -330,7 +324,6 @@ class DirectConsumer(AsyncJsonWebsocketConsumer):
             if not mid:
                 await self.send_json({"type": "error", "detail": "mid required"})
                 return
-            # .delete() оставим как есть, но вызов через thread_sensitive=False не критичен
             deleted = await sync_to_async(
                 IGMessage.objects.filter(mid=mid, thread__ig_account=self.account).delete,
                 thread_sensitive=False
@@ -395,8 +388,8 @@ class DirectConsumer(AsyncJsonWebsocketConsumer):
             users = [{"pk": pk, "username": name} for pk, name in u_map.items()]
 
         self._user_map = u_map
-        await self.send_json({"type": "participants", "users": users})
 
+        # гарантируем актуальный IGThread
         self._thread_obj = await sync_to_async(self.svc.sync_thread)({
             "thread_id": thread_id,
             "title": "",
@@ -404,8 +397,8 @@ class DirectConsumer(AsyncJsonWebsocketConsumer):
             "last_activity": timezone.localtime(),
         })
 
+        # История: сначала БД, при пустоте — из Instagram
         msgs = await sync_to_async(self.svc.fetch_messages_db)(self._thread_obj, POLL_LIMIT)
-
         if not msgs:
             msgs = await sync_to_async(self.svc.fetch_messages_live)(thread_id, POLL_LIMIT)
             for m in msgs:
@@ -413,7 +406,7 @@ class DirectConsumer(AsyncJsonWebsocketConsumer):
                 if self._thread_obj:
                     await sync_to_async(self.svc.sync_message)(self._thread_obj, m)
 
-        # готовим к отправке наружу
+        # подготовка к отправке
         prepared = []
         for m in msgs:
             prepared.append({
@@ -423,21 +416,29 @@ class DirectConsumer(AsyncJsonWebsocketConsumer):
             })
             self._seen.add(m["mid"])
 
-        await self.send_json({"type": "history", "thread_id": thread_id, "messages": prepared})
-        await self.send_json({"type": "watching", "thread_id": thread_id})
+        # единый инициализационный фрейм
+        await self.send_json({
+            "type": "watch_init",
+            "thread_id": thread_id,
+            "users": users,
+            "messages": prepared,
+            "last_activity": serialize_dt(self._thread_obj.last_activity),
+        })
 
+        # старт поллинга сообщений
         self._poll_task = asyncio.create_task(self._poll_loop())
 
     async def _poll_loop(self):
         backoff = 0.0
         # берём последнее сообщение быстро и без лишней гидрации
-        last_qs = (
+        get_last_row = lambda: (
             IGMessage.objects
             .filter(thread=self._thread_obj)
             .order_by("-created_at")
-            .values("created_at")[:1]
+            .values("created_at")
+            .first()
         )
-        last_row = await sync_to_async(lambda: next(iter(last_qs), None), thread_sensitive=False)()
+        last_row = await sync_to_async(get_last_row, thread_sensitive=False)()
         last_ts: datetime | None = last_row["created_at"] if last_row else None
 
         while not self._stop.is_set():
@@ -449,19 +450,27 @@ class DirectConsumer(AsyncJsonWebsocketConsumer):
                 )
 
                 if msgs:
-                    # синк + отправка
+                    # синк в БД
                     for m in msgs:
                         self._seen.add(m["mid"])
-                        m["username"] = self._user_map.get(m["sender_pk"])
                         if self._thread_obj:
                             await sync_to_async(self.svc.sync_message)(self._thread_obj, m)
 
-                        await self.send_json({
-                            "type": "incoming",
-                            "message": {**m, "created_at": serialize_dt(m["created_at"])},
-                            "thread_id": self.thread_id,
-                        })
+                    # батч в сокет
+                    batch = [
+                        {
+                            **m,
+                            "created_at": serialize_dt(m["created_at"]),
+                            "username": self._user_map.get(m["sender_pk"]),
+                        } for m in msgs
+                    ]
+                    await self.send_json({
+                        "type": "incoming_batch",
+                        "thread_id": self.thread_id,
+                        "messages": batch,
+                    })
 
+                    # двигаем watermark
                     last_ts = msgs[-1]["created_at"]
 
                     if self._thread_obj:

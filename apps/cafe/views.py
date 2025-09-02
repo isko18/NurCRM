@@ -5,13 +5,14 @@ from django_filters.rest_framework import DjangoFilterBackend
 from .models import (
     Zone, Table, Booking, Warehouse, Purchase,
     Category, MenuItem, Ingredient,
-    Order, OrderItem,
+    Order, OrderItem, CafeClient,          # ← добавили CafeClient
 )
 from .serializers import (
     ZoneSerializer, TableSerializer, BookingSerializer,
     WarehouseSerializer, PurchaseSerializer,
     CategorySerializer, MenuItemSerializer, IngredientInlineSerializer,
     OrderSerializer, OrderItemInlineSerializer,
+    CafeClientSerializer,                  # ← добавили сериализатор клиента
 )
 
 
@@ -32,6 +33,48 @@ class CompanyQuerysetMixin:
         if any(f.name == "company" for f in model._meta.fields):
             return qs.filter(company=company)
         return qs
+
+
+# ==================== CafeClient ====================
+class CafeClientListCreateView(CompanyQuerysetMixin, generics.ListCreateAPIView):
+    queryset = CafeClient.objects.all()
+    serializer_class = CafeClientSerializer
+    filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
+    filterset_fields = ["name", "phone"]
+    search_fields = ["name", "phone"]
+    ordering_fields = ["name", "id"]
+
+
+class CafeClientRetrieveUpdateDestroyView(CompanyQuerysetMixin, generics.RetrieveUpdateDestroyAPIView):
+    queryset = CafeClient.objects.all()
+    serializer_class = CafeClientSerializer
+
+
+class ClientOrderListCreateView(CompanyQuerysetMixin, generics.ListCreateAPIView):
+    """
+    /cafe/clients/<uuid:pk>/orders/
+    GET  — список заказов клиента
+    POST — создать заказ этому клиенту (company и client проставляются автоматически)
+    """
+    queryset = (Order.objects
+                .select_related("table", "waiter", "company", "client")
+                .prefetch_related("items__menu_item"))
+    serializer_class = OrderSerializer
+    filter_backends = [DjangoFilterBackend, filters.OrderingFilter]
+    filterset_fields = ["table", "waiter", "guests", "created_at"]
+    ordering_fields = ["created_at", "guests", "id"]
+
+    def _get_client(self):
+        # берём клиента в рамках компании текущего пользователя
+        company = self.get_company()
+        return generics.get_object_or_404(CafeClient, pk=self.kwargs["pk"], company=company)
+
+    def get_queryset(self):
+        return super().get_queryset().filter(client=self._get_client())
+
+    def perform_create(self, serializer):
+        client = self._get_client()
+        serializer.save(company=client.company, client=client)
 
 
 # ==================== Zone ====================
@@ -168,17 +211,17 @@ class IngredientRetrieveUpdateDestroyView(CompanyQuerysetMixin, generics.Retriev
 # ==================== Order ====================
 class OrderListCreateView(CompanyQuerysetMixin, generics.ListCreateAPIView):
     queryset = (Order.objects
-                .select_related("table", "waiter", "company")
+                .select_related("table", "waiter", "company", "client")   # ← client
                 .prefetch_related("items__menu_item"))
     serializer_class = OrderSerializer
     filter_backends = [DjangoFilterBackend, filters.OrderingFilter]
-    filterset_fields = ["table", "waiter", "guests", "created_at"]
+    filterset_fields = ["table", "waiter", "client", "guests", "created_at"]  # ← client в фильтрах
     ordering_fields = ["created_at", "guests", "id"]
 
 
 class OrderRetrieveUpdateDestroyView(CompanyQuerysetMixin, generics.RetrieveUpdateDestroyAPIView):
     queryset = (Order.objects
-                .select_related("table", "waiter", "company")
+                .select_related("table", "waiter", "company", "client")   # ← client
                 .prefetch_related("items__menu_item"))
     serializer_class = OrderSerializer
 

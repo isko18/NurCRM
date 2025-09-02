@@ -4,7 +4,7 @@ from django.conf import settings
 from apps.users.models import User   # <-- берём настоящего пользователя
 from .models import (
     Zone, Table, Booking, Warehouse, Purchase,
-    Category, MenuItem, Ingredient, Order, OrderItem,
+    Category, MenuItem, Ingredient, Order, OrderItem, CafeClient,
 )
 
 # --------- Базовый миксин для company ---------
@@ -165,8 +165,29 @@ class OrderItemInlineSerializer(serializers.ModelSerializer):
         return menu_item
 
 
+# краткая карточка заказа для вложенного чтения в клиенте
+class OrderBriefSerializer(serializers.ModelSerializer):
+    table_number = serializers.IntegerField(source="table.number", read_only=True)
+
+    class Meta:
+        model = Order
+        fields = ["id", "table_number", "guests", "waiter", "created_at"]
+
+
+# клиент кафе: с вложенными заказами (read-only)
+class CafeClientSerializer(CompanyReadOnlyMixin):
+    orders = OrderBriefSerializer(many=True, read_only=True)
+
+    class Meta:
+        model = CafeClient
+        fields = ["id", "company", "name", "phone", "notes", "orders"]
+
+
 class OrderSerializer(CompanyReadOnlyMixin):
     table = serializers.PrimaryKeyRelatedField(queryset=Table.objects.all())
+    client = serializers.PrimaryKeyRelatedField(
+        queryset=CafeClient.objects.all(), required=False, allow_null=True
+    )
     waiter = serializers.PrimaryKeyRelatedField(
         queryset=User.objects.filter(role="waiter"),  # только пользователи с ролью официанта
         allow_null=True,
@@ -177,17 +198,21 @@ class OrderSerializer(CompanyReadOnlyMixin):
     class Meta:
         ref_name = "CafeOrder"
         model = Order
-        fields = ["id", "company", "table", "waiter", "guests", "created_at", "items"]
+        fields = ["id", "company", "table", "client", "waiter", "guests", "created_at", "items"]
         read_only_fields = ["created_at"]
 
     def validate(self, attrs):
         company = (self.instance.company if self.instance else self._get_company())
         table = attrs.get("table", getattr(self.instance, "table", None))
         waiter = attrs.get("waiter", getattr(self.instance, "waiter", None))
+        client = attrs.get("client", getattr(self.instance, "client", None))
+
         if company and table and table.company_id != company.id:
             raise serializers.ValidationError({"table": "Стол принадлежит другой компании."})
         if company and waiter and getattr(waiter, "company_id", None) != company.id:
             raise serializers.ValidationError({"waiter": "Официант принадлежит другой компании."})
+        if company and client and client.company_id != company.id:
+            raise serializers.ValidationError({"client": "Клиент принадлежит другой компании."})
         return attrs
 
     def _upsert_items(self, order, items, company):
