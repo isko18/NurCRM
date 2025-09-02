@@ -12,3 +12,17 @@ def sync_ig_account_threads(account_id: str, amount: int = 20, per_thread_messag
     if not svc.try_resume_session():
         return "login_required"
     return svc.sync_threads(amount=amount, per_thread_messages=per_thread_messages)
+
+
+@shared_task
+def sync_instagram_updates():
+    """
+    Фоновая задача: пройтись по всем активным аккаунтам и обновить чаты.
+    """
+    for acc in CompanyIGAccount.objects.filter(is_active=True):
+        svc = IGChatService(acc)
+        if svc.try_resume_session():
+            try:
+                svc.sync_updates(msgs_per_thread=30)
+            except Exception as e:
+                print(f"[IG Sync] Ошибка для {acc.username}: {e}")

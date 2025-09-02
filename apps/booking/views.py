@@ -1,16 +1,19 @@
 # views.py
 from rest_framework import generics, permissions
 from rest_framework.parsers import MultiPartParser, FormParser
+from rest_framework.response import Response
+from django.shortcuts import get_object_or_404
 from django_filters import rest_framework as filters
 from django_filters.rest_framework import DjangoFilterBackend
 
 from .models import (
     Hotel, Bed, ConferenceRoom, Booking, ManagerAssignment,
-    Folder, Document,
+    Folder, Document, BookingClient,  # ← добавлен BookingClient
 )
 from .serializers import (
     HotelSerializer, BedSerializer, RoomSerializer, BookingSerializer,
     ManagerAssignmentSerializer, FolderSerializer, DocumentSerializer,
+    BookingClientSerializer,  # ← добавлен сериализатор клиента
 )
 from .permissions import IsAdminOrReadOnly, IsManagerOrAdmin
 
@@ -18,7 +21,7 @@ from .permissions import IsAdminOrReadOnly, IsManagerOrAdmin
 # ---- Кастомные фильтры ----
 class DocumentFilter(filters.FilterSet):
     name = filters.CharFilter(lookup_expr='icontains')
-    folder = filters.UUIDFilter(field_name='folder__id')          # фильтр по UUID папки
+    folder = filters.UUIDFilter(field_name='folder__id')
     file_name = filters.CharFilter(field_name='file', lookup_expr='icontains')
     created_at = filters.DateTimeFromToRangeFilter()
     updated_at = filters.DateTimeFromToRangeFilter()
@@ -37,7 +40,8 @@ class BookingFilter(filters.FilterSet):
 
     class Meta:
         model = Booking
-        fields = ['hotel', 'room', 'bed', 'reserved_by', 'start_time', 'end_time']
+        # ↓ заменили reserved_by → client
+        fields = ['hotel', 'room', 'bed', 'client', 'start_time', 'end_time']
 
 
 # ---- Миксин для компании ----
@@ -66,6 +70,51 @@ class CompanyQuerysetMixin:
     def perform_update(self, serializer):
         company = self._user_company()
         serializer.save(company=company) if company else serializer.save()
+
+
+# ========= BookingClient (клиенты) =========
+class BookingClientListCreateView(CompanyQuerysetMixin, generics.ListCreateAPIView):
+    queryset = BookingClient.objects.all()
+    serializer_class = BookingClientSerializer
+    permission_classes = [permissions.IsAuthenticated]
+    filter_backends = [DjangoFilterBackend]
+    filterset_fields = [f.name for f in BookingClient._meta.get_fields()
+                        if not f.is_relation or f.many_to_one]
+    ordering = ['name']
+
+
+class BookingClientRetrieveUpdateDestroyView(CompanyQuerysetMixin, generics.RetrieveUpdateDestroyAPIView):
+    queryset = BookingClient.objects.all()
+    serializer_class = BookingClientSerializer
+    permission_classes = [permissions.IsAuthenticated]
+
+
+class ClientBookingListCreateView(CompanyQuerysetMixin, generics.ListCreateAPIView):
+    """
+    /clients/<uuid:pk>/bookings/
+    GET  — список броней клиента
+    POST — создать бронь этому клиенту (client и company проставляются автоматически)
+    """
+    queryset = Booking.objects.select_related('hotel', 'room', 'bed', 'client').all()
+    serializer_class = BookingSerializer
+    permission_classes = [permissions.IsAuthenticated]
+    filter_backends = [DjangoFilterBackend]
+    filterset_class = BookingFilter
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        client = self._get_client()
+        return qs.filter(client=client).order_by('-start_time')
+
+    def _get_client(self):
+        # pk из URL
+        company = self._user_company()
+        return get_object_or_404(BookingClient, pk=self.kwargs['pk'], company=company)
+
+    def perform_create(self, serializer):
+        client = self._get_client()
+        # company и client выставляем жёстко из URL
+        serializer.save(company=client.company, client=client)
 
 
 # ========= Hotel =========
@@ -118,7 +167,8 @@ class RoomRetrieveUpdateDestroyView(CompanyQuerysetMixin, generics.RetrieveUpdat
 
 # ========= Booking =========
 class BookingListCreateView(CompanyQuerysetMixin, generics.ListCreateAPIView):
-    queryset = Booking.objects.select_related('hotel', 'room', 'bed', 'reserved_by').all()
+    # ↓ заменили reserved_by → client
+    queryset = Booking.objects.select_related('hotel', 'room', 'bed', 'client').all()
     serializer_class = BookingSerializer
     permission_classes = [permissions.IsAuthenticated]
     filter_backends = [DjangoFilterBackend]
@@ -126,7 +176,8 @@ class BookingListCreateView(CompanyQuerysetMixin, generics.ListCreateAPIView):
 
 
 class BookingRetrieveUpdateDestroyView(CompanyQuerysetMixin, generics.RetrieveUpdateDestroyAPIView):
-    queryset = Booking.objects.select_related('hotel', 'room', 'bed', 'reserved_by').all()
+    # ↓ заменили reserved_by → client
+    queryset = Booking.objects.select_related('hotel', 'room', 'bed', 'client').all()
     serializer_class = BookingSerializer
     permission_classes = [permissions.IsAuthenticated]
 
@@ -171,7 +222,7 @@ class DocumentListCreateView(CompanyQuerysetMixin, generics.ListCreateAPIView):
     permission_classes = [permissions.IsAuthenticated]
     parser_classes = [MultiPartParser, FormParser]
     filter_backends = [DjangoFilterBackend]
-    filterset_class = DocumentFilter   # без автогенерации по FileField
+    filterset_class = DocumentFilter
 
 
 class DocumentRetrieveUpdateDestroyView(CompanyQuerysetMixin, generics.RetrieveUpdateDestroyAPIView):

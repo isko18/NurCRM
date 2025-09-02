@@ -4,6 +4,25 @@ from django.core.exceptions import ValidationError
 from django.conf import settings  # используем AUTH_USER_MODEL
 
 
+# apps/booking/models.py
+class BookingClient(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    company = models.ForeignKey(
+        'users.Company',
+        on_delete=models.CASCADE,
+        related_name='booking_clients',        # <-- было 'clients'
+        related_query_name='booking_client',   # <-- чтобы не конфликтовал запросный псевдоним
+        verbose_name='Компания',
+    )
+    phone = models.CharField(max_length=255, verbose_name="Номер телефона")
+    name = models.CharField(max_length=255, verbose_name="Имя")
+    text = models.TextField(verbose_name="Заметки", blank=True)
+
+    class Meta:
+        unique_together = (('company', 'phone'),)
+        indexes = [models.Index(fields=['company', 'phone'])]
+
+    
 class Hotel(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     company = models.ForeignKey(
@@ -87,13 +106,13 @@ class Booking(models.Model):
     hotel = models.ForeignKey(Hotel, on_delete=models.CASCADE, null=True, blank=True, related_name='bookings')
     room = models.ForeignKey(ConferenceRoom, on_delete=models.CASCADE, null=True, blank=True, related_name='bookings')
     bed = models.ForeignKey(Bed, on_delete=models.CASCADE, null=True, blank=True, related_name='bookings')  # ✅ добавлено
-    reserved_by = models.ForeignKey(
-        settings.AUTH_USER_MODEL,
+    client = models.ForeignKey(
+        BookingClient,
         on_delete=models.SET_NULL,
-        null=True,
+        null=True, blank=True,
         related_name='bookings',
+        verbose_name='Клиент',
     )
-
     start_time = models.DateTimeField()
     end_time = models.DateTimeField()
     purpose = models.CharField(max_length=255, blank=True)
@@ -106,12 +125,10 @@ class Booking(models.Model):
         ]
 
     def clean(self):
-        # 1) Выбран ровно один ресурс: hotel/room/bed
         chosen = [x for x in [self.hotel, self.room, self.bed] if x]
         if len(chosen) != 1:
             raise ValidationError("Выберите либо гостиницу, либо комнату, либо койко-место (ровно одно).")
 
-        # 2) Согласованность компаний
         if self.company_id:
             if self.hotel and self.hotel.company_id != self.company_id:
                 raise ValidationError({'hotel': 'Отель принадлежит другой компании.'})
@@ -119,20 +136,19 @@ class Booking(models.Model):
                 raise ValidationError({'room': 'Комната принадлежит другой компании.'})
             if self.bed and self.bed.company_id != self.company_id:
                 raise ValidationError({'bed': 'Койка принадлежит другой компании.'})
-            if self.reserved_by and getattr(self.reserved_by, 'company_id', None) \
-               and self.reserved_by.company_id != self.company_id:
-                raise ValidationError({'reserved_by': 'Пользователь из другой компании.'})
+            if self.client and self.client.company_id != self.company_id:
+                raise ValidationError({'client': 'Клиент из другой компании.'})
 
-        # 3) Временной интервал
         if self.start_time and self.end_time and self.end_time <= self.start_time:
             raise ValidationError('Время окончания должно быть позже времени начала.')
+
 
     def __str__(self):
         hotel_name = self.hotel.name if self.hotel else "No Hotel"
         room_name = self.room.name if self.room else "No Room"
         bed_name = self.bed.name if self.bed else "No Bed"
-        reserved_by_display = getattr(self.reserved_by, 'email', None) or "Unknown"
-        return f"{hotel_name} / {room_name} / {bed_name} by {reserved_by_display}"
+        client_display = (self.client.name or self.client.phone) if self.client else "Unknown"
+        return f"{hotel_name} / {room_name} / {bed_name} for {client_display}"
 
 
 
