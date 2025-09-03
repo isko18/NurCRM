@@ -1,17 +1,23 @@
 from django.db import models
-from apps.users.models import Company
-import uuid
 from django.conf import settings
 from django.core.exceptions import ValidationError
+from django.db.models.signals import pre_delete
+from django.dispatch import receiver
+from django.utils import timezone
+
+from apps.users.models import Company
+import uuid
 
 
-# Create your models here.
+# ==========================
+# Клиент кафе
+# ==========================
 class CafeClient(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     company = models.ForeignKey(
         Company,
         on_delete=models.CASCADE,
-        related_name='cafe_clients',          # уникальное имя обратной связи, чтобы не конфликтовать
+        related_name='cafe_clients',
         related_query_name='cafe_client',
         verbose_name='Компания',
     )
@@ -22,7 +28,7 @@ class CafeClient(models.Model):
     class Meta:
         verbose_name = 'Клиент кафе'
         verbose_name_plural = 'Клиенты кафе'
-        unique_together = (('company', 'phone'),)   # в пределах компании телефон уникален
+        unique_together = (('company', 'phone'),)
         indexes = [
             models.Index(fields=['company', 'phone']),
             models.Index(fields=['company', 'name']),
@@ -32,29 +38,30 @@ class CafeClient(models.Model):
         return self.name or self.phone or f'Клиент {str(self.id)[:8]}'
 
 
+# ==========================
+# Зоны и столы
+# ==========================
 class Zone(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-
     company = models.ForeignKey(
         Company, on_delete=models.CASCADE, related_name='zone', verbose_name='Компания'
     )
     title = models.CharField(max_length=255, verbose_name="Зона")
-    
-    def __str__(self):
-        return self.title
-    
+
     class Meta:
         verbose_name = 'Зона'
         verbose_name_plural = 'Зоны'
-        
-        
+
+    def __str__(self):
+        return self.title
+
+
 class Table(models.Model):
     class Status(models.TextChoices):
         FREE = 'free', 'Свободен'
         BUSY = 'busy', 'Занят'
-        
-    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
 
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     company = models.ForeignKey(
         Company, on_delete=models.CASCADE, related_name='table', verbose_name='Компания'
     )
@@ -66,16 +73,18 @@ class Table(models.Model):
     status = models.CharField(
         max_length=16, choices=Status.choices, default=Status.FREE, verbose_name='Статус'
     )
-    
-    def __str__(self):
-        return f"Стол {self.number} (мест: {self.places})"
 
-    
     class Meta:
         verbose_name = 'Стол'
         verbose_name_plural = 'Столы'
 
+    def __str__(self):
+        return f"Стол {self.number} (мест: {self.places})"
 
+
+# ==========================
+# Бронирования столов
+# ==========================
 class Booking(models.Model):
     class Status(models.TextChoices):
         BOOKED = 'booked', 'Забронировано'
@@ -124,8 +133,11 @@ class Booking(models.Model):
     def start_at(self):
         from datetime import datetime
         return datetime.combine(self.date, self.time)
-    
-    
+
+
+# ==========================
+# Склад, закупки, меню
+# ==========================
 class Warehouse(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     company = models.ForeignKey(
@@ -135,15 +147,15 @@ class Warehouse(models.Model):
     unit = models.CharField(max_length=255, verbose_name="Ед. изм.")
     remainder = models.CharField(max_length=255, verbose_name="Остаток")
     minimum = models.CharField(max_length=255, verbose_name="Минимум")
-    
-    
-    def __str__(self):
-        return f"{self.title} - осталось {self.remainder}"
-    
+
     class Meta:
         verbose_name = 'Склад'
         verbose_name_plural = 'Склады'
-        
+
+    def __str__(self):
+        return f"{self.title} - осталось {self.remainder}"
+
+
 class Purchase(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     company = models.ForeignKey(
@@ -152,16 +164,15 @@ class Purchase(models.Model):
     supplier = models.CharField(max_length=255, verbose_name="Поставщик")
     positions = models.CharField(max_length=255, verbose_name="Позиций")
     price = models.DecimalField(max_digits=10, decimal_places=2, verbose_name='Цена')
-    
-    def __str__(self):
-        return f"{self.supplier} - cумма:{self.price}"
 
     class Meta:
         verbose_name = 'Закупка'
         verbose_name_plural = 'Закупки'
-        
-    
-    
+
+    def __str__(self):
+        return f"{self.supplier} - cумма:{self.price}"
+
+
 class Category(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     company = models.ForeignKey(
@@ -216,8 +227,11 @@ class Ingredient(models.Model):
 
     def __str__(self):
         return f"{self.product.title} ({self.amount} {self.product.unit})"
-    
-    
+
+
+# ==========================
+# Заказы
+# ==========================
 class Order(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     company = models.ForeignKey(
@@ -226,7 +240,6 @@ class Order(models.Model):
     table = models.ForeignKey(
         Table, on_delete=models.PROTECT, related_name='orders', verbose_name='Стол'
     )
-    # ↓↓↓ НОВОЕ ПОЛЕ: клиент заказа
     client = models.ForeignKey(
         CafeClient,
         on_delete=models.SET_NULL,
@@ -252,7 +265,7 @@ class Order(models.Model):
         ordering = ['-created_at']
         indexes = [
             models.Index(fields=['company', 'created_at']),
-            models.Index(fields=['client', 'created_at']),  # ускоряет выборки по клиенту
+            models.Index(fields=['client', 'created_at']),
         ]
 
     def __str__(self):
@@ -266,10 +279,10 @@ class Order(models.Model):
             if self.client and self.client.company_id != self.company_id:
                 raise ValidationError({'client': 'Клиент принадлежит другой компании.'})
 
+
 class OrderItem(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-
-    # ← добавили company (редактировать руками не нужно)
+    # company синхронизируется с заказом в save()
     company = models.ForeignKey(
         Company,
         on_delete=models.CASCADE,
@@ -277,11 +290,9 @@ class OrderItem(models.Model):
         verbose_name='Компания',
         editable=False,
     )
-    
     order = models.ForeignKey(
         Order, on_delete=models.CASCADE,
-        related_name='items',  # как уже исправляли
-        verbose_name='Заказ'
+        related_name='items', verbose_name='Заказ'
     )
     menu_item = models.ForeignKey(
         'MenuItem', on_delete=models.PROTECT,
@@ -310,3 +321,109 @@ class OrderItem(models.Model):
 
     def __str__(self):
         return f'{self.menu_item.title} × {self.quantity}'
+
+
+# ==========================
+# Архив заказов (сохраняем историю при удалении)
+# ==========================
+class OrderHistory(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    company = models.ForeignKey(
+        Company, on_delete=models.CASCADE, related_name='cafe_order_history', verbose_name='Компания'
+    )
+    client = models.ForeignKey(
+        CafeClient, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='order_history', verbose_name='Клиент'
+    )
+    original_order_id = models.UUIDField(verbose_name='ID исходного заказа')
+    table = models.ForeignKey(
+        Table, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='order_history', verbose_name='Стол (ref)'
+    )
+    table_number = models.IntegerField(null=True, blank=True, verbose_name='Номер стола (снапшот)')
+    waiter = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='served_orders_history', verbose_name='Официант (ref)'
+    )
+    waiter_label = models.CharField('Метка официанта', max_length=255, blank=True)
+    guests = models.PositiveIntegerField('Гостей', default=1)
+    created_at = models.DateTimeField('Создано (в заказе)')
+    archived_at = models.DateTimeField('Архивировано', auto_now_add=True)
+
+    class Meta:
+        verbose_name = 'Архив заказа'
+        verbose_name_plural = 'Архив заказов'
+        ordering = ['-created_at']
+        indexes = [
+            models.Index(fields=['company', 'created_at']),
+            models.Index(fields=['client', 'created_at']),
+            models.Index(fields=['original_order_id']),
+        ]
+        constraints = [
+            models.UniqueConstraint(fields=['original_order_id'], name='uniq_orderhistory_original'),
+        ]
+
+    def __str__(self):
+        return f'OrderHistory {str(self.original_order_id)[:8]} — клиент: {self.client or "—"}'
+
+
+class OrderItemHistory(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    order_history = models.ForeignKey(
+        OrderHistory, on_delete=models.CASCADE, related_name='items', verbose_name='Архив заказа'
+    )
+    menu_item = models.ForeignKey(
+        MenuItem, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='archived_items', verbose_name='Позиция (ref)'
+    )
+    menu_item_title = models.CharField('Название позиции (снапшот)', max_length=255)
+    menu_item_price = models.DecimalField('Цена (снапшот)', max_digits=10, decimal_places=2)
+    quantity = models.PositiveIntegerField('Кол-во', default=1)
+
+    class Meta:
+        verbose_name = 'Архив позиции заказа'
+        verbose_name_plural = 'Архив позиций заказа'
+        indexes = [models.Index(fields=['order_history'])]
+
+    def __str__(self):
+        return f'{self.menu_item_title} × {self.quantity}'
+
+
+# ==========================
+# Сигнал: архивируем заказ перед удалением
+# ==========================
+@receiver(pre_delete, sender=Order)
+def archive_order_before_delete(sender, instance: Order, **kwargs):
+    # метка официанта
+    waiter_label = ''
+    if instance.waiter_id:
+        full = getattr(instance.waiter, 'get_full_name', lambda: '')() or ''
+        email = getattr(instance.waiter, 'email', '') or ''
+        waiter_label = full or email or str(instance.waiter_id)
+
+    # шапка архива
+    oh = OrderHistory.objects.create(
+        company=instance.company,
+        client=instance.client,
+        original_order_id=instance.id,
+        table=instance.table,
+        table_number=(instance.table.number if instance.table_id else None),
+        waiter=instance.waiter,
+        waiter_label=waiter_label,
+        guests=instance.guests,
+        created_at=instance.created_at,
+        archived_at=timezone.now(),
+    )
+
+    # позиции архива (снапшот названия и цены)
+    items = []
+    for it in instance.items.select_related('menu_item'):
+        items.append(OrderItemHistory(
+            order_history=oh,
+            menu_item=it.menu_item,
+            menu_item_title=it.menu_item.title,
+            menu_item_price=it.menu_item.price,
+            quantity=it.quantity,
+        ))
+    if items:
+        OrderItemHistory.objects.bulk_create(items)

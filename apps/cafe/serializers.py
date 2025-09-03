@@ -1,16 +1,21 @@
 # apps/cafe/serializers.py
 from rest_framework import serializers
-from django.conf import settings
-from apps.users.models import User   # <-- берём настоящего пользователя
+from django.contrib.auth import get_user_model
+
 from .models import (
     Zone, Table, Booking, Warehouse, Purchase,
-    Category, MenuItem, Ingredient, Order, OrderItem, CafeClient,
+    Category, MenuItem, Ingredient,
+    Order, OrderItem, CafeClient,
+    OrderHistory, OrderItemHistory,
 )
+
+User = get_user_model()
+
 
 # --------- Базовый миксин для company ---------
 class CompanyReadOnlyMixin(serializers.ModelSerializer):
     """
-    Делает поле company read-only (как id) и проставляет company из request.user при create().
+    Делает поле company read-only (как id) и проставляет company из request.user при create/update.
     """
     company = serializers.ReadOnlyField(source="company.id")
 
@@ -24,6 +29,14 @@ class CompanyReadOnlyMixin(serializers.ModelSerializer):
             raise serializers.ValidationError("Невозможно определить компанию пользователя.")
         validated_data["company"] = company
         return super().create(validated_data)
+
+    def update(self, instance, validated_data):
+        # company не меняем руками извне, но на всякий случай закрепим из пользователя
+        company = self._get_company()
+        if company is None:
+            return super().update(instance, validated_data)
+        validated_data["company"] = company
+        return super().update(instance, validated_data)
 
 
 # --------- Простые справочники ---------
@@ -174,13 +187,35 @@ class OrderBriefSerializer(serializers.ModelSerializer):
         fields = ["id", "table_number", "guests", "waiter", "created_at"]
 
 
-# клиент кафе: с вложенными заказами (read-only)
+# --------- История заказов (архив) ---------
+class OrderItemHistorySerializer(serializers.ModelSerializer):
+    class Meta:
+        model = OrderItemHistory
+        fields = ["id", "menu_item", "menu_item_title", "menu_item_price", "quantity"]
+        read_only_fields = fields = ["id", "menu_item", "menu_item_title", "menu_item_price", "quantity"]
+
+
+class OrderHistorySerializer(serializers.ModelSerializer):
+    items = OrderItemHistorySerializer(many=True, read_only=True)
+
+    class Meta:
+        model = OrderHistory
+        fields = [
+            "id", "original_order_id", "company", "client",
+            "table", "table_number", "waiter", "waiter_label",
+            "guests", "created_at", "archived_at", "items",
+        ]
+        read_only_fields = fields
+
+
+# клиент кафе: с вложенными заказами (read-only) и историей (read-only)
 class CafeClientSerializer(CompanyReadOnlyMixin):
     orders = OrderBriefSerializer(many=True, read_only=True)
+    history = OrderHistorySerializer(source="order_history", many=True, read_only=True)
 
     class Meta:
         model = CafeClient
-        fields = ["id", "company", "name", "phone", "notes", "orders"]
+        fields = ["id", "company", "name", "phone", "notes", "orders", "history"]
 
 
 class OrderSerializer(CompanyReadOnlyMixin):
@@ -189,7 +224,7 @@ class OrderSerializer(CompanyReadOnlyMixin):
         queryset=CafeClient.objects.all(), required=False, allow_null=True
     )
     waiter = serializers.PrimaryKeyRelatedField(
-        queryset=User.objects.filter(role="waiter"),  # только пользователи с ролью официанта
+        queryset=User.objects.all(),  # при необходимости сузьте: .filter(role='waiter')
         allow_null=True,
         required=False
     )

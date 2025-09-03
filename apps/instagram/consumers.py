@@ -41,6 +41,8 @@ except Exception:
 REDIS_URL       = os.getenv("REDIS_URL", "redis://127.0.0.1:6379/0")
 POLL_LIMIT      = int(os.getenv("IG_POLL_LIMIT", "12"))
 MAX_HIST        = int(os.getenv("IG_HIST_CACHE", "200"))
+BOOTSTRAP_THREADS = int(os.getenv("IG_BOOTSTRAP_THREADS", "40"))
+BOOTSTRAP_MSGS    = int(os.getenv("IG_BOOTSTRAP_MSGS", "20"))
 
 # Channels group: только [A-Za-z0-9._-], без двоеточий
 GROUP_FMT         = "ig.{account_id}"
@@ -186,10 +188,69 @@ class DirectConsumer(AsyncJsonWebsocketConsumer):
             logger.warning("threads snapshot redis failed: %s", e)
             return []
 
+    # ---------- DB → Redis warmers ----------
+    async def _warm_threads_from_db(self, limit: int = 200):
+        """Считывает треды из БД и прогревает Redis-снепшот (ZSET + per-thread key)."""
+        rows = await sync_to_async(list, thread_sensitive=False)(
+            IGThread.objects.filter(ig_account=self.account)
+            .order_by("-last_activity")
+            .values("thread_id", "title", "users", "last_activity")[:limit]
+        )
+        if not rows or not self._r:
+            return
+        zkey = THREADS_ZSET_FMT.format(account_id=str(self.account.pk))
+        pipe = self._r.pipeline()
+        for th in rows:
+            tid = th["thread_id"]
+            score = ts_json(th["last_activity"]) or _dt_to_epoch_ms(datetime.utcnow())
+            row = {
+                "thread_id": tid,
+                "title": th["title"],
+                "users": th["users"],
+                "last_activity": score,
+            }
+            pipe.set(THREAD_KEY_FMT.format(thread_id=tid), dumps(row))
+            pipe.zadd(zkey, {tid: score})
+        try:
+            await pipe.execute()
+        except Exception as e:
+            logger.warning("warm threads redis failed: %s", e)
+
+    async def _warm_hist_from_db(self, thread_id: str, limit: int = MAX_HIST):
+        if not self._r:
+            return
+        rows = await sync_to_async(list, thread_sensitive=False)(
+            IGMessage.objects.filter(thread__ig_account=self.account, thread__thread_id=thread_id)
+            .order_by("-created_at")
+            .values("mid", "text", "sender_pk", "created_at", "direction", "attachments")[:limit]
+        )
+        if not rows:
+            return
+        key = HIST_LIST_FMT.format(thread_id=thread_id)
+        payload = []
+        for r in reversed(rows):
+            payload.append(dumps({
+                "mid": r["mid"],
+                "text": r["text"],
+                "sender_pk": r["sender_pk"],
+                "username": None,
+                "created_at": _dt_to_epoch_ms(r["created_at"]),
+                "direction": r["direction"],
+                "attachments": r.get("attachments") or [],
+            }))
+        try:
+            pipe = self._r.pipeline()
+            for s in payload:
+                pipe.rpush(key, s)
+            pipe.ltrim(key, -MAX_HIST, -1)
+            await pipe.execute()
+        except Exception as e:
+            logger.warning("warm hist redis failed: %s", e)
+
     # ---------- DB bootstrap (при пустой базе) ----------
     async def _bootstrap_if_empty(self):
         """
-        Если для аккаунта нет тредов и сообщений в БД — инициализируем из внешнего IG API через IGChatService,
+        Если для аккаунта нет тредов И нет сообщений — инициализируем из IG API (IGChatService.initial_sync),
         сохраняем в БД и прогреваем Redis-снепшоты/историю.
         """
         try:
@@ -214,7 +275,6 @@ class DirectConsumer(AsyncJsonWebsocketConsumer):
                 lock_key = BOOTSTRAP_LOCK.format(account_id=str(self.account.pk))
                 lock_acquired = await self._r.set(lock_key, "1", ex=180, nx=True)  # 3 мин TTL
                 if not lock_acquired:
-                    # кто-то уже делает бутстрап — немного подождём и выходим
                     await asyncio.sleep(1.0)
                     return
             except Exception:
@@ -227,123 +287,24 @@ class DirectConsumer(AsyncJsonWebsocketConsumer):
                 logger.warning("bootstrap: IG session not available for account %s", self.account.pk)
                 return
 
-            # Попытка найти совместимые методы сервиса
-            list_threads_fn = getattr(svc, "list_threads", None) or getattr(svc, "fetch_threads", None)
-            fetch_history_fn = (
-                getattr(svc, "fetch_thread_messages", None)
-                or getattr(svc, "get_thread_history", None)
-                or getattr(svc, "fetch_history", None)
+            # Основной бутстрап — в БД
+            await sync_to_async(svc.initial_sync)(
+                threads_limit=BOOTSTRAP_THREADS,
+                msgs_per_thread=BOOTSTRAP_MSGS,
             )
 
-            if not callable(list_threads_fn):
-                logger.warning("bootstrap: service has no list_threads/fetch_threads")
-                return
-
-            threads = await sync_to_async(list_threads_fn)(limit=200)
-            if not threads:
-                logger.info("bootstrap: service returned no threads")
-                return
-
-            # Сохраняем треды и по чуть-чуть истории
-            for th in threads:
-                try:
-                    thread_id = str(th.get("thread_id") or th.get("id") or "").strip()
-                    if not thread_id:
-                        continue
-                    title = th.get("title")
-                    users = th.get("users") or []
-                    last_activity = ts_json(th.get("last_activity"))
-
-                    # DB upsert треда
-                    ig_thread = await sync_to_async(IGThread.objects.update_or_create, thread_sensitive=False)(
-                        ig_account=self.account,
-                        thread_id=thread_id,
-                        defaults={
-                            "title": title,
-                            "users": users,
-                            "last_activity": datetime.fromtimestamp(last_activity/1000.0) if isinstance(last_activity, int) else th.get("last_activity"),
-                        },
-                    )
-                    # update_or_create возвращает (obj, created)
-                    if isinstance(ig_thread, tuple):
-                        ig_thread = ig_thread[0]
-
-                    # Redis прогрев для списка тредов
-                    if self._r:
-                        try:
-                            zkey = THREADS_ZSET_FMT.format(account_id=str(self.account.pk))
-                            tkey = THREAD_KEY_FMT.format(thread_id=thread_id)
-                            score = last_activity or _dt_to_epoch_ms(th.get("last_activity") or datetime.utcnow())
-                            row = {
-                                "thread_id": thread_id,
-                                "title": title,
-                                "users": users,
-                                "last_activity": score,
-                            }
-                            pipe = self._r.pipeline()
-                            pipe.set(tkey, dumps(row))
-                            pipe.zadd(zkey, {thread_id: score})
-                            await pipe.execute()
-                        except Exception as e:
-                            logger.warning("bootstrap: redis thread warmup failed: %s", e)
-
-                    # Подтянем историю (небольшой лимит) — если сервис умеет
-                    msgs = []
-                    if callable(fetch_history_fn):
-                        try:
-                            msgs = await sync_to_async(fetch_history_fn)(thread_id, limit=POLL_LIMIT)
-                        except Exception as e:
-                            logger.warning("bootstrap: fetch_history failed for %s: %s", thread_id, e)
-
-                    # Сохранение сообщений в БД и Redis
-                    if msgs:
-                        hist_key = HIST_LIST_FMT.format(thread_id=thread_id)
-                        to_redis = []
-                        for m in msgs:
-                            try:
-                                mid = str(m.get("mid") or m.get("id") or "").strip()
-                                if not mid:
-                                    continue
-                                created = ts_json(m.get("created_at"))
-                                payload = {
-                                    "mid": mid,
-                                    "text": m.get("text") or "",
-                                    "sender_pk": m.get("sender_pk") or "",
-                                    "username": m.get("username"),
-                                    "created_at": created,
-                                    "direction": m.get("direction") or "in",
-                                    "attachments": m.get("attachments") or [],
-                                }
-                                # DB upsert
-                                await sync_to_async(IGMessage.objects.update_or_create, thread_sensitive=False)(
-                                    mid=mid,
-                                    defaults={
-                                        "thread": ig_thread,
-                                        "text": payload["text"],
-                                        "sender_pk": payload["sender_pk"],
-                                        "created_at": datetime.fromtimestamp(created/1000.0) if isinstance(created, int) else m.get("created_at"),
-                                        "direction": payload["direction"],
-                                        "attachments": payload["attachments"],
-                                    },
-                                )
-                                to_redis.append(dumps(payload))
-                            except Exception:
-                                continue
-                        if self._r and to_redis:
-                            try:
-                                pipe = self._r.pipeline()
-                                for s in to_redis:
-                                    pipe.rpush(hist_key, s)
-                                pipe.ltrim(hist_key, -MAX_HIST, -1)
-                                await pipe.execute()
-                            except Exception as e:
-                                logger.warning("bootstrap: redis hist warmup failed: %s", e)
-
-                except Exception as e:
-                    logger.warning("bootstrap save loop error: %s", e)
+            # Затем прогреть Redis из БД
+            await self._warm_threads_from_db(limit=200)
+            # history только для последних N тредов (быстро)
+            last_threads = await sync_to_async(list, thread_sensitive=False)(
+                IGThread.objects.filter(ig_account=self.account)
+                .order_by("-last_activity")
+                .values_list("thread_id", flat=True)[:BOOTSTRAP_THREADS]
+            )
+            for tid in last_threads:
+                await self._warm_hist_from_db(str(tid), limit=min(BOOTSTRAP_MSGS, MAX_HIST))
 
         finally:
-            # снимаем лок
             if self._r and lock_acquired:
                 try:
                     await self._r.delete(BOOTSTRAP_LOCK.format(account_id=str(self.account.pk)))
@@ -484,7 +445,7 @@ class DirectConsumer(AsyncJsonWebsocketConsumer):
             if not self.thread_id:
                 await self._send_pkt({"type": "error", "detail": "no thread selected"})
                 return
-            text = (content.get("text") or "").trim() if hasattr(str, 'trim') else (content.get("text") or "").strip()
+            text = (content.get("text") or "").strip()
             client_id = (content.get("client_id") or "").strip()  # ← ACK свяжем с фронтом
             if not text:
                 await self._send_pkt({"type": "error", "detail": "text is required"})

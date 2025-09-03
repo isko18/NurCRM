@@ -3,6 +3,7 @@ from django.urls import path
 from .views import (
     # Clients + nested client orders
     CafeClientListCreateView, CafeClientRetrieveUpdateDestroyView, ClientOrderListCreateView,
+    ClientOrderHistoryListView, OrderHistoryListView,  # ← история
 
     # Zones / Tables / Bookings / Warehouse / Purchases / Categories / Menu Items / Ingredients / Orders / Order Items
     ZoneListCreateView, ZoneRetrieveUpdateDestroyView,
@@ -25,6 +26,8 @@ urlpatterns = [
     path("clients/<uuid:pk>/", CafeClientRetrieveUpdateDestroyView.as_view(), name="client-detail"),
     # Вложенные заказы конкретного клиента
     path("clients/<uuid:pk>/orders/", ClientOrderListCreateView.as_view(), name="client-orders"),
+    # История заказов конкретного клиента
+    path("clients/<uuid:pk>/orders/history/", ClientOrderHistoryListView.as_view(), name="client-order-history"),
 
     # === Zones ===
     path("zones/", ZoneListCreateView.as_view(), name="zone-list"),
@@ -61,6 +64,8 @@ urlpatterns = [
     # === Orders ===
     path("orders/", OrderListCreateView.as_view(), name="order-list"),
     path("orders/<uuid:pk>/", OrderRetrieveUpdateDestroyView.as_view(), name="order-detail"),
+    # Общая история заказов компании
+    path("orders/history/", OrderHistoryListView.as_view(), name="order-history"),
 
     # === Order items ===
     path("order-items/", OrderItemListCreateView.as_view(), name="orderitem-list"),
