@@ -495,3 +495,23 @@ class IGChatService:
                 msgs = []
             for m in msgs:
                 self.sync_message(th, m)
+
+    def list_threads(self, limit: int = 200) -> List[dict]:
+        return self.fetch_threads_live(amount=limit)
+
+    def fetch_thread_messages(
+        self,
+        thread_id: str,
+        limit: int = 50,
+        *,
+        user_map: Optional[Dict[str, str]] = None,
+        include_usernames: bool = False,
+        since: Optional[datetime] = None,
+    ) -> List[dict]:
+        return self.fetch_messages_live(
+            thread_id,
+            limit,
+            user_map=user_map,
+            include_usernames=include_usernames,
+            since=since,
+        )

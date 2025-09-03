@@ -5,14 +5,16 @@ from django_filters.rest_framework import DjangoFilterBackend
 from .models import (
     Zone, Table, Booking, Warehouse, Purchase,
     Category, MenuItem, Ingredient,
-    Order, OrderItem, CafeClient,          # ← добавили CafeClient
+    Order, OrderItem, CafeClient,
+    OrderHistory,                                # ← история
 )
 from .serializers import (
     ZoneSerializer, TableSerializer, BookingSerializer,
     WarehouseSerializer, PurchaseSerializer,
     CategorySerializer, MenuItemSerializer, IngredientInlineSerializer,
     OrderSerializer, OrderItemInlineSerializer,
-    CafeClientSerializer,                  # ← добавили сериализатор клиента
+    CafeClientSerializer,
+    OrderHistorySerializer,                      # ← сериализатор истории
 )
 
 
@@ -65,7 +67,6 @@ class ClientOrderListCreateView(CompanyQuerysetMixin, generics.ListCreateAPIView
     ordering_fields = ["created_at", "guests", "id"]
 
     def _get_client(self):
-        # берём клиента в рамках компании текущего пользователя
         company = self.get_company()
         return generics.get_object_or_404(CafeClient, pk=self.kwargs["pk"], company=company)
 
@@ -75,6 +76,43 @@ class ClientOrderListCreateView(CompanyQuerysetMixin, generics.ListCreateAPIView
     def perform_create(self, serializer):
         client = self._get_client()
         serializer.save(company=client.company, client=client)
+
+
+# -------- История заказов клиента (вложенно) --------
+class ClientOrderHistoryListView(CompanyQuerysetMixin, generics.ListAPIView):
+    """
+    /cafe/clients/<uuid:pk>/orders/history/
+    История (архив) заказов конкретного клиента в рамках компании пользователя.
+    """
+    queryset = (OrderHistory.objects
+                .select_related("client", "table", "waiter", "company")
+                .prefetch_related("items"))
+    serializer_class = OrderHistorySerializer
+    filter_backends = [DjangoFilterBackend, filters.OrderingFilter]
+    filterset_fields = ["table", "waiter", "created_at", "archived_at", "guests"]
+    ordering_fields = ["created_at", "archived_at", "id"]
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        company = self.get_company()
+        client = generics.get_object_or_404(CafeClient, pk=self.kwargs["pk"], company=company)
+        return qs.filter(client=client).order_by("-created_at")
+
+
+# -------- Общая история заказов по компании --------
+class OrderHistoryListView(CompanyQuerysetMixin, generics.ListAPIView):
+    """
+    /cafe/orders/history/
+    История (архив) всех заказов компании.
+    """
+    queryset = (OrderHistory.objects
+                .select_related("client", "table", "waiter", "company")
+                .prefetch_related("items"))
+    serializer_class = OrderHistorySerializer
+    filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
+    filterset_fields = ["client", "table", "waiter", "created_at", "archived_at", "guests"]
+    search_fields = ["client__name", "client__phone"]
+    ordering_fields = ["created_at", "archived_at", "id"]
 
 
 # ==================== Zone ====================
@@ -211,17 +249,17 @@ class IngredientRetrieveUpdateDestroyView(CompanyQuerysetMixin, generics.Retriev
 # ==================== Order ====================
 class OrderListCreateView(CompanyQuerysetMixin, generics.ListCreateAPIView):
     queryset = (Order.objects
-                .select_related("table", "waiter", "company", "client")   # ← client
+                .select_related("table", "waiter", "company", "client")
                 .prefetch_related("items__menu_item"))
     serializer_class = OrderSerializer
     filter_backends = [DjangoFilterBackend, filters.OrderingFilter]
-    filterset_fields = ["table", "waiter", "client", "guests", "created_at"]  # ← client в фильтрах
+    filterset_fields = ["table", "waiter", "client", "guests", "created_at"]
     ordering_fields = ["created_at", "guests", "id"]
 
 
 class OrderRetrieveUpdateDestroyView(CompanyQuerysetMixin, generics.RetrieveUpdateDestroyAPIView):
     queryset = (Order.objects
-                .select_related("table", "waiter", "company", "client")   # ← client
+                .select_related("table", "waiter", "company", "client")
                 .prefetch_related("items__menu_item"))
     serializer_class = OrderSerializer
 
