@@ -50,6 +50,7 @@ ACTIVE_SET_FMT    = "ig:active:{account_id}"
 HIST_LIST_FMT     = "ig:hist:{thread_id}"
 THREADS_ZSET_FMT  = "ig:threads:{account_id}"
 THREAD_KEY_FMT    = "ig:thread:{thread_id}"
+BOOTSTRAP_LOCK    = "ig:bootstrap:{account_id}"
 
 
 # ---------------- time helpers ----------------
@@ -185,6 +186,170 @@ class DirectConsumer(AsyncJsonWebsocketConsumer):
             logger.warning("threads snapshot redis failed: %s", e)
             return []
 
+    # ---------- DB bootstrap (при пустой базе) ----------
+    async def _bootstrap_if_empty(self):
+        """
+        Если для аккаунта нет тредов и сообщений в БД — инициализируем из внешнего IG API через IGChatService,
+        сохраняем в БД и прогреваем Redis-снепшоты/историю.
+        """
+        try:
+            has_threads = await sync_to_async(
+                IGThread.objects.filter(ig_account=self.account).exists,
+                thread_sensitive=False,
+            )()
+            has_messages = await sync_to_async(
+                IGMessage.objects.filter(thread__ig_account=self.account).exists,
+                thread_sensitive=False,
+            )()
+            if has_threads or has_messages:
+                return
+        except Exception as e:
+            logger.warning("bootstrap exists-check failed: %s", e)
+            return
+
+        # Redis lock чтобы не делать параллельных бутстрапов
+        lock_acquired = False
+        if self._r:
+            try:
+                lock_key = BOOTSTRAP_LOCK.format(account_id=str(self.account.pk))
+                lock_acquired = await self._r.set(lock_key, "1", ex=180, nx=True)  # 3 мин TTL
+                if not lock_acquired:
+                    # кто-то уже делает бутстрап — немного подождём и выходим
+                    await asyncio.sleep(1.0)
+                    return
+            except Exception:
+                pass
+
+        svc = IGChatService(self.account)
+        try:
+            ok = await sync_to_async(svc.try_resume_session)()
+            if not ok:
+                logger.warning("bootstrap: IG session not available for account %s", self.account.pk)
+                return
+
+            # Попытка найти совместимые методы сервиса
+            list_threads_fn = getattr(svc, "list_threads", None) or getattr(svc, "fetch_threads", None)
+            fetch_history_fn = (
+                getattr(svc, "fetch_thread_messages", None)
+                or getattr(svc, "get_thread_history", None)
+                or getattr(svc, "fetch_history", None)
+            )
+
+            if not callable(list_threads_fn):
+                logger.warning("bootstrap: service has no list_threads/fetch_threads")
+                return
+
+            threads = await sync_to_async(list_threads_fn)(limit=200)
+            if not threads:
+                logger.info("bootstrap: service returned no threads")
+                return
+
+            # Сохраняем треды и по чуть-чуть истории
+            for th in threads:
+                try:
+                    thread_id = str(th.get("thread_id") or th.get("id") or "").strip()
+                    if not thread_id:
+                        continue
+                    title = th.get("title")
+                    users = th.get("users") or []
+                    last_activity = ts_json(th.get("last_activity"))
+
+                    # DB upsert треда
+                    ig_thread = await sync_to_async(IGThread.objects.update_or_create, thread_sensitive=False)(
+                        ig_account=self.account,
+                        thread_id=thread_id,
+                        defaults={
+                            "title": title,
+                            "users": users,
+                            "last_activity": datetime.fromtimestamp(last_activity/1000.0) if isinstance(last_activity, int) else th.get("last_activity"),
+                        },
+                    )
+                    # update_or_create возвращает (obj, created)
+                    if isinstance(ig_thread, tuple):
+                        ig_thread = ig_thread[0]
+
+                    # Redis прогрев для списка тредов
+                    if self._r:
+                        try:
+                            zkey = THREADS_ZSET_FMT.format(account_id=str(self.account.pk))
+                            tkey = THREAD_KEY_FMT.format(thread_id=thread_id)
+                            score = last_activity or _dt_to_epoch_ms(th.get("last_activity") or datetime.utcnow())
+                            row = {
+                                "thread_id": thread_id,
+                                "title": title,
+                                "users": users,
+                                "last_activity": score,
+                            }
+                            pipe = self._r.pipeline()
+                            pipe.set(tkey, dumps(row))
+                            pipe.zadd(zkey, {thread_id: score})
+                            await pipe.execute()
+                        except Exception as e:
+                            logger.warning("bootstrap: redis thread warmup failed: %s", e)
+
+                    # Подтянем историю (небольшой лимит) — если сервис умеет
+                    msgs = []
+                    if callable(fetch_history_fn):
+                        try:
+                            msgs = await sync_to_async(fetch_history_fn)(thread_id, limit=POLL_LIMIT)
+                        except Exception as e:
+                            logger.warning("bootstrap: fetch_history failed for %s: %s", thread_id, e)
+
+                    # Сохранение сообщений в БД и Redis
+                    if msgs:
+                        hist_key = HIST_LIST_FMT.format(thread_id=thread_id)
+                        to_redis = []
+                        for m in msgs:
+                            try:
+                                mid = str(m.get("mid") or m.get("id") or "").strip()
+                                if not mid:
+                                    continue
+                                created = ts_json(m.get("created_at"))
+                                payload = {
+                                    "mid": mid,
+                                    "text": m.get("text") or "",
+                                    "sender_pk": m.get("sender_pk") or "",
+                                    "username": m.get("username"),
+                                    "created_at": created,
+                                    "direction": m.get("direction") or "in",
+                                    "attachments": m.get("attachments") or [],
+                                }
+                                # DB upsert
+                                await sync_to_async(IGMessage.objects.update_or_create, thread_sensitive=False)(
+                                    mid=mid,
+                                    defaults={
+                                        "thread": ig_thread,
+                                        "text": payload["text"],
+                                        "sender_pk": payload["sender_pk"],
+                                        "created_at": datetime.fromtimestamp(created/1000.0) if isinstance(created, int) else m.get("created_at"),
+                                        "direction": payload["direction"],
+                                        "attachments": payload["attachments"],
+                                    },
+                                )
+                                to_redis.append(dumps(payload))
+                            except Exception:
+                                continue
+                        if self._r and to_redis:
+                            try:
+                                pipe = self._r.pipeline()
+                                for s in to_redis:
+                                    pipe.rpush(hist_key, s)
+                                pipe.ltrim(hist_key, -MAX_HIST, -1)
+                                await pipe.execute()
+                            except Exception as e:
+                                logger.warning("bootstrap: redis hist warmup failed: %s", e)
+
+                except Exception as e:
+                    logger.warning("bootstrap save loop error: %s", e)
+
+        finally:
+            # снимаем лок
+            if self._r and lock_acquired:
+                try:
+                    await self._r.delete(BOOTSTRAP_LOCK.format(account_id=str(self.account.pk)))
+                except Exception:
+                    pass
+
     # ---------- lifecycle ----------
     async def connect(self):
         self.account_id = self.scope["url_route"]["kwargs"]["account_id"]
@@ -242,6 +407,9 @@ class DirectConsumer(AsyncJsonWebsocketConsumer):
 
         # подписка на группу
         await self.channel_layer.group_add(self.group, self.channel_name)
+
+        # Прежде чем принимать — возможный бутстрап
+        await self._bootstrap_if_empty()
 
         await self.accept()
         await self._send_pkt({"type": "connected", "enc": "mp" if self._use_msgpack else "json"})
@@ -316,7 +484,7 @@ class DirectConsumer(AsyncJsonWebsocketConsumer):
             if not self.thread_id:
                 await self._send_pkt({"type": "error", "detail": "no thread selected"})
                 return
-            text = (content.get("text") or "").strip()
+            text = (content.get("text") or "").trim() if hasattr(str, 'trim') else (content.get("text") or "").strip()
             client_id = (content.get("client_id") or "").strip()  # ← ACK свяжем с фронтом
             if not text:
                 await self._send_pkt({"type": "error", "detail": "text is required"})
@@ -358,6 +526,9 @@ class DirectConsumer(AsyncJsonWebsocketConsumer):
                     await self._send_pkt({"type": "history", "thread_id": thread_id, "messages": hist})
                     return
 
+            # Если БД пустая — попытаемся бутстрапнуть перед запросом истории
+            await self._bootstrap_if_empty()
+
             base_qs = (
                 IGMessage.objects
                 .filter(thread__ig_account=self.account, thread__thread_id=thread_id)
@@ -385,6 +556,11 @@ class DirectConsumer(AsyncJsonWebsocketConsumer):
             offset = int(content.get("offset") or 0)
 
             snap = await self._threads_snapshot_redis(limit=offset+limit)
+            if not snap:
+                # Попробуем бутстрапнуть, если пусто
+                await self._bootstrap_if_empty()
+                snap = await self._threads_snapshot_redis(limit=offset+limit)
+
             if snap:
                 await self._send_pkt({"type": "threads", "threads": snap[offset:offset+limit]})
                 return
