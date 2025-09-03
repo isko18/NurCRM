@@ -274,14 +274,19 @@ EMAIL_HOST_USER = 'nurcrm2025@gmail.com'
 EMAIL_HOST_PASSWORD = 'yljz yusd uzjd itmo'
 DEFAULT_FROM_EMAIL = 'nurcrm2025@gmail.com'
 
-
+import os
 
 
 CHANNEL_LAYERS = {
     "default": {
         "BACKEND": "channels_redis.core.RedisChannelLayer",
-        "CONFIG": {"hosts": ["redis://127.0.0.1:6379/0"]},
+        "CONFIG": {
+            "hosts": [os.getenv("REDIS_URL", "redis://127.0.0.1:6379/0")],
+            "capacity": 2000,  # ↑ буфер пачек
+            "expiry": 15,      # ↓ время жизни сообщений в слое
+        },
     }
 }
+
 
 INSTAGRAM_POLL_SECONDS = 0.1
