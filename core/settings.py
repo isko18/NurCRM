@@ -53,7 +53,9 @@ INSTALLED_APPS = [
     'apps.cafe',
     'apps.whatsapp',
     'apps.instagram',
-    'apps.storehouse'
+    'apps.storehouse',
+    'logger'
+    
     
 ]
 
