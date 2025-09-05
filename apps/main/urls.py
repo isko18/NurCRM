@@ -95,6 +95,8 @@ urlpatterns = [
     ),
     path("api/main/pos/sales/<uuid:pk>/receipt/", SaleReceiptDownloadAPIView.as_view(), name="sale-receipt-download"),
     path("sales/<uuid:pk>/invoice/", SaleInvoiceDownloadAPIView.as_view()),
-
+    
+    path("transactions/", TransactionRecordListCreateView.as_view(), name="transaction-list"),
+    path("transactions/<uuid:pk>/", TransactionRecordRetrieveUpdateDestroyView.as_view(), name="transaction-detail"),
 ]
 

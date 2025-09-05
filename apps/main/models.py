@@ -7,7 +7,7 @@ from django.db import models
 from decimal import Decimal
 from django.utils import timezone
 from mptt.models import MPTTModel, TreeForeignKey
-
+from django.core.validators import MinValueValidator
 
 class Contact(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
@@ -788,3 +788,35 @@ class SocialApplications(models.Model):
         verbose_name = "Заявка на соц. сети"
         verbose_name_plural = "Заявки на соц. сети"
         ordering = ["-created_at"]
+        
+        
+class TransactionRecord(models.Model):
+    class Status(models.TextChoices):
+        NEW = 'new', 'Новая'
+        APPROVED = 'approved', 'Подтверждена'
+        CANCELLED = 'cancelled', 'Отменена'
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    company = models.ForeignKey(
+        Company, on_delete=models.CASCADE, related_name='transaction_records', verbose_name='Компания'
+    )
+    name = models.CharField('Наименование', max_length=255)
+    amount = models.DecimalField('Сумма', max_digits=12, decimal_places=2,
+                                 validators=[MinValueValidator(Decimal('0'))])
+    status = models.CharField('Статус', max_length=16, choices=Status.choices, default=Status.NEW)
+    date = models.DateField('Дата')
+
+    created_at = models.DateTimeField('Создано', auto_now_add=True)
+    updated_at = models.DateTimeField('Обновлено', auto_now=True)
+
+    class Meta:
+        verbose_name = 'Запись'
+        verbose_name_plural = 'Записи'
+        ordering = ['-date', '-created_at']
+        indexes = [
+            models.Index(fields=['company', 'date']),
+            models.Index(fields=['company', 'status']),
+        ]
+
+    def __str__(self):
+        return f'{self.name} — {self.amount} ({self.get_status_display()})'

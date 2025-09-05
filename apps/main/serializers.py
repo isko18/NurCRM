@@ -1,5 +1,5 @@
 from rest_framework import serializers
-from apps.main.models import Contact, Pipeline, Deal, Task, Integration, Analytics, Order, Product, Review, Notification, Event, Warehouse, WarehouseEvent, ProductCategory, ProductBrand, OrderItem, Client, GlobalProduct, CartItem, ClientDeal, Bid, SocialApplications
+from apps.main.models import Contact, Pipeline, Deal, Task, Integration, Analytics, Order, Product, Review, Notification, Event, Warehouse, WarehouseEvent, ProductCategory, ProductBrand, OrderItem, Client, GlobalProduct, CartItem, ClientDeal, Bid, SocialApplications, TransactionRecord
 
 from apps.users.models import User, Company
 from django.db import transaction
@@ -510,3 +510,34 @@ class ClientDealSerializer(serializers.ModelSerializer):
         # его добавит view через serializer.save(client=...)
         validated_data['company'] = self.context['request'].user.company
         return super().create(validated_data)
+    
+class TransactionRecordSerializer(serializers.ModelSerializer):
+    # компания только для чтения, берём из request.user.company
+    company = serializers.ReadOnlyField(source="company.id")
+
+    class Meta:
+        model = TransactionRecord
+        fields = [
+            "id",
+            "company",
+            "name",
+            "amount",
+            "status",
+            "date",
+            "created_at",
+            "updated_at",
+        ]
+        read_only_fields = ["id", "company", "created_at", "updated_at"]
+
+    def create(self, validated_data):
+        user = self.context.get("request").user
+        company = getattr(user, "owned_company", None) or getattr(user, "company", None)
+        if not company:
+            raise serializers.ValidationError("Невозможно определить компанию пользователя.")
+        validated_data["company"] = company
+        return super().create(validated_data)
+
+    def update(self, instance, validated_data):
+        # Защищаем company от внешнего изменения
+        validated_data.pop("company", None)
+        return super().update(instance, validated_data)
