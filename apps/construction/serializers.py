@@ -12,25 +12,66 @@ class CashFlowInsideCashboxSerializer(serializers.ModelSerializer):
 
 # ─── CASHBOX: c вложенными CashFlow ────────────────────────
 class CashboxWithFlowsSerializer(serializers.ModelSerializer):
+    company = serializers.ReadOnlyField(source='company.id')
+    department = serializers.PrimaryKeyRelatedField(
+        queryset=Department.objects.all(), allow_null=True, required=False
+    )
     department_name = serializers.SerializerMethodField()
     cashflows = CashFlowInsideCashboxSerializer(source='flows', many=True, read_only=True)
 
     class Meta:
         model = Cashbox
-        fields = ['id', 'department', 'department_name', 'name', 'cashflows']
+        fields = ['id', 'company', 'department', 'department_name', 'name', 'cashflows']
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        request = self.context.get('request')
+        if request and getattr(request.user, 'company_id', None):
+            # Разрешаем выбирать только отделы своей компании
+            self.fields['department'].queryset = Department.objects.filter(
+                company_id=request.user.company_id
+            )
 
     def get_department_name(self, obj):
         return obj.department.name if obj.department else None
 
+    def validate(self, attrs):
+        request = self.context.get('request')
+        dept = attrs.get('department') or getattr(self.instance, 'department', None)
+        if dept and request and dept.company_id != request.user.company_id:
+            raise serializers.ValidationError('Отдел должен принадлежать вашей компании.')
+        return attrs
+
+    def create(self, validated_data):
+        request = self.context.get('request')
+        validated_data['company'] = request.user.company
+        return super().create(validated_data)
+
+    def update(self, instance, validated_data):
+        validated_data.pop('company', None)
+        return super().update(instance, validated_data)
+
 
 # ─── CASHBOX: краткий (для Department) ─────────────────────
 class CashboxSerializer(serializers.ModelSerializer):
+    company = serializers.ReadOnlyField(source='company.id')
+    department = serializers.PrimaryKeyRelatedField(
+        queryset=Department.objects.all(), allow_null=True, required=False
+    )
     department_name = serializers.SerializerMethodField()
     analytics = serializers.SerializerMethodField()
 
     class Meta:
         model = Cashbox
-        fields = ['id', 'department', 'department_name', 'name', 'analytics']
+        fields = ['id', 'company', 'department', 'department_name', 'name', 'analytics']
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        request = self.context.get('request')
+        if request and getattr(request.user, 'company_id', None):
+            self.fields['department'].queryset = Department.objects.filter(
+                company_id=request.user.company_id
+            )
 
     def get_department_name(self, obj):
         return obj.department.name if obj.department else None
@@ -38,30 +79,72 @@ class CashboxSerializer(serializers.ModelSerializer):
     def get_analytics(self, obj):
         return obj.get_summary()
 
+    def validate(self, attrs):
+        request = self.context.get('request')
+        dept = attrs.get('department') or getattr(self.instance, 'department', None)
+        if dept and request and dept.company_id != request.user.company_id:
+            raise serializers.ValidationError('Отдел должен принадлежать вашей компании.')
+        return attrs
+
+    def create(self, validated_data):
+        request = self.context.get('request')
+        validated_data['company'] = request.user.company
+        return super().create(validated_data)
+
+    def update(self, instance, validated_data):
+        validated_data.pop('company', None)
+        return super().update(instance, validated_data)
 
 
 # ─── CASHFLOW: основной ────────────────────────────────────
 class CashFlowSerializer(serializers.ModelSerializer):
+    company = serializers.ReadOnlyField(source='company.id')
+    cashbox = serializers.PrimaryKeyRelatedField(queryset=Cashbox.objects.all())
     cashbox_name = serializers.SerializerMethodField()
 
     class Meta:
         model = CashFlow
         fields = [
             'id',
-            'cashbox',           
+            'company',
+            'cashbox',
             'cashbox_name',
             'type',
             'name',
             'amount',
             'created_at'
         ]
-        read_only_fields = ['id', 'created_at', 'cashbox_name']
+        read_only_fields = ['id', 'created_at', 'cashbox_name', 'company']
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        request = self.context.get('request')
+        if request and getattr(request.user, 'company_id', None):
+            # Разрешаем выбирать только кассы своей компании
+            self.fields['cashbox'].queryset = Cashbox.objects.filter(
+                company_id=request.user.company_id
+            )
 
     def get_cashbox_name(self, obj):
         if obj.cashbox.department:
             return obj.cashbox.department.name
         return obj.cashbox.name or "Свободная касса"
 
+    def validate(self, attrs):
+        request = self.context.get('request')
+        cashbox = attrs.get('cashbox') or getattr(self.instance, 'cashbox', None)
+        if cashbox and request and cashbox.company_id != request.user.company_id:
+            raise serializers.ValidationError('Касса должна принадлежать вашей компании.')
+        return attrs
+
+    def create(self, validated_data):
+        request = self.context.get('request')
+        validated_data['company'] = request.user.company
+        return super().create(validated_data)
+
+    def update(self, instance, validated_data):
+        validated_data.pop('company', None)
+        return super().update(instance, validated_data)
 
 
 # ─── DEPARTMENT: основной ──────────────────────────────────
@@ -111,7 +194,7 @@ class DepartmentSerializer(serializers.ModelSerializer):
                 if field in entry:
                     setattr(user, field, entry[field])
             user.save()
-            
+
     def create(self, validated_data):
         request = self.context.get('request')
         validated_data['company'] = request.user.company

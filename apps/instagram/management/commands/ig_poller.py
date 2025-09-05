@@ -1,9 +1,10 @@
+# apps/instagram/management/commands/ig_poller.py
 import os
 import asyncio
 import logging
 import random
 from datetime import datetime, timezone as dt_tz
-from typing import Dict, Optional, List
+from typing import Dict, Optional
 
 from asgiref.sync import sync_to_async
 from django.core.management.base import BaseCommand
@@ -25,15 +26,15 @@ from ...service import IGChatService
 
 logger = logging.getLogger(__name__)
 
-# ====== интервалы/лимиты (резвые дефолты) ======
-INBOX_INTERVAL_ACTIVE = float(os.getenv("IG_INBOX_ACTIVE", "0.25"))
-INBOX_INTERVAL_IDLE   = float(os.getenv("IG_INBOX_IDLE", "1.5"))
-THREAD_POLL_INTERVAL  = float(os.getenv("IG_THREAD_POLL", "0.25"))
-POLL_LIMIT            = max(5, int(os.getenv("IG_POLL_LIMIT", "200")))
+# Интервалы/лимиты
+INBOX_INTERVAL_ACTIVE = float(os.getenv("IG_INBOX_ACTIVE", "0.5"))
+INBOX_INTERVAL_IDLE   = float(os.getenv("IG_INBOX_IDLE", "0.2"))
+THREAD_POLL_INTERVAL  = float(os.getenv("IG_THREAD_POLL", "0.1"))
+POLL_LIMIT            = int(os.getenv("IG_POLL_LIMIT", "6"))
 REDIS_URL             = os.getenv("REDIS_URL", "redis://127.0.0.1:6379/0")
-MAX_HIST              = int(os.getenv("IG_HIST_CACHE", "200"))
+MAX_HIST              = int(os.getenv("IG_HIST_CACHE", "400"))
 
-# ====== имена групп/ключей ======
+# Имена групп/ключей
 GROUP_FMT         = "ig.{account_id}"          # Channels group (без ':')
 ACTIVE_SET_FMT    = "ig:active:{account_id}"   # Redis Set активных тредов
 WM_HASH_FMT       = "ig:wm:{account_id}"       # Redis Hash watermarks (ISO)
@@ -47,13 +48,18 @@ def _dt_to_epoch_ms(dt: Optional[datetime]) -> Optional[int]:
     if not dt:
         return None
     if timezone.is_naive(dt):
-        dt = timezone.make_aware(dt, timezone=dt_tz.utc)
-    else:
-        dt = dt.astimezone(dt_tz.utc)
+        dt = timezone.make_aware(dt)
     return int(dt.timestamp() * 1000)
 
 
 def ts_json(val):
+    """
+    Унификация временных меток:
+      - datetime -> epoch ms (int)
+      - int/float -> int
+      - None -> None
+      - прочее -> вернуть как есть
+    """
     if val is None:
         return None
     if isinstance(val, (int, float)):
@@ -64,36 +70,38 @@ def ts_json(val):
 
 
 def serialize_dt(dt_obj: datetime | str | None) -> str | None:
+    """
+    Для хранения в WM_HASH используем ISO-строку.
+    """
     if not dt_obj:
         return None
     if isinstance(dt_obj, datetime):
         if timezone.is_naive(dt_obj):
-            dt_obj = timezone.make_aware(dt_obj, timezone=dt_tz.utc)
-        else:
-            dt_obj = dt_obj.astimezone(dt_tz.utc)
+            dt_obj = timezone.make_aware(dt_obj)
         return dt_obj.isoformat()
     return str(dt_obj)
 
 
 def parse_dt(val) -> Optional[datetime]:
     if isinstance(val, datetime):
-        return timezone.make_aware(val, timezone=dt_tz.utc) if timezone.is_naive(val) else val.astimezone(dt_tz.utc)
+        return val
     if not val:
         return None
     try:
-        dt = datetime.fromisoformat(str(val).replace("Z", "+00:00"))
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=dt_tz.utc)
-        return dt.astimezone(dt_tz.utc)
+        return datetime.fromisoformat(str(val))
     except Exception:
         return None
 
 
 def _to_dt(val) -> Optional[datetime]:
+    """
+    Универсальная конверсия: epoch(sec/ms/us) ИЛИ ISO -> aware datetime UTC.
+    Нужна для значений created_at, которые приходят как epoch-ms (int).
+    """
     if not val:
         return None
     if isinstance(val, datetime):
-        return timezone.make_aware(val, timezone=dt_tz.utc) if timezone.is_naive(val) else val.astimezone(dt_tz.utc)
+        return timezone.make_aware(val) if timezone.is_naive(val) else val
     s = str(val)
     if s.isdigit():
         try:
@@ -106,10 +114,7 @@ def _to_dt(val) -> Optional[datetime]:
         except Exception:
             return None
     try:
-        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=dt_tz.utc)
-        return dt.astimezone(dt_tz.utc)
+        return datetime.fromisoformat(s.replace("Z", "+00:00"))
     except Exception:
         return None
 
@@ -121,18 +126,13 @@ def dumps(obj: dict) -> str:
     return json.dumps(obj, separators=(",", ":"))
 
 
-def _created_dt(msg: dict) -> Optional[datetime]:
-    """Безопасно достаём created_at как aware datetime (UTC)."""
-    return _to_dt(msg.get("created_at"))
-
-
 class AccountWorker:
     """
-    Реактивный воркер IG-аккаунта:
-      — быстрый опрос inbox/активных тредов
-      — синк БД
-      — события в Channels-группу (timestamps уже epoch-ms)
-      — Redis: история (LIST) и снепшоты тредов (ZSET + per-thread key)
+    Воркер на IG-аккаунт:
+      — опрашивает inbox и активные треды через IGChatService
+      — синкает БД (IGThread/IGMessage)
+      — шлёт события в Channels-группу (created_at/last_activity уже epoch-ms)
+      — ведёт Redis-кэш истории (LIST) и снапшот списка тредов (ZSET + per-thread key)
     """
     def __init__(self, account: CompanyIGAccount, channel_layer, r=None):
         self.account = account
@@ -178,6 +178,10 @@ class AccountWorker:
             logger.warning("wm hset failed: %s", e)
 
     async def _hist_push(self, thread_id: str, msg: dict, u_map: Dict[str, str]):
+        """
+        Кладём нормализованную запись в Redis LIST (последние MAX_HIST).
+        created_at — epoch ms.
+        """
         if not self.r:
             return
         key = HIST_LIST_FMT.format(thread_id=thread_id)
@@ -197,6 +201,10 @@ class AccountWorker:
             logger.warning("hist push failed: %s", e)
 
     async def _snapshot_thread(self, t: dict, users: list | None, last_dt: Optional[datetime]):
+        """
+        Обновляем ZSET (по времени) и персистим компактный снапшот треда.
+        last_activity кладём как epoch-ms в JSON, а score — в секундах.
+        """
         if not self.r:
             return
         tid = t["thread_id"]
@@ -254,35 +262,39 @@ class AccountWorker:
         while True:
             try:
                 active = await self._get_active_threads()
-
-                base_sleep = THREAD_POLL_INTERVAL if active else INBOX_INTERVAL_IDLE
+                base_sleep = INBOX_INTERVAL_ACTIVE if active else INBOX_INTERVAL_IDLE
 
                 updates_found = await self._tick_inbox(active_threads=active)
                 if active:
                     await self._tick_active_threads(active)
 
-                sleep_for = inbox_backoff or (max(0.12, base_sleep * (0.6 if updates_found else 1.0)))
-                sleep_for *= 0.9 + 0.2 * random.random()  # лёгкий джиттер
+                sleep_for = inbox_backoff or (max(0.6, base_sleep * 0.5) if updates_found else base_sleep)
+                # небольшой джиттер, чтобы рассинхронизировать аккаунты/воркеры
+                sleep_for *= 0.85 + 0.3 * random.random()
                 await asyncio.sleep(sleep_for)
                 inbox_backoff = 0.0
             except Exception as e:
-                logger.exception("account loop error (%s): %s",
-                                 getattr(self.account, "username", self.account.pk), e)
-                inbox_backoff = min((inbox_backoff or 0.25) * 2, 4.0)
+                logger.exception("account loop error (%s): %s", getattr(self.account, "username", self.account.pk), e)
+                inbox_backoff = min((inbox_backoff or 0.5) * 2, 8.0)
                 await asyncio.sleep(inbox_backoff)
 
     async def _tick_inbox(self, active_threads: set[str]) -> bool:
         updates_found = False
+
+        # Забираем треды
         threads = await asyncio.to_thread(self.cl.fetch_threads_live, 30)
 
         for t in threads:
             tid = t["thread_id"]
+            # Нормализуем last_activity к datetime для сравнения
             last = parse_dt(t.get("last_activity"))
             prev = self.threads_cache.get(tid)
 
+            # Для sync в БД лучше передать корректный datetime
             t_for_db = {**t, "last_activity": last}
             th = await self._sync_thread(t_for_db)
 
+            # users cache
             u_map = self.thread_users.get(tid)
             users = t.get("users")
             if u_map is None:
@@ -293,15 +305,16 @@ class AccountWorker:
             elif users is None:
                 users = [{"pk": pk, "username": name} for pk, name in u_map.items()]
 
-            # актуализируем снэпшот
+            # поддерживаем Redis snapshot
             await self._snapshot_thread(t_for_db, users, last)
 
             # Новый тред
             if prev is None:
                 preview = await asyncio.to_thread(self.cl.fetch_last_text, tid, u_map)
                 if preview:
+                    # в БД — как есть (datetime), в Redis/клиента — нормализуем ниже
                     await self._sync_msg(th, preview)
-                    wm = _created_dt(preview)
+                    wm = _to_dt(preview.get("created_at"))   # FIX: epoch-ms -> datetime
                     if wm:
                         await self._set_wm(tid, wm)
                     await self._hist_push(tid, preview, u_map)
@@ -310,15 +323,16 @@ class AccountWorker:
                     "type": "thread_new",
                     "thread": {
                         **t,
-                        "last_activity": ts_json(last),
+                        "last_activity": ts_json(last),   # epoch-ms
                         "users": users,
-                        "preview": ({**preview, "created_at": ts_json(preview["created_at"])}
-                                    if preview else None),
+                        "preview": (
+                            {**preview, "created_at": ts_json(preview["created_at"])}
+                            if preview else None
+                        ),
                     }
                 })
 
-                # на клиент слать входящие превью — только если это не наше исходящее
-                if preview and preview.get("direction") != "out" and (tid not in active_threads):
+                if preview and (tid not in active_threads):
                     await self.group_send({
                         "type": "incoming_batch",
                         "thread_id": tid,
@@ -335,50 +349,48 @@ class AccountWorker:
 
             # Обновление существующего
             if last and prev and last > prev:
-                # Подтягиваем новые с учётом WM/prev
-                since_dt = await self._get_wm(tid) or prev
-                new_msgs: List[dict] = await asyncio.to_thread(
-                    self.cl.fetch_messages_live, tid, POLL_LIMIT,
-                    user_map=None, include_usernames=False, since=since_dt,
-                )
+                if tid not in active_threads:
+                    since_dt = await self._get_wm(tid) or prev
+                    new_msgs = await asyncio.to_thread(
+                        self.cl.fetch_messages_live,
+                        tid,
+                        POLL_LIMIT,
+                        user_map=None,
+                        include_usernames=False,
+                        since=since_dt,
+                    )
+                    if new_msgs:
+                        for m in new_msgs:
+                            await self._sync_msg(th, m)
+                            await self._hist_push(tid, m, u_map)
 
-                if new_msgs:
-                    # sync + history cache
-                    for m in new_msgs:
-                        await self._sync_msg(th, m)
-                        await self._hist_push(tid, m, u_map)
-
-                    # отправляем только входящие, чтобы не дублировать исходящие
-                    in_only = [m for m in new_msgs if m.get("direction") != "out"]
-                    if in_only:
                         await self.group_send({
                             "type": "incoming_batch",
                             "thread_id": tid,
                             "messages": [
-                                {**m, "created_at": ts_json(m.get("created_at")),
-                                 "username": u_map.get(m.get("sender_pk"))}
-                                for m in in_only
+                                {**m, "created_at": ts_json(m.get("created_at")), "username": u_map.get(m.get("sender_pk"))}
+                                for m in new_msgs
                             ],
                         })
 
-                    last_created = _created_dt(new_msgs[-1]) or last
-                    if last_created:
-                        await self._set_wm(tid, last_created)
-                        # актуализируем зет/снэпшот по реальному времени сообщения
-                        await self._snapshot_thread(t_for_db, users, last_created)
+                        last_created = _to_dt(new_msgs[-1].get("created_at"))  # FIX
+                        if last_created:
+                            await self._set_wm(tid, last_created)
 
                 preview = await asyncio.to_thread(self.cl.fetch_last_text, tid, u_map)
                 await self.group_send({
                     "type": "thread_update",
                     "thread_id": tid,
-                    "last_activity": ts_json(last),
-                    "preview": ({**preview, "created_at": ts_json(preview["created_at"])}
-                                if preview else None),
-                    "has_new": bool(new_msgs),
+                    "last_activity": ts_json(last),   # epoch-ms
+                    "preview": (
+                        {**preview, "created_at": ts_json(preview["created_at"])}
+                        if preview else None
+                    ),
+                    "has_new": True,
                 })
 
                 self.threads_cache[tid] = last
-                updates_found = updates_found or bool(new_msgs)
+                updates_found = True
 
         return updates_found
 
@@ -389,66 +401,58 @@ class AccountWorker:
 
     async def _poll_thread_once(self, thread_id: str):
         try:
-            th = await asyncio.to_thread(IGThread.objects.get,
-                                         ig_account=self.account, thread_id=thread_id)
+            th = await asyncio.to_thread(IGThread.objects.get, ig_account=self.account, thread_id=thread_id)
         except IGThread.DoesNotExist:
             th = await self._sync_thread({
-                "thread_id": thread_id, "title": "",
-                "users": [{"pk": pk, "username": name}
-                          for pk, name in (self.thread_users.get(thread_id, {})).items()],
-                "last_activity": timezone.now(),
+                "thread_id": thread_id,
+                "title": "",
+                "users": [{"pk": pk, "username": name} for pk, name in (self.thread_users.get(thread_id, {})).items()],
+                "last_activity": timezone.localtime(),
             })
 
         u_map = await self._ensure_thread_users(thread_id)
 
         since_dt = await self._get_wm(thread_id)
-        msgs: List[dict] = await asyncio.to_thread(
-            self.cl.fetch_messages_live, thread_id, POLL_LIMIT,
-            user_map=None, include_usernames=False, since=since_dt,
+        msgs = await asyncio.to_thread(
+            self.cl.fetch_messages_live,
+            thread_id,
+            POLL_LIMIT,
+            user_map=None,
+            include_usernames=False,
+            since=since_dt,
         )
 
-        last_created: Optional[datetime] = None
         if msgs:
             for m in msgs:
                 await self._sync_msg(th, m)
                 await self._hist_push(thread_id, m, u_map)
-            last_created = _created_dt(msgs[-1])
 
-            # только входящие — в канал
-            in_only = [m for m in msgs if m.get("direction") != "out"]
-            if in_only:
-                await self.group_send({
-                    "type": "incoming_batch",
-                    "thread_id": thread_id,
-                    "messages": [
-                        {**m, "created_at": ts_json(m.get("created_at")),
-                         "username": u_map.get(m.get("sender_pk"))}
-                        for m in in_only
-                    ],
-                })
+            await self.group_send({
+                "type": "incoming_batch",
+                "thread_id": thread_id,
+                "messages": [
+                    {**m, "created_at": ts_json(m.get("created_at")), "username": u_map.get(m.get("sender_pk"))}
+                    for m in msgs
+                ],
+            })
 
+            last_created = _to_dt(msgs[-1].get("created_at"))  # FIX
             if last_created:
                 await self._set_wm(thread_id, last_created)
 
-        # снэпшот по реальному времени сообщения (если было), иначе — по now()
-        snapshot_dt = last_created or timezone.now()
-        await self._snapshot_thread({"thread_id": thread_id, "title": ""},
-                                    [{"pk": pk, "username": name} for pk, name in u_map.items()],
-                                    snapshot_dt)
-        await asyncio.to_thread(lambda: IGThread.objects.filter(pk=th.pk).update(last_activity=snapshot_dt))
+        # Поддержка Redis snapshot по last_activity
+        now_dt = timezone.localtime()
+        await self._snapshot_thread(
+            {"thread_id": thread_id, "title": ""},
+            [{"pk": pk, "username": name} for pk, name in u_map.items()],
+            now_dt,
+        )
 
-        if msgs:
-            last = msgs[-1]
-            try:
-                await self.group_send({
-                    "type": "thread_update",
-                    "thread_id": thread_id,
-                    "last_activity": ts_json(snapshot_dt),
-                    "preview": {**last, "created_at": ts_json(last.get("created_at"))},
-                    "has_new": True,
-                })
-            except Exception as e:
-                logger.warning("thread_update broadcast failed: %s", e)
+        # Обновим last_activity в БД без гидрации
+        await asyncio.to_thread(
+            lambda: IGThread.objects.filter(pk=th.pk).update(last_activity=now_dt)
+        )
+        await asyncio.sleep(THREAD_POLL_INTERVAL)
 
 
 class Command(BaseCommand):

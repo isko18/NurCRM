@@ -52,7 +52,7 @@ apps_includes = [
       
     path('instagram/', include('apps.instagram.urls')),   
     
-    path('logger/', include('logger.urls')),   
+    # path('logger/', include('logger.urls')),   
     
     
     

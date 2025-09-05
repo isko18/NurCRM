@@ -54,9 +54,7 @@ INSTALLED_APPS = [
     'apps.whatsapp',
     'apps.instagram',
     'apps.storehouse',
-    'logger'
-    
-    
+    # "apps.instagram_mcp",
 ]
 
 MIDDLEWARE = [
