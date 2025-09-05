@@ -11,14 +11,15 @@ from rest_framework.views import APIView
 from rest_framework.exceptions import NotFound
 from django.shortcuts import get_object_or_404
 from rest_framework import serializers
-
+from .filters import TransactionRecordFilter
 from django_filters.rest_framework import DjangoFilterBackend
+from rest_framework.exceptions import PermissionDenied
 
 from apps.main.models import (
     Contact, Pipeline, Deal, Task, Integration, Analytics,
     Order, Product, Review, Notification, Event,
     ProductBrand, ProductCategory, Warehouse, WarehouseEvent, Client,
-    GlobalProduct, GlobalBrand, GlobalCategory, ClientDeal, Bid, SocialApplications
+    GlobalProduct, GlobalBrand, GlobalCategory, ClientDeal, Bid, SocialApplications, TransactionRecord
 )
 from apps.main.serializers import (
     ContactSerializer, PipelineSerializer, DealSerializer, TaskSerializer,
@@ -26,7 +27,7 @@ from apps.main.serializers import (
     ReviewSerializer, NotificationSerializer, EventSerializer,
     WarehouseSerializer, WarehouseEventSerializer,
     ProductCategorySerializer, ProductBrandSerializer,
-    OrderItemSerializer, ClientSerializer, ClientDealSerializer, BidSerializers, SocialApplicationsSerializers
+    OrderItemSerializer, ClientSerializer, ClientDealSerializer, BidSerializers, SocialApplicationsSerializers, TransactionRecordSerializer
 )
 
 
@@ -588,4 +589,49 @@ class SocialApplicationsRetrieveUpdateDestroyAPIView(generics.RetrieveUpdateDest
     serializer_class = SocialApplicationsSerializers
     queryset = SocialApplications.objects.all()
     
-    
+
+def _get_company(user):
+    if user.is_superuser:
+        return None
+    return getattr(user, "owned_company", None) or getattr(user, "company", None)
+
+class TransactionRecordListCreateView(generics.ListCreateAPIView):
+    serializer_class = TransactionRecordSerializer
+    permission_classes = [permissions.IsAuthenticated]
+    filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
+    filterset_class = TransactionRecordFilter
+    search_fields = ["name"]
+    ordering_fields = ["date", "amount", "created_at", "id"]
+    ordering = ["-date", "-created_at"]
+
+    def get_queryset(self):
+        user = self.request.user
+        if user.is_superuser:
+            return TransactionRecord.objects.all()
+        company = _get_company(user)
+        if company:
+            return TransactionRecord.objects.filter(company=company)
+        return TransactionRecord.objects.none()
+
+    def perform_create(self, serializer):
+        user = self.request.user
+        company = _get_company(user)
+        if not (user.is_superuser or company):
+            raise PermissionDenied("Нет прав создавать записи.")
+        # суперюзеру тоже проставим компанию пользователя (если есть)
+        if user.is_superuser and not company:
+            raise PermissionDenied("Суперпользователю необходимо иметь company для создания записи.")
+        serializer.save(company=company)
+
+class TransactionRecordRetrieveUpdateDestroyView(generics.RetrieveUpdateDestroyAPIView):
+    serializer_class = TransactionRecordSerializer
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get_queryset(self):
+        user = self.request.user
+        if user.is_superuser:
+            return TransactionRecord.objects.all()
+        company = _get_company(user)
+        if company:
+            return TransactionRecord.objects.filter(company=company)
+        return TransactionRecord.objects.none()
