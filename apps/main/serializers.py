@@ -1,6 +1,6 @@
 from rest_framework import serializers
 from apps.main.models import Contact, Pipeline, Deal, Task, Integration, Analytics, Order, Product, Review, Notification, Event, Warehouse, WarehouseEvent, ProductCategory, ProductBrand, OrderItem, Client, GlobalProduct, CartItem, ClientDeal, Bid, SocialApplications, TransactionRecord
-
+from apps.construction.models import Department
 from apps.users.models import User, Company
 from django.db import transaction
 
@@ -512,14 +512,25 @@ class ClientDealSerializer(serializers.ModelSerializer):
         return super().create(validated_data)
     
 class TransactionRecordSerializer(serializers.ModelSerializer):
-    # компания только для чтения, берём из request.user.company
+    # компания только для чтения (id)
     company = serializers.ReadOnlyField(source="company.id")
+
+    # новое поле: отдел
+    department = serializers.PrimaryKeyRelatedField(
+        queryset=Department.objects.all(),
+        required=False,
+        allow_null=True
+    )
+    # опционально удобно отдавать имя отдела
+    department_name = serializers.CharField(source="department.name", read_only=True)
 
     class Meta:
         model = TransactionRecord
         fields = [
             "id",
             "company",
+            "department",
+            "department_name",
             "name",
             "amount",
             "status",
@@ -527,17 +538,68 @@ class TransactionRecordSerializer(serializers.ModelSerializer):
             "created_at",
             "updated_at",
         ]
-        read_only_fields = ["id", "company", "created_at", "updated_at"]
+        read_only_fields = ["id", "company", "department_name", "created_at", "updated_at"]
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # Ограничим выбор отделов компанией текущего пользователя
+        request = self.context.get("request")
+        user = getattr(request, "user", None)
+        company = getattr(user, "owned_company", None) or getattr(user, "company", None)
+        if company and "department" in self.fields:
+            self.fields["department"].queryset = Department.objects.filter(company=company)
+
+    def validate_department(self, department):
+        """
+        Защитимся от скрещивания разных компаний.
+        """
+        if department is None:
+            return department
+        request = self.context.get("request")
+        user = getattr(request, "user", None)
+        company = getattr(user, "owned_company", None) or getattr(user, "company", None)
+        if company and department.company_id != company.id:
+            raise serializers.ValidationError("Отдел принадлежит другой компании.")
+        return department
 
     def create(self, validated_data):
-        user = self.context.get("request").user
+        request = self.context.get("request")
+        user = getattr(request, "user", None)
+
         company = getattr(user, "owned_company", None) or getattr(user, "company", None)
+        department = validated_data.get("department")
+
+        # Если отдел указан — сверим компанию; если у пользователя компании нет, возьмём из отдела
+        if department:
+            if company and department.company_id != company.id:
+                raise serializers.ValidationError({"department": "Отдел принадлежит другой компании."})
+            if not company:
+                company = department.company
+
         if not company:
             raise serializers.ValidationError("Невозможно определить компанию пользователя.")
+
         validated_data["company"] = company
         return super().create(validated_data)
 
     def update(self, instance, validated_data):
-        # Защищаем company от внешнего изменения
+        """
+        company остаётся как есть (фиксируется на компанию пользователя по вью/фильтрам).
+        При смене department проверяем согласованность.
+        """
         validated_data.pop("company", None)
+
+        new_department = validated_data.get("department", getattr(instance, "department", None))
+        if new_department:
+            # проверим ещё раз на всякий случай
+            request = self.context.get("request")
+            user = getattr(request, "user", None)
+            company = getattr(user, "owned_company", None) or getattr(user, "company", None)
+            # если компания пользователя известна — сверим
+            if company and new_department.company_id != company.id:
+                raise serializers.ValidationError({"department": "Отдел принадлежит другой компании."})
+            # если по каким-то причинам экземпляр без company (не должно случиться) — подставим
+            if not instance.company_id:
+                validated_data["company"] = new_department.company
+
         return super().update(instance, validated_data)

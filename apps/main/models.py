@@ -8,6 +8,8 @@ from decimal import Decimal
 from django.utils import timezone
 from mptt.models import MPTTModel, TreeForeignKey
 from django.core.validators import MinValueValidator
+from apps.construction.models import Department
+from django.core.exceptions import ValidationError
 
 class Contact(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
@@ -789,7 +791,6 @@ class SocialApplications(models.Model):
         verbose_name_plural = "Заявки на соц. сети"
         ordering = ["-created_at"]
         
-        
 class TransactionRecord(models.Model):
     class Status(models.TextChoices):
         NEW = 'new', 'Новая'
@@ -800,9 +801,21 @@ class TransactionRecord(models.Model):
     company = models.ForeignKey(
         Company, on_delete=models.CASCADE, related_name='transaction_records', verbose_name='Компания'
     )
+
+    # ← НОВОЕ ПОЛЕ
+    department = models.ForeignKey(
+        Department,
+        on_delete=models.SET_NULL,  # не блокируем удаление отдела
+        null=True, blank=True,
+        related_name='transaction_records',
+        verbose_name='Отдел'
+    )
+
     name = models.CharField('Наименование', max_length=255)
-    amount = models.DecimalField('Сумма', max_digits=12, decimal_places=2,
-                                 validators=[MinValueValidator(Decimal('0'))])
+    amount = models.DecimalField(
+        'Сумма', max_digits=12, decimal_places=2,
+        validators=[MinValueValidator(Decimal('0'))]
+    )
     status = models.CharField('Статус', max_length=16, choices=Status.choices, default=Status.NEW)
     date = models.DateField('Дата')
 
@@ -816,7 +829,21 @@ class TransactionRecord(models.Model):
         indexes = [
             models.Index(fields=['company', 'date']),
             models.Index(fields=['company', 'status']),
+            models.Index(fields=['company', 'department', 'date']),  # ← удобно для отчётов по отделам
         ]
 
     def __str__(self):
-        return f'{self.name} — {self.amount} ({self.get_status_display()})'
+        dep = f", отдел: {self.department.name}" if self.department_id else ""
+        return f'{self.name} — {self.amount} ({self.get_status_display()}{dep})'
+
+    # Согласованность company ↔ department
+    def clean(self):
+        if self.department_id and self.company_id and self.department.company_id != self.company_id:
+            raise ValidationError({'department': 'Отдел принадлежит другой компании.'})
+
+    def save(self, *args, **kwargs):
+        # если отдел задан, но company ещё нет — подставим
+        if self.department_id and not self.company_id:
+            self.company_id = self.department.company_id
+        self.full_clean(exclude=None)
+        super().save(*args, **kwargs)
