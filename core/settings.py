@@ -53,8 +53,8 @@ INSTALLED_APPS = [
     'apps.cafe',
     'apps.whatsapp',
     'apps.instagram',
-    'apps.storehouse'
-    
+    'apps.storehouse',
+    "apps.instagram_mcp",
 ]
 
 MIDDLEWARE = [

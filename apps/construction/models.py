@@ -1,7 +1,8 @@
 from django.db import models
+from django.core.exceptions import ValidationError
 import uuid
 from apps.users.models import Company, User
-import random 
+import random
 
 
 class Department(models.Model):
@@ -52,21 +53,44 @@ class Department(models.Model):
         verbose_name_plural = 'Отделы'
 
 
-
 class Cashbox(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     name = models.CharField(max_length=255, blank=True, null=True, verbose_name="Название кассы")
+
+    # ЯВНАЯ привязка к компании
+    company = models.ForeignKey(
+        Company,
+        on_delete=models.CASCADE,
+        related_name='cashboxes',
+        verbose_name='Компания'
+    )
+
+    # По-прежнему можно связать с отделом (его компания должна совпадать с company)
     department = models.OneToOneField(
         Department,
         on_delete=models.CASCADE,
         related_name='cashbox',
-        null=True, blank=True
+        null=True, blank=True,
+        verbose_name='Отдел'
     )
 
     def __str__(self):
         if self.department:
-            return f"Касса отдела{self.name} - {self.department.name}"
+            base = f"Касса отдела {self.department.name}"
+            return f"{base}{f' ({self.name})' if self.name else ''}"
         return self.name or "Свободная касса"
+
+    def clean(self):
+        # Защита от несоответствия компаний
+        if self.department and self.department.company_id != self.company_id:
+            raise ValidationError({'company': 'Компания кассы должна совпадать с компанией отдела.'})
+
+    def save(self, *args, **kwargs):
+        # Если отдел задан, но company не задан явно — подставим из отдела
+        if self.department and not self.company_id:
+            self.company = self.department.company
+        self.full_clean(exclude=None)  # чтобы сработал clean() и валидаторы
+        super().save(*args, **kwargs)
 
     def get_summary(self):
         """Аналитика по кассе (без баланса)"""
@@ -99,10 +123,20 @@ class CashFlow(models.Model):
     ]
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+
+    # ЯВНАЯ привязка к компании
+    company = models.ForeignKey(
+        Company,
+        on_delete=models.CASCADE,
+        related_name='cashflows',
+        verbose_name='Компания'
+    )
+
     cashbox = models.ForeignKey(
         Cashbox,
         on_delete=models.CASCADE,
-        related_name='flows'
+        related_name='flows',
+        verbose_name='Касса'
     )
     type = models.CharField(max_length=10, choices=TYPE_CHOICES, verbose_name='Тип')
     name = models.CharField(max_length=255, verbose_name='Наименование')
@@ -110,8 +144,24 @@ class CashFlow(models.Model):
     created_at = models.DateTimeField(auto_now_add=True)
 
     def __str__(self):
-        department_name = self.cashbox.department.name if self.cashbox and self.cashbox.department else "Без отдела"
-        return f"{self.get_type_display()} {self.amount} ₽ ({department_name})"
+        department_name = (
+            self.cashbox.department.name
+            if self.cashbox and self.cashbox.department
+            else "Без отдела"
+        )
+        return f"{self.get_type_display()} {self.amount} ₽ ({department_name}, {self.company.name})"
+
+    def clean(self):
+        # Компания движения должна совпадать с компанией кассы
+        if self.cashbox and self.company_id != self.cashbox.company_id:
+            raise ValidationError({'company': 'Компания движения должна совпадать с компанией кассы.'})
+
+    def save(self, *args, **kwargs):
+        # Если company не задана явно — наследуем из кассы
+        if self.cashbox and not self.company_id:
+            self.company_id = self.cashbox.company_id
+        self.full_clean(exclude=None)
+        super().save(*args, **kwargs)
 
     class Meta:
         verbose_name = 'Движение по кассе'
