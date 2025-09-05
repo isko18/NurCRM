@@ -99,14 +99,27 @@ class IngredientInlineSerializer(serializers.ModelSerializer):
 class MenuItemSerializer(CompanyReadOnlyMixin):
     category = serializers.PrimaryKeyRelatedField(queryset=Category.objects.all())
     ingredients = IngredientInlineSerializer(many=True, required=False)
+    image = serializers.ImageField(required=False, allow_null=True)
+    image_url = serializers.SerializerMethodField()
 
     class Meta:
         model = MenuItem
         fields = [
             "id", "company", "title", "category", "price", "is_active",
+            "image", "image_url",      # добавили image_url
             "created_at", "updated_at", "ingredients",
-        ]
+        ]   
         read_only_fields = ["created_at", "updated_at"]
+
+    def get_image_url(self, obj):
+        """
+        Возвращает абсолютный URL до webp-файла, если он есть.
+        """
+        request = self.context.get("request")
+        if obj.image and hasattr(obj.image, "url"):
+            url = obj.image.url
+            return request.build_absolute_uri(url) if request else url
+        return None
 
     def validate_category(self, category):
         company = self._get_company()

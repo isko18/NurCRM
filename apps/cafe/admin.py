@@ -140,7 +140,7 @@ class TableAdmin(admin.ModelAdmin):
 
 @admin.register(MenuItem)
 class MenuItemAdmin(admin.ModelAdmin):
-    list_display = ("title", "category", "company", "price", "is_active", "created_at")
+    list_display = ("title", "image", "category", "company", "price", "is_active", "created_at")
     list_filter = ("company", "is_active", "category")
     search_fields = ("title", "category__title")
     ordering = ("title",)

@@ -4,9 +4,11 @@ from django.core.exceptions import ValidationError
 from django.db.models.signals import pre_delete
 from django.dispatch import receiver
 from django.utils import timezone
-
+from django.core.files.base import ContentFile
+from PIL import Image
+import io, uuid, os
 from apps.users.models import Company
-import uuid
+
 
 
 # ==========================
@@ -191,14 +193,23 @@ class Category(models.Model):
 class MenuItem(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     company = models.ForeignKey(
-        Company, on_delete=models.CASCADE, related_name="menu_items", verbose_name="Компания"
+        Company, on_delete=models.CASCADE,
+        related_name="menu_items", verbose_name="Компания"
     )
     title = models.CharField("Название", max_length=255)
     category = models.ForeignKey(
-        Category, on_delete=models.CASCADE, related_name="items", verbose_name="Категория"
+        "Category", on_delete=models.CASCADE,
+        related_name="items", verbose_name="Категория"
     )
     price = models.DecimalField("Цена", max_digits=10, decimal_places=2)
     is_active = models.BooleanField("Активно в продаже", default=True)
+
+    image = models.ImageField(
+        "Изображение",
+        upload_to="menu_items/",
+        blank=True,
+        null=True
+    )
 
     created_at = models.DateTimeField("Дата создания", auto_now_add=True)
     updated_at = models.DateTimeField("Дата обновления", auto_now=True)
@@ -209,6 +220,25 @@ class MenuItem(models.Model):
 
     def __str__(self):
         return f"{self.title} ({self.category})"
+
+    def save(self, *args, **kwargs):
+        """
+        При сохранении автоматически конвертируем картинку в WebP.
+        """
+        if self.image and hasattr(self.image, 'file'):
+            img = Image.open(self.image)
+            img = img.convert("RGB")  # гарантируем совместимость
+
+            # имя файла с расширением webp
+            filename = f"{uuid.uuid4().hex}.webp"
+            buffer = io.BytesIO()
+            img.save(buffer, format="WEBP", quality=80)  # качество можно регулировать
+            buffer.seek(0)
+
+            # сохраняем в поле
+            self.image.save(filename, ContentFile(buffer.read()), save=False)
+
+        super().save(*args, **kwargs)
 
 
 class Ingredient(models.Model):
