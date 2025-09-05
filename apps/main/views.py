@@ -595,6 +595,7 @@ def _get_company(user):
         return None
     return getattr(user, "owned_company", None) or getattr(user, "company", None)
 
+
 class TransactionRecordListCreateView(generics.ListCreateAPIView):
     serializer_class = TransactionRecordSerializer
     permission_classes = [permissions.IsAuthenticated]
@@ -606,22 +607,35 @@ class TransactionRecordListCreateView(generics.ListCreateAPIView):
 
     def get_queryset(self):
         user = self.request.user
+        qs = TransactionRecord.objects.select_related("company", "department")
         if user.is_superuser:
-            return TransactionRecord.objects.all()
+            return qs
         company = _get_company(user)
         if company:
-            return TransactionRecord.objects.filter(company=company)
-        return TransactionRecord.objects.none()
+            return qs.filter(company=company)
+        return qs.none()
 
     def perform_create(self, serializer):
         user = self.request.user
         company = _get_company(user)
-        if not (user.is_superuser or company):
+        department = serializer.validated_data.get("department")
+
+        # если не суперюзер и нет компании — запрещаем
+        if not user.is_superuser and not company:
             raise PermissionDenied("Нет прав создавать записи.")
-        # суперюзеру тоже проставим компанию пользователя (если есть)
-        if user.is_superuser and not company:
-            raise PermissionDenied("Суперпользователю необходимо иметь company для создания записи.")
-        serializer.save(company=company)
+
+        # сверка company ↔ department (если оба заданы)
+        if company and department and department.company_id != company.id:
+            raise PermissionDenied("Отдел принадлежит другой компании.")
+
+        # суперюзер без company должен указать department (чтобы взять company из него)
+        if user.is_superuser and not company and department is None:
+            raise PermissionDenied("Укажите отдел, чтобы определить компанию записи.")
+
+        # не передаём company=None в save — пусть сериализатор установит из department при необходимости
+        extra = {"company": company} if company is not None else {}
+        serializer.save(**extra)
+
 
 class TransactionRecordRetrieveUpdateDestroyView(generics.RetrieveUpdateDestroyAPIView):
     serializer_class = TransactionRecordSerializer
@@ -629,9 +643,10 @@ class TransactionRecordRetrieveUpdateDestroyView(generics.RetrieveUpdateDestroyA
 
     def get_queryset(self):
         user = self.request.user
+        qs = TransactionRecord.objects.select_related("company", "department")
         if user.is_superuser:
-            return TransactionRecord.objects.all()
+            return qs
         company = _get_company(user)
         if company:
-            return TransactionRecord.objects.filter(company=company)
-        return TransactionRecord.objects.none()
+            return qs.filter(company=company)
+        return qs.none()
