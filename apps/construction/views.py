@@ -169,30 +169,24 @@ class CashFlowListCreateView(generics.ListCreateAPIView):
 
     def perform_create(self, serializer):
         user = self.request.user
-        cashbox = serializer.validated_data.get("cashbox")
-        if not cashbox:
-            raise PermissionDenied("Необходимо указать кассу.")
-
         company = _get_company(user)
+        department = serializer.validated_data.get("department")
 
-        # суперюзер — полный доступ
-        if user.is_superuser:
-            return serializer.save(company=cashbox.company)
+        if department:  # касса для отдела
+            if not (user.is_superuser or (company and department.company_id == company.id)):
+                raise PermissionDenied("Нет прав для создания кассы у этого отдела.")
 
-        # владелец компании
-        if getattr(user, "owned_company", None):
-            if cashbox.company_id == user.owned_company_id:
-                return serializer.save(company=cashbox.company)
+            # 🚫 вместо hasattr(...)
+            if Cashbox.objects.filter(department=department).exists():
+                raise PermissionDenied("У отдела уже есть касса.")
 
-        # администратор компании (если есть флаг is_admin)
-        if getattr(user, "is_admin", False) and company and cashbox.company_id == company.id:
-            return serializer.save(company=cashbox.company)
+            # company кассы = company отдела
+            serializer.save(company=department.company)
 
-        # сотрудник отдела
-        if cashbox.department and user in cashbox.department.employees.all():
-            return serializer.save(company=cashbox.company)
-
-        raise PermissionDenied("Нет прав добавлять движение в эту кассу.")
+        else:  # свободная касса
+            if not (user.is_superuser or company):
+                raise PermissionDenied("Нет прав для создания свободной кассы.")
+            serializer.save(company=company)
 
 
 class CashFlowDetailView(generics.RetrieveDestroyAPIView):
@@ -318,17 +312,12 @@ class CashboxOwnerDetailSingleView(generics.RetrieveAPIView):
     serializer_class = CashboxWithFlowsSerializer
     permission_classes = [IsAuthenticated]
 
-    def get_object(self):
+    def get_queryset(self):
         user = self.request.user
-        cashbox = super().get_object()
-
         if user.is_superuser:
-            return cashbox
-
+            return Cashbox.objects.all()
         company = _get_company(user)
         if (getattr(user, 'owned_company', None) or getattr(user, 'is_admin', False)) and company:
-            # доступ только к кассе своей компании (и для отделов, и для свободных)
-            if cashbox.company_id == company.id:
-                return cashbox
-
-        raise PermissionDenied("Нет доступа к этой кассе.")
+            return Cashbox.objects.filter(company=company)
+        # никому больше не показываем ничего
+        return Cashbox.objects.none()
