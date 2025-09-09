@@ -139,7 +139,7 @@ class CashFlow(models.Model):
         verbose_name='Касса'
     )
     type = models.CharField(max_length=10, choices=TYPE_CHOICES, verbose_name='Тип')
-    name = models.CharField(max_length=255, verbose_name='Наименование')
+    name = models.CharField(max_length=255, verbose_name='Наименование', null=True, blank=True)
     amount = models.DecimalField(max_digits=12, decimal_places=2, verbose_name='Сумма')
     created_at = models.DateTimeField(auto_now_add=True)
 
