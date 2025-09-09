@@ -55,10 +55,21 @@ class AddItemSerializer(serializers.Serializer):
     quantity = serializers.IntegerField(min_value=1, required=False, default=1)
 
 
+class OptionalUUIDField(serializers.UUIDField):
+    """
+    UUID-поле, которое принимает None/""/"null" как отсутствие значения.
+    Удобно для фронтов, которые шлют пустую строку.
+    """
+    def to_internal_value(self, data):
+        if data in (None, "", "null", "None"):
+            return None
+        return super().to_internal_value(data)
+
 class CheckoutSerializer(serializers.Serializer):
     print_receipt = serializers.BooleanField(default=False)
-    client_id = serializers.UUIDField(required=False, allow_null=True)
-
+    client_id = OptionalUUIDField(required=False, allow_null=True)
+    # (опц.) чтобы не читать department_id напрямую из request.data во вьюхе:
+    department_id = OptionalUUIDField(required=False, allow_null=True)
 
 class MobileScannerTokenSerializer(serializers.ModelSerializer):
     class Meta:
