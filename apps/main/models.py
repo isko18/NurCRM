@@ -802,7 +802,8 @@ class TransactionRecord(models.Model):
         Company, on_delete=models.CASCADE, related_name='transaction_records', verbose_name='Компания'
     )
 
-    # ← НОВОЕ ПОЛЕ
+    description = models.TextField(verbose_name="Обращение",)
+
     department = models.ForeignKey(
         Department,
         on_delete=models.SET_NULL,  # не блокируем удаление отдела
