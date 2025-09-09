@@ -200,7 +200,7 @@ SIMPLE_JWT = {
     'BLACKLIST_AFTER_ROTATION': True,
 
     'ALGORITHM': 'HS256',
-    'SIGNING_KEY': 'uu8)g9w0#jt(u0%_c$5xkpoc&8260&g%impr3l3f*ddlr*ue3&',
+    'SIGNING_KEY': 'devjwtsecret',
     'VERIFYING_KEY': None,
     'AUDIENCE': None,
     'ISSUER': None,

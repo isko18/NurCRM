@@ -2,9 +2,7 @@
 import uuid
 from django.db import models
 from django.utils import timezone
-
 from apps.users.models import Company
-
 
 class InstagramAccount(models.Model):
     """Аккаунт Instagram, привязанный к компании"""

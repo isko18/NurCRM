@@ -7,7 +7,7 @@ from .views import (
     StudentListCreateView, StudentRetrieveUpdateDestroyView,
     LessonListCreateView, LessonRetrieveUpdateDestroyView,
     FolderListCreateView, FolderRetrieveUpdateDestroyView,
-    DocumentListCreateView, DocumentRetrieveUpdateDestroyView,
+    DocumentListCreateView, DocumentRetrieveUpdateDestroyView, LessonAttendanceView, StudentAttendanceListView
 )
 
 app_name = "education" 
@@ -27,4 +27,6 @@ urlpatterns = [
     path("folders/<uuid:pk>/", FolderRetrieveUpdateDestroyView.as_view(), name="folder-detail"),
     path("documents/", DocumentListCreateView.as_view(), name="document-list"),
     path("documents/<uuid:pk>/", DocumentRetrieveUpdateDestroyView.as_view(), name="document-detail"),
+    path("lessons/<uuid:lesson_id>/attendance/", LessonAttendanceView.as_view()),
+    path("students/<uuid:student_id>/attendance/", StudentAttendanceListView.as_view()),
 ]
