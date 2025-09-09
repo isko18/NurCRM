@@ -1,7 +1,10 @@
 import uuid
 from django.db import models
 from django.core.exceptions import ValidationError
-from django.conf import settings  # используем AUTH_USER_MODEL
+from django.conf import settings  # используем AUTH_USER_MOD
+from django.db.models.signals import pre_delete
+from django.dispatch import receiver
+from django.utils import timezone
 
 
 # apps/booking/models.py
@@ -102,12 +105,11 @@ class Booking(models.Model):
         related_name='bookings',
         verbose_name='Компания',
     )
-
-    hotel = models.ForeignKey(Hotel, on_delete=models.CASCADE, null=True, blank=True, related_name='bookings')
-    room = models.ForeignKey(ConferenceRoom, on_delete=models.CASCADE, null=True, blank=True, related_name='bookings')
-    bed = models.ForeignKey(Bed, on_delete=models.CASCADE, null=True, blank=True, related_name='bookings')  # ✅ добавлено
+    hotel = models.ForeignKey('Hotel', on_delete=models.CASCADE, null=True, blank=True, related_name='bookings')
+    room = models.ForeignKey('ConferenceRoom', on_delete=models.CASCADE, null=True, blank=True, related_name='bookings')
+    bed = models.ForeignKey('Bed', on_delete=models.CASCADE, null=True, blank=True, related_name='bookings')
     client = models.ForeignKey(
-        BookingClient,
+        'BookingClient',
         on_delete=models.SET_NULL,
         null=True, blank=True,
         related_name='bookings',
@@ -120,9 +122,7 @@ class Booking(models.Model):
     class Meta:
         verbose_name = 'Бронирование'
         verbose_name_plural = 'Бронирования'
-        indexes = [
-            models.Index(fields=['company', 'start_time']),
-        ]
+        indexes = [models.Index(fields=['company', 'start_time'])]
 
     def clean(self):
         chosen = [x for x in [self.hotel, self.room, self.bed] if x]
@@ -142,13 +142,60 @@ class Booking(models.Model):
         if self.start_time and self.end_time and self.end_time <= self.start_time:
             raise ValidationError('Время окончания должно быть позже времени начала.')
 
-
     def __str__(self):
         hotel_name = self.hotel.name if self.hotel else "No Hotel"
         room_name = self.room.name if self.room else "No Room"
         bed_name = self.bed.name if self.bed else "No Bed"
         client_display = (self.client.name or self.client.phone) if self.client else "Unknown"
         return f"{hotel_name} / {room_name} / {bed_name} for {client_display}"
+    
+class BookingHistory(models.Model):
+    class TargetType(models.TextChoices):
+        HOTEL = 'hotel', 'Отель'
+        ROOM = 'room', 'Переговорная'
+        BED = 'bed', 'Койко-место'
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    company = models.ForeignKey(
+        'users.Company', on_delete=models.CASCADE,
+        related_name='booking_history', verbose_name='Компания'
+    )
+    client = models.ForeignKey(
+        'BookingClient', on_delete=models.SET_NULL,
+        null=True, blank=True,
+        related_name='booking_history', verbose_name='Клиент (ref)'
+    )
+    client_label = models.CharField('Метка клиента (снапшот)', max_length=255, blank=True)
+
+    original_booking_id = models.UUIDField('ID исходного бронирования', unique=True)
+
+    target_type = models.CharField('Тип ресурса', max_length=16, choices=TargetType.choices)
+    hotel = models.ForeignKey('Hotel', on_delete=models.SET_NULL, null=True, blank=True, related_name='archived_bookings', verbose_name='Отель (ref)')
+    room = models.ForeignKey('ConferenceRoom', on_delete=models.SET_NULL, null=True, blank=True, related_name='archived_bookings', verbose_name='Комната (ref)')
+    bed = models.ForeignKey('Bed', on_delete=models.SET_NULL, null=True, blank=True, related_name='archived_bookings', verbose_name='Койка (ref)')
+
+    target_name = models.CharField('Название ресурса (снапшот)', max_length=255)
+    target_price = models.DecimalField('Цена (снапшот)', max_digits=10, decimal_places=2, null=True, blank=True)
+
+    start_time = models.DateTimeField('Начало (из брони)')
+    end_time = models.DateTimeField('Окончание (из брони)')
+    purpose = models.CharField('Цель (снапшот)', max_length=255, blank=True)
+
+    archived_at = models.DateTimeField('Архивировано', auto_now_add=True)
+
+    class Meta:
+        verbose_name = 'Архив бронирования'
+        verbose_name_plural = 'Архив бронирований'
+        ordering = ['-start_time']
+        indexes = [
+            models.Index(fields=['company', 'start_time']),
+            models.Index(fields=['client', 'start_time']),
+            models.Index(fields=['original_booking_id']),
+        ]
+
+    def __str__(self):
+        who = self.client_label or (self.client and (self.client.name or self.client.phone)) or '—'
+        return f'BookingHistory {str(self.original_booking_id)[:8]} — {self.target_name} для {who}'
 
 
 
@@ -239,3 +286,41 @@ class Document(models.Model):
         folder_company_id = getattr(self.folder, 'company_id', None)
         if folder_company_id and self.company_id and folder_company_id != self.company_id:
             raise ValidationError({'folder': 'Папка принадлежит другой компании.'})
+
+
+@receiver(pre_delete, sender=Booking)
+def archive_booking_before_delete(sender, instance: Booking, **kwargs):
+    # определить целевой ресурс и его поля-снимки
+    if instance.hotel_id:
+        target_type = BookingHistory.TargetType.HOTEL
+        target_name = instance.hotel.name
+        target_price = instance.hotel.price
+    elif instance.room_id:
+        target_type = BookingHistory.TargetType.ROOM
+        target_name = instance.room.name
+        target_price = instance.room.price
+    else:
+        target_type = BookingHistory.TargetType.BED
+        target_name = instance.bed.name
+        target_price = instance.bed.price
+
+    client_label = ''
+    if instance.client_id:
+        client_label = (instance.client.name or instance.client.phone or str(instance.client_id))
+
+    BookingHistory.objects.create(
+        company=instance.company,
+        client=instance.client,
+        client_label=client_label,
+        original_booking_id=instance.id,
+        target_type=target_type,
+        hotel=instance.hotel if instance.hotel_id else None,
+        room=instance.room if instance.room_id else None,
+        bed=instance.bed if instance.bed_id else None,
+        target_name=target_name,
+        target_price=target_price,
+        start_time=instance.start_time,
+        end_time=instance.end_time,
+        purpose=instance.purpose,
+        archived_at=timezone.now(),  # auto_now_add тоже сработает, но явное не повредит
+    )

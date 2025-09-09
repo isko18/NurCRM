@@ -4,7 +4,7 @@ from rest_framework import serializers
 
 from .models import (
     Hotel, ConferenceRoom, Booking, ManagerAssignment,
-    Folder, Document, Bed, BookingClient
+    Folder, Document, Bed, BookingClient, BookingHistory
 )
 
 User = get_user_model()
@@ -88,11 +88,29 @@ class BookingBriefSerializer(serializers.ModelSerializer):
             return f"Bed: {obj.bed.name}"
         return "—"
 
+class BookingHistoryBriefSerializer(serializers.ModelSerializer):
+    resource = serializers.SerializerMethodField()
 
+    class Meta:
+        model = BookingHistory
+        fields = [
+            "id",
+            "resource",
+            "target_price",
+            "start_time",
+            "end_time",
+            "purpose",
+            "archived_at",
+        ]
+
+    def get_resource(self, obj):
+        type_map = {"hotel": "Hotel", "room": "Room", "bed": "Bed"}
+        kind = type_map.get(obj.target_type, "—")
+        return f"{kind}: {obj.target_name}" if obj.target_name else kind
+    
 # ===== Booking =====
 class BookingSerializer(CompanyReadOnlyMixin, serializers.ModelSerializer):
     company = serializers.HiddenField(default=CurrentCompanyDefault())
-    # client можем передавать PK; при POST на /clients/<id>/bookings/ он будет установлен во viewset
     client = serializers.PrimaryKeyRelatedField(
         queryset=BookingClient.objects.all(),
         required=False,
@@ -100,7 +118,6 @@ class BookingSerializer(CompanyReadOnlyMixin, serializers.ModelSerializer):
     )
 
     class Meta:
-        # ref_name — чтобы не конфликтовать с возможными дублями в схемах
         ref_name = 'BookingBooking'
         model = Booking
         fields = [
@@ -110,6 +127,7 @@ class BookingSerializer(CompanyReadOnlyMixin, serializers.ModelSerializer):
             "start_time", "end_time",
             "purpose",
         ]
+
 
     def validate(self, attrs):
         """
@@ -158,10 +176,12 @@ class BookingSerializer(CompanyReadOnlyMixin, serializers.ModelSerializer):
 class BookingClientSerializer(CompanyReadOnlyMixin, serializers.ModelSerializer):
     company = serializers.HiddenField(default=CurrentCompanyDefault())
     bookings = BookingBriefSerializer(many=True, read_only=True)
+    history = BookingHistoryBriefSerializer(many=True, read_only=True, source="booking_history")  # <-- NEW
 
     class Meta:
         model = BookingClient
-        fields = ["id", "company", "phone", "name", "text", "bookings"]
+        fields = ["id", "company", "phone", "name", "text", "bookings", "history"]  # <-- history добавили
+
 
 
 # ===== ManagerAssignment =====
@@ -240,3 +260,28 @@ class DocumentSerializer(CompanyReadOnlyMixin, serializers.ModelSerializer):
         if folder_company_id and user_company_id and folder_company_id != user_company_id:
             raise serializers.ValidationError('Папка принадлежит другой компании.')
         return folder
+
+
+class BookingHistorySerializer(serializers.ModelSerializer):
+    company = serializers.ReadOnlyField(source="company.id")
+    client_name = serializers.CharField(source="client.name", read_only=True)
+    client_phone = serializers.CharField(source="client.phone", read_only=True)
+    resource = serializers.SerializerMethodField()
+
+    class Meta:
+        model = BookingHistory
+        fields = [
+            "id", "company",
+            "original_booking_id",
+            "target_type", "resource", "target_name", "target_price",
+            "hotel", "room", "bed",
+            "client", "client_name", "client_phone", "client_label",
+            "start_time", "end_time", "purpose",
+            "archived_at",
+        ]
+        read_only_fields = fields  # историю создаёт сигнал, менять ничего не нужно
+
+    def get_resource(self, obj):
+        type_map = {"hotel": "Hotel", "room": "Room", "bed": "Bed"}
+        kind = type_map.get(obj.target_type, "—")
+        return f"{kind}: {obj.target_name}" if obj.target_name else kind

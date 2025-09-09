@@ -1,46 +1,44 @@
 # views.py
-from rest_framework import generics, permissions
+from rest_framework import generics, permissions, filters as drf_filters
 from rest_framework.parsers import MultiPartParser, FormParser
-from rest_framework.response import Response
 from django.shortcuts import get_object_or_404
-from django_filters import rest_framework as filters
+from django_filters import rest_framework as dj_filters
 from django_filters.rest_framework import DjangoFilterBackend
 
 from .models import (
     Hotel, Bed, ConferenceRoom, Booking, ManagerAssignment,
-    Folder, Document, BookingClient,  # ← добавлен BookingClient
+    Folder, Document, BookingClient, BookingHistory
 )
 from .serializers import (
     HotelSerializer, BedSerializer, RoomSerializer, BookingSerializer,
     ManagerAssignmentSerializer, FolderSerializer, DocumentSerializer,
-    BookingClientSerializer,  # ← добавлен сериализатор клиента
+    BookingClientSerializer, BookingHistorySerializer
 )
 from .permissions import IsAdminOrReadOnly, IsManagerOrAdmin
 
 
 # ---- Кастомные фильтры ----
-class DocumentFilter(filters.FilterSet):
-    name = filters.CharFilter(lookup_expr='icontains')
-    folder = filters.UUIDFilter(field_name='folder__id')
-    file_name = filters.CharFilter(field_name='file', lookup_expr='icontains')
-    created_at = filters.DateTimeFromToRangeFilter()
-    updated_at = filters.DateTimeFromToRangeFilter()
+class DocumentFilter(dj_filters.FilterSet):
+    name = dj_filters.CharFilter(lookup_expr='icontains')
+    folder = dj_filters.UUIDFilter(field_name='folder__id')
+    file_name = dj_filters.CharFilter(field_name='file', lookup_expr='icontains')
+    created_at = dj_filters.DateTimeFromToRangeFilter()
+    updated_at = dj_filters.DateTimeFromToRangeFilter()
 
     class Meta:
         model = Document
         fields = ['name', 'folder', 'file_name', 'created_at', 'updated_at']
 
 
-class BookingFilter(filters.FilterSet):
-    start_time = filters.DateTimeFromToRangeFilter()
-    end_time = filters.DateTimeFromToRangeFilter()
-    hotel_name = filters.CharFilter(field_name='hotel__name', lookup_expr='icontains')
-    room_name = filters.CharFilter(field_name='room__name', lookup_expr='icontains')
-    bed_name = filters.CharFilter(field_name='bed__name', lookup_expr='icontains')
+class BookingFilter(dj_filters.FilterSet):
+    start_time = dj_filters.DateTimeFromToRangeFilter()
+    end_time = dj_filters.DateTimeFromToRangeFilter()
+    hotel_name = dj_filters.CharFilter(field_name='hotel__name', lookup_expr='icontains')
+    room_name = dj_filters.CharFilter(field_name='room__name', lookup_expr='icontains')
+    bed_name = dj_filters.CharFilter(field_name='bed__name', lookup_expr='icontains')
 
     class Meta:
         model = Booking
-        # ↓ заменили reserved_by → client
         fields = ['hotel', 'room', 'bed', 'client', 'start_time', 'end_time']
 
 
@@ -77,10 +75,11 @@ class BookingClientListCreateView(CompanyQuerysetMixin, generics.ListCreateAPIVi
     queryset = BookingClient.objects.all()
     serializer_class = BookingClientSerializer
     permission_classes = [permissions.IsAuthenticated]
-    filter_backends = [DjangoFilterBackend]
+    filter_backends = [DjangoFilterBackend, drf_filters.OrderingFilter]
     filterset_fields = [f.name for f in BookingClient._meta.get_fields()
                         if not f.is_relation or f.many_to_one]
     ordering = ['name']
+    ordering_fields = ['name']
 
 
 class BookingClientRetrieveUpdateDestroyView(CompanyQuerysetMixin, generics.RetrieveUpdateDestroyAPIView):
@@ -107,7 +106,6 @@ class ClientBookingListCreateView(CompanyQuerysetMixin, generics.ListCreateAPIVi
         return qs.filter(client=client).order_by('-start_time')
 
     def _get_client(self):
-        # pk из URL
         company = self._user_company()
         return get_object_or_404(BookingClient, pk=self.kwargs['pk'], company=company)
 
@@ -167,7 +165,6 @@ class RoomRetrieveUpdateDestroyView(CompanyQuerysetMixin, generics.RetrieveUpdat
 
 # ========= Booking =========
 class BookingListCreateView(CompanyQuerysetMixin, generics.ListCreateAPIView):
-    # ↓ заменили reserved_by → client
     queryset = Booking.objects.select_related('hotel', 'room', 'bed', 'client').all()
     serializer_class = BookingSerializer
     permission_classes = [permissions.IsAuthenticated]
@@ -176,7 +173,6 @@ class BookingListCreateView(CompanyQuerysetMixin, generics.ListCreateAPIView):
 
 
 class BookingRetrieveUpdateDestroyView(CompanyQuerysetMixin, generics.RetrieveUpdateDestroyAPIView):
-    # ↓ заменили reserved_by → client
     queryset = Booking.objects.select_related('hotel', 'room', 'bed', 'client').all()
     serializer_class = BookingSerializer
     permission_classes = [permissions.IsAuthenticated]
@@ -230,3 +226,29 @@ class DocumentRetrieveUpdateDestroyView(CompanyQuerysetMixin, generics.RetrieveU
     serializer_class = DocumentSerializer
     permission_classes = [permissions.IsAuthenticated]
     parser_classes = [MultiPartParser, FormParser]
+
+
+# ========= Booking History =========
+class BookingHistoryListView(CompanyQuerysetMixin, generics.ListAPIView):
+    """
+    /booking/history/
+    История (архив) всех бронирований компании.
+    """
+    queryset = (BookingHistory.objects
+                .select_related("client", "hotel", "room", "bed", "company"))
+    serializer_class = BookingHistorySerializer
+    filter_backends = [DjangoFilterBackend, drf_filters.SearchFilter, drf_filters.OrderingFilter]
+    filterset_fields = [
+        "client", "target_type", "hotel", "room", "bed",
+        "start_time", "end_time", "archived_at", "original_booking_id",
+    ]
+    search_fields = ["client__name", "client__phone", "target_name", "purpose"]
+    ordering_fields = ["start_time", "end_time", "archived_at", "id"]
+
+
+class ClientBookingHistoryListView(BookingHistoryListView):
+    """
+    /booking/clients/<uuid:client_id>/history/
+    """
+    def get_queryset(self):
+        return super().get_queryset().filter(client_id=self.kwargs["client_id"])
