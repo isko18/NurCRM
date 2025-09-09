@@ -1,14 +1,9 @@
+# apps/integrations/serializers.py
 from rest_framework import serializers
-from .models import Message, WhatsAppSession
+from .models import WhatsAppSession
 
-
-class MessageSerializer(serializers.ModelSerializer):
-    class Meta:
-        model = Message
-        fields = "__all__"
-
-
-class SessionSerializer(serializers.ModelSerializer):
+class WhatsAppSessionSerializer(serializers.ModelSerializer):
     class Meta:
         model = WhatsAppSession
-        fields = "__all__"
+        fields = ("company", "status", "last_qr_data_url", "phone_hint", "updated_at")
+        read_only_fields = ("updated_at",)

@@ -1,7 +1,7 @@
 from rest_framework import serializers
 from .models import (
     Lead, Course, Group, Student, Lesson,
-    Folder, Document,
+    Folder, Document, Attendance
 )
 from apps.users.models import User   # 🔑 используем User вместо Teacher
 
@@ -171,3 +171,59 @@ class DocumentSerializer(CompanyReadOnlyMixin, serializers.ModelSerializer):
         if user_company_id and folder and folder.company_id != user_company_id:
             raise serializers.ValidationError('Папка принадлежит другой компании.')
         return folder
+
+
+# ====== Attendance (общий CRUD, если понадобится) ======
+class AttendanceSerializer(CompanyReadOnlyMixin, serializers.ModelSerializer):
+    company = serializers.ReadOnlyField(source='company.id')
+
+    class Meta:
+        model = Attendance
+        fields = [
+            'id', 'company', 'lesson', 'student',
+            'present', 'note', 'created_at', 'updated_at'
+        ]
+        read_only_fields = ['id', 'company', 'created_at', 'updated_at']
+        ref_name = "EducationAttendance"
+
+    def validate(self, attrs):
+        request = self.context.get('request')
+        user_company_id = getattr(getattr(request.user, 'company', None), 'id', None)
+
+        lesson = attrs.get('lesson') or getattr(self.instance, 'lesson', None)
+        student = attrs.get('student') or getattr(self.instance, 'student', None)
+
+        if user_company_id and lesson and lesson.company_id != user_company_id:
+            raise serializers.ValidationError({'lesson': 'Занятие принадлежит другой компании.'})
+        if user_company_id and student and student.company_id != user_company_id:
+            raise serializers.ValidationError({'student': 'Студент принадлежит другой компании.'})
+        if lesson and student and student.group_id != lesson.group_id:
+            raise serializers.ValidationError({'student': 'Студент не из группы этого занятия.'})
+        return attrs
+
+
+# ====== Lesson attendance snapshot (GET/PUT /lessons/{id}/attendance/) ======
+class LessonAttendanceItemSerializer(serializers.Serializer):
+    """Элемент снимка посещаемости урока."""
+    student = serializers.UUIDField()
+    present = serializers.BooleanField(allow_null=True)
+    note = serializers.CharField(allow_blank=True, required=False)
+    # для ответа (GET) — имя ученика
+    student_name = serializers.CharField(read_only=True)
+
+class LessonAttendanceSnapshotSerializer(serializers.Serializer):
+    """Тело запроса для PUT /lessons/{id}/attendance/ (для схемы)."""
+    attendances = LessonAttendanceItemSerializer(many=True)
+
+
+# ====== История посещаемости ученика (GET /students/{id}/attendance/) ======
+class StudentAttendanceSerializer(serializers.ModelSerializer):
+    lesson = serializers.UUIDField(source='lesson.id', read_only=True)
+    date = serializers.DateField(source='lesson.date', read_only=True)
+    time = serializers.TimeField(source='lesson.time', read_only=True)
+    group = serializers.CharField(source='lesson.group.name', read_only=True)
+
+    class Meta:
+        model = Attendance
+        fields = ("lesson", "date", "time", "group", "present", "note")
+        ref_name = "EducationStudentAttendanceItem"

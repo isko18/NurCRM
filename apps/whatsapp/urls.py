@@ -1,7 +1,9 @@
+# apps/integrations/urls.py
 from django.urls import path
-from . import views
+from .views import WhatsAppSessionGetView, WhatsAppSessionUpsertView, MeView
 
 urlpatterns = [
-    path("health/", views.health, name="health"),
-    path("version/", views.version, name="version"),
+    path("companies/<uuid:company_id>/wa/session/", WhatsAppSessionGetView.as_view()),
+    path("companies/<uuid:company_id>/wa/session/upsert/", WhatsAppSessionUpsertView.as_view()),
+    path("me/", MeView.as_view()),
 ]

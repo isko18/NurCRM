@@ -183,3 +183,45 @@ class Document(models.Model):
         folder_company_id = getattr(self.folder, 'company_id', None)
         if folder_company_id and self.company_id and folder_company_id != self.company_id:
             raise ValidationError({'folder': 'Папка принадлежит другой компании.'})
+
+
+class Attendance(models.Model):
+    """Отметка посещаемости ученика на конкретном занятии."""
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    company = models.ForeignKey(
+        Company, on_delete=models.CASCADE, related_name="attendances", verbose_name="Компания"
+    )
+    lesson = models.ForeignKey(
+        Lesson, on_delete=models.CASCADE, related_name="attendances", verbose_name="Занятие"
+    )
+    student = models.ForeignKey(
+        Student, on_delete=models.CASCADE, related_name="attendances", verbose_name="Студент"
+    )
+    # None = ещё не отмечали; True/False = присутствовал/отсутствовал
+    present = models.BooleanField("Присутствие", null=True, blank=True)
+    note = models.CharField("Примечание", max_length=255, blank=True)
+    created_at = models.DateTimeField("Создано", auto_now_add=True)
+    updated_at = models.DateTimeField("Обновлено", auto_now=True)
+
+    class Meta:
+        verbose_name = "Посещаемость"
+        verbose_name_plural = "Посещаемость"
+        unique_together = (("lesson", "student"),)
+        indexes = [
+            models.Index(fields=["company"]),
+            models.Index(fields=["lesson"]),
+            models.Index(fields=["student"]),
+        ]
+
+    def __str__(self):
+        return f"{self.student} — {self.lesson}: {self.present}"
+
+    def clean(self):
+        # компания везде одна
+        if self.company_id != self.lesson.company_id:
+            raise ValidationError({"lesson": "Занятие другой компании."})
+        if self.company_id != self.student.company_id:
+            raise ValidationError({"student": "Студент другой компании."})
+        # ученик должен быть из группы занятия
+        if self.student.group_id != self.lesson.group_id:
+            raise ValidationError({"student": "Студент не из группы этого занятия."})

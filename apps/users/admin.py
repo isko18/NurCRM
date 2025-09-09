@@ -7,7 +7,7 @@ from .models import User, Company, Industry, SubscriptionPlan, Feature, Sector, 
 @admin.register(User)
 class UserAdmin(BaseUserAdmin):
     list_display = (
-        'email', 'first_name', 'last_name', 'company', 'role', 'custom_role',
+        'email', 'first_name', 'last_name', 'company', 'role_display', 'custom_role',
         'can_view_cashbox', 'can_view_orders',
         'can_view_clients', 'can_view_settings', 'can_view_sale',
         'is_staff', 'is_active'
@@ -57,12 +57,14 @@ class UserAdmin(BaseUserAdmin):
     )
 
     def get_form(self, request, obj=None, **kwargs):
+        """Делаем пароль необязательным при редактировании"""
         form = super().get_form(request, obj, **kwargs)
         if obj is not None and 'password' in form.base_fields:
             form.base_fields['password'].required = False
         return form
 
     def save_model(self, request, obj, form, change):
+        """Если роль owner/admin — включаем все права"""
         if obj.role in ['owner', 'admin']:
             permission_fields = [
                 'can_view_dashboard', 'can_view_cashbox', 'can_view_departments',
@@ -75,19 +77,36 @@ class UserAdmin(BaseUserAdmin):
                 setattr(obj, field, True)
         super().save_model(request, obj, form, change)
 
-
 # 🏢 Компания
 @admin.register(Company)
 class CompanyAdmin(admin.ModelAdmin):
-    list_display = ('name', 'get_industry_name', 'sector', 'owner', 'employee_count', 'created_at', 'start_date', 'end_date')
+    list_display = (
+        'name', 'get_industry_name', 'sector', 'owner',
+        'employee_count', 'created_at', 'start_date', 'end_date',
+        'can_view_documents', 'can_view_whatsapp', 'can_view_instagram', 'can_view_telegram'
+    )
     search_fields = ('name', 'industry__name', 'sector__name', 'owner__email')
     ordering = ('name',)
-    readonly_fields = ('employees_list', 'created_at')  # ✅ created_at только readonly
+    readonly_fields = ('employees_list', 'created_at')
 
     fieldsets = (
-        (None, {'fields': ('name', 'industry', 'sector', 'subscription_plan', 'owner')}),
-        ('Сотрудники', {'fields': ('employees_list',)}),
-        ('Даты', {'fields': ('start_date', 'end_date')}),  # ❌ created_at убрали отсюда
+        (None, {
+            'fields': (
+                'name', 'industry', 'sector', 'subscription_plan', 'owner'
+            )
+        }),
+        ('Сотрудники', {
+            'fields': ('employees_list',)
+        }),
+        ('Доступы', {
+            'fields': (
+                'can_view_documents', 'can_view_whatsapp',
+                'can_view_instagram', 'can_view_telegram'
+            )
+        }),
+        ('Даты', {
+            'fields': ('start_date', 'end_date', 'created_at')
+        }),
     )
 
     def get_industry_name(self, obj):
@@ -104,7 +123,7 @@ class CompanyAdmin(admin.ModelAdmin):
             return "Нет сотрудников"
         names = []
         for e in employees:
-            role_display = e.custom_role.name if e.custom_role else e.get_role_display()
+            role_display = e.custom_role.name if e.custom_role else e.role_display
             names.append(f'{e.first_name} {e.last_name} ({role_display})')
         result = ', '.join(names)
         total = obj.employees.count()
