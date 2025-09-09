@@ -16,7 +16,7 @@ from .views import (
 
     # Folders / Documents
     FolderListCreateView, FolderRetrieveUpdateDestroyView,
-    DocumentListCreateView, DocumentRetrieveUpdateDestroyView,
+    DocumentListCreateView, DocumentRetrieveUpdateDestroyView, ClientBookingHistoryListView, BookingHistoryListView
 )
 
 urlpatterns = [
@@ -42,7 +42,8 @@ urlpatterns = [
     # ==== Bookings ====
     path('bookings/', BookingListCreateView.as_view(), name='booking-list'),
     path('bookings/<uuid:pk>/', BookingRetrieveUpdateDestroyView.as_view(), name='booking-detail'),
-
+    path("booking/history/", BookingHistoryListView.as_view(), name="booking-history-list"),
+    path("booking/clients/<uuid:client_id>/history/", ClientBookingHistoryListView.as_view(), name="client-booking-history-list"),
     # ==== Manager assignments ====
     path('manager-assignments/', ManagerAssignmentListCreateView.as_view(), name='manager-assignment-list'),
     path('manager-assignments/<uuid:pk>/', ManagerAssignmentRetrieveUpdateDestroyView.as_view(), name='manager-assignment-detail'),
