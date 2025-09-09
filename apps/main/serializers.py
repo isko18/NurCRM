@@ -529,6 +529,7 @@ class TransactionRecordSerializer(serializers.ModelSerializer):
         fields = [
             "id",
             "company",
+            "description",
             "department",
             "department_name",
             "name",
