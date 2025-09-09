@@ -101,7 +101,6 @@ class User(AbstractBaseUser, PermissionsMixin):
         null=True,
         verbose_name='Системная роль'
     )
-    # кастомная роль
     custom_role = models.ForeignKey(
         CustomRole,
         on_delete=models.SET_NULL,
@@ -111,7 +110,7 @@ class User(AbstractBaseUser, PermissionsMixin):
         verbose_name="Кастомная роль"
     )
 
-    # 📌 Права доступа
+    # ===== Права доступа (существующие) =====
     can_view_dashboard = models.BooleanField(default=False, blank=True, null=True, verbose_name='Доступ к обзору')
     can_view_cashbox = models.BooleanField(default=False, blank=True, null=True, verbose_name='Доступ к кассе')
     can_view_departments = models.BooleanField(default=False, blank=True, null=True, verbose_name='Доступ к отделам')
@@ -125,6 +124,38 @@ class User(AbstractBaseUser, PermissionsMixin):
     can_view_brand_category = models.BooleanField(default=False, blank=True, null=True, verbose_name='Доступ к брендам и категориям')
     can_view_settings = models.BooleanField(default=False, blank=True, null=True, verbose_name='Доступ к настройкам')
     can_view_sale = models.BooleanField(default=False, blank=True, null=True, verbose_name='Доступ к продажам')
+
+    # ===== Права доступа (НОВЫЕ) =====
+    can_view_building_work_process = models.BooleanField(default=False, blank=True, null=True, verbose_name='Доступ к процессам строительства')
+    can_view_additional_services = models.BooleanField(default=False, blank=True, null=True, verbose_name='Доступ к доп. услугам')
+
+    # Барбершоп
+    can_view_barber_clients = models.BooleanField(default=False, blank=True, null=True, verbose_name='Барбершоп: клиенты')
+    can_view_barber_services = models.BooleanField(default=False, blank=True, null=True, verbose_name='Барбершоп: услуги')
+    can_view_barber_history = models.BooleanField(default=False, blank=True, null=True, verbose_name='Барбершоп: история')
+    can_view_barber_records = models.BooleanField(default=False, blank=True, null=True, verbose_name='Барбершоп: записи')
+
+    # Хостел
+    can_view_hostel_rooms = models.BooleanField(default=False, blank=True, null=True, verbose_name='Хостел: комнаты')
+    can_view_hostel_booking = models.BooleanField(default=False, blank=True, null=True, verbose_name='Хостел: бронирование')
+    can_view_hostel_clients = models.BooleanField(default=False, blank=True, null=True, verbose_name='Хостел: клиенты')
+    can_view_hostel_analytics = models.BooleanField(default=False, blank=True, null=True, verbose_name='Хостел: аналитика')
+
+    # Кафе
+    can_view_cafe_menu = models.BooleanField(default=False, blank=True, null=True, verbose_name='Кафе: меню')
+    can_view_cafe_orders = models.BooleanField(default=False, blank=True, null=True, verbose_name='Кафе: заказы')
+    can_view_cafe_purchasing = models.BooleanField(default=False, blank=True, null=True, verbose_name='Кафе: закупки')
+    can_view_cafe_booking = models.BooleanField(default=False, blank=True, null=True, verbose_name='Кафе: бронирование')
+    can_view_cafe_clients = models.BooleanField(default=False, blank=True, null=True, verbose_name='Кафе: клиенты')
+    can_view_cafe_tables = models.BooleanField(default=False, blank=True, null=True, verbose_name='Кафе: столы')
+
+    # Школа
+    can_view_school_students = models.BooleanField(default=False, blank=True, null=True, verbose_name='Школа: ученики')
+    can_view_school_groups = models.BooleanField(default=False, blank=True, null=True, verbose_name='Школа: группы')
+    can_view_school_lessons = models.BooleanField(default=False, blank=True, null=True, verbose_name='Школа: занятия')
+    can_view_school_teachers = models.BooleanField(default=False, blank=True, null=True, verbose_name='Школа: преподаватели')
+    can_view_school_leads = models.BooleanField(default=False, blank=True, null=True, verbose_name='Школа: лиды')
+    can_view_school_invoices = models.BooleanField(default=False, blank=True, null=True, verbose_name='Школа: счета')
 
     created_at = models.DateTimeField(auto_now_add=True, verbose_name='Дата создания')
     updated_at = models.DateTimeField(auto_now=True, verbose_name='Дата обновления')
@@ -146,17 +177,12 @@ class User(AbstractBaseUser, PermissionsMixin):
 
     @property
     def role_display(self) -> str:
-        """
-        Возвращает строковое представление роли:
-        - если системная (admin/owner) → её перевод
-        - если кастомная → её название
-        - иначе 'Без роли'
-        """
         if self.role:
             return self.get_role_display()
         if self.custom_role:
             return self.custom_role.name
         return "Без роли"
+
 
 # Модель Company (компания)
 class Company(models.Model):

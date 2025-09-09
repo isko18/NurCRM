@@ -45,11 +45,35 @@ class UserSerializer(serializers.ModelSerializer):
             'id', 'email', 'password',
             'first_name', 'last_name', 'avatar',
             'company', 'role', 'custom_role', 'role_display',
+
+            # --- Доступы (общие) ---
             'can_view_dashboard', 'can_view_cashbox', 'can_view_departments',
             'can_view_orders', 'can_view_analytics', 'can_view_department_analytics',
             'can_view_products', 'can_view_booking',
             'can_view_employees', 'can_view_clients',
             'can_view_brand_category', 'can_view_settings', 'can_view_sale',
+
+            # --- Новые доступы ---
+            'can_view_building_work_process', 'can_view_additional_services',
+
+            # Барбершоп
+            'can_view_barber_clients', 'can_view_barber_services',
+            'can_view_barber_history', 'can_view_barber_records',
+
+            # Хостел
+            'can_view_hostel_rooms', 'can_view_hostel_booking',
+            'can_view_hostel_clients', 'can_view_hostel_analytics',
+
+            # Кафе
+            'can_view_cafe_menu', 'can_view_cafe_orders',
+            'can_view_cafe_purchasing', 'can_view_cafe_booking',
+            'can_view_cafe_clients', 'can_view_cafe_tables',
+
+            # Школа
+            'can_view_school_students', 'can_view_school_groups',
+            'can_view_school_lessons', 'can_view_school_teachers',
+            'can_view_school_leads', 'can_view_school_invoices',
+
             'created_at', 'updated_at',
         ]
         read_only_fields = ['id', 'created_at', 'updated_at', 'company']
@@ -71,11 +95,33 @@ class UserSerializer(serializers.ModelSerializer):
         current_user = request.user if request else None
 
         permission_fields = [
+            # общие
             'can_view_dashboard', 'can_view_cashbox', 'can_view_departments',
             'can_view_orders', 'can_view_analytics', 'can_view_department_analytics',
             'can_view_products', 'can_view_booking',
             'can_view_employees', 'can_view_clients',
-            'can_view_brand_category', 'can_view_settings', 'can_view_sale'
+            'can_view_brand_category', 'can_view_settings', 'can_view_sale',
+
+            # новые
+            'can_view_building_work_process', 'can_view_additional_services',
+
+            # барбершоп
+            'can_view_barber_clients', 'can_view_barber_services',
+            'can_view_barber_history', 'can_view_barber_records',
+
+            # хостел
+            'can_view_hostel_rooms', 'can_view_hostel_booking',
+            'can_view_hostel_clients', 'can_view_hostel_analytics',
+
+            # кафе
+            'can_view_cafe_menu', 'can_view_cafe_orders',
+            'can_view_cafe_purchasing', 'can_view_cafe_booking',
+            'can_view_cafe_clients', 'can_view_cafe_tables',
+
+            # школа
+            'can_view_school_students', 'can_view_school_groups',
+            'can_view_school_lessons', 'can_view_school_teachers',
+            'can_view_school_leads', 'can_view_school_invoices',
         ]
 
         for field in permission_fields:
@@ -157,13 +203,35 @@ class OwnerRegisterSerializer(serializers.ModelSerializer):
             is_active=True
         )
 
-        # 👉 назначаем все флаги доступа
+        # 👉 назначаем все флаги доступа владельцу
         permission_fields = [
+            # общие
             'can_view_dashboard', 'can_view_cashbox', 'can_view_departments',
             'can_view_orders', 'can_view_analytics', 'can_view_department_analytics',
             'can_view_products', 'can_view_booking',
             'can_view_employees', 'can_view_clients',
-            'can_view_brand_category', 'can_view_settings', 'can_view_sale'
+            'can_view_brand_category', 'can_view_settings', 'can_view_sale',
+
+            # новые
+            'can_view_building_work_process', 'can_view_additional_services',
+
+            # барбершоп
+            'can_view_barber_clients', 'can_view_barber_services',
+            'can_view_barber_history', 'can_view_barber_records',
+
+            # хостел
+            'can_view_hostel_rooms', 'can_view_hostel_booking',
+            'can_view_hostel_clients', 'can_view_hostel_analytics',
+
+            # кафе
+            'can_view_cafe_menu', 'can_view_cafe_orders',
+            'can_view_cafe_purchasing', 'can_view_cafe_booking',
+            'can_view_cafe_clients', 'can_view_cafe_tables',
+
+            # школа
+            'can_view_school_students', 'can_view_school_groups',
+            'can_view_school_lessons', 'can_view_school_teachers',
+            'can_view_school_leads', 'can_view_school_invoices',
         ]
         for field in permission_fields:
             setattr(user, field, True)
@@ -208,11 +276,34 @@ class EmployeeCreateSerializer(serializers.ModelSerializer):
         fields = [
             'email', 'first_name', 'last_name', 'avatar',
             'role', 'custom_role', 'role_display',
+
+            # общие
             'can_view_dashboard', 'can_view_cashbox', 'can_view_departments',
             'can_view_orders', 'can_view_analytics', 'can_view_department_analytics',
             'can_view_products', 'can_view_booking',
             'can_view_employees', 'can_view_clients',
-            'can_view_brand_category', 'can_view_settings', 'can_view_sale'
+            'can_view_brand_category', 'can_view_settings', 'can_view_sale',
+
+            # новые
+            'can_view_building_work_process', 'can_view_additional_services',
+
+            # барбершоп
+            'can_view_barber_clients', 'can_view_barber_services',
+            'can_view_barber_history', 'can_view_barber_records',
+
+            # хостел
+            'can_view_hostel_rooms', 'can_view_hostel_booking',
+            'can_view_hostel_clients', 'can_view_hostel_analytics',
+
+            # кафе
+            'can_view_cafe_menu', 'can_view_cafe_orders',
+            'can_view_cafe_purchasing', 'can_view_cafe_booking',
+            'can_view_cafe_clients', 'can_view_cafe_tables',
+
+            # школа
+            'can_view_school_students', 'can_view_school_groups',
+            'can_view_school_lessons', 'can_view_school_teachers',
+            'can_view_school_leads', 'can_view_school_invoices',
         ]
         extra_kwargs = {field: {'required': False} for field in fields if field.startswith('can_view_')}
 
@@ -235,11 +326,33 @@ class EmployeeCreateSerializer(serializers.ModelSerializer):
 
         # извлекаем флаги
         access_fields = [
+            # общие
             'can_view_dashboard', 'can_view_cashbox', 'can_view_departments',
             'can_view_orders', 'can_view_analytics', 'can_view_department_analytics',
             'can_view_products', 'can_view_booking',
             'can_view_employees', 'can_view_clients',
-            'can_view_brand_category', 'can_view_settings', 'can_view_sale'
+            'can_view_brand_category', 'can_view_settings', 'can_view_sale',
+
+            # новые
+            'can_view_building_work_process', 'can_view_additional_services',
+
+            # барбершоп
+            'can_view_barber_clients', 'can_view_barber_services',
+            'can_view_barber_history', 'can_view_barber_records',
+
+            # хостел
+            'can_view_hostel_rooms', 'can_view_hostel_booking',
+            'can_view_hostel_clients', 'can_view_hostel_analytics',
+
+            # кафе
+            'can_view_cafe_menu', 'can_view_cafe_orders',
+            'can_view_cafe_purchasing', 'can_view_cafe_booking',
+            'can_view_cafe_clients', 'can_view_cafe_tables',
+
+            # школа
+            'can_view_school_students', 'can_view_school_groups',
+            'can_view_school_lessons', 'can_view_school_teachers',
+            'can_view_school_leads', 'can_view_school_invoices',
         ]
         access_flags = {field: validated_data.pop(field, None) for field in access_fields}
 
@@ -309,11 +422,34 @@ class UserListSerializer(serializers.ModelSerializer):
         model = User
         fields = [
             'id', 'email', 'first_name', 'last_name', 'role', 'custom_role', 'role_display', 'avatar',
+
+            # общие
             'can_view_dashboard', 'can_view_cashbox', 'can_view_departments',
             'can_view_orders', 'can_view_analytics', 'can_view_department_analytics',
             'can_view_products', 'can_view_booking',
             'can_view_employees', 'can_view_clients',
-            'can_view_brand_category', 'can_view_settings', 'can_view_sale'
+            'can_view_brand_category', 'can_view_settings', 'can_view_sale',
+
+            # новые
+            'can_view_building_work_process', 'can_view_additional_services',
+
+            # барбершоп
+            'can_view_barber_clients', 'can_view_barber_services',
+            'can_view_barber_history', 'can_view_barber_records',
+
+            # хостел
+            'can_view_hostel_rooms', 'can_view_hostel_booking',
+            'can_view_hostel_clients', 'can_view_hostel_analytics',
+
+            # кафе
+            'can_view_cafe_menu', 'can_view_cafe_orders',
+            'can_view_cafe_purchasing', 'can_view_cafe_booking',
+            'can_view_cafe_clients', 'can_view_cafe_tables',
+
+            # школа
+            'can_view_school_students', 'can_view_school_groups',
+            'can_view_school_lessons', 'can_view_school_teachers',
+            'can_view_school_leads', 'can_view_school_invoices',
         ]
 
 
@@ -324,11 +460,34 @@ class UserWithPermissionsSerializer(serializers.ModelSerializer):
         model = User
         fields = [
             'id', 'email', 'first_name', 'last_name', 'role', 'custom_role', 'role_display', 'avatar',
+
+            # общие
             'can_view_dashboard', 'can_view_cashbox', 'can_view_departments',
             'can_view_orders', 'can_view_analytics', 'can_view_department_analytics',
             'can_view_products', 'can_view_booking',
             'can_view_employees', 'can_view_clients',
-            'can_view_brand_category', 'can_view_settings', 'can_view_sale'
+            'can_view_brand_category', 'can_view_settings', 'can_view_sale',
+
+            # новые
+            'can_view_building_work_process', 'can_view_additional_services',
+
+            # барбершоп
+            'can_view_barber_clients', 'can_view_barber_services',
+            'can_view_barber_history', 'can_view_barber_records',
+
+            # хостел
+            'can_view_hostel_rooms', 'can_view_hostel_booking',
+            'can_view_hostel_clients', 'can_view_hostel_analytics',
+
+            # кафе
+            'can_view_cafe_menu', 'can_view_cafe_orders',
+            'can_view_cafe_purchasing', 'can_view_cafe_booking',
+            'can_view_cafe_clients', 'can_view_cafe_tables',
+
+            # школа
+            'can_view_school_students', 'can_view_school_groups',
+            'can_view_school_lessons', 'can_view_school_teachers',
+            'can_view_school_leads', 'can_view_school_invoices',
         ]
 
 
@@ -396,11 +555,34 @@ class EmployeeUpdateSerializer(serializers.ModelSerializer):
         fields = [
             'id', 'first_name', 'last_name', 'avatar',
             'role', 'custom_role', 'role_display',
+
+            # общие
             'can_view_dashboard', 'can_view_cashbox', 'can_view_departments',
             'can_view_orders', 'can_view_analytics', 'can_view_department_analytics',
             'can_view_products', 'can_view_booking',
             'can_view_employees', 'can_view_clients',
-            'can_view_brand_category', 'can_view_settings', 'can_view_sale'
+            'can_view_brand_category', 'can_view_settings', 'can_view_sale',
+
+            # новые
+            'can_view_building_work_process', 'can_view_additional_services',
+
+            # барбершоп
+            'can_view_barber_clients', 'can_view_barber_services',
+            'can_view_barber_history', 'can_view_barber_records',
+
+            # хостел
+            'can_view_hostel_rooms', 'can_view_hostel_booking',
+            'can_view_hostel_clients', 'can_view_hostel_analytics',
+
+            # кафе
+            'can_view_cafe_menu', 'can_view_cafe_orders',
+            'can_view_cafe_purchasing', 'can_view_cafe_booking',
+            'can_view_cafe_clients', 'can_view_cafe_tables',
+
+            # школа
+            'can_view_school_students', 'can_view_school_groups',
+            'can_view_school_lessons', 'can_view_school_teachers',
+            'can_view_school_leads', 'can_view_school_invoices',
         ]
         read_only_fields = ['id']
 
