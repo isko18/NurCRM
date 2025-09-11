@@ -3,6 +3,7 @@ from decimal import Decimal
 from django.db import transaction
 from django.db.models import Sum, Count, Avg
 from django.utils.dateparse import parse_date
+from django.utils import timezone
 
 from rest_framework import generics, permissions, filters, status
 from rest_framework.permissions import IsAuthenticated
@@ -22,7 +23,7 @@ from apps.main.models import (
     Order, Product, Review, Notification, Event,
     ProductBrand, ProductCategory, Warehouse, WarehouseEvent, Client,
     GlobalProduct, GlobalBrand, GlobalCategory, ClientDeal, Bid, SocialApplications, TransactionRecord,
-    ContractorWork
+    ContractorWork, DealInstallment
 )
 from apps.main.serializers import (
     ContactSerializer, PipelineSerializer, DealSerializer, TaskSerializer,
@@ -585,7 +586,54 @@ class ClientDealRetrieveUpdateDestroyAPIView(generics.RetrieveUpdateDestroyAPIVi
             raise serializers.ValidationError({"client": "Клиент принадлежит другой компании."})
         serializer.save(company=company)  # company остаётся той же
         
-        
+class ClientDealPayAPIView(APIView):
+    """
+    POST /api/main/deals/<uuid:pk>/pay/
+    Body (опционально):
+      {
+        "installment_number": 2,      // если не указать — оплатится ближайший не оплаченный
+        "date": "2025-11-10"          // если не указать — сегодняшняя дата (локальная)
+      }
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    @transaction.atomic
+    def post(self, request, pk, *args, **kwargs):
+        company = request.user.company
+        # если используете nested, можно проверить client_id:
+        client_id = kwargs.get("client_id")
+
+        deal_qs = ClientDeal.objects.filter(company=company, pk=pk)
+        if client_id:
+            deal_qs = deal_qs.filter(client_id=client_id)
+
+        deal = get_object_or_404(deal_qs)
+
+        if deal.kind != ClientDeal.Kind.DEBT:
+            return Response({"detail": "Оплата помесячно доступна только для сделок типа 'debt'."},
+                            status=status.HTTP_400_BAD_REQUEST)
+
+        number = request.data.get("installment_number")
+        paid_date_str = request.data.get("date")
+        paid_date = parse_date(paid_date_str) if paid_date_str else timezone.localdate()
+
+        if number:
+            inst = get_object_or_404(DealInstallment, deal=deal, number=number)
+            if inst.paid_on:
+                return Response({"detail": f"Взнос №{number} уже оплачен ({inst.paid_on})."},
+                                status=status.HTTP_400_BAD_REQUEST)
+        else:
+            inst = deal.installments.filter(paid_on__isnull=True).order_by("number").first()
+            if not inst:
+                return Response({"detail": "Все взносы уже оплачены."}, status=status.HTTP_400_BAD_REQUEST)
+
+        inst.paid_on = paid_date
+        inst.save(update_fields=["paid_on"])
+
+        # вернём обновлённую сделку (с пересчитанным remaining_debt)
+        data = ClientDealSerializer(deal, context={"request": request}).data
+        return Response(data, status=status.HTTP_200_OK)
+
 class BidListCreateAPIView(generics.ListCreateAPIView):
     serializer_class = BidSerializers
     queryset = Bid.objects.all()
