@@ -226,25 +226,28 @@ class OrderSerializer(serializers.ModelSerializer):
 
         return order
     
-    
 class ProductSerializer(serializers.ModelSerializer):
     company = serializers.ReadOnlyField(source="company.id")
 
-    # бренд и категория (только название для чтения)
+    # бренд/категория: только названия на чтение
     brand = serializers.CharField(source="brand.name", read_only=True)
     category = serializers.CharField(source="category.name", read_only=True)
 
-    # ручное создание/редактирование
+    # ручной ввод названий на запись
     brand_name = serializers.CharField(write_only=True, required=False, allow_blank=True)
     category_name = serializers.CharField(write_only=True, required=False, allow_blank=True)
 
     # клиент
     client = serializers.PrimaryKeyRelatedField(
-        queryset=Client.objects.all(),
-        required=False,
-        allow_null=True
+        queryset=Client.objects.all(), required=False, allow_null=True
     )
     client_name = serializers.CharField(source="client.full_name", read_only=True)
+
+    # статус (необязательный) + человекочитаемое значение
+    status = serializers.ChoiceField(
+        choices=Product.Status.choices, required=False, allow_null=True
+    )
+    status_display = serializers.CharField(source="get_status_display", read_only=True)
 
     class Meta:
         model = Product
@@ -252,30 +255,23 @@ class ProductSerializer(serializers.ModelSerializer):
             "id", "name", "barcode",
             "brand", "brand_name",
             "category", "category_name",
-            "quantity", "price", "purchase_price",  # ✅ добавлено
+            "quantity", "price", "purchase_price",
+            "status", "status_display",
             "company",
             "client", "client_name",
-            "created_at", "updated_at"
+            "created_at", "updated_at",
         ]
         read_only_fields = [
             "id", "created_at", "updated_at",
-            "company", "name", "brand", "category", "client_name"
+            "company", "name", "brand", "category", "client_name", "status_display",
         ]
         extra_kwargs = {
             "price": {"required": False, "default": 0},
-            "purchase_price": {"required": False, "default": 0},  # ✅ дефолт
+            "purchase_price": {"required": False, "default": 0},
             "quantity": {"required": False, "default": 0},
         }
 
-    def validate_barcode(self, value):
-        value = str(value).strip()
-        if not value:
-            raise serializers.ValidationError("Укажите штрих-код.")
-        company = self.context["request"].user.company
-        if Product.objects.filter(company=company, barcode=value).exists():
-            raise serializers.ValidationError("В вашей компании уже есть товар с таким штрих-кодом.")
-        return value
-
+    # ---------- helpers ----------
     def _ensure_company_brand(self, company, global_brand):
         if global_brand:
             brand, _ = ProductBrand.objects.get_or_create(company=company, name=global_brand.name)
@@ -288,14 +284,44 @@ class ProductSerializer(serializers.ModelSerializer):
             return category
         return None
 
+    # ---------- validation ----------
+    def validate_status(self, value):
+        # пустую строку трактуем как None
+        if value in ("", None):
+            return None
+        return value
+
+    def validate_barcode(self, value):
+        value = str(value).strip()
+        if not value:
+            raise serializers.ValidationError("Укажите штрих-код.")
+        company = self.context["request"].user.company
+        qs = Product.objects.filter(company=company, barcode=value)
+        if self.instance:
+            qs = qs.exclude(pk=self.instance.pk)
+        if qs.exists():
+            raise serializers.ValidationError("В вашей компании уже есть товар с таким штрих-кодом.")
+        return value
+
+    def validate(self, attrs):
+        # клиент (если передан) должен принадлежать компании пользователя
+        company = self.context["request"].user.company
+        client = attrs.get("client") or (self.instance.client if self.instance else None)
+        if client and client.company_id != company.id:
+            raise serializers.ValidationError({"client": "Клиент принадлежит другой компании."})
+        return attrs
+
+    # ---------- create/update ----------
     @transaction.atomic
     def create(self, validated_data):
         request = self.context["request"]
         company = request.user.company
         barcode = validated_data["barcode"]
 
-        # достаём клиента отдельно
+        # write-only поля
         client = validated_data.pop("client", None)
+        brand_name = (validated_data.pop("brand_name", "") or "").strip()
+        category_name = (validated_data.pop("category_name", "") or "").strip()
 
         gp = GlobalProduct.objects.select_related("brand", "category").filter(barcode=barcode).first()
         if not gp:
@@ -303,8 +329,16 @@ class ProductSerializer(serializers.ModelSerializer):
                 "barcode": "Товар с таким штрих-кодом не найден в глобальной базе. Заполните карточку вручную."
             })
 
-        brand = self._ensure_company_brand(company, gp.brand)
-        category = self._ensure_company_category(company, gp.category)
+        # приоритет: явные *_name -> иначе копируем из глобальных
+        if brand_name:
+            brand = ProductBrand.objects.get_or_create(company=company, name=brand_name)[0]
+        else:
+            brand = self._ensure_company_brand(company, gp.brand)
+
+        if category_name:
+            category = ProductCategory.objects.get_or_create(company=company, name=category_name)[0]
+        else:
+            category = self._ensure_company_category(company, gp.category)
 
         product = Product.objects.create(
             company=company,
@@ -313,12 +347,34 @@ class ProductSerializer(serializers.ModelSerializer):
             brand=brand,
             category=category,
             price=validated_data.get("price", 0),
-            purchase_price=validated_data.get("purchase_price", 0),  # ✅ сохраняем
+            purchase_price=validated_data.get("purchase_price", 0),
             quantity=validated_data.get("quantity", 0),
-            client=client
+            client=client,
+            status=validated_data.get("status", None),   # необязательное
         )
         return product
 
+    @transaction.atomic
+    def update(self, instance, validated_data):
+        company = self.context["request"].user.company
+        brand_name = (validated_data.pop("brand_name", "") or "").strip()
+        category_name = (validated_data.pop("category_name", "") or "").strip()
+
+        if brand_name:
+            instance.brand, _ = ProductBrand.objects.get_or_create(company=company, name=brand_name)
+        if category_name:
+            instance.category, _ = ProductCategory.objects.get_or_create(company=company, name=category_name)
+
+        # простые поля; status и client могут быть None
+        for field in ("barcode", "quantity", "price", "purchase_price", "client", "status"):
+            if field in validated_data:
+                setattr(instance, field, validated_data[field])
+
+        instance.save(update_fields=[
+            "brand_id", "category_id", "barcode", "quantity",
+            "price", "purchase_price", "client_id", "status", "updated_at"
+        ])
+        return instance
 
 class ReviewSerializer(serializers.ModelSerializer):
     user = serializers.ReadOnlyField(source='user.id')
@@ -485,19 +541,16 @@ class DealInstallmentSerializer(serializers.ModelSerializer):
         fields = ("number", "due_date", "amount", "balance_after", "paid_on")
         read_only_fields = ("number", "due_date", "amount", "balance_after")
 
-
 class ClientDealSerializer(serializers.ModelSerializer):
     company = serializers.ReadOnlyField(source="company.id")
-    # client может отсутствовать — его подставит view через serializer.save(client=...)
     client = serializers.PrimaryKeyRelatedField(queryset=Client.objects.all(), required=False)
     client_full_name = serializers.CharField(source="client.full_name", read_only=True)
 
-    # вычисляемые поля для карточек/модалки
-    debt_amount = serializers.DecimalField(source="debt_amount", max_digits=12, decimal_places=2, read_only=True)
-    remaining_debt = serializers.DecimalField(source="remaining_debt", max_digits=12, decimal_places=2, read_only=True)
-    monthly_payment = serializers.DecimalField(source="monthly_payment", max_digits=12, decimal_places=2, read_only=True)
+    # было: source="debt_amount"/"monthly_payment"/"remaining_debt" → убрать
+    debt_amount = serializers.DecimalField(max_digits=12, decimal_places=2, read_only=True)
+    monthly_payment = serializers.DecimalField(max_digits=12, decimal_places=2, read_only=True)
+    remaining_debt = serializers.DecimalField(max_digits=12, decimal_places=2, read_only=True)
 
-    # график платежей
     installments = DealInstallmentSerializer(many=True, read_only=True)
 
     class Meta:
@@ -515,7 +568,7 @@ class ClientDealSerializer(serializers.ModelSerializer):
             "id", "company", "created_at", "updated_at", "client_full_name",
             "debt_amount", "monthly_payment", "remaining_debt", "installments",
         ]
-
+        
     def validate(self, attrs):
         request = self.context["request"]
         company = request.user.company
