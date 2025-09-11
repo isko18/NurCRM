@@ -83,8 +83,8 @@ urlpatterns = [
          name="client-deals-detail"),
 
     # flat
-    path("api/main/deals/", ClientDealListCreateAPIView.as_view(), name="deal-list-create"),
-    path("api/main/deals/<uuid:pk>/", ClientDealRetrieveUpdateDestroyAPIView.as_view(), name="deal-detail"),
+    path("clientdeals/", ClientDealListCreateAPIView.as_view(), name="deal-list-create"),
+    path("clientdeals/<uuid:pk>/", ClientDealRetrieveUpdateDestroyAPIView.as_view(), name="deal-detail"),
     
     path("pos/sales/", SaleListAPIView.as_view(), name="pos-sale-list"),
     path("pos/sales/start/", SaleStartAPIView.as_view(), name="pos-sale-start"),
