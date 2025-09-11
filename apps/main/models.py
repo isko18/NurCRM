@@ -1017,3 +1017,5 @@ class Debts(models.Model):
     full_name = models.CharField(max_length=255)
     amount = models.DecimalField("Сумма", max_digits=12, decimal_places=2)
     
+    
+    
