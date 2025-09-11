@@ -573,7 +573,6 @@ class ClientDealSerializer(serializers.ModelSerializer):
         request = self.context["request"]
         company = request.user.company
 
-        # проверяем клиента в рамках компании
         client = attrs.get("client") or (self.instance.client if self.instance else None)
         if client and client.company_id != company.id:
             raise serializers.ValidationError({"client": "Клиент принадлежит другой компании."})
@@ -584,7 +583,6 @@ class ClientDealSerializer(serializers.ModelSerializer):
         debt_months = attrs.get("debt_months", getattr(self.instance, "debt_months", None))
 
         errors = {}
-
         if amount is not None and amount < 0:
             errors["amount"] = "Сумма не может быть отрицательной."
         if prepayment is not None and prepayment < 0:
@@ -599,11 +597,9 @@ class ClientDealSerializer(serializers.ModelSerializer):
             if not debt_months or debt_months <= 0:
                 errors["debt_months"] = "Укажите срок (в месяцах) для рассрочки."
         else:
-            # если это не долг — не держим «хвосты»
-            if "debt_months" in attrs and not attrs["debt_months"]:
-                attrs["debt_months"] = None
-            if "first_due_date" in attrs and not attrs["first_due_date"]:
-                attrs["first_due_date"] = None
+            # всегда очищаем поля рассрочки при не-debt
+            attrs["debt_months"] = None
+            attrs["first_due_date"] = None
 
         if errors:
             raise serializers.ValidationError(errors)
