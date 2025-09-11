@@ -1,5 +1,5 @@
 from rest_framework import serializers
-from apps.main.models import Contact, Pipeline, Deal, Task, Integration, Analytics, Order, Product, Review, Notification, Event, Warehouse, WarehouseEvent, ProductCategory, ProductBrand, OrderItem, Client, GlobalProduct, CartItem, ClientDeal, Bid, SocialApplications, TransactionRecord, DealInstallment
+from apps.main.models import Contact, Pipeline, Deal, Task, Integration, Analytics, Order, Product, Review, Notification, Event, Warehouse, WarehouseEvent, ProductCategory, ProductBrand, OrderItem, Client, GlobalProduct, CartItem, ClientDeal, Bid, SocialApplications, TransactionRecord, DealInstallment, ContractorWork
 from apps.construction.models import Department
 from apps.users.models import User, Company
 from django.db import transaction
@@ -702,3 +702,52 @@ class TransactionRecordSerializer(serializers.ModelSerializer):
                 validated_data["company"] = new_department.company
 
         return super().update(instance, validated_data)
+    
+    
+class ContractorWorkSerializer(serializers.ModelSerializer):
+    company = serializers.ReadOnlyField(source="company.id")
+
+    department = serializers.PrimaryKeyRelatedField(queryset=Department.objects.all())
+    department_name = serializers.CharField(source="department.name", read_only=True)
+
+    duration_days = serializers.IntegerField(read_only=True)  # @property из модели
+
+    class Meta:
+        model = ContractorWork
+        fields = [
+            "id", "company",
+            "title",
+            "contractor_name", "contractor_phone",
+            "contractor_entity_type", "contractor_entity_name",
+            "amount",
+            "department", "department_name",
+            "start_date", "end_date",
+            "planned_completion_date", "work_calendar_date",
+            "description",
+            "duration_days",
+            "created_at", "updated_at",
+        ]
+        read_only_fields = ["id", "company", "department_name", "duration_days", "created_at", "updated_at"]
+
+    def validate(self, attrs):
+        company = self.context["request"].user.company
+        dep = attrs.get("department") or (self.instance.department if self.instance else None)
+        if dep and dep.company_id != company.id:
+            raise serializers.ValidationError({"department": "Отдел принадлежит другой компании."})
+
+        start = attrs.get("start_date", getattr(self.instance, "start_date", None))
+        end = attrs.get("end_date", getattr(self.instance, "end_date", None))
+        planned = attrs.get("planned_completion_date", getattr(self.instance, "planned_completion_date", None))
+
+        errors = {}
+        if start and end and end < start:
+            errors["end_date"] = "Дата окончания не может быть раньше даты начала."
+        if planned and start and planned < start:
+            errors["planned_completion_date"] = "Плановая дата завершения не может быть раньше начала."
+        if errors:
+            raise serializers.ValidationError(errors)
+        return attrs
+
+    def create(self, validated_data):
+        validated_data["company"] = self.context["request"].user.company
+        return super().create(validated_data)

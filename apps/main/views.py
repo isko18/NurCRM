@@ -15,11 +15,14 @@ from .filters import TransactionRecordFilter
 from django_filters.rest_framework import DjangoFilterBackend
 from rest_framework.exceptions import PermissionDenied
 
+from apps.construction.models import Department
+
 from apps.main.models import (
     Contact, Pipeline, Deal, Task, Integration, Analytics,
     Order, Product, Review, Notification, Event,
     ProductBrand, ProductCategory, Warehouse, WarehouseEvent, Client,
-    GlobalProduct, GlobalBrand, GlobalCategory, ClientDeal, Bid, SocialApplications, TransactionRecord
+    GlobalProduct, GlobalBrand, GlobalCategory, ClientDeal, Bid, SocialApplications, TransactionRecord,
+    ContractorWork
 )
 from apps.main.serializers import (
     ContactSerializer, PipelineSerializer, DealSerializer, TaskSerializer,
@@ -27,7 +30,7 @@ from apps.main.serializers import (
     ReviewSerializer, NotificationSerializer, EventSerializer,
     WarehouseSerializer, WarehouseEventSerializer,
     ProductCategorySerializer, ProductBrandSerializer,
-    OrderItemSerializer, ClientSerializer, ClientDealSerializer, BidSerializers, SocialApplicationsSerializers, TransactionRecordSerializer
+    OrderItemSerializer, ClientSerializer, ClientDealSerializer, BidSerializers, SocialApplicationsSerializers, TransactionRecordSerializer, ContractorWorkSerializer
 )
 
 
@@ -663,3 +666,74 @@ class TransactionRecordRetrieveUpdateDestroyView(generics.RetrieveUpdateDestroyA
         if company:
             return qs.filter(company=company)
         return qs.none()
+    
+    
+class ContractorWorkListCreateAPIView(generics.ListCreateAPIView):
+    """
+      GET  /api/main/contractor-works/
+      POST /api/main/contractor-works/
+      GET  /api/main/departments/<uuid:department_id>/contractor-works/
+      POST /api/main/departments/<uuid:department_id>/contractor-works/
+    """
+    permission_classes = [permissions.IsAuthenticated]
+    serializer_class = ContractorWorkSerializer
+    filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
+    filterset_fields = ["department", "contractor_entity_type", "start_date", "end_date"]
+    search_fields = ["title", "contractor_name", "contractor_phone", "contractor_entity_name", "description"]
+    ordering_fields = ["created_at", "updated_at", "amount", "start_date", "end_date", "planned_completion_date"]
+    ordering = ["-created_at"]
+
+    def get_queryset(self):
+        qs = ContractorWork.objects.select_related("department").filter(
+            company_id=self.request.user.company_id
+        )
+        dep_id = self.kwargs.get("department_id")
+        if dep_id:
+            qs = qs.filter(department_id=dep_id)
+        return qs
+
+    @transaction.atomic
+    def perform_create(self, serializer):
+        company = self.request.user.company
+        dep_id = self.kwargs.get("department_id")
+        if dep_id:
+            # nested: отдел из URL и в рамках компании
+            department = get_object_or_404(Department, id=dep_id, company=company)
+            serializer.save(company=company, department=department)
+        else:
+            # flat: отдел приходит в теле и должен принадлежать компании
+            dep = serializer.validated_data.get("department")
+            if not dep or dep.company_id != company.id:
+                raise serializers.ValidationError({"department": "Отдел не найден в вашей компании."})
+            serializer.save(company=company)
+
+
+class ContractorWorkRetrieveUpdateDestroyAPIView(generics.RetrieveUpdateDestroyAPIView):
+    """
+    GET    /api/main/contractor-works/<uuid:pk>/
+    PATCH  /api/main/contractor-works/<uuid:pk>/
+    PUT    /api/main/contractor-works/<uuid:pk>/
+    DELETE /api/main/contractor-works/<uuid:pk>/
+
+    (опционально nested)
+    GET    /api/main/departments/<uuid:department_id>/contractor-works/<uuid:pk>/
+    """
+    permission_classes = [permissions.IsAuthenticated]
+    serializer_class = ContractorWorkSerializer
+
+    def get_queryset(self):
+        qs = ContractorWork.objects.select_related("department").filter(
+            company_id=self.request.user.company_id
+        )
+        dep_id = self.kwargs.get("department_id")
+        if dep_id:
+            qs = qs.filter(department_id=dep_id)
+        return qs
+
+    @transaction.atomic
+    def perform_update(self, serializer):
+        company = self.request.user.company
+        dep = serializer.validated_data.get("department")
+        if dep and dep.company_id != company.id:
+            raise serializers.ValidationError({"department": "Отдел принадлежит другой компании."})
+        serializer.save(company=company)
