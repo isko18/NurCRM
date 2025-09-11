@@ -229,24 +229,19 @@ class OrderSerializer(serializers.ModelSerializer):
 class ProductSerializer(serializers.ModelSerializer):
     company = serializers.ReadOnlyField(source="company.id")
 
-    # бренд/категория: только названия на чтение
     brand = serializers.CharField(source="brand.name", read_only=True)
     category = serializers.CharField(source="category.name", read_only=True)
 
-    # ручной ввод названий на запись
     brand_name = serializers.CharField(write_only=True, required=False, allow_blank=True)
     category_name = serializers.CharField(write_only=True, required=False, allow_blank=True)
 
-    # клиент
     client = serializers.PrimaryKeyRelatedField(
         queryset=Client.objects.all(), required=False, allow_null=True
     )
     client_name = serializers.CharField(source="client.full_name", read_only=True)
 
-    # статус (необязательный) + человекочитаемое значение
-    status = serializers.ChoiceField(
-        choices=Product.Status.choices, required=False, allow_null=True
-    )
+    # 🔧 меняем ChoiceField → CharField, обработаем вручную
+    status = serializers.CharField(required=False, allow_null=True, allow_blank=True)
     status_display = serializers.CharField(source="get_status_display", read_only=True)
 
     class Meta:
@@ -263,7 +258,8 @@ class ProductSerializer(serializers.ModelSerializer):
         ]
         read_only_fields = [
             "id", "created_at", "updated_at",
-            "company", "name", "brand", "category", "client_name", "status_display",
+            "company", "name", "brand", "category",
+            "client_name", "status_display",
         ]
         extra_kwargs = {
             "price": {"required": False, "default": 0},
@@ -286,10 +282,27 @@ class ProductSerializer(serializers.ModelSerializer):
 
     # ---------- validation ----------
     def validate_status(self, value):
-        # пустую строку трактуем как None
         if value in ("", None):
             return None
-        return value
+        v = str(value).strip().lower()
+        # принимаем и коды, и русские подписи
+        mapping = {
+            "pending": Product.Status.PENDING,
+            "accepted": Product.Status.ACCEPTED,
+            "rejected": Product.Status.REJECTED,
+            "ожидание": Product.Status.PENDING,
+            "принят": Product.Status.ACCEPTED,
+            "отказ": Product.Status.REJECTED,
+        }
+        if v in mapping:
+            return mapping[v]
+        # если пришло уже корректное значение (например, из другого клиента)
+        valid_codes = {c[0] for c in Product.Status.choices}
+        if value in valid_codes:
+            return value
+        raise serializers.ValidationError(
+            f"Недопустимый статус. Допустимые: {', '.join(sorted(valid_codes))}."
+        )
 
     def validate_barcode(self, value):
         value = str(value).strip()
@@ -304,7 +317,6 @@ class ProductSerializer(serializers.ModelSerializer):
         return value
 
     def validate(self, attrs):
-        # клиент (если передан) должен принадлежать компании пользователя
         company = self.context["request"].user.company
         client = attrs.get("client") or (self.instance.client if self.instance else None)
         if client and client.company_id != company.id:
@@ -318,10 +330,10 @@ class ProductSerializer(serializers.ModelSerializer):
         company = request.user.company
         barcode = validated_data["barcode"]
 
-        # write-only поля
         client = validated_data.pop("client", None)
         brand_name = (validated_data.pop("brand_name", "") or "").strip()
         category_name = (validated_data.pop("category_name", "") or "").strip()
+        status_value = validated_data.pop("status", None)  # уже нормализован validate_status
 
         gp = GlobalProduct.objects.select_related("brand", "category").filter(barcode=barcode).first()
         if not gp:
@@ -329,16 +341,10 @@ class ProductSerializer(serializers.ModelSerializer):
                 "barcode": "Товар с таким штрих-кодом не найден в глобальной базе. Заполните карточку вручную."
             })
 
-        # приоритет: явные *_name -> иначе копируем из глобальных
-        if brand_name:
-            brand = ProductBrand.objects.get_or_create(company=company, name=brand_name)[0]
-        else:
-            brand = self._ensure_company_brand(company, gp.brand)
-
-        if category_name:
-            category = ProductCategory.objects.get_or_create(company=company, name=category_name)[0]
-        else:
-            category = self._ensure_company_category(company, gp.category)
+        brand = (ProductBrand.objects.get_or_create(company=company, name=brand_name)[0]
+                 if brand_name else self._ensure_company_brand(company, gp.brand))
+        category = (ProductCategory.objects.get_or_create(company=company, name=category_name)[0]
+                    if category_name else self._ensure_company_category(company, gp.category))
 
         product = Product.objects.create(
             company=company,
@@ -350,7 +356,7 @@ class ProductSerializer(serializers.ModelSerializer):
             purchase_price=validated_data.get("purchase_price", 0),
             quantity=validated_data.get("quantity", 0),
             client=client,
-            status=validated_data.get("status", None),   # необязательное
+            status=status_value,  # 💡 точно проставим
         )
         return product
 
@@ -365,17 +371,21 @@ class ProductSerializer(serializers.ModelSerializer):
         if category_name:
             instance.category, _ = ProductCategory.objects.get_or_create(company=company, name=category_name)
 
-        # простые поля; status и client могут быть None
-        for field in ("barcode", "quantity", "price", "purchase_price", "client", "status"):
+        # простые поля
+        for field in ("barcode", "quantity", "price", "purchase_price", "client"):
             if field in validated_data:
                 setattr(instance, field, validated_data[field])
+
+        # статус обрабатываем отдельно: даже если None — это осознанное значение
+        if "status" in validated_data:
+            instance.status = validated_data["status"]
 
         instance.save(update_fields=[
             "brand_id", "category_id", "barcode", "quantity",
             "price", "purchase_price", "client_id", "status", "updated_at"
         ])
         return instance
-
+    
 class ReviewSerializer(serializers.ModelSerializer):
     user = serializers.ReadOnlyField(source='user.id')
     company = serializers.ReadOnlyField(source='company.id')
