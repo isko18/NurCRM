@@ -113,6 +113,11 @@ urlpatterns = [
     # nested по отделу (если нужно)
     path("departments/<uuid:department_id>/contractor-works/", ContractorWorkListCreateAPIView.as_view(), name="department-contractorwork-list"),
     path("departments/<uuid:department_id>/contractor-works/<uuid:pk>/", ContractorWorkRetrieveUpdateDestroyAPIView.as_view(), name="department-contractorwork-detail"),
+    
+    path("debts/", DebtListCreateAPIView.as_view(), name="debt-list"),
+    path("debts/<uuid:pk>/", DebtRetrieveUpdateDestroyAPIView.as_view(), name="debt-detail"),
+    path("debts/<uuid:pk>/pay/", DebtPayAPIView.as_view(), name="debt-pay"),
+    path("debts/<uuid:pk>/payments/", DebtPaymentListAPIView.as_view(), name="debt-payments"),
 ]
 
 
