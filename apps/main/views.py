@@ -549,35 +549,32 @@ class ClientDealListCreateAPIView(generics.ListCreateAPIView):
 
 
 class ClientDealRetrieveUpdateDestroyAPIView(generics.RetrieveUpdateDestroyAPIView):
-    """
-    GET    /api/main/deals/<uuid:pk>/
-    PATCH  /api/main/deals/<uuid:pk>/
-    PUT    /api/main/deals/<uuid:pk>/
-    DELETE /api/main/deals/<uuid:pk>/
-    """
     permission_classes = [permissions.IsAuthenticated]
     serializer_class = ClientDealSerializer
 
+    # Если вдруг в URL у вас <uuid:id>/ — раскомментируйте строку ниже
+    # lookup_url_kwarg = "id"     # по умолчанию DRF ждёт 'pk'
+
     def get_queryset(self):
-        return (
+        qs = (
             ClientDeal.objects
             .select_related("client")
             .prefetch_related("installments")
             .filter(company=self.request.user.company)
         )
+        # поддержка nested-роута: /clients/<client_id>/deals/<pk>/
+        client_id = self.kwargs.get("client_id")
+        if client_id:
+            qs = qs.filter(client_id=client_id)
+        return qs
 
     @transaction.atomic
     def perform_update(self, serializer):
-        """
-        Не даём увести сделку в другую компанию через смену client.
-        График пересоберётся в model.save().
-        """
         company = self.request.user.company
         new_client = serializer.validated_data.get("client")
         if new_client and new_client.company_id != company.id:
             raise serializers.ValidationError({"client": "Клиент принадлежит другой компании."})
-        serializer.save(company=company)  # company остаётся той же
-        
+        serializer.save(company=company)
         
 class BidListCreateAPIView(generics.ListCreateAPIView):
     serializer_class = BidSerializers

@@ -692,6 +692,7 @@ class Client(models.Model):
     )
     type = models.CharField(
         "Тип клиента", max_length=16, choices=StatusClient.choices, default=StatusClient.CLIENT, null=True, blank=True)
+    enterprise = models.CharField("Предприятие ", max_length=255)
     full_name = models.CharField("ФИО", max_length=255)
     phone = models.CharField("Телефон", max_length=32)
     email = models.EmailField("Почта", blank=True)          # по желанию
@@ -738,7 +739,7 @@ class ClientDeal(models.Model):
     title = models.CharField("Название сделки", max_length=255)
     kind = models.CharField("Тип сделки", max_length=16, choices=Kind.choices, default=Kind.SALE)
 
-    # --- ключевые суммы для карточек ---
+ 
     amount = models.DecimalField("Сумма договора", max_digits=12, decimal_places=2, default=0)  # как на карточке слева
     prepayment = models.DecimalField("Предоплата", max_digits=12, decimal_places=2, default=0)  # карточка по центру
 
