@@ -2,7 +2,8 @@ import uuid
 from django.db import models
 from apps.users.models import Company, User
 from django.core.exceptions import ValidationError
-
+from django.core.validators import MinValueValidator, RegexValidator
+from decimal import Decimal
 
 class Lead(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
@@ -94,6 +95,7 @@ class Student(models.Model):
     discount = models.DecimalField("Скидка (сом)", max_digits=10, decimal_places=2, default=0)
     note = models.TextField("Заметка", blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
+    active = models.BooleanField(default=False, verbose_name="Завершен/Активный")
 
     class Meta:
         verbose_name = "Студент"
@@ -109,6 +111,12 @@ class Lesson(models.Model):
     company = models.ForeignKey(
         Company, on_delete=models.CASCADE, related_name='lessons', verbose_name='Организация'
     )
+
+    # НОВОЕ: прямое FK на курс
+    course = models.ForeignKey(
+        Course, on_delete=models.PROTECT, related_name="lessons", verbose_name="Курс"
+    )
+
     group = models.ForeignKey(
         Group, on_delete=models.CASCADE, related_name="lessons", verbose_name="Группа"
     )
@@ -131,9 +139,22 @@ class Lesson(models.Model):
                 fields=["teacher", "date", "time"], name="unique_teacher_lesson_per_time"
             )
         ]
+        indexes = [
+            models.Index(fields=["company", "course"]),   # удобно фильтровать по курсу
+        ]
 
     def __str__(self):
         return f"{self.group.name} — {self.date} {self.time} ({self.teacher})"
+
+    def clean(self):
+        # компания везде одна
+        if self.course and self.company_id != self.course.company_id:
+            raise ValidationError({"course": "Курс принадлежит другой компании."})
+        if self.group and self.company_id != self.group.company_id:
+            raise ValidationError({"group": "Группа принадлежит другой компании."})
+        # курс урока должен совпадать с курсом группы
+        if self.group_id and self.course_id and self.group.course_id != self.course_id:
+            raise ValidationError({"course": "Курс урока должен совпадать с курсом выбранной группы."})
 
 
 class Folder(models.Model):
@@ -225,3 +246,65 @@ class Attendance(models.Model):
         # ученик должен быть из группы занятия
         if self.student.group_id != self.lesson.group_id:
             raise ValidationError({"student": "Студент не из группы этого занятия."})
+        
+class TeacherRate(models.Model):
+    class Mode(models.TextChoices):
+        HOUR   = "hour",   "Час"
+        LESSON = "lesson", "Урок"
+        MONTH  = "month",  "Месяц"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    company = models.ForeignKey(Company, on_delete=models.CASCADE,
+                                related_name="teacher_rates", verbose_name="Компания")
+    teacher = models.ForeignKey(User, on_delete=models.CASCADE,
+                                related_name="teacher_rates", verbose_name="Преподаватель")
+
+    period = models.CharField(
+        "Период", max_length=7,
+        validators=[RegexValidator(r"^\d{4}-(0[1-9]|1[0-2])$", "Формат периода: YYYY-MM")],
+        help_text="YYYY-MM",
+    )
+    mode = models.CharField("Режим", max_length=10, choices=Mode.choices)
+    rate = models.DecimalField("Ставка", max_digits=12, decimal_places=2,
+                               validators=[MinValueValidator(Decimal("0"))])
+
+    created_at = models.DateTimeField("Создано", auto_now_add=True)
+    updated_at = models.DateTimeField("Обновлено", auto_now=True)
+
+    class Meta:
+        db_table = "education_teacher_rate"
+        verbose_name = "Ставка преподавателя"
+        verbose_name_plural = "Ставки преподавателей"
+        ordering = ["-updated_at"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["company", "teacher", "mode", "period"],
+                name="uniq_company_teacher_mode_period",
+            ),
+        ]
+        indexes = [
+            models.Index(fields=["company", "teacher", "period", "mode"],
+                         name="idx_tr_company_teacher_period_mode"),
+        ]
+
+    def __str__(self):
+        return f"{self.teacher} · {self.period} · {self.get_mode_display()} = {self.rate}"
+
+    def clean(self):
+        # согласованность компании
+        if self.teacher_id and self.company_id:
+            # если в User есть поле company — проверим
+            teacher_company_id = getattr(self.teacher, "company_id", None)
+            if teacher_company_id and teacher_company_id != self.company_id:
+                raise ValidationError({"teacher": "Преподаватель из другой компании."})
+
+    @classmethod
+    def get_for(cls, company, teacher, period: str, mode: str):
+        """
+        Удобный помощник: вернуть ставку за период (точное совпадение).
+        period: 'YYYY-MM'
+        """
+        try:
+            return cls.objects.get(company=company, teacher=teacher, period=period, mode=mode).rate
+        except cls.DoesNotExist:
+            return None
