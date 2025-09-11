@@ -557,15 +557,18 @@ class ClientDealRetrieveUpdateDestroyAPIView(generics.RetrieveUpdateDestroyAPIVi
     """
     permission_classes = [permissions.IsAuthenticated]
     serializer_class = ClientDealSerializer
-
     def get_queryset(self):
-        return (
+        qs = (
             ClientDeal.objects
             .select_related("client")
             .prefetch_related("installments")
-            .filter(company=self.request.user.company)
+            .filter(company_id=self.request.user.company_id)
         )
-
+        # если у вас есть nested путь для retrieve
+        client_id = self.kwargs.get("client_id")
+        if client_id:
+            qs = qs.filter(client_id=client_id)
+        return qs
     @transaction.atomic
     def perform_update(self, serializer):
         """

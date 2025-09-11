@@ -80,6 +80,7 @@ urlpatterns = [
     path("deals/", ClientDealListCreateAPIView.as_view()),
     path("deals/<uuid:pk>/", ClientDealRetrieveUpdateDestroyAPIView.as_view()),
     path("clients/<uuid:client_id>/deals/", ClientDealListCreateAPIView.as_view()),
+    path("api/main/clients/<uuid:client_id>/deals/<uuid:pk>/", ClientDealRetrieveUpdateDestroyAPIView.as_view()),
     
     path("pos/sales/", SaleListAPIView.as_view(), name="pos-sale-list"),
     path("pos/sales/start/", SaleStartAPIView.as_view(), name="pos-sale-start"),
