@@ -209,10 +209,33 @@ class ProductCreateByBarcodeAPIView(generics.CreateAPIView):
 
 class ProductCreateManualAPIView(generics.CreateAPIView):
     """
-    Ручное создание товара + добавление в глобальную базу.
+    Ручное создание товара + (опционально) добавление в глобальную базу.
+    Принимает status как: pending/accepted/rejected или Ожидание/Принят/Отказ.
+    Пустая строка/null -> статус не устанавливается (NULL).
     """
     serializer_class = ProductSerializer
     permission_classes = [IsAuthenticated]
+
+    def _normalize_status(self, raw):
+        """Приводим входной статус к коду из Product.Status.* или None."""
+        if raw in (None, "", "null"):
+            return None
+        v = str(raw).strip().lower()
+        mapping = {
+            "pending":  Product.Status.PENDING,
+            "accepted": Product.Status.ACCEPTED,
+            "rejected": Product.Status.REJECTED,
+            "ожидание": Product.Status.PENDING,
+            "принят":   Product.Status.ACCEPTED,
+            "отказ":    Product.Status.REJECTED,
+        }
+        if v in mapping:
+            return mapping[v]
+        # допускаем уже корректные коды
+        codes = {c[0] for c in Product.Status.choices}
+        if v in codes:
+            return v
+        raise ValueError(f"Недопустимый статус. Допустимые: {', '.join(sorted(codes))}.")
 
     @transaction.atomic
     def create(self, request, *args, **kwargs):
@@ -225,24 +248,22 @@ class ProductCreateManualAPIView(generics.CreateAPIView):
 
         barcode = (data.get("barcode") or "").strip() or None
 
-        # Проверка уникальности в компании
+        # уникальность штрих-кода в компании
         if barcode and Product.objects.filter(company=company, barcode=barcode).exists():
             return Response(
                 {"barcode": "В вашей компании уже есть товар с таким штрих-кодом."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        # ✅ price / purchase_price / quantity
+        # цены/кол-во
         try:
             price = Decimal(str(data.get("price", 0)))
         except Exception:
             return Response({"price": "Неверный формат цены."}, status=status.HTTP_400_BAD_REQUEST)
-
         try:
             purchase_price = Decimal(str(data.get("purchase_price", 0)))
         except Exception:
             return Response({"purchase_price": "Неверный формат закупочной цены."}, status=status.HTTP_400_BAD_REQUEST)
-
         try:
             quantity = int(data.get("quantity", 0))
             if quantity < 0:
@@ -250,21 +271,29 @@ class ProductCreateManualAPIView(generics.CreateAPIView):
         except Exception:
             return Response({"quantity": "Неверное количество."}, status=status.HTTP_400_BAD_REQUEST)
 
-        # ✅ глобальный бренд/категория
-        g_brand = GlobalBrand.objects.get_or_create(name=(data.get("brand_name") or "").strip())[0] if data.get("brand_name") else None
-        g_category = GlobalCategory.objects.get_or_create(name=(data.get("category_name") or "").strip())[0] if data.get("category_name") else None
+        # статус (необязателен)
+        try:
+            status_value = self._normalize_status(data.get("status"))
+        except ValueError as e:
+            return Response({"status": str(e)}, status=status.HTTP_400_BAD_REQUEST)
 
-        # ✅ локальные справочники
+        # глобальные справочники (если переданы имена)
+        brand_name = (data.get("brand_name") or "").strip()
+        category_name = (data.get("category_name") or "").strip()
+        g_brand = GlobalBrand.objects.get_or_create(name=brand_name)[0] if brand_name else None
+        g_category = GlobalCategory.objects.get_or_create(name=category_name)[0] if category_name else None
+
+        # локальные справочники компании
         brand = ProductBrand.objects.get_or_create(company=company, name=g_brand.name)[0] if g_brand else None
         category = ProductCategory.objects.get_or_create(company=company, name=g_category.name)[0] if g_category else None
 
-        # ✅ клиент (если передан)
+        # клиент (если передан)
         client = None
         client_id = data.get("client")
         if client_id:
             client = get_object_or_404(Client, id=client_id, company=company)
 
-        # Создаём товар компании
+        # создаём товар
         product = Product.objects.create(
             company=company,
             name=name,
@@ -272,12 +301,13 @@ class ProductCreateManualAPIView(generics.CreateAPIView):
             brand=brand,
             category=category,
             price=price,
-            purchase_price=purchase_price,  # ✅ новая закупочная цена
+            purchase_price=purchase_price,
             quantity=quantity,
-            client=client
+            client=client,
+            status=status_value,   # ← теперь статус точно сохранится
         )
 
-        # Если штрих-код есть — синхронизируем в глобальную базу
+        # синхронизация в глобальную базу (если есть штрих-код)
         if barcode:
             GlobalProduct.objects.get_or_create(
                 barcode=barcode,
@@ -285,7 +315,6 @@ class ProductCreateManualAPIView(generics.CreateAPIView):
             )
 
         return Response(self.get_serializer(product).data, status=status.HTTP_201_CREATED)
-
 
 
 
