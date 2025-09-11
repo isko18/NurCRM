@@ -12,7 +12,7 @@ from rest_framework.views import APIView
 from rest_framework.exceptions import NotFound
 from django.shortcuts import get_object_or_404
 from rest_framework import serializers
-from .filters import TransactionRecordFilter
+from .filters import TransactionRecordFilter, DebtFilter, DebtPaymentFilter
 from django_filters.rest_framework import DjangoFilterBackend
 from rest_framework.exceptions import PermissionDenied
 
@@ -23,7 +23,7 @@ from apps.main.models import (
     Order, Product, Review, Notification, Event,
     ProductBrand, ProductCategory, Warehouse, WarehouseEvent, Client,
     GlobalProduct, GlobalBrand, GlobalCategory, ClientDeal, Bid, SocialApplications, TransactionRecord,
-    ContractorWork, DealInstallment
+    ContractorWork, DealInstallment, DebtPayment, Debt
 )
 from apps.main.serializers import (
     ContactSerializer, PipelineSerializer, DealSerializer, TaskSerializer,
@@ -31,7 +31,7 @@ from apps.main.serializers import (
     ReviewSerializer, NotificationSerializer, EventSerializer,
     WarehouseSerializer, WarehouseEventSerializer,
     ProductCategorySerializer, ProductBrandSerializer,
-    OrderItemSerializer, ClientSerializer, ClientDealSerializer, BidSerializers, SocialApplicationsSerializers, TransactionRecordSerializer, ContractorWorkSerializer
+    OrderItemSerializer, ClientSerializer, ClientDealSerializer, BidSerializers, SocialApplicationsSerializers, TransactionRecordSerializer, ContractorWorkSerializer, DebtSerializer, DebtPaymentSerializer
 )
 
 
@@ -785,3 +785,76 @@ class ContractorWorkRetrieveUpdateDestroyAPIView(generics.RetrieveUpdateDestroyA
         if dep and dep.company_id != company.id:
             raise serializers.ValidationError({"department": "Отдел принадлежит другой компании."})
         serializer.save(company=company)
+        
+        
+class DebtListCreateAPIView(generics.ListCreateAPIView):
+    """
+    GET  /api/main/debts/?search=...&date_from=YYYY-MM-DD&date_to=YYYY-MM-DD
+    POST /api/main/debts/
+    """
+    permission_classes = [permissions.IsAuthenticated]
+    serializer_class = DebtSerializer
+    filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
+    filterset_class = DebtFilter
+    search_fields = ["name", "phone"]
+    ordering_fields = ["created_at", "updated_at", "amount"]
+    ordering = ["-created_at"]
+
+    def get_queryset(self):
+        return Debt.objects.filter(company_id=self.request.user.company_id)
+
+
+class DebtRetrieveUpdateDestroyAPIView(generics.RetrieveUpdateDestroyAPIView):
+    """
+    GET/PATCH/PUT/DELETE /api/main/debts/<uuid:pk>/
+    """
+    permission_classes = [permissions.IsAuthenticated]
+    serializer_class = DebtSerializer
+
+    def get_queryset(self):
+        return Debt.objects.filter(company_id=self.request.user.company_id)
+
+
+class DebtPayAPIView(APIView):
+    """
+    POST /api/main/debts/<uuid:pk>/pay/
+    Body: { "amount": "235.00", "paid_at": "2025-09-12", "note": "оплата с карты" }
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    @transaction.atomic
+    def post(self, request, pk):
+        company = request.user.company
+        debt = get_object_or_404(Debt, pk=pk, company=company)
+
+        ser = DebtPaymentSerializer(data=request.data, context={"request": request})
+        ser.is_valid(raise_exception=True)
+        # создаём платеж, компания и долг фиксируются тут
+        DebtPayment.objects.create(
+            company=company,
+            debt=debt,
+            amount=ser.validated_data["amount"],
+            paid_at=ser.validated_data.get("paid_at"),
+            note=ser.validated_data.get("note", ""),
+        )
+        # вернём обновлённую карточку долга (для таблицы)
+        return Response(DebtSerializer(debt, context={"request": request}).data, status=status.HTTP_201_CREATED)
+
+
+# (опционально) список платежей по долгу
+class DebtPaymentListAPIView(generics.ListAPIView):
+    """
+    GET /api/main/debts/<uuid:pk>/payments/?date_from=&date_to=
+    """
+    permission_classes = [permissions.IsAuthenticated]
+    serializer_class = DebtPaymentSerializer
+    filter_backends = [DjangoFilterBackend, filters.OrderingFilter]
+    filterset_class = DebtPaymentFilter
+    ordering_fields = ["paid_at", "created_at", "amount"]
+    ordering = ["-paid_at", "-created_at"]
+
+    def get_queryset(self):
+        return DebtPayment.objects.filter(
+            company_id=self.request.user.company_id,
+            debt_id=self.kwargs["pk"]
+        )

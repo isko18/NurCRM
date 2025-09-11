@@ -1,5 +1,5 @@
 from rest_framework import serializers
-from apps.main.models import Contact, Pipeline, Deal, Task, Integration, Analytics, Order, Product, Review, Notification, Event, Warehouse, WarehouseEvent, ProductCategory, ProductBrand, OrderItem, Client, GlobalProduct, CartItem, ClientDeal, Bid, SocialApplications, TransactionRecord, DealInstallment, ContractorWork
+from apps.main.models import Contact, Pipeline, Deal, Task, Integration, Analytics, Order, Product, Review, Notification, Event, Warehouse, WarehouseEvent, ProductCategory, ProductBrand, OrderItem, Client, GlobalProduct, CartItem, ClientDeal, Bid, SocialApplications, TransactionRecord, DealInstallment, ContractorWork, Debt, DebtPayment
 from apps.construction.models import Department
 from apps.users.models import User, Company
 from django.db import transaction
@@ -751,3 +751,42 @@ class ContractorWorkSerializer(serializers.ModelSerializer):
     def create(self, validated_data):
         validated_data["company"] = self.context["request"].user.company
         return super().create(validated_data)
+    
+    
+class DebtSerializer(serializers.ModelSerializer):
+    company = serializers.ReadOnlyField(source="company.id")
+    paid_total = serializers.DecimalField(max_digits=12, decimal_places=2, read_only=True)
+    balance = serializers.DecimalField(max_digits=12, decimal_places=2, read_only=True)
+
+    class Meta:
+        model = Debt
+        fields = [
+            "id", "company", "name", "phone", "amount",
+            "paid_total", "balance",
+            "created_at", "updated_at",
+        ]
+        read_only_fields = ["id", "company", "paid_total", "balance", "created_at", "updated_at"]
+
+    def validate_phone(self, value):
+        value = value.strip()
+        company = self.context["request"].user.company
+        qs = Debt.objects.filter(company=company, phone=value)
+        if self.instance:
+            qs = qs.exclude(pk=self.instance.pk)
+        if qs.exists():
+            raise serializers.ValidationError("В вашей компании уже есть долг с таким телефоном.")
+        return value
+
+    def create(self, validated_data):
+        validated_data["company"] = self.context["request"].user.company
+        return super().create(validated_data)
+
+
+class DebtPaymentSerializer(serializers.ModelSerializer):
+    company = serializers.ReadOnlyField(source="company.id")
+    debt = serializers.ReadOnlyField(source="debt.id")
+
+    class Meta:
+        model = DebtPayment
+        fields = ["id", "company", "debt", "amount", "paid_at", "note", "created_at"]
+        read_only_fields = ["id", "company", "debt", "created_at"]

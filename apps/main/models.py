@@ -1013,9 +1013,93 @@ class ContractorWork(models.Model):
             return (self.end_date - self.start_date).days
         return None
 
-class Debts(models.Model):
-    full_name = models.CharField(max_length=255)
-    amount = models.DecimalField("Сумма", max_digits=12, decimal_places=2)
-    
-    
-    
+
+class Debt(models.Model):
+    """Карточка долга одного человека (телефон уникален в компании)."""
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    company = models.ForeignKey(Company, on_delete=models.CASCADE, related_name="debts", verbose_name="Компания")
+    name = models.CharField("Имя", max_length=255)
+    phone = models.CharField("Телефон", max_length=32)
+    amount = models.DecimalField("Сумма долга", max_digits=12, decimal_places=2,
+                                 validators=[MinValueValidator(Decimal("0"))])
+
+    created_at = models.DateTimeField("Создан", auto_now_add=True)
+    updated_at = models.DateTimeField("Обновлён", auto_now=True)
+
+    class Meta:
+        verbose_name = "Долг"
+        verbose_name_plural = "Долги"
+        ordering = ["-created_at"]
+        unique_together = (("company", "phone"),)   # телефон уникален в рамках компании
+        indexes = [
+            models.Index(fields=["company", "phone"]),
+            models.Index(fields=["company", "created_at"]),
+        ]
+
+    def __str__(self):
+        return f"{self.name} — {self.phone} ({self.amount} c)"
+
+    # агрегаты для таблицы
+    @property
+    def paid_total(self) -> Decimal:
+        return self.payments.aggregate(s=models.Sum("amount"))["s"] or Decimal("0")
+
+    @property
+    def balance(self) -> Decimal:
+        """Остаток долга = сумма долга − оплачено."""
+        return (self.amount - self.paid_total).quantize(Decimal("0.01"))
+
+    # удобный хелпер для оплаты (можно дергать из сервисов/вьюх)
+    def add_payment(self, amount: Decimal, paid_at=None, note: str = ""):
+        payment = DebtPayment(debt=self, company=self.company, amount=amount,
+                              paid_at=paid_at or timezone.now().date(), note=note)
+        payment.full_clean()
+        payment.save()
+        return payment
+
+
+class DebtPayment(models.Model):
+    """Оплата долга (частичная/полная)."""
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    company = models.ForeignKey(Company, on_delete=models.CASCADE, related_name="debt_payments", verbose_name="Компания")
+    debt = models.ForeignKey(Debt, on_delete=models.CASCADE, related_name="payments", verbose_name="Долг")
+
+    amount = models.DecimalField("Сумма оплаты", max_digits=12, decimal_places=2,
+                                 validators=[MinValueValidator(Decimal("0.01"))])
+    paid_at = models.DateField("Дата оплаты", default=timezone.localdate)
+    note = models.CharField("Комментарий", max_length=255, blank=True)
+
+    created_at = models.DateTimeField("Создано", auto_now_add=True)
+
+    class Meta:
+        verbose_name = "Оплата долга"
+        verbose_name_plural = "Оплаты долга"
+        ordering = ["-paid_at", "-created_at"]
+        indexes = [
+            models.Index(fields=["company", "paid_at"]),
+            models.Index(fields=["debt", "paid_at"]),
+        ]
+
+    def __str__(self):
+        return f"{self.amount} c от {self.paid_at} ({self.debt.name})"
+
+    # согласованность и запрет переплаты
+    def clean(self):
+        # компания у платежа = компании долга
+        if self.debt and self.company_id and self.debt.company_id != self.company_id:
+            raise ValidationError({"company": "Компания платежа должна совпадать с компанией долга."})
+
+        # запрет переплаты
+        if self.debt_id and self.amount:
+            # если редактируют существующий платеж, исключим его из суммы
+            qs = self.debt.payments.exclude(pk=self.pk) if self.pk else self.debt.payments
+            already = qs.aggregate(s=models.Sum("amount"))["s"] or Decimal("0")
+            rest = (self.debt.amount - already)
+            if self.amount > rest:
+                raise ValidationError({"amount": f"Сумма оплаты превышает остаток долга ({rest} c)."})
+
+    def save(self, *args, **kwargs):
+        if self.debt_id and not self.company_id:
+            self.company_id = self.debt.company_id
+        self.full_clean()
+        super().save(*args, **kwargs)
