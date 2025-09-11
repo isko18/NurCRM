@@ -3,9 +3,10 @@ from django.utils.html import format_html
 
 from .models import (
     Lead, Course, Group, Student, Lesson,
-    Folder, Document,
+    Folder, Document, TeacherRate
 )
 
+admin.site.register(TeacherRate)
 
 class CompanyScopedAdmin(admin.ModelAdmin):
     readonly_fields = ("company",)
