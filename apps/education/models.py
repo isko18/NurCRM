@@ -279,12 +279,14 @@ class TeacherRate(models.Model):
         constraints = [
             models.UniqueConstraint(
                 fields=["company", "teacher", "mode", "period"],
-                name="uniq_company_teacher_mode_period",
+                name="uq_tr_comp_tchr_mode_per",        # <= 24 симв.
             ),
         ]
         indexes = [
-            models.Index(fields=["company", "teacher", "period", "mode"],
-                         name="idx_tr_company_teacher_period_mode"),
+            models.Index(
+                fields=["company", "teacher", "period", "mode"],
+                name="ix_tr_comp_tchr_per_mode",        # <= 24 симв.
+            ),
         ]
 
     def __str__(self):
