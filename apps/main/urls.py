@@ -104,5 +104,13 @@ urlpatterns = [
     
     path("transactions/", TransactionRecordListCreateView.as_view(), name="transaction-list"),
     path("transactions/<uuid:pk>/", TransactionRecordRetrieveUpdateDestroyView.as_view(), name="transaction-detail"),
+    
+    path("contractor-works/", ContractorWorkListCreateAPIView.as_view(), name="contractorwork-list"),
+    path("contractor-works/<uuid:pk>/", ContractorWorkRetrieveUpdateDestroyAPIView.as_view(), name="contractorwork-detail"),
+
+    # nested по отделу (если нужно)
+    path("departments/<uuid:department_id>/contractor-works/", ContractorWorkListCreateAPIView.as_view(), name="department-contractorwork-list"),
+    path("departments/<uuid:department_id>/contractor-works/<uuid:pk>/", ContractorWorkRetrieveUpdateDestroyAPIView.as_view(), name="department-contractorwork-detail"),
 ]
+
 

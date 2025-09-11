@@ -948,3 +948,72 @@ class TransactionRecord(models.Model):
             self.company_id = self.department.company_id
         self.full_clean(exclude=None)
         super().save(*args, **kwargs)
+
+
+class ContractorWork(models.Model):
+    class ContractorType(models.TextChoices):
+        LLC = "llc", "ОсОО / ООО"
+        IP  = "ip",  "ИП"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False, verbose_name="ID")
+    company = models.ForeignKey(Company, on_delete=models.CASCADE, related_name="contractor_works", verbose_name="Компания")
+    department = models.ForeignKey(Department, on_delete=models.PROTECT, related_name="contractor_works", verbose_name="Отдел")
+
+    # основное
+    title = models.CharField("Наименование", max_length=255)
+    contractor_name = models.CharField("Имя подрядчика", max_length=255)
+    contractor_phone = models.CharField("Телефон", max_length=32)
+    contractor_entity_type = models.CharField(
+        "Тип юрлица", max_length=8, choices=ContractorType.choices, null=True, blank=True
+    )
+    contractor_entity_name = models.CharField(
+        "Название его ООО/ИП", max_length=255, null=True, blank=True
+    )
+
+    amount = models.DecimalField(
+        "Сумма договора", max_digits=12, decimal_places=2,
+        validators=[MinValueValidator(Decimal("0"))]
+    )
+
+    # даты
+    start_date = models.DateField("Дата начала", null=True, blank=True)
+    end_date = models.DateField("Дата окончания", null=True, blank=True)
+    planned_completion_date = models.DateField("Плановая дата завершения", null=True, blank=True)
+    work_calendar_date = models.DateField("Дата календаря выполнения работ", null=True, blank=True)
+
+    description = models.TextField("Описание", blank=True)
+
+    created_at = models.DateTimeField("Создано", auto_now_add=True)
+    updated_at = models.DateTimeField("Обновлено", auto_now=True)
+
+    class Meta:
+        verbose_name = "Подрядные работы"
+        verbose_name_plural = "Подрядные работы"
+        ordering = ["-created_at"]
+        indexes = [
+            models.Index(fields=["company", "department"]),
+            models.Index(fields=["company", "start_date"]),
+            models.Index(fields=["company", "end_date"]),
+        ]
+
+    def __str__(self):
+        return f"{self.title} — {self.contractor_name}"
+
+    # простые проверки согласованности
+    def clean(self):
+        if self.start_date and self.end_date and self.end_date < self.start_date:
+            raise ValidationError({"end_date": "Дата окончания не может быть раньше даты начала."})
+        if self.planned_completion_date and self.start_date and self.planned_completion_date < self.start_date:
+            raise ValidationError({"planned_completion_date": "Плановая дата завершения не может быть раньше начала."})
+
+    @property
+    def duration_days(self):
+        """Длительность по факту (в днях), если заданы обе даты."""
+        if self.start_date and self.end_date:
+            return (self.end_date - self.start_date).days
+        return None
+
+class Debts(models.Model):
+    full_name = models.CharField(max_length=255)
+    amount = models.DecimalField("Сумма", max_digits=12, decimal_places=2)
+    
