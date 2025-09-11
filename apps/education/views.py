@@ -1,6 +1,7 @@
 from rest_framework import generics, permissions
+from rest_framework import filters as drf_filters  # DRF Search/Ordering
 from rest_framework.parsers import MultiPartParser, FormParser
-from django_filters import rest_framework as filters
+from django_filters import rest_framework as dj_filters
 from django_filters.rest_framework import DjangoFilterBackend
 from rest_framework.response import Response
 from rest_framework import status
@@ -10,21 +11,22 @@ from rest_framework.views import APIView
 
 from .models import (
     Lead, Course, Group, Student, Lesson,
-    Folder, Document, Attendance
+    Folder, Document, Attendance, TeacherRate
 )
 from .serializers import (
     LeadSerializer, CourseSerializer, GroupSerializer,
-    StudentSerializer, LessonSerializer, FolderSerializer, DocumentSerializer, LessonAttendanceItemSerializer, StudentAttendanceSerializer
+    StudentSerializer, LessonSerializer, FolderSerializer, DocumentSerializer,
+    LessonAttendanceItemSerializer, StudentAttendanceSerializer, TeacherRateSerializer
 )
 
 
 # ----- Кастомный фильтр для Document (не автофильтруем FileField) -----
-class DocumentFilter(filters.FilterSet):
-    name = filters.CharFilter(lookup_expr='icontains')
-    folder = filters.UUIDFilter(field_name='folder__id')  # фильтр по UUID папки
-    file_name = filters.CharFilter(field_name='file', lookup_expr='icontains')
-    created_at = filters.DateTimeFromToRangeFilter()
-    updated_at = filters.DateTimeFromToRangeFilter()
+class DocumentFilter(dj_filters.FilterSet):
+    name = dj_filters.CharFilter(lookup_expr='icontains')
+    folder = dj_filters.UUIDFilter(field_name='folder__id')  # фильтр по UUID папки
+    file_name = dj_filters.CharFilter(field_name='file', lookup_expr='icontains')
+    created_at = dj_filters.IsoDateTimeFromToRangeFilter()
+    updated_at = dj_filters.IsoDateTimeFromToRangeFilter()
 
     class Meta:
         model = Document
@@ -63,8 +65,11 @@ class LeadListCreateView(CompanyQuerysetMixin, generics.ListCreateAPIView):
     queryset = Lead.objects.all()
     serializer_class = LeadSerializer
     permission_classes = [permissions.IsAuthenticated]
-    filter_backends = [DjangoFilterBackend]
-    filterset_fields = ['id', 'company', 'name', 'phone', 'source', 'note', 'created_at']
+    filter_backends = [DjangoFilterBackend, drf_filters.SearchFilter, drf_filters.OrderingFilter]
+    filterset_fields = ['name', 'phone', 'source', 'created_at']
+    search_fields = ['name', 'phone', 'note']
+    ordering_fields = ['created_at', 'name', 'source']
+    ordering = ['-created_at']
 
 
 class LeadRetrieveUpdateDestroyView(CompanyQuerysetMixin, generics.RetrieveUpdateDestroyAPIView):
@@ -78,8 +83,11 @@ class CourseListCreateView(CompanyQuerysetMixin, generics.ListCreateAPIView):
     queryset = Course.objects.all()
     serializer_class = CourseSerializer
     permission_classes = [permissions.IsAuthenticated]
-    filter_backends = [DjangoFilterBackend]
-    filterset_fields = [f.name for f in Course._meta.get_fields() if not f.is_relation or f.many_to_one]
+    filter_backends = [DjangoFilterBackend, drf_filters.SearchFilter, drf_filters.OrderingFilter]
+    filterset_fields = ['title', 'price_per_month']
+    search_fields = ['title']
+    ordering_fields = ['title', 'price_per_month']
+    ordering = ['title']
 
 
 class CourseRetrieveUpdateDestroyView(CompanyQuerysetMixin, generics.RetrieveUpdateDestroyAPIView):
@@ -93,8 +101,11 @@ class GroupListCreateView(CompanyQuerysetMixin, generics.ListCreateAPIView):
     queryset = Group.objects.select_related('course').all()
     serializer_class = GroupSerializer
     permission_classes = [permissions.IsAuthenticated]
-    filter_backends = [DjangoFilterBackend]
-    filterset_fields = [f.name for f in Group._meta.get_fields() if not f.is_relation or f.many_to_one]
+    filter_backends = [DjangoFilterBackend, drf_filters.SearchFilter, drf_filters.OrderingFilter]
+    filterset_fields = ['course', 'name']
+    search_fields = ['name', 'course__title']
+    ordering_fields = ['name', 'course']
+    ordering = ['course', 'name']
 
 
 class GroupRetrieveUpdateDestroyView(CompanyQuerysetMixin, generics.RetrieveUpdateDestroyAPIView):
@@ -108,8 +119,11 @@ class StudentListCreateView(CompanyQuerysetMixin, generics.ListCreateAPIView):
     queryset = Student.objects.select_related('group').all()
     serializer_class = StudentSerializer
     permission_classes = [permissions.IsAuthenticated]
-    filter_backends = [DjangoFilterBackend]
-    filterset_fields = [f.name for f in Student._meta.get_fields() if not f.is_relation or f.many_to_one]
+    filter_backends = [DjangoFilterBackend, drf_filters.SearchFilter, drf_filters.OrderingFilter]
+    filterset_fields = ['status', 'group', 'active', 'created_at']
+    search_fields = ['name', 'phone', 'note', 'group__name']
+    ordering_fields = ['created_at', 'name', 'status']
+    ordering = ['-created_at']
 
 
 class StudentRetrieveUpdateDestroyView(CompanyQuerysetMixin, generics.RetrieveUpdateDestroyAPIView):
@@ -120,15 +134,18 @@ class StudentRetrieveUpdateDestroyView(CompanyQuerysetMixin, generics.RetrieveUp
 
 # ===== Lessons =====
 class LessonListCreateView(CompanyQuerysetMixin, generics.ListCreateAPIView):
-    queryset = Lesson.objects.select_related('group', 'teacher').all()
+    queryset = Lesson.objects.select_related('group', 'teacher', 'course').all()
     serializer_class = LessonSerializer
     permission_classes = [permissions.IsAuthenticated]
-    filter_backends = [DjangoFilterBackend]
-    filterset_fields = [f.name for f in Lesson._meta.get_fields() if not f.is_relation or f.many_to_one]
+    filter_backends = [DjangoFilterBackend, drf_filters.SearchFilter, drf_filters.OrderingFilter]
+    filterset_fields = ['group', 'course', 'teacher', 'date', 'time', 'classroom']
+    search_fields = ['group__name', 'teacher__first_name', 'teacher__last_name', 'classroom']
+    ordering_fields = ['date', 'time', 'created_at']
+    ordering = ['-date', '-time']
 
 
 class LessonRetrieveUpdateDestroyView(CompanyQuerysetMixin, generics.RetrieveUpdateDestroyAPIView):
-    queryset = Lesson.objects.select_related('group', 'teacher').all()
+    queryset = Lesson.objects.select_related('group', 'teacher', 'course').all()
     serializer_class = LessonSerializer
     permission_classes = [permissions.IsAuthenticated]
 
@@ -138,8 +155,10 @@ class FolderListCreateView(CompanyQuerysetMixin, generics.ListCreateAPIView):
     queryset = Folder.objects.select_related('parent').all()
     serializer_class = FolderSerializer
     permission_classes = [permissions.IsAuthenticated]
-    filter_backends = [DjangoFilterBackend]
-    filterset_fields = [f.name for f in Folder._meta.get_fields() if not f.is_relation or f.many_to_one]
+    filter_backends = [DjangoFilterBackend, drf_filters.SearchFilter, drf_filters.OrderingFilter]
+    filterset_fields = ['parent', 'name']
+    search_fields = ['name', 'parent__name']
+    ordering_fields = ['name', 'created_at']
     ordering = ['name']
 
 
@@ -155,8 +174,11 @@ class DocumentListCreateView(CompanyQuerysetMixin, generics.ListCreateAPIView):
     serializer_class = DocumentSerializer
     permission_classes = [permissions.IsAuthenticated]
     parser_classes = [MultiPartParser, FormParser]
-    filter_backends = [DjangoFilterBackend]
+    filter_backends = [DjangoFilterBackend, drf_filters.SearchFilter, drf_filters.OrderingFilter]
     filterset_class = DocumentFilter
+    search_fields = ['name', 'folder__name', 'file']  # по имени файла тоже найдёт
+    ordering_fields = ['created_at', 'updated_at', 'name']
+    ordering = ['-created_at']
 
 
 class DocumentRetrieveUpdateDestroyView(CompanyQuerysetMixin, generics.RetrieveUpdateDestroyAPIView):
@@ -166,6 +188,7 @@ class DocumentRetrieveUpdateDestroyView(CompanyQuerysetMixin, generics.RetrieveU
     parser_classes = [MultiPartParser, FormParser]
 
 
+# ===== Lesson attendance snapshot =====
 class LessonAttendanceView(CompanyQuerysetMixin, APIView):
     permission_classes = [permissions.IsAuthenticated]
 
@@ -271,6 +294,7 @@ class LessonAttendanceView(CompanyQuerysetMixin, APIView):
         return self.get(request, lesson_id)
 
 
+# ===== Student attendance history =====
 class StudentAttendanceListView(CompanyQuerysetMixin, generics.ListAPIView):
     permission_classes = [permissions.IsAuthenticated]
     serializer_class = StudentAttendanceSerializer
@@ -287,3 +311,31 @@ class StudentAttendanceListView(CompanyQuerysetMixin, generics.ListAPIView):
             .select_related("lesson", "lesson__group")
             .order_by("-lesson__date", "-lesson__time")
         )
+
+
+# ===== Teacher rates =====
+class TeacherRateListCreateAPIView(CompanyQuerysetMixin, generics.ListCreateAPIView):
+    """
+    GET  /api/main/teacher-rates/?teacher=<id>&period=YYYY-MM&mode=hour|lesson|month
+    POST /api/main/teacher-rates/
+    """
+    permission_classes = [permissions.IsAuthenticated]
+    serializer_class = TeacherRateSerializer
+    filter_backends = [DjangoFilterBackend, drf_filters.OrderingFilter]
+    filterset_fields = ["teacher", "period", "mode"]
+    ordering_fields = ["updated_at", "period", "rate"]
+    ordering = ["-updated_at"]
+
+    def get_queryset(self):
+        return TeacherRate.objects.filter(company_id=self.request.user.company_id)
+
+
+class TeacherRateRetrieveUpdateDestroyAPIView(CompanyQuerysetMixin, generics.RetrieveUpdateDestroyAPIView):
+    """
+    GET/PATCH/PUT/DELETE /api/main/teacher-rates/<uuid:pk>/
+    """
+    permission_classes = [permissions.IsAuthenticated]
+    serializer_class = TeacherRateSerializer
+
+    def get_queryset(self):
+        return TeacherRate.objects.filter(company_id=self.request.user.company_id)
