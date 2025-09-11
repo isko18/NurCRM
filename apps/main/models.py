@@ -282,22 +282,27 @@ class ProductBrand(MPTTModel):
 
 
 class Product(models.Model):
+    class Status(models.TextChoices):
+        PENDING  = "pending",  "Ожидание"
+        ACCEPTED = "accepted", "Принят"
+        REJECTED = "rejected", "Отказ"
+
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    
+
     company = models.ForeignKey(
         Company,
         on_delete=models.CASCADE,
         related_name='products',
         verbose_name='Компания'
     )
-    client = models.ForeignKey(  
+    client = models.ForeignKey(
         "Client",
-        on_delete=models.SET_NULL, 
-        null=True,
-        blank=True,
+        on_delete=models.SET_NULL,
+        null=True, blank=True,
         related_name="products",
         verbose_name="Клиент"
     )
+
     name = models.CharField(max_length=255)
     barcode = models.CharField(max_length=64, null=True, blank=True)
     brand = models.ForeignKey(ProductBrand, on_delete=models.SET_NULL, null=True, blank=True)
@@ -306,17 +311,16 @@ class Product(models.Model):
     quantity = models.PositiveIntegerField(default=0)
 
     # 💰 цены
-    purchase_price = models.DecimalField(   # ✅ новая колонка
-        max_digits=10, 
-        decimal_places=2, 
-        default=0,
-        verbose_name="Закупочная цена"
-    )
-    price = models.DecimalField(            
-        max_digits=10, 
-        decimal_places=2, 
-        default=0,
-        verbose_name="Розничная цена"
+    purchase_price = models.DecimalField(max_digits=10, decimal_places=2, default=0, verbose_name="Закупочная цена")
+    price = models.DecimalField(max_digits=10, decimal_places=2, default=0, verbose_name="Розничная цена")
+
+    # 🏷️ статус
+    status = models.CharField(
+        "Статус",
+        max_length=16,
+        choices=Status.choices,
+        db_index=True, 
+        blank=True, null=True
     )
 
     created_at = models.DateTimeField(auto_now_add=True)
@@ -326,10 +330,12 @@ class Product(models.Model):
         unique_together = ('company', 'barcode')
         verbose_name = 'Товар'
         verbose_name_plural = 'Товары'
+        indexes = [
+            models.Index(fields=['company', 'status']),   # удобно для фильтров по статусу
+        ]
 
     def __str__(self):
         return self.name
-
     
 class Cart(models.Model):
     class Status(models.TextChoices):
