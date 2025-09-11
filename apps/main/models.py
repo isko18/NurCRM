@@ -692,7 +692,7 @@ class Client(models.Model):
     )
     type = models.CharField(
         "Тип клиента", max_length=16, choices=StatusClient.choices, default=StatusClient.CLIENT, null=True, blank=True)
-    enterprise = models.CharField("Предприятие ", max_length=255)
+    enterprise = models.CharField("Предприятие O", max_length=255, blank=True, null=True)
     full_name = models.CharField("ФИО", max_length=255)
     phone = models.CharField("Телефон", max_length=32)
     email = models.EmailField("Почта", blank=True)          # по желанию
