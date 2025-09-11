@@ -718,7 +718,7 @@ class ClientDeal(models.Model):
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     company = models.ForeignKey(
-        "Company",
+        Company,
         on_delete=models.CASCADE,
         related_name="client_deals",
         verbose_name="Компания",
