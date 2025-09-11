@@ -6,10 +6,12 @@ from mptt.models import MPTTModel, TreeForeignKey
 from django.db import models
 from decimal import Decimal
 from django.utils import timezone
-from mptt.models import MPTTModel, TreeForeignKey
 from django.core.validators import MinValueValidator
 from apps.construction.models import Department
 from django.core.exceptions import ValidationError
+from dateutil.relativedelta import relativedelta
+from django.db.models import Sum
+from decimal import Decimal, ROUND_HALF_UP
 
 class Contact(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
@@ -676,6 +678,7 @@ class Client(models.Model):
         CLIENT = "client", "клиент"
         SUPPLIERS = "suppliers", "Поставщики"
         IMPLEMENTERS = "implementers", "Реализаторы"
+        CONTRACTOR = "contractor", "Подрядчик"
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False, verbose_name="ID клиента")
     company = models.ForeignKey(
@@ -706,18 +709,18 @@ class Client(models.Model):
     def __str__(self):
         return f"{self.full_name} ({self.phone})"
     
-    
 class ClientDeal(models.Model):
     class Kind(models.TextChoices):
+        AMOUNT = "amount", "Сумма договора"
         SALE = "sale", "Продажа"
         DEBT = "debt", "Долг"
         PREPAYMENT = "prepayment", "Предоплата"
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     company = models.ForeignKey(
-        Company,
+        "Company",
         on_delete=models.CASCADE,
-        related_name="client_deals",   # <= было "deals"
+        related_name="client_deals",
         verbose_name="Компания",
     )
     client = models.ForeignKey(
@@ -728,8 +731,15 @@ class ClientDeal(models.Model):
     )
     title = models.CharField("Название сделки", max_length=255)
     kind = models.CharField("Тип сделки", max_length=16, choices=Kind.choices, default=Kind.SALE)
-    count_debt = models.CharField(max_length=255, verbose_name="На сколько делим", blank=True, null=True)
-    amount = models.DecimalField("Сумма", max_digits=12, decimal_places=2, default=0)
+
+    # --- ключевые суммы для карточек ---
+    amount = models.DecimalField("Сумма договора", max_digits=12, decimal_places=2, default=0)  # как на карточке слева
+    prepayment = models.DecimalField("Предоплата", max_digits=12, decimal_places=2, default=0)  # карточка по центру
+
+    # --- параметры долга/рассрочки ---
+    debt_months = models.PositiveSmallIntegerField("Срок (мес.)", blank=True, null=True)
+    first_due_date = models.DateField("Первая дата оплаты", blank=True, null=True)
+
     note = models.TextField("Комментарий", blank=True)
     created_at = models.DateTimeField("Создано", auto_now_add=True)
     updated_at = models.DateTimeField("Обновлено", auto_now=True)
@@ -742,7 +752,90 @@ class ClientDeal(models.Model):
             models.Index(fields=["company", "client"]),
             models.Index(fields=["company", "kind"]),
         ]
-        
+
+    # ===== вычисляемые поля для UI =====
+    @property
+    def debt_amount(self) -> Decimal:
+        """Размер долга = сумма договора - предоплата."""
+        return (self.amount or Decimal("0")) - (self.prepayment or Decimal("0"))
+
+    @property
+    def paid_total(self) -> Decimal:
+        return self.installments.filter(paid_on__isnull=False).aggregate(
+            s=Sum("amount")
+        )["s"] or Decimal("0")
+
+    @property
+    def remaining_debt(self) -> Decimal:
+        """Остаток долга для карточки справа."""
+        return (self.debt_amount - self.paid_total).quantize(Decimal("0.01"))
+
+    @property
+    def monthly_payment(self) -> Decimal:
+        """Ежемесячный платёж = долг / месяцев (для модалки)."""
+        if not self.debt_months or self.debt_months == 0:
+            return Decimal("0.00")
+        return (self.debt_amount / Decimal(self.debt_months)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+    # утилита: пересобрать график
+    def rebuild_installments(self):
+        if self.kind != ClientDeal.Kind.DEBT or not self.debt_months or self.debt_months == 0:
+            self.installments.all().delete()
+            return
+
+        total = self.debt_amount
+        if total <= 0:
+            self.installments.all().delete()
+            return
+
+        # стартовая дата: через месяц от создания, если не задано
+        start = self.first_due_date or (timezone.now().date() + relativedelta(months=+1))
+
+        self.installments.all().delete()
+
+        base = (total / Decimal(self.debt_months)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        paid = Decimal("0.00")
+        items = []
+
+        for i in range(1, self.debt_months + 1):
+            # чтобы сойтись до копейки — последний платёж = остаток
+            amount_i = (total - paid) if i == self.debt_months else base
+            paid += amount_i
+            due = start + relativedelta(months=+(i - 1))
+            items.append(DealInstallment(
+                deal=self,
+                number=i,
+                due_date=due,
+                amount=amount_i,
+                balance_after=(total - paid).quantize(Decimal("0.01")),
+            ))
+
+        DealInstallment.objects.bulk_create(items)
+
+    def save(self, *args, **kwargs):
+        super().save(*args, **kwargs)
+        # после каждого сохранения держим график в актуальном виде
+        self.rebuild_installments()
+
+
+class DealInstallment(models.Model):
+    deal = models.ForeignKey(
+        ClientDeal,
+        on_delete=models.CASCADE,
+        related_name="installments",
+        verbose_name="Сделка",
+    )
+    number = models.PositiveSmallIntegerField("№")
+    due_date = models.DateField("Срок оплаты")
+    amount = models.DecimalField("Сумма", max_digits=12, decimal_places=2)
+    balance_after = models.DecimalField("Остаток", max_digits=12, decimal_places=2)
+    paid_on = models.DateField("Оплачен", blank=True, null=True)
+
+    class Meta:
+        verbose_name = "Платёж по графику"
+        verbose_name_plural = "График платежей"
+        ordering = ["deal", "number"]
+        unique_together = [("deal", "number")]
         
 class Bid(models.Model):
     class Status(models.TextChoices):
