@@ -1,8 +1,9 @@
 from rest_framework import serializers
-from apps.main.models import Contact, Pipeline, Deal, Task, Integration, Analytics, Order, Product, Review, Notification, Event, Warehouse, WarehouseEvent, ProductCategory, ProductBrand, OrderItem, Client, GlobalProduct, CartItem, ClientDeal, Bid, SocialApplications, TransactionRecord
+from apps.main.models import Contact, Pipeline, Deal, Task, Integration, Analytics, Order, Product, Review, Notification, Event, Warehouse, WarehouseEvent, ProductCategory, ProductBrand, OrderItem, Client, GlobalProduct, CartItem, ClientDeal, Bid, SocialApplications, TransactionRecord, DealInstallment
 from apps.construction.models import Department
 from apps.users.models import User, Company
 from django.db import transaction
+from decimal import Decimal
 
 class SocialApplicationsSerializers(serializers.ModelSerializer):
     class Meta:
@@ -478,37 +479,85 @@ class ClientSerializer(serializers.ModelSerializer):
         return super().create(validated_data)
     
     
+class DealInstallmentSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = DealInstallment
+        fields = ("number", "due_date", "amount", "balance_after", "paid_on")
+        read_only_fields = ("number", "due_date", "amount", "balance_after")
+
+
 class ClientDealSerializer(serializers.ModelSerializer):
-    company = serializers.ReadOnlyField(source='company.id')
-    # КЛЮЧЕВОЕ: client не обязателен — при nested-роуте его задаёт view
-    client = serializers.PrimaryKeyRelatedField(
-        queryset=Client.objects.all(),
-        required=False
-    )
-    client_full_name = serializers.CharField(source='client.full_name', read_only=True)
+    company = serializers.ReadOnlyField(source="company.id")
+    # client может отсутствовать — его подставит view через serializer.save(client=...)
+    client = serializers.PrimaryKeyRelatedField(queryset=Client.objects.all(), required=False)
+    client_full_name = serializers.CharField(source="client.full_name", read_only=True)
+
+    # вычисляемые поля для карточек/модалки
+    debt_amount = serializers.DecimalField(source="debt_amount", max_digits=12, decimal_places=2, read_only=True)
+    remaining_debt = serializers.DecimalField(source="remaining_debt", max_digits=12, decimal_places=2, read_only=True)
+    monthly_payment = serializers.DecimalField(source="monthly_payment", max_digits=12, decimal_places=2, read_only=True)
+
+    # график платежей
+    installments = DealInstallmentSerializer(many=True, read_only=True)
 
     class Meta:
         model = ClientDeal
         fields = [
-            'id', 'company', 'client', 'client_full_name',
-            'title', 'kind', 'count_debt', 'amount', 'note',
-            'created_at', 'updated_at'
+            "id", "company", "client", "client_full_name",
+            "title", "kind",
+            "amount", "prepayment",
+            "debt_months", "first_due_date",
+            "debt_amount", "monthly_payment", "remaining_debt",
+            "installments",
+            "note", "created_at", "updated_at",
         ]
-        read_only_fields = ['id', 'company', 'created_at', 'updated_at', 'client_full_name']
+        read_only_fields = [
+            "id", "company", "created_at", "updated_at", "client_full_name",
+            "debt_amount", "monthly_payment", "remaining_debt", "installments",
+        ]
 
     def validate(self, attrs):
-        # Если client придёт в теле запроса (плоский роут) — проверим компанию.
-        client = attrs.get('client')
-        if client:
-            company = self.context['request'].user.company
-            if client.company_id != company.id:
-                raise serializers.ValidationError({'client': 'Клиент принадлежит другой компании.'})
+        request = self.context["request"]
+        company = request.user.company
+
+        # проверяем клиента в рамках компании
+        client = attrs.get("client") or (self.instance.client if self.instance else None)
+        if client and client.company_id != company.id:
+            raise serializers.ValidationError({"client": "Клиент принадлежит другой компании."})
+
+        amount = attrs.get("amount", getattr(self.instance, "amount", None))
+        prepayment = attrs.get("prepayment", getattr(self.instance, "prepayment", None))
+        kind = attrs.get("kind", getattr(self.instance, "kind", None))
+        debt_months = attrs.get("debt_months", getattr(self.instance, "debt_months", None))
+
+        errors = {}
+
+        if amount is not None and amount < 0:
+            errors["amount"] = "Сумма не может быть отрицательной."
+        if prepayment is not None and prepayment < 0:
+            errors["prepayment"] = "Предоплата не может быть отрицательной."
+        if amount is not None and prepayment is not None and prepayment > amount:
+            errors["prepayment"] = "Предоплата не может превышать сумму договора."
+
+        if kind == ClientDeal.Kind.DEBT:
+            debt_amt = (amount or Decimal("0")) - (prepayment or Decimal("0"))
+            if debt_amt <= 0:
+                errors["prepayment"] = 'Для типа "Долг" сумма договора должна быть больше предоплаты.'
+            if not debt_months or debt_months <= 0:
+                errors["debt_months"] = "Укажите срок (в месяцах) для рассрочки."
+        else:
+            # если это не долг — не держим «хвосты»
+            if "debt_months" in attrs and not attrs["debt_months"]:
+                attrs["debt_months"] = None
+            if "first_due_date" in attrs and not attrs["first_due_date"]:
+                attrs["first_due_date"] = None
+
+        if errors:
+            raise serializers.ValidationError(errors)
         return attrs
 
     def create(self, validated_data):
-        # company всегда от пользователя; client может быть не в validated_data —
-        # его добавит view через serializer.save(client=...)
-        validated_data['company'] = self.context['request'].user.company
+        validated_data["company"] = self.context["request"].user.company
         return super().create(validated_data)
     
 class TransactionRecordSerializer(serializers.ModelSerializer):

@@ -504,10 +504,8 @@ class ClientRetrieveUpdateDestroyAPIView(generics.RetrieveUpdateDestroyAPIView):
         return Client.objects.filter(company=self.request.user.company)
 
 
-# ---------- Сделки клиента ----------
 class ClientDealListCreateAPIView(generics.ListCreateAPIView):
     """
-    Варианты:
       GET  /api/main/deals/                      — все сделки компании
       POST /api/main/deals/                      — создать сделку (client в теле)
       GET  /api/main/clients/<client_id>/deals/  — сделки конкретного клиента
@@ -518,30 +516,36 @@ class ClientDealListCreateAPIView(generics.ListCreateAPIView):
     filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
     filterset_fields = ["kind", "client"]
     search_fields = ["title", "note"]
-    ordering_fields = ["created_at", "amount", "kind"]
+    ordering_fields = ["created_at", "updated_at", "amount", "kind"]
     ordering = ["-created_at"]
 
     def get_queryset(self):
-        qs = ClientDeal.objects.select_related("client").filter(company=self.request.user.company)
+        qs = (
+            ClientDeal.objects
+            .select_related("client")
+            .prefetch_related("installments")        # чтобы не ловить N+1 при выдаче графика
+            .filter(company=self.request.user.company)
+        )
         client_id = self.kwargs.get("client_id")
         if client_id:
             qs = qs.filter(client_id=client_id)
         return qs
 
+    @transaction.atomic
     def perform_create(self, serializer):
         company = self.request.user.company
         client_id = self.kwargs.get("client_id")
 
         if client_id:
-            # Вложенный маршрут: клиент берётся из URL, проверяем принадлежность компании
+            # nested-роут: клиент из URL, проверяем компанию
             client = get_object_or_404(Client, id=client_id, company=company)
             serializer.save(company=company, client=client)
         else:
-            # Обычный маршрут: client приходит в теле запроса — дополнительно проверим компанию
+            # плоский роут: client должен быть в теле и принадлежать компании
             client = serializer.validated_data.get("client")
             if not client or client.company_id != company.id:
                 raise serializers.ValidationError({"client": "Клиент не найден в вашей компании."})
-            serializer.save(company=company)
+            serializer.save(company=company)          # company фиксируем на пользователя
 
 
 class ClientDealRetrieveUpdateDestroyAPIView(generics.RetrieveUpdateDestroyAPIView):
@@ -555,19 +559,24 @@ class ClientDealRetrieveUpdateDestroyAPIView(generics.RetrieveUpdateDestroyAPIVi
     serializer_class = ClientDealSerializer
 
     def get_queryset(self):
-        # Ограничиваем сделки компанией текущего пользователя
-        return ClientDeal.objects.select_related("client").filter(company=self.request.user.company)
+        return (
+            ClientDeal.objects
+            .select_related("client")
+            .prefetch_related("installments")
+            .filter(company=self.request.user.company)
+        )
 
+    @transaction.atomic
     def perform_update(self, serializer):
         """
-        Запрещаем «уход» сделки в другую компанию через смену client.
-        Разрешаем смену клиента только внутри своей компании.
+        Не даём увести сделку в другую компанию через смену client.
+        График пересоберётся в model.save().
         """
         company = self.request.user.company
         new_client = serializer.validated_data.get("client")
         if new_client and new_client.company_id != company.id:
             raise serializers.ValidationError({"client": "Клиент принадлежит другой компании."})
-        serializer.save()
+        serializer.save(company=company)  # company остаётся той же
         
         
 class BidListCreateAPIView(generics.ListCreateAPIView):
