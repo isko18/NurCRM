@@ -118,6 +118,13 @@ urlpatterns = [
     path("debts/<uuid:pk>/", DebtRetrieveUpdateDestroyAPIView.as_view(), name="debt-detail"),
     path("debts/<uuid:pk>/pay/", DebtPayAPIView.as_view(), name="debt-pay"),
     path("debts/<uuid:pk>/payments/", DebtPaymentListAPIView.as_view(), name="debt-payments"),
+    
+    path("object-items/", ObjectItemListCreateAPIView.as_view()),
+    path("object-items/<uuid:pk>/", ObjectItemRetrieveUpdateDestroyAPIView.as_view()),
+
+    path("object-sales/", ObjectSaleListCreateAPIView.as_view()),
+    path("object-sales/<uuid:pk>/", ObjectSaleRetrieveUpdateDestroyAPIView.as_view()),
+    path("object-sales/<uuid:sale_id>/items/", ObjectSaleAddItemAPIView.as_view()),
 ]
 
 

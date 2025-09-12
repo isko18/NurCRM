@@ -23,7 +23,7 @@ from apps.main.models import (
     Order, Product, Review, Notification, Event,
     ProductBrand, ProductCategory, Warehouse, WarehouseEvent, Client,
     GlobalProduct, GlobalBrand, GlobalCategory, ClientDeal, Bid, SocialApplications, TransactionRecord,
-    ContractorWork, DealInstallment, DebtPayment, Debt
+    ContractorWork, DealInstallment, DebtPayment, Debt, ObjectSaleItem, ObjectSale, ObjectItem
 )
 from apps.main.serializers import (
     ContactSerializer, PipelineSerializer, DealSerializer, TaskSerializer,
@@ -31,7 +31,7 @@ from apps.main.serializers import (
     ReviewSerializer, NotificationSerializer, EventSerializer,
     WarehouseSerializer, WarehouseEventSerializer,
     ProductCategorySerializer, ProductBrandSerializer,
-    OrderItemSerializer, ClientSerializer, ClientDealSerializer, BidSerializers, SocialApplicationsSerializers, TransactionRecordSerializer, ContractorWorkSerializer, DebtSerializer, DebtPaymentSerializer
+    OrderItemSerializer, ClientSerializer, ClientDealSerializer, BidSerializers, SocialApplicationsSerializers, TransactionRecordSerializer, ContractorWorkSerializer, DebtSerializer, DebtPaymentSerializer, ObjectItemSerializer, ObjectSaleSerializer, ObjectSaleItemSerializer, O
 )
 
 
@@ -887,3 +887,72 @@ class DebtPaymentListAPIView(generics.ListAPIView):
             company_id=self.request.user.company_id,
             debt_id=self.kwargs["pk"]
         )
+        
+class ObjectItemListCreateAPIView(CompanyRestrictedMixin, generics.ListCreateAPIView):
+    serializer_class = ObjectItemSerializer
+    queryset = ObjectItem.objects.all()
+    filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
+    search_fields = ["name", "description"]
+    ordering_fields = ["date", "created_at", "updated_at", "price", "quantity", "name"]
+    ordering = ["-date", "-created_at"]
+
+class ObjectItemRetrieveUpdateDestroyAPIView(CompanyRestrictedMixin, generics.RetrieveUpdateDestroyAPIView):
+    serializer_class = ObjectItemSerializer
+    queryset = ObjectItem.objects.all()
+    
+class ObjectSaleListCreateAPIView(CompanyRestrictedMixin, generics.ListCreateAPIView):
+    serializer_class = ObjectSaleSerializer
+    filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
+    search_fields = ["note", "client__full_name", "client__phone"]
+    ordering_fields = ["sold_at", "created_at", "subtotal", "status"]
+    ordering = ["-sold_at", "-created_at"]
+
+    def get_queryset(self):
+        return (
+            ObjectSale.objects
+            .select_related("client")
+            .prefetch_related("items")
+            .filter(company_id=self.request.user.company_id)
+        )
+
+    def perform_create(self, serializer):
+        client = serializer.validated_data.get("client")
+        if client.company_id != self.request.user.company_id:
+            raise serializers.ValidationError({"client": "Клиент принадлежит другой компании."})
+        serializer.save(company=self.request.user.company)
+
+class ObjectSaleRetrieveUpdateDestroyAPIView(CompanyRestrictedMixin, generics.RetrieveUpdateDestroyAPIView):
+    serializer_class = ObjectSaleSerializer
+    def get_queryset(self):
+        return (
+            ObjectSale.objects
+            .select_related("client")
+            .prefetch_related("items")
+            .filter(company_id=self.request.user.company_id)
+        )
+
+
+class ObjectSaleAddItemAPIView(CompanyRestrictedMixin, APIView):
+    """
+    POST /api/main/object-sales/<uuid:sale_id>/items/
+    Body:
+      { "object_item": "<uuid>", "unit_price": "200.00", "quantity": 2 }
+    """
+    def post(self, request, sale_id):
+        company = request.user.company
+        sale = get_object_or_404(ObjectSale, id=sale_id, company=company)
+
+        ser = ObjectSaleItemSerializer(data=request.data, context={"request": request})
+        ser.is_valid(raise_exception=True)
+
+        obj = get_object_or_404(ObjectItem, id=ser.validated_data["object_item"].id, company=company)
+
+        item = ObjectSaleItem.objects.create(
+            sale=sale,
+            object_item=obj,
+            name_snapshot=obj.name,
+            unit_price=ser.validated_data.get("unit_price") or obj.price,
+            quantity=ser.validated_data["quantity"],
+        )
+        sale.recalc()
+        return Response(ObjectSaleItemSerializer(item).data, status=status.HTTP_201_CREATED)

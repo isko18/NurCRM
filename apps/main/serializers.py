@@ -1,5 +1,5 @@
 from rest_framework import serializers
-from apps.main.models import Contact, Pipeline, Deal, Task, Integration, Analytics, Order, Product, Review, Notification, Event, Warehouse, WarehouseEvent, ProductCategory, ProductBrand, OrderItem, Client, GlobalProduct, CartItem, ClientDeal, Bid, SocialApplications, TransactionRecord, DealInstallment, ContractorWork, Debt, DebtPayment
+from apps.main.models import Contact, Pipeline, Deal, Task, Integration, Analytics, Order, Product, Review, Notification, Event, Warehouse, WarehouseEvent, ProductCategory, ProductBrand, OrderItem, Client, GlobalProduct, CartItem, ClientDeal, Bid, SocialApplications, TransactionRecord, DealInstallment, ContractorWork, Debt, DebtPayment, ObjectItem, ObjectSale, ObjectSaleItem
 from apps.construction.models import Department
 from apps.users.models import User, Company
 from django.db import transaction
@@ -801,3 +801,41 @@ class DebtPaymentSerializer(serializers.ModelSerializer):
         model = DebtPayment
         fields = ["id", "company", "debt", "amount", "paid_at", "note", "created_at"]
         read_only_fields = ["id", "company", "debt", "created_at"]
+        
+        
+class ObjectItemSerializer(serializers.ModelSerializer):
+    company = serializers.ReadOnlyField(source="company.id")
+
+    class Meta:
+        model = ObjectItem
+        fields = ["id", "company", "name", "description", "price", "date", "quantity", "created_at", "updated_at"]
+        read_only_fields = ["id", "company", "created_at", "updated_at"]
+
+
+class ObjectSaleItemSerializer(serializers.ModelSerializer):
+    object_name = serializers.ReadOnlyField(source="name_snapshot")
+
+    class Meta:
+        model = ObjectSaleItem
+        fields = ["id", "object_item", "object_name", "unit_price", "quantity"]
+
+
+class ObjectSaleSerializer(serializers.ModelSerializer):
+    company = serializers.ReadOnlyField(source="company.id")
+    client_name = serializers.ReadOnlyField(source="client.full_name")
+    items = ObjectSaleItemSerializer(many=True, read_only=True)
+
+    class Meta:
+        model = ObjectSale
+        fields = ["id", "company", "client", "client_name", "status", "sold_at", "note", "subtotal", "items", "created_at"]
+        read_only_fields = ["id", "company", "client_name", "subtotal", "created_at"]
+
+    def validate_client(self, client):
+        company = self.context["request"].user.company
+        if client.company_id != company.id:
+            raise serializers.ValidationError("Клиент принадлежит другой компании.")
+        return client
+
+    def create(self, validated_data):
+        validated_data["company"] = self.context["request"].user.company
+        return super().create(validated_data)
