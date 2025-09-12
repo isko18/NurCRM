@@ -12,9 +12,11 @@ from django.http import FileResponse
 from reportlab.lib.utils import ImageReader
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
+from decimal import Decimal, ROUND_HALF_UP
 import qrcode
+import io, os
 
-from apps.main.models import Cart, CartItem, Sale, Product, MobileScannerToken
+from apps.main.models import Cart, CartItem, Sale, Product, MobileScannerToken, Client
 from .pos_serializers import (
     SaleCartSerializer, SaleItemSerializer,
     ScanRequestSerializer, AddItemSerializer,
@@ -23,10 +25,8 @@ from .pos_serializers import (
 )
 from apps.main.services import checkout_cart, NotEnoughStock
 from apps.main.views import CompanyRestrictedMixin
-from apps.main.models import Client
 from apps.construction.models import Department
 from django.http import Http404
-import io,os
 
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -37,6 +37,13 @@ FONTS_DIR = os.path.join(BASE_DIR, "fonts")
 # Регистрируем шрифты
 pdfmetrics.registerFont(TTFont("DejaVu", os.path.join(FONTS_DIR, "DejaVuSans.ttf")))
 pdfmetrics.registerFont(TTFont("DejaVu-Bold", os.path.join(FONTS_DIR, "DejaVuSans-Bold.ttf")))
+
+# ---- money helpers ----
+def _q2(x: Decimal) -> Decimal:
+    return (x or Decimal("0")).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+def fmt_money(x: Decimal) -> str:
+    return f"{_q2(x):.2f}"
 
 
 # pos/views.py
@@ -49,7 +56,7 @@ class SaleInvoiceDownloadAPIView(APIView):
 
     def get(self, request, pk, *args, **kwargs):
         sale = get_object_or_404(
-            Sale.objects.prefetch_related("items__product", "user"),
+            Sale.objects.select_related("company", "user").prefetch_related("items__product"),
             id=pk, company=request.user.company
         )
 
@@ -58,7 +65,7 @@ class SaleInvoiceDownloadAPIView(APIView):
 
         # === Заголовок ===
         p.setFont("DejaVu-Bold", 14)
-        p.drawCentredString(105 * mm, 280 * mm, "НАКЛАДНАЯ № {}".format(sale.id))
+        p.drawCentredString(105 * mm, 280 * mm, f"НАКЛАДНАЯ № {sale.id}")
         p.setFont("DejaVu", 10)
         p.drawCentredString(105 * mm, 273 * mm, f"от {sale.created_at.strftime('%d.%m.%Y %H:%M')}")
 
@@ -86,10 +93,10 @@ class SaleInvoiceDownloadAPIView(APIView):
 
         p.setFont("DejaVu", 10)
         for it in sale.items.all():
-            p.drawString(20 * mm, y, it.name_snapshot[:40])
+            p.drawString(20 * mm, y, (it.name_snapshot or "")[:40])
             p.drawRightString(140 * mm, y, str(it.quantity))
-            p.drawRightString(160 * mm, y, f"{it.unit_price:.2f}")
-            p.drawRightString(190 * mm, y, f"{(it.quantity * it.unit_price):.2f}")
+            p.drawRightString(160 * mm, y, fmt_money(it.unit_price))
+            p.drawRightString(190 * mm, y, fmt_money(it.unit_price * it.quantity))
             y -= 7 * mm
             if y < 50 * mm:
                 p.showPage()
@@ -99,7 +106,15 @@ class SaleInvoiceDownloadAPIView(APIView):
         # === ИТОГ ===
         y -= 10
         p.setFont("DejaVu-Bold", 11)
-        p.drawRightString(190 * mm, y, f"ИТОГО: {sale.total:.2f}")
+        p.drawRightString(190 * mm, y, f"СУММА (без скидок): {fmt_money(sale.subtotal)}")
+        y -= 6 * mm
+        if sale.discount_total and sale.discount_total > 0:
+            p.drawRightString(190 * mm, y, f"СКИДКА: {fmt_money(sale.discount_total)}")
+            y -= 6 * mm
+        if sale.tax_total and sale.tax_total > 0:
+            p.drawRightString(190 * mm, y, f"НАЛОГ: {fmt_money(sale.tax_total)}")
+            y -= 6 * mm
+        p.drawRightString(190 * mm, y, f"ИТОГО К ОПЛАТЕ: {fmt_money(sale.total)}")
 
         # === Подписи ===
         y -= 20
@@ -123,7 +138,7 @@ class SaleReceiptDownloadAPIView(APIView):
 
     def get(self, request, pk, *args, **kwargs):
         sale = get_object_or_404(
-            Sale.objects.prefetch_related("items"),
+            Sale.objects.select_related("company").prefetch_related("items"),
             id=pk, company=request.user.company
         )
 
@@ -131,7 +146,10 @@ class SaleReceiptDownloadAPIView(APIView):
         base_height = 80   # шапка и отступы
         per_item = 15      # место на строку товара
         qr_block = 40      # блок под QR
-        page_height = (base_height + per_item * sale.items.count() + qr_block) * mm
+        extra_lines = 1 + (1 if sale.discount_total and sale.discount_total > 0 else 0) \
+                        + (1 if sale.tax_total and sale.tax_total > 0 else 0) + 1
+        extra_height = 6 * extra_lines + 6
+        page_height = (base_height + per_item * sale.items.count() + qr_block + extra_height) * mm
         page_width = 58 * mm
 
         buffer = io.BytesIO()
@@ -157,15 +175,12 @@ class SaleReceiptDownloadAPIView(APIView):
 
         # === Товары ===
         for it in sale.items.all():
-            name = it.name_snapshot[:22]  # ограничиваем длину строки
-            qty_price = f"{it.quantity} x {it.unit_price:.2f}"
-            total = f"{(it.quantity * it.unit_price):.2f}"
+            name = (it.name_snapshot or "")[:22]
+            qty_price = f"{it.quantity} x {fmt_money(it.unit_price)}"
+            total = fmt_money(it.unit_price * it.quantity)
 
-            # название
             p.drawString(5 * mm, y, name)
             y -= 4 * mm
-
-            # количество и сумма
             p.drawString(5 * mm, y, qty_price)
             p.drawRightString(page_width - 5 * mm, y, total)
             y -= 6 * mm
@@ -174,20 +189,30 @@ class SaleReceiptDownloadAPIView(APIView):
         p.drawCentredString(page_width / 2, y, "-" * 32)
         y -= 6 * mm
 
-        # === ИТОГО ===
+        # === ИТОГИ ===
+        p.setFont("DejaVu", 9)
+        p.drawRightString(page_width - 5 * mm, y, f"СУММА: {fmt_money(sale.subtotal)}")
+        y -= 6 * mm
+        if sale.discount_total and sale.discount_total > 0:
+            p.drawRightString(page_width - 5 * mm, y, f"СКИДКА: {fmt_money(sale.discount_total)}")
+            y -= 6 * mm
+        if sale.tax_total and sale.tax_total > 0:
+            p.drawRightString(page_width - 5 * mm, y, f"НАЛОГ: {fmt_money(sale.tax_total)}")
+            y -= 6 * mm
+
         p.setFont("DejaVu-Bold", 11)
-        p.drawRightString(page_width - 5 * mm, y, f"ИТОГО: {sale.total:.2f}")
+        p.drawRightString(page_width - 5 * mm, y, f"ИТОГО: {fmt_money(sale.total)}")
         y -= 12 * mm
 
-        # === QR-код (через Pillow/qrcode) ===
-        qr_img = qrcode.make(f"SALE:{sale.id};SUM:{sale.total}")
+        # === QR-код ===
+        qr_img = qrcode.make(f"SALE={sale.id};SUM={fmt_money(sale.total)};DATE={sale.created_at.isoformat()}")
         qr_size = 25 * mm
         qr_img = qr_img.resize((int(qr_size), int(qr_size)))
 
         p.drawImage(
             ImageReader(qr_img),
-            (page_width - qr_size) / 2,  # центрируем по ширине
-            y - qr_size,                 # опускаем вниз
+            (page_width - qr_size) / 2,
+            y - qr_size,
             qr_size,
             qr_size
         )
@@ -203,6 +228,7 @@ class SaleReceiptDownloadAPIView(APIView):
         buffer.seek(0)
         return FileResponse(buffer, as_attachment=True, filename=f"receipt_{sale.id}.pdf")
     
+
 class SaleStartAPIView(APIView):
     """
     POST — создать/получить активную корзину для текущего пользователя.
@@ -280,6 +306,7 @@ class SaleScanAPIView(APIView):
 class SaleAddItemAPIView(APIView):
     """
     POST — ручное добавление товара после поиска.
+    Можно передать либо unit_price, либо discount_total (на всю строку).
     """
     permission_classes = [permissions.IsAuthenticated]
 
@@ -290,19 +317,37 @@ class SaleAddItemAPIView(APIView):
         )
         ser = AddItemSerializer(data=request.data)
         ser.is_valid(raise_exception=True)
+
         product = get_object_or_404(
             Product, id=ser.validated_data["product_id"], company=cart.company
         )
         qty = ser.validated_data["quantity"]
 
+        # --- Цена/скидка на строку ---
+        unit_price = ser.validated_data.get("unit_price")
+        line_discount = ser.validated_data.get("discount_total")
+
+        if unit_price is None:
+            if line_discount is not None:
+                # скидка на всю строку -> рассчитать цену за ед.
+                per_unit_disc = _q2(Decimal(line_discount) / Decimal(qty))
+                unit_price = _q2(Decimal(product.price) - per_unit_disc)
+                if unit_price < 0:
+                    unit_price = Decimal("0.00")
+            else:
+                unit_price = product.price  # без скидки
+
         item, created = CartItem.objects.get_or_create(
             cart=cart,
             product=product,
-            defaults={"company": cart.company, "quantity": qty, "unit_price": product.price},
+            defaults={"company": cart.company, "quantity": qty, "unit_price": unit_price},
         )
         if not created:
+            # объединяем строки: увеличиваем количество и обновляем цену на позицию
             item.quantity += qty
-            item.save(update_fields=["quantity"])
+            item.unit_price = unit_price
+            item.save(update_fields=["quantity", "unit_price"])
+
         cart.recalc()
 
         return Response(SaleCartSerializer(cart).data, status=status.HTTP_201_CREATED)
@@ -322,8 +367,8 @@ class SaleCheckoutAPIView(APIView):
         print_receipt = ser.validated_data["print_receipt"]
         client_id = ser.validated_data.get("client_id")
 
-        # Определяем отдел
-        department_id = request.data.get("department_id")
+        # Определяем отдел — берём из сериализатора
+        department_id = ser.validated_data.get("department_id")
         department = None
         if department_id:
             department = get_object_or_404(Department, id=department_id, company=request.user.company)
@@ -343,18 +388,27 @@ class SaleCheckoutAPIView(APIView):
 
         payload = {
             "sale_id": str(sale.id),
-            "total": str(sale.total),
             "status": sale.status,
+            "subtotal": fmt_money(sale.subtotal),
+            "discount_total": fmt_money(sale.discount_total),
+            "tax_total": fmt_money(sale.tax_total),
+            "total": fmt_money(sale.total),
             "client": str(sale.client_id) if sale.client_id else None,
             "client_name": getattr(sale.client, "full_name", None) if sale.client else None,
         }
 
         if print_receipt:
             lines = [
-                f"{it.name_snapshot} x{it.quantity} = {(it.unit_price * it.quantity):.2f}"
+                f"{it.name_snapshot} x{it.quantity} = {fmt_money(it.unit_price * it.quantity)}"
                 for it in sale.items.all()
             ]
-            payload["receipt_text"] = "ЧЕК\n" + "\n".join(lines) + f"\nИТОГО: {sale.total:.2f}"
+            totals = [f"СУММА: {fmt_money(sale.subtotal)}"]
+            if sale.discount_total and sale.discount_total > 0:
+                totals.append(f"СКИДКА: {fmt_money(sale.discount_total)}")
+            if sale.tax_total and sale.tax_total > 0:
+                totals.append(f"НАЛОГ: {fmt_money(sale.tax_total)}")
+            totals.append(f"ИТОГО: {fmt_money(sale.total)}")
+            payload["receipt_text"] = "ЧЕК\n" + "\n".join(lines) + "\n" + "\n".join(totals)
 
         return Response(payload, status=status.HTTP_201_CREATED)
 
@@ -475,6 +529,7 @@ class SaleRetrieveAPIView(generics.RetrieveAPIView):
             id=self.kwargs["pk"],
             company=self.request.user.company,
         )
+
 
 class CartItemUpdateDestroyAPIView(APIView):
     """
