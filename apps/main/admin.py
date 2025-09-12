@@ -13,7 +13,7 @@ from .models import (
     Review, Notification, Integration, Analytics, Event,
     Warehouse, WarehouseEvent,
     Client, ClientDeal, DealInstallment,
-    Bid, SocialApplications, TransactionRecord, DebtPayment, Debt
+    Bid, SocialApplications, TransactionRecord, DebtPayment, Debt, ObjectItem, ObjectSale, ObjectSaleItem
 )
 
 admin.site.site_header = "nurCRM Admin"
@@ -22,6 +22,10 @@ admin.site.index_title = "Управление данными"
 
 admin.site.register(Debt)
 admin.site.register(DebtPayment)
+admin.site.register(ObjectItem)
+admin.site.register(ObjectSale)
+admin.site.register(ObjectSaleItem)
+
 
 # ========= Инлайны =========
 class DealInstallmentInline(admin.TabularInline):
