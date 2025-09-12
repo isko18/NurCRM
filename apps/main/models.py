@@ -980,7 +980,7 @@ class ContractorWork(models.Model):
     )
 
     status = models.CharField(
-        "Статус", max_length=8, choices=Status.choices, null=True, blank=True
+        "Статус", max_length=255, choices=Status.choices, null=True, blank=True
     )
     start_date = models.DateField("Дата начала", null=True, blank=True)
     end_date = models.DateField("Дата окончания", null=True, blank=True)
