@@ -129,6 +129,7 @@ class User(AbstractBaseUser, PermissionsMixin):
     can_view_building_work_process = models.BooleanField(default=False, blank=True, null=True, verbose_name='Доступ к процессам строительства')
     can_view_building_objects = models.BooleanField(default=False, blank=True, null=True, verbose_name='Доступ к объектам')
     can_view_additional_services = models.BooleanField(default=False, blank=True, null=True, verbose_name='Доступ к доп. услугам')
+    can_view_debts = models.BooleanField(default=False, blank=True, null=True, verbose_name='Доступ к долгам')
 
     # Барбершоп
     can_view_barber_clients = models.BooleanField(default=False, blank=True, null=True, verbose_name='Барбершоп: клиенты')
