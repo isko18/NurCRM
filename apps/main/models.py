@@ -13,6 +13,10 @@ from dateutil.relativedelta import relativedelta
 from django.db.models import Sum
 from decimal import Decimal, ROUND_HALF_UP
 
+_Q2 = Decimal("0.01")
+def _money(x: Decimal) -> Decimal:
+    return (x or Decimal("0")).quantize(_Q2, rounding=ROUND_HALF_UP)
+
 class Contact(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     company = models.ForeignKey(Company, on_delete=models.CASCADE, related_name='contacts')
@@ -336,7 +340,9 @@ class Product(models.Model):
 
     def __str__(self):
         return self.name
-    
+
+
+
 class Cart(models.Model):
     class Status(models.TextChoices):
         ACTIVE = "active", "Активна"
@@ -375,16 +381,40 @@ class Cart(models.Model):
         verbose_name = "Корзина"
         verbose_name_plural = "Корзины"
 
-    def recalc(self):
-        items = self.items.all()
-        self.subtotal = sum((i.quantity * i.unit_price for i in items), Decimal("0"))
-        self.discount_total = Decimal("0")
-        self.tax_total = Decimal("0")
-        self.total = self.subtotal - self.discount_total + self.tax_total
-        self.save(update_fields=["subtotal", "discount_total", "tax_total", "total", "updated_at"])
+    def _calc_tax(self, taxable_base: Decimal) -> Decimal:
+        # если налогов нет — верните 0; иначе подставьте свою логику/ставку
+        TAX_RATE = Decimal("0.00")
+        return taxable_base * TAX_RATE
 
-    def __str__(self):
-        return f"Корзина {self.id} ({self.get_status_display()})"
+    def recalc(self):
+        subtotal = Decimal("0")
+        discount_total = Decimal("0")
+
+        for it in self.items.select_related("product"):
+            qty = Decimal(it.quantity or 0)
+
+            # Базовая (прайсовая) цена товара; если по какой-то причине её нет, fallback на unit_price
+            base_unit = getattr(it.product, "price", None)
+            if base_unit is None:
+                base_unit = it.unit_price or Decimal("0")
+
+            line_base = base_unit * qty            # до скидок
+            line_actual = (it.unit_price or 0) * qty  # после скидок
+
+            subtotal += line_base
+            diff = line_base - line_actual
+            if diff > 0:
+                discount_total += diff
+
+        taxable_base = subtotal - discount_total
+        tax_total = self._calc_tax(taxable_base)
+
+        self.subtotal = _money(subtotal)
+        self.discount_total = _money(discount_total)
+        self.tax_total = _money(tax_total)
+        self.total = _money(self.subtotal - self.discount_total + self.tax_total)
+
+        self.save(update_fields=["subtotal", "discount_total", "tax_total", "total", "updated_at"])
 
 
 class CartItem(models.Model):
