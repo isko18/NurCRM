@@ -181,7 +181,7 @@ class DepartmentSerializer(serializers.ModelSerializer):
             'can_view_brand_category', 'can_view_settings', 'can_view_sale',
 
             # новые
-            'can_view_building_work_process', 'can_view_additional_services',
+            'can_view_building_work_process', 'can_view_building_objects', 'can_view_additional_services',
 
             # барбершоп
             'can_view_barber_clients', 'can_view_barber_services',

@@ -127,6 +127,7 @@ class User(AbstractBaseUser, PermissionsMixin):
 
     # ===== Права доступа (НОВЫЕ) =====
     can_view_building_work_process = models.BooleanField(default=False, blank=True, null=True, verbose_name='Доступ к процессам строительства')
+    can_view_building_objects = models.BooleanField(default=False, blank=True, null=True, verbose_name='Доступ к объектам')
     can_view_additional_services = models.BooleanField(default=False, blank=True, null=True, verbose_name='Доступ к доп. услугам')
 
     # Барбершоп
