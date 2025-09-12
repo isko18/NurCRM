@@ -14,6 +14,7 @@ from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 from decimal import Decimal, ROUND_HALF_UP
 import qrcode
+import io, os
 
 from apps.main.models import Cart, CartItem, Sale, Product, MobileScannerToken
 from .pos_serializers import (
@@ -27,7 +28,6 @@ from apps.main.views import CompanyRestrictedMixin
 from apps.main.models import Client
 from apps.construction.models import Department
 from django.http import Http404
-import io, os
 
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -103,7 +103,7 @@ class SaleInvoiceDownloadAPIView(APIView):
                 p.showPage()
                 y = 270 * mm
                 p.setFont("DejaVu", 10)
-                # можно дорисовать хедер таблицы на новой странице при необходимости
+                # при необходимости можно дорисовать хедер таблицы
 
         # === ИТОГ ===
         y -= 10
@@ -212,15 +212,15 @@ class SaleReceiptDownloadAPIView(APIView):
         p.drawRightString(page_width - 5 * mm, y, f"ИТОГО: {fmt_money(sale.total)}")
         y -= 12 * mm
 
-        # === QR-код (через Pillow/qrcode) ===
+        # === QR-код ===
         qr_img = qrcode.make(f"SALE={sale.id};SUM={fmt_money(sale.total)};DATE={sale.created_at.isoformat()}")
         qr_size = 25 * mm
         qr_img = qr_img.resize((int(qr_size), int(qr_size)))
 
         p.drawImage(
             ImageReader(qr_img),
-            (page_width - qr_size) / 2,  # центрируем по ширине
-            y - qr_size,                 # опускаем вниз
+            (page_width - qr_size) / 2,
+            y - qr_size,
             qr_size,
             qr_size
         )
@@ -313,6 +313,9 @@ class SaleScanAPIView(APIView):
 class SaleAddItemAPIView(APIView):
     """
     POST — ручное добавление товара после поиска.
+    Поддерживает:
+      - unit_price: цена за единицу (после скидки),
+      - discount_total: скидка на всю строку (будет конвертирована в unit_price).
     """
     permission_classes = [permissions.IsAuthenticated]
 
@@ -323,20 +326,38 @@ class SaleAddItemAPIView(APIView):
         )
         ser = AddItemSerializer(data=request.data)
         ser.is_valid(raise_exception=True)
+
         product = get_object_or_404(
             Product, id=ser.validated_data["product_id"], company=cart.company
         )
         qty = ser.validated_data["quantity"]
 
+        # --- цена или скидка на строку
+        unit_price = ser.validated_data.get("unit_price")
+        line_discount = ser.validated_data.get("discount_total")
+
+        if unit_price is None:
+            if line_discount is not None:
+                # скидка на всю строку -> пересчёт цены за единицу
+                per_unit_disc = _q2(Decimal(line_discount) / Decimal(qty))
+                unit_price = _q2(Decimal(product.price) - per_unit_disc)
+                if unit_price < 0:
+                    unit_price = Decimal("0.00")
+            else:
+                unit_price = product.price  # без скидки
+
         item, created = CartItem.objects.get_or_create(
             cart=cart,
             product=product,
-            defaults={"company": cart.company, "quantity": qty, "unit_price": product.price},
+            defaults={"company": cart.company, "quantity": qty, "unit_price": unit_price},
         )
         if not created:
+            # при повторном добавлении обновим цену/количество
             item.quantity += qty
-            item.save(update_fields=["quantity"])
-        cart.recalc()
+            item.unit_price = unit_price
+            item.save(update_fields=["quantity", "unit_price"])
+
+        cart.recalc()  # должен уметь считать discount_total
 
         return Response(SaleCartSerializer(cart).data, status=status.HTTP_201_CREATED)
 
@@ -415,7 +436,7 @@ class SaleMobileScannerTokenAPIView(APIView):
             Cart, id=pk, company=request.user.company, status=Cart.Status.ACTIVE
         )
         token = MobileScannerToken.issue(cart, ttl_minutes=10)
-        return Response(MobileScannerTokenSerializer(token).data, status=201)
+        return Response(MobileScannerTokenSerializer(token).data, status=status.HTTP_201_CREATED)
 
 
 class ProductFindByBarcodeAPIView(APIView):
@@ -427,12 +448,12 @@ class ProductFindByBarcodeAPIView(APIView):
     def get(self, request, *args, **kwargs):
         barcode = request.query_params.get("barcode", "").strip()
         if not barcode:
-            return Response([], status=200)
+            return Response([], status=status.HTTP_200_OK)
         qs = Product.objects.filter(company=request.user.company, barcode=barcode)[:1]
         return Response([
             {"id": str(p.id), "name": p.name, "barcode": p.barcode, "price": str(p.price)}
             for p in qs
-        ], status=200)
+        ], status=status.HTTP_200_OK)
 
 
 class MobileScannerIngestAPIView(APIView):
@@ -446,19 +467,19 @@ class MobileScannerIngestAPIView(APIView):
         barcode = request.data.get("barcode", "").strip()
         qty = int(request.data.get("quantity", 1))
         if not barcode or qty <= 0:
-            return Response({"detail": "barcode required"}, status=400)
+            return Response({"detail": "barcode required"}, status=status.HTTP_400_BAD_REQUEST)
 
         mt = MobileScannerToken.objects.select_related("cart", "cart__company").filter(token=token).first()
         if not mt:
-            return Response({"detail": "invalid token"}, status=404)
+            return Response({"detail": "invalid token"}, status=status.HTTP_404_NOT_FOUND)
         if not mt.is_valid():
-            return Response({"detail": "token expired"}, status=410)
+            return Response({"detail": "token expired"}, status=status.HTTP_410_GONE)
 
         cart = mt.cart
         try:
             product = Product.objects.get(company=cart.company, barcode=barcode)
         except Product.DoesNotExist:
-            return Response({"not_found": True, "message": "Товар не найден"}, status=404)
+            return Response({"not_found": True, "message": "Товар не найден"}, status=status.HTTP_404_NOT_FOUND)
 
         item, created = CartItem.objects.get_or_create(
             cart=cart,
@@ -470,7 +491,7 @@ class MobileScannerIngestAPIView(APIView):
             item.save(update_fields=["quantity"])
         cart.recalc()
 
-        return Response({"ok": True}, status=201)
+        return Response({"ok": True}, status=status.HTTP_201_CREATED)
 
 
 class SaleListAPIView(CompanyRestrictedMixin, generics.ListAPIView):
@@ -521,6 +542,7 @@ class SaleRetrieveAPIView(generics.RetrieveAPIView):
             company=self.request.user.company,
         )
 
+
 class CartItemUpdateDestroyAPIView(APIView):
     """
     PATCH /api/main/pos/carts/<uuid:cart_id>/items/<uuid:item_id>/
@@ -566,20 +588,20 @@ class CartItemUpdateDestroyAPIView(APIView):
         try:
             qty = int(request.data.get("quantity"))
         except (TypeError, ValueError):
-            return Response({"quantity": "Укажите целое число >= 0."}, status=400)
+            return Response({"quantity": "Укажите целое число >= 0."}, status=status.HTTP_400_BAD_REQUEST)
 
         if qty < 0:
-            return Response({"quantity": "Количество не может быть отрицательным."}, status=400)
+            return Response({"quantity": "Количество не может быть отрицательным."}, status=status.HTTP_400_BAD_REQUEST)
 
         if qty == 0:
             item.delete()
             cart.recalc()
-            return Response(SaleCartSerializer(cart).data, status=200)
+            return Response(SaleCartSerializer(cart).data, status=status.HTTP_200_OK)
 
         item.quantity = qty
         item.save(update_fields=["quantity"])
         cart.recalc()
-        return Response(SaleCartSerializer(cart).data, status=200)
+        return Response(SaleCartSerializer(cart).data, status=status.HTTP_200_OK)
 
     @transaction.atomic
     def delete(self, request, cart_id, item_id, *args, **kwargs):
@@ -587,4 +609,4 @@ class CartItemUpdateDestroyAPIView(APIView):
         item = self._get_item_in_cart(cart, item_id)
         item.delete()
         cart.recalc()
-        return Response(SaleCartSerializer(cart).data, status=200)
+        return Response(SaleCartSerializer(cart).data, status=status.HTTP_200_OK)
