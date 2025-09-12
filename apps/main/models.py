@@ -1109,3 +1109,81 @@ class DebtPayment(models.Model):
             self.company_id = self.debt.company_id
         self.full_clean()
         super().save(*args, **kwargs)
+        
+        
+class ObjectItem(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    company = models.ForeignKey(Company, on_delete=models.CASCADE, related_name="object_items")
+    name = models.CharField("Наименование", max_length=255)
+    description = models.TextField("Описание", blank=True)
+    price = models.DecimalField("Цена", max_digits=12, decimal_places=2)
+    date = models.DateField("Дата", default=timezone.localdate)
+    quantity = models.PositiveIntegerField("Количество", default=1, validators=[MinValueValidator(1)])
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["-date", "-created_at"]
+
+    def __str__(self):
+        return self.name
+
+
+class ObjectSale(models.Model):
+    """Шапка продажи — клиент обязателен."""
+    class Status(models.TextChoices):
+        NEW = "new", "Новая"
+        PAID = "paid", "Оплачена"
+        CANCELED = "canceled", "Отменена"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    company = models.ForeignKey(Company, on_delete=models.CASCADE, related_name="object_sales", verbose_name="Компания")
+    client = models.ForeignKey("main.Client", on_delete=models.PROTECT, related_name="object_sales", verbose_name="Клиент")
+
+    status = models.CharField("Статус", max_length=16, choices=Status.choices, default=Status.NEW)
+    sold_at = models.DateField("Дата продажи", default=timezone.localdate)
+    note = models.CharField("Комментарий", max_length=255, blank=True)
+
+    subtotal = models.DecimalField("Сумма", max_digits=12, decimal_places=2, default=0)
+    created_at = models.DateTimeField("Создано", auto_now_add=True)
+
+    class Meta:
+        ordering = ["-sold_at", "-created_at"]
+        indexes = [
+            models.Index(fields=["company", "sold_at"]),
+            models.Index(fields=["company", "client"]),
+        ]
+
+    def __str__(self):
+        return f"Продажа {self.id} — {self.get_status_display()}"
+
+    def recalc(self):
+        total = sum((i.unit_price * i.quantity for i in self.items.all()), Decimal("0"))
+        self.subtotal = total
+        self.save(update_fields=["subtotal"])
+
+
+class ObjectSaleItem(models.Model):
+    """Строка продажи с “снимком” названия и цены на момент продажи."""
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    sale = models.ForeignKey(ObjectSale, on_delete=models.CASCADE, related_name="items", verbose_name="Продажа")
+    object_item = models.ForeignKey(ObjectItem, on_delete=models.PROTECT, related_name="sold_items", verbose_name="Объект")
+
+    name_snapshot = models.CharField("Наименование (снимок)", max_length=255)
+    unit_price = models.DecimalField("Цена за единицу", max_digits=12, decimal_places=2)
+    quantity = models.PositiveIntegerField("Кол-во", validators=[MinValueValidator(1)])
+
+    def save(self, *args, **kwargs):
+        creating = self.pk is None
+        if creating:
+            # подставим снимок
+            if not self.name_snapshot:
+                self.name_snapshot = self.object_item.name
+            if not self.unit_price:
+                self.unit_price = self.object_item.price
+        super().save(*args, **kwargs)
+        # уменьшим остаток и пересчитаем сумму (упрощённая логика)
+        if creating:
+            self.object_item.quantity = max(0, self.object_item.quantity - self.quantity)
+            self.object_item.save(update_fields=["quantity"])
+        self.sale.recalc()
