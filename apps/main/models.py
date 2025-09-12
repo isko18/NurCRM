@@ -954,6 +954,10 @@ class ContractorWork(models.Model):
     class ContractorType(models.TextChoices):
         LLC = "llc", "ОсОО / ООО"
         IP  = "ip",  "ИП"
+        
+    class Status(models.TextChoices):
+        PROCESS = "process", "В процессе"
+        COMPLETED  = "completed",  "Завершен"
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False, verbose_name="ID")
     company = models.ForeignKey(Company, on_delete=models.CASCADE, related_name="contractor_works", verbose_name="Компания")
@@ -975,7 +979,9 @@ class ContractorWork(models.Model):
         validators=[MinValueValidator(Decimal("0"))]
     )
 
-    # даты
+    status = models.CharField(
+        "Статус", max_length=8, choices=Status.choices, null=True, blank=True
+    )
     start_date = models.DateField("Дата начала", null=True, blank=True)
     end_date = models.DateField("Дата окончания", null=True, blank=True)
     planned_completion_date = models.DateField("Плановая дата завершения", null=True, blank=True)
