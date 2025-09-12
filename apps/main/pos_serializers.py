@@ -5,6 +5,28 @@ from .models import (
     Product, Cart, CartItem, Sale, SaleItem, MobileScannerToken
 )
 
+# ---------- Helpers ----------
+
+Q2 = Decimal("0.01")
+
+def money(x: Decimal) -> Decimal:
+    return (x or Decimal("0")).quantize(Q2, rounding=ROUND_HALF_UP)
+
+
+class MoneyField(serializers.DecimalField):
+    """
+    Денежное поле: 2 знака, округление ROUND_HALF_UP.
+    """
+    def __init__(self, *args, **kwargs):
+        kwargs.setdefault("max_digits", 12)
+        kwargs.setdefault("decimal_places", 2)
+        super().__init__(*args, **kwargs)
+
+    def to_internal_value(self, value):
+        val = super().to_internal_value(value)
+        return money(val)
+
+
 # --- Позиция в корзине ---
 class SaleItemSerializer(serializers.ModelSerializer):
     product_name = serializers.CharField(source="product.name", read_only=True)
@@ -53,9 +75,9 @@ class ScanRequestSerializer(serializers.Serializer):
 class AddItemSerializer(serializers.Serializer):
     product_id = serializers.UUIDField()
     quantity = serializers.IntegerField(min_value=1, required=False, default=1)
-    # НОВОЕ:
-    unit_price = serializers.DecimalField(max_digits=12, decimal_places=2, required=False)
-    discount_total = serializers.DecimalField(max_digits=12, decimal_places=2, required=False)
+    # Можно задать либо цену позиции (после скидки), либо скидку на всю строку:
+    unit_price = MoneyField(required=False)
+    discount_total = MoneyField(required=False)
 
     def validate(self, attrs):
         up = attrs.get("unit_price")
@@ -68,9 +90,11 @@ class AddItemSerializer(serializers.Serializer):
             raise serializers.ValidationError({"discount_total": "Должна быть ≥ 0."})
         if up is not None and disc is not None:
             raise serializers.ValidationError("Передавайте либо unit_price, либо discount_total.")
-
+        if qty < 1:
+            raise serializers.ValidationError({"quantity": "Минимум 1."})
         return attrs
-    
+
+
 class OptionalUUIDField(serializers.UUIDField):
     """
     UUID-поле, которое принимает None/""/"null" как отсутствие значения.
@@ -81,11 +105,13 @@ class OptionalUUIDField(serializers.UUIDField):
             return None
         return super().to_internal_value(data)
 
+
 class CheckoutSerializer(serializers.Serializer):
     print_receipt = serializers.BooleanField(default=False)
     client_id = OptionalUUIDField(required=False, allow_null=True)
     # (опц.) чтобы не читать department_id напрямую из request.data во вьюхе:
     department_id = OptionalUUIDField(required=False, allow_null=True)
+
 
 class MobileScannerTokenSerializer(serializers.ModelSerializer):
     class Meta:
@@ -156,7 +182,7 @@ class SaleItemReadSerializer(serializers.ModelSerializer):
     def get_line_total(self, obj):
         # аккуратно считаем Decimal сумму и округляем до 2 знаков
         total = (obj.unit_price or Decimal("0")) * Decimal(obj.quantity or 0)
-        return total.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        return money(total)
 
 
 class SaleDetailSerializer(serializers.ModelSerializer):
@@ -180,6 +206,7 @@ class SaleDetailSerializer(serializers.ModelSerializer):
             "client_name",   # имя клиента
             "items",
         )
+    # весь объект только для чтения (деталка)
         read_only_fields = fields
 
     def get_user_display(self, obj):
