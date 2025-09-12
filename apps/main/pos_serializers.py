@@ -53,8 +53,24 @@ class ScanRequestSerializer(serializers.Serializer):
 class AddItemSerializer(serializers.Serializer):
     product_id = serializers.UUIDField()
     quantity = serializers.IntegerField(min_value=1, required=False, default=1)
+    # НОВОЕ:
+    unit_price = serializers.DecimalField(max_digits=12, decimal_places=2, required=False)
+    discount_total = serializers.DecimalField(max_digits=12, decimal_places=2, required=False)
 
+    def validate(self, attrs):
+        up = attrs.get("unit_price")
+        disc = attrs.get("discount_total")
+        qty = attrs.get("quantity", 1)
 
+        if up is not None and up < 0:
+            raise serializers.ValidationError({"unit_price": "Должна быть ≥ 0."})
+        if disc is not None and disc < 0:
+            raise serializers.ValidationError({"discount_total": "Должна быть ≥ 0."})
+        if up is not None and disc is not None:
+            raise serializers.ValidationError("Передавайте либо unit_price, либо discount_total.")
+
+        return attrs
+    
 class OptionalUUIDField(serializers.UUIDField):
     """
     UUID-поле, которое принимает None/""/"null" как отсутствие значения.
