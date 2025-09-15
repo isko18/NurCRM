@@ -839,3 +839,14 @@ class ObjectSaleSerializer(serializers.ModelSerializer):
     def create(self, validated_data):
         validated_data["company"] = self.context["request"].user.company
         return super().create(validated_data)
+    
+    
+class BulkIdsSerializer(serializers.Serializer):
+    ids = serializers.ListField(
+        child=serializers.UUIDField(format='hex_verbose'),
+        allow_empty=False
+    )
+    # если хотите не жёстко удалять, а помечать
+    soft = serializers.BooleanField(required=False, default=False)
+    # если хотите всё-или-ничего (транзакция)
+    require_all = serializers.BooleanField(required=False, default=False)
