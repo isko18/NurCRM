@@ -421,7 +421,7 @@ class CartItem(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False, verbose_name="ID")
     company = models.ForeignKey(Company, on_delete=models.CASCADE, related_name="cart_items", verbose_name="Компания")
     cart = models.ForeignKey(Cart, on_delete=models.CASCADE, related_name="items", verbose_name="Корзина")
-    product = models.ForeignKey(Product, on_delete=models.PROTECT, related_name="cart_items", verbose_name="Товар")
+    product = models.ForeignKey(Product, null=True, blank=True, on_delete=models.SET_NULL, related_name="cart_items", verbose_name="Товар")
     quantity = models.PositiveIntegerField(default=1, verbose_name="Количество")
     unit_price = models.DecimalField(max_digits=12, decimal_places=2, verbose_name="Цена за единицу")
 
