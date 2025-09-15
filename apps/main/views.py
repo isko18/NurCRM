@@ -31,9 +31,9 @@ from apps.main.serializers import (
     ReviewSerializer, NotificationSerializer, EventSerializer,
     WarehouseSerializer, WarehouseEventSerializer,
     ProductCategorySerializer, ProductBrandSerializer,
-    OrderItemSerializer, ClientSerializer, ClientDealSerializer, BidSerializers, SocialApplicationsSerializers, TransactionRecordSerializer, ContractorWorkSerializer, DebtSerializer, DebtPaymentSerializer, ObjectItemSerializer, ObjectSaleSerializer, ObjectSaleItemSerializer, 
+    OrderItemSerializer, ClientSerializer, ClientDealSerializer, BidSerializers, SocialApplicationsSerializers, TransactionRecordSerializer, ContractorWorkSerializer, DebtSerializer, DebtPaymentSerializer, ObjectItemSerializer, ObjectSaleSerializer, ObjectSaleItemSerializer, BulkIdsSerializer
 )
-
+from django.db.models import ProtectedError
 
 class CompanyRestrictedMixin:
     permission_classes = [permissions.IsAuthenticated]
@@ -322,6 +322,62 @@ class ProductRetrieveUpdateDestroyAPIView(CompanyRestrictedMixin, generics.Retri
     serializer_class = ProductSerializer
     queryset = Product.objects.select_related("brand", "category").all()
 
+class ProductBulkDeleteAPIView(CompanyRestrictedMixin, APIView):
+    """
+    DELETE /api/main/products/bulk-delete/
+    Body: {"ids": [...], "soft": false, "require_all": false}
+    """
+    def delete(self, request, *args, **kwargs):
+        serializer = BulkIdsSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        ids = serializer.validated_data["ids"]
+        soft = serializer.validated_data["soft"]
+        require_all = serializer.validated_data["require_all"]
+
+        # найдём продукты заранее, чтобы отделить "не найдено"
+        qs = Product.objects.filter(id__in=ids)
+        found_map = {p.id: p for p in qs}
+        not_found = [str(id_) for id_ in ids if id_ not in found_map]
+
+        results = {"deleted": [], "protected": [], "not_found": not_found}
+
+        def _delete_one(p: Product):
+            try:
+                if soft and hasattr(p, "is_active"):
+                    p.is_active = False
+                    p.save(update_fields=["is_active"])
+                else:
+                    p.delete()
+                results["deleted"].append(str(p.id))
+            except ProtectedError:
+                results["protected"].append(str(p.id))
+
+        if require_all:
+            # либо все успешно, либо ничего
+            try:
+                with transaction.atomic():
+                    for p in found_map.values():
+                        _delete_one(p)
+                    # если хоть один защищённый — ошибка, откатываем
+                    if results["protected"]:
+                        raise ProtectedError("protected", None)
+            except ProtectedError:
+                return Response(
+                    {
+                        "detail": "Некоторые продукты защищены связями, удаление откатено.",
+                        "protected": results["protected"],
+                        "not_found": results["not_found"],
+                    },
+                    status=status.HTTP_409_CONFLICT,
+                )
+            return Response(results, status=status.HTTP_200_OK)
+
+        # частичный режим: удаляем что можем
+        for p in found_map.values():
+            _delete_one(p)
+
+        http_status = status.HTTP_200_OK if not results["protected"] else status.HTTP_207_MULTI_STATUS
+        return Response(results, status=http_status)
 
 class ReviewListCreateAPIView(CompanyRestrictedMixin, generics.ListCreateAPIView):
     serializer_class = ReviewSerializer
