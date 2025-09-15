@@ -1168,7 +1168,7 @@ class ObjectSale(models.Model):
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     company = models.ForeignKey(Company, on_delete=models.CASCADE, related_name="object_sales", verbose_name="Компания")
-    client = models.ForeignKey("main.Client", on_delete=models.PROTECT, related_name="object_sales", verbose_name="Клиент")
+    client = models.ForeignKey("main.Client",blank=True, null=True, on_delete=models.SET_NULL, related_name="object_sales", verbose_name="Клиент")
 
     status = models.CharField("Статус", max_length=16, choices=Status.choices, default=Status.NEW)
     sold_at = models.DateField("Дата продажи", default=timezone.localdate)
