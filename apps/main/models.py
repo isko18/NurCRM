@@ -491,7 +491,7 @@ class SaleItem(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False, verbose_name="ID")
     company = models.ForeignKey(Company, on_delete=models.CASCADE, related_name="sale_items", verbose_name="Компания")
     sale = models.ForeignKey(Sale, on_delete=models.CASCADE, related_name="items", verbose_name="Продажа")
-    product = models.ForeignKey(Product, on_delete=models.PROTECT, related_name="sale_items", verbose_name="Товар")
+    product = models.ForeignKey(Product,blank=True, null=True, on_delete=models.SET_NULL, related_name="sale_items", verbose_name="Товар")
     name_snapshot = models.CharField(max_length=255, verbose_name="Название товара (снимок)")
     barcode_snapshot = models.CharField(max_length=64, null=True, blank=True, verbose_name="Штрихкод (снимок)")
     unit_price = models.DecimalField(max_digits=12, decimal_places=2, verbose_name="Цена за единицу")
