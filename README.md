@@ -11,10 +11,11 @@
    ```python
    ./venv/Scripts/activate
    ```
-   3. **Установка зависимостей**
-      ```python
-      pip install -r requirements.txt
-      ```
+   **3.Установка зависимостей**
+
+   ```python
+   pip install -r requirements.txt
+   ```
    4. **Миграции**
       ```python
       python manage.py makemigrations

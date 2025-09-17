@@ -515,7 +515,7 @@ class SaleListAPIView(CompanyRestrictedMixin, generics.ListAPIView):
         return qs
 
 
-class SaleRetrieveAPIView(generics.RetrieveAPIView):
+class SaleRetrieveAPIView(generics.RetrieveUpdateDestroyAPIView):
     """
     GET /api/main/pos/sales/<uuid:pk>/
     Детальная продажа с её позициями.
@@ -527,7 +527,7 @@ class SaleRetrieveAPIView(generics.RetrieveAPIView):
         return get_object_or_404(
             Sale.objects.select_related("user").prefetch_related("items__product"),
             id=self.kwargs["pk"],
-            company=self.request.user.company,
+            company=self.request.user.company,  
         )
 
 
