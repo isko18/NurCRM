@@ -14,7 +14,8 @@ from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 from decimal import Decimal, ROUND_HALF_UP
 import qrcode
-import io, os
+import io, os, uuid
+from django.db.models import Q
 
 from apps.main.models import Cart, CartItem, Sale, Product, MobileScannerToken, Client
 from .pos_serializers import (
@@ -530,7 +531,70 @@ class SaleRetrieveAPIView(generics.RetrieveUpdateDestroyAPIView):
             company=self.request.user.company,  
         )
 
+class SaleBulkDeleteAPIView(APIView):
+    """
+    DELETE /api/main/pos/sales/bulk-delete/
+    Body:
+      {
+        "ids": ["uuid1", "uuid2", ...],
+        "allow_paid": false   # опционально: разрешить удаление оплаченных
+      }
+    Ответ:
+      {
+        "deleted": 3,
+        "not_found": ["uuidX", ...],
+        "not_allowed": ["uuidY", ...]
+      }
+    """
+    permission_classes = [permissions.IsAuthenticated]
 
+    @transaction.atomic
+    def delete(self, request, *args, **kwargs):
+        ids = request.data.get("ids")
+        allow_paid = bool(request.data.get("allow_paid", False))
+        if not isinstance(ids, list) or not ids:
+            return Response({"detail": "Укажите непустой список 'ids'."}, status=400)
+
+        # валидируем UUID (чтобы не падать на мусорных значениях)
+        valid_ids, invalid_ids = [], []
+        for x in ids:
+            try:
+                valid_ids.append(uuid.UUID(str(x)))
+            except Exception:
+                invalid_ids.append(str(x))
+
+        if not valid_ids and invalid_ids:
+            return Response({"detail": "Нет валидных UUID.", "invalid_ids": invalid_ids}, status=400)
+
+        # продажи только своей компании
+        base_qs = Sale.objects.filter(company=request.user.company, id__in=valid_ids)
+
+        # делим на разрешённые к удалению и запрещённые (например, оплаченные)
+        if allow_paid:
+            deletable_qs = base_qs
+            not_allowed_ids = []
+        else:
+            deletable_qs = base_qs.exclude(status=Sale.Status.PAID)
+            not_allowed_ids = list(
+                base_qs.filter(status=Sale.Status.PAID).values_list("id", flat=True)
+            )
+
+        # найдены в принципе?
+        found_ids = set(str(sid) for sid in base_qs.values_list("id", flat=True))
+        not_found_ids = [str(x) for x in valid_ids if str(x) not in found_ids]
+
+        # удаляем (с каскадом по items)
+        deleted_count, _ = deletable_qs.delete()
+
+        return Response(
+            {
+                "deleted": deleted_count,     # количество удалённых объектов (включая каскад может быть > продаж)
+                "not_found": not_found_ids + invalid_ids,
+                "not_allowed": [str(x) for x in not_allowed_ids],
+            },
+            status=200,
+        )
+        
 class CartItemUpdateDestroyAPIView(APIView):
     """
     PATCH /api/main/pos/carts/<uuid:cart_id>/items/<uuid:item_id>/
