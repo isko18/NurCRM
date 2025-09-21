@@ -225,17 +225,18 @@ class OrderSerializer(serializers.ModelSerializer):
             OrderItemSerializer(context=self.context).create(item_data)
 
         return order
-
 class ProductSerializer(serializers.ModelSerializer):
     company = serializers.ReadOnlyField(source="company.id")
 
     brand = serializers.CharField(source="brand.name", read_only=True)
     category = serializers.CharField(source="category.name", read_only=True)
-    item_make_name = serializers.CharField(source="item_make.name", read_only=True)
+    item_make_names = serializers.SerializerMethodField(read_only=True)  # список названий
 
     brand_name = serializers.CharField(write_only=True, required=False, allow_blank=True)
     category_name = serializers.CharField(write_only=True, required=False, allow_blank=True)
-    item_make = serializers.PrimaryKeyRelatedField(queryset=ItemMake.objects.all(), required=False, allow_null=True)
+    item_make = serializers.PrimaryKeyRelatedField(
+        queryset=ItemMake.objects.all(), many=True, required=False
+    )
 
     client = serializers.PrimaryKeyRelatedField(
         queryset=Client.objects.all(), required=False, allow_null=True
@@ -251,7 +252,7 @@ class ProductSerializer(serializers.ModelSerializer):
             "id", "name", "barcode",
             "brand", "brand_name",
             "category", "category_name",
-            "item_make", "item_make_name",
+            "item_make", "item_make_names",
             "quantity", "price", "purchase_price",
             "status", "status_display",
             "company",
@@ -261,7 +262,7 @@ class ProductSerializer(serializers.ModelSerializer):
         read_only_fields = [
             "id", "created_at", "updated_at",
             "company", "name", "brand", "category",
-            "client_name", "status_display", "item_make_name",
+            "client_name", "status_display", "item_make_names",
         ]
         extra_kwargs = {
             "price": {"required": False, "default": 0},
@@ -269,70 +270,20 @@ class ProductSerializer(serializers.ModelSerializer):
             "quantity": {"required": False, "default": 0},
         }
 
-    def _ensure_company_brand(self, company, global_brand):
-        if global_brand:
-            brand, _ = ProductBrand.objects.get_or_create(company=company, name=global_brand.name)
-            return brand
-        return None
-
-    def _ensure_company_category(self, company, global_category):
-        if global_category:
-            category, _ = ProductCategory.objects.get_or_create(company=company, name=global_category.name)
-            return category
-        return None
-
-    def validate_status(self, value):
-        if value in ("", None):
-            return None
-        v = str(value).strip().lower()
-        mapping = {
-            "pending": Product.Status.PENDING,
-            "accepted": Product.Status.ACCEPTED,
-            "rejected": Product.Status.REJECTED,
-            "ожидание": Product.Status.PENDING,
-            "принят": Product.Status.ACCEPTED,
-            "отказ": Product.Status.REJECTED,
-        }
-        if v in mapping:
-            return mapping[v]
-        valid_codes = {c[0] for c in Product.Status.choices}
-        if value in valid_codes:
-            return value
-        raise serializers.ValidationError(
-            f"Недопустимый статус. Допустимые: {', '.join(sorted(valid_codes))}."
-        )
-
-    def validate_barcode(self, value):
-        value = str(value).strip()
-        if not value:
-            raise serializers.ValidationError("Укажите штрих-код.")
-        company = self.context["request"].user.company
-        qs = Product.objects.filter(company=company, barcode=value)
-        if self.instance:
-            qs = qs.exclude(pk=self.instance.pk)
-        if qs.exists():
-            raise serializers.ValidationError("В вашей компании уже есть товар с таким штрих-кодом.")
-        return value
-
-    def validate(self, attrs):
-        company = self.context["request"].user.company
-        client = attrs.get("client") or (self.instance.client if self.instance else None)
-        if client and client.company_id != company.id:
-            raise serializers.ValidationError({"client": "Клиент принадлежит другой компании."})
-        return attrs
+    def get_item_make_names(self, obj):
+        return [im.name for im in obj.item_make.all()]
 
     @transaction.atomic
     def create(self, validated_data):
-        request = self.context["request"]
-        company = request.user.company
-        barcode = validated_data.get("barcode")
+        item_make_data = validated_data.pop("item_make", [])
+        company = self.context["request"].user.company
 
         client = validated_data.pop("client", None)
         brand_name = (validated_data.pop("brand_name", "") or "").strip()
         category_name = (validated_data.pop("category_name", "") or "").strip()
-        item_make = validated_data.pop("item_make", None)
         status_value = validated_data.pop("status", None)
 
+        barcode = validated_data.get("barcode")
         gp = GlobalProduct.objects.select_related("brand", "category").filter(barcode=barcode).first()
         if not gp:
             raise serializers.ValidationError({
@@ -354,9 +305,13 @@ class ProductSerializer(serializers.ModelSerializer):
             purchase_price=validated_data.get("purchase_price", 0),
             quantity=validated_data.get("quantity", 0),
             client=client,
-            item_make=item_make,
             status=status_value,
         )
+
+        # Связываем все ItemMake
+        if item_make_data:
+            product.item_make.set(item_make_data)
+
         return product
 
     @transaction.atomic
@@ -372,21 +327,15 @@ class ProductSerializer(serializers.ModelSerializer):
 
         # обновляем item_make, если передано
         if "item_make" in validated_data:
-            instance.item_make = validated_data["item_make"]
+            instance.item_make.set(validated_data.pop("item_make"))
 
-        for field in ("barcode", "quantity", "price", "purchase_price", "client"):
+        for field in ("barcode", "quantity", "price", "purchase_price", "client", "status"):
             if field in validated_data:
                 setattr(instance, field, validated_data[field])
 
-        if "status" in validated_data:
-            instance.status = validated_data["status"]
-
-        instance.save(update_fields=[
-            "brand_id", "category_id", "barcode", "quantity",
-            "price", "purchase_price", "client_id", "status", "item_make_id", "updated_at"
-        ])
+        instance.save()
         return instance
-    
+
 class ReviewSerializer(serializers.ModelSerializer):
     user = serializers.ReadOnlyField(source='user.id')
     company = serializers.ReadOnlyField(source='company.id')

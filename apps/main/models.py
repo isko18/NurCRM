@@ -328,13 +328,11 @@ class Product(models.Model):
     )
 
     # 🔹 связь с ItemMake (необязательная)
-    item_make = models.ForeignKey(
+    item_make = models.ManyToManyField(
         "ItemMake",
-        on_delete=models.SET_NULL,
-        null=True,
         blank=True,
         related_name="products",
-        verbose_name="Единица товара"
+        verbose_name="Единицы товара"
     )
 
     created_at = models.DateTimeField(auto_now_add=True)
