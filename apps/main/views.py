@@ -1032,18 +1032,16 @@ class ItemListCreateAPIView(CompanyRestrictedMixin, generics.ListCreateAPIView):
 
     def get_queryset(self):
         """
-        Ограничиваем queryset объектами компании пользователя, если нужно.
+        Ограничиваем queryset объектами компании пользователя.
         """
         qs = super().get_queryset()
         company = getattr(self.request.user, "company", None)
         if company:
-            qs = qs.filter(products__company=company).distinct()
+            qs = qs.filter(company=company).distinct()
         return qs
 
     def perform_create(self, serializer):
-        # company берется через Product.item_make (если нужно)
-        serializer.save()
-
+        serializer.save(company=self.request.user.company)
 
 class ItemRetrieveUpdateDestroyAPIView(CompanyRestrictedMixin, generics.RetrieveUpdateDestroyAPIView):
     """
