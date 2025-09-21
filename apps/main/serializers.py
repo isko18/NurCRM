@@ -802,12 +802,15 @@ class BulkIdsSerializer(serializers.Serializer):
     require_all = serializers.BooleanField(required=False, default=False)
     
 
+class ProductNestedSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Product
+        fields = ["id", "name", "barcode", "quantity", "price"]
+
+
 class ItemMakeSerializer(serializers.ModelSerializer):
-    # Список связанных продуктов (необязательное поле)
-    products = serializers.PrimaryKeyRelatedField(
-        many=True,
-        read_only=True
-    )
+    # GET: показываем детальные объекты продуктов
+    products = ProductNestedSerializer(many=True, read_only=True)
     company = serializers.ReadOnlyField(source="company.id")  # вывод id компании
 
     class Meta:
@@ -819,7 +822,7 @@ class ItemMakeSerializer(serializers.ModelSerializer):
             "price",
             "unit",
             "quantity",
-            "products",  # список связанных продуктов
+            "products",  # список связанных продуктов с деталями
             "created_at",
             "updated_at",
         ]
