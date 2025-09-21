@@ -127,6 +127,9 @@ urlpatterns = [
     path("object-sales/", ObjectSaleListCreateAPIView.as_view()),
     path("object-sales/<uuid:pk>/", ObjectSaleRetrieveUpdateDestroyAPIView.as_view()),
     path("object-sales/<uuid:sale_id>/items/", ObjectSaleAddItemAPIView.as_view()),
+    
+    path("items-make/", ItemListCreateAPIView.as_view(), name="item-make-list-create"),
+    path("items-make/<uuid:pk>/", ItemRetrieveUpdateDestroyAPIView.as_view(), name="item-make-detail"),
 ]
 
 

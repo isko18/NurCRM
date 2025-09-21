@@ -341,8 +341,43 @@ class Product(models.Model):
     def __str__(self):
         return self.name
 
+class ItemMake(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
 
+    company = models.ForeignKey(
+        "Company",
+        on_delete=models.CASCADE,
+        related_name="items_make",
+        verbose_name="Компания"
+    )
 
+    product = models.ForeignKey(
+        "Product",
+        on_delete=models.CASCADE,
+        related_name="items",
+        verbose_name="Товар"
+    )
+
+    name = models.CharField("Название", max_length=255)
+    price = models.DecimalField("Цена", max_digits=10, decimal_places=2, default=0)
+    unit = models.CharField("Единица измерения", max_length=50)  # шт, кг, л и т.д.
+    quantity = models.PositiveIntegerField("Количество", default=0)
+
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = "Единица товара"
+        verbose_name_plural = "Единицы товаров"
+        indexes = [
+            models.Index(fields=["company", "product"]),
+        ]
+        unique_together = ("company", "product", "name")
+
+    def __str__(self):
+        return f"{self.name} ({self.quantity} {self.unit})"
+    
+    
 class Cart(models.Model):
     class Status(models.TextChoices):
         ACTIVE = "active", "Активна"
@@ -625,7 +660,7 @@ class Analytics(models.Model):
     company = models.ForeignKey(Company, on_delete=models.CASCADE, related_name='analytics')
 
     type = models.CharField(max_length=20, choices=TYPE_CHOICES)
-    data = models.JSONField()  # Пример: {"metric": "total_sales", "value": 150000, "date": "2025-06-01"}
+    data = models.JSONField()
 
     created_at = models.DateTimeField(auto_now_add=True)
 
