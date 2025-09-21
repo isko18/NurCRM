@@ -1017,25 +1017,37 @@ class ObjectSaleAddItemAPIView(CompanyRestrictedMixin, APIView):
 
 class ItemListCreateAPIView(CompanyRestrictedMixin, generics.ListCreateAPIView):
     """
-    GET  /api/main/items/      — список товаров компании
-    POST /api/main/items/      — создание нового товара
+    GET  /api/main/items/      — список единиц товаров компании
+    POST /api/main/items/      — создание новой единицы товара
     """
     serializer_class = ItemMakeSerializer
     queryset = ItemMake.objects.all()
     filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
-    search_fields = ["name", "product__name"]
-    filterset_fields = ["product", "unit", "price"]
+
+    # поиск по имени единицы и по названию связанных продуктов
+    search_fields = ["name", "products__name"]
+    filterset_fields = ["unit", "price", "quantity", "products"]
     ordering_fields = ["created_at", "updated_at", "price", "quantity", "name"]
     ordering = ["-created_at"]
 
+    def get_queryset(self):
+        """
+        Ограничиваем queryset объектами компании пользователя, если нужно.
+        """
+        qs = super().get_queryset()
+        company = getattr(self.request.user, "company", None)
+        if company:
+            qs = qs.filter(products__company=company).distinct()
+        return qs
+
     def perform_create(self, serializer):
-        # company автоматически берется из миксина
-        super().perform_create(serializer)
+        # company берется через Product.item_make (если нужно)
+        serializer.save()
 
 
 class ItemRetrieveUpdateDestroyAPIView(CompanyRestrictedMixin, generics.RetrieveUpdateDestroyAPIView):
     """
-    GET    /api/main/items/<uuid:pk>/   — просмотр
+    GET    /api/main/items/<uuid:pk>/   — просмотр единицы товара
     PATCH  /api/main/items/<uuid:pk>/   — частичное обновление
     PUT    /api/main/items/<uuid:pk>/   — полное обновление
     DELETE /api/main/items/<uuid:pk>/   — удаление

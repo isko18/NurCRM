@@ -327,6 +327,16 @@ class Product(models.Model):
         blank=True, null=True
     )
 
+    # 🔹 связь с ItemMake (необязательная)
+    item_make = models.ForeignKey(
+        "ItemMake",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="products",
+        verbose_name="Единица товара"
+    )
+
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -335,21 +345,20 @@ class Product(models.Model):
         verbose_name = 'Товар'
         verbose_name_plural = 'Товары'
         indexes = [
-            models.Index(fields=['company', 'status']),   # удобно для фильтров по статусу
+            models.Index(fields=['company', 'status']),
         ]
 
     def __str__(self):
         return self.name
-
+    
 class ItemMake(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
 
-    company = models.ForeignKey("users.Company", on_delete=models.PROTECT)
-    product = models.ForeignKey(
-        "Product",
-        on_delete=models.CASCADE,
-        related_name="items",
-        verbose_name="Товар"
+    company = models.ForeignKey(
+        "users.Company",  # или просто Company, если импортирован
+        on_delete=models.PROTECT,
+        related_name="item_makes",
+        verbose_name="Компания"
     )
 
     name = models.CharField("Название", max_length=255)
@@ -364,9 +373,9 @@ class ItemMake(models.Model):
         verbose_name = "Единица товара"
         verbose_name_plural = "Единицы товаров"
         indexes = [
-            models.Index(fields=["company", "product"]),
+            models.Index(fields=["company", "name"]),  # удобный индекс по компании и имени
         ]
-        unique_together = ("company", "product", "name")
+        # unique_together = ("company", "name")  # если нужно уникальное имя внутри компании
 
     def __str__(self):
         return f"{self.name} ({self.quantity} {self.unit})"
