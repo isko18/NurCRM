@@ -23,7 +23,7 @@ from apps.main.models import (
     Order, Product, Review, Notification, Event,
     ProductBrand, ProductCategory, Warehouse, WarehouseEvent, Client,
     GlobalProduct, GlobalBrand, GlobalCategory, ClientDeal, Bid, SocialApplications, TransactionRecord,
-    ContractorWork, DealInstallment, DebtPayment, Debt, ObjectSaleItem, ObjectSale, ObjectItem
+    ContractorWork, DealInstallment, DebtPayment, Debt, ObjectSaleItem, ObjectSale, ObjectItem, ItemMake
 )
 from apps.main.serializers import (
     ContactSerializer, PipelineSerializer, DealSerializer, TaskSerializer,
@@ -31,7 +31,7 @@ from apps.main.serializers import (
     ReviewSerializer, NotificationSerializer, EventSerializer,
     WarehouseSerializer, WarehouseEventSerializer,
     ProductCategorySerializer, ProductBrandSerializer,
-    OrderItemSerializer, ClientSerializer, ClientDealSerializer, BidSerializers, SocialApplicationsSerializers, TransactionRecordSerializer, ContractorWorkSerializer, DebtSerializer, DebtPaymentSerializer, ObjectItemSerializer, ObjectSaleSerializer, ObjectSaleItemSerializer, BulkIdsSerializer
+    OrderItemSerializer, ClientSerializer, ClientDealSerializer, BidSerializers, SocialApplicationsSerializers, TransactionRecordSerializer, ContractorWorkSerializer, DebtSerializer, DebtPaymentSerializer, ObjectItemSerializer, ObjectSaleSerializer, ObjectSaleItemSerializer, BulkIdsSerializer, ItemMakeSerializer
 )
 from django.db.models import ProtectedError
 
@@ -1012,3 +1012,33 @@ class ObjectSaleAddItemAPIView(CompanyRestrictedMixin, APIView):
         )
         sale.recalc()
         return Response(ObjectSaleItemSerializer(item).data, status=status.HTTP_201_CREATED)
+
+
+
+class ItemListCreateAPIView(CompanyRestrictedMixin, generics.ListCreateAPIView):
+    """
+    GET  /api/main/items/      — список товаров компании
+    POST /api/main/items/      — создание нового товара
+    """
+    serializer_class = ItemMakeSerializer
+    queryset = ItemMake.objects.all()
+    filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
+    search_fields = ["name", "product__name"]
+    filterset_fields = ["product", "unit", "price"]
+    ordering_fields = ["created_at", "updated_at", "price", "quantity", "name"]
+    ordering = ["-created_at"]
+
+    def perform_create(self, serializer):
+        # company автоматически берется из миксина
+        super().perform_create(serializer)
+
+
+class ItemRetrieveUpdateDestroyAPIView(CompanyRestrictedMixin, generics.RetrieveUpdateDestroyAPIView):
+    """
+    GET    /api/main/items/<uuid:pk>/   — просмотр
+    PATCH  /api/main/items/<uuid:pk>/   — частичное обновление
+    PUT    /api/main/items/<uuid:pk>/   — полное обновление
+    DELETE /api/main/items/<uuid:pk>/   — удаление
+    """
+    serializer_class = ItemMakeSerializer
+    queryset = ItemMake.objects.all()

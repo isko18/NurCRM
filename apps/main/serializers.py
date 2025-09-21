@@ -1,5 +1,5 @@
 from rest_framework import serializers
-from apps.main.models import Contact, Pipeline, Deal, Task, Integration, Analytics, Order, Product, Review, Notification, Event, Warehouse, WarehouseEvent, ProductCategory, ProductBrand, OrderItem, Client, GlobalProduct, CartItem, ClientDeal, Bid, SocialApplications, TransactionRecord, DealInstallment, ContractorWork, Debt, DebtPayment, ObjectItem, ObjectSale, ObjectSaleItem
+from apps.main.models import Contact, Pipeline, Deal, Task, Integration, Analytics, Order, Product, Review, Notification, Event, Warehouse, WarehouseEvent, ProductCategory, ProductBrand, OrderItem, Client, GlobalProduct, CartItem, ClientDeal, Bid, SocialApplications, TransactionRecord, DealInstallment, ContractorWork, Debt, DebtPayment, ObjectItem, ObjectSale, ObjectSaleItem, ItemMake
 from apps.construction.models import Department
 from apps.users.models import User, Company
 from django.db import transaction
@@ -850,3 +850,44 @@ class BulkIdsSerializer(serializers.Serializer):
     soft = serializers.BooleanField(required=False, default=False)
     # если хотите всё-или-ничего (транзакция)
     require_all = serializers.BooleanField(required=False, default=False)
+    
+    
+class ItemMakeSerializer(serializers.ModelSerializer):
+    company = serializers.ReadOnlyField(source="company.id")
+    product_name = serializers.CharField(source="product.name", read_only=True)
+
+    product = serializers.PrimaryKeyRelatedField(
+        queryset=Product.objects.all()
+    )
+
+    class Meta:
+        model = ItemMake
+        fields = [
+            "id",
+            "company",
+            "product",
+            "product_name",
+            "name",
+            "price",
+            "unit",
+            "quantity",
+            "created_at",
+            "updated_at",
+        ]
+        read_only_fields = ["id", "created_at", "updated_at", "company", "product_name"]
+
+    def validate_product(self, value):
+        """Проверяем, что продукт принадлежит той же компании."""
+        company = self.context["request"].user.company
+        if value.company_id != company.id:
+            raise serializers.ValidationError("Продукт принадлежит другой компании.")
+        return value
+
+    def create(self, validated_data):
+        validated_data["company"] = self.context["request"].user.company
+        return super().create(validated_data)
+
+    def update(self, instance, validated_data):
+        # company не меняется
+        validated_data.pop("company", None)
+        return super().update(instance, validated_data)

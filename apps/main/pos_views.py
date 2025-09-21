@@ -532,20 +532,6 @@ class SaleRetrieveAPIView(generics.RetrieveUpdateDestroyAPIView):
         )
 
 class SaleBulkDeleteAPIView(APIView):
-    """
-    DELETE /api/main/pos/sales/bulk-delete/
-    Body:
-      {
-        "ids": ["uuid1", "uuid2", ...],
-        "allow_paid": false   # опционально: разрешить удаление оплаченных
-      }
-    Ответ:
-      {
-        "deleted": 3,
-        "not_found": ["uuidX", ...],
-        "not_allowed": ["uuidY", ...]
-      }
-    """
     permission_classes = [permissions.IsAuthenticated]
 
     @transaction.atomic
