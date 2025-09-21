@@ -165,16 +165,48 @@ def reject_products(modeladmin, request, queryset):
 def clear_status(modeladmin, request, queryset):
     queryset.update(status=None)
 
+from django.contrib import admin
+from .models import Product, ItemMake, ProductBrand, ProductCategory, Client, Company
+
+@admin.register(ItemMake)
+class ItemMakeAdmin(admin.ModelAdmin):
+    list_display = ("name", "unit", "quantity", "price", "created_at")
+    search_fields = ("name",)
+    list_filter = ("unit",)
+    ordering = ("name",)
+
+
+class ItemMakeInline(admin.TabularInline):
+    model = Product.item_make.through
+    extra = 1
+    verbose_name = "Единица товара"
+    verbose_name_plural = "Единицы товара"
+
 
 @admin.register(Product)
 class ProductAdmin(admin.ModelAdmin):
-    list_display = ("name", "company", "brand", "category", "barcode", "quantity", "purchase_price", "price", "status", "updated_at")
-    list_filter = ("company", "brand", "category", "status", "updated_at")
+    list_display = ("name", "barcode", "company", "brand", "category", "quantity", "price", "status")
+    list_filter = ("company", "brand", "category", "status")
     search_fields = ("name", "barcode")
-    list_select_related = ("company", "brand", "category")
-    autocomplete_fields = ("brand", "category", "client")
-    actions = (accept_products, reject_products, clear_status)
+    ordering = ("name",)
+    inlines = [ItemMakeInline]
+    exclude = ("item_make",)  # так как мы используем inline для M2M
     readonly_fields = ("created_at", "updated_at")
+
+    fieldsets = (
+        (None, {
+            "fields": ("name", "barcode", "company", "client", "status")
+        }),
+        ("Цены и количество", {
+            "fields": ("price", "purchase_price", "quantity")
+        }),
+        ("Категории и бренд", {
+            "fields": ("brand", "category")
+        }),
+        ("Даты", {
+            "fields": ("created_at", "updated_at")
+        }),
+    )
 
 
 @admin.register(Cart)
