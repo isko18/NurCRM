@@ -741,7 +741,6 @@ class WarehouseEvent(models.Model):
         verbose_name_plural = 'Складские события'
         ordering = ['event_date']
           
-
 class Client(models.Model):
     class Status(models.TextChoices):
         NEW = "new", "Новый"
@@ -754,7 +753,7 @@ class Client(models.Model):
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False, verbose_name="ID клиента")
     company = models.ForeignKey(
-        "Company", on_delete=models.CASCADE, related_name="clients", verbose_name="Компания"
+        Company, on_delete=models.CASCADE, related_name="clients", verbose_name="Компания"
     )
     type = models.CharField(
         "Тип клиента", max_length=16, choices=StatusClient.choices, default=StatusClient.CLIENT, null=True, blank=True
