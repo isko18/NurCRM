@@ -754,18 +754,25 @@ class Client(models.Model):
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False, verbose_name="ID клиента")
     company = models.ForeignKey(
-        Company, on_delete=models.CASCADE, related_name="clients", verbose_name="Компания"
+        "Company", on_delete=models.CASCADE, related_name="clients", verbose_name="Компания"
     )
     type = models.CharField(
-        "Тип клиента", max_length=16, choices=StatusClient.choices, default=StatusClient.CLIENT, null=True, blank=True)
+        "Тип клиента", max_length=16, choices=StatusClient.choices, default=StatusClient.CLIENT, null=True, blank=True
+    )
     enterprise = models.CharField("Предприятие O", max_length=255, blank=True, null=True)
     full_name = models.CharField("ФИО", max_length=255)
     phone = models.CharField("Телефон", max_length=32)
-    email = models.EmailField("Почта", blank=True)          # по желанию
+    email = models.EmailField("Почта", blank=True)
     date = models.DateField("Дата", null=True, blank=True)
-    status = models.CharField(
-        "Статус", max_length=16, choices=Status.choices, default=Status.NEW
-    )
+    status = models.CharField("Статус", max_length=16, choices=Status.choices, default=Status.NEW)
+
+    # Новые поля для юридических данных
+    llc = models.CharField("Название компании", max_length=255, blank=True, null=True)
+    inn = models.CharField("ИНН", max_length=32, blank=True, null=True)
+    okpo = models.CharField("ОКПО", max_length=32, blank=True, null=True)
+    score = models.CharField("Расчетный счет", max_length=64, blank=True, null=True)
+    bik = models.CharField("БИК", max_length=32, blank=True, null=True)
+    address = models.CharField("Адрес", max_length=255, blank=True, null=True)
 
     created_at = models.DateTimeField("Создано", auto_now_add=True)
     updated_at = models.DateTimeField("Обновлено", auto_now=True)
@@ -781,6 +788,7 @@ class Client(models.Model):
 
     def __str__(self):
         return f"{self.full_name} ({self.phone})"
+
     
 class ClientDeal(models.Model):
     class Kind(models.TextChoices):

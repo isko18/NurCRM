@@ -519,8 +519,6 @@ class SubscriptionPlanSerializer(serializers.ModelSerializer):
         model = SubscriptionPlan
         fields = ['id', 'name', 'price', 'description', 'features']
 
-
-# 🏢 Компания
 class CompanySerializer(serializers.ModelSerializer):
     industry = IndustrySerializer(read_only=True)
     subscription_plan = SubscriptionPlanSerializer(read_only=True)
@@ -542,10 +540,15 @@ class CompanySerializer(serializers.ModelSerializer):
             'can_view_documents',
             'can_view_whatsapp',
             'can_view_instagram',
-            'can_view_telegram'
+            'can_view_telegram',
+            # новые поля
+            'llc',
+            'inn',
+            'okpo',
+            'score',
+            'bik',
+            'address',
         ]
-
-
 # ✏️ Обновление сотрудника
 class EmployeeUpdateSerializer(serializers.ModelSerializer):
     role_display = serializers.CharField(read_only=True)

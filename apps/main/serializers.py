@@ -510,15 +510,16 @@ class ClientSerializer(serializers.ModelSerializer):
     class Meta:
         model = Client
         fields = [
-            'id', 'type','full_name', 'phone', 'email', 'date', 'status',
+            'id', 'type', 'full_name', 'phone', 'email', 'date', 'status',
+            'llc', 'inn', 'okpo', 'score', 'bik', 'address',  # новые поля
             'company', 'created_at', 'updated_at'
         ]
         read_only_fields = ['id', 'company', 'created_at', 'updated_at']
 
     def create(self, validated_data):
+        # Автоматически привязываем компанию пользователя
         validated_data['company'] = self.context['request'].user.company
         return super().create(validated_data)
-    
     
 class DealInstallmentSerializer(serializers.ModelSerializer):
     class Meta:

@@ -190,25 +190,35 @@ class User(AbstractBaseUser, PermissionsMixin):
 class Company(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     name = models.CharField(max_length=255, verbose_name='Название компании')
-    subscription_plan = models.ForeignKey(SubscriptionPlan, on_delete=models.SET_NULL, null=True, blank=True)
+    subscription_plan = models.ForeignKey('SubscriptionPlan', on_delete=models.SET_NULL, null=True, blank=True)
     industry = models.ForeignKey(
-        Industry,
+        'Industry',
         on_delete=models.SET_NULL,
         null=True,
         blank=True,
         verbose_name='Вид деятельности'
     )
     sector = models.ForeignKey(
-        Sector,
+        'Sector',
         on_delete=models.SET_NULL,
         null=True,
         blank=True,
         verbose_name='Отрасль'
     )
     owner = models.OneToOneField('User', on_delete=models.CASCADE, related_name='owned_company', verbose_name='Владелец компании')
+
+    # Новые поля юридических/банковских данных
+    llc = models.CharField("Название компании", max_length=255, blank=True, null=True)
+    inn = models.CharField("ИНН", max_length=32, blank=True, null=True)
+    okpo = models.CharField("ОКПО", max_length=32, blank=True, null=True)
+    score = models.CharField("Расчетный счет", max_length=64, blank=True, null=True)
+    bik = models.CharField("БИК", max_length=32, blank=True, null=True)
+    address = models.CharField("Адрес", max_length=255, blank=True, null=True)
+
     created_at = models.DateTimeField(auto_now_add=True, verbose_name='Дата создания')
     start_date = models.DateTimeField(verbose_name='Дата начала', blank=True, null=True)
     end_date = models.DateTimeField(verbose_name='Дата окончания', blank=True, null=True) 
+
     can_view_documents = models.BooleanField(default=False, verbose_name='Доступ к документам')
     can_view_whatsapp = models.BooleanField(default=False, verbose_name='Доступ к whatsapp')
     can_view_instagram = models.BooleanField(default=False, verbose_name='Доступ к instagram')
