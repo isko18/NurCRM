@@ -141,6 +141,7 @@ class OrderRetrieveUpdateDestroyAPIView(CompanyRestrictedMixin, generics.Retriev
     serializer_class = OrderSerializer
     queryset = Order.objects.all().prefetch_related("items__product")
     
+    
 class ProductCreateByBarcodeAPIView(generics.CreateAPIView):
     """
     Создание товара только по штрих-коду (если найден в глобальной базе).
@@ -189,7 +190,17 @@ class ProductCreateByBarcodeAPIView(generics.CreateAPIView):
         except Exception:
             return Response({"quantity": "Неверное количество."}, status=status.HTTP_400_BAD_REQUEST)
 
-        # ✅ создаём или берём локальные справочники
+        # Обработка даты
+        date_value = request.data.get("date")
+        if date_value:
+            try:
+                date_value = timezone.datetime.strptime(date_value, "%Y-%m-%d").date()
+            except ValueError:
+                return Response({"date": "Неверный формат даты. Используйте YYYY-MM-DD."}, status=400)
+        else:
+            date_value = timezone.now().date()
+
+        # создаём или берём локальные справочники
         brand = ProductBrand.objects.get_or_create(company=company, name=gp.brand.name)[0] if gp.brand else None
         category = ProductCategory.objects.get_or_create(company=company, name=gp.category.name)[0] if gp.category else None
 
@@ -201,11 +212,13 @@ class ProductCreateByBarcodeAPIView(generics.CreateAPIView):
             brand=brand,
             category=category,
             price=price,
-            purchase_price=purchase_price,  # ✅ добавили закупочную цену
+            purchase_price=purchase_price,
             quantity=quantity,
+            date=date_value,  # <- теперь сохраняем дату
         )
 
         return Response(self.get_serializer(product).data, status=status.HTTP_201_CREATED)
+
 
 class ProductCreateManualAPIView(generics.CreateAPIView):
     """
@@ -231,7 +244,6 @@ class ProductCreateManualAPIView(generics.CreateAPIView):
         }
         if v in mapping:
             return mapping[v]
-        # допускаем уже корректные коды
         codes = {c[0] for c in Product.Status.choices}
         if v in codes:
             return v
@@ -277,6 +289,16 @@ class ProductCreateManualAPIView(generics.CreateAPIView):
         except ValueError as e:
             return Response({"status": str(e)}, status=status.HTTP_400_BAD_REQUEST)
 
+        # дата
+        date_value = data.get("date")
+        if date_value:
+            try:
+                date_value = timezone.datetime.strptime(date_value, "%Y-%m-%d").date()
+            except ValueError:
+                return Response({"date": "Неверный формат даты. Используйте YYYY-MM-DD."}, status=400)
+        else:
+            date_value = timezone.now().date()
+
         # глобальные справочники (если переданы имена)
         brand_name = (data.get("brand_name") or "").strip()
         category_name = (data.get("category_name") or "").strip()
@@ -304,7 +326,8 @@ class ProductCreateManualAPIView(generics.CreateAPIView):
             purchase_price=purchase_price,
             quantity=quantity,
             client=client,
-            status=status_value,   # ← теперь статус точно сохранится
+            status=status_value,
+            date=date_value,  # <- сохраняем дату
         )
 
         # синхронизация в глобальную базу (если есть штрих-код)
@@ -315,8 +338,6 @@ class ProductCreateManualAPIView(generics.CreateAPIView):
             )
 
         return Response(self.get_serializer(product).data, status=status.HTTP_201_CREATED)
-
-
 
 class ProductRetrieveUpdateDestroyAPIView(CompanyRestrictedMixin, generics.RetrieveUpdateDestroyAPIView):
     serializer_class = ProductSerializer
