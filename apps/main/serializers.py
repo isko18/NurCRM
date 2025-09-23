@@ -4,6 +4,7 @@ from apps.construction.models import Department
 from apps.users.models import User, Company
 from django.db import transaction
 from decimal import Decimal
+from django.utils import timezone
 
 class SocialApplicationsSerializers(serializers.ModelSerializer):
     class Meta:
@@ -246,6 +247,13 @@ class ProductSerializer(serializers.ModelSerializer):
     status = serializers.CharField(required=False, allow_null=True, allow_blank=True)
     status_display = serializers.CharField(source="get_status_display", read_only=True)
 
+    date = serializers.DateField(
+        format="%Y-%m-%d",  # формат вывода
+        input_formats=["%Y-%m-%d", "%d-%m-%Y"],  # допустимые форматы ввода
+        required=False,
+        allow_null=True
+    )
+
     class Meta:
         model = Product
         fields = [
@@ -256,7 +264,7 @@ class ProductSerializer(serializers.ModelSerializer):
             "quantity", "price", "purchase_price",
             "status", "status_display",
             "company",
-            "client", "client_name",
+            "client", "client_name", "date",
             "created_at", "updated_at",
         ]
         read_only_fields = [
@@ -283,6 +291,11 @@ class ProductSerializer(serializers.ModelSerializer):
         category_name = (validated_data.pop("category_name", "") or "").strip()
         status_value = validated_data.pop("status", None)
 
+        # Обработка даты: если не передана, ставим текущую
+        date_value = validated_data.pop("date", None)
+        if date_value is None:
+            date_value = timezone.now().date()
+
         barcode = validated_data.get("barcode")
         gp = GlobalProduct.objects.select_related("brand", "category").filter(barcode=barcode).first()
         if not gp:
@@ -306,6 +319,7 @@ class ProductSerializer(serializers.ModelSerializer):
             quantity=validated_data.get("quantity", 0),
             client=client,
             status=status_value,
+            date=date_value
         )
 
         # Связываем все ItemMake
@@ -329,12 +343,23 @@ class ProductSerializer(serializers.ModelSerializer):
         if "item_make" in validated_data:
             instance.item_make.set(validated_data.pop("item_make"))
 
-        for field in ("barcode", "quantity", "price", "purchase_price", "client", "status"):
+        for field in ("barcode", "quantity", "price", "purchase_price", "client", "status", "date"):
             if field in validated_data:
                 setattr(instance, field, validated_data[field])
 
         instance.save()
         return instance
+
+    # Вспомогательные методы для работы с брендом и категорией
+    def _ensure_company_brand(self, company, brand):
+        if brand is None:
+            return None
+        return ProductBrand.objects.get_or_create(company=company, name=brand.name)[0]
+
+    def _ensure_company_category(self, company, category):
+        if category is None:
+            return None
+        return ProductCategory.objects.get_or_create(company=company, name=category.name)[0]
 
 class ReviewSerializer(serializers.ModelSerializer):
     user = serializers.ReadOnlyField(source='user.id')

@@ -334,7 +334,7 @@ class Product(models.Model):
         related_name="products",
         verbose_name="Единицы товара"
     )
-
+    date = models.DateTimeField(verbose_name="Дата")
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
