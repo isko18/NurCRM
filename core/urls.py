@@ -48,7 +48,7 @@ apps_includes = [
     path('cafe/', include('apps.cafe.urls')),   
     path('whatsapp/', include('apps.whatsapp.urls')), 
     path('storehouse/', include('apps.storehouse.urls')), 
-    path('сonsalting/', include('apps.сonsalting.urls')),
+    path('consalting/', include('apps.consalting.urls')),
     path('instagram/', include('apps.instagram.urls')),   
     
 ]
