@@ -226,11 +226,11 @@ class OrderSerializer(serializers.ModelSerializer):
             OrderItemSerializer(context=self.context).create(item_data)
 
         return order
-    
 class ItemMakeNestedSerializer(serializers.ModelSerializer):
     class Meta:
         model = ItemMake
         fields = ["id", "name", "price", "unit", "quantity"]
+
 
 class ProductSerializer(serializers.ModelSerializer):
     company = serializers.ReadOnlyField(source="company.id")
@@ -256,12 +256,8 @@ class ProductSerializer(serializers.ModelSerializer):
     status = serializers.CharField(required=False, allow_null=True, allow_blank=True)
     status_display = serializers.CharField(source="get_status_display", read_only=True)
 
-    date = serializers.DateField(
-        format="%Y-%m-%d",
-        input_formats=["%Y-%m-%d", "%d-%m-%Y"],
-        required=False,
-        allow_null=True
-    )
+    # date как read-only: безопасно возвращаем только дату (YYYY-MM-DD)
+    date = serializers.SerializerMethodField(read_only=True)
 
     class Meta:
         model = Product
@@ -279,13 +275,31 @@ class ProductSerializer(serializers.ModelSerializer):
         read_only_fields = [
             "id", "created_at", "updated_at",
             "company", "name", "brand", "category",
-            "client_name", "status_display",
+            "client_name", "status_display", "item_make",
+            "date",
         ]
         extra_kwargs = {
             "price": {"required": False, "default": 0},
             "purchase_price": {"required": False, "default": 0},
             "quantity": {"required": False, "default": 0},
         }
+
+    def get_date(self, obj):
+        """
+        Возвращаем только дату в формате YYYY-MM-DD или None.
+        Если в модели хранится datetime, аккуратно приводим к локальному времени.
+        """
+        dt = getattr(obj, "date", None)
+        if not dt:
+            return None
+        try:
+            # если aware — привести к локальной временной зоне
+            from django.utils import timezone as dj_tz
+            if dj_tz.is_aware(dt):
+                dt = dj_tz.localtime(dt)
+        except Exception:
+            pass
+        return dt.date().isoformat()
 
     def _ensure_company_brand(self, company, brand):
         if brand is None:
@@ -299,6 +313,7 @@ class ProductSerializer(serializers.ModelSerializer):
 
     @transaction.atomic
     def create(self, validated_data):
+        # берём список ID для M2M (если пришли)
         item_make_data = validated_data.pop("item_make_ids", [])
         company = self.context["request"].user.company
 
@@ -307,9 +322,8 @@ class ProductSerializer(serializers.ModelSerializer):
         category_name = (validated_data.pop("category_name", "") or "").strip()
         status_value = validated_data.pop("status", None)
 
-        date_value = validated_data.pop("date", None)
-        if date_value is None:
-            date_value = timezone.now().date()
+        # сохраняем datetime (timezone-aware), а не только date
+        date_value = timezone.now()
 
         barcode = validated_data.get("barcode")
         gp = GlobalProduct.objects.select_related("brand", "category").filter(barcode=barcode).first()
@@ -337,6 +351,7 @@ class ProductSerializer(serializers.ModelSerializer):
             date=date_value,
         )
 
+        # Связываем все ItemMake (если переданы)
         if item_make_data:
             product.item_make.set(item_make_data)
 
@@ -357,10 +372,11 @@ class ProductSerializer(serializers.ModelSerializer):
         if item_make_data is not None:
             instance.item_make.set(item_make_data)
 
-        for field in ("barcode", "quantity", "price", "purchase_price", "client", "status", "date"):
+        for field in ("barcode", "quantity", "price", "purchase_price", "client", "status"):
             if field in validated_data:
                 setattr(instance, field, validated_data[field])
 
+        # не принимаем date из тела (date — read-only). Если нужно — добавить отдельное write-only поле.
         instance.save()
         return instance
     
