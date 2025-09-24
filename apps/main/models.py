@@ -1,6 +1,7 @@
 from django.db import models
 import uuid, secrets
 from apps.users.models import User, Company
+from consalting.models import ServicesConsalting 
 from django.conf import settings
 from mptt.models import MPTTModel, TreeForeignKey
 from django.db import models
@@ -772,6 +773,24 @@ class Client(models.Model):
     score = models.CharField("Расчетный счет", max_length=64, blank=True, null=True)
     bik = models.CharField("БИК", max_length=32, blank=True, null=True)
     address = models.CharField("Адрес", max_length=255, blank=True, null=True)
+
+    # Новые поля для связи с продавцом и услугой
+    salesperson = models.ForeignKey(
+        User,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="clients_as_salesperson",
+        verbose_name="Продавец"
+    )
+    service = models.ForeignKey(
+        ServicesConsalting,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="clients_using_service",
+        verbose_name="Услуга"
+    )
 
     created_at = models.DateTimeField("Создано", auto_now_add=True)
     updated_at = models.DateTimeField("Обновлено", auto_now=True)

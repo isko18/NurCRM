@@ -642,7 +642,6 @@ class ClientListCreateAPIView(generics.ListCreateAPIView):
     permission_classes = [permissions.IsAuthenticated]
     serializer_class = ClientSerializer
     filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
-    # фильтры и поиск по базе
     filterset_fields = ["status", "date"]
     search_fields = ["full_name", "phone", "email"]
     ordering_fields = ["created_at", "updated_at", "date"]
