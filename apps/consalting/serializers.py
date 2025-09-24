@@ -68,16 +68,24 @@ class SaleConsaltingSerializer(CompanyReadOnlyMixin, serializers.ModelSerializer
 # ==========================
 class SalaryConsaltingSerializer(CompanyReadOnlyMixin, serializers.ModelSerializer):
     company = serializers.ReadOnlyField(source='company.id')
-    user = serializers.ReadOnlyField(source='user.id')
+    user = serializers.PrimaryKeyRelatedField(
+        queryset=User.objects.all(),  # можно фильтровать по компании в get_queryset
+        required=True
+    )
     created_at = serializers.DateTimeField(read_only=True)
     updated_at = serializers.DateTimeField(read_only=True)
 
     class Meta:
         model = SalaryConsalting
         fields = ('id', 'company', 'user', 'amount', 'description', 'percent', 'created_at', 'updated_at')
-        read_only_fields = ('id', 'company', 'user', 'created_at', 'updated_at')
+        read_only_fields = ('id', 'company', 'created_at', 'updated_at')
 
-
+    def validate_user(self, value):
+        """Проверка, что выбранный пользователь принадлежит той же компании"""
+        company = getattr(self.context.get('request').user, 'company', None)
+        if value and company and value.company_id != company.id:
+            raise serializers.ValidationError("Выбранный сотрудник должен принадлежать вашей компании.")
+        return value
 # ==========================
 # RequestsConsalting
 # ==========================

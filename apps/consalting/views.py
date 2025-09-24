@@ -102,11 +102,13 @@ class SalaryConsaltingListCreateView(CompanyScopedMixin, generics.ListCreateAPIV
     permission_classes = [permissions.IsAuthenticated]
 
     def get_queryset(self):
-        return self.filter_queryset_by_company(super().get_queryset())
+        qs = super().get_queryset()
+        return self.filter_queryset_by_company(qs)
 
     def perform_create(self, serializer):
+        # сохраняем только company; user передаётся из payload
         company = self.get_company_or_raise()
-        serializer.save(company=company, user=self.request.user)
+        serializer.save(company=company)
 
 
 class SalaryConsaltingRetrieveUpdateDestroyView(CompanyScopedMixin, generics.RetrieveUpdateDestroyAPIView):
@@ -115,8 +117,8 @@ class SalaryConsaltingRetrieveUpdateDestroyView(CompanyScopedMixin, generics.Ret
     permission_classes = [permissions.IsAuthenticated]
 
     def get_queryset(self):
-        return self.filter_queryset_by_company(super().get_queryset())
-
+        qs = super().get_queryset()
+        return self.filter_queryset_by_company(qs)
 
 # ==========================
 # RequestsConsalting
