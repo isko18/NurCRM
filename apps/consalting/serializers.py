@@ -5,6 +5,7 @@ from .models import (
     SaleConsalting,
     SalaryConsalting,
     RequestsConsalting,
+    BookingConsalting
 )
 from apps.users.models import User
 
@@ -98,3 +99,27 @@ class RequestsConsaltingSerializer(CompanyReadOnlyMixin, serializers.ModelSerial
         model = RequestsConsalting
         fields = ('id', 'company', 'client', 'status', 'name', 'description', 'created_at', 'updated_at')
         read_only_fields = ('id', 'company', 'created_at', 'updated_at')
+
+
+class BookingConsaltingSerializer(serializers.ModelSerializer):
+    company = serializers.ReadOnlyField(source='company.id')
+    employee = serializers.PrimaryKeyRelatedField(queryset=User.objects.all(), required=False, allow_null=True)
+    created_at = serializers.DateTimeField(read_only=True)
+    updated_at = serializers.DateTimeField(read_only=True)
+
+    class Meta:
+        model = BookingConsalting
+        fields = ('id', 'company', 'title', 'date', 'time', 'employee', 'note', 'created_at', 'updated_at')
+        read_only_fields = ('id', 'company', 'created_at', 'updated_at')
+
+    def create(self, validated_data):
+        request = self.context.get('request')
+        if request and request.user and getattr(request.user, 'company', None):
+            validated_data['company'] = request.user.company
+        return super().create(validated_data)
+
+    def update(self, instance, validated_data):
+        request = self.context.get('request')
+        if request and request.user and getattr(request.user, 'company', None):
+            validated_data['company'] = request.user.company
+        return super().update(instance, validated_data)

@@ -146,3 +146,36 @@ class RequestsConsalting(TimeStampedModel):
         verbose_name_plural = "Заявки на консультацию"
         ordering = ['-created_at']
         indexes = [models.Index(fields=['company', 'status'])]
+
+
+class BookingConsalting(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    company = models.ForeignKey(
+        Company,
+        on_delete=models.CASCADE,
+        related_name='consalting_bookings',
+        verbose_name='Компания'
+    )
+    title = models.CharField(max_length=255, verbose_name='Название')
+    date = models.DateField(verbose_name='Дата')
+    time = models.TimeField(verbose_name='Время')
+    employee = models.ForeignKey(
+        User,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='consalting_bookings',
+        verbose_name='Сотрудник'
+    )
+    note = models.TextField(blank=True, verbose_name='Заметка')
+    created_at = models.DateTimeField(auto_now_add=True, verbose_name='Дата создания')
+    updated_at = models.DateTimeField(auto_now=True, verbose_name='Дата обновления')
+
+    class Meta:
+        verbose_name = "Бронирование"
+        verbose_name_plural = "Бронирования"
+        ordering = ['-date', 'time']
+
+    def __str__(self):
+        return f"{self.title} — {self.date} {self.time}"
+    
