@@ -51,15 +51,6 @@ apps_includes = [
     path('consalting/', include('apps.consalting.urls')),
     path('instagram/', include('apps.instagram.urls')),   
     
-<<<<<<< HEAD
-    # path('logger/', include('logger.urls')),   
-    
-    
-    
-    
-    
-=======
->>>>>>> c56cb4a2d03dfa6096b02af92870b93efe0394f8
 ]
 
 # API-роуты
