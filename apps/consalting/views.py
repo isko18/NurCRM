@@ -1,12 +1,13 @@
 # views.py
 from rest_framework import generics, permissions
 from rest_framework.exceptions import PermissionDenied
-from .models import ServicesConsalting, SaleConsalting, SalaryConsalting, RequestsConsalting
+from .models import ServicesConsalting, SaleConsalting, SalaryConsalting, RequestsConsalting, BookingConsalting
 from .serializers import (
     ServicesConsaltingSerializer,
     SaleConsaltingSerializer,
     SalaryConsaltingSerializer,
     RequestsConsaltingSerializer,
+    BookingConsaltingSerializer
 )
 
 
@@ -139,6 +140,28 @@ class RequestsConsaltingListCreateView(CompanyScopedMixin, generics.ListCreateAP
 class RequestsConsaltingRetrieveUpdateDestroyView(CompanyScopedMixin, generics.RetrieveUpdateDestroyAPIView):
     queryset = RequestsConsalting.objects.select_related('client', 'company').all()
     serializer_class = RequestsConsaltingSerializer
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get_queryset(self):
+        return self.filter_queryset_by_company(super().get_queryset())
+
+
+class BookingConsaltingListCreateView(CompanyScopedMixin, generics.ListCreateAPIView):
+    queryset = BookingConsalting.objects.select_related('employee', 'company').all()
+    serializer_class = BookingConsaltingSerializer
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get_queryset(self):
+        return self.filter_queryset_by_company(super().get_queryset())
+
+    def perform_create(self, serializer):
+        company = self.get_company_or_raise()
+        serializer.save(company=company)
+
+
+class BookingConsaltingRetrieveUpdateDestroyView(CompanyScopedMixin, generics.RetrieveUpdateDestroyAPIView):
+    queryset = BookingConsalting.objects.select_related('employee', 'company').all()
+    serializer_class = BookingConsaltingSerializer
     permission_classes = [permissions.IsAuthenticated]
 
     def get_queryset(self):

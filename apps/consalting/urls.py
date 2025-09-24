@@ -8,6 +8,8 @@ from .views import (
     SalaryConsaltingRetrieveUpdateDestroyView,
     RequestsConsaltingListCreateView,
     RequestsConsaltingRetrieveUpdateDestroyView,
+    BookingConsaltingListCreateView, 
+    BookingConsaltingRetrieveUpdateDestroyView
 )
 
 urlpatterns = [
@@ -22,4 +24,7 @@ urlpatterns = [
 
     path('requests/', RequestsConsaltingListCreateView.as_view(), name='requests-list-create'),
     path('requests/<uuid:pk>/', RequestsConsaltingRetrieveUpdateDestroyView.as_view(), name='requests-rud'),
+    
+    path('bookings/', BookingConsaltingListCreateView.as_view(), name='bookings-list-create'),
+    path('bookings/<uuid:pk>/', BookingConsaltingRetrieveUpdateDestroyView.as_view(), name='bookings-detail'),
 ]
