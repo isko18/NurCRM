@@ -226,18 +226,27 @@ class OrderSerializer(serializers.ModelSerializer):
             OrderItemSerializer(context=self.context).create(item_data)
 
         return order
+    
+class ItemMakeNestedSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = ItemMake
+        fields = ["id", "name", "price", "unit", "quantity"]
+
 class ProductSerializer(serializers.ModelSerializer):
     company = serializers.ReadOnlyField(source="company.id")
 
     brand = serializers.CharField(source="brand.name", read_only=True)
     category = serializers.CharField(source="category.name", read_only=True)
-    item_make_names = serializers.SerializerMethodField(read_only=True)  # список названий
+
+    # GET: детализированные объекты ItemMake
+    item_make = ItemMakeNestedSerializer(many=True, read_only=True)
+    # POST/PUT: передаём список ID
+    item_make_ids = serializers.PrimaryKeyRelatedField(
+        queryset=ItemMake.objects.all(), many=True, write_only=True, required=False
+    )
 
     brand_name = serializers.CharField(write_only=True, required=False, allow_blank=True)
     category_name = serializers.CharField(write_only=True, required=False, allow_blank=True)
-    item_make = serializers.PrimaryKeyRelatedField(
-        queryset=ItemMake.objects.all(), many=True, required=False
-    )
 
     client = serializers.PrimaryKeyRelatedField(
         queryset=Client.objects.all(), required=False, allow_null=True
@@ -248,8 +257,8 @@ class ProductSerializer(serializers.ModelSerializer):
     status_display = serializers.CharField(source="get_status_display", read_only=True)
 
     date = serializers.DateField(
-        format="%Y-%m-%d",  # формат вывода
-        input_formats=["%Y-%m-%d", "%d-%m-%Y"],  # допустимые форматы ввода
+        format="%Y-%m-%d",
+        input_formats=["%Y-%m-%d", "%d-%m-%Y"],
         required=False,
         allow_null=True
     )
@@ -260,7 +269,7 @@ class ProductSerializer(serializers.ModelSerializer):
             "id", "name", "barcode",
             "brand", "brand_name",
             "category", "category_name",
-            "item_make", "item_make_names",
+            "item_make", "item_make_ids",
             "quantity", "price", "purchase_price",
             "status", "status_display",
             "company",
@@ -270,7 +279,7 @@ class ProductSerializer(serializers.ModelSerializer):
         read_only_fields = [
             "id", "created_at", "updated_at",
             "company", "name", "brand", "category",
-            "client_name", "status_display", "item_make_names",
+            "client_name", "status_display",
         ]
         extra_kwargs = {
             "price": {"required": False, "default": 0},
@@ -278,12 +287,19 @@ class ProductSerializer(serializers.ModelSerializer):
             "quantity": {"required": False, "default": 0},
         }
 
-    def get_item_make_names(self, obj):
-        return [im.name for im in obj.item_make.all()]
+    def _ensure_company_brand(self, company, brand):
+        if brand is None:
+            return None
+        return ProductBrand.objects.get_or_create(company=company, name=brand.name)[0]
+
+    def _ensure_company_category(self, company, category):
+        if category is None:
+            return None
+        return ProductCategory.objects.get_or_create(company=company, name=category.name)[0]
 
     @transaction.atomic
     def create(self, validated_data):
-        item_make_data = validated_data.pop("item_make", [])
+        item_make_data = validated_data.pop("item_make_ids", [])
         company = self.context["request"].user.company
 
         client = validated_data.pop("client", None)
@@ -291,7 +307,6 @@ class ProductSerializer(serializers.ModelSerializer):
         category_name = (validated_data.pop("category_name", "") or "").strip()
         status_value = validated_data.pop("status", None)
 
-        # Обработка даты: если не передана, ставим текущую
         date_value = validated_data.pop("date", None)
         if date_value is None:
             date_value = timezone.now().date()
@@ -319,10 +334,9 @@ class ProductSerializer(serializers.ModelSerializer):
             quantity=validated_data.get("quantity", 0),
             client=client,
             status=status_value,
-            date=date_value
+            date=date_value,
         )
 
-        # Связываем все ItemMake
         if item_make_data:
             product.item_make.set(item_make_data)
 
@@ -339,9 +353,9 @@ class ProductSerializer(serializers.ModelSerializer):
         if category_name:
             instance.category, _ = ProductCategory.objects.get_or_create(company=company, name=category_name)
 
-        # обновляем item_make, если передано
-        if "item_make" in validated_data:
-            instance.item_make.set(validated_data.pop("item_make"))
+        item_make_data = validated_data.pop("item_make_ids", None)
+        if item_make_data is not None:
+            instance.item_make.set(item_make_data)
 
         for field in ("barcode", "quantity", "price", "purchase_price", "client", "status", "date"):
             if field in validated_data:
@@ -349,18 +363,7 @@ class ProductSerializer(serializers.ModelSerializer):
 
         instance.save()
         return instance
-
-    # Вспомогательные методы для работы с брендом и категорией
-    def _ensure_company_brand(self, company, brand):
-        if brand is None:
-            return None
-        return ProductBrand.objects.get_or_create(company=company, name=brand.name)[0]
-
-    def _ensure_company_category(self, company, category):
-        if category is None:
-            return None
-        return ProductCategory.objects.get_or_create(company=company, name=category.name)[0]
-
+    
 class ReviewSerializer(serializers.ModelSerializer):
     user = serializers.ReadOnlyField(source='user.id')
     company = serializers.ReadOnlyField(source='company.id')

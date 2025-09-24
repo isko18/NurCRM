@@ -527,8 +527,10 @@ class ProductListView(CompanyRestrictedMixin, generics.ListAPIView):
     ordering_fields = ["created_at", "updated_at", "price"]
 
     def get_queryset(self):
-        return Product.objects.filter(company=self.request.user.company)
-
+        # подгружаем связанные объекты, чтобы GET корректно сериализовался
+        qs = Product.objects.filter(company=self.request.user.company)
+        qs = qs.select_related("brand", "category", "client").prefetch_related("item_make")
+        return qs
 
 class OrderAnalyticsView(APIView):
     permission_classes = [IsAuthenticated]
