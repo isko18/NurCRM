@@ -53,7 +53,7 @@ class SaleConsalting(TimeStampedModel):
         verbose_name='Пользователь'
     )
     services = models.ForeignKey(
-        ServicesConsalting,
+        'consalting.ServicesConsalting',  # латинская "c"
         on_delete=models.SET_NULL,
         null=True,
         blank=True,
@@ -99,6 +99,7 @@ class SalaryConsalting(TimeStampedModel):
         verbose_name='Пользователь'
     )
     amount = models.DecimalField(max_digits=12, decimal_places=2, verbose_name="Сумма")
+    percent = models.CharField(max_length=255, verbose_name="Процент")
     description = models.TextField(verbose_name="Описание", blank=True)
 
     def __str__(self):
