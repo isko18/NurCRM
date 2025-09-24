@@ -1,6 +1,7 @@
 from rest_framework import serializers
 from apps.main.models import Contact, Pipeline, Deal, Task, Integration, Analytics, Order, Product, Review, Notification, Event, Warehouse, WarehouseEvent, ProductCategory, ProductBrand, OrderItem, Client, GlobalProduct, CartItem, ClientDeal, Bid, SocialApplications, TransactionRecord, DealInstallment, ContractorWork, Debt, DebtPayment, ObjectItem, ObjectSale, ObjectSaleItem, ItemMake
 from apps.construction.models import Department
+from consalting.models import ServicesConsalting 
 from apps.users.models import User, Company
 from django.db import transaction
 from decimal import Decimal
@@ -519,21 +520,40 @@ class WarehouseEventSerializer(serializers.ModelSerializer):
             instance.participants.set(participants)
         return instance
     
-    
 class ClientSerializer(serializers.ModelSerializer):
     company = serializers.ReadOnlyField(source='company.id')
+    salesperson = serializers.PrimaryKeyRelatedField(
+        queryset=User.objects.all(), required=False, allow_null=True
+    )
+    service = serializers.PrimaryKeyRelatedField(
+        queryset=ServicesConsalting.objects.all(), required=False, allow_null=True
+    )
+    salesperson_display = serializers.SerializerMethodField(read_only=True)
+    service_display = serializers.SerializerMethodField(read_only=True)
 
     class Meta:
         model = Client
         fields = [
             'id', 'type', 'full_name', 'phone', 'email', 'date', 'status',
-            'llc', 'inn', 'okpo', 'score', 'bik', 'address',  # новые поля
+            'llc', 'inn', 'okpo', 'score', 'bik', 'address',
+            'salesperson', 'salesperson_display',
+            'service', 'service_display',
             'company', 'created_at', 'updated_at'
         ]
-        read_only_fields = ['id', 'company', 'created_at', 'updated_at']
+        read_only_fields = ['id', 'company', 'created_at', 'updated_at',
+                            'salesperson_display', 'service_display']
+
+    def get_salesperson_display(self, obj):
+        if obj.salesperson:
+            return f"{obj.salesperson.first_name} {obj.salesperson.last_name}"
+        return None
+
+    def get_service_display(self, obj):
+        if obj.service:
+            return obj.service.name
+        return None
 
     def create(self, validated_data):
-        # Автоматически привязываем компанию пользователя
         validated_data['company'] = self.context['request'].user.company
         return super().create(validated_data)
     
