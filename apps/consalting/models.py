@@ -1,6 +1,6 @@
 from django.db import models
 from apps.users.models import Company, User
-from apps.main.models import Client
+# from apps.main.models import Client
 import uuid
 
 
@@ -61,11 +61,11 @@ class SaleConsalting(TimeStampedModel):
         verbose_name="Услуга"
     )
     client = models.ForeignKey(
-        Client,
+        "main.Client",  # <-- строка вместо прямого импорта
         on_delete=models.SET_NULL,
         null=True,
         blank=True,
-        related_name="consalting_sale",
+        related_name="sales",
         verbose_name="Клиент"
     )
     description = models.TextField(verbose_name="Заметка", blank=True)
@@ -127,7 +127,7 @@ class RequestsConsalting(TimeStampedModel):
         verbose_name='Компания'
     )
     client = models.ForeignKey(
-        Client,
+        "main.Client", 
         on_delete=models.SET_NULL,
         null=True,
         blank=True,
