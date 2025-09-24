@@ -219,18 +219,22 @@ class ProductCreateByBarcodeAPIView(generics.CreateAPIView):
 
         return Response(self.get_serializer(product).data, status=status.HTTP_201_CREATED)
 
-
 class ProductCreateManualAPIView(generics.CreateAPIView):
     """
     Ручное создание товара + (опционально) добавление в глобальную базу.
     Принимает status как: pending/accepted/rejected или Ожидание/Принят/Отказ.
-    Пустая строка/null -> статус не устанавливается (NULL).
+    Для item_make можно передать:
+      - "item_make": ["uuid1", "uuid2"]
+      - "item_make": "uuid1"
+      - "item_make_ids": [...]
+    Для date принимаются форматы:
+      - "YYYY-MM-DD"
+      - ISO datetime "YYYY-MM-DDTHH:MM:SSZ" и т.п.
     """
     serializer_class = ProductSerializer
     permission_classes = [IsAuthenticated]
 
     def _normalize_status(self, raw):
-        """Приводим входной статус к коду из Product.Status.* или None."""
         if raw in (None, "", "null"):
             return None
         v = str(raw).strip().lower()
@@ -248,6 +252,40 @@ class ProductCreateManualAPIView(generics.CreateAPIView):
         if v in codes:
             return v
         raise ValueError(f"Недопустимый статус. Допустимые: {', '.join(sorted(codes))}.")
+
+    def _parse_date_to_aware_datetime(self, raw_value):
+        """
+        Принимает строку date/datetime или date/datetime объект.
+        Возвращает timezone-aware datetime или raises ValueError.
+        """
+        if raw_value is None or raw_value == "":
+            return None
+
+        # если уже datetime
+        if isinstance(raw_value, timezone.datetime):
+            dt = raw_value
+            if timezone.is_naive(dt):
+                dt = timezone.make_aware(dt)
+            return dt
+
+        # если пришёл date object (not datetime)
+        if isinstance(raw_value, timezone.datetime.date) and not isinstance(raw_value, timezone.datetime):
+            d = raw_value
+            dt = timezone.datetime(d.year, d.month, d.day, 0, 0, 0)
+            return timezone.make_aware(dt)
+
+        # строка: сначала пробуем parse_datetime, затем parse_date
+        dt = dateparse.parse_datetime(raw_value)
+        if dt:
+            if timezone.is_naive(dt):
+                dt = timezone.make_aware(dt)
+            return dt
+        d = dateparse.parse_date(raw_value)
+        if d:
+            dt = timezone.datetime(d.year, d.month, d.day, 0, 0, 0)
+            return timezone.make_aware(dt)
+
+        raise ValueError("Неверный формат даты/времени. Допустимые: YYYY-MM-DD или ISO datetime.")
 
     @transaction.atomic
     def create(self, request, *args, **kwargs):
@@ -289,15 +327,12 @@ class ProductCreateManualAPIView(generics.CreateAPIView):
         except ValueError as e:
             return Response({"status": str(e)}, status=status.HTTP_400_BAD_REQUEST)
 
-        # дата
-        date_value = data.get("date")
-        if date_value:
-            try:
-                date_value = timezone.datetime.strptime(date_value, "%Y-%m-%d").date()
-            except ValueError:
-                return Response({"date": "Неверный формат даты. Используйте YYYY-MM-DD."}, status=400)
-        else:
-            date_value = timezone.now().date()
+        # дата: сохраняем timezone-aware datetime
+        raw_date = data.get("date")
+        try:
+            date_value = self._parse_date_to_aware_datetime(raw_date) if raw_date else timezone.now()
+        except ValueError as e:
+            return Response({"date": str(e)}, status=status.HTTP_400_BAD_REQUEST)
 
         # глобальные справочники (если переданы имена)
         brand_name = (data.get("brand_name") or "").strip()
@@ -315,7 +350,7 @@ class ProductCreateManualAPIView(generics.CreateAPIView):
         if client_id:
             client = get_object_or_404(Client, id=client_id, company=company)
 
-        # создаём товар
+        # создаём товар (с datetime в поле date)
         product = Product.objects.create(
             company=company,
             name=name,
@@ -327,8 +362,26 @@ class ProductCreateManualAPIView(generics.CreateAPIView):
             quantity=quantity,
             client=client,
             status=status_value,
-            date=date_value,  # <- сохраняем дату
+            date=date_value,
         )
+
+        # обработаем item_make вход: поддерживаем "item_make" (str or list) или "item_make_ids"
+        item_make_input = data.get("item_make") or data.get("item_make_ids")
+        if item_make_input:
+            # нормализуем в список uuid-строк
+            if isinstance(item_make_input, (str,)):
+                item_make_ids = [item_make_input]
+            elif isinstance(item_make_input, (list, tuple)):
+                item_make_ids = list(item_make_input)
+            else:
+                item_make_ids = []
+
+            # выбираем объекты, только из той же компании
+            ims = ItemMake.objects.filter(id__in=item_make_ids, company=company)
+            # если количество выбранных != кол-ву id — значит какой-то id не найден / не принадлежит компании
+            if len(item_make_ids) != ims.count():
+                return Response({"item_make": "Один или несколько item_make не найдены или принадлежат другой компании."}, status=400)
+            product.item_make.set(ims)
 
         # синхронизация в глобальную базу (если есть штрих-код)
         if barcode:
