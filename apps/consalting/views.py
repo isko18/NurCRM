@@ -1,4 +1,3 @@
-# views.py
 from rest_framework import generics, permissions
 from rest_framework.exceptions import PermissionDenied
 from .models import ServicesConsalting, SaleConsalting, SalaryConsalting, RequestsConsalting, BookingConsalting
@@ -56,8 +55,7 @@ class ServicesConsaltingListCreateView(CompanyScopedMixin, generics.ListCreateAP
         return self.filter_queryset_by_company(super().get_queryset())
 
     def perform_create(self, serializer):
-        company = self.get_company_or_raise()
-        serializer.save(company=company)
+        serializer.save(company=self.get_company_or_raise())
 
 
 class ServicesConsaltingRetrieveUpdateDestroyView(CompanyScopedMixin, generics.RetrieveUpdateDestroyAPIView):
@@ -81,8 +79,7 @@ class SaleConsaltingListCreateView(CompanyScopedMixin, generics.ListCreateAPIVie
         return self.filter_queryset_by_company(super().get_queryset())
 
     def perform_create(self, serializer):
-        company = self.get_company_or_raise()
-        serializer.save(company=company, user=self.request.user)
+        serializer.save(company=self.get_company_or_raise(), user=self.request.user)
 
 
 class SaleConsaltingRetrieveUpdateDestroyView(CompanyScopedMixin, generics.RetrieveUpdateDestroyAPIView):
@@ -103,13 +100,10 @@ class SalaryConsaltingListCreateView(CompanyScopedMixin, generics.ListCreateAPIV
     permission_classes = [permissions.IsAuthenticated]
 
     def get_queryset(self):
-        qs = super().get_queryset()
-        return self.filter_queryset_by_company(qs)
+        return self.filter_queryset_by_company(super().get_queryset())
 
     def perform_create(self, serializer):
-        # сохраняем только company; user передаётся из payload
-        company = self.get_company_or_raise()
-        serializer.save(company=company)
+        serializer.save(company=self.get_company_or_raise())
 
 
 class SalaryConsaltingRetrieveUpdateDestroyView(CompanyScopedMixin, generics.RetrieveUpdateDestroyAPIView):
@@ -118,8 +112,8 @@ class SalaryConsaltingRetrieveUpdateDestroyView(CompanyScopedMixin, generics.Ret
     permission_classes = [permissions.IsAuthenticated]
 
     def get_queryset(self):
-        qs = super().get_queryset()
-        return self.filter_queryset_by_company(qs)
+        return self.filter_queryset_by_company(super().get_queryset())
+
 
 # ==========================
 # RequestsConsalting
@@ -133,8 +127,7 @@ class RequestsConsaltingListCreateView(CompanyScopedMixin, generics.ListCreateAP
         return self.filter_queryset_by_company(super().get_queryset())
 
     def perform_create(self, serializer):
-        company = self.get_company_or_raise()
-        serializer.save(company=company)
+        serializer.save(company=self.get_company_or_raise())
 
 
 class RequestsConsaltingRetrieveUpdateDestroyView(CompanyScopedMixin, generics.RetrieveUpdateDestroyAPIView):
@@ -146,6 +139,9 @@ class RequestsConsaltingRetrieveUpdateDestroyView(CompanyScopedMixin, generics.R
         return self.filter_queryset_by_company(super().get_queryset())
 
 
+# ==========================
+# BookingConsalting
+# ==========================
 class BookingConsaltingListCreateView(CompanyScopedMixin, generics.ListCreateAPIView):
     queryset = BookingConsalting.objects.select_related('employee', 'company').all()
     serializer_class = BookingConsaltingSerializer
@@ -155,8 +151,7 @@ class BookingConsaltingListCreateView(CompanyScopedMixin, generics.ListCreateAPI
         return self.filter_queryset_by_company(super().get_queryset())
 
     def perform_create(self, serializer):
-        company = self.get_company_or_raise()
-        serializer.save(company=company)
+        serializer.save(company=self.get_company_or_raise())
 
 
 class BookingConsaltingRetrieveUpdateDestroyView(CompanyScopedMixin, generics.RetrieveUpdateDestroyAPIView):
