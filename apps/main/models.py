@@ -1,7 +1,7 @@
 from django.db import models
 import uuid, secrets
 from apps.users.models import User, Company
-from consalting.models import ServicesConsalting 
+from apps.consalting.models import ServicesConsalting 
 from django.conf import settings
 from mptt.models import MPTTModel, TreeForeignKey
 from django.db import models

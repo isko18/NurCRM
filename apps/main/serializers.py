@@ -1,7 +1,8 @@
 from rest_framework import serializers
 from apps.main.models import Contact, Pipeline, Deal, Task, Integration, Analytics, Order, Product, Review, Notification, Event, Warehouse, WarehouseEvent, ProductCategory, ProductBrand, OrderItem, Client, GlobalProduct, CartItem, ClientDeal, Bid, SocialApplications, TransactionRecord, DealInstallment, ContractorWork, Debt, DebtPayment, ObjectItem, ObjectSale, ObjectSaleItem, ItemMake
 from apps.construction.models import Department
-from consalting.models import ServicesConsalting 
+from apps.consalting.models import ServicesConsalting 
+
 from apps.users.models import User, Company
 from django.db import transaction
 from decimal import Decimal
