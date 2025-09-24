@@ -48,16 +48,18 @@ apps_includes = [
     path('cafe/', include('apps.cafe.urls')),   
     path('whatsapp/', include('apps.whatsapp.urls')), 
     path('storehouse/', include('apps.storehouse.urls')), 
-    
-      
+    path('сonsalting/', include('apps.сonsalting.urls')),
     path('instagram/', include('apps.instagram.urls')),   
     
+<<<<<<< HEAD
     # path('logger/', include('logger.urls')),   
     
     
     
     
     
+=======
+>>>>>>> c56cb4a2d03dfa6096b02af92870b93efe0394f8
 ]
 
 # API-роуты

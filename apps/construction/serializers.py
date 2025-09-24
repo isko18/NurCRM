@@ -112,7 +112,8 @@ class CashFlowSerializer(serializers.ModelSerializer):
             'type',
             'name',
             'amount',
-            'created_at'
+            'created_at',
+            'status'
         ]
         read_only_fields = ['id', 'created_at', 'cashbox_name', 'company']
 
