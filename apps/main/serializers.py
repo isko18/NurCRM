@@ -226,6 +226,8 @@ class OrderSerializer(serializers.ModelSerializer):
             OrderItemSerializer(context=self.context).create(item_data)
 
         return order
+    
+    
 class ItemMakeNestedSerializer(serializers.ModelSerializer):
     class Meta:
         model = ItemMake
@@ -240,7 +242,7 @@ class ProductSerializer(serializers.ModelSerializer):
 
     # GET: детализированные объекты ItemMake
     item_make = ItemMakeNestedSerializer(many=True, read_only=True)
-    # POST/PUT: передаём список ID
+    # POST/PUT: список ID для записи (если используете сериализатор create/update)
     item_make_ids = serializers.PrimaryKeyRelatedField(
         queryset=ItemMake.objects.all(), many=True, write_only=True, required=False
     )
@@ -256,7 +258,7 @@ class ProductSerializer(serializers.ModelSerializer):
     status = serializers.CharField(required=False, allow_null=True, allow_blank=True)
     status_display = serializers.CharField(source="get_status_display", read_only=True)
 
-    # date как read-only: безопасно возвращаем только дату (YYYY-MM-DD)
+    # date — read-only: возвращаем только дату (YYYY-MM-DD), модель хранит DateTimeField
     date = serializers.SerializerMethodField(read_only=True)
 
     class Meta:
@@ -275,8 +277,7 @@ class ProductSerializer(serializers.ModelSerializer):
         read_only_fields = [
             "id", "created_at", "updated_at",
             "company", "name", "brand", "category",
-            "client_name", "status_display", "item_make",
-            "date",
+            "client_name", "status_display", "item_make", "date",
         ]
         extra_kwargs = {
             "price": {"required": False, "default": 0},
@@ -285,15 +286,10 @@ class ProductSerializer(serializers.ModelSerializer):
         }
 
     def get_date(self, obj):
-        """
-        Возвращаем только дату в формате YYYY-MM-DD или None.
-        Если в модели хранится datetime, аккуратно приводим к локальному времени.
-        """
         dt = getattr(obj, "date", None)
         if not dt:
             return None
         try:
-            # если aware — привести к локальной временной зоне
             from django.utils import timezone as dj_tz
             if dj_tz.is_aware(dt):
                 dt = dj_tz.localtime(dt)
@@ -313,7 +309,10 @@ class ProductSerializer(serializers.ModelSerializer):
 
     @transaction.atomic
     def create(self, validated_data):
-        # берём список ID для M2M (если пришли)
+        """
+        Если вы создаёте через этот сериализатор (альтернативный путь),
+        используйте item_make_ids = [ItemMake instances]
+        """
         item_make_data = validated_data.pop("item_make_ids", [])
         company = self.context["request"].user.company
 
@@ -322,7 +321,7 @@ class ProductSerializer(serializers.ModelSerializer):
         category_name = (validated_data.pop("category_name", "") or "").strip()
         status_value = validated_data.pop("status", None)
 
-        # сохраняем datetime (timezone-aware), а не только date
+        # при создании через сериализатор ставим текущий datetime
         date_value = timezone.now()
 
         barcode = validated_data.get("barcode")
@@ -351,7 +350,6 @@ class ProductSerializer(serializers.ModelSerializer):
             date=date_value,
         )
 
-        # Связываем все ItemMake (если переданы)
         if item_make_data:
             product.item_make.set(item_make_data)
 
@@ -376,7 +374,6 @@ class ProductSerializer(serializers.ModelSerializer):
             if field in validated_data:
                 setattr(instance, field, validated_data[field])
 
-        # не принимаем date из тела (date — read-only). Если нужно — добавить отдельное write-only поле.
         instance.save()
         return instance
     
