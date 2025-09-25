@@ -158,7 +158,12 @@ class User(AbstractBaseUser, PermissionsMixin):
     can_view_school_teachers = models.BooleanField(default=False, blank=True, null=True, verbose_name='Школа: преподаватели')
     can_view_school_leads = models.BooleanField(default=False, blank=True, null=True, verbose_name='Школа: лиды')
     can_view_school_invoices = models.BooleanField(default=False, blank=True, null=True, verbose_name='Школа: счета')
-
+    can_view_clients = models.BooleanField(default=False, verbose_name="Доступ к клиентам")
+    can_view_client_requests = models.BooleanField(default=False, verbose_name="Доступ к заявкам клиентов")
+    can_view_salary = models.BooleanField(default=False, verbose_name="Доступ к зарплатам")
+    can_view_sales = models.BooleanField(default=False, verbose_name="Доступ к продажам")
+    can_view_services = models.BooleanField(default=False, verbose_name="Доступ к услугам")
+    
     created_at = models.DateTimeField(auto_now_add=True, verbose_name='Дата создания')
     updated_at = models.DateTimeField(auto_now=True, verbose_name='Дата обновления')
 
