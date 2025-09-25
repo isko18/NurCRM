@@ -7,7 +7,7 @@ from apps.users.serializers import UserListSerializer, UserWithPermissionsSerial
 class CashFlowInsideCashboxSerializer(serializers.ModelSerializer):
     class Meta:
         model = CashFlow
-        fields = ['id', 'type', 'name', 'amount', 'created_at']
+        fields = ['id', 'type', 'name', 'amount', 'status', 'created_at']
 
 
 # ─── CASHBOX: c вложенными CashFlow ────────────────────────
