@@ -33,7 +33,7 @@ class Department(models.Model):
         return f"{self.name} ({self.company.name})"
 
     def cashflow_summary(self):
-        if hasattr(self, 'cashbox'):
+        if hasattr(self, 'cashbox') and self.cashbox:
             return self.cashbox.get_summary()
         return {
             'income': {'total': 0, 'count': 0},
@@ -93,9 +93,9 @@ class Cashbox(models.Model):
         super().save(*args, **kwargs)
 
     def get_summary(self):
-        """Аналитика по кассе (без баланса)"""
-        income = self.flows.filter(type='income')
-        expense = self.flows.filter(type='expense')
+        """Аналитика по кассе (только утверждённые движения)"""
+        income = self.flows.filter(type='income', status=True)
+        expense = self.flows.filter(type='expense', status=True)
 
         income_total = income.aggregate(total=models.Sum('amount'))['total'] or 0
         expense_total = expense.aggregate(total=models.Sum('amount'))['total'] or 0
