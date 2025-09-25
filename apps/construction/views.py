@@ -189,7 +189,7 @@ class CashFlowListCreateView(generics.ListCreateAPIView):
             serializer.save(company=company)
 
 
-class CashFlowDetailView(generics.RetrieveDestroyAPIView):
+class CashFlowDetailView(generics.RetrieveUpdateDestroyAPIView):
     serializer_class = CashFlowSerializer
     permission_classes = [IsAuthenticated]
 
