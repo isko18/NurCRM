@@ -73,8 +73,8 @@ class UserSerializer(serializers.ModelSerializer):
             'can_view_school_students', 'can_view_school_groups',
             'can_view_school_lessons', 'can_view_school_teachers',
             'can_view_school_leads', 'can_view_school_invoices',
-                        'can_view_clients', 'can_view_client_requests', 'can_view_salary ',
-            'can_view_sales ', 'can_view_services '
+            'can_view_clients', 'can_view_client_requests', 'can_view_salary',
+            'can_view_sales', 'can_view_services',
 
             'created_at', 'updated_at',
         ]
@@ -124,8 +124,8 @@ class UserSerializer(serializers.ModelSerializer):
             'can_view_school_students', 'can_view_school_groups',
             'can_view_school_lessons', 'can_view_school_teachers',
             'can_view_school_leads', 'can_view_school_invoices',
-                        'can_view_clients', 'can_view_client_requests', 'can_view_salary ',
-            'can_view_sales ', 'can_view_services '
+                        'can_view_clients', 'can_view_client_requests', 'can_view_salary',
+            'can_view_sales', 'can_view_services',
         ]
 
         for field in permission_fields:
@@ -236,8 +236,8 @@ class OwnerRegisterSerializer(serializers.ModelSerializer):
             'can_view_school_students', 'can_view_school_groups',
             'can_view_school_lessons', 'can_view_school_teachers',
             'can_view_school_leads', 'can_view_school_invoices',
-                        'can_view_clients', 'can_view_client_requests', 'can_view_salary ',
-            'can_view_sales ', 'can_view_services '
+                        'can_view_clients', 'can_view_client_requests', 'can_view_salary',
+            'can_view_sales', 'can_view_services',
         ]
         for field in permission_fields:
             setattr(user, field, True)
@@ -310,8 +310,8 @@ class EmployeeCreateSerializer(serializers.ModelSerializer):
             'can_view_school_students', 'can_view_school_groups',
             'can_view_school_lessons', 'can_view_school_teachers',
             'can_view_school_leads', 'can_view_school_invoices',
-                        'can_view_clients', 'can_view_client_requests', 'can_view_salary ',
-            'can_view_sales ', 'can_view_services '
+                        'can_view_clients', 'can_view_client_requests', 'can_view_salary',
+            'can_view_sales', 'can_view_services',
         ]
         extra_kwargs = {field: {'required': False} for field in fields if field.startswith('can_view_')}
 
@@ -361,8 +361,8 @@ class EmployeeCreateSerializer(serializers.ModelSerializer):
             'can_view_school_students', 'can_view_school_groups',
             'can_view_school_lessons', 'can_view_school_teachers',
             'can_view_school_leads', 'can_view_school_invoices',
-                        'can_view_clients', 'can_view_client_requests', 'can_view_salary ',
-            'can_view_sales ', 'can_view_services '
+                        'can_view_clients', 'can_view_client_requests', 'can_view_salary',
+            'can_view_sales', 'can_view_services',
         ]
         access_flags = {field: validated_data.pop(field, None) for field in access_fields}
 
@@ -460,8 +460,8 @@ class UserListSerializer(serializers.ModelSerializer):
             'can_view_school_students', 'can_view_school_groups',
             'can_view_school_lessons', 'can_view_school_teachers',
             'can_view_school_leads', 'can_view_school_invoices',
-                        'can_view_clients', 'can_view_client_requests', 'can_view_salary ',
-            'can_view_sales ', 'can_view_services '
+                        'can_view_clients', 'can_view_client_requests', 'can_view_salary',
+            'can_view_sales', 'can_view_services',
         ]
 
 
@@ -500,8 +500,8 @@ class UserWithPermissionsSerializer(serializers.ModelSerializer):
             'can_view_school_students', 'can_view_school_groups',
             'can_view_school_lessons', 'can_view_school_teachers',
             'can_view_school_leads', 'can_view_school_invoices',
-                        'can_view_clients', 'can_view_client_requests', 'can_view_salary ',
-            'can_view_sales ', 'can_view_services '
+            'can_view_clients', 'can_view_client_requests', 'can_view_salary',
+            'can_view_sales', 'can_view_services',
         ]
 
 
@@ -600,8 +600,8 @@ class EmployeeUpdateSerializer(serializers.ModelSerializer):
             'can_view_school_students', 'can_view_school_groups',
             'can_view_school_lessons', 'can_view_school_teachers',
             'can_view_school_leads', 'can_view_school_invoices',
-                        'can_view_clients', 'can_view_client_requests', 'can_view_salary ',
-            'can_view_sales ', 'can_view_services '
+                        'can_view_clients', 'can_view_client_requests', 'can_view_salary',
+            'can_view_sales', 'can_view_services',
             
         ]
         read_only_fields = ['id']
