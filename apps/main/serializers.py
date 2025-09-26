@@ -1,5 +1,6 @@
 from rest_framework import serializers
-from apps.main.models import Contact, Pipeline, Deal, Task, Integration, Analytics, Order, Product, Review, Notification, Event, Warehouse, WarehouseEvent, ProductCategory, ProductBrand, OrderItem, Client, GlobalProduct, CartItem, ClientDeal, Bid, SocialApplications, TransactionRecord, DealInstallment, ContractorWork, Debt, DebtPayment, ObjectItem, ObjectSale, ObjectSaleItem, ItemMake
+from apps.main.models import Contact, Pipeline, Deal, Task, Integration, Analytics, Order, Product, Review, Notification, Event, Warehouse, WarehouseEvent, ProductCategory, ProductBrand, OrderItem, Client, GlobalProduct, CartItem, ClientDeal, Bid, SocialApplications, TransactionRecord, DealInstallment, ContractorWork, Debt, DebtPayment, ObjectItem, ObjectSale, ObjectSaleItem, ItemMake, ManufactureSubreal, Acceptance
+
 from apps.construction.models import Department
 from apps.consalting.models import ServicesConsalting 
 
@@ -895,3 +896,161 @@ class ItemMakeSerializer(serializers.ModelSerializer):
         # автоматически привязываем компанию текущего пользователя
         validated_data["company"] = self.context["request"].user.company
         return super().create(validated_data)
+    
+    
+class ManufactureSubrealSerializer(serializers.ModelSerializer):
+    company = serializers.ReadOnlyField(source="company.id")
+    user = serializers.ReadOnlyField(source="user.id")
+    agent = serializers.PrimaryKeyRelatedField(queryset=User.objects.all())
+    product = serializers.PrimaryKeyRelatedField(queryset=Product.objects.all())
+    product_name = serializers.ReadOnlyField(source="product.name")
+    agent_name = serializers.SerializerMethodField()
+    qty_remaining = serializers.ReadOnlyField()
+
+    class Meta:
+        model = ManufactureSubreal
+        fields = [
+            "id",
+            "company",
+            "user",
+            "agent",
+            "agent_name",
+            "product",
+            "product_name",
+            "qty_transferred",
+            "qty_accepted",
+            "qty_remaining",
+            "status",
+            "created_at",
+        ]
+        read_only_fields = [
+            "id",
+            "company",
+            "user",
+            "agent_name",
+            "product_name",
+            "qty_accepted",
+            "qty_remaining",
+            "status",
+            "created_at",
+        ]
+
+    def get_agent_name(self, obj):
+        # красивое имя, если определено; иначе username / str
+        if hasattr(obj.agent, "get_full_name"):
+            full = obj.agent.get_full_name()
+            if full:
+                return full
+        return getattr(obj.agent, "username", str(obj.agent))
+
+    def validate_agent(self, agent):
+        """
+        Если у User есть company_id — проверим согласованность.
+        Иначе пропустим проверку (не у всех проектов у User есть прямая FK на Company).
+        """
+        request_company = self.context["request"].user.company
+        agent_company_id = getattr(agent, "company_id", None)
+        if agent_company_id and agent_company_id != request_company.id:
+            raise serializers.ValidationError("Агент принадлежит другой компании.")
+        return agent
+
+    def validate_product(self, product):
+        request_company = self.context["request"].user.company
+        if product.company_id != request_company.id:
+            raise serializers.ValidationError("Товар принадлежит другой компании.")
+        return product
+
+    def create(self, validated_data):
+        user = self.context["request"].user
+        validated_data["company"] = user.company
+        validated_data["user"] = user
+        return super().create(validated_data)
+
+
+class AcceptanceSerializer(serializers.ModelSerializer):
+    company = serializers.ReadOnlyField(source="company.id")
+    accepted_by = serializers.ReadOnlyField(source="accepted_by.id")
+
+    class Meta:
+        model = Acceptance
+        fields = [
+            "id",
+            "company",
+            "subreal",
+            "accepted_by",
+            "qty",
+            "accepted_at",
+        ]
+        read_only_fields = ["id", "company", "accepted_by", "accepted_at"]
+
+    def validate_subreal(self, subreal):
+        request_company = self.context["request"].user.company
+        if subreal.company_id != request_company.id:
+            raise serializers.ValidationError("Передача из другой компании.")
+        return subreal
+
+    def validate(self, attrs):
+        # Проверим остаток сразу в сериализаторе
+        sub = attrs.get("subreal")
+        qty = attrs.get("qty") or 0
+        if sub and qty > sub.qty_remaining:
+            raise serializers.ValidationError({"qty": f"Нельзя принять {qty}: доступно {sub.qty_remaining}."})
+        return attrs
+
+    def create(self, validated_data):
+        user = self.context["request"].user
+        validated_data["company"] = user.company
+        validated_data["accepted_by"] = user
+        return super().create(validated_data)
+    
+    
+class AcceptInlineInputSerializer(serializers.Serializer):
+    """
+    Вход: agent_id, product_id, qty
+    Ищет последнюю открытую передачу (company = request.user.company) по паре (agent, product).
+    Кладёт найденный subreal в validated_data["subreal"].
+    """
+    agent_id = serializers.PrimaryKeyRelatedField(source="agent", queryset=User.objects.all())
+    product_id = serializers.PrimaryKeyRelatedField(source="product", queryset=Product.objects.all())
+    qty = serializers.IntegerField(min_value=1)
+
+    def validate(self, attrs):
+        request = self.context["request"]
+        company = request.user.company
+
+        agent = attrs["agent"]
+        product = attrs["product"]
+
+        # если у User есть company_id — проверим согласованность
+        agent_company_id = getattr(agent, "company_id", None)
+        if agent_company_id and agent_company_id != company.id:
+            raise serializers.ValidationError({"agent_id": "Агент принадлежит другой компании."})
+        if product.company_id != company.id:
+            raise serializers.ValidationError({"product_id": "Товар принадлежит другой компании."})
+
+        sub = (
+            ManufactureSubreal.objects
+            .filter(company=company, agent=agent, product=product, status=ManufactureSubreal.Status.OPEN)
+            .order_by("-created_at")
+            .first()
+        )
+        if not sub:
+            raise serializers.ValidationError("Открытая передача для этого агента и товара не найдена.")
+
+        qty = attrs["qty"]
+        if qty > sub.qty_remaining:
+            raise serializers.ValidationError({"qty": f"Нельзя принять {qty}: доступно {sub.qty_remaining}."})
+
+        attrs["subreal"] = sub
+        return attrs
+
+
+class AcceptInlineOutputSerializer(serializers.Serializer):
+    """
+    Плоский ответ для UI (как на макете).
+    """
+    agent = serializers.CharField()
+    product = serializers.CharField()
+    qty_transferred = serializers.IntegerField()
+    qty_accept = serializers.IntegerField()
+    qty_remaining_after = serializers.IntegerField()
