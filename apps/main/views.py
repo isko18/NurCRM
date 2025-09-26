@@ -23,7 +23,8 @@ from apps.main.models import (
     Order, Product, Review, Notification, Event,
     ProductBrand, ProductCategory, Warehouse, WarehouseEvent, Client,
     GlobalProduct, GlobalBrand, GlobalCategory, ClientDeal, Bid, SocialApplications, TransactionRecord,
-    ContractorWork, DealInstallment, DebtPayment, Debt, ObjectSaleItem, ObjectSale, ObjectItem, ItemMake
+    ContractorWork, DealInstallment, DebtPayment, Debt, ObjectSaleItem, ObjectSale, ObjectItem, ItemMake,
+    ManufactureSubreal, Acceptance
 )
 from apps.main.serializers import (
     ContactSerializer, PipelineSerializer, DealSerializer, TaskSerializer,
@@ -31,7 +32,7 @@ from apps.main.serializers import (
     ReviewSerializer, NotificationSerializer, EventSerializer,
     WarehouseSerializer, WarehouseEventSerializer,
     ProductCategorySerializer, ProductBrandSerializer,
-    OrderItemSerializer, ClientSerializer, ClientDealSerializer, BidSerializers, SocialApplicationsSerializers, TransactionRecordSerializer, ContractorWorkSerializer, DebtSerializer, DebtPaymentSerializer, ObjectItemSerializer, ObjectSaleSerializer, ObjectSaleItemSerializer, BulkIdsSerializer, ItemMakeSerializer
+    OrderItemSerializer, ClientSerializer, ClientDealSerializer, BidSerializers, SocialApplicationsSerializers, TransactionRecordSerializer, ContractorWorkSerializer, DebtSerializer, DebtPaymentSerializer, ObjectItemSerializer, ObjectSaleSerializer, ObjectSaleItemSerializer, BulkIdsSerializer, ItemMakeSerializer, ManufactureSubrealSerializer, AcceptanceSerializer, AcceptInlineOutputSerializer, AcceptInlineInputSerializer
 )
 from django.db.models import ProtectedError
 
@@ -1127,3 +1128,182 @@ class ItemRetrieveUpdateDestroyAPIView(CompanyRestrictedMixin, generics.Retrieve
     """
     serializer_class = ItemMakeSerializer
     queryset = ItemMake.objects.all()
+    
+    
+    
+# -------------------------
+#   ManufactureSubreal
+# -------------------------
+
+class ManufactureSubrealListCreateAPIView(generics.ListCreateAPIView):
+    """
+    GET  /api/main/subreals/
+    POST /api/main/subreals/
+    """
+    permission_classes = [permissions.IsAuthenticated]
+    serializer_class = ManufactureSubrealSerializer
+    filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
+    # фильтрация по агенту/товару/статусу и датам
+    filterset_fields = ["agent", "product", "status", "created_at"]
+    # поиск по имени товара и имени/username агента
+    search_fields = ["product__name", "agent__username", "agent__first_name", "agent__last_name"]
+    ordering_fields = ["created_at", "qty_transferred", "qty_accepted", "status"]
+    ordering = ["-created_at"]
+
+    def get_queryset(self):
+        return (
+            ManufactureSubreal.objects
+            .select_related("company", "user", "agent", "product")
+            .filter(company_id=self.request.user.company_id)
+        )
+
+    def perform_create(self, serializer):
+        """
+        company и user ставим от текущего пользователя.
+        Дополнительно страхуем согласованность product.company == request.user.company.
+        """
+        company = self.request.user.company
+        product = serializer.validated_data.get("product")
+        if product and product.company_id != company.id:
+            raise serializers.ValidationError({"product": "Товар принадлежит другой компании."})
+        # agent = User — если у User есть company_id, можно проверить согласованность:
+        agent = serializer.validated_data.get("agent")
+        agent_company_id = getattr(agent, "company_id", None)
+        if agent_company_id and agent_company_id != company.id:
+            raise serializers.ValidationError({"agent": "Агент принадлежит другой компании."})
+
+        serializer.save(company=company, user=self.request.user)
+
+
+class ManufactureSubrealRetrieveUpdateDestroyAPIView(generics.RetrieveUpdateDestroyAPIView):
+    """
+    GET    /api/main/subreals/<uuid:pk>/
+    PATCH  /api/main/subreals/<uuid:pk>/
+    PUT    /api/main/subreals/<uuid:pk>/
+    DELETE /api/main/subreals/<uuid:pk>/
+    """
+    permission_classes = [permissions.IsAuthenticated]
+    serializer_class = ManufactureSubrealSerializer
+
+    def get_queryset(self):
+        return (
+            ManufactureSubreal.objects
+            .select_related("company", "user", "agent", "product")
+            .filter(company_id=self.request.user.company_id)
+        )
+
+    def perform_update(self, serializer):
+        """
+        На апдейте не даём «увести» в другую компанию связанные сущности.
+        """
+        company = self.request.user.company
+        prod = serializer.validated_data.get("product")
+        if prod and prod.company_id != company.id:
+            raise serializers.ValidationError({"product": "Товар принадлежит другой компании."})
+
+        agent = serializer.validated_data.get("agent")
+        agent_company_id = getattr(agent, "company_id", None) if agent else None
+        if agent and agent_company_id and agent_company_id != company.id:
+            raise serializers.ValidationError({"agent": "Агент принадлежит другой компании."})
+
+        serializer.save(company=company)  # фиксируем компанию
+
+
+# -------------------------
+#   Acceptance (обычный CRUD)
+# -------------------------
+
+class AcceptanceListCreateAPIView(generics.ListCreateAPIView):
+    """
+    GET  /api/main/acceptances/
+    POST /api/main/acceptances/          — создание приёма по subreal + qty
+    """
+    permission_classes = [permissions.IsAuthenticated]
+    serializer_class = AcceptanceSerializer
+    filter_backends = [DjangoFilterBackend, filters.OrderingFilter]
+    filterset_fields = ["subreal", "accepted_by", "accepted_at"]
+    ordering_fields = ["accepted_at", "qty", "id"]
+    ordering = ["-accepted_at"]
+
+    def get_queryset(self):
+        return (
+            Acceptance.objects
+            .select_related("company", "subreal", "accepted_by")
+            .filter(company_id=self.request.user.company_id)
+        )
+
+    @transaction.atomic
+    def perform_create(self, serializer):
+        """
+        company/accepted_by ставим из request.user.
+        Сериализатор уже проверяет остаток и принадлежность компании.
+        """
+        serializer.save(company=self.request.user.company, accepted_by=self.request.user)
+
+
+class AcceptanceRetrieveDestroyAPIView(generics.RetrieveDestroyAPIView):
+    """
+    GET    /api/main/acceptances/<uuid:pk>/
+    DELETE /api/main/acceptances/<uuid:pk>/
+    """
+    permission_classes = [permissions.IsAuthenticated]
+    serializer_class = AcceptanceSerializer
+
+    def get_queryset(self):
+        return (
+            Acceptance.objects
+            .select_related("company", "subreal", "accepted_by")
+            .filter(company_id=self.request.user.company_id)
+        )
+
+
+# --------------------------------------------
+#  ЕДИНЫЙ эндпоинт "accept" как на макете:
+#  POST /api/main/accept/
+#  Body: { "agent_id": "<uuid User>", "product_id": "<uuid Product>", "qty": 50 }
+# --------------------------------------------
+
+class AcceptInlineAPIView(APIView):
+    """
+    POST /api/main/accept/
+    {
+      "agent_id": "<uuid>",
+      "product_id": "<uuid>",
+      "qty": 50
+    }
+
+    Логика:
+      - находим последнюю открытую передачу (company=user.company, agent, product, status=open)
+      - проверяем остаток
+      - создаём Acceptance
+      - отдаём компактный ответ для UI (как на макете)
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    @transaction.atomic
+    def post(self, request, *args, **kwargs):
+        in_ser = AcceptInlineInputSerializer(data=request.data, context={"request": request})
+        in_ser.is_valid(raise_exception=True)
+
+        sub = in_ser.validated_data["subreal"]
+        qty = in_ser.validated_data["qty"]
+
+        # создаём приём
+        acc = Acceptance.objects.create(
+            company=sub.company,
+            subreal=sub,
+            accepted_by=request.user,
+            qty=qty,
+            accepted_at=timezone.now(),
+        )
+        # обновим родителя
+        sub.refresh_from_db()
+
+        out = {
+            "agent": getattr(sub.agent, "get_full_name", lambda: "")() or getattr(sub.agent, "username", str(sub.agent)),
+            "product": sub.product.name,
+            "qty_transferred": sub.qty_transferred,
+            "qty_accept": qty,
+            "qty_remaining_after": sub.qty_remaining,
+        }
+        return Response(AcceptInlineOutputSerializer(out).data, status=status.HTTP_201_CREATED)

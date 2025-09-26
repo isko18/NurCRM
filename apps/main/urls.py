@@ -130,6 +130,17 @@ urlpatterns = [
     
     path("items-make/", ItemListCreateAPIView.as_view(), name="item-make-list-create"),
     path("items-make/<uuid:pk>/", ItemRetrieveUpdateDestroyAPIView.as_view(), name="item-make-detail"),
+    
+    
+    path("subreals/", ManufactureSubrealListCreateAPIView.as_view(), name="subreal-list-create"),
+    path("subreals/<uuid:pk>/", ManufactureSubrealRetrieveUpdateDestroyAPIView.as_view(), name="subreal-detail"),
+
+    # --- Acceptance ---
+    path("acceptances/", AcceptanceListCreateAPIView.as_view(), name="acceptance-list-create"),
+    path("acceptances/<uuid:pk>/", AcceptanceRetrieveDestroyAPIView.as_view(), name="acceptance-detail"),
+
+    # --- Inline accept ---
+    path("accept/", AcceptInlineAPIView.as_view(), name="accept-inline"),
 ]
 
 

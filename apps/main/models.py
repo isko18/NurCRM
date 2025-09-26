@@ -1279,3 +1279,115 @@ class ObjectSaleItem(models.Model):
             self.object_item.quantity = max(0, self.object_item.quantity - self.quantity)
             self.object_item.save(update_fields=["quantity"])
         self.sale.recalc()
+        
+        
+    # ↓↓↓ Замените ваш блок моделей на этот
+
+class ManufactureSubreal(models.Model):
+    class Status(models.TextChoices):
+        OPEN = "open", "Открыта"
+        CLOSED = "closed", "Закрыта"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    company = models.ForeignKey(
+        Company, on_delete=models.CASCADE, related_name="subreals", verbose_name="Компания"
+    )
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.PROTECT, related_name="subreals", verbose_name="Создал"
+    )
+
+    # Агент = ПОЛЬЗОВАТЕЛЬ
+    agent = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.PROTECT,
+        related_name="subreals_as_agent", verbose_name="Агент"
+    )
+    product = models.ForeignKey(
+        Product, on_delete=models.PROTECT, related_name="subreals", verbose_name="Товар"
+    )
+
+    qty_transferred = models.PositiveIntegerField(verbose_name="Кол-во передано")
+    qty_accepted = models.PositiveIntegerField(default=0, verbose_name="Кол-во принято")
+
+    status = models.CharField(max_length=10, choices=Status.choices, default=Status.OPEN, db_index=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        verbose_name = "Передача агенту"
+        verbose_name_plural = "Передачи агентам"
+        indexes = [
+            models.Index(fields=["company", "agent", "product", "status"]),
+            models.Index(fields=["created_at"]),
+        ]
+
+    def __str__(self):
+        # красиво выводим имя пользователя-агента
+        if hasattr(self.agent, "get_full_name"):
+            name = self.agent.get_full_name() or self.agent.username
+        else:
+            name = getattr(self.agent, "username", str(self.agent))
+        return f"{name} · {self.product.name} · {self.qty_transferred}"
+
+    @property
+    def qty_remaining(self) -> int:
+        return max(self.qty_transferred - self.qty_accepted, 0)
+
+    def clean(self):
+        # согласованность company (если у User есть company_id — проверим, иначе пропустим)
+        agent_company_id = getattr(self.agent, "company_id", None)
+        if self.agent_id and self.company_id and agent_company_id and agent_company_id != self.company_id:
+            raise ValidationError({"agent": "Агент принадлежит другой компании."})
+
+        if self.product_id and self.company_id and self.product.company_id != self.company_id:
+            raise ValidationError({"product": "Товар принадлежит другой компании."})
+
+        # проверку типа клиента убираем (её нет у User)
+        if self.qty_accepted > self.qty_transferred:
+            raise ValidationError({"qty_accepted": "Принято не может превышать переданное."})
+
+    def try_close(self):
+        if self.qty_remaining == 0 and self.status != self.Status.CLOSED:
+            self.status = self.Status.CLOSED
+            self.save(update_fields=["status"])
+
+
+class Acceptance(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    company = models.ForeignKey(
+        Company, on_delete=models.CASCADE, related_name="acceptances", verbose_name="Компания"
+    )
+    subreal = models.ForeignKey(
+        ManufactureSubreal, on_delete=models.CASCADE, related_name="acceptances", verbose_name="Передача"
+    )
+    accepted_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.PROTECT, related_name="acceptances", verbose_name="Кем принято"
+    )
+    qty = models.PositiveIntegerField(verbose_name="Кол-во принять")
+    accepted_at = models.DateTimeField(default=timezone.now)
+
+    class Meta:
+        verbose_name = "Приём по передаче"
+        verbose_name_plural = "Приёмы по передаче"
+        ordering = ["-accepted_at"]
+        indexes = [
+            models.Index(fields=["company", "accepted_at"]),
+            models.Index(fields=["subreal"]),
+        ]
+
+    def clean(self):
+        if self.subreal_id and self.company_id and self.subreal.company_id != self.company_id:
+            raise ValidationError({"company": "Компания приёма должна совпадать с компанией передачи."})
+        if self.subreal and self.qty > self.subreal.qty_remaining:
+            raise ValidationError({"qty": f"Нельзя принять {self.qty}: доступно {self.subreal.qty_remaining}."})
+
+    def save(self, *args, **kwargs):
+        if self.subreal_id and not self.company_id:
+            self.company_id = self.subreal.company_id
+        self.full_clean()
+        creating = self._state.adding
+        super().save(*args, **kwargs)
+        if creating:
+            ManufactureSubreal.objects.filter(pk=self.subreal_id).update(
+                qty_accepted=models.F("qty_accepted") + self.qty
+            )
+            self.subreal.refresh_from_db(fields=["qty_accepted", "qty_transferred", "status"])
+            self.subreal.try_close()
