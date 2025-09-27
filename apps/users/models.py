@@ -163,6 +163,8 @@ class User(AbstractBaseUser, PermissionsMixin):
     can_view_salary = models.BooleanField(default=False, verbose_name='Доступ к зарплатам')
     can_view_sales = models.BooleanField(default=False, verbose_name='Доступ к продажам')
     can_view_services = models.BooleanField(default=False, verbose_name='Доступ к услугам')
+    can_view_agent = models.BooleanField(default=False, verbose_name='Доступ к агентам')
+    
     created_at = models.DateTimeField(auto_now_add=True, verbose_name='Дата создания')
     updated_at = models.DateTimeField(auto_now=True, verbose_name='Дата обновления')
 
