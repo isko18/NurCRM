@@ -1287,7 +1287,7 @@ class ManufactureSubreal(models.Model):
         CLOSED = "closed", "Закрыта"
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    company = models.ForeignKey("Company", on_delete=models.CASCADE, related_name="subreals")
+    company = models.ForeignKey(Company, on_delete=models.CASCADE, related_name="subreals")
     user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.PROTECT, related_name="subreals")
     agent = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.PROTECT, related_name="subreals_as_agent")
     product = models.ForeignKey("Product", on_delete=models.PROTECT, related_name="subreals")
@@ -1340,7 +1340,7 @@ class ManufactureSubreal(models.Model):
 
 class Acceptance(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    company = models.ForeignKey("Company", on_delete=models.CASCADE, related_name="acceptances")
+    company = models.ForeignKey(Company, on_delete=models.CASCADE, related_name="acceptances")
     subreal = models.ForeignKey(ManufactureSubreal, on_delete=models.CASCADE, related_name="acceptances")
     accepted_by = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.PROTECT, related_name="acceptances")
     qty = models.PositiveIntegerField()
@@ -1377,7 +1377,7 @@ class Acceptance(models.Model):
 
 class ReturnFromAgent(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    company = models.ForeignKey("Company", on_delete=models.CASCADE, related_name="returns")
+    company = models.ForeignKey(Company, on_delete=models.CASCADE, related_name="returns")
     subreal = models.ForeignKey(ManufactureSubreal, on_delete=models.CASCADE, related_name="returns")
     returned_by = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.PROTECT, related_name="returns")
     qty = models.PositiveIntegerField()
