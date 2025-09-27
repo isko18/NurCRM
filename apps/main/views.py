@@ -32,7 +32,7 @@ from apps.main.serializers import (
     ReviewSerializer, NotificationSerializer, EventSerializer,
     WarehouseSerializer, WarehouseEventSerializer,
     ProductCategorySerializer, ProductBrandSerializer,
-    OrderItemSerializer, ClientSerializer, ClientDealSerializer, BidSerializers, SocialApplicationsSerializers, TransactionRecordSerializer, ContractorWorkSerializer, DebtSerializer, DebtPaymentSerializer, ObjectItemSerializer, ObjectSaleSerializer, ObjectSaleItemSerializer, BulkIdsSerializer, ItemMakeSerializer, ManufactureSubrealSerializer, AcceptanceCreateSerializer, ReturnCreateSerializer
+    OrderItemSerializer, ClientSerializer, ClientDealSerializer, BidSerializers, SocialApplicationsSerializers, TransactionRecordSerializer, ContractorWorkSerializer, DebtSerializer, DebtPaymentSerializer, ObjectItemSerializer, ObjectSaleSerializer, ObjectSaleItemSerializer, BulkIdsSerializer, ItemMakeSerializer, ManufactureSubrealSerializer, AcceptanceCreateSerializer, ReturnCreateSerializer, BulkSubrealCreateSerializer
 )
 from django.db.models import ProtectedError
 
@@ -1135,34 +1135,6 @@ class ItemRetrieveUpdateDestroyAPIView(CompanyRestrictedMixin, generics.Retrieve
 # -------------------------
 
 class ManufactureSubrealListCreateAPIView(generics.ListCreateAPIView):
-    permission_classes = [permissions.IsAuthenticated]
-    serializer_class = ManufactureSubrealSerializer
-    filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
-    filterset_fields = ["agent", "product", "status", "created_at"]
-    search_fields = ["product__name", "agent__username", "agent__first_name", "agent__last_name"]
-    ordering_fields = ["created_at", "qty_transferred", "qty_accepted", "status"]
-    ordering = ["-created_at"]
-
-    def get_queryset(self):
-        return ManufactureSubreal.objects.select_related("company", "user", "agent", "product") \
-            .filter(company_id=self.request.user.company_id)
-
-    def perform_create(self, serializer):
-        company = self.request.user.company
-        product = serializer.validated_data.get("product")
-        if product and product.company_id != company.id:
-            raise serializers.ValidationError({"product": "Товар другой компании."})
-        agent = serializer.validated_data.get("agent")
-        agent_company_id = getattr(agent, "company_id", None)
-        if agent_company_id and agent_company_id != company.id:
-            raise serializers.ValidationError({"agent": "Агент другой компании."})
-        serializer.save(company=company, user=self.request.user)
-
-# -------------------------
-#   ManufactureSubreal
-# -------------------------
-
-class ManufactureSubrealListCreateAPIView(generics.ListCreateAPIView):
     """
     GET  /api/main/subreals/
     POST /api/main/subreals/
@@ -1237,13 +1209,13 @@ class AcceptanceListCreateAPIView(generics.ListCreateAPIView):
 
     @transaction.atomic
     def perform_create(self, serializer):
+        # блокируем родителя для корректности остатка при конкуренции
         sub = serializer.validated_data["subreal"]
         locked = ManufactureSubreal.objects.select_for_update().get(pk=sub.pk)
         qty = serializer.validated_data["qty"]
         if qty > locked.qty_remaining:
             raise serializers.ValidationError({"qty": f"Можно принять максимум {locked.qty_remaining}."})
         serializer.save(company=self.request.user.company, accepted_by=self.request.user)
-
 
 class AcceptanceRetrieveDestroyAPIView(generics.RetrieveDestroyAPIView):
     """
@@ -1286,7 +1258,6 @@ class ReturnFromAgentListCreateAPIView(generics.ListCreateAPIView):
             raise serializers.ValidationError({"qty": f"Можно вернуть максимум {locked.qty_on_agent}."})
         serializer.save(company=self.request.user.company, returned_by=self.request.user)
 
-
 class ReturnFromAgentRetrieveDestroyAPIView(generics.RetrieveDestroyAPIView):
     """
     GET    /api/main/returns/<uuid:pk>/
@@ -1298,3 +1269,48 @@ class ReturnFromAgentRetrieveDestroyAPIView(generics.RetrieveDestroyAPIView):
     def get_queryset(self):
         return ReturnFromAgent.objects.select_related("company", "subreal", "returned_by") \
             .filter(company_id=self.request.user.company_id)
+
+# -------------------------
+#   Bulk: одному агенту — несколько товаров
+# -------------------------
+
+class ManufactureSubrealBulkCreateAPIView(APIView):
+    """
+    POST /api/main/subreals/bulk/
+    Body:
+    {
+      "agent": "<uuid-агента>",
+      "items": [
+        {"product": "<uuid-товара-1>", "qty_transferred": 10},
+        {"product": "<uuid-товара-2>", "qty_transferred": 5}
+      ]
+    }
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    @transaction.atomic
+    def post(self, request, *args, **kwargs):
+        ser = BulkSubrealCreateSerializer(data=request.data, context={"request": request})
+        ser.is_valid(raise_exception=True)
+
+        agent = ser.validated_data["agent"]
+        items = ser.validated_data["items"]
+        user = request.user
+        company = user.company
+
+        created = [
+            ManufactureSubreal(
+                company=company,
+                user=user,
+                agent=agent,
+                product=item["product"],
+                qty_transferred=item["qty_transferred"],
+            )
+            for item in items
+        ]
+        ManufactureSubreal.objects.bulk_create(created)
+
+        ids = [obj.id for obj in created]
+        objs = ManufactureSubreal.objects.select_related("company", "user", "agent", "product").filter(id__in=ids)
+        out = ManufactureSubrealSerializer(objs, many=True, context={"request": request}).data
+        return Response(out, status=status.HTTP_201_CREATED)

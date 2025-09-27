@@ -975,7 +975,6 @@ class AcceptanceCreateSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError({"qty": "Минимум 1."})
         if qty > sub.qty_remaining:
             raise serializers.ValidationError({"qty": f"Доступно к приёму {sub.qty_remaining}."})
-        # компания приёма должна совпадать
         user_company_id = getattr(self.context["request"].user, "company_id", None)
         if user_company_id and sub.company_id != user_company_id:
             raise serializers.ValidationError({"subreal": "Передача из другой компании."})
@@ -1021,3 +1020,30 @@ class ReturnCreateSerializer(serializers.ModelSerializer):
         validated_data["company_id"] = company_id
         validated_data["returned_by"] = user
         return super().create(validated_data)
+    
+    
+class BulkSubrealItemSerializer(serializers.Serializer):
+    product = serializers.PrimaryKeyRelatedField(queryset=Product.objects.all())
+    qty_transferred = serializers.IntegerField(min_value=1)
+
+class BulkSubrealCreateSerializer(serializers.Serializer):
+    agent = serializers.PrimaryKeyRelatedField(queryset=User.objects.all())
+    items = BulkSubrealItemSerializer(many=True, allow_empty=False)
+
+    def validate(self, attrs):
+        request = self.context["request"]
+        company_id = getattr(request.user, "company_id", None)
+        if not company_id:
+            raise serializers.ValidationError("У пользователя не задана компания.")
+
+        agent = attrs["agent"]
+        agent_company_id = getattr(agent, "company_id", None)
+        if agent_company_id and agent_company_id != company_id:
+            raise serializers.ValidationError({"agent": "Агент принадлежит другой компании."})
+
+        for i, item in enumerate(attrs["items"]):
+            prod = item["product"]
+            if prod.company_id != company_id:
+                raise serializers.ValidationError({"items": {i: {"product": "Товар другой компании."}}})
+
+        return attrs

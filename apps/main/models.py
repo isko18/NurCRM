@@ -1287,17 +1287,29 @@ class ManufactureSubreal(models.Model):
         CLOSED = "closed", "Закрыта"
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    company = models.ForeignKey(Company, on_delete=models.CASCADE, related_name="subreals")
+    company = models.ForeignKey("Company", on_delete=models.CASCADE, related_name="subreals")
     user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.PROTECT, related_name="subreals")
     agent = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.PROTECT, related_name="subreals_as_agent")
-    product = models.ForeignKey(Product, on_delete=models.PROTECT, related_name="subreals")
+    product = models.ForeignKey("Product", on_delete=models.PROTECT, related_name="subreals")
 
     qty_transferred = models.PositiveIntegerField()
     qty_accepted = models.PositiveIntegerField(default=0)
-    qty_returned = models.PositiveIntegerField(default=0)  # ← добавили
+    qty_returned = models.PositiveIntegerField(default=0)
 
     status = models.CharField(max_length=10, choices=Status.choices, default=Status.OPEN, db_index=True)
     created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        verbose_name = "Передача агенту"
+        verbose_name_plural = "Передачи агентам"
+        indexes = [
+            models.Index(fields=["company", "agent", "product", "status"]),
+            models.Index(fields=["created_at"]),
+        ]
+
+    def __str__(self):
+        name = getattr(self.agent, "get_full_name", lambda: "")() or getattr(self.agent, "username", str(self.agent))
+        return f"{name} · {self.product.name} · {self.qty_transferred}"
 
     @property
     def qty_remaining(self) -> int:
@@ -1328,11 +1340,20 @@ class ManufactureSubreal(models.Model):
 
 class Acceptance(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    company = models.ForeignKey(Company, on_delete=models.CASCADE, related_name="acceptances")
+    company = models.ForeignKey("Company", on_delete=models.CASCADE, related_name="acceptances")
     subreal = models.ForeignKey(ManufactureSubreal, on_delete=models.CASCADE, related_name="acceptances")
     accepted_by = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.PROTECT, related_name="acceptances")
     qty = models.PositiveIntegerField()
     accepted_at = models.DateTimeField(default=timezone.now)
+
+    class Meta:
+        verbose_name = "Приём по передаче"
+        verbose_name_plural = "Приёмы по передаче"
+        ordering = ["-accepted_at"]
+        indexes = [
+            models.Index(fields=["company", "accepted_at"]),
+            models.Index(fields=["subreal"]),
+        ]
 
     def clean(self):
         if self.subreal_id and self.company_id and self.subreal.company_id != self.company_id:
@@ -1356,11 +1377,20 @@ class Acceptance(models.Model):
 
 class ReturnFromAgent(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    company = models.ForeignKey(Company, on_delete=models.CASCADE, related_name="returns")
+    company = models.ForeignKey("Company", on_delete=models.CASCADE, related_name="returns")
     subreal = models.ForeignKey(ManufactureSubreal, on_delete=models.CASCADE, related_name="returns")
     returned_by = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.PROTECT, related_name="returns")
     qty = models.PositiveIntegerField()
     returned_at = models.DateTimeField(default=timezone.now)
+
+    class Meta:
+        verbose_name = "Возврат от агента"
+        verbose_name_plural = "Возвраты от агентов"
+        ordering = ["-returned_at"]
+        indexes = [
+            models.Index(fields=["company", "returned_at"]),
+            models.Index(fields=["subreal"]),
+        ]
 
     def clean(self):
         if self.subreal_id and self.company_id and self.subreal.company_id != self.company_id:
