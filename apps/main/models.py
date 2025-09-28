@@ -1376,14 +1376,25 @@ class Acceptance(models.Model):
             self.subreal.refresh_from_db(fields=["qty_accepted", "qty_transferred", "status"])
             self.subreal.try_close()
 
-
 class ReturnFromAgent(models.Model):
+    class Status(models.TextChoices):
+        PENDING  = "pending",  "Ожидает приёма"
+        ACCEPTED = "accepted", "Принят"
+        REJECTED = "rejected", "Отклонён"
+
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     company = models.ForeignKey(Company, on_delete=models.CASCADE, related_name="returns")
     subreal = models.ForeignKey(ManufactureSubreal, on_delete=models.CASCADE, related_name="returns")
     returned_by = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.PROTECT, related_name="returns")
     qty = models.PositiveIntegerField()
     returned_at = models.DateTimeField(default=timezone.now)
+
+    status = models.CharField(max_length=10, choices=Status.choices, default=Status.PENDING, db_index=True)
+    accepted_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.PROTECT,
+        related_name="accepted_returns", null=True, blank=True
+    )
+    accepted_at = models.DateTimeField(null=True, blank=True)
 
     class Meta:
         verbose_name = "Возврат от агента"
@@ -1392,31 +1403,46 @@ class ReturnFromAgent(models.Model):
         indexes = [
             models.Index(fields=["company", "returned_at"]),
             models.Index(fields=["subreal"]),
+            models.Index(fields=["status"]),
         ]
 
     def clean(self):
         if self.subreal_id and self.company_id and self.subreal.company_id != self.company_id:
             raise ValidationError({"company": "Компания возврата должна совпадать с компанией передачи."})
-        if self.subreal and self.qty > self.subreal.qty_on_agent:
+        if self.qty < 1:
+            raise ValidationError({"qty": "Минимум 1."})
+        # на создании/редактировании PENDING гарантируем, что агент не возвращает больше, чем у него на руках
+        if self.subreal and self.status == self.Status.PENDING and self.qty > self.subreal.qty_on_agent:
             raise ValidationError({"qty": f"Нельзя вернуть {self.qty}: на руках {self.subreal.qty_on_agent}."})
 
     def save(self, *args, **kwargs):
+        # НИКАКИХ движений склада здесь!
         if self.subreal_id and not self.company_id:
             self.company_id = self.subreal.company_id
         self.full_clean()
-        creating = self._state.adding
         super().save(*args, **kwargs)
 
-        if creating:
-            # 1) учесть возврат на передаче
-            ManufactureSubreal.objects.filter(pk=self.subreal_id).update(
-                qty_returned=F("qty_returned") + self.qty
-            )
+    @transaction.atomic
+    def accept(self, by_user):
+        if self.status != self.Status.PENDING:
+            raise ValidationError("Возврат уже обработан.")
 
-            # 2) (+) вернуть на склад товара: product.quantity += qty
-            # Без импорта Product, безопасно через фактический класс объекта:
-            product = self.subreal.product
-            with transaction.atomic():
-                type(product).objects.select_for_update().filter(pk=product.pk).update(
-                    quantity=F("quantity") + self.qty
-                )
+        # Лочим передачу и проверяем остаток на руках ещё раз
+        locked_sub = ManufactureSubreal.objects.select_for_update().get(pk=self.subreal_id)
+        if self.qty > locked_sub.qty_on_agent:
+            raise ValidationError({"qty": f"Можно принять максимум {locked_sub.qty_on_agent}."})
+
+        # Приходуем товар на склад
+        product = locked_sub.product
+        type(product).objects.select_for_update().filter(pk=product.pk).update(
+            quantity=F("quantity") + self.qty
+        )
+        # Фиксируем возврат на передаче
+        ManufactureSubreal.objects.filter(pk=locked_sub.pk).update(
+            qty_returned=F("qty_returned") + self.qty
+        )
+        # Обновляем статус
+        self.status = self.Status.ACCEPTED
+        self.accepted_by = by_user
+        self.accepted_at = timezone.now()
+        super().save(update_fields=["status", "accepted_by", "accepted_at"])
