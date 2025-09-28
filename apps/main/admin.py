@@ -13,7 +13,7 @@ from .models import (
     Review, Notification, Integration, Analytics, Event,
     Warehouse, WarehouseEvent,
     Client, ClientDeal, DealInstallment,
-    Bid, SocialApplications, TransactionRecord, DebtPayment, Debt, ObjectItem, ObjectSale, ObjectSaleItem
+    Bid, SocialApplications, TransactionRecord, DebtPayment, Debt, ObjectItem, ObjectSale, ObjectSaleItem, ManufactureSubreal, Acceptance, ReturnFromAgent
 )
 
 admin.site.site_header = "nurCRM Admin"
@@ -25,6 +25,11 @@ admin.site.register(DebtPayment)
 admin.site.register(ObjectItem)
 admin.site.register(ObjectSale)
 admin.site.register(ObjectSaleItem)
+
+admin.site.register(ManufactureSubreal)
+admin.site.register(Acceptance)
+admin.site.register(ReturnFromAgent)
+
 
 
 # ========= Инлайны =========
