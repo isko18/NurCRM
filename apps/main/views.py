@@ -4,6 +4,8 @@ from django.db import transaction
 from django.db.models import Sum, Count, Avg
 from django.utils.dateparse import parse_date
 from django.utils import timezone
+from itertools import groupby
+from operator import attrgetter
 from django.db.models import F
 
 from rest_framework import generics, permissions, filters, status
@@ -33,7 +35,7 @@ from apps.main.serializers import (
     ReviewSerializer, NotificationSerializer, EventSerializer,
     WarehouseSerializer, WarehouseEventSerializer,
     ProductCategorySerializer, ProductBrandSerializer,
-    OrderItemSerializer, ClientSerializer, ClientDealSerializer, BidSerializers, SocialApplicationsSerializers, TransactionRecordSerializer, ContractorWorkSerializer, DebtSerializer, DebtPaymentSerializer, ObjectItemSerializer, ObjectSaleSerializer, ObjectSaleItemSerializer, BulkIdsSerializer, ItemMakeSerializer, ManufactureSubrealSerializer, AcceptanceCreateSerializer, ReturnCreateSerializer, BulkSubrealCreateSerializer, AcceptanceReadSerializer, ReturnApproveSerializer, ReturnReadSerializer
+    OrderItemSerializer, ClientSerializer, ClientDealSerializer, BidSerializers, SocialApplicationsSerializers, TransactionRecordSerializer, ContractorWorkSerializer, DebtSerializer, DebtPaymentSerializer, ObjectItemSerializer, ObjectSaleSerializer, ObjectSaleItemSerializer, BulkIdsSerializer, ItemMakeSerializer, ManufactureSubrealSerializer, AcceptanceCreateSerializer, ReturnCreateSerializer, BulkSubrealCreateSerializer, AcceptanceReadSerializer, ReturnApproveSerializer, ReturnReadSerializer, AgentProductOnHandSerializer
 )
 from django.db.models import ProtectedError
 
@@ -1410,6 +1412,11 @@ class ManufactureSubrealBulkCreateAPIView(APIView):
 class AgentMyProductsListAPIView(APIView):
     """
     GET /api/main/agents/me/products/
+    Возвращает по каждому товару:
+      - product, product_name
+      - qty_on_hand (сумма по всем передачам: accepted - returned)
+      - last_movement_at (максимум из created_at передач, accepted_at приёмов, accepted_at принятых возвратов)
+      - subreals: список передач (id, created_at, qty_transferred/accepted/returned)
     """
     permission_classes = [permissions.IsAuthenticated]
 
@@ -1418,16 +1425,63 @@ class AgentMyProductsListAPIView(APIView):
         if not company_id:
             return Response([], status=200)
 
-        rows = (
+        # забираем все передачи агента по компании, вместе с продуктом и движениями
+        qs = (
             ManufactureSubreal.objects
             .filter(company_id=company_id, agent_id=request.user.id)
-            .values("product_id", "product__name")
-            .annotate(qty_on_hand=Sum(F("qty_accepted") - F("qty_returned")))
-            .filter(qty_on_hand__gt=0)
-            .order_by("product__name")
+            .select_related("product")
+            .prefetch_related("acceptances", "returns")
+            .order_by("product_id", "-created_at")  # для groupby по product_id
         )
-        data = [
-            {"product": r["product_id"], "product_name": r["product__name"], "qty_on_hand": r["qty_on_hand"] or 0}
-            for r in rows
-        ]
-        return Response(data, status=200)
+
+        data = []
+        for product_id, subreals_iter in groupby(qs, key=attrgetter("product_id")):
+            subreals = list(subreals_iter)
+            # суммарно на руках по этому товару
+            qty_on_hand = sum((s.qty_accepted - s.qty_returned) for s in subreals)
+            if qty_on_hand <= 0:
+                continue  # показываем только то, что реально на руках
+
+            # соберём даты движений
+            movement_dates = []
+            for s in subreals:
+                # создание передачи — тоже движение
+                if s.created_at:
+                    movement_dates.append(s.created_at)
+                # приёмы
+                for acc in s.acceptances.all():
+                    if acc.accepted_at:
+                        movement_dates.append(acc.accepted_at)
+                # возвраты: учитываем только принятые возвраты (accepted)
+                for ret in s.returns.all():
+                    dt = getattr(ret, "accepted_at", None)
+                    if getattr(ret, "status", None) == getattr(ReturnFromAgent.Status, "ACCEPTED", "accepted") and dt:
+                        movement_dates.append(dt)
+
+            last_movement_at = max(movement_dates) if movement_dates else None
+
+            # список передач для UI
+            subreals_payload = [
+                {
+                    "id": s.id,
+                    "created_at": s.created_at,
+                    "qty_transferred": s.qty_transferred,
+                    "qty_accepted": s.qty_accepted,
+                    "qty_returned": s.qty_returned,
+                }
+                for s in subreals
+            ]
+
+            data.append({
+                "product": product_id,
+                "product_name": subreals[0].product.name if subreals and subreals[0].product else "",
+                "qty_on_hand": qty_on_hand,
+                "last_movement_at": last_movement_at,
+                "subreals": subreals_payload,
+            })
+
+        # если используешь AgentProductOnHandSerializer с новыми полями
+        # убедись, что он содержит:
+        # - last_movement_at = serializers.DateTimeField()
+        # - subreals = AgentSubrealSerializer(many=True)
+        return Response(AgentProductOnHandSerializer(data, many=True).data, status=200)

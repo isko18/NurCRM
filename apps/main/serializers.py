@@ -1176,7 +1176,16 @@ class BulkSubrealCreateSerializer(serializers.Serializer):
 #   Аггрегированный ответ: "мои товары" у агента
 # -------------------------
 
+class AgentSubrealSerializer(serializers.Serializer):
+    id = serializers.UUIDField()
+    created_at = serializers.DateTimeField()
+    qty_transferred = serializers.IntegerField()
+    qty_accepted = serializers.IntegerField()
+    qty_returned = serializers.IntegerField()
+
 class AgentProductOnHandSerializer(serializers.Serializer):
-    product = serializers.UUIDField()    # UUID товара
+    product = serializers.UUIDField()
     product_name = serializers.CharField()
     qty_on_hand = serializers.IntegerField()
+    last_movement_at = serializers.DateTimeField(allow_null=True)
+    subreals = AgentSubrealSerializer(many=True)
