@@ -897,6 +897,11 @@ class ItemMakeSerializer(serializers.ModelSerializer):
         validated_data["company"] = self.context["request"].user.company
         return super().create(validated_data)
  # serializers.py
+
+# -------------------------
+#   ManufactureSubreal
+# -------------------------
+# serializers.py
 from django.contrib.auth import get_user_model
 from rest_framework import serializers
 
@@ -929,12 +934,7 @@ class ManufactureSubrealSerializer(serializers.ModelSerializer):
             "qty_remaining", "qty_on_agent",
             "status", "created_at",
         ]
-        read_only_fields = [
-            "id", "company", "user",
-            "qty_accepted", "qty_returned",
-            "qty_remaining", "qty_on_agent",
-            "status", "created_at",
-        ]
+    # read_only_fields не нужен отдельно — все вычисляемые и audit-поля уже ReadOnly/заполняются на сервере.
 
     def get_agent_name(self, obj):
         if not getattr(obj, "agent", None):
@@ -950,6 +950,7 @@ class ManufactureSubrealSerializer(serializers.ModelSerializer):
         user = getattr(request, "user", None) if request else None
         company_id = getattr(user, "company_id", None)
 
+        # На create требуем компанию
         if self.instance is None and not company_id:
             raise serializers.ValidationError("У пользователя не задана компания.")
 
@@ -1016,37 +1017,31 @@ class AcceptanceCreateSerializer(serializers.ModelSerializer):
 
 class AcceptanceReadSerializer(serializers.ModelSerializer):
     subreal_id = serializers.UUIDField(source="subreal.id", read_only=True)
-    accepted_by_name = serializers.SerializerMethodField()
     product = serializers.CharField(source="subreal.product.name", read_only=True)
     agent = serializers.SerializerMethodField()
+    accepted_by_name = serializers.SerializerMethodField()
 
     class Meta:
         model = Acceptance
         fields = [
-            "id",
-            "company",
-            "subreal_id",
-            "product",
-            "agent",
-            "accepted_by",
-            "accepted_by_name",
-            "qty",
-            "accepted_at",
+            "id", "company", "subreal_id", "product", "agent",
+            "accepted_by", "accepted_by_name", "qty", "accepted_at",
         ]
         read_only_fields = fields
-
-    def get_accepted_by_name(self, obj):
-        fn = getattr(obj.accepted_by, "get_full_name", lambda: "")() or None
-        return fn or getattr(obj.accepted_by, "username", str(obj.accepted_by))
 
     def get_agent(self, obj):
         a = obj.subreal.agent
         fn = getattr(a, "get_full_name", lambda: "")() or None
         return fn or getattr(a, "username", str(a))
 
+    def get_accepted_by_name(self, obj):
+        fn = getattr(obj.accepted_by, "get_full_name", lambda: "")() or None
+        return fn or getattr(obj.accepted_by, "username", str(obj.accepted_by))
+
 
 # -------------------------
 #   ReturnFromAgent
+#   (двухшаговый: create -> pending, approve -> accepted)
 # -------------------------
 
 class ReturnCreateSerializer(serializers.ModelSerializer):
@@ -1066,6 +1061,7 @@ class ReturnCreateSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError({"subreal": "Обязательное поле."})
         if qty is None or qty < 1:
             raise serializers.ValidationError({"qty": "Минимум 1."})
+        # на стадии "pending" проверяем, что агент не запрашивает больше, чем на руках
         if qty > sub.qty_on_agent:
             raise serializers.ValidationError({"qty": f"На руках {sub.qty_on_agent}."})
         if user_company_id and sub.company_id != user_company_id:
@@ -1080,7 +1076,55 @@ class ReturnCreateSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError({"company": "У пользователя не задана компания."})
         validated_data["company_id"] = company_id
         validated_data["returned_by"] = user
+        # status остаётся по default = pending (в модели)
         return super().create(validated_data)
+
+
+class ReturnReadSerializer(serializers.ModelSerializer):
+    subreal_id = serializers.UUIDField(source="subreal.id", read_only=True)
+    product = serializers.CharField(source="subreal.product.name", read_only=True)
+    agent = serializers.SerializerMethodField()
+    returned_by_name = serializers.SerializerMethodField()
+    accepted_by_name = serializers.SerializerMethodField()
+
+    class Meta:
+        model = ReturnFromAgent
+        fields = [
+            "id", "company", "subreal_id", "product", "agent",
+            "qty", "status",
+            "returned_by", "returned_by_name",
+            "accepted_by", "accepted_by_name",
+            "returned_at", "accepted_at",
+        ]
+        read_only_fields = fields
+
+    def get_agent(self, obj):
+        a = obj.subreal.agent
+        fn = getattr(a, "get_full_name", lambda: "")() or None
+        return fn or getattr(a, "username", str(a))
+
+    def get_returned_by_name(self, obj):
+        fn = getattr(obj.returned_by, "get_full_name", lambda: "")() or None
+        return fn or getattr(obj.returned_by, "username", str(obj.returned_by))
+
+    def get_accepted_by_name(self, obj):
+        u = obj.accepted_by
+        if not u:
+            return None
+        fn = getattr(u, "get_full_name", lambda: "")() or None
+        return fn or getattr(u, "username", str(u))
+
+
+class ReturnApproveSerializer(serializers.Serializer):
+    """
+    Пустой вход; объект возврата передаём через context["return_obj"].
+    Вызывает ReturnFromAgent.accept(...) (движение склада и qty_returned).
+    """
+    def save(self, **kwargs):
+        ret: ReturnFromAgent = self.context["return_obj"]
+        user = self.context["request"].user
+        ret.accept(by_user=user)
+        return ret
 
 
 # -------------------------
@@ -1107,12 +1151,13 @@ class BulkSubrealCreateSerializer(serializers.Serializer):
         if agent_company_id and agent_company_id != company_id:
             raise serializers.ValidationError({"agent": "Агент принадлежит другой компании."})
 
+        # Проверка компании у товаров
         for i, item in enumerate(attrs["items"]):
             prod = item["product"]
             if prod.company_id != company_id:
                 raise serializers.ValidationError({"items": {i: {"product": "Товар другой компании."}}})
 
-        # Склейка дубликатов (опционально; удобно, если фронт может прислать один и тот же товар несколько раз)
+        # Склейка дубликатов (если один и тот же product пришёл несколько раз)
         merged = {}
         for item in attrs["items"]:
             key = item["product"].pk
