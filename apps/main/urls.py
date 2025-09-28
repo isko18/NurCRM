@@ -136,13 +136,22 @@ urlpatterns = [
     path("subreals/<uuid:pk>/", ManufactureSubrealRetrieveUpdateDestroyAPIView.as_view(), name="subreal-detail"),
     path("subreals/bulk/", ManufactureSubrealBulkCreateAPIView.as_view(), name="subreal-bulk-create"),
 
+    # -------------------------
     # Приёмы
+    # -------------------------
     path("acceptances/", AcceptanceListCreateAPIView.as_view(), name="acceptance-list-create"),
     path("acceptances/<uuid:pk>/", AcceptanceRetrieveDestroyAPIView.as_view(), name="acceptance-detail"),
 
+    # -------------------------
     # Возвраты
+    # -------------------------
     path("returns/", ReturnFromAgentListCreateAPIView.as_view(), name="return-list-create"),
     path("returns/<uuid:pk>/", ReturnFromAgentRetrieveDestroyAPIView.as_view(), name="return-detail"),
+
+    # -------------------------
+    # Агент: свои товары
+    # -------------------------
+    path("agents/me/products/", AgentMyProductsListAPIView.as_view(), name="agent-my-products"),
 ]
 
 

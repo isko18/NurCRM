@@ -13,6 +13,8 @@ from django.core.exceptions import ValidationError
 from dateutil.relativedelta import relativedelta
 from django.db.models import Sum
 from decimal import Decimal, ROUND_HALF_UP
+from django.db import transaction
+from django.db.models import F
 
 _Q2 = Decimal("0.01")
 def _money(x: Decimal) -> Decimal:
@@ -1404,7 +1406,17 @@ class ReturnFromAgent(models.Model):
         self.full_clean()
         creating = self._state.adding
         super().save(*args, **kwargs)
+
         if creating:
+            # 1) учесть возврат на передаче
             ManufactureSubreal.objects.filter(pk=self.subreal_id).update(
-                qty_returned=models.F("qty_returned") + self.qty
+                qty_returned=F("qty_returned") + self.qty
             )
+
+            # 2) (+) вернуть на склад товара: product.quantity += qty
+            # Без импорта Product, безопасно через фактический класс объекта:
+            product = self.subreal.product
+            with transaction.atomic():
+                type(product).objects.select_for_update().filter(pk=product.pk).update(
+                    quantity=F("quantity") + self.qty
+                )
