@@ -22,7 +22,7 @@ from .pos_serializers import (
     SaleCartSerializer, SaleItemSerializer,
     ScanRequestSerializer, AddItemSerializer,
     CheckoutSerializer, MobileScannerTokenSerializer,
-    SaleListSerializer, SaleDetailSerializer,
+    SaleListSerializer, SaleDetailSerializer, StartCartOptionsSerializer
 )
 from apps.main.services import checkout_cart, NotEnoughStock
 from apps.main.views import CompanyRestrictedMixin
@@ -229,11 +229,11 @@ class SaleReceiptDownloadAPIView(APIView):
         buffer.seek(0)
         return FileResponse(buffer, as_attachment=True, filename=f"receipt_{sale.id}.pdf")
     
-
 class SaleStartAPIView(APIView):
     """
     POST — создать/получить активную корзину для текущего пользователя.
     Если найдено несколько активных — оставим самую свежую, остальные закроем.
+    + Опционально: принять скидку на итог (сумма) при старте.
     """
     permission_classes = [permissions.IsAuthenticated]
 
@@ -256,7 +256,21 @@ class SaleStartAPIView(APIView):
                     status=Cart.Status.CHECKED_OUT, updated_at=timezone.now()
                 )
 
+        # === НОВОЕ: суммовая скидка на весь заказ ===
+        opts = StartCartOptionsSerializer(data=request.data)
+        # мягкая валидация: если фронт ничего не прислал — не ломаем контракт
+        if opts.is_valid():
+            order_disc = opts.validated_data.get("order_discount_total")
+            if order_disc is not None:
+                # нормализуем до 2 знаков и сохраняем
+                cart.order_discount_total = _q2(order_disc)
+                cart.save(update_fields=["order_discount_total"])
+
+        # пересчёт итогов с учётом order_discount_total
+        cart.recalc()
+
         return Response(SaleCartSerializer(cart).data, status=status.HTTP_201_CREATED)
+
 
 
 class CartDetailAPIView(generics.RetrieveAPIView):
