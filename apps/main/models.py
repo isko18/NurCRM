@@ -470,6 +470,9 @@ class CartItem(models.Model):
     company = models.ForeignKey(Company, on_delete=models.CASCADE, related_name="cart_items", verbose_name="Компания")
     cart = models.ForeignKey(Cart, on_delete=models.CASCADE, related_name="items", verbose_name="Корзина")
     product = models.ForeignKey(Product, null=True, blank=True, on_delete=models.SET_NULL, related_name="cart_items", verbose_name="Товар")
+    custom_name = models.CharField(               # ← НОВОЕ
+        max_length=255, blank=True, verbose_name="Название (кастомное)"
+    )
     quantity = models.PositiveIntegerField(default=1, verbose_name="Количество")
     unit_price = models.DecimalField(max_digits=12, decimal_places=2, verbose_name="Цена за единицу")
 
@@ -479,8 +482,9 @@ class CartItem(models.Model):
         verbose_name_plural = "Товары в корзине"
 
     def save(self, *args, **kwargs):
-        if not self.unit_price:
-            self.unit_price = self.product.price
+        # если цена не задана — берём из продукта, иначе 0
+        if self.unit_price is None:
+            self.unit_price = getattr(self.product, "price", Decimal("0.00"))
         super().save(*args, **kwargs)
         self.cart.recalc()
 
