@@ -465,7 +465,7 @@ class SaleInvoiceDownloadAPIView(APIView):
             bik=getattr(company, "bik", None),
             addr=getattr(company, "address", None),
             phone=getattr(company, "phone", None),
-            email=getattr(company, "email", None),
+            # email=getattr(company, "email", None),
         )
         if client:
             right = _party_lines(
@@ -473,7 +473,7 @@ class SaleInvoiceDownloadAPIView(APIView):
                 client.llc or client.enterprise or client.full_name,
                 inn=client.inn, okpo=client.okpo,
                 score=client.score, bik=client.bik,
-                addr=client.address, phone=client.phone, email=client.email,
+                addr=client.address, phone=client.phone
             )
         else:
             right = _party_lines("ПОКУПАТЕЛЬ", "—")
