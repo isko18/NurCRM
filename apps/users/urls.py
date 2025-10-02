@@ -14,7 +14,7 @@ from .views import (
     SectorListAPIView,
     EmployeeDetailAPIView,
     ChangePasswordView,
-    CompanyUpdateView,
+    CompanyUpdateAPIView,
     # 👇 новые для ролей
     RoleListAPIView,
     CustomRoleCreateAPIView,
@@ -29,7 +29,7 @@ urlpatterns = [
 
     # ⚙️ Настройки
     path('settings/change-password/', ChangePasswordView.as_view(), name='change-password'),
-    path('settings/company/', CompanyUpdateView.as_view(), name='company-update'),
+    path('settings/company/', CompanyUpdateAPIView.as_view(), name='company-update'),
 
     # 👥 Работа с сотрудниками
     path('employees/', EmployeeListAPIView.as_view(), name='employee-list'),
