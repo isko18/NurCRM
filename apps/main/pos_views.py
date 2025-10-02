@@ -14,6 +14,7 @@ from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 from decimal import Decimal, ROUND_HALF_UP
 import qrcode
+from datetime import timedelta
 import io, os, uuid
 from django.db.models import Q, F
 from apps.users.models import Company
@@ -33,7 +34,7 @@ from datetime import datetime, date, time as dtime
 from django.db.models import Sum
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.units import mm
-from typing import Iterable, List, Optional
+from typing import Iterable, List, Optional, Dict
 from reportlab.pdfbase.ttfonts import TTFont
 # from __future__ import annotations
 from dataclasses import dataclass
@@ -59,7 +60,12 @@ def _q2(x: Decimal) -> Decimal:
 
 def fmt_money(x: Decimal) -> str:
     return f"{_q2(x):.2f}"
+Q2 = Decimal("0.01")
+def q2(x: Optional[Decimal]) -> Decimal:
+    return (x or Decimal("0.00")).quantize(Q2, rounding=ROUND_HALF_UP)
 
+def fmt(x: Optional[Decimal]) -> str:
+    return f"{q2(x):,.2f}".replace(",", " ").replace("\xa0", " ")
 Q2 = Decimal("0.01")
 def money(x: Optional[Decimal]) -> Decimal:
     return (x or Decimal("0")).quantize(Q2, rounding=ROUND_HALF_UP)
@@ -96,9 +102,12 @@ class Entry:
     debit: Decimal
     credit: Decimal
 
-class ClientReconciliationDownloadAPIView(APIView):
+class ClientReconciliationClassicAPIView(APIView):
     """
-    GET /api/main/clients/<uuid:client_id>/reconciliation/?start=YYYY-MM-DD&end=YYYY-MM-DD&source=both|sales|deals&currency=KGS
+    GET /api/main/clients/<uuid:client_id>/reconciliation/classic/?start=YYYY-MM-DD&end=YYYY-MM-DD&source=both|sales|deals&currency=KGS
+    Отрисовка «классического» акта: №, Содержание, Дт/Кт компании и Дт/Кт клиента.
+    Логика проводок: увеличение долга клиента (продажа/сумма сделки) -> Дт Компания / Кт Клиент.
+                     оплата/предоплата -> Кт Компания / Дт Клиент.
     """
     permission_classes = [permissions.IsAuthenticated]
 
@@ -106,49 +115,46 @@ class ClientReconciliationDownloadAPIView(APIView):
         company = request.user.company
         client = get_object_or_404(Client, id=client_id, company=company)
 
-        # --- параметры
-        q_start = request.query_params.get("start")
-        q_end = request.query_params.get("end")
         source = (request.query_params.get("source") or "both").lower()  # both|sales|deals
         currency = request.query_params.get("currency") or "KGS"
 
-        if not q_start or not q_end:
+        s = request.query_params.get("start")
+        e = request.query_params.get("end")
+        if not s or not e:
             return self._error_pdf("Укажите параметры start и end (YYYY-MM-DD).")
 
-        start_dt = parse_datetime(q_start) or parse_date(q_start)
-        end_dt = parse_datetime(q_end) or parse_date(q_end)
+        start_dt = parse_datetime(s) or parse_date(s)
+        end_dt = parse_datetime(e) or parse_date(e)
         if not start_dt or not end_dt:
             return self._error_pdf("Неверный формат дат. Используйте YYYY-MM-DD или ISO datetime.")
 
         start_dt = _aware(start_dt, end=False)
         end_dt = _aware(end_dt, end=True)
 
-        # --- входящие обороты до начала периода
-        debit_before = Decimal("0.00")
-        credit_before = Decimal("0.00")
+        # ===== входящие обороты до периода
+        debit_before = Decimal("0.00")   # увеличивали долг клиента
+        credit_before = Decimal("0.00")  # погашали долг клиента
 
-        # продажи → дебет
+        # продажи -> дебет
         if source in ("both", "sales"):
             sales_before = (Sale.objects
                             .filter(company=company, client=client, created_at__lt=start_dt)
                             .aggregate(s=Sum("total"))["s"] or Decimal("0"))
             debit_before += sales_before
 
-        # сделки (SALE/AMOUNT/DEBT) → дебет
         if ClientDeal and source in ("both", "deals"):
+            # сделки SALE/AMOUNT/DEBT -> дебет
             deals_before = (ClientDeal.objects
                             .filter(company=company, client=client, created_at__lt=start_dt,
                                     kind__in=[ClientDeal.Kind.SALE, ClientDeal.Kind.AMOUNT, ClientDeal.Kind.DEBT])
                             .aggregate(s=Sum("amount"))["s"] or Decimal("0"))
             debit_before += deals_before
-
-            # предоплаты как кредит до начала
+            # предоплаты -> кредит
             pre_before = (ClientDeal.objects
                           .filter(company=company, client=client, created_at__lt=start_dt)
                           .aggregate(s=Sum("prepayment"))["s"] or Decimal("0"))
             credit_before += pre_before
 
-        # оплаты по рассрочке → кредит
         if DealInstallment and source in ("both", "deals"):
             inst_before = (DealInstallment.objects
                            .filter(deal__company=company, deal__client=client,
@@ -156,230 +162,257 @@ class ClientReconciliationDownloadAPIView(APIView):
                            .aggregate(s=Sum("amount"))["s"] or Decimal("0"))
             credit_before += inst_before
 
-        opening = money(debit_before - credit_before)
+        opening = q2(debit_before - credit_before)  # >0 клиент должен компании; <0 наоборот
 
-        # --- движения за период
-        entries: List[Entry] = []
+        # ===== движения периода: собираем «универсальные» элементы
+        entries: List[Dict] = []
 
-        # продажи
+        # Продажа = рост долга -> Дт Компании / Кт Клиента
         if source in ("both", "sales"):
-            sales_qs = (Sale.objects
-                        .filter(company=company, client=client,
-                                created_at__gte=start_dt, created_at__lte=end_dt)
-                        .order_by("created_at"))
-            for s in sales_qs:
-                entries.append(Entry(
-                    date=s.created_at,
-                    desc=f"Продажа {s.id}",
-                    debit=money(s.total or 0),
-                    credit=Decimal("0.00"),
-                ))
+            for s in (Sale.objects
+                      .filter(company=company, client=client, created_at__gte=start_dt, created_at__lte=end_dt)
+                      .order_by("created_at")):
+                if q2(s.total) > 0:
+                    entries.append(dict(
+                        date=s.created_at,
+                        title=f"Продажа {s.id}",
+                        a_debit=q2(s.total), a_credit=Decimal("0.00"),
+                        b_debit=Decimal("0.00"), b_credit=q2(s.total),
+                    ))
 
-        # сделки (дебет) и их предоплаты (кредит)
         if ClientDeal and source in ("both", "deals"):
-            deals_qs = (ClientDeal.objects
-                        .filter(company=company, client=client,
-                                created_at__gte=start_dt, created_at__lte=end_dt,
-                                kind__in=[ClientDeal.Kind.SALE, ClientDeal.Kind.AMOUNT, ClientDeal.Kind.DEBT])
-                        .order_by("created_at"))
-            for d in deals_qs:
-                entries.append(Entry(
-                    date=d.created_at,
-                    desc=f"Сделка: {d.title} ({d.get_kind_display()})",
-                    debit=money(d.amount or 0),
-                    credit=Decimal("0.00"),
-                ))
-            pre_qs = (ClientDeal.objects
-                      .filter(company=company, client=client,
-                              prepayment__gt=0,
+            # Суммы сделок = рост долга
+            for d in (ClientDeal.objects
+                      .filter(company=company, client=client, created_at__gte=start_dt, created_at__lte=end_dt,
+                              kind__in=[ClientDeal.Kind.SALE, ClientDeal.Kind.AMOUNT, ClientDeal.Kind.DEBT])
+                      .order_by("created_at")):
+                amt = q2(d.amount)
+                if amt > 0:
+                    entries.append(dict(
+                        date=d.created_at,
+                        title=f"Сделка: {d.title} ({d.get_kind_display()})",
+                        a_debit=amt, a_credit=Decimal("0.00"),
+                        b_debit=Decimal("0.00"), b_credit=amt,
+                    ))
+            # Предоплата = погашение долга
+            for d in (ClientDeal.objects
+                      .filter(company=company, client=client, prepayment__gt=0,
                               created_at__gte=start_dt, created_at__lte=end_dt)
-                      .order_by("created_at"))
-            for d in pre_qs:
-                entries.append(Entry(
+                      .order_by("created_at")):
+                pp = q2(d.prepayment)
+                entries.append(dict(
                     date=d.created_at,
-                    desc=f"Предоплата (сделка: {d.title})",
-                    debit=Decimal("0.00"),
-                    credit=money(d.prepayment or 0),
+                    title=f"Предоплата (сделка: {d.title})",
+                    a_debit=Decimal("0.00"), a_credit=pp,
+                    b_debit=pp, b_credit=Decimal("0.00"),
                 ))
 
-        # оплаты по графику (кредит)
+        # Платежи по графику = погашение долга
         if DealInstallment and source in ("both", "deals"):
-            inst_qs = (DealInstallment.objects
-                       .filter(deal__company=company, deal__client=client,
-                               paid_on__isnull=False,
-                               paid_on__gte=start_dt.date(), paid_on__lte=end_dt.date())
-                       .select_related("deal").order_by("paid_on", "number"))
-            for inst in inst_qs:
-                entries.append(Entry(
-                    date=_aware(inst.paid_on, end=False),
-                    desc=f"Оплата по рассрочке №{inst.number} (сделка: {inst.deal.title})",
-                    debit=Decimal("0.00"),
-                    credit=money(inst.amount or 0),
+            for inst in (DealInstallment.objects
+                         .filter(deal__company=company, deal__client=client,
+                                 paid_on__isnull=False, paid_on__gte=start_dt.date(), paid_on__lte=end_dt.date())
+                         .select_related("deal").order_by("paid_on", "number")):
+                amt = q2(inst.amount)
+                dt = _aware(inst.paid_on, end=False)
+                entries.append(dict(
+                    date=dt,
+                    title=f"Оплата по рассрочке №{inst.number} (сделка: {inst.deal.title})",
+                    a_debit=Decimal("0.00"), a_credit=amt,
+                    b_debit=amt, b_credit=Decimal("0.00"),
                 ))
 
-        entries.sort(key=lambda e: e.date)
-        period_debit = money(sum(e.debit for e in entries))
-        period_credit = money(sum(e.credit for e in entries))
-        closing = money(opening + period_debit - period_credit)
+        entries.sort(key=lambda x: x["date"])
 
-        # --- PDF
+        # итоги оборотов по 4 колонкам
+        totals = dict(
+            a_debit=q2(sum(x["a_debit"] for x in entries) if entries else 0),
+            a_credit=q2(sum(x["a_credit"] for x in entries) if entries else 0),
+            b_debit=q2(sum(x["b_debit"] for x in entries) if entries else 0),
+            b_credit=q2(sum(x["b_credit"] for x in entries) if entries else 0),
+        )
+
+        # конечное сальдо (как «одностороннее»)
+        closing = q2(opening + totals["a_debit"] - totals["a_credit"])  # для стороны A; у B будет зеркально
+        # текстовая дата «на …» — следующий день после конца периода, как в примере
+        on_date = (end_dt + timedelta(days=1)).date()
+
+        # ===== PDF
         buf = io.BytesIO()
         p = canvas.Canvas(buf, pagesize=A4)
-        width, height = A4
+        W, H = A4
 
-        # шрифты
+        # шрифт
         try:
-            body, bold = "DejaVu", "DejaVu-Bold"
-            p.setFont(bold, 14)
+            FONT, BFONT = "DejaVu", "DejaVu-Bold"
+            p.setFont(BFONT, 14)
         except Exception:
-            body, bold = "Helvetica", "Helvetica-Bold"
-            p.setFont(bold, 14)
+            FONT, BFONT = "Helvetica", "Helvetica-Bold"
+            p.setFont(BFONT, 14)
 
-        # верхняя шапка
-        p.drawCentredString(width / 2, height - 20 * mm, "АКТ СВЕРКИ ВЗАИМНЫХ РАСЧЁТОВ")
-        p.setFont(body, 10)
-        p.drawCentredString(width / 2, height - 27 * mm,
-                            f"Период: {start_dt.strftime('%d.%m.%Y')} — {end_dt.strftime('%d.%m.%Y')}   Валюта: {currency}")
+        # заголовок
+        p.drawCentredString(W/2, H - 20*mm, "АКТ СВЕРКИ ВЗАИМНЫХ РАСЧЁТОВ")
+        p.setFont(FONT, 11)
+        p.drawCentredString(W/2, H - 27*mm,
+                            f"Период: {start_dt.strftime('%d.%m.%Y')} — {end_dt.strftime('%d.%m.%Y')}   валюта сверки {currency}")
 
-        # реквизиты сторон
-        def party_lines(title, name, inn=None, okpo=None, score=None, bik=None, addr=None, phone=None, email=None):
-            return [
-                title,
-                name,
-                f"ИНН: {_safe(inn)}   ОКПО: {_safe(okpo)}",
-                f"Р/с: {_safe(score)}   БИК: {_safe(bik)}",
-                f"Адрес: {_safe(addr)}",
-                f"Тел.: {_safe(phone)}   E-mail: {_safe(email)}",
-            ]
-
+        # шапка сторон (крупные названия)
         company_name = getattr(company, "llc", None) or getattr(company, "name", str(company))
         client_name = client.llc or client.enterprise or client.full_name
 
-        left = party_lines(
-            "КОМПАНИЯ", company_name,
-            inn=getattr(company, "inn", None),
-            okpo=getattr(company, "okpo", None),
-            score=getattr(company, "score", None),
-            bik=getattr(company, "bik", None),
-            addr=getattr(company, "address", None),
-            phone=getattr(company, "phone", None),
-            email=getattr(company, "email", None),
-        )
-        right = party_lines(
-            "КЛИЕНТ", client_name,
-            inn=client.inn, okpo=client.okpo, score=client.score, bik=client.bik,
-            addr=client.address, phone=client.phone, email=client.email,
-        )
+        p.setFont(BFONT, 10)
+        p.drawString(20*mm, H - 38*mm, "КОМПАНИЯ")
+        p.drawString(110*mm, H - 38*mm, "КЛИЕНТ")
+        p.setFont(FONT, 11)
+        p.drawString(20*mm, H - 44*mm, _safe(company_name))
+        p.drawString(110*mm, H - 44*mm, _safe(client_name))
+        p.setFont(FONT, 9)
+        p.drawString(20*mm, H - 50*mm, f"ИНН: {_safe(getattr(company,'inn',None))}    ОКПО: {_safe(getattr(company,'okpo',None))}")
+        p.drawString(110*mm, H - 50*mm, f"ИНН: {_safe(client.inn)}    ОКПО: {_safe(client.okpo)}")
+        p.drawString(20*mm, H - 56*mm, f"Р/с: {_safe(getattr(company,'score',None))}    БИК: {_safe(getattr(company,'bik',None))}")
+        p.drawString(110*mm, H - 56*mm, f"Р/с: {_safe(client.score)}    БИК: {_safe(client.bik)}")
+        p.drawString(20*mm, H - 62*mm, f"Адрес: {_safe(getattr(company,'address',None))}")
+        p.drawString(110*mm, H - 62*mm, f"Адрес: {_safe(client.address)}")
+        p.drawString(20*mm, H - 68*mm, f"Тел.: {_safe(getattr(company,'phone',None))}    E-mail: {_safe(getattr(company,'email',None))}")
+        p.drawString(110*mm, H - 68*mm, f"Тел.: {_safe(client.phone)}    E-mail: {_safe(client.email)}")
 
-        x_l, x_r = 20 * mm, 110 * mm
-        y = height - 40 * mm
-        p.setFont(bold, 10); p.drawString(x_l, y, left[0]); p.drawString(x_r, y, right[0]); y -= 6 * mm
-        p.setFont(body, 10)
-        for i in range(1, len(left)):
-            p.drawString(x_l, y, left[i])
-            p.drawString(x_r, y, right[i])
-            y -= 6 * mm
+        # таблица: колонки как в образце
+        y = H - 78*mm
+        p.setFont(BFONT, 9)
+        p.drawString(20*mm, y, "№")
+        p.drawString(28*mm, y, "Содержание записи")
+        p.drawString(100*mm, y, _safe(company_name))
+        p.drawString(148*mm, y, _safe(client_name))
 
-        # таблица
-        y -= 4 * mm
-        p.setFont(bold, 10)
-        p.drawString(20 * mm, y, "Дата")
-        p.drawString(45 * mm, y, "Описание")
-        p.drawRightString(140 * mm, y, "Дебет")
-        p.drawRightString(170 * mm, y, "Кредит")
-        p.drawRightString(190 * mm, y, "Сальдо")
-        p.line(20 * mm, y - 2 * mm, 190 * mm, y - 2 * mm)
-        y -= 8 * mm
+        y -= 5*mm
+        p.setFont(BFONT, 9)
+        p.drawString(100*mm, y, "Дт");  p.drawString(118*mm, y, "Кт")
+        p.drawString(148*mm, y, "Дт");  p.drawString(166*mm, y, "Кт")
+        p.line(20*mm, y-1*mm, 190*mm, y-1*mm)
+        y -= 6*mm
 
-        # входящее
-        p.setFont(body, 10)
-        p.drawString(45 * mm, y, "Входящее сальдо")
-        running = opening
-        p.drawRightString(190 * mm, y, fmt(running))
-        y -= 6 * mm
+        # строка «Сальдо начальное»
+        p.setFont(FONT, 9)
+        # расщепляем opening на 2 стороны
+        a_dt = opening if opening > 0 else Decimal("0.00")
+        a_kt = -opening if opening < 0 else Decimal("0.00")
+        b_dt = a_kt
+        b_kt = a_dt
 
-        # строка-отрез
-        p.line(120 * mm, y, 190 * mm, y); y -= 8 * mm
+        p.drawString(28*mm, y, "Сальдо начальное")
+        p.drawRightString(115*mm, y, fmt(a_dt))
+        p.drawRightString(133*mm, y, fmt(a_kt))
+        p.drawRightString(163*mm, y, fmt(b_dt))
+        p.drawRightString(181*mm, y, fmt(b_kt))
+        y -= 7*mm
 
-        # строки
-        def draw_row(dt: datetime, desc: str, debit: Decimal, credit: Decimal, running_total: Decimal, y_pos: float) -> float:
-            # перенос описания на 2 строки макс
-            max_len = 64
-            desc = desc or ""
-            first = desc[:max_len]
-            second = desc[max_len:2*max_len] if len(desc) > max_len else ""
-            p.drawString(20 * mm, y_pos, dt.strftime("%d.%m.%Y"))
-            p.drawString(45 * mm, y_pos, first)
-            if debit > 0:
-                p.drawRightString(140 * mm, y_pos, fmt(debit))
-            if credit > 0:
-                p.drawRightString(170 * mm, y_pos, fmt(credit))
-            p.drawRightString(190 * mm, y_pos, fmt(running_total))
-            y_pos -= 6 * mm
-            if second:
-                p.drawString(45 * mm, y_pos, second)
-                y_pos -= 6 * mm
-            return y_pos
+        # строки движений, нумерация
+        num = 0
+        p.setFont(FONT, 9)
 
-        for e in entries:
-            # новая страница?
-            if y < 40 * mm:
+        def ensure_page_space(current_y: float) -> float:
+            if current_y < 40*mm:
                 p.showPage()
-                p.setFont(bold, 10)
-                p.drawString(20 * mm, height - 20 * mm, "Продолжение акта сверки")
-                p.line(20 * mm, height - 22 * mm, 190 * mm, height - 22 * mm)
-                y = height - 30 * mm
-                p.drawString(20 * mm, y, "Дата")
-                p.drawString(45 * mm, y, "Описание")
-                p.drawRightString(140 * mm, y, "Дебет")
-                p.drawRightString(170 * mm, y, "Кредит")
-                p.drawRightString(190 * mm, y, "Сальдо")
-                p.line(20 * mm, y - 2 * mm, 190 * mm, y - 2 * mm)
-                y -= 8 * mm
-                p.setFont(body, 10)
-                p.drawString(45 * mm, y, "Сальдо на продолжение")
-                p.drawRightString(190 * mm, y, fmt(running))
-                y -= 6 * mm
-                p.line(120 * mm, y, 190 * mm, y); y -= 8 * mm
+                # повторить мини-шапку
+                try:
+                    p.setFont(BFONT, 10)
+                except Exception:
+                    p.setFont("Helvetica-Bold", 10)
+                p.drawString(20*mm, H - 20*mm, "Продолжение акта сверки")
+                yy = H - 30*mm
+                p.setFont(BFONT, 9)
+                p.drawString(20*mm, yy, "№")
+                p.drawString(28*mm, yy, "Содержание записи")
+                p.drawString(100*mm, yy, _safe(company_name))
+                p.drawString(148*mm, yy, _safe(client_name))
+                yy -= 5*mm
+                p.drawString(100*mm, yy, "Дт");  p.drawString(118*mm, yy, "Кт")
+                p.drawString(148*mm, yy, "Дт");  p.drawString(166*mm, yy, "Кт")
+                p.line(20*mm, yy-1*mm, 190*mm, yy-1*mm)
+                return yy - 6*mm
+            return current_y
 
-            running = money(running + e.debit - e.credit)
-            y = draw_row(e.date, e.desc, e.debit, e.credit, running, y)
+        for row in entries:
+            y = ensure_page_space(y)
+            num += 1
+            p.drawString(20*mm, y, str(num))
+            # контент (2 строки макс, как в примере)
+            desc = row["title"]
+            line1 = desc[:52]
+            line2 = desc[52:104] if len(desc) > 52 else ""
+            p.drawString(28*mm, y, line1)
 
-        # итоги
-        y -= 4 * mm
-        p.line(120 * mm, y, 190 * mm, y); y -= 8 * mm
-        p.setFont(bold, 11)
-        p.drawRightString(140 * mm, y, fmt(period_debit))
-        p.drawRightString(170 * mm, y, fmt(period_credit))
-        p.drawRightString(190 * mm, y, fmt(running))
+            # суммы по сторонам уже «зеркальные»
+            p.drawRightString(115*mm, y, fmt(row["a_debit"]))
+            p.drawRightString(133*mm, y, fmt(row["a_credit"]))
+            p.drawRightString(163*mm, y, fmt(row["b_debit"]))
+            p.drawRightString(181*mm, y, fmt(row["b_credit"]))
+            y -= 6*mm
+            if line2:
+                y = ensure_page_space(y)
+                p.drawString(28*mm, y, line2)
+                y -= 6*mm
+
+        # итоги оборотов (как в образце — по 4 колонкам)
+        y -= 4*mm
+        p.line(20*mm, y, 190*mm, y); y -= 7*mm
+        p.setFont(BFONT, 10)
+        p.drawString(28*mm, y, "Итого обороты:")
+        p.drawRightString(115*mm, y, fmt(totals["a_debit"]))
+        p.drawRightString(133*mm, y, fmt(totals["a_credit"]))
+        p.drawRightString(163*mm, y, fmt(totals["b_debit"]))
+        p.drawRightString(181*mm, y, fmt(totals["b_credit"]))
+        y -= 10*mm
+
+        # конечное сальдо — выводим фразу
+        # кто кому должен по итогам: если closing > 0, клиент должен компании; если < 0 — наоборот
+        debtor, creditor, amount = None, None, abs(closing)
+        if closing > 0:
+            debtor = client_name
+            creditor = company_name
+        elif closing < 0:
+            debtor = company_name
+            creditor = client_name
+
+        p.setFont(FONT, 10)
+        if amount == 0:
+            phrase = f"Задолженность отсутствует на {on_date.strftime('%d.%m.%Y')}."
+        else:
+            phrase = (f"Задолженность {debtor} перед {creditor} на {on_date.strftime('%d.%m.%Y')} "
+                      f"составляет {fmt(amount)} {currency}")
+        p.drawString(20*mm, y, phrase)
+        y -= 8*mm
+        if amount == 0:
+            p.drawString(20*mm, y, "(Ноль сом 00 тыйын)")
+        y -= 16*mm
 
         # подписи
-        y -= 18 * mm
-        p.setFont(body, 10)
-        p.drawString(20 * mm, y, "Со стороны компании: Директор _____________   Гл. бухгалтер _____________")
-        p.drawString(20 * mm, y - 6 * mm, company_name)
-        p.drawString(20 * mm, y - 18 * mm, "Со стороны клиента:  Директор _____________   Гл. бухгалтер _____________")
-        p.drawString(20 * mm, y - 24 * mm, client_name)
+        p.setFont(BFONT, 10)
+        p.drawString(20*mm, y, _safe(company_name))
+        p.drawString(110*mm, y, _safe(client_name))
+        y -= 8*mm
+        p.setFont(FONT, 10)
+        p.drawString(20*mm, y, "Главный бухгалтер: __________________")
+        p.drawString(110*mm, y, "Главный бухгалтер: __________________")
 
         p.showPage()
         p.save()
         buf.seek(0)
+        filename = f"reconciliation_classic_{client.id}_{start_dt.date()}_{end_dt.date()}.pdf"
+        return FileResponse(buf, as_attachment=True, filename=filename)
 
-        fname = f"reconciliation_{client.id}_{start_dt.date()}_{end_dt.date()}_{source}.pdf"
-        return FileResponse(buf, as_attachment=True, filename=fname)
-
-    # простой генератор PDF с сообщением об ошибке
     def _error_pdf(self, message: str):
         buf = io.BytesIO()
         p = canvas.Canvas(buf, pagesize=A4)
         p.setFont("Helvetica-Bold", 14)
-        p.drawString(30 * mm, 260 * mm, "Невозможно сформировать акт сверки")
+        p.drawString(30*mm, 260*mm, "Невозможно сформировать акт сверки")
         p.setFont("Helvetica", 11)
-        p.drawString(30 * mm, 248 * mm, message)
+        p.drawString(30*mm, 248*mm, message)
         p.showPage()
         p.save()
         buf.seek(0)
         return FileResponse(buf, as_attachment=False, filename="reconciliation_error.pdf", status=400)
+    
 # pos/views.py
 class SaleInvoiceDownloadAPIView(APIView):
     """
