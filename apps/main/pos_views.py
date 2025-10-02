@@ -16,7 +16,7 @@ from decimal import Decimal, ROUND_HALF_UP
 import qrcode
 import io, os, uuid
 from django.db.models import Q, F
-
+from apps.users.models import Company
 from apps.main.models import Cart, CartItem, Sale, Product, MobileScannerToken, Client
 from .pos_serializers import (
     SaleCartSerializer, SaleItemSerializer,
@@ -28,8 +28,16 @@ from apps.main.services import checkout_cart, NotEnoughStock
 from apps.main.views import CompanyRestrictedMixin
 from apps.construction.models import Department
 from django.http import Http404
+from django.utils.timezone import is_aware, make_aware, get_current_timezone
+from datetime import datetime, date, time as dtime
+from django.db.models import Sum
 
-
+try:
+    from apps.main.models import ClientDeal, DealInstallment
+except Exception:
+    ClientDeal = None
+    DealInstallment = None
+    
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # Путь к папке fonts внутри apps/main
@@ -45,7 +53,295 @@ def _q2(x: Decimal) -> Decimal:
 
 def fmt_money(x: Decimal) -> str:
     return f"{_q2(x):.2f}"
+def _safe_register_fonts():
+    try:
+        # подставь актуальные пути, если шрифты лежат в другом месте
+        pdfmetrics.registerFont(TTFont("DejaVu", "DejaVuSans.ttf"))
+        pdfmetrics.registerFont(TTFont("DejaVu-Bold", "DejaVuSans-Bold.ttf"))
+    except Exception:
+        # ок — будем использовать Helvetica
+        pass
 
+_safe_register_fonts()
+
+# ==== Утилиты дат ====
+def _aware(dt_or_date, end: bool = False):
+    """Приводит date/datetime к aware datetime в текущем TZ; end=True -> 23:59:59."""
+    tz = get_current_timezone()
+    if isinstance(dt_or_date, datetime):
+        return dt_or_date if is_aware(dt_or_date) else make_aware(dt_or_date, tz)
+    if isinstance(dt_or_date, date):
+        tt = dtime(23, 59, 59) if end else dtime(0, 0, 0)
+        return make_aware(datetime.combine(dt_or_date, tt), tz)
+    return None
+
+def _line_or_dash(v) -> str:
+    return v if (v is not None and str(v).strip()) else "—"
+
+def _party_lines(title: str, name: str, inn=None, okpo=None, score=None, bik=None,
+                 addr=None, phone=None, email=None) -> list[str]:
+    lines = [title, name]
+    lines.append(f"ИНН: {_line_or_dash(inn)}   ОКПО: {_line_or_dash(okpo)}")
+    lines.append(f"Р/с: {_line_or_dash(score)}   БИК: {_line_or_dash(bik)}")
+    lines.append(f"Адрес: {_line_or_dash(addr)}")
+    contact = "  ".join([
+        f"Тел.: {_line_or_dash(phone)}",
+        f"E-mail: {_line_or_dash(email)}",
+    ])
+    lines.append(contact)
+    return lines
+
+class ClientReconciliationDownloadAPIView(APIView):
+    """
+    GET /api/main/clients/<uuid:client_id>/reconciliation/?start=YYYY-MM-DD&end=YYYY-MM-DD
+    Скачивание PDF «Акта сверки» по клиенту с движением за период.
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request, client_id, *args, **kwargs):
+        company: Company = request.user.company
+        client: Client = get_object_or_404(Client, id=client_id, company=company)
+
+        # ---- Период
+        q_start = request.query_params.get("start")
+        q_end = request.query_params.get("end")
+        if not q_start or not q_end:
+            # Мягкая ошибка: вернём 400 с коротким PDF-комментарием
+            buf = io.BytesIO()
+            p = canvas.Canvas(buf, pagesize=(210 * mm, 297 * mm))
+            p.setFont("Helvetica", 12)
+            p.drawString(30 * mm, 260 * mm, "Укажите параметры start и end (YYYY-MM-DD).")
+            p.showPage()
+            p.save()
+            buf.seek(0)
+            return FileResponse(buf, as_attachment=False, filename="reconciliation_error.pdf", status=400)
+
+        start_dt = parse_datetime(q_start) or parse_date(q_start)
+        end_dt = parse_datetime(q_end) or parse_date(q_end)
+        if not start_dt or not end_dt:
+            buf = io.BytesIO()
+            p = canvas.Canvas(buf, pagesize=(210 * mm, 297 * mm))
+            p.setFont("Helvetica", 12)
+            p.drawString(30 * mm, 260 * mm, "Неверный формат дат. Используйте YYYY-MM-DD или ISO datetime.")
+            p.showPage()
+            p.save()
+            buf.seek(0)
+            return FileResponse(buf, as_attachment=False, filename="reconciliation_error.pdf", status=400)
+
+        start_dt = _aware(start_dt, end=False)
+        end_dt = _aware(end_dt, end=True)
+
+        # ==== Входящее сальдо (до start)
+        sales_before = (Sale.objects
+                        .filter(company=company, client=client, created_at__lt=start_dt)
+                        .aggregate(s=Sum("total"))["s"] or Decimal("0"))
+        payments_before = Decimal("0")
+
+        # Оплаты по графику, если модель доступна
+        if DealInstallment is not None:
+            payments_before += (DealInstallment.objects
+                                .filter(deal__company=company,
+                                        deal__client=client,
+                                        paid_on__isnull=False,
+                                        paid_on__lt=start_dt.date())
+                                .aggregate(s=Sum("amount"))["s"] or Decimal("0"))
+
+        # Предоплаты как «кредит» на дату создания сделки (если уместно для вашего учёта)
+        if ClientDeal is not None:
+            pre_before = (ClientDeal.objects
+                          .filter(company=company, client=client, created_at__lt=start_dt)
+                          .aggregate(s=Sum("prepayment"))["s"] or Decimal("0"))
+            payments_before += pre_before
+
+        opening_balance = _q2(sales_before - payments_before)  # дебетовое положительное
+
+        # ==== Движения за период
+        entries: list[dict] = []
+
+        # Продажи — дебет
+        sales_qs = (Sale.objects
+                    .filter(company=company, client=client,
+                            created_at__gte=start_dt, created_at__lte=end_dt)
+                    .order_by("created_at"))
+        for s in sales_qs:
+            entries.append({
+                "date": s.created_at,
+                "desc": f"Продажа {s.id}",
+                "debit": _q2(s.total or Decimal("0")),
+                "credit": Decimal("0.00"),
+            })
+
+        # Оплаты по рассрочке — кредит
+        if DealInstallment is not None:
+            inst_qs = (DealInstallment.objects
+                       .filter(deal__company=company,
+                               deal__client=client,
+                               paid_on__isnull=False,
+                               paid_on__gte=start_dt.date(),
+                               paid_on__lte=end_dt.date())
+                       .select_related("deal")
+                       .order_by("paid_on", "number"))
+            for inst in inst_qs:
+                dt = _aware(inst.paid_on, end=False)
+                entries.append({
+                    "date": dt,
+                    "desc": f"Оплата по рассрочке №{inst.number} (сделка: {inst.deal.title})",
+                    "debit": Decimal("0.00"),
+                    "credit": _q2(inst.amount or Decimal("0")),
+                })
+
+        # Предоплаты в период — кредит
+        if ClientDeal is not None:
+            deals_with_prepay = (ClientDeal.objects
+                                 .filter(company=company, client=client,
+                                         prepayment__gt=0,
+                                         created_at__gte=start_dt, created_at__lte=end_dt)
+                                 .order_by("created_at"))
+            for d in deals_with_prepay:
+                entries.append({
+                    "date": d.created_at,
+                    "desc": f"Предоплата (сделка: {d.title})",
+                    "debit": Decimal("0.00"),
+                    "credit": _q2(d.prepayment or Decimal("0")),
+                })
+
+        # Сортировка
+        entries.sort(key=lambda x: x["date"])
+
+        # Обороты за период и конечное сальдо
+        period_debit = _q2(sum(e["debit"] for e in entries) or Decimal("0"))
+        period_credit = _q2(sum(e["credit"] for e in entries) or Decimal("0"))
+        closing_balance = _q2(opening_balance + period_debit - period_credit)
+
+        # ==== Данные сторон
+        company_name = getattr(company, "llc", None) or getattr(company, "name", str(company))
+        client_name = client.llc or client.enterprise or client.full_name
+
+        left = _party_lines(
+            "КОМПАНИЯ",
+            company_name,
+            inn=getattr(company, "inn", None),
+            okpo=getattr(company, "okpo", None),
+            score=getattr(company, "score", None),
+            bik=getattr(company, "bik", None),
+            addr=getattr(company, "address", None),
+            phone=getattr(company, "phone", None),
+            email=getattr(company, "email", None),
+        )
+        right = _party_lines(
+            "КЛИЕНТ",
+            client_name,
+            inn=client.inn, okpo=client.okpo,
+            score=client.score, bik=client.bik,
+            addr=client.address, phone=client.phone, email=client.email,
+        )
+
+        # ==== Рисуем PDF
+        buf = io.BytesIO()
+        p = canvas.Canvas(buf, pagesize=(210 * mm, 297 * mm))  # A4
+
+        # заголовок и период
+        try:
+            p.setFont("DejaVu-Bold", 14)
+            body_font, bold_font = "DejaVu", "DejaVu-Bold"
+        except Exception:
+            p.setFont("Helvetica-Bold", 14)
+            body_font, bold_font = "Helvetica", "Helvetica-Bold"
+
+        p.drawCentredString(105 * mm, 280 * mm, "АКТ СВЕРКИ ВЗАИМНЫХ РАСЧЁТОВ")
+        p.setFont(body_font, 10)
+        p.drawCentredString(
+            105 * mm, 272 * mm,
+            f"Период: {start_dt.strftime('%d.%m.%Y')} — {end_dt.strftime('%d.%m.%Y')}   Валюта: KGS"
+        )
+
+        # две колонки: данные сторон
+        y = 260 * mm
+        x_left, x_right = 20 * mm, 110 * mm
+        p.setFont(bold_font, 10)
+        p.drawString(x_left, y, left[0]); p.drawString(x_right, y, right[0]); y -= 6 * mm
+        p.setFont(body_font, 10)
+        for i in range(1, len(left)):
+            p.drawString(x_left, y, left[i])
+            p.drawString(x_right, y, right[i])
+            y -= 6 * mm
+
+        # таблица заголовок
+        p.setFont(bold_font, 10)
+        p.drawString(20 * mm, y, "Дата")
+        p.drawString(45 * mm, y, "Описание")
+        p.drawRightString(140 * mm, y, "Дебет")
+        p.drawRightString(170 * mm, y, "Кредит")
+        p.drawRightString(190 * mm, y, "Сальдо")
+        p.line(20 * mm, y - 2 * mm, 190 * mm, y - 2 * mm)
+        y -= 8 * mm
+
+        # входящее сальдо
+        p.setFont(body_font, 10)
+        p.drawString(45 * mm, y, "Входящее сальдо")
+        running = opening_balance
+        p.drawRightString(190 * mm, y, fmt_money(running))
+        y -= 6 * mm
+
+        # строки движений
+        for e in entries:
+            if y < 35 * mm:
+                p.showPage()
+                # шапка на новой странице
+                try:
+                    p.setFont(bold_font, 10)
+                except Exception:
+                    p.setFont("Helvetica-Bold", 10)
+                p.drawString(20 * mm, 280 * mm, "Продолжение акта сверки")
+                p.line(20 * mm, 278 * mm, 190 * mm, 278 * mm)
+                y = 270 * mm
+                p.setFont(bold_font, 10)
+                p.drawString(20 * mm, y, "Дата")
+                p.drawString(45 * mm, y, "Описание")
+                p.drawRightString(140 * mm, y, "Дебет")
+                p.drawRightString(170 * mm, y, "Кредит")
+                p.drawRightString(190 * mm, y, "Сальдо")
+                p.line(20 * mm, y - 2 * mm, 190 * mm, y - 2 * mm)
+                y -= 8 * mm
+                p.setFont(body_font, 10)
+                p.drawString(45 * mm, y, "Сальдо на продолжение")
+                p.drawRightString(190 * mm, y, fmt_money(running))
+                y -= 6 * mm
+
+            p.drawString(20 * mm, y, e["date"].strftime("%d.%m.%Y"))
+            p.drawString(45 * mm, y, (e["desc"][:64]))
+            if e["debit"] > 0:
+                p.drawRightString(140 * mm, y, fmt_money(e["debit"]))
+            if e["credit"] > 0:
+                p.drawRightString(170 * mm, y, fmt_money(e["credit"]))
+
+            running = _q2(running + e["debit"] - e["credit"])
+            p.drawRightString(190 * mm, y, fmt_money(running))
+            y -= 6 * mm
+
+        # итоги
+        y -= 4 * mm
+        p.line(120 * mm, y, 190 * mm, y)
+        y -= 8 * mm
+        p.setFont(bold_font, 11)
+        p.drawRightString(140 * mm, y, f"{fmt_money(period_debit)}")
+        p.drawRightString(170 * mm, y, f"{fmt_money(period_credit)}")
+        p.drawRightString(190 * mm, y, f"{fmt_money(running)}")  # closing
+
+        # подписи
+        y -= 20 * mm
+        p.setFont(body_font, 10)
+        p.drawString(20 * mm, y, "Со стороны компании: Директор _____________  Гл. бухгалтер _____________")
+        p.drawString(20 * mm, y - 7 * mm, f"{company_name}")
+        p.drawString(20 * mm, y - 20 * mm, "Со стороны клиента:  Директор _____________  Гл. бухгалтер _____________")
+        p.drawString(20 * mm, y - 27 * mm, f"{client_name}")
+
+        p.showPage()
+        p.save()
+        buf.seek(0)
+
+        fname = f"reconciliation_{client.id}_{start_dt.date()}_{end_dt.date()}.pdf"
+        return FileResponse(buf, as_attachment=True, filename=fname)
 
 # pos/views.py
 class SaleInvoiceDownloadAPIView(APIView):
