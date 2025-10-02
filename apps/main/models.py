@@ -518,6 +518,7 @@ class Sale(models.Model):
         max_length=16, choices=Status.choices, default=Status.NEW,
         verbose_name="Статус"
     )
+    doc_number = models.PositiveIntegerField("Номер документа", null=True, blank=True, db_index=True)
     subtotal = models.DecimalField(max_digits=12, decimal_places=2, default=0, verbose_name="Сумма без скидок и налогов")
     discount_total = models.DecimalField(max_digits=12, decimal_places=2, default=0, verbose_name="Сумма скидки")
     tax_total = models.DecimalField(max_digits=12, decimal_places=2, default=0, verbose_name="Сумма налога")
