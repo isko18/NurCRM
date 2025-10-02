@@ -38,6 +38,7 @@ from typing import Iterable, List, Optional, Dict
 from reportlab.pdfbase.ttfonts import TTFont
 # from __future__ import annotations
 from dataclasses import dataclass
+from apps.main.utils_numbers import ensure_sale_doc_number
 
 try:
     from apps.main.models import ClientDeal, DealInstallment
@@ -101,6 +102,18 @@ class Entry:
     desc: str
     debit: Decimal
     credit: Decimal
+def _safe(v):
+    return v if (v is not None and str(v).strip()) else "—"
+
+def _party_lines(title, name, inn=None, okpo=None, score=None, bik=None, addr=None, phone=None, email=None):
+    return [
+        title,
+        name,
+        f"ИНН: {_safe(inn)}   ОКПО: {_safe(okpo)}",
+        f"Р/с: {_safe(score)}   БИК: {_safe(bik)}",
+        f"Адрес: {_safe(addr)}",
+        f"Тел.: {_safe(phone)}   E-mail: {_safe(email)}",
+    ]
 
 class ClientReconciliationClassicAPIView(APIView):
     """
@@ -423,31 +436,59 @@ class SaleInvoiceDownloadAPIView(APIView):
 
     def get(self, request, pk, *args, **kwargs):
         sale = get_object_or_404(
-            Sale.objects.select_related("company", "user").prefetch_related("items__product"),
+            Sale.objects.select_related("company", "user", "client").prefetch_related("items__product"),
             id=pk, company=request.user.company
         )
+
+        # присвоим сквозной номер, если ещё нет
+        doc_no = ensure_sale_doc_number(sale)
 
         buffer = io.BytesIO()
         p = canvas.Canvas(buffer, pagesize=(210 * mm, 297 * mm))  # A4
 
         # === Заголовок ===
         p.setFont("DejaVu-Bold", 14)
-        p.drawCentredString(105 * mm, 280 * mm, f"НАКЛАДНАЯ № {sale.id}")
+        p.drawCentredString(105 * mm, 280 * mm, f"НАКЛАДНАЯ № {doc_no}")
         p.setFont("DejaVu", 10)
         p.drawCentredString(105 * mm, 273 * mm, f"от {sale.created_at.strftime('%d.%m.%Y %H:%M')}")
 
-        # Продавец / покупатель
-        y = 260 * mm
-        p.setFont("DejaVu", 10)
-        p.drawString(20 * mm, y, f"Продавец: {sale.company.name}")
-        y -= 6 * mm
-        client = getattr(sale, "client", None)
+        # === Реквизиты сторон (две колонки) ===
+        company = sale.company
+        client = sale.client
+
+        left = _party_lines(
+            "КОМПАНИЯ",
+            getattr(company, "llc", None) or getattr(company, "name", "—"),
+            inn=getattr(company, "inn", None),
+            okpo=getattr(company, "okpo", None),
+            score=getattr(company, "score", None),
+            bik=getattr(company, "bik", None),
+            addr=getattr(company, "address", None),
+            phone=getattr(company, "phone", None),
+            email=getattr(company, "email", None),
+        )
         if client:
-            p.drawString(20 * mm, y, f"Покупатель: {client.full_name}")
+            right = _party_lines(
+                "ПОКУПАТЕЛЬ",
+                client.llc or client.enterprise or client.full_name,
+                inn=client.inn, okpo=client.okpo,
+                score=client.score, bik=client.bik,
+                addr=client.address, phone=client.phone, email=client.email,
+            )
+        else:
+            right = _party_lines("ПОКУПАТЕЛЬ", "—")
+
+        y = 260 * mm
+        x_left, x_right = 20 * mm, 110 * mm
+        p.setFont("DejaVu-Bold", 10); p.drawString(x_left, y, left[0]); p.drawString(x_right, y, right[0]); y -= 6 * mm
+        p.setFont("DejaVu", 10)
+        for i in range(1, len(left)):
+            p.drawString(x_left, y, left[i])
+            p.drawString(x_right, y, right[i])
             y -= 6 * mm
 
         # === Таблица товаров ===
-        y -= 10
+        y -= 6 * mm
         p.setFont("DejaVu-Bold", 10)
         p.drawString(20 * mm, y, "Товар")
         p.drawRightString(140 * mm, y, "Кол-во")
@@ -460,12 +501,12 @@ class SaleInvoiceDownloadAPIView(APIView):
 
         p.setFont("DejaVu", 10)
         for it in sale.items.all():
-            p.drawString(20 * mm, y, (it.name_snapshot or "")[:40])
+            p.drawString(20 * mm, y, (it.name_snapshot or "")[:60])
             p.drawRightString(140 * mm, y, str(it.quantity))
             p.drawRightString(160 * mm, y, fmt_money(it.unit_price))
             p.drawRightString(190 * mm, y, fmt_money(it.unit_price * it.quantity))
             y -= 7 * mm
-            if y < 50 * mm:
+            if y < 60 * mm:
                 p.showPage()
                 y = 270 * mm
                 p.setFont("DejaVu", 10)
@@ -493,13 +534,13 @@ class SaleInvoiceDownloadAPIView(APIView):
         p.save()
 
         buffer.seek(0)
-        return FileResponse(buffer, as_attachment=True, filename=f"invoice_{sale.id}.pdf")
+        return FileResponse(buffer, as_attachment=True, filename=f"invoice_{doc_no}.pdf")
 
 
 class SaleReceiptDownloadAPIView(APIView):
     """
     GET /api/main/pos/sales/<uuid:pk>/receipt/
-    Скачивание PDF-чека в формате кассового аппарата
+    Скачивание PDF-чека (58 мм).
     """
     permission_classes = [permissions.IsAuthenticated]
 
@@ -509,10 +550,13 @@ class SaleReceiptDownloadAPIView(APIView):
             id=pk, company=request.user.company
         )
 
+        # присвоим сквозной номер, если ещё нет
+        doc_no = ensure_sale_doc_number(sale)
+
         # === Расчёт высоты под чек ===
-        base_height = 80   # шапка и отступы
-        per_item = 15      # место на строку товара
-        qr_block = 40      # блок под QR
+        base_height = 80
+        per_item = 15
+        qr_block = 40
         extra_lines = 1 + (1 if sale.discount_total and sale.discount_total > 0 else 0) \
                         + (1 if sale.tax_total and sale.tax_total > 0 else 0) + 1
         extra_height = 6 * extra_lines + 6
@@ -529,9 +573,8 @@ class SaleReceiptDownloadAPIView(APIView):
         y -= 10 * mm
 
         p.setFont("DejaVu", 9)
-
-        # Номер чека и дата
-        p.drawString(5 * mm, y, f"Продажа № {sale.id}")
+        # Номер и дата (теперь без UUID)
+        p.drawString(5 * mm, y, f"Чек № {doc_no}")
         y -= 5 * mm
         p.drawString(5 * mm, y, sale.created_at.strftime("%d.%m.%Y %H:%M"))
         y -= 7 * mm
@@ -572,17 +615,11 @@ class SaleReceiptDownloadAPIView(APIView):
         y -= 12 * mm
 
         # === QR-код ===
-        qr_img = qrcode.make(f"SALE={sale.id};SUM={fmt_money(sale.total)};DATE={sale.created_at.isoformat()}")
+        qr_img = qrcode.make(f"SALE={doc_no};SUM={fmt_money(sale.total)};DATE={sale.created_at.isoformat()}")
         qr_size = 25 * mm
         qr_img = qr_img.resize((int(qr_size), int(qr_size)))
 
-        p.drawImage(
-            ImageReader(qr_img),
-            (page_width - qr_size) / 2,
-            y - qr_size,
-            qr_size,
-            qr_size
-        )
+        p.drawImage(ImageReader(qr_img), (page_width - qr_size) / 2, y - qr_size, qr_size, qr_size)
         y -= (qr_size + 10)
 
         # === Подвал ===
@@ -593,7 +630,7 @@ class SaleReceiptDownloadAPIView(APIView):
         p.save()
 
         buffer.seek(0)
-        return FileResponse(buffer, as_attachment=True, filename=f"receipt_{sale.id}.pdf")
+        return FileResponse(buffer, as_attachment=True, filename=f"receipt_{doc_no}.pdf")
     
 class SaleStartAPIView(APIView):
     """
