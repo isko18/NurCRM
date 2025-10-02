@@ -35,7 +35,7 @@ from reportlab.lib.pagesizes import A4
 from reportlab.lib.units import mm
 from typing import Iterable, List, Optional
 from reportlab.pdfbase.ttfonts import TTFont
-from __future__ import annotations
+# from __future__ import annotations
 from dataclasses import dataclass
 
 try:
