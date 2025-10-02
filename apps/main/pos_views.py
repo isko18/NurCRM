@@ -112,7 +112,7 @@ def _party_lines(title, name, inn=None, okpo=None, score=None, bik=None, addr=No
         f"ИНН: {_safe(inn)}   ОКПО: {_safe(okpo)}",
         f"Р/с: {_safe(score)}   БИК: {_safe(bik)}",
         f"Адрес: {_safe(addr)}",
-        f"Тел.: {_safe(phone)}   E-mail: {_safe(email)}",
+        f"Тел.: {_safe(phone)}",
     ]
 
 class ClientReconciliationClassicAPIView(APIView):
