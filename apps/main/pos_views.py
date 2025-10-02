@@ -15,14 +15,14 @@ from reportlab.pdfbase.ttfonts import TTFont
 from decimal import Decimal, ROUND_HALF_UP
 import qrcode
 import io, os, uuid
-from django.db.models import Q
+from django.db.models import Q, F
 
 from apps.main.models import Cart, CartItem, Sale, Product, MobileScannerToken, Client
 from .pos_serializers import (
     SaleCartSerializer, SaleItemSerializer,
     ScanRequestSerializer, AddItemSerializer,
     CheckoutSerializer, MobileScannerTokenSerializer,
-    SaleListSerializer, SaleDetailSerializer, StartCartOptionsSerializer
+    SaleListSerializer, SaleDetailSerializer, StartCartOptionsSerializer, CustomCartItemCreateSerializer
 )
 from apps.main.services import checkout_cart, NotEnoughStock
 from apps.main.views import CompanyRestrictedMixin
@@ -662,3 +662,49 @@ class CartItemUpdateDestroyAPIView(APIView):
         item.delete()
         cart.recalc()
         return Response(SaleCartSerializer(cart).data, status=200)
+
+
+class SaleAddCustomItemAPIView(APIView):
+    """
+    POST /api/main/pos/carts/<uuid:pk>/custom-item/
+    body: {"name": "Диагностика", "price": "500.00", "quantity": 1}
+    Добавляет кастомную позицию (без product) в корзину.
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    @transaction.atomic
+    def post(self, request, pk, *args, **kwargs):
+        cart = get_object_or_404(
+            Cart, id=pk, company=request.user.company, status=Cart.Status.ACTIVE
+        )
+        ser = CustomCartItemCreateSerializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+
+        name = ser.validated_data["name"].strip()
+        if not name:
+            return Response({"name": "Название не может быть пустым."}, status=400)
+
+        price = _q2(ser.validated_data["price"])   # нормализуем деньги
+        qty = ser.validated_data.get("quantity", 1)
+
+        # (опция) объединять одинаковые кастомные позиции
+        item = CartItem.objects.filter(
+            cart=cart, product__isnull=True, custom_name=name, unit_price=price
+        ).first()
+
+        if item:
+            CartItem.objects.filter(pk=item.pk).update(quantity=F("quantity") + qty)
+            item.refresh_from_db(fields=["quantity"])
+        else:
+            CartItem.objects.create(
+                company=cart.company,
+                cart=cart,
+                product=None,
+                custom_name=name,
+                unit_price=price,
+                quantity=qty,
+            )
+
+        # cart.recalc() не нужен: CartItem.save() уже пересчитает
+
+        return Response(SaleCartSerializer(cart).data, status=status.HTTP_201_CREATED)

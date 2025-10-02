@@ -91,6 +91,7 @@ urlpatterns = [
     
     path("pos/sales/", SaleListAPIView.as_view(), name="pos-sale-list"),
     path("pos/sales/start/", SaleStartAPIView.as_view(), name="pos-sale-start"),
+    path("pos/carts/<uuid:pk>/custom-item/", SaleAddCustomItemAPIView.as_view(), name="pos-cart-add-custom-item"),
     path("pos/carts/<uuid:pk>/", CartDetailAPIView.as_view(), name="pos-cart-detail"),
     path("sales/bulk-delete/", SaleBulkDeleteAPIView.as_view(), name="sale-bulk-delete"),
     path("pos/sales/<uuid:pk>/", SaleRetrieveAPIView.as_view(), name="pos-sale-detail"),

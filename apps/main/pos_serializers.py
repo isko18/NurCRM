@@ -39,15 +39,31 @@ class StartCartOptionsSerializer(serializers.Serializer):
         if v is not None and v < 0:
             raise serializers.ValidationError("Должна быть ≥ 0.")
         return v
-    
+
+class CustomCartItemCreateSerializer(serializers.Serializer):
+    name = serializers.CharField(max_length=255)
+    price = MoneyField()
+    quantity = serializers.IntegerField(min_value=1, required=False, default=1)
+
+
 class SaleItemSerializer(serializers.ModelSerializer):
     product_name = serializers.CharField(source="product.name", read_only=True)
     barcode = serializers.CharField(source="product.barcode", read_only=True)
+    display_name = serializers.SerializerMethodField()  # ← будем отдавать имя товара или custom_name
 
     class Meta:
         model = CartItem
-        fields = ("id", "cart", "product", "product_name", "barcode", "quantity", "unit_price")
-        read_only_fields = ("id", "product_name", "barcode")
+        fields = (
+            "id", "cart", "product",
+            "product_name", "barcode",
+            "quantity", "unit_price",
+            "display_name",              # ← добавить в выдачу
+        )
+        read_only_fields = ("id", "product_name", "barcode", "display_name")
+
+    def get_display_name(self, obj):
+        # если product есть — берём его имя, иначе кастомное
+        return getattr(getattr(obj, "product", None), "name", None) or (getattr(obj, "custom_name", "") or "")
 
     def validate(self, attrs):
         cart = attrs.get("cart") or getattr(self.instance, "cart", None)
@@ -58,10 +74,14 @@ class SaleItemSerializer(serializers.ModelSerializer):
 
     def create(self, validated_data):
         cart = validated_data["cart"]
-        validated_data.setdefault("unit_price", validated_data["product"].price)
+        # для «обычных» товаров по умолчанию берём цену продукта;
+        # кастомные позиции создаются отдельным эндпоинтом через CustomCartItemCreateSerializer
+        if validated_data.get("product") and "unit_price" not in validated_data:
+            validated_data["unit_price"] = validated_data["product"].price
+
         # Если у CartItem есть поле company — проставим из корзины
         if any(f.name == "company" for f in CartItem._meta.fields):
-            validated_data["company"] = cart.company
+            validated_data.setdefault("company", cart.company)
         return super().create(validated_data)
 
     def update(self, instance, validated_data):
@@ -69,7 +89,6 @@ class SaleItemSerializer(serializers.ModelSerializer):
         validated_data.pop("company", None)
         validated_data.pop("cart", None)
         return super().update(instance, validated_data)
-
 
 class SaleCartSerializer(serializers.ModelSerializer):
     items = SaleItemSerializer(many=True, read_only=True)
@@ -228,3 +247,4 @@ class SaleDetailSerializer(serializers.ModelSerializer):
         return (getattr(u, "get_full_name", lambda: "")()
                 or getattr(u, "email", None)
                 or getattr(u, "username", None))
+
