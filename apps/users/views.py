@@ -4,7 +4,7 @@ from rest_framework.response import Response
 from rest_framework.exceptions import NotFound, PermissionDenied
 from rest_framework_simplejwt.views import TokenObtainPairView
 
-from .models import User, Industry, SubscriptionPlan, Feature, Sector, CustomRole
+from .models import User, Industry, SubscriptionPlan, Feature, Sector, CustomRole, Company
 from .serializers import (
     UserSerializer,
     OwnerRegisterSerializer,
@@ -167,19 +167,16 @@ class ChangePasswordView(generics.UpdateAPIView):
 
 
 # 🏢 Обновление компании
-class CompanyUpdateView(generics.UpdateAPIView):
+class CompanyUpdateAPIView(generics.RetrieveUpdateAPIView):
+    permission_classes = [permissions.IsAuthenticated]
     serializer_class = CompanyUpdateSerializer
-    permission_classes = [IsAuthenticated]
+
+    def get_queryset(self):
+        # пользователь редактирует ТОЛЬКО свою компанию
+        return Company.objects.filter(id=self.request.user.owned_company_id)
 
     def get_object(self):
-        if getattr(self, 'swagger_fake_view', False):
-            return None
-        user = self.request.user
-        company = getattr(user, "owned_company", None)
-        if not company:
-            raise PermissionDenied("Только владелец компании может изменять её настройки.")
-        return company
-
+        return self.get_queryset().get()
 
 # ====================
 # 🎭 Управление кастомными ролями

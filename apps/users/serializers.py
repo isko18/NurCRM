@@ -650,16 +650,26 @@ class ChangePasswordSerializer(serializers.Serializer):
 
 
 # 🏢 Обновление компании
+_OPTIONAL_TEXT = ("llc", "inn", "okpo", "score", "bik", "address")
+
 class CompanyUpdateSerializer(serializers.ModelSerializer):
     class Meta:
         model = Company
-        fields = ['name']
+        fields = [
+            "name",
+            "llc", "inn", "okpo", "score", "bik", "address",
+        ]
+        # ничего лишнего: без start_date/end_date, без can_view_*, subscription_plan, industry, sector, owner
 
-    def validate_name(self, value):
-        if len(value) < 2:
-            raise serializers.ValidationError("Название компании слишком короткое.")
-        return value
+    def validate(self, attrs):
+        # пустые строки -> None для опциональных текстовых полей
+        for f in _OPTIONAL_TEXT:
+            if f in attrs and (attrs[f] is None or str(attrs[f]).strip() == ""):
+                attrs[f] = None
 
+        if "name" in attrs and len(attrs["name"].strip()) < 2:
+            raise serializers.ValidationError({"name": "Название компании слишком короткое."})
+        return attrs
 
 # 🎭 Кастомные роли
 class CustomRoleSerializer(serializers.ModelSerializer):
