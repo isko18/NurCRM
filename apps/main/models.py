@@ -408,7 +408,10 @@ class Cart(models.Model):
     discount_total = models.DecimalField(max_digits=12, decimal_places=2, default=0, verbose_name="Сумма скидки")
     tax_total = models.DecimalField(max_digits=12, decimal_places=2, default=0, verbose_name="Сумма налога")
     total = models.DecimalField(max_digits=12, decimal_places=2, default=0, verbose_name="Итого")
-
+    order_discount_total = models.DecimalField(
+        max_digits=12, decimal_places=2, default=Decimal("0.00"),
+        verbose_name="Скидка на заказ (сумма)"
+    )
     created_at = models.DateTimeField(auto_now_add=True, verbose_name="Создана")
     updated_at = models.DateTimeField(auto_now=True, verbose_name="Обновлена")
 
@@ -427,29 +430,35 @@ class Cart(models.Model):
 
     def recalc(self):
         subtotal = Decimal("0")
-        discount_total = Decimal("0")
+        line_discount_total = Decimal("0")
 
         for it in self.items.select_related("product"):
             qty = Decimal(it.quantity or 0)
 
-            # Базовая (прайсовая) цена товара; если по какой-то причине её нет, fallback на unit_price
-            base_unit = getattr(it.product, "price", None)
-            if base_unit is None:
-                base_unit = it.unit_price or Decimal("0")
-
-            line_base = base_unit * qty            # до скидок
+            base_unit = getattr(it.product, "price", None) or (it.unit_price or Decimal("0"))
+            line_base = base_unit * qty               # до скидок
             line_actual = (it.unit_price or 0) * qty  # после скидок
 
             subtotal += line_base
             diff = line_base - line_actual
             if diff > 0:
-                discount_total += diff
+                line_discount_total += diff
+
+        subtotal = _money(subtotal)
+        line_discount_total = _money(line_discount_total)
+
+        # --- Скидка на итог (сумма) ---
+        requested_extra = _money(self.order_discount_total or Decimal("0"))
+        max_extra = max(Decimal("0"), subtotal - line_discount_total)
+        extra_discount = min(requested_extra, max_extra)
+
+        discount_total = _money(line_discount_total + extra_discount)
 
         taxable_base = subtotal - discount_total
         tax_total = self._calc_tax(taxable_base)
 
-        self.subtotal = _money(subtotal)
-        self.discount_total = _money(discount_total)
+        self.subtotal = subtotal
+        self.discount_total = discount_total
         self.tax_total = _money(tax_total)
         self.total = _money(self.subtotal - self.discount_total + self.tax_total)
 

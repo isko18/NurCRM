@@ -28,6 +28,18 @@ class MoneyField(serializers.DecimalField):
 
 
 # --- Позиция в корзине ---
+class StartCartOptionsSerializer(serializers.Serializer):
+    """
+    Опциональные настройки при старте корзины.
+    Скидка на весь заказ указывается суммой (MoneyField).
+    """
+    order_discount_total = MoneyField(required=False)
+
+    def validate_order_discount_total(self, v):
+        if v is not None and v < 0:
+            raise serializers.ValidationError("Должна быть ≥ 0.")
+        return v
+    
 class SaleItemSerializer(serializers.ModelSerializer):
     product_name = serializers.CharField(source="product.name", read_only=True)
     barcode = serializers.CharField(source="product.barcode", read_only=True)
@@ -64,7 +76,7 @@ class SaleCartSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = Cart
-        fields = ("id", "status", "subtotal", "discount_total", "tax_total", "total", "items")
+        fields = ("id", "status", "subtotal", "discount_total", "order_discount_total", "tax_total", "total", "items")
 
 
 class ScanRequestSerializer(serializers.Serializer):
