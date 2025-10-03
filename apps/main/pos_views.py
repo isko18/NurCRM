@@ -770,7 +770,6 @@ class SaleAddItemAPIView(APIView):
 
         return Response(SaleCartSerializer(cart).data, status=status.HTTP_201_CREATED)
 
-
 class SaleCheckoutAPIView(APIView):
     permission_classes = [permissions.IsAuthenticated]
 
@@ -785,9 +784,8 @@ class SaleCheckoutAPIView(APIView):
         print_receipt = ser.validated_data["print_receipt"]
         client_id = ser.validated_data.get("client_id")
 
-        # Определяем отдел — берём из сериализатора
-        department_id = ser.validated_data.get("department_id")
         department = None
+        department_id = ser.validated_data.get("department_id")
         if department_id:
             department = get_object_or_404(Department, id=department_id, company=request.user.company)
 
@@ -798,7 +796,6 @@ class SaleCheckoutAPIView(APIView):
         except ValueError as e:
             return Response({"detail": str(e)}, status=status.HTTP_400_BAD_REQUEST)
 
-        # --- сохраняем клиента ---
         if client_id:
             client = get_object_or_404(Client, id=client_id, company=request.user.company)
             sale.client = client
@@ -817,7 +814,7 @@ class SaleCheckoutAPIView(APIView):
 
         if print_receipt:
             lines = [
-                f"{it.name_snapshot} x{it.quantity} = {fmt_money(it.unit_price * it.quantity)}"
+                f"{(it.name_snapshot or '')[:40]} x{it.quantity} = {fmt_money((it.unit_price or 0)* (it.quantity or 0))}"
                 for it in sale.items.all()
             ]
             totals = [f"СУММА: {fmt_money(sale.subtotal)}"]
