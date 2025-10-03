@@ -482,15 +482,17 @@ class CartItem(models.Model):
         verbose_name_plural = "Товары в корзине"
 
     def save(self, *args, **kwargs):
-        # если цена не задана — берём из продукта, иначе 0
+        """
+        ВАЖНО: не обращаться к product.price, если product=None.
+        """
         if self.unit_price is None:
-            self.unit_price = getattr(self.product, "price", Decimal("0.00"))
+            self.unit_price = (self.product.price if self.product else Decimal("0.00"))
         super().save(*args, **kwargs)
         self.cart.recalc()
 
     def __str__(self):
-        return f"{self.product.name} x{self.quantity}"
-
+        base = getattr(self.product, "name", None) or (self.custom_name or "Позиция")
+        return f"{base} x{self.quantity}"
 
 
 class Sale(models.Model):
