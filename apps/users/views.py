@@ -3,6 +3,7 @@ from rest_framework.permissions import IsAuthenticated, AllowAny
 from rest_framework.response import Response
 from rest_framework.exceptions import NotFound, PermissionDenied
 from rest_framework_simplejwt.views import TokenObtainPairView
+from django.http import Http404
 
 from .models import User, Industry, SubscriptionPlan, Feature, Sector, CustomRole, Company
 from .serializers import (
@@ -170,14 +171,15 @@ class ChangePasswordView(generics.UpdateAPIView):
 class CompanyUpdateAPIView(generics.RetrieveUpdateAPIView):
     permission_classes = [permissions.IsAuthenticated]
     serializer_class = CompanyUpdateSerializer
-
-    def get_queryset(self):
-        # пользователь редактирует ТОЛЬКО свою компанию
-        return Company.objects.filter(id=self.request.user.owned_company_id)
+    # queryset DRF требует, но объект будем доставать вручную
+    queryset = Company.objects.none()
 
     def get_object(self):
-        return self.get_queryset().get()
-
+        user = self.request.user
+        company = getattr(user, "company", None) or getattr(user, "owned_company", None)
+        if not company:
+            raise Http404("Компания для текущего пользователя не найдена.")
+        return company
 # ====================
 # 🎭 Управление кастомными ролями
 # ====================
