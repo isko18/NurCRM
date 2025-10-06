@@ -1408,6 +1408,22 @@ class ManufactureSubrealBulkCreateAPIView(APIView):
 # -------------------------
 #   Agent: мои товары
 # -------------------------
+from typing import List, Optional, Dict, Any
+from datetime import datetime
+
+from django.db import transaction
+from django.db.models import Prefetch
+from rest_framework import permissions, status
+from rest_framework.response import Response
+from rest_framework.views import APIView
+from rest_framework.exceptions import ValidationError
+
+from itertools import groupby
+from operator import attrgetter
+
+from .models import ManufactureSubreal, ReturnFromAgent
+from .serializers import AgentProductOnHandSerializer
+
 
 class AgentMyProductsListAPIView(APIView):
     """
@@ -1415,73 +1431,199 @@ class AgentMyProductsListAPIView(APIView):
     Возвращает по каждому товару:
       - product, product_name
       - qty_on_hand (сумма по всем передачам: accepted - returned)
-      - last_movement_at (максимум из created_at передач, accepted_at приёмов, accepted_at принятых возвратов)
+      - last_movement_at (максимум из created_at передач, accepted_at приёмов,
+        accepted_at принятых возвратов)
       - subreals: список передач (id, created_at, qty_transferred/accepted/returned)
+
+    PATCH /api/main/agents/me/products/
+    Принимает:
+      {
+        "subreals": [
+          {"id": <int>, "qty_accepted": <int?>, "qty_returned": <int?>},
+          ...
+        ]
+      }
+    Обновляет только переданные поля с валидацией и принадлежностью к агенту/компании.
+    В ответе — актуальные данные как у GET.
     """
     permission_classes = [permissions.IsAuthenticated]
 
-    def get(self, request, *args, **kwargs):
-        company_id = getattr(request.user, "company_id", None)
-        if not company_id:
-            return Response([], status=200)
-
-        # забираем все передачи агента по компании, вместе с продуктом и движениями
-        qs = (
+    # -------- Helpers --------
+    def _build_queryset(self, request):
+        # префетчим только принятые возвраты — остальные не влияют на last_movement_at
+        accepted_returns_qs = ReturnFromAgent.objects.filter(
+            status=ReturnFromAgent.Status.ACCEPTED
+        )
+        return (
             ManufactureSubreal.objects
-            .filter(company_id=company_id, agent_id=request.user.id)
+            .filter(company_id=getattr(request.user, "company_id", None),
+                    agent_id=request.user.id)
             .select_related("product")
-            .prefetch_related("acceptances", "returns")
-            .order_by("product_id", "-created_at")  # для groupby по product_id
+            .prefetch_related(
+                "acceptances",
+                Prefetch("returns", queryset=accepted_returns_qs, to_attr="accepted_returns"),
+            )
+            .order_by("product_id", "-created_at")
         )
 
+    @staticmethod
+    def _nz(v: Optional[int]) -> int:
+        return int(v or 0)
+
+    def _serialize_products(self, qs) -> List[Dict[str, Any]]:
         data = []
         for product_id, subreals_iter in groupby(qs, key=attrgetter("product_id")):
             subreals = list(subreals_iter)
-            # суммарно на руках по этому товару
-            qty_on_hand = sum((s.qty_accepted - s.qty_returned) for s in subreals)
-            if qty_on_hand <= 0:
-                continue  # показываем только то, что реально на руках
 
-            # соберём даты движений
-            movement_dates = []
+            qty_on_hand = sum(
+                (self._nz(s.qty_accepted) - self._nz(s.qty_returned)) for s in subreals
+            )
+            if qty_on_hand <= 0:
+                continue
+
+            movement_dates: List[datetime] = []
             for s in subreals:
-                # создание передачи — тоже движение
                 if s.created_at:
                     movement_dates.append(s.created_at)
-                # приёмы
                 for acc in s.acceptances.all():
-                    if acc.accepted_at:
+                    if getattr(acc, "accepted_at", None):
                         movement_dates.append(acc.accepted_at)
-                # возвраты: учитываем только принятые возвраты (accepted)
-                for ret in s.returns.all():
-                    dt = getattr(ret, "accepted_at", None)
-                    if getattr(ret, "status", None) == getattr(ReturnFromAgent.Status, "ACCEPTED", "accepted") and dt:
-                        movement_dates.append(dt)
+                for ret in getattr(s, "accepted_returns", []):
+                    if getattr(ret, "accepted_at", None):
+                        movement_dates.append(ret.accepted_at)
 
             last_movement_at = max(movement_dates) if movement_dates else None
 
-            # список передач для UI
             subreals_payload = [
                 {
                     "id": s.id,
                     "created_at": s.created_at,
-                    "qty_transferred": s.qty_transferred,
-                    "qty_accepted": s.qty_accepted,
-                    "qty_returned": s.qty_returned,
+                    "qty_transferred": self._nz(s.qty_transferred),
+                    "qty_accepted": self._nz(s.qty_accepted),
+                    "qty_returned": self._nz(s.qty_returned),
                 }
                 for s in subreals
             ]
 
             data.append({
                 "product": product_id,
-                "product_name": subreals[0].product.name if subreals and subreals[0].product else "",
+                "product_name": (
+                    subreals[0].product.name
+                    if (subreals and getattr(subreals[0], "product", None))
+                    else ""
+                ),
                 "qty_on_hand": qty_on_hand,
                 "last_movement_at": last_movement_at,
                 "subreals": subreals_payload,
             })
+        return data
 
-        # если используешь AgentProductOnHandSerializer с новыми полями
-        # убедись, что он содержит:
-        # - last_movement_at = serializers.DateTimeField()
-        # - subreals = AgentSubrealSerializer(many=True)
-        return Response(AgentProductOnHandSerializer(data, many=True).data, status=200)
+    # -------- GET --------
+    def get(self, request, *args, **kwargs):
+        company_id = getattr(request.user, "company_id", None)
+        if not company_id:
+            return Response([], status=status.HTTP_200_OK)
+
+        qs = self._build_queryset(request)
+        data = self._serialize_products(qs)
+        return Response(AgentProductOnHandSerializer(data, many=True).data, status=status.HTTP_200_OK)
+
+    # -------- PATCH --------
+    def patch(self, request, *args, **kwargs):
+        """
+        Частичное обновление qty_accepted / qty_returned по конкретным передачам.
+        """
+        company_id = getattr(request.user, "company_id", None)
+        if not company_id:
+            return Response({"detail": "No company bound."}, status=status.HTTP_400_BAD_REQUEST)
+
+        payload = request.data or {}
+        if not isinstance(payload, dict) or "subreals" not in payload:
+            raise ValidationError({"subreals": "Required list of updates."})
+
+        items = payload["subreals"]
+        if not isinstance(items, list) or not items:
+            raise ValidationError({"subreals": "Must be a non-empty list."})
+
+        # собираем id для выборки и простую схему валидации
+        ids = []
+        for i, it in enumerate(items):
+            if not isinstance(it, dict):
+                raise ValidationError({f"subreals[{i}]": "Must be an object."})
+            if "id" not in it:
+                raise ValidationError({f"subreals[{i}].id": "Required."})
+            if not isinstance(it["id"], int):
+                raise ValidationError({f"subreals[{i}].id": "Must be integer."})
+
+            allowed_keys = {"qty_accepted", "qty_returned"}
+            unknown = set(it.keys()) - ({"id"} | allowed_keys)
+            if unknown:
+                raise ValidationError({f"subreals[{i}]": f"Unknown fields: {', '.join(sorted(unknown))}"})
+
+            for f in allowed_keys & set(it.keys()):
+                v = it[f]
+                if v is None:
+                    continue
+                if not isinstance(v, int):
+                    raise ValidationError({f"subreals[{i}].{f}": "Must be integer."})
+                if v < 0:
+                    raise ValidationError({f"subreals[{i}].{f}": "Must be >= 0."})
+
+            ids.append(it["id"])
+
+        # выбираем только свои передачи
+        subreal_map = {
+            s.id: s
+            for s in ManufactureSubreal.objects.filter(
+                id__in=ids,
+                company_id=company_id,
+                agent_id=request.user.id,
+            ).select_for_update()
+        }
+        missing = [sid for sid in ids if sid not in subreal_map]
+        if missing:
+            raise ValidationError({"subreals": f"Not found or not allowed: {missing}"})
+
+        # применяем изменения с проверками инвариантов
+        to_update: List[ManufactureSubreal] = []
+        with transaction.atomic():
+            for it in items:
+                s = subreal_map[it["id"]]
+
+                new_accepted = s.qty_accepted if s.qty_accepted is not None else 0
+                new_returned = s.qty_returned if s.qty_returned is not None else 0
+                transferred = s.qty_transferred if s.qty_transferred is not None else 0
+
+                if "qty_accepted" in it and it["qty_accepted"] is not None:
+                    new_accepted = it["qty_accepted"]
+                if "qty_returned" in it and it["qty_returned"] is not None:
+                    new_returned = it["qty_returned"]
+
+                # инварианты
+                if new_accepted > transferred:
+                    raise ValidationError({
+                        f"id={s.id}": f"qty_accepted ({new_accepted}) must be <= qty_transferred ({transferred})"
+                    })
+                if new_returned > new_accepted:
+                    raise ValidationError({
+                        f"id={s.id}": f"qty_returned ({new_returned}) must be <= qty_accepted ({new_accepted})"
+                    })
+
+                # если есть фактические изменения — ставим и копим
+                changed = False
+                if new_accepted != (s.qty_accepted or 0):
+                    s.qty_accepted = new_accepted
+                    changed = True
+                if new_returned != (s.qty_returned or 0):
+                    s.qty_returned = new_returned
+                    changed = True
+                if changed:
+                    to_update.append(s)
+
+            if to_update:
+                ManufactureSubreal.objects.bulk_update(to_update, ["qty_accepted", "qty_returned"])
+
+        # возвращаем актуальное состояние как в GET
+        qs = self._build_queryset(request)
+        data = self._serialize_products(qs)
+        return Response(AgentProductOnHandSerializer(data, many=True).data, status=status.HTTP_200_OK)
