@@ -23,7 +23,7 @@ from .pos_serializers import (
     SaleCartSerializer, SaleItemSerializer,
     ScanRequestSerializer, AddItemSerializer,
     CheckoutSerializer, MobileScannerTokenSerializer,
-    SaleListSerializer, SaleDetailSerializer, StartCartOptionsSerializer, CustomCartItemCreateSerializer
+    SaleListSerializer, SaleDetailSerializer, StartCartOptionsSerializer, CustomCartItemCreateSerializer, SaleStatusUpdateSerializer
 )
 from apps.main.services import checkout_cart, NotEnoughStock
 from apps.main.views import CompanyRestrictedMixin
@@ -932,18 +932,32 @@ class SaleListAPIView(CompanyRestrictedMixin, generics.ListAPIView):
 
 class SaleRetrieveAPIView(generics.RetrieveUpdateDestroyAPIView):
     """
-    GET /api/main/pos/sales/<uuid:pk>/
-    Детальная продажа с её позициями.
+    GET    /api/main/pos/sales/<uuid:pk>/  — детальная продажа с позициями
+    PATCH  /api/main/pos/sales/<uuid:pk>/  — обновить статус
+    PUT    /api/main/pos/sales/<uuid:pk>/  — обновить статус
+    DELETE /api/main/pos/sales/<uuid:pk>/  — удалить
     """
-    serializer_class = SaleDetailSerializer
     permission_classes = [permissions.IsAuthenticated]
+    lookup_field = "id"
+    lookup_url_kwarg = "pk"
 
-    def get_object(self):
-        return get_object_or_404(
-            Sale.objects.select_related("user").prefetch_related("items__product"),
-            id=self.kwargs["pk"],
-            company=self.request.user.company,  
+    # read-сериализатор с детальными полями (status — единственное writable)
+    serializer_class = SaleDetailSerializer
+
+    def get_queryset(self):
+        # базовый queryset с нужными join/prefetch и ограничением по компании
+        return (
+            Sale.objects
+            .select_related("user")
+            .prefetch_related("items__product")
+            .filter(company=self.request.user.company)
         )
+
+    def get_serializer_class(self):
+        # На запись — узкий сериализатор только для статуса
+        if self.request.method in ("PUT", "PATCH"):
+            return SaleStatusUpdateSerializer
+        return SaleDetailSerializer
 
 class SaleBulkDeleteAPIView(APIView):
     permission_classes = [permissions.IsAuthenticated]

@@ -217,7 +217,7 @@ class SaleItemReadSerializer(serializers.ModelSerializer):
 
 
 class SaleDetailSerializer(serializers.ModelSerializer):
-    user_display = serializers.SerializerMethodField()
+    user_display = serializers.SerializerMethodField(read_only=True)
     items = SaleItemReadSerializer(many=True, read_only=True)
     client_name = serializers.CharField(source="client.full_name", read_only=True)
 
@@ -225,7 +225,7 @@ class SaleDetailSerializer(serializers.ModelSerializer):
         model = Sale
         fields = (
             "id",
-            "status",
+            "status",          # <-- допускаем запись
             "subtotal",
             "discount_total",
             "tax_total",
@@ -233,18 +233,36 @@ class SaleDetailSerializer(serializers.ModelSerializer):
             "created_at",
             "paid_at",
             "user_display",
-            "client",        # id клиента
-            "client_name",   # имя клиента
+            "client",          # id клиента
+            "client_name",     # имя клиента
             "items",
         )
-    # весь объект только для чтения (деталка)
-        read_only_fields = fields
+        # всё read-only, КРОМЕ status
+        read_only_fields = (
+            "id",
+            "subtotal",
+            "discount_total",
+            "tax_total",
+            "total",
+            "created_at",
+            "paid_at",
+            "user_display",
+            "client",
+            "client_name",
+            "items",
+        )
 
     def get_user_display(self, obj):
         u = obj.user
         if not u:
             return None
-        return (getattr(u, "get_full_name", lambda: "")()
-                or getattr(u, "email", None)
-                or getattr(u, "username", None))
+        return (
+            getattr(u, "get_full_name", lambda: "")()
+            or getattr(u, "email", None)
+            or getattr(u, "username", None)
+        )
 
+class SaleStatusUpdateSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Sale
+        fields = ("status",)
