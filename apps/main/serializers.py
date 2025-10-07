@@ -804,7 +804,7 @@ class DebtSerializer(serializers.ModelSerializer):
         model = Debt
         fields = [
             "id", "company", "name", "phone", "amount",
-            "paid_total", "balance",
+            "paid_total", "balance",'due_date',
             "created_at", "updated_at",
         ]
         read_only_fields = ["id", "company", "paid_total", "balance", "created_at", "updated_at"]
