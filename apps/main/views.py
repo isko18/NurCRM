@@ -145,7 +145,6 @@ class OrderRetrieveUpdateDestroyAPIView(CompanyRestrictedMixin, generics.Retriev
     serializer_class = OrderSerializer
     queryset = Order.objects.all().prefetch_related("items__product")
     
-    
 class ProductCreateByBarcodeAPIView(generics.CreateAPIView):
     """
     Создание товара только по штрих-коду (если найден в глобальной базе).
@@ -218,7 +217,8 @@ class ProductCreateByBarcodeAPIView(generics.CreateAPIView):
             price=price,
             purchase_price=purchase_price,
             quantity=quantity,
-            date=date_value,  # <- теперь сохраняем дату
+            date=date_value,  # <- сохраняем дату (как у вас)
+            created_by=request.user,  # <- добавлено
         )
 
         return Response(self.get_serializer(product).data, status=status.HTTP_201_CREATED)
@@ -367,6 +367,7 @@ class ProductCreateManualAPIView(generics.CreateAPIView):
             client=client,
             status=status_value,
             date=date_value,
+            created_by=request.user,  # <- добавлено
         )
 
         # обработаем item_make вход: поддерживаем "item_make" (str or list) или "item_make_ids"
@@ -395,6 +396,7 @@ class ProductCreateManualAPIView(generics.CreateAPIView):
             )
 
         return Response(self.get_serializer(product).data, status=status.HTTP_201_CREATED)
+
 
 class ProductRetrieveUpdateDestroyAPIView(CompanyRestrictedMixin, generics.RetrieveUpdateDestroyAPIView):
     serializer_class = ProductSerializer

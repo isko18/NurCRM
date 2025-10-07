@@ -309,7 +309,7 @@ class Product(models.Model):
         related_name="products",
         verbose_name="Клиент"
     )
-
+    created_by = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, blank=True)
     name = models.CharField(max_length=255)
     barcode = models.CharField(max_length=64, null=True, blank=True)
     brand = models.ForeignKey(ProductBrand, on_delete=models.SET_NULL, null=True, blank=True)

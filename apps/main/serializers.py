@@ -243,6 +243,10 @@ class ProductSerializer(serializers.ModelSerializer):
     brand = serializers.CharField(source="brand.name", read_only=True)
     category = serializers.CharField(source="category.name", read_only=True)
 
+    # кто создал (read-only)
+    created_by = serializers.ReadOnlyField(source="created_by.id")
+    created_by_name = serializers.SerializerMethodField(read_only=True)
+
     # GET: детализированные объекты ItemMake
     item_make = ItemMakeNestedSerializer(many=True, read_only=True)
     # POST/PUT: список ID для записи (если используете сериализатор create/update)
@@ -275,18 +279,30 @@ class ProductSerializer(serializers.ModelSerializer):
             "status", "status_display",
             "company",
             "client", "client_name", "date",
+            "created_by", "created_by_name",   # ← добавлено
             "created_at", "updated_at",
         ]
         read_only_fields = [
             "id", "created_at", "updated_at",
             "company", "name", "brand", "category",
             "client_name", "status_display", "item_make", "date",
+            "created_by", "created_by_name",   # ← добавлено
         ]
         extra_kwargs = {
             "price": {"required": False, "default": 0},
             "purchase_price": {"required": False, "default": 0},
             "quantity": {"required": False, "default": 0},
         }
+
+    def get_created_by_name(self, obj):
+        u = getattr(obj, "created_by", None)
+        if not u:
+            return None
+        return (
+            getattr(u, "get_full_name", lambda: "")()
+            or getattr(u, "email", None)
+            or getattr(u, "username", None)
+        )
 
     def get_date(self, obj):
         dt = getattr(obj, "date", None)
@@ -351,6 +367,7 @@ class ProductSerializer(serializers.ModelSerializer):
             client=client,
             status=status_value,
             date=date_value,
+            created_by=getattr(self.context["request"], "user", None),  # ← добавлено
         )
 
         if item_make_data:
@@ -379,7 +396,7 @@ class ProductSerializer(serializers.ModelSerializer):
 
         instance.save()
         return instance
-    
+
 class ReviewSerializer(serializers.ModelSerializer):
     user = serializers.ReadOnlyField(source='user.id')
     company = serializers.ReadOnlyField(source='company.id')
@@ -896,28 +913,7 @@ class ItemMakeSerializer(serializers.ModelSerializer):
         # автоматически привязываем компанию текущего пользователя
         validated_data["company"] = self.context["request"].user.company
         return super().create(validated_data)
- # serializers.py
 
-# -------------------------
-#   ManufactureSubreal
-# -------------------------
-# serializers.py
-from django.contrib.auth import get_user_model
-from rest_framework import serializers
-
-from .models import (
-    ManufactureSubreal,
-    Acceptance,
-    ReturnFromAgent,
-    Product,
-)
-
-User = get_user_model()
-
-
-# -------------------------
-#   ManufactureSubreal
-# -------------------------
 
 class ManufactureSubrealSerializer(serializers.ModelSerializer):
     product_name = serializers.ReadOnlyField(source="product.name")
