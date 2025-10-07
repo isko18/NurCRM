@@ -1138,6 +1138,7 @@ class Debt(models.Model):
     phone = models.CharField("Телефон", max_length=32)
     amount = models.DecimalField("Сумма долга", max_digits=12, decimal_places=2,
                                  validators=[MinValueValidator(Decimal("0"))])
+    due_date = models.DateTimeField(verbose_name="дата возвращения")
 
     created_at = models.DateTimeField("Создан", auto_now_add=True)
     updated_at = models.DateTimeField("Обновлён", auto_now=True)
