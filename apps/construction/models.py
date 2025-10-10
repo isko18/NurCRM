@@ -4,7 +4,7 @@ from django.core.exceptions import ValidationError
 from django.db.models import Sum
 import uuid
 import random
-
+from django.core.exceptions import ObjectDoesNotExist
 from apps.users.models import Company, User, Branch
 
 
@@ -75,10 +75,19 @@ class Department(models.Model):
 
     # быстрая сводка с учётом только утверждённых движений
     def cashflow_summary(self):
-        if hasattr(self, 'cashbox') and self.cashbox_id:
-            return self.cashbox.get_summary()
-        return {'income': {'total': 0, 'count': 0}, 'expense': {'total': 0, 'count': 0}}
+        # у Department нет cashbox_id — достаём обратную связь try/except
+        try:
+            cashbox = self.cashbox   # OneToOne reverse; может не существовать
+        except ObjectDoesNotExist:
+            cashbox = None
 
+        if cashbox:
+            return cashbox.get_summary()
+
+        return {
+            'income':  {'total': 0, 'count': 0},
+            'expense': {'total': 0, 'count': 0},
+        }
 
 # ==========================
 # Касса
