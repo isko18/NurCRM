@@ -202,7 +202,7 @@ class RequestsConsalting(TimeStampedModel):
     class Status(models.TextChoices):
         NEW = 'new', 'Новая'
         IN_WORK = 'in_work', 'В работе'
-        COMPLETED = 'completed', 'Завершена'
+        DONE = 'done', 'Завершена'
         CANCELLED = 'cancelled', 'Отменена'
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
