@@ -203,7 +203,7 @@ class RequestsConsalting(TimeStampedModel):
         NEW = 'new', 'Новая'
         IN_WORK = 'in_work', 'В работе'
         DONE = 'done', 'Завершена'
-        CANCELLED = 'cancelled', 'Отменена'
+        CANCELED = 'canceled', 'Отменена'
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     company = models.ForeignKey(
