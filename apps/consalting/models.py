@@ -201,7 +201,7 @@ class SalaryConsalting(TimeStampedModel):
 class RequestsConsalting(TimeStampedModel):
     class Status(models.TextChoices):
         NEW = 'new', 'Новая'
-        IN_PROGRESS = 'in_progress', 'В работе'
+        IN_WORK = 'in_work', 'В работе'
         COMPLETED = 'completed', 'Завершена'
         CANCELLED = 'cancelled', 'Отменена'
 
