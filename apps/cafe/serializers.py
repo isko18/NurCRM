@@ -1,6 +1,8 @@
 # apps/cafe/serializers.py
-from rest_framework import serializers
 from django.contrib.auth import get_user_model
+from django.db.models import Q
+from rest_framework import serializers
+from django.core.exceptions import ValidationError as DjangoValidationError
 
 from .models import (
     Zone, Table, Booking, Warehouse, Purchase,
@@ -12,71 +14,139 @@ from .models import (
 User = get_user_model()
 
 
-# --------- Базовый миксин для company ---------
-class CompanyReadOnlyMixin(serializers.ModelSerializer):
-    """
-    Делает поле company read-only (как id) и проставляет company из request.user при create/update.
-    """
+# ===== company/branch mixin (как в барбере/букинге) =====
+class CompanyBranchReadOnlyMixin(serializers.ModelSerializer):
     company = serializers.ReadOnlyField(source="company.id")
+    branch = serializers.ReadOnlyField(source="branch.id")
 
-    def _get_company(self):
+    def _user(self):
+        return getattr(self.context.get("request"), "user", None)
+
+    def _user_company(self):
+        u = self._user()
+        return getattr(u, "company", None) or getattr(u, "owned_company", None)
+
+    def _auto_branch(self):
+        """
+        1) user.primary_branch() / user.primary_branch
+        2) request.branch (если есть)
+        3) None
+        Только если branch принадлежит компании пользователя.
+        """
         request = self.context.get("request")
-        return getattr(getattr(request, "user", None), "company", None)
+        user = self._user()
+        comp_id = getattr(self._user_company(), "id", None)
+        if not request or not user or not comp_id:
+            return None
+
+        primary = getattr(user, "primary_branch", None)
+        if callable(primary):
+            try:
+                val = primary()
+                if val and getattr(val, "company_id", None) == comp_id:
+                    return val
+            except Exception:
+                pass
+        if primary and getattr(primary, "company_id", None) == comp_id:
+            return primary
+
+        if hasattr(request, "branch"):
+            b = getattr(request, "branch")
+            if b and getattr(b, "company_id", None) == comp_id:
+                return b
+
+        return None
 
     def create(self, validated_data):
-        company = self._get_company()
-        if company is None:
+        company = self._user_company()
+        if not company:
             raise serializers.ValidationError("Невозможно определить компанию пользователя.")
         validated_data["company"] = company
+
+        # если у модели есть branch — проставим
+        if "branch" in getattr(self.Meta, "fields", []):
+            auto_branch = self._auto_branch()
+            validated_data["branch"] = auto_branch if auto_branch is not None else None
         return super().create(validated_data)
 
     def update(self, instance, validated_data):
-        # company не меняем руками извне, но на всякий случай закрепим из пользователя
-        company = self._get_company()
-        if company is None:
-            return super().update(instance, validated_data)
-        validated_data["company"] = company
+        company = self._user_company()
+        if company:
+            validated_data["company"] = company
+        # не перетираем branch, если не смогли определить
+        if "branch" in getattr(self.Meta, "fields", []):
+            auto_branch = self._auto_branch()
+            if auto_branch is not None:
+                validated_data["branch"] = auto_branch
         return super().update(instance, validated_data)
 
 
+def _scope_queryset_by_context(qs, serializer: CompanyBranchReadOnlyMixin):
+    """Сужает QuerySet по компании и (branch = активный | NULL)."""
+    company = serializer._user_company()
+    if not company:
+        return qs.none()
+    qs = qs.filter(company=company)
+    model = qs.model
+    if hasattr(model, "branch"):
+        b = serializer._auto_branch()
+        if b is not None:
+            qs = qs.filter(Q(branch=b) | Q(branch__isnull=True))
+        else:
+            qs = qs.filter(branch__isnull=True)
+    return qs
+
+
 # --------- Простые справочники ---------
-class ZoneSerializer(CompanyReadOnlyMixin):
+class ZoneSerializer(CompanyBranchReadOnlyMixin):
     class Meta:
         model = Zone
-        fields = ["id", "company", "title"]
+        fields = ["id", "company", "branch", "title"]
+        read_only_fields = ["id", "company", "branch"]
 
 
-class TableSerializer(CompanyReadOnlyMixin):
+class TableSerializer(CompanyBranchReadOnlyMixin):
     zone = serializers.PrimaryKeyRelatedField(queryset=Zone.objects.all())
 
     class Meta:
         model = Table
-        fields = ["id", "company", "zone", "number", "places", "status"]
+        fields = ["id", "company", "branch", "zone", "number", "places", "status"]
+        read_only_fields = ["id", "company", "branch"]
 
-    def validate_zone(self, zone):
-        company = self._get_company()
-        if company and zone.company_id != company.id:
-            raise serializers.ValidationError("Зона принадлежит другой компании.")
-        return zone
+    def get_fields(self):
+        fields = super().get_fields()
+        fields["zone"].queryset = _scope_queryset_by_context(Zone.objects.all(), self)
+        return fields
+
+    def validate(self, attrs):
+        zone = attrs.get("zone") or getattr(self.instance, "zone", None)
+        # согласованность филиала: зона глобальная или текущего филиала, и совпадает с табличным branch
+        tb = self._auto_branch()
+        if tb is not None and zone and zone.branch_id not in (None, tb.id):
+            raise serializers.ValidationError({"zone": "Зона принадлежит другому филиалу."})
+        return attrs
 
 
-class WarehouseSerializer(CompanyReadOnlyMixin):
+class WarehouseSerializer(CompanyBranchReadOnlyMixin):
     class Meta:
         ref_name = "CafeWarehouse"
         model = Warehouse
-        fields = ["id", "company", "title", "unit", "remainder", "minimum"]
+        fields = ["id", "company", "branch", "title", "unit", "remainder", "minimum"]
+        read_only_fields = ["id", "company", "branch"]
 
 
-class PurchaseSerializer(CompanyReadOnlyMixin):
+class PurchaseSerializer(CompanyBranchReadOnlyMixin):
     class Meta:
         model = Purchase
-        fields = ["id", "company", "supplier", "positions", "price"]
+        fields = ["id", "company", "branch", "supplier", "positions", "price"]
+        read_only_fields = ["id", "company", "branch"]
 
 
-class CategorySerializer(CompanyReadOnlyMixin):
+class CategorySerializer(CompanyBranchReadOnlyMixin):
     class Meta:
         model = Category
-        fields = ["id", "company", "title"]
+        fields = ["id", "company", "branch", "title"]
+        read_only_fields = ["id", "company", "branch"]
 
 
 # --------- Меню и ингредиенты ---------
@@ -89,14 +159,18 @@ class IngredientInlineSerializer(serializers.ModelSerializer):
         fields = ["id", "product", "product_title", "product_unit", "amount"]
         read_only_fields = ["id", "product_title", "product_unit"]
 
-    def validate_product(self, product):
-        company = getattr(getattr(self.context.get("request"), "user", None), "company", None)
-        if company and product.company_id != company.id:
-            raise serializers.ValidationError("Товар склада принадлежит другой компании.")
-        return product
+    def get_fields(self):
+        fields = super().get_fields()
+        # product принадлежит складу в скоупе
+        fields["product"].queryset = _scope_queryset_by_context(Warehouse.objects.all(), self.parent.parent)
+        return fields
+
+    def validate(self, attrs):
+        # model.clean() на связях добьёт; здесь ничего лишнего
+        return attrs
 
 
-class MenuItemSerializer(CompanyReadOnlyMixin):
+class MenuItemSerializer(CompanyBranchReadOnlyMixin):
     category = serializers.PrimaryKeyRelatedField(queryset=Category.objects.all())
     ingredients = IngredientInlineSerializer(many=True, required=False)
     image = serializers.ImageField(required=False, allow_null=True)
@@ -105,36 +179,32 @@ class MenuItemSerializer(CompanyReadOnlyMixin):
     class Meta:
         model = MenuItem
         fields = [
-            "id", "company", "title", "category", "price", "is_active",
-            "image", "image_url",      # добавили image_url
+            "id", "company", "branch", "title", "category", "price", "is_active",
+            "image", "image_url",
             "created_at", "updated_at", "ingredients",
-        ]   
-        read_only_fields = ["created_at", "updated_at"]
+        ]
+        read_only_fields = ["id", "company", "branch", "created_at", "updated_at"]
+
+    def get_fields(self):
+        fields = super().get_fields()
+        fields["category"].queryset = _scope_queryset_by_context(Category.objects.all(), self)
+        return fields
 
     def get_image_url(self, obj):
-        """
-        Возвращает абсолютный URL до webp-файла, если он есть.
-        """
         request = self.context.get("request")
         if obj.image and hasattr(obj.image, "url"):
             url = obj.image.url
             return request.build_absolute_uri(url) if request else url
         return None
 
-    def validate_category(self, category):
-        company = self._get_company()
-        if company and category.company_id != company.id:
-            raise serializers.ValidationError("Категория принадлежит другой компании.")
-        return category
-
-    def _upsert_ingredients(self, menu_item, ing_list, company):
+    def _upsert_ingredients(self, menu_item, ing_list):
         to_create = []
         for ing in ing_list:
-            product = ing["product"]
-            amount = ing["amount"]
-            if company and product.company_id != company.id:
-                raise serializers.ValidationError("Товар склада принадлежит другой компании.")
-            to_create.append(Ingredient(menu_item=menu_item, product=product, amount=amount))
+            to_create.append(Ingredient(
+                menu_item=menu_item,
+                product=ing["product"],
+                amount=ing["amount"]
+            ))
         if to_create:
             Ingredient.objects.bulk_create(to_create)
 
@@ -142,7 +212,7 @@ class MenuItemSerializer(CompanyReadOnlyMixin):
         ingredients = validated_data.pop("ingredients", [])
         obj = super().create(validated_data)
         if ingredients:
-            self._upsert_ingredients(obj, ingredients, obj.company)
+            self._upsert_ingredients(obj, ingredients)
         return obj
 
     def update(self, instance, validated_data):
@@ -151,27 +221,34 @@ class MenuItemSerializer(CompanyReadOnlyMixin):
         if ingredients is not None:
             instance.ingredients.all().delete()
             if ingredients:
-                self._upsert_ingredients(instance, ingredients, instance.company)
+                self._upsert_ingredients(instance, ingredients)
         return obj
 
 
 # --------- Бронь ---------
-class BookingSerializer(CompanyReadOnlyMixin):
+class BookingSerializer(CompanyBranchReadOnlyMixin):
     table = serializers.PrimaryKeyRelatedField(queryset=Table.objects.all())
 
     class Meta:
         model = Booking
         fields = [
-            "id", "company", "guest", "phone", "date", "time", "guests", "table",
+            "id", "company", "branch",
+            "guest", "phone", "date", "time", "guests", "table",
             "status", "created_at", "updated_at",
         ]
-        read_only_fields = ["created_at", "updated_at"]
+        read_only_fields = ["id", "company", "branch", "created_at", "updated_at"]
 
-    def validate_table(self, table):
-        company = self._get_company()
-        if company and table.company_id != company.id:
-            raise serializers.ValidationError("Стол принадлежит другой компании.")
-        return table
+    def get_fields(self):
+        fields = super().get_fields()
+        fields["table"].queryset = _scope_queryset_by_context(Table.objects.all(), self)
+        return fields
+
+    def validate(self, attrs):
+        table = attrs.get("table") or getattr(self.instance, "table", None)
+        tb = self._auto_branch()
+        if tb is not None and table and table.branch_id not in (None, tb.id):
+            raise serializers.ValidationError({"table": "Стол принадлежит другому филиалу."})
+        return attrs
 
 
 # --------- Заказы ---------
@@ -184,14 +261,14 @@ class OrderItemInlineSerializer(serializers.ModelSerializer):
         fields = ["id", "menu_item", "menu_item_title", "menu_item_price", "quantity"]
         read_only_fields = ["id", "menu_item_title", "menu_item_price"]
 
-    def validate_menu_item(self, menu_item):
-        company = getattr(getattr(self.context.get("request"), "user", None), "company", None)
-        if company and menu_item.company_id != company.id:
-            raise serializers.ValidationError("Позиция меню принадлежит другой компании.")
-        return menu_item
+    def get_fields(self):
+        fields = super().get_fields()
+        # получить родительский OrderSerializer
+        order_serializer = self.parent.parent
+        fields["menu_item"].queryset = _scope_queryset_by_context(MenuItem.objects.all(), order_serializer)
+        return fields
 
 
-# краткая карточка заказа для вложенного чтения в клиенте
 class OrderBriefSerializer(serializers.ModelSerializer):
     table_number = serializers.IntegerField(source="table.number", read_only=True)
 
@@ -200,12 +277,11 @@ class OrderBriefSerializer(serializers.ModelSerializer):
         fields = ["id", "table_number", "guests", "waiter", "created_at"]
 
 
-# --------- История заказов (архив) ---------
 class OrderItemHistorySerializer(serializers.ModelSerializer):
     class Meta:
         model = OrderItemHistory
         fields = ["id", "menu_item", "menu_item_title", "menu_item_price", "quantity"]
-        read_only_fields = fields = ["id", "menu_item", "menu_item_title", "menu_item_price", "quantity"]
+        read_only_fields = ["id", "menu_item", "menu_item_title", "menu_item_price", "quantity"]
 
 
 class OrderHistorySerializer(serializers.ModelSerializer):
@@ -214,78 +290,89 @@ class OrderHistorySerializer(serializers.ModelSerializer):
     class Meta:
         model = OrderHistory
         fields = [
-            "id", "original_order_id", "company", "client",
+            "id", "original_order_id", "company", "branch", "client",
             "table", "table_number", "waiter", "waiter_label",
             "guests", "created_at", "archived_at", "items",
         ]
         read_only_fields = fields
 
 
-# клиент кафе: с вложенными заказами (read-only) и историей (read-only)
-class CafeClientSerializer(CompanyReadOnlyMixin):
+class CafeClientSerializer(CompanyBranchReadOnlyMixin):
     orders = OrderBriefSerializer(many=True, read_only=True)
     history = OrderHistorySerializer(source="order_history", many=True, read_only=True)
 
     class Meta:
         model = CafeClient
-        fields = ["id", "company", "name", "phone", "notes", "orders", "history"]
+        fields = ["id", "company", "branch", "name", "phone", "notes", "orders", "history"]
+        read_only_fields = ["id", "company", "branch", "orders", "history"]
+
+    def validate_phone(self, value):
+        # лёгкая нормализация
+        if not value:
+            return value
+        return ''.join(ch for ch in value if ch.isdigit() or ch == '+')
 
 
-class OrderSerializer(CompanyReadOnlyMixin):
+class OrderSerializer(CompanyBranchReadOnlyMixin):
     table = serializers.PrimaryKeyRelatedField(queryset=Table.objects.all())
-    client = serializers.PrimaryKeyRelatedField(
-        queryset=CafeClient.objects.all(), required=False, allow_null=True
-    )
-    waiter = serializers.PrimaryKeyRelatedField(
-        queryset=User.objects.all(),  # при необходимости сузьте: .filter(role='waiter')
-        allow_null=True,
-        required=False
-    )
+    client = serializers.PrimaryKeyRelatedField(queryset=CafeClient.objects.all(), required=False, allow_null=True)
+    waiter = serializers.PrimaryKeyRelatedField(queryset=User.objects.all(), allow_null=True, required=False)
     items = OrderItemInlineSerializer(many=True, required=False)
 
     class Meta:
         ref_name = "CafeOrder"
         model = Order
-        fields = ["id", "company", "table", "client", "waiter", "guests", "created_at", "items"]
-        read_only_fields = ["created_at"]
+        fields = ["id", "company", "branch", "table", "client", "waiter", "guests", "created_at", "items"]
+        read_only_fields = ["id", "company", "branch", "created_at"]
+
+    def get_fields(self):
+        fields = super().get_fields()
+        fields["table"].queryset = _scope_queryset_by_context(Table.objects.all(), self)
+        fields["client"].queryset = _scope_queryset_by_context(CafeClient.objects.all(), self)
+        # сузим официантов по компании, если есть такое поле у User
+        company = self._user_company()
+        if company and hasattr(User, "company_id"):
+            fields["waiter"].queryset = User.objects.filter(company_id=company.id)
+        return fields
 
     def validate(self, attrs):
-        company = (self.instance.company if self.instance else self._get_company())
-        table = attrs.get("table", getattr(self.instance, "table", None))
-        waiter = attrs.get("waiter", getattr(self.instance, "waiter", None))
-        client = attrs.get("client", getattr(self.instance, "client", None))
+        company = self._user_company() or getattr(self.instance, "company", None)
+        tb = self._auto_branch()
+        table = attrs.get("table") or getattr(self.instance, "table", None)
+        waiter = attrs.get("waiter") or getattr(self.instance, "waiter", None)
+        client = attrs.get("client") or getattr(self.instance, "client", None)
 
         if company and table and table.company_id != company.id:
             raise serializers.ValidationError({"table": "Стол принадлежит другой компании."})
-        if company and waiter and getattr(waiter, "company_id", None) != company.id:
+        if company and waiter and getattr(waiter, "company_id", None) not in (None, company.id):
             raise serializers.ValidationError({"waiter": "Официант принадлежит другой компании."})
         if company and client and client.company_id != company.id:
             raise serializers.ValidationError({"client": "Клиент принадлежит другой компании."})
+
+        if tb is not None:
+            tb_id = tb.id
+            if table and table.branch_id not in (None, tb_id):
+                raise serializers.ValidationError({"table": "Стол другого филиала."})
+            if client and client.branch_id not in (None, tb_id):
+                raise serializers.ValidationError({"client": "Клиент другого филиала."})
         return attrs
 
-    def _upsert_items(self, order, items, company):
+    def _upsert_items(self, order, items):
         for it in items:
             menu_item = it["menu_item"]
             qty = it.get("quantity", 1)
-            if company and menu_item.company_id != company.id:
-                raise serializers.ValidationError("Позиция меню принадлежит другой компании.")
             existing = order.items.filter(menu_item=menu_item).first()
             if existing:
                 existing.quantity += qty
                 existing.save(update_fields=["quantity"])
             else:
-                OrderItem.objects.create(
-                    order=order,
-                    menu_item=menu_item,
-                    quantity=qty,
-                    **({"company": order.company} if hasattr(OrderItem, "company") else {})
-                )
+                OrderItem.objects.create(order=order, menu_item=menu_item, quantity=qty, company=order.company)
 
     def create(self, validated_data):
         items = validated_data.pop("items", [])
         obj = super().create(validated_data)
         if items:
-            self._upsert_items(obj, items, obj.company)
+            self._upsert_items(obj, items)
         return obj
 
     def update(self, instance, validated_data):
@@ -294,5 +381,5 @@ class OrderSerializer(CompanyReadOnlyMixin):
         if items is not None:
             instance.items.all().delete()
             if items:
-                self._upsert_items(instance, items, instance.company)
+                self._upsert_items(instance, items)
         return obj

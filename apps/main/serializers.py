@@ -1,161 +1,302 @@
+# apps/main/serializers.py
 from rest_framework import serializers
-from apps.main.models import Contact, Pipeline, Deal, Task, Integration, Analytics, Order, Product, Review, Notification, Event, Warehouse, WarehouseEvent, ProductCategory, ProductBrand, OrderItem, Client, GlobalProduct, CartItem, ClientDeal, Bid, SocialApplications, TransactionRecord, DealInstallment, ContractorWork, Debt, DebtPayment, ObjectItem, ObjectSale, ObjectSaleItem, ItemMake, ManufactureSubreal, Acceptance, ReturnFromAgent
-
-from apps.construction.models import Department
-from apps.consalting.models import ServicesConsalting 
-
-from apps.users.models import User, Company
 from django.db import transaction
-from decimal import Decimal
 from django.utils import timezone
+from django.db.models import Q
+from decimal import Decimal
 
+from apps.main.models import (
+    Contact, Pipeline, Deal, Task, Integration, Analytics, Order, Product, Review,
+    Notification, Event, Warehouse, WarehouseEvent, ProductCategory, ProductBrand,
+    OrderItem, Client, GlobalProduct, CartItem, ClientDeal, Bid, SocialApplications,
+    TransactionRecord, DealInstallment, ContractorWork, Debt, DebtPayment,
+    ObjectItem, ObjectSale, ObjectSaleItem, ItemMake, ManufactureSubreal, Acceptance,
+    ReturnFromAgent
+)
+from apps.construction.models import Department
+from apps.consalting.models import ServicesConsalting
+from apps.users.models import User, Company
+
+
+# ===========================
+# Общий миксин: company/branch (как в barber)
+# ===========================
+class CompanyBranchReadOnlyMixin:
+    """
+    Делает company/branch read-only наружу и гарантированно проставляет их из контекста на create/update.
+    Порядок получения branch:
+      1) user.primary_branch (свойство или метод, если есть)
+      2) request.branch (если положил middleware)
+      3) None (глобальная запись компании)
+    """
+
+    def _request(self):
+        return self.context.get("request")
+
+    def _user(self):
+        req = self._request()
+        return getattr(req, "user", None) if req else None
+
+    def _user_company(self):
+        user = self._user()
+        return getattr(user, "company", None) or getattr(user, "owned_company", None)
+
+    def _auto_branch(self):
+        request = self._request()
+        if not request:
+            return None
+        user = self._user()
+
+        primary = getattr(user, "primary_branch", None)
+        if callable(primary):
+            try:
+                val = primary()
+                if val:
+                    return val
+            except Exception:
+                pass
+        if primary:
+            return primary
+
+        if hasattr(request, "branch"):
+            return request.branch
+
+        return None
+
+    def _global_or_branch(self, qs, branch):
+        if branch is None:
+            return qs.filter(branch__isnull=True)
+        return qs.filter(Q(branch__isnull=True) | Q(branch=branch))
+
+    def create(self, validated_data):
+        company = self._user_company()
+        if company:
+            validated_data.setdefault("company", company)
+        # если у модели есть поле branch (присутствует в Meta.fields) — подставим активный
+        if "branch" in getattr(self.Meta, "fields", []):
+            validated_data["branch"] = self._auto_branch()
+        return super().create(validated_data)
+
+    def update(self, instance, validated_data):
+        company = self._user_company()
+        if company:
+            validated_data["company"] = company
+        if "branch" in getattr(self.Meta, "fields", []):
+            validated_data["branch"] = self._auto_branch()
+        return super().update(instance, validated_data)
+
+
+def restrict_pk_queryset(field, base_qs, company, branch):
+    """
+    Ограничивает queryset для PK-полей:
+      - по company (если у целевой модели есть поле company)
+      - по branch (если у целевой модели есть поле branch): допускаем глобальные (NULL) и текущий филиал
+    """
+    if base_qs is None or company is None or field is None:
+        return
+    qs = base_qs
+    if hasattr(base_qs.model, "company"):
+        qs = qs.filter(company=company)
+    if hasattr(base_qs.model, "branch"):
+        qs = qs.filter(Q(branch__isnull=True) | Q(branch=branch)) if branch else qs.filter(branch__isnull=True)
+    field.queryset = qs
+
+
+# ===========================
+# Простые справочники без company/branch
+# ===========================
 class SocialApplicationsSerializers(serializers.ModelSerializer):
     class Meta:
         model = SocialApplications
-        fields = ['id', 'company', 'text', 'status','created_at']
+        fields = ['id', 'company', 'text', 'status', 'created_at']
 
 
 class BidSerializers(serializers.ModelSerializer):
     class Meta:
         model = Bid
-        fields = ['id', 'full_name', 'phone', 'text', 'status','created_at']
+        fields = ['id', 'full_name', 'phone', 'text', 'status', 'created_at']
 
-    
-class ProductCategorySerializer(serializers.ModelSerializer):
+
+# ===========================
+# ProductCategory / ProductBrand (company/branch)
+# ===========================
+class ProductCategorySerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
+    company = serializers.ReadOnlyField(source="company.id")
+    branch = serializers.ReadOnlyField(source="branch.id")
+
     parent = serializers.PrimaryKeyRelatedField(
         queryset=ProductCategory.objects.all(),
         allow_null=True,
-        required=False  
+        required=False
     )
 
     class Meta:
         model = ProductCategory
-        fields = ['id', 'name', 'parent']
-        read_only_fields = ['id']
+        fields = ['id', 'company', 'branch', 'name', 'parent']
+        read_only_fields = ['id', 'company', 'branch']
 
-        
-class ProductBrandSerializer(serializers.ModelSerializer):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        comp = self._user_company()
+        br = self._auto_branch()
+        restrict_pk_queryset(self.fields.get("parent"), ProductCategory.objects.all(), comp, br)
+
+
+class ProductBrandSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
+    company = serializers.ReadOnlyField(source="company.id")
+    branch = serializers.ReadOnlyField(source="branch.id")
+
     parent = serializers.PrimaryKeyRelatedField(
         queryset=ProductBrand.objects.all(),
         allow_null=True,
-        required=False  
+        required=False
     )
 
     class Meta:
         model = ProductBrand
-        fields = ['id', 'name', 'parent']
-        read_only_fields = ['id']
+        fields = ['id', 'company', 'branch', 'name', 'parent']
+        read_only_fields = ['id', 'company', 'branch']
 
-        
-class ContactSerializer(serializers.ModelSerializer):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        comp = self._user_company()
+        br = self._auto_branch()
+        restrict_pk_queryset(self.fields.get("parent"), ProductBrand.objects.all(), comp, br)
+
+
+# ===========================
+# Contact / Pipeline / Deal / Task
+# ===========================
+class ContactSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
     owner = serializers.ReadOnlyField(source='owner.id')
     company = serializers.ReadOnlyField(source='company.id')
+    branch = serializers.ReadOnlyField(source='branch.id')
 
     class Meta:
         model = Contact
         fields = [
-            'id', 'name', 'email', 'phone', 'address', 'client_company',
+            'id', 'company', 'branch',
+            'name', 'email', 'phone', 'address', 'client_company',
             'notes', 'department', 'created_at', 'updated_at',
-            'owner', 'company'
+            'owner'
         ]
-        read_only_fields = ['id', 'created_at', 'updated_at', 'owner', 'company']
+        read_only_fields = ['id', 'created_at', 'updated_at', 'owner', 'company', 'branch']
 
     def create(self, validated_data):
         validated_data['owner'] = self.context['request'].user
-        validated_data['company'] = self.context['request'].user.company
         return super().create(validated_data)
 
 
-class PipelineSerializer(serializers.ModelSerializer):
+class PipelineSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
     owner = serializers.ReadOnlyField(source='owner.id')
     company = serializers.ReadOnlyField(source='company.id')
+    branch = serializers.ReadOnlyField(source='branch.id')
 
     class Meta:
         model = Pipeline
-        fields = ['id', 'name', 'stages', 'created_at', 'updated_at', 'owner', 'company']
-        read_only_fields = ['id', 'created_at', 'updated_at', 'owner', 'company']
+        fields = ['id', 'company', 'branch', 'name', 'stages', 'created_at', 'updated_at', 'owner']
+        read_only_fields = ['id', 'created_at', 'updated_at', 'owner', 'company', 'branch']
 
     def create(self, validated_data):
         validated_data['owner'] = self.context['request'].user
-        validated_data['company'] = self.context['request'].user.company
         return super().create(validated_data)
 
 
-class DealSerializer(serializers.ModelSerializer):
+class DealSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
+    company = serializers.ReadOnlyField(source='company.id')
+    branch = serializers.ReadOnlyField(source='branch.id')
+
     pipeline = serializers.PrimaryKeyRelatedField(queryset=Pipeline.objects.all())
     contact = serializers.PrimaryKeyRelatedField(queryset=Contact.objects.all())
     assigned_to = serializers.PrimaryKeyRelatedField(queryset=User.objects.all(), allow_null=True)
-    company = serializers.ReadOnlyField(source='company.id')
 
     class Meta:
         model = Deal
         fields = [
-            'id', 'title', 'value', 'status',
+            'id', 'company', 'branch',
+            'title', 'value', 'status',
             'pipeline', 'stage', 'contact', 'assigned_to',
-            'company', 'created_at', 'updated_at'
+            'created_at', 'updated_at'
         ]
-        read_only_fields = ['id', 'created_at', 'updated_at', 'company']
+        read_only_fields = ['id', 'created_at', 'updated_at', 'company', 'branch']
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        comp = self._user_company()
+        br = self._auto_branch()
+        restrict_pk_queryset(self.fields.get("pipeline"), Pipeline.objects.all(), comp, br)
+        restrict_pk_queryset(self.fields.get("contact"), Contact.objects.all(), comp, br)
+        if comp and self.fields.get("assigned_to"):
+            self.fields["assigned_to"].queryset = User.objects.filter(company=comp)
 
     def validate(self, attrs):
         user = self.context['request'].user
         company = user.company
+        pipeline = attrs.get('pipeline') or getattr(self.instance, "pipeline", None)
+        contact = attrs.get('contact') or getattr(self.instance, "contact", None)
+        assigned_to = attrs.get('assigned_to') or getattr(self.instance, "assigned_to", None)
 
-        if attrs['pipeline'].company != company:
+        if pipeline and pipeline.company != company:
             raise serializers.ValidationError("Воронка принадлежит другой компании.")
-        if attrs['contact'].company != company:
+        if contact and contact.company != company:
             raise serializers.ValidationError("Контакт принадлежит другой компании.")
-        if attrs['assigned_to'].company != company:
+        if assigned_to and assigned_to.company != company:
             raise serializers.ValidationError("Ответственный не из вашей компании.")
-
         return attrs
 
-    def create(self, validated_data):
-        validated_data['company'] = self.context['request'].user.company
-        return super().create(validated_data)
 
-class TaskSerializer(serializers.ModelSerializer):
+class TaskSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
+    company = serializers.ReadOnlyField(source='company.id')
+    branch = serializers.ReadOnlyField(source='branch.id')
+
     assigned_to = serializers.PrimaryKeyRelatedField(queryset=User.objects.all(), allow_null=True)
     deal = serializers.PrimaryKeyRelatedField(queryset=Deal.objects.all(), allow_null=True, required=False)
-    company = serializers.ReadOnlyField(source='company.id')
 
     class Meta:
         model = Task
         fields = [
-            'id', 'title', 'description', 'due_date', 'status',
-            'assigned_to', 'deal', 'company',
+            'id', 'company', 'branch',
+            'title', 'description', 'due_date', 'status',
+            'assigned_to', 'deal',
             'created_at', 'updated_at'
         ]
-        read_only_fields = ['id', 'created_at', 'updated_at', 'company']
+        read_only_fields = ['id', 'created_at', 'updated_at', 'company', 'branch']
 
-    def create(self, validated_data):
-        validated_data['company'] = self.context['request'].user.company
-        return super().create(validated_data)
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        comp = self._user_company()
+        br = self._auto_branch()
+        if comp and self.fields.get("assigned_to"):
+            self.fields["assigned_to"].queryset = User.objects.filter(company=comp)
+        restrict_pk_queryset(self.fields.get("deal"), Deal.objects.all(), comp, br)
 
-class IntegrationSerializer(serializers.ModelSerializer):
+
+# ===========================
+# Integration / Analytics
+# ===========================
+class IntegrationSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
     company = serializers.ReadOnlyField(source='company.id')
+    branch = serializers.ReadOnlyField(source='branch.id')
 
     class Meta:
         model = Integration
-        fields = ['id', 'type', 'config', 'status', 'company', 'created_at', 'updated_at']
-        read_only_fields = ['id', 'created_at', 'updated_at', 'company']
-
-    def create(self, validated_data):
-        validated_data['company'] = self.context['request'].user.company
-        return super().create(validated_data)
+        fields = ['id', 'company', 'branch', 'type', 'config', 'status', 'created_at', 'updated_at']
+        read_only_fields = ['id', 'created_at', 'updated_at', 'company', 'branch']
 
 
-class AnalyticsSerializer(serializers.ModelSerializer):
+class AnalyticsSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
     company = serializers.ReadOnlyField(source='company.id')
+    branch = serializers.ReadOnlyField(source='branch.id')
 
     class Meta:
         model = Analytics
-        fields = ['id', 'type', 'data', 'company', 'created_at']
-        read_only_fields = ['id', 'created_at', 'company']
+        fields = ['id', 'company', 'branch', 'type', 'data', 'created_at']
+        read_only_fields = ['id', 'created_at', 'company', 'branch']
 
-    def create(self, validated_data):
-        validated_data['company'] = self.context['request'].user.company
-        return super().create(validated_data)
 
+# ===========================
+# Order / OrderItem
+# ===========================
 class OrderItemSerializer(serializers.ModelSerializer):
     price = serializers.DecimalField(max_digits=10, decimal_places=2, read_only=True)
     total = serializers.DecimalField(max_digits=12, decimal_places=2, read_only=True)
@@ -163,6 +304,28 @@ class OrderItemSerializer(serializers.ModelSerializer):
     class Meta:
         model = OrderItem
         fields = ['id', 'product', 'quantity', 'price', 'total']
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # ограничим товары компанией/филиалом
+        req = self.context.get("request")
+        user = getattr(req, "user", None) if req else None
+        comp = getattr(user, "company", None)
+        br = None
+        primary = getattr(user, "primary_branch", None) if user else None
+        if callable(primary):
+            try:
+                br = primary() or None
+            except Exception:
+                br = None
+        elif primary:
+            br = primary
+        elif hasattr(req, "branch"):
+            br = getattr(req, "branch")
+        if comp and self.fields.get("product"):
+            qs = Product.objects.filter(company=comp)
+            qs = qs.filter(Q(branch__isnull=True) | Q(branch=br)) if br else qs.filter(branch__isnull=True)
+            self.fields["product"].queryset = qs
 
     def validate(self, data):
         product = data['product']
@@ -183,19 +346,23 @@ class OrderItemSerializer(serializers.ModelSerializer):
         product.quantity -= quantity
         product.save()
 
-        # company подставляем из связанного заказа
+        # company/branch подставляем из связанного заказа
         order = validated_data['order']
         company = order.company
+        branch = getattr(order, "branch", None)
 
         return OrderItem.objects.create(
             **validated_data,
             company=company,
+            branch=branch,
             price=price,
             total=total
         )
 
-class OrderSerializer(serializers.ModelSerializer):
+
+class OrderSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
     company = serializers.ReadOnlyField(source='company.id')
+    branch = serializers.ReadOnlyField(source='branch.id')
     items = OrderItemSerializer(many=True)
 
     total = serializers.SerializerMethodField()
@@ -204,52 +371,50 @@ class OrderSerializer(serializers.ModelSerializer):
     class Meta:
         model = Order
         fields = [
-            'id', 'order_number', 'customer_name', 'date_ordered',
+            'id', 'company', 'branch',
+            'order_number', 'customer_name', 'date_ordered',
             'status', 'phone', 'department',
-            'company', 'created_at', 'updated_at',
+            'created_at', 'updated_at',
             'items', 'total', 'total_quantity'
         ]
-        read_only_fields = ['id', 'created_at', 'updated_at', 'company', 'total', 'total_quantity']
+        read_only_fields = ['id', 'created_at', 'updated_at', 'company', 'branch', 'total', 'total_quantity']
 
     def get_total(self, obj):
         return obj.total
 
     def get_total_quantity(self, obj):
-        return obj.total_quantity
+        # в модели нет поля total_quantity — посчитаем по факту
+        return sum((it.quantity for it in obj.items.all()), 0)
 
     def create(self, validated_data):
-        request = self.context['request']
-        validated_data['company'] = request.user.company
-
         items_data = validated_data.pop('items')
-        order = Order.objects.create(**validated_data)
-
+        order = super().create(validated_data)
         for item_data in items_data:
             item_data['order'] = order
             OrderItemSerializer(context=self.context).create(item_data)
-
         return order
-    
-    
+
+
+# ===========================
+# ItemMake / Product
+# ===========================
 class ItemMakeNestedSerializer(serializers.ModelSerializer):
     class Meta:
         model = ItemMake
         fields = ["id", "name", "price", "unit", "quantity"]
 
 
-class ProductSerializer(serializers.ModelSerializer):
+class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
     company = serializers.ReadOnlyField(source="company.id")
+    branch = serializers.ReadOnlyField(source="branch.id")
 
     brand = serializers.CharField(source="brand.name", read_only=True)
     category = serializers.CharField(source="category.name", read_only=True)
 
-    # кто создал (read-only)
     created_by = serializers.ReadOnlyField(source="created_by.id")
     created_by_name = serializers.SerializerMethodField(read_only=True)
 
-    # GET: детализированные объекты ItemMake
     item_make = ItemMakeNestedSerializer(many=True, read_only=True)
-    # POST/PUT: список ID для записи (если используете сериализатор create/update)
     item_make_ids = serializers.PrimaryKeyRelatedField(
         queryset=ItemMake.objects.all(), many=True, write_only=True, required=False
     )
@@ -265,34 +430,41 @@ class ProductSerializer(serializers.ModelSerializer):
     status = serializers.CharField(required=False, allow_null=True, allow_blank=True)
     status_display = serializers.CharField(source="get_status_display", read_only=True)
 
-    # date — read-only: возвращаем только дату (YYYY-MM-DD), модель хранит DateTimeField
     date = serializers.SerializerMethodField(read_only=True)
 
     class Meta:
         model = Product
         fields = [
-            "id", "name", "barcode",
+            "id", "company", "branch",
+            "name", "barcode",
             "brand", "brand_name",
             "category", "category_name",
             "item_make", "item_make_ids",
             "quantity", "price", "purchase_price",
             "status", "status_display",
-            "company",
             "client", "client_name", "date",
-            "created_by", "created_by_name",   # ← добавлено
+            "created_by", "created_by_name",
             "created_at", "updated_at",
         ]
         read_only_fields = [
             "id", "created_at", "updated_at",
-            "company", "name", "brand", "category",
+            "company", "branch",
+            "name", "brand", "category",
             "client_name", "status_display", "item_make", "date",
-            "created_by", "created_by_name",   # ← добавлено
+            "created_by", "created_by_name",
         ]
         extra_kwargs = {
             "price": {"required": False, "default": 0},
             "purchase_price": {"required": False, "default": 0},
             "quantity": {"required": False, "default": 0},
         }
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        comp = self._user_company()
+        br = self._auto_branch()
+        restrict_pk_queryset(self.fields.get("item_make_ids"), ItemMake.objects.all(), comp, br)
+        restrict_pk_queryset(self.fields.get("client"), Client.objects.all(), comp, br)
 
     def get_created_by_name(self, obj):
         u = getattr(obj, "created_by", None)
@@ -328,19 +500,14 @@ class ProductSerializer(serializers.ModelSerializer):
 
     @transaction.atomic
     def create(self, validated_data):
-        """
-        Если вы создаёте через этот сериализатор (альтернативный путь),
-        используйте item_make_ids = [ItemMake instances]
-        """
         item_make_data = validated_data.pop("item_make_ids", [])
-        company = self.context["request"].user.company
+        company = self._user_company()
 
         client = validated_data.pop("client", None)
         brand_name = (validated_data.pop("brand_name", "") or "").strip()
         category_name = (validated_data.pop("category_name", "") or "").strip()
         status_value = validated_data.pop("status", None)
 
-        # при создании через сериализатор ставим текущий datetime
         date_value = timezone.now()
 
         barcode = validated_data.get("barcode")
@@ -357,6 +524,7 @@ class ProductSerializer(serializers.ModelSerializer):
 
         product = Product.objects.create(
             company=company,
+            branch=self._auto_branch(),
             name=gp.name,
             barcode=gp.barcode,
             brand=brand,
@@ -367,7 +535,7 @@ class ProductSerializer(serializers.ModelSerializer):
             client=client,
             status=status_value,
             date=date_value,
-            created_by=getattr(self.context["request"], "user", None),  # ← добавлено
+            created_by=self._user(),
         )
 
         if item_make_data:
@@ -377,7 +545,7 @@ class ProductSerializer(serializers.ModelSerializer):
 
     @transaction.atomic
     def update(self, instance, validated_data):
-        company = self.context["request"].user.company
+        company = self._user_company()
         brand_name = (validated_data.pop("brand_name", "") or "").strip()
         category_name = (validated_data.pop("category_name", "") or "").strip()
 
@@ -397,62 +565,81 @@ class ProductSerializer(serializers.ModelSerializer):
         instance.save()
         return instance
 
-class ReviewSerializer(serializers.ModelSerializer):
+
+# ===========================
+# Review / Notification
+# ===========================
+class ReviewSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
     user = serializers.ReadOnlyField(source='user.id')
     company = serializers.ReadOnlyField(source='company.id')
+    branch = serializers.ReadOnlyField(source='branch.id')
 
     class Meta:
         model = Review
-        fields = ['id', 'user', 'rating', 'comment', 'company', 'created_at', 'updated_at']
-        read_only_fields = ['id', 'user', 'company', 'created_at', 'updated_at']
+        fields = ['id', 'company', 'branch', 'user', 'rating', 'comment', 'created_at', 'updated_at']
+        read_only_fields = ['id', 'company', 'branch', 'user', 'created_at', 'updated_at']
 
     def create(self, validated_data):
-        validated_data['user'] = self.context['request'].user
-        validated_data['company'] = self.context['request'].user.company
+        validated_data['user'] = self._user()
         return super().create(validated_data)
 
 
-class NotificationSerializer(serializers.ModelSerializer):
+class NotificationSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
     company = serializers.ReadOnlyField(source='company.id')
+    branch = serializers.ReadOnlyField(source='branch.id')
 
     class Meta:
         model = Notification
-        fields = ['id', 'message', 'is_read', 'company', 'created_at']
-        read_only_fields = ['id', 'created_at', 'company']
+        fields = ['id', 'company', 'branch', 'message', 'is_read', 'created_at']
+        read_only_fields = ['id', 'company', 'branch', 'created_at']
 
     def create(self, validated_data):
-        validated_data['company'] = self.context['request'].user.company
+        # user обязателен в модели — проставим
+        user = self._user()
+        if user:
+            validated_data.setdefault("user", user)
         return super().create(validated_data)
 
 
+# ===========================
+# Users short
+# ===========================
 class UserShortSerializer(serializers.ModelSerializer):
     class Meta:
         model = User
         fields = ['id', 'first_name', 'last_name', 'email']
 
 
-class EventSerializer(serializers.ModelSerializer):
+# ===========================
+# Event (company/branch)
+# ===========================
+class EventSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
+    company = serializers.ReadOnlyField(source='company.id')
+    branch = serializers.ReadOnlyField(source='branch.id')
+
     participants = serializers.PrimaryKeyRelatedField(
         many=True,
-        queryset=User.objects.all()  # Теперь не ограничиваем здесь, валидируем вручную
+        queryset=User.objects.all()
     )
     participants_detail = UserShortSerializer(source='participants', many=True, read_only=True)
 
     class Meta:
         model = Event
         fields = [
-            'id', 'company', 'title', 'datetime', 'participants',
+            'id', 'company', 'branch',
+            'title', 'datetime', 'participants',
             'participants_detail', 'notes', 'created_at', 'updated_at'
         ]
-        read_only_fields = ['id', 'company', 'created_at', 'updated_at', 'participants_detail']
+        read_only_fields = ['id', 'company', 'branch', 'created_at', 'updated_at', 'participants_detail']
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        comp = self._user_company()
+        if comp and self.fields.get("participants"):
+            self.fields["participants"].queryset = User.objects.filter(company=comp)
 
     def validate_participants(self, participants):
-        """
-        Проверяем, что все участники из компании текущего пользователя.
-        """
-        request = self.context['request']
-        company = request.user.company
-
+        company = self._user_company()
         for participant in participants:
             if participant.company != company:
                 raise serializers.ValidationError(
@@ -462,7 +649,7 @@ class EventSerializer(serializers.ModelSerializer):
 
     def create(self, validated_data):
         participants = validated_data.pop('participants')
-        event = Event.objects.create(**validated_data)
+        event = super().create(validated_data)
         event.participants.set(participants)
         return event
 
@@ -474,51 +661,52 @@ class EventSerializer(serializers.ModelSerializer):
         return instance
 
 
-class WarehouseSerializer(serializers.ModelSerializer):
+# ===========================
+# Warehouse / WarehouseEvent
+# ===========================
+class WarehouseSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
     company = serializers.ReadOnlyField(source='company.id')
+    branch = serializers.ReadOnlyField(source='branch.id')
 
     class Meta:
         model = Warehouse
-        fields = ['id', 'name', 'location', 'company', 'created_at', 'updated_at']
-        read_only_fields = ['id', 'created_at', 'updated_at', 'company']
-
-    def create(self, validated_data):
-        validated_data['company'] = self.context['request'].user.company
-        return super().create(validated_data)
+        fields = ['id', 'company', 'branch', 'name', 'location', 'created_at', 'updated_at']
+        read_only_fields = ['id', 'company', 'branch', 'created_at', 'updated_at']
 
 
-# Сериализатор для модели WarehouseEvent (Складское событие)
-class WarehouseEventSerializer(serializers.ModelSerializer):
-    STATUS_CHOICES = [
-        ('draf', 'Черновик'),
-        ('conducted', 'Проведен'),
-        ('cancelled', 'Отменен'),
-    ]
+class WarehouseEventSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
+    company = serializers.ReadOnlyField(source='company.id')
+    branch = serializers.ReadOnlyField(source='branch.id')
 
     participants = serializers.PrimaryKeyRelatedField(
         many=True,
-        queryset=User.objects.all()  # Здесь валидируем, что участники принадлежат компании текущего пользователя
+        queryset=User.objects.all()
     )
     participants_detail = serializers.StringRelatedField(source='participants', many=True, read_only=True)
-    
     responsible_person = serializers.PrimaryKeyRelatedField(queryset=User.objects.all(), allow_null=True)
 
     class Meta:
         model = WarehouseEvent
         fields = [
-            'id', 'warehouse', 'responsible_person', 'status', 'client_name',
+            'id', 'company', 'branch',
+            'warehouse', 'responsible_person', 'status', 'client_name',
             'title', 'description', 'amount', 'event_date', 'participants',
             'participants_detail', 'created_at', 'updated_at'
         ]
-        read_only_fields = ['id', 'created_at', 'updated_at', 'participants_detail']
+        read_only_fields = ['id', 'company', 'branch', 'created_at', 'updated_at', 'participants_detail']
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        comp = self._user_company()
+        br = self._auto_branch()
+        if comp:
+            self.fields["participants"].queryset = User.objects.filter(company=comp)
+            restrict_pk_queryset(self.fields.get("warehouse"), Warehouse.objects.all(), comp, br)
+            if self.fields.get("responsible_person"):
+                self.fields["responsible_person"].queryset = User.objects.filter(company=comp)
 
     def validate_participants(self, participants):
-        """
-        Проверяем, что все участники из компании текущего пользователя.
-        """
-        request = self.context['request']
-        company = request.user.company
-
+        company = self._user_company()
         for participant in participants:
             if participant.company != company:
                 raise serializers.ValidationError(
@@ -528,9 +716,9 @@ class WarehouseEventSerializer(serializers.ModelSerializer):
 
     def create(self, validated_data):
         participants = validated_data.pop('participants')
-        warehouse_event = WarehouseEvent.objects.create(**validated_data)
-        warehouse_event.participants.set(participants)
-        return warehouse_event
+        we = super().create(validated_data)
+        we.participants.set(participants)
+        return we
 
     def update(self, instance, validated_data):
         participants = validated_data.pop('participants', None)
@@ -538,9 +726,15 @@ class WarehouseEventSerializer(serializers.ModelSerializer):
         if participants is not None:
             instance.participants.set(participants)
         return instance
-    
-class ClientSerializer(serializers.ModelSerializer):
+
+
+# ===========================
+# Client / ClientDeal / DealInstallment
+# ===========================
+class ClientSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
     company = serializers.ReadOnlyField(source='company.id')
+    branch = serializers.ReadOnlyField(source='branch.id')
+
     salesperson = serializers.PrimaryKeyRelatedField(
         queryset=User.objects.all(), required=False, allow_null=True
     )
@@ -553,14 +747,21 @@ class ClientSerializer(serializers.ModelSerializer):
     class Meta:
         model = Client
         fields = [
-            'id', 'type', 'full_name', 'phone', 'email', 'date', 'status',
+            'id', 'company', 'branch',
+            'type', 'full_name', 'phone', 'email', 'date', 'status',
             'llc', 'inn', 'okpo', 'score', 'bik', 'address',
             'salesperson', 'salesperson_display',
             'service', 'service_display',
-            'company', 'created_at', 'updated_at'
+            'created_at', 'updated_at'
         ]
-        read_only_fields = ['id', 'company', 'created_at', 'updated_at',
+        read_only_fields = ['id', 'company', 'branch', 'created_at', 'updated_at',
                             'salesperson_display', 'service_display']
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        comp = self._user_company()
+        if comp and self.fields.get("salesperson"):
+            self.fields["salesperson"].queryset = User.objects.filter(company=comp)
 
     def get_salesperson_display(self, obj):
         if obj.salesperson:
@@ -572,22 +773,21 @@ class ClientSerializer(serializers.ModelSerializer):
             return obj.service.name
         return None
 
-    def create(self, validated_data):
-        validated_data['company'] = self.context['request'].user.company
-        return super().create(validated_data)
-    
+
 class DealInstallmentSerializer(serializers.ModelSerializer):
     class Meta:
         model = DealInstallment
         fields = ("number", "due_date", "amount", "balance_after", "paid_on")
         read_only_fields = ("number", "due_date", "amount", "balance_after")
 
-class ClientDealSerializer(serializers.ModelSerializer):
+
+class ClientDealSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
     company = serializers.ReadOnlyField(source="company.id")
+    branch = serializers.ReadOnlyField(source="branch.id")
+
     client = serializers.PrimaryKeyRelatedField(queryset=Client.objects.all(), required=False)
     client_full_name = serializers.CharField(source="client.full_name", read_only=True)
 
-    # было: source="debt_amount"/"monthly_payment"/"remaining_debt" → убрать
     debt_amount = serializers.DecimalField(max_digits=12, decimal_places=2, read_only=True)
     monthly_payment = serializers.DecimalField(max_digits=12, decimal_places=2, read_only=True)
     remaining_debt = serializers.DecimalField(max_digits=12, decimal_places=2, read_only=True)
@@ -597,7 +797,8 @@ class ClientDealSerializer(serializers.ModelSerializer):
     class Meta:
         model = ClientDeal
         fields = [
-            "id", "company", "client", "client_full_name",
+            "id", "company", "branch",
+            "client", "client_full_name",
             "title", "kind",
             "amount", "prepayment",
             "debt_months", "first_due_date",
@@ -606,10 +807,16 @@ class ClientDealSerializer(serializers.ModelSerializer):
             "note", "created_at", "updated_at",
         ]
         read_only_fields = [
-            "id", "company", "created_at", "updated_at", "client_full_name",
+            "id", "company", "branch", "created_at", "updated_at", "client_full_name",
             "debt_amount", "monthly_payment", "remaining_debt", "installments",
         ]
-        
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        comp = self._user_company()
+        br = self._auto_branch()
+        restrict_pk_queryset(self.fields.get("client"), Client.objects.all(), comp, br)
+
     def validate(self, attrs):
         request = self.context["request"]
         company = request.user.company
@@ -638,7 +845,6 @@ class ClientDealSerializer(serializers.ModelSerializer):
             if not debt_months or debt_months <= 0:
                 errors["debt_months"] = "Укажите срок (в месяцах) для рассрочки."
         else:
-            # всегда очищаем поля рассрочки при не-debt
             attrs["debt_months"] = None
             attrs["first_due_date"] = None
 
@@ -646,43 +852,34 @@ class ClientDealSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError(errors)
         return attrs
 
-    def create(self, validated_data):
-        validated_data["company"] = self.context["request"].user.company
-        return super().create(validated_data)
-    
-class TransactionRecordSerializer(serializers.ModelSerializer):
-    # компания только для чтения (id)
-    company = serializers.ReadOnlyField(source="company.id")
 
-    # новое поле: отдел
+# ===========================
+# TransactionRecord
+# ===========================
+class TransactionRecordSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
+    company = serializers.ReadOnlyField(source="company.id")
+    branch = serializers.ReadOnlyField(source="branch.id")
+
     department = serializers.PrimaryKeyRelatedField(
         queryset=Department.objects.all(),
         required=False,
         allow_null=True
     )
-    # опционально удобно отдавать имя отдела
     department_name = serializers.CharField(source="department.name", read_only=True)
 
     class Meta:
         model = TransactionRecord
         fields = [
-            "id",
-            "company",
+            "id", "company", "branch",
             "description",
-            "department",
-            "department_name",
-            "name",
-            "amount",
-            "status",
-            "date",
-            "created_at",
-            "updated_at",
+            "department", "department_name",
+            "name", "amount", "status", "date",
+            "created_at", "updated_at",
         ]
-        read_only_fields = ["id", "company", "department_name", "created_at", "updated_at"]
+        read_only_fields = ["id", "company", "branch", "department_name", "created_at", "updated_at"]
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        # Ограничим выбор отделов компанией текущего пользователя
         request = self.context.get("request")
         user = getattr(request, "user", None)
         company = getattr(user, "owned_company", None) or getattr(user, "company", None)
@@ -690,9 +887,6 @@ class TransactionRecordSerializer(serializers.ModelSerializer):
             self.fields["department"].queryset = Department.objects.filter(company=company)
 
     def validate_department(self, department):
-        """
-        Защитимся от скрещивания разных компаний.
-        """
         if department is None:
             return department
         request = self.context.get("request")
@@ -702,61 +896,23 @@ class TransactionRecordSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError("Отдел принадлежит другой компании.")
         return department
 
-    def create(self, validated_data):
-        request = self.context.get("request")
-        user = getattr(request, "user", None)
 
-        company = getattr(user, "owned_company", None) or getattr(user, "company", None)
-        department = validated_data.get("department")
-
-        # Если отдел указан — сверим компанию; если у пользователя компании нет, возьмём из отдела
-        if department:
-            if company and department.company_id != company.id:
-                raise serializers.ValidationError({"department": "Отдел принадлежит другой компании."})
-            if not company:
-                company = department.company
-
-        if not company:
-            raise serializers.ValidationError("Невозможно определить компанию пользователя.")
-
-        validated_data["company"] = company
-        return super().create(validated_data)
-
-    def update(self, instance, validated_data):
-        """
-        company остаётся как есть (фиксируется на компанию пользователя по вью/фильтрам).
-        При смене department проверяем согласованность.
-        """
-        validated_data.pop("company", None)
-
-        new_department = validated_data.get("department", getattr(instance, "department", None))
-        if new_department:
-            # проверим ещё раз на всякий случай
-            request = self.context.get("request")
-            user = getattr(request, "user", None)
-            company = getattr(user, "owned_company", None) or getattr(user, "company", None)
-            # если компания пользователя известна — сверим
-            if company and new_department.company_id != company.id:
-                raise serializers.ValidationError({"department": "Отдел принадлежит другой компании."})
-            # если по каким-то причинам экземпляр без company (не должно случиться) — подставим
-            if not instance.company_id:
-                validated_data["company"] = new_department.company
-
-        return super().update(instance, validated_data)
-    
-    
-class ContractorWorkSerializer(serializers.ModelSerializer):
+# ===========================
+# ContractorWork
+# ===========================
+class ContractorWorkSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
     company = serializers.ReadOnlyField(source="company.id")
+    branch = serializers.ReadOnlyField(source="branch.id")
 
     department = serializers.PrimaryKeyRelatedField(queryset=Department.objects.all())
     department_name = serializers.CharField(source="department.name", read_only=True)
 
-    duration_days = serializers.IntegerField(read_only=True)  # @property из модели
+    duration_days = serializers.IntegerField(read_only=True)
 
     class Meta:
         model = ContractorWork
         fields = [
-            "id", "company",
+            "id", "company", "branch",
             "title",
             "contractor_name", "contractor_phone",
             "contractor_entity_type", "contractor_entity_name",
@@ -769,10 +925,17 @@ class ContractorWorkSerializer(serializers.ModelSerializer):
             "created_at", "updated_at",
             "status"
         ]
-        read_only_fields = ["id", "company", "department_name", "duration_days", "created_at", "updated_at"]
+        read_only_fields = ["id", "company", "branch", "department_name", "duration_days", "created_at", "updated_at"]
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        req = self.context.get("request")
+        comp = getattr(getattr(req, "user", None), "company", None) if req else None
+        if comp:
+            self.fields["department"].queryset = Department.objects.filter(company=comp)
 
     def validate(self, attrs):
-        company = self.context["request"].user.company
+        company = self._user_company()
         dep = attrs.get("department") or (self.instance.department if self.instance else None)
         if dep and dep.company_id != company.id:
             raise serializers.ValidationError({"department": "Отдел принадлежит другой компании."})
@@ -790,38 +953,35 @@ class ContractorWorkSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError(errors)
         return attrs
 
-    def create(self, validated_data):
-        validated_data["company"] = self.context["request"].user.company
-        return super().create(validated_data)
-    
-    
-class DebtSerializer(serializers.ModelSerializer):
+
+# ===========================
+# Debt / DebtPayment
+# ===========================
+class DebtSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
     company = serializers.ReadOnlyField(source="company.id")
+    branch = serializers.ReadOnlyField(source="branch.id")
     paid_total = serializers.DecimalField(max_digits=12, decimal_places=2, read_only=True)
     balance = serializers.DecimalField(max_digits=12, decimal_places=2, read_only=True)
 
     class Meta:
         model = Debt
         fields = [
-            "id", "company", "name", "phone", "amount",
-            "paid_total", "balance",'due_date',
+            "id", "company", "branch",
+            "name", "phone", "amount", "due_date",
+            "paid_total", "balance",
             "created_at", "updated_at",
         ]
-        read_only_fields = ["id", "company", "paid_total", "balance", "created_at", "updated_at"]
+        read_only_fields = ["id", "company", "branch", "paid_total", "balance", "created_at", "updated_at"]
 
     def validate_phone(self, value):
         value = value.strip()
-        company = self.context["request"].user.company
+        company = self._user_company()
         qs = Debt.objects.filter(company=company, phone=value)
         if self.instance:
             qs = qs.exclude(pk=self.instance.pk)
         if qs.exists():
             raise serializers.ValidationError("В вашей компании уже есть долг с таким телефоном.")
         return value
-
-    def create(self, validated_data):
-        validated_data["company"] = self.context["request"].user.company
-        return super().create(validated_data)
 
 
 class DebtPaymentSerializer(serializers.ModelSerializer):
@@ -832,15 +992,19 @@ class DebtPaymentSerializer(serializers.ModelSerializer):
         model = DebtPayment
         fields = ["id", "company", "debt", "amount", "paid_at", "note", "created_at"]
         read_only_fields = ["id", "company", "debt", "created_at"]
-        
-        
-class ObjectItemSerializer(serializers.ModelSerializer):
+
+
+# ===========================
+# ObjectItem / ObjectSale / ObjectSaleItem
+# ===========================
+class ObjectItemSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
     company = serializers.ReadOnlyField(source="company.id")
+    branch = serializers.ReadOnlyField(source="branch.id")
 
     class Meta:
         model = ObjectItem
-        fields = ["id", "company", "name", "description", "price", "date", "quantity", "created_at", "updated_at"]
-        read_only_fields = ["id", "company", "created_at", "updated_at"]
+        fields = ["id", "company", "branch", "name", "description", "price", "date", "quantity", "created_at", "updated_at"]
+        read_only_fields = ["id", "company", "branch", "created_at", "updated_at"]
 
 
 class ObjectSaleItemSerializer(serializers.ModelSerializer):
@@ -851,71 +1015,75 @@ class ObjectSaleItemSerializer(serializers.ModelSerializer):
         fields = ["id", "object_item", "object_name", "unit_price", "quantity"]
 
 
-class ObjectSaleSerializer(serializers.ModelSerializer):
+class ObjectSaleSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
     company = serializers.ReadOnlyField(source="company.id")
+    branch = serializers.ReadOnlyField(source="branch.id")
     client_name = serializers.ReadOnlyField(source="client.full_name")
     items = ObjectSaleItemSerializer(many=True, read_only=True)
 
     class Meta:
         model = ObjectSale
-        fields = ["id", "company", "client", "client_name", "status", "sold_at", "note", "subtotal", "items", "created_at"]
-        read_only_fields = ["id", "company", "client_name", "subtotal", "created_at"]
+        fields = ["id", "company", "branch", "client", "client_name", "status", "sold_at", "note", "subtotal", "items", "created_at"]
+        read_only_fields = ["id", "company", "branch", "client_name", "subtotal", "created_at"]
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        comp = self._user_company()
+        br = self._auto_branch()
+        if comp and self.fields.get("client"):
+            restrict_pk_queryset(self.fields["client"], Client.objects.all(), comp, br)
 
     def validate_client(self, client):
-        company = self.context["request"].user.company
+        company = self._user_company()
         if client.company_id != company.id:
             raise serializers.ValidationError("Клиент принадлежит другой компании.")
         return client
 
-    def create(self, validated_data):
-        validated_data["company"] = self.context["request"].user.company
-        return super().create(validated_data)
-    
-    
+
+# ===========================
+# BulkIds — утилита
+# ===========================
 class BulkIdsSerializer(serializers.Serializer):
     ids = serializers.ListField(
         child=serializers.UUIDField(format='hex_verbose'),
         allow_empty=False
     )
-    # если хотите не жёстко удалять, а помечать
     soft = serializers.BooleanField(required=False, default=False)
-    # если хотите всё-или-ничего (транзакция)
     require_all = serializers.BooleanField(required=False, default=False)
-    
 
+
+# ===========================
+# ItemMake — плоский список с company/branch + связанные продукты (read-only)
+# ===========================
 class ProductNestedSerializer(serializers.ModelSerializer):
     class Meta:
         model = Product
         fields = ["id", "name", "barcode", "quantity", "price"]
 
 
-class ItemMakeSerializer(serializers.ModelSerializer):
-    # GET: показываем детальные объекты продуктов
+class ItemMakeSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
+    company = serializers.ReadOnlyField(source="company.id")
+    branch = serializers.ReadOnlyField(source="branch.id")
     products = ProductNestedSerializer(many=True, read_only=True)
-    company = serializers.ReadOnlyField(source="company.id")  # вывод id компании
 
     class Meta:
         model = ItemMake
         fields = [
-            "id",
-            "company",
-            "name",
-            "price",
-            "unit",
-            "quantity",
-            "products",  # список связанных продуктов с деталями
-            "created_at",
-            "updated_at",
+            "id", "company", "branch",
+            "name", "price", "unit", "quantity",
+            "products",
+            "created_at", "updated_at",
         ]
-        read_only_fields = ["id", "created_at", "updated_at", "products", "company"]
-
-    def create(self, validated_data):
-        # автоматически привязываем компанию текущего пользователя
-        validated_data["company"] = self.context["request"].user.company
-        return super().create(validated_data)
+    # company/branch — read-only и проставляются миксином
 
 
-class ManufactureSubrealSerializer(serializers.ModelSerializer):
+# ===========================
+# Subreal / Acceptance / ReturnFromAgent
+# ===========================
+class ManufactureSubrealSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
+    company = serializers.ReadOnlyField(source="company.id")
+    branch = serializers.ReadOnlyField(source="branch.id")
+
     product_name = serializers.ReadOnlyField(source="product.name")
     agent_name = serializers.SerializerMethodField()
     qty_remaining = serializers.ReadOnlyField()
@@ -924,13 +1092,22 @@ class ManufactureSubrealSerializer(serializers.ModelSerializer):
     class Meta:
         model = ManufactureSubreal
         fields = [
-            "id", "company", "user", "agent", "agent_name",
+            "id", "company", "branch",
+            "user", "agent", "agent_name",
             "product", "product_name",
             "qty_transferred", "qty_accepted", "qty_returned",
             "qty_remaining", "qty_on_agent",
             "status", "created_at",
         ]
-    # read_only_fields не нужен отдельно — все вычисляемые и audit-поля уже ReadOnly/заполняются на сервере.
+        read_only_fields = ["id", "company", "branch", "user", "agent_name", "product_name", "qty_remaining", "qty_on_agent", "status", "created_at"]
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        comp = self._user_company()
+        br = self._auto_branch()
+        restrict_pk_queryset(self.fields.get("product"), Product.objects.all(), comp, br)
+        if comp and self.fields.get("agent"):
+            self.fields["agent"].queryset = User.objects.filter(company=comp)
 
     def get_agent_name(self, obj):
         if not getattr(obj, "agent", None):
@@ -939,49 +1116,34 @@ class ManufactureSubrealSerializer(serializers.ModelSerializer):
         return fn or getattr(obj.agent, "username", str(obj.agent))
 
     def validate(self, attrs):
-        """
-        Согласованность по company. Поддержка PATCH.
-        """
-        request = self.context.get("request")
-        user = getattr(request, "user", None) if request else None
-        company_id = getattr(user, "company_id", None)
-
-        # На create требуем компанию
-        if self.instance is None and not company_id:
-            raise serializers.ValidationError("У пользователя не задана компания.")
-
+        company = self._user_company()
         product = attrs.get("product")
-        if product is not None and product.company_id != company_id:
+        if product is not None and product.company_id != getattr(company, "id", None):
             raise serializers.ValidationError({"product": "Товар другой компании."})
 
         agent = attrs.get("agent")
         if agent is not None:
             agent_company_id = getattr(agent, "company_id", None)
-            if agent_company_id and agent_company_id != company_id:
+            if agent_company_id and agent_company_id != getattr(company, "id", None):
                 raise serializers.ValidationError({"agent": "Агент другой компании."})
-
         return attrs
 
     def create(self, validated_data):
-        request = self.context.get("request")
-        user = getattr(request, "user", None) if request else None
-        company_id = getattr(user, "company_id", None)
-        if not company_id:
-            raise serializers.ValidationError({"company": "У пользователя не задана компания."})
-        validated_data["company_id"] = company_id
-        validated_data["user"] = user
+        validated_data["user"] = self._user()
         return super().create(validated_data)
 
-
-# -------------------------
-#   Acceptance
-# -------------------------
 
 class AcceptanceCreateSerializer(serializers.ModelSerializer):
     class Meta:
         model = Acceptance
         fields = ["subreal", "qty"]
         extra_kwargs = {"subreal": {"queryset": ManufactureSubreal.objects.all()}}
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        comp = getattr(getattr(self.context.get("request"), "user", None), "company", None)
+        if comp and self.fields.get("subreal"):
+            self.fields["subreal"].queryset = ManufactureSubreal.objects.filter(company=comp)
 
     def validate(self, attrs):
         request = self.context.get("request")
@@ -1023,7 +1185,6 @@ class AcceptanceReadSerializer(serializers.ModelSerializer):
             "id", "company", "subreal_id", "product", "agent",
             "accepted_by", "accepted_by_name", "qty", "accepted_at",
         ]
-        read_only_fields = fields
 
     def get_agent(self, obj):
         a = obj.subreal.agent
@@ -1035,16 +1196,17 @@ class AcceptanceReadSerializer(serializers.ModelSerializer):
         return fn or getattr(obj.accepted_by, "username", str(obj.accepted_by))
 
 
-# -------------------------
-#   ReturnFromAgent
-#   (двухшаговый: create -> pending, approve -> accepted)
-# -------------------------
-
 class ReturnCreateSerializer(serializers.ModelSerializer):
     class Meta:
         model = ReturnFromAgent
         fields = ["subreal", "qty"]
         extra_kwargs = {"subreal": {"queryset": ManufactureSubreal.objects.all()}}
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        comp = getattr(getattr(self.context.get("request"), "user", None), "company", None)
+        if comp and self.fields.get("subreal"):
+            self.fields["subreal"].queryset = ManufactureSubreal.objects.filter(company=comp)
 
     def validate(self, attrs):
         request = self.context.get("request")
@@ -1057,7 +1219,6 @@ class ReturnCreateSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError({"subreal": "Обязательное поле."})
         if qty is None or qty < 1:
             raise serializers.ValidationError({"qty": "Минимум 1."})
-        # на стадии "pending" проверяем, что агент не запрашивает больше, чем на руках
         if qty > sub.qty_on_agent:
             raise serializers.ValidationError({"qty": f"На руках {sub.qty_on_agent}."})
         if user_company_id and sub.company_id != user_company_id:
@@ -1072,7 +1233,6 @@ class ReturnCreateSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError({"company": "У пользователя не задана компания."})
         validated_data["company_id"] = company_id
         validated_data["returned_by"] = user
-        # status остаётся по default = pending (в модели)
         return super().create(validated_data)
 
 
@@ -1092,7 +1252,6 @@ class ReturnReadSerializer(serializers.ModelSerializer):
             "accepted_by", "accepted_by_name",
             "returned_at", "accepted_at",
         ]
-        read_only_fields = fields
 
     def get_agent(self, obj):
         a = obj.subreal.agent
@@ -1112,10 +1271,6 @@ class ReturnReadSerializer(serializers.ModelSerializer):
 
 
 class ReturnApproveSerializer(serializers.Serializer):
-    """
-    Пустой вход; объект возврата передаём через context["return_obj"].
-    Вызывает ReturnFromAgent.accept(...) (движение склада и qty_returned).
-    """
     def save(self, **kwargs):
         ret: ReturnFromAgent = self.context["return_obj"]
         user = self.context["request"].user
@@ -1123,17 +1278,37 @@ class ReturnApproveSerializer(serializers.Serializer):
         return ret
 
 
-# -------------------------
-#   BULK: одному агенту — несколько товаров
-# -------------------------
-
+# ===========================
+# BULK выдача агенту
+# ===========================
 class BulkSubrealItemSerializer(serializers.Serializer):
     product = serializers.PrimaryKeyRelatedField(queryset=Product.objects.all())
     qty_transferred = serializers.IntegerField(min_value=1)
 
+
 class BulkSubrealCreateSerializer(serializers.Serializer):
     agent = serializers.PrimaryKeyRelatedField(queryset=User.objects.all())
     items = BulkSubrealItemSerializer(many=True, allow_empty=False)
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        comp = getattr(getattr(self.context.get("request"), "user", None), "company", None)
+        br = None
+        user = getattr(self.context.get("request"), "user", None)
+        if user:
+            primary = getattr(user, "primary_branch", None)
+            if callable(primary):
+                try:
+                    br = primary() or None
+                except Exception:
+                    br = None
+            elif primary:
+                br = primary
+        if comp:
+            self.fields["agent"].queryset = User.objects.filter(company=comp)
+            prod_qs = Product.objects.filter(company=comp)
+            prod_qs = prod_qs.filter(Q(branch__isnull=True) | Q(branch=br)) if br else prod_qs.filter(branch__isnull=True)
+            self.fields["items"].child.fields["product"].queryset = prod_qs
 
     def validate(self, attrs):
         request = self.context.get("request")
@@ -1147,13 +1322,11 @@ class BulkSubrealCreateSerializer(serializers.Serializer):
         if agent_company_id and agent_company_id != company_id:
             raise serializers.ValidationError({"agent": "Агент принадлежит другой компании."})
 
-        # Проверка компании у товаров
         for i, item in enumerate(attrs["items"]):
             prod = item["product"]
             if prod.company_id != company_id:
                 raise serializers.ValidationError({"items": {i: {"product": "Товар другой компании."}}})
 
-        # Склейка дубликатов (если один и тот же product пришёл несколько раз)
         merged = {}
         for item in attrs["items"]:
             key = item["product"].pk
@@ -1168,16 +1341,16 @@ class BulkSubrealCreateSerializer(serializers.Serializer):
         return attrs
 
 
-# -------------------------
-#   Аггрегированный ответ: "мои товары" у агента
-# -------------------------
-
+# ===========================
+# Аггрегированные ответы для агента
+# ===========================
 class AgentSubrealSerializer(serializers.Serializer):
     id = serializers.UUIDField()
     created_at = serializers.DateTimeField()
     qty_transferred = serializers.IntegerField()
     qty_accepted = serializers.IntegerField()
     qty_returned = serializers.IntegerField()
+
 
 class AgentProductOnHandSerializer(serializers.Serializer):
     product = serializers.UUIDField()

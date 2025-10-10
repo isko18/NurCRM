@@ -2,11 +2,14 @@
 from rest_framework import generics, permissions, status
 from rest_framework.response import Response
 from rest_framework.parsers import MultiPartParser, FormParser
+from rest_framework.exceptions import PermissionDenied
 from django.db.models.deletion import ProtectedError
+from django.db.models import Q
 
 from django_filters import rest_framework as filters
 from django_filters.rest_framework import DjangoFilterBackend
 
+from apps.users.models import Branch
 from .models import Service, Client, Appointment, Document, Folder
 from .serializers import (
     ServiceSerializer,
@@ -30,32 +33,114 @@ class DocumentFilter(filters.FilterSet):
         fields = ["name", "folder", "file_name", "created_at", "updated_at"]
 
 
+# ==== Company + Branch scoped mixin ====
 class CompanyQuerysetMixin:
     """
-    Скоуп по компании текущего пользователя + защита company на create/update.
-    Безопасен для drf_yasg (swagger_fake_view) и AnonymousUser.
+    Видимость данных:
+      - нет филиала у пользователя → только глобальные записи (branch IS NULL)
+      - есть филиал у пользователя → только записи этого филиала (branch = user_branch)
+    Создание/обновление:
+      - company берётся из request.user.company/owned_company
+      - branch проставляется автоматически как выше (без участия клиента)
     """
 
+    # --- helpers ---
+    def _user(self):
+        return getattr(self.request, "user", None)
+
     def _user_company(self):
-        user = getattr(self.request, "user", None)
+        user = self._user()
         if not user or not getattr(user, "is_authenticated", False):
             return None
         return getattr(user, "company", None) or getattr(user, "owned_company", None)
 
+    def _user_primary_branch(self):
+        """
+        Определяем филиал сотрудника:
+          1) membership с is_primary=True
+          2) любой membership
+          3) иначе None
+        """
+        user = self._user()
+        if not user or not getattr(user, "is_authenticated", False):
+            return None
+
+        memberships = getattr(user, "branch_memberships", None)
+        if memberships is None:
+            return None
+
+        primary = memberships.filter(is_primary=True).select_related("branch").first()
+        if primary and primary.branch:
+            return primary.branch
+
+        any_member = memberships.select_related("branch").first()
+        if any_member and any_member.branch:
+            return any_member.branch
+
+        return None
+
+    def _model_has_field(self, field_name: str) -> bool:
+        model = getattr(self, "queryset", None).model
+        return field_name in {f.name for f in model._meta.get_fields()}
+
+    def _active_branch(self):
+        """
+        Только автоопределение по пользователю:
+        - если есть филиал → возвращаем его и кладём в request.branch
+        - если нет → возвращаем None и кладём None
+        """
+        request = self.request
+        company = self._user_company()
+        if not company:
+            setattr(request, "branch", None)
+            return None
+
+        user_branch = self._user_primary_branch()
+        if user_branch and user_branch.company_id == company.id:
+            setattr(request, "branch", user_branch)
+            return user_branch
+
+        setattr(request, "branch", None)
+        return None
+
+    # --- queryset / save hooks ---
     def get_queryset(self):
         if getattr(self, "swagger_fake_view", False):
             return self.queryset.none()
+
         qs = super().get_queryset()
         company = self._user_company()
-        return qs.filter(company=company) if company else qs.none()
+        if not company:
+            return qs.none()
+
+        qs = qs.filter(company=company)
+
+        if self._model_has_field("branch"):
+            active_branch = self._active_branch()  # None или Branch
+            if active_branch is not None:
+                # У ПОЛЬЗОВАТЕЛЯ ЕСТЬ ФИЛИАЛ → ПОКАЗЫВАЕМ ТОЛЬКО ЕГО ЗАПИСИ
+                qs = qs.filter(branch=active_branch)
+            else:
+                # НЕТ ФИЛИАЛА → ТОЛЬКО ГЛОБАЛЬНЫЕ ЗАПИСИ
+                qs = qs.filter(branch__isnull=True)
+
+        return qs
 
     def perform_create(self, serializer):
         company = self._user_company()
-        serializer.save(company=company) if company else serializer.save()
+        if self._model_has_field("branch"):
+            active_branch = self._active_branch()  # None или Branch
+            serializer.save(company=company, branch=active_branch)
+        else:
+            serializer.save(company=company)
 
     def perform_update(self, serializer):
         company = self._user_company()
-        serializer.save(company=company) if company else serializer.save()
+        if self._model_has_field("branch"):
+            active_branch = self._active_branch()
+            serializer.save(company=company, branch=active_branch)
+        else:
+            serializer.save(company=company)
 
 
 # ==== Service ====

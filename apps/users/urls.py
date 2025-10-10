@@ -19,6 +19,8 @@ from .views import (
     RoleListAPIView,
     CustomRoleCreateAPIView,
     CustomRoleDetailAPIView,
+    BranchDetailAPIView, 
+    BranchListCreateAPIView
 )
 
 urlpatterns = [
@@ -46,6 +48,9 @@ urlpatterns = [
     path('subscription-plans/', SubscriptionPlanListAPIView.as_view(), name='subscription-plan-list'),
     path('features/', FeatureListAPIView.as_view(), name='feature-list'),
     path('company/', CompanyDetailAPIView.as_view(), name='company-detail'),
+    
+    path("branches/", BranchListCreateAPIView.as_view(), name="branch-list"),
+    path("branches/<uuid:pk>/", BranchDetailAPIView.as_view(), name="branch-detail"),
 
     # 🎭 Роли
     path('roles/', RoleListAPIView.as_view(), name='role-list'),  # системные + кастомные

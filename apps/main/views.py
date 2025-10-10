@@ -1,23 +1,21 @@
 from decimal import Decimal
 
 from django.db import transaction
-from django.db.models import Sum, Count, Avg
+from django.db.models import Sum, Count, Avg, F, Q
 from django.utils.dateparse import parse_date
 from django.utils import timezone
 from itertools import groupby
 from operator import attrgetter
-from django.db.models import F
 
 from rest_framework import generics, permissions, filters, status
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
-from rest_framework.exceptions import NotFound
+from rest_framework.exceptions import NotFound, PermissionDenied, ValidationError
 from django.shortcuts import get_object_or_404
 from rest_framework import serializers
 from .filters import TransactionRecordFilter, DebtFilter, DebtPaymentFilter
 from django_filters.rest_framework import DjangoFilterBackend
-from rest_framework.exceptions import PermissionDenied
 import dateparse
 from apps.construction.models import Department
 
@@ -39,20 +37,118 @@ from apps.main.serializers import (
 )
 from django.db.models import ProtectedError
 
-class CompanyRestrictedMixin:
+
+# ===========================
+#  Company + Branch mixin (как в barber)
+# ===========================
+class CompanyBranchRestrictedMixin:
+    """
+    - Фильтрует queryset по компании и (если у модели есть поле branch) по «глобальному или активному филиалу».
+    - На create/save подставляет company и (если у модели есть поле branch) — текущий филиал.
+    - branch берём в порядке:
+        1) user.primary_branch() или user.primary_branch
+        2) request.branch (если добавляет middleware)
+        3) None (глобальные записи компании)
+    """
     permission_classes = [permissions.IsAuthenticated]
 
+    # ----- helpers -----
+    def _request(self):
+        return getattr(self, "request", None)
+
+    def _user(self):
+        req = self._request()
+        return getattr(req, "user", None) if req else None
+
+    def _company(self):
+        u = self._user()
+        return getattr(u, "owned_company", None) or getattr(u, "company", None)
+
+    def _auto_branch(self):
+        req = self._request()
+        user = self._user()
+        if not user:
+            return None
+
+        primary = getattr(user, "primary_branch", None)
+        if callable(primary):
+            try:
+                val = primary()
+                if val:
+                    return val
+            except Exception:
+                pass
+        elif primary:
+            return primary
+
+        if req and hasattr(req, "branch"):
+            return getattr(req, "branch")
+        return None
+
+    @staticmethod
+    def _model_has_field(model, field_name: str) -> bool:
+        try:
+            return any(f.name == field_name for f in model._meta.get_fields())
+        except Exception:
+            return False
+
+    def _filter_qs_company_branch(self, qs):
+        model = qs.model
+        company = self._company()
+        branch = self._auto_branch()
+
+        if self._model_has_field(model, "company") and company is not None:
+            qs = qs.filter(company=company)
+
+        if self._model_has_field(model, "branch"):
+            if branch is None:
+                qs = qs.filter(branch__isnull=True)
+            else:
+                qs = qs.filter(Q(branch__isnull=True) | Q(branch=branch))
+
+        return qs
+
     def get_queryset(self):
-        return self.queryset.filter(company=self.request.user.company)
+        assert hasattr(self, "queryset") and self.queryset is not None, (
+            f"{self.__class__.__name__} must define .queryset or override get_queryset()."
+        )
+        return self._filter_qs_company_branch(self.queryset.all())
 
     def get_serializer_context(self):
+        # обязательно пробрасываем request, чтобы сериализаторы брали company/branch
         return {"request": self.request}
 
+    def _save_with_company_branch(self, serializer, **extra):
+        """
+        Безопасно подставляет company/branch только если такие поля есть у модели.
+        """
+        model = serializer.Meta.model
+        kwargs = dict(extra)
+
+        company = self._company()
+        if self._model_has_field(model, "company") and company is not None:
+            kwargs.setdefault("company", company)
+
+        if self._model_has_field(model, "branch"):
+            kwargs.setdefault("branch", self._auto_branch())
+
+        serializer.save(**kwargs)
+
     def perform_create(self, serializer):
-        serializer.save(company=self.request.user.company)
+        self._save_with_company_branch(serializer)
 
 
-class ContactListCreateAPIView(CompanyRestrictedMixin, generics.ListCreateAPIView):
+# ========= Утилиты для выборок суперпользователя в некоторых вьюхах =========
+def _get_company(user):
+    if user.is_superuser:
+        return None
+    return getattr(user, "owned_company", None) or getattr(user, "company", None)
+
+
+# ===========================
+#  Contacts
+# ===========================
+class ContactListCreateAPIView(CompanyBranchRestrictedMixin, generics.ListCreateAPIView):
     serializer_class = ContactSerializer
     queryset = Contact.objects.all()
     filter_backends = [DjangoFilterBackend, filters.SearchFilter]
@@ -60,15 +156,19 @@ class ContactListCreateAPIView(CompanyRestrictedMixin, generics.ListCreateAPIVie
     filterset_fields = "__all__"
 
     def perform_create(self, serializer):
-        serializer.save(owner=self.request.user, company=self.request.user.company)
+        # owner + company/branch
+        self._save_with_company_branch(serializer, owner=self.request.user)
 
 
-class ContactRetrieveUpdateDestroyAPIView(CompanyRestrictedMixin, generics.RetrieveUpdateDestroyAPIView):
+class ContactRetrieveUpdateDestroyAPIView(CompanyBranchRestrictedMixin, generics.RetrieveUpdateDestroyAPIView):
     serializer_class = ContactSerializer
     queryset = Contact.objects.all()
 
 
-class PipelineListCreateAPIView(CompanyRestrictedMixin, generics.ListCreateAPIView):
+# ===========================
+#  Pipelines
+# ===========================
+class PipelineListCreateAPIView(CompanyBranchRestrictedMixin, generics.ListCreateAPIView):
     serializer_class = PipelineSerializer
     queryset = Pipeline.objects.all()
     filter_backends = [filters.SearchFilter, DjangoFilterBackend]
@@ -76,15 +176,18 @@ class PipelineListCreateAPIView(CompanyRestrictedMixin, generics.ListCreateAPIVi
     filterset_fields = "__all__"
 
     def perform_create(self, serializer):
-        serializer.save(owner=self.request.user, company=self.request.user.company)
+        self._save_with_company_branch(serializer, owner=self.request.user)
 
 
-class PipelineRetrieveUpdateDestroyAPIView(CompanyRestrictedMixin, generics.RetrieveUpdateDestroyAPIView):
+class PipelineRetrieveUpdateDestroyAPIView(CompanyBranchRestrictedMixin, generics.RetrieveUpdateDestroyAPIView):
     serializer_class = PipelineSerializer
     queryset = Pipeline.objects.all()
 
 
-class DealListCreateAPIView(CompanyRestrictedMixin, generics.ListCreateAPIView):
+# ===========================
+#  Deals
+# ===========================
+class DealListCreateAPIView(CompanyBranchRestrictedMixin, generics.ListCreateAPIView):
     serializer_class = DealSerializer
     queryset = Deal.objects.all()
     filter_backends = [DjangoFilterBackend, filters.SearchFilter]
@@ -92,12 +195,15 @@ class DealListCreateAPIView(CompanyRestrictedMixin, generics.ListCreateAPIView):
     filterset_fields = "__all__"
 
 
-class DealRetrieveUpdateDestroyAPIView(CompanyRestrictedMixin, generics.RetrieveUpdateDestroyAPIView):
+class DealRetrieveUpdateDestroyAPIView(CompanyBranchRestrictedMixin, generics.RetrieveUpdateDestroyAPIView):
     serializer_class = DealSerializer
     queryset = Deal.objects.all()
 
 
-class TaskListCreateAPIView(CompanyRestrictedMixin, generics.ListCreateAPIView):
+# ===========================
+#  Tasks
+# ===========================
+class TaskListCreateAPIView(CompanyBranchRestrictedMixin, generics.ListCreateAPIView):
     serializer_class = TaskSerializer
     queryset = Task.objects.all()
     filter_backends = [DjangoFilterBackend, filters.SearchFilter]
@@ -105,31 +211,37 @@ class TaskListCreateAPIView(CompanyRestrictedMixin, generics.ListCreateAPIView):
     filterset_fields = "__all__"
 
 
-class TaskRetrieveUpdateDestroyAPIView(CompanyRestrictedMixin, generics.RetrieveUpdateDestroyAPIView):
+class TaskRetrieveUpdateDestroyAPIView(CompanyBranchRestrictedMixin, generics.RetrieveUpdateDestroyAPIView):
     serializer_class = TaskSerializer
     queryset = Task.objects.all()
 
 
-class IntegrationListCreateAPIView(CompanyRestrictedMixin, generics.ListCreateAPIView):
+# ===========================
+#  Integrations / Analytics
+# ===========================
+class IntegrationListCreateAPIView(CompanyBranchRestrictedMixin, generics.ListCreateAPIView):
     serializer_class = IntegrationSerializer
     queryset = Integration.objects.all()
     filter_backends = [DjangoFilterBackend]
     filterset_fields = "__all__"
 
 
-class IntegrationRetrieveUpdateDestroyAPIView(CompanyRestrictedMixin, generics.RetrieveUpdateDestroyAPIView):
+class IntegrationRetrieveUpdateDestroyAPIView(CompanyBranchRestrictedMixin, generics.RetrieveUpdateDestroyAPIView):
     serializer_class = IntegrationSerializer
     queryset = Integration.objects.all()
 
 
-class AnalyticsListAPIView(CompanyRestrictedMixin, generics.ListAPIView):
+class AnalyticsListAPIView(CompanyBranchRestrictedMixin, generics.ListAPIView):
     serializer_class = AnalyticsSerializer
     queryset = Analytics.objects.all()
     filter_backends = [DjangoFilterBackend]
     filterset_fields = "__all__"
 
 
-class OrderListCreateAPIView(CompanyRestrictedMixin, generics.ListCreateAPIView):
+# ===========================
+#  Orders
+# ===========================
+class OrderListCreateAPIView(CompanyBranchRestrictedMixin, generics.ListCreateAPIView):
     serializer_class = OrderSerializer
     queryset = Order.objects.all().prefetch_related("items__product")
     filter_backends = [DjangoFilterBackend, filters.SearchFilter]
@@ -137,15 +249,19 @@ class OrderListCreateAPIView(CompanyRestrictedMixin, generics.ListCreateAPIView)
     filterset_fields = "__all__"
 
     def perform_create(self, serializer):
-        # важно не потерять company из миксина
+        # company/branch проставит миксин
         super().perform_create(serializer)
 
 
-class OrderRetrieveUpdateDestroyAPIView(CompanyRestrictedMixin, generics.RetrieveUpdateDestroyAPIView):
+class OrderRetrieveUpdateDestroyAPIView(CompanyBranchRestrictedMixin, generics.RetrieveUpdateDestroyAPIView):
     serializer_class = OrderSerializer
     queryset = Order.objects.all().prefetch_related("items__product")
-    
-class ProductCreateByBarcodeAPIView(generics.CreateAPIView):
+
+
+# ===========================
+#  Product create by barcode (ручной view)
+# ===========================
+class ProductCreateByBarcodeAPIView(generics.CreateAPIView, CompanyBranchRestrictedMixin):
     """
     Создание товара только по штрих-коду (если найден в глобальной базе).
     """
@@ -154,13 +270,14 @@ class ProductCreateByBarcodeAPIView(generics.CreateAPIView):
 
     @transaction.atomic
     def create(self, request, *args, **kwargs):
-        company = request.user.company
+        company = self._company()
+        branch = self._auto_branch()
         barcode = (request.data.get("barcode") or "").strip()
 
         if not barcode:
             return Response({"barcode": "Укажите штрих-код."}, status=status.HTTP_400_BAD_REQUEST)
 
-        # Проверка дубликатов внутри компании
+        # Проверка дубликатов внутри компании (+ branch не влияет на уникальность в ТЗ)
         if Product.objects.filter(company=company, barcode=barcode).exists():
             return Response(
                 {"barcode": "В вашей компании уже есть товар с таким штрих-кодом."},
@@ -207,9 +324,10 @@ class ProductCreateByBarcodeAPIView(generics.CreateAPIView):
         brand = ProductBrand.objects.get_or_create(company=company, name=gp.brand.name)[0] if gp.brand else None
         category = ProductCategory.objects.get_or_create(company=company, name=gp.category.name)[0] if gp.category else None
 
-        # Создаём локальный товар
+        # Создаём локальный товар (учитываем branch + created_by)
         product = Product.objects.create(
             company=company,
+            branch=branch,
             name=gp.name,
             barcode=gp.barcode,
             brand=brand,
@@ -217,13 +335,14 @@ class ProductCreateByBarcodeAPIView(generics.CreateAPIView):
             price=price,
             purchase_price=purchase_price,
             quantity=quantity,
-            date=date_value,  # <- сохраняем дату (как у вас)
-            created_by=request.user,  # <- добавлено
+            date=date_value,
+            created_by=request.user,
         )
 
         return Response(self.get_serializer(product).data, status=status.HTTP_201_CREATED)
 
-class ProductCreateManualAPIView(generics.CreateAPIView):
+
+class ProductCreateManualAPIView(generics.CreateAPIView, CompanyBranchRestrictedMixin):
     """
     Ручное создание товара + (опционально) добавление в глобальную базу.
     Принимает status как: pending/accepted/rejected или Ожидание/Принят/Отказ.
@@ -265,20 +384,17 @@ class ProductCreateManualAPIView(generics.CreateAPIView):
         if raw_value is None or raw_value == "":
             return None
 
-        # если уже datetime
         if isinstance(raw_value, timezone.datetime):
             dt = raw_value
             if timezone.is_naive(dt):
                 dt = timezone.make_aware(dt)
             return dt
 
-        # если пришёл date object (not datetime)
         if isinstance(raw_value, timezone.datetime.date) and not isinstance(raw_value, timezone.datetime):
             d = raw_value
             dt = timezone.datetime(d.year, d.month, d.day, 0, 0, 0)
             return timezone.make_aware(dt)
 
-        # строка: сначала пробуем parse_datetime, затем parse_date
         dt = dateparse.parse_datetime(raw_value)
         if dt:
             if timezone.is_naive(dt):
@@ -293,7 +409,8 @@ class ProductCreateManualAPIView(generics.CreateAPIView):
 
     @transaction.atomic
     def create(self, request, *args, **kwargs):
-        company = request.user.company
+        company = self._company()
+        branch = self._auto_branch()
         data = request.data
 
         name = (data.get("name") or "").strip()
@@ -302,14 +419,12 @@ class ProductCreateManualAPIView(generics.CreateAPIView):
 
         barcode = (data.get("barcode") or "").strip() or None
 
-        # уникальность штрих-кода в компании
         if barcode and Product.objects.filter(company=company, barcode=barcode).exists():
             return Response(
                 {"barcode": "В вашей компании уже есть товар с таким штрих-кодом."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        # цены/кол-во
         try:
             price = Decimal(str(data.get("price", 0)))
         except Exception:
@@ -325,38 +440,33 @@ class ProductCreateManualAPIView(generics.CreateAPIView):
         except Exception:
             return Response({"quantity": "Неверное количество."}, status=status.HTTP_400_BAD_REQUEST)
 
-        # статус (необязателен)
         try:
             status_value = self._normalize_status(data.get("status"))
         except ValueError as e:
             return Response({"status": str(e)}, status=status.HTTP_400_BAD_REQUEST)
 
-        # дата: сохраняем timezone-aware datetime
         raw_date = data.get("date")
         try:
             date_value = self._parse_date_to_aware_datetime(raw_date) if raw_date else timezone.now()
         except ValueError as e:
             return Response({"date": str(e)}, status=status.HTTP_400_BAD_REQUEST)
 
-        # глобальные справочники (если переданы имена)
         brand_name = (data.get("brand_name") or "").strip()
         category_name = (data.get("category_name") or "").strip()
         g_brand = GlobalBrand.objects.get_or_create(name=brand_name)[0] if brand_name else None
         g_category = GlobalCategory.objects.get_or_create(name=category_name)[0] if category_name else None
 
-        # локальные справочники компании
         brand = ProductBrand.objects.get_or_create(company=company, name=g_brand.name)[0] if g_brand else None
         category = ProductCategory.objects.get_or_create(company=company, name=g_category.name)[0] if g_category else None
 
-        # клиент (если передан)
         client = None
         client_id = data.get("client")
         if client_id:
             client = get_object_or_404(Client, id=client_id, company=company)
 
-        # создаём товар (с datetime в поле date)
         product = Product.objects.create(
             company=company,
+            branch=branch,
             name=name,
             barcode=barcode,
             brand=brand,
@@ -367,13 +477,11 @@ class ProductCreateManualAPIView(generics.CreateAPIView):
             client=client,
             status=status_value,
             date=date_value,
-            created_by=request.user,  # <- добавлено
+            created_by=request.user,
         )
 
-        # обработаем item_make вход: поддерживаем "item_make" (str or list) или "item_make_ids"
         item_make_input = data.get("item_make") or data.get("item_make_ids")
         if item_make_input:
-            # нормализуем в список uuid-строк
             if isinstance(item_make_input, (str,)):
                 item_make_ids = [item_make_input]
             elif isinstance(item_make_input, (list, tuple)):
@@ -381,14 +489,11 @@ class ProductCreateManualAPIView(generics.CreateAPIView):
             else:
                 item_make_ids = []
 
-            # выбираем объекты, только из той же компании
             ims = ItemMake.objects.filter(id__in=item_make_ids, company=company)
-            # если количество выбранных != кол-ву id — значит какой-то id не найден / не принадлежит компании
             if len(item_make_ids) != ims.count():
                 return Response({"item_make": "Один или несколько item_make не найдены или принадлежат другой компании."}, status=400)
             product.item_make.set(ims)
 
-        # синхронизация в глобальную базу (если есть штрих-код)
         if barcode:
             GlobalProduct.objects.get_or_create(
                 barcode=barcode,
@@ -398,11 +503,12 @@ class ProductCreateManualAPIView(generics.CreateAPIView):
         return Response(self.get_serializer(product).data, status=status.HTTP_201_CREATED)
 
 
-class ProductRetrieveUpdateDestroyAPIView(CompanyRestrictedMixin, generics.RetrieveUpdateDestroyAPIView):
+class ProductRetrieveUpdateDestroyAPIView(CompanyBranchRestrictedMixin, generics.RetrieveUpdateDestroyAPIView):
     serializer_class = ProductSerializer
     queryset = Product.objects.select_related("brand", "category").all()
 
-class ProductBulkDeleteAPIView(CompanyRestrictedMixin, APIView):
+
+class ProductBulkDeleteAPIView(CompanyBranchRestrictedMixin, APIView):
     """
     DELETE /api/main/products/bulk-delete/
     Body: {"ids": [...], "soft": false, "require_all": false}
@@ -414,8 +520,8 @@ class ProductBulkDeleteAPIView(CompanyRestrictedMixin, APIView):
         soft = serializer.validated_data["soft"]
         require_all = serializer.validated_data["require_all"]
 
-        # найдём продукты заранее, чтобы отделить "не найдено"
-        qs = Product.objects.filter(id__in=ids)
+        # в рамках компании и текущего филиала/глобальных
+        qs = self._filter_qs_company_branch(Product.objects.all()).filter(id__in=ids)
         found_map = {p.id: p for p in qs}
         not_found = [str(id_) for id_ in ids if id_ not in found_map]
 
@@ -433,12 +539,10 @@ class ProductBulkDeleteAPIView(CompanyRestrictedMixin, APIView):
                 results["protected"].append(str(p.id))
 
         if require_all:
-            # либо все успешно, либо ничего
             try:
                 with transaction.atomic():
                     for p in found_map.values():
                         _delete_one(p)
-                    # если хоть один защищённый — ошибка, откатываем
                     if results["protected"]:
                         raise ProtectedError("protected", None)
             except ProtectedError:
@@ -452,36 +556,42 @@ class ProductBulkDeleteAPIView(CompanyRestrictedMixin, APIView):
                 )
             return Response(results, status=status.HTTP_200_OK)
 
-        # частичный режим: удаляем что можем
         for p in found_map.values():
             _delete_one(p)
 
         http_status = status.HTTP_200_OK if not results["protected"] else status.HTTP_207_MULTI_STATUS
         return Response(results, status=http_status)
 
-class ReviewListCreateAPIView(CompanyRestrictedMixin, generics.ListCreateAPIView):
+
+# ===========================
+#  Reviews
+# ===========================
+class ReviewListCreateAPIView(CompanyBranchRestrictedMixin, generics.ListCreateAPIView):
     serializer_class = ReviewSerializer
     queryset = Review.objects.all()
     filter_backends = [DjangoFilterBackend]
     filterset_fields = "__all__"
 
     def perform_create(self, serializer):
-        serializer.save(user=self.request.user, company=self.request.user.company)
+        self._save_with_company_branch(serializer, user=self.request.user)
 
 
-class ReviewRetrieveUpdateDestroyAPIView(CompanyRestrictedMixin, generics.RetrieveUpdateDestroyAPIView):
+class ReviewRetrieveUpdateDestroyAPIView(CompanyBranchRestrictedMixin, generics.RetrieveUpdateDestroyAPIView):
     serializer_class = ReviewSerializer
     queryset = Review.objects.all()
 
 
-class NotificationListView(CompanyRestrictedMixin, generics.ListAPIView):
+# ===========================
+#  Notifications
+# ===========================
+class NotificationListView(CompanyBranchRestrictedMixin, generics.ListAPIView):
     serializer_class = NotificationSerializer
     queryset = Notification.objects.all()
     filter_backends = [DjangoFilterBackend]
     filterset_fields = "__all__"
 
 
-class NotificationDetailView(CompanyRestrictedMixin, generics.RetrieveAPIView):
+class NotificationDetailView(CompanyBranchRestrictedMixin, generics.RetrieveAPIView):
     serializer_class = NotificationSerializer
     queryset = Notification.objects.all()
 
@@ -494,51 +604,54 @@ class MarkAllNotificationsReadView(APIView):
         return Response({"status": "Все уведомления прочитаны"}, status=status.HTTP_200_OK)
 
 
-class EventListCreateAPIView(CompanyRestrictedMixin, generics.ListCreateAPIView):
+# ===========================
+#  Events
+# ===========================
+class EventListCreateAPIView(CompanyBranchRestrictedMixin, generics.ListCreateAPIView):
     serializer_class = EventSerializer
     queryset = Event.objects.all()
     filter_backends = [DjangoFilterBackend]
     filterset_fields = "__all__"
 
 
-class EventRetrieveUpdateDestroyAPIView(CompanyRestrictedMixin, generics.RetrieveUpdateDestroyAPIView):
+class EventRetrieveUpdateDestroyAPIView(CompanyBranchRestrictedMixin, generics.RetrieveUpdateDestroyAPIView):
     serializer_class = EventSerializer
     queryset = Event.objects.all()
 
 
-class WarehouseListCreateAPIView(CompanyRestrictedMixin, generics.ListCreateAPIView):
+# ===========================
+#  Warehouses
+# ===========================
+class WarehouseListCreateAPIView(CompanyBranchRestrictedMixin, generics.ListCreateAPIView):
     serializer_class = WarehouseSerializer
     queryset = Warehouse.objects.all()
     filter_backends = [DjangoFilterBackend, filters.SearchFilter]
     search_fields = ["name", "location"]
     filterset_fields = "__all__"
 
-    def perform_create(self, serializer):
-        serializer.save(company=self.request.user.company)
 
-
-class WarehouseRetrieveUpdateDestroyAPIView(CompanyRestrictedMixin, generics.RetrieveUpdateDestroyAPIView):
+class WarehouseRetrieveUpdateDestroyAPIView(CompanyBranchRestrictedMixin, generics.RetrieveUpdateDestroyAPIView):
     serializer_class = WarehouseSerializer
     queryset = Warehouse.objects.all()
 
 
-class WarehouseEventListCreateAPIView(CompanyRestrictedMixin, generics.ListCreateAPIView):
+class WarehouseEventListCreateAPIView(CompanyBranchRestrictedMixin, generics.ListCreateAPIView):
     serializer_class = WarehouseEventSerializer
     queryset = WarehouseEvent.objects.all()
     filter_backends = [DjangoFilterBackend, filters.SearchFilter]
     search_fields = ["title", "client_name"]
     filterset_fields = "__all__"
 
-    def perform_create(self, serializer):
-        serializer.save(company=self.request.user.company)
 
-
-class WarehouseEventRetrieveUpdateDestroyAPIView(CompanyRestrictedMixin, generics.RetrieveUpdateDestroyAPIView):
+class WarehouseEventRetrieveUpdateDestroyAPIView(CompanyBranchRestrictedMixin, generics.RetrieveUpdateDestroyAPIView):
     serializer_class = WarehouseEventSerializer
     queryset = WarehouseEvent.objects.all()
 
 
-class ProductCategoryListCreateAPIView(CompanyRestrictedMixin, generics.ListCreateAPIView):
+# ===========================
+#  Product taxonomies
+# ===========================
+class ProductCategoryListCreateAPIView(CompanyBranchRestrictedMixin, generics.ListCreateAPIView):
     serializer_class = ProductCategorySerializer
     queryset = ProductCategory.objects.all()
     filter_backends = [DjangoFilterBackend, filters.SearchFilter]
@@ -546,12 +659,12 @@ class ProductCategoryListCreateAPIView(CompanyRestrictedMixin, generics.ListCrea
     filterset_fields = "__all__"
 
 
-class ProductCategoryRetrieveUpdateDestroyAPIView(CompanyRestrictedMixin, generics.RetrieveUpdateDestroyAPIView):
+class ProductCategoryRetrieveUpdateDestroyAPIView(CompanyBranchRestrictedMixin, generics.RetrieveUpdateDestroyAPIView):
     serializer_class = ProductCategorySerializer
     queryset = ProductCategory.objects.all()
 
 
-class ProductBrandListCreateAPIView(CompanyRestrictedMixin, generics.ListCreateAPIView):
+class ProductBrandListCreateAPIView(CompanyBranchRestrictedMixin, generics.ListCreateAPIView):
     serializer_class = ProductBrandSerializer
     queryset = ProductBrand.objects.all()
     filter_backends = [DjangoFilterBackend, filters.SearchFilter]
@@ -559,12 +672,15 @@ class ProductBrandListCreateAPIView(CompanyRestrictedMixin, generics.ListCreateA
     filterset_fields = "__all__"
 
 
-class ProductBrandRetrieveUpdateDestroyAPIView(CompanyRestrictedMixin, generics.RetrieveUpdateDestroyAPIView):
+class ProductBrandRetrieveUpdateDestroyAPIView(CompanyBranchRestrictedMixin, generics.RetrieveUpdateDestroyAPIView):
     serializer_class = ProductBrandSerializer
     queryset = ProductBrand.objects.all()
 
 
-class ProductByBarcodeAPIView(CompanyRestrictedMixin, generics.RetrieveAPIView):
+# ===========================
+#  Product views
+# ===========================
+class ProductByBarcodeAPIView(CompanyBranchRestrictedMixin, generics.RetrieveAPIView):
     serializer_class = ProductSerializer
     lookup_field = "barcode"
 
@@ -579,28 +695,37 @@ class ProductByBarcodeAPIView(CompanyRestrictedMixin, generics.RetrieveAPIView):
         return product
 
 
-class ProductListView(CompanyRestrictedMixin, generics.ListAPIView):
+class ProductListView(CompanyBranchRestrictedMixin, generics.ListAPIView):
     serializer_class = ProductSerializer
     filter_backends = [filters.SearchFilter, filters.OrderingFilter]
     search_fields = ["name", "barcode"]
-    ordering_fields = ["created_at", "updated_at", "price"]
+    ordering_fields = ["created_at", "updated_at, price", "price"]
 
     def get_queryset(self):
-        # подгружаем связанные объекты, чтобы GET корректно сериализовался
-        qs = Product.objects.filter(company=self.request.user.company)
-        qs = qs.select_related("brand", "category", "client").prefetch_related("item_make")
-        return qs
+        qs = Product.objects.select_related("brand", "category", "client").prefetch_related("item_make").all()
+        return self._filter_qs_company_branch(qs)
 
-class OrderAnalyticsView(APIView):
+
+# ===========================
+#  Order analytics
+# ===========================
+class OrderAnalyticsView(APIView, CompanyBranchRestrictedMixin):
     permission_classes = [IsAuthenticated]
 
     def get(self, request, *args, **kwargs):
-        company = request.user.company
+        company = self._company()
+        branch = self._auto_branch()
+
+        orders = Order.objects.filter(company=company)
+        if hasattr(Order, "branch"):
+            if branch is None:
+                orders = orders.filter(branch__isnull=True)
+            else:
+                orders = orders.filter(Q(branch__isnull=True) | Q(branch=branch))
+
         start_date = request.query_params.get("start")
         end_date = request.query_params.get("end")
         status_filter = request.query_params.get("status")
-
-        orders = Order.objects.filter(company=company)
 
         if start_date:
             start_date = parse_date(start_date)
@@ -640,12 +765,14 @@ class OrderAnalyticsView(APIView):
         return Response(response_data)
 
 
-class ClientListCreateAPIView(generics.ListCreateAPIView):
+# ===========================
+#  Clients
+# ===========================
+class ClientListCreateAPIView(CompanyBranchRestrictedMixin, generics.ListCreateAPIView):
     """
     GET  /api/main/clients/
     POST /api/main/clients/
     """
-    permission_classes = [permissions.IsAuthenticated]
     serializer_class = ClientSerializer
     filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
     filterset_fields = ["status", "date"]
@@ -654,34 +781,34 @@ class ClientListCreateAPIView(generics.ListCreateAPIView):
     ordering = ["-created_at"]
 
     def get_queryset(self):
-        return Client.objects.filter(company=self.request.user.company)
+        return self._filter_qs_company_branch(Client.objects.all())
 
-    def perform_create(self, serializer):
-        serializer.save(company=self.request.user.company)
+    # perform_create — миксин
 
 
-class ClientRetrieveUpdateDestroyAPIView(generics.RetrieveUpdateDestroyAPIView):
+class ClientRetrieveUpdateDestroyAPIView(CompanyBranchRestrictedMixin, generics.RetrieveUpdateDestroyAPIView):
     """
     GET    /api/main/clients/<uuid:pk>/
     PATCH  /api/main/clients/<uuid:pk>/
     PUT    /api/main/clients/<uuid:pk>/
     DELETE /api/main/clients/<uuid:pk>/
     """
-    permission_classes = [permissions.IsAuthenticated]
     serializer_class = ClientSerializer
 
     def get_queryset(self):
-        return Client.objects.filter(company=self.request.user.company)
+        return self._filter_qs_company_branch(Client.objects.all())
 
 
-class ClientDealListCreateAPIView(generics.ListCreateAPIView):
+# ===========================
+#  Client deals
+# ===========================
+class ClientDealListCreateAPIView(CompanyBranchRestrictedMixin, generics.ListCreateAPIView):
     """
-      GET  /api/main/deals/                      — все сделки компании
+      GET  /api/main/deals/                      — все сделки компании/филиала
       POST /api/main/deals/                      — создать сделку (client в теле)
       GET  /api/main/clients/<client_id>/deals/  — сделки конкретного клиента
       POST /api/main/clients/<client_id>/deals/  — создать сделку для клиента из URL
     """
-    permission_classes = [permissions.IsAuthenticated]
     serializer_class = ClientDealSerializer
     filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
     filterset_fields = ["kind", "client"]
@@ -693,9 +820,10 @@ class ClientDealListCreateAPIView(generics.ListCreateAPIView):
         qs = (
             ClientDeal.objects
             .select_related("client")
-            .prefetch_related("installments")        # чтобы не ловить N+1 при выдаче графика
-            .filter(company=self.request.user.company)
+            .prefetch_related("installments")
+            .all()
         )
+        qs = self._filter_qs_company_branch(qs)
         client_id = self.kwargs.get("client_id")
         if client_id:
             qs = qs.filter(client_id=client_id)
@@ -703,73 +831,76 @@ class ClientDealListCreateAPIView(generics.ListCreateAPIView):
 
     @transaction.atomic
     def perform_create(self, serializer):
-        company = self.request.user.company
+        company = self._company()
+        branch = self._auto_branch()
         client_id = self.kwargs.get("client_id")
 
         if client_id:
-            # nested-роут: клиент из URL, проверяем компанию
             client = get_object_or_404(Client, id=client_id, company=company)
-            serializer.save(company=company, client=client)
+            serializer.save(company=company, branch=branch, client=client)
         else:
-            # плоский роут: client должен быть в теле и принадлежать компании
             client = serializer.validated_data.get("client")
             if not client or client.company_id != company.id:
                 raise serializers.ValidationError({"client": "Клиент не найден в вашей компании."})
-            serializer.save(company=company)          # company фиксируем на пользователя
+            serializer.save(company=company, branch=branch)
 
 
-class ClientDealRetrieveUpdateDestroyAPIView(generics.RetrieveUpdateDestroyAPIView):
+class ClientDealRetrieveUpdateDestroyAPIView(CompanyBranchRestrictedMixin, generics.RetrieveUpdateDestroyAPIView):
     """
     GET    /api/main/deals/<uuid:pk>/
     PATCH  /api/main/deals/<uuid:pk>/
     PUT    /api/main/deals/<uuid:pk>/
     DELETE /api/main/deals/<uuid:pk>/
+    (опционально nested /clients/<client_id>/deals/<pk>/)
     """
-    permission_classes = [permissions.IsAuthenticated]
     serializer_class = ClientDealSerializer
-    
+
     def get_queryset(self):
         qs = (
             ClientDeal.objects
             .select_related("client")
             .prefetch_related("installments")
-            .filter(company_id=self.request.user.company_id)
+            .all()
         )
+        qs = self._filter_qs_company_branch(qs)
         client_id = self.kwargs.get("client_id")
         if client_id:
             qs = qs.filter(client_id=client_id)
         return qs
-    
+
     @transaction.atomic
     def perform_update(self, serializer):
-        """
-        Не даём увести сделку в другую компанию через смену client.
-        График пересоберётся в model.save().
-        """
-        company = self.request.user.company
+        company = self._company()
+        branch = self._auto_branch()
         new_client = serializer.validated_data.get("client")
         if new_client and new_client.company_id != company.id:
             raise serializers.ValidationError({"client": "Клиент принадлежит другой компании."})
-        serializer.save(company=company)  # company остаётся той же
-        
-class ClientDealPayAPIView(APIView):
+        serializer.save(company=company, branch=branch)
+
+
+class ClientDealPayAPIView(APIView, CompanyBranchRestrictedMixin):
     """
     POST /api/main/deals/<uuid:pk>/pay/
     Body (опционально):
       {
-        "installment_number": 2,      // если не указать — оплатится ближайший не оплаченный
-        "date": "2025-11-10"          // если не указать — сегодняшняя дата (локальная)
+        "installment_number": 2,
+        "date": "2025-11-10"
       }
     """
     permission_classes = [permissions.IsAuthenticated]
 
     @transaction.atomic
     def post(self, request, pk, *args, **kwargs):
-        company = request.user.company
-        # если используете nested, можно проверить client_id:
+        company = self._company()
         client_id = kwargs.get("client_id")
 
         deal_qs = ClientDeal.objects.filter(company=company, pk=pk)
+        if hasattr(ClientDeal, "branch"):
+            branch = self._auto_branch()
+            if branch is None:
+                deal_qs = deal_qs.filter(branch__isnull=True)
+            else:
+                deal_qs = deal_qs.filter(Q(branch__isnull=True) | Q(branch=branch))
         if client_id:
             deal_qs = deal_qs.filter(client_id=client_id)
 
@@ -796,37 +927,37 @@ class ClientDealPayAPIView(APIView):
         inst.paid_on = paid_date
         inst.save(update_fields=["paid_on"])
 
-        # вернём обновлённую сделку (с пересчитанным remaining_debt)
         data = ClientDealSerializer(deal, context={"request": request}).data
         return Response(data, status=status.HTTP_200_OK)
 
-class BidListCreateAPIView(generics.ListCreateAPIView):
+
+# ===========================
+#  Bids & Social Applications
+# ===========================
+class BidListCreateAPIView(CompanyBranchRestrictedMixin, generics.ListCreateAPIView):
     serializer_class = BidSerializers
     queryset = Bid.objects.all()
-    
-    
-class BidRetrieveUpdateDestroyAPIView(generics.RetrieveUpdateDestroyAPIView):
+
+
+class BidRetrieveUpdateDestroyAPIView(CompanyBranchRestrictedMixin, generics.RetrieveUpdateDestroyAPIView):
     serializer_class = BidSerializers
     queryset = Bid.objects.all()
-    # lookup_field = "uuid"
-    
-class SocialApplicationsListCreateAPIView(generics.ListCreateAPIView):
+
+
+class SocialApplicationsListCreateAPIView(CompanyBranchRestrictedMixin, generics.ListCreateAPIView):
     serializer_class = SocialApplicationsSerializers
     queryset = SocialApplications.objects.all()
-    
-    
-class SocialApplicationsRetrieveUpdateDestroyAPIView(generics.RetrieveUpdateDestroyAPIView):
+
+
+class SocialApplicationsRetrieveUpdateDestroyAPIView(CompanyBranchRestrictedMixin, generics.RetrieveUpdateDestroyAPIView):
     serializer_class = SocialApplicationsSerializers
     queryset = SocialApplications.objects.all()
-    
-
-def _get_company(user):
-    if user.is_superuser:
-        return None
-    return getattr(user, "owned_company", None) or getattr(user, "company", None)
 
 
-class TransactionRecordListCreateView(generics.ListCreateAPIView):
+# ===========================
+#  Transaction Records
+# ===========================
+class TransactionRecordListCreateView(generics.ListCreateAPIView, CompanyBranchRestrictedMixin):
     serializer_class = TransactionRecordSerializer
     permission_classes = [permissions.IsAuthenticated]
     filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
@@ -839,35 +970,32 @@ class TransactionRecordListCreateView(generics.ListCreateAPIView):
         user = self.request.user
         qs = TransactionRecord.objects.select_related("company", "department")
         if user.is_superuser:
+            # суперюзер видит всё; но если нужно — можно ограничить по branch
             return qs
-        company = _get_company(user)
-        if company:
-            return qs.filter(company=company)
-        return qs.none()
+        return self._filter_qs_company_branch(qs)
 
     def perform_create(self, serializer):
         user = self.request.user
         company = _get_company(user)
         department = serializer.validated_data.get("department")
 
-        # если не суперюзер и нет компании — запрещаем
         if not user.is_superuser and not company:
             raise PermissionDenied("Нет прав создавать записи.")
 
-        # сверка company ↔ department (если оба заданы)
         if company and department and department.company_id != company.id:
             raise PermissionDenied("Отдел принадлежит другой компании.")
 
-        # суперюзер без company должен указать department (чтобы взять company из него)
         if user.is_superuser and not company and department is None:
             raise PermissionDenied("Укажите отдел, чтобы определить компанию записи.")
 
-        # не передаём company=None в save — пусть сериализатор установит из department при необходимости
-        extra = {"company": company} if company is not None else {}
-        serializer.save(**extra)
+        # company/branch подставит миксин; если суперюзер без company — сериализатор подставит из department
+        extra = {}
+        if company is not None:
+            extra["company"] = company
+        self._save_with_company_branch(serializer, **extra)
 
 
-class TransactionRecordRetrieveUpdateDestroyView(generics.RetrieveUpdateDestroyAPIView):
+class TransactionRecordRetrieveUpdateDestroyView(generics.RetrieveUpdateDestroyAPIView, CompanyBranchRestrictedMixin):
     serializer_class = TransactionRecordSerializer
     permission_classes = [permissions.IsAuthenticated]
 
@@ -876,20 +1004,19 @@ class TransactionRecordRetrieveUpdateDestroyView(generics.RetrieveUpdateDestroyA
         qs = TransactionRecord.objects.select_related("company", "department")
         if user.is_superuser:
             return qs
-        company = _get_company(user)
-        if company:
-            return qs.filter(company=company)
-        return qs.none()
-    
-    
-class ContractorWorkListCreateAPIView(generics.ListCreateAPIView):
+        return self._filter_qs_company_branch(qs)
+
+
+# ===========================
+#  Contractor Works
+# ===========================
+class ContractorWorkListCreateAPIView(CompanyBranchRestrictedMixin, generics.ListCreateAPIView):
     """
       GET  /api/main/contractor-works/
       POST /api/main/contractor-works/
       GET  /api/main/departments/<uuid:department_id>/contractor-works/
       POST /api/main/departments/<uuid:department_id>/contractor-works/
     """
-    permission_classes = [permissions.IsAuthenticated]
     serializer_class = ContractorWorkSerializer
     filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
     filterset_fields = ["department", "contractor_entity_type", "start_date", "end_date"]
@@ -898,9 +1025,8 @@ class ContractorWorkListCreateAPIView(generics.ListCreateAPIView):
     ordering = ["-created_at"]
 
     def get_queryset(self):
-        qs = ContractorWork.objects.select_related("department").filter(
-            company_id=self.request.user.company_id
-        )
+        qs = ContractorWork.objects.select_related("department").all()
+        qs = self._filter_qs_company_branch(qs)
         dep_id = self.kwargs.get("department_id")
         if dep_id:
             qs = qs.filter(department_id=dep_id)
@@ -908,57 +1034,54 @@ class ContractorWorkListCreateAPIView(generics.ListCreateAPIView):
 
     @transaction.atomic
     def perform_create(self, serializer):
-        company = self.request.user.company
+        company = self._company()
+        branch = self._auto_branch()
         dep_id = self.kwargs.get("department_id")
         if dep_id:
-            # nested: отдел из URL и в рамках компании
             department = get_object_or_404(Department, id=dep_id, company=company)
-            serializer.save(company=company, department=department)
+            serializer.save(company=company, branch=branch, department=department)
         else:
-            # flat: отдел приходит в теле и должен принадлежать компании
             dep = serializer.validated_data.get("department")
             if not dep or dep.company_id != company.id:
                 raise serializers.ValidationError({"department": "Отдел не найден в вашей компании."})
-            serializer.save(company=company)
+            serializer.save(company=company, branch=branch)
 
 
-class ContractorWorkRetrieveUpdateDestroyAPIView(generics.RetrieveUpdateDestroyAPIView):
+class ContractorWorkRetrieveUpdateDestroyAPIView(CompanyBranchRestrictedMixin, generics.RetrieveUpdateDestroyAPIView):
     """
     GET    /api/main/contractor-works/<uuid:pk>/
     PATCH  /api/main/contractor-works/<uuid:pk>/
     PUT    /api/main/contractor-works/<uuid:pk>/
     DELETE /api/main/contractor-works/<uuid:pk>/
-
-    (опционально nested)
-    GET    /api/main/departments/<uuid:department_id>/contractor-works/<uuid:pk>/
     """
-    permission_classes = [permissions.IsAuthenticated]
     serializer_class = ContractorWorkSerializer
 
     def get_queryset(self):
-        qs = ContractorWork.objects.select_related("department").filter(
-            company_id=self.request.user.company_id
-        )
+        qs = ContractorWork.objects.select_related("department").all()
         dep_id = self.kwargs.get("department_id")
+        qs = self._filter_qs_company_branch(qs)
         if dep_id:
             qs = qs.filter(department_id=dep_id)
         return qs
 
     @transaction.atomic
     def perform_update(self, serializer):
-        company = self.request.user.company
+        company = self._company()
+        branch = self._auto_branch()
         dep = serializer.validated_data.get("department")
         if dep and dep.company_id != company.id:
             raise serializers.ValidationError({"department": "Отдел принадлежит другой компании."})
-        serializer.save(company=company)
-        
-        
-class DebtListCreateAPIView(generics.ListCreateAPIView):
+        serializer.save(company=company, branch=branch)
+
+
+# ===========================
+#  Debts
+# ===========================
+class DebtListCreateAPIView(CompanyBranchRestrictedMixin, generics.ListCreateAPIView):
     """
     GET  /api/main/debts/?search=...&date_from=YYYY-MM-DD&date_to=YYYY-MM-DD
     POST /api/main/debts/
     """
-    permission_classes = [permissions.IsAuthenticated]
     serializer_class = DebtSerializer
     filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
     filterset_class = DebtFilter
@@ -967,21 +1090,20 @@ class DebtListCreateAPIView(generics.ListCreateAPIView):
     ordering = ["-created_at"]
 
     def get_queryset(self):
-        return Debt.objects.filter(company_id=self.request.user.company_id)
+        return self._filter_qs_company_branch(Debt.objects.all())
 
 
-class DebtRetrieveUpdateDestroyAPIView(generics.RetrieveUpdateDestroyAPIView):
+class DebtRetrieveUpdateDestroyAPIView(CompanyBranchRestrictedMixin, generics.RetrieveUpdateDestroyAPIView):
     """
     GET/PATCH/PUT/DELETE /api/main/debts/<uuid:pk>/
     """
-    permission_classes = [permissions.IsAuthenticated]
     serializer_class = DebtSerializer
 
     def get_queryset(self):
-        return Debt.objects.filter(company_id=self.request.user.company_id)
+        return self._filter_qs_company_branch(Debt.objects.all())
 
 
-class DebtPayAPIView(APIView):
+class DebtPayAPIView(APIView, CompanyBranchRestrictedMixin):
     """
     POST /api/main/debts/<uuid:pk>/pay/
     Body: { "amount": "235.00", "paid_at": "2025-09-12", "note": "оплата с карты" }
@@ -990,12 +1112,20 @@ class DebtPayAPIView(APIView):
 
     @transaction.atomic
     def post(self, request, pk):
-        company = request.user.company
-        debt = get_object_or_404(Debt, pk=pk, company=company)
+        company = self._company()
+        branch = self._auto_branch()
+
+        qs = Debt.objects.filter(company=company)
+        if hasattr(Debt, "branch"):
+            if branch is None:
+                qs = qs.filter(branch__isnull=True)
+            else:
+                qs = qs.filter(Q(branch__isnull=True) | Q(branch=branch))
+
+        debt = get_object_or_404(qs, pk=pk)
 
         ser = DebtPaymentSerializer(data=request.data, context={"request": request})
         ser.is_valid(raise_exception=True)
-        # создаём платеж, компания и долг фиксируются тут
         DebtPayment.objects.create(
             company=company,
             debt=debt,
@@ -1003,16 +1133,13 @@ class DebtPayAPIView(APIView):
             paid_at=ser.validated_data.get("paid_at"),
             note=ser.validated_data.get("note", ""),
         )
-        # вернём обновлённую карточку долга (для таблицы)
         return Response(DebtSerializer(debt, context={"request": request}).data, status=status.HTTP_201_CREATED)
 
 
-# (опционально) список платежей по долгу
-class DebtPaymentListAPIView(generics.ListAPIView):
+class DebtPaymentListAPIView(CompanyBranchRestrictedMixin, generics.ListAPIView):
     """
     GET /api/main/debts/<uuid:pk>/payments/?date_from=&date_to=
     """
-    permission_classes = [permissions.IsAuthenticated]
     serializer_class = DebtPaymentSerializer
     filter_backends = [DjangoFilterBackend, filters.OrderingFilter]
     filterset_class = DebtPaymentFilter
@@ -1020,12 +1147,16 @@ class DebtPaymentListAPIView(generics.ListAPIView):
     ordering = ["-paid_at", "-created_at"]
 
     def get_queryset(self):
-        return DebtPayment.objects.filter(
-            company_id=self.request.user.company_id,
-            debt_id=self.kwargs["pk"]
-        )
-        
-class ObjectItemListCreateAPIView(CompanyRestrictedMixin, generics.ListCreateAPIView):
+        # платежи конкретного долга в рамках компании/филиала
+        debt_qs = self._filter_qs_company_branch(Debt.objects.all())
+        debt = get_object_or_404(debt_qs, pk=self.kwargs["pk"])
+        return DebtPayment.objects.filter(company=debt.company, debt=debt)
+
+
+# ===========================
+#  Object items / sales
+# ===========================
+class ObjectItemListCreateAPIView(CompanyBranchRestrictedMixin, generics.ListCreateAPIView):
     serializer_class = ObjectItemSerializer
     queryset = ObjectItem.objects.all()
     filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
@@ -1033,11 +1164,13 @@ class ObjectItemListCreateAPIView(CompanyRestrictedMixin, generics.ListCreateAPI
     ordering_fields = ["date", "created_at", "updated_at", "price", "quantity", "name"]
     ordering = ["-date", "-created_at"]
 
-class ObjectItemRetrieveUpdateDestroyAPIView(CompanyRestrictedMixin, generics.RetrieveUpdateDestroyAPIView):
+
+class ObjectItemRetrieveUpdateDestroyAPIView(CompanyBranchRestrictedMixin, generics.RetrieveUpdateDestroyAPIView):
     serializer_class = ObjectItemSerializer
     queryset = ObjectItem.objects.all()
-    
-class ObjectSaleListCreateAPIView(CompanyRestrictedMixin, generics.ListCreateAPIView):
+
+
+class ObjectSaleListCreateAPIView(CompanyBranchRestrictedMixin, generics.ListCreateAPIView):
     serializer_class = ObjectSaleSerializer
     filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
     search_fields = ["note", "client__full_name", "client__phone"]
@@ -1045,44 +1178,39 @@ class ObjectSaleListCreateAPIView(CompanyRestrictedMixin, generics.ListCreateAPI
     ordering = ["-sold_at", "-created_at"]
 
     def get_queryset(self):
-        return (
-            ObjectSale.objects
-            .select_related("client")
-            .prefetch_related("items")
-            .filter(company_id=self.request.user.company_id)
-        )
+        qs = ObjectSale.objects.select_related("client").prefetch_related("items").all()
+        return self._filter_qs_company_branch(qs)
 
     def perform_create(self, serializer):
         client = serializer.validated_data.get("client")
-        if client.company_id != self.request.user.company_id:
+        if client.company_id != self._company().id:
             raise serializers.ValidationError({"client": "Клиент принадлежит другой компании."})
-        serializer.save(company=self.request.user.company)
+        self._save_with_company_branch(serializer)
 
-class ObjectSaleRetrieveUpdateDestroyAPIView(CompanyRestrictedMixin, generics.RetrieveUpdateDestroyAPIView):
+
+class ObjectSaleRetrieveUpdateDestroyAPIView(CompanyBranchRestrictedMixin, generics.RetrieveUpdateDestroyAPIView):
     serializer_class = ObjectSaleSerializer
+
     def get_queryset(self):
-        return (
-            ObjectSale.objects
-            .select_related("client")
-            .prefetch_related("items")
-            .filter(company_id=self.request.user.company_id)
-        )
+        qs = ObjectSale.objects.select_related("client").prefetch_related("items").all()
+        return self._filter_qs_company_branch(qs)
 
 
-class ObjectSaleAddItemAPIView(CompanyRestrictedMixin, APIView):
+class ObjectSaleAddItemAPIView(CompanyBranchRestrictedMixin, APIView):
     """
     POST /api/main/object-sales/<uuid:sale_id>/items/
     Body:
       { "object_item": "<uuid>", "unit_price": "200.00", "quantity": 2 }
     """
     def post(self, request, sale_id):
-        company = request.user.company
-        sale = get_object_or_404(ObjectSale, id=sale_id, company=company)
+        sale_qs = self._filter_qs_company_branch(ObjectSale.objects.all())
+        sale = get_object_or_404(sale_qs, id=sale_id)
 
         ser = ObjectSaleItemSerializer(data=request.data, context={"request": request})
         ser.is_valid(raise_exception=True)
 
-        obj = get_object_or_404(ObjectItem, id=ser.validated_data["object_item"].id, company=company)
+        obj_qs = self._filter_qs_company_branch(ObjectItem.objects.all())
+        obj = get_object_or_404(obj_qs, id=ser.validated_data["object_item"].id)
 
         item = ObjectSaleItem.objects.create(
             sale=sale,
@@ -1095,62 +1223,48 @@ class ObjectSaleAddItemAPIView(CompanyRestrictedMixin, APIView):
         return Response(ObjectSaleItemSerializer(item).data, status=status.HTTP_201_CREATED)
 
 
-
-class ItemListCreateAPIView(CompanyRestrictedMixin, generics.ListCreateAPIView):
+# ===========================
+#  ItemMake
+# ===========================
+class ItemListCreateAPIView(CompanyBranchRestrictedMixin, generics.ListCreateAPIView):
     """
-    GET  /api/main/items/      — список единиц товаров компании
-    POST /api/main/items/      — создание новой единицы товара
+    GET  /api/main/items/
+    POST /api/main/items/
     """
     serializer_class = ItemMakeSerializer
     queryset = ItemMake.objects.all()
     filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
-
-    # поиск по имени единицы и по названию связанных продуктов
     search_fields = ["name", "products__name"]
     filterset_fields = ["unit", "price", "quantity", "products"]
     ordering_fields = ["created_at", "updated_at", "price", "quantity", "name"]
     ordering = ["-created_at"]
 
     def get_queryset(self):
-        """
-        Ограничиваем queryset объектами компании пользователя.
-        """
         qs = super().get_queryset()
-        company = getattr(self.request.user, "company", None)
-        if company:
-            qs = qs.filter(company=company).distinct()
-        return qs
+        return self._filter_qs_company_branch(qs).distinct()
 
-    def perform_create(self, serializer):
-        serializer.save(company=self.request.user.company)
+    # perform_create — миксин
 
-class ItemRetrieveUpdateDestroyAPIView(CompanyRestrictedMixin, generics.RetrieveUpdateDestroyAPIView):
+
+class ItemRetrieveUpdateDestroyAPIView(CompanyBranchRestrictedMixin, generics.RetrieveUpdateDestroyAPIView):
     """
-    GET    /api/main/items/<uuid:pk>/   — просмотр единицы товара
-    PATCH  /api/main/items/<uuid:pk>/   — частичное обновление
-    PUT    /api/main/items/<uuid:pk>/   — полное обновление
-    DELETE /api/main/items/<uuid:pk>/   — удаление
+    GET    /api/main/items/<uuid:pk>/
+    PATCH  /api/main/items/<uuid:pk>/
+    PUT    /api/main/items/<uuid:pk>/
+    DELETE /api/main/items/<uuid:pk>/
     """
     serializer_class = ItemMakeSerializer
     queryset = ItemMake.objects.all()
-    
-    
-# -------------------------
-#   ManufactureSubreal
-# -------------------------
-# views.py
 
 
-# -------------------------
-#   Subreal
-# -------------------------
-
-class ManufactureSubrealListCreateAPIView(generics.ListCreateAPIView):
+# ===========================
+#  Subreal / Acceptance / ReturnFromAgent
+# ===========================
+class ManufactureSubrealListCreateAPIView(CompanyBranchRestrictedMixin, generics.ListCreateAPIView):
     """
     GET  /api/main/subreals/
     POST /api/main/subreals/
     """
-    permission_classes = [permissions.IsAuthenticated]
     serializer_class = ManufactureSubrealSerializer
     filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
     filterset_fields = ["agent", "product", "status", "created_at"]
@@ -1159,15 +1273,13 @@ class ManufactureSubrealListCreateAPIView(generics.ListCreateAPIView):
     ordering = ["-created_at"]
 
     def get_queryset(self):
-        return (
-            ManufactureSubreal.objects
-            .select_related("company", "user", "agent", "product")
-            .filter(company_id=self.request.user.company_id)
-        )
+        qs = ManufactureSubreal.objects.select_related("company", "user", "agent", "product").all()
+        return self._filter_qs_company_branch(qs)
 
     @transaction.atomic
     def perform_create(self, serializer):
-        company = self.request.user.company
+        company = self._company()
+        branch = self._auto_branch()
         product = serializer.validated_data.get("product")
         qty = serializer.validated_data.get("qty_transferred", 0)
 
@@ -1184,7 +1296,7 @@ class ManufactureSubrealListCreateAPIView(generics.ListCreateAPIView):
             if current_qty is None or current_qty < qty:
                 raise serializers.ValidationError({"qty_transferred": f"Недостаточно на складе: доступно {current_qty or 0}."})
 
-        obj = serializer.save(company=company, user=self.request.user)
+        obj = serializer.save(company=company, branch=branch, user=self.request.user)
 
         if qty:
             type(product).objects.filter(pk=product.pk).update(quantity=F("quantity") - qty)
@@ -1192,39 +1304,32 @@ class ManufactureSubrealListCreateAPIView(generics.ListCreateAPIView):
         return obj
 
 
-class ManufactureSubrealRetrieveUpdateDestroyAPIView(generics.RetrieveUpdateDestroyAPIView):
+class ManufactureSubrealRetrieveUpdateDestroyAPIView(CompanyBranchRestrictedMixin, generics.RetrieveUpdateDestroyAPIView):
     """
     GET    /api/main/subreals/<uuid:pk>/
     PATCH  /api/main/subreals/<uuid:pk>/
     PUT    /api/main/subreals/<uuid:pk>/
     DELETE /api/main/subreals/<uuid:pk>/
     """
-    permission_classes = [permissions.IsAuthenticated]
     serializer_class = ManufactureSubrealSerializer
 
     def get_queryset(self):
-        return (
-            ManufactureSubreal.objects
-            .select_related("company", "user", "agent", "product")
-            .filter(company_id=self.request.user.company_id)
-        )
+        qs = ManufactureSubreal.objects.select_related("company", "user", "agent", "product").all()
+        return self._filter_qs_company_branch(qs)
 
     def perform_update(self, serializer):
-        company = self.request.user.company
+        company = self._company()
+        branch = self._auto_branch()
         prod = serializer.validated_data.get("product")
         if prod and prod.company_id != company.id:
             raise serializers.ValidationError({"product": "Товар другой компании."})
         agent = serializer.validated_data.get("agent")
         if agent and getattr(agent, "company_id", None) != company.id:
             raise serializers.ValidationError({"agent": "Агент другой компании."})
-        serializer.save(company=company)
+        serializer.save(company=company, branch=branch)
 
 
-# -------------------------
-#   Acceptance
-# -------------------------
-
-class AcceptanceListCreateAPIView(generics.ListCreateAPIView):
+class AcceptanceListCreateAPIView(CompanyBranchRestrictedMixin, generics.ListCreateAPIView):
     """
     GET  /api/main/acceptances/
     POST /api/main/acceptances/
@@ -1239,7 +1344,7 @@ class AcceptanceListCreateAPIView(generics.ListCreateAPIView):
         return (
             Acceptance.objects
             .select_related("company", "subreal", "accepted_by")
-            .filter(company_id=self.request.user.company_id)
+            .filter(company_id=self._company().id)
         )
 
     def get_serializer_class(self):
@@ -1254,30 +1359,25 @@ class AcceptanceListCreateAPIView(generics.ListCreateAPIView):
         qty = serializer.validated_data["qty"]
         if qty > locked.qty_remaining:
             raise serializers.ValidationError({"qty": f"Можно принять максимум {locked.qty_remaining}."})
-        serializer.save(company=self.request.user.company, accepted_by=self.request.user)
+        serializer.save(company=self._company(), accepted_by=self._user())
 
 
-class AcceptanceRetrieveDestroyAPIView(generics.RetrieveDestroyAPIView):
+class AcceptanceRetrieveDestroyAPIView(CompanyBranchRestrictedMixin, generics.RetrieveDestroyAPIView):
     """
     GET    /api/main/acceptances/<uuid:pk>/
     DELETE /api/main/acceptances/<uuid:pk>/
     """
-    permission_classes = [permissions.IsAuthenticated]
     serializer_class = AcceptanceReadSerializer
 
     def get_queryset(self):
         return (
             Acceptance.objects
             .select_related("company", "subreal", "accepted_by")
-            .filter(company_id=self.request.user.company_id)
+            .filter(company_id=self._company().id)
         )
 
 
-# -------------------------
-#   ReturnFromAgent
-# -------------------------
-
-class ReturnFromAgentListCreateAPIView(generics.ListCreateAPIView):
+class ReturnFromAgentListCreateAPIView(CompanyBranchRestrictedMixin, generics.ListCreateAPIView):
     """
     GET  /api/main/returns/
     POST /api/main/returns/
@@ -1292,7 +1392,7 @@ class ReturnFromAgentListCreateAPIView(generics.ListCreateAPIView):
         return (
             ReturnFromAgent.objects
             .select_related("company", "subreal", "returned_by", "accepted_by")
-            .filter(company_id=self.request.user.company_id)
+            .filter(company_id=self._company().id)
         )
 
     def get_serializer_class(self):
@@ -1302,26 +1402,25 @@ class ReturnFromAgentListCreateAPIView(generics.ListCreateAPIView):
 
     @transaction.atomic
     def perform_create(self, serializer):
-        serializer.save(company=self.request.user.company, returned_by=self.request.user)
+        serializer.save(company=self._company(), returned_by=self._user())
 
 
-class ReturnFromAgentRetrieveDestroyAPIView(generics.RetrieveDestroyAPIView):
+class ReturnFromAgentRetrieveDestroyAPIView(CompanyBranchRestrictedMixin, generics.RetrieveDestroyAPIView):
     """
     GET    /api/main/returns/<uuid:pk>/
     DELETE /api/main/returns/<uuid:pk>/
     """
-    permission_classes = [permissions.IsAuthenticated]
     serializer_class = ReturnReadSerializer
 
     def get_queryset(self):
         return (
             ReturnFromAgent.objects
             .select_related("company", "subreal", "returned_by", "accepted_by")
-            .filter(company_id=self.request.user.company_id)
+            .filter(company_id=self._company().id)
         )
 
 
-class ReturnFromAgentApproveAPIView(APIView):
+class ReturnFromAgentApproveAPIView(APIView, CompanyBranchRestrictedMixin):
     """
     POST /api/main/returns/<uuid:pk>/approve/
     Подтверждение возврата (статус -> accepted, движение на склад).
@@ -1332,7 +1431,7 @@ class ReturnFromAgentApproveAPIView(APIView):
     def post(self, request, pk, *args, **kwargs):
         try:
             ret = ReturnFromAgent.objects.select_related("subreal__product").get(
-                pk=pk, company_id=request.user.company_id
+                pk=pk, company_id=self._company().id
             )
         except ReturnFromAgent.DoesNotExist:
             return Response({"detail": "Возврат не найден."}, status=status.HTTP_404_NOT_FOUND)
@@ -1346,11 +1445,7 @@ class ReturnFromAgentApproveAPIView(APIView):
         return Response(ReturnReadSerializer(ret).data, status=200)
 
 
-# -------------------------
-#   Bulk
-# -------------------------
-
-class ManufactureSubrealBulkCreateAPIView(APIView):
+class ManufactureSubrealBulkCreateAPIView(APIView, CompanyBranchRestrictedMixin):
     """
     POST /api/main/subreals/bulk/
     {
@@ -1370,8 +1465,9 @@ class ManufactureSubrealBulkCreateAPIView(APIView):
 
         agent = ser.validated_data["agent"]
         items = ser.validated_data["items"]
-        user = request.user
-        company = user.company
+        user = self._user()
+        company = self._company()
+        branch = self._auto_branch()
 
         created = []
         for item in items:
@@ -1389,6 +1485,7 @@ class ManufactureSubrealBulkCreateAPIView(APIView):
 
             created.append(ManufactureSubreal(
                 company=company,
+                branch=branch,
                 user=user,
                 agent=agent,
                 product=product,
@@ -1407,59 +1504,28 @@ class ManufactureSubrealBulkCreateAPIView(APIView):
         return Response(out, status=status.HTTP_201_CREATED)
 
 
-# -------------------------
-#   Agent: мои товары
-# -------------------------
+# ===========================
+#  Agent: my products
+# ===========================
 from typing import List, Optional, Dict, Any
 from datetime import datetime
-
-from django.db import transaction
 from django.db.models import Prefetch
-from rest_framework import permissions, status
-from rest_framework.response import Response
-from rest_framework.views import APIView
-from rest_framework.exceptions import ValidationError
 
-from itertools import groupby
-from operator import attrgetter
-
-from .models import ManufactureSubreal, ReturnFromAgent
-from .serializers import AgentProductOnHandSerializer
-
-
-class AgentMyProductsListAPIView(APIView):
+class AgentMyProductsListAPIView(APIView, CompanyBranchRestrictedMixin):
     """
     GET /api/main/agents/me/products/
-    Возвращает по каждому товару:
-      - product, product_name
-      - qty_on_hand (сумма по всем передачам: accepted - returned)
-      - last_movement_at (максимум из created_at передач, accepted_at приёмов,
-        accepted_at принятых возвратов)
-      - subreals: список передач (id, created_at, qty_transferred/accepted/returned)
-
-    PATCH /api/main/agents/me/products/
-    Принимает:
-      {
-        "subreals": [
-          {"id": <int>, "qty_accepted": <int?>, "qty_returned": <int?>},
-          ...
-        ]
-      }
-    Обновляет только переданные поля с валидацией и принадлежностью к агенту/компании.
-    В ответе — актуальные данные как у GET.
+    PATCH /api/main/agents/me/products/  — частичное обновление qty_accepted/qty_returned
     """
     permission_classes = [permissions.IsAuthenticated]
 
     # -------- Helpers --------
     def _build_queryset(self, request):
-        # префетчим только принятые возвраты — остальные не влияют на last_movement_at
         accepted_returns_qs = ReturnFromAgent.objects.filter(
             status=ReturnFromAgent.Status.ACCEPTED
         )
-        return (
+        base = (
             ManufactureSubreal.objects
-            .filter(company_id=getattr(request.user, "company_id", None),
-                    agent_id=request.user.id)
+            .filter(agent_id=request.user.id)
             .select_related("product")
             .prefetch_related(
                 "acceptances",
@@ -1467,6 +1533,8 @@ class AgentMyProductsListAPIView(APIView):
             )
             .order_by("product_id", "-created_at")
         )
+        # ограничим company/branch
+        return self._filter_qs_company_branch(base)
 
     @staticmethod
     def _nz(v: Optional[int]) -> int:
@@ -1547,7 +1615,6 @@ class AgentMyProductsListAPIView(APIView):
         if not isinstance(items, list) or not items:
             raise ValidationError({"subreals": "Must be a non-empty list."})
 
-        # собираем id для выборки и простую схему валидации
         ids = []
         for i, it in enumerate(items):
             if not isinstance(it, dict):
@@ -1573,35 +1640,28 @@ class AgentMyProductsListAPIView(APIView):
 
             ids.append(it["id"])
 
-        # выбираем только свои передачи
-        subreal_map = {
-            s.id: s
-            for s in ManufactureSubreal.objects.filter(
-                id__in=ids,
-                company_id=company_id,
-                agent_id=request.user.id,
-            ).select_for_update()
-        }
+        # выбираем только свои передачи в рамках компании/филиала
+        base_qs = ManufactureSubreal.objects.filter(id__in=ids, agent_id=request.user.id)
+        base_qs = self._filter_qs_company_branch(base_qs)
+        subreal_map = {s.id: s for s in base_qs.select_for_update()}
         missing = [sid for sid in ids if sid not in subreal_map]
         if missing:
             raise ValidationError({"subreals": f"Not found or not allowed: {missing}"})
 
-        # применяем изменения с проверками инвариантов
-        to_update: List[ManufactureSubreal] = []
+        to_update = []
         with transaction.atomic():
             for it in items:
                 s = subreal_map[it["id"]]
 
-                new_accepted = s.qty_accepted if s.qty_accepted is not None else 0
-                new_returned = s.qty_returned if s.qty_returned is not None else 0
-                transferred = s.qty_transferred if s.qty_transferred is not None else 0
+                new_accepted = s.qty_accepted or 0
+                new_returned = s.qty_returned or 0
+                transferred = s.qty_transferred or 0
 
                 if "qty_accepted" in it and it["qty_accepted"] is not None:
                     new_accepted = it["qty_accepted"]
                 if "qty_returned" in it and it["qty_returned"] is not None:
                     new_returned = it["qty_returned"]
 
-                # инварианты
                 if new_accepted > transferred:
                     raise ValidationError({
                         f"id={s.id}": f"qty_accepted ({new_accepted}) must be <= qty_transferred ({transferred})"
@@ -1611,7 +1671,6 @@ class AgentMyProductsListAPIView(APIView):
                         f"id={s.id}": f"qty_returned ({new_returned}) must be <= qty_accepted ({new_accepted})"
                     })
 
-                # если есть фактические изменения — ставим и копим
                 changed = False
                 if new_accepted != (s.qty_accepted or 0):
                     s.qty_accepted = new_accepted
@@ -1625,7 +1684,6 @@ class AgentMyProductsListAPIView(APIView):
             if to_update:
                 ManufactureSubreal.objects.bulk_update(to_update, ["qty_accepted", "qty_returned"])
 
-        # возвращаем актуальное состояние как в GET
         qs = self._build_queryset(request)
         data = self._serialize_products(qs)
         return Response(AgentProductOnHandSerializer(data, many=True).data, status=status.HTTP_200_OK)

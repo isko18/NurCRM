@@ -1,10 +1,9 @@
 from django.db.models import Q
-from rest_framework import generics
+from django.shortcuts import get_object_or_404
+from rest_framework import generics, permissions
 from rest_framework.views import APIView
 from rest_framework.response import Response
-from rest_framework.permissions import IsAuthenticated
 from rest_framework.exceptions import PermissionDenied
-from django.shortcuts import get_object_or_404
 
 from apps.construction.models import Department, Cashbox, CashFlow
 from apps.users.models import User
@@ -13,311 +12,293 @@ from apps.construction.serializers import (
     CashboxSerializer,
     CashFlowSerializer,
     DepartmentAnalyticsSerializer,
-    CashboxWithFlowsSerializer
+    CashboxWithFlowsSerializer,
 )
 
 
 # ─────────────────────────────────────────────────────────────
-# ВСПОМОГАТЕЛЬНАЯ ФУНКЦИЯ
+# ВСПОМОГАТЕЛЬНЫЕ
 # ─────────────────────────────────────────────────────────────
 def _get_company(user):
-    if user.is_superuser:
+    """Компания текущего пользователя (owner/company)."""
+    if not user or not getattr(user, "is_authenticated", False):
         return None
-    return getattr(user, "owned_company", None) or user.company
+    return getattr(user, "company", None) or getattr(user, "owned_company", None)
+
+
+def _get_active_branch(request):
+    """
+    Активный филиал:
+      1) user.primary_branch() / user.primary_branch (если реализовано)
+      2) request.branch (если мидлварь ставит)
+      3) None (глобальный контекст)
+    """
+    user = getattr(request, "user", None)
+    primary = getattr(user, "primary_branch", None)
+    if callable(primary):
+        try:
+            val = primary()
+            if val:
+                setattr(request, "branch", val)
+                return val
+        except Exception:
+            pass
+    if primary:
+        setattr(request, "branch", primary)
+        return primary
+    if hasattr(request, "branch"):
+        return request.branch
+    setattr(request, "branch", None)
+    return None
+
+
+# ─────────────────────────────────────────────────────────────
+# Базовый mixin для company + branch scope
+# ─────────────────────────────────────────────────────────────
+class CompanyBranchScopedMixin:
+    permission_classes = [permissions.IsAuthenticated]
+
+    def _company(self):
+        return _get_company(getattr(self, "request", None).user)
+
+    def _active_branch(self):
+        return _get_active_branch(self.request)
+
+    def _model_has_field(self, queryset, field_name: str) -> bool:
+        return field_name in {f.name for f in queryset.model._meta.get_fields()}
+
+    def _scoped_queryset(self, base_qs):
+        """
+        company: строго компания пользователя,
+        branch (если есть поле у модели):
+          - если у юзера есть активный филиал → branch IS NULL ИЛИ = мой филиал
+          - если филиала нет → только branch IS NULL (глобальные)
+        """
+        if getattr(self, "swagger_fake_view", False):
+            return base_qs.none()
+
+        company = self._company()
+        if not company:
+            return base_qs.none()
+
+        qs = base_qs.filter(company=company)
+        if self._model_has_field(qs, "branch"):
+            br = self._active_branch()
+            if br is not None:
+                qs = qs.filter(Q(branch__isnull=True) | Q(branch=br))
+            else:
+                qs = qs.filter(branch__isnull=True)
+        return qs
+
+    # На create/update всегда жестко ставим company/branch
+    def _inject_company_branch_on_save(self, serializer):
+        company = self._company()
+        if not company:
+            raise PermissionDenied("У пользователя не настроена компания.")
+        br = self._active_branch()
+        # Если у модели нет поля branch — просто пропадет при save()
+        serializer.save(company=company, branch=br)
 
 
 # ===== DEPARTMENTS ==========================================================
-class DepartmentListCreateView(generics.ListCreateAPIView):
+class DepartmentListCreateView(CompanyBranchScopedMixin, generics.ListCreateAPIView):
+    queryset = Department.objects.select_related("company", "branch").prefetch_related("employees")
     serializer_class = DepartmentSerializer
-    permission_classes = [IsAuthenticated]
 
     def get_queryset(self):
-        user = self.request.user
-        if user.is_superuser:
-            return Department.objects.all().select_related('company').prefetch_related('employees')
-
-        company = _get_company(user)
-        if company:
-            return Department.objects.filter(company=company).select_related('company').prefetch_related('employees')
-
-        # Пользователь без company — видит отделы, где состоит
-        return Department.objects.filter(employees=user).select_related('company').prefetch_related('employees')
+        return self._scoped_queryset(super().get_queryset())
 
     def perform_create(self, serializer):
-        user = self.request.user
-        if user.is_superuser:
-            serializer.save()
-        else:
-            company = _get_company(user)
-            if not company:
-                raise PermissionDenied("У вас нет прав создавать отделы.")
-            serializer.save(company=company)
+        self._inject_company_branch_on_save(serializer)
 
 
-class DepartmentDetailView(generics.RetrieveUpdateDestroyAPIView):
+class DepartmentDetailView(CompanyBranchScopedMixin, generics.RetrieveUpdateDestroyAPIView):
+    queryset = Department.objects.select_related("company", "branch").prefetch_related("employees")
     serializer_class = DepartmentSerializer
-    permission_classes = [IsAuthenticated]
 
     def get_queryset(self):
-        user = self.request.user
-        if user.is_superuser:
-            return Department.objects.all()
-        company = _get_company(user)
-        if company:
-            return Department.objects.filter(company=company)
-        return Department.objects.filter(employees=user)
+        return self._scoped_queryset(super().get_queryset())
 
 
-# ===== DEPARTMENT ANALYTICS =====================================
-class DepartmentAnalyticsListView(generics.ListAPIView):
+# ===== DEPARTMENT ANALYTICS ================================================
+class DepartmentAnalyticsListView(CompanyBranchScopedMixin, generics.ListAPIView):
+    queryset = Department.objects.select_related("company", "branch")
     serializer_class = DepartmentAnalyticsSerializer
-    permission_classes = [IsAuthenticated]
 
     def get_queryset(self):
-        user = self.request.user
-        if user.is_superuser:
-            return Department.objects.all()
-
-        company = _get_company(user)
-        if company:
-            return Department.objects.filter(company=company)
-
-        return Department.objects.filter(employees=user)
+        return self._scoped_queryset(super().get_queryset())
 
 
-class DepartmentAnalyticsDetailView(generics.RetrieveAPIView):
+class DepartmentAnalyticsDetailView(CompanyBranchScopedMixin, generics.RetrieveAPIView):
+    queryset = Department.objects.select_related("company", "branch")
     serializer_class = DepartmentAnalyticsSerializer
-    permission_classes = [IsAuthenticated]
 
     def get_queryset(self):
-        user = self.request.user
-        if user.is_superuser:
-            return Department.objects.all()
-        company = _get_company(user)
-        if company:
-            return Department.objects.filter(company=company)
-        return Department.objects.filter(employees=user)
+        return self._scoped_queryset(super().get_queryset())
 
 
-# ===== CASHBOXES ================================================
-class CashboxListCreateView(generics.ListCreateAPIView):
+# ===== CASHBOXES ============================================================
+class CashboxListCreateView(CompanyBranchScopedMixin, generics.ListCreateAPIView):
+    queryset = Cashbox.objects.select_related("company", "branch", "department", "department__branch")
     serializer_class = CashboxSerializer
-    permission_classes = [IsAuthenticated]
 
     def get_queryset(self):
-        user = self.request.user
-        if user.is_superuser:
-            return Cashbox.objects.all().select_related('company', 'department')
-
-        company = _get_company(user)
-        if company:
-            # теперь у кассы есть company → фильтруем строго по ней
-            return Cashbox.objects.filter(company=company).select_related('company', 'department')
-
-        # без company — кассы отделов, где пользователь состоит
-        return Cashbox.objects.filter(department__employees=user).select_related('company', 'department')
+        return self._scoped_queryset(super().get_queryset())
 
     def perform_create(self, serializer):
-        user = self.request.user
-        company = _get_company(user)
-        department = serializer.validated_data.get("department")
-
-        if department:  # касса для отдела
-            if not (user.is_superuser or (company and department.company_id == company.id)):
-                raise PermissionDenied("Нет прав для создания кассы у этого отдела.")
-            if hasattr(department, "cashbox"):
-                raise PermissionDenied("У отдела уже есть касса.")
-            # company кассы = company отдела
-            serializer.save(company=department.company)
-        else:  # свободная касса
-            if not (user.is_superuser or company):
-                raise PermissionDenied("Нет прав для создания свободной кассы.")
-            serializer.save(company=company)
+        """
+        company/branch проставляем из контекста.
+        Валидация согласованности с department:
+          - department.company == company
+          - department.branch ∈ {NULL, branch}
+        Это уже проверяет сериализатор/модель, но мы держим единую точку записи.
+        """
+        self._inject_company_branch_on_save(serializer)
 
 
-class CashboxDetailView(generics.RetrieveUpdateDestroyAPIView):
+class CashboxDetailView(CompanyBranchScopedMixin, generics.RetrieveUpdateDestroyAPIView):
+    queryset = Cashbox.objects.select_related("company", "branch", "department", "department__branch")
     serializer_class = CashboxWithFlowsSerializer
-    permission_classes = [IsAuthenticated]
 
     def get_queryset(self):
-        user = self.request.user
-        if user.is_superuser:
-            return Cashbox.objects.all()
-        company = _get_company(user)
-        if company:
-            return Cashbox.objects.filter(company=company)
-        return Cashbox.objects.filter(department__employees=user)
+        return self._scoped_queryset(super().get_queryset())
 
 
-# ===== CASHFLOWS ================================================
-class CashFlowListCreateView(generics.ListCreateAPIView):
+# ===== CASHFLOWS ============================================================
+class CashFlowListCreateView(CompanyBranchScopedMixin, generics.ListCreateAPIView):
+    queryset = CashFlow.objects.select_related("company", "branch", "cashbox", "cashbox__department", "cashbox__branch")
     serializer_class = CashFlowSerializer
-    permission_classes = [IsAuthenticated]
 
     def get_queryset(self):
-        user = self.request.user
-        if user.is_superuser:
-            return CashFlow.objects.all().select_related('company', 'cashbox', 'cashbox__department')
-
-        company = _get_company(user)
-        if company:
-            # у движений теперь есть company → фильтруем по ней (жёстче и проще)
-            return CashFlow.objects.filter(company=company).select_related('company', 'cashbox', 'cashbox__department')
-
-        # без company — движения касс отделов, где пользователь состоит
-        return CashFlow.objects.filter(cashbox__department__employees=user).select_related('company', 'cashbox', 'cashbox__department')
+        return self._scoped_queryset(super().get_queryset())
 
     def perform_create(self, serializer):
-        user = self.request.user
-        company = _get_company(user)
-        department = serializer.validated_data.get("department")
-
-        if department:  # касса для отдела
-            if not (user.is_superuser or (company and department.company_id == company.id)):
-                raise PermissionDenied("Нет прав для создания кассы у этого отдела.")
-
-            # 🚫 вместо hasattr(...)
-            if Cashbox.objects.filter(department=department).exists():
-                raise PermissionDenied("У отдела уже есть касса.")
-
-            # company кассы = company отдела
-            serializer.save(company=department.company)
-
-        else:  # свободная касса
-            if not (user.is_superuser or company):
-                raise PermissionDenied("Нет прав для создания свободной кассы.")
-            serializer.save(company=company)
+        """
+        Проставляем company/branch из контекста (как и у кассы).
+        Модель/сериализатор проверят, что выбранная cashbox принадлежит той же company
+        и является глобальной или филиала пользователя.
+        """
+        self._inject_company_branch_on_save(serializer)
 
 
-class CashFlowDetailView(generics.RetrieveUpdateDestroyAPIView):
+class CashFlowDetailView(CompanyBranchScopedMixin, generics.RetrieveUpdateDestroyAPIView):
+    queryset = CashFlow.objects.select_related("company", "branch", "cashbox", "cashbox__department", "cashbox__branch")
     serializer_class = CashFlowSerializer
-    permission_classes = [IsAuthenticated]
 
     def get_queryset(self):
-        user = self.request.user
-        if user.is_superuser:
-            return CashFlow.objects.all()
-        company = _get_company(user)
-        if company:
-            return CashFlow.objects.filter(company=company)
-        return CashFlow.objects.filter(cashbox__department__employees=user)
+        return self._scoped_queryset(super().get_queryset())
 
 
-# ===== ASSIGN / REMOVE EMPLOYEES =================================
+# ===== ASSIGN / REMOVE EMPLOYEES ===========================================
 class AssignEmployeeToDepartmentView(APIView):
-    permission_classes = [IsAuthenticated]
+    permission_classes = [permissions.IsAuthenticated]
 
     def post(self, request, department_id):
         user = request.user
-        data = request.data
-        employee_id = data.get("employee_id")
-        department = get_object_or_404(Department, id=department_id)
+        company = _get_company(user)
+        if not company:
+            return Response({"detail": "Нет компании у пользователя."}, status=403)
 
-        if not (
-            user.is_superuser or
-            (hasattr(user, "owned_company") and department.company == user.owned_company) or
-            getattr(user, "is_admin", False) and department.company_id == getattr(_get_company(user), 'id', None)
-        ):
-            return Response({"detail": "Недостаточно прав для изменения сотрудников отдела."}, status=403)
+        dept = get_object_or_404(
+            Department.objects.select_related("company", "branch"),
+            id=department_id, company=company
+        )
+        employee_id = request.data.get("employee_id")
+        employee = get_object_or_404(User, id=employee_id, company=company)
 
-        employee = get_object_or_404(User, id=employee_id)
+        # Запрет на состязание между филиалами: отдел глобальный или моего филиала
+        br = _get_active_branch(request)
+        if br is not None and dept.branch_id not in (None, br.id):
+            return Response({"detail": "Отдел принадлежит другому филиалу."}, status=400)
 
-        if employee.company != department.company:
-            return Response({"detail": "Нельзя добавить сотрудника из другой компании."}, status=400)
+        # Один сотрудник может состоять в нескольких отделах — если надо запретить, раскомментируй:
+        # if employee.departments.exists():
+        #     return Response({"detail": "Пользователь уже прикреплён к другому отделу."}, status=400)
 
-        if employee.departments.exists():
-            return Response({"detail": "Пользователь уже прикреплён к другому отделу."}, status=400)
+        dept.employees.add(employee)
 
-        department.employees.add(employee)
-
-        # Проставляем права (если есть в запросе)
+        # Проставляем упрощённый набор прав (если есть в payload)
         access_fields = [
             'can_view_dashboard', 'can_view_cashbox', 'can_view_departments',
             'can_view_orders', 'can_view_analytics', 'can_view_products', 'can_view_booking'
         ]
         updated = False
         for field in access_fields:
-            if field in data:
-                setattr(employee, field, data[field])
+            if field in request.data:
+                setattr(employee, field, request.data[field])
                 updated = True
-
         if updated:
             employee.save()
 
-        return Response({"detail": "Сотрудник успешно добавлен в отдел и права обновлены."}, status=200)
+        return Response({"detail": "Сотрудник добавлен в отдел, права обновлены."}, status=200)
 
 
 class RemoveEmployeeFromDepartmentView(APIView):
-    permission_classes = [IsAuthenticated]
+    permission_classes = [permissions.IsAuthenticated]
 
     def post(self, request, department_id):
         user = request.user
+        company = _get_company(user)
+        if not company:
+            return Response({"detail": "Нет компании у пользователя."}, status=403)
+
+        dept = get_object_or_404(
+            Department.objects.select_related("company", "branch"),
+            id=department_id, company=company
+        )
         employee_id = request.data.get("employee_id")
-        department = get_object_or_404(Department, id=department_id)
+        employee = get_object_or_404(User, id=employee_id, company=company)
 
-        if not (
-            user.is_superuser or
-            (hasattr(user, "owned_company") and department.company == user.owned_company) or
-            getattr(user, "is_admin", False) and department.company_id == getattr(_get_company(user), 'id', None)
-        ):
-            return Response({"detail": "Недостаточно прав для удаления сотрудников из отдела."}, status=403)
-
-        employee = get_object_or_404(User, id=employee_id)
-
-        if employee not in department.employees.all():
+        if employee not in dept.employees.all():
             return Response({"detail": "Сотрудник не состоит в этом отделе."}, status=400)
 
-        department.employees.remove(employee)
-        return Response({"detail": "Сотрудник успешно удалён из отдела."}, status=200)
+        dept.employees.remove(employee)
+        return Response({"detail": "Сотрудник удалён из отдела."}, status=200)
 
 
-# ===== COMPANY-WIDE ANALYTICS ===================================
-class CompanyDepartmentAnalyticsView(generics.ListAPIView):
+# ===== COMPANY-WIDE ANALYTICS (owner/admin) ================================
+class CompanyDepartmentAnalyticsView(CompanyBranchScopedMixin, generics.ListAPIView):
     serializer_class = DepartmentAnalyticsSerializer
-    permission_classes = [IsAuthenticated]
 
     def get_queryset(self):
         user = self.request.user
-        if user.is_superuser:
-            return Department.objects.all()
-
         company = _get_company(user)
-        if company and (getattr(user, "owned_company", None) or getattr(user, "is_admin", False)):
-            return Department.objects.filter(company=company)
+        if user.is_superuser:
+            qs = Department.objects.select_related("company", "branch")
+        elif company and (getattr(user, "owned_company", None) or getattr(user, "is_admin", False)):
+            qs = Department.objects.filter(company=company).select_related("company", "branch")
+        else:
+            raise PermissionDenied("Вы не являетесь владельцем компании или администратором.")
+        # Даже для owner/admin соблюдаем «глобальные или мой филиал»
+        return self._scoped_queryset(qs)
 
-        raise PermissionDenied("Вы не являетесь владельцем компании или администратором.")
 
-
-# ===== CASHBOX DETAIL WITH FLOWS ================================
-class CashboxOwnerDetailView(generics.ListAPIView):
+# ===== CASHBOX DETAIL WITH FLOWS (owner/admin) =============================
+class CashboxOwnerDetailView(CompanyBranchScopedMixin, generics.ListAPIView):
     serializer_class = CashboxWithFlowsSerializer
-    permission_classes = [IsAuthenticated]
 
     def get_queryset(self):
         user = self.request.user
-
         if user.is_superuser:
-            return Cashbox.objects.all()
+            qs = Cashbox.objects.select_related("company", "branch", "department", "department__branch")
+        else:
+            company = _get_company(user)
+            if not (company and (getattr(user, "owned_company", None) or getattr(user, "is_admin", False))):
+                raise PermissionDenied("Только владельцы компании или администраторы могут просматривать кассы.")
+            qs = Cashbox.objects.filter(company=company).select_related("company", "branch", "department", "department__branch")
+        return self._scoped_queryset(qs)
 
-        company = _get_company(user)
-        if (getattr(user, "owned_company", None) or getattr(user, "is_admin", False)) and company:
-            # все кассы компании: и отделов, и свободные
-            return Cashbox.objects.filter(company=company)
 
-        raise PermissionDenied("Только владельцы компании или администраторы могут просматривать кассы.")
-
-
-class CashboxOwnerDetailSingleView(generics.RetrieveAPIView):
-    queryset = Cashbox.objects.all()
+class CashboxOwnerDetailSingleView(CompanyBranchScopedMixin, generics.RetrieveAPIView):
     serializer_class = CashboxWithFlowsSerializer
-    permission_classes = [IsAuthenticated]
 
     def get_queryset(self):
         user = self.request.user
         if user.is_superuser:
-            return Cashbox.objects.all()
-        company = _get_company(user)
-        if (getattr(user, 'owned_company', None) or getattr(user, 'is_admin', False)) and company:
-            return Cashbox.objects.filter(company=company)
-        # никому больше не показываем ничего
-        return Cashbox.objects.none()
+            qs = Cashbox.objects.select_related("company", "branch", "department", "department__branch")
+        else:
+            company = _get_company(user)
+            if not (company and (getattr(user, "owned_company", None) or getattr(user, "is_admin", False))):
+                return Cashbox.objects.none()
+            qs = Cashbox.objects.filter(company=company).select_related("company", "branch", "department", "department__branch")
+        return self._scoped_queryset(qs)

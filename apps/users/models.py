@@ -1,9 +1,11 @@
 from django.db import models
 from django.contrib.auth.models import AbstractBaseUser, PermissionsMixin
+from django.core.exceptions import ValidationError
 import uuid
 from apps.users.managers import UserManager
 from datetime import timedelta
 from django.utils import timezone
+
 
 class Feature(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False, verbose_name='ID')
@@ -16,13 +18,15 @@ class Feature(models.Model):
     class Meta:
         verbose_name = 'Функция'
         verbose_name_plural = 'Функции'
-        
+
+
 class SubscriptionPlan(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False, verbose_name='ID')
     name = models.CharField(max_length=128)
     price = models.DecimalField(max_digits=10, decimal_places=2)
     description = models.TextField(blank=True, null=True)
-    features = models.ManyToManyField(Feature, null=True, blank=True)  
+    # ManyToManyField корректно использовать с blank=True (null=True не поддерживается)
+    features = models.ManyToManyField(Feature, blank=True)
 
     def __str__(self):
         return f"{self.name} - {self.price}₽"
@@ -40,6 +44,7 @@ class Roles(models.TextChoices):
     ADMIN = "admin", "Администратор"
     OWNER = "owner", "Владелец"
 
+
 class Sector(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     name = models.CharField(max_length=255, unique=True, verbose_name='Название отрасли')
@@ -50,7 +55,8 @@ class Sector(models.Model):
     class Meta:
         verbose_name = "Отрасль"
         verbose_name_plural = "Отрасли"
-        
+
+
 class Industry(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     name = models.CharField(max_length=255, unique=True, verbose_name='Название вида деятельности')
@@ -63,9 +69,17 @@ class Industry(models.Model):
         verbose_name = "Вид деятельности"
         verbose_name_plural = "Виды деятельности"
 
+
 class CustomRole(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    company = models.ForeignKey('Company', on_delete=models.CASCADE, null=True, blank=True, related_name='custom_roles', verbose_name='Компания')
+    company = models.ForeignKey(
+        'Company',
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
+        related_name='custom_roles',
+        verbose_name='Компания'
+    )
     name = models.CharField(max_length=64, verbose_name="Название роли")
 
     class Meta:
@@ -75,8 +89,8 @@ class CustomRole(models.Model):
 
     def __str__(self):
         return self.name
-    
-    
+
+
 class User(AbstractBaseUser, PermissionsMixin):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False, verbose_name='ID')
     email = models.EmailField(unique=True, verbose_name='Email')
@@ -158,13 +172,22 @@ class User(AbstractBaseUser, PermissionsMixin):
     can_view_school_teachers = models.BooleanField(default=False, blank=True, null=True, verbose_name='Школа: преподаватели')
     can_view_school_leads = models.BooleanField(default=False, blank=True, null=True, verbose_name='Школа: лиды')
     can_view_school_invoices = models.BooleanField(default=False, blank=True, null=True, verbose_name='Школа: счета')
-    can_view_clients = models.BooleanField(default=False, verbose_name='Доступ к клиентам')
+    # дубликат can_view_clients здесь намеренно отсутствует
     can_view_client_requests = models.BooleanField(default=False, verbose_name='Доступ к заявкам клиентов')
     can_view_salary = models.BooleanField(default=False, verbose_name='Доступ к зарплатам')
     can_view_sales = models.BooleanField(default=False, verbose_name='Доступ к продажам')
     can_view_services = models.BooleanField(default=False, verbose_name='Доступ к услугам')
     can_view_agent = models.BooleanField(default=False, verbose_name='Доступ к агентам')
-    
+
+    # Распределение сотрудника по филиалам (через промежуточную модель)
+    branches = models.ManyToManyField(
+        "Branch",
+        through="BranchMembership",
+        blank=True,
+        related_name="users",
+        verbose_name="Филиалы"
+    )
+
     created_at = models.DateTimeField(auto_now_add=True, verbose_name='Дата создания')
     updated_at = models.DateTimeField(auto_now=True, verbose_name='Дата обновления')
 
@@ -191,8 +214,30 @@ class User(AbstractBaseUser, PermissionsMixin):
             return self.custom_role.name
         return "Без роли"
 
+    # ---- Удобные методы для филиалов ----
+    def is_in_branch(self, branch) -> bool:
+        """
+        Состоит ли сотрудник в филиале.
+        branch=None — доступ к «глобальным» данным компании.
+        """
+        if branch is None:
+            return True
+        if not self.pk:
+            return False
+        return self.branch_memberships.filter(branch=branch).exists()
 
-# Модель Company (компания)
+    @property
+    def allowed_branch_ids(self):
+        """Список id филиалов, к которым у пользователя есть доступ."""
+        return list(self.branch_memberships.values_list("branch_id", flat=True))
+
+    @property
+    def primary_branch(self):
+        """Основной филиал сотрудника (если помечен)."""
+        membership = self.branch_memberships.select_related("branch").filter(is_primary=True).first()
+        return membership.branch if membership else None
+
+
 class Company(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     name = models.CharField(max_length=255, verbose_name='Название компании')
@@ -223,23 +268,152 @@ class Company(models.Model):
 
     created_at = models.DateTimeField(auto_now_add=True, verbose_name='Дата создания')
     start_date = models.DateTimeField(verbose_name='Дата начала', blank=True, null=True)
-    end_date = models.DateTimeField(verbose_name='Дата окончания', blank=True, null=True) 
+    end_date = models.DateTimeField(verbose_name='Дата окончания', blank=True, null=True)
 
     can_view_documents = models.BooleanField(default=False, verbose_name='Доступ к документам')
     can_view_whatsapp = models.BooleanField(default=False, verbose_name='Доступ к whatsapp')
     can_view_instagram = models.BooleanField(default=False, verbose_name='Доступ к instagram')
     can_view_telegram = models.BooleanField(default=False, verbose_name='Доступ к telegram')
-    
+
     def save(self, *args, **kwargs):
         if not self.start_date:
             self.start_date = timezone.now()
         if not self.end_date and self.start_date:
             self.end_date = self.start_date + timedelta(days=10)
         super().save(*args, **kwargs)
-        
+
     def __str__(self):
         return self.name
 
     class Meta:
         verbose_name = 'Компания'
         verbose_name_plural = 'Компании'
+
+
+class Branch(models.Model):
+    """
+    Филиал компании (точка продаж, офис, подразделение).
+    Поддерживает сценарий, где branch=None = глобальный объект компании.
+    """
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False, verbose_name="ID")
+
+    company = models.ForeignKey(
+        "Company",
+        on_delete=models.CASCADE,
+        related_name="branches",
+        verbose_name="Компания",
+    )
+
+    name = models.CharField(max_length=128, verbose_name="Название филиала")
+    code = models.SlugField(
+        max_length=64,
+        blank=True,
+        null=True,
+        verbose_name="Код филиала (slug, например для URL или субдомена)",
+        help_text="Например: spb, moscow, online — уникален в пределах компании.",
+    )
+    address = models.CharField(max_length=255, blank=True, null=True, verbose_name="Адрес")
+    phone = models.CharField(max_length=32, blank=True, null=True, verbose_name="Телефон")
+    email = models.EmailField(blank=True, null=True, verbose_name="Email филиала")
+    timezone = models.CharField(
+        max_length=64,
+        default="Asia/Bishkek",
+        verbose_name="Часовой пояс",
+        help_text="Используется для расписаний, графиков и аналитики"
+    )
+
+    # Свой тариф (если нужно ограничить функционал на уровне филиала)
+    subscription_plan = models.ForeignKey(
+        "SubscriptionPlan",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="branches",
+        verbose_name="Тариф филиала",
+    )
+
+    # Отдельные включённые фичи (поверх тарифа)
+    features = models.ManyToManyField(
+        "Feature",
+        blank=True,
+        related_name="branches",
+        verbose_name="Доп. функции филиала"
+    )
+
+    is_active = models.BooleanField(default=True, verbose_name="Активен")
+    created_at = models.DateTimeField(auto_now_add=True, verbose_name="Дата создания")
+    updated_at = models.DateTimeField(auto_now=True, verbose_name="Дата обновления")
+
+    class Meta:
+        verbose_name = "Филиал"
+        verbose_name_plural = "Филиалы"
+        unique_together = (("company", "name"), ("company", "code"))
+
+    def __str__(self):
+        return f"{self.company.name} / {self.name}"
+
+    def save(self, *args, **kwargs):
+        """Гарантирует уникальность code внутри компании при автогенерации."""
+        if not self.code:
+            self.code = f"branch-{self.pk or uuid.uuid4().hex[:6]}"
+        super().save(*args, **kwargs)
+
+    # -------- Вспомогательные методы --------
+    def effective_plan(self):
+        """Возвращает тариф филиала или компании."""
+        return self.subscription_plan or getattr(self.company, "subscription_plan", None)
+
+    def has_feature(self, feature_name: str) -> bool:
+        """
+        Проверка наличия функции:
+        - сначала смотрит фичи филиала,
+        - потом тариф филиала,
+        - потом тариф компании.
+        """
+        if self.features.filter(name=feature_name).exists():
+            return True
+        plan = self.effective_plan()
+        if plan and plan.has_feature(feature_name):
+            return True
+        return False
+
+
+class BranchMembership(models.Model):
+    """
+    Членство сотрудника в филиале компании.
+    Позволяет распределять сотрудников по филиалам (один сотрудник — несколько филиалов).
+    """
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False, verbose_name="ID")
+    user = models.ForeignKey(
+        "User", on_delete=models.CASCADE, related_name="branch_memberships", verbose_name="Сотрудник"
+    )
+    branch = models.ForeignKey(
+        "Branch", on_delete=models.CASCADE, related_name="branch_memberships", verbose_name="Филиал"
+    )
+    # опционально: роль/метки в рамках филиала
+    role = models.CharField(max_length=64, blank=True, null=True, verbose_name="Роль в филиале")
+    is_primary = models.BooleanField(default=False, verbose_name="Основной филиал")
+
+    created_at = models.DateTimeField(auto_now_add=True, verbose_name="Создано")
+
+    class Meta:
+        verbose_name = "Членство в филиале"
+        verbose_name_plural = "Членства в филиалах"
+        unique_together = (("user", "branch"),)
+        indexes = [
+            models.Index(fields=["user", "branch"]),
+            models.Index(fields=["branch", "is_primary"]),
+        ]
+
+    def __str__(self):
+        return f"{self.user.email} → {self.branch}"
+
+    def clean(self):
+        """
+        Сотрудник и филиал должны относиться к одной компании.
+        """
+        if self.user and self.branch:
+            if not self.user.company_id:
+                raise ValidationError({"user": "У сотрудника не указана компания."})
+            if self.user.company_id != self.branch.company_id:
+                raise ValidationError("Сотрудник и филиал принадлежат разным компаниям.")

@@ -1,6 +1,9 @@
 # serializers.py
 from django.contrib.auth import get_user_model
+from django.db import models
+from django.db.models import Q
 from rest_framework import serializers
+from django.core.exceptions import ValidationError as DjangoValidationError
 
 from .models import (
     Hotel, ConferenceRoom, Booking, ManagerAssignment,
@@ -10,68 +13,131 @@ from .models import (
 User = get_user_model()
 
 
-# ===== Общие миксины и defaults =====
-class CompanyReadOnlyMixin:
+# ===== Общий миксин company/branch (как в барбере) =====
+class CompanyBranchReadOnlyMixin:
     """
-    Проставляет company из request.user.company / request.user.owned_company
-    на create/update и делает поле company "скрытым" наружу (вместе с HiddenField ниже).
+    Делает company/branch read-only наружу и гарантированно проставляет их из контекста на create/update.
+    Порядок получения branch:
+      1) user.primary_branch() / user.primary_branch
+      2) request.branch (если проставлен)
+      3) None (глобальная запись компании)
     """
+
+    def _auto_branch(self):
+        request = self.context.get("request")
+        if not request:
+            return None
+        user = getattr(request, "user", None)
+        user_company_id = getattr(user, "company_id", None) or getattr(getattr(user, "owned_company", None), "id", None)
+
+        # 1) primary_branch: метод или поле
+        primary = getattr(user, "primary_branch", None)
+        if callable(primary):
+            try:
+                val = primary()
+                if val and (user_company_id is None or val.company_id == user_company_id):
+                    return val
+            except Exception:
+                pass
+        if primary and getattr(primary, "company_id", None) == user_company_id:
+            return primary
+
+        # 2) request.branch из middleware
+        if hasattr(request, "branch"):
+            b = getattr(request, "branch")
+            if b and getattr(b, "company_id", None) == user_company_id:
+                return b
+
+        # 3) глобально
+        return None
+
     def create(self, validated_data):
-        request = self.context.get('request')
-        if request and request.user and getattr(request.user, "is_authenticated", False):
-            user_company = getattr(request.user, "company", None) \
-                           or getattr(request.user, "owned_company", None)
+        request = self.context.get("request")
+        if request:
+            user = getattr(request, "user", None)
+            user_company = getattr(user, "company", None) or getattr(user, "owned_company", None)
             if user_company:
-                validated_data['company'] = user_company
+                validated_data["company"] = user_company
+            # проставляем branch, если смогли определить; иначе оставляем None (глобально)
+            auto_branch = self._auto_branch()
+            validated_data["branch"] = auto_branch if auto_branch is not None else None
         return super().create(validated_data)
 
     def update(self, instance, validated_data):
-        request = self.context.get('request')
-        if request and request.user and getattr(request.user, "is_authenticated", False):
-            user_company = getattr(request.user, "company", None) \
-                           or getattr(request.user, "owned_company", None)
+        request = self.context.get("request")
+        if request:
+            user = getattr(request, "user", None)
+            user_company = getattr(user, "company", None) or getattr(user, "owned_company", None)
             if user_company:
-                validated_data['company'] = user_company
+                validated_data["company"] = user_company
+            auto_branch = self._auto_branch()
+            # ВАЖНО: если филиал не определён, не перетираем существующий branch
+            if auto_branch is not None:
+                validated_data["branch"] = auto_branch
         return super().update(instance, validated_data)
 
 
-class CurrentCompanyDefault:
-    """Автоматически подставляет компанию текущего пользователя в HiddenField."""
-    requires_context = True
-    def __call__(self, serializer_field):
-        request = serializer_field.context.get("request")
-        user = getattr(request, "user", None)
-        if user and getattr(user, "is_authenticated", False):
-            return getattr(user, "company", None) or getattr(user, "owned_company", None)
-        return None
+# ====== helpers для сужения queryset по company/branch ======
+def _scope_queryset_by_context(qs, serializer):
+    request = serializer.context.get("request")
+    if not request:
+        return qs.none()
+    user = getattr(request, "user", None)
+    company_id = getattr(user, "company_id", None) or getattr(getattr(user, "owned_company", None), "id", None)
+    if not company_id:
+        return qs.none()
+    # определяем активный филиал так же, как миксин
+    branch = None
+    cbm = serializer if hasattr(serializer, "_auto_branch") else None
+    if cbm:
+        branch = cbm._auto_branch()
+    else:
+        branch = getattr(request, "branch", None)
+    qs = qs.filter(company_id=company_id)
+    if hasattr(qs.model, "branch"):
+        if branch is not None:
+            qs = qs.filter(Q(branch=branch) | Q(branch__isnull=True))
+        else:
+            qs = qs.filter(branch__isnull=True)
+    return qs
 
 
 # ===== Hotel / Bed / Room =====
-class HotelSerializer(CompanyReadOnlyMixin, serializers.ModelSerializer):
-    company = serializers.HiddenField(default=CurrentCompanyDefault())
+class HotelSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
+    company = serializers.ReadOnlyField(source="company.id")
+    branch = serializers.ReadOnlyField(source="branch.id")
 
     class Meta:
         model = Hotel
-        fields = ["id", "company", "name", "capacity", "description", "price"]
+        fields = ["id", "company", "branch", "name", "capacity", "description", "price"]
+        read_only_fields = ["id", "company", "branch"]
+
+    def validate(self, attrs):
+        # model.clean() добьёт компанию↔филиал; здесь ничего спец. не нужно
+        return attrs
 
 
-class BedSerializer(CompanyReadOnlyMixin, serializers.ModelSerializer):
-    company = serializers.HiddenField(default=CurrentCompanyDefault())
+class BedSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
+    company = serializers.ReadOnlyField(source="company.id")
+    branch = serializers.ReadOnlyField(source="branch.id")
 
     class Meta:
         model = Bed
-        fields = ["id", "company", "name", "capacity", "description", "price"]
+        fields = ["id", "company", "branch", "name", "capacity", "description", "price"]
+        read_only_fields = ["id", "company", "branch"]
 
 
-class RoomSerializer(CompanyReadOnlyMixin, serializers.ModelSerializer):
-    company = serializers.HiddenField(default=CurrentCompanyDefault())
+class RoomSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
+    company = serializers.ReadOnlyField(source="company.id")
+    branch = serializers.ReadOnlyField(source="branch.id")
 
     class Meta:
         model = ConferenceRoom
-        fields = ["id", "company", "name", "capacity", "location", "price"]
+        fields = ["id", "company", "branch", "name", "capacity", "location", "price"]
+        read_only_fields = ["id", "company", "branch"]
 
 
-# ===== Booking (короткая карточка для вложенного чтения у клиента) =====
+# ===== Booking (короткая карточка) =====
 class BookingBriefSerializer(serializers.ModelSerializer):
     resource = serializers.SerializerMethodField()
 
@@ -88,57 +154,67 @@ class BookingBriefSerializer(serializers.ModelSerializer):
             return f"Bed: {obj.bed.name}"
         return "—"
 
+
 class BookingHistoryBriefSerializer(serializers.ModelSerializer):
     resource = serializers.SerializerMethodField()
 
     class Meta:
         model = BookingHistory
-        fields = [
-            "id",
-            "resource",
-            "target_price",
-            "start_time",
-            "end_time",
-            "purpose",
-            "archived_at",
-        ]
+        fields = ["id", "resource", "target_price", "start_time", "end_time", "purpose", "archived_at"]
 
     def get_resource(self, obj):
         type_map = {"hotel": "Hotel", "room": "Room", "bed": "Bed"}
         kind = type_map.get(obj.target_type, "—")
         return f"{kind}: {obj.target_name}" if obj.target_name else kind
-    
+
+
 # ===== Booking =====
-class BookingSerializer(CompanyReadOnlyMixin, serializers.ModelSerializer):
-    company = serializers.HiddenField(default=CurrentCompanyDefault())
-    client = serializers.PrimaryKeyRelatedField(
-        queryset=BookingClient.objects.all(),
-        required=False,
-        allow_null=True
-    )
+class BookingSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
+    company = serializers.ReadOnlyField(source="company.id")
+    branch = serializers.ReadOnlyField(source="branch.id")
+
+    client = serializers.PrimaryKeyRelatedField(queryset=BookingClient.objects.all(), required=False, allow_null=True)
 
     class Meta:
         ref_name = 'BookingBooking'
         model = Booking
         fields = [
-            "id", "company",
+            "id", "company", "branch",
             "hotel", "room", "bed",
             "client",
             "start_time", "end_time",
             "purpose",
         ]
+        read_only_fields = ["id", "company", "branch"]
 
+    # сузим связанные PK по company/branch (как в барбере)
+    def get_fields(self):
+        fields = super().get_fields()
+        fields["client"].queryset = _scope_queryset_by_context(BookingClient.objects.all(), self)
+        fields["hotel"] = serializers.PrimaryKeyRelatedField(
+            queryset=_scope_queryset_by_context(Hotel.objects.all(), self), required=False, allow_null=True
+        )
+        fields["room"] = serializers.PrimaryKeyRelatedField(
+            queryset=_scope_queryset_by_context(ConferenceRoom.objects.all(), self), required=False, allow_null=True
+        )
+        fields["bed"] = serializers.PrimaryKeyRelatedField(
+            queryset=_scope_queryset_by_context(Bed.objects.all(), self), required=False, allow_null=True
+        )
+        return fields
 
     def validate(self, attrs):
         """
         - выбран ровно один из hotel/room/bed;
         - все связанные объекты принадлежат компании пользователя;
-        - корректный временной интервал.
+        - клиент/ресурс — глобальные или из текущего филиала;
+        - корректный временной интервал;
+        - прогоняем model.clean().
         """
         request = self.context.get("request")
         user_company = getattr(getattr(request, "user", None), "company", None) \
                        or getattr(getattr(request, "user", None), "owned_company", None)
         company_id = getattr(user_company, "id", None)
+        target_branch = self._auto_branch()
 
         hotel  = attrs.get("hotel")  or getattr(self.instance, "hotel", None)
         room   = attrs.get("room")   or getattr(self.instance, "room", None)
@@ -148,9 +224,7 @@ class BookingSerializer(CompanyReadOnlyMixin, serializers.ModelSerializer):
         # --- Ровно один из hotel/room/bed ---
         chosen = [x for x in (hotel, room, bed) if x]
         if len(chosen) != 1:
-            raise serializers.ValidationError(
-                "Выберите либо гостиницу, либо комнату, либо койко-место, но не несколько сразу."
-            )
+            raise serializers.ValidationError("Выберите либо гостиницу, либо комнату, либо койко-место (ровно одно).")
 
         # --- Компания должна совпадать ---
         if company_id:
@@ -163,115 +237,154 @@ class BookingSerializer(CompanyReadOnlyMixin, serializers.ModelSerializer):
             if client and client.company_id != company_id:
                 raise serializers.ValidationError({"client": "Клиент из другой компании."})
 
+        # --- Филиал: ресурс/клиент — глобальные или текущего филиала ---
+        if target_branch is not None:
+            tb_id = target_branch.id
+            if hotel and hotel.branch_id not in (None, tb_id):
+                raise serializers.ValidationError({"hotel": "Отель принадлежит другому филиалу."})
+            if room and room.branch_id not in (None, tb_id):
+                raise serializers.ValidationError({"room": "Комната принадлежит другому филиалу."})
+            if bed and bed.branch_id not in (None, tb_id):
+                raise serializers.ValidationError({"bed": "Койка принадлежит другому филиалу."})
+            if client and client.branch_id not in (None, tb_id):
+                raise serializers.ValidationError({"client": "Клиент принадлежит другому филиалу."})
+
         # --- Интервал времени ---
         start = attrs.get("start_time") or getattr(self.instance, "start_time", None)
         end   = attrs.get("end_time")   or getattr(self.instance, "end_time", None)
         if start and end and end <= start:
             raise serializers.ValidationError({"end_time": "Время окончания должно быть позже времени начала."})
 
+        # Прогоняем model.clean() на временном экземпляре
+        temp_kwargs = {**attrs}
+        if user_company is not None:
+            temp_kwargs.setdefault("company", user_company)
+        temp_kwargs.setdefault("branch", target_branch)
+        inst = Booking(**temp_kwargs)
+        if self.instance:
+            inst.id = self.instance.id
+        try:
+            inst.clean()
+        except DjangoValidationError as e:
+            if hasattr(e, "message_dict"):
+                raise serializers.ValidationError(e.message_dict)
+            if hasattr(e, "messages"):
+                raise serializers.ValidationError({"detail": e.messages})
+            raise serializers.ValidationError({"detail": str(e)})
         return attrs
 
 
-# ===== BookingClient (с вложенными бронированиями для просмотра) =====
-class BookingClientSerializer(CompanyReadOnlyMixin, serializers.ModelSerializer):
-    company = serializers.HiddenField(default=CurrentCompanyDefault())
+# ===== BookingClient (с вложенными бронированиями/историей) =====
+class BookingClientSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
+    company = serializers.ReadOnlyField(source="company.id")
+    branch = serializers.ReadOnlyField(source="branch.id")
+
     bookings = BookingBriefSerializer(many=True, read_only=True)
-    history = BookingHistoryBriefSerializer(many=True, read_only=True, source="booking_history")  # <-- NEW
+    history = BookingHistoryBriefSerializer(many=True, read_only=True, source="booking_history")
 
     class Meta:
         model = BookingClient
-        fields = ["id", "company", "phone", "name", "text", "bookings", "history"]  # <-- history добавили
+        fields = ["id", "company", "branch", "phone", "name", "text", "bookings", "history"]
+        read_only_fields = ["id", "company", "branch", "bookings", "history"]
 
+    def validate_phone(self, value):
+        # простая нормализация (как пожелание)
+        if not value:
+            return value
+        return ''.join(ch for ch in value if ch.isdigit() or ch == '+')
 
 
 # ===== ManagerAssignment =====
-class ManagerAssignmentSerializer(CompanyReadOnlyMixin, serializers.ModelSerializer):
-    company = serializers.HiddenField(default=CurrentCompanyDefault())
+class ManagerAssignmentSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
+    company = serializers.ReadOnlyField(source="company.id")
+    # у ManagerAssignment нет branch поля → оставляем как есть
 
     class Meta:
         model = ManagerAssignment
         fields = ["id", "company", "room", "manager"]
+        read_only_fields = ["id", "company"]
+
+    def get_fields(self):
+        fields = super().get_fields()
+        fields["room"].queryset = _scope_queryset_by_context(ConferenceRoom.objects.all(), self)
+        # менеджеры обычно фильтруются по company:
+        fields["manager"].queryset = User.objects.all()
+        request = self.context.get("request")
+        if request and getattr(request.user, "company_id", None):
+            fields["manager"].queryset = User.objects.filter(company_id=request.user.company_id)
+        return fields
 
     def validate(self, attrs):
         request = self.context.get("request")
-        user_company = getattr(getattr(request, "user", None), "company", None) \
-                       or getattr(getattr(request, "user", None), "owned_company", None)
-        company_id = getattr(user_company, "id", None)
-
+        user_company_id = getattr(getattr(request, "user", None), "company_id", None) \
+                          or getattr(getattr(getattr(request, "user", None), "owned_company", None), "id", None)
         room = attrs.get("room") or getattr(self.instance, "room", None)
         manager = attrs.get("manager") or getattr(self.instance, "manager", None)
-
-        if company_id:
-            if room and room.company_id != company_id:
+        if user_company_id:
+            if room and room.company_id != user_company_id:
                 raise serializers.ValidationError({"room": "Комната из другой компании."})
-            if manager and getattr(manager, "company_id", None) and manager.company_id != company_id:
+            if manager and getattr(manager, "company_id", None) != user_company_id:
                 raise serializers.ValidationError({"manager": "Пользователь из другой компании."})
         return attrs
 
 
 # ===== Folder =====
-class FolderSerializer(CompanyReadOnlyMixin, serializers.ModelSerializer):
-    # можно и HiddenField(default=CurrentCompanyDefault()), но оставим id для удобства чтения
-    company = serializers.ReadOnlyField(source='company.id')
-    parent = serializers.PrimaryKeyRelatedField(
-        queryset=Folder.objects.all(), allow_null=True, required=False
-    )
-    parent_name = serializers.CharField(source='parent.name', read_only=True)
+class FolderSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
+    company = serializers.ReadOnlyField(source="company.id")
+    branch = serializers.ReadOnlyField(source="branch.id")
+    parent = serializers.PrimaryKeyRelatedField(queryset=Folder.objects.all(), allow_null=True, required=False)
+    parent_name = serializers.CharField(source="parent.name", read_only=True)
 
     class Meta:
         model = Folder
-        fields = ['id', 'company', 'name', 'parent', 'parent_name']
-        read_only_fields = ['id', 'company', 'parent_name']
+        fields = ["id", "company", "branch", "name", "parent", "parent_name"]
+        read_only_fields = ["id", "company", "branch", "parent_name"]
+
+    def get_fields(self):
+        fields = super().get_fields()
+        fields["parent"].queryset = _scope_queryset_by_context(Folder.objects.all(), self)
+        return fields
 
     def validate_parent(self, parent):
-        """Родительская папка (если указана) должна принадлежать той же компании."""
         if parent is None:
             return parent
-        request = self.context.get('request')
-        user_company = getattr(getattr(request, "user", None), "company", None) \
-                       or getattr(getattr(request, "user", None), "owned_company", None)
-        user_company_id = getattr(user_company, "id", None)
-        if user_company_id and parent.company_id != user_company_id:
-            raise serializers.ValidationError('Родительская папка принадлежит другой компании.')
+        # остальное добьёт model.clean()
         return parent
 
 
 # ===== Document =====
-class DocumentSerializer(CompanyReadOnlyMixin, serializers.ModelSerializer):
-    company = serializers.ReadOnlyField(source='company.id')
-    folder_name = serializers.CharField(source='folder.name', read_only=True)
+class DocumentSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
+    company = serializers.ReadOnlyField(source="company.id")
+    branch = serializers.ReadOnlyField(source="branch.id")
+    folder_name = serializers.CharField(source="folder.name", read_only=True)
 
     class Meta:
         model = Document
-        fields = [
-            'id', 'company', 'name', 'file',
-            'folder', 'folder_name',
-            'created_at', 'updated_at'
-        ]
-        read_only_fields = ['id', 'company', 'created_at', 'updated_at', 'folder_name']
+        fields = ["id", "company", "branch", "name", "file", "folder", "folder_name", "created_at", "updated_at"]
+        read_only_fields = ["id", "company", "branch", "created_at", "updated_at", "folder_name"]
+
+    def get_fields(self):
+        fields = super().get_fields()
+        fields["folder"].queryset = _scope_queryset_by_context(Folder.objects.all(), self)
+        return fields
 
     def validate_folder(self, folder):
-        """Папка должна принадлежать компании пользователя."""
-        request = self.context.get('request')
-        user_company = getattr(getattr(request, "user", None), "company", None) \
-                       or getattr(getattr(request, "user", None), "owned_company", None)
-        user_company_id = getattr(user_company, "id", None)
-        folder_company_id = getattr(folder, "company_id", None)
-        if folder_company_id and user_company_id and folder_company_id != user_company_id:
-            raise serializers.ValidationError('Папка принадлежит другой компании.')
+        # остальную согласованность проверит model.clean()
         return folder
 
 
+# ===== BookingHistory (read-only) =====
 class BookingHistorySerializer(serializers.ModelSerializer):
     company = serializers.ReadOnlyField(source="company.id")
     client_name = serializers.CharField(source="client.name", read_only=True)
     client_phone = serializers.CharField(source="client.phone", read_only=True)
     resource = serializers.SerializerMethodField()
+    branch = serializers.ReadOnlyField(source="branch.id")
 
     class Meta:
         model = BookingHistory
         fields = [
-            "id", "company",
+            "id", "company", "branch",
             "original_booking_id",
             "target_type", "resource", "target_name", "target_price",
             "hotel", "room", "bed",
@@ -279,7 +392,7 @@ class BookingHistorySerializer(serializers.ModelSerializer):
             "start_time", "end_time", "purpose",
             "archived_at",
         ]
-        read_only_fields = fields  # историю создаёт сигнал, менять ничего не нужно
+        read_only_fields = fields  # историю создаёт сигнал
 
     def get_resource(self, obj):
         type_map = {"hotel": "Hotel", "room": "Room", "bed": "Bed"}
