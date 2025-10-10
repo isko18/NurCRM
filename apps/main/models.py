@@ -1075,7 +1075,7 @@ class WarehouseEvent(models.Model):
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False, verbose_name='ID события')
     warehouse = models.ForeignKey(Warehouse, on_delete=models.CASCADE, related_name='events', verbose_name='Склад')
-    company = models.ForeignKey(Company, on_delete=models.CASCADE, related_name='warehouse_events', verbose_name='Компания')
+    company = models.ForeignKey(Company, on_delete=models.CASCADE, null=True, blank=True,related_name='warehouse_events', verbose_name='Компания')
     branch = models.ForeignKey(
         Branch, on_delete=models.CASCADE, related_name='crm_warehouse_events',
         null=True, blank=True, db_index=True, verbose_name='Филиал'
