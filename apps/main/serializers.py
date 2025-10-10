@@ -19,87 +19,92 @@ from apps.users.models import User, Company
 
 
 # ===========================
-# Общий миксин: company/branch (как в barber)
+# Общие утилиты (STRICT branch)
 # ===========================
-class CompanyBranchReadOnlyMixin:
+def _company_from_ctx(serializer: serializers.Serializer):
+    req = serializer.context.get("request")
+    return getattr(getattr(req, "user", None), "company", None) if req else None
+
+def _active_branch(serializer: serializers.Serializer):
     """
-    Делает company/branch read-only наружу и гарантированно проставляет их из контекста на create/update.
-    Порядок получения branch:
-      1) user.primary_branch (свойство или метод, если есть)
-      2) request.branch (если положил middleware)
-      3) None (глобальная запись компании)
+    Активный филиал:
+      1) user.primary_branch() / user.primary_branch
+      2) request.branch
+      3) None (глобальный контекст)
     """
-
-    def _request(self):
-        return self.context.get("request")
-
-    def _user(self):
-        req = self._request()
-        return getattr(req, "user", None) if req else None
-
-    def _user_company(self):
-        user = self._user()
-        return getattr(user, "company", None) or getattr(user, "owned_company", None)
-
-    def _auto_branch(self):
-        request = self._request()
-        if not request:
-            return None
-        user = self._user()
-
-        primary = getattr(user, "primary_branch", None)
-        if callable(primary):
-            try:
-                val = primary()
-                if val:
-                    return val
-            except Exception:
-                pass
-        if primary:
-            return primary
-
-        if hasattr(request, "branch"):
-            return request.branch
-
+    req = serializer.context.get("request")
+    if not req:
         return None
+    user = getattr(req, "user", None)
 
-    def _global_or_branch(self, qs, branch):
-        if branch is None:
-            return qs.filter(branch__isnull=True)
-        return qs.filter(Q(branch__isnull=True) | Q(branch=branch))
+    primary = getattr(user, "primary_branch", None)
+    if callable(primary):
+        try:
+            val = primary()
+            if val:
+                return val
+        except Exception:
+            pass
+    if primary:
+        return primary
+    if hasattr(req, "branch"):
+        return req.branch
+    return None
 
-    def create(self, validated_data):
-        company = self._user_company()
-        if company:
-            validated_data.setdefault("company", company)
-        # если у модели есть поле branch (присутствует в Meta.fields) — подставим активный
-        if "branch" in getattr(self.Meta, "fields", []):
-            validated_data["branch"] = self._auto_branch()
-        return super().create(validated_data)
-
-    def update(self, instance, validated_data):
-        company = self._user_company()
-        if company:
-            validated_data["company"] = company
-        if "branch" in getattr(self.Meta, "fields", []):
-            validated_data["branch"] = self._auto_branch()
-        return super().update(instance, validated_data)
-
-
-def restrict_pk_queryset(field, base_qs, company, branch):
+def _restrict_pk_queryset_strict(field, base_qs, company, branch):
     """
-    Ограничивает queryset для PK-полей:
-      - по company (если у целевой модели есть поле company)
-      - по branch (если у целевой модели есть поле branch): допускаем глобальные (NULL) и текущий филиал
+    Сужение queryset для PK-полей по строгому правилу:
+      - по company (если у модели есть поле company)
+      - по branch (если у модели есть поле branch):
+           если branch задан → branch == active_branch
+           иначе → branch IS NULL (только глобальные)
     """
-    if base_qs is None or company is None or field is None:
+    if not field or base_qs is None or company is None:
         return
     qs = base_qs
     if hasattr(base_qs.model, "company"):
         qs = qs.filter(company=company)
     if hasattr(base_qs.model, "branch"):
-        qs = qs.filter(Q(branch__isnull=True) | Q(branch=branch)) if branch else qs.filter(branch__isnull=True)
+        qs = qs.filter(branch=branch) if branch else qs.filter(branch__isnull=True)
     field.queryset = qs
+
+
+# ===========================
+# Общий миксин: company/branch
+# ===========================
+class CompanyBranchReadOnlyMixin:
+    """
+    Делает company/branch read-only наружу и проставляет их из контекста на create/update.
+    Правило:
+      - есть активный филиал → branch = этот филиал
+      - нет филиала → branch = NULL (глобально)
+    """
+    def _user(self):
+        req = self.context.get("request")
+        return getattr(req, "user", None) if req else None
+
+    def _user_company(self):
+        u = self._user()
+        return getattr(u, "company", None) or getattr(u, "owned_company", None)
+
+    def _auto_branch(self):
+        return _active_branch(self)
+
+    def create(self, validated_data):
+        user = self._user()
+        if user and getattr(user, "company_id", None):
+            validated_data.setdefault("company", user.company)
+        if "branch" in getattr(self.Meta, "fields", []):
+            validated_data["branch"] = self._auto_branch()
+        return super().create(validated_data)
+
+    def update(self, instance, validated_data):
+        user = self._user()
+        if user and getattr(user, "company_id", None):
+            validated_data["company"] = user.company
+        if "branch" in getattr(self.Meta, "fields", []):
+            validated_data["branch"] = self._auto_branch()
+        return super().update(instance, validated_data)
 
 
 # ===========================
@@ -118,7 +123,7 @@ class BidSerializers(serializers.ModelSerializer):
 
 
 # ===========================
-# ProductCategory / ProductBrand (company/branch)
+# ProductCategory / ProductBrand (STRICT)
 # ===========================
 class ProductCategorySerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
     company = serializers.ReadOnlyField(source="company.id")
@@ -139,7 +144,7 @@ class ProductCategorySerializer(CompanyBranchReadOnlyMixin, serializers.ModelSer
         super().__init__(*args, **kwargs)
         comp = self._user_company()
         br = self._auto_branch()
-        restrict_pk_queryset(self.fields.get("parent"), ProductCategory.objects.all(), comp, br)
+        _restrict_pk_queryset_strict(self.fields.get("parent"), ProductCategory.objects.all(), comp, br)
 
 
 class ProductBrandSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
@@ -161,7 +166,7 @@ class ProductBrandSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerial
         super().__init__(*args, **kwargs)
         comp = self._user_company()
         br = self._auto_branch()
-        restrict_pk_queryset(self.fields.get("parent"), ProductBrand.objects.all(), comp, br)
+        _restrict_pk_queryset_strict(self.fields.get("parent"), ProductBrand.objects.all(), comp, br)
 
 
 # ===========================
@@ -224,24 +229,38 @@ class DealSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
         super().__init__(*args, **kwargs)
         comp = self._user_company()
         br = self._auto_branch()
-        restrict_pk_queryset(self.fields.get("pipeline"), Pipeline.objects.all(), comp, br)
-        restrict_pk_queryset(self.fields.get("contact"), Contact.objects.all(), comp, br)
+        _restrict_pk_queryset_strict(self.fields.get("pipeline"), Pipeline.objects.all(), comp, br)
+        _restrict_pk_queryset_strict(self.fields.get("contact"), Contact.objects.all(), comp, br)
         if comp and self.fields.get("assigned_to"):
             self.fields["assigned_to"].queryset = User.objects.filter(company=comp)
 
     def validate(self, attrs):
         user = self.context['request'].user
         company = user.company
+        branch = self._auto_branch()
+
         pipeline = attrs.get('pipeline') or getattr(self.instance, "pipeline", None)
         contact = attrs.get('contact') or getattr(self.instance, "contact", None)
         assigned_to = attrs.get('assigned_to') or getattr(self.instance, "assigned_to", None)
 
         if pipeline and pipeline.company != company:
-            raise serializers.ValidationError("Воронка принадлежит другой компании.")
+            raise serializers.ValidationError({"pipeline": "Воронка принадлежит другой компании."})
         if contact and contact.company != company:
-            raise serializers.ValidationError("Контакт принадлежит другой компании.")
+            raise serializers.ValidationError({"contact": "Контакт принадлежит другой компании."})
         if assigned_to and assigned_to.company != company:
-            raise serializers.ValidationError("Ответственный не из вашей компании.")
+            raise serializers.ValidationError({"assigned_to": "Ответственный не из вашей компании."})
+
+        # STRICT: филиал должен совпадать с активным, либо быть NULL, если филиал не выбран
+        if branch is not None:
+            if pipeline and pipeline.branch_id != branch.id:
+                raise serializers.ValidationError({"pipeline": "Воронка другого филиала."})
+            if contact and contact.branch_id != branch.id:
+                raise serializers.ValidationError({"contact": "Контакт другого филиала."})
+        else:
+            if pipeline and pipeline.branch_id is not None:
+                raise serializers.ValidationError({"pipeline": "Воронка не должна быть привязана к филиалу."})
+            if contact and contact.branch_id is not None:
+                raise serializers.ValidationError({"contact": "Контакт не должен быть привязан к филиалу."})
         return attrs
 
 
@@ -268,7 +287,7 @@ class TaskSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
         br = self._auto_branch()
         if comp and self.fields.get("assigned_to"):
             self.fields["assigned_to"].queryset = User.objects.filter(company=comp)
-        restrict_pk_queryset(self.fields.get("deal"), Deal.objects.all(), comp, br)
+        _restrict_pk_queryset_strict(self.fields.get("deal"), Deal.objects.all(), comp, br)
 
 
 # ===========================
@@ -307,24 +326,14 @@ class OrderItemSerializer(serializers.ModelSerializer):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        # ограничим товары компанией/филиалом
         req = self.context.get("request")
         user = getattr(req, "user", None) if req else None
         comp = getattr(user, "company", None)
-        br = None
-        primary = getattr(user, "primary_branch", None) if user else None
-        if callable(primary):
-            try:
-                br = primary() or None
-            except Exception:
-                br = None
-        elif primary:
-            br = primary
-        elif hasattr(req, "branch"):
-            br = getattr(req, "branch")
+        br = _active_branch(self)
         if comp and self.fields.get("product"):
             qs = Product.objects.filter(company=comp)
-            qs = qs.filter(Q(branch__isnull=True) | Q(branch=br)) if br else qs.filter(branch__isnull=True)
+            # STRICT
+            qs = qs.filter(branch=br) if br else qs.filter(branch__isnull=True)
             self.fields["product"].queryset = qs
 
     def validate(self, data):
@@ -342,11 +351,9 @@ class OrderItemSerializer(serializers.ModelSerializer):
         price = product.price
         total = price * quantity
 
-        # Списание товара
         product.quantity -= quantity
         product.save()
 
-        # company/branch подставляем из связанного заказа
         order = validated_data['order']
         company = order.company
         branch = getattr(order, "branch", None)
@@ -383,7 +390,6 @@ class OrderSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
         return obj.total
 
     def get_total_quantity(self, obj):
-        # в модели нет поля total_quantity — посчитаем по факту
         return sum((it.quantity for it in obj.items.all()), 0)
 
     def create(self, validated_data):
@@ -463,18 +469,16 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
         super().__init__(*args, **kwargs)
         comp = self._user_company()
         br = self._auto_branch()
-        restrict_pk_queryset(self.fields.get("item_make_ids"), ItemMake.objects.all(), comp, br)
-        restrict_pk_queryset(self.fields.get("client"), Client.objects.all(), comp, br)
+        _restrict_pk_queryset_strict(self.fields.get("item_make_ids"), ItemMake.objects.all(), comp, br)
+        _restrict_pk_queryset_strict(self.fields.get("client"), Client.objects.all(), comp, br)
 
     def get_created_by_name(self, obj):
         u = getattr(obj, "created_by", None)
         if not u:
             return None
-        return (
-            getattr(u, "get_full_name", lambda: "")()
-            or getattr(u, "email", None)
-            or getattr(u, "username", None)
-        )
+        return (getattr(u, "get_full_name", lambda: "")()
+                or getattr(u, "email", None)
+                or getattr(u, "username", None))
 
     def get_date(self, obj):
         dt = getattr(obj, "date", None)
@@ -502,6 +506,7 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
     def create(self, validated_data):
         item_make_data = validated_data.pop("item_make_ids", [])
         company = self._user_company()
+        branch = self._auto_branch()
 
         client = validated_data.pop("client", None)
         brand_name = (validated_data.pop("brand_name", "") or "").strip()
@@ -524,7 +529,7 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
 
         product = Product.objects.create(
             company=company,
-            branch=self._auto_branch(),
+            branch=branch,  # STRICT
             name=gp.name,
             barcode=gp.barcode,
             brand=brand,
@@ -546,6 +551,7 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
     @transaction.atomic
     def update(self, instance, validated_data):
         company = self._user_company()
+        branch = self._auto_branch()
         brand_name = (validated_data.pop("brand_name", "") or "").strip()
         category_name = (validated_data.pop("category_name", "") or "").strip()
 
@@ -557,6 +563,9 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
         item_make_data = validated_data.pop("item_make_ids", None)
         if item_make_data is not None:
             instance.item_make.set(item_make_data)
+
+        # STRICT: фиксируем branch из контекста
+        instance.branch = branch
 
         for field in ("barcode", "quantity", "price", "purchase_price", "client", "status"):
             if field in validated_data:
@@ -594,7 +603,6 @@ class NotificationSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerial
         read_only_fields = ['id', 'company', 'branch', 'created_at']
 
     def create(self, validated_data):
-        # user обязателен в модели — проставим
         user = self._user()
         if user:
             validated_data.setdefault("user", user)
@@ -611,7 +619,7 @@ class UserShortSerializer(serializers.ModelSerializer):
 
 
 # ===========================
-# Event (company/branch)
+# Event (STRICT branch только по company для участников)
 # ===========================
 class EventSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
     company = serializers.ReadOnlyField(source='company.id')
@@ -684,6 +692,7 @@ class WarehouseEventSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSeri
     )
     participants_detail = serializers.StringRelatedField(source='participants', many=True, read_only=True)
     responsible_person = serializers.PrimaryKeyRelatedField(queryset=User.objects.all(), allow_null=True)
+    warehouse = serializers.PrimaryKeyRelatedField(queryset=Warehouse.objects.all())
 
     class Meta:
         model = WarehouseEvent
@@ -701,7 +710,7 @@ class WarehouseEventSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSeri
         br = self._auto_branch()
         if comp:
             self.fields["participants"].queryset = User.objects.filter(company=comp)
-            restrict_pk_queryset(self.fields.get("warehouse"), Warehouse.objects.all(), comp, br)
+            _restrict_pk_queryset_strict(self.fields.get("warehouse"), Warehouse.objects.all(), comp, br)
             if self.fields.get("responsible_person"):
                 self.fields["responsible_person"].queryset = User.objects.filter(company=comp)
 
@@ -815,15 +824,24 @@ class ClientDealSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializ
         super().__init__(*args, **kwargs)
         comp = self._user_company()
         br = self._auto_branch()
-        restrict_pk_queryset(self.fields.get("client"), Client.objects.all(), comp, br)
+        _restrict_pk_queryset_strict(self.fields.get("client"), Client.objects.all(), comp, br)
 
     def validate(self, attrs):
         request = self.context["request"]
         company = request.user.company
+        branch = self._auto_branch()
 
         client = attrs.get("client") or (self.instance.client if self.instance else None)
         if client and client.company_id != company.id:
             raise serializers.ValidationError({"client": "Клиент принадлежит другой компании."})
+
+        # STRICT branch
+        if branch is not None:
+            if client and client.branch_id != branch.id:
+                raise serializers.ValidationError({"client": "Клиент другого филиала."})
+        else:
+            if client and client.branch_id is not None:
+                raise serializers.ValidationError({"client": "Глобальный режим: клиент должен быть без филиала."})
 
         amount = attrs.get("amount", getattr(self.instance, "amount", None))
         prepayment = attrs.get("prepayment", getattr(self.instance, "prepayment", None))
@@ -880,20 +898,29 @@ class TransactionRecordSerializer(CompanyBranchReadOnlyMixin, serializers.ModelS
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        request = self.context.get("request")
-        user = getattr(request, "user", None)
+        req = self.context.get("request")
+        user = getattr(req, "user", None)
         company = getattr(user, "owned_company", None) or getattr(user, "company", None)
+        branch = _active_branch(self)
         if company and "department" in self.fields:
-            self.fields["department"].queryset = Department.objects.filter(company=company)
+            # STRICT по Department: только этот филиал ИЛИ глобальные при отсутствии филиала у пользователя
+            qs = Department.objects.filter(company=company)
+            qs = qs.filter(branch=branch) if branch else qs.filter(branch__isnull=True)
+            self.fields["department"].queryset = qs
 
     def validate_department(self, department):
         if department is None:
             return department
-        request = self.context.get("request")
-        user = getattr(request, "user", None)
-        company = getattr(user, "owned_company", None) or getattr(user, "company", None)
+        company = self._user_company()
+        branch = self._auto_branch()
         if company and department.company_id != company.id:
             raise serializers.ValidationError("Отдел принадлежит другой компании.")
+        if branch is not None:
+            if department.branch_id != branch.id:
+                raise serializers.ValidationError("Отдел другого филиала.")
+        else:
+            if department.branch_id is not None:
+                raise serializers.ValidationError("Глобальный режим: отдел должен быть без филиала.")
         return department
 
 
@@ -929,16 +956,26 @@ class ContractorWorkSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSeri
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        req = self.context.get("request")
-        comp = getattr(getattr(req, "user", None), "company", None) if req else None
+        comp = self._user_company()
+        br = self._auto_branch()
         if comp:
-            self.fields["department"].queryset = Department.objects.filter(company=comp)
+            qs = Department.objects.filter(company=comp)
+            qs = qs.filter(branch=br) if br else qs.filter(branch__isnull=True)
+            self.fields["department"].queryset = qs
 
     def validate(self, attrs):
         company = self._user_company()
+        branch = self._auto_branch()
         dep = attrs.get("department") or (self.instance.department if self.instance else None)
         if dep and dep.company_id != company.id:
             raise serializers.ValidationError({"department": "Отдел принадлежит другой компании."})
+        # STRICT branch
+        if branch is not None:
+            if dep and dep.branch_id != branch.id:
+                raise serializers.ValidationError({"department": "Отдел другого филиала."})
+        else:
+            if dep and dep.branch_id is not None:
+                raise serializers.ValidationError({"department": "Глобальный режим: отдел должен быть без филиала."})
 
         start = attrs.get("start_date", getattr(self.instance, "start_date", None))
         end = attrs.get("end_date", getattr(self.instance, "end_date", None))
@@ -1031,12 +1068,20 @@ class ObjectSaleSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializ
         comp = self._user_company()
         br = self._auto_branch()
         if comp and self.fields.get("client"):
-            restrict_pk_queryset(self.fields["client"], Client.objects.all(), comp, br)
+            _restrict_pk_queryset_strict(self.fields["client"], Client.objects.all(), comp, br)
 
     def validate_client(self, client):
         company = self._user_company()
+        branch = self._auto_branch()
         if client.company_id != company.id:
             raise serializers.ValidationError("Клиент принадлежит другой компании.")
+        # STRICT branch
+        if branch is not None:
+            if client.branch_id != branch.id:
+                raise serializers.ValidationError("Клиент другого филиала.")
+        else:
+            if client.branch_id is not None:
+                raise serializers.ValidationError("Глобальный режим: клиент должен быть без филиала.")
         return client
 
 
@@ -1053,7 +1098,7 @@ class BulkIdsSerializer(serializers.Serializer):
 
 
 # ===========================
-# ItemMake — плоский список с company/branch + связанные продукты (read-only)
+# ItemMake — плоский список + связанные продукты (read-only)
 # ===========================
 class ProductNestedSerializer(serializers.ModelSerializer):
     class Meta:
@@ -1074,7 +1119,6 @@ class ItemMakeSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer
             "products",
             "created_at", "updated_at",
         ]
-    # company/branch — read-only и проставляются миксином
 
 
 # ===========================
@@ -1105,7 +1149,7 @@ class ManufactureSubrealSerializer(CompanyBranchReadOnlyMixin, serializers.Model
         super().__init__(*args, **kwargs)
         comp = self._user_company()
         br = self._auto_branch()
-        restrict_pk_queryset(self.fields.get("product"), Product.objects.all(), comp, br)
+        _restrict_pk_queryset_strict(self.fields.get("product"), Product.objects.all(), comp, br)
         if comp and self.fields.get("agent"):
             self.fields["agent"].queryset = User.objects.filter(company=comp)
 
@@ -1141,9 +1185,13 @@ class AcceptanceCreateSerializer(serializers.ModelSerializer):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        comp = getattr(getattr(self.context.get("request"), "user", None), "company", None)
+        req = self.context.get("request")
+        comp = getattr(getattr(req, "user", None), "company", None)
+        br = _active_branch(self)
         if comp and self.fields.get("subreal"):
-            self.fields["subreal"].queryset = ManufactureSubreal.objects.filter(company=comp)
+            qs = ManufactureSubreal.objects.filter(company=comp)
+            qs = qs.filter(branch=br) if br else qs.filter(branch__isnull=True)
+            self.fields["subreal"].queryset = qs
 
     def validate(self, attrs):
         request = self.context.get("request")
@@ -1204,9 +1252,13 @@ class ReturnCreateSerializer(serializers.ModelSerializer):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        comp = getattr(getattr(self.context.get("request"), "user", None), "company", None)
+        req = self.context.get("request")
+        comp = getattr(getattr(req, "user", None), "company", None)
+        br = _active_branch(self)
         if comp and self.fields.get("subreal"):
-            self.fields["subreal"].queryset = ManufactureSubreal.objects.filter(company=comp)
+            qs = ManufactureSubreal.objects.filter(company=comp)
+            qs = qs.filter(branch=br) if br else qs.filter(branch__isnull=True)
+            self.fields["subreal"].queryset = qs
 
     def validate(self, attrs):
         request = self.context.get("request")
@@ -1292,22 +1344,14 @@ class BulkSubrealCreateSerializer(serializers.Serializer):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        comp = getattr(getattr(self.context.get("request"), "user", None), "company", None)
-        br = None
-        user = getattr(self.context.get("request"), "user", None)
-        if user:
-            primary = getattr(user, "primary_branch", None)
-            if callable(primary):
-                try:
-                    br = primary() or None
-                except Exception:
-                    br = None
-            elif primary:
-                br = primary
+        req = self.context.get("request")
+        comp = getattr(getattr(req, "user", None), "company", None)
+        br = _active_branch(self)
         if comp:
             self.fields["agent"].queryset = User.objects.filter(company=comp)
             prod_qs = Product.objects.filter(company=comp)
-            prod_qs = prod_qs.filter(Q(branch__isnull=True) | Q(branch=br)) if br else prod_qs.filter(branch__isnull=True)
+            # STRICT
+            prod_qs = prod_qs.filter(branch=br) if br else prod_qs.filter(branch__isnull=True)
             self.fields["items"].child.fields["product"].queryset = prod_qs
 
     def validate(self, attrs):
@@ -1327,6 +1371,7 @@ class BulkSubrealCreateSerializer(serializers.Serializer):
             if prod.company_id != company_id:
                 raise serializers.ValidationError({"items": {i: {"product": "Товар другой компании."}}})
 
+        # сжимаем дубликаты
         merged = {}
         for item in attrs["items"]:
             key = item["product"].pk
