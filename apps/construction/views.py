@@ -90,14 +90,13 @@ class CompanyBranchScopedMixin:
                 qs = qs.filter(branch__isnull=True)
         return qs
 
-    # На create/update всегда жестко ставим company/branch
+    # На create/update всегда жёстко ставим company/branch
     def _inject_company_branch_on_save(self, serializer):
         company = self._company()
         if not company:
             raise PermissionDenied("У пользователя не настроена компания.")
         br = self._active_branch()
-        # Если у модели нет поля branch — просто пропадет при save()
-        serializer.save(company=company, branch=br)
+        serializer.save(company=company, branch=br)  # если модели нет branch — поле будет проигнорировано
 
 
 # ===== DEPARTMENTS ==========================================================
@@ -151,7 +150,7 @@ class CashboxListCreateView(CompanyBranchScopedMixin, generics.ListCreateAPIView
         Валидация согласованности с department:
           - department.company == company
           - department.branch ∈ {NULL, branch}
-        Это уже проверяет сериализатор/модель, но мы держим единую точку записи.
+        Это уже проверяет сериализатор/модель.
         """
         self._inject_company_branch_on_save(serializer)
 
@@ -166,7 +165,9 @@ class CashboxDetailView(CompanyBranchScopedMixin, generics.RetrieveUpdateDestroy
 
 # ===== CASHFLOWS ============================================================
 class CashFlowListCreateView(CompanyBranchScopedMixin, generics.ListCreateAPIView):
-    queryset = CashFlow.objects.select_related("company", "branch", "cashbox", "cashbox__department", "cashbox__branch")
+    queryset = CashFlow.objects.select_related(
+        "company", "branch", "cashbox", "cashbox__department", "cashbox__branch"
+    )
     serializer_class = CashFlowSerializer
 
     def get_queryset(self):
@@ -182,7 +183,9 @@ class CashFlowListCreateView(CompanyBranchScopedMixin, generics.ListCreateAPIVie
 
 
 class CashFlowDetailView(CompanyBranchScopedMixin, generics.RetrieveUpdateDestroyAPIView):
-    queryset = CashFlow.objects.select_related("company", "branch", "cashbox", "cashbox__department", "cashbox__branch")
+    queryset = CashFlow.objects.select_related(
+        "company", "branch", "cashbox", "cashbox__department", "cashbox__branch"
+    )
     serializer_class = CashFlowSerializer
 
     def get_queryset(self):
@@ -206,12 +209,12 @@ class AssignEmployeeToDepartmentView(APIView):
         employee_id = request.data.get("employee_id")
         employee = get_object_or_404(User, id=employee_id, company=company)
 
-        # Запрет на состязание между филиалами: отдел глобальный или моего филиала
+        # Запрет на пересечение филиалов: отдел глобальный или моего филиала
         br = _get_active_branch(request)
         if br is not None and dept.branch_id not in (None, br.id):
             return Response({"detail": "Отдел принадлежит другому филиалу."}, status=400)
 
-        # Один сотрудник может состоять в нескольких отделах — если надо запретить, раскомментируй:
+        # Если нужно запретить множественные отделы — раскомментируйте:
         # if employee.departments.exists():
         #     return Response({"detail": "Пользователь уже прикреплён к другому отделу."}, status=400)
 
