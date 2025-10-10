@@ -2,7 +2,7 @@ from rest_framework import serializers
 from django.db.models import Q
 
 from apps.construction.models import Department, Cashbox, CashFlow
-from apps.users.serializers import UserListSerializer, UserWithPermissionsSerializer
+from apps.users.serializers import UserWithPermissionsSerializer
 
 
 # ───────────────────────────────────────────────────────────
@@ -19,14 +19,12 @@ class CompanyBranchReadOnlyMixin(serializers.ModelSerializer):
     company = serializers.ReadOnlyField(source="company.id")
     branch = serializers.ReadOnlyField(source="branch.id")
 
-    # ---- какой филиал реально использовать ----
     def _auto_branch(self):
         request = self.context.get("request")
         if not request:
             return None
         user = getattr(request, "user", None)
 
-        # 1) primary_branch может быть полем или методом
         primary = getattr(user, "primary_branch", None)
         if callable(primary):
             try:
@@ -38,18 +36,15 @@ class CompanyBranchReadOnlyMixin(serializers.ModelSerializer):
         if primary:
             return primary
 
-        # 2) из middleware (на будущее)
         if hasattr(request, "branch"):
             return request.branch
 
-        # 3) глобально
         return None
 
     def create(self, validated_data):
         request = self.context.get("request")
         if request and request.user and getattr(request.user, "company_id", None):
             validated_data["company"] = request.user.company
-            # branch строго из контекста (payload игнорируется)
             validated_data["branch"] = self._auto_branch()
         return super().create(validated_data)
 
@@ -83,7 +78,7 @@ class CashboxWithFlowsSerializer(CompanyBranchReadOnlyMixin):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        # Ограничим список отделов: та же компания и «глобальные или текущий филиал»
+        # Ограничим отделы: та же компания и «глобальные или текущего филиала»
         request = self.context.get('request')
         if request and getattr(request.user, 'company_id', None):
             target_branch = self._auto_branch()
@@ -98,14 +93,10 @@ class CashboxWithFlowsSerializer(CompanyBranchReadOnlyMixin):
         return obj.department.name if obj.department else None
 
     def validate(self, attrs):
-        """
-        Если активен филиал — department должен быть глобальным или этого филиала.
-        """
         dept = attrs.get('department') or getattr(self.instance, 'department', None)
         target_branch = self._auto_branch()
         if dept and target_branch is not None and dept.branch_id not in (None, getattr(target_branch, "id", None)):
             raise serializers.ValidationError('Отдел принадлежит другому филиалу.')
-        # company валидируется на уровне модели clean(), здесь лишь мягкая проверка
         request = self.context.get('request')
         if dept and request and dept.company_id != request.user.company_id:
             raise serializers.ValidationError('Отдел должен принадлежать вашей компании.')
@@ -141,6 +132,7 @@ class CashboxSerializer(CompanyBranchReadOnlyMixin):
         return obj.department.name if obj.department else None
 
     def get_analytics(self, obj):
+        # вызывает Cashbox.get_summary() из модели
         return obj.get_summary()
 
     def validate(self, attrs):
@@ -177,7 +169,7 @@ class CashFlowSerializer(CompanyBranchReadOnlyMixin):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        # Разрешаем выбирать только кассы своей компании + «глобальные или текущий филиал»
+        # Кассы своей компании + «глобальные или текущего филиала»
         request = self.context.get('request')
         if request and getattr(request.user, 'company_id', None):
             target_branch = self._auto_branch()
@@ -200,20 +192,9 @@ class CashFlowSerializer(CompanyBranchReadOnlyMixin):
 
         if cashbox and request and cashbox.company_id != request.user.company_id:
             raise serializers.ValidationError('Касса должна принадлежать вашей компании.')
-        # филиальная согласованность: касса глобальная или текущего филиала
         if cashbox and target_branch is not None and cashbox.branch_id not in (None, getattr(target_branch, "id", None)):
             raise serializers.ValidationError('Касса принадлежит другому филиалу.')
         return attrs
-
-    def create(self, validated_data):
-        """
-        company/branch ставятся миксином; модель дополнительно проверит,
-        что cashbox.company/branch совпадают с движением.
-        """
-        return super().create(validated_data)
-
-    def update(self, instance, validated_data):
-        return super().update(instance, validated_data)
 
 
 # ─── DEPARTMENT: основной ──────────────────────────────────
@@ -239,7 +220,7 @@ class DepartmentSerializer(CompanyBranchReadOnlyMixin):
         read_only_fields = ['id', 'created_at', 'company', 'branch', 'cashbox', 'employees', 'analytics']
 
     def _assign_employees_and_permissions(self, department, employees_data):
-        from apps.users.models import User  # локальный импорт во избежание циклов
+        from apps.users.models import User  # локальный импорт, чтобы избежать циклов импорта
 
         permission_fields = [
             'can_view_dashboard', 'can_view_cashbox', 'can_view_departments',
@@ -250,7 +231,7 @@ class DepartmentSerializer(CompanyBranchReadOnlyMixin):
 
             # новые
             'can_view_building_work_process', 'can_view_building_objects', 'can_view_additional_services',
-            "can_view_debts",
+            'can_view_debts',
 
             # барбершоп
             'can_view_barber_clients', 'can_view_barber_services',
@@ -278,7 +259,7 @@ class DepartmentSerializer(CompanyBranchReadOnlyMixin):
             try:
                 user = User.objects.get(id=user_id, company=department.company)
             except User.DoesNotExist:
-                continue  # или raise serializers.ValidationError
+                continue
 
             department.employees.add(user)
 
