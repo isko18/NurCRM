@@ -1,6 +1,9 @@
+from decimal import Decimal
 from django.db import models
 from django.core.exceptions import ValidationError
-import uuid, random
+from django.db.models import Sum
+import uuid
+import random
 
 from apps.users.models import Company, User, Branch
 
@@ -145,6 +148,24 @@ class Cashbox(models.Model):
             self.branch_id = self.department.branch_id
         self.full_clean()
         return super().save(*args, **kwargs)
+
+    def get_summary(self) -> dict:
+        """
+        Сводка по кассе только по утверждённым операциям (status=True),
+        раздельно по приходу/расходу.
+        """
+        qs = self.flows.filter(status=True)  # CashFlow.related_name='flows'
+        income_qs = qs.filter(type='income')
+        expense_qs = qs.filter(type='expense')
+
+        income_total = income_qs.aggregate(s=Sum('amount'))['s'] or Decimal('0')
+        expense_total = expense_qs.aggregate(s=Sum('amount'))['s'] or Decimal('0')
+
+        return {
+            'income':  {'total': income_total,  'count': income_qs.count()},
+            'expense': {'total': expense_total, 'count': expense_qs.count()},
+        }
+
 
 # ==========================
 # Движение по кассе
