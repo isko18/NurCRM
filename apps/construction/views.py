@@ -56,112 +56,60 @@ def _get_active_branch(request):
 # Базовый mixin для company + branch scope
 # ─────────────────────────────────────────────────────────────
 class CompanyBranchScopedMixin:
-    """
-    Видимость данных:
-      - нет филиала у пользователя → только глобальные записи (branch IS NULL)
-      - есть филиал у пользователя → только записи этого филиала (branch = user_branch)
-    Создание/обновление:
-      - company берётся из request.user.company/owned_company
-      - branch проставляется автоматически как выше (без участия клиента)
-    """
+    permission_classes = [permissions.IsAuthenticated]
 
-    # --- helpers ---
-    def _user(self):
-        return getattr(self.request, "user", None)
-
-    def _user_company(self):
-        user = self._user()
-        if not user or not getattr(user, "is_authenticated", False):
-            return None
-        return getattr(user, "company", None) or getattr(user, "owned_company", None)
-
-    def _user_primary_branch(self):
-        """
-        Определяем филиал сотрудника:
-          1) membership с is_primary=True
-          2) любой membership
-          3) иначе None
-        """
-        user = self._user()
-        if not user or not getattr(user, "is_authenticated", False):
-            return None
-
-        memberships = getattr(user, "branch_memberships", None)
-        if memberships is None:
-            return None
-
-        primary = memberships.filter(is_primary=True).select_related("branch").first()
-        if primary and primary.branch:
-            return primary.branch
-
-        any_member = memberships.select_related("branch").first()
-        if any_member and any_member.branch:
-            return any_member.branch
-
-        return None
-
-    def _model_has_field(self, field_name: str) -> bool:
-        model = getattr(self, "queryset", None).model
-        return field_name in {f.name for f in model._meta.get_fields()}
+    def _company(self):
+        return _get_company(getattr(self, "request", None).user)
 
     def _active_branch(self):
+        return _get_active_branch(self.request)
+
+    def _model_has_field(self, queryset, field_name: str) -> bool:
+        return field_name in {f.name for f in queryset.model._meta.get_fields()}
+
+    def _scoped_queryset(self, base_qs):
         """
-        Только автоопределение по пользователю:
-        - если есть филиал → возвращаем его и кладём в request.branch
-        - если нет → возвращаем None и кладём None
+        company: строго компания пользователя,
+        branch (если у модели есть поле):
+        - если у юзера есть активный филиал → ТОЛЬКО branch = мой филиал
+        - если филиала нет → ТОЛЬКО branch IS NULL (глобальные)
         """
-        request = self.request
-        company = self._user_company()
-        if not company:
-            setattr(request, "branch", None)
-            return None
-
-        user_branch = self._user_primary_branch()
-        if user_branch and user_branch.company_id == company.id:
-            setattr(request, "branch", user_branch)
-            return user_branch
-
-        setattr(request, "branch", None)
-        return None
-
-    # --- queryset / save hooks ---
-    def get_queryset(self):
         if getattr(self, "swagger_fake_view", False):
-            return self.queryset.none()
+            return base_qs.none()
 
-        qs = super().get_queryset()
-        company = self._user_company()
+        company = self._company()
         if not company:
-            return qs.none()
+            return base_qs.none()
 
-        qs = qs.filter(company=company)
-
-        if self._model_has_field("branch"):
-            active_branch = self._active_branch()  # None или Branch
-            if active_branch is not None:
-                # У ПОЛЬЗОВАТЕЛЯ ЕСТЬ ФИЛИАЛ → ПОКАЗЫВАЕМ ТОЛЬКО ЕГО ЗАПИСИ
-                qs = qs.filter(branch=active_branch)
+        qs = base_qs.filter(company=company)
+        if self._model_has_field(qs, "branch"):
+            br = self._active_branch()
+            if br is not None:
+                qs = qs.filter(branch=br)
             else:
-                # НЕТ ФИЛИАЛА → ТОЛЬКО ГЛОБАЛЬНЫЕ ЗАПИСИ
                 qs = qs.filter(branch__isnull=True)
-
         return qs
+    
+    # На create/update всегда жёстко ставим company/branch
+    def _inject_company_branch_on_save(self, serializer):
+        company = self._company()
+        if not company:
+            raise PermissionDenied("У пользователя не настроена компания.")
+        br = self._active_branch()
 
-    def perform_create(self, serializer):
-        company = self._user_company()
-        if self._model_has_field("branch"):
-            active_branch = self._active_branch()  # None или Branch
-            serializer.save(company=company, branch=active_branch)
+        model = getattr(getattr(serializer, "Meta", None), "model", None)
+        kwargs = {}
+        if model:
+            model_fields = {f.name for f in model._meta.get_fields()}
+            if "company" in model_fields:
+                kwargs["company"] = company
+            if "branch" in model_fields:
+                kwargs["branch"] = br
         else:
-            serializer.save(company=company)
+            # на всякий случай подставим company; branch не трогаем
+            kwargs["company"] = company
 
-    def perform_update(self, serializer):
-        company = self._user_company()
-        if self._model_has_field("branch"):
-            active_branch = self._active_branch()
-            serializer.save(company=company, branch=active_branch)
-        else:
-            serializer.save(company=company)
+        serializer.save(**kwargs)
 
 
 # ===== DEPARTMENTS ==========================================================
