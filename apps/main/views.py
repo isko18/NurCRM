@@ -101,13 +101,9 @@ class CompanyBranchRestrictedMixin:
             qs = qs.filter(company=company)
 
         if self._model_has_field(model, "branch"):
-            if branch is None:
-                qs = qs.filter(branch__isnull=True)
-            else:
-                qs = qs.filter(Q(branch__isnull=True) | Q(branch=branch))
+            qs = qs.filter(branch=branch) if branch is not None else qs.filter(branch__isnull=True)
 
         return qs
-
     def get_queryset(self):
         assert hasattr(self, "queryset") and self.queryset is not None, (
             f"{self.__class__.__name__} must define .queryset or override get_queryset()."
