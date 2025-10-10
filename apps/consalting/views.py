@@ -1,163 +1,205 @@
 from rest_framework import generics, permissions
 from rest_framework.exceptions import PermissionDenied
-from .models import ServicesConsalting, SaleConsalting, SalaryConsalting, RequestsConsalting, BookingConsalting
+
+from .models import (
+    ServicesConsalting,
+    SaleConsalting,
+    SalaryConsalting,
+    RequestsConsalting,
+    BookingConsalting,
+)
 from .serializers import (
     ServicesConsaltingSerializer,
     SaleConsaltingSerializer,
     SalaryConsaltingSerializer,
     RequestsConsaltingSerializer,
-    BookingConsaltingSerializer
+    BookingConsaltingSerializer,
 )
 
 
-def get_company_from_user(user):
-    """Безопасно получить company из user"""
-    if not user or not getattr(user, "is_authenticated", False):
-        return None
-    return getattr(user, "company", None)
+# ===== helpers =====
+def _has_field(model_cls, field_name: str) -> bool:
+    try:
+        return any(f.name == field_name for f in model_cls._meta.get_fields())
+    except Exception:
+        return False
 
 
-class CompanyScopedMixin:
+# ===== company + branch scoped mixin (как в барбере/букинге/кафе) =====
+class CompanyBranchQuerysetMixin:
     """
-    Миксин для generic views:
-    - фильтрует queryset по текущей компании
-    - безопасно для Swagger/AnonymousUser
+    Видимость данных:
+      - всегда ограничиваемся компанией пользователя
+      - если у модели есть поле branch:
+          * при активном филиале пользователя → только записи этого филиала
+          * без филиала → только глобальные записи (branch IS NULL)
+    Создание/обновление:
+      - company берём из пользователя
+      - branch автоматически из пользователя/запроса (см. _active_branch)
+    Безопасен для swagger_fake_view и анонимов.
     """
-    company_field_name = "company"
+    permission_classes = [permissions.IsAuthenticated]
 
-    def is_schema_generation(self):
-        return getattr(self, "swagger_fake_view", False)
+    # --- user/company/branch helpers ---
+    def _user(self):
+        return getattr(self.request, "user", None)
 
-    def get_company_or_raise(self):
-        if self.is_schema_generation():
+    def _user_company(self):
+        user = self._user()
+        if not user or not getattr(user, "is_authenticated", False):
             return None
-        company = get_company_from_user(getattr(self.request, "user", None))
+        # поддержка владельца и сотрудника
+        return getattr(user, "company", None) or getattr(user, "owned_company", None)
+
+    def _active_branch(self):
+        """
+        Определяем активный филиал пользователя:
+          1) user.primary_branch() как метод
+          2) user.primary_branch как свойство
+          3) request.branch (если проставляет middleware)
+          4) None (глобальная область)
+        """
+        request = getattr(self, "request", None)
+        user = self._user()
+        if not user or not getattr(user, "is_authenticated", False):
+            if request:
+                setattr(request, "branch", None)
+            return None
+
+        # 1) метод
+        primary = getattr(user, "primary_branch", None)
+        if callable(primary):
+            try:
+                val = primary()
+                if val:
+                    if request:
+                        setattr(request, "branch", val)
+                    return val
+            except Exception:
+                pass
+        # 2) свойство
+        if primary:
+            if request:
+                setattr(request, "branch", primary)
+            return primary
+
+        # 3) из middleware
+        if request and hasattr(request, "branch"):
+            return request.branch
+
+        # 4) глобально
+        if request:
+            setattr(request, "branch", None)
+        return None
+
+    # --- queryset / save hooks ---
+    def get_queryset(self):
+        if getattr(self, "swagger_fake_view", False):
+            return self.queryset.none()
+
+        qs = super().get_queryset()
+        company = self._user_company()
+        if not company:
+            return qs.none()
+
+        qs = qs.filter(company=company)
+
+        model = qs.model
+        if _has_field(model, "branch"):
+            active_branch = self._active_branch()  # None или Branch
+            if active_branch is not None:
+                qs = qs.filter(branch=active_branch)
+            else:
+                qs = qs.filter(branch__isnull=True)
+        return qs
+
+    def perform_create(self, serializer):
+        company = self._user_company()
         if not company:
             raise PermissionDenied("У пользователя не настроена компания.")
-        return company
+        if _has_field(self.get_queryset().model, "branch"):
+            serializer.save(company=company, branch=self._active_branch())
+        else:
+            serializer.save(company=company)
 
-    def filter_queryset_by_company(self, queryset):
-        if self.is_schema_generation():
-            return queryset.none()
-        company = self.get_company_or_raise()
-        return queryset.filter(**{self.company_field_name: company})
+    def perform_update(self, serializer):
+        company = self._user_company()
+        if not company:
+            raise PermissionDenied("У пользователя не настроена компания.")
+        if _has_field(self.get_queryset().model, "branch"):
+            serializer.save(company=company, branch=self._active_branch())
+        else:
+            serializer.save(company=company)
 
 
 # ==========================
 # ServicesConsalting
 # ==========================
-class ServicesConsaltingListCreateView(CompanyScopedMixin, generics.ListCreateAPIView):
+class ServicesConsaltingListCreateView(CompanyBranchQuerysetMixin, generics.ListCreateAPIView):
     queryset = ServicesConsalting.objects.all()
     serializer_class = ServicesConsaltingSerializer
-    permission_classes = [permissions.IsAuthenticated]
-
-    def get_queryset(self):
-        return self.filter_queryset_by_company(super().get_queryset())
-
-    def perform_create(self, serializer):
-        serializer.save(company=self.get_company_or_raise())
 
 
-class ServicesConsaltingRetrieveUpdateDestroyView(CompanyScopedMixin, generics.RetrieveUpdateDestroyAPIView):
+class ServicesConsaltingRetrieveUpdateDestroyView(CompanyBranchQuerysetMixin, generics.RetrieveUpdateDestroyAPIView):
     queryset = ServicesConsalting.objects.all()
     serializer_class = ServicesConsaltingSerializer
-    permission_classes = [permissions.IsAuthenticated]
-
-    def get_queryset(self):
-        return self.filter_queryset_by_company(super().get_queryset())
 
 
 # ==========================
 # SaleConsalting
 # ==========================
-class SaleConsaltingListCreateView(CompanyScopedMixin, generics.ListCreateAPIView):
-    queryset = SaleConsalting.objects.select_related('services', 'client', 'user', 'company').all()
+class SaleConsaltingListCreateView(CompanyBranchQuerysetMixin, generics.ListCreateAPIView):
+    queryset = SaleConsalting.objects.select_related("services", "client", "user", "company").all()
     serializer_class = SaleConsaltingSerializer
-    permission_classes = [permissions.IsAuthenticated]
-
-    def get_queryset(self):
-        return self.filter_queryset_by_company(super().get_queryset())
 
     def perform_create(self, serializer):
-        serializer.save(company=self.get_company_or_raise(), user=self.request.user)
+        # company/branch — миксин; user — текущий оператор
+        company = self._user_company()
+        if _has_field(self.get_queryset().model, "branch"):
+            serializer.save(company=company, branch=self._active_branch(), user=self.request.user)
+        else:
+            serializer.save(company=company, user=self.request.user)
 
 
-class SaleConsaltingRetrieveUpdateDestroyView(CompanyScopedMixin, generics.RetrieveUpdateDestroyAPIView):
-    queryset = SaleConsalting.objects.select_related('services', 'client', 'user', 'company').all()
+class SaleConsaltingRetrieveUpdateDestroyView(CompanyBranchQuerysetMixin, generics.RetrieveUpdateDestroyAPIView):
+    queryset = SaleConsalting.objects.select_related("services", "client", "user", "company").all()
     serializer_class = SaleConsaltingSerializer
-    permission_classes = [permissions.IsAuthenticated]
-
-    def get_queryset(self):
-        return self.filter_queryset_by_company(super().get_queryset())
 
 
 # ==========================
 # SalaryConsalting
 # ==========================
-class SalaryConsaltingListCreateView(CompanyScopedMixin, generics.ListCreateAPIView):
-    queryset = SalaryConsalting.objects.select_related('user', 'company').all()
+class SalaryConsaltingListCreateView(CompanyBranchQuerysetMixin, generics.ListCreateAPIView):
+    queryset = SalaryConsalting.objects.select_related("user", "company").all()
     serializer_class = SalaryConsaltingSerializer
-    permission_classes = [permissions.IsAuthenticated]
-
-    def get_queryset(self):
-        return self.filter_queryset_by_company(super().get_queryset())
-
-    def perform_create(self, serializer):
-        serializer.save(company=self.get_company_or_raise())
 
 
-class SalaryConsaltingRetrieveUpdateDestroyView(CompanyScopedMixin, generics.RetrieveUpdateDestroyAPIView):
-    queryset = SalaryConsalting.objects.select_related('user', 'company').all()
+class SalaryConsaltingRetrieveUpdateDestroyView(CompanyBranchQuerysetMixin, generics.RetrieveUpdateDestroyAPIView):
+    queryset = SalaryConsalting.objects.select_related("user", "company").all()
     serializer_class = SalaryConsaltingSerializer
-    permission_classes = [permissions.IsAuthenticated]
-
-    def get_queryset(self):
-        return self.filter_queryset_by_company(super().get_queryset())
 
 
 # ==========================
 # RequestsConsalting
 # ==========================
-class RequestsConsaltingListCreateView(CompanyScopedMixin, generics.ListCreateAPIView):
-    queryset = RequestsConsalting.objects.select_related('client', 'company').all()
+class RequestsConsaltingListCreateView(CompanyBranchQuerysetMixin, generics.ListCreateAPIView):
+    queryset = RequestsConsalting.objects.select_related("client", "company").all()
     serializer_class = RequestsConsaltingSerializer
-    permission_classes = [permissions.IsAuthenticated]
-
-    def get_queryset(self):
-        return self.filter_queryset_by_company(super().get_queryset())
-
-    def perform_create(self, serializer):
-        serializer.save(company=self.get_company_or_raise())
 
 
-class RequestsConsaltingRetrieveUpdateDestroyView(CompanyScopedMixin, generics.RetrieveUpdateDestroyAPIView):
-    queryset = RequestsConsalting.objects.select_related('client', 'company').all()
+class RequestsConsaltingRetrieveUpdateDestroyView(CompanyBranchQuerysetMixin, generics.RetrieveUpdateDestroyAPIView):
+    queryset = RequestsConsalting.objects.select_related("client", "company").all()
     serializer_class = RequestsConsaltingSerializer
-    permission_classes = [permissions.IsAuthenticated]
-
-    def get_queryset(self):
-        return self.filter_queryset_by_company(super().get_queryset())
 
 
 # ==========================
 # BookingConsalting
 # ==========================
-class BookingConsaltingListCreateView(CompanyScopedMixin, generics.ListCreateAPIView):
-    queryset = BookingConsalting.objects.select_related('employee', 'company').all()
+class BookingConsaltingListCreateView(CompanyBranchQuerysetMixin, generics.ListCreateAPIView):
+    queryset = BookingConsalting.objects.select_related("employee", "company").all()
     serializer_class = BookingConsaltingSerializer
-    permission_classes = [permissions.IsAuthenticated]
-
-    def get_queryset(self):
-        return self.filter_queryset_by_company(super().get_queryset())
-
-    def perform_create(self, serializer):
-        serializer.save(company=self.get_company_or_raise())
 
 
-class BookingConsaltingRetrieveUpdateDestroyView(CompanyScopedMixin, generics.RetrieveUpdateDestroyAPIView):
-    queryset = BookingConsalting.objects.select_related('employee', 'company').all()
+class BookingConsaltingRetrieveUpdateDestroyView(CompanyBranchQuerysetMixin, generics.RetrieveUpdateDestroyAPIView):
+    queryset = BookingConsalting.objects.select_related("employee", "company").all()
     serializer_class = BookingConsaltingSerializer
-    permission_classes = [permissions.IsAuthenticated]
-
-    def get_queryset(self):
-        return self.filter_queryset_by_company(super().get_queryset())

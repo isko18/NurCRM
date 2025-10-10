@@ -1,14 +1,15 @@
 from django.db import models
 from django.conf import settings
 from django.core.exceptions import ValidationError
+from django.db.models import Q, F
 from django.db.models.signals import pre_delete
 from django.dispatch import receiver
 from django.utils import timezone
 from django.core.files.base import ContentFile
 from PIL import Image
-import io, uuid, os
-from apps.users.models import Company
+import io, uuid
 
+from apps.users.models import Company, Branch
 
 
 # ==========================
@@ -17,24 +18,47 @@ from apps.users.models import Company
 class CafeClient(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     company = models.ForeignKey(
-        Company,
-        on_delete=models.CASCADE,
-        related_name='cafe_clients',
-        related_query_name='cafe_client',
+        Company, on_delete=models.CASCADE,
+        related_name='cafe_clients', related_query_name='cafe_client',
         verbose_name='Компания',
     )
+    # NEW: глобальный или филиальный клиент
+    branch = models.ForeignKey(
+        Branch, on_delete=models.CASCADE,
+        related_name='cafe_clients', verbose_name='Филиал',
+        null=True, blank=True, db_index=True
+    )
+
     name = models.CharField('Имя', max_length=255, blank=True)
-    phone = models.CharField('Телефон', max_length=32, blank=True)
+    phone = models.CharField('Телефон', max_length=32, blank=True, db_index=True)
     notes = models.TextField('Заметки', blank=True)
 
     class Meta:
         verbose_name = 'Клиент кафе'
         verbose_name_plural = 'Клиенты кафе'
-        unique_together = (('company', 'phone'),)
+        constraints = [
+            # телефон уникален в рамках филиала
+            models.UniqueConstraint(
+                fields=('branch', 'phone'),
+                name='uniq_cafeclient_phone_per_branch',
+                condition=Q(branch__isnull=False),
+            ),
+            # и отдельно — глобально в рамках компании
+            models.UniqueConstraint(
+                fields=('company', 'phone'),
+                name='uniq_cafeclient_phone_global_per_company',
+                condition=Q(branch__isnull=True),
+            ),
+        ]
         indexes = [
             models.Index(fields=['company', 'phone']),
+            models.Index(fields=['company', 'branch', 'phone']),
             models.Index(fields=['company', 'name']),
         ]
+
+    def clean(self):
+        if self.branch_id and self.branch.company_id != self.company_id:
+            raise ValidationError({'branch': 'Филиал принадлежит другой компании.'})
 
     def __str__(self):
         return self.name or self.phone or f'Клиент {str(self.id)[:8]}'
@@ -46,13 +70,38 @@ class CafeClient(models.Model):
 class Zone(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     company = models.ForeignKey(
-        Company, on_delete=models.CASCADE, related_name='zone', verbose_name='Компания'
+        Company, on_delete=models.CASCADE, related_name='zones', verbose_name='Компания'
+    )
+    # NEW
+    branch = models.ForeignKey(
+        Branch, on_delete=models.CASCADE, related_name='zones',
+        verbose_name='Филиал', null=True, blank=True, db_index=True
     )
     title = models.CharField(max_length=255, verbose_name="Зона")
 
     class Meta:
         verbose_name = 'Зона'
         verbose_name_plural = 'Зоны'
+        constraints = [
+            models.UniqueConstraint(
+                fields=('branch', 'title'),
+                name='uniq_zone_title_per_branch',
+                condition=Q(branch__isnull=False),
+            ),
+            models.UniqueConstraint(
+                fields=('company', 'title'),
+                name='uniq_zone_title_global_per_company',
+                condition=Q(branch__isnull=True),
+            ),
+        ]
+        indexes = [
+            models.Index(fields=['company', 'title']),
+            models.Index(fields=['company', 'branch', 'title']),
+        ]
+
+    def clean(self):
+        if self.branch_id and self.branch.company_id != self.company_id:
+            raise ValidationError({'branch': 'Филиал принадлежит другой компании.'})
 
     def __str__(self):
         return self.title
@@ -65,7 +114,12 @@ class Table(models.Model):
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     company = models.ForeignKey(
-        Company, on_delete=models.CASCADE, related_name='table', verbose_name='Компания'
+        Company, on_delete=models.CASCADE, related_name='tables', verbose_name='Компания'
+    )
+    # NEW
+    branch = models.ForeignKey(
+        Branch, on_delete=models.CASCADE, related_name='tables',
+        verbose_name='Филиал', null=True, blank=True, db_index=True
     )
     zone = models.ForeignKey(
         Zone, on_delete=models.CASCADE, related_name="tables", verbose_name="Зона"
@@ -79,6 +133,34 @@ class Table(models.Model):
     class Meta:
         verbose_name = 'Стол'
         verbose_name_plural = 'Столы'
+        constraints = [
+            # номер уникален в зоне
+            models.UniqueConstraint(fields=('zone', 'number'), name='uniq_table_number_per_zone'),
+            # дополнительно: уникальность номера в филиале/глобально
+            models.UniqueConstraint(
+                fields=('branch', 'number'),
+                name='uniq_table_number_per_branch',
+                condition=Q(branch__isnull=False),
+            ),
+            models.UniqueConstraint(
+                fields=('company', 'number'),
+                name='uniq_table_number_global_per_company',
+                condition=Q(branch__isnull=True),
+            ),
+        ]
+        indexes = [
+            models.Index(fields=['company', 'number']),
+            models.Index(fields=['company', 'branch', 'number']),
+            models.Index(fields=['zone']),
+        ]
+
+    def clean(self):
+        if self.branch_id and self.branch.company_id != self.company_id:
+            raise ValidationError({'branch': 'Филиал принадлежит другой компании.'})
+        if self.zone and self.zone.company_id != self.company_id:
+            raise ValidationError({'zone': 'Зона принадлежит другой компании.'})
+        if self.zone and (self.zone.branch_id or None) != (self.branch_id or None):
+            raise ValidationError({'zone': 'Зона принадлежит другому филиалу.'})
 
     def __str__(self):
         return f"Стол {self.number} (мест: {self.places})"
@@ -96,8 +178,14 @@ class Booking(models.Model):
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     company = models.ForeignKey(
-        Company, on_delete=models.CASCADE, related_name='booking', verbose_name='Компания'
+        Company, on_delete=models.CASCADE, related_name='bookings', verbose_name='Компания'
     )
+    # NEW
+    branch = models.ForeignKey(
+        Branch, on_delete=models.CASCADE, related_name='bookings',
+        verbose_name='Филиал', null=True, blank=True, db_index=True
+    )
+
     guest = models.CharField('Гость', max_length=255)
     phone = models.CharField('Телефон', max_length=32, blank=True)
     date = models.DateField('Дата')
@@ -108,7 +196,7 @@ class Booking(models.Model):
         related_name='bookings', verbose_name='Стол'
     )
     status = models.CharField(
-        'Статус', max_length=16, choices=Status.choices, default=Status.BOOKED
+        'Статус', max_length=16, choices=Status.choices, default=Status.BOOKED, db_index=True
     )
     created_at = models.DateTimeField('Создано', auto_now_add=True)
     updated_at = models.DateTimeField('Обновлено', auto_now=True)
@@ -118,15 +206,31 @@ class Booking(models.Model):
         verbose_name_plural = 'Брони'
         ordering = ['-date', '-time']
         constraints = [
+            # слот уникален для стола (company не нужен, table уникален сам по себе)
             models.UniqueConstraint(
-                fields=['company', 'table', 'date', 'time'],
+                fields=['table', 'date', 'time'],
                 name='uniq_booking_table_slot',
             ),
         ]
         indexes = [
             models.Index(fields=['company', 'date', 'time']),
+            models.Index(fields=['company', 'branch', 'date', 'time']),
             models.Index(fields=['company', 'status']),
+            models.Index(fields=['table', 'date', 'time']),
         ]
+
+    def clean(self):
+        # company согласованность
+        if self.company_id:
+            if self.table and self.table.company_id != self.company_id:
+                raise ValidationError({'table': 'Стол принадлежит другой компании.'})
+
+        # branch согласованность
+        if self.branch_id:
+            if self.table and self.table.branch_id not in (None, self.branch_id):
+                raise ValidationError({'table': 'Стол принадлежит другому филиалу.'})
+            if self.table and self.table.zone and self.table.zone.branch_id not in (None, self.branch_id):
+                raise ValidationError({'table': 'Зона стола принадлежит другому филиалу.'})
 
     def __str__(self):
         return f'{self.date} {self.time} — {self.guest} ({self.table})'
@@ -145,6 +249,11 @@ class Warehouse(models.Model):
     company = models.ForeignKey(
         Company, on_delete=models.CASCADE, related_name='cafe_warehouse', verbose_name='Компания'
     )
+    # NEW
+    branch = models.ForeignKey(
+        Branch, on_delete=models.CASCADE, related_name='cafe_warehouse',
+        verbose_name='Филиал', null=True, blank=True, db_index=True
+    )
     title = models.CharField(max_length=255, verbose_name="Название")
     unit = models.CharField(max_length=255, verbose_name="Ед. изм.")
     remainder = models.CharField(max_length=255, verbose_name="Остаток")
@@ -153,6 +262,26 @@ class Warehouse(models.Model):
     class Meta:
         verbose_name = 'Склад'
         verbose_name_plural = 'Склады'
+        constraints = [
+            models.UniqueConstraint(
+                fields=('branch', 'title'),
+                name='uniq_warehouse_title_per_branch',
+                condition=Q(branch__isnull=False),
+            ),
+            models.UniqueConstraint(
+                fields=('company', 'title'),
+                name='uniq_warehouse_title_global_per_company',
+                condition=Q(branch__isnull=True),
+            ),
+        ]
+        indexes = [
+            models.Index(fields=['company', 'title']),
+            models.Index(fields=['company', 'branch', 'title']),
+        ]
+
+    def clean(self):
+        if self.branch_id and self.branch.company_id != self.company_id:
+            raise ValidationError({'branch': 'Филиал принадлежит другой компании.'})
 
     def __str__(self):
         return f"{self.title} - осталось {self.remainder}"
@@ -161,7 +290,12 @@ class Warehouse(models.Model):
 class Purchase(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     company = models.ForeignKey(
-        Company, on_delete=models.CASCADE, related_name='cafe_purchase', verbose_name='Компания'
+        Company, on_delete=models.CASCADE, related_name='cafe_purchases', verbose_name='Компания'
+    )
+    # NEW
+    branch = models.ForeignKey(
+        Branch, on_delete=models.CASCADE, related_name='cafe_purchases',
+        verbose_name='Филиал', null=True, blank=True, db_index=True
     )
     supplier = models.CharField(max_length=255, verbose_name="Поставщик")
     positions = models.CharField(max_length=255, verbose_name="Позиций")
@@ -170,6 +304,14 @@ class Purchase(models.Model):
     class Meta:
         verbose_name = 'Закупка'
         verbose_name_plural = 'Закупки'
+        indexes = [
+            models.Index(fields=['company']),
+            models.Index(fields=['company', 'branch']),
+        ]
+
+    def clean(self):
+        if self.branch_id and self.branch.company_id != self.company_id:
+            raise ValidationError({'branch': 'Филиал принадлежит другой компании.'})
 
     def __str__(self):
         return f"{self.supplier} - cумма:{self.price}"
@@ -180,11 +322,36 @@ class Category(models.Model):
     company = models.ForeignKey(
         Company, on_delete=models.CASCADE, related_name="menu_categories", verbose_name="Компания"
     )
+    # NEW
+    branch = models.ForeignKey(
+        Branch, on_delete=models.CASCADE, related_name='menu_categories',
+        verbose_name='Филиал', null=True, blank=True, db_index=True
+    )
     title = models.CharField("Название категории", max_length=100)
 
     class Meta:
         verbose_name = "Категория"
         verbose_name_plural = "Категории"
+        constraints = [
+            models.UniqueConstraint(
+                fields=('branch', 'title'),
+                name='uniq_category_title_per_branch',
+                condition=Q(branch__isnull=False),
+            ),
+            models.UniqueConstraint(
+                fields=('company', 'title'),
+                name='uniq_category_title_global_per_company',
+                condition=Q(branch__isnull=True),
+            ),
+        ]
+        indexes = [
+            models.Index(fields=['company', 'title']),
+            models.Index(fields=['company', 'branch', 'title']),
+        ]
+
+    def clean(self):
+        if self.branch_id and self.branch.company_id != self.company_id:
+            raise ValidationError({'branch': 'Филиал принадлежит другой компании.'})
 
     def __str__(self):
         return self.title
@@ -196,6 +363,11 @@ class MenuItem(models.Model):
         Company, on_delete=models.CASCADE,
         related_name="menu_items", verbose_name="Компания"
     )
+    # NEW
+    branch = models.ForeignKey(
+        Branch, on_delete=models.CASCADE, related_name='menu_items',
+        verbose_name='Филиал', null=True, blank=True, db_index=True
+    )
     title = models.CharField("Название", max_length=255)
     category = models.ForeignKey(
         "Category", on_delete=models.CASCADE,
@@ -204,12 +376,7 @@ class MenuItem(models.Model):
     price = models.DecimalField("Цена", max_digits=10, decimal_places=2)
     is_active = models.BooleanField("Активно в продаже", default=True)
 
-    image = models.ImageField(
-        "Изображение",
-        upload_to="menu_items/",
-        blank=True,
-        null=True
-    )
+    image = models.ImageField("Изображение", upload_to="menu_items/", blank=True, null=True)
 
     created_at = models.DateTimeField("Дата создания", auto_now_add=True)
     updated_at = models.DateTimeField("Дата обновления", auto_now=True)
@@ -217,6 +384,32 @@ class MenuItem(models.Model):
     class Meta:
         verbose_name = "Позиция меню"
         verbose_name_plural = "Меню"
+        constraints = [
+            models.UniqueConstraint(
+                fields=('branch', 'title'),
+                name='uniq_menuitem_title_per_branch',
+                condition=Q(branch__isnull=False),
+            ),
+            models.UniqueConstraint(
+                fields=('company', 'title'),
+                name='uniq_menuitem_title_global_per_company',
+                condition=Q(branch__isnull=True),
+            ),
+        ]
+        indexes = [
+            models.Index(fields=['company', 'title']),
+            models.Index(fields=['company', 'branch', 'title']),
+            models.Index(fields=['category']),
+            models.Index(fields=['company', 'is_active']),
+        ]
+
+    def clean(self):
+        if self.branch_id and self.branch.company_id != self.company_id:
+            raise ValidationError({'branch': 'Филиал принадлежит другой компании.'})
+        if self.category and self.category.company_id != self.company_id:
+            raise ValidationError({'category': 'Категория принадлежит другой компании.'})
+        if self.category and (self.category.branch_id or None) != (self.branch_id or None):
+            raise ValidationError({'category': 'Категория другого филиала.'})
 
     def __str__(self):
         return f"{self.title} ({self.category})"
@@ -227,17 +420,12 @@ class MenuItem(models.Model):
         """
         if self.image and hasattr(self.image, 'file'):
             img = Image.open(self.image)
-            img = img.convert("RGB")  # гарантируем совместимость
-
-            # имя файла с расширением webp
+            img = img.convert("RGB")
             filename = f"{uuid.uuid4().hex}.webp"
             buffer = io.BytesIO()
-            img.save(buffer, format="WEBP", quality=80)  # качество можно регулировать
+            img.save(buffer, format="WEBP", quality=80)
             buffer.seek(0)
-
-            # сохраняем в поле
             self.image.save(filename, ContentFile(buffer.read()), save=False)
-
         super().save(*args, **kwargs)
 
 
@@ -254,6 +442,16 @@ class Ingredient(models.Model):
     class Meta:
         verbose_name = "Ингредиент"
         verbose_name_plural = "Ингредиенты"
+        indexes = [
+            models.Index(fields=['menu_item']),
+            models.Index(fields=['product']),
+        ]
+
+    def clean(self):
+        if self.menu_item.company_id != self.product.company_id:
+            raise ValidationError({'product': 'Склад из другой компании.'})
+        if (self.menu_item.branch_id or None) != (self.product.branch_id or None):
+            raise ValidationError({'product': 'Склад другого филиала.'})
 
     def __str__(self):
         return f"{self.product.title} ({self.amount} {self.product.unit})"
@@ -267,24 +465,21 @@ class Order(models.Model):
     company = models.ForeignKey(
         Company, on_delete=models.CASCADE, related_name='cafe_orders', verbose_name='Компания'
     )
+    # NEW
+    branch = models.ForeignKey(
+        Branch, on_delete=models.CASCADE, related_name='cafe_orders',
+        verbose_name='Филиал', null=True, blank=True, db_index=True
+    )
     table = models.ForeignKey(
         Table, on_delete=models.PROTECT, related_name='orders', verbose_name='Стол'
     )
     client = models.ForeignKey(
-        CafeClient,
-        on_delete=models.SET_NULL,
-        null=True,
-        blank=True,
-        related_name='orders',
-        verbose_name='Клиент',
+        CafeClient, on_delete=models.SET_NULL,
+        null=True, blank=True, related_name='orders', verbose_name='Клиент',
     )
     waiter = models.ForeignKey(
-        settings.AUTH_USER_MODEL,
-        on_delete=models.SET_NULL,
-        null=True,
-        blank=True,
-        related_name='served_orders',
-        verbose_name='Официант'
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL,
+        null=True, blank=True, related_name='served_orders', verbose_name='Официант'
     )
     guests = models.PositiveIntegerField('Количество гостей', default=1)
     created_at = models.DateTimeField('Создано', auto_now_add=True)
@@ -295,6 +490,7 @@ class Order(models.Model):
         ordering = ['-created_at']
         indexes = [
             models.Index(fields=['company', 'created_at']),
+            models.Index(fields=['company', 'branch', 'created_at']),
             models.Index(fields=['client', 'created_at']),
         ]
 
@@ -302,31 +498,32 @@ class Order(models.Model):
         return f'Order {str(self.id)[:8]} — {self.table}'
 
     def clean(self):
-        # согласованность компании у связанных сущностей
+        # согласованность компании
         if self.company_id:
             if self.table and self.table.company_id != self.company_id:
                 raise ValidationError({'table': 'Стол принадлежит другой компании.'})
             if self.client and self.client.company_id != self.company_id:
                 raise ValidationError({'client': 'Клиент принадлежит другой компании.'})
+        # согласованность филиала
+        if self.branch_id:
+            if self.table and self.table.branch_id not in (None, self.branch_id):
+                raise ValidationError({'table': 'Стол другого филиала.'})
+            if self.client and self.client.branch_id not in (None, self.branch_id):
+                raise ValidationError({'client': 'Клиент другого филиала.'})
 
 
 class OrderItem(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     # company синхронизируется с заказом в save()
     company = models.ForeignKey(
-        Company,
-        on_delete=models.CASCADE,
-        related_name='cafe_order_items',
-        verbose_name='Компания',
-        editable=False,
+        Company, on_delete=models.CASCADE,
+        related_name='cafe_order_items', verbose_name='Компания', editable=False,
     )
     order = models.ForeignKey(
-        Order, on_delete=models.CASCADE,
-        related_name='items', verbose_name='Заказ'
+        Order, on_delete=models.CASCADE, related_name='items', verbose_name='Заказ'
     )
     menu_item = models.ForeignKey(
-        'MenuItem', on_delete=models.PROTECT,
-        related_name='order_items', verbose_name='Позиция меню'
+        'MenuItem', on_delete=models.PROTECT, related_name='order_items', verbose_name='Позиция меню'
     )
     quantity = models.PositiveIntegerField('Кол-во', default=1)
 
@@ -341,8 +538,15 @@ class OrderItem(models.Model):
             models.Index(fields=['order']),
         ]
 
+    def clean(self):
+        # согласованность company/branch с заказом
+        if self.order and self.menu_item:
+            if self.order.company_id != self.menu_item.company_id:
+                raise ValidationError({'menu_item': 'Позиция меню из другой компании.'})
+            if (self.order.branch_id or None) != (self.menu_item.branch_id or None):
+                raise ValidationError({'menu_item': 'Позиция меню другого филиала.'})
+
     def save(self, *args, **kwargs):
-        # всегда синхронизируем с заказом
         if self.order_id:
             if self.company_id and self.company_id != self.order.company_id:
                 raise ValueError("company у позиции не совпадает с company заказа.")
@@ -361,11 +565,17 @@ class OrderHistory(models.Model):
     company = models.ForeignKey(
         Company, on_delete=models.CASCADE, related_name='cafe_order_history', verbose_name='Компания'
     )
+    # NEW: сохраняем филиал
+    branch = models.ForeignKey(
+        Branch, on_delete=models.SET_NULL,
+        related_name='cafe_order_history', verbose_name='Филиал (ref)',
+        null=True, blank=True
+    )
     client = models.ForeignKey(
         CafeClient, on_delete=models.SET_NULL, null=True, blank=True,
         related_name='order_history', verbose_name='Клиент'
     )
-    original_order_id = models.UUIDField(verbose_name='ID исходного заказа')
+    original_order_id = models.UUIDField(verbose_name='ID исходного заказа', unique=True)
     table = models.ForeignKey(
         Table, on_delete=models.SET_NULL, null=True, blank=True,
         related_name='order_history', verbose_name='Стол (ref)'
@@ -386,11 +596,9 @@ class OrderHistory(models.Model):
         ordering = ['-created_at']
         indexes = [
             models.Index(fields=['company', 'created_at']),
+            models.Index(fields=['company', 'branch', 'created_at']),
             models.Index(fields=['client', 'created_at']),
             models.Index(fields=['original_order_id']),
-        ]
-        constraints = [
-            models.UniqueConstraint(fields=['original_order_id'], name='uniq_orderhistory_original'),
         ]
 
     def __str__(self):
@@ -431,9 +639,9 @@ def archive_order_before_delete(sender, instance: Order, **kwargs):
         email = getattr(instance.waiter, 'email', '') or ''
         waiter_label = full or email or str(instance.waiter_id)
 
-    # шапка архива
     oh = OrderHistory.objects.create(
         company=instance.company,
+        branch=instance.branch,  # NEW
         client=instance.client,
         original_order_id=instance.id,
         table=instance.table,

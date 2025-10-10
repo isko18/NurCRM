@@ -26,7 +26,7 @@ from .pos_serializers import (
     SaleListSerializer, SaleDetailSerializer, StartCartOptionsSerializer, CustomCartItemCreateSerializer, SaleStatusUpdateSerializer
 )
 from apps.main.services import checkout_cart, NotEnoughStock
-from apps.main.views import CompanyRestrictedMixin
+from apps.main.views import CompanyBranchRestrictedMixin
 from apps.construction.models import Department
 from django.http import Http404
 from django.utils.timezone import is_aware, make_aware, get_current_timezone
@@ -45,7 +45,7 @@ try:
 except Exception:
     ClientDeal = None
     DealInstallment = None
-    
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # Путь к папке fonts внутри apps/main
@@ -425,7 +425,7 @@ class ClientReconciliationClassicAPIView(APIView):
         p.save()
         buf.seek(0)
         return FileResponse(buf, as_attachment=False, filename="reconciliation_error.pdf", status=400)
-    
+
 # pos/views.py
 class SaleInvoiceDownloadAPIView(APIView):
     """
@@ -631,7 +631,7 @@ class SaleReceiptDownloadAPIView(APIView):
 
         buffer.seek(0)
         return FileResponse(buffer, as_attachment=True, filename=f"receipt_{doc_no}.pdf")
-    
+
 class SaleStartAPIView(APIView):
     """
     POST — создать/получить активную корзину для текущего пользователя.
@@ -711,7 +711,12 @@ class SaleScanAPIView(APIView):
         item, created = CartItem.objects.get_or_create(
             cart=cart,
             product=product,
-            defaults={"company": cart.company, "quantity": qty, "unit_price": product.price},
+            defaults={
+                "company": cart.company,
+                "branch": getattr(cart, "branch", None),  # ← NEW: подставляем branch
+                "quantity": qty,
+                "unit_price": product.price,
+            },
         )
         if not created:
             item.quantity += qty
@@ -758,7 +763,12 @@ class SaleAddItemAPIView(APIView):
         item, created = CartItem.objects.get_or_create(
             cart=cart,
             product=product,
-            defaults={"company": cart.company, "quantity": qty, "unit_price": unit_price},
+            defaults={
+                "company": cart.company,
+                "branch": getattr(cart, "branch", None),  # ← NEW
+                "quantity": qty,
+                "unit_price": unit_price,
+            },
         )
         if not created:
             # объединяем строки: увеличиваем количество и обновляем цену на позицию
@@ -795,6 +805,17 @@ class SaleCheckoutAPIView(APIView):
             return Response({"detail": str(e)}, status=status.HTTP_400_BAD_REQUEST)
         except ValueError as e:
             return Response({"detail": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+        # ← NEW: синхронизируем branch продажи с branch корзины
+        if hasattr(sale, "branch_id") and hasattr(cart, "branch_id"):
+            if sale.branch_id != cart.branch_id:
+                sale.branch_id = cart.branch_id
+                sale.save(update_fields=["branch"])
+        # ← NEW: на всякий случай обновим branch у позиций продажи, если null
+        try:
+            sale.items.filter(branch__isnull=True).update(branch=getattr(cart, "branch", None))
+        except Exception:
+            pass
 
         if client_id:
             client = get_object_or_404(Client, id=client_id, company=request.user.company)
@@ -887,7 +908,12 @@ class MobileScannerIngestAPIView(APIView):
         item, created = CartItem.objects.get_or_create(
             cart=cart,
             product=product,
-            defaults={"company": cart.company, "quantity": qty, "unit_price": product.price},
+            defaults={
+                "company": cart.company,
+                "branch": getattr(cart, "branch", None),  # ← NEW
+                "quantity": qty,
+                "unit_price": product.price,
+            },
         )
         if not created:
             item.quantity += qty
@@ -897,7 +923,7 @@ class MobileScannerIngestAPIView(APIView):
         return Response({"ok": True}, status=201)
 
 
-class SaleListAPIView(CompanyRestrictedMixin, generics.ListAPIView):
+class SaleListAPIView(CompanyBranchRestrictedMixin, generics.ListAPIView):
     """
     GET /api/main/pos/sales/?status=&start=&end=&user=
     Возвращает список продаж по компании с простыми фильтрами.
@@ -1008,7 +1034,7 @@ class SaleBulkDeleteAPIView(APIView):
             },
             status=200,
         )
-        
+
 class CartItemUpdateDestroyAPIView(APIView):
     """
     PATCH /api/main/pos/carts/<uuid:cart_id>/items/<uuid:item_id>/
@@ -1112,6 +1138,7 @@ class SaleAddCustomItemAPIView(APIView):
         else:
             CartItem.objects.create(
                 company=cart.company,
+                branch=getattr(cart, "branch", None),  # ← NEW: сохраняем branch у кастомной позиции
                 cart=cart,
                 product=None,
                 custom_name=name,

@@ -2,6 +2,7 @@
 from rest_framework import generics, permissions, filters as drf_filters
 from rest_framework.parsers import MultiPartParser, FormParser
 from django.shortcuts import get_object_or_404
+from django.db.models import Q
 from django_filters import rest_framework as dj_filters
 from django_filters.rest_framework import DjangoFilterBackend
 
@@ -42,36 +43,118 @@ class BookingFilter(dj_filters.FilterSet):
         fields = ['hotel', 'room', 'bed', 'client', 'start_time', 'end_time']
 
 
-# ---- Миксин для компании ----
-class CompanyQuerysetMixin:
+# ---- Миксин company + branch (как в барбере) ----
+class CompanyBranchQuerysetMixin:
     """
-    Скоуп по компании текущего пользователя + защита company на create/update.
-    Безопасен для drf_yasg (swagger_fake_view) и AnonymousUser.
+    Видимость данных:
+      - есть активный филиал → записи этого филиала И глобальные (branch IS NULL)
+      - нет активного филиала → только глобальные (branch IS NULL)
+    Создание/обновление:
+      - company берётся из request.user.company/owned_company
+      - branch проставляется автоматически, если смогли определить активный филиал
+        (иначе не трогаем, чтобы не затирать существующее значение)
     """
+
+    # --- helpers ---
+    def _user(self):
+        return getattr(self.request, "user", None)
+
     def _user_company(self):
-        user = getattr(self.request, "user", None)
+        user = self._user()
         if not user or not getattr(user, "is_authenticated", False):
             return None
         return getattr(user, "company", None) or getattr(user, "owned_company", None)
 
+    def _model_has_field(self, field_name: str) -> bool:
+        model = getattr(self, "queryset", None).model
+        return any(getattr(f, "name", None) == field_name for f in model._meta.get_fields())
+
+    def _active_branch(self):
+        """
+        Определяем активный филиал по тем же правилам, что и в сериализаторах:
+          1) user.primary_branch() / user.primary_branch
+          2) request.branch (если middleware уже положил)
+          3) иначе None
+        Одновременно убеждаемся, что филиал принадлежит компании пользователя.
+        """
+        request = self.request
+        company = self._user_company()
+        if not company:
+            setattr(request, "branch", None)
+            return None
+
+        user = self._user()
+
+        # 1) primary_branch: метод или поле
+        primary = getattr(user, "primary_branch", None)
+        if callable(primary):
+            try:
+                val = primary()
+                if val and val.company_id == company.id:
+                    setattr(request, "branch", val)
+                    return val
+            except Exception:
+                pass
+        if primary and getattr(primary, "company_id", None) == company.id:
+            setattr(request, "branch", primary)
+            return primary
+
+        # 2) из middleware / ранее установленное
+        if hasattr(request, "branch"):
+            b = getattr(request, "branch")
+            if b and getattr(b, "company_id", None) == company.id:
+                return b
+
+        setattr(request, "branch", None)
+        return None
+
+    # --- queryset / save hooks ---
     def get_queryset(self):
         if getattr(self, "swagger_fake_view", False):
             return self.queryset.none()
+
         qs = super().get_queryset()
         company = self._user_company()
-        return qs.filter(company=company) if company else qs.none()
+        if not company:
+            return qs.none()
+
+        qs = qs.filter(company=company)
+
+        if self._model_has_field("branch"):
+            active_branch = self._active_branch()  # None или Branch
+            if active_branch is not None:
+                # есть филиал → показываем его записи И глобальные
+                qs = qs.filter(Q(branch=active_branch) | Q(branch__isnull=True))
+            else:
+                # нет филиала → только глобальные
+                qs = qs.filter(branch__isnull=True)
+
+        return qs
 
     def perform_create(self, serializer):
         company = self._user_company()
-        serializer.save(company=company) if company else serializer.save()
+        if self._model_has_field("branch"):
+            active_branch = self._active_branch()
+            # если филиал не определён → создаём глобальную запись (branch=None)
+            serializer.save(company=company, branch=active_branch if active_branch is not None else None)
+        else:
+            serializer.save(company=company)
 
     def perform_update(self, serializer):
         company = self._user_company()
-        serializer.save(company=company) if company else serializer.save()
+        if self._model_has_field("branch"):
+            active_branch = self._active_branch()
+            # не перетираем branch, если активный филиал не определён
+            if active_branch is not None:
+                serializer.save(company=company, branch=active_branch)
+            else:
+                serializer.save(company=company)
+        else:
+            serializer.save(company=company)
 
 
 # ========= BookingClient (клиенты) =========
-class BookingClientListCreateView(CompanyQuerysetMixin, generics.ListCreateAPIView):
+class BookingClientListCreateView(CompanyBranchQuerysetMixin, generics.ListCreateAPIView):
     queryset = BookingClient.objects.all()
     serializer_class = BookingClientSerializer
     permission_classes = [permissions.IsAuthenticated]
@@ -82,13 +165,13 @@ class BookingClientListCreateView(CompanyQuerysetMixin, generics.ListCreateAPIVi
     ordering_fields = ['name']
 
 
-class BookingClientRetrieveUpdateDestroyView(CompanyQuerysetMixin, generics.RetrieveUpdateDestroyAPIView):
+class BookingClientRetrieveUpdateDestroyView(CompanyBranchQuerysetMixin, generics.RetrieveUpdateDestroyAPIView):
     queryset = BookingClient.objects.all()
     serializer_class = BookingClientSerializer
     permission_classes = [permissions.IsAuthenticated]
 
 
-class ClientBookingListCreateView(CompanyQuerysetMixin, generics.ListCreateAPIView):
+class ClientBookingListCreateView(CompanyBranchQuerysetMixin, generics.ListCreateAPIView):
     """
     /clients/<uuid:pk>/bookings/
     GET  — список броней клиента
@@ -100,23 +183,27 @@ class ClientBookingListCreateView(CompanyQuerysetMixin, generics.ListCreateAPIVi
     filter_backends = [DjangoFilterBackend]
     filterset_class = BookingFilter
 
-    def get_queryset(self):
-        qs = super().get_queryset()
-        client = self._get_client()
-        return qs.filter(client=client).order_by('-start_time')
-
     def _get_client(self):
         company = self._user_company()
         return get_object_or_404(BookingClient, pk=self.kwargs['pk'], company=company)
 
+    def get_queryset(self):
+        qs = super().get_queryset()  # уже отфильтровано по company+branch/global миксином
+        client = self._get_client()
+        return qs.filter(client=client).order_by('-start_time')
+
     def perform_create(self, serializer):
         client = self._get_client()
-        # company и client выставляем жёстко из URL
-        serializer.save(company=client.company, client=client)
+        # company и client выставляем жёстко из URL; branch проставит миксин
+        super().perform_create(serializer=serializer)
+        # но нужен именно этот клиент:
+        serializer.instance.client = client
+        serializer.instance.company = client.company
+        serializer.instance.save(update_fields=["client", "company"])
 
 
 # ========= Hotel =========
-class HotelListCreateView(CompanyQuerysetMixin, generics.ListCreateAPIView):
+class HotelListCreateView(CompanyBranchQuerysetMixin, generics.ListCreateAPIView):
     queryset = Hotel.objects.all()
     serializer_class = HotelSerializer
     permission_classes = [IsAdminOrReadOnly]
@@ -125,14 +212,14 @@ class HotelListCreateView(CompanyQuerysetMixin, generics.ListCreateAPIView):
                         if not f.is_relation or f.many_to_one]
 
 
-class HotelRetrieveUpdateDestroyView(CompanyQuerysetMixin, generics.RetrieveUpdateDestroyAPIView):
+class HotelRetrieveUpdateDestroyView(CompanyBranchQuerysetMixin, generics.RetrieveUpdateDestroyAPIView):
     queryset = Hotel.objects.all()
     serializer_class = HotelSerializer
     permission_classes = [IsAdminOrReadOnly]
 
 
 # ========= Bed =========
-class BedListCreateView(CompanyQuerysetMixin, generics.ListCreateAPIView):
+class BedListCreateView(CompanyBranchQuerysetMixin, generics.ListCreateAPIView):
     queryset = Bed.objects.all()
     serializer_class = BedSerializer
     permission_classes = [IsAdminOrReadOnly]
@@ -141,14 +228,14 @@ class BedListCreateView(CompanyQuerysetMixin, generics.ListCreateAPIView):
                         if not f.is_relation or f.many_to_one]
 
 
-class BedRetrieveUpdateDestroyView(CompanyQuerysetMixin, generics.RetrieveUpdateDestroyAPIView):
+class BedRetrieveUpdateDestroyView(CompanyBranchQuerysetMixin, generics.RetrieveUpdateDestroyAPIView):
     queryset = Bed.objects.all()
     serializer_class = BedSerializer
     permission_classes = [IsAdminOrReadOnly]
 
 
 # ========= ConferenceRoom (Room) =========
-class RoomListCreateView(CompanyQuerysetMixin, generics.ListCreateAPIView):
+class RoomListCreateView(CompanyBranchQuerysetMixin, generics.ListCreateAPIView):
     queryset = ConferenceRoom.objects.all()
     serializer_class = RoomSerializer
     permission_classes = [IsAdminOrReadOnly]
@@ -157,14 +244,14 @@ class RoomListCreateView(CompanyQuerysetMixin, generics.ListCreateAPIView):
                         if not f.is_relation or f.many_to_one]
 
 
-class RoomRetrieveUpdateDestroyView(CompanyQuerysetMixin, generics.RetrieveUpdateDestroyAPIView):
+class RoomRetrieveUpdateDestroyView(CompanyBranchQuerysetMixin, generics.RetrieveUpdateDestroyAPIView):
     queryset = ConferenceRoom.objects.all()
     serializer_class = RoomSerializer
     permission_classes = [IsAdminOrReadOnly]
 
 
 # ========= Booking =========
-class BookingListCreateView(CompanyQuerysetMixin, generics.ListCreateAPIView):
+class BookingListCreateView(CompanyBranchQuerysetMixin, generics.ListCreateAPIView):
     queryset = Booking.objects.select_related('hotel', 'room', 'bed', 'client').all()
     serializer_class = BookingSerializer
     permission_classes = [permissions.IsAuthenticated]
@@ -172,14 +259,14 @@ class BookingListCreateView(CompanyQuerysetMixin, generics.ListCreateAPIView):
     filterset_class = BookingFilter
 
 
-class BookingRetrieveUpdateDestroyView(CompanyQuerysetMixin, generics.RetrieveUpdateDestroyAPIView):
+class BookingRetrieveUpdateDestroyView(CompanyBranchQuerysetMixin, generics.RetrieveUpdateDestroyAPIView):
     queryset = Booking.objects.select_related('hotel', 'room', 'bed', 'client').all()
     serializer_class = BookingSerializer
     permission_classes = [permissions.IsAuthenticated]
 
 
 # ========= ManagerAssignment =========
-class ManagerAssignmentListCreateView(CompanyQuerysetMixin, generics.ListCreateAPIView):
+class ManagerAssignmentListCreateView(CompanyBranchQuerysetMixin, generics.ListCreateAPIView):
     queryset = ManagerAssignment.objects.select_related('room', 'manager').all()
     serializer_class = ManagerAssignmentSerializer
     permission_classes = [IsManagerOrAdmin]
@@ -188,14 +275,14 @@ class ManagerAssignmentListCreateView(CompanyQuerysetMixin, generics.ListCreateA
                         if not f.is_relation or f.many_to_one]
 
 
-class ManagerAssignmentRetrieveUpdateDestroyView(CompanyQuerysetMixin, generics.RetrieveUpdateDestroyAPIView):
+class ManagerAssignmentRetrieveUpdateDestroyView(CompanyBranchQuerysetMixin, generics.RetrieveUpdateDestroyAPIView):
     queryset = ManagerAssignment.objects.select_related('room', 'manager').all()
     serializer_class = ManagerAssignmentSerializer
     permission_classes = [IsManagerOrAdmin]
 
 
 # ========= Folder =========
-class FolderListCreateView(CompanyQuerysetMixin, generics.ListCreateAPIView):
+class FolderListCreateView(CompanyBranchQuerysetMixin, generics.ListCreateAPIView):
     queryset = Folder.objects.select_related('parent').all()
     serializer_class = FolderSerializer
     permission_classes = [permissions.IsAuthenticated]
@@ -205,14 +292,14 @@ class FolderListCreateView(CompanyQuerysetMixin, generics.ListCreateAPIView):
     ordering = ['name']
 
 
-class FolderRetrieveUpdateDestroyView(CompanyQuerysetMixin, generics.RetrieveUpdateDestroyAPIView):
+class FolderRetrieveUpdateDestroyView(CompanyBranchQuerysetMixin, generics.RetrieveUpdateDestroyAPIView):
     queryset = Folder.objects.select_related('parent').all()
     serializer_class = FolderSerializer
     permission_classes = [permissions.IsAuthenticated]
 
 
 # ========= Document =========
-class DocumentListCreateView(CompanyQuerysetMixin, generics.ListCreateAPIView):
+class DocumentListCreateView(CompanyBranchQuerysetMixin, generics.ListCreateAPIView):
     queryset = Document.objects.select_related('folder').all()
     serializer_class = DocumentSerializer
     permission_classes = [permissions.IsAuthenticated]
@@ -221,7 +308,7 @@ class DocumentListCreateView(CompanyQuerysetMixin, generics.ListCreateAPIView):
     filterset_class = DocumentFilter
 
 
-class DocumentRetrieveUpdateDestroyView(CompanyQuerysetMixin, generics.RetrieveUpdateDestroyAPIView):
+class DocumentRetrieveUpdateDestroyView(CompanyBranchQuerysetMixin, generics.RetrieveUpdateDestroyAPIView):
     queryset = Document.objects.select_related('folder').all()
     serializer_class = DocumentSerializer
     permission_classes = [permissions.IsAuthenticated]
@@ -229,7 +316,7 @@ class DocumentRetrieveUpdateDestroyView(CompanyQuerysetMixin, generics.RetrieveU
 
 
 # ========= Booking History =========
-class BookingHistoryListView(CompanyQuerysetMixin, generics.ListAPIView):
+class BookingHistoryListView(CompanyBranchQuerysetMixin, generics.ListAPIView):
     """
     /booking/history/
     История (архив) всех бронирований компании.

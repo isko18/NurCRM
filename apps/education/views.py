@@ -1,10 +1,9 @@
-from rest_framework import generics, permissions
-from rest_framework import filters as drf_filters  # DRF Search/Ordering
+from rest_framework import generics, permissions, status
+from rest_framework import filters as drf_filters
 from rest_framework.parsers import MultiPartParser, FormParser
 from django_filters import rest_framework as dj_filters
 from django_filters.rest_framework import DjangoFilterBackend
 from rest_framework.response import Response
-from rest_framework import status
 from django.db import transaction
 from django.shortcuts import get_object_or_404
 from rest_framework.views import APIView
@@ -33,35 +32,116 @@ class DocumentFilter(dj_filters.FilterSet):
         fields = ['name', 'folder', 'file_name', 'created_at', 'updated_at']
 
 
-class CompanyQuerysetMixin:
+# ===== Company + Branch scoped mixin (как в «барбере») =====
+class CompanyBranchQuerysetMixin:
     """
-    Скоуп по компании текущего пользователя + проставление company на create/update.
-    Безопасен для drf_yasg (swagger_fake_view) и AnonymousUser.
+    Видимость:
+      - если у пользователя есть активный филиал → только записи этого филиала (branch=<user_branch>)
+      - иначе → только глобальные записи (branch is NULL)
+    Всегда фильтруем по company пользователя.
+    Создание/обновление: принудительно проставляем company/branch из контекста.
     """
+    _cached_active_branch = object()  # маркер «ещё не вычисляли»
+
+    # --- helpers ---
+    def _user(self):
+        return getattr(self.request, "user", None)
+
     def _user_company(self):
-        user = getattr(self.request, "user", None)
+        user = self._user()
         if not user or not getattr(user, "is_authenticated", False):
             return None
         return getattr(user, "company", None) or getattr(user, "owned_company", None)
 
+    def _user_primary_branch(self):
+        """
+        Определяем филиал сотрудника:
+          1) membership с is_primary=True
+          2) любой membership
+          3) иначе None
+        """
+        user = self._user()
+        if not user or not getattr(user, "is_authenticated", False):
+            return None
+        memberships = getattr(user, "branch_memberships", None)
+        if memberships is None:
+            return None
+        primary = memberships.filter(is_primary=True).select_related("branch").first()
+        if primary and primary.branch:
+            return primary.branch
+        any_member = memberships.select_related("branch").first()
+        return any_member.branch if any_member and any_member.branch else None
+
+    def _get_model(self):
+        sc = self.get_serializer_class()
+        return getattr(getattr(sc, "Meta", None), "model", None)
+
+    def _model_has_field(self, field_name: str) -> bool:
+        model = self._get_model()
+        if not model:
+            return False
+        try:
+            model._meta.get_field(field_name)
+            return True
+        except Exception:
+            return False
+
+    def _active_branch(self):
+        if self._cached_active_branch is not object():
+            return self._cached_active_branch
+
+        request = self.request
+        company = self._user_company()
+        if not company:
+            setattr(request, "branch", None)
+            self._cached_active_branch = None
+            return None
+
+        user_branch = self._user_primary_branch()
+        if user_branch and user_branch.company_id == company.id:
+            setattr(request, "branch", user_branch)
+            self._cached_active_branch = user_branch
+            return user_branch
+
+        setattr(request, "branch", None)
+        self._cached_active_branch = None
+        return None
+
+    # --- queryset / save hooks ---
     def get_queryset(self):
         if getattr(self, "swagger_fake_view", False):
             return self.queryset.none()
+
         qs = super().get_queryset()
         company = self._user_company()
-        return qs.filter(company=company) if company else qs.none()
+        if not company:
+            return qs.none()
+
+        qs = qs.filter(company=company)
+
+        if self._model_has_field("branch"):
+            active_branch = self._active_branch()  # None или Branch
+            qs = qs.filter(branch=active_branch) if active_branch is not None else qs.filter(branch__isnull=True)
+
+        return qs
 
     def perform_create(self, serializer):
         company = self._user_company()
-        serializer.save(company=company) if company else serializer.save()
+        if self._model_has_field("branch"):
+            serializer.save(company=company, branch=self._active_branch())
+        else:
+            serializer.save(company=company)
 
     def perform_update(self, serializer):
         company = self._user_company()
-        serializer.save(company=company) if company else serializer.save()
+        if self._model_has_field("branch"):
+            serializer.save(company=company, branch=self._active_branch())
+        else:
+            serializer.save(company=company)
 
 
 # ===== Leads =====
-class LeadListCreateView(CompanyQuerysetMixin, generics.ListCreateAPIView):
+class LeadListCreateView(CompanyBranchQuerysetMixin, generics.ListCreateAPIView):
     queryset = Lead.objects.all()
     serializer_class = LeadSerializer
     permission_classes = [permissions.IsAuthenticated]
@@ -72,14 +152,14 @@ class LeadListCreateView(CompanyQuerysetMixin, generics.ListCreateAPIView):
     ordering = ['-created_at']
 
 
-class LeadRetrieveUpdateDestroyView(CompanyQuerysetMixin, generics.RetrieveUpdateDestroyAPIView):
+class LeadRetrieveUpdateDestroyView(CompanyBranchQuerysetMixin, generics.RetrieveUpdateDestroyAPIView):
     queryset = Lead.objects.all()
     serializer_class = LeadSerializer
     permission_classes = [permissions.IsAuthenticated]
 
 
 # ===== Courses =====
-class CourseListCreateView(CompanyQuerysetMixin, generics.ListCreateAPIView):
+class CourseListCreateView(CompanyBranchQuerysetMixin, generics.ListCreateAPIView):
     queryset = Course.objects.all()
     serializer_class = CourseSerializer
     permission_classes = [permissions.IsAuthenticated]
@@ -90,15 +170,15 @@ class CourseListCreateView(CompanyQuerysetMixin, generics.ListCreateAPIView):
     ordering = ['title']
 
 
-class CourseRetrieveUpdateDestroyView(CompanyQuerysetMixin, generics.RetrieveUpdateDestroyAPIView):
+class CourseRetrieveUpdateDestroyView(CompanyBranchQuerysetMixin, generics.RetrieveUpdateDestroyAPIView):
     queryset = Course.objects.all()
     serializer_class = CourseSerializer
     permission_classes = [permissions.IsAuthenticated]
 
 
 # ===== Groups =====
-class GroupListCreateView(CompanyQuerysetMixin, generics.ListCreateAPIView):
-    queryset = Group.objects.select_related('course').all()
+class GroupListCreateView(CompanyBranchQuerysetMixin, generics.ListCreateAPIView):
+    queryset = Group.objects.select_related('course')
     serializer_class = GroupSerializer
     permission_classes = [permissions.IsAuthenticated]
     filter_backends = [DjangoFilterBackend, drf_filters.SearchFilter, drf_filters.OrderingFilter]
@@ -108,15 +188,15 @@ class GroupListCreateView(CompanyQuerysetMixin, generics.ListCreateAPIView):
     ordering = ['course', 'name']
 
 
-class GroupRetrieveUpdateDestroyView(CompanyQuerysetMixin, generics.RetrieveUpdateDestroyAPIView):
-    queryset = Group.objects.select_related('course').all()
+class GroupRetrieveUpdateDestroyView(CompanyBranchQuerysetMixin, generics.RetrieveUpdateDestroyAPIView):
+    queryset = Group.objects.select_related('course')
     serializer_class = GroupSerializer
     permission_classes = [permissions.IsAuthenticated]
 
 
 # ===== Students =====
-class StudentListCreateView(CompanyQuerysetMixin, generics.ListCreateAPIView):
-    queryset = Student.objects.select_related('group').all()
+class StudentListCreateView(CompanyBranchQuerysetMixin, generics.ListCreateAPIView):
+    queryset = Student.objects.select_related('group')
     serializer_class = StudentSerializer
     permission_classes = [permissions.IsAuthenticated]
     filter_backends = [DjangoFilterBackend, drf_filters.SearchFilter, drf_filters.OrderingFilter]
@@ -126,15 +206,15 @@ class StudentListCreateView(CompanyQuerysetMixin, generics.ListCreateAPIView):
     ordering = ['-created_at']
 
 
-class StudentRetrieveUpdateDestroyView(CompanyQuerysetMixin, generics.RetrieveUpdateDestroyAPIView):
-    queryset = Student.objects.select_related('group').all()
+class StudentRetrieveUpdateDestroyView(CompanyBranchQuerysetMixin, generics.RetrieveUpdateDestroyAPIView):
+    queryset = Student.objects.select_related('group')
     serializer_class = StudentSerializer
     permission_classes = [permissions.IsAuthenticated]
 
 
 # ===== Lessons =====
-class LessonListCreateView(CompanyQuerysetMixin, generics.ListCreateAPIView):
-    queryset = Lesson.objects.select_related('group', 'teacher', 'course').all()
+class LessonListCreateView(CompanyBranchQuerysetMixin, generics.ListCreateAPIView):
+    queryset = Lesson.objects.select_related('group', 'teacher', 'course')
     serializer_class = LessonSerializer
     permission_classes = [permissions.IsAuthenticated]
     filter_backends = [DjangoFilterBackend, drf_filters.SearchFilter, drf_filters.OrderingFilter]
@@ -144,15 +224,15 @@ class LessonListCreateView(CompanyQuerysetMixin, generics.ListCreateAPIView):
     ordering = ['-date', '-time']
 
 
-class LessonRetrieveUpdateDestroyView(CompanyQuerysetMixin, generics.RetrieveUpdateDestroyAPIView):
-    queryset = Lesson.objects.select_related('group', 'teacher', 'course').all()
+class LessonRetrieveUpdateDestroyView(CompanyBranchQuerysetMixin, generics.RetrieveUpdateDestroyAPIView):
+    queryset = Lesson.objects.select_related('group', 'teacher', 'course')
     serializer_class = LessonSerializer
     permission_classes = [permissions.IsAuthenticated]
 
 
 # ===== Folders =====
-class FolderListCreateView(CompanyQuerysetMixin, generics.ListCreateAPIView):
-    queryset = Folder.objects.select_related('parent').all()
+class FolderListCreateView(CompanyBranchQuerysetMixin, generics.ListCreateAPIView):
+    queryset = Folder.objects.select_related('parent')
     serializer_class = FolderSerializer
     permission_classes = [permissions.IsAuthenticated]
     filter_backends = [DjangoFilterBackend, drf_filters.SearchFilter, drf_filters.OrderingFilter]
@@ -162,15 +242,15 @@ class FolderListCreateView(CompanyQuerysetMixin, generics.ListCreateAPIView):
     ordering = ['name']
 
 
-class FolderRetrieveUpdateDestroyView(CompanyQuerysetMixin, generics.RetrieveUpdateDestroyAPIView):
-    queryset = Folder.objects.select_related('parent').all()
+class FolderRetrieveUpdateDestroyView(CompanyBranchQuerysetMixin, generics.RetrieveUpdateDestroyAPIView):
+    queryset = Folder.objects.select_related('parent')
     serializer_class = FolderSerializer
     permission_classes = [permissions.IsAuthenticated]
 
 
 # ===== Documents =====
-class DocumentListCreateView(CompanyQuerysetMixin, generics.ListCreateAPIView):
-    queryset = Document.objects.select_related('folder').all()
+class DocumentListCreateView(CompanyBranchQuerysetMixin, generics.ListCreateAPIView):
+    queryset = Document.objects.select_related('folder')
     serializer_class = DocumentSerializer
     permission_classes = [permissions.IsAuthenticated]
     parser_classes = [MultiPartParser, FormParser]
@@ -181,38 +261,39 @@ class DocumentListCreateView(CompanyQuerysetMixin, generics.ListCreateAPIView):
     ordering = ['-created_at']
 
 
-class DocumentRetrieveUpdateDestroyView(CompanyQuerysetMixin, generics.RetrieveUpdateDestroyAPIView):
-    queryset = Document.objects.select_related('folder').all()
+class DocumentRetrieveUpdateDestroyView(CompanyBranchQuerysetMixin, generics.RetrieveUpdateDestroyAPIView):
+    queryset = Document.objects.select_related('folder')
     serializer_class = DocumentSerializer
     permission_classes = [permissions.IsAuthenticated]
     parser_classes = [MultiPartParser, FormParser]
 
 
 # ===== Lesson attendance snapshot =====
-class LessonAttendanceView(CompanyQuerysetMixin, APIView):
+class LessonAttendanceView(CompanyBranchQuerysetMixin, APIView):
     permission_classes = [permissions.IsAuthenticated]
 
     def _get_lesson(self, lesson_id):
         company = self._user_company()
-        return get_object_or_404(
-            Lesson.objects.select_related("group", "company"),
-            id=lesson_id, company=company
-        )
+        # учитываем и ветку (глобально/филиально), как в списках
+        qs = Lesson.objects.select_related("group", "company")
+        qs = qs.filter(company=company)
+        active_branch = self._active_branch()
+        if active_branch is not None:
+            qs = qs.filter(branch=active_branch)
+        else:
+            qs = qs.filter(branch__isnull=True)
+        return get_object_or_404(qs, id=lesson_id)
 
     def get(self, request, lesson_id):
         lesson = self._get_lesson(lesson_id)
 
-        # все ученики группы
         students = (
             Student.objects
             .filter(company=lesson.company, group=lesson.group)
-            .order_by("name")
             .only("id", "name")
+            .order_by("name")
         )
-        # существующие отметки
-        existing = {
-            a.student_id: a for a in Attendance.objects.filter(lesson=lesson)
-        }
+        existing = {a.student_id: a for a in Attendance.objects.filter(lesson=lesson)}
 
         items = []
         for s in students:
@@ -239,7 +320,6 @@ class LessonAttendanceView(CompanyQuerysetMixin, APIView):
         ser.is_valid(raise_exception=True)
         items = ser.validated_data
 
-        # ожидаем снимок по всей группе
         group_student_ids = set(
             Student.objects.filter(company=lesson.company, group=lesson.group)
             .values_list("id", flat=True)
@@ -278,6 +358,7 @@ class LessonAttendanceView(CompanyQuerysetMixin, APIView):
             else:
                 to_create.append(Attendance(
                     company=lesson.company,
+                    branch=lesson.branch,   # 🔑 проставляем branch, как и в миксине
                     lesson=lesson,
                     student_id=sid,
                     present=present,
@@ -290,31 +371,37 @@ class LessonAttendanceView(CompanyQuerysetMixin, APIView):
             if to_update:
                 Attendance.objects.bulk_update(to_update, fields=["present", "note"])
 
-        # вернуть актуальный список (как GET)
         return self.get(request, lesson_id)
 
 
 # ===== Student attendance history =====
-class StudentAttendanceListView(CompanyQuerysetMixin, generics.ListAPIView):
+class StudentAttendanceListView(CompanyBranchQuerysetMixin, generics.ListAPIView):
     permission_classes = [permissions.IsAuthenticated]
     serializer_class = StudentAttendanceSerializer
 
     def get_queryset(self):
         company = self._user_company()
-        student = get_object_or_404(
-            Student.objects.filter(company=company),
-            id=self.kwargs["student_id"]
-        )
-        return (
-            Attendance.objects
-            .filter(company=company, student=student)
-            .select_related("lesson", "lesson__group")
-            .order_by("-lesson__date", "-lesson__time")
-        )
+        active_branch = self._active_branch()
+
+        student_qs = Student.objects.filter(company=company)
+        if active_branch is not None:
+            student_qs = student_qs.filter(branch__in=[None, active_branch])  # студент может быть глобальным
+        else:
+            student_qs = student_qs.filter(branch__isnull=True)
+
+        student = get_object_or_404(student_qs, id=self.kwargs["student_id"])
+
+        qs = Attendance.objects.filter(company=company, student=student).select_related("lesson", "lesson__group")
+        if self._model_has_field("branch"):
+            if active_branch is not None:
+                qs = qs.filter(branch__in=[None, active_branch])  # отметка может быть глобальной или филиальной
+            else:
+                qs = qs.filter(branch__isnull=True)
+        return qs.order_by("-lesson__date", "-lesson__time")
 
 
 # ===== Teacher rates =====
-class TeacherRateListCreateAPIView(CompanyQuerysetMixin, generics.ListCreateAPIView):
+class TeacherRateListCreateAPIView(CompanyBranchQuerysetMixin, generics.ListCreateAPIView):
     """
     GET  /api/main/teacher-rates/?teacher=<id>&period=YYYY-MM&mode=hour|lesson|month
     POST /api/main/teacher-rates/
@@ -327,10 +414,12 @@ class TeacherRateListCreateAPIView(CompanyQuerysetMixin, generics.ListCreateAPIV
     ordering = ["-updated_at"]
 
     def get_queryset(self):
-        return TeacherRate.objects.filter(company_id=self.request.user.company_id)
+        qs = TeacherRate.objects.filter(company_id=self.request.user.company_id)
+        active_branch = self._active_branch()
+        return qs.filter(branch=active_branch) if active_branch is not None else qs.filter(branch__isnull=True)
 
 
-class TeacherRateRetrieveUpdateDestroyAPIView(CompanyQuerysetMixin, generics.RetrieveUpdateDestroyAPIView):
+class TeacherRateRetrieveUpdateDestroyAPIView(CompanyBranchQuerysetMixin, generics.RetrieveUpdateDestroyAPIView):
     """
     GET/PATCH/PUT/DELETE /api/main/teacher-rates/<uuid:pk>/
     """
@@ -338,4 +427,6 @@ class TeacherRateRetrieveUpdateDestroyAPIView(CompanyQuerysetMixin, generics.Ret
     serializer_class = TeacherRateSerializer
 
     def get_queryset(self):
-        return TeacherRate.objects.filter(company_id=self.request.user.company_id)
+        qs = TeacherRate.objects.filter(company_id=self.request.user.company_id)
+        active_branch = self._active_branch()
+        return qs.filter(branch=active_branch) if active_branch is not None else qs.filter(branch__isnull=True)

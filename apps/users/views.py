@@ -5,7 +5,7 @@ from rest_framework.exceptions import NotFound, PermissionDenied
 from rest_framework_simplejwt.views import TokenObtainPairView
 from django.http import Http404
 
-from .models import User, Industry, SubscriptionPlan, Feature, Sector, CustomRole, Company
+from .models import User, Industry, SubscriptionPlan, Feature, Sector, CustomRole, Company, Branch
 from .serializers import (
     UserSerializer,
     OwnerRegisterSerializer,
@@ -22,6 +22,9 @@ from .serializers import (
     CompanyUpdateSerializer,
     CustomRoleSerializer,
 )
+# сериализаторы филиала (read + write)
+from .serializers import BranchSerializer, BranchCreateUpdateSerializer
+
 from .permissions import IsCompanyOwner, IsCompanyOwnerOrAdmin
 
 
@@ -180,6 +183,8 @@ class CompanyUpdateAPIView(generics.RetrieveUpdateAPIView):
         if not company:
             raise Http404("Компания для текущего пользователя не найдена.")
         return company
+
+
 # ====================
 # 🎭 Управление кастомными ролями
 # ====================
@@ -214,7 +219,7 @@ class CustomRoleCreateAPIView(generics.CreateAPIView):
         serializer.save(company=company)
 
 
-# ❌ Удаление кастомной роли
+# ❌ Детали/удаление кастомной роли
 class CustomRoleDetailAPIView(generics.RetrieveUpdateDestroyAPIView):
     serializer_class = CustomRoleSerializer
     permission_classes = [IsAuthenticated, IsCompanyOwner]
@@ -229,3 +234,57 @@ class CustomRoleDetailAPIView(generics.RetrieveUpdateDestroyAPIView):
             return CustomRole.objects.none()
 
         return CustomRole.objects.filter(company=company)
+
+
+# =========================================
+# 🌿 Филиалы: список/создание/детали/редактирование/удаление
+# =========================================
+
+class BranchListCreateAPIView(generics.ListCreateAPIView):
+    serializer_class = BranchSerializer
+    permission_classes = [permissions.IsAuthenticated, IsCompanyOwnerOrAdmin]
+
+    def get_queryset(self):
+        if getattr(self, "swagger_fake_view", False):
+            return Branch.objects.none()
+        user = self.request.user
+        company = getattr(user, "owned_company", None) or getattr(user, "company", None)
+        return Branch.objects.filter(company=company) if company else Branch.objects.none()
+
+    def perform_create(self, serializer):
+        # ВАЖНО: НЕ передаём company сюда — сериализатор сам подставит
+        serializer.save()
+
+class BranchDetailAPIView(generics.RetrieveUpdateDestroyAPIView):
+    """
+    GET    /api/branches/<id>/
+    PATCH  /api/branches/<id>/   — править может owner/admin
+    DELETE /api/branches/<id>/   — удалять может owner/admin
+    """
+    permission_classes = [IsAuthenticated]
+    queryset = Branch.objects.none()  # будет заменён в get_queryset
+
+    def get_queryset(self):
+        if getattr(self, 'swagger_fake_view', False):
+            return Branch.objects.none()
+        user = self.request.user
+        company = getattr(user, "owned_company", None) or getattr(user, "company", None)
+        return Branch.objects.filter(company=company) if company else Branch.objects.none()
+
+    def get_serializer_class(self):
+        # чтение — read-only, запись — create/update
+        if self.request.method in ("GET", "HEAD"):
+            return BranchSerializer
+        return BranchCreateUpdateSerializer
+
+    def perform_update(self, serializer):
+        user = self.request.user
+        if not (user.is_superuser or user.role in ("owner", "admin")):
+            raise PermissionDenied("Недостаточно прав для изменения филиала.")
+        serializer.save()
+
+    def perform_destroy(self, instance):
+        user = self.request.user
+        if not (user.is_superuser or user.role in ("owner", "admin")):
+            raise PermissionDenied("Недостаточно прав для удаления филиала.")
+        instance.delete()
