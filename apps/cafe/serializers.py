@@ -161,8 +161,13 @@ class IngredientInlineSerializer(serializers.ModelSerializer):
 
     def get_fields(self):
         fields = super().get_fields()
-        # product принадлежит складу в скоупе
-        fields["product"].queryset = _scope_queryset_by_context(Warehouse.objects.all(), self.parent.parent)
+        # Раньше: self.parent.parent  →  падало в Swagger
+        holder = getattr(self, "root", None)
+        if isinstance(holder, CompanyBranchReadOnlyMixin):
+            fields["product"].queryset = _scope_queryset_by_context(Warehouse.objects.all(), holder)
+        else:
+            # нет контекста/корня (Swagger) — безопасно отдаём пусто
+            fields["product"].queryset = Warehouse.objects.none()
         return fields
 
     def validate(self, attrs):
@@ -263,9 +268,12 @@ class OrderItemInlineSerializer(serializers.ModelSerializer):
 
     def get_fields(self):
         fields = super().get_fields()
-        # получить родительский OrderSerializer
-        order_serializer = self.parent.parent
-        fields["menu_item"].queryset = _scope_queryset_by_context(MenuItem.objects.all(), order_serializer)
+        # Раньше: order_serializer = self.parent.parent
+        holder = getattr(self, "root", None)
+        if isinstance(holder, CompanyBranchReadOnlyMixin):
+            fields["menu_item"].queryset = _scope_queryset_by_context(MenuItem.objects.all(), holder)
+        else:
+            fields["menu_item"].queryset = MenuItem.objects.none()
         return fields
 
 
