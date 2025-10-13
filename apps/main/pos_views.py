@@ -37,6 +37,8 @@ from reportlab.lib.units import mm
 from typing import Iterable, List, Optional, Dict
 from reportlab.pdfbase.ttfonts import TTFont
 # from __future__ import annotations
+from apps.main.models import ManufactureSubreal, AgentSaleAllocation
+from apps.main.services_agent_pos import checkout_agent_cart, AgentNotEnoughStock
 from dataclasses import dataclass
 from apps.main.utils_numbers import ensure_sale_doc_number
 
@@ -1149,3 +1151,229 @@ class SaleAddCustomItemAPIView(APIView):
         # cart.recalc() не нужен: CartItem.save() уже пересчитает
 
         return Response(SaleCartSerializer(cart).data, status=status.HTTP_201_CREATED)
+
+
+def _agent_available_qty(user, company, product_id):
+    sub = ManufactureSubreal.objects.filter(company=company, agent_id=user.id, product_id=product_id)
+    accepted = sub.aggregate(s=Sum("qty_accepted"))["s"] or 0
+    returned = sub.aggregate(s=Sum("qty_returned"))["s"] or 0
+    sold = (AgentSaleAllocation.objects
+            .filter(company=company, agent=user, product_id=product_id)
+            .aggregate(s=Sum("qty"))["s"] or 0)
+    return int(accepted) - int(returned) - int(sold)
+
+class AgentCartStartAPIView(CompanyBranchRestrictedMixin, APIView):
+    permission_classes = [permissions.IsAuthenticated]
+
+    @transaction.atomic
+    def post(self, request, *args, **kwargs):
+        user = request.user
+        company = user.company
+
+        qs = (Cart.objects
+              .filter(company=company, user=user, status=Cart.Status.ACTIVE)
+              .order_by('-created_at'))
+        cart = qs.first()
+        if cart is None:
+            cart = Cart.objects.create(company=company, user=user, status=Cart.Status.ACTIVE)
+        else:
+            extra_ids = list(qs.values_list('id', flat=True)[1:])
+            if extra_ids:
+                Cart.objects.filter(id__in=extra_ids).update(
+                    status=Cart.Status.CHECKED_OUT
+                )
+
+        # опциональная суммовая скидка (как в обычной)
+        opts = StartCartOptionsSerializer(data=request.data)
+        if opts.is_valid():
+            order_disc = opts.validated_data.get("order_discount_total")
+            if order_disc is not None:
+                cart.order_discount_total = q2(order_disc)
+                cart.save(update_fields=["order_discount_total"])
+
+        cart.recalc()
+        return Response(SaleCartSerializer(cart).data, status=status.HTTP_201_CREATED)
+
+class AgentSaleScanAPIView(CompanyBranchRestrictedMixin, APIView):
+    permission_classes = [permissions.IsAuthenticated]
+
+    @transaction.atomic
+    def post(self, request, pk, *args, **kwargs):
+        cart = get_object_or_404(Cart, id=pk, company=request.user.company, status=Cart.Status.ACTIVE)
+        ser = ScanRequestSerializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+        barcode = ser.validated_data["barcode"].strip()
+        qty = ser.validated_data["quantity"]
+
+        product = Product.objects.filter(company=cart.company, barcode=barcode).first()
+        if not product:
+            return Response({"not_found": True, "message": "Товар не найден"}, status=404)
+
+        # проверяем доступность у агента (с учётом уже набранного в корзине)
+        available = _agent_available_qty(request.user, cart.company, product.id)
+        in_cart = CartItem.objects.filter(cart=cart, product=product).aggregate(s=Sum("quantity"))["s"] or 0
+        if qty + in_cart > available:
+            return Response({"detail": f"Недостаточно у агента. Доступно: {max(0, available - in_cart)}."}, status=400)
+
+        item, created = CartItem.objects.get_or_create(
+            cart=cart,
+            product=product,
+            defaults={
+                "company": cart.company,
+                "branch": getattr(cart, "branch", None),
+                "quantity": qty,
+                "unit_price": product.price,
+            },
+        )
+        if not created:
+            item.quantity += qty
+            item.save(update_fields=["quantity"])
+
+        cart.recalc()
+        return Response(SaleCartSerializer(cart).data, status=status.HTTP_201_CREATED)
+
+class AgentSaleAddItemAPIView(CompanyBranchRestrictedMixin, APIView):
+    permission_classes = [permissions.IsAuthenticated]
+
+    @transaction.atomic
+    def post(self, request, pk, *args, **kwargs):
+        cart = get_object_or_404(Cart, id=pk, company=request.user.company, status=Cart.Status.ACTIVE)
+        ser = AddItemSerializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+
+        product = get_object_or_404(Product, id=ser.validated_data["product_id"], company=cart.company)
+        qty = ser.validated_data["quantity"]
+
+        # проверка доступности у агента
+        available = _agent_available_qty(request.user, cart.company, product.id)
+        in_cart = CartItem.objects.filter(cart=cart, product=product).aggregate(s=Sum("quantity"))["s"] or 0
+        if qty + in_cart > available:
+            return Response({"detail": f"Недостаточно у агента. Доступно: {max(0, available - in_cart)}."}, status=400)
+
+        unit_price = ser.validated_data.get("unit_price")
+        line_discount = ser.validated_data.get("discount_total")
+        if unit_price is None:
+            if line_discount is not None:
+                per_unit_disc = q2(Decimal(line_discount) / Decimal(qty))
+                unit_price = q2(Decimal(product.price) - per_unit_disc)
+                if unit_price < 0:
+                    unit_price = Decimal("0.00")
+            else:
+                unit_price = product.price
+
+        item, created = CartItem.objects.get_or_create(
+            cart=cart,
+            product=product,
+            defaults={
+                "company": cart.company,
+                "branch": getattr(cart, "branch", None),
+                "quantity": qty,
+                "unit_price": unit_price,
+            },
+        )
+        if not created:
+            item.quantity += qty
+            item.unit_price = unit_price
+            item.save(update_fields=["quantity", "unit_price"])
+
+        cart.recalc()
+        return Response(SaleCartSerializer(cart).data, status=status.HTTP_201_CREATED)
+
+class AgentSaleAddCustomItemAPIView(CompanyBranchRestrictedMixin, APIView):
+    permission_classes = [permissions.IsAuthenticated]
+
+    @transaction.atomic
+    def post(self, request, pk, *args, **kwargs):
+        cart = get_object_or_404(Cart, id=pk, company=request.user.company, status=Cart.Status.ACTIVE)
+        ser = CustomCartItemCreateSerializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+
+        name = ser.validated_data["name"].strip()
+        if not name:
+            return Response({"name": "Название не может быть пустым."}, status=400)
+
+        price = q2(ser.validated_data["price"])
+        qty = ser.validated_data.get("quantity", 1)
+
+        item = CartItem.objects.filter(
+            cart=cart, product__isnull=True, custom_name=name, unit_price=price
+        ).first()
+
+        if item:
+            CartItem.objects.filter(pk=item.pk).update(quantity=F("quantity") + qty)
+            item.refresh_from_db(fields=["quantity"])
+        else:
+            CartItem.objects.create(
+                company=cart.company,
+                branch=getattr(cart, "branch", None),
+                cart=cart,
+                product=None,
+                custom_name=name,
+                unit_price=price,
+                quantity=qty,
+            )
+
+        return Response(SaleCartSerializer(cart).data, status=status.HTTP_201_CREATED)
+
+class AgentSaleCheckoutAPIView(CompanyBranchRestrictedMixin, APIView):
+    permission_classes = [permissions.IsAuthenticated]
+
+    @transaction.atomic
+    def post(self, request, pk, *args, **kwargs):
+        cart = get_object_or_404(Cart, id=pk, company=request.user.company, status=Cart.Status.ACTIVE)
+
+        ser = CheckoutSerializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+        print_receipt = ser.validated_data["print_receipt"]
+        client_id = ser.validated_data.get("client_id")
+
+        department = None
+        department_id = ser.validated_data.get("department_id")
+        if department_id:
+            department = get_object_or_404(Department, id=department_id, company=request.user.company)
+
+        if client_id:
+            client = get_object_or_404(Client, id=client_id, company=request.user.company)
+            cart.client = client  # если у Cart есть поле client — иначе пропустите
+            try:
+                cart.save(update_fields=["client"])
+            except Exception:
+                pass
+
+        try:
+            sale = checkout_agent_cart(cart, department=department)
+        except AgentNotEnoughStock as e:
+            return Response({"detail": str(e)}, status=400)
+        except ValueError as e:
+            return Response({"detail": str(e)}, status=400)
+
+        # синхронизация branch как в обычной продаже
+        if hasattr(sale, "branch_id") and hasattr(cart, "branch_id") and sale.branch_id != cart.branch_id:
+            sale.branch_id = cart.branch_id
+            sale.save(update_fields=["branch"])
+
+        payload = {
+            "sale_id": str(sale.id),
+            "status": sale.status,
+            "subtotal": f"{sale.subtotal:.2f}",
+            "discount_total": f"{sale.discount_total:.2f}",
+            "tax_total": f"{sale.tax_total:.2f}",
+            "total": f"{sale.total:.2f}",
+            "client": str(sale.client_id) if sale.client_id else None,
+            "client_name": getattr(sale.client, "full_name", None) if sale.client else None,
+        }
+
+        if print_receipt:
+            lines = [
+                f"{(it.name_snapshot or '')[:40]} x{it.quantity} = { (it.unit_price or 0) * (it.quantity or 0):.2f}"
+                for it in sale.items.all()
+            ]
+            totals = [f"СУММА: {sale.subtotal:.2f}"]
+            if sale.discount_total and sale.discount_total > 0:
+                totals.append(f"СКИДКА: {sale.discount_total:.2f}")
+            if sale.tax_total and sale.tax_total > 0:
+                totals.append(f"НАЛОГ: {sale.tax_total:.2f}")
+            totals.append(f"ИТОГО: {sale.total:.2f}")
+            payload["receipt_text"] = "ЧЕК\n" + "\n".join(lines) + "\n" + "\n".join(totals)
+
+        return Response(payload, status=status.HTTP_201_CREATED)

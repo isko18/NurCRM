@@ -154,6 +154,12 @@ name="client-reconciliation",),
     # Агент: свои товары
     # -------------------------
     path("agents/me/products/", AgentMyProductsListAPIView.as_view(), name="agent-my-products"),
+    
+    path("agents/me/cart/start/", AgentCartStartAPIView.as_view()),
+    path("agents/me/carts/<uuid:pk>/scan/", AgentSaleScanAPIView.as_view()),
+    path("agents/me/carts/<uuid:pk>/add-item/", AgentSaleAddItemAPIView.as_view()),
+    path("agents/me/carts/<uuid:pk>/custom-item/", AgentSaleAddCustomItemAPIView.as_view()),
+    path("agents/me/carts/<uuid:pk>/checkout/", AgentSaleCheckoutAPIView.as_view()),
 ]
 
 
