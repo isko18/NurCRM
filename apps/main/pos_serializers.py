@@ -315,3 +315,5 @@ class SaleStatusUpdateSerializer(serializers.ModelSerializer):
     class Meta:
         model = Sale
         fields = ("status",)
+
+

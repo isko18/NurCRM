@@ -1845,3 +1845,21 @@ class ReturnFromAgent(models.Model):
         self.accepted_by = by_user
         self.accepted_at = timezone.now()
         super().save(update_fields=["status", "accepted_by", "accepted_at"])
+
+
+
+class AgentSaleAllocation(models.Model):
+    company   = models.ForeignKey("users.Company", on_delete=models.CASCADE)
+    agent     = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, db_index=True)
+    subreal   = models.ForeignKey("main.ManufactureSubreal", on_delete=models.CASCADE, related_name="sale_allocations", db_index=True)
+    sale      = models.ForeignKey("main.Sale", on_delete=models.CASCADE, related_name="agent_allocations")
+    sale_item = models.ForeignKey("main.SaleItem", on_delete=models.CASCADE, related_name="agent_allocations")
+    product   = models.ForeignKey("main.Product", on_delete=models.PROTECT)
+    qty       = models.PositiveIntegerField()
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        indexes = [
+            models.Index(fields=["agent", "product"]),
+            models.Index(fields=["subreal", "product"]),
+        ]
