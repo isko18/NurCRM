@@ -1403,3 +1403,5 @@ class AgentProductOnHandSerializer(serializers.Serializer):
     qty_on_hand = serializers.IntegerField()
     last_movement_at = serializers.DateTimeField(allow_null=True)
     subreals = AgentSubrealSerializer(many=True)
+
+

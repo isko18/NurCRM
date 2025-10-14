@@ -1377,3 +1377,74 @@ class AgentSaleCheckoutAPIView(CompanyBranchRestrictedMixin, APIView):
             payload["receipt_text"] = "ЧЕК\n" + "\n".join(lines) + "\n" + "\n".join(totals)
 
         return Response(payload, status=status.HTTP_201_CREATED)
+    
+    
+class AgentCartItemUpdateDestroyAPIView(APIView):
+    """
+    PATCH /api/main/agents/me/carts/<uuid:cart_id>/items/<uuid:item_id>/
+      body: {"quantity": <int >= 0>}
+      quantity == 0 -> удалить позицию
+      quantity > 0  -> установить новое количество
+
+    DELETE /api/main/agents/me/carts/<uuid:cart_id>/items/<uuid:item_id>/
+      удалить позицию
+
+    Примечание:
+      item_id может быть как ID позиции корзины, так и ID товара.
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    def _get_active_cart(self, request, cart_id):
+        # корзина именно этого пользователя-агента и его компании
+        return get_object_or_404(
+            Cart,
+            id=cart_id,
+            company=request.user.company,
+            user=request.user,
+            status=Cart.Status.ACTIVE,
+        )
+
+    def _get_item_in_cart(self, cart, item_or_product_id):
+        # 1) как ID позиции корзины
+        item = CartItem.objects.filter(cart=cart, id=item_or_product_id).first()
+        if item:
+            return item
+
+        # 2) как ID товара (некоторые фронты шлют product_id)
+        item = CartItem.objects.filter(cart=cart, product_id=item_or_product_id).first()
+        if item:
+            return item
+
+        raise Http404("CartItem not found in this cart.")
+
+    @transaction.atomic
+    def patch(self, request, cart_id, item_id, *args, **kwargs):
+        cart = self._get_active_cart(request, cart_id)
+        item = self._get_item_in_cart(cart, item_id)
+
+        # Валидация количества
+        try:
+            qty = int(request.data.get("quantity"))
+        except (TypeError, ValueError):
+            return Response({"quantity": "Укажите целое число >= 0."}, status=400)
+
+        if qty < 0:
+            return Response({"quantity": "Количество не может быть отрицательным."}, status=400)
+
+        if qty == 0:
+            item.delete()
+            cart.recalc()
+            return Response(SaleCartSerializer(cart).data, status=200)
+
+        item.quantity = qty
+        item.save(update_fields=["quantity"])
+        cart.recalc()
+        return Response(SaleCartSerializer(cart).data, status=200)
+
+    @transaction.atomic
+    def delete(self, request, cart_id, item_id, *args, **kwargs):
+        cart = self._get_active_cart(request, cart_id)
+        item = self._get_item_in_cart(cart, item_id)
+        item.delete()
+        cart.recalc()
+        return Response(SaleCartSerializer(cart).data, status=200)

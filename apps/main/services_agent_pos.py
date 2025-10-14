@@ -2,12 +2,25 @@
 from decimal import Decimal
 from django.db import transaction
 from django.db.models import Sum
+from django.db import models
 from apps.main.models import (
     Sale, SaleItem, Product, ManufactureSubreal, AgentSaleAllocation
 )
 
 class AgentNotEnoughStock(Exception):
     pass
+
+
+def model_has_field(model, field_name: str) -> bool:
+    """
+    Возвращает True, если у модели есть поле с именем field_name.
+    Безопасно для вызова на любом Django model class.
+    """
+    try:
+        return any(f.name == field_name for f in model._meta.get_fields())
+    except Exception:
+        return False
+
 
 @transaction.atomic
 def checkout_agent_cart(cart, *, department=None):
@@ -62,21 +75,28 @@ def checkout_agent_cart(cart, *, department=None):
         need = int(v["qty"] or 0)
         have = sum(q for _, q in fifo.get(pid, []))
         if need > have:
-            raise AgentNotEnoughStock(f"Недостаточно у агента: «{v['product'].name}». Нужно {need}, доступно {have}.")
+            raise AgentNotEnoughStock(
+                f"Недостаточно у агента: «{v['product'].name}». Нужно {need}, доступно {have}."
+            )
 
-    # 4) создаём Sale как обычно
-    sale = Sale.objects.create(
+    # 4) создаём Sale как обычно — добавляем ТОЛЬКО существующие поля
+    create_kwargs = dict(
         company=company,
-        branch=branch if hasattr(Sale, "branch") else None,
         user=user,
         status=Sale.Status.PAID,  # или ваша логика статуса
-        client=getattr(cart, "client", None) if hasattr(cart, "client") else None,
-        department=department if hasattr(Sale, "department") else None,
         subtotal=Decimal("0.00"),
         discount_total=cart.order_discount_total or Decimal("0.00"),
         tax_total=Decimal("0.00"),
         total=Decimal("0.00"),
     )
+    if model_has_field(Sale, "branch"):
+        create_kwargs["branch"] = branch
+    if model_has_field(Sale, "client") and getattr(cart, "client", None) is not None:
+        create_kwargs["client"] = cart.client
+    if model_has_field(Sale, "department") and department is not None:
+        create_kwargs["department"] = department
+
+    sale = Sale.objects.create(**create_kwargs)
 
     allocations = []
     subtotal = Decimal("0.00")
