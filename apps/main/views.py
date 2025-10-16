@@ -1,13 +1,14 @@
 from decimal import Decimal
 
 from django.db import transaction
-from django.db.models import Sum, Count, Avg, F, Q, Prefetch
+from django.db.models import Sum, Count, Avg, F, Q, Prefetch, Value as V
 from django.utils.dateparse import parse_date
 from django.utils import timezone
 from itertools import groupby
 from typing import List, Optional, Dict, Any
 from operator import attrgetter
 from datetime import datetime
+from django.db.models.functions import Coalesce
 
 from rest_framework import generics, permissions, filters, status
 from rest_framework.permissions import IsAuthenticated
@@ -27,7 +28,7 @@ from apps.main.models import (
     ProductBrand, ProductCategory, Warehouse, WarehouseEvent, Client,
     GlobalProduct, GlobalBrand, GlobalCategory, ClientDeal, Bid, SocialApplications, TransactionRecord,
     ContractorWork, DealInstallment, DebtPayment, Debt, ObjectSaleItem, ObjectSale, ObjectItem, ItemMake,
-    ManufactureSubreal, Acceptance, ReturnFromAgent
+    ManufactureSubreal, Acceptance, ReturnFromAgent, AgentSaleAllocation
 )
 from apps.main.serializers import (
     ContactSerializer, PipelineSerializer, DealSerializer, TaskSerializer,
@@ -1651,6 +1652,8 @@ class AgentMyProductsListAPIView(APIView, CompanyBranchRestrictedMixin):
         accepted_returns_qs = ReturnFromAgent.objects.filter(
             status=ReturnFromAgent.Status.ACCEPTED
         )
+        alloc_qs = AgentSaleAllocation.objects.only("id", "subreal_id", "qty")
+
         base = (
             ManufactureSubreal.objects
             .filter(agent_id=request.user.id)
@@ -1658,7 +1661,9 @@ class AgentMyProductsListAPIView(APIView, CompanyBranchRestrictedMixin):
             .prefetch_related(
                 "acceptances",
                 Prefetch("returns", queryset=accepted_returns_qs, to_attr="accepted_returns"),
+                Prefetch("sale_allocations", queryset=alloc_qs, to_attr="prefetched_allocs"),
             )
+            .annotate(sold_qty=Coalesce(Sum("sale_allocations__qty"), V(0)))  # ← добавили
             .order_by("product_id", "-created_at")
         )
         return self._filter_qs_company_branch(base)
@@ -1668,13 +1673,24 @@ class AgentMyProductsListAPIView(APIView, CompanyBranchRestrictedMixin):
         return int(v or 0)
 
     def _serialize_products(self, qs) -> List[Dict[str, Any]]:
+        def _sold_for_sub(s):
+            # сначала берём аннотацию, если есть; иначе — из префетча
+            ann = self._nz(getattr(s, "sold_qty", 0))
+            if ann:
+                return ann
+            return sum(self._nz(a.qty) for a in getattr(s, "prefetched_allocs", []))
+
         data = []
         for product_id, subreals_iter in groupby(qs, key=attrgetter("product_id")):
             subreals = list(subreals_iter)
 
-            qty_on_hand = sum(
-                (self._nz(s.qty_accepted) - self._nz(s.qty_returned)) for s in subreals
-            )
+            qty_on_hand = 0
+            for s in subreals:
+                accepted = self._nz(s.qty_accepted)
+                returned = self._nz(s.qty_returned)
+                sold     = _sold_for_sub(s)
+                qty_on_hand += max(accepted - returned - sold, 0)
+
             if qty_on_hand <= 0:
                 continue
 
@@ -1691,24 +1707,24 @@ class AgentMyProductsListAPIView(APIView, CompanyBranchRestrictedMixin):
 
             last_movement_at = max(movement_dates) if movement_dates else None
 
-            subreals_payload = [
-                {
+            subreals_payload = []
+            for s in subreals:
+                accepted = self._nz(s.qty_accepted)
+                returned = self._nz(s.qty_returned)
+                sold     = _sold_for_sub(s)
+                subreals_payload.append({
                     "id": s.id,
                     "created_at": s.created_at,
                     "qty_transferred": self._nz(s.qty_transferred),
-                    "qty_accepted": self._nz(s.qty_accepted),
-                    "qty_returned": self._nz(s.qty_returned),
-                }
-                for s in subreals
-            ]
+                    "qty_accepted": accepted,
+                    "qty_returned": returned,
+                    "qty_sold": sold,                       # ← добавили
+                    "qty_on_hand": max(accepted - returned - sold, 0),  # ← добавили
+                })
 
             data.append({
                 "product": product_id,
-                "product_name": (
-                    subreals[0].product.name
-                    if (subreals and getattr(subreals[0], "product", None))
-                    else ""
-                ),
+                "product_name": (subreals[0].product.name if (subreals and getattr(subreals[0], "product", None)) else ""),
                 "qty_on_hand": qty_on_hand,
                 "last_movement_at": last_movement_at,
                 "subreals": subreals_payload,
@@ -1833,39 +1849,42 @@ class OwnerAgentsProductsListAPIView(APIView, CompanyBranchRestrictedMixin):
         return int(v or 0)
 
     def _build_queryset(self, request):
-        """
-        Готовим базовый набор передач по КОМПАНИИ/ФИЛИАЛУ для всех агентов,
-        с префетчем приёмов и только принятых возвратов.
-        """
         accepted_returns_qs = ReturnFromAgent.objects.filter(
             status=ReturnFromAgent.Status.ACCEPTED
         )
+        alloc_qs = AgentSaleAllocation.objects.only("id", "subreal_id", "qty")
+
         base = (
             ManufactureSubreal.objects
-            .select_related("product", "agent")  # важно: тянем агента
+            .select_related("product", "agent")
             .prefetch_related(
                 "acceptances",
                 Prefetch("returns", queryset=accepted_returns_qs, to_attr="accepted_returns"),
+                Prefetch("sale_allocations", queryset=alloc_qs, to_attr="prefetched_allocs"),
             )
+            .annotate(sold_qty=Coalesce(Sum("sale_allocations__qty"), V(0)))
             .order_by("agent_id", "product_id", "-created_at")
         )
-        # ограничение по company/branch из миксина
         return self._filter_qs_company_branch(base)
 
     def _serialize_products_for_agent(self, subreals_qs) -> List[Dict[str, Any]]:
-        """
-        На вход — subreal'ы одного агента (уже отфильтрованные по агенту),
-        на выход — список продуктов в формате AgentProductOnHandSerializer.
-        """
-        data: List[Dict[str, Any]] = []
+        def _sold_for_sub(s):
+            ann = self._nz(getattr(s, "sold_qty", 0))
+            if ann:
+                return ann
+            return sum(self._nz(a.qty) for a in getattr(s, "prefetched_allocs", []))
 
-        # группируем по product_id
+        data: List[Dict[str, Any]] = []
         for product_id, subreals_iter in groupby(subreals_qs, key=attrgetter("product_id")):
             subreals = list(subreals_iter)
 
-            qty_on_hand = sum(
-                (self._nz(s.qty_accepted) - self._nz(s.qty_returned)) for s in subreals
-            )
+            qty_on_hand = 0
+            for s in subreals:
+                accepted = self._nz(s.qty_accepted)
+                returned = self._nz(s.qty_returned)
+                sold     = _sold_for_sub(s)
+                qty_on_hand += max(accepted - returned - sold, 0)
+
             if qty_on_hand <= 0:
                 continue
 
@@ -1882,30 +1901,29 @@ class OwnerAgentsProductsListAPIView(APIView, CompanyBranchRestrictedMixin):
 
             last_movement_at = max(movement_dates) if movement_dates else None
 
-            subreals_payload = [
-                {
+            subreals_payload = []
+            for s in subreals:
+                accepted = self._nz(s.qty_accepted)
+                returned = self._nz(s.qty_returned)
+                sold     = _sold_for_sub(s)
+                subreals_payload.append({
                     "id": s.id,
                     "created_at": s.created_at,
                     "qty_transferred": self._nz(s.qty_transferred),
-                    "qty_accepted": self._nz(s.qty_accepted),
-                    "qty_returned": self._nz(s.qty_returned),
-                }
-                for s in subreals
-            ]
+                    "qty_accepted": accepted,
+                    "qty_returned": returned,
+                    "qty_sold": sold,                       # ← добавили
+                    "qty_on_hand": max(accepted - returned - sold, 0),  # ← добавили
+                })
 
             data.append({
                 "product": product_id,
-                "product_name": (
-                    subreals[0].product.name
-                    if (subreals and getattr(subreals[0], "product", None))
-                    else ""
-                ),
+                "product_name": (subreals[0].product.name if (subreals and getattr(subreals[0], "product", None)) else ""),
                 "qty_on_hand": qty_on_hand,
                 "last_movement_at": last_movement_at,
                 "subreals": subreals_payload,
             })
         return data
-
     # -------- GET --------
     def get(self, request, *args, **kwargs):
         # если нужно ограничить доступ только owner'у — включи проверку тут:
