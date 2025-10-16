@@ -23,51 +23,62 @@ def model_has_field(model, field_name: str) -> bool:
 
 
 @transaction.atomic
-def checkout_agent_cart(cart, *, department=None):
+def checkout_agent_cart(cart, *, department=None, agent=None):
     """
-    Чекаут корзины агента.
-    Создаёт Sale/SaleItem как обычная продажа, но списание идёт по партиям агента (ManufactureSubreal)
-    через AgentSaleAllocation. Склад Product.quantity не трогаем.
+    Чекаут корзины с продажей от лица АГЕНТА (может быть отличен от cart.user).
+    Создаёт Sale/SaleItem как обычная продажа, а списание идёт по партиям агента (ManufactureSubreal)
+    через AgentSaleAllocation. Склад Product.quantity НЕ трогаем.
+
+    :param cart:     корзина
+    :param department: опционально, подразделение для продажи
+    :param agent:    пользователь-агент, у которого списываем (если None — берём cart.user)
     """
     company = cart.company
-    user    = cart.user
+    operator = cart.user                # кто оформляет (кассир / владелец)
+    acting_agent = agent or cart.user   # у кого списываем “на руках”
     branch  = getattr(cart, "branch", None)
 
-    # 1) агрегируем потребности
+    # 1) агрегируем потребности (по продуктам и кастомным позициям)
     needs = {}
     for it in cart.items.select_related("product"):
         if it.product is None:
             key = f"custom:{it.custom_name}:{it.unit_price}"
             needs.setdefault(key, {"custom_name": it.custom_name, "unit_price": it.unit_price, "qty": 0})
-            needs[key]["qty"] += it.quantity or 0
+            needs[key]["qty"] += int(it.quantity or 0)
             continue
+
         pid = str(it.product_id)
-        needs.setdefault(pid, {"product": it.product, "unit_price": it.unit_price, "qty": 0})
-        needs[pid]["qty"] += it.quantity or 0
+        if pid not in needs:
+            needs[pid] = {"product": it.product, "unit_price": it.unit_price, "qty": 0}
+        needs[pid]["qty"] += int(it.quantity or 0)
 
-    # 2) подготовим FIFO остатки агента
+    # 2) подготовим FIFO остатки КОНКРЕТНОГО агента (acting_agent)
     product_ids = [v["product"].id for k, v in needs.items() if not k.startswith("custom:")]
-
-    subreals = (
-        ManufactureSubreal.objects
-        .filter(agent_id=user.id, product_id__in=product_ids, company=company)
-        .select_related("product")
-        .order_by("product_id", "created_at", "id")
-    )
-    sold_map = (
-        AgentSaleAllocation.objects
-        .filter(agent=user, company=company, product_id__in=product_ids)
-        .values("subreal_id").annotate(s=Sum("qty"))
-    )
-    sold_by_subreal = {r["subreal_id"]: int(r["s"] or 0) for r in sold_map}
+    if product_ids:
+        subreals = (
+            ManufactureSubreal.objects
+            .filter(agent_id=acting_agent.id, product_id__in=product_ids, company=company)
+            .select_related("product")
+            .order_by("product_id", "created_at", "id")
+        )
+        sold_map = (
+            AgentSaleAllocation.objects
+            .filter(agent=acting_agent, company=company, product_id__in=product_ids)
+            .values("subreal_id").annotate(s=Sum("qty"))
+        )
+        sold_by_subreal = {r["subreal_id"]: int(r["s"] or 0) for r in sold_map}
+    else:
+        subreals = []
+        sold_by_subreal = {}
 
     fifo = {}
     for s in subreals:
+        # доступно по этой передаче: принято - возвращено - уже распределено в прошлых продажах
         free = max(0, int(s.qty_accepted or 0) - int(s.qty_returned or 0) - int(sold_by_subreal.get(s.id, 0)))
         if free > 0:
             fifo.setdefault(str(s.product_id), []).append([s, free])
 
-    # 3) проверка достаточности
+    # 3) проверка достаточности остатков агента
     for k, v in needs.items():
         if k.startswith("custom:"):
             continue
@@ -79,11 +90,11 @@ def checkout_agent_cart(cart, *, department=None):
                 f"Недостаточно у агента: «{v['product'].name}». Нужно {need}, доступно {have}."
             )
 
-    # 4) создаём Sale как обычно — добавляем ТОЛЬКО существующие поля
+    # 4) создаём Sale — только с реально существующими полями
     create_kwargs = dict(
         company=company,
-        user=user,
-        status=Sale.Status.PAID,  # или ваша логика статуса
+        user=operator,                   # оператор, кто оформляет
+        status=Sale.Status.PAID,         # либо ваша логика статуса
         subtotal=Decimal("0.00"),
         discount_total=cart.order_discount_total or Decimal("0.00"),
         tax_total=Decimal("0.00"),
@@ -101,39 +112,47 @@ def checkout_agent_cart(cart, *, department=None):
     allocations = []
     subtotal = Decimal("0.00")
 
-    # 5) перенос позиций + FIFO-распределение по партиям агента
+    # 5) перенос позиций в Sale + FIFO-распределение по партиям агента
     for k, v in needs.items():
         if k.startswith("custom:"):
             qty = int(v["qty"])
-            price = v["unit_price"]
+            price = v["unit_price"] or Decimal("0.00")
             SaleItem.objects.create(
                 sale=sale, product=None,
                 name_snapshot=v["custom_name"], barcode_snapshot=None,
                 unit_price=price, quantity=qty
             )
-            subtotal += (price or 0) * qty
+            subtotal += (price or Decimal("0.00")) * qty
             continue
 
         product = v["product"]
         qty = int(v["qty"])
-        price = v["unit_price"] or product.price
+        price = v["unit_price"] or product.price or Decimal("0.00")
 
         sitem = SaleItem.objects.create(
             sale=sale, product=product,
             name_snapshot=product.name, barcode_snapshot=product.barcode,
             unit_price=price, quantity=qty
         )
-        subtotal += (price or 0) * qty
+        subtotal += (price or Decimal("0.00")) * qty
 
+        # FIFO
         left = qty
-        queue = fifo[str(product.id)]
+        queue = fifo.get(str(product.id), [])
         while left > 0 and queue:
             subr, free = queue[0]
             take = min(left, free)
+
             allocations.append(AgentSaleAllocation(
-                company=company, agent=user, subreal=subr,
-                sale=sale, sale_item=sitem, product=product, qty=take
+                company=company,
+                agent=acting_agent,     # ← КЛЮЧЕВОЕ: списываем у acting_agent
+                subreal=subr,
+                sale=sale,
+                sale_item=sitem,
+                product=product,
+                qty=take,
             ))
+
             free -= take
             left -= take
             if free == 0:
