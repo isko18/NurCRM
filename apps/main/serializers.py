@@ -1126,17 +1126,21 @@ class ItemMakeSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer
 # ===========================
 class ManufactureSubrealSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
     company = serializers.ReadOnlyField(source="company.id")
-    branch = serializers.ReadOnlyField(source="branch.id")
+    branch  = serializers.ReadOnlyField(source="branch.id")
 
     product_name = serializers.ReadOnlyField(source="product.name")
 
-    # ✅ Поля агента: имя, фамилия и номер машины
-    agent_first_name = serializers.ReadOnlyField(source="agent.first_name")
-    agent_last_name = serializers.ReadOnlyField(source="agent.last_name")
+    # Поля агента: имя, фамилия и номер машины
+    agent_first_name  = serializers.ReadOnlyField(source="agent.first_name")
+    agent_last_name   = serializers.ReadOnlyField(source="agent.last_name")
     agent_track_number = serializers.ReadOnlyField(source="agent.track_number")
 
+    # вычисляемые
     qty_remaining = serializers.ReadOnlyField()
-    qty_on_agent = serializers.ReadOnlyField()
+    qty_on_agent  = serializers.ReadOnlyField()
+
+    # ⬇️ НОВОЕ поле — “пилорама” на уровне КОНКРЕТНОЙ передачи
+    is_sawmill = serializers.BooleanField(required=False, default=False)
 
     class Meta:
         model = ManufactureSubreal
@@ -1145,6 +1149,7 @@ class ManufactureSubrealSerializer(CompanyBranchReadOnlyMixin, serializers.Model
             "user",
             "agent", "agent_first_name", "agent_last_name", "agent_track_number",
             "product", "product_name",
+            "is_sawmill",                 # ← добавили
             "qty_transferred", "qty_accepted", "qty_returned",
             "qty_remaining", "qty_on_agent",
             "status", "created_at",
@@ -1160,26 +1165,41 @@ class ManufactureSubrealSerializer(CompanyBranchReadOnlyMixin, serializers.Model
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         comp = self._user_company()
-        br = self._auto_branch()
+        br   = self._auto_branch()
         _restrict_pk_queryset_strict(self.fields.get("product"), Product.objects.all(), comp, br)
         if comp and self.fields.get("agent"):
             self.fields["agent"].queryset = User.objects.filter(company=comp)
 
     def validate(self, attrs):
         company = self._user_company()
+        branch  = self._auto_branch()
+
         product = attrs.get("product")
         if product is not None and product.company_id != getattr(company, "id", None):
             raise serializers.ValidationError({"product": "Товар другой компании."})
+
+        # строгая проверка филиала (если у вас режим “строгих филиалов”)
+        if branch is not None and product is not None and product.branch_id not in (None, branch.id):
+            raise serializers.ValidationError({"product": "Товар другого филиала."})
 
         agent = attrs.get("agent")
         if agent is not None:
             agent_company_id = getattr(agent, "company_id", None)
             if agent_company_id and agent_company_id != getattr(company, "id", None):
                 raise serializers.ValidationError({"agent": "Агент другой компании."})
+
+        # qty_transferred > 0 — обычно требование для создания передачи
+        qty = attrs.get("qty_transferred")
+        if qty is not None and qty < 1:
+            raise serializers.ValidationError({"qty_transferred": "Минимум 1."})
+
         return attrs
 
     def create(self, validated_data):
-        validated_data["user"] = self._user()
+        # сервер выставляет связь с компанией/филиалом/пользователем
+        validated_data["user"]    = self._user()
+        validated_data["company"] = self._user_company()
+        validated_data["branch"]  = self._auto_branch()
         return super().create(validated_data)
 
 
@@ -1191,9 +1211,9 @@ class AcceptanceCreateSerializer(serializers.ModelSerializer):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        req = self.context.get("request")
+        req  = self.context.get("request")
         comp = getattr(getattr(req, "user", None), "company", None)
-        br = _active_branch(self)
+        br   = _active_branch(self)
         if comp and self.fields.get("subreal"):
             qs = ManufactureSubreal.objects.filter(company=comp)
             qs = qs.filter(branch=br) if br else qs.filter(branch__isnull=True)
@@ -1258,9 +1278,9 @@ class ReturnCreateSerializer(serializers.ModelSerializer):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        req = self.context.get("request")
+        req  = self.context.get("request")
         comp = getattr(getattr(req, "user", None), "company", None)
-        br = _active_branch(self)
+        br   = _active_branch(self)
         if comp and self.fields.get("subreal"):
             qs = ManufactureSubreal.objects.filter(company=comp)
             qs = qs.filter(branch=br) if br else qs.filter(branch__isnull=True)
@@ -1342,6 +1362,8 @@ class ReturnApproveSerializer(serializers.Serializer):
 class BulkSubrealItemSerializer(serializers.Serializer):
     product = serializers.PrimaryKeyRelatedField(queryset=Product.objects.all())
     qty_transferred = serializers.IntegerField(min_value=1)
+    # ⬇️ НОВОЕ поле для item в bulk-выдаче
+    is_sawmill = serializers.BooleanField(required=False, default=False)
 
 
 class BulkSubrealCreateSerializer(serializers.Serializer):
@@ -1350,9 +1372,9 @@ class BulkSubrealCreateSerializer(serializers.Serializer):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        req = self.context.get("request")
+        req  = self.context.get("request")
         comp = getattr(getattr(req, "user", None), "company", None)
-        br = _active_branch(self)
+        br   = _active_branch(self)
         if comp:
             self.fields["agent"].queryset = User.objects.filter(company=comp)
             prod_qs = Product.objects.filter(company=comp)
@@ -1377,17 +1399,24 @@ class BulkSubrealCreateSerializer(serializers.Serializer):
             if prod.company_id != company_id:
                 raise serializers.ValidationError({"items": {i: {"product": "Товар другой компании."}}})
 
-        # сжимаем дубликаты
+        # сжимаем дубликаты по product, суммируя qty и OR по is_sawmill
         merged = {}
         for item in attrs["items"]:
             key = item["product"].pk
-            merged[key] = merged.get(key, 0) + int(item["qty_transferred"])
+            prev = merged.get(key)
+            if prev is None:
+                merged[key] = {
+                    "product": item["product"],
+                    "qty_transferred": int(item["qty_transferred"]),
+                    "is_sawmill": bool(item.get("is_sawmill", False)),
+                }
+            else:
+                prev["qty_transferred"] += int(item["qty_transferred"])
+                # если хотя бы один из дублей is_sawmill=True — считаем TRUE
+                prev["is_sawmill"] = prev["is_sawmill"] or bool(item.get("is_sawmill", False))
+
         if len(merged) != len(attrs["items"]):
-            new_items = []
-            for prod_id, qty in merged.items():
-                prod_obj = next(x["product"] for x in attrs["items"] if x["product"].pk == prod_id)
-                new_items.append({"product": prod_obj, "qty_transferred": qty})
-            attrs["items"] = new_items
+            attrs["items"] = list(merged.values())
 
         return attrs
 
@@ -1409,5 +1438,3 @@ class AgentProductOnHandSerializer(serializers.Serializer):
     qty_on_hand = serializers.IntegerField()
     last_movement_at = serializers.DateTimeField(allow_null=True)
     subreals = AgentSubrealSerializer(many=True)
-
-
