@@ -1670,9 +1670,21 @@ class ObjectSaleItem(models.Model):
 # ==========================
 # ManufactureSubreal / Acceptance / ReturnFromAgent
 # ==========================
+# models.py
+import uuid
+from django.conf import settings
+from django.core.exceptions import ValidationError
+from django.db import models, transaction
+from django.db.models import F
+from django.utils import timezone
+
+# предполагаю, что Company, Branch, Product уже импортируются/определены выше
+# from .models import Company, Branch, Product  # скорректируйте путь при необходимости
+
+
 class ManufactureSubreal(models.Model):
     class Status(models.TextChoices):
-        OPEN = "open", "Открыта"
+        OPEN   = "open",   "Открыта"
         CLOSED = "closed", "Закрыта"
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
@@ -1685,9 +1697,14 @@ class ManufactureSubreal(models.Model):
     agent = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.PROTECT, related_name="subreals_as_agent")
     product = models.ForeignKey("Product", on_delete=models.PROTECT, related_name="subreals")
 
+    # ⬇️ новое поле — решаем “это пилорама?” на уровне КОНКРЕТНОЙ передачи
+    is_sawmill = models.BooleanField(
+        default=False, db_index=True, help_text="Если True — авто-приём на весь объём при создании."
+    )
+
     qty_transferred = models.PositiveIntegerField()
-    qty_accepted = models.PositiveIntegerField(default=0)
-    qty_returned = models.PositiveIntegerField(default=0)
+    qty_accepted    = models.PositiveIntegerField(default=0)
+    qty_returned    = models.PositiveIntegerField(default=0)
 
     status = models.CharField(max_length=10, choices=Status.choices, default=Status.OPEN, db_index=True)
     created_at = models.DateTimeField(auto_now_add=True)
@@ -1699,6 +1716,8 @@ class ManufactureSubreal(models.Model):
             models.Index(fields=["company", "agent", "product", "status"]),
             models.Index(fields=["company", "branch", "agent", "product", "status"]),
             models.Index(fields=["created_at"]),
+            # можно добавить композитный индекс, если часто фильтруете по is_sawmill
+            models.Index(fields=["company", "is_sawmill", "status"]),
         ]
 
     def __str__(self):
@@ -1732,6 +1751,30 @@ class ManufactureSubreal(models.Model):
         if self.qty_remaining == 0 and self.status != self.Status.CLOSED:
             self.status = self.Status.CLOSED
             self.save(update_fields=["status"])
+
+    # ⬇️ Удобный метод: авто-приём, если is_sawmill=True
+    @transaction.atomic
+    def auto_accept_if_needed(self, by_user):
+        """
+        Если передача помечена как is_sawmill=True, создаёт Acceptance
+        на весь доступный остаток (qty_remaining) в одной транзакции.
+        Идempotent: несколько вызовов подряд не приведут к лишним приёмам.
+        """
+        if not self.is_sawmill:
+            return
+        # Лочим актуальную запись, чтобы избежать гонок
+        locked = type(self).objects.select_for_update().select_related("company", "branch").get(pk=self.pk)
+        remaining = locked.qty_remaining
+        if remaining <= 0:
+            return
+        Acceptance.objects.create(
+            company=locked.company,
+            branch=locked.branch,
+            subreal=locked,
+            accepted_by=by_user,
+            qty=remaining,
+            accepted_at=timezone.now(),
+        )
 
 
 class Acceptance(models.Model):
@@ -1845,7 +1888,6 @@ class ReturnFromAgent(models.Model):
         self.accepted_by = by_user
         self.accepted_at = timezone.now()
         super().save(update_fields=["status", "accepted_by", "accepted_at"])
-
 
 
 class AgentSaleAllocation(models.Model):

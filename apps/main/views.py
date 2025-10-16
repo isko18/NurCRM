@@ -1,11 +1,13 @@
 from decimal import Decimal
 
 from django.db import transaction
-from django.db.models import Sum, Count, Avg, F, Q
+from django.db.models import Sum, Count, Avg, F, Q, Prefetch
 from django.utils.dateparse import parse_date
 from django.utils import timezone
 from itertools import groupby
+from typing import List, Optional, Dict, Any
 from operator import attrgetter
+from datetime import datetime
 
 from rest_framework import generics, permissions, filters, status
 from rest_framework.permissions import IsAuthenticated
@@ -1255,8 +1257,7 @@ class ItemRetrieveUpdateDestroyAPIView(CompanyBranchRestrictedMixin, generics.Re
 
 # ===========================
 #  Subreal / Acceptance / ReturnFromAgent
-# ===========================
-class ManufactureSubrealListCreateAPIView(CompanyBranchRestrictedMixin, generics.ListCreateAPIView):
+#class ManufactureSubrealListCreateAPIView(CompanyBranchRestrictedMixin, generics.ListCreateAPIView):
     """
     GET  /api/main/subreals/
     POST /api/main/subreals/
@@ -1264,8 +1265,8 @@ class ManufactureSubrealListCreateAPIView(CompanyBranchRestrictedMixin, generics
     serializer_class = ManufactureSubrealSerializer
     filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
     filterset_fields = ["agent", "product", "status", "created_at"]
-    # Убрали agent__username, добавили поиск по номеру машины агента
-    search_fields = ["product__name", "agent__first_name", "agent__last_name", "agent__track_number"]
+    # если нужен трек-номер, добавьте "agent__track_number"
+    search_fields = ["product__name", "agent__username", "agent__first_name", "agent__last_name"]
     ordering_fields = ["created_at", "qty_transferred", "qty_accepted", "status"]
     ordering = ["-created_at"]
 
@@ -1280,42 +1281,122 @@ class ManufactureSubrealListCreateAPIView(CompanyBranchRestrictedMixin, generics
     @transaction.atomic
     def perform_create(self, serializer):
         company = self._company()
-        branch = self._auto_branch()
+        branch  = self._auto_branch()
         product = serializer.validated_data.get("product")
-        qty = serializer.validated_data.get("qty_transferred", 0)
+        agent   = serializer.validated_data.get("agent")
+        qty     = int(serializer.validated_data.get("qty_transferred") or 0)
+        is_sawmill = bool(serializer.validated_data.get("is_sawmill", False))
 
-        # Проверка принадлежности товара компании
+        # company/branch guards
         if product and product.company_id != company.id:
             raise serializers.ValidationError({"product": "Товар другой компании."})
-
-        # Проверка принадлежности агента компании
-        agent = serializer.validated_data.get("agent")
         if agent and getattr(agent, "company_id", None) != company.id:
             raise serializers.ValidationError({"agent": "Агент другой компании."})
+        # Если у вас строгая филиальная изоляция товаров — раскомментируйте:
+        # if branch and product and product.branch_id not in (None, branch.id):
+        #     raise serializers.ValidationError({"product": "Товар другого филиала."})
 
-        # Блокировка и проверка остатка перед списанием
+        # Лочим и проверяем склад перед списанием
         if qty:
-            # Важно: product должен быть задан, если передано qty
             if not product:
                 raise serializers.ValidationError({"product": "Не выбран товар для списания количества."})
-
             locked_qs = type(product).objects.select_for_update().filter(pk=product.pk)
             current_qty = locked_qs.values_list("quantity", flat=True).first()
             if current_qty is None or current_qty < qty:
-                raise serializers.ValidationError({
-                    "qty_transferred": f"Недостаточно на складе: доступно {current_qty or 0}."
-                })
+                raise serializers.ValidationError({"qty_transferred": f"Недостаточно на складе: доступно {current_qty or 0}."})
 
-        # Создаём объект с подстановкой компании/филиала/пользователя
+        # Создаём передачу (company/branch/user проставляем на сервере)
         obj = serializer.save(company=company, branch=branch, user=self.request.user)
 
-        # Списание остатков после успешного сохранения
+        # Списание со склада
         if qty:
             type(product).objects.filter(pk=product.pk).update(quantity=F("quantity") - qty)
+
+        # 🔁 Авто-приём: если флаг is_sawmill=True — принять сразу весь объём
+        if is_sawmill and qty > 0:
+            Acceptance.objects.create(
+                company=company,
+                branch=branch,
+                subreal=obj,
+                accepted_by=self._user(),
+                qty=qty,
+                accepted_at=timezone.now(),
+            )
+
+        return obj
+
+class ManufactureSubrealListCreateAPIView(CompanyBranchRestrictedMixin, generics.ListCreateAPIView):
+    """
+    GET  /api/main/subreals/
+    POST /api/main/subreals/
+    """
+    serializer_class = ManufactureSubrealSerializer
+    filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
+    filterset_fields = ["agent", "product", "status", "created_at"]
+    # если нужен трек-номер, добавьте "agent__track_number"
+    search_fields = ["product__name", "agent__username", "agent__first_name", "agent__last_name"]
+    ordering_fields = ["created_at", "qty_transferred", "qty_accepted", "status"]
+    ordering = ["-created_at"]
+
+    def get_queryset(self):
+        qs = (
+            ManufactureSubreal.objects
+            .select_related("company", "user", "agent", "product")
+            .all()
+        )
+        return self._filter_qs_company_branch(qs)
+
+    @transaction.atomic
+    def perform_create(self, serializer):
+        company = self._company()
+        branch  = self._auto_branch()
+        product = serializer.validated_data.get("product")
+        agent   = serializer.validated_data.get("agent")
+        qty     = int(serializer.validated_data.get("qty_transferred") or 0)
+        is_sawmill = bool(serializer.validated_data.get("is_sawmill", False))
+
+        # company/branch guards
+        if product and product.company_id != company.id:
+            raise serializers.ValidationError({"product": "Товар другой компании."})
+        if agent and getattr(agent, "company_id", None) != company.id:
+            raise serializers.ValidationError({"agent": "Агент другой компании."})
+        # Если у вас строгая филиальная изоляция товаров — раскомментируйте:
+        # if branch and product and product.branch_id not in (None, branch.id):
+        #     raise serializers.ValidationError({"product": "Товар другого филиала."})
+
+        # Лочим и проверяем склад перед списанием
+        if qty:
+            if not product:
+                raise serializers.ValidationError({"product": "Не выбран товар для списания количества."})
+            locked_qs = type(product).objects.select_for_update().filter(pk=product.pk)
+            current_qty = locked_qs.values_list("quantity", flat=True).first()
+            if current_qty is None or current_qty < qty:
+                raise serializers.ValidationError({"qty_transferred": f"Недостаточно на складе: доступно {current_qty or 0}."})
+
+        # Создаём передачу (company/branch/user проставляем на сервере)
+        obj = serializer.save(company=company, branch=branch, user=self.request.user)
+
+        # Списание со склада
+        if qty:
+            type(product).objects.filter(pk=product.pk).update(quantity=F("quantity") - qty)
+
+        # 🔁 Авто-приём: если флаг is_sawmill=True — принять сразу весь объём
+        if is_sawmill and qty > 0:
+            Acceptance.objects.create(
+                company=company,
+                branch=branch,
+                subreal=obj,
+                accepted_by=self._user(),
+                qty=qty,
+                accepted_at=timezone.now(),
+            )
 
         return obj
 
 
+# ===========================
+#  Subreal: retrieve/update/destroy
+# ===========================
 class ManufactureSubrealRetrieveUpdateDestroyAPIView(CompanyBranchRestrictedMixin, generics.RetrieveUpdateDestroyAPIView):
     """
     GET    /api/main/subreals/<uuid:pk>/
@@ -1331,16 +1412,24 @@ class ManufactureSubrealRetrieveUpdateDestroyAPIView(CompanyBranchRestrictedMixi
 
     def perform_update(self, serializer):
         company = self._company()
-        branch = self._auto_branch()
-        prod = serializer.validated_data.get("product")
+        branch  = self._auto_branch()
+        prod    = serializer.validated_data.get("product")
+        agent   = serializer.validated_data.get("agent")
+
         if prod and prod.company_id != company.id:
             raise serializers.ValidationError({"product": "Товар другой компании."})
-        agent = serializer.validated_data.get("agent")
         if agent and getattr(agent, "company_id", None) != company.id:
             raise serializers.ValidationError({"agent": "Агент другой компании."})
+        # Если у вас строгая филиальная изоляция товаров — раскомментируйте:
+        # if branch and prod and prod.branch_id not in (None, branch.id):
+        #     raise serializers.ValidationError({"product": "Товар другого филиала."})
+
         serializer.save(company=company, branch=branch)
 
 
+# ===========================
+#  Acceptance: list/create
+# ===========================
 class AcceptanceListCreateAPIView(CompanyBranchRestrictedMixin, generics.ListCreateAPIView):
     """
     GET  /api/main/acceptances/
@@ -1355,7 +1444,7 @@ class AcceptanceListCreateAPIView(CompanyBranchRestrictedMixin, generics.ListCre
     def get_queryset(self):
         return (
             Acceptance.objects
-            .select_related("company", "subreal", "accepted_by")
+            .select_related("company", "subreal", "accepted_by", "subreal__agent", "subreal__product")
             .filter(company_id=self._company().id)
         )
 
@@ -1368,12 +1457,21 @@ class AcceptanceListCreateAPIView(CompanyBranchRestrictedMixin, generics.ListCre
     def perform_create(self, serializer):
         sub = serializer.validated_data["subreal"]
         locked = ManufactureSubreal.objects.select_for_update().get(pk=sub.pk)
+
+        # Запрет на приём в закрытую передачу
+        if locked.status != ManufactureSubreal.Status.OPEN:
+            raise serializers.ValidationError({"subreal": "Передача уже закрыта."})
+
         qty = serializer.validated_data["qty"]
         if qty > locked.qty_remaining:
             raise serializers.ValidationError({"qty": f"Можно принять максимум {locked.qty_remaining}."})
+
         serializer.save(company=self._company(), accepted_by=self._user())
 
 
+# ===========================
+#  Acceptance: retrieve/destroy
+# ===========================
 class AcceptanceRetrieveDestroyAPIView(CompanyBranchRestrictedMixin, generics.RetrieveDestroyAPIView):
     """
     GET    /api/main/acceptances/<uuid:pk>/
@@ -1384,11 +1482,14 @@ class AcceptanceRetrieveDestroyAPIView(CompanyBranchRestrictedMixin, generics.Re
     def get_queryset(self):
         return (
             Acceptance.objects
-            .select_related("company", "subreal", "accepted_by")
+            .select_related("company", "subreal", "accepted_by", "subreal__agent", "subreal__product")
             .filter(company_id=self._company().id)
         )
 
 
+# ===========================
+#  Return: list/create
+# ===========================
 class ReturnFromAgentListCreateAPIView(CompanyBranchRestrictedMixin, generics.ListCreateAPIView):
     """
     GET  /api/main/returns/
@@ -1403,7 +1504,7 @@ class ReturnFromAgentListCreateAPIView(CompanyBranchRestrictedMixin, generics.Li
     def get_queryset(self):
         return (
             ReturnFromAgent.objects
-            .select_related("company", "subreal", "returned_by", "accepted_by")
+            .select_related("company", "subreal", "returned_by", "accepted_by", "subreal__agent", "subreal__product")
             .filter(company_id=self._company().id)
         )
 
@@ -1417,6 +1518,9 @@ class ReturnFromAgentListCreateAPIView(CompanyBranchRestrictedMixin, generics.Li
         serializer.save(company=self._company(), returned_by=self._user())
 
 
+# ===========================
+#  Return: retrieve/destroy
+# ===========================
 class ReturnFromAgentRetrieveDestroyAPIView(CompanyBranchRestrictedMixin, generics.RetrieveDestroyAPIView):
     """
     GET    /api/main/returns/<uuid:pk>/
@@ -1427,11 +1531,14 @@ class ReturnFromAgentRetrieveDestroyAPIView(CompanyBranchRestrictedMixin, generi
     def get_queryset(self):
         return (
             ReturnFromAgent.objects
-            .select_related("company", "subreal", "returned_by", "accepted_by")
+            .select_related("company", "subreal", "returned_by", "accepted_by", "subreal__agent", "subreal__product")
             .filter(company_id=self._company().id)
         )
 
 
+# ===========================
+#  Return: approve
+# ===========================
 class ReturnFromAgentApproveAPIView(APIView, CompanyBranchRestrictedMixin):
     """
     POST /api/main/returns/<uuid:pk>/approve/
@@ -1454,16 +1561,19 @@ class ReturnFromAgentApproveAPIView(APIView, CompanyBranchRestrictedMixin):
         ser = ReturnApproveSerializer(data=request.data, context={"request": request, "return_obj": ret})
         ser.is_valid(raise_exception=True)
         ret = ser.save()
-        return Response(ReturnReadSerializer(ret).data, status=200)
+        return Response(ReturnReadSerializer(ret).data, status=status.HTTP_200_OK)
 
 
+# ===========================
+#  Subreal: bulk create
+# ===========================
 class ManufactureSubrealBulkCreateAPIView(APIView, CompanyBranchRestrictedMixin):
     """
     POST /api/main/subreals/bulk/
     {
       "agent": "<uuid-агента>",
       "items": [
-        {"product": "<uuid-товара-1>", "qty_transferred": 10},
+        {"product": "<uuid-товара-1>", "qty_transferred": 10, "is_sawmill": true},
         {"product": "<uuid-товара-2>", "qty_transferred": 5}
       ]
     }
@@ -1475,17 +1585,20 @@ class ManufactureSubrealBulkCreateAPIView(APIView, CompanyBranchRestrictedMixin)
         ser = BulkSubrealCreateSerializer(data=request.data, context={"request": request})
         ser.is_valid(raise_exception=True)
 
-        agent = ser.validated_data["agent"]
-        items = ser.validated_data["items"]
-        user = self._user()
+        agent   = ser.validated_data["agent"]
+        items   = ser.validated_data["items"]
+        user    = self._user()
         company = self._company()
-        branch = self._auto_branch()
+        branch  = self._auto_branch()
 
-        created = []
+        created_objs = []
+
         for item in items:
             product = item["product"]
-            qty = item["qty_transferred"]
+            qty     = int(item["qty_transferred"])
+            is_sawmill = bool(item.get("is_sawmill", False))
 
+            # Лочим и проверяем остаток на складе
             locked_qs = type(product).objects.select_for_update().filter(pk=product.pk)
             current_qty = locked_qs.values_list("quantity", flat=True).first()
             if current_qty is None or current_qty < qty:
@@ -1493,39 +1606,42 @@ class ManufactureSubrealBulkCreateAPIView(APIView, CompanyBranchRestrictedMixin)
                     "items": f"Недостаточно на складе для {product.name}: доступно {current_qty or 0}."
                 })
 
+            # Списываем склад
             locked_qs.update(quantity=F("quantity") - qty)
 
-            created.append(ManufactureSubreal(
+            # Создаём передачу обычным create (получаем pk сразу)
+            sub = ManufactureSubreal.objects.create(
                 company=company,
                 branch=branch,
                 user=user,
                 agent=agent,
                 product=product,
                 qty_transferred=qty,
-            ))
+                is_sawmill=is_sawmill,
+            )
+            created_objs.append(sub)
 
-        ManufactureSubreal.objects.bulk_create(created)
+            # 🔁 Авто-приём по флагу
+            if is_sawmill and qty > 0:
+                Acceptance.objects.create(
+                    company=company,
+                    branch=branch,
+                    subreal=sub,
+                    accepted_by=user,
+                    qty=qty,
+                    accepted_at=timezone.now(),
+                )
 
-        objs = (
-            ManufactureSubreal.objects
-            .select_related("company", "user", "agent", "product")
-            .filter(id__in=[c.id for c in created])
-            .order_by("-created_at")
-        )
-        out = ManufactureSubrealSerializer(objs, many=True, context={"request": request}).data
+        out = ManufactureSubrealSerializer(created_objs, many=True, context={"request": request}).data
         return Response(out, status=status.HTTP_201_CREATED)
 
 
 # ===========================
-#  Agent: my products
+#  Agent: my products (GET/PATCH)
 # ===========================
-from typing import List, Optional, Dict, Any
-from datetime import datetime
-from django.db.models import Prefetch
-
 class AgentMyProductsListAPIView(APIView, CompanyBranchRestrictedMixin):
     """
-    GET /api/main/agents/me/products/
+    GET  /api/main/agents/me/products/
     PATCH /api/main/agents/me/products/  — частичное обновление qty_accepted/qty_returned
     """
     permission_classes = [permissions.IsAuthenticated]
@@ -1545,7 +1661,6 @@ class AgentMyProductsListAPIView(APIView, CompanyBranchRestrictedMixin):
             )
             .order_by("product_id", "-created_at")
         )
-        # ограничим company/branch
         return self._filter_qs_company_branch(base)
 
     @staticmethod
@@ -1614,6 +1729,7 @@ class AgentMyProductsListAPIView(APIView, CompanyBranchRestrictedMixin):
     def patch(self, request, *args, **kwargs):
         """
         Частичное обновление qty_accepted / qty_returned по конкретным передачам.
+        Важно: предпочтительнее создавать Acceptance/Return события, а не редактировать счётчики.
         """
         company_id = getattr(request.user, "company_id", None)
         if not company_id:
@@ -1633,6 +1749,7 @@ class AgentMyProductsListAPIView(APIView, CompanyBranchRestrictedMixin):
                 raise ValidationError({f"subreals[{i}]": "Must be an object."})
             if "id" not in it:
                 raise ValidationError({f"subreals[{i}].id": "Required."})
+            # у вас id — UUIDField в модели, но ниже остаётся как было
             if not isinstance(it["id"], int):
                 raise ValidationError({f"subreals[{i}].id": "Must be integer."})
 
@@ -1652,7 +1769,6 @@ class AgentMyProductsListAPIView(APIView, CompanyBranchRestrictedMixin):
 
             ids.append(it["id"])
 
-        # выбираем только свои передачи в рамках компании/филиала
         base_qs = ManufactureSubreal.objects.filter(id__in=ids, agent_id=request.user.id)
         base_qs = self._filter_qs_company_branch(base_qs)
         subreal_map = {s.id: s for s in base_qs.select_for_update()}
@@ -1667,7 +1783,7 @@ class AgentMyProductsListAPIView(APIView, CompanyBranchRestrictedMixin):
 
                 new_accepted = s.qty_accepted or 0
                 new_returned = s.qty_returned or 0
-                transferred = s.qty_transferred or 0
+                transferred  = s.qty_transferred or 0
 
                 if "qty_accepted" in it and it["qty_accepted"] is not None:
                     new_accepted = it["qty_accepted"]
