@@ -542,7 +542,7 @@ class SaleInvoiceDownloadAPIView(APIView):
 class SaleReceiptDownloadAPIView(APIView):
     """
     GET /api/main/pos/sales/<uuid:pk>/receipt/
-    Вместо скачивания PDF сразу печатает чек на USB ESC/POS.
+    Печать чека сразу в USB-принтер на этой машине (касовый ПК).
     """
     permission_classes = [permissions.IsAuthenticated]
 
@@ -551,25 +551,14 @@ class SaleReceiptDownloadAPIView(APIView):
             Sale.objects.select_related("company").prefetch_related("items"),
             id=pk, company=request.user.company
         )
-
-        # сквозной номер документа (если ещё не присвоен — присвоится)
         doc_no = ensure_sale_doc_number(sale)
 
         try:
-            # печать на аппарат
-            from .printers import UsbEscposPrinter  # класс из pos/printers.py
-            prn = UsbEscposPrinter()
-            prn.print_sale(sale, doc_no, fmt_money)  # использует твой fmt_money
-            return Response(
-                {"ok": True, "printed": True, "doc_no": doc_no},
-                status=200,
-            )
+            from .printers import UsbEscposPrinter
+            UsbEscposPrinter().print_sale(sale, doc_no, fmt_money)
+            return Response({"ok": True, "printed": True, "doc_no": doc_no}, status=200)
         except Exception as e:
-            # не роняем запрос — отдаём ошибку в JSON
-            return Response(
-                {"ok": False, "printed": False, "doc_no": doc_no, "error": str(e)},
-                status=500,
-            )
+            return Response({"ok": False, "printed": False, "doc_no": doc_no, "error": str(e)}, status=500)
 
 class SaleStartAPIView(APIView):
     """
