@@ -1129,7 +1129,12 @@ class ManufactureSubrealSerializer(CompanyBranchReadOnlyMixin, serializers.Model
     branch = serializers.ReadOnlyField(source="branch.id")
 
     product_name = serializers.ReadOnlyField(source="product.name")
-    agent_name = serializers.SerializerMethodField()
+
+    # ✅ Поля агента: имя, фамилия и номер машины
+    agent_first_name = serializers.ReadOnlyField(source="agent.first_name")
+    agent_last_name = serializers.ReadOnlyField(source="agent.last_name")
+    agent_track_number = serializers.ReadOnlyField(source="agent.track_number")
+
     qty_remaining = serializers.ReadOnlyField()
     qty_on_agent = serializers.ReadOnlyField()
 
@@ -1137,13 +1142,20 @@ class ManufactureSubrealSerializer(CompanyBranchReadOnlyMixin, serializers.Model
         model = ManufactureSubreal
         fields = [
             "id", "company", "branch",
-            "user", "agent", "agent_name",
+            "user",
+            "agent", "agent_first_name", "agent_last_name", "agent_track_number",
             "product", "product_name",
             "qty_transferred", "qty_accepted", "qty_returned",
             "qty_remaining", "qty_on_agent",
             "status", "created_at",
         ]
-        read_only_fields = ["id", "company", "branch", "user", "agent_name", "product_name", "qty_remaining", "qty_on_agent", "status", "created_at"]
+        read_only_fields = [
+            "id", "company", "branch", "user",
+            "agent_first_name", "agent_last_name", "agent_track_number",
+            "product_name",
+            "qty_remaining", "qty_on_agent",
+            "status", "created_at",
+        ]
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -1152,12 +1164,6 @@ class ManufactureSubrealSerializer(CompanyBranchReadOnlyMixin, serializers.Model
         _restrict_pk_queryset_strict(self.fields.get("product"), Product.objects.all(), comp, br)
         if comp and self.fields.get("agent"):
             self.fields["agent"].queryset = User.objects.filter(company=comp)
-
-    def get_agent_name(self, obj):
-        if not getattr(obj, "agent", None):
-            return ""
-        fn = getattr(obj.agent, "get_full_name", lambda: "")() or None
-        return fn or getattr(obj.agent, "username", str(obj.agent))
 
     def validate(self, attrs):
         company = self._user_company()

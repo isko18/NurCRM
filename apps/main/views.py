@@ -1264,12 +1264,17 @@ class ManufactureSubrealListCreateAPIView(CompanyBranchRestrictedMixin, generics
     serializer_class = ManufactureSubrealSerializer
     filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
     filterset_fields = ["agent", "product", "status", "created_at"]
-    search_fields = ["product__name", "agent__username", "agent__first_name", "agent__last_name"]
+    # Убрали agent__username, добавили поиск по номеру машины агента
+    search_fields = ["product__name", "agent__first_name", "agent__last_name", "agent__track_number"]
     ordering_fields = ["created_at", "qty_transferred", "qty_accepted", "status"]
     ordering = ["-created_at"]
 
     def get_queryset(self):
-        qs = ManufactureSubreal.objects.select_related("company", "user", "agent", "product").all()
+        qs = (
+            ManufactureSubreal.objects
+            .select_related("company", "user", "agent", "product")
+            .all()
+        )
         return self._filter_qs_company_branch(qs)
 
     @transaction.atomic
@@ -1279,21 +1284,32 @@ class ManufactureSubrealListCreateAPIView(CompanyBranchRestrictedMixin, generics
         product = serializer.validated_data.get("product")
         qty = serializer.validated_data.get("qty_transferred", 0)
 
+        # Проверка принадлежности товара компании
         if product and product.company_id != company.id:
             raise serializers.ValidationError({"product": "Товар другой компании."})
 
+        # Проверка принадлежности агента компании
         agent = serializer.validated_data.get("agent")
         if agent and getattr(agent, "company_id", None) != company.id:
             raise serializers.ValidationError({"agent": "Агент другой компании."})
 
+        # Блокировка и проверка остатка перед списанием
         if qty:
+            # Важно: product должен быть задан, если передано qty
+            if not product:
+                raise serializers.ValidationError({"product": "Не выбран товар для списания количества."})
+
             locked_qs = type(product).objects.select_for_update().filter(pk=product.pk)
             current_qty = locked_qs.values_list("quantity", flat=True).first()
             if current_qty is None or current_qty < qty:
-                raise serializers.ValidationError({"qty_transferred": f"Недостаточно на складе: доступно {current_qty or 0}."})
+                raise serializers.ValidationError({
+                    "qty_transferred": f"Недостаточно на складе: доступно {current_qty or 0}."
+                })
 
+        # Создаём объект с подстановкой компании/филиала/пользователя
         obj = serializer.save(company=company, branch=branch, user=self.request.user)
 
+        # Списание остатков после успешного сохранения
         if qty:
             type(product).objects.filter(pk=product.pk).update(quantity=F("quantity") - qty)
 
