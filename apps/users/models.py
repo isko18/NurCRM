@@ -98,7 +98,9 @@ class User(AbstractBaseUser, PermissionsMixin):
     first_name = models.CharField(max_length=64, verbose_name='Имя')
     last_name = models.CharField(max_length=64, verbose_name='Фамилия')
     avatar = models.URLField(blank=True, null=True, verbose_name='Аватар (URL)')
-
+    phone_number = models.CharField(max_length=64, verbose_name='Номер телефона', blank=True, null=True)
+    track_number = models.CharField(max_length=64, verbose_name='Номер машины', blank=True, null=True)
+    
     company = models.ForeignKey(
         "Company",
         on_delete=models.CASCADE,

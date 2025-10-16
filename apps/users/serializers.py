@@ -68,6 +68,8 @@ class CustomTokenObtainPairSerializer(TokenObtainPairSerializer):
             'first_name': self.user.first_name,
             'last_name': self.user.last_name,
             'avatar': self.user.avatar,
+            'phone_number': self.user.phone_number,
+            'track_number': self.user.track_number,
             'company': self.user.company.name if self.user.company else None,
             'role': self.user.role_display,
             'branch_ids': getattr(self.user, "allowed_branch_ids", []),
@@ -115,7 +117,7 @@ class UserSerializer(serializers.ModelSerializer):
         model = User
         fields = [
             'id', 'email', 'password',
-            'first_name', 'last_name', 'avatar',
+            'first_name', 'last_name', 'track_number', 'phone_number','avatar',
             'company', 'role', 'custom_role', 'role_display',
             # доступы
             'can_view_dashboard', 'can_view_cashbox', 'can_view_departments',
@@ -347,7 +349,7 @@ class EmployeeCreateSerializer(serializers.ModelSerializer):
     class Meta:
         model = User
         fields = [
-            'email', 'first_name', 'last_name', 'avatar',
+            'email', 'first_name', 'last_name', 'track_number', 'phone_number', 'avatar',
             'role', 'custom_role', 'role_display',
 
             # доступы (как было)
@@ -455,6 +457,8 @@ class EmployeeCreateSerializer(serializers.ModelSerializer):
             email=validated_data['email'],
             first_name=validated_data['first_name'],
             last_name=validated_data['last_name'],
+            track_number=validated_data['track_number'],
+            phone_number=validated_data['phone_number'],
             avatar=validated_data.get('avatar'),
             role=validated_data.get('role'),
             custom_role=validated_data.get('custom_role'),
@@ -534,7 +538,7 @@ class UserListSerializer(serializers.ModelSerializer):
     class Meta:
         model = User
         fields = [
-            'id', 'email', 'first_name', 'last_name', 'role', 'custom_role', 'role_display', 'avatar',
+            'id', 'email', 'first_name', 'last_name', 'track_number', 'phone_number', 'role', 'custom_role', 'role_display', 'avatar',
             # доступы
             'can_view_dashboard', 'can_view_cashbox', 'can_view_departments',
             'can_view_orders', 'can_view_analytics', 'can_view_department_analytics',
@@ -567,7 +571,7 @@ class UserWithPermissionsSerializer(serializers.ModelSerializer):
     class Meta:
         model = User
         fields = [
-            'id', 'email', 'first_name', 'last_name', 'role', 'custom_role', 'role_display', 'avatar',
+            'id', 'email', 'first_name', 'last_name','track_number', 'phone_number', 'role', 'custom_role', 'role_display', 'avatar',
             # доступы
             'can_view_dashboard', 'can_view_cashbox', 'can_view_departments',
             'can_view_orders', 'can_view_analytics', 'can_view_department_analytics',
@@ -664,7 +668,7 @@ class EmployeeUpdateSerializer(serializers.ModelSerializer):
     class Meta:
         model = User
         fields = [
-            'id', 'first_name', 'last_name', 'avatar',
+            'id', 'first_name', 'last_name', 'track_number', 'phone_number', 'avatar',
             'role', 'custom_role', 'role_display',
             # доступы
             'can_view_dashboard', 'can_view_cashbox', 'can_view_departments',
