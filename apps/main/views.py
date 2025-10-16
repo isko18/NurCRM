@@ -35,7 +35,7 @@ from apps.main.serializers import (
     ReviewSerializer, NotificationSerializer, EventSerializer,
     WarehouseSerializer, WarehouseEventSerializer,
     ProductCategorySerializer, ProductBrandSerializer,
-    OrderItemSerializer, ClientSerializer, ClientDealSerializer, BidSerializers, SocialApplicationsSerializers, TransactionRecordSerializer, ContractorWorkSerializer, DebtSerializer, DebtPaymentSerializer, ObjectItemSerializer, ObjectSaleSerializer, ObjectSaleItemSerializer, BulkIdsSerializer, ItemMakeSerializer, ManufactureSubrealSerializer, AcceptanceCreateSerializer, ReturnCreateSerializer, BulkSubrealCreateSerializer, AcceptanceReadSerializer, ReturnApproveSerializer, ReturnReadSerializer, AgentProductOnHandSerializer
+    OrderItemSerializer, ClientSerializer, ClientDealSerializer, BidSerializers, SocialApplicationsSerializers, TransactionRecordSerializer, ContractorWorkSerializer, DebtSerializer, DebtPaymentSerializer, ObjectItemSerializer, ObjectSaleSerializer, ObjectSaleItemSerializer, BulkIdsSerializer, ItemMakeSerializer, ManufactureSubrealSerializer, AcceptanceCreateSerializer, ReturnCreateSerializer, BulkSubrealCreateSerializer, AcceptanceReadSerializer, ReturnApproveSerializer, ReturnReadSerializer, AgentProductOnHandSerializer, AgentWithProductsSerializer
 )
 from django.db.models import ProtectedError
 
@@ -1815,3 +1815,126 @@ class AgentMyProductsListAPIView(APIView, CompanyBranchRestrictedMixin):
         qs = self._build_queryset(request)
         data = self._serialize_products(qs)
         return Response(AgentProductOnHandSerializer(data, many=True).data, status=status.HTTP_200_OK)
+    
+    
+    
+class OwnerAgentsProductsListAPIView(APIView, CompanyBranchRestrictedMixin):
+    """
+    GET /api/main/owner/agents/products/
+    Возвращает по КАЖДОМУ агенту список его товаров "на руках" (как в /agents/me/products),
+    + ФИО агента и его track_number.
+    Доступ: IsAuthenticated (при необходимости можно ужесточить до owner-only).
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    # -------- Helpers --------
+    @staticmethod
+    def _nz(v: Optional[int]) -> int:
+        return int(v or 0)
+
+    def _build_queryset(self, request):
+        """
+        Готовим базовый набор передач по КОМПАНИИ/ФИЛИАЛУ для всех агентов,
+        с префетчем приёмов и только принятых возвратов.
+        """
+        accepted_returns_qs = ReturnFromAgent.objects.filter(
+            status=ReturnFromAgent.Status.ACCEPTED
+        )
+        base = (
+            ManufactureSubreal.objects
+            .select_related("product", "agent")  # важно: тянем агента
+            .prefetch_related(
+                "acceptances",
+                Prefetch("returns", queryset=accepted_returns_qs, to_attr="accepted_returns"),
+            )
+            .order_by("agent_id", "product_id", "-created_at")
+        )
+        # ограничение по company/branch из миксина
+        return self._filter_qs_company_branch(base)
+
+    def _serialize_products_for_agent(self, subreals_qs) -> List[Dict[str, Any]]:
+        """
+        На вход — subreal'ы одного агента (уже отфильтрованные по агенту),
+        на выход — список продуктов в формате AgentProductOnHandSerializer.
+        """
+        data: List[Dict[str, Any]] = []
+
+        # группируем по product_id
+        for product_id, subreals_iter in groupby(subreals_qs, key=attrgetter("product_id")):
+            subreals = list(subreals_iter)
+
+            qty_on_hand = sum(
+                (self._nz(s.qty_accepted) - self._nz(s.qty_returned)) for s in subreals
+            )
+            if qty_on_hand <= 0:
+                continue
+
+            movement_dates: List[datetime] = []
+            for s in subreals:
+                if s.created_at:
+                    movement_dates.append(s.created_at)
+                for acc in s.acceptances.all():
+                    if getattr(acc, "accepted_at", None):
+                        movement_dates.append(acc.accepted_at)
+                for ret in getattr(s, "accepted_returns", []):
+                    if getattr(ret, "accepted_at", None):
+                        movement_dates.append(ret.accepted_at)
+
+            last_movement_at = max(movement_dates) if movement_dates else None
+
+            subreals_payload = [
+                {
+                    "id": s.id,
+                    "created_at": s.created_at,
+                    "qty_transferred": self._nz(s.qty_transferred),
+                    "qty_accepted": self._nz(s.qty_accepted),
+                    "qty_returned": self._nz(s.qty_returned),
+                }
+                for s in subreals
+            ]
+
+            data.append({
+                "product": product_id,
+                "product_name": (
+                    subreals[0].product.name
+                    if (subreals and getattr(subreals[0], "product", None))
+                    else ""
+                ),
+                "qty_on_hand": qty_on_hand,
+                "last_movement_at": last_movement_at,
+                "subreals": subreals_payload,
+            })
+        return data
+
+    # -------- GET --------
+    def get(self, request, *args, **kwargs):
+        # если нужно ограничить доступ только owner'у — включи проверку тут:
+        # if not getattr(request.user, "is_owner", False):
+        #     return Response({"detail": "Forbidden"}, status=status.HTTP_403_FORBIDDEN)
+
+        qs = self._build_queryset(request)
+
+        # Группировка по агенту
+        out: List[Dict[str, Any]] = []
+        for agent_id, agent_subreals_iter in groupby(qs, key=attrgetter("agent_id")):
+            agent_subreals = list(agent_subreals_iter)
+            if not agent_subreals:
+                continue
+            agent = agent_subreals[0].agent  # благодаря select_related("agent")
+
+            products_payload = self._serialize_products_for_agent(agent_subreals)
+            # можно фильтровать агентов без остатков: пропускаем пустые списки
+            if not products_payload:
+                continue
+
+            out.append({
+                "agent": {
+                    "id": agent.id,
+                    "first_name": getattr(agent, "first_name", "") or "",
+                    "last_name": getattr(agent, "last_name", "") or "",
+                    "track_number": getattr(agent, "track_number", None),
+                },
+                "products": products_payload,
+            })
+
+        return Response(AgentWithProductsSerializer(out, many=True).data, status=status.HTTP_200_OK)
