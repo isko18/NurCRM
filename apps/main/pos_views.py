@@ -44,7 +44,7 @@ from dataclasses import dataclass
 from apps.main.utils_numbers import ensure_sale_doc_number
 from django.core.cache import cache
 from django.shortcuts import get_object_or_404
-from apps.users.models import User
+from apps.users.models import Roles, User, Company  # важно подтянуть Roles
 
 try:
     from apps.main.models import ClientDeal, DealInstallment
@@ -1082,6 +1082,24 @@ class SaleAddCustomItemAPIView(APIView):
 
         return Response(SaleCartSerializer(cart).data, status=status.HTTP_201_CREATED)
 
+OWNER_ROLES = {Roles.OWNER}  # можно расширить по желанию
+
+def _is_owner(user) -> bool:
+    """
+    Является ли пользователь владельцем компании:
+    - системная роль == owner
+    И (по желанию, но полезно):
+    - он действительно указан как owner у своей Company
+    """
+    if getattr(user, "role", None) in OWNER_ROLES:
+        # дополнительная строгая проверка: user == company.owner
+        company = getattr(user, "company", None)
+        if company and getattr(company, "owner_id", None):
+            return company.owner_id == user.id
+        # если company.owner не заполнен — считаем, что роль достаточно
+        return True
+    return False
+
 def _agent_available_qty(user, company, product_id):
     """
     Сколько у агента на руках: accepted - returned - sold(allocations)
@@ -1105,27 +1123,18 @@ def _subreal_sold_qty(company, subreal_id):
         .aggregate(s=Sum("qty"))["s"] or 0
     )
 
-
 def _resolve_acting_agent(request, cart, *, allow_owner_override=True):
-    """
-    Порядок:
-      1) если owner и передан agent в теле/квери — валидируем и используем его;
-      2) иначе пробуем из cache по cart.id;
-      3) иначе — request.user.
-    """
     user = request.user
     company = user.company
 
-    # 1) owner может переопределить агента явно
     agent_id = request.data.get("agent") or request.query_params.get("agent")
     if allow_owner_override and agent_id:
-        if not getattr(user, "is_owner", False):
+        if not _is_owner(user):  # ← раньше было is_owner / role == "Владелец"
             raise ValidationError({"agent": "Только владелец может продавать за агента."})
         agent = get_object_or_404(User, id=agent_id, company=company)
-        cache.set(f"cart_agent:{cart.id}", str(agent.id), timeout=60 * 60)  # хранить 1 час
+        cache.set(f"cart_agent:{cart.id}", str(agent.id), timeout=60 * 60)
         return agent
 
-    # 2) из кэша
     cached_id = cache.get(f"cart_agent:{cart.id}")
     if cached_id:
         try:
@@ -1133,7 +1142,6 @@ def _resolve_acting_agent(request, cart, *, allow_owner_override=True):
         except User.DoesNotExist:
             cache.delete(f"cart_agent:{cart.id}")
 
-    # 3) по умолчанию — сам пользователь
     return user
 
 
