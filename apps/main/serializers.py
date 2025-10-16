@@ -1438,3 +1438,14 @@ class AgentProductOnHandSerializer(serializers.Serializer):
     qty_on_hand = serializers.IntegerField()
     last_movement_at = serializers.DateTimeField(allow_null=True)
     subreals = AgentSubrealSerializer(many=True)
+
+
+class AgentInfoSerializer(serializers.Serializer):
+    id = serializers.UUIDField()
+    first_name = serializers.CharField(allow_blank=True)
+    last_name = serializers.CharField(allow_blank=True)
+    track_number = serializers.CharField(allow_blank=True, allow_null=True)
+
+class AgentWithProductsSerializer(serializers.Serializer):
+    agent = AgentInfoSerializer()
+    products = AgentProductOnHandSerializer(many=True)
