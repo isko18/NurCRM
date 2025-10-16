@@ -542,7 +542,7 @@ class SaleInvoiceDownloadAPIView(APIView):
 class SaleReceiptDownloadAPIView(APIView):
     """
     GET /api/main/pos/sales/<uuid:pk>/receipt/
-    Скачивание PDF-чека (58 мм).
+    Вместо скачивания PDF сразу печатает чек на USB ESC/POS.
     """
     permission_classes = [permissions.IsAuthenticated]
 
@@ -552,87 +552,24 @@ class SaleReceiptDownloadAPIView(APIView):
             id=pk, company=request.user.company
         )
 
-        # присвоим сквозной номер, если ещё нет
+        # сквозной номер документа (если ещё не присвоен — присвоится)
         doc_no = ensure_sale_doc_number(sale)
 
-        # === Расчёт высоты под чек ===
-        base_height = 80
-        per_item = 15
-        qr_block = 40
-        extra_lines = 1 + (1 if sale.discount_total and sale.discount_total > 0 else 0) \
-                        + (1 if sale.tax_total and sale.tax_total > 0 else 0) + 1
-        extra_height = 6 * extra_lines + 6
-        page_height = (base_height + per_item * sale.items.count() + qr_block + extra_height) * mm
-        page_width = 58 * mm
-
-        buffer = io.BytesIO()
-        p = canvas.Canvas(buffer, pagesize=(page_width, page_height))
-        y = page_height - 10 * mm
-
-        # === Заголовок ===
-        p.setFont("DejaVu-Bold", 12)
-        p.drawCentredString(page_width / 2, y, "ЧЕК ПРОДАЖИ")
-        y -= 10 * mm
-
-        p.setFont("DejaVu", 9)
-        # Номер и дата (теперь без UUID)
-        p.drawString(5 * mm, y, f"Чек № {doc_no}")
-        y -= 5 * mm
-        p.drawString(5 * mm, y, sale.created_at.strftime("%d.%m.%Y %H:%M"))
-        y -= 7 * mm
-
-        # Разделитель
-        p.drawCentredString(page_width / 2, y, "-" * 32)
-        y -= 6 * mm
-
-        # === Товары ===
-        for it in sale.items.all():
-            name = (it.name_snapshot or "")[:22]
-            qty_price = f"{it.quantity} x {fmt_money(it.unit_price)}"
-            total = fmt_money(it.unit_price * it.quantity)
-
-            p.drawString(5 * mm, y, name)
-            y -= 4 * mm
-            p.drawString(5 * mm, y, qty_price)
-            p.drawRightString(page_width - 5 * mm, y, total)
-            y -= 6 * mm
-
-        # Разделитель
-        p.drawCentredString(page_width / 2, y, "-" * 32)
-        y -= 6 * mm
-
-        # === ИТОГИ ===
-        p.setFont("DejaVu", 9)
-        p.drawRightString(page_width - 5 * mm, y, f"СУММА: {fmt_money(sale.subtotal)}")
-        y -= 6 * mm
-        if sale.discount_total and sale.discount_total > 0:
-            p.drawRightString(page_width - 5 * mm, y, f"СКИДКА: {fmt_money(sale.discount_total)}")
-            y -= 6 * mm
-        if sale.tax_total and sale.tax_total > 0:
-            p.drawRightString(page_width - 5 * mm, y, f"НАЛОГ: {fmt_money(sale.tax_total)}")
-            y -= 6 * mm
-
-        p.setFont("DejaVu-Bold", 11)
-        p.drawRightString(page_width - 5 * mm, y, f"ИТОГО: {fmt_money(sale.total)}")
-        y -= 12 * mm
-
-        # === QR-код ===
-        qr_img = qrcode.make(f"SALE={doc_no};SUM={fmt_money(sale.total)};DATE={sale.created_at.isoformat()}")
-        qr_size = 25 * mm
-        qr_img = qr_img.resize((int(qr_size), int(qr_size)))
-
-        p.drawImage(ImageReader(qr_img), (page_width - qr_size) / 2, y - qr_size, qr_size, qr_size)
-        y -= (qr_size + 10)
-
-        # === Подвал ===
-        p.setFont("DejaVu", 9)
-        p.drawCentredString(page_width / 2, y, "СПАСИБО ЗА ПОКУПКУ!")
-
-        p.showPage()
-        p.save()
-
-        buffer.seek(0)
-        return FileResponse(buffer, as_attachment=True, filename=f"receipt_{doc_no}.pdf")
+        try:
+            # печать на аппарат
+            from .printers import UsbEscposPrinter  # класс из pos/printers.py
+            prn = UsbEscposPrinter()
+            prn.print_sale(sale, doc_no, fmt_money)  # использует твой fmt_money
+            return Response(
+                {"ok": True, "printed": True, "doc_no": doc_no},
+                status=200,
+            )
+        except Exception as e:
+            # не роняем запрос — отдаём ошибку в JSON
+            return Response(
+                {"ok": False, "printed": False, "doc_no": doc_no, "error": str(e)},
+                status=500,
+            )
 
 class SaleStartAPIView(APIView):
     """

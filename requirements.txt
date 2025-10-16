@@ -30,6 +30,9 @@ colorama==0.4.6
 constantly==23.10.4
 cryptography==45.0.4
 daphne==4.2.1
+dateparse==1.4.0
+dateparser==1.2.2
+DateTime==4.9
 decorator==4.4.2
 Django==5.2.1
 django-cors-headers==4.7.0
@@ -96,6 +99,7 @@ PyYAML==6.0.2
 qrcode==8.2
 react==4.3.0
 redis==6.2.0
+regex==2025.9.18
 reportlab==4.4.3
 requests==2.32.4
 rich==14.0.0
@@ -116,6 +120,7 @@ typer==0.16.0
 typing-inspection==0.4.1
 typing_extensions==4.14.0
 tzdata==2025.2
+tzlocal==5.3.1
 uritemplate==4.2.0
 urllib3==2.5.0
 uvicorn==0.34.3
