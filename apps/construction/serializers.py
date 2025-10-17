@@ -70,10 +70,12 @@ class CashboxWithFlowsSerializer(CompanyBranchReadOnlyMixin):
     )
     department_name = serializers.SerializerMethodField()
     cashflows = CashFlowInsideCashboxSerializer(source='flows', many=True, read_only=True)
+    is_consumption = serializers.BooleanField(read_only=True, allow_null=True)
 
     class Meta:
         model = Cashbox
-        fields = ['id', 'company', 'branch', 'department', 'department_name', 'name', 'cashflows']
+        fields = ['id', 'company', 'branch', 'department', 'department_name',
+                  'name', 'is_consumption', 'cashflows']
         read_only_fields = ['id', 'company', 'branch', 'department_name', 'cashflows', 'is_consumption']
 
     def __init__(self, *args, **kwargs):
@@ -110,12 +112,13 @@ class CashboxSerializer(CompanyBranchReadOnlyMixin):
     )
     department_name = serializers.SerializerMethodField()
     analytics = serializers.SerializerMethodField()
+    is_consumption = serializers.BooleanField(read_only=True, allow_null=True)
 
     class Meta:
         model = Cashbox
-        fields = ['id', 'company', 'branch', 'department', 'department_name', 'name', 'analytics']
+        fields = ['id', 'company', 'branch', 'department', 'department_name',
+                  'name', 'is_consumption', 'analytics']
         read_only_fields = ['id', 'company', 'branch', 'department_name', 'analytics', 'is_consumption']
-
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         request = self.context.get('request')
