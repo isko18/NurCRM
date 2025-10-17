@@ -74,7 +74,7 @@ class CashboxWithFlowsSerializer(CompanyBranchReadOnlyMixin):
     class Meta:
         model = Cashbox
         fields = ['id', 'company', 'branch', 'department', 'department_name', 'name', 'cashflows']
-        read_only_fields = ['id', 'company', 'branch', 'department_name', 'cashflows']
+        read_only_fields = ['id', 'company', 'branch', 'department_name', 'cashflows', 'is_consumption']
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -114,7 +114,7 @@ class CashboxSerializer(CompanyBranchReadOnlyMixin):
     class Meta:
         model = Cashbox
         fields = ['id', 'company', 'branch', 'department', 'department_name', 'name', 'analytics']
-        read_only_fields = ['id', 'company', 'branch', 'department_name', 'analytics']
+        read_only_fields = ['id', 'company', 'branch', 'department_name', 'analytics', 'is_consumption']
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)

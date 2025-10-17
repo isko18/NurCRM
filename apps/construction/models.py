@@ -111,6 +111,7 @@ class Cashbox(models.Model):
         Department, on_delete=models.CASCADE, related_name='cashbox',
         null=True, blank=True, verbose_name='Отдел',
     )
+    is_consumption = models.BooleanField(verbose_name="Расход", default=False, blank=True, null=True)
 
     class Meta:
         verbose_name = 'Касса'
