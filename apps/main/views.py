@@ -1384,21 +1384,28 @@ class ManufactureSubrealListCreateAPIView(CompanyBranchRestrictedMixin, generics
         if qty and locked_qs is not None:
             locked_qs.update(quantity=F("quantity") - qty)
 
-        # 🔁 Авто-приём: если флаг is_sawmill=True — принять сразу весь объём
-        if is_sawmill and qty > 0:
-            Acceptance.objects.create(
-                company=company,
-                branch=branch,
-                subreal=obj,
-                accepted_by=self._user(),
-                qty=qty,
-                accepted_at=timezone.now(),
-            )
-            # обновить счётчики и закрыть при полном приёме
-            ManufactureSubreal.objects.filter(pk=obj.pk).update(qty_accepted=F("qty_accepted") + qty)
-            ManufactureSubreal.objects.filter(pk=obj.pk, qty_transferred=F("qty_accepted")).update(
-                status=ManufactureSubreal.Status.CLOSED
-            )
+        # 🔁 ИДЕМПОТЕНТНЫЙ авто-приём: принимаем ровно остаток, если is_sawmill=True
+        if is_sawmill:
+            # перечитываем счётчики, чтобы учесть возможные конкурентные операции
+            obj.refresh_from_db(fields=["qty_transferred", "qty_accepted", "status"])
+            # сколько ещё можно принять по этой передаче
+            to_accept = int((obj.qty_transferred or 0) - (obj.qty_accepted or 0))
+            if to_accept > 0 and obj.status == ManufactureSubreal.Status.OPEN:
+                Acceptance.objects.create(
+                    company=company,
+                    branch=branch,
+                    subreal=obj,
+                    accepted_by=self._user(),
+                    qty=to_accept,
+                    accepted_at=timezone.now(),
+                )
+                ManufactureSubreal.objects.filter(pk=obj.pk).update(
+                    qty_accepted=F("qty_accepted") + to_accept
+                )
+                ManufactureSubreal.objects.filter(
+                    pk=obj.pk,
+                    qty_transferred=F("qty_accepted")
+                ).update(status=ManufactureSubreal.Status.CLOSED)
 
         return obj
 
@@ -1648,20 +1655,26 @@ class ManufactureSubrealBulkCreateAPIView(APIView, CompanyBranchRestrictedMixin)
             )
             created_objs.append(sub)
 
-            # 🔁 Авто-приём по флагу
-            if is_sawmill and qty > 0:
-                Acceptance.objects.create(
-                    company=company,
-                    branch=branch,
-                    subreal=sub,
-                    accepted_by=user,
-                    qty=qty,
-                    accepted_at=timezone.now(),
-                )
-                ManufactureSubreal.objects.filter(pk=sub.pk).update(qty_accepted=F("qty_accepted") + qty)
-                ManufactureSubreal.objects.filter(pk=sub.pk, qty_transferred=F("qty_accepted")).update(
-                    status=ManufactureSubreal.Status.CLOSED
-                )
+            # 🔁 ИДЕМПОТЕНТНЫЙ авто-приём по флагу
+            if is_sawmill:
+                sub.refresh_from_db(fields=["qty_transferred", "qty_accepted", "status"])
+                to_accept = int((sub.qty_transferred or 0) - (sub.qty_accepted or 0))
+                if to_accept > 0 and sub.status == ManufactureSubreal.Status.OPEN:
+                    Acceptance.objects.create(
+                        company=company,
+                        branch=branch,
+                        subreal=sub,
+                        accepted_by=user,
+                        qty=to_accept,
+                        accepted_at=timezone.now(),
+                    )
+                    ManufactureSubreal.objects.filter(pk=sub.pk).update(
+                        qty_accepted=F("qty_accepted") + to_accept
+                    )
+                    ManufactureSubreal.objects.filter(
+                        pk=sub.pk,
+                        qty_transferred=F("qty_accepted")
+                    ).update(status=ManufactureSubreal.Status.CLOSED)
 
         out = ManufactureSubrealSerializer(created_objs, many=True, context={"request": request}).data
         return Response(out, status=status.HTTP_201_CREATED)
