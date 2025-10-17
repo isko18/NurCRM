@@ -1086,12 +1086,6 @@ class SaleAddCustomItemAPIView(APIView):
 OWNER_ROLES = {Roles.OWNER}  # можно расширить по желанию
 
 def _is_owner(user) -> bool:
-    """
-    Является ли пользователь владельцем компании:
-    - системная роль == owner
-    И (по желанию, но полезно):
-    - он действительно указан как owner у своей Company
-    """
     if getattr(user, "role", None) in OWNER_ROLES:
         company = getattr(user, "company", None)
         if company and getattr(company, "owner_id", None):
@@ -1100,14 +1094,7 @@ def _is_owner(user) -> bool:
     return False
 
 
-# ---------------------------
-# Остатки агента (простой вариант)
-# ---------------------------
-
 def _agent_available_qty(user, company, product_id) -> int:
-    """
-    Сколько у агента на руках: accepted - returned - sold(allocations)
-    """
     sub = ManufactureSubreal.objects.filter(company=company, agent_id=user.id, product_id=product_id)
     accepted = sub.aggregate(s=Sum("qty_accepted"))["s"] or 0
     returned = sub.aggregate(s=Sum("qty_returned"))["s"] or 0
@@ -1141,33 +1128,23 @@ def _resolve_acting_agent(request, cart, *, allow_owner_override=True):
     return user
 
 
-# ---------------------------
-# Аллокатор (исправленный: без N+1 и рассинхрона)
-# ---------------------------
-
 @transaction.atomic
 def _allocate_agent_sale(*, company, agent, sale: Sale):
-    """
-    FIFO-распределение продаж по передачам агента.
-    Избегаем 'FOR UPDATE ... GROUP BY': лочим subreals отдельно,
-    агрегации делаем во втором запросе без блокировок.
-    """
     items = sale.items.select_related("product").all()
 
     for item in items:
         if not item.product_id:
-            continue  # кастомные позиции не списывают остатки
+            continue
 
         qty_to_allocate = int(item.quantity or 0)
         if qty_to_allocate <= 0:
             continue
 
-        # 1) Лочим только передачи без агрегатов (нет GROUP BY)
         locked_subreals = list(
             ManufactureSubreal.objects
             .select_for_update()
             .filter(company=company, agent_id=agent.id, product_id=item.product_id)
-            .order_by("created_at", "id")  # FIFO
+            .order_by("created_at", "id")
         )
 
         if not locked_subreals:
@@ -1176,17 +1153,13 @@ def _allocate_agent_sale(*, company, agent, sale: Sale):
             })
 
         sub_ids = [s.id for s in locked_subreals]
-
-        # 2) Подтягиваем агрегаты одним запросом (уже без FOR UPDATE)
         sold_map = {
             row["subreal_id"]: (row["s"] or 0)
             for row in AgentSaleAllocation.objects
                 .filter(company=company, subreal_id__in=sub_ids)
-                .values("subreal_id")
-                .annotate(s=Sum("qty"))
+                .values("subreal_id").annotate(s=Sum("qty"))
         }
 
-        # 3) Считаем общий доступный
         total_available = 0
         avail_rows = []
         for s in locked_subreals:
@@ -1204,7 +1177,6 @@ def _allocate_agent_sale(*, company, agent, sale: Sale):
                           f"Нужно {qty_to_allocate}, доступно {total_available}."
             })
 
-        # 4) Выделяем по FIFO и создаём allocations
         for s, avail in avail_rows:
             if qty_to_allocate <= 0 or avail <= 0:
                 continue
@@ -1222,10 +1194,8 @@ def _allocate_agent_sale(*, company, agent, sale: Sale):
             qty_to_allocate -= take
 
         if qty_to_allocate > 0:
-            # Не должно случиться после общей проверки
             raise ValidationError({"detail": "Внутренняя ошибка распределения остатков по передачам."})
 
-# ===========================
 # ВЬЮХИ: корзина/скан/добавление/кастом/чекаут
 # ===========================
 
@@ -1395,9 +1365,8 @@ class AgentSaleAddCustomItemAPIView(CompanyBranchRestrictedMixin, APIView):
                 quantity=qty,
             )
 
-        cart.recalc()  # ← добавили пересчёт перед ответом
+        cart.recalc()
         return Response(SaleCartSerializer(cart).data, status=status.HTTP_201_CREATED)
-
 
 class AgentSaleCheckoutAPIView(CompanyBranchRestrictedMixin, APIView):
     permission_classes = [permissions.IsAuthenticated]
@@ -1422,14 +1391,11 @@ class AgentSaleCheckoutAPIView(CompanyBranchRestrictedMixin, APIView):
                 cart.client = client
                 cart.save(update_fields=["client"])
 
-        # кто списывает остатки — агент из cache/параметра или текущий пользователь
         acting_agent = _resolve_acting_agent(request, cart, allow_owner_override=True)
 
-        # ---- создаём продажу (если твой checkout уже принимает agent — передай) ----
         try:
             sale = checkout_agent_cart(cart, department=department, agent=acting_agent)
         except Exception as e:
-            # важно: не возвращаем Response внутри транзакции — кидаем ValidationError
             transaction.set_rollback(True)
             raise ValidationError({"detail": str(e)})
 
@@ -1438,8 +1404,9 @@ class AgentSaleCheckoutAPIView(CompanyBranchRestrictedMixin, APIView):
             sale.branch_id = cart.branch_id
             sale.save(update_fields=["branch"])
 
-        # ---- распределяем продажу по передачам агента ----
-        _allocate_agent_sale(company=cart.company, agent=acting_agent, sale=sale)
+        # ⛔️ ВАЖНО: избегаем дублей — если аллокации уже есть для sale, повторно не распределяем
+        if not AgentSaleAllocation.objects.filter(sale=sale).exists():
+            _allocate_agent_sale(company=cart.company, agent=acting_agent, sale=sale)
 
         payload = {
             "sale_id": str(sale.id),

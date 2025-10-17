@@ -1692,8 +1692,8 @@ class ManufactureSubreal(models.Model):
         "users.Branch", on_delete=models.CASCADE, related_name="crm_subreals",
         null=True, blank=True, db_index=True, verbose_name="Филиал"
     )
-    user = models.ForeignKey("auth.User", on_delete=models.PROTECT, related_name="subreals")
-    agent = models.ForeignKey("auth.User", on_delete=models.PROTECT, related_name="subreals_as_agent")
+    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.PROTECT, related_name="subreals")
+    agent = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.PROTECT, related_name="subreals_as_agent")
     product = models.ForeignKey("main.Product", on_delete=models.PROTECT, related_name="subreals")
 
     # Опциональный идемпотентный ключ на создание передачи
@@ -1796,7 +1796,7 @@ class Acceptance(models.Model):
         null=True, blank=True, db_index=True, verbose_name="Филиал"
     )
     subreal = models.ForeignKey(ManufactureSubreal, on_delete=models.CASCADE, related_name="acceptances")
-    accepted_by = models.ForeignKey("auth.User", on_delete=models.PROTECT, related_name="acceptances")
+    accepted_by = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.PROTECT, related_name="acceptances")
     qty = models.PositiveIntegerField()
     accepted_at = models.DateTimeField(default=timezone.now)
 
@@ -1817,7 +1817,7 @@ class Acceptance(models.Model):
             raise ValidationError({"branch": "Филиал приёма должен совпадать с филиалом передачи."})
         if (self.qty or 0) < 1:
             raise ValidationError({"qty": "Минимум 1."})
-        # запретим приём в закрытую передачу на уровне модели (дублирует check во вью, но надёжнее)
+        # запретим приём в закрытую передачу на уровне модели
         if self.subreal and self.subreal.status != ManufactureSubreal.Status.OPEN:
             raise ValidationError({"subreal": "Передача уже закрыта."})
         if self.subreal and (self.qty or 0) > self.subreal.qty_remaining:
@@ -1851,13 +1851,15 @@ class ReturnFromAgent(models.Model):
         null=True, blank=True, db_index=True, verbose_name="Филиал"
     )
     subreal = models.ForeignKey(ManufactureSubreal, on_delete=models.CASCADE, related_name="returns")
-    returned_by = models.ForeignKey("auth.User", on_delete=models.PROTECT, related_name="returns")
+    returned_by = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.PROTECT, related_name="returns")
     qty = models.PositiveIntegerField()
     returned_at = models.DateTimeField(default=timezone.now)
 
     status = models.CharField(max_length=10, choices=Status.choices, default=Status.PENDING, db_index=True)
-    accepted_by = models.ForeignKey("auth.User", on_delete=models.PROTECT,
-                                    related_name="accepted_returns", null=True, blank=True)
+    accepted_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.PROTECT,
+        related_name="accepted_returns", null=True, blank=True
+    )
     accepted_at = models.DateTimeField(null=True, blank=True)
 
     class Meta:
@@ -1908,7 +1910,7 @@ class ReturnFromAgent(models.Model):
 
 class AgentSaleAllocation(models.Model):
     company   = models.ForeignKey("users.Company", on_delete=models.CASCADE)
-    agent     = models.ForeignKey("auth.User", on_delete=models.CASCADE, db_index=True)
+    agent     = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, db_index=True)
     subreal   = models.ForeignKey(ManufactureSubreal, on_delete=models.CASCADE, related_name="sale_allocations", db_index=True)
     sale      = models.ForeignKey("main.Sale", on_delete=models.CASCADE, related_name="agent_allocations")
     sale_item = models.ForeignKey("main.SaleItem", on_delete=models.CASCADE, related_name="agent_allocations")
@@ -1923,7 +1925,6 @@ class AgentSaleAllocation(models.Model):
             models.Index(fields=["sale", "product", "subreal"]),
         ]
         constraints = [
-            # ключевая защита от дублей при повторном checkout / гонках
             models.UniqueConstraint(
                 fields=["sale_item", "subreal"],
                 name="uniq_allocation_saleitem_subreal",
