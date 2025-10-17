@@ -4,6 +4,7 @@ from django.db import transaction
 from django.utils import timezone
 from django.db.models import Q
 from decimal import Decimal
+from typing import Any, Dict
 
 from apps.main.models import (
     Contact, Pipeline, Deal, Task, Integration, Analytics, Order, Product, Review,
@@ -1131,15 +1132,15 @@ class ManufactureSubrealSerializer(CompanyBranchReadOnlyMixin, serializers.Model
     product_name = serializers.ReadOnlyField(source="product.name")
 
     # Поля агента: имя, фамилия и номер машины
-    agent_first_name  = serializers.ReadOnlyField(source="agent.first_name")
-    agent_last_name   = serializers.ReadOnlyField(source="agent.last_name")
+    agent_first_name   = serializers.ReadOnlyField(source="agent.first_name")
+    agent_last_name    = serializers.ReadOnlyField(source="agent.last_name")
     agent_track_number = serializers.ReadOnlyField(source="agent.track_number")
 
-    # вычисляемые
-    qty_remaining = serializers.ReadOnlyField()
-    qty_on_agent  = serializers.ReadOnlyField()
+    # вычисляемые — делаем через SMethodField, чтобы не падать на None
+    qty_remaining = serializers.SerializerMethodField()
+    qty_on_agent  = serializers.SerializerMethodField()
 
-    # ⬇️ НОВОЕ поле — “пилорама” на уровне КОНКРЕТНОЙ передачи
+    # “пилорама” на уровне конкретной передачи (разрешим только при create)
     is_sawmill = serializers.BooleanField(required=False, default=False)
 
     class Meta:
@@ -1149,7 +1150,7 @@ class ManufactureSubrealSerializer(CompanyBranchReadOnlyMixin, serializers.Model
             "user",
             "agent", "agent_first_name", "agent_last_name", "agent_track_number",
             "product", "product_name",
-            "is_sawmill",                 # ← добавили
+            "is_sawmill",
             "qty_transferred", "qty_accepted", "qty_returned",
             "qty_remaining", "qty_on_agent",
             "status", "created_at",
@@ -1162,6 +1163,14 @@ class ManufactureSubrealSerializer(CompanyBranchReadOnlyMixin, serializers.Model
             "status", "created_at",
         ]
 
+    # ---- computed getters ----
+    def get_qty_remaining(self, obj) -> int:
+        return int(getattr(obj, "qty_remaining", 0) or 0)
+
+    def get_qty_on_agent(self, obj) -> int:
+        return int(getattr(obj, "qty_on_agent", 0) or 0)
+
+    # ---- init: ограничим queryset-ы по компании/филиалу ----
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         comp = self._user_company()
@@ -1170,9 +1179,14 @@ class ManufactureSubrealSerializer(CompanyBranchReadOnlyMixin, serializers.Model
         if comp and self.fields.get("agent"):
             self.fields["agent"].queryset = User.objects.filter(company=comp)
 
+    # ---- validation ----
     def validate(self, attrs):
         company = self._user_company()
         branch  = self._auto_branch()
+
+        # Для create — product обязателен
+        if self.instance is None and attrs.get("product") is None:
+            raise serializers.ValidationError({"product": "Обязательное поле."})
 
         product = attrs.get("product")
         if product is not None and product.company_id != getattr(company, "id", None):
@@ -1188,8 +1202,10 @@ class ManufactureSubrealSerializer(CompanyBranchReadOnlyMixin, serializers.Model
             if agent_company_id and agent_company_id != getattr(company, "id", None):
                 raise serializers.ValidationError({"agent": "Агент другой компании."})
 
-        # qty_transferred > 0 — обычно требование для создания передачи
+        # qty_transferred обязателен и >= 1 при создании
         qty = attrs.get("qty_transferred")
+        if self.instance is None and qty is None:
+            raise serializers.ValidationError({"qty_transferred": "Обязательное поле."})
         if qty is not None and qty < 1:
             raise serializers.ValidationError({"qty_transferred": "Минимум 1."})
 
@@ -1201,6 +1217,11 @@ class ManufactureSubrealSerializer(CompanyBranchReadOnlyMixin, serializers.Model
         validated_data["company"] = self._user_company()
         validated_data["branch"]  = self._auto_branch()
         return super().create(validated_data)
+
+    def update(self, instance, validated_data):
+        # запрещаем менять флаг после создания
+        validated_data.pop("is_sawmill", None)
+        return super().update(instance, validated_data)
 
 
 class AcceptanceCreateSerializer(serializers.ModelSerializer):
@@ -1260,14 +1281,18 @@ class AcceptanceReadSerializer(serializers.ModelSerializer):
             "accepted_by", "accepted_by_name", "qty", "accepted_at",
         ]
 
+    @staticmethod
+    def _full_or_username(user):
+        if not user:
+            return None
+        fn = getattr(user, "get_full_name", lambda: "")() or None
+        return fn or getattr(user, "username", str(user))
+
     def get_agent(self, obj):
-        a = obj.subreal.agent
-        fn = getattr(a, "get_full_name", lambda: "")() or None
-        return fn or getattr(a, "username", str(a))
+        return self._full_or_username(getattr(obj.subreal, "agent", None))
 
     def get_accepted_by_name(self, obj):
-        fn = getattr(obj.accepted_by, "get_full_name", lambda: "")() or None
-        return fn or getattr(obj.accepted_by, "username", str(obj.accepted_by))
+        return self._full_or_username(getattr(obj, "accepted_by", None))
 
 
 class ReturnCreateSerializer(serializers.ModelSerializer):
@@ -1331,21 +1356,21 @@ class ReturnReadSerializer(serializers.ModelSerializer):
             "returned_at", "accepted_at",
         ]
 
+    @staticmethod
+    def _full_or_username(user):
+        if not user:
+            return None
+        fn = getattr(user, "get_full_name", lambda: "")() or None
+        return fn or getattr(user, "username", str(user))
+
     def get_agent(self, obj):
-        a = obj.subreal.agent
-        fn = getattr(a, "get_full_name", lambda: "")() or None
-        return fn or getattr(a, "username", str(a))
+        return self._full_or_username(getattr(obj.subreal, "agent", None))
 
     def get_returned_by_name(self, obj):
-        fn = getattr(obj.returned_by, "get_full_name", lambda: "")() or None
-        return fn or getattr(obj.returned_by, "username", str(obj.returned_by))
+        return self._full_or_username(getattr(obj, "returned_by", None))
 
     def get_accepted_by_name(self, obj):
-        u = obj.accepted_by
-        if not u:
-            return None
-        fn = getattr(u, "get_full_name", lambda: "")() or None
-        return fn or getattr(u, "username", str(u))
+        return self._full_or_username(getattr(obj, "accepted_by", None))
 
 
 class ReturnApproveSerializer(serializers.Serializer):
@@ -1362,7 +1387,6 @@ class ReturnApproveSerializer(serializers.Serializer):
 class BulkSubrealItemSerializer(serializers.Serializer):
     product = serializers.PrimaryKeyRelatedField(queryset=Product.objects.all())
     qty_transferred = serializers.IntegerField(min_value=1)
-    # ⬇️ НОВОЕ поле для item в bulk-выдаче
     is_sawmill = serializers.BooleanField(required=False, default=False)
 
 
@@ -1400,7 +1424,7 @@ class BulkSubrealCreateSerializer(serializers.Serializer):
                 raise serializers.ValidationError({"items": {i: {"product": "Товар другой компании."}}})
 
         # сжимаем дубликаты по product, суммируя qty и OR по is_sawmill
-        merged = {}
+        merged: Dict[Any, Dict[str, Any]] = {}
         for item in attrs["items"]:
             key = item["product"].pk
             prev = merged.get(key)
@@ -1415,8 +1439,10 @@ class BulkSubrealCreateSerializer(serializers.Serializer):
                 # если хотя бы один из дублей is_sawmill=True — считаем TRUE
                 prev["is_sawmill"] = prev["is_sawmill"] or bool(item.get("is_sawmill", False))
 
-        if len(merged) != len(attrs["items"]):
-            attrs["items"] = list(merged.values())
+        # убираем позиции с нулём и убеждаемся, что что-то осталось
+        attrs["items"] = [it for it in merged.values() if int(it["qty_transferred"]) > 0]
+        if not attrs["items"]:
+            raise serializers.ValidationError({"items": "Нет позиций с количеством > 0."})
 
         return attrs
 
@@ -1445,6 +1471,7 @@ class AgentInfoSerializer(serializers.Serializer):
     first_name = serializers.CharField(allow_blank=True)
     last_name = serializers.CharField(allow_blank=True)
     track_number = serializers.CharField(allow_blank=True, allow_null=True)
+
 
 class AgentWithProductsSerializer(serializers.Serializer):
     agent = AgentInfoSerializer()

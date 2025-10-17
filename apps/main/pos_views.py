@@ -17,7 +17,8 @@ from decimal import Decimal, ROUND_HALF_UP
 import qrcode
 from datetime import timedelta
 import io, os, uuid
-from django.db.models import Q, F
+from django.db.models import Q, F, Value as V
+from django.db.models.functions import Coalesce
 from apps.users.models import Company
 from apps.main.models import Cart, CartItem, Sale, Product, MobileScannerToken, Client
 from .pos_serializers import (
@@ -1092,15 +1093,18 @@ def _is_owner(user) -> bool:
     - он действительно указан как owner у своей Company
     """
     if getattr(user, "role", None) in OWNER_ROLES:
-        # дополнительная строгая проверка: user == company.owner
         company = getattr(user, "company", None)
         if company and getattr(company, "owner_id", None):
             return company.owner_id == user.id
-        # если company.owner не заполнен — считаем, что роль достаточно
         return True
     return False
 
-def _agent_available_qty(user, company, product_id):
+
+# ---------------------------
+# Остатки агента (простой вариант)
+# ---------------------------
+
+def _agent_available_qty(user, company, product_id) -> int:
     """
     Сколько у агента на руках: accepted - returned - sold(allocations)
     """
@@ -1115,21 +1119,13 @@ def _agent_available_qty(user, company, product_id):
     return int(accepted) - int(returned) - int(sold)
 
 
-def _subreal_sold_qty(company, subreal_id):
-    """Сколько уже распределено продаж по конкретной передаче агента."""
-    return (
-        AgentSaleAllocation.objects
-        .filter(company=company, subreal_id=subreal_id)
-        .aggregate(s=Sum("qty"))["s"] or 0
-    )
-
 def _resolve_acting_agent(request, cart, *, allow_owner_override=True):
     user = request.user
     company = user.company
 
     agent_id = request.data.get("agent") or request.query_params.get("agent")
     if allow_owner_override and agent_id:
-        if not _is_owner(user):  # ← раньше было is_owner / role == "Владелец"
+        if not _is_owner(user):
             raise ValidationError({"agent": "Только владелец может продавать за агента."})
         agent = get_object_or_404(User, id=agent_id, company=company)
         cache.set(f"cart_agent:{cart.id}", str(agent.id), timeout=60 * 60)
@@ -1145,11 +1141,14 @@ def _resolve_acting_agent(request, cart, *, allow_owner_override=True):
     return user
 
 
+# ---------------------------
+# Аллокатор (исправленный: без N+1 и рассинхрона)
+# ---------------------------
+
 @transaction.atomic
 def _allocate_agent_sale(*, company, agent, sale: Sale):
     """
-    Распределяет позиции продажи по передачам агента (FIFO) и создаёт AgentSaleAllocation,
-    тем самым “списывая” остатки на руках у агента.
+    Распределяет позиции продажи по передачам агента (FIFO) и создаёт AgentSaleAllocation.
     Бросает ValidationError, если не хватает остатков.
     """
     items = sale.items.select_related("product").all()
@@ -1163,51 +1162,54 @@ def _allocate_agent_sale(*, company, agent, sale: Sale):
         if qty_to_allocate <= 0:
             continue
 
-        # FIFO по передачам этого агента
+        # Все передачи под продукт, лочим и сразу аннотируем проданное
         subreals = (
             ManufactureSubreal.objects
             .select_for_update()
             .filter(company=company, agent_id=agent.id, product_id=item.product_id)
-            .order_by("created_at", "id")
+            .annotate(
+                sold_qty=Coalesce(Sum("sale_allocations__qty"), V(0)),
+                acc_qty=Coalesce(F("qty_accepted"), V(0)),
+                ret_qty=Coalesce(F("qty_returned"), V(0)),
+            )
+            .order_by("created_at", "id")  # FIFO
         )
 
-        # Быстрая проверка на общую доступность
-        total_available = _agent_available_qty(agent, company, item.product_id)
+        # общий доступный с тех же залоченных строк
+        rows = []
+        total_available = 0
+        for s in subreals:
+            avail = int(s.acc_qty - s.ret_qty - s.sold_qty)
+            if avail > 0:
+                total_available += avail
+            rows.append((s, max(avail, 0)))
+
         if qty_to_allocate > total_available:
+            name = getattr(item.product, "name", item.product_id)
             raise ValidationError({
-                "detail": (
-                    f"Недостаточно на руках у агента для товара "
-                    f"{getattr(item.product, 'name', item.product_id)}. "
-                    f"Нужно {qty_to_allocate}, доступно {total_available}."
-                )
+                "detail": f"Недостаточно на руках у агента для товара {name}. "
+                          f"Нужно {qty_to_allocate}, доступно {total_available}."
             })
 
-        # Пошаговое распределение
-        for sub in subreals:
-            if qty_to_allocate <= 0:
-                break
-
-            already_sold_in_sub = _subreal_sold_qty(company, sub.id)
-            sub_available = int((sub.qty_accepted or 0) - (sub.qty_returned or 0) - already_sold_in_sub)
-            if sub_available <= 0:
+        # выделяем по FIFO
+        for s, avail in rows:
+            if qty_to_allocate <= 0 or avail <= 0:
                 continue
-
-            take = min(sub_available, qty_to_allocate)
+            take = min(avail, qty_to_allocate)
 
             AgentSaleAllocation.objects.create(
                 company=company,
                 agent=agent,
-                subreal=sub,
+                subreal=s,
                 sale=sale,
                 sale_item=item,
                 product=item.product,
                 qty=take,
             )
-
             qty_to_allocate -= take
 
+        # «страховка» — сюда не попадём после общей проверки
         if qty_to_allocate > 0:
-            # Непредвиденный случай (теоретически не должен возникать после общей проверки)
             raise ValidationError({"detail": "Внутренняя ошибка распределения остатков по передачам."})
 
 
@@ -1226,21 +1228,19 @@ class AgentCartStartAPIView(CompanyBranchRestrictedMixin, APIView):
         qs = (
             Cart.objects
             .filter(company=company, user=user, status=Cart.Status.ACTIVE)
-            .order_by('-created_at')
+            .order_by("-created_at")
         )
         cart = qs.first()
         if cart is None:
             cart = Cart.objects.create(company=company, user=user, status=Cart.Status.ACTIVE)
         else:
-            extra_ids = list(qs.values_list('id', flat=True)[1:])
+            extra_ids = list(qs.values_list("id", flat=True)[1:])
             if extra_ids:
+                # при желании можно использовать CLOSED/ABANDONED
                 Cart.objects.filter(id__in=extra_ids).update(status=Cart.Status.CHECKED_OUT)
 
         # зафиксируем агента (если owner передал)
-        try:
-            _ = _resolve_acting_agent(request, cart, allow_owner_override=True)
-        except ValidationError as e:
-            return Response(e.detail, status=403)
+        _ = _resolve_acting_agent(request, cart, allow_owner_override=True)
 
         # опциональная суммовая скидка
         opts = StartCartOptionsSerializer(data=request.data)
@@ -1269,10 +1269,7 @@ class AgentSaleScanAPIView(CompanyBranchRestrictedMixin, APIView):
         if not product:
             return Response({"not_found": True, "message": "Товар не найден"}, status=404)
 
-        try:
-            acting_agent = _resolve_acting_agent(request, cart, allow_owner_override=True)
-        except ValidationError as e:
-            return Response(e.detail, status=403)
+        acting_agent = _resolve_acting_agent(request, cart, allow_owner_override=True)
 
         available = _agent_available_qty(acting_agent, cart.company, product.id)
         in_cart = (
@@ -1312,10 +1309,7 @@ class AgentSaleAddItemAPIView(CompanyBranchRestrictedMixin, APIView):
         product = get_object_or_404(Product, id=ser.validated_data["product_id"], company=cart.company)
         qty = ser.validated_data["quantity"]
 
-        try:
-            acting_agent = _resolve_acting_agent(request, cart, allow_owner_override=True)
-        except ValidationError as e:
-            return Response(e.detail, status=403)
+        acting_agent = _resolve_acting_agent(request, cart, allow_owner_override=True)
 
         available = _agent_available_qty(acting_agent, cart.company, product.id)
         in_cart = (
@@ -1389,6 +1383,7 @@ class AgentSaleAddCustomItemAPIView(CompanyBranchRestrictedMixin, APIView):
                 quantity=qty,
             )
 
+        cart.recalc()  # ← добавили пересчёт перед ответом
         return Response(SaleCartSerializer(cart).data, status=status.HTTP_201_CREATED)
 
 
@@ -1413,36 +1408,26 @@ class AgentSaleCheckoutAPIView(CompanyBranchRestrictedMixin, APIView):
             client = get_object_or_404(Client, id=client_id, company=request.user.company)
             if hasattr(cart, "client_id"):
                 cart.client = client
-                try:
-                    cart.save(update_fields=["client"])
-                except Exception:
-                    pass
+                cart.save(update_fields=["client"])
 
         # кто списывает остатки — агент из cache/параметра или текущий пользователь
-        try:
-            acting_agent = _resolve_acting_agent(request, cart, allow_owner_override=True)
-        except ValidationError as e:
-            return Response(e.detail, status=403)
+        acting_agent = _resolve_acting_agent(request, cart, allow_owner_override=True)
 
-        # ---- создаём продажу (ваша функция должна вернуть Sale и SaleItems) ----
+        # ---- создаём продажу (если твой checkout уже принимает agent — передай) ----
         try:
-            # ВАЖНО: если твоя checkout-функция уже умеет принимать agent=, можно передать туда;
-            # ниже — общий случай, когда она создаёт Sale, а списание делаем мы.
             sale = checkout_agent_cart(cart, department=department, agent=acting_agent)
         except Exception as e:
-            # приведи к вашим исключениям, если нужно
-            return Response({"detail": str(e)}, status=400)
+            # важно: не возвращаем Response внутри транзакции — кидаем ValidationError
+            transaction.set_rollback(True)
+            raise ValidationError({"detail": str(e)})
 
         # привести branch продажи к branch корзины, если нужно
         if hasattr(sale, "branch_id") and hasattr(cart, "branch_id") and sale.branch_id != cart.branch_id:
             sale.branch_id = cart.branch_id
             sale.save(update_fields=["branch"])
 
-        # ---- КЛЮЧЕВОЕ: РАСПРЕДЕЛЯЕМ ПРОДАЖУ ПО ПЕРЕДАЧАМ АГЕНТА (СПИСЫВАЕМ ЕГО ОСТАТКИ) ----
-        try:
-            _allocate_agent_sale(company=cart.company, agent=acting_agent, sale=sale)
-        except ValidationError as e:
-            return Response(e.detail, status=400)
+        # ---- распределяем продажу по передачам агента ----
+        _allocate_agent_sale(company=cart.company, agent=acting_agent, sale=sale)
 
         payload = {
             "sale_id": str(sale.id),
@@ -1487,7 +1472,6 @@ class AgentCartItemUpdateDestroyAPIView(APIView):
     permission_classes = [permissions.IsAuthenticated]
 
     def _get_active_cart(self, request, cart_id):
-        # корзина именно этого пользователя-агента и его компании
         return get_object_or_404(
             Cart,
             id=cart_id,
@@ -1501,12 +1485,10 @@ class AgentCartItemUpdateDestroyAPIView(APIView):
         item = CartItem.objects.filter(cart=cart, id=item_or_product_id).first()
         if item:
             return item
-
-        # 2) как ID товара (некоторые фронты шлют product_id)
+        # 2) как ID товара
         item = CartItem.objects.filter(cart=cart, product_id=item_or_product_id).first()
         if item:
             return item
-
         raise Http404("CartItem not found in this cart.")
 
     @transaction.atomic
@@ -1514,7 +1496,6 @@ class AgentCartItemUpdateDestroyAPIView(APIView):
         cart = self._get_active_cart(request, cart_id)
         item = self._get_item_in_cart(cart, item_id)
 
-        # Валидация количества
         try:
             qty = int(request.data.get("quantity"))
         except (TypeError, ValueError):
