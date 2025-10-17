@@ -1148,41 +1148,54 @@ def _resolve_acting_agent(request, cart, *, allow_owner_override=True):
 @transaction.atomic
 def _allocate_agent_sale(*, company, agent, sale: Sale):
     """
-    Распределяет позиции продажи по передачам агента (FIFO) и создаёт AgentSaleAllocation.
-    Бросает ValidationError, если не хватает остатков.
+    FIFO-распределение продаж по передачам агента.
+    Избегаем 'FOR UPDATE ... GROUP BY': лочим subreals отдельно,
+    агрегации делаем во втором запросе без блокировок.
     """
     items = sale.items.select_related("product").all()
 
     for item in items:
         if not item.product_id:
-            # кастомные позиции (без Product) не списывают агентские остатки
-            continue
+            continue  # кастомные позиции не списывают остатки
 
         qty_to_allocate = int(item.quantity or 0)
         if qty_to_allocate <= 0:
             continue
 
-        # Все передачи под продукт, лочим и сразу аннотируем проданное
-        subreals = (
+        # 1) Лочим только передачи без агрегатов (нет GROUP BY)
+        locked_subreals = list(
             ManufactureSubreal.objects
             .select_for_update()
             .filter(company=company, agent_id=agent.id, product_id=item.product_id)
-            .annotate(
-                sold_qty=Coalesce(Sum("sale_allocations__qty"), V(0)),
-                acc_qty=Coalesce(F("qty_accepted"), V(0)),
-                ret_qty=Coalesce(F("qty_returned"), V(0)),
-            )
             .order_by("created_at", "id")  # FIFO
         )
 
-        # общий доступный с тех же залоченных строк
-        rows = []
+        if not locked_subreals:
+            raise ValidationError({
+                "detail": f"У агента нет передач по товару {getattr(item.product, 'name', item.product_id)}."
+            })
+
+        sub_ids = [s.id for s in locked_subreals]
+
+        # 2) Подтягиваем агрегаты одним запросом (уже без FOR UPDATE)
+        sold_map = {
+            row["subreal_id"]: (row["s"] or 0)
+            for row in AgentSaleAllocation.objects
+                .filter(company=company, subreal_id__in=sub_ids)
+                .values("subreal_id")
+                .annotate(s=Sum("qty"))
+        }
+
+        # 3) Считаем общий доступный
         total_available = 0
-        for s in subreals:
-            avail = int(s.acc_qty - s.ret_qty - s.sold_qty)
-            if avail > 0:
-                total_available += avail
-            rows.append((s, max(avail, 0)))
+        avail_rows = []
+        for s in locked_subreals:
+            sold = int(sold_map.get(s.id, 0))
+            acc  = int(s.qty_accepted or 0)
+            ret  = int(s.qty_returned or 0)
+            avail = max(acc - ret - sold, 0)
+            total_available += avail
+            avail_rows.append((s, avail))
 
         if qty_to_allocate > total_available:
             name = getattr(item.product, "name", item.product_id)
@@ -1191,8 +1204,8 @@ def _allocate_agent_sale(*, company, agent, sale: Sale):
                           f"Нужно {qty_to_allocate}, доступно {total_available}."
             })
 
-        # выделяем по FIFO
-        for s, avail in rows:
+        # 4) Выделяем по FIFO и создаём allocations
+        for s, avail in avail_rows:
             if qty_to_allocate <= 0 or avail <= 0:
                 continue
             take = min(avail, qty_to_allocate)
@@ -1208,10 +1221,9 @@ def _allocate_agent_sale(*, company, agent, sale: Sale):
             )
             qty_to_allocate -= take
 
-        # «страховка» — сюда не попадём после общей проверки
         if qty_to_allocate > 0:
+            # Не должно случиться после общей проверки
             raise ValidationError({"detail": "Внутренняя ошибка распределения остатков по передачам."})
-
 
 # ===========================
 # ВЬЮХИ: корзина/скан/добавление/кастом/чекаут
