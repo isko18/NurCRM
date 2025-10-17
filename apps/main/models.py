@@ -6,7 +6,7 @@ from django.core.validators import MinValueValidator
 from decimal import Decimal, ROUND_HALF_UP
 from dateutil.relativedelta import relativedelta
 from django.db import transaction
-from django.db.models import Sum, F
+from django.db.models import Sum, F, Q
 from mptt.models import MPTTModel, TreeForeignKey
 import uuid, secrets
 
@@ -1681,25 +1681,27 @@ from django.utils import timezone
 # предполагаю, что Company, Branch, Product уже импортируются/определены выше
 # from .models import Company, Branch, Product  # скорректируйте путь при необходимости
 
-
 class ManufactureSubreal(models.Model):
     class Status(models.TextChoices):
         OPEN   = "open",   "Открыта"
         CLOSED = "closed", "Закрыта"
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    company = models.ForeignKey(Company, on_delete=models.CASCADE, related_name="subreals")
+    company = models.ForeignKey("users.Company", on_delete=models.CASCADE, related_name="subreals")
     branch = models.ForeignKey(
-        Branch, on_delete=models.CASCADE, related_name='crm_subreals',
-        null=True, blank=True, db_index=True, verbose_name='Филиал'
+        "users.Branch", on_delete=models.CASCADE, related_name="crm_subreals",
+        null=True, blank=True, db_index=True, verbose_name="Филиал"
     )
-    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.PROTECT, related_name="subreals")
-    agent = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.PROTECT, related_name="subreals_as_agent")
-    product = models.ForeignKey("Product", on_delete=models.PROTECT, related_name="subreals")
+    user = models.ForeignKey("auth.User", on_delete=models.PROTECT, related_name="subreals")
+    agent = models.ForeignKey("auth.User", on_delete=models.PROTECT, related_name="subreals_as_agent")
+    product = models.ForeignKey("main.Product", on_delete=models.PROTECT, related_name="subreals")
 
-    # ⬇️ новое поле — решаем “это пилорама?” на уровне КОНКРЕТНОЙ передачи
+    # Опциональный идемпотентный ключ на создание передачи
+    external_ref = models.CharField(max_length=64, null=True, blank=True, db_index=True)
+
+    # Флаг «пилорама» — авто-приём при создании
     is_sawmill = models.BooleanField(
-        default=False, db_index=True, help_text="Если True — авто-приём на весь объём при создании."
+        default=False, db_index=True, help_text="Если True — авто-приём на весь остаток при создании."
     )
 
     qty_transferred = models.PositiveIntegerField()
@@ -1716,35 +1718,46 @@ class ManufactureSubreal(models.Model):
             models.Index(fields=["company", "agent", "product", "status"]),
             models.Index(fields=["company", "branch", "agent", "product", "status"]),
             models.Index(fields=["created_at"]),
-            # можно добавить композитный индекс, если часто фильтруете по is_sawmill
             models.Index(fields=["company", "is_sawmill", "status"]),
+        ]
+        constraints = [
+            # идемпотентность создания передачи (включается только когда external_ref не NULL)
+            models.UniqueConstraint(
+                fields=["company", "external_ref"],
+                name="uniq_subreal_company_external_ref",
+                condition=Q(external_ref__isnull=False),
+            ),
         ]
 
     def __str__(self):
-        name = getattr(self.agent, "get_full_name", lambda: "")() or getattr(self.agent, "username", str(self.agent))
-        return f"{name} · {self.product.name} · {self.qty_transferred}"
+        agent_name = (
+            getattr(self.agent, "get_full_name", lambda: "")() or
+            getattr(self.agent, "username", None) or
+            str(self.agent_id)
+        )
+        prod_name = getattr(self.product, "name", None) or str(self.product_id)
+        return f"{agent_name} · {prod_name} · {self.qty_transferred}"
 
     @property
     def qty_remaining(self) -> int:
-        return max(self.qty_transferred - self.qty_accepted, 0)
+        return max((self.qty_transferred or 0) - (self.qty_accepted or 0), 0)
 
     @property
     def qty_on_agent(self) -> int:
-        return max(self.qty_accepted - self.qty_returned, 0)
+        return max((self.qty_accepted or 0) - (self.qty_returned or 0), 0)
 
     def clean(self):
         if self.branch_id and self.branch.company_id != self.company_id:
-            raise ValidationError({'branch': 'Филиал принадлежит другой компании.'})
+            raise ValidationError({"branch": "Филиал принадлежит другой компании."})
         if self.agent_id and getattr(self.agent, "company_id", None) not in (None, self.company_id):
             raise ValidationError({"agent": "Агент принадлежит другой компании."})
         if self.product_id and self.product.company_id != self.company_id:
             raise ValidationError({"product": "Товар принадлежит другой компании."})
-        if self.branch_id:
-            if self.product and self.product.branch_id not in (None, self.branch_id):
-                raise ValidationError({"product": "Товар другого филиала."})
-        if self.qty_accepted > self.qty_transferred:
+        if self.branch_id and self.product and self.product.branch_id not in (None, self.branch_id):
+            raise ValidationError({"product": "Товар другого филиала."})
+        if (self.qty_accepted or 0) > (self.qty_transferred or 0):
             raise ValidationError({"qty_accepted": "Принято не может превышать переданное."})
-        if self.qty_returned > self.qty_accepted:
+        if (self.qty_returned or 0) > (self.qty_accepted or 0):
             raise ValidationError({"qty_returned": "Возвращено не может превышать принятое."})
 
     def try_close(self):
@@ -1752,20 +1765,17 @@ class ManufactureSubreal(models.Model):
             self.status = self.Status.CLOSED
             self.save(update_fields=["status"])
 
-    # ⬇️ Удобный метод: авто-приём, если is_sawmill=True
     @transaction.atomic
     def auto_accept_if_needed(self, by_user):
         """
-        Если передача помечена как is_sawmill=True, создаёт Acceptance
-        на весь доступный остаток (qty_remaining) в одной транзакции.
-        Идempotent: несколько вызовов подряд не приведут к лишним приёмам.
+        Для is_sawmill=True: один раз принять весь доступный остаток.
+        Идемпотентно и безопасно к гонкам.
         """
         if not self.is_sawmill:
             return
-        # Лочим актуальную запись, чтобы избежать гонок
         locked = type(self).objects.select_for_update().select_related("company", "branch").get(pk=self.pk)
         remaining = locked.qty_remaining
-        if remaining <= 0:
+        if remaining <= 0 or locked.status != locked.Status.OPEN:
             return
         Acceptance.objects.create(
             company=locked.company,
@@ -1775,17 +1785,18 @@ class ManufactureSubreal(models.Model):
             qty=remaining,
             accepted_at=timezone.now(),
         )
+        # qty_accepted и статус обновятся через Acceptance.save() + try_close()
 
 
 class Acceptance(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    company = models.ForeignKey(Company, on_delete=models.CASCADE, related_name="acceptances")
+    company = models.ForeignKey("users.Company", on_delete=models.CASCADE, related_name="acceptances")
     branch = models.ForeignKey(
-        Branch, on_delete=models.CASCADE, related_name='crm_acceptances',
-        null=True, blank=True, db_index=True, verbose_name='Филиал'
+        "users.Branch", on_delete=models.CASCADE, related_name="crm_acceptances",
+        null=True, blank=True, db_index=True, verbose_name="Филиал"
     )
     subreal = models.ForeignKey(ManufactureSubreal, on_delete=models.CASCADE, related_name="acceptances")
-    accepted_by = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.PROTECT, related_name="acceptances")
+    accepted_by = models.ForeignKey("auth.User", on_delete=models.PROTECT, related_name="acceptances")
     qty = models.PositiveIntegerField()
     accepted_at = models.DateTimeField(default=timezone.now)
 
@@ -1804,7 +1815,12 @@ class Acceptance(models.Model):
             raise ValidationError({"company": "Компания приёма должна совпадать с компанией передачи."})
         if self.subreal_id and self.branch_id is not None and self.subreal.branch_id not in (None, self.branch_id):
             raise ValidationError({"branch": "Филиал приёма должен совпадать с филиалом передачи."})
-        if self.subreal and self.qty > self.subreal.qty_remaining:
+        if (self.qty or 0) < 1:
+            raise ValidationError({"qty": "Минимум 1."})
+        # запретим приём в закрытую передачу на уровне модели (дублирует check во вью, но надёжнее)
+        if self.subreal and self.subreal.status != ManufactureSubreal.Status.OPEN:
+            raise ValidationError({"subreal": "Передача уже закрыта."})
+        if self.subreal and (self.qty or 0) > self.subreal.qty_remaining:
             raise ValidationError({"qty": f"Нельзя принять {self.qty}: доступно {self.subreal.qty_remaining}."})
 
     def save(self, *args, **kwargs):
@@ -1829,18 +1845,18 @@ class ReturnFromAgent(models.Model):
         REJECTED = "rejected", "Отклонён"
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    company = models.ForeignKey(Company, on_delete=models.CASCADE, related_name="returns")
+    company = models.ForeignKey("users.Company", on_delete=models.CASCADE, related_name="returns")
     branch = models.ForeignKey(
-        Branch, on_delete=models.CASCADE, related_name='crm_returns',
-        null=True, blank=True, db_index=True, verbose_name='Филиал'
+        "users.Branch", on_delete=models.CASCADE, related_name="crm_returns",
+        null=True, blank=True, db_index=True, verbose_name="Филиал"
     )
     subreal = models.ForeignKey(ManufactureSubreal, on_delete=models.CASCADE, related_name="returns")
-    returned_by = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.PROTECT, related_name="returns")
+    returned_by = models.ForeignKey("auth.User", on_delete=models.PROTECT, related_name="returns")
     qty = models.PositiveIntegerField()
     returned_at = models.DateTimeField(default=timezone.now)
 
     status = models.CharField(max_length=10, choices=Status.choices, default=Status.PENDING, db_index=True)
-    accepted_by = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.PROTECT,
+    accepted_by = models.ForeignKey("auth.User", on_delete=models.PROTECT,
                                     related_name="accepted_returns", null=True, blank=True)
     accepted_at = models.DateTimeField(null=True, blank=True)
 
@@ -1860,9 +1876,9 @@ class ReturnFromAgent(models.Model):
             raise ValidationError({"company": "Компания возврата должна совпадать с компанией передачи."})
         if self.subreal_id and self.branch_id is not None and self.subreal.branch_id not in (None, self.branch_id):
             raise ValidationError({"branch": "Филиал возврата должен совпадать с филиалом передачи."})
-        if self.qty < 1:
+        if (self.qty or 0) < 1:
             raise ValidationError({"qty": "Минимум 1."})
-        if self.subreal and self.status == self.Status.PENDING and self.qty > self.subreal.qty_on_agent:
+        if self.subreal and self.status == self.Status.PENDING and (self.qty or 0) > self.subreal.qty_on_agent:
             raise ValidationError({"qty": f"Нельзя вернуть {self.qty}: на руках {self.subreal.qty_on_agent}."})
 
     def save(self, *args, **kwargs):
@@ -1892,8 +1908,8 @@ class ReturnFromAgent(models.Model):
 
 class AgentSaleAllocation(models.Model):
     company   = models.ForeignKey("users.Company", on_delete=models.CASCADE)
-    agent     = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, db_index=True)
-    subreal   = models.ForeignKey("main.ManufactureSubreal", on_delete=models.CASCADE, related_name="sale_allocations", db_index=True)
+    agent     = models.ForeignKey("auth.User", on_delete=models.CASCADE, db_index=True)
+    subreal   = models.ForeignKey(ManufactureSubreal, on_delete=models.CASCADE, related_name="sale_allocations", db_index=True)
     sale      = models.ForeignKey("main.Sale", on_delete=models.CASCADE, related_name="agent_allocations")
     sale_item = models.ForeignKey("main.SaleItem", on_delete=models.CASCADE, related_name="agent_allocations")
     product   = models.ForeignKey("main.Product", on_delete=models.PROTECT)
@@ -1904,4 +1920,12 @@ class AgentSaleAllocation(models.Model):
         indexes = [
             models.Index(fields=["agent", "product"]),
             models.Index(fields=["subreal", "product"]),
+            models.Index(fields=["sale", "product", "subreal"]),
+        ]
+        constraints = [
+            # ключевая защита от дублей при повторном checkout / гонках
+            models.UniqueConstraint(
+                fields=["sale_item", "subreal"],
+                name="uniq_allocation_saleitem_subreal",
+            ),
         ]
