@@ -25,7 +25,7 @@ from .pos_serializers import (
     SaleCartSerializer, SaleItemSerializer,
     ScanRequestSerializer, AddItemSerializer,
     CheckoutSerializer, MobileScannerTokenSerializer,
-    SaleListSerializer, SaleDetailSerializer, StartCartOptionsSerializer, CustomCartItemCreateSerializer, SaleStatusUpdateSerializer
+    SaleListSerializer, SaleDetailSerializer, StartCartOptionsSerializer, CustomCartItemCreateSerializer, SaleStatusUpdateSerializer, ReceiptSerializer
 )
 from apps.main.services import checkout_cart, NotEnoughStock
 from apps.main.views import CompanyBranchRestrictedMixin
@@ -46,6 +46,10 @@ from apps.main.utils_numbers import ensure_sale_doc_number
 from django.core.cache import cache
 from django.shortcuts import get_object_or_404
 from apps.users.models import Roles, User, Company  # важно подтянуть Roles
+# from .serializers import SalePayloadSerializer
+# from .printers import UsbEscposPrinter
+import requests
+from django.conf import settings
 
 try:
     from apps.main.models import ClientDeal, DealInstallment
@@ -544,11 +548,7 @@ class SaleInvoiceDownloadAPIView(APIView):
         return FileResponse(buffer, as_attachment=True, filename=f"invoice_{doc_no}.pdf")
 
 
-class SaleReceiptDownloadAPIView(APIView):
-    """
-    GET /api/main/pos/sales/<uuid:pk>/receipt/
-    Печать чека сразу в USB-принтер на этой машине (касовый ПК).
-    """
+class SaleReceiptDataAPIView(APIView):
     permission_classes = [permissions.IsAuthenticated]
 
     def get(self, request, pk, *args, **kwargs):
@@ -556,14 +556,14 @@ class SaleReceiptDownloadAPIView(APIView):
             Sale.objects.select_related("company").prefetch_related("items"),
             id=pk, company=request.user.company
         )
-        doc_no = ensure_sale_doc_number(sale)
-
-        try:
-            from .printers import UsbEscposPrinter
-            UsbEscposPrinter().print_sale(sale, doc_no, fmt_money)
-            return Response({"ok": True, "printed": True, "doc_no": doc_no}, status=200)
-        except Exception as e:
-            return Response({"ok": False, "printed": False, "doc_no": doc_no, "error": str(e)}, status=500)
+        cashier_name = (
+            request.query_params.get("cashier_name")
+            or getattr(request.user, "full_name", None)
+            or getattr(request.user, "get_full_name", lambda: None)()
+        )
+        from apps.main.printers import build_receipt_payload
+        payload = build_receipt_payload(sale, cashier_name=cashier_name, ensure_number=True)
+        return Response(payload, status=200)
 
 class SaleStartAPIView(APIView):
     """
@@ -1500,3 +1500,64 @@ class AgentCartItemUpdateDestroyAPIView(APIView):
         item.delete()
         cart.recalc()
         return Response(SaleCartSerializer(cart).data, status=200)
+    
+# import logging
+# log = logging.getLogger(__name__)
+# from django.conf import settings
+
+# def _client_ip(request):
+#     xff = request.META.get("HTTP_X_FORWARDED_FOR")
+#     return xff.split(",")[0].strip() if xff else request.META.get("REMOTE_ADDR")
+
+# class HealthAPIView(APIView):
+#     authentication_classes=[]; permission_classes=[]
+#     def get(self, request): return Response({"ok": True})
+
+# class PrintSaleAPIView(APIView):
+#     authentication_classes=[]; permission_classes=[]
+
+#     def post(self, request):
+#         # IP allowlist (если задан)
+#         allow = getattr(settings, "ALLOWLIST", [])
+#         cip = _client_ip(request)
+#         if allow and cip not in allow:
+#             return Response({"detail":"IP not allowed"}, status=403)
+
+#         # Static token в заголовке Authorization: Token <...>
+#         auth = request.META.get("HTTP_AUTHORIZATION","")
+#         token = auth.split("Token ")[1].strip() if auth.startswith("Token ") else None
+#         if not token or token != getattr(settings, "AGENT_STATIC_TOKEN", ""):
+#             return Response({"detail":"Unauthorized"}, status=401)
+
+#         ser = SalePayloadSerializer(data=request.data)
+#         if not ser.is_valid():
+#             return Response({"ok": False, "errors": ser.errors}, status=400)
+#         data = ser.validated_data
+
+#         class Obj: pass
+#         sale = Obj()
+#         sale.company = Obj(); sale.company.name = data.get("company") or "Компания"
+#         sale.created_at = data.get("created_at")
+#         sale.discount = data.get("discount", 0)
+#         sale.tax = data.get("tax", 0)
+#         sale.paid_cash = data.get("paid_cash", 0)
+#         sale.paid_card = data.get("paid_card", 0)
+#         sale.change = data.get("change", 0)
+#         sale.cashier_name = data.get("cashier_name")
+
+#         class Items:
+#             def __init__(self, items): self._items = items
+#             def all(self): return self._items
+#         class Item:
+#             def __init__(self, n,q,p): self.name=n; self.qty=q; self.price=p
+
+#         sale.items = Items([Item(i["name"], i["qty"], i["price"]) for i in data["items"]])
+
+#         def fmt_money(x): return f"{x:,.2f}".replace(",", " ").replace(".", ",")
+
+#         try:
+#             UsbEscposPrinter().print_sale(sale, data["doc_no"], fmt_money)
+#             return Response({"ok": True, "printed": True})
+#         except Exception as e:
+#             log.exception("Print error")
+#             return Response({"ok": False, "printed": False, "error": str(e)}, status=500)

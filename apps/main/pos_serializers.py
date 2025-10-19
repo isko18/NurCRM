@@ -317,3 +317,19 @@ class SaleStatusUpdateSerializer(serializers.ModelSerializer):
         fields = ("status",)
 
 
+class ReceiptItemSerializer(serializers.Serializer):
+    name  = serializers.CharField()
+    qty   = serializers.FloatField()
+    price = serializers.FloatField()
+
+class ReceiptSerializer(serializers.Serializer):
+    doc_no       = serializers.CharField()
+    company      = serializers.CharField(allow_blank=True, required=False)
+    created_at   = serializers.CharField(allow_null=True, required=False)   # строкой YYYY-MM-DD HH:MM:SS
+    cashier_name = serializers.CharField(allow_null=True, required=False)
+    items        = ReceiptItemSerializer(many=True)
+    discount     = serializers.FloatField(required=False, default=0.0)
+    tax          = serializers.FloatField(required=False, default=0.0)
+    paid_cash    = serializers.FloatField(required=False, default=0.0)
+    paid_card    = serializers.FloatField(required=False, default=0.0)
+    change       = serializers.FloatField(required=False, default=0.0)
