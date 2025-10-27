@@ -421,8 +421,8 @@ class StudentAttendanceSerializer(serializers.ModelSerializer):
 
 # ====== TeacherRate ======
 class TeacherRateSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
-    company = serializers.ReadOnlyField(source="company.id")
-    branch = serializers.ReadOnlyField(source="branch.id")
+    company = serializers.UUIDField(source="company_id", read_only=True)
+    branch = serializers.UUIDField(source="branch_id", read_only=True)
 
     teacher = serializers.PrimaryKeyRelatedField(queryset=User.objects.all())
     teacher_name = serializers.CharField(source="teacher.get_full_name", read_only=True)
