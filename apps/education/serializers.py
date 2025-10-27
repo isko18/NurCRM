@@ -73,8 +73,9 @@ class CompanyBranchReadOnlyMixin:
 
 # ====== Lead ======
 class LeadSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
-    company = serializers.ReadOnlyField(source='company.id')
-    branch = serializers.ReadOnlyField(source='branch.id')
+    company = serializers.UUIDField(source='company_id', read_only=True)
+    branch = serializers.UUIDField(source='branch_id', read_only=True)
+
 
     class Meta:
         model = Lead
@@ -91,8 +92,9 @@ class LeadSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
 
 # ====== Course ======
 class CourseSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
-    company = serializers.ReadOnlyField(source='company.id')
-    branch = serializers.ReadOnlyField(source='branch.id')
+    company = serializers.UUIDField(source='company_id', read_only=True)
+    branch = serializers.UUIDField(source='branch_id', read_only=True)
+
 
     class Meta:
         model = Course
@@ -102,8 +104,9 @@ class CourseSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
 
 # ====== Group ======
 class GroupSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
-    company = serializers.ReadOnlyField(source='company.id')
-    branch = serializers.ReadOnlyField(source='branch.id')
+    company = serializers.UUIDField(source='company_id', read_only=True)
+    branch = serializers.UUIDField(source='branch_id', read_only=True)
+
 
     course = serializers.PrimaryKeyRelatedField(queryset=Course.objects.all())
     course_title = serializers.CharField(source='course.title', read_only=True)
@@ -133,8 +136,9 @@ class GroupSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
 
 # ====== Student ======
 class StudentSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
-    company = serializers.ReadOnlyField(source='company.id')
-    branch = serializers.ReadOnlyField(source='branch.id')
+    company = serializers.UUIDField(source='company_id', read_only=True)
+    branch = serializers.UUIDField(source='branch_id', read_only=True)
+
 
     group = serializers.PrimaryKeyRelatedField(queryset=Group.objects.all(), allow_null=True, required=False)
     group_name = serializers.CharField(source='group.name', read_only=True)
@@ -170,8 +174,8 @@ class StudentSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
 
 # ====== Lesson ======
 class LessonSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
-    company = serializers.ReadOnlyField(source='company.id')
-    branch = serializers.ReadOnlyField(source='branch.id')
+    company = serializers.UUIDField(source='company_id', read_only=True)
+    branch = serializers.UUIDField(source='branch_id', read_only=True)
 
     group = serializers.PrimaryKeyRelatedField(queryset=Group.objects.all())
     course = serializers.PrimaryKeyRelatedField(queryset=Course.objects.all(), required=False)
@@ -271,9 +275,8 @@ class LessonSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
 
 # ====== Folder ======
 class FolderSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
-    company = serializers.ReadOnlyField(source='company.id')
-    branch = serializers.ReadOnlyField(source='branch.id')
-
+    company = serializers.UUIDField(source='company_id', read_only=True)
+    branch = serializers.UUIDField(source='branch_id', read_only=True)
     parent = serializers.PrimaryKeyRelatedField(queryset=Folder.objects.all(), allow_null=True, required=False)
     parent_name = serializers.CharField(source='parent.name', read_only=True)
 
@@ -298,8 +301,9 @@ class FolderSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
 
 # ====== Document ======
 class DocumentSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
-    company = serializers.ReadOnlyField(source='company.id')
-    branch = serializers.ReadOnlyField(source='branch.id')
+    company = serializers.UUIDField(source='company_id', read_only=True)
+    branch = serializers.UUIDField(source='branch_id', read_only=True)
+
     folder_name = serializers.CharField(source='folder.name', read_only=True)
 
     class Meta:
@@ -328,8 +332,9 @@ class DocumentSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer
 
 # ====== Attendance (общий CRUD) ======
 class AttendanceSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
-    company = serializers.ReadOnlyField(source='company.id')
-    branch = serializers.ReadOnlyField(source='branch.id')
+    company = serializers.UUIDField(source='company_id', read_only=True)
+    branch = serializers.UUIDField(source='branch_id', read_only=True)
+
 
     class Meta:
         model = Attendance
