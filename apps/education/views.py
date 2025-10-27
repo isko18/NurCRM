@@ -35,44 +35,51 @@ class DocumentFilter(dj_filters.FilterSet):
 # ===== Company + Branch scoped mixin (как в «барбере») =====
 class CompanyBranchQuerysetMixin:
     """
-    Видимость:
-      - если у пользователя есть активный филиал → только записи этого филиала (branch=<user_branch>)
-      - иначе → только глобальные записи (branch is NULL)
-    Всегда фильтруем по company пользователя.
-    Создание/обновление: принудительно проставляем company/branch из контекста.
-    """
-    _cached_active_branch = object()  # маркер «ещё не вычисляли»
+    🔒 Универсальный миксин для фильтрации queryset по компании и филиалу.
 
-    # --- helpers ---
+    Правила:
+      • Всегда фильтрует записи по company пользователя.
+      • Если у пользователя есть активный филиал → показывает только branch=<активный>.
+      • Если филиала нет → показывает глобальные (branch IS NULL).
+      • При создании/обновлении автоматически проставляет company/branch.
+    """
+    _UNSET = object()  # единый маркер "ещё не вычисляли"
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._cached_active_branch = self._UNSET
+
+    # ---- helpers ----
     def _user(self):
         return getattr(self.request, "user", None)
 
     def _user_company(self):
+        """Определяем компанию пользователя (Company)."""
         user = self._user()
         if not user or not getattr(user, "is_authenticated", False):
             return None
         return getattr(user, "company", None) or getattr(user, "owned_company", None)
 
     def _user_primary_branch(self):
-        """
-        Определяем филиал сотрудника:
-          1) membership с is_primary=True
-          2) любой membership
-          3) иначе None
-        """
+        """Определяем основной филиал пользователя (Branch)."""
         user = self._user()
         if not user or not getattr(user, "is_authenticated", False):
             return None
+
         memberships = getattr(user, "branch_memberships", None)
         if memberships is None:
             return None
+
+        # Приоритет: primary → первый попавшийся
         primary = memberships.filter(is_primary=True).select_related("branch").first()
         if primary and primary.branch:
             return primary.branch
+
         any_member = memberships.select_related("branch").first()
         return any_member.branch if any_member and any_member.branch else None
 
     def _get_model(self):
+        """Извлекаем модель из serializer.Meta.model (если есть)."""
         sc = self.get_serializer_class()
         return getattr(getattr(sc, "Meta", None), "model", None)
 
@@ -87,7 +94,8 @@ class CompanyBranchQuerysetMixin:
             return False
 
     def _active_branch(self):
-        if self._cached_active_branch is not object():
+        """Определяем активный филиал и кешируем результат."""
+        if self._cached_active_branch is not self._UNSET:
             return self._cached_active_branch
 
         request = self.request
@@ -107,8 +115,9 @@ class CompanyBranchQuerysetMixin:
         self._cached_active_branch = None
         return None
 
-    # --- queryset / save hooks ---
+    # ---- queryset / save hooks ----
     def get_queryset(self):
+        """Автоматически фильтруем queryset по company и branch."""
         if getattr(self, "swagger_fake_view", False):
             return self.queryset.none()
 
@@ -120,24 +129,26 @@ class CompanyBranchQuerysetMixin:
         qs = qs.filter(company=company)
 
         if self._model_has_field("branch"):
-            active_branch = self._active_branch()  # None или Branch
-            qs = qs.filter(branch=active_branch) if active_branch is not None else qs.filter(branch__isnull=True)
+            active_branch = self._active_branch()
+            if active_branch is not None:
+                qs = qs.filter(branch=active_branch)
+            else:
+                qs = qs.filter(branch__isnull=True)
 
         return qs
 
     def perform_create(self, serializer):
+        """Автопроставление company/branch при создании."""
         company = self._user_company()
-        if self._model_has_field("branch"):
-            serializer.save(company=company, branch=self._active_branch())
-        else:
-            serializer.save(company=company)
+        branch = self._active_branch() if self._model_has_field("branch") else None
+        serializer.save(company=company, branch=branch)
 
     def perform_update(self, serializer):
+        """Автопроставление company/branch при обновлении."""
         company = self._user_company()
-        if self._model_has_field("branch"):
-            serializer.save(company=company, branch=self._active_branch())
-        else:
-            serializer.save(company=company)
+        branch = self._active_branch() if self._model_has_field("branch") else None
+        serializer.save(company=company, branch=branch)
+
 
 
 # ===== Leads =====
