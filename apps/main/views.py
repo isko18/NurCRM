@@ -684,6 +684,15 @@ class ProductByBarcodeAPIView(CompanyBranchRestrictedMixin, generics.RetrieveAPI
     serializer_class = ProductSerializer
     lookup_field = "barcode"
 
+    def get_queryset(self):
+        qs = (
+            Product.objects
+            .select_related("brand", "category", "client")
+            .prefetch_related("item_make")
+            .all()
+        )
+        return self._filter_qs_company_branch(qs)
+
     def get_object(self):
         barcode = self.kwargs.get("barcode")
         if not barcode:
