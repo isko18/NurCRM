@@ -429,6 +429,7 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
         queryset=ItemMake.objects.all(), many=True, write_only=True, required=False
     )
 
+    # писать надо сюда, а не в read-only brand/category
     brand_name = serializers.CharField(write_only=True, required=False, allow_blank=True)
     category_name = serializers.CharField(write_only=True, required=False, allow_blank=True)
 
@@ -440,6 +441,7 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
     status = serializers.CharField(required=False, allow_null=True, allow_blank=True)
     status_display = serializers.CharField(source="get_status_display", read_only=True)
 
+    # читаемая дата
     date = serializers.SerializerMethodField(read_only=True)
 
     class Meta:
@@ -459,7 +461,8 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
         read_only_fields = [
             "id", "created_at", "updated_at",
             "company", "branch",
-            "name", "brand", "category",
+            # "name",  <-- УБРАНО из read_only: теперь можно менять name
+            "brand", "category",
             "client_name", "status_display", "item_make", "date",
             "created_by", "created_by_name",
         ]
@@ -488,21 +491,19 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
         val = getattr(obj, "date", None)
         if not val:
             return None
-
-        # Если это datetime — локализуем (если нужно) и вернём только дату
+        # datetime -> локализуем и берём .date()
         if isinstance(val, _datetime):
             try:
-                if dj_tz.is_aware(val):
-                    val = dj_tz.localtime(val)
+                if dj_tz.is_naive(val):
+                    val = dj_tz.make_aware(val)
+                val = dj_tz.localtime(val)
             except Exception:
                 pass
             return val.date().isoformat()
-
-        # Если это date — сразу ISO
+        # date -> сразу ISO
         if isinstance(val, _date):
             return val.isoformat()
-
-        # На всякий случай: если пришла строка / другой тип — мягко распарсим
+        # мягкий парсинг строк
         try:
             dt = parse_datetime(str(val))
             if dt:
@@ -515,6 +516,20 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
         except Exception:
             pass
         return None
+
+    # ---- helpers ----
+    @staticmethod
+    def _normalize_status(raw):
+        if raw in (None, "", "null"):
+            return None
+        v = str(raw).strip().lower()
+        mapping = {
+            "pending": "pending",  "ожидание": "pending",
+            "accepted": "accepted","принят":   "accepted",
+            "rejected": "rejected","отказ":    "rejected",
+        }
+        # если пришёл уже валидный код — вернём как есть
+        return mapping.get(v, v)
 
     def _ensure_company_brand(self, company, brand):
         if brand is None:
@@ -535,9 +550,9 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
         client = validated_data.pop("client", None)
         brand_name = (validated_data.pop("brand_name", "") or "").strip()
         category_name = (validated_data.pop("category_name", "") or "").strip()
-        status_value = validated_data.pop("status", None)
+        status_value = self._normalize_status(validated_data.pop("status", None))
 
-        date_value = timezone.now()
+        date_value = dj_tz.now()
 
         barcode = validated_data.get("barcode")
         gp = GlobalProduct.objects.select_related("brand", "category").filter(barcode=barcode).first()
@@ -576,28 +591,53 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
     def update(self, instance, validated_data):
         company = self._user_company()
         branch = self._auto_branch()
+
+        # brand/category через *_name
         brand_name = (validated_data.pop("brand_name", "") or "").strip()
         category_name = (validated_data.pop("category_name", "") or "").strip()
-
         if brand_name:
             instance.brand, _ = ProductBrand.objects.get_or_create(company=company, name=brand_name)
         if category_name:
             instance.category, _ = ProductCategory.objects.get_or_create(company=company, name=category_name)
 
+        # item_make
         item_make_data = validated_data.pop("item_make_ids", None)
         if item_make_data is not None:
             instance.item_make.set(item_make_data)
 
-        # STRICT: фиксируем branch из контекста
+        # фиксируем branch из контекста
         instance.branch = branch
 
-        for field in ("barcode", "quantity", "price", "purchase_price", "client", "status"):
+        # разрешённые простые поля (+ name теперь тоже)
+        for field in ("name", "barcode", "quantity", "price", "purchase_price", "client"):
             if field in validated_data:
                 setattr(instance, field, validated_data[field])
 
+        # статус с нормализацией
+        if "status" in validated_data:
+            instance.status = self._normalize_status(validated_data["status"])
+
+        # Принимаем дату даже если поле read-only (берём из исходного payload)
+        raw_date = (self.initial_data.get("date")
+                    if isinstance(getattr(self, "initial_data", None), dict) else None)
+        if not raw_date:
+            raw_date = (self.initial_data.get("date_raw")
+                        if isinstance(getattr(self, "initial_data", None), dict) else None)
+        if raw_date not in (None, ""):
+            dt = parse_datetime(str(raw_date))
+            if dt:
+                if dj_tz.is_naive(dt):
+                    dt = dj_tz.make_aware(dt)
+                instance.date = dt
+            else:
+                d = parse_date(str(raw_date))
+                if d:
+                    instance.date = dj_tz.make_aware(_datetime(d.year, d.month, d.day))
+                else:
+                    raise serializers.ValidationError({"date": "Неверный формат даты. Используйте YYYY-MM-DD или ISO datetime."})
+
         instance.save()
         return instance
-
 
 # ===========================
 # Review / Notification
