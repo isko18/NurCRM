@@ -15,7 +15,7 @@ from apps.main.models import (
     OrderItem, Client, GlobalProduct, CartItem, ClientDeal, Bid, SocialApplications,
     TransactionRecord, DealInstallment, ContractorWork, Debt, DebtPayment,
     ObjectItem, ObjectSale, ObjectSaleItem, ItemMake, ManufactureSubreal, Acceptance,
-    ReturnFromAgent
+    ReturnFromAgent, ProductImage
 )
 from apps.construction.models import Department
 from apps.consalting.models import ServicesConsalting
@@ -412,8 +412,21 @@ class ItemMakeNestedSerializer(serializers.ModelSerializer):
     class Meta:
         model = ItemMake
         fields = ["id", "name", "price", "unit", "quantity"]
+        
+class ProductImageSerializer(serializers.ModelSerializer):
+    image_url = serializers.SerializerMethodField()
 
+    class Meta:
+        model = ProductImage
+        fields = ["id", "image", "image_url", "alt", "is_primary", "created_at"]
+        read_only_fields = ["id", "image_url", "created_at"]
 
+    def get_image_url(self, obj):
+        req = self.context.get("request")
+        if obj.image and hasattr(obj.image, "url"):
+            return req.build_absolute_uri(obj.image.url) if req else obj.image.url
+        return None
+    
 class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
     company = serializers.ReadOnlyField(source="company.id")
     branch = serializers.ReadOnlyField(source="branch.id")
@@ -429,7 +442,6 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
         queryset=ItemMake.objects.all(), many=True, write_only=True, required=False
     )
 
-    # писать надо сюда, а не в read-only brand/category
     brand_name = serializers.CharField(write_only=True, required=False, allow_blank=True)
     category_name = serializers.CharField(write_only=True, required=False, allow_blank=True)
 
@@ -441,8 +453,10 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
     status = serializers.CharField(required=False, allow_null=True, allow_blank=True)
     status_display = serializers.CharField(source="get_status_display", read_only=True)
 
-    # читаемая дата
     date = serializers.SerializerMethodField(read_only=True)
+
+    # картинки товара (read-only список)
+    images = ProductImageSerializer(many=True, read_only=True, source="images")
 
     class Meta:
         model = Product
@@ -457,14 +471,15 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
             "client", "client_name", "date",
             "created_by", "created_by_name",
             "created_at", "updated_at",
+            "images",
         ]
         read_only_fields = [
             "id", "created_at", "updated_at",
             "company", "branch",
-            # "name",  <-- УБРАНО из read_only: теперь можно менять name
             "brand", "category",
             "client_name", "status_display", "item_make", "date",
             "created_by", "created_by_name",
+            "images",
         ]
         extra_kwargs = {
             "price": {"required": False, "default": 0},
@@ -524,11 +539,10 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
             return None
         v = str(raw).strip().lower()
         mapping = {
-            "pending": "pending",  "ожидание": "pending",
-            "accepted": "accepted","принят":   "accepted",
-            "rejected": "rejected","отказ":    "rejected",
+            "pending": "pending",   "ожидание": "pending",
+            "accepted": "accepted", "принят":   "accepted",
+            "rejected": "rejected", "отказ":    "rejected",
         }
-        # если пришёл уже валидный код — вернём как есть
         return mapping.get(v, v)
 
     def _ensure_company_brand(self, company, brand):
@@ -568,7 +582,7 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
 
         product = Product.objects.create(
             company=company,
-            branch=branch,  # STRICT
+            branch=branch,
             name=gp.name,
             barcode=gp.barcode,
             brand=brand,
@@ -608,7 +622,7 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
         # фиксируем branch из контекста
         instance.branch = branch
 
-        # разрешённые простые поля (+ name теперь тоже)
+        # разрешённые простые поля (name тоже можно менять)
         for field in ("name", "barcode", "quantity", "price", "purchase_price", "client"):
             if field in validated_data:
                 setattr(instance, field, validated_data[field])
@@ -617,7 +631,7 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
         if "status" in validated_data:
             instance.status = self._normalize_status(validated_data["status"])
 
-        # Принимаем дату даже если поле read-only (берём из исходного payload)
+        # Принимаем дату из payload (даже если read-only в выдаче)
         raw_date = (self.initial_data.get("date")
                     if isinstance(getattr(self, "initial_data", None), dict) else None)
         if not raw_date:
@@ -634,7 +648,9 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
                 if d:
                     instance.date = dj_tz.make_aware(_datetime(d.year, d.month, d.day))
                 else:
-                    raise serializers.ValidationError({"date": "Неверный формат даты. Используйте YYYY-MM-DD или ISO datetime."})
+                    raise serializers.ValidationError({
+                        "date": "Неверный формат даты. Используйте YYYY-MM-DD или ISO datetime."
+                    })
 
         instance.save()
         return instance

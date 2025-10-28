@@ -29,7 +29,7 @@ from apps.main.models import (
     ProductBrand, ProductCategory, Warehouse, WarehouseEvent, Client,
     GlobalProduct, GlobalBrand, GlobalCategory, ClientDeal, Bid, SocialApplications, TransactionRecord,
     ContractorWork, DealInstallment, DebtPayment, Debt, ObjectSaleItem, ObjectSale, ObjectItem, ItemMake,
-    ManufactureSubreal, Acceptance, ReturnFromAgent, AgentSaleAllocation
+    ManufactureSubreal, Acceptance, ReturnFromAgent, AgentSaleAllocation, ProductImage
 )
 from apps.main.serializers import (
     ContactSerializer, PipelineSerializer, DealSerializer, TaskSerializer,
@@ -37,9 +37,10 @@ from apps.main.serializers import (
     ReviewSerializer, NotificationSerializer, EventSerializer,
     WarehouseSerializer, WarehouseEventSerializer,
     ProductCategorySerializer, ProductBrandSerializer,
-    OrderItemSerializer, ClientSerializer, ClientDealSerializer, BidSerializers, SocialApplicationsSerializers, TransactionRecordSerializer, ContractorWorkSerializer, DebtSerializer, DebtPaymentSerializer, ObjectItemSerializer, ObjectSaleSerializer, ObjectSaleItemSerializer, BulkIdsSerializer, ItemMakeSerializer, ManufactureSubrealSerializer, AcceptanceCreateSerializer, ReturnCreateSerializer, BulkSubrealCreateSerializer, AcceptanceReadSerializer, ReturnApproveSerializer, ReturnReadSerializer, AgentProductOnHandSerializer, AgentWithProductsSerializer, GlobalProductReadSerializer
+    OrderItemSerializer, ClientSerializer, ClientDealSerializer, BidSerializers, SocialApplicationsSerializers, TransactionRecordSerializer, ContractorWorkSerializer, DebtSerializer, DebtPaymentSerializer, ObjectItemSerializer, ObjectSaleSerializer, ObjectSaleItemSerializer, BulkIdsSerializer, ItemMakeSerializer, ManufactureSubrealSerializer, AcceptanceCreateSerializer, ReturnCreateSerializer, BulkSubrealCreateSerializer, AcceptanceReadSerializer, ReturnApproveSerializer, ReturnReadSerializer, AgentProductOnHandSerializer, AgentWithProductsSerializer, GlobalProductReadSerializer, ProductImageSerializer
 )
 from django.db.models import ProtectedError
+from apps.utils import product_images_prefetch
 
 
 # ===========================
@@ -505,7 +506,12 @@ class ProductCreateManualAPIView(generics.CreateAPIView, CompanyBranchRestricted
 
 class ProductRetrieveUpdateDestroyAPIView(CompanyBranchRestrictedMixin, generics.RetrieveUpdateDestroyAPIView):
     serializer_class = ProductSerializer
-    queryset = Product.objects.select_related("brand", "category").all()
+    queryset = (
+        Product.objects
+        .select_related("brand", "category", "client")
+        .prefetch_related("item_make", product_images_prefetch)   # ← добавили
+        .all()
+    )
 
 
 class ProductBulkDeleteAPIView(CompanyBranchRestrictedMixin, APIView):
@@ -688,7 +694,7 @@ class ProductByBarcodeAPIView(CompanyBranchRestrictedMixin, generics.RetrieveAPI
         qs = (
             Product.objects
             .select_related("brand", "category", "client")
-            .prefetch_related("item_make")
+            .prefetch_related("item_make", product_images_prefetch)   # ← добавили
             .all()
         )
         return self._filter_qs_company_branch(qs)
@@ -702,6 +708,7 @@ class ProductByBarcodeAPIView(CompanyBranchRestrictedMixin, generics.RetrieveAPI
         if not product:
             raise NotFound(detail="Товар с таким штрих-кодом не найден")
         return product
+
 
 class ProductByGlobalBarcodeAPIView(CompanyBranchRestrictedMixin, generics.RetrieveAPIView):
     """
@@ -729,7 +736,12 @@ class ProductListView(CompanyBranchRestrictedMixin, generics.ListAPIView):
     ordering_fields = ["created_at", "updated_at, price", "price"]
 
     def get_queryset(self):
-        qs = Product.objects.select_related("brand", "category", "client").prefetch_related("item_make").all()
+        qs = (
+            Product.objects
+            .select_related("brand", "category", "client")
+            .prefetch_related("item_make", product_images_prefetch)   # ← добавили
+            .all()
+        )
         return self._filter_qs_company_branch(qs)
 
 
@@ -1977,3 +1989,85 @@ class OwnerAgentsProductsListAPIView(APIView, CompanyBranchRestrictedMixin):
             })
 
         return Response(AgentWithProductsSerializer(out, many=True).data, status=status.HTTP_200_OK)
+    
+    
+class ProductImageListCreateAPIView(CompanyBranchRestrictedMixin, generics.ListCreateAPIView):
+    """
+    GET  /api/main/products/<uuid:product_id>/images/
+    POST /api/main/products/<uuid:product_id>/images/
+      form-data: image=<file>, alt="...", is_primary=true|false
+    """
+    permission_classes = [permissions.IsAuthenticated]
+    serializer_class = ProductImageSerializer
+
+    def _base_qs(self):
+        company = self._company()
+        branch = self._auto_branch()
+        qs = ProductImage.objects.select_related("product")
+        if company is not None:
+            qs = qs.filter(product__company=company)
+        if branch is None:
+            qs = qs.filter(product__branch__isnull=True)
+        else:
+            qs = qs.filter(product__branch=branch)
+        return qs
+
+    def get_queryset(self):
+        product_id = self.kwargs["product_id"]
+        return self._base_qs().filter(product_id=product_id)
+
+    @transaction.atomic
+    def perform_create(self, serializer):
+        product_qs = self._base_qs().values_list("product_id", flat=True).distinct()
+        # проверим, что продукт доступен текущему пользователю
+        pid = self.kwargs["product_id"]
+        allowed = Product.objects.filter(id=pid)
+        company = self._company()
+        branch = self._auto_branch()
+        if company is not None:
+            allowed = allowed.filter(company=company)
+        if branch is None:
+            allowed = allowed.filter(branch__isnull=True)
+        else:
+            allowed = allowed.filter(branch=branch)
+
+        product = get_object_or_404(allowed)
+
+        obj = serializer.save(product=product)
+        # если пришёл флаг is_primary=True — снимем признак с остальных
+        if getattr(obj, "is_primary", False):
+            ProductImage.objects.filter(product=product).exclude(pk=obj.pk).update(is_primary=False)
+
+
+class ProductImageRetrieveUpdateDestroyAPIView(CompanyBranchRestrictedMixin, generics.RetrieveUpdateDestroyAPIView):
+    """
+    PATCH /api/main/products/<uuid:product_id>/images/<uuid:image_id>/
+      { "alt": "...", "is_primary": true/false }
+    DELETE /api/main/products/<uuid:product_id>/images/<uuid:image_id>/
+    """
+    permission_classes = [permissions.IsAuthenticated]
+    serializer_class = ProductImageSerializer
+    lookup_url_kwarg = "image_id"
+
+    def _base_qs(self):
+        company = self._company()
+        branch = self._auto_branch()
+        qs = ProductImage.objects.select_related("product")
+        if company is not None:
+            qs = qs.filter(product__company=company)
+        if branch is None:
+            qs = qs.filter(product__branch__isnull=True)
+        else:
+            qs = qs.filter(product__branch=branch)
+        return qs
+
+    def get_queryset(self):
+        product_id = self.kwargs["product_id"]
+        return self._base_qs().filter(product_id=product_id)
+
+    @transaction.atomic
+    def perform_update(self, serializer):
+        obj = serializer.save()
+        # единственная "главная" картинка
+        if getattr(obj, "is_primary", False):
+            ProductImage.objects.filter(product=obj.product).exclude(pk=obj.pk).update(is_primary=False)
