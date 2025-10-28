@@ -456,7 +456,7 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
     date = serializers.SerializerMethodField(read_only=True)
 
     # картинки товара (read-only список)
-    images = ProductImageSerializer(many=True, read_only=True, source="images")
+    images = ProductImageSerializer(many=True, read_only=True)
 
     class Meta:
         model = Product
