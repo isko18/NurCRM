@@ -29,7 +29,7 @@ from .models import (
     # Object items/sales
     ObjectItem, ObjectSale, ObjectSaleItem,
     # Subreal / agent pathway
-    ManufactureSubreal, Acceptance, ReturnFromAgent
+    ManufactureSubreal, Acceptance, ReturnFromAgent, ProductImage
 )
 
 admin.site.site_header = "nurCRM Admin"
@@ -255,19 +255,74 @@ class ItemMakeAdmin(admin.ModelAdmin):
     list_select_related = ("company", "branch")
     autocomplete_fields = ("company", "branch")
 
+class ProductImageInline(admin.TabularInline):
+    model = ProductImage
+    extra = 0
+    fields = ("image", "preview", "alt", "is_primary", "created_at")
+    readonly_fields = ("preview", "created_at")
+    autocomplete_fields = ()  # не нужно, product подтянется от родителя
+    can_delete = True
+
+    def preview(self, obj):
+        if obj and getattr(obj, "image", None) and getattr(obj.image, "url", None):
+            return format_html(
+                '<img src="{}" style="height:70px;object-fit:cover;border-radius:6px;" />',
+                obj.image.url
+            )
+        return "—"
+    preview.short_description = "Превью"
+
+
 @admin.register(Product)
 class ProductAdmin(admin.ModelAdmin):
-    list_display = ("name", "barcode", "company", "branch", "brand", "category", "client",
-                    "quantity", "purchase_price", "price", "status", "created_at")
+    list_display = (
+        "primary_image_thumb",  # миниатюра
+        "name", "barcode", "company", "branch", "brand", "category", "client",
+        "quantity", "purchase_price", "price", "status", "created_at"
+    )
     list_filter = ("company", "branch", "brand", "category", "status", "created_at")
     search_fields = ("name", "barcode")
     ordering = ("name",)
-    inlines = [ItemMakeInline]
+    inlines = [ItemMakeInline, ProductImageInline]   # ← добавили инлайн фото
     exclude = ("item_make",)  # используем inline для M2M
     readonly_fields = ("created_at", "updated_at")
     list_select_related = ("company", "branch", "brand", "category", "client")
     autocomplete_fields = ("company", "branch", "brand", "category", "client", "created_by")
     actions = (accept_products, reject_products, clear_status)
+
+    def get_queryset(self, request):
+        qs = super().get_queryset(request)
+        # префетчим изображения, чтобы миниатюры не били по БД
+        return qs.prefetch_related("images")
+
+    def primary_image_thumb(self, obj):
+        # показываем основное изображение, если есть; иначе первое
+        img = None
+        for im in obj.images.all():
+            if im.is_primary and getattr(im, "image", None) and getattr(im.image, "url", None):
+                img = im
+                break
+        if img is None:
+            for im in obj.images.all():
+                if getattr(im, "image", None) and getattr(im.image, "url", None):
+                    img = im
+                    break
+        if img:
+            return format_html(
+                '<img src="{}" width="45" style="object-fit:cover;border-radius:6px;" />',
+                img.image.url
+            )
+        return "—"
+    primary_image_thumb.short_description = "Фото"
+    primary_image_thumb.admin_order_field = "created_at"  # чтобы было сортируемо «как-то»
+
+# (опционально) отдельная админка для ProductImage, если нужно управлять отдельно
+@admin.register(ProductImage)
+class ProductImageAdmin(admin.ModelAdmin):
+    list_display = ("product", "is_primary", "alt", "created_at")
+    list_filter = ("is_primary", "created_at")
+    search_fields = ("product__name", "product__barcode")
+    autocomplete_fields = ("product",)
 
 @admin.register(Cart)
 class CartAdmin(admin.ModelAdmin):

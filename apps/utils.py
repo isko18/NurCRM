@@ -1,3 +1,6 @@
+from django.db.models import Prefetch
+from apps.main.models import ProductImage
+
 def get_filtered_contacts(queryset, params):
     """
     Переиспользуемая функция для фильтрации контактов по параметрам.
@@ -17,3 +20,8 @@ def get_filtered_contacts(queryset, params):
         queryset = queryset.filter(department__icontains=department)
 
     return queryset
+
+product_images_prefetch = Prefetch(
+    "images",
+    queryset=ProductImage.objects.order_by("-is_primary", "-created_at"),
+)
