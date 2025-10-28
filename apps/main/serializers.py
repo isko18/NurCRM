@@ -7,6 +7,7 @@ from decimal import Decimal
 from typing import Any, Dict
 from datetime import date as _date, datetime as _datetime
 from django.utils import timezone as dj_tz
+from django.utils.dateparse import parse_datetime, parse_date
 
 from apps.main.models import (
     Contact, Pipeline, Deal, Task, Integration, Analytics, Order, Product, Review,
@@ -1498,3 +1499,11 @@ class AgentInfoSerializer(serializers.Serializer):
 class AgentWithProductsSerializer(serializers.Serializer):
     agent = AgentInfoSerializer()
     products = AgentProductOnHandSerializer(many=True)
+    
+class GlobalProductReadSerializer(serializers.ModelSerializer):
+    brand = serializers.CharField(source="brand.name", read_only=True)
+    category = serializers.CharField(source="category.name", read_only=True)
+
+    class Meta:
+        model = GlobalProduct
+        fields = ["id", "name", "barcode", "brand", "category"]

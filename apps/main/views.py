@@ -37,7 +37,7 @@ from apps.main.serializers import (
     ReviewSerializer, NotificationSerializer, EventSerializer,
     WarehouseSerializer, WarehouseEventSerializer,
     ProductCategorySerializer, ProductBrandSerializer,
-    OrderItemSerializer, ClientSerializer, ClientDealSerializer, BidSerializers, SocialApplicationsSerializers, TransactionRecordSerializer, ContractorWorkSerializer, DebtSerializer, DebtPaymentSerializer, ObjectItemSerializer, ObjectSaleSerializer, ObjectSaleItemSerializer, BulkIdsSerializer, ItemMakeSerializer, ManufactureSubrealSerializer, AcceptanceCreateSerializer, ReturnCreateSerializer, BulkSubrealCreateSerializer, AcceptanceReadSerializer, ReturnApproveSerializer, ReturnReadSerializer, AgentProductOnHandSerializer, AgentWithProductsSerializer
+    OrderItemSerializer, ClientSerializer, ClientDealSerializer, BidSerializers, SocialApplicationsSerializers, TransactionRecordSerializer, ContractorWorkSerializer, DebtSerializer, DebtPaymentSerializer, ObjectItemSerializer, ObjectSaleSerializer, ObjectSaleItemSerializer, BulkIdsSerializer, ItemMakeSerializer, ManufactureSubrealSerializer, AcceptanceCreateSerializer, ReturnCreateSerializer, BulkSubrealCreateSerializer, AcceptanceReadSerializer, ReturnApproveSerializer, ReturnReadSerializer, AgentProductOnHandSerializer, AgentWithProductsSerializer, GlobalProductReadSerializer
 )
 from django.db.models import ProtectedError
 
@@ -703,7 +703,25 @@ class ProductByBarcodeAPIView(CompanyBranchRestrictedMixin, generics.RetrieveAPI
             raise NotFound(detail="Товар с таким штрих-кодом не найден")
         return product
 
+class ProductByGlobalBarcodeAPIView(CompanyBranchRestrictedMixin, generics.RetrieveAPIView):
+    """
+    GET /main/products/barcode/<barcode>/
+    Возвращает товар ТОЛЬКО из глобальной базы (GlobalProduct).
+    """
+    serializer_class = GlobalProductReadSerializer
+    lookup_field = "barcode"
+    # важно определить queryset, иначе миксин выдаст AssertionError
+    queryset = GlobalProduct.objects.select_related("brand", "category").all()
 
+    def get_object(self):
+        barcode = self.kwargs.get("barcode")
+        if not barcode:
+            raise NotFound(detail="Штрих-код не указан")
+        obj = self.get_queryset().filter(barcode=barcode).first()
+        if not obj:
+            raise NotFound(detail="Товар с таким штрих-кодом не найден в глобальной базе")
+        return obj
+    
 class ProductListView(CompanyBranchRestrictedMixin, generics.ListAPIView):
     serializer_class = ProductSerializer
     filter_backends = [filters.SearchFilter, filters.OrderingFilter]
