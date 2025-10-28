@@ -5,6 +5,8 @@ from django.utils import timezone
 from django.db.models import Q
 from decimal import Decimal
 from typing import Any, Dict
+from datetime import date as _date, datetime as _datetime
+from django.utils import timezone as dj_tz
 
 from apps.main.models import (
     Contact, Pipeline, Deal, Task, Integration, Analytics, Order, Product, Review,
@@ -482,16 +484,36 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
                 or getattr(u, "username", None))
 
     def get_date(self, obj):
-        dt = getattr(obj, "date", None)
-        if not dt:
+        val = getattr(obj, "date", None)
+        if not val:
             return None
+
+        # Если это datetime — локализуем (если нужно) и вернём только дату
+        if isinstance(val, _datetime):
+            try:
+                if dj_tz.is_aware(val):
+                    val = dj_tz.localtime(val)
+            except Exception:
+                pass
+            return val.date().isoformat()
+
+        # Если это date — сразу ISO
+        if isinstance(val, _date):
+            return val.isoformat()
+
+        # На всякий случай: если пришла строка / другой тип — мягко распарсим
         try:
-            from django.utils import timezone as dj_tz
-            if dj_tz.is_aware(dt):
-                dt = dj_tz.localtime(dt)
+            dt = parse_datetime(str(val))
+            if dt:
+                if dj_tz.is_naive(dt):
+                    dt = dj_tz.make_aware(dt)
+                return dj_tz.localtime(dt).date().isoformat()
+            d = parse_date(str(val))
+            if d:
+                return d.isoformat()
         except Exception:
             pass
-        return dt.date().isoformat()
+        return None
 
     def _ensure_company_brand(self, company, brand):
         if brand is None:
