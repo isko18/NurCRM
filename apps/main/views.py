@@ -2314,10 +2314,12 @@ class AgentRequestCartListCreateAPIView(CompanyBranchRestrictedMixin, generics.L
     ordering = ["-created_at"]
 
     def get_queryset(self):
-        """
-        - владелец видит все корзины своей компании/филиала
-        - агент видит только свои корзины
-        """
+        items_qs = (
+            AgentRequestItem.objects
+            .select_related("product")                    # продукт одной пачкой
+            .prefetch_related("product__images")          # и все фотки товара
+        )
+
         qs = (
             AgentRequestCart.objects
             .select_related(
@@ -2327,8 +2329,11 @@ class AgentRequestCartListCreateAPIView(CompanyBranchRestrictedMixin, generics.L
                 "client",
                 "approved_by",
             )
-            .prefetch_related("items")
+            .prefetch_related(
+                Prefetch("items", queryset=items_qs)
+            )
         )
+
         qs = self._filter_qs_company_branch(qs)
 
         user = self.request.user
@@ -2359,6 +2364,12 @@ class AgentRequestCartRetrieveUpdateDestroyAPIView(
     serializer_class = AgentRequestCartSerializer
 
     def get_queryset(self):
+        items_qs = (
+            AgentRequestItem.objects
+            .select_related("product")                    # продукт одной пачкой
+            .prefetch_related("product__images")          # и все фотки товара
+        )
+
         qs = (
             AgentRequestCart.objects
             .select_related(
@@ -2368,8 +2379,11 @@ class AgentRequestCartRetrieveUpdateDestroyAPIView(
                 "client",
                 "approved_by",
             )
-            .prefetch_related("items")
+            .prefetch_related(
+                Prefetch("items", queryset=items_qs)
+            )
         )
+
         qs = self._filter_qs_company_branch(qs)
 
         user = self.request.user
