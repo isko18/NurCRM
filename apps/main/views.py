@@ -46,6 +46,46 @@ from apps.utils import product_images_prefetch, _is_owner_like
 # ===========================
 #  Company + Branch mixin (как в barber)
 # ===========================
+
+class AgentCartLockMixin:
+    """
+    Общая логика блокировки корзины перед submit/approve/reject.
+    """
+
+    def _lock_cart_for_submit(self, request, pk):
+        """
+        Агент → submit только свою корзину.
+        Владелец может тоже сабмитить (не обязательно, но не ломаем кейс).
+        """
+        allowed_qs = AgentRequestCart.objects.all()
+        allowed_qs = self._filter_qs_company_branch(allowed_qs)
+
+        user = request.user
+        if not _is_owner_like(user):
+            allowed_qs = allowed_qs.filter(agent=user)
+
+        cart = get_object_or_404(allowed_qs, pk=pk)
+
+        # ВТОРОЙ шаг: форсируем блокировку уже по pk, без join'ов.
+        locked_cart = AgentRequestCart.objects.select_for_update().get(pk=cart.pk)
+        return locked_cart
+
+    def _lock_cart_for_owner_action(self, request, pk):
+        """
+        Одобрение / отклонение — только владелец/админ.
+        """
+        user = request.user
+        if not _is_owner_like(user):
+            raise PermissionDenied("Forbidden")
+
+        allowed_qs = AgentRequestCart.objects.all()
+        allowed_qs = self._filter_qs_company_branch(allowed_qs)
+
+        cart = get_object_or_404(allowed_qs, pk=pk)
+
+        locked_cart = AgentRequestCart.objects.select_for_update().get(pk=cart.pk)
+        return locked_cart
+    
 class CompanyBranchRestrictedMixin:
     """
     - Фильтрует queryset по компании и (если у модели есть поле branch) по «активному филиалу».
@@ -2349,28 +2389,12 @@ class AgentRequestCartRetrieveUpdateDestroyAPIView(
         instance.delete()
 
 
-class AgentRequestCartSubmitAPIView(APIView, CompanyBranchRestrictedMixin):
-    """
-    Сабмит корзины агентом:
-    POST /agent-carts/<uuid:pk>/submit/
-
-    Делает:
-      - фиксируем всё внутри позиций (quantity итд)
-      - статус -> SUBMITTED
-      - submitted_at = now
-    """
+class AgentRequestCartSubmitAPIView(AgentCartLockMixin, CompanyBranchRestrictedMixin, APIView):
     permission_classes = [permissions.IsAuthenticated]
 
     @transaction.atomic
     def post(self, request, pk, *args, **kwargs):
-        # агент может сабмитить только свою корзину
-        base_qs = AgentRequestCart.objects.select_for_update().filter(pk=pk)
-        base_qs = self._filter_qs_company_branch(base_qs)
-
-        if _is_owner_like(request.user):
-            cart = get_object_or_404(base_qs)
-        else:
-            cart = get_object_or_404(base_qs, agent_id=request.user.id)
+        cart = self._lock_cart_for_submit(request, pk)
 
         ser = AgentRequestCartSubmitSerializer(
             data=request.data,
@@ -2383,28 +2407,12 @@ class AgentRequestCartSubmitAPIView(APIView, CompanyBranchRestrictedMixin):
         return Response(out, status=status.HTTP_200_OK)
 
 
-class AgentRequestCartApproveAPIView(APIView, CompanyBranchRestrictedMixin):
-    """
-    Одобрить корзину (owner/admin):
-    POST /agent-carts/<uuid:pk>/approve/
-
-    cart.approve(by_user=owner) внутри:
-      - проверяет остатки
-      - списывает Product.quantity
-      - создаёт ManufactureSubreal (is_sawmill=True)
-      - линкует subreal к позициям
-      - ставит статус -> APPROVED
-    """
+class AgentRequestCartApproveAPIView(AgentCartLockMixin, CompanyBranchRestrictedMixin, APIView):
     permission_classes = [permissions.IsAuthenticated]
 
     @transaction.atomic
     def post(self, request, pk, *args, **kwargs):
-        if not _is_owner_like(request.user):
-            return Response({"detail": "Forbidden"}, status=status.HTTP_403_FORBIDDEN)
-
-        base_qs = AgentRequestCart.objects.select_for_update().filter(pk=pk)
-        base_qs = self._filter_qs_company_branch(base_qs)
-        cart = get_object_or_404(base_qs)
+        cart = self._lock_cart_for_owner_action(request, pk)
 
         ser = AgentRequestCartApproveSerializer(
             data=request.data,
@@ -2416,25 +2424,12 @@ class AgentRequestCartApproveAPIView(APIView, CompanyBranchRestrictedMixin):
         out = AgentRequestCartSerializer(cart, context={"request": request}).data
         return Response(out, status=status.HTTP_200_OK)
 
-
-class AgentRequestCartRejectAPIView(APIView, CompanyBranchRestrictedMixin):
-    """
-    Отклонить корзину (owner/admin):
-    POST /agent-carts/<uuid:pk>/reject/
-
-    cart.reject(by_user=owner):
-      - статус -> REJECTED
-    """
+class AgentRequestCartRejectAPIView(AgentCartLockMixin, CompanyBranchRestrictedMixin, APIView):
     permission_classes = [permissions.IsAuthenticated]
 
     @transaction.atomic
     def post(self, request, pk, *args, **kwargs):
-        if not _is_owner_like(request.user):
-            return Response({"detail": "Forbidden"}, status=status.HTTP_403_FORBIDDEN)
-
-        base_qs = AgentRequestCart.objects.select_for_update().filter(pk=pk)
-        base_qs = self._filter_qs_company_branch(base_qs)
-        cart = get_object_or_404(base_qs)
+        cart = self._lock_cart_for_owner_action(request, pk)
 
         ser = AgentRequestCartRejectSerializer(
             data=request.data,
