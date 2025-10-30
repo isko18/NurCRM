@@ -16,6 +16,7 @@ import io
 from apps.users.models import Company, User, Branch
 from apps.consalting.models import ServicesConsalting
 from apps.construction.models import Department
+# from apps.utils import compute_gift_qty
 
 _Q2 = Decimal("0.01")
 def _money(x: Decimal) -> Decimal:
@@ -494,6 +495,85 @@ class ProductBrand(MPTTModel):
             if (self.parent.branch_id or None) != (self.branch_id or None):
                 raise ValidationError({'parent': 'Родительский бренд другого филиала.'})
 
+class PromoRule(models.Model):
+    """
+    Динамическое правило "подарка".
+    Пример:
+    - min_qty=20, gift_qty=1, inclusive=False  => если >20 шт -> 1 в подарок
+    - min_qty=50, gift_qty=4, inclusive=True   => если >=50 шт -> 4 в подарок
+    scope: либо конкретный product, либо бренд, либо категория, либо вообще все.
+    """
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+
+    company = models.ForeignKey(Company, on_delete=models.CASCADE, related_name='promo_rules', verbose_name='Компания')
+    branch = models.ForeignKey(
+        Branch, on_delete=models.CASCADE, related_name='crm_promo_rules',
+        null=True, blank=True, db_index=True, verbose_name='Филиал'
+    )
+
+    product  = models.ForeignKey("Product", on_delete=models.CASCADE, null=True, blank=True, related_name="promo_rules")
+    brand    = models.ForeignKey("ProductBrand", on_delete=models.CASCADE, null=True, blank=True, related_name="promo_rules")
+    category = models.ForeignKey("ProductCategory", on_delete=models.CASCADE, null=True, blank=True, related_name="promo_rules")
+
+    title = models.CharField(max_length=128, blank=True, default="", verbose_name="Название правила")
+
+    min_qty   = models.PositiveIntegerField(verbose_name="Порог количества")
+    gift_qty  = models.PositiveIntegerField(verbose_name="Подарок (шт)")
+    inclusive = models.BooleanField(
+        default=False,
+        verbose_name="Включительно (≥ вместо >). Если True, то условие qty ≥ min_qty. Если False, qty > min_qty."
+    )
+
+    priority = models.IntegerField(default=0, verbose_name="Приоритет")
+    active_from = models.DateField(null=True, blank=True)
+    active_to   = models.DateField(null=True, blank=True)
+    is_active   = models.BooleanField(default=True)
+
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = "Правило подарков"
+        verbose_name_plural = "Правила подарков"
+        ordering = ["-priority", "-min_qty", "-id"]
+        indexes = [
+            models.Index(fields=["company", "branch", "is_active"]),
+            models.Index(fields=["company", "product", "min_qty"]),
+            models.Index(fields=["company", "brand", "min_qty"]),
+            models.Index(fields=["company", "category", "min_qty"]),
+        ]
+        constraints = [
+            # Разрешаем не более одного scоpe одновременно
+            # (гарантируем на уровне clean(), это просто инфо-коммент)
+        ]
+
+    def __str__(self):
+        scope = self.product or self.brand or self.category or "все товары"
+        sign = "≥" if self.inclusive else ">"
+        return f"{self.title or 'Промо'}: {scope} — если {sign} {self.min_qty} → +{self.gift_qty}"
+
+    def clean(self):
+        # филиал должен относиться к компании
+        if self.branch_id and self.branch.company_id != self.company_id:
+            raise ValidationError({'branch': 'Филиал принадлежит другой компании.'})
+
+        # только один таргет: product ИЛИ brand ИЛИ category ИЛИ ни одного
+        chosen = [self.product_id, self.brand_id, self.category_id]
+        if sum(bool(x) for x in chosen) > 1:
+            raise ValidationError("Укажите только product ИЛИ brand ИЛИ category (или ни одного).")
+
+        # проверка компании у таргета
+        for rel, name in [(self.product, "product"), (self.brand, "brand"), (self.category, "category")]:
+            if rel:
+                if getattr(rel, "company_id", None) != self.company_id:
+                    raise ValidationError({name: "Объект принадлежит другой компании."})
+                if self.branch_id and getattr(rel, "branch_id", None) not in (None, self.branch_id):
+                    raise ValidationError({name: "Объект другого филиала."})
+
+        if self.min_qty < 1:
+            raise ValidationError({"min_qty": "Порог должен быть ≥ 1."})
+        if self.gift_qty < 1:
+            raise ValidationError({"gift_qty": "Подарок должен быть ≥ 1."})
 
 # ==========================
 # Product
@@ -563,7 +643,6 @@ class ProductImage(models.Model):
     )
     product = models.ForeignKey("Product", on_delete=models.CASCADE, related_name="images", verbose_name="Товар")
 
-    # Храним уже сжатый webp
     image = models.ImageField(upload_to=product_image_upload_to, null=True, blank=True, verbose_name="Изображение (WebP)")
     alt = models.CharField(max_length=255, blank=True, verbose_name="Alt-текст")
     is_primary = models.BooleanField(default=False, verbose_name="Основное изображение")
@@ -2035,3 +2114,271 @@ class AgentSaleAllocation(models.Model):
                 name="uniq_allocation_saleitem_subreal",
             ),
         ]
+        
+        
+class AgentRequestCart(models.Model):
+    """
+    Заявка агента на получение товара.
+    Агент сначала копит товары в статусе draft, потом отправляет (submitted),
+    владелец подтверждает (approved), после чего товар списывается со склада
+    и создаются передачи (ManufactureSubreal) на агента.
+    """
+
+    class Status(models.TextChoices):
+        DRAFT     = "draft", "Черновик"
+        SUBMITTED = "submitted", "Отправлено владельцу"
+        APPROVED  = "approved", "Одобрено и выдано"
+        REJECTED  = "rejected", "Отклонено"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    company = models.ForeignKey(Company, on_delete=models.CASCADE, related_name="agent_carts", verbose_name="Компания")
+    branch = models.ForeignKey(
+        Branch, on_delete=models.CASCADE, related_name="crm_agent_carts",
+        null=True, blank=True, db_index=True, verbose_name="Филиал"
+    )
+    agent = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.PROTECT,
+        related_name="agent_request_carts",
+        verbose_name="Агент",
+        help_text="Кому выдаём товар",
+    )
+    client = models.ForeignKey(
+        Client,
+        on_delete=models.SET_NULL,
+        null=True, blank=True,
+        related_name="agent_request_carts",
+        verbose_name="Клиент"
+    )
+
+    status = models.CharField(max_length=16, choices=Status.choices, default=Status.DRAFT)
+    note = models.CharField(max_length=255, blank=True, verbose_name="Комментарий агента")
+
+    submitted_at = models.DateTimeField(null=True, blank=True)
+    approved_at = models.DateTimeField(null=True, blank=True)
+    approved_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.PROTECT,
+        null=True, blank=True,
+        related_name="approved_agent_carts",
+        verbose_name="Кем одобрено"
+    )
+
+    created_at = models.DateTimeField(auto_now_add=True, verbose_name="Создано")
+    updated_at = models.DateTimeField(auto_now=True, verbose_name="Обновлено")
+
+    class Meta:
+        verbose_name = "Заявка агента на товар"
+        verbose_name_plural = "Заявки агентов на товар"
+        ordering = ["-created_at"]
+        indexes = [
+            models.Index(fields=["company", "status"]),
+            models.Index(fields=["company", "branch", "status"]),
+            models.Index(fields=["agent", "status"]),
+        ]
+
+    def __str__(self):
+        return f"Заявка {self.id} от {getattr(self.agent,'username',self.agent_id)} [{self.get_status_display()}]"
+
+    def clean(self):
+        # привязки по компании/филиалу
+        if self.branch_id and self.branch.company_id != self.company_id:
+            raise ValidationError({'branch': 'Филиал принадлежит другой компании.'})
+        if self.agent_id and getattr(self.agent, "company_id", None) not in (None, self.company_id):
+            raise ValidationError({'agent': 'Агент принадлежит другой компании.'})
+        if self.client_id and self.client.company_id != self.company_id:
+            raise ValidationError({'client': 'Клиент другой компании.'})
+        if self.branch_id and self.client_id and self.client.branch_id not in (None, self.branch_id):
+            raise ValidationError({'client': 'Клиент другого филиала.'})
+
+    def is_editable(self) -> bool:
+        return self.status == self.Status.DRAFT
+
+    def _recalc_gifts_for_items(self):
+        """
+        Пересчитать подарки для всех позиций.
+        Вызывается при submit() — фиксируем gift_quantity и total_quantity.
+        """
+        for it in self.items.select_related("product"):
+            base_qty = int(it.quantity_requested or 0)
+            from apps.utils import compute_gift_qty
+            gift_qty = compute_gift_qty(
+                product=it.product,
+                qty=base_qty,
+                company=self.company,
+                branch=self.branch,
+            )
+            it.gift_quantity = gift_qty
+            it.total_quantity = base_qty + gift_qty
+            it.price_snapshot = it.price_snapshot or (it.product.price if it.product else Decimal("0.00"))
+            it.save(update_fields=["gift_quantity", "total_quantity", "price_snapshot", "updated_at"])
+
+    @transaction.atomic
+    def submit(self):
+        """
+        Агент нажал 'Отправить запрос'.
+        После этого менять корзину нельзя.
+        """
+        if self.status != self.Status.DRAFT:
+            raise ValidationError("Можно отправить только черновик.")
+        if not self.items.exists():
+            raise ValidationError("Нельзя отправить пустую заявку.")
+        # фиксируем подарки
+        self._recalc_gifts_for_items()
+        self.status = self.Status.SUBMITTED
+        self.submitted_at = timezone.now()
+        self.full_clean()
+        self.save(update_fields=["status", "submitted_at", "updated_at"])
+
+    @transaction.atomic
+    def approve(self, by_user):
+        """
+        Владелец/админ подтверждает заявку.
+        Мы списываем товар со склада, создаём передачи (ManufactureSubreal) на агента,
+        отмечаем подарок, и привязываем каждую позицию к созданной передаче.
+        """
+        if self.status != self.Status.SUBMITTED:
+            raise ValidationError("Можно одобрить только заявку в статусе 'submitted'.")
+
+        # пересчитаем подарки ещё раз на всякий случай (чтобы правило не потерялось)
+        self._recalc_gifts_for_items()
+
+        # по каждой позиции:
+        for it in self.items.select_related("product"):
+            prod = it.product
+            need_qty = int(it.total_quantity or 0)
+
+            if need_qty <= 0:
+                continue  # странно, но ок
+
+            # лочим остаток товара
+            locked_qs = type(prod).objects.select_for_update().filter(pk=prod.pk)
+            current_qty = locked_qs.values_list("quantity", flat=True).first() or 0
+            if current_qty < need_qty:
+                raise ValidationError({
+                    "items": f"Недостаточно на складе для {prod.name}: нужно {need_qty}, доступно {current_qty}."
+                })
+
+            # списываем со склада
+            locked_qs.update(quantity=F("quantity") - need_qty)
+
+            # создаём передачу агенту через ManufactureSubreal
+            sub = ManufactureSubreal.objects.create(
+                company=self.company,
+                branch=self.branch,
+                user=by_user,        # кто выдал
+                agent=self.agent,    # кто получил
+                product=prod,
+                qty_transferred=need_qty,
+                is_sawmill=True,     # авто-принять сразу (агент получил в руки)
+            )
+            # авто-принять (это заполнит qty_accepted и закроет при необходимости)
+            sub.auto_accept_if_needed(by_user)
+
+            # привязываем позицию к этой фактической передаче
+            it.subreal = sub
+            it.save(update_fields=["subreal", "updated_at"])
+
+        self.status = self.Status.APPROVED
+        self.approved_at = timezone.now()
+        self.approved_by = by_user
+        self.full_clean()
+        self.save(update_fields=["status", "approved_at", "approved_by", "updated_at"])
+
+    @transaction.atomic
+    def reject(self, by_user):
+        """
+        Владелец/админ отклонил.
+        Товар не списываем.
+        """
+        if self.status != self.Status.SUBMITTED:
+            raise ValidationError("Можно отклонить только заявку в статусе 'submitted'.")
+        self.status = self.Status.REJECTED
+        self.approved_at = timezone.now()
+        self.approved_by = by_user
+        self.full_clean()
+        self.save(update_fields=["status", "approved_at", "approved_by", "updated_at"])
+        
+        
+class AgentRequestItem(models.Model):
+    """
+    Строка внутри AgentRequestCart.
+    В черновике агент просто накидывает product + quantity_requested.
+    Когда заявка отправляется (submit), мы фиксируем:
+      - gift_quantity (сколько бесплатно),
+      - total_quantity (итого нужно выдать агенту),
+      - price_snapshot (цена на момент заявки).
+    При approve мы создаём ManufactureSubreal и кладём ссылку сюда.
+    """
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    cart = models.ForeignKey(
+        AgentRequestCart,
+        on_delete=models.CASCADE,
+        related_name="items",
+        verbose_name="Заявка"
+    )
+    product = models.ForeignKey(
+        Product,
+        on_delete=models.PROTECT,
+        related_name="agent_request_items",
+        verbose_name="Товар"
+    )
+
+    quantity_requested = models.PositiveIntegerField(verbose_name="Запрошено (шт)")
+    gift_quantity = models.PositiveIntegerField(default=0, verbose_name="Подарок (шт)")
+    total_quantity = models.PositiveIntegerField(default=0, verbose_name="Итого выдать (шт)")
+
+    price_snapshot = models.DecimalField(
+        "Цена на момент заявки",
+        max_digits=12,
+        decimal_places=2,
+        default=Decimal("0.00"),
+        help_text="фиксируется при отправке"
+    )
+
+    subreal = models.ForeignKey(
+        ManufactureSubreal,
+        on_delete=models.SET_NULL,
+        null=True, blank=True,
+        related_name="request_items",
+        verbose_name="Передача агенту"
+    )
+
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = "Позиция заявки агента"
+        verbose_name_plural = "Позиции заявки агента"
+        indexes = [
+            models.Index(fields=["cart"]),
+            models.Index(fields=["product"]),
+        ]
+
+    def __str__(self):
+        return f"{self.product.name} x {self.quantity_requested}"
+
+    def clean(self):
+        # нельзя чужую компанию/филиал
+        if self.cart_id and self.product_id:
+            if self.product.company_id != self.cart.company_id:
+                raise ValidationError({"product": "Товар другой компании."})
+            if self.cart.branch_id and self.product.branch_id not in (None, self.cart.branch_id):
+                raise ValidationError({"product": "Товар другого филиала."})
+        if self.quantity_requested < 1:
+            raise ValidationError({"quantity_requested": "Количество должно быть ≥ 1."})
+
+        # если корзина уже SUBMITTED/APPROVED/REJECTED — менять нельзя
+        if self.cart_id and self.cart.status != AgentRequestCart.Status.DRAFT:
+            raise ValidationError("Нельзя редактировать позиции не в черновике.")
+
+    def save(self, *args, **kwargs):
+        # если корзина не draft — стоп
+        if self.cart_id and self.cart.status != AgentRequestCart.Status.DRAFT:
+            raise ValidationError("Редактирование запрещено: заявка уже отправлена.")
+        # дефолтная цена пока черновик
+        if not self.price_snapshot:
+            self.price_snapshot = self.product.price or Decimal("0.00")
+        self.full_clean()
+        super().save(*args, **kwargs)
