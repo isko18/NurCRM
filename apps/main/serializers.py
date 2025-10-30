@@ -1825,10 +1825,29 @@ class AgentRequestCartSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSe
         _restrict_pk_queryset_strict(self.fields.get("client"), Client.objects.all(), comp, br)
 
     def get_agent_name(self, obj):
-        if not obj.agent:
-            return None
-        full = getattr(obj.agent, "get_full_name", lambda: "")() or ""
-        return full or obj.agent.username or str(obj.agent.id)
+        """
+        Возвращаем человеко-читаемое имя агента:
+        - сначала Имя + Фамилия
+        - потом track_number (если вдруг у него нет имени)
+        - потом email как самый последний fallback
+        """
+        u = getattr(obj, "agent", None)
+        if not u:
+            return ""
+
+        full = f"{(u.first_name or '').strip()} {(u.last_name or '').strip()}".strip()
+        if full:
+            return full
+
+        if getattr(u, "track_number", None):
+            return u.track_number
+
+        # last fallback: email или id
+        return u.email or str(u.id)
+
+    def get_agent_track_number(self, obj):
+        u = getattr(obj, "agent", None)
+        return getattr(u, "track_number", None)
 
     def get_approved_by_name(self, obj):
         u = getattr(obj, "approved_by", None)
