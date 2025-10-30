@@ -49,13 +49,15 @@ from apps.utils import product_images_prefetch, _is_owner_like
 
 class AgentCartLockMixin:
     """
-    Общая логика блокировки корзины перед submit/approve/reject.
+    Безопасная блокировка корзины:
+    1) сначала выбираем корзину с фильтрами компании/филиала/прав
+    2) потом отдельно лочим её чистым SELECT ... FOR UPDATE без join'ов
     """
 
     def _lock_cart_for_submit(self, request, pk):
         """
-        Агент → submit только свою корзину.
-        Владелец может тоже сабмитить (не обязательно, но не ломаем кейс).
+        Агент сабмитит ТОЛЬКО свою корзину.
+        Владелец тоже может (разрешаем, вдруг нужно).
         """
         allowed_qs = AgentRequestCart.objects.all()
         allowed_qs = self._filter_qs_company_branch(allowed_qs)
@@ -64,15 +66,21 @@ class AgentCartLockMixin:
         if not _is_owner_like(user):
             allowed_qs = allowed_qs.filter(agent=user)
 
+        # шаг 1: находим корзину с фильтрами доступа
         cart = get_object_or_404(allowed_qs, pk=pk)
 
-        # ВТОРОЙ шаг: форсируем блокировку уже по pk, без join'ов.
-        locked_cart = AgentRequestCart.objects.select_for_update().get(pk=cart.pk)
+        # шаг 2: чистый лок без join'ов
+        locked_cart = (
+            AgentRequestCart.objects
+            .select_related(None)        # ВАЖНО: убираем автоджойны
+            .select_for_update()
+            .get(pk=cart.pk)
+        )
         return locked_cart
 
     def _lock_cart_for_owner_action(self, request, pk):
         """
-        Одобрение / отклонение — только владелец/админ.
+        approve / reject -> только для владельца/админа.
         """
         user = request.user
         if not _is_owner_like(user):
@@ -83,7 +91,12 @@ class AgentCartLockMixin:
 
         cart = get_object_or_404(allowed_qs, pk=pk)
 
-        locked_cart = AgentRequestCart.objects.select_for_update().get(pk=cart.pk)
+        locked_cart = (
+            AgentRequestCart.objects
+            .select_related(None)        # ВАЖНО
+            .select_for_update()
+            .get(pk=cart.pk)
+        )
         return locked_cart
     
 class CompanyBranchRestrictedMixin:
