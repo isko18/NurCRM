@@ -71,7 +71,24 @@ def _restrict_pk_queryset_strict(field, base_qs, company, branch):
         qs = qs.filter(branch=branch) if branch else qs.filter(branch__isnull=True)
     field.queryset = qs
 
+class ProductImageReadSerializer(serializers.ModelSerializer):
+    image_url = serializers.SerializerMethodField()
 
+    class Meta:
+        model = ProductImage
+        fields = ["id", "image_url", "alt", "is_primary", "created_at"]
+        read_only_fields = fields  # всё только на чтение тут
+
+    def get_image_url(self, obj):
+        """
+        Делаем абсолютный URL, чтобы фронту было удобно.
+        """
+        request = self.context.get("request")
+        if not obj.image:
+            return None
+        if request:
+            return request.build_absolute_uri(obj.image.url)
+        return obj.image.url
 # ===========================
 # Общий миксин: company/branch
 # ===========================
@@ -1675,13 +1692,15 @@ class AgentRequestItemSerializer(serializers.ModelSerializer):
     product_name = serializers.ReadOnlyField(source="product.name")
     product_barcode = serializers.ReadOnlyField(source="product.barcode")
     subreal_id = serializers.ReadOnlyField(source="subreal.id")
-
+    product_image_url = serializers.SerializerMethodField()
+    
     class Meta:
         model = AgentRequestItem
         fields = [
             "id",
             "cart",
             "product", "product_name", "product_barcode",
+            "product_image_url", 
             "quantity_requested",
             "gift_quantity",
             "total_quantity",
@@ -1696,6 +1715,7 @@ class AgentRequestItemSerializer(serializers.ModelSerializer):
             "price_snapshot",
             "subreal", "subreal_id",
             "created_at", "updated_at",
+            "product_image_url",
         ]
 
     def __init__(self, *args, **kwargs):
@@ -1721,7 +1741,31 @@ class AgentRequestItemSerializer(serializers.ModelSerializer):
                 cart_qs = cart_qs.filter(agent=user, status=AgentRequestCart.Status.DRAFT)
 
             self.fields["cart"].queryset = cart_qs
+    def get_product_image_url(self, obj):
+        """
+        Возвращаем URL главной фотки товара (is_primary=True),
+        если нет главной — просто первую.
+        """
+        product = getattr(obj, "product", None)
+        if not product:
+            return None
 
+        # у продукта есть related_name="images"
+        images_qs = getattr(product, "images", None)
+        if images_qs is None:
+            return None
+
+        # сначала пытаемся взять основную
+        primary = images_qs.filter(is_primary=True).first()
+        img_obj = primary or images_qs.first()
+        if not img_obj or not img_obj.image:
+            return None
+
+        request = self.context.get("request")
+        if request:
+            return request.build_absolute_uri(img_obj.image.url)
+        return img_obj.image.url
+    
     def validate(self, data):
         """
         Проверяем:
