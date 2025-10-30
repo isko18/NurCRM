@@ -2374,48 +2374,69 @@ class AgentRequestItem(models.Model):
             raise ValidationError("Нельзя редактировать позиции не в черновике.")
 
     def save(self, *args, **kwargs):
+        """
+        Правила:
+        - Пока корзина DRAFT:
+            можно свободно создавать/редактировать строку (агент наполняет заявку).
+        - Когда корзина уже SUBMITTED:
+            агент руками редактировать не может,
+            но backend при submit()/approve() может:
+            * зафиксировать gift_quantity / total_quantity / price_snapshot
+            * проставить ссылку subreal после фактической выдачи
+            Эти апдейты приходят с явным update_fields.
+        - Когда корзина APPROVED или REJECTED:
+            больше никаких изменений.
+        """
+
         if not self.cart_id:
-            # теоретически shouldn't happen, но пусть падает раньше
             raise ValidationError("Строка без cart не сохраняется.")
 
         cart_status = self.cart.status
-        creating = self._state.adding  # True если это .create() (новая позиция)
+        creating = self._state.adding  # True если это новая позиция (INSERT)
 
         # ===== 1. Корзина ещё черновик -> полный доступ
         if cart_status == AgentRequestCart.Status.DRAFT:
             # зафиксируем price_snapshot если не задан
             if not self.price_snapshot:
                 self.price_snapshot = self.product.price or Decimal("0.00")
-            # обычная валидация (clean() проверяет количество, компанию, филиал и т.д.)
+            # обычная валидация
             self.full_clean()
             return super().save(*args, **kwargs)
 
-        # ===== 2. Корзина SUBMITTED -> только "сервисное" обновление при approve()
+        # ===== 2. Корзина SUBMITTED -> только служебные апдейты бекэнда
         if cart_status == AgentRequestCart.Status.SUBMITTED:
             # агент не может добавлять новые позиции
             if creating:
                 raise ValidationError("Нельзя добавлять позиции после отправки заявки.")
 
-            # смотрим, что именно хотят апдейтнуть
             allowed_fields = kwargs.get("update_fields")
 
-            # если явно пришёл update_fields и он только про subreal / updated_at,
-            # значит это наш approve() -> разрешаем без full_clean()
             if allowed_fields:
                 allowed_fields = set(allowed_fields)
-                if allowed_fields.issubset({"subreal", "updated_at"}):
+
+                # набор полей, которые мы разрешаем менять после сабмита:
+                allowed_service_fields = {
+                    "subreal",          # линковка позиции к созданной передаче
+                    "updated_at",
+                    "gift_quantity",    # фиксируем подарок
+                    "total_quantity",   # фиксируем итоговую выдачу
+                    "price_snapshot",   # фиксируем цену на момент заявки
+                }
+
+                # если ВСЕ поля, которые хотят сохранить — из разрешённого списка,
+                # то даём сохранить без full_clean (чтобы не упасть на статусе).
+                if allowed_fields.issubset(allowed_service_fields):
                     return super().save(*args, **kwargs)
 
-                # кто-то пытается поменять количество/товар и т.д.
+                # кто-то пытается поменять product, quantity_requested и т.д.
                 raise ValidationError("Редактирование позиций после отправки запрещено.")
 
-            # если update_fields не задан (обычный .save()), мы не разрешаем,
-            # чтобы никто случайно не отредактировал что-то лишнее
+            # если update_fields не задан (т.е. кто-то делает .save() без ограничений) — не даём
             raise ValidationError("Редактирование позиций после отправки запрещено.")
 
         # ===== 3. Корзина APPROVED / REJECTED -> вообще нельзя трогать
         if cart_status in (AgentRequestCart.Status.APPROVED, AgentRequestCart.Status.REJECTED):
             raise ValidationError("Заявка уже обработана. Изменения позиций запрещены.")
 
-        # safety net: теоретически не должны сюда попадать
+        # safety net
         raise ValidationError(f"Нельзя сохранить позицию при статусе {cart_status!r}.")
