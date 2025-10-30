@@ -2374,11 +2374,48 @@ class AgentRequestItem(models.Model):
             raise ValidationError("Нельзя редактировать позиции не в черновике.")
 
     def save(self, *args, **kwargs):
-        # если корзина не draft — стоп
-        if self.cart_id and self.cart.status != AgentRequestCart.Status.DRAFT:
-            raise ValidationError("Редактирование запрещено: заявка уже отправлена.")
-        # дефолтная цена пока черновик
-        if not self.price_snapshot:
-            self.price_snapshot = self.product.price or Decimal("0.00")
-        self.full_clean()
-        super().save(*args, **kwargs)
+        if not self.cart_id:
+            # теоретически shouldn't happen, но пусть падает раньше
+            raise ValidationError("Строка без cart не сохраняется.")
+
+        cart_status = self.cart.status
+        creating = self._state.adding  # True если это .create() (новая позиция)
+
+        # ===== 1. Корзина ещё черновик -> полный доступ
+        if cart_status == AgentRequestCart.Status.DRAFT:
+            # зафиксируем price_snapshot если не задан
+            if not self.price_snapshot:
+                self.price_snapshot = self.product.price or Decimal("0.00")
+            # обычная валидация (clean() проверяет количество, компанию, филиал и т.д.)
+            self.full_clean()
+            return super().save(*args, **kwargs)
+
+        # ===== 2. Корзина SUBMITTED -> только "сервисное" обновление при approve()
+        if cart_status == AgentRequestCart.Status.SUBMITTED:
+            # агент не может добавлять новые позиции
+            if creating:
+                raise ValidationError("Нельзя добавлять позиции после отправки заявки.")
+
+            # смотрим, что именно хотят апдейтнуть
+            allowed_fields = kwargs.get("update_fields")
+
+            # если явно пришёл update_fields и он только про subreal / updated_at,
+            # значит это наш approve() -> разрешаем без full_clean()
+            if allowed_fields:
+                allowed_fields = set(allowed_fields)
+                if allowed_fields.issubset({"subreal", "updated_at"}):
+                    return super().save(*args, **kwargs)
+
+                # кто-то пытается поменять количество/товар и т.д.
+                raise ValidationError("Редактирование позиций после отправки запрещено.")
+
+            # если update_fields не задан (обычный .save()), мы не разрешаем,
+            # чтобы никто случайно не отредактировал что-то лишнее
+            raise ValidationError("Редактирование позиций после отправки запрещено.")
+
+        # ===== 3. Корзина APPROVED / REJECTED -> вообще нельзя трогать
+        if cart_status in (AgentRequestCart.Status.APPROVED, AgentRequestCart.Status.REJECTED):
+            raise ValidationError("Заявка уже обработана. Изменения позиций запрещены.")
+
+        # safety net: теоретически не должны сюда попадать
+        raise ValidationError(f"Нельзя сохранить позицию при статусе {cart_status!r}.")
