@@ -97,31 +97,16 @@ def compute_gift_qty(product, qty: int, *, company, branch=None, date=None, stac
 
 def _is_owner_like(user) -> bool:
     """
-    Кто имеет право одобрять/отклонять заявки агентов и списывать склад:
-    - суперюзер (is_superuser)
-    - is_staff (можно трактовать как админ системы)
-    - роль в системе = owner или admin
-    - он является владельцем компании (company.owner == этот user),
-      что у тебя доступно как user.owned_company (reverse OneToOne)
+    кто имеет право одобрять:
+    - суперюзер
+    - staff
+    - роль owner или admin
     """
-    if not user or not getattr(user, "is_active", False):
-        return False
-
-    # 1. суперюзер из PermissionsMixin
     if getattr(user, "is_superuser", False):
         return True
-
-    # 2. системный staff
     if getattr(user, "is_staff", False):
         return True
-
-    # 3. владелец компании (есть related_name='owned_company')
-    if getattr(user, "owned_company", None) is not None:
+    role = getattr(user, "role", None)
+    if role in ("owner", "admin"):
         return True
-
-    # 4. системная роль пользователя
-    role_value = getattr(user, "role", None)
-    if role_value in ("owner", "admin"):
-        return True
-
     return False

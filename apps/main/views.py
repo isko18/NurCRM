@@ -2389,48 +2389,91 @@ class AgentRequestCartRetrieveUpdateDestroyAPIView(
         instance.delete()
 
 
-class AgentRequestCartSubmitAPIView(AgentCartLockMixin, CompanyBranchRestrictedMixin, APIView):
+class AgentRequestCartSubmitAPIView(AgentCartLockMixin,
+                                    CompanyBranchRestrictedMixin,
+                                    APIView):
+    """
+    POST /agent-carts/<uuid:pk>/submit/
+    Агент (или владелец вместо него) отправляет корзину.
+    После этого корзина перестаёт редактироваться.
+    """
     permission_classes = [permissions.IsAuthenticated]
 
     @transaction.atomic
     def post(self, request, pk, *args, **kwargs):
+        # 1) лочим корзину безопасно (двухшагово, без FOR UPDATE с LEFT JOIN)
         cart = self._lock_cart_for_submit(request, pk)
 
+        # 2) выполняем submit() через сериализатор
         ser = AgentRequestCartSubmitSerializer(
             data=request.data,
             context={"cart_obj": cart, "request": request},
         )
         ser.is_valid(raise_exception=True)
-        cart = ser.save()
+        cart = ser.save()  # cart.submit()
 
+        # 3) возвращаем свежие данные
         out = AgentRequestCartSerializer(cart, context={"request": request}).data
         return Response(out, status=status.HTTP_200_OK)
 
 
-class AgentRequestCartApproveAPIView(AgentCartLockMixin, CompanyBranchRestrictedMixin, APIView):
+class AgentRequestCartApproveAPIView(AgentCartLockMixin,
+                                     CompanyBranchRestrictedMixin,
+                                     APIView):
+    """
+    POST /agent-carts/<uuid:pk>/approve/
+    Только владелец/админ.
+    Делает cart.approve(by_user=request.user):
+      - проверка остатков
+      - минусуем склад
+      - создаём ManufactureSubreal с is_sawmill=True
+      - линкуем subreal к позициям
+      - статус -> APPROVED
+    """
     permission_classes = [permissions.IsAuthenticated]
 
     @transaction.atomic
     def post(self, request, pk, *args, **kwargs):
+        # 1) только владелец / админ
+        if not _is_owner_like(request.user):
+            raise PermissionDenied("Forbidden")
+
+        # 2) безопасно лочим корзину (без джойнов в FOR UPDATE)
         cart = self._lock_cart_for_owner_action(request, pk)
 
+        # 3) выполняем approve() через сериализатор
         ser = AgentRequestCartApproveSerializer(
             data=request.data,
             context={"cart_obj": cart, "request": request},
         )
         ser.is_valid(raise_exception=True)
-        cart = ser.save()
+        cart = ser.save()  # cart.approve(by_user=...)
 
+        # 4) отдаём обновлённую корзину
         out = AgentRequestCartSerializer(cart, context={"request": request}).data
         return Response(out, status=status.HTTP_200_OK)
 
-class AgentRequestCartRejectAPIView(AgentCartLockMixin, CompanyBranchRestrictedMixin, APIView):
+class AgentRequestCartRejectAPIView(AgentCartLockMixin,
+                                    CompanyBranchRestrictedMixin,
+                                    APIView):
+    """
+    POST /agent-carts/<uuid:pk>/reject/
+    Только владелец/админ.
+    cart.reject(by_user=request.user):
+      - статус -> REJECTED
+    """
     permission_classes = [permissions.IsAuthenticated]
 
     @transaction.atomic
     def post(self, request, pk, *args, **kwargs):
+        # 1) только владелец / админ
+        if not _is_owner_like(request.user):
+            raise PermissionDenied("Forbidden")
+
+        # 2) лочим корзину
         cart = self._lock_cart_for_owner_action(request, pk)
 
+        # 3) выполняем reject()
         ser = AgentRequestCartRejectSerializer(
             data=request.data,
             context={"cart_obj": cart, "request": request},
@@ -2438,6 +2481,7 @@ class AgentRequestCartRejectAPIView(AgentCartLockMixin, CompanyBranchRestrictedM
         ser.is_valid(raise_exception=True)
         cart = ser.save()
 
+        # 4) назад корзину в сериализованном виде
         out = AgentRequestCartSerializer(cart, context={"request": request}).data
         return Response(out, status=status.HTTP_200_OK)
 
