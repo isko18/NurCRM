@@ -1,4 +1,3 @@
-# apps/main/serializers.py
 from rest_framework import serializers
 from django.db import transaction
 from django.utils import timezone
@@ -15,7 +14,7 @@ from apps.main.models import (
     OrderItem, Client, GlobalProduct, CartItem, ClientDeal, Bid, SocialApplications,
     TransactionRecord, DealInstallment, ContractorWork, Debt, DebtPayment,
     ObjectItem, ObjectSale, ObjectSaleItem, ItemMake, ManufactureSubreal, Acceptance,
-    ReturnFromAgent, ProductImage
+    ReturnFromAgent, ProductImage, PromoRule, AgentRequestCart, AgentRequestItem
 )
 from apps.construction.models import Department
 from apps.consalting.models import ServicesConsalting
@@ -1215,7 +1214,7 @@ class ManufactureSubrealSerializer(CompanyBranchReadOnlyMixin, serializers.Model
     agent_last_name    = serializers.ReadOnlyField(source="agent.last_name")
     agent_track_number = serializers.ReadOnlyField(source="agent.track_number")
 
-    # вычисляемые — делаем через SMethodField, чтобы не падать на None
+    # вычисляемые — делаем через SerializerMethodField, чтобы не падать на None
     qty_remaining = serializers.SerializerMethodField()
     qty_on_agent  = serializers.SerializerMethodField()
 
@@ -1271,7 +1270,7 @@ class ManufactureSubrealSerializer(CompanyBranchReadOnlyMixin, serializers.Model
         if product is not None and product.company_id != getattr(company, "id", None):
             raise serializers.ValidationError({"product": "Товар другой компании."})
 
-        # строгая проверка филиала (если у вас режим “строгих филиалов”)
+        # строгая проверка филиала
         if branch is not None and product is not None and product.branch_id not in (None, branch.id):
             raise serializers.ValidationError({"product": "Товар другого филиала."})
 
@@ -1563,3 +1562,340 @@ class GlobalProductReadSerializer(serializers.ModelSerializer):
     class Meta:
         model = GlobalProduct
         fields = ["id", "name", "barcode", "brand", "category"]
+        
+        
+class PromoRuleSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
+    company = serializers.ReadOnlyField(source="company.id")
+    branch  = serializers.ReadOnlyField(source="branch.id")
+
+    # Покажем удобные подписи
+    product_name  = serializers.ReadOnlyField(source="product.name")
+    brand_name    = serializers.ReadOnlyField(source="brand.name")
+    category_name = serializers.ReadOnlyField(source="category.name")
+
+    class Meta:
+        model = PromoRule
+        fields = [
+            "id", "company", "branch",
+            "title",
+            "product", "product_name",
+            "brand", "brand_name",
+            "category", "category_name",
+            "min_qty", "gift_qty", "inclusive",
+            "priority",
+            "active_from", "active_to", "is_active",
+            "created_at", "updated_at",
+        ]
+        read_only_fields = [
+            "id", "company", "branch",
+            "product_name", "brand_name", "category_name",
+            "created_at", "updated_at",
+        ]
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        comp = self._user_company()
+        br   = self._auto_branch()
+        # Ограничим product / brand / category в выпадашках так же, как ты делаешь в других местах:
+        _restrict_pk_queryset_strict(self.fields.get("product"), Product.objects.all(), comp, br)
+        _restrict_pk_queryset_strict(self.fields.get("brand"), ProductBrand.objects.all(), comp, br)
+        _restrict_pk_queryset_strict(self.fields.get("category"), ProductCategory.objects.all(), comp, br)
+
+    def validate(self, attrs):
+        """
+        Правила:
+          - только один таргет: product ИЛИ brand ИЛИ category ИЛИ ни одного (глобальное правило)
+          - min_qty >= 1, gift_qty >= 1
+          - объект должен принадлежать той же компании и (если есть филиал) филиалу
+        Остальное уже проверяет модель .clean(), но мы словим пораньше.
+        """
+        product  = attrs.get("product")  or getattr(self.instance, "product", None)
+        brand    = attrs.get("brand")    or getattr(self.instance, "brand", None)
+        category = attrs.get("category") or getattr(self.instance, "category", None)
+
+        chosen = [product, brand, category]
+        if sum(bool(x) for x in chosen) > 1:
+            raise serializers.ValidationError("Укажите только product ИЛИ brand ИЛИ category (или ничего).")
+
+        min_qty  = attrs.get("min_qty",  getattr(self.instance, "min_qty",  None))
+        gift_qty = attrs.get("gift_qty", getattr(self.instance, "gift_qty", None))
+
+        if min_qty is not None and min_qty < 1:
+            raise serializers.ValidationError({"min_qty": "Порог должен быть ≥ 1."})
+        if gift_qty is not None and gift_qty < 1:
+            raise serializers.ValidationError({"gift_qty": "Подарок должен быть ≥ 1."})
+
+        return attrs
+ 
+
+
+class AgentRequestCartSubmitSerializer(serializers.Serializer):
+    """
+    Агент нажимает 'отправить заявку владельцу'.
+    cart.submit() делает:
+      - фиксирует подарки (gift_quantity/total_quantity/price_snapshot),
+      - ставит status='submitted', submitted_at=...
+    """
+    def save(self, **kwargs):
+        cart: AgentRequestCart = self.context["cart_obj"]
+        cart.submit()
+        return cart
+
+
+class AgentRequestCartApproveSerializer(serializers.Serializer):
+    """
+    Владелец/админ нажимает 'одобрить'.
+    cart.approve(by_user=request.user) делает:
+      - проверяет остатки,
+      - списывает Product.quantity,
+      - создаёт ManufactureSubreal под агента с is_sawmill=True,
+      - связывает эти subreal с позициями,
+      - ставит status='approved'
+    """
+    def save(self, **kwargs):
+        cart: AgentRequestCart = self.context["cart_obj"]
+        user = self.context["request"].user
+        cart.approve(by_user=user)
+        return cart
+
+
+class AgentRequestCartRejectSerializer(serializers.Serializer):
+    """
+    Владелец/админ отклоняет.
+    cart.reject(by_user=request.user) просто помечает статус='rejected'
+    """
+    def save(self, **kwargs):
+        cart: AgentRequestCart = self.context["cart_obj"]
+        user = self.context["request"].user
+        cart.reject(by_user=user)
+        return cart   
+
+
+class AgentRequestItemSerializer(serializers.ModelSerializer):
+    product_name = serializers.ReadOnlyField(source="product.name")
+    product_barcode = serializers.ReadOnlyField(source="product.barcode")
+    subreal_id = serializers.ReadOnlyField(source="subreal.id")
+
+    class Meta:
+        model = AgentRequestItem
+        fields = [
+            "id",
+            "cart",
+            "product", "product_name", "product_barcode",
+            "quantity_requested",
+            "gift_quantity",
+            "total_quantity",
+            "price_snapshot",
+            "subreal", "subreal_id",
+            "created_at", "updated_at",
+        ]
+        read_only_fields = [
+            "id",
+            "gift_quantity",
+            "total_quantity",
+            "price_snapshot",
+            "subreal", "subreal_id",
+            "created_at", "updated_at",
+        ]
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+        req = self.context.get("request")
+        user = getattr(req, "user", None) if req else None
+        comp = getattr(user, "company", None)
+        br   = _active_branch(self)
+
+        # Ограничим queryset для product и cart по company/branch и по правам агента
+        if comp and self.fields.get("product"):
+            prod_qs = Product.objects.filter(company=comp)
+            prod_qs = prod_qs.filter(branch=br) if br else prod_qs.filter(branch__isnull=True)
+            self.fields["product"].queryset = prod_qs
+
+        if comp and self.fields.get("cart"):
+            cart_qs = AgentRequestCart.objects.filter(company=comp)
+            cart_qs = cart_qs.filter(branch=br) if br else cart_qs.filter(branch__isnull=True)
+
+            # агент может создавать строки только в своих корзинах
+            if user and not getattr(user, "is_superuser", False) and not getattr(user, "is_owner", False):
+                cart_qs = cart_qs.filter(agent=user, status=AgentRequestCart.Status.DRAFT)
+
+            self.fields["cart"].queryset = cart_qs
+
+    def validate(self, data):
+        """
+        Проверяем:
+          - cart в статусе draft
+          - product из той же компании/филиала
+          - quantity_requested >=1
+          - есть ли столько товара на складе
+        """
+        cart = data.get("cart") or getattr(self.instance, "cart", None)
+        product = data.get("product") or getattr(self.instance, "product", None)
+        qty = data.get("quantity_requested", getattr(self.instance, "quantity_requested", None))
+
+        if not cart:
+            raise serializers.ValidationError({"cart": "Обязательное поле."})
+
+        if cart.status != AgentRequestCart.Status.DRAFT:
+            raise serializers.ValidationError("Нельзя менять позиции: корзина не в черновике.")
+
+        if not product:
+            raise serializers.ValidationError({"product": "Обязательное поле."})
+
+        if product.company_id != cart.company_id:
+            raise serializers.ValidationError({"product": "Товар другой компании."})
+        if cart.branch_id and product.branch_id not in (None, cart.branch_id):
+            raise serializers.ValidationError({"product": "Товар другого филиала."})
+
+        if qty is None or qty < 1:
+            raise serializers.ValidationError({"quantity_requested": "Количество должно быть ≥ 1."})
+
+        # мягкая проверка склада
+        if product.quantity < qty:
+            raise serializers.ValidationError(
+                {"quantity_requested": f"Недостаточно '{product.name}' на складе. Доступно: {product.quantity}"}
+            )
+
+        return data
+
+    @transaction.atomic
+    def create(self, validated_data):
+        cart = validated_data["cart"]
+        if cart.status != AgentRequestCart.Status.DRAFT:
+            raise serializers.ValidationError("Добавлять можно только в черновик.")
+        # вручную подарки не ставим — они рассчитываются на submit()
+        return super().create(validated_data)
+
+    @transaction.atomic
+    def update(self, instance, validated_data):
+        cart = instance.cart
+        if cart.status != AgentRequestCart.Status.DRAFT:
+            raise serializers.ValidationError("Редактировать можно только черновик.")
+        instance.product = validated_data.get("product", instance.product)
+        instance.quantity_requested = validated_data.get("quantity_requested", instance.quantity_requested)
+        instance.save(update_fields=["product", "quantity_requested", "updated_at"])
+        return instance
+    
+class AgentRequestCartSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
+    company = serializers.ReadOnlyField(source="company.id")
+    branch  = serializers.ReadOnlyField(source="branch.id")
+
+    agent = serializers.ReadOnlyField(source="agent.id")
+    agent_name = serializers.SerializerMethodField(read_only=True)
+
+    client_name = serializers.ReadOnlyField(source="client.full_name")
+
+    approved_by_name = serializers.SerializerMethodField(read_only=True)
+
+    items = AgentRequestItemSerializer(many=True, read_only=True)
+
+    total_requested = serializers.SerializerMethodField()
+    total_gift = serializers.SerializerMethodField()
+    total_all = serializers.SerializerMethodField()
+
+    class Meta:
+        model = AgentRequestCart
+        fields = [
+            "id", "company", "branch",
+            "agent", "agent_name",
+            "client", "client_name",
+            "status", "note",
+            "submitted_at", "approved_at", "approved_by", "approved_by_name",
+            "items",
+            "total_requested", "total_gift", "total_all",
+            "created_at", "updated_at",
+        ]
+        read_only_fields = [
+            "id", "company", "branch",
+            "agent", "agent_name",
+            "client_name",
+            "status",
+            "submitted_at", "approved_at", "approved_by", "approved_by_name",
+            "items",
+            "total_requested", "total_gift", "total_all",
+            "created_at", "updated_at",
+        ]
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # Ограничим выбор клиента: как в других местах
+        comp = self._user_company()
+        br   = self._auto_branch()
+        _restrict_pk_queryset_strict(self.fields.get("client"), Client.objects.all(), comp, br)
+
+    def get_agent_name(self, obj):
+        if not obj.agent:
+            return None
+        full = getattr(obj.agent, "get_full_name", lambda: "")() or ""
+        return full or obj.agent.username or str(obj.agent.id)
+
+    def get_approved_by_name(self, obj):
+        u = getattr(obj, "approved_by", None)
+        if not u:
+            return None
+        full = getattr(u, "get_full_name", lambda: "")() or ""
+        return full or getattr(u, "username", None) or str(u.id)
+
+    def get_total_requested(self, obj):
+        # сумма quantity_requested по всем позициям
+        return sum((it.quantity_requested for it in obj.items.all()), 0)
+
+    def get_total_gift(self, obj):
+        # сумма gift_quantity — рассчитывается и фиксируется на submit()
+        return sum((it.gift_quantity for it in obj.items.all()), 0)
+
+    def get_total_all(self, obj):
+        # сумма total_quantity (requested + gift)
+        return sum((it.total_quantity for it in obj.items.all()), 0)
+
+    def validate_client(self, client):
+        """
+        Повторяем branch-валидацию как в других сериализаторах (ClientDeal, ObjectSale и т.д.)
+        """
+        if client is None:
+            return None
+        company = self._user_company()
+        branch = self._auto_branch()
+        if client.company_id != company.id:
+            raise serializers.ValidationError("Клиент принадлежит другой компании.")
+        if branch is not None:
+            if client.branch_id != branch.id:
+                raise serializers.ValidationError("Клиент другого филиала.")
+        else:
+            if client.branch_id is not None:
+                raise serializers.ValidationError("Глобальный режим: клиент должен быть без филиала.")
+        return client
+
+    def create(self, validated_data):
+        """
+        создаём черновик. agent = текущий пользователь.
+        company/branch нам уже зафигачит CompanyBranchReadOnlyMixin.create(),
+        но agent нужно подставить явно.
+        """
+        user = self.context["request"].user
+        validated_data["agent"] = user
+        cart = super().create(validated_data)
+        return cart
+
+    def update(self, instance, validated_data):
+        """
+        В draft агент может менять только:
+          - client
+          - note
+        Статусы и системные поля руками менять нельзя.
+        """
+        if instance.status != AgentRequestCart.Status.DRAFT:
+            raise serializers.ValidationError("Редактировать можно только черновик.")
+
+        # client уже прошёл validate_client
+        if "client" in validated_data:
+            instance.client = validated_data["client"]
+
+        if "note" in validated_data:
+            instance.note = validated_data["note"]
+
+        # branch/company ставит миксин update() сам, но status трогать нельзя
+        super().update(instance, {})  # чтобы миксин прописал company/branch
+        instance.save(update_fields=["client", "note", "branch", "updated_at"])
+        return instance

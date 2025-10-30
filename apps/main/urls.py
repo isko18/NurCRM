@@ -173,6 +173,16 @@ name="client-reconciliation",),
     path("agents/me/carts/<uuid:pk>/custom-item/", AgentSaleAddCustomItemAPIView.as_view()),
     path("agents/me/carts/<uuid:pk>/checkout/", AgentSaleCheckoutAPIView.as_view()),
     path("agents/me/carts/<uuid:cart_id>/items/<uuid:item_id>/", AgentCartItemUpdateDestroyAPIView.as_view(),name="agent-cart-item-update-destroy", ),
+    
+    
+    path("agent-carts/", AgentRequestCartListCreateAPIView.as_view()),
+    path("agent-carts/<uuid:pk>/", AgentRequestCartRetrieveUpdateDestroyAPIView.as_view()),
+    path("agent-carts/<uuid:pk>/submit/", AgentRequestCartSubmitAPIView.as_view()),
+    path("agent-carts/<uuid:pk>/approve/", AgentRequestCartApproveAPIView.as_view()),
+    path("agent-carts/<uuid:pk>/reject/", AgentRequestCartRejectAPIView.as_view()),
+
+    path("agent-cart-items/", AgentRequestItemListCreateAPIView.as_view()),
+    path("agent-cart-items/<uuid:pk>/", AgentRequestItemRetrieveUpdateDestroyAPIView.as_view()),
 ]
 
 
