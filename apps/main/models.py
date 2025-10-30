@@ -1952,24 +1952,39 @@ class ManufactureSubreal(models.Model):
     @transaction.atomic
     def auto_accept_if_needed(self, by_user):
         """
-        Для is_sawmill=True: один раз принять весь доступный остаток.
-        Идемпотентно и безопасно к гонкам.
+        Для is_sawmill=True: принять весь остаток сразу один раз.
+        Идемпотентно и без конфликтов.
         """
         if not self.is_sawmill:
             return
-        locked = type(self).objects.select_for_update().select_related("company", "branch").get(pk=self.pk)
+
+        # 1. Жёстко лочим ТОЛЬКО сам subreal, без join'ов
+        locked = (
+            type(self).objects
+            .select_related(None)        # убираем join'ы
+            .select_for_update()
+            .get(pk=self.pk)
+        )
+
         remaining = locked.qty_remaining
         if remaining <= 0 or locked.status != locked.Status.OPEN:
             return
+
+        # 2. Нам ещё нужны company и branch для Acceptance.
+        #    Они уже есть на self (или можем рефрешнуть locked с нужными связями без FOR UPDATE).
+        #    Сейчас проще так: возьмём company/branch с self, они не меняются в процессе.
+        company = self.company
+        branch = self.branch
+
         Acceptance.objects.create(
-            company=locked.company,
-            branch=locked.branch,
+            company=company,
+            branch=branch,
             subreal=locked,
             accepted_by=by_user,
             qty=remaining,
             accepted_at=timezone.now(),
         )
-        # qty_accepted и статус обновятся через Acceptance.save() + try_close()
+        # Остальное (qty_accepted, try_close) сделает Acceptance.save()
 
 
 class Acceptance(models.Model):
@@ -2235,24 +2250,28 @@ class AgentRequestCart(models.Model):
         """
         Владелец/админ подтверждает заявку.
         Мы списываем товар со склада, создаём передачи (ManufactureSubreal) на агента,
-        отмечаем подарок, и привязываем каждую позицию к созданной передаче.
+        и привязываем каждую позицию к созданной передаче.
         """
         if self.status != self.Status.SUBMITTED:
             raise ValidationError("Можно одобрить только заявку в статусе 'submitted'.")
 
-        # пересчитаем подарки ещё раз на всякий случай (чтобы правило не потерялось)
+        # пересчёт подарков, чтобы qty/подарок/итого были зафиксированы
         self._recalc_gifts_for_items()
 
-        # по каждой позиции:
         for it in self.items.select_related("product"):
             prod = it.product
             need_qty = int(it.total_quantity or 0)
-
             if need_qty <= 0:
-                continue  # странно, но ок
+                continue  # пустышка - пропускаем
 
-            # лочим остаток товара
-            locked_qs = type(prod).objects.select_for_update().filter(pk=prod.pk)
+            # 💡 безопасная блокировка конкретного продукта без join'ов
+            locked_qs = (
+                type(prod).objects
+                .select_related(None)     # ВАЖНО: убираем автоджойны
+                .select_for_update()
+                .filter(pk=prod.pk)
+            )
+
             current_qty = locked_qs.values_list("quantity", flat=True).first() or 0
             if current_qty < need_qty:
                 raise ValidationError({
@@ -2262,7 +2281,7 @@ class AgentRequestCart(models.Model):
             # списываем со склада
             locked_qs.update(quantity=F("quantity") - need_qty)
 
-            # создаём передачу агенту через ManufactureSubreal
+            # создаём передачу агенту
             sub = ManufactureSubreal.objects.create(
                 company=self.company,
                 branch=self.branch,
@@ -2270,12 +2289,13 @@ class AgentRequestCart(models.Model):
                 agent=self.agent,    # кто получил
                 product=prod,
                 qty_transferred=need_qty,
-                is_sawmill=True,     # авто-принять сразу (агент получил в руки)
+                is_sawmill=True,     # сразу считаем, что он взял в руки
             )
-            # авто-принять (это заполнит qty_accepted и закроет при необходимости)
+
+            # авто-принять (это поднимет qty_accepted и может закрыть передачу)
             sub.auto_accept_if_needed(by_user)
 
-            # привязываем позицию к этой фактической передаче
+            # привязываем позицию к созданной передаче
             it.subreal = sub
             it.save(update_fields=["subreal", "updated_at"])
 
