@@ -6,14 +6,14 @@ from apps.users.serializers import UserWithPermissionsSerializer
 
 
 # ───────────────────────────────────────────────────────────
-# Общий миксин: company/branch (как в барбере/букинге/кафе)
+# Общий миксин: company/branch
 # ───────────────────────────────────────────────────────────
 class CompanyBranchReadOnlyMixin(serializers.ModelSerializer):
     """
     Делает company/branch read-only наружу и гарантированно проставляет их из контекста на create/update.
     Порядок получения branch:
       1) user.primary_branch() / user.primary_branch
-      2) request.branch (если положил middleware)
+      2) request.branch (если middleware это положил)
       3) None (глобальная запись компании)
     """
     company = serializers.ReadOnlyField(source="company.id")
@@ -25,6 +25,7 @@ class CompanyBranchReadOnlyMixin(serializers.ModelSerializer):
             return None
         user = getattr(request, "user", None)
 
+        # пробуем user.primary_branch() как функцию
         primary = getattr(user, "primary_branch", None)
         if callable(primary):
             try:
@@ -33,12 +34,15 @@ class CompanyBranchReadOnlyMixin(serializers.ModelSerializer):
                     return val
             except Exception:
                 pass
+        # или просто атрибут
         if primary:
             return primary
 
+        # middleware мог положить request.branch
         if hasattr(request, "branch"):
             return request.branch
 
+        # глобально по компании
         return None
 
     def create(self, validated_data):
@@ -56,31 +60,68 @@ class CompanyBranchReadOnlyMixin(serializers.ModelSerializer):
         return super().update(instance, validated_data)
 
 
-# ─── CASHFLOW: внутри кассы ───────────────────────────────
+# ─── CASHFLOW: внутри кассы (вложенный) ────────────────────
 class CashFlowInsideCashboxSerializer(serializers.ModelSerializer):
     class Meta:
         model = CashFlow
-        fields = ['id', 'type', 'name', 'amount', 'status', 'created_at']
+        fields = [
+            'id',
+            'type',
+            'name',
+            'amount',
+            'status',
+            'created_at',
+            'source_cashbox_flow_id',
+            'source_business_operation_id',
+        ]
 
 
-# ─── CASHBOX: c вложенными CashFlow ────────────────────────
+# ─── CASHBOX: с вложенными CashFlow ────────────────────────
 class CashboxWithFlowsSerializer(CompanyBranchReadOnlyMixin):
     department = serializers.PrimaryKeyRelatedField(
-        queryset=Department.objects.all(), allow_null=True, required=False
+        queryset=Department.objects.all(),
+        allow_null=True,
+        required=False,
     )
     department_name = serializers.SerializerMethodField()
+
+    # Вариант А (как у тебя сейчас): просто все связанные CashFlow
     cashflows = CashFlowInsideCashboxSerializer(source='flows', many=True, read_only=True)
-    is_consumption = serializers.BooleanField(read_only=True, allow_null=True)
+
+    # Если нужно только утверждённые операции, то вместо строки выше можно:
+    # cashflows = serializers.SerializerMethodField()
+    #
+    # def get_cashflows(self, obj):
+    #     qs = obj.flows.filter(status=CashFlow.Status.APPROVED)
+    #     return CashFlowInsideCashboxSerializer(qs, many=True).data
+
+    # поле-флаг кассы
+    is_consumption = serializers.BooleanField(read_only=True)
 
     class Meta:
         model = Cashbox
-        fields = ['id', 'company', 'branch', 'department', 'department_name',
-                  'name', 'is_consumption', 'cashflows']
-        read_only_fields = ['id', 'company', 'branch', 'department_name', 'cashflows', 'is_consumption']
+        fields = [
+            'id',
+            'company',
+            'branch',
+            'department',
+            'department_name',
+            'name',
+            'is_consumption',
+            'cashflows',
+        ]
+        read_only_fields = [
+            'id',
+            'company',
+            'branch',
+            'department_name',
+            'cashflows',
+            'is_consumption',
+        ]
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        # Ограничим отделы: та же компания и «глобальные или текущего филиала»
+        # Ограничим доступные отделы: только этой компании и либо глобальные, либо текущего филиала
         request = self.context.get('request')
         if request and getattr(request.user, 'company_id', None):
             target_branch = self._auto_branch()
@@ -97,30 +138,52 @@ class CashboxWithFlowsSerializer(CompanyBranchReadOnlyMixin):
     def validate(self, attrs):
         dept = attrs.get('department') or getattr(self.instance, 'department', None)
         target_branch = self._auto_branch()
+        request = self.context.get('request')
+
         if dept and target_branch is not None and dept.branch_id not in (None, getattr(target_branch, "id", None)):
             raise serializers.ValidationError('Отдел принадлежит другому филиалу.')
-        request = self.context.get('request')
+
         if dept and request and dept.company_id != request.user.company_id:
             raise serializers.ValidationError('Отдел должен принадлежать вашей компании.')
+
         return attrs
 
 
-# ─── CASHBOX: краткий (для Department) ─────────────────────
+# ─── CASHBOX: краткий (для Department / списков) ───────────
 class CashboxSerializer(CompanyBranchReadOnlyMixin):
     department = serializers.PrimaryKeyRelatedField(
-        queryset=Department.objects.all(), allow_null=True, required=False
+        queryset=Department.objects.all(),
+        allow_null=True,
+        required=False,
     )
     department_name = serializers.SerializerMethodField()
     analytics = serializers.SerializerMethodField()
-    is_consumption = serializers.BooleanField(read_only=True, allow_null=True)
+    is_consumption = serializers.BooleanField(read_only=True)
 
     class Meta:
         model = Cashbox
-        fields = ['id', 'company', 'branch', 'department', 'department_name',
-                  'name', 'is_consumption', 'analytics']
-        read_only_fields = ['id', 'company', 'branch', 'department_name', 'analytics', 'is_consumption']
+        fields = [
+            'id',
+            'company',
+            'branch',
+            'department',
+            'department_name',
+            'name',
+            'is_consumption',
+            'analytics',
+        ]
+        read_only_fields = [
+            'id',
+            'company',
+            'branch',
+            'department_name',
+            'analytics',
+            'is_consumption',
+        ]
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+
         request = self.context.get('request')
         if request and getattr(request.user, 'company_id', None):
             target_branch = self._auto_branch()
@@ -142,10 +205,13 @@ class CashboxSerializer(CompanyBranchReadOnlyMixin):
         dept = attrs.get('department') or getattr(self.instance, 'department', None)
         target_branch = self._auto_branch()
         request = self.context.get('request')
+
         if dept and request and dept.company_id != request.user.company_id:
             raise serializers.ValidationError('Отдел должен принадлежать вашей компании.')
+
         if dept and target_branch is not None and dept.branch_id not in (None, getattr(target_branch, "id", None)):
             raise serializers.ValidationError('Отдел принадлежит другому филиалу.')
+
         return attrs
 
 
@@ -167,12 +233,23 @@ class CashFlowSerializer(CompanyBranchReadOnlyMixin):
             'amount',
             'created_at',
             'status',
+            'source_cashbox_flow_id',
+            'source_business_operation_id',
         ]
-        read_only_fields = ['id', 'created_at', 'cashbox_name', 'company', 'branch']
+        read_only_fields = [
+            'id',
+            'created_at',
+            'cashbox_name',
+            'company',
+            'branch',
+        ]
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        # Кассы своей компании + «глобальные или текущего филиала»
+
+        # ограничиваем доступные кассы:
+        # - только из моей компании
+        # - только глобальные кассы (branch is NULL) или кассы моего филиала
         request = self.context.get('request')
         if request and getattr(request.user, 'company_id', None):
             target_branch = self._auto_branch()
@@ -195,8 +272,10 @@ class CashFlowSerializer(CompanyBranchReadOnlyMixin):
 
         if cashbox and request and cashbox.company_id != request.user.company_id:
             raise serializers.ValidationError('Касса должна принадлежать вашей компании.')
+
         if cashbox and target_branch is not None and cashbox.branch_id not in (None, getattr(target_branch, "id", None)):
             raise serializers.ValidationError('Касса принадлежит другому филиалу.')
+
         return attrs
 
 
@@ -216,15 +295,32 @@ class DepartmentSerializer(CompanyBranchReadOnlyMixin):
     class Meta:
         model = Department
         fields = [
-            'id', 'name', 'company', 'branch', 'color',
-            'employees', 'employees_data', 'cashbox',
-            'analytics', 'created_at'
+            'id',
+            'name',
+            'company',
+            'branch',
+            'color',
+            'employees',
+            'employees_data',
+            'cashbox',
+            'analytics',
+            'created_at',
         ]
-        read_only_fields = ['id', 'created_at', 'company', 'branch', 'cashbox', 'employees', 'analytics']
+        read_only_fields = [
+            'id',
+            'created_at',
+            'company',
+            'branch',
+            'cashbox',
+            'employees',
+            'analytics',
+        ]
 
     def _assign_employees_and_permissions(self, department, employees_data):
-        from apps.users.models import User  # локальный импорт, чтобы избежать циклов импорта
+        # локальный импорт, чтобы не ловить циклический импорт
+        from apps.users.models import User
 
+        # список разрешений, которые мы разрешаем обновлять пачкой
         permission_fields = [
             'can_view_dashboard', 'can_view_cashbox', 'can_view_departments',
             'can_view_orders', 'can_view_analytics', 'can_view_department_analytics',
@@ -232,7 +328,6 @@ class DepartmentSerializer(CompanyBranchReadOnlyMixin):
             'can_view_employees', 'can_view_clients',
             'can_view_brand_category', 'can_view_settings', 'can_view_sale',
 
-            # новые
             'can_view_building_work_process', 'can_view_building_objects', 'can_view_additional_services',
             'can_view_debts',
 
@@ -249,12 +344,12 @@ class DepartmentSerializer(CompanyBranchReadOnlyMixin):
             'can_view_cafe_purchasing', 'can_view_cafe_booking',
             'can_view_cafe_clients', 'can_view_cafe_tables',
 
-            # школа
+            # школа / CRM
             'can_view_school_students', 'can_view_school_groups',
             'can_view_school_lessons', 'can_view_school_teachers',
             'can_view_school_leads', 'can_view_school_invoices',
             'can_view_clients', 'can_view_client_requests', 'can_view_salary',
-            'can_view_sales', 'can_view_services', 'can_view_agent', 'can_view_catalog'
+            'can_view_sales', 'can_view_services', 'can_view_agent', 'can_view_catalog',
         ]
 
         for entry in employees_data:
@@ -264,16 +359,19 @@ class DepartmentSerializer(CompanyBranchReadOnlyMixin):
             except User.DoesNotExist:
                 continue
 
+            # привязка к отделу
             department.employees.add(user)
 
+            # массовое проставление флагов-доступов
             for field in permission_fields:
                 if field in entry:
                     setattr(user, field, entry[field])
+
             user.save()
 
     def create(self, validated_data):
         employees_data = validated_data.pop('employees_data', [])
-        obj = super().create(validated_data)  # company/branch выставит миксин
+        obj = super().create(validated_data)  # company/branch установит миксин
         if employees_data:
             self._assign_employees_and_permissions(obj, employees_data)
         return obj
@@ -282,6 +380,8 @@ class DepartmentSerializer(CompanyBranchReadOnlyMixin):
         employees_data = validated_data.pop('employees_data', None)
         obj = super().update(instance, validated_data)  # company/branch обновит миксин
 
+        # если employees_data пришёл вообще (включая пустой список) —
+        # мы пересобираем состав отдела
         if employees_data is not None:
             instance.employees.clear()
             if employees_data:
@@ -292,7 +392,7 @@ class DepartmentSerializer(CompanyBranchReadOnlyMixin):
         return obj.cashflow_summary()
 
 
-# ─── DEPARTMENT: аналитика ─────────────────────────────────
+# ─── DEPARTMENT: только аналитика ──────────────────────────
 class DepartmentAnalyticsSerializer(serializers.ModelSerializer):
     analytics = serializers.SerializerMethodField()
 
