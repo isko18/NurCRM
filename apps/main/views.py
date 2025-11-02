@@ -1054,7 +1054,93 @@ class ClientDealPayAPIView(APIView, CompanyBranchRestrictedMixin):
         data = ClientDealSerializer(deal, context={"request": request}).data
         return Response(data, status=status.HTTP_200_OK)
 
+class ClientDealUnpayAPIView(APIView, CompanyBranchRestrictedMixin):
+    """
+    POST /api/main/deals/<uuid:pk>/unpay/
+    (опционально nested)
+    POST /api/main/clients/<client_id>/deals/<uuid:pk>/unpay/
 
+    Тело запроса (опционально):
+    {
+      "installment_number": 2
+    }
+
+    Логика:
+      - только для сделок с kind == "debt"
+      - если передан installment_number:
+            откатываем оплату именно этого взноса
+        иначе:
+            откатываем ОДИН последний оплаченный взнос (с максимальным number)
+      - если взнос не был оплачен -> 400
+      - возвращаем обновлённую сделку
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    @transaction.atomic
+    def post(self, request, pk, *args, **kwargs):
+        company = self._company()
+        if not company:
+            return Response({"detail": "Нет компании у пользователя."}, status=status.HTTP_403_FORBIDDEN)
+
+        client_id = kwargs.get("client_id")
+
+        # 1. Определяем сделку в рамках компании и филиала юзера
+        deal_qs = ClientDeal.objects.filter(company=company, pk=pk)
+
+        # branch-ограничение такое же, как у pay()
+        if hasattr(ClientDeal, "branch"):
+            branch = self._auto_branch()
+            if branch is None:
+                # пользователь в "глобальном" контексте -> доступ только к глобальным сделкам
+                deal_qs = deal_qs.filter(branch__isnull=True)
+            else:
+                # пользователь с активным филиалом видит сделки своего филиала И глобальные
+                deal_qs = deal_qs.filter(Q(branch__isnull=True) | Q(branch=branch))
+
+        # если запрос в nested-виде /clients/<client_id>/deals/<pk>/unpay/
+        if client_id:
+            deal_qs = deal_qs.filter(client_id=client_id)
+
+        deal = get_object_or_404(deal_qs)
+
+        # 2. Только для долговых сделок
+        if deal.kind != ClientDeal.Kind.DEBT:
+            return Response(
+                {"detail": "Отмена оплаты доступна только для сделок типа 'debt'."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        # 3. Выбираем какой платёж откатываем
+        installment_number = request.data.get("installment_number")
+
+        if installment_number:
+            inst = get_object_or_404(DealInstallment, deal=deal, number=installment_number)
+            if not inst.paid_on:
+                return Response(
+                    {"detail": f"Взнос №{installment_number} и так не оплачен."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+        else:
+            # если номер не указан — берём последний оплаченный (самый поздний по номеру)
+            inst = (
+                deal.installments
+                .filter(paid_on__isnull=False)
+                .order_by("-number")
+                .first()
+            )
+            if not inst:
+                return Response(
+                    {"detail": "Нет оплаченных взносов для отмены."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+        # 4. Откатываем оплату
+        inst.paid_on = None
+        inst.save(update_fields=["paid_on"])
+
+        # 5. Возвращаем актуальное состояние сделки
+        data = ClientDealSerializer(deal, context={"request": request}).data
+        return Response(data, status=status.HTTP_200_OK)
 # ===========================
 #  Bids & Social Applications
 # ===========================
