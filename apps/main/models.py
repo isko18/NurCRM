@@ -606,7 +606,7 @@ class Product(models.Model):
     price = models.DecimalField(max_digits=10, decimal_places=2, default=0, verbose_name="Розничная цена")
 
     status = models.CharField("Статус", max_length=16, choices=Status.choices, db_index=True, blank=True, null=True)
-
+    stock = models.BooleanField(default=False, verbose_name="Акции", null=True, blank=True)
     item_make = models.ManyToManyField("ItemMake", blank=True, related_name="products", verbose_name="Единицы товара")
     date = models.DateTimeField(verbose_name="Дата", blank=True, null=True)
     created_at = models.DateTimeField(auto_now_add=True)

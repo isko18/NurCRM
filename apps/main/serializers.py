@@ -484,7 +484,7 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
             "item_make", "item_make_ids",
             "quantity", "price", "purchase_price",
             "status", "status_display",
-            "client", "client_name", "date",
+            "client", "client_name","stock", "date",
             "created_by", "created_by_name",
             "created_at", "updated_at",
             "images",
