@@ -473,6 +473,8 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
 
     # картинки товара (read-only список)
     images = ProductImageSerializer(many=True, read_only=True)
+    stock = serializers.BooleanField(required=False)
+
 
     class Meta:
         model = Product
@@ -642,7 +644,8 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
         for field in ("name", "barcode", "quantity", "price", "purchase_price", "client"):
             if field in validated_data:
                 setattr(instance, field, validated_data[field])
-
+        if "stock" in validated_data:
+            instance.stock = validated_data["stock"]
         # статус с нормализацией
         if "status" in validated_data:
             instance.status = self._normalize_status(validated_data["status"])
