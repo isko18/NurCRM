@@ -2,7 +2,7 @@ from decimal import Decimal, ROUND_HALF_UP
 from rest_framework import serializers
 
 from .models import (
-    Product, Cart, CartItem, Sale, SaleItem, MobileScannerToken
+    Product, Cart, CartItem, Sale, SaleItem, MobileScannerToken, ProductImage
 )
 
 # ---------- Helpers ----------
@@ -58,12 +58,29 @@ class CustomCartItemCreateSerializer(serializers.Serializer):
     price = MoneyField()
     quantity = serializers.IntegerField(min_value=1, required=False, default=1)
 
+class ProductImageReadSerializer(serializers.ModelSerializer):
+    image_url = serializers.SerializerMethodField()
 
+    class Meta:
+        model = ProductImage
+        fields = ("id", "image_url", "alt", "is_primary")
+
+    def get_image_url(self, obj):
+        if not obj.image:
+            return None
+        request = self.context.get("request")
+        url = obj.image.url
+        return request.build_absolute_uri(url) if request else url
+    
 class SaleItemSerializer(serializers.ModelSerializer):
     product_name = serializers.CharField(source="product.name", read_only=True)
     barcode = serializers.CharField(source="product.barcode", read_only=True)
     display_name = serializers.SerializerMethodField()  # ← имя товара или custom_name
-
+    primary_image_url = serializers.SerializerMethodField(read_only=True)
+    images = ProductImageReadSerializer(
+        many=True, read_only=True, source="product.images"
+    )
+    
     class Meta:
         model = CartItem
         fields = (
@@ -71,14 +88,27 @@ class SaleItemSerializer(serializers.ModelSerializer):
             "product_name", "barcode",
             "quantity", "unit_price",
             "display_name",
+            "primary_image_url",  # ← главная картинка
+            "images",   
         )
-        read_only_fields = ("id", "product_name", "barcode", "display_name")
+        read_only_fields = ("id", "product_name", "barcode", "display_name", "primary_image_url", "images")
 
     # ---- helpers ----
     def get_display_name(self, obj):
         # если product есть — берём его имя, иначе кастомное
         return _get_attr(_get_attr(obj, "product", None), "name", None) or (_get_attr(obj, "custom_name", "") or "")
 
+    def get_primary_image_url(self, obj):
+        prod = getattr(obj, "product", None)
+        if not prod:
+            return None
+        im = prod.images.filter(is_primary=True).first() or prod.images.first()
+        if not (im and im.image):
+            return None
+        request = self.context.get("request")
+        url = im.image.url
+        return request.build_absolute_uri(url) if request else url
+    
     def _validate_company_branch(self, cart: Cart, product: Product):
         """
         Совместимость компании и филиала между корзиной и товаром.
@@ -230,6 +260,7 @@ class SaleListSerializer(serializers.ModelSerializer):
         return (getattr(u, "get_full_name", lambda: "")()
                 or getattr(u, "email", None)
                 or getattr(u, "username", None))
+
 
 
 class SaleItemReadSerializer(serializers.ModelSerializer):
