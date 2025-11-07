@@ -77,6 +77,8 @@ class Service(models.Model):
     )
 
     name = models.CharField(max_length=128, verbose_name='Название')
+    time = models.CharField(max_length=128, verbose_name='Время', null=True, blank=True)
+    category = models.CharField(max_length=128, verbose_name='Категория', null=True, blank=True)
     price = models.DecimalField(max_digits=10, decimal_places=2, verbose_name='Цена')
     is_active = models.BooleanField(default=True, verbose_name='Активна')
 
@@ -214,12 +216,7 @@ class Appointment(models.Model):
         related_name="appointments",
         verbose_name="Мастер",
     )
-    service = models.ForeignKey(
-        Service,
-        on_delete=models.PROTECT,
-        related_name="appointments",
-        verbose_name="Услуга",
-    )
+    services = models.ManyToManyField(Service, related_name="appointments", verbose_name="Услуги", null=True, blank=True)
 
     start_at = models.DateTimeField(verbose_name="Начало")
     end_at = models.DateTimeField(verbose_name="Конец")
@@ -250,17 +247,22 @@ class Appointment(models.Model):
         return f"{self.client} → {self.service} ({self.start_at:%Y-%m-%d %H:%M})"
 
     def clean(self):
-        # пересечения по мастеру
+        # Проверка пересечения по мастеру (как раньше)
         if self.barber_id and self.start_at and self.end_at:
             overlaps = Appointment.objects.filter(
                 barber_id=self.barber_id,
                 status__in=[self.Status.BOOKED, self.Status.CONFIRMED],
-            ).exclude(id=self.id).filter(
-                start_at__lt=self.end_at,
-                end_at__gt=self.start_at,
-            )
+            ).exclude(id=self.id).filter(start_at__lt=self.end_at, end_at__gt=self.start_at)
             if overlaps.exists():
                 raise ValidationError("У мастера уже есть запись в это время.")
+
+        # Company и Branch согласованность как раньше
+        # Но теперь services — список
+        for service in self.services.all():
+            if service.company_id != self.company_id:
+                raise ValidationError({"services": "Услуга принадлежит другой компании."})
+            if self.branch_id and service.branch_id not in (None, self.branch_id):
+                raise ValidationError({"services": "Услуга принадлежит другому филиалу."})
 
         # согласованность по компании
         if self.company_id:

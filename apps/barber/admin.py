@@ -155,16 +155,21 @@ class ClientAdmin(CompanyScopedAdmin):
 # ===== Appointment =====
 @admin.register(Appointment)
 class AppointmentAdmin(CompanyScopedAdmin):
-    list_display = ("client", "barber", "service", "start_at", "end_at", "status", "branch", "company")
-    list_filter = ("status", "barber")  # branch/company для суперюзера добавятся из миксина
+    list_display = ("client", "barber", "get_services", "start_at", "end_at", "status", "branch", "company")
+    list_filter = ("status", "barber")  # branch/company добавятся для суперюзера
     search_fields = (
         "client__full_name", "client__phone",
         "barber__first_name", "barber__last_name", "barber__email",
-        "service__name", "comment",
+        "services__name", "comment",
     )
-    list_select_related = ("client", "barber", "service", "company", "branch")
-    autocomplete_fields = ("client", "barber", "service")
+    list_select_related = ("client", "barber", "company", "branch")
+    autocomplete_fields = ("client", "barber",)
+    filter_horizontal = ("services",)  # 👈 для удобного выбора нескольких услуг
 
+    def get_services(self, obj):
+        """Красиво выводит список услуг через запятую."""
+        return ", ".join(s.name for s in obj.services.all())
+    get_services.short_description = "Услуги"
 
 # ===== Folder =====
 @admin.register(Folder)

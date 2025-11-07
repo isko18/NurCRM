@@ -89,7 +89,7 @@ class ServiceSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
 
     class Meta:
         model = Service
-        fields = ["id", "company", "branch", "name", "price", "is_active"]
+        fields = ["id", "company", "branch", "name", "time", "category", "price", "is_active"]
         read_only_fields = ["id", "company", "branch"]
 
     def validate(self, attrs):
@@ -135,10 +135,10 @@ class AppointmentSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSeriali
     company = serializers.ReadOnlyField(source="company.id")
     branch = serializers.ReadOnlyField(source="branch.id")
 
-    # Для удобного отображения
     client_name = serializers.CharField(source="client.full_name", read_only=True)
     barber_name = serializers.SerializerMethodField()
-    service_name = serializers.CharField(source="service.name", read_only=True)
+    services = serializers.PrimaryKeyRelatedField(queryset=Service.objects.all(), many=True)
+    services_names = serializers.SlugRelatedField(source='services', many=True, read_only=True, slug_field='name')
 
     class Meta:
         model = Appointment
@@ -146,7 +146,7 @@ class AppointmentSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSeriali
             "id", "company", "branch",
             "client", "client_name",
             "barber", "barber_name",
-            "service", "service_name",
+            "services", "services_names",
             "start_at", "end_at", "status", "comment", "created_at",
         ]
         read_only_fields = ["id", "created_at", "company", "branch"]
@@ -158,57 +158,46 @@ class AppointmentSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSeriali
             return f"{obj.barber.first_name or ''} {obj.barber.last_name or ''}".strip()
         return obj.barber.email
 
+    def create(self, validated_data):
+        services = validated_data.pop("services", [])
+        instance = super().create(validated_data)
+        instance.services.set(services)
+        return instance
+
+    def update(self, instance, validated_data):
+        services = validated_data.pop("services", None)
+        instance = super().update(instance, validated_data)
+        if services is not None:
+            instance.services.set(services)
+        return instance
+
     def validate(self, attrs):
-        """
-        Проверки:
-        - client/barber/service из той же company
-        - client/service глобальные или из филиала пользователя
-        - дополнительные проверки из model.clean()
-        """
+        # Проверки те же, но нужно пройтись по списку services
         request = self.context.get("request")
         user_company = getattr(getattr(request, "user", None), "company", None) if request else None
         target_branch = self._auto_branch()
 
         client = attrs.get("client") or getattr(self.instance, "client", None)
         barber = attrs.get("barber") or getattr(self.instance, "barber", None)
-        service = attrs.get("service") or getattr(self.instance, "service", None)
+        services = attrs.get("services") or getattr(self.instance, "services", [])
 
-        # проверка компании
-        for obj, name in [(client, "client"), (barber, "barber"), (service, "service")]:
+        # company проверки
+        for obj, name in [(client, "client"), (barber, "barber")]:
             if obj and getattr(obj, "company_id", None) != getattr(user_company, "id", None):
                 raise serializers.ValidationError({name: "Объект не принадлежит вашей компании."})
+        for service in services:
+            if getattr(service, "company_id", None) != getattr(user_company, "id", None):
+                raise serializers.ValidationError({"services": "Одна из услуг принадлежит другой компании."})
 
-        # проверка филиала (клиент/услуга — глобальные или текущего филиала)
+        # branch проверки
         if target_branch is not None:
             if client and getattr(client, "branch_id", None) not in (None, target_branch.id):
                 raise serializers.ValidationError({"client": "Клиент принадлежит другому филиалу."})
-            if service and getattr(service, "branch_id", None) not in (None, target_branch.id):
-                raise serializers.ValidationError({"service": "Услуга принадлежит другому филиалу."})
-            # при необходимости: проверить доступ barber к target_branch (если у вас есть членства по филиалам)
-
-        # Собираем временный инстанс для model.clean()
-        temp_kwargs = {**attrs}
-        if user_company is not None:
-            temp_kwargs.setdefault("company", user_company)
-        temp_kwargs.setdefault("branch", target_branch)
-
-        instance = Appointment(**temp_kwargs)
-        if self.instance:
-            instance.id = self.instance.id
-
-        try:
-            instance.clean()
-        except DjangoValidationError as e:
-            if hasattr(e, "message_dict"):
-                raise serializers.ValidationError(e.message_dict)
-            if hasattr(e, "messages"):
-                raise serializers.ValidationError({"detail": e.messages})
-            raise serializers.ValidationError({"detail": str(e)})
-        except Exception as e:
-            raise serializers.ValidationError({"detail": str(e)})
+            for service in services:
+                if getattr(service, "branch_id", None) not in (None, target_branch.id):
+                    raise serializers.ValidationError({"services": f"Услуга '{service.name}' принадлежит другому филиалу."})
 
         return attrs
-
 
 # ===========================
 # Folder
