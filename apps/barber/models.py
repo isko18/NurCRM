@@ -5,6 +5,9 @@ from django.db import models
 from django.db.models import Q, F
 from django.utils import timezone
 from django.conf import settings
+from django.core.exceptions import ValidationError, ValidationError as DjangoValidationError
+from django.db.models.signals import m2m_changed
+from django.dispatch import receiver
 
 from apps.users.models import Company, Branch  # Branch берём из твоей users-модели
 
@@ -244,44 +247,53 @@ class Appointment(models.Model):
         ]
 
     def __str__(self):
-        return f"{self.client} → {self.service} ({self.start_at:%Y-%m-%d %H:%M})"
+        try:
+            names = ", ".join(self.services.values_list("name", flat=True))
+        except Exception:
+            names = ""
+        return f"{self.client} → {names or '—'} ({self.start_at:%Y-%m-%d %H:%M})"
 
     def clean(self):
-        # Проверка пересечения по мастеру (как раньше)
+        # 1) Пересечения по мастеру
         if self.barber_id and self.start_at and self.end_at:
-            overlaps = Appointment.objects.filter(
-                barber_id=self.barber_id,
-                status__in=[self.Status.BOOKED, self.Status.CONFIRMED],
-            ).exclude(id=self.id).filter(start_at__lt=self.end_at, end_at__gt=self.start_at)
+            overlaps = (
+                Appointment.objects.filter(
+                    barber_id=self.barber_id,
+                    status__in=[self.Status.BOOKED, self.Status.CONFIRMED],
+                )
+                .exclude(id=self.id)
+                .filter(start_at__lt=self.end_at, end_at__gt=self.start_at)
+            )
             if overlaps.exists():
                 raise ValidationError("У мастера уже есть запись в это время.")
 
-        # Company и Branch согласованность как раньше
-        # Но теперь services — список
-        for service in self.services.all():
-            if service.company_id != self.company_id:
-                raise ValidationError({"services": "Услуга принадлежит другой компании."})
-            if self.branch_id and service.branch_id not in (None, self.branch_id):
-                raise ValidationError({"services": "Услуга принадлежит другому филиалу."})
-
-        # согласованность по компании
+        # 2) Согласованность по компании (без services здесь)
         if self.company_id:
             if self.client and self.client.company_id != self.company_id:
                 raise ValidationError({"client": "Клиент принадлежит другой компании."})
             if self.barber and getattr(self.barber, "company_id", None) != self.company_id:
                 raise ValidationError({"barber": "Мастер принадлежит другой компании."})
-            if self.service and self.service.company_id != self.company_id:
-                raise ValidationError({"service": "Услуга принадлежит другой компании."})
 
-        # согласованность по филиалу (если задан)
+        # 3) Согласованность по филиалу (без services здесь)
         if self.branch_id:
-            # клиент может быть глобальным (NULL) или того же филиала
             if self.client and self.client.branch_id not in (None, self.branch_id):
                 raise ValidationError({"client": "Клиент принадлежит другому филиалу."})
-            # услуга — глобальная или того же филиала
-            if self.service and self.service.branch_id not in (None, self.branch_id):
-                raise ValidationError({"service": "Услуга принадлежит другому филиалу."})
-            # при наличии модели членства мастера в филиале — проверь её здесь
+        # ВАЖНО: услуги НЕ проверяем здесь — M2M ещё не проставлен при create()
+
+# Глобальный валидатор M2M: проверяет услуги при добавлении/замене
+@receiver(m2m_changed, sender=Appointment.services.through)
+def validate_appointment_services(sender, instance: Appointment, action, pk_set, **kwargs):
+    if action not in ('pre_add', 'pre_set') or not pk_set:
+        return
+    svcs = Service.objects.filter(pk__in=pk_set)
+
+    # company
+    if any(s.company_id != instance.company_id for s in svcs):
+        raise DjangoValidationError({'services': 'Услуга принадлежит другой компании.'})
+
+    # branch
+    if instance.branch_id and any(s.branch_id not in (None, instance.branch_id) for s in svcs):
+        raise DjangoValidationError({'services': 'Услуга принадлежит другому филиалу.'})
 
     def save(self, *args, **kwargs):
         self.full_clean()
