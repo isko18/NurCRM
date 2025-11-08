@@ -4,7 +4,8 @@ from django.core.exceptions import ValidationError as DjangoValidationError
 
 from .models import BarberProfile, Service, Client, Appointment, Document, Folder
 
-
+from datetime import timedelta
+import re
 # ===========================
 # Общий миксин: company/branch (branch авто из пользователя)
 # ===========================
@@ -211,6 +212,45 @@ class AppointmentSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSeriali
             for service in services:
                 if getattr(service, "branch_id", None) not in (None, target_branch.id):
                     raise serializers.ValidationError({"services": f"Услуга '{service.name}' принадлежит другому филиалу."})
+
+        return attrs
+    
+    def _parse_minutes(self, s: str) -> int:
+        """Парсим Service.time: '30', '00:30', '1:15', '30m', '1h', '1h30m' -> минуты."""
+        if not s:
+            return 0
+        s = s.strip()
+        try:
+            return int(s)  # "30"
+        except ValueError:
+            pass
+        if ":" in s:  # "HH:MM" или "MM:SS" — используем как часы:минуты
+            h, m = s.split(":", 1)
+            return int(h) * 60 + int(m)
+        m = re.match(r'(?i)^(?:(\d+)\s*h)?\s*(?:(\d+)\s*m)?$', s)
+        if m:
+            return (int(m.group(1) or 0) * 60) + int(m.group(2) or 0)
+        return 0
+
+    def validate(self, attrs):
+        attrs = super().validate(attrs)
+
+        start_at = attrs.get("start_at") or getattr(self.instance, "start_at", None)
+        end_at   = attrs.get("end_at")   or getattr(self.instance, "end_at", None)
+        services = attrs.get("services") or (self.instance.services.all() if self.instance else [])
+
+        # Если конец не передан — попробуем вычислить из услуг
+        if start_at and not end_at and services:
+            total = 0
+            for s in services:
+                total += self._parse_minutes(getattr(s, "time", None))
+            if total > 0:
+                attrs["end_at"] = start_at + timedelta(minutes=total)
+                end_at = attrs["end_at"]
+
+        # Строгая проверка: end_at > start_at
+        if start_at and end_at and not (end_at > start_at):
+            raise serializers.ValidationError({"end_at": "Должно быть строго позже start_at."})
 
         return attrs
 
