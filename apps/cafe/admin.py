@@ -2,19 +2,28 @@
 from django.contrib import admin
 from django.db.models import Q
 from django.forms.models import BaseInlineFormSet
+from django.utils import timezone
 
 from .models import (
     CafeClient, Order, OrderItem, Table, MenuItem,
     OrderHistory, OrderItemHistory,
     Zone,  # для фильтров по связям
+    KitchenTask, NotificationCafe,
 )
 
+
+# -----------------------------
+# Zone
+# -----------------------------
 @admin.register(Zone)
 class ZoneAdmin(admin.ModelAdmin):
-    list_display  = ("title", "company")   # если у Zone есть branch, можно: ("title", "company", "branch")
-    list_filter   = ("company",)           # и добавить "branch" при наличии поля
+    list_display  = ("title", "company", "branch")
+    list_filter   = ("company", "branch")
     search_fields = ("title",)
-    ordering      = ("company", "title")
+    ordering      = ("company", "branch", "title")
+    list_select_related = ("company", "branch")
+
+
 # -----------------------------
 # Inline заказа на странице клиента
 # -----------------------------
@@ -82,6 +91,18 @@ class CafeClientAdmin(admin.ModelAdmin):
 
 
 # -----------------------------
+# Inline задач кухни на странице позиции заказа (read-only)
+# -----------------------------
+class KitchenTaskInline(admin.TabularInline):
+    model = KitchenTask
+    extra = 0
+    can_delete = False
+    fields = ("status", "unit_index", "cook", "waiter", "created_at", "started_at", "finished_at")
+    readonly_fields = fields
+    show_change_link = True
+
+
+# -----------------------------
 # Inline позиций в заказе
 # -----------------------------
 class OrderItemInline(admin.TabularInline):
@@ -90,6 +111,7 @@ class OrderItemInline(admin.TabularInline):
     autocomplete_fields = ("menu_item",)
     fields = ("menu_item", "quantity")
     # company у OrderItem ставится автоматически в save()
+    inlines = []  # не вкладываем KitchenTaskInline внутрь inline-of-inline (не поддерживается админкой)
 
     def formfield_for_foreignkey(self, db_field, request, **kwargs):
         ff = super().formfield_for_foreignkey(db_field, request, **kwargs)
@@ -176,6 +198,7 @@ class OrderItemAdmin(admin.ModelAdmin):
     # текстовый поиск — по связанным текстовым полям
     search_fields = ("order__client__name", "order__client__phone", "menu_item__title")
     list_select_related = ("order", "menu_item")
+    inlines = [KitchenTaskInline]
 
 
 # -----------------------------
@@ -218,3 +241,132 @@ class OrderHistoryAdmin(admin.ModelAdmin):
     ordering = ("-created_at",)
     inlines = [OrderItemHistoryInline]
     readonly_fields = [f.name for f in OrderHistory._meta.fields]
+
+
+# -----------------------------
+# KitchenTask (повар)
+# -----------------------------
+@admin.register(KitchenTask)
+class KitchenTaskAdmin(admin.ModelAdmin):
+    list_display = (
+        "menu_item", "order_display", "table_number",
+        "company", "branch", "status", "unit_index",
+        "cook", "waiter", "created_at", "started_at", "finished_at",
+    )
+    list_filter = ("company", "branch", "status", "cook", "waiter", "created_at", "finished_at")
+    search_fields = (
+        "menu_item__title",
+        "order__client__name", "order__client__phone",
+        "waiter__email", "cook__email",
+    )
+    ordering = ("-created_at",)
+    list_select_related = ("company", "branch", "order__table", "menu_item", "cook", "waiter")
+    readonly_fields = ("created_at", "started_at", "finished_at")
+    autocomplete_fields = ("order", "order_item", "menu_item", "cook", "waiter")
+
+    def order_display(self, obj):
+        return f"{str(obj.order_id)[:8]}"
+    order_display.short_description = "Order"
+
+    def table_number(self, obj):
+        try:
+            return obj.order.table.number
+        except Exception:
+            return "—"
+    table_number.short_description = "Стол"
+
+    # экшены
+    actions = ["action_claim", "action_mark_ready"]
+
+    def action_claim(self, request, queryset):
+        """
+        Взять задачи в работу: только PENDING и без cook.
+        cook = текущий пользователь; started_at = now
+        """
+        now = timezone.now()
+        qs = queryset.select_for_update().filter(status=KitchenTask.Status.PENDING, cook__isnull=True)
+        updated = 0
+        for task in qs:
+            task.status = KitchenTask.Status.IN_PROGRESS
+            task.cook = request.user
+            task.started_at = now
+            task.save(update_fields=["status", "cook", "started_at"])
+            updated += 1
+        self.message_user(request, f"В работу взято задач: {updated}")
+    action_claim.short_description = "Взять в работу"
+
+    def action_mark_ready(self, request, queryset):
+        """
+        Отметить готовыми все выбранные задачи, которые в работе у текущего пользователя.
+        Создать уведомления официанту.
+        """
+        now = timezone.now()
+        qs = queryset.select_related("waiter", "order__table", "menu_item")\
+                     .filter(status=KitchenTask.Status.IN_PROGRESS, cook=request.user)
+
+        notifications = []
+        ready_count = 0
+        for task in qs:
+            task.status = KitchenTask.Status.READY
+            task.finished_at = now
+            task.save(update_fields=["status", "finished_at"])
+            ready_count += 1
+
+            if task.waiter_id:
+                notifications.append(NotificationCafe(
+                    company=task.company,
+                    branch=task.branch,
+                    recipient=task.waiter,
+                    type='kitchen_ready',
+                    message=f'Готово: {task.menu_item.title} (стол {task.order.table.number})',
+                    payload={
+                        "task_id": str(task.id),
+                        "order_id": str(task.order_id),
+                        "table": task.order.table.number,
+                        "menu_item": task.menu_item.title,
+                        "unit_index": task.unit_index,
+                    }
+                ))
+        if notifications:
+            NotificationCafe.objects.bulk_create(notifications)
+        self.message_user(request, f"Отмечено готовыми: {ready_count}")
+    action_mark_ready.short_description = "Отметить готовым"
+
+
+    def save_model(self, request, obj, form, change):
+        """
+        Подстрахуемся: если вручную создают задачу в админке —
+        авто-проставим company/branch по заказу.
+        И вызовем full_clean(), чтобы сработали проверки согласованности.
+        """
+        if obj.order_id and not obj.company_id:
+            obj.company = obj.order.company
+        if obj.order_id and obj.branch_id is None:
+            obj.branch = obj.order.branch
+        obj.full_clean()
+        super().save_model(request, obj, form, change)
+
+
+# -----------------------------
+# NotificationCafe
+# -----------------------------
+@admin.register(NotificationCafe)
+class NotificationCafeAdmin(admin.ModelAdmin):
+    list_display = ("short_message", "recipient", "company", "branch", "type", "is_read", "created_at", "read_at")
+    list_filter = ("company", "branch", "type", "is_read", "created_at")
+    search_fields = ("message", "recipient__email")
+    ordering = ("-created_at",)
+    readonly_fields = ("created_at", "read_at")
+    autocomplete_fields = ("recipient",)
+
+    def short_message(self, obj):
+        return (obj.message[:60] + "…") if obj.message and len(obj.message) > 60 else obj.message
+    short_message.short_description = "Сообщение"
+
+    actions = ["mark_as_read"]
+
+    def mark_as_read(self, request, queryset):
+        now = timezone.now()
+        updated = queryset.filter(is_read=False).update(is_read=True, read_at=now)
+        self.message_user(request, f"Помечено прочитанным: {updated}")
+    mark_as_read.short_description = "Пометить как прочитанные"

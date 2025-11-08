@@ -1,15 +1,109 @@
 from django.db import models
 from django.conf import settings
 from django.core.exceptions import ValidationError
-from django.db.models import Q, F
-from django.db.models.signals import pre_delete
+from django.db.models import Q
+from django.db.models.signals import pre_delete, post_save
 from django.dispatch import receiver
 from django.utils import timezone
 from django.core.files.base import ContentFile
-from PIL import Image
+from django.core.validators import MinValueValidator
+from PIL import Image, ImageOps
 import io, uuid
 
 from apps.users.models import Company, Branch
+
+
+# ==========================
+# Задача кухни + уведомления
+# ==========================
+class KitchenTask(models.Model):
+    class Status(models.TextChoices):
+        PENDING = 'pending', 'В ожидании'
+        IN_PROGRESS = 'in_progress', 'В работе'
+        READY = 'ready', 'Готово'
+        CANCELLED = 'cancelled', 'Отменено'
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+
+    company = models.ForeignKey(
+        Company, on_delete=models.CASCADE, related_name='kitchen_tasks', verbose_name='Компания'
+    )
+    branch = models.ForeignKey(
+        Branch, on_delete=models.CASCADE, related_name='kitchen_tasks',
+        verbose_name='Филиал', null=True, blank=True, db_index=True
+    )
+
+    order = models.ForeignKey('Order', on_delete=models.CASCADE, related_name='kitchen_tasks', verbose_name='Заказ')
+    order_item = models.ForeignKey('OrderItem', on_delete=models.CASCADE, related_name='kitchen_tasks', verbose_name='Позиция заказа')
+    menu_item = models.ForeignKey('MenuItem', on_delete=models.PROTECT, related_name='kitchen_tasks', verbose_name='Позиция меню')
+
+    waiter = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL,
+        null=True, blank=True, related_name='kitchen_waiter_tasks', verbose_name='Официант (ref)'
+    )
+    cook = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL,
+        null=True, blank=True, related_name='kitchen_cook_tasks', verbose_name='Повар'
+    )
+
+    # если у OrderItem.quantity > 1 — создаём столько задач, нумеруем:
+    unit_index = models.PositiveSmallIntegerField('Номер порции', default=1, validators=[MinValueValidator(1)])
+
+    status = models.CharField('Статус', max_length=16, choices=Status.choices, default=Status.PENDING, db_index=True)
+    created_at = models.DateTimeField('Создано', auto_now_add=True)
+    started_at = models.DateTimeField('Взято в работу', null=True, blank=True)
+    finished_at = models.DateTimeField('Готово', null=True, blank=True)
+
+    class Meta:
+        verbose_name = 'Задача кухни'
+        verbose_name_plural = 'Задачи кухни'
+        constraints = [
+            models.UniqueConstraint(fields=['order_item', 'unit_index'], name='uniq_kitchen_task_per_unit'),
+        ]
+        indexes = [
+            models.Index(fields=['company', 'branch', 'status', 'created_at']),
+            models.Index(fields=['cook', 'status']),
+            models.Index(fields=['waiter']),
+            models.Index(fields=['order']),
+        ]
+
+    def clean(self):
+        # согласованность принадлежности
+        if (
+            self.order.company_id != self.company_id
+            or self.order_item.company_id != self.company_id
+            or self.menu_item.company_id != self.company_id
+        ):
+            raise ValidationError('Несогласованные company у KitchenTask.')
+        if (self.order.branch_id or None) != (self.branch_id or None):
+            raise ValidationError('Несогласованный branch у KitchenTask.')
+        if self.order_item.order_id != self.order_id or self.order_item.menu_item_id != self.menu_item_id:
+            raise ValidationError('order_item не соответствует order/menu_item.')
+
+    def __str__(self):
+        return f'[{self.get_status_display()}] {self.menu_item.title} (стол {self.order.table.number})'
+
+
+class NotificationCafe(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    company = models.ForeignKey(Company, on_delete=models.CASCADE, related_name='notifications')
+    branch = models.ForeignKey(Branch, on_delete=models.SET_NULL, null=True, blank=True, related_name='notifications')
+    recipient = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='notifications')
+    type = models.CharField(max_length=64, default='kitchen_ready')
+    message = models.CharField(max_length=255)
+    payload = models.JSONField(default=dict, blank=True)
+    is_read = models.BooleanField(default=False)
+    created_at = models.DateTimeField(auto_now_add=True)
+    read_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        indexes = [
+            models.Index(fields=['recipient', 'is_read', 'created_at']),
+            models.Index(fields=['company', 'created_at']),
+        ]
+
+    def __str__(self):
+        return f'Notify -> {self.recipient_id}: {self.message}'
 
 
 # ==========================
@@ -22,7 +116,7 @@ class CafeClient(models.Model):
         related_name='cafe_clients', related_query_name='cafe_client',
         verbose_name='Компания',
     )
-    # NEW: глобальный или филиальный клиент
+    # глобальный или филиальный клиент
     branch = models.ForeignKey(
         Branch, on_delete=models.CASCADE,
         related_name='cafe_clients', verbose_name='Филиал',
@@ -37,17 +131,17 @@ class CafeClient(models.Model):
         verbose_name = 'Клиент кафе'
         verbose_name_plural = 'Клиенты кафе'
         constraints = [
-            # телефон уникален в рамках филиала
+            # телефон уникален в рамках филиала (кроме пустых значений)
             models.UniqueConstraint(
                 fields=('branch', 'phone'),
                 name='uniq_cafeclient_phone_per_branch',
-                condition=Q(branch__isnull=False),
+                condition=Q(branch__isnull=False) & ~Q(phone=''),
             ),
-            # и отдельно — глобально в рамках компании
+            # и отдельно — глобально в рамках компании (кроме пустых значений)
             models.UniqueConstraint(
                 fields=('company', 'phone'),
                 name='uniq_cafeclient_phone_global_per_company',
-                condition=Q(branch__isnull=True),
+                condition=Q(branch__isnull=True) & ~Q(phone=''),
             ),
         ]
         indexes = [
@@ -72,7 +166,6 @@ class Zone(models.Model):
     company = models.ForeignKey(
         Company, on_delete=models.CASCADE, related_name='zones', verbose_name='Компания'
     )
-    # NEW
     branch = models.ForeignKey(
         Branch, on_delete=models.CASCADE, related_name='zones',
         verbose_name='Филиал', null=True, blank=True, db_index=True
@@ -116,7 +209,6 @@ class Table(models.Model):
     company = models.ForeignKey(
         Company, on_delete=models.CASCADE, related_name='tables', verbose_name='Компания'
     )
-    # NEW
     branch = models.ForeignKey(
         Branch, on_delete=models.CASCADE, related_name='tables',
         verbose_name='Филиал', null=True, blank=True, db_index=True
@@ -125,7 +217,7 @@ class Table(models.Model):
         Zone, on_delete=models.CASCADE, related_name="tables", verbose_name="Зона"
     )
     number = models.IntegerField(verbose_name="Номер стола")
-    places = models.IntegerField(verbose_name="Кол-во мест")
+    places = models.PositiveSmallIntegerField(verbose_name="Кол-во мест", validators=[MinValueValidator(1)])
     status = models.CharField(
         max_length=16, choices=Status.choices, default=Status.FREE, verbose_name='Статус'
     )
@@ -134,9 +226,7 @@ class Table(models.Model):
         verbose_name = 'Стол'
         verbose_name_plural = 'Столы'
         constraints = [
-            # номер уникален в зоне
             models.UniqueConstraint(fields=('zone', 'number'), name='uniq_table_number_per_zone'),
-            # дополнительно: уникальность номера в филиале/глобально
             models.UniqueConstraint(
                 fields=('branch', 'number'),
                 name='uniq_table_number_per_branch',
@@ -180,7 +270,6 @@ class Booking(models.Model):
     company = models.ForeignKey(
         Company, on_delete=models.CASCADE, related_name='bookings', verbose_name='Компания'
     )
-    # NEW
     branch = models.ForeignKey(
         Branch, on_delete=models.CASCADE, related_name='bookings',
         verbose_name='Филиал', null=True, blank=True, db_index=True
@@ -190,7 +279,7 @@ class Booking(models.Model):
     phone = models.CharField('Телефон', max_length=32, blank=True)
     date = models.DateField('Дата')
     time = models.TimeField('Время')
-    guests = models.PositiveSmallIntegerField('Гостей', default=0)
+    guests = models.PositiveSmallIntegerField('Гостей', default=0, validators=[MinValueValidator(1)])
     table = models.ForeignKey(
         Table, on_delete=models.PROTECT,
         related_name='bookings', verbose_name='Стол'
@@ -206,11 +295,7 @@ class Booking(models.Model):
         verbose_name_plural = 'Брони'
         ordering = ['-date', '-time']
         constraints = [
-            # слот уникален для стола (company не нужен, table уникален сам по себе)
-            models.UniqueConstraint(
-                fields=['table', 'date', 'time'],
-                name='uniq_booking_table_slot',
-            ),
+            models.UniqueConstraint(fields=['table', 'date', 'time'], name='uniq_booking_table_slot'),
         ]
         indexes = [
             models.Index(fields=['company', 'date', 'time']),
@@ -220,12 +305,9 @@ class Booking(models.Model):
         ]
 
     def clean(self):
-        # company согласованность
         if self.company_id:
             if self.table and self.table.company_id != self.company_id:
                 raise ValidationError({'table': 'Стол принадлежит другой компании.'})
-
-        # branch согласованность
         if self.branch_id:
             if self.table and self.table.branch_id not in (None, self.branch_id):
                 raise ValidationError({'table': 'Стол принадлежит другому филиалу.'})
@@ -238,7 +320,8 @@ class Booking(models.Model):
     @property
     def start_at(self):
         from datetime import datetime
-        return datetime.combine(self.date, self.time)
+        dt = datetime.combine(self.date, self.time)
+        return timezone.make_aware(dt, timezone.get_current_timezone())
 
 
 # ==========================
@@ -249,7 +332,6 @@ class Warehouse(models.Model):
     company = models.ForeignKey(
         Company, on_delete=models.CASCADE, related_name='cafe_warehouse', verbose_name='Компания'
     )
-    # NEW
     branch = models.ForeignKey(
         Branch, on_delete=models.CASCADE, related_name='cafe_warehouse',
         verbose_name='Филиал', null=True, blank=True, db_index=True
@@ -292,7 +374,6 @@ class Purchase(models.Model):
     company = models.ForeignKey(
         Company, on_delete=models.CASCADE, related_name='cafe_purchases', verbose_name='Компания'
     )
-    # NEW
     branch = models.ForeignKey(
         Branch, on_delete=models.CASCADE, related_name='cafe_purchases',
         verbose_name='Филиал', null=True, blank=True, db_index=True
@@ -322,7 +403,6 @@ class Category(models.Model):
     company = models.ForeignKey(
         Company, on_delete=models.CASCADE, related_name="menu_categories", verbose_name="Компания"
     )
-    # NEW
     branch = models.ForeignKey(
         Branch, on_delete=models.CASCADE, related_name='menu_categories',
         verbose_name='Филиал', null=True, blank=True, db_index=True
@@ -344,15 +424,7 @@ class Category(models.Model):
                 condition=Q(branch__isnull=True),
             ),
         ]
-        indexes = [
-            models.Index(fields=['company', 'title']),
-            models.Index(fields=['company', 'branch', 'title']),
-        ]
-
-    def clean(self):
-        if self.branch_id and self.branch.company_id != self.company_id:
-            raise ValidationError({'branch': 'Филиал принадлежит другой компании.'})
-
+    ...
     def __str__(self):
         return self.title
 
@@ -363,7 +435,6 @@ class MenuItem(models.Model):
         Company, on_delete=models.CASCADE,
         related_name="menu_items", verbose_name="Компания"
     )
-    # NEW
     branch = models.ForeignKey(
         Branch, on_delete=models.CASCADE, related_name='menu_items',
         verbose_name='Филиал', null=True, blank=True, db_index=True
@@ -415,16 +486,14 @@ class MenuItem(models.Model):
         return f"{self.title} ({self.category})"
 
     def save(self, *args, **kwargs):
-        """
-        При сохранении автоматически конвертируем картинку в WebP.
-        """
+        """Автоконвертация изображения в WebP с учётом EXIF-ориентации."""
         if self.image and hasattr(self.image, 'file'):
             img = Image.open(self.image)
-            img = img.convert("RGB")
-            filename = f"{uuid.uuid4().hex}.webp"
+            img = ImageOps.exif_transpose(img).convert("RGB")
             buffer = io.BytesIO()
-            img.save(buffer, format="WEBP", quality=80)
+            img.save(buffer, format="WEBP", quality=80, method=6)
             buffer.seek(0)
+            filename = f"{uuid.uuid4().hex}.webp"
             self.image.save(filename, ContentFile(buffer.read()), save=False)
         super().save(*args, **kwargs)
 
@@ -465,7 +534,6 @@ class Order(models.Model):
     company = models.ForeignKey(
         Company, on_delete=models.CASCADE, related_name='cafe_orders', verbose_name='Компания'
     )
-    # NEW
     branch = models.ForeignKey(
         Branch, on_delete=models.CASCADE, related_name='cafe_orders',
         verbose_name='Филиал', null=True, blank=True, db_index=True
@@ -481,7 +549,7 @@ class Order(models.Model):
         settings.AUTH_USER_MODEL, on_delete=models.SET_NULL,
         null=True, blank=True, related_name='served_orders', verbose_name='Официант'
     )
-    guests = models.PositiveIntegerField('Количество гостей', default=1)
+    guests = models.PositiveIntegerField('Количество гостей', default=1, validators=[MinValueValidator(1)])
     created_at = models.DateTimeField('Создано', auto_now_add=True)
 
     class Meta:
@@ -498,13 +566,11 @@ class Order(models.Model):
         return f'Order {str(self.id)[:8]} — {self.table}'
 
     def clean(self):
-        # согласованность компании
         if self.company_id:
             if self.table and self.table.company_id != self.company_id:
                 raise ValidationError({'table': 'Стол принадлежит другой компании.'})
             if self.client and self.client.company_id != self.company_id:
                 raise ValidationError({'client': 'Клиент принадлежит другой компании.'})
-        # согласованность филиала
         if self.branch_id:
             if self.table and self.table.branch_id not in (None, self.branch_id):
                 raise ValidationError({'table': 'Стол другого филиала.'})
@@ -514,7 +580,6 @@ class Order(models.Model):
 
 class OrderItem(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    # company синхронизируется с заказом в save()
     company = models.ForeignKey(
         Company, on_delete=models.CASCADE,
         related_name='cafe_order_items', verbose_name='Компания', editable=False,
@@ -525,7 +590,7 @@ class OrderItem(models.Model):
     menu_item = models.ForeignKey(
         'MenuItem', on_delete=models.PROTECT, related_name='order_items', verbose_name='Позиция меню'
     )
-    quantity = models.PositiveIntegerField('Кол-во', default=1)
+    quantity = models.PositiveIntegerField('Кол-во', default=1, validators=[MinValueValidator(1)])
 
     class Meta:
         verbose_name = 'Позиция заказа'
@@ -539,7 +604,6 @@ class OrderItem(models.Model):
         ]
 
     def clean(self):
-        # согласованность company/branch с заказом
         if self.order and self.menu_item:
             if self.order.company_id != self.menu_item.company_id:
                 raise ValidationError({'menu_item': 'Позиция меню из другой компании.'})
@@ -565,7 +629,6 @@ class OrderHistory(models.Model):
     company = models.ForeignKey(
         Company, on_delete=models.CASCADE, related_name='cafe_order_history', verbose_name='Компания'
     )
-    # NEW: сохраняем филиал
     branch = models.ForeignKey(
         Branch, on_delete=models.SET_NULL,
         related_name='cafe_order_history', verbose_name='Филиал (ref)',
@@ -628,11 +691,10 @@ class OrderItemHistory(models.Model):
 
 
 # ==========================
-# Сигнал: архивируем заказ перед удалением
+# Сигналы: архив + синхронизация задач кухни
 # ==========================
 @receiver(pre_delete, sender=Order)
 def archive_order_before_delete(sender, instance: Order, **kwargs):
-    # метка официанта
     waiter_label = ''
     if instance.waiter_id:
         full = getattr(instance.waiter, 'get_full_name', lambda: '')() or ''
@@ -641,7 +703,7 @@ def archive_order_before_delete(sender, instance: Order, **kwargs):
 
     oh = OrderHistory.objects.create(
         company=instance.company,
-        branch=instance.branch,  # NEW
+        branch=instance.branch,
         client=instance.client,
         original_order_id=instance.id,
         table=instance.table,
@@ -653,7 +715,6 @@ def archive_order_before_delete(sender, instance: Order, **kwargs):
         archived_at=timezone.now(),
     )
 
-    # позиции архива (снапшот названия и цены)
     items = []
     for it in instance.items.select_related('menu_item'):
         items.append(OrderItemHistory(
@@ -665,3 +726,39 @@ def archive_order_before_delete(sender, instance: Order, **kwargs):
         ))
     if items:
         OrderItemHistory.objects.bulk_create(items)
+
+
+@receiver(post_save, sender=OrderItem)
+def ensure_kitchen_tasks_for_order_item(sender, instance: 'OrderItem', created, **kwargs):
+    """
+    Гарантируем наличие quantity штук KitchenTask на позицию заказа.
+    - При увеличении quantity — досоздаём недостающие.
+    - При уменьшении quantity — удаляем лишние задачи в статусе PENDING (уже начатые/готовые не трогаем).
+    """
+    current = KitchenTask.objects.filter(order_item=instance).count()
+    need = instance.quantity or 0
+
+    # досоздать
+    if need > current:
+        to_create = []
+        for idx in range(current + 1, need + 1):
+            to_create.append(KitchenTask(
+                company=instance.company,
+                branch=instance.order.branch,
+                order=instance.order,
+                order_item=instance,
+                menu_item=instance.menu_item,
+                waiter=instance.order.waiter,
+                unit_index=idx,
+            ))
+        if to_create:
+            # на случай гонок оставим ignore_conflicts: True (работает на PostgreSQL/MySQL)
+            KitchenTask.objects.bulk_create(to_create, ignore_conflicts=True)
+
+    # удалить лишние невзятые задачи, если quantity уменьшили
+    elif need < current:
+        KitchenTask.objects.filter(
+            order_item=instance,
+            unit_index__gt=need,
+            status=KitchenTask.Status.PENDING,
+        ).delete()

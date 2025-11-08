@@ -1,9 +1,10 @@
 # cafe/urls.py
 from django.urls import path
+
 from .views import (
     # Clients + nested client orders
     CafeClientListCreateView, CafeClientRetrieveUpdateDestroyView, ClientOrderListCreateView,
-    ClientOrderHistoryListView, OrderHistoryListView,  # ← история
+    ClientOrderHistoryListView, OrderHistoryListView,
 
     # Zones / Tables / Bookings / Warehouse / Purchases / Categories / Menu Items / Ingredients / Orders / Order Items
     ZoneListCreateView, ZoneRetrieveUpdateDestroyView,
@@ -16,6 +17,11 @@ from .views import (
     IngredientListCreateView, IngredientRetrieveUpdateDestroyView,
     OrderListCreateView, OrderRetrieveUpdateDestroyView,
     OrderItemListCreateView, OrderItemRetrieveUpdateDestroyView,
+
+    # Kitchen / notifications / analytics
+    KitchenTaskListView, KitchenTaskClaimView, KitchenTaskReadyView, KitchenTaskMonitorView,
+    KitchenAnalyticsByCookView, KitchenAnalyticsByWaiterView,
+    NotificationListView,
 )
 
 app_name = "cafe"
@@ -70,4 +76,21 @@ urlpatterns = [
     # === Order items ===
     path("order-items/", OrderItemListCreateView.as_view(), name="orderitem-list"),
     path("order-items/<uuid:pk>/", OrderItemRetrieveUpdateDestroyView.as_view(), name="orderitem-detail"),
+
+    # ==================== Kitchen (повар) ====================
+    # Лента задач (pending + in_progress; ?mine=1, ?status=ready и т.п.)
+    path("kitchen/tasks/", KitchenTaskListView.as_view(), name="kitchen-task-list"),
+    # Взять задачу в работу
+    path("kitchen/tasks/<uuid:pk>/claim/", KitchenTaskClaimView.as_view(), name="kitchen-task-claim"),
+    # Отметить как готово (уведомляет официанта)
+    path("kitchen/tasks/<uuid:pk>/ready/", KitchenTaskReadyView.as_view(), name="kitchen-task-ready"),
+    # Мониторинг задач для владельца/админа
+    path("kitchen/tasks/monitor/", KitchenTaskMonitorView.as_view(), name="kitchen-task-monitor"),
+
+    # === Analytics ===
+    path("kitchen/analytics/cooks/", KitchenAnalyticsByCookView.as_view(), name="kitchen-analytics-cooks"),
+    path("kitchen/analytics/waiters/", KitchenAnalyticsByWaiterView.as_view(), name="kitchen-analytics-waiters"),
+
+    # === Notifications (официант) ===
+    path("notifications/", NotificationListView.as_view(), name="notifications-list"),
 ]
