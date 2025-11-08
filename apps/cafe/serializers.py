@@ -447,7 +447,8 @@ class InventoryItemSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = InventoryItem
-        fields = ["id", "product", "product_title", "product_unit", "expected_qty", "actual_qty", "difference"]
+        fields = ["id", "product", "product_title", "product_unit",
+                  "expected_qty", "actual_qty", "difference"]
         read_only_fields = ["id", "product_title", "product_unit", "difference"]
 
     def get_fields(self):
@@ -459,30 +460,61 @@ class InventoryItemSerializer(serializers.ModelSerializer):
             fields["product"].queryset = Warehouse.objects.none()
         return fields
 
+    def validate(self, attrs):
+        exp = attrs.get("expected_qty")
+        act = attrs.get("actual_qty")
+        if exp is None or act is None:
+            return attrs
+        if exp < 0 or act < 0:
+            raise serializers.ValidationError({"actual_qty": "Кол-во не может быть отрицательным."})
+        return attrs
+
 
 class InventorySessionSerializer(CompanyBranchReadOnlyMixin):
     items = InventoryItemSerializer(many=True)
 
     class Meta:
         model = InventorySession
-        fields = ["id", "company", "branch", "comment", "created_by", "created_at", "confirmed_at", "is_confirmed", "items"]
-        read_only_fields = ["id", "company", "branch", "created_by", "created_at", "confirmed_at", "is_confirmed"]
+        fields = ["id", "company", "branch", "comment", "created_by",
+                  "created_at", "confirmed_at", "is_confirmed", "items"]
+        read_only_fields = ["id", "company", "branch", "created_by",
+                            "created_at", "confirmed_at", "is_confirmed"]
 
     def create(self, validated_data):
         items_data = validated_data.pop("items", [])
-        obj = super().create(validated_data)  # company/branch заполнятся миксином
-        # проставим автора
-        obj.created_by = getattr(self.context.get("request"), "user", None)
-        obj.save(update_fields=["created_by"])
-        if items_data:
-            InventoryItem.objects.bulk_create([
-                InventoryItem(session=obj, **item) for item in items_data
-            ])
+        with transaction.atomic():
+            obj = super().create(validated_data)  # company/branch проставит миксин
+            obj.created_by = getattr(self.context.get("request"), "user", None)
+            obj.save(update_fields=["created_by"])
+
+            if items_data:
+                seen = set()
+                bulk = []
+                for it in items_data:
+                    product = it["product"]
+                    if product.pk in seen:
+                        raise serializers.ValidationError(
+                            {"items": f"Товар «{product.title}» повторяется в одном акте."}
+                        )
+                    seen.add(product.pk)
+                    exp = it["expected_qty"]
+                    act = it["actual_qty"]
+                    bulk.append(InventoryItem(
+                        session=obj,
+                        product=product,
+                        expected_qty=exp,
+                        actual_qty=act,
+                        difference=act - exp,  # важно: bulk_create не вызовет save()
+                    ))
+                InventoryItem.objects.bulk_create(bulk)
         return obj
 
 
 # ==========================
 # SERIALIZERS: Инвентаризация оборудования
+# ==========================
+# ==========================
+# INVENTORY (оборудование)
 # ==========================
 class EquipmentSerializer(CompanyBranchReadOnlyMixin):
     class Meta:
@@ -500,7 +532,8 @@ class EquipmentInventoryItemSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = EquipmentInventoryItem
-        fields = ["id", "equipment", "equipment_title", "serial_number", "is_present", "condition", "notes"]
+        fields = ["id", "equipment", "equipment_title", "serial_number",
+                  "is_present", "condition", "notes"]
         read_only_fields = ["id", "equipment_title", "serial_number"]
 
     def get_fields(self):
@@ -518,16 +551,34 @@ class EquipmentInventorySessionSerializer(CompanyBranchReadOnlyMixin):
 
     class Meta:
         model = EquipmentInventorySession
-        fields = ["id", "company", "branch", "comment", "created_by", "created_at", "confirmed_at", "is_confirmed", "items"]
-        read_only_fields = ["id", "company", "branch", "created_by", "created_at", "confirmed_at", "is_confirmed"]
+        fields = ["id", "company", "branch", "comment", "created_by",
+                  "created_at", "confirmed_at", "is_confirmed", "items"]
+        read_only_fields = ["id", "company", "branch", "created_by",
+                            "created_at", "confirmed_at", "is_confirmed"]
 
     def create(self, validated_data):
         items_data = validated_data.pop("items", [])
-        obj = super().create(validated_data)
-        obj.created_by = getattr(self.context.get("request"), "user", None)
-        obj.save(update_fields=["created_by"])
-        if items_data:
-            EquipmentInventoryItem.objects.bulk_create([
-                EquipmentInventoryItem(session=obj, **item) for item in items_data
-            ])
+        with transaction.atomic():
+            obj = super().create(validated_data)
+            obj.created_by = getattr(self.context.get("request"), "user", None)
+            obj.save(update_fields=["created_by"])
+
+            if items_data:
+                seen = set()
+                bulk = []
+                for it in items_data:
+                    eq = it["equipment"]
+                    if eq.pk in seen:
+                        raise serializers.ValidationError(
+                            {"items": f"Оборудование «{eq.title}» повторяется в одном акте."}
+                        )
+                    seen.add(eq.pk)
+                    bulk.append(EquipmentInventoryItem(
+                        session=obj,
+                        equipment=eq,
+                        is_present=it.get("is_present", True),
+                        condition=it.get("condition", Equipment.Condition.GOOD),
+                        notes=it.get("notes", ""),
+                    ))
+                EquipmentInventoryItem.objects.bulk_create(bulk)
         return obj

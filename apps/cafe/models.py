@@ -297,7 +297,7 @@ class Booking(models.Model):
     phone = models.CharField('Телефон', max_length=32, blank=True)
     date = models.DateField('Дата')
     time = models.TimeField('Время')
-    guests = models.PositiveSmallIntegerField('Гостей', default=0, validators=[MinValueValidator(1)])
+    guests = models.PositiveSmallIntegerField('Гостей', default=1, validators=[MinValueValidator(1)])
     table = models.ForeignKey(
         Table, on_delete=models.PROTECT,
         related_name='bookings', verbose_name='Стол'
@@ -442,10 +442,17 @@ class Category(models.Model):
                 condition=Q(branch__isnull=True),
             ),
         ]
-    ...
+        indexes = [
+            models.Index(fields=['company', 'title']),
+            models.Index(fields=['company', 'branch', 'title']),
+        ]
+
+    def clean(self):
+        if self.branch_id and self.branch.company_id != self.company_id:
+            raise ValidationError({'branch': 'Филиал принадлежит другой компании.'})
+
     def __str__(self):
         return self.title
-
 
 class MenuItem(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
