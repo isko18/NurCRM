@@ -1,13 +1,18 @@
 # apps/cafe/views.py
-from rest_framework import generics, permissions, filters
+from rest_framework import generics, permissions, filters, status
+from rest_framework.views import APIView
+from rest_framework.response import Response
+
 from django_filters.rest_framework import DjangoFilterBackend
-from django.db.models import Q
+from django.db.models import Q, Count, Avg, ExpressionWrapper, DurationField, F
+from django.utils import timezone
+from django.db import transaction
 
 from .models import (
     Zone, Table, Booking, Warehouse, Purchase,
     Category, MenuItem, Ingredient,
     Order, OrderItem, CafeClient,
-    OrderHistory,
+    OrderHistory, KitchenTask, NotificationCafe,
 )
 from .serializers import (
     ZoneSerializer, TableSerializer, BookingSerializer,
@@ -16,7 +21,17 @@ from .serializers import (
     OrderSerializer, OrderItemInlineSerializer,
     CafeClientSerializer,
     OrderHistorySerializer,
+    KitchenTaskSerializer, NotificationCafeSerializer,
 )
+
+# если добавлял кастомные пермишены — импортируем
+try:
+    from apps.users.permissions import IsCompanyOwnerOrAdmin
+except Exception:
+    class IsCompanyOwnerOrAdmin(permissions.BasePermission):  # fallback, пускает только staff/superuser
+        def has_permission(self, request, view):
+            u = request.user
+            return bool(u and u.is_authenticated and (u.is_staff or u.is_superuser))
 
 
 # --------- company + branch (как в барбере/букинге) ---------
@@ -430,3 +445,187 @@ class OrderItemRetrieveUpdateDestroyView(CompanyBranchQuerysetMixin, generics.Re
                 Q(menu_item__branch=active_branch) | Q(menu_item__branch__isnull=True),
             )
         return qs.filter(order__branch__isnull=True, menu_item__branch__isnull=True)
+
+
+# ==================== Kitchen (повар) ====================
+
+class KitchenTaskListView(CompanyBranchQuerysetMixin, generics.ListAPIView):
+    """
+    Лента задач для повара:
+      - по умолчанию pending + in_progress
+      - ?mine=1 — только мои
+      - ?status=... — конкретный статус
+    """
+    queryset = KitchenTask.objects.select_related('order__table', 'menu_item', 'waiter', 'cook')
+    serializer_class = KitchenTaskSerializer
+    filter_backends = [DjangoFilterBackend, filters.OrderingFilter]
+    filterset_fields = ['status', 'cook', 'waiter', 'menu_item', 'order']
+    ordering_fields = ['created_at', 'started_at', 'finished_at', 'status']
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        user = self.request.user
+        status_param = self.request.query_params.get('status')
+        mine = self.request.query_params.get('mine')
+
+        if status_param:
+            qs = qs.filter(status=status_param)
+        else:
+            qs = qs.filter(status__in=[KitchenTask.Status.PENDING, KitchenTask.Status.IN_PROGRESS])
+
+        if mine in ('1', 'true', 'True'):
+            qs = qs.filter(cook=user)
+        else:
+            # показываем и свободные, и мои активные
+            qs = qs.filter(Q(cook__isnull=True) | Q(cook=user))
+        return qs
+
+
+class KitchenTaskClaimView(CompanyBranchQuerysetMixin, APIView):
+    """
+    POST /cafe/kitchen/tasks/<uuid:pk>/claim/
+    Берёт задачу в работу: pending -> in_progress, cook = request.user
+    """
+    def post(self, request, pk):
+        company = self._user_company()
+        user = request.user
+        with transaction.atomic():
+            updated = (KitchenTask.objects
+                       .select_for_update()
+                       .filter(pk=pk, company=company,
+                               status=KitchenTask.Status.PENDING, cook__isnull=True)
+                       .update(status=KitchenTask.Status.IN_PROGRESS,
+                               cook=user, started_at=timezone.now()))
+            if not updated:
+                return Response({"detail": "Задачу уже взяли или статус не 'pending'."},
+                                status=status.HTTP_409_CONFLICT)
+        obj = KitchenTask.objects.select_related('order__table', 'menu_item', 'waiter', 'cook').get(pk=pk)
+        return Response(KitchenTaskSerializer(obj, context={'request': request}).data)
+
+
+class KitchenTaskReadyView(CompanyBranchQuerysetMixin, APIView):
+    """
+    POST /cafe/kitchen/tasks/<uuid:pk>/ready/
+    Отмечает задачу как готовую: in_progress -> ready, уведомляет официанта.
+    """
+    def post(self, request, pk):
+        company = self._user_company()
+        user = request.user
+        with transaction.atomic():
+            task = generics.get_object_or_404(
+                KitchenTask.objects.select_for_update(),
+                pk=pk, company=company, cook=user, status=KitchenTask.Status.IN_PROGRESS
+            )
+            task.status = KitchenTask.Status.READY
+            task.finished_at = timezone.now()
+            task.save(update_fields=['status', 'finished_at'])
+
+            # уведомление официанту
+            if task.waiter_id:
+                NotificationCafe.objects.create(
+                    company=task.company,
+                    branch=task.branch,
+                    recipient=task.waiter,
+                    type='kitchen_ready',
+                    message=f'Готово: {task.menu_item.title} (стол {task.order.table.number})',
+                    payload={
+                        "task_id": str(task.id),
+                        "order_id": str(task.order_id),
+                        "table": task.order.table.number,
+                        "menu_item": task.menu_item.title,
+                        "unit_index": task.unit_index,
+                    }
+                )
+
+        return Response(KitchenTaskSerializer(task, context={'request': request}).data)
+
+
+# ---- Мониторинг задач кухни для владельца/админа ----
+class KitchenTaskMonitorView(CompanyBranchQuerysetMixin, generics.ListAPIView):
+    """
+    /cafe/kitchen/tasks/monitor/
+    Видят владелец/админ/стaff. Все задачи по компании.
+    """
+    permission_classes = [permissions.IsAuthenticated, IsCompanyOwnerOrAdmin]
+    queryset = KitchenTask.objects.select_related('order__table', 'menu_item', 'waiter', 'cook')
+    serializer_class = KitchenTaskSerializer
+    filter_backends = [DjangoFilterBackend, filters.OrderingFilter]
+    filterset_fields = ['status', 'cook', 'waiter', 'menu_item', 'order']
+    ordering_fields = ['created_at', 'started_at', 'finished_at', 'status']
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        date_from = self.request.query_params.get('date_from')
+        date_to = self.request.query_params.get('date_to')
+        if date_from:
+            qs = qs.filter(created_at__date__gte=date_from)
+        if date_to:
+            qs = qs.filter(created_at__date__lte=date_to)
+        return qs
+
+
+# ---- Аналитика: по поварам и по официантам ----
+class KitchenAnalyticsBaseView(CompanyBranchQuerysetMixin, APIView):
+    """Агрегация по cook или waiter. ?date_from=YYYY-MM-DD&date_to=YYYY-MM-DD"""
+    group_field = None  # 'cook' или 'waiter'
+
+    def get(self, request):
+        if not self.group_field:
+            return Response({"detail": "group_field not set"}, status=500)
+
+        qs = KitchenTask.objects.filter(company=self._user_company())
+        active_branch = self._active_branch()
+        if active_branch is not None:
+            qs = qs.filter(Q(branch=active_branch) | Q(branch__isnull=True))
+        else:
+            qs = qs.filter(branch__isnull=True)
+
+        df = request.query_params.get('date_from')
+        dt = request.query_params.get('date_to')
+        if df:
+            qs = qs.filter(created_at__date__gte=df)
+        if dt:
+            qs = qs.filter(created_at__date__lte=dt)
+
+        lead_time = ExpressionWrapper(F('finished_at') - F('started_at'), output_field=DurationField())
+        data = (qs.values(self.group_field)
+                  .annotate(
+                      total=Count('id'),
+                      taken=Count('id', filter=Q(status__in=[KitchenTask.Status.IN_PROGRESS, KitchenTask.Status.READY])),
+                      ready=Count('id', filter=Q(status=KitchenTask.Status.READY)),
+                      avg_lead=Avg(lead_time, filter=Q(status=KitchenTask.Status.READY)),
+                  )
+                  .order_by('-ready', '-total'))
+
+        result = []
+        for row in data:
+            uid = row[self.group_field]
+            result.append({
+                self.group_field: uid,
+                "total": row["total"],
+                "taken": row["taken"],
+                "ready": row["ready"],
+                "avg_lead_seconds": (row["avg_lead"].total_seconds() if row["avg_lead"] else None),
+            })
+        return Response(result)
+
+
+class KitchenAnalyticsByCookView(KitchenAnalyticsBaseView):
+    group_field = 'cook'
+
+
+class KitchenAnalyticsByWaiterView(KitchenAnalyticsBaseView):
+    group_field = 'waiter'
+
+
+# ---- Уведомления для официанта ----
+class NotificationListView(CompanyBranchQuerysetMixin, generics.ListAPIView):
+    serializer_class = NotificationCafeSerializer
+    filter_backends = [DjangoFilterBackend, filters.OrderingFilter]
+    ordering_fields = ['created_at']
+
+    def get_queryset(self):
+        company = self._user_company()
+        if not company:
+            return NotificationCafe.objects.none()
+        return NotificationCafe.objects.filter(company=company, recipient=self.request.user).order_by('-created_at')

@@ -3,12 +3,13 @@ from django.contrib.auth import get_user_model
 from django.db.models import Q
 from rest_framework import serializers
 from django.core.exceptions import ValidationError as DjangoValidationError
+from django.db import transaction
 
 from .models import (
     Zone, Table, Booking, Warehouse, Purchase,
     Category, MenuItem, Ingredient,
     Order, OrderItem, CafeClient,
-    OrderHistory, OrderItemHistory,
+    OrderHistory, OrderItemHistory, KitchenTask, NotificationCafe
 )
 
 User = get_user_model()
@@ -82,19 +83,63 @@ class CompanyBranchReadOnlyMixin(serializers.ModelSerializer):
 
 
 def _scope_queryset_by_context(qs, serializer: CompanyBranchReadOnlyMixin):
-    """Сужает QuerySet по компании и (branch = активный | NULL)."""
     company = serializer._user_company()
     if not company:
         return qs.none()
     qs = qs.filter(company=company)
-    model = qs.model
-    if hasattr(model, "branch"):
+
+    # было: if hasattr(qs.model, "branch"):
+    has_branch = any(getattr(f, "name", None) == "branch" for f in qs.model._meta.get_fields())
+    if has_branch:
         b = serializer._auto_branch()
         if b is not None:
             qs = qs.filter(Q(branch=b) | Q(branch__isnull=True))
         else:
             qs = qs.filter(branch__isnull=True)
     return qs
+
+
+
+class KitchenTaskSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
+    table_number = serializers.IntegerField(source='order.table.number', read_only=True)
+    guest = serializers.SerializerMethodField()
+    waiter_label = serializers.SerializerMethodField()
+    menu_item_title = serializers.CharField(source='menu_item.title', read_only=True)
+    price = serializers.DecimalField(source='menu_item.price', max_digits=10, decimal_places=2, read_only=True)
+
+    class Meta:
+        model = KitchenTask
+        fields = [
+            'id', 'company', 'branch',
+            'status', 'created_at', 'started_at', 'finished_at',
+            'order', 'order_item', 'menu_item',
+            'table_number', 'guest', 'waiter', 'waiter_label',
+            'cook', 'unit_index', 'menu_item_title', 'price',
+        ]
+        read_only_fields = [
+            'id', 'company', 'branch', 'created_at', 'started_at', 'finished_at',
+            'order', 'order_item', 'menu_item', 'table_number', 'guest',
+            'waiter', 'waiter_label', 'menu_item_title', 'price'
+        ]
+
+    def get_guest(self, obj):
+        return getattr(obj.order, 'client', None) and (obj.order.client.name or obj.order.client.phone) or ''
+
+    def get_waiter_label(self, obj):
+        w = obj.waiter
+        if not w:
+            return ''
+        fn = getattr(w, 'get_full_name', lambda: '')() or ''
+        return fn or getattr(w, 'email', '') or str(w.pk)
+
+
+# --- НОВОЕ: Notification (если нужно выводить списком) ---
+class NotificationCafeSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = NotificationCafe
+        fields = ['id', 'type', 'message', 'payload', 'is_read', 'created_at']
+        read_only_fields = ['id', 'type', 'message', 'payload', 'is_read', 'created_at']
+
 
 
 # --------- Простые справочники ---------
@@ -120,8 +165,10 @@ class TableSerializer(CompanyBranchReadOnlyMixin):
 
     def validate(self, attrs):
         zone = attrs.get("zone") or getattr(self.instance, "zone", None)
-        # согласованность филиала: зона глобальная или текущего филиала, и совпадает с табличным branch
         tb = self._auto_branch()
+        company = self._user_company()
+        if company and zone and zone.company_id != company.id:
+            raise serializers.ValidationError({"zone": "Зона принадлежит другой компании."})
         if tb is not None and zone and zone.branch_id not in (None, tb.id):
             raise serializers.ValidationError({"zone": "Зона принадлежит другому филиалу."})
         return attrs
@@ -385,9 +432,10 @@ class OrderSerializer(CompanyBranchReadOnlyMixin):
 
     def update(self, instance, validated_data):
         items = validated_data.pop("items", None)
-        obj = super().update(instance, validated_data)
-        if items is not None:
-            instance.items.all().delete()
-            if items:
-                self._upsert_items(instance, items)
-        return obj
+        with transaction.atomic():
+            instance = super().update(instance, validated_data)
+            if items is not None:
+                instance.items.all().delete()  # каскадом удалит KitchenTask
+                if items:
+                    self._upsert_items(instance, items)
+        return instance
