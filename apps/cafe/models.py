@@ -9,6 +9,7 @@ from django.core.files.base import ContentFile
 from django.core.validators import MinValueValidator
 from PIL import Image, ImageOps
 import io, uuid
+from decimal import Decimal
 
 from apps.users.models import Company, Branch
 
@@ -779,3 +780,225 @@ def ensure_kitchen_tasks_for_order_item(sender, instance: 'OrderItem', created, 
             unit_index__gt=need,
             status=KitchenTask.Status.PENDING,
         ).delete()
+
+
+class InventorySession(models.Model):
+    """
+    Акт инвентаризации склада в рамках компании/филиала.
+    Содержит список замеров по отдельным позициям Warehouse.
+    """
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    company = models.ForeignKey(
+        Company, on_delete=models.CASCADE,
+        related_name="cafe_inventory_sessions", verbose_name="Компания",
+    )
+    branch = models.ForeignKey(
+        Branch, on_delete=models.SET_NULL,
+        null=True, blank=True, related_name="cafe_inventory_sessions",
+        verbose_name="Филиал",
+    )
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL,
+        null=True, blank=True, related_name="cafe_inventory_created",
+        verbose_name="Создан пользователем",
+    )
+    comment = models.TextField("Комментарий", blank=True)
+    created_at = models.DateTimeField("Создано", auto_now_add=True)
+    confirmed_at = models.DateTimeField("Подтверждено", null=True, blank=True)
+    is_confirmed = models.BooleanField("Подтвержден", default=False, db_index=True)
+
+    class Meta:
+        verbose_name = "Инвентаризация"
+        verbose_name_plural = "Инвентаризации"
+        ordering = ["-created_at"]
+        indexes = [
+            models.Index(fields=["company", "created_at"]),
+            models.Index(fields=["company", "branch", "is_confirmed"]),
+        ]
+
+    def __str__(self):
+        who = f" / {self.branch}" if self.branch_id else " / GLOBAL"
+        return f"Инвентаризация{who} ({self.created_at:%Y-%m-%d %H:%M})"
+
+    def confirm(self, user=None):
+        """
+        Применяет фактические остатки к Warehouse.remainder.
+        ВНИМАНИЕ: у вас remainder=CharField, поэтому пишем строкой Decimal.
+        """
+        if self.is_confirmed:
+            return
+        for item in self.items.select_related("product"):
+            # фиксируем актуальный остаток в карточке товара
+            # переводим Decimal -> строка (без форматирования единиц)
+            item.product.remainder = str(item.actual_qty)
+            item.product.save(update_fields=["remainder"])
+        self.is_confirmed = True
+        self.confirmed_at = timezone.now()
+        self.save(update_fields=["is_confirmed", "confirmed_at"])
+
+
+class InventoryItem(models.Model):
+    """
+    Строка инвентаризации: одна позиция склада (Warehouse).
+    expected_qty — учетный остаток на момент замера
+    actual_qty — фактический остаток
+    difference = actual - expected (считается автоматически)
+    """
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    session = models.ForeignKey(
+        InventorySession, on_delete=models.CASCADE,
+        related_name="items", verbose_name="Сессия",
+    )
+    product = models.ForeignKey(
+        Warehouse, on_delete=models.CASCADE,
+        related_name="inventory_items", verbose_name="Товар",
+    )
+    expected_qty = models.DecimalField("Ожидалось", max_digits=12, decimal_places=3)
+    actual_qty = models.DecimalField("Факт", max_digits=12, decimal_places=3)
+    difference = models.DecimalField("Разница", max_digits=12, decimal_places=3, default=Decimal("0"))
+
+    class Meta:
+        verbose_name = "Строка инвентаризации"
+        verbose_name_plural = "Строки инвентаризации"
+        constraints = [
+            models.UniqueConstraint(fields=["session", "product"], name="uniq_inventory_line_per_session_product"),
+        ]
+        indexes = [
+            models.Index(fields=["session"]),
+            models.Index(fields=["product"]),
+        ]
+
+    def save(self, *args, **kwargs):
+        self.difference = (self.actual_qty or Decimal("0")) - (self.expected_qty or Decimal("0"))
+        super().save(*args, **kwargs)
+
+    def __str__(self):
+        return f"{self.product.title}: {self.expected_qty} -> {self.actual_qty} ({self.difference})"
+
+
+# ==========================
+# ИНВЕНТАРИЗАЦИЯ ОБОРУДОВАНИЯ
+# ==========================
+class Equipment(models.Model):
+    """
+    Единица оборудования (кофемашина, холодильник, ноутбук и т.п.)
+    """
+    class Condition(models.TextChoices):
+        GOOD = "good", "Исправно"
+        REPAIR = "repair", "На ремонте"
+        BROKEN = "broken", "Списано"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    company = models.ForeignKey(
+        Company, on_delete=models.CASCADE,
+        related_name="cafe_equipments", verbose_name="Компания",
+    )
+    branch = models.ForeignKey(
+        Branch, on_delete=models.SET_NULL,
+        null=True, blank=True, related_name="cafe_equipments", verbose_name="Филиал",
+    )
+    title = models.CharField("Название", max_length=255)
+    serial_number = models.CharField("Серийный номер", max_length=255, blank=True)
+    category = models.CharField("Категория", max_length=100, blank=True)
+    purchase_date = models.DateField("Дата покупки", null=True, blank=True)
+    price = models.DecimalField("Цена", max_digits=12, decimal_places=2, null=True, blank=True)
+    condition = models.CharField("Состояние", max_length=16, choices=Condition.choices, default=Condition.GOOD)
+    is_active = models.BooleanField("Активно", default=True)
+    notes = models.TextField("Заметки", blank=True)
+
+    class Meta:
+        verbose_name = "Оборудование"
+        verbose_name_plural = "Оборудование"
+        indexes = [
+            models.Index(fields=["company", "branch"]),
+            models.Index(fields=["company", "category"]),
+            models.Index(fields=["company", "is_active"]),
+        ]
+
+    def __str__(self):
+        sn = f" / SN:{self.serial_number}" if self.serial_number else ""
+        return f"{self.title}{sn}"
+
+
+class EquipmentInventorySession(models.Model):
+    """
+    Акт инвентаризации оборудования в компании/филиале.
+    """
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    company = models.ForeignKey(
+        Company, on_delete=models.CASCADE,
+        related_name="cafe_equipment_inventory_sessions", verbose_name="Компания",
+    )
+    branch = models.ForeignKey(
+        Branch, on_delete=models.SET_NULL,
+        null=True, blank=True, related_name="cafe_equipment_inventory_sessions", verbose_name="Филиал",
+    )
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL,
+        null=True, blank=True, related_name="cafe_equipment_inventory_created", verbose_name="Создан пользователем",
+    )
+    comment = models.TextField("Комментарий", blank=True)
+    created_at = models.DateTimeField("Создано", auto_now_add=True)
+    confirmed_at = models.DateTimeField("Подтверждено", null=True, blank=True)
+    is_confirmed = models.BooleanField("Подтвержден", default=False, db_index=True)
+
+    class Meta:
+        verbose_name = "Инвентаризация оборудования"
+        verbose_name_plural = "Инвентаризации оборудования"
+        ordering = ["-created_at"]
+        indexes = [
+            models.Index(fields=["company", "created_at"]),
+            models.Index(fields=["company", "branch", "is_confirmed"]),
+        ]
+
+    def __str__(self):
+        who = f" / {self.branch}" if self.branch_id else " / GLOBAL"
+        return f"Инв. оборудования{who} ({self.created_at:%Y-%m-%d %H:%M})"
+
+    def confirm(self, user=None):
+        """
+        Применяет состояние оборудования из строк акта.
+        """
+        if self.is_confirmed:
+            return
+        for item in self.items.select_related("equipment"):
+            eq = item.equipment
+            eq.condition = item.condition
+            if not item.is_present:
+                eq.is_active = False
+            eq.save(update_fields=["condition", "is_active"])
+        self.is_confirmed = True
+        self.confirmed_at = timezone.now()
+        self.save(update_fields=["is_confirmed", "confirmed_at"])
+
+
+class EquipmentInventoryItem(models.Model):
+    """
+    Строка инвентаризации оборудования.
+    """
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    session = models.ForeignKey(
+        EquipmentInventorySession, on_delete=models.CASCADE,
+        related_name="items", verbose_name="Сессия",
+    )
+    equipment = models.ForeignKey(
+        Equipment, on_delete=models.CASCADE,
+        related_name="inventory_items", verbose_name="Оборудование",
+    )
+    is_present = models.BooleanField("В наличии", default=True)
+    condition = models.CharField("Состояние", max_length=16, choices=Equipment.Condition.choices, default=Equipment.Condition.GOOD)
+    notes = models.TextField("Заметки", blank=True)
+
+    class Meta:
+        verbose_name = "Строка инв. оборудования"
+        verbose_name_plural = "Строки инв. оборудования"
+        constraints = [
+            models.UniqueConstraint(fields=["session", "equipment"], name="uniq_eq_inventory_line_per_session_equipment"),
+        ]
+        indexes = [
+            models.Index(fields=["session"]),
+            models.Index(fields=["equipment"]),
+        ]
+
+    def __str__(self):
+        return f"{self.equipment} — {self.get_condition_display()} ({'есть' if self.is_present else 'нет'})"

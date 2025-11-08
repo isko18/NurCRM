@@ -9,7 +9,7 @@ from .models import (
     Zone, Table, Booking, Warehouse, Purchase,
     Category, MenuItem, Ingredient,
     Order, OrderItem, CafeClient,
-    OrderHistory, OrderItemHistory, KitchenTask, NotificationCafe
+    OrderHistory, OrderItemHistory, KitchenTask, NotificationCafe, InventorySession, InventoryItem, Equipment, EquipmentInventoryItem, EquipmentInventorySession
 )
 
 User = get_user_model()
@@ -439,3 +439,95 @@ class OrderSerializer(CompanyBranchReadOnlyMixin):
                 if items:
                     self._upsert_items(instance, items)
         return instance
+    
+
+class InventoryItemSerializer(serializers.ModelSerializer):
+    product_title = serializers.CharField(source="product.title", read_only=True)
+    product_unit = serializers.CharField(source="product.unit", read_only=True)
+
+    class Meta:
+        model = InventoryItem
+        fields = ["id", "product", "product_title", "product_unit", "expected_qty", "actual_qty", "difference"]
+        read_only_fields = ["id", "product_title", "product_unit", "difference"]
+
+    def get_fields(self):
+        fields = super().get_fields()
+        holder = getattr(self, "root", None)
+        if isinstance(holder, CompanyBranchReadOnlyMixin):
+            fields["product"].queryset = _scope_queryset_by_context(Warehouse.objects.all(), holder)
+        else:
+            fields["product"].queryset = Warehouse.objects.none()
+        return fields
+
+
+class InventorySessionSerializer(CompanyBranchReadOnlyMixin):
+    items = InventoryItemSerializer(many=True)
+
+    class Meta:
+        model = InventorySession
+        fields = ["id", "company", "branch", "comment", "created_by", "created_at", "confirmed_at", "is_confirmed", "items"]
+        read_only_fields = ["id", "company", "branch", "created_by", "created_at", "confirmed_at", "is_confirmed"]
+
+    def create(self, validated_data):
+        items_data = validated_data.pop("items", [])
+        obj = super().create(validated_data)  # company/branch заполнятся миксином
+        # проставим автора
+        obj.created_by = getattr(self.context.get("request"), "user", None)
+        obj.save(update_fields=["created_by"])
+        if items_data:
+            InventoryItem.objects.bulk_create([
+                InventoryItem(session=obj, **item) for item in items_data
+            ])
+        return obj
+
+
+# ==========================
+# SERIALIZERS: Инвентаризация оборудования
+# ==========================
+class EquipmentSerializer(CompanyBranchReadOnlyMixin):
+    class Meta:
+        model = Equipment
+        fields = [
+            "id", "company", "branch", "title", "serial_number",
+            "category", "purchase_date", "price", "condition", "is_active", "notes",
+        ]
+        read_only_fields = ["id", "company", "branch"]
+
+
+class EquipmentInventoryItemSerializer(serializers.ModelSerializer):
+    equipment_title = serializers.CharField(source="equipment.title", read_only=True)
+    serial_number = serializers.CharField(source="equipment.serial_number", read_only=True)
+
+    class Meta:
+        model = EquipmentInventoryItem
+        fields = ["id", "equipment", "equipment_title", "serial_number", "is_present", "condition", "notes"]
+        read_only_fields = ["id", "equipment_title", "serial_number"]
+
+    def get_fields(self):
+        fields = super().get_fields()
+        holder = getattr(self, "root", None)
+        if isinstance(holder, CompanyBranchReadOnlyMixin):
+            fields["equipment"].queryset = _scope_queryset_by_context(Equipment.objects.all(), holder)
+        else:
+            fields["equipment"].queryset = Equipment.objects.none()
+        return fields
+
+
+class EquipmentInventorySessionSerializer(CompanyBranchReadOnlyMixin):
+    items = EquipmentInventoryItemSerializer(many=True)
+
+    class Meta:
+        model = EquipmentInventorySession
+        fields = ["id", "company", "branch", "comment", "created_by", "created_at", "confirmed_at", "is_confirmed", "items"]
+        read_only_fields = ["id", "company", "branch", "created_by", "created_at", "confirmed_at", "is_confirmed"]
+
+    def create(self, validated_data):
+        items_data = validated_data.pop("items", [])
+        obj = super().create(validated_data)
+        obj.created_by = getattr(self.context.get("request"), "user", None)
+        obj.save(update_fields=["created_by"])
+        if items_data:
+            EquipmentInventoryItem.objects.bulk_create([
+                EquipmentInventoryItem(session=obj, **item) for item in items_data
+            ])
+        return obj
