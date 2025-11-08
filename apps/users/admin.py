@@ -1,28 +1,115 @@
+# apps/users/admin.py
 from django.contrib import admin
 from django.contrib.auth.admin import UserAdmin as BaseUserAdmin
+from django.db import models as dj_models
 
 from .models import (
-    User, Company, Industry, SubscriptionPlan, Feature, Sector, CustomRole,
-    Branch, BranchMembership
+    User, Company, Branch, BranchMembership,
+    Feature, SubscriptionPlan, Sector, Industry, CustomRole
 )
 
-# =========================
-# Inline: членство пользователя в филиале
-# =========================
-class BranchMembershipInline(admin.TabularInline):
+# -------------------- Вспомогательный миксин --------------------
+
+class CompanyScopedFKMixin:
+    """
+    Ограничивает ForeignKey(company) выбором компании текущего пользователя, если он не суперпользователь.
+    Также ограничивает связанные user/branch тем же контекстом компании.
+    """
+    def formfield_for_foreignkey(self, db_field, request, **kwargs):
+        if not request.user.is_superuser:
+            user_company = getattr(request.user, "company", None) or getattr(request.user, "owned_company", None)
+
+            if db_field.name == "company":
+                kwargs["queryset"] = Company.objects.filter(id=user_company.id) if user_company else Company.objects.none()
+
+            if db_field.name == "user":
+                kwargs["queryset"] = User.objects.filter(company=user_company) if user_company else User.objects.none()
+
+            if db_field.name == "branch":
+                kwargs["queryset"] = Branch.objects.filter(company=user_company) if user_company else Branch.objects.none()
+
+        return super().formfield_for_foreignkey(db_field, request, **kwargs)
+
+# -------------------- Константы групп прав пользователя --------------------
+
+BASE_PERMS = (
+    'can_view_dashboard', 'can_view_cashbox', 'can_view_departments',
+    'can_view_orders', 'can_view_analytics', 'can_view_department_analytics',
+    'can_view_products', 'can_view_booking',
+    'can_view_employees', 'can_view_clients',
+    'can_view_brand_category', 'can_view_settings', 'can_view_sale',
+)
+
+BUILDING_PERMS = (
+    'can_view_building_work_process',
+    'can_view_building_objects',
+    'can_view_additional_services',
+    'can_view_debts',
+)
+
+BARBER_PERMS = (
+    'can_view_barber_clients',
+    'can_view_barber_services',
+    'can_view_barber_history',
+    'can_view_barber_records',
+)
+
+HOSTEL_PERMS = (
+    'can_view_hostel_rooms',
+    'can_view_hostel_booking',
+    'can_view_hostel_clients',
+    'can_view_hostel_analytics',
+)
+
+CAFE_PERMS = (
+    'can_view_cafe_menu',
+    'can_view_cafe_orders',
+    'can_view_cafe_purchasing',
+    'can_view_cafe_booking',
+    'can_view_cafe_clients',
+    'can_view_cafe_tables',
+)
+
+SCHOOL_PERMS = (
+    'can_view_school_students',
+    'can_view_school_groups',
+    'can_view_school_lessons',
+    'can_view_school_teachers',
+    'can_view_school_leads',
+    'can_view_school_invoices',
+)
+
+EXTRA_PERMS = (
+    'can_view_client_requests',
+    'can_view_salary',
+    'can_view_sales',
+    'can_view_services',
+    'can_view_agent',
+    'can_view_catalog',
+)
+
+# -------------------- Inlines --------------------
+
+class BranchMembershipInlineForUser(admin.TabularInline):
     model = BranchMembership
     fk_name = "user"
-    extra = 1
-    autocomplete_fields = ["branch"]
+    extra = 0
+    autocomplete_fields = ("branch",)
     fields = ("branch", "role", "is_primary", "created_at")
     readonly_fields = ("created_at",)
-    verbose_name = "Принадлежность к филиалу"
-    verbose_name_plural = "Филиалы пользователя"
 
+class BranchMembershipInlineForBranch(admin.TabularInline):
+    model = BranchMembership
+    fk_name = "branch"
+    extra = 0
+    autocomplete_fields = ("user",)
+    fields = ("user", "role", "is_primary", "created_at")
+    readonly_fields = ("created_at",)
 
-# 👤 Пользователь
+# -------------------- User --------------------
+
 @admin.register(User)
-class UserAdmin(BaseUserAdmin):
+class UserAdmin(CompanyScopedFKMixin, BaseUserAdmin):
     list_display = (
         'email', 'first_name', 'last_name', 'company', 'role_display', 'custom_role',
         'primary_branch_display', 'branches_display',
@@ -30,31 +117,32 @@ class UserAdmin(BaseUserAdmin):
         'can_view_clients', 'can_view_settings', 'can_view_sale',
         'is_staff', 'is_active'
     )
-    list_filter = ('role', 'custom_role', 'is_staff', 'is_active')
-    search_fields = ('email', 'first_name', 'last_name')
+    list_filter = ('role', 'custom_role', 'company', 'is_staff', 'is_active')
+    search_fields = ('email', 'first_name', 'last_name', 'phone_number', 'track_number')
     ordering = ('email',)
     readonly_fields = ('created_at', 'updated_at')
-    inlines = [BranchMembershipInline]
+    inlines = [BranchMembershipInlineForUser]
+    autocomplete_fields = ("company", "custom_role")
+    list_select_related = ("company", "custom_role")
 
     fieldsets = (
         (None, {'fields': ('email', 'password')}),
         ('Персональная информация', {
-            'fields': ('first_name', 'last_name', 'avatar', 'company', 'role', 'custom_role')
-        }),
-        ('Разрешения по разделам', {
             'fields': (
-                'can_view_dashboard', 'can_view_cashbox', 'can_view_departments',
-                'can_view_orders', 'can_view_analytics', 'can_view_department_analytics',
-                'can_view_products', 'can_view_booking',
-                'can_view_employees', 'can_view_clients',
-                'can_view_brand_category', 'can_view_settings', 'can_view_sale',
+                'first_name', 'last_name', 'avatar',
+                'phone_number', 'track_number',
+                'company', 'role', 'custom_role',
             )
         }),
+        ('Разрешения — базовые', {'fields': BASE_PERMS}),
+        ('Разрешения — строительство', {'fields': BUILDING_PERMS}),
+        ('Разрешения — барбершоп', {'fields': BARBER_PERMS}),
+        ('Разрешения — хостел', {'fields': HOSTEL_PERMS}),
+        ('Разрешения — кафе', {'fields': CAFE_PERMS}),
+        ('Разрешения — школа', {'fields': SCHOOL_PERMS}),
+        ('Разрешения — прочие', {'fields': EXTRA_PERMS}),
         ('Права доступа', {
-            'fields': (
-                'is_active', 'is_staff', 'is_superuser',
-                'groups', 'user_permissions'
-            )
+            'fields': ('is_active', 'is_staff', 'is_superuser', 'groups', 'user_permissions')
         }),
         ('Даты', {'fields': ('last_login', 'created_at', 'updated_at')}),
     )
@@ -64,51 +152,39 @@ class UserAdmin(BaseUserAdmin):
             'classes': ('wide',),
             'fields': (
                 'email', 'password1', 'password2',
-                'first_name', 'last_name', 'avatar', 'company', 'role', 'custom_role',
-                'can_view_dashboard', 'can_view_cashbox', 'can_view_departments',
-                'can_view_orders', 'can_view_analytics', 'can_view_department_analytics',
-                'can_view_products', 'can_view_booking',
-                'can_view_employees', 'can_view_clients',
-                'can_view_brand_category', 'can_view_settings', 'can_view_sale',
-                'is_staff', 'is_superuser', 'is_active'
+                'first_name', 'last_name', 'avatar',
+                'phone_number', 'track_number',
+                'company', 'role', 'custom_role',
             ),
+        }),
+        ('Разрешения — базовые', {'fields': BASE_PERMS}),
+        ('Разрешения — строительство', {'fields': BUILDING_PERMS}),
+        ('Разрешения — барбершоп', {'fields': BARBER_PERMS}),
+        ('Разрешения — хостел', {'fields': HOSTEL_PERMS}),
+        ('Разрешения — кафе', {'fields': CAFE_PERMS}),
+        ('Разрешения — школа', {'fields': SCHOOL_PERMS}),
+        ('Разрешения — прочие', {'fields': EXTRA_PERMS}),
+        ('Права доступа', {
+            'fields': ('is_staff', 'is_superuser', 'is_active', 'groups', 'user_permissions')
         }),
     )
 
     def get_form(self, request, obj=None, **kwargs):
-        """Делаем пароль необязательным при редактировании"""
+        # Пароль необязателен при редактировании
         form = super().get_form(request, obj, **kwargs)
         if obj is not None and 'password' in form.base_fields:
             form.base_fields['password'].required = False
         return form
 
-    def formfield_for_foreignkey(self, db_field, request, **kwargs):
-        """
-        Несуперпользователям — только их компания в выпадающем списке.
-        """
-        if db_field.name == "company" and not request.user.is_superuser:
-            user_company = getattr(request.user, "company", None) or getattr(request.user, "owned_company", None)
-            if user_company:
-                kwargs["queryset"] = Company.objects.filter(id=user_company.id)
-            else:
-                kwargs["queryset"] = Company.objects.none()
-        return super().formfield_for_foreignkey(db_field, request, **kwargs)
-
     def save_model(self, request, obj, form, change):
-        """Если роль owner/admin — включаем все права"""
+        # Для owner/admin включаем все can_* флаги автоматически
         if obj.role in ['owner', 'admin']:
-            permission_fields = [
-                'can_view_dashboard', 'can_view_cashbox', 'can_view_departments',
-                'can_view_orders', 'can_view_analytics', 'can_view_department_analytics',
-                'can_view_products', 'can_view_booking',
-                'can_view_employees', 'can_view_clients',
-                'can_view_brand_category', 'can_view_settings', 'can_view_sale'
-            ]
-            for field in permission_fields:
-                setattr(obj, field, True)
+            for f in obj._meta.get_fields():
+                if isinstance(f, dj_models.BooleanField) and f.name.startswith('can_'):
+                    setattr(obj, f.name, True)
         super().save_model(request, obj, form, change)
 
-    # --- отображение филиалов в списке пользователей ---
+    # ---- отображение филиалов в списке ----
     def primary_branch_display(self, obj):
         mb = obj.branch_memberships.filter(is_primary=True).select_related("branch").first()
         return mb.branch.name if mb and mb.branch else "-"
@@ -123,157 +199,115 @@ class UserAdmin(BaseUserAdmin):
         return result
     branches_display.short_description = "Филиалы"
 
+# -------------------- Company --------------------
 
-# =========================
-# Inline: филиалы внутри компании
-# =========================
-class BranchInline(admin.TabularInline):
-    model = Branch
-    extra = 1
-    fields = (
-        'name', 'code', 'address', 'phone', 'email',
-        'timezone', 'subscription_plan', 'is_active'
-    )
-    show_change_link = True
-    autocomplete_fields = ('subscription_plan',)
-    verbose_name = "Филиал"
-    verbose_name_plural = "Филиалы"
-
-
-# 🏢 Компания
 @admin.register(Company)
 class CompanyAdmin(admin.ModelAdmin):
     list_display = (
-        'name', 'get_industry_name', 'sector', 'owner',
-        'employee_count', 'branch_count',
-        'created_at', 'start_date', 'end_date',
-        'can_view_documents', 'can_view_whatsapp', 'can_view_instagram', 'can_view_telegram'
+        "name", "owner", "subscription_plan", "industry", "sector",
+        "start_date", "end_date",
+        "can_view_documents", "can_view_whatsapp", "can_view_instagram", "can_view_telegram",
+        "created_at",
     )
-    list_filter = ('sector', 'subscription_plan', 'can_view_documents', 'can_view_whatsapp',
-                   'can_view_instagram', 'can_view_telegram')
-    search_fields = ('name', 'industry__name', 'sector__name', 'owner__email')
-    ordering = ('name',)
-    readonly_fields = ('employees_list', 'created_at')
-    inlines = [BranchInline]
+    list_filter = ("subscription_plan", "industry", "sector",
+                   "can_view_documents", "can_view_whatsapp", "can_view_instagram", "can_view_telegram")
+    search_fields = ("name", "owner__email", "llc", "inn", "address")
+    readonly_fields = ("created_at",)
+    autocomplete_fields = ("owner", "subscription_plan", "industry", "sector")
 
     fieldsets = (
-        (None, {
-            'fields': (
-                'name', 'industry', 'sector', 'subscription_plan', 'owner'
-            )
-        }),
-        ('Сотрудники', {
-            'fields': ('employees_list',)
-        }),
-        ('Доступы', {
-            'fields': (
-                'can_view_documents', 'can_view_whatsapp',
-                'can_view_instagram', 'can_view_telegram'
-            )
-        }),
-        ('Даты', {
-            'fields': ('start_date', 'end_date', 'created_at')
-        }),
+        (None, {"fields": ("name", "owner", "subscription_plan", "industry", "sector")}),
+        ("Юр./банковские данные", {"fields": ("llc", "inn", "okpo", "score", "bik", "address")}),
+        ("Доступы к каналам", {"fields": ("can_view_documents", "can_view_whatsapp", "can_view_instagram", "can_view_telegram")}),
+        ("Срок действия", {"fields": ("start_date", "end_date", "created_at")}),
     )
 
-    def get_industry_name(self, obj):
-        return obj.industry.name if obj.industry else '-'
-    get_industry_name.short_description = 'Вид деятельности'
+# -------------------- Branch --------------------
 
-    def employee_count(self, obj):
-        return obj.employees.count()
-    employee_count.short_description = 'Кол-во сотрудников'
+@admin.register(Branch)
+class BranchAdmin(CompanyScopedFKMixin, admin.ModelAdmin):
+    list_display = (
+        "name", "company", "code", "subscription_plan",
+        "is_active", "created_at", "updated_at", "features_display"
+    )
+    list_filter = ("company", "subscription_plan", "is_active")
+    search_fields = ("name", "code", "company__name", "email")
+    readonly_fields = ("created_at", "updated_at")
+    inlines = [BranchMembershipInlineForBranch]
+    autocomplete_fields = ("company", "subscription_plan", "features")
+    filter_horizontal = ("features",)
 
-    def branch_count(self, obj):
-        return obj.branches.count()
-    branch_count.short_description = 'Кол-во филиалов'
+    def features_display(self, obj):
+        names = list(obj.features.values_list("name", flat=True)[:5])
+        total = obj.features.count()
+        if not names:
+            return "-"
+        return ", ".join(names) + (f" и ещё {total - 5}" if total > 5 else "")
+    features_display.short_description = "Функции"
 
-    def employees_list(self, obj):
-        employees = obj.employees.all()[:5]
-        if not employees:
-            return "Нет сотрудников"
-        names = []
-        for e in employees:
-            role_display = e.custom_role.name if e.custom_role else e.role_display
-            names.append(f'{e.first_name} {e.last_name} ({role_display})')
-        result = ', '.join(names)
-        total = obj.employees.count()
-        if total > 5:
-            result += f" и ещё {total - 5}"
-        return result
-    employees_list.short_description = 'Сотрудники'
+# -------------------- BranchMembership --------------------
 
+@admin.register(BranchMembership)
+class BranchMembershipAdmin(CompanyScopedFKMixin, admin.ModelAdmin):
+    list_display = ("user", "branch", "role", "is_primary", "created_at")
+    list_filter = ("is_primary", "branch__company")
+    search_fields = ("user__email", "user__first_name", "user__last_name", "branch__name", "role")
+    readonly_fields = ("created_at",)
+    autocomplete_fields = ("user", "branch")
 
-# 🏭 Сектора (inline в индустрии)
-class SectorInline(admin.TabularInline):
-    model = Industry.sectors.through
-    extra = 1
-    verbose_name = 'Отрасль'
-    verbose_name_plural = 'Отрасли'
+# -------------------- Feature / SubscriptionPlan --------------------
 
-
-# 🧩 Индустрия
-@admin.register(Industry)
-class IndustryAdmin(admin.ModelAdmin):
-    list_display = ('name',)
-    search_fields = ('name',)
-    ordering = ('name',)
-    inlines = [SectorInline]
-    exclude = ('sectors',)
-
-
-# ⭐ Фича
 @admin.register(Feature)
 class FeatureAdmin(admin.ModelAdmin):
-    list_display = ('name', 'description')
-    search_fields = ('name',)
+    list_display = ("name", "description_short")
+    search_fields = ("name",)
 
+    def description_short(self, obj):
+        if not obj.description:
+            return "-"
+        return (obj.description[:80] + "…") if len(obj.description) > 80 else obj.description
+    description_short.short_description = "Описание"
 
-# 📦 Тариф
 @admin.register(SubscriptionPlan)
 class SubscriptionPlanAdmin(admin.ModelAdmin):
-    list_display = ('name', 'price', 'description')
-    search_fields = ('name',)
-    fields = ('name', 'price', 'description', 'features')
-    filter_horizontal = ('features',)
-    readonly_fields = ('id',)
+    list_display = ("name", "price", "features_display")
+    search_fields = ("name",)
+    filter_horizontal = ("features",)
 
+    def features_display(self, obj):
+        names = list(obj.features.values_list("name", flat=True)[:5])
+        total = obj.features.count()
+        if not names:
+            return "-"
+        return ", ".join(names) + (f" и ещё {total - 5}" if total > 5 else "")
+    features_display.short_description = "Функции"
 
-# 📚 Сектор
+# -------------------- Sector / Industry --------------------
+
 @admin.register(Sector)
 class SectorAdmin(admin.ModelAdmin):
-    list_display = ('name',)
-    search_fields = ('name',)
+    list_display = ("name",)
+    search_fields = ("name",)
 
+@admin.register(Industry)
+class IndustryAdmin(admin.ModelAdmin):
+    list_display = ("name", "sectors_display")
+    search_fields = ("name", "sectors__name")
+    filter_horizontal = ("sectors",)
 
-# 🎭 Кастомные роли
+    def sectors_display(self, obj):
+        names = list(obj.sectors.values_list("name", flat=True)[:5])
+        total = obj.sectors.count()
+        if not names:
+            return "-"
+        return ", ".join(names) + (f" и ещё {total - 5}" if total > 5 else "")
+    sectors_display.short_description = "Отрасли"
+
+# -------------------- CustomRole --------------------
+
 @admin.register(CustomRole)
-class CustomRoleAdmin(admin.ModelAdmin):
-    list_display = ('name', 'company')
-    search_fields = ('name', 'company__name')
-    ordering = ('name',)
-
-
-# 🏬 Филиал (отдельный админ, если нужно)
-@admin.register(Branch)
-class BranchAdmin(admin.ModelAdmin):
-    list_display = ('name', 'code', 'company', 'is_active', 'created_at')
-    list_filter = ('company', 'is_active')
-    search_fields = ('name', 'code', 'address', 'phone', 'email')
-    ordering = ('company', 'name')
-    readonly_fields = ('created_at', 'updated_at')
-
-    fieldsets = (
-        (None, {
-            'fields': ('company', 'name', 'code', 'is_active')
-        }),
-        ('Контакты/адрес', {
-            'fields': ('address', 'phone', 'email', 'timezone')
-        }),
-        ('Тариф/фичи', {
-            'fields': ('subscription_plan', 'features')
-        }),
-        ('Служебные', {
-            'fields': ('created_at', 'updated_at')
-        }),
-    )
+class CustomRoleAdmin(CompanyScopedFKMixin, admin.ModelAdmin):
+    list_display = ("name", "company")
+    list_filter = ("company",)
+    search_fields = ("name", "company__name")
+    autocomplete_fields = ("company",)
