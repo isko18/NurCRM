@@ -6,6 +6,8 @@ from rest_framework.exceptions import PermissionDenied
 from rest_framework.filters import SearchFilter, OrderingFilter  # NEW
 from django.db.models.deletion import ProtectedError
 from django.db.models import Q
+from django.db import IntegrityError
+from rest_framework.exceptions import ValidationError
 
 from django_filters import rest_framework as filters
 from django_filters.rest_framework import DjangoFilterBackend
@@ -143,6 +145,18 @@ class ServiceListCreateView(CompanyQuerysetMixin, generics.ListCreateAPIView):
     search_fields = ["name", "category"]  # NEW
     ordering_fields = ["name", "price", "is_active"]  # NEW
     ordering = ["name"]  # NEW
+
+    def create(self, request, *args, **kwargs):
+        try:
+            return super().create(request, *args, **kwargs)
+        except IntegrityError as e:
+            msg = "Услуга с таким названием уже существует."
+            s = str(e)
+            if "uniq_service_name_global_per_company" in s:
+                msg = "Глобальная услуга с таким названием уже существует в компании."
+            elif "uniq_service_name_per_branch" in s:
+                msg = "Услуга с таким названием уже существует в этом филиале."
+            raise ValidationError({"name": msg})
 
 
 class ServiceRetrieveUpdateDestroyView(
