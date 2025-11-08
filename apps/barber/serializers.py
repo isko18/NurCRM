@@ -92,14 +92,39 @@ class ServiceSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
         fields = ["id", "company", "branch", "name", "time", "category", "price", "is_active"]
         read_only_fields = ["id", "company", "branch"]
 
+    def validate_name(self, value):
+        # Нормализуем пробелы; если нужна строгая регистронезависимость – добавьте iexact ниже
+        return (value or "").strip()
+
     def validate(self, attrs):
         """
-        Если активен филиал (для этого пользователя/запроса) —
-        услуга может быть только глобальной (None) или этого филиала.
-        (Поле branch read-only, поэтому клиент не может подменить филиал.)
+        Не даём создать дубликат в рамках ТЕКУЩЕГО уровня видимости:
+          - если у пользователя есть активный филиал → проверяем уникальность в этом филиале
+          - если филиала нет → проверяем уникальность среди глобальных (branch IS NULL)
+        (Глобальные и филиальные между собой могут совпадать — как и в ваших DB-constraints.)
         """
-        # target_branch = self._auto_branch()
-        # Здесь дополнительных проверок не требуется, т.к. branch мы проставим в create().
+        request = self.context.get("request")
+        user_company_id = getattr(getattr(request, "user", None), "company_id", None) if request else None
+        if not user_company_id:
+            return attrs
+
+        target_branch = self._auto_branch()  # тот же механизм, что и при create()
+        name = attrs.get("name") or getattr(self.instance, "name", None)
+        if not name:
+            return attrs
+
+        qs = Service.objects.filter(company_id=user_company_id, name__iexact=name)
+        if target_branch is None:
+            qs = qs.filter(branch__isnull=True)
+        else:
+            qs = qs.filter(branch=target_branch)
+
+        if self.instance:
+            qs = qs.exclude(pk=self.instance.pk)
+
+        if qs.exists():
+            raise serializers.ValidationError({"name": "Услуга с таким названием уже существует на этом уровне (глобально/филиал)."})
+
         return attrs
 
 
