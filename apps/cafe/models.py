@@ -86,9 +86,27 @@ class KitchenTask(models.Model):
 
 class NotificationCafe(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    company = models.ForeignKey(Company, on_delete=models.CASCADE, related_name='notifications')
-    branch = models.ForeignKey(Branch, on_delete=models.SET_NULL, null=True, blank=True, related_name='notifications')
-    recipient = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='notifications')
+
+    company = models.ForeignKey(
+        Company,
+        on_delete=models.CASCADE,
+        related_name='cafe_notifications',            # было: 'notifications'
+        related_query_name='cafe_notification',
+    )
+    branch = models.ForeignKey(
+        Branch,
+        on_delete=models.SET_NULL,
+        null=True, blank=True,
+        related_name='cafe_notifications',            # безопасно дать своё имя
+        related_query_name='cafe_notification',
+    )
+    recipient = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name='cafe_notifications',            # было: 'notifications'
+        related_query_name='cafe_notification',
+    )
+
     type = models.CharField(max_length=64, default='kitchen_ready')
     message = models.CharField(max_length=255)
     payload = models.JSONField(default=dict, blank=True)
@@ -104,7 +122,6 @@ class NotificationCafe(models.Model):
 
     def __str__(self):
         return f'Notify -> {self.recipient_id}: {self.message}'
-
 
 # ==========================
 # Клиент кафе
