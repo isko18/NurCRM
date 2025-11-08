@@ -7,8 +7,10 @@ from django.utils import timezone
 from .models import (
     CafeClient, Order, OrderItem, Table, MenuItem,
     OrderHistory, OrderItemHistory,
-    Zone,  # для фильтров по связям
+    Zone,  Warehouse,
     KitchenTask, NotificationCafe,
+    InventorySession, InventoryItem,
+    Equipment, EquipmentInventorySession, EquipmentInventoryItem,
 )
 
 
@@ -370,3 +372,53 @@ class NotificationCafeAdmin(admin.ModelAdmin):
         updated = queryset.filter(is_read=False).update(is_read=True, read_at=now)
         self.message_user(request, f"Помечено прочитанным: {updated}")
     mark_as_read.short_description = "Пометить как прочитанные"
+
+
+class InventoryItemInline(admin.TabularInline):
+    model = InventoryItem
+    extra = 0
+    readonly_fields = ("difference",)
+    fields = ("product", "expected_qty", "actual_qty", "difference")
+    autocomplete_fields = ("product",)
+    show_change_link = False
+
+@admin.register(InventorySession)
+class InventorySessionAdmin(admin.ModelAdmin):
+    list_display = ("id", "company", "branch", "created_by", "is_confirmed", "created_at", "confirmed_at")
+    list_filter = ("company", "branch", "is_confirmed", "created_at")
+    search_fields = ("comment",)
+    readonly_fields = ("created_at", "confirmed_at")
+    inlines = [InventoryItemInline]
+    ordering = ("-created_at",)
+
+
+# ------- Оборудование -------
+@admin.register(Equipment)
+class EquipmentAdmin(admin.ModelAdmin):
+    list_display = ("title", "serial_number", "company", "branch", "category", "condition", "is_active")
+    list_filter = ("company", "branch", "category", "condition", "is_active")
+    search_fields = ("title", "serial_number", "category", "notes")
+    ordering = ("title",)
+
+
+class EquipmentInventoryItemInline(admin.TabularInline):
+    model = EquipmentInventoryItem
+    extra = 0
+    fields = ("equipment", "is_present", "condition", "notes")
+    autocomplete_fields = ("equipment",)
+
+@admin.register(EquipmentInventorySession)
+class EquipmentInventorySessionAdmin(admin.ModelAdmin):
+    list_display = ("id", "company", "branch", "created_by", "is_confirmed", "created_at", "confirmed_at")
+    list_filter = ("company", "branch", "is_confirmed", "created_at")
+    search_fields = ("comment",)
+    readonly_fields = ("created_at", "confirmed_at")
+    inlines = [EquipmentInventoryItemInline]
+    ordering = ("-created_at",)
+    
+@admin.register(Warehouse)
+class WarehouseAdmin(admin.ModelAdmin):
+    list_display = ("title", "company", "branch", "unit", "remainder", "minimum")
+    list_filter = ("company", "branch", "unit")
+    search_fields = ("title", "unit")     # <- обязательно для автокомплита
+    ordering = ("company", "branch", "title")

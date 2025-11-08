@@ -21,7 +21,9 @@ from .views import (
     # Kitchen / notifications / analytics
     KitchenTaskListView, KitchenTaskClaimView, KitchenTaskReadyView, KitchenTaskMonitorView,
     KitchenAnalyticsByCookView, KitchenAnalyticsByWaiterView,
-    NotificationListView,
+    NotificationListView, InventorySessionListCreateView, InventorySessionRetrieveView, InventorySessionConfirmView,
+    EquipmentListCreateView, EquipmentRetrieveUpdateDestroyView,
+    EquipmentInventorySessionListCreateView, EquipmentInventorySessionRetrieveView, EquipmentInventorySessionConfirmView,
 )
 
 app_name = "cafe"
@@ -93,4 +95,16 @@ urlpatterns = [
 
     # === Notifications (официант) ===
     path("notifications/", NotificationListView.as_view(), name="notifications-list"),
+    
+    
+    path("inventory/sessions/", InventorySessionListCreateView.as_view(), name="inventory-session-list"),
+    path("inventory/sessions/<uuid:pk>/", InventorySessionRetrieveView.as_view(), name="inventory-session-detail"),
+    path("inventory/sessions/<uuid:pk>/confirm/", InventorySessionConfirmView.as_view(), name="inventory-session-confirm"),
+
+    # ==================== INVENTORY: оборудование ====================
+    path("equipment/", EquipmentListCreateView.as_view(), name="equipment-list"),
+    path("equipment/<uuid:pk>/", EquipmentRetrieveUpdateDestroyView.as_view(), name="equipment-detail"),
+    path("equipment/inventory/sessions/", EquipmentInventorySessionListCreateView.as_view(), name="equipment-inventory-session-list"),
+    path("equipment/inventory/sessions/<uuid:pk>/", EquipmentInventorySessionRetrieveView.as_view(), name="equipment-inventory-session-detail"),
+    path("equipment/inventory/sessions/<uuid:pk>/confirm/", EquipmentInventorySessionConfirmView.as_view(), name="equipment-inventory-session-confirm"),
 ]

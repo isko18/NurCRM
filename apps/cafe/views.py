@@ -12,7 +12,7 @@ from .models import (
     Zone, Table, Booking, Warehouse, Purchase,
     Category, MenuItem, Ingredient,
     Order, OrderItem, CafeClient,
-    OrderHistory, KitchenTask, NotificationCafe,
+    OrderHistory, KitchenTask, NotificationCafe, InventorySession, Equipment, EquipmentInventorySession,
 )
 from .serializers import (
     ZoneSerializer, TableSerializer, BookingSerializer,
@@ -21,7 +21,7 @@ from .serializers import (
     OrderSerializer, OrderItemInlineSerializer,
     CafeClientSerializer,
     OrderHistorySerializer,
-    KitchenTaskSerializer, NotificationCafeSerializer,
+    KitchenTaskSerializer, NotificationCafeSerializer, InventorySessionSerializer, EquipmentSerializer, EquipmentInventorySessionSerializer,
 )
 
 # если добавлял кастомные пермишены — импортируем
@@ -629,3 +629,105 @@ class NotificationListView(CompanyBranchQuerysetMixin, generics.ListAPIView):
         if not company:
             return NotificationCafe.objects.none()
         return NotificationCafe.objects.filter(company=company, recipient=self.request.user).order_by('-created_at')
+
+
+
+class InventorySessionListCreateView(CompanyBranchQuerysetMixin, generics.ListCreateAPIView):
+    """
+    GET  /cafe/inventory/sessions/      — список актов инвентаризации (по компании/филиалу)
+    POST /cafe/inventory/sessions/      — создать акт с items
+    """
+    queryset = InventorySession.objects.select_related("company", "branch", "created_by").all()
+    serializer_class = InventorySessionSerializer
+    filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
+    filterset_fields = ["is_confirmed", "created_at", "confirmed_at"]
+    search_fields = ["comment"]
+    ordering_fields = ["created_at", "confirmed_at", "id"]
+
+    def perform_create(self, serializer):
+        # company/branch заполнит миксин; автора проставит сериализатор
+        super().perform_create(serializer)
+
+
+class InventorySessionRetrieveView(CompanyBranchQuerysetMixin, generics.RetrieveAPIView):
+    """
+    GET /cafe/inventory/sessions/<uuid:pk>/
+    """
+    queryset = InventorySession.objects.select_related("company", "branch", "created_by").prefetch_related("items__product")
+    serializer_class = InventorySessionSerializer
+
+
+class InventorySessionConfirmView(CompanyBranchQuerysetMixin, generics.GenericAPIView):
+    """
+    POST /cafe/inventory/sessions/<uuid:pk>/confirm/
+    Подтверждает акт и переписывает Warehouse.remainder фактическими значениями.
+    """
+    queryset = InventorySession.objects.all()
+    serializer_class = InventorySessionSerializer
+
+    def post(self, request, *args, **kwargs):
+        session = self.get_object()
+        if session.is_confirmed:
+            return Response({"detail": "Уже подтверждено."}, status=status.HTTP_200_OK)
+        session.confirm(user=request.user)
+        data = self.get_serializer(session).data
+        return Response(data, status=status.HTTP_200_OK)
+
+
+# ==================== INVENTORY: оборудование ====================
+class EquipmentListCreateView(CompanyBranchQuerysetMixin, generics.ListCreateAPIView):
+    """
+    GET  /cafe/equipment/
+    POST /cafe/equipment/
+    """
+    queryset = Equipment.objects.select_related("company", "branch")
+    serializer_class = EquipmentSerializer
+    filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
+    filterset_fields = ["category", "condition", "is_active"]
+    search_fields = ["title", "serial_number", "category", "notes"]
+    ordering_fields = ["title", "condition", "is_active", "purchase_date", "id"]
+
+
+class EquipmentRetrieveUpdateDestroyView(CompanyBranchQuerysetMixin, generics.RetrieveUpdateDestroyAPIView):
+    """
+    GET/PATCH/DELETE /cafe/equipment/<uuid:pk>/
+    """
+    queryset = Equipment.objects.select_related("company", "branch")
+    serializer_class = EquipmentSerializer
+
+
+class EquipmentInventorySessionListCreateView(CompanyBranchQuerysetMixin, generics.ListCreateAPIView):
+    """
+    GET  /cafe/equipment/inventory/sessions/
+    POST /cafe/equipment/inventory/sessions/
+    """
+    queryset = EquipmentInventorySession.objects.select_related("company", "branch", "created_by")
+    serializer_class = EquipmentInventorySessionSerializer
+    filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
+    filterset_fields = ["is_confirmed", "created_at", "confirmed_at"]
+    search_fields = ["comment"]
+    ordering_fields = ["created_at", "confirmed_at", "id"]
+
+
+class EquipmentInventorySessionRetrieveView(CompanyBranchQuerysetMixin, generics.RetrieveAPIView):
+    """
+    GET /cafe/equipment/inventory/sessions/<uuid:pk>/
+    """
+    queryset = EquipmentInventorySession.objects.select_related("company", "branch", "created_by").prefetch_related("items__equipment")
+    serializer_class = EquipmentInventorySessionSerializer
+
+
+class EquipmentInventorySessionConfirmView(CompanyBranchQuerysetMixin, generics.GenericAPIView):
+    """
+    POST /cafe/equipment/inventory/sessions/<uuid:pk>/confirm/
+    """
+    queryset = EquipmentInventorySession.objects.all()
+    serializer_class = EquipmentInventorySessionSerializer
+
+    def post(self, request, *args, **kwargs):
+        session = self.get_object()
+        if session.is_confirmed:
+            return Response({"detail": "Уже подтверждено."}, status=status.HTTP_200_OK)
+        session.confirm(user=request.user)
+        data = self.get_serializer(session).data
+        return Response(data, status=status.HTTP_200_OK)
