@@ -136,7 +136,7 @@ class UserSerializer(serializers.ModelSerializer):
             # кафе
             'can_view_cafe_menu', 'can_view_cafe_orders',
             'can_view_cafe_purchasing', 'can_view_cafe_booking',
-            'can_view_cafe_clients', 'can_view_cafe_tables',
+            'can_view_cafe_clients', 'can_view_cafe_tables', 'can_view_cafe_cook', 'can_view_cafe_inventory',
             # школа
             'can_view_school_students', 'can_view_school_groups',
             'can_view_school_lessons', 'can_view_school_teachers',
@@ -183,7 +183,7 @@ class UserSerializer(serializers.ModelSerializer):
             # кафе
             'can_view_cafe_menu', 'can_view_cafe_orders',
             'can_view_cafe_purchasing', 'can_view_cafe_booking',
-            'can_view_cafe_clients', 'can_view_cafe_tables',
+            'can_view_cafe_clients', 'can_view_cafe_tables', 'can_view_cafe_cook', 'can_view_cafe_inventory',
             # школа
             'can_view_school_students', 'can_view_school_groups',
             'can_view_school_lessons', 'can_view_school_teachers',
@@ -290,7 +290,7 @@ class OwnerRegisterSerializer(serializers.ModelSerializer):
             # кафе
             'can_view_cafe_menu', 'can_view_cafe_orders',
             'can_view_cafe_purchasing', 'can_view_cafe_booking',
-            'can_view_cafe_clients', 'can_view_cafe_tables',
+            'can_view_cafe_clients', 'can_view_cafe_tables', 'can_view_cafe_cook', 'can_view_cafe_inventory',
             # школа
             'can_view_school_students', 'can_view_school_groups',
             'can_view_school_lessons', 'can_view_school_teachers',
@@ -369,7 +369,7 @@ class EmployeeCreateSerializer(serializers.ModelSerializer):
 
             'can_view_cafe_menu', 'can_view_cafe_orders',
             'can_view_cafe_purchasing', 'can_view_cafe_booking',
-            'can_view_cafe_clients', 'can_view_cafe_tables',
+            'can_view_cafe_clients', 'can_view_cafe_tables', 'can_view_cafe_cook', 'can_view_cafe_inventory',
 
             'can_view_school_students', 'can_view_school_groups',
             'can_view_school_lessons', 'can_view_school_teachers',
@@ -442,7 +442,7 @@ class EmployeeCreateSerializer(serializers.ModelSerializer):
 
             'can_view_cafe_menu', 'can_view_cafe_orders',
             'can_view_cafe_purchasing', 'can_view_cafe_booking',
-            'can_view_cafe_clients', 'can_view_cafe_tables',
+            'can_view_cafe_clients', 'can_view_cafe_tables', 'can_view_cafe_cook', 'can_view_cafe_inventory',
 
             'can_view_school_students', 'can_view_school_groups',
             'can_view_school_lessons', 'can_view_school_teachers',
@@ -552,7 +552,7 @@ class UserListSerializer(serializers.ModelSerializer):
             'can_view_hostel_clients', 'can_view_hostel_analytics',
             'can_view_cafe_menu', 'can_view_cafe_orders',
             'can_view_cafe_purchasing', 'can_view_cafe_booking',
-            'can_view_cafe_clients', 'can_view_cafe_tables',
+            'can_view_cafe_clients', 'can_view_cafe_tables', 'can_view_cafe_cook', 'can_view_cafe_inventory',
             'can_view_school_students', 'can_view_school_groups',
             'can_view_school_lessons', 'can_view_school_teachers',
             'can_view_school_leads', 'can_view_school_invoices',
@@ -585,7 +585,7 @@ class UserWithPermissionsSerializer(serializers.ModelSerializer):
             'can_view_hostel_clients', 'can_view_hostel_analytics',
             'can_view_cafe_menu', 'can_view_cafe_orders',
             'can_view_cafe_purchasing', 'can_view_cafe_booking',
-            'can_view_cafe_clients', 'can_view_cafe_tables',
+            'can_view_cafe_clients', 'can_view_cafe_tables', 'can_view_cafe_cook', 'can_view_cafe_inventory',
             'can_view_school_students', 'can_view_school_groups',
             'can_view_school_lessons', 'can_view_school_teachers',
             'can_view_school_leads', 'can_view_school_invoices',
@@ -683,7 +683,7 @@ class EmployeeUpdateSerializer(serializers.ModelSerializer):
             'can_view_hostel_clients', 'can_view_hostel_analytics',
             'can_view_cafe_menu', 'can_view_cafe_orders',
             'can_view_cafe_purchasing', 'can_view_cafe_booking',
-            'can_view_cafe_clients', 'can_view_cafe_tables',
+            'can_view_cafe_clients', 'can_view_cafe_tables', 'can_view_cafe_cook', 'can_view_cafe_inventory',
             'can_view_school_students', 'can_view_school_groups',
             'can_view_school_lessons', 'can_view_school_teachers',
             'can_view_school_leads', 'can_view_school_invoices',
