@@ -68,6 +68,8 @@ CAFE_PERMS = (
     'can_view_cafe_booking',
     'can_view_cafe_clients',
     'can_view_cafe_tables',
+    'can_view_cafe_cook', 
+    'can_view_cafe_inventory',
 )
 
 SCHOOL_PERMS = (

@@ -343,6 +343,7 @@ class DepartmentSerializer(CompanyBranchReadOnlyMixin):
             'can_view_cafe_menu', 'can_view_cafe_orders',
             'can_view_cafe_purchasing', 'can_view_cafe_booking',
             'can_view_cafe_clients', 'can_view_cafe_tables',
+            'can_view_cafe_cook', 'can_view_cafe_inventory',
 
             # школа / CRM
             'can_view_school_students', 'can_view_school_groups',
