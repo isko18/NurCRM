@@ -1457,14 +1457,14 @@ class ItemListCreateAPIView(CompanyBranchRestrictedMixin, generics.ListCreateAPI
 
 
 class ItemRetrieveUpdateDestroyAPIView(CompanyBranchRestrictedMixin, generics.RetrieveUpdateDestroyAPIView):
-    """
-    GET    /api/main/items/<uuid:pk>/
-    PATCH  /api/main/items/<uuid:pk>/
-    PUT    /api/main/items/<uuid:pk>/
-    DELETE /api/main/items/<uuid:pk>/
-    """
     serializer_class = ItemMakeSerializer
     queryset = ItemMake.objects.all()
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        print("DEBUG ItemRetrieveUpdateDestroyAPIView queryset model:", qs.model.__name__)
+        return qs
+
 
 
 # ===========================
