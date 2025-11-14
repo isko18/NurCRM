@@ -143,7 +143,7 @@ class UserSerializer(serializers.ModelSerializer):
             'can_view_school_leads', 'can_view_school_invoices',
             'can_view_clients', 'can_view_client_requests', 'can_view_salary',
             'can_view_sales', 'can_view_services', 'can_view_agent', 'can_view_catalog',
-            'can_view_branch'
+            'can_view_branch',
             # филиалы (read-only)
             'branch_ids', 'primary_branch_id',
             'created_at', 'updated_at',
