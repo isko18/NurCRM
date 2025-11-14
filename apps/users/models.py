@@ -183,6 +183,7 @@ class User(AbstractBaseUser, PermissionsMixin):
     can_view_services = models.BooleanField(default=False, verbose_name='Доступ к услугам')
     can_view_agent = models.BooleanField(default=False, verbose_name='Доступ к агентам')
     can_view_catalog = models.BooleanField(default=False, verbose_name='Доступ к каталогу')
+    can_view_branch = models.BooleanField(default=False, verbose_name='Доступ к филиалу')
 
     # Распределение сотрудника по филиалам (через промежуточную модель)
     branches = models.ManyToManyField(
