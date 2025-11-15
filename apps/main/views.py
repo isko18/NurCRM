@@ -3,12 +3,12 @@ from uuid import UUID
 
 from django.db import transaction
 from django.db.models import Sum, Count, Avg, F, Q, Prefetch, Value as V
-from django.utils.dateparse import parse_date
+from django.utils.dateparse import parse_date, parse_datetime
 from django.utils import timezone
 from itertools import groupby
 from typing import List, Optional, Dict, Any
 from operator import attrgetter
-from datetime import datetime
+from datetime import datetime, date as _date
 from django.db.models.functions import Coalesce
 
 from rest_framework import generics, permissions, filters, status
@@ -20,7 +20,7 @@ from django.shortcuts import get_object_or_404
 from rest_framework import serializers
 from .filters import TransactionRecordFilter, DebtFilter, DebtPaymentFilter
 from django_filters.rest_framework import DjangoFilterBackend
-import dateparse
+
 from apps.construction.models import Department
 from apps.users.models import Branch
 
@@ -30,7 +30,8 @@ from apps.main.models import (
     ProductBrand, ProductCategory, Warehouse, WarehouseEvent, Client,
     GlobalProduct, GlobalBrand, GlobalCategory, ClientDeal, Bid, SocialApplications, TransactionRecord,
     ContractorWork, DealInstallment, DebtPayment, Debt, ObjectSaleItem, ObjectSale, ObjectItem, ItemMake,
-    ManufactureSubreal, Acceptance, ReturnFromAgent, AgentSaleAllocation, ProductImage
+    ManufactureSubreal, Acceptance, ReturnFromAgent, AgentSaleAllocation, ProductImage,
+    AgentRequestCart, AgentRequestItem
 )
 from apps.main.serializers import (
     ContactSerializer, PipelineSerializer, DealSerializer, TaskSerializer,
@@ -38,7 +39,16 @@ from apps.main.serializers import (
     ReviewSerializer, NotificationSerializer, EventSerializer,
     WarehouseSerializer, WarehouseEventSerializer,
     ProductCategorySerializer, ProductBrandSerializer,
-    OrderItemSerializer, ClientSerializer, ClientDealSerializer, BidSerializers, SocialApplicationsSerializers, TransactionRecordSerializer, ContractorWorkSerializer, DebtSerializer, DebtPaymentSerializer, ObjectItemSerializer, ObjectSaleSerializer, ObjectSaleItemSerializer, BulkIdsSerializer, ItemMakeSerializer, ManufactureSubrealSerializer, AcceptanceCreateSerializer, ReturnCreateSerializer, BulkSubrealCreateSerializer, AcceptanceReadSerializer, ReturnApproveSerializer, ReturnReadSerializer, AgentProductOnHandSerializer, AgentWithProductsSerializer, GlobalProductReadSerializer, ProductImageSerializer, AgentRequestItem, AgentRequestCartApproveSerializer, AgentRequestCartRejectSerializer, AgentRequestCartSerializer, AgentRequestCartSubmitSerializer, AgentRequestCart, AgentRequestItemSerializer
+    OrderItemSerializer, ClientSerializer, ClientDealSerializer, BidSerializers, SocialApplicationsSerializers,
+    TransactionRecordSerializer, ContractorWorkSerializer, DebtSerializer, DebtPaymentSerializer,
+    ObjectItemSerializer, ObjectSaleSerializer, ObjectSaleItemSerializer,
+    BulkIdsSerializer, ItemMakeSerializer,
+    ManufactureSubrealSerializer, AcceptanceCreateSerializer, ReturnCreateSerializer,
+    BulkSubrealCreateSerializer, AcceptanceReadSerializer, ReturnApproveSerializer, ReturnReadSerializer,
+    AgentProductOnHandSerializer, AgentWithProductsSerializer, GlobalProductReadSerializer,
+    ProductImageSerializer,
+    AgentRequestCartApproveSerializer, AgentRequestCartRejectSerializer,
+    AgentRequestCartSerializer, AgentRequestCartSubmitSerializer, AgentRequestItemSerializer
 )
 from django.db.models import ProtectedError
 from apps.utils import product_images_prefetch, _is_owner_like
@@ -99,17 +109,20 @@ class AgentCartLockMixin:
             .get(pk=cart.pk)
         )
         return locked_cart
-    
+
+
 class CompanyBranchRestrictedMixin:
     """
     - Фильтрует queryset по компании и (если у модели есть поле branch) по «активному филиалу».
     - На create/save подставляет company и (если у модели есть поле branch) — текущий филиал.
     - Активный филиал:
+
         1) user.primary_branch() или user.primary_branch (если принадлежит компании)
-        2) request.branch (если мидлварь поставила и принадлежит компании)
+        2) request.branch (если мидлварь уже положила)
         3) ?branch=<uuid> в запросе (если филиал принадлежит компании пользователя и у пользователя нет
            "жёстко" назначенного филиала)
         4) None (нет филиала — работаем по всей компании, без фильтра по branch)
+
     Логика выборки:
         - если branch определён → показываем только данные этого филиала;
         - если branch = None → показываем все данные компании (без ограничения по branch).
@@ -327,6 +340,8 @@ def _get_company(user):
     if getattr(user, "is_superuser", False):
         return None
     return getattr(user, "owned_company", None) or getattr(user, "company", None)
+
+
 # ===========================
 #  Contacts
 # ===========================
@@ -566,23 +581,27 @@ class ProductCreateManualAPIView(generics.CreateAPIView, CompanyBranchRestricted
         if raw_value is None or raw_value == "":
             return None
 
+        # datetime
         if isinstance(raw_value, timezone.datetime):
             dt = raw_value
             if timezone.is_naive(dt):
                 dt = timezone.make_aware(dt)
             return dt
 
-        if isinstance(raw_value, timezone.datetime.date) and not isinstance(raw_value, timezone.datetime):
+        # date
+        if isinstance(raw_value, _date) and not isinstance(raw_value, timezone.datetime):
             d = raw_value
             dt = timezone.datetime(d.year, d.month, d.day, 0, 0, 0)
             return timezone.make_aware(dt)
 
-        dt = dateparse.parse_datetime(raw_value)
+        # строка
+        s = str(raw_value)
+        dt = parse_datetime(s)
         if dt:
             if timezone.is_naive(dt):
                 dt = timezone.make_aware(dt)
             return dt
-        d = dateparse.parse_date(raw_value)
+        d = parse_date(s)
         if d:
             dt = timezone.datetime(d.year, d.month, d.day, 0, 0, 0)
             return timezone.make_aware(dt)
@@ -664,7 +683,7 @@ class ProductCreateManualAPIView(generics.CreateAPIView, CompanyBranchRestricted
 
         item_make_input = data.get("item_make") or data.get("item_make_ids")
         if item_make_input:
-            if isinstance(item_make_input, (str,)):
+            if isinstance(item_make_input, str):
                 item_make_ids = [item_make_input]
             elif isinstance(item_make_input, (list, tuple)):
                 item_make_ids = list(item_make_input)
@@ -673,7 +692,10 @@ class ProductCreateManualAPIView(generics.CreateAPIView, CompanyBranchRestricted
 
             ims = ItemMake.objects.filter(id__in=item_make_ids, company=company)
             if len(item_make_ids) != ims.count():
-                return Response({"item_make": "Один или несколько item_make не найдены или принадлежат другой компании."}, status=400)
+                return Response(
+                    {"item_make": "Один или несколько item_make не найдены или принадлежат другой компании."},
+                    status=400
+                )
             product.item_make.set(ims)
 
         if barcode:
@@ -690,7 +712,7 @@ class ProductRetrieveUpdateDestroyAPIView(CompanyBranchRestrictedMixin, generics
     queryset = (
         Product.objects
         .select_related("brand", "category", "client")
-        .prefetch_related("item_make", product_images_prefetch)   # ← добавили
+        .prefetch_related("item_make", product_images_prefetch)
         .all()
     )
 
@@ -875,7 +897,7 @@ class ProductByBarcodeAPIView(CompanyBranchRestrictedMixin, generics.RetrieveAPI
         qs = (
             Product.objects
             .select_related("brand", "category", "client")
-            .prefetch_related("item_make", product_images_prefetch)   # ← добавили
+            .prefetch_related("item_make", product_images_prefetch)
             .all()
         )
         return self._filter_qs_company_branch(qs)
@@ -909,18 +931,20 @@ class ProductByGlobalBarcodeAPIView(CompanyBranchRestrictedMixin, generics.Retri
         if not obj:
             raise NotFound(detail="Товар с таким штрих-кодом не найден в глобальной базе")
         return obj
-    
+
+
 class ProductListView(CompanyBranchRestrictedMixin, generics.ListAPIView):
     serializer_class = ProductSerializer
     filter_backends = [filters.SearchFilter, filters.OrderingFilter]
     search_fields = ["name", "barcode"]
-    ordering_fields = ["created_at", "updated_at, price", "price"]
+    ordering_fields = ["created_at", "updated_at", "price"]
+    ordering = ["-created_at"]
 
     def get_queryset(self):
         qs = (
             Product.objects
             .select_related("brand", "category", "client")
-            .prefetch_related("item_make", product_images_prefetch)   # ← добавили
+            .prefetch_related("item_make", product_images_prefetch)
             .all()
         )
         return self._filter_qs_company_branch(qs)
@@ -937,11 +961,11 @@ class OrderAnalyticsView(APIView, CompanyBranchRestrictedMixin):
         branch = self._auto_branch()
 
         orders = Order.objects.filter(company=company)
-        if hasattr(Order, "branch"):
-            if branch is None:
-                orders = orders.filter(branch__isnull=True)
-            else:
-                orders = orders.filter(Q(branch__isnull=True) | Q(branch=branch))
+
+        if hasattr(Order, "branch") and branch is not None:
+            # при активном филиале — только этот филиал
+            orders = orders.filter(branch=branch)
+        # если branch is None → все заказы компании без доп. фильтра
 
         start_date = request.query_params.get("start")
         end_date = request.query_params.get("end")
@@ -1115,12 +1139,13 @@ class ClientDealPayAPIView(APIView, CompanyBranchRestrictedMixin):
         client_id = kwargs.get("client_id")
 
         deal_qs = ClientDeal.objects.filter(company=company, pk=pk)
+
         if hasattr(ClientDeal, "branch"):
             branch = self._auto_branch()
-            if branch is None:
-                deal_qs = deal_qs.filter(branch__isnull=True)
-            else:
-                deal_qs = deal_qs.filter(Q(branch__isnull=True) | Q(branch=branch))
+            if branch is not None:
+                deal_qs = deal_qs.filter(branch=branch)
+        # branch is None → без доп. фильтра по филиалу (вся компания)
+
         if client_id:
             deal_qs = deal_qs.filter(client_id=client_id)
 
@@ -1149,6 +1174,7 @@ class ClientDealPayAPIView(APIView, CompanyBranchRestrictedMixin):
 
         data = ClientDealSerializer(deal, context={"request": request}).data
         return Response(data, status=status.HTTP_200_OK)
+
 
 class ClientDealUnpayAPIView(APIView, CompanyBranchRestrictedMixin):
     """
@@ -1183,15 +1209,11 @@ class ClientDealUnpayAPIView(APIView, CompanyBranchRestrictedMixin):
         # 1. Определяем сделку в рамках компании и филиала юзера
         deal_qs = ClientDeal.objects.filter(company=company, pk=pk)
 
-        # branch-ограничение такое же, как у pay()
+        # branch-ограничение
         if hasattr(ClientDeal, "branch"):
             branch = self._auto_branch()
-            if branch is None:
-                # пользователь в "глобальном" контексте -> доступ только к глобальным сделкам
-                deal_qs = deal_qs.filter(branch__isnull=True)
-            else:
-                # пользователь с активным филиалом видит сделки своего филиала И глобальные
-                deal_qs = deal_qs.filter(Q(branch__isnull=True) | Q(branch=branch))
+            if branch is not None:
+                deal_qs = deal_qs.filter(branch=branch)
 
         # если запрос в nested-виде /clients/<client_id>/deals/<pk>/unpay/
         if client_id:
@@ -1237,6 +1259,8 @@ class ClientDealUnpayAPIView(APIView, CompanyBranchRestrictedMixin):
         # 5. Возвращаем актуальное состояние сделки
         data = ClientDealSerializer(deal, context={"request": request}).data
         return Response(data, status=status.HTTP_200_OK)
+
+
 # ===========================
 #  Bids & Social Applications
 # ===========================
@@ -1422,11 +1446,9 @@ class DebtPayAPIView(APIView, CompanyBranchRestrictedMixin):
         branch = self._auto_branch()
 
         qs = Debt.objects.filter(company=company)
-        if hasattr(Debt, "branch"):
-            if branch is None:
-                qs = qs.filter(branch__isnull=True)
-            else:
-                qs = qs.filter(Q(branch__isnull=True) | Q(branch=branch))
+        if hasattr(Debt, "branch") and branch is not None:
+            qs = qs.filter(branch=branch)
+        # branch is None → все долги компании
 
         debt = get_object_or_404(qs, pk=pk)
 
@@ -1558,18 +1580,14 @@ class ItemRetrieveUpdateDestroyAPIView(CompanyBranchRestrictedMixin, generics.Re
 
     def get_queryset(self):
         qs = super().get_queryset()
-        print("DEBUG ItemRetrieveUpdateDestroyAPIView queryset model:", qs.model.__name__)
         return qs
-
 
 
 # ===========================
 #  Subreal / Acceptance / ReturnFromAgent
-#class ManufactureSubrealListCreateAPIView(CompanyBranchRestrictedMixin, generics.ListCreateAPIView):
-    """
-    GET  /api/main/subreals/
-    POST /api/main/subreals/
-    """
+# ===========================
+class ManufactureSubrealListCreateAPIView(CompanyBranchRestrictedMixin, generics.ListCreateAPIView):
+    permission_classes = [permissions.IsAuthenticated]
     serializer_class = ManufactureSubrealSerializer
     filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
     filterset_fields = ["agent", "product", "status", "created_at"]
@@ -1589,74 +1607,10 @@ class ItemRetrieveUpdateDestroyAPIView(CompanyBranchRestrictedMixin, generics.Re
     @transaction.atomic
     def perform_create(self, serializer):
         company = self._company()
-        branch  = self._auto_branch()
+        branch = self._auto_branch()
         product = serializer.validated_data.get("product")
-        agent   = serializer.validated_data.get("agent")
-        qty     = int(serializer.validated_data.get("qty_transferred") or 0)
-        is_sawmill = bool(serializer.validated_data.get("is_sawmill", False))
-
-        # company/branch guards
-        if product and product.company_id != company.id:
-            raise serializers.ValidationError({"product": "Товар другой компании."})
-        if agent and getattr(agent, "company_id", None) != company.id:
-            raise serializers.ValidationError({"agent": "Агент другой компании."})
-        # Если у вас строгая филиальная изоляция товаров — раскомментируйте:
-        # if branch and product and product.branch_id not in (None, branch.id):
-        #     raise serializers.ValidationError({"product": "Товар другого филиала."})
-
-        # Лочим и проверяем склад перед списанием
-        if qty:
-            if not product:
-                raise serializers.ValidationError({"product": "Не выбран товар для списания количества."})
-            locked_qs = type(product).objects.select_for_update().filter(pk=product.pk)
-            current_qty = locked_qs.values_list("quantity", flat=True).first()
-            if current_qty is None or current_qty < qty:
-                raise serializers.ValidationError({"qty_transferred": f"Недостаточно на складе: доступно {current_qty or 0}."})
-
-        # Создаём передачу (company/branch/user проставляем на сервере)
-        obj = serializer.save(company=company, branch=branch, user=self.request.user)
-
-        # Списание со склада
-        if qty:
-            type(product).objects.filter(pk=product.pk).update(quantity=F("quantity") - qty)
-
-        # 🔁 Авто-приём: если флаг is_sawmill=True — принять сразу весь объём
-        if is_sawmill and qty > 0:
-            Acceptance.objects.create(
-                company=company,
-                branch=branch,
-                subreal=obj,
-                accepted_by=self._user(),
-                qty=qty,
-                accepted_at=timezone.now(),
-            )
-
-        return obj
-
-class ManufactureSubrealListCreateAPIView(CompanyBranchRestrictedMixin, generics.ListCreateAPIView):
-    permission_classes = [permissions.IsAuthenticated]
-    serializer_class = ManufactureSubrealSerializer
-    filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
-    filterset_fields = ["agent", "product", "status", "created_at"]
-    search_fields = ["product__name", "agent__username", "agent__first_name", "agent__last_name"]
-    ordering_fields = ["created_at", "qty_transferred", "qty_accepted", "status"]
-    ordering = ["-created_at"]
-
-    def get_queryset(self):
-        qs = (
-            ManufactureSubreal.objects
-            .select_related("company", "user", "agent", "product")
-            .all()
-        )
-        return self._filter_qs_company_branch(qs)
-
-    @transaction.atomic
-    def perform_create(self, serializer):
-        company = self._company()
-        branch  = self._auto_branch()
-        product = serializer.validated_data.get("product")
-        agent   = serializer.validated_data.get("agent")
-        qty     = int(serializer.validated_data.get("qty_transferred") or 0)
+        agent = serializer.validated_data.get("agent")
+        qty = int(serializer.validated_data.get("qty_transferred") or 0)
         is_sawmill = bool(serializer.validated_data.get("is_sawmill", False))
 
         # защита от подмены company
@@ -1726,9 +1680,9 @@ class ManufactureSubrealRetrieveUpdateDestroyAPIView(
 
     def perform_update(self, serializer):
         company = self._company()
-        branch  = self._auto_branch()
-        prod    = serializer.validated_data.get("product")
-        agent   = serializer.validated_data.get("agent")
+        branch = self._auto_branch()
+        prod = serializer.validated_data.get("product")
+        agent = serializer.validated_data.get("agent")
 
         if prod and prod.company_id != company.id:
             raise serializers.ValidationError({"product": "Товар другой компании."})
@@ -1932,17 +1886,17 @@ class ManufactureSubrealBulkCreateAPIView(APIView, CompanyBranchRestrictedMixin)
         )
         ser.is_valid(raise_exception=True)
 
-        agent   = ser.validated_data["agent"]
-        items   = ser.validated_data["items"]
-        user    = self._user()
+        agent = ser.validated_data["agent"]
+        items = ser.validated_data["items"]
+        user = self._user()
         company = self._company()
-        branch  = self._auto_branch()
+        branch = self._auto_branch()
 
         created_objs = []
 
         for item in items:
             product = item["product"]
-            qty     = int(item["qty_transferred"])
+            qty = int(item["qty_transferred"])
             is_sawmill = bool(item.get("is_sawmill", False))
 
             locked_qs = type(product).objects.select_for_update().filter(pk=product.pk)
@@ -2048,7 +2002,7 @@ class AgentMyProductsListAPIView(APIView, CompanyBranchRestrictedMixin):
             for s in subreals:
                 accepted = self._nz(s.qty_accepted)
                 returned = self._nz(s.qty_returned)
-                sold     = _sold_for_sub(s)
+                sold = _sold_for_sub(s)
                 qty_on_hand += max(accepted - returned - sold, 0)
 
             if qty_on_hand <= 0:
@@ -2071,7 +2025,7 @@ class AgentMyProductsListAPIView(APIView, CompanyBranchRestrictedMixin):
             for s in subreals:
                 accepted = self._nz(s.qty_accepted)
                 returned = self._nz(s.qty_returned)
-                sold     = _sold_for_sub(s)
+                sold = _sold_for_sub(s)
                 subreals_payload.append({
                     "id": s.id,
                     "created_at": s.created_at,
@@ -2141,7 +2095,6 @@ class AgentMyProductsListAPIView(APIView, CompanyBranchRestrictedMixin):
             # validate UUID
             try:
                 ids.append(str(UUID(str(it["id"]))))
-
             except Exception:
                 raise ValidationError({f"subreals[{i}].id": "Must be UUID string."})
 
@@ -2185,7 +2138,7 @@ class AgentMyProductsListAPIView(APIView, CompanyBranchRestrictedMixin):
 
                 new_accepted = s.qty_accepted or 0
                 new_returned = s.qty_returned or 0
-                transferred  = s.qty_transferred or 0
+                transferred = s.qty_transferred or 0
 
                 if "qty_accepted" in it and it["qty_accepted"] is not None:
                     new_accepted = it["qty_accepted"]
@@ -2298,7 +2251,7 @@ class OwnerAgentsProductsListAPIView(APIView, CompanyBranchRestrictedMixin):
             for s in subreals:
                 accepted = self._nz(s.qty_accepted)
                 returned = self._nz(s.qty_returned)
-                sold     = _sold_for_sub(s)
+                sold = _sold_for_sub(s)
                 qty_on_hand += max(accepted - returned - sold, 0)
 
             if qty_on_hand <= 0:
@@ -2321,7 +2274,7 @@ class OwnerAgentsProductsListAPIView(APIView, CompanyBranchRestrictedMixin):
             for s in subreals:
                 accepted = self._nz(s.qty_accepted)
                 returned = self._nz(s.qty_returned)
-                sold     = _sold_for_sub(s)
+                sold = _sold_for_sub(s)
                 subreals_payload.append({
                     "id": s.id,
                     "created_at": s.created_at,
@@ -2347,7 +2300,7 @@ class OwnerAgentsProductsListAPIView(APIView, CompanyBranchRestrictedMixin):
         return data
 
     def get(self, request, *args, **kwargs):
-        # если надо можно тут навесить owner-only check
+        # если надо, можно тут навесить owner-only check
         qs = self._build_queryset(request)
 
         out: List[Dict[str, Any]] = []
@@ -2405,9 +2358,9 @@ class ProductImageListCreateAPIView(CompanyBranchRestrictedMixin, generics.ListC
         if company is not None:
             qs = qs.filter(product__company=company)
 
-        if branch is None:
-            qs = qs.filter(product__branch__isnull=True)
-        else:
+        # новая логика: если branch задан → только этот филиал,
+        # если branch None → не фильтруем по branch (вся компания)
+        if branch is not None:
             qs = qs.filter(product__branch=branch)
 
         return qs
@@ -2427,10 +2380,9 @@ class ProductImageListCreateAPIView(CompanyBranchRestrictedMixin, generics.ListC
         if company is not None:
             allowed = allowed.filter(company=company)
 
-        if branch is None:
-            allowed = allowed.filter(branch__isnull=True)
-        else:
+        if branch is not None:
             allowed = allowed.filter(branch=branch)
+        # branch is None → без ограничений по филиалу (вся компания)
 
         product = get_object_or_404(allowed)
 
@@ -2463,10 +2415,9 @@ class ProductImageRetrieveUpdateDestroyAPIView(
         if company is not None:
             qs = qs.filter(product__company=company)
 
-        if branch is None:
-            qs = qs.filter(product__branch__isnull=True)
-        else:
+        if branch is not None:
             qs = qs.filter(product__branch=branch)
+        # branch None → все филиалы компании
 
         return qs
 
@@ -2649,7 +2600,8 @@ class AgentRequestCartApproveAPIView(AgentCartLockMixin,
 
         out = AgentRequestCartSerializer(cart, context={"request": request}).data
         return Response(out, status=status.HTTP_200_OK)
-    
+
+
 class AgentRequestCartRejectAPIView(AgentCartLockMixin,
                                     CompanyBranchRestrictedMixin,
                                     APIView):

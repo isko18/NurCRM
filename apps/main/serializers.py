@@ -149,6 +149,8 @@ class ProductImageReadSerializer(serializers.ModelSerializer):
         if request:
             return request.build_absolute_uri(obj.image.url)
         return obj.image.url
+
+
 # ===========================
 # Общий миксин: company/branch
 # ===========================
@@ -185,7 +187,6 @@ class CompanyBranchReadOnlyMixin:
         if "branch" in getattr(self.Meta, "fields", []):
             validated_data["branch"] = self._auto_branch()
         return super().update(instance, validated_data)
-
 
 
 # ===========================
@@ -331,17 +332,13 @@ class DealSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
         if assigned_to and assigned_to.company != company:
             raise serializers.ValidationError({"assigned_to": "Ответственный не из вашей компании."})
 
-        # STRICT: филиал должен совпадать с активным, либо быть NULL, если филиал не выбран
+        # STRICT: филиал должен совпадать с активным, если он есть
         if branch is not None:
             if pipeline and pipeline.branch_id != branch.id:
                 raise serializers.ValidationError({"pipeline": "Воронка другого филиала."})
             if contact and contact.branch_id != branch.id:
                 raise serializers.ValidationError({"contact": "Контакт другого филиала."})
-        else:
-            if pipeline and pipeline.branch_id is not None:
-                raise serializers.ValidationError({"pipeline": "Воронка не должна быть привязана к филиалу."})
-            if contact and contact.branch_id is not None:
-                raise serializers.ValidationError({"contact": "Контакт не должен быть привязан к филиалу."})
+        # если branch is None — не проверяем филиал (видим всю компанию)
         return attrs
 
 
@@ -413,8 +410,9 @@ class OrderItemSerializer(serializers.ModelSerializer):
         br = _active_branch(self)
         if comp and self.fields.get("product"):
             qs = Product.objects.filter(company=comp)
-            # STRICT
-            qs = qs.filter(branch=br) if br else qs.filter(branch__isnull=True)
+            if br is not None:
+                qs = qs.filter(branch=br)
+            # если br is None — оставляем все товары компании, независимо от филиала
             self.fields["product"].queryset = qs
 
     def validate(self, data):
@@ -489,7 +487,8 @@ class ItemMakeNestedSerializer(serializers.ModelSerializer):
     class Meta:
         model = ItemMake
         fields = ["id", "name", "price", "unit", "quantity"]
-        
+
+
 class ProductImageSerializer(serializers.ModelSerializer):
     image_url = serializers.SerializerMethodField()
 
@@ -503,7 +502,8 @@ class ProductImageSerializer(serializers.ModelSerializer):
         if obj.image and hasattr(obj.image, "url"):
             return req.build_absolute_uri(obj.image.url) if req else obj.image.url
         return None
-    
+
+
 class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
     company = serializers.ReadOnlyField(source="company.id")
     branch = serializers.ReadOnlyField(source="branch.id")
@@ -536,7 +536,6 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
     images = ProductImageSerializer(many=True, read_only=True)
     stock = serializers.BooleanField(required=False)
 
-
     class Meta:
         model = Product
         fields = [
@@ -547,7 +546,7 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
             "item_make", "item_make_ids",
             "quantity", "price", "purchase_price",
             "status", "status_display",
-            "client", "client_name","stock", "date",
+            "client", "client_name", "stock", "date",
             "created_by", "created_by_name",
             "created_at", "updated_at",
             "images",
@@ -734,6 +733,7 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
 
         instance.save()
         return instance
+
 
 # ===========================
 # Review / Notification
@@ -999,9 +999,7 @@ class ClientDealSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializ
         if branch is not None:
             if client and client.branch_id != branch.id:
                 raise serializers.ValidationError({"client": "Клиент другого филиала."})
-        else:
-            if client and client.branch_id is not None:
-                raise serializers.ValidationError({"client": "Глобальный режим: клиент должен быть без филиала."})
+        # если branch None — клиент может быть из любого филиала компании
 
         amount = attrs.get("amount", getattr(self.instance, "amount", None))
         prepayment = attrs.get("prepayment", getattr(self.instance, "prepayment", None))
@@ -1063,9 +1061,10 @@ class TransactionRecordSerializer(CompanyBranchReadOnlyMixin, serializers.ModelS
         company = getattr(user, "owned_company", None) or getattr(user, "company", None)
         branch = _active_branch(self)
         if company and "department" in self.fields:
-            # STRICT по Department: только этот филиал ИЛИ глобальные при отсутствии филиала у пользователя
             qs = Department.objects.filter(company=company)
-            qs = qs.filter(branch=branch) if branch else qs.filter(branch__isnull=True)
+            if branch is not None:
+                qs = qs.filter(branch=branch)
+            # если branch None — отделы всех филиалов компании
             self.fields["department"].queryset = qs
 
     def validate_department(self, department):
@@ -1075,12 +1074,9 @@ class TransactionRecordSerializer(CompanyBranchReadOnlyMixin, serializers.ModelS
         branch = self._auto_branch()
         if company and department.company_id != company.id:
             raise serializers.ValidationError("Отдел принадлежит другой компании.")
-        if branch is not None:
-            if department.branch_id != branch.id:
-                raise serializers.ValidationError("Отдел другого филиала.")
-        else:
-            if department.branch_id is not None:
-                raise serializers.ValidationError("Глобальный режим: отдел должен быть без филиала.")
+        if branch is not None and department.branch_id != branch.id:
+            raise serializers.ValidationError("Отдел другого филиала.")
+        # если branch None — отдел может быть из любого филиала компании
         return department
 
 
@@ -1120,7 +1116,9 @@ class ContractorWorkSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSeri
         br = self._auto_branch()
         if comp:
             qs = Department.objects.filter(company=comp)
-            qs = qs.filter(branch=br) if br else qs.filter(branch__isnull=True)
+            if br is not None:
+                qs = qs.filter(branch=br)
+            # если br None — все отделы компании
             self.fields["department"].queryset = qs
 
     def validate(self, attrs):
@@ -1130,12 +1128,9 @@ class ContractorWorkSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSeri
         if dep and dep.company_id != company.id:
             raise serializers.ValidationError({"department": "Отдел принадлежит другой компании."})
         # STRICT branch
-        if branch is not None:
-            if dep and dep.branch_id != branch.id:
-                raise serializers.ValidationError({"department": "Отдел другого филиала."})
-        else:
-            if dep and dep.branch_id is not None:
-                raise serializers.ValidationError({"department": "Глобальный режим: отдел должен быть без филиала."})
+        if branch is not None and dep and dep.branch_id != branch.id:
+            raise serializers.ValidationError({"department": "Отдел другого филиала."})
+        # branch None — отдел из любого филиала компании
 
         start = attrs.get("start_date", getattr(self.instance, "start_date", None))
         end = attrs.get("end_date", getattr(self.instance, "end_date", None))
@@ -1236,12 +1231,9 @@ class ObjectSaleSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializ
         if client.company_id != company.id:
             raise serializers.ValidationError("Клиент принадлежит другой компании.")
         # STRICT branch
-        if branch is not None:
-            if client.branch_id != branch.id:
-                raise serializers.ValidationError("Клиент другого филиала.")
-        else:
-            if client.branch_id is not None:
-                raise serializers.ValidationError("Глобальный режим: клиент должен быть без филиала.")
+        if branch is not None and client.branch_id != branch.id:
+            raise serializers.ValidationError("Клиент другого филиала.")
+        # branch None — клиент из любого филиала компании
         return client
 
 
@@ -1286,18 +1278,18 @@ class ItemMakeSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer
 # ===========================
 class ManufactureSubrealSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
     company = serializers.ReadOnlyField(source="company.id")
-    branch  = serializers.ReadOnlyField(source="branch.id")
+    branch = serializers.ReadOnlyField(source="branch.id")
 
     product_name = serializers.ReadOnlyField(source="product.name")
 
     # Поля агента: имя, фамилия и номер машины
-    agent_first_name   = serializers.ReadOnlyField(source="agent.first_name")
-    agent_last_name    = serializers.ReadOnlyField(source="agent.last_name")
+    agent_first_name = serializers.ReadOnlyField(source="agent.first_name")
+    agent_last_name = serializers.ReadOnlyField(source="agent.last_name")
     agent_track_number = serializers.ReadOnlyField(source="agent.track_number")
 
     # вычисляемые — делаем через SerializerMethodField, чтобы не падать на None
     qty_remaining = serializers.SerializerMethodField()
-    qty_on_agent  = serializers.SerializerMethodField()
+    qty_on_agent = serializers.SerializerMethodField()
 
     # “пилорама” на уровне конкретной передачи (разрешим только при create)
     is_sawmill = serializers.BooleanField(required=False, default=False)
@@ -1333,7 +1325,7 @@ class ManufactureSubrealSerializer(CompanyBranchReadOnlyMixin, serializers.Model
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         comp = self._user_company()
-        br   = self._auto_branch()
+        br = self._auto_branch()
         _restrict_pk_queryset_strict(self.fields.get("product"), Product.objects.all(), comp, br)
         if comp and self.fields.get("agent"):
             self.fields["agent"].queryset = User.objects.filter(company=comp)
@@ -1341,7 +1333,7 @@ class ManufactureSubrealSerializer(CompanyBranchReadOnlyMixin, serializers.Model
     # ---- validation ----
     def validate(self, attrs):
         company = self._user_company()
-        branch  = self._auto_branch()
+        branch = self._auto_branch()
 
         # Для create — product обязателен
         if self.instance is None and attrs.get("product") is None:
@@ -1351,7 +1343,7 @@ class ManufactureSubrealSerializer(CompanyBranchReadOnlyMixin, serializers.Model
         if product is not None and product.company_id != getattr(company, "id", None):
             raise serializers.ValidationError({"product": "Товар другой компании."})
 
-        # строгая проверка филиала
+        # строгая проверка филиала: при наличии активного филиала товар либо глобальный, либо этого филиала
         if branch is not None and product is not None and product.branch_id not in (None, branch.id):
             raise serializers.ValidationError({"product": "Товар другого филиала."})
 
@@ -1372,9 +1364,9 @@ class ManufactureSubrealSerializer(CompanyBranchReadOnlyMixin, serializers.Model
 
     def create(self, validated_data):
         # сервер выставляет связь с компанией/филиалом/пользователем
-        validated_data["user"]    = self._user()
+        validated_data["user"] = self._user()
         validated_data["company"] = self._user_company()
-        validated_data["branch"]  = self._auto_branch()
+        validated_data["branch"] = self._auto_branch()
         return super().create(validated_data)
 
     def update(self, instance, validated_data):
@@ -1391,12 +1383,14 @@ class AcceptanceCreateSerializer(serializers.ModelSerializer):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        req  = self.context.get("request")
+        req = self.context.get("request")
         comp = getattr(getattr(req, "user", None), "company", None)
-        br   = _active_branch(self)
+        br = _active_branch(self)
         if comp and self.fields.get("subreal"):
             qs = ManufactureSubreal.objects.filter(company=comp)
-            qs = qs.filter(branch=br) if br else qs.filter(branch__isnull=True)
+            if br is not None:
+                qs = qs.filter(branch=br)
+            # если br None — все передачи компании
             self.fields["subreal"].queryset = qs
 
     def validate(self, attrs):
@@ -1462,12 +1456,14 @@ class ReturnCreateSerializer(serializers.ModelSerializer):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        req  = self.context.get("request")
+        req = self.context.get("request")
         comp = getattr(getattr(req, "user", None), "company", None)
-        br   = _active_branch(self)
+        br = _active_branch(self)
         if comp and self.fields.get("subreal"):
             qs = ManufactureSubreal.objects.filter(company=comp)
-            qs = qs.filter(branch=br) if br else qs.filter(branch__isnull=True)
+            if br is not None:
+                qs = qs.filter(branch=br)
+            # если br None — все передачи компании
             self.fields["subreal"].queryset = qs
 
     def validate(self, attrs):
@@ -1555,14 +1551,15 @@ class BulkSubrealCreateSerializer(serializers.Serializer):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        req  = self.context.get("request")
+        req = self.context.get("request")
         comp = getattr(getattr(req, "user", None), "company", None)
-        br   = _active_branch(self)
+        br = _active_branch(self)
         if comp:
             self.fields["agent"].queryset = User.objects.filter(company=comp)
             prod_qs = Product.objects.filter(company=comp)
-            # STRICT
-            prod_qs = prod_qs.filter(branch=br) if br else prod_qs.filter(branch__isnull=True)
+            if br is not None:
+                prod_qs = prod_qs.filter(branch=br)
+            # если br None — все товары компании
             self.fields["items"].child.fields["product"].queryset = prod_qs
 
     def validate(self, attrs):
@@ -1635,7 +1632,8 @@ class AgentInfoSerializer(serializers.Serializer):
 class AgentWithProductsSerializer(serializers.Serializer):
     agent = AgentInfoSerializer()
     products = AgentProductOnHandSerializer(many=True)
-    
+
+
 class GlobalProductReadSerializer(serializers.ModelSerializer):
     brand = serializers.CharField(source="brand.name", read_only=True)
     category = serializers.CharField(source="category.name", read_only=True)
@@ -1643,15 +1641,15 @@ class GlobalProductReadSerializer(serializers.ModelSerializer):
     class Meta:
         model = GlobalProduct
         fields = ["id", "name", "barcode", "brand", "category"]
-        
-        
+
+
 class PromoRuleSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
     company = serializers.ReadOnlyField(source="company.id")
-    branch  = serializers.ReadOnlyField(source="branch.id")
+    branch = serializers.ReadOnlyField(source="branch.id")
 
     # Покажем удобные подписи
-    product_name  = serializers.ReadOnlyField(source="product.name")
-    brand_name    = serializers.ReadOnlyField(source="brand.name")
+    product_name = serializers.ReadOnlyField(source="product.name")
+    brand_name = serializers.ReadOnlyField(source="brand.name")
     category_name = serializers.ReadOnlyField(source="category.name")
 
     class Meta:
@@ -1676,7 +1674,7 @@ class PromoRuleSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerialize
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         comp = self._user_company()
-        br   = self._auto_branch()
+        br = self._auto_branch()
         # Ограничим product / brand / category в выпадашках так же, как ты делаешь в других местах:
         _restrict_pk_queryset_strict(self.fields.get("product"), Product.objects.all(), comp, br)
         _restrict_pk_queryset_strict(self.fields.get("brand"), ProductBrand.objects.all(), comp, br)
@@ -1690,15 +1688,15 @@ class PromoRuleSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerialize
           - объект должен принадлежать той же компании и (если есть филиал) филиалу
         Остальное уже проверяет модель .clean(), но мы словим пораньше.
         """
-        product  = attrs.get("product")  or getattr(self.instance, "product", None)
-        brand    = attrs.get("brand")    or getattr(self.instance, "brand", None)
+        product = attrs.get("product") or getattr(self.instance, "product", None)
+        brand = attrs.get("brand") or getattr(self.instance, "brand", None)
         category = attrs.get("category") or getattr(self.instance, "category", None)
 
         chosen = [product, brand, category]
         if sum(bool(x) for x in chosen) > 1:
             raise serializers.ValidationError("Укажите только product ИЛИ brand ИЛИ category (или ничего).")
 
-        min_qty  = attrs.get("min_qty",  getattr(self.instance, "min_qty",  None))
+        min_qty = attrs.get("min_qty", getattr(self.instance, "min_qty", None))
         gift_qty = attrs.get("gift_qty", getattr(self.instance, "gift_qty", None))
 
         if min_qty is not None and min_qty < 1:
@@ -1707,7 +1705,6 @@ class PromoRuleSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerialize
             raise serializers.ValidationError({"gift_qty": "Подарок должен быть ≥ 1."})
 
         return attrs
- 
 
 
 class AgentRequestCartSubmitSerializer(serializers.Serializer):
@@ -1749,7 +1746,7 @@ class AgentRequestCartRejectSerializer(serializers.Serializer):
         cart: AgentRequestCart = self.context["cart_obj"]
         user = self.context["request"].user
         cart.reject(by_user=user)
-        return cart   
+        return cart
 
 
 class AgentRequestItemSerializer(serializers.ModelSerializer):
@@ -1757,14 +1754,14 @@ class AgentRequestItemSerializer(serializers.ModelSerializer):
     product_barcode = serializers.ReadOnlyField(source="product.barcode")
     subreal_id = serializers.ReadOnlyField(source="subreal.id")
     product_image_url = serializers.SerializerMethodField()
-    
+
     class Meta:
         model = AgentRequestItem
         fields = [
             "id",
             "cart",
             "product", "product_name", "product_barcode",
-            "product_image_url", 
+            "product_image_url",
             "quantity_requested",
             "gift_quantity",
             "total_quantity",
@@ -1788,23 +1785,28 @@ class AgentRequestItemSerializer(serializers.ModelSerializer):
         req = self.context.get("request")
         user = getattr(req, "user", None) if req else None
         comp = getattr(user, "company", None)
-        br   = _active_branch(self)
+        br = _active_branch(self)
 
         # Ограничим queryset для product и cart по company/branch и по правам агента
         if comp and self.fields.get("product"):
             prod_qs = Product.objects.filter(company=comp)
-            prod_qs = prod_qs.filter(branch=br) if br else prod_qs.filter(branch__isnull=True)
+            if br is not None:
+                prod_qs = prod_qs.filter(branch=br)
+            # если br None — все товары компании
             self.fields["product"].queryset = prod_qs
 
         if comp and self.fields.get("cart"):
             cart_qs = AgentRequestCart.objects.filter(company=comp)
-            cart_qs = cart_qs.filter(branch=br) if br else cart_qs.filter(branch__isnull=True)
+            if br is not None:
+                cart_qs = cart_qs.filter(branch=br)
+            # если br None — все корзины компании
 
             # агент может создавать строки только в своих корзинах
             if user and not getattr(user, "is_superuser", False) and not getattr(user, "is_owner", False):
                 cart_qs = cart_qs.filter(agent=user, status=AgentRequestCart.Status.DRAFT)
 
             self.fields["cart"].queryset = cart_qs
+
     def get_product_image_url(self, obj):
         """
         Возвращаем URL главной фотки товара (is_primary=True),
@@ -1829,7 +1831,7 @@ class AgentRequestItemSerializer(serializers.ModelSerializer):
         if request:
             return request.build_absolute_uri(img_obj.image.url)
         return img_obj.image.url
-    
+
     def validate(self, data):
         """
         Проверяем:
@@ -1884,10 +1886,11 @@ class AgentRequestItemSerializer(serializers.ModelSerializer):
         instance.quantity_requested = validated_data.get("quantity_requested", instance.quantity_requested)
         instance.save(update_fields=["product", "quantity_requested", "updated_at"])
         return instance
-    
+
+
 class AgentRequestCartSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
     company = serializers.ReadOnlyField(source="company.id")
-    branch  = serializers.ReadOnlyField(source="branch.id")
+    branch = serializers.ReadOnlyField(source="branch.id")
 
     agent = serializers.ReadOnlyField(source="agent.id")
     agent_name = serializers.SerializerMethodField(read_only=True)
@@ -1929,7 +1932,7 @@ class AgentRequestCartSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSe
         super().__init__(*args, **kwargs)
         # Ограничим выбор клиента: как в других местах
         comp = self._user_company()
-        br   = self._auto_branch()
+        br = self._auto_branch()
         _restrict_pk_queryset_strict(self.fields.get("client"), Client.objects.all(), comp, br)
 
     def get_agent_name(self, obj):
@@ -1986,12 +1989,9 @@ class AgentRequestCartSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSe
         branch = self._auto_branch()
         if client.company_id != company.id:
             raise serializers.ValidationError("Клиент принадлежит другой компании.")
-        if branch is not None:
-            if client.branch_id != branch.id:
-                raise serializers.ValidationError("Клиент другого филиала.")
-        else:
-            if client.branch_id is not None:
-                raise serializers.ValidationError("Глобальный режим: клиент должен быть без филиала.")
+        if branch is not None and client.branch_id != branch.id:
+            raise serializers.ValidationError("Клиент другого филиала.")
+        # branch None — клиент из любого филиала компании
         return client
 
     def create(self, validated_data):
