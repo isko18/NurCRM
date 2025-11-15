@@ -345,12 +345,23 @@ def _get_company(user):
     """
     Помощник, если нужно руками получить "компанию пользователя" вне миксина.
     Для суперпользователя возвращаем None (без ограничения по company).
+
+    NEW: если у юзера нет company, но есть branch с company — берём её.
     """
     if not user or not getattr(user, "is_authenticated", False):
         return None
     if getattr(user, "is_superuser", False):
         return None
-    return getattr(user, "owned_company", None) or getattr(user, "company", None)
+
+    company = getattr(user, "owned_company", None) or getattr(user, "company", None)
+    if company:
+        return company
+
+    br = getattr(user, "branch", None)
+    if br is not None:
+        return getattr(br, "company", None)
+
+    return None
 
 
 # ===========================
@@ -968,15 +979,8 @@ class OrderAnalyticsView(APIView, CompanyBranchRestrictedMixin):
     permission_classes = [IsAuthenticated]
 
     def get(self, request, *args, **kwargs):
-        company = self._company()
-        branch = self._auto_branch()
-
-        orders = Order.objects.filter(company=company)
-
-        if hasattr(Order, "branch") and branch is not None:
-            # при активном филиале — только этот филиал
-            orders = orders.filter(branch=branch)
-        # если branch is None → все заказы компании без доп. фильтра
+        # берём заказы в рамках company/branch по общей логике миксина
+        orders = self._filter_qs_company_branch(Order.objects.all())
 
         start_date = request.query_params.get("start")
         end_date = request.query_params.get("end")
@@ -1146,16 +1150,11 @@ class ClientDealPayAPIView(APIView, CompanyBranchRestrictedMixin):
 
     @transaction.atomic
     def post(self, request, pk, *args, **kwargs):
-        company = self._company()
         client_id = kwargs.get("client_id")
 
-        deal_qs = ClientDeal.objects.filter(company=company, pk=pk)
-
-        if hasattr(ClientDeal, "branch"):
-            branch = self._auto_branch()
-            if branch is not None:
-                deal_qs = deal_qs.filter(branch=branch)
-        # branch is None → без доп. фильтра по филиалу (вся компания)
+        deal_qs = ClientDeal.objects.all()
+        deal_qs = self._filter_qs_company_branch(deal_qs)
+        deal_qs = deal_qs.filter(pk=pk)
 
         if client_id:
             deal_qs = deal_qs.filter(client_id=client_id)
@@ -1163,8 +1162,10 @@ class ClientDealPayAPIView(APIView, CompanyBranchRestrictedMixin):
         deal = get_object_or_404(deal_qs)
 
         if deal.kind != ClientDeal.Kind.DEBT:
-            return Response({"detail": "Оплата помесячно доступна только для сделок типа 'debt'."},
-                            status=status.HTTP_400_BAD_REQUEST)
+            return Response(
+                {"detail": "Оплата помесячно доступна только для сделок типа 'debt'."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
 
         number = request.data.get("installment_number")
         paid_date_str = request.data.get("date")
@@ -1173,8 +1174,10 @@ class ClientDealPayAPIView(APIView, CompanyBranchRestrictedMixin):
         if number:
             inst = get_object_or_404(DealInstallment, deal=deal, number=number)
             if inst.paid_on:
-                return Response({"detail": f"Взнос №{number} уже оплачен ({inst.paid_on})."},
-                                status=status.HTTP_400_BAD_REQUEST)
+                return Response(
+                    {"detail": f"Взнос №{number} уже оплачен ({inst.paid_on})."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
         else:
             inst = deal.installments.filter(paid_on__isnull=True).order_by("number").first()
             if not inst:
@@ -1218,13 +1221,9 @@ class ClientDealUnpayAPIView(APIView, CompanyBranchRestrictedMixin):
         client_id = kwargs.get("client_id")
 
         # 1. Определяем сделку в рамках компании и филиала юзера
-        deal_qs = ClientDeal.objects.filter(company=company, pk=pk)
-
-        # branch-ограничение
-        if hasattr(ClientDeal, "branch"):
-            branch = self._auto_branch()
-            if branch is not None:
-                deal_qs = deal_qs.filter(branch=branch)
+        deal_qs = ClientDeal.objects.all()
+        deal_qs = self._filter_qs_company_branch(deal_qs)
+        deal_qs = deal_qs.filter(pk=pk)
 
         # если запрос в nested-виде /clients/<client_id>/deals/<pk>/unpay/
         if client_id:
@@ -1453,20 +1452,14 @@ class DebtPayAPIView(APIView, CompanyBranchRestrictedMixin):
 
     @transaction.atomic
     def post(self, request, pk):
-        company = self._company()
-        branch = self._auto_branch()
-
-        qs = Debt.objects.filter(company=company)
-        if hasattr(Debt, "branch") and branch is not None:
-            qs = qs.filter(branch=branch)
-        # branch is None → все долги компании
-
+        # выбираем долг в рамках company/branch по общей логике
+        qs = self._filter_qs_company_branch(Debt.objects.all())
         debt = get_object_or_404(qs, pk=pk)
 
         ser = DebtPaymentSerializer(data=request.data, context={"request": request})
         ser.is_valid(raise_exception=True)
         DebtPayment.objects.create(
-            company=company,
+            company=debt.company,
             debt=debt,
             amount=ser.validated_data["amount"],
             paid_at=ser.validated_data.get("paid_at"),
