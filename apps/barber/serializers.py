@@ -1,66 +1,97 @@
-# barber_crm/serializers.py
 from rest_framework import serializers
 from django.core.exceptions import ValidationError as DjangoValidationError
 
 from .models import BarberProfile, Service, Client, Appointment, Document, Folder
+from apps.users.models import Branch  # для проверки филиала по ?branch=
 
 from datetime import timedelta
 import re
+
+
 # ===========================
-# Общий миксин: company/branch (branch авто из пользователя)
+# Общий миксин: company/branch (branch авто из контекста/запроса)
 # ===========================
 class CompanyBranchReadOnlyMixin:
     """
     Делает company/branch read-only наружу и гарантированно проставляет их из контекста на create/update.
     Порядок получения branch:
+      0) ?branch=<uuid> в запросе (если филиал принадлежит компании пользователя)
       1) user.primary_branch (свойство или метод, если есть)
       2) request.branch (если положил middleware)
       3) None (глобальная запись компании)
     """
 
+    # ---- helpers ----
+    def _user(self):
+        request = self.context.get("request")
+        return getattr(request, "user", None) if request else None
+
+    def _user_company(self):
+        user = self._user()
+        if not user:
+            return None
+        return getattr(user, "company", None) or getattr(user, "owned_company", None)
+
     # ---- какой филиал реально использовать ----
     def _auto_branch(self):
         request = self.context.get("request")
-        if not request:
+        user = self._user()
+        company = self._user_company()
+        comp_id = getattr(company, "id", None)
+
+        if not request or not user or not comp_id:
             return None
-        user = getattr(request, "user", None)
+
+        # 0) ?branch=<uuid> в query-параметрах
+        branch_id = None
+        if hasattr(request, "query_params"):
+            branch_id = request.query_params.get("branch")
+        elif hasattr(request, "GET"):
+            branch_id = request.GET.get("branch")
+
+        if branch_id:
+            try:
+                br = Branch.objects.get(id=branch_id, company_id=comp_id)
+                setattr(request, "branch", br)
+                return br
+            except (Branch.DoesNotExist, ValueError):
+                # если id кривой/чужой — игнорируем
+                pass
 
         # 1) primary_branch может быть полем или методом
         primary = getattr(user, "primary_branch", None)
         if callable(primary):
             try:
                 val = primary()
-                if val:
+                if val and getattr(val, "company_id", None) == comp_id:
                     return val
             except Exception:
                 pass
-        if primary:
+        if primary and getattr(primary, "company_id", None) == comp_id:
             return primary
 
         # 2) из middleware (на будущее)
         if hasattr(request, "branch"):
-            return request.branch
+            b = getattr(request, "branch")
+            if b and getattr(b, "company_id", None) == comp_id:
+                return b
 
         # 3) глобально
         return None
 
     def create(self, validated_data):
-        request = self.context.get("request")
-        if request:
-            user = getattr(request, "user", None)
-            if user is not None and getattr(user, "company_id", None):
-                validated_data["company"] = user.company
-            # branch строго из контекста (payload игнорируется)
-            validated_data["branch"] = self._auto_branch()
+        company = self._user_company()
+        if company is not None:
+            validated_data["company"] = company
+        # branch строго из контекста (payload игнорируется)
+        validated_data["branch"] = self._auto_branch()
         return super().create(validated_data)
 
     def update(self, instance, validated_data):
-        request = self.context.get("request")
-        if request:
-            user = getattr(request, "user", None)
-            if user is not None and getattr(user, "company_id", None):
-                validated_data["company"] = user.company
-            validated_data["branch"] = self._auto_branch()
+        company = self._user_company()
+        if company is not None:
+            validated_data["company"] = company
+        validated_data["branch"] = self._auto_branch()
         return super().update(instance, validated_data)
 
 
@@ -187,34 +218,6 @@ class AppointmentSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSeriali
             instance.services.set(services)
         return instance
 
-    def validate(self, attrs):
-        # Проверки те же, но нужно пройтись по списку services
-        request = self.context.get("request")
-        user_company = getattr(getattr(request, "user", None), "company", None) if request else None
-        target_branch = self._auto_branch()
-
-        client = attrs.get("client") or getattr(self.instance, "client", None)
-        barber = attrs.get("barber") or getattr(self.instance, "barber", None)
-        services = attrs.get("services") or getattr(self.instance, "services", [])
-
-        # company проверки
-        for obj, name in [(client, "client"), (barber, "barber")]:
-            if obj and getattr(obj, "company_id", None) != getattr(user_company, "id", None):
-                raise serializers.ValidationError({name: "Объект не принадлежит вашей компании."})
-        for service in services:
-            if getattr(service, "company_id", None) != getattr(user_company, "id", None):
-                raise serializers.ValidationError({"services": "Одна из услуг принадлежит другой компании."})
-
-        # branch проверки
-        if target_branch is not None:
-            if client and getattr(client, "branch_id", None) not in (None, target_branch.id):
-                raise serializers.ValidationError({"client": "Клиент принадлежит другому филиалу."})
-            for service in services:
-                if getattr(service, "branch_id", None) not in (None, target_branch.id):
-                    raise serializers.ValidationError({"services": f"Услуга '{service.name}' принадлежит другому филиалу."})
-
-        return attrs
-    
     def _parse_minutes(self, s: str) -> int:
         """Парсим Service.time: '30', '00:30', '1:15', '30m', '1h', '1h30m' -> минуты."""
         if not s:
@@ -233,11 +236,44 @@ class AppointmentSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSeriali
         return 0
 
     def validate(self, attrs):
+        """
+        ОДИН общий validate:
+          1) проверка принадлежности client/barber/services компании и филиалу
+          2) автоподстановка end_at из суммарной длительности услуг
+          3) проверка end_at > start_at
+        """
         attrs = super().validate(attrs)
 
-        start_at = attrs.get("start_at") or getattr(self.instance, "start_at", None)
-        end_at   = attrs.get("end_at")   or getattr(self.instance, "end_at", None)
+        request = self.context.get("request")
+        user_company = getattr(getattr(request, "user", None), "company", None) if request else None
+        company_id = getattr(user_company, "id", None)
+        target_branch = self._auto_branch()
+
+        # текущее значение client/barber/services с учётом partial
+        client = attrs.get("client") or getattr(self.instance, "client", None)
+        barber = attrs.get("barber") or getattr(self.instance, "barber", None)
         services = attrs.get("services") or (self.instance.services.all() if self.instance else [])
+
+        # --- company проверки ---
+        for obj, name in [(client, "client"), (barber, "barber")]:
+            if obj and getattr(obj, "company_id", None) != company_id:
+                raise serializers.ValidationError({name: "Объект не принадлежит вашей компании."})
+        for service in services:
+            if getattr(service, "company_id", None) != company_id:
+                raise serializers.ValidationError({"services": "Одна из услуг принадлежит другой компании."})
+
+        # --- branch проверки ---
+        if target_branch is not None:
+            tb_id = target_branch.id
+            if client and getattr(client, "branch_id", None) not in (None, tb_id):
+                raise serializers.ValidationError({"client": "Клиент принадлежит другому филиалу."})
+            for service in services:
+                if getattr(service, "branch_id", None) not in (None, tb_id):
+                    raise serializers.ValidationError({"services": f"Услуга '{service.name}' принадлежит другому филиалу."})
+
+        # --- работа со временем ---
+        start_at = attrs.get("start_at") or getattr(self.instance, "start_at", None)
+        end_at = attrs.get("end_at") or getattr(self.instance, "end_at", None)
 
         # Если конец не передан — попробуем вычислить из услуг
         if start_at and not end_at and services:
@@ -253,6 +289,7 @@ class AppointmentSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSeriali
             raise serializers.ValidationError({"end_at": "Должно быть строго позже start_at."})
 
         return attrs
+
 
 # ===========================
 # Folder

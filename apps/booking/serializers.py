@@ -1,4 +1,3 @@
-# serializers.py
 from django.contrib.auth import get_user_model
 from django.db import models
 from django.db.models import Q
@@ -9,33 +8,65 @@ from .models import (
     Hotel, ConferenceRoom, Booking, ManagerAssignment,
     Folder, Document, Bed, BookingClient, BookingHistory
 )
+from apps.users.models import Branch  # для проверки филиала по ?branch=
 
 User = get_user_model()
 
 
-# ===== Общий миксин company/branch (как в барбере) =====
+# ===== Общий миксин company/branch (как в барбере/кафе) =====
 class CompanyBranchReadOnlyMixin:
     """
     Делает company/branch read-only наружу и гарантированно проставляет их из контекста на create/update.
     Порядок получения branch:
+      0) ?branch=<uuid> в запросе (если филиал принадлежит компании пользователя)
       1) user.primary_branch() / user.primary_branch
       2) request.branch (если проставлен)
       3) None (глобальная запись компании)
     """
 
+    def _user(self):
+        request = self.context.get("request")
+        return getattr(request, "user", None) if request else None
+
+    def _user_company(self):
+        user = self._user()
+        if not user:
+            return None
+        return getattr(user, "company", None) or getattr(user, "owned_company", None)
+
     def _auto_branch(self):
         request = self.context.get("request")
         if not request:
             return None
-        user = getattr(request, "user", None)
-        user_company_id = getattr(user, "company_id", None) or getattr(getattr(user, "owned_company", None), "id", None)
+        user = self._user()
+        company = self._user_company()
+        user_company_id = getattr(company, "id", None)
+
+        if not user_company_id:
+            return None
+
+        # 0) ?branch=<uuid> в query-параметрах
+        branch_id = None
+        if hasattr(request, "query_params"):
+            branch_id = request.query_params.get("branch")
+        elif hasattr(request, "GET"):
+            branch_id = request.GET.get("branch")
+
+        if branch_id:
+            try:
+                br = Branch.objects.get(id=branch_id, company_id=user_company_id)
+                setattr(request, "branch", br)
+                return br
+            except (Branch.DoesNotExist, ValueError):
+                # если чужой/кривой — игнорируем и идём дальше
+                pass
 
         # 1) primary_branch: метод или поле
         primary = getattr(user, "primary_branch", None)
         if callable(primary):
             try:
                 val = primary()
-                if val and (user_company_id is None or val.company_id == user_company_id):
+                if val and getattr(val, "company_id", None) == user_company_id:
                     return val
             except Exception:
                 pass
@@ -52,28 +83,21 @@ class CompanyBranchReadOnlyMixin:
         return None
 
     def create(self, validated_data):
-        request = self.context.get("request")
-        if request:
-            user = getattr(request, "user", None)
-            user_company = getattr(user, "company", None) or getattr(user, "owned_company", None)
-            if user_company:
-                validated_data["company"] = user_company
-            # проставляем branch, если смогли определить; иначе оставляем None (глобально)
-            auto_branch = self._auto_branch()
-            validated_data["branch"] = auto_branch if auto_branch is not None else None
+        user_company = self._user_company()
+        if user_company:
+            validated_data["company"] = user_company
+        auto_branch = self._auto_branch()
+        validated_data["branch"] = auto_branch if auto_branch is not None else None
         return super().create(validated_data)
 
     def update(self, instance, validated_data):
-        request = self.context.get("request")
-        if request:
-            user = getattr(request, "user", None)
-            user_company = getattr(user, "company", None) or getattr(user, "owned_company", None)
-            if user_company:
-                validated_data["company"] = user_company
-            auto_branch = self._auto_branch()
-            # ВАЖНО: если филиал не определён, не перетираем существующий branch
-            if auto_branch is not None:
-                validated_data["branch"] = auto_branch
+        user_company = self._user_company()
+        if user_company:
+            validated_data["company"] = user_company
+        auto_branch = self._auto_branch()
+        # ВАЖНО: если филиал не определён, не перетираем существующий branch
+        if auto_branch is not None:
+            validated_data["branch"] = auto_branch
         return super().update(instance, validated_data)
 
 
@@ -83,9 +107,11 @@ def _scope_queryset_by_context(qs, serializer):
     if not request:
         return qs.none()
     user = getattr(request, "user", None)
-    company_id = getattr(user, "company_id", None) or getattr(getattr(user, "owned_company", None), "id", None)
+    company = getattr(user, "company", None) or getattr(user, "owned_company", None)
+    company_id = getattr(company, "id", None)
     if not company_id:
         return qs.none()
+
     # определяем активный филиал так же, как миксин
     branch = None
     cbm = serializer if hasattr(serializer, "_auto_branch") else None
@@ -93,8 +119,9 @@ def _scope_queryset_by_context(qs, serializer):
         branch = cbm._auto_branch()
     else:
         branch = getattr(request, "branch", None)
+
     qs = qs.filter(company_id=company_id)
-    if hasattr(qs.model, "branch"):
+    if any(getattr(f, "name", None) == "branch" for f in qs.model._meta.get_fields()):
         if branch is not None:
             qs = qs.filter(Q(branch=branch) | Q(branch__isnull=True))
         else:
@@ -173,7 +200,11 @@ class BookingSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
     company = serializers.ReadOnlyField(source="company.id")
     branch = serializers.ReadOnlyField(source="branch.id")
 
-    client = serializers.PrimaryKeyRelatedField(queryset=BookingClient.objects.all(), required=False, allow_null=True)
+    client = serializers.PrimaryKeyRelatedField(
+        queryset=BookingClient.objects.all(),
+        required=False,
+        allow_null=True,
+    )
 
     class Meta:
         ref_name = 'BookingBooking'
@@ -192,13 +223,19 @@ class BookingSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
         fields = super().get_fields()
         fields["client"].queryset = _scope_queryset_by_context(BookingClient.objects.all(), self)
         fields["hotel"] = serializers.PrimaryKeyRelatedField(
-            queryset=_scope_queryset_by_context(Hotel.objects.all(), self), required=False, allow_null=True
+            queryset=_scope_queryset_by_context(Hotel.objects.all(), self),
+            required=False,
+            allow_null=True,
         )
         fields["room"] = serializers.PrimaryKeyRelatedField(
-            queryset=_scope_queryset_by_context(ConferenceRoom.objects.all(), self), required=False, allow_null=True
+            queryset=_scope_queryset_by_context(ConferenceRoom.objects.all(), self),
+            required=False,
+            allow_null=True,
         )
         fields["bed"] = serializers.PrimaryKeyRelatedField(
-            queryset=_scope_queryset_by_context(Bed.objects.all(), self), required=False, allow_null=True
+            queryset=_scope_queryset_by_context(Bed.objects.all(), self),
+            required=False,
+            allow_null=True,
         )
         return fields
 
@@ -211,8 +248,8 @@ class BookingSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
         - прогоняем model.clean().
         """
         request = self.context.get("request")
-        user_company = getattr(getattr(request, "user", None), "company", None) \
-                       or getattr(getattr(request, "user", None), "owned_company", None)
+        user = getattr(request, "user", None) if request else None
+        user_company = getattr(user, "company", None) or getattr(user, "owned_company", None)
         company_id = getattr(user_company, "id", None)
         target_branch = self._auto_branch()
 
@@ -224,7 +261,9 @@ class BookingSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
         # --- Ровно один из hotel/room/bed ---
         chosen = [x for x in (hotel, room, bed) if x]
         if len(chosen) != 1:
-            raise serializers.ValidationError("Выберите либо гостиницу, либо комнату, либо койко-место (ровно одно).")
+            raise serializers.ValidationError(
+                "Выберите либо гостиницу, либо комнату, либо койко-место (ровно одно)."
+            )
 
         # --- Компания должна совпадать ---
         if company_id:
@@ -288,7 +327,7 @@ class BookingClientSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSeria
         read_only_fields = ["id", "company", "branch", "bookings", "history"]
 
     def validate_phone(self, value):
-        # простая нормализация (как пожелание)
+        # простая нормализация
         if not value:
             return value
         return ''.join(ch for ch in value if ch.isdigit() or ch == '+')
@@ -307,17 +346,20 @@ class ManagerAssignmentSerializer(CompanyBranchReadOnlyMixin, serializers.ModelS
     def get_fields(self):
         fields = super().get_fields()
         fields["room"].queryset = _scope_queryset_by_context(ConferenceRoom.objects.all(), self)
-        # менеджеры обычно фильтруются по company:
-        fields["manager"].queryset = User.objects.all()
+        # менеджеры по company:
         request = self.context.get("request")
         if request and getattr(request.user, "company_id", None):
             fields["manager"].queryset = User.objects.filter(company_id=request.user.company_id)
+        else:
+            fields["manager"].queryset = User.objects.none()
         return fields
 
     def validate(self, attrs):
         request = self.context.get("request")
-        user_company_id = getattr(getattr(request, "user", None), "company_id", None) \
-                          or getattr(getattr(getattr(request, "user", None), "owned_company", None), "id", None)
+        user = getattr(request, "user", None) if request else None
+        company = getattr(user, "company", None) or getattr(user, "owned_company", None)
+        user_company_id = getattr(company, "id", None)
+
         room = attrs.get("room") or getattr(self.instance, "room", None)
         manager = attrs.get("manager") or getattr(self.instance, "manager", None)
         if user_company_id:

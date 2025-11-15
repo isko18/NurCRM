@@ -17,6 +17,7 @@ from .serializers import (
     StudentSerializer, LessonSerializer, FolderSerializer, DocumentSerializer,
     LessonAttendanceItemSerializer, StudentAttendanceSerializer, TeacherRateSerializer
 )
+from apps.users.models import Branch  # 🔑 для ?branch=<uuid>
 
 
 # ----- Кастомный фильтр для Document (не автофильтруем FileField) -----
@@ -32,16 +33,23 @@ class DocumentFilter(dj_filters.FilterSet):
         fields = ['name', 'folder', 'file_name', 'created_at', 'updated_at']
 
 
-# ===== Company + Branch scoped mixin (как в «барбере») =====
+# ===== Company + Branch scoped mixin (как в «барбере», с поддержкой ?branch) =====
 class CompanyBranchQuerysetMixin:
     """
     🔒 Универсальный миксин для фильтрации queryset по компании и филиалу.
 
     Правила:
-      • Всегда фильтрует записи по company пользователя.
-      • Если у пользователя есть активный филиал → показывает только branch=<активный>.
-      • Если филиала нет → показывает глобальные (branch IS NULL).
+      • Всегда фильтрует записи по company пользователя (company или owned_company).
+      • Если у модели есть поле branch:
+          - при активном филиале пользователя → только branch=<активный>;
+          - без филиала → только глобальные записи (branch IS NULL).
       • При создании/обновлении автоматически проставляет company/branch.
+
+    Активный филиал определяется:
+      0) ?branch=<uuid> (если филиал принадлежит компании пользователя)
+      1) user.branch_memberships (primary → первый)
+      2) request.branch (если проставляет middleware и принадлежит компании)
+      3) None (глобальная область)
     """
     _UNSET = object()  # единый маркер "ещё не вычисляли"
 
@@ -61,7 +69,7 @@ class CompanyBranchQuerysetMixin:
         return getattr(user, "company", None) or getattr(user, "owned_company", None)
 
     def _user_primary_branch(self):
-        """Определяем основной филиал пользователя (Branch)."""
+        """Определяем основной филиал пользователя (Branch) через branch_memberships."""
         user = self._user()
         if not user or not getattr(user, "is_authenticated", False):
             return None
@@ -94,7 +102,7 @@ class CompanyBranchQuerysetMixin:
             return False
 
     def _active_branch(self):
-        """Определяем активный филиал и кешируем результат."""
+        """Определяем активный филиал и кешируем результат, учитывая ?branch=<uuid>."""
         if self._cached_active_branch is not self._UNSET:
             return self._cached_active_branch
 
@@ -105,12 +113,38 @@ class CompanyBranchQuerysetMixin:
             self._cached_active_branch = None
             return None
 
+        # 0) branch из query-параметров (?branch=<uuid>)
+        branch_id = None
+        if hasattr(request, "query_params"):
+            branch_id = request.query_params.get("branch")
+        elif hasattr(request, "GET"):
+            branch_id = request.GET.get("branch")
+
+        if branch_id:
+            try:
+                br = Branch.objects.get(id=branch_id, company=company)
+                setattr(request, "branch", br)
+                self._cached_active_branch = br
+                return br
+            except (Branch.DoesNotExist, ValueError):
+                # чужой/кривой id — игнорируем и идём дальше
+                pass
+
+        # 1) основной филиал из membership
         user_branch = self._user_primary_branch()
         if user_branch and user_branch.company_id == company.id:
             setattr(request, "branch", user_branch)
             self._cached_active_branch = user_branch
             return user_branch
 
+        # 2) request.branch из middleware
+        if hasattr(request, "branch"):
+            b = getattr(request, "branch")
+            if b and getattr(b, "company_id", None) == company.id:
+                self._cached_active_branch = b
+                return b
+
+        # 3) глобально
         setattr(request, "branch", None)
         self._cached_active_branch = None
         return None
@@ -148,7 +182,6 @@ class CompanyBranchQuerysetMixin:
         company = self._user_company()
         branch = self._active_branch() if self._model_has_field("branch") else None
         serializer.save(company=company, branch=branch)
-
 
 
 # ===== Leads =====
@@ -285,7 +318,6 @@ class LessonAttendanceView(CompanyBranchQuerysetMixin, APIView):
 
     def _get_lesson(self, lesson_id):
         company = self._user_company()
-        # учитываем и ветку (глобально/филиально), как в списках
         qs = Lesson.objects.select_related("group", "company")
         qs = qs.filter(company=company)
         active_branch = self._active_branch()
@@ -369,7 +401,7 @@ class LessonAttendanceView(CompanyBranchQuerysetMixin, APIView):
             else:
                 to_create.append(Attendance(
                     company=lesson.company,
-                    branch=lesson.branch,   # 🔑 проставляем branch, как и в миксине
+                    branch=lesson.branch,   # 🔑 сохраняем филиал урока
                     lesson=lesson,
                     student_id=sid,
                     present=present,
@@ -394,18 +426,20 @@ class StudentAttendanceListView(CompanyBranchQuerysetMixin, generics.ListAPIView
         company = self._user_company()
         active_branch = self._active_branch()
 
+        # находим студента с учётом branch (глобальный или филиальный)
         student_qs = Student.objects.filter(company=company)
         if active_branch is not None:
-            student_qs = student_qs.filter(branch__in=[None, active_branch])  # студент может быть глобальным
+            student_qs = student_qs.filter(branch__in=[None, active_branch])
         else:
             student_qs = student_qs.filter(branch__isnull=True)
 
         student = get_object_or_404(student_qs, id=self.kwargs["student_id"])
 
         qs = Attendance.objects.filter(company=company, student=student).select_related("lesson", "lesson__group")
+        # отметка может быть глобальной или филиальной
         if self._model_has_field("branch"):
             if active_branch is not None:
-                qs = qs.filter(branch__in=[None, active_branch])  # отметка может быть глобальной или филиальной
+                qs = qs.filter(branch__in=[None, active_branch])
             else:
                 qs = qs.filter(branch__isnull=True)
         return qs.order_by("-lesson__date", "-lesson__time")
@@ -425,7 +459,10 @@ class TeacherRateListCreateAPIView(CompanyBranchQuerysetMixin, generics.ListCrea
     ordering = ["-updated_at"]
 
     def get_queryset(self):
-        qs = TeacherRate.objects.filter(company_id=self.request.user.company_id)
+        company = self._user_company()
+        if not company:
+            return TeacherRate.objects.none()
+        qs = TeacherRate.objects.filter(company=company)
         active_branch = self._active_branch()
         return qs.filter(branch=active_branch) if active_branch is not None else qs.filter(branch__isnull=True)
 
@@ -438,6 +475,9 @@ class TeacherRateRetrieveUpdateDestroyAPIView(CompanyBranchQuerysetMixin, generi
     serializer_class = TeacherRateSerializer
 
     def get_queryset(self):
-        qs = TeacherRate.objects.filter(company_id=self.request.user.company_id)
+        company = self._user_company()
+        if not company:
+            return TeacherRate.objects.none()
+        qs = TeacherRate.objects.filter(company=company)
         active_branch = self._active_branch()
         return qs.filter(branch=active_branch) if active_branch is not None else qs.filter(branch__isnull=True)

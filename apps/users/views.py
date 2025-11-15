@@ -4,6 +4,7 @@ from rest_framework.response import Response
 from rest_framework.exceptions import NotFound, PermissionDenied
 from rest_framework_simplejwt.views import TokenObtainPairView
 from django.http import Http404
+from django.db.models import Q  # для фильтра по филиалам
 
 from .models import User, Industry, SubscriptionPlan, Feature, Sector, CustomRole, Company, Branch
 from .serializers import (
@@ -26,6 +27,56 @@ from .serializers import (
 from .serializers import BranchSerializer, BranchCreateUpdateSerializer
 
 from .permissions import IsCompanyOwner, IsCompanyOwnerOrAdmin
+
+
+# ===== Вспомогательные для branch-фильтрации сотрудников =====
+def _get_active_branch(request, company):
+    """
+    Возвращает филиал компании по ?branch=<uuid>, если он существует и принадлежит компании.
+    Иначе — None.
+    """
+    if not request or not company:
+        return None
+
+    branch_id = None
+    if hasattr(request, "query_params"):
+        branch_id = request.query_params.get("branch")
+    elif hasattr(request, "GET"):
+        branch_id = request.GET.get("branch")
+
+    if not branch_id:
+        return None
+
+    try:
+        return Branch.objects.get(id=branch_id, company=company)
+    except (Branch.DoesNotExist, ValueError):
+        return None
+
+
+def _apply_branch_filter_to_users(request, base_qs):
+    """
+    Фильтр сотрудников по активному филиалу:
+      - если branch не задан/невалиден — возвращаем base_qs как есть
+      - если задан валидный branch:
+          сотрудники, у которых есть membership в этот филиал
+          ИЛИ сотрудники без membership (глобальные).
+    """
+    user = request.user
+    company = getattr(user, "owned_company", None) or getattr(user, "company", None)
+    if not company:
+        return base_qs.none()
+
+    branch = _get_active_branch(request, company)
+    if not branch:
+        return base_qs
+
+    return (
+        base_qs.filter(
+            Q(branch_memberships__branch=branch) |
+            Q(branch_memberships__isnull=True)
+        )
+        .distinct()
+    )
 
 
 # 👤 Регистрация владельца компании
@@ -57,7 +108,10 @@ class EmployeeListAPIView(generics.ListAPIView):
         company = getattr(user, "owned_company", None) or user.company
         if not company:
             return User.objects.none()
-        return company.employees.all()
+
+        base_qs = company.employees.all()
+        # применяем фильтрацию по ?branch=
+        return _apply_branch_filter_to_users(self.request, base_qs)
 
 
 # 👤 Текущий пользователь
@@ -114,8 +168,14 @@ class EmployeeDestroyAPIView(generics.DestroyAPIView):
         if getattr(self, 'swagger_fake_view', False):
             return User.objects.none()
 
-        company = getattr(self.request.user, "owned_company", None) or self.request.user.company
-        return company.employees.all() if company else User.objects.none()
+        user = self.request.user
+        company = getattr(user, "owned_company", None) or user.company
+        if not company:
+            return User.objects.none()
+
+        base_qs = company.employees.all()
+        # учитываем ?branch= как в списке
+        return _apply_branch_filter_to_users(self.request, base_qs)
 
     def delete(self, request, *args, **kwargs):
         employee = self.get_object()
@@ -148,8 +208,14 @@ class EmployeeDetailAPIView(generics.RetrieveUpdateDestroyAPIView):
         if getattr(self, 'swagger_fake_view', False):
             return User.objects.none()
 
-        company = getattr(self.request.user, "owned_company", None) or self.request.user.company
-        return company.employees.exclude(id=self.request.user.id) if company else User.objects.none()
+        user = self.request.user
+        company = getattr(user, "owned_company", None) or user.company
+        if not company:
+            return User.objects.none()
+
+        base_qs = company.employees.exclude(id=user.id)
+        # учитываем ?branch= чтобы не лезть в сотрудников другого филиала
+        return _apply_branch_filter_to_users(self.request, base_qs)
 
     def delete(self, request, *args, **kwargs):
         employee = self.get_object()
@@ -254,6 +320,7 @@ class BranchListCreateAPIView(generics.ListCreateAPIView):
     def perform_create(self, serializer):
         # ВАЖНО: НЕ передаём company сюда — сериализатор сам подставит
         serializer.save()
+
 
 class BranchDetailAPIView(generics.RetrieveUpdateDestroyAPIView):
     """

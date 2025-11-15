@@ -24,7 +24,9 @@ from .serializers import (
     KitchenTaskSerializer, NotificationCafeSerializer, InventorySessionSerializer, EquipmentSerializer, EquipmentInventorySessionSerializer,
 )
 
-# если добавлял кастомные пермишены — импортируем
+from apps.users.models import Branch
+
+
 try:
     from apps.users.permissions import IsCompanyOwnerOrAdmin
 except Exception:
@@ -54,10 +56,12 @@ class CompanyBranchQuerysetMixin:
     def _active_branch(self):
         """
         Определяем активный филиал:
+          0) ?branch=<uuid> в запросе (если филиал принадлежит компании пользователя)
           1) user.primary_branch() / user.primary_branch
           2) request.branch (если уже проставлен middleware-ом)
           3) None
-        Возвращаем только если филиал принадлежит компании пользователя.
+
+        Возвращаем только филиал своей компании.
         """
         request = self.request
         company = self._user_company()
@@ -65,8 +69,26 @@ class CompanyBranchQuerysetMixin:
             setattr(request, "branch", None)
             return None
 
+        # 0) branch из query-параметра
+        branch_id = None
+        if hasattr(request, "query_params"):
+            branch_id = request.query_params.get("branch")
+        elif hasattr(request, "GET"):
+            branch_id = request.GET.get("branch")
+
+        if branch_id:
+            try:
+                br = Branch.objects.get(id=branch_id, company=company)
+                setattr(request, "branch", br)
+                return br
+            except (Branch.DoesNotExist, ValueError):
+                # если id кривой/чужой — игнорируем и продолжаем по старой схеме
+                pass
+
         user = self._user()
         primary = getattr(user, "primary_branch", None)
+
+        # 1) primary_branch как метод
         if callable(primary):
             try:
                 val = primary()
@@ -75,15 +97,19 @@ class CompanyBranchQuerysetMixin:
                     return val
             except Exception:
                 pass
+
+        # 1b) primary_branch как атрибут
         if primary and getattr(primary, "company_id", None) == company.id:
             setattr(request, "branch", primary)
             return primary
 
+        # 2) request.branch, если уже стоит
         if hasattr(request, "branch"):
             b = getattr(request, "branch")
             if b and getattr(b, "company_id", None) == company.id:
                 return b
 
+        # 3) глобальный режим
         setattr(request, "branch", None)
         return None
 

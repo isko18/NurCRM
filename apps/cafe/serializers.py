@@ -5,12 +5,13 @@ from rest_framework import serializers
 from django.core.exceptions import ValidationError as DjangoValidationError
 from django.db import transaction
 
-from .models import (
+from apps.cafe.models import (
     Zone, Table, Booking, Warehouse, Purchase,
     Category, MenuItem, Ingredient,
     Order, OrderItem, CafeClient,
     OrderHistory, OrderItemHistory, KitchenTask, NotificationCafe, InventorySession, InventoryItem, Equipment, EquipmentInventoryItem, EquipmentInventorySession
 )
+from apps.users.models import Branch
 
 User = get_user_model()
 
@@ -29,17 +30,40 @@ class CompanyBranchReadOnlyMixin(serializers.ModelSerializer):
 
     def _auto_branch(self):
         """
-        1) user.primary_branch() / user.primary_branch
-        2) request.branch (если есть)
-        3) None
-        Только если branch принадлежит компании пользователя.
+        Активный филиал:
+          0) ?branch=<uuid> в запросе (если филиал принадлежит компании пользователя)
+          1) user.primary_branch() / user.primary_branch
+          2) request.branch (если есть)
+          3) None
+
+        Всегда проверяем, что branch.company_id == company.id.
         """
         request = self.context.get("request")
         user = self._user()
-        comp_id = getattr(self._user_company(), "id", None)
+        company = self._user_company()
+        comp_id = getattr(company, "id", None)
+
         if not request or not user or not comp_id:
             return None
 
+        # 0) ?branch=<uuid> в query-параметрах
+        branch_id = None
+        if hasattr(request, "query_params"):
+            branch_id = request.query_params.get("branch")
+        elif hasattr(request, "GET"):
+            branch_id = request.GET.get("branch")
+
+        if branch_id:
+            try:
+                br = Branch.objects.get(id=branch_id, company_id=comp_id)
+                # Зафиксируем на request, чтобы в остальных местах можно было использовать request.branch
+                setattr(request, "branch", br)
+                return br
+            except (Branch.DoesNotExist, ValueError):
+                # если кривой/чужой/несуществующий branch — тихо игнорируем и идём дальше
+                pass
+
+        # 1) primary_branch как метод
         primary = getattr(user, "primary_branch", None)
         if callable(primary):
             try:
@@ -48,14 +72,18 @@ class CompanyBranchReadOnlyMixin(serializers.ModelSerializer):
                     return val
             except Exception:
                 pass
+
+        # 1b) primary_branch как атрибут
         if primary and getattr(primary, "company_id", None) == comp_id:
             return primary
 
+        # 2) request.branch, если кто-то уже проставил (мидлварь и т.п.)
         if hasattr(request, "branch"):
             b = getattr(request, "branch")
             if b and getattr(b, "company_id", None) == comp_id:
                 return b
 
+        # 3) глобальный режим
         return None
 
     def create(self, validated_data):

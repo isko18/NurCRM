@@ -6,7 +6,7 @@ from rest_framework.response import Response
 from rest_framework.exceptions import PermissionDenied
 
 from apps.construction.models import Department, Cashbox, CashFlow
-from apps.users.models import User
+from apps.users.models import User, Branch
 from apps.construction.serializers import (
     DepartmentSerializer,
     CashboxSerializer,
@@ -29,11 +29,30 @@ def _get_company(user):
 def _get_active_branch(request):
     """
     Активный филиал:
+      0) ?branch=<uuid> в запросе (если принадлежит компании пользователя)
       1) user.primary_branch() / user.primary_branch (если реализовано)
       2) request.branch (если мидлварь ставит)
       3) None (глобальный контекст)
     """
     user = getattr(request, "user", None)
+    company = _get_company(user)
+
+    # 0) пробуем взять из query-параметра ?branch=<uuid>
+    branch_id = None
+    if hasattr(request, "query_params"):
+        branch_id = request.query_params.get("branch")
+    else:
+        branch_id = request.GET.get("branch")
+
+    if branch_id and company:
+        try:
+            br = Branch.objects.get(id=branch_id, company=company)
+            setattr(request, "branch", br)
+            return br
+        except Branch.DoesNotExist:
+            pass  # некорректный или чужой филиал — игнорируем
+
+    # 1) user.primary_branch() / user.primary_branch
     primary = getattr(user, "primary_branch", None)
     if callable(primary):
         try:
@@ -46,8 +65,12 @@ def _get_active_branch(request):
     if primary:
         setattr(request, "branch", primary)
         return primary
+
+    # 2) request.branch (если кто-то уже поставил)
     if hasattr(request, "branch"):
         return request.branch
+
+    # 3) глобальный контекст
     setattr(request, "branch", None)
     return None
 
@@ -59,19 +82,22 @@ class CompanyBranchScopedMixin:
     permission_classes = [permissions.IsAuthenticated]
 
     def _company(self):
-        return _get_company(getattr(self, "request", None).user)
+        request = getattr(self, "request", None)
+        user = getattr(request, "user", None)
+        return _get_company(user)
 
     def _active_branch(self):
         return _get_active_branch(self.request)
 
     def _model_has_field(self, queryset, field_name: str) -> bool:
-        return field_name in {f.name for f in queryset.model._meta.get_fields()}
+        # учитываем только реальные поля модели
+        return field_name in {f.name for f in queryset.model._meta.concrete_fields}
 
     def _scoped_queryset(self, base_qs):
         """
         company: строго компания пользователя,
         branch (если у модели есть поле):
-        - если у юзера есть активный филиал → ТОЛЬКО branch = мой филиал
+        - если у юзера/запроса есть активный филиал → глобальные (branch IS NULL) ИЛИ branch = мой филиал
         - если филиала нет → ТОЛЬКО branch IS NULL (глобальные)
         """
         if getattr(self, "swagger_fake_view", False):
@@ -85,11 +111,11 @@ class CompanyBranchScopedMixin:
         if self._model_has_field(qs, "branch"):
             br = self._active_branch()
             if br is not None:
-                qs = qs.filter(branch=br)
+                qs = qs.filter(Q(branch__isnull=True) | Q(branch=br))
             else:
                 qs = qs.filter(branch__isnull=True)
         return qs
-    
+
     # На create/update всегда жёстко ставим company/branch
     def _inject_company_branch_on_save(self, serializer):
         company = self._company()
@@ -100,7 +126,7 @@ class CompanyBranchScopedMixin:
         model = getattr(getattr(serializer, "Meta", None), "model", None)
         kwargs = {}
         if model:
-            model_fields = {f.name for f in model._meta.get_fields()}
+            model_fields = {f.name for f in model._meta.concrete_fields}
             if "company" in model_fields:
                 kwargs["company"] = company
             if "branch" in model_fields:
@@ -285,7 +311,7 @@ class CompanyDepartmentAnalyticsView(CompanyBranchScopedMixin, generics.ListAPIV
             qs = Department.objects.filter(company=company).select_related("company", "branch")
         else:
             raise PermissionDenied("Вы не являетесь владельцем компании или администратором.")
-        # Даже для owner/admin соблюдаем «глобальные или мой филиал»
+        # Даже для owner/admin соблюдаем «глобальные или мой филиал» (с учётом ?branch=...)
         return self._scoped_queryset(qs)
 
 

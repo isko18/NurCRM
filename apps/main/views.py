@@ -22,6 +22,7 @@ from .filters import TransactionRecordFilter, DebtFilter, DebtPaymentFilter
 from django_filters.rest_framework import DjangoFilterBackend
 import dateparse
 from apps.construction.models import Department
+from apps.users.models import Branch
 
 from apps.main.models import (
     Contact, Pipeline, Deal, Task, Integration, Analytics,
@@ -104,8 +105,9 @@ class CompanyBranchRestrictedMixin:
     - Фильтрует queryset по компании и (если у модели есть поле branch) по «активному филиалу».
     - На create/save подставляет company и (если у модели есть поле branch) — текущий филиал.
     - branch берём в порядке:
+        0) ?branch=<uuid> в запросе (если филиал принадлежит компании пользователя)
         1) user.primary_branch() или user.primary_branch
-        2) request.branch (если миддлварь поставила)
+        2) request.branch (если мидлварь поставила)
         3) None
     """
 
@@ -124,11 +126,38 @@ class CompanyBranchRestrictedMixin:
         return getattr(u, "owned_company", None) or getattr(u, "company", None)
 
     def _auto_branch(self):
+        """
+        Активный филиал:
+          0) ?branch=<uuid> в запросе (если филиал принадлежит компании пользователя)
+          1) user.primary_branch() / user.primary_branch
+          2) request.branch
+          3) None (глобальный режим)
+        """
         req = self._request()
         user = self._user()
-        if not user:
+        if not req or not user:
             return None
 
+        company = self._company()
+
+        # 0) berём из query-параметра ?branch=<uuid>
+        branch_id = None
+        if hasattr(req, "query_params"):
+            branch_id = req.query_params.get("branch")
+        elif hasattr(req, "GET"):
+            branch_id = req.GET.get("branch")
+
+        if branch_id and company:
+            try:
+                br = Branch.objects.get(id=branch_id, company=company)
+                # заодно закрепим на request, чтобы дальше можно было использовать как request.branch
+                setattr(req, "branch", br)
+                return br
+            except (Branch.DoesNotExist, ValueError):
+                # если передан чужой, несуществующий или битый UUID филиала — игнорируем
+                pass
+
+        # 1) user.primary_branch() как функция
         primary = getattr(user, "primary_branch", None)
         if callable(primary):
             try:
@@ -137,14 +166,18 @@ class CompanyBranchRestrictedMixin:
                     return val
             except Exception:
                 pass
-        elif primary:
+
+        # 1b) user.primary_branch как атрибут
+        if primary:
             return primary
 
-        if req and hasattr(req, "branch"):
+        # 2) request.branch (если мидлварь или код где-то уже поставил)
+        if hasattr(req, "branch"):
             return getattr(req, "branch")
 
+        # 3) глобальный режим
         return None
-
+    
     @staticmethod
     def _model_has_field(model, field_name: str) -> bool:
         try:
