@@ -35,12 +35,30 @@ def _get_company(user):
     return None
 
 
+def _is_owner_like(user) -> bool:
+    """
+    Владелец / админ / суперюзер – им позволяем переключаться между филиалами
+    и не привязываем к «жёсткому» филиалу.
+    """
+    if not user or not getattr(user, "is_authenticated", False):
+        return False
+    if getattr(user, "is_superuser", False):
+        return True
+    role = getattr(user, "role", None)
+    if role in ("owner", "admin"):
+        return True
+    if getattr(user, "owned_company", None):
+        return True
+    return False
+
+
 def _fixed_branch_from_user(user, company):
     """
     «Жёстко» назначенный филиал сотрудника (который нельзя поменять ?branch):
       - user.primary_branch() / user.primary_branch
       - user.branch
       - единственный branch из user.branch_ids (если есть такое поле)
+    Для owner/admin мы его НЕ навязываем, см. _get_active_branch.
     """
     if not user or not company:
         return None
@@ -83,11 +101,11 @@ def _fixed_branch_from_user(user, company):
 def _get_active_branch(request):
     """
     Активный филиал:
-      1) «жёсткий» филиал пользователя (primary / branch / branch_ids)
-      2) ?branch=<uuid> в запросе (если филиал принадлежит компании пользователя
-         и жёсткого филиала нет)
-      3) request.branch (если мидлварь ставит и филиал той же компании)
-      4) None (нет филиала → глобальный режим по всей компании)
+      1) для НЕ owner-like пользователя → «жёсткий» филиал (primary / branch / branch_ids)
+      2) для owner/admin или сотрудника БЕЗ жёсткого филиала:
+           2.0) ?branch=<uuid> (если филиал принадлежит компании пользователя)
+           2.1) request.branch (если мидлварь уже поставил и он той же компании)
+           2.2) None (нет филиала → глобальный режим по всей компании)
     """
     user = getattr(request, "user", None)
     company = _get_company(user)
@@ -97,13 +115,13 @@ def _get_active_branch(request):
 
     company_id = getattr(company, "id", None)
 
-    # 1) жёстко назначенный филиал
+    # 1) жёстко назначенный филиал – только для НЕ owner-like
     fixed = _fixed_branch_from_user(user, company)
-    if fixed is not None:
+    if fixed is not None and not _is_owner_like(user):
         setattr(request, "branch", fixed)
         return fixed
 
-    # 2) ?branch=<uuid> — только если нет жёсткого филиала
+    # 2) owner/admin или сотрудник без фиксированного филиала → можно ?branch
     branch_id = None
     if hasattr(request, "query_params"):
         branch_id = request.query_params.get("branch")
@@ -142,10 +160,9 @@ class CompanyBranchScopedMixin:
           * без филиала → все записи компании (без фильтра по branch)
 
     Активный филиал:
-      1) «жёсткий» филиал пользователя (primary / branch / branch_ids)
-      2) ?branch=<uuid>, если жёсткого нет
-      3) request.branch (middleware)
-      4) None
+      1) для НЕ owner-like → «жёсткий» филиал (primary / branch / branch_ids)
+      2) для owner/admin или сотрудника без жёсткого филиала:
+           ?branch=<uuid> или request.branch или None
 
     Создание:
       - company берём из пользователя
