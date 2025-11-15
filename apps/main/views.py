@@ -141,15 +141,26 @@ class CompanyBranchRestrictedMixin:
     def _company(self):
         """
         Компания текущего пользователя.
-        Для суперюзера можно вернуть None — тогда company не будет ограничением.
+        Для суперюзера -> None (без ограничения по company).
+
+        NEW: если у юзера нет company, но есть branch с company — берём её.
         """
         u = self._user()
         if not u or not getattr(u, "is_authenticated", False):
             return None
         if getattr(u, "is_superuser", False):
             return None
-        # приоритет: owned_company → company
-        return getattr(u, "owned_company", None) or getattr(u, "company", None)
+
+        company = getattr(u, "owned_company", None) or getattr(u, "company", None)
+        if company:
+            return company
+
+        # fallback: берем компанию из филиала пользователя
+        br = getattr(u, "branch", None)
+        if br is not None:
+            return getattr(br, "company", None)
+
+        return None
 
     def _fixed_branch_from_user(self, company) -> Optional[Branch]:
         """
