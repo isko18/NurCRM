@@ -20,17 +20,25 @@ from apps.construction.serializers import (
 # ВСПОМОГАТЕЛЬНЫЕ
 # ─────────────────────────────────────────────────────────────
 def _get_company(user):
-    """Компания текущего пользователя (owner/company)."""
+    """Компания текущего пользователя (owner/company или через membership)."""
     if not user or not getattr(user, "is_authenticated", False):
         return None
+
     company = getattr(user, "company", None) or getattr(user, "owned_company", None)
     if company:
         return company
 
     # fallback: если нет company, но есть branch с company
     br = getattr(user, "branch", None)
-    if br is not None:
-        return getattr(br, "company", None)
+    if br is not None and getattr(br, "company", None):
+        return br.company
+
+    # ещё один fallback: через membership-ы
+    memberships = getattr(user, "branch_memberships", None)
+    if memberships is not None:
+        m = memberships.select_related("branch__company").first()
+        if m and m.branch and m.branch.company:
+            return m.branch.company
 
     return None
 
@@ -42,33 +50,68 @@ def _is_owner_like(user) -> bool:
     """
     if not user or not getattr(user, "is_authenticated", False):
         return False
+
     if getattr(user, "is_superuser", False):
         return True
+
+    # если у тебя роль хранится строкой
     role = getattr(user, "role", None)
     if role in ("owner", "admin"):
         return True
+
+    # явный флаг владелец компании
     if getattr(user, "owned_company", None):
         return True
-    return False
 
+    # если используешь булевый is_admin
+    if getattr(user, "is_admin", False):
+        return True
+
+    return False
 
 def _fixed_branch_from_user(user, company):
     """
     «Жёстко» назначенный филиал сотрудника (который нельзя поменять ?branch):
-      - user.primary_branch() / user.primary_branch
-      - user.branch
-      - единственный branch из user.branch_ids (если есть такое поле)
-    Для owner/admin мы его НЕ навязываем, см. _get_active_branch.
+
+      1) через user.branch_memberships:
+         - primary (is_primary=True, branch.company == company)
+         - любой membership этой же компании
+      2) user.primary_branch() / user.primary_branch
+      3) user.branch
+      4) единственный branch из user.branch_ids (если есть такое поле)
+
+    Для owner/admin мы этот филиал НЕ навязываем (см. _get_active_branch).
     """
     if not user or not company:
         return None
 
     company_id = getattr(company, "id", None)
 
-    # 1) primary_branch: метод или атрибут
+    # 1) membership-ы
+    memberships = getattr(user, "branch_memberships", None)
+    if memberships is not None:
+        primary_m = (
+            memberships
+            .filter(is_primary=True, branch__company_id=company_id)
+            .select_related("branch")
+            .first()
+        )
+        if primary_m and primary_m.branch:
+            return primary_m.branch
+
+        any_m = (
+            memberships
+            .filter(branch__company_id=company_id)
+            .select_related("branch")
+            .first()
+        )
+        if any_m and any_m.branch:
+            return any_m.branch
+
+    # 2) primary_branch: метод или атрибут
     primary = getattr(user, "primary_branch", None)
 
-    # 1a) как метод
+    # 2a) как метод
     if callable(primary):
         try:
             val = primary()
@@ -77,17 +120,17 @@ def _fixed_branch_from_user(user, company):
         except Exception:
             pass
 
-    # 1b) как свойство
+    # 2b) как свойство
     if primary and not callable(primary) and getattr(primary, "company_id", None) == company_id:
         return primary
 
-    # 2) user.branch
+    # 3) user.branch
     if hasattr(user, "branch"):
         b = getattr(user, "branch")
         if b and getattr(b, "company_id", None) == company_id:
             return b
 
-    # 3) единственный филиал из branch_ids (как в JSON пользователя)
+    # 4) единственный филиал из branch_ids (как в JSON пользователя)
     branch_ids = getattr(user, "branch_ids", None)
     if isinstance(branch_ids, (list, tuple)) and len(branch_ids) == 1:
         try:
@@ -101,7 +144,8 @@ def _fixed_branch_from_user(user, company):
 def _get_active_branch(request):
     """
     Активный филиал:
-      1) для НЕ owner-like пользователя → «жёсткий» филиал (primary / branch / branch_ids)
+
+      1) для НЕ owner-like пользователя → «жёсткий» филиал (через membership / branch / branch_ids)
       2) для owner/admin или сотрудника БЕЗ жёсткого филиала:
            2.0) ?branch=<uuid> (если филиал принадлежит компании пользователя)
            2.1) request.branch (если мидлварь уже поставил и он той же компании)
@@ -146,8 +190,6 @@ def _get_active_branch(request):
     # 4) нет филиала
     setattr(request, "branch", None)
     return None
-
-
 # ─────────────────────────────────────────────────────────────
 # Базовый mixin для company + branch scope
 # ─────────────────────────────────────────────────────────────
