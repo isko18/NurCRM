@@ -104,11 +104,15 @@ class CompanyBranchRestrictedMixin:
     """
     - Фильтрует queryset по компании и (если у модели есть поле branch) по «активному филиалу».
     - На create/save подставляет company и (если у модели есть поле branch) — текущий филиал.
-    - branch берём в порядке:
-        0) ?branch=<uuid> в запросе (если филиал принадлежит компании пользователя)
-        1) user.primary_branch() или user.primary_branch
-        2) request.branch (если мидлварь поставила)
-        3) None
+    - Активный филиал:
+        1) user.primary_branch() или user.primary_branch (если принадлежит компании)
+        2) request.branch (если мидлварь поставила и принадлежит компании)
+        3) ?branch=<uuid> в запросе (если филиал принадлежит компании пользователя и у пользователя нет
+           "жёстко" назначенного филиала)
+        4) None (нет филиала — работаем по всей компании, без фильтра по branch)
+    Логика выборки:
+        - если branch определён → показываем только данные этого филиала;
+        - если branch = None → показываем все данные компании (без ограничения по branch).
     """
 
     permission_classes = [permissions.IsAuthenticated]
@@ -122,62 +126,100 @@ class CompanyBranchRestrictedMixin:
         return getattr(req, "user", None) if req else None
 
     def _company(self):
+        """
+        Компания текущего пользователя.
+        Для суперюзера можно вернуть None — тогда company не будет ограничением.
+        """
         u = self._user()
+        if not u or not getattr(u, "is_authenticated", False):
+            return None
+        if getattr(u, "is_superuser", False):
+            return None
+        # приоритет: owned_company → company
         return getattr(u, "owned_company", None) or getattr(u, "company", None)
 
-    def _auto_branch(self):
+    def _fixed_branch_from_user(self, company) -> Optional[Branch]:
         """
-        Активный филиал:
-          0) ?branch=<uuid> в запросе (если филиал принадлежит компании пользователя)
-          1) user.primary_branch() / user.primary_branch
-          2) request.branch
-          3) None (глобальный режим)
+        «Жёстко» назначенный филиал сотрудника (который нельзя менять ?branch):
+         - user.primary_branch() или user.primary_branch
+         - request.branch (если мидлварь уже положила)
         """
         req = self._request()
         user = self._user()
-        if not req or not user:
+        if not user or not company:
+            return None
+
+        company_id = getattr(company, "id", None)
+
+        # 1) user.primary_branch как метод
+        primary = getattr(user, "primary_branch", None)
+        if callable(primary):
+            try:
+                val = primary()
+                if val and getattr(val, "company_id", None) == company_id:
+                    return val
+            except Exception:
+                pass
+
+        # 1b) user.primary_branch как атрибут
+        if primary and not callable(primary) and getattr(primary, "company_id", None) == company_id:
+            return primary
+
+        # 1c) user.branch (если так хранится)
+        if hasattr(user, "branch"):
+            b = getattr(user, "branch")
+            if b and getattr(b, "company_id", None) == company_id:
+                return b
+
+        # 2) request.branch как результат работы middleware
+        if req and hasattr(req, "branch"):
+            b = getattr(req, "branch")
+            if b and getattr(b, "company_id", None) == company_id:
+                return b
+
+        return None
+
+    def _auto_branch(self) -> Optional[Branch]:
+        """
+        Активный филиал:
+          1) «Жёсткий» филиал сотрудника (primary / user.branch / request.branch)
+          2) ?branch=<uuid> в запросе (если принадлежит компании и нет жёсткого филиала)
+          3) None (нет филиала — глобальный режим по всей компании)
+        """
+        req = self._request()
+        user = self._user()
+        if not req or not user or not getattr(user, "is_authenticated", False):
             return None
 
         company = self._company()
+        company_id = getattr(company, "id", None)
 
-        # 0) berём из query-параметра ?branch=<uuid>
+        # 1) сначала ищем жёстко назначенный филиал
+        fixed_branch = self._fixed_branch_from_user(company)
+        if fixed_branch is not None:
+            # заодно закрепим на request, чтобы дальше можно было использовать как request.branch
+            setattr(req, "branch", fixed_branch)
+            return fixed_branch
+
+        # 2) если у пользователя НЕТ назначенного филиала — позволяем выбирать через ?branch
         branch_id = None
         if hasattr(req, "query_params"):
             branch_id = req.query_params.get("branch")
         elif hasattr(req, "GET"):
             branch_id = req.GET.get("branch")
 
-        if branch_id and company:
+        if branch_id and company_id:
             try:
-                br = Branch.objects.get(id=branch_id, company=company)
-                # заодно закрепим на request, чтобы дальше можно было использовать как request.branch
+                br = Branch.objects.get(id=branch_id, company_id=company_id)
                 setattr(req, "branch", br)
                 return br
             except (Branch.DoesNotExist, ValueError):
-                # если передан чужой, несуществующий или битый UUID филиала — игнорируем
+                # чужой/битый UUID — игнорируем
                 pass
 
-        # 1) user.primary_branch() как функция
-        primary = getattr(user, "primary_branch", None)
-        if callable(primary):
-            try:
-                val = primary()
-                if val:
-                    return val
-            except Exception:
-                pass
-
-        # 1b) user.primary_branch как атрибут
-        if primary:
-            return primary
-
-        # 2) request.branch (если мидлварь или код где-то уже поставил)
-        if hasattr(req, "branch"):
-            return getattr(req, "branch")
-
-        # 3) глобальный режим
+        # 3) никакого филиала → None (работаем по всей компании)
         return None
-    
+
     @staticmethod
     def _model_has_field(model, field_name: str) -> bool:
         try:
@@ -201,6 +243,10 @@ class CompanyBranchRestrictedMixin:
         AgentRequestItem -> cart -> company/branch), можно передать:
             company_field="cart__company"
             branch_field="cart__branch"
+
+        НОВАЯ ЛОГИКА:
+            - если branch определён → фильтруем по этому branch;
+            - если branch is None → НЕ фильтруем по branch вообще (вся компания).
         """
 
         company = self._company()
@@ -216,15 +262,13 @@ class CompanyBranchRestrictedMixin:
 
         # branch
         if branch_field:
-            if branch is None:
-                qs = qs.filter(**{f"{branch_field}__isnull": True})
-            else:
+            if branch is not None:
                 qs = qs.filter(**{branch_field: branch})
+            # если branch is None — ничего не добавляем, видим все филиалы компании
         elif self._model_has_field(model, "branch"):
-            if branch is None:
-                qs = qs.filter(branch__isnull=True)
-            else:
+            if branch is not None:
                 qs = qs.filter(branch=branch)
+            # branch is None → не фильтруем по branch, видим всё по компании
 
         return qs
 
@@ -236,11 +280,18 @@ class CompanyBranchRestrictedMixin:
 
     def get_serializer_context(self):
         # пробрасываем request, чтобы сериализаторы могли использовать company/branch/юзера
-        return {"request": self.request}
+        ctx = super().get_serializer_context() if hasattr(super(), "get_serializer_context") else {}
+        ctx["request"] = self.request
+        return ctx
 
     def _save_with_company_branch(self, serializer, **extra):
         """
         Безопасно подставляет company/branch только если такие поля есть у модели.
+
+        ВАЖНО:
+        - если у пользователя есть активный филиал → всегда жёстко проставляем его в branch;
+        - если филиала нет → branch не трогаем (можно создавать как глобальные, так и по филиалам,
+          если это позволено сериализатором/валидаторами).
         """
         model = serializer.Meta.model
         kwargs = dict(extra)
@@ -250,20 +301,32 @@ class CompanyBranchRestrictedMixin:
             kwargs.setdefault("company", company)
 
         if self._model_has_field(model, "branch"):
-            kwargs.setdefault("branch", self._auto_branch())
+            branch = self._auto_branch()
+            if branch is not None:
+                # сотрудник с филиалом — жёстко пишем его, игнорируя поле в payload
+                kwargs["branch"] = branch
+            # если branch is None — НЕ подставляем, пусть решает сериализатор/валидатор
 
         serializer.save(**kwargs)
 
     def perform_create(self, serializer):
         self._save_with_company_branch(serializer)
 
+    def perform_update(self, serializer):
+        self._save_with_company_branch(serializer)
+
+
 # ========= Утилиты для выборок суперпользователя в некоторых вьюхах =========
 def _get_company(user):
-    if user.is_superuser:
+    """
+    Помощник, если нужно руками получить "компанию пользователя" вне миксина.
+    Для суперпользователя возвращаем None (без ограничения по company).
+    """
+    if not user or not getattr(user, "is_authenticated", False):
+        return None
+    if getattr(user, "is_superuser", False):
         return None
     return getattr(user, "owned_company", None) or getattr(user, "company", None)
-
-
 # ===========================
 #  Contacts
 # ===========================
