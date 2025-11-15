@@ -8,56 +8,88 @@ from .models import (
     RequestsConsalting,
     BookingConsalting,
 )
-from apps.users.models import User
+from apps.users.models import User, Branch
 
 
 # ==========================
-# Общий миксин: company/branch (branch авто из пользователя)
+# Общий миксин: company/branch (branch авто из пользователя / ?branch)
 # ==========================
-class CompanyBranchReadOnlyMixin(serializers.ModelSerializer):
+class CompanyBranchReadOnlyMixin:
     """
     Делает company/branch read-only наружу и гарантированно проставляет их из контекста на create/update.
+
     Порядок получения branch:
-      1) user.primary_branch (свойство или метод, если есть)
-      2) request.branch (если вы кладёте в middleware)
+      0) ?branch=<uuid> в query-параметрах, если филиал принадлежит компании пользователя
+      1) user.primary_branch (свойство или метод, если есть и принадлежит компании)
+      2) request.branch (если вы кладёте в middleware и он принадлежит компании)
       3) None (глобальная запись компании)
     """
+
     company = serializers.ReadOnlyField(source="company.id")
     branch = serializers.ReadOnlyField(source="branch.id")
 
+    # ---- helpers ----
+    def _request(self):
+        return self.context.get("request")
+
+    def _user(self):
+        request = self._request()
+        return getattr(request, "user", None) if request else None
+
+    def _user_company(self):
+        user = self._user()
+        if user is None or not getattr(user, "is_authenticated", False):
+            return None
+        # поддержим как employee, так и owner
+        return getattr(user, "company", None) or getattr(user, "owned_company", None)
+
     # ---- какой филиал реально использовать ----
     def _auto_branch(self):
-        request = self.context.get("request")
+        request = self._request()
         if not request:
             return None
-        user = getattr(request, "user", None)
+        user = self._user()
+        company = self._user_company()
+        company_id = getattr(company, "id", None)
+        if not company_id:
+            return None
+
+        # 0) branch из query-параметров (?branch=<uuid>)
+        branch_id = None
+        if hasattr(request, "query_params"):
+            branch_id = request.query_params.get("branch")
+        elif hasattr(request, "GET"):
+            branch_id = request.GET.get("branch")
+
+        if branch_id:
+            try:
+                br = Branch.objects.get(id=branch_id, company_id=company_id)
+                setattr(request, "branch", br)
+                return br
+            except (Branch.DoesNotExist, ValueError):
+                # чужой/кривой id — игнорируем и идём дальше
+                pass
 
         # 1) primary_branch может быть полем или методом
         primary = getattr(user, "primary_branch", None)
         if callable(primary):
             try:
                 val = primary()
-                if val:
+                if val and getattr(val, "company_id", None) == company_id:
                     return val
             except Exception:
                 pass
-        if primary:
+        if primary and getattr(primary, "company_id", None) == company_id:
             return primary
 
         # 2) из middleware (на будущее)
         if hasattr(request, "branch"):
-            return request.branch
+            b = getattr(request, "branch")
+            if b and getattr(b, "company_id", None) == company_id:
+                return b
 
         # 3) глобально
         return None
-
-    def _user_company(self):
-        request = self.context.get("request")
-        user = getattr(request, "user", None) if request else None
-        if user is None or not getattr(user, "is_authenticated", False):
-            return None
-        # поддержим как employee, так и owner
-        return getattr(user, "company", None) or getattr(user, "owned_company", None)
 
     def create(self, validated_data):
         company = self._user_company()
@@ -70,14 +102,17 @@ class CompanyBranchReadOnlyMixin(serializers.ModelSerializer):
         company = self._user_company()
         if company is not None:
             validated_data["company"] = company
-            validated_data["branch"] = self._auto_branch()
+            # не перетираем существующий branch, если авто-branch не определён
+            auto_branch = self._auto_branch()
+            if auto_branch is not None:
+                validated_data["branch"] = auto_branch
         return super().update(instance, validated_data)
 
 
 # ==========================
 # ServicesConsalting
 # ==========================
-class ServicesConsaltingSerializer(CompanyBranchReadOnlyMixin):
+class ServicesConsaltingSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
     created_at = serializers.DateTimeField(read_only=True)
     updated_at = serializers.DateTimeField(read_only=True)
 
@@ -94,8 +129,9 @@ class ServicesConsaltingSerializer(CompanyBranchReadOnlyMixin):
 # ==========================
 # SaleConsalting
 # ==========================
-class SaleConsaltingSerializer(CompanyBranchReadOnlyMixin):
-    user = serializers.ReadOnlyField(source="user.id")  # пользователь — текущий автор/оператор; если нужно, можно сделать PK поле
+class SaleConsaltingSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
+    # пользователь — текущий автор/оператор
+    user = serializers.ReadOnlyField(source="user.id")
     user_display = serializers.SerializerMethodField()
     client_display = serializers.SerializerMethodField()
     service_display = serializers.CharField(source="services.name", read_only=True)
@@ -128,7 +164,11 @@ class SaleConsaltingSerializer(CompanyBranchReadOnlyMixin):
         if not obj.client:
             return None
         # стараемся красиво: full_name/название/телефон
-        return getattr(obj.client, "full_name", None) or getattr(obj.client, "name", None) or getattr(obj.client, "phone", None)
+        return (
+            getattr(obj.client, "full_name", None)
+            or getattr(obj.client, "name", None)
+            or getattr(obj.client, "phone", None)
+        )
 
     def validate_services(self, value):
         company = self._user_company()
@@ -150,6 +190,7 @@ class SaleConsaltingSerializer(CompanyBranchReadOnlyMixin):
         if company:
             if client and getattr(client, "company_id", None) != company.id:
                 raise serializers.ValidationError({"client": "Клиент принадлежит другой компании."})
+
         if target_branch is not None:
             if client and getattr(client, "branch_id", None) not in (None, target_branch.id):
                 raise serializers.ValidationError({"client": "Клиент принадлежит другому филиалу."})
@@ -166,7 +207,13 @@ class SaleConsaltingSerializer(CompanyBranchReadOnlyMixin):
                 temp.id = self.instance.id
             temp.clean()
         except DjangoValidationError as e:
-            raise serializers.ValidationError(getattr(e, "message_dict", {"detail": e.messages if hasattr(e, "messages") else str(e)}))
+            raise serializers.ValidationError(
+                getattr(
+                    e,
+                    "message_dict",
+                    {"detail": e.messages if hasattr(e, "messages") else str(e)},
+                )
+            )
 
         return attrs
 
@@ -174,7 +221,7 @@ class SaleConsaltingSerializer(CompanyBranchReadOnlyMixin):
 # ==========================
 # SalaryConsalting
 # ==========================
-class SalaryConsaltingSerializer(CompanyBranchReadOnlyMixin):
+class SalaryConsaltingSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
     user = serializers.PrimaryKeyRelatedField(queryset=User.objects.all(), required=True)
     user_display = serializers.SerializerMethodField()
     created_at = serializers.DateTimeField(read_only=True)
@@ -182,7 +229,12 @@ class SalaryConsaltingSerializer(CompanyBranchReadOnlyMixin):
 
     class Meta:
         model = SalaryConsalting
-        fields = ("id", "company", "branch", "user", "user_display", "amount", "percent", "description", "created_at", "updated_at")
+        fields = (
+            "id", "company", "branch",
+            "user", "user_display",
+            "amount", "percent", "description",
+            "created_at", "updated_at",
+        )
         read_only_fields = ("id", "company", "branch", "user_display", "created_at", "updated_at")
 
     def get_user_display(self, obj):
@@ -200,20 +252,29 @@ class SalaryConsaltingSerializer(CompanyBranchReadOnlyMixin):
 # ==========================
 # RequestsConsalting
 # ==========================
-class RequestsConsaltingSerializer(CompanyBranchReadOnlyMixin):
+class RequestsConsaltingSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
     client_display = serializers.SerializerMethodField()
     created_at = serializers.DateTimeField(read_only=True)
     updated_at = serializers.DateTimeField(read_only=True)
 
     class Meta:
         model = RequestsConsalting
-        fields = ("id", "company", "branch", "client", "client_display", "status", "name", "description", "created_at", "updated_at")
+        fields = (
+            "id", "company", "branch",
+            "client", "client_display",
+            "status", "name", "description",
+            "created_at", "updated_at",
+        )
         read_only_fields = ("id", "company", "branch", "created_at", "updated_at")
 
     def get_client_display(self, obj):
         if not obj.client:
             return None
-        return getattr(obj.client, "full_name", None) or getattr(obj.client, "name", None) or getattr(obj.client, "phone", None)
+        return (
+            getattr(obj.client, "full_name", None)
+            or getattr(obj.client, "name", None)
+            or getattr(obj.client, "phone", None)
+        )
 
     def validate(self, attrs):
         company = self._user_company()
@@ -232,14 +293,20 @@ class RequestsConsaltingSerializer(CompanyBranchReadOnlyMixin):
                 temp.id = self.instance.id
             temp.clean()
         except DjangoValidationError as e:
-            raise serializers.ValidationError(getattr(e, "message_dict", {"detail": e.messages if hasattr(e, "messages") else str(e)}))
+            raise serializers.ValidationError(
+                getattr(
+                    e,
+                    "message_dict",
+                    {"detail": e.messages if hasattr(e, "messages") else str(e)},
+                )
+            )
         return attrs
 
 
 # ==========================
 # BookingConsalting
 # ==========================
-class BookingConsaltingSerializer(CompanyBranchReadOnlyMixin):
+class BookingConsaltingSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
     employee = serializers.PrimaryKeyRelatedField(queryset=User.objects.all(), required=False, allow_null=True)
     employee_display = serializers.SerializerMethodField()
     created_at = serializers.DateTimeField(read_only=True)
@@ -247,7 +314,13 @@ class BookingConsaltingSerializer(CompanyBranchReadOnlyMixin):
 
     class Meta:
         model = BookingConsalting
-        fields = ("id", "company", "branch", "title", "date", "time", "employee", "employee_display", "note", "created_at", "updated_at")
+        fields = (
+            "id", "company", "branch",
+            "title", "date", "time",
+            "employee", "employee_display",
+            "note",
+            "created_at", "updated_at",
+        )
         read_only_fields = ("id", "company", "branch", "created_at", "updated_at", "employee_display")
 
     def get_employee_display(self, obj):
@@ -272,5 +345,11 @@ class BookingConsaltingSerializer(CompanyBranchReadOnlyMixin):
                 temp.id = self.instance.id
             temp.clean()
         except DjangoValidationError as e:
-            raise serializers.ValidationError(getattr(e, "message_dict", {"detail": e.messages if hasattr(e, "messages") else str(e)}))
+            raise serializers.ValidationError(
+                getattr(
+                    e,
+                    "message_dict",
+                    {"detail": e.messages if hasattr(e, "messages") else str(e)},
+                )
+            )
         return attrs

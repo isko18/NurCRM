@@ -3,6 +3,7 @@ from django.db.models import Q
 
 from apps.construction.models import Department, Cashbox, CashFlow
 from apps.users.serializers import UserWithPermissionsSerializer
+from apps.users.models import Branch  # нужен для ?branch=... в _auto_branch
 
 
 # ───────────────────────────────────────────────────────────
@@ -12,6 +13,7 @@ class CompanyBranchReadOnlyMixin(serializers.ModelSerializer):
     """
     Делает company/branch read-only наружу и гарантированно проставляет их из контекста на create/update.
     Порядок получения branch:
+      0) ?branch=<uuid> (если филиал принадлежит компании пользователя)
       1) user.primary_branch() / user.primary_branch
       2) request.branch (если middleware это положил)
       3) None (глобальная запись компании)
@@ -25,7 +27,24 @@ class CompanyBranchReadOnlyMixin(serializers.ModelSerializer):
             return None
         user = getattr(request, "user", None)
 
-        # пробуем user.primary_branch() как функцию
+        # компания пользователя (как в _get_company во views)
+        company = getattr(user, "company", None) or getattr(user, "owned_company", None)
+
+        # 0) query-параметр ?branch=<uuid>
+        branch_id = None
+        if hasattr(request, "query_params"):
+            branch_id = request.query_params.get("branch")
+        else:
+            branch_id = request.GET.get("branch")
+
+        if branch_id and company:
+            try:
+                br = Branch.objects.get(id=branch_id, company=company)
+                return br
+            except Branch.DoesNotExist:
+                pass  # некорректный/чужой branch — игнорируем
+
+        # 1) user.primary_branch() как функция
         primary = getattr(user, "primary_branch", None)
         if callable(primary):
             try:
@@ -34,15 +53,16 @@ class CompanyBranchReadOnlyMixin(serializers.ModelSerializer):
                     return val
             except Exception:
                 pass
-        # или просто атрибут
+
+        # 2) user.primary_branch как атрибут
         if primary:
             return primary
 
-        # middleware мог положить request.branch
+        # 3) middleware мог положить request.branch
         if hasattr(request, "branch"):
             return request.branch
 
-        # глобально по компании
+        # 4) глобально по компании
         return None
 
     def create(self, validated_data):
@@ -85,15 +105,8 @@ class CashboxWithFlowsSerializer(CompanyBranchReadOnlyMixin):
     )
     department_name = serializers.SerializerMethodField()
 
-    # Вариант А (как у тебя сейчас): просто все связанные CashFlow
+    # все связанные CashFlow
     cashflows = CashFlowInsideCashboxSerializer(source='flows', many=True, read_only=True)
-
-    # Если нужно только утверждённые операции, то вместо строки выше можно:
-    # cashflows = serializers.SerializerMethodField()
-    #
-    # def get_cashflows(self, obj):
-    #     qs = obj.flows.filter(status=CashFlow.Status.APPROVED)
-    #     return CashFlowInsideCashboxSerializer(qs, many=True).data
 
     # поле-флаг кассы
     is_consumption = serializers.BooleanField(read_only=True)
@@ -140,11 +153,11 @@ class CashboxWithFlowsSerializer(CompanyBranchReadOnlyMixin):
         target_branch = self._auto_branch()
         request = self.context.get('request')
 
-        if dept and target_branch is not None and dept.branch_id not in (None, getattr(target_branch, "id", None)):
-            raise serializers.ValidationError('Отдел принадлежит другому филиалу.')
-
         if dept and request and dept.company_id != request.user.company_id:
             raise serializers.ValidationError('Отдел должен принадлежать вашей компании.')
+
+        if dept and target_branch is not None and dept.branch_id not in (None, getattr(target_branch, "id", None)):
+            raise serializers.ValidationError('Отдел принадлежит другому филиалу.')
 
         return attrs
 
@@ -249,7 +262,7 @@ class CashFlowSerializer(CompanyBranchReadOnlyMixin):
 
         # ограничиваем доступные кассы:
         # - только из моей компании
-        # - только глобальные кассы (branch is NULL) или кассы моего филиала
+        # - глобальные (branch is NULL) или кассы моего филиала
         request = self.context.get('request')
         if request and getattr(request.user, 'company_id', None):
             target_branch = self._auto_branch()

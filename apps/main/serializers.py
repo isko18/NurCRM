@@ -18,7 +18,7 @@ from apps.main.models import (
 )
 from apps.construction.models import Department
 from apps.consalting.models import ServicesConsalting
-from apps.users.models import User, Company
+from apps.users.models import User, Company, Branch
 
 
 # ===========================
@@ -31,6 +31,7 @@ def _company_from_ctx(serializer: serializers.Serializer):
 def _active_branch(serializer: serializers.Serializer):
     """
     Активный филиал:
+      0) ?branch=<uuid> в запросе (если филиал принадлежит компании пользователя)
       1) user.primary_branch() / user.primary_branch
       2) request.branch
       3) None (глобальный контекст)
@@ -38,7 +39,25 @@ def _active_branch(serializer: serializers.Serializer):
     req = serializer.context.get("request")
     if not req:
         return None
+
     user = getattr(req, "user", None)
+    company = getattr(user, "company", None) or getattr(user, "owned_company", None)
+
+    branch_id = None
+    if hasattr(req, "query_params"):
+        branch_id = req.query_params.get("branch")
+    else:
+        branch_id = req.GET.get("branch")
+
+    # пустую строку тоже игнорируем
+    if branch_id and branch_id.strip() and company:
+        try:
+            br = Branch.objects.get(id=branch_id, company=company)
+            setattr(req, "branch", br)
+            return br
+        except (Branch.DoesNotExist, ValueError):
+            # не наш филиал / битый UUID — просто игнорируем
+            pass
 
     primary = getattr(user, "primary_branch", None)
     if callable(primary):
@@ -50,9 +69,12 @@ def _active_branch(serializer: serializers.Serializer):
             pass
     if primary:
         return primary
+
     if hasattr(req, "branch"):
         return req.branch
+
     return None
+
 
 def _restrict_pk_queryset_strict(field, base_qs, company, branch):
     """
@@ -111,20 +133,21 @@ class CompanyBranchReadOnlyMixin:
         return _active_branch(self)
 
     def create(self, validated_data):
-        user = self._user()
-        if user and getattr(user, "company_id", None):
-            validated_data.setdefault("company", user.company)
+        company = self._user_company()
+        if company:
+            validated_data.setdefault("company", company)
         if "branch" in getattr(self.Meta, "fields", []):
             validated_data["branch"] = self._auto_branch()
         return super().create(validated_data)
 
     def update(self, instance, validated_data):
-        user = self._user()
-        if user and getattr(user, "company_id", None):
-            validated_data["company"] = user.company
+        company = self._user_company()
+        if company:
+            validated_data["company"] = company
         if "branch" in getattr(self.Meta, "fields", []):
             validated_data["branch"] = self._auto_branch()
         return super().update(instance, validated_data)
+
 
 
 # ===========================

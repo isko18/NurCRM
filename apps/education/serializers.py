@@ -5,60 +5,100 @@ from .models import (
     Lead, Course, Group, Student, Lesson,
     Folder, Document, Attendance, TeacherRate
 )
-from apps.users.models import User   # 🔑 используем User вместо Teacher
+from apps.users.models import User, Branch   # 🔑 используем User и Branch
 
 
 # ===========================
-# Общий миксин: company/branch (branch авто из пользователя)
+# Общий миксин: company/branch (branch авто из пользователя / ?branch)
 # ===========================
 class CompanyBranchReadOnlyMixin:
     """
     Делает company/branch read-only наружу и гарантированно проставляет их из контекста на create/update.
     Порядок получения branch:
-      1) user.primary_branch() / user.primary_branch (если есть)
-      2) request.branch (если положил mixin/view/middleware)
+      0) ?branch=<uuid> (если филиал принадлежит компании пользователя)
+      1) user.primary_branch() / user.primary_branch (если есть и принадлежит компании)
+      2) request.branch (если положил mixin/view/middleware и он принадлежит компании)
       3) None (глобальная запись компании)
     """
     _cached_branch = None
+
+    # ---- helpers ----
+    def _request(self):
+        return self.context.get("request")
+
+    def _user(self):
+        r = self._request()
+        return getattr(r, "user", None) if r else None
+
+    def _user_company(self):
+        user = self._user()
+        if not user or not getattr(user, "is_authenticated", False):
+            return None
+        # поддержка employee + owner
+        return getattr(user, "company", None) or getattr(user, "owned_company", None)
 
     def _auto_branch(self):
         if self._cached_branch is not None:
             return self._cached_branch
 
-        request = self.context.get("request")
+        request = self._request()
         if not request:
             self._cached_branch = None
             return None
 
-        user = getattr(request, "user", None)
-        user_company_id = getattr(getattr(user, "company", None), "id", None)
+        user = self._user()
+        company = self._user_company()
+        company_id = getattr(company, "id", None)
 
         branch_candidate = None
-        primary = getattr(user, "primary_branch", None)
-        if callable(primary):
+
+        # 0) branch из query-параметров (?branch=<uuid>)
+        branch_id = None
+        if hasattr(request, "query_params"):
+            branch_id = request.query_params.get("branch")
+        elif hasattr(request, "GET"):
+            branch_id = request.GET.get("branch")
+
+        if branch_id and company_id:
             try:
-                branch_candidate = primary() or None
-            except Exception:
+                br = Branch.objects.get(id=branch_id, company_id=company_id)
+                branch_candidate = br
+            except (Branch.DoesNotExist, ValueError):
                 branch_candidate = None
-        elif primary:
-            branch_candidate = primary
 
+        # 1) primary_branch() / primary_branch
+        if branch_candidate is None and user is not None:
+            primary = getattr(user, "primary_branch", None)
+            if callable(primary):
+                try:
+                    val = primary()
+                    if val and getattr(val, "company_id", None) == company_id:
+                        branch_candidate = val
+                except Exception:
+                    pass
+            elif primary and getattr(primary, "company_id", None) == company_id:
+                branch_candidate = primary
+
+        # 2) request.branch
         if branch_candidate is None and hasattr(request, "branch"):
-            branch_candidate = getattr(request, "branch")
+            b = getattr(request, "branch")
+            if b and getattr(b, "company_id", None) == company_id:
+                branch_candidate = b
 
-        # консистентность company ↔ branch.company
-        if branch_candidate and user_company_id and getattr(branch_candidate, "company_id", None) != user_company_id:
+        # финальная проверка консистентности
+        if branch_candidate and company_id and getattr(branch_candidate, "company_id", None) != company_id:
             branch_candidate = None
 
         self._cached_branch = branch_candidate
         return self._cached_branch
 
     def _inject_company_branch(self, validated_data):
-        request = self.context.get("request")
+        request = self._request()
         if request:
-            user = getattr(request, "user", None)
-            if user is not None and getattr(getattr(user, "company", None), "id", None):
-                validated_data["company"] = user.company
+            user = self._user()
+            company = self._user_company()
+            if user is not None and company is not None:
+                validated_data["company"] = company
             validated_data["branch"] = self._auto_branch()
         return validated_data
 
@@ -67,6 +107,8 @@ class CompanyBranchReadOnlyMixin:
         return super().create(validated_data)
 
     def update(self, instance, validated_data):
+        # company/branch подправляем только при наличии компании; не трогаем явно переданное branch снаружи,
+        # т.к. оно всё равно игнорится полями read-only
         self._inject_company_branch(validated_data)
         return super().update(instance, validated_data)
 
@@ -75,7 +117,6 @@ class CompanyBranchReadOnlyMixin:
 class LeadSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
     company = serializers.UUIDField(source='company_id', read_only=True)
     branch = serializers.UUIDField(source='branch_id', read_only=True)
-
 
     class Meta:
         model = Lead
@@ -95,7 +136,6 @@ class CourseSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
     company = serializers.UUIDField(source='company_id', read_only=True)
     branch = serializers.UUIDField(source='branch_id', read_only=True)
 
-
     class Meta:
         model = Course
         fields = ['id', 'company', 'branch', 'title', 'price_per_month']
@@ -107,7 +147,6 @@ class GroupSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
     company = serializers.UUIDField(source='company_id', read_only=True)
     branch = serializers.UUIDField(source='branch_id', read_only=True)
 
-
     course = serializers.PrimaryKeyRelatedField(queryset=Course.objects.all())
     course_title = serializers.CharField(source='course.title', read_only=True)
 
@@ -118,7 +157,8 @@ class GroupSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
 
     def validate(self, attrs):
         request = self.context.get('request')
-        user_company_id = getattr(getattr(request.user, 'company', None), 'id', None)
+        company = self._user_company()
+        user_company_id = getattr(company, "id", None)
         target_branch = self._auto_branch()
 
         course = attrs.get('course') or getattr(self.instance, 'course', None)
@@ -139,7 +179,6 @@ class StudentSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
     company = serializers.UUIDField(source='company_id', read_only=True)
     branch = serializers.UUIDField(source='branch_id', read_only=True)
 
-
     group = serializers.PrimaryKeyRelatedField(queryset=Group.objects.all(), allow_null=True, required=False)
     group_name = serializers.CharField(source='group.name', read_only=True)
 
@@ -155,7 +194,8 @@ class StudentSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
         if group is None:
             return group
         request = self.context.get('request')
-        user_company_id = getattr(getattr(request.user, 'company', None), 'id', None)
+        company = self._user_company()
+        user_company_id = getattr(company, "id", None)
         if user_company_id and group.company_id != user_company_id:
             raise serializers.ValidationError('Группа принадлежит другой компании.')
         # ветка: студент глобальный/ветка пользователя; группа — глобальная/та же ветка
@@ -209,30 +249,29 @@ class LessonSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
         - если course не передан — берём из group
         - course == group.course
         - филиальная согласованность (group/course глобальные или активного филиала)
-        - вызывем model.clean() на «теневом» инстансе (важно для частичных апдейтов)
+        - вызываем model.clean() на «теневом» инстансе (важно для частичных апдейтов)
         """
         request = self.context.get('request')
-        company = getattr(request.user, 'company', None)
+        company = self._user_company()
         company_id = getattr(company, 'id', None)
         target_branch = self._auto_branch()
 
         instance = self.instance
-        group   = attrs.get('group',   getattr(instance, 'group',   None))
-        course  = attrs.get('course',  getattr(instance, 'course',  None))
-        teacher = attrs.get('teacher', getattr(instance, 'teacher', None))
-        date    = attrs.get('date',    getattr(instance, 'date',    None))
-        time    = attrs.get('time',    getattr(instance, 'time',    None))
-        duration= attrs.get('duration',getattr(instance, 'duration',None))
+        group    = attrs.get('group',    getattr(instance, 'group',    None))
+        course   = attrs.get('course',   getattr(instance, 'course',   None))
+        teacher  = attrs.get('teacher',  getattr(instance, 'teacher',  None))
+        date     = attrs.get('date',     getattr(instance, 'date',     None))
+        time     = attrs.get('time',     getattr(instance, 'time',     None))
+        duration = attrs.get('duration', getattr(instance, 'duration', None))
         classroom = attrs.get('classroom', getattr(instance, 'classroom', None))
 
         # company checks
-        if company_id and group  and group.company_id  != company_id:
-            raise serializers.ValidationError({'group':  'Группа принадлежит другой компании.'})
+        if company_id and group and group.company_id != company_id:
+            raise serializers.ValidationError({'group': 'Группа принадлежит другой компании.'})
         if company_id and course and course.company_id != company_id:
             raise serializers.ValidationError({'course': 'Курс принадлежит другой компании.'})
         if company_id and teacher and getattr(teacher, 'company_id', None) not in (None, company_id):
-            # если в User хранится company_id — проверим
-            if teacher.company_id != company_id:
+            if getattr(teacher, "company_id", None) != company_id:
                 raise serializers.ValidationError({'teacher': 'Преподаватель принадлежит другой компании.'})
 
         # если курс не передали — подставим из группы
@@ -255,9 +294,15 @@ class LessonSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
 
         # собрать «теневой» объект и дернуть model.clean()
         shadow = Lesson(
-            company=company, branch=target_branch,
-            group=group, course=course, teacher=teacher,
-            date=date, time=time, duration=duration, classroom=classroom
+            company=company,
+            branch=target_branch,
+            group=group,
+            course=course,
+            teacher=teacher,
+            date=date,
+            time=time,
+            duration=duration,
+            classroom=classroom,
         )
         if instance:
             shadow.id = instance.id
@@ -290,7 +335,8 @@ class FolderSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
         if parent is None:
             return parent
         request = self.context.get('request')
-        user_company_id = getattr(getattr(request.user, 'company', None), 'id', None)
+        company = self._user_company()
+        user_company_id = getattr(company, "id", None)
         target_branch = self._auto_branch()
         if user_company_id and parent.company_id != user_company_id:
             raise serializers.ValidationError('Родительская папка принадлежит другой компании.')
@@ -321,7 +367,8 @@ class DocumentSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer
         if folder is None:
             return folder
         request = self.context.get('request')
-        user_company_id = getattr(getattr(request.user, 'company', None), 'id', None)
+        company = self._user_company()
+        user_company_id = getattr(company, "id", None)
         target_branch = self._auto_branch()
         if user_company_id and folder.company_id != user_company_id:
             raise serializers.ValidationError('Папка принадлежит другой компании.')
@@ -335,7 +382,6 @@ class AttendanceSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializ
     company = serializers.UUIDField(source='company_id', read_only=True)
     branch = serializers.UUIDField(source='branch_id', read_only=True)
 
-
     class Meta:
         model = Attendance
         fields = [
@@ -348,7 +394,8 @@ class AttendanceSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializ
 
     def validate(self, attrs):
         request = self.context.get('request')
-        user_company_id = getattr(getattr(request.user, 'company', None), 'id', None)
+        company = self._user_company()
+        user_company_id = getattr(company, "id", None)
         target_branch = self._auto_branch()
 
         instance = self.instance
@@ -369,9 +416,11 @@ class AttendanceSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializ
             if student and student.branch_id not in (None, tbid):
                 raise serializers.ValidationError({'student': 'Студент другого филиала.'})
 
+        company_obj = company
+
         # дернём model.clean() через «теневой» объект
         shadow = Attendance(
-            company=self.context['request'].user.company,
+            company=company_obj,
             branch=target_branch,
             lesson=lesson,
             student=student,
@@ -439,7 +488,7 @@ class TeacherRateSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSeriali
 
     def validate(self, attrs):
         request = self.context["request"]
-        company = request.user.company
+        company = self._user_company()
         branch = self._auto_branch()
 
         teacher = attrs.get("teacher", getattr(self.instance, "teacher", None))

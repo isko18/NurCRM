@@ -1,4 +1,3 @@
-# barber_crm/views.py
 from rest_framework import generics, permissions, status
 from rest_framework.response import Response
 from rest_framework.parsers import MultiPartParser, FormParser
@@ -22,6 +21,7 @@ from .serializers import (
     DocumentSerializer,
 )
 
+
 # ---- DocumentFilter без изменений ----
 class DocumentFilter(filters.FilterSet):
     name = filters.CharFilter(lookup_expr="icontains")
@@ -39,14 +39,21 @@ class DocumentFilter(filters.FilterSet):
 class CompanyQuerysetMixin:
     """
     Видимость данных:
+      - company берётся из request.user.company/owned_company
+      - branch определяется:
+          0) ?branch=<uuid> (если филиал принадлежит компании пользователя)
+          1) primary-branch по членствам (BranchMembership)
+          2) request.branch (если кто-то уже поставил)
+          3) None (глобальный режим)
       - нет филиала у пользователя → только глобальные записи (branch IS NULL)
-      - есть филиал у пользователя → (рекомендуется) филиал И глобальные записи
+      - есть филиал → филиал И глобальные записи
+
     Создание:
       - company берётся из request.user.company/owned_company
       - branch проставляется автоматически (или None)
     Обновление:
       - company фиксируется
-      - branch НЕ перезаписывается автоматически (безопаснее)
+      - branch НЕ перезаписывается автоматически (не переносим запись между филиалами случайно)
     """
 
     # --- helpers ---
@@ -75,19 +82,55 @@ class CompanyQuerysetMixin:
         return None
 
     def _model_has_field(self, field_name: str) -> bool:
-        model = getattr(self, "queryset", None).model
+        qs = getattr(self, "queryset", None)
+        model = getattr(qs, "model", None)
+        if not model:
+            return False
         return field_name in {f.name for f in model._meta.get_fields()}
 
     def _active_branch(self):
+        """
+        Определяем активный филиал:
+          0) ?branch=<uuid> (если филиал принадлежит компании пользователя)
+          1) primary-branch по членствам
+          2) request.branch (если уже есть и принадлежит компании)
+          3) None
+        """
         request = self.request
         company = self._user_company()
         if not company:
             setattr(request, "branch", None)
             return None
+
+        # 0) branch из query-параметра
+        branch_id = None
+        if hasattr(request, "query_params"):
+            branch_id = request.query_params.get("branch")
+        elif hasattr(request, "GET"):
+            branch_id = request.GET.get("branch")
+
+        if branch_id:
+            try:
+                br = Branch.objects.get(id=branch_id, company=company)
+                setattr(request, "branch", br)
+                return br
+            except (Branch.DoesNotExist, ValueError):
+                # если id кривой/чужой — игнорируем и продолжаем
+                pass
+
+        # 1) primary-branch из membership
         user_branch = self._user_primary_branch()
         if user_branch and user_branch.company_id == company.id:
             setattr(request, "branch", user_branch)
             return user_branch
+
+        # 2) request.branch, если уже стоит и принадлежит компании
+        if hasattr(request, "branch"):
+            b = getattr(request, "branch")
+            if b and getattr(b, "company_id", None) == company.id:
+                return b
+
+        # 3) глобальный режим
         setattr(request, "branch", None)
         return None
 
@@ -106,10 +149,8 @@ class CompanyQuerysetMixin:
         if self._model_has_field("branch"):
             active_branch = self._active_branch()  # None или Branch
             if active_branch is not None:
-                # РЕКОМЕНДУЕМО: филиал + глобальные
+                # филиал + глобальные
                 qs = qs.filter(Q(branch=active_branch) | Q(branch__isnull=True))
-                # Если хотите строго только филиал — замените строкой ниже:
-                # qs = qs.filter(branch=active_branch)
             else:
                 qs = qs.filter(branch__isnull=True)
 
@@ -196,8 +237,8 @@ class ClientRetrieveUpdateDestroyView(
             qs = (
                 Appointment.objects
                 .filter(client=instance)
-                .select_related("barber")                # FIX
-                .prefetch_related("services")            # FIX
+                .select_related("barber")
+                .prefetch_related("services")
                 .order_by("-start_at")
             )
             examples = []
@@ -208,11 +249,11 @@ class ClientRetrieveUpdateDestroyView(
                         barber_name = f"{a.barber.first_name} {a.barber.last_name}".strip()
                     else:
                         barber_name = a.barber.email
-                service_names = list(a.services.values_list("name", flat=True))  # FIX
+                service_names = list(a.services.values_list("name", flat=True))
                 examples.append(
                     {
                         "start_at": a.start_at,
-                        "services": service_names,  # FIX
+                        "services": service_names,
                         "barber": barber_name,
                         "status": a.status,
                     }
@@ -235,8 +276,8 @@ class ClientRetrieveUpdateDestroyView(
 class AppointmentListCreateView(CompanyQuerysetMixin, generics.ListCreateAPIView):
     queryset = (
         Appointment.objects
-        .select_related("client", "barber")      # FIX: убран "service"
-        .prefetch_related("services")            # FIX
+        .select_related("client", "barber")
+        .prefetch_related("services")
         .all()
     )
     serializer_class = AppointmentSerializer
@@ -255,8 +296,8 @@ class AppointmentRetrieveUpdateDestroyView(
 ):
     queryset = (
         Appointment.objects
-        .select_related("client", "barber")      # FIX
-        .prefetch_related("services")            # FIX
+        .select_related("client", "barber")
+        .prefetch_related("services")
         .all()
     )
     serializer_class = AppointmentSerializer

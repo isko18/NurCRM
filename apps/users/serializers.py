@@ -62,6 +62,19 @@ def _sync_user_branches(user: User, branches: list[Branch]):
 class CustomTokenObtainPairSerializer(TokenObtainPairSerializer):
     def validate(self, attrs):
         data = super().validate(attrs)
+
+        # аккуратно достаём основной филиал (метод или атрибут)
+        primary = getattr(self.user, "primary_branch", None)
+        primary_branch_id = None
+        if callable(primary):
+            try:
+                br = primary()
+                primary_branch_id = getattr(br, "id", None)
+            except Exception:
+                primary_branch_id = None
+        else:
+            primary_branch_id = getattr(primary, "id", None)
+
         data.update({
             'user_id': self.user.id,
             'email': self.user.email,
@@ -73,7 +86,7 @@ class CustomTokenObtainPairSerializer(TokenObtainPairSerializer):
             'company': self.user.company.name if self.user.company else None,
             'role': self.user.role_display,
             'branch_ids': getattr(self.user, "allowed_branch_ids", []),
-            'primary_branch_id': getattr(self.user.primary_branch, "id", None),
+            'primary_branch_id': primary_branch_id,
         })
         return data
 
@@ -104,6 +117,7 @@ class BranchSerializer(serializers.ModelSerializer):
 
         return Branch.objects.create(company=company, **validated_data)
 
+
 # 🔑 Пользователь
 class UserSerializer(serializers.ModelSerializer):
     password = serializers.CharField(write_only=True, required=False, min_length=8, style={'input_type': 'password'})
@@ -117,7 +131,7 @@ class UserSerializer(serializers.ModelSerializer):
         model = User
         fields = [
             'id', 'email', 'password',
-            'first_name', 'last_name', 'track_number', 'phone_number','avatar',
+            'first_name', 'last_name', 'track_number', 'phone_number', 'avatar',
             'company', 'role', 'custom_role', 'role_display',
             # доступы
             'can_view_dashboard', 'can_view_cashbox', 'can_view_departments',
@@ -281,13 +295,13 @@ class OwnerRegisterSerializer(serializers.ModelSerializer):
             'can_view_employees', 'can_view_clients',
             'can_view_brand_category', 'can_view_settings', 'can_view_sale',
             # новые
-            'can_view_building_work_process', 'can_view_building_objects','can_view_additional_services', "can_view_debts",
+            'can_view_building_work_process', 'can_view_building_objects', 'can_view_additional_services', "can_view_debts",
             # барбершоп
             'can_view_barber_clients', 'can_view_barber_services',
             'can_view_barber_history', 'can_view_barber_records',
             # хостел
             'can_view_hostel_rooms', 'can_view_hostel_booking',
-            'can_view_hostel_clients', 'can_view_hostел_analytics',
+            'can_view_hostel_clients', 'can_view_hostel_analytics',
             # кафе
             'can_view_cafe_menu', 'can_view_cafe_orders',
             'can_view_cafe_purchasing', 'can_view_cafe_booking',
@@ -360,7 +374,7 @@ class EmployeeCreateSerializer(serializers.ModelSerializer):
             'can_view_employees', 'can_view_clients',
             'can_view_brand_category', 'can_view_settings', 'can_view_sale',
 
-            'can_view_building_work_process','can_view_building_objects', 'can_view_additional_services', "can_view_debts",
+            'can_view_building_work_process', 'can_view_building_objects', 'can_view_additional_services', "can_view_debts",
 
             'can_view_barber_clients', 'can_view_barber_services',
             'can_view_barber_history', 'can_view_barber_records',
@@ -433,7 +447,7 @@ class EmployeeCreateSerializer(serializers.ModelSerializer):
             'can_view_employees', 'can_view_clients',
             'can_view_brand_category', 'can_view_settings', 'can_view_sale',
 
-            'can_view_building_work_process','can_view_building_objects', 'can_view_additional_services', "can_view_debts",
+            'can_view_building_work_process', 'can_view_building_objects', 'can_view_additional_services', "can_view_debts",
 
             'can_view_barber_clients', 'can_view_barber_services',
             'can_view_barber_history', 'can_view_barber_records',
@@ -494,7 +508,6 @@ class EmployeeCreateSerializer(serializers.ModelSerializer):
 
             # проставляем основной (если указан)
             if primary_branch_id:
-                # сброс прежнего основного у этого пользователя на всякий случай (хоть его и нет пока)
                 BranchMembership.objects.filter(user=user, is_primary=True).update(is_primary=False)
                 BranchMembership.objects.filter(user=user, branch_id=primary_branch_id).update(is_primary=True)
 
@@ -529,6 +542,7 @@ class EmployeeCreateSerializer(serializers.ModelSerializer):
             for m in instance.branch_memberships.select_related("branch").all()
         ]
         return rep
+
 
 # 🔍 Список сотрудников
 class UserListSerializer(serializers.ModelSerializer):
@@ -572,7 +586,7 @@ class UserWithPermissionsSerializer(serializers.ModelSerializer):
     class Meta:
         model = User
         fields = [
-            'id', 'email', 'first_name', 'last_name','track_number', 'phone_number', 'role', 'custom_role', 'role_display', 'avatar',
+            'id', 'email', 'first_name', 'last_name', 'track_number', 'phone_number', 'role', 'custom_role', 'role_display', 'avatar',
             # доступы
             'can_view_dashboard', 'can_view_cashbox', 'can_view_departments',
             'can_view_orders', 'can_view_analytics', 'can_view_department_analytics',
@@ -763,6 +777,7 @@ class ChangePasswordSerializer(serializers.Serializer):
 # 🏢 Обновление компании
 _OPTIONAL_TEXT = ("llc", "inn", "okpo", "score", "bik", "address")
 
+
 class CompanyUpdateSerializer(serializers.ModelSerializer):
     class Meta:
         model = Company
@@ -788,6 +803,7 @@ class CustomRoleSerializer(serializers.ModelSerializer):
         model = CustomRole
         fields = ["id", "name", "company"]
         read_only_fields = ["id", "company"]
+
 
 class BranchCreateUpdateSerializer(serializers.ModelSerializer):
     class Meta:

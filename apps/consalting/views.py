@@ -1,6 +1,8 @@
 from rest_framework import generics, permissions
 from rest_framework.exceptions import PermissionDenied
 
+from django_filters.rest_framework import DjangoFilterBackend
+
 from .models import (
     ServicesConsalting,
     SaleConsalting,
@@ -15,6 +17,7 @@ from .serializers import (
     RequestsConsaltingSerializer,
     BookingConsaltingSerializer,
 )
+from apps.users.models import Branch
 
 
 # ===== helpers =====
@@ -33,9 +36,17 @@ class CompanyBranchQuerysetMixin:
       - если у модели есть поле branch:
           * при активном филиале пользователя → только записи этого филиала
           * без филиала → только глобальные записи (branch IS NULL)
+
+    Активный филиал определяется:
+      0) ?branch=<uuid> (если филиал принадлежит компании пользователя)
+      1) user.primary_branch() как метод
+      2) user.primary_branch как свойство
+      3) request.branch (если проставляет middleware)
+      4) None (глобальная область)
+
     Создание/обновление:
       - company берём из пользователя
-      - branch автоматически из пользователя/запроса (см. _active_branch)
+      - branch автоматически из _active_branch()
     Безопасен для swagger_fake_view и анонимов.
     """
     permission_classes = [permissions.IsAuthenticated]
@@ -53,39 +64,57 @@ class CompanyBranchQuerysetMixin:
 
     def _active_branch(self):
         """
-        Определяем активный филиал пользователя:
-          1) user.primary_branch() как метод
-          2) user.primary_branch как свойство
-          3) request.branch (если проставляет middleware)
-          4) None (глобальная область)
+        Определяем активный филиал пользователя с проверкой на принадлежность компании.
         """
         request = getattr(self, "request", None)
-        user = self._user()
-        if not user or not getattr(user, "is_authenticated", False):
+        company = self._user_company()
+        if not company:
             if request:
                 setattr(request, "branch", None)
             return None
 
-        # 1) метод
+        # 0) branch из query-параметров (?branch=<uuid>)
+        branch_id = None
+        if request is not None:
+            if hasattr(request, "query_params"):
+                branch_id = request.query_params.get("branch")
+            elif hasattr(request, "GET"):
+                branch_id = request.GET.get("branch")
+
+        if branch_id:
+            try:
+                br = Branch.objects.get(id=branch_id, company=company)
+                setattr(request, "branch", br)
+                return br
+            except (Branch.DoesNotExist, ValueError):
+                # чужой/кривой id — игнорируем и идём дальше
+                pass
+
+        user = self._user()
+
+        # 1) primary_branch как метод
         primary = getattr(user, "primary_branch", None)
         if callable(primary):
             try:
                 val = primary()
-                if val:
+                if val and getattr(val, "company_id", None) == company.id:
                     if request:
                         setattr(request, "branch", val)
                     return val
             except Exception:
                 pass
-        # 2) свойство
-        if primary:
+
+        # 2) primary_branch как свойство
+        if primary and not callable(primary) and getattr(primary, "company_id", None) == company.id:
             if request:
                 setattr(request, "branch", primary)
             return primary
 
         # 3) из middleware
         if request and hasattr(request, "branch"):
-            return request.branch
+            b = getattr(request, "branch")
+            if b and getattr(b, "company_id", None) == company.id:
+                return b
 
         # 4) глобально
         if request:
@@ -117,7 +146,8 @@ class CompanyBranchQuerysetMixin:
         company = self._user_company()
         if not company:
             raise PermissionDenied("У пользователя не настроена компания.")
-        if _has_field(self.get_queryset().model, "branch"):
+        model = self.get_queryset().model
+        if _has_field(model, "branch"):
             serializer.save(company=company, branch=self._active_branch())
         else:
             serializer.save(company=company)
@@ -126,7 +156,8 @@ class CompanyBranchQuerysetMixin:
         company = self._user_company()
         if not company:
             raise PermissionDenied("У пользователя не настроена компания.")
-        if _has_field(self.get_queryset().model, "branch"):
+        model = self.get_queryset().model
+        if _has_field(model, "branch"):
             serializer.save(company=company, branch=self._active_branch())
         else:
             serializer.save(company=company)
@@ -138,6 +169,11 @@ class CompanyBranchQuerysetMixin:
 class ServicesConsaltingListCreateView(CompanyBranchQuerysetMixin, generics.ListCreateAPIView):
     queryset = ServicesConsalting.objects.all()
     serializer_class = ServicesConsaltingSerializer
+    filter_backends = [DjangoFilterBackend]
+    filterset_fields = [
+        f.name for f in ServicesConsalting._meta.get_fields()
+        if not f.is_relation or f.many_to_one
+    ]
 
 
 class ServicesConsaltingRetrieveUpdateDestroyView(CompanyBranchQuerysetMixin, generics.RetrieveUpdateDestroyAPIView):
@@ -151,11 +187,19 @@ class ServicesConsaltingRetrieveUpdateDestroyView(CompanyBranchQuerysetMixin, ge
 class SaleConsaltingListCreateView(CompanyBranchQuerysetMixin, generics.ListCreateAPIView):
     queryset = SaleConsalting.objects.select_related("services", "client", "user", "company").all()
     serializer_class = SaleConsaltingSerializer
+    filter_backends = [DjangoFilterBackend]
+    filterset_fields = [
+        f.name for f in SaleConsalting._meta.get_fields()
+        if not f.is_relation or f.many_to_one
+    ]
 
     def perform_create(self, serializer):
         # company/branch — миксин; user — текущий оператор
         company = self._user_company()
-        if _has_field(self.get_queryset().model, "branch"):
+        if not company:
+            raise PermissionDenied("У пользователя не настроена компания.")
+        model = self.get_queryset().model
+        if _has_field(model, "branch"):
             serializer.save(company=company, branch=self._active_branch(), user=self.request.user)
         else:
             serializer.save(company=company, user=self.request.user)
@@ -172,6 +216,11 @@ class SaleConsaltingRetrieveUpdateDestroyView(CompanyBranchQuerysetMixin, generi
 class SalaryConsaltingListCreateView(CompanyBranchQuerysetMixin, generics.ListCreateAPIView):
     queryset = SalaryConsalting.objects.select_related("user", "company").all()
     serializer_class = SalaryConsaltingSerializer
+    filter_backends = [DjangoFilterBackend]
+    filterset_fields = [
+        f.name for f in SalaryConsalting._meta.get_fields()
+        if not f.is_relation or f.many_to_one
+    ]
 
 
 class SalaryConsaltingRetrieveUpdateDestroyView(CompanyBranchQuerysetMixin, generics.RetrieveUpdateDestroyAPIView):
@@ -185,6 +234,11 @@ class SalaryConsaltingRetrieveUpdateDestroyView(CompanyBranchQuerysetMixin, gene
 class RequestsConsaltingListCreateView(CompanyBranchQuerysetMixin, generics.ListCreateAPIView):
     queryset = RequestsConsalting.objects.select_related("client", "company").all()
     serializer_class = RequestsConsaltingSerializer
+    filter_backends = [DjangoFilterBackend]
+    filterset_fields = [
+        f.name for f in RequestsConsalting._meta.get_fields()
+        if not f.is_relation or f.many_to_one
+    ]
 
 
 class RequestsConsaltingRetrieveUpdateDestroyView(CompanyBranchQuerysetMixin, generics.RetrieveUpdateDestroyAPIView):
@@ -198,6 +252,11 @@ class RequestsConsaltingRetrieveUpdateDestroyView(CompanyBranchQuerysetMixin, ge
 class BookingConsaltingListCreateView(CompanyBranchQuerysetMixin, generics.ListCreateAPIView):
     queryset = BookingConsalting.objects.select_related("employee", "company").all()
     serializer_class = BookingConsaltingSerializer
+    filter_backends = [DjangoFilterBackend]
+    filterset_fields = [
+        f.name for f in BookingConsalting._meta.get_fields()
+        if not f.is_relation or f.many_to_one
+    ]
 
 
 class BookingConsaltingRetrieveUpdateDestroyView(CompanyBranchQuerysetMixin, generics.RetrieveUpdateDestroyAPIView):
