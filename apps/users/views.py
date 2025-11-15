@@ -29,45 +29,145 @@ from .serializers import BranchSerializer, BranchCreateUpdateSerializer
 from .permissions import IsCompanyOwner, IsCompanyOwnerOrAdmin
 
 
-# ===== Вспомогательные для branch-фильтрации сотрудников =====
-def _get_active_branch(request, company):
+# ===== Общие helpers для company / branch / ролей =====
+
+def _get_company(user):
     """
-    Возвращает филиал компании по ?branch=<uuid>, если он существует и принадлежит компании.
-    Иначе — None.
+    Компания текущего пользователя:
+      - owned_company (владелец)
+      - company (сотрудник)
     """
-    if not request or not company:
+    if not user or not getattr(user, "is_authenticated", False):
+        return None
+    return getattr(user, "owned_company", None) or getattr(user, "company", None)
+
+
+def _is_owner_like(user) -> bool:
+    """
+    Владелец / админ / суперюзер – тем разрешаем видеть всю компанию,
+    а не только свой филиал.
+    """
+    if not user or not getattr(user, "is_authenticated", False):
+        return False
+    if getattr(user, "is_superuser", False):
+        return True
+    role = getattr(user, "role", None)
+    if role in ("owner", "admin"):
+        return True
+    if getattr(user, "owned_company", None):
+        return True
+    return False
+
+
+def _fixed_branch_from_user(user, company):
+    """
+    «Жёстко» назначенный филиал сотрудника (который нельзя переключать ?branch):
+      1) user.primary_branch() / user.primary_branch
+      2) user.branch
+      3) единственный id в user.branch_ids
+    """
+    if not user or not company:
         return None
 
+    company_id = getattr(company, "id", None)
+
+    # 1) primary_branch как метод
+    primary = getattr(user, "primary_branch", None)
+    if callable(primary):
+        try:
+            val = primary()
+            if val and getattr(val, "company_id", None) == company_id:
+                return val
+        except Exception:
+            pass
+
+    # 1b) primary_branch как свойство
+    if primary and not callable(primary) and getattr(primary, "company_id", None) == company_id:
+        return primary
+
+    # 2) user.branch
+    if hasattr(user, "branch"):
+        b = getattr(user, "branch")
+        if b and getattr(b, "company_id", None) == company_id:
+            return b
+
+    # 3) единственный филиал из branch_ids
+    branch_ids = getattr(user, "branch_ids", None)
+    if isinstance(branch_ids, (list, tuple)) and len(branch_ids) == 1:
+        try:
+            return Branch.objects.get(id=branch_ids[0], company_id=company_id)
+        except Branch.DoesNotExist:
+            pass
+
+    return None
+
+
+def _get_active_branch(request, company):
+    """
+    Активный филиал для ФИЛЬТРАЦИИ СОТРУДНИКОВ.
+
+    Логика:
+      - если пользователь не owner-like и у него есть «жёсткий» филиал → всегда этот филиал,
+        ?branch игнорируем;
+      - иначе:
+          0) ?branch=<uuid> (если филиал принадлежит компании)
+          1) request.branch (если кто-то уже поставил и он от этой компании)
+          2) иначе None (вся компания).
+    """
+    user = getattr(request, "user", None)
+    if not company or not user or not getattr(user, "is_authenticated", False):
+        return None
+
+    # 1) для обычного сотрудника сначала фиксируем его филиал
+    fixed = _fixed_branch_from_user(user, company)
+    if fixed is not None and not _is_owner_like(user):
+        # продавец/сотрудник с назначенным филиалом – жёстко сидит в нём
+        setattr(request, "branch", fixed)
+        return fixed
+
+    # 2) owner/admin/сотрудник без фиксированного филиала – можно выбирать ?branch
     branch_id = None
     if hasattr(request, "query_params"):
         branch_id = request.query_params.get("branch")
     elif hasattr(request, "GET"):
         branch_id = request.GET.get("branch")
 
-    if not branch_id:
-        return None
+    if branch_id:
+        try:
+            br = Branch.objects.get(id=branch_id, company=company)
+            setattr(request, "branch", br)
+            return br
+        except (Branch.DoesNotExist, ValueError):
+            # если id кривой/чужой – игнорируем
+            pass
 
-    try:
-        return Branch.objects.get(id=branch_id, company=company)
-    except (Branch.DoesNotExist, ValueError):
-        return None
+    # 3) request.branch, если уже стоит и принадлежит компании
+    if hasattr(request, "branch"):
+        b = getattr(request, "branch")
+        if b and getattr(b, "company_id", None) == getattr(company, "id", None):
+            return b
+
+    # 4) глобальный режим (вся компания)
+    setattr(request, "branch", None)
+    return None
 
 
 def _apply_branch_filter_to_users(request, base_qs):
     """
     Фильтр сотрудников по активному филиалу:
-      - если branch не задан/невалиден — возвращаем base_qs как есть
-      - если задан валидный branch:
+      - если branch не определён → возвращаем base_qs как есть (вся компания);
+      - если branch определён:
           сотрудники, у которых есть membership в этот филиал
           ИЛИ сотрудники без membership (глобальные).
     """
-    user = request.user
-    company = getattr(user, "owned_company", None) or getattr(user, "company", None)
+    user = getattr(request, "user", None)
+    company = _get_company(user)
     if not company:
         return base_qs.none()
 
     branch = _get_active_branch(request, company)
     if not branch:
+        # нет активного филиала → весь список сотрудников компании
         return base_qs
 
     return (
@@ -105,12 +205,14 @@ class EmployeeListAPIView(generics.ListAPIView):
             return User.objects.none()
 
         user = self.request.user
-        company = getattr(user, "owned_company", None) or user.company
+        company = _get_company(user)
         if not company:
             return User.objects.none()
 
         base_qs = company.employees.all()
-        # применяем фильтрацию по ?branch=
+        # применяем фильтрацию по филиалу:
+        #  - для обычных сотрудников → их фиксированный филиал (если есть),
+        #  - для owner/admin → опционально ?branch=<uuid>
         return _apply_branch_filter_to_users(self.request, base_qs)
 
 
@@ -169,12 +271,12 @@ class EmployeeDestroyAPIView(generics.DestroyAPIView):
             return User.objects.none()
 
         user = self.request.user
-        company = getattr(user, "owned_company", None) or user.company
+        company = _get_company(user)
         if not company:
             return User.objects.none()
 
         base_qs = company.employees.all()
-        # учитываем ?branch= как в списке
+        # учитываем branch-ограничения так же, как в списке
         return _apply_branch_filter_to_users(self.request, base_qs)
 
     def delete(self, request, *args, **kwargs):
@@ -209,12 +311,12 @@ class EmployeeDetailAPIView(generics.RetrieveUpdateDestroyAPIView):
             return User.objects.none()
 
         user = self.request.user
-        company = getattr(user, "owned_company", None) or user.company
+        company = _get_company(user)
         if not company:
             return User.objects.none()
 
         base_qs = company.employees.exclude(id=user.id)
-        # учитываем ?branch= чтобы не лезть в сотрудников другого филиала
+        # учитываем branch-ограничения
         return _apply_branch_filter_to_users(self.request, base_qs)
 
     def delete(self, request, *args, **kwargs):
@@ -295,7 +397,7 @@ class CustomRoleDetailAPIView(generics.RetrieveUpdateDestroyAPIView):
             return CustomRole.objects.none()
 
         user = self.request.user
-        company = getattr(user, "owned_company", None) or getattr(user, "company", None)
+        company = _get_company(user)
         if not company:
             return CustomRole.objects.none()
 
@@ -314,11 +416,11 @@ class BranchListCreateAPIView(generics.ListCreateAPIView):
         if getattr(self, "swagger_fake_view", False):
             return Branch.objects.none()
         user = self.request.user
-        company = getattr(user, "owned_company", None) or getattr(user, "company", None)
+        company = _get_company(user)
         return Branch.objects.filter(company=company) if company else Branch.objects.none()
 
     def perform_create(self, serializer):
-        # ВАЖНО: НЕ передаём company сюда — сериализатор сам подставит
+        # company подставит сам сериализатор (из request.user)
         serializer.save()
 
 
@@ -335,7 +437,7 @@ class BranchDetailAPIView(generics.RetrieveUpdateDestroyAPIView):
         if getattr(self, 'swagger_fake_view', False):
             return Branch.objects.none()
         user = self.request.user
-        company = getattr(user, "owned_company", None) or getattr(user, "company", None)
+        company = _get_company(user)
         return Branch.objects.filter(company=company) if company else Branch.objects.none()
 
     def get_serializer_class(self):
@@ -346,12 +448,12 @@ class BranchDetailAPIView(generics.RetrieveUpdateDestroyAPIView):
 
     def perform_update(self, serializer):
         user = self.request.user
-        if not (user.is_superuser or user.role in ("owner", "admin")):
+        if not (user.is_superuser or getattr(user, "role", None) in ("owner", "admin")):
             raise PermissionDenied("Недостаточно прав для изменения филиала.")
         serializer.save()
 
     def perform_destroy(self, instance):
         user = self.request.user
-        if not (user.is_superuser or user.role in ("owner", "admin")):
+        if not (user.is_superuser or getattr(user, "role", None) in ("owner", "admin")):
             raise PermissionDenied("Недостаточно прав для удаления филиала.")
         instance.delete()

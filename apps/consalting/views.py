@@ -34,37 +34,104 @@ class CompanyBranchQuerysetMixin:
     Видимость данных:
       - всегда ограничиваемся компанией пользователя
       - если у модели есть поле branch:
-          * при активном филиале пользователя → только записи этого филиала
-          * без филиала → только глобальные записи (branch IS NULL)
+          * при привязке сотрудника к филиалу → только записи этого филиала
+          * без филиала → все записи компании (без фильтра по branch)
 
-    Активный филиал определяется:
-      0) ?branch=<uuid> (если филиал принадлежит компании пользователя)
-      1) user.primary_branch() как метод
-      2) user.primary_branch как свойство
-      3) request.branch (если проставляет middleware)
-      4) None (глобальная область)
+    Активный филиал:
+      1) «жёстко» назначенный филиал пользователя:
+           - user.primary_branch() / user.primary_branch
+           - user.branch
+           - (опционально) единственный филиал из user.branch_ids
+      2) если жёсткого филиала нет — ?branch=<uuid>, если филиал принадлежит компании
+      3) request.branch (если проставляет middleware и он из этой компании)
+      4) иначе None
 
-    Создание/обновление:
+    Создание:
       - company берём из пользователя
-      - branch автоматически из _active_branch()
-    Безопасен для swagger_fake_view и анонимов.
+      - если активный филиал определён → жёстко ставим его в branch
+      - если филиала нет → branch не трогаем
+
+    Обновление:
+      - company фиксируем
+      - branch не меняем (не переносим запись между филиалами)
     """
+
     permission_classes = [permissions.IsAuthenticated]
 
-    # --- user/company/branch helpers ---
+    # --- helpers: user / company / branch ---
+
     def _user(self):
         return getattr(self.request, "user", None)
 
     def _user_company(self):
+        """
+        Компания пользователя:
+          - сначала owned_company / company
+          - если нет, пробуем взять через user.branch.company
+        """
         user = self._user()
         if not user or not getattr(user, "is_authenticated", False):
             return None
-        # поддержка владельца и сотрудника
-        return getattr(user, "company", None) or getattr(user, "owned_company", None)
+
+        company = getattr(user, "company", None) or getattr(user, "owned_company", None)
+        if company:
+            return company
+
+        # fallback: компания только через филиал пользователя
+        br = getattr(user, "branch", None)
+        if br is not None:
+            return getattr(br, "company", None)
+
+        return None
+
+    def _fixed_branch_from_user(self, company):
+        """
+        «Жёстко» назначенный филиал сотрудника (который нельзя менять ?branch):
+          - user.primary_branch() / user.primary_branch
+          - user.branch
+          - (опционально) единственный филиал из branch_ids
+        """
+        user = self._user()
+        if not user or not company:
+            return None
+
+        company_id = getattr(company, "id", None)
+
+        # 1) primary_branch: метод или атрибут
+        primary = getattr(user, "primary_branch", None)
+
+        # 1a) как метод
+        if callable(primary):
+            try:
+                val = primary()
+                if val and getattr(val, "company_id", None) == company_id:
+                    return val
+            except Exception:
+                pass
+
+        # 1b) как свойство
+        if primary and not callable(primary) and getattr(primary, "company_id", None) == company_id:
+            return primary
+
+        # 2) user.branch
+        if hasattr(user, "branch"):
+            b = getattr(user, "branch")
+            if b and getattr(b, "company_id", None) == company_id:
+                return b
+
+        # 3) единственный филиал в branch_ids
+        branch_ids = getattr(user, "branch_ids", None)
+        if isinstance(branch_ids, (list, tuple)) and len(branch_ids) == 1:
+            try:
+                return Branch.objects.get(id=branch_ids[0], company_id=company_id)
+            except Branch.DoesNotExist:
+                pass
+
+        return None
 
     def _active_branch(self):
         """
-        Определяем активный филиал пользователя с проверкой на принадлежность компании.
+        Итоговый активный филиал с проверкой принадлежности компании.
         """
         request = getattr(self, "request", None)
         company = self._user_company()
@@ -73,7 +140,16 @@ class CompanyBranchQuerysetMixin:
                 setattr(request, "branch", None)
             return None
 
-        # 0) branch из query-параметров (?branch=<uuid>)
+        company_id = getattr(company, "id", None)
+
+        # 1) жёстко назначенный филиал (primary / branch / branch_ids)
+        fixed = self._fixed_branch_from_user(company)
+        if fixed is not None:
+            if request:
+                setattr(request, "branch", fixed)
+            return fixed
+
+        # 2) если жёсткого филиала нет — смотрим ?branch=
         branch_id = None
         if request is not None:
             if hasattr(request, "query_params"):
@@ -83,45 +159,26 @@ class CompanyBranchQuerysetMixin:
 
         if branch_id:
             try:
-                br = Branch.objects.get(id=branch_id, company=company)
+                br = Branch.objects.get(id=branch_id, company_id=company_id)
                 setattr(request, "branch", br)
                 return br
             except (Branch.DoesNotExist, ValueError):
-                # чужой/кривой id — игнорируем и идём дальше
+                # чужой/кривой id — игнорируем
                 pass
 
-        user = self._user()
-
-        # 1) primary_branch как метод
-        primary = getattr(user, "primary_branch", None)
-        if callable(primary):
-            try:
-                val = primary()
-                if val and getattr(val, "company_id", None) == company.id:
-                    if request:
-                        setattr(request, "branch", val)
-                    return val
-            except Exception:
-                pass
-
-        # 2) primary_branch как свойство
-        if primary and not callable(primary) and getattr(primary, "company_id", None) == company.id:
-            if request:
-                setattr(request, "branch", primary)
-            return primary
-
-        # 3) из middleware
+        # 3) request.branch, если middleware уже поставил корректный филиал
         if request and hasattr(request, "branch"):
             b = getattr(request, "branch")
-            if b and getattr(b, "company_id", None) == company.id:
+            if b and getattr(b, "company_id", None) == company_id:
                 return b
 
-        # 4) глобально
+        # 4) филиала нет
         if request:
             setattr(request, "branch", None)
         return None
 
     # --- queryset / save hooks ---
+
     def get_queryset(self):
         if getattr(self, "swagger_fake_view", False):
             return self.queryset.none()
@@ -131,36 +188,46 @@ class CompanyBranchQuerysetMixin:
         if not company:
             return qs.none()
 
-        qs = qs.filter(company=company)
-
+        # ограничиваем по компании, если у модели есть такое поле
         model = qs.model
+        if _has_field(model, "company"):
+            qs = qs.filter(company=company)
+
+        # если у модели есть branch — применяем логику филиала
         if _has_field(model, "branch"):
             active_branch = self._active_branch()  # None или Branch
+
             if active_branch is not None:
+                # пользователь привязан к филиалу → только этот филиал
                 qs = qs.filter(branch=active_branch)
-            else:
-                qs = qs.filter(branch__isnull=True)
+            # если филиала нет → НЕ фильтруем по branch (видно все филиалы компании)
+
         return qs
 
     def perform_create(self, serializer):
         company = self._user_company()
         if not company:
             raise PermissionDenied("У пользователя не настроена компания.")
+
         model = self.get_queryset().model
+        kwargs = {"company": company}
+
         if _has_field(model, "branch"):
-            serializer.save(company=company, branch=self._active_branch())
-        else:
-            serializer.save(company=company)
+            active_branch = self._active_branch()
+            if active_branch is not None:
+                # если есть филиал — жёстко пишем его
+                kwargs["branch"] = active_branch
+            # если филиала нет — branch не трогаем (можно создавать глобальные/любые по правилам сериализатора)
+
+        serializer.save(**kwargs)
 
     def perform_update(self, serializer):
         company = self._user_company()
         if not company:
             raise PermissionDenied("У пользователя не настроена компания.")
-        model = self.get_queryset().model
-        if _has_field(model, "branch"):
-            serializer.save(company=company, branch=self._active_branch())
-        else:
-            serializer.save(company=company)
+
+        # company фиксируем, branch не меняем
+        serializer.save(company=company)
 
 
 # ==========================

@@ -10,93 +10,171 @@ from .serializers import (
     WarehouseSerializer, SupplierSerializer, ProductSerializer, StockSerializer,
     StockInSerializer, StockOutSerializer, StockTransferSerializer
 )
+from apps.users.models import Branch  # 🔑 для branch-логики
 
 
-# ===== Company + Branch scoped mixin (как в «барбере») =====
+# ===== helpers для company/branch =====
+def _get_company(user):
+    """Компания текущего пользователя (owner/company или из user.branch.company)."""
+    if not user or not getattr(user, "is_authenticated", False):
+        return None
+
+    company = getattr(user, "company", None) or getattr(user, "owned_company", None)
+    if company:
+        return company
+
+    # fallback: если у юзера нет company, но есть branch с company
+    br = getattr(user, "branch", None)
+    if br is not None:
+        return getattr(br, "company", None)
+
+    return None
+
+
+def _fixed_branch_from_user(user, company):
+    """
+    «Жёстко» назначенный филиал (который нельзя менять через ?branch):
+      - user.primary_branch() / user.primary_branch
+      - user.branch
+      - единственный id в user.branch_ids
+    """
+    if not user or not company:
+        return None
+
+    company_id = getattr(company, "id", None)
+
+    # 1) primary_branch: метод или атрибут
+    primary = getattr(user, "primary_branch", None)
+
+    # 1a) как метод
+    if callable(primary):
+        try:
+            val = primary()
+            if val and getattr(val, "company_id", None) == company_id:
+                return val
+        except Exception:
+            pass
+
+    # 1b) как свойство
+    if primary and not callable(primary) and getattr(primary, "company_id", None) == company_id:
+        return primary
+
+    # 2) user.branch
+    if hasattr(user, "branch"):
+        b = getattr(user, "branch")
+        if b and getattr(b, "company_id", None) == company_id:
+            return b
+
+    # 3) единственный филиал из branch_ids
+    branch_ids = getattr(user, "branch_ids", None)
+    if isinstance(branch_ids, (list, tuple)) and len(branch_ids) == 1:
+        try:
+            return Branch.objects.get(id=branch_ids[0], company_id=company_id)
+        except Branch.DoesNotExist:
+            pass
+
+    return None
+
+
+# ===== Company + Branch scoped mixin (единая логика, как в других модулях) =====
 class CompanyBranchQuerysetMixin:
     """
     Видимость:
-      - если у пользователя есть активный филиал → только записи этого филиала (branch=<user_branch>)
-      - иначе → только глобальные записи (branch is NULL)
-    Всегда фильтруем по company пользователя.
-    Создание/обновление: принудительно проставляем company/branch из контекста.
+      - всегда ограничиваемся компанией пользователя;
+      - если у пользователя есть активный филиал → только записи этого филиала;
+      - если филиала нет → **все филиалы компании** (никакого branch__isnull).
+
+    Активный филиал:
+      1) «жёсткий» филиал пользователя (primary / branch / branch_ids);
+      2) ?branch=<uuid> (если филиал принадлежит компании и нет жёсткого филиала);
+      3) request.branch (если middleware уже поставил и он от той же компании);
+      4) иначе None.
+
+    Создание/обновление:
+      - mixin просто гарантирует, что request.branch будет проставлен
+        (через _active_branch()), остальное делают сериализаторы/модели.
     """
-    _cached_active_branch = object()  # маркер «ещё не вычисляли»
+
+    _BRANCH_UNSET = object()  # маркер «ещё не вычисляли»
 
     # --- helpers ---
     def _user(self):
         return getattr(self.request, "user", None)
 
     def _user_company(self):
-        user = self._user()
-        if not user or not getattr(user, "is_authenticated", False):
-            return None
-        return getattr(user, "company", None) or getattr(user, "owned_company", None)
-
-    def _user_primary_branch(self):
-        """
-        Определяем филиал сотрудника:
-          1) membership с is_primary=True
-          2) любой membership
-          3) иначе None
-        """
-        user = self._user()
-        if not user or not getattr(user, "is_authenticated", False):
-            return None
-        memberships = getattr(user, "branch_memberships", None)
-        if memberships is None:
-            return None
-        primary = memberships.filter(is_primary=True).select_related("branch").first()
-        if primary and primary.branch:
-            return primary.branch
-        any_member = memberships.select_related("branch").first()
-        return any_member.branch if any_member and any_member.branch else None
+        return _get_company(self._user())
 
     def _active_branch(self):
-        if self._cached_active_branch is not object():
+        """
+        Определяем активный филиал и кешируем:
+          1) жёсткий филиал пользователя;
+          2) ?branch=<uuid>, если нет жёсткого;
+          3) request.branch (middleware / ранее проставлен);
+          4) None.
+        """
+        if getattr(self, "_cached_active_branch", self._BRANCH_UNSET) is not self._BRANCH_UNSET:
             return self._cached_active_branch
 
         request = self.request
+        user = self._user()
         company = self._user_company()
         if not company:
             setattr(request, "branch", None)
             self._cached_active_branch = None
             return None
 
-        user_branch = self._user_primary_branch()
-        if user_branch and user_branch.company_id == company.id:
-            setattr(request, "branch", user_branch)
-            self._cached_active_branch = user_branch
-            return user_branch
+        company_id = getattr(company, "id", None)
 
+        # 1) жёсткий филиал из пользователя
+        fixed = _fixed_branch_from_user(user, company)
+        if fixed is not None:
+            setattr(request, "branch", fixed)
+            self._cached_active_branch = fixed
+            return fixed
+
+        # 2) branch из query-параметра (?branch=<uuid>), если нет жёсткого
+        branch_id = None
+        if hasattr(request, "query_params"):
+            branch_id = request.query_params.get("branch")
+        elif hasattr(request, "GET"):
+            branch_id = request.GET.get("branch")
+
+        if branch_id:
+            try:
+                br = Branch.objects.get(id=branch_id, company_id=company_id)
+                setattr(request, "branch", br)
+                self._cached_active_branch = br
+                return br
+            except (Branch.DoesNotExist, ValueError):
+                # чужой/кривой id — игнорируем и продолжаем
+                pass
+
+        # 3) request.branch (middleware / ранее проставлен)
+        if hasattr(request, "branch"):
+            b = getattr(request, "branch")
+            if b and getattr(b, "company_id", None) == company_id:
+                self._cached_active_branch = b
+                return b
+
+        # 4) нет филиала
         setattr(request, "branch", None)
         self._cached_active_branch = None
         return None
 
-    def _model_has_field(self, model, field_name: str) -> bool:
-        try:
-            model._meta.get_field(field_name)
-            return True
-        except Exception:
-            return False
-
-    # --- queryset / save hooks ---
+    # --- company helper ---
     def _base_company_filter(self, qs):
         company = self._user_company()
         return qs.filter(company=company) if company else qs.none()
 
+    # --- queryset / save hooks ---
     def get_queryset(self):
-        """
-        Реализация ниже в конкретных вьюхах, потому что для Stock
-        ветка берётся с warehouse.branch, а не из самой модели.
-        """
+        # по умолчанию не трогаем, вьюхи реализуют сами
         return super().get_queryset()
 
     def perform_create(self, serializer):
         """
-        Сериализаторы уже проставляют company/branch (как в барбере),
-        но мы всё равно кладём активную ветку в request.branch,
-        чтобы mixin сериализатора увидел её.
+        Просто гарантируем, что _active_branch() отработал
+        и положил request.branch для сериализаторов.
         """
         self._active_branch()
         serializer.save()
@@ -122,8 +200,7 @@ class WarehouseListCreateAPIView(CompanyBranchQuerysetMixin, generics.ListCreate
         active_branch = self._active_branch()
         if active_branch is not None:
             qs = qs.filter(branch=active_branch)
-        else:
-            qs = qs.filter(branch__isnull=True)
+        # если филиала нет → все склады компании
         return qs
 
 
@@ -137,8 +214,6 @@ class WarehouseDetailAPIView(CompanyBranchQuerysetMixin, generics.RetrieveUpdate
         active_branch = self._active_branch()
         if active_branch is not None:
             qs = qs.filter(branch=active_branch)
-        else:
-            qs = qs.filter(branch__isnull=True)
         return qs
 
 
@@ -158,8 +233,6 @@ class SupplierListCreateAPIView(CompanyBranchQuerysetMixin, generics.ListCreateA
         active_branch = self._active_branch()
         if active_branch is not None:
             qs = qs.filter(branch=active_branch)
-        else:
-            qs = qs.filter(branch__isnull=True)
         return qs
 
 
@@ -173,8 +246,6 @@ class SupplierDetailAPIView(CompanyBranchQuerysetMixin, generics.RetrieveUpdateD
         active_branch = self._active_branch()
         if active_branch is not None:
             qs = qs.filter(branch=active_branch)
-        else:
-            qs = qs.filter(branch__isnull=True)
         return qs
 
 
@@ -194,8 +265,6 @@ class ProductListCreateAPIView(CompanyBranchQuerysetMixin, generics.ListCreateAP
         active_branch = self._active_branch()
         if active_branch is not None:
             qs = qs.filter(branch=active_branch)
-        else:
-            qs = qs.filter(branch__isnull=True)
         return qs
 
 
@@ -209,8 +278,6 @@ class ProductDetailAPIView(CompanyBranchQuerysetMixin, generics.RetrieveUpdateDe
         active_branch = self._active_branch()
         if active_branch is not None:
             qs = qs.filter(branch=active_branch)
-        else:
-            qs = qs.filter(branch__isnull=True)
         return qs
 
 
@@ -224,7 +291,7 @@ class StockListAPIView(CompanyBranchQuerysetMixin, generics.ListAPIView):
     ordering = ["-quantity"]
 
     def get_queryset(self):
-        # остатки по складам компании и активного филиала (или глобальным)
+        # остатки по складам компании и активного филиала (или всем филиалам)
         qs = Stock.objects.select_related("warehouse", "product")
         company = self._user_company()
         if not company:
@@ -233,8 +300,7 @@ class StockListAPIView(CompanyBranchQuerysetMixin, generics.ListAPIView):
         active_branch = self._active_branch()
         if active_branch is not None:
             qs = qs.filter(warehouse__branch=active_branch)
-        else:
-            qs = qs.filter(warehouse__branch__isnull=True)
+        # если филиал не задан — все склады компании
         return qs
 
 
@@ -251,8 +317,6 @@ class StockDetailAPIView(CompanyBranchQuerysetMixin, generics.RetrieveAPIView):
         active_branch = self._active_branch()
         if active_branch is not None:
             qs = qs.filter(warehouse__branch=active_branch)
-        else:
-            qs = qs.filter(warehouse__branch__isnull=True)
         return qs
 
 
@@ -272,8 +336,6 @@ class StockInListCreateAPIView(CompanyBranchQuerysetMixin, generics.ListCreateAP
         active_branch = self._active_branch()
         if active_branch is not None:
             qs = qs.filter(branch=active_branch)
-        else:
-            qs = qs.filter(branch__isnull=True)
         return qs
 
 
@@ -287,8 +349,6 @@ class StockInDetailAPIView(CompanyBranchQuerysetMixin, generics.RetrieveUpdateDe
         active_branch = self._active_branch()
         if active_branch is not None:
             qs = qs.filter(branch=active_branch)
-        else:
-            qs = qs.filter(branch__isnull=True)
         return qs
 
 
@@ -308,8 +368,6 @@ class StockOutListCreateAPIView(CompanyBranchQuerysetMixin, generics.ListCreateA
         active_branch = self._active_branch()
         if active_branch is not None:
             qs = qs.filter(branch=active_branch)
-        else:
-            qs = qs.filter(branch__isnull=True)
         return qs
 
 
@@ -323,8 +381,6 @@ class StockOutDetailAPIView(CompanyBranchQuerysetMixin, generics.RetrieveUpdateD
         active_branch = self._active_branch()
         if active_branch is not None:
             qs = qs.filter(branch=active_branch)
-        else:
-            qs = qs.filter(branch__isnull=True)
         return qs
 
 
@@ -344,8 +400,6 @@ class StockTransferListCreateAPIView(CompanyBranchQuerysetMixin, generics.ListCr
         active_branch = self._active_branch()
         if active_branch is not None:
             qs = qs.filter(branch=active_branch)
-        else:
-            qs = qs.filter(branch__isnull=True)
         return qs
 
 
@@ -359,6 +413,4 @@ class StockTransferDetailAPIView(CompanyBranchQuerysetMixin, generics.RetrieveUp
         active_branch = self._active_branch()
         if active_branch is not None:
             qs = qs.filter(branch=active_branch)
-        else:
-            qs = qs.filter(branch__isnull=True)
         return qs
