@@ -1397,19 +1397,31 @@ class AgentCartStartAPIView(CompanyBranchRestrictedMixin, APIView):
     @transaction.atomic
     def post(self, request, *args, **kwargs):
         user = request.user
-        company = user.company
 
-        qs = (
-            Cart.objects.filter(company=company, user=user, status=Cart.Status.ACTIVE)
-            .order_by("-created_at")
-        )
+        # компания и филиал — как в SaleStartAPIView
+        company = self._company() or user.company
+        branch = self._auto_branch()
+
+        qs = Cart.objects.filter(company=company, user=user, status=Cart.Status.ACTIVE)
+
+        # если у Cart есть поле branch — фильтруем по текущему филиалу
+        if hasattr(Cart, "branch"):
+            if branch is not None:
+                qs = qs.filter(branch=branch)
+            else:
+                qs = qs.filter(branch__isnull=True)
+
+        qs = qs.order_by("-created_at")
         cart = qs.first()
+
         if cart is None:
-            cart = Cart.objects.create(company=company, user=user, status=Cart.Status.ACTIVE)
+            create_kwargs = dict(company=company, user=user, status=Cart.Status.ACTIVE)
+            if hasattr(Cart, "branch"):
+                create_kwargs["branch"] = branch
+            cart = Cart.objects.create(**create_kwargs)
         else:
             extra_ids = list(qs.values_list("id", flat=True)[1:])
             if extra_ids:
-                # при желании можно использовать CLOSED/ABANDONED
                 Cart.objects.filter(id__in=extra_ids).update(
                     status=Cart.Status.CHECKED_OUT,
                 )
