@@ -486,11 +486,12 @@ class SocialApplicationsAdmin(admin.ModelAdmin):
 
 @admin.register(TransactionRecord)
 class TransactionRecordAdmin(admin.ModelAdmin):
-    list_display = ("name", "company", "branch", "department", "amount", "status", "date", "created_at")
-    list_filter = ("company", "branch", "status", "department", "date")
+    list_display = ("name", "company", "branch", "amount", "status", "date", "created_at")
+    list_filter = ("company", "branch", "status", "date")
     search_fields = ("name", "description")
-    list_select_related = ("company", "branch", "department")
-    autocomplete_fields = ("company", "branch", "department")
+    list_select_related = ("company", "branch")
+    autocomplete_fields = ("company", "branch")
+
 
 @admin.register(MobileScannerToken)
 class MobileScannerTokenAdmin(admin.ModelAdmin):

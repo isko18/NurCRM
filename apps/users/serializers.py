@@ -12,7 +12,7 @@ from apps.users.models import (
     User, Company, Roles, Industry, SubscriptionPlan,
     Feature, Sector, CustomRole, Branch, BranchMembership
 )
-from apps.construction.models import Cashbox, Department
+from apps.construction.models import Cashbox
 
 
 # ===== Вспомогательные =====
@@ -330,17 +330,12 @@ class OwnerRegisterSerializer(serializers.ModelSerializer):
         user.company = company
         user.save()
 
-        # автосоздание департаментов и кассы для строительной компании
+        # если нужно — создаём одну кассу для строительной компании без отделов
         if industry.name.lower() == "строительная компания":
-            default_departments = [
-                "Строительный отдел", "Отдел ремонта",
-                "Архитектура и дизайн", "Инженерные услуги"
-            ]
-            for dept_name in default_departments:
-                dept = Department.objects.create(company=company, name=dept_name)
-                Cashbox.objects.create(department=dept)
+            Cashbox.objects.create(company=company)  # подставь нужные поля, если модель другая
 
         return user
+
 
 
 # 👥 Создание сотрудника (+ распределение по филиалам)
