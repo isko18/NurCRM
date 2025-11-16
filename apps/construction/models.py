@@ -3,91 +3,9 @@ from django.db import models
 from django.core.exceptions import ValidationError
 from django.db.models import Sum, Count, Q
 import uuid
-import random
-from django.core.exceptions import ObjectDoesNotExist
-from apps.users.models import Company, User, Branch
 
+from apps.users.models import Company, Branch
 
-# ==========================
-# Отдел
-# ==========================
-class Department(models.Model):
-    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-
-    company = models.ForeignKey(
-        Company,
-        on_delete=models.CASCADE,
-        related_name='cash_departments',   # уникальный related_name для модуля "cash"
-        verbose_name='Компания',
-    )
-    # может быть глобальным (NULL) или филиальным
-    branch = models.ForeignKey(
-        Branch,
-        on_delete=models.CASCADE,
-        related_name='cash_departments',
-        verbose_name='Филиал',
-        null=True, blank=True, db_index=True,
-    )
-
-    name = models.CharField(max_length=255, verbose_name='Название отдела')
-
-    employees = models.ManyToManyField(
-        User,
-        blank=True,
-        related_name='cash_departments',
-        verbose_name='Сотрудники отдела',
-    )
-
-    color = models.CharField(
-        max_length=7, blank=True, null=True, default='',
-        verbose_name='Цвет отдела (RGB)',
-    )
-    created_at = models.DateTimeField(auto_now_add=True)
-
-    class Meta:
-        verbose_name = 'Отдел'
-        verbose_name_plural = 'Отделы'
-        constraints = [
-            # уникальность названия в рамках филиала
-            models.UniqueConstraint(
-                fields=('company', 'branch', 'name'),
-                name='uniq_cash_department_company_branch_name',
-            ),
-        ]
-        indexes = [
-            models.Index(fields=['company', 'name']),
-            models.Index(fields=['company', 'branch', 'name']),
-        ]
-
-    def __str__(self):
-        return f"{self.name} ({self.company.name})"
-
-    def clean(self):
-        # company ↔ branch.company согласованность
-        if self.branch_id and self.branch.company_id != self.company_id:
-            raise ValidationError({'branch': 'Филиал принадлежит другой компании.'})
-
-    def save(self, *args, **kwargs):
-        if not self.color:
-            self.color = "#{:06x}".format(random.randint(0, 0xFFFFFF)).upper()
-        self.full_clean()
-        return super().save(*args, **kwargs)
-
-    # быстрая сводка с учётом только утверждённых движений
-    def cashflow_summary(self):
-        # у Department нет cashbox_id — достаём обратную связь try/except
-        try:
-            cashbox = self.cashbox   # OneToOne reverse; может не существовать
-        except ObjectDoesNotExist:
-            cashbox = None
-
-        if cashbox:
-            return cashbox.get_summary()
-
-        return {
-            'income':  {'total': 0, 'count': 0},
-            'expense': {'total': 0, 'count': 0},
-        }
 
 # ==========================
 # Касса
@@ -96,22 +14,36 @@ class Cashbox(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
 
     company = models.ForeignKey(
-        Company, on_delete=models.CASCADE,
-        related_name='cash_cashboxes', verbose_name='Компания',
+        Company,
+        on_delete=models.CASCADE,
+        related_name='cash_cashboxes',
+        verbose_name='Компания',
     )
+    # может быть глобальной (для компании) или филиальной
     branch = models.ForeignKey(
-        Branch, on_delete=models.CASCADE,
-        related_name='cash_cashboxes', verbose_name='Филиал',
-        null=True, blank=True, db_index=True,
+        Branch,
+        on_delete=models.CASCADE,
+        related_name='cash_cashboxes',
+        verbose_name='Филиал',
+        null=True,
+        blank=True,
+        db_index=True,
     )
-    name = models.CharField(max_length=255, blank=True, null=True, verbose_name='Название кассы')
 
-    # привязка к отделу той же company/branch (проверяем в clean())
-    department = models.OneToOneField(
-        Department, on_delete=models.CASCADE, related_name='cashbox',
-        null=True, blank=True, verbose_name='Отдел',
+    name = models.CharField(
+        max_length=255,
+        blank=True,
+        null=True,
+        verbose_name='Название кассы',
     )
-    is_consumption = models.BooleanField(verbose_name="Расход", default=False, blank=True, null=True)
+
+    # флаг «расходной» кассы, если используется в бизнес-логике
+    is_consumption = models.BooleanField(
+        verbose_name="Расход",
+        default=False,
+        blank=True,
+        null=True,
+    )
 
     class Meta:
         verbose_name = 'Касса'
@@ -121,12 +53,13 @@ class Cashbox(models.Model):
             models.Index(fields=['company', 'branch']),
         ]
         constraints = [
-            # безопасные (без join) уникальности имён
+            # уникальность имён в пределах филиала (для филиальных касс)
             models.UniqueConstraint(
                 fields=('branch', 'name'),
                 name='uq_cashbox_name_per_branch',
                 condition=models.Q(branch__isnull=False) & models.Q(name__isnull=False),
             ),
+            # и глобально по компании, если branch IS NULL (касса компании)
             models.UniqueConstraint(
                 fields=('company', 'name'),
                 name='uq_cashbox_name_global_per_company',
@@ -135,27 +68,20 @@ class Cashbox(models.Model):
         ]
 
     def __str__(self):
-        if self.department:
-            base = f"Касса отдела {self.department.name}"
+        # касса филиала
+        if self.branch_id:
+            base = f"Касса филиала {self.branch.name}"
             return f"{base}{f' ({self.name})' if self.name else ''}"
-        return self.name or "Свободная касса"
+        # касса компании
+        return self.name or f"Касса компании {self.company.name}"
 
     def clean(self):
-        # company ↔ branch.company
+        # company ↔ branch.company согласованность
         if self.branch_id and self.branch.company_id != self.company_id:
             raise ValidationError({'branch': 'Филиал принадлежит другой компании.'})
-        # department согласован с company/branch
-        if self.department_id:
-            if self.department.company_id != self.company_id:
-                raise ValidationError({'department': 'Отдел другой компании.'})
-            if (self.department.branch_id or None) != (self.branch_id or None):
-                raise ValidationError({'department': 'Отдел другого филиала (или глобальности).'})
 
     def save(self, *args, **kwargs):
-        # если задан отдел — подберём company/branch из отдела
-        if self.department_id:
-            self.company_id = self.department.company_id
-            self.branch_id = self.department.branch_id
+        # отделов больше нет, company/branch задаются напрямую
         self.full_clean()
         return super().save(*args, **kwargs)
 
@@ -164,16 +90,17 @@ class Cashbox(models.Model):
         Сводка по кассе только по утверждённым операциям
         (status=APPROVED), раздельно по приходу/расходу.
         """
+        from .models import CashFlow  # локальный импорт, чтобы избежать циклов
 
         approved_qs = self.flows.filter(
-            status=CashFlow.Status.APPROVED  # только проведённые
+            status=CashFlow.Status.APPROVED
         )
 
         agg = approved_qs.aggregate(
-            income_total=Sum('amount', filter=Q(type='income')),
-            expense_total=Sum('amount', filter=Q(type='expense')),
-            income_count=Count('id', filter=Q(type='income')),
-            expense_count=Count('id', filter=Q(type='expense')),
+            income_total=Sum('amount', filter=Q(type=CashFlow.Type.INCOME)),
+            expense_total=Sum('amount', filter=Q(type=CashFlow.Type.EXPENSE)),
+            income_count=Count('id', filter=Q(type=CashFlow.Type.INCOME)),
+            expense_count=Count('id', filter=Q(type=CashFlow.Type.EXPENSE)),
         )
 
         z = Decimal('0')
@@ -188,6 +115,7 @@ class Cashbox(models.Model):
                 'count': agg['expense_count'] or 0,
             },
         }
+
 
 # ==========================
 # Движение по кассе
@@ -211,6 +139,7 @@ class CashFlow(models.Model):
         verbose_name='Компания',
     )
 
+    # может быть глобальным (для кассы компании) или филиальным
     branch = models.ForeignKey(
         Branch,
         on_delete=models.CASCADE,
@@ -299,8 +228,11 @@ class CashFlow(models.Model):
         ]
 
     def __str__(self):
-        dept = self.cashbox.department.name if self.cashbox and self.cashbox.department_id else "Без отдела"
-        return f"{self.get_type_display()} {self.amount} ₽ ({dept}, {self.company.name})"
+        if self.cashbox and self.cashbox.branch_id:
+            place = f"Филиал {self.cashbox.branch.name}"
+        else:
+            place = f"Компания {self.company.name}"
+        return f"{self.get_type_display()} {self.amount} ₽ ({place})"
 
     def clean(self):
         # company/branch должны совпадать с кассой

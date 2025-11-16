@@ -21,7 +21,6 @@ from rest_framework import serializers
 from .filters import TransactionRecordFilter, DebtFilter, DebtPaymentFilter
 from django_filters.rest_framework import DjangoFilterBackend
 
-from apps.construction.models import Department
 from apps.users.models import Branch
 
 from apps.main.models import (
@@ -1413,40 +1412,43 @@ class ContractorWorkListCreateAPIView(CompanyBranchRestrictedMixin, generics.Lis
     """
       GET  /api/main/contractor-works/
       POST /api/main/contractor-works/
-      GET  /api/main/departments/<uuid:department_id>/contractor-works/
-      POST /api/main/departments/<uuid:department_id>/contractor-works/
     """
     serializer_class = ContractorWorkSerializer
     filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
-    filterset_fields = ["department", "contractor_entity_type", "start_date", "end_date"]
-    search_fields = ["title", "contractor_name", "contractor_phone", "contractor_entity_name", "description"]
-    ordering_fields = ["created_at", "updated_at", "amount", "start_date", "end_date", "planned_completion_date"]
+    # department убран из фильтров
+    filterset_fields = ["contractor_entity_type", "start_date", "end_date"]
+    search_fields = [
+        "title",
+        "contractor_name",
+        "contractor_phone",
+        "contractor_entity_name",
+        "description",
+    ]
+    ordering_fields = [
+        "created_at",
+        "updated_at",
+        "amount",
+        "start_date",
+        "end_date",
+        "planned_completion_date",
+    ]
     ordering = ["-created_at"]
 
     def get_queryset(self):
-        qs = ContractorWork.objects.select_related("department").all()
-        qs = self._filter_qs_company_branch(qs)
-        dep_id = self.kwargs.get("department_id")
-        if dep_id:
-            qs = qs.filter(department_id=dep_id)
-        return qs
+        qs = ContractorWork.objects.select_related().all()
+        # только company/branch-ограничение
+        return self._filter_qs_company_branch(qs)
 
     @transaction.atomic
     def perform_create(self, serializer):
-        company = self._company()
-        branch = self._auto_branch()
-        dep_id = self.kwargs.get("department_id")
-        if dep_id:
-            department = get_object_or_404(Department, id=dep_id, company=company)
-            serializer.save(company=company, branch=branch, department=department)
-        else:
-            dep = serializer.validated_data.get("department")
-            if not dep or dep.company_id != company.id:
-                raise serializers.ValidationError({"department": "Отдел не найден в вашей компании."})
-            serializer.save(company=company, branch=branch)
+        # company/branch подставит миксин
+        self._save_with_company_branch(serializer)
 
 
-class ContractorWorkRetrieveUpdateDestroyAPIView(CompanyBranchRestrictedMixin, generics.RetrieveUpdateDestroyAPIView):
+class ContractorWorkRetrieveUpdateDestroyAPIView(
+    CompanyBranchRestrictedMixin,
+    generics.RetrieveUpdateDestroyAPIView,
+):
     """
     GET    /api/main/contractor-works/<uuid:pk>/
     PATCH  /api/main/contractor-works/<uuid:pk>/
@@ -1456,21 +1458,13 @@ class ContractorWorkRetrieveUpdateDestroyAPIView(CompanyBranchRestrictedMixin, g
     serializer_class = ContractorWorkSerializer
 
     def get_queryset(self):
-        qs = ContractorWork.objects.select_related("department").all()
-        dep_id = self.kwargs.get("department_id")
-        qs = self._filter_qs_company_branch(qs)
-        if dep_id:
-            qs = qs.filter(department_id=dep_id)
-        return qs
+        qs = ContractorWork.objects.select_related().all()
+        return self._filter_qs_company_branch(qs)
 
     @transaction.atomic
     def perform_update(self, serializer):
-        company = self._company()
-        branch = self._auto_branch()
-        dep = serializer.validated_data.get("department")
-        if dep and dep.company_id != company.id:
-            raise serializers.ValidationError({"department": "Отдел принадлежит другой компании."})
-        serializer.save(company=company, branch=branch)
+        # company/branch подставит миксин
+        self._save_with_company_branch(serializer)
 
 
 # ===========================

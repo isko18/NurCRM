@@ -16,7 +16,7 @@ from apps.main.models import (
     ObjectItem, ObjectSale, ObjectSaleItem, ItemMake, ManufactureSubreal, Acceptance,
     ReturnFromAgent, ProductImage, PromoRule, AgentRequestCart, AgentRequestItem
 )
-from apps.construction.models import Department
+
 from apps.consalting.models import ServicesConsalting
 from apps.users.models import User, Company, Branch
 
@@ -1036,49 +1036,15 @@ class TransactionRecordSerializer(CompanyBranchReadOnlyMixin, serializers.ModelS
     company = serializers.ReadOnlyField(source="company.id")
     branch = serializers.ReadOnlyField(source="branch.id")
 
-    department = serializers.PrimaryKeyRelatedField(
-        queryset=Department.objects.all(),
-        required=False,
-        allow_null=True
-    )
-    department_name = serializers.CharField(source="department.name", read_only=True)
-
     class Meta:
         model = TransactionRecord
         fields = [
             "id", "company", "branch",
             "description",
-            "department", "department_name",
             "name", "amount", "status", "date",
             "created_at", "updated_at",
         ]
-        read_only_fields = ["id", "company", "branch", "department_name", "created_at", "updated_at"]
-
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        req = self.context.get("request")
-        user = getattr(req, "user", None)
-        company = getattr(user, "owned_company", None) or getattr(user, "company", None)
-        branch = _active_branch(self)
-        if company and "department" in self.fields:
-            qs = Department.objects.filter(company=company)
-            if branch is not None:
-                qs = qs.filter(branch=branch)
-            # если branch None — отделы всех филиалов компании
-            self.fields["department"].queryset = qs
-
-    def validate_department(self, department):
-        if department is None:
-            return department
-        company = self._user_company()
-        branch = self._auto_branch()
-        if company and department.company_id != company.id:
-            raise serializers.ValidationError("Отдел принадлежит другой компании.")
-        if branch is not None and department.branch_id != branch.id:
-            raise serializers.ValidationError("Отдел другого филиала.")
-        # если branch None — отдел может быть из любого филиала компании
-        return department
-
+        read_only_fields = ["id", "company", "branch", "created_at", "updated_at"]
 
 # ===========================
 # ContractorWork
@@ -1086,9 +1052,6 @@ class TransactionRecordSerializer(CompanyBranchReadOnlyMixin, serializers.ModelS
 class ContractorWorkSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
     company = serializers.ReadOnlyField(source="company.id")
     branch = serializers.ReadOnlyField(source="branch.id")
-
-    department = serializers.PrimaryKeyRelatedField(queryset=Department.objects.all())
-    department_name = serializers.CharField(source="department.name", read_only=True)
 
     duration_days = serializers.IntegerField(read_only=True)
 
@@ -1100,41 +1063,26 @@ class ContractorWorkSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSeri
             "contractor_name", "contractor_phone",
             "contractor_entity_type", "contractor_entity_name",
             "amount",
-            "department", "department_name",
             "start_date", "end_date",
             "planned_completion_date", "work_calendar_date",
             "description",
             "duration_days",
             "created_at", "updated_at",
-            "status"
+            "status",
         ]
-        read_only_fields = ["id", "company", "branch", "department_name", "duration_days", "created_at", "updated_at"]
-
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        comp = self._user_company()
-        br = self._auto_branch()
-        if comp:
-            qs = Department.objects.filter(company=comp)
-            if br is not None:
-                qs = qs.filter(branch=br)
-            # если br None — все отделы компании
-            self.fields["department"].queryset = qs
+        read_only_fields = [
+            "id", "company", "branch",
+            "duration_days",
+            "created_at", "updated_at",
+        ]
 
     def validate(self, attrs):
-        company = self._user_company()
-        branch = self._auto_branch()
-        dep = attrs.get("department") or (self.instance.department if self.instance else None)
-        if dep and dep.company_id != company.id:
-            raise serializers.ValidationError({"department": "Отдел принадлежит другой компании."})
-        # STRICT branch
-        if branch is not None and dep and dep.branch_id != branch.id:
-            raise serializers.ValidationError({"department": "Отдел другого филиала."})
-        # branch None — отдел из любого филиала компании
-
         start = attrs.get("start_date", getattr(self.instance, "start_date", None))
         end = attrs.get("end_date", getattr(self.instance, "end_date", None))
-        planned = attrs.get("planned_completion_date", getattr(self.instance, "planned_completion_date", None))
+        planned = attrs.get(
+            "planned_completion_date",
+            getattr(self.instance, "planned_completion_date", None),
+        )
 
         errors = {}
         if start and end and end < start:
@@ -1144,6 +1092,7 @@ class ContractorWorkSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSeri
         if errors:
             raise serializers.ValidationError(errors)
         return attrs
+
 
 
 # ===========================

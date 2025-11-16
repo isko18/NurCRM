@@ -29,7 +29,6 @@ from .pos_serializers import (
 )
 from apps.main.services import checkout_cart, NotEnoughStock
 from apps.main.views import CompanyBranchRestrictedMixin
-from apps.construction.models import Department
 from django.http import Http404
 from django.utils.timezone import is_aware, make_aware, get_current_timezone
 from datetime import datetime, date, time as dtime
@@ -727,13 +726,9 @@ class SaleCheckoutAPIView(APIView):
         print_receipt = ser.validated_data["print_receipt"]
         client_id = ser.validated_data.get("client_id")
 
-        department = None
-        department_id = ser.validated_data.get("department_id")
-        if department_id:
-            department = get_object_or_404(Department, id=department_id, company=request.user.company)
-
+        # отделы убрали, просто не передаём department
         try:
-            sale = checkout_cart(cart, department=department)
+            sale = checkout_cart(cart)
         except NotEnoughStock as e:
             return Response({"detail": str(e)}, status=status.HTTP_400_BAD_REQUEST)
         except ValueError as e:
@@ -1380,10 +1375,7 @@ class AgentSaleCheckoutAPIView(CompanyBranchRestrictedMixin, APIView):
         print_receipt = ser.validated_data["print_receipt"]
         client_id = ser.validated_data.get("client_id")
 
-        department = None
-        department_id = ser.validated_data.get("department_id")
-        if department_id:
-            department = get_object_or_404(Department, id=department_id, company=request.user.company)
+        # отделы убрали, блок с department_id больше не нужен
 
         if client_id:
             client = get_object_or_404(Client, id=client_id, company=request.user.company)
@@ -1394,7 +1386,7 @@ class AgentSaleCheckoutAPIView(CompanyBranchRestrictedMixin, APIView):
         acting_agent = _resolve_acting_agent(request, cart, allow_owner_override=True)
 
         try:
-            sale = checkout_agent_cart(cart, department=department, agent=acting_agent)
+            sale = checkout_agent_cart(cart, agent=acting_agent)
         except Exception as e:
             transaction.set_rollback(True)
             raise ValidationError({"detail": str(e)})

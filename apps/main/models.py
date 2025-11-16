@@ -15,8 +15,7 @@ import io
 
 from apps.users.models import Company, User, Branch
 from apps.consalting.models import ServicesConsalting
-from apps.construction.models import Department
-# from apps.utils import compute_gift_qty
+# from apps.construction.models import Department   # УДАЛЕНО: отделы больше не используются
 
 _Q2 = Decimal("0.01")
 def _money(x: Decimal) -> Decimal:
@@ -26,6 +25,8 @@ def _money(x: Decimal) -> Decimal:
 def product_image_upload_to(instance, filename: str) -> str:
     # всегда сохраняем в .webp с новым именем
     return f"products/{instance.product_id}/{uuid.uuid4().hex}.webp"
+
+
 # ==========================
 # Contact
 # ==========================
@@ -495,6 +496,7 @@ class ProductBrand(MPTTModel):
             if (self.parent.branch_id or None) != (self.branch_id or None):
                 raise ValidationError({'parent': 'Родительский бренд другого филиала.'})
 
+
 class PromoRule(models.Model):
     """
     Динамическое правило "подарка".
@@ -575,6 +577,7 @@ class PromoRule(models.Model):
         if self.gift_qty < 1:
             raise ValidationError({"gift_qty": "Подарок должен быть ≥ 1."})
 
+
 # ==========================
 # Product
 # ==========================
@@ -620,6 +623,7 @@ class Product(models.Model):
         indexes = [
             models.Index(fields=['company', 'status']),
             models.Index(fields=['company', 'branch', 'status']),
+
         ]
 
     def __str__(self):
@@ -633,6 +637,7 @@ class Product(models.Model):
                 raise ValidationError({name: "Объект принадлежит другой компании."})
             if self.branch_id and rel and getattr(rel, "branch_id", None) not in (None, self.branch_id):
                 raise ValidationError({name: "Объект другого филиала."})
+
 
 class ProductImage(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
@@ -732,6 +737,7 @@ class ProductImage(models.Model):
         # новое имя с webp-расширением
         content.name = f"{uuid.uuid4().hex}.webp"
         return content
+
 
 class ItemMake(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
@@ -1241,6 +1247,7 @@ class Warehouse(models.Model):
         indexes = [
             models.Index(fields=['company', 'name']),
             models.Index(fields=['company', 'branch', 'name']),
+
         ]
 
     def __str__(self):
@@ -1260,7 +1267,7 @@ class WarehouseEvent(models.Model):
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False, verbose_name='ID события')
     warehouse = models.ForeignKey(Warehouse, on_delete=models.CASCADE, related_name='events', verbose_name='Склад')
-    company = models.ForeignKey(Company, on_delete=models.CASCADE, null=True, blank=True,related_name='warehouse_events', verbose_name='Компания')
+    company = models.ForeignKey(Company, on_delete=models.CASCADE, null=True, blank=True, related_name='warehouse_events', verbose_name='Компания')
     branch = models.ForeignKey(
         Branch, on_delete=models.CASCADE, related_name='crm_warehouse_events',
         null=True, blank=True, db_index=True, verbose_name='Филиал'
@@ -1536,9 +1543,8 @@ class TransactionRecord(models.Model):
         null=True, blank=True, db_index=True, verbose_name='Филиал'
     )
     description = models.TextField(verbose_name="Обращение")
-    department = models.ForeignKey(Department, on_delete=models.SET_NULL, null=True, blank=True,
-                                   related_name='transaction_records', verbose_name='Отдел')
 
+    # УДАЛЕНО: department FK, теперь запись не привязана к отделу
     name = models.CharField('Наименование', max_length=255)
     amount = models.DecimalField('Сумма', max_digits=12, decimal_places=2, validators=[MinValueValidator(Decimal('0'))])
     status = models.CharField('Статус', max_length=16, choices=Status.choices, default=Status.NEW)
@@ -1554,26 +1560,16 @@ class TransactionRecord(models.Model):
         indexes = [
             models.Index(fields=['company', 'date']),
             models.Index(fields=['company', 'branch', 'date']),
-            models.Index(fields=['company', 'department', 'date']),
         ]
 
     def __str__(self):
-        dep = f", отдел: {self.department.name}" if self.department_id else ""
-        return f'{self.name} — {self.amount} ({self.get_status_display()}{dep})'
+        return f'{self.name} — {self.amount} ({self.get_status_display()})'
 
     def clean(self):
         if self.branch_id and self.branch.company_id != self.company_id:
             raise ValidationError({'branch': 'Филиал принадлежит другой компании.'})
-        if self.department_id and self.department.company_id != self.company_id:
-            raise ValidationError({'department': 'Отдел принадлежит другой компании.'})
-        if self.branch_id and self.department_id and self.department.branch_id not in (None, self.branch_id):
-            raise ValidationError({'department': 'Отдел другого филиала.'})
 
     def save(self, *args, **kwargs):
-        if self.department_id and not self.company_id:
-            self.company_id = self.department.company_id
-        if self.department_id and self.branch_id is None:
-            self.branch_id = self.department.branch_id
         self.full_clean(exclude=None)
         super().save(*args, **kwargs)
 
@@ -1596,7 +1592,8 @@ class ContractorWork(models.Model):
         Branch, on_delete=models.CASCADE, related_name='crm_contractor_works',
         null=True, blank=True, db_index=True, verbose_name='Филиал'
     )
-    department = models.ForeignKey(Department, on_delete=models.PROTECT, related_name="contractor_works", verbose_name="Отдел")
+
+    # УДАЛЕНО: department FK, теперь подрядные работы не привязаны к отделу
 
     title = models.CharField("Наименование", max_length=255)
     contractor_name = models.CharField("Имя подрядчика", max_length=255)
@@ -1621,8 +1618,6 @@ class ContractorWork(models.Model):
         verbose_name_plural = "Подрядные работы"
         ordering = ["-created_at"]
         indexes = [
-            models.Index(fields=["company", "department"]),
-            models.Index(fields=["company", "branch", "department"]),
             models.Index(fields=["company", "start_date"]),
             models.Index(fields=["company", "branch", "start_date"]),
         ]
@@ -1633,11 +1628,6 @@ class ContractorWork(models.Model):
     def clean(self):
         if self.branch_id and self.branch.company_id != self.company_id:
             raise ValidationError({'branch': 'Филиал принадлежит другой компании.'})
-        if self.department_id:
-            if self.department.company_id != self.company_id:
-                raise ValidationError({"department": "Отдел другой компании."})
-            if self.branch_id and self.department.branch_id not in (None, self.branch_id):
-                raise ValidationError({"department": "Отдел другого филиала."})
         if self.start_date and self.end_date and self.end_date < self.start_date:
             raise ValidationError({"end_date": "Дата окончания не может быть раньше даты начала."})
         if self.planned_completion_date and self.start_date and self.planned_completion_date < self.start_date:
@@ -1735,7 +1725,7 @@ class DebtPayment(models.Model):
         if self.debt and self.company_id and self.debt.company_id != self.company_id:
             raise ValidationError({"company": "Компания платежа должна совпадать с компанией долга."})
         if self.debt and self.branch_id is not None and self.debt.branch_id not in (None, self.branch_id):
-            raise ValidationError({"branch": "Филиал платежа должен совпадать с филиалом долга (или быть глобальным вместе с ним)."})
+            raise ValidationError({"branch": "Филиал платежа должен совпадать с филиалом долга (или быть глобальным вместе с ней)."})
         if self.debt_id and self.amount:
             qs = self.debt.payments.exclude(pk=self.pk) if self.pk else self.debt.payments
             already = qs.aggregate(s=models.Sum("amount"))["s"] or Decimal("0")
@@ -1904,6 +1894,7 @@ class ManufactureSubreal(models.Model):
             models.Index(fields=["company", "branch", "agent", "product", "status"]),
             models.Index(fields=["created_at"]),
             models.Index(fields=["company", "is_sawmill", "status"]),
+
         ]
         constraints = [
             # идемпотентность создания передачи (включается только когда external_ref не NULL)
@@ -2008,6 +1999,7 @@ class Acceptance(models.Model):
             models.Index(fields=["company", "accepted_at"]),
             models.Index(fields=["company", "branch", "accepted_at"]),
             models.Index(fields=["subreal"]),
+
         ]
 
     def clean(self):
@@ -2130,8 +2122,8 @@ class AgentSaleAllocation(models.Model):
                 name="uniq_allocation_saleitem_subreal",
             ),
         ]
-        
-        
+
+
 class AgentRequestCart(models.Model):
     """
     Заявка агента на получение товара.
@@ -2150,7 +2142,7 @@ class AgentRequestCart(models.Model):
     company = models.ForeignKey(Company, on_delete=models.CASCADE, related_name="agent_carts", verbose_name="Компания")
     branch = models.ForeignKey(
         Branch, on_delete=models.CASCADE, related_name="crm_agent_carts",
-        null=True, blank=True, db_index=True, verbose_name="Филиал"
+        null=True, blank=True, db_index=True, verbose_name='Филиал'
     )
     agent = models.ForeignKey(
         settings.AUTH_USER_MODEL,
@@ -2319,8 +2311,8 @@ class AgentRequestCart(models.Model):
         self.approved_by = by_user
         self.full_clean()
         self.save(update_fields=["status", "approved_at", "approved_by", "updated_at"])
-        
-        
+
+
 class AgentRequestItem(models.Model):
     """
     Строка внутри AgentRequestCart.

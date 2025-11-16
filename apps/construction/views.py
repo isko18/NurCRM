@@ -5,13 +5,11 @@ from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework.exceptions import PermissionDenied
 
-from apps.construction.models import Department, Cashbox, CashFlow
-from apps.users.models import User, Branch
+from apps.construction.models import Cashbox, CashFlow
+from apps.users.models import Branch
 from apps.construction.serializers import (
-    DepartmentSerializer,
     CashboxSerializer,
     CashFlowSerializer,
-    DepartmentAnalyticsSerializer,
     CashboxWithFlowsSerializer,
 )
 
@@ -43,6 +41,7 @@ def _get_company(user):
             return m.branch.company
 
     return None
+
 
 def _is_owner_like(user) -> bool:
     """
@@ -193,6 +192,8 @@ def _get_active_branch(request):
     # 4) филиал не выбран → None (owner/admin видят все филиалы)
     setattr(request, "branch", None)
     return None
+
+
 # ─────────────────────────────────────────────────────────────
 # Базовый mixin для company + branch scope
 # ─────────────────────────────────────────────────────────────
@@ -290,46 +291,10 @@ class CompanyBranchScopedMixin:
 
         serializer.save(**kwargs)
 
-# ===== DEPARTMENTS ==========================================================
-class DepartmentListCreateView(CompanyBranchScopedMixin, generics.ListCreateAPIView):
-    queryset = Department.objects.select_related("company", "branch").prefetch_related("employees")
-    serializer_class = DepartmentSerializer
-
-    def get_queryset(self):
-        return self._scoped_queryset(super().get_queryset())
-
-    def perform_create(self, serializer):
-        self._inject_company_branch_on_save(serializer)
-
-
-class DepartmentDetailView(CompanyBranchScopedMixin, generics.RetrieveUpdateDestroyAPIView):
-    queryset = Department.objects.select_related("company", "branch").prefetch_related("employees")
-    serializer_class = DepartmentSerializer
-
-    def get_queryset(self):
-        return self._scoped_queryset(super().get_queryset())
-
-
-# ===== DEPARTMENT ANALYTICS ================================================
-class DepartmentAnalyticsListView(CompanyBranchScopedMixin, generics.ListAPIView):
-    queryset = Department.objects.select_related("company", "branch")
-    serializer_class = DepartmentAnalyticsSerializer
-
-    def get_queryset(self):
-        return self._scoped_queryset(super().get_queryset())
-
-
-class DepartmentAnalyticsDetailView(CompanyBranchScopedMixin, generics.RetrieveAPIView):
-    queryset = Department.objects.select_related("company", "branch")
-    serializer_class = DepartmentAnalyticsSerializer
-
-    def get_queryset(self):
-        return self._scoped_queryset(super().get_queryset())
-
 
 # ===== CASHBOXES ============================================================
 class CashboxListCreateView(CompanyBranchScopedMixin, generics.ListCreateAPIView):
-    queryset = Cashbox.objects.select_related("company", "branch", "department", "department__branch")
+    queryset = Cashbox.objects.select_related("company", "branch")
     serializer_class = CashboxSerializer
 
     def get_queryset(self):
@@ -338,16 +303,12 @@ class CashboxListCreateView(CompanyBranchScopedMixin, generics.ListCreateAPIView
     def perform_create(self, serializer):
         """
         company/branch проставляем из контекста.
-        Валидация согласованности с department:
-          - department.company == company
-          - department.branch согласован с branch
-        Это уже проверяет сериализатор/модель.
         """
         self._inject_company_branch_on_save(serializer)
 
 
 class CashboxDetailView(CompanyBranchScopedMixin, generics.RetrieveUpdateDestroyAPIView):
-    queryset = Cashbox.objects.select_related("company", "branch", "department", "department__branch")
+    queryset = Cashbox.objects.select_related("company", "branch")
     serializer_class = CashboxWithFlowsSerializer
 
     def get_queryset(self):
@@ -357,7 +318,7 @@ class CashboxDetailView(CompanyBranchScopedMixin, generics.RetrieveUpdateDestroy
 # ===== CASHFLOWS ============================================================
 class CashFlowListCreateView(CompanyBranchScopedMixin, generics.ListCreateAPIView):
     queryset = CashFlow.objects.select_related(
-        "company", "branch", "cashbox", "cashbox__department", "cashbox__branch"
+        "company", "branch", "cashbox", "cashbox__branch"
     )
     serializer_class = CashFlowSerializer
 
@@ -374,97 +335,12 @@ class CashFlowListCreateView(CompanyBranchScopedMixin, generics.ListCreateAPIVie
 
 class CashFlowDetailView(CompanyBranchScopedMixin, generics.RetrieveUpdateDestroyAPIView):
     queryset = CashFlow.objects.select_related(
-        "company", "branch", "cashbox", "cashbox__department", "cashbox__branch"
+        "company", "branch", "cashbox", "cashbox__branch"
     )
     serializer_class = CashFlowSerializer
 
     def get_queryset(self):
         return self._scoped_queryset(super().get_queryset())
-
-
-# ===== ASSIGN / REMOVE EMPLOYEES ===========================================
-class AssignEmployeeToDepartmentView(APIView):
-    permission_classes = [permissions.IsAuthenticated]
-
-    def post(self, request, department_id):
-        user = request.user
-        company = _get_company(user)
-        if not company:
-            return Response({"detail": "Нет компании у пользователя."}, status=403)
-
-        dept = get_object_or_404(
-            Department.objects.select_related("company", "branch"),
-            id=department_id, company=company
-        )
-        employee_id = request.data.get("employee_id")
-        employee = get_object_or_404(User, id=employee_id, company=company)
-
-        # Запрет на пересечение филиалов:
-        # отдел должен быть глобальным или филиала, видимого для текущего пользователя
-        br = _get_active_branch(request)
-        if br is not None and dept.branch_id not in (None, br.id):
-            return Response({"detail": "Отдел принадлежит другому филиалу."}, status=400)
-
-        # Если нужно запретить множественные отделы — раскомментируйте:
-        # if employee.departments.exists():
-        #     return Response({"detail": "Пользователь уже прикреплён к другому отделу."}, status=400)
-
-        dept.employees.add(employee)
-
-        # Проставляем упрощённый набор прав (если есть в payload)
-        access_fields = [
-            'can_view_dashboard', 'can_view_cashbox', 'can_view_departments',
-            'can_view_orders', 'can_view_analytics', 'can_view_products', 'can_view_booking'
-        ]
-        updated = False
-        for field in access_fields:
-            if field in request.data:
-                setattr(employee, field, request.data[field])
-                updated = True
-        if updated:
-            employee.save()
-
-        return Response({"detail": "Сотрудник добавлен в отдел, права обновлены."}, status=200)
-
-
-class RemoveEmployeeFromDepartmentView(APIView):
-    permission_classes = [permissions.IsAuthenticated]
-
-    def post(self, request, department_id):
-        user = request.user
-        company = _get_company(user)
-        if not company:
-            return Response({"detail": "Нет компании у пользователя."}, status=403)
-
-        dept = get_object_or_404(
-            Department.objects.select_related("company", "branch"),
-            id=department_id, company=company
-        )
-        employee_id = request.data.get("employee_id")
-        employee = get_object_or_404(User, id=employee_id, company=company)
-
-        if employee not in dept.employees.all():
-            return Response({"detail": "Сотрудник не состоит в этом отделе."}, status=400)
-
-        dept.employees.remove(employee)
-        return Response({"detail": "Сотрудник удалён из отдела."}, status=200)
-
-
-# ===== COMPANY-WIDE ANALYTICS (owner/admin) ================================
-class CompanyDepartmentAnalyticsView(CompanyBranchScopedMixin, generics.ListAPIView):
-    serializer_class = DepartmentAnalyticsSerializer
-
-    def get_queryset(self):
-        user = self.request.user
-        company = _get_company(user)
-        if user.is_superuser:
-            qs = Department.objects.select_related("company", "branch")
-        elif company and (getattr(user, "owned_company", None) or getattr(user, "is_admin", False)):
-            qs = Department.objects.filter(company=company).select_related("company", "branch")
-        else:
-            raise PermissionDenied("Вы не являетесь владельцем компании или администратором.")
-        # Даже для owner/admin соблюдаем правило «филиал или вся компания»
-        return self._scoped_queryset(qs)
 
 
 # ===== CASHBOX DETAIL WITH FLOWS (owner/admin) =============================
@@ -474,12 +350,12 @@ class CashboxOwnerDetailView(CompanyBranchScopedMixin, generics.ListAPIView):
     def get_queryset(self):
         user = self.request.user
         if user.is_superuser:
-            qs = Cashbox.objects.select_related("company", "branch", "department", "department__branch")
+            qs = Cashbox.objects.select_related("company", "branch")
         else:
             company = _get_company(user)
             if not (company and (getattr(user, "owned_company", None) or getattr(user, "is_admin", False))):
                 raise PermissionDenied("Только владельцы компании или администраторы могут просматривать кассы.")
-            qs = Cashbox.objects.filter(company=company).select_related("company", "branch", "department", "department__branch")
+            qs = Cashbox.objects.filter(company=company).select_related("company", "branch")
         return self._scoped_queryset(qs)
 
 
@@ -489,10 +365,10 @@ class CashboxOwnerDetailSingleView(CompanyBranchScopedMixin, generics.RetrieveAP
     def get_queryset(self):
         user = self.request.user
         if user.is_superuser:
-            qs = Cashbox.objects.select_related("company", "branch", "department", "department__branch")
+            qs = Cashbox.objects.select_related("company", "branch")
         else:
             company = _get_company(user)
             if not (company and (getattr(user, "owned_company", None) or getattr(user, "is_admin", False))):
                 return Cashbox.objects.none()
-            qs = Cashbox.objects.filter(company=company).select_related("company", "branch", "department", "department__branch")
+            qs = Cashbox.objects.filter(company=company).select_related("company", "branch")
         return self._scoped_queryset(qs)
