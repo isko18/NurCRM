@@ -124,11 +124,11 @@ class CompanyBranchRestrictedMixin:
             - request.branch (если мидлварь уже положила)
         2) ?branch=<uuid> в запросе (если филиал принадлежит компании,
            И у пользователя нет жёстко назначенного филиала)
-        3) None (нет филиала — работаем по всей компании, без фильтра по branch)
+        3) None (нет филиала — работаем по всей компании, но только с записями без branch)
 
     Логика выборки:
         - если branch определён → показываем только данные этого филиала;
-        - если branch = None → показываем все данные компании (без ограничения по branch).
+        - если branch = None → показываем только данные без филиала (branch IS NULL).
     """
 
     permission_classes = [permissions.IsAuthenticated]
@@ -258,7 +258,7 @@ class CompanyBranchRestrictedMixin:
         Активный филиал:
           1) «Жёсткий» филиал сотрудника (primary / branch / branch_ids / memberships / request.branch)
           2) ?branch=<uuid> в запросе (если принадлежит компании и НЕТ жёсткого филиала)
-          3) None (нет филиала — глобальный режим по всей компании)
+          3) None (нет филиала — глобальный режим по всей компании, но только записи без branch)
         """
         req = self._request()
         user = self._user()
@@ -297,7 +297,7 @@ class CompanyBranchRestrictedMixin:
                 # чужой/битый UUID — игнорируем
                 pass
 
-        # 3) никакого филиала → None (работаем по всей компании)
+        # 3) никакого филиала → None (работаем по компании, но без филиалов)
         setattr(req, "_cached_auto_branch", None)
         return None
 
@@ -327,7 +327,7 @@ class CompanyBranchRestrictedMixin:
 
         НОВАЯ ЛОГИКА:
             - если branch определён → фильтруем по этому branch;
-            - если branch is None → НЕ фильтруем по branch вообще (вся компания).
+            - если branch is None → показываем только записи с branch IS NULL.
         """
 
         company = self._company()
@@ -344,12 +344,16 @@ class CompanyBranchRestrictedMixin:
         # branch
         if branch_field:
             if branch is not None:
+                # есть активный филиал → только он
                 qs = qs.filter(**{branch_field: branch})
-            # если branch is None — ничего не добавляем, видим все филиалы компании
+            else:
+                # филиал не выбран → только глобальные записи без филиала
+                qs = qs.filter(**{f"{branch_field}__isnull": True})
         elif self._model_has_field(model, "branch"):
             if branch is not None:
                 qs = qs.filter(branch=branch)
-            # branch is None → не фильтруем по branch, видим всё по компании
+            else:
+                qs = qs.filter(branch__isnull=True)
 
         return qs
 
@@ -397,7 +401,6 @@ class CompanyBranchRestrictedMixin:
         self._save_with_company_branch(serializer)
 
 
-
 # ========= Утилиты для выборок суперпользователя в некоторых вьюхах =========
 def _get_company(user):
     """
@@ -420,6 +423,8 @@ def _get_company(user):
         return getattr(br, "company", None)
 
     return None
+
+# ========= Утилиты для выборок суперпользователя в некоторых вьюхах =========
 
 
 # ===========================
