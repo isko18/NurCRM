@@ -303,20 +303,23 @@ class CashFlowSerializer(CompanyBranchReadOnlyMixin):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
-        # ограничиваем доступные кассы:
-        # - только из моей компании
-        # - глобальные (branch is NULL) или кассы моего филиала
         request = self.context.get('request')
         if request:
             company = _get_company_from_user(getattr(request, "user", None))
             if company:
                 target_branch = self._auto_branch()
                 qs = Cashbox.objects.filter(company=company)
+
                 if target_branch is not None:
+                    # видим глобальные кассы и кассу своего филиала
                     qs = qs.filter(Q(branch__isnull=True) | Q(branch=target_branch))
-                else:
-                    qs = qs.filter(branch__isnull=True)
+                # else:
+                #   НЕ фильтруем по branch вообще → все кассы компании (как во view)
+
                 self.fields['cashbox'].queryset = qs
+            else:
+                # на всякий случай, если компания не найдена — не даём выбрать чужую кассу
+                self.fields['cashbox'].queryset = Cashbox.objects.none()
 
     def get_cashbox_name(self, obj):
         if obj.cashbox.branch:
