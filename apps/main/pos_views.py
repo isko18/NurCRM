@@ -690,26 +690,39 @@ class SaleReceiptDataAPIView(APIView):
         return Response(payload, status=200)
 
 
-class SaleStartAPIView(APIView):
+class SaleStartAPIView(CompanyBranchRestrictedMixin, APIView):
     """
     POST — создать/получить активную корзину для текущего пользователя.
     Если найдено несколько активных — оставим самую свежую, остальные закроем.
     + Опционально: принять скидку на итог (сумма) при старте.
     """
-
     permission_classes = [permissions.IsAuthenticated]
 
     @transaction.atomic
     def post(self, request, *args, **kwargs):
         user = request.user
-        company = user.company
+        # компания либо из миксина, либо из юзера
+        company = self._company() or user.company
+        # активный филиал (для сотрудника — его «жёсткий» филиал)
+        branch = self._auto_branch()
 
-        qs = (
-            Cart.objects.filter(company=company, user=user, status=Cart.Status.ACTIVE).order_by("-created_at")
-        )
+        qs = Cart.objects.filter(company=company, user=user, status=Cart.Status.ACTIVE)
+
+        # если у Cart есть поле branch — фильтруем по нему
+        if hasattr(Cart, "branch"):
+            if branch is not None:
+                qs = qs.filter(branch=branch)
+            else:
+                qs = qs.filter(branch__isnull=True)
+
+        qs = qs.order_by("-created_at")
+
         cart = qs.first()
         if cart is None:
-            cart = Cart.objects.create(company=company, user=user, status=Cart.Status.ACTIVE)
+            create_kwargs = dict(company=company, user=user, status=Cart.Status.ACTIVE)
+            if hasattr(Cart, "branch"):
+                create_kwargs["branch"] = branch
+            cart = Cart.objects.create(**create_kwargs)
         else:
             # закрыть дубликаты, если есть
             extra_ids = list(qs.values_list("id", flat=True)[1:])
@@ -721,18 +734,15 @@ class SaleStartAPIView(APIView):
 
         # === НОВОЕ: суммовая скидка на весь заказ ===
         opts = StartCartOptionsSerializer(data=request.data)
-        # мягкая валидация: если фронт ничего не прислал — не ломаем контракт
         if opts.is_valid():
             order_disc = opts.validated_data.get("order_discount_total")
             if order_disc is not None:
-                # нормализуем до 2 знаков и сохраняем
                 cart.order_discount_total = _q2(order_disc)
                 cart.save(update_fields=["order_discount_total"])
 
-        # пересчёт итогов с учётом order_discount_total
         cart.recalc()
-
         return Response(SaleCartSerializer(cart).data, status=status.HTTP_201_CREATED)
+
 
 
 class CartDetailAPIView(generics.RetrieveAPIView):
