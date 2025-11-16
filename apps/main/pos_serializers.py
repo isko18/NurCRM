@@ -39,7 +39,7 @@ class MoneyField(serializers.DecimalField):
         return money(val)
 
 
-# --- Позиция в корзине ---
+# --- Параметры при старте корзины ---
 class StartCartOptionsSerializer(serializers.Serializer):
     """
     Опциональные настройки при старте корзины.
@@ -58,6 +58,7 @@ class CustomCartItemCreateSerializer(serializers.Serializer):
     price = MoneyField()
     quantity = serializers.IntegerField(min_value=1, required=False, default=1)
 
+
 class ProductImageReadSerializer(serializers.ModelSerializer):
     image_url = serializers.SerializerMethodField()
 
@@ -71,16 +72,20 @@ class ProductImageReadSerializer(serializers.ModelSerializer):
         request = self.context.get("request")
         url = obj.image.url
         return request.build_absolute_uri(url) if request else url
-    
+
+
 class SaleItemSerializer(serializers.ModelSerializer):
+    """
+    Позиция в корзине (CartItem) — используется в POS.
+    """
     product_name = serializers.CharField(source="product.name", read_only=True)
     barcode = serializers.CharField(source="product.barcode", read_only=True)
-    display_name = serializers.SerializerMethodField()  # ← имя товара или custom_name
+    display_name = serializers.SerializerMethodField()  # товар или custom_name
     primary_image_url = serializers.SerializerMethodField(read_only=True)
     images = ProductImageReadSerializer(
         many=True, read_only=True, source="product.images"
     )
-    
+
     class Meta:
         model = CartItem
         fields = (
@@ -88,15 +93,20 @@ class SaleItemSerializer(serializers.ModelSerializer):
             "product_name", "barcode",
             "quantity", "unit_price",
             "display_name",
-            "primary_image_url",  # ← главная картинка
-            "images",   
+            "primary_image_url",
+            "images",
         )
-        read_only_fields = ("id", "product_name", "barcode", "display_name", "primary_image_url", "images")
+        read_only_fields = (
+            "id", "product_name", "barcode",
+            "display_name", "primary_image_url", "images",
+        )
 
     # ---- helpers ----
     def get_display_name(self, obj):
         # если product есть — берём его имя, иначе кастомное
-        return _get_attr(_get_attr(obj, "product", None), "name", None) or (_get_attr(obj, "custom_name", "") or "")
+        return _get_attr(_get_attr(obj, "product", None), "name", None) or (
+            _get_attr(obj, "custom_name", "") or ""
+        )
 
     def get_primary_image_url(self, obj):
         prod = getattr(obj, "product", None)
@@ -108,12 +118,13 @@ class SaleItemSerializer(serializers.ModelSerializer):
         request = self.context.get("request")
         url = im.image.url
         return request.build_absolute_uri(url) if request else url
-    
+
     def _validate_company_branch(self, cart: Cart, product: Product):
         """
         Совместимость компании и филиала между корзиной и товаром.
         - company: должно совпадать;
-        - branch: товар либо глобальный (product.branch is None), либо из того же филиала, что и корзина.
+        - branch: товар либо глобальный (product.branch is None),
+                  либо из того же филиала, что и корзина.
         Проверки выполняются только если соответствующие поля существуют у моделей.
         """
         # company
@@ -121,14 +132,19 @@ class SaleItemSerializer(serializers.ModelSerializer):
         product_company_id = _get_attr(product, "company_id")
         if cart and product and cart_company_id is not None and product_company_id is not None:
             if cart_company_id != product_company_id:
-                raise serializers.ValidationError({"product": "Товар принадлежит другой компании, чем корзина."})
+                raise serializers.ValidationError(
+                    {"product": "Товар принадлежит другой компании, чем корзина."}
+                )
 
-        # branch (мягкая совместимость как в «барбере»: глобальный товар доступен в любом филиале)
+        # branch (мягкая совместимость как в «барбере»:
+        # глобальный товар доступен в любом филиале)
         if _has_field(type(cart), "branch") and _has_field(type(product), "branch"):
             cart_branch_id = _get_attr(cart, "branch_id")
             product_branch_id = _get_attr(product, "branch_id")
             if product_branch_id is not None and product_branch_id != cart_branch_id:
-                raise serializers.ValidationError({"product": "Товар из другого филиала и не является глобальным."})
+                raise serializers.ValidationError(
+                    {"product": "Товар из другого филиала и не является глобальным."}
+                )
 
     # ---- validate / create / update ----
     def validate(self, attrs):
@@ -175,7 +191,16 @@ class SaleCartSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = Cart
-        fields = ("id", "status", "subtotal", "discount_total", "order_discount_total", "tax_total", "total", "items")
+        fields = (
+            "id",
+            "status",
+            "subtotal",
+            "discount_total",
+            "order_discount_total",
+            "tax_total",
+            "total",
+            "items",
+        )
 
 
 class ScanRequestSerializer(serializers.Serializer):
@@ -257,10 +282,11 @@ class SaleListSerializer(serializers.ModelSerializer):
         u = obj.user
         if not u:
             return None
-        return (getattr(u, "get_full_name", lambda: "")()
-                or getattr(u, "email", None)
-                or getattr(u, "username", None))
-
+        return (
+            getattr(u, "get_full_name", lambda: "")()
+            or getattr(u, "email", None)
+            or getattr(u, "username", None)
+        )
 
 
 class SaleItemReadSerializer(serializers.ModelSerializer):
@@ -352,6 +378,7 @@ class ReceiptItemSerializer(serializers.Serializer):
     name  = serializers.CharField()
     qty   = serializers.FloatField()
     price = serializers.FloatField()
+
 
 class ReceiptSerializer(serializers.Serializer):
     doc_no       = serializers.CharField()
