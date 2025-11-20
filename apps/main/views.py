@@ -1335,27 +1335,21 @@ class ClientDealUnpayAPIView(APIView, CompanyBranchRestrictedMixin):
         return Response(data, status=status.HTTP_200_OK)
 
 class ClientWithDebtsListAPIView(CompanyBranchRestrictedMixin, generics.ListAPIView):
-    """
-    GET /api/main/clients/with-debts/
-
-    Клиенты, у которых есть хотя бы одна сделка типа "debt"
-    с неоплаченными взносами.
-    """
     serializer_class = ClientSerializer
-    filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
-    search_fields = ["full_name", "phone", "email"]
-    ordering_fields = ["created_at", "updated_at", "date"]
-    ordering = ["-created_at"]
 
     def get_queryset(self):
-        # базовый queryset по company/branch
         qs = self._filter_qs_company_branch(Client.objects.all())
 
-        # оставляем только клиентов, у которых есть сделки-долги с неоплаченными взносами
-        qs = qs.filter(
-            clientdeal__kind=ClientDeal.Kind.DEBT,
-            clientdeal__installments__paid_on__isnull=True,
-        ).distinct()
+        qs = (
+            qs.annotate(
+                total_debt=Sum(
+                    F("deals__amount") - F("deals__installments__amount_paid"),
+                    filter=Q(deals__kind=ClientDeal.Kind.DEBT)
+                )
+            )
+            .filter(total_debt__gt=0)
+            .distinct()
+        )
 
         return qs
 # ===========================
