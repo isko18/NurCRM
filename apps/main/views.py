@@ -1106,8 +1106,6 @@ class ClientListCreateAPIView(CompanyBranchRestrictedMixin, generics.ListCreateA
     def get_queryset(self):
         return self._filter_qs_company_branch(Client.objects.all())
 
-    # perform_create — миксин
-
 
 class ClientRetrieveUpdateDestroyAPIView(CompanyBranchRestrictedMixin, generics.RetrieveUpdateDestroyAPIView):
     """
@@ -1122,15 +1120,12 @@ class ClientRetrieveUpdateDestroyAPIView(CompanyBranchRestrictedMixin, generics.
         return self._filter_qs_company_branch(Client.objects.all())
 
 
-# ===========================
-#  Client deals
-# ===========================
 class ClientDealListCreateAPIView(CompanyBranchRestrictedMixin, generics.ListCreateAPIView):
     """
-      GET  /api/main/deals/                      — все сделки компании/филиала
-      POST /api/main/deals/                      — создать сделку (client в теле)
-      GET  /api/main/clients/<client_id>/deals/  — сделки конкретного клиента
-      POST /api/main/clients/<client_id>/deals/  — создать сделку для клиента из URL
+      GET  /api/main/deals/
+      POST /api/main/deals/
+      GET  /api/main/clients/<client_id>/deals/
+      POST /api/main/clients/<client_id>/deals/
     """
     serializer_class = ClientDealSerializer
     filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
@@ -1174,7 +1169,7 @@ class ClientDealRetrieveUpdateDestroyAPIView(CompanyBranchRestrictedMixin, gener
     PATCH  /api/main/deals/<uuid:pk>/
     PUT    /api/main/deals/<uuid:pk>/
     DELETE /api/main/deals/<uuid:pk>/
-    (опционально nested /clients/<client_id>/deals/<pk>/)
+    опционально nested: /clients/<client_id>/deals/<pk>/
     """
     serializer_class = ClientDealSerializer
 
@@ -1204,10 +1199,13 @@ class ClientDealRetrieveUpdateDestroyAPIView(CompanyBranchRestrictedMixin, gener
 class ClientDealPayAPIView(APIView, CompanyBranchRestrictedMixin):
     """
     POST /api/main/deals/<uuid:pk>/pay/
+    POST /api/main/clients/<client_id>/deals/<uuid:pk>/pay/
+
     Body (опционально):
       {
-        "installment_number": 2,
-        "date": "2025-11-10"
+        "installment_number": 2,          номер взноса (если не указать — берётся первый не полностью оплаченный)
+        "amount": "5000.00",             сколько оплатил за этот период (если не указать — гасится весь взнос)
+        "date": "2025-11-10"             дата платежа (если не указать — сегодня)
       }
     """
     permission_classes = [permissions.IsAuthenticated]
@@ -1232,23 +1230,56 @@ class ClientDealPayAPIView(APIView, CompanyBranchRestrictedMixin):
             )
 
         number = request.data.get("installment_number")
+        raw_amount = request.data.get("amount")
+        paid_amount = None
+
+        if raw_amount not in (None, ""):
+            try:
+                paid_amount = Decimal(str(raw_amount))
+            except Exception:
+                return Response({"amount": "Неверный формат суммы оплаты."}, status=status.HTTP_400_BAD_REQUEST)
+            if paid_amount <= 0:
+                return Response({"amount": "Сумма оплаты должна быть больше нуля."}, status=status.HTTP_400_BAD_REQUEST)
+
         paid_date_str = request.data.get("date")
         paid_date = parse_date(paid_date_str) if paid_date_str else timezone.localdate()
 
         if number:
             inst = get_object_or_404(DealInstallment, deal=deal, number=number)
-            if inst.paid_on:
-                return Response(
-                    {"detail": f"Взнос №{number} уже оплачен ({inst.paid_on})."},
-                    status=status.HTTP_400_BAD_REQUEST,
-                )
         else:
-            inst = deal.installments.filter(paid_on__isnull=True).order_by("number").first()
+            inst = (
+                deal.installments
+                .filter(paid_amount__lt=F("amount"))
+                .order_by("number")
+                .first()
+            )
             if not inst:
-                return Response({"detail": "Все взносы уже оплачены."}, status=status.HTTP_400_BAD_REQUEST)
+                return Response({"detail": "Все взносы уже полностью оплачены."}, status=status.HTTP_400_BAD_REQUEST)
 
-        inst.paid_on = paid_date
-        inst.save(update_fields=["paid_on"])
+        current_paid = inst.paid_amount or Decimal("0")
+        total_amount = inst.amount or Decimal("0")
+        remaining = (total_amount - current_paid).quantize(Decimal("0.01"))
+
+        if remaining <= 0:
+            return Response(
+                {"detail": f"Взнос №{inst.number} уже полностью оплачен."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        if paid_amount is None:
+            paid_amount = remaining
+
+        if paid_amount > remaining:
+            return Response(
+                {"amount": f"Сумма оплаты превышает сумму взноса. Максимум: {remaining}."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        inst.paid_amount = (current_paid + paid_amount).quantize(Decimal("0.01"))
+        if inst.paid_amount >= total_amount:
+            inst.paid_on = paid_date
+            inst.paid_amount = total_amount
+        inst.save(update_fields=["paid_amount", "paid_on"])
 
         data = ClientDealSerializer(deal, context={"request": request}).data
         return Response(data, status=status.HTTP_200_OK)
@@ -1257,22 +1288,15 @@ class ClientDealPayAPIView(APIView, CompanyBranchRestrictedMixin):
 class ClientDealUnpayAPIView(APIView, CompanyBranchRestrictedMixin):
     """
     POST /api/main/deals/<uuid:pk>/unpay/
-    (опционально nested)
     POST /api/main/clients/<client_id>/deals/<uuid:pk>/unpay/
 
-    Тело запроса (опционально):
-    {
-      "installment_number": 2
-    }
+    Body (опционально):
+      {
+        "installment_number": 2
+      }
 
-    Логика:
-      - только для сделок с kind == "debt"
-      - если передан installment_number:
-            откатываем оплату именно этого взноса
-        иначе:
-            откатываем ОДИН последний оплаченный взнос (с максимальным number)
-      - если взнос не был оплачен -> 400
-      - возвращаем обновлённую сделку
+    Если указан номер — полностью очищает оплату по этому взносу (paid_amount=0, paid_on=NULL).
+    Если номер не указан — откатывает оплату по последнему оплаченному/частично оплаченному взносу.
     """
     permission_classes = [permissions.IsAuthenticated]
 
@@ -1284,39 +1308,34 @@ class ClientDealUnpayAPIView(APIView, CompanyBranchRestrictedMixin):
 
         client_id = kwargs.get("client_id")
 
-        # 1. Определяем сделку в рамках компании и филиала юзера
         deal_qs = ClientDeal.objects.all()
         deal_qs = self._filter_qs_company_branch(deal_qs)
         deal_qs = deal_qs.filter(pk=pk)
 
-        # если запрос в nested-виде /clients/<client_id>/deals/<pk>/unpay/
         if client_id:
             deal_qs = deal_qs.filter(client_id=client_id)
 
         deal = get_object_or_404(deal_qs)
 
-        # 2. Только для долговых сделок
         if deal.kind != ClientDeal.Kind.DEBT:
             return Response(
                 {"detail": "Отмена оплаты доступна только для сделок типа 'debt'."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        # 3. Выбираем какой платёж откатываем
         installment_number = request.data.get("installment_number")
 
         if installment_number:
             inst = get_object_or_404(DealInstallment, deal=deal, number=installment_number)
-            if not inst.paid_on:
+            if (inst.paid_amount or Decimal("0")) <= 0 and not inst.paid_on:
                 return Response(
                     {"detail": f"Взнос №{installment_number} и так не оплачен."},
                     status=status.HTTP_400_BAD_REQUEST,
                 )
         else:
-            # если номер не указан — берём последний оплаченный (самый поздний по номеру)
             inst = (
                 deal.installments
-                .filter(paid_on__isnull=False)
+                .filter(Q(paid_amount__gt=0) | Q(paid_on__isnull=False))
                 .order_by("-number")
                 .first()
             )
@@ -1326,25 +1345,23 @@ class ClientDealUnpayAPIView(APIView, CompanyBranchRestrictedMixin):
                     status=status.HTTP_400_BAD_REQUEST,
                 )
 
-        # 4. Откатываем оплату
+        inst.paid_amount = Decimal("0.00")
         inst.paid_on = None
-        inst.save(update_fields=["paid_on"])
+        inst.save(update_fields=["paid_amount", "paid_on"])
 
-        # 5. Возвращаем актуальное состояние сделки
         data = ClientDealSerializer(deal, context={"request": request}).data
         return Response(data, status=status.HTTP_200_OK)
+
 
 class ClientWithDebtsListAPIView(CompanyBranchRestrictedMixin, generics.ListAPIView):
     serializer_class = ClientSerializer
 
     def get_queryset(self):
         qs = self._filter_qs_company_branch(Client.objects.all())
-
         qs = qs.filter(
             deals__kind=ClientDeal.Kind.DEBT,
-            deals__installments__paid_on__isnull=True
+            deals__installments__paid_on__isnull=True,
         ).distinct()
-
         return qs
 # ===========================
 #  Bids & Social Applications
