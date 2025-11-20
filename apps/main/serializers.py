@@ -923,8 +923,10 @@ class ClientSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
             'service', 'service_display',
             'created_at', 'updated_at'
         ]
-        read_only_fields = ['id', 'company', 'branch', 'created_at', 'updated_at',
-                            'salesperson_display', 'service_display']
+        read_only_fields = [
+            'id', 'company', 'branch', 'created_at', 'updated_at',
+            'salesperson_display', 'service_display'
+        ]
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -944,10 +946,28 @@ class ClientSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
 
 
 class DealInstallmentSerializer(serializers.ModelSerializer):
+    remaining_for_period = serializers.DecimalField(max_digits=12, decimal_places=2, read_only=True)
+
     class Meta:
         model = DealInstallment
-        fields = ("number", "due_date", "amount", "balance_after", "paid_on")
-        read_only_fields = ("number", "due_date", "amount", "balance_after")
+        fields = (
+            "number",
+            "due_date",
+            "amount",
+            "balance_after",
+            "paid_on",
+            "paid_amount",
+            "remaining_for_period",
+        )
+        read_only_fields = (
+            "number",
+            "due_date",
+            "amount",
+            "balance_after",
+            "paid_on",
+            "paid_amount",
+            "remaining_for_period",
+        )
 
 
 class ClientDealSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
@@ -995,11 +1015,9 @@ class ClientDealSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializ
         if client and client.company_id != company.id:
             raise serializers.ValidationError({"client": "Клиент принадлежит другой компании."})
 
-        # STRICT branch
         if branch is not None:
             if client and client.branch_id != branch.id:
                 raise serializers.ValidationError({"client": "Клиент другого филиала."})
-        # если branch None — клиент может быть из любого филиала компании
 
         amount = attrs.get("amount", getattr(self.instance, "amount", None))
         prepayment = attrs.get("prepayment", getattr(self.instance, "prepayment", None))

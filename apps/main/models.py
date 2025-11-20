@@ -1420,14 +1420,14 @@ class ClientDeal(models.Model):
         if self.branch_id and self.client_id and self.client.branch_id not in (None, self.branch_id):
             raise ValidationError({'client': 'Клиент другого филиала.'})
 
-    # ===== вычисляемые поля для UI =====
     @property
     def debt_amount(self) -> Decimal:
         return (self.amount or Decimal("0")) - (self.prepayment or Decimal("0"))
 
     @property
     def paid_total(self) -> Decimal:
-        return self.installments.filter(paid_on__isnull=False).aggregate(s=Sum("amount"))["s"] or Decimal("0")
+        s = self.installments.aggregate(s=Sum("paid_amount"))["s"] or Decimal("0")
+        return s.quantize(Decimal("0.01"))
 
     @property
     def remaining_debt(self) -> Decimal:
@@ -1456,10 +1456,15 @@ class ClientDeal(models.Model):
             amount_i = (total - paid) if i == self.debt_months else base
             paid += amount_i
             due = start + relativedelta(months=+(i - 1))
-            items.append(DealInstallment(
-                deal=self, number=i, due_date=due, amount=amount_i,
-                balance_after=(total - paid).quantize(Decimal("0.01")),
-            ))
+            items.append(
+                DealInstallment(
+                    deal=self,
+                    number=i,
+                    due_date=due,
+                    amount=amount_i,
+                    balance_after=(total - paid).quantize(Decimal("0.01")),
+                )
+            )
         DealInstallment.objects.bulk_create(items)
 
     def save(self, *args, **kwargs):
@@ -1474,6 +1479,7 @@ class DealInstallment(models.Model):
     amount = models.DecimalField("Сумма", max_digits=12, decimal_places=2)
     balance_after = models.DecimalField("Остаток", max_digits=12, decimal_places=2)
     paid_on = models.DateField("Оплачен", blank=True, null=True)
+    paid_amount = models.DecimalField("Оплачено за период", max_digits=12, decimal_places=2, default=0)
 
     class Meta:
         verbose_name = "Платёж по графику"
@@ -1481,6 +1487,9 @@ class DealInstallment(models.Model):
         ordering = ["deal", "number"]
         unique_together = (("deal", "number"),)
 
+    @property
+    def remaining_for_period(self) -> Decimal:
+        return (self.amount - (self.paid_amount or Decimal("0"))).quantize(Decimal("0.01"))
 
 class Bid(models.Model):
     class Status(models.TextChoices):
