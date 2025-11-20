@@ -1340,16 +1340,10 @@ class ClientWithDebtsListAPIView(CompanyBranchRestrictedMixin, generics.ListAPIV
     def get_queryset(self):
         qs = self._filter_qs_company_branch(Client.objects.all())
 
-        qs = (
-            qs.annotate(
-                total_debt=Sum(
-                    F("deals__amount") - F("deals__installments__amount_paid"),
-                    filter=Q(deals__kind=ClientDeal.Kind.DEBT)
-                )
-            )
-            .filter(total_debt__gt=0)
-            .distinct()
-        )
+        qs = qs.filter(
+            deals__kind=ClientDeal.Kind.DEBT,
+            deals__installments__paid_on__isnull=True
+        ).distinct()
 
         return qs
 # ===========================
