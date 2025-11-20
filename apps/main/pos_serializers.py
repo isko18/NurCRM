@@ -5,8 +5,6 @@ from .models import (
     Product, Cart, CartItem, Sale, SaleItem, MobileScannerToken, ProductImage
 )
 
-# ---------- Helpers ----------
-
 Q2 = Decimal("0.01")
 
 
@@ -26,9 +24,6 @@ def _get_attr(obj, name, default=None):
 
 
 class MoneyField(serializers.DecimalField):
-    """
-    Денежное поле: 2 знака, округление ROUND_HALF_UP.
-    """
     def __init__(self, *args, **kwargs):
         kwargs.setdefault("max_digits", 12)
         kwargs.setdefault("decimal_places", 2)
@@ -39,12 +34,7 @@ class MoneyField(serializers.DecimalField):
         return money(val)
 
 
-# --- Параметры при старте корзины ---
 class StartCartOptionsSerializer(serializers.Serializer):
-    """
-    Опциональные настройки при старте корзины.
-    Скидка на весь заказ указывается суммой (MoneyField).
-    """
     order_discount_total = MoneyField(required=False)
 
     def validate_order_discount_total(self, v):
@@ -75,12 +65,9 @@ class ProductImageReadSerializer(serializers.ModelSerializer):
 
 
 class SaleItemSerializer(serializers.ModelSerializer):
-    """
-    Позиция в корзине (CartItem) — используется в POS.
-    """
     product_name = serializers.CharField(source="product.name", read_only=True)
     barcode = serializers.CharField(source="product.barcode", read_only=True)
-    display_name = serializers.SerializerMethodField()  # товар или custom_name
+    display_name = serializers.SerializerMethodField()
     primary_image_url = serializers.SerializerMethodField(read_only=True)
     images = ProductImageReadSerializer(
         many=True, read_only=True, source="product.images"
@@ -101,9 +88,7 @@ class SaleItemSerializer(serializers.ModelSerializer):
             "display_name", "primary_image_url", "images",
         )
 
-    # ---- helpers ----
     def get_display_name(self, obj):
-        # если product есть — берём его имя, иначе кастомное
         return _get_attr(_get_attr(obj, "product", None), "name", None) or (
             _get_attr(obj, "custom_name", "") or ""
         )
@@ -120,14 +105,6 @@ class SaleItemSerializer(serializers.ModelSerializer):
         return request.build_absolute_uri(url) if request else url
 
     def _validate_company_branch(self, cart: Cart, product: Product):
-        """
-        Совместимость компании и филиала между корзиной и товаром.
-        - company: должно совпадать;
-        - branch: товар либо глобальный (product.branch is None),
-                  либо из того же филиала, что и корзина.
-        Проверки выполняются только если соответствующие поля существуют у моделей.
-        """
-        # company
         cart_company_id = _get_attr(cart, "company_id")
         product_company_id = _get_attr(product, "company_id")
         if cart and product and cart_company_id is not None and product_company_id is not None:
@@ -136,8 +113,6 @@ class SaleItemSerializer(serializers.ModelSerializer):
                     {"product": "Товар принадлежит другой компании, чем корзина."}
                 )
 
-        # branch (мягкая совместимость как в «барбере»:
-        # глобальный товар доступен в любом филиале)
         if _has_field(type(cart), "branch") and _has_field(type(product), "branch"):
             cart_branch_id = _get_attr(cart, "branch_id")
             product_branch_id = _get_attr(product, "branch_id")
@@ -146,7 +121,6 @@ class SaleItemSerializer(serializers.ModelSerializer):
                     {"product": "Товар из другого филиала и не является глобальным."}
                 )
 
-    # ---- validate / create / update ----
     def validate(self, attrs):
         cart = attrs.get("cart") or _get_attr(self.instance, "cart", None)
         product = attrs.get("product") or _get_attr(self.instance, "product", None)
@@ -163,23 +137,18 @@ class SaleItemSerializer(serializers.ModelSerializer):
     def create(self, validated_data):
         cart = validated_data["cart"]
 
-        # Для «обычных» товаров — по умолчанию берём цену продукта,
-        # кастомные позиции создаются отдельным эндпоинтом через CustomCartItemCreateSerializer.
         if validated_data.get("product") and "unit_price" not in validated_data:
             validated_data["unit_price"] = validated_data["product"].price
 
-        # Если у CartItem есть поле company — проставим из корзины
         if _has_field(CartItem, "company"):
             validated_data.setdefault("company", cart.company)
 
-        # Если у CartItem есть поле branch — тоже проставим из корзины
         if _has_field(CartItem, "branch"):
             validated_data.setdefault("branch", _get_attr(cart, "branch", None))
 
         return super().create(validated_data)
 
     def update(self, instance, validated_data):
-        # company/cart/branch менять нельзя через позицию
         validated_data.pop("company", None)
         validated_data.pop("cart", None)
         validated_data.pop("branch", None)
@@ -211,7 +180,6 @@ class ScanRequestSerializer(serializers.Serializer):
 class AddItemSerializer(serializers.Serializer):
     product_id = serializers.UUIDField()
     quantity = serializers.IntegerField(min_value=1, required=False, default=1)
-    # Можно задать либо цену позиции (после скидки), либо скидку на всю строку:
     unit_price = MoneyField(required=False)
     discount_total = MoneyField(required=False)
 
@@ -232,10 +200,6 @@ class AddItemSerializer(serializers.Serializer):
 
 
 class OptionalUUIDField(serializers.UUIDField):
-    """
-    UUID-поле, которое принимает None/""/"null" как отсутствие значения.
-    Удобно для фронтов, которые шлют пустую строку.
-    """
     def to_internal_value(self, data):
         if data in (None, "", "null", "None"):
             return None
@@ -245,8 +209,37 @@ class OptionalUUIDField(serializers.UUIDField):
 class CheckoutSerializer(serializers.Serializer):
     print_receipt = serializers.BooleanField(default=False)
     client_id = OptionalUUIDField(required=False, allow_null=True)
-    # (опц.) чтобы не читать department_id напрямую из request.data во вьюхе:
     department_id = OptionalUUIDField(required=False, allow_null=True)
+
+    payment_method = serializers.ChoiceField(
+        choices=Sale.PaymentMethod.choices,
+        default=Sale.PaymentMethod.CASH,
+        required=False,
+    )
+    cash_received = MoneyField(required=False, allow_null=True)
+
+    def validate(self, attrs):
+        payment_method = attrs.get("payment_method") or Sale.PaymentMethod.CASH
+        cash_received = attrs.get("cash_received")
+
+        if payment_method == Sale.PaymentMethod.CASH:
+            if cash_received is None:
+                raise serializers.ValidationError(
+                    {"cash_received": "Укажите сумму, принятую наличными."}
+                )
+            if cash_received < 0:
+                raise serializers.ValidationError(
+                    {"cash_received": "Не может быть отрицательной."}
+                )
+        else:
+            if cash_received is None:
+                attrs["cash_received"] = Decimal("0.00")
+            elif cash_received < 0:
+                raise serializers.ValidationError(
+                    {"cash_received": "Не может быть отрицательной."}
+                )
+
+        return attrs
 
 
 class MobileScannerTokenSerializer(serializers.ModelSerializer):
@@ -256,11 +249,15 @@ class MobileScannerTokenSerializer(serializers.ModelSerializer):
         read_only_fields = ("token", "expires_at")
 
 
-# ============== ПРОДАЖИ ==============
-
 class SaleListSerializer(serializers.ModelSerializer):
     user_display = serializers.SerializerMethodField()
     client_name = serializers.CharField(source="client.full_name", read_only=True)
+    change = serializers.DecimalField(
+        max_digits=12,
+        decimal_places=2,
+        read_only=True,
+        source="change",   # <-- ВАЖНО
+    )
 
     class Meta:
         model = Sale
@@ -274,8 +271,11 @@ class SaleListSerializer(serializers.ModelSerializer):
             "created_at",
             "paid_at",
             "user_display",
-            "client",        # id клиента
-            "client_name",   # имя клиента
+            "client",
+            "client_name",
+            "payment_method",
+            "cash_received",
+            "change",
         )
 
     def get_user_display(self, obj):
@@ -290,12 +290,6 @@ class SaleListSerializer(serializers.ModelSerializer):
 
 
 class SaleItemReadSerializer(serializers.ModelSerializer):
-    """
-    Позиция продажи. Показываем:
-    - текущее имя product (если он ещё существует),
-    - name_snapshot / barcode_snapshot (снимки на момент продажи),
-    - рассчитанный line_total.
-    """
     product_name = serializers.SerializerMethodField()
     line_total = serializers.SerializerMethodField()
 
@@ -303,10 +297,10 @@ class SaleItemReadSerializer(serializers.ModelSerializer):
         model = SaleItem
         fields = (
             "id",
-            "product",          # может быть null, если товар удалён
-            "product_name",     # текущее имя товара (если есть product), иначе из снимка
-            "name_snapshot",    # снимок имени
-            "barcode_snapshot", # снимок штрих-кода
+            "product",
+            "product_name",
+            "name_snapshot",
+            "barcode_snapshot",
             "unit_price",
             "quantity",
             "line_total",
@@ -314,7 +308,6 @@ class SaleItemReadSerializer(serializers.ModelSerializer):
         read_only_fields = fields
 
     def get_product_name(self, obj):
-        # если связанный product ещё жив — берём его имя; иначе используем снимок
         return _get_attr(_get_attr(obj, "product", None), "name", None) or obj.name_snapshot
 
     def get_line_total(self, obj):
@@ -326,12 +319,18 @@ class SaleDetailSerializer(serializers.ModelSerializer):
     user_display = serializers.SerializerMethodField(read_only=True)
     items = SaleItemReadSerializer(many=True, read_only=True)
     client_name = serializers.CharField(source="client.full_name", read_only=True)
+    change = serializers.DecimalField(
+        max_digits=12,
+        decimal_places=2,
+        read_only=True,
+        source="change",   # <-- ВАЖНО
+    )
 
     class Meta:
         model = Sale
         fields = (
             "id",
-            "status",          # <-- допускаем запись
+            "status",
             "subtotal",
             "discount_total",
             "tax_total",
@@ -339,9 +338,12 @@ class SaleDetailSerializer(serializers.ModelSerializer):
             "created_at",
             "paid_at",
             "user_display",
-            "client",          # id клиента
-            "client_name",     # имя клиента
+            "client",
+            "client_name",
             "items",
+            "payment_method",
+            "cash_received",
+            "change",
         )
         read_only_fields = (
             "id",
@@ -355,6 +357,9 @@ class SaleDetailSerializer(serializers.ModelSerializer):
             "client",
             "client_name",
             "items",
+            "payment_method",
+            "cash_received",
+            "change",
         )
 
     def get_user_display(self, obj):
@@ -375,19 +380,19 @@ class SaleStatusUpdateSerializer(serializers.ModelSerializer):
 
 
 class ReceiptItemSerializer(serializers.Serializer):
-    name  = serializers.CharField()
-    qty   = serializers.FloatField()
+    name = serializers.CharField()
+    qty = serializers.FloatField()
     price = serializers.FloatField()
 
 
 class ReceiptSerializer(serializers.Serializer):
-    doc_no       = serializers.CharField()
-    company      = serializers.CharField(allow_blank=True, required=False)
-    created_at   = serializers.CharField(allow_null=True, required=False)   # строкой YYYY-MM-DD HH:MM:SS
+    doc_no = serializers.CharField()
+    company = serializers.CharField(allow_blank=True, required=False)
+    created_at = serializers.CharField(allow_null=True, required=False)
     cashier_name = serializers.CharField(allow_null=True, required=False)
-    items        = ReceiptItemSerializer(many=True)
-    discount     = serializers.FloatField(required=False, default=0.0)
-    tax          = serializers.FloatField(required=False, default=0.0)
-    paid_cash    = serializers.FloatField(required=False, default=0.0)
-    paid_card    = serializers.FloatField(required=False, default=0.0)
-    change       = serializers.FloatField(required=False, default=0.0)
+    items = ReceiptItemSerializer(many=True)
+    discount = serializers.FloatField(required=False, default=0.0)
+    tax = serializers.FloatField(required=False, default=0.0)
+    paid_cash = serializers.FloatField(required=False, default=0.0)
+    paid_card = serializers.FloatField(required=False, default=0.0)
+    change = serializers.FloatField(required=False, default=0.0)

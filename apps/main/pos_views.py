@@ -43,7 +43,7 @@ from apps.main.services_agent_pos import checkout_agent_cart, AgentNotEnoughStoc
 from dataclasses import dataclass
 from apps.main.utils_numbers import ensure_sale_doc_number
 from django.core.cache import cache
-from apps.users.models import Roles, User, Company  # важно подтянуть Roles
+from apps.users.models import Roles, User, Company
 import requests
 from django.conf import settings
 
@@ -55,14 +55,12 @@ except Exception:
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-# Путь к папке fonts внутри apps/main
 FONTS_DIR = os.path.join(BASE_DIR, "fonts")
 
-# Регистрируем шрифты
 pdfmetrics.registerFont(TTFont("DejaVu", os.path.join(FONTS_DIR, "DejaVuSans.ttf")))
 pdfmetrics.registerFont(TTFont("DejaVu-Bold", os.path.join(FONTS_DIR, "DejaVuSans-Bold.ttf")))
 
-# ---- money helpers ----
+
 def _q2(x: Decimal) -> Decimal:
     return (x or Decimal("0")).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
 
@@ -108,7 +106,6 @@ def _safe(s) -> str:
 
 
 def register_fonts_if_needed():
-    # если в проекте уже зарегистрированы — ничего страшного
     try:
         pdfmetrics.registerFont(TTFont("DejaVu", "DejaVuSans.ttf"))
         pdfmetrics.registerFont(TTFont("DejaVu-Bold", "DejaVuSans-Bold.ttf"))
@@ -153,20 +150,13 @@ def _party_lines(
 
 
 class ClientReconciliationClassicAPIView(APIView):
-    """
-    GET /api/main/clients/<uuid:client_id>/reconciliation/classic/?start=YYYY-MM-DD&end=YYYY-MM-DD&source=both|sales|deals&currency=KGS
-    Отрисовка «классического» акта: №, Содержание, Дт/Кт компании и Дт/Кт клиента.
-    Логика проводок: увеличение долга клиента (продажа/сумма сделки) -> Дт Компания / Кт Клиент.
-                     оплата/предоплата -> Кт Компания / Дт Клиент.
-    """
-
     permission_classes = [permissions.IsAuthenticated]
 
     def get(self, request, client_id, *args, **kwargs):
         company = request.user.company
         client = get_object_or_404(Client, id=client_id, company=company)
 
-        source = (request.query_params.get("source") or "both").lower()  # both|sales|deals
+        source = (request.query_params.get("source") or "both").lower()
         currency = request.query_params.get("currency") or "KGS"
 
         s = request.query_params.get("start")
@@ -182,11 +172,9 @@ class ClientReconciliationClassicAPIView(APIView):
         start_dt = _aware(start_dt, end=False)
         end_dt = _aware(end_dt, end=True)
 
-        # ===== входящие обороты до периода
-        debit_before = Decimal("0.00")  # увеличивали долг клиента
-        credit_before = Decimal("0.00")  # погашали долг клиента
+        debit_before = Decimal("0.00")
+        credit_before = Decimal("0.00")
 
-        # продажи -> дебет
         if source in ("both", "sales"):
             sales_before = (
                 Sale.objects.filter(company=company, client=client, created_at__lt=start_dt).aggregate(s=Sum("total"))[
@@ -197,7 +185,6 @@ class ClientReconciliationClassicAPIView(APIView):
             debit_before += sales_before
 
         if ClientDeal and source in ("both", "deals"):
-            # сделки SALE/AMOUNT/DEBT -> дебет
             deals_before = (
                 ClientDeal.objects.filter(
                     company=company,
@@ -208,7 +195,6 @@ class ClientReconciliationClassicAPIView(APIView):
                 or Decimal("0")
             )
             debit_before += deals_before
-            # предоплаты -> кредит
             pre_before = (
                 ClientDeal.objects.filter(company=company, client=client, created_at__lt=start_dt).aggregate(
                     s=Sum("prepayment")
@@ -229,12 +215,10 @@ class ClientReconciliationClassicAPIView(APIView):
             )
             credit_before += inst_before
 
-        opening = q2(debit_before - credit_before)  # >0 клиент должен компании; <0 наоборот
+        opening = q2(debit_before - credit_before)
 
-        # ===== движения периода: собираем «универсальные» элементы
         entries: List[Dict] = []
 
-        # Продажа = рост долга -> Дт Компании / Кт Клиента
         if source in ("both", "sales"):
             for s in (
                 Sale.objects.filter(
@@ -257,7 +241,6 @@ class ClientReconciliationClassicAPIView(APIView):
                     )
 
         if ClientDeal and source in ("both", "deals"):
-            # Суммы сделок = рост долга
             for d in (
                 ClientDeal.objects.filter(
                     company=company,
@@ -279,7 +262,6 @@ class ClientReconciliationClassicAPIView(APIView):
                             b_credit=amt,
                         )
                     )
-            # Предоплата = погашение долга
             for d in (
                 ClientDeal.objects.filter(
                     company=company,
@@ -301,7 +283,6 @@ class ClientReconciliationClassicAPIView(APIView):
                     )
                 )
 
-        # Платежи по графику = погашение долга
         if DealInstallment and source in ("both", "deals"):
             for inst in (
                 DealInstallment.objects.filter(
@@ -329,7 +310,6 @@ class ClientReconciliationClassicAPIView(APIView):
 
         entries.sort(key=lambda x: x["date"])
 
-        # итоги оборотов по 4 колонкам
         totals = dict(
             a_debit=q2(sum(x["a_debit"] for x in entries) if entries else 0),
             a_credit=q2(sum(x["a_credit"] for x in entries) if entries else 0),
@@ -337,17 +317,13 @@ class ClientReconciliationClassicAPIView(APIView):
             b_credit=q2(sum(x["b_credit"] for x in entries) if entries else 0),
         )
 
-        # конечное сальдо (как «одностороннее»)
-        closing = q2(opening + totals["a_debit"] - totals["a_credit"])  # для стороны A; у B будет зеркально
-        # текстовая дата «на …» — следующий день после конца периода, как в примере
+        closing = q2(opening + totals["a_debit"] - totals["a_credit"])
         on_date = (end_dt + timedelta(days=1)).date()
 
-        # ===== PDF
         buf = io.BytesIO()
         p = canvas.Canvas(buf, pagesize=A4)
         W, H = A4
 
-        # шрифт
         try:
             FONT, BFONT = "DejaVu", "DejaVu-Bold"
             p.setFont(BFONT, 14)
@@ -355,7 +331,6 @@ class ClientReconciliationClassicAPIView(APIView):
             FONT, BFONT = "Helvetica", "Helvetica-Bold"
             p.setFont(BFONT, 14)
 
-        # заголовок
         p.drawCentredString(W / 2, H - 20 * mm, "АКТ СВЕРКИ ВЗАИМНЫХ РАСЧЁТОВ")
         p.setFont(FONT, 11)
         p.drawCentredString(
@@ -364,7 +339,6 @@ class ClientReconciliationClassicAPIView(APIView):
             f"Период: {start_dt.strftime('%d.%m.%Y')} — {end_dt.strftime('%d.%m.%Y')}   валюта сверки {currency}",
         )
 
-        # шапка сторон (крупные названия)
         company_name = getattr(company, "llc", None) or getattr(company, "name", str(company))
         client_name = client.llc or client.enterprise or client.full_name
 
@@ -408,7 +382,6 @@ class ClientReconciliationClassicAPIView(APIView):
             f"Тел.: {_safe(client.phone)}    E-mail: {_safe(client.email)}",
         )
 
-        # таблица: колонки как в образце
         y = H - 78 * mm
         p.setFont(BFONT, 9)
         p.drawString(20 * mm, y, "№")
@@ -425,9 +398,7 @@ class ClientReconciliationClassicAPIView(APIView):
         p.line(20 * mm, y - 1 * mm, 190 * mm, y - 1 * mm)
         y -= 6 * mm
 
-        # строка «Сальдо начальное»
         p.setFont(FONT, 9)
-        # расщепляем opening на 2 стороны
         a_dt = opening if opening > 0 else Decimal("0.00")
         a_kt = -opening if opening < 0 else Decimal("0.00")
         b_dt = a_kt
@@ -440,14 +411,12 @@ class ClientReconciliationClassicAPIView(APIView):
         p.drawRightString(181 * mm, y, fmt(b_kt))
         y -= 7 * mm
 
-        # строки движений, нумерация
         num = 0
         p.setFont(FONT, 9)
 
         def ensure_page_space(current_y: float) -> float:
             if current_y < 40 * mm:
                 p.showPage()
-                # повторить мини-шапку
                 try:
                     p.setFont(BFONT, 10)
                 except Exception:
@@ -472,13 +441,11 @@ class ClientReconciliationClassicAPIView(APIView):
             y = ensure_page_space(y)
             num += 1
             p.drawString(20 * mm, y, str(num))
-            # контент (2 строки макс, как в примере)
             desc = row["title"]
             line1 = desc[:52]
             line2 = desc[52:104] if len(desc) > 52 else ""
             p.drawString(28 * mm, y, line1)
 
-            # суммы по сторонам уже «зеркальные»
             p.drawRightString(115 * mm, y, fmt(row["a_debit"]))
             p.drawRightString(133 * mm, y, fmt(row["a_credit"]))
             p.drawRightString(163 * mm, y, fmt(row["b_debit"]))
@@ -489,7 +456,6 @@ class ClientReconciliationClassicAPIView(APIView):
                 p.drawString(28 * mm, y, line2)
                 y -= 6 * mm
 
-        # итоги оборотов (как в образце — по 4 колонкам)
         y -= 4 * mm
         p.line(20 * mm, y, 190 * mm, y)
         y -= 7 * mm
@@ -501,8 +467,6 @@ class ClientReconciliationClassicAPIView(APIView):
         p.drawRightString(181 * mm, y, fmt(totals["b_credit"]))
         y -= 10 * mm
 
-        # конечное сальдо — выводим фразу
-        # кто кому должен по итогам: если closing > 0, клиент должен компании; если < 0 — наоборот
         debtor, creditor, amount = None, None, abs(closing)
         if closing > 0:
             debtor = client_name
@@ -525,7 +489,6 @@ class ClientReconciliationClassicAPIView(APIView):
             p.drawString(20 * mm, y, "(Ноль сом 00 тыйын)")
         y -= 16 * mm
 
-        # подписи
         p.setFont(BFONT, 10)
         p.drawString(20 * mm, y, _safe(company_name))
         p.drawString(110 * mm, y, _safe(client_name))
@@ -554,11 +517,6 @@ class ClientReconciliationClassicAPIView(APIView):
 
 
 class SaleInvoiceDownloadAPIView(APIView):
-    """
-    GET /api/main/pos/sales/<uuid:pk>/invoice/
-    Скачивание PDF-накладной по продаже (А4).
-    """
-
     permission_classes = [permissions.IsAuthenticated]
 
     def get(self, request, pk, *args, **kwargs):
@@ -568,19 +526,16 @@ class SaleInvoiceDownloadAPIView(APIView):
             company=request.user.company,
         )
 
-        # присвоим сквозной номер, если ещё нет
         doc_no = ensure_sale_doc_number(sale)
 
         buffer = io.BytesIO()
-        p = canvas.Canvas(buffer, pagesize=(210 * mm, 297 * mm))  # A4
+        p = canvas.Canvas(buffer, pagesize=(210 * mm, 297 * mm))
 
-        # === Заголовок ===
         p.setFont("DejaVu-Bold", 14)
         p.drawCentredString(105 * mm, 280 * mm, f"НАКЛАДНАЯ № {doc_no}")
         p.setFont("DejaVu", 10)
         p.drawCentredString(105 * mm, 273 * mm, f"от {sale.created_at.strftime('%d.%m.%Y %H:%M')}")
 
-        # === Реквизиты сторон (две колонки) ===
         company = sale.company
         client = sale.client
 
@@ -620,7 +575,6 @@ class SaleInvoiceDownloadAPIView(APIView):
             p.drawString(x_right, y, right[i])
             y -= 6 * mm
 
-        # === Таблица товаров ===
         y -= 6 * mm
         p.setFont("DejaVu-Bold", 10)
         p.drawString(20 * mm, y, "Товар")
@@ -644,7 +598,6 @@ class SaleInvoiceDownloadAPIView(APIView):
                 y = 270 * mm
                 p.setFont("DejaVu", 10)
 
-        # === ИТОГ ===
         y -= 10
         p.setFont("DejaVu-Bold", 11)
         p.drawRightString(190 * mm, y, f"СУММА (без скидок): {fmt_money(sale.subtotal)}")
@@ -657,7 +610,6 @@ class SaleInvoiceDownloadAPIView(APIView):
             y -= 6 * mm
         p.drawRightString(190 * mm, y, f"ИТОГО К ОПЛАТЕ: {fmt_money(sale.total)}")
 
-        # === Подписи ===
         y -= 20
         p.setFont("DejaVu", 10)
         p.drawString(20 * mm, y, "Продавец: _____________")
@@ -691,24 +643,16 @@ class SaleReceiptDataAPIView(APIView):
 
 
 class SaleStartAPIView(CompanyBranchRestrictedMixin, APIView):
-    """
-    POST — создать/получить активную корзину для текущего пользователя.
-    Если найдено несколько активных — оставим самую свежую, остальные закроем.
-    + Опционально: принять скидку на итог (сумма) при старте.
-    """
     permission_classes = [permissions.IsAuthenticated]
 
     @transaction.atomic
     def post(self, request, *args, **kwargs):
         user = request.user
-        # компания либо из миксина, либо из юзера
         company = self._company() or user.company
-        # активный филиал (для сотрудника — его «жёсткий» филиал)
         branch = self._auto_branch()
 
         qs = Cart.objects.filter(company=company, user=user, status=Cart.Status.ACTIVE)
 
-        # если у Cart есть поле branch — фильтруем по нему
         if hasattr(Cart, "branch"):
             if branch is not None:
                 qs = qs.filter(branch=branch)
@@ -724,7 +668,6 @@ class SaleStartAPIView(CompanyBranchRestrictedMixin, APIView):
                 create_kwargs["branch"] = branch
             cart = Cart.objects.create(**create_kwargs)
         else:
-            # закрыть дубликаты, если есть
             extra_ids = list(qs.values_list("id", flat=True)[1:])
             if extra_ids:
                 Cart.objects.filter(id__in=extra_ids).update(
@@ -732,7 +675,6 @@ class SaleStartAPIView(CompanyBranchRestrictedMixin, APIView):
                     updated_at=timezone.now(),
                 )
 
-        # === НОВОЕ: суммовая скидка на весь заказ ===
         opts = StartCartOptionsSerializer(data=request.data)
         if opts.is_valid():
             order_disc = opts.validated_data.get("order_discount_total")
@@ -744,12 +686,7 @@ class SaleStartAPIView(CompanyBranchRestrictedMixin, APIView):
         return Response(SaleCartSerializer(cart).data, status=status.HTTP_201_CREATED)
 
 
-
 class CartDetailAPIView(generics.RetrieveAPIView):
-    """
-    GET /api/main/pos/carts/<uuid:pk>/ — получить корзину по id.
-    """
-
     serializer_class = SaleCartSerializer
     permission_classes = [permissions.IsAuthenticated]
 
@@ -758,10 +695,6 @@ class CartDetailAPIView(generics.RetrieveAPIView):
 
 
 class SaleScanAPIView(APIView):
-    """
-    POST — добавить товар по штрих-коду (сканер ПК).
-    """
-
     permission_classes = [permissions.IsAuthenticated]
 
     @transaction.atomic
@@ -787,7 +720,7 @@ class SaleScanAPIView(APIView):
             product=product,
             defaults={
                 "company": cart.company,
-                "branch": getattr(cart, "branch", None),  # ← NEW: подставляем branch
+                "branch": getattr(cart, "branch", None),
                 "quantity": qty,
                 "unit_price": product.price,
             },
@@ -801,11 +734,6 @@ class SaleScanAPIView(APIView):
 
 
 class SaleAddItemAPIView(APIView):
-    """
-    POST — ручное добавление товара после поиска.
-    Можно передать либо unit_price, либо discount_total (на всю строку).
-    """
-
     permission_classes = [permissions.IsAuthenticated]
 
     @transaction.atomic
@@ -826,32 +754,29 @@ class SaleAddItemAPIView(APIView):
         )
         qty = ser.validated_data["quantity"]
 
-        # --- Цена/скидка на строку ---
         unit_price = ser.validated_data.get("unit_price")
         line_discount = ser.validated_data.get("discount_total")
 
         if unit_price is None:
             if line_discount is not None:
-                # скидка на всю строку -> рассчитать цену за ед.
                 per_unit_disc = _q2(Decimal(line_discount) / Decimal(qty))
                 unit_price = _q2(Decimal(product.price) - per_unit_disc)
                 if unit_price < 0:
                     unit_price = Decimal("0.00")
             else:
-                unit_price = product.price  # без скидки
+                unit_price = product.price
 
         item, created = CartItem.objects.get_or_create(
             cart=cart,
             product=product,
             defaults={
                 "company": cart.company,
-                "branch": getattr(cart, "branch", None),  # ← NEW
+                "branch": getattr(cart, "branch", None),
                 "quantity": qty,
                 "unit_price": unit_price,
             },
         )
         if not created:
-            # объединяем строки: увеличиваем количество и обновляем цену на позицию
             item.quantity += qty
             item.unit_price = unit_price
             item.save(update_fields=["quantity", "unit_price"])
@@ -877,8 +802,16 @@ class SaleCheckoutAPIView(APIView):
         ser.is_valid(raise_exception=True)
         print_receipt = ser.validated_data["print_receipt"]
         client_id = ser.validated_data.get("client_id")
+        payment_method = ser.validated_data.get("payment_method") or Sale.PaymentMethod.CASH
+        cash_received = ser.validated_data.get("cash_received") or Decimal("0.00")
 
-        # отделы убрали, просто не передаём department
+        cart.recalc()
+        if payment_method == Sale.PaymentMethod.CASH and cash_received < cart.total:
+            return Response(
+                {"detail": "Сумма, полученная наличными, меньше суммы продажи."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
         try:
             sale = checkout_cart(cart)
         except NotEnoughStock as e:
@@ -886,12 +819,11 @@ class SaleCheckoutAPIView(APIView):
         except ValueError as e:
             return Response({"detail": str(e)}, status=status.HTTP_400_BAD_REQUEST)
 
-        # ← NEW: синхронизируем branch продажи с branch корзины
         if hasattr(sale, "branch_id") and hasattr(cart, "branch_id"):
             if sale.branch_id != cart.branch_id:
                 sale.branch_id = cart.branch_id
                 sale.save(update_fields=["branch"])
-        # ← NEW: на всякий случай обновим branch у позиций продажи, если null
+
         try:
             sale.items.filter(branch__isnull=True).update(branch=getattr(cart, "branch", None))
         except Exception:
@@ -902,6 +834,10 @@ class SaleCheckoutAPIView(APIView):
             sale.client = client
             sale.save(update_fields=["client"])
 
+        sale.payment_method = payment_method
+        sale.cash_received = cash_received
+        sale.save(update_fields=["payment_method", "cash_received"])
+
         payload = {
             "sale_id": str(sale.id),
             "status": sale.status,
@@ -911,6 +847,9 @@ class SaleCheckoutAPIView(APIView):
             "total": fmt_money(sale.total),
             "client": str(sale.client_id) if sale.client_id else None,
             "client_name": getattr(sale.client, "full_name", None) if sale.client else None,
+            "payment_method": sale.payment_method,
+            "cash_received": fmt_money(sale.cash_received),
+            "change": fmt_money(sale.change),
         }
 
         if print_receipt:
@@ -925,16 +864,17 @@ class SaleCheckoutAPIView(APIView):
             if sale.tax_total and sale.tax_total > 0:
                 totals.append(f"НАЛОГ: {fmt_money(sale.tax_total)}")
             totals.append(f"ИТОГО: {fmt_money(sale.total)}")
+            if sale.payment_method == Sale.PaymentMethod.CASH:
+                totals.append(f"ПОЛУЧЕНО НАЛИЧНЫМИ: {fmt_money(sale.cash_received)}")
+                totals.append(f"СДАЧА: {fmt_money(sale.change)}")
+            else:
+                totals.append("ОПЛАТА ПЕРЕВОДОМ")
             payload["receipt_text"] = "ЧЕК\n" + "\n".join(lines) + "\n" + "\n".join(totals)
 
         return Response(payload, status=status.HTTP_201_CREATED)
 
 
 class SaleMobileScannerTokenAPIView(APIView):
-    """
-    POST — выдать токен для телефона как сканера.
-    """
-
     permission_classes = [permissions.IsAuthenticated]
 
     def post(self, request, pk, *args, **kwargs):
@@ -949,10 +889,6 @@ class SaleMobileScannerTokenAPIView(APIView):
 
 
 class ProductFindByBarcodeAPIView(APIView):
-    """
-    GET — поиск товара по штрих-коду (строгий, 0 или 1 запись).
-    """
-
     permission_classes = [permissions.IsAuthenticated]
 
     def get(self, request, *args, **kwargs):
@@ -975,10 +911,6 @@ class ProductFindByBarcodeAPIView(APIView):
 
 
 class MobileScannerIngestAPIView(APIView):
-    """
-    POST — телефон отправляет штрих-код в корзину по токену.
-    """
-
     permission_classes = [permissions.AllowAny]
 
     @transaction.atomic
@@ -1005,7 +937,7 @@ class MobileScannerIngestAPIView(APIView):
             product=product,
             defaults={
                 "company": cart.company,
-                "branch": getattr(cart, "branch", None),  # ← NEW
+                "branch": getattr(cart, "branch", None),
                 "quantity": qty,
                 "unit_price": product.price,
             },
@@ -1019,11 +951,6 @@ class MobileScannerIngestAPIView(APIView):
 
 
 class SaleListAPIView(CompanyBranchRestrictedMixin, generics.ListAPIView):
-    """
-    GET /api/main/pos/sales/?status=&start=&end=&user=
-    Возвращает список продаж по компании/филиалу согласно CompanyBranchRestrictedMixin.
-    """
-
     serializer_class = SaleListSerializer
     queryset = Sale.objects.select_related("user").all()
     filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
@@ -1033,10 +960,8 @@ class SaleListAPIView(CompanyBranchRestrictedMixin, generics.ListAPIView):
     ordering = ("-created_at",)
 
     def get_queryset(self):
-        # базовый скоуп по company/branch — доверяем миксину
         qs = super().get_queryset()
 
-        # Фильтры по дате (поддерживаются YYYY-MM-DD и ISO datetime)
         start = self.request.query_params.get("start")
         end = self.request.query_params.get("end")
         if start:
@@ -1054,21 +979,10 @@ class SaleListAPIView(CompanyBranchRestrictedMixin, generics.ListAPIView):
 
 
 class SaleRetrieveAPIView(CompanyBranchRestrictedMixin, generics.RetrieveUpdateDestroyAPIView):
-    """
-    GET    /api/main/pos/sales/<uuid:pk>/  — детальная продажа с позициями
-    PATCH  /api/main/pos/sales/<uuid:pk>/  — обновить статус
-    PUT    /api/main/pos/sales/<uuid:pk>/  — обновить статус
-    DELETE /api/main/pos/sales/<uuid:pk>/  — удалить
-
-    Доступ ограничен company/branch по CompanyBranchRestrictedMixin.
-    """
-
     permission_classes = [permissions.IsAuthenticated]
     lookup_field = "id"
     lookup_url_kwarg = "pk"
 
-    # базовый queryset с нужными join/prefetch, без фильтра по company —
-    # company/branch накладывает миксин
     queryset = (
         Sale.objects.select_related("user")
         .prefetch_related("items__product")
@@ -1076,7 +990,6 @@ class SaleRetrieveAPIView(CompanyBranchRestrictedMixin, generics.RetrieveUpdateD
     )
 
     def get_serializer_class(self):
-        # На запись — узкий сериализатор только для статуса
         if self.request.method in ("PUT", "PATCH"):
             return SaleStatusUpdateSerializer
         return SaleDetailSerializer
@@ -1092,7 +1005,6 @@ class SaleBulkDeleteAPIView(CompanyBranchRestrictedMixin, APIView):
         if not isinstance(ids, list) or not ids:
             return Response({"detail": "Укажите непустой список 'ids'."}, status=400)
 
-        # валидируем UUID (чтобы не падать на мусорных значениях)
         valid_ids, invalid_ids = [], []
         for x in ids:
             try:
@@ -1103,11 +1015,9 @@ class SaleBulkDeleteAPIView(CompanyBranchRestrictedMixin, APIView):
         if not valid_ids and invalid_ids:
             return Response({"detail": "Нет валидных UUID.", "invalid_ids": invalid_ids}, status=400)
 
-        # базовый queryset по id, дальше сузим по company/branch через миксин
         base_qs = Sale.objects.filter(id__in=valid_ids)
         base_qs = self._filter_qs_company_branch(base_qs)
 
-        # делим на разрешённые к удалению и запрещённые (например, оплаченные)
         if allow_paid:
             deletable_qs = base_qs
             not_allowed_ids = []
@@ -1117,16 +1027,14 @@ class SaleBulkDeleteAPIView(CompanyBranchRestrictedMixin, APIView):
                 base_qs.filter(status=Sale.Status.PAID).values_list("id", flat=True)
             )
 
-        # найдены в принципе?
         found_ids = set(str(sid) for sid in base_qs.values_list("id", flat=True))
         not_found_ids = [str(x) for x in valid_ids if str(x) not in found_ids]
 
-        # удаляем (с каскадом по items)
         deleted_count, _ = deletable_qs.delete()
 
         return Response(
             {
-                "deleted": deleted_count,  # количество удалённых объектов (включая каскад может быть > продаж)
+                "deleted": deleted_count,
                 "not_found": not_found_ids + invalid_ids,
                 "not_allowed": [str(x) for x in not_allowed_ids],
             },
@@ -1135,19 +1043,6 @@ class SaleBulkDeleteAPIView(CompanyBranchRestrictedMixin, APIView):
 
 
 class CartItemUpdateDestroyAPIView(APIView):
-    """
-    PATCH /api/main/pos/carts/<uuid:cart_id>/items/<uuid:item_id>/
-      body: {"quantity": <int >= 0>}
-      quantity == 0 -> удалить позицию
-      quantity > 0  -> установить новое количество
-
-    DELETE /api/main/pos/carts/<uuid:cart_id>/items/<uuid:item_id>/
-      удалить позицию
-
-    Примечание:
-      item_id может быть как ID позиции корзины, так и ID товара.
-    """
-
     permission_classes = [permissions.IsAuthenticated]
 
     def _get_active_cart(self, request, cart_id):
@@ -1159,12 +1054,10 @@ class CartItemUpdateDestroyAPIView(APIView):
         )
 
     def _get_item_in_cart(self, cart, item_or_product_id):
-        # 1) пробуем как ID позиции корзины
         item = CartItem.objects.filter(cart=cart, id=item_or_product_id).first()
         if item:
             return item
 
-        # 2) пробуем как ID товара (некоторые фронты шлют product_id)
         item = CartItem.objects.filter(cart=cart, product_id=item_or_product_id).first()
         if item:
             return item
@@ -1176,7 +1069,6 @@ class CartItemUpdateDestroyAPIView(APIView):
         cart = self._get_active_cart(request, cart_id)
         item = self._get_item_in_cart(cart, item_id)
 
-        # Валидация количества
         try:
             qty = int(request.data.get("quantity"))
         except (TypeError, ValueError):
@@ -1205,12 +1097,6 @@ class CartItemUpdateDestroyAPIView(APIView):
 
 
 class SaleAddCustomItemAPIView(APIView):
-    """
-    POST /api/main/pos/carts/<uuid:pk>/custom-item/
-    body: {"name": "Диагностика", "price": "500.00", "quantity": 1}
-    Добавляет кастомную позицию (без product) в корзину.
-    """
-
     permission_classes = [permissions.IsAuthenticated]
 
     @transaction.atomic
@@ -1228,10 +1114,9 @@ class SaleAddCustomItemAPIView(APIView):
         if not name:
             return Response({"name": "Название не может быть пустым."}, status=400)
 
-        price = _q2(ser.validated_data["price"])  # нормализуем деньги
+        price = _q2(ser.validated_data["price"])
         qty = ser.validated_data.get("quantity", 1)
 
-        # (опция) объединять одинаковые кастомные позиции
         item = CartItem.objects.filter(
             cart=cart,
             product__isnull=True,
@@ -1245,7 +1130,7 @@ class SaleAddCustomItemAPIView(APIView):
         else:
             CartItem.objects.create(
                 company=cart.company,
-                branch=getattr(cart, "branch", None),  # ← NEW: сохраняем branch у кастомной позиции
+                branch=getattr(cart, "branch", None),
                 cart=cart,
                 product=None,
                 custom_name=name,
@@ -1253,12 +1138,10 @@ class SaleAddCustomItemAPIView(APIView):
                 quantity=qty,
             )
 
-        # cart.recalc() не нужен: CartItem.save() уже пересчитает
-
         return Response(SaleCartSerializer(cart).data, status=status.HTTP_201_CREATED)
 
 
-OWNER_ROLES = {Roles.OWNER}  # можно расширить по желанию
+OWNER_ROLES = {Roles.OWNER}
 
 
 def _is_owner(user) -> bool:
@@ -1387,10 +1270,6 @@ def _allocate_agent_sale(*, company, agent, sale: Sale):
             raise ValidationError({"detail": "Внутренняя ошибка распределения остатков по передачам."})
 
 
-# ВЬЮХИ: корзина/скан/добавление/кастом/чекаут
-# ===========================
-
-
 class AgentCartStartAPIView(CompanyBranchRestrictedMixin, APIView):
     permission_classes = [permissions.IsAuthenticated]
 
@@ -1398,13 +1277,11 @@ class AgentCartStartAPIView(CompanyBranchRestrictedMixin, APIView):
     def post(self, request, *args, **kwargs):
         user = request.user
 
-        # компания и филиал — как в SaleStartAPIView
         company = self._company() or user.company
         branch = self._auto_branch()
 
         qs = Cart.objects.filter(company=company, user=user, status=Cart.Status.ACTIVE)
 
-        # если у Cart есть поле branch — фильтруем по текущему филиалу
         if hasattr(Cart, "branch"):
             if branch is not None:
                 qs = qs.filter(branch=branch)
@@ -1426,10 +1303,8 @@ class AgentCartStartAPIView(CompanyBranchRestrictedMixin, APIView):
                     status=Cart.Status.CHECKED_OUT,
                 )
 
-        # зафиксируем агента (если owner передал)
         _ = _resolve_acting_agent(request, cart, allow_owner_override=True)
 
-        # опциональная суммовая скидка
         opts = StartCartOptionsSerializer(data=request.data)
         if opts.is_valid():
             order_disc = opts.validated_data.get("order_discount_total")
@@ -1624,8 +1499,8 @@ class AgentSaleCheckoutAPIView(CompanyBranchRestrictedMixin, APIView):
         ser.is_valid(raise_exception=True)
         print_receipt = ser.validated_data["print_receipt"]
         client_id = ser.validated_data.get("client_id")
-
-        # отделы убрали, блок с department_id больше не нужен
+        payment_method = ser.validated_data.get("payment_method") or Sale.PaymentMethod.CASH
+        cash_received = ser.validated_data.get("cash_received") or Decimal("0.00")
 
         if client_id:
             client = get_object_or_404(Client, id=client_id, company=request.user.company)
@@ -1635,20 +1510,26 @@ class AgentSaleCheckoutAPIView(CompanyBranchRestrictedMixin, APIView):
 
         acting_agent = _resolve_acting_agent(request, cart, allow_owner_override=True)
 
+        cart.recalc()
+        if payment_method == Sale.PaymentMethod.CASH and cash_received < cart.total:
+            raise ValidationError({"detail": "Сумма, полученная наличными, меньше суммы продажи."})
+
         try:
             sale = checkout_agent_cart(cart, agent=acting_agent)
         except Exception as e:
             transaction.set_rollback(True)
             raise ValidationError({"detail": str(e)})
 
-        # привести branch продажи к branch корзины, если нужно
         if hasattr(sale, "branch_id") and hasattr(cart, "branch_id") and sale.branch_id != cart.branch_id:
             sale.branch_id = cart.branch_id
             sale.save(update_fields=["branch"])
 
-        # ⛔️ ВАЖНО: избегаем дублей — если аллокации уже есть для sale, повторно не распределяем
         if not AgentSaleAllocation.objects.filter(sale=sale).exists():
             _allocate_agent_sale(company=cart.company, agent=acting_agent, sale=sale)
+
+        sale.payment_method = payment_method
+        sale.cash_received = cash_received
+        sale.save(update_fields=["payment_method", "cash_received"])
 
         payload = {
             "sale_id": str(sale.id),
@@ -1659,6 +1540,9 @@ class AgentSaleCheckoutAPIView(CompanyBranchRestrictedMixin, APIView):
             "total": f"{sale.total:.2f}",
             "client": str(sale.client_id) if sale.client_id else None,
             "client_name": getattr(sale.client, "full_name", None) if sale.client else None,
+            "payment_method": sale.payment_method,
+            "cash_received": f"{sale.cash_received:.2f}",
+            "change": f"{sale.change:.2f}",
         }
 
         if print_receipt:
@@ -1673,25 +1557,17 @@ class AgentSaleCheckoutAPIView(CompanyBranchRestrictedMixin, APIView):
             if sale.tax_total and sale.tax_total > 0:
                 totals.append(f"НАЛОГ: {sale.tax_total:.2f}")
             totals.append(f"ИТОГО: {sale.total:.2f}")
+            if sale.payment_method == Sale.PaymentMethod.CASH:
+                totals.append(f"ПОЛУЧЕНО НАЛИЧНЫМИ: {sale.cash_received:.2f}")
+                totals.append(f"СДАЧА: {sale.change:.2f}")
+            else:
+                totals.append("ОПЛАТА ПЕРЕВОДОМ")
             payload["receipt_text"] = "ЧЕК\n" + "\n".join(lines) + "\n" + "\n".join(totals)
 
         return Response(payload, status=status.HTTP_201_CREATED)
 
 
 class AgentCartItemUpdateDestroyAPIView(APIView):
-    """
-    PATCH /api/main/agents/me/carts/<uuid:cart_id>/items/<uuid:item_id>/
-      body: {"quantity": <int >= 0>}
-      quantity == 0 -> удалить позицию
-      quantity > 0  -> установить новое количество
-
-    DELETE /api/main/agents/me/carts/<uuid:cart_id>/items/<uuid:item_id>/
-      удалить позицию
-
-    Примечание:
-      item_id может быть как ID позиции корзины, так и ID товара.
-    """
-
     permission_classes = [permissions.IsAuthenticated]
 
     def _get_active_cart(self, request, cart_id):
@@ -1704,11 +1580,9 @@ class AgentCartItemUpdateDestroyAPIView(APIView):
         )
 
     def _get_item_in_cart(self, cart, item_or_product_id):
-        # 1) как ID позиции корзины
         item = CartItem.objects.filter(cart=cart, id=item_or_product_id).first()
         if item:
             return item
-        # 2) как ID товара
         item = CartItem.objects.filter(cart=cart, product_id=item_or_product_id).first()
         if item:
             return item

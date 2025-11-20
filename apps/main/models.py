@@ -902,23 +902,62 @@ class Sale(models.Model):
         PAID = "paid", "Оплачен"
         CANCELED = "canceled", "Отменён"
 
+    class PaymentMethod(models.TextChoices):
+        CASH = "cash", "Наличные"
+        TRANSFER = "transfer", "Перевод"
+
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False, verbose_name="ID")
     company = models.ForeignKey(Company, on_delete=models.CASCADE, related_name="sales", verbose_name="Компания")
     branch = models.ForeignKey(
         Branch, on_delete=models.CASCADE, related_name='crm_sales',
         null=True, blank=True, db_index=True, verbose_name='Филиал'
     )
-    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.SET_NULL,
-                             null=True, blank=True, related_name="sales", verbose_name="Пользователь")
-    client = models.ForeignKey("Client", on_delete=models.SET_NULL, null=True, blank=True,
-                               related_name="sale", verbose_name="Клиент")
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL,
+        null=True, blank=True, related_name="sales", verbose_name="Пользователь"
+    )
+    client = models.ForeignKey(
+        "Client", on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="sale", verbose_name="Клиент"
+    )
 
-    status = models.CharField(max_length=16, choices=Status.choices, default=Status.NEW, verbose_name="Статус")
+    status = models.CharField(
+        max_length=16,
+        choices=Status.choices,
+        default=Status.NEW,
+        verbose_name="Статус",
+    )
     doc_number = models.PositiveIntegerField("Номер документа", null=True, blank=True, db_index=True)
-    subtotal = models.DecimalField(max_digits=12, decimal_places=2, default=0, verbose_name="Сумма без скидок и налогов")
-    discount_total = models.DecimalField(max_digits=12, decimal_places=2, default=0, verbose_name="Сумма скидки")
-    tax_total = models.DecimalField(max_digits=12, decimal_places=2, default=0, verbose_name="Сумма налога")
-    total = models.DecimalField(max_digits=12, decimal_places=2, default=0, verbose_name="Итого")
+
+    subtotal = models.DecimalField(
+        max_digits=12, decimal_places=2, default=0,
+        verbose_name="Сумма без скидок и налогов",
+    )
+    discount_total = models.DecimalField(
+        max_digits=12, decimal_places=2, default=0,
+        verbose_name="Сумма скидки",
+    )
+    tax_total = models.DecimalField(
+        max_digits=12, decimal_places=2, default=0,
+        verbose_name="Сумма налога",
+    )
+    total = models.DecimalField(
+        max_digits=12, decimal_places=2, default=0,
+        verbose_name="Итого",
+    )
+
+    payment_method = models.CharField(
+        max_length=16,
+        choices=PaymentMethod.choices,
+        default=PaymentMethod.CASH,
+        verbose_name="Способ оплаты",
+    )
+    cash_received = models.DecimalField(
+        max_digits=12,
+        decimal_places=2,
+        default=Decimal("0.00"),
+        verbose_name="Принято наличными",
+    )
 
     created_at = models.DateTimeField(auto_now_add=True, verbose_name="Создано")
     paid_at = models.DateTimeField(null=True, blank=True, verbose_name="Дата оплаты")
@@ -946,12 +985,43 @@ class Sale(models.Model):
         if self.branch_id and self.client_id and self.client.branch_id not in (None, self.branch_id):
             raise ValidationError({"client": "Клиент другого филиала."})
 
-    def mark_paid(self):
+    @property
+    def change(self) -> Decimal:
+        """
+        Сдача: только для наличных, не уходим в минус.
+        """
+        if self.payment_method != self.PaymentMethod.CASH:
+            return Decimal("0.00")
+
+        total = self.total or Decimal("0.00")
+        received = self.cash_received or Decimal("0.00")
+
+        diff = received - total
+        if diff <= 0:
+            return Decimal("0.00")
+
+        return diff.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+    def mark_paid(self, payment_method=None, cash_received=None):
+        """
+        Универсальный метод: помечаем продажу как оплаченную,
+        заодно фиксируем способ оплаты и сумму, принятую наличными.
+        """
+        if payment_method is not None:
+            self.payment_method = payment_method
+
+        if cash_received is not None:
+            # если метод не наличные — на всякий случай обнулим
+            if self.payment_method == self.PaymentMethod.CASH:
+                self.cash_received = cash_received
+            else:
+                self.cash_received = Decimal("0.00")
+
         self.status = Sale.Status.PAID
         self.paid_at = timezone.now()
-        self.save(update_fields=["status", "paid_at"])
-
-
+        self.save(update_fields=["status", "paid_at", "payment_method", "cash_received"])
+        
+        
 class SaleItem(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False, verbose_name="ID")
     company = models.ForeignKey(Company, on_delete=models.CASCADE, related_name="sale_items", verbose_name="Компания")
