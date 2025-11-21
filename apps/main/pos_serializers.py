@@ -255,8 +255,7 @@ class SaleListSerializer(serializers.ModelSerializer):
     change = serializers.DecimalField(
         max_digits=12,
         decimal_places=2,
-        read_only=True,
-        source="change",   # <-- ВАЖНО
+        read_only=True,   # <-- ВАЖНО
     )
 
     class Meta:
@@ -322,8 +321,7 @@ class SaleDetailSerializer(serializers.ModelSerializer):
     change = serializers.DecimalField(
         max_digits=12,
         decimal_places=2,
-        read_only=True,
-        source="change",   # <-- ВАЖНО
+        read_only=True,   # <-- ВАЖНО
     )
 
     class Meta:
