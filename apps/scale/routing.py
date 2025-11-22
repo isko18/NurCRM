@@ -1,7 +1,8 @@
-# проектный routing.py (например, в config/routing.py)
-from django.urls import path
-from apps.scale.consumers import AgentScaleConsumer
+# apps/scales/routing.py
+from django.urls import re_path
+from .consumers import AgentScaleConsumer  # см. ниже
 
 websocket_urlpatterns = [
-    path("ws/agents/<uuid:agent_id>/", AgentScaleConsumer.as_asgi()),
+    # простой URL без ID, всё будем определять по токену ?token=
+    re_path(r"ws/agents/?$", AgentScaleConsumer.as_asgi()),
 ]

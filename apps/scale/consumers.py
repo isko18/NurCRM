@@ -1,79 +1,60 @@
-# apps/main/consumers.py
+# apps/scales/consumers.py
 import json
+from channels.generic.websocket import AsyncWebsocketConsumer
 from urllib.parse import parse_qs
+from django.contrib.auth import get_user_model
+from apps.main.models import Company  # подставь свою модель компании, если она в другом месте
 
-from channels.generic.websocket import AsyncJsonWebsocketConsumer
-
-# если будешь проверять токен через БД:
-from asgiref.sync import sync_to_async
-from apps.users.models import User  # или твоя модель агента / юзера
+User = get_user_model()
 
 
-@sync_to_async
-def _check_scale_token(agent_id, token: str) -> bool:
-    """
-    Тут сам реши, где хранится токен:
-    - user.scale_token
-    - company.scale_token и связь user->company
-    - отдельная модель ScaleToken
-    """
-    try:
-        user = User.objects.get(id=agent_id)
-    except User.DoesNotExist:
-        return False
-
-    # пример: токен на компании
-    company = getattr(user, "company", None) or getattr(user, "owned_company", None)
-    if not company:
-        return False
-
-    # допустим, у компании поле scale_api_token
-    return bool(company.scale_api_token and company.scale_api_token == token)
-
-
-class AgentScaleConsumer(AsyncJsonWebsocketConsumer):
-    """
-    ws://app.nurcrm.kg/ws/agents/<uuid:agent_id>/?token=<scale_token>
-
-    Сервер шлёт в группу события типа:
-      {"type": "send_plu_batch", "payload": {...}}
-    А сюда прилетает send_plu_batch(...)
-    """
-
+class AgentScaleConsumer(AsyncWebsocketConsumer):
     async def connect(self):
-        self.agent_id = str(self.scope["url_route"]["kwargs"]["agent_id"])
+        """
+        Ждём ?token=<scale_api_token> в query string.
+        По нему ищем company и вешаемся на группу этой компании.
+        """
+        qs = self.scope.get("query_string", b"").decode()
+        params = parse_qs(qs)
+        token_list = params.get("token") or []
+        token = token_list[0] if token_list else None
 
-        # достаём token из query params
-        query_string = self.scope.get("query_string", b"").decode()
-        params = parse_qs(query_string)
-        token = (params.get("token") or [None])[0]
-
-        if not token or not await _check_scale_token(self.agent_id, token):
-            # не пускаем
+        if not token:
             await self.close(code=4001)
             return
 
-        self.group_name = f"agent_scale_{self.agent_id}"
+        # ищем компанию по токену
+        try:
+            company = Company.objects.get(scale_token=token)
+        except Company.DoesNotExist:
+            await self.close(code=4002)
+            return
 
+        self.company_id = str(company.id)
+        self.group_name = f"scale_company_{self.company_id}"
+
+        # подписываемся на группу компании
         await self.channel_layer.group_add(self.group_name, self.channel_name)
         await self.accept()
+
+        # можно отправить привет
+        await self.send_json({"type": "hello", "company_id": self.company_id})
 
     async def disconnect(self, code):
         if hasattr(self, "group_name"):
             await self.channel_layer.group_discard(self.group_name, self.channel_name)
 
-    async def receive_json(self, content, **kwargs):
+    async def receive(self, text_data=None, bytes_data=None):
         """
-        Агент может что-то присылать обратно (например, статус заливки),
-        но это опционально. Пока можно игнорировать.
+        Агента можно слушать, но пока просто логика-заглушка.
         """
-        # print("from agent:", content)
-        pass
+        # если нужно что-то особенное от агента — парси тут
+        return
 
-    # ====== обработчик групповго события от Django ======
-    async def send_plu_batch(self, event):
+    # метод для отправки данных из group_send
+    async def send_scale_payload(self, event):
         """
-        event = {"type": "send_plu_batch", "payload": {...}}
+        event: {"type": "send_scale_payload", "payload": {...}}
         """
         payload = event.get("payload") or {}
-        await self.send_json(payload)
+        await self.send(json.dumps(payload))
