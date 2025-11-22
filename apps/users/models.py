@@ -5,6 +5,7 @@ import uuid
 from apps.users.managers import UserManager
 from datetime import timedelta
 from django.utils import timezone
+import secrets
 
 
 class Feature(models.Model):
@@ -280,6 +281,30 @@ class Company(models.Model):
     can_view_whatsapp = models.BooleanField(default=False, verbose_name='Доступ к whatsapp')
     can_view_instagram = models.BooleanField(default=False, verbose_name='Доступ к instagram')
     can_view_telegram = models.BooleanField(default=False, verbose_name='Доступ к telegram')
+    
+    
+    scale_api_token = models.CharField(
+        max_length=64,
+        unique=True,
+        blank=True,
+        null=True,
+        verbose_name="Токен для весов/агентов",
+        help_text="Постоянный токен, которым подключаются весы к API",
+    )
+
+    def ensure_scale_token(self):
+        """Генерируем токен один раз, если его ещё нет."""
+        if not self.scale_api_token:
+            self.scale_api_token = secrets.token_hex(32)
+            self.save(update_fields=["scale_api_token"])
+        return self.scale_api_token
+
+    def save(self, *args, **kwargs):
+        if not self.start_date:
+            self.start_date = timezone.now()
+        if not self.end_date and self.start_date:
+            self.end_date = self.start_date + timedelta(days=10)
+        super().save(*args, **kwargs)
 
     def save(self, *args, **kwargs):
         if not self.start_date:
@@ -423,3 +448,43 @@ class BranchMembership(models.Model):
                 raise ValidationError({"user": "У сотрудника не указана компания."})
             if self.user.company_id != self.branch.company_id:
                 raise ValidationError("Сотрудник и филиал принадлежат разным компаниям.")
+
+
+
+class ScaleDevice(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False, verbose_name="ID")
+
+    company = models.ForeignKey(
+        Company,
+        on_delete=models.CASCADE,
+        related_name="scales",
+        verbose_name="Компания",
+    )
+
+    branch = models.ForeignKey(
+        Branch,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="scales",
+        verbose_name="Филиал",
+    )
+
+    name = models.CharField(max_length=128, verbose_name="Название весов")
+    ip_address = models.GenericIPAddressField(blank=True, null=True, verbose_name="IP агента/весов")
+
+    is_active = models.BooleanField(default=True, verbose_name="Активны")
+    last_seen_at = models.DateTimeField(blank=True, null=True, verbose_name="Последнее подключение")
+    products_last_sync_at = models.DateTimeField(blank=True, null=True, verbose_name="Последняя загрузка товаров")
+
+    created_at = models.DateTimeField(auto_now_add=True, verbose_name="Создано")
+    updated_at = models.DateTimeField(auto_now=True, verbose_name="Обновлено")
+
+    class Meta:
+        verbose_name = "Весы"
+        verbose_name_plural = "Весы"
+
+    def __str__(self):
+        if self.branch:
+            return f"{self.company.name} / {self.branch.name} / {self.name}"
+        return f"{self.company.name} / {self.name}"

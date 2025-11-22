@@ -587,6 +587,10 @@ class Product(models.Model):
         ACCEPTED = "accepted", "Принят"
         REJECTED = "rejected", "Отказ"
 
+    class ScaleType(models.TextChoices):
+        PIECE  = "piece",  "Штучный"
+        WEIGHT = "weight", "Весовой"
+
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
 
     company = models.ForeignKey(Company, on_delete=models.CASCADE, related_name='products', verbose_name='Компания')
@@ -608,6 +612,22 @@ class Product(models.Model):
     purchase_price = models.DecimalField(max_digits=10, decimal_places=2, default=0, verbose_name="Закупочная цена")
     price = models.DecimalField(max_digits=10, decimal_places=2, default=0, verbose_name="Розничная цена")
 
+    # <<< НОВОЕ: поля для весов >>>
+    plu = models.PositiveIntegerField(
+        blank=True,
+        null=True,
+        verbose_name="ПЛУ",
+        help_text="Номер ПЛУ для весов (можно не заполнять)",
+    )
+    scale_type = models.CharField(
+        max_length=16,
+        choices=ScaleType.choices,
+        default=ScaleType.PIECE,
+        verbose_name="Тип товара для весов",
+        help_text="Штучный или весовой товар",
+    )
+    # <<< КОНЕЦ НОВОГО >>>
+
     status = models.CharField("Статус", max_length=16, choices=Status.choices, db_index=True, blank=True, null=True)
     stock = models.BooleanField(default=False, verbose_name="Акции", null=True, blank=True)
     item_make = models.ManyToManyField("ItemMake", blank=True, related_name="products", verbose_name="Единицы товара")
@@ -623,7 +643,7 @@ class Product(models.Model):
         indexes = [
             models.Index(fields=['company', 'status']),
             models.Index(fields=['company', 'branch', 'status']),
-
+            models.Index(fields=['company', 'plu']),  # чтобы по ПЛУ быстро находить
         ]
 
     def __str__(self):

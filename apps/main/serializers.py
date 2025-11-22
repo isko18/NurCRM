@@ -550,6 +550,10 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
             "created_by", "created_by_name",
             "created_at", "updated_at",
             "images",
+
+            # === НОВЫЕ ПОЛЯ ДЛЯ ВЕСОВ ===
+            "plu",
+            "scale_type",
         ]
         read_only_fields = [
             "id", "created_at", "updated_at",
@@ -563,6 +567,7 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
             "price": {"required": False, "default": 0},
             "purchase_price": {"required": False, "default": 0},
             "quantity": {"required": False, "default": 0},
+            # plu и scale_type остаются обычными полями (не read_only)
         }
 
     def __init__(self, *args, **kwargs):
@@ -644,6 +649,10 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
         category_name = (validated_data.pop("category_name", "") or "").strip()
         status_value = self._normalize_status(validated_data.pop("status", None))
 
+        # НОВОЕ: забираем plu и scale_type из validated_data (если пришли)
+        plu = validated_data.pop("plu", None)
+        scale_type = validated_data.pop("scale_type", Product.ScaleType.PIECE)
+
         date_value = dj_tz.now()
 
         barcode = validated_data.get("barcode")
@@ -672,6 +681,10 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
             status=status_value,
             date=date_value,
             created_by=self._user(),
+
+            # НОВОЕ:
+            plu=plu,
+            scale_type=scale_type,
         )
 
         if item_make_data:
@@ -700,12 +713,14 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
         # фиксируем branch из контекста
         instance.branch = branch
 
-        # разрешённые простые поля (name тоже можно менять)
-        for field in ("name", "barcode", "quantity", "price", "purchase_price", "client"):
+        # разрешённые простые поля (добавили plu и scale_type)
+        for field in ("name", "barcode", "quantity", "price", "purchase_price", "client", "plu", "scale_type"):
             if field in validated_data:
                 setattr(instance, field, validated_data[field])
+
         if "stock" in validated_data:
             instance.stock = validated_data["stock"]
+
         # статус с нормализацией
         if "status" in validated_data:
             instance.status = self._normalize_status(validated_data["status"])
@@ -733,7 +748,6 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
 
         instance.save()
         return instance
-
 
 # ===========================
 # Review / Notification

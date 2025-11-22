@@ -23,11 +23,17 @@ from .views import (
     BranchListCreateAPIView
 )
 
+from apps.users.scale_views import ScaleProductListAPIView, get_scale_api_token, register_scale
+
 urlpatterns = [
     # 🔐 Авторизация / регистрация
     path('auth/register/', RegisterAPIView.as_view(), name='user-register'),
     path('auth/login/', CustomTokenObtainPairView.as_view(), name='token_obtain_pair'),
     path('auth/refresh/', TokenRefreshView.as_view(), name='token_refresh'),
+    
+    path("scales/token/", get_scale_api_token, name="scale-api-token"),
+    path("scales/register/", register_scale, name="scale-api-register"),
+    
 
     # ⚙️ Настройки
     path('settings/change-password/', ChangePasswordView.as_view(), name='change-password'),
@@ -56,4 +62,7 @@ urlpatterns = [
     path('roles/', RoleListAPIView.as_view(), name='role-list'),  # системные + кастомные
     path('roles/custom/', CustomRoleCreateAPIView.as_view(), name='custom-role-create'),
     path('roles/custom/<uuid:pk>/', CustomRoleDetailAPIView.as_view(), name='custom-role-detail'),
+    
+    
+    path("products/scale/", ScaleProductListAPIView.as_view(), name="products-scale-list"),
 ]
