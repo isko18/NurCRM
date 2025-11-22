@@ -1,46 +1,65 @@
 # apps/instagram/ws_jwt.py
 from urllib.parse import parse_qs
-
-from django.contrib.auth.models import AnonymousUser
-from channels.auth import AuthMiddlewareStack
 from channels.db import database_sync_to_async
-
-try:
-    from rest_framework_simplejwt.authentication import JWTAuthentication
-except Exception:
-    JWTAuthentication = None
-
-
-@database_sync_to_async
-def _user_from_token(token: str):
-    if not JWTAuthentication or not token:
-        return AnonymousUser()
-    try:
-        auth = JWTAuthentication()
-        validated = auth.get_validated_token(token)
-        return auth.get_user(validated)
-    except Exception:
-        return AnonymousUser()
-
+from django.contrib.auth.models import AnonymousUser
+from rest_framework_simplejwt.tokens import AccessToken
 
 class JWTAuthMiddleware:
     """
-    ASGI3-совместимый middleware для Channels 4:
-    ожидает JWT в querystring: ?token=<JWT>
+    Прокидывает user в scope["user"] по JWT в query string (?token=...) или заголовках.
+    Для /ws/agents/ — JWT не нужен, пропускаем как есть.
     """
+
     def __init__(self, inner):
         self.inner = inner
 
     async def __call__(self, scope, receive, send):
-        # Клонируем scope, чтобы не мутировать внешний
-        scope = dict(scope)
-        qs = parse_qs(scope.get("query_string", b"").decode())
-        token = (qs.get("token") or [None])[0]
-        scope["user"] = await _user_from_token(token)
+        path = scope.get("path", "") or ""
+
+        # 🔥 ВАЖНО: для /ws/agents/ ничего не проверяем, сразу пропускаем
+        if path.startswith("/ws/agents/"):
+            return await self.inner(scope, receive, send)
+
+        # --- дальше твоя старая логика для инсты/чата ---
+        query_string = scope.get("query_string", b"").decode()
+        params = parse_qs(query_string)
+
+        token = None
+
+        # пример: ws://.../ws/instagram/?token=<JWT>
+        if "token" in params:
+            token = params["token"][0]
+
+        # либо из headers (если так делаешь с фронта)
+        if not token:
+            for name, value in scope.get("headers", []):
+                if name.lower() == b"authorization":
+                    # "Bearer xxx"
+                    auth_val = value.decode()
+                    if auth_val.lower().startswith("bearer "):
+                        token = auth_val.split(" ", 1)[1].strip()
+                    break
+
+        if not token:
+            scope["user"] = AnonymousUser()
+            return await self.inner(scope, receive, send)
+
+        try:
+            access = AccessToken(token)
+            user_id = access["user_id"]
+        except Exception:
+            scope["user"] = AnonymousUser()
+            return await self.inner(scope, receive, send)
+
+        from django.contrib.auth import get_user_model
+        User = get_user_model()
+
+        @database_sync_to_async
+        def get_user(uid):
+            try:
+                return User.objects.get(id=uid)
+            except User.DoesNotExist:
+                return AnonymousUser()
+
+        scope["user"] = await get_user(user_id)
         return await self.inner(scope, receive, send)
-
-
-def JWTAuthMiddlewareStack(inner):
-    # Сочетаем с cookie-AuthMiddlewareStack, чтобы не ломать поведение,
-    # если вдруг нет токена — будут работать сессии через cookies.
-    return JWTAuthMiddleware(AuthMiddlewareStack(inner))
