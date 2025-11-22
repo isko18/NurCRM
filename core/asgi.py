@@ -8,11 +8,14 @@ django_asgi_app = get_asgi_application()
 
 from channels.routing import ProtocolTypeRouter, URLRouter
 from channels.security.websocket import AllowedHostsOriginValidator
-from apps.scale import ws_routing  # см. выше
+from apps.instagram.ws_jwt import JWTAuthMiddleware
+from apps.instagram import routing as ig_routing
 
 application = ProtocolTypeRouter({
-    "http": ASGIStaticFilesHandler(django_asgi_app),
+    "http": ASGIStaticFilesHandler(django_asgi_app),  # <-- добавляем статику
     "websocket": AllowedHostsOriginValidator(
-        URLRouter(ws_routing.websocket_urlpatterns)
+        JWTAuthMiddleware(
+            URLRouter(ig_routing.websocket_urlpatterns)
+        )
     ),
 })
