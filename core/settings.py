@@ -55,7 +55,7 @@ INSTALLED_APPS = [
     'apps.whatsapp',
     'apps.instagram',
     'apps.storehouse',
-    "apps.instagram_mcp",
+    # "apps.instagram_mcp",
     'apps.consalting',
 ]
 
@@ -186,7 +186,7 @@ REST_FRAMEWORK = {
         'rest_framework.filters.SearchFilter',
     ],
     'DEFAULT_PAGINATION_CLASS': 'rest_framework.pagination.PageNumberPagination',
-    'PAGE_SIZE': 1000,
+    'PAGE_SIZE': 100,
     'DEFAULT_PARSER_CLASSES': [
         'rest_framework.parsers.JSONParser',
         'rest_framework.parsers.FormParser',
