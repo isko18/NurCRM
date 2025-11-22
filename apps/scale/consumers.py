@@ -25,7 +25,7 @@ class AgentScaleConsumer(AsyncWebsocketConsumer):
 
         # ищем компанию по токену
         try:
-            company = Company.objects.get(scale_token=token)
+            company = Company.objects.get(scale_api_token=token)
         except Company.DoesNotExist:
             await self.close(code=4002)
             return
