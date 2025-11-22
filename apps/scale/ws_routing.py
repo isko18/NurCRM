@@ -1,13 +1,7 @@
-# apps/ws_routing.py
+# apps/scale/ws_routing.py
 from django.urls import re_path
-from apps.instagram.consumers import DirectConsumer  # реальный класс
-from apps.instagram.ws_jwt import JWTAuthMiddleware
-from apps.scale.consumers import AgentScaleConsumer
+from .consumers import AgentScaleConsumer  # наш consumer для агентов/весов
 
 websocket_urlpatterns = [
-    # Инстаграм: под JWT
-    re_path(r"ws/instagram/?$", JWTAuthMiddleware(DirectConsumer.as_asgi())),
-
-    # Агенты: без JWT, свой токен в query string
-    re_path(r"ws/agents/?$", AgentScaleConsumer.as_asgi()),
+    re_path(r"^ws/agents/$", AgentScaleConsumer.as_asgi()),
 ]
