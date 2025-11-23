@@ -104,6 +104,23 @@ def send_products_to_scale(request):
       "product_ids": [1, 2, 3],   # необязательно
       "plu_start": 1              # с какого ПЛУ начинать нумерацию (по умолчанию 1)
     }
+
+    В ответе:
+    {
+      "sent": 3,
+      "items": [
+        {
+          "product_uuid": "...",
+          "plu_number": 1,
+          "code": 1,
+          "name": "Картошка",
+          "price": 40.0,
+          "shelf_life_days": 0,
+          "is_piece": false
+        },
+        ...
+      ]
+    }
     """
     user = request.user
 
@@ -141,8 +158,7 @@ def send_products_to_scale(request):
         scale_type = (getattr(p, "scale_type", "") or "").lower()
         is_piece = scale_type in ("piece", "штучный", "штучно")
 
-        # Пытаемся взять числовой код, если он есть (например p.scale_code).
-        # Если нет — используем текущий ПЛУ.
+        # числовой код для весов
         scale_code = getattr(p, "scale_code", None)
         try:
             code = int(scale_code) if scale_code is not None else cur_plu
@@ -151,14 +167,13 @@ def send_products_to_scale(request):
 
         items.append(
             {
-                # ВАЖНО: только строки/числа/булевые – НИКАКИХ UUID-объектов
-                "product_uuid": str(p.id),   # UUID → строка, если нужно отследить товар
-                "plu_number": cur_plu,       # int
-                "code": code,                # int, для весов
-                "name": name,                # str
-                "price": price,              # float
-                "shelf_life_days": shelf,    # int
-                "is_piece": is_piece,        # bool
+                "product_uuid": str(p.id),   # UUID -> str
+                "plu_number": cur_plu,
+                "code": code,
+                "name": name,
+                "price": price,
+                "shelf_life_days": shelf,
+                "is_piece": is_piece,
             }
         )
         cur_plu += 1
@@ -170,12 +185,12 @@ def send_products_to_scale(request):
         )
 
     channel_layer = get_channel_layer()
-    group_name = f"scale_company_{company.id}"  # здесь уже строка, UUID внутри f"" ок
+    group_name = f"scale_company_{company.id}"
 
     async_to_sync(channel_layer.group_send)(
         group_name,
         {
-            "type": "send_scale_payload",  # handler в AgentScaleConsumer
+            "type": "send_scale_payload",
             "payload": {
                 "action": "plu_batch",
                 "items": items,
@@ -183,4 +198,11 @@ def send_products_to_scale(request):
         },
     )
 
-    return Response({"sent": len(items)}, status=status.HTTP_200_OK)
+    # ВОТ ЗДЕСЬ возвращаем те же items
+    return Response(
+        {
+            "sent": len(items),
+            "items": items,
+        },
+        status=status.HTTP_200_OK,
+    )
