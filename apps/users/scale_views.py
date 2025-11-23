@@ -1,5 +1,5 @@
 # apps/scales/views.py
-from rest_framework.decorators import api_view, permission_classes
+from rest_framework.decorators import api_view, permission_classes, authentication_classes
 from rest_framework.permissions import IsAuthenticated
 from rest_framework import generics, filters
 from rest_framework.response import Response
@@ -11,23 +11,27 @@ from apps.main.models import Product
 from apps.main.serializers import ProductSerializer
 from apps.main.views import CompanyBranchRestrictedMixin
 from apps.utils import product_images_prefetch
+from rest_framework.permissions import IsAuthenticated, AllowAny
+from apps.scale.auth import ScaleAgentAuthentication 
 
 @api_view(["GET"])
 @permission_classes([IsAuthenticated])
 def get_scale_api_token(request):
     """
-    Вернуть постоянный токен для весов/агентов этой компании.
-    Если ещё не сгенерирован — создать.
+    Вернуть постоянный токен для весового агента текущей компании.
     """
     user = request.user
 
-    # как у тебя устроено: либо user.company, либо owned_company
+    # Подставь свою логику связи user -> company
     company = getattr(user, "company", None) or getattr(user, "owned_company", None)
-    if not company:
-        return Response({"detail": "Пользователь не привязан к компании."},
-                        status=status.HTTP_400_BAD_REQUEST)
 
-    token = company.ensure_scale_token()
+    if not company:
+        return Response(
+            {"detail": "Пользователь не привязан к компании."},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    token = company.ensure_scale_api_token()
     return Response({"scale_api_token": token})
 
 
@@ -65,33 +69,23 @@ def register_scale(request):
     
     
     
-class ScaleProductListAPIView(CompanyBranchRestrictedMixin, generics.ListAPIView):
+@api_view(["GET"])
+@authentication_classes([ScaleAgentAuthentication])
+@permission_classes([AllowAny])  # потому что аутентификация своя
+def scale_products_list(request):
     """
-    GET /api/main/products/scale/
-
-    Отдаёт только товары, которые используются с весами:
-    - scale_type = piece (штучные)
-    - scale_type = weight (весовые)
+    Вернуть список только весовых/штучных товаров для компании агента.
+    Авторизация: Authorization: Bearer <scale_api_token>
     """
-    serializer_class = ProductSerializer
-    filter_backends = [filters.SearchFilter, filters.OrderingFilter]
-    search_fields = ["name", "barcode"]
-    ordering_fields = ["created_at", "updated_at", "price", "name"]
-    ordering = ["name"]
+    company = getattr(request.user, "company", None)
+    if not company:
+        return Response([])
 
-    def get_queryset(self):
-        qs = (
-            Product.objects
-            .select_related("brand", "category", "client")
-            .prefetch_related("item_make", product_images_prefetch)
-            .all()
-        )
-        qs = self._filter_qs_company_branch(qs)
+    qs = Product.objects.filter(
+        company=company,
+        scale_type__in=["weight", "piece"],
+        is_active=True,
+    ).order_by("name")
 
-        # только весовые и штучные
-        return qs.filter(
-            scale_type__in=[
-                Product.ScaleType.PIECE,
-                Product.ScaleType.WEIGHT,
-            ]
-        )
+    data = ProductSerializer(qs, many=True).data
+    return Response(data)

@@ -11,9 +11,9 @@ from channels.security.websocket import AllowedHostsOriginValidator
 
 from apps.instagram.ws_jwt import JWTAuthMiddleware
 from apps.instagram import routing as ig_routing
-from apps.scale import ws_routing as scale_ws_routing  # <-- добавили
+from apps.scale import ws_routing as scale_ws_routing
 
-# объединяем все ws-маршруты в один список
+# один общий список всех WS-маршрутов
 websocket_urlpatterns = (
     ig_routing.websocket_urlpatterns
     + scale_ws_routing.websocket_urlpatterns
