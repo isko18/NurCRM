@@ -97,11 +97,12 @@ def scale_products_list(request):
 @permission_classes([IsAuthenticated])
 def send_products_to_scale(request):
     """
-    Отправить список товаров в подключённые scale-агенты компании.
-    Body:
+    Отправить товары в подключённые scale-агенты компании.
+
+    Body (product_ids можно не передавать):
     {
-      "product_ids": [1, 2, 3],
-      "plu_start": 1          # с какого ПЛУ начинать нумерацию
+      "product_ids": [1, 2, 3],   # необязательно
+      "plu_start": 1              # с какого ПЛУ начинать нумерацию (по умолчанию 1)
     }
     """
     user = request.user
@@ -114,25 +115,28 @@ def send_products_to_scale(request):
         )
 
     product_ids = request.data.get("product_ids") or []
-    if not product_ids:
-        return Response(
-            {"detail": "Нужно передать product_ids"},
-            status=status.HTTP_400_BAD_REQUEST,
-        )
-
     plu_start = int(request.data.get("plu_start") or 1)
 
-    qs = (
-        Product.objects
-        .filter(company=company, id__in=product_ids)
-        .order_by("id")
-    )
+    # ---- выбираем товары ----
+    qs = Product.objects.filter(company=company)
+
+    if product_ids:
+        # если передали список id — фильтруем по нему
+        qs = qs.filter(id__in=product_ids)
+
+    # фильтр только весовых/штучных
+    # подстрой под свои значения scale_type, если другие
+    qs = qs.filter(
+        scale_type__in=[
+            "weight", "piece",
+            "весовой", "штучный", "штучно",
+        ]
+    ).order_by("id")
 
     items = []
     cur_plu = plu_start
 
     for p in qs:
-        # подстрой под свои поля
         name = p.name or ""
         price = float(p.price or 0)
         shelf = int(getattr(p, "shelf_life_days", 0) or 0)
@@ -143,7 +147,7 @@ def send_products_to_scale(request):
         items.append(
             {
                 "plu_number": cur_plu,
-                "code": p.id,          # можно свой артикул/штрихкод
+                "code": p.id,  # можешь заменить на свой артикул/штрихкод
                 "name": name,
                 "price": price,
                 "shelf_life_days": shelf,
@@ -153,16 +157,19 @@ def send_products_to_scale(request):
         cur_plu += 1
 
     if not items:
-        return Response({"detail": "Нет товаров для отправки"}, status=400)
+        return Response(
+            {"detail": "Нет весовых/штучных товаров для отправки"},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
 
-    # шлём в группу компании
+    # ---- шлём в группу компании ----
     channel_layer = get_channel_layer()
     group_name = f"scale_company_{company.id}"
 
     async_to_sync(channel_layer.group_send)(
         group_name,
         {
-            "type": "send_scale_payload",   # имя handler'а в Consumer
+            "type": "send_scale_payload",  # handler в AgentScaleConsumer
             "payload": {
                 "action": "plu_batch",
                 "items": items,
@@ -170,4 +177,4 @@ def send_products_to_scale(request):
         },
     )
 
-    return Response({"sent": len(items)}, status=200)
+    return Response({"sent": len(items)}, status=status.HTTP_200_OK)
