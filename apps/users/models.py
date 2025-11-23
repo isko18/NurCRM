@@ -292,10 +292,13 @@ class Company(models.Model):
         help_text="Постоянный токен, которым подключаются весы к API",
     )
 
-    def ensure_scale_token(self):
-        """Генерируем токен один раз, если его ещё нет."""
+    def ensure_scale_api_token(self):
+        """
+        Возвращает постоянный токен для компании.
+        Создаёт новый, если отсутствует.
+        """
         if not self.scale_api_token:
-            self.scale_api_token = secrets.token_hex(32)
+            self.scale_api_token = str(uuid.uuid4())
             self.save(update_fields=["scale_api_token"])
         return self.scale_api_token
 
