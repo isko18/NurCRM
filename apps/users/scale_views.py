@@ -117,15 +117,12 @@ def send_products_to_scale(request):
     product_ids = request.data.get("product_ids") or []
     plu_start = int(request.data.get("plu_start") or 1)
 
-    # ---- выбираем товары ----
     qs = Product.objects.filter(company=company)
 
     if product_ids:
-        # если передали список id — фильтруем по нему
         qs = qs.filter(id__in=product_ids)
 
-    # фильтр только весовых/штучных
-    # подстрой под свои значения scale_type, если другие
+    # только весовые/штучные
     qs = qs.filter(
         scale_type__in=[
             "weight", "piece",
@@ -144,14 +141,24 @@ def send_products_to_scale(request):
         scale_type = (getattr(p, "scale_type", "") or "").lower()
         is_piece = scale_type in ("piece", "штучный", "штучно")
 
+        # Пытаемся взять числовой код, если он есть (например p.scale_code).
+        # Если нет — используем текущий ПЛУ.
+        scale_code = getattr(p, "scale_code", None)
+        try:
+            code = int(scale_code) if scale_code is not None else cur_plu
+        except (TypeError, ValueError):
+            code = cur_plu
+
         items.append(
             {
-                "plu_number": cur_plu,
-                "code": p.id,  # можешь заменить на свой артикул/штрихкод
-                "name": name,
-                "price": price,
-                "shelf_life_days": shelf,
-                "is_piece": is_piece,
+                # ВАЖНО: только строки/числа/булевые – НИКАКИХ UUID-объектов
+                "product_uuid": str(p.id),   # UUID → строка, если нужно отследить товар
+                "plu_number": cur_plu,       # int
+                "code": code,                # int, для весов
+                "name": name,                # str
+                "price": price,              # float
+                "shelf_life_days": shelf,    # int
+                "is_piece": is_piece,        # bool
             }
         )
         cur_plu += 1
@@ -162,9 +169,8 @@ def send_products_to_scale(request):
             status=status.HTTP_400_BAD_REQUEST,
         )
 
-    # ---- шлём в группу компании ----
     channel_layer = get_channel_layer()
-    group_name = f"scale_company_{company.id}"
+    group_name = f"scale_company_{company.id}"  # здесь уже строка, UUID внутри f"" ок
 
     async_to_sync(channel_layer.group_send)(
         group_name,
