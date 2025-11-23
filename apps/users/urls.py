@@ -23,7 +23,7 @@ from .views import (
     BranchListCreateAPIView
 )
 
-from apps.users.scale_views import scale_products_list, get_scale_api_token, register_scale
+from apps.users.scale_views import send_products_to_scale, get_scale_api_token, register_scale
 
 urlpatterns = [
     # 🔐 Авторизация / регистрация
@@ -64,5 +64,5 @@ urlpatterns = [
     path('roles/custom/<uuid:pk>/', CustomRoleDetailAPIView.as_view(), name='custom-role-detail'),
     
     
-    path("products/scale/", scale_products_list, name="scale-products-list"),
+    path("scales/send-products/", send_products_to_scale),
 ]

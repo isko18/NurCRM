@@ -13,6 +13,8 @@ from apps.main.views import CompanyBranchRestrictedMixin
 from apps.utils import product_images_prefetch
 from rest_framework.permissions import IsAuthenticated, AllowAny
 from apps.scale.auth import ScaleAgentAuthentication 
+from channels.layers import get_channel_layer
+from asgiref.sync import async_to_sync
 
 @api_view(["GET"])
 @permission_classes([IsAuthenticated])
@@ -89,3 +91,83 @@ def scale_products_list(request):
 
     data = ProductSerializer(qs, many=True).data
     return Response(data)
+
+
+@api_view(["POST"])
+@permission_classes([IsAuthenticated])
+def send_products_to_scale(request):
+    """
+    Отправить список товаров в подключённые scale-агенты компании.
+    Body:
+    {
+      "product_ids": [1, 2, 3],
+      "plu_start": 1          # с какого ПЛУ начинать нумерацию
+    }
+    """
+    user = request.user
+
+    company = getattr(user, "company", None) or getattr(user, "owned_company", None)
+    if not company:
+        return Response(
+            {"detail": "Пользователь не привязан к компании"},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    product_ids = request.data.get("product_ids") or []
+    if not product_ids:
+        return Response(
+            {"detail": "Нужно передать product_ids"},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    plu_start = int(request.data.get("plu_start") or 1)
+
+    qs = (
+        Product.objects
+        .filter(company=company, id__in=product_ids)
+        .order_by("id")
+    )
+
+    items = []
+    cur_plu = plu_start
+
+    for p in qs:
+        # подстрой под свои поля
+        name = p.name or ""
+        price = float(p.price or 0)
+        shelf = int(getattr(p, "shelf_life_days", 0) or 0)
+
+        scale_type = (getattr(p, "scale_type", "") or "").lower()
+        is_piece = scale_type in ("piece", "штучный", "штучно")
+
+        items.append(
+            {
+                "plu_number": cur_plu,
+                "code": p.id,          # можно свой артикул/штрихкод
+                "name": name,
+                "price": price,
+                "shelf_life_days": shelf,
+                "is_piece": is_piece,
+            }
+        )
+        cur_plu += 1
+
+    if not items:
+        return Response({"detail": "Нет товаров для отправки"}, status=400)
+
+    # шлём в группу компании
+    channel_layer = get_channel_layer()
+    group_name = f"scale_company_{company.id}"
+
+    async_to_sync(channel_layer.group_send)(
+        group_name,
+        {
+            "type": "send_scale_payload",   # имя handler'а в Consumer
+            "payload": {
+                "action": "plu_batch",
+                "items": items,
+            },
+        },
+    )
+
+    return Response({"sent": len(items)}, status=200)
