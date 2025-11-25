@@ -18,13 +18,16 @@ class LogisticsAdmin(admin.ModelAdmin):
         "status",
         "price_car",
         "price_service",
+        "arrival_date",   # 👈
         "created_at",
         "created_by",
     )
+
     list_filter = (
         "status",
         "company",
         "branch",
+        "arrival_date",   # 👈 опционально
         "created_at",
     )
     search_fields = (

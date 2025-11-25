@@ -14,8 +14,6 @@ from apps.main.serializers import (
 
 
 class LogisticsSerializer(serializers.ModelSerializer):
-    """Сериализатор для логистики с автоматической компанией/филиалом."""
-
     status_display = serializers.CharField(
         source="get_status_display",
         read_only=True,
@@ -33,6 +31,7 @@ class LogisticsSerializer(serializers.ModelSerializer):
             "description",
             "price_car",
             "price_service",
+            "arrival_date",      # 👈 сюда
             "status",
             "status_display",
             "created_at",
@@ -44,7 +43,6 @@ class LogisticsSerializer(serializers.ModelSerializer):
             "created_at",
             "updated_at",
         )
-
     # ------------------------------------------------------------------
     # === ДИНАМИЧЕСКИЕ queryset ДЛЯ ПОЛЕЙ (company / branch / client)
     # ------------------------------------------------------------------
