@@ -73,7 +73,6 @@ class Logistics(models.Model):
         verbose_name="Стоимость услуги",
     )
 
-    # 👉 Новое поле
     arrival_date = models.DateField(
         null=True,
         blank=True,
