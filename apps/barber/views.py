@@ -450,3 +450,36 @@ class PayoutRetrieveUpdateDestroyView(
     )
     serializer_class = PayoutSerializer
     permission_classes = [permissions.IsAuthenticated]
+    
+    
+
+class ServiceCategoryListCreateView(CompanyQuerysetMixin, generics.ListCreateAPIView):
+    """
+    GET  /api/barber/service-categories/      – список категорий (по компании/филиалу)
+    POST /api/barber/service-categories/      – создать категорию услуги
+    """
+    queryset = ServiceCategory.objects.all()
+    serializer_class = ServiceCategorySerializer
+    permission_classes = [permissions.IsAuthenticated]
+
+    filter_backends = [DjangoFilterBackend, SearchFilter, OrderingFilter]
+    filterset_fields = [
+        f.name for f in ServiceCategory._meta.get_fields() if not f.is_relation or f.many_to_one
+    ]
+    search_fields = ["name"]
+    ordering_fields = ["name", "is_active", "created_at"] if hasattr(ServiceCategory, "created_at") else ["name", "is_active"]
+    ordering = ["name"]
+
+
+class ServiceCategoryRetrieveUpdateDestroyView(
+    CompanyQuerysetMixin,
+    generics.RetrieveUpdateDestroyAPIView,
+):
+    """
+    GET    /api/barber/service-categories/<uuid:pk>/   – одна категория
+    PATCH  /api/barber/service-categories/<uuid:pk>/   – обновить
+    DELETE /api/barber/service-categories/<uuid:pk>/   – удалить
+    """
+    queryset = ServiceCategory.objects.all()
+    serializer_class = ServiceCategorySerializer
+    permission_classes = [permissions.IsAuthenticated]
