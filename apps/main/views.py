@@ -1073,7 +1073,13 @@ class ProductBrandRetrieveUpdateDestroyAPIView(CompanyBranchRestrictedMixin, gen
 # ===========================
 #  Product views
 # ===========================
+# apps/catalog/api_views.py (или где он у тебя лежит)
 class ProductByBarcodeAPIView(CompanyBranchRestrictedMixin, generics.RetrieveAPIView):
+    """
+    Поиск товара по:
+    1) обычному штрихкоду (Product.barcode)
+    2) весовому штрихкоду (13 цифр, внутри ПЛУ + вес)
+    """
     serializer_class = ProductSerializer
     lookup_field = "barcode"
 
@@ -1082,19 +1088,81 @@ class ProductByBarcodeAPIView(CompanyBranchRestrictedMixin, generics.RetrieveAPI
             Product.objects
             .select_related("brand", "category", "client")
             .prefetch_related("item_make", product_images_prefetch)
-            .all()
         )
         return self._filter_qs_company_branch(qs)
 
+    # ---------- парсер весового штрихкода ----------
+    def _parse_scale_barcode(self, barcode: str):
+        """
+        Ожидаемый формат 13-значного весового штрихкода:
+        PP CCCCC WWWWW K
+
+        - PP     : префикс (20/21/22/23 и т.п.)
+        - CCCCC  : ПЛУ товара (5 цифр)
+        - WWWWW  : вес в граммах (5 цифр, например 00312 -> 0.312 кг)
+        - K      : контрольная цифра (игнорируем)
+        """
+        if not barcode or len(barcode) != 13 or not barcode.isdigit():
+            return None
+
+        prefix = barcode[0:2]
+        # тут укажи все префиксы, которые у тебя настроены на весах
+        if prefix not in ("20", "21", "22", "23"):
+            return None
+
+        plu_digits = barcode[2:7]      # 5 цифр ПЛУ
+        weight_digits = barcode[7:12]  # 5 цифр веса в граммах
+
+        try:
+            plu_int = int(plu_digits)
+            weight_raw = int(weight_digits)
+        except ValueError:
+            return None
+
+        weight_kg = weight_raw / 1000.0
+
+        return {
+            "prefix": prefix,
+            "plu": plu_int,
+            "weight_raw": weight_raw,
+            "weight_kg": weight_kg,
+        }
+
     def get_object(self):
-        barcode = self.kwargs.get("barcode")
+        # берём штрихкод из URL
+        barcode = self.kwargs.get(self.lookup_field)
         if not barcode:
             raise NotFound(detail="Штрих-код не указан")
 
-        product = self.get_queryset().filter(barcode=barcode).first()
-        if not product:
+        qs = self.get_queryset()
+
+        # 1) пробуем найти обычный товар по полю barcode
+        product = qs.filter(barcode=barcode).first()
+        if product:
+            # обычный штрихкод — никаких данных от весов нет
+            self._scale_data = None
+            return product
+
+        # 2) пробуем распознать весовой штрихкод (с ПЛУ и весом)
+        parsed = self._parse_scale_barcode(barcode)
+        if not parsed:
             raise NotFound(detail="Товар с таким штрих-кодом не найден")
+
+        plu = parsed["plu"]
+
+        # ищем товар по ПЛУ в рамках компании/филиала (индекс по company + plu уже есть в модели)
+        product = qs.filter(plu=plu).first()
+        if not product:
+            raise NotFound(detail="Товар по ПЛУ из штрих-кода не найден")
+
+        # сохраним разобранные данные, чтобы сериалайзер посчитал weight_kg и total_price
+        self._scale_data = parsed
         return product
+
+    def get_serializer_context(self):
+        ctx = super().get_serializer_context()
+        ctx["scale_data"] = getattr(self, "_scale_data", None)
+        return ctx
 
 
 class ProductByGlobalBarcodeAPIView(CompanyBranchRestrictedMixin, generics.RetrieveAPIView):
