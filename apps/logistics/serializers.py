@@ -2,7 +2,9 @@
 
 from rest_framework import serializers
 from .models import Logistics
-from apps.users.models import Company, Branch, User, Client
+from apps.users.models import Company, Branch, User
+from apps.main.models import Client
+
 
 from apps.main.serializers import (
     _company_from_ctx,

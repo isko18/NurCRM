@@ -3,7 +3,8 @@
 from django.contrib import admin
 
 from .models import Logistics
-from apps.users.models import Company, Branch, Client
+from apps.users.models import Company, Branch
+from apps.main.models import Client
 from apps.main.views import _get_company  # там же, где и CompanyBranchRestrictedMixin
 
 

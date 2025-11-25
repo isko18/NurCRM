@@ -1,5 +1,6 @@
 from django.db import models
 from apps.users.models import Company, Branch, User
+from apps.main.models import Client
 import uuid
 
 
@@ -33,7 +34,7 @@ class Logistics(models.Model):
     )
 
     client = models.ForeignKey(
-        "Client",
+        Client,
         on_delete=models.SET_NULL,
         null=True,
         blank=True,
