@@ -2,9 +2,8 @@ from rest_framework import generics, permissions, status
 from rest_framework.response import Response
 from rest_framework.parsers import MultiPartParser, FormParser
 from rest_framework.exceptions import PermissionDenied
-from rest_framework.filters import SearchFilter, OrderingFilter  # NEW
+from rest_framework.filters import SearchFilter, OrderingFilter
 from django.db.models.deletion import ProtectedError
-from django.db.models import Q
 from django.db import IntegrityError
 from rest_framework.exceptions import ValidationError
 
@@ -12,17 +11,19 @@ from django_filters import rest_framework as filters
 from django_filters.rest_framework import DjangoFilterBackend
 
 from apps.users.models import Branch
-from .models import Service, Client, Appointment, Document, Folder
+from .models import Service, Client, Appointment, Document, Folder, ServiceCategory, Payout
 from .serializers import (
     ServiceSerializer,
     ClientSerializer,
     AppointmentSerializer,
     FolderSerializer,
     DocumentSerializer,
+    ServiceCategorySerializer,
+    PayoutSerializer
 )
 
 
-# ---- DocumentFilter без изменений ----
+# ---- DocumentFilter ----
 class DocumentFilter(filters.FilterSet):
     name = filters.CharFilter(lookup_expr="icontains")
     folder = filters.UUIDFilter(field_name="folder__id")
@@ -61,8 +62,6 @@ class CompanyQuerysetMixin:
       - company фиксируем;
       - branch НЕ трогаем (не переносим запись между филиалами случайно).
     """
-
-    # --- helpers ---
 
     def _user(self):
         return getattr(self.request, "user", None)
@@ -163,8 +162,6 @@ class CompanyQuerysetMixin:
         setattr(request, "branch", None)
         return None
 
-    # --- queryset / save hooks ---
-
     def get_queryset(self):
         if getattr(self, "swagger_fake_view", False):
             return self.queryset.none()
@@ -179,9 +176,7 @@ class CompanyQuerysetMixin:
         if self._model_has_field("branch"):
             active_branch = self._active_branch()  # None или Branch
             if active_branch is not None:
-                # только записи этого филиала
                 qs = qs.filter(branch=active_branch)
-            # если active_branch is None — не фильтруем по branch (вся компания)
 
         return qs
 
@@ -195,20 +190,37 @@ class CompanyQuerysetMixin:
         if self._model_has_field("branch"):
             active_branch = self._active_branch()
             if active_branch is not None:
-                # если у юзера есть активный филиал — жёстко пишем его
                 kwargs["branch"] = active_branch
-            # если филиала нет — branch не трогаем, решает сериализатор/валидатор
 
         serializer.save(**kwargs)
 
     def perform_update(self, serializer):
-        """
-        company фиксируем, branch не трогаем (чтобы случайно не перенести запись между филиалами).
-        """
         company = self._user_company()
         if not company:
             raise PermissionDenied("У пользователя не задана компания.")
         serializer.save(company=company)
+
+
+# ==== ServiceCategory ====
+class ServiceCategoryListCreateView(CompanyQuerysetMixin, generics.ListCreateAPIView):
+    queryset = ServiceCategory.objects.all()
+    serializer_class = ServiceCategorySerializer
+    permission_classes = [permissions.IsAuthenticated]
+    filter_backends = [DjangoFilterBackend, SearchFilter, OrderingFilter]
+    filterset_fields = [
+        f.name for f in ServiceCategory._meta.get_fields() if not f.is_relation or f.many_to_one
+    ]
+    search_fields = ["name"]
+    ordering_fields = ["name", "is_active"]
+    ordering = ["name"]
+
+
+class ServiceCategoryRetrieveUpdateDestroyView(
+    CompanyQuerysetMixin, generics.RetrieveUpdateDestroyAPIView
+):
+    queryset = ServiceCategory.objects.all()
+    serializer_class = ServiceCategorySerializer
+    permission_classes = [permissions.IsAuthenticated]
 
 
 # ==== Service ====
@@ -216,13 +228,14 @@ class ServiceListCreateView(CompanyQuerysetMixin, generics.ListCreateAPIView):
     queryset = Service.objects.all()
     serializer_class = ServiceSerializer
     permission_classes = [permissions.IsAuthenticated]
-    filter_backends = [DjangoFilterBackend, SearchFilter, OrderingFilter]  # NEW
+    filter_backends = [DjangoFilterBackend, SearchFilter, OrderingFilter]
     filterset_fields = [
         f.name for f in Service._meta.get_fields() if not f.is_relation or f.many_to_one
     ]
-    search_fields = ["name", "category"]  # NEW
-    ordering_fields = ["name", "price", "is_active"]  # NEW
-    ordering = ["name"]  # NEW
+    # category → теперь FK → ищем по названию категории
+    search_fields = ["name", "category__name"]
+    ordering_fields = ["name", "price", "is_active"]
+    ordering = ["name"]
 
     def create(self, request, *args, **kwargs):
         try:
@@ -250,13 +263,13 @@ class ClientListCreateView(CompanyQuerysetMixin, generics.ListCreateAPIView):
     queryset = Client.objects.all()
     serializer_class = ClientSerializer
     permission_classes = [permissions.IsAuthenticated]
-    filter_backends = [DjangoFilterBackend, SearchFilter, OrderingFilter]  # NEW
+    filter_backends = [DjangoFilterBackend, SearchFilter, OrderingFilter]
     filterset_fields = [
         f.name for f in Client._meta.get_fields() if not f.is_relation or f.many_to_one
     ]
-    search_fields = ["full_name", "phone", "email", "notes"]  # NEW
-    ordering_fields = ["full_name", "created_at", "status"]  # NEW
-    ordering = ["-created_at"]  # NEW
+    search_fields = ["full_name", "phone", "email", "notes"]
+    ordering_fields = ["full_name", "created_at", "status"]
+    ordering = ["-created_at"]
 
 
 class ClientRetrieveUpdateDestroyView(
@@ -319,13 +332,18 @@ class AppointmentListCreateView(CompanyQuerysetMixin, generics.ListCreateAPIView
     )
     serializer_class = AppointmentSerializer
     permission_classes = [permissions.IsAuthenticated]
-    filter_backends = [DjangoFilterBackend, SearchFilter, OrderingFilter]  # NEW
+    filter_backends = [DjangoFilterBackend, SearchFilter, OrderingFilter]
     filterset_fields = [
         f.name for f in Appointment._meta.get_fields() if not f.is_relation or f.many_to_one
     ]
-    search_fields = ["client__full_name", "barber__first_name", "barber__last_name", "comment"]  # NEW
-    ordering_fields = ["start_at", "end_at", "status", "created_at"]  # NEW
-    ordering = ["-start_at"]  # NEW
+    search_fields = [
+        "client__full_name",
+        "barber__first_name",
+        "barber__last_name",
+        "comment",
+    ]
+    ordering_fields = ["start_at", "end_at", "status", "created_at"]
+    ordering = ["-start_at"]
 
 
 class AppointmentRetrieveUpdateDestroyView(
@@ -346,12 +364,12 @@ class FolderListCreateView(CompanyQuerysetMixin, generics.ListCreateAPIView):
     queryset = Folder.objects.select_related("parent").all()
     serializer_class = FolderSerializer
     permission_classes = [permissions.IsAuthenticated]
-    filter_backends = [DjangoFilterBackend, SearchFilter, OrderingFilter]  # NEW
+    filter_backends = [DjangoFilterBackend, SearchFilter, OrderingFilter]
     filterset_fields = [
         f.name for f in Folder._meta.get_fields() if not f.is_relation or f.many_to_one
     ]
-    search_fields = ["name", "parent__name"]  # NEW
-    ordering_fields = ["name"]  # NEW
+    search_fields = ["name", "parent__name"]
+    ordering_fields = ["name"]
     ordering = ["name"]
 
 
@@ -369,11 +387,11 @@ class DocumentListCreateView(CompanyQuerysetMixin, generics.ListCreateAPIView):
     serializer_class = DocumentSerializer
     permission_classes = [permissions.IsAuthenticated]
     parser_classes = [MultiPartParser, FormParser]
-    filter_backends = [DjangoFilterBackend, SearchFilter, OrderingFilter]  # NEW
+    filter_backends = [DjangoFilterBackend, SearchFilter, OrderingFilter]
     filterset_class = DocumentFilter
-    search_fields = ["name", "folder__name", "file"]  # NEW
-    ordering_fields = ["name", "created_at", "updated_at"]  # NEW
-    ordering = ["name"]  # NEW
+    search_fields = ["name", "folder__name", "file"]
+    ordering_fields = ["name", "created_at", "updated_at"]
+    ordering = ["name"]
 
 
 class DocumentRetrieveUpdateDestroyView(
@@ -383,3 +401,52 @@ class DocumentRetrieveUpdateDestroyView(
     serializer_class = DocumentSerializer
     permission_classes = [permissions.IsAuthenticated]
     parser_classes = [MultiPartParser, FormParser]
+
+
+
+class PayoutListCreateView(CompanyQuerysetMixin, generics.ListCreateAPIView):
+    """
+    GET  /api/barber/payouts/        – список выплат (по компании/филиалу, с фильтрами)
+    POST /api/barber/payouts/        – создать выплату + авторасчёт суммы
+    """
+
+    queryset = (
+        Payout.objects
+        .select_related("company", "branch", "barber")
+        .all()
+    )
+    serializer_class = PayoutSerializer
+    permission_classes = [permissions.IsAuthenticated]
+
+    filter_backends = [DjangoFilterBackend, SearchFilter, OrderingFilter]
+    filterset_fields = [
+        f.name for f in Payout._meta.get_fields() if not f.is_relation or f.many_to_one
+    ]
+    search_fields = [
+        "period",
+        "comment",
+        "barber__first_name",
+        "barber__last_name",
+        "barber__email",
+    ]
+    ordering_fields = ["created_at", "period", "payout_amount"]
+    ordering = ["-created_at"]
+
+
+class PayoutRetrieveUpdateDestroyView(
+    CompanyQuerysetMixin,
+    generics.RetrieveUpdateDestroyAPIView,
+):
+    """
+    GET    /api/barber/payouts/<uuid:pk>/   – одна выплата
+    PATCH  /api/barber/payouts/<uuid:pk>/   – изменить (например, комментарий/ставку)
+    DELETE /api/barber/payouts/<uuid:pk>/   – удалить
+    """
+
+    queryset = (
+        Payout.objects
+        .select_related("company", "branch", "barber")
+        .all()
+    )
+    serializer_class = PayoutSerializer
+    permission_classes = [permissions.IsAuthenticated]

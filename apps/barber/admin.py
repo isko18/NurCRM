@@ -4,8 +4,13 @@ from django.utils.html import format_html
 from django.db.models import Q
 
 from .models import (
-    BarberProfile, Service, Client, Appointment,
-    Folder, Document,
+    BarberProfile,
+    Service,
+    Client,
+    Appointment,
+    Folder,
+    Document,
+    ServiceCategory,   # 👈 добавили
 )
 
 
@@ -20,7 +25,6 @@ class CompanyScopedAdmin(admin.ModelAdmin):
     ограничивает выпадающие списки по компании/филиалу.
     """
 
-    # динамически добавляем created_at/updated_at в readonly, если они есть в модели
     def get_readonly_fields(self, request, obj=None):
         ro = list(super().get_readonly_fields(request, obj))
         fields = {f.name for f in self.model._meta.fields}
@@ -131,15 +135,24 @@ class BarberProfileAdmin(CompanyScopedAdmin):
     list_filter = ("is_active",)
     search_fields = ("full_name", "phone", "extra_phone")
     ordering = ("full_name",)
-    autocomplete_fields = ()  # при необходимости
+    autocomplete_fields = ()
+
+
+# ===== ServiceCategory =====
+@admin.register(ServiceCategory)
+class ServiceCategoryAdmin(CompanyScopedAdmin):
+    list_display = ("name", "is_active", "branch", "company")
+    list_filter = ("is_active",)
+    search_fields = ("name",)
+    ordering = ("name",)
 
 
 # ===== Service =====
 @admin.register(Service)
 class ServiceAdmin(CompanyScopedAdmin):
-    list_display = ("name", "price", "is_active", "branch", "company")
-    list_filter = ("is_active",)  # branch/company добавятся для суперюзера автоматически
-    search_fields = ("name",)
+    list_display = ("name", "category", "price", "is_active", "branch", "company")
+    list_filter = ("is_active", "category")  # branch/company добавятся для суперюзера автоматически
+    search_fields = ("name", "category__name")
     ordering = ("name",)
 
 
@@ -155,7 +168,18 @@ class ClientAdmin(CompanyScopedAdmin):
 # ===== Appointment =====
 @admin.register(Appointment)
 class AppointmentAdmin(CompanyScopedAdmin):
-    list_display = ("client", "barber", "get_services", "start_at", "end_at", "status", "branch", "company")
+    list_display = (
+        "client",
+        "barber",
+        "get_services",
+        "start_at",
+        "end_at",
+        "price",
+        "discount",
+        "status",
+        "branch",
+        "company",
+    )
     list_filter = ("status", "barber")  # branch/company добавятся для суперюзера
     search_fields = (
         "client__full_name", "client__phone",
@@ -164,12 +188,13 @@ class AppointmentAdmin(CompanyScopedAdmin):
     )
     list_select_related = ("client", "barber", "company", "branch")
     autocomplete_fields = ("client", "barber",)
-    filter_horizontal = ("services",)  # 👈 для удобного выбора нескольких услуг
+    filter_horizontal = ("services",)
 
     def get_services(self, obj):
         """Красиво выводит список услуг через запятую."""
         return ", ".join(s.name for s in obj.services.all())
     get_services.short_description = "Услуги"
+
 
 # ===== Folder =====
 @admin.register(Folder)
