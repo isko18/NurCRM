@@ -1,6 +1,6 @@
 # barber_crm/urls.py
 from django.urls import path
-from . import views
+from apps.barber import views
 
 urlpatterns = [
     path('services/', views.ServiceListCreateView.as_view(), name='service-list'),
@@ -16,4 +16,7 @@ urlpatterns = [
     path('folders/<uuid:pk>/', views.FolderRetrieveUpdateDestroyView.as_view(), name='folder-detail'),
     path('documents/', views.DocumentListCreateView.as_view(), name='document-list'),
     path('documents/<uuid:pk>/', views.DocumentRetrieveUpdateDestroyView.as_view(), name='document-detail'),
+    
+    path("payouts/", views.PayoutListCreateView.as_view(), name="payout-list-create"),
+    path("payouts/<uuid:pk>/", views.PayoutRetrieveUpdateDestroyView.as_view(), name="payout-detail"),
 ]

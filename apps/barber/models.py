@@ -4,6 +4,7 @@ from django.core.exceptions import ValidationError
 from django.db import models
 from django.db.models import Q, F
 from django.utils import timezone
+from decimal import Decimal
 from django.conf import settings
 from django.core.exceptions import ValidationError, ValidationError as DjangoValidationError
 from django.db.models.signals import m2m_changed
@@ -63,6 +64,52 @@ class BarberProfile(models.Model):
             start_at__lte=now, end_at__gt=now
         ).exists()
 
+class ServiceCategory(models.Model):
+    """Категория услуг барбершопа."""
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+
+    company = models.ForeignKey(
+        Company, on_delete=models.CASCADE,
+        related_name="service_categories", verbose_name="Компания",
+    )
+    # может быть глобальной (branch=NULL) или филиальной
+    branch = models.ForeignKey(
+        Branch, on_delete=models.CASCADE,
+        related_name="service_categories",
+        verbose_name="Филиал", null=True, blank=True, db_index=True,
+    )
+
+    name = models.CharField(max_length=128, verbose_name="Название")
+    is_active = models.BooleanField(default=True, verbose_name="Активна")
+
+    class Meta:
+        verbose_name = "Категория услуги"
+        verbose_name_plural = "Категории услуг"
+        constraints = [
+            # уникальное название в рамках филиала
+            models.UniqueConstraint(
+                fields=("branch", "name"),
+                name="uniq_service_category_name_per_branch",
+                condition=Q(branch__isnull=False),
+            ),
+            # и отдельный уникальный набор для глобальных категорий в рамках компании
+            models.UniqueConstraint(
+                fields=("company", "name"),
+                name="uniq_service_category_name_global_per_company",
+                condition=Q(branch__isnull=True),
+            ),
+        ]
+        indexes = [
+            models.Index(fields=["company", "is_active"]),
+            models.Index(fields=["company", "branch", "is_active"]),
+        ]
+
+    def __str__(self):
+        return self.name
+
+    def clean(self):
+        if self.branch_id and self.branch.company_id != self.company_id:
+            raise ValidationError({"branch": "Филиал принадлежит другой компании."})
 
 # ===========================
 # Service
@@ -81,7 +128,14 @@ class Service(models.Model):
 
     name = models.CharField(max_length=128, verbose_name='Название')
     time = models.CharField(max_length=128, verbose_name='Время', null=True, blank=True)
-    category = models.CharField(max_length=128, verbose_name='Категория', null=True, blank=True)
+    category = models.ForeignKey(
+        ServiceCategory,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="services",
+        verbose_name="Категория",
+    )
     price = models.DecimalField(max_digits=10, decimal_places=2, verbose_name='Цена')
     is_active = models.BooleanField(default=True, verbose_name='Активна')
 
@@ -223,6 +277,19 @@ class Appointment(models.Model):
 
     start_at = models.DateTimeField(verbose_name="Начало")
     end_at = models.DateTimeField(verbose_name="Конец")
+    price = models.DecimalField(
+        max_digits=10,
+        decimal_places=2,
+        verbose_name="Цена",
+        default=0,
+    )
+    discount = models.DecimalField(
+        max_digits=5,
+        decimal_places=2,
+        verbose_name="Скидка (%)",
+        default=0,
+        help_text="Процент скидки от 0 до 100",
+    )
     status = models.CharField(
         max_length=16, choices=Status.choices, default=Status.BOOKED, db_index=True
     )
@@ -396,3 +463,136 @@ class Document(models.Model):
             raise ValidationError({'folder': 'Папка принадлежит другой компании.'})
         if (self.folder.branch_id or None) != (self.branch_id or None):
             raise ValidationError({'folder': 'Папка принадлежит другому филиалу.'})
+
+
+class Payout(models.Model):
+    """
+    Выплата сотруднику за период.
+    Используется для формы «Выплата сотрудникам».
+    """
+
+    class Mode(models.TextChoices):
+        RECORD = "record", "За запись"        # ставка за каждую запись
+        FIXED = "fixed", "Фиксированная"      # фиксированная сумма за период
+        PERCENT = "percent", "Процент"        # процент от выручки
+
+    id = models.UUIDField(
+        primary_key=True,
+        default=uuid.uuid4,
+        editable=False,
+    )
+
+    company = models.ForeignKey(
+        Company,
+        on_delete=models.CASCADE,
+        related_name="payouts",
+        verbose_name="Компания",
+    )
+
+    # может быть глобальной (NULL) или филиальной выплатой
+    branch = models.ForeignKey(
+        Branch,
+        on_delete=models.CASCADE,
+        related_name="payouts",
+        verbose_name="Филиал",
+        null=True,
+        blank=True,
+        db_index=True,
+    )
+
+    # сотрудник = тот же тип, что и в Appointment.barber
+    barber = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.PROTECT,
+        related_name="payouts",
+        verbose_name="Сотрудник",
+    )
+
+    # Период в формате "YYYY-MM" (как в форме)
+    period = models.CharField(
+        max_length=7,
+        db_index=True,
+        verbose_name="Период (YYYY-MM)",
+        help_text="Например: 2025-11",
+    )
+
+    mode = models.CharField(
+        max_length=16,
+        choices=Mode.choices,
+        verbose_name="Режим",
+    )
+
+    # ставка:
+    #   - mode=record  → сумма за одну запись
+    #   - mode=fixed   → фиксированная сумма
+    #   - mode=percent → процент от выручки (0–100)
+    rate = models.DecimalField(
+        max_digits=10,
+        decimal_places=2,
+        verbose_name="Ставка",
+    )
+
+    # результат расчёта на момент создания выплаты
+    appointments_count = models.PositiveIntegerField(
+        default=0,
+        verbose_name="Кол-во записей",
+    )
+
+    total_revenue = models.DecimalField(
+        max_digits=12,
+        decimal_places=2,
+        default=Decimal("0.00"),
+        verbose_name="Выручка за период",
+    )
+
+    payout_amount = models.DecimalField(
+        max_digits=12,
+        decimal_places=2,
+        default=Decimal("0.00"),
+        verbose_name="Сумма выплаты",
+    )
+
+    comment = models.TextField(
+        blank=True,
+        null=True,
+        verbose_name="Комментарий",
+    )
+
+    created_at = models.DateTimeField(
+        auto_now_add=True,
+        verbose_name="Создано",
+    )
+
+    updated_at = models.DateTimeField(
+        auto_now=True,
+        verbose_name="Обновлено",
+    )
+
+    class Meta:
+        verbose_name = "Выплата сотруднику"
+        verbose_name_plural = "Выплаты сотрудникам"
+        ordering = ("-created_at",)
+        # одна выплата на сотрудника за период внутри компании/филиала
+        constraints = [
+            models.UniqueConstraint(
+                fields=("company", "branch", "barber", "period"),
+                name="uniq_payout_per_barber_period",
+            )
+        ]
+
+    def __str__(self):
+        return f"{self.barber} — {self.period} — {self.payout_amount}"
+
+    def clean(self):
+        # company ↔ branch.company
+        if self.branch_id and self.branch.company_id != self.company_id:
+            raise ValidationError({"branch": "Филиал принадлежит другой компании."})
+
+        # сотрудник должен быть из той же компании
+        if self.barber and getattr(self.barber, "company_id", None) != self.company_id:
+            raise ValidationError({"barber": "Сотрудник принадлежит другой компании."})
+
+        # проверка ставки для процента
+        if self.mode == self.Mode.PERCENT:
+            if self.rate < 0 or self.rate > 100:
+                raise ValidationError({"rate": "Для режима 'Процент' ставка должна быть от 0 до 100."})
