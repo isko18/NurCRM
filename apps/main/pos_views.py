@@ -149,6 +149,40 @@ def _party_lines(
     ]
 
 
+def _parse_scale_barcode(barcode: str):
+    """
+    Парсим EAN-13 весовой штрихкод формата:
+    PP CCCCC WWWWW K
+
+    - PP     : префикс (20/21/22/... — тут не валидируем жёстко)
+    - CCCCC  : ПЛУ товара (5 цифр)
+    - WWWWW  : вес в граммах (5 цифр, 00312 -> 0.312 кг)
+    - K      : контрольная цифра (игнорируем)
+
+    Возвращаем dict или None, если не похоже на весовой штрих.
+    """
+    if not barcode or len(barcode) != 13 or not barcode.isdigit():
+        return None
+
+    prefix = barcode[0:2]
+    plu_digits = barcode[2:7]
+    weight_digits = barcode[7:12]
+
+    try:
+        plu_int = int(plu_digits)
+        weight_raw = int(weight_digits)
+    except ValueError:
+        return None
+
+    weight_kg = weight_raw / 1000.0
+
+    return {
+        "prefix": prefix,
+        "plu": plu_int,
+        "weight_raw": weight_raw,
+        "weight_kg": weight_kg,
+    }
+
 class ClientReconciliationClassicAPIView(APIView):
     permission_classes = [permissions.IsAuthenticated]
 
@@ -693,7 +727,6 @@ class CartDetailAPIView(generics.RetrieveAPIView):
     def get_queryset(self):
         return Cart.objects.filter(company=self.request.user.company)
 
-
 class SaleScanAPIView(APIView):
     permission_classes = [permissions.IsAuthenticated]
 
@@ -710,10 +743,40 @@ class SaleScanAPIView(APIView):
         barcode = ser.validated_data["barcode"].strip()
         qty = ser.validated_data["quantity"]
 
+        product = None
+        scale_data = None
+
+        # 1) пробуем найти обычный товар по barcode
         try:
             product = Product.objects.get(company=cart.company, barcode=barcode)
         except Product.DoesNotExist:
-            return Response({"not_found": True, "message": "Товар не найден"}, status=404)
+            # 2) пробуем распарсить весовой штрихкод
+            scale_data = _parse_scale_barcode(barcode)
+            if not scale_data:
+                return Response(
+                    {"not_found": True, "message": "Товар не найден"},
+                    status=404,
+                )
+
+            plu = scale_data["plu"]
+            try:
+                product = Product.objects.get(company=cart.company, plu=plu)
+            except Product.DoesNotExist:
+                return Response(
+                    {
+                        "not_found": True,
+                        "message": f"Товар с ПЛУ {plu} не найден",
+                    },
+                    status=404,
+                )
+
+        # считаем количество
+        if product.scale_type == Product.ScaleType.WEIGHT and scale_data:
+            # весовой товар -> количество в килограммах из штрихкода
+            effective_qty = Decimal(str(scale_data["weight_kg"]))
+        else:
+            # штучный товар -> берём из запроса (обычно 1)
+            effective_qty = Decimal(str(qty))
 
         item, created = CartItem.objects.get_or_create(
             cart=cart,
@@ -721,13 +784,14 @@ class SaleScanAPIView(APIView):
             defaults={
                 "company": cart.company,
                 "branch": getattr(cart, "branch", None),
-                "quantity": qty,
-                "unit_price": product.price,
+                "quantity": effective_qty,
+                "unit_price": product.price,  # для веса: цена за кг, для штучного: за штуку
             },
         )
         if not created:
-            item.quantity += qty
+            item.quantity = item.quantity + effective_qty
             item.save(update_fields=["quantity"])
+
         cart.recalc()
 
         return Response(SaleCartSerializer(cart).data, status=status.HTTP_201_CREATED)
