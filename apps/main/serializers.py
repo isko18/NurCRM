@@ -2,7 +2,7 @@ from rest_framework import serializers
 from django.db import transaction
 from django.utils import timezone
 from django.db.models import Q
-from decimal import Decimal
+from decimal import Decimal, ROUND_HALF_UP
 from typing import Any, Dict
 from datetime import date as _date, datetime as _datetime
 from django.utils import timezone as dj_tz
@@ -503,7 +503,6 @@ class ProductImageSerializer(serializers.ModelSerializer):
             return req.build_absolute_uri(obj.image.url) if req else obj.image.url
         return None
 
-
 class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
     company = serializers.ReadOnlyField(source="company.id")
     branch = serializers.ReadOnlyField(source="branch.id")
@@ -536,6 +535,10 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
     images = ProductImageSerializer(many=True, read_only=True)
     stock = serializers.BooleanField(required=False)
 
+    # ==== НОВОЕ: поля только для чтения (данные с весов) ====
+    weight_kg = serializers.SerializerMethodField(read_only=True)
+    total_price = serializers.SerializerMethodField(read_only=True)
+
     class Meta:
         model = Product
         fields = [
@@ -551,9 +554,13 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
             "created_at", "updated_at",
             "images",
 
-            # === НОВЫЕ ПОЛЯ ДЛЯ ВЕСОВ ===
+            # === ПОЛЯ ДЛЯ ВЕСОВ И ПЛУ ===
             "plu",
             "scale_type",
+
+            # === РАСЧЁТНЫЕ ПОЛЯ С ВЕСОВ ===
+            "weight_kg",
+            "total_price",
         ]
         read_only_fields = [
             "id", "created_at", "updated_at",
@@ -562,6 +569,7 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
             "client_name", "status_display", "item_make", "date",
             "created_by", "created_by_name",
             "images",
+            "weight_kg", "total_price",  # расчётные, только на чтение
         ]
         extra_kwargs = {
             "price": {"required": False, "default": 0},
@@ -576,6 +584,43 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
         br = self._auto_branch()
         _restrict_pk_queryset_strict(self.fields.get("item_make_ids"), ItemMake.objects.all(), comp, br)
         _restrict_pk_queryset_strict(self.fields.get("client"), Client.objects.all(), comp, br)
+
+    # ==== НОВОЕ: данные с весов ====
+
+    def get_weight_kg(self, obj):
+        """
+        Вес берём только если:
+        - в контексте есть scale_data (значит штрих-код был весовой),
+        - товар помечен как весовой (scale_type = WEIGHT).
+        """
+        scale_data = self.context.get("scale_data")
+        if not scale_data:
+            return None
+        if obj.scale_type != Product.ScaleType.WEIGHT:
+            return None
+        return scale_data.get("weight_kg")
+
+    def get_total_price(self, obj):
+        """
+        Для весового товара: price (за кг) * weight_kg.
+        Для штучного: просто price.
+        Если контекста от весов нет — возвращаем price.
+        """
+        scale_data = self.context.get("scale_data")
+
+        # штучный товар — просто цена
+        if obj.scale_type == Product.ScaleType.PIECE or not scale_data:
+            return obj.price
+
+        weight_kg = scale_data.get("weight_kg")
+        if not weight_kg:
+            return obj.price  # на всякий случай
+
+        price_per_kg = obj.price
+        total = Decimal(price_per_kg) * Decimal(str(weight_kg))
+        return total.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+    # ---- helpers ----
 
     def get_created_by_name(self, obj):
         u = getattr(obj, "created_by", None)
@@ -615,7 +660,6 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
             pass
         return None
 
-    # ---- helpers ----
     @staticmethod
     def _normalize_status(raw):
         if raw in (None, "", "null"):
@@ -748,7 +792,6 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
 
         instance.save()
         return instance
-
 # ===========================
 # Review / Notification
 # ===========================

@@ -158,24 +158,31 @@ def send_products_to_scale(request):
         scale_type = (getattr(p, "scale_type", "") or "").lower()
         is_piece = scale_type in ("piece", "штучный", "штучно")
 
-        # числовой код для весов
+        # Числовой код PLU
         scale_code = getattr(p, "scale_code", None)
         try:
             code = int(scale_code) if scale_code is not None else cur_plu
         except (TypeError, ValueError):
             code = cur_plu
 
+        # --- НОВОЕ: штрих-код ---
+        barcode = getattr(p, "barcode", None)
+        if barcode:
+            barcode = str(barcode)
+
         items.append(
             {
-                "product_uuid": str(p.id),   # UUID -> str
+                "product_uuid": str(p.id),   # UUID -> string
                 "plu_number": cur_plu,
                 "code": code,
                 "name": name,
                 "price": price,
                 "shelf_life_days": shelf,
                 "is_piece": is_piece,
+                "barcode": barcode,          # <-- добавили это поле
             }
         )
+
         cur_plu += 1
 
     if not items:
