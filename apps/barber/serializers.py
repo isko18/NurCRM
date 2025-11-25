@@ -123,22 +123,59 @@ class BarberProfileSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSeria
         read_only_fields = ["id", "created_at", "company", "branch"]
 
 
-# ===========================
-# ServiceCategory (динамичные категории)
-# ===========================
 class ServiceCategorySerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
     company = serializers.ReadOnlyField(source="company.id")
     branch = serializers.ReadOnlyField(source="branch.id")
 
     class Meta:
         model = ServiceCategory
-        fields = ["id", "company", "branch", "name", "is_active"]
-        read_only_fields = ["id", "company", "branch"]
+        fields = [
+            "id",
+            "company",
+            "branch",
+            "name",
+            "is_active",
+        ]
+        read_only_fields = [
+            "id",
+            "company",
+            "branch",
+        ]
 
+    def validate_name(self, value):
+        value = (value or "").strip()
+        if not value:
+            raise serializers.ValidationError("Название не может быть пустым.")
+        return value
 
-# ===========================
-# Service
-# ===========================
+    def validate(self, attrs):
+        attrs = super().validate(attrs)
+
+        request = self.context.get("request")
+        user = getattr(request, "user", None) if request else None
+        company = getattr(user, "owned_company", None) or getattr(user, "company", None)
+        if not company:
+            return attrs
+
+        target_branch = self._auto_branch()
+        name = (attrs.get("name") or getattr(self.instance, "name", "")).strip()
+
+        qs = ServiceCategory.objects.filter(company=company, name__iexact=name)
+        if target_branch is None:
+            qs = qs.filter(branch__isnull=True)   # глобальные категории
+        else:
+            qs = qs.filter(branch=target_branch)  # категории конкретного филиала
+
+        if self.instance:
+            qs = qs.exclude(pk=self.instance.pk)
+
+        if qs.exists():
+            raise serializers.ValidationError(
+                {"name": "Категория с таким названием уже существует (для этой компании/филиала)."}
+            )
+
+        return attrs
+    
 class ServiceSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
     company = serializers.ReadOnlyField(source="company.id")
     branch = serializers.ReadOnlyField(source="branch.id")

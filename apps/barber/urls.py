@@ -19,4 +19,7 @@ urlpatterns = [
     
     path("payouts/", views.PayoutListCreateView.as_view(), name="payout-list-create"),
     path("payouts/<uuid:pk>/", views.PayoutRetrieveUpdateDestroyView.as_view(), name="payout-detail"),
+    
+    path("service-categories/", views.ServiceCategoryListCreateView.as_view(), name="service-category-list-create"),
+    path("service-categories/<uuid:pk>/", views.ServiceCategoryRetrieveUpdateDestroyView.as_view(), name="service-category-detail"),
 ]
