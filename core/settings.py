@@ -55,6 +55,7 @@ INSTALLED_APPS = [
     'apps.whatsapp',
     'apps.instagram',
     'apps.storehouse',
+    'apps.logistics',
     # "apps.instagram_mcp",
     'apps.consalting',
 ]
