@@ -185,6 +185,8 @@ class User(AbstractBaseUser, PermissionsMixin):
     can_view_agent = models.BooleanField(default=False, verbose_name='Доступ к агентам')
     can_view_catalog = models.BooleanField(default=False, verbose_name='Доступ к каталогу')
     can_view_branch = models.BooleanField(default=False, verbose_name='Доступ к филиалу')
+    can_view_logistics = models.BooleanField(default=False, verbose_name='Доступ к логистике')
+    
 
     # Распределение сотрудника по филиалам (через промежуточную модель)
     branches = models.ManyToManyField(

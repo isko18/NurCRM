@@ -157,7 +157,7 @@ class UserSerializer(serializers.ModelSerializer):
             'can_view_school_leads', 'can_view_school_invoices',
             'can_view_clients', 'can_view_client_requests', 'can_view_salary',
             'can_view_sales', 'can_view_services', 'can_view_agent', 'can_view_catalog',
-            'can_view_branch',
+            'can_view_branch', 'can_view_logistics',
             # филиалы (read-only)
             'branch_ids', 'primary_branch_id',
             'created_at', 'updated_at',
@@ -204,7 +204,7 @@ class UserSerializer(serializers.ModelSerializer):
             'can_view_school_lessons', 'can_view_school_teachers',
             'can_view_school_leads', 'can_view_school_invoices',
             'can_view_clients', 'can_view_client_requests', 'can_view_salary',
-            'can_view_sales', 'can_view_services', 'can_view_agent', 'can_view_catalog', 'can_view_branch',
+            'can_view_sales', 'can_view_services', 'can_view_agent', 'can_view_catalog', 'can_view_branch', 'can_view_logistics',
         ]
 
         for field in permission_fields:
@@ -311,7 +311,7 @@ class OwnerRegisterSerializer(serializers.ModelSerializer):
             'can_view_school_lessons', 'can_view_school_teachers',
             'can_view_school_leads', 'can_view_school_invoices',
             'can_view_clients', 'can_view_client_requests', 'can_view_salary',
-            'can_view_sales', 'can_view_services', 'can_view_agent', 'can_view_catalog', 'can_view_branch',
+            'can_view_sales', 'can_view_services', 'can_view_agent', 'can_view_catalog', 'can_view_branch', 'can_view_logistics',
         ]
         for field in permission_fields:
             setattr(user, field, True)
@@ -385,7 +385,7 @@ class EmployeeCreateSerializer(serializers.ModelSerializer):
             'can_view_school_lessons', 'can_view_school_teachers',
             'can_view_school_leads', 'can_view_school_invoices',
             'can_view_clients', 'can_view_client_requests', 'can_view_salary',
-            'can_view_sales', 'can_view_services', 'can_view_agent', 'can_view_catalog', 'can_view_branch',
+            'can_view_sales', 'can_view_services', 'can_view_agent', 'can_view_catalog', 'can_view_branch', 'can_view_logistics',
 
             # 👇 новые поля
             'primary_branch', 'branches',
@@ -458,7 +458,7 @@ class EmployeeCreateSerializer(serializers.ModelSerializer):
             'can_view_school_lessons', 'can_view_school_teachers',
             'can_view_school_leads', 'can_view_school_invoices',
             'can_view_clients', 'can_view_client_requests', 'can_view_salary',
-            'can_view_sales', 'can_view_services', 'can_view_agent', 'can_view_catalog', 'can_view_branch',
+            'can_view_sales', 'can_view_services', 'can_view_agent', 'can_view_catalog', 'can_view_branch', 'can_view_logistics',
         ]
         access_flags = {field: validated_data.pop(field, None) for field in access_fields}
 
@@ -567,7 +567,7 @@ class UserListSerializer(serializers.ModelSerializer):
             'can_view_school_lessons', 'can_view_school_teachers',
             'can_view_school_leads', 'can_view_school_invoices',
             'can_view_clients', 'can_view_client_requests', 'can_view_salary',
-            'can_view_sales', 'can_view_services', 'can_view_agent', 'can_view_catalog', 'can_view_branch',
+            'can_view_sales', 'can_view_services', 'can_view_agent', 'can_view_catalog', 'can_view_branch', 'can_view_logistics',
             # филиалы
             'branch_ids', 'primary_branch_id',
         ]
@@ -600,7 +600,7 @@ class UserWithPermissionsSerializer(serializers.ModelSerializer):
             'can_view_school_lessons', 'can_view_school_teachers',
             'can_view_school_leads', 'can_view_school_invoices',
             'can_view_clients', 'can_view_client_requests', 'can_view_salary',
-            'can_view_sales', 'can_view_services', 'can_view_agent', 'can_view_catalog', 'can_view_branch',
+            'can_view_sales', 'can_view_services', 'can_view_agent', 'can_view_catalog', 'can_view_branch', 'can_view_logistics',
             # филиалы
             'branch_ids', 'primary_branch_id',
         ]
@@ -698,7 +698,7 @@ class EmployeeUpdateSerializer(serializers.ModelSerializer):
             'can_view_school_lessons', 'can_view_school_teachers',
             'can_view_school_leads', 'can_view_school_invoices',
             'can_view_clients', 'can_view_client_requests', 'can_view_salary',
-            'can_view_sales', 'can_view_services', 'can_view_agent', 'can_view_catalog', 'can_view_branch',
+            'can_view_sales', 'can_view_services', 'can_view_agent', 'can_view_catalog', 'can_view_branch', 'can_view_logistics',
             # филиалы (write-only)
             'branch_ids',
         ]

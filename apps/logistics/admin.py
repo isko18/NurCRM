@@ -18,7 +18,7 @@ class LogisticsAdmin(admin.ModelAdmin):
         "status",
         "price_car",
         "price_service",
-        "arrival_date",   # 👈
+        "arrival_date",
         "created_at",
         "created_by",
     )
@@ -27,7 +27,7 @@ class LogisticsAdmin(admin.ModelAdmin):
         "status",
         "company",
         "branch",
-        "arrival_date",   # 👈 опционально
+        "arrival_date",   
         "created_at",
     )
     search_fields = (
