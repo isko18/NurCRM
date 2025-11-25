@@ -92,35 +92,11 @@ def scale_products_list(request):
     data = ProductSerializer(qs, many=True).data
     return Response(data)
 
-
 @api_view(["POST"])
 @permission_classes([IsAuthenticated])
 def send_products_to_scale(request):
     """
     Отправить товары в подключённые scale-агенты компании.
-
-    Body (product_ids можно не передавать):
-    {
-      "product_ids": [1, 2, 3],   # необязательно
-      "plu_start": 1              # с какого ПЛУ начинать нумерацию (по умолчанию 1)
-    }
-
-    В ответе:
-    {
-      "sent": 3,
-      "items": [
-        {
-          "product_uuid": "...",
-          "plu_number": 1,
-          "code": 1,
-          "name": "Картошка",
-          "price": 40.0,
-          "shelf_life_days": 0,
-          "is_piece": false
-        },
-        ...
-      ]
-    }
     """
     user = request.user
 
@@ -139,7 +115,6 @@ def send_products_to_scale(request):
     if product_ids:
         qs = qs.filter(id__in=product_ids)
 
-    # только весовые/штучные
     qs = qs.filter(
         scale_type__in=[
             "weight", "piece",
@@ -158,32 +133,47 @@ def send_products_to_scale(request):
         scale_type = (getattr(p, "scale_type", "") or "").lower()
         is_piece = scale_type in ("piece", "штучный", "штучно")
 
-        # Числовой код PLU
-        scale_code = getattr(p, "scale_code", None)
-        try:
-            code = int(scale_code) if scale_code is not None else cur_plu
-        except (TypeError, ValueError):
-            code = cur_plu
+        # ---- ИСПОЛЬЗУЕМ ПОЛЕ product.plu ----
+        plu_value = p.plu
 
-        # --- НОВОЕ: штрих-код ---
+        if plu_value is None:
+            # если у товара ещё нет ПЛУ — берём текущий счётчик
+            plu_value = cur_plu
+
+            # по желанию можно сразу сохранить в БД,
+            # чтобы в следующий раз отправлялся тот же ПЛУ:
+            p.plu = plu_value
+            p.save(update_fields=["plu"])
+
+        # код для весов = тот же PLU
+        code = int(plu_value)
+
+        # штрих-код, если есть
         barcode = getattr(p, "barcode", None)
         if barcode:
             barcode = str(barcode)
 
         items.append(
             {
-                "product_uuid": str(p.id),   # UUID -> string
-                "plu_number": cur_plu,
-                "code": code,
+                "product_uuid": str(p.id),
+                "plu_number": int(plu_value),   # <-- ТОТ САМЫЙ ПЛУ (55 и т.д.)
+                "code": code,                   # <-- ТОТ ЖЕ САМЫЙ КОД
                 "name": name,
                 "price": price,
                 "shelf_life_days": shelf,
                 "is_piece": is_piece,
-                "barcode": barcode,          # <-- добавили это поле
+                "barcode": barcode,
             }
         )
 
-        cur_plu += 1
+        # если у товара не было собственного PLU и мы назначили cur_plu,
+        # то инкрементируем счётчик
+        if p.plu is None:  # до сохранения мы уже присвоили plu_value
+            cur_plu += 1
+        else:
+            # если у каждого товара ПЛУ уже задан вручную,
+            # можно просто cur_plu оставлять как есть
+            cur_plu = max(cur_plu, int(plu_value) + 1)
 
     if not items:
         return Response(
@@ -205,7 +195,6 @@ def send_products_to_scale(request):
         },
     )
 
-    # ВОТ ЗДЕСЬ возвращаем те же items
     return Response(
         {
             "sent": len(items),
