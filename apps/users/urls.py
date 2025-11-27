@@ -20,7 +20,10 @@ from .views import (
     CustomRoleCreateAPIView,
     CustomRoleDetailAPIView,
     BranchDetailAPIView, 
-    BranchListCreateAPIView
+    BranchListCreateAPIView,
+    #таски лист для админа и апдейт на подписку
+    CompanyListAPIView,
+    CompanySubscriptionAdminAPIView,
 )
 
 from apps.users.scale_views import send_products_to_scale, get_scale_api_token, register_scale
@@ -65,4 +68,8 @@ urlpatterns = [
     
     
     path("scales/send-products/", send_products_to_scale),
+
+    path('companies/', CompanyListAPIView.as_view(), name='company-list'),#Список всех компаний для Админа
+    path('companies/<uuid:pk>/subscription/', CompanySubscriptionAdminAPIView.as_view(), name='company-subscription',
+    ),
 ]
