@@ -265,6 +265,7 @@ class Appointment(models.Model):
         on_delete=models.PROTECT,
         related_name="appointments",
         verbose_name="Клиент",
+        blank=True, null=True
     )
     # мастер — это User (в твоей модели User есть FK company, так что проверка валидна)
     barber = models.ForeignKey(
