@@ -22,4 +22,9 @@ urlpatterns = [
     
     path("service-categories/", views.ServiceCategoryListCreateView.as_view(), name="service-category-list-create"),
     path("service-categories/<uuid:pk>/", views.ServiceCategoryRetrieveUpdateDestroyView.as_view(), name="service-category-detail"),
+    
+    path("product-sale-payouts/", views.ProductSalePayoutListCreateView.as_view(),
+         name="barber-product-sale-payout-list"),
+    path("product-sale-payouts/<uuid:pk>/", views.ProductSalePayoutRetrieveUpdateDestroyView.as_view(),
+         name="barber-product-sale-payout-detail"),
 ]
