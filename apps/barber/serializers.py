@@ -9,7 +9,8 @@ from .models import (
     Document,
     Folder,
     ServiceCategory,
-    Payout
+    Payout,
+    ProductSalePayout
 )
 from apps.users.models import Branch  # для проверки филиала по ?branch=
 from decimal import Decimal
@@ -629,3 +630,99 @@ class PayoutSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
 
         # обходим create из миксина и идём сразу в ModelSerializer
         return super(CompanyBranchReadOnlyMixin, self).create(validated_data)
+    
+    
+class ProductSalePayoutSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
+    """
+    Для формы «Процент от продажи товара».
+    Поля модалки:
+      - product      → Товар
+      - employee     → Сотрудник
+      - percent      → Процент (%)
+      - price        → Цена (сом)
+    payout_amount считается в save() модели и только возвращается наружу.
+    """
+
+    company = serializers.ReadOnlyField(source="company.id")
+    branch = serializers.ReadOnlyField(source="branch.id")
+
+    product_name = serializers.CharField(
+        source="product.name",
+        read_only=True,
+    )
+    employee_name = serializers.SerializerMethodField()
+
+    class Meta:
+        model = ProductSalePayout
+        fields = [
+            "id",
+            "company",
+            "branch",
+            "product",
+            "product_name",
+            "employee",
+            "employee_name",
+            "percent",
+            "price",
+            "payout_amount",
+            "created_at",
+        ]
+        read_only_fields = [
+            "id",
+            "company",
+            "branch",
+            "product_name",
+            "employee_name",
+            "payout_amount",
+            "created_at",
+        ]
+
+    # ----- helpers -----
+
+    def get_employee_name(self, obj):
+        e = obj.employee
+        if not e:
+            return None
+        if e.first_name or e.last_name:
+            return f"{e.first_name or ''} {e.last_name or ''}".strip()
+        return getattr(e, "email", None) or getattr(e, "username", None)
+
+    # ----- валидация -----
+
+    def validate_percent(self, value):
+        if value is None:
+            return value
+        if value < 0 or value > 100:
+            raise serializers.ValidationError("Процент должен быть от 0 до 100.")
+        return value
+
+    def validate(self, attrs):
+        attrs = super().validate(attrs)
+
+        company = self._user_company()
+        company_id = getattr(company, "id", None)
+
+        product = attrs.get("product") or getattr(self.instance, "product", None)
+        employee = attrs.get("employee") or getattr(self.instance, "employee", None)
+
+        target_branch = self._auto_branch()
+
+        # товар → та же компания
+        if company_id and product and getattr(product, "company_id", None) != company_id:
+            raise serializers.ValidationError({"product": "Товар принадлежит другой компании."})
+
+        # сотрудник → та же компания
+        if company_id and employee and getattr(employee, "company_id", None) != company_id:
+            raise serializers.ValidationError({"employee": "Сотрудник принадлежит другой компании."})
+
+        # если у товара есть branch, проверяем, что он глобальный/этого филиала
+        if target_branch is not None and product is not None:
+            pb = getattr(product, "branch_id", None)
+            if pb not in (None, target_branch.id):
+                raise serializers.ValidationError({"product": "Товар принадлежит другому филиалу."})
+
+        return attrs
+
+    # create/update оставляем от миксина:
+    # company/branch берутся из пользователя и ?branch,
+    # payout_amount посчитается в save() модели ProductSalePayout.

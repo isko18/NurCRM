@@ -10,8 +10,8 @@ from django.core.exceptions import ValidationError, ValidationError as DjangoVal
 from django.db.models.signals import m2m_changed
 from django.dispatch import receiver
 
-from apps.users.models import Company, Branch  # Branch берём из твоей users-модели
-
+from apps.users.models import Company, Branch  
+from apps.main.models import Product
 
 # ===========================
 # BarberProfile
@@ -597,3 +597,108 @@ class Payout(models.Model):
         if self.mode == self.Mode.PERCENT:
             if self.rate < 0 or self.rate > 100:
                 raise ValidationError({"rate": "Для режима 'Процент' ставка должна быть от 0 до 100."})
+
+
+
+class ProductSalePayout(models.Model):
+    """
+    Начисление процента от продажи товара конкретному сотруднику.
+    Соответствует форме «Процент от продажи товара».
+    """
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+
+    company = models.ForeignKey(
+        Company,
+        on_delete=models.CASCADE,
+        related_name="product_sale_payouts",
+        verbose_name="Компания",
+    )
+
+    # может быть глобальным (NULL) или филиальным
+    branch = models.ForeignKey(
+        Branch,
+        on_delete=models.CASCADE,
+        related_name="product_sale_payouts",
+        verbose_name="Филиал",
+        null=True,
+        blank=True,
+        db_index=True,
+    )
+
+    product = models.ForeignKey(
+        Product,
+        on_delete=models.PROTECT,
+        related_name="sale_payouts",
+        verbose_name="Товар",
+    )
+
+    employee = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.PROTECT,
+        related_name="product_sale_payouts",
+        verbose_name="Сотрудник",
+    )
+
+    percent = models.DecimalField(
+        max_digits=5,
+        decimal_places=2,
+        verbose_name="Процент (%)",
+        help_text="От 0 до 100",
+    )
+
+    price = models.DecimalField(
+        max_digits=12,
+        decimal_places=2,
+        verbose_name="Цена (сом)",
+        help_text="Сумма продажи, от которой считается процент",
+    )
+
+    # рассчитанная сумма начисления (price * percent / 100)
+    payout_amount = models.DecimalField(
+        max_digits=12,
+        decimal_places=2,
+        default=Decimal("0.00"),
+        verbose_name="Сумма начисления",
+    )
+
+    created_at = models.DateTimeField(auto_now_add=True, verbose_name="Создано")
+
+    class Meta:
+        verbose_name = "Процент от продажи товара"
+        verbose_name_plural = "Проценты от продажи товара"
+        ordering = ("-created_at",)
+        indexes = [
+            models.Index(fields=["company", "created_at"]),
+            models.Index(fields=["company", "branch", "created_at"]),
+            models.Index(fields=["employee", "created_at"]),
+        ]
+
+    def __str__(self):
+        return f"{self.product} → {self.employee} ({self.percent}% от {self.price} сом)"
+
+    def clean(self):
+        # company ↔ branch.company
+        if self.branch_id and self.branch.company_id != self.company_id:
+            raise ValidationError({"branch": "Филиал принадлежит другой компании."})
+
+        # товар должен быть из той же компании
+        if self.product and getattr(self.product, "company_id", None) != self.company_id:
+            raise ValidationError({"product": "Товар принадлежит другой компании."})
+
+        # сотрудник должен быть из той же компании
+        if self.employee and getattr(self.employee, "company_id", None) != self.company_id:
+            raise ValidationError({"employee": "Сотрудник принадлежит другой компании."})
+
+        # проверка процента
+        if self.percent < 0 or self.percent > 100:
+            raise ValidationError({"percent": "Процент должен быть от 0 до 100."})
+
+    def save(self, *args, **kwargs):
+        # пересчитываем сумму перед сохранением
+        if self.price is not None and self.percent is not None:
+            self.payout_amount = (
+                Decimal(self.price) * Decimal(self.percent) / Decimal("100")
+            )
+        self.full_clean()
+        return super().save(*args, **kwargs)
