@@ -11,7 +11,7 @@ from django_filters import rest_framework as filters
 from django_filters.rest_framework import DjangoFilterBackend
 
 from apps.users.models import Branch
-from .models import Service, Client, Appointment, Document, Folder, ServiceCategory, Payout
+from .models import Service, Client, Appointment, Document, Folder, ServiceCategory, Payout, PayoutSale
 from .serializers import (
     ServiceSerializer,
     ClientSerializer,
@@ -19,7 +19,8 @@ from .serializers import (
     FolderSerializer,
     DocumentSerializer,
     ServiceCategorySerializer,
-    PayoutSerializer
+    PayoutSerializer,
+    PayoutSaleSerializer
 )
 
 
@@ -482,4 +483,32 @@ class ServiceCategoryRetrieveUpdateDestroyView(
     """
     queryset = ServiceCategory.objects.all()
     serializer_class = ServiceCategorySerializer
+    permission_classes = [permissions.IsAuthenticated]
+
+    
+    
+class PayoutSaleListCreateView(
+    CompanyQuerysetMixin,
+    generics.ListCreateAPIView
+):
+
+    queryset = PayoutSale.objects.all()
+    serializer_class = PayoutSaleSerializer
+    permission_classes = [permissions.IsAuthenticated]
+    
+    filter_backends = [DjangoFilterBackend, SearchFilter, OrderingFilter]
+
+    filterset_fields = [
+        f.name for f in PayoutSale._meta.get_fields() if not f.is_relation or f.many_to_one
+    ]
+    search_fields = ["period"]
+    ordering_fields = ["period", "total", "old_total_fund", "new_total_fund"]
+    ordering = ["-period"]
+
+class PayoutSaleRetrieveUpdateDestroyView(
+    CompanyQuerysetMixin,
+    generics.RetrieveUpdateDestroyAPIView
+):
+    queryset = PayoutSale.objects.all()
+    serializer_class = PayoutSaleSerializer
     permission_classes = [permissions.IsAuthenticated]

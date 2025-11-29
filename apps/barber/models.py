@@ -596,3 +596,48 @@ class Payout(models.Model):
         if self.mode == self.Mode.PERCENT:
             if self.rate < 0 or self.rate > 100:
                 raise ValidationError({"rate": "Для режима 'Процент' ставка должна быть от 0 до 100."})
+class PayoutSale(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+
+    company = models.ForeignKey(
+        Company,
+        on_delete=models.CASCADE,
+        related_name="product_sale_payouts",
+        verbose_name="Компания",
+    )
+
+    branch = models.ForeignKey(
+        Branch,
+        on_delete=models.CASCADE,
+        related_name="product_sale_payouts",
+        verbose_name="Филиал",
+        null=True,
+        blank=True,
+        db_index=True,
+    )
+
+    period = models.DateTimeField(verbose_name="Период")
+
+    old_total_fund = models.DecimalField(
+        max_digits=12,
+        decimal_places=2,
+        verbose_name="Старая общая цена",
+    )
+    new_total_fund = models.DecimalField(
+        max_digits=12,
+        decimal_places=2,
+        verbose_name="Новая общая цена",
+    )
+    total = models.DecimalField(
+        max_digits=12,
+        decimal_places=2,
+        verbose_name="Общая цена / Разница",
+        default=Decimal("0.00"),
+    )
+
+    class Meta:
+        verbose_name = "Фонд продаж за период"
+        verbose_name_plural = "Фонды продаж за период"
+
+    def __str__(self):
+        return f"{self.total}"

@@ -9,10 +9,11 @@ from .models import (
     Document,
     Folder,
     ServiceCategory,
-    Payout
+    Payout,
+    PayoutSale,
 )
 from apps.users.models import Branch  # для проверки филиала по ?branch=
-from decimal import Decimal
+from decimal import Decimal, ROUND_HALF_UP
 from datetime import date
 from calendar import monthrange
 from datetime import timedelta
@@ -621,6 +622,9 @@ class PayoutSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
         else:
             payout_amount = Decimal("0.00")
 
+        payout_amount = payout_amount.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+
         validated_data["company"] = company
         validated_data["branch"] = branch
         validated_data["appointments_count"] = appointments_count
@@ -629,3 +633,89 @@ class PayoutSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
 
         # обходим create из миксина и идём сразу в ModelSerializer
         return super(CompanyBranchReadOnlyMixin, self).create(validated_data)
+class PayoutSaleSerializer(serializers.ModelSerializer):
+    # принимаем "2025-11" и ISO, в БД хранится datetime,
+    # наружу показываем обратно "2025-11"
+    period = serializers.DateTimeField(
+        input_formats=["%Y-%m", "iso-8601"],
+        format="%Y-%m",
+    )
+
+    class Meta:
+        model = PayoutSale
+        fields = [
+            "id",
+            "period",
+            "old_total_fund",
+            "new_total_fund",
+            "total",
+        ]
+        read_only_fields = ["id", "total"]
+
+    def _calc_total(self, old_fund, new_fund) -> Decimal:
+        # total = old - new (на сколько фонд упал)
+        return (Decimal(old_fund) - Decimal(new_fund)).quantize(
+            Decimal("0.01"), rounding=ROUND_HALF_UP
+        )
+
+    def _get_company(self):
+        request = self.context.get("request")
+        user = getattr(request, "user", None) if request else None
+        if not user:
+            return None
+        return getattr(user, "company", None) or getattr(user, "owned_company", None)
+
+    def _get_branch(self, request, company):
+        """
+        Берём филиал только из ?branch=<uuid>, если он принадлежит компании.
+        Если нет/кривой — считаем запись глобальной (branch=None).
+        """
+        if not request or not company:
+            return None
+
+        from apps.users.models import Branch
+
+        branch_id = None
+        if hasattr(request, "query_params"):
+            branch_id = request.query_params.get("branch")
+        elif hasattr(request, "GET"):
+            branch_id = request.GET.get("branch")
+
+        if not branch_id:
+            return None
+
+        try:
+            return Branch.objects.get(id=branch_id, company=company)
+        except (Branch.DoesNotExist, ValueError):
+            return None
+
+    def create(self, validated_data):
+        request = self.context.get("request")
+
+        company = self._get_company()
+        if not company:
+            raise serializers.ValidationError("У пользователя не задана компания.")
+
+        branch = self._get_branch(request, company)
+
+        validated_data["company"] = company
+        validated_data["branch"] = branch
+
+        old_fund = validated_data["old_total_fund"]
+        new_fund = validated_data["new_total_fund"]
+        validated_data["total"] = self._calc_total(old_fund, new_fund)
+
+        return super().create(validated_data)
+
+    def update(self, instance, validated_data):
+        # компанию/филиал не даём менять
+        validated_data.pop("company", None)
+        validated_data.pop("branch", None)
+
+        instance = super().update(instance, validated_data)
+        instance.total = self._calc_total(
+            instance.old_total_fund,
+            instance.new_total_fund,
+        )
+        instance.save(update_fields=["old_total_fund", "new_total_fund", "total"])
+        return instance
