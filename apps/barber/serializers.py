@@ -10,10 +10,10 @@ from .models import (
     Folder,
     ServiceCategory,
     Payout,
-    ProductSalePayout
+    PayoutSale,
 )
 from apps.users.models import Branch  # для проверки филиала по ?branch=
-from decimal import Decimal
+from decimal import Decimal, ROUND_HALF_UP
 from datetime import date
 from calendar import monthrange
 from datetime import timedelta
@@ -622,6 +622,9 @@ class PayoutSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
         else:
             payout_amount = Decimal("0.00")
 
+        payout_amount = payout_amount.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+
         validated_data["company"] = company
         validated_data["branch"] = branch
         validated_data["appointments_count"] = appointments_count
@@ -630,99 +633,89 @@ class PayoutSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
 
         # обходим create из миксина и идём сразу в ModelSerializer
         return super(CompanyBranchReadOnlyMixin, self).create(validated_data)
-    
-    
-class ProductSalePayoutSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
-    """
-    Для формы «Процент от продажи товара».
-    Поля модалки:
-      - product      → Товар
-      - employee     → Сотрудник
-      - percent      → Процент (%)
-      - price        → Цена (сом)
-    payout_amount считается в save() модели и только возвращается наружу.
-    """
-
-    company = serializers.ReadOnlyField(source="company.id")
-    branch = serializers.ReadOnlyField(source="branch.id")
-
-    product_name = serializers.CharField(
-        source="product.name",
-        read_only=True,
+class PayoutSaleSerializer(serializers.ModelSerializer):
+    # принимаем "2025-11" и ISO, в БД хранится datetime,
+    # наружу показываем обратно "2025-11"
+    period = serializers.DateTimeField(
+        input_formats=["%Y-%m", "iso-8601"],
+        format="%Y-%m",
     )
-    employee_name = serializers.SerializerMethodField()
 
     class Meta:
-        model = ProductSalePayout
+        model = PayoutSale
         fields = [
             "id",
-            "company",
-            "branch",
-            "product",
-            "product_name",
-            "employee",
-            "employee_name",
-            "percent",
-            "price",
-            "payout_amount",
-            "created_at",
+            "period",
+            "old_total_fund",
+            "new_total_fund",
+            "total",
         ]
-        read_only_fields = [
-            "id",
-            "company",
-            "branch",
-            "product_name",
-            "employee_name",
-            "payout_amount",
-            "created_at",
-        ]
+        read_only_fields = ["id", "total"]
 
-    # ----- helpers -----
+    def _calc_total(self, old_fund, new_fund) -> Decimal:
+        # total = old - new (на сколько фонд упал)
+        return (Decimal(old_fund) - Decimal(new_fund)).quantize(
+            Decimal("0.01"), rounding=ROUND_HALF_UP
+        )
 
-    def get_employee_name(self, obj):
-        e = obj.employee
-        if not e:
+    def _get_company(self):
+        request = self.context.get("request")
+        user = getattr(request, "user", None) if request else None
+        if not user:
             return None
-        if e.first_name or e.last_name:
-            return f"{e.first_name or ''} {e.last_name or ''}".strip()
-        return getattr(e, "email", None) or getattr(e, "username", None)
+        return getattr(user, "company", None) or getattr(user, "owned_company", None)
 
-    # ----- валидация -----
+    def _get_branch(self, request, company):
+        """
+        Берём филиал только из ?branch=<uuid>, если он принадлежит компании.
+        Если нет/кривой — считаем запись глобальной (branch=None).
+        """
+        if not request or not company:
+            return None
 
-    def validate_percent(self, value):
-        if value is None:
-            return value
-        if value < 0 or value > 100:
-            raise serializers.ValidationError("Процент должен быть от 0 до 100.")
-        return value
+        from apps.users.models import Branch
 
-    def validate(self, attrs):
-        attrs = super().validate(attrs)
+        branch_id = None
+        if hasattr(request, "query_params"):
+            branch_id = request.query_params.get("branch")
+        elif hasattr(request, "GET"):
+            branch_id = request.GET.get("branch")
 
-        company = self._user_company()
-        company_id = getattr(company, "id", None)
+        if not branch_id:
+            return None
 
-        product = attrs.get("product") or getattr(self.instance, "product", None)
-        employee = attrs.get("employee") or getattr(self.instance, "employee", None)
+        try:
+            return Branch.objects.get(id=branch_id, company=company)
+        except (Branch.DoesNotExist, ValueError):
+            return None
 
-        target_branch = self._auto_branch()
+    def create(self, validated_data):
+        request = self.context.get("request")
 
-        # товар → та же компания
-        if company_id and product and getattr(product, "company_id", None) != company_id:
-            raise serializers.ValidationError({"product": "Товар принадлежит другой компании."})
+        company = self._get_company()
+        if not company:
+            raise serializers.ValidationError("У пользователя не задана компания.")
 
-        # сотрудник → та же компания
-        if company_id and employee and getattr(employee, "company_id", None) != company_id:
-            raise serializers.ValidationError({"employee": "Сотрудник принадлежит другой компании."})
+        branch = self._get_branch(request, company)
 
-        # если у товара есть branch, проверяем, что он глобальный/этого филиала
-        if target_branch is not None and product is not None:
-            pb = getattr(product, "branch_id", None)
-            if pb not in (None, target_branch.id):
-                raise serializers.ValidationError({"product": "Товар принадлежит другому филиалу."})
+        validated_data["company"] = company
+        validated_data["branch"] = branch
 
-        return attrs
+        old_fund = validated_data["old_total_fund"]
+        new_fund = validated_data["new_total_fund"]
+        validated_data["total"] = self._calc_total(old_fund, new_fund)
 
-    # create/update оставляем от миксина:
-    # company/branch берутся из пользователя и ?branch,
-    # payout_amount посчитается в save() модели ProductSalePayout.
+        return super().create(validated_data)
+
+    def update(self, instance, validated_data):
+        # компанию/филиал не даём менять
+        validated_data.pop("company", None)
+        validated_data.pop("branch", None)
+
+        instance = super().update(instance, validated_data)
+        instance.total = self._calc_total(
+            instance.old_total_fund,
+            instance.new_total_fund,
+        )
+        instance.save(update_fields=["old_total_fund", "new_total_fund", "total"])
+        return instance

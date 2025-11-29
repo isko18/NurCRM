@@ -22,6 +22,7 @@ from .serializers import (
     ChangePasswordSerializer,
     CompanyUpdateSerializer,
     CustomRoleSerializer,
+    CompanySubscriptionSerializer 
 )
 # сериализаторы филиала (read + write)
 from .serializers import BranchSerializer, BranchCreateUpdateSerializer
@@ -457,3 +458,63 @@ class BranchDetailAPIView(generics.RetrieveUpdateDestroyAPIView):
         if not (user.is_superuser or getattr(user, "role", None) in ("owner", "admin")):
             raise PermissionDenied("Недостаточно прав для удаления филиала.")
         instance.delete()
+
+# Список компаний (для свагера / фронта)
+class CompanyListAPIView(generics.ListAPIView):
+    serializer_class = CompanySerializer
+    permission_classes = [IsAuthenticated]
+
+    def get_queryset(self):
+        if getattr(self, 'swagger_fake_view', False):
+            return Company.objects.none()
+
+        user = self.request.user
+
+        # 🔓 superuser видит все компании
+        if user.is_superuser:
+            return Company.objects.all()
+
+        # 👑 системный админ (role = admin) — тоже все
+        if getattr(user, "role", None) == "admin":
+            return Company.objects.all()
+
+        # 👔 владелец компании — только свою
+        if getattr(user, "owned_company_id", None):
+            return Company.objects.filter(id=user.owned_company_id)
+
+        # 👷 сотрудник — только свою
+        if getattr(user, "company_id", None):
+            return Company.objects.filter(id=user.company_id)
+
+        # прочие — ничего
+        return Company.objects.none()
+
+
+class CompanySubscriptionAdminAPIView(generics.RetrieveUpdateAPIView):
+    """
+    GET   /api/users/companies/<uuid:pk>/subscription/
+    PATCH /api/users/companies/<uuid:pk>/subscription/
+    """
+    serializer_class = CompanySubscriptionSerializer
+    permission_classes = [IsAuthenticated]
+
+    def get_queryset(self):
+        user = self.request.user
+
+        # суперюзер и системный admin видят/меняют подписку любой компании
+        if user.is_superuser or getattr(user, "role", None) == "admin":
+            return Company.objects.all()
+
+        # владелец компании может менять только свою
+        if getattr(user, "owned_company_id", None):
+            return Company.objects.filter(id=user.owned_company_id)
+
+        # обычный сотрудник — лучше запретить вообще:
+        return Company.objects.none()
+
+    def perform_update(self, serializer):
+        user = self.request.user
+        if not (user.is_superuser or getattr(user, "role", None) == "admin" or getattr(user, "owned_company_id", None)):
+            # если хочешь — можешь оставить только superuser/admin
+            raise PermissionDenied("У вас нет прав изменять подписку компании.")
+        serializer.save()
