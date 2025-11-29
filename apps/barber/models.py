@@ -702,3 +702,4 @@ class ProductSalePayout(models.Model):
             )
         self.full_clean()
         return super().save(*args, **kwargs)
+    
