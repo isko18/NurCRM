@@ -657,7 +657,7 @@ class ProductSalePayout(models.Model):
     payout_amount = models.DecimalField(
         max_digits=12,
         decimal_places=2,
-        default=Decimal("0.00"),
+        # default=Decimal("0.00"),
         verbose_name="Сумма начисления",
     )
 

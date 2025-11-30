@@ -623,7 +623,10 @@ class PayoutSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
         else:
             payout_amount = Decimal("0.00")
 
-        payout_amount = payout_amount.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        payout_amount = (price * percent / 100).quantize(
+    Decimal("0.00"),
+    rounding=ROUND_HALF_UP
+)
 
 
         validated_data["company"] = company
