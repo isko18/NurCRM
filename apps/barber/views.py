@@ -11,7 +11,7 @@ from django_filters import rest_framework as filters
 from django_filters.rest_framework import DjangoFilterBackend
 
 from apps.users.models import Branch
-from .models import Service, Client, Appointment, Document, Folder, ServiceCategory, Payout, ProductSalePayout
+from .models import Service, Client, Appointment, Document, Folder, ServiceCategory, Payout, PayoutSale
 from .serializers import (
     ServiceSerializer,
     ClientSerializer,
@@ -20,7 +20,7 @@ from .serializers import (
     DocumentSerializer,
     ServiceCategorySerializer,
     PayoutSerializer,
-    ProductSalePayoutSerializer
+    PayoutSaleSerializer
 )
 
 
@@ -484,52 +484,31 @@ class ServiceCategoryRetrieveUpdateDestroyView(
     queryset = ServiceCategory.objects.all()
     serializer_class = ServiceCategorySerializer
     permission_classes = [permissions.IsAuthenticated]
+
     
     
-    
-class ProductSalePayoutListCreateView(CompanyQuerysetMixin, generics.ListCreateAPIView):
-    """
-    GET  /api/barber/product-sale-payouts/  – список начислений с процента от товара
-    POST /api/barber/product-sale-payouts/  – создать одно начисление (по форме модалки)
-    """
-
-    queryset = (
-        ProductSalePayout.objects
-        .select_related("company", "branch", "product", "employee")
-        .all()
-    )
-    serializer_class = ProductSalePayoutSerializer
-    permission_classes = [permissions.IsAuthenticated]
-
-    filter_backends = [DjangoFilterBackend, SearchFilter, OrderingFilter]
-    filterset_fields = [
-        f.name for f in ProductSalePayout._meta.get_fields()
-        if not f.is_relation or f.many_to_one
-    ]
-    search_fields = [
-        "product__name",
-        "employee__first_name",
-        "employee__last_name",
-        "employee__email",
-    ]
-    ordering_fields = ["created_at", "price", "payout_amount", "percent"]
-    ordering = ["-created_at"]
-
-
-class ProductSalePayoutRetrieveUpdateDestroyView(
+class PayoutSaleListCreateView(
     CompanyQuerysetMixin,
-    generics.RetrieveUpdateDestroyAPIView,
+    generics.ListCreateAPIView
 ):
-    """
-    GET    /api/barber/product-sale-payouts/<uuid:pk>/   – одно начисление
-    PATCH  /api/barber/product-sale-payouts/<uuid:pk>/   – можно править процент/цену/комментарий
-    DELETE /api/barber/product-sale-payouts/<uuid:pk>/   – удалить начисление
-    """
 
-    queryset = (
-        ProductSalePayout.objects
-        .select_related("company", "branch", "product", "employee")
-        .all()
-    )
-    serializer_class = ProductSalePayoutSerializer
+    queryset = PayoutSale.objects.all()
+    serializer_class = PayoutSaleSerializer
+    permission_classes = [permissions.IsAuthenticated]
+    
+    filter_backends = [DjangoFilterBackend, SearchFilter, OrderingFilter]
+
+    filterset_fields = [
+        f.name for f in PayoutSale._meta.get_fields() if not f.is_relation or f.many_to_one
+    ]
+    search_fields = ["period"]
+    ordering_fields = ["period", "total", "old_total_fund", "new_total_fund"]
+    ordering = ["-period"]
+
+class PayoutSaleRetrieveUpdateDestroyView(
+    CompanyQuerysetMixin,
+    generics.RetrieveUpdateDestroyAPIView
+):
+    queryset = PayoutSale.objects.all()
+    serializer_class = PayoutSaleSerializer
     permission_classes = [permissions.IsAuthenticated]

@@ -5,6 +5,9 @@ from django.core.mail import send_mail
 from django.conf import settings
 from django.contrib.auth.password_validation import validate_password
 
+from datetime import timedelta
+from django.utils import timezone
+
 import string
 import secrets
 
@@ -824,3 +827,43 @@ class BranchCreateUpdateSerializer(serializers.ModelSerializer):
             if qs.exists():
                 raise serializers.ValidationError({"code": "Код филиала должен быть уникален в пределах компании."})
         return super().validate(attrs)
+
+
+class CompanySubscriptionSerializer(serializers.ModelSerializer):
+    # служебное поле для кнопки "Продлить на месяц"
+    extend_months = serializers.IntegerField(
+        write_only=True,
+        required=False,
+        min_value=1,
+        help_text="На сколько месяцев продлить подписку (для кнопки 'Продлить на месяц' = 1).",
+    )
+
+    class Meta:
+        model = Company
+        fields = [
+            "start_date",
+            "end_date",
+            "extend_months",
+        ]
+
+    def update(self, instance, validated_data):
+        # забираем extend_months, чтобы не улетел в setattr
+        extend_months = validated_data.pop("extend_months", None)
+
+        # если явно прислали start_date / end_date — просто обновляем
+        for attr, value in validated_data.items():
+            setattr(instance, attr, value)
+
+        # если пришло extend_months — двигаем дату окончания
+        if extend_months:
+            now = timezone.now()
+            base_date = instance.end_date or now
+            if base_date < now:
+                # если подписка уже истекла — считаем от текущего момента
+                base_date = now
+
+            # условно месяц = 30 дней
+            instance.end_date = base_date + timedelta(days=30 * extend_months)
+
+        instance.save()
+        return instance

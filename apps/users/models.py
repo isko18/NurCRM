@@ -493,3 +493,7 @@ class ScaleDevice(models.Model):
         if self.branch:
             return f"{self.company.name} / {self.branch.name} / {self.name}"
         return f"{self.company.name} / {self.name}"
+
+
+
+
