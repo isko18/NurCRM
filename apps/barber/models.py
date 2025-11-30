@@ -4,7 +4,7 @@ from django.core.exceptions import ValidationError
 from django.db import models
 from django.db.models import Q, F
 from django.utils import timezone
-from decimal import Decimal
+from decimal import Decimal, ROUND_HALF_UP
 from django.conf import settings
 from django.core.exceptions import ValidationError, ValidationError as DjangoValidationError
 from django.db.models.signals import m2m_changed
@@ -657,7 +657,7 @@ class ProductSalePayout(models.Model):
     payout_amount = models.DecimalField(
         max_digits=12,
         decimal_places=2,
-        # default=Decimal("0.00"),
+        default=Decimal("0.00"),
         verbose_name="Сумма начисления",
     )
 
@@ -697,8 +697,8 @@ class ProductSalePayout(models.Model):
         # пересчитываем сумму перед сохранением
         if self.price is not None and self.percent is not None:
             self.payout_amount = (
-                Decimal(self.price) * Decimal(self.percent) / Decimal("100")
-            )
+                (self.price * self.percent) / Decimal("100")
+            ).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
         self.full_clean()
         return super().save(*args, **kwargs)
         
