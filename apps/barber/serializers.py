@@ -728,10 +728,8 @@ class ProductSalePayoutSerializer(CompanyBranchReadOnlyMixin, serializers.ModelS
 
         return attrs
 
-
 class PayoutSaleSerializer(serializers.ModelSerializer):
-    # принимаем "2025-11" и ISO, в БД хранится datetime,
-    # наружу показываем обратно "2025-11"
+    # фронт шлёт "2025-11", храним datetime, наружу тоже "YYYY-MM"
     period = serializers.DateTimeField(
         input_formats=["%Y-%m", "iso-8601"],
         format="%Y-%m",
@@ -746,11 +744,16 @@ class PayoutSaleSerializer(serializers.ModelSerializer):
             "new_total_fund",
             "total",
         ]
-        read_only_fields = ["id", "total"]
+        # эти поля считаются на бэке, с фронта игнорим
+        read_only_fields = ["id", "old_total_fund", "total"]
+
+    # ===== helpers =====
 
     def _calc_total(self, old_fund, new_fund) -> Decimal:
-        # total = old - new (на сколько фонд упал)
-        return (Decimal(old_fund) - Decimal(new_fund)).quantize(
+        """
+        total = new_total_fund - old_total_fund
+        """
+        return (Decimal(new_fund) - Decimal(old_fund)).quantize(
             Decimal("0.01"), rounding=ROUND_HALF_UP
         )
 
@@ -785,7 +788,22 @@ class PayoutSaleSerializer(serializers.ModelSerializer):
         except (Branch.DoesNotExist, ValueError):
             return None
 
+    # ===== create: реализуем всю логику Infinity =====
+
     def create(self, validated_data):
+        """
+        Вход:  { "period": "YYYY-MM", "new_total_fund": "1200.00" }
+
+        1) company/branch берём из пользователя и ?branch=
+        2) Ищем запись за этот же period.
+        3) old_total_fund:
+              если запись была → old = previous.new_total_fund
+              если не было     → old = 0
+        4) total = new_total_fund - old_total_fund
+        5) Upsert:
+              если запись за period уже есть → UPDATE
+              если нет → CREATE
+        """
         request = self.context.get("request")
 
         company = self._get_company()
@@ -793,25 +811,44 @@ class PayoutSaleSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError("У пользователя не задана компания.")
 
         branch = self._get_branch(request, company)
+        period = validated_data["period"]
+        new_total_fund = Decimal(str(validated_data["new_total_fund"]))
 
-        validated_data["company"] = company
-        validated_data["branch"] = branch
+        # 2) ищем существующую запись за этот же period
+        try:
+            instance = PayoutSale.objects.get(
+                company=company,
+                branch=branch,
+                period=period,
+            )
+            # 3а) была запись → old = прошлый new_total_fund
+            old_total_fund = instance.new_total_fund
+        except PayoutSale.DoesNotExist:
+            instance = None
+            # 3б) не было → old = 0
+            old_total_fund = Decimal("0.00")
 
-        old_fund = validated_data["old_total_fund"]
-        new_fund = validated_data["new_total_fund"]
-        validated_data["total"] = self._calc_total(old_fund, new_fund)
+        # 4) считаем total
+        total = self._calc_total(old_total_fund, new_total_fund)
 
-        return super().create(validated_data)
+        if instance is None:
+            # 5) CREATE
+            instance = PayoutSale.objects.create(
+                company=company,
+                branch=branch,
+                period=period,
+                old_total_fund=old_total_fund,
+                new_total_fund=new_total_fund,
+                total=total,
+            )
+        else:
+            # 5) UPDATE
+            instance.old_total_fund = old_total_fund
+            instance.new_total_fund = new_total_fund
+            instance.total = total
+            instance.save(update_fields=["old_total_fund", "new_total_fund", "total"])
 
-    def update(self, instance, validated_data):
-        # компанию/филиал не даём менять
-        validated_data.pop("company", None)
-        validated_data.pop("branch", None)
-
-        instance = super().update(instance, validated_data)
-        instance.total = self._calc_total(
-            instance.old_total_fund,
-            instance.new_total_fund,
-        )
-        instance.save(update_fields=["old_total_fund", "new_total_fund", "total"])
         return instance
+
+    # опционально: если кто-то вдруг будет делать PATCH/PUT —
+    # можно оставить поведение по умолчанию или тоже пересчитывать тут.
