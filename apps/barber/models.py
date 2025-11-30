@@ -708,14 +708,14 @@ class PayoutSale(models.Model):
     company = models.ForeignKey(
         Company,
         on_delete=models.CASCADE,
-        related_name="product_sale_payouts",
+        related_name="sale_payouts",
         verbose_name="Компания",
     )
 
     branch = models.ForeignKey(
         Branch,
         on_delete=models.CASCADE,
-        related_name="product_sale_payouts",
+        related_name="sale_payouts",
         verbose_name="Филиал",
         null=True,
         blank=True,
