@@ -1,10 +1,8 @@
 from datetime import date, timedelta
-from collections import defaultdict
 from decimal import Decimal
 from datetime import datetime
 
 from django.db.models import Prefetch
-from django.db.models import DecimalField, ExpressionWrapper
 from django.db.models import Sum, Count, F, Value as V
 from django.db.models.functions import Coalesce, TruncDate
 from django.utils import timezone
@@ -17,7 +15,6 @@ from .models import (
     Acceptance,
     ReturnFromAgent,
     AgentSaleAllocation,
-    Product,
 )
 from apps.users.models import User
 
@@ -181,6 +178,7 @@ def _compute_agent_on_hand(*, company, branch, agent) -> dict:
 def build_agent_analytics_payload(*, company, branch, agent, period, date_from, date_to, group_by="day"):
     """
     Считает всё, что нужно для экрана аналитики агента.
+    ВСЯ математика по деньгам делается в Python, без Sum(F()*F()).
     """
     # ---- Фильтры по датам ----
     dt_from = timezone.make_aware(
@@ -226,63 +224,75 @@ def build_agent_analytics_payload(*, company, branch, agent, period, date_from, 
 
     sales_count = sale_alloc_qs.values("sale_id").distinct().count()
 
-    # qty * price через ExpressionWrapper
-    amount_expr = ExpressionWrapper(
-        F("qty") * F("product__price"),
-        output_field=DecimalField(max_digits=18, decimal_places=2),
-    )
-
-    sales_by_product = (
+    # 1) Продажи по товарам: qty суммируем в БД, amount считаем в Python
+    sales_by_product_qs = (
         sale_alloc_qs
-        .values("product_id", "product__name")
+        .values("product_id", "product__name", "product__price")
         .annotate(
             qty=Coalesce(Sum("qty"), V(0)),
-            amount=Coalesce(Sum(amount_expr), V(0)),
         )
-        .order_by("-amount")
+        .order_by("-qty")
     )
 
-    sales_amount = 0
-    for row in sales_by_product:
-        sales_amount += float(row["amount"] or 0)
+    sales_amount = 0.0
+    sales_by_product_amount = []
 
-    # ---- Продажи по датам ----
-    sales_by_date_qs = (
+    for row in sales_by_product_qs:
+        qty = int(row["qty"] or 0)
+        price = row["product__price"] or Decimal("0.00")
+        amount = float(price) * qty
+        sales_amount += amount
+
+        sales_by_product_amount.append({
+            "product_id": str(row["product_id"]),
+            "product_name": row["product__name"],
+            "amount": amount,
+        })
+
+    # 2) Продажи по датам: sales_count / items_sold считаем в БД,
+    #    суммы по дням считаем в Python из "сырых" аллокаций.
+    sales_by_date_base = (
         sale_alloc_qs
         .annotate(day=TruncDate("sale__created_at"))
         .values("day")
         .annotate(
             sales_count=Count("sale_id", distinct=True),
             items_sold=Coalesce(Sum("qty"), V(0)),
-            amount=Coalesce(Sum(amount_expr), V(0)),
         )
         .order_by("day")
     )
+
+    # словарь: день -> сумма денег
+    amounts_by_day = {}
+    raw_rows = (
+        sale_alloc_qs
+        .annotate(day=TruncDate("sale__created_at"))
+        .values("day", "qty", "product__price")
+    )
+    for r in raw_rows:
+        d = r["day"]
+        qty = int(r["qty"] or 0)
+        price = r["product__price"] or Decimal("0.00")
+        amount = (amounts_by_day.get(d) or Decimal("0.00")) + (price * qty)
+        amounts_by_day[d] = amount
+
     sales_by_date = [
         {
             "date": row["day"],
             "sales_count": row["sales_count"],
-            "sales_amount": float(row["amount"] or 0),
+            "sales_amount": float(amounts_by_day.get(row["day"], Decimal("0.00"))),
         }
-        for row in sales_by_date_qs
+        for row in sales_by_date_base
     ]
 
-    # ---- Продажи по товарам (сумма) + распределение ----
-    sales_by_product_amount = []
-    for row in sales_by_product:
-        sales_by_product_amount.append({
-            "product_id": str(row["product_id"]),
-            "product_name": row["product__name"],
-            "amount": float(row["amount"] or 0),
-        })
-
+    # 3) Распределение по товарам (проценты)
     sales_distribution_by_product = []
     if sales_amount > 0:
-        for row in sales_by_product:
-            amount = float(row["amount"] or 0)
+        for row in sales_by_product_amount:
+            amount = row["amount"]
             sales_distribution_by_product.append({
-                "product_id": str(row["product_id"]),
-                "product_name": row["product__name"],
+                "product_id": row["product_id"],
+                "product_name": row["product_name"],
                 "amount": amount,
                 "percent": round(amount * 100.0 / sales_amount, 2),
             })
