@@ -2,10 +2,9 @@ from datetime import date, timedelta
 from collections import defaultdict
 from decimal import Decimal
 from datetime import datetime
+
 from django.db.models import Prefetch
 from django.db.models import DecimalField, ExpressionWrapper
-
-
 from django.db.models import Sum, Count, F, Value as V
 from django.db.models.functions import Coalesce, TruncDate
 from django.utils import timezone
@@ -13,7 +12,6 @@ from django.utils import timezone
 from itertools import groupby
 from operator import attrgetter
 
-# модели
 from .models import (
     ManufactureSubreal,
     Acceptance,
@@ -22,7 +20,6 @@ from .models import (
     Product,
 )
 from apps.users.models import User
-
 
 
 def _parse_period(request):
@@ -140,7 +137,6 @@ def _compute_agent_on_hand(*, company, branch, agent) -> dict:
         if not product:
             continue
 
-        # ⚠️ если у тебя другое поле цены — поменяй тут
         price = getattr(product, "price", None) or Decimal("0.00")
 
         qty_on_hand = 0
@@ -150,7 +146,6 @@ def _compute_agent_on_hand(*, company, branch, agent) -> dict:
             returned = int(s.qty_returned or 0)
 
             sold = int(getattr(s, "sold_qty", 0) or 0)
-            # fallback на prefetched_allocs, если аннотации нет
             if not sold and getattr(s, "prefetched_allocs", None) is not None:
                 sold = sum(int(a.qty or 0) for a in s.prefetched_allocs)
 
@@ -181,7 +176,6 @@ def _compute_agent_on_hand(*, company, branch, agent) -> dict:
         "by_product_qty": by_product_qty,
         "by_product_amount": by_product_amount,
     }
-
 
 
 def build_agent_analytics_payload(*, company, branch, agent, period, date_from, date_to, group_by="day"):
@@ -222,7 +216,6 @@ def build_agent_analytics_payload(*, company, branch, agent, period, date_from, 
     acceptances_count = acc_qs.count()
 
     # ---- Продажи (по AgentSaleAllocation) ----
-    # ---- Продажи (по AgentSaleAllocation) ----
     sale_alloc_qs = AgentSaleAllocation.objects.filter(
         company=company,
         agent=agent,
@@ -233,7 +226,7 @@ def build_agent_analytics_payload(*, company, branch, agent, period, date_from, 
 
     sales_count = sale_alloc_qs.values("sale_id").distinct().count()
 
-    # аккуратно считаем qty * price через ExpressionWrapper
+    # qty * price через ExpressionWrapper
     amount_expr = ExpressionWrapper(
         F("qty") * F("product__price"),
         output_field=DecimalField(max_digits=18, decimal_places=2),
@@ -249,10 +242,8 @@ def build_agent_analytics_payload(*, company, branch, agent, period, date_from, 
         .order_by("-amount")
     )
 
-
     sales_amount = 0
     for row in sales_by_product:
-        # amount может быть Decimal
         sales_amount += float(row["amount"] or 0)
 
     # ---- Продажи по датам ----
@@ -263,7 +254,7 @@ def build_agent_analytics_payload(*, company, branch, agent, period, date_from, 
         .annotate(
             sales_count=Count("sale_id", distinct=True),
             items_sold=Coalesce(Sum("qty"), V(0)),
-            amount=Coalesce(Sum(F("qty") * F("product__price")), V(0)),
+            amount=Coalesce(Sum(amount_expr), V(0)),
         )
         .order_by("day")
     )
@@ -299,7 +290,6 @@ def build_agent_analytics_payload(*, company, branch, agent, period, date_from, 
     # ---- Товары на руках (сейчас) ----
     on_hand = _compute_agent_on_hand(company=company, branch=branch, agent=agent)
 
-    # ---- Товары на руках по количеству / стоимости ----
     on_hand_by_product_qty = on_hand["by_product_qty"]
     on_hand_by_product_amount = on_hand["by_product_amount"]
 
