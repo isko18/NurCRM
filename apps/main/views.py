@@ -21,7 +21,7 @@ from rest_framework import serializers
 from .filters import TransactionRecordFilter, DebtFilter, DebtPaymentFilter
 from django_filters.rest_framework import DjangoFilterBackend
 
-from apps.users.models import Branch
+from apps.users.models import Branch, User
 
 from apps.main.models import (
     Contact, Pipeline, Deal, Task, Integration, Analytics,
@@ -51,6 +51,8 @@ from apps.main.serializers import (
 )
 from django.db.models import ProtectedError
 from apps.utils import product_images_prefetch, _is_owner_like
+from apps.main.analytics_agent import build_agent_analytics_payload, _parse_period
+
 
 
 # ===========================
@@ -2938,3 +2940,70 @@ class AgentRequestItemRetrieveUpdateDestroyAPIView(
             raise ValidationError("Нельзя удалить позицию из чужой корзины.")
 
         instance.delete()
+        
+class AgentMyAnalyticsAPIView(APIView, CompanyBranchRestrictedMixin):
+    """
+    GET /api/main/agents/me/analytics/
+
+    Квери:
+      ?period=day|week|month|custom
+      ?date_from=YYYY-MM-DD
+      ?date_to=YYYY-MM-DD
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request, *args, **kwargs):
+        company = self._company()
+        branch = self._auto_branch()
+        agent = request.user
+
+        if not getattr(agent, "company_id", None) or agent.company_id != company.id:
+            return Response(
+                {"detail": "Профиль агента не привязан к компании."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        period_params = _parse_period(request)
+
+        data = build_agent_analytics_payload(
+            company=company,
+            branch=branch,
+            agent=agent,
+            **period_params,
+        )
+        return Response(data, status=status.HTTP_200_OK)
+
+
+class OwnerAgentAnalyticsAPIView(APIView, CompanyBranchRestrictedMixin):
+    """
+    GET /api/main/owners/agents/<uuid:agent_id>/analytics/
+
+    Доступ: только владелец/админ (_is_owner_like).
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request, agent_id, *args, **kwargs):
+        if not _is_owner_like(request.user):
+            return Response({"detail": "Forbidden"}, status=status.HTTP_403_FORBIDDEN)
+
+        company = self._company()
+        branch = self._auto_branch()
+
+        try:
+            agent = (
+                User.objects
+                .filter(company=company)
+                .get(pk=agent_id)
+            )
+        except User.DoesNotExist:
+            return Response({"detail": "Agent not found."}, status=status.HTTP_404_NOT_FOUND)
+
+        period_params = _parse_period(request)
+
+        data = build_agent_analytics_payload(
+            company=company,
+            branch=branch,
+            agent=agent,
+            **period_params,
+        )
+        return Response(data, status=status.HTTP_200_OK)

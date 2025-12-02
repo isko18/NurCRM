@@ -189,6 +189,11 @@ name="client-reconciliation",),
 
     path("agent-cart-items/", AgentRequestItemListCreateAPIView.as_view()),
     path("agent-cart-items/<uuid:pk>/", AgentRequestItemRetrieveUpdateDestroyAPIView.as_view()),
+    
+    path("agents/me/products/", AgentMyProductsListAPIView.as_view(), name="agent-my-products"),
+
+    path("agents/me/analytics/", AgentMyAnalyticsAPIView.as_view(), name="agent-my-analytics"),
+    path("owners/agents/<uuid:agent_id>/analytics/", OwnerAgentAnalyticsAPIView.as_view(), name="owner-agent-analytics",),
 ]
 
 

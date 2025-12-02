@@ -311,13 +311,6 @@ class Company(models.Model):
             self.end_date = self.start_date + timedelta(days=10)
         super().save(*args, **kwargs)
 
-    def save(self, *args, **kwargs):
-        if not self.start_date:
-            self.start_date = timezone.now()
-        if not self.end_date and self.start_date:
-            self.end_date = self.start_date + timedelta(days=10)
-        super().save(*args, **kwargs)
-
     def __str__(self):
         return self.name
 

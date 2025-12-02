@@ -1940,21 +1940,6 @@ class ObjectSaleItem(models.Model):
             self.object_item.save(update_fields=["quantity"])
         self.sale.recalc()
 
-
-# ==========================
-# ManufactureSubreal / Acceptance / ReturnFromAgent
-# ==========================
-# models.py
-import uuid
-from django.conf import settings
-from django.core.exceptions import ValidationError
-from django.db import models, transaction
-from django.db.models import F
-from django.utils import timezone
-
-# предполагаю, что Company, Branch, Product уже импортируются/определены выше
-# from .models import Company, Branch, Product  # скорректируйте путь при необходимости
-
 class ManufactureSubreal(models.Model):
     class Status(models.TextChoices):
         OPEN   = "open",   "Открыта"
