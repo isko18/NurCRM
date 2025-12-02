@@ -19,7 +19,7 @@ from .models import (
     AgentSaleAllocation,
     Product,
 )
-from users.models import User
+from apps.users.models import User
 
 
 
