@@ -3,6 +3,8 @@ from collections import defaultdict
 from decimal import Decimal
 from datetime import datetime
 from django.db.models import Prefetch
+from django.db.models import DecimalField, ExpressionWrapper
+
 
 from django.db.models import Sum, Count, F, Value as V
 from django.db.models.functions import Coalesce, TruncDate
@@ -220,6 +222,7 @@ def build_agent_analytics_payload(*, company, branch, agent, period, date_from, 
     acceptances_count = acc_qs.count()
 
     # ---- Продажи (по AgentSaleAllocation) ----
+    # ---- Продажи (по AgentSaleAllocation) ----
     sale_alloc_qs = AgentSaleAllocation.objects.filter(
         company=company,
         agent=agent,
@@ -230,17 +233,22 @@ def build_agent_analytics_payload(*, company, branch, agent, period, date_from, 
 
     sales_count = sale_alloc_qs.values("sale_id").distinct().count()
 
-    # ⚠️ Тут я считаю сумму как qty * product.price.
-    # Если у тебя в SaleItem есть своё поле суммы, можно переписать на него.
+    # аккуратно считаем qty * price через ExpressionWrapper
+    amount_expr = ExpressionWrapper(
+        F("qty") * F("product__price"),
+        output_field=DecimalField(max_digits=18, decimal_places=2),
+    )
+
     sales_by_product = (
         sale_alloc_qs
         .values("product_id", "product__name")
         .annotate(
             qty=Coalesce(Sum("qty"), V(0)),
-            amount=Coalesce(Sum(F("qty") * F("product__price")), V(0)),
+            amount=Coalesce(Sum(amount_expr), V(0)),
         )
         .order_by("-amount")
     )
+
 
     sales_amount = 0
     for row in sales_by_product:
