@@ -1465,7 +1465,6 @@ class Client(models.Model):
             if sp_company_id and sp_company_id != self.company_id:
                 raise ValidationError({'salesperson': 'Продавец другой компании.'})
 
-
 class ClientDeal(models.Model):
     class Kind(models.TextChoices):
         AMOUNT = "amount", "Сумма договора"
@@ -1474,20 +1473,55 @@ class ClientDeal(models.Model):
         PREPAYMENT = "prepayment", "Предоплата"
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    company = models.ForeignKey(Company, on_delete=models.CASCADE, related_name="client_deals", verbose_name="Компания")
-    branch = models.ForeignKey(
-        Branch, on_delete=models.CASCADE, related_name='crm_client_deals',
-        null=True, blank=True, db_index=True, verbose_name='Филиал'
+    company = models.ForeignKey(
+        Company,
+        on_delete=models.CASCADE,
+        related_name="client_deals",
+        verbose_name="Компания",
     )
-    client = models.ForeignKey("Client", on_delete=models.CASCADE, related_name="deals", verbose_name="Клиент")
+    branch = models.ForeignKey(
+        Branch,
+        on_delete=models.CASCADE,
+        related_name="crm_client_deals",
+        null=True,
+        blank=True,
+        db_index=True,
+        verbose_name="Филиал",
+    )
+    client = models.ForeignKey(
+        "Client",
+        on_delete=models.CASCADE,
+        related_name="deals",
+        verbose_name="Клиент",
+    )
     title = models.CharField("Название сделки", max_length=255)
-    kind = models.CharField("Тип сделки", max_length=16, choices=Kind.choices, default=Kind.SALE)
+    kind = models.CharField(
+        "Тип сделки",
+        max_length=16,
+        choices=Kind.choices,
+        default=Kind.SALE,
+    )
 
-    amount = models.DecimalField("Сумма договора", max_digits=12, decimal_places=2, default=0)
-    prepayment = models.DecimalField("Предоплата", max_digits=12, decimal_places=2, default=0)
+    amount = models.DecimalField(
+        "Сумма договора", max_digits=12, decimal_places=2, default=0
+    )
+    prepayment = models.DecimalField(
+        "Предоплата", max_digits=12, decimal_places=2, default=0
+    )
 
-    debt_months = models.PositiveSmallIntegerField("Срок (мес.)", blank=True, null=True)
-    first_due_date = models.DateField("Первая дата оплаты", blank=True, null=True)
+    debt_months = models.PositiveSmallIntegerField(
+        "Срок (мес.)", blank=True, null=True
+    )
+    first_due_date = models.DateField(
+        "Первая дата оплаты", blank=True, null=True
+    )
+
+    # 🔥 НОВОЕ: управляем автогенерацией графика
+    auto_schedule = models.BooleanField(
+        "Автоматический график",
+        default=True,
+        help_text="Если выключено — график не пересобирается автоматически.",
+    )
 
     note = models.TextField("Комментарий", blank=True)
     created_at = models.DateTimeField("Создано", auto_now_add=True)
@@ -1504,11 +1538,17 @@ class ClientDeal(models.Model):
 
     def clean(self):
         if self.branch_id and self.branch.company_id != self.company_id:
-            raise ValidationError({'branch': 'Филиал принадлежит другой компании.'})
+            raise ValidationError(
+                {"branch": "Филиал принадлежит другой компании."}
+            )
         if self.client_id and self.client.company_id != self.company_id:
-            raise ValidationError({'client': 'Клиент другой компании.'})
-        if self.branch_id and self.client_id and self.client.branch_id not in (None, self.branch_id):
-            raise ValidationError({'client': 'Клиент другого филиала.'})
+            raise ValidationError({"client": "Клиент другой компании."})
+        if (
+            self.branch_id
+            and self.client_id
+            and self.client.branch_id not in (None, self.branch_id)
+        ):
+            raise ValidationError({"client": "Клиент другого филиала."})
 
     @property
     def debt_amount(self) -> Decimal:
@@ -1527,21 +1567,35 @@ class ClientDeal(models.Model):
     def monthly_payment(self) -> Decimal:
         if not self.debt_months or self.debt_months == 0:
             return Decimal("0.00")
-        return (self.debt_amount / Decimal(self.debt_months)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        return (self.debt_amount / Decimal(self.debt_months)).quantize(
+            Decimal("0.01"), rounding=ROUND_HALF_UP
+        )
 
     def rebuild_installments(self):
+        """
+        Пересобираем график ТОЛЬКО под долги.
+        Вызывать руками или из save(), если auto_schedule=True.
+        """
         if self.kind != ClientDeal.Kind.DEBT or not self.debt_months or self.debt_months == 0:
             self.installments.all().delete()
             return
+
         total = self.debt_amount
         if total <= 0:
             self.installments.all().delete()
             return
-        start = self.first_due_date or (timezone.now().date() + relativedelta(months=+1))
+
+        start = self.first_due_date or (
+            timezone.now().date() + relativedelta(months=+1)
+        )
         self.installments.all().delete()
-        base = (total / Decimal(self.debt_months)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+        base = (total / Decimal(self.debt_months)).quantize(
+            Decimal("0.01"), rounding=ROUND_HALF_UP
+        )
         paid = Decimal("0.00")
         items = []
+
         for i in range(1, self.debt_months + 1):
             amount_i = (total - paid) if i == self.debt_months else base
             paid += amount_i
@@ -1555,11 +1609,19 @@ class ClientDeal(models.Model):
                     balance_after=(total - paid).quantize(Decimal("0.01")),
                 )
             )
+
         DealInstallment.objects.bulk_create(items)
 
     def save(self, *args, **kwargs):
+        """
+        По умолчанию (auto_schedule=True) — пересобираем график при сохранении.
+        Если фронт/админ руками правил installments и выключил auto_schedule,
+        то save() график больше не трогает.
+        """
         super().save(*args, **kwargs)
-        self.rebuild_installments()
+
+        if self.kind == ClientDeal.Kind.DEBT and self.auto_schedule:
+            self.rebuild_installments()
 
 
 class DealInstallment(models.Model):

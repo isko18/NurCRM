@@ -1263,15 +1263,15 @@ class ClientDealListCreateAPIView(CompanyBranchRestrictedMixin, generics.ListCre
                 raise serializers.ValidationError({"client": "Клиент не найден в вашей компании."})
             serializer.save(company=company, branch=branch)
 
-
-class ClientDealRetrieveUpdateDestroyAPIView(CompanyBranchRestrictedMixin,
-                                             generics.RetrieveUpdateDestroyAPIView):
+class ClientDealRetrieveUpdateDestroyAPIView(
+    CompanyBranchRestrictedMixin,
+    generics.RetrieveUpdateDestroyAPIView,
+):
     """
-    GET    /api/main/deals/<uuid:pk>/
-    PATCH  /api/main/deals/<uuid:pk>/
-    PUT    /api/main/deals/<uuid:pk>/
-    DELETE /api/main/deals/<uuid:pk>/
-    опционально nested: /clients/<client_id>/deals/<pk>/
+    GET    /api/main/clients/<client_id>/deals/<uuid:pk>/
+    PATCH  /api/main/clients/<client_id>/deals/<uuid:pk>/
+    PUT    /api/main/clients/<client_id>/deals/<uuid:pk>/
+    DELETE /api/main/clients/<client_id>/deals/<uuid:pk>/
     """
     serializer_class = ClientDealSerializer
 
@@ -1280,12 +1280,13 @@ class ClientDealRetrieveUpdateDestroyAPIView(CompanyBranchRestrictedMixin,
             ClientDeal.objects
             .select_related("client")
             .prefetch_related("installments")
-            .all()
         )
         qs = self._filter_qs_company_branch(qs)
+
         client_id = self.kwargs.get("client_id")
         if client_id:
             qs = qs.filter(client_id=client_id)
+
         return qs
 
     @transaction.atomic
@@ -1294,16 +1295,25 @@ class ClientDealRetrieveUpdateDestroyAPIView(CompanyBranchRestrictedMixin,
         branch = self._auto_branch()
 
         if company is None:
-            raise serializers.ValidationError({"company": "У пользователя не задана компания."})
+            raise serializers.ValidationError(
+                {"company": "У пользователя не задана компания."}
+            )
 
         new_client = serializer.validated_data.get("client")
         if new_client and new_client.company_id != company.id:
-            raise serializers.ValidationError({"client": "Клиент принадлежит другой компании."})
+            raise serializers.ValidationError(
+                {"client": "Клиент принадлежит другой компании."}
+            )
 
+        # сохраняем с нужной company / branch
         deal = serializer.save(company=company, branch=branch)
 
-        # 🔥 Ключевой момент: сбрасываем префетч и читаем свежие данные
+        # ⚡ ВАЖНО: сбросить кеш prefetch_related("installments"),
+        # чтобы сериализация отдала свежесозданные / пересчитанные
         deal.refresh_from_db()
+
+        # DRF всё равно возьмёт serializer.instance для .data,
+        # так что на всякий случай оставим явное присвоение:
         serializer.instance = deal
 
 

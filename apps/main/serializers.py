@@ -1026,19 +1026,39 @@ class DealInstallmentSerializer(serializers.ModelSerializer):
             "remaining_for_period",
         )
 
-
 class ClientDealSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
     company = serializers.ReadOnlyField(source="company.id")
     branch = serializers.ReadOnlyField(source="branch.id")
 
-    client = serializers.PrimaryKeyRelatedField(queryset=Client.objects.all(), required=False)
-    client_full_name = serializers.CharField(source="client.full_name", read_only=True)
+    client = serializers.PrimaryKeyRelatedField(
+        queryset=Client.objects.all(),
+        required=False,
+    )
+    client_full_name = serializers.CharField(
+        source="client.full_name",
+        read_only=True,
+    )
 
-    debt_amount = serializers.DecimalField(max_digits=12, decimal_places=2, read_only=True)
-    monthly_payment = serializers.DecimalField(max_digits=12, decimal_places=2, read_only=True)
-    remaining_debt = serializers.DecimalField(max_digits=12, decimal_places=2, read_only=True)
+    debt_amount = serializers.DecimalField(
+        max_digits=12,
+        decimal_places=2,
+        read_only=True,
+    )
+    monthly_payment = serializers.DecimalField(
+        max_digits=12,
+        decimal_places=2,
+        read_only=True,
+    )
+    remaining_debt = serializers.DecimalField(
+        max_digits=12,
+        decimal_places=2,
+        read_only=True,
+    )
 
     installments = DealInstallmentSerializer(many=True, read_only=True)
+
+    # 🔥 новое поле — управляем автогенерацией графика
+    auto_schedule = serializers.BooleanField(required=False)
 
     class Meta:
         model = ClientDeal
@@ -1050,52 +1070,80 @@ class ClientDealSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializ
             "debt_months", "first_due_date",
             "debt_amount", "monthly_payment", "remaining_debt",
             "installments",
+            "auto_schedule",
             "note", "created_at", "updated_at",
         ]
         read_only_fields = [
-            "id", "company", "branch", "created_at", "updated_at", "client_full_name",
-            "debt_amount", "monthly_payment", "remaining_debt", "installments",
+            "id", "company", "branch",
+            "created_at", "updated_at",
+            "client_full_name",
+            "debt_amount", "monthly_payment",
+            "remaining_debt", "installments",
         ]
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         comp = self._user_company()
         br = self._auto_branch()
-        _restrict_pk_queryset_strict(self.fields.get("client"), Client.objects.all(), comp, br)
+        _restrict_pk_queryset_strict(
+            self.fields.get("client"),
+            Client.objects.all(),
+            comp,
+            br,
+        )
 
     def validate(self, attrs):
         request = self.context["request"]
         company = request.user.company
         branch = self._auto_branch()
 
-        client = attrs.get("client") or (self.instance.client if self.instance else None)
+        client = attrs.get("client") or (
+            self.instance.client if self.instance else None
+        )
         if client and client.company_id != company.id:
-            raise serializers.ValidationError({"client": "Клиент принадлежит другой компании."})
+            raise serializers.ValidationError(
+                {"client": "Клиент принадлежит другой компании."}
+            )
 
         if branch is not None:
             if client and client.branch_id != branch.id:
-                raise serializers.ValidationError({"client": "Клиент другого филиала."})
+                raise serializers.ValidationError(
+                    {"client": "Клиент другого филиала."}
+                )
 
         amount = attrs.get("amount", getattr(self.instance, "amount", None))
-        prepayment = attrs.get("prepayment", getattr(self.instance, "prepayment", None))
+        prepayment = attrs.get(
+            "prepayment", getattr(self.instance, "prepayment", None)
+        )
         kind = attrs.get("kind", getattr(self.instance, "kind", None))
-        debt_months = attrs.get("debt_months", getattr(self.instance, "debt_months", None))
+        debt_months = attrs.get(
+            "debt_months", getattr(self.instance, "debt_months", None)
+        )
 
         errors = {}
         if amount is not None and amount < 0:
             errors["amount"] = "Сумма не может быть отрицательной."
         if prepayment is not None and prepayment < 0:
             errors["prepayment"] = "Предоплата не может быть отрицательной."
-        if amount is not None and prepayment is not None and prepayment > amount:
-            errors["prepayment"] = "Предоплата не может превышать сумму договора."
+        if (
+            amount is not None
+            and prepayment is not None
+            and prepayment > amount
+        ):
+            errors["prepayment"] = (
+                "Предоплата не может превышать сумму договора."
+            )
 
         if kind == ClientDeal.Kind.DEBT:
             debt_amt = (amount or Decimal("0")) - (prepayment or Decimal("0"))
             if debt_amt <= 0:
-                errors["prepayment"] = 'Для типа "Долг" сумма договора должна быть больше предоплаты.'
+                errors["prepayment"] = (
+                    'Для типа "Долг" сумма договора должна быть больше предоплаты.'
+                )
             if not debt_months or debt_months <= 0:
                 errors["debt_months"] = "Укажите срок (в месяцах) для рассрочки."
         else:
+            # Для других типов долга и графика быть не должно
             attrs["debt_months"] = None
             attrs["first_due_date"] = None
 
