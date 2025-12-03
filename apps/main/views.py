@@ -1264,7 +1264,8 @@ class ClientDealListCreateAPIView(CompanyBranchRestrictedMixin, generics.ListCre
             serializer.save(company=company, branch=branch)
 
 
-class ClientDealRetrieveUpdateDestroyAPIView(CompanyBranchRestrictedMixin, generics.RetrieveUpdateDestroyAPIView):
+class ClientDealRetrieveUpdateDestroyAPIView(CompanyBranchRestrictedMixin,
+                                             generics.RetrieveUpdateDestroyAPIView):
     """
     GET    /api/main/deals/<uuid:pk>/
     PATCH  /api/main/deals/<uuid:pk>/
@@ -1289,12 +1290,17 @@ class ClientDealRetrieveUpdateDestroyAPIView(CompanyBranchRestrictedMixin, gener
 
     @transaction.atomic
     def perform_update(self, serializer):
-        company = self._company()
-        branch = self._auto_branch()
+        company = self._company()          # может быть None (для суперюзера и т.п.)
         new_client = serializer.validated_data.get("client")
-        if new_client and new_client.company_id != company.id:
-            raise serializers.ValidationError({"client": "Клиент принадлежит другой компании."})
-        serializer.save(company=company, branch=branch)
+
+        # Проверяем принадлежность клиента компании ТОЛЬКО если company не None
+        if company and new_client and new_client.company_id != company.id:
+            raise serializers.ValidationError(
+                {"client": "Клиент принадлежит другой компании."}
+            )
+
+        # Всё остальное (company/branch) выставит сам сериализатор через миксин
+        serializer.save()
 
 
 class ClientDealPayAPIView(APIView, CompanyBranchRestrictedMixin):
