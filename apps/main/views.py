@@ -1290,17 +1290,21 @@ class ClientDealRetrieveUpdateDestroyAPIView(CompanyBranchRestrictedMixin,
 
     @transaction.atomic
     def perform_update(self, serializer):
-        company = self._company()          # может быть None (для суперюзера и т.п.)
+        company = self._company()
+        branch = self._auto_branch()
+
+        if company is None:
+            raise serializers.ValidationError({"company": "У пользователя не задана компания."})
+
         new_client = serializer.validated_data.get("client")
+        if new_client and new_client.company_id != company.id:
+            raise serializers.ValidationError({"client": "Клиент принадлежит другой компании."})
 
-        # Проверяем принадлежность клиента компании ТОЛЬКО если company не None
-        if company and new_client and new_client.company_id != company.id:
-            raise serializers.ValidationError(
-                {"client": "Клиент принадлежит другой компании."}
-            )
+        deal = serializer.save(company=company, branch=branch)
 
-        # Всё остальное (company/branch) выставит сам сериализатор через миксин
-        serializer.save()
+        # 🔥 Ключевой момент: сбрасываем префетч и читаем свежие данные
+        deal.refresh_from_db()
+        serializer.instance = deal
 
 
 class ClientDealPayAPIView(APIView, CompanyBranchRestrictedMixin):
