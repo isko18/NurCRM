@@ -1016,7 +1016,12 @@ class MobileScannerIngestAPIView(APIView):
 
 class SaleListAPIView(CompanyBranchRestrictedMixin, generics.ListAPIView):
     serializer_class = SaleListSerializer
-    queryset = Sale.objects.select_related("user").all()
+    queryset = (
+        Sale.objects
+        .select_related("user")
+        .prefetch_related("items__product")  # <-- важно для first_item_name
+        .all()
+    )
     filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
     filterset_fields = ("status", "user")
     search_fields = ("id",)

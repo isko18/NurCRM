@@ -255,8 +255,9 @@ class SaleListSerializer(serializers.ModelSerializer):
     change = serializers.DecimalField(
         max_digits=12,
         decimal_places=2,
-        read_only=True,   # <-- ВАЖНО
+        read_only=True,
     )
+    first_item_name = serializers.SerializerMethodField(read_only=True)
 
     class Meta:
         model = Sale
@@ -275,6 +276,7 @@ class SaleListSerializer(serializers.ModelSerializer):
             "payment_method",
             "cash_received",
             "change",
+            "first_item_name",  # <-- добавили
         )
 
     def get_user_display(self, obj):
@@ -286,6 +288,18 @@ class SaleListSerializer(serializers.ModelSerializer):
             or getattr(u, "email", None)
             or getattr(u, "username", None)
         )
+
+    def get_first_item_name(self, obj):
+        item = obj.items.first()  # related_name=items у SaleItem
+        if not item:
+            return None
+
+        # сначала фиксированное имя на момент продажи, потом живой product.name
+        return (
+            (item.name_snapshot or "").strip()
+            or getattr(getattr(item, "product", None), "name", None)
+        )
+
 
 
 class SaleItemReadSerializer(serializers.ModelSerializer):
