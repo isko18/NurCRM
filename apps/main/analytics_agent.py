@@ -11,7 +11,9 @@ from .models import (
     ManufactureSubreal,
     Acceptance,
     ReturnFromAgent,
-    AgentSaleAllocation, Sale, SaleItem
+    AgentSaleAllocation,  # остаётся для расчёта остатков
+    Sale,
+    SaleItem,
 )
 from apps.users.models import User
 
@@ -172,6 +174,7 @@ def _compute_agent_on_hand(*, company, branch, agent) -> dict:
         "by_product_amount": by_product_amount,
     }
 
+
 def build_agent_analytics_payload(
     *,
     company,
@@ -209,6 +212,9 @@ def build_agent_analytics_payload(
     if branch is not None:
         sub_qs = sub_qs.filter(branch=branch)
 
+    # если есть статусы — можно исключить отменённые:
+    # sub_qs = sub_qs.exclude(status=ManufactureSubreal.Status.CANCELED)
+
     transfers_count = sub_qs.count()
     items_transferred = sub_qs.aggregate(
         s=Coalesce(Sum("qty_transferred"), V(0))
@@ -226,6 +232,9 @@ def build_agent_analytics_payload(
     if branch is not None:
         acc_qs = acc_qs.filter(subreal__branch=branch)
 
+    # если есть статусы — можно исключить черновики:
+    # acc_qs = acc_qs.exclude(status=Acceptance.Status.DRAFT)
+
     acceptances_count = acc_qs.count()
 
     # ======================================================
@@ -239,7 +248,8 @@ def build_agent_analytics_payload(
     if branch is not None:
         sales_qs = sales_qs.filter(branch=branch)
 
-    # если есть статус "оплачено" – можно тут отфильтровать, чтобы не считать черновики
+    # ОБЯЗАТЕЛЬНО: если у тебя есть статус "оплачено" — фильтруем только оплаченные,
+    # чтобы совпадало с тем, что видишь в отчётах
     # sales_qs = sales_qs.filter(status=Sale.Status.PAID)
 
     sales_count = sales_qs.count()
@@ -253,12 +263,14 @@ def build_agent_analytics_payload(
     # ------------------------------------------------------
     items_qs = SaleItem.objects.filter(sale__in=sales_qs)
 
+    # если у тебя поля называются по-другому
+    # (например qty / line_total) — ЗАМЕНИ тут:
     sales_by_product_qs = (
         items_qs
         .values("product_id", "product__name")
         .annotate(
-            qty=Coalesce(Sum("quantity"), V(0)),   # <-- quantity, если у тебя другое поле — поменяй
-            amount=Coalesce(Sum("total"), V(0)),   # <-- total суммы по позиции
+            qty=Coalesce(Sum("quantity"), V(0)),   # <-- quantity
+            amount=Coalesce(Sum("total"), V(0)),   # <-- total
         )
         .order_by("-amount")
     )
