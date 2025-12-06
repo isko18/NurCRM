@@ -1,28 +1,21 @@
-from datetime import date, timedelta, datetime
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 from itertools import groupby
 from operator import attrgetter
 
-from django.db.models import (
-    Prefetch,
-    Sum,
-    Count,
-    Value as V,
-    F,
-    DecimalField,
-)
+from django.db.models import Sum, Count, F, Value as V, DecimalField
 from django.db.models.functions import Coalesce, TruncDate
 from django.utils import timezone
 
-from .models import (
+from apps.main.models import (
     ManufactureSubreal,
     Acceptance,
     ReturnFromAgent,
     AgentSaleAllocation,
     Sale,
     SaleItem,
+    Product,
 )
-from apps.users.models import User
 
 
 def _parse_period(request):
@@ -33,7 +26,7 @@ def _parse_period(request):
     """
     q = request.query_params
     period = (q.get("period") or "month").lower()
-    today = timezone.now().date()
+    today = timezone.localdate()
 
     def _parse_date(name, default):
         v = q.get(name)
@@ -46,107 +39,72 @@ def _parse_period(request):
 
     if period == "day":
         d = _parse_date("date", today)
-        return {
-            "period": "day",
-            "date_from": d,
-            "date_to": d,
-            "group_by": "day",
-        }
+        return {"period": "day", "date_from": d, "date_to": d}
 
     if period == "week":
         date_to = _parse_date("date_to", today)
         date_from = _parse_date("date_from", date_to - timedelta(days=6))
-        return {
-            "period": "week",
-            "date_from": date_from,
-            "date_to": date_to,
-            "group_by": "day",
-        }
+        return {"period": "week", "date_from": date_from, "date_to": date_to}
 
     if period == "custom":
         date_to = _parse_date("date_to", today)
         date_from = _parse_date("date_from", date_to - timedelta(days=29))
-        return {
-            "period": "custom",
-            "date_from": date_from,
-            "date_to": date_to,
-            "group_by": "day",
-        }
+        return {"period": "custom", "date_from": date_from, "date_to": date_to}
 
-    # месяц (последние 30 дней)
+    # по умолчанию: месяц = последние 30 дней
     date_to = _parse_date("date_to", today)
     date_from = _parse_date("date_from", date_to - timedelta(days=29))
-    return {
-        "period": "month",
-        "date_from": date_from,
-        "date_to": date_to,
-        "group_by": "day",
-    }
+    return {"period": "month", "date_from": date_from, "date_to": date_to}
 
 
-def _compute_agent_on_hand(*, company, branch, agent) -> dict:
+def _branch_filter(qs, branch):
     """
-    Остатки у агента на руках.
+    У тебя в моделях паттерн один и тот же:
+    branch == NULL → глобально, иначе конкретный филиал.
     """
-    accepted_returns_qs = ReturnFromAgent.objects.filter(
-        company=company,
-        status=ReturnFromAgent.Status.ACCEPTED,
-    )
-    alloc_qs = AgentSaleAllocation.objects.filter(company=company)
+    if branch is not None:
+        return qs.filter(branch=branch)
+    return qs.filter(branch__isnull=True)
 
-    base = (
+
+def _compute_on_hand(company, branch, agent):
+    """
+    Что сейчас на руках у агента:
+    из ManufactureSubreal с учётом принятых / возвращённых / проданных.
+    """
+    sub_qs = (
         ManufactureSubreal.objects
         .filter(company=company, agent=agent)
+    )
+    sub_qs = _branch_filter(sub_qs, branch)
+
+    # заранее подтянем product и аллокации
+    sub_qs = (
+        sub_qs
         .select_related("product")
-        .prefetch_related(
-            "acceptances",
-            Prefetch(
-                "returns",
-                queryset=accepted_returns_qs,
-                to_attr="accepted_returns",
-            ),
-            Prefetch(
-                "sale_allocations",
-                queryset=alloc_qs,
-                to_attr="prefetched_allocs",
-            ),
-        )
-        .annotate(sold_qty=Coalesce(Sum("sale_allocations__qty"), V(0)))
+        .prefetch_related("sale_allocations")
         .order_by("product_id", "-created_at")
     )
-
-    # ВАЖНО: логика как в миксине — если branch None → branch IS NULL
-    if branch is not None:
-        base = base.filter(branch=branch)
-    else:
-        base = base.filter(branch__isnull=True)
 
     total_qty = 0
     total_amount = Decimal("0.00")
     by_product_qty = []
     by_product_amount = []
 
-    for product_id, subreals_iter in groupby(base, key=attrgetter("product_id")):
-        subreals = list(subreals_iter)
-        if not subreals:
-            continue
-
-        product = subreals[0].product if getattr(subreals[0], "product", None) else None
+    for product_id, sub_list in groupby(sub_qs, key=attrgetter("product_id")):
+        sub_list = list(sub_list)
+        product = sub_list[0].product
         if not product:
             continue
 
-        price = getattr(product, "price", None) or Decimal("0.00")
-
+        price = product.price or Decimal("0.00")
         qty_on_hand = 0
 
-        for s in subreals:
+        for s in sub_list:
             accepted = int(s.qty_accepted or 0)
             returned = int(s.qty_returned or 0)
-
-            sold = int(getattr(s, "sold_qty", 0) or 0)
-            if not sold and getattr(s, "prefetched_allocs", None) is not None:
-                sold = sum(int(a.qty or 0) for a in s.prefetched_allocs)
-
+            # уже продали через AgentSaleAllocation
+            sold = sum(int(a.qty or 0) for a in s.sale_allocations.all())
             qty_on_hand += max(accepted - returned - sold, 0)
 
         if qty_on_hand <= 0:
@@ -176,76 +134,46 @@ def _compute_agent_on_hand(*, company, branch, agent) -> dict:
     }
 
 
-def build_agent_analytics_payload(
-    *,
-    company,
-    branch,
-    agent,
-    period,
-    date_from,
-    date_to,
-    group_by="day",
-):
+def build_agent_analytics(company, branch, agent, *, date_from, date_to, period: str):
     """
-    Аналитика агента.
+    Основной payload для "Моя аналитика" агента.
+    company/branch/agent — это текущая компания/филиал/пользователь.
     """
+    dt_from = datetime.combine(date_from, datetime.min.time())
+    dt_to = datetime.combine(date_to, datetime.max.time())
+    dt_from = timezone.make_aware(dt_from)
+    dt_to = timezone.make_aware(dt_to)
 
-    # ---- диапазон дат ----
-    dt_from = timezone.make_aware(
-        datetime.combine(date_from, datetime.min.time())
-    )
-    dt_to = timezone.make_aware(
-        datetime.combine(date_to, datetime.max.time())
-    )
-
-    # ======================================================
-    #              П Е Р Е Д А Ч И
-    # ======================================================
+    # ===== ПЕРЕДАЧИ =====
     sub_qs = ManufactureSubreal.objects.filter(
         company=company,
         agent=agent,
         created_at__range=(dt_from, dt_to),
     )
-    if branch is not None:
-        sub_qs = sub_qs.filter(branch=branch)
-    else:
-        sub_qs = sub_qs.filter(branch__isnull=True)
+    sub_qs = _branch_filter(sub_qs, branch)
 
     transfers_count = sub_qs.count()
     items_transferred = sub_qs.aggregate(
         s=Coalesce(Sum("qty_transferred"), V(0))
     )["s"] or 0
 
-    # ======================================================
-    #              П Р И Ё М К И
-    # ======================================================
+    # ===== ПРИЁМКИ =====
     acc_qs = Acceptance.objects.filter(
         company=company,
         subreal__agent=agent,
         accepted_at__range=(dt_from, dt_to),
     )
-    if branch is not None:
-        acc_qs = acc_qs.filter(subreal__branch=branch)
-    else:
-        acc_qs = acc_qs.filter(subreal__branch__isnull=True)
-
+    acc_qs = _branch_filter(acc_qs, branch)
     acceptances_count = acc_qs.count()
 
-    # ======================================================
-    #              П Р О Д А Ж И
-    # ======================================================
+    # ===== ПРОДАЖИ (только PAID) =====
     sales_qs = Sale.objects.filter(
         company=company,
         user=agent,
         created_at__range=(dt_from, dt_to),
+        status=Sale.Status.PAID,
     )
-    if branch is not None:
-        sales_qs = sales_qs.filter(branch=branch)
-    else:
-        sales_qs = sales_qs.filter(branch__isnull=True)
-
-    # считаем только оплаченные
-    sales_qs = sales_qs.filter(status=Sale.Status.PAID)
+    sales_qs = _branch_filter(sales_qs, branch)
 
     sales_count = sales_qs.count()
     sales_amount_dec = sales_qs.aggregate(
@@ -253,10 +181,11 @@ def build_agent_analytics_payload(
     )["s"] or Decimal("0.00")
     sales_amount = float(sales_amount_dec)
 
-    # 1) продажи по товарам
+    # подробности по позициям
     items_qs = SaleItem.objects.filter(sale__in=sales_qs)
 
-    sales_by_product_qs = (
+    # продажи по товарам (сумма)
+    by_product_qs = (
         items_qs
         .values("product_id", "product__name")
         .annotate(
@@ -271,18 +200,18 @@ def build_agent_analytics_payload(
         )
         .order_by("-amount")
     )
-
-    sales_by_product_amount = []
-    for row in sales_by_product_qs:
-        amount = row["amount"] or Decimal("0.00")
-        sales_by_product_amount.append({
+    sales_by_product_amount = [
+        {
             "product_id": str(row["product_id"]),
             "product_name": row["product__name"],
-            "amount": float(amount),
-        })
+            "amount": float(row["amount"] or Decimal("0.00")),
+            "qty": row["qty"],
+        }
+        for row in by_product_qs
+    ]
 
-    # 2) продажи по датам
-    sales_by_date_qs = (
+    # продажи по датам
+    by_date_qs = (
         items_qs
         .annotate(day=TruncDate("sale__created_at"))
         .values("day")
@@ -299,42 +228,30 @@ def build_agent_analytics_payload(
         )
         .order_by("day")
     )
-
     sales_by_date = [
         {
             "date": row["day"],
             "sales_count": row["sales_count"],
             "sales_amount": float(row["amount"] or Decimal("0.00")),
+            "items_sold": row["items_sold"],
         }
-        for row in sales_by_date_qs
+        for row in by_date_qs
     ]
 
-    # 3) распределение по товарам
-    sales_distribution_by_product = []
+    # распределение по товарам (проценты)
+    distribution = []
     if sales_amount > 0:
-        for row in sales_by_product_amount:
-            amount = row["amount"]
-            sales_distribution_by_product.append({
-                "product_id": row["product_id"],
-                "product_name": row["product_name"],
-                "amount": amount,
-                "percent": round(amount * 100.0 / sales_amount, 2),
+        for item in sales_by_product_amount:
+            amt = item["amount"]
+            distribution.append({
+                **item,
+                "percent": round(amt * 100.0 / sales_amount, 2),
             })
 
-    # ======================================================
-    #        Т О В А Р Ы  Н А  Р У К А Х
-    # ======================================================
-    on_hand = _compute_agent_on_hand(
-        company=company,
-        branch=branch,
-        agent=agent,
-    )
-    on_hand_by_product_qty = on_hand["by_product_qty"]
-    on_hand_by_product_amount = on_hand["by_product_amount"]
+    # товары на руках
+    on_hand = _compute_on_hand(company, branch, agent)
 
-    # ======================================================
-    #      П Е Р Е Д А Ч И  П О  Д Н Я М
-    # ======================================================
+    # передачи по датам (для графика)
     transfers_by_date_qs = (
         sub_qs
         .annotate(day=TruncDate("created_at"))
@@ -354,55 +271,7 @@ def build_agent_analytics_payload(
         for row in transfers_by_date_qs
     ]
 
-    # ТОП товаров по передачам
-    top_products_qs = (
-        sub_qs
-        .values("product_id", "product__name")
-        .annotate(
-            transfers_count=Count("id"),
-            items_transferred=Coalesce(Sum("qty_transferred"), V(0)),
-        )
-        .order_by("-items_transferred")[:10]
-    )
-    top_products_by_transfers = [
-        {
-            "product_id": str(row["product_id"]),
-            "product_name": row["product__name"],
-            "transfers_count": row["transfers_count"],
-            "items_transferred": row["items_transferred"],
-        }
-        for row in top_products_qs
-    ]
-
-    # история передач
-    history_qs = (
-        sub_qs
-        .select_related("product")
-        .order_by("-created_at")[:200]
-    )
-    transfers_history = [
-        {
-            "id": str(s.id),
-            "date": s.created_at,
-            "product_id": str(s.product_id),
-            "product_name": getattr(s.product, "name", ""),
-            "qty": s.qty_transferred,
-            "status": s.status,
-            "status_label": s.get_status_display(),
-        }
-        for s in history_qs
-    ]
-
-    # базовая инфа по агенту
-    agent_payload = {
-        "id": str(agent.id),
-        "first_name": getattr(agent, "first_name", "") or "",
-        "last_name": getattr(agent, "last_name", "") or "",
-        "track_number": getattr(agent, "track_number", None),
-    }
-
     return {
-        "agent": agent_payload,
         "period": {
             "type": period,
             "date_from": date_from,
@@ -420,11 +289,9 @@ def build_agent_analytics_payload(
         "charts": {
             "sales_by_date": sales_by_date,
             "sales_by_product_amount": sales_by_product_amount,
-            "sales_distribution_by_product": sales_distribution_by_product,
-            "on_hand_by_product_qty": on_hand_by_product_qty,
-            "on_hand_by_product_amount": on_hand_by_product_amount,
+            "sales_distribution_by_product": distribution,
+            "on_hand_by_product_qty": on_hand["by_product_qty"],
+            "on_hand_by_product_amount": on_hand["by_product_amount"],
             "transfers_by_date": transfers_by_date,
-            "top_products_by_transfers": top_products_by_transfers,
         },
-        "transfers_history": transfers_history,
     }

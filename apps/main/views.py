@@ -52,7 +52,7 @@ from apps.main.serializers import (
 )
 from django.db.models import ProtectedError
 from apps.utils import product_images_prefetch, _is_owner_like
-from apps.main.analytics_agent import build_agent_analytics_payload, _parse_period
+from apps.main.analytics_agent import build_agent_analytics, _parse_period
 
 
 
@@ -2963,42 +2963,29 @@ class AgentRequestItemRetrieveUpdateDestroyAPIView(
         instance.delete()
 
       
-class AgentMyAnalyticsAPIView(CompanyBranchRestrictedMixin, APIView):
+class MyAgentAnalyticsAPIView(APIView):
     """
-    GET /api/main/agents/me/analytics/
-
-    Квери:
-      ?period=day|week|month|custom
-      ?date_from=YYYY-MM-DD
-      ?date_to=YYYY-MM-DD
+    GET /api/main/agents/me/analytics/?period=month
+    + опционально ?date_from=2025-11-01&date_to=2025-12-07
     """
-    permission_classes = [permissions.IsAuthenticated]
+    permission_classes = [IsAuthenticated]
 
     def get(self, request, *args, **kwargs):
-        # компания из миксина (company/branch уже используются во всей системе)
-        company = self._company()
-        branch = self._auto_branch()
-        agent = request.user
+        user = request.user
+        company = getattr(user, "company", None)
+        branch = getattr(user, "branch", None)  # если у тебя branch на юзере, иначе бери из сессии
 
-        # fallback, если вдруг _company() вернул None
-        if company is None:
-            company = getattr(agent, "owned_company", None) or getattr(agent, "company", None)
+        if not company:
+            return Response({"detail": "Нет компании у пользователя."}, status=400)
 
-        if company is None or getattr(agent, "company_id", None) != company.id:
-            return Response(
-                {"detail": "Профиль агента не привязан к компании."},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-
-        period_params = _parse_period(request)
-
-        data = build_agent_analytics_payload(
+        params = _parse_period(request)
+        payload = build_agent_analytics(
             company=company,
             branch=branch,
-            agent=agent,
-            **period_params,
+            agent=user,
+            **params,
         )
-        return Response(data, status=status.HTTP_200_OK)
+        return Response(payload)
 
 
 class OwnerAgentAnalyticsAPIView(CompanyBranchRestrictedMixin, APIView):
