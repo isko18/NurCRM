@@ -173,21 +173,13 @@ def _compute_agent_on_hand(*, company, branch, agent) -> dict:
     }
 
 
-def build_agent_analytics_payload(
-    *,
-    company,
-    branch,
-    agent,
-    period,
-    date_from,
-    date_to,
-    group_by="day",
-):
+def build_agent_analytics_payload(*, company, branch, agent, period, date_from, date_to, group_by="day"):
     """
     Считает всё, что нужно для экрана аналитики агента.
-    ВСЯ математика по деньгам делается в Python, без Sum(F()*F()).
+    Вся тяжёлая математика по деньгам делается в Python (без Sum(F()*F())).
     """
-    # ---- Фильтры по датам ----
+
+    # ---- Диапазон дат (включительно) ----
     dt_from = timezone.make_aware(
         datetime.combine(date_from, datetime.min.time())
     )
@@ -195,7 +187,9 @@ def build_agent_analytics_payload(
         datetime.combine(date_to, datetime.max.time())
     )
 
-    # ---- Передачи ----
+    # ======================================================
+    #              П Е Р Е Д А Ч И  (ManufactureSubreal)
+    # ======================================================
     sub_qs = ManufactureSubreal.objects.filter(
         company=company,
         agent=agent,
@@ -209,30 +203,41 @@ def build_agent_analytics_payload(
         s=Coalesce(Sum("qty_transferred"), V(0))
     )["s"] or 0
 
-    # ---- Приёмки ----
+    # ======================================================
+    #              П Р И Ё М К И  (Acceptance)
+    # ======================================================
     acc_qs = Acceptance.objects.filter(
         company=company,
         subreal__agent=agent,
         accepted_at__range=(dt_from, dt_to),
     )
-    # 🔧 ВАЖНО: фильтруем по филиалу через subreal, а не по полю branch у Acceptance
+    # ВАЖНО: филиал берём с передачи (subreal.branch), а не из самой приёмки
     if branch is not None:
         acc_qs = acc_qs.filter(subreal__branch=branch)
 
     acceptances_count = acc_qs.count()
 
-    # ---- Продажи (по AgentSaleAllocation) ----
+    # ======================================================
+    #              П Р О Д А Ж И  (AgentSaleAllocation)
+    # ======================================================
     sale_alloc_qs = AgentSaleAllocation.objects.filter(
         company=company,
         agent=agent,
         sale__created_at__range=(dt_from, dt_to),
     )
+    # Филиал продаж — по sale.branch (а не по subreal.branch)
     if branch is not None:
-        sale_alloc_qs = sale_alloc_qs.filter(subreal__branch=branch)
+        sale_alloc_qs = sale_alloc_qs.filter(sale__branch=branch)
 
+    # Кол-во чеков
     sales_count = sale_alloc_qs.values("sale_id").distinct().count()
 
-    # 1) Продажи по товарам: qty суммируем в БД, amount считаем в Python
+    # ------------------------------------------------------
+    # 1) Продажи по товарам: количество считаем в БД,
+    #    сумму считаем в Python (qty * текущая цена товара).
+    #    Если хочешь брать цену из snapshot — тут нужно
+    #    заменить product__price на поле snapshot из модели.
+    # ------------------------------------------------------
     sales_by_product_qs = (
         sale_alloc_qs
         .values("product_id", "product__name", "product__price")
@@ -248,8 +253,7 @@ def build_agent_analytics_payload(
     for row in sales_by_product_qs:
         qty = int(row["qty"] or 0)
         price = row["product__price"] or Decimal("0.00")
-        amount_dec = price * qty
-        amount = float(amount_dec)
+        amount = float(price) * qty
         sales_amount += amount
 
         sales_by_product_amount.append({
@@ -258,8 +262,10 @@ def build_agent_analytics_payload(
             "amount": amount,
         })
 
-    # 2) Продажи по датам: sales_count / items_sold считаем в БД,
-    #    суммы по дням считаем в Python из "сырых" аллокаций.
+    # ------------------------------------------------------
+    # 2) Продажи по датам: количество и кол-во чеков считаем в БД,
+    #    суммы по дням — в Python на "сырых" аллокациях.
+    # ------------------------------------------------------
     sales_by_date_base = (
         sale_alloc_qs
         .annotate(day=TruncDate("sale__created_at"))
@@ -271,7 +277,7 @@ def build_agent_analytics_payload(
         .order_by("day")
     )
 
-    # словарь: день -> сумма денег
+    # день -> сумма денег
     amounts_by_day = {}
     raw_rows = (
         sale_alloc_qs
@@ -283,20 +289,20 @@ def build_agent_analytics_payload(
         qty = int(r["qty"] or 0)
         price = r["product__price"] or Decimal("0.00")
         prev = amounts_by_day.get(d) or Decimal("0.00")
-        amounts_by_day[d] = prev + (price * qty)
+        amounts_by_day[d] = prev + price * qty
 
     sales_by_date = [
         {
             "date": row["day"],
             "sales_count": row["sales_count"],
-            "sales_amount": float(
-                amounts_by_day.get(row["day"], Decimal("0.00"))
-            ),
+            "sales_amount": float(amounts_by_day.get(row["day"], Decimal("0.00"))),
         }
         for row in sales_by_date_base
     ]
 
+    # ------------------------------------------------------
     # 3) Распределение по товарам (проценты)
+    # ------------------------------------------------------
     sales_distribution_by_product = []
     if sales_amount > 0:
         for row in sales_by_product_amount:
@@ -308,17 +314,18 @@ def build_agent_analytics_payload(
                 "percent": round(amount * 100.0 / sales_amount, 2),
             })
 
-    # ---- Товары на руках (сейчас) ----
-    on_hand = _compute_agent_on_hand(
-        company=company,
-        branch=branch,
-        agent=agent,
-    )
+    # ======================================================
+    #       Т О В А Р Ы  Н А  Р У К А Х  (сейчас)
+    # ======================================================
 
+
+    on_hand = _compute_agent_on_hand(company=company, branch=branch, agent=agent)
     on_hand_by_product_qty = on_hand["by_product_qty"]
     on_hand_by_product_amount = on_hand["by_product_amount"]
 
-    # ---- Передачи по датам ----
+    # ======================================================
+    #             П Е Р Е Д А Ч И  П О  Д Н Я М
+    # ======================================================
     transfers_by_date_qs = (
         sub_qs
         .annotate(day=TruncDate("created_at"))
@@ -338,7 +345,9 @@ def build_agent_analytics_payload(
         for row in transfers_by_date_qs
     ]
 
-    # ---- Топ товаров по передачам ----
+    # ======================================================
+    #         ТОП ТОВАРОВ ПО ПЕРЕДАЧАМ (по qty)
+    # ======================================================
     top_products_qs = (
         sub_qs
         .values("product_id", "product__name")
@@ -358,7 +367,9 @@ def build_agent_analytics_payload(
         for row in top_products_qs
     ]
 
-    # ---- История передач ----
+    # ======================================================
+    #              И С Т О Р И Я  П Е Р Е Д А Ч
+    # ======================================================
     history_qs = (
         sub_qs
         .select_related("product")
@@ -377,7 +388,9 @@ def build_agent_analytics_payload(
         for s in history_qs
     ]
 
-    # ---- Базовая инфа по агенту ----
+    # ======================================================
+    #              Б А З О В А Я  И Н Ф О  П О  А Г Е Н Т У
+    # ======================================================
     agent_payload = {
         "id": str(agent.id),
         "first_name": getattr(agent, "first_name", "") or "",
