@@ -4,7 +4,8 @@ from .pos_views import *
 
 
 urlpatterns = [
-
+    
+    path("test-celery/", TestCeleryAPIView.as_view(), name="test-celery"),
     # 🔹 Контакты
     path('socialapplications/<uuid:pk>/', SocialApplicationsRetrieveUpdateDestroyAPIView.as_view(), name='socialapplications-detail'),
     path('socialapplications/', SocialApplicationsListCreateAPIView.as_view(), name='socialapplications-list-create'),

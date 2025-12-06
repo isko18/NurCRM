@@ -37,3 +37,13 @@ def notify_assigned_user_async(sender, instance, created, **kwargs):
     if created and instance.assigned_to:
         # Убедитесь, что задача сохранена, прежде чем вызывать celery задачу
         transaction.on_commit(lambda: create_task_notification.delay(str(instance.id)))
+
+# apps/main/tasks.py
+from time import sleep
+
+@shared_task
+def test_celery_api(name: str):
+    print("=== START TEST TASK FROM API ===", name)
+    sleep(5)  # имитация тяжёлой задачи
+    print("=== END TEST TASK FROM API ===", name)
+    return f"Hello from Celery, {name}"
