@@ -1,14 +1,11 @@
-from datetime import date, timedelta
+from datetime import date, timedelta, datetime
 from decimal import Decimal
-from datetime import datetime
-
-from django.db.models import Prefetch
-from django.db.models import Sum, Count, F, Value as V
-from django.db.models.functions import Coalesce, TruncDate
-from django.utils import timezone
-
 from itertools import groupby
 from operator import attrgetter
+
+from django.db.models import Prefetch, Sum, Count, Value as V
+from django.db.models.functions import Coalesce, TruncDate
+from django.utils import timezone
 
 from .models import (
     ManufactureSubreal,
@@ -89,6 +86,7 @@ def _compute_agent_on_hand(*, company, branch, agent) -> dict:
       - total_amount   — их стоимость (qty * product.price)
       - by_product_qty — список по каждому товару (qty)
       - by_product_amount — список по каждому товару (qty + amount)
+
     Логика такая же, как в AgentMyProductsListAPIView.
     """
     accepted_returns_qs = ReturnFromAgent.objects.filter(
@@ -175,7 +173,16 @@ def _compute_agent_on_hand(*, company, branch, agent) -> dict:
     }
 
 
-def build_agent_analytics_payload(*, company, branch, agent, period, date_from, date_to, group_by="day"):
+def build_agent_analytics_payload(
+    *,
+    company,
+    branch,
+    agent,
+    period,
+    date_from,
+    date_to,
+    group_by="day",
+):
     """
     Считает всё, что нужно для экрана аналитики агента.
     ВСЯ математика по деньгам делается в Python, без Sum(F()*F()).
@@ -208,8 +215,9 @@ def build_agent_analytics_payload(*, company, branch, agent, period, date_from, 
         subreal__agent=agent,
         accepted_at__range=(dt_from, dt_to),
     )
+    # 🔧 ВАЖНО: фильтруем по филиалу через subreal, а не по полю branch у Acceptance
     if branch is not None:
-        acc_qs = acc_qs.filter(branch=branch)
+        acc_qs = acc_qs.filter(subreal__branch=branch)
 
     acceptances_count = acc_qs.count()
 
@@ -240,7 +248,8 @@ def build_agent_analytics_payload(*, company, branch, agent, period, date_from, 
     for row in sales_by_product_qs:
         qty = int(row["qty"] or 0)
         price = row["product__price"] or Decimal("0.00")
-        amount = float(price) * qty
+        amount_dec = price * qty
+        amount = float(amount_dec)
         sales_amount += amount
 
         sales_by_product_amount.append({
@@ -273,14 +282,16 @@ def build_agent_analytics_payload(*, company, branch, agent, period, date_from, 
         d = r["day"]
         qty = int(r["qty"] or 0)
         price = r["product__price"] or Decimal("0.00")
-        amount = (amounts_by_day.get(d) or Decimal("0.00")) + (price * qty)
-        amounts_by_day[d] = amount
+        prev = amounts_by_day.get(d) or Decimal("0.00")
+        amounts_by_day[d] = prev + (price * qty)
 
     sales_by_date = [
         {
             "date": row["day"],
             "sales_count": row["sales_count"],
-            "sales_amount": float(amounts_by_day.get(row["day"], Decimal("0.00"))),
+            "sales_amount": float(
+                amounts_by_day.get(row["day"], Decimal("0.00"))
+            ),
         }
         for row in sales_by_date_base
     ]
@@ -298,7 +309,11 @@ def build_agent_analytics_payload(*, company, branch, agent, period, date_from, 
             })
 
     # ---- Товары на руках (сейчас) ----
-    on_hand = _compute_agent_on_hand(company=company, branch=branch, agent=agent)
+    on_hand = _compute_agent_on_hand(
+        company=company,
+        branch=branch,
+        agent=agent,
+    )
 
     on_hand_by_product_qty = on_hand["by_product_qty"]
     on_hand_by_product_amount = on_hand["by_product_amount"]

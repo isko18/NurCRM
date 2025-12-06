@@ -2961,8 +2961,9 @@ class AgentRequestItemRetrieveUpdateDestroyAPIView(
             raise ValidationError("Нельзя удалить позицию из чужой корзины.")
 
         instance.delete()
-        
-class AgentMyAnalyticsAPIView(APIView, CompanyBranchRestrictedMixin):
+
+      
+class AgentMyAnalyticsAPIView(CompanyBranchRestrictedMixin, APIView):
     """
     GET /api/main/agents/me/analytics/
 
@@ -2974,11 +2975,16 @@ class AgentMyAnalyticsAPIView(APIView, CompanyBranchRestrictedMixin):
     permission_classes = [permissions.IsAuthenticated]
 
     def get(self, request, *args, **kwargs):
+        # компания из миксина (company/branch уже используются во всей системе)
         company = self._company()
         branch = self._auto_branch()
         agent = request.user
 
-        if not getattr(agent, "company_id", None) or agent.company_id != company.id:
+        # fallback, если вдруг _company() вернул None
+        if company is None:
+            company = getattr(agent, "owned_company", None) or getattr(agent, "company", None)
+
+        if company is None or getattr(agent, "company_id", None) != company.id:
             return Response(
                 {"detail": "Профиль агента не привязан к компании."},
                 status=status.HTTP_400_BAD_REQUEST,
@@ -2995,7 +3001,7 @@ class AgentMyAnalyticsAPIView(APIView, CompanyBranchRestrictedMixin):
         return Response(data, status=status.HTTP_200_OK)
 
 
-class OwnerAgentAnalyticsAPIView(APIView, CompanyBranchRestrictedMixin):
+class OwnerAgentAnalyticsAPIView(CompanyBranchRestrictedMixin, APIView):
     """
     GET /api/main/owners/agents/<uuid:agent_id>/analytics/
 
@@ -3004,11 +3010,22 @@ class OwnerAgentAnalyticsAPIView(APIView, CompanyBranchRestrictedMixin):
     permission_classes = [permissions.IsAuthenticated]
 
     def get(self, request, agent_id, *args, **kwargs):
-        if not _is_owner_like(request.user):
+        user = request.user
+        if not _is_owner_like(user):
             return Response({"detail": "Forbidden"}, status=status.HTTP_403_FORBIDDEN)
 
         company = self._company()
         branch = self._auto_branch()
+
+        # fallback, если _company() ничего не дал
+        if company is None:
+            company = getattr(user, "owned_company", None) or getattr(user, "company", None)
+
+        if company is None:
+            return Response(
+                {"detail": "У вас не задана компания."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
 
         try:
             agent = (

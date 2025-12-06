@@ -2335,7 +2335,6 @@ class AgentRequestCart(models.Model):
         return f"Заявка {self.id} от {getattr(self.agent,'username',self.agent_id)} [{self.get_status_display()}]"
 
     def clean(self):
-        # привязки по компании/филиалу
         if self.branch_id and self.branch.company_id != self.company_id:
             raise ValidationError({'branch': 'Филиал принадлежит другой компании.'})
         if self.agent_id and getattr(self.agent, "company_id", None) not in (None, self.company_id):
