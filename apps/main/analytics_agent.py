@@ -3,7 +3,14 @@ from decimal import Decimal
 from itertools import groupby
 from operator import attrgetter
 
-from django.db.models import Prefetch, Sum, Count, Value as V, F
+from django.db.models import (
+    Prefetch,
+    Sum,
+    Count,
+    Value as V,
+    F,
+    DecimalField,
+)
 from django.db.models.functions import Coalesce, TruncDate
 from django.utils import timezone
 
@@ -261,10 +268,12 @@ def build_agent_analytics_payload(
         .values("product_id", "product__name")
         .annotate(
             qty=Coalesce(Sum("quantity"), V(0)),
-            # сумма по строкам: quantity * unit_price
             amount=Coalesce(
-                Sum(F("quantity") * F("unit_price")),
-                V(0),
+                Sum(
+                    F("quantity") * F("unit_price"),
+                    output_field=DecimalField(max_digits=12, decimal_places=2),
+                ),
+                V(Decimal("0.00")),
             ),
         )
         .order_by("-amount")
@@ -290,8 +299,11 @@ def build_agent_analytics_payload(
             sales_count=Count("sale_id", distinct=True),
             items_sold=Coalesce(Sum("quantity"), V(0)),
             amount=Coalesce(
-                Sum(F("quantity") * F("unit_price")),
-                V(0),
+                Sum(
+                    F("quantity") * F("unit_price"),
+                    output_field=DecimalField(max_digits=12, decimal_places=2),
+                ),
+                V(Decimal("0.00")),
             ),
         )
         .order_by("day")
@@ -332,7 +344,7 @@ def build_agent_analytics_payload(
     on_hand_by_product_amount = on_hand["by_product_amount"]
 
     # ======================================================
-    #             П Е Р Е Д А Ч И  П О  Д Н Я М
+    #             П Е Р Е Д А ЧИ  П О  Д Н Я М
     # ======================================================
     transfers_by_date_qs = (
         sub_qs
