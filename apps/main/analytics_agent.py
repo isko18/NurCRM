@@ -11,7 +11,7 @@ from .models import (
     ManufactureSubreal,
     Acceptance,
     ReturnFromAgent,
-    AgentSaleAllocation,
+    AgentSaleAllocation, Sale, SaleItem
 )
 from apps.users.models import User
 
@@ -172,11 +172,22 @@ def _compute_agent_on_hand(*, company, branch, agent) -> dict:
         "by_product_amount": by_product_amount,
     }
 
-
-def build_agent_analytics_payload(*, company, branch, agent, period, date_from, date_to, group_by="day"):
+def build_agent_analytics_payload(
+    *,
+    company,
+    branch,
+    agent,
+    period,
+    date_from,
+    date_to,
+    group_by="day",
+):
     """
-    Считает всё, что нужно для экрана аналитики агента.
-    Вся тяжёлая математика по деньгам делается в Python (без Sum(F()*F())).
+    Аналитика агента:
+      - передачи (ManufactureSubreal)
+      - приёмки (Acceptance)
+      - продажи (Sale + SaleItem)
+      - остатки на руках (_compute_agent_on_hand)
     """
 
     # ---- Диапазон дат (включительно) ----
@@ -211,93 +222,78 @@ def build_agent_analytics_payload(*, company, branch, agent, period, date_from, 
         subreal__agent=agent,
         accepted_at__range=(dt_from, dt_to),
     )
-    # ВАЖНО: филиал берём с передачи (subreal.branch), а не из самой приёмки
+    # филиал берём с передачи (subreal.branch)
     if branch is not None:
         acc_qs = acc_qs.filter(subreal__branch=branch)
 
     acceptances_count = acc_qs.count()
 
     # ======================================================
-    #              П Р О Д А Ж И  (AgentSaleAllocation)
+    #              П Р О Д А Ж И  (Sale + SaleItem)
     # ======================================================
-    sale_alloc_qs = AgentSaleAllocation.objects.filter(
+    sales_qs = Sale.objects.filter(
         company=company,
-        agent=agent,
-        sale__created_at__range=(dt_from, dt_to),
+        user=agent,
+        created_at__range=(dt_from, dt_to),
     )
-    # Филиал продаж — по sale.branch (а не по subreal.branch)
     if branch is not None:
-        sale_alloc_qs = sale_alloc_qs.filter(sale__branch=branch)
+        sales_qs = sales_qs.filter(branch=branch)
 
-    # Кол-во чеков
-    sales_count = sale_alloc_qs.values("sale_id").distinct().count()
+    # если есть статус "оплачено" – можно тут отфильтровать, чтобы не считать черновики
+    # sales_qs = sales_qs.filter(status=Sale.Status.PAID)
+
+    sales_count = sales_qs.count()
+    sales_amount_dec = sales_qs.aggregate(
+        s=Coalesce(Sum("total"), V(Decimal("0.00")))
+    )["s"] or Decimal("0.00")
+    sales_amount = float(sales_amount_dec)
 
     # ------------------------------------------------------
-    # 1) Продажи по товарам: количество считаем в БД,
-    #    сумму считаем в Python (qty * текущая цена товара).
-    #    Если хочешь брать цену из snapshot — тут нужно
-    #    заменить product__price на поле snapshot из модели.
+    # 1) Продажи по товарам (через SaleItem)
     # ------------------------------------------------------
+    items_qs = SaleItem.objects.filter(sale__in=sales_qs)
+
     sales_by_product_qs = (
-        sale_alloc_qs
-        .values("product_id", "product__name", "product__price")
+        items_qs
+        .values("product_id", "product__name")
         .annotate(
-            qty=Coalesce(Sum("qty"), V(0)),
+            qty=Coalesce(Sum("quantity"), V(0)),   # <-- quantity, если у тебя другое поле — поменяй
+            amount=Coalesce(Sum("total"), V(0)),   # <-- total суммы по позиции
         )
-        .order_by("-qty")
+        .order_by("-amount")
     )
 
-    sales_amount = 0.0
     sales_by_product_amount = []
-
     for row in sales_by_product_qs:
-        qty = int(row["qty"] or 0)
-        price = row["product__price"] or Decimal("0.00")
-        amount = float(price) * qty
-        sales_amount += amount
-
+        amount = row["amount"] or Decimal("0.00")
         sales_by_product_amount.append({
             "product_id": str(row["product_id"]),
             "product_name": row["product__name"],
-            "amount": amount,
+            "amount": float(amount),
         })
 
     # ------------------------------------------------------
-    # 2) Продажи по датам: количество и кол-во чеков считаем в БД,
-    #    суммы по дням — в Python на "сырых" аллокациях.
+    # 2) Продажи по датам (по чекам, но с суммами по товарам)
     # ------------------------------------------------------
-    sales_by_date_base = (
-        sale_alloc_qs
+    sales_by_date_qs = (
+        items_qs
         .annotate(day=TruncDate("sale__created_at"))
         .values("day")
         .annotate(
             sales_count=Count("sale_id", distinct=True),
-            items_sold=Coalesce(Sum("qty"), V(0)),
+            items_sold=Coalesce(Sum("quantity"), V(0)),
+            amount=Coalesce(Sum("total"), V(0)),
         )
         .order_by("day")
     )
-
-    # день -> сумма денег
-    amounts_by_day = {}
-    raw_rows = (
-        sale_alloc_qs
-        .annotate(day=TruncDate("sale__created_at"))
-        .values("day", "qty", "product__price")
-    )
-    for r in raw_rows:
-        d = r["day"]
-        qty = int(r["qty"] or 0)
-        price = r["product__price"] or Decimal("0.00")
-        prev = amounts_by_day.get(d) or Decimal("0.00")
-        amounts_by_day[d] = prev + price * qty
 
     sales_by_date = [
         {
             "date": row["day"],
             "sales_count": row["sales_count"],
-            "sales_amount": float(amounts_by_day.get(row["day"], Decimal("0.00"))),
+            "sales_amount": float(row["amount"] or Decimal("0.00")),
         }
-        for row in sales_by_date_base
+        for row in sales_by_date_qs
     ]
 
     # ------------------------------------------------------
@@ -317,9 +313,11 @@ def build_agent_analytics_payload(*, company, branch, agent, period, date_from, 
     # ======================================================
     #       Т О В А Р Ы  Н А  Р У К А Х  (сейчас)
     # ======================================================
-
-
-    on_hand = _compute_agent_on_hand(company=company, branch=branch, agent=agent)
+    on_hand = _compute_agent_on_hand(
+        company=company,
+        branch=branch,
+        agent=agent,
+    )
     on_hand_by_product_qty = on_hand["by_product_qty"]
     on_hand_by_product_amount = on_hand["by_product_amount"]
 
