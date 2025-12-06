@@ -1,4 +1,3 @@
-# admin.py
 from django.contrib import admin
 from django.utils.html import format_html
 from django.utils.timezone import now
@@ -29,7 +28,9 @@ from .models import (
     # Object items/sales
     ObjectItem, ObjectSale, ObjectSaleItem,
     # Subreal / agent pathway
-    ManufactureSubreal, Acceptance, ReturnFromAgent, ProductImage
+    ManufactureSubreal, Acceptance, ReturnFromAgent, ProductImage,
+    # Промо и агентские заявки
+    PromoRule, AgentRequestCart, AgentRequestItem, AgentSaleAllocation,
 )
 
 admin.site.site_header = "nurCRM Admin"
@@ -46,6 +47,7 @@ class DebtAdmin(admin.ModelAdmin):
     readonly_fields = ("created_at", "updated_at")
     autocomplete_fields = ("company", "branch")
 
+
 @admin.register(DebtPayment)
 class DebtPaymentAdmin(admin.ModelAdmin):
     list_display = ("debt", "company", "branch", "amount", "paid_at", "created_at")
@@ -55,6 +57,7 @@ class DebtPaymentAdmin(admin.ModelAdmin):
     readonly_fields = ("created_at",)
     autocomplete_fields = ("company", "branch", "debt")
 
+
 @admin.register(ObjectItem)
 class ObjectItemAdmin(admin.ModelAdmin):
     list_display = ("name", "company", "branch", "price", "quantity", "date", "created_at")
@@ -62,6 +65,7 @@ class ObjectItemAdmin(admin.ModelAdmin):
     search_fields = ("name",)
     list_select_related = ("company", "branch")
     autocomplete_fields = ("company", "branch")
+
 
 @admin.register(ObjectSale)
 class ObjectSaleAdmin(admin.ModelAdmin):
@@ -72,6 +76,7 @@ class ObjectSaleAdmin(admin.ModelAdmin):
     readonly_fields = ("created_at", "subtotal")
     autocomplete_fields = ("company", "branch", "client")
 
+
 @admin.register(ObjectSaleItem)
 class ObjectSaleItemAdmin(admin.ModelAdmin):
     list_display = ("sale", "name_snapshot", "unit_price", "quantity", "object_item")
@@ -80,15 +85,19 @@ class ObjectSaleItemAdmin(admin.ModelAdmin):
     list_select_related = ("sale", "object_item")
     autocomplete_fields = ("sale", "object_item")
 
+
 @admin.register(ManufactureSubreal)
 class ManufactureSubrealAdmin(admin.ModelAdmin):
-    list_display = ("id", "company", "branch", "user", "agent", "product",
-                    "qty_transferred", "qty_accepted", "qty_returned",
-                    "status", "created_at")
+    list_display = (
+        "id", "company", "branch", "user", "agent", "product",
+        "qty_transferred", "qty_accepted", "qty_returned",
+        "status", "created_at",
+    )
     list_filter = ("company", "branch", "status", "created_at")
     search_fields = ("agent__email", "product__name")
     list_select_related = ("company", "branch", "user", "agent", "product")
     autocomplete_fields = ("company", "branch", "user", "agent", "product")
+
 
 @admin.register(Acceptance)
 class AcceptanceAdmin(admin.ModelAdmin):
@@ -98,10 +107,13 @@ class AcceptanceAdmin(admin.ModelAdmin):
     list_select_related = ("company", "branch", "subreal", "accepted_by")
     autocomplete_fields = ("company", "branch", "subreal", "accepted_by")
 
+
 @admin.register(ReturnFromAgent)
 class ReturnFromAgentAdmin(admin.ModelAdmin):
-    list_display = ("id", "company", "branch", "subreal", "returned_by", "qty",
-                    "status", "returned_at", "accepted_by", "accepted_at")
+    list_display = (
+        "id", "company", "branch", "subreal", "returned_by", "qty",
+        "status", "returned_at", "accepted_by", "accepted_at",
+    )
     list_filter = ("company", "branch", "status", "returned_at", "accepted_at")
     search_fields = ("subreal__agent__email", "subreal__product__name")
     list_select_related = ("company", "branch", "subreal", "returned_by", "accepted_by")
@@ -116,11 +128,13 @@ class DealInstallmentInline(admin.TabularInline):
     readonly_fields = ("number", "due_date", "amount", "balance_after")
     ordering = ("number",)
 
+
 class CartItemInline(admin.TabularInline):
     model = CartItem
     extra = 0
     autocomplete_fields = ("product",)
     fields = ("product", "custom_name", "quantity", "unit_price")
+
 
 class SaleItemInline(admin.TabularInline):
     model = SaleItem
@@ -128,6 +142,7 @@ class SaleItemInline(admin.TabularInline):
     autocomplete_fields = ("product",)
     fields = ("product", "name_snapshot", "barcode_snapshot", "quantity", "unit_price")
     readonly_fields = ("name_snapshot", "barcode_snapshot")
+
 
 class OrderItemInline(admin.TabularInline):
     model = OrderItem
@@ -142,10 +157,12 @@ class GlobalBrandAdmin(MPTTModelAdmin):
     list_display = ("name", "parent")
     search_fields = ("name",)
 
+
 @admin.register(GlobalCategory)
 class GlobalCategoryAdmin(MPTTModelAdmin):
     list_display = ("name", "parent")
     search_fields = ("name",)
+
 
 @admin.register(ProductBrand)
 class ProductBrandAdmin(MPTTModelAdmin):
@@ -155,6 +172,7 @@ class ProductBrandAdmin(MPTTModelAdmin):
     list_select_related = ("company", "branch")
     autocomplete_fields = ("company", "branch", "parent")
 
+
 @admin.register(ProductCategory)
 class ProductCategoryAdmin(MPTTModelAdmin):
     list_display = ("name", "company", "branch", "parent")
@@ -162,6 +180,7 @@ class ProductCategoryAdmin(MPTTModelAdmin):
     search_fields = ("name",)
     list_select_related = ("company", "branch")
     autocomplete_fields = ("company", "branch", "parent")
+
 
 @admin.register(GlobalProduct)
 class GlobalProductAdmin(admin.ModelAdmin):
@@ -180,6 +199,7 @@ class ContactAdmin(admin.ModelAdmin):
     list_select_related = ("company", "branch", "owner")
     autocomplete_fields = ("company", "branch", "owner")
 
+
 @admin.register(Pipeline)
 class PipelineAdmin(admin.ModelAdmin):
     list_display = ("name", "company", "branch", "owner", "created_at")
@@ -188,13 +208,18 @@ class PipelineAdmin(admin.ModelAdmin):
     list_select_related = ("company", "branch", "owner")
     autocomplete_fields = ("company", "branch", "owner")
 
+
 @admin.register(Deal)
 class DealAdmin(admin.ModelAdmin):
-    list_display = ("title", "company", "branch", "pipeline", "contact", "assigned_to", "value", "status", "stage", "created_at")
+    list_display = (
+        "title", "company", "branch", "pipeline", "contact",
+        "assigned_to", "value", "status", "stage", "created_at",
+    )
     list_filter = ("company", "branch", "status", "pipeline", "assigned_to", "created_at")
     search_fields = ("title", "contact__name")
     list_select_related = ("company", "branch", "pipeline", "contact", "assigned_to")
     autocomplete_fields = ("company", "branch", "pipeline", "contact", "assigned_to")
+
 
 @admin.register(Task)
 class TaskAdmin(admin.ModelAdmin):
@@ -204,6 +229,7 @@ class TaskAdmin(admin.ModelAdmin):
     list_select_related = ("company", "branch", "assigned_to", "deal")
     autocomplete_fields = ("company", "branch", "assigned_to", "deal")
 
+
 @admin.register(Client)
 class ClientAdmin(admin.ModelAdmin):
     list_display = ("full_name", "phone", "email", "type", "status", "company", "branch", "created_at")
@@ -212,11 +238,14 @@ class ClientAdmin(admin.ModelAdmin):
     list_select_related = ("company", "branch")
     autocomplete_fields = ("company", "branch", "salesperson", "service")
 
+
 @admin.register(ClientDeal)
 class ClientDealAdmin(admin.ModelAdmin):
     inlines = (DealInstallmentInline,)
-    list_display = ("title", "client", "company", "branch", "kind", "amount", "prepayment",
-                    "debt_months", "remaining_debt", "created_at")
+    list_display = (
+        "title", "client", "company", "branch", "kind", "amount", "prepayment",
+        "debt_months", "remaining_debt", "created_at",
+    )
     list_filter = ("company", "branch", "kind", "created_at")
     search_fields = ("title", "note", "client__full_name")
     list_select_related = ("company", "branch", "client")
@@ -232,19 +261,23 @@ class ClientDealAdmin(admin.ModelAdmin):
 def accept_products(modeladmin, request, queryset):
     queryset.update(status=Product.Status.ACCEPTED)
 
+
 @admin.action(description="Отметить как отклонённые")
 def reject_products(modeladmin, request, queryset):
     queryset.update(status=Product.Status.REJECTED)
 
+
 @admin.action(description="Очистить статус (None)")
 def clear_status(modeladmin, request, queryset):
     queryset.update(status=None)
+
 
 class ItemMakeInline(admin.TabularInline):
     model = Product.item_make.through
     extra = 1
     verbose_name = "Единица товара"
     verbose_name_plural = "Единицы товара"
+
 
 @admin.register(ItemMake)
 class ItemMakeAdmin(admin.ModelAdmin):
@@ -255,36 +288,39 @@ class ItemMakeAdmin(admin.ModelAdmin):
     list_select_related = ("company", "branch")
     autocomplete_fields = ("company", "branch")
 
+
 class ProductImageInline(admin.TabularInline):
     model = ProductImage
     extra = 0
     fields = ("image", "preview", "alt", "is_primary", "created_at")
     readonly_fields = ("preview", "created_at")
-    autocomplete_fields = ()  # не нужно, product подтянется от родителя
+    autocomplete_fields = ()
     can_delete = True
 
     def preview(self, obj):
         if obj and getattr(obj, "image", None) and getattr(obj.image, "url", None):
             return format_html(
                 '<img src="{}" style="height:70px;object-fit:cover;border-radius:6px;" />',
-                obj.image.url
+                obj.image.url,
             )
         return "—"
+
     preview.short_description = "Превью"
 
 
 @admin.register(Product)
 class ProductAdmin(admin.ModelAdmin):
     list_display = (
-        "primary_image_thumb",  # миниатюра
-        "name", "barcode", "company", "branch", "brand", "category", "client",
-        "quantity", "purchase_price", "price", "status", "created_at"
+        "primary_image_thumb",
+        "name", "barcode", "plu", "scale_type",
+        "company", "branch", "brand", "category", "client",
+        "quantity", "purchase_price", "price", "status", "created_at",
     )
-    list_filter = ("company", "branch", "brand", "category", "status", "created_at")
-    search_fields = ("name", "barcode")
+    list_filter = ("company", "branch", "brand", "category", "status", "scale_type", "created_at")
+    search_fields = ("name", "barcode", "plu")
     ordering = ("name",)
-    inlines = [ItemMakeInline, ProductImageInline]   # ← добавили инлайн фото
-    exclude = ("item_make",)  # используем inline для M2M
+    inlines = [ItemMakeInline, ProductImageInline]
+    exclude = ("item_make",)
     readonly_fields = ("created_at", "updated_at")
     list_select_related = ("company", "branch", "brand", "category", "client")
     autocomplete_fields = ("company", "branch", "brand", "category", "client", "created_by")
@@ -292,11 +328,9 @@ class ProductAdmin(admin.ModelAdmin):
 
     def get_queryset(self, request):
         qs = super().get_queryset(request)
-        # префетчим изображения, чтобы миниатюры не били по БД
         return qs.prefetch_related("images")
 
     def primary_image_thumb(self, obj):
-        # показываем основное изображение, если есть; иначе первое
         img = None
         for im in obj.images.all():
             if im.is_primary and getattr(im, "image", None) and getattr(im.image, "url", None):
@@ -310,13 +344,14 @@ class ProductAdmin(admin.ModelAdmin):
         if img:
             return format_html(
                 '<img src="{}" width="45" style="object-fit:cover;border-radius:6px;" />',
-                img.image.url
+                img.image.url,
             )
         return "—"
-    primary_image_thumb.short_description = "Фото"
-    primary_image_thumb.admin_order_field = "created_at"  # чтобы было сортируемо «как-то»
 
-# (опционально) отдельная админка для ProductImage, если нужно управлять отдельно
+    primary_image_thumb.short_description = "Фото"
+    primary_image_thumb.admin_order_field = "created_at"
+
+
 @admin.register(ProductImage)
 class ProductImageAdmin(admin.ModelAdmin):
     list_display = ("product", "is_primary", "alt", "created_at")
@@ -324,17 +359,23 @@ class ProductImageAdmin(admin.ModelAdmin):
     search_fields = ("product__name", "product__barcode")
     autocomplete_fields = ("product",)
 
+
 @admin.register(Cart)
 class CartAdmin(admin.ModelAdmin):
     inlines = (CartItemInline,)
-    list_display = ("id", "company", "branch", "user", "status", "subtotal", "discount_total",
-                    "order_discount_total", "tax_total", "total", "updated_at")
+    list_display = (
+        "id", "company", "branch", "user", "status", "subtotal",
+        "discount_total", "order_discount_total", "tax_total", "total", "updated_at",
+    )
     list_filter = ("company", "branch", "status", "updated_at")
     search_fields = ("id", "session_key", "user__email")
     list_select_related = ("company", "branch", "user")
-    readonly_fields = ("subtotal", "discount_total", "order_discount_total", "tax_total",
-                       "total", "created_at", "updated_at")
+    readonly_fields = (
+        "subtotal", "discount_total", "order_discount_total", "tax_total",
+        "total", "created_at", "updated_at",
+    )
     autocomplete_fields = ("company", "branch", "user")
+
 
 @admin.register(CartItem)
 class CartItemAdmin(admin.ModelAdmin):
@@ -344,11 +385,14 @@ class CartItemAdmin(admin.ModelAdmin):
     list_select_related = ("cart", "product", "company", "branch")
     autocomplete_fields = ("cart", "product", "company", "branch")
 
+
 @admin.register(Sale)
 class SaleAdmin(admin.ModelAdmin):
     inlines = (SaleItemInline,)
-    list_display = ("id", "company", "branch", "user", "client", "status", "subtotal",
-                    "discount_total", "tax_total", "total", "created_at", "paid_at")
+    list_display = (
+        "id", "company", "branch", "user", "client", "status", "subtotal",
+        "discount_total", "tax_total", "total", "created_at", "paid_at",
+    )
     list_filter = ("company", "branch", "status", "created_at", "paid_at")
     search_fields = ("id", "client__full_name", "user__email")
     list_select_related = ("company", "branch", "user", "client")
@@ -362,20 +406,53 @@ class SaleAdmin(admin.ModelAdmin):
 
     actions = ("mark_paid_action",)
 
+
 @admin.register(SaleItem)
 class SaleItemAdmin(admin.ModelAdmin):
-    list_display = ("sale", "product", "name_snapshot", "barcode_snapshot", "quantity", "unit_price", "company", "branch")
+    list_display = (
+        "sale", "product", "name_snapshot", "barcode_snapshot",
+        "quantity", "unit_price", "company", "branch",
+    )
     list_filter = ("company", "branch")
     search_fields = ("sale__id", "product__name", "name_snapshot", "barcode_snapshot")
     list_select_related = ("sale", "product", "company", "branch")
     autocomplete_fields = ("sale", "product", "company", "branch")
 
+# ========= Промо-правила =========
+@admin.register(PromoRule)
+class PromoRuleAdmin(admin.ModelAdmin):
+    list_display = (
+        "title", "company", "branch", "scope_display",
+        "min_qty", "gift_qty", "inclusive",
+        "priority", "is_active", "active_from", "active_to", "created_at",
+    )
+    list_filter = (
+        "company", "branch", "is_active",
+        "product", "brand", "category",
+        "inclusive", "active_from", "active_to",
+    )
+    search_fields = ("title", "product__name", "brand__name", "category__name")
+    list_select_related = ("company", "branch", "product", "brand", "category")
+    autocomplete_fields = ("company", "branch", "product", "brand", "category")
+
+    @admin.display(description="Область действия")
+    def scope_display(self, obj):
+        if obj.product:
+            return f"Товар: {obj.product.name}"
+        if obj.brand:
+            return f"Бренд: {obj.brand.name}"
+        if obj.category:
+            return f"Категория: {obj.category.name}"
+        return "Все товары"
+
 # ========= Заказы =========
 @admin.register(Order)
 class OrderAdmin(admin.ModelAdmin):
     inlines = (OrderItemInline,)
-    list_display = ("order_number", "company", "branch", "customer_name", "date_ordered",
-                    "status", "phone", "department", "total_qty", "total_amount")
+    list_display = (
+        "order_number", "company", "branch", "customer_name", "date_ordered",
+        "status", "phone", "department", "total_qty", "total_amount",
+    )
     list_filter = ("company", "branch", "status", "date_ordered", "department")
     search_fields = ("order_number", "customer_name", "phone")
     list_select_related = ("company", "branch")
@@ -383,12 +460,12 @@ class OrderAdmin(admin.ModelAdmin):
 
     @admin.display(description="Кол-во")
     def total_qty(self, obj):
-        # В модели Order нет total_quantity — посчитаем по инлайнам
         return obj.items.aggregate(s=Sum("quantity"))["s"] or 0
 
     @admin.display(description="Итого")
     def total_amount(self, obj):
         return obj.total
+
 
 @admin.register(OrderItem)
 class OrderItemAdmin(admin.ModelAdmin):
@@ -407,6 +484,7 @@ class ReviewAdmin(admin.ModelAdmin):
     list_select_related = ("company", "branch", "user")
     autocomplete_fields = ("company", "branch", "user")
 
+
 @admin.register(Notification)
 class NotificationAdmin(admin.ModelAdmin):
     list_display = ("company", "branch", "user", "short_message", "is_read", "created_at")
@@ -419,6 +497,7 @@ class NotificationAdmin(admin.ModelAdmin):
     def short_message(self, obj):
         return (obj.message[:60] + "…") if len(obj.message) > 60 else obj.message
 
+
 @admin.register(Integration)
 class IntegrationAdmin(admin.ModelAdmin):
     list_display = ("company", "branch", "type", "status", "created_at", "updated_at")
@@ -426,6 +505,7 @@ class IntegrationAdmin(admin.ModelAdmin):
     search_fields = ("company__name",)
     list_select_related = ("company", "branch")
     autocomplete_fields = ("company", "branch")
+
 
 @admin.register(Analytics)
 class AnalyticsAdmin(admin.ModelAdmin):
@@ -439,6 +519,7 @@ class AnalyticsAdmin(admin.ModelAdmin):
     def metric(self, obj):
         return obj.data.get("metric", "")
 
+
 @admin.register(Event)
 class EventAdmin(admin.ModelAdmin):
     list_display = ("title", "company", "branch", "datetime", "participants_count", "created_at", "updated_at")
@@ -451,6 +532,7 @@ class EventAdmin(admin.ModelAdmin):
     def participants_count(self, obj):
         return obj.participants.count()
 
+
 @admin.register(Warehouse)
 class WarehouseAdmin(admin.ModelAdmin):
     list_display = ("name", "company", "branch", "location", "created_at", "updated_at")
@@ -459,19 +541,25 @@ class WarehouseAdmin(admin.ModelAdmin):
     list_select_related = ("company", "branch")
     autocomplete_fields = ("company", "branch")
 
+
 @admin.register(WarehouseEvent)
 class WarehouseEventAdmin(admin.ModelAdmin):
-    list_display = ("title", "warehouse", "company", "branch", "status", "event_date", "amount", "responsible_person", "created_at")
+    list_display = (
+        "title", "warehouse", "company", "branch",
+        "status", "event_date", "amount", "responsible_person", "created_at",
+    )
     list_filter = ("company", "branch", "warehouse", "status", "event_date", "created_at")
     search_fields = ("title", "client_name", "description")
     list_select_related = ("warehouse", "company", "branch", "responsible_person")
     autocomplete_fields = ("warehouse", "company", "branch", "responsible_person")
+
 
 @admin.register(Bid)
 class BidAdmin(admin.ModelAdmin):
     list_display = ("full_name", "phone", "status", "created_at")
     list_filter = ("status", "created_at")
     search_fields = ("full_name", "phone", "text")
+
 
 @admin.register(SocialApplications)
 class SocialApplicationsAdmin(admin.ModelAdmin):
@@ -483,6 +571,7 @@ class SocialApplicationsAdmin(admin.ModelAdmin):
     def text_short(self, obj):
         t = obj.text or ""
         return (t[:60] + "…") if len(t) > 60 else t
+
 
 @admin.register(TransactionRecord)
 class TransactionRecordAdmin(admin.ModelAdmin):
@@ -504,3 +593,44 @@ class MobileScannerTokenAdmin(admin.ModelAdmin):
     @admin.display(boolean=True, description="Действителен")
     def is_valid_now(self, obj):
         return now() <= obj.expires_at
+
+# ========= Агентские заявки и аллокации =========
+class AgentRequestItemInline(admin.TabularInline):
+    model = AgentRequestItem
+    extra = 0
+    autocomplete_fields = ("product",)
+    fields = ("product", "quantity_requested", "gift_quantity", "total_quantity", "price_snapshot", "subreal")
+    readonly_fields = ("gift_quantity", "total_quantity", "price_snapshot", "subreal", "created_at", "updated_at")
+
+
+@admin.register(AgentRequestCart)
+class AgentRequestCartAdmin(admin.ModelAdmin):
+    inlines = (AgentRequestItemInline,)
+    list_display = (
+        "id", "company", "branch", "agent", "client",
+        "status", "submitted_at", "approved_at", "created_at",
+    )
+    list_filter = ("company", "branch", "status", "created_at", "submitted_at", "approved_at")
+    search_fields = ("agent__email", "client__full_name", "note")
+    list_select_related = ("company", "branch", "agent", "client", "approved_by")
+    readonly_fields = ("submitted_at", "approved_at", "approved_by", "created_at", "updated_at")
+    autocomplete_fields = ("company", "branch", "agent", "client", "approved_by")
+
+
+@admin.register(AgentRequestItem)
+class AgentRequestItemAdmin(admin.ModelAdmin):
+    list_display = (
+        "cart", "product", "quantity_requested",
+        "gift_quantity", "total_quantity", "price_snapshot", "subreal",
+    )
+    list_filter = ("cart__company", "cart__branch")
+    search_fields = ("cart__id", "product__name")
+    list_select_related = ("cart", "product", "subreal")
+
+
+@admin.register(AgentSaleAllocation)
+class AgentSaleAllocationAdmin(admin.ModelAdmin):
+    list_display = ("company", "agent", "subreal", "sale", "sale_item", "product", "qty", "created_at")
+    list_filter = ("company", "agent", "product")
+    search_fields = ("agent__email", "product__name", "sale__id")
+    list_select_related = ("company", "agent", "subreal", "sale", "sale_item", "product")
