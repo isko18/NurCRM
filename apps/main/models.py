@@ -590,13 +590,13 @@ class Product(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
 
     company = models.ForeignKey(
-        "Company",
+        Company,
         on_delete=models.CASCADE,
         related_name="products",
         verbose_name="Компания",
     )
     branch = models.ForeignKey(
-        "Branch",
+        Branch,
         on_delete=models.CASCADE,
         related_name="crm_products",
         null=True,
@@ -613,7 +613,7 @@ class Product(models.Model):
         verbose_name="Клиент",
     )
     created_by = models.ForeignKey(
-        "User",
+        User,
         on_delete=models.SET_NULL,
         null=True,
         blank=True,
@@ -839,13 +839,13 @@ class ProductCharacteristics(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
 
     company = models.ForeignKey(
-        "Company",
+        Company,
         on_delete=models.CASCADE,
         related_name="product_characteristics",
         verbose_name="Компания",
     )
     branch = models.ForeignKey(
-        "Branch",
+        Branch,
         on_delete=models.CASCADE,
         related_name="crm_product_characteristics",
         null=True,
@@ -926,13 +926,13 @@ class ProductPackage(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
 
     company = models.ForeignKey(
-        "Company",
+        Company,
         on_delete=models.CASCADE,
         related_name="product_packages",
         verbose_name="Компания",
     )
     branch = models.ForeignKey(
-        "Branch",
+        Branch,
         on_delete=models.CASCADE,
         related_name="crm_product_packages",
         null=True,
@@ -940,7 +940,7 @@ class ProductPackage(models.Model):
         db_index=True,
         verbose_name="Филиал",
     )
-
+    
     product = models.ForeignKey(
         "Product",
         on_delete=models.CASCADE,

@@ -13,6 +13,8 @@ from .models import (
     GlobalBrand, GlobalCategory, GlobalProduct,
     # Company-scoped taxonomies & goods
     ProductCategory, ProductBrand, Product, ItemMake,
+    # Extra product models
+    ProductImage, ProductCharacteristics, ProductPackage,
     # POS
     Cart, CartItem, MobileScannerToken, Sale, SaleItem,
     # Others
@@ -28,7 +30,7 @@ from .models import (
     # Object items/sales
     ObjectItem, ObjectSale, ObjectSaleItem,
     # Subreal / agent pathway
-    ManufactureSubreal, Acceptance, ReturnFromAgent, ProductImage,
+    ManufactureSubreal, Acceptance, ReturnFromAgent,
     # Промо и агентские заявки
     PromoRule, AgentRequestCart, AgentRequestItem, AgentSaleAllocation,
 )
@@ -312,12 +314,17 @@ class ProductImageInline(admin.TabularInline):
 class ProductAdmin(admin.ModelAdmin):
     list_display = (
         "primary_image_thumb",
-        "name", "barcode", "plu", "scale_type",
+        "name", "barcode", "code", "article", "plu",
         "company", "branch", "brand", "category", "client",
-        "quantity", "purchase_price", "price", "status", "created_at",
+        "unit", "is_weight",
+        "quantity", "purchase_price", "markup_percent", "price", "discount_percent",
+        "status", "created_at",
     )
-    list_filter = ("company", "branch", "brand", "category", "status", "scale_type", "created_at")
-    search_fields = ("name", "barcode", "plu")
+    list_filter = (
+        "company", "branch", "brand", "category", "status",
+        "is_weight", "created_at",
+    )
+    search_fields = ("name", "barcode", "plu", "code", "article")
     ordering = ("name",)
     inlines = [ItemMakeInline, ProductImageInline]
     exclude = ("item_make",)
@@ -360,9 +367,29 @@ class ProductImageAdmin(admin.ModelAdmin):
     autocomplete_fields = ("product",)
 
 
+@admin.register(ProductCharacteristics)
+class ProductCharacteristicsAdmin(admin.ModelAdmin):
+    list_display = ("product", "company", "branch", "height_cm", "width_cm", "depth_cm", "factual_weight_kg", "created_at")
+    list_filter = ("company", "branch")
+    search_fields = ("product__name", "product__barcode")
+    list_select_related = ("product", "company", "branch")
+    autocomplete_fields = ("company", "branch", "product")
+    readonly_fields = ("created_at", "updated_at")
+
+
+@admin.register(ProductPackage)
+class ProductPackageAdmin(admin.ModelAdmin):
+    list_display = ("product", "name", "quantity_in_package", "unit", "company", "branch", "created_at")
+    list_filter = ("company", "branch")
+    search_fields = ("product__name", "product__barcode", "name")
+    list_select_related = ("product", "company", "branch")
+    autocomplete_fields = ("company", "branch", "product")
+    readonly_fields = ("created_at",)
+
 @admin.register(Cart)
 class CartAdmin(admin.ModelAdmin):
     inlines = (CartItemInline,)
+
     list_display = (
         "id", "company", "branch", "user", "status", "subtotal",
         "discount_total", "order_discount_total", "tax_total", "total", "updated_at",
