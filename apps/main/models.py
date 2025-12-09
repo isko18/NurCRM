@@ -772,6 +772,25 @@ class Product(models.Model):
             models.Index(fields=["company", "branch", "status"]),
             models.Index(fields=["company", "plu"]),
         ]
+        constraints = [
+            # штрихкод уникален в рамках компании
+            models.UniqueConstraint(
+                fields=("company", "barcode"),
+                name="uq_company_barcode",
+            ),
+            # код товара уникален в рамках компании, если указан и не пустой
+            models.UniqueConstraint(
+                fields=("company", "code"),
+                condition=models.Q(code__isnull=False) & ~models.Q(code=""),
+                name="uq_company_code",
+            ),
+            # ПЛУ уникален в рамках компании, если задан
+            models.UniqueConstraint(
+                fields=("company", "plu"),
+                condition=models.Q(plu__isnull=False),
+                name="uq_company_plu_not_null",
+            ),
+        ]
 
     def __str__(self):
         return self.name
