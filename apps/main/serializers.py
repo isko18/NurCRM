@@ -14,7 +14,7 @@ from apps.main.models import (
     OrderItem, Client, GlobalProduct, CartItem, ClientDeal, Bid, SocialApplications,
     TransactionRecord, DealInstallment, ContractorWork, Debt, DebtPayment,
     ObjectItem, ObjectSale, ObjectSaleItem, ItemMake, ManufactureSubreal, Acceptance,
-    ReturnFromAgent, ProductImage, PromoRule, AgentRequestCart, AgentRequestItem
+    ReturnFromAgent, ProductImage, PromoRule, AgentRequestCart, AgentRequestItem, ProductPackage, ProductCharacteristics
 )
 
 from apps.consalting.models import ServicesConsalting
@@ -502,63 +502,149 @@ class ProductImageSerializer(serializers.ModelSerializer):
         if obj.image and hasattr(obj.image, "url"):
             return req.build_absolute_uri(obj.image.url) if req else obj.image.url
         return None
+    
+class ProductCharacteristicsSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = ProductCharacteristics
+        fields = [
+            "id",
+            "height_cm",
+            "width_cm",
+            "depth_cm",
+            "factual_weight_kg",
+            "description",
+        ]
+        read_only_fields = ["id"]
 
+
+class ProductPackageSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = ProductPackage
+        fields = [
+            "id",
+            "name",
+            "quantity_in_package",
+            "unit",
+        ]
+        read_only_fields = ["id"]
+        
 class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
+    # ====== базовые поля компании/филиала ======
     company = serializers.ReadOnlyField(source="company.id")
     branch = serializers.ReadOnlyField(source="branch.id")
 
+    # ====== бренд / категория ======
     brand = serializers.CharField(source="brand.name", read_only=True)
     category = serializers.CharField(source="category.name", read_only=True)
-
-    created_by = serializers.ReadOnlyField(source="created_by.id")
-    created_by_name = serializers.SerializerMethodField(read_only=True)
-
-    item_make = ItemMakeNestedSerializer(many=True, read_only=True)
-    item_make_ids = serializers.PrimaryKeyRelatedField(
-        queryset=ItemMake.objects.all(), many=True, write_only=True, required=False
-    )
 
     brand_name = serializers.CharField(write_only=True, required=False, allow_blank=True)
     category_name = serializers.CharField(write_only=True, required=False, allow_blank=True)
 
+    # ====== кто создал ======
+    created_by = serializers.ReadOnlyField(source="created_by.id")
+    created_by_name = serializers.SerializerMethodField(read_only=True)
+
+    # ====== единицы товара ======
+    item_make = ItemMakeNestedSerializer(many=True, read_only=True)
+    item_make_ids = serializers.PrimaryKeyRelatedField(
+        queryset=ItemMake.objects.all(),
+        many=True,
+        write_only=True,
+        required=False,
+    )
+
+    # ====== клиент ======
     client = serializers.PrimaryKeyRelatedField(
-        queryset=Client.objects.all(), required=False, allow_null=True
+        queryset=Client.objects.all(),
+        required=False,
+        allow_null=True,
     )
     client_name = serializers.CharField(source="client.full_name", read_only=True)
 
+    # ====== статус ======
     status = serializers.CharField(required=False, allow_null=True, allow_blank=True)
     status_display = serializers.CharField(source="get_status_display", read_only=True)
 
+    # ====== дата (как и раньше) ======
     date = serializers.SerializerMethodField(read_only=True)
 
-    # картинки товара (read-only список)
+    # ====== картинки ======
     images = ProductImageSerializer(many=True, read_only=True)
+
     stock = serializers.BooleanField(required=False)
+
+    # ====== новые поля модели ======
+    code = serializers.CharField(read_only=True)  # генерится в модели
+    article = serializers.CharField(required=False, allow_blank=True)
+
+    unit = serializers.CharField(required=False, allow_blank=True)
+    is_weight = serializers.BooleanField(required=False)
+
+    purchase_price = serializers.DecimalField(
+        max_digits=10, decimal_places=2, required=False
+    )
+    markup_percent = serializers.DecimalField(
+        max_digits=5, decimal_places=2, required=False
+    )
+    price = serializers.DecimalField(
+        max_digits=10, decimal_places=2, required=False
+    )
+    discount_percent = serializers.DecimalField(
+        max_digits=5, decimal_places=2, required=False
+    )
+
+    country = serializers.CharField(required=False, allow_blank=True)
+    expiration_date = serializers.DateField(required=False, allow_null=True)
+
+    # ==== ПЛУ ====
+    plu = serializers.IntegerField(required=False, allow_null=True)
 
     # ==== НОВОЕ: поля только для чтения (данные с весов) ====
     weight_kg = serializers.SerializerMethodField(read_only=True)
     total_price = serializers.SerializerMethodField(read_only=True)
 
+    # ==== НОВОЕ: связанные модели ====
+    characteristics = ProductCharacteristicsSerializer(read_only=True)
+    packages = ProductPackageSerializer(many=True, read_only=True)
+
     class Meta:
         model = Product
         fields = [
             "id", "company", "branch",
+
+            "code", "article",
+
             "name", "barcode",
+
             "brand", "brand_name",
             "category", "category_name",
+
+            "unit", "is_weight",
+
             "item_make", "item_make_ids",
-            "quantity", "price", "purchase_price",
+
+            "quantity",
+            "purchase_price",
+            "markup_percent",
+            "price",
+            "discount_percent",
+
+            "plu",
+
+            "country",
+            "expiration_date",
+
             "status", "status_display",
-            "client", "client_name", "stock", "date",
+            "client", "client_name",
+            "stock", "date",
+
             "created_by", "created_by_name",
             "created_at", "updated_at",
+
             "images",
+            "characteristics",
+            "packages",
 
-            # === ПОЛЯ ДЛЯ ВЕСОВ И ПЛУ ===
-            "plu",
-            "scale_type",
-
-            # === РАСЧЁТНЫЕ ПОЛЯ С ВЕСОВ ===
             "weight_kg",
             "total_price",
         ]
@@ -566,16 +652,23 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
             "id", "created_at", "updated_at",
             "company", "branch",
             "brand", "category",
-            "client_name", "status_display", "item_make", "date",
+            "client_name", "status_display",
+            "item_make", "date",
             "created_by", "created_by_name",
             "images",
-            "weight_kg", "total_price",  # расчётные, только на чтение
+            "code",
+            "characteristics",
+            "packages",
+            "weight_kg", "total_price",
         ]
         extra_kwargs = {
-            "price": {"required": False, "default": 0},
             "purchase_price": {"required": False, "default": 0},
+            "markup_percent": {"required": False, "default": 0},
+            "discount_percent": {"required": False, "default": 0},
             "quantity": {"required": False, "default": 0},
-            # plu и scale_type остаются обычными полями (не read_only)
+            "unit": {"required": False, "default": "шт."},
+            "is_weight": {"required": False, "default": False},
+            "price": {"required": False},
         }
 
     def __init__(self, *args, **kwargs):
@@ -585,36 +678,35 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
         _restrict_pk_queryset_strict(self.fields.get("item_make_ids"), ItemMake.objects.all(), comp, br)
         _restrict_pk_queryset_strict(self.fields.get("client"), Client.objects.all(), comp, br)
 
-    # ==== НОВОЕ: данные с весов ====
+    # ==== ДАННЫЕ С ВЕСОВ ====
 
     def get_weight_kg(self, obj):
         """
         Вес берём только если:
-        - в контексте есть scale_data (значит штрих-код был весовой),
-        - товар помечен как весовой (scale_type = WEIGHT).
+        - есть scale_data в контексте
+        - товар помечен как весовой (is_weight=True)
         """
         scale_data = self.context.get("scale_data")
         if not scale_data:
             return None
-        if obj.scale_type != Product.ScaleType.WEIGHT:
+        if not obj.is_weight:
             return None
         return scale_data.get("weight_kg")
 
     def get_total_price(self, obj):
         """
-        Для весового товара: price (за кг) * weight_kg.
-        Для штучного: просто price.
-        Если контекста от весов нет — возвращаем price.
+        Если есть вес и товар весовой:
+            total = price * weight_kg
+        Иначе просто возвращаем price.
         """
         scale_data = self.context.get("scale_data")
 
-        # штучный товар — просто цена
-        if obj.scale_type == Product.ScaleType.PIECE or not scale_data:
+        if not obj.is_weight or not scale_data:
             return obj.price
 
         weight_kg = scale_data.get("weight_kg")
         if not weight_kg:
-            return obj.price  # на всякий случай
+            return obj.price
 
         price_per_kg = obj.price
         total = Decimal(price_per_kg) * Decimal(str(weight_kg))
@@ -634,7 +726,9 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
         val = getattr(obj, "date", None)
         if not val:
             return None
-        # datetime -> локализуем и берём .date()
+
+        from datetime import datetime as _datetime, date as _date
+
         if isinstance(val, _datetime):
             try:
                 if dj_tz.is_naive(val):
@@ -643,10 +737,10 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
             except Exception:
                 pass
             return val.date().isoformat()
-        # date -> сразу ISO
+
         if isinstance(val, _date):
             return val.isoformat()
-        # мягкий парсинг строк
+
         try:
             dt = parse_datetime(str(val))
             if dt:
@@ -658,6 +752,7 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
                 return d.isoformat()
         except Exception:
             pass
+
         return None
 
     @staticmethod
@@ -666,9 +761,9 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
             return None
         v = str(raw).strip().lower()
         mapping = {
-            "pending": "pending",   "ожидание": "pending",
-            "accepted": "accepted", "принят":   "accepted",
-            "rejected": "rejected", "отказ":    "rejected",
+            "pending": "pending", "ожидание": "pending",
+            "accepted": "accepted", "принят": "accepted",
+            "rejected": "rejected", "отказ": "rejected",
         }
         return mapping.get(v, v)
 
@@ -682,6 +777,8 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
             return None
         return ProductCategory.objects.get_or_create(company=company, name=category.name)[0]
 
+    # ==== CREATE / UPDATE ====
+
     @transaction.atomic
     def create(self, validated_data):
         item_make_data = validated_data.pop("item_make_ids", [])
@@ -693,9 +790,30 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
         category_name = (validated_data.pop("category_name", "") or "").strip()
         status_value = self._normalize_status(validated_data.pop("status", None))
 
-        # НОВОЕ: забираем plu и scale_type из validated_data (если пришли)
+        article = validated_data.pop("article", "").strip()
+        unit = (validated_data.pop("unit", None) or "шт.").strip()
+        is_weight = validated_data.pop("is_weight", False)
+
+        # --- цены / наценка / цена продажи ---
+        purchase_price = validated_data.pop("purchase_price", Decimal("0"))
+        markup_percent = validated_data.pop("markup_percent", Decimal("0"))
+        price_from_payload = validated_data.pop("price", None)
+
+        if price_from_payload is not None:
+            # фронт задал цену руками → наценку обнуляем
+            price = Decimal(str(price_from_payload))
+            markup_percent = Decimal("0")
+        else:
+            # цену не прислали → считаем из закупки и процента
+            mp = markup_percent or Decimal("0")
+            price = purchase_price * (Decimal("1") + mp / Decimal("100"))
+            price = price.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+        discount_percent = validated_data.pop("discount_percent", Decimal("0"))
+
+        country = (validated_data.pop("country", "") or "").strip()
+        expiration_date = validated_data.pop("expiration_date", None)
         plu = validated_data.pop("plu", None)
-        scale_type = validated_data.pop("scale_type", Product.ScaleType.PIECE)
 
         date_value = dj_tz.now()
 
@@ -714,21 +832,32 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
         product = Product.objects.create(
             company=company,
             branch=branch,
+
             name=gp.name,
             barcode=gp.barcode,
+
             brand=brand,
             category=category,
-            price=validated_data.get("price", 0),
-            purchase_price=validated_data.get("purchase_price", 0),
+
+            article=article,
+            unit=unit,
+            is_weight=is_weight,
+
+            purchase_price=purchase_price,
+            markup_percent=markup_percent,
+            price=price,
+            discount_percent=discount_percent,
+
             quantity=validated_data.get("quantity", 0),
+
+            plu=plu,
+            country=country,
+            expiration_date=expiration_date,
+
             client=client,
             status=status_value,
             date=date_value,
             created_by=self._user(),
-
-            # НОВОЕ:
-            plu=plu,
-            scale_type=scale_type,
         )
 
         if item_make_data:
@@ -741,7 +870,7 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
         company = self._user_company()
         branch = self._auto_branch()
 
-        # brand/category через *_name
+        # бренд/категория через *_name
         brand_name = (validated_data.pop("brand_name", "") or "").strip()
         category_name = (validated_data.pop("category_name", "") or "").strip()
         if brand_name:
@@ -754,22 +883,54 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
         if item_make_data is not None:
             instance.item_make.set(item_make_data)
 
-        # фиксируем branch из контекста
         instance.branch = branch
 
-        # разрешённые простые поля (добавили plu и scale_type)
-        for field in ("name", "barcode", "quantity", "price", "purchase_price", "client", "plu", "scale_type"):
+        # --- цены / наценка / цена продажи ---
+        purchase_price = validated_data.get("purchase_price", instance.purchase_price)
+        markup_percent_current = instance.markup_percent or Decimal("0")
+        markup_percent = validated_data.get("markup_percent", markup_percent_current)
+
+        price_explicitly_set = "price" in validated_data
+        if price_explicitly_set:
+            # фронт руками меняет цену → процент очищаем
+            price = Decimal(str(validated_data["price"]))
+            markup_percent = Decimal("0")
+        else:
+            # цену не передавали:
+            # если меняется закупка или процент → пересчитываем price
+            if "purchase_price" in validated_data or "markup_percent" in validated_data:
+                mp = markup_percent or Decimal("0")
+                price = purchase_price * (Decimal("1") + mp / Decimal("100"))
+                price = price.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+            else:
+                price = instance.price
+
+        instance.purchase_price = purchase_price
+        instance.markup_percent = markup_percent
+        instance.price = price
+
+        # остальные поля
+        for field in (
+            "name", "barcode", "quantity",
+            "discount_percent",
+            "article",
+            "unit",
+            "is_weight",
+            "country",
+            "expiration_date",
+            "client",
+            "plu",
+        ):
             if field in validated_data:
                 setattr(instance, field, validated_data[field])
 
         if "stock" in validated_data:
             instance.stock = validated_data["stock"]
 
-        # статус с нормализацией
         if "status" in validated_data:
             instance.status = self._normalize_status(validated_data["status"])
 
-        # Принимаем дату из payload (даже если read-only в выдаче)
+        # дата (как у тебя было)
         raw_date = (self.initial_data.get("date")
                     if isinstance(getattr(self, "initial_data", None), dict) else None)
         if not raw_date:
@@ -784,6 +945,7 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
             else:
                 d = parse_date(str(raw_date))
                 if d:
+                    from datetime import datetime as _datetime
                     instance.date = dj_tz.make_aware(_datetime(d.year, d.month, d.day))
                 else:
                     raise serializers.ValidationError({

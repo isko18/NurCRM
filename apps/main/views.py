@@ -1,4 +1,4 @@
-from decimal import Decimal
+from decimal import Decimal, ROUND_HALF_UP
 from uuid import UUID
 
 from django.db import transaction
@@ -21,6 +21,7 @@ from rest_framework import serializers
 from .filters import TransactionRecordFilter, DebtFilter, DebtPaymentFilter
 from django_filters.rest_framework import DjangoFilterBackend
 from django.db.models import DecimalField, ExpressionWrapper
+
 
 from apps.users.models import Branch, User
 
@@ -547,6 +548,34 @@ class OrderRetrieveUpdateDestroyAPIView(CompanyBranchRestrictedMixin, generics.R
 # ===========================
 #  Product create by barcode (ручной view)
 # ===========================
+class ProductListView(CompanyBranchRestrictedMixin, generics.ListAPIView):
+    serializer_class = ProductSerializer
+    filter_backends = [filters.SearchFilter, filters.OrderingFilter]
+    search_fields = ["name", "barcode"]
+    ordering_fields = ["created_at", "updated_at", "price"]
+    ordering = ["-created_at"]
+
+    def get_queryset(self):
+        qs = (
+            Product.objects
+            .select_related(
+                "company",
+                "branch",
+                "brand",
+                "category",
+                "client",
+                "created_by",
+                "characteristics",  # OneToOne
+            )
+            .prefetch_related(
+                "item_make",
+                "packages",
+                product_images_prefetch,  # как было, твой Prefetch для images
+            )
+        )
+        return self._filter_qs_company_branch(qs)
+
+
 class ProductCreateByBarcodeAPIView(generics.CreateAPIView, CompanyBranchRestrictedMixin):
     """
     Создание товара только по штрих-коду (если найден в глобальной базе).
@@ -554,47 +583,12 @@ class ProductCreateByBarcodeAPIView(generics.CreateAPIView, CompanyBranchRestric
     serializer_class = ProductSerializer
     permission_classes = [IsAuthenticated]
 
-    def _normalize_scale_type(self, raw):
-        """
-        Приводим scale_type к коду из Product.ScaleType.
-        Допускаем человеко-понятные варианты.
-        """
-        from apps.main.models import Product  # чтобы не было циклов при импорте
-
-        if raw in (None, "", "null"):
-            # по умолчанию считаем, что товар штучный
-            return Product.ScaleType.PIECE
-
-        v = str(raw).strip().lower()
-
-        mapping = {
-            "piece": Product.ScaleType.PIECE,
-            "шт": Product.ScaleType.PIECE,
-            "штука": Product.ScaleType.PIECE,
-            "штуки": Product.ScaleType.PIECE,
-            "штучный": Product.ScaleType.PIECE,
-
-            "weight": Product.ScaleType.WEIGHT,
-            "вес": Product.ScaleType.WEIGHT,
-            "по весу": Product.ScaleType.WEIGHT,
-            "кг": Product.ScaleType.WEIGHT,
-            "kg": Product.ScaleType.WEIGHT,
-        }
-
-        if v in mapping:
-            return mapping[v]
-
-        # позволяем прислать «сырой» код из choices
-        codes = {c[0] for c in Product.ScaleType.choices}
-        if v in codes:
-            return v
-
-        raise ValueError(
-            f"Недопустимый тип товара для весов. Допустимые коды: {', '.join(sorted(codes))}."
-        )
-
     @transaction.atomic
     def create(self, request, *args, **kwargs):
+        from decimal import Decimal
+        from django.utils import timezone
+        from django.utils.dateparse import parse_date
+
         company = self._company()
         branch = self._auto_branch()
         data = request.data
@@ -603,7 +597,7 @@ class ProductCreateByBarcodeAPIView(generics.CreateAPIView, CompanyBranchRestric
         if not barcode:
             return Response({"barcode": "Укажите штрих-код."}, status=status.HTTP_400_BAD_REQUEST)
 
-        # Проверка дубликатов внутри компании (+ branch не влияет на уникальность в ТЗ)
+        # Проверка дубликатов внутри компании
         if Product.objects.filter(company=company, barcode=barcode).exists():
             return Response(
                 {"barcode": "В вашей компании уже есть товар с таким штрих-кодом."},
@@ -618,17 +612,36 @@ class ProductCreateByBarcodeAPIView(generics.CreateAPIView, CompanyBranchRestric
                 status=status.HTTP_404_NOT_FOUND,
             )
 
-        # Парсим цены и количество
-        try:
-            price = Decimal(str(data.get("price", 0)))
-        except Exception:
-            return Response({"price": "Неверный формат цены."}, status=status.HTTP_400_BAD_REQUEST)
-
+        # Цены
         try:
             purchase_price = Decimal(str(data.get("purchase_price", 0)))
         except Exception:
             return Response({"purchase_price": "Неверный формат закупочной цены."}, status=status.HTTP_400_BAD_REQUEST)
 
+        try:
+            markup_percent = Decimal(str(data.get("markup_percent", 0)))
+        except Exception:
+            return Response({"markup_percent": "Неверный формат наценки."}, status=status.HTTP_400_BAD_REQUEST)
+
+        price_raw = data.get("price", None)
+        if price_raw not in (None, ""):
+            try:
+                price = Decimal(str(price_raw))
+            except Exception:
+                return Response({"price": "Неверный формат цены продажи."}, status=status.HTTP_400_BAD_REQUEST)
+            # ручная цена → обнуляем процент
+            markup_percent = Decimal("0")
+        else:
+            mp = markup_percent or Decimal("0")
+            price = purchase_price * (Decimal("1") + mp / Decimal("100"))
+            price = price.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+        try:
+            discount_percent = Decimal(str(data.get("discount_percent", 0)))
+        except Exception:
+            return Response({"discount_percent": "Неверный формат скидки."}, status=status.HTTP_400_BAD_REQUEST)
+
+        # Количество
         try:
             quantity = int(data.get("quantity", 0))
             if quantity < 0:
@@ -636,7 +649,7 @@ class ProductCreateByBarcodeAPIView(generics.CreateAPIView, CompanyBranchRestric
         except Exception:
             return Response({"quantity": "Неверное количество."}, status=status.HTTP_400_BAD_REQUEST)
 
-        # Обработка даты
+        # Дата (дата документа)
         date_value = data.get("date")
         if date_value:
             try:
@@ -646,18 +659,34 @@ class ProductCreateByBarcodeAPIView(generics.CreateAPIView, CompanyBranchRestric
         else:
             date_value = timezone.now().date()
 
-        # --- НОВОЕ: plu и scale_type ---
-        plu = data.get("plu")
-        try:
-            scale_type = self._normalize_scale_type(data.get("scale_type"))
-        except ValueError as e:
-            return Response({"scale_type": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+        # ПЛУ
+        plu = data.get("plu") or None
+
+        # Ед. измерения / весовой / страна / срок годности
+        unit = (data.get("unit") or "шт.").strip()
+        is_weight_raw = data.get("is_weight")
+        if isinstance(is_weight_raw, bool):
+            is_weight = is_weight_raw
+        else:
+            is_weight = str(is_weight_raw).strip().lower() in ("1", "true", "yes", "да", "kg", "кг", "weight", "вес")
+
+        country = (data.get("country") or "").strip()
+
+        expiration_raw = data.get("expiration_date")
+        expiration_date = None
+        if expiration_raw not in (None, ""):
+            expiration_date = parse_date(str(expiration_raw))
+            if not expiration_date:
+                return Response(
+                    {"expiration_date": "Неверный формат. Используйте YYYY-MM-DD."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
 
         # создаём или берём локальные справочники
         brand = ProductBrand.objects.get_or_create(company=company, name=gp.brand.name)[0] if gp.brand else None
         category = ProductCategory.objects.get_or_create(company=company, name=gp.category.name)[0] if gp.category else None
 
-        # Создаём локальный товар (учитываем branch + created_by)
+        # Создаём локальный товар
         product = Product.objects.create(
             company=company,
             branch=branch,
@@ -665,32 +694,32 @@ class ProductCreateByBarcodeAPIView(generics.CreateAPIView, CompanyBranchRestric
             barcode=gp.barcode,
             brand=brand,
             category=category,
-            price=price,
+
+            unit=unit,
+            is_weight=is_weight,
+
             purchase_price=purchase_price,
+            markup_percent=markup_percent,
+            price=price,
+            discount_percent=discount_percent,
+
             quantity=quantity,
+            plu=plu,
+            country=country,
+            expiration_date=expiration_date,
+
             date=date_value,
             created_by=request.user,
-
-            # новые поля
-            plu=plu,
-            scale_type=scale_type,
         )
 
         return Response(self.get_serializer(product).data, status=status.HTTP_201_CREATED)
 
 
 
+
 class ProductCreateManualAPIView(generics.CreateAPIView, CompanyBranchRestrictedMixin):
     """
     Ручное создание товара + (опционально) добавление в глобальную базу.
-    Принимает status как: pending/accepted/rejected или Ожидание/Принят/Отказ.
-    Для item_make можно передать:
-      - "item_make": ["uuid1", "uuid2"]
-      - "item_make": "uuid1"
-      - "item_make_ids": [...]
-    Для date принимаются форматы:
-      - "YYYY-MM-DD"
-      - ISO datetime "YYYY-MM-DDTHH:MM:SSZ" и т.п.
     """
     serializer_class = ProductSerializer
     permission_classes = [IsAuthenticated]
@@ -714,62 +743,28 @@ class ProductCreateManualAPIView(generics.CreateAPIView, CompanyBranchRestricted
             return v
         raise ValueError(f"Недопустимый статус. Допустимые: {', '.join(sorted(codes))}.")
 
-    def _normalize_scale_type(self, raw):
-        """
-        Приводим scale_type к коду из Product.ScaleType.
-        """
-        if raw in (None, "", "null"):
-            return Product.ScaleType.PIECE
-
-        v = str(raw).strip().lower()
-
-        mapping = {
-            "piece": Product.ScaleType.PIECE,
-            "шт": Product.ScaleType.PIECE,
-            "штука": Product.ScaleType.PIECE,
-            "штуки": Product.ScaleType.PIECE,
-            "штучный": Product.ScaleType.PIECE,
-
-            "weight": Product.ScaleType.WEIGHT,
-            "вес": Product.ScaleType.WEIGHT,
-            "по весу": Product.ScaleType.WEIGHT,
-            "кг": Product.ScaleType.WEIGHT,
-            "kg": Product.ScaleType.WEIGHT,
-        }
-
-        if v in mapping:
-            return mapping[v]
-
-        codes = {c[0] for c in Product.ScaleType.choices}
-        if v in codes:
-            return v
-
-        raise ValueError(
-            f"Недопустимый тип товара для весов. Допустимые коды: {', '.join(sorted(codes))}."
-        )
-
     def _parse_date_to_aware_datetime(self, raw_value):
         """
         Принимает строку date/datetime или date/datetime объект.
         Возвращает timezone-aware datetime или raises ValueError.
         """
+        from django.utils import timezone
+        from datetime import date as _date
+
         if raw_value is None or raw_value == "":
             return None
 
-        # datetime
         if isinstance(raw_value, timezone.datetime):
             dt = raw_value
             if timezone.is_naive(dt):
                 dt = timezone.make_aware(dt)
             return dt
 
-        # date
         if isinstance(raw_value, _date) and not isinstance(raw_value, timezone.datetime):
             d = raw_value
             dt = timezone.datetime(d.year, d.month, d.day, 0, 0, 0)
             return timezone.make_aware(dt)
 
-        # строка
         s = str(raw_value)
         dt = parse_datetime(s)
         if dt:
@@ -785,6 +780,9 @@ class ProductCreateManualAPIView(generics.CreateAPIView, CompanyBranchRestricted
 
     @transaction.atomic
     def create(self, request, *args, **kwargs):
+        from decimal import Decimal
+        from django.utils import timezone
+
         company = self._company()
         branch = self._auto_branch()
         data = request.data
@@ -801,14 +799,35 @@ class ProductCreateManualAPIView(generics.CreateAPIView, CompanyBranchRestricted
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        try:
-            price = Decimal(str(data.get("price", 0)))
-        except Exception:
-            return Response({"price": "Неверный формат цены."}, status=status.HTTP_400_BAD_REQUEST)
+        # Цены
         try:
             purchase_price = Decimal(str(data.get("purchase_price", 0)))
         except Exception:
             return Response({"purchase_price": "Неверный формат закупочной цены."}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            markup_percent = Decimal(str(data.get("markup_percent", 0)))
+        except Exception:
+            return Response({"markup_percent": "Неверный формат наценки."}, status=status.HTTP_400_BAD_REQUEST)
+
+        price_raw = data.get("price", None)
+        if price_raw not in (None, ""):
+            try:
+                price = Decimal(str(price_raw))
+            except Exception:
+                return Response({"price": "Неверный формат цены продажи."}, status=status.HTTP_400_BAD_REQUEST)
+            markup_percent = Decimal("0")
+        else:
+            mp = markup_percent or Decimal("0")
+            price = purchase_price * (Decimal("1") + mp / Decimal("100"))
+            price = price.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+        try:
+            discount_percent = Decimal(str(data.get("discount_percent", 0)))
+        except Exception:
+            return Response({"discount_percent": "Неверный формат скидки."}, status=status.HTTP_400_BAD_REQUEST)
+
+        # Количество
         try:
             quantity = int(data.get("quantity", 0))
             if quantity < 0:
@@ -816,24 +835,42 @@ class ProductCreateManualAPIView(generics.CreateAPIView, CompanyBranchRestricted
         except Exception:
             return Response({"quantity": "Неверное количество."}, status=status.HTTP_400_BAD_REQUEST)
 
+        # Статус
         try:
             status_value = self._normalize_status(data.get("status"))
         except ValueError as e:
             return Response({"status": str(e)}, status=status.HTTP_400_BAD_REQUEST)
 
+        # Дата документа
         raw_date = data.get("date")
         try:
             date_value = self._parse_date_to_aware_datetime(raw_date) if raw_date else timezone.now()
         except ValueError as e:
             return Response({"date": str(e)}, status=status.HTTP_400_BAD_REQUEST)
 
-        # --- НОВОЕ: plu и scale_type ---
-        plu = data.get("plu")
-        try:
-            scale_type = self._normalize_scale_type(data.get("scale_type"))
-        except ValueError as e:
-            return Response({"scale_type": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+        # ПЛУ / ед. измерения / весовой / страна / срок годности
+        plu = data.get("plu") or None
 
+        unit = (data.get("unit") or "шт.").strip()
+        is_weight_raw = data.get("is_weight")
+        if isinstance(is_weight_raw, bool):
+            is_weight = is_weight_raw
+        else:
+            is_weight = str(is_weight_raw).strip().lower() in ("1", "true", "yes", "да", "kg", "кг", "weight", "вес")
+
+        country = (data.get("country") or "").strip()
+
+        expiration_raw = data.get("expiration_date")
+        expiration_date = None
+        if expiration_raw not in (None, ""):
+            expiration_date = parse_date(str(expiration_raw))
+            if not expiration_date:
+                return Response(
+                    {"expiration_date": "Неверный формат. Используйте YYYY-MM-DD."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+        # Бренд / категория (через глобальные справочники, как было)
         brand_name = (data.get("brand_name") or "").strip()
         category_name = (data.get("category_name") or "").strip()
         g_brand = GlobalBrand.objects.get_or_create(name=brand_name)[0] if brand_name else None
@@ -842,6 +879,7 @@ class ProductCreateManualAPIView(generics.CreateAPIView, CompanyBranchRestricted
         brand = ProductBrand.objects.get_or_create(company=company, name=g_brand.name)[0] if g_brand else None
         category = ProductCategory.objects.get_or_create(company=company, name=g_category.name)[0] if g_category else None
 
+        # Клиент
         client = None
         client_id = data.get("client")
         if client_id:
@@ -854,19 +892,28 @@ class ProductCreateManualAPIView(generics.CreateAPIView, CompanyBranchRestricted
             barcode=barcode,
             brand=brand,
             category=category,
-            price=price,
+
+            unit=unit,
+            is_weight=is_weight,
+
             purchase_price=purchase_price,
+            markup_percent=markup_percent,
+            price=price,
+            discount_percent=discount_percent,
+
             quantity=quantity,
             client=client,
             status=status_value,
             date=date_value,
-            created_by=request.user,
 
-            # новые поля
             plu=plu,
-            scale_type=scale_type,
+            country=country,
+            expiration_date=expiration_date,
+
+            created_by=request.user,
         )
 
+        # item_make
         item_make_input = data.get("item_make") or data.get("item_make_ids")
         if item_make_input:
             if isinstance(item_make_input, str):
@@ -884,6 +931,7 @@ class ProductCreateManualAPIView(generics.CreateAPIView, CompanyBranchRestricted
                 )
             product.item_make.set(ims)
 
+        # глобальная база
         if barcode:
             GlobalProduct.objects.get_or_create(
                 barcode=barcode,
@@ -894,14 +942,29 @@ class ProductCreateManualAPIView(generics.CreateAPIView, CompanyBranchRestricted
 
 
 
+
 class ProductRetrieveUpdateDestroyAPIView(CompanyBranchRestrictedMixin, generics.RetrieveUpdateDestroyAPIView):
     serializer_class = ProductSerializer
+
     queryset = (
         Product.objects
-        .select_related("brand", "category", "client")
-        .prefetch_related("item_make", product_images_prefetch)
+        .select_related(
+            "company",
+            "branch",
+            "brand",
+            "category",
+            "client",
+            "created_by",
+            "characteristics",
+        )
+        .prefetch_related(
+            "item_make",
+            "packages",
+            product_images_prefetch,
+        )
         .all()
     )
+
 
 
 class ProductBulkDeleteAPIView(CompanyBranchRestrictedMixin, APIView):
@@ -957,6 +1020,41 @@ class ProductBulkDeleteAPIView(CompanyBranchRestrictedMixin, APIView):
 
         http_status = status.HTTP_200_OK if not results["protected"] else status.HTTP_207_MULTI_STATUS
         return Response(results, status=http_status)
+
+class ProductByBarcodeAPIView(CompanyBranchRestrictedMixin, generics.RetrieveAPIView):
+    serializer_class = ProductSerializer
+    lookup_field = "barcode"
+
+    def get_queryset(self):
+        qs = (
+            Product.objects
+            .select_related(
+                "company",
+                "branch",
+                "brand",
+                "category",
+                "client",
+                "created_by",
+                "characteristics",
+            )
+            .prefetch_related(
+                "item_make",
+                "packages",
+                product_images_prefetch,
+            )
+            .all()
+        )
+        return self._filter_qs_company_branch(qs)
+
+    def get_object(self):
+        barcode = self.kwargs.get("barcode")
+        if not barcode:
+            raise NotFound(detail="Штрих-код не указан")
+
+        product = self.get_queryset().filter(barcode=barcode).first()
+        if not product:
+            raise NotFound(detail="Товар с таким штрих-кодом не найден")
+        return product
 
 
 # ===========================
@@ -1076,28 +1174,6 @@ class ProductBrandRetrieveUpdateDestroyAPIView(CompanyBranchRestrictedMixin, gen
 # ===========================
 #  Product views
 # ===========================
-class ProductByBarcodeAPIView(CompanyBranchRestrictedMixin, generics.RetrieveAPIView):
-    serializer_class = ProductSerializer
-    lookup_field = "barcode"
-
-    def get_queryset(self):
-        qs = (
-            Product.objects
-            .select_related("brand", "category", "client")
-            .prefetch_related("item_make", product_images_prefetch)
-            .all()
-        )
-        return self._filter_qs_company_branch(qs)
-
-    def get_object(self):
-        barcode = self.kwargs.get("barcode")
-        if not barcode:
-            raise NotFound(detail="Штрих-код не указан")
-
-        product = self.get_queryset().filter(barcode=barcode).first()
-        if not product:
-            raise NotFound(detail="Товар с таким штрих-кодом не найден")
-        return product
 
 
 class ProductByGlobalBarcodeAPIView(CompanyBranchRestrictedMixin, generics.RetrieveAPIView):
@@ -1120,21 +1196,6 @@ class ProductByGlobalBarcodeAPIView(CompanyBranchRestrictedMixin, generics.Retri
         return obj
 
 
-class ProductListView(CompanyBranchRestrictedMixin, generics.ListAPIView):
-    serializer_class = ProductSerializer
-    filter_backends = [filters.SearchFilter, filters.OrderingFilter]
-    search_fields = ["name", "barcode"]
-    ordering_fields = ["created_at", "updated_at", "price"]
-    ordering = ["-created_at"]
-
-    def get_queryset(self):
-        qs = (
-            Product.objects
-            .select_related("brand", "category", "client")
-            .prefetch_related("item_make", product_images_prefetch)
-            .all()
-        )
-        return self._filter_qs_company_branch(qs)
 
 
 # ===========================

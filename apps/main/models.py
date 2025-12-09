@@ -583,81 +583,424 @@ class PromoRule(models.Model):
 # ==========================
 class Product(models.Model):
     class Status(models.TextChoices):
-        PENDING  = "pending",  "Ожидание"
+        PENDING = "pending", "Ожидание"
         ACCEPTED = "accepted", "Принят"
         REJECTED = "rejected", "Отказ"
 
-    class ScaleType(models.TextChoices):
-        PIECE  = "piece",  "Штучный"
-        WEIGHT = "weight", "Весовой"
-
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
 
-    company = models.ForeignKey(Company, on_delete=models.CASCADE, related_name='products', verbose_name='Компания')
-    branch = models.ForeignKey(
-        Branch, on_delete=models.CASCADE, related_name='crm_products',
-        null=True, blank=True, db_index=True, verbose_name='Филиал'
+    company = models.ForeignKey(
+        "Company",
+        on_delete=models.CASCADE,
+        related_name="products",
+        verbose_name="Компания",
     )
-    client = models.ForeignKey("Client", on_delete=models.SET_NULL, null=True, blank=True,
-                               related_name="products", verbose_name="Клиент")
-    created_by = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, blank=True)
+    branch = models.ForeignKey(
+        "Branch",
+        on_delete=models.CASCADE,
+        related_name="crm_products",
+        null=True,
+        blank=True,
+        db_index=True,
+        verbose_name="Филиал",
+    )
+    client = models.ForeignKey(
+        "Client",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="products",
+        verbose_name="Клиент",
+    )
+    created_by = models.ForeignKey(
+        "User",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        verbose_name="Создал",
+    )
 
-    name = models.CharField(max_length=255)
-    barcode = models.CharField(max_length=64, null=True, blank=True)
-    brand = models.ForeignKey(ProductBrand, on_delete=models.SET_NULL, null=True, blank=True)
-    category = models.ForeignKey(ProductCategory, on_delete=models.SET_NULL, null=True, blank=True)
+    # ---- Код / артикул ----
+    code = models.CharField(
+        "Код товара",
+        max_length=16,
+        blank=True,
+        db_index=True,
+        help_text="Автогенерация в формате 0001 внутри компании",
+    )
+    article = models.CharField(
+        "Артикул",
+        max_length=64,
+        blank=True,
+    )
 
-    quantity = models.PositiveIntegerField(default=0)
+    name = models.CharField("Название", max_length=255)
+    barcode = models.CharField("Штрихкод", max_length=64, null=True, blank=True)
 
-    purchase_price = models.DecimalField(max_digits=10, decimal_places=2, default=0, verbose_name="Закупочная цена")
-    price = models.DecimalField(max_digits=10, decimal_places=2, default=0, verbose_name="Розничная цена")
+    brand = models.ForeignKey(
+        "ProductBrand",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        verbose_name="Бренд",
+    )
+    category = models.ForeignKey(
+        "ProductCategory",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        verbose_name="Категория",
+    )
 
-    # <<< НОВОЕ: поля для весов >>>
+    # ---- Единица и весовой товар ----
+    unit = models.CharField(
+        "Единица измерения",
+        max_length=32,
+        default="шт.",
+        help_text="Вводится вручную: шт., кг, м, упак., л и т.д.",
+    )
+    is_weight = models.BooleanField(
+        "Весовой товар",
+        default=False,
+        help_text="Если товар продаётся по весу (обычно кг)",
+    )
+
+    quantity = models.PositiveIntegerField("Количество на складе", default=0)
+
+    # ---- Цены / наценка / скидка ----
+    purchase_price = models.DecimalField(
+        "Цена закупки",
+        max_digits=10,
+        decimal_places=2,
+        default=0,
+    )
+    markup_percent = models.DecimalField(
+        "Наценка, %",
+        max_digits=5,
+        decimal_places=2,
+        default=0,
+        help_text="Наценка в процентах к закупочной цене",
+    )
+    price = models.DecimalField(
+        "Цена продажи",
+        max_digits=10,
+        decimal_places=2,
+        default=0,
+        help_text="Считается автоматически из закупки и наценки",
+    )
+    discount_percent = models.DecimalField(
+        "Скидка, %",
+        max_digits=5,
+        decimal_places=2,
+        default=0,
+        help_text="Скидка в процентах от цены продажи",
+    )
+
+    # ---- ПЛУ для весов ----
     plu = models.PositiveIntegerField(
+        "ПЛУ",
         blank=True,
         null=True,
-        verbose_name="ПЛУ",
         help_text="Номер ПЛУ для весов (можно не заполнять)",
     )
-    scale_type = models.CharField(
-        max_length=16,
-        choices=ScaleType.choices,
-        default=ScaleType.PIECE,
-        verbose_name="Тип товара для весов",
-        help_text="Штучный или весовой товар",
-    )
-    # <<< КОНЕЦ НОВОГО >>>
 
-    status = models.CharField("Статус", max_length=16, choices=Status.choices, db_index=True, blank=True, null=True)
-    stock = models.BooleanField(default=False, verbose_name="Акции", null=True, blank=True)
-    item_make = models.ManyToManyField("ItemMake", blank=True, related_name="products", verbose_name="Единицы товара")
-    date = models.DateTimeField(verbose_name="Дата", blank=True, null=True)
-    created_at = models.DateTimeField(auto_now_add=True)
-    updated_at = models.DateTimeField(auto_now=True)
+    # ---- Страна и прочее ----
+    country = models.CharField(
+        "Страна происхождения",
+        max_length=64,
+        blank=True,
+        help_text="Например: Россия, Китай, Кыргызстан",
+    )
+
+    status = models.CharField(
+        "Статус",
+        max_length=16,
+        choices=Status.choices,
+        db_index=True,
+        blank=True,
+        null=True,
+    )
+    stock = models.BooleanField(
+        "Акционный товар",
+        default=False,
+        null=True,
+        blank=True,
+    )
+
+    item_make = models.ManyToManyField(
+        "ItemMake",
+        blank=True,
+        related_name="products",
+        verbose_name="Единицы товара",
+    )
+
+    date = models.DateTimeField("Дата", blank=True, null=True)
+
+    expiration_date = models.DateField(
+        "Срок годности",
+        null=True,
+        blank=True,
+    )
+
+    created_at = models.DateTimeField("Создан", auto_now_add=True)
+    updated_at = models.DateTimeField("Обновлён", auto_now=True)
 
     class Meta:
-        verbose_name = 'Товар'
-        verbose_name_plural = 'Товары'
+        verbose_name = "Товар"
+        verbose_name_plural = "Товары"
         ordering = ["-created_at"]
-        unique_together = (("company", "barcode"),)
+        constraints = [
+            # штрихкод уникален в рамках компании
+            models.UniqueConstraint(
+                fields=("company", "barcode"),
+                name="uq_company_barcode",
+            ),
+            # код товара уникален в рамках компании
+            models.UniqueConstraint(
+                fields=("company", "code"),
+                name="uq_company_code",
+            ),
+            # ПЛУ уникален в рамках компании, если задан
+            models.UniqueConstraint(
+                fields=("company", "plu"),
+                condition=models.Q(plu__isnull=False),
+                name="uq_company_plu_not_null",
+            ),
+        ]
         indexes = [
-            models.Index(fields=['company', 'status']),
-            models.Index(fields=['company', 'branch', 'status']),
-            models.Index(fields=['company', 'plu']),  # чтобы по ПЛУ быстро находить
+            models.Index(fields=["company", "status"]),
+            models.Index(fields=["company", "branch", "status"]),
+            models.Index(fields=["company", "plu"]),
         ]
 
     def __str__(self):
         return self.name
 
+    # --------- внутренние методы ---------
+
+    def _auto_generate_code(self):
+        """
+        Генерация кода 0001, 0002... внутри компании.
+        """
+        if self.code or not self.company_id:
+            return
+
+        last_code = (
+            Product.objects.filter(company_id=self.company_id)
+            .exclude(code__isnull=True)
+            .exclude(code__exact="")
+            .order_by("-created_at")
+            .values_list("code", flat=True)
+            .first()
+        )
+
+        last_num = 0
+        if last_code and last_code.isdigit():
+            try:
+                last_num = int(last_code)
+            except ValueError:
+                last_num = 0
+
+        self.code = f"{last_num + 1:04d}"
+
+    def _recalc_price(self):
+        """
+        Цена продажи = закупочная + наценка%.
+        """
+        base = self.purchase_price or Decimal("0")
+        percent = self.markup_percent or Decimal("0")
+        result = base * (Decimal("1") + percent / Decimal("100"))
+        self.price = result.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+    # --------- валидации / сохранение ---------
+
     def clean(self):
+        # филиал ↔ компания
         if self.branch_id and self.branch.company_id != self.company_id:
-            raise ValidationError({'branch': 'Филиал принадлежит другой компании.'})
+            raise ValidationError({"branch": "Филиал принадлежит другой компании."})
+
+        # brand/category/client должны быть той же компании/филиала
         for rel, name in [(self.brand, "brand"), (self.category, "category"), (self.client, "client")]:
             if rel and getattr(rel, "company_id", None) != self.company_id:
                 raise ValidationError({name: "Объект принадлежит другой компании."})
             if self.branch_id and rel and getattr(rel, "branch_id", None) not in (None, self.branch_id):
                 raise ValidationError({name: "Объект другого филиала."})
 
+        # скидка 0–100
+        if self.discount_percent and not (Decimal("0") <= self.discount_percent <= Decimal("100")):
+            raise ValidationError({"discount_percent": "Скидка должна быть от 0 до 100%."})
+
+    def save(self, *args, **kwargs):
+        self._auto_generate_code()
+        self._recalc_price()
+        super().save(*args, **kwargs)
+        
+class ProductCharacteristics(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+
+    company = models.ForeignKey(
+        "Company",
+        on_delete=models.CASCADE,
+        related_name="product_characteristics",
+        verbose_name="Компания",
+    )
+    branch = models.ForeignKey(
+        "Branch",
+        on_delete=models.CASCADE,
+        related_name="crm_product_characteristics",
+        null=True,
+        blank=True,
+        db_index=True,
+        verbose_name="Филиал",
+    )
+
+    product = models.OneToOneField(
+        "Product",
+        on_delete=models.CASCADE,
+        related_name="characteristics",
+        verbose_name="Товар",
+    )
+
+    height_cm = models.DecimalField(
+        "Высота, см",
+        max_digits=8,
+        decimal_places=2,
+        null=True,
+        blank=True,
+    )
+    width_cm = models.DecimalField(
+        "Ширина, см",
+        max_digits=8,
+        decimal_places=2,
+        null=True,
+        blank=True,
+    )
+    depth_cm = models.DecimalField(
+        "Глубина, см",
+        max_digits=8,
+        decimal_places=2,
+        null=True,
+        blank=True,
+    )
+    factual_weight_kg = models.DecimalField(
+        "Фактический вес, кг",
+        max_digits=8,
+        decimal_places=3,
+        null=True,
+        blank=True,
+    )
+    description = models.TextField(
+        "Описание",
+        blank=True,
+    )
+
+    created_at = models.DateTimeField("Создано", auto_now_add=True)
+    updated_at = models.DateTimeField("Обновлено", auto_now=True)
+
+    class Meta:
+        verbose_name = "Характеристики товара"
+        verbose_name_plural = "Характеристики товара"
+
+    def __str__(self):
+        return f"Характеристики: {self.product}"
+
+    def clean(self):
+        if self.product_id:
+            # компания / филиал должны совпадать с товаром
+            if self.company_id and self.product.company_id != self.company_id:
+                raise ValidationError({"company": "Компания должна совпадать с компанией товара."})
+            if self.branch_id is not None and self.product.branch_id != self.branch_id:
+                raise ValidationError({"branch": "Филиал должен совпадать с филиалом товара (оба None или одинаковые)."})
+
+    def save(self, *args, **kwargs):
+        # если не указали company/branch — подставляем из товара
+        if self.product_id:
+            if not self.company_id:
+                self.company_id = self.product.company_id
+            if self.branch_id is None:
+                self.branch_id = self.product.branch_id
+        super().save(*args, **kwargs)
+
+
+class ProductPackage(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+
+    company = models.ForeignKey(
+        "Company",
+        on_delete=models.CASCADE,
+        related_name="product_packages",
+        verbose_name="Компания",
+    )
+    branch = models.ForeignKey(
+        "Branch",
+        on_delete=models.CASCADE,
+        related_name="crm_product_packages",
+        null=True,
+        blank=True,
+        db_index=True,
+        verbose_name="Филиал",
+    )
+
+    product = models.ForeignKey(
+        "Product",
+        on_delete=models.CASCADE,
+        related_name="packages",
+        verbose_name="Товар",
+    )
+
+    name = models.CharField(
+        "Упаковка",
+        max_length=64,
+        help_text="Например: коробка, пачка, блок, рулон",
+    )
+
+    quantity_in_package = models.DecimalField(
+        "Количество в упаковке",
+        max_digits=10,
+        decimal_places=3,
+        help_text="Сколько базовых единиц в одной упаковке",
+    )
+
+    unit = models.CharField(
+        "Ед. изм.",
+        max_length=32,
+        blank=True,
+        help_text="Если пусто — берём единицу товара",
+    )
+
+    created_at = models.DateTimeField("Создано", auto_now_add=True)
+
+    class Meta:
+        verbose_name = "Упаковка товара"
+        verbose_name_plural = "Упаковки товара"
+
+    def __str__(self):
+        return f"{self.name}: {self.quantity_in_package} {self.unit or self.product.unit}"
+
+    def clean(self):
+        if self.quantity_in_package is not None and self.quantity_in_package <= 0:
+            raise ValidationError(
+                {"quantity_in_package": "Количество в упаковке должно быть больше 0."}
+            )
+
+        if self.product_id:
+            if self.company_id and self.product.company_id != self.company_id:
+                raise ValidationError({"company": "Компания должна совпадать с компанией товара."})
+            if self.branch_id is not None and self.product.branch_id != self.branch_id:
+                raise ValidationError({"branch": "Филиал должен совпадать с филиалом товара (оба None или одинаковые)."})
+
+    def save(self, *args, **kwargs):
+        # автоподстановка company/branch из товара, если не заданы
+        if self.product_id:
+            if not self.company_id:
+                self.company_id = self.product.company_id
+            if self.branch_id is None:
+                self.branch_id = self.product.branch_id
+            # если unit не указали — наследуем от товара
+            if not self.unit:
+                self.unit = self.product.unit
+
+        super().save(*args, **kwargs)
 
 class ProductImage(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
