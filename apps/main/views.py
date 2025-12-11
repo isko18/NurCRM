@@ -959,28 +959,30 @@ class ProductCreateManualAPIView(generics.CreateAPIView, CompanyBranchRestricted
             product.item_make.set(ims)
 
         # СОЗДАЁМ packages
-        packages_to_create = []
-        for pkg in packages_input:
-            name_pkg = (pkg.get("name") or "").strip()
-            if not name_pkg:
-                continue
-            try:
-                qip = int(pkg.get("quantity_in_package"))
-            except (TypeError, ValueError):
-                continue
-            unit_pkg = (pkg.get("unit") or "").strip()
+            packages_to_create = []
+            for pkg in packages_input:
+                name_pkg = (pkg.get("name") or "").strip()
+                if not name_pkg:
+                    continue
+                try:
+                    qip = int(pkg.get("quantity_in_package"))
+                except (TypeError, ValueError):
+                    continue
+                unit_pkg = (pkg.get("unit") or "").strip()
 
-            packages_to_create.append(
-                ProductPackage(
-                    product=product,
-                    name=name_pkg,
-                    quantity_in_package=qip,
-                    unit=unit_pkg,
+                packages_to_create.append(
+                    ProductPackage(
+                        product=product,
+                        company=company,      # <-- добавили
+                        branch=branch,      # <-- если в модели есть branch и он not null
+                        name=name_pkg,
+                        quantity_in_package=qip,
+                        unit=unit_pkg,
+                    )
                 )
-            )
 
-        if packages_to_create:
-            ProductPackage.objects.bulk_create(packages_to_create)
+            if packages_to_create:
+                ProductPackage.objects.bulk_create(packages_to_create)
 
         # глобальная база
         if barcode:
