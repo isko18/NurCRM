@@ -797,7 +797,34 @@ class Product(models.Model):
         return self.name
 
     # --------- внутренние методы ---------
+    def _auto_generate_plu(self):
+        """
+        Автогенерация ПЛУ только для весовых товаров внутри компании.
+        Если is_weight=True и plu пустой → берём max(plu) по компании и +1.
+        Для is_weight=False ПЛУ не трогаем.
+        """
+        # не весовой товар → ничего не делаем
+        if not self.is_weight:
+            return
 
+        # уже есть ПЛУ или нет компании → выходим
+        if self.plu is not None or not self.company_id:
+            return
+
+        max_plu = (
+            Product.objects
+            .filter(company_id=self.company_id, plu__isnull=False)
+            .aggregate(m=Max("plu"))
+            .get("m") or 0
+        )
+        self.plu = max_plu + 1
+
+    def save(self, *args, **kwargs):
+        self._auto_generate_code()
+        self._auto_generate_plu()   # <-- добавили
+        self._recalc_price()
+        super().save(*args, **kwargs)
+        
     def _auto_generate_code(self):
         """
         Генерация кода 0001, 0002... внутри КОНКРЕТНОЙ компании.

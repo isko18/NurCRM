@@ -596,8 +596,8 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
     country = serializers.CharField(required=False, allow_blank=True)
     expiration_date = serializers.DateField(required=False, allow_null=True)
 
-    # ==== ПЛУ ====
-    plu = serializers.IntegerField(required=False, allow_null=True)
+    # ==== ПЛУ ====  — ТОЛЬКО READ-ONLY!
+    plu = serializers.IntegerField(read_only=True)
 
     # ==== НОВОЕ: поля только для чтения (данные с весов) ====
     weight_kg = serializers.SerializerMethodField(read_only=True)
@@ -659,6 +659,7 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
             "code",
             "characteristics",
             "packages",
+            "plu",              # <-- здесь тоже фиксируем, что только READ-ONLY
             "weight_kg", "total_price",
         ]
         extra_kwargs = {
@@ -681,11 +682,6 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
     # ==== ДАННЫЕ С ВЕСОВ ====
 
     def get_weight_kg(self, obj):
-        """
-        Вес берём только если:
-        - есть scale_data в контексте
-        - товар помечен как весовой (is_weight=True)
-        """
         scale_data = self.context.get("scale_data")
         if not scale_data:
             return None
@@ -694,11 +690,6 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
         return scale_data.get("weight_kg")
 
     def get_total_price(self, obj):
-        """
-        Если есть вес и товар весовой:
-            total = price * weight_kg
-        Иначе просто возвращаем price.
-        """
         scale_data = self.context.get("scale_data")
 
         if not obj.is_weight or not scale_data:
@@ -813,7 +804,9 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
 
         country = (validated_data.pop("country", "") or "").strip()
         expiration_date = validated_data.pop("expiration_date", None)
-        plu = validated_data.pop("plu", None)
+
+        # ПЛУ из payload больше НЕ используем — всё делает модель
+        # plu = validated_data.pop("plu", None)
 
         date_value = dj_tz.now()
 
@@ -850,7 +843,7 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
 
             quantity=validated_data.get("quantity", 0),
 
-            plu=plu,
+            # plu не передаём — модель сама проставит, если is_weight=True
             country=country,
             expiration_date=expiration_date,
 
@@ -919,7 +912,7 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
             "country",
             "expiration_date",
             "client",
-            "plu",
+            # "plu",  # ПЛУ больше не трогаем из payload
         ):
             if field in validated_data:
                 setattr(instance, field, validated_data[field])
@@ -929,6 +922,12 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
 
         if "status" in validated_data:
             instance.status = self._normalize_status(validated_data["status"])
+
+        # связка is_weight ↔ plu:
+        # если товар НЕ весовой → чистим ПЛУ
+        if instance.is_weight is False:
+            instance.plu = None
+        # если товар весовой и ПЛУ None → модель сама сгенерит при save()
 
         # дата (как у тебя было)
         raw_date = (self.initial_data.get("date")
