@@ -750,24 +750,6 @@ class Product(models.Model):
         verbose_name = "Товар"
         verbose_name_plural = "Товары"
         ordering = ["-created_at"]
-        constraints = [
-            # штрихкод уникален в рамках компании
-            models.UniqueConstraint(
-                fields=("company", "barcode"),
-                name="uq_company_barcode",
-            ),
-            # код товара уникален в рамках компании
-            models.UniqueConstraint(
-                fields=("company", "code"),
-                name="uq_company_code",
-            ),
-            # ПЛУ уникален в рамках компании, если задан
-            models.UniqueConstraint(
-                fields=("company", "plu"),
-                condition=models.Q(plu__isnull=False),
-                name="uq_company_plu_not_null",
-            ),
-        ]
         indexes = [
             models.Index(fields=["company", "status"]),
             models.Index(fields=["company", "branch", "status"]),
@@ -803,11 +785,9 @@ class Product(models.Model):
         Если is_weight=True и plu пустой → берём max(plu) по компании и +1.
         Для is_weight=False ПЛУ не трогаем.
         """
-        # не весовой товар → ничего не делаем
         if not self.is_weight:
             return
 
-        # уже есть ПЛУ или нет компании → выходим
         if self.plu is not None or not self.company_id:
             return
 
@@ -819,12 +799,6 @@ class Product(models.Model):
         )
         self.plu = max_plu + 1
 
-    def save(self, *args, **kwargs):
-        self._auto_generate_code()
-        self._auto_generate_plu()   # <-- добавили
-        self._recalc_price()
-        super().save(*args, **kwargs)
-        
     def _auto_generate_code(self):
         """
         Генерация кода 0001, 0002... внутри КОНКРЕТНОЙ компании.
@@ -839,7 +813,7 @@ class Product(models.Model):
             .filter(company_id=self.company_id)
             .exclude(code__isnull=True)
             .exclude(code__exact="")
-            .filter(code__regex=r"^\d+$")              # только коды, состоящие из цифр
+            .filter(code__regex=r"^\d+$")
             .annotate(code_int=Cast("code", IntegerField()))
         )
 
@@ -848,15 +822,22 @@ class Product(models.Model):
 
     def _recalc_price(self):
         """
-        Цена продажи = закупочная + наценка%.
+        Цена продажи:
+        - если markup_percent > 0 → считаем из закупки + наценки
+        - если markup_percent == 0 и price уже задан руками → не трогаем, только округляем
         """
         base = self.purchase_price or Decimal("0")
         percent = self.markup_percent or Decimal("0")
+
+        # ручная цена + наценка 0 → уважаем price
+        if self.price not in (None, Decimal("0")) and percent == Decimal("0"):
+            self.price = Decimal(self.price).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+            return
+
         result = base * (Decimal("1") + percent / Decimal("100"))
         self.price = result.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
 
     # --------- валидации / сохранение ---------
-
     def clean(self):
         # филиал ↔ компания
         if self.branch_id and self.branch.company_id != self.company_id:
@@ -874,7 +855,9 @@ class Product(models.Model):
             raise ValidationError({"discount_percent": "Скидка должна быть от 0 до 100%."})
 
     def save(self, *args, **kwargs):
+        # один общий save
         self._auto_generate_code()
+        self._auto_generate_plu()
         self._recalc_price()
         super().save(*args, **kwargs)
         

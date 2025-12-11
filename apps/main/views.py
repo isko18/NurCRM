@@ -32,7 +32,7 @@ from apps.main.models import (
     GlobalProduct, GlobalBrand, GlobalCategory, ClientDeal, Bid, SocialApplications, TransactionRecord,
     ContractorWork, DealInstallment, DebtPayment, Debt, ObjectSaleItem, ObjectSale, ObjectItem, ItemMake,
     ManufactureSubreal, Acceptance, ReturnFromAgent, AgentSaleAllocation, ProductImage,
-    AgentRequestCart, AgentRequestItem, ProductPackage
+    AgentRequestCart, AgentRequestItem, ProductPackage, ProductCharacteristics
 )
 from apps.main.serializers import (
     ContactSerializer, PipelineSerializer, DealSerializer, TaskSerializer,
@@ -713,7 +713,20 @@ class ProductCreateByBarcodeAPIView(generics.CreateAPIView, CompanyBranchRestric
             date=date_value,
             created_by=request.user,
         )
-
+        chars_data = data.get("characteristics")
+        if isinstance(chars_data, dict):
+            ProductCharacteristics.objects.update_or_create(
+                product=product,
+                defaults={
+                    "company": company,
+                    "branch": branch,
+                    "height_cm": chars_data.get("height_cm") or None,
+                    "width_cm": chars_data.get("width_cm") or None,
+                    "depth_cm": chars_data.get("depth_cm") or None,
+                    "factual_weight_kg": chars_data.get("factual_weight_kg") or None,
+                    "description": chars_data.get("description") or "",
+                },
+            )
         # Создаём упаковки
         packages_to_create = []
         for pkg in packages_input:
@@ -942,6 +955,20 @@ class ProductCreateManualAPIView(generics.CreateAPIView, CompanyBranchRestricted
             created_by=request.user,
         )
 
+        chars_data = data.get("characteristics")
+        if isinstance(chars_data, dict):
+            ProductCharacteristics.objects.update_or_create(
+                product=product,
+                defaults={
+                    "company": company,
+                    "branch": branch,
+                    "height_cm": chars_data.get("height_cm") or None,
+                    "width_cm": chars_data.get("width_cm") or None,
+                    "depth_cm": chars_data.get("depth_cm") or None,
+                    "factual_weight_kg": chars_data.get("factual_weight_kg") or None,
+                    "description": chars_data.get("description") or "",
+                },
+            )
         # item_make
         item_make_input = data.get("item_make") or data.get("item_make_ids")
         if item_make_input:
