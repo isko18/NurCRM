@@ -848,9 +848,7 @@ class ProductCreateManualAPIView(generics.CreateAPIView, CompanyBranchRestricted
         except ValueError as e:
             return Response({"date": str(e)}, status=status.HTTP_400_BAD_REQUEST)
 
-        # ПЛУ / ед. измерения / весовой / страна / срок годности
-        plu = data.get("plu") or None
-
+        # Ед. измерения / весовой / страна / срок годности
         unit = (data.get("unit") or "шт.").strip()
         is_weight_raw = data.get("is_weight")
         if isinstance(is_weight_raw, bool):
@@ -885,6 +883,7 @@ class ProductCreateManualAPIView(generics.CreateAPIView, CompanyBranchRestricted
         if client_id:
             client = get_object_or_404(Client, id=client_id, company=company)
 
+        # ВАЖНО: plu НЕ передаём, модель сама разрулит по is_weight
         product = Product.objects.create(
             company=company,
             branch=branch,
@@ -906,7 +905,6 @@ class ProductCreateManualAPIView(generics.CreateAPIView, CompanyBranchRestricted
             status=status_value,
             date=date_value,
 
-            plu=plu,
             country=country,
             expiration_date=expiration_date,
 
@@ -939,9 +937,6 @@ class ProductCreateManualAPIView(generics.CreateAPIView, CompanyBranchRestricted
             )
 
         return Response(self.get_serializer(product).data, status=status.HTTP_201_CREATED)
-
-
-
 
 class ProductRetrieveUpdateDestroyAPIView(CompanyBranchRestrictedMixin, generics.RetrieveUpdateDestroyAPIView):
     serializer_class = ProductSerializer
