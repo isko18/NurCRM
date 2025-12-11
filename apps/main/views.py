@@ -575,7 +575,6 @@ class ProductListView(CompanyBranchRestrictedMixin, generics.ListAPIView):
         )
         return self._filter_qs_company_branch(qs)
 
-
 class ProductCreateByBarcodeAPIView(generics.CreateAPIView, CompanyBranchRestrictedMixin):
     """
     Создание товара только по штрих-коду (если найден в глобальной базе).
@@ -611,6 +610,18 @@ class ProductCreateByBarcodeAPIView(generics.CreateAPIView, CompanyBranchRestric
                 {"barcode": "Товар с таким штрих-кодом не найден в глобальной базе. Заполните карточку вручную."},
                 status=status.HTTP_404_NOT_FOUND,
             )
+
+        # ====== ТИП ТОВАРА (kind) ======
+        kind_raw = str(data.get("kind") or Product.Kind.PRODUCT).strip().lower()
+        kind_map = {
+            "product": Product.Kind.PRODUCT,
+            "товар": Product.Kind.PRODUCT,
+            "service": Product.Kind.SERVICE,
+            "услуга": Product.Kind.SERVICE,
+            "bundle": Product.Kind.BUNDLE,
+            "комплект": Product.Kind.BUNDLE,
+        }
+        kind_value = kind_map.get(kind_raw, Product.Kind.PRODUCT)
 
         # Цены
         try:
@@ -689,10 +700,10 @@ class ProductCreateByBarcodeAPIView(generics.CreateAPIView, CompanyBranchRestric
             packages_input = []
 
         # Создаём локальный товар
-        # ВАЖНО: plu больше не берём из payload → модель сама сделает для весовых
         product = Product.objects.create(
             company=company,
             branch=branch,
+            kind=kind_value,              # <---- ВАЖНО
             name=gp.name,
             barcode=gp.barcode,
             brand=brand,
@@ -713,6 +724,8 @@ class ProductCreateByBarcodeAPIView(generics.CreateAPIView, CompanyBranchRestric
             date=date_value,
             created_by=request.user,
         )
+
+        # характеристики
         chars_data = data.get("characteristics")
         if isinstance(chars_data, dict):
             ProductCharacteristics.objects.update_or_create(
@@ -727,7 +740,8 @@ class ProductCreateByBarcodeAPIView(generics.CreateAPIView, CompanyBranchRestric
                     "description": chars_data.get("description") or "",
                 },
             )
-        # Создаём упаковки
+
+        # упаковки
         packages_to_create = []
         for pkg in packages_input:
             name = (pkg.get("name") or "").strip()
@@ -742,8 +756,8 @@ class ProductCreateByBarcodeAPIView(generics.CreateAPIView, CompanyBranchRestric
             packages_to_create.append(
                 ProductPackage(
                     product=product,
-                    company=company,   # <-- фикс company_id
-                    branch=branch,     # <-- если есть такое поле и оно not null
+                    company=company,
+                    branch=branch,
                     name=name,
                     quantity_in_package=qip,
                     unit=unit_pkg,
@@ -754,6 +768,7 @@ class ProductCreateByBarcodeAPIView(generics.CreateAPIView, CompanyBranchRestric
             ProductPackage.objects.bulk_create(packages_to_create)
 
         return Response(self.get_serializer(product).data, status=status.HTTP_201_CREATED)
+
 
 
 class ProductCreateManualAPIView(generics.CreateAPIView, CompanyBranchRestrictedMixin):
@@ -837,7 +852,16 @@ class ProductCreateManualAPIView(generics.CreateAPIView, CompanyBranchRestricted
                 {"barcode": "В вашей компании уже есть товар с таким штрих-кодом."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
-
+        kind_raw = str(data.get("kind") or Product.Kind.PRODUCT).strip().lower()
+        kind_map = {
+            "product": Product.Kind.PRODUCT,
+            "товар": Product.Kind.PRODUCT,
+            "service": Product.Kind.SERVICE,
+            "услуга": Product.Kind.SERVICE,
+            "bundle": Product.Kind.BUNDLE,
+            "комплект": Product.Kind.BUNDLE,
+        }
+        kind_value = kind_map.get(kind_raw, Product.Kind.PRODUCT)
         # Цены
         try:
             purchase_price = Decimal(str(data.get("purchase_price", 0)))
@@ -931,6 +955,7 @@ class ProductCreateManualAPIView(generics.CreateAPIView, CompanyBranchRestricted
         product = Product.objects.create(
             company=company,
             branch=branch,
+            kind=kind_value,    
             name=name,
             barcode=barcode,
             brand=brand,

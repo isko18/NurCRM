@@ -611,12 +611,17 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
     packages = ProductPackageSerializer(many=True, read_only=True)
     # WRITE-ONLY — то, что принимаем с фронта
     packages_input = ProductPackageSerializer(many=True, write_only=True, required=False)
+    kind = serializers.ChoiceField(
+        choices=Product.Kind.choices,
+        required=False,
+        default=Product.Kind.PRODUCT,
+    )
 
     class Meta:
         model = Product
         fields = [
             "id", "company", "branch",
-
+            "kind",  
             "code", "article",
 
             "name", "barcode",
@@ -669,6 +674,7 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
             "weight_kg", "total_price",
         ]
         extra_kwargs = {
+            "kind": {"required": False, "default": Product.Kind.PRODUCT},
             "purchase_price": {"required": False, "default": 0},
             "markup_percent": {"required": False, "default": 0},
             "discount_percent": {"required": False, "default": 0},

@@ -588,6 +588,11 @@ class Product(models.Model):
         ACCEPTED = "accepted", "Принят"
         REJECTED = "rejected", "Отказ"
 
+    class Kind(models.TextChoices):
+        PRODUCT = "product", "Товар"
+        SERVICE = "service", "Услуга"
+        BUNDLE  = "bundle", "Комплект"
+        
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
 
     company = models.ForeignKey(
@@ -604,6 +609,13 @@ class Product(models.Model):
         blank=True,
         db_index=True,
         verbose_name="Филиал",
+    )
+    kind = models.CharField(
+        "Тип позиции",
+        max_length=16,
+        choices=Kind.choices,
+        default=Kind.PRODUCT,
+        db_index=True,
     )
     client = models.ForeignKey(
         "Client",
