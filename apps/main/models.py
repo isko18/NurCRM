@@ -6,11 +6,12 @@ from django.core.validators import MinValueValidator
 from decimal import Decimal, ROUND_HALF_UP
 from dateutil.relativedelta import relativedelta
 from django.db import transaction
-from django.db.models import Sum, F, Q
+from django.db.models import Sum, F, Q, Max, IntegerField
 from mptt.models import MPTTModel, TreeForeignKey
 import uuid, secrets
 from django.core.files.base import ContentFile
 from PIL import Image
+from django.db.models.functions import Cast
 import io
 
 from apps.users.models import Company, User, Branch
@@ -799,27 +800,23 @@ class Product(models.Model):
 
     def _auto_generate_code(self):
         """
-        Генерация кода 0001, 0002... внутри компании.
+        Генерация кода 0001, 0002... внутри КОНКРЕТНОЙ компании.
+        Смотрим максимальный числовой код и +1.
+        Старые записи не трогаем.
         """
         if self.code or not self.company_id:
             return
 
-        last_code = (
-            Product.objects.filter(company_id=self.company_id)
+        qs = (
+            Product.objects
+            .filter(company_id=self.company_id)
             .exclude(code__isnull=True)
             .exclude(code__exact="")
-            .order_by("-created_at")
-            .values_list("code", flat=True)
-            .first()
+            .filter(code__regex=r"^\d+$")              # только коды, состоящие из цифр
+            .annotate(code_int=Cast("code", IntegerField()))
         )
 
-        last_num = 0
-        if last_code and last_code.isdigit():
-            try:
-                last_num = int(last_code)
-            except ValueError:
-                last_num = 0
-
+        last_num = qs.aggregate(max_num=Max("code_int"))["max_num"] or 0
         self.code = f"{last_num + 1:04d}"
 
     def _recalc_price(self):
