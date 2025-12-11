@@ -591,7 +591,10 @@ class ProductCreateByBarcodeAPIView(generics.CreateAPIView, CompanyBranchRestric
         company = self._company()
         branch = self._auto_branch()
         data = request.data
+
         barcode = (data.get("barcode") or "").strip()
+        description = (data.get("description") or "").strip()
+        article = (data.get("article") or "").strip()
 
         if not barcode:
             return Response({"barcode": "Укажите штрих-код."}, status=status.HTTP_400_BAD_REQUEST)
@@ -703,11 +706,14 @@ class ProductCreateByBarcodeAPIView(generics.CreateAPIView, CompanyBranchRestric
         product = Product.objects.create(
             company=company,
             branch=branch,
-            kind=kind_value,              # <---- ВАЖНО
+            kind=kind_value,
             name=gp.name,
             barcode=gp.barcode,
             brand=brand,
             category=category,
+
+            article=article,
+            description=description,
 
             unit=unit,
             is_weight=is_weight,
@@ -768,7 +774,6 @@ class ProductCreateByBarcodeAPIView(generics.CreateAPIView, CompanyBranchRestric
             ProductPackage.objects.bulk_create(packages_to_create)
 
         return Response(self.get_serializer(product).data, status=status.HTTP_201_CREATED)
-
 
 
 class ProductCreateManualAPIView(generics.CreateAPIView, CompanyBranchRestrictedMixin):
@@ -842,6 +847,9 @@ class ProductCreateManualAPIView(generics.CreateAPIView, CompanyBranchRestricted
         data = request.data
 
         name = (data.get("name") or "").strip()
+        description = (data.get("description") or "").strip()
+        article = (data.get("article") or "").strip()
+
         if not name:
             return Response({"name": "Обязательное поле."}, status=status.HTTP_400_BAD_REQUEST)
 
@@ -852,6 +860,8 @@ class ProductCreateManualAPIView(generics.CreateAPIView, CompanyBranchRestricted
                 {"barcode": "В вашей компании уже есть товар с таким штрих-кодом."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
+
+        # kind
         kind_raw = str(data.get("kind") or Product.Kind.PRODUCT).strip().lower()
         kind_map = {
             "product": Product.Kind.PRODUCT,
@@ -862,6 +872,7 @@ class ProductCreateManualAPIView(generics.CreateAPIView, CompanyBranchRestricted
             "комплект": Product.Kind.BUNDLE,
         }
         kind_value = kind_map.get(kind_raw, Product.Kind.PRODUCT)
+
         # Цены
         try:
             purchase_price = Decimal(str(data.get("purchase_price", 0)))
@@ -931,7 +942,7 @@ class ProductCreateManualAPIView(generics.CreateAPIView, CompanyBranchRestricted
                     status=status.HTTP_400_BAD_REQUEST,
                 )
 
-        # Бренд / категория (через глобальные справочники, как было)
+        # Бренд / категория
         brand_name = (data.get("brand_name") or "").strip()
         category_name = (data.get("category_name") or "").strip()
         g_brand = GlobalBrand.objects.get_or_create(name=brand_name)[0] if brand_name else None
@@ -951,15 +962,18 @@ class ProductCreateManualAPIView(generics.CreateAPIView, CompanyBranchRestricted
         if not isinstance(packages_input, list):
             packages_input = []
 
-        # ВАЖНО: plu НЕ передаём, модель сама разрулит по is_weight
+        # ВАЖНО: plu не передаём
         product = Product.objects.create(
             company=company,
             branch=branch,
-            kind=kind_value,    
+            kind=kind_value,
             name=name,
             barcode=barcode,
             brand=brand,
             category=category,
+
+            article=article,
+            description=description,
 
             unit=unit,
             is_weight=is_weight,
@@ -980,6 +994,7 @@ class ProductCreateManualAPIView(generics.CreateAPIView, CompanyBranchRestricted
             created_by=request.user,
         )
 
+        # характеристики
         chars_data = data.get("characteristics")
         if isinstance(chars_data, dict):
             ProductCharacteristics.objects.update_or_create(
@@ -994,6 +1009,7 @@ class ProductCreateManualAPIView(generics.CreateAPIView, CompanyBranchRestricted
                     "description": chars_data.get("description") or "",
                 },
             )
+
         # item_make
         item_make_input = data.get("item_make") or data.get("item_make_ids")
         if item_make_input:
@@ -1012,7 +1028,7 @@ class ProductCreateManualAPIView(generics.CreateAPIView, CompanyBranchRestricted
                 )
             product.item_make.set(ims)
 
-        # СОЗДАЁМ packages (всегда, независимо от item_make)
+        # packages
         packages_to_create = []
         for pkg in packages_input:
             name_pkg = (pkg.get("name") or "").strip()
@@ -1027,8 +1043,8 @@ class ProductCreateManualAPIView(generics.CreateAPIView, CompanyBranchRestricted
             packages_to_create.append(
                 ProductPackage(
                     product=product,
-                    company=company,   # фикс company_id
-                    branch=branch,     # если есть такое поле и not null
+                    company=company,
+                    branch=branch,
                     name=name_pkg,
                     quantity_in_package=qip,
                     unit=unit_pkg,
@@ -1046,6 +1062,7 @@ class ProductCreateManualAPIView(generics.CreateAPIView, CompanyBranchRestricted
             )
 
         return Response(self.get_serializer(product).data, status=status.HTTP_201_CREATED)
+
 
 class ProductRetrieveUpdateDestroyAPIView(CompanyBranchRestrictedMixin, generics.RetrieveUpdateDestroyAPIView):
     serializer_class = ProductSerializer

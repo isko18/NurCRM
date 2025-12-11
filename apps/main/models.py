@@ -648,6 +648,11 @@ class Product(models.Model):
     )
 
     name = models.CharField("Название", max_length=255)
+    description = models.TextField(
+        "Описание",
+        blank=True,
+        null=True
+    )
     barcode = models.CharField("Штрихкод", max_length=64, null=True, blank=True)
 
     brand = models.ForeignKey(

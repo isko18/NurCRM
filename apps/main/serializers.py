@@ -577,6 +577,7 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
     # ====== новые поля модели ======
     code = serializers.CharField(read_only=True)  # генерится в модели
     article = serializers.CharField(required=False, allow_blank=True)
+    description = serializers.CharField(required=False, allow_blank=True)
 
     unit = serializers.CharField(required=False, allow_blank=True)
     is_weight = serializers.BooleanField(required=False)
@@ -624,7 +625,7 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
             "kind",  
             "code", "article",
 
-            "name", "barcode",
+            "name", "description","barcode",
 
             "brand", "brand_name",
             "category", "category_name",
@@ -682,6 +683,7 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
             "unit": {"required": False, "default": "шт."},
             "is_weight": {"required": False, "default": False},
             "price": {"required": False},
+            "description": {"required": False, "allow_blank": True},
         }
 
     def __init__(self, *args, **kwargs):
@@ -800,6 +802,7 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
         is_weight = validated_data.pop("is_weight", False)
 
         # --- цены / наценка / цена продажи ---
+        description = (validated_data.pop("description", "") or "").strip() 
         purchase_price = validated_data.pop("purchase_price", Decimal("0"))
         markup_percent = validated_data.pop("markup_percent", Decimal("0"))
         price_from_payload = validated_data.pop("price", None)
@@ -842,6 +845,7 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
             category=category,
 
             article=article,
+            description=description,
             unit=unit,
             is_weight=is_weight,
 
