@@ -527,7 +527,8 @@ class ProductPackageSerializer(serializers.ModelSerializer):
             "unit",
         ]
         read_only_fields = ["id"]
-        
+
+
 class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
     # ====== базовые поля компании/филиала ======
     company = serializers.ReadOnlyField(source="company.id")
@@ -599,13 +600,17 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
     # ==== ПЛУ ====  — ТОЛЬКО READ-ONLY!
     plu = serializers.IntegerField(read_only=True)
 
-    # ==== НОВОЕ: поля только для чтения (данные с весов) ====
+    # ==== ДАННЫЕ С ВЕСОВ ====
     weight_kg = serializers.SerializerMethodField(read_only=True)
     total_price = serializers.SerializerMethodField(read_only=True)
 
-    # ==== НОВОЕ: связанные модели ====
+    # ==== связанные модели ====
     characteristics = ProductCharacteristicsSerializer(read_only=True)
+
+    # READ-ONLY — то, что отдаём фронту
     packages = ProductPackageSerializer(many=True, read_only=True)
+    # WRITE-ONLY — то, что принимаем с фронта
+    packages_input = ProductPackageSerializer(many=True, write_only=True, required=False)
 
     class Meta:
         model = Product
@@ -643,7 +648,8 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
 
             "images",
             "characteristics",
-            "packages",
+            "packages",        # читаем
+            "packages_input",  # пишем
 
             "weight_kg",
             "total_price",
@@ -659,7 +665,7 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
             "code",
             "characteristics",
             "packages",
-            "plu",              # <-- здесь тоже фиксируем, что только READ-ONLY
+            "plu",
             "weight_kg", "total_price",
         ]
         extra_kwargs = {
@@ -773,6 +779,8 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
     @transaction.atomic
     def create(self, validated_data):
         item_make_data = validated_data.pop("item_make_ids", [])
+        packages_data = validated_data.pop("packages_input", [])  # <-- NEW
+
         company = self._user_company()
         branch = self._auto_branch()
 
@@ -791,11 +799,9 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
         price_from_payload = validated_data.pop("price", None)
 
         if price_from_payload is not None:
-            # фронт задал цену руками → наценку обнуляем
             price = Decimal(str(price_from_payload))
             markup_percent = Decimal("0")
         else:
-            # цену не прислали → считаем из закупки и процента
             mp = markup_percent or Decimal("0")
             price = purchase_price * (Decimal("1") + mp / Decimal("100"))
             price = price.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
@@ -804,9 +810,6 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
 
         country = (validated_data.pop("country", "") or "").strip()
         expiration_date = validated_data.pop("expiration_date", None)
-
-        # ПЛУ из payload больше НЕ используем — всё делает модель
-        # plu = validated_data.pop("plu", None)
 
         date_value = dj_tz.now()
 
@@ -843,7 +846,6 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
 
             quantity=validated_data.get("quantity", 0),
 
-            # plu не передаём — модель сама проставит, если is_weight=True
             country=country,
             expiration_date=expiration_date,
 
@@ -856,12 +858,23 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
         if item_make_data:
             product.item_make.set(item_make_data)
 
+        # СОХРАНЯЕМ PACKAGES
+        for pkg in packages_data:
+            ProductPackage.objects.create(
+                product=product,
+                name=pkg.get("name", "").strip(),
+                quantity_in_package=pkg.get("quantity_in_package"),
+                unit=(pkg.get("unit") or "").strip(),
+            )
+
         return product
 
     @transaction.atomic
     def update(self, instance, validated_data):
         company = self._user_company()
         branch = self._auto_branch()
+
+        packages_data = validated_data.pop("packages_input", None)  # <-- NEW
 
         # бренд/категория через *_name
         brand_name = (validated_data.pop("brand_name", "") or "").strip()
@@ -885,12 +898,9 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
 
         price_explicitly_set = "price" in validated_data
         if price_explicitly_set:
-            # фронт руками меняет цену → процент очищаем
             price = Decimal(str(validated_data["price"]))
             markup_percent = Decimal("0")
         else:
-            # цену не передавали:
-            # если меняется закупка или процент → пересчитываем price
             if "purchase_price" in validated_data or "markup_percent" in validated_data:
                 mp = markup_percent or Decimal("0")
                 price = purchase_price * (Decimal("1") + mp / Decimal("100"))
@@ -912,7 +922,6 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
             "country",
             "expiration_date",
             "client",
-            # "plu",  # ПЛУ больше не трогаем из payload
         ):
             if field in validated_data:
                 setattr(instance, field, validated_data[field])
@@ -923,13 +932,10 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
         if "status" in validated_data:
             instance.status = self._normalize_status(validated_data["status"])
 
-        # связка is_weight ↔ plu:
-        # если товар НЕ весовой → чистим ПЛУ
         if instance.is_weight is False:
             instance.plu = None
-        # если товар весовой и ПЛУ None → модель сама сгенерит при save()
 
-        # дата (как у тебя было)
+        # дата
         raw_date = (self.initial_data.get("date")
                     if isinstance(getattr(self, "initial_data", None), dict) else None)
         if not raw_date:
@@ -952,6 +958,18 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
                     })
 
         instance.save()
+
+        # ПЕРЕЗАПИСЫВАЕМ PACKAGES, если прилетели
+        if packages_data is not None:
+            instance.packages.all().delete()
+            for pkg in packages_data:
+                ProductPackage.objects.create(
+                    product=instance,
+                    name=pkg.get("name", "").strip(),
+                    quantity_in_package=pkg.get("quantity_in_package"),
+                    unit=(pkg.get("unit") or "").strip(),
+                )
+
         return instance
 # ===========================
 # Review / Notification

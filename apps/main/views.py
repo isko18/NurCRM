@@ -32,7 +32,7 @@ from apps.main.models import (
     GlobalProduct, GlobalBrand, GlobalCategory, ClientDeal, Bid, SocialApplications, TransactionRecord,
     ContractorWork, DealInstallment, DebtPayment, Debt, ObjectSaleItem, ObjectSale, ObjectItem, ItemMake,
     ManufactureSubreal, Acceptance, ReturnFromAgent, AgentSaleAllocation, ProductImage,
-    AgentRequestCart, AgentRequestItem
+    AgentRequestCart, AgentRequestItem, ProductPackage
 )
 from apps.main.serializers import (
     ContactSerializer, PipelineSerializer, DealSerializer, TaskSerializer,
@@ -659,9 +659,6 @@ class ProductCreateByBarcodeAPIView(generics.CreateAPIView, CompanyBranchRestric
         else:
             date_value = timezone.now().date()
 
-        # ПЛУ
-        plu = data.get("plu") or None
-
         # Ед. измерения / весовой / страна / срок годности
         unit = (data.get("unit") or "шт.").strip()
         is_weight_raw = data.get("is_weight")
@@ -686,7 +683,13 @@ class ProductCreateByBarcodeAPIView(generics.CreateAPIView, CompanyBranchRestric
         brand = ProductBrand.objects.get_or_create(company=company, name=gp.brand.name)[0] if gp.brand else None
         category = ProductCategory.objects.get_or_create(company=company, name=gp.category.name)[0] if gp.category else None
 
+        # --- packages_input из фронта ---
+        packages_input = data.get("packages_input") or data.get("packages")
+        if not isinstance(packages_input, list):
+            packages_input = []
+
         # Создаём локальный товар
+        # ВАЖНО: plu больше не берём из payload → модель сама сделает для весовых
         product = Product.objects.create(
             company=company,
             branch=branch,
@@ -704,7 +707,6 @@ class ProductCreateByBarcodeAPIView(generics.CreateAPIView, CompanyBranchRestric
             discount_percent=discount_percent,
 
             quantity=quantity,
-            plu=plu,
             country=country,
             expiration_date=expiration_date,
 
@@ -712,9 +714,31 @@ class ProductCreateByBarcodeAPIView(generics.CreateAPIView, CompanyBranchRestric
             created_by=request.user,
         )
 
+        # Создаём упаковки
+        packages_to_create = []
+        for pkg in packages_input:
+            name = (pkg.get("name") or "").strip()
+            if not name:
+                continue
+            try:
+                qip = int(pkg.get("quantity_in_package"))
+            except (TypeError, ValueError):
+                continue
+            unit_pkg = (pkg.get("unit") or "").strip()
+
+            packages_to_create.append(
+                ProductPackage(
+                    product=product,
+                    name=name,
+                    quantity_in_package=qip,
+                    unit=unit_pkg,
+                )
+            )
+
+        if packages_to_create:
+            ProductPackage.objects.bulk_create(packages_to_create)
+
         return Response(self.get_serializer(product).data, status=status.HTTP_201_CREATED)
-
-
 
 
 class ProductCreateManualAPIView(generics.CreateAPIView, CompanyBranchRestrictedMixin):
@@ -883,6 +907,11 @@ class ProductCreateManualAPIView(generics.CreateAPIView, CompanyBranchRestricted
         if client_id:
             client = get_object_or_404(Client, id=client_id, company=company)
 
+        # packages_input
+        packages_input = data.get("packages_input") or data.get("packages")
+        if not isinstance(packages_input, list):
+            packages_input = []
+
         # ВАЖНО: plu НЕ передаём, модель сама разрулит по is_weight
         product = Product.objects.create(
             company=company,
@@ -928,6 +957,30 @@ class ProductCreateManualAPIView(generics.CreateAPIView, CompanyBranchRestricted
                     status=400
                 )
             product.item_make.set(ims)
+
+        # СОЗДАЁМ packages
+        packages_to_create = []
+        for pkg in packages_input:
+            name_pkg = (pkg.get("name") or "").strip()
+            if not name_pkg:
+                continue
+            try:
+                qip = int(pkg.get("quantity_in_package"))
+            except (TypeError, ValueError):
+                continue
+            unit_pkg = (pkg.get("unit") or "").strip()
+
+            packages_to_create.append(
+                ProductPackage(
+                    product=product,
+                    name=name_pkg,
+                    quantity_in_package=qip,
+                    unit=unit_pkg,
+                )
+            )
+
+        if packages_to_create:
+            ProductPackage.objects.bulk_create(packages_to_create)
 
         # глобальная база
         if barcode:
