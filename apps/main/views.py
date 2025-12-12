@@ -54,6 +54,7 @@ from apps.main.serializers import (
 from django.db.models import ProtectedError
 from apps.utils import product_images_prefetch, _is_owner_like
 from apps.main.analytics_agent import build_agent_analytics_payload, _parse_period
+from apps.main.services import _parse_bool_like, _parse_date_to_aware_datetime, _parse_kind, _parse_int_nonneg, _parse_decimal
 
 
 
@@ -574,8 +575,7 @@ class ProductListView(CompanyBranchRestrictedMixin, generics.ListAPIView):
             )
         )
         return self._filter_qs_company_branch(qs)
-
-class ProductCreateByBarcodeAPIView(generics.CreateAPIView, CompanyBranchRestrictedMixin):
+class ProductCreateByBarcodeAPIView(CompanyBranchRestrictedMixin, generics.CreateAPIView):
     """
     Создание товара только по штрих-коду (если найден в глобальной базе).
     """
@@ -584,10 +584,6 @@ class ProductCreateByBarcodeAPIView(generics.CreateAPIView, CompanyBranchRestric
 
     @transaction.atomic
     def create(self, request, *args, **kwargs):
-        from decimal import Decimal
-        from django.utils import timezone
-        from django.utils.dateparse import parse_date
-
         company = self._company()
         branch = self._auto_branch()
         data = request.data
@@ -599,43 +595,35 @@ class ProductCreateByBarcodeAPIView(generics.CreateAPIView, CompanyBranchRestric
         if not barcode:
             return Response({"barcode": "Укажите штрих-код."}, status=status.HTTP_400_BAD_REQUEST)
 
-        # Проверка дубликатов внутри компании
+        # Дубликат внутри компании
         if Product.objects.filter(company=company, barcode=barcode).exists():
             return Response(
                 {"barcode": "В вашей компании уже есть товар с таким штрих-кодом."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        # Ищем в глобальной базе
-        gp = GlobalProduct.objects.select_related("brand", "category").filter(barcode=barcode).first()
+        gp = (
+            GlobalProduct.objects
+            .select_related("brand", "category")
+            .filter(barcode=barcode)
+            .first()
+        )
         if not gp:
             return Response(
                 {"barcode": "Товар с таким штрих-кодом не найден в глобальной базе. Заполните карточку вручную."},
                 status=status.HTTP_404_NOT_FOUND,
             )
 
-        # ====== ТИП ТОВАРА (kind) ======
-        kind_raw = str(data.get("kind") or Product.Kind.PRODUCT).strip().lower()
-        kind_map = {
-            "product": Product.Kind.PRODUCT,
-            "товар": Product.Kind.PRODUCT,
-            "service": Product.Kind.SERVICE,
-            "услуга": Product.Kind.SERVICE,
-            "bundle": Product.Kind.BUNDLE,
-            "комплект": Product.Kind.BUNDLE,
-        }
-        kind_value = kind_map.get(kind_raw, Product.Kind.PRODUCT)
+        # kind
+        kind_value = _parse_kind(data.get("kind"), Product)
 
-        # Цены
+        # decimals + price calc
         try:
-            purchase_price = Decimal(str(data.get("purchase_price", 0)))
-        except Exception:
-            return Response({"purchase_price": "Неверный формат закупочной цены."}, status=status.HTTP_400_BAD_REQUEST)
-
-        try:
-            markup_percent = Decimal(str(data.get("markup_percent", 0)))
-        except Exception:
-            return Response({"markup_percent": "Неверный формат наценки."}, status=status.HTTP_400_BAD_REQUEST)
+            purchase_price = _parse_decimal(data.get("purchase_price", 0), "purchase_price")
+            markup_percent = _parse_decimal(data.get("markup_percent", 0), "markup_percent")
+            discount_percent = _parse_decimal(data.get("discount_percent", 0), "discount_percent")
+        except ValueError as e:
+            return Response({str(e): "Неверный формат числа."}, status=status.HTTP_400_BAD_REQUEST)
 
         price_raw = data.get("price", None)
         if price_raw not in (None, ""):
@@ -643,44 +631,29 @@ class ProductCreateByBarcodeAPIView(generics.CreateAPIView, CompanyBranchRestric
                 price = Decimal(str(price_raw))
             except Exception:
                 return Response({"price": "Неверный формат цены продажи."}, status=status.HTTP_400_BAD_REQUEST)
-            # ручная цена → обнуляем процент
             markup_percent = Decimal("0")
         else:
             mp = markup_percent or Decimal("0")
             price = purchase_price * (Decimal("1") + mp / Decimal("100"))
             price = price.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
 
+        # quantity
         try:
-            discount_percent = Decimal(str(data.get("discount_percent", 0)))
-        except Exception:
-            return Response({"discount_percent": "Неверный формат скидки."}, status=status.HTTP_400_BAD_REQUEST)
-
-        # Количество
-        try:
-            quantity = int(data.get("quantity", 0))
-            if quantity < 0:
-                raise ValueError
-        except Exception:
+            quantity = _parse_int_nonneg(data.get("quantity", 0), "quantity")
+        except ValueError:
             return Response({"quantity": "Неверное количество."}, status=status.HTTP_400_BAD_REQUEST)
 
-        # Дата (дата документа)
-        date_value = data.get("date")
-        if date_value:
-            try:
-                date_value = timezone.datetime.strptime(date_value, "%Y-%m-%d").date()
-            except ValueError:
-                return Response({"date": "Неверный формат даты. Используйте YYYY-MM-DD."}, status=400)
-        else:
-            date_value = timezone.now().date()
+        # date -> aware datetime
+        raw_date = data.get("date")
+        try:
+            date_value = _parse_date_to_aware_datetime(raw_date) if raw_date else timezone.now()
+        except ValueError:
+            return Response({"date": "Неверный формат даты. Используйте YYYY-MM-DD или ISO datetime."},
+                            status=status.HTTP_400_BAD_REQUEST)
 
-        # Ед. измерения / весовой / страна / срок годности
+        # unit/is_weight/country/expiration
         unit = (data.get("unit") or "шт.").strip()
-        is_weight_raw = data.get("is_weight")
-        if isinstance(is_weight_raw, bool):
-            is_weight = is_weight_raw
-        else:
-            is_weight = str(is_weight_raw).strip().lower() in ("1", "true", "yes", "да", "kg", "кг", "weight", "вес")
-
+        is_weight = _parse_bool_like(data.get("is_weight"))
         country = (data.get("country") or "").strip()
 
         expiration_raw = data.get("expiration_date")
@@ -688,25 +661,24 @@ class ProductCreateByBarcodeAPIView(generics.CreateAPIView, CompanyBranchRestric
         if expiration_raw not in (None, ""):
             expiration_date = parse_date(str(expiration_raw))
             if not expiration_date:
-                return Response(
-                    {"expiration_date": "Неверный формат. Используйте YYYY-MM-DD."},
-                    status=status.HTTP_400_BAD_REQUEST,
-                )
+                return Response({"expiration_date": "Неверный формат. Используйте YYYY-MM-DD."},
+                                status=status.HTTP_400_BAD_REQUEST)
 
-        # создаём или берём локальные справочники
+        # локальные справочники
         brand = ProductBrand.objects.get_or_create(company=company, name=gp.brand.name)[0] if gp.brand else None
         category = ProductCategory.objects.get_or_create(company=company, name=gp.category.name)[0] if gp.category else None
 
-        # --- packages_input из фронта ---
+        # packages_input
         packages_input = data.get("packages_input") or data.get("packages")
         if not isinstance(packages_input, list):
             packages_input = []
 
-        # Создаём локальный товар
+        # create product
         product = Product.objects.create(
             company=company,
             branch=branch,
             kind=kind_value,
+
             name=gp.name,
             barcode=gp.barcode,
             brand=brand,
@@ -731,7 +703,7 @@ class ProductCreateByBarcodeAPIView(generics.CreateAPIView, CompanyBranchRestric
             created_by=request.user,
         )
 
-        # характеристики
+        # characteristics
         chars_data = data.get("characteristics")
         if isinstance(chars_data, dict):
             ProductCharacteristics.objects.update_or_create(
@@ -747,9 +719,11 @@ class ProductCreateByBarcodeAPIView(generics.CreateAPIView, CompanyBranchRestric
                 },
             )
 
-        # упаковки
+        # packages bulk_create
         packages_to_create = []
         for pkg in packages_input:
+            if not isinstance(pkg, dict):
+                continue
             name = (pkg.get("name") or "").strip()
             if not name:
                 continue
@@ -773,10 +747,14 @@ class ProductCreateByBarcodeAPIView(generics.CreateAPIView, CompanyBranchRestric
         if packages_to_create:
             ProductPackage.objects.bulk_create(packages_to_create)
 
-        return Response(self.get_serializer(product).data, status=status.HTTP_201_CREATED)
+        ser = self.get_serializer(product, context=self.get_serializer_context())
+        return Response(ser.data, status=status.HTTP_201_CREATED)
 
 
-class ProductCreateManualAPIView(generics.CreateAPIView, CompanyBranchRestrictedMixin):
+# ==========================
+# Product create manual
+# ==========================
+class ProductCreateManualAPIView(CompanyBranchRestrictedMixin, generics.CreateAPIView):
     """
     Ручное создание товара + (опционально) добавление в глобальную базу.
     """
@@ -802,46 +780,8 @@ class ProductCreateManualAPIView(generics.CreateAPIView, CompanyBranchRestricted
             return v
         raise ValueError(f"Недопустимый статус. Допустимые: {', '.join(sorted(codes))}.")
 
-    def _parse_date_to_aware_datetime(self, raw_value):
-        """
-        Принимает строку date/datetime или date/datetime объект.
-        Возвращает timezone-aware datetime или raises ValueError.
-        """
-        from django.utils import timezone
-        from datetime import date as _date
-
-        if raw_value is None or raw_value == "":
-            return None
-
-        if isinstance(raw_value, timezone.datetime):
-            dt = raw_value
-            if timezone.is_naive(dt):
-                dt = timezone.make_aware(dt)
-            return dt
-
-        if isinstance(raw_value, _date) and not isinstance(raw_value, timezone.datetime):
-            d = raw_value
-            dt = timezone.datetime(d.year, d.month, d.day, 0, 0, 0)
-            return timezone.make_aware(dt)
-
-        s = str(raw_value)
-        dt = parse_datetime(s)
-        if dt:
-            if timezone.is_naive(dt):
-                dt = timezone.make_aware(dt)
-            return dt
-        d = parse_date(s)
-        if d:
-            dt = timezone.datetime(d.year, d.month, d.day, 0, 0, 0)
-            return timezone.make_aware(dt)
-
-        raise ValueError("Неверный формат даты/времени. Допустимые: YYYY-MM-DD или ISO datetime.")
-
     @transaction.atomic
     def create(self, request, *args, **kwargs):
-        from decimal import Decimal
-        from django.utils import timezone
-
         company = self._company()
         branch = self._auto_branch()
         data = request.data
@@ -854,35 +794,20 @@ class ProductCreateManualAPIView(generics.CreateAPIView, CompanyBranchRestricted
             return Response({"name": "Обязательное поле."}, status=status.HTTP_400_BAD_REQUEST)
 
         barcode = (data.get("barcode") or "").strip() or None
-
         if barcode and Product.objects.filter(company=company, barcode=barcode).exists():
-            return Response(
-                {"barcode": "В вашей компании уже есть товар с таким штрих-кодом."},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
+            return Response({"barcode": "В вашей компании уже есть товар с таким штрих-кодом."},
+                            status=status.HTTP_400_BAD_REQUEST)
 
         # kind
-        kind_raw = str(data.get("kind") or Product.Kind.PRODUCT).strip().lower()
-        kind_map = {
-            "product": Product.Kind.PRODUCT,
-            "товар": Product.Kind.PRODUCT,
-            "service": Product.Kind.SERVICE,
-            "услуга": Product.Kind.SERVICE,
-            "bundle": Product.Kind.BUNDLE,
-            "комплект": Product.Kind.BUNDLE,
-        }
-        kind_value = kind_map.get(kind_raw, Product.Kind.PRODUCT)
+        kind_value = _parse_kind(data.get("kind"), Product)
 
-        # Цены
+        # decimals + price calc
         try:
-            purchase_price = Decimal(str(data.get("purchase_price", 0)))
-        except Exception:
-            return Response({"purchase_price": "Неверный формат закупочной цены."}, status=status.HTTP_400_BAD_REQUEST)
-
-        try:
-            markup_percent = Decimal(str(data.get("markup_percent", 0)))
-        except Exception:
-            return Response({"markup_percent": "Неверный формат наценки."}, status=status.HTTP_400_BAD_REQUEST)
+            purchase_price = _parse_decimal(data.get("purchase_price", 0), "purchase_price")
+            markup_percent = _parse_decimal(data.get("markup_percent", 0), "markup_percent")
+            discount_percent = _parse_decimal(data.get("discount_percent", 0), "discount_percent")
+        except ValueError as e:
+            return Response({str(e): "Неверный формат числа."}, status=status.HTTP_400_BAD_REQUEST)
 
         price_raw = data.get("price", None)
         if price_raw not in (None, ""):
@@ -896,40 +821,29 @@ class ProductCreateManualAPIView(generics.CreateAPIView, CompanyBranchRestricted
             price = purchase_price * (Decimal("1") + mp / Decimal("100"))
             price = price.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
 
+        # quantity
         try:
-            discount_percent = Decimal(str(data.get("discount_percent", 0)))
-        except Exception:
-            return Response({"discount_percent": "Неверный формат скидки."}, status=status.HTTP_400_BAD_REQUEST)
-
-        # Количество
-        try:
-            quantity = int(data.get("quantity", 0))
-            if quantity < 0:
-                raise ValueError
-        except Exception:
+            quantity = _parse_int_nonneg(data.get("quantity", 0), "quantity")
+        except ValueError:
             return Response({"quantity": "Неверное количество."}, status=status.HTTP_400_BAD_REQUEST)
 
-        # Статус
+        # status
         try:
             status_value = self._normalize_status(data.get("status"))
         except ValueError as e:
             return Response({"status": str(e)}, status=status.HTTP_400_BAD_REQUEST)
 
-        # Дата документа
+        # date (aware datetime)
         raw_date = data.get("date")
         try:
-            date_value = self._parse_date_to_aware_datetime(raw_date) if raw_date else timezone.now()
-        except ValueError as e:
-            return Response({"date": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+            date_value = _parse_date_to_aware_datetime(raw_date) if raw_date else timezone.now()
+        except ValueError:
+            return Response({"date": "Неверный формат даты. Используйте YYYY-MM-DD или ISO datetime."},
+                            status=status.HTTP_400_BAD_REQUEST)
 
-        # Ед. измерения / весовой / страна / срок годности
+        # unit/is_weight/country/expiration
         unit = (data.get("unit") or "шт.").strip()
-        is_weight_raw = data.get("is_weight")
-        if isinstance(is_weight_raw, bool):
-            is_weight = is_weight_raw
-        else:
-            is_weight = str(is_weight_raw).strip().lower() in ("1", "true", "yes", "да", "kg", "кг", "weight", "вес")
-
+        is_weight = _parse_bool_like(data.get("is_weight"))
         country = (data.get("country") or "").strip()
 
         expiration_raw = data.get("expiration_date")
@@ -937,12 +851,10 @@ class ProductCreateManualAPIView(generics.CreateAPIView, CompanyBranchRestricted
         if expiration_raw not in (None, ""):
             expiration_date = parse_date(str(expiration_raw))
             if not expiration_date:
-                return Response(
-                    {"expiration_date": "Неверный формат. Используйте YYYY-MM-DD."},
-                    status=status.HTTP_400_BAD_REQUEST,
-                )
+                return Response({"expiration_date": "Неверный формат. Используйте YYYY-MM-DD."},
+                                status=status.HTTP_400_BAD_REQUEST)
 
-        # Бренд / категория
+        # brand/category (через global)
         brand_name = (data.get("brand_name") or "").strip()
         category_name = (data.get("category_name") or "").strip()
         g_brand = GlobalBrand.objects.get_or_create(name=brand_name)[0] if brand_name else None
@@ -951,7 +863,7 @@ class ProductCreateManualAPIView(generics.CreateAPIView, CompanyBranchRestricted
         brand = ProductBrand.objects.get_or_create(company=company, name=g_brand.name)[0] if g_brand else None
         category = ProductCategory.objects.get_or_create(company=company, name=g_category.name)[0] if g_category else None
 
-        # Клиент
+        # client
         client = None
         client_id = data.get("client")
         if client_id:
@@ -962,11 +874,11 @@ class ProductCreateManualAPIView(generics.CreateAPIView, CompanyBranchRestricted
         if not isinstance(packages_input, list):
             packages_input = []
 
-        # ВАЖНО: plu не передаём
         product = Product.objects.create(
             company=company,
             branch=branch,
             kind=kind_value,
+
             name=name,
             barcode=barcode,
             brand=brand,
@@ -984,6 +896,7 @@ class ProductCreateManualAPIView(generics.CreateAPIView, CompanyBranchRestricted
             discount_percent=discount_percent,
 
             quantity=quantity,
+
             client=client,
             status=status_value,
             date=date_value,
@@ -994,7 +907,7 @@ class ProductCreateManualAPIView(generics.CreateAPIView, CompanyBranchRestricted
             created_by=request.user,
         )
 
-        # характеристики
+        # characteristics
         chars_data = data.get("characteristics")
         if isinstance(chars_data, dict):
             ProductCharacteristics.objects.update_or_create(
@@ -1024,13 +937,15 @@ class ProductCreateManualAPIView(generics.CreateAPIView, CompanyBranchRestricted
             if len(item_make_ids) != ims.count():
                 return Response(
                     {"item_make": "Один или несколько item_make не найдены или принадлежат другой компании."},
-                    status=400
+                    status=status.HTTP_400_BAD_REQUEST
                 )
             product.item_make.set(ims)
 
         # packages
         packages_to_create = []
         for pkg in packages_input:
+            if not isinstance(pkg, dict):
+                continue
             name_pkg = (pkg.get("name") or "").strip()
             if not name_pkg:
                 continue
@@ -1054,15 +969,15 @@ class ProductCreateManualAPIView(generics.CreateAPIView, CompanyBranchRestricted
         if packages_to_create:
             ProductPackage.objects.bulk_create(packages_to_create)
 
-        # глобальная база
+        # add to global product base (optional)
         if barcode:
             GlobalProduct.objects.get_or_create(
                 barcode=barcode,
                 defaults={"name": name, "brand": g_brand, "category": g_category},
             )
 
-        return Response(self.get_serializer(product).data, status=status.HTTP_201_CREATED)
-
+        ser = self.get_serializer(product, context=self.get_serializer_context())
+        return Response(ser.data, status=status.HTTP_201_CREATED)
 
 class ProductRetrieveUpdateDestroyAPIView(CompanyBranchRestrictedMixin, generics.RetrieveUpdateDestroyAPIView):
     serializer_class = ProductSerializer

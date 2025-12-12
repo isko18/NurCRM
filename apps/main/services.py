@@ -2,6 +2,7 @@
 from decimal import Decimal
 from django.db import transaction
 from django.utils import timezone
+from django.utils.dateparse import parse_date, parse_datetime
 
 from apps.main.models import Cart, CartItem, Sale, SaleItem, Product
 
@@ -91,3 +92,74 @@ def checkout_cart(cart: Cart, department=None) -> Sale:
     cart.save(update_fields=["status", "updated_at"])
 
     return sale
+
+
+
+
+def _parse_kind(raw, Product):
+    kind_raw = str(raw or Product.Kind.PRODUCT).strip().lower()
+    kind_map = {
+        "product": Product.Kind.PRODUCT,
+        "товар": Product.Kind.PRODUCT,
+        "service": Product.Kind.SERVICE,
+        "услуга": Product.Kind.SERVICE,
+        "bundle": Product.Kind.BUNDLE,
+        "комплект": Product.Kind.BUNDLE,
+    }
+    return kind_map.get(kind_raw, Product.Kind.PRODUCT)
+
+
+def _parse_bool_like(raw):
+    if isinstance(raw, bool):
+        return raw
+    return str(raw or "").strip().lower() in ("1", "true", "yes", "да", "kg", "кг", "weight", "вес")
+
+
+def _parse_decimal(value, field_name):
+    try:
+        if value in (None, ""):
+            return Decimal("0")
+        return Decimal(str(value))
+    except Exception:
+        raise ValueError(field_name)
+
+
+def _parse_int_nonneg(value, field_name):
+    try:
+        if value in (None, ""):
+            return 0
+        v = int(value)
+        if v < 0:
+            raise ValueError
+        return v
+    except Exception:
+        raise ValueError(field_name)
+
+
+def _parse_date_to_aware_datetime(raw_value):
+    """
+    Принимает YYYY-MM-DD или ISO datetime.
+    Возвращает timezone-aware datetime.
+    """
+    if raw_value in (None, ""):
+        return None
+
+    if isinstance(raw_value, timezone.datetime):
+        dt = raw_value
+        if timezone.is_naive(dt):
+            dt = timezone.make_aware(dt)
+        return dt
+
+    s = str(raw_value).strip()
+    dt = parse_datetime(s)
+    if dt:
+        if timezone.is_naive(dt):
+            dt = timezone.make_aware(dt)
+        return dt
+
+    d = parse_date(s)
+    if d:
+        dt = timezone.datetime(d.year, d.month, d.day, 0, 0, 0)
+        return timezone.make_aware(dt)
+
+    raise ValueError("date")
