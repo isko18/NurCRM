@@ -185,46 +185,58 @@ def _parse_scale_barcode(barcode: str):
     }
     
 def _resolve_pos_cashbox(company, branch, cashbox_id=None):
-    qs = Cashbox.objects.filter(company=company).filter(
-        Q(is_consumption=False) | Q(is_consumption__isnull=True)
-    )
+    """
+    Правило:
+    - если cashbox_id передали -> берём её (только этой компании/филиала)
+    - иначе -> берём последнюю созданную кассу этого филиала
+    - если в филиале нет кассы -> пробуем глобальную (branch NULL)
+    """
+    qs = Cashbox.objects.filter(company=company)
 
-    if branch is not None:
-        qs = qs.filter(branch=branch)
+    if branch is None:
+        qs_branch = qs.filter(branch__isnull=True)
     else:
-        qs = qs.filter(branch__isnull=True)
+        qs_branch = qs.filter(branch=branch)
 
     if cashbox_id:
-        cb = qs.filter(id=cashbox_id).first()
+        cb = qs_branch.filter(id=cashbox_id).first()
         if not cb:
-            raise ValidationError({"cashbox_id": "Касса не найдена или не подходит по филиалу/компании."})
+            raise ValidationError({"cashbox_id": "Касса не найдена или не принадлежит этому филиалу."})
         return cb
 
-    cnt = qs.count()
-    if cnt == 0:
-        return None
-    if cnt == 1:
-        return qs.first()
+    cb = qs_branch.order_by("-created_at").first()
+    if cb:
+        return cb
 
-    raise ValidationError({"cashbox_id": "В филиале несколько касс — передай cashbox_id."})
+    # fallback на глобальную кассу компании
+    cb = qs.filter(branch__isnull=True).order_by("-created_at").first()
+    return cb
 
+def _ensure_open_shift(*, company, branch, cashier, cashbox):
+    """
+    1 OPEN смена на 1 кассу.
+    Если касса уже открыта другим кассиром — ошибка.
+    """
+    open_shift = (
+        CashShift.objects
+        .select_for_update()
+        .select_related("cashier")
+        .filter(company=company, cashbox=cashbox, status=CashShift.Status.OPEN)
+        .first()
+    )
 
-def _ensure_open_shift(*, company, branch, cashier, cashbox, opening_cash=None):
-    shift = CashShift.objects.filter(
-        company=company,
-        cashbox=cashbox,
-        cashier=cashier,
-        status=CashShift.Status.OPEN,
-    ).first()
-    if shift:
-        return shift
+    if open_shift:
+        if open_shift.cashier_id != cashier.id:
+            raise ValidationError({"detail": "Касса уже открыта другим кассиром."})
+        return open_shift
 
     return CashShift.objects.create(
         company=company,
         branch=branch,
         cashbox=cashbox,
         cashier=cashier,
-        opening_cash=money(opening_cash) if opening_cash is not None else Decimal("0.00"),
+        status=CashShift.Status.OPEN,
+        opening_cash=Decimal("0.00"),
     )
 
 class ClientReconciliationClassicAPIView(APIView):

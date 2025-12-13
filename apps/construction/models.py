@@ -31,6 +31,8 @@ class Cashbox(models.Model):
 
     name = models.CharField(max_length=255, blank=True, null=True, verbose_name="Название кассы")
     is_consumption = models.BooleanField(verbose_name="Расход", default=False, blank=True, null=True)
+    created_at = models.DateTimeField(auto_now_add=True, db_index=True)
+    updated_at = models.DateTimeField(auto_now=True)
 
     class Meta:
         verbose_name = "Касса"
