@@ -62,6 +62,94 @@ class Cashbox(models.Model):
         self.full_clean()
         return super().save(*args, **kwargs)
 
+    def get_summary(self) -> dict:
+        """
+        Короткая аналитика по кассе:
+        - приходы/расходы (только APPROVED)
+        - продажи (PAID) по этой кассе
+        - если есть открытая смена — отдаём её live expected_cash
+        """
+        from decimal import Decimal
+        from django.db import connection
+        from django.db.models import Sum, Count, Q, DecimalField, Case, When, Value
+        from django.db.models.expressions import RawSQL
+
+        z = Decimal("0.00")
+
+        # ---- flows (approved) ----
+        flows_qs = self.flows.filter(status=CashFlow.Status.APPROVED)
+        fa = flows_qs.aggregate(
+            income=Sum("amount", filter=Q(type=CashFlow.Type.INCOME)),
+            expense=Sum("amount", filter=Q(type=CashFlow.Type.EXPENSE)),
+        )
+
+        income_total = fa["income"] or z
+        expense_total = fa["expense"] or z
+
+        # ---- sales (paid) ----
+        # Берём модель из related manager, чтобы не импортить Sale напрямую
+        Sale = self.sales.model
+        sales_qs = self.sales.filter(status=Sale.Status.PAID)
+
+        # ✅ защита от ситуации, когда где-то есть annotate(total=...)
+        table = connection.ops.quote_name(Sale._meta.db_table)
+        col_total = connection.ops.quote_name("total")
+        total_col = RawSQL(f"{table}.{col_total}", [])
+
+        sa = sales_qs.aggregate(
+            cnt=Count("id"),
+            total_sum=Sum(total_col),
+            cash_sum=Sum(
+                Case(
+                    When(payment_method=Sale.PaymentMethod.CASH, then=total_col),
+                    default=Value(0),
+                    output_field=DecimalField(max_digits=12, decimal_places=2),
+                )
+            ),
+            noncash_sum=Sum(
+                Case(
+                    When(~Q(payment_method=Sale.PaymentMethod.CASH), then=total_col),
+                    default=Value(0),
+                    output_field=DecimalField(max_digits=12, decimal_places=2),
+                )
+            ),
+        )
+
+        sales_count = sa["cnt"] or 0
+        sales_total = sa["total_sum"] or z
+        cash_sales_total = sa["cash_sum"] or z
+        noncash_sales_total = sa["noncash_sum"] or z
+
+        # ---- open shift info ----
+        open_shift = (
+            self.shifts
+            .filter(status=CashShift.Status.OPEN)
+            .select_related("cashier")
+            .order_by("-opened_at")
+            .first()
+        )
+
+        open_shift_expected_cash = None
+        open_shift_id = None
+        if open_shift:
+            open_shift_id = str(open_shift.id)
+            try:
+                t = open_shift.calc_live_totals()
+                open_shift_expected_cash = t.get("expected_cash")
+            except Exception:
+                open_shift_expected_cash = None
+
+        return {
+            "income_total": income_total,
+            "expense_total": expense_total,
+            "sales_count": sales_count,
+            "sales_total": sales_total,
+            "cash_sales_total": cash_sales_total,
+            "noncash_sales_total": noncash_sales_total,
+            # "open_shift_id": open_shift_id,
+            "open_shift_expected_cash": open_shift_expected_cash,
+        }
+        
     def __str__(self):
         if self.branch_id:
             base = f"Касса филиала {self.branch.name}"
