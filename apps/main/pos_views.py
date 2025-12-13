@@ -212,33 +212,28 @@ def _resolve_pos_cashbox(company, branch, cashbox_id=None):
     cb = qs.filter(branch__isnull=True).order_by("-created_at").first()
     return cb
 
-def _ensure_open_shift(*, company, branch, cashier, cashbox):
-    """
-    1 OPEN смена на 1 кассу.
-    Если касса уже открыта другим кассиром — ошибка.
-    """
-    open_shift = (
+@transaction.atomic
+def _ensure_open_shift(*, company, branch, cashier, cashbox, opening_cash=None):
+    opening_cash = Decimal(opening_cash or "0.00")
+
+    shift = (
         CashShift.objects
         .select_for_update()
-        .select_related("cashier")
         .filter(company=company, cashbox=cashbox, status=CashShift.Status.OPEN)
+        .order_by("-opened_at")
         .first()
     )
-
-    if open_shift:
-        if open_shift.cashier_id != cashier.id:
-            raise ValidationError({"detail": "Касса уже открыта другим кассиром."})
-        return open_shift
+    if shift:
+        return shift
 
     return CashShift.objects.create(
         company=company,
         branch=branch,
         cashbox=cashbox,
         cashier=cashier,
+        opening_cash=opening_cash,
         status=CashShift.Status.OPEN,
-        opening_cash=Decimal("0.00"),
     )
-
 class ClientReconciliationClassicAPIView(APIView):
     permission_classes = [permissions.IsAuthenticated]
 
