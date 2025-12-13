@@ -6,18 +6,24 @@ from apps.construction.views import (
     CashFlowDetailView,
     CashboxOwnerDetailView,
     CashboxOwnerDetailSingleView,
+    CashShiftListView,
+    CashShiftDetailView,
+    CashShiftOpenView,
+    CashShiftCloseView,
 )
 
 urlpatterns = [
-    # CASHBOXES
-    path('cashboxes/', CashboxListCreateView.as_view(), name='cashbox-list-create'),
-    path('cashboxes/<uuid:pk>/', CashboxDetailView.as_view(), name='cashbox-detail'),
+    path("cashboxes/", CashboxListCreateView.as_view(), name="cashbox-list-create"),
+    path("cashboxes/<uuid:pk>/", CashboxDetailView.as_view(), name="cashbox-detail"),
 
-    # CASHFLOWS
-    path('cashflows/', CashFlowListCreateView.as_view(), name='cashflow-list-create'),
-    path('cashflows/<uuid:pk>/', CashFlowDetailView.as_view(), name='cashflow-detail'),
+    path("cashflows/", CashFlowListCreateView.as_view(), name="cashflow-list-create"),
+    path("cashflows/<uuid:pk>/", CashFlowDetailView.as_view(), name="cashflow-detail"),
 
-    # CASHBOX DETAIL WITH FLOWS (owner/admin)
-    path('cashboxes/detail/owner/', CashboxOwnerDetailView.as_view(), name='owner-cashboxes'),
-    path('cashboxes/<uuid:pk>/detail/owner/', CashboxOwnerDetailSingleView.as_view(), name='owner-cashbox-detail'),
+    path("cashboxes/detail/owner/", CashboxOwnerDetailView.as_view(), name="owner-cashboxes"),
+    path("cashboxes/<uuid:pk>/detail/owner/", CashboxOwnerDetailSingleView.as_view(), name="owner-cashbox-detail"),
+
+    path("shifts/", CashShiftListView.as_view(), name="cashshift-list"),
+    path("shifts/open/", CashShiftOpenView.as_view(), name="cashshift-open"),
+    path("shifts/<uuid:pk>/", CashShiftDetailView.as_view(), name="cashshift-detail"),
+    path("shifts/<uuid:pk>/close/", CashShiftCloseView.as_view(), name="cashshift-close"),
 ]

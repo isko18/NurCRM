@@ -46,6 +46,7 @@ from django.core.cache import cache
 from apps.users.models import Roles, User, Company
 import requests
 from django.conf import settings
+from apps.construction.models import Cashbox, CashShift
 
 try:
     from apps.main.models import ClientDeal, DealInstallment
@@ -182,6 +183,49 @@ def _parse_scale_barcode(barcode: str):
         "weight_raw": weight_raw,
         "weight_kg": weight_kg,
     }
+    
+def _resolve_pos_cashbox(company, branch, cashbox_id=None):
+    qs = Cashbox.objects.filter(company=company).filter(
+        Q(is_consumption=False) | Q(is_consumption__isnull=True)
+    )
+
+    if branch is not None:
+        qs = qs.filter(branch=branch)
+    else:
+        qs = qs.filter(branch__isnull=True)
+
+    if cashbox_id:
+        cb = qs.filter(id=cashbox_id).first()
+        if not cb:
+            raise ValidationError({"cashbox_id": "Касса не найдена или не подходит по филиалу/компании."})
+        return cb
+
+    cnt = qs.count()
+    if cnt == 0:
+        return None
+    if cnt == 1:
+        return qs.first()
+
+    raise ValidationError({"cashbox_id": "В филиале несколько касс — передай cashbox_id."})
+
+
+def _ensure_open_shift(*, company, branch, cashier, cashbox, opening_cash=None):
+    shift = CashShift.objects.filter(
+        company=company,
+        cashbox=cashbox,
+        cashier=cashier,
+        status=CashShift.Status.OPEN,
+    ).first()
+    if shift:
+        return shift
+
+    return CashShift.objects.create(
+        company=company,
+        branch=branch,
+        cashbox=cashbox,
+        cashier=cashier,
+        opening_cash=money(opening_cash) if opening_cash is not None else Decimal("0.00"),
+    )
 
 class ClientReconciliationClassicAPIView(APIView):
     permission_classes = [permissions.IsAuthenticated]
@@ -675,7 +719,6 @@ class SaleReceiptDataAPIView(APIView):
         payload = build_receipt_payload(sale, cashier_name=cashier_name, ensure_number=True)
         return Response(payload, status=200)
 
-
 class SaleStartAPIView(CompanyBranchRestrictedMixin, APIView):
     permission_classes = [permissions.IsAuthenticated]
 
@@ -685,22 +728,26 @@ class SaleStartAPIView(CompanyBranchRestrictedMixin, APIView):
         company = self._company() or user.company
         branch = self._auto_branch()
 
-        qs = Cart.objects.filter(company=company, user=user, status=Cart.Status.ACTIVE)
+        cashbox_id = request.data.get("cashbox_id")
+        opening_cash = request.data.get("opening_cash")
 
-        if hasattr(Cart, "branch"):
-            if branch is not None:
-                qs = qs.filter(branch=branch)
-            else:
-                qs = qs.filter(branch__isnull=True)
+        cashbox = _resolve_pos_cashbox(company, branch, cashbox_id=cashbox_id)
+        if not cashbox:
+            raise ValidationError({"detail": "Нет кассы для этого филиала. Создай Cashbox."})
 
-        qs = qs.order_by("-created_at")
+        shift = _ensure_open_shift(
+            company=company,
+            branch=branch,
+            cashier=user,
+            cashbox=cashbox,
+            opening_cash=opening_cash,
+        )
 
+        qs = Cart.objects.filter(company=company, user=user, status=Cart.Status.ACTIVE, shift=shift).order_by("-created_at")
         cart = qs.first()
+
         if cart is None:
-            create_kwargs = dict(company=company, user=user, status=Cart.Status.ACTIVE)
-            if hasattr(Cart, "branch"):
-                create_kwargs["branch"] = branch
-            cart = Cart.objects.create(**create_kwargs)
+            cart = Cart.objects.create(company=company, user=user, status=Cart.Status.ACTIVE, branch=branch, shift=shift)
         else:
             extra_ids = list(qs.values_list("id", flat=True)[1:])
             if extra_ids:
@@ -849,7 +896,6 @@ class SaleAddItemAPIView(APIView):
 
         return Response(SaleCartSerializer(cart).data, status=status.HTTP_201_CREATED)
 
-
 class SaleCheckoutAPIView(APIView):
     permission_classes = [permissions.IsAuthenticated]
 
@@ -862,12 +908,26 @@ class SaleCheckoutAPIView(APIView):
             status=Cart.Status.ACTIVE,
         )
 
-        ser = CheckoutSerializer(data=request.data)
+        ser = CheckoutSerializer(data=request.data, context={"request": request, "cart": cart})
         ser.is_valid(raise_exception=True)
+
         print_receipt = ser.validated_data["print_receipt"]
         client_id = ser.validated_data.get("client_id")
         payment_method = ser.validated_data.get("payment_method") or Sale.PaymentMethod.CASH
         cash_received = ser.validated_data.get("cash_received") or Decimal("0.00")
+        cashbox_id = ser.validated_data.get("cashbox_id")
+
+        # ✅ гарантируем смену (иначе Sale.save/full_clean может требовать cashbox)
+        if not cart.shift_id:
+            company = cart.company
+            branch = getattr(cart, "branch", None)
+            cashbox = _resolve_pos_cashbox(company, branch, cashbox_id=cashbox_id)
+            if not cashbox:
+                raise ValidationError({"detail": "Нет кассы для этого филиала. Создай Cashbox."})
+
+            shift = _ensure_open_shift(company=company, branch=branch, cashier=request.user, cashbox=cashbox)
+            cart.shift = shift
+            cart.save(update_fields=["shift"])
 
         cart.recalc()
         if payment_method == Sale.PaymentMethod.CASH and cash_received < cart.total:
@@ -883,24 +943,18 @@ class SaleCheckoutAPIView(APIView):
         except ValueError as e:
             return Response({"detail": str(e)}, status=status.HTTP_400_BAD_REQUEST)
 
-        if hasattr(sale, "branch_id") and hasattr(cart, "branch_id"):
-            if sale.branch_id != cart.branch_id:
-                sale.branch_id = cart.branch_id
-                sale.save(update_fields=["branch"])
-
-        try:
-            sale.items.filter(branch__isnull=True).update(branch=getattr(cart, "branch", None))
-        except Exception:
-            pass
+        # ✅ точно привяжем к смене (на случай если сервис не проставил)
+        if cart.shift_id and sale.shift_id != cart.shift_id:
+            sale.shift_id = cart.shift_id
+            sale.save(update_fields=["shift"])
 
         if client_id:
             client = get_object_or_404(Client, id=client_id, company=request.user.company)
             sale.client = client
             sale.save(update_fields=["client"])
 
-        sale.payment_method = payment_method
-        sale.cash_received = cash_received
-        sale.save(update_fields=["payment_method", "cash_received"])
+        # ✅ нормально “оплатить” (paid_at + status)
+        sale.mark_paid(payment_method=payment_method, cash_received=cash_received)
 
         payload = {
             "sale_id": str(sale.id),
@@ -914,12 +968,13 @@ class SaleCheckoutAPIView(APIView):
             "payment_method": sale.payment_method,
             "cash_received": fmt_money(sale.cash_received),
             "change": fmt_money(sale.change),
+            "shift_id": str(sale.shift_id) if sale.shift_id else None,
+            "cashbox_id": str(sale.cashbox_id) if sale.cashbox_id else None,
         }
 
         if print_receipt:
             lines = [
-                f"{(it.name_snapshot or '')[:40]} x{it.quantity} = "
-                f"{fmt_money((it.unit_price or 0) * (it.quantity or 0))}"
+                f"{(it.name_snapshot or '')[:40]} x{it.quantity} = {fmt_money((it.unit_price or 0) * (it.quantity or 0))}"
                 for it in sale.items.all()
             ]
             totals = [f"СУММА: {fmt_money(sale.subtotal)}"]
@@ -936,6 +991,7 @@ class SaleCheckoutAPIView(APIView):
             payload["receipt_text"] = "ЧЕК\n" + "\n".join(lines) + "\n" + "\n".join(totals)
 
         return Response(payload, status=status.HTTP_201_CREATED)
+
 
 
 class SaleMobileScannerTokenAPIView(APIView):

@@ -1,26 +1,28 @@
-from django.db.models import Q
+from django.db import transaction
 from django.shortcuts import get_object_or_404
+
 from rest_framework import generics, permissions
 from rest_framework.views import APIView
 from rest_framework.response import Response
-from rest_framework.exceptions import PermissionDenied
+from rest_framework.exceptions import PermissionDenied, ValidationError
 
-from apps.construction.models import Cashbox, CashFlow
+from apps.construction.models import Cashbox, CashFlow, CashShift
 from apps.users.models import Branch
+
 from apps.construction.serializers import (
     CashboxSerializer,
     CashFlowSerializer,
     CashboxWithFlowsSerializer,
+    CashShiftListSerializer,
+    CashShiftOpenSerializer,
+    CashShiftCloseSerializer,
 )
 
 
 # ─────────────────────────────────────────────────────────────
-# ВСПОМОГАТЕЛЬНЫЕ
+# helpers
 # ─────────────────────────────────────────────────────────────
 def _get_company(user):
-    """
-    Компания текущего пользователя (owner/company или через branch_memberships).
-    """
     if not user or not getattr(user, "is_authenticated", False):
         return None
 
@@ -28,12 +30,10 @@ def _get_company(user):
     if company:
         return company
 
-    # fallback: если нет company, но есть branch с company
     br = getattr(user, "branch", None)
     if br is not None and getattr(br, "company", None):
         return br.company
 
-    # ещё fallback: через memberships
     memberships = getattr(user, "branch_memberships", None)
     if memberships is not None:
         m = memberships.select_related("branch__company").first()
@@ -44,24 +44,18 @@ def _get_company(user):
 
 
 def _is_owner_like(user) -> bool:
-    """
-    Owner-like: могут свободно переключать филиалы через ?branch=...
-    """
     if not user or not getattr(user, "is_authenticated", False):
         return False
 
     if getattr(user, "is_superuser", False):
         return True
 
-    # если есть owned_company – явно владелец
     if getattr(user, "owned_company", None):
         return True
 
-    # если есть булевый флаг
     if getattr(user, "is_admin", False):
         return True
 
-    # если роль хранится строкой
     role = getattr(user, "role", None)
     if role in ("owner", "admin", "OWNER", "ADMIN", "Владелец", "Администратор"):
         return True
@@ -70,19 +64,11 @@ def _is_owner_like(user) -> bool:
 
 
 def _fixed_branch_from_user(user, company):
-    """
-    «Жёстко» назначенный филиал сотрудника (для не-owner-like):
-      1) через user.branch_memberships (primary → любой)
-      2) user.primary_branch() / user.primary_branch
-      3) user.branch
-      4) единственный branch из user.branch_ids (как в JSON пользователя).
-    """
     if not user or not company:
         return None
 
     company_id = getattr(company, "id", None)
 
-    # 1) memberships
     memberships = getattr(user, "branch_memberships", None)
     if memberships is not None:
         primary_m = (
@@ -103,10 +89,7 @@ def _fixed_branch_from_user(user, company):
         if any_m and any_m.branch:
             return any_m.branch
 
-    # 2) primary_branch: метод или атрибут
     primary = getattr(user, "primary_branch", None)
-
-    # 2a) как метод
     if callable(primary):
         try:
             val = primary()
@@ -115,17 +98,14 @@ def _fixed_branch_from_user(user, company):
         except Exception:
             pass
 
-    # 2b) как свойство
     if primary and not callable(primary) and getattr(primary, "company_id", None) == company_id:
         return primary
 
-    # 3) user.branch
     if hasattr(user, "branch"):
         b = getattr(user, "branch")
         if b and getattr(b, "company_id", None) == company_id:
             return b
 
-    # 4) один-единственный branch из branch_ids
     branch_ids = getattr(user, "branch_ids", None)
     if isinstance(branch_ids, (list, tuple)) and len(branch_ids) == 1:
         try:
@@ -137,18 +117,6 @@ def _fixed_branch_from_user(user, company):
 
 
 def _get_active_branch(request):
-    """
-    Активный филиал:
-
-      • для НЕ owner-like пользователя:
-            → «жёсткий» филиал (_fixed_branch_from_user)
-            → если не найден, то филиала нет (записи всех филиалов, но в рамках company)
-
-      • для owner/admin:
-            → ?branch=<uuid> (если филиал этой компании)
-            → request.branch (если уже поставили и той же компании)
-            → None (нет фильтра по branch → все филиалы компании)
-    """
     user = getattr(request, "user", None)
     company = _get_company(user)
     if not company:
@@ -157,80 +125,45 @@ def _get_active_branch(request):
 
     company_id = getattr(company, "id", None)
 
-    # 1) не-owner-like → жёсткий филиал, если есть
     if not _is_owner_like(user):
         fixed = _fixed_branch_from_user(user, company)
-        if fixed is not None:
-            setattr(request, "branch", fixed)
-            return fixed
-        # если нет фиксированного филиала — живём без branch (видит всю компанию)
-        setattr(request, "branch", None)
-        return None
+        setattr(request, "branch", fixed if fixed else None)
+        return fixed if fixed else None
 
-    # 2) owner-like → можно руками выбирать филиал через ?branch
-    branch_id = None
-    if hasattr(request, "query_params"):
-        branch_id = request.query_params.get("branch")
-    else:
-        branch_id = request.GET.get("branch")
-
+    branch_id = request.query_params.get("branch") if hasattr(request, "query_params") else request.GET.get("branch")
     if branch_id:
         try:
             br = Branch.objects.get(id=branch_id, company_id=company_id)
             setattr(request, "branch", br)
             return br
         except (Branch.DoesNotExist, ValueError):
-            # некорректный или чужой филиал — просто игнорируем
             pass
 
-    # 3) если уже есть request.branch и это филиал этой же компании
     if hasattr(request, "branch"):
         b = getattr(request, "branch")
         if b and getattr(b, "company_id", None) == company_id:
             return b
 
-    # 4) филиал не выбран → None (owner/admin видят все филиалы)
     setattr(request, "branch", None)
     return None
 
 
 # ─────────────────────────────────────────────────────────────
-# Базовый mixin для company + branch scope
+# base mixin: company + branch scope
 # ─────────────────────────────────────────────────────────────
 class CompanyBranchScopedMixin:
-    """
-    Видимость данных:
-      - всегда ограничиваемся компанией пользователя;
-      - если у модели есть поле branch:
-          • для обычного сотрудника c фиксированным филиалом → только этот филиал;
-          • для owner/admin:
-                - если ?branch=<uuid> → только этот филиал;
-                - без ?branch → все филиалы (никакого фильтра по branch).
-      - если у пользователя нет филиала (и он не owner-like) → видит все филиалы компании.
-    """
-
     permission_classes = [permissions.IsAuthenticated]
 
     def _company(self):
-        request = getattr(self, "request", None)
-        user = getattr(request, "user", None)
-        return _get_company(user)
+        return _get_company(getattr(self.request, "user", None))
 
     def _active_branch(self):
         return _get_active_branch(self.request)
 
     def _model_has_field(self, queryset, field_name: str) -> bool:
-        # учитываем только реальные поля модели
         return field_name in {f.name for f in queryset.model._meta.concrete_fields}
 
     def _scoped_queryset(self, base_qs):
-        """
-        company: строго компания пользователя,
-        branch (если у модели есть поле):
-          - если _active_branch() вернул филиал → фильтруем по нему;
-          - если None → НЕ фильтруем по branch (owner/admin видят всю компанию,
-            обычный сотрудник без филиала — тоже все филиалы своей компании).
-        """
         if getattr(self, "swagger_fake_view", False):
             return base_qs.none()
 
@@ -246,12 +179,10 @@ class CompanyBranchScopedMixin:
             br = self._active_branch()
             if br is not None:
                 qs = qs.filter(branch=br)
-            # br is None → не добавляем фильтр по branch → все филиалы компании
+            # br None → вся компания
 
         return qs
 
-    # На create/update подставляем company всегда,
-    # branch — только если активный филиал определён
     def _inject_company_branch_on_save(self, serializer):
         company = self._company()
         if not company:
@@ -273,9 +204,6 @@ class CompanyBranchScopedMixin:
         serializer.save(**kwargs)
 
     def perform_update(self, serializer):
-        """
-        company фиксируем, branch не трогаем (не переносим запись между филиалами).
-        """
         company = self._company()
         if not company:
             raise PermissionDenied("У пользователя не настроена компания.")
@@ -292,7 +220,9 @@ class CompanyBranchScopedMixin:
         serializer.save(**kwargs)
 
 
-# ===== CASHBOXES ============================================================
+# ─────────────────────────────────────────────────────────────
+# CASHBOXES
+# ─────────────────────────────────────────────────────────────
 class CashboxListCreateView(CompanyBranchScopedMixin, generics.ListCreateAPIView):
     queryset = Cashbox.objects.select_related("company", "branch")
     serializer_class = CashboxSerializer
@@ -301,9 +231,6 @@ class CashboxListCreateView(CompanyBranchScopedMixin, generics.ListCreateAPIView
         return self._scoped_queryset(super().get_queryset())
 
     def perform_create(self, serializer):
-        """
-        company/branch проставляем из контекста.
-        """
         self._inject_company_branch_on_save(serializer)
 
 
@@ -315,27 +242,44 @@ class CashboxDetailView(CompanyBranchScopedMixin, generics.RetrieveUpdateDestroy
         return self._scoped_queryset(super().get_queryset())
 
 
-# ===== CASHFLOWS ============================================================
+# ─────────────────────────────────────────────────────────────
+# CASHFLOWS
+# ─────────────────────────────────────────────────────────────
 class CashFlowListCreateView(CompanyBranchScopedMixin, generics.ListCreateAPIView):
     queryset = CashFlow.objects.select_related(
-        "company", "branch", "cashbox", "cashbox__branch"
+        "company", "branch",
+        "cashbox", "cashbox__branch",
+        "shift", "shift__cashier",
+        "cashier",
     )
     serializer_class = CashFlowSerializer
 
     def get_queryset(self):
-        return self._scoped_queryset(super().get_queryset())
+        qs = self._scoped_queryset(super().get_queryset())
+
+        shift_id = self.request.query_params.get("shift")
+        cashier_id = self.request.query_params.get("cashier")
+        cashbox_id = self.request.query_params.get("cashbox")
+
+        if cashbox_id:
+            qs = qs.filter(cashbox_id=cashbox_id)
+        if shift_id:
+            qs = qs.filter(shift_id=shift_id)
+        if cashier_id:
+            qs = qs.filter(cashier_id=cashier_id)
+
+        return qs
 
     def perform_create(self, serializer):
-        """
-        Проставляем company/branch из контекста (как и у кассы).
-        Модель/сериализатор проверят, что выбранная cashbox принадлежит той же company.
-        """
         self._inject_company_branch_on_save(serializer)
 
 
 class CashFlowDetailView(CompanyBranchScopedMixin, generics.RetrieveUpdateDestroyAPIView):
     queryset = CashFlow.objects.select_related(
-        "company", "branch", "cashbox", "cashbox__branch"
+        "company", "branch",
+        "cashbox", "cashbox__branch",
+        "shift", "shift__cashier",
+        "cashier",
     )
     serializer_class = CashFlowSerializer
 
@@ -343,7 +287,9 @@ class CashFlowDetailView(CompanyBranchScopedMixin, generics.RetrieveUpdateDestro
         return self._scoped_queryset(super().get_queryset())
 
 
-# ===== CASHBOX DETAIL WITH FLOWS (owner/admin) =============================
+# ─────────────────────────────────────────────────────────────
+# OWNER-ONLY VIEWS
+# ─────────────────────────────────────────────────────────────
 class CashboxOwnerDetailView(CompanyBranchScopedMixin, generics.ListAPIView):
     serializer_class = CashboxWithFlowsSerializer
 
@@ -354,7 +300,7 @@ class CashboxOwnerDetailView(CompanyBranchScopedMixin, generics.ListAPIView):
         else:
             company = _get_company(user)
             if not (company and (getattr(user, "owned_company", None) or getattr(user, "is_admin", False))):
-                raise PermissionDenied("Только владельцы компании или администраторы могут просматривать кассы.")
+                raise PermissionDenied("Только владельцы/админы могут просматривать кассы.")
             qs = Cashbox.objects.filter(company=company).select_related("company", "branch")
         return self._scoped_queryset(qs)
 
@@ -372,3 +318,98 @@ class CashboxOwnerDetailSingleView(CompanyBranchScopedMixin, generics.RetrieveAP
                 return Cashbox.objects.none()
             qs = Cashbox.objects.filter(company=company).select_related("company", "branch")
         return self._scoped_queryset(qs)
+
+
+# ─────────────────────────────────────────────────────────────
+# CASHSHIFTS (СМЕНЫ)
+# ─────────────────────────────────────────────────────────────
+class CashShiftListView(CompanyBranchScopedMixin, generics.ListAPIView):
+    serializer_class = CashShiftListSerializer
+
+    def get_queryset(self):
+        qs = CashShift.objects.select_related(
+            "company", "branch", "cashbox", "cashbox__branch", "cashier"
+        )
+
+        qs = self._scoped_queryset(qs)
+
+        user = self.request.user
+        if not _is_owner_like(user):
+            qs = qs.filter(cashier=user)
+
+        cashbox_id = self.request.query_params.get("cashbox")
+        status = self.request.query_params.get("status")
+        if cashbox_id:
+            qs = qs.filter(cashbox_id=cashbox_id)
+        if status in ("open", "closed"):
+            qs = qs.filter(status=status)
+
+        return qs
+
+
+class CashShiftDetailView(CompanyBranchScopedMixin, generics.RetrieveAPIView):
+    serializer_class = CashShiftListSerializer
+
+    def get_queryset(self):
+        qs = CashShift.objects.select_related(
+            "company", "branch", "cashbox", "cashbox__branch", "cashier"
+        )
+        qs = self._scoped_queryset(qs)
+
+        user = self.request.user
+        if not _is_owner_like(user):
+            qs = qs.filter(cashier=user)
+
+        return qs
+
+
+class CashShiftOpenView(CompanyBranchScopedMixin, generics.CreateAPIView):
+    """
+    ✅ Открыть смену:
+      - кассир открывает себе
+      - owner/admin может открыть на другого кассира (cashier)
+    ✅ Важно: atomic нужен для select_for_update в сериализаторе
+    """
+    serializer_class = CashShiftOpenSerializer
+
+    @transaction.atomic
+    def create(self, request, *args, **kwargs):
+        serializer = self.get_serializer(data=request.data, context={"request": request})
+        serializer.is_valid(raise_exception=True)
+        shift = serializer.save()
+        out = CashShiftListSerializer(shift, context={"request": request}).data
+        return Response(out, status=201)
+
+
+class CashShiftCloseView(APIView):
+    permission_classes = [permissions.IsAuthenticated]
+
+    @transaction.atomic
+    def post(self, request, pk):
+        # company scope как у тебя
+        # (я не трогаю твою логику company/branch, просто оставь её)
+        company = getattr(request.user, "company", None) or getattr(request.user, "owned_company", None)
+        if not company:
+            raise PermissionDenied("У пользователя не настроена компания.")
+
+        shift = get_object_or_404(
+            CashShift.objects.select_related("company", "cashier", "cashbox"),
+            id=pk,
+            company=company,
+        )
+
+        user = request.user
+        is_owner_like = getattr(user, "is_superuser", False) or getattr(user, "owned_company", None) or getattr(user, "is_admin", False) or getattr(user, "role", None) in ("owner", "admin")
+        if not is_owner_like and shift.cashier_id != user.id:
+            raise PermissionDenied("Нельзя закрыть чужую смену.")
+
+        ser = CashShiftCloseSerializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+
+        try:
+            ser.save(shift=shift)
+        except Exception as e:
+            raise ValidationError(str(e))
+
+        out = CashShiftListSerializer(shift, context={"request": request}).data
+        return Response(out, status=200)

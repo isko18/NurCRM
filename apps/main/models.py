@@ -1187,116 +1187,177 @@ class Cart(models.Model):
         ABANDONED = "abandoned", "Отменена"
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False, verbose_name="ID")
+
     company = models.ForeignKey(Company, on_delete=models.CASCADE, related_name="carts", verbose_name="Компания")
     branch = models.ForeignKey(
-        Branch, on_delete=models.CASCADE, related_name='crm_carts',
-        null=True, blank=True, db_index=True, verbose_name='Филиал'
+        Branch, on_delete=models.CASCADE, related_name="crm_carts",
+        null=True, blank=True, db_index=True, verbose_name="Филиал"
     )
-    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.SET_NULL,
-                             null=True, blank=True, related_name="carts", verbose_name="Пользователь")
+
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL,
+        null=True, blank=True, related_name="carts", verbose_name="Пользователь"
+    )
     session_key = models.CharField(max_length=64, null=True, blank=True, verbose_name="Ключ сессии")
+
+    shift = models.ForeignKey(
+        "construction.CashShift",
+        on_delete=models.PROTECT,
+        null=True, blank=True,
+        related_name="carts",
+        db_index=True,
+        verbose_name="Смена",
+    )
+
     status = models.CharField(max_length=16, choices=Status.choices, default=Status.ACTIVE, verbose_name="Статус")
 
-    subtotal = models.DecimalField(max_digits=12, decimal_places=2, default=0, verbose_name="Сумма без скидок и налогов")
-    discount_total = models.DecimalField(max_digits=12, decimal_places=2, default=0, verbose_name="Сумма скидки")
-    tax_total = models.DecimalField(max_digits=12, decimal_places=2, default=0, verbose_name="Сумма налога")
-    total = models.DecimalField(max_digits=12, decimal_places=2, default=0, verbose_name="Итого")
-    order_discount_total = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal("0.00"),
-                                               verbose_name="Скидка на заказ (сумма)")
-    created_at = models.DateTimeField(auto_now_add=True, verbose_name="Создана")
-    updated_at = models.DateTimeField(auto_now=True, verbose_name="Обновлена")
+    subtotal = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal("0.00"))
+    discount_total = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal("0.00"))
+    tax_total = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal("0.00"))
+    total = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal("0.00"))
+
+    order_discount_total = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal("0.00"))
+
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
 
     class Meta:
         indexes = [
             models.Index(fields=["company", "status"]),
             models.Index(fields=["company", "branch", "status"]),
             models.Index(fields=["session_key"]),
+            models.Index(fields=["shift", "status"]),
+            models.Index(fields=["shift", "user", "status"]),
+        ]
+        constraints = [
+            # 1) со сменой: одна активная на (shift,user)
+            models.UniqueConstraint(
+                fields=("shift", "user"),
+                condition=Q(status="active") & Q(shift__isnull=False) & Q(user__isnull=False),
+                name="uq_active_cart_per_shift_user",
+            ),
+            # 2) без смены и branch НЕ NULL
+            models.UniqueConstraint(
+                fields=("company", "branch", "user"),
+                condition=Q(status="active") & Q(shift__isnull=True) & Q(branch__isnull=False) & Q(user__isnull=False),
+                name="uq_active_cart_per_user_no_shift_branch",
+            ),
+            # 3) без смены и branch IS NULL
+            models.UniqueConstraint(
+                fields=("company", "user"),
+                condition=Q(status="active") & Q(shift__isnull=True) & Q(branch__isnull=True) & Q(user__isnull=False),
+                name="uq_active_cart_per_user_no_shift_global",
+            ),
         ]
         verbose_name = "Корзина"
         verbose_name_plural = "Корзины"
 
     def _calc_tax(self, taxable_base: Decimal) -> Decimal:
-        TAX_RATE = Decimal("0.00")
-        return taxable_base * TAX_RATE
+        return Decimal("0.00")
 
     def clean(self):
-        if self.branch_id and self.branch.company_id != self.company_id:
-            raise ValidationError({'branch': 'Филиал принадлежит другой компании.'})
-        if self.user_id:
+        super().clean()
+
+        if self.branch_id and self.company_id and self.branch.company_id != self.company_id:
+            raise ValidationError({"branch": "Филиал принадлежит другой компании."})
+
+        if self.user_id and self.company_id:
             user_company_id = getattr(self.user, "company_id", None)
             if user_company_id and user_company_id != self.company_id:
                 raise ValidationError({"user": "Пользователь другой компании."})
 
+        if self.shift_id:
+            if self.company_id and self.shift.company_id != self.company_id:
+                raise ValidationError({"shift": "Смена другой компании."})
+            if self.branch_id is not None and (self.shift.branch_id or None) != (self.branch_id or None):
+                raise ValidationError({"shift": "Смена другого филиала."})
+            if self.user_id and self.shift.cashier_id and self.user_id != self.shift.cashier_id:
+                raise ValidationError({"user": "Корзина не принадлежит кассиру этой смены."})
+
+    def save(self, *args, **kwargs):
+        # shift есть → всё берём из смены
+        if self.shift_id:
+            self.company_id = self.shift.company_id
+            self.branch_id = self.shift.branch_id
+            if not self.user_id:
+                self.user_id = self.shift.cashier_id
+        else:
+            # мягкий fallback (если вдруг создают без твоего mixin-а)
+            if not self.company_id and self.user_id:
+                u_company_id = getattr(self.user, "company_id", None)
+                if u_company_id:
+                    self.company_id = u_company_id
+            if self.branch_id is None and self.user_id:
+                u_branch_id = getattr(self.user, "branch_id", None)
+                if u_branch_id:
+                    self.branch_id = u_branch_id
+
+        self.full_clean()
+        return super().save(*args, **kwargs)
+
     def recalc(self):
         subtotal = Decimal("0")
         line_discount_total = Decimal("0")
+
         for it in self.items.select_related("product"):
             qty = Decimal(it.quantity or 0)
             base_unit = getattr(it.product, "price", None) or (it.unit_price or Decimal("0"))
             line_base = base_unit * qty
-            line_actual = (it.unit_price or 0) * qty
+            line_actual = (it.unit_price or Decimal("0")) * qty
             subtotal += line_base
             diff = line_base - line_actual
             if diff > 0:
                 line_discount_total += diff
+
         subtotal = _money(subtotal)
         line_discount_total = _money(line_discount_total)
+
         requested_extra = _money(self.order_discount_total or Decimal("0"))
         max_extra = max(Decimal("0"), subtotal - line_discount_total)
         extra_discount = min(requested_extra, max_extra)
+
         discount_total = _money(line_discount_total + extra_discount)
         taxable_base = subtotal - discount_total
         tax_total = self._calc_tax(taxable_base)
+
         self.subtotal = subtotal
         self.discount_total = discount_total
         self.tax_total = _money(tax_total)
         self.total = _money(self.subtotal - self.discount_total + self.tax_total)
+
         self.save(update_fields=["subtotal", "discount_total", "tax_total", "total", "updated_at"])
 
 
 class CartItem(models.Model):
-    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False, verbose_name="ID")
-    company = models.ForeignKey(Company, on_delete=models.CASCADE, related_name="cart_items", verbose_name="Компания")
-    branch = models.ForeignKey(
-        Branch, on_delete=models.CASCADE, related_name='crm_cart_items',
-        null=True, blank=True, db_index=True, verbose_name='Филиал'
-    )
-    cart = models.ForeignKey(Cart, on_delete=models.CASCADE, related_name="items", verbose_name="Корзина")
-    product = models.ForeignKey(Product, null=True, blank=True, on_delete=models.SET_NULL,
-                                related_name="cart_items", verbose_name="Товар")
-    custom_name = models.CharField(max_length=255, blank=True, verbose_name="Название (кастомное)")
-    quantity = models.PositiveIntegerField(default=1, verbose_name="Количество")
-    unit_price = models.DecimalField(max_digits=12, decimal_places=2, verbose_name="Цена за единицу")
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    company = models.ForeignKey(Company, on_delete=models.CASCADE, related_name="cart_items")
+    branch = models.ForeignKey(Branch, on_delete=models.CASCADE, related_name="crm_cart_items", null=True, blank=True, db_index=True)
+
+    cart = models.ForeignKey(Cart, on_delete=models.CASCADE, related_name="items")
+    product = models.ForeignKey("main.Product", null=True, blank=True, on_delete=models.SET_NULL, related_name="cart_items")
+    custom_name = models.CharField(max_length=255, blank=True)
+    quantity = models.PositiveIntegerField(default=1)
+    unit_price = models.DecimalField(max_digits=12, decimal_places=2)
 
     class Meta:
         unique_together = (("cart", "product"),)
-        verbose_name = "Товар в корзине"
-        verbose_name_plural = "Товары в корзине"
-        indexes = [
-            models.Index(fields=['company']),
-            models.Index(fields=['company', 'branch']),
-        ]
-
-    def __str__(self):
-        base = getattr(self.product, "name", None) or (self.custom_name or "Позиция")
-        return f"{base} x{self.quantity}"
 
     def clean(self):
         if self.cart_id and self.company_id and self.cart.company_id != self.company_id:
             raise ValidationError({"company": "Компания позиции должна совпадать с компанией корзины."})
         if self.cart_id and self.branch_id is not None and self.cart.branch_id not in (None, self.branch_id):
-            raise ValidationError({"branch": "Филиал позиции должен совпадать с филиалом корзины (или быть глобальным вместе с ней)."})
+            raise ValidationError({"branch": "Филиал позиции должен совпадать с филиалом корзины."})
         if self.product_id and self.company_id and self.product.company_id != self.company_id:
             raise ValidationError({"product": "Товар принадлежит другой компании."})
 
     def save(self, *args, **kwargs):
         if self.cart_id:
-            if not self.company_id:
-                self.company_id = self.cart.company_id
-            if self.branch_id is None:
-                self.branch_id = self.cart.branch_id
+            self.company_id = self.cart.company_id
+            self.branch_id = self.cart.branch_id
+
         if self.unit_price is None:
-            self.unit_price = (self.product.price if self.product else Decimal("0.00"))
+            self.unit_price = self.product.price if self.product else Decimal("0.00")
+
         self.full_clean()
         super().save(*args, **kwargs)
         self.cart.recalc()
@@ -1312,112 +1373,127 @@ class Sale(models.Model):
         CASH = "cash", "Наличные"
         TRANSFER = "transfer", "Перевод"
 
-    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False, verbose_name="ID")
-    company = models.ForeignKey(Company, on_delete=models.CASCADE, related_name="sales", verbose_name="Компания")
-    branch = models.ForeignKey(
-        Branch, on_delete=models.CASCADE, related_name='crm_sales',
-        null=True, blank=True, db_index=True, verbose_name='Филиал'
-    )
-    user = models.ForeignKey(
-        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL,
-        null=True, blank=True, related_name="sales", verbose_name="Пользователь"
-    )
-    client = models.ForeignKey(
-        "Client", on_delete=models.SET_NULL, null=True, blank=True,
-        related_name="sale", verbose_name="Клиент"
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+
+    company = models.ForeignKey(Company, on_delete=models.CASCADE, related_name="sales")
+    branch = models.ForeignKey(Branch, on_delete=models.CASCADE, related_name="crm_sales", null=True, blank=True, db_index=True)
+
+    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True, related_name="sales")
+
+    # смена ОПЦИОНАЛЬНО
+    shift = models.ForeignKey(
+        "construction.CashShift",
+        on_delete=models.PROTECT,
+        null=True, blank=True,
+        related_name="sales",
+        db_index=True,
+        verbose_name="Смена",
     )
 
-    status = models.CharField(
-        max_length=16,
-        choices=Status.choices,
-        default=Status.NEW,
-        verbose_name="Статус",
-    )
-    doc_number = models.PositiveIntegerField("Номер документа", null=True, blank=True, db_index=True)
-
-    subtotal = models.DecimalField(
-        max_digits=12, decimal_places=2, default=0,
-        verbose_name="Сумма без скидок и налогов",
-    )
-    discount_total = models.DecimalField(
-        max_digits=12, decimal_places=2, default=0,
-        verbose_name="Сумма скидки",
-    )
-    tax_total = models.DecimalField(
-        max_digits=12, decimal_places=2, default=0,
-        verbose_name="Сумма налога",
-    )
-    total = models.DecimalField(
-        max_digits=12, decimal_places=2, default=0,
-        verbose_name="Итого",
+    # касса НУЖНА если shift нет
+    cashbox = models.ForeignKey(
+        "construction.Cashbox",
+        on_delete=models.PROTECT,
+        null=True, blank=True,
+        related_name="sales",
+        db_index=True,
+        verbose_name="Касса",
     )
 
-    payment_method = models.CharField(
-        max_length=16,
-        choices=PaymentMethod.choices,
-        default=PaymentMethod.CASH,
-        verbose_name="Способ оплаты",
-    )
-    cash_received = models.DecimalField(
-        max_digits=12,
-        decimal_places=2,
-        default=Decimal("0.00"),
-        verbose_name="Принято наличными",
-    )
+    client = models.ForeignKey("main.Client", on_delete=models.SET_NULL, null=True, blank=True, related_name="sale")
 
-    created_at = models.DateTimeField(auto_now_add=True, verbose_name="Создано")
-    paid_at = models.DateTimeField(null=True, blank=True, verbose_name="Дата оплаты")
+    status = models.CharField(max_length=16, choices=Status.choices, default=Status.NEW)
+    doc_number = models.PositiveIntegerField(null=True, blank=True, db_index=True)
+
+    subtotal = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal("0.00"))
+    discount_total = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal("0.00"))
+    tax_total = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal("0.00"))
+    total = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal("0.00"))
+
+    payment_method = models.CharField(max_length=16, choices=PaymentMethod.choices, default=PaymentMethod.CASH)
+    cash_received = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal("0.00"))
+
+    created_at = models.DateTimeField(auto_now_add=True)
+    paid_at = models.DateTimeField(null=True, blank=True)
 
     class Meta:
-        verbose_name = "Продажа"
-        verbose_name_plural = "Продажи"
         indexes = [
-            models.Index(fields=['company', 'created_at']),
-            models.Index(fields=['company', 'branch', 'created_at']),
+            models.Index(fields=["company", "created_at"]),
+            models.Index(fields=["company", "branch", "created_at"]),
+            models.Index(fields=["shift", "created_at"]),
+            models.Index(fields=["cashbox", "created_at"]),
         ]
 
-    def __str__(self):
-        return f"Продажа {self.id} ({self.get_status_display()})"
-
     def clean(self):
-        if self.branch_id and self.branch.company_id != self.company_id:
-            raise ValidationError({'branch': 'Филиал принадлежит другой компании.'})
-        if self.user_id:
+        super().clean()
+
+        if self.branch_id and self.company_id and self.branch.company_id != self.company_id:
+            raise ValidationError({"branch": "Филиал принадлежит другой компании."})
+
+        if self.user_id and self.company_id:
             user_company_id = getattr(self.user, "company_id", None)
             if user_company_id and user_company_id != self.company_id:
                 raise ValidationError({"user": "Пользователь другой компании."})
-        if self.client_id and self.client.company_id != self.company_id:
+
+        if self.client_id and self.company_id and self.client.company_id != self.company_id:
             raise ValidationError({"client": "Клиент другой компании."})
         if self.branch_id and self.client_id and self.client.branch_id not in (None, self.branch_id):
             raise ValidationError({"client": "Клиент другого филиала."})
 
+        # ✅ shift есть — строгие проверки + cashbox должен совпасть со сменой (если передан)
+        if self.shift_id:
+            if self.company_id and self.shift.company_id != self.company_id:
+                raise ValidationError({"shift": "Смена другой компании."})
+            if (self.branch_id or None) != (self.shift.branch_id or None):
+                raise ValidationError({"shift": "Смена другого филиала."})
+            if self.user_id and self.shift.cashier_id and self.user_id != self.shift.cashier_id:
+                raise ValidationError({"user": "Продажа не принадлежит кассиру этой смены."})
+            if self.cashbox_id and self.cashbox_id != self.shift.cashbox_id:
+                raise ValidationError({"cashbox": "Касса продажи должна совпадать с кассой смены."})
+
+        # ✅ shift НЕТ — требуем cashbox
+        else:
+            if not self.cashbox_id:
+                raise ValidationError({"cashbox": "Укажите кассу (если смены нет)."})
+            if self.company_id and self.cashbox.company_id != self.company_id:
+                raise ValidationError({"cashbox": "Касса другой компании."})
+            if (self.branch_id or None) != (self.cashbox.branch_id or None):
+                # branch может быть None — тогда проверка ок только если и у кассы None
+                raise ValidationError({"cashbox": "Касса другого филиала."})
+
+    def save(self, *args, **kwargs):
+        # shift есть → ЖЁСТКО всё берём из смены
+        if self.shift_id:
+            self.company_id = self.shift.company_id
+            self.branch_id = self.shift.branch_id
+            self.cashbox_id = self.shift.cashbox_id  # ← важно: всегда, не только если пусто
+            if not self.user_id:
+                self.user_id = self.shift.cashier_id
+
+        # shift нет → если cashbox указан, можно подтянуть company/branch (если пустые)
+        elif self.cashbox_id:
+            if not self.company_id:
+                self.company_id = self.cashbox.company_id
+            if self.branch_id is None:
+                self.branch_id = self.cashbox.branch_id
+
+        self.full_clean()
+        return super().save(*args, **kwargs)
+
     @property
     def change(self) -> Decimal:
-        """
-        Сдача: только для наличных, не уходим в минус.
-        """
         if self.payment_method != self.PaymentMethod.CASH:
             return Decimal("0.00")
-
-        total = self.total or Decimal("0.00")
-        received = self.cash_received or Decimal("0.00")
-
-        diff = received - total
+        diff = (self.cash_received or Decimal("0")) - (self.total or Decimal("0"))
         if diff <= 0:
             return Decimal("0.00")
-
-        return diff.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        return diff.quantize(_Q2, rounding=ROUND_HALF_UP)
 
     def mark_paid(self, payment_method=None, cash_received=None):
-        """
-        Универсальный метод: помечаем продажу как оплаченную,
-        заодно фиксируем способ оплаты и сумму, принятую наличными.
-        """
         if payment_method is not None:
             self.payment_method = payment_method
 
         if cash_received is not None:
-            # если метод не наличные — на всякий случай обнулим
             if self.payment_method == self.PaymentMethod.CASH:
                 self.cash_received = cash_received
             else:
@@ -1426,61 +1502,47 @@ class Sale(models.Model):
         self.status = Sale.Status.PAID
         self.paid_at = timezone.now()
         self.save(update_fields=["status", "paid_at", "payment_method", "cash_received"])
-        
-        
+
+
 class SaleItem(models.Model):
-    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False, verbose_name="ID")
-    company = models.ForeignKey(Company, on_delete=models.CASCADE, related_name="sale_items", verbose_name="Компания")
-    branch = models.ForeignKey(
-        Branch, on_delete=models.CASCADE, related_name='crm_sale_items',
-        null=True, blank=True, db_index=True, verbose_name='Филиал'
-    )
-    sale = models.ForeignKey(Sale, on_delete=models.CASCADE, related_name="items", verbose_name="Продажа")
-    product = models.ForeignKey(Product, blank=True, null=True, on_delete=models.SET_NULL,
-                                related_name="sale_items", verbose_name="Товар")
-    name_snapshot = models.CharField(max_length=255, verbose_name="Название товара (снимок)")
-    barcode_snapshot = models.CharField(max_length=64, null=True, blank=True, verbose_name="Штрихкод (снимок)")
-    unit_price = models.DecimalField(max_digits=12, decimal_places=2, verbose_name="Цена за единицу")
-    quantity = models.PositiveIntegerField(verbose_name="Количество")
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    company = models.ForeignKey(Company, on_delete=models.CASCADE, related_name="sale_items")
+    branch = models.ForeignKey(Branch, on_delete=models.CASCADE, related_name="crm_sale_items", null=True, blank=True, db_index=True)
 
-    class Meta:
-        verbose_name = "Товар в продаже"
-        verbose_name_plural = "Товары в продаже"
-        indexes = [
-            models.Index(fields=['company']),
-            models.Index(fields=['company', 'branch']),
-        ]
+    sale = models.ForeignKey(Sale, on_delete=models.CASCADE, related_name="items")
+    product = models.ForeignKey("main.Product", blank=True, null=True, on_delete=models.SET_NULL, related_name="sale_items")
 
-    def __str__(self):
-        return f"{self.name_snapshot} x{self.quantity}"
+    name_snapshot = models.CharField(max_length=255)
+    barcode_snapshot = models.CharField(max_length=64, null=True, blank=True)
+    unit_price = models.DecimalField(max_digits=12, decimal_places=2)
+    quantity = models.PositiveIntegerField()
 
     def clean(self):
         if self.sale_id and self.company_id and self.sale.company_id != self.company_id:
             raise ValidationError({"company": "Компания позиции должна совпадать с компанией продажи."})
         if self.sale_id and self.branch_id is not None and self.sale.branch_id not in (None, self.branch_id):
-            raise ValidationError({"branch": "Филиал позиции должен совпадать с филиалом продажи (или быть глобальным вместе с ней)."})
+            raise ValidationError({"branch": "Филиал позиции должен совпадать с филиалом продажи."})
         if self.product_id and self.company_id and self.product.company_id != self.company_id:
             raise ValidationError({"product": "Товар принадлежит другой компании."})
-        if self.quantity is not None and self.quantity < 1:
+        if self.quantity < 1:
             raise ValidationError({"quantity": "Количество должно быть положительным."})
 
     def save(self, *args, **kwargs):
-        if not self.company_id and self.sale_id:
+        if self.sale_id:
             self.company_id = self.sale.company_id
-        if self.branch_id is None and self.sale_id:
             self.branch_id = self.sale.branch_id
-        creating = self.pk is None
-        if creating:
+
+        if self.pk is None:
             if not self.name_snapshot and self.product:
                 self.name_snapshot = self.product.name
             if not self.unit_price and self.product:
                 self.unit_price = self.product.price
             if not self.barcode_snapshot and self.product:
                 self.barcode_snapshot = self.product.barcode
+
         self.full_clean()
-        super().save(*args, **kwargs)
-
-
+        return super().save(*args, **kwargs)
+    
 class MobileScannerToken(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False, verbose_name="ID")
     company = models.ForeignKey(Company, on_delete=models.CASCADE, related_name="mobile_tokens", verbose_name="Компания")
