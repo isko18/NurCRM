@@ -210,7 +210,8 @@ class UserSerializer(serializers.ModelSerializer):
             "can_view_client_requests", "can_view_salary",
             "can_view_sales", "can_view_services",
             "can_view_agent", "can_view_catalog",
-            "can_view_branch", "can_view_logistics", "can_view_request",
+            "can_view_branch", "can_view_logistics", "can_view_request", "can_view_shifts",
+            "can_view_cashier",
 
             "branch_ids", "primary_branch_id",
             "created_at", "updated_at",
