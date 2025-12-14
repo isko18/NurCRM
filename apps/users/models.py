@@ -1,4 +1,4 @@
-from django.db import models
+from django.db import models, transaction
 from django.contrib.auth.models import AbstractBaseUser, PermissionsMixin
 from django.core.exceptions import ValidationError
 import uuid
@@ -202,6 +202,15 @@ class User(AbstractBaseUser, PermissionsMixin):
 
     is_active = models.BooleanField(default=True)
     is_staff = models.BooleanField(default=False)
+    deleted_at = models.DateTimeField(null=True, blank=True, verbose_name="Удалён")
+    deleted_by = models.ForeignKey(
+        "User",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="deleted_users",
+        verbose_name="Кем удалён",
+    )
 
     USERNAME_FIELD = 'email'
     REQUIRED_FIELDS = []
@@ -211,6 +220,8 @@ class User(AbstractBaseUser, PermissionsMixin):
     class Meta:
         verbose_name = 'Пользователь'
         verbose_name_plural = 'Пользователи'
+
+
 
     def __str__(self):
         return self.email
@@ -246,7 +257,27 @@ class User(AbstractBaseUser, PermissionsMixin):
         membership = self.branch_memberships.select_related("branch").filter(is_primary=True).first()
         return membership.branch if membership else None
 
+    @transaction.atomic
+    def soft_delete(self, by_user=None):
+        if self.deleted_at:
+            return  # уже удалён
 
+        old_email = self.email or ""
+        stamp = uuid.uuid4().hex  # уникально
+        # укладываемся в лимит EmailField (обычно 254)
+        new_email = f"deleted__{stamp}__{old_email}"[:254]
+
+        self.is_active = False
+        self.deleted_at = timezone.now()
+        if by_user and getattr(by_user, "pk", None):
+            self.deleted_by = by_user
+
+        # освобождаем email и запрещаем вход
+        self.email = new_email
+        self.set_unusable_password()
+
+        self.save(update_fields=["is_active", "deleted_at", "deleted_by", "email", "password"])
+        
 class Company(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     name = models.CharField(max_length=255, verbose_name='Название компании')
@@ -382,9 +413,8 @@ class Branch(models.Model):
         return f"{self.company.name} / {self.name}"
 
     def save(self, *args, **kwargs):
-        """Гарантирует уникальность code внутри компании при автогенерации."""
         if not self.code:
-            self.code = f"branch-{self.pk or uuid.uuid4().hex[:6]}"
+            self.code = uuid.uuid4().hex[:10]  # коротко и уникально
         super().save(*args, **kwargs)
 
     # -------- Вспомогательные методы --------
