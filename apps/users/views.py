@@ -1,6 +1,6 @@
 # views.py
 
-from django.db.models import Q
+from django.db.models import Q, Prefetch
 from django.http import Http404
 
 from rest_framework import generics, permissions, status
@@ -9,7 +9,7 @@ from rest_framework.response import Response
 from rest_framework.exceptions import NotFound, PermissionDenied
 from rest_framework_simplejwt.views import TokenObtainPairView
 
-from .models import User, Industry, SubscriptionPlan, Feature, Sector, CustomRole, Company, Branch
+from .models import User, Industry, SubscriptionPlan, Feature, Sector, CustomRole, Company, Branch, BranchMembership
 from .serializers import (
     UserSerializer,
     OwnerRegisterSerializer,
@@ -57,61 +57,65 @@ def _is_owner_like(user) -> bool:
 
 def _fixed_branch_from_user(user, company):
     """
-    «Жёстко» назначенный филиал сотрудника (который нельзя переключать ?branch):
-      1) user.primary_branch (property или метод)
+    «Жёстко» назначенный филиал сотрудника:
+      1) user.primary_branch (property) -> Branch
       2) user.branch (если вдруг есть)
-      3) единственный id в user.allowed_branch_ids
+      3) единственный id в user.allowed_branch_ids -> вернём uuid, БД не трогаем
     """
     if not user or not company:
         return None
 
     company_id = getattr(company, "id", None)
 
-    # 1) primary_branch как метод или свойство
+    # 1) primary_branch (в твоей модели это property, не метод)
     primary = getattr(user, "primary_branch", None)
-    if callable(primary):
-        try:
-            val = primary()
-            if val and getattr(val, "company_id", None) == company_id:
-                return val
-        except Exception:
-            pass
-    else:
-        if primary and getattr(primary, "company_id", None) == company_id:
-            return primary
+    if primary and getattr(primary, "company_id", None) == company_id:
+        return primary
 
     # 2) user.branch (если в проекте где-то есть)
     b = getattr(user, "branch", None)
     if b and getattr(b, "company_id", None) == company_id:
         return b
 
-    # 3) единственный филиал из allowed_branch_ids (это property модели User)
+    # 3) единственный филиал по membership — возвращаем uuid, а не делаем Branch.objects.get
     branch_ids = getattr(user, "allowed_branch_ids", None)
     if isinstance(branch_ids, (list, tuple)) and len(branch_ids) == 1:
-        try:
-            return Branch.objects.get(id=branch_ids[0], company_id=company_id)
-        except Branch.DoesNotExist:
-            pass
+        return branch_ids[0]
 
     return None
 
 
 def _get_active_branch(request, company):
     """
-    Активный филиал для ФИЛЬТРАЦИИ.
-
+    Активный филиал для фильтрации:
     - обычный сотрудник с фиксированным филиалом -> всегда он (игнорим ?branch)
     - owner/admin -> может выбрать ?branch, иначе None (вся компания)
+
+    Возвращаем:
+      - Branch объект (если нашли)
+      - None (если вся компания)
     """
     user = getattr(request, "user", None)
     if not company or not user or not getattr(user, "is_authenticated", False):
         return None
 
     fixed = _fixed_branch_from_user(user, company)
-    if fixed is not None and not _is_owner_like(user):
-        setattr(request, "branch", fixed)
-        return fixed
 
+    # сотрудник — фиксируем жестко
+    if fixed is not None and not _is_owner_like(user):
+        if isinstance(fixed, Branch):
+            setattr(request, "branch", fixed)
+            return fixed
+        # fixed uuid -> пробуем взять из request.branch (если уже ставили), иначе достанем один раз из БД
+        try:
+            br = Branch.objects.get(id=fixed, company=company)
+            setattr(request, "branch", br)
+            return br
+        except Branch.DoesNotExist:
+            setattr(request, "branch", None)
+            return None
+
+    # owner/admin — можно выбирать ?branch
     branch_id = None
     if hasattr(request, "query_params"):
         branch_id = request.query_params.get("branch")
@@ -126,22 +130,20 @@ def _get_active_branch(request, company):
         except (Branch.DoesNotExist, ValueError):
             pass
 
-    if hasattr(request, "branch"):
-        b = getattr(request, "branch")
-        if b and getattr(b, "company_id", None) == getattr(company, "id", None):
-            return b
+    # если где-то ранее уже установили request.branch
+    b = getattr(request, "branch", None)
+    if b and getattr(b, "company_id", None) == getattr(company, "id", None):
+        return b
 
     setattr(request, "branch", None)
     return None
 
 
-def _apply_branch_filter_to_users(request, base_qs):
+def _apply_branch_filter_to_users(request, company, base_qs):
     """
     branch=None -> весь base_qs
     branch!=None -> (membership в branch) ИЛИ (нет membership вообще)
     """
-    user = getattr(request, "user", None)
-    company = _get_company(user)
     if not company:
         return base_qs.none()
 
@@ -149,12 +151,27 @@ def _apply_branch_filter_to_users(request, base_qs):
     if not branch:
         return base_qs
 
+    # ВАЖНО: distinct нужен, потому что join на memberships
     return (
         base_qs.filter(
             Q(branch_memberships__branch=branch) |
             Q(branch_memberships__isnull=True)
         )
         .distinct()
+    )
+
+
+def _employees_qs(company):
+    """
+    Базовый QS сотрудников с оптимизацией под сериализаторы:
+    - select_related: company, custom_role
+    - prefetch_related: memberships + branch
+    """
+    memberships_qs = BranchMembership.objects.select_related("branch")
+    return (
+        company.employees
+        .select_related("company", "custom_role")
+        .prefetch_related(Prefetch("branch_memberships", queryset=memberships_qs))
     )
 
 
@@ -193,9 +210,8 @@ class EmployeeListAPIView(generics.ListAPIView):
         if not company:
             return User.objects.none()
 
-        # ✅ не показываем soft-deleted
-        base_qs = company.employees.filter(is_active=True, deleted_at__isnull=True)
-        return _apply_branch_filter_to_users(self.request, base_qs)
+        base_qs = _employees_qs(company).filter(is_active=True, deleted_at__isnull=True)
+        return _apply_branch_filter_to_users(self.request, company, base_qs)
 
 
 class CurrentUserAPIView(generics.RetrieveUpdateAPIView):
@@ -215,7 +231,7 @@ class EmployeeCreateAPIView(generics.CreateAPIView):
         serializer.save()
 
 
-# ✅ SOFT DELETE (вместо физического удаления)
+# ✅ SOFT DELETE
 class EmployeeDestroyAPIView(generics.DestroyAPIView):
     queryset = User.objects.all()
     serializer_class = UserListSerializer
@@ -225,13 +241,12 @@ class EmployeeDestroyAPIView(generics.DestroyAPIView):
         if getattr(self, "swagger_fake_view", False):
             return User.objects.none()
 
-        user = self.request.user
-        company = _get_company(user)
+        company = _get_company(self.request.user)
         if not company:
             return User.objects.none()
 
-        base_qs = company.employees.filter(is_active=True, deleted_at__isnull=True)
-        return _apply_branch_filter_to_users(self.request, base_qs)
+        base_qs = _employees_qs(company).filter(is_active=True, deleted_at__isnull=True)
+        return _apply_branch_filter_to_users(self.request, company, base_qs)
 
     def destroy(self, request, *args, **kwargs):
         employee = self.get_object()
@@ -242,7 +257,6 @@ class EmployeeDestroyAPIView(generics.DestroyAPIView):
         if getattr(employee, "role", None) == "owner" and not request.user.is_superuser:
             return Response({"detail": "Нельзя удалить владельца компании."}, status=status.HTTP_400_BAD_REQUEST)
 
-        # если уже удалён — считаем ок
         if getattr(employee, "deleted_at", None):
             return Response(status=status.HTTP_204_NO_CONTENT)
 
@@ -264,9 +278,12 @@ class EmployeeDetailAPIView(generics.RetrieveUpdateDestroyAPIView):
         if not company:
             return User.objects.none()
 
-        # ✅ не даём редактировать/видеть себя и deleted
-        base_qs = company.employees.filter(is_active=True, deleted_at__isnull=True).exclude(id=user.id)
-        return _apply_branch_filter_to_users(self.request, base_qs)
+        base_qs = (
+            _employees_qs(company)
+            .filter(is_active=True, deleted_at__isnull=True)
+            .exclude(id=user.id)
+        )
+        return _apply_branch_filter_to_users(self.request, company, base_qs)
 
     def destroy(self, request, *args, **kwargs):
         employee = self.get_object()
@@ -323,7 +340,8 @@ class CompanyDetailAPIView(generics.RetrieveAPIView):
     def get_object(self):
         if getattr(self, "swagger_fake_view", False):
             return None
-        company = _get_company(self.request.user)  # ✅ owner тоже работает
+
+        company = _get_company(self.request.user)
         if company is None:
             raise NotFound("Вы не принадлежите ни к одной компании.")
         return company
@@ -409,8 +427,12 @@ class BranchListCreateAPIView(generics.ListCreateAPIView):
     def get_queryset(self):
         if getattr(self, "swagger_fake_view", False):
             return Branch.objects.none()
+
         company = _get_company(self.request.user)
-        return Branch.objects.filter(company=company) if company else Branch.objects.none()
+        if not company:
+            return Branch.objects.none()
+
+        return Branch.objects.filter(company=company).order_by("created_at")
 
     def perform_create(self, serializer):
         serializer.save()
@@ -423,8 +445,12 @@ class BranchDetailAPIView(generics.RetrieveUpdateDestroyAPIView):
     def get_queryset(self):
         if getattr(self, "swagger_fake_view", False):
             return Branch.objects.none()
+
         company = _get_company(self.request.user)
-        return Branch.objects.filter(company=company) if company else Branch.objects.none()
+        if not company:
+            return Branch.objects.none()
+
+        return Branch.objects.filter(company=company)
 
     def get_serializer_class(self):
         if self.request.method in ("GET", "HEAD"):

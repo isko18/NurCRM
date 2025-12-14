@@ -1,44 +1,59 @@
-from rest_framework import serializers
-from rest_framework_simplejwt.serializers import TokenObtainPairSerializer
-from django.core.mail import send_mail
+from datetime import timedelta
+
+import secrets
+import string
+
 from django.conf import settings
 from django.contrib.auth.password_validation import validate_password
-
-from datetime import timedelta
+from django.core.mail import send_mail
+from django.db import transaction
 from django.utils import timezone
 
-import string
-import secrets
+from rest_framework import serializers
+from rest_framework_simplejwt.serializers import TokenObtainPairSerializer
 
+from apps.construction.models import Cashbox
 from apps.users.models import (
     User, Company, Roles, Industry, SubscriptionPlan,
     Feature, Sector, CustomRole, Branch, BranchMembership
 )
-from apps.construction.models import Cashbox
 
 
-# ===== Вспомогательные =====
+# ======================
+# Helpers
+# ======================
+
 def _ensure_owner_or_admin(user):
-    if not user or (getattr(user, "role", None) not in ("owner", "admin") and not user.is_superuser):
+    if not user or (getattr(user, "role", None) not in ("owner", "admin") and not getattr(user, "is_superuser", False)):
         raise serializers.ValidationError("Требуются права владельца или администратора.")
+
+
+def _get_user_company(user):
+    return getattr(user, "owned_company", None) or getattr(user, "company", None)
 
 
 def _validate_branch_ids_for_company(branch_ids, company):
     if not branch_ids:
         return []
-    branches = list(Branch.objects.filter(id__in=branch_ids, company=company))
-    if len(branches) != len(set(branch_ids)):
+    # уникальные id без лишних запросов
+    unique_ids = list(dict.fromkeys(branch_ids))
+    branches = list(Branch.objects.filter(id__in=unique_ids, company=company))
+    if len(branches) != len(unique_ids):
         raise serializers.ValidationError({"branch_ids": "Некоторые филиалы не найдены в вашей компании."})
-    return branches
+    # сохраняем порядок как пришло
+    by_id = {str(b.id): b for b in branches}
+    ordered = [by_id[str(bid)] for bid in unique_ids]
+    return ordered
 
 
+@transaction.atomic
 def _sync_user_branches(user: User, branches: list[Branch]):
     """
-    Пересобирает членства сотрудника в филиалах:
+    Пересобирает членства:
     - удаляет лишние
     - добавляет недостающие
-    - помечает первый филиал как основной
-    Если список пустой — очищает членства (остаётся «общим по компании»).
+    - первый филиал делает primary
+    Пустой список -> очищаем membership (пользователь остаётся «глобальный по компании»)
     """
     current_ids = set(user.branch_memberships.values_list("branch_id", flat=True))
     new_ids = set(b.id for b in branches)
@@ -48,35 +63,43 @@ def _sync_user_branches(user: User, branches: list[Branch]):
         BranchMembership.objects.filter(user=user, branch_id__in=to_delete).delete()
 
     to_add = new_ids - current_ids
-    for b in branches:
-        if b.id in to_add:
-            BranchMembership.objects.create(user=user, branch=b, is_primary=False)
+    if to_add:
+        BranchMembership.objects.bulk_create(
+            [BranchMembership(user=user, branch=b, is_primary=False) for b in branches if b.id in to_add],
+            ignore_conflicts=True,
+        )
 
+    # primary: гарантируем ровно один
     BranchMembership.objects.filter(user=user, is_primary=True).update(is_primary=False)
     if branches:
         BranchMembership.objects.filter(user=user, branch_id=branches[0].id).update(is_primary=True)
 
 
-# ✅ JWT авторизация с доп.данными
+@transaction.atomic
+def _set_primary_branch(user: User, branch_id):
+    """Ставит primary филиал пользователю, учитывая constraint '1 primary'."""
+    BranchMembership.objects.filter(user=user, is_primary=True).update(is_primary=False)
+    if branch_id:
+        BranchMembership.objects.filter(user=user, branch_id=branch_id).update(is_primary=True)
+
+
+def _generate_password(length=10):
+    alphabet = string.ascii_letters + string.digits
+    return "".join(secrets.choice(alphabet) for _ in range(length))
+
+
+# ======================
+# JWT
+# ======================
+
 class CustomTokenObtainPairSerializer(TokenObtainPairSerializer):
     def validate(self, attrs):
         data = super().validate(attrs)
 
-        # ✅ запрет входа для деактивированных (soft delete)
         if not getattr(self.user, "is_active", True):
             raise serializers.ValidationError("Аккаунт деактивирован.")
 
-        # основной филиал (property или метод — на всякий)
-        primary = getattr(self.user, "primary_branch", None)
-        br = None
-        if callable(primary):
-            try:
-                br = primary()
-            except Exception:
-                br = None
-        else:
-            br = primary
-
+        br = getattr(self.user, "primary_branch", None)
         primary_branch_id = getattr(br, "id", None) if br else None
 
         data.update({
@@ -95,38 +118,62 @@ class CustomTokenObtainPairSerializer(TokenObtainPairSerializer):
         return data
 
 
+# ======================
+# Branch
+# ======================
+
 class BranchSerializer(serializers.ModelSerializer):
     class Meta:
         model = Branch
         fields = [
             "id", "name", "code", "address", "phone", "email",
-            "timezone", "is_active", "created_at", "updated_at"
+            "timezone", "is_active", "created_at", "updated_at",
         ]
+        read_only_fields = ["id", "created_at", "updated_at"]
+
+
+class BranchCreateUpdateSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Branch
+        fields = [
+            "id", "name", "code", "address", "phone", "email",
+            "timezone", "is_active", "created_at", "updated_at",
+        ]
+        read_only_fields = ["id", "created_at", "updated_at"]
+
+    def validate(self, attrs):
+        request = self.context.get("request")
+        company = _get_user_company(getattr(request, "user", None)) if request else None
+        if not company:
+            raise serializers.ValidationError("Компания не определена.")
+
+        code = attrs.get("code")
+        if code:
+            qs = Branch.objects.filter(company=company, code=code)
+            if self.instance:
+                qs = qs.exclude(pk=self.instance.pk)
+            if qs.exists():
+                raise serializers.ValidationError({"code": "Код филиала должен быть уникален в пределах компании."})
+
+        return attrs
 
     def create(self, validated_data):
-        company = validated_data.pop("company", None)
-
-        if company is None:
-            request = self.context.get("request")
-            user = getattr(request, "user", None) if request else None
-            if user is None:
-                raise serializers.ValidationError("Пользователь не определён.")
-            company = getattr(user, "owned_company", None) or getattr(user, "company", None)
-
-        if company is None:
+        request = self.context.get("request")
+        company = _get_user_company(getattr(request, "user", None)) if request else None
+        if not company:
             raise serializers.ValidationError("Компания не определена для создания филиала.")
-
         return Branch.objects.create(company=company, **validated_data)
 
 
-# 🔑 Пользователь
+# ======================
+# User (current user)
+# ======================
+
 class UserSerializer(serializers.ModelSerializer):
     password = serializers.CharField(write_only=True, required=False, min_length=8, style={"input_type": "password"})
     role_display = serializers.CharField(read_only=True)
 
-    branch_ids = serializers.ListField(
-        child=serializers.UUIDField(), read_only=True, source="allowed_branch_ids"
-    )
+    branch_ids = serializers.ListField(child=serializers.UUIDField(), read_only=True, source="allowed_branch_ids")
     primary_branch_id = serializers.UUIDField(read_only=True, source="primary_branch.id")
 
     class Meta:
@@ -136,57 +183,46 @@ class UserSerializer(serializers.ModelSerializer):
             "first_name", "last_name", "track_number", "phone_number", "avatar",
             "company", "role", "custom_role", "role_display",
 
-            # доступы
             "can_view_dashboard", "can_view_cashbox", "can_view_departments",
             "can_view_orders", "can_view_analytics", "can_view_department_analytics",
             "can_view_products", "can_view_booking",
             "can_view_employees", "can_view_clients",
             "can_view_brand_category", "can_view_settings", "can_view_sale",
 
-            # новые
             "can_view_building_work_process", "can_view_building_objects",
             "can_view_additional_services", "can_view_debts",
 
-            # барбершоп
             "can_view_barber_clients", "can_view_barber_services",
             "can_view_barber_history", "can_view_barber_records",
 
-            # хостел
             "can_view_hostel_rooms", "can_view_hostel_booking",
             "can_view_hostel_clients", "can_view_hostel_analytics",
 
-            # кафе
             "can_view_cafe_menu", "can_view_cafe_orders",
             "can_view_cafe_purchasing", "can_view_cafe_booking",
             "can_view_cafe_clients", "can_view_cafe_tables",
             "can_view_cafe_cook", "can_view_cafe_inventory",
 
-            # школа
             "can_view_school_students", "can_view_school_groups",
             "can_view_school_lessons", "can_view_school_teachers",
             "can_view_school_leads", "can_view_school_invoices",
+
             "can_view_client_requests", "can_view_salary",
             "can_view_sales", "can_view_services",
             "can_view_agent", "can_view_catalog",
             "can_view_branch", "can_view_logistics", "can_view_request",
 
-            # филиалы (read-only)
             "branch_ids", "primary_branch_id",
-
             "created_at", "updated_at",
         ]
         read_only_fields = ["id", "created_at", "updated_at", "company"]
 
     def validate_email(self, value):
         value = (value or "").strip().lower()
-
         if self.instance and (self.instance.email or "").strip().lower() == value:
             return value
-
-        # ✅ уникальность только среди активных
         if User.objects.filter(email=value, is_active=True).exists():
             raise serializers.ValidationError("Email уже занят другим пользователем.")
-
         return value
 
     def validate_avatar(self, value):
@@ -196,66 +232,36 @@ class UserSerializer(serializers.ModelSerializer):
 
     def validate(self, data):
         request = self.context.get("request")
-        current_user = request.user if request else None
+        current_user = getattr(request, "user", None) if request else None
 
-        permission_fields = [
-            "can_view_dashboard", "can_view_cashbox", "can_view_departments",
-            "can_view_orders", "can_view_analytics", "can_view_department_analytics",
-            "can_view_products", "can_view_booking",
-            "can_view_employees", "can_view_clients",
-            "can_view_brand_category", "can_view_settings", "can_view_sale",
+        if current_user and getattr(current_user, "role", None) == "manager":
+            # менеджеру запрещаем менять любые permission-флаги
+            if any(k.startswith("can_view_") for k in data.keys()):
+                raise serializers.ValidationError("Менеджеру запрещено изменять права доступа.")
 
-            "can_view_building_work_process", "can_view_building_objects",
-            "can_view_additional_services", "can_view_debts",
-
-            "can_view_barber_clients", "can_view_barber_services",
-            "can_view_barber_history", "can_view_barber_records",
-
-            "can_view_hostel_rooms", "can_view_hostel_booking",
-            "can_view_hostel_clients", "can_view_hostel_analytics",
-
-            "can_view_cafe_menu", "can_view_cafe_orders",
-            "can_view_cafe_purchasing", "can_view_cafe_booking",
-            "can_view_cafe_clients", "can_view_cafe_tables",
-            "can_view_cafe_cook", "can_view_cafe_inventory",
-
-            "can_view_school_students", "can_view_school_groups",
-            "can_view_school_lessons", "can_view_school_teachers",
-            "can_view_school_leads", "can_view_school_invoices",
-
-            "can_view_client_requests", "can_view_salary",
-            "can_view_sales", "can_view_services",
-            "can_view_agent", "can_view_catalog",
-            "can_view_branch", "can_view_logistics", "can_view_request",
-        ]
-
-        for field in permission_fields:
-            if field in data:
-                if not isinstance(data[field], bool):
-                    raise serializers.ValidationError({field: "Значение должно быть True или False."})
-                if current_user and getattr(current_user, "role", None) == "manager":
-                    raise serializers.ValidationError({field: "Менеджеру запрещено изменять права доступа."})
+        # проверка типов только для тех флагов, которые реально прислали
+        for k, v in data.items():
+            if k.startswith("can_view_") and not isinstance(v, bool):
+                raise serializers.ValidationError({k: "Значение должно быть True или False."})
 
         return data
 
     def update(self, instance, validated_data):
         password = validated_data.pop("password", None)
-
         for attr, value in validated_data.items():
             setattr(instance, attr, value)
-
         if password:
             instance.set_password(password)
-
         instance.save()
         return instance
 
 
-# 👑 Регистрация владельца компании
-class OwnerRegisterSerializer(serializers.ModelSerializer):
-    # ✅ UniqueValidator убрали (он не знает про is_active)
-    email = serializers.EmailField(required=True)
+# ======================
+# Owner register
+# ======================
 
+class OwnerRegisterSerializer(serializers.ModelSerializer):
+    email = serializers.EmailField(required=True)
     password = serializers.CharField(write_only=True, min_length=8, style={"input_type": "password"})
     password2 = serializers.CharField(write_only=True, style={"input_type": "password"})
     company_name = serializers.CharField(write_only=True, required=True)
@@ -282,14 +288,15 @@ class OwnerRegisterSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError({"password2": "Пароли не совпадают."})
         return data
 
+    @transaction.atomic
     def create(self, validated_data):
         company_name = validated_data.pop("company_name")
-        company_sector_id = validated_data.pop("company_sector_id")
-        subscription_plan_id = validated_data.pop("subscription_plan_id")
+        sector_id = validated_data.pop("company_sector_id")
+        plan_id = validated_data.pop("subscription_plan_id")
         validated_data.pop("password2")
 
         try:
-            sector = Sector.objects.get(id=company_sector_id)
+            sector = Sector.objects.get(id=sector_id)
         except Sector.DoesNotExist:
             raise serializers.ValidationError({"company_sector_id": "Выбранный сектор не найден."})
 
@@ -298,16 +305,15 @@ class OwnerRegisterSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError({"company_sector_id": "Для выбранного сектора не найдена индустрия."})
         if industries.count() > 1:
             raise serializers.ValidationError({"company_sector_id": "Для выбранного сектора найдено несколько индустрий."})
-
         industry = industries.first()
 
         try:
-            subscription_plan = SubscriptionPlan.objects.get(id=subscription_plan_id)
+            subscription_plan = SubscriptionPlan.objects.get(id=plan_id)
         except SubscriptionPlan.DoesNotExist:
             raise serializers.ValidationError({"subscription_plan_id": "Выбранный тариф не найден."})
 
         user = User.objects.create(
-            email=validated_data["email"].strip().lower(),
+            email=(validated_data["email"] or "").strip().lower(),
             first_name=validated_data.get("first_name"),
             last_name=validated_data.get("last_name"),
             avatar=validated_data.get("avatar"),
@@ -315,37 +321,8 @@ class OwnerRegisterSerializer(serializers.ModelSerializer):
             is_active=True,
         )
 
-        permission_fields = [
-            "can_view_dashboard", "can_view_cashbox", "can_view_departments",
-            "can_view_orders", "can_view_analytics", "can_view_department_analytics",
-            "can_view_products", "can_view_booking",
-            "can_view_employees", "can_view_clients",
-            "can_view_brand_category", "can_view_settings", "can_view_sale",
-
-            "can_view_building_work_process", "can_view_building_objects",
-            "can_view_additional_services", "can_view_debts",
-
-            "can_view_barber_clients", "can_view_barber_services",
-            "can_view_barber_history", "can_view_barber_records",
-
-            "can_view_hostel_rooms", "can_view_hostel_booking",
-            "can_view_hostel_clients", "can_view_hostel_analytics",
-
-            "can_view_cafe_menu", "can_view_cafe_orders",
-            "can_view_cafe_purchasing", "can_view_cafe_booking",
-            "can_view_cafe_clients", "can_view_cafe_tables",
-            "can_view_cafe_cook", "can_view_cafe_inventory",
-
-            "can_view_school_students", "can_view_school_groups",
-            "can_view_school_lessons", "can_view_school_teachers",
-            "can_view_school_leads", "can_view_school_invoices",
-
-            "can_view_client_requests", "can_view_salary",
-            "can_view_sales", "can_view_services",
-            "can_view_agent", "can_view_catalog",
-            "can_view_branch", "can_view_logistics", "can_view_request",
-        ]
-        for f in permission_fields:
+        # владельцу — все доступы
+        for f in [x.name for x in User._meta.fields if x.name.startswith("can_view_")]:
             setattr(user, f, True)
 
         user.set_password(validated_data["password"])
@@ -368,11 +345,12 @@ class OwnerRegisterSerializer(serializers.ModelSerializer):
         return user
 
 
-# 👥 Создание сотрудника (+ распределение по филиалам)
-class EmployeeCreateSerializer(serializers.ModelSerializer):
-    # ✅ UniqueValidator убрали (он не знает про is_active)
-    email = serializers.EmailField(required=True)
+# ======================
+# Employee create
+# ======================
 
+class EmployeeCreateSerializer(serializers.ModelSerializer):
+    email = serializers.EmailField(required=True)
     role_display = serializers.CharField(read_only=True)
 
     primary_branch = serializers.UUIDField(required=False, allow_null=True, write_only=True)
@@ -390,34 +368,8 @@ class EmployeeCreateSerializer(serializers.ModelSerializer):
             "email", "first_name", "last_name", "track_number", "phone_number", "avatar",
             "role", "custom_role", "role_display",
 
-            "can_view_dashboard", "can_view_cashbox", "can_view_departments",
-            "can_view_orders", "can_view_analytics", "can_view_department_analytics",
-            "can_view_products", "can_view_booking",
-            "can_view_employees", "can_view_clients",
-            "can_view_brand_category", "can_view_settings", "can_view_sale",
-
-            "can_view_building_work_process", "can_view_building_objects",
-            "can_view_additional_services", "can_view_debts",
-
-            "can_view_barber_clients", "can_view_barber_services",
-            "can_view_barber_history", "can_view_barber_records",
-
-            "can_view_hostel_rooms", "can_view_hostel_booking",
-            "can_view_hostel_clients", "can_view_hostel_analytics",
-
-            "can_view_cafe_menu", "can_view_cafe_orders",
-            "can_view_cafe_purchasing", "can_view_cafe_booking",
-            "can_view_cafe_clients", "can_view_cafe_tables",
-            "can_view_cafe_cook", "can_view_cafe_inventory",
-
-            "can_view_school_students", "can_view_school_groups",
-            "can_view_school_lessons", "can_view_school_teachers",
-            "can_view_school_leads", "can_view_school_invoices",
-
-            "can_view_client_requests", "can_view_salary",
-            "can_view_sales", "can_view_services",
-            "can_view_agent", "can_view_catalog",
-            "can_view_branch", "can_view_logistics", "can_view_request",
+            # все can_view_* которые ты раньше использовал
+            *[f.name for f in User._meta.fields if f.name.startswith("can_view_")],
 
             "primary_branch", "branches",
         ]
@@ -435,25 +387,24 @@ class EmployeeCreateSerializer(serializers.ModelSerializer):
         if getattr(current_user, "role", None) == "manager":
             raise serializers.ValidationError("У вас нет прав для создания сотрудников.")
 
-        owner_company = getattr(current_user, "owned_company", None) or getattr(current_user, "company", None)
-        if not owner_company:
-            raise serializers.ValidationError("У текущего пользователя не определена компания.")
+        company = getattr(current_user, "owned_company", None)
+        if not company:
+            raise serializers.ValidationError("Только владелец может создавать сотрудников.")
 
         primary_branch_id = data.get("primary_branch")
-        branch_ids = set(data.get("branches") or [])
-        if primary_branch_id:
-            branch_ids.add(primary_branch_id)
+        branch_ids = list(data.get("branches") or [])
 
-        if branch_ids:
-            branches = Branch.objects.filter(id__in=branch_ids, company=owner_company)
-            if branches.count() != len(branch_ids):
-                raise serializers.ValidationError("Некоторые филиалы не найдены или принадлежат другой компании.")
-            self._validated_branches = {str(b.id): b for b in branches}
-        else:
-            self._validated_branches = {}
+        # primary обязательно должен быть в списке
+        if primary_branch_id and primary_branch_id not in branch_ids:
+            branch_ids = [primary_branch_id] + branch_ids
 
+        branches = _validate_branch_ids_for_company(branch_ids, company)
+        data["_branches_objects"] = branches  # локально, без self-полей
+
+        # если primary передали — проверим что он реально в компании (уже проверено выше)
         return data
 
+    @transaction.atomic
     def create(self, validated_data):
         request = self.context["request"]
         owner = request.user
@@ -462,43 +413,17 @@ class EmployeeCreateSerializer(serializers.ModelSerializer):
         primary_branch_id = validated_data.pop("primary_branch", None)
         validated_data.pop("branches", None)
 
-        alphabet = string.ascii_letters + string.digits
-        generated_password = "".join(secrets.choice(alphabet) for _ in range(10))
+        branches_objects = validated_data.pop("_branches_objects", [])
 
-        access_fields = [
-            "can_view_dashboard", "can_view_cashbox", "can_view_departments",
-            "can_view_orders", "can_view_analytics", "can_view_department_analytics",
-            "can_view_products", "can_view_booking",
-            "can_view_employees", "can_view_clients",
-            "can_view_brand_category", "can_view_settings", "can_view_sale",
+        generated_password = _generate_password(10)
 
-            "can_view_building_work_process", "can_view_building_objects",
-            "can_view_additional_services", "can_view_debts",
-
-            "can_view_barber_clients", "can_view_barber_services",
-            "can_view_barber_history", "can_view_barber_records",
-
-            "can_view_hostel_rooms", "can_view_hostel_booking",
-            "can_view_hostel_clients", "can_view_hostel_analytics",
-
-            "can_view_cafe_menu", "can_view_cafe_orders",
-            "can_view_cafe_purchasing", "can_view_cafe_booking",
-            "can_view_cafe_clients", "can_view_cafe_tables",
-            "can_view_cafe_cook", "can_view_cafe_inventory",
-
-            "can_view_school_students", "can_view_school_groups",
-            "can_view_school_lessons", "can_view_school_teachers",
-            "can_view_school_leads", "can_view_school_invoices",
-
-            "can_view_client_requests", "can_view_salary",
-            "can_view_sales", "can_view_services",
-            "can_view_agent", "can_view_catalog",
-            "can_view_branch", "can_view_logistics", "can_view_request",
-        ]
-        access_flags = {field: validated_data.pop(field, None) for field in access_fields}
+        # заберём все can_view_* (опциональные) и не дадим им попасть в User.objects.create если хочешь
+        access_flags = {}
+        for f in [x.name for x in User._meta.fields if x.name.startswith("can_view_")]:
+            access_flags[f] = validated_data.pop(f, None)
 
         user = User.objects.create(
-            email=(validated_data["email"] or "").strip().lower(),
+            email=(validated_data.get("email") or "").strip().lower(),
             first_name=validated_data.get("first_name"),
             last_name=validated_data.get("last_name"),
             track_number=validated_data.get("track_number"),
@@ -511,10 +436,11 @@ class EmployeeCreateSerializer(serializers.ModelSerializer):
         )
         user.set_password(generated_password)
 
+        # автоназначение прав (как у тебя)
         if all(v is None for v in access_flags.values()):
             if user.role in ["owner", "admin"]:
-                for f in access_flags:
-                    setattr(user, f, True)
+                for k in access_flags.keys():
+                    setattr(user, k, True)
             elif user.role == "manager":
                 user.can_view_cashbox = True
                 user.can_view_orders = True
@@ -522,22 +448,26 @@ class EmployeeCreateSerializer(serializers.ModelSerializer):
             else:
                 user.can_view_dashboard = True
         else:
-            for f, v in access_flags.items():
+            for k, v in access_flags.items():
                 if v is not None:
-                    setattr(user, f, v)
+                    setattr(user, k, v)
 
         user.save()
 
-        if getattr(self, "_validated_branches", None):
-            for _, branch in self._validated_branches.items():
-                BranchMembership.objects.get_or_create(
-                    user=user, branch=branch, defaults={"is_primary": False}
-                )
+        # memberships
+        if branches_objects:
+            BranchMembership.objects.bulk_create(
+                [BranchMembership(user=user, branch=b, is_primary=False) for b in branches_objects],
+                ignore_conflicts=True,
+            )
 
-            if primary_branch_id:
-                BranchMembership.objects.filter(user=user, is_primary=True).update(is_primary=False)
-                BranchMembership.objects.filter(user=user, branch_id=primary_branch_id).update(is_primary=True)
+            # primary: если не передали — сделаем первый филиал primary
+            if primary_branch_id is None:
+                primary_branch_id = branches_objects[0].id
 
+            _set_primary_branch(user, primary_branch_id)
+
+        # почта не должна ломать создание
         try:
             send_mail(
                 subject="Добро пожаловать в CRM",
@@ -548,12 +478,11 @@ class EmployeeCreateSerializer(serializers.ModelSerializer):
                     f"Пароль: {generated_password}\n\n"
                     "Рекомендуем сменить пароль после входа."
                 ),
-                from_email=settings.DEFAULT_FROM_EMAIL,
+                from_email=getattr(settings, "DEFAULT_FROM_EMAIL", None),
                 recipient_list=[user.email],
                 fail_silently=False,
             )
         except Exception:
-            # не ломаем создание сотрудника из-за почты
             pass
 
         self._generated_password = generated_password
@@ -569,7 +498,70 @@ class EmployeeCreateSerializer(serializers.ModelSerializer):
         return rep
 
 
-# 🔍 Список сотрудников
+# ======================
+# Employee update
+# ======================
+
+class EmployeeUpdateSerializer(serializers.ModelSerializer):
+    role_display = serializers.CharField(read_only=True)
+    branch_ids = serializers.ListField(
+        child=serializers.UUIDField(),
+        required=False,
+        write_only=True,
+        help_text="Полный новый список филиалов сотрудника. Если не указано — без изменений.",
+    )
+
+    class Meta:
+        model = User
+        fields = [
+            "id", "first_name", "last_name", "track_number", "phone_number", "avatar",
+            "role", "custom_role", "role_display",
+            *[f.name for f in User._meta.fields if f.name.startswith("can_view_")],
+            "branch_ids",
+        ]
+        read_only_fields = ["id"]
+
+    def validate(self, data):
+        request = self.context["request"]
+        current_user = request.user
+        target_user = self.instance
+
+        if getattr(current_user, "role", None) == "manager":
+            raise serializers.ValidationError("Менеджеру запрещено редактировать сотрудников.")
+
+        if current_user.id == target_user.id:
+            raise serializers.ValidationError("Вы не можете редактировать самого себя через этот интерфейс.")
+
+        if getattr(target_user, "role", None) == "owner" and not getattr(current_user, "is_superuser", False):
+            if "role" in data and data["role"] != "owner":
+                raise serializers.ValidationError("Вы не можете изменить роль владельца компании.")
+
+        branch_ids = data.get("branch_ids", None)
+        if branch_ids is not None:
+            company = target_user.company
+            _validate_branch_ids_for_company(branch_ids, company)
+
+        return data
+
+    @transaction.atomic
+    def update(self, instance, validated_data):
+        branch_ids = validated_data.pop("branch_ids", None)
+
+        for attr, value in validated_data.items():
+            setattr(instance, attr, value)
+        instance.save()
+
+        if branch_ids is not None:
+            branches = _validate_branch_ids_for_company(branch_ids, instance.company)
+            _sync_user_branches(instance, branches)
+
+        return instance
+
+
+# ======================
+# Lists / dictionaries
+# ======================
+
 class UserListSerializer(serializers.ModelSerializer):
     role_display = serializers.CharField(read_only=True)
     branch_ids = serializers.ListField(child=serializers.UUIDField(), read_only=True, source="allowed_branch_ids")
@@ -580,36 +572,7 @@ class UserListSerializer(serializers.ModelSerializer):
         fields = [
             "id", "email", "first_name", "last_name", "track_number", "phone_number",
             "role", "custom_role", "role_display", "avatar",
-
-            "can_view_dashboard", "can_view_cashbox", "can_view_departments",
-            "can_view_orders", "can_view_analytics", "can_view_department_analytics",
-            "can_view_products", "can_view_booking",
-            "can_view_employees", "can_view_clients",
-            "can_view_brand_category", "can_view_settings", "can_view_sale",
-
-            "can_view_building_work_process", "can_view_building_objects",
-            "can_view_additional_services", "can_view_debts",
-
-            "can_view_barber_clients", "can_view_barber_services",
-            "can_view_barber_history", "can_view_barber_records",
-
-            "can_view_hostel_rooms", "can_view_hostel_booking",
-            "can_view_hostel_clients", "can_view_hostel_analytics",
-
-            "can_view_cafe_menu", "can_view_cafe_orders",
-            "can_view_cafe_purchasing", "can_view_cafe_booking",
-            "can_view_cafe_clients", "can_view_cafe_tables",
-            "can_view_cafe_cook", "can_view_cafe_inventory",
-
-            "can_view_school_students", "can_view_school_groups",
-            "can_view_school_lessons", "can_view_school_teachers",
-            "can_view_school_leads", "can_view_school_invoices",
-
-            "can_view_client_requests", "can_view_salary",
-            "can_view_sales", "can_view_services",
-            "can_view_agent", "can_view_catalog",
-            "can_view_branch", "can_view_logistics", "can_view_request",
-
+            *[f.name for f in User._meta.fields if f.name.startswith("can_view_")],
             "branch_ids", "primary_branch_id",
         ]
 
@@ -624,41 +587,11 @@ class UserWithPermissionsSerializer(serializers.ModelSerializer):
         fields = [
             "id", "email", "first_name", "last_name", "track_number", "phone_number",
             "role", "custom_role", "role_display", "avatar",
-
-            "can_view_dashboard", "can_view_cashbox", "can_view_departments",
-            "can_view_orders", "can_view_analytics", "can_view_department_analytics",
-            "can_view_products", "can_view_booking",
-            "can_view_employees", "can_view_clients",
-            "can_view_brand_category", "can_view_settings", "can_view_sale",
-
-            "can_view_building_work_process", "can_view_building_objects",
-            "can_view_additional_services", "can_view_debts",
-
-            "can_view_barber_clients", "can_view_barber_services",
-            "can_view_barber_history", "can_view_barber_records",
-
-            "can_view_hostel_rooms", "can_view_hostel_booking",
-            "can_view_hostel_clients", "can_view_hostel_analytics",
-
-            "can_view_cafe_menu", "can_view_cafe_orders",
-            "can_view_cafe_purchasing", "can_view_cafe_booking",
-            "can_view_cafe_clients", "can_view_cafe_tables",
-            "can_view_cafe_cook", "can_view_cafe_inventory",
-
-            "can_view_school_students", "can_view_school_groups",
-            "can_view_school_lessons", "can_view_school_teachers",
-            "can_view_school_leads", "can_view_school_invoices",
-
-            "can_view_client_requests", "can_view_salary",
-            "can_view_sales", "can_view_services",
-            "can_view_agent", "can_view_catalog",
-            "can_view_branch", "can_view_logistics", "can_view_request",
-
+            *[f.name for f in User._meta.fields if f.name.startswith("can_view_")],
             "branch_ids", "primary_branch_id",
         ]
 
 
-# 📦 Отрасли и тарифы
 class SectorSerializer(serializers.ModelSerializer):
     class Meta:
         model = Sector
@@ -705,92 +638,6 @@ class CompanySerializer(serializers.ModelSerializer):
         ]
 
 
-# ✏️ Обновление сотрудника (+ перераспределение по филиалам)
-class EmployeeUpdateSerializer(serializers.ModelSerializer):
-    role_display = serializers.CharField(read_only=True)
-    branch_ids = serializers.ListField(
-        child=serializers.UUIDField(),
-        required=False,
-        write_only=True,
-        help_text="Полный новый список филиалов сотрудника. Если не указано — без изменений.",
-    )
-
-    class Meta:
-        model = User
-        fields = [
-            "id", "first_name", "last_name", "track_number", "phone_number", "avatar",
-            "role", "custom_role", "role_display",
-
-            "can_view_dashboard", "can_view_cashbox", "can_view_departments",
-            "can_view_orders", "can_view_analytics", "can_view_department_analytics",
-            "can_view_products", "can_view_booking",
-            "can_view_employees", "can_view_clients",
-            "can_view_brand_category", "can_view_settings", "can_view_sale",
-
-            "can_view_building_work_process", "can_view_building_objects",
-            "can_view_additional_services", "can_view_debts",
-
-            "can_view_barber_clients", "can_view_barber_services",
-            "can_view_barber_history", "can_view_barber_records",
-
-            "can_view_hostel_rooms", "can_view_hostel_booking",
-            "can_view_hostel_clients", "can_view_hostel_analytics",
-
-            "can_view_cafe_menu", "can_view_cafe_orders",
-            "can_view_cafe_purchasing", "can_view_cafe_booking",
-            "can_view_cafe_clients", "can_view_cafe_tables",
-            "can_view_cafe_cook", "can_view_cafe_inventory",
-
-            "can_view_school_students", "can_view_school_groups",
-            "can_view_school_lessons", "can_view_school_teachers",
-            "can_view_school_leads", "can_view_school_invoices",
-
-            "can_view_client_requests", "can_view_salary",
-            "can_view_sales", "can_view_services",
-            "can_view_agent", "can_view_catalog",
-            "can_view_branch", "can_view_logistics", "can_view_request",
-
-            "branch_ids",
-        ]
-        read_only_fields = ["id"]
-
-    def validate(self, data):
-        request = self.context["request"]
-        current_user = request.user
-        target_user = self.instance
-
-        if getattr(current_user, "role", None) == "manager":
-            raise serializers.ValidationError("Менеджеру запрещено редактировать сотрудников.")
-
-        if current_user.id == target_user.id:
-            raise serializers.ValidationError("Вы не можете редактировать самого себя через этот интерфейс.")
-
-        if getattr(target_user, "role", None) == "owner" and not current_user.is_superuser:
-            if "role" in data and data["role"] != "owner":
-                raise serializers.ValidationError("Вы не можете изменить роль владельца компании.")
-
-        branch_ids = data.get("branch_ids", None)
-        if branch_ids is not None:
-            company = getattr(current_user, "owned_company", None) or current_user.company
-            _validate_branch_ids_for_company(branch_ids, company)
-
-        return data
-
-    def update(self, instance, validated_data):
-        branch_ids = validated_data.pop("branch_ids", None)
-
-        for attr, value in validated_data.items():
-            setattr(instance, attr, value)
-        instance.save()
-
-        if branch_ids is not None:
-            branches = _validate_branch_ids_for_company(branch_ids, instance.company)
-            _sync_user_branches(instance, branches)
-
-        return instance
-
-
-# 🔑 Смена пароля
 class ChangePasswordSerializer(serializers.Serializer):
     current_password = serializers.CharField(required=True, write_only=True)
     new_password = serializers.CharField(required=True, write_only=True)
@@ -815,7 +662,6 @@ class ChangePasswordSerializer(serializers.Serializer):
         return user
 
 
-# 🏢 Обновление компании
 _OPTIONAL_TEXT = ("llc", "inn", "okpo", "score", "bik", "address")
 
 
@@ -834,36 +680,11 @@ class CompanyUpdateSerializer(serializers.ModelSerializer):
         return attrs
 
 
-# 🎭 Кастомные роли
 class CustomRoleSerializer(serializers.ModelSerializer):
     class Meta:
         model = CustomRole
         fields = ["id", "name", "company"]
         read_only_fields = ["id", "company"]
-
-
-class BranchCreateUpdateSerializer(serializers.ModelSerializer):
-    class Meta:
-        model = Branch
-        fields = ["id", "name", "code", "address", "phone", "email", "timezone", "is_active", "created_at", "updated_at"]
-        read_only_fields = ["id", "created_at", "updated_at"]
-
-    def create(self, validated_data):
-        request = self.context.get("request")
-        company = getattr(request.user, "owned_company", None) or request.user.company
-        return Branch.objects.create(company=company, **validated_data)
-
-    def validate(self, attrs):
-        request = self.context.get("request")
-        company = getattr(request.user, "owned_company", None) or request.user.company
-        code = attrs.get("code")
-        if code:
-            qs = Branch.objects.filter(company=company, code=code)
-            if self.instance:
-                qs = qs.exclude(pk=self.instance.pk)
-            if qs.exists():
-                raise serializers.ValidationError({"code": "Код филиала должен быть уникален в пределах компании."})
-        return super().validate(attrs)
 
 
 class CompanySubscriptionSerializer(serializers.ModelSerializer):
