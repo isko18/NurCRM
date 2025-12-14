@@ -384,12 +384,20 @@ class CashboxSerializer(CompanyBranchReadOnlyMixin):
         read_only_fields = ["id", "company", "branch", "analytics", "is_consumption"]
 
     def get_analytics(self, obj):
-        # ✅ fast-path for list endpoint (batch analytics from view)
-        analytics_map = self.context.get("analytics_map")
-        if analytics_map is not None:
-            return analytics_map.get(str(obj.id)) or {}
+        # ✅ если view передала пачкой — берём отсюда (быстро)
+        amap = self.context.get("analytics_map")
+        if amap:
+            return amap.get(str(obj.id)) or {
+                "income_total": "0.00",
+                "expense_total": "0.00",
+                "sales_count": 0,
+                "sales_total": "0.00",
+                "cash_sales_total": "0.00",
+                "noncash_sales_total": "0.00",
+                "open_shift_expected_cash": None,
+            }
 
-        # fallback for detail / old usage
+        # ✅ иначе (detail / старые вызовы) — считаем как раньше
         return obj.get_summary()
 
 
