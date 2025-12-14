@@ -1,6 +1,7 @@
 from decimal import Decimal
-from rest_framework import serializers
+
 from django.db.models import Q
+from rest_framework import serializers
 from django.contrib.auth import get_user_model
 
 from apps.construction.models import Cashbox, CashFlow, CashShift
@@ -9,6 +10,9 @@ from apps.users.models import Branch
 User = get_user_model()
 
 
+# ─────────────────────────────────────────────────────────────
+# helpers
+# ─────────────────────────────────────────────────────────────
 def _get_company_from_user(user):
     if not user or not getattr(user, "is_authenticated", False):
         return None
@@ -33,15 +37,20 @@ def _get_company_from_user(user):
 def _is_owner_like(user) -> bool:
     if not user or not getattr(user, "is_authenticated", False):
         return False
+
     if getattr(user, "is_superuser", False):
         return True
-    role = getattr(user, "role", None)
-    if role in ("owner", "admin"):
-        return True
+
     if getattr(user, "owned_company", None):
         return True
+
     if getattr(user, "is_admin", False):
         return True
+
+    role = getattr(user, "role", None)
+    if role in ("owner", "admin", "OWNER", "ADMIN", "Владелец", "Администратор"):
+        return True
+
     return False
 
 
@@ -60,7 +69,12 @@ def _fixed_branch_from_user(user, company):
         )
         if m and m.branch:
             return m.branch
-        m = memberships.filter(branch__company_id=company_id).select_related("branch").first()
+
+        m = (
+            memberships.filter(branch__company_id=company_id)
+            .select_related("branch")
+            .first()
+        )
         if m and m.branch:
             return m.branch
 
@@ -72,6 +86,7 @@ def _fixed_branch_from_user(user, company):
                 return val
         except Exception:
             pass
+
     if primary and not callable(primary) and getattr(primary, "company_id", None) == company_id:
         return primary
 
@@ -119,6 +134,9 @@ def _resolve_branch_for_request(request):
     return None
 
 
+# ─────────────────────────────────────────────────────────────
+# base serializer mixin
+# ─────────────────────────────────────────────────────────────
 class CompanyBranchReadOnlyMixin(serializers.ModelSerializer):
     company = serializers.ReadOnlyField(source="company.id")
     branch = serializers.ReadOnlyField(source="branch.id")
@@ -135,8 +153,10 @@ class CompanyBranchReadOnlyMixin(serializers.ModelSerializer):
 
     def create(self, validated_data):
         request = self.context.get("request")
-        if request and request.user:
-            company = _get_company_from_user(request.user)
+        user = getattr(request, "user", None) if request else None
+
+        if user:
+            company = _get_company_from_user(user)
             if company is not None:
                 validated_data["company"] = company
 
@@ -148,8 +168,10 @@ class CompanyBranchReadOnlyMixin(serializers.ModelSerializer):
 
     def update(self, instance, validated_data):
         request = self.context.get("request")
-        if request and request.user:
-            company = _get_company_from_user(request.user)
+        user = getattr(request, "user", None) if request else None
+
+        if user:
+            company = _get_company_from_user(user)
             if company is not None:
                 validated_data["company"] = company
 
@@ -160,6 +182,9 @@ class CompanyBranchReadOnlyMixin(serializers.ModelSerializer):
         return super().update(instance, validated_data)
 
 
+# ─────────────────────────────────────────────────────────────
+# CashShift
+# ─────────────────────────────────────────────────────────────
 class CashShiftListSerializer(serializers.ModelSerializer):
     cashbox_name = serializers.SerializerMethodField()
     cashier_display = serializers.SerializerMethodField()
@@ -211,6 +236,7 @@ class CashShiftListSerializer(serializers.ModelSerializer):
     def to_representation(self, obj):
         data = super().to_representation(obj)
 
+        # ✅ OPEN: live-цифры без записи в БД
         if obj.status == CashShift.Status.OPEN:
             t = obj.calc_live_totals()
 
@@ -233,7 +259,7 @@ class CashShiftOpenSerializer(serializers.ModelSerializer):
     """
 
     cashier = serializers.PrimaryKeyRelatedField(required=False, allow_null=True, queryset=User.objects.none())
-    cashbox = serializers.PrimaryKeyRelatedField(queryset=Cashbox.objects.all())
+    cashbox = serializers.PrimaryKeyRelatedField(queryset=Cashbox.objects.none())
 
     class Meta:
         model = CashShift
@@ -247,11 +273,13 @@ class CashShiftOpenSerializer(serializers.ModelSerializer):
         user = getattr(request, "user", None) if request else None
         company = _get_company_from_user(user)
 
+        # cashiers
         if company:
             self.fields["cashier"].queryset = User.objects.filter(company=company)
         else:
             self.fields["cashier"].queryset = User.objects.none()
 
+        # cashboxes: строго по выбранному branch
         if company:
             target_branch = _resolve_branch_for_request(request) if request else None
             qs = Cashbox.objects.filter(company=company)
@@ -277,15 +305,19 @@ class CashShiftOpenSerializer(serializers.ModelSerializer):
         if cashbox.company_id != company.id:
             raise serializers.ValidationError({"cashbox": "Касса другой компании."})
 
+        # cashier
         chosen_cashier = attrs.get("cashier") or None
         if chosen_cashier is None:
+            if not user:
+                raise serializers.ValidationError({"cashier": "Нужен кассир."})
             attrs["cashier"] = user
         else:
-            if not _is_owner_like(user) and chosen_cashier.id != user.id:
+            if not _is_owner_like(user) and chosen_cashier.id != getattr(user, "id", None):
                 raise serializers.ValidationError({"cashier": "Нельзя открыть смену на другого кассира."})
 
         cashier = attrs["cashier"]
 
+        # ✅ select_for_update работает только внутри transaction.atomic (в view)
         existing = (
             CashShift.objects
             .select_for_update()
@@ -334,6 +366,9 @@ class CashShiftCloseSerializer(serializers.Serializer):
         return shift
 
 
+# ─────────────────────────────────────────────────────────────
+# Cashbox
+# ─────────────────────────────────────────────────────────────
 class CashFlowInsideCashboxSerializer(serializers.ModelSerializer):
     cashier_display = serializers.SerializerMethodField()
 
@@ -384,23 +419,42 @@ class CashboxSerializer(CompanyBranchReadOnlyMixin):
         read_only_fields = ["id", "company", "branch", "analytics", "is_consumption"]
 
     def get_analytics(self, obj):
-        # ✅ если view передала пачкой — берём отсюда (быстро)
+        # ✅ если view дала пачкой — берём быстро
         amap = self.context.get("analytics_map")
-        if amap:
-            return amap.get(str(obj.id)) or {
-                "income_total": "0.00",
-                "expense_total": "0.00",
-                "sales_count": 0,
-                "sales_total": "0.00",
-                "cash_sales_total": "0.00",
-                "noncash_sales_total": "0.00",
-                "open_shift_expected_cash": None,
+        if amap is not None:
+            a = amap.get(str(obj.id))
+            if a is None:
+                return {
+                    "income_total": "0.00",
+                    "expense_total": "0.00",
+                    "sales_count": 0,
+                    "sales_total": "0.00",
+                    "cash_sales_total": "0.00",
+                    "noncash_sales_total": "0.00",
+                    "open_shift_expected_cash": None,
+                }
+
+            # приводим Decimal → str чтобы фронт не ловил Decimal JSON
+            def _d(v):
+                return str(v) if isinstance(v, Decimal) else v
+
+            return {
+                "income_total": _d(a.get("income_total")),
+                "expense_total": _d(a.get("expense_total")),
+                "sales_count": int(a.get("sales_count") or 0),
+                "sales_total": _d(a.get("sales_total")),
+                "cash_sales_total": _d(a.get("cash_sales_total")),
+                "noncash_sales_total": _d(a.get("noncash_sales_total")),
+                "open_shift_expected_cash": _d(a.get("open_shift_expected_cash")),
             }
 
-        # ✅ иначе (detail / старые вызовы) — считаем как раньше
+        # ✅ fallback как раньше
         return obj.get_summary()
 
 
+# ─────────────────────────────────────────────────────────────
+# CashFlow
+# ─────────────────────────────────────────────────────────────
 class CashFlowSerializer(CompanyBranchReadOnlyMixin):
     cashbox = serializers.PrimaryKeyRelatedField(queryset=Cashbox.objects.all())
     cashbox_name = serializers.SerializerMethodField()
@@ -467,7 +521,7 @@ class CashFlowSerializer(CompanyBranchReadOnlyMixin):
     def get_cashbox_name(self, obj):
         if obj.cashbox and obj.cashbox.branch:
             return f"Касса филиала {obj.cashbox.branch.name}"
-        return obj.cashbox.name or f"Касса компании {obj.company.name}"
+        return getattr(obj.cashbox, "name", None) or f"Касса компании {obj.company.name}"
 
     def get_cashier_display(self, obj):
         u = getattr(obj, "cashier", None)
@@ -512,6 +566,7 @@ class CashFlowSerializer(CompanyBranchReadOnlyMixin):
         cashbox = validated_data.get("cashbox")
         shift = validated_data.get("shift", None)
 
+        # ✅ shift не передали — цепляем единственную открытую смену кассы
         if not shift and cashbox:
             open_shift = (
                 CashShift.objects
