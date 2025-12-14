@@ -234,6 +234,7 @@ def _ensure_open_shift(*, company, branch, cashier, cashbox, opening_cash=None):
         opening_cash=opening_cash,
         status=CashShift.Status.OPEN,
     )
+    
 class ClientReconciliationClassicAPIView(APIView):
     permission_classes = [permissions.IsAuthenticated]
 
@@ -792,19 +793,21 @@ class SaleScanAPIView(APIView):
             company=request.user.company,
             status=Cart.Status.ACTIVE,
         )
+
         ser = ScanRequestSerializer(data=request.data)
         ser.is_valid(raise_exception=True)
+
         barcode = ser.validated_data["barcode"].strip()
         qty = ser.validated_data["quantity"]
 
         product = None
         scale_data = None
 
-        # 1) пробуем найти обычный товар по barcode
+        # 1) обычный штрихкод
         try:
             product = Product.objects.get(company=cart.company, barcode=barcode)
         except Product.DoesNotExist:
-            # 2) пробуем распарсить весовой штрихкод
+            # 2) весовой штрихкод
             scale_data = _parse_scale_barcode(barcode)
             if not scale_data:
                 return Response(
@@ -824,12 +827,10 @@ class SaleScanAPIView(APIView):
                     status=404,
                 )
 
-        # считаем количество
-        if product.scale_type == Product.ScaleType.WEIGHT and scale_data:
-            # весовой товар -> количество в килограммах из штрихкода
+        # ✅ КОЛИЧЕСТВО
+        if scale_data:
             effective_qty = Decimal(str(scale_data["weight_kg"]))
         else:
-            # штучный товар -> берём из запроса (обычно 1)
             effective_qty = Decimal(str(qty))
 
         item, created = CartItem.objects.get_or_create(
@@ -839,16 +840,17 @@ class SaleScanAPIView(APIView):
                 "company": cart.company,
                 "branch": getattr(cart, "branch", None),
                 "quantity": effective_qty,
-                "unit_price": product.price,  # для веса: цена за кг, для штучного: за штуку
+                "unit_price": product.price,  # цена за кг или за штуку
             },
         )
+
         if not created:
             item.quantity = item.quantity + effective_qty
             item.save(update_fields=["quantity"])
 
         cart.recalc()
-
         return Response(SaleCartSerializer(cart).data, status=status.HTTP_201_CREATED)
+
 
 
 class SaleAddItemAPIView(APIView):
