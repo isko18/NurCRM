@@ -1,6 +1,7 @@
 from django.urls import path
 from .views import *
 from .pos_views import *
+from .analytics_market import *
 
 
 urlpatterns = [
@@ -194,6 +195,10 @@ name="client-reconciliation",),
 
     path("agents/me/analytics/", AgentMyAnalyticsAPIView.as_view(), name="agent-my-analytics"),
     path("owners/agents/<uuid:agent_id>/analytics/", OwnerAgentAnalyticsAPIView.as_view(), name="owner-agent-analytics",),
+    
+    
+    path("analytics/market/", AnalyticsView.as_view(), name="analytics"),
+
 ]
 
 
