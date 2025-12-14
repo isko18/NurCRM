@@ -164,7 +164,6 @@ class CashShiftListSerializer(serializers.ModelSerializer):
     cashbox_name = serializers.SerializerMethodField()
     cashier_display = serializers.SerializerMethodField()
 
-    # эти поля подменим "на лету" для OPEN смены
     expected_cash = serializers.DecimalField(max_digits=12, decimal_places=2, read_only=True)
     cash_diff = serializers.DecimalField(max_digits=12, decimal_places=2, read_only=True)
 
@@ -212,7 +211,6 @@ class CashShiftListSerializer(serializers.ModelSerializer):
     def to_representation(self, obj):
         data = super().to_representation(obj)
 
-        # ✅ OPEN: считаем live-цифры, но НЕ пишем их в БД
         if obj.status == CashShift.Status.OPEN:
             t = obj.calc_live_totals()
 
@@ -224,7 +222,7 @@ class CashShiftListSerializer(serializers.ModelSerializer):
             data["noncash_sales_total"] = str(t["noncash_sales_total"])
 
             data["expected_cash"] = str(t["expected_cash"])
-            data["cash_diff"] = "0.00"  # пока нет closing_cash — разницы нет
+            data["cash_diff"] = "0.00"
 
         return data
 
@@ -258,7 +256,6 @@ class CashShiftOpenSerializer(serializers.ModelSerializer):
             target_branch = _resolve_branch_for_request(request) if request else None
             qs = Cashbox.objects.filter(company=company)
 
-            # строго: если branch выбран → касса должна быть этого branch, иначе касса company-level (branch null)
             if target_branch is not None:
                 qs = qs.filter(branch=target_branch)
             else:
@@ -289,7 +286,6 @@ class CashShiftOpenSerializer(serializers.ModelSerializer):
 
         cashier = attrs["cashier"]
 
-        # ✅ важное: select_for_update работает только внутри transaction.atomic (см. view)
         existing = (
             CashShift.objects
             .select_for_update()
@@ -388,6 +384,12 @@ class CashboxSerializer(CompanyBranchReadOnlyMixin):
         read_only_fields = ["id", "company", "branch", "analytics", "is_consumption"]
 
     def get_analytics(self, obj):
+        # ✅ fast-path for list endpoint (batch analytics from view)
+        analytics_map = self.context.get("analytics_map")
+        if analytics_map is not None:
+            return analytics_map.get(str(obj.id)) or {}
+
+        # fallback for detail / old usage
         return obj.get_summary()
 
 
@@ -502,7 +504,6 @@ class CashFlowSerializer(CompanyBranchReadOnlyMixin):
         cashbox = validated_data.get("cashbox")
         shift = validated_data.get("shift", None)
 
-        # ✅ если shift не передали — цепляем единственную открытую смену кассы
         if not shift and cashbox:
             open_shift = (
                 CashShift.objects

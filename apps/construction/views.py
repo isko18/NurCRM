@@ -1,4 +1,8 @@
+from decimal import Decimal
+
+from django.apps import apps
 from django.db import transaction
+from django.db.models import Sum, Count, Q
 from django.shortcuts import get_object_or_404
 
 from rest_framework import generics, permissions
@@ -148,6 +152,41 @@ def _get_active_branch(request):
     return None
 
 
+def _guess_sale_model():
+    """
+    Пытаемся найти модель Sale без жёсткого импорта:
+    - должна иметь FK cashbox -> Cashbox
+    - должна иметь поля status, total, payment_method (желательно)
+    """
+    candidates = []
+    for m in apps.get_models():
+        fields = {f.name: f for f in m._meta.get_fields() if getattr(f, "concrete", False)}
+        if "cashbox" not in fields:
+            continue
+        f = fields["cashbox"]
+        if not getattr(f, "is_relation", False):
+            continue
+        if getattr(f, "related_model", None) is not Cashbox:
+            continue
+
+        has_total = "total" in fields
+        has_status = "status" in fields
+        has_pm = "payment_method" in fields
+        score = (10 if has_total else 0) + (10 if has_status else 0) + (5 if has_pm else 0)
+
+        name = (m.__name__ or "").lower()
+        if "sale" in name:
+            score += 3
+
+        candidates.append((score, m))
+
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    return candidates[0][1] if candidates else None
+
+
+SALE_MODEL = _guess_sale_model()
+
+
 # ─────────────────────────────────────────────────────────────
 # base mixin: company + branch scope
 # ─────────────────────────────────────────────────────────────
@@ -179,7 +218,6 @@ class CompanyBranchScopedMixin:
             br = self._active_branch()
             if br is not None:
                 qs = qs.filter(branch=br)
-            # br None → вся компания
 
         return qs
 
@@ -232,6 +270,131 @@ class CashboxListCreateView(CompanyBranchScopedMixin, generics.ListCreateAPIView
 
     def perform_create(self, serializer):
         self._inject_company_branch_on_save(serializer)
+
+    def list(self, request, *args, **kwargs):
+        """
+        ✅ Ускорение: считаем analytics пачкой для page-касс и кладём в context["analytics_map"]
+        """
+        z = Decimal("0.00")
+
+        qs = self.filter_queryset(self.get_queryset())
+        page = self.paginate_queryset(qs)
+        cashboxes = page if page is not None else list(qs)
+
+        ids = [cb.id for cb in cashboxes]
+        analytics_map = {str(cb_id): {
+            "income_total": z,
+            "expense_total": z,
+            "sales_count": 0,
+            "sales_total": z,
+            "cash_sales_total": z,
+            "noncash_sales_total": z,
+            "open_shift_expected_cash": None,
+        } for cb_id in ids}
+
+        if ids:
+            # ---- flows (approved) by cashbox ----
+            flows = (
+                CashFlow.objects
+                .filter(cashbox_id__in=ids, status=CashFlow.Status.APPROVED)
+                .values("cashbox_id")
+                .annotate(
+                    income=Sum("amount", filter=Q(type=CashFlow.Type.INCOME)),
+                    expense=Sum("amount", filter=Q(type=CashFlow.Type.EXPENSE)),
+                )
+            )
+            for r in flows:
+                k = str(r["cashbox_id"])
+                analytics_map[k]["income_total"] = r["income"] or z
+                analytics_map[k]["expense_total"] = r["expense"] or z
+
+            # ---- sales (paid) by cashbox ----
+            if SALE_MODEL is not None:
+                # статусы/методы стараемся читать максимально мягко
+                paid_value = getattr(getattr(SALE_MODEL, "Status", None), "PAID", None) or "paid"
+                cash_value = getattr(getattr(getattr(SALE_MODEL, "PaymentMethod", None), "CASH", None), "value", None)
+                if cash_value is None:
+                    cash_value = getattr(getattr(SALE_MODEL, "PaymentMethod", None), "CASH", None) or "cash"
+
+                sales = (
+                    SALE_MODEL.objects
+                    .filter(cashbox_id__in=ids, status=paid_value)
+                    .values("cashbox_id")
+                    .annotate(
+                        cnt=Count("id"),
+                        total_sum=Sum("total"),
+                        cash_sum=Sum("total", filter=Q(payment_method=cash_value)),
+                        noncash_sum=Sum("total", filter=~Q(payment_method=cash_value)),
+                    )
+                )
+                for r in sales:
+                    k = str(r["cashbox_id"])
+                    analytics_map[k]["sales_count"] = r["cnt"] or 0
+                    analytics_map[k]["sales_total"] = r["total_sum"] or z
+                    analytics_map[k]["cash_sales_total"] = r["cash_sum"] or z
+                    analytics_map[k]["noncash_sales_total"] = r["noncash_sum"] or z
+
+            # ---- open shift expected cash (batch) ----
+            # берём актуальную OPEN смену на каждую кассу (последнюю по opened_at)
+            open_shifts = (
+                CashShift.objects
+                .filter(cashbox_id__in=ids, status=CashShift.Status.OPEN)
+                .only("id", "cashbox_id", "opening_cash", "opened_at")
+                .order_by("cashbox_id", "-opened_at")
+            )
+
+            open_by_cashbox = {}
+            for sh in open_shifts:
+                if sh.cashbox_id not in open_by_cashbox:
+                    open_by_cashbox[sh.cashbox_id] = sh
+
+            if open_by_cashbox:
+                open_ids = [s.id for s in open_by_cashbox.values()]
+
+                # flows внутри open shift
+                shift_flows = (
+                    CashFlow.objects
+                    .filter(shift_id__in=open_ids, status=CashFlow.Status.APPROVED)
+                    .values("shift__cashbox_id")
+                    .annotate(
+                        income=Sum("amount", filter=Q(type=CashFlow.Type.INCOME)),
+                        expense=Sum("amount", filter=Q(type=CashFlow.Type.EXPENSE)),
+                    )
+                )
+                sf_map = {r["shift__cashbox_id"]: r for r in shift_flows}
+
+                cash_sales_map = {}
+                if SALE_MODEL is not None:
+                    paid_value = getattr(getattr(SALE_MODEL, "Status", None), "PAID", None) or "paid"
+                    cash_value = getattr(getattr(getattr(SALE_MODEL, "PaymentMethod", None), "CASH", None), "value", None)
+                    if cash_value is None:
+                        cash_value = getattr(getattr(SALE_MODEL, "PaymentMethod", None), "CASH", None) or "cash"
+
+                    cash_sales = (
+                        SALE_MODEL.objects
+                        .filter(shift_id__in=open_ids, status=paid_value, payment_method=cash_value)
+                        .values("shift__cashbox_id")
+                        .annotate(cash_sum=Sum("total"))
+                    )
+                    cash_sales_map = {r["shift__cashbox_id"]: (r["cash_sum"] or z) for r in cash_sales}
+
+                for cb_id, sh in open_by_cashbox.items():
+                    k = str(cb_id)
+                    inc = (sf_map.get(cb_id) or {}).get("income") or z
+                    exp = (sf_map.get(cb_id) or {}).get("expense") or z
+                    cash_sales_total = cash_sales_map.get(cb_id, z)
+                    opening_cash = sh.opening_cash or z
+                    analytics_map[k]["open_shift_expected_cash"] = opening_cash + cash_sales_total + inc - exp
+
+        serializer = self.get_serializer(
+            cashboxes,
+            many=True,
+            context={"request": request, "analytics_map": analytics_map},
+        )
+
+        if page is not None:
+            return self.get_paginated_response(serializer.data)
+        return Response(serializer.data)
 
 
 class CashboxDetailView(CompanyBranchScopedMixin, generics.RetrieveUpdateDestroyAPIView):
@@ -386,8 +549,6 @@ class CashShiftCloseView(APIView):
 
     @transaction.atomic
     def post(self, request, pk):
-        # company scope как у тебя
-        # (я не трогаю твою логику company/branch, просто оставь её)
         company = getattr(request.user, "company", None) or getattr(request.user, "owned_company", None)
         if not company:
             raise PermissionDenied("У пользователя не настроена компания.")
@@ -399,7 +560,12 @@ class CashShiftCloseView(APIView):
         )
 
         user = request.user
-        is_owner_like = getattr(user, "is_superuser", False) or getattr(user, "owned_company", None) or getattr(user, "is_admin", False) or getattr(user, "role", None) in ("owner", "admin")
+        is_owner_like = (
+            getattr(user, "is_superuser", False)
+            or getattr(user, "owned_company", None)
+            or getattr(user, "is_admin", False)
+            or getattr(user, "role", None) in ("owner", "admin")
+        )
         if not is_owner_like and shift.cashier_id != user.id:
             raise PermissionDenied("Нельзя закрыть чужую смену.")
 

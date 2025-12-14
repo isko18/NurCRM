@@ -4,11 +4,10 @@ import uuid
 from django.conf import settings
 from django.db import models
 from django.core.exceptions import ValidationError
-from django.db.models import Sum, Count, Q
+from django.db.models import Sum, Count, Q, DecimalField, Case, When, Value
 from django.utils import timezone
 
 from apps.users.models import Company, Branch
-
 
 class Cashbox(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
@@ -63,52 +62,34 @@ class Cashbox(models.Model):
         return super().save(*args, **kwargs)
 
     def get_summary(self) -> dict:
-        """
-        Короткая аналитика по кассе:
-        - приходы/расходы (только APPROVED)
-        - продажи (PAID) по этой кассе
-        - если есть открытая смена — отдаём её live expected_cash
-        """
-        from decimal import Decimal
-        from django.db import connection
-        from django.db.models import Sum, Count, Q, DecimalField, Case, When, Value
-        from django.db.models.expressions import RawSQL
-
         z = Decimal("0.00")
 
-        # ---- flows (approved) ----
+        # flows (approved)
         flows_qs = self.flows.filter(status=CashFlow.Status.APPROVED)
         fa = flows_qs.aggregate(
             income=Sum("amount", filter=Q(type=CashFlow.Type.INCOME)),
             expense=Sum("amount", filter=Q(type=CashFlow.Type.EXPENSE)),
         )
-
         income_total = fa["income"] or z
         expense_total = fa["expense"] or z
 
-        # ---- sales (paid) ----
-        # Берём модель из related manager, чтобы не импортить Sale напрямую
+        # sales (paid)
         Sale = self.sales.model
         sales_qs = self.sales.filter(status=Sale.Status.PAID)
 
-        # ✅ защита от ситуации, когда где-то есть annotate(total=...)
-        table = connection.ops.quote_name(Sale._meta.db_table)
-        col_total = connection.ops.quote_name("total")
-        total_col = RawSQL(f"{table}.{col_total}", [])
-
         sa = sales_qs.aggregate(
             cnt=Count("id"),
-            total_sum=Sum(total_col),
+            total_sum=Sum("total"),
             cash_sum=Sum(
                 Case(
-                    When(payment_method=Sale.PaymentMethod.CASH, then=total_col),
+                    When(payment_method=Sale.PaymentMethod.CASH, then="total"),
                     default=Value(0),
                     output_field=DecimalField(max_digits=12, decimal_places=2),
                 )
             ),
             noncash_sum=Sum(
                 Case(
-                    When(~Q(payment_method=Sale.PaymentMethod.CASH), then=total_col),
+                    When(~Q(payment_method=Sale.PaymentMethod.CASH), then="total"),
                     default=Value(0),
                     output_field=DecimalField(max_digits=12, decimal_places=2),
                 )
@@ -120,22 +101,20 @@ class Cashbox(models.Model):
         cash_sales_total = sa["cash_sum"] or z
         noncash_sales_total = sa["noncash_sum"] or z
 
-        # ---- open shift info ----
+        # open shift
         open_shift = (
             self.shifts
             .filter(status=CashShift.Status.OPEN)
             .select_related("cashier")
+            .only("id", "opening_cash", "cashier_id", "status", "opened_at")
             .order_by("-opened_at")
             .first()
         )
 
         open_shift_expected_cash = None
-        open_shift_id = None
         if open_shift:
-            open_shift_id = str(open_shift.id)
             try:
-                t = open_shift.calc_live_totals()
-                open_shift_expected_cash = t.get("expected_cash")
+                open_shift_expected_cash = open_shift.calc_live_totals().get("expected_cash")
             except Exception:
                 open_shift_expected_cash = None
 
@@ -146,10 +125,9 @@ class Cashbox(models.Model):
             "sales_total": sales_total,
             "cash_sales_total": cash_sales_total,
             "noncash_sales_total": noncash_sales_total,
-            # "open_shift_id": open_shift_id,
             "open_shift_expected_cash": open_shift_expected_cash,
         }
-        
+
     def __str__(self):
         if self.branch_id:
             base = f"Касса филиала {self.branch.name}"
@@ -177,19 +155,13 @@ class CashShift(models.Model):
     cashbox = models.ForeignKey("construction.Cashbox", on_delete=models.PROTECT, related_name="shifts")
     cashier = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.PROTECT, related_name="shifts")
 
-    status = models.CharField(
-        max_length=10,
-        choices=Status.choices,
-        default=Status.OPEN,
-        db_index=True,
-    )
+    status = models.CharField(max_length=10, choices=Status.choices, default=Status.OPEN, db_index=True)
     opened_at = models.DateTimeField(auto_now_add=True)
     closed_at = models.DateTimeField(null=True, blank=True)
 
     opening_cash = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal("0.00"))
     closing_cash = models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
 
-    # кешируем итоги ТОЛЬКО при закрытии
     income_total = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal("0.00"))
     expense_total = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal("0.00"))
     sales_count = models.PositiveIntegerField(default=0)
@@ -199,7 +171,6 @@ class CashShift(models.Model):
 
     class Meta:
         constraints = [
-            # ✅ ОДНА открытая смена на кассу
             models.UniqueConstraint(
                 fields=("cashbox",),
                 condition=Q(status="open"),
@@ -225,46 +196,31 @@ class CashShift(models.Model):
             if cashier_company_id and cashier_company_id != self.company_id:
                 raise ValidationError({"cashier": "Кассир другой компании."})
 
-    # ─────────────────────────────────────────────
-    # ✅ LIVE totals (для OPEN смены, без записи в БД)
-    # ─────────────────────────────────────────────
     def calc_live_totals(self) -> dict:
-        from django.db import connection
-        from django.db.models import Sum, Count, Q, DecimalField, Case, When, Value
-        from django.db.models.expressions import RawSQL
-
         z = Decimal("0.00")
 
-        # flows (approved)
         flows = self.shift_flows.filter(status=CashFlow.Status.APPROVED)
         fa = flows.aggregate(
             income=Sum("amount", filter=Q(type=CashFlow.Type.INCOME)),
             expense=Sum("amount", filter=Q(type=CashFlow.Type.EXPENSE)),
         )
 
-        # sales (paid) — берём МОДЕЛЬ Sale от related_name="sales"
         Sale = self.sales.model
-
         sales_qs = Sale.objects.filter(shift_id=self.id, status=Sale.Status.PAID)
-
-        # 🔥 берём колонку БД напрямую, игнорируя любые annotate(total=...)
-        table = connection.ops.quote_name(Sale._meta.db_table)
-        col_total = connection.ops.quote_name("total")
-        total_col = RawSQL(f"{table}.{col_total}", [])
 
         sa = sales_qs.aggregate(
             cnt=Count("id"),
-            total_sum=Sum(total_col),
+            total_sum=Sum("total"),
             cash_sum=Sum(
                 Case(
-                    When(payment_method=Sale.PaymentMethod.CASH, then=total_col),
+                    When(payment_method=Sale.PaymentMethod.CASH, then="total"),
                     default=Value(0),
                     output_field=DecimalField(max_digits=12, decimal_places=2),
                 )
             ),
             noncash_sum=Sum(
                 Case(
-                    When(~Q(payment_method=Sale.PaymentMethod.CASH), then=total_col),
+                    When(~Q(payment_method=Sale.PaymentMethod.CASH), then="total"),
                     default=Value(0),
                     output_field=DecimalField(max_digits=12, decimal_places=2),
                 )
@@ -292,8 +248,6 @@ class CashShift(models.Model):
 
     @property
     def expected_cash(self) -> Decimal:
-        # это "кеш-логика": после закрытия будет точно (кеш записан),
-        # до закрытия в API мы подменим цифры на live-значения в сериализаторе.
         return (self.opening_cash or 0) + (self.cash_sales_total or 0) + (self.income_total or 0) - (self.expense_total or 0)
 
     @property
@@ -303,9 +257,6 @@ class CashShift(models.Model):
         return (self.closing_cash or 0) - (self.expected_cash or 0)
 
     def recalc_totals_for_close(self):
-        """
-        Кешируем итоги ТОЛЬКО при закрытии.
-        """
         t = self.calc_live_totals()
         self.income_total = t["income_total"]
         self.expense_total = t["expense_total"]
@@ -320,7 +271,6 @@ class CashShift(models.Model):
 
         self.closing_cash = closing_cash
         self.closed_at = timezone.now()
-
         self.recalc_totals_for_close()
 
         self.status = self.Status.CLOSED
@@ -340,7 +290,6 @@ class CashShift(models.Model):
 
     def __str__(self):
         return f"Смена {self.cashier} / {self.cashbox} ({self.status})"
-
 
 class CashFlow(models.Model):
     class Type(models.TextChoices):
