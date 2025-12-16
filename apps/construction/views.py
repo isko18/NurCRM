@@ -20,6 +20,7 @@ from apps.construction.serializers import (
     CashShiftListSerializer,
     CashShiftOpenSerializer,
     CashShiftCloseSerializer,
+    CashFlowBulkStatusSerializer
 )
 
 # ─────────────────────────────────────────────────────────────
@@ -609,3 +610,26 @@ class CashShiftCloseView(APIView):
 
         out = CashShiftListSerializer(shift, context={"request": request}).data
         return Response(out, status=200)
+
+class CashFlowBulkStatusUpdateView(CompanyBranchScopedMixin, generics.GenericAPIView):
+    serializer_class = CashFlowBulkStatusSerializer
+
+    @transaction.atomic
+    def patch(self, request, *args, **kwargs):
+        ser = self.get_serializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+        items = ser.validated_data["items"]
+
+        ids = list({it["id"] for it in items})
+
+        qs = self._scoped_queryset(CashFlow.objects.filter(id__in=ids))
+
+        existing_ids = set(qs.values_list("id", flat=True))
+        missing = [str(i) for i in ids if i not in existing_ids]
+        if missing:
+            raise ValidationError({"missing_ids": missing})
+
+        whens = [When(id=it["id"], then=Value(it["status"])) for it in items]
+        updated = qs.update(status=Case(*whens, output_field=CharField()))
+
+        return Response({"count": updated, "updated_ids": [str(i) for i in ids]}, status=200)

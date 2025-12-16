@@ -552,8 +552,8 @@ class CashFlowSerializer(CompanyBranchReadOnlyMixin):
         if shift:
             if cashbox and shift.cashbox_id != cashbox.id:
                 raise serializers.ValidationError({"shift": "Смена относится к другой кассе."})
-            if shift.status != CashShift.Status.OPEN:
-                raise serializers.ValidationError({"shift": "Нельзя привязать движение к закрытой смене."})
+            # if shift.status != CashShift.Status.OPEN:
+            #     raise serializers.ValidationError({"shift": "Нельзя привязать движение к закрытой смене."})
             if user and (not _is_owner_like(user)) and shift.cashier_id != user.id:
                 raise serializers.ValidationError({"shift": "Это не ваша смена."})
 
@@ -585,3 +585,17 @@ class CashFlowSerializer(CompanyBranchReadOnlyMixin):
         return super().create(validated_data)
 
 
+class CashFlowBulkStatusItemSerializer(serializers.Serializer):
+    id = serializers.UUIDField()
+    status = serializers.ChoiceField(choices=CashFlow.Status.choices)
+
+
+class CashFlowBulkStatusSerializer(serializers.Serializer):
+    items = CashFlowBulkStatusItemSerializer(many=True)
+
+    def validate_items(self, items):
+        if not items:
+            raise serializers.ValidationError("Пустой список.")
+        if len(items) > 50000:
+            raise serializers.ValidationError("Слишком много. Максимум 50 000 за раз.")
+        return items

@@ -10,6 +10,7 @@ from apps.construction.views import (
     CashShiftDetailView,
     CashShiftOpenView,
     CashShiftCloseView,
+    CashFlowBulkStatusUpdateView
 )
 from apps.construction.sale_history_views import CashShiftSalesListView
 urlpatterns = [
@@ -18,6 +19,7 @@ urlpatterns = [
 
     path("cashflows/", CashFlowListCreateView.as_view(), name="cashflow-list-create"),
     path("cashflows/<uuid:pk>/", CashFlowDetailView.as_view(), name="cashflow-detail"),
+    path("cashflows/bulk/status/", CashFlowBulkStatusUpdateView.as_view(), name="cashflow-bulk-status"),
 
     path("cashboxes/detail/owner/", CashboxOwnerDetailView.as_view(), name="owner-cashboxes"),
     path("cashboxes/<uuid:pk>/detail/owner/", CashboxOwnerDetailSingleView.as_view(), name="owner-cashbox-detail"),
