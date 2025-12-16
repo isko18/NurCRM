@@ -1928,6 +1928,8 @@ class ClientDeal(models.Model):
         related_name="client_deals",
         verbose_name="Компания",
         db_index=True,
+                null=True,
+        blank=True,
     )
     branch = models.ForeignKey(
         Branch,
@@ -2136,6 +2138,9 @@ class DealInstallment(models.Model):
         related_name="deal_installments",
         verbose_name="Компания",
         db_index=True,
+        null=True,
+        blank=True,
+        
     )
     branch = models.ForeignKey(
         Branch,
@@ -2211,6 +2216,8 @@ class DealPayment(models.Model):
         related_name="deal_payments",
         verbose_name="Компания",
         db_index=True,
+                null=True,
+        blank=True,
     )
     branch = models.ForeignKey(
         Branch,
@@ -2228,6 +2235,8 @@ class DealPayment(models.Model):
         related_name="payments",
         verbose_name="Сделка",
         db_index=True,
+                null=True,
+        blank=True,
     )
 
     installment = models.ForeignKey(
@@ -2236,6 +2245,8 @@ class DealPayment(models.Model):
         related_name="payments",
         verbose_name="Взнос",
         db_index=True,
+                null=True,
+        blank=True,
     )
 
     kind = models.CharField("Тип", max_length=16, choices=Kind.choices, default=Kind.PAY)
