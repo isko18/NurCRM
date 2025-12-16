@@ -1,5 +1,6 @@
 # apps/construction/views/shift_sales.py
 from datetime import datetime, time
+from decimal import Decimal, InvalidOperation
 
 from django.db.models import Q, Prefetch
 from django.shortcuts import get_object_or_404
@@ -61,12 +62,6 @@ def assert_shift_access(user, shift: CashShift):
 
 
 def _parse_dt_or_date(s: str, *, end_of_day: bool = False):
-    """
-    Принимает:
-      - YYYY-MM-DD
-      - ISO datetime (YYYY-MM-DDTHH:MM[:SS])
-    Возвращает aware datetime (в timezone проекта) или None.
-    """
     if not s:
         return None
 
@@ -85,20 +80,42 @@ def _parse_dt_or_date(s: str, *, end_of_day: bool = False):
     return dt
 
 
+def _parse_decimal(s: str):
+    if s is None:
+        return None
+    s = str(s).strip()
+    if s == "":
+        return None
+    try:
+        return Decimal(s)
+    except (InvalidOperation, ValueError):
+        return None
+
+
+def _choice_map_from_textchoices(textchoices):
+    # {"paid","PAID"} -> value
+    out = {}
+    for k, _ in getattr(textchoices, "choices", []):
+        out[str(k).lower()] = k
+        out[str(k)] = k
+    return out
+
+
+STATUS_MAP = _choice_map_from_textchoices(Sale.Status)
+PM_MAP = _choice_map_from_textchoices(Sale.PaymentMethod)
+
+ALLOWED_ORDERING = {
+    "created_at", "-created_at",
+    "total", "-total",
+    "paid_at", "-paid_at",
+    "doc_number", "-doc_number",
+}
+
+
 # ─────────────────────────────────────────────────────────────
 # view
 # ─────────────────────────────────────────────────────────────
 class CashShiftSalesListView(generics.ListAPIView):
-    """
-    GET /api/cash/shifts/<shift_id>/sales/
-
-    query params:
-      - status: new|paid|canceled
-      - payment_method: cash|transfer
-      - q: поиск по doc_number или по части uuid
-      - date_from: YYYY-MM-DD или ISO datetime
-      - date_to: YYYY-MM-DD или ISO datetime (если дата — включительно до конца дня)
-    """
     permission_classes = [permissions.IsAuthenticated]
     serializer_class = SaleHistorySerializer
 
@@ -113,10 +130,9 @@ class CashShiftSalesListView(generics.ListAPIView):
             id=self.kwargs["pk"],
             company=company,
         )
-
         assert_shift_access(user, shift)
 
-        # базовый qs продаж смены
+        # base qs
         qs = (
             Sale.objects
             .filter(company=company, shift=shift)
@@ -129,10 +145,9 @@ class CashShiftSalesListView(generics.ListAPIView):
                 "created_at", "paid_at",
                 "client_id", "user_id",
             )
-            .order_by("-created_at")
         )
 
-        # items prefetch: один раз, сразу оптимальный
+        # items prefetch (оптимально)
         item_qs = (
             SaleItem.objects
             .select_related("product")
@@ -145,45 +160,76 @@ class CashShiftSalesListView(generics.ListAPIView):
         )
         qs = qs.prefetch_related(Prefetch("items", queryset=item_qs))
 
-        # ---- filters ----
         p = self.request.query_params
 
-        status = (p.get("status") or "").strip()
-        if status:
-            allowed = {Sale.Status.NEW, Sale.Status.PAID, Sale.Status.CANCELED, "new", "paid", "canceled"}
-            if status not in allowed:
+        # ---- status ----
+        raw_status = (p.get("status") or "").strip()
+        if raw_status:
+            val = STATUS_MAP.get(raw_status.lower())
+            if val is None:
                 raise ValidationError({"status": "Допустимо: new, paid, canceled"})
-            qs = qs.filter(status=status)
+            qs = qs.filter(status=val)
 
-        pm = (p.get("payment_method") or "").strip()
-        if pm:
-            allowed = {Sale.PaymentMethod.CASH, Sale.PaymentMethod.TRANSFER, "cash", "transfer"}
-            if pm not in allowed:
+        # ---- payment_method ----
+        raw_pm = (p.get("payment_method") or "").strip()
+        if raw_pm:
+            val = PM_MAP.get(raw_pm.lower())
+            if val is None:
                 raise ValidationError({"payment_method": "Допустимо: cash, transfer"})
-            qs = qs.filter(payment_method=pm)
+            qs = qs.filter(payment_method=val)
 
+        # ---- q search ----
         q = (p.get("q") or "").strip()
         if q:
-            cond = Q()
+            cond = Q(id__icontains=q)
+
             if q.isdigit():
-                cond |= Q(doc_number=int(q))
-            cond |= Q(id__icontains=q)
+                # doc_number
+                try:
+                    cond |= Q(doc_number=int(q))
+                except Exception:
+                    pass
+
+            # client name (если есть поле)
+            if hasattr(Sale, "client") and hasattr(Sale._meta.get_field("client").related_model, "name"):
+                cond |= Q(client__name__icontains=q)
+
             qs = qs.filter(cond)
 
-        raw_from = p.get("date_from") or ""
-        raw_to = p.get("date_to") or ""
+        # ---- date range ----
+        raw_from = (p.get("date_from") or "").strip()
+        raw_to = (p.get("date_to") or "").strip()
 
         date_from = _parse_dt_or_date(raw_from, end_of_day=False) if raw_from else None
-        date_to = _parse_dt_or_date(raw_to, end_of_day=(len(raw_to.strip()) == 10)) if raw_to else None
+        date_to = _parse_dt_or_date(raw_to, end_of_day=(len(raw_to) == 10)) if raw_to else None
 
         if raw_from and date_from is None:
-            raise ValidationError({"date_from": "Неверный формат. Пример: 2025-12-16 или 2025-12-16T10:30:00"})
+            raise ValidationError({"date_from": "Формат: 2025-12-16 или 2025-12-16T10:30:00"})
         if raw_to and date_to is None:
-            raise ValidationError({"date_to": "Неверный формат. Пример: 2025-12-16 или 2025-12-16T10:30:00"})
+            raise ValidationError({"date_to": "Формат: 2025-12-16 или 2025-12-16T10:30:00"})
 
         if date_from:
             qs = qs.filter(created_at__gte=date_from)
         if date_to:
             qs = qs.filter(created_at__lte=date_to)
 
-        return qs
+        # ---- totals range ----
+        min_total = _parse_decimal(p.get("min_total"))
+        max_total = _parse_decimal(p.get("max_total"))
+
+        if p.get("min_total") is not None and min_total is None:
+            raise ValidationError({"min_total": "Неверное число"})
+        if p.get("max_total") is not None and max_total is None:
+            raise ValidationError({"max_total": "Неверное число"})
+
+        if min_total is not None:
+            qs = qs.filter(total__gte=min_total)
+        if max_total is not None:
+            qs = qs.filter(total__lte=max_total)
+
+        # ---- ordering ----
+        ordering = (p.get("ordering") or "-created_at").strip()
+        if ordering not in ALLOWED_ORDERING:
+            raise ValidationError({"ordering": f"Допустимо: {', '.join(sorted(ALLOWED_ORDERING))}"})
+
+        return qs.order_by(ordering)
