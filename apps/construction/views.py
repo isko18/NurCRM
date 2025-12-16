@@ -614,15 +614,43 @@ class CashShiftCloseView(APIView):
         return Response(out, status=200)
 
 class CashFlowBulkStatusUpdateView(CompanyBranchScopedMixin, generics.GenericAPIView):
+    """
+    PATCH /api/construction/cashflows/bulk/status/
+
+    body:
+    {
+      "items": [
+        {"id": "<uuid>", "status": "approved"},
+        {"id": "<uuid>", "status": "rejected"}
+      ]
+    }
+
+    Ограничения:
+    - проверяем доступ через scoped queryset (company/branch)
+    - проверяем missing_ids
+    - обновляем чанками, чтобы не упереться в лимиты SQL (10k+)
+    """
     serializer_class = CashFlowBulkStatusSerializer
+
+    # сколько When'ов в одном UPDATE (под 10k+ обязательно)
+    CHUNK_SIZE = 1000
 
     @transaction.atomic
     def patch(self, request, *args, **kwargs):
         ser = self.get_serializer(data=request.data)
         ser.is_valid(raise_exception=True)
-        items = ser.validated_data["items"]
 
-        ids = list({it["id"] for it in items})
+        items = ser.validated_data.get("items") or []
+        if not items:
+            return Response({"count": 0, "updated_ids": []}, status=200)
+
+        # дедуп по id: если одинаковые id прилетели несколько раз — берём последний статус
+        id_to_status = {}
+        for it in items:
+            _id = it["id"]
+            id_to_status[_id] = it["status"]
+
+        ids = list(id_to_status.keys())
 
         qs = self._scoped_queryset(CashFlow.objects.filter(id__in=ids))
 
@@ -631,7 +659,27 @@ class CashFlowBulkStatusUpdateView(CompanyBranchScopedMixin, generics.GenericAPI
         if missing:
             raise ValidationError({"missing_ids": missing})
 
-        whens = [When(id=it["id"], then=Value(it["status"])) for it in items]
-        updated = qs.update(status=Case(*whens, output_field=CharField()))
+        updated_ids = []
+        updated_count = 0
 
-        return Response({"count": updated, "updated_ids": [str(i) for i in ids]}, status=200)
+        # обновляем порциями, чтобы Case/When не раздувал SQL
+        for i in range(0, len(ids), self.CHUNK_SIZE):
+            chunk_ids = ids[i:i + self.CHUNK_SIZE]
+
+            whens = [
+                When(id=_id, then=Value(id_to_status[_id]))
+                for _id in chunk_ids
+            ]
+
+            # scoped queryset уже отфильтровал company/branch, здесь режем по chunk_ids
+            chunk_qs = qs.filter(id__in=chunk_ids)
+
+            updated_count += chunk_qs.update(
+                status=Case(*whens, output_field=CharField())
+            )
+            updated_ids.extend([str(x) for x in chunk_ids])
+
+        return Response(
+            {"count": updated_count, "updated_ids": updated_ids},
+            status=200
+        )
