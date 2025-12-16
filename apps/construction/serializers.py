@@ -583,3 +583,5 @@ class CashFlowSerializer(CompanyBranchReadOnlyMixin):
             validated_data["cashier"] = user
 
         return super().create(validated_data)
+
+

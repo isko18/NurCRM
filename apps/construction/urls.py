@@ -11,7 +11,7 @@ from apps.construction.views import (
     CashShiftOpenView,
     CashShiftCloseView,
 )
-
+from apps.construction.sale_history_views import CashShiftSalesListView
 urlpatterns = [
     path("cashboxes/", CashboxListCreateView.as_view(), name="cashbox-list-create"),
     path("cashboxes/<uuid:pk>/", CashboxDetailView.as_view(), name="cashbox-detail"),
@@ -26,4 +26,5 @@ urlpatterns = [
     path("shifts/open/", CashShiftOpenView.as_view(), name="cashshift-open"),
     path("shifts/<uuid:pk>/", CashShiftDetailView.as_view(), name="cashshift-detail"),
     path("shifts/<uuid:pk>/close/", CashShiftCloseView.as_view(), name="cashshift-close"),
+    path("cash/shifts/<uuid:pk>/sales/", CashShiftSalesListView.as_view(), name="cash-shift-sales",),
 ]
