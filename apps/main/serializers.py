@@ -14,7 +14,7 @@ from apps.main.models import (
     OrderItem, Client, GlobalProduct, CartItem, ClientDeal, Bid, SocialApplications,
     TransactionRecord, DealInstallment, ContractorWork, Debt, DebtPayment,
     ObjectItem, ObjectSale, ObjectSaleItem, ItemMake, ManufactureSubreal, Acceptance,
-    ReturnFromAgent, ProductImage, PromoRule, AgentRequestCart, AgentRequestItem, ProductPackage, ProductCharacteristics
+    ReturnFromAgent, ProductImage, PromoRule, AgentRequestCart, AgentRequestItem, ProductPackage, ProductCharacteristics, DealPayment
 )
 
 from apps.consalting.models import ServicesConsalting
@@ -1211,14 +1211,25 @@ class ClientSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
         if obj.service:
             return obj.service.name
         return None
+class DealInstallmentSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
+    company = serializers.ReadOnlyField(source="company.id")
+    branch = serializers.ReadOnlyField(source="branch.id")
+    deal = serializers.ReadOnlyField(source="deal.id")
 
-
-class DealInstallmentSerializer(serializers.ModelSerializer):
-    remaining_for_period = serializers.DecimalField(max_digits=12, decimal_places=2, read_only=True)
+    remaining_for_period = serializers.DecimalField(
+        max_digits=12,
+        decimal_places=2,
+        read_only=True,
+        source="remaining_for_period",
+    )
 
     class Meta:
         model = DealInstallment
         fields = (
+            "id",
+            "company",
+            "branch",
+            "deal",
             "number",
             "due_date",
             "amount",
@@ -1227,48 +1238,54 @@ class DealInstallmentSerializer(serializers.ModelSerializer):
             "paid_amount",
             "remaining_for_period",
         )
-        read_only_fields = (
-            "number",
-            "due_date",
+        read_only_fields = fields
+
+
+class DealPaymentSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
+    company = serializers.ReadOnlyField(source="company.id")
+    branch = serializers.ReadOnlyField(source="branch.id")
+
+    deal = serializers.ReadOnlyField(source="deal.id")
+    installment = serializers.ReadOnlyField(source="installment.id")
+    installment_number = serializers.IntegerField(source="installment.number", read_only=True)
+
+    created_by = serializers.ReadOnlyField(source="created_by.id")
+
+    class Meta:
+        model = DealPayment
+        fields = (
+            "id",
+            "company",
+            "branch",
+            "deal",
+            "installment",
+            "installment_number",
+            "kind",
             "amount",
-            "balance_after",
-            "paid_on",
-            "paid_amount",
-            "remaining_for_period",
+            "paid_date",
+            "idempotency_key",
+            "created_by",
+            "note",
+            "created_at",
         )
+        read_only_fields = fields
+
 
 class ClientDealSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
     company = serializers.ReadOnlyField(source="company.id")
     branch = serializers.ReadOnlyField(source="branch.id")
 
-    client = serializers.PrimaryKeyRelatedField(
-        queryset=Client.objects.all(),
-        required=False,
-    )
-    client_full_name = serializers.CharField(
-        source="client.full_name",
-        read_only=True,
-    )
+    # client может прийти из URL /clients/<client_id>/deals/ -> поэтому required=False
+    client = serializers.PrimaryKeyRelatedField(queryset=Client.objects.all(), required=False)
+    client_full_name = serializers.CharField(source="client.full_name", read_only=True)
 
-    debt_amount = serializers.DecimalField(
-        max_digits=12,
-        decimal_places=2,
-        read_only=True,
-    )
-    monthly_payment = serializers.DecimalField(
-        max_digits=12,
-        decimal_places=2,
-        read_only=True,
-    )
-    remaining_debt = serializers.DecimalField(
-        max_digits=12,
-        decimal_places=2,
-        read_only=True,
-    )
+    debt_amount = serializers.DecimalField(max_digits=12, decimal_places=2, read_only=True)
+    monthly_payment = serializers.DecimalField(max_digits=12, decimal_places=2, read_only=True)
+    remaining_debt = serializers.DecimalField(max_digits=12, decimal_places=2, read_only=True)
 
     installments = DealInstallmentSerializer(many=True, read_only=True)
+    payments = DealPaymentSerializer(many=True, read_only=True)
 
-    # 🔥 новое поле — управляем автогенерацией графика
     auto_schedule = serializers.BooleanField(required=False)
 
     class Meta:
@@ -1281,6 +1298,7 @@ class ClientDealSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializ
             "debt_months", "first_due_date",
             "debt_amount", "monthly_payment", "remaining_debt",
             "installments",
+            "payments",
             "auto_schedule",
             "note", "created_at", "updated_at",
         ]
@@ -1288,14 +1306,16 @@ class ClientDealSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializ
             "id", "company", "branch",
             "created_at", "updated_at",
             "client_full_name",
-            "debt_amount", "monthly_payment",
-            "remaining_debt", "installments",
+            "debt_amount", "monthly_payment", "remaining_debt",
+            "installments", "payments",
         ]
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+
         comp = self._user_company()
         br = self._auto_branch()
+
         _restrict_pk_queryset_strict(
             self.fields.get("client"),
             Client.objects.all(),
@@ -1307,61 +1327,81 @@ class ClientDealSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializ
         request = self.context["request"]
         company = request.user.company
         branch = self._auto_branch()
+        instance = getattr(self, "instance", None)
 
-        client = attrs.get("client") or (
-            self.instance.client if self.instance else None
-        )
-        if client and client.company_id != company.id:
-            raise serializers.ValidationError(
-                {"client": "Клиент принадлежит другой компании."}
-            )
+        # ===== client обязателен, если не передан через URL =====
+        view = self.context.get("view")
+        client_id_from_url = getattr(view, "kwargs", {}).get("client_id") if view else None
 
-        if branch is not None:
-            if client and client.branch_id != branch.id:
-                raise serializers.ValidationError(
-                    {"client": "Клиент другого филиала."}
-                )
+        client = attrs.get("client") or (instance.client if instance else None)
 
-        amount = attrs.get("amount", getattr(self.instance, "amount", None))
-        prepayment = attrs.get(
-            "prepayment", getattr(self.instance, "prepayment", None)
-        )
-        kind = attrs.get("kind", getattr(self.instance, "kind", None))
-        debt_months = attrs.get(
-            "debt_months", getattr(self.instance, "debt_months", None)
-        )
+        if not client and not client_id_from_url:
+            raise serializers.ValidationError({"client": "Укажите клиента."})
+
+        # ===== scope проверки клиента (компания/филиал) =====
+        if client:
+            if client.company_id != company.id:
+                raise serializers.ValidationError({"client": "Клиент принадлежит другой компании."})
+
+            # клиент может быть общий (branch=None)
+            if branch is not None and client.branch_id not in (None, branch.id):
+                raise serializers.ValidationError({"client": "Клиент другого филиала."})
+
+        # ===== прод: если уже есть платежи — условия сделки нельзя менять =====
+        if instance and instance.pk and instance.payments.exists():
+            allowed = {"title", "note"}  # максимально безопасно
+            illegal = [k for k in attrs.keys() if k not in allowed]
+            if illegal:
+                raise serializers.ValidationError({
+                    "detail": "Нельзя менять тип/суммы/срок/дату/график: по сделке уже есть платежи. "
+                              "Разрешено менять только title и note."
+                })
+
+        amount = attrs.get("amount", getattr(instance, "amount", None))
+        prepayment = attrs.get("prepayment", getattr(instance, "prepayment", None))
+        kind = attrs.get("kind", getattr(instance, "kind", None))
+        debt_months = attrs.get("debt_months", getattr(instance, "debt_months", None))
 
         errors = {}
+
         if amount is not None and amount < 0:
             errors["amount"] = "Сумма не может быть отрицательной."
         if prepayment is not None and prepayment < 0:
             errors["prepayment"] = "Предоплата не может быть отрицательной."
-        if (
-            amount is not None
-            and prepayment is not None
-            and prepayment > amount
-        ):
-            errors["prepayment"] = (
-                "Предоплата не может превышать сумму договора."
-            )
+        if amount is not None and prepayment is not None and prepayment > amount:
+            errors["prepayment"] = "Предоплата не может превышать сумму договора."
 
         if kind == ClientDeal.Kind.DEBT:
             debt_amt = (amount or Decimal("0")) - (prepayment or Decimal("0"))
             if debt_amt <= 0:
-                errors["prepayment"] = (
-                    'Для типа "Долг" сумма договора должна быть больше предоплаты.'
-                )
+                errors["prepayment"] = 'Для типа "Долг" сумма договора должна быть больше предоплаты.'
             if not debt_months or debt_months <= 0:
                 errors["debt_months"] = "Укажите срок (в месяцах) для рассрочки."
         else:
-            # Для других типов долга и графика быть не должно
+            # не долг -> чистим всё, как в модели
             attrs["debt_months"] = None
             attrs["first_due_date"] = None
+            attrs["auto_schedule"] = False
 
         if errors:
             raise serializers.ValidationError(errors)
+
         return attrs
 
+class DealPayInputSerializer(serializers.Serializer):
+    installment_id = serializers.UUIDField(required=False)   # если нет — возьмём первый не полностью оплаченный
+    amount = serializers.DecimalField(max_digits=12, decimal_places=2, required=False)
+    date = serializers.DateField(required=False)
+    idempotency_key = serializers.UUIDField(required=True)
+    note = serializers.CharField(required=False, allow_blank=True)
+
+
+class DealRefundInputSerializer(serializers.Serializer):
+    installment_id = serializers.UUIDField(required=False)   # если нет — возьмём последний оплаченный/частично
+    amount = serializers.DecimalField(max_digits=12, decimal_places=2, required=False)  # если нет — вернём всё
+    date = serializers.DateField(required=False)
+    idempotency_key = serializers.UUIDField(required=True)
+    note = serializers.CharField(required=False, allow_blank=True)
 
 # ===========================
 # TransactionRecord

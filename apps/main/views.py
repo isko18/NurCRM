@@ -1,7 +1,7 @@
 from decimal import Decimal, ROUND_HALF_UP
 from uuid import UUID
 
-from django.db import transaction
+from django.db import transaction, IntegrityError
 from django.db.models import Sum, Count, Avg, F, Q, Prefetch, Value as V
 from django.utils.dateparse import parse_date, parse_datetime
 from django.utils import timezone
@@ -32,7 +32,7 @@ from apps.main.models import (
     GlobalProduct, GlobalBrand, GlobalCategory, ClientDeal, Bid, SocialApplications, TransactionRecord,
     ContractorWork, DealInstallment, DebtPayment, Debt, ObjectSaleItem, ObjectSale, ObjectItem, ItemMake,
     ManufactureSubreal, Acceptance, ReturnFromAgent, AgentSaleAllocation, ProductImage,
-    AgentRequestCart, AgentRequestItem, ProductPackage, ProductCharacteristics
+    AgentRequestCart, AgentRequestItem, ProductPackage, ProductCharacteristics, DealPayment
 )
 from apps.main.serializers import (
     ContactSerializer, PipelineSerializer, DealSerializer, TaskSerializer,
@@ -49,7 +49,7 @@ from apps.main.serializers import (
     AgentProductOnHandSerializer, AgentWithProductsSerializer, GlobalProductReadSerializer,
     ProductImageSerializer,
     AgentRequestCartApproveSerializer, AgentRequestCartRejectSerializer,
-    AgentRequestCartSerializer, AgentRequestCartSubmitSerializer, AgentRequestItemSerializer
+    AgentRequestCartSerializer, AgentRequestCartSubmitSerializer, AgentRequestItemSerializer, DealPayInputSerializer, DealRefundInputSerializer
 )
 from django.db.models import ProtectedError
 from apps.utils import product_images_prefetch, _is_owner_like
@@ -1318,6 +1318,18 @@ class ClientRetrieveUpdateDestroyAPIView(CompanyBranchRestrictedMixin, generics.
         return self._filter_qs_company_branch(Client.objects.all())
 
 
+def _deal_prefetch():
+    return [
+        Prefetch("installments", queryset=DealInstallment.objects.order_by("number")),
+        Prefetch(
+            "payments",
+            queryset=DealPayment.objects.select_related("installment", "created_by").order_by("-created_at"),
+        ),
+    ]
+
+
+# ===== Deals list/create =====
+
 class ClientDealListCreateAPIView(CompanyBranchRestrictedMixin, generics.ListCreateAPIView):
     """
       GET  /api/main/deals/
@@ -1336,13 +1348,14 @@ class ClientDealListCreateAPIView(CompanyBranchRestrictedMixin, generics.ListCre
         qs = (
             ClientDeal.objects
             .select_related("client")
-            .prefetch_related("installments")
-            .all()
+            .prefetch_related(*_deal_prefetch())
         )
         qs = self._filter_qs_company_branch(qs)
+
         client_id = self.kwargs.get("client_id")
         if client_id:
             qs = qs.filter(client_id=client_id)
+
         return qs
 
     @transaction.atomic
@@ -1351,14 +1364,30 @@ class ClientDealListCreateAPIView(CompanyBranchRestrictedMixin, generics.ListCre
         branch = self._auto_branch()
         client_id = self.kwargs.get("client_id")
 
+        if not company:
+            raise serializers.ValidationError({"company": "У пользователя не задана компания."})
+
         if client_id:
             client = get_object_or_404(Client, id=client_id, company=company)
+
+            # клиент может быть общий (branch=None)
+            if branch is not None and client.branch_id not in (None, branch.id):
+                raise serializers.ValidationError({"client": "Клиент другого филиала."})
+
             serializer.save(company=company, branch=branch, client=client)
-        else:
-            client = serializer.validated_data.get("client")
-            if not client or client.company_id != company.id:
-                raise serializers.ValidationError({"client": "Клиент не найден в вашей компании."})
-            serializer.save(company=company, branch=branch)
+            return
+
+        client = serializer.validated_data.get("client")
+        if not client or client.company_id != company.id:
+            raise serializers.ValidationError({"client": "Клиент не найден в вашей компании."})
+
+        if branch is not None and client.branch_id not in (None, branch.id):
+            raise serializers.ValidationError({"client": "Клиент другого филиала."})
+
+        serializer.save(company=company, branch=branch)
+
+
+# ===== Deals retrieve/update/destroy =====
 
 class ClientDealRetrieveUpdateDestroyAPIView(
     CompanyBranchRestrictedMixin,
@@ -1376,7 +1405,7 @@ class ClientDealRetrieveUpdateDestroyAPIView(
         qs = (
             ClientDeal.objects
             .select_related("client")
-            .prefetch_related("installments")
+            .prefetch_related(*_deal_prefetch())
         )
         qs = self._filter_qs_company_branch(qs)
 
@@ -1391,40 +1420,38 @@ class ClientDealRetrieveUpdateDestroyAPIView(
         company = self._company()
         branch = self._auto_branch()
 
-        if company is None:
-            raise serializers.ValidationError(
-                {"company": "У пользователя не задана компания."}
-            )
+        if not company:
+            raise serializers.ValidationError({"company": "У пользователя не задана компания."})
 
         new_client = serializer.validated_data.get("client")
-        if new_client and new_client.company_id != company.id:
-            raise serializers.ValidationError(
-                {"client": "Клиент принадлежит другой компании."}
-            )
+        if new_client:
+            if new_client.company_id != company.id:
+                raise serializers.ValidationError({"client": "Клиент принадлежит другой компании."})
+            if branch is not None and new_client.branch_id not in (None, branch.id):
+                raise serializers.ValidationError({"client": "Клиент другого филиала."})
 
-        # сохраняем с нужной company / branch
         deal = serializer.save(company=company, branch=branch)
 
-        # ⚡ ВАЖНО: сбросить кеш prefetch_related("installments"),
-        # чтобы сериализация отдала свежесозданные / пересчитанные
+        # сброс кеша prefetch — чтобы отдать свежие installments/payments
         deal.refresh_from_db()
-
-        # DRF всё равно возьмёт serializer.instance для .data,
-        # так что на всякий случай оставим явное присвоение:
         serializer.instance = deal
 
+
+# ===== PAY (создаём DealPayment + обновляем installment) =====
 
 class ClientDealPayAPIView(APIView, CompanyBranchRestrictedMixin):
     """
     POST /api/main/deals/<uuid:pk>/pay/
     POST /api/main/clients/<client_id>/deals/<uuid:pk>/pay/
 
-    Body (опционально):
-      {
-        "installment_number": 2,          номер взноса (если не указать — берётся первый не полностью оплаченный)
-        "amount": "5000.00",             сколько оплатил за этот период (если не указать — гасится весь взнос)
-        "date": "2025-11-10"             дата платежа (если не указать — сегодня)
-      }
+    body:
+    {
+      "installment_id": "<uuid>" | null,
+      "amount": "5000.00" | null,
+      "date": "2025-11-10" | null,
+      "idempotency_key": "<uuid>",   # ОБЯЗАТЕЛЬНО
+      "note": "..." | ""
+    }
     """
     permission_classes = [permissions.IsAuthenticated]
 
@@ -1432,9 +1459,9 @@ class ClientDealPayAPIView(APIView, CompanyBranchRestrictedMixin):
     def post(self, request, pk, *args, **kwargs):
         client_id = kwargs.get("client_id")
 
-        deal_qs = ClientDeal.objects.all()
-        deal_qs = self._filter_qs_company_branch(deal_qs)
-        deal_qs = deal_qs.filter(pk=pk)
+        deal_qs = self._filter_qs_company_branch(
+            ClientDeal.objects.select_related("client").prefetch_related(*_deal_prefetch())
+        ).filter(pk=pk)
 
         if client_id:
             deal_qs = deal_qs.filter(client_id=client_id)
@@ -1447,26 +1474,28 @@ class ClientDealPayAPIView(APIView, CompanyBranchRestrictedMixin):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        number = request.data.get("installment_number")
-        raw_amount = request.data.get("amount")
-        paid_amount = None
+        inp = DealPayInputSerializer(data=request.data)
+        inp.is_valid(raise_exception=True)
+        data = inp.validated_data
 
-        if raw_amount not in (None, ""):
-            try:
-                paid_amount = Decimal(str(raw_amount))
-            except Exception:
-                return Response({"amount": "Неверный формат суммы оплаты."}, status=status.HTTP_400_BAD_REQUEST)
-            if paid_amount <= 0:
-                return Response({"amount": "Сумма оплаты должна быть больше нуля."}, status=status.HTTP_400_BAD_REQUEST)
+        idem = data["idempotency_key"]
+        paid_date = data.get("date") or timezone.localdate()
+        note = data.get("note", "") or ""
+        amount = data.get("amount", None)
 
-        paid_date_str = request.data.get("date")
-        paid_date = parse_date(paid_date_str) if paid_date_str else timezone.localdate()
+        # идемпотентность
+        if DealPayment.objects.filter(deal=deal, idempotency_key=idem).exists():
+            fresh = ClientDeal.objects.select_related("client").prefetch_related(*_deal_prefetch()).get(pk=deal.pk)
+            return Response(ClientDealSerializer(fresh, context={"request": request}).data, status=status.HTTP_200_OK)
 
-        if number:
-            inst = get_object_or_404(DealInstallment, deal=deal, number=number)
+        inst_qs = DealInstallment.objects.select_for_update().filter(deal=deal)
+
+        inst_id = data.get("installment_id")
+        if inst_id:
+            inst = get_object_or_404(inst_qs, id=inst_id)
         else:
             inst = (
-                deal.installments
+                inst_qs
                 .filter(paid_amount__lt=F("amount"))
                 .order_by("number")
                 .first()
@@ -1474,61 +1503,76 @@ class ClientDealPayAPIView(APIView, CompanyBranchRestrictedMixin):
             if not inst:
                 return Response({"detail": "Все взносы уже полностью оплачены."}, status=status.HTTP_400_BAD_REQUEST)
 
-        current_paid = inst.paid_amount or Decimal("0")
-        total_amount = inst.amount or Decimal("0")
-        remaining = (total_amount - current_paid).quantize(Decimal("0.01"))
+        total = (inst.amount or Decimal("0")).quantize(Decimal("0.01"))
+        current_paid = (inst.paid_amount or Decimal("0")).quantize(Decimal("0.01"))
+        remaining = (total - current_paid).quantize(Decimal("0.01"))
 
         if remaining <= 0:
-            return Response(
-                {"detail": f"Взнос №{inst.number} уже полностью оплачен."},
-                status=status.HTTP_400_BAD_REQUEST,
+            return Response({"detail": f"Взнос №{inst.number} уже полностью оплачен."}, status=status.HTTP_400_BAD_REQUEST)
+
+        pay_amt = remaining if amount is None else Decimal(str(amount)).quantize(Decimal("0.01"))
+        if pay_amt <= 0:
+            return Response({"amount": "Сумма оплаты должна быть больше нуля."}, status=status.HTTP_400_BAD_REQUEST)
+        if pay_amt > remaining:
+            return Response({"amount": f"Сумма оплаты превышает остаток. Максимум: {remaining}."}, status=status.HTTP_400_BAD_REQUEST)
+
+        # audit
+        try:
+            DealPayment.objects.create(
+                company=deal.company,
+                branch=deal.branch,
+                deal=deal,
+                installment=inst,
+                kind=DealPayment.Kind.PAY,
+                amount=pay_amt,
+                paid_date=paid_date,
+                idempotency_key=idem,
+                created_by=request.user,
+                note=note,
             )
+        except IntegrityError:
+            fresh = ClientDeal.objects.select_related("client").prefetch_related(*_deal_prefetch()).get(pk=deal.pk)
+            return Response(ClientDealSerializer(fresh, context={"request": request}).data, status=status.HTTP_200_OK)
 
-        if paid_amount is None:
-            paid_amount = remaining
-
-        if paid_amount > remaining:
-            return Response(
-                {"amount": f"Сумма оплаты превышает сумму взноса. Максимум: {remaining}."},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-
-        inst.paid_amount = (current_paid + paid_amount).quantize(Decimal("0.01"))
-        if inst.paid_amount >= total_amount:
+        # update installment
+        new_paid = (current_paid + pay_amt).quantize(Decimal("0.01"))
+        if new_paid >= total:
+            inst.paid_amount = total
             inst.paid_on = paid_date
-            inst.paid_amount = total_amount
+        else:
+            inst.paid_amount = new_paid
+            inst.paid_on = None
         inst.save(update_fields=["paid_amount", "paid_on"])
 
-        data = ClientDealSerializer(deal, context={"request": request}).data
-        return Response(data, status=status.HTTP_200_OK)
+        fresh = ClientDeal.objects.select_related("client").prefetch_related(*_deal_prefetch()).get(pk=deal.pk)
+        return Response(ClientDealSerializer(fresh, context={"request": request}).data, status=status.HTTP_200_OK)
 
 
-class ClientDealUnpayAPIView(APIView, CompanyBranchRestrictedMixin):
+# ===== REFUND (создаём DealPayment refund + уменьшаем paid_amount) =====
+
+class ClientDealRefundAPIView(APIView, CompanyBranchRestrictedMixin):
     """
-    POST /api/main/deals/<uuid:pk>/unpay/
-    POST /api/main/clients/<client_id>/deals/<uuid:pk>/unpay/
+    POST /api/main/deals/<uuid:pk>/refund/
+    POST /api/main/clients/<client_id>/deals/<uuid:pk>/refund/
 
-    Body (опционально):
-      {
-        "installment_number": 2
-      }
-
-    Если указан номер — полностью очищает оплату по этому взносу (paid_amount=0, paid_on=NULL).
-    Если номер не указан — откатывает оплату по последнему оплаченному/частично оплаченному взносу.
+    body:
+    {
+      "installment_id": "<uuid>" | null,
+      "amount": "5000.00" | null,      # если null — вернуть всё по взносу
+      "date": "2025-11-10" | null,
+      "idempotency_key": "<uuid>",     # ОБЯЗАТЕЛЬНО
+      "note": "..." | ""
+    }
     """
     permission_classes = [permissions.IsAuthenticated]
 
     @transaction.atomic
     def post(self, request, pk, *args, **kwargs):
-        company = self._company()
-        if not company:
-            return Response({"detail": "Нет компании у пользователя."}, status=status.HTTP_403_FORBIDDEN)
-
         client_id = kwargs.get("client_id")
 
-        deal_qs = ClientDeal.objects.all()
-        deal_qs = self._filter_qs_company_branch(deal_qs)
-        deal_qs = deal_qs.filter(pk=pk)
+        deal_qs = self._filter_qs_company_branch(
+            ClientDeal.objects.select_related("client").prefetch_related(*_deal_prefetch())
+        ).filter(pk=pk)
 
         if client_id:
             deal_qs = deal_qs.filter(client_id=client_id)
@@ -1537,45 +1581,88 @@ class ClientDealUnpayAPIView(APIView, CompanyBranchRestrictedMixin):
 
         if deal.kind != ClientDeal.Kind.DEBT:
             return Response(
-                {"detail": "Отмена оплаты доступна только для сделок типа 'debt'."},
+                {"detail": "Возврат доступен только для сделок типа 'debt'."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        installment_number = request.data.get("installment_number")
+        inp = DealRefundInputSerializer(data=request.data)
+        inp.is_valid(raise_exception=True)
+        data = inp.validated_data
 
-        if installment_number:
-            inst = get_object_or_404(DealInstallment, deal=deal, number=installment_number)
-            if (inst.paid_amount or Decimal("0")) <= 0 and not inst.paid_on:
-                return Response(
-                    {"detail": f"Взнос №{installment_number} и так не оплачен."},
-                    status=status.HTTP_400_BAD_REQUEST,
-                )
+        idem = data["idempotency_key"]
+        paid_date = data.get("date") or timezone.localdate()
+        note = data.get("note", "") or ""
+        amount = data.get("amount", None)
+
+        if DealPayment.objects.filter(deal=deal, idempotency_key=idem).exists():
+            fresh = ClientDeal.objects.select_related("client").prefetch_related(*_deal_prefetch()).get(pk=deal.pk)
+            return Response(ClientDealSerializer(fresh, context={"request": request}).data, status=status.HTTP_200_OK)
+
+        inst_qs = DealInstallment.objects.select_for_update().filter(deal=deal)
+
+        inst_id = data.get("installment_id")
+        if inst_id:
+            inst = get_object_or_404(inst_qs, id=inst_id)
         else:
             inst = (
-                deal.installments
+                inst_qs
                 .filter(Q(paid_amount__gt=0) | Q(paid_on__isnull=False))
                 .order_by("-number")
                 .first()
             )
             if not inst:
-                return Response(
-                    {"detail": "Нет оплаченных взносов для отмены."},
-                    status=status.HTTP_400_BAD_REQUEST,
-                )
+                return Response({"detail": "Нет оплаченных взносов для возврата."}, status=status.HTTP_400_BAD_REQUEST)
 
-        inst.paid_amount = Decimal("0.00")
-        inst.paid_on = None
+        total = (inst.amount or Decimal("0")).quantize(Decimal("0.01"))
+        current_paid = (inst.paid_amount or Decimal("0")).quantize(Decimal("0.01"))
+
+        if current_paid <= 0:
+            return Response({"detail": "По этому взносу нечего возвращать."}, status=status.HTTP_400_BAD_REQUEST)
+
+        refund_amt = current_paid if amount is None else Decimal(str(amount)).quantize(Decimal("0.01"))
+        if refund_amt <= 0:
+            return Response({"amount": "Сумма возврата должна быть больше нуля."}, status=status.HTTP_400_BAD_REQUEST)
+        if refund_amt > current_paid:
+            return Response({"amount": f"Сумма возврата больше оплаченного. Максимум: {current_paid}."}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            DealPayment.objects.create(
+                company=deal.company,
+                branch=deal.branch,
+                deal=deal,
+                installment=inst,
+                kind=DealPayment.Kind.REFUND,
+                amount=refund_amt,
+                paid_date=paid_date,
+                idempotency_key=idem,
+                created_by=request.user,
+                note=note,
+            )
+        except IntegrityError:
+            fresh = ClientDeal.objects.select_related("client").prefetch_related(*_deal_prefetch()).get(pk=deal.pk)
+            return Response(ClientDealSerializer(fresh, context={"request": request}).data, status=status.HTTP_200_OK)
+
+        new_paid = (current_paid - refund_amt).quantize(Decimal("0.01"))
+        inst.paid_amount = new_paid
+
+        # если не полностью оплачен — paid_on не должен стоять
+        if new_paid < total:
+            inst.paid_on = None
+
         inst.save(update_fields=["paid_amount", "paid_on"])
 
-        data = ClientDealSerializer(deal, context={"request": request}).data
-        return Response(data, status=status.HTTP_200_OK)
+        fresh = ClientDeal.objects.select_related("client").prefetch_related(*_deal_prefetch()).get(pk=deal.pk)
+        return Response(ClientDealSerializer(fresh, context={"request": request}).data, status=status.HTTP_200_OK)
 
+
+# ===== Clients with debts =====
 
 class ClientWithDebtsListAPIView(CompanyBranchRestrictedMixin, generics.ListAPIView):
     serializer_class = ClientSerializer
 
     def get_queryset(self):
         qs = self._filter_qs_company_branch(Client.objects.all())
+        # unpaid = paid_on is null (включая частично оплаченные)
         qs = qs.filter(
             deals__kind=ClientDeal.Kind.DEBT,
             deals__installments__paid_on__isnull=True,

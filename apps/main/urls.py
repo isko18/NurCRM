@@ -85,23 +85,56 @@ urlpatterns = [
     
     path("clients/", ClientListCreateAPIView.as_view(), name="client-list"),
     path("clients/<uuid:pk>/", ClientRetrieveUpdateDestroyAPIView.as_view(), name="client-detail"),
-    path("clients/clients/with-debts/", ClientWithDebtsListAPIView.as_view(), name="client-with-debts"),
-    
+    path(
+        "clients/<uuid:client_id>/deals/",
+        ClientDealListCreateAPIView.as_view(),
+        name="client-deals-list-create",
+    ),
+    path(
+        "clients/<uuid:client_id>/deals/<uuid:pk>/",
+        ClientDealRetrieveUpdateDestroyAPIView.as_view(),
+        name="client-deals-detail",
+    ),
 
-    # Сделки клиента (тип: продажа/долг/предоплата)
-    path("clients/<uuid:client_id>/deals/", ClientDealListCreateAPIView.as_view(),
-         name="client-deals-list-create"),
-    path("clients/<uuid:client_id>/deals/<uuid:pk>/", ClientDealRetrieveUpdateDestroyAPIView.as_view(),
-         name="client-deals-detail"),
+    # pay/refund (nested)
+    path(
+        "clients/<uuid:client_id>/deals/<uuid:pk>/pay/",
+        ClientDealPayAPIView.as_view(),
+        name="client-deal-pay",
+    ),
+    path(
+        "clients/<uuid:client_id>/deals/<uuid:pk>/refund/",
+        ClientDealRefundAPIView.as_view(),
+        name="client-deal-refund",
+    ),
 
-    # flat
+    # ✅ legacy alias: unpay -> refund (вернёт всё по последнему/указанному взносу)
+    path(
+        "clients/<uuid:client_id>/deals/<uuid:pk>/unpay/",
+        ClientDealRefundAPIView.as_view(),
+        name="client-deal-unpay",
+    ),
+
+    # ===== flat =====
     path("clientdeals/", ClientDealListCreateAPIView.as_view(), name="deal-list-create"),
-    path("deals/<uuid:pk>/unpay/", ClientDealUnpayAPIView.as_view()),
-    path("clients/<uuid:client_id>/deals/<uuid:pk>/unpay/", ClientDealUnpayAPIView.as_view()),
+    path("clientdeals/<uuid:pk>/", ClientDealRetrieveUpdateDestroyAPIView.as_view(), name="deal-detail"),
 
-    path("clientdeals/<uuid:pk>/pay/", ClientDealPayAPIView.as_view(), name="deal-pay-create"),
-    path("clients/<uuid:client_id>/reconciliation/",ClientReconciliationClassicAPIView.as_view(),
-name="client-reconciliation",),
+    path("clientdeals/<uuid:pk>/pay/", ClientDealPayAPIView.as_view(), name="deal-pay"),
+    path("clientdeals/<uuid:pk>/refund/", ClientDealRefundAPIView.as_view(), name="deal-refund"),
+
+    # ✅ legacy alias: unpay -> refund
+    path("clientdeals/<uuid:pk>/unpay/", ClientDealRefundAPIView.as_view(), name="deal-unpay"),
+
+    # ✅ если у тебя где-то уже был такой путь — оставь как алиас тоже
+    path("deals/<uuid:pk>/unpay/", ClientDealRefundAPIView.as_view(), name="deal-unpay-legacy"),
+
+    # ===== extra =====
+    path("clients/with-debts/", ClientWithDebtsListAPIView.as_view(), name="clients-with-debts"),
+    path(
+        "clients/<uuid:client_id>/reconciliation/",
+        ClientReconciliationClassicAPIView.as_view(),
+        name="client-reconciliation",
+    ),
     
     
     path("pos/sales/", SaleListAPIView.as_view(), name="pos-sale-list"),
