@@ -1216,11 +1216,11 @@ class DealInstallmentSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSer
     branch = serializers.ReadOnlyField(source="branch.id")
     deal = serializers.ReadOnlyField(source="deal.id")
 
+    # ВАЖНО: source НЕ НУЖЕН, потому что имя поля совпадает с property модели
     remaining_for_period = serializers.DecimalField(
         max_digits=12,
         decimal_places=2,
         read_only=True,
-        source="remaining_for_period",
     )
 
     class Meta:
@@ -1241,6 +1241,7 @@ class DealInstallmentSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSer
         read_only_fields = fields
 
 
+# ===== Payments =====
 class DealPaymentSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
     company = serializers.ReadOnlyField(source="company.id")
     branch = serializers.ReadOnlyField(source="branch.id")
@@ -1271,11 +1272,12 @@ class DealPaymentSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSeriali
         read_only_fields = fields
 
 
+# ===== Deals =====
 class ClientDealSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
     company = serializers.ReadOnlyField(source="company.id")
     branch = serializers.ReadOnlyField(source="branch.id")
 
-    # client может прийти из URL /clients/<client_id>/deals/ -> поэтому required=False
+    # client может прийти из URL /clients/<client_id>/deals/ -> required=False
     client = serializers.PrimaryKeyRelatedField(queryset=Client.objects.all(), required=False)
     client_full_name = serializers.CharField(source="client.full_name", read_only=True)
 
@@ -1329,7 +1331,7 @@ class ClientDealSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializ
         branch = self._auto_branch()
         instance = getattr(self, "instance", None)
 
-        # ===== client обязателен, если не передан через URL =====
+        # client обязателен, если не передан через URL
         view = self.context.get("view")
         client_id_from_url = getattr(view, "kwargs", {}).get("client_id") if view else None
 
@@ -1338,7 +1340,7 @@ class ClientDealSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializ
         if not client and not client_id_from_url:
             raise serializers.ValidationError({"client": "Укажите клиента."})
 
-        # ===== scope проверки клиента (компания/филиал) =====
+        # scope проверки клиента (компания/филиал)
         if client:
             if client.company_id != company.id:
                 raise serializers.ValidationError({"client": "Клиент принадлежит другой компании."})
@@ -1347,14 +1349,16 @@ class ClientDealSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializ
             if branch is not None and client.branch_id not in (None, branch.id):
                 raise serializers.ValidationError({"client": "Клиент другого филиала."})
 
-        # ===== прод: если уже есть платежи — условия сделки нельзя менять =====
+        # прод: если уже есть платежи — условия сделки нельзя менять
         if instance and instance.pk and instance.payments.exists():
             allowed = {"title", "note"}  # максимально безопасно
             illegal = [k for k in attrs.keys() if k not in allowed]
             if illegal:
                 raise serializers.ValidationError({
-                    "detail": "Нельзя менять тип/суммы/срок/дату/график: по сделке уже есть платежи. "
-                              "Разрешено менять только title и note."
+                    "detail": (
+                        "Нельзя менять тип/суммы/срок/дату/график: по сделке уже есть платежи. "
+                        "Разрешено менять только title и note."
+                    )
                 })
 
         amount = attrs.get("amount", getattr(instance, "amount", None))
@@ -1388,8 +1392,10 @@ class ClientDealSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializ
 
         return attrs
 
+
+# ===== Inputs for pay/refund endpoints =====
 class DealPayInputSerializer(serializers.Serializer):
-    installment_id = serializers.UUIDField(required=False)   # если нет — возьмём первый не полностью оплаченный
+    installment_id = serializers.UUIDField(required=False)  # если нет — возьмём первый не полностью оплаченный
     amount = serializers.DecimalField(max_digits=12, decimal_places=2, required=False)
     date = serializers.DateField(required=False)
     idempotency_key = serializers.UUIDField(required=True)
@@ -1397,7 +1403,7 @@ class DealPayInputSerializer(serializers.Serializer):
 
 
 class DealRefundInputSerializer(serializers.Serializer):
-    installment_id = serializers.UUIDField(required=False)   # если нет — возьмём последний оплаченный/частично
+    installment_id = serializers.UUIDField(required=False)  # если нет — возьмём последний оплаченный/частично
     amount = serializers.DecimalField(max_digits=12, decimal_places=2, required=False)  # если нет — вернём всё
     date = serializers.DateField(required=False)
     idempotency_key = serializers.UUIDField(required=True)
