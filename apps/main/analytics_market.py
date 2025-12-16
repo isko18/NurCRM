@@ -778,235 +778,235 @@ class AnalyticsView(APIView):
     # ─────────────────────────────────────────────────────────
     # SHIFTS
     # ─────────────────────────────────────────────────────────
-def _shifts(self, company, branch, period: Period):
-    z = Decimal("0.00")
+    def _shifts(self, company, branch, period: Period):
+        z = Decimal("0.00")
 
-    # ===== filters from query =====
-    qp = self.request.query_params
-    cashbox_id = qp.get("cashbox") or None
-    cashier_id = qp.get("cashier") or None
-    status = (qp.get("status") or "").lower() or None  # open|closed|None
+        # ===== filters from query =====
+        qp = self.request.query_params
+        cashbox_id = qp.get("cashbox") or None
+        cashier_id = qp.get("cashier") or None
+        status = (qp.get("status") or "").lower() or None  # open|closed|None
 
-    qs = CashShift.objects.filter(company=company)
-    if branch is not None:
-        qs = qs.filter(branch=branch)
+        qs = CashShift.objects.filter(company=company)
+        if branch is not None:
+            qs = qs.filter(branch=branch)
 
-    if cashbox_id:
-        qs = qs.filter(cashbox_id=cashbox_id)
-    if cashier_id:
-        qs = qs.filter(cashier_id=cashier_id)
-    if status in ("open", "closed"):
-        qs = qs.filter(status=status)
-
-    # cards
-    active_cnt = qs.filter(status=CashShift.Status.OPEN).count()
-
-    today = timezone.localdate()
-    start_today = timezone.make_aware(datetime.combine(today, time.min))
-    end_today = start_today + timedelta(days=1)
-    today_cnt = qs.filter(opened_at__gte=start_today, opened_at__lt=end_today).count()
-
-    period_qs = qs.filter(opened_at__gte=period.start, opened_at__lt=period.end)
-
-    closed = period_qs.filter(status=CashShift.Status.CLOSED).exclude(closed_at__isnull=True)
-    avg_duration_hours = None
-    durations = []
-    for r in closed.values("opened_at", "closed_at"):
-        if r["opened_at"] and r["closed_at"]:
-            durations.append((r["closed_at"] - r["opened_at"]).total_seconds())
-    if durations:
-        avg_sec = sum(durations) / len(durations)
-        avg_duration_hours = round(avg_sec / 3600, 1)
-
-    # revenue total for period (for avg_revenue_per_shift card)
-    revenue_total = z
-    if SALE_MODEL is not None and _model_has_field(SALE_MODEL, "shift"):
-        paid_value = getattr(getattr(SALE_MODEL, "Status", None), "PAID", None) or "paid"
-        dt_field = "paid_at" if _model_has_field(SALE_MODEL, "paid_at") else "created_at"
-
-        sqs = SALE_MODEL.objects.filter(company=company, status=paid_value)
-        if branch is not None and _model_has_field(SALE_MODEL, "branch"):
-            sqs = sqs.filter(branch=branch)
-
-        # если sales должны подчиняться фильтрам cashbox/cashier
-        if cashbox_id and _model_has_field(SALE_MODEL, "cashbox"):
-            sqs = sqs.filter(cashbox_id=cashbox_id)
+        if cashbox_id:
+            qs = qs.filter(cashbox_id=cashbox_id)
         if cashier_id:
-            # sale.user может быть, но у тебя продажи жёстко завязаны на shift.cashier.
-            # поэтому фильтруем через shift__cashier_id (если есть shift)
-            sqs = sqs.filter(shift__cashier_id=cashier_id)
+            qs = qs.filter(cashier_id=cashier_id)
+        if status in ("open", "closed"):
+            qs = qs.filter(status=status)
 
-        sqs = sqs.filter(**{f"{dt_field}__gte": period.start, f"{dt_field}__lt": period.end})
-        revenue_total = sqs.aggregate(v=Coalesce(Sum("total"), Value(z)))["v"] or z
+        # cards
+        active_cnt = qs.filter(status=CashShift.Status.OPEN).count()
 
-    shifts_cnt = period_qs.count() or 1
-    avg_revenue_per_shift = _safe_div(_money(revenue_total), shifts_cnt)
+        today = timezone.localdate()
+        start_today = timezone.make_aware(datetime.combine(today, time.min))
+        end_today = start_today + timedelta(days=1)
+        today_cnt = qs.filter(opened_at__gte=start_today, opened_at__lt=end_today).count()
 
-    # bucket revenue by shift open time (period)
-    def bucket(h: int) -> str:
-        if 6 <= h < 12:
-            return "morning"
-        if 12 <= h < 18:
-            return "day"
-        return "evening"
+        period_qs = qs.filter(opened_at__gte=period.start, opened_at__lt=period.end)
 
-    bucket_map = {
-        "morning": {"revenue": z, "transactions": 0},
-        "day": {"revenue": z, "transactions": 0},
-        "evening": {"revenue": z, "transactions": 0},
-    }
+        closed = period_qs.filter(status=CashShift.Status.CLOSED).exclude(closed_at__isnull=True)
+        avg_duration_hours = None
+        durations = []
+        for r in closed.values("opened_at", "closed_at"):
+            if r["opened_at"] and r["closed_at"]:
+                durations.append((r["closed_at"] - r["opened_at"]).total_seconds())
+        if durations:
+            avg_sec = sum(durations) / len(durations)
+            avg_duration_hours = round(avg_sec / 3600, 1)
 
-    if SALE_MODEL is not None and _model_has_field(SALE_MODEL, "shift"):
-        paid_value = getattr(getattr(SALE_MODEL, "Status", None), "PAID", None) or "paid"
-        dt_field = "paid_at" if _model_has_field(SALE_MODEL, "paid_at") else "created_at"
+        # revenue total for period (for avg_revenue_per_shift card)
+        revenue_total = z
+        if SALE_MODEL is not None and _model_has_field(SALE_MODEL, "shift"):
+            paid_value = getattr(getattr(SALE_MODEL, "Status", None), "PAID", None) or "paid"
+            dt_field = "paid_at" if _model_has_field(SALE_MODEL, "paid_at") else "created_at"
 
-        sqs = SALE_MODEL.objects.filter(company=company, status=paid_value)
-        if branch is not None and _model_has_field(SALE_MODEL, "branch"):
-            sqs = sqs.filter(branch=branch)
+            sqs = SALE_MODEL.objects.filter(company=company, status=paid_value)
+            if branch is not None and _model_has_field(SALE_MODEL, "branch"):
+                sqs = sqs.filter(branch=branch)
 
-        if cashbox_id and _model_has_field(SALE_MODEL, "cashbox"):
-            sqs = sqs.filter(cashbox_id=cashbox_id)
+            # если sales должны подчиняться фильтрам cashbox/cashier
+            if cashbox_id and _model_has_field(SALE_MODEL, "cashbox"):
+                sqs = sqs.filter(cashbox_id=cashbox_id)
+            if cashier_id:
+                # sale.user может быть, но у тебя продажи жёстко завязаны на shift.cashier.
+                # поэтому фильтруем через shift__cashier_id (если есть shift)
+                sqs = sqs.filter(shift__cashier_id=cashier_id)
+
+            sqs = sqs.filter(**{f"{dt_field}__gte": period.start, f"{dt_field}__lt": period.end})
+            revenue_total = sqs.aggregate(v=Coalesce(Sum("total"), Value(z)))["v"] or z
+
+        shifts_cnt = period_qs.count() or 1
+        avg_revenue_per_shift = _safe_div(_money(revenue_total), shifts_cnt)
+
+        # bucket revenue by shift open time (period)
+        def bucket(h: int) -> str:
+            if 6 <= h < 12:
+                return "morning"
+            if 12 <= h < 18:
+                return "day"
+            return "evening"
+
+        bucket_map = {
+            "morning": {"revenue": z, "transactions": 0},
+            "day": {"revenue": z, "transactions": 0},
+            "evening": {"revenue": z, "transactions": 0},
+        }
+
+        if SALE_MODEL is not None and _model_has_field(SALE_MODEL, "shift"):
+            paid_value = getattr(getattr(SALE_MODEL, "Status", None), "PAID", None) or "paid"
+            dt_field = "paid_at" if _model_has_field(SALE_MODEL, "paid_at") else "created_at"
+
+            sqs = SALE_MODEL.objects.filter(company=company, status=paid_value)
+            if branch is not None and _model_has_field(SALE_MODEL, "branch"):
+                sqs = sqs.filter(branch=branch)
+
+            if cashbox_id and _model_has_field(SALE_MODEL, "cashbox"):
+                sqs = sqs.filter(cashbox_id=cashbox_id)
+            if cashier_id:
+                sqs = sqs.filter(shift__cashier_id=cashier_id)
+
+            sqs = sqs.filter(**{f"{dt_field}__gte": period.start, f"{dt_field}__lt": period.end})
+
+            sale_rows = sqs.values("total", "shift__opened_at")
+            for r in sale_rows:
+                o = r.get("shift__opened_at")
+                if not o:
+                    continue
+                b = bucket(int(o.hour))
+                bucket_map[b]["revenue"] += Decimal(r.get("total") or 0)
+                bucket_map[b]["transactions"] += 1
+
+        sales_by_shift_bucket = [
+            {"name": "Утро", "key": "morning", "revenue": str(_money(bucket_map["morning"]["revenue"])), "transactions": bucket_map["morning"]["transactions"]},
+            {"name": "День", "key": "day", "revenue": str(_money(bucket_map["day"]["revenue"])), "transactions": bucket_map["day"]["transactions"]},
+            {"name": "Вечер", "key": "evening", "revenue": str(_money(bucket_map["evening"]["revenue"])), "transactions": bucket_map["evening"]["transactions"]},
+        ]
+
+        # ===== active shifts table + SALES FIX =====
+        active_rows = []
+        act_qs = CashShift.objects.filter(company=company, status=CashShift.Status.OPEN)
+        if branch is not None:
+            act_qs = act_qs.filter(branch=branch)
+        if cashbox_id:
+            act_qs = act_qs.filter(cashbox_id=cashbox_id)
         if cashier_id:
-            sqs = sqs.filter(shift__cashier_id=cashier_id)
+            act_qs = act_qs.filter(cashier_id=cashier_id)
 
-        sqs = sqs.filter(**{f"{dt_field}__gte": period.start, f"{dt_field}__lt": period.end})
-
-        sale_rows = sqs.values("total", "shift__opened_at")
-        for r in sale_rows:
-            o = r.get("shift__opened_at")
-            if not o:
-                continue
-            b = bucket(int(o.hour))
-            bucket_map[b]["revenue"] += Decimal(r.get("total") or 0)
-            bucket_map[b]["transactions"] += 1
-
-    sales_by_shift_bucket = [
-        {"name": "Утро", "key": "morning", "revenue": str(_money(bucket_map["morning"]["revenue"])), "transactions": bucket_map["morning"]["transactions"]},
-        {"name": "День", "key": "day", "revenue": str(_money(bucket_map["day"]["revenue"])), "transactions": bucket_map["day"]["transactions"]},
-        {"name": "Вечер", "key": "evening", "revenue": str(_money(bucket_map["evening"]["revenue"])), "transactions": bucket_map["evening"]["transactions"]},
-    ]
-
-    # ===== active shifts table + SALES FIX =====
-    active_rows = []
-    act_qs = CashShift.objects.filter(company=company, status=CashShift.Status.OPEN)
-    if branch is not None:
-        act_qs = act_qs.filter(branch=branch)
-    if cashbox_id:
-        act_qs = act_qs.filter(cashbox_id=cashbox_id)
-    if cashier_id:
-        act_qs = act_qs.filter(cashier_id=cashier_id)
-
-    act = (
-        act_qs.select_related("cashier", "cashbox")
-        .order_by("-opened_at")[:50]
-    )
-
-    act_ids = [s.id for s in act]
-
-    shift_sales_map = {}  # shift_id -> Decimal(sum)
-    if act_ids and SALE_MODEL is not None and _model_has_field(SALE_MODEL, "shift"):
-        paid_value = getattr(getattr(SALE_MODEL, "Status", None), "PAID", None) or "paid"
-        sale_qs = SALE_MODEL.objects.filter(company=company, status=paid_value, shift_id__in=act_ids)
-
-        if branch is not None and _model_has_field(SALE_MODEL, "branch"):
-            sale_qs = sale_qs.filter(branch=branch)
-
-        # если sale хранит cashbox — дополнительно можно ограничить
-        if cashbox_id and _model_has_field(SALE_MODEL, "cashbox"):
-            sale_qs = sale_qs.filter(cashbox_id=cashbox_id)
-
-        rows = (
-            sale_qs.values("shift_id")
-            .annotate(rev=Coalesce(Sum("total"), Value(z)))
-        )
-        shift_sales_map = {r["shift_id"]: _money(r["rev"] or z) for r in rows}
-
-    for sh in act:
-        cb_name = getattr(sh.cashbox, "name", None) or f"Касса {sh.cashbox_id}"
-        opened = timezone.localtime(sh.opened_at).isoformat() if sh.opened_at else None
-        sales_sum = shift_sales_map.get(sh.id, z)
-
-        active_rows.append({
-            "cashier": _user_label(sh.cashier),
-            "cashbox": cb_name,
-            "opened_at": opened,
-            "sales": str(_money(sales_sum)),
-            "status": "open",
-        })
-
-    # best cashiers (period)
-    best_cashiers = []
-    if SALE_MODEL is not None and _model_has_field(SALE_MODEL, "shift"):
-        paid_value = getattr(getattr(SALE_MODEL, "Status", None), "PAID", None) or "paid"
-        dt_field = "paid_at" if _model_has_field(SALE_MODEL, "paid_at") else "created_at"
-
-        sqs = SALE_MODEL.objects.filter(company=company, status=paid_value)
-        if branch is not None and _model_has_field(SALE_MODEL, "branch"):
-            sqs = sqs.filter(branch=branch)
-
-        if cashbox_id and _model_has_field(SALE_MODEL, "cashbox"):
-            sqs = sqs.filter(cashbox_id=cashbox_id)
-        if cashier_id:
-            sqs = sqs.filter(shift__cashier_id=cashier_id)
-
-        sqs = sqs.filter(**{f"{dt_field}__gte": period.start, f"{dt_field}__lt": period.end})
-
-        rows = (
-            sqs.values(
-                "shift__cashier_id",
-                "shift__cashier__first_name",
-                "shift__cashier__last_name",
-                "shift__cashier__email",
-                "shift__cashier__phone_number",
-            )
-            .annotate(
-                revenue=Coalesce(Sum("total"), Value(z)),
-                tx=Count("id"),
-                shifts=Count("shift_id", distinct=True),
-            )
-            .order_by("-revenue")[:10]
+        act = (
+            act_qs.select_related("cashier", "cashbox")
+            .order_by("-opened_at")[:50]
         )
 
-        for i, r in enumerate(rows, start=1):
-            rev = _money(r["revenue"] or z)
-            txc = int(r["tx"] or 0)
-            best_cashiers.append({
-                "place": i,
-                "cashier": _user_label(
-                    None,
-                    first_name=r.get("shift__cashier__first_name"),
-                    last_name=r.get("shift__cashier__last_name"),
-                    email=r.get("shift__cashier__email"),
-                    phone=r.get("shift__cashier__phone_number"),
-                    user_id=r.get("shift__cashier_id"),
-                ),
-                "shifts": int(r["shifts"] or 0),
-                "sales": str(rev),
-                "avg_check": str(_safe_div(rev, txc)),
+        act_ids = [s.id for s in act]
+
+        shift_sales_map = {}  # shift_id -> Decimal(sum)
+        if act_ids and SALE_MODEL is not None and _model_has_field(SALE_MODEL, "shift"):
+            paid_value = getattr(getattr(SALE_MODEL, "Status", None), "PAID", None) or "paid"
+            sale_qs = SALE_MODEL.objects.filter(company=company, status=paid_value, shift_id__in=act_ids)
+
+            if branch is not None and _model_has_field(SALE_MODEL, "branch"):
+                sale_qs = sale_qs.filter(branch=branch)
+
+            # если sale хранит cashbox — дополнительно можно ограничить
+            if cashbox_id and _model_has_field(SALE_MODEL, "cashbox"):
+                sale_qs = sale_qs.filter(cashbox_id=cashbox_id)
+
+            rows = (
+                sale_qs.values("shift_id")
+                .annotate(rev=Coalesce(Sum("total"), Value(z)))
+            )
+            shift_sales_map = {r["shift_id"]: _money(r["rev"] or z) for r in rows}
+
+        for sh in act:
+            cb_name = getattr(sh.cashbox, "name", None) or f"Касса {sh.cashbox_id}"
+            opened = timezone.localtime(sh.opened_at).isoformat() if sh.opened_at else None
+            sales_sum = shift_sales_map.get(sh.id, z)
+
+            active_rows.append({
+                "cashier": _user_label(sh.cashier),
+                "cashbox": cb_name,
+                "opened_at": opened,
+                "sales": str(_money(sales_sum)),
+                "status": "open",
             })
 
-    return {
-        "tab": "shifts",
-        "period": {"from": period.start.isoformat(), "to": period.end.isoformat()},
-        "filters": {
-            "branch": str(branch.id) if branch else None,
-            "include_global": bool(self.request.query_params.get("include_global") in ("1", "true", "True")),
-            "cashbox": cashbox_id,
-            "cashier": cashier_id,
-            "status": status,
-        },
-        "cards": {
-            "active_shifts": active_cnt,
-            "shifts_today": today_cnt,
-            "avg_duration_hours": avg_duration_hours,
-            "avg_revenue_per_shift": str(_money(avg_revenue_per_shift)),
-        },
-        "charts": {
-            "sales_by_shift_bucket": sales_by_shift_bucket,
-        },
-        "tables": {
-            "active_shifts": active_rows,
-            "best_cashiers": best_cashiers,
-        },
-    }
+        # best cashiers (period)
+        best_cashiers = []
+        if SALE_MODEL is not None and _model_has_field(SALE_MODEL, "shift"):
+            paid_value = getattr(getattr(SALE_MODEL, "Status", None), "PAID", None) or "paid"
+            dt_field = "paid_at" if _model_has_field(SALE_MODEL, "paid_at") else "created_at"
+
+            sqs = SALE_MODEL.objects.filter(company=company, status=paid_value)
+            if branch is not None and _model_has_field(SALE_MODEL, "branch"):
+                sqs = sqs.filter(branch=branch)
+
+            if cashbox_id and _model_has_field(SALE_MODEL, "cashbox"):
+                sqs = sqs.filter(cashbox_id=cashbox_id)
+            if cashier_id:
+                sqs = sqs.filter(shift__cashier_id=cashier_id)
+
+            sqs = sqs.filter(**{f"{dt_field}__gte": period.start, f"{dt_field}__lt": period.end})
+
+            rows = (
+                sqs.values(
+                    "shift__cashier_id",
+                    "shift__cashier__first_name",
+                    "shift__cashier__last_name",
+                    "shift__cashier__email",
+                    "shift__cashier__phone_number",
+                )
+                .annotate(
+                    revenue=Coalesce(Sum("total"), Value(z)),
+                    tx=Count("id"),
+                    shifts=Count("shift_id", distinct=True),
+                )
+                .order_by("-revenue")[:10]
+            )
+
+            for i, r in enumerate(rows, start=1):
+                rev = _money(r["revenue"] or z)
+                txc = int(r["tx"] or 0)
+                best_cashiers.append({
+                    "place": i,
+                    "cashier": _user_label(
+                        None,
+                        first_name=r.get("shift__cashier__first_name"),
+                        last_name=r.get("shift__cashier__last_name"),
+                        email=r.get("shift__cashier__email"),
+                        phone=r.get("shift__cashier__phone_number"),
+                        user_id=r.get("shift__cashier_id"),
+                    ),
+                    "shifts": int(r["shifts"] or 0),
+                    "sales": str(rev),
+                    "avg_check": str(_safe_div(rev, txc)),
+                })
+
+        return {
+            "tab": "shifts",
+            "period": {"from": period.start.isoformat(), "to": period.end.isoformat()},
+            "filters": {
+                "branch": str(branch.id) if branch else None,
+                "include_global": bool(self.request.query_params.get("include_global") in ("1", "true", "True")),
+                "cashbox": cashbox_id,
+                "cashier": cashier_id,
+                "status": status,
+            },
+            "cards": {
+                "active_shifts": active_cnt,
+                "shifts_today": today_cnt,
+                "avg_duration_hours": avg_duration_hours,
+                "avg_revenue_per_shift": str(_money(avg_revenue_per_shift)),
+            },
+            "charts": {
+                "sales_by_shift_bucket": sales_by_shift_bucket,
+            },
+            "tables": {
+                "active_shifts": active_rows,
+                "best_cashiers": best_cashiers,
+            },
+        }
 
