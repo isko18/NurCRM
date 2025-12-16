@@ -778,11 +778,13 @@ class AnalyticsView(APIView):
     # ─────────────────────────────────────────────────────────
     # SHIFTS
     # ─────────────────────────────────────────────────────────
-    def _shifts(self, company, branch, period: Period):
+    def _shifts(self, request, company, branch, period: Period):
         z = Decimal("0.00")
 
+        Sale, _SaleItem = get_sale_models()
+
         # ===== filters from query =====
-        qp = self.request.query_params
+        qp = request.query_params
         cashbox_id = qp.get("cashbox") or None
         cashier_id = qp.get("cashier") or None
         status = (qp.get("status") or "").lower() or None  # open|closed|None
@@ -818,25 +820,30 @@ class AnalyticsView(APIView):
             avg_sec = sum(durations) / len(durations)
             avg_duration_hours = round(avg_sec / 3600, 1)
 
-        # revenue total for period (for avg_revenue_per_shift card)
+        # revenue total for period (avg_revenue_per_shift)
         revenue_total = z
-        if SALE_MODEL is not None and _model_has_field(SALE_MODEL, "shift"):
-            paid_value = getattr(getattr(SALE_MODEL, "Status", None), "PAID", None) or "paid"
-            dt_field = "paid_at" if _model_has_field(SALE_MODEL, "paid_at") else "created_at"
+        if Sale is not None and _model_has_field(Sale, "shift"):
+            paid_value = _choice_value(Sale, "Status", "PAID", "paid")
+            dt_field = "paid_at" if _model_has_field(Sale, "paid_at") else "created_at"
 
-            sqs = SALE_MODEL.objects.filter(company=company, status=paid_value)
-            if branch is not None and _model_has_field(SALE_MODEL, "branch"):
-                sqs = sqs.filter(branch=branch)
+            sqs = Sale.objects.filter(company=company, status=paid_value)
 
-            # если sales должны подчиняться фильтрам cashbox/cashier
-            if cashbox_id and _model_has_field(SALE_MODEL, "cashbox"):
+            if branch is not None and _model_has_field(Sale, "branch"):
+                if self._include_global(request):
+                    sqs = sqs.filter(Q(branch=branch) | Q(branch__isnull=True))
+                else:
+                    sqs = sqs.filter(branch=branch)
+
+            if cashbox_id and _model_has_field(Sale, "cashbox"):
                 sqs = sqs.filter(cashbox_id=cashbox_id)
             if cashier_id:
-                # sale.user может быть, но у тебя продажи жёстко завязаны на shift.cashier.
-                # поэтому фильтруем через shift__cashier_id (если есть shift)
-                sqs = sqs.filter(shift__cashier_id=cashier_id)
+                if _model_has_field(Sale, "user"):
+                    sqs = sqs.filter(user_id=cashier_id)
+                else:
+                    sqs = sqs.filter(shift__cashier_id=cashier_id)
 
             sqs = sqs.filter(**{f"{dt_field}__gte": period.start, f"{dt_field}__lt": period.end})
+
             revenue_total = sqs.aggregate(v=Coalesce(Sum("total"), Value(z)))["v"] or z
 
         shifts_cnt = period_qs.count() or 1
@@ -856,23 +863,29 @@ class AnalyticsView(APIView):
             "evening": {"revenue": z, "transactions": 0},
         }
 
-        if SALE_MODEL is not None and _model_has_field(SALE_MODEL, "shift"):
-            paid_value = getattr(getattr(SALE_MODEL, "Status", None), "PAID", None) or "paid"
-            dt_field = "paid_at" if _model_has_field(SALE_MODEL, "paid_at") else "created_at"
+        if Sale is not None and _model_has_field(Sale, "shift"):
+            paid_value = _choice_value(Sale, "Status", "PAID", "paid")
+            dt_field = "paid_at" if _model_has_field(Sale, "paid_at") else "created_at"
 
-            sqs = SALE_MODEL.objects.filter(company=company, status=paid_value)
-            if branch is not None and _model_has_field(SALE_MODEL, "branch"):
-                sqs = sqs.filter(branch=branch)
+            sqs = Sale.objects.filter(company=company, status=paid_value)
 
-            if cashbox_id and _model_has_field(SALE_MODEL, "cashbox"):
+            if branch is not None and _model_has_field(Sale, "branch"):
+                if self._include_global(request):
+                    sqs = sqs.filter(Q(branch=branch) | Q(branch__isnull=True))
+                else:
+                    sqs = sqs.filter(branch=branch)
+
+            if cashbox_id and _model_has_field(Sale, "cashbox"):
                 sqs = sqs.filter(cashbox_id=cashbox_id)
             if cashier_id:
-                sqs = sqs.filter(shift__cashier_id=cashier_id)
+                if _model_has_field(Sale, "user"):
+                    sqs = sqs.filter(user_id=cashier_id)
+                else:
+                    sqs = sqs.filter(shift__cashier_id=cashier_id)
 
             sqs = sqs.filter(**{f"{dt_field}__gte": period.start, f"{dt_field}__lt": period.end})
 
-            sale_rows = sqs.values("total", "shift__opened_at")
-            for r in sale_rows:
+            for r in sqs.values("total", "shift__opened_at"):
                 o = r.get("shift__opened_at")
                 if not o:
                     continue
@@ -886,9 +899,10 @@ class AnalyticsView(APIView):
             {"name": "Вечер", "key": "evening", "revenue": str(_money(bucket_map["evening"]["revenue"])), "transactions": bucket_map["evening"]["transactions"]},
         ]
 
-        # ===== active shifts table + SALES FIX =====
+        # ===== active shifts table + SALES (fixed) =====
         active_rows = []
         act_qs = CashShift.objects.filter(company=company, status=CashShift.Status.OPEN)
+
         if branch is not None:
             act_qs = act_qs.filter(branch=branch)
         if cashbox_id:
@@ -896,29 +910,25 @@ class AnalyticsView(APIView):
         if cashier_id:
             act_qs = act_qs.filter(cashier_id=cashier_id)
 
-        act = (
-            act_qs.select_related("cashier", "cashbox")
-            .order_by("-opened_at")[:50]
-        )
-
+        act = act_qs.select_related("cashier", "cashbox").order_by("-opened_at")[:50]
         act_ids = [s.id for s in act]
 
-        shift_sales_map = {}  # shift_id -> Decimal(sum)
-        if act_ids and SALE_MODEL is not None and _model_has_field(SALE_MODEL, "shift"):
-            paid_value = getattr(getattr(SALE_MODEL, "Status", None), "PAID", None) or "paid"
-            sale_qs = SALE_MODEL.objects.filter(company=company, status=paid_value, shift_id__in=act_ids)
+        shift_sales_map = {}
+        if act_ids and Sale is not None and _model_has_field(Sale, "shift"):
+            paid_value = _choice_value(Sale, "Status", "PAID", "paid")
 
-            if branch is not None and _model_has_field(SALE_MODEL, "branch"):
-                sale_qs = sale_qs.filter(branch=branch)
+            sale_qs = Sale.objects.filter(company=company, status=paid_value, shift_id__in=act_ids)
 
-            # если sale хранит cashbox — дополнительно можно ограничить
-            if cashbox_id and _model_has_field(SALE_MODEL, "cashbox"):
+            if branch is not None and _model_has_field(Sale, "branch"):
+                if self._include_global(request):
+                    sale_qs = sale_qs.filter(Q(branch=branch) | Q(branch__isnull=True))
+                else:
+                    sale_qs = sale_qs.filter(branch=branch)
+
+            if cashbox_id and _model_has_field(Sale, "cashbox"):
                 sale_qs = sale_qs.filter(cashbox_id=cashbox_id)
 
-            rows = (
-                sale_qs.values("shift_id")
-                .annotate(rev=Coalesce(Sum("total"), Value(z)))
-            )
+            rows = sale_qs.values("shift_id").annotate(rev=Coalesce(Sum("total"), Value(z)))
             shift_sales_map = {r["shift_id"]: _money(r["rev"] or z) for r in rows}
 
         for sh in act:
@@ -936,18 +946,25 @@ class AnalyticsView(APIView):
 
         # best cashiers (period)
         best_cashiers = []
-        if SALE_MODEL is not None and _model_has_field(SALE_MODEL, "shift"):
-            paid_value = getattr(getattr(SALE_MODEL, "Status", None), "PAID", None) or "paid"
-            dt_field = "paid_at" if _model_has_field(SALE_MODEL, "paid_at") else "created_at"
+        if Sale is not None and _model_has_field(Sale, "shift"):
+            paid_value = _choice_value(Sale, "Status", "PAID", "paid")
+            dt_field = "paid_at" if _model_has_field(Sale, "paid_at") else "created_at"
 
-            sqs = SALE_MODEL.objects.filter(company=company, status=paid_value)
-            if branch is not None and _model_has_field(SALE_MODEL, "branch"):
-                sqs = sqs.filter(branch=branch)
+            sqs = Sale.objects.filter(company=company, status=paid_value)
 
-            if cashbox_id and _model_has_field(SALE_MODEL, "cashbox"):
+            if branch is not None and _model_has_field(Sale, "branch"):
+                if self._include_global(request):
+                    sqs = sqs.filter(Q(branch=branch) | Q(branch__isnull=True))
+                else:
+                    sqs = sqs.filter(branch=branch)
+
+            if cashbox_id and _model_has_field(Sale, "cashbox"):
                 sqs = sqs.filter(cashbox_id=cashbox_id)
             if cashier_id:
-                sqs = sqs.filter(shift__cashier_id=cashier_id)
+                if _model_has_field(Sale, "user"):
+                    sqs = sqs.filter(user_id=cashier_id)
+                else:
+                    sqs = sqs.filter(shift__cashier_id=cashier_id)
 
             sqs = sqs.filter(**{f"{dt_field}__gte": period.start, f"{dt_field}__lt": period.end})
 
@@ -990,7 +1007,7 @@ class AnalyticsView(APIView):
             "period": {"from": period.start.isoformat(), "to": period.end.isoformat()},
             "filters": {
                 "branch": str(branch.id) if branch else None,
-                "include_global": bool(self.request.query_params.get("include_global") in ("1", "true", "True")),
+                "include_global": self._include_global(request),
                 "cashbox": cashbox_id,
                 "cashier": cashier_id,
                 "status": status,
@@ -1001,12 +1018,7 @@ class AnalyticsView(APIView):
                 "avg_duration_hours": avg_duration_hours,
                 "avg_revenue_per_shift": str(_money(avg_revenue_per_shift)),
             },
-            "charts": {
-                "sales_by_shift_bucket": sales_by_shift_bucket,
-            },
-            "tables": {
-                "active_shifts": active_rows,
-                "best_cashiers": best_cashiers,
-            },
+            "charts": {"sales_by_shift_bucket": sales_by_shift_bucket},
+            "tables": {"active_shifts": active_rows, "best_cashiers": best_cashiers},
         }
 
