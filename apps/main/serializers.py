@@ -582,19 +582,11 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
     unit = serializers.CharField(required=False, allow_blank=True)
     is_weight = serializers.BooleanField(required=False)
 
-    # ВАЖНО: allow_null=True чтобы PATCH мог "очищать" значения
-    purchase_price = serializers.DecimalField(
-        max_digits=10, decimal_places=2, required=False, allow_null=True
-    )
-    markup_percent = serializers.DecimalField(
-        max_digits=5, decimal_places=2, required=False, allow_null=True
-    )
-    price = serializers.DecimalField(
-        max_digits=10, decimal_places=2, required=False, allow_null=True
-    )
-    discount_percent = serializers.DecimalField(
-        max_digits=5, decimal_places=2, required=False, allow_null=True
-    )
+    # allow_null=True чтобы PATCH мог "очищать" значения
+    purchase_price = serializers.DecimalField(max_digits=10, decimal_places=2, required=False, allow_null=True)
+    markup_percent = serializers.DecimalField(max_digits=5, decimal_places=2, required=False, allow_null=True)
+    price = serializers.DecimalField(max_digits=10, decimal_places=2, required=False, allow_null=True)
+    discount_percent = serializers.DecimalField(max_digits=5, decimal_places=2, required=False, allow_null=True)
 
     country = serializers.CharField(required=False, allow_blank=True)
     expiration_date = serializers.DateField(required=False, allow_null=True)
@@ -646,8 +638,8 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
             "created_at", "updated_at",
             "images",
             "characteristics",
-            "packages",        # читаем
-            "packages_input",  # пишем
+            "packages",
+            "packages_input",
             "weight_kg",
             "total_price",
         ]
@@ -696,7 +688,6 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
 
     def get_total_price(self, obj):
         scale_data = self.context.get("scale_data")
-
         if not obj.is_weight or not scale_data:
             return obj.price
 
@@ -704,8 +695,7 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
         if not weight_kg:
             return obj.price
 
-        price_per_kg = obj.price
-        total = Decimal(price_per_kg) * Decimal(str(weight_kg))
+        total = Decimal(obj.price) * Decimal(str(weight_kg))
         return total.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
 
     # ---- helpers ----
@@ -775,6 +765,28 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
             return None
         return ProductCategory.objects.get_or_create(company=company, name=category.name)[0]
 
+    # ====== PRICE <-> MARKUP helper ======
+
+    _Q2 = Decimal("0.01")
+
+    @staticmethod
+    def _to_dec(v, default=Decimal("0")):
+        if v in (None, "", "null"):
+            return default
+        return Decimal(str(v))
+
+    @classmethod
+    def _calc_price(cls, purchase_price: Decimal, markup_percent: Decimal) -> Decimal:
+        price = purchase_price * (Decimal("1") + markup_percent / Decimal("100"))
+        return price.quantize(cls._Q2, rounding=ROUND_HALF_UP)
+
+    @classmethod
+    def _calc_markup(cls, purchase_price: Decimal, price: Decimal) -> Decimal:
+        if purchase_price <= 0:
+            return Decimal("0.00")
+        mp = (price / purchase_price - Decimal("1")) * Decimal("100")
+        return mp.quantize(cls._Q2, rounding=ROUND_HALF_UP)
+
     # ==== CREATE / UPDATE ====
 
     @transaction.atomic
@@ -796,27 +808,18 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
 
         description = (validated_data.pop("description", "") or "").strip()
 
-        # цены
-        purchase_price = validated_data.pop("purchase_price", Decimal("0"))
-        markup_percent = validated_data.pop("markup_percent", Decimal("0"))
-        price_from_payload = validated_data.pop("price", None)
+        # ===== цены: двусторонняя логика =====
+        purchase_price = self._to_dec(validated_data.pop("purchase_price", Decimal("0")))
+        markup_percent = self._to_dec(validated_data.pop("markup_percent", Decimal("0")))
+        price_in = validated_data.pop("price", None)
 
-        if purchase_price in (None, ""):
-            purchase_price = Decimal("0")
-        if markup_percent in (None, ""):
-            markup_percent = Decimal("0")
-
-        if price_from_payload not in (None, ""):
-            price = Decimal(str(price_from_payload))
-            markup_percent = Decimal("0")
+        if price_in not in (None, ""):
+            price = self._to_dec(price_in)
+            markup_percent = self._calc_markup(purchase_price, price)
         else:
-            mp = markup_percent or Decimal("0")
-            price = Decimal(str(purchase_price)) * (Decimal("1") + mp / Decimal("100"))
-            price = price.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+            price = self._calc_price(purchase_price, markup_percent)
 
-        discount_percent = validated_data.pop("discount_percent", Decimal("0"))
-        if discount_percent in (None, ""):
-            discount_percent = Decimal("0")
+        discount_percent = self._to_dec(validated_data.pop("discount_percent", Decimal("0")))
 
         country = (validated_data.pop("country", "") or "").strip()
         expiration_date = validated_data.pop("expiration_date", None)
@@ -847,7 +850,6 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
         product = Product.objects.create(
             company=company,
             branch=branch,
-
             kind=validated_data.get("kind", Product.Kind.PRODUCT),
 
             name=gp.name,
@@ -875,6 +877,7 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
             status=status_value,
             date=date_value,
             created_by=self._user(),
+            stock=validated_data.get("stock", False),
         )
 
         if item_make_data:
@@ -913,28 +916,31 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
         # если у тебя бизнес-логика такая — оставляем:
         instance.branch = branch
 
-        # --- цены / наценка / цена продажи ---
-        purchase_price = validated_data.get("purchase_price", instance.purchase_price)
-        markup_percent = validated_data.get("markup_percent", instance.markup_percent)
+        # ===== цены: двусторонняя логика =====
+        has_purchase = "purchase_price" in validated_data
+        has_markup = "markup_percent" in validated_data
+        has_price = "price" in validated_data
 
-        if purchase_price is None:
-            purchase_price = Decimal("0")
-        if markup_percent is None:
-            markup_percent = Decimal("0")
+        purchase_price = self._to_dec(validated_data.get("purchase_price", instance.purchase_price))
+        markup_percent = self._to_dec(validated_data.get("markup_percent", instance.markup_percent))
+        price = self._to_dec(validated_data.get("price", instance.price))
 
-        price_explicitly_set = ("price" in validated_data and validated_data.get("price") is not None)
+        # 1) пришёл price -> считаем markup
+        if has_price and validated_data.get("price") not in (None, ""):
+            price = self._to_dec(validated_data["price"])
+            markup_percent = self._calc_markup(purchase_price, price)
 
-        if price_explicitly_set:
-            price = Decimal(str(validated_data["price"]))
-            markup_percent = Decimal("0")
-        else:
-            need_recalc = ("purchase_price" in validated_data) or ("markup_percent" in validated_data)
-            if need_recalc:
-                mp = Decimal(str(markup_percent or 0))
-                price = Decimal(str(purchase_price)) * (Decimal("1") + mp / Decimal("100"))
-                price = price.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        # 2) иначе пришёл markup -> считаем price
+        elif has_markup and validated_data.get("markup_percent") not in (None, ""):
+            markup_percent = self._to_dec(validated_data["markup_percent"])
+            price = self._calc_price(purchase_price, markup_percent)
+
+        # 3) иначе пришёл только purchase_price -> пересчитываем разумно
+        elif has_purchase:
+            if Decimal(instance.markup_percent or 0) != Decimal("0"):
+                price = self._calc_price(purchase_price, markup_percent)
             else:
-                price = instance.price
+                markup_percent = self._calc_markup(purchase_price, price)
 
         instance.purchase_price = purchase_price
         instance.markup_percent = markup_percent
@@ -944,7 +950,7 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
         updatable_fields = (
             "name",
             "barcode",
-            "description",   # <-- ВАЖНО: раньше не обновлялось
+            "description",
             "quantity",
             "discount_percent",
             "article",
@@ -953,7 +959,7 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
             "country",
             "expiration_date",
             "client",
-            "kind",          # <-- если разрешаешь менять
+            "kind",
         )
         for field in updatable_fields:
             if field in validated_data:

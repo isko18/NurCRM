@@ -5,7 +5,7 @@ from django.conf import settings
 from django.core.validators import MinValueValidator
 from decimal import Decimal, ROUND_HALF_UP
 from dateutil.relativedelta import relativedelta
-from django.db import transaction
+from django.db import transaction, connection
 from django.db.models import Sum, F, Q, Max, IntegerField
 from mptt.models import MPTTModel, TreeForeignKey
 import uuid, secrets
@@ -591,18 +591,18 @@ class Product(models.Model):
     class Kind(models.TextChoices):
         PRODUCT = "product", "Товар"
         SERVICE = "service", "Услуга"
-        BUNDLE  = "bundle", "Комплект"
-        
+        BUNDLE = "bundle", "Комплект"
+
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
 
     company = models.ForeignKey(
-        Company,
+        "Company",
         on_delete=models.CASCADE,
         related_name="products",
         verbose_name="Компания",
     )
     branch = models.ForeignKey(
-        Branch,
+        "Branch",
         on_delete=models.CASCADE,
         related_name="crm_products",
         null=True,
@@ -610,6 +610,7 @@ class Product(models.Model):
         db_index=True,
         verbose_name="Филиал",
     )
+
     kind = models.CharField(
         "Тип позиции",
         max_length=16,
@@ -617,6 +618,7 @@ class Product(models.Model):
         default=Kind.PRODUCT,
         db_index=True,
     )
+
     client = models.ForeignKey(
         "Client",
         on_delete=models.SET_NULL,
@@ -626,7 +628,7 @@ class Product(models.Model):
         verbose_name="Клиент",
     )
     created_by = models.ForeignKey(
-        User,
+        "User",
         on_delete=models.SET_NULL,
         null=True,
         blank=True,
@@ -641,18 +643,10 @@ class Product(models.Model):
         db_index=True,
         help_text="Автогенерация в формате 0001 внутри компании",
     )
-    article = models.CharField(
-        "Артикул",
-        max_length=64,
-        blank=True,
-    )
+    article = models.CharField("Артикул", max_length=64, blank=True)
 
     name = models.CharField("Название", max_length=255)
-    description = models.TextField(
-        "Описание",
-        blank=True,
-        null=True
-    )
+    description = models.TextField("Описание", blank=True, null=True)
     barcode = models.CharField("Штрихкод", max_length=64, null=True, blank=True)
 
     brand = models.ForeignKey(
@@ -738,12 +732,9 @@ class Product(models.Model):
         blank=True,
         null=True,
     )
-    stock = models.BooleanField(
-        "Акционный товар",
-        default=False,
-        null=True,
-        blank=True,
-    )
+
+    # ✅ фикс: без null=True
+    stock = models.BooleanField("Акционный товар", default=False)
 
     item_make = models.ManyToManyField(
         "ItemMake",
@@ -754,11 +745,7 @@ class Product(models.Model):
 
     date = models.DateTimeField("Дата", blank=True, null=True)
 
-    expiration_date = models.DateField(
-        "Срок годности",
-        null=True,
-        blank=True,
-    )
+    expiration_date = models.DateField("Срок годности", null=True, blank=True)
 
     created_at = models.DateTimeField("Создан", auto_now_add=True)
     updated_at = models.DateTimeField("Обновлён", auto_now=True)
@@ -773,21 +760,22 @@ class Product(models.Model):
             models.Index(fields=["company", "plu"]),
         ]
         constraints = [
-            # штрихкод уникален в рамках компании
+            # ✅ штрихкод уникален в рамках компании, только если задан и не пустой
             models.UniqueConstraint(
                 fields=("company", "barcode"),
-                name="uq_company_barcode",
+                condition=Q(barcode__isnull=False) & ~Q(barcode=""),
+                name="uq_company_barcode_not_empty",
             ),
             # код товара уникален в рамках компании, если указан и не пустой
             models.UniqueConstraint(
                 fields=("company", "code"),
-                condition=models.Q(code__isnull=False) & ~models.Q(code=""),
-                name="uq_company_code",
+                condition=Q(code__isnull=False) & ~Q(code=""),
+                name="uq_company_code_not_empty",
             ),
             # ПЛУ уникален в рамках компании, если задан
             models.UniqueConstraint(
                 fields=("company", "plu"),
-                condition=models.Q(plu__isnull=False),
+                condition=Q(plu__isnull=False),
                 name="uq_company_plu_not_null",
             ),
         ]
@@ -795,16 +783,22 @@ class Product(models.Model):
     def __str__(self):
         return self.name
 
+    # ---------- Postgres advisory lock ----------
+    def _pg_lock_company(self):
+        """
+        Защита от гонок при генерации max()+1.
+        Все создания товаров в одной company идут по очереди.
+        """
+        if not self.company_id:
+            return
+        key = int(str(self.company_id).replace("-", "")[:16], 16)  # 64-bit key
+        with connection.cursor() as cur:
+            cur.execute("SELECT pg_advisory_xact_lock(%s);", [key])
+
     # --------- внутренние методы ---------
     def _auto_generate_plu(self):
-        """
-        Автогенерация ПЛУ только для весовых товаров внутри компании.
-        Если is_weight=True и plu пустой → берём max(plu) по компании и +1.
-        Для is_weight=False ПЛУ не трогаем.
-        """
         if not self.is_weight:
             return
-
         if self.plu is not None or not self.company_id:
             return
 
@@ -817,11 +811,6 @@ class Product(models.Model):
         self.plu = max_plu + 1
 
     def _auto_generate_code(self):
-        """
-        Генерация кода 0001, 0002... внутри КОНКРЕТНОЙ компании.
-        Смотрим максимальный числовой код и +1.
-        Старые записи не трогаем.
-        """
         if self.code or not self.company_id:
             return
 
@@ -838,46 +827,38 @@ class Product(models.Model):
         self.code = f"{last_num + 1:04d}"
 
     def _recalc_price(self):
-        """
-        Цена продажи:
-        - если markup_percent > 0 → считаем из закупки + наценки
-        - если markup_percent == 0 и price уже задан руками → не трогаем, только округляем
-        """
         base = self.purchase_price or Decimal("0")
         percent = self.markup_percent or Decimal("0")
 
-        # ручная цена + наценка 0 → уважаем price
-        if self.price not in (None, Decimal("0")) and percent == Decimal("0"):
+        # ✅ уважай ручную цену даже если price=0
+        if self.price is not None and percent == Decimal("0"):
             self.price = Decimal(self.price).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
             return
 
         result = base * (Decimal("1") + percent / Decimal("100"))
         self.price = result.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
 
-    # --------- валидации / сохранение ---------
     def clean(self):
-        # филиал ↔ компания
         if self.branch_id and self.branch.company_id != self.company_id:
             raise ValidationError({"branch": "Филиал принадлежит другой компании."})
 
-        # brand/category/client должны быть той же компании/филиала
         for rel, name in [(self.brand, "brand"), (self.category, "category"), (self.client, "client")]:
             if rel and getattr(rel, "company_id", None) != self.company_id:
                 raise ValidationError({name: "Объект принадлежит другой компании."})
             if self.branch_id and rel and getattr(rel, "branch_id", None) not in (None, self.branch_id):
                 raise ValidationError({name: "Объект другого филиала."})
 
-        # скидка 0–100
-        if self.discount_percent and not (Decimal("0") <= self.discount_percent <= Decimal("100")):
+        if self.discount_percent is not None and not (Decimal("0") <= self.discount_percent <= Decimal("100")):
             raise ValidationError({"discount_percent": "Скидка должна быть от 0 до 100%."})
 
     def save(self, *args, **kwargs):
-        # один общий save
-        self._auto_generate_code()
-        self._auto_generate_plu()
         self._recalc_price()
-        super().save(*args, **kwargs)
-        
+        with transaction.atomic():
+            self._pg_lock_company()
+            self._auto_generate_code()
+            self._auto_generate_plu()
+            super().save(*args, **kwargs)
+            
 class ProductCharacteristics(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
 
@@ -1367,6 +1348,7 @@ class Sale(models.Model):
     class Status(models.TextChoices):
         NEW = "new", "Новый"
         PAID = "paid", "Оплачен"
+        DEBT = "debt", "Долг"
         CANCELED = "canceled", "Отменён"
 
     class PaymentMethod(models.TextChoices):

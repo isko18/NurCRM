@@ -61,6 +61,25 @@ from apps.main.services import _parse_bool_like, _parse_date_to_aware_datetime, 
 # ===========================
 #  Company + Branch mixin (как в barber)
 # ===========================
+_Q2 = Decimal("0.01")
+
+
+def _to_dec(v, default=Decimal("0")):
+    if v in (None, "", "null"):
+        return default
+    return Decimal(str(v))
+
+
+def _calc_price(purchase_price: Decimal, markup_percent: Decimal) -> Decimal:
+    price = purchase_price * (Decimal("1") + markup_percent / Decimal("100"))
+    return price.quantize(_Q2, rounding=ROUND_HALF_UP)
+
+
+def _calc_markup(purchase_price: Decimal, price: Decimal) -> Decimal:
+    if purchase_price <= 0:
+        return Decimal("0.00")
+    mp = (price / purchase_price - Decimal("1")) * Decimal("100")
+    return mp.quantize(_Q2, rounding=ROUND_HALF_UP)
 
 class AgentCartLockMixin:
     """
@@ -575,6 +594,7 @@ class ProductListView(CompanyBranchRestrictedMixin, generics.ListAPIView):
             )
         )
         return self._filter_qs_company_branch(qs)
+    
 class ProductCreateByBarcodeAPIView(CompanyBranchRestrictedMixin, generics.CreateAPIView):
     """
     Создание товара только по штрих-коду (если найден в глобальной базе).
@@ -617,7 +637,7 @@ class ProductCreateByBarcodeAPIView(CompanyBranchRestrictedMixin, generics.Creat
         # kind
         kind_value = _parse_kind(data.get("kind"), Product)
 
-        # decimals + price calc
+        # decimals
         try:
             purchase_price = _parse_decimal(data.get("purchase_price", 0), "purchase_price")
             markup_percent = _parse_decimal(data.get("markup_percent", 0), "markup_percent")
@@ -625,17 +645,19 @@ class ProductCreateByBarcodeAPIView(CompanyBranchRestrictedMixin, generics.Creat
         except ValueError as e:
             return Response({str(e): "Неверный формат числа."}, status=status.HTTP_400_BAD_REQUEST)
 
+        # ====== FIX: двусторонняя логика price <-> markup_percent ======
         price_raw = data.get("price", None)
+
+        # если прислали price — считаем markup_percent
         if price_raw not in (None, ""):
             try:
-                price = Decimal(str(price_raw))
+                price = _to_dec(price_raw)
             except Exception:
                 return Response({"price": "Неверный формат цены продажи."}, status=status.HTTP_400_BAD_REQUEST)
-            markup_percent = Decimal("0")
+            markup_percent = _calc_markup(purchase_price, price)
         else:
-            mp = markup_percent or Decimal("0")
-            price = purchase_price * (Decimal("1") + mp / Decimal("100"))
-            price = price.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+            # иначе считаем price из markup_percent
+            price = _calc_price(purchase_price, markup_percent)
 
         # quantity
         try:
@@ -648,8 +670,10 @@ class ProductCreateByBarcodeAPIView(CompanyBranchRestrictedMixin, generics.Creat
         try:
             date_value = _parse_date_to_aware_datetime(raw_date) if raw_date else timezone.now()
         except ValueError:
-            return Response({"date": "Неверный формат даты. Используйте YYYY-MM-DD или ISO datetime."},
-                            status=status.HTTP_400_BAD_REQUEST)
+            return Response(
+                {"date": "Неверный формат даты. Используйте YYYY-MM-DD или ISO datetime."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
 
         # unit/is_weight/country/expiration
         unit = (data.get("unit") or "шт.").strip()
@@ -661,8 +685,10 @@ class ProductCreateByBarcodeAPIView(CompanyBranchRestrictedMixin, generics.Creat
         if expiration_raw not in (None, ""):
             expiration_date = parse_date(str(expiration_raw))
             if not expiration_date:
-                return Response({"expiration_date": "Неверный формат. Используйте YYYY-MM-DD."},
-                                status=status.HTTP_400_BAD_REQUEST)
+                return Response(
+                    {"expiration_date": "Неверный формат. Используйте YYYY-MM-DD."},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
 
         # локальные справочники
         brand = ProductBrand.objects.get_or_create(company=company, name=gp.brand.name)[0] if gp.brand else None
@@ -795,13 +821,15 @@ class ProductCreateManualAPIView(CompanyBranchRestrictedMixin, generics.CreateAP
 
         barcode = (data.get("barcode") or "").strip() or None
         if barcode and Product.objects.filter(company=company, barcode=barcode).exists():
-            return Response({"barcode": "В вашей компании уже есть товар с таким штрих-кодом."},
-                            status=status.HTTP_400_BAD_REQUEST)
+            return Response(
+                {"barcode": "В вашей компании уже есть товар с таким штрих-кодом."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
 
         # kind
         kind_value = _parse_kind(data.get("kind"), Product)
 
-        # decimals + price calc
+        # decimals
         try:
             purchase_price = _parse_decimal(data.get("purchase_price", 0), "purchase_price")
             markup_percent = _parse_decimal(data.get("markup_percent", 0), "markup_percent")
@@ -809,17 +837,16 @@ class ProductCreateManualAPIView(CompanyBranchRestrictedMixin, generics.CreateAP
         except ValueError as e:
             return Response({str(e): "Неверный формат числа."}, status=status.HTTP_400_BAD_REQUEST)
 
+        # ====== FIX: двусторонняя логика price <-> markup_percent ======
         price_raw = data.get("price", None)
         if price_raw not in (None, ""):
             try:
-                price = Decimal(str(price_raw))
+                price = _to_dec(price_raw)
             except Exception:
                 return Response({"price": "Неверный формат цены продажи."}, status=status.HTTP_400_BAD_REQUEST)
-            markup_percent = Decimal("0")
+            markup_percent = _calc_markup(purchase_price, price)
         else:
-            mp = markup_percent or Decimal("0")
-            price = purchase_price * (Decimal("1") + mp / Decimal("100"))
-            price = price.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+            price = _calc_price(purchase_price, markup_percent)
 
         # quantity
         try:
@@ -838,8 +865,10 @@ class ProductCreateManualAPIView(CompanyBranchRestrictedMixin, generics.CreateAP
         try:
             date_value = _parse_date_to_aware_datetime(raw_date) if raw_date else timezone.now()
         except ValueError:
-            return Response({"date": "Неверный формат даты. Используйте YYYY-MM-DD или ISO datetime."},
-                            status=status.HTTP_400_BAD_REQUEST)
+            return Response(
+                {"date": "Неверный формат даты. Используйте YYYY-MM-DD или ISO datetime."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
 
         # unit/is_weight/country/expiration
         unit = (data.get("unit") or "шт.").strip()
@@ -851,8 +880,10 @@ class ProductCreateManualAPIView(CompanyBranchRestrictedMixin, generics.CreateAP
         if expiration_raw not in (None, ""):
             expiration_date = parse_date(str(expiration_raw))
             if not expiration_date:
-                return Response({"expiration_date": "Неверный формат. Используйте YYYY-MM-DD."},
-                                status=status.HTTP_400_BAD_REQUEST)
+                return Response(
+                    {"expiration_date": "Неверный формат. Используйте YYYY-MM-DD."},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
 
         # brand/category (через global)
         brand_name = (data.get("brand_name") or "").strip()
@@ -979,6 +1010,7 @@ class ProductCreateManualAPIView(CompanyBranchRestrictedMixin, generics.CreateAP
         ser = self.get_serializer(product, context=self.get_serializer_context())
         return Response(ser.data, status=status.HTTP_201_CREATED)
 
+
 class ProductRetrieveUpdateDestroyAPIView(CompanyBranchRestrictedMixin, generics.RetrieveUpdateDestroyAPIView):
     serializer_class = ProductSerializer
 
@@ -1000,7 +1032,6 @@ class ProductRetrieveUpdateDestroyAPIView(CompanyBranchRestrictedMixin, generics
         )
         .all()
     )
-
 
 
 class ProductBulkDeleteAPIView(CompanyBranchRestrictedMixin, APIView):
@@ -1057,6 +1088,7 @@ class ProductBulkDeleteAPIView(CompanyBranchRestrictedMixin, APIView):
         http_status = status.HTTP_200_OK if not results["protected"] else status.HTTP_207_MULTI_STATUS
         return Response(results, status=http_status)
 
+
 class ProductByBarcodeAPIView(CompanyBranchRestrictedMixin, generics.RetrieveAPIView):
     serializer_class = ProductSerializer
     lookup_field = "barcode"
@@ -1083,6 +1115,8 @@ class ProductByBarcodeAPIView(CompanyBranchRestrictedMixin, generics.RetrieveAPI
         return self._filter_qs_company_branch(qs)
 
     def get_object(self):
+        from rest_framework.exceptions import NotFound
+
         barcode = self.kwargs.get("barcode")
         if not barcode:
             raise NotFound(detail="Штрих-код не указан")
@@ -1091,7 +1125,6 @@ class ProductByBarcodeAPIView(CompanyBranchRestrictedMixin, generics.RetrieveAPI
         if not product:
             raise NotFound(detail="Товар с таким штрих-кодом не найден")
         return product
-
 
 # ===========================
 #  Reviews
