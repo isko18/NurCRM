@@ -47,7 +47,7 @@ from apps.users.models import Roles, User, Company
 import requests
 from django.conf import settings
 from apps.construction.models import Cashbox, CashShift
-from apps.utils import _is_owner_like
+from apps.utils import _is_owner_like, _get_active_cart_or_404
 try:
     from apps.main.models import ClientDeal, DealInstallment
 except Exception:
@@ -753,7 +753,7 @@ class SaleStartAPIView(CompanyBranchRestrictedMixin, APIView):
         if not cashbox:
             raise ValidationError({"detail": "Нет кассы для этого филиала. Создай Cashbox."})
 
-        # ✅ теперь это будет shift ТОЛЬКО этого кассира в этой кассе
+        # ✅ shift ТОЛЬКО этого кассира в этой кассе
         shift = _ensure_open_shift(
             company=company,
             branch=branch,
@@ -778,6 +778,7 @@ class SaleStartAPIView(CompanyBranchRestrictedMixin, APIView):
                 shift=shift,
             )
         else:
+            # ✅ если вдруг насыпалось несколько активных — закрываем лишние
             extra_ids = list(qs.values_list("id", flat=True)[1:])
             if extra_ids:
                 Cart.objects.filter(id__in=extra_ids).update(
@@ -785,36 +786,44 @@ class SaleStartAPIView(CompanyBranchRestrictedMixin, APIView):
                     updated_at=timezone.now(),
                 )
 
+        # ✅ ВАЖНО: скидка НЕ должна залипать
         opts = StartCartOptionsSerializer(data=request.data)
-        if opts.is_valid():
-            order_disc = opts.validated_data.get("order_discount_total")
-            if order_disc is not None:
-                cart.order_discount_total = _q2(order_disc)
-                cart.save(update_fields=["order_discount_total"])
+        opts.is_valid(raise_exception=True)
+        cart.order_discount_total = opts.validated_data["order_discount_total"]  # всегда есть (default=0.00)
+        cart.save(update_fields=["order_discount_total"])
 
         cart.recalc()
-        return Response(SaleCartSerializer(cart).data, status=status.HTTP_201_CREATED)
+        return Response(SaleCartSerializer(cart, context={"request": request}).data, status=status.HTTP_201_CREATED)
 
 
+# ─────────────────────────────────────────────────────────────
+# CART DETAIL
+# ─────────────────────────────────────────────────────────────
 
 class CartDetailAPIView(generics.RetrieveAPIView):
     serializer_class = SaleCartSerializer
     permission_classes = [permissions.IsAuthenticated]
+    lookup_field = "id"
+    lookup_url_kwarg = "pk"
 
     def get_queryset(self):
-        return Cart.objects.filter(company=self.request.user.company)
+        u = self.request.user
+        qs = Cart.objects.filter(company=u.company)
+        if not _is_owner_like(u):
+            qs = qs.filter(user=u)
+        return qs
+
+
+# ─────────────────────────────────────────────────────────────
+# SCAN BARCODE
+# ─────────────────────────────────────────────────────────────
 
 class SaleScanAPIView(APIView):
     permission_classes = [permissions.IsAuthenticated]
 
     @transaction.atomic
     def post(self, request, pk, *args, **kwargs):
-        cart = get_object_or_404(
-            Cart,
-            id=pk,
-            company=request.user.company,
-            status=Cart.Status.ACTIVE,
-        )
+        cart = _get_active_cart_or_404(request, pk)
 
         ser = ScanRequestSerializer(data=request.data)
         ser.is_valid(raise_exception=True)
@@ -832,68 +841,58 @@ class SaleScanAPIView(APIView):
             # 2) весовой штрихкод
             scale_data = _parse_scale_barcode(barcode)
             if not scale_data:
-                return Response(
-                    {"not_found": True, "message": "Товар не найден"},
-                    status=404,
-                )
+                return Response({"not_found": True, "message": "Товар не найден"}, status=404)
 
             plu = scale_data["plu"]
             try:
                 product = Product.objects.get(company=cart.company, plu=plu)
             except Product.DoesNotExist:
                 return Response(
-                    {
-                        "not_found": True,
-                        "message": f"Товар с ПЛУ {plu} не найден",
-                    },
+                    {"not_found": True, "message": f"Товар с ПЛУ {plu} не найден"},
                     status=404,
                 )
 
-        # ✅ КОЛИЧЕСТВО
-        if scale_data:
-            effective_qty = Decimal(str(scale_data["weight_kg"]))
-        else:
-            effective_qty = Decimal(str(qty))
+        # ✅ количество
+        effective_qty = Decimal(str(scale_data["weight_kg"])) if scale_data else Decimal(str(qty))
 
-        item, created = CartItem.objects.get_or_create(
-            cart=cart,
-            product=product,
-            defaults={
-                "company": cart.company,
-                "branch": getattr(cart, "branch", None),
-                "quantity": effective_qty,
-                "unit_price": product.price,  # цена за кг или за штуку
-            },
+        # ✅ защищаемся от гонок (селект-лок)
+        item = (
+            CartItem.objects
+            .select_for_update()
+            .filter(cart=cart, product=product)
+            .first()
         )
-
-        if not created:
-            item.quantity = item.quantity + effective_qty
-            item.save(update_fields=["quantity"])
+        if item:
+            CartItem.objects.filter(pk=item.pk).update(quantity=F("quantity") + effective_qty)
+        else:
+            CartItem.objects.create(
+                cart=cart,
+                product=product,
+                company=cart.company,
+                branch=getattr(cart, "branch", None),
+                quantity=effective_qty,
+                unit_price=product.price,
+            )
 
         cart.recalc()
-        return Response(SaleCartSerializer(cart).data, status=status.HTTP_201_CREATED)
+        return Response(SaleCartSerializer(cart, context={"request": request}).data, status=status.HTTP_201_CREATED)
 
 
+# ─────────────────────────────────────────────────────────────
+# ADD ITEM (manual)
+# ─────────────────────────────────────────────────────────────
 
 class SaleAddItemAPIView(APIView):
     permission_classes = [permissions.IsAuthenticated]
 
     @transaction.atomic
     def post(self, request, pk, *args, **kwargs):
-        cart = get_object_or_404(
-            Cart,
-            id=pk,
-            company=request.user.company,
-            status=Cart.Status.ACTIVE,
-        )
+        cart = _get_active_cart_or_404(request, pk)
+
         ser = AddItemSerializer(data=request.data)
         ser.is_valid(raise_exception=True)
 
-        product = get_object_or_404(
-            Product,
-            id=ser.validated_data["product_id"],
-            company=cart.company,
-        )
+        product = get_object_or_404(Product, id=ser.validated_data["product_id"], company=cart.company)
         qty = ser.validated_data["quantity"]
 
         unit_price = ser.validated_data.get("unit_price")
@@ -901,43 +900,48 @@ class SaleAddItemAPIView(APIView):
 
         if unit_price is None:
             if line_discount is not None:
-                per_unit_disc = _q2(Decimal(line_discount) / Decimal(qty))
-                unit_price = _q2(Decimal(product.price) - per_unit_disc)
+                per_unit_disc = (Decimal(line_discount) / Decimal(qty)).quantize(Decimal("0.01"))
+                unit_price = (Decimal(product.price) - per_unit_disc).quantize(Decimal("0.01"))
                 if unit_price < 0:
                     unit_price = Decimal("0.00")
             else:
                 unit_price = product.price
 
-        item, created = CartItem.objects.get_or_create(
-            cart=cart,
-            product=product,
-            defaults={
-                "company": cart.company,
-                "branch": getattr(cart, "branch", None),
-                "quantity": qty,
-                "unit_price": unit_price,
-            },
+        item = (
+            CartItem.objects
+            .select_for_update()
+            .filter(cart=cart, product=product)
+            .first()
         )
-        if not created:
-            item.quantity += qty
-            item.unit_price = unit_price
-            item.save(update_fields=["quantity", "unit_price"])
+        if item:
+            CartItem.objects.filter(pk=item.pk).update(
+                quantity=F("quantity") + qty,
+                unit_price=unit_price,
+            )
+        else:
+            CartItem.objects.create(
+                cart=cart,
+                product=product,
+                company=cart.company,
+                branch=getattr(cart, "branch", None),
+                quantity=qty,
+                unit_price=unit_price,
+            )
 
         cart.recalc()
+        return Response(SaleCartSerializer(cart, context={"request": request}).data, status=status.HTTP_201_CREATED)
 
-        return Response(SaleCartSerializer(cart).data, status=status.HTTP_201_CREATED)
+
+# ─────────────────────────────────────────────────────────────
+# CHECKOUT
+# ─────────────────────────────────────────────────────────────
 
 class SaleCheckoutAPIView(APIView):
     permission_classes = [permissions.IsAuthenticated]
 
     @transaction.atomic
     def post(self, request, pk, *args, **kwargs):
-        cart = get_object_or_404(
-            Cart,
-            id=pk,
-            company=request.user.company,
-            status=Cart.Status.ACTIVE,
-        )
+        cart = _get_active_cart_or_404(request, pk)
 
         ser = CheckoutSerializer(data=request.data, context={"request": request, "cart": cart})
         ser.is_valid(raise_exception=True)
@@ -948,7 +952,7 @@ class SaleCheckoutAPIView(APIView):
         cash_received = ser.validated_data.get("cash_received") or Decimal("0.00")
 
         cashbox_id = ser.validated_data.get("cashbox_id")
-        shift_id = ser.validated_data.get("shift_id")  # ✅ важно
+        shift_id = ser.validated_data.get("shift_id")
 
         # ✅ гарантируем shift на корзине
         if not cart.shift_id:
@@ -959,7 +963,6 @@ class SaleCheckoutAPIView(APIView):
             if not cashbox:
                 raise ValidationError({"detail": "Нет кассы для этого филиала. Создай Cashbox."})
 
-            # ✅ если shift_id дали — привязываем именно его
             if shift_id:
                 shift = (
                     CashShift.objects
@@ -975,19 +978,17 @@ class SaleCheckoutAPIView(APIView):
                 if not shift:
                     raise ValidationError({"shift_id": "Смена не найдена или закрыта, или не относится к этой кассе."})
 
-                # ✅ обычный кассир не может продавать в чужую смену
                 if (not getattr(request.user, "is_superuser", False)) and (not _is_owner_like(request.user)):
                     if shift.cashier_id != request.user.id:
                         raise ValidationError({"shift_id": "Нельзя оформить продажу в чужую смену."})
-
             else:
-                # ✅ shift_id не дали — берём/создаём смену ТОЛЬКО текущего кассира
                 shift = _ensure_open_shift(company=company, branch=branch, cashier=request.user, cashbox=cashbox)
 
             cart.shift = shift
             cart.save(update_fields=["shift"])
 
         cart.recalc()
+
         if payment_method == Sale.PaymentMethod.CASH and cash_received < cart.total:
             return Response(
                 {"detail": "Сумма, полученная наличными, меньше суммы продажи."},
@@ -1001,10 +1002,18 @@ class SaleCheckoutAPIView(APIView):
         except ValueError as e:
             return Response({"detail": str(e)}, status=status.HTTP_400_BAD_REQUEST)
 
-        # ✅ точно привяжем к смене
-        if cart.shift_id and sale.shift_id != cart.shift_id:
-            sale.shift_id = cart.shift_id
-            sale.save(update_fields=["shift"])
+        # ✅ жёстко синхронизируем shift/cashbox
+        if cart.shift_id:
+            sh = CashShift.objects.select_related("cashbox").get(id=cart.shift_id)
+            upd = []
+            if sale.shift_id != sh.id:
+                sale.shift_id = sh.id
+                upd.append("shift")
+            if getattr(sale, "cashbox_id", None) != sh.cashbox_id:
+                sale.cashbox_id = sh.cashbox_id
+                upd.append("cashbox")
+            if upd:
+                sale.save(update_fields=upd)
 
         if client_id:
             client = get_object_or_404(Client, id=client_id, company=request.user.company)
@@ -1026,7 +1035,7 @@ class SaleCheckoutAPIView(APIView):
             "cash_received": fmt_money(sale.cash_received),
             "change": fmt_money(sale.change),
             "shift_id": str(sale.shift_id) if sale.shift_id else None,
-            "cashbox_id": str(sale.cashbox_id) if sale.cashbox_id else None,
+            "cashbox_id": str(sale.cashbox_id) if getattr(sale, "cashbox_id", None) else None,
         }
 
         if print_receipt:
@@ -1050,42 +1059,17 @@ class SaleCheckoutAPIView(APIView):
         return Response(payload, status=status.HTTP_201_CREATED)
 
 
-
+# ─────────────────────────────────────────────────────────────
+# MOBILE SCANNER TOKEN
+# ─────────────────────────────────────────────────────────────
 
 class SaleMobileScannerTokenAPIView(APIView):
     permission_classes = [permissions.IsAuthenticated]
 
     def post(self, request, pk, *args, **kwargs):
-        cart = get_object_or_404(
-            Cart,
-            id=pk,
-            company=request.user.company,
-            status=Cart.Status.ACTIVE,
-        )
+        cart = _get_active_cart_or_404(request, pk)
         token = MobileScannerToken.issue(cart, ttl_minutes=10)
         return Response(MobileScannerTokenSerializer(token).data, status=201)
-
-
-class ProductFindByBarcodeAPIView(APIView):
-    permission_classes = [permissions.IsAuthenticated]
-
-    def get(self, request, *args, **kwargs):
-        barcode = request.query_params.get("barcode", "").strip()
-        if not barcode:
-            return Response([], status=200)
-        qs = Product.objects.filter(company=request.user.company, barcode=barcode)[:1]
-        return Response(
-            [
-                {
-                    "id": str(p.id),
-                    "name": p.name,
-                    "barcode": p.barcode,
-                    "price": str(p.price),
-                }
-                for p in qs
-            ],
-            status=200,
-        )
 
 
 class MobileScannerIngestAPIView(APIView):
@@ -1105,35 +1089,45 @@ class MobileScannerIngestAPIView(APIView):
             return Response({"detail": "token expired"}, status=410)
 
         cart = mt.cart
+
+        # ВАЖНО: тут тоже лучше учитывать branch-правила, если у тебя товары по филиалам
         try:
             product = Product.objects.get(company=cart.company, barcode=barcode)
         except Product.DoesNotExist:
             return Response({"not_found": True, "message": "Товар не найден"}, status=404)
 
-        item, created = CartItem.objects.get_or_create(
-            cart=cart,
-            product=product,
-            defaults={
-                "company": cart.company,
-                "branch": getattr(cart, "branch", None),
-                "quantity": qty,
-                "unit_price": product.price,
-            },
+        item = (
+            CartItem.objects
+            .select_for_update()
+            .filter(cart=cart, product=product)
+            .first()
         )
-        if not created:
-            item.quantity += qty
-            item.save(update_fields=["quantity"])
-        cart.recalc()
+        if item:
+            CartItem.objects.filter(pk=item.pk).update(quantity=F("quantity") + qty)
+        else:
+            CartItem.objects.create(
+                cart=cart,
+                product=product,
+                company=cart.company,
+                branch=getattr(cart, "branch", None),
+                quantity=qty,
+                unit_price=product.price,
+            )
 
+        cart.recalc()
         return Response({"ok": True}, status=201)
 
+
+# ─────────────────────────────────────────────────────────────
+# SALES LIST/DETAIL
+# ─────────────────────────────────────────────────────────────
 
 class SaleListAPIView(CompanyBranchRestrictedMixin, generics.ListAPIView):
     serializer_class = SaleListSerializer
     queryset = (
         Sale.objects
         .select_related("user")
-        .prefetch_related("items__product")  # <-- важно для first_item_name
+        .prefetch_related("items__product")
         .all()
     )
     filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
@@ -1147,12 +1141,24 @@ class SaleListAPIView(CompanyBranchRestrictedMixin, generics.ListAPIView):
 
         start = self.request.query_params.get("start")
         end = self.request.query_params.get("end")
+
         if start:
-            dt = parse_datetime(start) or (parse_date(start) and f"{start} 00:00:00")
-            qs = qs.filter(created_at__gte=dt)
+            dt = parse_datetime(start)
+            if not dt:
+                d = parse_date(start)
+                if d:
+                    dt = timezone.make_aware(timezone.datetime.combine(d, timezone.datetime.min.time()))
+            if dt:
+                qs = qs.filter(created_at__gte=dt)
+
         if end:
-            dt = parse_datetime(end) or (parse_date(end) and f"{end} 23:59:59")
-            qs = qs.filter(created_at__lte=dt)
+            dt = parse_datetime(end)
+            if not dt:
+                d = parse_date(end)
+                if d:
+                    dt = timezone.make_aware(timezone.datetime.combine(d, timezone.datetime.max.time().replace(microsecond=0)))
+            if dt:
+                qs = qs.filter(created_at__lte=dt)
 
         paid_only = self.request.query_params.get("paid")
         if paid_only in ("1", "true", "True"):
@@ -1167,7 +1173,8 @@ class SaleRetrieveAPIView(CompanyBranchRestrictedMixin, generics.RetrieveUpdateD
     lookup_url_kwarg = "pk"
 
     queryset = (
-        Sale.objects.select_related("user")
+        Sale.objects
+        .select_related("user")
         .prefetch_related("items__product")
         .all()
     )
@@ -1178,63 +1185,15 @@ class SaleRetrieveAPIView(CompanyBranchRestrictedMixin, generics.RetrieveUpdateD
         return SaleDetailSerializer
 
 
-class SaleBulkDeleteAPIView(CompanyBranchRestrictedMixin, APIView):
-    permission_classes = [permissions.IsAuthenticated]
-
-    @transaction.atomic
-    def delete(self, request, *args, **kwargs):
-        ids = request.data.get("ids")
-        allow_paid = bool(request.data.get("allow_paid", False))
-        if not isinstance(ids, list) or not ids:
-            return Response({"detail": "Укажите непустой список 'ids'."}, status=400)
-
-        valid_ids, invalid_ids = [], []
-        for x in ids:
-            try:
-                valid_ids.append(uuid.UUID(str(x)))
-            except Exception:
-                invalid_ids.append(str(x))
-
-        if not valid_ids and invalid_ids:
-            return Response({"detail": "Нет валидных UUID.", "invalid_ids": invalid_ids}, status=400)
-
-        base_qs = Sale.objects.filter(id__in=valid_ids)
-        base_qs = self._filter_qs_company_branch(base_qs)
-
-        if allow_paid:
-            deletable_qs = base_qs
-            not_allowed_ids = []
-        else:
-            deletable_qs = base_qs.exclude(status=Sale.Status.PAID)
-            not_allowed_ids = list(
-                base_qs.filter(status=Sale.Status.PAID).values_list("id", flat=True)
-            )
-
-        found_ids = set(str(sid) for sid in base_qs.values_list("id", flat=True))
-        not_found_ids = [str(x) for x in valid_ids if str(x) not in found_ids]
-
-        deleted_count, _ = deletable_qs.delete()
-
-        return Response(
-            {
-                "deleted": deleted_count,
-                "not_found": not_found_ids + invalid_ids,
-                "not_allowed": [str(x) for x in not_allowed_ids],
-            },
-            status=200,
-        )
-
+# ─────────────────────────────────────────────────────────────
+# CART ITEM UPDATE/DELETE (важно: decimal qty, не int)
+# ─────────────────────────────────────────────────────────────
 
 class CartItemUpdateDestroyAPIView(APIView):
     permission_classes = [permissions.IsAuthenticated]
 
     def _get_active_cart(self, request, cart_id):
-        return get_object_or_404(
-            Cart,
-            id=cart_id,
-            company=request.user.company,
-            status=Cart.Status.ACTIVE,
-        )
+        return _get_active_cart_or_404(request, cart_id)
 
     def _get_item_in_cart(self, cart, item_or_product_id):
         item = CartItem.objects.filter(cart=cart, id=item_or_product_id).first()
@@ -1252,10 +1211,14 @@ class CartItemUpdateDestroyAPIView(APIView):
         cart = self._get_active_cart(request, cart_id)
         item = self._get_item_in_cart(cart, item_id)
 
+        raw = request.data.get("quantity", None)
+        if raw is None:
+            return Response({"quantity": "Укажите quantity."}, status=400)
+
         try:
-            qty = int(request.data.get("quantity"))
-        except (TypeError, ValueError):
-            return Response({"quantity": "Укажите целое число >= 0."}, status=400)
+            qty = Decimal(str(raw))
+        except (InvalidOperation, TypeError):
+            return Response({"quantity": "Укажите число >= 0."}, status=400)
 
         if qty < 0:
             return Response({"quantity": "Количество не может быть отрицательным."}, status=400)
@@ -1263,12 +1226,12 @@ class CartItemUpdateDestroyAPIView(APIView):
         if qty == 0:
             item.delete()
             cart.recalc()
-            return Response(SaleCartSerializer(cart).data, status=200)
+            return Response(SaleCartSerializer(cart, context={"request": request}).data, status=200)
 
         item.quantity = qty
         item.save(update_fields=["quantity"])
         cart.recalc()
-        return Response(SaleCartSerializer(cart).data, status=200)
+        return Response(SaleCartSerializer(cart, context={"request": request}).data, status=200)
 
     @transaction.atomic
     def delete(self, request, cart_id, item_id, *args, **kwargs):
@@ -1276,7 +1239,7 @@ class CartItemUpdateDestroyAPIView(APIView):
         item = self._get_item_in_cart(cart, item_id)
         item.delete()
         cart.recalc()
-        return Response(SaleCartSerializer(cart).data, status=200)
+        return Response(SaleCartSerializer(cart, context={"request": request}).data, status=200)
 
 
 class SaleAddCustomItemAPIView(APIView):
@@ -1284,12 +1247,8 @@ class SaleAddCustomItemAPIView(APIView):
 
     @transaction.atomic
     def post(self, request, pk, *args, **kwargs):
-        cart = get_object_or_404(
-            Cart,
-            id=pk,
-            company=request.user.company,
-            status=Cart.Status.ACTIVE,
-        )
+        cart = _get_active_cart_or_404(request, pk)
+
         ser = CustomCartItemCreateSerializer(data=request.data)
         ser.is_valid(raise_exception=True)
 
@@ -1297,19 +1256,23 @@ class SaleAddCustomItemAPIView(APIView):
         if not name:
             return Response({"name": "Название не может быть пустым."}, status=400)
 
-        price = _q2(ser.validated_data["price"])
-        qty = ser.validated_data.get("quantity", 1)
+        price = ser.validated_data["price"]
+        qty = ser.validated_data.get("quantity", Decimal("1"))
 
-        item = CartItem.objects.filter(
-            cart=cart,
-            product__isnull=True,
-            custom_name=name,
-            unit_price=price,
-        ).first()
+        item = (
+            CartItem.objects
+            .select_for_update()
+            .filter(
+                cart=cart,
+                product__isnull=True,
+                custom_name=name,
+                unit_price=price,
+            )
+            .first()
+        )
 
         if item:
             CartItem.objects.filter(pk=item.pk).update(quantity=F("quantity") + qty)
-            item.refresh_from_db(fields=["quantity"])
         else:
             CartItem.objects.create(
                 company=cart.company,
@@ -1321,7 +1284,8 @@ class SaleAddCustomItemAPIView(APIView):
                 quantity=qty,
             )
 
-        return Response(SaleCartSerializer(cart).data, status=status.HTTP_201_CREATED)
+        cart.recalc()
+        return Response(SaleCartSerializer(cart, context={"request": request}).data, status=status.HTTP_201_CREATED)
 
 
 OWNER_ROLES = {Roles.OWNER}

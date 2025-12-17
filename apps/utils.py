@@ -110,3 +110,18 @@ def _is_owner_like(user) -> bool:
     if role in ("owner", "admin"):
         return True
     return False
+
+
+def _get_active_cart_or_404(request, cart_id):
+    """
+    ВАЖНО: обычный кассир видит/меняет только свою корзину.
+    owner/admin видит корзины компании.
+    """
+    qs = Cart.objects.filter(
+        id=cart_id,
+        company=request.user.company,
+        status=Cart.Status.ACTIVE,
+    )
+    if not _is_owner_like(request.user):
+        qs = qs.filter(user=request.user)
+    return get_object_or_404(qs)
