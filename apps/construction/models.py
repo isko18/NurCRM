@@ -9,6 +9,7 @@ from django.utils import timezone
 
 from apps.users.models import Company, Branch
 
+
 class Cashbox(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
 
@@ -29,7 +30,9 @@ class Cashbox(models.Model):
     )
 
     name = models.CharField(max_length=255, blank=True, null=True, verbose_name="Название кассы")
+    # ⛔ лучше без null=True на boolean, но я оставлю как есть, чтобы не ломать миграции
     is_consumption = models.BooleanField(verbose_name="Расход", default=False, blank=True, null=True)
+
     created_at = models.DateTimeField(auto_now_add=True, db_index=True, null=True, blank=True)
     updated_at = models.DateTimeField(auto_now=True, null=True, blank=True)
 
@@ -101,22 +104,37 @@ class Cashbox(models.Model):
         cash_sales_total = sa["cash_sum"] or z
         noncash_sales_total = sa["noncash_sum"] or z
 
-        # open shift
-        open_shift = (
+        # ✅ open shifts (их может быть несколько!)
+        open_shifts = (
             self.shifts
             .filter(status=CashShift.Status.OPEN)
             .select_related("cashier")
             .only("id", "opening_cash", "cashier_id", "status", "opened_at")
             .order_by("-opened_at")
-            .first()
         )
 
-        open_shift_expected_cash = None
-        if open_shift:
-            try:
-                open_shift_expected_cash = open_shift.calc_live_totals().get("expected_cash")
-            except Exception:
-                open_shift_expected_cash = None
+        open_shifts_info = []
+        open_shifts_expected_cash_total = None
+
+        if open_shifts.exists():
+            total_expected = Decimal("0.00")
+            for sh in open_shifts:
+                expected = None
+                try:
+                    expected = sh.calc_live_totals().get("expected_cash")
+                    if expected is not None:
+                        total_expected += expected
+                except Exception:
+                    expected = None
+
+                open_shifts_info.append({
+                    "id": str(sh.id),
+                    "cashier_id": str(sh.cashier_id) if sh.cashier_id else None,
+                    "opened_at": sh.opened_at.isoformat() if sh.opened_at else None,
+                    "expected_cash": str(expected) if expected is not None else None,
+                })
+
+            open_shifts_expected_cash_total = str(total_expected)
 
         return {
             "income_total": income_total,
@@ -125,7 +143,11 @@ class Cashbox(models.Model):
             "sales_total": sales_total,
             "cash_sales_total": cash_sales_total,
             "noncash_sales_total": noncash_sales_total,
-            "open_shift_expected_cash": open_shift_expected_cash,
+
+            # было: open_shift_expected_cash (одна смена)
+            # стало: список смен + сумма expected_cash
+            "open_shifts": open_shifts_info,
+            "open_shifts_expected_cash_total": open_shifts_expected_cash_total,
         }
 
     def __str__(self):
@@ -171,10 +193,12 @@ class CashShift(models.Model):
 
     class Meta:
         constraints = [
+            # ✅ теперь можно много OPEN на 1 cashbox,
+            # но нельзя 2 OPEN смены одному кассиру на одной кассе
             models.UniqueConstraint(
-                fields=("cashbox",),
+                fields=("cashbox", "cashier"),
                 condition=Q(status="open"),
-                name="uq_open_shift_per_cashbox",
+                name="uq_open_shift_per_cashbox_cashier",
             ),
         ]
         indexes = [
@@ -290,6 +314,7 @@ class CashShift(models.Model):
 
     def __str__(self):
         return f"Смена {self.cashier} / {self.cashbox} ({self.status})"
+
 
 class CashFlow(models.Model):
     class Type(models.TextChoices):

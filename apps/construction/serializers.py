@@ -255,7 +255,8 @@ class CashShiftListSerializer(serializers.ModelSerializer):
 
 class CashShiftOpenSerializer(serializers.ModelSerializer):
     """
-    ✅ 1 OPEN смена на 1 кассу.
+    ✅ Разрешаем несколько OPEN смен на одну кассу.
+    ✅ Запрещаем только повторную OPEN смену этому же кассиру на этой кассе.
     """
 
     cashier = serializers.PrimaryKeyRelatedField(required=False, allow_null=True, queryset=User.objects.none())
@@ -317,26 +318,16 @@ class CashShiftOpenSerializer(serializers.ModelSerializer):
 
         cashier = attrs["cashier"]
 
-        # ✅ select_for_update работает только внутри transaction.atomic (в view)
+        # ✅ теперь проверяем только "есть ли уже OPEN смена этого кассира на этой кассе"
         existing = (
             CashShift.objects
             .select_for_update()
-            .select_related("cashier")
-            .filter(company=company, cashbox=cashbox, status=CashShift.Status.OPEN)
+            .filter(company=company, cashbox=cashbox, cashier=cashier, status=CashShift.Status.OPEN)
+            .order_by("-opened_at")
             .first()
         )
-
         if existing:
-            if existing.cashier_id == cashier.id:
-                attrs["_existing_shift"] = existing
-                return attrs
-
-            who = (
-                getattr(existing.cashier, "email", None)
-                or getattr(existing.cashier, "username", None)
-                or str(existing.cashier_id)
-            )
-            raise serializers.ValidationError({"cashbox": f"Касса уже открыта другим кассиром: {who}."})
+            attrs["_existing_shift"] = existing
 
         return attrs
 
@@ -419,7 +410,6 @@ class CashboxSerializer(CompanyBranchReadOnlyMixin):
         read_only_fields = ["id", "company", "branch", "analytics", "is_consumption"]
 
     def get_analytics(self, obj):
-        # ✅ если view дала пачкой — берём быстро
         amap = self.context.get("analytics_map")
         if amap is not None:
             a = amap.get(str(obj.id))
@@ -434,7 +424,6 @@ class CashboxSerializer(CompanyBranchReadOnlyMixin):
                     "open_shift_expected_cash": None,
                 }
 
-            # приводим Decimal → str чтобы фронт не ловил Decimal JSON
             def _d(v):
                 return str(v) if isinstance(v, Decimal) else v
 
@@ -448,7 +437,6 @@ class CashboxSerializer(CompanyBranchReadOnlyMixin):
                 "open_shift_expected_cash": _d(a.get("open_shift_expected_cash")),
             }
 
-        # ✅ fallback как раньше
         return obj.get_summary()
 
 
@@ -513,6 +501,7 @@ class CashFlowSerializer(CompanyBranchReadOnlyMixin):
             cb_qs = cb_qs.filter(Q(branch__isnull=True) | Q(branch=target_branch))
         self.fields["cashbox"].queryset = cb_qs
 
+        # shifts: owner видит все, обычный пользователь — только свои
         sh_qs = CashShift.objects.filter(company=company)
         if not _is_owner_like(user):
             sh_qs = sh_qs.filter(cashier=user)
@@ -552,8 +541,11 @@ class CashFlowSerializer(CompanyBranchReadOnlyMixin):
         if shift:
             if cashbox and shift.cashbox_id != cashbox.id:
                 raise serializers.ValidationError({"shift": "Смена относится к другой кассе."})
-            # if shift.status != CashShift.Status.OPEN:
-            #     raise serializers.ValidationError({"shift": "Нельзя привязать движение к закрытой смене."})
+
+            # ✅ в кассовых движениях нормальный смысл — только OPEN смена
+            if shift.status != CashShift.Status.OPEN:
+                raise serializers.ValidationError({"shift": "Нельзя делать движение по закрытой смене."})
+
             if user and (not _is_owner_like(user)) and shift.cashier_id != user.id:
                 raise serializers.ValidationError({"shift": "Это не ваша смена."})
 
@@ -566,18 +558,26 @@ class CashFlowSerializer(CompanyBranchReadOnlyMixin):
         cashbox = validated_data.get("cashbox")
         shift = validated_data.get("shift", None)
 
-        # ✅ shift не передали — цепляем единственную открытую смену кассы
+        # ✅ shift не передали — цепляем OPEN смену именно ЭТОГО пользователя в этой кассе
         if not shift and cashbox:
+            if not user:
+                raise serializers.ValidationError({"shift": "Нужен пользователь для выбора смены."})
+
             open_shift = (
                 CashShift.objects
-                .filter(cashbox=cashbox, status=CashShift.Status.OPEN)
+                .filter(
+                    cashbox=cashbox,
+                    status=CashShift.Status.OPEN,
+                    cashier=user,
+                )
                 .order_by("-opened_at")
                 .first()
             )
-            if open_shift:
-                if user and (not _is_owner_like(user)) and open_shift.cashier_id != user.id:
-                    raise serializers.ValidationError({"cashbox": "Касса открыта другим кассиром. Нельзя делать движения."})
-                validated_data["shift"] = open_shift
+
+            if not open_shift:
+                raise serializers.ValidationError({"shift": "У вас нет открытой смены на этой кассе."})
+
+            validated_data["shift"] = open_shift
 
         if user and "cashier" not in validated_data:
             validated_data["cashier"] = user

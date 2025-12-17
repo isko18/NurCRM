@@ -155,11 +155,6 @@ def _get_active_branch(request):
 
 
 def _guess_sale_model():
-    """
-    Пытаемся найти модель Sale без жёсткого импорта:
-    - должна иметь FK cashbox -> Cashbox
-    - желательно поля status, total, payment_method, shift
-    """
     candidates = []
     for m in apps.get_models():
         try:
@@ -197,10 +192,6 @@ SALE_MODEL = None
 
 
 def get_sale_model():
-    """
-    ✅ Важно: не вычислять на импорте файла.
-    В dev autoreload/apps registry это реально ломает жизнь.
-    """
     global SALE_MODEL
     if SALE_MODEL is None:
         SALE_MODEL = _guess_sale_model()
@@ -208,9 +199,6 @@ def get_sale_model():
 
 
 def _choice_value(model, enum_name: str, member: str, fallback: str):
-    """
-    Достаём значение из TextChoices/Enum максимально мягко.
-    """
     enum = getattr(model, enum_name, None)
     v = getattr(enum, member, None)
     return getattr(v, "value", None) or v or fallback
@@ -304,8 +292,10 @@ class CashboxListCreateView(CompanyBranchScopedMixin, generics.ListCreateAPIView
 
     def list(self, request, *args, **kwargs):
         """
-        ✅ Ускорение: analytics считаем пачкой только для касс текущей страницы,
-        и отдаём в serializer через context["analytics_map"].
+        ✅ Ускорение: analytics считаем пачкой.
+        ✅ ВАЖНО: теперь у кассы может быть несколько OPEN смен.
+            - отдаём open_shifts: список по кассирам
+            - оставляем open_shift_expected_cash (для совместимости) как "самая свежая open смена"
         """
         z = Decimal("0.00")
 
@@ -323,7 +313,12 @@ class CashboxListCreateView(CompanyBranchScopedMixin, generics.ListCreateAPIView
                 "sales_total": z,
                 "cash_sales_total": z,
                 "noncash_sales_total": z,
+
+                # backward compatible (one value)
                 "open_shift_expected_cash": None,
+
+                # new (correct)
+                "open_shifts": [],
             }
             for cb_id in ids
         }
@@ -368,35 +363,36 @@ class CashboxListCreateView(CompanyBranchScopedMixin, generics.ListCreateAPIView
                     analytics_map[k]["cash_sales_total"] = r["cash_sum"] or z
                     analytics_map[k]["noncash_sales_total"] = r["noncash_sum"] or z
 
-            # ---- open shift expected cash (batch) ----
+            # ---- OPEN shifts (many) ----
             open_shifts = (
                 CashShift.objects
                 .filter(cashbox_id__in=ids, status=CashShift.Status.OPEN)
-                .only("id", "cashbox_id", "opening_cash", "opened_at")
+                .select_related("cashier")
+                .only("id", "cashbox_id", "cashier_id", "opening_cash", "opened_at")
                 .order_by("cashbox_id", "-opened_at")
             )
 
-            open_by_cashbox = {}
+            # group shifts by cashbox
+            by_cashbox = {}
             for sh in open_shifts:
-                if sh.cashbox_id not in open_by_cashbox:
-                    open_by_cashbox[sh.cashbox_id] = sh
+                by_cashbox.setdefault(sh.cashbox_id, []).append(sh)
 
-            if open_by_cashbox:
-                open_ids = [s.id for s in open_by_cashbox.values()]
+            if by_cashbox:
+                all_open_ids = [sh.id for lst in by_cashbox.values() for sh in lst]
 
-                # flows внутри open shift
+                # flows inside open shifts
                 shift_flows = (
                     CashFlow.objects
-                    .filter(shift_id__in=open_ids, status=CashFlow.Status.APPROVED)
-                    .values("shift__cashbox_id")
+                    .filter(shift_id__in=all_open_ids, status=CashFlow.Status.APPROVED)
+                    .values("shift_id")
                     .annotate(
                         income=Sum("amount", filter=Q(type=CashFlow.Type.INCOME)),
                         expense=Sum("amount", filter=Q(type=CashFlow.Type.EXPENSE)),
                     )
                 )
-                sf_map = {r["shift__cashbox_id"]: r for r in shift_flows}
+                sf_map = {r["shift_id"]: r for r in shift_flows}
 
-                # cash sales внутри open shift
+                # cash sales inside open shifts
                 cash_sales_map = {}
                 sale_model = get_sale_model()
                 if sale_model is not None:
@@ -405,19 +401,37 @@ class CashboxListCreateView(CompanyBranchScopedMixin, generics.ListCreateAPIView
 
                     cash_sales = (
                         sale_model.objects
-                        .filter(shift_id__in=open_ids, status=paid_value, payment_method=cash_value)
-                        .values("shift__cashbox_id")
+                        .filter(shift_id__in=all_open_ids, status=paid_value, payment_method=cash_value)
+                        .values("shift_id")
                         .annotate(cash_sum=Sum("total"))
                     )
-                    cash_sales_map = {r["shift__cashbox_id"]: (r["cash_sum"] or z) for r in cash_sales}
+                    cash_sales_map = {r["shift_id"]: (r["cash_sum"] or z) for r in cash_sales}
 
-                for cb_id, sh in open_by_cashbox.items():
+                # build per-cashbox open_shifts list
+                for cb_id, shifts in by_cashbox.items():
                     k = str(cb_id)
-                    inc = (sf_map.get(cb_id) or {}).get("income") or z
-                    exp = (sf_map.get(cb_id) or {}).get("expense") or z
-                    cash_sales_total = cash_sales_map.get(cb_id, z)
-                    opening_cash = sh.opening_cash or z
-                    analytics_map[k]["open_shift_expected_cash"] = opening_cash + cash_sales_total + inc - exp
+                    items = []
+
+                    for sh in shifts:
+                        inc = (sf_map.get(sh.id) or {}).get("income") or z
+                        exp = (sf_map.get(sh.id) or {}).get("expense") or z
+                        cash_sales_total = cash_sales_map.get(sh.id, z)
+                        opening_cash = sh.opening_cash or z
+                        expected = opening_cash + cash_sales_total + inc - exp
+
+                        items.append({
+                            "shift_id": str(sh.id),
+                            "cashier_id": str(sh.cashier_id),
+                            "opened_at": sh.opened_at.isoformat() if sh.opened_at else None,
+                            "opening_cash": str(opening_cash),
+                            "expected_cash": str(expected),
+                        })
+
+                    analytics_map[k]["open_shifts"] = items
+
+                    # backward compatible single value: most recent open shift
+                    if items:
+                        analytics_map[k]["open_shift_expected_cash"] = items[0]["expected_cash"]
 
         serializer = self.get_serializer(
             cashboxes,
@@ -534,11 +548,11 @@ class CashShiftListView(CompanyBranchScopedMixin, generics.ListAPIView):
             qs = qs.filter(cashier=user)
 
         cashbox_id = self.request.query_params.get("cashbox")
-        status = self.request.query_params.get("status")
+        status_q = self.request.query_params.get("status")
         if cashbox_id:
             qs = qs.filter(cashbox_id=cashbox_id)
-        if status in ("open", "closed"):
-            qs = qs.filter(status=status)
+        if status_q in ("open", "closed"):
+            qs = qs.filter(status=status_q)
 
         return qs
 
@@ -564,7 +578,7 @@ class CashShiftOpenView(CompanyBranchScopedMixin, generics.CreateAPIView):
     ✅ Открыть смену:
       - кассир открывает себе
       - owner/admin может открыть на другого кассира (cashier)
-    ✅ Важно: atomic нужен для select_for_update в сериализаторе
+    ✅ atomic нужен для select_for_update в serializer.validate
     """
     serializer_class = CashShiftOpenSerializer
 
@@ -582,7 +596,7 @@ class CashShiftCloseView(APIView):
 
     @transaction.atomic
     def post(self, request, pk):
-        company = getattr(request.user, "company", None) or getattr(request.user, "owned_company", None)
+        company = _get_company(request.user)
         if not company:
             raise PermissionDenied("У пользователя не настроена компания.")
 
@@ -593,13 +607,7 @@ class CashShiftCloseView(APIView):
         )
 
         user = request.user
-        is_owner_like = (
-            getattr(user, "is_superuser", False)
-            or getattr(user, "owned_company", None)
-            or getattr(user, "is_admin", False)
-            or getattr(user, "role", None) in ("owner", "admin")
-        )
-        if not is_owner_like and shift.cashier_id != user.id:
+        if not _is_owner_like(user) and shift.cashier_id != user.id:
             raise PermissionDenied("Нельзя закрыть чужую смену.")
 
         ser = CashShiftCloseSerializer(data=request.data)
@@ -613,26 +621,9 @@ class CashShiftCloseView(APIView):
         out = CashShiftListSerializer(shift, context={"request": request}).data
         return Response(out, status=200)
 
+
 class CashFlowBulkStatusUpdateView(CompanyBranchScopedMixin, generics.GenericAPIView):
-    """
-    PATCH /api/construction/cashflows/bulk/status/
-
-    body:
-    {
-      "items": [
-        {"id": "<uuid>", "status": "approved"},
-        {"id": "<uuid>", "status": "rejected"}
-      ]
-    }
-
-    Ограничения:
-    - проверяем доступ через scoped queryset (company/branch)
-    - проверяем missing_ids
-    - обновляем чанками, чтобы не упереться в лимиты SQL (10k+)
-    """
     serializer_class = CashFlowBulkStatusSerializer
-
-    # сколько When'ов в одном UPDATE (под 10k+ обязательно)
     CHUNK_SIZE = 1000
 
     @transaction.atomic
@@ -644,7 +635,6 @@ class CashFlowBulkStatusUpdateView(CompanyBranchScopedMixin, generics.GenericAPI
         if not items:
             return Response({"count": 0, "updated_ids": []}, status=200)
 
-        # дедуп по id: если одинаковые id прилетели несколько раз — берём последний статус
         id_to_status = {}
         for it in items:
             _id = it["id"]
@@ -662,7 +652,6 @@ class CashFlowBulkStatusUpdateView(CompanyBranchScopedMixin, generics.GenericAPI
         updated_ids = []
         updated_count = 0
 
-        # обновляем порциями, чтобы Case/When не раздувал SQL
         for i in range(0, len(ids), self.CHUNK_SIZE):
             chunk_ids = ids[i:i + self.CHUNK_SIZE]
 
@@ -671,7 +660,6 @@ class CashFlowBulkStatusUpdateView(CompanyBranchScopedMixin, generics.GenericAPI
                 for _id in chunk_ids
             ]
 
-            # scoped queryset уже отфильтровал company/branch, здесь режем по chunk_ids
             chunk_qs = qs.filter(id__in=chunk_ids)
 
             updated_count += chunk_qs.update(
