@@ -650,14 +650,14 @@ class Product(models.Model):
     barcode = models.CharField("Штрихкод", max_length=64, null=True, blank=True)
 
     brand = models.ForeignKey(
-        "ProductBrand",
+        ProductBrand,
         on_delete=models.SET_NULL,
         null=True,
         blank=True,
         verbose_name="Бренд",
     )
     category = models.ForeignKey(
-        "ProductCategory",
+        ProductCategory,
         on_delete=models.SET_NULL,
         null=True,
         blank=True,
