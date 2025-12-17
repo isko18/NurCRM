@@ -727,6 +727,7 @@ class SaleReceiptDataAPIView(APIView):
 
         payload = build_receipt_payload(sale, cashier_name=cashier_name, ensure_number=True)
         return Response(payload, status=200)
+
 class SaleStartAPIView(CompanyBranchRestrictedMixin, APIView):
     permission_classes = [permissions.IsAuthenticated]
 
@@ -751,34 +752,28 @@ class SaleStartAPIView(CompanyBranchRestrictedMixin, APIView):
             opening_cash=opening_cash,
         )
 
-        # ✅ читаем скидку (если не пришла — будет 0.00)
+        qs = Cart.objects.filter(company=company, user=user, status=Cart.Status.ACTIVE, shift=shift).order_by("-created_at")
+        cart = qs.first()
+
+        if cart is None:
+            cart = Cart.objects.create(company=company, user=user, status=Cart.Status.ACTIVE, branch=branch, shift=shift)
+        else:
+            extra_ids = list(qs.values_list("id", flat=True)[1:])
+            if extra_ids:
+                Cart.objects.filter(id__in=extra_ids).update(
+                    status=Cart.Status.CHECKED_OUT,
+                    updated_at=timezone.now(),
+                )
+
         opts = StartCartOptionsSerializer(data=request.data)
-        opts.is_valid(raise_exception=True)
-        order_disc = opts.validated_data.get("order_discount_total") or Decimal("0.00")
-
-        # ✅ ВАЖНО: не переиспользуем старую ACTIVE корзину — закрываем все и создаём новую
-        Cart.objects.filter(
-            company=company,
-            user=user,
-            status=Cart.Status.ACTIVE,
-            shift=shift,
-        ).update(
-            status=Cart.Status.CHECKED_OUT,
-            updated_at=timezone.now(),
-        )
-
-        cart = Cart.objects.create(
-            company=company,
-            user=user,
-            status=Cart.Status.ACTIVE,
-            branch=branch,
-            shift=shift,
-            order_discount_total=_q2(order_disc),
-        )
+        if opts.is_valid():
+            order_disc = opts.validated_data.get("order_discount_total")
+            if order_disc is not None:
+                cart.order_discount_total = _q2(order_disc)
+                cart.save(update_fields=["order_discount_total"])
 
         cart.recalc()
         return Response(SaleCartSerializer(cart).data, status=status.HTTP_201_CREATED)
-
 
 
 class CartDetailAPIView(generics.RetrieveAPIView):
