@@ -628,7 +628,7 @@ class Product(models.Model):
         verbose_name="Клиент",
     )
     created_by = models.ForeignKey(
-        "User",
+        User,
         on_delete=models.SET_NULL,
         null=True,
         blank=True,
