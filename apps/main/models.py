@@ -1358,6 +1358,8 @@ class Sale(models.Model):
     class PaymentMethod(models.TextChoices):
         CASH = "cash", "Наличные"
         TRANSFER = "transfer", "Перевод"
+        DEBT = "debt", "Долг"
+        
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
 
