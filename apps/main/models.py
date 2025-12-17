@@ -596,13 +596,13 @@ class Product(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
 
     company = models.ForeignKey(
-        "Company",
+        Company,
         on_delete=models.CASCADE,
         related_name="products",
         verbose_name="Компания",
     )
     branch = models.ForeignKey(
-        "Branch",
+        Branch,
         on_delete=models.CASCADE,
         related_name="crm_products",
         null=True,
