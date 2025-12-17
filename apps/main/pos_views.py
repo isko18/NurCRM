@@ -13,7 +13,7 @@ from reportlab.lib.utils import ImageReader
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 from rest_framework.exceptions import NotFound, PermissionDenied, ValidationError
-from decimal import Decimal, ROUND_HALF_UP
+from decimal import Decimal, ROUND_HALF_UP, InvalidOperation
 import qrcode
 from datetime import timedelta
 import io, os, uuid
@@ -47,7 +47,7 @@ from apps.users.models import Roles, User, Company
 import requests
 from django.conf import settings
 from apps.construction.models import Cashbox, CashShift
-
+from apps.utils import _is_owner_like
 try:
     from apps.main.models import ClientDeal, DealInstallment
 except Exception:
@@ -214,12 +214,22 @@ def _resolve_pos_cashbox(company, branch, cashbox_id=None):
 
 @transaction.atomic
 def _ensure_open_shift(*, company, branch, cashier, cashbox, opening_cash=None):
-    opening_cash = Decimal(opening_cash or "0.00")
+    # opening_cash -> Decimal("0.00") если не передали/пусто
+    try:
+        opening_cash = Decimal(str(opening_cash)) if opening_cash not in (None, "", "null") else Decimal("0.00")
+    except (InvalidOperation, ValueError, TypeError):
+        opening_cash = Decimal("0.00")
 
+    # ✅ ВАЖНО: ищем open смену только этого кассира в этой кассе
     shift = (
         CashShift.objects
         .select_for_update()
-        .filter(company=company, cashbox=cashbox, status=CashShift.Status.OPEN)
+        .filter(
+            company=company,
+            cashbox=cashbox,
+            cashier=cashier,
+            status=CashShift.Status.OPEN,
+        )
         .order_by("-opened_at")
         .first()
     )
@@ -743,6 +753,7 @@ class SaleStartAPIView(CompanyBranchRestrictedMixin, APIView):
         if not cashbox:
             raise ValidationError({"detail": "Нет кассы для этого филиала. Создай Cashbox."})
 
+        # ✅ теперь это будет shift ТОЛЬКО этого кассира в этой кассе
         shift = _ensure_open_shift(
             company=company,
             branch=branch,
@@ -751,11 +762,21 @@ class SaleStartAPIView(CompanyBranchRestrictedMixin, APIView):
             opening_cash=opening_cash,
         )
 
-        qs = Cart.objects.filter(company=company, user=user, status=Cart.Status.ACTIVE, shift=shift).order_by("-created_at")
+        qs = (
+            Cart.objects
+            .filter(company=company, user=user, status=Cart.Status.ACTIVE, shift=shift)
+            .order_by("-created_at")
+        )
         cart = qs.first()
 
         if cart is None:
-            cart = Cart.objects.create(company=company, user=user, status=Cart.Status.ACTIVE, branch=branch, shift=shift)
+            cart = Cart.objects.create(
+                company=company,
+                user=user,
+                status=Cart.Status.ACTIVE,
+                branch=branch,
+                shift=shift,
+            )
         else:
             extra_ids = list(qs.values_list("id", flat=True)[1:])
             if extra_ids:
@@ -773,6 +794,7 @@ class SaleStartAPIView(CompanyBranchRestrictedMixin, APIView):
 
         cart.recalc()
         return Response(SaleCartSerializer(cart).data, status=status.HTTP_201_CREATED)
+
 
 
 class CartDetailAPIView(generics.RetrieveAPIView):
@@ -924,17 +946,44 @@ class SaleCheckoutAPIView(APIView):
         client_id = ser.validated_data.get("client_id")
         payment_method = ser.validated_data.get("payment_method") or Sale.PaymentMethod.CASH
         cash_received = ser.validated_data.get("cash_received") or Decimal("0.00")
-        cashbox_id = ser.validated_data.get("cashbox_id")
 
-        # ✅ гарантируем смену (иначе Sale.save/full_clean может требовать cashbox)
+        cashbox_id = ser.validated_data.get("cashbox_id")
+        shift_id = ser.validated_data.get("shift_id")  # ✅ важно
+
+        # ✅ гарантируем shift на корзине
         if not cart.shift_id:
             company = cart.company
             branch = getattr(cart, "branch", None)
+
             cashbox = _resolve_pos_cashbox(company, branch, cashbox_id=cashbox_id)
             if not cashbox:
                 raise ValidationError({"detail": "Нет кассы для этого филиала. Создай Cashbox."})
 
-            shift = _ensure_open_shift(company=company, branch=branch, cashier=request.user, cashbox=cashbox)
+            # ✅ если shift_id дали — привязываем именно его
+            if shift_id:
+                shift = (
+                    CashShift.objects
+                    .select_for_update()
+                    .filter(
+                        id=shift_id,
+                        company=company,
+                        cashbox=cashbox,
+                        status=CashShift.Status.OPEN,
+                    )
+                    .first()
+                )
+                if not shift:
+                    raise ValidationError({"shift_id": "Смена не найдена или закрыта, или не относится к этой кассе."})
+
+                # ✅ обычный кассир не может продавать в чужую смену
+                if (not getattr(request.user, "is_superuser", False)) and (not _is_owner_like(request.user)):
+                    if shift.cashier_id != request.user.id:
+                        raise ValidationError({"shift_id": "Нельзя оформить продажу в чужую смену."})
+
+            else:
+                # ✅ shift_id не дали — берём/создаём смену ТОЛЬКО текущего кассира
+                shift = _ensure_open_shift(company=company, branch=branch, cashier=request.user, cashbox=cashbox)
+
             cart.shift = shift
             cart.save(update_fields=["shift"])
 
@@ -952,7 +1001,7 @@ class SaleCheckoutAPIView(APIView):
         except ValueError as e:
             return Response({"detail": str(e)}, status=status.HTTP_400_BAD_REQUEST)
 
-        # ✅ точно привяжем к смене (на случай если сервис не проставил)
+        # ✅ точно привяжем к смене
         if cart.shift_id and sale.shift_id != cart.shift_id:
             sale.shift_id = cart.shift_id
             sale.save(update_fields=["shift"])
@@ -962,7 +1011,6 @@ class SaleCheckoutAPIView(APIView):
             sale.client = client
             sale.save(update_fields=["client"])
 
-        # ✅ нормально “оплатить” (paid_at + status)
         sale.mark_paid(payment_method=payment_method, cash_received=cash_received)
 
         payload = {
@@ -1000,6 +1048,7 @@ class SaleCheckoutAPIView(APIView):
             payload["receipt_text"] = "ЧЕК\n" + "\n".join(lines) + "\n" + "\n".join(totals)
 
         return Response(payload, status=status.HTTP_201_CREATED)
+
 
 
 

@@ -1,7 +1,7 @@
 from decimal import Decimal, ROUND_HALF_UP
 from rest_framework import serializers
 
-from apps.construction.models import Cashbox  # ✅ нужно для checkout без смены
+from apps.construction.models import Cashbox, CashShift  # ✅ cashbox/shift для checkout
 from .models import (
     Product, Cart, CartItem, Sale, SaleItem, MobileScannerToken, ProductImage
 )
@@ -209,6 +209,24 @@ class OptionalUUIDField(serializers.UUIDField):
         return super().to_internal_value(data)
 
 
+# ⚠️ ВАЖНО:
+# - Эта функция у тебя уже есть в construction serializers.
+# - Если в этом файле её нет — импортни или вставь такую же.
+def _is_owner_like(user) -> bool:
+    if not user or not getattr(user, "is_authenticated", False):
+        return False
+    if getattr(user, "is_superuser", False):
+        return True
+    if getattr(user, "owned_company", None):
+        return True
+    if getattr(user, "is_admin", False):
+        return True
+    role = getattr(user, "role", None)
+    if role in ("owner", "admin", "OWNER", "ADMIN", "Владелец", "Администратор"):
+        return True
+    return False
+
+
 class CheckoutSerializer(serializers.Serializer):
     print_receipt = serializers.BooleanField(default=False)
     client_id = OptionalUUIDField(required=False, allow_null=True)
@@ -217,6 +235,9 @@ class CheckoutSerializer(serializers.Serializer):
     # если смены нет — можно передать кассу (или автоподбор)
     cashbox_id = OptionalUUIDField(required=False, allow_null=True)
 
+    # ✅ НОВОЕ: можно явно указать смену (нужно, когда 2 смены на 1 кассу)
+    shift_id = OptionalUUIDField(required=False, allow_null=True)
+
     payment_method = serializers.ChoiceField(
         choices=Sale.PaymentMethod.choices,
         default=Sale.PaymentMethod.CASH,
@@ -224,12 +245,82 @@ class CheckoutSerializer(serializers.Serializer):
     )
     cash_received = MoneyField(required=False, allow_null=True)
 
+    def _resolve_cashbox(self, cart: Cart, cashbox_id):
+        if not cashbox_id:
+            cb = (
+                Cashbox.objects
+                .filter(company_id=cart.company_id, branch_id=cart.branch_id)
+                .order_by("-created_at")
+                .first()
+                or Cashbox.objects
+                .filter(company_id=cart.company_id, branch__isnull=True)
+                .order_by("-created_at")
+                .first()
+            )
+            if cb:
+                return cb
+            raise serializers.ValidationError({"cashbox_id": "Нет кассы для этого филиала/компании."})
+
+        cb = Cashbox.objects.filter(id=cashbox_id).first()
+        if not cb:
+            raise serializers.ValidationError({"cashbox_id": "Касса не найдена."})
+        if cb.company_id != cart.company_id:
+            raise serializers.ValidationError({"cashbox_id": "Касса другой компании."})
+        if (cb.branch_id or None) != (cart.branch_id or None):
+            raise serializers.ValidationError({"cashbox_id": "Касса другого филиала."})
+
+        return cb
+
+    def _resolve_shift(self, cart: Cart, cashbox: Cashbox, user, shift_id):
+        # 1) если shift_id явно передали — валидируем
+        if shift_id:
+            sh = CashShift.objects.select_related("cashbox", "cashier").filter(id=shift_id).first()
+            if not sh:
+                raise serializers.ValidationError({"shift_id": "Смена не найдена."})
+            if sh.company_id != cart.company_id:
+                raise serializers.ValidationError({"shift_id": "Смена другой компании."})
+            if (sh.branch_id or None) != (cart.branch_id or None):
+                raise serializers.ValidationError({"shift_id": "Смена другого филиала."})
+            if sh.cashbox_id != cashbox.id:
+                raise serializers.ValidationError({"shift_id": "Смена относится к другой кассе."})
+            if sh.status != CashShift.Status.OPEN:
+                raise serializers.ValidationError({"shift_id": "Смена закрыта. Нужна открытая смена."})
+
+            if user and (not _is_owner_like(user)) and sh.cashier_id != user.id:
+                raise serializers.ValidationError({"shift_id": "Нельзя оформить продажу в чужую смену."})
+
+            return sh
+
+        # 2) shift_id не передали → берём открытую смену текущего пользователя в этой кассе
+        if not user or not getattr(user, "is_authenticated", False):
+            raise serializers.ValidationError({"shift_id": "Нужен пользователь для определения смены."})
+
+        sh = (
+            CashShift.objects
+            .filter(
+                company_id=cart.company_id,
+                branch_id=cart.branch_id,
+                cashbox=cashbox,
+                status=CashShift.Status.OPEN,
+                cashier=user,
+            )
+            .order_by("-opened_at")
+            .first()
+        )
+        if sh:
+            return sh
+
+        raise serializers.ValidationError(
+            {"shift_id": "У вас нет открытой смены в этой кассе. Откройте смену перед продажей."}
+        )
+
     def validate(self, attrs):
         cart = self.context.get("cart")
         if not cart:
             raise serializers.ValidationError("Serializer context должен содержать cart.")
 
-        shift_id = getattr(cart, "shift_id", None)
+        request = self.context.get("request")
+        user = getattr(request, "user", None) if request else None
 
         # --- оплата ---
         payment_method = attrs.get("payment_method") or Sale.PaymentMethod.CASH
@@ -247,41 +338,19 @@ class CheckoutSerializer(serializers.Serializer):
                 raise serializers.ValidationError({"cash_received": "Не может быть отрицательной."})
 
         # --- касса/смена ---
-        if shift_id:
-            # есть смена → касса берётся из смены, cashbox_id игнорируем
+        if getattr(cart, "shift_id", None):
+            # уже привязано на старте продажи — не трогаем
             attrs["cashbox_id"] = None
+            attrs["shift_id"] = None
             return attrs
 
-        cashbox_id = attrs.get("cashbox_id")
+        cb = self._resolve_cashbox(cart, attrs.get("cashbox_id"))
+        sh = self._resolve_shift(cart, cb, user, attrs.get("shift_id"))
 
-        # смены нет → автоподбор кассы (ПОСЛЕДНЯЯ)
-        if not cashbox_id:
-            cb = (
-                Cashbox.objects
-                .filter(company_id=cart.company_id, branch_id=cart.branch_id)
-                .order_by("-created_at")
-                .first()
-                or Cashbox.objects
-                .filter(company_id=cart.company_id, branch__isnull=True)
-                .order_by("-created_at")
-                .first()
-            )
-            if cb:
-                attrs["cashbox_id"] = cb.id
-                return attrs
-
-            raise serializers.ValidationError({"cashbox_id": "Нет кассы для этого филиала/компании."})
-
-        # валидация кассы
-        cb = Cashbox.objects.filter(id=cashbox_id).first()
-        if not cb:
-            raise serializers.ValidationError({"cashbox_id": "Касса не найдена."})
-        if cb.company_id != cart.company_id:
-            raise serializers.ValidationError({"cashbox_id": "Касса другой компании."})
-        if (cb.branch_id or None) != (cart.branch_id or None):
-            raise serializers.ValidationError({"cashbox_id": "Касса другого филиала."})
-
+        attrs["cashbox_id"] = cb.id
+        attrs["shift_id"] = sh.id
         return attrs
+
 
 class MobileScannerTokenSerializer(serializers.ModelSerializer):
     class Meta:
