@@ -1316,16 +1316,34 @@ class Cart(models.Model):
 class CartItem(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     company = models.ForeignKey(Company, on_delete=models.CASCADE, related_name="cart_items")
-    branch = models.ForeignKey(Branch, on_delete=models.CASCADE, related_name="crm_cart_items", null=True, blank=True, db_index=True)
+    branch = models.ForeignKey(Branch, on_delete=models.CASCADE, related_name="crm_cart_items",
+                               null=True, blank=True, db_index=True)
 
-    cart = models.ForeignKey(Cart, on_delete=models.CASCADE, related_name="items")
-    product = models.ForeignKey("main.Product", null=True, blank=True, on_delete=models.SET_NULL, related_name="cart_items")
+    cart = models.ForeignKey("Cart", on_delete=models.CASCADE, related_name="items")
+    product = models.ForeignKey("main.Product", null=True, blank=True,
+                                on_delete=models.SET_NULL, related_name="cart_items")
+
     custom_name = models.CharField(max_length=255, blank=True)
-    quantity = models.PositiveIntegerField(default=1)
+
+    # ✅ было PositiveIntegerField — стало DecimalField (под вес)
+    quantity = models.DecimalField(
+        "Количество",
+        max_digits=10,
+        decimal_places=3,
+        default=Decimal("1.000"),
+    )
+
     unit_price = models.DecimalField(max_digits=12, decimal_places=2)
 
     class Meta:
-        unique_together = (("cart", "product"),)
+        constraints = [
+            # ✅ product может быть NULL для кастомных позиций — unique_together ломается
+            models.UniqueConstraint(
+                fields=("cart", "product"),
+                condition=Q(product__isnull=False),
+                name="uq_cart_product_not_null",
+            )
+        ]
 
     def clean(self):
         if self.cart_id and self.company_id and self.cart.company_id != self.company_id:
@@ -1334,6 +1352,8 @@ class CartItem(models.Model):
             raise ValidationError({"branch": "Филиал позиции должен совпадать с филиалом корзины."})
         if self.product_id and self.company_id and self.product.company_id != self.company_id:
             raise ValidationError({"product": "Товар принадлежит другой компании."})
+        if self.quantity is not None and self.quantity <= 0:
+            raise ValidationError({"quantity": "Количество должно быть больше 0."})
 
     def save(self, *args, **kwargs):
         if self.cart_id:
@@ -1345,7 +1365,10 @@ class CartItem(models.Model):
 
         self.full_clean()
         super().save(*args, **kwargs)
+
+        # ❗️я бы НЕ делал recalc() внутри save(), иначе при recalc() ты снова сохраняешь cart и ловишь лишние запросы
         self.cart.recalc()
+
 
 
 class Sale(models.Model):

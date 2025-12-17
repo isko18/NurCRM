@@ -916,6 +916,9 @@ class SaleCheckoutAPIView(APIView):
 
     @transaction.atomic
     def post(self, request, pk, *args, **kwargs):
+        # ─────────────────────────────────────────────────────────────
+        # 1) cart: безопасность (обычный кассир — только свою)
+        # ─────────────────────────────────────────────────────────────
         qs = Cart.objects.filter(
             id=pk,
             company=request.user.company,
@@ -925,6 +928,9 @@ class SaleCheckoutAPIView(APIView):
             qs = qs.filter(user=request.user)
         cart = get_object_or_404(qs)
 
+        # ─────────────────────────────────────────────────────────────
+        # 2) validate payload
+        # ─────────────────────────────────────────────────────────────
         ser = CheckoutSerializer(data=request.data, context={"request": request, "cart": cart})
         ser.is_valid(raise_exception=True)
 
@@ -934,8 +940,11 @@ class SaleCheckoutAPIView(APIView):
         cash_received = ser.validated_data.get("cash_received") or Decimal("0.00")
 
         cashbox_id = ser.validated_data.get("cashbox_id")
-        shift_id = ser.validated_data.get("shift_id")
+        shift_id = ser.validated_data.get("shift_id")  # ✅ если сериалайзер поддерживает
 
+        # ─────────────────────────────────────────────────────────────
+        # 3) гарантируем shift на корзине
+        # ─────────────────────────────────────────────────────────────
         if not cart.shift_id:
             company = cart.company
             branch = getattr(cart, "branch", None)
@@ -945,6 +954,7 @@ class SaleCheckoutAPIView(APIView):
                 raise ValidationError({"detail": "Нет кассы для этого филиала. Создай Cashbox."})
 
             if shift_id:
+                # ✅ привязываем именно указанную смену (если открыта и принадлежит этой кассе)
                 shift = (
                     CashShift.objects
                     .select_for_update()
@@ -959,15 +969,25 @@ class SaleCheckoutAPIView(APIView):
                 if not shift:
                     raise ValidationError({"shift_id": "Смена не найдена или закрыта, или не относится к этой кассе."})
 
+                # ✅ обычный кассир не может продавать в чужую смену
                 if not _is_owner_like(request.user) and not getattr(request.user, "is_superuser", False):
                     if shift.cashier_id != request.user.id:
                         raise ValidationError({"shift_id": "Нельзя оформить продажу в чужую смену."})
             else:
-                shift = _ensure_open_shift(company=company, branch=branch, cashier=request.user, cashbox=cashbox)
+                # ✅ shift_id не дали — берём/создаём смену текущего кассира
+                shift = _ensure_open_shift(
+                    company=company,
+                    branch=branch,
+                    cashier=request.user,
+                    cashbox=cashbox,
+                )
 
             cart.shift = shift
             cart.save(update_fields=["shift"])
 
+        # ─────────────────────────────────────────────────────────────
+        # 4) пересчёт и проверка оплаты
+        # ─────────────────────────────────────────────────────────────
         cart.recalc()
 
         if payment_method == Sale.PaymentMethod.CASH and cash_received < (cart.total or Decimal("0")):
@@ -976,6 +996,9 @@ class SaleCheckoutAPIView(APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
+        # ─────────────────────────────────────────────────────────────
+        # 5) checkout service
+        # ─────────────────────────────────────────────────────────────
         try:
             sale = checkout_cart(cart)
         except NotEnoughStock as e:
@@ -983,31 +1006,37 @@ class SaleCheckoutAPIView(APIView):
         except ValueError as e:
             return Response({"detail": str(e)}, status=status.HTTP_400_BAD_REQUEST)
 
+        # ─────────────────────────────────────────────────────────────
+        # 6) жёстко синхронизируем shift/cashbox (иначе могут "разъехаться")
+        # ─────────────────────────────────────────────────────────────
         if cart.shift_id:
             sh = CashShift.objects.select_related("cashbox").get(id=cart.shift_id)
+
             upd = []
             if sale.shift_id != sh.id:
                 sale.shift_id = sh.id
                 upd.append("shift")
+
+            # ✅ cashbox должен соответствовать смене
             if getattr(sale, "cashbox_id", None) != sh.cashbox_id:
                 sale.cashbox_id = sh.cashbox_id
                 upd.append("cashbox")
+
             if upd:
                 sale.save(update_fields=upd)
 
+        # ─────────────────────────────────────────────────────────────
+        # 7) client
+        # ─────────────────────────────────────────────────────────────
         if client_id:
             client = get_object_or_404(Client, id=client_id, company=request.user.company)
             sale.client = client
             sale.save(update_fields=["client"])
 
+        # ─────────────────────────────────────────────────────────────
+        # 8) mark paid
+        # ─────────────────────────────────────────────────────────────
         sale.mark_paid(payment_method=payment_method, cash_received=cash_received)
-
-        # ✅ вот оно — фикс "липкой скидки" (и вообще липкого состояния)
-        Cart.objects.filter(pk=cart.pk).update(
-            status=Cart.Status.CHECKED_OUT,
-            updated_at=timezone.now(),
-            order_discount_total=Decimal("0.00"),
-        )
 
         payload = {
             "sale_id": str(sale.id),
