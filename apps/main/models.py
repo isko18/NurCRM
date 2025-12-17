@@ -787,14 +787,18 @@ class Product(models.Model):
     def _pg_lock_company(self):
         """
         Защита от гонок при генерации max()+1.
-        Все создания товаров в одной company идут по очереди.
+        В Postgres pg_advisory_xact_lock принимает BIGINT (int8).
         """
         if not self.company_id:
             return
-        key = int(str(self.company_id).replace("-", "")[:16], 16)  # 64-bit key
-        with connection.cursor() as cur:
-            cur.execute("SELECT pg_advisory_xact_lock(%s);", [key])
 
+        # 64-bit key (0..2^63-1)
+        key = int(str(self.company_id).replace("-", "")[:16], 16)
+        key = key & 0x7FFFFFFFFFFFFFFF  # чтобы точно влез в signed BIGINT
+
+        with connection.cursor() as cur:
+            # ЯВНО кастим к BIGINT, чтобы не улетало в numeric
+            cur.execute("SELECT pg_advisory_xact_lock(%s::bigint);", [key])
     # --------- внутренние методы ---------
     def _auto_generate_plu(self):
         if not self.is_weight:
