@@ -1,7 +1,7 @@
 from decimal import Decimal, ROUND_HALF_UP
 from rest_framework import serializers
 
-from apps.construction.models import Cashbox, CashShift
+from apps.construction.models import Cashbox, CashShift  # ✅ cashbox/shift для checkout
 from .models import (
     Product, Cart, CartItem, Sale, SaleItem, MobileScannerToken, ProductImage
 )
@@ -36,11 +36,7 @@ class MoneyField(serializers.DecimalField):
 
 
 class StartCartOptionsSerializer(serializers.Serializer):
-    """
-    ВАЖНО: default=0.00 чтобы скидка НЕ залипала.
-    Если фронт не отправил поле — мы всё равно получим 0.00.
-    """
-    order_discount_total = MoneyField(required=False, default=Decimal("0.00"))
+    order_discount_total = MoneyField(required=False)
 
     def validate_order_discount_total(self, v):
         if v is not None and v < 0:
@@ -51,12 +47,7 @@ class StartCartOptionsSerializer(serializers.Serializer):
 class CustomCartItemCreateSerializer(serializers.Serializer):
     name = serializers.CharField(max_length=255)
     price = MoneyField()
-    quantity = MoneyField(required=False, default=Decimal("1"))  # можно и int, но под вес лучше decimal
-
-    def validate_quantity(self, v):
-        if v is not None and v <= 0:
-            raise serializers.ValidationError("Минимум 1.")
-        return v
+    quantity = serializers.IntegerField(min_value=1, required=False, default=1)
 
 
 class ProductImageReadSerializer(serializers.ModelSerializer):
@@ -74,7 +65,7 @@ class ProductImageReadSerializer(serializers.ModelSerializer):
         return request.build_absolute_uri(url) if request else url
 
 
-# ⚠️ Историческое название (у тебя импорты). Фактически это CartItem serializer.
+# ⚠️ это serializer для CartItem (название у тебя старое, оставляю чтобы не ломать импорты)
 class SaleItemSerializer(serializers.ModelSerializer):
     product_name = serializers.CharField(source="product.name", read_only=True)
     barcode = serializers.CharField(source="product.barcode", read_only=True)
@@ -85,24 +76,16 @@ class SaleItemSerializer(serializers.ModelSerializer):
     class Meta:
         model = CartItem
         fields = (
-            "id",
-            "cart",
-            "product",
-            "product_name",
-            "barcode",
-            "quantity",
-            "unit_price",
+            "id", "cart", "product",
+            "product_name", "barcode",
+            "quantity", "unit_price",
             "display_name",
             "primary_image_url",
             "images",
         )
         read_only_fields = (
-            "id",
-            "product_name",
-            "barcode",
-            "display_name",
-            "primary_image_url",
-            "images",
+            "id", "product_name", "barcode",
+            "display_name", "primary_image_url", "images",
         )
 
     def get_display_name(self, obj):
@@ -147,7 +130,7 @@ class SaleItemSerializer(serializers.ModelSerializer):
             self._validate_company_branch(cart, product)
 
         qty = attrs.get("quantity", _get_attr(self.instance, "quantity", 1))
-        if qty is not None and Decimal(str(qty)) <= 0:
+        if qty is not None and qty < 1:
             raise serializers.ValidationError({"quantity": "Минимум 1."})
 
         return attrs
@@ -226,6 +209,9 @@ class OptionalUUIDField(serializers.UUIDField):
         return super().to_internal_value(data)
 
 
+# ⚠️ ВАЖНО:
+# - Эта функция у тебя уже есть в construction serializers.
+# - Если в этом файле её нет — импортни или вставь такую же.
 def _is_owner_like(user) -> bool:
     if not user or not getattr(user, "is_authenticated", False):
         return False
@@ -246,7 +232,10 @@ class CheckoutSerializer(serializers.Serializer):
     client_id = OptionalUUIDField(required=False, allow_null=True)
     department_id = OptionalUUIDField(required=False, allow_null=True)
 
+    # если смены нет — можно передать кассу (или автоподбор)
     cashbox_id = OptionalUUIDField(required=False, allow_null=True)
+
+    # ✅ НОВОЕ: можно явно указать смену (нужно, когда 2 смены на 1 кассу)
     shift_id = OptionalUUIDField(required=False, allow_null=True)
 
     payment_method = serializers.ChoiceField(
@@ -257,21 +246,17 @@ class CheckoutSerializer(serializers.Serializer):
     cash_received = MoneyField(required=False, allow_null=True)
 
     def _resolve_cashbox(self, cart: Cart, cashbox_id):
-        # Автоподбор — только по филиалу корзины, потом глобальная касса компании (если разрешено)
         if not cashbox_id:
             cb = (
                 Cashbox.objects
                 .filter(company_id=cart.company_id, branch_id=cart.branch_id)
                 .order_by("-created_at")
                 .first()
+                or Cashbox.objects
+                .filter(company_id=cart.company_id, branch__isnull=True)
+                .order_by("-created_at")
+                .first()
             )
-            if not cb:
-                cb = (
-                    Cashbox.objects
-                    .filter(company_id=cart.company_id, branch__isnull=True)
-                    .order_by("-created_at")
-                    .first()
-                )
             if cb:
                 return cb
             raise serializers.ValidationError({"cashbox_id": "Нет кассы для этого филиала/компании."})
@@ -281,25 +266,21 @@ class CheckoutSerializer(serializers.Serializer):
             raise serializers.ValidationError({"cashbox_id": "Касса не найдена."})
         if cb.company_id != cart.company_id:
             raise serializers.ValidationError({"cashbox_id": "Касса другой компании."})
-
-        # ✅ Вариант “глобальная касса разрешена”: branch=None принимаем для любого филиала
-        if cb.branch_id is not None and (cb.branch_id or None) != (cart.branch_id or None):
+        if (cb.branch_id or None) != (cart.branch_id or None):
             raise serializers.ValidationError({"cashbox_id": "Касса другого филиала."})
 
         return cb
 
     def _resolve_shift(self, cart: Cart, cashbox: Cashbox, user, shift_id):
+        # 1) если shift_id явно передали — валидируем
         if shift_id:
             sh = CashShift.objects.select_related("cashbox", "cashier").filter(id=shift_id).first()
             if not sh:
                 raise serializers.ValidationError({"shift_id": "Смена не найдена."})
             if sh.company_id != cart.company_id:
                 raise serializers.ValidationError({"shift_id": "Смена другой компании."})
-
-            # если у смены branch задан — должен совпадать; если branch=None — считаем глобальной
-            if sh.branch_id is not None and (sh.branch_id or None) != (cart.branch_id or None):
+            if (sh.branch_id or None) != (cart.branch_id or None):
                 raise serializers.ValidationError({"shift_id": "Смена другого филиала."})
-
             if sh.cashbox_id != cashbox.id:
                 raise serializers.ValidationError({"shift_id": "Смена относится к другой кассе."})
             if sh.status != CashShift.Status.OPEN:
@@ -310,30 +291,27 @@ class CheckoutSerializer(serializers.Serializer):
 
             return sh
 
+        # 2) shift_id не передали → берём открытую смену текущего пользователя в этой кассе
         if not user or not getattr(user, "is_authenticated", False):
             raise serializers.ValidationError({"shift_id": "Нужен пользователь для определения смены."})
 
-        qs = (
+        sh = (
             CashShift.objects
             .filter(
                 company_id=cart.company_id,
+                branch_id=cart.branch_id,
                 cashbox=cashbox,
                 status=CashShift.Status.OPEN,
+                cashier=user,
             )
             .order_by("-opened_at")
+            .first()
         )
-
-        # ✅ owner/admin может работать в любой открытой смене этой кассы
-        if _is_owner_like(user):
-            sh = qs.first()
-        else:
-            sh = qs.filter(cashier=user).first()
-
         if sh:
             return sh
 
         raise serializers.ValidationError(
-            {"shift_id": "Нет открытой смены в этой кассе. Откройте смену перед продажей."}
+            {"shift_id": "У вас нет открытой смены в этой кассе. Откройте смену перед продажей."}
         )
 
     def validate(self, attrs):
@@ -344,6 +322,7 @@ class CheckoutSerializer(serializers.Serializer):
         request = self.context.get("request")
         user = getattr(request, "user", None) if request else None
 
+        # --- оплата ---
         payment_method = attrs.get("payment_method") or Sale.PaymentMethod.CASH
         cash_received = attrs.get("cash_received")
 
@@ -358,8 +337,9 @@ class CheckoutSerializer(serializers.Serializer):
             elif cash_received < 0:
                 raise serializers.ValidationError({"cash_received": "Не может быть отрицательной."})
 
-        # если cart уже со сменой — не вмешиваемся
+        # --- касса/смена ---
         if getattr(cart, "shift_id", None):
+            # уже привязано на старте продажи — не трогаем
             attrs["cashbox_id"] = None
             attrs["shift_id"] = None
             return attrs
@@ -382,7 +362,7 @@ class MobileScannerTokenSerializer(serializers.ModelSerializer):
 class SaleListSerializer(serializers.ModelSerializer):
     user_display = serializers.SerializerMethodField()
     client_name = serializers.CharField(source="client.full_name", read_only=True)
-    change = serializers.SerializerMethodField(read_only=True)
+    change = serializers.DecimalField(max_digits=12, decimal_places=2, read_only=True)
     first_item_name = serializers.SerializerMethodField(read_only=True)
 
     shift = serializers.PrimaryKeyRelatedField(read_only=True)
@@ -436,11 +416,6 @@ class SaleListSerializer(serializers.ModelSerializer):
             return f"Касса филиала {cb.branch.name}"
         return cb.name or "Касса компании"
 
-    def get_change(self, obj):
-        if obj.payment_method != Sale.PaymentMethod.CASH:
-            return money(Decimal("0"))
-        return money((obj.cash_received or Decimal("0")) - (obj.total or Decimal("0")))
-
 
 class SaleItemReadSerializer(serializers.ModelSerializer):
     product_name = serializers.SerializerMethodField()
@@ -472,7 +447,7 @@ class SaleDetailSerializer(serializers.ModelSerializer):
     user_display = serializers.SerializerMethodField(read_only=True)
     items = SaleItemReadSerializer(many=True, read_only=True)
     client_name = serializers.CharField(source="client.full_name", read_only=True)
-    change = serializers.SerializerMethodField(read_only=True)
+    change = serializers.DecimalField(max_digits=12, decimal_places=2, read_only=True)
 
     shift = serializers.PrimaryKeyRelatedField(read_only=True)
     cashbox = serializers.PrimaryKeyRelatedField(read_only=True)
@@ -519,11 +494,6 @@ class SaleDetailSerializer(serializers.ModelSerializer):
         if getattr(cb, "branch", None):
             return f"Касса филиала {cb.branch.name}"
         return cb.name or "Касса компании"
-
-    def get_change(self, obj):
-        if obj.payment_method != Sale.PaymentMethod.CASH:
-            return money(Decimal("0"))
-        return money((obj.cash_received or Decimal("0")) - (obj.total or Decimal("0")))
 
 
 class SaleStatusUpdateSerializer(serializers.ModelSerializer):

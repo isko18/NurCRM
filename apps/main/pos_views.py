@@ -47,7 +47,6 @@ from apps.users.models import Roles, User, Company
 import requests
 from django.conf import settings
 from apps.construction.models import Cashbox, CashShift
-from apps.utils import _is_owner_like
 
 try:
     from apps.main.models import ClientDeal, DealInstallment
@@ -911,14 +910,12 @@ class SaleCheckoutAPIView(APIView):
 
     @transaction.atomic
     def post(self, request, pk, *args, **kwargs):
-        qs = Cart.objects.filter(
+        cart = get_object_or_404(
+            Cart,
             id=pk,
             company=request.user.company,
             status=Cart.Status.ACTIVE,
         )
-        if not _is_owner_like(request.user):
-            qs = qs.filter(user=request.user)
-        cart = get_object_or_404(qs)
 
         ser = CheckoutSerializer(data=request.data, context={"request": request, "cart": cart})
         ser.is_valid(raise_exception=True)
@@ -927,57 +924,27 @@ class SaleCheckoutAPIView(APIView):
         client_id = ser.validated_data.get("client_id")
         payment_method = ser.validated_data.get("payment_method") or Sale.PaymentMethod.CASH
         cash_received = ser.validated_data.get("cash_received") or Decimal("0.00")
-
         cashbox_id = ser.validated_data.get("cashbox_id")
-        shift_id = ser.validated_data.get("shift_id")
 
-        # 1) гарантируем shift на корзине
+        # ✅ гарантируем смену (иначе Sale.save/full_clean может требовать cashbox)
         if not cart.shift_id:
             company = cart.company
             branch = getattr(cart, "branch", None)
-
             cashbox = _resolve_pos_cashbox(company, branch, cashbox_id=cashbox_id)
             if not cashbox:
                 raise ValidationError({"detail": "Нет кассы для этого филиала. Создай Cashbox."})
 
-            if shift_id:
-                shift = (
-                    CashShift.objects
-                    .select_for_update()
-                    .filter(
-                        id=shift_id,
-                        company=company,
-                        cashbox=cashbox,
-                        status=CashShift.Status.OPEN,
-                    )
-                    .first()
-                )
-                if not shift:
-                    raise ValidationError({"shift_id": "Смена не найдена или закрыта, или не относится к этой кассе."})
-
-                if not _is_owner_like(request.user) and not getattr(request.user, "is_superuser", False):
-                    if shift.cashier_id != request.user.id:
-                        raise ValidationError({"shift_id": "Нельзя оформить продажу в чужую смену."})
-            else:
-                shift = _ensure_open_shift(
-                    company=company,
-                    branch=branch,
-                    cashier=request.user,
-                    cashbox=cashbox,
-                )
-
+            shift = _ensure_open_shift(company=company, branch=branch, cashier=request.user, cashbox=cashbox)
             cart.shift = shift
             cart.save(update_fields=["shift"])
 
-        # 2) пересчёт и проверка оплаты
         cart.recalc()
-        if payment_method == Sale.PaymentMethod.CASH and cash_received < (cart.total or Decimal("0")):
+        if payment_method == Sale.PaymentMethod.CASH and cash_received < cart.total:
             return Response(
                 {"detail": "Сумма, полученная наличными, меньше суммы продажи."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        # 3) checkout
         try:
             sale = checkout_cart(cart)
         except NotEnoughStock as e:
@@ -985,34 +952,18 @@ class SaleCheckoutAPIView(APIView):
         except ValueError as e:
             return Response({"detail": str(e)}, status=status.HTTP_400_BAD_REQUEST)
 
-        # 4) синхронизируем shift/cashbox
-        if cart.shift_id:
-            sh = CashShift.objects.select_related("cashbox").get(id=cart.shift_id)
-            upd = []
-            if sale.shift_id != sh.id:
-                sale.shift_id = sh.id
-                upd.append("shift")
-            if getattr(sale, "cashbox_id", None) != sh.cashbox_id:
-                sale.cashbox_id = sh.cashbox_id
-                upd.append("cashbox")
-            if upd:
-                sale.save(update_fields=upd)
+        # ✅ точно привяжем к смене (на случай если сервис не проставил)
+        if cart.shift_id and sale.shift_id != cart.shift_id:
+            sale.shift_id = cart.shift_id
+            sale.save(update_fields=["shift"])
 
-        # 5) client
         if client_id:
             client = get_object_or_404(Client, id=client_id, company=request.user.company)
             sale.client = client
             sale.save(update_fields=["client"])
 
-        # 6) paid
+        # ✅ нормально “оплатить” (paid_at + status)
         sale.mark_paid(payment_method=payment_method, cash_received=cash_received)
-
-        # ✅ ВАЖНО: закрываем корзину и сбрасываем скидку, чтобы “следующая” не наследовала
-        Cart.objects.filter(pk=cart.pk).update(
-            status=Cart.Status.CHECKED_OUT,
-            order_discount_total=Decimal("0.00"),
-            updated_at=timezone.now(),
-        )
 
         payload = {
             "sale_id": str(sale.id),
@@ -1027,7 +978,7 @@ class SaleCheckoutAPIView(APIView):
             "cash_received": fmt_money(sale.cash_received),
             "change": fmt_money(sale.change),
             "shift_id": str(sale.shift_id) if sale.shift_id else None,
-            "cashbox_id": str(sale.cashbox_id) if getattr(sale, "cashbox_id", None) else None,
+            "cashbox_id": str(sale.cashbox_id) if sale.cashbox_id else None,
         }
 
         if print_receipt:
@@ -1041,17 +992,14 @@ class SaleCheckoutAPIView(APIView):
             if sale.tax_total and sale.tax_total > 0:
                 totals.append(f"НАЛОГ: {fmt_money(sale.tax_total)}")
             totals.append(f"ИТОГО: {fmt_money(sale.total)}")
-
             if sale.payment_method == Sale.PaymentMethod.CASH:
                 totals.append(f"ПОЛУЧЕНО НАЛИЧНЫМИ: {fmt_money(sale.cash_received)}")
                 totals.append(f"СДАЧА: {fmt_money(sale.change)}")
             else:
                 totals.append("ОПЛАТА ПЕРЕВОДОМ")
-
             payload["receipt_text"] = "ЧЕК\n" + "\n".join(lines) + "\n" + "\n".join(totals)
 
         return Response(payload, status=status.HTTP_201_CREATED)
-
 
 
 
