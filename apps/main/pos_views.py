@@ -212,27 +212,50 @@ def _resolve_pos_cashbox(company, branch, cashbox_id=None):
     cb = qs.filter(branch__isnull=True).order_by("-created_at").first()
     return cb
 
-@transaction.atomic
 def _ensure_open_shift(*, company, branch, cashier, cashbox, opening_cash=None):
-    opening_cash = Decimal(opening_cash or "0.00")
+    """
+    Возвращает открытую смену ТОЛЬКО этого cashier в этой cashbox.
+    Если нет — открывает новую.
+    Чужую смену НЕ возвращает никогда.
+    """
+    if not cashier or not getattr(cashier, "is_authenticated", False):
+        raise ValidationError({"cashier": "Нужен кассир."})
+    if not cashbox:
+        raise ValidationError({"cashbox": "Нужна касса."})
 
-    shift = (
+    # аккуратно приводим opening_cash
+    if opening_cash in (None, "", "null", "None"):
+        opening_cash = None
+    if opening_cash is not None:
+        opening_cash = Decimal(str(opening_cash))
+    else:
+        opening_cash = Decimal("0.00")
+
+    # блокируем, чтобы параллельные запросы не создали 2 смены
+    qs = (
         CashShift.objects
         .select_for_update()
-        .filter(company=company, cashbox=cashbox, status=CashShift.Status.OPEN)
+        .filter(
+            company=company,
+            cashbox=cashbox,
+            status=CashShift.Status.OPEN,
+            cashier=cashier,  # ✅ ТОЛЬКО СВОЯ
+        )
         .order_by("-opened_at")
-        .first()
     )
+    shift = qs.first()
     if shift:
         return shift
 
+    # ✅ НЕТ СВОЕЙ — создаём новую
     return CashShift.objects.create(
         company=company,
         branch=branch,
         cashbox=cashbox,
         cashier=cashier,
-        opening_cash=opening_cash,
         status=CashShift.Status.OPEN,
+        opened_at=timezone.now(),
+        opening_cash=opening_cash,
     )
     
 class ClientReconciliationClassicAPIView(APIView):
@@ -743,19 +766,62 @@ class SaleStartAPIView(CompanyBranchRestrictedMixin, APIView):
         if not cashbox:
             raise ValidationError({"detail": "Нет кассы для этого филиала. Создай Cashbox."})
 
-        shift = _ensure_open_shift(
-            company=company,
-            branch=branch,
-            cashier=user,
-            cashbox=cashbox,
-            opening_cash=opening_cash,
+        # ─────────────────────────────────────────────────────────────
+        # ✅ 1) Смена ТОЛЬКО этого кассира (чужую НЕ берём никогда)
+        # ─────────────────────────────────────────────────────────────
+        shift = (
+            CashShift.objects
+            .select_for_update()
+            .filter(
+                company=company,
+                cashbox=cashbox,
+                status=CashShift.Status.OPEN,
+                cashier=user,
+            )
+            .order_by("-opened_at")
+            .first()
         )
 
-        qs = Cart.objects.filter(company=company, user=user, status=Cart.Status.ACTIVE, shift=shift).order_by("-created_at")
+        if not shift:
+            # opening_cash -> Decimal
+            if opening_cash in (None, "", "null", "None"):
+                opening_cash_val = Decimal("0.00")
+            else:
+                opening_cash_val = Decimal(str(opening_cash))
+
+            shift = CashShift.objects.create(
+                company=company,
+                branch=branch,
+                cashbox=cashbox,
+                cashier=user,
+                status=CashShift.Status.OPEN,
+                opened_at=timezone.now(),
+                opening_cash=opening_cash_val,
+            )
+
+        # ─────────────────────────────────────────────────────────────
+        # ✅ 2) Берём/создаём активную корзину только для (shift,user)
+        # ─────────────────────────────────────────────────────────────
+        qs = (
+            Cart.objects
+            .filter(
+                company=company,
+                user=user,
+                status=Cart.Status.ACTIVE,
+                shift=shift,
+            )
+            .order_by("-created_at")
+        )
         cart = qs.first()
 
         if cart is None:
-            cart = Cart.objects.create(company=company, user=user, status=Cart.Status.ACTIVE, branch=branch, shift=shift)
+            cart = Cart.objects.create(
+                company=company,
+                user=user,
+                status=Cart.Status.ACTIVE,
+                branch=branch,
+                shift=shift,
+            )
         else:
             extra_ids = list(qs.values_list("id", flat=True)[1:])
             if extra_ids:
@@ -764,12 +830,20 @@ class SaleStartAPIView(CompanyBranchRestrictedMixin, APIView):
                     updated_at=timezone.now(),
                 )
 
+        # ─────────────────────────────────────────────────────────────
+        # ✅ 3) Скидка НЕ должна залипать
+        #    - если фронт не прислал скидку -> ставим 0.00
+        #    - если прислал -> ставим её
+        # ─────────────────────────────────────────────────────────────
         opts = StartCartOptionsSerializer(data=request.data)
-        if opts.is_valid():
-            order_disc = opts.validated_data.get("order_discount_total")
-            if order_disc is not None:
-                cart.order_discount_total = _q2(order_disc)
-                cart.save(update_fields=["order_discount_total"])
+        opts.is_valid(raise_exception=True)
+
+        order_disc = opts.validated_data.get("order_discount_total")
+        if order_disc is None:
+            order_disc = Decimal("0.00")
+
+        cart.order_discount_total = _q2(order_disc)
+        cart.save(update_fields=["order_discount_total", "updated_at"])
 
         cart.recalc()
         return Response(SaleCartSerializer(cart).data, status=status.HTTP_201_CREATED)
