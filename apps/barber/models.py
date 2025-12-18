@@ -192,7 +192,7 @@ class Client(models.Model):
     )
 
     full_name = models.CharField(max_length=128, verbose_name='ФИО')
-    phone = models.CharField(max_length=32, verbose_name='Телефон', db_index=True)
+    phone = models.CharField(max_length=32, verbose_name='Телефон', db_index=True, blank=True, null=True)
     email = models.EmailField(blank=True, null=True, verbose_name='Email')
     birth_date = models.DateField(blank=True, null=True, verbose_name='Дата рождения')
     status = models.CharField(
