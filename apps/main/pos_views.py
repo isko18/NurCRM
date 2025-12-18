@@ -6,47 +6,57 @@ from django.shortcuts import get_object_or_404
 from django.utils.dateparse import parse_datetime, parse_date
 from django.utils import timezone
 from django_filters.rest_framework import DjangoFilterBackend
+
 from reportlab.pdfgen import canvas
 from reportlab.lib.units import mm
-from django.http import FileResponse
+from reportlab.lib.pagesizes import A4
 from reportlab.lib.utils import ImageReader
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
-from rest_framework.exceptions import NotFound, PermissionDenied, ValidationError
-from decimal import Decimal, ROUND_HALF_UP
-import qrcode
-from datetime import timedelta
-import io, os, uuid
-from django.db.models import Q, F, Value as V
-from django.db.models.functions import Coalesce
-from apps.users.models import Company
-from apps.main.models import Cart, CartItem, Sale, Product, MobileScannerToken, Client
-from .pos_serializers import (
-    SaleCartSerializer, SaleItemSerializer,
-    ScanRequestSerializer, AddItemSerializer,
-    CheckoutSerializer, MobileScannerTokenSerializer,
-    SaleListSerializer, SaleDetailSerializer, StartCartOptionsSerializer,
-    CustomCartItemCreateSerializer, SaleStatusUpdateSerializer, ReceiptSerializer,
-)
-from apps.main.services import checkout_cart, NotEnoughStock
-from apps.main.views import CompanyBranchRestrictedMixin
+
+from django.http import FileResponse
 from django.http import Http404
+from rest_framework.exceptions import NotFound, PermissionDenied, ValidationError
+
+from decimal import Decimal, ROUND_HALF_UP, InvalidOperation
+from datetime import timedelta, datetime, date, time as dtime
+import io, os, uuid
+
+from django.db.models import Q, F, Value as V, Sum
+from django.db.models.functions import Coalesce
 from django.utils.timezone import is_aware, make_aware, get_current_timezone
-from datetime import datetime, date, time as dtime
-from django.db.models import Sum
-from reportlab.lib.pagesizes import A4
-from reportlab.lib.units import mm
-from typing import Iterable, List, Optional, Dict
-from reportlab.pdfbase.ttfonts import TTFont
-from apps.main.models import ManufactureSubreal, AgentSaleAllocation
-from apps.main.services_agent_pos import checkout_agent_cart, AgentNotEnoughStock
+
+from typing import List, Optional, Dict
 from dataclasses import dataclass
-from apps.main.utils_numbers import ensure_sale_doc_number
+
 from django.core.cache import cache
-from apps.users.models import Roles, User, Company
-import requests
 from django.conf import settings
+import requests
+import qrcode
+
+from apps.users.models import Roles, User, Company
+from apps.main.models import Cart, CartItem, Sale, Product, MobileScannerToken, Client
+from apps.main.models import ManufactureSubreal, AgentSaleAllocation
+from apps.main.services import checkout_cart, NotEnoughStock
+from apps.main.services_agent_pos import checkout_agent_cart, AgentNotEnoughStock
+from apps.main.utils_numbers import ensure_sale_doc_number
+from apps.main.views import CompanyBranchRestrictedMixin
 from apps.construction.models import Cashbox, CashShift
+
+from .pos_serializers import (
+    SaleCartSerializer,
+    SaleItemSerializer,
+    ScanRequestSerializer,
+    AddItemSerializer,
+    CheckoutSerializer,
+    MobileScannerTokenSerializer,
+    SaleListSerializer,
+    SaleDetailSerializer,
+    StartCartOptionsSerializer,
+    CustomCartItemCreateSerializer,
+    SaleStatusUpdateSerializer,
+    ReceiptSerializer,
+)
 
 try:
     from apps.main.models import ClientDeal, DealInstallment
@@ -54,19 +64,43 @@ except Exception:
     ClientDeal = None
     DealInstallment = None
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 FONTS_DIR = os.path.join(BASE_DIR, "fonts")
 
-pdfmetrics.registerFont(TTFont("DejaVu", os.path.join(FONTS_DIR, "DejaVuSans.ttf")))
-pdfmetrics.registerFont(TTFont("DejaVu-Bold", os.path.join(FONTS_DIR, "DejaVuSans-Bold.ttf")))
+try:
+    pdfmetrics.registerFont(TTFont("DejaVu", os.path.join(FONTS_DIR, "DejaVuSans.ttf")))
+    pdfmetrics.registerFont(TTFont("DejaVu-Bold", os.path.join(FONTS_DIR, "DejaVuSans-Bold.ttf")))
+except Exception:
+    # если шрифтов нет в окружении — PDF всё равно сгенерится на Helvetica
+    pass
 
 
-def _q2(x: Decimal) -> Decimal:
+def register_fonts_if_needed():
+    try:
+        pdfmetrics.registerFont(TTFont("DejaVu", "DejaVuSans.ttf"))
+        pdfmetrics.registerFont(TTFont("DejaVu-Bold", "DejaVuSans-Bold.ttf"))
+    except Exception:
+        pass
+
+
+register_fonts_if_needed()
+
+
+def _to_decimal(v, default=None):
+    if v in (None, "", "null", "None"):
+        return default
+    try:
+        return Decimal(str(v).replace(",", "."))
+    except (InvalidOperation, ValueError, TypeError):
+        return default
+
+
+def _q2(x: Optional[Decimal]) -> Decimal:
     return (x or Decimal("0")).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
 
 
-def fmt_money(x: Decimal) -> str:
+def fmt_money(x: Optional[Decimal]) -> str:
     return f"{_q2(x):.2f}"
 
 
@@ -75,13 +109,6 @@ Q2 = Decimal("0.01")
 
 def q2(x: Optional[Decimal]) -> Decimal:
     return (x or Decimal("0.00")).quantize(Q2, rounding=ROUND_HALF_UP)
-
-
-def fmt(x: Optional[Decimal]) -> str:
-    return f"{q2(x):,.2f}".replace(",", " ").replace("\xa0", " ")
-
-
-Q2 = Decimal("0.01")
 
 
 def money(x: Optional[Decimal]) -> Decimal:
@@ -102,19 +129,8 @@ def _aware(dt_or_date, end=False):
     return None
 
 
-def _safe(s) -> str:
-    return s if (s is not None and str(s).strip()) else "—"
-
-
-def register_fonts_if_needed():
-    try:
-        pdfmetrics.registerFont(TTFont("DejaVu", "DejaVuSans.ttf"))
-        pdfmetrics.registerFont(TTFont("DejaVu-Bold", "DejaVuSans-Bold.ttf"))
-    except Exception:
-        pass
-
-
-register_fonts_if_needed()
+def _safe(v) -> str:
+    return v if (v is not None and str(v).strip()) else "—"
 
 
 @dataclass
@@ -123,10 +139,6 @@ class Entry:
     desc: str
     debit: Decimal
     credit: Decimal
-
-
-def _safe(v):
-    return v if (v is not None and str(v).strip()) else "—"
 
 
 def _party_lines(
@@ -183,7 +195,8 @@ def _parse_scale_barcode(barcode: str):
         "weight_raw": weight_raw,
         "weight_kg": weight_kg,
     }
-    
+
+
 def _resolve_pos_cashbox(company, branch, cashbox_id=None):
     """
     Правило:
@@ -208,9 +221,9 @@ def _resolve_pos_cashbox(company, branch, cashbox_id=None):
     if cb:
         return cb
 
-    # fallback на глобальную кассу компании
     cb = qs.filter(branch__isnull=True).order_by("-created_at").first()
     return cb
+
 
 def _ensure_open_shift(*, company, branch, cashier, cashbox, opening_cash=None):
     """
@@ -223,23 +236,23 @@ def _ensure_open_shift(*, company, branch, cashier, cashbox, opening_cash=None):
     if not cashbox:
         raise ValidationError({"cashbox": "Нужна касса."})
 
-    # аккуратно приводим opening_cash
     if opening_cash in (None, "", "null", "None"):
         opening_cash = None
     if opening_cash is not None:
-        opening_cash = Decimal(str(opening_cash))
+        try:
+            opening_cash = Decimal(str(opening_cash))
+        except Exception:
+            opening_cash = Decimal("0.00")
     else:
         opening_cash = Decimal("0.00")
 
-    # блокируем, чтобы параллельные запросы не создали 2 смены
     qs = (
-        CashShift.objects
-        .select_for_update()
+        CashShift.objects.select_for_update()
         .filter(
             company=company,
             cashbox=cashbox,
             status=CashShift.Status.OPEN,
-            cashier=cashier,  # ✅ ТОЛЬКО СВОЯ
+            cashier=cashier,
         )
         .order_by("-opened_at")
     )
@@ -247,7 +260,6 @@ def _ensure_open_shift(*, company, branch, cashier, cashbox, opening_cash=None):
     if shift:
         return shift
 
-    # ✅ НЕТ СВОЕЙ — создаём новую
     return CashShift.objects.create(
         company=company,
         branch=branch,
@@ -257,7 +269,8 @@ def _ensure_open_shift(*, company, branch, cashier, cashbox, opening_cash=None):
         opened_at=timezone.now(),
         opening_cash=opening_cash,
     )
-    
+
+
 class ClientReconciliationClassicAPIView(APIView):
     permission_classes = [permissions.IsAuthenticated]
 
@@ -304,6 +317,7 @@ class ClientReconciliationClassicAPIView(APIView):
                 or Decimal("0")
             )
             debit_before += deals_before
+
             pre_before = (
                 ClientDeal.objects.filter(company=company, client=client, created_at__lt=start_dt).aggregate(
                     s=Sum("prepayment")
@@ -371,6 +385,7 @@ class ClientReconciliationClassicAPIView(APIView):
                             b_credit=amt,
                         )
                     )
+
             for d in (
                 ClientDeal.objects.filter(
                     company=company,
@@ -750,6 +765,7 @@ class SaleReceiptDataAPIView(APIView):
         payload = build_receipt_payload(sale, cashier_name=cashier_name, ensure_number=True)
         return Response(payload, status=200)
 
+
 class SaleStartAPIView(CompanyBranchRestrictedMixin, APIView):
     permission_classes = [permissions.IsAuthenticated]
 
@@ -766,29 +782,15 @@ class SaleStartAPIView(CompanyBranchRestrictedMixin, APIView):
         if not cashbox:
             raise ValidationError({"detail": "Нет кассы для этого филиала. Создай Cashbox."})
 
-        # ─────────────────────────────────────────────────────────────
-        # ✅ 1) Смена ТОЛЬКО этого кассира (чужую НЕ берём никогда)
-        # ─────────────────────────────────────────────────────────────
         shift = (
-            CashShift.objects
-            .select_for_update()
-            .filter(
-                company=company,
-                cashbox=cashbox,
-                status=CashShift.Status.OPEN,
-                cashier=user,
-            )
+            CashShift.objects.select_for_update()
+            .filter(company=company, cashbox=cashbox, status=CashShift.Status.OPEN, cashier=user)
             .order_by("-opened_at")
             .first()
         )
 
         if not shift:
-            # opening_cash -> Decimal
-            if opening_cash in (None, "", "null", "None"):
-                opening_cash_val = Decimal("0.00")
-            else:
-                opening_cash_val = Decimal(str(opening_cash))
-
+            opening_cash_val = _to_decimal(opening_cash, default=Decimal("0.00"))
             shift = CashShift.objects.create(
                 company=company,
                 branch=branch,
@@ -796,20 +798,12 @@ class SaleStartAPIView(CompanyBranchRestrictedMixin, APIView):
                 cashier=user,
                 status=CashShift.Status.OPEN,
                 opened_at=timezone.now(),
-                opening_cash=opening_cash_val,
+                opening_cash=_q2(opening_cash_val),
             )
 
-        # ─────────────────────────────────────────────────────────────
-        # ✅ 2) Берём/создаём активную корзину только для (shift,user)
-        # ─────────────────────────────────────────────────────────────
         qs = (
-            Cart.objects
-            .filter(
-                company=company,
-                user=user,
-                status=Cart.Status.ACTIVE,
-                shift=shift,
-            )
+            Cart.objects.select_for_update()
+            .filter(company=company, user=user, status=Cart.Status.ACTIVE, shift=shift)
             .order_by("-created_at")
         )
         cart = qs.first()
@@ -830,11 +824,6 @@ class SaleStartAPIView(CompanyBranchRestrictedMixin, APIView):
                     updated_at=timezone.now(),
                 )
 
-        # ─────────────────────────────────────────────────────────────
-        # ✅ 3) Скидка НЕ должна залипать
-        #    - если фронт не прислал скидку -> ставим 0.00
-        #    - если прислал -> ставим её
-        # ─────────────────────────────────────────────────────────────
         opts = StartCartOptionsSerializer(data=request.data)
         opts.is_valid(raise_exception=True)
 
@@ -855,6 +844,7 @@ class CartDetailAPIView(generics.RetrieveAPIView):
 
     def get_queryset(self):
         return Cart.objects.filter(company=self.request.user.company)
+
 
 class SaleScanAPIView(APIView):
     permission_classes = [permissions.IsAuthenticated]
@@ -877,31 +867,19 @@ class SaleScanAPIView(APIView):
         product = None
         scale_data = None
 
-        # 1) обычный штрихкод
         try:
             product = Product.objects.get(company=cart.company, barcode=barcode)
         except Product.DoesNotExist:
-            # 2) весовой штрихкод
             scale_data = _parse_scale_barcode(barcode)
             if not scale_data:
-                return Response(
-                    {"not_found": True, "message": "Товар не найден"},
-                    status=404,
-                )
+                return Response({"not_found": True, "message": "Товар не найден"}, status=404)
 
             plu = scale_data["plu"]
             try:
                 product = Product.objects.get(company=cart.company, plu=plu)
             except Product.DoesNotExist:
-                return Response(
-                    {
-                        "not_found": True,
-                        "message": f"Товар с ПЛУ {plu} не найден",
-                    },
-                    status=404,
-                )
+                return Response({"not_found": True, "message": f"Товар с ПЛУ {plu} не найден"}, status=404)
 
-        # ✅ КОЛИЧЕСТВО
         if scale_data:
             effective_qty = Decimal(str(scale_data["weight_kg"]))
         else:
@@ -914,7 +892,7 @@ class SaleScanAPIView(APIView):
                 "company": cart.company,
                 "branch": getattr(cart, "branch", None),
                 "quantity": effective_qty,
-                "unit_price": product.price,  # цена за кг или за штуку
+                "unit_price": product.price,
             },
         )
 
@@ -924,7 +902,6 @@ class SaleScanAPIView(APIView):
 
         cart.recalc()
         return Response(SaleCartSerializer(cart).data, status=status.HTTP_201_CREATED)
-
 
 
 class SaleAddItemAPIView(APIView):
@@ -976,8 +953,8 @@ class SaleAddItemAPIView(APIView):
             item.save(update_fields=["quantity", "unit_price"])
 
         cart.recalc()
-
         return Response(SaleCartSerializer(cart).data, status=status.HTTP_201_CREATED)
+
 
 class SaleCheckoutAPIView(APIView):
     permission_classes = [permissions.IsAuthenticated]
@@ -1000,7 +977,6 @@ class SaleCheckoutAPIView(APIView):
         cash_received = ser.validated_data.get("cash_received") or Decimal("0.00")
         cashbox_id = ser.validated_data.get("cashbox_id")
 
-        # ✅ гарантируем смену (иначе Sale.save/full_clean может требовать cashbox)
         if not cart.shift_id:
             company = cart.company
             branch = getattr(cart, "branch", None)
@@ -1026,7 +1002,6 @@ class SaleCheckoutAPIView(APIView):
         except ValueError as e:
             return Response({"detail": str(e)}, status=status.HTTP_400_BAD_REQUEST)
 
-        # ✅ точно привяжем к смене (на случай если сервис не проставил)
         if cart.shift_id and sale.shift_id != cart.shift_id:
             sale.shift_id = cart.shift_id
             sale.save(update_fields=["shift"])
@@ -1036,7 +1011,6 @@ class SaleCheckoutAPIView(APIView):
             sale.client = client
             sale.save(update_fields=["client"])
 
-        # ✅ нормально “оплатить” (paid_at + status)
         sale.mark_paid(payment_method=payment_method, cash_received=cash_received)
 
         payload = {
@@ -1076,7 +1050,6 @@ class SaleCheckoutAPIView(APIView):
         return Response(payload, status=status.HTTP_201_CREATED)
 
 
-
 class SaleMobileScannerTokenAPIView(APIView):
     permission_classes = [permissions.IsAuthenticated]
 
@@ -1100,15 +1073,7 @@ class ProductFindByBarcodeAPIView(APIView):
             return Response([], status=200)
         qs = Product.objects.filter(company=request.user.company, barcode=barcode)[:1]
         return Response(
-            [
-                {
-                    "id": str(p.id),
-                    "name": p.name,
-                    "barcode": p.barcode,
-                    "price": str(p.price),
-                }
-                for p in qs
-            ],
+            [{"id": str(p.id), "name": p.name, "barcode": p.barcode, "price": str(p.price)} for p in qs],
             status=200,
         )
 
@@ -1156,9 +1121,8 @@ class MobileScannerIngestAPIView(APIView):
 class SaleListAPIView(CompanyBranchRestrictedMixin, generics.ListAPIView):
     serializer_class = SaleListSerializer
     queryset = (
-        Sale.objects
-        .select_related("user")
-        .prefetch_related("items__product")  # <-- важно для first_item_name
+        Sale.objects.select_related("user")
+        .prefetch_related("items__product")
         .all()
     )
     filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
@@ -1231,9 +1195,7 @@ class SaleBulkDeleteAPIView(CompanyBranchRestrictedMixin, APIView):
             not_allowed_ids = []
         else:
             deletable_qs = base_qs.exclude(status=Sale.Status.PAID)
-            not_allowed_ids = list(
-                base_qs.filter(status=Sale.Status.PAID).values_list("id", flat=True)
-            )
+            not_allowed_ids = list(base_qs.filter(status=Sale.Status.PAID).values_list("id", flat=True))
 
         found_ids = set(str(sid) for sid in base_qs.values_list("id", flat=True))
         not_found_ids = [str(x) for x in valid_ids if str(x) not in found_ids]
@@ -1346,6 +1308,7 @@ class SaleAddCustomItemAPIView(APIView):
                 quantity=qty,
             )
 
+        cart.recalc()
         return Response(SaleCartSerializer(cart).data, status=status.HTTP_201_CREATED)
 
 
@@ -1547,16 +1510,10 @@ class AgentSaleScanAPIView(CompanyBranchRestrictedMixin, APIView):
         acting_agent = _resolve_acting_agent(request, cart, allow_owner_override=True)
 
         available = _agent_available_qty(acting_agent, cart.company, product.id)
-        in_cart = (
-            CartItem.objects.filter(cart=cart, product=product).aggregate(s=Sum("quantity"))["s"]
-            or 0
-        )
+        in_cart = CartItem.objects.filter(cart=cart, product=product).aggregate(s=Sum("quantity"))["s"] or 0
         if qty + in_cart > available:
             return Response(
-                {
-                    "detail": f"Недостаточно у агента. "
-                    f"Доступно: {max(0, available - in_cart)}."
-                },
+                {"detail": f"Недостаточно у агента. Доступно: {max(0, available - in_cart)}."},
                 status=400,
             )
 
@@ -1602,16 +1559,10 @@ class AgentSaleAddItemAPIView(CompanyBranchRestrictedMixin, APIView):
         acting_agent = _resolve_acting_agent(request, cart, allow_owner_override=True)
 
         available = _agent_available_qty(acting_agent, cart.company, product.id)
-        in_cart = (
-            CartItem.objects.filter(cart=cart, product=product).aggregate(s=Sum("quantity"))["s"]
-            or 0
-        )
+        in_cart = CartItem.objects.filter(cart=cart, product=product).aggregate(s=Sum("quantity"))["s"] or 0
         if qty + in_cart > available:
             return Response(
-                {
-                    "detail": f"Недостаточно у агента. "
-                    f"Доступно: {max(0, available - in_cart)}."
-                },
+                {"detail": f"Недостаточно у агента. Доступно: {max(0, available - in_cart)}."},
                 status=400,
             )
 
@@ -1690,6 +1641,7 @@ class AgentSaleAddCustomItemAPIView(CompanyBranchRestrictedMixin, APIView):
         cart.recalc()
         return Response(SaleCartSerializer(cart).data, status=status.HTTP_201_CREATED)
 
+
 class AgentSaleCheckoutAPIView(CompanyBranchRestrictedMixin, APIView):
     permission_classes = [permissions.IsAuthenticated]
 
@@ -1711,7 +1663,6 @@ class AgentSaleCheckoutAPIView(CompanyBranchRestrictedMixin, APIView):
 
         cart = get_object_or_404(cart_qs)
 
-        # ✅ КРИТИЧНО: контекст обязателен (cart + request)
         ser = CheckoutSerializer(
             data=request.data,
             context={"request": request, "cart": cart},
@@ -1722,7 +1673,7 @@ class AgentSaleCheckoutAPIView(CompanyBranchRestrictedMixin, APIView):
         client_id = ser.validated_data.get("client_id")
         payment_method = ser.validated_data.get("payment_method") or Sale.PaymentMethod.CASH
         cash_received = ser.validated_data.get("cash_received") or Decimal("0.00")
-        cashbox_id = ser.validated_data.get("cashbox_id")  # ✅ теперь используется
+        cashbox_id = ser.validated_data.get("cashbox_id")
 
         if client_id:
             client = get_object_or_404(Client, id=client_id, company=company)
@@ -1737,7 +1688,6 @@ class AgentSaleCheckoutAPIView(CompanyBranchRestrictedMixin, APIView):
             raise ValidationError({"detail": "Сумма, полученная наличными, меньше суммы продажи."})
 
         try:
-            # ✅ передаём кассу/оплату в сервис
             sale = checkout_agent_cart(
                 cart,
                 agent=acting_agent,
@@ -1748,9 +1698,7 @@ class AgentSaleCheckoutAPIView(CompanyBranchRestrictedMixin, APIView):
         except Exception as e:
             raise ValidationError({"detail": str(e)})
 
-        # ✅ если твой сервис не выставил paid_at/paid — добьём безопасно
         if hasattr(sale, "mark_paid") and callable(sale.mark_paid):
-            # mark_paid уже мог быть вызван внутри — повторно норм, но если не хочешь — можешь проверять paid_at/status
             if sale.status != Sale.Status.PAID:
                 sale.mark_paid(payment_method=payment_method, cash_received=cash_received)
         else:
@@ -1807,6 +1755,7 @@ class AgentSaleCheckoutAPIView(CompanyBranchRestrictedMixin, APIView):
             payload["receipt_text"] = "ЧЕК\n" + "\n".join(lines) + "\n" + "\n".join(totals)
 
         return Response(payload, status=status.HTTP_201_CREATED)
+
 
 class AgentCartItemUpdateDestroyAPIView(APIView):
     permission_classes = [permissions.IsAuthenticated]
