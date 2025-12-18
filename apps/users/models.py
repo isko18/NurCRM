@@ -327,7 +327,7 @@ class User(AbstractBaseUser, PermissionsMixin):
     can_view_request = models.BooleanField(default=False, verbose_name="Доступ к запросам")
     can_view_shifts = models.BooleanField(default=False, verbose_name="Доступ к смене")
     can_view_cashier = models.BooleanField(default=False, verbose_name="Доступ к интерфейсу кассы")
-    
+    can_view_document = models.BooleanField(default=False, verbose_name="Доступ к документам")
     branches = models.ManyToManyField(
         "Branch",
         through="BranchMembership",
