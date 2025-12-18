@@ -1500,15 +1500,15 @@ class DebtSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
         ]
         read_only_fields = ["id", "company", "branch", "paid_total", "balance", "created_at", "updated_at"]
 
-    def validate_phone(self, value):
-        value = value.strip()
-        company = self._user_company()
-        qs = Debt.objects.filter(company=company, phone=value)
-        if self.instance:
-            qs = qs.exclude(pk=self.instance.pk)
-        if qs.exists():
-            raise serializers.ValidationError("В вашей компании уже есть долг с таким телефоном.")
-        return value
+    # def validate_phone(self, value):
+    #     value = value.strip()
+    #     company = self._user_company()
+    #     qs = Debt.objects.filter(company=company, phone=value)
+    #     if self.instance:
+    #         qs = qs.exclude(pk=self.instance.pk)
+    #     if qs.exists():
+    #         raise serializers.ValidationError("В вашей компании уже есть долг с таким телефоном.")
+    #     return value
 
 
 class DebtPaymentSerializer(serializers.ModelSerializer):
