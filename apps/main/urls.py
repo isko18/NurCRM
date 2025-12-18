@@ -2,6 +2,7 @@ from django.urls import path
 from .views import *
 from .pos_views import *
 from .analytics_market import *
+from .document import SaleReceiptAPIView, SaleInvoiceAPIView
 
 
 urlpatterns = [
@@ -154,6 +155,9 @@ urlpatterns = [
     ),
     path("pos/sales/<uuid:pk>/receipt/", SaleReceiptDataAPIView.as_view(), name="sale-receipt-download"),
     path("sales/<uuid:pk>/invoice/", SaleInvoiceDownloadAPIView.as_view()),
+    
+    path("sales/json/<uuid:pk>/receipt/", SaleReceiptAPIView.as_view(), name="sale-receipt"),
+    path("sales/json/<uuid:pk>/invoice/", SaleInvoiceAPIView.as_view(), name="sale-invoice"),
     
     path("transactions/", TransactionRecordListCreateView.as_view(), name="transaction-list"),
     path("transactions/<uuid:pk>/", TransactionRecordRetrieveUpdateDestroyView.as_view(), name="transaction-detail"),
