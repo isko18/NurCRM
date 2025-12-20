@@ -463,7 +463,11 @@ class CashFlowSerializer(CompanyBranchReadOnlyMixin):
     cashbox = serializers.PrimaryKeyRelatedField(queryset=Cashbox.objects.all())
     cashbox_name = serializers.SerializerMethodField()
 
-    shift = serializers.PrimaryKeyRelatedField(queryset=CashShift.objects.all(), required=False, allow_null=True)
+    shift = serializers.PrimaryKeyRelatedField(
+        queryset=CashShift.objects.all(),
+        required=False,
+        allow_null=True,
+    )
     cashier = serializers.ReadOnlyField(source="cashier.id")
     cashier_display = serializers.SerializerMethodField()
 
@@ -517,13 +521,11 @@ class CashFlowSerializer(CompanyBranchReadOnlyMixin):
             cb_qs = cb_qs.filter(Q(branch__isnull=True) | Q(branch=target_branch))
         self.fields["cashbox"].queryset = cb_qs
 
-        # shifts: owner видит все, обычный пользователь — только свои
         sh_qs = CashShift.objects.filter(company=company)
         if not _is_owner_like(user):
             sh_qs = sh_qs.filter(cashier=user)
         self.fields["shift"].queryset = sh_qs
-    def get_name(self, obj):
-        return obj.name or "Основная касса компании"
+
     def get_cashbox_name(self, obj):
         if obj.cashbox and obj.cashbox.branch:
             return f"Касса филиала {obj.cashbox.branch.name}"
@@ -544,7 +546,10 @@ class CashFlowSerializer(CompanyBranchReadOnlyMixin):
         user = getattr(request, "user", None) if request else None
 
         cashbox = attrs.get("cashbox") or getattr(self.instance, "cashbox", None)
-        shift = attrs.get("shift") if "shift" in attrs else getattr(self.instance, "shift", None)
+
+        # важно: различаем "shift не передали" и "shift=None"
+        shift_provided = "shift" in attrs
+        shift = attrs.get("shift") if shift_provided else getattr(self.instance, "shift", None)
 
         if request and cashbox:
             company = _get_company_from_user(user)
@@ -555,52 +560,29 @@ class CashFlowSerializer(CompanyBranchReadOnlyMixin):
         if cashbox and target_branch is not None and cashbox.branch_id not in (None, getattr(target_branch, "id", None)):
             raise serializers.ValidationError("Касса принадлежит другому филиалу.")
 
-        if shift:
+        # ✅ строгие проверки ТОЛЬКО если shift передали и он не None
+        if shift_provided and shift is not None:
             if cashbox and shift.cashbox_id != cashbox.id:
                 raise serializers.ValidationError({"shift": "Смена относится к другой кассе."})
 
-            # ✅ в кассовых движениях нормальный смысл — только OPEN смена
             if shift.status != CashShift.Status.OPEN:
                 raise serializers.ValidationError({"shift": "Нельзя делать движение по закрытой смене."})
 
             if user and (not _is_owner_like(user)) and shift.cashier_id != user.id:
                 raise serializers.ValidationError({"shift": "Это не ваша смена."})
 
+        # ✅ если shift не передали или shift=None — это “общий режим”, разрешаем
         return attrs
 
     def create(self, validated_data):
         request = self.context.get("request")
         user = getattr(request, "user", None) if request else None
 
-        cashbox = validated_data.get("cashbox")
-        shift = validated_data.get("shift", None)
-
-        # ✅ shift не передали — цепляем OPEN смену именно ЭТОГО пользователя в этой кассе
-        if not shift and cashbox:
-            if not user:
-                raise serializers.ValidationError({"shift": "Нужен пользователь для выбора смены."})
-
-            open_shift = (
-                CashShift.objects
-                .filter(
-                    cashbox=cashbox,
-                    status=CashShift.Status.OPEN,
-                    cashier=user,
-                )
-                .order_by("-opened_at")
-                .first()
-            )
-
-            if not open_shift:
-                raise serializers.ValidationError({"shift": "У вас нет открытой смены на этой кассе."})
-
-            validated_data["shift"] = open_shift
-
+        # ✅ НИКАКОГО авто-поиска смены. Если shift нет — создаём общий cashflow.
         if user and "cashier" not in validated_data:
             validated_data["cashier"] = user
 
         return super().create(validated_data)
-
 
 class CashFlowBulkStatusItemSerializer(serializers.Serializer):
     id = serializers.UUIDField()
