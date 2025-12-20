@@ -54,6 +54,7 @@ from apps.main.serializers import (
 from django.db.models import ProtectedError
 from apps.utils import product_images_prefetch, _is_owner_like
 from apps.main.analytics_agent import build_agent_analytics_payload, _parse_period
+from apps.main.analytics_owner_production import build_owner_analytics_payload
 from apps.main.services import _parse_bool_like, _parse_date_to_aware_datetime, _parse_kind, _parse_int_nonneg, _parse_decimal
     
 
@@ -3259,6 +3260,42 @@ class OwnerAgentAnalyticsAPIView(CompanyBranchRestrictedMixin, APIView):
             company=company,
             branch=branch,
             agent=agent,
+            **period_params,
+        )
+        return Response(data, status=status.HTTP_200_OK)
+    
+class OwnerOverallAnalyticsAPIView(CompanyBranchRestrictedMixin, APIView):
+    """
+    GET /api/main/owners/analytics/
+
+    Доступ: только владелец/админ (_is_owner_like).
+    Аналитика считается по всей компании (ветка/branch — как в твоём миксине).
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request, *args, **kwargs):
+        user = request.user
+        if not _is_owner_like(user):
+            return Response({"detail": "Forbidden"}, status=status.HTTP_403_FORBIDDEN)
+
+        company = self._company()
+        branch = self._auto_branch()
+
+        # fallback, если _company() ничего не дал
+        if company is None:
+            company = getattr(user, "owned_company", None) or getattr(user, "company", None)
+
+        if company is None:
+            return Response(
+                {"detail": "У вас не задана компания."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        period_params = _parse_period(request)
+
+        data = build_owner_analytics_payload(
+            company=company,
+            branch=branch,
             **period_params,
         )
         return Response(data, status=status.HTTP_200_OK)

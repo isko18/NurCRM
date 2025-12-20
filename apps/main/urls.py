@@ -232,6 +232,7 @@ urlpatterns = [
 
     path("agents/me/analytics/", AgentMyAnalyticsAPIView.as_view(), name="agent-my-analytics"),
     path("owners/agents/<uuid:agent_id>/analytics/", OwnerAgentAnalyticsAPIView.as_view(), name="owner-agent-analytics",),
+    path("owners/analytics/", OwnerOverallAnalyticsAPIView.as_view(), name="owner-overall-analytics"),
     
     
     path("analytics/market/", AnalyticsView.as_view(), name="analytics"),
