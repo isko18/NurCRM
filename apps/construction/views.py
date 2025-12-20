@@ -463,32 +463,25 @@ class CashFlowListCreateView(CompanyBranchScopedMixin, generics.ListCreateAPIVie
         "cashier",
     )
     serializer_class = CashFlowSerializer
-    # pagination_class = None  # если нужно без пагинации
 
     def get_queryset(self):
         qs = self._scoped_queryset(super().get_queryset())
 
-        # 1) одна касса: ?cashbox=<uuid>
+        shift_id = self.request.query_params.get("shift")
+        cashier_id = self.request.query_params.get("cashier")
         cashbox_id = self.request.query_params.get("cashbox")
+
         if cashbox_id:
             qs = qs.filter(cashbox_id=cashbox_id)
-
-        # 2) несколько касс: ?cashboxes=<uuid>,<uuid>,<uuid>
-        cashboxes = self.request.query_params.get("cashboxes")
-        if cashboxes:
-            ids = [s.strip() for s in cashboxes.split(",") if s.strip()]
-            qs = qs.filter(cashbox_id__in=ids)
-
-        # доп фильтры (если нужны)
-        shift_id = self.request.query_params.get("shift")
         if shift_id:
             qs = qs.filter(shift_id=shift_id)
-
-        cashier_id = self.request.query_params.get("cashier")
         if cashier_id:
             qs = qs.filter(cashier_id=cashier_id)
 
         return qs
+
+    def perform_create(self, serializer):
+        self._inject_company_branch_on_save(serializer)
 
 
 class CashFlowDetailView(CompanyBranchScopedMixin, generics.RetrieveUpdateDestroyAPIView):
