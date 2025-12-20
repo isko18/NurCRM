@@ -506,7 +506,8 @@ class CashFlowSerializer(CompanyBranchReadOnlyMixin):
         if not _is_owner_like(user):
             sh_qs = sh_qs.filter(cashier=user)
         self.fields["shift"].queryset = sh_qs
-
+    def get_name(self, obj):
+        return obj.name or "Основная касса компании"
     def get_cashbox_name(self, obj):
         if obj.cashbox and obj.cashbox.branch:
             return f"Касса филиала {obj.cashbox.branch.name}"
