@@ -688,7 +688,7 @@ class Product(models.Model):
     )
     markup_percent = models.DecimalField(
         "Наценка, %",
-        max_digits=5,
+        max_digits=12,
         decimal_places=2,
         default=0,
         help_text="Наценка в процентах к закупочной цене",
@@ -702,7 +702,7 @@ class Product(models.Model):
     )
     discount_percent = models.DecimalField(
         "Скидка, %",
-        max_digits=5,
+        max_digits=12,
         decimal_places=2,
         default=0,
         help_text="Скидка в процентах от цены продажи",
