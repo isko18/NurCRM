@@ -463,6 +463,7 @@ class CashFlowListCreateView(CompanyBranchScopedMixin, generics.ListCreateAPIVie
         "cashier",
     )
     serializer_class = CashFlowSerializer
+    pagination_class = None
 
     def get_queryset(self):
         qs = self._scoped_queryset(super().get_queryset())
