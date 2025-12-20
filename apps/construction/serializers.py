@@ -410,8 +410,20 @@ class CashboxSerializer(CompanyBranchReadOnlyMixin):
         read_only_fields = ["id", "company", "branch", "analytics", "is_consumption"]
     def to_representation(self, instance):
         data = super().to_representation(instance)
+
+        # если name пустой — проверяем, первая ли это касса компании
         if not data.get("name"):
-            data["name"] = "Основная касса компании"
+            first_cashbox_id = (
+                Cashbox.objects
+                .filter(company=instance.company)
+                .order_by("created_at")
+                .values_list("id", flat=True)
+                .first()
+            )
+
+            if instance.id == first_cashbox_id:
+                data["name"] = "Основная касса компании"
+
         return data
     def get_analytics(self, obj):
         amap = self.context.get("analytics_map")
