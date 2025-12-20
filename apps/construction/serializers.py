@@ -408,7 +408,11 @@ class CashboxSerializer(CompanyBranchReadOnlyMixin):
         model = Cashbox
         fields = ["id", "company", "branch", "name", "is_consumption", "analytics"]
         read_only_fields = ["id", "company", "branch", "analytics", "is_consumption"]
-
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        if not data.get("name"):
+            data["name"] = "Основная касса компании"
+        return data
     def get_analytics(self, obj):
         amap = self.context.get("analytics_map")
         if amap is not None:
