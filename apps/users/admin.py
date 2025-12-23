@@ -65,6 +65,7 @@ BASE_PERMS = (
     "can_view_settings",
     "can_view_sale",
     "can_view_document",
+    "can_view_market_scales",
 )
 
 BUILDING_PERMS = (
