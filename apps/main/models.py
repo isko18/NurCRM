@@ -677,7 +677,12 @@ class Product(models.Model):
         help_text="Если товар продаётся по весу (обычно кг)",
     )
 
-    quantity = models.PositiveIntegerField("Количество на складе", default=0)
+    quantity = models.DecimalField(
+        "Цена закупки",
+        max_digits=12,
+        decimal_places=2,
+        default=0, null=True, blank=True
+    )
 
     # ---- Цены / наценка / скидка ----
     purchase_price = models.DecimalField(
