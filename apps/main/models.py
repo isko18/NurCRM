@@ -680,7 +680,7 @@ class Product(models.Model):
     quantity = models.DecimalField(
         "Цена закупки",
         max_digits=12,
-        decimal_places=2,
+        decimal_places=3,
         default=0, null=True, blank=True
     )
 

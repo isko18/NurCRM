@@ -132,6 +132,10 @@ def _aware(dt_or_date, end=False):
 def _safe(v) -> str:
     return v if (v is not None and str(v).strip()) else "—"
 
+Q3 = Decimal("0.001")
+
+def qty3(x: Optional[Decimal]) -> Decimal:
+    return (x or Decimal("0")).quantize(Q3, rounding=ROUND_HALF_UP)
 
 @dataclass
 class Entry:
@@ -1239,10 +1243,12 @@ class CartItemUpdateDestroyAPIView(APIView):
         cart = self._get_active_cart(request, cart_id)
         item = self._get_item_in_cart(cart, item_id)
 
-        try:
-            qty = int(request.data.get("quantity"))
-        except (TypeError, ValueError):
-            return Response({"quantity": "Укажите целое число >= 0."}, status=400)
+        raw = request.data.get("quantity")
+        qty = _to_decimal(raw, default=None)
+        if qty is None:
+            return Response({"quantity": "Укажите число >= 0."}, status=400)
+
+        qty = qty3(qty)
 
         if qty < 0:
             return Response({"quantity": "Количество не может быть отрицательным."}, status=400)
@@ -1256,6 +1262,7 @@ class CartItemUpdateDestroyAPIView(APIView):
         item.save(update_fields=["quantity"])
         cart.recalc()
         return Response(SaleCartSerializer(cart).data, status=200)
+
 
     @transaction.atomic
     def delete(self, request, cart_id, item_id, *args, **kwargs):
