@@ -7,6 +7,59 @@ from .models import (
 )
 
 Q2 = Decimal("0.01")
+Q2 = Decimal("0.01")
+Q3 = Decimal("0.001")
+
+
+def money(x: Decimal) -> Decimal:
+    return (x or Decimal("0")).quantize(Q2, rounding=ROUND_HALF_UP)
+
+
+def qty3(x: Decimal) -> Decimal:
+    return (x or Decimal("0")).quantize(Q3, rounding=ROUND_HALF_UP)
+
+
+def _has_field(model, name: str) -> bool:
+    try:
+        return any(f.name == name for f in model._meta.get_fields())
+    except Exception:
+        return False
+
+
+def _get_attr(obj, name, default=None):
+    return getattr(obj, name, default) if obj is not None else default
+
+
+class MoneyField(serializers.DecimalField):
+    def __init__(self, *args, **kwargs):
+        kwargs.setdefault("max_digits", 12)
+        kwargs.setdefault("decimal_places", 2)
+        super().__init__(*args, **kwargs)
+
+    def to_internal_value(self, value):
+        val = super().to_internal_value(value)
+        return money(val)
+
+
+class QtyField(serializers.DecimalField):
+    """
+    Кол-во для POS:
+    - для штучного товара будет 1,2,3...
+    - для весового будет 0.312, 1.245 ...
+    """
+    def __init__(self, *args, **kwargs):
+        kwargs.setdefault("max_digits", 12)
+        kwargs.setdefault("decimal_places", 3)
+        kwargs.setdefault("required", False)
+        kwargs.setdefault("default", Decimal("1.000"))
+        super().__init__(*args, **kwargs)
+
+    def to_internal_value(self, value):
+        val = super().to_internal_value(value)
+        val = qty3(val)
+        if val <= 0:
+            raise serializers.ValidationError("Количество должно быть > 0.")
+        return val
 
 
 def money(x: Decimal) -> Decimal:
@@ -73,6 +126,9 @@ class SaleItemSerializer(serializers.ModelSerializer):
     primary_image_url = serializers.SerializerMethodField(read_only=True)
     images = ProductImageReadSerializer(many=True, read_only=True, source="product.images")
 
+    # ✅ важно: quantity должен быть Decimal(3), а не int
+    quantity = QtyField()
+
     class Meta:
         model = CartItem
         fields = (
@@ -109,18 +165,13 @@ class SaleItemSerializer(serializers.ModelSerializer):
         product_company_id = _get_attr(product, "company_id")
         if cart and product and cart_company_id is not None and product_company_id is not None:
             if cart_company_id != product_company_id:
-                raise serializers.ValidationError(
-                    {"product": "Товар принадлежит другой компании, чем корзина."}
-                )
+                raise serializers.ValidationError({"product": "Товар принадлежит другой компании, чем корзина."})
 
         if _has_field(type(cart), "branch") and _has_field(type(product), "branch"):
             cart_branch_id = _get_attr(cart, "branch_id")
             product_branch_id = _get_attr(product, "branch_id")
-            # product.branch=None → глобальный, разрешаем
             if product_branch_id is not None and product_branch_id != cart_branch_id:
-                raise serializers.ValidationError(
-                    {"product": "Товар из другого филиала и не является глобальным."}
-                )
+                raise serializers.ValidationError({"product": "Товар из другого филиала и не является глобальным."})
 
     def validate(self, attrs):
         cart = attrs.get("cart") or _get_attr(self.instance, "cart", None)
@@ -129,10 +180,12 @@ class SaleItemSerializer(serializers.ModelSerializer):
         if cart and product:
             self._validate_company_branch(cart, product)
 
-        qty = attrs.get("quantity", _get_attr(self.instance, "quantity", 1))
-        if qty is not None and qty < 1:
-            raise serializers.ValidationError({"quantity": "Минимум 1."})
+        qty = attrs.get("quantity", _get_attr(self.instance, "quantity", Decimal("1.000")))
+        qty = qty3(Decimal(str(qty)))
+        if qty <= 0:
+            raise serializers.ValidationError({"quantity": "Количество должно быть > 0."})
 
+        attrs["quantity"] = qty
         return attrs
 
     def create(self, validated_data):
@@ -156,6 +209,7 @@ class SaleItemSerializer(serializers.ModelSerializer):
         return super().update(instance, validated_data)
 
 
+
 class SaleCartSerializer(serializers.ModelSerializer):
     items = SaleItemSerializer(many=True, read_only=True)
     shift = serializers.PrimaryKeyRelatedField(read_only=True)
@@ -177,19 +231,20 @@ class SaleCartSerializer(serializers.ModelSerializer):
 
 class ScanRequestSerializer(serializers.Serializer):
     barcode = serializers.CharField(max_length=64)
-    quantity = serializers.IntegerField(min_value=1, required=False, default=1)
-
+    # ✅ было IntegerField → стало Decimal 3 знака
+    quantity = QtyField(required=False, default=Decimal("1.000"))
 
 class AddItemSerializer(serializers.Serializer):
     product_id = serializers.UUIDField()
-    quantity = serializers.IntegerField(min_value=1, required=False, default=1)
+    # ✅ было IntegerField → стало Decimal 3 знака
+    quantity = QtyField(required=False, default=Decimal("1.000"))
     unit_price = MoneyField(required=False)
     discount_total = MoneyField(required=False)
 
     def validate(self, attrs):
         up = attrs.get("unit_price")
         disc = attrs.get("discount_total")
-        qty = attrs.get("quantity", 1)
+        qty = attrs.get("quantity", Decimal("1.000"))
 
         if up is not None and up < 0:
             raise serializers.ValidationError({"unit_price": "Должна быть ≥ 0."})
@@ -197,10 +252,13 @@ class AddItemSerializer(serializers.Serializer):
             raise serializers.ValidationError({"discount_total": "Должна быть ≥ 0."})
         if up is not None and disc is not None:
             raise serializers.ValidationError("Передавайте либо unit_price, либо discount_total.")
-        if qty < 1:
-            raise serializers.ValidationError({"quantity": "Минимум 1."})
-        return attrs
 
+        qty = qty3(Decimal(str(qty)))
+        if qty <= 0:
+            raise serializers.ValidationError({"quantity": "Количество должно быть > 0."})
+
+        attrs["quantity"] = qty
+        return attrs
 
 class OptionalUUIDField(serializers.UUIDField):
     def to_internal_value(self, data):
