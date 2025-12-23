@@ -1326,7 +1326,7 @@ class CartItem(models.Model):
     cart = models.ForeignKey(Cart, on_delete=models.CASCADE, related_name="items")
     product = models.ForeignKey("main.Product", null=True, blank=True, on_delete=models.SET_NULL, related_name="cart_items")
     custom_name = models.CharField(max_length=255, blank=True)
-    quantity = models.PositiveIntegerField(default=1)
+    quantity = models.DecimalField(max_digits=12, decimal_places=3, default=Decimal("1.000"))
     unit_price = models.DecimalField(max_digits=12, decimal_places=2)
 
     class Meta:
@@ -1339,6 +1339,10 @@ class CartItem(models.Model):
             raise ValidationError({"branch": "Филиал позиции должен совпадать с филиалом корзины."})
         if self.product_id and self.company_id and self.product.company_id != self.company_id:
             raise ValidationError({"product": "Товар принадлежит другой компании."})
+
+        # ✅ запрет 0 и минуса
+        if self.quantity is None or Decimal(self.quantity) <= 0:
+            raise ValidationError({"quantity": "Количество должно быть > 0."})
 
     def save(self, *args, **kwargs):
         if self.cart_id:
