@@ -95,12 +95,9 @@ def scale_products_list(request):
 @api_view(["POST"])
 @permission_classes([IsAuthenticated])
 def send_products_to_scale(request):
-    """
-    Отправить товары в подключённые scale-агенты компании.
-    """
     user = request.user
-
     company = getattr(user, "company", None) or getattr(user, "owned_company", None)
+
     if not company:
         return Response(
             {"detail": "Пользователь не привязан к компании"},
@@ -110,17 +107,16 @@ def send_products_to_scale(request):
     product_ids = request.data.get("product_ids") or []
     plu_start = int(request.data.get("plu_start") or 1)
 
-    qs = Product.objects.filter(company=company)
+    qs = Product.objects.filter(company=company, kind=Product.Kind.PRODUCT)
 
     if product_ids:
         qs = qs.filter(id__in=product_ids)
 
-    qs = qs.filter(
-        scale_type__in=[
-            "weight", "piece",
-            "весовой", "штучный", "штучно",
-        ]
-    ).order_by("id")
+    # Если хочешь слать только товары для весов:
+    # - весовые (is_weight=True)
+    # - и/или штучные (is_weight=False) — решай сам
+    # Сейчас: шлём и весовые и штучные товары (оба типа)
+    qs = qs.order_by("id")
 
     items = []
     cur_plu = plu_start
@@ -130,34 +126,26 @@ def send_products_to_scale(request):
         price = float(p.price or 0)
         shelf = int(getattr(p, "shelf_life_days", 0) or 0)
 
-        scale_type = (getattr(p, "scale_type", "") or "").lower()
-        is_piece = scale_type in ("piece", "штучный", "штучно")
+        is_piece = not bool(p.is_weight)
 
-        # ---- ИСПОЛЬЗУЕМ ПОЛЕ product.plu ----
-        plu_value = p.plu
+        # используем product.plu, если есть, иначе назначаем
+        plu_was_missing = p.plu is None
+        plu_value = p.plu if p.plu is not None else cur_plu
 
-        if plu_value is None:
-            # если у товара ещё нет ПЛУ — берём текущий счётчик
-            plu_value = cur_plu
-
-            # по желанию можно сразу сохранить в БД,
-            # чтобы в следующий раз отправлялся тот же ПЛУ:
-            p.plu = plu_value
+        if plu_was_missing:
+            p.plu = int(plu_value)
             p.save(update_fields=["plu"])
 
-        # код для весов = тот же PLU
         code = int(plu_value)
 
-        # штрих-код, если есть
         barcode = getattr(p, "barcode", None)
-        if barcode:
-            barcode = str(barcode)
+        barcode = str(barcode) if barcode else None
 
         items.append(
             {
                 "product_uuid": str(p.id),
-                "plu_number": int(plu_value),   # <-- ТОТ САМЫЙ ПЛУ (55 и т.д.)
-                "code": code,                   # <-- ТОТ ЖЕ САМЫЙ КОД
+                "plu_number": int(plu_value),
+                "code": int(plu_value),
                 "name": name,
                 "price": price,
                 "shelf_life_days": shelf,
@@ -166,18 +154,14 @@ def send_products_to_scale(request):
             }
         )
 
-        # если у товара не было собственного PLU и мы назначили cur_plu,
-        # то инкрементируем счётчик
-        if p.plu is None:  # до сохранения мы уже присвоили plu_value
+        if plu_was_missing:
             cur_plu += 1
         else:
-            # если у каждого товара ПЛУ уже задан вручную,
-            # можно просто cur_plu оставлять как есть
             cur_plu = max(cur_plu, int(plu_value) + 1)
 
     if not items:
         return Response(
-            {"detail": "Нет весовых/штучных товаров для отправки"},
+            {"detail": "Нет товаров для отправки"},
             status=status.HTTP_400_BAD_REQUEST,
         )
 
@@ -188,17 +172,8 @@ def send_products_to_scale(request):
         group_name,
         {
             "type": "send_scale_payload",
-            "payload": {
-                "action": "plu_batch",
-                "items": items,
-            },
+            "payload": {"action": "plu_batch", "items": items},
         },
     )
 
-    return Response(
-        {
-            "sent": len(items),
-            "items": items,
-        },
-        status=status.HTTP_200_OK,
-    )
+    return Response({"sent": len(items), "items": items}, status=status.HTTP_200_OK)
