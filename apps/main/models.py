@@ -1368,7 +1368,10 @@ class Sale(models.Model):
         CASH = "cash", "Наличные"
         TRANSFER = "transfer", "Перевод"
         DEBT = "debt", "Долг"
-        
+        MBANK = "mbank", "Мбанк"
+        OPTIMA = "optima", "Оптима"
+        OBANK = "obank", "Обанк"
+        BAKAI = "bakai", "Бакай"
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
 
