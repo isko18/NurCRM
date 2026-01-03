@@ -42,6 +42,7 @@ django-filter==25.1
 django-jazzmin==3.0.1
 django-js-asset==3.1.2
 django-mptt==0.17.0
+django-redis==5.4.0
 djangorestframework==3.16.0
 djangorestframework_simplejwt==5.5.0
 drf-yasg==1.21.10

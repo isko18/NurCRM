@@ -12,6 +12,7 @@ https://docs.djangoproject.com/en/5.2/ref/settings/
 
 from pathlib import Path
 from datetime import timedelta
+import os
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -227,6 +228,27 @@ CELERY_BROKER_URL = 'redis://localhost:6379/0'
 CELERY_RESULT_BACKEND = 'redis://localhost:6379/0'
 CELERY_ACCEPT_CONTENT = ['json']
 CELERY_TASK_SERIALIZER = 'json'
+
+# ===========================
+# Кэширование (Redis)
+# ===========================
+CACHES = {
+    'default': {
+        'BACKEND': 'django_redis.cache.RedisCache',
+        'LOCATION': os.getenv('REDIS_URL', 'redis://127.0.0.1:6379/1'),
+        'OPTIONS': {
+            'CLIENT_CLASS': 'django_redis.client.DefaultClient',
+        },
+        'KEY_PREFIX': 'nurcrm',
+        'TIMEOUT': 300,  # 5 минут по умолчанию
+    }
+}
+
+# Время кэширования для разных типов данных (в секундах)
+CACHE_TIMEOUT_SHORT = 60  # 1 минута - для часто меняющихся данных
+CACHE_TIMEOUT_MEDIUM = 300  # 5 минут - для аналитики
+CACHE_TIMEOUT_LONG = 3600  # 1 час - для статических данных
+CACHE_TIMEOUT_ANALYTICS = 600  # 10 минут - для аналитики агентов
 
 
 CORS_ORIGIN_ALLOW_ALL = True

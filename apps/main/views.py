@@ -458,7 +458,7 @@ def _get_company(user):
 # ===========================
 class ContactListCreateAPIView(CompanyBranchRestrictedMixin, generics.ListCreateAPIView):
     serializer_class = ContactSerializer
-    queryset = Contact.objects.all()
+    queryset = Contact.objects.select_related("company", "branch", "owner").all()
     filter_backends = [DjangoFilterBackend, filters.SearchFilter]
     search_fields = ["name", "email", "phone", "client_company"]
     filterset_fields = "__all__"
@@ -470,7 +470,7 @@ class ContactListCreateAPIView(CompanyBranchRestrictedMixin, generics.ListCreate
 
 class ContactRetrieveUpdateDestroyAPIView(CompanyBranchRestrictedMixin, generics.RetrieveUpdateDestroyAPIView):
     serializer_class = ContactSerializer
-    queryset = Contact.objects.all()
+    queryset = Contact.objects.select_related("company", "branch", "owner").all()
 
 
 # ===========================
@@ -478,7 +478,7 @@ class ContactRetrieveUpdateDestroyAPIView(CompanyBranchRestrictedMixin, generics
 # ===========================
 class PipelineListCreateAPIView(CompanyBranchRestrictedMixin, generics.ListCreateAPIView):
     serializer_class = PipelineSerializer
-    queryset = Pipeline.objects.all()
+    queryset = Pipeline.objects.select_related("company", "branch", "owner").all()
     filter_backends = [filters.SearchFilter, DjangoFilterBackend]
     search_fields = ["name"]
     filterset_fields = "__all__"
@@ -489,7 +489,7 @@ class PipelineListCreateAPIView(CompanyBranchRestrictedMixin, generics.ListCreat
 
 class PipelineRetrieveUpdateDestroyAPIView(CompanyBranchRestrictedMixin, generics.RetrieveUpdateDestroyAPIView):
     serializer_class = PipelineSerializer
-    queryset = Pipeline.objects.all()
+    queryset = Pipeline.objects.select_related("company", "branch", "owner").all()
 
 
 # ===========================
@@ -497,7 +497,7 @@ class PipelineRetrieveUpdateDestroyAPIView(CompanyBranchRestrictedMixin, generic
 # ===========================
 class DealListCreateAPIView(CompanyBranchRestrictedMixin, generics.ListCreateAPIView):
     serializer_class = DealSerializer
-    queryset = Deal.objects.all()
+    queryset = Deal.objects.select_related("company", "branch", "pipeline", "contact", "assigned_to").all()
     filter_backends = [DjangoFilterBackend, filters.SearchFilter]
     search_fields = ["title", "stage"]
     filterset_fields = "__all__"
@@ -505,7 +505,7 @@ class DealListCreateAPIView(CompanyBranchRestrictedMixin, generics.ListCreateAPI
 
 class DealRetrieveUpdateDestroyAPIView(CompanyBranchRestrictedMixin, generics.RetrieveUpdateDestroyAPIView):
     serializer_class = DealSerializer
-    queryset = Deal.objects.all()
+    queryset = Deal.objects.select_related("company", "branch", "pipeline", "contact", "assigned_to").all()
 
 
 # ===========================
@@ -521,7 +521,7 @@ class TaskListCreateAPIView(CompanyBranchRestrictedMixin, generics.ListCreateAPI
 
 class TaskRetrieveUpdateDestroyAPIView(CompanyBranchRestrictedMixin, generics.RetrieveUpdateDestroyAPIView):
     serializer_class = TaskSerializer
-    queryset = Task.objects.all()
+    queryset = Task.objects.select_related("company", "branch", "assigned_to", "deal").all()
 
 
 # ===========================
@@ -1132,7 +1132,7 @@ class ProductByBarcodeAPIView(CompanyBranchRestrictedMixin, generics.RetrieveAPI
 # ===========================
 class ReviewListCreateAPIView(CompanyBranchRestrictedMixin, generics.ListCreateAPIView):
     serializer_class = ReviewSerializer
-    queryset = Review.objects.all()
+    queryset = Review.objects.select_related("company", "branch", "user", "product").all()
     filter_backends = [DjangoFilterBackend]
     filterset_fields = "__all__"
 
@@ -1142,7 +1142,7 @@ class ReviewListCreateAPIView(CompanyBranchRestrictedMixin, generics.ListCreateA
 
 class ReviewRetrieveUpdateDestroyAPIView(CompanyBranchRestrictedMixin, generics.RetrieveUpdateDestroyAPIView):
     serializer_class = ReviewSerializer
-    queryset = Review.objects.all()
+    queryset = Review.objects.select_related("company", "branch", "user", "product").all()
 
 
 # ===========================
@@ -1150,14 +1150,14 @@ class ReviewRetrieveUpdateDestroyAPIView(CompanyBranchRestrictedMixin, generics.
 # ===========================
 class NotificationListView(CompanyBranchRestrictedMixin, generics.ListAPIView):
     serializer_class = NotificationSerializer
-    queryset = Notification.objects.all()
+    queryset = Notification.objects.select_related("company", "branch", "user").all()
     filter_backends = [DjangoFilterBackend]
     filterset_fields = "__all__"
 
 
 class NotificationDetailView(CompanyBranchRestrictedMixin, generics.RetrieveAPIView):
     serializer_class = NotificationSerializer
-    queryset = Notification.objects.all()
+    queryset = Notification.objects.select_related("company", "branch", "user").all()
 
 
 class MarkAllNotificationsReadView(APIView):
@@ -1173,14 +1173,14 @@ class MarkAllNotificationsReadView(APIView):
 # ===========================
 class EventListCreateAPIView(CompanyBranchRestrictedMixin, generics.ListCreateAPIView):
     serializer_class = EventSerializer
-    queryset = Event.objects.all()
+    queryset = Event.objects.select_related("company", "branch", "user").all()
     filter_backends = [DjangoFilterBackend]
     filterset_fields = "__all__"
 
 
 class EventRetrieveUpdateDestroyAPIView(CompanyBranchRestrictedMixin, generics.RetrieveUpdateDestroyAPIView):
     serializer_class = EventSerializer
-    queryset = Event.objects.all()
+    queryset = Event.objects.select_related("company", "branch", "user").all()
 
 
 # ===========================
@@ -1188,7 +1188,7 @@ class EventRetrieveUpdateDestroyAPIView(CompanyBranchRestrictedMixin, generics.R
 # ===========================
 class WarehouseListCreateAPIView(CompanyBranchRestrictedMixin, generics.ListCreateAPIView):
     serializer_class = WarehouseSerializer
-    queryset = Warehouse.objects.all()
+    queryset = Warehouse.objects.select_related("company", "branch").all()
     filter_backends = [DjangoFilterBackend, filters.SearchFilter]
     search_fields = ["name", "location"]
     filterset_fields = "__all__"
@@ -1196,12 +1196,12 @@ class WarehouseListCreateAPIView(CompanyBranchRestrictedMixin, generics.ListCrea
 
 class WarehouseRetrieveUpdateDestroyAPIView(CompanyBranchRestrictedMixin, generics.RetrieveUpdateDestroyAPIView):
     serializer_class = WarehouseSerializer
-    queryset = Warehouse.objects.all()
+    queryset = Warehouse.objects.select_related("company", "branch").all()
 
 
 class WarehouseEventListCreateAPIView(CompanyBranchRestrictedMixin, generics.ListCreateAPIView):
     serializer_class = WarehouseEventSerializer
-    queryset = WarehouseEvent.objects.all()
+    queryset = WarehouseEvent.objects.select_related("company", "branch", "warehouse", "responsible_person").all()
     filter_backends = [DjangoFilterBackend, filters.SearchFilter]
     search_fields = ["title", "client_name"]
     filterset_fields = "__all__"
@@ -1209,7 +1209,7 @@ class WarehouseEventListCreateAPIView(CompanyBranchRestrictedMixin, generics.Lis
 
 class WarehouseEventRetrieveUpdateDestroyAPIView(CompanyBranchRestrictedMixin, generics.RetrieveUpdateDestroyAPIView):
     serializer_class = WarehouseEventSerializer
-    queryset = WarehouseEvent.objects.all()
+    queryset = WarehouseEvent.objects.select_related("company", "branch", "warehouse", "responsible_person").all()
 
 
 # ===========================
@@ -1217,7 +1217,7 @@ class WarehouseEventRetrieveUpdateDestroyAPIView(CompanyBranchRestrictedMixin, g
 # ===========================
 class ProductCategoryListCreateAPIView(CompanyBranchRestrictedMixin, generics.ListCreateAPIView):
     serializer_class = ProductCategorySerializer
-    queryset = ProductCategory.objects.all()
+    queryset = ProductCategory.objects.select_related("company", "branch", "parent").all()
     filter_backends = [DjangoFilterBackend, filters.SearchFilter]
     search_fields = ["name"]
     filterset_fields = "__all__"
@@ -1225,12 +1225,12 @@ class ProductCategoryListCreateAPIView(CompanyBranchRestrictedMixin, generics.Li
 
 class ProductCategoryRetrieveUpdateDestroyAPIView(CompanyBranchRestrictedMixin, generics.RetrieveUpdateDestroyAPIView):
     serializer_class = ProductCategorySerializer
-    queryset = ProductCategory.objects.all()
+    queryset = ProductCategory.objects.select_related("company", "branch", "parent").all()
 
 
 class ProductBrandListCreateAPIView(CompanyBranchRestrictedMixin, generics.ListCreateAPIView):
     serializer_class = ProductBrandSerializer
-    queryset = ProductBrand.objects.all()
+    queryset = ProductBrand.objects.select_related("company", "branch").all()
     filter_backends = [DjangoFilterBackend, filters.SearchFilter]
     search_fields = ["name"]
     filterset_fields = "__all__"
@@ -1238,7 +1238,7 @@ class ProductBrandListCreateAPIView(CompanyBranchRestrictedMixin, generics.ListC
 
 class ProductBrandRetrieveUpdateDestroyAPIView(CompanyBranchRestrictedMixin, generics.RetrieveUpdateDestroyAPIView):
     serializer_class = ProductBrandSerializer
-    queryset = ProductBrand.objects.all()
+    queryset = ProductBrand.objects.select_related("company", "branch").all()
 
 
 # ===========================
@@ -1336,7 +1336,9 @@ class ClientListCreateAPIView(CompanyBranchRestrictedMixin, generics.ListCreateA
     ordering = ["-created_at"]
 
     def get_queryset(self):
-        return self._filter_qs_company_branch(Client.objects.all())
+        return self._filter_qs_company_branch(
+            Client.objects.select_related("company", "branch").all()
+        )
 
 
 class ClientRetrieveUpdateDestroyAPIView(CompanyBranchRestrictedMixin, generics.RetrieveUpdateDestroyAPIView):
@@ -1349,7 +1351,9 @@ class ClientRetrieveUpdateDestroyAPIView(CompanyBranchRestrictedMixin, generics.
     serializer_class = ClientSerializer
 
     def get_queryset(self):
-        return self._filter_qs_company_branch(Client.objects.all())
+        return self._filter_qs_company_branch(
+            Client.objects.select_related("company", "branch").all()
+        )
 
 
 def _deal_prefetch():
@@ -1695,7 +1699,9 @@ class ClientWithDebtsListAPIView(CompanyBranchRestrictedMixin, generics.ListAPIV
     serializer_class = ClientSerializer
 
     def get_queryset(self):
-        qs = self._filter_qs_company_branch(Client.objects.all())
+        qs = self._filter_qs_company_branch(
+            Client.objects.select_related("company", "branch").all()
+        )
         # unpaid = paid_on is null (включая частично оплаченные)
         qs = qs.filter(
             deals__kind=ClientDeal.Kind.DEBT,
@@ -1707,22 +1713,22 @@ class ClientWithDebtsListAPIView(CompanyBranchRestrictedMixin, generics.ListAPIV
 # ===========================
 class BidListCreateAPIView(CompanyBranchRestrictedMixin, generics.ListCreateAPIView):
     serializer_class = BidSerializers
-    queryset = Bid.objects.all()
+    queryset = Bid.objects.select_related("company", "branch", "client").all()
 
 
 class BidRetrieveUpdateDestroyAPIView(CompanyBranchRestrictedMixin, generics.RetrieveUpdateDestroyAPIView):
     serializer_class = BidSerializers
-    queryset = Bid.objects.all()
+    queryset = Bid.objects.select_related("company", "branch", "client").all()
 
 
 class SocialApplicationsListCreateAPIView(CompanyBranchRestrictedMixin, generics.ListCreateAPIView):
     serializer_class = SocialApplicationsSerializers
-    queryset = SocialApplications.objects.all()
+    queryset = SocialApplications.objects.select_related("company", "branch", "client").all()
 
 
 class SocialApplicationsRetrieveUpdateDestroyAPIView(CompanyBranchRestrictedMixin, generics.RetrieveUpdateDestroyAPIView):
     serializer_class = SocialApplicationsSerializers
-    queryset = SocialApplications.objects.all()
+    queryset = SocialApplications.objects.select_related("company", "branch", "client").all()
 
 
 # ===========================
@@ -1856,7 +1862,9 @@ class DebtListCreateAPIView(CompanyBranchRestrictedMixin, generics.ListCreateAPI
     ordering = ["-created_at"]
 
     def get_queryset(self):
-        return self._filter_qs_company_branch(Debt.objects.all())
+        return self._filter_qs_company_branch(
+            Debt.objects.select_related("company", "branch", "client").all()
+        )
 
 
 class DebtRetrieveUpdateDestroyAPIView(CompanyBranchRestrictedMixin, generics.RetrieveUpdateDestroyAPIView):
@@ -1866,7 +1874,9 @@ class DebtRetrieveUpdateDestroyAPIView(CompanyBranchRestrictedMixin, generics.Re
     serializer_class = DebtSerializer
 
     def get_queryset(self):
-        return self._filter_qs_company_branch(Debt.objects.all())
+        return self._filter_qs_company_branch(
+            Debt.objects.select_related("company", "branch", "client").all()
+        )
 
 
 class DebtPayAPIView(APIView, CompanyBranchRestrictedMixin):
@@ -1906,7 +1916,9 @@ class DebtPaymentListAPIView(CompanyBranchRestrictedMixin, generics.ListAPIView)
 
     def get_queryset(self):
         # платежи конкретного долга в рамках компании/филиала
-        debt_qs = self._filter_qs_company_branch(Debt.objects.all())
+        debt_qs = self._filter_qs_company_branch(
+            Debt.objects.select_related("company", "branch", "client").all()
+        )
         debt = get_object_or_404(debt_qs, pk=self.kwargs["pk"])
         return DebtPayment.objects.filter(company=debt.company, debt=debt)
 

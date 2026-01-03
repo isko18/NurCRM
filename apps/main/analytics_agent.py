@@ -24,6 +24,17 @@ from .models import (
     SaleItem,
 )
 from apps.users.models import User
+from django.core.cache import cache
+from django.conf import settings
+
+try:
+    from apps.main.cache_utils import cached_result
+except ImportError:
+    # Fallback если cache_utils не доступен
+    def cached_result(*args, **kwargs):
+        def decorator(func):
+            return func
+        return decorator
 
 
 def _parse_period(request):
@@ -114,9 +125,11 @@ def _parse_period(request):
     }
 
 
+@cached_result(timeout=settings.CACHE_TIMEOUT_SHORT, key_prefix="agent_on_hand")
 def _compute_agent_on_hand(*, company, branch, agent) -> dict:
     """
     Остатки у агента на руках (логика максимально совпадает с /agents/me/products).
+    Кэшируется на 1 минуту (CACHE_TIMEOUT_SHORT).
     """
     accepted_returns_qs = ReturnFromAgent.objects.filter(
         company=company,
@@ -205,6 +218,7 @@ def _compute_agent_on_hand(*, company, branch, agent) -> dict:
     }
 
 
+@cached_result(timeout=settings.CACHE_TIMEOUT_ANALYTICS, key_prefix="analytics_agent")
 def build_agent_analytics_payload(
     *,
     company,
@@ -217,6 +231,7 @@ def build_agent_analytics_payload(
 ):
     """
     Аналитика агента.
+    Кэшируется на 10 минут (CACHE_TIMEOUT_ANALYTICS).
     """
     # ---- диапазон дат ----
     dt_from = timezone.make_aware(
