@@ -232,12 +232,27 @@ CELERY_TASK_SERIALIZER = 'json'
 # ===========================
 # Кэширование (Redis)
 # ===========================
+REDIS_URL = os.getenv('REDIS_URL', 'redis://127.0.0.1:6379/1')
+REDIS_PASSWORD = os.getenv('REDIS_PASSWORD', None)
+
+# Если есть пароль, добавляем его в URL
+if REDIS_PASSWORD and 'redis://' in REDIS_URL and '@' not in REDIS_URL:
+    # Формат: redis://:password@host:port/db
+    REDIS_URL = REDIS_URL.replace('redis://', f'redis://:{REDIS_PASSWORD}@')
+
 CACHES = {
     'default': {
         'BACKEND': 'django_redis.cache.RedisCache',
-        'LOCATION': os.getenv('REDIS_URL', 'redis://127.0.0.1:6379/1'),
+        'LOCATION': REDIS_URL,
         'OPTIONS': {
             'CLIENT_CLASS': 'django_redis.client.DefaultClient',
+            # 'PARSER_CLASS': 'redis.connection.HiredisParser',  # Раскомментируйте, если установлен hiredis
+            'CONNECTION_POOL_KWARGS': {
+                'max_connections': 50,
+                'retry_on_timeout': True,
+            },
+            'COMPRESSOR': 'django_redis.compressors.zlib.ZlibCompressor',  # Сжатие больших значений
+            'IGNORE_EXCEPTIONS': True,  # Не падать, если Redis недоступен (fallback на БД)
         },
         'KEY_PREFIX': 'nurcrm',
         'TIMEOUT': 300,  # 5 минут по умолчанию
