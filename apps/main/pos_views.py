@@ -56,6 +56,7 @@ from .pos_serializers import (
     CustomCartItemCreateSerializer,
     SaleStatusUpdateSerializer,
     ReceiptSerializer,
+    AgentCheckoutSerializer
 )
 
 try:
@@ -1088,9 +1089,12 @@ class MobileScannerIngestAPIView(APIView):
     @transaction.atomic
     def post(self, request, token, *args, **kwargs):
         barcode = request.data.get("barcode", "").strip()
-        qty = int(request.data.get("quantity", 1))
-        if not barcode or qty <= 0:
-            return Response({"detail": "barcode required"}, status=400)
+        raw_qty = request.data.get("quantity", "1.000")
+        qty = _to_decimal(raw_qty, default=Decimal("1.000"))
+        qty = qty3(qty)
+        if qty <= 0:
+            return Response({"detail": "quantity must be > 0"}, status=400)
+
 
         mt = MobileScannerToken.objects.select_related("cart", "cart__company").filter(token=token).first()
         if not mt:
@@ -1115,9 +1119,9 @@ class MobileScannerIngestAPIView(APIView):
             },
         )
         if not created:
-            item.quantity += qty
-            item.save(update_fields=["quantity"])
-        cart.recalc()
+            CartItem.objects.filter(pk=item.pk).update(quantity=F("quantity") + qty)
+            item.refresh_from_db(fields=["quantity"])
+
 
         return Response({"ok": True}, status=201)
 
@@ -1657,30 +1661,19 @@ class AgentSaleCheckoutAPIView(CompanyBranchRestrictedMixin, APIView):
         company = self._company() or request.user.company
         branch = self._auto_branch()
 
-        cart_qs = Cart.objects.filter(
-            id=pk,
-            company=company,
-            status=Cart.Status.ACTIVE,
-        )
+        cart_qs = Cart.objects.filter(id=pk, company=company, status=Cart.Status.ACTIVE)
         if hasattr(Cart, "branch"):
-            if branch is not None:
-                cart_qs = cart_qs.filter(branch=branch)
-            else:
-                cart_qs = cart_qs.filter(branch__isnull=True)
-
+            cart_qs = cart_qs.filter(branch=branch) if branch is not None else cart_qs.filter(branch__isnull=True)
         cart = get_object_or_404(cart_qs)
 
-        ser = CheckoutSerializer(
-            data=request.data,
-            context={"request": request, "cart": cart},
-        )
+        ser = AgentCheckoutSerializer(data=request.data)
         ser.is_valid(raise_exception=True)
 
         print_receipt = ser.validated_data["print_receipt"]
         client_id = ser.validated_data.get("client_id")
         payment_method = ser.validated_data.get("payment_method") or Sale.PaymentMethod.CASH
         cash_received = ser.validated_data.get("cash_received") or Decimal("0.00")
-        cashbox_id = ser.validated_data.get("cashbox_id")
+        cashbox_id = ser.validated_data.get("cashbox_id")  # опционально
 
         if client_id:
             client = get_object_or_404(Client, id=client_id, company=company)
@@ -1694,17 +1687,24 @@ class AgentSaleCheckoutAPIView(CompanyBranchRestrictedMixin, APIView):
         if payment_method == Sale.PaymentMethod.CASH and cash_received < cart.total:
             raise ValidationError({"detail": "Сумма, полученная наличными, меньше суммы продажи."})
 
+        # ✅ ВАЖНО: checkout_agent_cart должен НЕ требовать shift
         try:
             sale = checkout_agent_cart(
                 cart,
                 agent=acting_agent,
-                cashbox_id=cashbox_id,
+                cashbox_id=cashbox_id,  # можно сохранить кассу в Sale, но без смен
                 payment_method=payment_method,
                 cash_received=cash_received,
             )
         except Exception as e:
             raise ValidationError({"detail": str(e)})
 
+        # ✅ гарантируем, что смены нет
+        if getattr(sale, "shift_id", None):
+            sale.shift = None
+            sale.save(update_fields=["shift"])
+
+        # отмечаем оплату
         if hasattr(sale, "mark_paid") and callable(sale.mark_paid):
             if sale.status != Sale.Status.PAID:
                 sale.mark_paid(payment_method=payment_method, cash_received=cash_received)
@@ -1736,9 +1736,9 @@ class AgentSaleCheckoutAPIView(CompanyBranchRestrictedMixin, APIView):
             "client_name": getattr(sale.client, "full_name", None) if sale.client else None,
             "payment_method": getattr(sale, "payment_method", payment_method),
             "cash_received": f"{getattr(sale, 'cash_received', cash_received):.2f}",
-            "change": f"{sale.change:.2f}" if hasattr(sale, "change") else "0.00",
-            "shift_id": str(sale.shift_id) if getattr(sale, "shift_id", None) else None,
-            "cashbox_id": str(sale.cashbox_id) if getattr(sale, "cashbox_id", None) else None,
+            "change": f"{getattr(sale, 'change', Decimal('0.00')):.2f}",
+            "shift_id": None,  # ✅ нет смен у агента
+            "cashbox_id": str(getattr(sale, "cashbox_id", None)) if getattr(sale, "cashbox_id", None) else None,
         }
 
         if print_receipt:
@@ -1752,13 +1752,11 @@ class AgentSaleCheckoutAPIView(CompanyBranchRestrictedMixin, APIView):
             if sale.tax_total and sale.tax_total > 0:
                 totals.append(f"НАЛОГ: {sale.tax_total:.2f}")
             totals.append(f"ИТОГО: {sale.total:.2f}")
-
             if getattr(sale, "payment_method", payment_method) == Sale.PaymentMethod.CASH:
                 totals.append(f"ПОЛУЧЕНО НАЛИЧНЫМИ: {getattr(sale, 'cash_received', cash_received):.2f}")
-                totals.append(f"СДАЧА: {sale.change:.2f}" if hasattr(sale, "change") else "СДАЧА: 0.00")
+                totals.append(f"СДАЧА: {getattr(sale, 'change', Decimal('0.00')):.2f}")
             else:
                 totals.append("ОПЛАТА ПЕРЕВОДОМ")
-
             payload["receipt_text"] = "ЧЕК\n" + "\n".join(lines) + "\n" + "\n".join(totals)
 
         return Response(payload, status=status.HTTP_201_CREATED)

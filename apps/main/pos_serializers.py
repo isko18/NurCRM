@@ -577,3 +577,35 @@ class ReceiptSerializer(serializers.Serializer):
     paid_cash = serializers.FloatField(required=False, default=0.0)
     paid_card = serializers.FloatField(required=False, default=0.0)
     change = serializers.FloatField(required=False, default=0.0)
+
+
+class AgentCheckoutSerializer(serializers.Serializer):
+    print_receipt = serializers.BooleanField(default=False)
+    client_id = OptionalUUIDField(required=False, allow_null=True)
+
+    payment_method = serializers.ChoiceField(
+        choices=Sale.PaymentMethod.choices,
+        default=Sale.PaymentMethod.CASH,
+        required=False,
+    )
+    cash_received = MoneyField(required=False, allow_null=True)
+
+    # если хочешь сохранять кассу в продаже — оставь
+    cashbox_id = OptionalUUIDField(required=False, allow_null=True)
+
+    def validate(self, attrs):
+        pm = attrs.get("payment_method") or Sale.PaymentMethod.CASH
+        cr = attrs.get("cash_received")
+
+        if pm == Sale.PaymentMethod.CASH:
+            if cr is None:
+                raise serializers.ValidationError({"cash_received": "Укажите сумму, принятую наличными."})
+            if cr < 0:
+                raise serializers.ValidationError({"cash_received": "Не может быть отрицательной."})
+        else:
+            if cr is None:
+                attrs["cash_received"] = Decimal("0.00")
+            elif cr < 0:
+                raise serializers.ValidationError({"cash_received": "Не может быть отрицательной."})
+
+        return attrs
