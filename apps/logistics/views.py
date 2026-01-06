@@ -7,6 +7,7 @@ from django.db.models import (
     Count,
     F,
     DecimalField,
+    Value,
     ExpressionWrapper,
 )
 from django.db.models.functions import Coalesce, TruncDate
@@ -19,6 +20,9 @@ from .models import Logistics
 from .serializers import LogisticsSerializer
 
 from apps.main.views import CompanyBranchRestrictedMixin
+
+DECIMAL_OUT = DecimalField(max_digits=12, decimal_places=2)
+ZERO_DEC = Value(Decimal("0.00"), output_field=DECIMAL_OUT)
 
 def get_company_from_request(request):
     company_id = request.query_params.get("company")
@@ -172,7 +176,7 @@ class LogisticsAnalyticsView(CompanyBranchRestrictedMixin, APIView):
 
 
 class LogisticsAnalyticsView(APIView):
-    permission_classes = [permissions.IsAuthenticated]
+    permission_classes = [IsAuthenticated]
 
     def get(self, request):
         company = get_company_from_request(request)
@@ -185,7 +189,6 @@ class LogisticsAnalyticsView(APIView):
         if branch:
             qs = qs.filter(branch=branch)
 
-        # фильтры (опционально)
         status = request.query_params.get("status")
         if status:
             qs = qs.filter(status=status)
@@ -200,20 +203,20 @@ class LogisticsAnalyticsView(APIView):
 
         totals = qs.aggregate(
             total_orders=Coalesce(Count("id"), 0),
-            total_revenue=Coalesce(Sum("revenue"), 0),
-            total_service=Coalesce(Sum("price_service"), 0),
-            total_car=Coalesce(Sum("price_car"), 0),
-            total_sale=Coalesce(Sum("sale_price"), 0),
+            total_revenue=Coalesce(Sum("revenue"), ZERO_DEC, output_field=DECIMAL_OUT),
+            total_service=Coalesce(Sum("price_service"), ZERO_DEC, output_field=DECIMAL_OUT),
+            total_car=Coalesce(Sum("price_car"), ZERO_DEC, output_field=DECIMAL_OUT),
+            total_sale=Coalesce(Sum("sale_price"), ZERO_DEC, output_field=DECIMAL_OUT),
         )
 
         by_status_raw = list(
             qs.values("status")
             .annotate(
                 orders=Coalesce(Count("id"), 0),
-                revenue=Coalesce(Sum("revenue"), 0),
-                service=Coalesce(Sum("price_service"), 0),
-                car=Coalesce(Sum("price_car"), 0),
-                sale=Coalesce(Sum("sale_price"), 0),
+                revenue=Coalesce(Sum("revenue"), ZERO_DEC, output_field=DECIMAL_OUT),
+                service=Coalesce(Sum("price_service"), ZERO_DEC, output_field=DECIMAL_OUT),
+                car=Coalesce(Sum("price_car"), ZERO_DEC, output_field=DECIMAL_OUT),
+                sale=Coalesce(Sum("sale_price"), ZERO_DEC, output_field=DECIMAL_OUT),
             )
             .order_by("status")
         )
