@@ -13,12 +13,34 @@ from django.db.models.functions import Coalesce, TruncDate
 from rest_framework import generics, permissions
 from rest_framework.views import APIView
 from rest_framework.response import Response
-
+from apps.users.models import Company, Branch
+from rest_framework.exceptions import ValidationError
 from .models import Logistics
 from .serializers import LogisticsSerializer
 
 from apps.main.views import CompanyBranchRestrictedMixin
-from apps.main.serializers import _company_from_ctx, _active_branch
+
+def get_company_from_request(request):
+    company_id = request.query_params.get("company")
+    if not company_id:
+        return None
+    try:
+        return Company.objects.get(id=company_id)
+    except Company.DoesNotExist:
+        raise ValidationError({"company": "Компания не найдена."})
+
+
+def get_branch_from_request(request, company=None):
+    branch_id = request.query_params.get("branch")
+    if not branch_id:
+        return None
+    qs = Branch.objects.all()
+    if company:
+        qs = qs.filter(company=company)
+    try:
+        return qs.get(id=branch_id)
+    except Branch.DoesNotExist:
+        raise ValidationError({"branch": "Филиал не найден или не принадлежит компании."})
 
 class LogisticsListCreateView(CompanyBranchRestrictedMixin, generics.ListCreateAPIView):
     """
@@ -153,18 +175,17 @@ class LogisticsAnalyticsView(APIView):
     permission_classes = [permissions.IsAuthenticated]
 
     def get(self, request):
-        company = _company_from_ctx(self)
-        branch = _active_branch(self)
+        company = get_company_from_request(request)
+        branch = get_branch_from_request(request, company=company)
 
         qs = Logistics.objects.all()
 
-        # Ограничение по компании/филиалу (как у тебя в сериализаторе)
         if company:
             qs = qs.filter(company=company)
         if branch:
             qs = qs.filter(branch=branch)
 
-        # Доп. фильтры (по желанию)
+        # фильтры (опционально)
         status = request.query_params.get("status")
         if status:
             qs = qs.filter(status=status)
@@ -177,9 +198,6 @@ class LogisticsAnalyticsView(APIView):
         if date_to:
             qs = qs.filter(created_at__date__lte=date_to)
 
-        # -----------------------------
-        # TOTALS (Все заказы)
-        # -----------------------------
         totals = qs.aggregate(
             total_orders=Coalesce(Count("id"), 0),
             total_revenue=Coalesce(Sum("revenue"), 0),
@@ -188,9 +206,6 @@ class LogisticsAnalyticsView(APIView):
             total_sale=Coalesce(Sum("sale_price"), 0),
         )
 
-        # -----------------------------
-        # BY STATUS
-        # -----------------------------
         by_status_raw = list(
             qs.values("status")
             .annotate(
@@ -203,7 +218,6 @@ class LogisticsAnalyticsView(APIView):
             .order_by("status")
         )
 
-        # Чтобы UI мог рисовать красиво (display)
         status_display_map = dict(Logistics.Status.choices)
         by_status = [
             {
@@ -218,9 +232,6 @@ class LogisticsAnalyticsView(APIView):
             for row in by_status_raw
         ]
 
-        # -----------------------------
-        # BY ARRIVAL DATE (Заказы по датам прибытия)
-        # -----------------------------
         by_arrival_date = list(
             qs.exclude(arrival_date__isnull=True)
             .annotate(day=TruncDate("arrival_date"))
@@ -229,9 +240,6 @@ class LogisticsAnalyticsView(APIView):
             .order_by("day")
         )
 
-        # -----------------------------
-        # CHARTS (готовые структуры)
-        # -----------------------------
         charts = {
             "orders_by_status": [
                 {"name": x["status_display"], "value": x["orders"], "status": x["status"]}
@@ -251,14 +259,10 @@ class LogisticsAnalyticsView(APIView):
             ],
         }
 
-        # -----------------------------
-        # RESPONSE (под твой UI)
-        # -----------------------------
         return Response(
             {
                 "totals": totals,
                 "cards": {
-                    # Можно прямо этим кормить карточки
                     "all": {
                         "title": "Все заказы",
                         "orders": totals["total_orders"],
