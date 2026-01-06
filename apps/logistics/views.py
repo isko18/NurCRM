@@ -9,7 +9,7 @@ from django.db.models import (
     DecimalField,
     ExpressionWrapper,
 )
-
+from django.db.models.functions import Coalesce, TruncDate
 from rest_framework import generics, permissions
 from rest_framework.views import APIView
 from rest_framework.response import Response
@@ -18,7 +18,7 @@ from .models import Logistics
 from .serializers import LogisticsSerializer
 
 from apps.main.views import CompanyBranchRestrictedMixin
-
+from apps.main.serializers import _company_from_ctx, _active_branch
 
 class LogisticsListCreateView(CompanyBranchRestrictedMixin, generics.ListCreateAPIView):
     """
@@ -145,5 +145,140 @@ class LogisticsAnalyticsView(CompanyBranchRestrictedMixin, APIView):
                     "orders": total_orders,
                     "amount": total_amount,
                 },
+            }
+        )
+
+
+class LogisticsAnalyticsView(APIView):
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request):
+        company = _company_from_ctx(self)
+        branch = _active_branch(self)
+
+        qs = Logistics.objects.all()
+
+        # Ограничение по компании/филиалу (как у тебя в сериализаторе)
+        if company:
+            qs = qs.filter(company=company)
+        if branch:
+            qs = qs.filter(branch=branch)
+
+        # Доп. фильтры (по желанию)
+        status = request.query_params.get("status")
+        if status:
+            qs = qs.filter(status=status)
+
+        date_from = request.query_params.get("date_from")  # YYYY-MM-DD
+        if date_from:
+            qs = qs.filter(created_at__date__gte=date_from)
+
+        date_to = request.query_params.get("date_to")  # YYYY-MM-DD
+        if date_to:
+            qs = qs.filter(created_at__date__lte=date_to)
+
+        # -----------------------------
+        # TOTALS (Все заказы)
+        # -----------------------------
+        totals = qs.aggregate(
+            total_orders=Coalesce(Count("id"), 0),
+            total_revenue=Coalesce(Sum("revenue"), 0),
+            total_service=Coalesce(Sum("price_service"), 0),
+            total_car=Coalesce(Sum("price_car"), 0),
+            total_sale=Coalesce(Sum("sale_price"), 0),
+        )
+
+        # -----------------------------
+        # BY STATUS
+        # -----------------------------
+        by_status_raw = list(
+            qs.values("status")
+            .annotate(
+                orders=Coalesce(Count("id"), 0),
+                revenue=Coalesce(Sum("revenue"), 0),
+                service=Coalesce(Sum("price_service"), 0),
+                car=Coalesce(Sum("price_car"), 0),
+                sale=Coalesce(Sum("sale_price"), 0),
+            )
+            .order_by("status")
+        )
+
+        # Чтобы UI мог рисовать красиво (display)
+        status_display_map = dict(Logistics.Status.choices)
+        by_status = [
+            {
+                "status": row["status"],
+                "status_display": status_display_map.get(row["status"], row["status"]),
+                "orders": row["orders"],
+                "revenue": row["revenue"],
+                "service": row["service"],
+                "car": row["car"],
+                "sale": row["sale"],
+            }
+            for row in by_status_raw
+        ]
+
+        # -----------------------------
+        # BY ARRIVAL DATE (Заказы по датам прибытия)
+        # -----------------------------
+        by_arrival_date = list(
+            qs.exclude(arrival_date__isnull=True)
+            .annotate(day=TruncDate("arrival_date"))
+            .values("day")
+            .annotate(orders=Coalesce(Count("id"), 0))
+            .order_by("day")
+        )
+
+        # -----------------------------
+        # CHARTS (готовые структуры)
+        # -----------------------------
+        charts = {
+            "orders_by_status": [
+                {"name": x["status_display"], "value": x["orders"], "status": x["status"]}
+                for x in by_status
+            ],
+            "service_by_status": [
+                {"name": x["status_display"], "value": x["service"], "status": x["status"]}
+                for x in by_status
+            ],
+            "revenue_by_status": [
+                {"name": x["status_display"], "value": x["revenue"], "status": x["status"]}
+                for x in by_status
+            ],
+            "orders_by_arrival_date": [
+                {"date": str(x["day"]), "value": x["orders"]}
+                for x in by_arrival_date
+            ],
+        }
+
+        # -----------------------------
+        # RESPONSE (под твой UI)
+        # -----------------------------
+        return Response(
+            {
+                "totals": totals,
+                "cards": {
+                    # Можно прямо этим кормить карточки
+                    "all": {
+                        "title": "Все заказы",
+                        "orders": totals["total_orders"],
+                        "revenue": totals["total_revenue"],
+                        "service": totals["total_service"],
+                    },
+                    "by_status": [
+                        {
+                            "title": x["status_display"],
+                            "orders": x["orders"],
+                            "revenue": x["revenue"],
+                            "service": x["service"],
+                        }
+                        for x in by_status
+                    ],
+                },
+                "tables": {
+                    "by_status": by_status,
+                    "by_arrival_date": by_arrival_date,
+                },
+                "charts": charts,
             }
         )
