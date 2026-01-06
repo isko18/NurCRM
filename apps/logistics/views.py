@@ -176,7 +176,7 @@ class LogisticsAnalyticsView(CompanyBranchRestrictedMixin, APIView):
 
 
 class LogisticsAnalyticsView(APIView):
-    permission_classes = [IsAuthenticated]
+    permission_classes = [permissions.IsAuthenticated]
 
     def get(self, request):
         company = get_company_from_request(request)
