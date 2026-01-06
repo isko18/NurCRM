@@ -12,7 +12,6 @@ from apps.main.serializers import (
     _restrict_pk_queryset_strict,
 )
 
-
 class LogisticsSerializer(serializers.ModelSerializer):
     status_display = serializers.CharField(
         source="get_status_display",
@@ -31,7 +30,9 @@ class LogisticsSerializer(serializers.ModelSerializer):
             "description",
             "price_car",
             "price_service",
-            "arrival_date",      # 👈 сюда
+            "sale_price",
+            "revenue",
+            "arrival_date",
             "status",
             "status_display",
             "created_at",
@@ -42,16 +43,21 @@ class LogisticsSerializer(serializers.ModelSerializer):
             "created_by",
             "created_at",
             "updated_at",
+            "status_display",
         )
+
     # ------------------------------------------------------------------
     # === ДИНАМИЧЕСКИЕ queryset ДЛЯ ПОЛЕЙ (company / branch / client)
     # ------------------------------------------------------------------
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
-        request = self.context.get("request")
         company = _company_from_ctx(self)
         branch = _active_branch(self)
+
+        # created_by - только чтение (на всякий случай)
+        if "created_by" in self.fields:
+            self.fields["created_by"].read_only = True
 
         # ------ Ограничиваем company ------
         if "company" in self.fields:
@@ -82,9 +88,21 @@ class LogisticsSerializer(serializers.ModelSerializer):
     # === ПЕРЕД СОХРАНЕНИЕМ
     # ------------------------------------------------------------------
     def validate(self, attrs):
-        """Автоподстановка company/branch."""
-        company = attrs.get("company") or _company_from_ctx(self)
-        branch = attrs.get("branch") or _active_branch(self)
+        """
+        Автоподстановка company/branch.
+        Важно: не перезаписываем на None, иначе получишь ошибки сохранения.
+        """
+        ctx_company = _company_from_ctx(self)
+        ctx_branch = _active_branch(self)
+
+        company = attrs.get("company") or ctx_company
+        if not company:
+            raise serializers.ValidationError(
+                {"company": "Компания не определена (нет в запросе и нет в контексте)."}
+            )
+
+        # branch может быть null по модели, поэтому тут мягко
+        branch = attrs.get("branch") if "branch" in attrs else ctx_branch
 
         attrs["company"] = company
         attrs["branch"] = branch

@@ -2,7 +2,30 @@
 
 ## 🚀 Быстрый старт (5 минут)
 
-### 1. Установка Redis на Ubuntu/Debian
+### Windows 🪟
+
+**Вариант 1: WSL2 (Рекомендуется)**
+```powershell
+# Установите WSL2 (если еще не установлен)
+wsl --install
+
+# Перезагрузите компьютер, затем в WSL:
+sudo apt update
+sudo apt install redis-server -y
+sudo service redis-server start
+```
+
+**Вариант 2: Docker**
+```powershell
+docker run -d --name redis-nurcrm -p 6379:6379 redis:7-alpine
+```
+
+**Вариант 3: Memurai**
+Скачайте и установите: https://www.memurai.com/get-memurai
+
+📖 **Подробная инструкция:** См. `REDIS_WINDOWS_SETUP.md`
+
+### Linux (Ubuntu/Debian)
 
 ```bash
 sudo apt update
