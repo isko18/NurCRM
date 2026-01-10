@@ -88,12 +88,33 @@ def register_fonts_if_needed():
 register_fonts_if_needed()
 
 
+def _set_font(p, name: str, size: int, fallback: str = "Helvetica"):
+    """
+    Безопасно ставит шрифт. Если кастомного нет — падаем на fallback,
+    но PDF продолжаем генерировать.
+    """
+    try:
+        p.setFont(name, size)
+    except Exception:
+        p.setFont(fallback, size)
+
+
 def _to_decimal(v, default=None):
     if v in (None, "", "null", "None"):
         return default
     try:
         return Decimal(str(v).replace(",", "."))
     except (InvalidOperation, ValueError, TypeError):
+        return default
+
+
+def _as_decimal(v, default: Decimal = Decimal("0")) -> Decimal:
+    d = _to_decimal(v, default=None)
+    if d is None:
+        return default
+    try:
+        return Decimal(d)
+    except Exception:
         return default
 
 
@@ -130,13 +151,33 @@ def _aware(dt_or_date, end=False):
     return None
 
 
+def _parse_range_dt(v: str, *, end: bool) -> Optional[datetime]:
+    """
+    start/end из query_params.
+    Поддерживает YYYY-MM-DD и ISO datetime.
+    Всегда возвращает aware datetime или None.
+    """
+    if not v:
+        return None
+    dt = parse_datetime(v)
+    if dt:
+        return _aware(dt, end=end)
+    d = parse_date(v)
+    if d:
+        return _aware(d, end=end)
+    return None
+
+
 def _safe(v) -> str:
     return v if (v is not None and str(v).strip()) else "—"
 
+
 Q3 = Decimal("0.001")
+
 
 def qty3(x: Optional[Decimal]) -> Decimal:
     return (x or Decimal("0")).quantize(Q3, rounding=ROUND_HALF_UP)
+
 
 @dataclass
 class Entry:
@@ -275,6 +316,301 @@ def _ensure_open_shift(*, company, branch, cashier, cashbox, opening_cash=None):
         opening_cash=opening_cash,
     )
 
+
+class ClientReconciliationJSONAPIView(APIView):
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request, client_id, *args, **kwargs):
+        company = request.user.company
+        client = get_object_or_404(Client, id=client_id, company=company)
+
+        source = (request.query_params.get("source") or "both").lower()
+        currency = request.query_params.get("currency") or "KGS"
+
+        s = request.query_params.get("start")
+        e = request.query_params.get("end")
+        if not s or not e:
+            return Response(
+                {"detail": "Укажите параметры start и end (YYYY-MM-DD)."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        start_raw = parse_datetime(s) or parse_date(s)
+        end_raw = parse_datetime(e) or parse_date(e)
+        if not start_raw or not end_raw:
+            return Response(
+                {"detail": "Неверный формат дат. Используйте YYYY-MM-DD или ISO datetime."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        start_dt = _aware(start_raw, end=False)
+        end_dt = _aware(end_raw, end=True)
+
+        if start_dt > end_dt:
+            return Response(
+                {"detail": "start не может быть больше end."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        # ---------- opening ----------
+        debit_before = Decimal("0.00")
+        credit_before = Decimal("0.00")
+
+        if source in ("both", "sales"):
+            sales_before = (
+                Sale.objects.filter(company=company, client=client, created_at__lt=start_dt)
+                .aggregate(s=Sum("total"))
+                .get("s")
+                or Decimal("0")
+            )
+            debit_before += sales_before
+
+        if ClientDeal and source in ("both", "deals"):
+            deals_before = (
+                ClientDeal.objects.filter(
+                    company=company,
+                    client=client,
+                    created_at__lt=start_dt,
+                    kind__in=[ClientDeal.Kind.SALE, ClientDeal.Kind.AMOUNT, ClientDeal.Kind.DEBT],
+                )
+                .aggregate(s=Sum("amount"))
+                .get("s")
+                or Decimal("0")
+            )
+            debit_before += deals_before
+
+            pre_before = (
+                ClientDeal.objects.filter(company=company, client=client, created_at__lt=start_dt)
+                .aggregate(s=Sum("prepayment"))
+                .get("s")
+                or Decimal("0")
+            )
+            credit_before += pre_before
+
+        if DealInstallment and source in ("both", "deals"):
+            inst_before = (
+                DealInstallment.objects.filter(
+                    deal__company=company,
+                    deal__client=client,
+                    paid_on__isnull=False,
+                    paid_on__lt=start_dt.date(),
+                )
+                .aggregate(s=Sum("amount"))
+                .get("s")
+                or Decimal("0")
+            )
+            credit_before += inst_before
+
+        opening = q2(debit_before - credit_before)
+
+        # ---------- entries ----------
+        entries = []
+
+        def _push(dt, title, a_debit, a_credit, b_debit, b_credit, ref_type=None, ref_id=None):
+            # отдаём ISO в локальном времени, чтобы фронту было проще
+            dt_local = timezone.localtime(dt) if hasattr(timezone, "localtime") else dt
+            entries.append(
+                {
+                    "date": dt_local.isoformat(),
+                    "title": title,
+                    "a_debit": fmt(a_debit),
+                    "a_credit": fmt(a_credit),
+                    "b_debit": fmt(b_debit),
+                    "b_credit": fmt(b_credit),
+                    "ref_type": ref_type,
+                    "ref_id": str(ref_id) if ref_id else None,
+                }
+            )
+
+        if source in ("both", "sales"):
+            qs = (
+                Sale.objects.filter(
+                    company=company,
+                    client=client,
+                    created_at__gte=start_dt,
+                    created_at__lte=end_dt,
+                )
+                .order_by("created_at")
+            )
+            for srow in qs:
+                amt = q2(srow.total)
+                if amt > 0:
+                    _push(
+                        srow.created_at,
+                        f"Продажа {srow.id}",
+                        a_debit=amt,
+                        a_credit=Decimal("0.00"),
+                        b_debit=Decimal("0.00"),
+                        b_credit=amt,
+                        ref_type="sale",
+                        ref_id=srow.id,
+                    )
+
+        if ClientDeal and source in ("both", "deals"):
+            deals_qs = (
+                ClientDeal.objects.filter(
+                    company=company,
+                    client=client,
+                    created_at__gte=start_dt,
+                    created_at__lte=end_dt,
+                    kind__in=[ClientDeal.Kind.SALE, ClientDeal.Kind.AMOUNT, ClientDeal.Kind.DEBT],
+                )
+                .order_by("created_at")
+            )
+            for d in deals_qs:
+                amt = q2(d.amount)
+                if amt > 0:
+                    _push(
+                        d.created_at,
+                        f"Сделка: {d.title} ({d.get_kind_display()})",
+                        a_debit=amt,
+                        a_credit=Decimal("0.00"),
+                        b_debit=Decimal("0.00"),
+                        b_credit=amt,
+                        ref_type="deal",
+                        ref_id=d.id,
+                    )
+
+            pre_qs = (
+                ClientDeal.objects.filter(
+                    company=company,
+                    client=client,
+                    prepayment__gt=0,
+                    created_at__gte=start_dt,
+                    created_at__lte=end_dt,
+                )
+                .order_by("created_at")
+            )
+            for d in pre_qs:
+                pp = q2(d.prepayment)
+                _push(
+                    d.created_at,
+                    f"Предоплата (сделка: {d.title})",
+                    a_debit=Decimal("0.00"),
+                    a_credit=pp,
+                    b_debit=pp,
+                    b_credit=Decimal("0.00"),
+                    ref_type="deal_prepayment",
+                    ref_id=d.id,
+                )
+
+        if DealInstallment and source in ("both", "deals"):
+            inst_qs = (
+                DealInstallment.objects.filter(
+                    deal__company=company,
+                    deal__client=client,
+                    paid_on__isnull=False,
+                    paid_on__gte=start_dt.date(),
+                    paid_on__lte=end_dt.date(),
+                )
+                .select_related("deal")
+                .order_by("paid_on", "number")
+            )
+            for inst in inst_qs:
+                amt = q2(inst.amount)
+                dt = _aware(inst.paid_on, end=False)
+                _push(
+                    dt,
+                    f"Оплата по рассрочке №{inst.number} (сделка: {inst.deal.title})",
+                    a_debit=Decimal("0.00"),
+                    a_credit=amt,
+                    b_debit=amt,
+                    b_credit=Decimal("0.00"),
+                    ref_type="installment_payment",
+                    ref_id=inst.id,
+                )
+
+        # сортировка по дате (ISO строка уже есть, но сортируем по реальному dt)
+        # поэтому собираем ещё раз через парсинг ISO не надо — проще сортировать до преобразования
+        # тут уже entries готовые => сортируем по date-строке, она ISO и корректно сортируется
+        entries.sort(key=lambda x: x["date"])
+
+        # ---------- totals & closing ----------
+        def _sum_field(field: str) -> Decimal:
+            s = Decimal("0")
+            for r in entries:
+                try:
+                    s += Decimal(str(r[field]).replace(",", "."))
+                except Exception:
+                    pass
+            return q2(s)
+
+        totals = {
+            "a_debit": fmt(_sum_field("a_debit")),
+            "a_credit": fmt(_sum_field("a_credit")),
+            "b_debit": fmt(_sum_field("b_debit")),
+            "b_credit": fmt(_sum_field("b_credit")),
+        }
+
+        # closing = opening + обороты (как в PDF)
+        closing = q2(opening + _sum_field("a_debit") - _sum_field("a_credit"))
+        as_of_date = (end_dt + timedelta(days=1)).date()
+
+        company_name = getattr(company, "llc", None) or getattr(company, "name", str(company))
+        client_name = client.llc or client.enterprise or client.full_name
+
+        debtor = None
+        creditor = None
+        amount = abs(closing)
+
+        if closing > 0:
+            debtor = client_name
+            creditor = company_name
+        elif closing < 0:
+            debtor = company_name
+            creditor = client_name
+
+        # ---------- running balance after each entry (для фронта) ----------
+        # running = opening; for each row: running += a_debit - a_credit
+        running = opening
+        for r in entries:
+            a_deb = _as_decimal(r["a_debit"], default=Decimal("0"))
+            a_cre = _as_decimal(r["a_credit"], default=Decimal("0"))
+            running = q2(running + a_deb - a_cre)
+            r["running_balance_after"] = fmt(running)
+
+        payload = {
+            "company": {
+                "id": str(company.id),
+                "name": company_name,
+                "inn": _safe(getattr(company, "inn", None)),
+                "okpo": _safe(getattr(company, "okpo", None)),
+                "score": _safe(getattr(company, "score", None)),
+                "bik": _safe(getattr(company, "bik", None)),
+                "address": _safe(getattr(company, "address", None)),
+                "phone": _safe(getattr(company, "phone", None)),
+                "email": _safe(getattr(company, "email", None)),
+            },
+            "client": {
+                "id": str(client.id),
+                "name": client_name,
+                "inn": _safe(getattr(client, "inn", None)),
+                "okpo": _safe(getattr(client, "okpo", None)),
+                "score": _safe(getattr(client, "score", None)),
+                "bik": _safe(getattr(client, "bik", None)),
+                "address": _safe(getattr(client, "address", None)),
+                "phone": _safe(getattr(client, "phone", None)),
+                "email": _safe(getattr(client, "email", None)),
+            },
+            "period": {
+                "start": start_dt.date().isoformat(),
+                "end": end_dt.date().isoformat(),
+                "source": source,
+                "currency": currency,
+            },
+            "opening_balance": fmt(opening),
+            "entries": entries,
+            "totals": totals,
+            "closing_balance": fmt(closing),
+            "as_of_date": as_of_date.isoformat(),
+            "debt": {
+                "debtor": debtor,
+                "creditor": creditor,
+                "amount": fmt(amount),
+                "currency": currency,
+            },
+        }
+        return Response(payload, status=200)
 
 class ClientReconciliationClassicAPIView(APIView):
     permission_classes = [permissions.IsAuthenticated]
@@ -660,9 +996,10 @@ class SaleInvoiceDownloadAPIView(APIView):
         buffer = io.BytesIO()
         p = canvas.Canvas(buffer, pagesize=(210 * mm, 297 * mm))
 
-        p.setFont("DejaVu-Bold", 14)
+        # ✅ безопасно: если DejaVu не зарегистрирован — упадём на Helvetica
+        _set_font(p, "DejaVu-Bold", 14, fallback="Helvetica-Bold")
         p.drawCentredString(105 * mm, 280 * mm, f"НАКЛАДНАЯ № {doc_no}")
-        p.setFont("DejaVu", 10)
+        _set_font(p, "DejaVu", 10, fallback="Helvetica")
         p.drawCentredString(105 * mm, 273 * mm, f"от {sale.created_at.strftime('%d.%m.%Y %H:%M')}")
 
         company = sale.company
@@ -694,18 +1031,18 @@ class SaleInvoiceDownloadAPIView(APIView):
 
         y = 260 * mm
         x_left, x_right = 20 * mm, 110 * mm
-        p.setFont("DejaVu-Bold", 10)
+        _set_font(p, "DejaVu-Bold", 10, fallback="Helvetica-Bold")
         p.drawString(x_left, y, left[0])
         p.drawString(x_right, y, right[0])
         y -= 6 * mm
-        p.setFont("DejaVu", 10)
+        _set_font(p, "DejaVu", 10, fallback="Helvetica")
         for i in range(1, len(left)):
             p.drawString(x_left, y, left[i])
             p.drawString(x_right, y, right[i])
             y -= 6 * mm
 
         y -= 6 * mm
-        p.setFont("DejaVu-Bold", 10)
+        _set_font(p, "DejaVu-Bold", 10, fallback="Helvetica-Bold")
         p.drawString(20 * mm, y, "Товар")
         p.drawRightString(140 * mm, y, "Кол-во")
         p.drawRightString(160 * mm, y, "Цена")
@@ -715,7 +1052,7 @@ class SaleInvoiceDownloadAPIView(APIView):
         p.line(20 * mm, y, 190 * mm, y)
         y -= 10
 
-        p.setFont("DejaVu", 10)
+        _set_font(p, "DejaVu", 10, fallback="Helvetica")
         for it in sale.items.all():
             p.drawString(20 * mm, y, (it.name_snapshot or "")[:60])
             p.drawRightString(140 * mm, y, str(it.quantity))
@@ -725,10 +1062,10 @@ class SaleInvoiceDownloadAPIView(APIView):
             if y < 60 * mm:
                 p.showPage()
                 y = 270 * mm
-                p.setFont("DejaVu", 10)
+                _set_font(p, "DejaVu", 10, fallback="Helvetica")
 
         y -= 10
-        p.setFont("DejaVu-Bold", 11)
+        _set_font(p, "DejaVu-Bold", 11, fallback="Helvetica-Bold")
         p.drawRightString(190 * mm, y, f"СУММА (без скидок): {fmt_money(sale.subtotal)}")
         y -= 6 * mm
         if sale.discount_total and sale.discount_total > 0:
@@ -740,7 +1077,7 @@ class SaleInvoiceDownloadAPIView(APIView):
         p.drawRightString(190 * mm, y, f"ИТОГО К ОПЛАТЕ: {fmt_money(sale.total)}")
 
         y -= 20
-        p.setFont("DejaVu", 10)
+        _set_font(p, "DejaVu", 10, fallback="Helvetica")
         p.drawString(20 * mm, y, "Продавец: _____________")
         p.drawString(120 * mm, y, "Покупатель: _____________")
 
@@ -1095,7 +1432,6 @@ class MobileScannerIngestAPIView(APIView):
         if qty <= 0:
             return Response({"detail": "quantity must be > 0"}, status=400)
 
-
         mt = MobileScannerToken.objects.select_related("cart", "cart__company").filter(token=token).first()
         if not mt:
             return Response({"detail": "invalid token"}, status=404)
@@ -1103,6 +1439,11 @@ class MobileScannerIngestAPIView(APIView):
             return Response({"detail": "token expired"}, status=410)
 
         cart = mt.cart
+
+        # ✅ защита: нельзя сканить в уже закрытую/неактивную корзину
+        if cart.status != Cart.Status.ACTIVE:
+            return Response({"detail": "cart is not active"}, status=409)
+
         try:
             product = Product.objects.get(company=cart.company, barcode=barcode)
         except Product.DoesNotExist:
@@ -1121,7 +1462,6 @@ class MobileScannerIngestAPIView(APIView):
         if not created:
             CartItem.objects.filter(pk=item.pk).update(quantity=F("quantity") + qty)
             item.refresh_from_db(fields=["quantity"])
-
 
         return Response({"ok": True}, status=201)
 
@@ -1142,14 +1482,14 @@ class SaleListAPIView(CompanyBranchRestrictedMixin, generics.ListAPIView):
     def get_queryset(self):
         qs = super().get_queryset()
 
-        start = self.request.query_params.get("start")
-        end = self.request.query_params.get("end")
-        if start:
-            dt = parse_datetime(start) or (parse_date(start) and f"{start} 00:00:00")
-            qs = qs.filter(created_at__gte=dt)
-        if end:
-            dt = parse_datetime(end) or (parse_date(end) and f"{end} 23:59:59")
-            qs = qs.filter(created_at__lte=dt)
+        # ✅ корректные aware datetime
+        start_dt = _parse_range_dt(self.request.query_params.get("start"), end=False)
+        end_dt = _parse_range_dt(self.request.query_params.get("end"), end=True)
+
+        if start_dt:
+            qs = qs.filter(created_at__gte=start_dt)
+        if end_dt:
+            qs = qs.filter(created_at__lte=end_dt)
 
         paid_only = self.request.query_params.get("paid")
         if paid_only in ("1", "true", "True"):
@@ -1266,7 +1606,6 @@ class CartItemUpdateDestroyAPIView(APIView):
         item.save(update_fields=["quantity"])
         cart.recalc()
         return Response(SaleCartSerializer(cart).data, status=200)
-
 
     @transaction.atomic
     def delete(self, request, cart_id, item_id, *args, **kwargs):
@@ -1520,11 +1859,18 @@ class AgentSaleScanAPIView(CompanyBranchRestrictedMixin, APIView):
 
         acting_agent = _resolve_acting_agent(request, cart, allow_owner_override=True)
 
-        available = _agent_available_qty(acting_agent, cart.company, product.id)
-        in_cart = CartItem.objects.filter(cart=cart, product=product).aggregate(s=Sum("quantity"))["s"] or 0
-        if qty + in_cart > available:
+        # ✅ типобезопасно: int/Decimal не смешиваем
+        available = Decimal(_agent_available_qty(acting_agent, cart.company, product.id))
+        in_cart = _as_decimal(
+            CartItem.objects.filter(cart=cart, product=product).aggregate(s=Sum("quantity"))["s"] or 0,
+            default=Decimal("0"),
+        )
+        req = _as_decimal(qty, default=Decimal("0"))
+
+        if req + in_cart > available:
+            remaining = max(Decimal("0"), available - in_cart)
             return Response(
-                {"detail": f"Недостаточно у агента. Доступно: {max(0, available - in_cart)}."},
+                {"detail": f"Недостаточно у агента. Доступно: {qty3(remaining)}."},
                 status=400,
             )
 
@@ -1569,11 +1915,18 @@ class AgentSaleAddItemAPIView(CompanyBranchRestrictedMixin, APIView):
 
         acting_agent = _resolve_acting_agent(request, cart, allow_owner_override=True)
 
-        available = _agent_available_qty(acting_agent, cart.company, product.id)
-        in_cart = CartItem.objects.filter(cart=cart, product=product).aggregate(s=Sum("quantity"))["s"] or 0
-        if qty + in_cart > available:
+        # ✅ типобезопасно: int/Decimal не смешиваем
+        available = Decimal(_agent_available_qty(acting_agent, cart.company, product.id))
+        in_cart = _as_decimal(
+            CartItem.objects.filter(cart=cart, product=product).aggregate(s=Sum("quantity"))["s"] or 0,
+            default=Decimal("0"),
+        )
+        req = _as_decimal(qty, default=Decimal("0"))
+
+        if req + in_cart > available:
+            remaining = max(Decimal("0"), available - in_cart)
             return Response(
-                {"detail": f"Недостаточно у агента. Доступно: {max(0, available - in_cart)}."},
+                {"detail": f"Недостаточно у агента. Доступно: {qty3(remaining)}."},
                 status=400,
             )
 
