@@ -653,15 +653,17 @@ class ChangePasswordSerializer(serializers.Serializer):
         if data["new_password"] != data["new_password2"]:
             raise serializers.ValidationError({"new_password2": "Пароли не совпадают."})
 
+        if data["new_password"] == data["current_password"]:
+            raise serializers.ValidationError({"new_password": "Новый пароль должен отличаться от текущего."})
+
         validate_password(data["new_password"], user)
         return data
 
     def save(self, **kwargs):
         user = self.context["request"].user
         user.set_password(self.validated_data["new_password"])
-        user.save()
+        user.save(update_fields=["password"])
         return user
-
 
 _OPTIONAL_TEXT = ("llc", "inn", "okpo", "score", "bik", "address")
 

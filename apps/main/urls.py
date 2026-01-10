@@ -136,7 +136,7 @@ urlpatterns = [
         ClientReconciliationClassicAPIView.as_view(),
         name="client-reconciliation",
     ),
-    
+    path("clients/<uuid:client_id>/reconciliation/json/", ClientReconciliationJSONAPIView.as_view()),
     
     path("pos/sales/", SaleListAPIView.as_view(), name="pos-sale-list"),
     path("pos/sales/start/", SaleStartAPIView.as_view(), name="pos-sale-start"),
