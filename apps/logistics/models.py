@@ -87,11 +87,13 @@ class Logistics(models.Model):
         blank=True,
         verbose_name="Прибыль",
     )
-
-    arrival_date = models.DateField(
+    
+    # Здесь теперь CharField ()
+    arrival_date = models.CharField(
+        max_length=20,
         null=True,
         blank=True,
-        verbose_name="Дата прибытия",
+        verbose_name="Примерная дата прибытия",
     )
 
     status = models.CharField(
