@@ -1,9 +1,14 @@
 from apps.warehouse.models.base import (
-    BaseModelId,BaseModelCompanyBranch
+    BaseModelId,BaseModelCompanyBranch,
+
+    product_image_upload_to
 )
 
 from django.core.exceptions import ValidationError
 from django.db import models
+
+from django.core.files.base import ContentFile
+
 
 class WarehouseProductImage(BaseModelId,BaseModelCompanyBranch):
     

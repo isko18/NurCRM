@@ -9,7 +9,7 @@ from django.db import models
 # класс для склада
 class Warehouse(BaseModelId,BaseModelDate,BaseModelCompanyBranch):
 
-    name = models.CharField(max_length="Название ", null=True, blank=True)
+    name = models.CharField(max_length=128,verbose_name="Название ", null=True, blank=True)
 
     location = models.TextField(verbose_name="Локация",blank=False)
     

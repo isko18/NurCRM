@@ -21,7 +21,7 @@ class WarehouseView(CompanyBranchRestrictedMixin,generics.ListCreateAPIView):
     filteret_class = WarehouseFilter
 
 
-class WarehouseDetailView(CompanyBranchRestrictedMixin,generics.RetrieveUpdateDestroyAPIView)):
+class WarehouseDetailView(CompanyBranchRestrictedMixin,generics.RetrieveUpdateDestroyAPIView):
     serializer_class = WarehouseSerializer
     queryset = Warehouse.objects.select_related("company","branch").all()    
 

@@ -12,6 +12,7 @@ from .product.charasteristics import WarehouseProductCharasteristics
 
 from .product.package import WarehouseProductPackage
 
+from .product.image import WarehouseProductImage
 
 
 

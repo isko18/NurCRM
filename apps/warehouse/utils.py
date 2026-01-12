@@ -1,3 +1,5 @@
+from rest_framework import serializers
+
 
 def _active_branch(serializer: serializers.Serializer):
     """
@@ -70,4 +72,22 @@ def _active_branch(serializer: serializers.Serializer):
 
     # ----- 3. Глобальный режим по компании -----
     return None
+
+def _restrict_pk_queryset_strict(field, base_qs, company, branch):
+    """
+    Было: если branch None -> показываем только branch__isnull=True.
+
+    Теперь:
+      - фильтруем по company (если есть поле company),
+      - по branch фильтруем ТОЛЬКО если branch не None;
+      - если branch is None -> не фильтруем по branch вообще.
+    """
+    if not field or base_qs is None or company is None:
+        return
+    qs = base_qs
+    if hasattr(base_qs.model, "company"):
+        qs = qs.filter(company=company)
+    if hasattr(base_qs.model, "branch") and branch is not None:
+        qs = qs.filter(branch=branch)
+    field.queryset = qs
 

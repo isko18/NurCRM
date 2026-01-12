@@ -4,6 +4,19 @@ from .views.warehouse import (
     WarehouseView,WarehouseDetailView
 )
 
+from .views.brands import (
+    BrandView,BrandDetailView
+)
+
+from .views.category import (
+    CategoryView,CategoryDetailView
+)
+
+from .views.product import (
+    ProductView,ProductDetailView
+)
+
+
 # / -> create | list 
 # /<uuid> -> update | delete | retrieve
 
@@ -17,9 +30,6 @@ from .views.warehouse import (
 # products/<uuid>/packages -> 
 # products-packages/<uuid> ->
 
-# products/<uuid>/charasteristics -> 
-# products-charasteristics/<uuid> ->
-
 
 # warehouses-brands/ -> create | list 
 # warehouses-category/ -> create | list
@@ -31,8 +41,16 @@ from .views.warehouse import (
 urlpatterns = [
 
     path("",WarehouseView.as_view() ,name="warehouse"),
-    path("<uuid:pk>/",WarehouseDetailView.as_view() ,name="warehouse-detail")
-    
+    path("<uuid:pk>/",WarehouseDetailView.as_view() ,name="warehouse-detail"),
+
+    path("brands/",BrandView.as_view(),name="warehouse-brand"),
+    path("brands/<uuid:pk>",BrandDetailView.as_view(),name="warehouse-brand-detail"),
+
+    path("category/",CategoryView.as_view(),name="warehouse-category"),
+    path("category/<uuid:pk>",CategoryDetailView.as_view(),name="warehouse-category-detail"),
+
+    path("<uuid:warehouse_uuid>/products/",ProductView.as_view(),name="warehouse-product"),
+    path("products/<uuid:pk>/",ProductDetailView.as_view(),name="warehouse-detail-product"),
 
 
 ]
