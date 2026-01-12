@@ -51,7 +51,7 @@ apps_includes = [
     path('consalting/', include('apps.consalting.urls')),
     path('logistics/', include('apps.logistics.urls')),
     path('instagram/', include('apps.instagram.urls')),   
-    
+    path('warehouse/', include("apps.warehouse.urls")),
 ]
 
 # API-роуты

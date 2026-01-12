@@ -583,11 +583,12 @@ class PromoRule(models.Model):
 # Product
 # ==========================
 class Product(models.Model):
+    
     class Status(models.TextChoices):
         PENDING = "pending", "Ожидание"
         ACCEPTED = "accepted", "Принят"
         REJECTED = "rejected", "Отказ"
-
+    
     class Kind(models.TextChoices):
         PRODUCT = "product", "Товар"
         SERVICE = "service", "Услуга"
@@ -601,6 +602,7 @@ class Product(models.Model):
         related_name="products",
         verbose_name="Компания",
     )
+
     branch = models.ForeignKey(
         Branch,
         on_delete=models.CASCADE,
@@ -643,6 +645,7 @@ class Product(models.Model):
         db_index=True,
         help_text="Автогенерация в формате 0001 внутри компании",
     )
+    
     article = models.CharField("Артикул", max_length=64, blank=True)
 
     name = models.CharField("Название", max_length=255)
@@ -804,6 +807,7 @@ class Product(models.Model):
         with connection.cursor() as cur:
             # ЯВНО кастим к BIGINT, чтобы не улетало в numeric
             cur.execute("SELECT pg_advisory_xact_lock(%s::bigint);", [key])
+    
     # --------- внутренние методы ---------
     def _auto_generate_plu(self):
         if not self.is_weight:
@@ -1775,6 +1779,7 @@ class Warehouse(models.Model):
         Branch, on_delete=models.CASCADE, related_name='crm_warehouses',
         null=True, blank=True, db_index=True, verbose_name='Филиал'
     )
+
     created_at = models.DateTimeField(auto_now_add=True, verbose_name='Дата создания')
     updated_at = models.DateTimeField(auto_now=True, verbose_name='Дата обновления')
 
