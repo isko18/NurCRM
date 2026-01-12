@@ -4,7 +4,7 @@ from apps.warehouse.serializers.mixins import CompanyBranchReadOnlyMixin
 from rest_framework import serializers
 
 
-class ProductPackageSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
+class WarehouseProductPackageSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
     class Meta:
         model = WarehouseProductPackage
         fields = (

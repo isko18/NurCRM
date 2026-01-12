@@ -16,7 +16,7 @@ class WarehouseSerializer(CompanyBranchReadOnlyMixin,serializers.ModelSerializer
     class Meta:
         model = Warehouse 
         fields = ("id","name","location","status","company","branch")
-
+        ref_name = "WarehouseWarehouseSerializer"
 
 
 

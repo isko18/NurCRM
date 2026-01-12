@@ -3,7 +3,7 @@ from rest_framework import serializers
 from apps.warehouse.models import WarehouseProductImage
 
 
-class ProductImageSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
+class WarehouseProductImageSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
     image = serializers.ImageField(write_only=True)
     image_url = serializers.SerializerMethodField(read_only=True)
 
@@ -11,6 +11,7 @@ class ProductImageSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerial
         model = WarehouseProductImage
         fields = ("id","product","image","image_url","is_primary","alt","created_at")
         read_only_fields = ("product",)
+        
 
     def get_image_url(self, obj):
         request = self.context.get("request")

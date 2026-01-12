@@ -8,9 +8,9 @@ from apps.warehouse.models import (
 
 
 from apps.warehouse.serializers.product import (
-    ProductSerializer,
-    ProductPackageSerializer,
-    ProductImageSerializer
+    WarehouseProductSerializer,
+    WarehouseProductPackageSerializer,
+    WarehouseProductImageSerializer
 )
 
 
@@ -24,7 +24,7 @@ from apps.warehouse.filters import ProductFilter
 
 
 class ProductView(CompanyBranchRestrictedMixin, generics.ListCreateAPIView):
-    serializer_class = ProductSerializer
+    serializer_class = WarehouseProductSerializer
 
     filterset_class = ProductFilter
     filter_backends = [DjangoFilterBackend]
@@ -43,7 +43,7 @@ class ProductView(CompanyBranchRestrictedMixin, generics.ListCreateAPIView):
 
 
 class ProductDetailView(CompanyBranchRestrictedMixin, generics.RetrieveUpdateDestroyAPIView):
-    serializer_class = ProductSerializer
+    serializer_class = WarehouseProductSerializer
 
     queryset = (
         WarehouseProduct.objects
@@ -58,7 +58,7 @@ class ProductDetailView(CompanyBranchRestrictedMixin, generics.RetrieveUpdateDes
 
 
 class ProductImagesView(CompanyBranchRestrictedMixin, generics.ListCreateAPIView):
-    serializer_class = ProductImageSerializer
+    serializer_class = WarehouseProductImageSerializer
 
     def get_queryset(self):
         product_uuid = self.kwargs.get("product_uuid")
@@ -70,7 +70,7 @@ class ProductImagesView(CompanyBranchRestrictedMixin, generics.ListCreateAPIView
 
 
 class ProductImageDetailView(CompanyBranchRestrictedMixin, generics.RetrieveUpdateDestroyAPIView):
-    serializer_class = ProductImageSerializer
+    serializer_class = WarehouseProductImageSerializer
     queryset = WarehouseProductImage.objects.all()
 
 
@@ -79,7 +79,7 @@ class ProductImageDetailView(CompanyBranchRestrictedMixin, generics.RetrieveUpda
 
 
 class ProductPackagesView(CompanyBranchRestrictedMixin, generics.ListCreateAPIView):
-    serializer_class = ProductPackageSerializer
+    serializer_class = WarehouseProductPackageSerializer
 
     def get_queryset(self):
         product_uuid = self.kwargs.get("product_uuid")
@@ -91,7 +91,7 @@ class ProductPackagesView(CompanyBranchRestrictedMixin, generics.ListCreateAPIVi
 
 
 class ProductPackageDetailView(CompanyBranchRestrictedMixin, generics.RetrieveUpdateDestroyAPIView):
-    serializer_class = ProductPackageSerializer
+    serializer_class = WarehouseProductPackageSerializer
     queryset = WarehouseProductPackage.objects.all()
 
 

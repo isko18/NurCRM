@@ -13,7 +13,9 @@ from .views.category import (
 )
 
 from .views.product import (
-    ProductView,ProductDetailView
+    ProductView,ProductDetailView,
+    ProductImagesView,ProductImageDetailView,
+    ProductPackagesView,ProductPackageDetailView
 )
 
 
@@ -52,5 +54,9 @@ urlpatterns = [
     path("<uuid:warehouse_uuid>/products/",ProductView.as_view(),name="warehouse-product"),
     path("products/<uuid:pk>/",ProductDetailView.as_view(),name="warehouse-detail-product"),
 
+    path("products/<uuid:product_uuid>/images/", ProductImagesView.as_view(), name="product-images-list-create"),
+    path("product-images/<uuid:pk>/", ProductImageDetailView.as_view(), name="product-image-detail"),
 
+    path("products/<uuid:product_uuid>/packages/", ProductPackagesView.as_view(), name="product-packages-list-create"),
+    path("products-packages/<uuid:pk>/", ProductPackageDetailView.as_view(), name="product-package-detail"),
 ]

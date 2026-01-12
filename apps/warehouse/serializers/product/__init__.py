@@ -2,24 +2,25 @@ from rest_framework import serializers
 from apps.warehouse.serializers.mixins import CompanyBranchReadOnlyMixin
 from apps.warehouse.models import WarehouseProduct
 
-from .charasteristics import ProductCharacteristicsSerializer
+from .charasteristics import WarehouseProductCharacteristicsSerializer
 
-from .image import ProductImageSerializer
+from .image import WarehouseProductImageSerializer
 
-from .package import ProductPackageSerializer
+from .package import WarehouseProductPackageSerializer
 
 
 
 
 # Сериализатор для list|create
 
-class ProductSerializer(CompanyBranchReadOnlyMixin,serializers.ModelSerializer):
+class WarehouseProductSerializer(CompanyBranchReadOnlyMixin,serializers.ModelSerializer):
     
-    characteristics = ProductCharacteristicsSerializer(required=False)
-    images = ProductImageSerializer(many=True, read_only=True)
-    packages = ProductPackageSerializer(many=True, read_only=True)
+    characteristics = WarehouseProductCharacteristicsSerializer(required=False)
+    images = WarehouseProductImageSerializer(many=True, read_only=True)
+    packages = WarehouseProductPackageSerializer(many=True, read_only=True)
 
     class Meta:
+        ref_name = "WarehouseProductSerializer"
         model = WarehouseProduct
         fields = [
             "id",
