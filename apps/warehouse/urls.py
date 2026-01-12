@@ -1,12 +1,15 @@
 from django.urls import path 
 
-
+from .views.warehouse import (
+    WarehouseView,WarehouseDetailView
+)
 
 # / -> create | list 
 # /<uuid> -> update | delete | retrieve
 
+
 # /<uuid>/products -> list | create  
-# /<uuid>/products/<uuid> -> update | delete | retrieve
+# /products/<uuid> -> update | delete | retrieve
 
 # products/<uuid>/images -> 
 # product-images/<uuid> ->
@@ -17,6 +20,7 @@ from django.urls import path
 # products/<uuid>/charasteristics -> 
 # products-charasteristics/<uuid> ->
 
+
 # warehouses-brands/ -> create | list 
 # warehouses-category/ -> create | list
 
@@ -25,5 +29,10 @@ from django.urls import path
 
 
 urlpatterns = [
+
+    path("",WarehouseView.as_view() ,name="warehouse"),
+    path("<uuid:pk>/",WarehouseDetailView.as_view() ,name="warehouse-detail")
+    
+
 
 ]
