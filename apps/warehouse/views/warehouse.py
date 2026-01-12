@@ -18,7 +18,7 @@ class WarehouseView(CompanyBranchRestrictedMixin,generics.ListCreateAPIView):
     queryset = Warehouse.objects.select_related("company","branch").all()    
     
     filter_backends = [DjangoFilterBackend]
-    filteret_class = WarehouseFilter
+    filterset_class = WarehouseFilter
 
 
 class WarehouseDetailView(CompanyBranchRestrictedMixin,generics.RetrieveUpdateDestroyAPIView):
