@@ -24,7 +24,7 @@ class BrandSerializer(CompanyBranchReadOnlyMixin,serializers.ModelSerializer):
         super().__init__(*args, **kwargs)
         comp = self._user_company()
         br = self._auto_branch()
-        _restrict_pk_queryset_strict(self.fields.get("parent"), ProductBrand.objects.all(), comp, br)
+        _restrict_pk_queryset_strict(self.fields.get("parent"), WarehouseProductBrand.objects.all(), comp, br)
 
 
 

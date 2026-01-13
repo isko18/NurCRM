@@ -22,12 +22,13 @@ class CategorySerializer(CompanyBranchReadOnlyMixin,serializers.ModelSerializer)
         model = WarehouseProductCategory
         fields = ['id', 'company', 'branch', 'name', 'parent']
         read_only_fields = ['id', 'company', 'branch']
+        ref_name = "WarehouseCategory"
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         comp = self._user_company()
         br = self._auto_branch()
-        _restrict_pk_queryset_strict(self.fields.get("parent"), ProductBrand.objects.all(), comp, br)
+        _restrict_pk_queryset_strict(self.fields.get("parent"), WarehouseProductCategory.objects.all(), comp, br)
 
 
 
