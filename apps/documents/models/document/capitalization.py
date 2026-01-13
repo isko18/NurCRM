@@ -1,29 +1,31 @@
-from apps.documents.models.base import (
+from apps.documents.models.mixins import (
     UUIDPrimaryKeyMixin
+)
+
+from apps.documents.models.abstract import (
+    ShopAbstractModel,
+    CompanyBranchAbstractModel,
+    DocumentAbstarctModel
 )
 
 from django.db import models
 
-class DocumentCapitalization(UUIDPrimaryMixin):
-    
-    document = models.OneToOneField(
-        "documents.Document",
-        on_delete=models.CASCADE,
-        related_name="capitalization")
+class DocumentCapitalization(
+    UUIDPrimaryMixin,
+    ShopAbstarctModel,
+    CompanyBranchAbstractModel,
+    DocumentAsbtractModel
+): 
     
 
     
     class Meta:
-        verbose_name = ""
-        verbose_name_plural = ""
+        verbose_name = "Оприходование"
+        verbose_name_plural = "Оприходование"
 
         indexes = [
             models.Index()
         ]
-
-
-
-
 
 
 

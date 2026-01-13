@@ -19,7 +19,7 @@ class Document(UUIDPrimaryKeyMixin,DateTimeMixin,CompanyBranchMixin):
         SALE = "sale", "Продажа"
         WRITE_OFF = "write_off", "Списание"
     
-    type = models.CharField(max_length=50,
+    document_type = models.CharField(max_length=50,
         choices=DocumentTypes.choices,
         null=False,blank=False
     )

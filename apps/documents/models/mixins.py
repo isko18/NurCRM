@@ -22,18 +22,4 @@ class DateTimeMixin(models.Model):
 
     
 
-class CompanyBranchMixin(models.Model):
-        
-    company = models.ForeignKey(
-        "users.Company", 
-        on_delete=models.CASCADE, 
-        verbose_name='Компания'
-    )
-    
-    branch = models.ForeignKey(
-        "users.Branch", 
-        on_delete=models.CASCADE, 
-        null=True, blank=True, db_index=True, verbose_name='Филиал'    # фильтр по имени (частичное совпадение, ignore case)
-    
-    class Meta:
-        abstract = True
+
