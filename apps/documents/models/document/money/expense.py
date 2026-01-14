@@ -5,15 +5,19 @@ from apps.documents.models.mixins import (
 )
 
 from apps.documents.models.abstract import (
-    DocumentAbstractModel
+    DocumentAbstractModel,
+    CompanyBranchAbstractModel
 )
 
 from django.db import models
 
 
+
+
 class DocumentExpense(
     UUIDPrimaryKeyMixin,
     DocumentAbstractModel,
+    CompanyBranchAbstractModel
 ):
     
     

@@ -4,6 +4,8 @@ from django.db import models
 
 from apps.documents.models.abstract import (
     DocumentAbstractModel
+    CompanyBranchAbstractModel,
+    DateTimeMixin
 ) 
 
 from apps.documents.models.mixins import (
@@ -19,7 +21,8 @@ from django.contrib.contenttypes.fields import GenericForeignKey
 
 
 class DocumentProduct(
-    UUIDPrimaryKeyMixin
+    UUIDPrimaryKeyMixin,
+    CompanyBranchAbstractModel
 ):
     product = models.ForeignKey(
         "warehouse.WarehouseProduct",on_delete=models.SET_NULL
@@ -49,7 +52,11 @@ class DocumentProduct(
 
 
 
-class InvoicePayment(models.Model):
+class InvoicePayment(
+    UUIDPrimaryKey,
+    DateTimeMixin,
+    CompanyBranchAbstractModel
+):
 
     is_paid = models.BooleanField(verbose_name="Оплачен?")
     

@@ -14,8 +14,8 @@ class UUIDPrimaryKeyMixin(models.Model):
 
 class DateTimeMixin(models.Model):
     
-    created_date = models.DateTimeField(auto_now_add=True, verbose_name="Дата открытия") 
-    updated_date = models.DateTimeField(auto_now=True, verbose_name="Дата обновления")
+    created_at = models.DateTimeField(auto_now_add=True, verbose_name="Дата открытия") 
+    updated_at = models.DateTimeField(auto_now=True, verbose_name="Дата обновления")
 
     class Meta:
         abstract = True

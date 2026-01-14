@@ -5,7 +5,8 @@ from apps.documents.models.mixins import (
 )
 
 from apps.documents.models.abstract import (
-    DocumentAbstractModel
+    DocumentAbstractModel,
+    CompanyBranchAbstractModel
 )
 
 from django.db import models
@@ -14,6 +15,7 @@ from django.db import models
 class DocumentReceipt(
     UUIDPrimaryKeyMixin,
     DocumentAbstractModel,
+    CompanyBranchAbstractModel
 ):
     
     

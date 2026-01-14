@@ -3,32 +3,46 @@ from django.urls import path
 
 
 
-
-# documents/ - list
-# documents/<uuid> - read|delete 
-# 
-# 
-# capitalization/
-# capitalization/<uuid>
-# ....
-# {update/create}
 #
-# documents/<uuid>/products/ 
-# documents/products-detail/<uuid>
+# documents/ - list
 # 
-# documents/<uuid>/invoices/
-# documents/invoice-detail/<uuid>
-
+#  create|update|delete
+#-------------------------------- 
+# <uuid>/capitalization/
+#  
+# <uuid>/sale/
+#
+# <uuid>/procurement/
+#
+# <uuid>/return_sale/
+#
+# <uuid>/return_procurement/
+#
+# <uuid>/write_off/
+#
+# <uuid>/expense/
+#
+# <uuid>/repeit/
+#
+# <uuid>/displacement/
+#
+# <uuid>/inventory/
+#----------------------------------
+#
+# documents/<uuid>/products/ <- list|create 
+# documents/products-detail/<uuid> <- retrieve|update|delete
+# 
+# documents/<uuid>/invoices/ <- list|delete
+# documents/invoice-detail/<uuid> <- retrieve|update|delete
+#
 
 urlpatterns = [
-# Основная работа с документами 
+# Базовая работа с документами 
+  
     # (фильтры и поиск документов) 
     #path("" , , name="document"),
     
-    # (все что есть внутри конкретного документы? )
-    #path("<uuid:pk>/" , , name="documents-detail"),
-
-
+# Работа с разными типами
 
 
 
