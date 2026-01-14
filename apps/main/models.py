@@ -1519,17 +1519,44 @@ class SaleItem(models.Model):
     name_snapshot = models.CharField(max_length=255)
     barcode_snapshot = models.CharField(max_length=64, null=True, blank=True)
     unit_price = models.DecimalField(max_digits=12, decimal_places=2)
-    quantity = models.PositiveIntegerField()
+    quantity = models.DecimalField(max_digits=12, decimal_places=3, default=Decimal("1.000"))
+
 
     def clean(self):
         if self.sale_id and self.company_id and self.sale.company_id != self.company_id:
             raise ValidationError({"company": "Компания позиции должна совпадать с компанией продажи."})
+
         if self.sale_id and self.branch_id is not None and self.sale.branch_id not in (None, self.branch_id):
             raise ValidationError({"branch": "Филиал позиции должен совпадать с филиалом продажи."})
+
         if self.product_id and self.company_id and self.product.company_id != self.company_id:
             raise ValidationError({"product": "Товар принадлежит другой компании."})
-        if self.quantity < 1:
-            raise ValidationError({"quantity": "Количество должно быть положительным."})
+
+        # ✅ запрет 0 и минуса (для Decimal)
+        if self.quantity is None or Decimal(str(self.quantity)) <= 0:
+            raise ValidationError({"quantity": "Количество должно быть > 0."})
+
+        # полезно: не давать пустое имя для кастомных позиций
+        if not self.product_id and not (self.name_snapshot or "").strip():
+            raise ValidationError({"name_snapshot": "Укажите название позиции (если товар не выбран)."})
+
+
+    def save(self, *args, **kwargs):
+        if self.sale_id:
+            self.company_id = self.sale.company_id
+            self.branch_id = self.sale.branch_id
+
+        # заполнение снапшотов при создании
+        if self.pk is None:
+            if (not self.name_snapshot) and self.product:
+                self.name_snapshot = self.product.name
+            if (not self.unit_price) and self.product:
+                self.unit_price = self.product.price
+            if (not self.barcode_snapshot) and self.product:
+                self.barcode_snapshot = self.product.barcode
+
+        self.full_clean()
+        return super().save(*args, **kwargs)
 
     def save(self, *args, **kwargs):
         if self.sale_id:

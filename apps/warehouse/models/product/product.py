@@ -201,7 +201,7 @@ class WarehouseProduct(BaseModelId,BaseModelDate,BaseModelCompanyBranch):
             return
 
         max_plu = (
-            Product.objects
+            WarehouseProduct.objects
             .filter(company_id=self.company_id, plu__isnull=False)
             .aggregate(m=Max("plu"))
             .get("m") or 0
