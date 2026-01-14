@@ -1479,6 +1479,11 @@ class ContractorWorkSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSeri
             raise serializers.ValidationError(errors)
         return attrs
 
+def normalize_phone(v: str) -> str:
+    v = (v or "").strip()
+    # минимум: убрать пробелы
+    v = v.replace(" ", "")
+    return v
 
 
 # ===========================
@@ -1487,8 +1492,9 @@ class ContractorWorkSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSeri
 class DebtSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
     company = serializers.ReadOnlyField(source="company.id")
     branch = serializers.ReadOnlyField(source="branch.id")
-    paid_total = serializers.DecimalField(max_digits=12, decimal_places=2, read_only=True)
-    balance = serializers.DecimalField(max_digits=12, decimal_places=2, read_only=True)
+
+    paid_total = serializers.SerializerMethodField()
+    balance = serializers.SerializerMethodField()
 
     class Meta:
         model = Debt
@@ -1500,26 +1506,59 @@ class DebtSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
         ]
         read_only_fields = ["id", "company", "branch", "paid_total", "balance", "created_at", "updated_at"]
 
-    # def validate_phone(self, value):
-    #     value = value.strip()
-    #     company = self._user_company()
-    #     qs = Debt.objects.filter(company=company, phone=value)
-    #     if self.instance:
-    #         qs = qs.exclude(pk=self.instance.pk)
-    #     if qs.exists():
-    #         raise serializers.ValidationError("В вашей компании уже есть долг с таким телефоном.")
-    #     return value
+    def get_paid_total(self, obj) -> Decimal:
+        # берём из queryset-аннотации если она есть
+        v = getattr(obj, "paid_total_db", None)
+        if v is None:
+            v = obj.paid_total  # fallback (но это будет отдельный запрос)
+        return Decimal(v).quantize(Decimal("0.01"))
+
+    def get_balance(self, obj) -> Decimal:
+        v = getattr(obj, "balance_db", None)
+        if v is None:
+            v = obj.balance
+        return Decimal(v).quantize(Decimal("0.01"))
+
+    def validate_phone(self, value: str) -> str:
+        value = normalize_phone(value)
+
+        # важно: company у тебя read-only, значит берём компанию из миксина/контекста
+        company = self._user_company()  # предполагаю, что CompanyBranchReadOnlyMixin это даёт
+        qs = Debt.objects.filter(company=company, phone=value)
+        if self.instance:
+            qs = qs.exclude(pk=self.instance.pk)
+
+        if qs.exists():
+            raise serializers.ValidationError("В вашей компании уже есть долг с таким телефоном.")
+
+        return value
 
 
 class DebtPaymentSerializer(serializers.ModelSerializer):
     company = serializers.ReadOnlyField(source="company.id")
+    branch = serializers.ReadOnlyField(source="branch.id")
     debt = serializers.ReadOnlyField(source="debt.id")
 
     class Meta:
         model = DebtPayment
-        fields = ["id", "company", "debt", "amount", "paid_at", "note", "created_at"]
-        read_only_fields = ["id", "company", "debt", "created_at"]
+        fields = ["id", "company", "branch", "debt", "amount", "paid_at", "note", "created_at"]
+        read_only_fields = ["id", "company", "branch", "debt", "created_at"]
 
+    def create(self, validated_data):
+        """
+        Правильнее создавать оплату через debt.add_payment(), чтобы:
+        - сработала блокировка/транзакция (если ты её сделал в модели)
+        - вся бизнес-логика была в одном месте
+        """
+        debt = self.context.get("debt")
+        if debt is None:
+            raise serializers.ValidationError({"debt": "Debt обязателен (передай его в serializer context)."})
+
+        amount = validated_data["amount"]
+        paid_at = validated_data.get("paid_at")
+        note = validated_data.get("note", "")
+
+        return debt.add_payment(amount=amount, paid_at=paid_at, note=note)
 
 # ===========================
 # ObjectItem / ObjectSale / ObjectSaleItem
