@@ -4,73 +4,30 @@ from django.urls import path
 
 
 
-# documents/
-# documents/<uuid>/
+# documents/ - list
+# documents/<uuid> - read|delete 
+# 
+# 
+# capitalization/
+# capitalization/<uuid>
+# ....
+# {update/create}
 #
-# documents/<uuid>/sale
-# documents/<uuid>/sale/products/
-# documents/<uuid>/sale/products/<uuid> 
-# documents/<uuid>:/sale/invoices/
-# documents/<uuid>/sale/invoices/<uuid>
+# documents/<uuid>/products/ 
+# documents/products-detail/<uuid>
 # 
-#  
-# 
-# 
-# 
-# 
-# 
-
+# documents/<uuid>/invoices/
+# documents/invoice-detail/<uuid>
 
 
 urlpatterns = [
 # Основная работа с документами 
-    # (какие вообше есть документы? фильтры получение и т.д ) 
-    path("" , , name="document"),
-    # (все что есть внутри конкретного документы? также это обновление )
-    path("<uuid:pk>/" , , name="documents-detail"),
-
-# Работа с разными типами документа
-
-    # Оприходование
+    # (фильтры и поиск документов) 
+    #path("" , , name="document"),
     
+    # (все что есть внутри конкретного документы? )
+    #path("<uuid:pk>/" , , name="documents-detail"),
 
-    # Перемещение 
-
-
-    # Инвентаризация
-
-
-
-    # Закупка
-
-
-
-    # Возврат закупки
-
-
-
-    # Продажа
-
-
-    
-    # Возврат продажи
-
-
-
-
-    # Cписание
-
-
-   
-
-
-    # Расход
-
-
-
-
-
-    # Приход
 
 
 
