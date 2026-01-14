@@ -28,12 +28,12 @@ def _get_characteristics_model():
     """
     В проекте встречаются разные имена:
     - WarehouseProductCharacteristics
-    - WarehouseProductCharasteristics (ошибка в слове)
+    - WarehouseProductCharacteristicsSerializer (ошибка в слове)
     Тут подстраховываемся.
     """
     for label in (
         "warehouse.WarehouseProductCharacteristics",
-        "warehouse.WarehouseProductCharasteristics",
+        "warehouse.WarehouseProductCharacteristicsSerializer",
     ):
         try:
             return apps.get_model(label)
@@ -76,126 +76,64 @@ class WarehouseProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSe
             "images",
             "packages",
         ]
-        read_only_fields = ["id"]
-
-    def validate(self, attrs):
-        # нормализуем строки, чтобы не ловить "дубли" из-за пробелов
-        if "barcode" in attrs:
-            attrs["barcode"] = _norm_str(attrs.get("barcode"))
-        if "code" in attrs:
-            attrs["code"] = _norm_str(attrs.get("code"))
-        if "article" in attrs:
-            attrs["article"] = (attrs.get("article") or "").strip()
-
-        # quantity в Decimal (на всякий)
-        if "quantity" in attrs:
-            attrs["quantity"] = _to_decimal(attrs.get("quantity"), default="0")
-
-        return attrs
-
-    def _upsert_characteristics(self, product, characteristics_data):
-        if not characteristics_data:
-            return
-
-        CharModel = _get_characteristics_model()
-        if not CharModel:
-            # если модели характеристик нет/не найдена — молча пропускаем
-            return
-
-        # предполагаем OneToOne/ForeignKey на product (часто поле product)
-        # если у тебя поле называется иначе — поменяй здесь.
-        obj = CharModel.objects.filter(product=product).first()
-        if obj:
-            for k, v in characteristics_data.items():
-                setattr(obj, k, v)
-            obj.save()
-        else:
-            CharModel.objects.create(product=product, **characteristics_data)
+        read_only_fields = ["id", "company", "branch"]
 
     def create(self, validated_data):
-        """
-        UP SERT логика:
-        - если barcode задан и уже есть товар в этом складе (company+warehouse+barcode),
-          вместо create -> увеличиваем quantity и обновляем поля.
-        - если barcode пустой -> создаём новую запись.
-        """
         characteristics_data = validated_data.pop("characteristics", None)
 
-        barcode = validated_data.get("barcode")
+        barcode = (validated_data.get("barcode") or "").strip()
         company = validated_data.get("company")
         warehouse = validated_data.get("warehouse")
 
-        qty_in = _to_decimal(validated_data.get("quantity"), default="0")
-
-        # barcode пустой -> обычный create
-        if not barcode:
-            product = WarehouseProduct.objects.create(**validated_data)
-            self._upsert_characteristics(product, characteristics_data)
-            return product
-
-        # barcode есть -> upsert в рамках company+warehouse+barcode
         with transaction.atomic():
-            existing = (
-                WarehouseProduct.objects
-                .select_for_update()
-                .filter(company=company, warehouse=warehouse, barcode=barcode)
-                .first()
-            )
-
-            if existing:
-                # 1) увеличиваем остаток (можешь заменить на "перезаписать", если надо)
-                existing.quantity = _to_decimal(existing.quantity, "0") + qty_in
-
-                # 2) опционально обновляем поля (чтобы скан всегда актуализировал данные)
-                # если НЕ надо — просто убери этот блок
-                for f in (
-                    "name",
-                    "article",
-                    "description",
-                    "unit",
-                    "is_weight",
-                    "purchase_price",
-                    "markup_percent",
-                    "price",
-                    "discount_percent",
-                    "plu",
-                    "country",
-                    "status",
-                    "stock",
-                    "expiration_date",
-                    "brand",
-                    "category",
-                    "code",
-                ):
-                    if f in validated_data:
-                        setattr(existing, f, validated_data[f])
-
-                existing.save()
-                self._upsert_characteristics(existing, characteristics_data)
-                return existing
-
-            # если не нашли -> создаём
-            try:
-                product = WarehouseProduct.objects.create(**validated_data)
-            except IntegrityError:
-                # защита от гонки: пока создавали, кто-то успел создать
-                product = (
+            # Если barcode есть — делаем мягкий upsert в рамках company+warehouse+barcode
+            if barcode and company and warehouse:
+                existing = (
                     WarehouseProduct.objects
+                    .filter(company=company, warehouse=warehouse, barcode=barcode)
                     .select_for_update()
-                    .get(company=company, warehouse=warehouse, barcode=barcode)
+                    .first()
                 )
-                product.quantity = _to_decimal(product.quantity, "0") + qty_in
-                product.save()
+                if existing:
+                    # Обновляем нужные поля (ты сам реши список)
+                    for k, v in validated_data.items():
+                        setattr(existing, k, v)
+                    existing.save()
 
-            self._upsert_characteristics(product, characteristics_data)
+                    if characteristics_data:
+                        WarehouseProductCharacteristicsSerializer.objects.update_or_create(
+                            product=existing,
+                            defaults=characteristics_data,
+                        )
+                    return existing
+
+            # Иначе обычное создание
+            product = WarehouseProduct.objects.create(**validated_data)
+
+            if characteristics_data:
+                WarehouseProductCharacteristicsSerializer.objects.create(
+                    product=product,
+                    **characteristics_data
+                )
+
             return product
 
     def update(self, instance, validated_data):
         characteristics_data = validated_data.pop("characteristics", None)
 
+        # запрещаем менять склад/компанию/филиал через update
+        validated_data.pop("warehouse", None)
+        validated_data.pop("company", None)
+        validated_data.pop("branch", None)
+
         for attr, value in validated_data.items():
             setattr(instance, attr, value)
-
         instance.save()
-        self._upsert_characteristics(instance, characteristics_data)
+
+        if characteristics_data:
+            WarehouseProductCharacteristicsSerializer.objects.update_or_create(
+                product=instance,
+                defaults=characteristics_data,
+            )
+
         return instance
