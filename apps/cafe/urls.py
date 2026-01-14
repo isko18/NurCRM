@@ -98,9 +98,9 @@ urlpatterns = [
     # Мониторинг задач для владельца/админа
     path("kitchen/tasks/monitor/", KitchenTaskMonitorView.as_view(), name="kitchen-task-monitor"),
 
-    # === Analytics ===
-    path("kitchen/analytics/cooks/", KitchenAnalyticsByCookView.as_view(), name="kitchen-analytics-cooks"),
-    path("kitchen/analytics/waiters/", KitchenAnalyticsByWaiterView.as_view(), name="kitchen-analytics-waiters"),
+    # # === Analytics ===
+    # path("kitchen/analytics/cooks/", KitchenAnalyticsByCookView.as_view(), name="kitchen-analytics-cooks"),
+    # path("kitchen/analytics/waiters/", KitchenAnalyticsByWaiterView.as_view(), name="kitchen-analytics-waiters"),
 
     # === Notifications (официант) ===
     path("notifications/", NotificationListView.as_view(), name="notifications-list"),
