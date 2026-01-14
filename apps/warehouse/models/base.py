@@ -2,12 +2,6 @@ import uuid
 
 from django.db import models 
 
-def product_image_upload_to(instance, filename: str) -> str:
-    # всегда сохраняем в .webp с новым именем
-    return f"products/{instance.product_id}/{uuid.uuid4().hex}.webp"
-
-
-
 
 class BaseModelId(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
@@ -37,6 +31,15 @@ class BaseModelCompanyBranch(models.Model):
         on_delete=models.CASCADE, 
         null=True, blank=True, db_index=True, verbose_name='Филиал'    # фильтр по имени (частичное совпадение, ignore case)
     )
-     
+
+
     class Meta:
         abstract = True
+
+
+
+
+def product_image_upload_to(instance, filename: str) -> str:
+    # всегда сохраняем в .webp с новым именем
+    return f"products/{instance.product_id}/{uuid.uuid4().hex}.webp"
+
