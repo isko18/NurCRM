@@ -1635,7 +1635,9 @@ class SaleAddCustomItemAPIView(APIView):
             return Response({"name": "Название не может быть пустым."}, status=400)
 
         price = _q2(ser.validated_data["price"])
-        qty = ser.validated_data.get("quantity", 1)
+        qty = _to_decimal(ser.validated_data.get("quantity", "1.000"), default=Decimal("1.000"))
+        qty = qty3(qty)
+
 
         item = CartItem.objects.filter(
             cart=cart,
