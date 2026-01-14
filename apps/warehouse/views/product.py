@@ -15,8 +15,6 @@ from apps.warehouse.models import (
 from apps.warehouse.serializers.product.product import WarehouseProductSerializer
 from apps.warehouse.serializers.product.image import WarehouseProductImageSerializer
 from apps.warehouse.serializers.product.package import WarehouseProductPackageSerializer
-
-
 from apps.warehouse.filters import ProductFilter
 
 
@@ -39,8 +37,6 @@ class ProductView(CompanyBranchRestrictedMixin, generics.ListCreateAPIView):
 
     def perform_create(self, serializer):
         wh = self._get_warehouse()
-
-        # company/branch берём строго со склада (чтобы не было NULL и подмен)
         serializer.save(
             warehouse=wh,
             company=wh.company,
@@ -54,63 +50,64 @@ class ProductDetailView(CompanyBranchRestrictedMixin, generics.RetrieveUpdateDes
     lookup_url_kwarg = "product_uuid"
 
     def get_queryset(self):
-        qs = (
+        return (
             WarehouseProduct.objects
-            .select_related("brand", "category", "warehouse", "company", "branch")
-            .select_related("characteristics")
+            .select_related("brand", "category", "warehouse", "company", "branch", "characteristics")
             .prefetch_related("images", "packages")
         )
 
-        # Если у тебя URL для detail тоже под складом — можно дополнительно зажать по warehouse_uuid:
-        warehouse_uuid = self.kwargs.get("warehouse_uuid")
-        if warehouse_uuid:
-            qs = qs.filter(warehouse_id=warehouse_uuid)
-
-        return qs
-
     def perform_update(self, serializer):
-        """
-        Запрещаем менять склад через PUT/PATCH.
-        Если detail-роут не содержит warehouse_uuid, просто не даём менять warehouse вообще.
-        """
-        if "warehouse" in serializer.validated_data:
-            serializer.validated_data.pop("warehouse", None)
+        # не даём менять склад/компанию/филиал через update
+        serializer.validated_data.pop("warehouse", None)
+        serializer.validated_data.pop("company", None)
+        serializer.validated_data.pop("branch", None)
         serializer.save()
 
 
 class ProductImagesView(CompanyBranchRestrictedMixin, generics.ListCreateAPIView):
     serializer_class = WarehouseProductImageSerializer
 
+    def _get_product(self):
+        return get_object_or_404(WarehouseProduct, id=self.kwargs.get("product_uuid"))
+
     def get_queryset(self):
-        product_uuid = self.kwargs.get("product_uuid")
-        return WarehouseProductImage.objects.filter(product_id=product_uuid)
+        product = self._get_product()
+        return WarehouseProductImage.objects.filter(product=product)
 
     def perform_create(self, serializer):
-        product_uuid = self.kwargs.get("product_uuid")
-        serializer.save(product_id=product_uuid)
+        product = self._get_product()
+        serializer.save(product=product)
 
 
 class ProductImageDetailView(CompanyBranchRestrictedMixin, generics.RetrieveUpdateDestroyAPIView):
     serializer_class = WarehouseProductImageSerializer
     lookup_field = "id"
     lookup_url_kwarg = "image_uuid"
-    queryset = WarehouseProductImage.objects.all()
+
+    def get_queryset(self):
+        # важно: ограничиваем только изображениями нужного продукта
+        return WarehouseProductImage.objects.filter(product_id=self.kwargs.get("product_uuid"))
 
 
 class ProductPackagesView(CompanyBranchRestrictedMixin, generics.ListCreateAPIView):
     serializer_class = WarehouseProductPackageSerializer
 
+    def _get_product(self):
+        return get_object_or_404(WarehouseProduct, id=self.kwargs.get("product_uuid"))
+
     def get_queryset(self):
-        product_uuid = self.kwargs.get("product_uuid")
-        return WarehouseProductPackage.objects.filter(product_id=product_uuid)
+        product = self._get_product()
+        return WarehouseProductPackage.objects.filter(product=product)
 
     def perform_create(self, serializer):
-        product_uuid = self.kwargs.get("product_uuid")
-        serializer.save(product_id=product_uuid)
+        product = self._get_product()
+        serializer.save(product=product)
 
 
 class ProductPackageDetailView(CompanyBranchRestrictedMixin, generics.RetrieveUpdateDestroyAPIView):
     serializer_class = WarehouseProductPackageSerializer
     lookup_field = "id"
     lookup_url_kwarg = "package_uuid"
-    queryset = WarehouseProductPackage.objects.all()
+
+    def get_queryset(self):
+        return WarehouseProductPackage.objects.filter(product_id=self.kwargs.get("product_uuid"))
