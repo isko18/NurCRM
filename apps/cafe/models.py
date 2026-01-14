@@ -1,4 +1,4 @@
-from django.db import models
+from django.db import models, transaction
 from django.conf import settings
 from django.core.exceptions import ValidationError
 from django.db.models import Q
@@ -17,6 +17,61 @@ from apps.users.models import Company, Branch
 # ==========================
 # Задача кухни + уведомления
 # ==========================
+class Kitchen(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+
+    company = models.ForeignKey(
+        Company, on_delete=models.CASCADE,
+        related_name="kitchens", verbose_name="Компания",
+    )
+    branch = models.ForeignKey(
+        Branch, on_delete=models.CASCADE,
+        related_name="kitchens", verbose_name="Филиал",
+        null=True, blank=True, db_index=True
+    )
+
+    title = models.CharField("Кухня", max_length=255)
+    number = models.PositiveIntegerField("Номер", validators=[MinValueValidator(1)], db_index=True)
+
+    class Meta:
+        verbose_name = "Кухня"
+        verbose_name_plural = "Кухни"
+        constraints = [
+            models.UniqueConstraint(
+                fields=("branch", "number"),
+                name="uniq_kitchen_number_per_branch",
+                condition=Q(branch__isnull=False),
+            ),
+            models.UniqueConstraint(
+                fields=("company", "number"),
+                name="uniq_kitchen_number_global_per_company",
+                condition=Q(branch__isnull=True),
+            ),
+            models.UniqueConstraint(
+                fields=("branch", "title"),
+                name="uniq_kitchen_title_per_branch",
+                condition=Q(branch__isnull=False),
+            ),
+            models.UniqueConstraint(
+                fields=("company", "title"),
+                name="uniq_kitchen_title_global_per_company",
+                condition=Q(branch__isnull=True),
+            ),
+        ]
+        indexes = [
+            models.Index(fields=["company", "number"]),
+            models.Index(fields=["company", "branch", "number"]),
+            models.Index(fields=["company", "title"]),
+        ]
+        ordering = ["number", "title"]
+
+    def clean(self):
+        if self.branch_id and self.branch.company_id != self.company_id:
+            raise ValidationError({"branch": "Филиал принадлежит другой компании."})
+
+    def __str__(self):
+        return f"{self.number}. {self.title}"
+
 class KitchenTask(models.Model):
     class Status(models.TextChoices):
         PENDING = 'pending', 'В ожидании'
@@ -399,7 +454,8 @@ class Purchase(models.Model):
     supplier = models.CharField(max_length=255, verbose_name="Поставщик")
     positions = models.CharField(max_length=255, verbose_name="Позиций")
     price = models.DecimalField(max_digits=10, decimal_places=2, verbose_name='Цена')
-
+    created_at = models.DateTimeField('Создано', auto_now_add=True)
+    updated_at = models.DateTimeField('Обновлено', auto_now=True)
     class Meta:
         verbose_name = 'Закупка'
         verbose_name_plural = 'Закупки'
@@ -464,6 +520,13 @@ class MenuItem(models.Model):
         Branch, on_delete=models.CASCADE, related_name='menu_items',
         verbose_name='Филиал', null=True, blank=True, db_index=True
     )
+    kitchen = models.ForeignKey(
+        "Kitchen",
+        on_delete=models.PROTECT,
+        related_name="menu_items",
+        verbose_name="Кухня",
+        null=True, blank=True,
+    )
     title = models.CharField("Название", max_length=255)
     category = models.ForeignKey(
         "Category", on_delete=models.CASCADE,
@@ -497,6 +560,7 @@ class MenuItem(models.Model):
             models.Index(fields=['company', 'branch', 'title']),
             models.Index(fields=['category']),
             models.Index(fields=['company', 'is_active']),
+            models.Index(fields=["kitchen"]),
         ]
 
     def clean(self):
@@ -507,12 +571,40 @@ class MenuItem(models.Model):
         if self.category and (self.category.branch_id or None) != (self.branch_id or None):
             raise ValidationError({'category': 'Категория другого филиала.'})
 
+        # НОВОЕ: проверка кухни
+        if self.kitchen:
+            if self.kitchen.company_id != self.company_id:
+                raise ValidationError({"kitchen": "Кухня принадлежит другой компании."})
+            if (self.kitchen.branch_id or None) != (self.branch_id or None):
+                raise ValidationError({"kitchen": "Кухня другого филиала."})
+
     def __str__(self):
         return f"{self.title} ({self.category})"
 
     def save(self, *args, **kwargs):
-        """Автоконвертация изображения в WebP с учётом EXIF-ориентации."""
-        if self.image and hasattr(self.image, 'file'):
+        """
+        Автоконвертация изображения в WebP с учётом EXIF-ориентации.
+        Конвертируем только если:
+        - есть image
+        - или объект новый
+        - или файл изображения изменился
+        """
+        should_convert = False
+
+        if self.image and hasattr(self.image, "file"):
+            if not self.pk:
+                should_convert = True
+            else:
+                try:
+                    old = MenuItem.objects.only("image").get(pk=self.pk)
+                    old_name = getattr(old.image, "name", "") or ""
+                    new_name = getattr(self.image, "name", "") or ""
+                    # если имя/путь изменились — считаем, что файл новый
+                    should_convert = old_name != new_name
+                except MenuItem.DoesNotExist:
+                    should_convert = True
+
+        if should_convert:
             img = Image.open(self.image)
             img = ImageOps.exif_transpose(img).convert("RGB")
             buffer = io.BytesIO()
@@ -520,8 +612,8 @@ class MenuItem(models.Model):
             buffer.seek(0)
             filename = f"{uuid.uuid4().hex}.webp"
             self.image.save(filename, ContentFile(buffer.read()), save=False)
-        super().save(*args, **kwargs)
 
+        super().save(*args, **kwargs)
 
 class Ingredient(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
@@ -720,54 +812,60 @@ class OrderItemHistory(models.Model):
 # ==========================
 @receiver(pre_delete, sender=Order)
 def archive_order_before_delete(sender, instance: Order, **kwargs):
-    waiter_label = ''
-    if instance.waiter_id:
-        full = getattr(instance.waiter, 'get_full_name', lambda: '')() or ''
-        email = getattr(instance.waiter, 'email', '') or ''
-        waiter_label = full or email or str(instance.waiter_id)
+    with transaction.atomic():
+        waiter_label = ""
+        if instance.waiter_id:
+            full = getattr(instance.waiter, "get_full_name", lambda: "")() or ""
+            email = getattr(instance.waiter, "email", "") or ""
+            waiter_label = full or email or str(instance.waiter_id)
 
-    oh = OrderHistory.objects.create(
-        company=instance.company,
-        branch=instance.branch,
-        client=instance.client,
-        original_order_id=instance.id,
-        table=instance.table,
-        table_number=(instance.table.number if instance.table_id else None),
-        waiter=instance.waiter,
-        waiter_label=waiter_label,
-        guests=instance.guests,
-        created_at=instance.created_at,
-        archived_at=timezone.now(),
-    )
+        oh = OrderHistory.objects.create(
+            company=instance.company,
+            branch=instance.branch,
+            client=instance.client,
+            original_order_id=instance.id,
+            table=instance.table,
+            table_number=(instance.table.number if instance.table_id else None),
+            waiter=instance.waiter,
+            waiter_label=waiter_label,
+            guests=instance.guests,
+            created_at=instance.created_at,
+            archived_at=timezone.now(),
+        )
 
-    items = []
-    for it in instance.items.select_related('menu_item'):
-        items.append(OrderItemHistory(
-            order_history=oh,
-            menu_item=it.menu_item,
-            menu_item_title=it.menu_item.title,
-            menu_item_price=it.menu_item.price,
-            quantity=it.quantity,
-        ))
-    if items:
-        OrderItemHistory.objects.bulk_create(items)
+        items = [
+            OrderItemHistory(
+                order_history=oh,
+                menu_item=it.menu_item,
+                menu_item_title=it.menu_item.title,
+                menu_item_price=it.menu_item.price,
+                quantity=it.quantity,
+            )
+            for it in instance.items.select_related("menu_item")
+        ]
+        if items:
+            OrderItemHistory.objects.bulk_create(items)
+
 
 
 @receiver(post_save, sender=OrderItem)
-def ensure_kitchen_tasks_for_order_item(sender, instance: 'OrderItem', created, **kwargs):
+def ensure_kitchen_tasks_for_order_item(sender, instance: "OrderItem", created, **kwargs):
     """
-    Гарантируем наличие quantity штук KitchenTask на позицию заказа.
-    - При увеличении quantity — досоздаём недостающие.
-    - При уменьшении quantity — удаляем лишние задачи в статусе PENDING (уже начатые/готовые не трогаем).
+    Гарантируем наличие unit_index=1..quantity для KitchenTask.
+    - Создаём отсутствующие unit_index (не по count).
+    - При уменьшении quantity удаляем лишние только в PENDING.
     """
-    current = KitchenTask.objects.filter(order_item=instance).count()
-    need = instance.quantity or 0
+    need = int(instance.quantity or 0)
+    if need <= 0:
+        return
 
-    # досоздать
-    if need > current:
-        to_create = []
-        for idx in range(current + 1, need + 1):
-            to_create.append(KitchenTask(
+    qs = KitchenTask.objects.filter(order_item=instance).only("id", "unit_index", "status")
+    existing = set(qs.values_list("unit_index", flat=True))
+
+    missing = [idx for idx in range(1, need + 1) if idx not in existing]
+    if missing:
+        to_create = [
+            KitchenTask(
                 company=instance.company,
                 branch=instance.order.branch,
                 order=instance.order,
@@ -775,18 +873,19 @@ def ensure_kitchen_tasks_for_order_item(sender, instance: 'OrderItem', created, 
                 menu_item=instance.menu_item,
                 waiter=instance.order.waiter,
                 unit_index=idx,
-            ))
-        if to_create:
-            # на случай гонок оставим ignore_conflicts: True (работает на PostgreSQL/MySQL)
+            )
+            for idx in missing
+        ]
+        # atomic + ignore_conflicts: переживаем гонки
+        with transaction.atomic():
             KitchenTask.objects.bulk_create(to_create, ignore_conflicts=True)
 
-    # удалить лишние невзятые задачи, если quantity уменьшили
-    elif need < current:
-        KitchenTask.objects.filter(
-            order_item=instance,
-            unit_index__gt=need,
-            status=KitchenTask.Status.PENDING,
-        ).delete()
+    # если quantity уменьшили — удаляем лишние PENDING
+    KitchenTask.objects.filter(
+        order_item=instance,
+        unit_index__gt=need,
+        status=KitchenTask.Status.PENDING,
+    ).delete()
 
 
 class InventorySession(models.Model):

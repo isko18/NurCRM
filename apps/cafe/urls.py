@@ -24,6 +24,15 @@ from .views import (
     NotificationListView, InventorySessionListCreateView, InventorySessionRetrieveView, InventorySessionConfirmView,
     EquipmentListCreateView, EquipmentRetrieveUpdateDestroyView,
     EquipmentInventorySessionListCreateView, EquipmentInventorySessionRetrieveView, EquipmentInventorySessionConfirmView,
+
+    KitchenListCreateView, KitchenRetrieveUpdateDestroyView
+)
+
+from apps.cafe.analytics import (
+    KitchenAnalyticsByCookView, KitchenAnalyticsByWaiterView,
+    SalesSummaryView, SalesByMenuItemView,
+    PurchasesSummaryView, PurchasesBySupplierView,
+    WarehouseLowStockView,
 )
 
 app_name = "cafe"
@@ -107,4 +116,19 @@ urlpatterns = [
     path("equipment/inventory/sessions/", EquipmentInventorySessionListCreateView.as_view(), name="equipment-inventory-session-list"),
     path("equipment/inventory/sessions/<uuid:pk>/", EquipmentInventorySessionRetrieveView.as_view(), name="equipment-inventory-session-detail"),
     path("equipment/inventory/sessions/<uuid:pk>/confirm/", EquipmentInventorySessionConfirmView.as_view(), name="equipment-inventory-session-confirm"),
+
+    path("kitchens/", KitchenListCreateView.as_view(), name="cafe-kitchen-list"),
+    path("kitchens/<uuid:pk>/", KitchenRetrieveUpdateDestroyView.as_view(), name="cafe-kitchen-detail"),
+
+    path("kitchen/analytics/cooks/", KitchenAnalyticsByCookView.as_view()),
+    path("kitchen/analytics/waiters/", KitchenAnalyticsByWaiterView.as_view()),
+
+    path("analytics/sales/summary/", SalesSummaryView.as_view()),
+    path("analytics/sales/items/", SalesByMenuItemView.as_view()),
+
+    path("analytics/purchases/summary/", PurchasesSummaryView.as_view()),
+    path("analytics/purchases/suppliers/", PurchasesBySupplierView.as_view()),
+
+    path("analytics/warehouse/low-stock/", WarehouseLowStockView.as_view()),
+
 ]
