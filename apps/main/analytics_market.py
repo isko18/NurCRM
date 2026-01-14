@@ -3,15 +3,23 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timedelta, time
 from decimal import Decimal
+import hashlib
+import json
 
 from django.apps import apps
 from django.db.models import (
-    Sum, Count, Q, F, Value,
+    Sum,
+    Count,
+    Q,
+    F,
+    Value,
     DecimalField,
     ExpressionWrapper,
 )
 from django.db.models.functions import TruncDate, ExtractHour, ExtractWeekDay, Coalesce
 from django.utils import timezone
+from django.core.cache import cache
+from django.conf import settings
 
 from rest_framework.views import APIView
 from rest_framework.response import Response
@@ -21,28 +29,153 @@ from rest_framework.exceptions import PermissionDenied
 from apps.users.models import Branch
 from apps.construction.models import CashShift
 
+from apps.main.cache_utils import cache_market_analytics_key  # путь поправь под свой проект
+
 
 # ─────────────────────────────────────────────────────────────
-# helpers (company/branch)
+# constants for safe typing
+# ─────────────────────────────────────────────────────────────
+Z_MONEY = Decimal("0.00")
+Z_QTY = Decimal("0.000")
+
+MONEY_FIELD = DecimalField(max_digits=18, decimal_places=2)
+QTY_FIELD = DecimalField(max_digits=18, decimal_places=3)
+
+
+def _money(x) -> Decimal:
+    try:
+        return (x or Z_MONEY).quantize(Decimal("0.01"))
+    except Exception:
+        return Z_MONEY
+
+
+def _safe_div(a: Decimal, b: int | Decimal) -> Decimal:
+    if not b:
+        return Z_MONEY
+    return _money(Decimal(a) / Decimal(b))
+
+
+def _parse_dt(s: str | None) -> datetime | None:
+    if not s:
+        return None
+    try:
+        if len(s) == 10:  # YYYY-MM-DD
+            d = datetime.fromisoformat(s)
+            return datetime.combine(d.date(), time.min)
+        return datetime.fromisoformat(s)
+    except Exception:
+        return None
+
+
+@dataclass
+class Period:
+    start: datetime
+    end: datetime  # exclusive
+
+
+def _get_period(request) -> Period:
+    tz = timezone.get_current_timezone()
+    now = timezone.now().astimezone(tz)
+
+    df = _parse_dt(request.query_params.get("date_from"))
+    dt = _parse_dt(request.query_params.get("date_to"))
+
+    if df and timezone.is_naive(df):
+        df = timezone.make_aware(df, tz)
+    if dt and timezone.is_naive(dt):
+        dt = timezone.make_aware(dt, tz)
+
+    if df and dt:
+        # если date_to пришёл как дата — делаем +1 день (exclusive)
+        if request.query_params.get("date_to") and len(request.query_params.get("date_to")) == 10:
+            dt = dt + timedelta(days=1)
+        return Period(start=df, end=dt)
+
+    first = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    if first.month == 12:
+        nxt = first.replace(year=first.year + 1, month=1)
+    else:
+        nxt = first.replace(month=first.month + 1)
+    return Period(start=first, end=nxt)
+
+
+def _model_has_field(model, field_name: str) -> bool:
+    try:
+        return field_name in {f.name for f in model._meta.get_fields()}
+    except Exception:
+        return False
+
+
+def _choice_value(model, enum_name: str, member: str, fallback: str) -> str:
+    enum = getattr(model, enum_name, None)
+    v = getattr(enum, member, None)
+    return getattr(v, "value", None) or str(v or fallback)
+
+
+# ─────────────────────────────────────────────────────────────
+# Sale models lazy
+# ─────────────────────────────────────────────────────────────
+SALE_MODEL = None
+SALE_ITEM_MODEL = None
+
+
+def _guess_sale_models():
+    Sale = None
+    SaleItem = None
+
+    for label in ("main.Sale", "pos.Sale", "sales.Sale"):
+        try:
+            Sale = apps.get_model(label)
+            break
+        except Exception:
+            pass
+
+    for label in ("main.SaleItem", "pos.SaleItem", "sales.SaleItem"):
+        try:
+            SaleItem = apps.get_model(label)
+            break
+        except Exception:
+            pass
+
+    if Sale is None:
+        for m in apps.get_models():
+            if _model_has_field(m, "total") and _model_has_field(m, "status") and _model_has_field(m, "cashbox"):
+                Sale = m
+                break
+
+    if SaleItem is None and Sale is not None:
+        for m in apps.get_models():
+            if _model_has_field(m, "sale") and _model_has_field(m, "quantity"):
+                SaleItem = m
+                break
+
+    return Sale, SaleItem
+
+
+def get_sale_models():
+    global SALE_MODEL, SALE_ITEM_MODEL
+    if SALE_MODEL is None or SALE_ITEM_MODEL is None:
+        SALE_MODEL, SALE_ITEM_MODEL = _guess_sale_models()
+    return SALE_MODEL, SALE_ITEM_MODEL
+
+
+# ─────────────────────────────────────────────────────────────
+# company/branch helpers (твоя логика)
 # ─────────────────────────────────────────────────────────────
 def _get_company(user):
     if not user or not getattr(user, "is_authenticated", False):
         return None
-
     company = getattr(user, "company", None) or getattr(user, "owned_company", None)
     if company:
         return company
-
     br = getattr(user, "branch", None)
     if br is not None and getattr(br, "company", None):
         return br.company
-
     memberships = getattr(user, "branch_memberships", None)
     if memberships is not None:
         m = memberships.select_related("branch__company").first()
         if m and m.branch and m.branch.company:
             return m.branch.company
-
     return None
 
 
@@ -62,14 +195,12 @@ def _is_owner_like(user) -> bool:
 def _fixed_branch_from_user(user, company):
     if not user or not company:
         return None
-
     company_id = getattr(company, "id", None)
 
     memberships = getattr(user, "branch_memberships", None)
     if memberships is not None:
         primary_m = (
-            memberships
-            .filter(is_primary=True, branch__company_id=company_id)
+            memberships.filter(is_primary=True, branch__company_id=company_id)
             .select_related("branch")
             .first()
         )
@@ -77,8 +208,7 @@ def _fixed_branch_from_user(user, company):
             return primary_m.branch
 
         any_m = (
-            memberships
-            .filter(branch__company_id=company_id)
+            memberships.filter(branch__company_id=company_id)
             .select_related("branch")
             .first()
         )
@@ -113,10 +243,6 @@ def _fixed_branch_from_user(user, company):
 
 
 def _get_active_branch(request):
-    """
-    owner/admin: может выбрать ?branch=UUID, иначе branch=None (вся компания)
-    не owner/admin: фиксированный филиал
-    """
     user = getattr(request, "user", None)
     company = _get_company(user)
     if not company:
@@ -136,36 +262,11 @@ def _get_active_branch(request):
             br = Branch.objects.get(id=branch_id, company_id=company_id)
             setattr(request, "branch", br)
             return br
-        except (Branch.DoesNotExist, ValueError):
+        except Exception:
             pass
 
     setattr(request, "branch", None)
     return None
-
-
-def _money(x) -> Decimal:
-    try:
-        return (x or Decimal("0")).quantize(Decimal("0.01"))
-    except Exception:
-        return Decimal("0.00")
-
-
-def _safe_div(a: Decimal, b: int | Decimal) -> Decimal:
-    if not b:
-        return Decimal("0.00")
-    return _money(Decimal(a) / Decimal(b))
-
-
-def _parse_dt(s: str | None) -> datetime | None:
-    if not s:
-        return None
-    try:
-        if len(s) == 10:  # YYYY-MM-DD
-            d = datetime.fromisoformat(s)
-            return datetime.combine(d.date(), time.min)
-        return datetime.fromisoformat(s)
-    except Exception:
-        return None
 
 
 def _user_label(user_obj=None, *, first_name=None, last_name=None, email=None, phone=None, user_id=None) -> str:
@@ -198,138 +299,15 @@ def _user_label(user_obj=None, *, first_name=None, last_name=None, email=None, p
     return "—"
 
 
-@dataclass
-class Period:
-    start: datetime
-    end: datetime  # exclusive
-
-
-def _get_period(request) -> Period:
-    """
-    date_from/date_to (ISO).
-    Если не дали — текущий месяц.
-    end — EXCLUSIVE.
-    """
-    tz = timezone.get_current_timezone()
-    now = timezone.now().astimezone(tz)
-
-    df = _parse_dt(request.query_params.get("date_from"))
-    dt = _parse_dt(request.query_params.get("date_to"))
-
-    if df and timezone.is_naive(df):
-        df = timezone.make_aware(df, tz)
-    if dt and timezone.is_naive(dt):
-        dt = timezone.make_aware(dt, tz)
-
-    if df and dt:
-        # если date_to пришёл как дата без времени — делаем +1 день (exclusive)
-        if request.query_params.get("date_to") and len(request.query_params.get("date_to")) == 10:
-            dt = dt + timedelta(days=1)
-        return Period(start=df, end=dt)
-
-    first = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-    if first.month == 12:
-        nxt = first.replace(year=first.year + 1, month=1)
-    else:
-        nxt = first.replace(month=first.month + 1)
-    return Period(start=first, end=nxt)
-
-
-def _model_has_field(model, field_name: str) -> bool:
-    try:
-        return field_name in {f.name for f in model._meta.get_fields()}
-    except Exception:
-        return False
-
-
-def _choice_value(model, enum_name: str, member: str, fallback: str) -> str:
-    """
-    TextChoices/Enum → берём .value максимально мягко.
-    """
-    enum = getattr(model, enum_name, None)
-    v = getattr(enum, member, None)
-    return getattr(v, "value", None) or str(v or fallback)
-
-
 # ─────────────────────────────────────────────────────────────
-# Sale models (LAZY)
-# ─────────────────────────────────────────────────────────────
-SALE_MODEL = None
-SALE_ITEM_MODEL = None
-
-
-def _guess_sale_models():
-    Sale = None
-    SaleItem = None
-
-    # быстрые варианты
-    for label in ("main.Sale", "pos.Sale", "sales.Sale"):
-        try:
-            Sale = apps.get_model(label)
-            break
-        except Exception:
-            pass
-
-    for label in ("main.SaleItem", "pos.SaleItem", "sales.SaleItem"):
-        try:
-            SaleItem = apps.get_model(label)
-            break
-        except Exception:
-            pass
-
-    # мягкий fallback (осторожно)
-    if Sale is None:
-        for m in apps.get_models():
-            if _model_has_field(m, "total") and _model_has_field(m, "status") and _model_has_field(m, "cashbox"):
-                Sale = m
-                break
-
-    if SaleItem is None and Sale is not None:
-        for m in apps.get_models():
-            if _model_has_field(m, "sale") and _model_has_field(m, "quantity"):
-                SaleItem = m
-                break
-
-    return Sale, SaleItem
-
-
-def get_sale_models():
-    global SALE_MODEL, SALE_ITEM_MODEL
-    if SALE_MODEL is None or SALE_ITEM_MODEL is None:
-        SALE_MODEL, SALE_ITEM_MODEL = _guess_sale_models()
-    return SALE_MODEL, SALE_ITEM_MODEL
-
-
-# ─────────────────────────────────────────────────────────────
-# Analytics API
+# Analytics API + caching
 # ─────────────────────────────────────────────────────────────
 class AnalyticsView(APIView):
     permission_classes = [permissions.IsAuthenticated]
 
-    def get(self, request):
-        tab = (request.query_params.get("tab") or "sales").lower()
+    def _include_global(self, request) -> bool:
+        return (request.query_params.get("include_global") or "").strip() in ("1", "true", "yes", "on")
 
-        company = _get_company(request.user)
-        if not company:
-            raise PermissionDenied("У пользователя не настроена компания.")
-
-        branch = _get_active_branch(request)
-        period = _get_period(request)
-
-        if tab == "sales":
-            return Response(self._sales(request, company, branch, period))
-        if tab == "stock":
-            return Response(self._stock(request, company, branch, period))
-        if tab == "cashboxes":
-            return Response(self._cashboxes(request, company, branch, period))
-        if tab == "shifts":
-            return Response(self._shifts(request, company, branch, period))
-
-        return Response({"detail": "Unknown tab. Use: sales|stock|cashboxes|shifts"}, status=400)
-
-    # ─────────────────────────────────────────────────────────
-    # universal filters for Sale qs
-    # ─────────────────────────────────────────────────────────
     def _apply_sale_filters(self, request, qs, SaleModel):
         cashbox_id = request.query_params.get("cashbox")
         if cashbox_id and _model_has_field(SaleModel, "cashbox"):
@@ -365,24 +343,55 @@ class AnalyticsView(APIView):
 
         return qs
 
-    def _include_global(self, request) -> bool:
-        """
-        include_global=1 → при выбранном branch включаем записи branch=NULL тоже
-        """
-        return (request.query_params.get("include_global") or "").strip() in ("1", "true", "yes", "on")
+    def _cache_hash_from_query(self, request) -> str:
+        qp = {k: request.query_params.getlist(k) for k in request.query_params.keys()}
+        raw = json.dumps(qp, ensure_ascii=False, sort_keys=True)
+        return hashlib.md5(raw.encode("utf-8")).hexdigest()
+
+    def get(self, request):
+        tab = (request.query_params.get("tab") or "sales").lower()
+
+        company = _get_company(request.user)
+        if not company:
+            raise PermissionDenied("У пользователя не настроена компания.")
+
+        branch = _get_active_branch(request)
+        period = _get_period(request)
+
+        # ===== caching (per tab + query) =====
+        company_id = str(getattr(company, "id", ""))
+        branch_id = str(getattr(branch, "id", "")) if branch else None
+        qhash = self._cache_hash_from_query(request)
+        ck = cache_market_analytics_key(company_id, branch_id, tab, qhash)
+
+        cached = cache.get(ck)
+        if cached is not None:
+            return Response(cached)
+
+        if tab == "sales":
+            data = self._sales(request, company, branch, period)
+        elif tab == "stock":
+            data = self._stock(request, company, branch, period)
+        elif tab == "cashboxes":
+            data = self._cashboxes(request, company, branch, period)
+        elif tab == "shifts":
+            data = self._shifts(request, company, branch, period)
+        else:
+            return Response({"detail": "Unknown tab. Use: sales|stock|cashboxes|shifts"}, status=400)
+
+        ttl = getattr(settings, "CACHE_TIMEOUT_ANALYTICS", getattr(settings, "CACHE_TIMEOUT_MEDIUM", 300))
+        cache.set(ck, data, ttl)
+        return Response(data)
 
     # ─────────────────────────────────────────────────────────
     # SALES
     # ─────────────────────────────────────────────────────────
     def _sales(self, request, company, branch, period: Period):
-        z = Decimal("0.00")
-
-        revenue = z
+        revenue = Z_MONEY
         tx = 0
         clients = 0
         daily = []
         top_products = []
-        documents = []
 
         Sale, SaleItem = get_sale_models()
         if Sale is not None:
@@ -399,14 +408,17 @@ class AnalyticsView(APIView):
 
             dt_field = "paid_at" if _model_has_field(Sale, "paid_at") else "created_at"
             qs = qs.filter(**{f"{dt_field}__gte": period.start, f"{dt_field}__lt": period.end})
-
             qs = self._apply_sale_filters(request, qs, Sale)
 
             agg = qs.aggregate(
-                revenue=Coalesce(Sum("total"), Value(z)),
+                revenue=Coalesce(
+                    Sum("total"),
+                    Value(Z_MONEY, output_field=MONEY_FIELD),
+                    output_field=MONEY_FIELD,
+                ),
                 tx=Count("id"),
             )
-            revenue = agg["revenue"] or z
+            revenue = agg["revenue"] or Z_MONEY
             tx = agg["tx"] or 0
 
             if _model_has_field(Sale, "client"):
@@ -417,24 +429,36 @@ class AnalyticsView(APIView):
             daily_rows = (
                 qs.annotate(d=TruncDate(dt_field))
                 .values("d")
-                .annotate(v=Coalesce(Sum("total"), Value(z)))
+                .annotate(
+                    v=Coalesce(
+                        Sum("total"),
+                        Value(Z_MONEY, output_field=MONEY_FIELD),
+                        output_field=MONEY_FIELD,
+                    )
+                )
                 .order_by("d")
             )
-            daily = [{"date": r["d"].isoformat(), "value": str(_money(r["v"]))} for r in daily_rows]
+            daily = [{"date": r["d"].isoformat(), "value": str(_money(r["v"]))} for r in daily_rows if r["d"]]
 
+            # top products (фикс mixed types)
             if SaleItem is not None and _model_has_field(SaleItem, "sale"):
                 item_qs = SaleItem.objects.filter(sale__in=qs)
 
                 if _model_has_field(SaleItem, "unit_price"):
-                    revenue_expr = ExpressionWrapper(
-                        F("quantity") * F("unit_price"),
-                        output_field=DecimalField(max_digits=18, decimal_places=2),
-                    )
+                    revenue_expr = ExpressionWrapper(F("quantity") * F("unit_price"), output_field=MONEY_FIELD)
                     item_rows = (
                         item_qs.values("product_id", "name_snapshot")
                         .annotate(
-                            sold=Coalesce(Sum("quantity"), Value(0)),
-                            revenue=Coalesce(Sum(revenue_expr), Value(z)),
+                            sold=Coalesce(
+                                Sum("quantity"),
+                                Value(Z_QTY, output_field=QTY_FIELD),
+                                output_field=QTY_FIELD,
+                            ),
+                            revenue=Coalesce(
+                                Sum(revenue_expr),
+                                Value(Z_MONEY, output_field=MONEY_FIELD),
+                                output_field=MONEY_FIELD,
+                            ),
                         )
                         .order_by("-revenue")[:5]
                     )
@@ -442,8 +466,12 @@ class AnalyticsView(APIView):
                     item_rows = (
                         item_qs.values("product_id", "name_snapshot")
                         .annotate(
-                            sold=Coalesce(Sum("quantity"), Value(0)),
-                            revenue=Value(z),
+                            sold=Coalesce(
+                                Sum("quantity"),
+                                Value(Z_QTY, output_field=QTY_FIELD),
+                                output_field=QTY_FIELD,
+                            ),
+                            revenue=Value(Z_MONEY, output_field=MONEY_FIELD),
                         )
                         .order_by("-sold")[:5]
                     )
@@ -451,8 +479,8 @@ class AnalyticsView(APIView):
                 top_products = [
                     {
                         "name": (r.get("name_snapshot") or "Товар"),
-                        "sold": int(r.get("sold") or 0),
-                        "revenue": str(_money(r.get("revenue") or z)),
+                        "sold": str((r.get("sold") or Z_QTY).quantize(Decimal("0.001"))),
+                        "revenue": str(_money(r.get("revenue") or Z_MONEY)),
                     }
                     for r in item_rows
                 ]
@@ -479,13 +507,8 @@ class AnalyticsView(APIView):
                 "avg_check": str(_money(avg_check)),
                 "clients": clients,
             },
-            "charts": {
-                "sales_dynamics": daily,
-            },
-            "tables": {
-                "top_products": top_products,
-                "documents": documents,
-            },
+            "charts": {"sales_dynamics": daily},
+            "tables": {"top_products": top_products, "documents": documents},
         }
 
     # ─────────────────────────────────────────────────────────
@@ -503,11 +526,9 @@ class AnalyticsView(APIView):
         except Exception:
             pass
 
-        z = Decimal("0.00")
-
         total_products = 0
         categories_count = 0
-        inventory_value = z
+        inventory_value = Z_MONEY
         low_count = 0
         turnover_days = None
         category_pie = []
@@ -553,13 +574,20 @@ class AnalyticsView(APIView):
                 mul_field = pp_field or price_field
                 inv_expr = ExpressionWrapper(
                     F(qty_field) * F(mul_field),
-                    output_field=DecimalField(max_digits=18, decimal_places=2),
+                    output_field=MONEY_FIELD,
                 )
                 inventory_value = (
-                    pqs.aggregate(v=Coalesce(Sum(inv_expr), Value(z)))["v"]
-                    or z
+                    pqs.aggregate(
+                        v=Coalesce(
+                            Sum(inv_expr),
+                            Value(Z_MONEY, output_field=MONEY_FIELD),
+                            output_field=MONEY_FIELD,
+                        )
+                    )["v"]
+                    or Z_MONEY
                 )
 
+            # min stock field
             min_field = None
             for f in ("min_quantity", "min_stock", "reorder_level", "minimum_quantity"):
                 if _model_has_field(Product, f):
@@ -573,7 +601,8 @@ class AnalyticsView(APIView):
                     low_qs = pqs.filter(**{f"{qty_field}__lte": 5})
 
                 # low_only=1 → показывать только low
-                if (request.query_params.get("low_only") or "").strip() in ("1", "true", "yes", "on"):
+                low_only = (request.query_params.get("low_only") or "").strip() in ("1", "true", "yes", "on")
+                if low_only:
                     pqs = low_qs
 
                 low_count = low_qs.count()
@@ -582,11 +611,20 @@ class AnalyticsView(APIView):
                 for p in low_rows:
                     q = getattr(p, qty_field, 0) or 0
                     mn = getattr(p, min_field, None) if min_field else 5
-                    status = "critical" if q <= max(1, int(mn) // 2) else "low"
+                    try:
+                        qd = Decimal(q)
+                    except Exception:
+                        qd = Decimal("0")
+                    try:
+                        mnd = Decimal(mn) if mn is not None else Decimal("5")
+                    except Exception:
+                        mnd = Decimal("5")
+
+                    status = "critical" if qd <= max(Decimal("1"), (mnd / 2)) else "low"
                     low_list.append({
                         "name": getattr(p, "name", "Товар"),
-                        "qty": int(q),
-                        "min": int(mn) if mn is not None else None,
+                        "qty": str(qd.quantize(Decimal("0.001"))),
+                        "min": str(mnd.quantize(Decimal("0.001"))) if mn is not None else None,
                         "status": status,
                     })
 
@@ -606,7 +644,7 @@ class AnalyticsView(APIView):
                     for r in rows
                 ]
 
-        # movement: units sold by day
+        # movement: units sold by day (Decimal-safe)
         Sale, SaleItem = get_sale_models()
         if Sale is not None and SaleItem is not None and _model_has_field(SaleItem, "quantity"):
             paid_value = _choice_value(Sale, "Status", "PAID", "paid")
@@ -618,6 +656,7 @@ class AnalyticsView(APIView):
                     sqs = sqs.filter(Q(branch=branch) | Q(branch__isnull=True))
                 else:
                     sqs = sqs.filter(branch=branch)
+
             sqs = sqs.filter(**{f"{dt_field}__gte": period.start, f"{dt_field}__lt": period.end})
             sqs = self._apply_sale_filters(request, sqs, Sale)
 
@@ -626,13 +665,26 @@ class AnalyticsView(APIView):
             rows = (
                 iq.annotate(d=TruncDate(f"sale__{dt_field}"))
                 .values("d")
-                .annotate(units=Coalesce(Sum("quantity"), Value(0)))
+                .annotate(
+                    units=Coalesce(
+                        Sum("quantity"),
+                        Value(Z_QTY, output_field=QTY_FIELD),
+                        output_field=QTY_FIELD,
+                    )
+                )
                 .order_by("d")
             )
-            movement = [{"date": r["d"].isoformat(), "units": int(r["units"] or 0)} for r in rows]
+            movement = [{"date": r["d"].isoformat(), "units": str((r["units"] or Z_QTY).quantize(Decimal("0.001")))} for r in rows if r["d"]]
 
+            # turnover_days (примерно)
             if inventory_value and inventory_value > Decimal("0"):
-                rev = sqs.aggregate(v=Coalesce(Sum("total"), Value(Decimal("0.00"))))["v"] or Decimal("0.00")
+                rev = sqs.aggregate(
+                    v=Coalesce(
+                        Sum("total"),
+                        Value(Z_MONEY, output_field=MONEY_FIELD),
+                        output_field=MONEY_FIELD,
+                    )
+                )["v"] or Z_MONEY
                 days = max(1, (period.end.date() - period.start.date()).days)
                 avg_daily_rev = Decimal(rev) / Decimal(days)
                 if avg_daily_rev > Decimal("0"):
@@ -669,12 +721,10 @@ class AnalyticsView(APIView):
     # CASHBOXES
     # ─────────────────────────────────────────────────────────
     def _cashboxes(self, request, company, branch, period: Period):
-        z = Decimal("0.00")
-
-        revenue = z
+        revenue = Z_MONEY
         tx = 0
-        avg_check = z
-        cash_in_box = z
+        avg_check = Z_MONEY
+        cash_in_box = Z_MONEY
 
         hourly = []
         pay_pie = []
@@ -698,10 +748,14 @@ class AnalyticsView(APIView):
             qs = self._apply_sale_filters(request, qs, Sale)
 
             agg = qs.aggregate(
-                revenue=Coalesce(Sum("total"), Value(z)),
+                revenue=Coalesce(
+                    Sum("total"),
+                    Value(Z_MONEY, output_field=MONEY_FIELD),
+                    output_field=MONEY_FIELD,
+                ),
                 tx=Count("id"),
             )
-            revenue = agg["revenue"] or z
+            revenue = agg["revenue"] or Z_MONEY
             tx = agg["tx"] or 0
             avg_check = _safe_div(_money(revenue), tx)
 
@@ -709,28 +763,56 @@ class AnalyticsView(APIView):
             if pm_field:
                 rows = (
                     qs.values(pm_field)
-                    .annotate(cnt=Count("id"), sm=Coalesce(Sum("total"), Value(z)))
+                    .annotate(
+                        cnt=Count("id"),
+                        sm=Coalesce(
+                            Sum("total"),
+                            Value(Z_MONEY, output_field=MONEY_FIELD),
+                            output_field=MONEY_FIELD,
+                        ),
+                    )
                     .order_by("-sm")
                 )
-                total_sum = sum([r["sm"] or z for r in rows]) or z
+
+                total_sum = Z_MONEY
+                for r in rows:
+                    total_sum += Decimal(r["sm"] or Z_MONEY)
+
                 for r in rows:
                     name = r[pm_field] or "unknown"
                     cnt = int(r["cnt"] or 0)
-                    sm = _money(r["sm"] or z)
+                    sm = _money(r["sm"] or Z_MONEY)
                     share = float((sm / total_sum * 100).quantize(Decimal("0.1"))) if total_sum else 0.0
                     pay_detail.append({"method": name, "transactions": cnt, "sum": str(sm), "share": share})
+
                 pay_pie = [{"name": d["method"], "percent": d["share"]} for d in pay_detail]
 
                 cash_value = _choice_value(Sale, "PaymentMethod", "CASH", "cash")
-                cash_in_box = qs.filter(**{pm_field: cash_value}).aggregate(v=Coalesce(Sum("total"), Value(z)))["v"] or z
+                cash_in_box = qs.filter(**{pm_field: cash_value}).aggregate(
+                    v=Coalesce(
+                        Sum("total"),
+                        Value(Z_MONEY, output_field=MONEY_FIELD),
+                        output_field=MONEY_FIELD,
+                    )
+                )["v"] or Z_MONEY
 
             hour_rows = (
                 qs.annotate(h=ExtractHour(dt_field))
                 .values("h")
-                .annotate(v=Coalesce(Sum("total"), Value(z)), cnt=Count("id"))
+                .annotate(
+                    v=Coalesce(
+                        Sum("total"),
+                        Value(Z_MONEY, output_field=MONEY_FIELD),
+                        output_field=MONEY_FIELD,
+                    ),
+                    cnt=Count("id"),
+                )
                 .order_by("h")
             )
-            hourly = [{"hour": int(r["h"]), "revenue": str(_money(r["v"])), "transactions": int(r["cnt"])} for r in hour_rows]
+            hourly = [
+                {"hour": int(r["h"]) if r["h"] is not None else 0, "revenue": str(_money(r["v"])), "transactions": int(r["cnt"])}
+                for r in hour_rows
+            ]
 
             wd_rows = (
                 qs.annotate(wd=ExtractWeekDay(dt_field))
@@ -738,7 +820,7 @@ class AnalyticsView(APIView):
                 .annotate(cnt=Count("id"))
                 .order_by("wd")
             )
-            tx_week = [{"weekday": int(r["wd"]), "transactions": int(r["cnt"])} for r in wd_rows]
+            tx_week = [{"weekday": int(r["wd"]), "transactions": int(r["cnt"])} for r in wd_rows if r["wd"] is not None]
 
             peak_hours = sorted(hourly, key=lambda x: Decimal(x["revenue"]), reverse=True)[:6]
             for r in peak_hours:
@@ -779,11 +861,6 @@ class AnalyticsView(APIView):
     # SHIFTS
     # ─────────────────────────────────────────────────────────
     def _shifts(self, request, company, branch, period: Period):
-        z = Decimal("0.00")
-
-        Sale, _SaleItem = get_sale_models()
-
-        # ===== filters from query =====
         qp = request.query_params
         cashbox_id = qp.get("cashbox") or None
         cashier_id = qp.get("cashier") or None
@@ -820,8 +897,10 @@ class AnalyticsView(APIView):
             avg_sec = sum(durations) / len(durations)
             avg_duration_hours = round(avg_sec / 3600, 1)
 
+        Sale, _SaleItem = get_sale_models()
+
         # revenue total for period (avg_revenue_per_shift)
-        revenue_total = z
+        revenue_total = Z_MONEY
         if Sale is not None and _model_has_field(Sale, "shift"):
             paid_value = _choice_value(Sale, "Status", "PAID", "paid")
             dt_field = "paid_at" if _model_has_field(Sale, "paid_at") else "created_at"
@@ -844,12 +923,18 @@ class AnalyticsView(APIView):
 
             sqs = sqs.filter(**{f"{dt_field}__gte": period.start, f"{dt_field}__lt": period.end})
 
-            revenue_total = sqs.aggregate(v=Coalesce(Sum("total"), Value(z)))["v"] or z
+            revenue_total = sqs.aggregate(
+                v=Coalesce(
+                    Sum("total"),
+                    Value(Z_MONEY, output_field=MONEY_FIELD),
+                    output_field=MONEY_FIELD,
+                )
+            )["v"] or Z_MONEY
 
         shifts_cnt = period_qs.count() or 1
         avg_revenue_per_shift = _safe_div(_money(revenue_total), shifts_cnt)
 
-        # bucket revenue by shift open time (period)
+        # bucket revenue by shift open time
         def bucket(h: int) -> str:
             if 6 <= h < 12:
                 return "morning"
@@ -858,9 +943,9 @@ class AnalyticsView(APIView):
             return "evening"
 
         bucket_map = {
-            "morning": {"revenue": z, "transactions": 0},
-            "day": {"revenue": z, "transactions": 0},
-            "evening": {"revenue": z, "transactions": 0},
+            "morning": {"revenue": Z_MONEY, "transactions": 0},
+            "day": {"revenue": Z_MONEY, "transactions": 0},
+            "evening": {"revenue": Z_MONEY, "transactions": 0},
         }
 
         if Sale is not None and _model_has_field(Sale, "shift"):
@@ -899,10 +984,9 @@ class AnalyticsView(APIView):
             {"name": "Вечер", "key": "evening", "revenue": str(_money(bucket_map["evening"]["revenue"])), "transactions": bucket_map["evening"]["transactions"]},
         ]
 
-        # ===== active shifts table + SALES (fixed) =====
+        # active shifts table + sales per active shift
         active_rows = []
         act_qs = CashShift.objects.filter(company=company, status=CashShift.Status.OPEN)
-
         if branch is not None:
             act_qs = act_qs.filter(branch=branch)
         if cashbox_id:
@@ -916,7 +1000,6 @@ class AnalyticsView(APIView):
         shift_sales_map = {}
         if act_ids and Sale is not None and _model_has_field(Sale, "shift"):
             paid_value = _choice_value(Sale, "Status", "PAID", "paid")
-
             sale_qs = Sale.objects.filter(company=company, status=paid_value, shift_id__in=act_ids)
 
             if branch is not None and _model_has_field(Sale, "branch"):
@@ -928,13 +1011,19 @@ class AnalyticsView(APIView):
             if cashbox_id and _model_has_field(Sale, "cashbox"):
                 sale_qs = sale_qs.filter(cashbox_id=cashbox_id)
 
-            rows = sale_qs.values("shift_id").annotate(rev=Coalesce(Sum("total"), Value(z)))
-            shift_sales_map = {r["shift_id"]: _money(r["rev"] or z) for r in rows}
+            rows = sale_qs.values("shift_id").annotate(
+                rev=Coalesce(
+                    Sum("total"),
+                    Value(Z_MONEY, output_field=MONEY_FIELD),
+                    output_field=MONEY_FIELD,
+                )
+            )
+            shift_sales_map = {r["shift_id"]: _money(r["rev"] or Z_MONEY) for r in rows}
 
         for sh in act:
             cb_name = getattr(sh.cashbox, "name", None) or f"Касса {sh.cashbox_id}"
             opened = timezone.localtime(sh.opened_at).isoformat() if sh.opened_at else None
-            sales_sum = shift_sales_map.get(sh.id, z)
+            sales_sum = shift_sales_map.get(sh.id, Z_MONEY)
 
             active_rows.append({
                 "cashier": _user_label(sh.cashier),
@@ -944,7 +1033,7 @@ class AnalyticsView(APIView):
                 "status": "open",
             })
 
-        # best cashiers (period)
+        # best cashiers
         best_cashiers = []
         if Sale is not None and _model_has_field(Sale, "shift"):
             paid_value = _choice_value(Sale, "Status", "PAID", "paid")
@@ -977,7 +1066,11 @@ class AnalyticsView(APIView):
                     "shift__cashier__phone_number",
                 )
                 .annotate(
-                    revenue=Coalesce(Sum("total"), Value(z)),
+                    revenue=Coalesce(
+                        Sum("total"),
+                        Value(Z_MONEY, output_field=MONEY_FIELD),
+                        output_field=MONEY_FIELD,
+                    ),
                     tx=Count("id"),
                     shifts=Count("shift_id", distinct=True),
                 )
@@ -985,7 +1078,7 @@ class AnalyticsView(APIView):
             )
 
             for i, r in enumerate(rows, start=1):
-                rev = _money(r["revenue"] or z)
+                rev = _money(r["revenue"] or Z_MONEY)
                 txc = int(r["tx"] or 0)
                 best_cashiers.append({
                     "place": i,
@@ -1021,4 +1114,3 @@ class AnalyticsView(APIView):
             "charts": {"sales_by_shift_bucket": sales_by_shift_bucket},
             "tables": {"active_shifts": active_rows, "best_cashiers": best_cashiers},
         }
-
