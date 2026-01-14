@@ -26,43 +26,26 @@ class ProductView(CompanyBranchRestrictedMixin, generics.ListCreateAPIView):
     filter_backends = [DjangoFilterBackend]
 
     def _get_warehouse(self):
-        warehouse_uuid = self.kwargs.get("warehouse_uuid")
-        if not warehouse_uuid:
-            return None
-        return get_object_or_404(Warehouse, id=warehouse_uuid)
+        return get_object_or_404(Warehouse, id=self.kwargs.get("warehouse_uuid"))
 
     def get_queryset(self):
         wh = self._get_warehouse()
-
-        qs = (
+        return (
             WarehouseProduct.objects
-            .select_related("brand", "category", "warehouse", "company", "branch")
-            # characteristics обычно OneToOne -> select_related, если реально M2M/Reverse FK — тогда верни prefetch
-            .select_related("characteristics")
+            .select_related("brand", "category", "warehouse", "company", "branch", "characteristics")
             .prefetch_related("images", "packages")
+            .filter(warehouse=wh)
         )
 
-        if wh:
-            qs = qs.filter(warehouse=wh)
-
-        # ВАЖНО: CompanyBranchRestrictedMixin обычно сам режет по company/branch.
-        # Если он НЕ режет — надо добавить фильтрацию здесь.
-        return qs
-
     def perform_create(self, serializer):
-        """
-        Критично: warehouse берём только из URL, а не из body.
-        Это полностью убивает подмену склада.
-        """
         wh = self._get_warehouse()
 
-        # Если у тебя миксин проставляет company/branch в request — ок.
-        # Иначе можно сделать так:
-        # company = getattr(self.request.user, "company", None) or getattr(self.request.user, "owned_company", None)
-        # branch = getattr(self.request, "branch", None) or getattr(self.request.user, "branch", None)
-        # serializer.save(company=company, branch=branch, warehouse=wh)
-
-        serializer.save(warehouse=wh)
+        # company/branch берём строго со склада (чтобы не было NULL и подмен)
+        serializer.save(
+            warehouse=wh,
+            company=wh.company,
+            branch=wh.branch,
+        )
 
 
 class ProductDetailView(CompanyBranchRestrictedMixin, generics.RetrieveUpdateDestroyAPIView):
