@@ -9,7 +9,7 @@ from apps.cafe.models import (
     Zone, Table, Booking, Warehouse, Purchase,
     Category, MenuItem, Ingredient,
     Order, OrderItem, CafeClient,
-    OrderHistory, OrderItemHistory, KitchenTask, NotificationCafe, InventorySession, InventoryItem, Equipment, EquipmentInventoryItem, EquipmentInventorySession
+    OrderHistory, OrderItemHistory, KitchenTask, NotificationCafe, InventorySession, InventoryItem, Equipment, EquipmentInventoryItem, EquipmentInventorySession, Kitchen
 )
 from apps.users.models import Branch
 
@@ -160,6 +160,18 @@ class KitchenTaskSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSeriali
         fn = getattr(w, 'get_full_name', lambda: '')() or ''
         return fn or getattr(w, 'email', '') or str(w.pk)
 
+class KitchenSerializer(CompanyBranchReadOnlyMixin):
+    class Meta:
+        model = Kitchen
+        fields = ["id", "company", "branch", "title", "number"]
+        read_only_fields = ["id", "company", "branch"]
+
+    def validate(self, attrs):
+        # Если хочешь запретить пустой title
+        title = (attrs.get("title") or "").strip()
+        if not title:
+            raise serializers.ValidationError({"title": "Название кухни обязательно."})
+        return attrs
 
 # --- НОВОЕ: Notification (если нужно выводить списком) ---
 class NotificationCafeSerializer(serializers.ModelSerializer):
@@ -252,6 +264,15 @@ class IngredientInlineSerializer(serializers.ModelSerializer):
 
 class MenuItemSerializer(CompanyBranchReadOnlyMixin):
     category = serializers.PrimaryKeyRelatedField(queryset=Category.objects.all())
+
+    kitchen = serializers.PrimaryKeyRelatedField(
+        queryset=Kitchen.objects.all(),
+        required=False,
+        allow_null=True
+    )
+    kitchen_title = serializers.CharField(source="kitchen.title", read_only=True)
+    kitchen_number = serializers.IntegerField(source="kitchen.number", read_only=True)
+
     ingredients = IngredientInlineSerializer(many=True, required=False)
     image = serializers.ImageField(required=False, allow_null=True)
     image_url = serializers.SerializerMethodField()
@@ -259,7 +280,10 @@ class MenuItemSerializer(CompanyBranchReadOnlyMixin):
     class Meta:
         model = MenuItem
         fields = [
-            "id", "company", "branch", "title", "category", "price", "is_active",
+            "id", "company", "branch",
+            "title", "category",
+            "kitchen", "kitchen_title", "kitchen_number",
+            "price", "is_active",
             "image", "image_url",
             "created_at", "updated_at", "ingredients",
         ]
@@ -268,6 +292,7 @@ class MenuItemSerializer(CompanyBranchReadOnlyMixin):
     def get_fields(self):
         fields = super().get_fields()
         fields["category"].queryset = _scope_queryset_by_context(Category.objects.all(), self)
+        fields["kitchen"].queryset = _scope_queryset_by_context(Kitchen.objects.all(), self)
         return fields
 
     def get_image_url(self, obj):
@@ -276,6 +301,26 @@ class MenuItemSerializer(CompanyBranchReadOnlyMixin):
             url = obj.image.url
             return request.build_absolute_uri(url) if request else url
         return None
+
+    def validate(self, attrs):
+        company = self._user_company() or getattr(self.instance, "company", None)
+        tb = self._auto_branch()
+
+        category = attrs.get("category") or getattr(self.instance, "category", None)
+        kitchen = attrs.get("kitchen") if "kitchen" in attrs else getattr(self.instance, "kitchen", None)
+
+        if company and category and category.company_id != company.id:
+            raise serializers.ValidationError({"category": "Категория принадлежит другой компании."})
+        if tb is not None and category and category.branch_id not in (None, tb.id):
+            raise serializers.ValidationError({"category": "Категория другого филиала."})
+
+        if kitchen:
+            if company and kitchen.company_id != company.id:
+                raise serializers.ValidationError({"kitchen": "Кухня принадлежит другой компании."})
+            if tb is not None and kitchen.branch_id not in (None, tb.id):
+                raise serializers.ValidationError({"kitchen": "Кухня другого филиала."})
+
+        return attrs
 
     def _upsert_ingredients(self, menu_item, ing_list):
         to_create = []
@@ -303,6 +348,7 @@ class MenuItemSerializer(CompanyBranchReadOnlyMixin):
             if ingredients:
                 self._upsert_ingredients(instance, ingredients)
         return obj
+
 
 
 # --------- Бронь ---------

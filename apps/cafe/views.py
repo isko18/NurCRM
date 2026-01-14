@@ -12,7 +12,7 @@ from .models import (
     Zone, Table, Booking, Warehouse, Purchase,
     Category, MenuItem, Ingredient,
     Order, OrderItem, CafeClient,
-    OrderHistory, KitchenTask, NotificationCafe, InventorySession, Equipment, EquipmentInventorySession,
+    OrderHistory, KitchenTask, NotificationCafe, InventorySession, Equipment, EquipmentInventorySession, Kitchen
 )
 from .serializers import (
     ZoneSerializer, TableSerializer, BookingSerializer,
@@ -21,7 +21,7 @@ from .serializers import (
     OrderSerializer, OrderItemInlineSerializer,
     CafeClientSerializer,
     OrderHistorySerializer,
-    KitchenTaskSerializer, NotificationCafeSerializer, InventorySessionSerializer, EquipmentSerializer, EquipmentInventorySessionSerializer,
+    KitchenTaskSerializer, NotificationCafeSerializer, InventorySessionSerializer, EquipmentSerializer, EquipmentInventorySessionSerializer, KitchenSerializer
 )
 
 from apps.users.models import Branch
@@ -405,7 +405,7 @@ class MenuItemListCreateView(CompanyBranchQuerysetMixin, generics.ListCreateAPIV
                 .all())
     serializer_class = MenuItemSerializer
     filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
-    filterset_fields = ["category", "is_active", "title"]
+    filterset_fields = ["category", "kitchen", "is_active", "title"]
     search_fields = ["title", "category__title"]
     ordering_fields = ["title", "price", "is_active", "id"]
 
@@ -803,3 +803,17 @@ class EquipmentInventorySessionConfirmView(CompanyBranchQuerysetMixin, generics.
         session.confirm(user=request.user)
         data = self.get_serializer(session).data
         return Response(data, status=status.HTTP_200_OK)
+    
+# ==================== Kitchen ====================
+class KitchenListCreateView(CompanyBranchQuerysetMixin, generics.ListCreateAPIView):
+    queryset = Kitchen.objects.all()
+    serializer_class = KitchenSerializer
+    filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
+    filterset_fields = ["title", "number"]
+    search_fields = ["title"]
+    ordering_fields = ["number", "title", "id"]
+
+
+class KitchenRetrieveUpdateDestroyView(CompanyBranchQuerysetMixin, generics.RetrieveUpdateDestroyAPIView):
+    queryset = Kitchen.objects.all()
+    serializer_class = KitchenSerializer
