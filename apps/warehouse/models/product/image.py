@@ -3,7 +3,9 @@ from apps.warehouse.models.base import (
 
     product_image_upload_to
 )
-
+import uuid
+from PIL import Image
+from io import BytesIO
 from django.core.exceptions import ValidationError
 from django.db import models
 
@@ -99,7 +101,7 @@ class WarehouseProductImage(BaseModelId,BaseModelCompanyBranch):
         if im.mode not in ("RGB", "L"):
             im = im.convert("RGB")
 
-        buf = io.BytesIO()
+        buf = BytesIO()
         # quality 80 / method 6 — хорошее качество и компрессия
         im.save(buf, format="WEBP", quality=80, method=6)
         buf.seek(0)

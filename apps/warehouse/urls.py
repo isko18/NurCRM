@@ -1,62 +1,46 @@
-from django.urls import path 
+from django.urls import path
 
-from .views.warehouse import (
-    WarehouseView,WarehouseDetailView
-)
-
-from .views.brands import (
-    BrandView,BrandDetailView
-)
-
-from .views.category import (
-    CategoryView,CategoryDetailView
-)
-
+from .views.warehouse import WarehouseView, WarehouseDetailView
+from .views.brands import BrandView, BrandDetailView
+from .views.category import CategoryView, CategoryDetailView
 from .views.product import (
-    ProductView,ProductDetailView,
-    ProductImagesView,ProductImageDetailView,
-    ProductPackagesView,ProductPackageDetailView
+    ProductView, ProductDetailView,
+    ProductImagesView, ProductImageDetailView,
+    ProductPackagesView, ProductPackageDetailView,
 )
-
-
-# / -> create | list 
-# /<uuid> -> update | delete | retrieve
-
-
-# /<uuid>/products -> list | create  
-# /products/<uuid> -> update | delete | retrieve
-
-# products/<uuid>/images -> 
-# product-images/<uuid> ->
-
-# products/<uuid>/packages -> 
-# products-packages/<uuid> ->
-
-
-# warehouses-brands/ -> create | list 
-# warehouses-category/ -> create | list
-
-# warehouses-brands/<uuid> -> update | retireve
-# warehouses-category/<uuid> -> update | retrieve
-
 
 urlpatterns = [
+    # warehouses
+    path("", WarehouseView.as_view(), name="warehouse"),
+    path("<uuid:warehouse_uuid>/", WarehouseDetailView.as_view(), name="warehouse-detail"),
 
-    path("",WarehouseView.as_view() ,name="warehouse"),
-    path("<uuid:pk>/",WarehouseDetailView.as_view() ,name="warehouse-detail"),
+    # brands
+    path("brands/", BrandView.as_view(), name="warehouse-brand"),
+    path("brands/<uuid:brand_uuid>/", BrandDetailView.as_view(), name="warehouse-brand-detail"),
 
-    path("brands/",BrandView.as_view(),name="warehouse-brand"),
-    path("brands/<uuid:pk>",BrandDetailView.as_view(),name="warehouse-brand-detail"),
+    # categories
+    path("category/", CategoryView.as_view(), name="warehouse-category"),
+    path("category/<uuid:category_uuid>/", CategoryDetailView.as_view(), name="warehouse-category-detail"),
 
-    path("category/",CategoryView.as_view(),name="warehouse-category"),
-    path("category/<uuid:pk>",CategoryDetailView.as_view(),name="warehouse-category-detail"),
+    # products in warehouse
+    path("<uuid:warehouse_uuid>/products/", ProductView.as_view(), name="warehouse-products"),
 
-    path("<uuid:warehouse_uuid>/products/",ProductView.as_view(),name="warehouse-product"),
-    path("products/<uuid:pk>/",ProductDetailView.as_view(),name="warehouse-detail-product"),
+    # product detail (global by product uuid)
+    path("products/<uuid:product_uuid>/", ProductDetailView.as_view(), name="warehouse-product-detail"),
 
-    path("products/<uuid:product_uuid>/images/", ProductImagesView.as_view(), name="product-images-list-create"),
-    path("product-images/<uuid:pk>/", ProductImageDetailView.as_view(), name="product-image-detail"),
+    # product images
+    path("products/<uuid:product_uuid>/images/", ProductImagesView.as_view(), name="product-images"),
+    path(
+        "products/<uuid:product_uuid>/images/<uuid:image_uuid>/",
+        ProductImageDetailView.as_view(),
+        name="product-image-detail",
+    ),
 
-    path("products/<uuid:product_uuid>/packages/", ProductPackagesView.as_view(), name="product-packages-list-create"),
-    path("products-packages/<uuid:pk>/", ProductPackageDetailView.as_view(), name="product-package-detail"),
+    # product packages
+    path("products/<uuid:product_uuid>/packages/", ProductPackagesView.as_view(), name="product-packages"),
+    path(
+        "products/<uuid:product_uuid>/packages/<uuid:package_uuid>/",
+        ProductPackageDetailView.as_view(),
+        name="product-package-detail",
+    ),
 ]
