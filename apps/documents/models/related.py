@@ -53,8 +53,13 @@ class InvoicePayment(models.Model):
 
     is_paid = models.BooleanField(verbose_name="Оплачен?")
     
-    total_sum = models.
-
+    total_sum = models.DecimalField(
+        max_digits=12,
+        decimal_places=2,
+        db_index=True,
+        verbose_name="Сумма"
+    )
+    
     created_at = models.DateTimField()
     
     content_type = models.ForeignKey(ContentType, on_delete=models.CASCADE)

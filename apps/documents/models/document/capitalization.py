@@ -36,9 +36,6 @@ class DocumentCapitalization(
         verbose_name = "Оприходование"
         verbose_name_plural = "Оприходование"
 
-        indexes = [
-            models.Index()
-        ]
 
 
 
