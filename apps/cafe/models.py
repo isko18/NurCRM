@@ -454,8 +454,8 @@ class Purchase(models.Model):
     supplier = models.CharField(max_length=255, verbose_name="Поставщик")
     positions = models.CharField(max_length=255, verbose_name="Позиций")
     price = models.DecimalField(max_digits=10, decimal_places=2, verbose_name='Цена')
-    created_at = models.DateTimeField('Создано', auto_now_add=True)
-    updated_at = models.DateTimeField('Обновлено', auto_now=True)
+    created_at = models.DateTimeField('Создано', auto_now_add=True, null=True, blank=True)
+    updated_at = models.DateTimeField('Обновлено', auto_now=True, null=True, blank=True)
     class Meta:
         verbose_name = 'Закупка'
         verbose_name_plural = 'Закупки'
