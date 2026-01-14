@@ -11,6 +11,10 @@ from apps.documents.models.abstract import (
 
 from django.db import models
 
+from django.contrib.contenttypes.fields import GenericRelation
+from apps.documents.models.related import (
+    DocumentProduct,InvoicePayment 
+)
 
 class DocumentSale(
     UUIDPrimaryKeyMixin,
@@ -22,6 +26,14 @@ class DocumentSale(
         on_delete=models.SET_NULL,
         null=True,blank=True
     )
+ 
+    products = GenericRelation(
+        DocumentProduct,related_name_query="sales"
+    )
+
+    invoices = GenericRelation(
+        InvoicePayment,related_name_query="sales"
+    ) 
     
 
     class Meta:

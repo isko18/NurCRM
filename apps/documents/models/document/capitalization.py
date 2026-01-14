@@ -10,6 +10,13 @@ from apps.documents.models.abstract import (
 
 from django.db import models
 
+from django.contrib.contenttypes.fields import GenericRelation
+
+from apps.documents.models.related import (
+    DocumentProduct,
+    InvoicePayment
+)
+
 class DocumentCapitalization(
     UUIDPrimaryMixin,
     ShopAbstarctModel,
@@ -17,7 +24,13 @@ class DocumentCapitalization(
     DocumentAsbtractModel
 ): 
     
+    products = GenericRelation(
+        DocumentProduct,related_name_query="capitalizations"
+    )
 
+    invoices = GenericRelation(
+        InvoicePayment,related_name_query="capitalization"
+    ) 
     
     class Meta:
         verbose_name = "Оприходование"

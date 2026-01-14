@@ -11,6 +11,11 @@ from apps.documents.models.abstract import (
 
 from django.db import models
 
+from django.contrib.contenttypes.fields import GenericRelation
+from apps.documents.models.related import (
+    DocumentProduct,
+    InvoicePayment
+)
 
 class DocumentInventory(
     UUIDPrimaryKeyMixin,
@@ -18,6 +23,16 @@ class DocumentInventory(
     DocumentAbstractModel,
     ShopAbstractModel
 ):
+    
+     
+    products = GenericRelation(
+        DocumentProduct,related_name_query="inventories"
+    )
+
+    invoices = GenericRelation(
+        InvoicePayment,related_name_query="inventories"
+    ) 
+    
 
     class Meta:
         verbose_name = "Инвентаризации"

@@ -1,12 +1,16 @@
 from apps.documents.models.mixins import (
     UUIDPrimaryKeyMixin,
-    DateTimeMixin,
-    CompanyBranchMixin
+    DateTimeMixin
 )
 
+from .abstract import CompanyBranchAbstractModel
 from django.db import models
 
-class Document(UUIDPrimaryKeyMixin,DateTimeMixin,CompanyBranchMixin):
+class Document(
+    UUIDPrimaryKeyMixin,
+    DateTimeMixin,
+    CompanyBranchAbstractModel
+):
    
 
     class DocumentTypes(models.TextChoices):
@@ -18,14 +22,32 @@ class Document(UUIDPrimaryKeyMixin,DateTimeMixin,CompanyBranchMixin):
         RETURN_SALE = "return_sale", "Возврат от клиента"
         SALE = "sale", "Продажа"
         WRITE_OFF = "write_off", "Списание"
+        EXPENSE = "expense","Расход"
+        RECEIPT = "receipt","Приход"
     
+    class StatusTypes(models.TextCHoices):
+        NEW = "new","новый"
+        INWORK = "inwork","В работе"
+        CLOSED = "closed","закрыт"
+        CANCELLED = "cancelled","отменен"  
+
+
+
+
     document_type = models.CharField(max_length=50,
         choices=DocumentTypes.choices,
-        null=False,blank=False
+        null=False,blank=False,
+        verbose_name="Тип документа"
     )
     
     carried_out = models.BooleanField(
         verbose_name="Документ проведен",default=True
+    )
+    
+    document_status = models.CharField(max_length=20,
+        choices=StatusTypes.choices,
+        null=True,blank=True,default=None,
+        verbose_name="Статус"
     )
 
     class Meta:

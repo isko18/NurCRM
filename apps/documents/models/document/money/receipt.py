@@ -16,7 +16,6 @@ class DocumentReceipt(
     DocumentAbstractModel,
 ):
     
-    account = models.CharField(max_length=128)
     
     
     client = models.ForeignKey(

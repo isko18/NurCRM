@@ -9,7 +9,6 @@ from .expense import DocumentExpense
 from .receipt import DocumentReceipt
 
 
-from .transfer import DocumentTransfer
 
 
 

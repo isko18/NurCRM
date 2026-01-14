@@ -18,8 +18,6 @@ from .return_sale import DocumentReturnSale
 from .write_off import DocumentWriteOff
 
 
-from .money import (
-    PaymentCategory
-)
+from .money import *
 
 
