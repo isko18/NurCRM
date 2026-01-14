@@ -1,21 +1,41 @@
+
+# Стандартные импорты
 from django.shortcuts import get_object_or_404
 
+# DRF
 from rest_framework import generics
+
+# Django filters
 from django_filters.rest_framework import DjangoFilterBackend
 
+# Локальные модули
+from .models import Warehouse, WarehouseProduct, WarehouseProductPackage, WarehouseProductImage, WarehouseProductCategory, WarehouseProductBrand
+from .serializers import (
+    WarehouseSerializer,
+    CategorySerializer,
+    BrandSerializer,
+    WarehouseProductSerializer,
+    WarehouseProductImageSerializer,
+    WarehouseProductPackageSerializer,
+)
+from .filters import WarehouseFilter, CategoryFilter, BrandFilter, ProductFilter
 from .mixins import CompanyBranchRestrictedMixin
 
-from apps.warehouse.models import (
-    Warehouse,
-    WarehouseProduct,
-    WarehouseProductPackage,
-    WarehouseProductImage,
-)
+class WarehouseView(CompanyBranchRestrictedMixin,generics.ListCreateAPIView):
+    serializer_class = WarehouseSerializer
+    queryset = Warehouse.objects.select_related("company","branch").all()    
+    
+    filter_backends = [DjangoFilterBackend]
+    filterset_class = WarehouseFilter
 
-from apps.warehouse.serializers.product.product import WarehouseProductSerializer
-from apps.warehouse.serializers.product.image import WarehouseProductImageSerializer
-from apps.warehouse.serializers.product.package import WarehouseProductPackageSerializer
-from apps.warehouse.filters import ProductFilter
+
+class WarehouseDetailView(CompanyBranchRestrictedMixin,generics.RetrieveUpdateDestroyAPIView):
+    serializer_class = WarehouseSerializer
+    queryset = Warehouse.objects.select_related("company","branch").all()    
+
+
+
+
 
 
 class ProductView(CompanyBranchRestrictedMixin, generics.ListCreateAPIView):
@@ -111,3 +131,50 @@ class ProductPackageDetailView(CompanyBranchRestrictedMixin, generics.RetrieveUp
 
     def get_queryset(self):
         return WarehouseProductPackage.objects.filter(product_id=self.kwargs.get("product_uuid"))
+
+
+
+class CategoryView(CompanyBranchRestrictedMixin, generics.ListCreateAPIView):
+    
+    serializer_class = CategorySerializer
+    queryset = WarehouseProductCategory.objects.select_related("company","branch").all()
+    
+    filter_backends = [DjangoFilterBackend]
+    filterset_class = (CategoryFilter)
+
+
+class CategoryDetailView(CompanyBranchRestrictedMixin, generics.RetrieveUpdateDestroyAPIView):
+    serializer_class = CategorySerializer
+    queryset = WarehouseProductCategory.objects.select_related("company","branch").all()
+
+
+
+
+
+
+
+class BrandView(CompanyBranchRestrictedMixin, generics.ListCreateAPIView):
+    
+    serializer_class = BrandSerializer
+    queryset = WarehouseProductBrand.objects.select_related("company","branch").all()
+    
+    filter_backends = [DjangoFilterBackend]
+    filterset_class = (BrandFilter)
+
+
+class BrandDetailView(CompanyBranchRestrictedMixin, generics.RetrieveUpdateDestroyAPIView):
+    
+    serializer_class = BrandSerializer
+    queryset = WarehouseProductBrand.objects.select_related("company","branch").all()
+
+
+
+
+
+
+
+
+
+
+
+

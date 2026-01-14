@@ -1,4 +1,5 @@
 
+
 from typing import Optional
 from apps.users.models import Branch, User
 from django.db.models import Q
@@ -299,7 +300,6 @@ class CompanyBranchRestrictedMixin:
 
     def perform_update(self, serializer):
         self._save_with_company_branch(serializer)
-
 
 
 

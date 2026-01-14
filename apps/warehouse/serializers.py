@@ -1,0 +1,397 @@
+
+from apps.warehouse.utils import (
+    _active_branch,_restrict_pk_queryset_strict
+)
+
+from rest_framework import serializers
+
+from decimal import Decimal
+from django.apps import apps
+from django.db import transaction
+
+
+from .models import (
+    Warehouse,
+    WarehouseProduct,
+    WarehouseProductCategory,
+    WarehouseProductBrand,
+    WarehouseProductCharasteristics,
+    WarehouseProductPackage,
+    WarehouseProductImage
+)
+
+from io import BytesIO
+from PIL import Image
+
+from django.core.files.base import ContentFile
+
+
+def _to_webp(uploaded_file, *, quality: int = 82) -> ContentFile:
+    """
+    Конвертирует загруженный файл в WebP и возвращает ContentFile,
+    который можно присвоить ImageField.
+    """
+    uploaded_file.seek(0)
+
+    img = Image.open(uploaded_file)
+
+    # Если PNG с альфой — оставим прозрачность
+    if img.mode in ("RGBA", "LA") or (img.mode == "P" and "transparency" in img.info):
+        img = img.convert("RGBA")
+    else:
+        img = img.convert("RGB")
+
+    buf = BytesIO()
+    img.save(buf, format="WEBP", quality=quality, method=6)
+    buf.seek(0)
+
+    base_name = (getattr(uploaded_file, "name", "image") or "image").rsplit(".", 1)[0]
+    return ContentFile(buf.read(), name=f"{base_name}.webp")
+
+
+def _norm_str(v):
+    s = (v or "").strip()
+    return s or None
+
+
+def _to_decimal(v, default="0"):
+    try:
+        return Decimal(str(v)) if v is not None else Decimal(default)
+    except Exception:
+        return Decimal(default)
+
+
+def _get_characteristics_model():
+    """
+    Подстраховка: в проектах бывает разное имя модели характеристик.
+    Укажи реальные варианты имён моделей (без Serializer).
+    """
+    for label in (
+        "warehouse.WarehouseProductCharacteristics",
+        "warehouse.WarehouseProductCharasteristics",  # если у тебя опечатка в названии модели
+    ):
+        try:
+            return apps.get_model(label)
+        except Exception:
+            continue
+    return None
+
+
+
+class CompanyBranchReadOnlyMixin:
+    """
+    Делает company/branch read-only наружу и проставляет их из контекста на create/update.
+    Правило:
+      - есть активный филиал → branch = этот филиал
+      - нет филиала → branch = NULL (глобально)
+    """
+    def _user(self):
+        req = self.context.get("request")
+        return getattr(req, "user", None) if req else None
+
+    def _user_company(self):
+        u = self._user()
+        return getattr(u, "company", None) or getattr(u, "owned_company", None)
+
+    def _auto_branch(self):
+        return _active_branch(self)
+
+    def create(self, validated_data):
+        company = self._user_company()
+        if company:
+            validated_data.setdefault("company", company)
+        if "branch" in getattr(self.Meta, "fields", []):
+            validated_data["branch"] = self._auto_branch()
+        return super().create(validated_data)
+
+    def update(self, instance, validated_data):
+        company = self._user_company()
+        if company:
+            validated_data["company"] = company
+        if "branch" in getattr(self.Meta, "fields", []):
+            validated_data["branch"] = self._auto_branch()
+        return super().update(instance, validated_data)
+
+
+
+
+class WarehouseSerializer(CompanyBranchReadOnlyMixin,serializers.ModelSerializer):
+    
+    company = serializers.ReadOnlyField(source='company.id')
+    branch = serializers.ReadOnlyField(source='branch.id')
+    
+    products_count = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Warehouse 
+        fields = ("id","name","location","status","company","branch")
+        ref_name = "WarehouseWarehouseSerializer"
+    
+    def get_products_count(self, obj):
+        return obj.products.count()
+
+
+
+class CategorySerializer(CompanyBranchReadOnlyMixin,serializers.ModelSerializer):
+    
+    company = serializers.ReadOnlyField(source="company.id")
+    branch = serializers.ReadOnlyField(source="branch.id")
+
+    parent = serializers.PrimaryKeyRelatedField(
+        queryset=WarehouseProductCategory.objects.all(),
+        allow_null=True,
+        required=False
+    )
+
+    class Meta:
+        model = WarehouseProductCategory
+        fields = ['id', 'company', 'branch', 'name', 'parent']
+        read_only_fields = ['id', 'company', 'branch']
+        ref_name = "WarehouseCategory"
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        comp = self._user_company()
+        br = self._auto_branch()
+        _restrict_pk_queryset_strict(self.fields.get("parent"), WarehouseProductCategory.objects.all(), comp, br)
+
+
+
+class BrandSerializer(CompanyBranchReadOnlyMixin,serializers.ModelSerializer):
+    
+    company = serializers.ReadOnlyField(source="company.id")
+    branch = serializers.ReadOnlyField(source="branch.id")
+
+    parent = serializers.PrimaryKeyRelatedField(
+        queryset=WarehouseProductBrand.objects.all(),
+        allow_null=True,
+        required=False
+    )
+
+    class Meta:
+        model = WarehouseProductBrand
+        fields = ['id', 'company', 'branch', 'name', 'parent']
+        read_only_fields = ['id', 'company', 'branch']
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        comp = self._user_company()
+        br = self._auto_branch()
+        _restrict_pk_queryset_strict(self.fields.get("parent"), WarehouseProductBrand.objects.all(), comp, br)
+
+
+
+
+
+class WarehouseProductCharacteristicsSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
+    class Meta:
+        model = WarehouseProductCharasteristics
+        fields = (
+            "height_cm", 
+            "width_cm", 
+            "depth_cm", 
+            "factual_weight_kg", 
+            "description"
+        )
+
+class WarehouseProductImageSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
+    # принимаем файл на вход
+    image = serializers.ImageField(write_only=True, required=True)
+    # отдаём ссылку наружу
+    image_url = serializers.SerializerMethodField(read_only=True)
+
+    class Meta:
+        model = WarehouseProductImage
+        fields = ("id", "product", "image", "image_url", "is_primary", "alt", "created_at")
+        read_only_fields = ("id", "product", "created_at")
+
+    def get_image_url(self, obj):
+        request = self.context.get("request")
+        if not getattr(obj, "image", None):
+            return None
+        url = obj.image.url
+        return request.build_absolute_uri(url) if request else url
+
+    def validate_image(self, value):
+        """
+        Мягкая валидация типа.
+        DRF/Pillow уже проверяет что это изображение, но доп. фильтр не помешает.
+        """
+        ct = getattr(value, "content_type", "") or ""
+        allowed = {"image/jpeg", "image/png", "image/webp"}
+        if ct and ct not in allowed:
+            raise serializers.ValidationError("Разрешены только JPG, PNG, WEBP.")
+        return value
+
+    def create(self, validated_data):
+        """
+        Конвертируем входной файл в webp перед сохранением.
+        product сюда не даём менять извне — его должен ставить view.perform_create().
+        """
+        uploaded = validated_data.pop("image", None)
+
+        if uploaded:
+            validated_data["image"] = _to_webp(uploaded)
+
+        return super().create(validated_data)
+
+    def update(self, instance, validated_data):
+        uploaded = validated_data.pop("image", None)
+
+        if uploaded:
+            validated_data["image"] = _to_webp(uploaded)
+
+        return super().update(instance, validated_data)
+
+
+
+
+
+
+
+
+
+
+class WarehouseProductPackageSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
+    class Meta:
+        model = WarehouseProductPackage
+        fields = (
+                "id", "product", 
+                "name", "quantity_in_package", 
+                "unit", "created_at")
+        
+        read_only_fields = ("id", "product", "created_at")
+
+
+
+
+class WarehouseProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
+    characteristics = WarehouseProductCharacteristicsSerializer(required=False)
+    images = WarehouseProductImageSerializer(many=True, read_only=True)
+    packages = WarehouseProductPackageSerializer(many=True, read_only=True)
+
+    class Meta:
+        ref_name = "WarehouseProductSerializer"
+        model = WarehouseProduct
+        fields = [
+            "id",
+            "name",
+            "article",
+            "description",
+            "barcode",
+            "code",
+            "unit",
+            "is_weight",
+            "quantity",
+            "purchase_price",
+            "markup_percent",
+            "price",
+            "discount_percent",
+            "plu",
+            "country",
+            "status",
+            "stock",
+            "expiration_date",
+            "brand",
+            "category",
+            "warehouse",
+            "characteristics",
+            "images",
+            "packages",
+        ]
+        read_only_fields = ["id", "company", "branch"]
+
+    def validate(self, attrs):
+        # нормализация
+        if "barcode" in attrs:
+            attrs["barcode"] = _norm_str(attrs.get("barcode"))
+        if "code" in attrs:
+            attrs["code"] = _norm_str(attrs.get("code"))
+        if "article" in attrs:
+            attrs["article"] = _norm_str(attrs.get("article"))
+        if "country" in attrs:
+            attrs["country"] = _norm_str(attrs.get("country"))
+
+        # decimal нормализация (если приходит строкой)
+        for f in ("quantity", "purchase_price", "markup_percent", "price", "discount_percent"):
+            if f in attrs:
+                attrs[f] = _to_decimal(attrs.get(f), "0")
+
+        return attrs
+
+    def _upsert_characteristics(self, product: WarehouseProduct, characteristics_data):
+        if not characteristics_data:
+            return
+
+        Model = _get_characteristics_model()
+        if Model is None:
+            # Модель не найдена — не падаем, но и не создаём мусор
+            return
+
+        # Если в Model FK называется не product, а product_id — подстройка:
+        fk_field = "product"
+        if "product" not in {f.name for f in Model._meta.get_fields()}:
+            # попробуем самое частое альтернативное
+            fk_field = "warehouse_product" if "warehouse_product" in {f.name for f in Model._meta.get_fields()} else "product"
+
+        defaults = dict(characteristics_data)
+        Model.objects.update_or_create(**{fk_field: product}, defaults=defaults)
+
+    def create(self, validated_data):
+        characteristics_data = validated_data.pop("characteristics", None)
+
+        barcode = _norm_str(validated_data.get("barcode"))
+        company = validated_data.get("company")
+        warehouse = validated_data.get("warehouse")
+
+        # ВАЖНО: company/warehouse должны быть проставлены во View через serializer.save(...)
+        # иначе company будет None и всё снова упадёт на NOT NULL
+        with transaction.atomic():
+            if barcode and company and warehouse:
+                existing = (
+                    WarehouseProduct.objects
+                    .select_for_update()
+                    .filter(company=company, warehouse=warehouse, barcode=barcode)
+                    .first()
+                )
+                if existing:
+                    # запрещаем менять связки
+                    validated_data.pop("company", None)
+                    validated_data.pop("branch", None)
+                    validated_data.pop("warehouse", None)
+
+                    for k, v in validated_data.items():
+                        setattr(existing, k, v)
+
+                    # гарантируем, что barcode хранится нормализованным
+                    existing.barcode = barcode
+                    existing.save()
+
+                    self._upsert_characteristics(existing, characteristics_data)
+                    return existing
+
+            product = WarehouseProduct.objects.create(**validated_data)
+            self._upsert_characteristics(product, characteristics_data)
+            return product
+
+    def update(self, instance, validated_data):
+        characteristics_data = validated_data.pop("characteristics", None)
+
+        # запрещаем менять склад/компанию/филиал через update
+        validated_data.pop("warehouse", None)
+        validated_data.pop("company", None)
+        validated_data.pop("branch", None)
+
+        # нормализуем barcode если прилетает
+        if "barcode" in validated_data:
+            validated_data["barcode"] = _norm_str(validated_data.get("barcode"))
+
+        for attr, value in validated_data.items():
+            setattr(instance, attr, value)
+
+        instance.save()
+        self._upsert_characteristics(instance, characteristics_data)
+        return instance
+
+
+
