@@ -3,6 +3,7 @@ from .views import *
 from .pos_views import *
 from .analytics_market import *
 from .document import SaleReceiptAPIView, SaleInvoiceAPIView
+from apps.main.showcase.views_public import PublicCompanyProductDetailAPIView, PublicCompanyAPIView, PublicCompanyShowcaseAPIView
 
 
 urlpatterns = [
@@ -236,6 +237,10 @@ urlpatterns = [
     
     
     path("analytics/market/", AnalyticsView.as_view(), name="analytics"),
+
+    path("public/companies/<slug:slug>/", PublicCompanyAPIView.as_view()),
+    path("public/companies/<slug:slug>/showcase/", PublicCompanyShowcaseAPIView.as_view()),
+    path("public/companies/<slug:slug>/showcase/<uuid:product_id>/", PublicCompanyProductDetailAPIView.as_view()),
 
 ]
 
