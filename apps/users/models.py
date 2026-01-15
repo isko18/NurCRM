@@ -80,7 +80,7 @@ class Industry(models.Model):
 class Company(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     name = models.CharField(max_length=255, verbose_name="Название компании")
-    slug = models.SlugField("Slug", max_length=80, db_index=True, blank=True, null=True)
+    slug = models.SlugField("Slug", max_length=80, unique=True, db_index=True, blank=True)
 
     subscription_plan = models.ForeignKey("SubscriptionPlan", on_delete=models.SET_NULL, null=True, blank=True)
     industry = models.ForeignKey("Industry", on_delete=models.SET_NULL, null=True, blank=True, verbose_name="Вид деятельности")
@@ -113,42 +113,34 @@ class Company(models.Model):
         help_text="Постоянный токен, которым подключаются весы к API",
     )
 
-    def _generate_unique_slug(self) -> str:
-        base = slugify(self.name)[:60] or "company"
-        candidate = base
-        i = 2
-        while Company.objects.filter(slug=candidate).exclude(pk=self.pk).exists():
-            candidate = f"{base}-{i}"
-            i += 1
-            if len(candidate) > 80:
-                # fallback, если имя очень длинное
-                candidate = f"{base[:50]}-{uuid.uuid4().hex[:8]}"
-        return candidate
-
-    def save(self, *args, **kwargs):
-        # твоя логика дат
-        if not self.start_date:
-            self.start_date = timezone.now()
-        if not self.end_date and self.start_date:
-            self.end_date = self.start_date + timedelta(days=10)
-
-        # ✅ slug
-        if not self.slug:
-            self.slug = self._generate_unique_slug()
-
-        super().save(*args, **kwargs)
-
     def ensure_scale_api_token(self):
         if not self.scale_api_token:
             self.scale_api_token = str(uuid.uuid4())
             self.save(update_fields=["scale_api_token"])
         return self.scale_api_token
 
+    def _generate_unique_slug(self) -> str:
+        base = slugify(self.name)[:60] or "company"
+        candidate = base
+        i = 2
+        while type(self).objects.filter(slug=candidate).exclude(pk=self.pk).exists():
+            candidate = f"{base}-{i}"
+            i += 1
+            if len(candidate) > 80:
+                candidate = f"{base[:50]}-{uuid.uuid4().hex[:8]}"
+        return candidate
+
     def save(self, *args, **kwargs):
+        # даты
         if not self.start_date:
             self.start_date = timezone.now()
         if not self.end_date and self.start_date:
             self.end_date = self.start_date + timedelta(days=10)
+
+        # slug
+        if not self.slug:
+            self.slug = self._generate_unique_slug()
+
         super().save(*args, **kwargs)
 
     def __str__(self):
@@ -161,7 +153,6 @@ class Company(models.Model):
             models.Index(fields=["created_at"]),
             models.Index(fields=["end_date"]),
         ]
-
 
 class CustomRole(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
