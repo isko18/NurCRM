@@ -55,6 +55,27 @@ def _safe_div(a: Decimal, b: int | Decimal) -> Decimal:
     return _money(Decimal(a) / Decimal(b))
 
 
+def _pct(a: Decimal, b: Decimal) -> float | None:
+    """
+    percent(a / b). returns float with 0.1 precision or None.
+    """
+    try:
+        bb = Decimal(b or 0)
+        if bb <= 0:
+            return None
+        return float((Decimal(a or 0) / bb * Decimal("100")).quantize(Decimal("0.1")))
+    except Exception:
+        return None
+
+
+def _calc_margin_pack(revenue: Decimal, cogs: Decimal):
+    rev = _money(revenue)
+    cg = _money(cogs)
+    profit = _money(rev - cg)
+    margin = _pct(profit, rev)
+    return cg, profit, margin
+
+
 def _parse_dt(s: str | None) -> datetime | None:
     if not s:
         return None
@@ -110,6 +131,32 @@ def _choice_value(model, enum_name: str, member: str, fallback: str) -> str:
     enum = getattr(model, enum_name, None)
     v = getattr(enum, member, None)
     return getattr(v, "value", None) or str(v or fallback)
+
+
+def _get_cogs_expr(SaleItem, ProductModel=None):
+    """
+    Возвращает (expr, ok). expr можно суммировать через Sum(expr).
+    Приоритет:
+    1) purchase_price_snapshot (исторично, правильно)
+    2) unit_cost/cost_price/purchase_price в SaleItem
+    3) product__purchase_price (неисторично, fallback)
+    """
+
+    # 1) ИСТОРИЧНО: snapshot на момент продажи
+    if _model_has_field(SaleItem, "purchase_price_snapshot") and _model_has_field(SaleItem, "quantity"):
+        return ExpressionWrapper(F("quantity") * F("purchase_price_snapshot"), output_field=MONEY_FIELD), True
+
+    # 2) другие варианты unit себестоимости
+    for f in ("unit_cost", "cost_price", "purchase_price", "buy_price"):
+        if _model_has_field(SaleItem, f) and _model_has_field(SaleItem, "quantity"):
+            return ExpressionWrapper(F("quantity") * F(f), output_field=MONEY_FIELD), True
+
+    # 3) fallback через Product.purchase_price (может "врать" задним числом)
+    if ProductModel is not None and _model_has_field(SaleItem, "product") and _model_has_field(SaleItem, "quantity"):
+        if _model_has_field(ProductModel, "purchase_price"):
+            return ExpressionWrapper(F("quantity") * F("product__purchase_price"), output_field=MONEY_FIELD), True
+
+    return None, False
 
 
 # ─────────────────────────────────────────────────────────────
@@ -393,6 +440,10 @@ class AnalyticsView(APIView):
         daily = []
         top_products = []
 
+        cogs = None
+        gross_profit = None
+        margin_percent = None
+
         Sale, SaleItem = get_sale_models()
         if Sale is not None:
             qs = Sale.objects.filter(company=company)
@@ -420,6 +471,27 @@ class AnalyticsView(APIView):
             )
             revenue = agg["revenue"] or Z_MONEY
             tx = agg["tx"] or 0
+
+            # ── margin (COGS / Profit / Margin%) ──
+            if SaleItem is not None and _model_has_field(SaleItem, "sale"):
+                ProductModel = None
+                try:
+                    ProductModel = apps.get_model("main.Product")
+                except Exception:
+                    ProductModel = None
+
+                cogs_expr, ok = _get_cogs_expr(SaleItem, ProductModel)
+                if ok:
+                    item_qs_cost = SaleItem.objects.filter(sale__in=qs)
+                    cogs_val = item_qs_cost.aggregate(
+                        v=Coalesce(
+                            Sum(cogs_expr),
+                            Value(Z_MONEY, output_field=MONEY_FIELD),
+                            output_field=MONEY_FIELD,
+                        )
+                    )["v"] or Z_MONEY
+
+                    cogs, gross_profit, margin_percent = _calc_margin_pack(revenue, cogs_val)
 
             if _model_has_field(Sale, "client"):
                 clients = qs.values("client_id").exclude(client_id__isnull=True).distinct().count()
@@ -506,6 +578,9 @@ class AnalyticsView(APIView):
                 "transactions": tx,
                 "avg_check": str(_money(avg_check)),
                 "clients": clients,
+                "cogs": str(_money(cogs)) if cogs is not None else None,
+                "gross_profit": str(_money(gross_profit)) if gross_profit is not None else None,
+                "margin_percent": margin_percent,
             },
             "charts": {"sales_dynamics": daily},
             "tables": {"top_products": top_products, "documents": documents},
@@ -674,7 +749,10 @@ class AnalyticsView(APIView):
                 )
                 .order_by("d")
             )
-            movement = [{"date": r["d"].isoformat(), "units": str((r["units"] or Z_QTY).quantize(Decimal("0.001")))} for r in rows if r["d"]]
+            movement = [
+                {"date": r["d"].isoformat(), "units": str((r["units"] or Z_QTY).quantize(Decimal("0.001")))}
+                for r in rows if r["d"]
+            ]
 
             # turnover_days (примерно)
             if inventory_value and inventory_value > Decimal("0"):
@@ -726,13 +804,17 @@ class AnalyticsView(APIView):
         avg_check = Z_MONEY
         cash_in_box = Z_MONEY
 
+        cogs = None
+        gross_profit = None
+        margin_percent = None
+
         hourly = []
         pay_pie = []
         pay_detail = []
         tx_week = []
         peak_hours = []
 
-        Sale, _ = get_sale_models()
+        Sale, SaleItem = get_sale_models()
         if Sale is not None:
             paid_value = _choice_value(Sale, "Status", "PAID", "paid")
             dt_field = "paid_at" if _model_has_field(Sale, "paid_at") else "created_at"
@@ -758,6 +840,27 @@ class AnalyticsView(APIView):
             revenue = agg["revenue"] or Z_MONEY
             tx = agg["tx"] or 0
             avg_check = _safe_div(_money(revenue), tx)
+
+            # ── margin (COGS / Profit / Margin%) ──
+            if SaleItem is not None and _model_has_field(SaleItem, "sale"):
+                ProductModel = None
+                try:
+                    ProductModel = apps.get_model("main.Product")
+                except Exception:
+                    ProductModel = None
+
+                cogs_expr, ok = _get_cogs_expr(SaleItem, ProductModel)
+                if ok:
+                    item_qs_cost = SaleItem.objects.filter(sale__in=qs)
+                    cogs_val = item_qs_cost.aggregate(
+                        v=Coalesce(
+                            Sum(cogs_expr),
+                            Value(Z_MONEY, output_field=MONEY_FIELD),
+                            output_field=MONEY_FIELD,
+                        )
+                    )["v"] or Z_MONEY
+
+                    cogs, gross_profit, margin_percent = _calc_margin_pack(revenue, cogs_val)
 
             pm_field = "payment_method" if _model_has_field(Sale, "payment_method") else None
             if pm_field:
@@ -810,7 +913,11 @@ class AnalyticsView(APIView):
                 .order_by("h")
             )
             hourly = [
-                {"hour": int(r["h"]) if r["h"] is not None else 0, "revenue": str(_money(r["v"])), "transactions": int(r["cnt"])}
+                {
+                    "hour": int(r["h"]) if r["h"] is not None else 0,
+                    "revenue": str(_money(r["v"])),
+                    "transactions": int(r["cnt"]),
+                }
                 for r in hour_rows
             ]
 
@@ -845,6 +952,9 @@ class AnalyticsView(APIView):
                 "avg_check": str(_money(avg_check)),
                 "cash_in_box": str(_money(cash_in_box)),
                 "cash_share_percent": cash_share,
+                "cogs": str(_money(cogs)) if cogs is not None else None,
+                "gross_profit": str(_money(gross_profit)) if gross_profit is not None else None,
+                "margin_percent": margin_percent,
             },
             "charts": {
                 "sales_by_hours": hourly,
@@ -897,10 +1007,17 @@ class AnalyticsView(APIView):
             avg_sec = sum(durations) / len(durations)
             avg_duration_hours = round(avg_sec / 3600, 1)
 
-        Sale, _SaleItem = get_sale_models()
+        Sale, SaleItem = get_sale_models()
 
         # revenue total for period (avg_revenue_per_shift)
         revenue_total = Z_MONEY
+        cogs_total = None
+        gross_profit_total = None
+        margin_percent_total = None
+        avg_profit_per_shift = None
+
+        sqs = None  # понадобится для расчетов
+
         if Sale is not None and _model_has_field(Sale, "shift"):
             paid_value = _choice_value(Sale, "Status", "PAID", "paid")
             dt_field = "paid_at" if _model_has_field(Sale, "paid_at") else "created_at"
@@ -931,8 +1048,32 @@ class AnalyticsView(APIView):
                 )
             )["v"] or Z_MONEY
 
+            # ── margin totals for shifts period ──
+            if SaleItem is not None and _model_has_field(SaleItem, "sale") and sqs is not None:
+                ProductModel = None
+                try:
+                    ProductModel = apps.get_model("main.Product")
+                except Exception:
+                    ProductModel = None
+
+                cogs_expr, ok = _get_cogs_expr(SaleItem, ProductModel)
+                if ok:
+                    item_qs_cost = SaleItem.objects.filter(sale__in=sqs)
+                    cogs_val = item_qs_cost.aggregate(
+                        v=Coalesce(
+                            Sum(cogs_expr),
+                            Value(Z_MONEY, output_field=MONEY_FIELD),
+                            output_field=MONEY_FIELD,
+                        )
+                    )["v"] or Z_MONEY
+
+                    cogs_total, gross_profit_total, margin_percent_total = _calc_margin_pack(revenue_total, cogs_val)
+
         shifts_cnt = period_qs.count() or 1
         avg_revenue_per_shift = _safe_div(_money(revenue_total), shifts_cnt)
+
+        if gross_profit_total is not None:
+            avg_profit_per_shift = _safe_div(_money(gross_profit_total), shifts_cnt)
 
         # bucket revenue by shift open time
         def bucket(h: int) -> str:
@@ -952,25 +1093,25 @@ class AnalyticsView(APIView):
             paid_value = _choice_value(Sale, "Status", "PAID", "paid")
             dt_field = "paid_at" if _model_has_field(Sale, "paid_at") else "created_at"
 
-            sqs = Sale.objects.filter(company=company, status=paid_value)
+            sqs2 = Sale.objects.filter(company=company, status=paid_value)
 
             if branch is not None and _model_has_field(Sale, "branch"):
                 if self._include_global(request):
-                    sqs = sqs.filter(Q(branch=branch) | Q(branch__isnull=True))
+                    sqs2 = sqs2.filter(Q(branch=branch) | Q(branch__isnull=True))
                 else:
-                    sqs = sqs.filter(branch=branch)
+                    sqs2 = sqs2.filter(branch=branch)
 
             if cashbox_id and _model_has_field(Sale, "cashbox"):
-                sqs = sqs.filter(cashbox_id=cashbox_id)
+                sqs2 = sqs2.filter(cashbox_id=cashbox_id)
             if cashier_id:
                 if _model_has_field(Sale, "user"):
-                    sqs = sqs.filter(user_id=cashier_id)
+                    sqs2 = sqs2.filter(user_id=cashier_id)
                 else:
-                    sqs = sqs.filter(shift__cashier_id=cashier_id)
+                    sqs2 = sqs2.filter(shift__cashier_id=cashier_id)
 
-            sqs = sqs.filter(**{f"{dt_field}__gte": period.start, f"{dt_field}__lt": period.end})
+            sqs2 = sqs2.filter(**{f"{dt_field}__gte": period.start, f"{dt_field}__lt": period.end})
 
-            for r in sqs.values("total", "shift__opened_at"):
+            for r in sqs2.values("total", "shift__opened_at"):
                 o = r.get("shift__opened_at")
                 if not o:
                     continue
@@ -1039,26 +1180,26 @@ class AnalyticsView(APIView):
             paid_value = _choice_value(Sale, "Status", "PAID", "paid")
             dt_field = "paid_at" if _model_has_field(Sale, "paid_at") else "created_at"
 
-            sqs = Sale.objects.filter(company=company, status=paid_value)
+            sqs3 = Sale.objects.filter(company=company, status=paid_value)
 
             if branch is not None and _model_has_field(Sale, "branch"):
                 if self._include_global(request):
-                    sqs = sqs.filter(Q(branch=branch) | Q(branch__isnull=True))
+                    sqs3 = sqs3.filter(Q(branch=branch) | Q(branch__isnull=True))
                 else:
-                    sqs = sqs.filter(branch=branch)
+                    sqs3 = sqs3.filter(branch=branch)
 
             if cashbox_id and _model_has_field(Sale, "cashbox"):
-                sqs = sqs.filter(cashbox_id=cashbox_id)
+                sqs3 = sqs3.filter(cashbox_id=cashbox_id)
             if cashier_id:
                 if _model_has_field(Sale, "user"):
-                    sqs = sqs.filter(user_id=cashier_id)
+                    sqs3 = sqs3.filter(user_id=cashier_id)
                 else:
-                    sqs = sqs.filter(shift__cashier_id=cashier_id)
+                    sqs3 = sqs3.filter(shift__cashier_id=cashier_id)
 
-            sqs = sqs.filter(**{f"{dt_field}__gte": period.start, f"{dt_field}__lt": period.end})
+            sqs3 = sqs3.filter(**{f"{dt_field}__gte": period.start, f"{dt_field}__lt": period.end})
 
             rows = (
-                sqs.values(
+                sqs3.values(
                     "shift__cashier_id",
                     "shift__cashier__first_name",
                     "shift__cashier__last_name",
@@ -1110,6 +1251,10 @@ class AnalyticsView(APIView):
                 "shifts_today": today_cnt,
                 "avg_duration_hours": avg_duration_hours,
                 "avg_revenue_per_shift": str(_money(avg_revenue_per_shift)),
+                "cogs_total": str(_money(cogs_total)) if cogs_total is not None else None,
+                "gross_profit_total": str(_money(gross_profit_total)) if gross_profit_total is not None else None,
+                "margin_percent_total": margin_percent_total,
+                "avg_profit_per_shift": str(_money(avg_profit_per_shift)) if avg_profit_per_shift is not None else None,
             },
             "charts": {"sales_by_shift_bucket": sales_by_shift_bucket},
             "tables": {"active_shifts": active_rows, "best_cashiers": best_cashiers},

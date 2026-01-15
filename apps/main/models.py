@@ -1510,17 +1510,46 @@ class Sale(models.Model):
 
 class SaleItem(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+
     company = models.ForeignKey(Company, on_delete=models.CASCADE, related_name="sale_items")
-    branch = models.ForeignKey(Branch, on_delete=models.CASCADE, related_name="crm_sale_items", null=True, blank=True, db_index=True)
+    branch = models.ForeignKey(
+        Branch,
+        on_delete=models.CASCADE,
+        related_name="crm_sale_items",
+        null=True,
+        blank=True,
+        db_index=True,
+    )
 
     sale = models.ForeignKey(Sale, on_delete=models.CASCADE, related_name="items")
-    product = models.ForeignKey("main.Product", blank=True, null=True, on_delete=models.SET_NULL, related_name="sale_items")
+    product = models.ForeignKey(
+        "main.Product",
+        blank=True,
+        null=True,
+        on_delete=models.SET_NULL,
+        related_name="sale_items",
+    )
 
     name_snapshot = models.CharField(max_length=255)
     barcode_snapshot = models.CharField(max_length=64, null=True, blank=True)
+
     unit_price = models.DecimalField(max_digits=12, decimal_places=2)
     quantity = models.DecimalField(max_digits=12, decimal_places=3, default=Decimal("1.000"))
 
+    # ✅ себестоимость единицы на момент продажи (для маржи)
+    purchase_price_snapshot = models.DecimalField(
+        "Себестоимость (снапшот)",
+        max_digits=12,
+        decimal_places=2,
+        default=Decimal("0.00"),
+    )
+
+    class Meta:
+        indexes = [
+            models.Index(fields=["company", "sale"]),
+            models.Index(fields=["company", "branch", "sale"]),
+            models.Index(fields=["company", "product"]),
+        ]
 
     def clean(self):
         if self.sale_id and self.company_id and self.sale.company_id != self.company_id:
@@ -1532,47 +1561,56 @@ class SaleItem(models.Model):
         if self.product_id and self.company_id and self.product.company_id != self.company_id:
             raise ValidationError({"product": "Товар принадлежит другой компании."})
 
-        # ✅ запрет 0 и минуса (для Decimal)
         if self.quantity is None or Decimal(str(self.quantity)) <= 0:
             raise ValidationError({"quantity": "Количество должно быть > 0."})
 
-        # полезно: не давать пустое имя для кастомных позиций
         if not self.product_id and not (self.name_snapshot or "").strip():
             raise ValidationError({"name_snapshot": "Укажите название позиции (если товар не выбран)."})
 
+        # себестоимость не может быть отрицательной
+        if self.purchase_price_snapshot is not None and Decimal(str(self.purchase_price_snapshot)) < 0:
+            raise ValidationError({"purchase_price_snapshot": "Себестоимость не может быть отрицательной."})
 
     def save(self, *args, **kwargs):
         if self.sale_id:
             self.company_id = self.sale.company_id
             self.branch_id = self.sale.branch_id
 
-        # заполнение снапшотов при создании
+        # снапшоты — только при создании
         if self.pk is None:
-            if (not self.name_snapshot) and self.product:
-                self.name_snapshot = self.product.name
-            if (not self.unit_price) and self.product:
-                self.unit_price = self.product.price
-            if (not self.barcode_snapshot) and self.product:
-                self.barcode_snapshot = self.product.barcode
+            if self.product_id:
+                if not (self.name_snapshot or "").strip():
+                    self.name_snapshot = self.product.name
+
+                # ✅ НЕ "not self.unit_price", а именно None
+                if self.unit_price is None:
+                    self.unit_price = self.product.price
+
+                if not (self.barcode_snapshot or "").strip():
+                    self.barcode_snapshot = self.product.barcode
+
+                # ✅ ключевое для маржи
+                if self.purchase_price_snapshot is None:
+                    self.purchase_price_snapshot = self.product.purchase_price or Decimal("0.00")
+            else:
+                # если товар не выбран — себестоимость неизвестна
+                if self.purchase_price_snapshot is None:
+                    self.purchase_price_snapshot = Decimal("0.00")
 
         self.full_clean()
         return super().save(*args, **kwargs)
 
-    def save(self, *args, **kwargs):
-        if self.sale_id:
-            self.company_id = self.sale.company_id
-            self.branch_id = self.sale.branch_id
+    @property
+    def line_total(self) -> Decimal:
+        return (Decimal(self.unit_price or 0) * Decimal(self.quantity or 0)).quantize(Decimal("0.01"))
 
-        if self.pk is None:
-            if not self.name_snapshot and self.product:
-                self.name_snapshot = self.product.name
-            if not self.unit_price and self.product:
-                self.unit_price = self.product.price
-            if not self.barcode_snapshot and self.product:
-                self.barcode_snapshot = self.product.barcode
+    @property
+    def line_cogs(self) -> Decimal:
+        return (Decimal(self.purchase_price_snapshot or 0) * Decimal(self.quantity or 0)).quantize(Decimal("0.01"))
 
-        self.full_clean()
-        return super().save(*args, **kwargs)
+    @property
+    def line_profit(self) -> Decimal:
+        return (self.line_total - self.line_cogs).quantize(Decimal("0.01"))
     
 class MobileScannerToken(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False, verbose_name="ID")
