@@ -8,10 +8,7 @@ from django_filters.rest_framework import DjangoFilterBackend
 
 from apps.users.models import Company
 from ..models import Product
-from .serializers_public import (
-    PublicCompanySerializer,
-    PublicProductSerializer,
-)
+from .serializers_public import PublicCompanySerializer, PublicProductSerializer
 
 
 class PublicCompanyAPIView(generics.RetrieveAPIView):
@@ -43,13 +40,9 @@ class PublicCompanyShowcaseAPIView(generics.ListAPIView):
 
         qs = (
             Product.objects
-            .filter(company=company, status=Product.Status.ACCEPTED)
+            .filter(company=company)  # ✅ без status фильтра
             .select_related("brand", "category")
-            .prefetch_related(
-                "images",
-                "packages",
-                "characteristics",
-            )
+            .prefetch_related("images", "packages", "characteristics")
         )
 
         branch_id = self.request.query_params.get("branch")
@@ -75,7 +68,7 @@ class PublicCompanyProductDetailAPIView(generics.RetrieveAPIView):
         company = self.get_company()
         return (
             Product.objects
-            .filter(company=company)
+            .filter(company=company)  # ✅ без status фильтра
             .select_related("brand", "category")
             .prefetch_related("images", "packages", "characteristics")
         )
