@@ -681,7 +681,7 @@ class Product(models.Model):
     )
 
     quantity = models.DecimalField(
-        "Цена закупки",
+        "Количество/Остаток",
         max_digits=12,
         decimal_places=2,
         default=0, null=True, blank=True
@@ -1541,8 +1541,11 @@ class SaleItem(models.Model):
         "Себестоимость (снапшот)",
         max_digits=12,
         decimal_places=2,
-        default=Decimal("0.00"),
+        null=True,
+        blank=True,
+        default=None,
     )
+
 
     class Meta:
         indexes = [

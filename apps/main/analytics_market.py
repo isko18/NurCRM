@@ -136,25 +136,47 @@ def _choice_value(model, enum_name: str, member: str, fallback: str) -> str:
 def _get_cogs_expr(SaleItem, ProductModel=None):
     """
     Возвращает (expr, ok). expr можно суммировать через Sum(expr).
-    Приоритет:
-    1) purchase_price_snapshot (исторично, правильно)
-    2) unit_cost/cost_price/purchase_price в SaleItem
-    3) product__purchase_price (неисторично, fallback)
-    """
 
-    # 1) ИСТОРИЧНО: snapshot на момент продажи
-    if _model_has_field(SaleItem, "purchase_price_snapshot") and _model_has_field(SaleItem, "quantity"):
-        return ExpressionWrapper(F("quantity") * F("purchase_price_snapshot"), output_field=MONEY_FIELD), True
+    Логика:
+    1) Если есть purchase_price_snapshot -> берём его, но делаем fallback на product.purchase_price
+       (чтобы старые строки / незаполненные snapshot не давали 100% маржу).
+    2) Если есть unit_cost/cost_price/purchase_price/buy_price в SaleItem -> используем их.
+    3) Иначе fallback на product.purchase_price (неисторично, но лучше чем 0).
+    """
+    if not _model_has_field(SaleItem, "quantity"):
+        return None, False
+
+    # 1) snapshot + fallback на product.purchase_price
+    if _model_has_field(SaleItem, "purchase_price_snapshot"):
+        has_product_fk = _model_has_field(SaleItem, "product")
+        has_product_purchase = (
+            ProductModel is not None
+            and _model_has_field(ProductModel, "purchase_price")
+            and has_product_fk
+        )
+
+        if has_product_purchase:
+            unit_cost = Coalesce(
+                F("purchase_price_snapshot"),
+                F("product__purchase_price"),
+                Value(Z_MONEY, output_field=MONEY_FIELD),
+            )
+        else:
+            unit_cost = Coalesce(
+                F("purchase_price_snapshot"),
+                Value(Z_MONEY, output_field=MONEY_FIELD),
+            )
+
+        return ExpressionWrapper(F("quantity") * unit_cost, output_field=MONEY_FIELD), True
 
     # 2) другие варианты unit себестоимости
     for f in ("unit_cost", "cost_price", "purchase_price", "buy_price"):
-        if _model_has_field(SaleItem, f) and _model_has_field(SaleItem, "quantity"):
+        if _model_has_field(SaleItem, f):
             return ExpressionWrapper(F("quantity") * F(f), output_field=MONEY_FIELD), True
 
-    # 3) fallback через Product.purchase_price (может "врать" задним числом)
-    if ProductModel is not None and _model_has_field(SaleItem, "product") and _model_has_field(SaleItem, "quantity"):
-        if _model_has_field(ProductModel, "purchase_price"):
-            return ExpressionWrapper(F("quantity") * F("product__purchase_price"), output_field=MONEY_FIELD), True
+    # 3) fallback через Product.purchase_price
+    if ProductModel is not None and _model_has_field(SaleItem, "product") and _model_has_field(ProductModel, "purchase_price"):
+        return ExpressionWrapper(F("quantity") * F("product__purchase_price"), output_field=MONEY_FIELD), True
 
     return None, False
 
@@ -405,7 +427,6 @@ class AnalyticsView(APIView):
         branch = _get_active_branch(request)
         period = _get_period(request)
 
-        # ===== caching (per tab + query) =====
         company_id = str(getattr(company, "id", ""))
         branch_id = str(getattr(branch, "id", "")) if branch else None
         qhash = self._cache_hash_from_query(request)
@@ -443,6 +464,7 @@ class AnalyticsView(APIView):
         cogs = None
         gross_profit = None
         margin_percent = None
+        cogs_warning = None
 
         Sale, SaleItem = get_sale_models()
         if Sale is not None:
@@ -493,6 +515,9 @@ class AnalyticsView(APIView):
 
                     cogs, gross_profit, margin_percent = _calc_margin_pack(revenue, cogs_val)
 
+            if _money(revenue) > 0 and _money(cogs or Z_MONEY) == 0:
+                cogs_warning = "Себестоимость не заполнена (маржа может быть некорректной)."
+
             if _model_has_field(Sale, "client"):
                 clients = qs.values("client_id").exclude(client_id__isnull=True).distinct().count()
             else:
@@ -512,7 +537,6 @@ class AnalyticsView(APIView):
             )
             daily = [{"date": r["d"].isoformat(), "value": str(_money(r["v"]))} for r in daily_rows if r["d"]]
 
-            # top products (фикс mixed types)
             if SaleItem is not None and _model_has_field(SaleItem, "sale"):
                 item_qs = SaleItem.objects.filter(sale__in=qs)
 
@@ -581,6 +605,7 @@ class AnalyticsView(APIView):
                 "cogs": str(_money(cogs)) if cogs is not None else None,
                 "gross_profit": str(_money(gross_profit)) if gross_profit is not None else None,
                 "margin_percent": margin_percent,
+                "cogs_warning": cogs_warning,
             },
             "charts": {"sales_dynamics": daily},
             "tables": {"top_products": top_products, "documents": documents},
@@ -619,7 +644,6 @@ class AnalyticsView(APIView):
                 else:
                     pqs = pqs.filter(branch=branch)
 
-            # extra filters
             product_id = request.query_params.get("product")
             category_id = request.query_params.get("category")
             kind = request.query_params.get("kind")
@@ -647,10 +671,7 @@ class AnalyticsView(APIView):
 
             if qty_field and (pp_field or price_field):
                 mul_field = pp_field or price_field
-                inv_expr = ExpressionWrapper(
-                    F(qty_field) * F(mul_field),
-                    output_field=MONEY_FIELD,
-                )
+                inv_expr = ExpressionWrapper(F(qty_field) * F(mul_field), output_field=MONEY_FIELD)
                 inventory_value = (
                     pqs.aggregate(
                         v=Coalesce(
@@ -662,7 +683,6 @@ class AnalyticsView(APIView):
                     or Z_MONEY
                 )
 
-            # min stock field
             min_field = None
             for f in ("min_quantity", "min_stock", "reorder_level", "minimum_quantity"):
                 if _model_has_field(Product, f):
@@ -675,7 +695,6 @@ class AnalyticsView(APIView):
                 else:
                     low_qs = pqs.filter(**{f"{qty_field}__lte": 5})
 
-                # low_only=1 → показывать только low
                 low_only = (request.query_params.get("low_only") or "").strip() in ("1", "true", "yes", "on")
                 if low_only:
                     pqs = low_qs
@@ -719,7 +738,6 @@ class AnalyticsView(APIView):
                     for r in rows
                 ]
 
-        # movement: units sold by day (Decimal-safe)
         Sale, SaleItem = get_sale_models()
         if Sale is not None and SaleItem is not None and _model_has_field(SaleItem, "quantity"):
             paid_value = _choice_value(Sale, "Status", "PAID", "paid")
@@ -754,7 +772,6 @@ class AnalyticsView(APIView):
                 for r in rows if r["d"]
             ]
 
-            # turnover_days (примерно)
             if inventory_value and inventory_value > Decimal("0"):
                 rev = sqs.aggregate(
                     v=Coalesce(
@@ -807,6 +824,7 @@ class AnalyticsView(APIView):
         cogs = None
         gross_profit = None
         margin_percent = None
+        cogs_warning = None
 
         hourly = []
         pay_pie = []
@@ -841,7 +859,6 @@ class AnalyticsView(APIView):
             tx = agg["tx"] or 0
             avg_check = _safe_div(_money(revenue), tx)
 
-            # ── margin (COGS / Profit / Margin%) ──
             if SaleItem is not None and _model_has_field(SaleItem, "sale"):
                 ProductModel = None
                 try:
@@ -861,6 +878,9 @@ class AnalyticsView(APIView):
                     )["v"] or Z_MONEY
 
                     cogs, gross_profit, margin_percent = _calc_margin_pack(revenue, cogs_val)
+
+            if _money(revenue) > 0 and _money(cogs or Z_MONEY) == 0:
+                cogs_warning = "Себестоимость не заполнена (маржа может быть некорректной)."
 
             pm_field = "payment_method" if _model_has_field(Sale, "payment_method") else None
             if pm_field:
@@ -913,11 +933,7 @@ class AnalyticsView(APIView):
                 .order_by("h")
             )
             hourly = [
-                {
-                    "hour": int(r["h"]) if r["h"] is not None else 0,
-                    "revenue": str(_money(r["v"])),
-                    "transactions": int(r["cnt"]),
-                }
+                {"hour": int(r["h"]) if r["h"] is not None else 0, "revenue": str(_money(r["v"])), "transactions": int(r["cnt"])}
                 for r in hour_rows
             ]
 
@@ -955,6 +971,7 @@ class AnalyticsView(APIView):
                 "cogs": str(_money(cogs)) if cogs is not None else None,
                 "gross_profit": str(_money(gross_profit)) if gross_profit is not None else None,
                 "margin_percent": margin_percent,
+                "cogs_warning": cogs_warning,
             },
             "charts": {
                 "sales_by_hours": hourly,
@@ -974,7 +991,7 @@ class AnalyticsView(APIView):
         qp = request.query_params
         cashbox_id = qp.get("cashbox") or None
         cashier_id = qp.get("cashier") or None
-        status = (qp.get("status") or "").lower() or None  # open|closed|None
+        status = (qp.get("status") or "").lower() or None
 
         qs = CashShift.objects.filter(company=company)
         if branch is not None:
@@ -987,7 +1004,6 @@ class AnalyticsView(APIView):
         if status in ("open", "closed"):
             qs = qs.filter(status=status)
 
-        # cards
         active_cnt = qs.filter(status=CashShift.Status.OPEN).count()
 
         today = timezone.localdate()
@@ -1009,14 +1025,14 @@ class AnalyticsView(APIView):
 
         Sale, SaleItem = get_sale_models()
 
-        # revenue total for period (avg_revenue_per_shift)
         revenue_total = Z_MONEY
         cogs_total = None
         gross_profit_total = None
         margin_percent_total = None
         avg_profit_per_shift = None
+        cogs_warning = None
 
-        sqs = None  # понадобится для расчетов
+        sqs = None
 
         if Sale is not None and _model_has_field(Sale, "shift"):
             paid_value = _choice_value(Sale, "Status", "PAID", "paid")
@@ -1048,7 +1064,6 @@ class AnalyticsView(APIView):
                 )
             )["v"] or Z_MONEY
 
-            # ── margin totals for shifts period ──
             if SaleItem is not None and _model_has_field(SaleItem, "sale") and sqs is not None:
                 ProductModel = None
                 try:
@@ -1069,13 +1084,15 @@ class AnalyticsView(APIView):
 
                     cogs_total, gross_profit_total, margin_percent_total = _calc_margin_pack(revenue_total, cogs_val)
 
+            if _money(revenue_total) > 0 and _money(cogs_total or Z_MONEY) == 0:
+                cogs_warning = "Себестоимость не заполнена (маржа может быть некорректной)."
+
         shifts_cnt = period_qs.count() or 1
         avg_revenue_per_shift = _safe_div(_money(revenue_total), shifts_cnt)
 
         if gross_profit_total is not None:
             avg_profit_per_shift = _safe_div(_money(gross_profit_total), shifts_cnt)
 
-        # bucket revenue by shift open time
         def bucket(h: int) -> str:
             if 6 <= h < 12:
                 return "morning"
@@ -1125,7 +1142,6 @@ class AnalyticsView(APIView):
             {"name": "Вечер", "key": "evening", "revenue": str(_money(bucket_map["evening"]["revenue"])), "transactions": bucket_map["evening"]["transactions"]},
         ]
 
-        # active shifts table + sales per active shift
         active_rows = []
         act_qs = CashShift.objects.filter(company=company, status=CashShift.Status.OPEN)
         if branch is not None:
@@ -1174,7 +1190,6 @@ class AnalyticsView(APIView):
                 "status": "open",
             })
 
-        # best cashiers
         best_cashiers = []
         if Sale is not None and _model_has_field(Sale, "shift"):
             paid_value = _choice_value(Sale, "Status", "PAID", "paid")
@@ -1255,6 +1270,7 @@ class AnalyticsView(APIView):
                 "gross_profit_total": str(_money(gross_profit_total)) if gross_profit_total is not None else None,
                 "margin_percent_total": margin_percent_total,
                 "avg_profit_per_shift": str(_money(avg_profit_per_shift)) if avg_profit_per_shift is not None else None,
+                "cogs_warning": cogs_warning,
             },
             "charts": {"sales_by_shift_bucket": sales_by_shift_bucket},
             "tables": {"active_shifts": active_rows, "best_cashiers": best_cashiers},
