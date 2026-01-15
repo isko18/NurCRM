@@ -631,7 +631,7 @@ class CompanySerializer(serializers.ModelSerializer):
         model = Company
         fields = [
             "id", "name","slug",
-            "industry", "sector", "subscription_plan",
+            "industry", "sector", "phone", "phones_howcase", "subscription_plan",
             "owner",
             "created_at", "start_date", "end_date",
             "can_view_documents", "can_view_whatsapp", "can_view_instagram", "can_view_telegram",

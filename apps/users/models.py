@@ -85,6 +85,8 @@ class Company(models.Model):
     subscription_plan = models.ForeignKey("SubscriptionPlan", on_delete=models.SET_NULL, null=True, blank=True)
     industry = models.ForeignKey("Industry", on_delete=models.SET_NULL, null=True, blank=True, verbose_name="Вид деятельности")
     sector = models.ForeignKey("Sector", on_delete=models.SET_NULL, null=True, blank=True, verbose_name="Отрасль")
+    phone = models.CharField(max_length=60, verbose_name="Номер телефона")
+    phones_howcase = models.CharField(max_length=60, verbose_name="Номер для обращения по витрине")
 
     owner = models.OneToOneField("User", on_delete=models.CASCADE, related_name="owned_company", verbose_name="Владелец компании")
 
