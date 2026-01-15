@@ -1,6 +1,7 @@
 # apps/cafe/serializers.py
 from django.contrib.auth import get_user_model
 from django.db.models import Q
+from decimal import Decimal
 from rest_framework import serializers
 from django.core.exceptions import ValidationError as DjangoValidationError
 from django.db import transaction
@@ -422,6 +423,7 @@ class OrderHistorySerializer(serializers.ModelSerializer):
             "id", "original_order_id", "company", "branch", "client",
             "table", "table_number", "waiter", "waiter_label",
             "guests", "created_at", "archived_at", "items",
+              "status","is_paid","paid_at","payment_method","total_amount","discount_amount", "items"
         ]
         read_only_fields = fields
 
@@ -451,8 +453,12 @@ class OrderSerializer(CompanyBranchReadOnlyMixin):
     class Meta:
         ref_name = "CafeOrder"
         model = Order
-        fields = ["id", "company", "branch", "table", "client", "waiter", "guests", "created_at", "items"]
-        read_only_fields = ["id", "company", "branch", "created_at"]
+        fields = [
+        "id","company","branch","table","client","waiter","guests","created_at",
+        "status","is_paid","paid_at","payment_method","total_amount","discount_amount",
+        "items"
+        ]
+        read_only_fields = ["status","is_paid","paid_at","payment_method","total_amount","discount_amount"]
 
     def get_fields(self):
         fields = super().get_fields()
@@ -514,6 +520,22 @@ class OrderSerializer(CompanyBranchReadOnlyMixin):
                     self._upsert_items(instance, items)
         return instance
     
+
+class OrderPaySerializer(serializers.Serializer):
+    payment_method = serializers.ChoiceField(
+        choices=[("cash", "cash"), ("card", "card"), ("transfer", "transfer")],
+        required=False,
+        default="cash",
+    )
+    discount_amount = serializers.DecimalField(max_digits=12, decimal_places=2, required=False, default=Decimal("0"))
+    close_order = serializers.BooleanField(required=False, default=True)
+
+    def validate_discount_amount(self, v):
+        if v is None:
+            return Decimal("0")
+        if v < 0:
+            raise serializers.ValidationError("discount_amount не может быть отрицательным.")
+        return v
 
 class InventoryItemSerializer(serializers.ModelSerializer):
     product_title = serializers.CharField(source="product.title", read_only=True)

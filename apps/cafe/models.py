@@ -10,6 +10,7 @@ from django.core.validators import MinValueValidator
 from PIL import Image, ImageOps
 import io, uuid
 from decimal import Decimal
+from django.db import IntegrityError
 
 from apps.users.models import Company, Branch
 
@@ -647,6 +648,11 @@ class Ingredient(models.Model):
 # Заказы
 # ==========================
 class Order(models.Model):
+    class Status(models.TextChoices):
+        OPEN = "open", "Открыт"
+        CLOSED = "closed", "Закрыт"
+        CANCELLED = "cancelled", "Отменен"
+        
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     company = models.ForeignKey(
         Company, on_delete=models.CASCADE, related_name='cafe_orders', verbose_name='Компания'
@@ -668,6 +674,18 @@ class Order(models.Model):
     )
     guests = models.PositiveIntegerField('Количество гостей', default=1, validators=[MinValueValidator(1)])
     created_at = models.DateTimeField('Создано', auto_now_add=True)
+    status = models.CharField(
+        "Статус", max_length=16, choices=Status.choices, default=Status.OPEN, db_index=True
+    )
+
+    is_paid = models.BooleanField("Оплачен", default=False, db_index=True)
+    paid_at = models.DateTimeField("Оплачен в", null=True, blank=True)
+    payment_method = models.CharField("Способ оплаты", max_length=32, blank=True, default="")
+
+    total_amount = models.DecimalField("Сумма", max_digits=12, decimal_places=2, default=Decimal("0"))
+    discount_amount = models.DecimalField("Скидка", max_digits=12, decimal_places=2, default=Decimal("0"))
+
+    updated_at = models.DateTimeField("Обновлено", auto_now=True)
 
     class Meta:
         verbose_name = 'Заказ'
@@ -681,7 +699,14 @@ class Order(models.Model):
 
     def __str__(self):
         return f'Order {str(self.id)[:8]} — {self.table}'
-
+    
+    def recalc_total(self):
+        total = Decimal("0")
+        for it in self.items.select_related("menu_item").all():
+            total += (it.menu_item.price or Decimal("0")) * Decimal(it.quantity or 0)
+        self.total_amount = total
+        return total
+    
     def clean(self):
         if self.company_id:
             if self.table and self.table.company_id != self.company_id:
@@ -742,6 +767,11 @@ class OrderItem(models.Model):
 # Архив заказов (сохраняем историю при удалении)
 # ==========================
 class OrderHistory(models.Model):
+    STATUS_CHOICES = [
+        ("open", "Открыт"),
+        ("closed", "Закрыт"),
+        ("cancelled", "Отменен"),
+    ]
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     company = models.ForeignKey(
         Company, on_delete=models.CASCADE, related_name='cafe_order_history', verbose_name='Компания'
@@ -769,6 +799,12 @@ class OrderHistory(models.Model):
     guests = models.PositiveIntegerField('Гостей', default=1)
     created_at = models.DateTimeField('Создано (в заказе)')
     archived_at = models.DateTimeField('Архивировано', auto_now_add=True)
+    status = models.CharField(max_length=16, choices=STATUS_CHOICES, default="closed", db_index=True)
+    is_paid = models.BooleanField(default=False, db_index=True)
+    paid_at = models.DateTimeField(null=True, blank=True)
+    payment_method = models.CharField(max_length=32, blank=True, default="")
+    total_amount = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal("0"))
+    discount_amount = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal("0"))
 
     class Meta:
         verbose_name = 'Архив заказа'
@@ -813,25 +849,38 @@ class OrderItemHistory(models.Model):
 @receiver(pre_delete, sender=Order)
 def archive_order_before_delete(sender, instance: Order, **kwargs):
     with transaction.atomic():
+        # если уже архив есть — просто выходим
+        if OrderHistory.objects.filter(original_order_id=instance.id).exists():
+            return
+
         waiter_label = ""
         if instance.waiter_id:
             full = getattr(instance.waiter, "get_full_name", lambda: "")() or ""
             email = getattr(instance.waiter, "email", "") or ""
             waiter_label = full or email or str(instance.waiter_id)
 
-        oh = OrderHistory.objects.create(
-            company=instance.company,
-            branch=instance.branch,
-            client=instance.client,
-            original_order_id=instance.id,
-            table=instance.table,
-            table_number=(instance.table.number if instance.table_id else None),
-            waiter=instance.waiter,
-            waiter_label=waiter_label,
-            guests=instance.guests,
-            created_at=instance.created_at,
-            archived_at=timezone.now(),
-        )
+        try:
+            oh = OrderHistory.objects.create(
+                company=instance.company,
+                branch=instance.branch,
+                client=instance.client,
+                original_order_id=instance.id,
+                table=instance.table,
+                table_number=(instance.table.number if instance.table_id else None),
+                waiter=instance.waiter,
+                waiter_label=waiter_label,
+                guests=instance.guests,
+                created_at=instance.created_at,
+                archived_at=timezone.now(),
+                status=instance.status,
+                is_paid=instance.is_paid,
+                paid_at=instance.paid_at,
+                payment_method=instance.payment_method,
+                total_amount=instance.total_amount,
+                discount_amount=instance.discount_amount,
+            )
+        except IntegrityError:
+            return
 
         items = [
             OrderItemHistory(
