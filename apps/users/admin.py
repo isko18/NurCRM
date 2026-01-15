@@ -1,14 +1,20 @@
+# apps/users/admin.py
 from django.contrib import admin
 from django.contrib.auth.admin import UserAdmin as BaseUserAdmin
 from django.db import models as dj_models
 
 from .models import (
-    User, Company, Branch, BranchMembership,
-    Feature, SubscriptionPlan, Sector, Industry, CustomRole,
+    User,
+    Company,
+    Branch,
+    BranchMembership,
+    Feature,
+    SubscriptionPlan,
+    Sector,
+    Industry,
+    CustomRole,
     ScaleDevice,
 )
-
-# -------------------- Вспомогательный миксин --------------------
 
 
 class CompanyScopedFKMixin:
@@ -17,38 +23,28 @@ class CompanyScopedFKMixin:
     Также ограничивает связанные user/branch тем же контекстом компании.
     """
 
+    def _get_user_company(self, request):
+        # Если юзер = владелец компании: owned_company
+        # Если сотрудник: company
+        return getattr(request.user, "company", None) or getattr(request.user, "owned_company", None)
+
     def formfield_for_foreignkey(self, db_field, request, **kwargs):
         if not request.user.is_superuser:
-            user_company = getattr(request.user, "company", None) or getattr(
-                request.user, "owned_company", None
-            )
+            user_company = self._get_user_company(request)
 
             if db_field.name == "company":
-                kwargs["queryset"] = (
-                    Company.objects.filter(id=user_company.id)
-                    if user_company
-                    else Company.objects.none()
-                )
+                kwargs["queryset"] = Company.objects.filter(id=user_company.id) if user_company else Company.objects.none()
 
             if db_field.name == "user":
-                kwargs["queryset"] = (
-                    User.objects.filter(company=user_company)
-                    if user_company
-                    else User.objects.none()
-                )
+                kwargs["queryset"] = User.objects.filter(company=user_company) if user_company else User.objects.none()
 
             if db_field.name == "branch":
-                kwargs["queryset"] = (
-                    Branch.objects.filter(company=user_company)
-                    if user_company
-                    else Branch.objects.none()
-                )
+                kwargs["queryset"] = Branch.objects.filter(company=user_company) if user_company else Branch.objects.none()
 
         return super().formfield_for_foreignkey(db_field, request, **kwargs)
 
 
 # -------------------- Константы групп прав пользователя --------------------
-
 
 BASE_PERMS = (
     "can_view_dashboard",
@@ -119,10 +115,13 @@ EXTRA_PERMS = (
     "can_view_branch",
     "can_view_logistics",
     "can_view_request",
+    "can_view_shifts",
+    "can_view_cashier",
+    "can_view_market_label",
 )
 
-# -------------------- Inlines --------------------
 
+# -------------------- Inlines --------------------
 
 class BranchMembershipInlineForUser(admin.TabularInline):
     model = BranchMembership
@@ -143,7 +142,6 @@ class BranchMembershipInlineForBranch(admin.TabularInline):
 
 
 # -------------------- User --------------------
-
 
 @admin.register(User)
 class UserAdmin(CompanyScopedFKMixin, BaseUserAdmin):
@@ -237,7 +235,6 @@ class UserAdmin(CompanyScopedFKMixin, BaseUserAdmin):
     )
 
     def get_form(self, request, obj=None, **kwargs):
-        # Пароль необязателен при редактировании
         form = super().get_form(request, obj, **kwargs)
         if obj is not None and "password" in form.base_fields:
             form.base_fields["password"].required = False
@@ -251,13 +248,8 @@ class UserAdmin(CompanyScopedFKMixin, BaseUserAdmin):
                     setattr(obj, f.name, True)
         super().save_model(request, obj, form, change)
 
-    # ---- отображение филиалов в списке ----
     def primary_branch_display(self, obj):
-        mb = (
-            obj.branch_memberships.filter(is_primary=True)
-            .select_related("branch")
-            .first()
-        )
+        mb = obj.branch_memberships.filter(is_primary=True).select_related("branch").first()
         return mb.branch.name if mb and mb.branch else "-"
 
     primary_branch_display.short_description = "Основной филиал"
@@ -275,12 +267,14 @@ class UserAdmin(CompanyScopedFKMixin, BaseUserAdmin):
 
 # -------------------- Company --------------------
 
-
 @admin.register(Company)
 class CompanyAdmin(admin.ModelAdmin):
     list_display = (
         "name",
+        "slug",
         "owner",
+        "phone",
+        "phones_howcase",
         "subscription_plan",
         "industry",
         "sector",
@@ -301,7 +295,7 @@ class CompanyAdmin(admin.ModelAdmin):
         "can_view_instagram",
         "can_view_telegram",
     )
-    search_fields = ("name", "owner__email", "llc", "inn", "address")
+    search_fields = ("name", "slug", "owner__email", "phone", "phones_howcase", "llc", "inn", "address")
     readonly_fields = ("created_at",)
     autocomplete_fields = ("owner", "subscription_plan", "industry", "sector")
 
@@ -311,6 +305,9 @@ class CompanyAdmin(admin.ModelAdmin):
             {
                 "fields": (
                     "name",
+                    "slug",
+                    "phone",
+                    "phones_howcase",
                     "owner",
                     "subscription_plan",
                     "industry",
@@ -338,7 +335,6 @@ class CompanyAdmin(admin.ModelAdmin):
 
 
 # -------------------- Branch --------------------
-
 
 @admin.register(Branch)
 class BranchAdmin(CompanyScopedFKMixin, admin.ModelAdmin):
@@ -371,24 +367,16 @@ class BranchAdmin(CompanyScopedFKMixin, admin.ModelAdmin):
 
 # -------------------- BranchMembership --------------------
 
-
 @admin.register(BranchMembership)
 class BranchMembershipAdmin(CompanyScopedFKMixin, admin.ModelAdmin):
     list_display = ("user", "branch", "role", "is_primary", "created_at")
     list_filter = ("is_primary", "branch__company")
-    search_fields = (
-        "user__email",
-        "user__first_name",
-        "user__last_name",
-        "branch__name",
-        "role",
-    )
+    search_fields = ("user__email", "user__first_name", "user__last_name", "branch__name", "role")
     readonly_fields = ("created_at",)
     autocomplete_fields = ("user", "branch")
 
 
 # -------------------- Feature / SubscriptionPlan --------------------
-
 
 @admin.register(Feature)
 class FeatureAdmin(admin.ModelAdmin):
@@ -398,11 +386,7 @@ class FeatureAdmin(admin.ModelAdmin):
     def description_short(self, obj):
         if not obj.description:
             return "-"
-        return (
-            obj.description[:80] + "…"
-            if len(obj.description) > 80
-            else obj.description
-        )
+        return (obj.description[:80] + "…") if len(obj.description) > 80 else obj.description
 
     description_short.short_description = "Описание"
 
@@ -424,7 +408,6 @@ class SubscriptionPlanAdmin(admin.ModelAdmin):
 
 
 # -------------------- Sector / Industry --------------------
-
 
 @admin.register(Sector)
 class SectorAdmin(admin.ModelAdmin):
@@ -450,7 +433,6 @@ class IndustryAdmin(admin.ModelAdmin):
 
 # -------------------- CustomRole --------------------
 
-
 @admin.register(CustomRole)
 class CustomRoleAdmin(CompanyScopedFKMixin, admin.ModelAdmin):
     list_display = ("name", "company")
@@ -460,7 +442,6 @@ class CustomRoleAdmin(CompanyScopedFKMixin, admin.ModelAdmin):
 
 
 # -------------------- ScaleDevice --------------------
-
 
 @admin.register(ScaleDevice)
 class ScaleDeviceAdmin(CompanyScopedFKMixin, admin.ModelAdmin):
