@@ -309,6 +309,11 @@ def build_agent_analytics_payload(
     ]
 
     # ---------------- 2) продажи по датам (FIX mixed types) ----------------
+    items_qs = SaleItem.objects.filter(sale__in=sales_qs)
+
+    qty_expr = ExpressionWrapper(F("quantity"), output_field=QTY_FIELD)
+    revenue_expr = ExpressionWrapper(F("quantity") * F("unit_price"), output_field=MONEY_FIELD)
+
     sales_by_date_qs = (
         items_qs
         .annotate(day=TruncDate("sale__created_at"))
@@ -337,6 +342,7 @@ def build_agent_analytics_payload(
         }
         for row in sales_by_date_qs
     ]
+
 
     # ---------------- 3) распределение по товарам ----------------
     sales_distribution_by_product = []
