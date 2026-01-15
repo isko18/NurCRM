@@ -1,18 +1,22 @@
 # apps/cafe/views.py
-from rest_framework import generics, permissions, filters, status
-from rest_framework.views import APIView
-from rest_framework.response import Response
+from decimal import Decimal
 
-from django_filters.rest_framework import DjangoFilterBackend
+from django.db import transaction
 from django.db.models import Q, Count, Avg, ExpressionWrapper, DurationField, F
 from django.utils import timezone
-from django.db import transaction
+from django_filters.rest_framework import DjangoFilterBackend
+from rest_framework import filters, generics, permissions, status
+from rest_framework.response import Response
+from rest_framework.views import APIView
 
+from apps.users.models import Branch
 from .models import (
     Zone, Table, Booking, Warehouse, Purchase,
     Category, MenuItem, Ingredient,
     Order, OrderItem, CafeClient,
-    OrderHistory, KitchenTask, NotificationCafe, InventorySession, Equipment, EquipmentInventorySession, Kitchen
+    OrderHistory, OrderItemHistory,
+    KitchenTask, NotificationCafe,
+    InventorySession, Equipment, EquipmentInventorySession, Kitchen
 )
 from .serializers import (
     ZoneSerializer, TableSerializer, BookingSerializer,
@@ -21,11 +25,11 @@ from .serializers import (
     OrderSerializer, OrderItemInlineSerializer,
     CafeClientSerializer,
     OrderHistorySerializer,
-    KitchenTaskSerializer, NotificationCafeSerializer, InventorySessionSerializer, EquipmentSerializer, EquipmentInventorySessionSerializer, KitchenSerializer
+    KitchenTaskSerializer, NotificationCafeSerializer,
+    InventorySessionSerializer, EquipmentSerializer,
+    EquipmentInventorySessionSerializer, KitchenSerializer,
+    OrderPaySerializer
 )
-
-from apps.users.models import Branch
-
 
 try:
     from apps.users.permissions import IsCompanyOwnerOrAdmin
@@ -39,8 +43,6 @@ except Exception:
 # --------- company + branch (как в барбере/букинге) ---------
 class CompanyBranchQuerysetMixin:
     permission_classes = [permissions.IsAuthenticated]
-
-    # --- helpers ---
 
     def _user(self):
         return getattr(self.request, "user", None)
@@ -59,7 +61,6 @@ class CompanyBranchQuerysetMixin:
         if company:
             return company
 
-        # fallback: если компания только через филиал пользователя
         br = getattr(u, "branch", None)
         if br is not None:
             return getattr(br, "company", None)
@@ -86,7 +87,6 @@ class CompanyBranchQuerysetMixin:
 
         company_id = getattr(company, "id", None)
 
-        # 1) primary_branch: метод или атрибут
         primary = getattr(user, "primary_branch", None)
         if callable(primary):
             try:
@@ -99,13 +99,11 @@ class CompanyBranchQuerysetMixin:
         if primary and not callable(primary) and getattr(primary, "company_id", None) == company_id:
             return primary
 
-        # 2) user.branch
         if hasattr(user, "branch"):
             b = getattr(user, "branch")
             if b and getattr(b, "company_id", None) == company_id:
                 return b
 
-        # 3) единственный филиал в branch_ids
         branch_ids = getattr(user, "branch_ids", None)
         if isinstance(branch_ids, (list, tuple)) and len(branch_ids) == 1:
             try:
@@ -133,13 +131,11 @@ class CompanyBranchQuerysetMixin:
 
         company_id = getattr(company, "id", None)
 
-        # 1) жёсткий филиал
         fixed = self._fixed_branch_from_user(company)
         if fixed is not None:
             setattr(request, "branch", fixed)
             return fixed
 
-        # 2) если жёсткого нет — разрешаем ?branch
         branch_id = None
         if hasattr(request, "query_params"):
             branch_id = request.query_params.get("branch")
@@ -152,14 +148,10 @@ class CompanyBranchQuerysetMixin:
                 setattr(request, "branch", br)
                 return br
             except (Branch.DoesNotExist, ValueError):
-                # чужой/битый UUID — игнорируем
                 pass
 
-        # 3) никакого филиала → None (вся компания)
         setattr(request, "branch", None)
         return None
-
-    # --- queryset / save hooks ---
 
     def get_queryset(self):
         qs = super().get_queryset()
@@ -167,18 +159,15 @@ class CompanyBranchQuerysetMixin:
         if not company:
             return qs.none()
 
-        # фильтруем по компании, если поле есть
         if self._model_has_field(qs, "company"):
             qs = qs.filter(company=company)
 
-        # если у модели есть поле branch — применяем НОВУЮ логику
+        # ВНИМАНИЕ: текущая логика — "жёстко только филиал" для branch-моделей.
+        # История заказов обходит это ограничение (см. OrderHistoryListView/ClientOrderHistoryListView).
         if self._model_has_field(qs, "branch"):
             active_branch = self._active_branch()
-
             if active_branch is not None:
-                # пользователь привязан к филиалу → ТОЛЬКО этот филиал
                 qs = qs.filter(branch=active_branch)
-            # если филиала нет → НЕ ограничиваем по branch (вся компания)
 
         return qs
 
@@ -187,7 +176,6 @@ class CompanyBranchQuerysetMixin:
         if not company:
             raise permissions.PermissionDenied("У пользователя не задана компания.")
 
-        # определяем поля модели
         try:
             model_fields = set(f.name for f in serializer.Meta.model._meta.get_fields())
         except Exception:
@@ -198,9 +186,7 @@ class CompanyBranchQuerysetMixin:
         if "branch" in model_fields:
             active_branch = self._active_branch()
             if active_branch is not None:
-                # если у сотрудника есть филиал — жёстко пишем его
                 kwargs["branch"] = active_branch
-            # если филиал не определён — branch не трогаем (можно создавать глобальные/любые по логике сериализатора)
 
         serializer.save(**kwargs)
 
@@ -208,9 +194,8 @@ class CompanyBranchQuerysetMixin:
         company = self._user_company()
         if not company:
             raise permissions.PermissionDenied("У пользователя не задана компания.")
-
-        # company фиксируем, branch не трогаем (чтобы не переносить записи между филиалами)
         serializer.save(company=company)
+
 
 # ==================== CafeClient ====================
 class CafeClientListCreateView(CompanyBranchQuerysetMixin, generics.ListCreateAPIView):
@@ -233,9 +218,11 @@ class ClientOrderListCreateView(CompanyBranchQuerysetMixin, generics.ListCreateA
     GET  — список заказов клиента
     POST — создать заказ этому клиенту (company и client проставляются автоматически)
     """
-    queryset = (Order.objects
-                .select_related("table", "waiter", "company", "client")
-                .prefetch_related("items__menu_item"))
+    queryset = (
+        Order.objects
+        .select_related("table", "waiter", "company", "client")
+        .prefetch_related("items__menu_item")
+    )
     serializer_class = OrderSerializer
     filter_backends = [DjangoFilterBackend, filters.OrderingFilter]
     filterset_fields = ["table", "waiter", "guests", "created_at"]
@@ -246,12 +233,10 @@ class ClientOrderListCreateView(CompanyBranchQuerysetMixin, generics.ListCreateA
         return generics.get_object_or_404(CafeClient, pk=self.kwargs["pk"], company=company)
 
     def get_queryset(self):
-        # базовый get_queryset уже отфильтровал company + branch/global
         return super().get_queryset().filter(client=self._get_client())
 
     def perform_create(self, serializer):
         client = self._get_client()
-        # company/branch поставит миксин; закрепим клиента и компанию явно
         super().perform_create(serializer)
         serializer.instance.client = client
         serializer.instance.company = client.company
@@ -263,25 +248,33 @@ class ClientOrderHistoryListView(CompanyBranchQuerysetMixin, generics.ListAPIVie
     """
     /cafe/clients/<uuid:pk>/orders/history/
     История (архив) заказов конкретного клиента в рамках компании пользователя.
+
+    ВАЖНО: здесь НЕ используем super().get_queryset(), потому что миксин
+    режет branch до "только branch=active_branch" и убивает global-историю.
     """
-    queryset = (OrderHistory.objects
-                .select_related("client", "table", "waiter", "company"))
     serializer_class = OrderHistorySerializer
     filter_backends = [DjangoFilterBackend, filters.OrderingFilter]
     filterset_fields = ["table", "waiter", "created_at", "archived_at", "guests"]
     ordering_fields = ["created_at", "archived_at", "id"]
 
     def get_queryset(self):
-        qs = super().get_queryset()
         company = self._user_company()
+        if not company:
+            return OrderHistory.objects.none()
+
         client = generics.get_object_or_404(CafeClient, pk=self.kwargs["pk"], company=company)
-        # учтём филиал: у OrderHistory есть поле branch
+
+        qs = (
+            OrderHistory.objects
+            .select_related("client", "table", "waiter", "company")
+            .filter(company=company, client=client)
+        )
+
         active_branch = self._active_branch()
         if active_branch is not None:
             qs = qs.filter(Q(branch=active_branch) | Q(branch__isnull=True))
-        else:
-            qs = qs.filter(branch__isnull=True)
-        return qs.filter(client=client).order_by("-created_at")
+
+        return qs.order_by("-created_at")
 
 
 # -------- Общая история заказов по компании --------
@@ -289,9 +282,10 @@ class OrderHistoryListView(CompanyBranchQuerysetMixin, generics.ListAPIView):
     """
     /cafe/orders/history/
     История (архив) всех заказов компании.
+
+    ВАЖНО: здесь НЕ используем super().get_queryset() по той же причине:
+    миксин "жёстко только филиал" убивает global-историю и/или историю других филиалов.
     """
-    queryset = (OrderHistory.objects
-                .select_related("client", "table", "waiter", "company"))
     serializer_class = OrderHistorySerializer
     filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
     filterset_fields = ["client", "table", "waiter", "created_at", "archived_at", "guests"]
@@ -299,12 +293,21 @@ class OrderHistoryListView(CompanyBranchQuerysetMixin, generics.ListAPIView):
     ordering_fields = ["created_at", "archived_at", "id"]
 
     def get_queryset(self):
-        qs = super().get_queryset()
-        # миксин уже применил company; добавим видимость по branch истории
+        company = self._user_company()
+        if not company:
+            return OrderHistory.objects.none()
+
+        qs = (
+            OrderHistory.objects
+            .select_related("client", "table", "waiter", "company")
+            .filter(company=company)
+        )
+
         active_branch = self._active_branch()
         if active_branch is not None:
-            return qs.filter(Q(branch=active_branch) | Q(branch__isnull=True))
-        return qs.filter(branch__isnull=True)
+            qs = qs.filter(Q(branch=active_branch) | Q(branch__isnull=True))
+
+        return qs.order_by("-created_at")
 
 
 # ==================== Zone ====================
@@ -399,10 +402,12 @@ class CategoryRetrieveUpdateDestroyView(CompanyBranchQuerysetMixin, generics.Ret
 
 # ==================== MenuItem (+ ingredients nested) ====================
 class MenuItemListCreateView(CompanyBranchQuerysetMixin, generics.ListCreateAPIView):
-    queryset = (MenuItem.objects
-                .select_related("category", "company")
-                .prefetch_related("ingredients__product")
-                .all())
+    queryset = (
+        MenuItem.objects
+        .select_related("category", "company")
+        .prefetch_related("ingredients__product")
+        .all()
+    )
     serializer_class = MenuItemSerializer
     filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
     filterset_fields = ["category", "kitchen", "is_active", "title"]
@@ -411,10 +416,12 @@ class MenuItemListCreateView(CompanyBranchQuerysetMixin, generics.ListCreateAPIV
 
 
 class MenuItemRetrieveUpdateDestroyView(CompanyBranchQuerysetMixin, generics.RetrieveUpdateDestroyAPIView):
-    queryset = (MenuItem.objects
-                .select_related("category", "company")
-                .prefetch_related("ingredients__product")
-                .all())
+    queryset = (
+        MenuItem.objects
+        .select_related("category", "company")
+        .prefetch_related("ingredients__product")
+        .all()
+    )
     serializer_class = MenuItemSerializer
 
 
@@ -432,7 +439,6 @@ class IngredientListCreateView(CompanyBranchQuerysetMixin, generics.ListCreateAP
         active_branch = self._active_branch()
         qs = Ingredient.objects.select_related("menu_item", "product")
         qs = qs.filter(menu_item__company=company, product__company=company)
-        # учтём филиал по обеим связям (глобальные/этого филиала)
         if active_branch is not None:
             return qs.filter(
                 Q(menu_item__branch=active_branch) | Q(menu_item__branch__isnull=True),
@@ -462,9 +468,11 @@ class IngredientRetrieveUpdateDestroyView(CompanyBranchQuerysetMixin, generics.R
 
 # ==================== Order ====================
 class OrderListCreateView(CompanyBranchQuerysetMixin, generics.ListCreateAPIView):
-    queryset = (Order.objects
-                .select_related("table", "waiter", "company", "client")
-                .prefetch_related("items__menu_item"))
+    queryset = (
+        Order.objects
+        .select_related("table", "waiter", "company", "client")
+        .prefetch_related("items__menu_item")
+    )
     serializer_class = OrderSerializer
     filter_backends = [DjangoFilterBackend, filters.OrderingFilter]
     filterset_fields = ["table", "waiter", "client", "guests", "created_at"]
@@ -472,9 +480,11 @@ class OrderListCreateView(CompanyBranchQuerysetMixin, generics.ListCreateAPIView
 
 
 class OrderRetrieveUpdateDestroyView(CompanyBranchQuerysetMixin, generics.RetrieveUpdateDestroyAPIView):
-    queryset = (Order.objects
-                .select_related("table", "waiter", "company", "client")
-                .prefetch_related("items__menu_item"))
+    queryset = (
+        Order.objects
+        .select_related("table", "waiter", "company", "client")
+        .prefetch_related("items__menu_item")
+    )
     serializer_class = OrderSerializer
 
 
@@ -519,8 +529,145 @@ class OrderItemRetrieveUpdateDestroyView(CompanyBranchQuerysetMixin, generics.Re
         return qs.filter(order__branch__isnull=True, menu_item__branch__isnull=True)
 
 
-# ==================== Kitchen (повар) ====================
+class OrderPayView(CompanyBranchQuerysetMixin, APIView):
+    """
+    POST /cafe/orders/<uuid:pk>/pay/
+    body:
+      {
+        "payment_method": "cash|card|transfer",
+        "discount_amount": "0.00",
+        "close_order": true
+      }
 
+    ВАЖНО: архивируем в OrderHistory сразу (история НЕ зависит от удаления заказа).
+    """
+    def post(self, request, pk):
+        company = self._user_company()
+        if not company:
+            return Response({"detail": "Компания не найдена."}, status=status.HTTP_403_FORBIDDEN)
+
+        qs = (
+            Order.objects
+            .select_related("table", "client", "waiter")
+            .prefetch_related("items__menu_item")
+            .filter(company=company)
+        )
+
+        active_branch = self._active_branch()
+        if active_branch is not None:
+            qs = qs.filter(branch=active_branch)
+
+        order = generics.get_object_or_404(qs, pk=pk)
+
+        if getattr(order, "is_paid", False):
+            return Response({"detail": "Заказ уже оплачен."}, status=status.HTTP_400_BAD_REQUEST)
+
+        ser = OrderPaySerializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+
+        payment_method = ser.validated_data.get("payment_method", "cash")
+        discount_amount = ser.validated_data.get("discount_amount", Decimal("0"))
+        close_order = ser.validated_data.get("close_order", True)
+
+        with transaction.atomic():
+            order.recalc_total()
+
+            if discount_amount and discount_amount > order.total_amount:
+                return Response({"detail": "Скидка больше суммы заказа."}, status=status.HTTP_400_BAD_REQUEST)
+
+            order.discount_amount = discount_amount or Decimal("0")
+            order.is_paid = True
+            order.paid_at = timezone.now()
+            order.payment_method = payment_method
+
+            if close_order:
+                order.status = Order.Status.CLOSED
+
+            order.save(update_fields=[
+                "total_amount", "discount_amount",
+                "is_paid", "paid_at", "payment_method",
+                "status", "updated_at",
+            ])
+
+            if close_order and order.table_id:
+                Table.objects.filter(id=order.table_id).update(status=Table.Status.FREE)
+
+            # ---------- ARCHIVE (OrderHistory) ----------
+            waiter_label = ""
+            if order.waiter_id:
+                full = getattr(order.waiter, "get_full_name", lambda: "")() or ""
+                email = getattr(order.waiter, "email", "") or ""
+                waiter_label = full or email or str(order.waiter_id)
+
+            oh, _created = OrderHistory.objects.update_or_create(
+                original_order_id=order.id,
+                defaults={
+                    "company": order.company,
+                    "branch": order.branch,
+                    "client": order.client,
+                    "table": order.table,
+                    "table_number": (order.table.number if order.table_id else None),
+                    "waiter": order.waiter,
+                    "waiter_label": waiter_label,
+                    "guests": order.guests,
+                    "created_at": order.created_at,
+                    "status": order.status,
+                    "is_paid": order.is_paid,
+                    "paid_at": order.paid_at,
+                    "payment_method": order.payment_method,
+                    "total_amount": order.total_amount,
+                    "discount_amount": order.discount_amount,
+                }
+            )
+
+            OrderItemHistory.objects.filter(order_history=oh).delete()
+            items = [
+                OrderItemHistory(
+                    order_history=oh,
+                    menu_item=it.menu_item,
+                    menu_item_title=it.menu_item.title,
+                    menu_item_price=it.menu_item.price,
+                    quantity=it.quantity,
+                )
+                for it in order.items.select_related("menu_item")
+            ]
+            if items:
+                OrderItemHistory.objects.bulk_create(items)
+
+        return Response({
+            "id": str(order.id),
+            "status": order.status,
+            "is_paid": order.is_paid,
+            "paid_at": order.paid_at,
+            "payment_method": order.payment_method,
+            "total_amount": str(order.total_amount),
+            "discount_amount": str(order.discount_amount),
+            "final_amount": str(order.total_amount - (order.discount_amount or Decimal("0"))),
+        }, status=status.HTTP_200_OK)
+
+
+class OrderClosedListView(CompanyBranchQuerysetMixin, generics.ListAPIView):
+    """
+    GET /cafe/orders/closed/
+    Живые закрытые/отменённые/оплаченные заказы (не архив).
+    """
+    queryset = (
+        Order.objects
+        .select_related("table", "waiter", "company", "client")
+        .prefetch_related("items__menu_item")
+    )
+    serializer_class = OrderSerializer
+    filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
+    filterset_fields = ["table", "waiter", "client", "guests", "created_at", "status", "is_paid"]
+    search_fields = ["client__name", "client__phone"]
+    ordering_fields = ["created_at", "id"]
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        return qs.filter(Q(status__in=[Order.Status.CLOSED, Order.Status.CANCELLED]) | Q(is_paid=True))
+
+
+# ==================== Kitchen (повар) ====================
 class KitchenTaskListView(CompanyBranchQuerysetMixin, generics.ListAPIView):
     """
     Лента задач для повара:
@@ -548,7 +695,6 @@ class KitchenTaskListView(CompanyBranchQuerysetMixin, generics.ListAPIView):
         if mine in ('1', 'true', 'True'):
             qs = qs.filter(cook=user)
         else:
-            # показываем и свободные, и мои активные
             qs = qs.filter(Q(cook__isnull=True) | Q(cook=user))
         return qs
 
@@ -562,15 +708,24 @@ class KitchenTaskClaimView(CompanyBranchQuerysetMixin, APIView):
         company = self._user_company()
         user = request.user
         with transaction.atomic():
-            updated = (KitchenTask.objects
-                       .select_for_update()
-                       .filter(pk=pk, company=company,
-                               status=KitchenTask.Status.PENDING, cook__isnull=True)
-                       .update(status=KitchenTask.Status.IN_PROGRESS,
-                               cook=user, started_at=timezone.now()))
+            updated = (
+                KitchenTask.objects
+                .select_for_update()
+                .filter(
+                    pk=pk, company=company,
+                    status=KitchenTask.Status.PENDING, cook__isnull=True
+                )
+                .update(
+                    status=KitchenTask.Status.IN_PROGRESS,
+                    cook=user, started_at=timezone.now()
+                )
+            )
             if not updated:
-                return Response({"detail": "Задачу уже взяли или статус не 'pending'."},
-                                status=status.HTTP_409_CONFLICT)
+                return Response(
+                    {"detail": "Задачу уже взяли или статус не 'pending'."},
+                    status=status.HTTP_409_CONFLICT
+                )
+
         obj = KitchenTask.objects.select_related('order__table', 'menu_item', 'waiter', 'cook').get(pk=pk)
         return Response(KitchenTaskSerializer(obj, context={'request': request}).data)
 
@@ -592,7 +747,6 @@ class KitchenTaskReadyView(CompanyBranchQuerysetMixin, APIView):
             task.finished_at = timezone.now()
             task.save(update_fields=['status', 'finished_at'])
 
-            # уведомление официанту
             if task.waiter_id:
                 NotificationCafe.objects.create(
                     company=task.company,
@@ -612,11 +766,10 @@ class KitchenTaskReadyView(CompanyBranchQuerysetMixin, APIView):
         return Response(KitchenTaskSerializer(task, context={'request': request}).data)
 
 
-# ---- Мониторинг задач кухни для владельца/админа ----
 class KitchenTaskMonitorView(CompanyBranchQuerysetMixin, generics.ListAPIView):
     """
     /cafe/kitchen/tasks/monitor/
-    Видят владелец/админ/стaff. Все задачи по компании.
+    Видят владелец/админ/staff. Все задачи по компании.
     """
     permission_classes = [permissions.IsAuthenticated, IsCompanyOwnerOrAdmin]
     queryset = KitchenTask.objects.select_related('order__table', 'menu_item', 'waiter', 'cook')
@@ -636,7 +789,6 @@ class KitchenTaskMonitorView(CompanyBranchQuerysetMixin, generics.ListAPIView):
         return qs
 
 
-# ---- Аналитика: по поварам и по официантам ----
 class KitchenAnalyticsBaseView(CompanyBranchQuerysetMixin, APIView):
     """Агрегация по cook или waiter. ?date_from=YYYY-MM-DD&date_to=YYYY-MM-DD"""
     group_field = None  # 'cook' или 'waiter'
@@ -660,14 +812,16 @@ class KitchenAnalyticsBaseView(CompanyBranchQuerysetMixin, APIView):
             qs = qs.filter(created_at__date__lte=dt)
 
         lead_time = ExpressionWrapper(F('finished_at') - F('started_at'), output_field=DurationField())
-        data = (qs.values(self.group_field)
-                  .annotate(
-                      total=Count('id'),
-                      taken=Count('id', filter=Q(status__in=[KitchenTask.Status.IN_PROGRESS, KitchenTask.Status.READY])),
-                      ready=Count('id', filter=Q(status=KitchenTask.Status.READY)),
-                      avg_lead=Avg(lead_time, filter=Q(status=KitchenTask.Status.READY)),
-                  )
-                  .order_by('-ready', '-total'))
+        data = (
+            qs.values(self.group_field)
+            .annotate(
+                total=Count('id'),
+                taken=Count('id', filter=Q(status__in=[KitchenTask.Status.IN_PROGRESS, KitchenTask.Status.READY])),
+                ready=Count('id', filter=Q(status=KitchenTask.Status.READY)),
+                avg_lead=Avg(lead_time, filter=Q(status=KitchenTask.Status.READY)),
+            )
+            .order_by('-ready', '-total')
+        )
 
         result = []
         for row in data:
@@ -690,7 +844,6 @@ class KitchenAnalyticsByWaiterView(KitchenAnalyticsBaseView):
     group_field = 'waiter'
 
 
-# ---- Уведомления для официанта ----
 class NotificationListView(CompanyBranchQuerysetMixin, generics.ListAPIView):
     serializer_class = NotificationCafeSerializer
     filter_backends = [DjangoFilterBackend, filters.OrderingFilter]
@@ -701,7 +854,6 @@ class NotificationListView(CompanyBranchQuerysetMixin, generics.ListAPIView):
         if not company:
             return NotificationCafe.objects.none()
         return NotificationCafe.objects.filter(company=company, recipient=self.request.user).order_by('-created_at')
-
 
 
 class InventorySessionListCreateView(CompanyBranchQuerysetMixin, generics.ListCreateAPIView):
@@ -716,24 +868,13 @@ class InventorySessionListCreateView(CompanyBranchQuerysetMixin, generics.ListCr
     search_fields = ["comment"]
     ordering_fields = ["created_at", "confirmed_at", "id"]
 
-    def perform_create(self, serializer):
-        # company/branch заполнит миксин; автора проставит сериализатор
-        super().perform_create(serializer)
-
 
 class InventorySessionRetrieveView(CompanyBranchQuerysetMixin, generics.RetrieveAPIView):
-    """
-    GET /cafe/inventory/sessions/<uuid:pk>/
-    """
     queryset = InventorySession.objects.select_related("company", "branch", "created_by").prefetch_related("items__product")
     serializer_class = InventorySessionSerializer
 
 
 class InventorySessionConfirmView(CompanyBranchQuerysetMixin, generics.GenericAPIView):
-    """
-    POST /cafe/inventory/sessions/<uuid:pk>/confirm/
-    Подтверждает акт и переписывает Warehouse.remainder фактическими значениями.
-    """
     queryset = InventorySession.objects.all()
     serializer_class = InventorySessionSerializer
 
@@ -748,10 +889,6 @@ class InventorySessionConfirmView(CompanyBranchQuerysetMixin, generics.GenericAP
 
 # ==================== INVENTORY: оборудование ====================
 class EquipmentListCreateView(CompanyBranchQuerysetMixin, generics.ListCreateAPIView):
-    """
-    GET  /cafe/equipment/
-    POST /cafe/equipment/
-    """
     queryset = Equipment.objects.select_related("company", "branch")
     serializer_class = EquipmentSerializer
     filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
@@ -761,18 +898,11 @@ class EquipmentListCreateView(CompanyBranchQuerysetMixin, generics.ListCreateAPI
 
 
 class EquipmentRetrieveUpdateDestroyView(CompanyBranchQuerysetMixin, generics.RetrieveUpdateDestroyAPIView):
-    """
-    GET/PATCH/DELETE /cafe/equipment/<uuid:pk>/
-    """
     queryset = Equipment.objects.select_related("company", "branch")
     serializer_class = EquipmentSerializer
 
 
 class EquipmentInventorySessionListCreateView(CompanyBranchQuerysetMixin, generics.ListCreateAPIView):
-    """
-    GET  /cafe/equipment/inventory/sessions/
-    POST /cafe/equipment/inventory/sessions/
-    """
     queryset = EquipmentInventorySession.objects.select_related("company", "branch", "created_by")
     serializer_class = EquipmentInventorySessionSerializer
     filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
@@ -782,17 +912,15 @@ class EquipmentInventorySessionListCreateView(CompanyBranchQuerysetMixin, generi
 
 
 class EquipmentInventorySessionRetrieveView(CompanyBranchQuerysetMixin, generics.RetrieveAPIView):
-    """
-    GET /cafe/equipment/inventory/sessions/<uuid:pk>/
-    """
-    queryset = EquipmentInventorySession.objects.select_related("company", "branch", "created_by").prefetch_related("items__equipment")
+    queryset = (
+        EquipmentInventorySession.objects
+        .select_related("company", "branch", "created_by")
+        .prefetch_related("items__equipment")
+    )
     serializer_class = EquipmentInventorySessionSerializer
 
 
 class EquipmentInventorySessionConfirmView(CompanyBranchQuerysetMixin, generics.GenericAPIView):
-    """
-    POST /cafe/equipment/inventory/sessions/<uuid:pk>/confirm/
-    """
     queryset = EquipmentInventorySession.objects.all()
     serializer_class = EquipmentInventorySessionSerializer
 
@@ -803,7 +931,8 @@ class EquipmentInventorySessionConfirmView(CompanyBranchQuerysetMixin, generics.
         session.confirm(user=request.user)
         data = self.get_serializer(session).data
         return Response(data, status=status.HTTP_200_OK)
-    
+
+
 # ==================== Kitchen ====================
 class KitchenListCreateView(CompanyBranchQuerysetMixin, generics.ListCreateAPIView):
     queryset = Kitchen.objects.all()

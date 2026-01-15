@@ -25,7 +25,7 @@ from .views import (
     EquipmentListCreateView, EquipmentRetrieveUpdateDestroyView,
     EquipmentInventorySessionListCreateView, EquipmentInventorySessionRetrieveView, EquipmentInventorySessionConfirmView,
 
-    KitchenListCreateView, KitchenRetrieveUpdateDestroyView
+    KitchenListCreateView, KitchenRetrieveUpdateDestroyView, OrderClosedListView, OrderPayView
 )
 
 from apps.cafe.analytics import (
@@ -34,6 +34,8 @@ from apps.cafe.analytics import (
     PurchasesSummaryView, PurchasesBySupplierView,
     WarehouseLowStockView,
 )
+
+from apps.cafe.showcase.views_public import PublicCafeInfoAPIView, PublicCafeMenuAPIView, PublicCafeMenuItemsAPIView
 
 app_name = "cafe"
 
@@ -81,6 +83,9 @@ urlpatterns = [
     # === Orders ===
     path("orders/", OrderListCreateView.as_view(), name="order-list"),
     path("orders/<uuid:pk>/", OrderRetrieveUpdateDestroyView.as_view(), name="order-detail"),
+
+    path("orders/<uuid:pk>/pay/", OrderPayView.as_view(), name="cafe_order_pay"),
+    path("orders/closed/", OrderClosedListView.as_view(), name="cafe_orders_closed"),
     # Общая история заказов компании
     path("orders/history/", OrderHistoryListView.as_view(), name="order-history"),
 
@@ -131,4 +136,7 @@ urlpatterns = [
 
     path("analytics/warehouse/low-stock/", WarehouseLowStockView.as_view()),
 
+    path("public/cafe/<slug:company_slug>/", PublicCafeInfoAPIView.as_view(), name="public_cafe_info"),
+    path("public/cafe/<slug:company_slug>/menu/", PublicCafeMenuAPIView.as_view(), name="public_cafe_menu"),
+    path("public/cafe/<slug:company_slug>/menu-items/", PublicCafeMenuItemsAPIView.as_view(), name="public_cafe_menu_items"),
 ]
