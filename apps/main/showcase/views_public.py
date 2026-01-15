@@ -75,7 +75,7 @@ class PublicCompanyProductDetailAPIView(generics.RetrieveAPIView):
         company = self.get_company()
         return (
             Product.objects
-            .filter(company=company, status=Product.Status.ACCEPTED)
+            # .filter(company=company, status=Product.Status.ACCEPTED)
             .select_related("brand", "category")
             .prefetch_related("images", "packages", "characteristics")
         )
