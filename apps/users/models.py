@@ -105,6 +105,8 @@ class Company(models.Model):
     can_view_whatsapp = models.BooleanField(default=False, verbose_name="Доступ к whatsapp")
     can_view_instagram = models.BooleanField(default=False, verbose_name="Доступ к instagram")
     can_view_telegram = models.BooleanField(default=False, verbose_name="Доступ к telegram")
+    can_view_showcase = models.BooleanField(default=False, verbose_name="Доступ к витрине")
+
 
     scale_api_token = models.CharField(
         max_length=64,

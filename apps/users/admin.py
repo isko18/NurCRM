@@ -284,6 +284,7 @@ class CompanyAdmin(admin.ModelAdmin):
         "can_view_whatsapp",
         "can_view_instagram",
         "can_view_telegram",
+        "can_view_showcase",
         "created_at",
     )
     list_filter = (
@@ -294,6 +295,7 @@ class CompanyAdmin(admin.ModelAdmin):
         "can_view_whatsapp",
         "can_view_instagram",
         "can_view_telegram",
+        "can_view_showcase",
     )
     search_fields = ("name", "slug", "owner__email", "phone", "phones_howcase", "llc", "inn", "address")
     readonly_fields = ("created_at",)
@@ -327,6 +329,7 @@ class CompanyAdmin(admin.ModelAdmin):
                     "can_view_whatsapp",
                     "can_view_instagram",
                     "can_view_telegram",
+                    "can_view_showcase",
                 )
             },
         ),
