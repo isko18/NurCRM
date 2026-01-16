@@ -226,6 +226,8 @@ class WarehouseView(CompanyBranchRestrictedMixin, generics.ListCreateAPIView):
 class WarehouseDetailView(CompanyBranchRestrictedMixin, generics.RetrieveUpdateDestroyAPIView):
     serializer_class = WarehouseSerializer
     queryset = m.Warehouse.objects.select_related("company", "branch").all()
+    lookup_field = "id"
+    lookup_url_kwarg = "warehouse_uuid"
 
 
 # ==== Brand ====
@@ -239,6 +241,8 @@ class BrandView(CompanyBranchRestrictedMixin, generics.ListCreateAPIView):
 class BrandDetailView(CompanyBranchRestrictedMixin, generics.RetrieveUpdateDestroyAPIView):
     serializer_class = BrandSerializer
     queryset = m.WarehouseProductBrand.objects.select_related("company", "branch").all()
+    lookup_field = "id"
+    lookup_url_kwarg = "brand_uuid"
 
 
 # ==== Category ====
@@ -252,6 +256,8 @@ class CategoryView(CompanyBranchRestrictedMixin, generics.ListCreateAPIView):
 class CategoryDetailView(CompanyBranchRestrictedMixin, generics.RetrieveUpdateDestroyAPIView):
     serializer_class = CategorySerializer
     queryset = m.WarehouseProductCategory.objects.select_related("company", "branch").all()
+    lookup_field = "id"
+    lookup_url_kwarg = "category_uuid"
 
 
 # ==== Products ====
