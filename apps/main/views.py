@@ -589,7 +589,6 @@ class ProductListView(CompanyBranchRestrictedMixin, generics.ListAPIView):
                 "category",
                 "client",
                 "created_by",
-                "characteristics",  # OneToOne
             )
             .prefetch_related(
                 "item_make",
