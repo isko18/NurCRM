@@ -1,18 +1,23 @@
 from datetime import date, datetime, timedelta
 from decimal import Decimal
 
-from django.db.models import (
-    Sum,
-    Count,
-    Value as V,
-    F,
-    DecimalField,
-)
+from django.db.models import Sum, Count, Value as V, F, DecimalField
 from django.db.models.functions import Coalesce, TruncDate, TruncWeek, TruncMonth
 from django.utils import timezone
 
 from apps.users.models import User
 from .models import ManufactureSubreal, Acceptance, Sale, SaleItem
+
+
+# ─────────────────────────────────────────────────────────────
+# typed zeros (важно: mixed types fix)
+# ─────────────────────────────────────────────────────────────
+MONEY_FIELD = DecimalField(max_digits=12, decimal_places=2)
+ZERO_MONEY = V(Decimal("0.00"), output_field=MONEY_FIELD)
+
+# quantity у SaleItem часто DecimalField → нужен Decimal-ноль
+QTY_FIELD = DecimalField(max_digits=14, decimal_places=3)
+ZERO_QTY = V(Decimal("0.000"), output_field=QTY_FIELD)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -30,11 +35,13 @@ def _trunc_by_group(field_name: str, group_by: str):
 def _dt_range(date_from: date, date_to: date):
     """
     (inclusive) date_from 00:00  -> (exclusive) (date_to+1) 00:00
-    Это правильнее, чем max.time() и не ловит микросекундные края.
     """
     tz = timezone.get_current_timezone()
     dt_from = timezone.make_aware(datetime.combine(date_from, datetime.min.time()), tz)
-    dt_to_excl = timezone.make_aware(datetime.combine(date_to + timedelta(days=1), datetime.min.time()), tz)
+    dt_to_excl = timezone.make_aware(
+        datetime.combine(date_to + timedelta(days=1), datetime.min.time()),
+        tz,
+    )
     return dt_from, dt_to_excl
 
 
@@ -50,14 +57,12 @@ def _money_str(x) -> str:
 
 
 # ─────────────────────────────────────────────────────────────
-# main: owner overall analytics
+# main: owner overall analytics (FIXED)
 # ─────────────────────────────────────────────────────────────
 def build_owner_analytics_payload(*, company, branch, period, date_from, date_to, group_by="day"):
     """
     Общая аналитика владельца по компании.
-
-    Возвращает:
-      period + summary + charts
+    Возвращает: period + summary + charts
     """
     dt_from, dt_to_excl = _dt_range(date_from, date_to)
 
@@ -152,8 +157,10 @@ def build_owner_analytics_payload(*, company, branch, period, date_from, date_to
         sales_qs = sales_qs.filter(branch__isnull=True)
 
     sales_count = sales_qs.count()
+
+    # FIX: правильный Decimal-ноль с output_field
     sales_amount_dec = sales_qs.aggregate(
-        s=Coalesce(Sum("total"), V(Decimal("0.00")))
+        s=Coalesce(Sum("total"), ZERO_MONEY)
     )["s"] or Decimal("0.00")
 
     items_qs = SaleItem.objects.filter(sale__in=sales_qs)
@@ -165,13 +172,14 @@ def build_owner_analytics_payload(*, company, branch, period, date_from, date_to
         .values("period")
         .annotate(
             sales_count=Count("sale_id", distinct=True),
-            items_sold=Coalesce(Sum("quantity"), V(0)),
+
+            # FIX: quantity может быть DecimalField → Sum(quantity)=Decimal → нужен ZERO_QTY
+            items_sold=Coalesce(Sum("quantity", output_field=QTY_FIELD), ZERO_QTY),
+
+            # FIX: Coalesce для Decimal только с ZERO_MONEY
             amount=Coalesce(
-                Sum(
-                    F("quantity") * F("unit_price"),
-                    output_field=DecimalField(max_digits=12, decimal_places=2),
-                ),
-                V(Decimal("0.00")),
+                Sum(F("quantity") * F("unit_price"), output_field=MONEY_FIELD),
+                ZERO_MONEY,
             ),
         )
         .order_by("period")
@@ -189,13 +197,11 @@ def build_owner_analytics_payload(*, company, branch, period, date_from, date_to
         items_qs
         .values("product_id", "product__name")
         .annotate(
-            qty=Coalesce(Sum("quantity"), V(0)),
+            # FIX: quantity → Decimal
+            qty=Coalesce(Sum("quantity", output_field=QTY_FIELD), ZERO_QTY),
             amount=Coalesce(
-                Sum(
-                    F("quantity") * F("unit_price"),
-                    output_field=DecimalField(max_digits=12, decimal_places=2),
-                ),
-                V(Decimal("0.00")),
+                Sum(F("quantity") * F("unit_price"), output_field=MONEY_FIELD),
+                ZERO_MONEY,
             ),
         )
         .order_by("-amount")[:10]
@@ -204,7 +210,9 @@ def build_owner_analytics_payload(*, company, branch, period, date_from, date_to
         {
             "product_id": str(r["product_id"]),
             "product_name": r["product__name"],
-            "qty": int(r["qty"] or 0),
+            # qty может быть Decimal — не убивай точность принудительным int, если она нужна
+            # если точно нужна целая — оставь int(...)
+            "qty": float(r["qty"] or Decimal("0.000")),
             "amount": _money_str(r["amount"] or Decimal("0.00")),
         }
         for r in top_products_qs
@@ -215,7 +223,8 @@ def build_owner_analytics_payload(*, company, branch, period, date_from, date_to
         .values("user_id", "user__first_name", "user__last_name", "user__role")
         .annotate(
             sales_count=Count("id"),
-            amount=Coalesce(Sum("total"), V(Decimal("0.00"))),
+            # FIX: Decimal-ноль
+            amount=Coalesce(Sum("total"), ZERO_MONEY),
         )
         .order_by("-amount")[:10]
     )
@@ -246,7 +255,6 @@ def build_owner_analytics_payload(*, company, branch, period, date_from, date_to
                 "percent": round(amt * 100.0 / sales_amount_float, 2),
             })
 
-    # summary
     users_count = User.objects.filter(company=company).count()
 
     return {
