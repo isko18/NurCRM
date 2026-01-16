@@ -36,7 +36,7 @@ from apps.main.models import (
 )
 from apps.main.serializers import (
     ContactSerializer, PipelineSerializer, DealSerializer, TaskSerializer,
-    IntegrationSerializer, AnalyticsSerializer, OrderSerializer, ProductSerializer, ProductListSerializer,
+    IntegrationSerializer, AnalyticsSerializer, OrderSerializer, ProductSerializer,
     ReviewSerializer, NotificationSerializer, EventSerializer,
     WarehouseSerializer, WarehouseEventSerializer,
     ProductCategorySerializer, ProductBrandSerializer,
@@ -570,7 +570,7 @@ class OrderRetrieveUpdateDestroyAPIView(CompanyBranchRestrictedMixin, generics.R
 #  Product create by barcode (ручной view)
 # ===========================
 class ProductListView(CompanyBranchRestrictedMixin, generics.ListAPIView):
-    serializer_class = ProductListSerializer
+    serializer_class = ProductSerializer
     filter_backends = [filters.SearchFilter, filters.OrderingFilter]
     search_fields = ["name", "barcode"]
     ordering_fields = ["created_at", "updated_at", "price"]
@@ -578,10 +578,7 @@ class ProductListView(CompanyBranchRestrictedMixin, generics.ListAPIView):
 
     def get_queryset(self):
         qs = (
-            Product.objects.only(
-                "id", "name", "price", "quantity", "brand_id", "category_id", "code", "article",
-                "company_id", "branch_id", "client_id", "created_by_id",
-            )
+            Product.objects
             .select_related(
                 "company",
                 "branch",
@@ -589,14 +586,12 @@ class ProductListView(CompanyBranchRestrictedMixin, generics.ListAPIView):
                 "category",
                 "client",
                 "created_by",
+                "characteristics",  # OneToOne
             )
             .prefetch_related(
                 "item_make",
                 "packages",
-                Prefetch(
-                    "images",
-                    queryset=ProductImage.objects.filter(is_primary=True).only("id", "image", "alt", "is_primary", "created_at"),
-                ),
+                product_images_prefetch,  # как было, твой Prefetch для images
             )
         )
         return self._filter_qs_company_branch(qs)
