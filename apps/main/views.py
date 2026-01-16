@@ -36,7 +36,7 @@ from apps.main.models import (
 )
 from apps.main.serializers import (
     ContactSerializer, PipelineSerializer, DealSerializer, TaskSerializer,
-    IntegrationSerializer, AnalyticsSerializer, OrderSerializer, ProductSerializer,
+    IntegrationSerializer, AnalyticsSerializer, OrderSerializer, ProductSerializer, ProductListSerializer,
     ReviewSerializer, NotificationSerializer, EventSerializer,
     WarehouseSerializer, WarehouseEventSerializer,
     ProductCategorySerializer, ProductBrandSerializer,
@@ -570,7 +570,7 @@ class OrderRetrieveUpdateDestroyAPIView(CompanyBranchRestrictedMixin, generics.R
 #  Product create by barcode (ручной view)
 # ===========================
 class ProductListView(CompanyBranchRestrictedMixin, generics.ListAPIView):
-    serializer_class = ProductSerializer
+    serializer_class = ProductListSerializer
     filter_backends = [filters.SearchFilter, filters.OrderingFilter]
     search_fields = ["name", "barcode"]
     ordering_fields = ["created_at", "updated_at", "price"]
@@ -578,7 +578,7 @@ class ProductListView(CompanyBranchRestrictedMixin, generics.ListAPIView):
 
     def get_queryset(self):
         qs = (
-            Product.objects
+            Product.objects.only("id", "name", "price", "quantity", "brand_id", "category_id", "code", "article")
             .select_related(
                 "company",
                 "branch",
@@ -591,7 +591,10 @@ class ProductListView(CompanyBranchRestrictedMixin, generics.ListAPIView):
             .prefetch_related(
                 "item_make",
                 "packages",
-                product_images_prefetch,  # как было, твой Prefetch для images
+                Prefetch(
+                    "images",
+                    queryset=ProductImage.objects.filter(is_primary=True).only("id", "image", "alt", "is_primary", "created_at"),
+                ),
             )
         )
         return self._filter_qs_company_branch(qs)

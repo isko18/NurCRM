@@ -1,3 +1,33 @@
 from django.contrib import admin
+from . import models
 
-# Register your models here.
+
+@admin.register(models.Document)
+class DocumentAdmin(admin.ModelAdmin):
+	list_display = ("number", "doc_type", "status", "date", "warehouse_from", "warehouse_to", "counterparty", "total")
+	list_filter = ("doc_type", "status")
+	search_fields = ("number", "comment")
+
+
+@admin.register(models.DocumentItem)
+class DocumentItemAdmin(admin.ModelAdmin):
+	list_display = ("document", "product", "qty", "price", "line_total")
+	search_fields = ("product__name",)
+
+
+@admin.register(models.StockBalance)
+class StockBalanceAdmin(admin.ModelAdmin):
+	list_display = ("warehouse", "product", "qty")
+	list_filter = ("warehouse",)
+
+
+@admin.register(models.StockMove)
+class StockMoveAdmin(admin.ModelAdmin):
+	list_display = ("document", "warehouse", "product", "qty_delta", "created_at")
+	list_filter = ("warehouse",)
+
+
+@admin.register(models.Counterparty)
+class CounterpartyAdmin(admin.ModelAdmin):
+	list_display = ("name", "type")
+	search_fields = ("name",)
