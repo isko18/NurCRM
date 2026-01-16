@@ -3191,30 +3191,37 @@ class AgentRequestItemRetrieveUpdateDestroyAPIView(
             raise ValidationError("Нельзя удалить позицию из чужой корзины.")
 
         instance.delete()
-
-      
 class AgentMyAnalyticsAPIView(CompanyBranchRestrictedMixin, APIView):
     """
     GET /api/main/agents/me/analytics/
 
-    Квери:
+    Query:
       ?period=day|week|month|custom
       ?date_from=YYYY-MM-DD
       ?date_to=YYYY-MM-DD
+      ?date=YYYY-MM-DD (для period=day, если используешь)
     """
     permission_classes = [permissions.IsAuthenticated]
 
     def get(self, request, *args, **kwargs):
-        # компания из миксина (company/branch уже используются во всей системе)
+        agent = request.user
         company = self._company()
         branch = self._auto_branch()
-        agent = request.user
 
         # fallback, если вдруг _company() вернул None
         if company is None:
             company = getattr(agent, "owned_company", None) or getattr(agent, "company", None)
 
-        if company is None or getattr(agent, "company_id", None) != getattr(company, "id", None):
+        # жёсткая защита от “не привязан” и “не та компания”
+        if company is None:
+            return Response(
+                {"detail": "Профиль агента не привязан к компании."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        agent_company_id = getattr(agent, "company_id", None)
+        company_id = getattr(company, "id", None)
+        if agent_company_id is None or company_id is None or agent_company_id != company_id:
             return Response(
                 {"detail": "Профиль агента не привязан к компании."},
                 status=status.HTTP_400_BAD_REQUEST,
@@ -3257,12 +3264,9 @@ class OwnerAgentAnalyticsAPIView(CompanyBranchRestrictedMixin, APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
+        # агент строго внутри компании владельца
         try:
-            agent = (
-                User.objects
-                .filter(company=company)
-                .get(pk=agent_id)
-            )
+            agent = User.objects.filter(company=company).get(pk=agent_id)
         except User.DoesNotExist:
             return Response({"detail": "Agent not found."}, status=status.HTTP_404_NOT_FOUND)
 
@@ -3275,13 +3279,14 @@ class OwnerAgentAnalyticsAPIView(CompanyBranchRestrictedMixin, APIView):
             **period_params,
         )
         return Response(data, status=status.HTTP_200_OK)
-    
+
+
 class OwnerOverallAnalyticsAPIView(CompanyBranchRestrictedMixin, APIView):
     """
     GET /api/main/owners/analytics/
 
     Доступ: только владелец/админ (_is_owner_like).
-    Аналитика считается по всей компании (ветка/branch — как в твоём миксине).
+    Аналитика считается по всей компании (ветка/branch — как в миксине).
     """
     permission_classes = [permissions.IsAuthenticated]
 
