@@ -1,11 +1,8 @@
-from __future__ import annotations
-
 from datetime import date, timedelta, datetime
 from decimal import Decimal
 from itertools import groupby
 from operator import attrgetter
 
-from django.conf import settings
 from django.db.models import (
     Prefetch,
     Sum,
@@ -13,8 +10,8 @@ from django.db.models import (
     Value as V,
     F,
     DecimalField,
-    Q,
 )
+    # from django.db.models.functions import Coalesce, TruncDate
 from django.db.models.functions import Coalesce, TruncDate
 from django.utils import timezone
 
@@ -27,7 +24,8 @@ from .models import (
     SaleItem,
 )
 from apps.users.models import User
-
+from django.core.cache import cache
+from django.conf import settings
 
 try:
     from apps.main.cache_utils import cached_result
@@ -36,17 +34,7 @@ except ImportError:
     def cached_result(*args, **kwargs):
         def decorator(func):
             return func
-
         return decorator
-
-
-# ===== типы/нули (важно для FieldError mixed types) =====
-MONEY_FIELD = DecimalField(max_digits=12, decimal_places=2)
-ZERO_MONEY = V(Decimal("0.00"), output_field=MONEY_FIELD)
-
-# quantity часто DecimalField → нужен Decimal-ноль, иначе mixed types
-QTY_FIELD = DecimalField(max_digits=14, decimal_places=3)
-ZERO_QTY = V(Decimal("0.000"), output_field=QTY_FIELD)
 
 
 def _parse_period(request):
@@ -54,7 +42,7 @@ def _parse_period(request):
     ?period=day|week|month|custom
 
     Понимает оба варианта:
-      - day:  ?date=YYYY-MM-DD ИЛИ ?date_from=YYYY-MM-DD
+      - day:  ?date=2025-12-01 ИЛИ ?date_from=2025-12-01
       - week: ?date_from=...&date_to=...
       - month/custom: ?date_from=...&date_to=...
 
@@ -78,30 +66,63 @@ def _parse_period(request):
     raw_from = _parse("date_from")
     raw_to = _parse("date_to")
 
+    # ---------- DAY ----------
     if period == "day":
+        # приоритет: ?date > ?date_from > ?date_to > today
         d = raw_date or raw_from or raw_to or today
-        return {"period": "day", "date_from": d, "date_to": d, "group_by": "day"}
+        return {
+            "period": "day",
+            "date_from": d,
+            "date_to": d,
+            "group_by": "day",
+        }
 
+    # ---------- WEEK ----------
     if period == "week":
+        # date_to: ?date_to > ?date > today
         date_to = raw_to or raw_date or today
+        # date_from: ?date_from > (date_to - 6)
         date_from = raw_from or (date_to - timedelta(days=6))
+
         if date_from > date_to:
             date_from, date_to = date_to, date_from
-        return {"period": "week", "date_from": date_from, "date_to": date_to, "group_by": "day"}
 
+        return {
+            "period": "week",
+            "date_from": date_from,
+            "date_to": date_to,
+            "group_by": "day",
+        }
+
+    # ---------- CUSTOM ----------
     if period == "custom":
+        # если нет дат — по умолчанию последние 30 дней
         date_to = raw_to or today
         date_from = raw_from or (date_to - timedelta(days=29))
+
         if date_from > date_to:
             date_from, date_to = date_to, date_from
-        return {"period": "custom", "date_from": date_from, "date_to": date_to, "group_by": "day"}
 
+        return {
+            "period": "custom",
+            "date_from": date_from,
+            "date_to": date_to,
+            "group_by": "day",
+        }
+
+    # ---------- MONTH (по умолчанию) ----------
     date_to = raw_to or today
     date_from = raw_from or (date_to - timedelta(days=29))
+
     if date_from > date_to:
         date_from, date_to = date_to, date_from
 
-    return {"period": "month", "date_from": date_from, "date_to": date_to, "group_by": "day"}
+    return {
+        "period": "month",
+        "date_from": date_from,
+        "date_to": date_to,
+        "group_by": "day",
+    }
 
 
 @cached_result(timeout=settings.CACHE_TIMEOUT_SHORT, key_prefix="agent_on_hand")
@@ -121,19 +142,23 @@ def _compute_agent_on_hand(*, company, branch, agent) -> dict:
         .filter(company=company, agent=agent)
         .select_related("product")
         .prefetch_related(
-            Prefetch("returns", queryset=accepted_returns_qs, to_attr="accepted_returns"),
-            Prefetch("sale_allocations", queryset=alloc_qs, to_attr="prefetched_allocs"),
+            "acceptances",
+            Prefetch(
+                "returns",
+                queryset=accepted_returns_qs,
+                to_attr="accepted_returns",
+            ),
+            Prefetch(
+                "sale_allocations",
+                queryset=alloc_qs,
+                to_attr="prefetched_allocs",
+            ),
         )
-        # sold_qty обычно int → V(0) ок; но фильтруем по company, чтобы не схватить чужое
-        .annotate(
-            sold_qty=Coalesce(
-                Sum("sale_allocations__qty", filter=Q(sale_allocations__company=company)),
-                V(0),
-            )
-        )
+        .annotate(sold_qty=Coalesce(Sum("sale_allocations__qty"), V(0)))
         .order_by("product_id", "-created_at")
     )
 
+    # ВАЖНО: та же логика, что и в миксине
     if branch is not None:
         base = base.filter(branch=branch)
     else:
@@ -144,7 +169,7 @@ def _compute_agent_on_hand(*, company, branch, agent) -> dict:
     by_product_qty = []
     by_product_amount = []
 
-    for _product_id, subreals_iter in groupby(base, key=attrgetter("product_id")):
+    for product_id, subreals_iter in groupby(base, key=attrgetter("product_id")):
         subreals = list(subreals_iter)
         if not subreals:
             continue
@@ -208,8 +233,13 @@ def build_agent_analytics_payload(
     Аналитика агента.
     Кэшируется на 10 минут (CACHE_TIMEOUT_ANALYTICS).
     """
-    dt_from = timezone.make_aware(datetime.combine(date_from, datetime.min.time()))
-    dt_to = timezone.make_aware(datetime.combine(date_to, datetime.max.time()))
+    # ---- диапазон дат ----
+    dt_from = timezone.make_aware(
+        datetime.combine(date_from, datetime.min.time())
+    )
+    dt_to = timezone.make_aware(
+        datetime.combine(date_to, datetime.max.time())
+    )
 
     # ======================================================
     #              П Е Р Е Д А Ч И
@@ -251,44 +281,48 @@ def build_agent_analytics_payload(
         company=company,
         user=agent,
         created_at__range=(dt_from, dt_to),
-        status=Sale.Status.PAID,
     )
     if branch is not None:
         sales_qs = sales_qs.filter(branch=branch)
     else:
         sales_qs = sales_qs.filter(branch__isnull=True)
 
+    # считаем только оплаченные
+    sales_qs = sales_qs.filter(status=Sale.Status.PAID)
+
     sales_count = sales_qs.count()
     sales_amount_dec = sales_qs.aggregate(
-        s=Coalesce(Sum("total"), ZERO_MONEY)
+        s=Coalesce(Sum("total"), V(Decimal("0.00")))
     )["s"] or Decimal("0.00")
     sales_amount = float(sales_amount_dec)
 
+    # ---------------- 1) продажи по товарам ----------------
     items_qs = SaleItem.objects.filter(sale__in=sales_qs)
 
-    # ---------------- 1) продажи по товарам ----------------
     sales_by_product_qs = (
         items_qs
         .values("product_id", "product__name")
         .annotate(
-            # ВАЖНО: quantity может быть DecimalField → Sum(quantity) = Decimal
-            qty=Coalesce(Sum("quantity", output_field=QTY_FIELD), ZERO_QTY),
+            qty=Coalesce(Sum("quantity"), V(0)),
             amount=Coalesce(
-                Sum(F("quantity") * F("unit_price"), output_field=MONEY_FIELD),
-                ZERO_MONEY,
+                Sum(
+                    F("quantity") * F("unit_price"),
+                    output_field=DecimalField(max_digits=12, decimal_places=2),
+                ),
+                V(Decimal("0.00")),
             ),
         )
         .order_by("-amount")
     )
 
-    sales_by_product_amount = [
-        {
+    sales_by_product_amount = []
+    for row in sales_by_product_qs:
+        amount = row["amount"] or Decimal("0.00")
+        sales_by_product_amount.append({
             "product_id": str(row["product_id"]),
             "product_name": row["product__name"],
-            "amount": float(row["amount"] or Decimal("0.00")),
-        }
-        for row in sales_by_product_qs
-    ]
+            "amount": float(amount),
+        })
 
     # ---------------- 2) продажи по датам ----------------
     sales_by_date_qs = (
@@ -297,11 +331,13 @@ def build_agent_analytics_payload(
         .values("day")
         .annotate(
             sales_count=Count("sale_id", distinct=True),
-            # тоже quantity → Decimal
-            items_sold=Coalesce(Sum("quantity", output_field=QTY_FIELD), ZERO_QTY),
+            items_sold=Coalesce(Sum("quantity"), V(0)),
             amount=Coalesce(
-                Sum(F("quantity") * F("unit_price"), output_field=MONEY_FIELD),
-                ZERO_MONEY,
+                Sum(
+                    F("quantity") * F("unit_price"),
+                    output_field=DecimalField(max_digits=12, decimal_places=2),
+                ),
+                V(Decimal("0.00")),
             ),
         )
         .order_by("day")
@@ -331,7 +367,13 @@ def build_agent_analytics_payload(
     # ======================================================
     #        Т О В А Р Ы  Н А  Р У К А Х
     # ======================================================
-    on_hand = _compute_agent_on_hand(company=company, branch=branch, agent=agent)
+    on_hand = _compute_agent_on_hand(
+        company=company,
+        branch=branch,
+        agent=agent,
+    )
+    on_hand_by_product_qty = on_hand["by_product_qty"]
+    on_hand_by_product_amount = on_hand["by_product_amount"]
 
     # ======================================================
     #      П Е Р Е Д А Ч И  П О  Д Н Я М
@@ -376,7 +418,11 @@ def build_agent_analytics_payload(
     ]
 
     # история передач
-    history_qs = sub_qs.select_related("product").order_by("-created_at")[:200]
+    history_qs = (
+        sub_qs
+        .select_related("product")
+        .order_by("-created_at")[:200]
+    )
     transfers_history = [
         {
             "id": str(s.id),
@@ -390,6 +436,7 @@ def build_agent_analytics_payload(
         for s in history_qs
     ]
 
+    # базовая инфа по агенту
     agent_payload = {
         "id": str(agent.id),
         "first_name": getattr(agent, "first_name", "") or "",
@@ -399,7 +446,11 @@ def build_agent_analytics_payload(
 
     return {
         "agent": agent_payload,
-        "period": {"type": period, "date_from": date_from, "date_to": date_to},
+        "period": {
+            "type": period,
+            "date_from": date_from,
+            "date_to": date_to,
+        },
         "summary": {
             "transfers_count": transfers_count,
             "acceptances_count": acceptances_count,
@@ -413,8 +464,8 @@ def build_agent_analytics_payload(
             "sales_by_date": sales_by_date,
             "sales_by_product_amount": sales_by_product_amount,
             "sales_distribution_by_product": sales_distribution_by_product,
-            "on_hand_by_product_qty": on_hand["by_product_qty"],
-            "on_hand_by_product_amount": on_hand["by_product_amount"],
+            "on_hand_by_product_qty": on_hand_by_product_qty,
+            "on_hand_by_product_amount": on_hand_by_product_amount,
             "transfers_by_date": transfers_by_date,
             "top_products_by_transfers": top_products_by_transfers,
         },
