@@ -697,7 +697,7 @@ class Product(models.Model):
     markup_percent = models.DecimalField(
         "Наценка, %",
         max_digits=12,
-        decimal_places=2,
+        decimal_places=4,
         default=0,
         help_text="Наценка в процентах к закупочной цене",
     )
