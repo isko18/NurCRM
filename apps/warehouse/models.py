@@ -337,6 +337,14 @@ class WarehouseProduct(BaseModelId, BaseModelDate, BaseModelCompanyBranch):
     def _pg_lock_company(self):
         if not self.company_id:
             return
+        # Use PostgreSQL advisory locks when available. Skip for SQLite/other backends.
+        try:
+            vendor = connection.vendor
+        except Exception:
+            vendor = None
+
+        if vendor != "postgresql":
+            return
 
         key = int(str(self.company_id).replace("-", "")[:16], 16) & 0x7FFFFFFFFFFFFFFF
         with connection.cursor() as cur:
@@ -581,3 +589,152 @@ class WarehouseProductPackage(BaseModelId, BaseModelCompanyBranch):
                 self.unit = self.product.unit
 
         super().save(*args, **kwargs)
+
+
+# -----------------------
+# Documents / stock models
+# -----------------------
+from django.conf import settings
+
+
+class StockBalance(models.Model):
+    warehouse = models.ForeignKey("warehouse.Warehouse", on_delete=models.CASCADE, related_name="balances")
+    product = models.ForeignKey("warehouse.WarehouseProduct", on_delete=models.CASCADE, related_name="balances")
+    qty = models.DecimalField(max_digits=18, decimal_places=3, default=Decimal("0.000"))
+
+    class Meta:
+        unique_together = ("warehouse", "product")
+        indexes = [models.Index(fields=["warehouse", "product"]) ]
+
+    def __str__(self):
+        return f"Balance {self.warehouse} / {self.product} = {self.qty}"
+
+
+class Counterparty(models.Model):
+    class Type(models.TextChoices):
+        CLIENT = "CLIENT", "Client"
+        SUPPLIER = "SUPPLIER", "Supplier"
+        BOTH = "BOTH", "Both"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    name = models.CharField(max_length=255)
+    type = models.CharField(max_length=16, choices=Type.choices, default=Type.BOTH)
+
+    def __str__(self):
+        return self.name
+
+
+class DocumentSequence(models.Model):
+    doc_type = models.CharField(max_length=32)
+    date = models.DateField()
+    seq = models.PositiveIntegerField(default=0)
+
+    class Meta:
+        unique_together = (("doc_type", "date"),)
+
+
+class Document(models.Model):
+    class DocType(models.TextChoices):
+        SALE = "SALE", "Sale"
+        PURCHASE = "PURCHASE", "Purchase"
+        SALE_RETURN = "SALE_RETURN", "Sale return"
+        PURCHASE_RETURN = "PURCHASE_RETURN", "Purchase return"
+        INVENTORY = "INVENTORY", "Inventory"
+        RECEIPT = "RECEIPT", "Receipt"
+        WRITE_OFF = "WRITE_OFF", "Write off"
+        TRANSFER = "TRANSFER", "Transfer"
+
+    class Status(models.TextChoices):
+        DRAFT = "DRAFT", "Draft"
+        POSTED = "POSTED", "Posted"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    doc_type = models.CharField(max_length=32, choices=DocType.choices)
+    status = models.CharField(max_length=16, choices=Status.choices, default=Status.DRAFT)
+    number = models.CharField(max_length=64, unique=True, null=True, blank=True)
+    date = models.DateTimeField(auto_now_add=True)
+
+    warehouse_from = models.ForeignKey("warehouse.Warehouse", on_delete=models.SET_NULL, null=True, blank=True, related_name="documents_from")
+    warehouse_to = models.ForeignKey("warehouse.Warehouse", on_delete=models.SET_NULL, null=True, blank=True, related_name="documents_to")
+    counterparty = models.ForeignKey("warehouse.Counterparty", on_delete=models.SET_NULL, null=True, blank=True)
+
+    comment = models.TextField(blank=True)
+    total = models.DecimalField(max_digits=18, decimal_places=2, default=Decimal("0.00"))
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    def __str__(self):
+        return f"{self.number} ({self.doc_type})"
+
+    def clean(self):
+        from django.core.exceptions import ValidationError
+
+        if self.doc_type == self.DocType.TRANSFER:
+            if not self.warehouse_from or not self.warehouse_to:
+                raise ValidationError("TRANSFER requires both warehouse_from and warehouse_to")
+            if self.warehouse_from_id == self.warehouse_to_id:
+                raise ValidationError("warehouse_from and warehouse_to must be different")
+
+        if self.doc_type in (self.DocType.SALE, self.DocType.SALE_RETURN, self.DocType.PURCHASE, self.DocType.PURCHASE_RETURN, self.DocType.RECEIPT, self.DocType.WRITE_OFF):
+            # require warehouse_from for most operations (warehouse where stock changes).
+            if not self.warehouse_from:
+                raise ValidationError("Document requires warehouse_from")
+            if self.doc_type in (self.DocType.SALE, self.DocType.PURCHASE, self.DocType.SALE_RETURN, self.DocType.PURCHASE_RETURN) and not self.counterparty:
+                raise ValidationError("Document requires counterparty")
+
+
+class DocumentItem(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    document = models.ForeignKey(Document, on_delete=models.CASCADE, related_name="items")
+    product = models.ForeignKey("warehouse.WarehouseProduct", on_delete=models.PROTECT)
+    qty = models.DecimalField(max_digits=18, decimal_places=3)
+    price = models.DecimalField(max_digits=18, decimal_places=2, default=Decimal("0.00"))
+    discount_percent = models.DecimalField(max_digits=5, decimal_places=2, default=Decimal("0.00"))
+    line_total = models.DecimalField(max_digits=18, decimal_places=2, default=Decimal("0.00"))
+
+    def clean(self):
+        from django.core.exceptions import ValidationError
+
+        if self.qty is None or Decimal(self.qty) <= Decimal("0"):
+            raise ValidationError({"qty": "Quantity must be > 0"})
+
+        if self.discount_percent is None:
+            self.discount_percent = Decimal("0.00")
+        dp = Decimal(self.discount_percent)
+        if not (Decimal("0") <= dp <= Decimal("100")):
+            raise ValidationError({"discount_percent": "Must be between 0 and 100"})
+
+        # integral check for PCS
+        try:
+            unit = self.product.unit
+        except Exception:
+            unit = None
+
+        if unit and unit.lower().startswith("pcs") or getattr(self.product, "is_weight", False) is False:
+            # treat as pieces: require integer qty
+            if (Decimal(self.qty) % 1) != 0:
+                raise ValidationError({"qty": "Quantity must be integer for piece items"})
+
+    def save(self, *args, **kwargs):
+        # compute line total: price * qty * (1 - discount)
+        q = Decimal(self.qty or 0)
+        p = Decimal(self.price or 0)
+        dp = Decimal(self.discount_percent or 0) / Decimal("100")
+        self.line_total = (p * q * (Decimal("1") - dp)).quantize(Decimal("0.01"))
+        super().save(*args, **kwargs)
+
+
+class StockMove(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    document = models.ForeignKey(Document, on_delete=models.CASCADE, related_name="moves")
+    warehouse = models.ForeignKey("warehouse.Warehouse", on_delete=models.CASCADE)
+    product = models.ForeignKey("warehouse.WarehouseProduct", on_delete=models.CASCADE)
+    qty_delta = models.DecimalField(max_digits=18, decimal_places=3)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        indexes = [models.Index(fields=["warehouse", "product", "created_at"])]
+
+    def __str__(self):
+        return f"Move {self.document.number} {self.product} {self.qty_delta} @ {self.warehouse}"
+
