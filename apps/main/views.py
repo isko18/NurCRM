@@ -21,6 +21,7 @@ from rest_framework import serializers
 from .filters import TransactionRecordFilter, DebtFilter, DebtPaymentFilter
 from django_filters.rest_framework import DjangoFilterBackend
 from django.db.models import DecimalField, ExpressionWrapper
+from rest_framework.pagination import CursorPagination
 
 
 from apps.users.models import Branch, User
@@ -37,6 +38,7 @@ from apps.main.models import (
 from apps.main.serializers import (
     ContactSerializer, PipelineSerializer, DealSerializer, TaskSerializer,
     IntegrationSerializer, AnalyticsSerializer, OrderSerializer, ProductSerializer,
+    ProductListSerializer,
     ReviewSerializer, NotificationSerializer, EventSerializer,
     WarehouseSerializer, WarehouseEventSerializer,
     ProductCategorySerializer, ProductBrandSerializer,
@@ -592,6 +594,35 @@ class ProductListView(CompanyBranchRestrictedMixin, generics.ListAPIView):
                 "item_make",
                 "packages",
                 product_images_prefetch,  # как было, твой Prefetch для images
+            )
+        )
+        return self._filter_qs_company_branch(qs)
+
+
+class CompactProductCursorPagination(CursorPagination):
+    page_size = 30
+    ordering = "-created_at"
+
+
+class ProductCompactListView(CompanyBranchRestrictedMixin, generics.ListAPIView):
+    """Компактный список товаров для бесконечного скролла — лёгкий сериализатор + курсорная пагинация."""
+    serializer_class = ProductListSerializer
+    pagination_class = CompactProductCursorPagination
+    filter_backends = [filters.SearchFilter, filters.OrderingFilter]
+    search_fields = ["name", "barcode"]
+    ordering_fields = ["created_at", "updated_at", "price"]
+    ordering = ["-created_at"]
+
+    def get_queryset(self):
+        qs = (
+            Product.objects.only(
+                "id", "name", "price", "quantity", "brand_id", "category_id", "code", "article",
+            )
+            .prefetch_related(
+                Prefetch(
+                    "images",
+                    queryset=ProductImage.objects.filter(is_primary=True).only("id", "image", "is_primary"),
+                ),
             )
         )
         return self._filter_qs_company_branch(qs)

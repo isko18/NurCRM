@@ -1632,6 +1632,31 @@ class ProductNestedSerializer(serializers.ModelSerializer):
         fields = ["id", "name", "barcode", "quantity", "price"]
 
 
+# Лёгкий сериализатор для списка товаров (минимальный набор полей)
+class ProductListSerializer(serializers.ModelSerializer):
+    image_url = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Product
+        fields = ["id", "name", "code", "article", "price", "quantity", "brand", "category", "image_url"]
+
+    def get_image_url(self, obj):
+        imgs = getattr(obj, "images", None)
+        if not imgs:
+            return None
+        try:
+            first = imgs.all()[0] if hasattr(imgs, "all") else imgs[0]
+        except Exception:
+            first = None
+        if not first or not getattr(first, "image", None):
+            return None
+        req = self.context.get("request")
+        try:
+            return req.build_absolute_uri(first.image.url) if req else first.image.url
+        except Exception:
+            return None
+
+
 class ItemMakeSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
     company = serializers.ReadOnlyField(source="company.id")
     branch = serializers.ReadOnlyField(source="branch.id")
