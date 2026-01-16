@@ -580,7 +580,7 @@ class ProductListView(CompanyBranchRestrictedMixin, generics.ListAPIView):
         qs = (
             Product.objects.only(
                 "id", "name", "price", "quantity", "brand_id", "category_id", "code", "article",
-                "company_id", "branch_id", "client_id", "created_by_id", "characteristics_id",
+                "company_id", "branch_id", "client_id", "created_by_id",
             )
             .select_related(
                 "company",
