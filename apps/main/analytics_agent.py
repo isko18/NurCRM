@@ -40,9 +40,13 @@ except ImportError:
         return decorator
 
 
-# ===== Money helpers (важно для FieldError mixed types) =====
+# ===== типы/нули (важно для FieldError mixed types) =====
 MONEY_FIELD = DecimalField(max_digits=12, decimal_places=2)
 ZERO_MONEY = V(Decimal("0.00"), output_field=MONEY_FIELD)
+
+# quantity часто DecimalField → нужен Decimal-ноль, иначе mixed types
+QTY_FIELD = DecimalField(max_digits=14, decimal_places=3)
+ZERO_QTY = V(Decimal("0.000"), output_field=QTY_FIELD)
 
 
 def _parse_period(request):
@@ -74,59 +78,30 @@ def _parse_period(request):
     raw_from = _parse("date_from")
     raw_to = _parse("date_to")
 
-    # ---------- DAY ----------
     if period == "day":
         d = raw_date or raw_from or raw_to or today
-        return {
-            "period": "day",
-            "date_from": d,
-            "date_to": d,
-            "group_by": "day",
-        }
+        return {"period": "day", "date_from": d, "date_to": d, "group_by": "day"}
 
-    # ---------- WEEK ----------
     if period == "week":
         date_to = raw_to or raw_date or today
         date_from = raw_from or (date_to - timedelta(days=6))
-
         if date_from > date_to:
             date_from, date_to = date_to, date_from
+        return {"period": "week", "date_from": date_from, "date_to": date_to, "group_by": "day"}
 
-        return {
-            "period": "week",
-            "date_from": date_from,
-            "date_to": date_to,
-            "group_by": "day",
-        }
-
-    # ---------- CUSTOM ----------
     if period == "custom":
         date_to = raw_to or today
         date_from = raw_from or (date_to - timedelta(days=29))
-
         if date_from > date_to:
             date_from, date_to = date_to, date_from
+        return {"period": "custom", "date_from": date_from, "date_to": date_to, "group_by": "day"}
 
-        return {
-            "period": "custom",
-            "date_from": date_from,
-            "date_to": date_to,
-            "group_by": "day",
-        }
-
-    # ---------- MONTH (по умолчанию) ----------
     date_to = raw_to or today
     date_from = raw_from or (date_to - timedelta(days=29))
-
     if date_from > date_to:
         date_from, date_to = date_to, date_from
 
-    return {
-        "period": "month",
-        "date_from": date_from,
-        "date_to": date_to,
-        "group_by": "day",
-    }
+    return {"period": "month", "date_from": date_from, "date_to": date_to, "group_by": "day"}
 
 
 @cached_result(timeout=settings.CACHE_TIMEOUT_SHORT, key_prefix="agent_on_hand")
@@ -139,38 +114,26 @@ def _compute_agent_on_hand(*, company, branch, agent) -> dict:
         company=company,
         status=ReturnFromAgent.Status.ACCEPTED,
     )
-
     alloc_qs = AgentSaleAllocation.objects.filter(company=company)
 
     base = (
-        ManufactureSubreal.objects.filter(company=company, agent=agent)
+        ManufactureSubreal.objects
+        .filter(company=company, agent=agent)
         .select_related("product")
         .prefetch_related(
-            Prefetch(
-                "returns",
-                queryset=accepted_returns_qs,
-                to_attr="accepted_returns",
-            ),
-            Prefetch(
-                "sale_allocations",
-                queryset=alloc_qs,
-                to_attr="prefetched_allocs",
-            ),
+            Prefetch("returns", queryset=accepted_returns_qs, to_attr="accepted_returns"),
+            Prefetch("sale_allocations", queryset=alloc_qs, to_attr="prefetched_allocs"),
         )
-        # ВАЖНО: sold_qty считаем только по allocations текущей компании
+        # sold_qty обычно int → V(0) ок; но фильтруем по company, чтобы не схватить чужое
         .annotate(
             sold_qty=Coalesce(
-                Sum(
-                    "sale_allocations__qty",
-                    filter=Q(sale_allocations__company=company),
-                ),
+                Sum("sale_allocations__qty", filter=Q(sale_allocations__company=company)),
                 V(0),
             )
         )
         .order_by("product_id", "-created_at")
     )
 
-    # ВАЖНО: та же логика, что и в миксине
     if branch is not None:
         base = base.filter(branch=branch)
     else:
@@ -198,7 +161,6 @@ def _compute_agent_on_hand(*, company, branch, agent) -> dict:
             returned = int(s.qty_returned or 0)
 
             sold = int(getattr(s, "sold_qty", 0) or 0)
-            # fallback: если вдруг аннотация не сработала, используем prefetched_allocs
             if not sold and getattr(s, "prefetched_allocs", None) is not None:
                 sold = sum(int(a.qty or 0) for a in s.prefetched_allocs)
 
@@ -211,21 +173,17 @@ def _compute_agent_on_hand(*, company, branch, agent) -> dict:
         total_qty += qty_on_hand
         total_amount += amount
 
-        by_product_qty.append(
-            {
-                "product_id": str(product.id),
-                "product_name": product.name,
-                "qty_on_hand": qty_on_hand,
-            }
-        )
-        by_product_amount.append(
-            {
-                "product_id": str(product.id),
-                "product_name": product.name,
-                "qty_on_hand": qty_on_hand,
-                "amount": float(amount),
-            }
-        )
+        by_product_qty.append({
+            "product_id": str(product.id),
+            "product_name": product.name,
+            "qty_on_hand": qty_on_hand,
+        })
+        by_product_amount.append({
+            "product_id": str(product.id),
+            "product_name": product.name,
+            "qty_on_hand": qty_on_hand,
+            "amount": float(amount),
+        })
 
     return {
         "total_qty": total_qty,
@@ -250,7 +208,6 @@ def build_agent_analytics_payload(
     Аналитика агента.
     Кэшируется на 10 минут (CACHE_TIMEOUT_ANALYTICS).
     """
-    # ---- диапазон дат ----
     dt_from = timezone.make_aware(datetime.combine(date_from, datetime.min.time()))
     dt_to = timezone.make_aware(datetime.combine(date_to, datetime.max.time()))
 
@@ -268,9 +225,9 @@ def build_agent_analytics_payload(
         sub_qs = sub_qs.filter(branch__isnull=True)
 
     transfers_count = sub_qs.count()
-    items_transferred = (
-        sub_qs.aggregate(s=Coalesce(Sum("qty_transferred"), V(0)))["s"] or 0
-    )
+    items_transferred = sub_qs.aggregate(
+        s=Coalesce(Sum("qty_transferred"), V(0))
+    )["s"] or 0
 
     # ======================================================
     #              П Р И Ё М К И
@@ -294,7 +251,7 @@ def build_agent_analytics_payload(
         company=company,
         user=agent,
         created_at__range=(dt_from, dt_to),
-        status=Sale.Status.PAID,  # считаем только оплаченные
+        status=Sale.Status.PAID,
     )
     if branch is not None:
         sales_qs = sales_qs.filter(branch=branch)
@@ -311,9 +268,11 @@ def build_agent_analytics_payload(
 
     # ---------------- 1) продажи по товарам ----------------
     sales_by_product_qs = (
-        items_qs.values("product_id", "product__name")
+        items_qs
+        .values("product_id", "product__name")
         .annotate(
-            qty=Coalesce(Sum("quantity"), V(0)),
+            # ВАЖНО: quantity может быть DecimalField → Sum(quantity) = Decimal
+            qty=Coalesce(Sum("quantity", output_field=QTY_FIELD), ZERO_QTY),
             amount=Coalesce(
                 Sum(F("quantity") * F("unit_price"), output_field=MONEY_FIELD),
                 ZERO_MONEY,
@@ -333,11 +292,13 @@ def build_agent_analytics_payload(
 
     # ---------------- 2) продажи по датам ----------------
     sales_by_date_qs = (
-        items_qs.annotate(day=TruncDate("sale__created_at"))
+        items_qs
+        .annotate(day=TruncDate("sale__created_at"))
         .values("day")
         .annotate(
             sales_count=Count("sale_id", distinct=True),
-            items_sold=Coalesce(Sum("quantity"), V(0)),
+            # тоже quantity → Decimal
+            items_sold=Coalesce(Sum("quantity", output_field=QTY_FIELD), ZERO_QTY),
             amount=Coalesce(
                 Sum(F("quantity") * F("unit_price"), output_field=MONEY_FIELD),
                 ZERO_MONEY,
@@ -360,14 +321,12 @@ def build_agent_analytics_payload(
     if sales_amount > 0:
         for row in sales_by_product_amount:
             amount = row["amount"]
-            sales_distribution_by_product.append(
-                {
-                    "product_id": row["product_id"],
-                    "product_name": row["product_name"],
-                    "amount": amount,
-                    "percent": round(amount * 100.0 / sales_amount, 2),
-                }
-            )
+            sales_distribution_by_product.append({
+                "product_id": row["product_id"],
+                "product_name": row["product_name"],
+                "amount": amount,
+                "percent": round(amount * 100.0 / sales_amount, 2),
+            })
 
     # ======================================================
     #        Т О В А Р Ы  Н А  Р У К А Х
@@ -378,7 +337,8 @@ def build_agent_analytics_payload(
     #      П Е Р Е Д А Ч И  П О  Д Н Я М
     # ======================================================
     transfers_by_date_qs = (
-        sub_qs.annotate(day=TruncDate("created_at"))
+        sub_qs
+        .annotate(day=TruncDate("created_at"))
         .values("day")
         .annotate(
             transfers_count=Count("id"),
@@ -397,7 +357,8 @@ def build_agent_analytics_payload(
 
     # ТОП товаров по передачам
     top_products_qs = (
-        sub_qs.values("product_id", "product__name")
+        sub_qs
+        .values("product_id", "product__name")
         .annotate(
             transfers_count=Count("id"),
             items_transferred=Coalesce(Sum("qty_transferred"), V(0)),
@@ -438,11 +399,7 @@ def build_agent_analytics_payload(
 
     return {
         "agent": agent_payload,
-        "period": {
-            "type": period,
-            "date_from": date_from,
-            "date_to": date_to,
-        },
+        "period": {"type": period, "date_from": date_from, "date_to": date_to},
         "summary": {
             "transfers_count": transfers_count,
             "acceptances_count": acceptances_count,
