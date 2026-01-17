@@ -615,7 +615,9 @@ class ProductCompactListView(CompanyBranchRestrictedMixin, generics.ListAPIView)
 
     def get_queryset(self):
         qs = (
-            Product.objects.only(
+            Product.objects
+            .select_related("brand", "category")  # Оптимизация: загружаем brand и category одним запросом (на случай будущего использования)
+            .only(
                 "id", "name", "price", "quantity", "brand_id", "category_id", "code", "article",
             )
             .prefetch_related(
