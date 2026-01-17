@@ -13,7 +13,7 @@ class NotEnoughStock(Exception):
 def checkout_cart(cart: Cart, department=None) -> Sale:
     cart.recalc()
 
-    items = list(cart.items.select_related("product"))
+    items = list(cart.items.select_related("product", "product__brand", "product__category"))
     if not items:
         raise ValueError("Корзина пуста.")
 

@@ -1209,18 +1209,33 @@ class SaleScanAPIView(APIView):
         product = None
         scale_data = None
 
-        try:
-            product = Product.objects.get(company=cart.company, barcode=barcode)
-        except Product.DoesNotExist:
-            scale_data = _parse_scale_barcode(barcode)
-            if not scale_data:
-                return Response({"not_found": True, "message": "Товар не найден"}, status=404)
-
-            plu = scale_data["plu"]
+        # Оптимизация: используем select_related для связанных объектов и кэширование
+        cache_key = f"product_barcode:{cart.company_id}:{barcode}"
+        product = cache.get(cache_key)
+        
+        if product is None:
             try:
-                product = Product.objects.get(company=cart.company, plu=plu)
+                product = Product.objects.select_related("brand", "category").get(
+                    company=cart.company, barcode=barcode
+                )
+                # Кэшируем на 5 минут
+                cache.set(cache_key, product, 300)
             except Product.DoesNotExist:
-                return Response({"not_found": True, "message": f"Товар с ПЛУ {plu} не найден"}, status=404)
+                scale_data = _parse_scale_barcode(barcode)
+                if not scale_data:
+                    return Response({"not_found": True, "message": "Товар не найден"}, status=404)
+
+                plu = scale_data["plu"]
+                try:
+                    plu_cache_key = f"product_plu:{cart.company_id}:{plu}"
+                    product = cache.get(plu_cache_key)
+                    if product is None:
+                        product = Product.objects.select_related("brand", "category").get(
+                            company=cart.company, plu=plu
+                        )
+                        cache.set(plu_cache_key, product, 300)
+                except Product.DoesNotExist:
+                    return Response({"not_found": True, "message": f"Товар с ПЛУ {plu} не найден"}, status=404)
 
         if scale_data:
             effective_qty = Decimal(str(scale_data["weight_kg"]))
@@ -1252,7 +1267,8 @@ class SaleAddItemAPIView(APIView):
     @transaction.atomic
     def post(self, request, pk, *args, **kwargs):
         cart = get_object_or_404(
-            Cart,
+            Cart.objects.select_related("company", "branch", "user", "shift")
+            .prefetch_related("items__product"),
             id=pk,
             company=request.user.company,
             status=Cart.Status.ACTIVE,
@@ -1304,7 +1320,8 @@ class SaleCheckoutAPIView(APIView):
     @transaction.atomic
     def post(self, request, pk, *args, **kwargs):
         cart = get_object_or_404(
-            Cart,
+            Cart.objects.select_related("company", "branch", "user", "shift")
+            .prefetch_related("items__product", "items__product__brand", "items__product__category"),
             id=pk,
             company=request.user.company,
             status=Cart.Status.ACTIVE,
@@ -1397,7 +1414,7 @@ class SaleMobileScannerTokenAPIView(APIView):
 
     def post(self, request, pk, *args, **kwargs):
         cart = get_object_or_404(
-            Cart,
+            Cart.objects.select_related("company", "branch", "user", "shift"),
             id=pk,
             company=request.user.company,
             status=Cart.Status.ACTIVE,
@@ -1413,9 +1430,24 @@ class ProductFindByBarcodeAPIView(APIView):
         barcode = request.query_params.get("barcode", "").strip()
         if not barcode:
             return Response([], status=200)
-        qs = Product.objects.filter(company=request.user.company, barcode=barcode)[:1]
+        
+        # Оптимизация: кэширование и select_related
+        cache_key = f"product_barcode:{request.user.company_id}:{barcode}"
+        product = cache.get(cache_key)
+        
+        if product is None:
+            qs = Product.objects.select_related("brand", "category").filter(
+                company=request.user.company, barcode=barcode
+            )[:1]
+            product = qs.first()
+            if product:
+                cache.set(cache_key, product, 300)
+        
+        if not product:
+            return Response([], status=200)
+        
         return Response(
-            [{"id": str(p.id), "name": p.name, "barcode": p.barcode, "price": str(p.price)} for p in qs],
+            [{"id": str(product.id), "name": product.name, "barcode": product.barcode, "price": str(product.price)}],
             status=200,
         )
 
@@ -1622,7 +1654,8 @@ class SaleAddCustomItemAPIView(APIView):
     @transaction.atomic
     def post(self, request, pk, *args, **kwargs):
         cart = get_object_or_404(
-            Cart,
+            Cart.objects.select_related("company", "branch", "user", "shift")
+            .prefetch_related("items"),
             id=pk,
             company=request.user.company,
             status=Cart.Status.ACTIVE,
@@ -1845,7 +1878,8 @@ class AgentSaleScanAPIView(CompanyBranchRestrictedMixin, APIView):
     @transaction.atomic
     def post(self, request, pk, *args, **kwargs):
         cart = get_object_or_404(
-            Cart,
+            Cart.objects.select_related("company", "branch", "user", "shift")
+            .prefetch_related("items__product", "items__product__brand", "items__product__category"),
             id=pk,
             company=request.user.company,
             status=Cart.Status.ACTIVE,
@@ -1855,7 +1889,17 @@ class AgentSaleScanAPIView(CompanyBranchRestrictedMixin, APIView):
         barcode = ser.validated_data["barcode"].strip()
         qty = ser.validated_data["quantity"]
 
-        product = Product.objects.filter(company=cart.company, barcode=barcode).first()
+        # Оптимизация: кэширование и select_related
+        cache_key = f"product_barcode:{cart.company_id}:{barcode}"
+        product = cache.get(cache_key)
+        
+        if product is None:
+            product = Product.objects.select_related("brand", "category").filter(
+                company=cart.company, barcode=barcode
+            ).first()
+            if product:
+                cache.set(cache_key, product, 300)
+        
         if not product:
             return Response({"not_found": True, "message": "Товар не найден"}, status=404)
 
@@ -1968,7 +2012,8 @@ class AgentSaleAddCustomItemAPIView(CompanyBranchRestrictedMixin, APIView):
     @transaction.atomic
     def post(self, request, pk, *args, **kwargs):
         cart = get_object_or_404(
-            Cart,
+            Cart.objects.select_related("company", "branch", "user", "shift")
+            .prefetch_related("items"),
             id=pk,
             company=request.user.company,
             status=Cart.Status.ACTIVE,

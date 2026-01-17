@@ -1,4 +1,5 @@
 from rest_framework import serializers
+from django.core.exceptions import ValidationError as DjangoValidationError
 from . import models
 
 
@@ -31,19 +32,57 @@ class DocumentSerializer(serializers.ModelSerializer):
 
     def create(self, validated_data):
         items = validated_data.pop("items", [])
+        
+        # Валидация документа перед созданием
+        doc = models.Document(**validated_data)
+        try:
+            doc.clean()
+        except DjangoValidationError as e:
+            raise serializers.ValidationError(getattr(e, "message_dict", {"detail": str(e)}))
+        
         doc = super().create(validated_data)
+        
+        # Валидация и создание items
         for it in items:
-            models.DocumentItem.objects.create(document=doc, **it)
+            item = models.DocumentItem(document=doc, **it)
+            try:
+                item.clean()
+            except DjangoValidationError as e:
+                raise serializers.ValidationError(getattr(e, "message_dict", {"detail": str(e)}))
+            item.save()
+        
         return doc
 
     def update(self, instance, validated_data):
         items = validated_data.pop("items", None)
+        
+        # Проверяем, что документ не проведен
+        if instance.status == instance.Status.POSTED:
+            raise serializers.ValidationError({"status": "Нельзя изменять проведенный документ. Сначала отмените проведение."})
+        
+        # Валидация документа перед обновлением
+        for key, value in validated_data.items():
+            setattr(instance, key, value)
+        try:
+            instance.clean()
+        except DjangoValidationError as e:
+            raise serializers.ValidationError(getattr(e, "message_dict", {"detail": str(e)}))
+        
         instance = super().update(instance, validated_data)
+        
         if items is not None:
-            # naive replace
+            # Удаляем старые items
             instance.items.all().delete()
+            
+            # Валидация и создание новых items
             for it in items:
-                models.DocumentItem.objects.create(document=instance, **it)
+                item = models.DocumentItem(document=instance, **it)
+                try:
+                    item.clean()
+                except DjangoValidationError as e:
+                    raise serializers.ValidationError(getattr(e, "message_dict", {"detail": str(e)}))
+                item.save()
+        
         return instance
 
 

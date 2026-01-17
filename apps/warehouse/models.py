@@ -58,7 +58,7 @@ def product_image_upload_to(instance, filename: str) -> str:
 
 
 class Warehouse(BaseModelId, BaseModelDate, BaseModelCompanyBranch):
-    name = models.CharField(max_length=128, verbose_name="Название ", null=True, blank=True)
+    name = models.CharField(max_length=128, verbose_name="Название", null=True, blank=True)
     location = models.TextField(verbose_name="Локация", blank=False)
 
     class Status(models.TextChoices):
@@ -68,8 +68,13 @@ class Warehouse(BaseModelId, BaseModelDate, BaseModelCompanyBranch):
     status = models.CharField(
         max_length=10,
         choices=Status.choices,
-        default=Status.inactive
+        default=Status.inactive,
+        verbose_name="Статус"
     )
+
+    class Meta:
+        verbose_name = "Склад"
+        verbose_name_plural = "Склады"
 
 
 # -----------------------
@@ -126,12 +131,12 @@ class WarehouseProductBrand(BaseModelId, BaseModelCompanyBranch):
 
 
 class WarehouseProductCategory(BaseModelId, BaseModelCompanyBranch):
-    name = models.CharField(max_length=128, verbose_name="Название ")
+    name = models.CharField(max_length=128, verbose_name="Название")
 
     parent = TreeForeignKey(
         'self', on_delete=models.CASCADE,
         null=True, blank=True,
-        related_name='children', verbose_name='Родительская категория ')
+        related_name='children', verbose_name='Родительская категория')
 
     class MPTTMeta:
         order_insertion_by = ['name']
@@ -414,6 +419,17 @@ class WarehouseProduct(BaseModelId, BaseModelDate, BaseModelCompanyBranch):
             raise ValidationError({"quantity": "Количество не может быть отрицательным."})
 
     def save(self, *args, **kwargs):
+        # Инвалидация кэша при изменении barcode или plu
+        old_barcode = None
+        old_plu = None
+        if self.pk:
+            try:
+                old_instance = WarehouseProduct.objects.get(pk=self.pk)
+                old_barcode = old_instance.barcode
+                old_plu = old_instance.plu
+            except WarehouseProduct.DoesNotExist:
+                pass
+        
         self._recalc_price()
         self.quantity = q_qty(Decimal(self.quantity or 0))
 
@@ -421,7 +437,24 @@ class WarehouseProduct(BaseModelId, BaseModelDate, BaseModelCompanyBranch):
             self._pg_lock_company()
             self._auto_generate_code()
             self._auto_generate_plu()
-            return super().save(*args, **kwargs)
+            result = super().save(*args, **kwargs)
+            
+            # Инвалидация кэша после сохранения
+            from django.core.cache import cache
+            if old_barcode and old_barcode != self.barcode:
+                cache_key = f"warehouse_product_barcode:{self.company_id}:{old_barcode}"
+                cache.delete(cache_key)
+            if self.barcode:
+                cache_key = f"warehouse_product_barcode:{self.company_id}:{self.barcode}"
+                cache.delete(cache_key)
+            if old_plu and old_plu != self.plu:
+                cache_key = f"warehouse_product_plu:{self.company_id}:{self.warehouse_id}:{old_plu}"
+                cache.delete(cache_key)
+            if self.plu:
+                cache_key = f"warehouse_product_plu:{self.company_id}:{self.warehouse_id}:{self.plu}"
+                cache.delete(cache_key)
+            
+            return result
 
 
 class WarehouseProductCharasteristics(BaseModelId, BaseModelCompanyBranch, BaseModelDate):
@@ -471,7 +504,7 @@ class WarehouseProductImage(BaseModelId, BaseModelCompanyBranch):
     image = models.ImageField(upload_to=product_image_upload_to, null=True, blank=True, verbose_name="Изображение (WebP)")
     alt = models.CharField(max_length=255, blank=True, verbose_name="Alt-текст")
     is_primary = models.BooleanField(default=False, verbose_name="Основное изображение")
-    created_at = models.DateTimeField(auto_now_add=True)
+    created_at = models.DateTimeField(auto_now_add=True, verbose_name="Дата создания")
 
     class Meta:
         verbose_name = "Фото товара"
@@ -598,11 +631,13 @@ from django.conf import settings
 
 
 class StockBalance(models.Model):
-    warehouse = models.ForeignKey("warehouse.Warehouse", on_delete=models.CASCADE, related_name="balances")
-    product = models.ForeignKey("warehouse.WarehouseProduct", on_delete=models.CASCADE, related_name="balances")
-    qty = models.DecimalField(max_digits=18, decimal_places=3, default=Decimal("0.000"))
+    warehouse = models.ForeignKey("warehouse.Warehouse", on_delete=models.CASCADE, related_name="balances", verbose_name="Склад")
+    product = models.ForeignKey("warehouse.WarehouseProduct", on_delete=models.CASCADE, related_name="balances", verbose_name="Товар")
+    qty = models.DecimalField(max_digits=18, decimal_places=3, default=Decimal("0.000"), verbose_name="Количество")
 
     class Meta:
+        verbose_name = "Остаток на складе"
+        verbose_name_plural = "Остатки на складах"
         unique_together = ("warehouse", "product")
         indexes = [models.Index(fields=["warehouse", "product"]) ]
 
@@ -612,56 +647,66 @@ class StockBalance(models.Model):
 
 class Counterparty(models.Model):
     class Type(models.TextChoices):
-        CLIENT = "CLIENT", "Client"
-        SUPPLIER = "SUPPLIER", "Supplier"
-        BOTH = "BOTH", "Both"
+        CLIENT = "CLIENT", "Клиент"
+        SUPPLIER = "SUPPLIER", "Поставщик"
+        BOTH = "BOTH", "Оба"
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    name = models.CharField(max_length=255)
-    type = models.CharField(max_length=16, choices=Type.choices, default=Type.BOTH)
+    name = models.CharField(max_length=255, verbose_name="Название")
+    type = models.CharField(max_length=16, choices=Type.choices, default=Type.BOTH, verbose_name="Тип")
+
+    class Meta:
+        verbose_name = "Контрагент"
+        verbose_name_plural = "Контрагенты"
 
     def __str__(self):
         return self.name
 
 
 class DocumentSequence(models.Model):
-    doc_type = models.CharField(max_length=32)
-    date = models.DateField()
-    seq = models.PositiveIntegerField(default=0)
+    doc_type = models.CharField(max_length=32, verbose_name="Тип документа")
+    date = models.DateField(verbose_name="Дата")
+    seq = models.PositiveIntegerField(default=0, verbose_name="Последовательность")
 
     class Meta:
+        verbose_name = "Последовательность документов"
+        verbose_name_plural = "Последовательности документов"
         unique_together = (("doc_type", "date"),)
 
 
 class Document(models.Model):
     class DocType(models.TextChoices):
-        SALE = "SALE", "Sale"
-        PURCHASE = "PURCHASE", "Purchase"
-        SALE_RETURN = "SALE_RETURN", "Sale return"
-        PURCHASE_RETURN = "PURCHASE_RETURN", "Purchase return"
-        INVENTORY = "INVENTORY", "Inventory"
-        RECEIPT = "RECEIPT", "Receipt"
-        WRITE_OFF = "WRITE_OFF", "Write off"
-        TRANSFER = "TRANSFER", "Transfer"
+        SALE = "SALE", "Продажа"
+        PURCHASE = "PURCHASE", "Покупка"
+        SALE_RETURN = "SALE_RETURN", "Возврат продажи"
+        PURCHASE_RETURN = "PURCHASE_RETURN", "Возврат покупки"
+        INVENTORY = "INVENTORY", "Инвентаризация"
+        RECEIPT = "RECEIPT", "Приход"
+        WRITE_OFF = "WRITE_OFF", "Списание"
+        TRANSFER = "TRANSFER", "Перемещение"
 
     class Status(models.TextChoices):
-        DRAFT = "DRAFT", "Draft"
-        POSTED = "POSTED", "Posted"
+        DRAFT = "DRAFT", "Черновик"
+        POSTED = "POSTED", "Проведен"
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    doc_type = models.CharField(max_length=32, choices=DocType.choices)
-    status = models.CharField(max_length=16, choices=Status.choices, default=Status.DRAFT)
-    number = models.CharField(max_length=64, unique=True, null=True, blank=True)
-    date = models.DateTimeField(auto_now_add=True)
+    doc_type = models.CharField(max_length=32, choices=DocType.choices, verbose_name="Тип документа")
+    status = models.CharField(max_length=16, choices=Status.choices, default=Status.DRAFT, verbose_name="Статус")
+    number = models.CharField(max_length=64, unique=True, null=True, blank=True, verbose_name="Номер")
+    date = models.DateTimeField(auto_now_add=True, verbose_name="Дата")
 
-    warehouse_from = models.ForeignKey("warehouse.Warehouse", on_delete=models.SET_NULL, null=True, blank=True, related_name="documents_from")
-    warehouse_to = models.ForeignKey("warehouse.Warehouse", on_delete=models.SET_NULL, null=True, blank=True, related_name="documents_to")
-    counterparty = models.ForeignKey("warehouse.Counterparty", on_delete=models.SET_NULL, null=True, blank=True)
+    warehouse_from = models.ForeignKey("warehouse.Warehouse", on_delete=models.SET_NULL, null=True, blank=True, related_name="documents_from", verbose_name="Склад-источник")
+    warehouse_to = models.ForeignKey("warehouse.Warehouse", on_delete=models.SET_NULL, null=True, blank=True, related_name="documents_to", verbose_name="Склад-приемник")
+    counterparty = models.ForeignKey("warehouse.Counterparty", on_delete=models.SET_NULL, null=True, blank=True, verbose_name="Контрагент")
 
-    comment = models.TextField(blank=True)
-    total = models.DecimalField(max_digits=18, decimal_places=2, default=Decimal("0.00"))
-    created_at = models.DateTimeField(auto_now_add=True)
-    updated_at = models.DateTimeField(auto_now=True)
+    comment = models.TextField(blank=True, verbose_name="Комментарий")
+    total = models.DecimalField(max_digits=18, decimal_places=2, default=Decimal("0.00"), verbose_name="Итого")
+    created_at = models.DateTimeField(auto_now_add=True, verbose_name="Дата создания")
+    updated_at = models.DateTimeField(auto_now=True, verbose_name="Дата обновления")
+
+    class Meta:
+        verbose_name = "Документ"
+        verbose_name_plural = "Документы"
 
     def __str__(self):
         return f"{self.number} ({self.doc_type})"
@@ -685,12 +730,16 @@ class Document(models.Model):
 
 class DocumentItem(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    document = models.ForeignKey(Document, on_delete=models.CASCADE, related_name="items")
-    product = models.ForeignKey("warehouse.WarehouseProduct", on_delete=models.PROTECT)
-    qty = models.DecimalField(max_digits=18, decimal_places=3)
-    price = models.DecimalField(max_digits=18, decimal_places=2, default=Decimal("0.00"))
-    discount_percent = models.DecimalField(max_digits=5, decimal_places=2, default=Decimal("0.00"))
-    line_total = models.DecimalField(max_digits=18, decimal_places=2, default=Decimal("0.00"))
+    document = models.ForeignKey(Document, on_delete=models.CASCADE, related_name="items", verbose_name="Документ")
+    product = models.ForeignKey("warehouse.WarehouseProduct", on_delete=models.PROTECT, verbose_name="Товар")
+    qty = models.DecimalField(max_digits=18, decimal_places=3, verbose_name="Количество")
+    price = models.DecimalField(max_digits=18, decimal_places=2, default=Decimal("0.00"), verbose_name="Цена")
+    discount_percent = models.DecimalField(max_digits=5, decimal_places=2, default=Decimal("0.00"), verbose_name="Скидка, %")
+    line_total = models.DecimalField(max_digits=18, decimal_places=2, default=Decimal("0.00"), verbose_name="Итого по строке")
+
+    class Meta:
+        verbose_name = "Строка документа"
+        verbose_name_plural = "Строки документов"
 
     def clean(self):
         from django.core.exceptions import ValidationError
@@ -704,13 +753,47 @@ class DocumentItem(models.Model):
         if not (Decimal("0") <= dp <= Decimal("100")):
             raise ValidationError({"discount_percent": "Must be between 0 and 100"})
 
+        # Проверка соответствия товара складу документа
+        # Проверяем только если document уже сохранен (имеет pk) или передан напрямую
+        doc = getattr(self, 'document', None)
+        if doc and self.product_id:
+            # Если document еще не сохранен, но передан - проверяем по ID
+            if hasattr(doc, 'pk') and doc.pk is None:
+                # Документ еще не сохранен - проверяем по warehouse_from_id напрямую
+                if hasattr(doc, 'warehouse_from_id') and doc.warehouse_from_id:
+                    prod = self.product
+                    if prod.warehouse_id != doc.warehouse_from_id and doc.doc_type != doc.DocType.TRANSFER:
+                        raise ValidationError({"product": "Товар должен принадлежать складу документа."})
+            elif hasattr(doc, 'pk') and doc.pk:
+                # Документ сохранен - полная проверка
+                prod = self.product
+                
+                # Проверка компании
+                if hasattr(doc, 'warehouse_from') and doc.warehouse_from_id:
+                    # Загружаем warehouse_from если нужно
+                    if not hasattr(doc.warehouse_from, 'company_id'):
+                        doc.warehouse_from.refresh_from_db()
+                    if prod.company_id != doc.warehouse_from.company_id:
+                        raise ValidationError({"product": "Товар принадлежит другой компании, чем склад документа."})
+                
+                # Проверка склада для операций с одним складом
+                if doc.doc_type != doc.DocType.TRANSFER:
+                    if doc.warehouse_from_id and prod.warehouse_id != doc.warehouse_from_id:
+                        warehouse_name = doc.warehouse_from.name if hasattr(doc, 'warehouse_from') and doc.warehouse_from else "документа"
+                        raise ValidationError({"product": f"Товар должен принадлежать складу '{warehouse_name}'."})
+                else:
+                    # Для TRANSFER товар должен быть на одном из складов
+                    if doc.warehouse_from_id and doc.warehouse_to_id:
+                        if prod.warehouse_id not in (doc.warehouse_from_id, doc.warehouse_to_id):
+                            raise ValidationError({"product": "Товар должен принадлежать одному из складов перемещения."})
+
         # integral check for PCS
         try:
-            unit = self.product.unit
+            unit = self.product.unit if self.product_id else None
         except Exception:
             unit = None
 
-        if unit and unit.lower().startswith("pcs") or getattr(self.product, "is_weight", False) is False:
+        if unit and unit.lower().startswith("pcs") or (self.product_id and getattr(self.product, "is_weight", False) is False):
             # treat as pieces: require integer qty
             if (Decimal(self.qty) % 1) != 0:
                 raise ValidationError({"qty": "Quantity must be integer for piece items"})
@@ -726,13 +809,15 @@ class DocumentItem(models.Model):
 
 class StockMove(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    document = models.ForeignKey(Document, on_delete=models.CASCADE, related_name="moves")
-    warehouse = models.ForeignKey("warehouse.Warehouse", on_delete=models.CASCADE)
-    product = models.ForeignKey("warehouse.WarehouseProduct", on_delete=models.CASCADE)
-    qty_delta = models.DecimalField(max_digits=18, decimal_places=3)
-    created_at = models.DateTimeField(auto_now_add=True)
+    document = models.ForeignKey(Document, on_delete=models.CASCADE, related_name="moves", verbose_name="Документ")
+    warehouse = models.ForeignKey("warehouse.Warehouse", on_delete=models.CASCADE, verbose_name="Склад")
+    product = models.ForeignKey("warehouse.WarehouseProduct", on_delete=models.CASCADE, verbose_name="Товар")
+    qty_delta = models.DecimalField(max_digits=18, decimal_places=3, verbose_name="Изменение количества")
+    created_at = models.DateTimeField(auto_now_add=True, verbose_name="Дата создания")
 
     class Meta:
+        verbose_name = "Движение товара"
+        verbose_name_plural = "Движения товаров"
         indexes = [models.Index(fields=["warehouse", "product", "created_at"])]
 
     def __str__(self):

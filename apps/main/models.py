@@ -766,6 +766,8 @@ class Product(models.Model):
             models.Index(fields=["company", "status"]),
             models.Index(fields=["company", "branch", "status"]),
             models.Index(fields=["company", "plu"]),
+            # Оптимизация для сканирования по штрих-коду
+            models.Index(fields=["company", "barcode"], name="idx_product_company_barcode"),
         ]
         constraints = [
             # ✅ штрихкод уникален в рамках компании, только если задан и не пустой
@@ -865,12 +867,34 @@ class Product(models.Model):
             raise ValidationError({"discount_percent": "Скидка должна быть от 0 до 100%."})
 
     def save(self, *args, **kwargs):
+        # Инвалидация кэша при изменении barcode или plu
+        old_barcode = None
+        old_plu = None
+        if self.pk:
+            try:
+                old_instance = Product.objects.get(pk=self.pk)
+                old_barcode = old_instance.barcode
+                old_plu = old_instance.plu
+            except Product.DoesNotExist:
+                pass
+        
         self._recalc_price()
         with transaction.atomic():
             self._pg_lock_company()
             self._auto_generate_code()
             self._auto_generate_plu()
             super().save(*args, **kwargs)
+            
+            # Инвалидация кэша после сохранения
+            from django.core.cache import cache
+            if old_barcode and old_barcode != self.barcode:
+                cache.delete(f"product_barcode:{self.company_id}:{old_barcode}")
+            if self.barcode:
+                cache.delete(f"product_barcode:{self.company_id}:{self.barcode}")
+            if old_plu and old_plu != self.plu:
+                cache.delete(f"product_plu:{self.company_id}:{old_plu}")
+            if self.plu:
+                cache.delete(f"product_plu:{self.company_id}:{self.plu}")
             
 class ProductCharacteristics(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
