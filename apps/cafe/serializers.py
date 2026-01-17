@@ -550,6 +550,7 @@ class OrderSerializer(CompanyBranchReadOnlyMixin):
                     
                     # Восстанавливаем активные задачи
                     tasks_to_restore = []
+                    tasks_to_update = []
                     for (menu_item_id, unit_index), task_data in active_tasks_by_menu.items():
                         # Ищем соответствующий новый item по menu_item_id
                         matching_items = created_items_by_menu.get(menu_item_id, [])
@@ -559,22 +560,48 @@ class OrderSerializer(CompanyBranchReadOnlyMixin):
                             
                             # Проверяем, что unit_index не превышает quantity нового item
                             if unit_index <= matching_item.quantity:
-                                tasks_to_restore.append(
-                                    KitchenTask(
-                                        company=instance.company,
-                                        branch=instance.branch,
-                                        order=instance,
-                                        order_item=matching_item,
-                                        menu_item_id=menu_item_id,
-                                        waiter=instance.waiter,
-                                        unit_index=unit_index,
-                                        status=task_data['status'],
-                                        cook_id=task_data['cook_id'],
-                                        started_at=task_data['started_at'],
-                                        finished_at=task_data['finished_at'],
+                                # Проверяем, существует ли уже задача с таким order_item и unit_index
+                                # (она могла быть создана сигналом со статусом PENDING)
+                                existing_task = KitchenTask.objects.filter(
+                                    order_item=matching_item,
+                                    unit_index=unit_index
+                                ).first()
+                                
+                                if existing_task:
+                                    # Если задача уже существует (создана сигналом), обновляем её
+                                    existing_task.status = task_data['status']
+                                    existing_task.cook_id = task_data['cook_id']
+                                    existing_task.started_at = task_data['started_at']
+                                    existing_task.finished_at = task_data['finished_at']
+                                    existing_task.waiter = instance.waiter
+                                    tasks_to_update.append(existing_task)
+                                else:
+                                    # Если задачи нет, создаем новую
+                                    tasks_to_restore.append(
+                                        KitchenTask(
+                                            company=instance.company,
+                                            branch=instance.branch,
+                                            order=instance,
+                                            order_item=matching_item,
+                                            menu_item_id=menu_item_id,
+                                            waiter=instance.waiter,
+                                            unit_index=unit_index,
+                                            status=task_data['status'],
+                                            cook_id=task_data['cook_id'],
+                                            started_at=task_data['started_at'],
+                                            finished_at=task_data['finished_at'],
+                                        )
                                     )
-                                )
                     
+                    # Обновляем существующие задачи
+                    if tasks_to_update:
+                        KitchenTask.objects.bulk_update(
+                            tasks_to_update,
+                            ['status', 'cook_id', 'started_at', 'finished_at', 'waiter_id'],
+                            batch_size=100
+                        )
+                    
+                    # Создаем новые задачи
                     if tasks_to_restore:
                         KitchenTask.objects.bulk_create(tasks_to_restore, ignore_conflicts=True)
         return instance
