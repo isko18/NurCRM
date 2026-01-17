@@ -458,7 +458,7 @@ class OrderSerializer(CompanyBranchReadOnlyMixin):
         "status","is_paid","paid_at","payment_method","total_amount","discount_amount",
         "items"
         ]
-        read_only_fields = ["status","is_paid","paid_at","payment_method","total_amount","discount_amount"]
+        read_only_fields = ["is_paid","paid_at","payment_method","total_amount","discount_amount"]
 
     def get_fields(self):
         fields = super().get_fields()
