@@ -515,9 +515,68 @@ class OrderSerializer(CompanyBranchReadOnlyMixin):
         with transaction.atomic():
             instance = super().update(instance, validated_data)
             if items is not None:
-                instance.items.all().delete()  # каскадом удалит KitchenTask
+                # Сохраняем KitchenTask, которые уже в работе (IN_PROGRESS или READY)
+                # Группируем по menu_item_id и unit_index для последующего восстановления
+                from .models import KitchenTask
+                active_tasks = KitchenTask.objects.filter(
+                    order=instance,
+                    status__in=[KitchenTask.Status.IN_PROGRESS, KitchenTask.Status.READY]
+                ).select_related('order_item', 'menu_item').values(
+                    'menu_item_id', 'unit_index', 'status', 
+                    'cook_id', 'started_at', 'finished_at'
+                )
+                
+                # Сохраняем активные задачи по menu_item_id и unit_index
+                active_tasks_by_menu = {}
+                for task in active_tasks:
+                    key = (task['menu_item_id'], task['unit_index'])
+                    active_tasks_by_menu[key] = task
+                
+                # Удаляем все items (каскадом удалятся KitchenTask)
+                instance.items.all().delete()
+                
+                # Создаем новые items
                 if items:
                     self._upsert_items(instance, items)
+                
+                # Восстанавливаем KitchenTask для соответствующих menu_item
+                if active_tasks_by_menu:
+                    # Получаем созданные items, сгруппированные по menu_item_id
+                    created_items_by_menu = {}
+                    for item in instance.items.select_related('menu_item').all():
+                        if item.menu_item_id not in created_items_by_menu:
+                            created_items_by_menu[item.menu_item_id] = []
+                        created_items_by_menu[item.menu_item_id].append(item)
+                    
+                    # Восстанавливаем активные задачи
+                    tasks_to_restore = []
+                    for (menu_item_id, unit_index), task_data in active_tasks_by_menu.items():
+                        # Ищем соответствующий новый item по menu_item_id
+                        matching_items = created_items_by_menu.get(menu_item_id, [])
+                        if matching_items:
+                            # Берем первый подходящий item (или можно выбрать по другим критериям)
+                            matching_item = matching_items[0]
+                            
+                            # Проверяем, что unit_index не превышает quantity нового item
+                            if unit_index <= matching_item.quantity:
+                                tasks_to_restore.append(
+                                    KitchenTask(
+                                        company=instance.company,
+                                        branch=instance.branch,
+                                        order=instance,
+                                        order_item=matching_item,
+                                        menu_item_id=menu_item_id,
+                                        waiter=instance.waiter,
+                                        unit_index=unit_index,
+                                        status=task_data['status'],
+                                        cook_id=task_data['cook_id'],
+                                        started_at=task_data['started_at'],
+                                        finished_at=task_data['finished_at'],
+                                    )
+                                )
+                    
+                    if tasks_to_restore:
+                        KitchenTask.objects.bulk_create(tasks_to_restore, ignore_conflicts=True)
         return instance
     
 
