@@ -401,6 +401,7 @@ class DocumentSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer
     folder_name = serializers.CharField(source="folder.name", read_only=True)
 
     class Meta:
+        ref_name = "BookingDocumentSerializer"
         model = Document
         fields = ["id", "company", "branch", "name", "file", "folder", "folder_name", "created_at", "updated_at"]
         read_only_fields = ["id", "company", "branch", "created_at", "updated_at", "folder_name"]
