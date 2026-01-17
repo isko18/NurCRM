@@ -66,6 +66,7 @@ class CompanyIGAccount(models.Model):
 
 
 class IGThread(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False, verbose_name="ID")
     ig_account = models.ForeignKey("CompanyIGAccount", on_delete=models.CASCADE)
     thread_id = models.CharField(max_length=100, db_index=True)
     title = models.CharField(max_length=255, blank=True)
@@ -90,6 +91,7 @@ class IGThread(models.Model):
 
 
 class IGMessage(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False, verbose_name="ID")
     thread = models.ForeignKey(IGThread, on_delete=models.CASCADE)
     mid = models.CharField(max_length=100, unique=True)
     sender_pk = models.CharField(max_length=100)

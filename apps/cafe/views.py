@@ -1,6 +1,7 @@
 # apps/cafe/views.py
 from decimal import Decimal
 import json
+import uuid
 
 from django.db import transaction
 from django.db.models import Q, Count, Avg, ExpressionWrapper, DurationField, F
@@ -11,6 +12,9 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 from channels.layers import get_channel_layer
 from asgiref.sync import async_to_sync
+import logging
+
+logger = logging.getLogger(__name__)
 
 from apps.users.models import Branch
 from .models import (
@@ -1073,8 +1077,10 @@ def send_order_created_notification(order):
     Отправляет WebSocket уведомление о создании заказа.
     """
     try:
+        logger.info(f"[send_order_created_notification] Starting: order_id={order.id}")
         channel_layer = get_channel_layer()
         if not channel_layer:
+            logger.warning(f"[send_order_created_notification] Channel layer not configured")
             return
         
         company_id = str(order.company_id)
@@ -1086,10 +1092,17 @@ def send_order_created_notification(order):
         else:
             group_name = f"cafe_orders_{company_id}"
         
+        logger.info(f"[send_order_created_notification] Sending to group: {group_name}, order_id={order.id}")
+        
         # Сериализуем данные заказа
         from .serializers import OrderSerializer
         serializer = OrderSerializer(order)
         order_data = serializer.data
+        
+        # Конвертируем UUID и Decimal в строки для msgpack сериализации
+        order_data = json.loads(json.dumps(order_data, default=str))
+        
+        logger.debug(f"[send_order_created_notification] Order data serialized: {len(str(order_data))} chars")
         
         # Отправляем уведомление в группу
         async_to_sync(channel_layer.group_send)(
@@ -1103,9 +1116,9 @@ def send_order_created_notification(order):
                 }
             }
         )
-    except Exception:
-        # Игнорируем ошибки WebSocket, чтобы не ломать основной процесс
-        pass
+        logger.info(f"[send_order_created_notification] Message sent to channel layer: group={group_name}")
+    except Exception as e:
+        logger.error(f"[send_order_created_notification] Error sending notification: {e}", exc_info=True)
 
 
 def send_order_updated_notification(order):
@@ -1113,8 +1126,10 @@ def send_order_updated_notification(order):
     Отправляет WebSocket уведомление об обновлении заказа.
     """
     try:
+        logger.info(f"[send_order_updated_notification] Starting: order_id={order.id}")
         channel_layer = get_channel_layer()
         if not channel_layer:
+            logger.warning(f"[send_order_updated_notification] Channel layer not configured")
             return
         
         company_id = str(order.company_id)
@@ -1126,10 +1141,17 @@ def send_order_updated_notification(order):
         else:
             group_name = f"cafe_orders_{company_id}"
         
+        logger.info(f"[send_order_updated_notification] Sending to group: {group_name}, order_id={order.id}")
+        
         # Сериализуем данные заказа
         from .serializers import OrderSerializer
         serializer = OrderSerializer(order)
         order_data = serializer.data
+        
+        # Конвертируем UUID и Decimal в строки для msgpack сериализации
+        order_data = json.loads(json.dumps(order_data, default=str))
+        
+        logger.debug(f"[send_order_updated_notification] Order data serialized: {len(str(order_data))} chars")
         
         # Отправляем уведомление в группу
         async_to_sync(channel_layer.group_send)(
@@ -1143,9 +1165,9 @@ def send_order_updated_notification(order):
                 }
             }
         )
-    except Exception:
-        # Игнорируем ошибки WebSocket, чтобы не ломать основной процесс
-        pass
+        logger.info(f"[send_order_updated_notification] Message sent to channel layer: group={group_name}")
+    except Exception as e:
+        logger.error(f"[send_order_updated_notification] Error sending notification: {e}", exc_info=True)
 
 
 def send_table_created_notification(table):
@@ -1171,6 +1193,9 @@ def send_table_created_notification(table):
         serializer = TableSerializer(table)
         table_data = serializer.data
         
+        # Конвертируем UUID и Decimal в строки для msgpack сериализации
+        table_data = json.loads(json.dumps(table_data, default=str))
+        
         # Отправляем уведомление в группу
         async_to_sync(channel_layer.group_send)(
             group_name,
@@ -1183,9 +1208,8 @@ def send_table_created_notification(table):
                 }
             }
         )
-    except Exception:
-        # Игнорируем ошибки WebSocket, чтобы не ломать основной процесс
-        pass
+    except Exception as e:
+        logger.error(f"[send_table_created_notification] Error: {e}", exc_info=True)
 
 
 def send_table_updated_notification(table):
@@ -1211,6 +1235,9 @@ def send_table_updated_notification(table):
         serializer = TableSerializer(table)
         table_data = serializer.data
         
+        # Конвертируем UUID и Decimal в строки для msgpack сериализации
+        table_data = json.loads(json.dumps(table_data, default=str))
+        
         # Отправляем уведомление в группу
         async_to_sync(channel_layer.group_send)(
             group_name,
@@ -1223,9 +1250,8 @@ def send_table_updated_notification(table):
                 }
             }
         )
-    except Exception:
-        # Игнорируем ошибки WebSocket, чтобы не ломать основной процесс
-        pass
+    except Exception as e:
+        logger.error(f"[send_table_updated_notification] Error: {e}", exc_info=True)
 
 
 def send_table_status_changed_notification(table):
@@ -1257,6 +1283,9 @@ def send_table_status_changed_notification(table):
         from .serializers import TableSerializer
         serializer = TableSerializer(table)
         table_data = serializer.data
+        
+        # Конвертируем UUID и Decimal в строки для msgpack сериализации
+        table_data = json.loads(json.dumps(table_data, default=str))
         
         # Отправляем уведомление в группу столов
         async_to_sync(channel_layer.group_send)(
@@ -1291,6 +1320,5 @@ def send_table_status_changed_notification(table):
                 }
             }
         )
-    except Exception:
-        # Игнорируем ошибки WebSocket, чтобы не ломать основной процесс
-        pass
+    except Exception as e:
+        logger.error(f"[send_table_status_changed_notification] Error: {e}", exc_info=True)

@@ -1,5 +1,6 @@
 # apps/cafe/consumers.py
 import json
+import logging
 from channels.generic.websocket import AsyncWebsocketConsumer
 from channels.db import database_sync_to_async
 from django.contrib.auth.models import AnonymousUser
@@ -7,6 +8,7 @@ from rest_framework_simplejwt.tokens import AccessToken
 from django.contrib.auth import get_user_model
 
 User = get_user_model()
+logger = logging.getLogger(__name__)
 
 
 class CafeOrderConsumer(AsyncWebsocketConsumer):
@@ -21,6 +23,7 @@ class CafeOrderConsumer(AsyncWebsocketConsumer):
         # Получаем пользователя из scope (уже обработан JWTAuthMiddleware)
         user = self.scope.get("user")
         if not user or isinstance(user, AnonymousUser):
+            logger.warning(f"[CafeOrderConsumer] Connection rejected: No user")
             await self.close(code=4003)
             return
         
@@ -28,6 +31,7 @@ class CafeOrderConsumer(AsyncWebsocketConsumer):
         company, branch = await self._get_user_company_and_branch(user)
         
         if not company:
+            logger.warning(f"[CafeOrderConsumer] Connection rejected: User {user.id} has no company")
             await self.close(code=4004, reason="User has no company")
             return
         
@@ -60,6 +64,8 @@ class CafeOrderConsumer(AsyncWebsocketConsumer):
         await self.channel_layer.group_add(self.group_name, self.channel_name)
         await self.accept()
         
+        logger.info(f"[CafeOrderConsumer] Connected: user={user.id}, company={self.company_id}, branch={self.branch_id}, group={self.group_name}")
+        
         # Отправляем подтверждение подключения
         await self.send(json.dumps({
             "type": "connection_established",
@@ -70,6 +76,7 @@ class CafeOrderConsumer(AsyncWebsocketConsumer):
     
     async def disconnect(self, code):
         if hasattr(self, "group_name"):
+            logger.info(f"[CafeTableConsumer] Disconnected: group={self.group_name}, code={code}")
             await self.channel_layer.group_discard(
                 self.group_name, self.channel_name
             )
@@ -90,27 +97,43 @@ class CafeOrderConsumer(AsyncWebsocketConsumer):
     
     async def order_created(self, event):
         """Отправка уведомления о создании заказа"""
-        payload = event.get("payload", {})
-        await self.send(json.dumps({
-            "type": "order_created",
-            "data": payload
-        }))
+        try:
+            payload = event.get("payload", {})
+            logger.info(f"[CafeOrderConsumer] Received order_created event: order_id={payload.get('order', {}).get('id')}, group={self.group_name}")
+            await self.send(json.dumps({
+                "type": "order_created",
+                "data": payload
+            }))
+            logger.info(f"[CafeOrderConsumer] Sent order_created notification to client")
+        except Exception as e:
+            logger.error(f"[CafeOrderConsumer] Error in order_created: {e}", exc_info=True)
     
     async def order_updated(self, event):
         """Отправка уведомления об обновлении заказа"""
-        payload = event.get("payload", {})
-        await self.send(json.dumps({
-            "type": "order_updated",
-            "data": payload
-        }))
+        try:
+            payload = event.get("payload", {})
+            logger.info(f"[CafeOrderConsumer] Received order_updated event: order_id={payload.get('order', {}).get('id')}, group={self.group_name}")
+            await self.send(json.dumps({
+                "type": "order_updated",
+                "data": payload
+            }))
+            logger.info(f"[CafeOrderConsumer] Sent order_updated notification to client")
+        except Exception as e:
+            logger.error(f"[CafeOrderConsumer] Error in order_updated: {e}", exc_info=True)
     
     async def table_status_changed(self, event):
         """Отправка уведомления об изменении статуса стола (FREE/BUSY) - для отслеживания занятости"""
-        payload = event.get("payload", {})
-        await self.send(json.dumps({
-            "type": "table_status_changed",
-            "data": payload
-        }))
+        try:
+            payload = event.get("payload", {})
+            table_id = payload.get("table_id") or payload.get("table", {}).get("id")
+            logger.info(f"[CafeOrderConsumer] Received table_status_changed event: table_id={table_id}, status={payload.get('status')}, group={self.group_name}")
+            await self.send(json.dumps({
+                "type": "table_status_changed",
+                "data": payload
+            }))
+            logger.info(f"[CafeOrderConsumer] Sent table_status_changed notification to client")
+        except Exception as e:
+            logger.error(f"[CafeOrderConsumer] Error in table_status_changed: {e}", exc_info=True)
     
     @database_sync_to_async
     def _get_user_company_and_branch(self, user):
@@ -190,6 +213,7 @@ class CafeTableConsumer(AsyncWebsocketConsumer):
         # Получаем пользователя из scope (уже обработан JWTAuthMiddleware)
         user = self.scope.get("user")
         if not user or isinstance(user, AnonymousUser):
+            logger.warning(f"[CafeTableConsumer] Connection rejected: No user")
             await self.close(code=4003)
             return
         
@@ -197,6 +221,7 @@ class CafeTableConsumer(AsyncWebsocketConsumer):
         company, branch = await self._get_user_company_and_branch(user)
         
         if not company:
+            logger.warning(f"[CafeTableConsumer] Connection rejected: User {user.id} has no company")
             await self.close(code=4004, reason="User has no company")
             return
         
@@ -229,6 +254,8 @@ class CafeTableConsumer(AsyncWebsocketConsumer):
         await self.channel_layer.group_add(self.group_name, self.channel_name)
         await self.accept()
         
+        logger.info(f"[CafeTableConsumer] Connected: user={user.id}, company={self.company_id}, branch={self.branch_id}, group={self.group_name}")
+        
         # Отправляем подтверждение подключения
         await self.send(json.dumps({
             "type": "connection_established",
@@ -239,6 +266,7 @@ class CafeTableConsumer(AsyncWebsocketConsumer):
     
     async def disconnect(self, code):
         if hasattr(self, "group_name"):
+            logger.info(f"[CafeTableConsumer] Disconnected: group={self.group_name}, code={code}")
             await self.channel_layer.group_discard(
                 self.group_name, self.channel_name
             )
@@ -253,33 +281,53 @@ class CafeTableConsumer(AsyncWebsocketConsumer):
             action = data.get("action")
             
             if action == "ping":
+                logger.debug(f"[CafeTableConsumer] Received ping from client")
                 await self.send(json.dumps({"type": "pong"}))
-        except Exception:
-            pass
+        except Exception as e:
+            logger.error(f"[CafeTableConsumer] Error in receive: {e}", exc_info=True)
     
     async def table_created(self, event):
         """Отправка уведомления о создании стола"""
-        payload = event.get("payload", {})
-        await self.send(json.dumps({
-            "type": "table_created",
-            "data": payload
-        }))
+        try:
+            payload = event.get("payload", {})
+            table_id = payload.get("table_id") or payload.get("table", {}).get("id")
+            logger.info(f"[CafeTableConsumer] Received table_created event: table_id={table_id}, group={self.group_name}")
+            await self.send(json.dumps({
+                "type": "table_created",
+                "data": payload
+            }))
+            logger.info(f"[CafeTableConsumer] Sent table_created notification to client")
+        except Exception as e:
+            logger.error(f"[CafeTableConsumer] Error in table_created: {e}", exc_info=True)
     
     async def table_updated(self, event):
         """Отправка уведомления об обновлении стола"""
-        payload = event.get("payload", {})
-        await self.send(json.dumps({
-            "type": "table_updated",
-            "data": payload
-        }))
+        try:
+            payload = event.get("payload", {})
+            table_id = payload.get("table_id") or payload.get("table", {}).get("id")
+            logger.info(f"[CafeTableConsumer] Received table_updated event: table_id={table_id}, group={self.group_name}")
+            await self.send(json.dumps({
+                "type": "table_updated",
+                "data": payload
+            }))
+            logger.info(f"[CafeTableConsumer] Sent table_updated notification to client")
+        except Exception as e:
+            logger.error(f"[CafeTableConsumer] Error in table_updated: {e}", exc_info=True)
     
     async def table_status_changed(self, event):
         """Отправка уведомления об изменении статуса стола (FREE/BUSY)"""
-        payload = event.get("payload", {})
-        await self.send(json.dumps({
-            "type": "table_status_changed",
-            "data": payload
-        }))
+        try:
+            payload = event.get("payload", {})
+            table_id = payload.get("table_id") or payload.get("table", {}).get("id")
+            status = payload.get("status")
+            logger.info(f"[CafeTableConsumer] Received table_status_changed event: table_id={table_id}, status={status}, group={self.group_name}")
+            await self.send(json.dumps({
+                "type": "table_status_changed",
+                "data": payload
+            }))
+            logger.info(f"[CafeTableConsumer] Sent table_status_changed notification to client")
+        except Exception as e:
+            logger.error(f"[CafeTableConsumer] Error in table_status_changed: {e}", exc_info=True)
     
     @database_sync_to_async
     def _get_user_company_and_branch(self, user):

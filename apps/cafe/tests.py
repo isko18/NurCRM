@@ -4,15 +4,11 @@ from django.test import TestCase, TransactionTestCase
 from django.contrib.auth import get_user_model
 from django.db import transaction
 from django.utils import timezone
-from channels.testing import WebsocketCommunicator
-from channels.layers import InMemoryChannelLayer
-from asgiref.sync import async_to_sync
 
 from apps.users.models import Company, Branch
 from apps.cafe.models import (
     Zone, Table, Order, OrderItem, MenuItem, Category, CafeClient, Kitchen
 )
-from apps.cafe.consumers import CafeOrderConsumer, CafeTableConsumer
 from apps.cafe.views import (
     send_order_created_notification,
     send_order_updated_notification,
