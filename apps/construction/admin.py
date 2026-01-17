@@ -4,27 +4,11 @@ from django.core.exceptions import PermissionDenied
 from django.db.models import Q
 
 from apps.construction.models import Cashbox, CashFlow, CashShift
-from apps.users.models import Branch
 
-
-# ── helpers ─────────────────────────────────────────────────────────
-def _user_company(user):
-    if not user or getattr(user, "is_anonymous", False):
-        return None
-    return getattr(user, "company", None) or getattr(user, "owned_company", None)
-
-
-def _is_owner_like(user) -> bool:
-    if not user or getattr(user, "is_anonymous", False):
-        return False
-    if getattr(user, "is_superuser", False):
-        return True
-    if getattr(user, "owned_company", None):
-        return True
-    if getattr(user, "is_admin", False):
-        return True
-    role = getattr(user, "role", None)
-    return role in ("owner", "admin", "OWNER", "ADMIN", "Владелец", "Администратор")
+from apps.construction.utils import (
+    get_company_from_user as _user_company,
+    is_owner_like as _is_owner_like,
+)
 
 
 def _active_branch(request):

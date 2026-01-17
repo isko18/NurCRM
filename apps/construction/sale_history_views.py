@@ -12,46 +12,10 @@ from apps.construction.models import CashShift
 from apps.main.models import Sale, SaleItem
 from apps.construction.sale_history_serializer import SaleHistorySerializer
 
-
-# ─────────────────────────────────────────────────────────────
-# helpers
-# ─────────────────────────────────────────────────────────────
-def _get_company(user):
-    if not user or not getattr(user, "is_authenticated", False):
-        return None
-
-    company = getattr(user, "company", None) or getattr(user, "owned_company", None)
-    if company:
-        return company
-
-    br = getattr(user, "branch", None)
-    if br is not None and getattr(br, "company", None):
-        return br.company
-
-    memberships = getattr(user, "branch_memberships", None)
-    if memberships is not None:
-        m = memberships.select_related("branch__company").first()
-        if m and m.branch and m.branch.company:
-            return m.branch.company
-
-    return None
-
-
-def _is_owner_like(user) -> bool:
-    if not user or not getattr(user, "is_authenticated", False):
-        return False
-
-    if getattr(user, "is_superuser", False):
-        return True
-
-    if getattr(user, "owned_company", None) is not None:
-        return True
-
-    if getattr(user, "is_admin", False):
-        return True
-
-    role = getattr(user, "role", None)
-    return role in ("owner", "admin", "OWNER", "ADMIN", "Владелец", "Администратор")
+from apps.construction.utils import (
+    get_company_from_user as _get_company,
+    is_owner_like as _is_owner_like,
+)
 
 
 def assert_shift_access(user, shift: CashShift):

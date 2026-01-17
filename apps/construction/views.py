@@ -13,7 +13,6 @@ from rest_framework.response import Response
 from rest_framework.exceptions import PermissionDenied, ValidationError
 
 from apps.construction.models import Cashbox, CashFlow, CashShift
-from apps.users.models import Branch
 
 from apps.construction.serializers import (
     CashboxSerializer,
@@ -25,133 +24,12 @@ from apps.construction.serializers import (
     CashFlowBulkStatusSerializer
 )
 
-# ─────────────────────────────────────────────────────────────
-# helpers
-# ─────────────────────────────────────────────────────────────
-def _get_company(user):
-    if not user or not getattr(user, "is_authenticated", False):
-        return None
-
-    company = getattr(user, "company", None) or getattr(user, "owned_company", None)
-    if company:
-        return company
-
-    br = getattr(user, "branch", None)
-    if br is not None and getattr(br, "company", None):
-        return br.company
-
-    memberships = getattr(user, "branch_memberships", None)
-    if memberships is not None:
-        m = memberships.select_related("branch__company").first()
-        if m and m.branch and m.branch.company:
-            return m.branch.company
-
-    return None
-
-
-def _is_owner_like(user) -> bool:
-    if not user or not getattr(user, "is_authenticated", False):
-        return False
-
-    if getattr(user, "is_superuser", False):
-        return True
-
-    if getattr(user, "owned_company", None):
-        return True
-
-    if getattr(user, "is_admin", False):
-        return True
-
-    role = getattr(user, "role", None)
-    if role in ("owner", "admin", "OWNER", "ADMIN", "Владелец", "Администратор"):
-        return True
-
-    return False
-
-
-def _fixed_branch_from_user(user, company):
-    if not user or not company:
-        return None
-
-    company_id = getattr(company, "id", None)
-
-    memberships = getattr(user, "branch_memberships", None)
-    if memberships is not None:
-        primary_m = (
-            memberships
-            .filter(is_primary=True, branch__company_id=company_id)
-            .select_related("branch")
-            .first()
-        )
-        if primary_m and primary_m.branch:
-            return primary_m.branch
-
-        any_m = (
-            memberships
-            .filter(branch__company_id=company_id)
-            .select_related("branch")
-            .first()
-        )
-        if any_m and any_m.branch:
-            return any_m.branch
-
-    primary = getattr(user, "primary_branch", None)
-    if callable(primary):
-        try:
-            val = primary()
-            if val and getattr(val, "company_id", None) == company_id:
-                return val
-        except Exception:
-            pass
-
-    if primary and not callable(primary) and getattr(primary, "company_id", None) == company_id:
-        return primary
-
-    if hasattr(user, "branch"):
-        b = getattr(user, "branch")
-        if b and getattr(b, "company_id", None) == company_id:
-            return b
-
-    branch_ids = getattr(user, "branch_ids", None)
-    if isinstance(branch_ids, (list, tuple)) and len(branch_ids) == 1:
-        try:
-            return Branch.objects.get(id=branch_ids[0], company_id=company_id)
-        except Branch.DoesNotExist:
-            pass
-
-    return None
-
-
-def _get_active_branch(request):
-    user = getattr(request, "user", None)
-    company = _get_company(user)
-    if not company:
-        setattr(request, "branch", None)
-        return None
-
-    company_id = getattr(company, "id", None)
-
-    if not _is_owner_like(user):
-        fixed = _fixed_branch_from_user(user, company)
-        setattr(request, "branch", fixed if fixed else None)
-        return fixed if fixed else None
-
-    branch_id = request.query_params.get("branch") if hasattr(request, "query_params") else request.GET.get("branch")
-    if branch_id:
-        try:
-            br = Branch.objects.get(id=branch_id, company_id=company_id)
-            setattr(request, "branch", br)
-            return br
-        except (Branch.DoesNotExist, ValueError):
-            pass
-
-    if hasattr(request, "branch"):
-        b = getattr(request, "branch")
-        if b and getattr(b, "company_id", None) == company_id:
-            return b
-
-    setattr(request, "branch", None)
-    return None
+from apps.construction.utils import (
+    get_company_from_user as _get_company,
+    is_owner_like as _is_owner_like,
+    fixed_branch_from_user as _fixed_branch_from_user,
+    get_active_branch as _get_active_branch,
+)
 
 
 def _guess_sale_model():
@@ -520,7 +398,7 @@ class CashboxOwnerDetailView(CompanyBranchScopedMixin, generics.ListAPIView):
             qs = Cashbox.objects.select_related("company", "branch")
         else:
             company = _get_company(user)
-            if not (company and (getattr(user, "owned_company", None) or getattr(user, "is_admin", False))):
+            if not (company and _is_owner_like(user)):
                 raise PermissionDenied("Только владельцы/админы могут просматривать кассы.")
             qs = Cashbox.objects.filter(company=company).select_related("company", "branch")
         return self._scoped_queryset(qs)
@@ -535,7 +413,7 @@ class CashboxOwnerDetailSingleView(CompanyBranchScopedMixin, generics.RetrieveAP
             qs = Cashbox.objects.select_related("company", "branch")
         else:
             company = _get_company(user)
-            if not (company and (getattr(user, "owned_company", None) or getattr(user, "is_admin", False))):
+            if not (company and _is_owner_like(user)):
                 return Cashbox.objects.none()
             qs = Cashbox.objects.filter(company=company).select_related("company", "branch")
         return self._scoped_queryset(qs)
