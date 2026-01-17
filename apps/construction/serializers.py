@@ -5,133 +5,20 @@ from rest_framework import serializers
 from django.contrib.auth import get_user_model
 
 from apps.construction.models import Cashbox, CashFlow, CashShift
-from apps.users.models import Branch
+
+from apps.construction.utils import (
+    get_company_from_user as _get_company_from_user,
+    is_owner_like as _is_owner_like,
+    fixed_branch_from_user as _fixed_branch_from_user,
+    get_active_branch,
+)
 
 User = get_user_model()
 
 
-# ─────────────────────────────────────────────────────────────
-# helpers
-# ─────────────────────────────────────────────────────────────
-def _get_company_from_user(user):
-    if not user or not getattr(user, "is_authenticated", False):
-        return None
-
-    company = getattr(user, "company", None) or getattr(user, "owned_company", None)
-    if company:
-        return company
-
-    br = getattr(user, "branch", None)
-    if br is not None:
-        return getattr(br, "company", None)
-
-    memberships = getattr(user, "branch_memberships", None)
-    if memberships is not None:
-        m = memberships.select_related("branch__company").first()
-        if m and m.branch and m.branch.company:
-            return m.branch.company
-
-    return None
-
-
-def _is_owner_like(user) -> bool:
-    if not user or not getattr(user, "is_authenticated", False):
-        return False
-
-    if getattr(user, "is_superuser", False):
-        return True
-
-    if getattr(user, "owned_company", None):
-        return True
-
-    if getattr(user, "is_admin", False):
-        return True
-
-    role = getattr(user, "role", None)
-    if role in ("owner", "admin", "OWNER", "ADMIN", "Владелец", "Администратор"):
-        return True
-
-    return False
-
-
-def _fixed_branch_from_user(user, company):
-    if not user or not company:
-        return None
-
-    company_id = getattr(company, "id", None)
-
-    memberships = getattr(user, "branch_memberships", None)
-    if memberships is not None:
-        m = (
-            memberships.filter(is_primary=True, branch__company_id=company_id)
-            .select_related("branch")
-            .first()
-        )
-        if m and m.branch:
-            return m.branch
-
-        m = (
-            memberships.filter(branch__company_id=company_id)
-            .select_related("branch")
-            .first()
-        )
-        if m and m.branch:
-            return m.branch
-
-    primary = getattr(user, "primary_branch", None)
-    if callable(primary):
-        try:
-            val = primary()
-            if val and getattr(val, "company_id", None) == company_id:
-                return val
-        except Exception:
-            pass
-
-    if primary and not callable(primary) and getattr(primary, "company_id", None) == company_id:
-        return primary
-
-    if hasattr(user, "branch"):
-        b = getattr(user, "branch")
-        if b and getattr(b, "company_id", None) == company_id:
-            return b
-
-    branch_ids = getattr(user, "branch_ids", None)
-    if isinstance(branch_ids, (list, tuple)) and len(branch_ids) == 1:
-        try:
-            return Branch.objects.get(id=branch_ids[0], company_id=company_id)
-        except Branch.DoesNotExist:
-            pass
-
-    return None
-
-
 def _resolve_branch_for_request(request):
-    if not request:
-        return None
-
-    user = getattr(request, "user", None)
-    company = _get_company_from_user(user)
-    if not company:
-        return None
-    company_id = getattr(company, "id", None)
-
-    fixed = _fixed_branch_from_user(user, company)
-    if fixed is not None and not _is_owner_like(user):
-        return fixed
-
-    branch_id = request.query_params.get("branch") if hasattr(request, "query_params") else request.GET.get("branch")
-    if branch_id:
-        try:
-            return Branch.objects.get(id=branch_id, company_id=company_id)
-        except (Branch.DoesNotExist, ValueError):
-            pass
-
-    if hasattr(request, "branch"):
-        b = getattr(request, "branch")
-        if b and getattr(b, "company_id", None) == company_id:
-            return b
-
-    return None
+    """Обертка для get_active_branch для совместимости."""
+    return get_active_branch(request)
 
 
 # ─────────────────────────────────────────────────────────────

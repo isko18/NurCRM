@@ -33,8 +33,8 @@ class Cashbox(models.Model):
     # ⛔ лучше без null=True на boolean, но я оставлю как есть, чтобы не ломать миграции
     is_consumption = models.BooleanField(verbose_name="Расход", default=False, blank=True, null=True)
 
-    created_at = models.DateTimeField(auto_now_add=True, db_index=True, null=True, blank=True)
-    updated_at = models.DateTimeField(auto_now=True, null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True, db_index=True, null=True, blank=True, verbose_name="Дата создания")
+    updated_at = models.DateTimeField(auto_now=True, null=True, blank=True, verbose_name="Дата обновления")
 
     class Meta:
         verbose_name = "Касса"
@@ -164,7 +164,7 @@ class CashShift(models.Model):
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
 
-    company = models.ForeignKey(Company, on_delete=models.CASCADE, related_name="shifts")
+    company = models.ForeignKey(Company, on_delete=models.CASCADE, related_name="shifts", verbose_name="Компания")
     branch = models.ForeignKey(
         Branch,
         on_delete=models.CASCADE,
@@ -172,26 +172,29 @@ class CashShift(models.Model):
         blank=True,
         related_name="shifts",
         db_index=True,
+        verbose_name="Филиал",
     )
 
-    cashbox = models.ForeignKey("construction.Cashbox", on_delete=models.PROTECT, related_name="shifts")
-    cashier = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.PROTECT, related_name="shifts")
+    cashbox = models.ForeignKey("construction.Cashbox", on_delete=models.PROTECT, related_name="shifts", verbose_name="Касса")
+    cashier = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.PROTECT, related_name="shifts", verbose_name="Кассир")
 
-    status = models.CharField(max_length=10, choices=Status.choices, default=Status.OPEN, db_index=True)
-    opened_at = models.DateTimeField(auto_now_add=True)
-    closed_at = models.DateTimeField(null=True, blank=True)
+    status = models.CharField(max_length=10, choices=Status.choices, default=Status.OPEN, db_index=True, verbose_name="Статус")
+    opened_at = models.DateTimeField(auto_now_add=True, verbose_name="Дата открытия")
+    closed_at = models.DateTimeField(null=True, blank=True, verbose_name="Дата закрытия")
 
-    opening_cash = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal("0.00"))
-    closing_cash = models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
+    opening_cash = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal("0.00"), verbose_name="Начальная сумма")
+    closing_cash = models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True, verbose_name="Конечная сумма")
 
-    income_total = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal("0.00"))
-    expense_total = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal("0.00"))
-    sales_count = models.PositiveIntegerField(default=0)
-    sales_total = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal("0.00"))
-    cash_sales_total = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal("0.00"))
-    noncash_sales_total = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal("0.00"))
+    income_total = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal("0.00"), verbose_name="Итого приходов")
+    expense_total = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal("0.00"), verbose_name="Итого расходов")
+    sales_count = models.PositiveIntegerField(default=0, verbose_name="Количество продаж")
+    sales_total = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal("0.00"), verbose_name="Итого продаж")
+    cash_sales_total = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal("0.00"), verbose_name="Наличные продажи")
+    noncash_sales_total = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal("0.00"), verbose_name="Безналичные продажи")
 
     class Meta:
+        verbose_name = "Кассовая смена"
+        verbose_name_plural = "Кассовые смены"
         constraints = [
             # ✅ теперь можно много OPEN на 1 cashbox,
             # но нельзя 2 OPEN смены одному кассиру на одной кассе
@@ -343,12 +346,12 @@ class CashFlow(models.Model):
     type = models.CharField(max_length=10, choices=Type.choices, verbose_name="Тип")
     name = models.CharField(max_length=255, null=True, blank=True, verbose_name="Наименование")
     amount = models.DecimalField(max_digits=12, decimal_places=2, verbose_name="Сумма")
-    created_at = models.DateTimeField(auto_now_add=True)
+    created_at = models.DateTimeField(auto_now_add=True, verbose_name="Дата создания")
 
-    status = models.CharField(max_length=10, choices=Status.choices, default=Status.PENDING, db_index=True)
+    status = models.CharField(max_length=10, choices=Status.choices, default=Status.PENDING, db_index=True, verbose_name="Статус")
 
-    source_cashbox_flow_id = models.CharField(max_length=36, null=True, blank=True)
-    source_business_operation_id = models.CharField(max_length=36, null=True, blank=True)
+    source_cashbox_flow_id = models.CharField(max_length=36, null=True, blank=True, verbose_name="ID исходного движения кассы")
+    source_business_operation_id = models.CharField(max_length=36, null=True, blank=True, verbose_name="ID бизнес-операции")
 
     shift = models.ForeignKey(
         "construction.CashShift",
@@ -357,6 +360,7 @@ class CashFlow(models.Model):
         blank=True,
         related_name="shift_flows",
         db_index=True,
+        verbose_name="Смена",
     )
     cashier = models.ForeignKey(
         settings.AUTH_USER_MODEL,
@@ -364,6 +368,7 @@ class CashFlow(models.Model):
         null=True,
         blank=True,
         related_name="cash_flows",
+        verbose_name="Кассир",
     )
 
     class Meta:

@@ -1,12 +1,18 @@
 from rest_framework.permissions import BasePermission
-from apps.construction.models import Department, Cashbox, CashFlow
+from apps.construction.models import Cashbox, CashFlow
+
+# Department был удален, но оставляем проверки для совместимости
+try:
+    from apps.construction.models import Department
+except ImportError:
+    Department = None
 
 
 def _get_obj_company(obj):
     """
     Аккуратно достаём company из разных типов объектов.
     """
-    if isinstance(obj, Department):
+    if Department and isinstance(obj, Department):
         return obj.company
 
     if isinstance(obj, Cashbox):
@@ -39,7 +45,7 @@ def _get_obj_department(obj):
       - Cashbox → cashbox.department
       - CashFlow → cashflow.cashbox.department
     """
-    if isinstance(obj, Department):
+    if Department and isinstance(obj, Department):
         return obj
 
     if isinstance(obj, Cashbox):
