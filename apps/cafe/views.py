@@ -1,5 +1,6 @@
 # apps/cafe/views.py
 from decimal import Decimal
+import json
 
 from django.db import transaction
 from django.db.models import Q, Count, Avg, ExpressionWrapper, DurationField, F
@@ -8,6 +9,8 @@ from django_filters.rest_framework import DjangoFilterBackend
 from rest_framework import filters, generics, permissions, status
 from rest_framework.response import Response
 from rest_framework.views import APIView
+from channels.layers import get_channel_layer
+from asgiref.sync import async_to_sync
 
 from apps.users.models import Branch
 from .models import (
@@ -238,9 +241,26 @@ class ClientOrderListCreateView(CompanyBranchQuerysetMixin, generics.ListCreateA
     def perform_create(self, serializer):
         client = self._get_client()
         super().perform_create(serializer)
-        serializer.instance.client = client
-        serializer.instance.company = client.company
-        serializer.instance.save(update_fields=["client", "company"])
+        order = serializer.instance
+        order.client = client
+        order.company = client.company
+        order.save(update_fields=["client", "company"])
+        # Пересчитываем сумму заказа
+        order.recalc_total()
+        order.save(update_fields=["total_amount"])
+        
+        # Устанавливаем стол как занятый при создании заказа
+        if order.table_id:
+            with transaction.atomic():
+                table = Table.objects.select_for_update().get(id=order.table_id)
+                if table.status != Table.Status.BUSY:
+                    table.status = Table.Status.BUSY
+                    table.save(update_fields=["status"])
+                    # Отправляем уведомление об изменении статуса стола
+                    send_table_status_changed_notification(table)
+        
+        # Отправляем WebSocket уведомление о создании заказа
+        send_order_created_notification(order)
 
 
 # -------- История заказов клиента (вложенно) --------
@@ -333,11 +353,23 @@ class TableListCreateView(CompanyBranchQuerysetMixin, generics.ListCreateAPIView
     filterset_fields = ["zone", "number", "places", "status"]
     search_fields = ["zone__title"]
     ordering_fields = ["number", "places", "status", "id"]
+    
+    def perform_create(self, serializer):
+        super().perform_create(serializer)
+        table = serializer.instance
+        # Отправляем WebSocket уведомление о создании стола
+        send_table_created_notification(table)
 
 
 class TableRetrieveUpdateDestroyView(CompanyBranchQuerysetMixin, generics.RetrieveUpdateDestroyAPIView):
     queryset = Table.objects.select_related("zone", "company").all()
     serializer_class = TableSerializer
+    
+    def perform_update(self, serializer):
+        super().perform_update(serializer)
+        table = serializer.instance
+        # Отправляем WebSocket уведомление об обновлении стола
+        send_table_updated_notification(table)
 
 
 # ==================== Booking ====================
@@ -477,6 +509,26 @@ class OrderListCreateView(CompanyBranchQuerysetMixin, generics.ListCreateAPIView
     filter_backends = [DjangoFilterBackend, filters.OrderingFilter]
     filterset_fields = ["table", "waiter", "client", "guests", "created_at"]
     ordering_fields = ["created_at", "guests", "id"]
+    
+    def perform_create(self, serializer):
+        super().perform_create(serializer)
+        order = serializer.instance
+        # Пересчитываем сумму заказа
+        order.recalc_total()
+        order.save(update_fields=["total_amount"])
+        
+        # Устанавливаем стол как занятый при создании заказа
+        if order.table_id:
+            with transaction.atomic():
+                table = Table.objects.select_for_update().get(id=order.table_id)
+                if table.status != Table.Status.BUSY:
+                    table.status = Table.Status.BUSY
+                    table.save(update_fields=["status"])
+                    # Отправляем уведомление об изменении статуса стола
+                    send_table_status_changed_notification(table)
+        
+        # Отправляем WebSocket уведомление о создании заказа
+        send_order_created_notification(order)
 
 
 class OrderRetrieveUpdateDestroyView(CompanyBranchQuerysetMixin, generics.RetrieveUpdateDestroyAPIView):
@@ -486,6 +538,65 @@ class OrderRetrieveUpdateDestroyView(CompanyBranchQuerysetMixin, generics.Retrie
         .prefetch_related("items__menu_item")
     )
     serializer_class = OrderSerializer
+    
+    def perform_update(self, serializer):
+        old_status = None
+        old_table_id = None
+        if serializer.instance:
+            old_status = serializer.instance.status
+            old_table_id = serializer.instance.table_id
+        
+        super().perform_update(serializer)
+        order = serializer.instance
+        # Пересчитываем сумму заказа при обновлении
+        order.recalc_total()
+        order.save(update_fields=["total_amount"])
+        
+        # Если заказ закрыт или отменен - освобождаем стол
+        if order.status in [Order.Status.CLOSED, Order.Status.CANCELLED]:
+            if order.table_id:
+                with transaction.atomic():
+                    table = Table.objects.select_for_update().get(id=order.table_id)
+                    if table.status != Table.Status.FREE:
+                        table.status = Table.Status.FREE
+                        table.save(update_fields=["status"])
+                        # Отправляем уведомление об изменении статуса стола
+                        send_table_status_changed_notification(table)
+        
+        # Если статус изменился с закрытого/отмененного на открытый - занимаем стол
+        elif order.status == Order.Status.OPEN and old_status in [Order.Status.CLOSED, Order.Status.CANCELLED]:
+            if order.table_id:
+                with transaction.atomic():
+                    table = Table.objects.select_for_update().get(id=order.table_id)
+                    if table.status != Table.Status.BUSY:
+                        table.status = Table.Status.BUSY
+                        table.save(update_fields=["status"])
+                        # Отправляем уведомление об изменении статуса стола
+                        send_table_status_changed_notification(table)
+        
+        # Отправляем WebSocket уведомление об обновлении заказа
+        send_order_updated_notification(order)
+    
+    def perform_destroy(self, instance):
+        table_id = instance.table_id
+        super().perform_destroy(instance)
+        
+        # При удалении заказа освобождаем стол, если нет других открытых заказов на этот стол
+        if table_id:
+            with transaction.atomic():
+                # Проверяем, есть ли другие открытые заказы на этот стол
+                has_open_orders = Order.objects.filter(
+                    table_id=table_id,
+                    status=Order.Status.OPEN
+                ).exists()
+                
+                if not has_open_orders:
+                    table = Table.objects.select_for_update().get(id=table_id)
+                    if table.status != Table.Status.FREE:
+                        table.status = Table.Status.FREE
+                        table.save(update_fields=["status"])
+                        # Отправляем уведомление об изменении статуса стола
+                        send_table_status_changed_notification(table)
 
 
 # ==================== OrderItem ====================
@@ -590,7 +701,12 @@ class OrderPayView(CompanyBranchQuerysetMixin, APIView):
             ])
 
             if close_order and order.table_id:
-                Table.objects.filter(id=order.table_id).update(status=Table.Status.FREE)
+                with transaction.atomic():
+                    table = Table.objects.select_for_update().get(id=order.table_id)
+                    table.status = Table.Status.FREE
+                    table.save(update_fields=["status"])
+                    # Отправляем уведомление об изменении статуса стола
+                    send_table_status_changed_notification(table)
 
             # ---------- ARCHIVE (OrderHistory) ----------
             waiter_label = ""
@@ -634,6 +750,9 @@ class OrderPayView(CompanyBranchQuerysetMixin, APIView):
             if items:
                 OrderItemHistory.objects.bulk_create(items)
 
+        # Отправляем WebSocket уведомление об обновлении заказа
+        send_order_updated_notification(order)
+        
         return Response({
             "id": str(order.id),
             "status": order.status,
@@ -946,3 +1065,232 @@ class KitchenListCreateView(CompanyBranchQuerysetMixin, generics.ListCreateAPIVi
 class KitchenRetrieveUpdateDestroyView(CompanyBranchQuerysetMixin, generics.RetrieveUpdateDestroyAPIView):
     queryset = Kitchen.objects.all()
     serializer_class = KitchenSerializer
+
+
+# ==================== WebSocket уведомления ====================
+def send_order_created_notification(order):
+    """
+    Отправляет WebSocket уведомление о создании заказа.
+    """
+    try:
+        channel_layer = get_channel_layer()
+        if not channel_layer:
+            return
+        
+        company_id = str(order.company_id)
+        branch_id = str(order.branch_id) if order.branch_id else None
+        
+        # Формируем имя группы
+        if branch_id:
+            group_name = f"cafe_orders_{company_id}_{branch_id}"
+        else:
+            group_name = f"cafe_orders_{company_id}"
+        
+        # Сериализуем данные заказа
+        from .serializers import OrderSerializer
+        serializer = OrderSerializer(order)
+        order_data = serializer.data
+        
+        # Отправляем уведомление в группу
+        async_to_sync(channel_layer.group_send)(
+            group_name,
+            {
+                "type": "order_created",
+                "payload": {
+                    "order": order_data,
+                    "company_id": company_id,
+                    "branch_id": branch_id,
+                }
+            }
+        )
+    except Exception:
+        # Игнорируем ошибки WebSocket, чтобы не ломать основной процесс
+        pass
+
+
+def send_order_updated_notification(order):
+    """
+    Отправляет WebSocket уведомление об обновлении заказа.
+    """
+    try:
+        channel_layer = get_channel_layer()
+        if not channel_layer:
+            return
+        
+        company_id = str(order.company_id)
+        branch_id = str(order.branch_id) if order.branch_id else None
+        
+        # Формируем имя группы
+        if branch_id:
+            group_name = f"cafe_orders_{company_id}_{branch_id}"
+        else:
+            group_name = f"cafe_orders_{company_id}"
+        
+        # Сериализуем данные заказа
+        from .serializers import OrderSerializer
+        serializer = OrderSerializer(order)
+        order_data = serializer.data
+        
+        # Отправляем уведомление в группу
+        async_to_sync(channel_layer.group_send)(
+            group_name,
+            {
+                "type": "order_updated",
+                "payload": {
+                    "order": order_data,
+                    "company_id": company_id,
+                    "branch_id": branch_id,
+                }
+            }
+        )
+    except Exception:
+        # Игнорируем ошибки WebSocket, чтобы не ломать основной процесс
+        pass
+
+
+def send_table_created_notification(table):
+    """
+    Отправляет WebSocket уведомление о создании стола.
+    """
+    try:
+        channel_layer = get_channel_layer()
+        if not channel_layer:
+            return
+        
+        company_id = str(table.company_id)
+        branch_id = str(table.branch_id) if table.branch_id else None
+        
+        # Формируем имя группы
+        if branch_id:
+            group_name = f"cafe_tables_{company_id}_{branch_id}"
+        else:
+            group_name = f"cafe_tables_{company_id}"
+        
+        # Сериализуем данные стола
+        from .serializers import TableSerializer
+        serializer = TableSerializer(table)
+        table_data = serializer.data
+        
+        # Отправляем уведомление в группу
+        async_to_sync(channel_layer.group_send)(
+            group_name,
+            {
+                "type": "table_created",
+                "payload": {
+                    "table": table_data,
+                    "company_id": company_id,
+                    "branch_id": branch_id,
+                }
+            }
+        )
+    except Exception:
+        # Игнорируем ошибки WebSocket, чтобы не ломать основной процесс
+        pass
+
+
+def send_table_updated_notification(table):
+    """
+    Отправляет WebSocket уведомление об обновлении стола.
+    """
+    try:
+        channel_layer = get_channel_layer()
+        if not channel_layer:
+            return
+        
+        company_id = str(table.company_id)
+        branch_id = str(table.branch_id) if table.branch_id else None
+        
+        # Формируем имя группы
+        if branch_id:
+            group_name = f"cafe_tables_{company_id}_{branch_id}"
+        else:
+            group_name = f"cafe_tables_{company_id}"
+        
+        # Сериализуем данные стола
+        from .serializers import TableSerializer
+        serializer = TableSerializer(table)
+        table_data = serializer.data
+        
+        # Отправляем уведомление в группу
+        async_to_sync(channel_layer.group_send)(
+            group_name,
+            {
+                "type": "table_updated",
+                "payload": {
+                    "table": table_data,
+                    "company_id": company_id,
+                    "branch_id": branch_id,
+                }
+            }
+        )
+    except Exception:
+        # Игнорируем ошибки WebSocket, чтобы не ломать основной процесс
+        pass
+
+
+def send_table_status_changed_notification(table):
+    """
+    Отправляет WebSocket уведомление об изменении статуса стола (FREE/BUSY).
+    Это специальное уведомление для отслеживания занятости столов в реальном времени.
+    """
+    try:
+        channel_layer = get_channel_layer()
+        if not channel_layer:
+            return
+        
+        company_id = str(table.company_id)
+        branch_id = str(table.branch_id) if table.branch_id else None
+        
+        # Формируем имя группы для столов
+        if branch_id:
+            group_name = f"cafe_tables_{company_id}_{branch_id}"
+        else:
+            group_name = f"cafe_tables_{company_id}"
+        
+        # Также отправляем в группу заказов, так как изменение статуса стола связано с заказами
+        if branch_id:
+            orders_group_name = f"cafe_orders_{company_id}_{branch_id}"
+        else:
+            orders_group_name = f"cafe_orders_{company_id}"
+        
+        # Сериализуем данные стола
+        from .serializers import TableSerializer
+        serializer = TableSerializer(table)
+        table_data = serializer.data
+        
+        # Отправляем уведомление в группу столов
+        async_to_sync(channel_layer.group_send)(
+            group_name,
+            {
+                "type": "table_status_changed",
+                "payload": {
+                    "table": table_data,
+                    "table_id": str(table.id),
+                    "table_number": table.number,
+                    "status": table.status,
+                    "status_display": table.get_status_display(),
+                    "company_id": company_id,
+                    "branch_id": branch_id,
+                }
+            }
+        )
+        
+        # Отправляем уведомление в группу заказов (чтобы официанты видели изменения)
+        async_to_sync(channel_layer.group_send)(
+            orders_group_name,
+            {
+                "type": "table_status_changed",
+                "payload": {
+                    "table": table_data,
+                    "table_id": str(table.id),
+                    "table_number": table.number,
+                    "status": table.status,
+                    "status_display": table.get_status_display(),
+                    "company_id": company_id,
+                    "branch_id": branch_id,
+                }
+            }
+        )
+    except Exception:
+        # Игнорируем ошибки WebSocket, чтобы не ломать основной процесс
+        pass
