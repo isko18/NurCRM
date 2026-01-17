@@ -63,7 +63,6 @@ urlpatterns += [
     # simple CRUD for products/warehouses/counterparties
     path("crud/products/", ProductListCreateView.as_view(), name="warehouse-products-crud"),
     path("crud/products/<uuid:pk>/", ProductDetailViewCRUD.as_view(), name="warehouse-product-detail-crud"),
-
     path("crud/warehouses/", WarehouseListCreateView.as_view(), name="warehouses-crud"),
     path("crud/warehouses/<uuid:pk>/", WarehouseDetailViewCRUD.as_view(), name="warehouses-detail-crud"),
 
