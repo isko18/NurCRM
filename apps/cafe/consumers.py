@@ -12,8 +12,9 @@ User = get_user_model()
 class CafeOrderConsumer(AsyncWebsocketConsumer):
     """
     WebSocket consumer для уведомлений о заказах в кафе.
-    Подключается по company_id и опционально branch_id.
-    URL: ws/cafe/orders/?token=<JWT>&company_id=<uuid>&branch_id=<uuid>
+    Company и branch определяются автоматически из JWT токена пользователя.
+    Опционально можно указать branch_id в query для выбора конкретного филиала (для owner/admin).
+    URL: ws/cafe/orders/?token=<JWT>&branch_id=<uuid> (опционально)
     """
     
     async def connect(self):
@@ -23,35 +24,37 @@ class CafeOrderConsumer(AsyncWebsocketConsumer):
             await self.close(code=4003)
             return
         
-        # Получаем company_id и branch_id из query string
+        # Получаем company и branch из пользователя
+        company, branch = await self._get_user_company_and_branch(user)
+        
+        if not company:
+            await self.close(code=4004, reason="User has no company")
+            return
+        
+        # Опционально можно указать branch_id в query для выбора конкретного филиала
         query_string = self.scope.get("query_string", b"").decode()
-        params = {}
+        branch_id_from_query = None
         if query_string:
             from urllib.parse import parse_qs
             parsed = parse_qs(query_string)
-            params = {k: v[0] if v else None for k, v in parsed.items()}
+            branch_id_from_query = parsed.get("branch_id", [None])[0]
         
-        company_id = params.get("company_id")
-        branch_id = params.get("branch_id")
+        # Если указан branch_id в query и пользователь owner/admin - используем его
+        if branch_id_from_query:
+            is_owner_like = await self._is_owner_like(user)
+            if is_owner_like:
+                branch_from_query = await self._get_branch_by_id(branch_id_from_query, company.id)
+                if branch_from_query:
+                    branch = branch_from_query
         
-        if not company_id:
-            await self.close(code=4004)
-            return
-        
-        # Проверяем, что пользователь имеет доступ к этой компании
-        has_access = await self._check_company_access(user, company_id)
-        if not has_access:
-            await self.close(code=4005)
-            return
-        
-        self.company_id = company_id
-        self.branch_id = branch_id
+        self.company_id = str(company.id)
+        self.branch_id = str(branch.id) if branch else None
         
         # Формируем имя группы для подписки
-        if branch_id:
-            self.group_name = f"cafe_orders_{company_id}_{branch_id}"
+        if self.branch_id:
+            self.group_name = f"cafe_orders_{self.company_id}_{self.branch_id}"
         else:
-            self.group_name = f"cafe_orders_{company_id}"
+            self.group_name = f"cafe_orders_{self.company_id}"
         
         # Подписываемся на группу
         await self.channel_layer.group_add(self.group_name, self.channel_name)
@@ -60,8 +63,8 @@ class CafeOrderConsumer(AsyncWebsocketConsumer):
         # Отправляем подтверждение подключения
         await self.send(json.dumps({
             "type": "connection_established",
-            "company_id": company_id,
-            "branch_id": branch_id,
+            "company_id": self.company_id,
+            "branch_id": self.branch_id,
             "group": self.group_name
         }))
     
@@ -110,39 +113,77 @@ class CafeOrderConsumer(AsyncWebsocketConsumer):
         }))
     
     @database_sync_to_async
-    def _check_company_access(self, user, company_id):
-        """Проверка доступа пользователя к компании"""
+    def _get_user_company_and_branch(self, user):
+        """Получает company и branch из пользователя"""
         try:
-            # Проверяем, что пользователь принадлежит компании
-            user_company = getattr(user, "company", None) or getattr(user, "owned_company", None)
-            if user_company and str(user_company.id) == company_id:
+            # Получаем компанию
+            company = getattr(user, "owned_company", None) or getattr(user, "company", None)
+            if not company:
+                return None, None
+            
+            # Получаем филиал
+            branch = None
+            
+            # 1) primary_branch (property)
+            primary = getattr(user, "primary_branch", None)
+            if primary and getattr(primary, "company_id", None) == company.id:
+                branch = primary
+            
+            # 2) user.branch
+            if not branch:
+                user_branch = getattr(user, "branch", None)
+                if user_branch and getattr(user_branch, "company_id", None) == company.id:
+                    branch = user_branch
+            
+            # 3) первый филиал из branch_memberships
+            if not branch and hasattr(user, "branch_memberships"):
+                membership = user.branch_memberships.filter(
+                    branch__company_id=company.id
+                ).select_related("branch").first()
+                if membership and membership.branch:
+                    branch = membership.branch
+            
+            return company, branch
+        except Exception:
+            return None, None
+    
+    @database_sync_to_async
+    def _is_owner_like(self, user):
+        """Проверяет, является ли пользователь owner/admin"""
+        try:
+            if getattr(user, "is_superuser", False):
                 return True
             
-            # Проверяем через branch
-            if hasattr(user, "branch") and user.branch:
-                if str(user.branch.company_id) == company_id:
-                    return True
+            if getattr(user, "owned_company", None):
+                return True
             
-            # Проверяем через branch_memberships
-            if hasattr(user, "branch_memberships"):
-                from apps.users.models import Branch
-                from django.db.models import Q
-                memberships = user.branch_memberships.filter(
-                    branch__company_id=company_id
-                ).exists()
-                if memberships:
-                    return True
+            if getattr(user, "is_admin", False):
+                return True
+            
+            role = getattr(user, "role", None)
+            if role in ("owner", "admin", "OWNER", "ADMIN", "Владелец", "Администратор"):
+                return True
             
             return False
         except Exception:
             return False
+    
+    @database_sync_to_async
+    def _get_branch_by_id(self, branch_id, company_id):
+        """Получает филиал по ID, если он принадлежит компании"""
+        try:
+            from apps.users.models import Branch
+            return Branch.objects.get(id=branch_id, company_id=company_id)
+        except Exception:
+            return None
 
 
 class CafeTableConsumer(AsyncWebsocketConsumer):
     """
     WebSocket consumer для уведомлений о столах в кафе.
-    Подключается по company_id и опционально branch_id.
-    URL: ws/cafe/tables/?token=<JWT>&company_id=<uuid>&branch_id=<uuid>
+    Company и branch определяются автоматически из JWT токена пользователя.
+    Опционально можно указать branch_id в query для выбора конкретного филиала (для owner/admin).
+    URL: ws/cafe/tables/?token=<JWT>&branch_id=<uuid> (опционально)
     """
     
     async def connect(self):
@@ -152,35 +193,37 @@ class CafeTableConsumer(AsyncWebsocketConsumer):
             await self.close(code=4003)
             return
         
-        # Получаем company_id и branch_id из query string
+        # Получаем company и branch из пользователя
+        company, branch = await self._get_user_company_and_branch(user)
+        
+        if not company:
+            await self.close(code=4004, reason="User has no company")
+            return
+        
+        # Опционально можно указать branch_id в query для выбора конкретного филиала
         query_string = self.scope.get("query_string", b"").decode()
-        params = {}
+        branch_id_from_query = None
         if query_string:
             from urllib.parse import parse_qs
             parsed = parse_qs(query_string)
-            params = {k: v[0] if v else None for k, v in parsed.items()}
+            branch_id_from_query = parsed.get("branch_id", [None])[0]
         
-        company_id = params.get("company_id")
-        branch_id = params.get("branch_id")
+        # Если указан branch_id в query и пользователь owner/admin - используем его
+        if branch_id_from_query:
+            is_owner_like = await self._is_owner_like(user)
+            if is_owner_like:
+                branch_from_query = await self._get_branch_by_id(branch_id_from_query, company.id)
+                if branch_from_query:
+                    branch = branch_from_query
         
-        if not company_id:
-            await self.close(code=4004)
-            return
-        
-        # Проверяем, что пользователь имеет доступ к этой компании
-        has_access = await self._check_company_access(user, company_id)
-        if not has_access:
-            await self.close(code=4005)
-            return
-        
-        self.company_id = company_id
-        self.branch_id = branch_id
+        self.company_id = str(company.id)
+        self.branch_id = str(branch.id) if branch else None
         
         # Формируем имя группы для подписки
-        if branch_id:
-            self.group_name = f"cafe_tables_{company_id}_{branch_id}"
+        if self.branch_id:
+            self.group_name = f"cafe_tables_{self.company_id}_{self.branch_id}"
         else:
-            self.group_name = f"cafe_tables_{company_id}"
+            self.group_name = f"cafe_tables_{self.company_id}"
         
         # Подписываемся на группу
         await self.channel_layer.group_add(self.group_name, self.channel_name)
@@ -189,8 +232,8 @@ class CafeTableConsumer(AsyncWebsocketConsumer):
         # Отправляем подтверждение подключения
         await self.send(json.dumps({
             "type": "connection_established",
-            "company_id": company_id,
-            "branch_id": branch_id,
+            "company_id": self.company_id,
+            "branch_id": self.branch_id,
             "group": self.group_name
         }))
     
@@ -239,29 +282,66 @@ class CafeTableConsumer(AsyncWebsocketConsumer):
         }))
     
     @database_sync_to_async
-    def _check_company_access(self, user, company_id):
-        """Проверка доступа пользователя к компании"""
+    def _get_user_company_and_branch(self, user):
+        """Получает company и branch из пользователя"""
         try:
-            # Проверяем, что пользователь принадлежит компании
-            user_company = getattr(user, "company", None) or getattr(user, "owned_company", None)
-            if user_company and str(user_company.id) == company_id:
+            # Получаем компанию
+            company = getattr(user, "owned_company", None) or getattr(user, "company", None)
+            if not company:
+                return None, None
+            
+            # Получаем филиал
+            branch = None
+            
+            # 1) primary_branch (property)
+            primary = getattr(user, "primary_branch", None)
+            if primary and getattr(primary, "company_id", None) == company.id:
+                branch = primary
+            
+            # 2) user.branch
+            if not branch:
+                user_branch = getattr(user, "branch", None)
+                if user_branch and getattr(user_branch, "company_id", None) == company.id:
+                    branch = user_branch
+            
+            # 3) первый филиал из branch_memberships
+            if not branch and hasattr(user, "branch_memberships"):
+                membership = user.branch_memberships.filter(
+                    branch__company_id=company.id
+                ).select_related("branch").first()
+                if membership and membership.branch:
+                    branch = membership.branch
+            
+            return company, branch
+        except Exception:
+            return None, None
+    
+    @database_sync_to_async
+    def _is_owner_like(self, user):
+        """Проверяет, является ли пользователь owner/admin"""
+        try:
+            if getattr(user, "is_superuser", False):
                 return True
             
-            # Проверяем через branch
-            if hasattr(user, "branch") and user.branch:
-                if str(user.branch.company_id) == company_id:
-                    return True
+            if getattr(user, "owned_company", None):
+                return True
             
-            # Проверяем через branch_memberships
-            if hasattr(user, "branch_memberships"):
-                from apps.users.models import Branch
-                from django.db.models import Q
-                memberships = user.branch_memberships.filter(
-                    branch__company_id=company_id
-                ).exists()
-                if memberships:
-                    return True
+            if getattr(user, "is_admin", False):
+                return True
+            
+            role = getattr(user, "role", None)
+            if role in ("owner", "admin", "OWNER", "ADMIN", "Владелец", "Администратор"):
+                return True
             
             return False
         except Exception:
             return False
+    
+    @database_sync_to_async
+    def _get_branch_by_id(self, branch_id, company_id):
+        """Получает филиал по ID, если он принадлежит компании"""
+        try:
+            from apps.users.models import Branch
+            return Branch.objects.get(id=branch_id, company_id=company_id)
+        except Exception:
+            return None
