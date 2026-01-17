@@ -12,6 +12,7 @@ class DocumentSerializer(serializers.ModelSerializer):
     items = DocumentItemSerializer(many=True)
 
     class Meta:
+        ref_name = "WarehouseDocumentSerializer"
         model = models.Document
         fields = (
             "id",
