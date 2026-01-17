@@ -556,8 +556,17 @@ class OrderRetrieveUpdateDestroyView(CompanyBranchQuerysetMixin, generics.Retrie
         order.recalc_total()
         order.save(update_fields=["total_amount"])
         
-        # Если заказ закрыт или отменен - освобождаем стол
+        # Если заказ закрыт или отменен - освобождаем стол и отменяем незавершенные задачи кухни
         if order.status in [Order.Status.CLOSED, Order.Status.CANCELLED]:
+            # Отменяем незавершенные задачи кухни (pending и in_progress)
+            if old_status not in [Order.Status.CLOSED, Order.Status.CANCELLED]:
+                unfinished_tasks = KitchenTask.objects.filter(
+                    order=order,
+                    status__in=[KitchenTask.Status.PENDING, KitchenTask.Status.IN_PROGRESS]
+                )
+                if unfinished_tasks.exists():
+                    unfinished_tasks.update(status=KitchenTask.Status.CANCELLED)
+            
             if order.table_id:
                 with transaction.atomic():
                     table = Table.objects.select_for_update().get(id=order.table_id)
@@ -703,6 +712,16 @@ class OrderPayView(CompanyBranchQuerysetMixin, APIView):
                 "is_paid", "paid_at", "payment_method",
                 "status", "updated_at",
             ])
+
+            # При закрытии заказа отменяем незавершенные задачи кухни
+            if close_order:
+                # Отменяем задачи в статусе PENDING и IN_PROGRESS
+                unfinished_tasks = KitchenTask.objects.filter(
+                    order=order,
+                    status__in=[KitchenTask.Status.PENDING, KitchenTask.Status.IN_PROGRESS]
+                )
+                if unfinished_tasks.exists():
+                    unfinished_tasks.update(status=KitchenTask.Status.CANCELLED)
 
             if close_order and order.table_id:
                 with transaction.atomic():
@@ -887,6 +906,64 @@ class KitchenTaskReadyView(CompanyBranchQuerysetMixin, APIView):
                 )
 
         return Response(KitchenTaskSerializer(task, context={'request': request}).data)
+
+
+class KitchenTaskRetrieveUpdateDestroyView(CompanyBranchQuerysetMixin, generics.RetrieveUpdateDestroyAPIView):
+    """
+    GET/PATCH/DELETE /cafe/kitchen/tasks/<uuid:pk>/
+    Позволяет получать, обновлять (включая статус) и удалять задачи кухни.
+    """
+    queryset = KitchenTask.objects.select_related('order__table', 'menu_item', 'waiter', 'cook')
+    serializer_class = KitchenTaskSerializer
+
+    def perform_update(self, serializer):
+        old_status = None
+        old_started_at = None
+        old_finished_at = None
+        if serializer.instance:
+            old_status = serializer.instance.status
+            old_started_at = serializer.instance.started_at
+            old_finished_at = serializer.instance.finished_at
+        
+        # Определяем, нужно ли устанавливать started_at или finished_at
+        new_status = serializer.validated_data.get('status', old_status)
+        update_fields = []
+        
+        # Если статус меняется на IN_PROGRESS, устанавливаем started_at и cook
+        if new_status == KitchenTask.Status.IN_PROGRESS and old_status != new_status:
+            if not old_started_at:
+                serializer.validated_data['started_at'] = timezone.now()
+                update_fields.append('started_at')
+            if not serializer.instance.cook_id:
+                serializer.validated_data['cook'] = self.request.user
+                update_fields.append('cook')
+        
+        # Если статус меняется на READY, устанавливаем finished_at
+        if new_status == KitchenTask.Status.READY and old_status != new_status:
+            if not old_finished_at:
+                serializer.validated_data['finished_at'] = timezone.now()
+                update_fields.append('finished_at')
+        
+        # Выполняем обновление
+        super().perform_update(serializer)
+        task = serializer.instance
+        
+        # Отправляем уведомление официанту при переходе в READY
+        if new_status == KitchenTask.Status.READY and old_status != new_status and task.waiter_id:
+            NotificationCafe.objects.create(
+                company=task.company,
+                branch=task.branch,
+                recipient=task.waiter,
+                type='kitchen_ready',
+                message=f'Готово: {task.menu_item.title} (стол {task.order.table.number})',
+                payload={
+                    "task_id": str(task.id),
+                    "order_id": str(task.order_id),
+                    "table": task.order.table.number,
+                    "menu_item": task.menu_item.title,
+                    "unit_index": task.unit_index,
+                }
+            )
 
 
 class KitchenTaskMonitorView(CompanyBranchQuerysetMixin, generics.ListAPIView):

@@ -19,7 +19,7 @@ from .views import (
     OrderItemListCreateView, OrderItemRetrieveUpdateDestroyView,
 
     # Kitchen / notifications / analytics
-    KitchenTaskListView, KitchenTaskClaimView, KitchenTaskReadyView, KitchenTaskMonitorView,
+    KitchenTaskListView, KitchenTaskClaimView, KitchenTaskReadyView, KitchenTaskRetrieveUpdateDestroyView, KitchenTaskMonitorView,
     KitchenAnalyticsByCookView, KitchenAnalyticsByWaiterView,
     NotificationListView, InventorySessionListCreateView, InventorySessionRetrieveView, InventorySessionConfirmView,
     EquipmentListCreateView, EquipmentRetrieveUpdateDestroyView,
@@ -96,6 +96,8 @@ urlpatterns = [
     # ==================== Kitchen (повар) ====================
     # Лента задач (pending + in_progress; ?mine=1, ?status=ready и т.п.)
     path("kitchen/tasks/", KitchenTaskListView.as_view(), name="kitchen-task-list"),
+    # Получить/обновить/удалить задачу (PATCH для изменения статуса и других полей)
+    path("kitchen/tasks/<uuid:pk>/", KitchenTaskRetrieveUpdateDestroyView.as_view(), name="kitchen-task-detail"),
     # Взять задачу в работу
     path("kitchen/tasks/<uuid:pk>/claim/", KitchenTaskClaimView.as_view(), name="kitchen-task-claim"),
     # Отметить как готово (уведомляет официанта)
