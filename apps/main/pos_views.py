@@ -1204,19 +1204,23 @@ class SaleScanAPIView(APIView):
         else:
             effective_qty = Decimal(str(qty))
 
-        item, created = CartItem.objects.get_or_create(
+        # Блокируем корзину для предотвращения race conditions
+        cart = Cart.objects.select_for_update().get(id=cart.id)
+        
+        item, created = CartItem.objects.select_for_update().get_or_create(
             cart=cart,
             product=product,
             defaults={
                 "company": cart.company,
                 "branch": getattr(cart, "branch", None),
-                "quantity": effective_qty,
+                "quantity": qty3(effective_qty),
                 "unit_price": product.price,
             },
         )
 
         if not created:
-            item.quantity = item.quantity + effective_qty
+            # Округляем количество после сложения
+            item.quantity = qty3(item.quantity + effective_qty)
             item.save(update_fields=["quantity"])
 
         cart.recalc()
@@ -1248,28 +1252,39 @@ class SaleAddItemAPIView(APIView):
         unit_price = ser.validated_data.get("unit_price")
         line_discount = ser.validated_data.get("discount_total")
 
+        # Вычисляем unit_price только если он явно не передан
+        calculated_unit_price = None
         if unit_price is None:
             if line_discount is not None:
                 per_unit_disc = _q2(Decimal(line_discount) / Decimal(qty))
-                unit_price = _q2(Decimal(product.price) - per_unit_disc)
-                if unit_price < 0:
-                    unit_price = Decimal("0.00")
+                calculated_unit_price = _q2(Decimal(product.price) - per_unit_disc)
+                if calculated_unit_price < 0:
+                    calculated_unit_price = Decimal("0.00")
             else:
-                unit_price = product.price
+                calculated_unit_price = product.price
 
-        item, created = CartItem.objects.get_or_create(
+        # Блокируем корзину для предотвращения race conditions
+        cart = Cart.objects.select_for_update().get(id=cart.id)
+        
+        item, created = CartItem.objects.select_for_update().get_or_create(
             cart=cart,
             product=product,
             defaults={
                 "company": cart.company,
                 "branch": getattr(cart, "branch", None),
-                "quantity": qty,
-                "unit_price": unit_price,
+                "quantity": qty3(qty),
+                "unit_price": calculated_unit_price or unit_price,
             },
         )
+        
         if not created:
-            item.quantity += qty
-            item.unit_price = unit_price
+            # Округляем количество после сложения
+            item.quantity = qty3(item.quantity + qty)
+            
+            # Обновляем цену только если она была явно указана (unit_price или discount_total)
+            if unit_price is not None or line_discount is not None:
+                item.unit_price = calculated_unit_price or unit_price
+            
             item.save(update_fields=["quantity", "unit_price"])
 
         cart.recalc()
@@ -1443,19 +1458,23 @@ class MobileScannerIngestAPIView(APIView):
         except Product.DoesNotExist:
             return Response({"not_found": True, "message": "Товар не найден"}, status=404)
 
-        item, created = CartItem.objects.get_or_create(
+        # Блокируем корзину для предотвращения race conditions
+        cart = Cart.objects.select_for_update().get(id=cart.id)
+        
+        item, created = CartItem.objects.select_for_update().get_or_create(
             cart=cart,
             product=product,
             defaults={
                 "company": cart.company,
                 "branch": getattr(cart, "branch", None),
-                "quantity": qty,
+                "quantity": qty3(qty),
                 "unit_price": product.price,
             },
         )
         if not created:
-            CartItem.objects.filter(pk=item.pk).update(quantity=F("quantity") + qty)
-            item.refresh_from_db(fields=["quantity"])
+            # Округляем количество после сложения
+            item.quantity = qty3(item.quantity + qty)
+            item.save(update_fields=["quantity"])
 
         return Response({"ok": True}, status=201)
 
@@ -1882,18 +1901,22 @@ class AgentSaleScanAPIView(CompanyBranchRestrictedMixin, APIView):
                 status=400,
             )
 
-        item, created = CartItem.objects.get_or_create(
+        # Блокируем корзину для предотвращения race conditions
+        cart = Cart.objects.select_for_update().get(id=cart.id)
+        
+        item, created = CartItem.objects.select_for_update().get_or_create(
             cart=cart,
             product=product,
             defaults={
                 "company": cart.company,
                 "branch": getattr(cart, "branch", None),
-                "quantity": qty,
+                "quantity": qty3(qty),
                 "unit_price": product.price,
             },
         )
         if not created:
-            item.quantity += qty
+            # Округляем количество после сложения
+            item.quantity = qty3(item.quantity + qty)
             item.save(update_fields=["quantity"])
 
         cart.recalc()
@@ -1940,28 +1963,39 @@ class AgentSaleAddItemAPIView(CompanyBranchRestrictedMixin, APIView):
 
         unit_price = ser.validated_data.get("unit_price")
         line_discount = ser.validated_data.get("discount_total")
+        
+        # Вычисляем unit_price только если он явно не передан
+        calculated_unit_price = None
         if unit_price is None:
             if line_discount is not None:
                 per_unit_disc = money(Decimal(line_discount) / Decimal(qty))
-                unit_price = money(Decimal(product.price) - per_unit_disc)
-                if unit_price < 0:
-                    unit_price = Decimal("0.00")
+                calculated_unit_price = money(Decimal(product.price) - per_unit_disc)
+                if calculated_unit_price < 0:
+                    calculated_unit_price = Decimal("0.00")
             else:
-                unit_price = product.price
+                calculated_unit_price = product.price
 
-        item, created = CartItem.objects.get_or_create(
+        # Блокируем корзину для предотвращения race conditions
+        cart = Cart.objects.select_for_update().get(id=cart.id)
+        
+        item, created = CartItem.objects.select_for_update().get_or_create(
             cart=cart,
             product=product,
             defaults={
                 "company": cart.company,
                 "branch": getattr(cart, "branch", None),
-                "quantity": qty,
-                "unit_price": unit_price,
+                "quantity": qty3(qty),
+                "unit_price": calculated_unit_price or unit_price,
             },
         )
         if not created:
-            item.quantity += qty
-            item.unit_price = unit_price
+            # Округляем количество после сложения
+            item.quantity = qty3(item.quantity + qty)
+            
+            # Обновляем цену только если она была явно указана (unit_price или discount_total)
+            if unit_price is not None or line_discount is not None:
+                item.unit_price = calculated_unit_price or unit_price
+            
             item.save(update_fields=["quantity", "unit_price"])
 
         cart.recalc()
