@@ -18,7 +18,7 @@ from django.http import FileResponse
 from django.http import Http404
 from rest_framework.exceptions import NotFound, PermissionDenied, ValidationError
 
-from decimal import Decimal, ROUND_HALF_UP, InvalidOperation
+from decimal import Decimal, ROUND_HALF_UP
 from datetime import timedelta, datetime, date, time as dtime
 import io, os, uuid
 
@@ -42,6 +42,9 @@ from apps.main.services_agent_pos import checkout_agent_cart, AgentNotEnoughStoc
 from apps.main.utils_numbers import ensure_sale_doc_number
 from apps.main.views import CompanyBranchRestrictedMixin
 from apps.construction.models import Cashbox, CashShift
+from .pos_utils import (
+    money, qty3, q2, fmt_money, fmt, to_decimal, as_decimal, _q2, Q2, Q3
+)
 
 from .pos_serializers import (
     SaleCartSerializer,
@@ -99,46 +102,9 @@ def _set_font(p, name: str, size: int, fallback: str = "Helvetica"):
         p.setFont(fallback, size)
 
 
-def _to_decimal(v, default=None):
-    if v in (None, "", "null", "None"):
-        return default
-    try:
-        return Decimal(str(v).replace(",", "."))
-    except (InvalidOperation, ValueError, TypeError):
-        return default
-
-
-def _as_decimal(v, default: Decimal = Decimal("0")) -> Decimal:
-    d = _to_decimal(v, default=None)
-    if d is None:
-        return default
-    try:
-        return Decimal(d)
-    except Exception:
-        return default
-
-
-def _q2(x: Optional[Decimal]) -> Decimal:
-    return (x or Decimal("0")).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
-
-
-def fmt_money(x: Optional[Decimal]) -> str:
-    return f"{_q2(x):.2f}"
-
-
-Q2 = Decimal("0.01")
-
-
-def q2(x: Optional[Decimal]) -> Decimal:
-    return (x or Decimal("0.00")).quantize(Q2, rounding=ROUND_HALF_UP)
-
-
-def money(x: Optional[Decimal]) -> Decimal:
-    return (x or Decimal("0")).quantize(Q2, rounding=ROUND_HALF_UP)
-
-
-def fmt(x: Optional[Decimal]) -> str:
-    return f"{money(x):.2f}"
+# Алиасы для обратной совместимости (используются в коде)
+_to_decimal = to_decimal
+_as_decimal = as_decimal
 
 
 def _aware(dt_or_date, end=False):
@@ -172,11 +138,7 @@ def _safe(v) -> str:
     return v if (v is not None and str(v).strip()) else "—"
 
 
-Q3 = Decimal("0.001")
-
-
-def qty3(x: Optional[Decimal]) -> Decimal:
-    return (x or Decimal("0")).quantize(Q3, rounding=ROUND_HALF_UP)
+# qty3 импортирован из pos_utils
 
 
 @dataclass
@@ -2188,10 +2150,12 @@ class AgentCartItemUpdateDestroyAPIView(APIView):
         cart = self._get_active_cart(request, cart_id)
         item = self._get_item_in_cart(cart, item_id)
 
-        try:
-            qty = int(request.data.get("quantity"))
-        except (TypeError, ValueError):
-            return Response({"quantity": "Укажите целое число >= 0."}, status=400)
+        raw = request.data.get("quantity")
+        qty = _to_decimal(raw, default=None)
+        if qty is None:
+            return Response({"quantity": "Укажите число >= 0."}, status=400)
+
+        qty = qty3(qty)
 
         if qty < 0:
             return Response({"quantity": "Количество не может быть отрицательным."}, status=400)

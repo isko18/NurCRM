@@ -1,33 +1,13 @@
-from decimal import Decimal, ROUND_HALF_UP
+from decimal import Decimal
 from rest_framework import serializers
 
-from apps.construction.models import Cashbox, CashShift  # ✅ cashbox/shift для checkout
+from apps.construction.models import Cashbox, CashShift
 from .models import (
     Product, Cart, CartItem, Sale, SaleItem, MobileScannerToken, ProductImage
 )
-
-Q2 = Decimal("0.01")
-Q2 = Decimal("0.01")
-Q3 = Decimal("0.001")
-
-
-def money(x: Decimal) -> Decimal:
-    return (x or Decimal("0")).quantize(Q2, rounding=ROUND_HALF_UP)
-
-
-def qty3(x: Decimal) -> Decimal:
-    return (x or Decimal("0")).quantize(Q3, rounding=ROUND_HALF_UP)
-
-
-def _has_field(model, name: str) -> bool:
-    try:
-        return any(f.name == name for f in model._meta.get_fields())
-    except Exception:
-        return False
-
-
-def _get_attr(obj, name, default=None):
-    return getattr(obj, name, default) if obj is not None else default
+from .pos_utils import (
+    money, qty3, has_field, get_attr, Q2, Q3
+)
 
 
 class MoneyField(serializers.DecimalField):
@@ -60,32 +40,6 @@ class QtyField(serializers.DecimalField):
         if val <= 0:
             raise serializers.ValidationError("Количество должно быть > 0.")
         return val
-
-
-def money(x: Decimal) -> Decimal:
-    return (x or Decimal("0")).quantize(Q2, rounding=ROUND_HALF_UP)
-
-
-def _has_field(model, name: str) -> bool:
-    try:
-        return any(f.name == name for f in model._meta.get_fields())
-    except Exception:
-        return False
-
-
-def _get_attr(obj, name, default=None):
-    return getattr(obj, name, default) if obj is not None else default
-
-
-class MoneyField(serializers.DecimalField):
-    def __init__(self, *args, **kwargs):
-        kwargs.setdefault("max_digits", 12)
-        kwargs.setdefault("decimal_places", 2)
-        super().__init__(*args, **kwargs)
-
-    def to_internal_value(self, value):
-        val = super().to_internal_value(value)
-        return money(val)
 
 
 class StartCartOptionsSerializer(serializers.Serializer):
@@ -145,8 +99,8 @@ class SaleItemSerializer(serializers.ModelSerializer):
         )
 
     def get_display_name(self, obj):
-        return _get_attr(_get_attr(obj, "product", None), "name", None) or (
-            _get_attr(obj, "custom_name", "") or ""
+        return get_attr(get_attr(obj, "product", None), "name", None) or (
+            get_attr(obj, "custom_name", "") or ""
         )
 
     def get_primary_image_url(self, obj):
@@ -161,26 +115,26 @@ class SaleItemSerializer(serializers.ModelSerializer):
         return request.build_absolute_uri(url) if request else url
 
     def _validate_company_branch(self, cart: Cart, product: Product):
-        cart_company_id = _get_attr(cart, "company_id")
-        product_company_id = _get_attr(product, "company_id")
+        cart_company_id = get_attr(cart, "company_id")
+        product_company_id = get_attr(product, "company_id")
         if cart and product and cart_company_id is not None and product_company_id is not None:
             if cart_company_id != product_company_id:
                 raise serializers.ValidationError({"product": "Товар принадлежит другой компании, чем корзина."})
 
-        if _has_field(type(cart), "branch") and _has_field(type(product), "branch"):
-            cart_branch_id = _get_attr(cart, "branch_id")
-            product_branch_id = _get_attr(product, "branch_id")
+        if has_field(type(cart), "branch") and has_field(type(product), "branch"):
+            cart_branch_id = get_attr(cart, "branch_id")
+            product_branch_id = get_attr(product, "branch_id")
             if product_branch_id is not None and product_branch_id != cart_branch_id:
                 raise serializers.ValidationError({"product": "Товар из другого филиала и не является глобальным."})
 
     def validate(self, attrs):
-        cart = attrs.get("cart") or _get_attr(self.instance, "cart", None)
-        product = attrs.get("product") or _get_attr(self.instance, "product", None)
+        cart = attrs.get("cart") or get_attr(self.instance, "cart", None)
+        product = attrs.get("product") or get_attr(self.instance, "product", None)
 
         if cart and product:
             self._validate_company_branch(cart, product)
 
-        qty = attrs.get("quantity", _get_attr(self.instance, "quantity", Decimal("1.000")))
+        qty = attrs.get("quantity", get_attr(self.instance, "quantity", Decimal("1.000")))
         qty = qty3(Decimal(str(qty)))
         if qty <= 0:
             raise serializers.ValidationError({"quantity": "Количество должно быть > 0."})
@@ -194,11 +148,11 @@ class SaleItemSerializer(serializers.ModelSerializer):
         if validated_data.get("product") and "unit_price" not in validated_data:
             validated_data["unit_price"] = validated_data["product"].price
 
-        if _has_field(CartItem, "company"):
+        if has_field(CartItem, "company"):
             validated_data.setdefault("company", cart.company)
 
-        if _has_field(CartItem, "branch"):
-            validated_data.setdefault("branch", _get_attr(cart, "branch", None))
+        if has_field(CartItem, "branch"):
+            validated_data.setdefault("branch", get_attr(cart, "branch", None))
 
         return super().create(validated_data)
 
@@ -494,7 +448,7 @@ class SaleItemReadSerializer(serializers.ModelSerializer):
         read_only_fields = fields
 
     def get_product_name(self, obj):
-        return _get_attr(_get_attr(obj, "product", None), "name", None) or obj.name_snapshot
+        return get_attr(get_attr(obj, "product", None), "name", None) or obj.name_snapshot
 
     def get_line_total(self, obj):
         total = (obj.unit_price or Decimal("0")) * Decimal(obj.quantity or 0)
