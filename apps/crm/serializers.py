@@ -102,6 +102,7 @@ class LeadSerializer(serializers.ModelSerializer):
     owner_name = serializers.CharField(source='owner.get_full_name', read_only=True)
     
     class Meta:
+        ref_name = "CrmLeadSerializer"
         model = Lead
         fields = [
             'id', 'company', 'contact', 'contact_id', 'funnel', 'funnel_name',
