@@ -89,7 +89,15 @@ def post_document(document: models.Document) -> models.Document:
                     cur_from = Decimal(bal_from.qty) if bal_from else Decimal("0")
                     qty_to_move = Decimal(item.qty)
                     if cur_from - qty_to_move < 0:
-                        raise ValueError(f"Недостаточно товара на складе '{document.warehouse_from.name}'. Доступно: {cur_from}, требуется: {qty_to_move}")
+                        # Формируем информативное название товара: артикул или имя
+                        if item.product:
+                            product_display = item.product.article if item.product.article else item.product.name
+                            if not product_display:
+                                product_display = f"ID {item.product_id}"
+                        else:
+                            product_display = f"ID {item.product_id}"
+                        warehouse_name = document.warehouse_from.name if document.warehouse_from else "не указан"
+                        raise ValueError(f"Недостаточно товара '{product_display}' на складе '{warehouse_name}'. Доступно: {cur_from}, требуется: {qty_to_move}")
                 
                 # from
                 mv1 = models.StockMove.objects.create(
@@ -118,8 +126,15 @@ def post_document(document: models.Document) -> models.Document:
                 if delta == 0:
                     continue
                 if not allow_negative and cur + delta < 0:
-                    product_name = item.product.name if item.product else f"ID {item.product_id}"
-                    raise ValueError(f"Инвентаризация приведет к отрицательному остатку для товара '{product_name}' на складе '{document.warehouse_from.name}'. Текущий остаток: {cur}, устанавливается: {item.qty}")
+                    # Формируем информативное название товара: артикул или имя
+                    if item.product:
+                        product_display = item.product.article if item.product.article else item.product.name
+                        if not product_display:
+                            product_display = f"ID {item.product_id}"
+                    else:
+                        product_display = f"ID {item.product_id}"
+                    warehouse_name = document.warehouse_from.name if document.warehouse_from else "не указан"
+                    raise ValueError(f"Инвентаризация приведет к отрицательному остатку для товара '{product_display}' на складе '{warehouse_name}'. Текущий остаток: {cur}, устанавливается: {item.qty}")
                 mv = models.StockMove.objects.create(
                     document=document,
                     warehouse=document.warehouse_from,
@@ -147,8 +162,15 @@ def post_document(document: models.Document) -> models.Document:
                     bal = models.StockBalance.objects.select_for_update().filter(warehouse=document.warehouse_from, product=item.product).first()
                     cur = Decimal(bal.qty) if bal else Decimal("0")
                     if cur + delta < 0:
-                        product_name = item.product.name if item.product else f"ID {item.product_id}"
-                        raise ValueError(f"Недостаточно товара '{product_name}' на складе '{document.warehouse_from.name}'. Доступно: {cur}, требуется: {abs(delta)}")
+                        # Формируем информативное название товара: артикул или имя
+                        if item.product:
+                            product_display = item.product.article if item.product.article else item.product.name
+                            if not product_display:
+                                product_display = f"ID {item.product_id}"
+                        else:
+                            product_display = f"ID {item.product_id}"
+                        warehouse_name = document.warehouse_from.name if document.warehouse_from else "не указан"
+                        raise ValueError(f"Недостаточно товара '{product_display}' на складе '{warehouse_name}'. Доступно: {cur}, требуется: {abs(delta)}")
                 mv = models.StockMove.objects.create(
                     document=document,
                     warehouse=document.warehouse_from,
