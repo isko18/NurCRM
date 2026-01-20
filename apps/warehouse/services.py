@@ -47,7 +47,7 @@ def _apply_move(move: models.StockMove):
     bal.save()
 
 
-def post_document(document: models.Document) -> models.Document:
+def post_document(document: models.Document, allow_negative: bool = None) -> models.Document:
     if document.status == document.Status.POSTED:
         raise ValueError("Document already posted")
 
@@ -72,7 +72,9 @@ def post_document(document: models.Document) -> models.Document:
 
     recalc_document_totals(document)
 
-    allow_negative = getattr(settings, "ALLOW_NEGATIVE_STOCK", False)
+    # Если allow_negative не передан явно, берем из настроек
+    if allow_negative is None:
+        allow_negative = getattr(settings, "ALLOW_NEGATIVE_STOCK", False)
 
     with transaction.atomic():
         # Оптимизация: предзагружаем items с продуктами
