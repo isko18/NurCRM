@@ -11,6 +11,11 @@ class DocumentItemSerializer(serializers.ModelSerializer):
 
 class DocumentSerializer(serializers.ModelSerializer):
     items = DocumentItemSerializer(many=True)
+    counterparty_display_name = serializers.CharField(
+        source='counterparty.name',
+        read_only=True,
+        allow_null=True
+    )
 
     class Meta:
         ref_name = "WarehouseDocumentSerializer"
@@ -24,6 +29,7 @@ class DocumentSerializer(serializers.ModelSerializer):
             "warehouse_from",
             "warehouse_to",
             "counterparty",
+            "counterparty_display_name",
             "comment",
             "total",
             "items",
