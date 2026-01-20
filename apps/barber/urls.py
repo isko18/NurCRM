@@ -30,4 +30,12 @@ urlpatterns = [
 
     path("sale-payouts/", views.PayoutSaleListCreateView.as_view(), name="sale-payout-list"),
     path("sale-payouts/<uuid:pk>/", views.PayoutSaleRetrieveUpdateDestroyView.as_view(), name="sale-payout-detail"),
+    
+    # Онлайн заявки (публичный эндпоинт)
+    path("public/<str:company_slug>/bookings/", views.OnlineBookingPublicCreateView.as_view(), name="online-booking-public-create"),
+    
+    # Онлайн заявки (защищенные эндпоинты)
+    path("bookings/", views.OnlineBookingListView.as_view(), name="online-booking-list"),
+    path("bookings/<uuid:pk>/", views.OnlineBookingDetailView.as_view(), name="online-booking-detail"),
+    path("bookings/<uuid:pk>/status/", views.OnlineBookingStatusUpdateView.as_view(), name="online-booking-status-update"),
 ]
