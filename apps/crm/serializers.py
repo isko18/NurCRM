@@ -70,6 +70,7 @@ class ContactSerializer(serializers.ModelSerializer):
     full_name = serializers.CharField(read_only=True)
     
     class Meta:
+        ref_name = "CrmContactSerializer"
         model = Contact
         fields = [
             'id', 'company', 'company_name', 'branch', 'branch_name',
@@ -141,6 +142,7 @@ class DealSerializer(serializers.ModelSerializer):
     owner_name = serializers.CharField(source='owner.get_full_name', read_only=True)
     
     class Meta:
+        ref_name = "CrmDealSerializer"
         model = Deal
         fields = [
             'id', 'company', 'lead', 'lead_title', 'contact', 'funnel',

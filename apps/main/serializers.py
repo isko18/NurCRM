@@ -260,6 +260,7 @@ class ContactSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
     branch = serializers.ReadOnlyField(source='branch.id')
 
     class Meta:
+        ref_name = "MainContactSerializer"
         model = Contact
         fields = [
             'id', 'company', 'branch',
@@ -298,6 +299,7 @@ class DealSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
     assigned_to = serializers.PrimaryKeyRelatedField(queryset=User.objects.all(), allow_null=True)
 
     class Meta:
+        ref_name = "MainDealSerializer"
         model = Deal
         fields = [
             'id', 'company', 'branch',
