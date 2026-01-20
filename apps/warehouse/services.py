@@ -40,9 +40,13 @@ def recalc_document_totals(document: models.Document) -> models.Document:
 def _apply_move(move: models.StockMove):
     # apply qty_delta to StockBalance
     # Оптимизация: используем select_related если warehouse и product уже загружены
-    bal, _ = models.StockBalance.objects.select_for_update().get_or_create(
+    bal, created = models.StockBalance.objects.select_for_update().get_or_create(
         warehouse=move.warehouse, product=move.product, defaults={"qty": Decimal("0.000")}
     )
+    # Если StockBalance только что создан и товар принадлежит этому складу, инициализируем из quantity
+    if created and move.product.warehouse_id == move.warehouse_id:
+        initial_qty = Decimal(move.product.quantity) if move.product.quantity else Decimal("0.000")
+        bal.qty = initial_qty
     bal.qty = Decimal(bal.qty or 0) + Decimal(move.qty_delta or 0)
     bal.save()
 
@@ -88,7 +92,14 @@ def post_document(document: models.Document, allow_negative: bool = None) -> mod
                     bal_from = models.StockBalance.objects.select_for_update().filter(
                         warehouse=document.warehouse_from, product=item.product
                     ).first()
-                    cur_from = Decimal(bal_from.qty) if bal_from else Decimal("0")
+                    if bal_from:
+                        cur_from = Decimal(bal_from.qty) if bal_from.qty else Decimal("0")
+                    else:
+                        # Если StockBalance нет, проверяем quantity товара (если товар принадлежит этому складу)
+                        if item.product.warehouse_id == document.warehouse_from_id:
+                            cur_from = Decimal(item.product.quantity) if item.product.quantity else Decimal("0")
+                        else:
+                            cur_from = Decimal("0")
                     qty_to_move = Decimal(item.qty)
                     if cur_from - qty_to_move < 0:
                         # Формируем информативное название товара: артикул или имя
@@ -123,7 +134,14 @@ def post_document(document: models.Document, allow_negative: bool = None) -> mod
             for item in items:
                 # fact = item.qty, compare with current
                 bal = models.StockBalance.objects.select_for_update().filter(warehouse=document.warehouse_from, product=item.product).first()
-                cur = Decimal(bal.qty) if bal else Decimal("0")
+                if bal:
+                    cur = Decimal(bal.qty) if bal.qty else Decimal("0")
+                else:
+                    # Если StockBalance нет, проверяем quantity товара (если товар принадлежит этому складу)
+                    if item.product.warehouse_id == document.warehouse_from_id:
+                        cur = Decimal(item.product.quantity) if item.product.quantity else Decimal("0")
+                    else:
+                        cur = Decimal("0")
                 delta = Decimal(item.qty) - cur
                 if delta == 0:
                     continue
@@ -161,8 +179,16 @@ def post_document(document: models.Document, allow_negative: bool = None) -> mod
             for item in items:
                 delta = sign * Decimal(item.qty)
                 if not allow_negative:
+                    # Проверяем остатки: сначала в StockBalance, если нет - используем WarehouseProduct.quantity
                     bal = models.StockBalance.objects.select_for_update().filter(warehouse=document.warehouse_from, product=item.product).first()
-                    cur = Decimal(bal.qty) if bal else Decimal("0")
+                    if bal:
+                        cur = Decimal(bal.qty) if bal.qty else Decimal("0")
+                    else:
+                        # Если StockBalance нет, проверяем quantity товара (если товар принадлежит этому складу)
+                        if item.product.warehouse_id == document.warehouse_from_id:
+                            cur = Decimal(item.product.quantity) if item.product.quantity else Decimal("0")
+                        else:
+                            cur = Decimal("0")
                     if cur + delta < 0:
                         # Формируем информативное название товара: артикул или имя
                         if item.product:
