@@ -119,6 +119,7 @@ class LeadSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
     branch = serializers.UUIDField(source='branch_id', read_only=True)
 
     class Meta:
+        ref_name = "EducationLeadSerializer"
         model = Lead
         fields = ['id', 'company', 'branch', 'name', 'phone', 'source', 'note', 'created_at']
         read_only_fields = ['id', 'company', 'branch', 'created_at']
