@@ -747,3 +747,134 @@ class PayoutSale(models.Model):
 
     def __str__(self):
         return f"{self.total}"
+
+
+# ===========================
+# OnlineBooking
+# ===========================
+class OnlineBooking(models.Model):
+    """Заявка на онлайн запись (публичная форма записи)."""
+    
+    class Status(models.TextChoices):
+        NEW = "new", "Новая"
+        CONFIRMED = "confirmed", "Подтверждена"
+        NO_SHOW = "no_show", "Не пришёл"
+        SPAM = "spam", "Спам"
+    
+    class PaymentMethod(models.TextChoices):
+        CASH = "cash", "Наличные"
+        CARD = "card", "Карта"
+        ONLINE = "online", "Онлайн"
+    
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    
+    company = models.ForeignKey(
+        Company,
+        on_delete=models.CASCADE,
+        related_name="online_bookings",
+        verbose_name="Компания"
+    )
+    branch = models.ForeignKey(
+        Branch,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="online_bookings",
+        verbose_name="Филиал",
+        db_index=True
+    )
+    
+    # Услуги (храним как JSON для гибкости)
+    services = models.JSONField(
+        default=list,
+        verbose_name="Услуги",
+        help_text="Массив услуг: [{'service_id': 'uuid', 'title': 'название', 'price': 100, 'duration_min': 30}]"
+    )
+    
+    # Мастер
+    master_id = models.UUIDField(
+        null=True,
+        blank=True,
+        verbose_name="ID мастера",
+        help_text="ID пользователя (мастера)"
+    )
+    master_name = models.CharField(
+        max_length=255,
+        blank=True,
+        null=True,
+        verbose_name="Имя мастера"
+    )
+    
+    # Дата и время
+    date = models.DateField(verbose_name="Дата записи")
+    time_start = models.TimeField(verbose_name="Время начала")
+    time_end = models.TimeField(verbose_name="Время окончания")
+    
+    # Клиент
+    client_name = models.CharField(max_length=255, verbose_name="Имя клиента")
+    client_phone = models.CharField(max_length=32, verbose_name="Телефон клиента", db_index=True)
+    client_comment = models.TextField(blank=True, null=True, verbose_name="Комментарий клиента")
+    
+    # Итоговые суммы (вычисляются из services)
+    total_price = models.DecimalField(
+        max_digits=10,
+        decimal_places=2,
+        default=Decimal("0.00"),
+        verbose_name="Общая цена"
+    )
+    total_duration_min = models.PositiveIntegerField(
+        default=0,
+        verbose_name="Общая длительность (минуты)"
+    )
+    
+    # Статус и оплата
+    status = models.CharField(
+        max_length=16,
+        choices=Status.choices,
+        default=Status.NEW,
+        db_index=True,
+        verbose_name="Статус"
+    )
+    payment_method = models.CharField(
+        max_length=16,
+        choices=PaymentMethod.choices,
+        default=PaymentMethod.CASH,
+        verbose_name="Способ оплаты"
+    )
+    
+    created_at = models.DateTimeField(auto_now_add=True, verbose_name="Дата создания")
+    updated_at = models.DateTimeField(auto_now=True, verbose_name="Дата обновления")
+    
+    class Meta:
+        verbose_name = "Онлайн заявка"
+        verbose_name_plural = "Онлайн заявки"
+        ordering = ["-created_at"]
+        indexes = [
+            models.Index(fields=["company", "status"]),
+            models.Index(fields=["company", "branch", "status"]),
+            models.Index(fields=["date", "time_start"]),
+            models.Index(fields=["client_phone"]),
+        ]
+    
+    def __str__(self):
+        return f"{self.client_name} - {self.date} {self.time_start}"
+    
+    def clean(self):
+        if self.branch_id and self.branch.company_id != self.company_id:
+            raise ValidationError({'branch': 'Филиал принадлежит другой компании.'})
+        
+        # Проверка времени
+        if self.time_end <= self.time_start:
+            raise ValidationError({'time_end': 'Время окончания должно быть позже времени начала.'})
+    
+    def save(self, *args, **kwargs):
+        # Автоматически вычисляем total_price и total_duration_min из services
+        if self.services:
+            self.total_price = sum(
+                Decimal(str(s.get('price', 0))) for s in self.services
+            )
+            self.total_duration_min = sum(
+                int(s.get('duration_min', 0)) for s in self.services
+            )
+        self.full_clean()
+        super().save(*args, **kwargs)

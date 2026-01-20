@@ -1,17 +1,16 @@
 from rest_framework import generics, permissions, status
 from rest_framework.response import Response
 from rest_framework.parsers import MultiPartParser, FormParser
-from rest_framework.exceptions import PermissionDenied
+from rest_framework.exceptions import PermissionDenied, ValidationError
 from rest_framework.filters import SearchFilter, OrderingFilter
 from django.db.models.deletion import ProtectedError
 from django.db import IntegrityError
-from rest_framework.exceptions import ValidationError
 
 from django_filters import rest_framework as filters
 from django_filters.rest_framework import DjangoFilterBackend
 
-from apps.users.models import Branch
-from .models import Service, Client, Appointment, Document, Folder, ServiceCategory, Payout, PayoutSale, ProductSalePayout
+from apps.users.models import Branch, Company
+from .models import Service, Client, Appointment, Document, Folder, ServiceCategory, Payout, PayoutSale, ProductSalePayout, OnlineBooking
 
 from .serializers import (
     ServiceSerializer,
@@ -22,7 +21,10 @@ from .serializers import (
     ServiceCategorySerializer,
     PayoutSerializer,
     PayoutSaleSerializer,
-    ProductSalePayoutSerializer
+    ProductSalePayoutSerializer,
+    OnlineBookingCreateSerializer,
+    OnlineBookingSerializer,
+    OnlineBookingStatusUpdateSerializer
 )
 
 
@@ -559,3 +561,74 @@ class PayoutSaleRetrieveUpdateDestroyView(
     queryset = PayoutSale.objects.all()
     serializer_class = PayoutSaleSerializer
     permission_classes = [permissions.IsAuthenticated]
+
+
+# ===========================
+# OnlineBooking - Публичный эндпоинт для создания заявки
+# ===========================
+class OnlineBookingPublicCreateView(generics.CreateAPIView):
+    """
+    Публичный эндпоинт для создания заявки на онлайн запись.
+    Доступен без авторизации, но требует slug компании в URL.
+    URL: /api/barbershop/public/{company_slug}/bookings/
+    """
+    serializer_class = OnlineBookingCreateSerializer
+    permission_classes = [permissions.AllowAny]
+    authentication_classes = []
+    
+    def get_company(self):
+        """Получаем компанию по slug из URL"""
+        slug = self.kwargs.get('company_slug')
+        try:
+            return Company.objects.get(slug=slug)
+        except Company.DoesNotExist:
+            raise ValidationError({'detail': 'Компания не найдена'})
+    
+    def perform_create(self, serializer):
+        """Создаем заявку с автоматическим определением компании"""
+        company = self.get_company()
+        serializer.save(
+            company=company,
+            status=OnlineBooking.Status.NEW
+        )
+
+
+# ===========================
+# OnlineBooking - Защищенные эндпоинты для управления заявками
+# ===========================
+class OnlineBookingListView(CompanyQuerysetMixin, generics.ListAPIView):
+    """
+    Список заявок на онлайн запись (только для авторизованных пользователей компании).
+    GET /api/barbershop/bookings/
+    """
+    queryset = OnlineBooking.objects.select_related('company', 'branch').all()
+    serializer_class = OnlineBookingSerializer
+    permission_classes = [permissions.IsAuthenticated]
+    filter_backends = [DjangoFilterBackend, SearchFilter, OrderingFilter]
+    filterset_fields = ['status', 'date', 'payment_method', 'branch']
+    search_fields = ['client_name', 'client_phone']
+    ordering_fields = ['created_at', 'date', 'time_start']
+    ordering = ['-created_at']
+
+
+class OnlineBookingDetailView(CompanyQuerysetMixin, generics.RetrieveAPIView):
+    """
+    Детали заявки.
+    GET /api/barbershop/bookings/{pk}/
+    """
+    queryset = OnlineBooking.objects.select_related('company', 'branch').all()
+    serializer_class = OnlineBookingSerializer
+    permission_classes = [permissions.IsAuthenticated]
+
+
+class OnlineBookingStatusUpdateView(CompanyQuerysetMixin, generics.UpdateAPIView):
+    """
+    Изменение статуса заявки.
+    PATCH /api/barbershop/bookings/{pk}/status/
+    """
+    queryset = OnlineBooking.objects.select_related('company', 'branch').all()
+    serializer_class = OnlineBookingStatusUpdateSerializer
+    permission_classes = [permissions.IsAuthenticated]
+    
+    def get_serializer_class(self):
+        return OnlineBookingStatusUpdateSerializer

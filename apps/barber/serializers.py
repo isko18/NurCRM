@@ -11,7 +11,8 @@ from .models import (
     ServiceCategory,
     Payout,
     PayoutSale,
-    ProductSalePayout
+    ProductSalePayout,
+    OnlineBooking
 )
 from apps.users.models import Branch  # для проверки филиала по ?branch=
 from decimal import Decimal, ROUND_HALF_UP
@@ -852,3 +853,117 @@ class PayoutSaleSerializer(serializers.ModelSerializer):
 
     # опционально: если кто-то вдруг будет делать PATCH/PUT —
     # можно оставить поведение по умолчанию или тоже пересчитывать тут.
+
+
+# ===========================
+# OnlineBooking
+# ===========================
+class OnlineBookingCreateSerializer(serializers.ModelSerializer):
+    """Публичный сериализатор для создания заявки (без авторизации)"""
+    
+    class Meta:
+        model = OnlineBooking
+        fields = [
+            'services',
+            'master_id',
+            'master_name',
+            'date',
+            'time_start',
+            'time_end',
+            'client_name',
+            'client_phone',
+            'client_comment',
+            'payment_method',
+            'status'
+        ]
+        read_only_fields = ['status']
+    
+    def validate_services(self, value):
+        """Валидация массива услуг"""
+        if not value or not isinstance(value, list):
+            raise serializers.ValidationError("services должен быть массивом")
+        
+        for service in value:
+            if not isinstance(service, dict):
+                raise serializers.ValidationError("Каждая услуга должна быть объектом")
+            required_fields = ['service_id', 'title', 'price', 'duration_min']
+            for field in required_fields:
+                if field not in service:
+                    raise serializers.ValidationError(f"Услуга должна содержать поле '{field}'")
+        
+        return value
+    
+    def validate(self, attrs):
+        """Валидация времени и даты"""
+        time_start = attrs.get('time_start')
+        time_end = attrs.get('time_end')
+        
+        if time_start and time_end and time_end <= time_start:
+            raise serializers.ValidationError({
+                'time_end': 'Время окончания должно быть позже времени начала'
+            })
+        
+        return attrs
+
+
+class OnlineBookingSerializer(serializers.ModelSerializer):
+    """Сериализатор для списка и деталей заявок (с авторизацией)"""
+    
+    company_name = serializers.CharField(source='company.name', read_only=True)
+    branch_name = serializers.CharField(source='branch.name', read_only=True)
+    services_titles = serializers.SerializerMethodField()
+    
+    class Meta:
+        model = OnlineBooking
+        fields = [
+            'id',
+            'status',
+            'created_at',
+            'client_name',
+            'client_phone',
+            'services',
+            'services_titles',
+            'total_price',
+            'total_duration_min',
+            'date',
+            'time_start',
+            'time_end',
+            'master_id',
+            'master_name',
+            'payment_method',
+            'client_comment',
+            'company',
+            'company_name',
+            'branch',
+            'branch_name',
+            'updated_at'
+        ]
+        read_only_fields = ['id', 'created_at', 'updated_at', 'total_price', 'total_duration_min']
+    
+    def get_services_titles(self, obj):
+        """Извлекаем только названия услуг для отображения"""
+        if obj.services:
+            return [s.get('title', '') for s in obj.services]
+        return []
+
+
+class OnlineBookingStatusUpdateSerializer(serializers.ModelSerializer):
+    """Сериализатор только для изменения статуса"""
+    
+    class Meta:
+        model = OnlineBooking
+        fields = ['status']
+    
+    def validate_status(self, value):
+        """Проверяем, что статус из разрешенных значений"""
+        allowed_statuses = [
+            OnlineBooking.Status.NEW,
+            OnlineBooking.Status.CONFIRMED,
+            OnlineBooking.Status.NO_SHOW,
+            OnlineBooking.Status.SPAM
+        ]
+        if value not in allowed_statuses:
+            raise serializers.ValidationError(
+                f"Статус должен быть одним из: {', '.join(allowed_statuses)}"
+            )
+        return value
