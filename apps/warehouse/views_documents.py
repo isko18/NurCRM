@@ -44,7 +44,11 @@ class DocumentPostView(CompanyBranchRestrictedMixin, generics.GenericAPIView):
     def post(self, request, pk=None):
         doc = self.get_object()
         try:
-            services.post_document(doc)
+            # Позволяем передать allow_negative в теле запроса для обхода проверки остатков
+            allow_negative = request.data.get('allow_negative', False)
+            if isinstance(allow_negative, str):
+                allow_negative = allow_negative.lower() in ('true', '1', 'yes')
+            services.post_document(doc, allow_negative=allow_negative)
         except Exception as e:
             return Response({"detail": str(e)}, status=status.HTTP_400_BAD_REQUEST)
         return Response(self.get_serializer(doc).data)

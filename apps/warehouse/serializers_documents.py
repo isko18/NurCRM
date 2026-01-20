@@ -95,7 +95,7 @@ class DocumentSerializer(serializers.ModelSerializer):
 class ProductSimpleSerializer(serializers.ModelSerializer):
     class Meta:
         model = models.WarehouseProduct
-        fields = ("id", "name", "article", "barcode", "unit")
+        fields = ("id", "name", "article", "barcode", "unit", "quantity")
 
 
 class WarehouseSimpleSerializer(serializers.ModelSerializer):
