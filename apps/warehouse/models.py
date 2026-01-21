@@ -823,3 +823,136 @@ class StockMove(models.Model):
     def __str__(self):
         return f"Move {self.document.number} {self.product} {self.qty_delta} @ {self.warehouse}"
 
+
+# -----------------------
+# Money documents
+# -----------------------
+
+
+class PaymentCategory(BaseModelId, BaseModelCompanyBranch):
+    """
+    Категория платежа для денежных документов (приход/расход).
+    """
+
+    title = models.CharField(max_length=255, verbose_name="Название")
+
+    class Meta:
+        verbose_name = "Категория платежа"
+        verbose_name_plural = "Категории платежей"
+        constraints = [
+            models.UniqueConstraint(
+                fields=("branch", "title"),
+                name="uq_wh_payment_category_title_per_branch",
+                condition=models.Q(branch__isnull=False),
+            ),
+            models.UniqueConstraint(
+                fields=("company", "title"),
+                name="uq_wh_payment_category_title_global_per_company",
+                condition=models.Q(branch__isnull=True),
+            ),
+        ]
+        indexes = [
+            models.Index(fields=["company", "title"]),
+            models.Index(fields=["company", "branch", "title"]),
+        ]
+
+    def __str__(self):
+        return self.title
+
+    def clean(self):
+        if self.branch_id and self.branch.company_id != self.company_id:
+            raise ValidationError({"branch": "Филиал принадлежит другой компании."})
+
+
+class MoneyDocument(BaseModelCompanyBranch):
+    """
+    Денежные документы:
+    - MONEY_RECEIPT: получаем деньги от контрагента
+    - MONEY_EXPENSE: отправляем деньги контрагенту
+
+    В отличие от товарных документов, здесь нет items и нет StockMove.
+    """
+
+    class DocType(models.TextChoices):
+        MONEY_RECEIPT = "MONEY_RECEIPT", "Приход"
+        MONEY_EXPENSE = "MONEY_EXPENSE", "Расход"
+
+    class Status(models.TextChoices):
+        DRAFT = "DRAFT", "Черновик"
+        POSTED = "POSTED", "Проведен"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    doc_type = models.CharField(max_length=32, choices=DocType.choices, verbose_name="Тип документа")
+    status = models.CharField(max_length=16, choices=Status.choices, default=Status.DRAFT, verbose_name="Статус")
+    number = models.CharField(max_length=64, unique=True, null=True, blank=True, verbose_name="Номер")
+    date = models.DateTimeField(auto_now_add=True, verbose_name="Дата")
+
+    warehouse = models.ForeignKey(
+        "warehouse.Warehouse",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="money_documents",
+        verbose_name="Счёт (склад)",
+    )
+
+    counterparty = models.ForeignKey(
+        "warehouse.Counterparty",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="money_documents",
+        verbose_name="Контрагент",
+    )
+
+    payment_category = models.ForeignKey(
+        "warehouse.PaymentCategory",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="money_documents",
+        verbose_name="Категория платежа",
+    )
+
+    amount = models.DecimalField(max_digits=18, decimal_places=2, default=Decimal("0.00"), verbose_name="Сумма")
+    comment = models.TextField(blank=True, verbose_name="Комментарий")
+
+    created_at = models.DateTimeField(auto_now_add=True, verbose_name="Дата создания")
+    updated_at = models.DateTimeField(auto_now=True, verbose_name="Дата обновления")
+
+    class Meta:
+        verbose_name = "Денежный документ"
+        verbose_name_plural = "Денежные документы"
+        indexes = [
+            models.Index(fields=["doc_type", "status", "date"]),
+            models.Index(fields=["counterparty", "date"]),
+            models.Index(fields=["warehouse", "date"]),
+            models.Index(fields=["payment_category", "date"]),
+        ]
+
+    def __str__(self):
+        return f"{self.number or self.id} ({self.doc_type})"
+
+    def clean(self):
+        super().clean()
+        # warehouse is required for both money operations (account)
+        if not self.warehouse_id:
+            raise ValidationError({"warehouse": "Укажите счёт (склад)."})
+
+        if self.doc_type in (self.DocType.MONEY_RECEIPT, self.DocType.MONEY_EXPENSE):
+            if not self.counterparty_id:
+                raise ValidationError({"counterparty": "Укажите контрагента."})
+            if not self.payment_category_id:
+                raise ValidationError({"payment_category": "Укажите категорию платежа."})
+
+        if self.amount is None or Decimal(self.amount) <= 0:
+            raise ValidationError({"amount": "Сумма должна быть больше 0."})
+
+        # company/branch consistency (based on warehouse)
+        if self.company_id and self.branch_id and self.branch.company_id != self.company_id:
+            raise ValidationError({"branch": "Филиал принадлежит другой компании."})
+
+        if self.warehouse_id:
+            wh = self.warehouse
+            if wh and self.company_id and wh.company_id != self.company_id:
+                raise ValidationError({"warehouse": "Склад принадлежит другой компании."})

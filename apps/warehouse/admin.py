@@ -31,3 +31,17 @@ class StockMoveAdmin(admin.ModelAdmin):
 class CounterpartyAdmin(admin.ModelAdmin):
 	list_display = ("name", "type")
 	search_fields = ("name",)
+
+
+@admin.register(models.PaymentCategory)
+class PaymentCategoryAdmin(admin.ModelAdmin):
+	list_display = ("title", "company", "branch")
+	search_fields = ("title",)
+	list_filter = ("company", "branch")
+
+
+@admin.register(models.MoneyDocument)
+class MoneyDocumentAdmin(admin.ModelAdmin):
+	list_display = ("number", "doc_type", "status", "date", "warehouse", "counterparty", "payment_category", "amount")
+	list_filter = ("doc_type", "status", "company", "branch", "warehouse", "payment_category")
+	search_fields = ("number", "comment", "counterparty__name")

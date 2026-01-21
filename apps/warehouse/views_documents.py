@@ -22,6 +22,57 @@ class DocumentListCreateView(CompanyBranchRestrictedMixin, generics.ListCreateAP
         ).prefetch_related("items__product").order_by("-date")
 
 
+class _DocumentTypedListCreateView(DocumentListCreateView):
+    """
+    Базовый класс для списков по одному типу документа.
+    """
+    DOC_TYPE = None  # override in subclasses
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        if self.DOC_TYPE:
+            qs = qs.filter(doc_type=self.DOC_TYPE)
+        return qs
+
+    def perform_create(self, serializer):
+        extra = {}
+        if self.DOC_TYPE:
+            extra["doc_type"] = self.DOC_TYPE
+        self._save_with_company_branch(serializer, **extra)
+
+
+class DocumentSaleListCreateView(_DocumentTypedListCreateView):
+    DOC_TYPE = models.Document.DocType.SALE
+
+
+class DocumentPurchaseListCreateView(_DocumentTypedListCreateView):
+    DOC_TYPE = models.Document.DocType.PURCHASE
+
+
+class DocumentSaleReturnListCreateView(_DocumentTypedListCreateView):
+    DOC_TYPE = models.Document.DocType.SALE_RETURN
+
+
+class DocumentPurchaseReturnListCreateView(_DocumentTypedListCreateView):
+    DOC_TYPE = models.Document.DocType.PURCHASE_RETURN
+
+
+class DocumentInventoryListCreateView(_DocumentTypedListCreateView):
+    DOC_TYPE = models.Document.DocType.INVENTORY
+
+
+class DocumentReceiptListCreateView(_DocumentTypedListCreateView):
+    DOC_TYPE = models.Document.DocType.RECEIPT
+
+
+class DocumentWriteOffListCreateView(_DocumentTypedListCreateView):
+    DOC_TYPE = models.Document.DocType.WRITE_OFF
+
+
+class DocumentTransferListCreateView(_DocumentTypedListCreateView):
+    DOC_TYPE = models.Document.DocType.TRANSFER
+
+
 class DocumentDetailView(CompanyBranchRestrictedMixin, generics.RetrieveUpdateDestroyAPIView):
     serializer_class = serializers_documents.DocumentSerializer
     
