@@ -967,3 +967,49 @@ class OnlineBookingStatusUpdateSerializer(serializers.ModelSerializer):
                 f"Статус должен быть одним из: {', '.join(allowed_statuses)}"
             )
         return value
+
+
+# ===========================
+# Публичные сериализаторы для онлайн-записи
+# ===========================
+class PublicServiceSerializer(serializers.ModelSerializer):
+    """Публичный сериализатор для услуг (без авторизации)"""
+    category_name = serializers.CharField(source="category.name", read_only=True)
+    
+    class Meta:
+        model = Service
+        fields = [
+            'id',
+            'name',
+            'time',
+            'price',
+            'category',
+            'category_name',
+        ]
+
+
+class PublicServiceCategorySerializer(serializers.ModelSerializer):
+    """Публичный сериализатор для категорий услуг (без авторизации)"""
+    services = PublicServiceSerializer(many=True, read_only=True)
+    
+    class Meta:
+        model = ServiceCategory
+        fields = [
+            'id',
+            'name',
+            'services',
+        ]
+
+
+class PublicMasterSerializer(serializers.Serializer):
+    """Публичный сериализатор для мастеров (без авторизации)"""
+    id = serializers.UUIDField()
+    first_name = serializers.CharField()
+    last_name = serializers.CharField()
+    full_name = serializers.SerializerMethodField()
+    avatar = serializers.URLField(allow_null=True)
+    
+    def get_full_name(self, obj):
+        first = obj.first_name or ''
+        last = obj.last_name or ''
+        return f"{first} {last}".strip() or obj.email
