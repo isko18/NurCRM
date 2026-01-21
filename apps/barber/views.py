@@ -28,7 +28,9 @@ from .serializers import (
     OnlineBookingStatusUpdateSerializer,
     PublicServiceSerializer,
     PublicServiceCategorySerializer,
-    PublicMasterSerializer
+    PublicMasterSerializer,
+    PublicMasterScheduleSerializer,
+    PublicMasterAvailabilitySerializer
 )
 
 
@@ -743,7 +745,10 @@ class PublicMastersListView(generics.ListAPIView):
     Доступен без авторизации, требует slug компании в URL.
     URL: /api/barbershop/public/{company_slug}/masters/
     
-    Мастера - это пользователи (User) компании с правом can_view_barber_records.
+    Мастера определяются по одному из критериев:
+    1. У пользователя есть записи (appointments) как barber
+    2. У пользователя установлен флаг can_view_barber_records=True
+    3. Роль пользователя = 'barber' или 'master'
     
     Query params:
         - branch: UUID филиала (опционально)
@@ -765,13 +770,23 @@ class PublicMastersListView(generics.ListAPIView):
         
         company = self.get_company()
         
-        # Получаем сотрудников компании, которые являются мастерами
-        # (имеют доступ к записям барбершопа)
+        # Получаем ID пользователей, у которых есть записи как мастер
+        masters_with_appointments = Appointment.objects.filter(
+            company=company
+        ).values_list('barber_id', flat=True).distinct()
+        
+        # Получаем сотрудников компании, которые являются мастерами по любому критерию:
+        # 1. Есть записи как мастер (barber)
+        # 2. Установлен флаг can_view_barber_records
+        # 3. Роль = barber или master
         qs = User.objects.filter(
             company=company,
-            is_active=True,
-            can_view_barber_records=True
-        ).order_by('first_name', 'last_name')
+            is_active=True
+        ).filter(
+            Q(id__in=masters_with_appointments) |
+            Q(can_view_barber_records=True) |
+            Q(role__in=['barber', 'master'])
+        ).distinct().order_by('first_name', 'last_name')
         
         # Фильтрация по филиалу (если указан)
         branch_id = self.request.query_params.get('branch')
@@ -784,3 +799,177 @@ class PublicMastersListView(generics.ListAPIView):
                 pass
         
         return qs
+
+
+class PublicMasterScheduleView(generics.GenericAPIView):
+    """
+    Публичный эндпоинт для получения занятых слотов мастера.
+    URL: /api/barbershop/public/{company_slug}/masters/{master_id}/schedule/
+    
+    Query params:
+        - date: дата в формате YYYY-MM-DD (обязательно)
+        - days: количество дней вперед (по умолчанию 1, максимум 14)
+    
+    Возвращает занятые временные слоты мастера на указанную дату/период.
+    """
+    serializer_class = PublicMasterScheduleSerializer
+    permission_classes = [permissions.AllowAny]
+    authentication_classes = []
+    
+    def get_company(self):
+        slug = self.kwargs.get('company_slug')
+        try:
+            return Company.objects.get(slug=slug)
+        except Company.DoesNotExist:
+            raise ValidationError({'detail': 'Компания не найдена'})
+    
+    def get(self, request, *args, **kwargs):
+        from datetime import datetime, timedelta
+        from apps.users.models import User
+        
+        company = self.get_company()
+        master_id = self.kwargs.get('master_id')
+        
+        # Проверяем, что мастер существует и принадлежит компании
+        try:
+            master = User.objects.get(id=master_id, company=company, is_active=True)
+        except User.DoesNotExist:
+            raise ValidationError({'detail': 'Мастер не найден'})
+        
+        # Получаем параметры запроса
+        date_str = request.query_params.get('date')
+        if not date_str:
+            raise ValidationError({'date': 'Параметр date обязателен (формат: YYYY-MM-DD)'})
+        
+        try:
+            start_date = datetime.strptime(date_str, '%Y-%m-%d').date()
+        except ValueError:
+            raise ValidationError({'date': 'Неверный формат даты. Используйте YYYY-MM-DD'})
+        
+        # Количество дней
+        try:
+            days = min(int(request.query_params.get('days', 1)), 14)
+        except ValueError:
+            days = 1
+        
+        end_date = start_date + timedelta(days=days)
+        
+        # Получаем занятые слоты мастера
+        # Показываем только активные записи (booked, confirmed)
+        busy_slots = Appointment.objects.filter(
+            company=company,
+            barber=master,
+            start_at__date__gte=start_date,
+            start_at__date__lt=end_date,
+            status__in=[Appointment.Status.BOOKED, Appointment.Status.CONFIRMED]
+        ).order_by('start_at').values('id', 'start_at', 'end_at')
+        
+        # Формируем ответ
+        result = {
+            'master_id': str(master.id),
+            'master_name': f"{master.first_name or ''} {master.last_name or ''}".strip() or master.email,
+            'date_from': start_date.isoformat(),
+            'date_to': (end_date - timedelta(days=1)).isoformat(),
+            'busy_slots': list(busy_slots),
+            'work_start': '09:00',
+            'work_end': '21:00'
+        }
+        
+        return Response(result)
+
+
+class PublicMastersAvailabilityView(generics.GenericAPIView):
+    """
+    Публичный эндпоинт для получения доступности всех мастеров на дату.
+    URL: /api/barbershop/public/{company_slug}/masters/availability/
+    
+    Query params:
+        - date: дата в формате YYYY-MM-DD (обязательно)
+        - branch: UUID филиала (опционально)
+    
+    Возвращает список мастеров с их занятыми слотами на указанную дату.
+    """
+    permission_classes = [permissions.AllowAny]
+    authentication_classes = []
+    
+    def get_company(self):
+        slug = self.kwargs.get('company_slug')
+        try:
+            return Company.objects.get(slug=slug)
+        except Company.DoesNotExist:
+            raise ValidationError({'detail': 'Компания не найдена'})
+    
+    def get(self, request, *args, **kwargs):
+        from datetime import datetime, timedelta
+        from apps.users.models import User
+        
+        company = self.get_company()
+        
+        # Получаем дату
+        date_str = request.query_params.get('date')
+        if not date_str:
+            raise ValidationError({'date': 'Параметр date обязателен (формат: YYYY-MM-DD)'})
+        
+        try:
+            target_date = datetime.strptime(date_str, '%Y-%m-%d').date()
+        except ValueError:
+            raise ValidationError({'date': 'Неверный формат даты. Используйте YYYY-MM-DD'})
+        
+        # Получаем мастеров
+        masters_with_appointments = Appointment.objects.filter(
+            company=company
+        ).values_list('barber_id', flat=True).distinct()
+        
+        masters_qs = User.objects.filter(
+            company=company,
+            is_active=True
+        ).filter(
+            Q(id__in=masters_with_appointments) |
+            Q(can_view_barber_records=True) |
+            Q(role__in=['barber', 'master'])
+        ).distinct()
+        
+        # Фильтрация по филиалу
+        branch_id = request.query_params.get('branch')
+        if branch_id:
+            try:
+                branch = Branch.objects.get(id=branch_id, company=company)
+                masters_qs = masters_qs.filter(branches=branch)
+            except (Branch.DoesNotExist, ValueError):
+                pass
+        
+        # Получаем все занятые слоты на дату
+        busy_appointments = Appointment.objects.filter(
+            company=company,
+            start_at__date=target_date,
+            status__in=[Appointment.Status.BOOKED, Appointment.Status.CONFIRMED]
+        ).select_related('barber').order_by('start_at')
+        
+        # Группируем по мастерам
+        busy_by_master = {}
+        for apt in busy_appointments:
+            if apt.barber_id not in busy_by_master:
+                busy_by_master[apt.barber_id] = []
+            busy_by_master[apt.barber_id].append({
+                'id': str(apt.id),
+                'start_at': apt.start_at.isoformat(),
+                'end_at': apt.end_at.isoformat()
+            })
+        
+        # Формируем результат
+        result = []
+        for master in masters_qs:
+            result.append({
+                'master_id': str(master.id),
+                'master_name': f"{master.first_name or ''} {master.last_name or ''}".strip() or master.email,
+                'avatar': master.avatar,
+                'date': target_date.isoformat(),
+                'busy_slots': busy_by_master.get(master.id, []),
+                'work_start': '09:00',
+                'work_end': '21:00'
+            })
+        
+        return Response({
+            'date': target_date.isoformat(),
+            'masters': result
+        })

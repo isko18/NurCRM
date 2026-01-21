@@ -1008,8 +1008,28 @@ class PublicMasterSerializer(serializers.Serializer):
     last_name = serializers.CharField()
     full_name = serializers.SerializerMethodField()
     avatar = serializers.URLField(allow_null=True)
+    phone_number = serializers.CharField(allow_null=True, required=False)
     
     def get_full_name(self, obj):
         first = obj.first_name or ''
         last = obj.last_name or ''
         return f"{first} {last}".strip() or obj.email
+
+
+class PublicMasterScheduleSerializer(serializers.Serializer):
+    """Сериализатор для занятых слотов мастера"""
+    id = serializers.UUIDField()
+    start_at = serializers.DateTimeField()
+    end_at = serializers.DateTimeField()
+    # Не показываем детали клиента и услуг в публичном API
+
+
+class PublicMasterAvailabilitySerializer(serializers.Serializer):
+    """Сериализатор для доступности мастера на конкретную дату"""
+    master_id = serializers.UUIDField()
+    master_name = serializers.CharField()
+    date = serializers.DateField()
+    busy_slots = PublicMasterScheduleSerializer(many=True)
+    # Рабочие часы (можно расширить в будущем)
+    work_start = serializers.TimeField(default="09:00")
+    work_end = serializers.TimeField(default="21:00")
