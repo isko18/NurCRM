@@ -1,24 +1,37 @@
 from rest_framework import generics, viewsets, status, permissions
-from rest_framework.decorators import action
+from rest_framework.decorators import action, api_view, permission_classes
 from rest_framework.response import Response
+from rest_framework.views import APIView
 from django_filters.rest_framework import DjangoFilterBackend
 from rest_framework.filters import SearchFilter, OrderingFilter
 from django_filters import rest_framework as filters
 from django.db.models import Q, Count, Sum, Avg
 from django.utils import timezone
+from django.http import HttpResponse
+import json
+import logging
 
 from .models import (
-    SalesFunnel, FunnelStage, Contact, Lead, Deal,
-    WazzuppAccount, WazzuppMessage, Activity
+    SalesFunnel, FunnelStage, Contact, Lead, Deal, Activity,
+    MetaBusinessAccount, WhatsAppBusinessAccount, InstagramBusinessAccount,
+    Conversation, Message, MessageTemplate
 )
 from .serializers import (
     SalesFunnelSerializer, SalesFunnelCreateSerializer,
     FunnelStageSerializer, ContactSerializer, ContactCreateSerializer,
     LeadSerializer, LeadCreateSerializer, DealSerializer, DealCreateSerializer,
-    WazzuppAccountSerializer, WazzuppMessageSerializer, ActivitySerializer
+    ActivitySerializer,
+    MetaBusinessAccountSerializer, MetaBusinessAccountCreateSerializer,
+    WhatsAppBusinessAccountSerializer, InstagramBusinessAccountSerializer,
+    ConversationListSerializer, ConversationDetailSerializer,
+    MessageSerializer, SendMessageSerializer, MessageTemplateSerializer
 )
-from .services import WazzuppService
-from apps.users.models import Company
+from .services_meta import (
+    MetaWebhookService, WhatsAppService, InstagramService,
+    ConversationService, WebhookProcessor, MetaAPIError
+)
+
+logger = logging.getLogger(__name__)
 
 
 class CompanyQuerysetMixin:
@@ -81,6 +94,23 @@ class DealFilter(filters.FilterSet):
     class Meta:
         model = Deal
         fields = ['title', 'funnel', 'stage', 'owner', 'is_won', 'is_lost', 'expected_close_date']
+
+
+class ConversationFilter(filters.FilterSet):
+    channel = filters.ChoiceFilter(choices=Conversation.CHANNEL_CHOICES)
+    status = filters.ChoiceFilter(choices=Conversation.STATUS_CHOICES)
+    assigned_to = filters.UUIDFilter()
+    contact = filters.UUIDFilter()
+    has_unread = filters.BooleanFilter(method='filter_has_unread')
+    
+    def filter_has_unread(self, queryset, name, value):
+        if value:
+            return queryset.filter(unread_count__gt=0)
+        return queryset.filter(unread_count=0)
+    
+    class Meta:
+        model = Conversation
+        fields = ['channel', 'status', 'assigned_to', 'contact']
 
 
 # ==================== ВОРОНКИ ПРОДАЖ ====================
@@ -355,95 +385,6 @@ class DealViewSet(CompanyQuerysetMixin, viewsets.ModelViewSet):
         return Response(DealSerializer(deal).data)
 
 
-# ==================== WAZZUPP ====================
-
-class WazzuppAccountViewSet(CompanyQuerysetMixin, viewsets.ModelViewSet):
-    """Wazzupp аккаунты"""
-    queryset = WazzuppAccount.objects.all()
-    serializer_class = WazzuppAccountSerializer
-    permission_classes = [permissions.IsAuthenticated]
-    filter_backends = [DjangoFilterBackend, OrderingFilter]
-    filterset_fields = ['integration_type', 'is_active', 'is_connected']
-    ordering = ['-created_at']
-    
-    def perform_create(self, serializer):
-        user = self.request.user
-        if hasattr(user, 'company_id') and user.company_id:
-            serializer.save(company_id=user.company_id)
-        else:
-            serializer.save()
-    
-    @action(detail=True, methods=['post'])
-    def check_connection(self, request, pk=None):
-        """Проверить подключение к Wazzupp"""
-        account = self.get_object()
-        service = WazzuppService(account)
-        is_connected = service.check_connection()
-        
-        return Response({
-            'is_connected': is_connected,
-            'last_sync': account.last_sync
-        })
-    
-    @action(detail=True, methods=['post'])
-    def sync_messages(self, request, pk=None):
-        """Синхронизировать сообщения из Wazzupp"""
-        account = self.get_object()
-        service = WazzuppService(account)
-        synced_count = service.sync_messages()
-        
-        return Response({
-            'synced_count': synced_count,
-            'last_sync': account.last_sync
-        })
-    
-    @action(detail=True, methods=['post'])
-    def send_message(self, request, pk=None):
-        """Отправить сообщение через Wazzupp"""
-        account = self.get_object()
-        service = WazzuppService(account)
-        
-        to = request.data.get('to')
-        message = request.data.get('message')
-        message_type = request.data.get('message_type', 'text')
-        media_url = request.data.get('media_url')
-        caption = request.data.get('caption')
-        
-        if not to or not message:
-            return Response(
-                {'detail': 'to and message are required'},
-                status=status.HTTP_400_BAD_REQUEST
-            )
-        
-        result = service.send_message(
-            to=to,
-            message=message,
-            message_type=message_type,
-            media_url=media_url,
-            caption=caption
-        )
-        
-        if result:
-            return Response({'status': 'sent', 'result': result})
-        else:
-            return Response(
-                {'detail': 'Failed to send message'},
-                status=status.HTTP_400_BAD_REQUEST
-            )
-
-
-class WazzuppMessageViewSet(CompanyQuerysetMixin, viewsets.ReadOnlyModelViewSet):
-    """Сообщения Wazzupp"""
-    queryset = WazzuppMessage.objects.all()
-    serializer_class = WazzuppMessageSerializer
-    permission_classes = [permissions.IsAuthenticated]
-    filter_backends = [DjangoFilterBackend, SearchFilter, OrderingFilter]
-    filterset_fields = ['account', 'contact', 'lead', 'is_incoming', 'is_read', 'message_type', 'status']
-    search_fields = ['text', 'from_number', 'to_number']
-    ordering_fields = ['timestamp', 'created_at']
-    ordering = ['-timestamp']
-
-
 # ==================== АКТИВНОСТИ ====================
 
 class ActivityViewSet(CompanyQuerysetMixin, viewsets.ModelViewSet):
@@ -462,3 +403,428 @@ class ActivityViewSet(CompanyQuerysetMixin, viewsets.ModelViewSet):
             serializer.save(company_id=user.company_id, user=user)
         else:
             serializer.save(user=user)
+
+
+# ==================== META BUSINESS INTEGRATION ====================
+
+class MetaBusinessAccountViewSet(CompanyQuerysetMixin, viewsets.ModelViewSet):
+    """Meta Business аккаунты"""
+    queryset = MetaBusinessAccount.objects.all()
+    permission_classes = [permissions.IsAuthenticated]
+    filter_backends = [DjangoFilterBackend, OrderingFilter]
+    filterset_fields = ['is_active', 'is_verified']
+    ordering = ['-created_at']
+    
+    def get_serializer_class(self):
+        if self.action == 'create':
+            return MetaBusinessAccountCreateSerializer
+        return MetaBusinessAccountSerializer
+    
+    def perform_create(self, serializer):
+        user = self.request.user
+        if hasattr(user, 'company_id') and user.company_id:
+            serializer.save(company_id=user.company_id)
+        else:
+            serializer.save()
+    
+    @action(detail=True, methods=['post'])
+    def verify(self, request, pk=None):
+        """Проверить подключение к Meta API"""
+        account = self.get_object()
+        # Простая проверка токена
+        import requests
+        try:
+            response = requests.get(
+                f"https://graph.facebook.com/v18.0/{account.business_id}",
+                params={'access_token': account.access_token},
+                timeout=10
+            )
+            if response.status_code == 200:
+                account.is_verified = True
+                account.save()
+                return Response({'status': 'verified', 'data': response.json()})
+            else:
+                return Response(
+                    {'status': 'failed', 'error': response.json()},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+        except Exception as e:
+            return Response(
+                {'status': 'error', 'message': str(e)},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+
+
+class WhatsAppBusinessAccountViewSet(viewsets.ModelViewSet):
+    """WhatsApp Business аккаунты"""
+    queryset = WhatsAppBusinessAccount.objects.all()
+    serializer_class = WhatsAppBusinessAccountSerializer
+    permission_classes = [permissions.IsAuthenticated]
+    filter_backends = [DjangoFilterBackend, OrderingFilter]
+    filterset_fields = ['meta_account', 'is_active', 'is_verified', 'quality_rating']
+    ordering = ['-created_at']
+    
+    def get_queryset(self):
+        user = self.request.user
+        if user.is_authenticated and hasattr(user, 'company_id') and user.company_id:
+            return self.queryset.filter(meta_account__company_id=user.company_id)
+        elif user.is_staff or user.is_superuser:
+            return self.queryset
+        return self.queryset.none()
+    
+    @action(detail=True, methods=['post'])
+    def sync_templates(self, request, pk=None):
+        """Синхронизировать шаблоны сообщений"""
+        account = self.get_object()
+        try:
+            service = WhatsAppService(account)
+            count = service.sync_templates()
+            return Response({'synced_count': count})
+        except MetaAPIError as e:
+            return Response(
+                {'error': e.message, 'code': e.code},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+
+class InstagramBusinessAccountViewSet(viewsets.ModelViewSet):
+    """Instagram Business аккаунты"""
+    queryset = InstagramBusinessAccount.objects.all()
+    serializer_class = InstagramBusinessAccountSerializer
+    permission_classes = [permissions.IsAuthenticated]
+    filter_backends = [DjangoFilterBackend, OrderingFilter]
+    filterset_fields = ['meta_account', 'is_active']
+    ordering = ['-created_at']
+    
+    def get_queryset(self):
+        user = self.request.user
+        if user.is_authenticated and hasattr(user, 'company_id') and user.company_id:
+            return self.queryset.filter(meta_account__company_id=user.company_id)
+        elif user.is_staff or user.is_superuser:
+            return self.queryset
+        return self.queryset.none()
+
+
+# ==================== ПЕРЕПИСКИ ====================
+
+class ConversationViewSet(CompanyQuerysetMixin, viewsets.ModelViewSet):
+    """Переписки"""
+    queryset = Conversation.objects.select_related(
+        'contact', 'lead', 'assigned_to',
+        'whatsapp_account', 'instagram_account'
+    )
+    permission_classes = [permissions.IsAuthenticated]
+    filter_backends = [DjangoFilterBackend, SearchFilter, OrderingFilter]
+    filterset_class = ConversationFilter
+    search_fields = ['participant_name', 'participant_id', 'participant_username']
+    ordering_fields = ['last_message_at', 'created_at', 'unread_count']
+    ordering = ['-last_message_at']
+    
+    def get_serializer_class(self):
+        if self.action == 'retrieve':
+            return ConversationDetailSerializer
+        return ConversationListSerializer
+    
+    @action(detail=True, methods=['get'])
+    def messages(self, request, pk=None):
+        """Получить сообщения переписки"""
+        conversation = self.get_object()
+        messages = conversation.messages.select_related('sender_user', 'reply_to')
+        
+        # Пагинация
+        page = self.paginate_queryset(messages)
+        if page is not None:
+            serializer = MessageSerializer(page, many=True)
+            return self.get_paginated_response(serializer.data)
+        
+        serializer = MessageSerializer(messages, many=True)
+        return Response(serializer.data)
+    
+    @action(detail=True, methods=['post'])
+    def send_message(self, request, pk=None):
+        """Отправить сообщение в переписку"""
+        conversation = self.get_object()
+        serializer = SendMessageSerializer(data={
+            'conversation_id': str(conversation.id),
+            **request.data
+        })
+        
+        if not serializer.is_valid():
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+        
+        data = serializer.validated_data
+        
+        try:
+            if conversation.channel == 'whatsapp':
+                result = self._send_whatsapp_message(conversation, data, request.user)
+            else:
+                result = self._send_instagram_message(conversation, data, request.user)
+            
+            return Response(MessageSerializer(result).data, status=status.HTTP_201_CREATED)
+        except MetaAPIError as e:
+            return Response(
+                {'error': e.message, 'code': e.code},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+    
+    def _send_whatsapp_message(self, conversation, data, user):
+        """Отправка сообщения через WhatsApp"""
+        service = WhatsAppService(conversation.whatsapp_account)
+        msg_type = data['message_type']
+        to = conversation.participant_id
+        
+        if msg_type == 'text':
+            result = service.send_text_message(
+                to=to,
+                text=data['text'],
+                reply_to_message_id=data.get('reply_to_message_id')
+            )
+        elif msg_type in ('image', 'video', 'audio', 'document'):
+            result = service.send_media_message(
+                to=to,
+                media_type=msg_type,
+                media_url=data['media_url'],
+                caption=data.get('media_caption')
+            )
+        elif msg_type == 'template':
+            result = service.send_template_message(
+                to=to,
+                template_name=data['template_name'],
+                language_code=data.get('template_language', 'ru'),
+                components=data.get('template_components', [])
+            )
+        else:
+            raise MetaAPIError(f"Unsupported message type: {msg_type}")
+        
+        # Сохраняем сообщение в БД
+        message_id = result.get('messages', [{}])[0].get('id', '')
+        
+        message = Message.objects.create(
+            conversation=conversation,
+            meta_message_id=message_id,
+            direction='outbound',
+            sender_user=user,
+            message_type=msg_type,
+            text=data.get('text', ''),
+            media_url=data.get('media_url', ''),
+            media_caption=data.get('media_caption', ''),
+            status='sent',
+            timestamp=timezone.now()
+        )
+        
+        ConversationService.update_conversation_on_message(
+            conversation, message, is_inbound=False
+        )
+        
+        return message
+    
+    def _send_instagram_message(self, conversation, data, user):
+        """Отправка сообщения через Instagram"""
+        service = InstagramService(conversation.instagram_account)
+        msg_type = data['message_type']
+        to = conversation.participant_id
+        
+        if msg_type == 'text':
+            result = service.send_text_message(to, data['text'])
+        elif msg_type == 'image':
+            result = service.send_image_message(to, data['media_url'])
+        else:
+            raise MetaAPIError(f"Instagram doesn't support message type: {msg_type}")
+        
+        message_id = result.get('message_id', '')
+        
+        message = Message.objects.create(
+            conversation=conversation,
+            meta_message_id=message_id,
+            direction='outbound',
+            sender_user=user,
+            message_type=msg_type,
+            text=data.get('text', ''),
+            media_url=data.get('media_url', ''),
+            status='sent',
+            timestamp=timezone.now()
+        )
+        
+        ConversationService.update_conversation_on_message(
+            conversation, message, is_inbound=False
+        )
+        
+        return message
+    
+    @action(detail=True, methods=['post'])
+    def mark_read(self, request, pk=None):
+        """Отметить все сообщения переписки как прочитанные"""
+        conversation = self.get_object()
+        conversation.messages.filter(
+            direction='inbound',
+            is_read=False
+        ).update(is_read=True, read_at=timezone.now())
+        conversation.unread_count = 0
+        conversation.save(update_fields=['unread_count'])
+        
+        return Response({'status': 'ok'})
+    
+    @action(detail=True, methods=['post'])
+    def assign(self, request, pk=None):
+        """Назначить ответственного менеджера"""
+        conversation = self.get_object()
+        user_id = request.data.get('user_id')
+        
+        if user_id:
+            from apps.users.models import User
+            try:
+                user = User.objects.get(id=user_id, company=conversation.company)
+                conversation.assigned_to = user
+            except User.DoesNotExist:
+                return Response(
+                    {'error': 'User not found'},
+                    status=status.HTTP_404_NOT_FOUND
+                )
+        else:
+            conversation.assigned_to = None
+        
+        conversation.save(update_fields=['assigned_to'])
+        return Response(ConversationDetailSerializer(conversation).data)
+    
+    @action(detail=True, methods=['post'])
+    def link_contact(self, request, pk=None):
+        """Связать переписку с контактом CRM"""
+        conversation = self.get_object()
+        contact_id = request.data.get('contact_id')
+        
+        if contact_id:
+            try:
+                contact = Contact.objects.get(id=contact_id, company=conversation.company)
+                conversation.contact = contact
+            except Contact.DoesNotExist:
+                return Response(
+                    {'error': 'Contact not found'},
+                    status=status.HTTP_404_NOT_FOUND
+                )
+        else:
+            conversation.contact = None
+        
+        conversation.save(update_fields=['contact'])
+        return Response(ConversationDetailSerializer(conversation).data)
+
+
+class MessageViewSet(viewsets.ReadOnlyModelViewSet):
+    """Сообщения (только чтение)"""
+    queryset = Message.objects.select_related('sender_user', 'reply_to')
+    serializer_class = MessageSerializer
+    permission_classes = [permissions.IsAuthenticated]
+    filter_backends = [DjangoFilterBackend, OrderingFilter]
+    filterset_fields = ['conversation', 'direction', 'message_type', 'status', 'is_read']
+    ordering_fields = ['timestamp', 'created_at']
+    ordering = ['timestamp']
+    
+    def get_queryset(self):
+        user = self.request.user
+        if user.is_authenticated and hasattr(user, 'company_id') and user.company_id:
+            return self.queryset.filter(conversation__company_id=user.company_id)
+        elif user.is_staff or user.is_superuser:
+            return self.queryset
+        return self.queryset.none()
+
+
+class MessageTemplateViewSet(viewsets.ModelViewSet):
+    """Шаблоны сообщений WhatsApp"""
+    queryset = MessageTemplate.objects.select_related('whatsapp_account')
+    serializer_class = MessageTemplateSerializer
+    permission_classes = [permissions.IsAuthenticated]
+    filter_backends = [DjangoFilterBackend, SearchFilter, OrderingFilter]
+    filterset_fields = ['whatsapp_account', 'category', 'status', 'is_active']
+    search_fields = ['name']
+    ordering = ['name']
+    
+    def get_queryset(self):
+        user = self.request.user
+        if user.is_authenticated and hasattr(user, 'company_id') and user.company_id:
+            return self.queryset.filter(
+                whatsapp_account__meta_account__company_id=user.company_id
+            )
+        elif user.is_staff or user.is_superuser:
+            return self.queryset
+        return self.queryset.none()
+
+
+# ==================== META WEBHOOK ====================
+
+class MetaWebhookView(APIView):
+    """
+    Webhook endpoint для Meta (WhatsApp Cloud API + Instagram Messaging API).
+    
+    URL: /api/crm/webhook/meta/<business_id>/
+    
+    Meta будет отправлять сюда:
+    - Входящие сообщения
+    - Статусы доставки
+    - Другие события
+    """
+    permission_classes = [permissions.AllowAny]  # Webhook должен быть публичным
+    
+    def get(self, request, business_id):
+        """
+        Верификация webhook при подписке.
+        Meta отправляет GET-запрос с параметрами:
+        - hub.mode
+        - hub.verify_token
+        - hub.challenge
+        """
+        mode = request.GET.get('hub.mode')
+        token = request.GET.get('hub.verify_token')
+        challenge = request.GET.get('hub.challenge')
+        
+        try:
+            meta_account = MetaBusinessAccount.objects.get(business_id=business_id)
+        except MetaBusinessAccount.DoesNotExist:
+            logger.warning(f"Webhook verification failed: account {business_id} not found")
+            return HttpResponse('Account not found', status=404)
+        
+        result = MetaWebhookService.verify_webhook(
+            mode, token, challenge, meta_account.webhook_verify_token
+        )
+        
+        if result:
+            logger.info(f"Webhook verified for business_id: {business_id}")
+            return HttpResponse(result, content_type='text/plain')
+        
+        logger.warning(f"Webhook verification failed for business_id: {business_id}")
+        return HttpResponse('Verification failed', status=403)
+    
+    def post(self, request, business_id):
+        """
+        Обработка входящих событий от Meta.
+        """
+        try:
+            meta_account = MetaBusinessAccount.objects.get(business_id=business_id)
+        except MetaBusinessAccount.DoesNotExist:
+            logger.warning(f"Webhook received for unknown account: {business_id}")
+            return Response({'error': 'Account not found'}, status=404)
+        
+        # Проверяем подпись (если настроен app_secret)
+        if meta_account.webhook_secret:
+            signature = request.headers.get('X-Hub-Signature-256', '')
+            if not MetaWebhookService.verify_signature(
+                request.body, signature, meta_account.webhook_secret
+            ):
+                logger.warning(f"Invalid webhook signature for business_id: {business_id}")
+                return Response({'error': 'Invalid signature'}, status=403)
+        
+        payload = request.data
+        object_type = payload.get('object')
+        
+        logger.info(f"Webhook received: {object_type} for {business_id}")
+        
+        try:
+            if object_type == 'whatsapp_business_account':
+                WebhookProcessor.process_whatsapp_webhook(payload, meta_account)
+            elif object_type == 'instagram':
+                WebhookProcessor.process_instagram_webhook(payload, meta_account)
+            else:
+                logger.warning(f"Unknown webhook object type: {object_type}")
+        except Exception as e:
+            logger.exception(f"Error processing webhook: {e}")
+            # Всё равно возвращаем 200, чтобы Meta не ретраила
+        
+        return Response({'status': 'ok'})

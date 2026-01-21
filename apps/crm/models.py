@@ -328,79 +328,285 @@ class Deal(models.Model):
         return f"{self.title} - {self.amount}"
 
 
-class WazzuppAccount(models.Model):
-    """Аккаунт Wazzupp для интеграции"""
+# ==================== META BUSINESS INTEGRATION ====================
+
+
+class MetaBusinessAccount(models.Model):
+    """
+    Аккаунт Meta Business для интеграции с WhatsApp Business API и Instagram Messaging API.
+    Один Meta Business Account может иметь несколько WhatsApp и Instagram аккаунтов.
+    
+    Документация:
+    - https://developers.facebook.com/docs/whatsapp/cloud-api
+    - https://developers.facebook.com/docs/messenger-platform/instagram
+    """
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     company = models.ForeignKey(
         Company,
         on_delete=models.CASCADE,
-        related_name='wazzupp_accounts',
+        related_name='meta_accounts',
         verbose_name='Компания'
     )
     
-    # Данные для подключения
-    api_key = models.CharField(max_length=255, verbose_name='API ключ')
-    api_url = models.URLField(verbose_name='API URL', help_text='Базовый URL API Wazzupp')
-    instance_id = models.CharField(
+    # Данные Meta Business
+    business_id = models.CharField(
         max_length=100,
+        verbose_name='Meta Business ID',
+        help_text='ID бизнес-аккаунта в Meta Business Suite'
+    )
+    business_name = models.CharField(
+        max_length=255,
         blank=True,
-        null=True,
-        verbose_name='ID инстанса',
-        help_text='ID инстанса в Wazzupp'
+        verbose_name='Название бизнеса'
     )
     
-    # Тип интеграции
-    INTEGRATION_TYPES = [
-        ('whatsapp', 'WhatsApp'),
-        ('instagram', 'Instagram'),
-        ('telegram', 'Telegram'),
-    ]
-    integration_type = models.CharField(
-        max_length=20,
-        choices=INTEGRATION_TYPES,
-        default='whatsapp',
-        verbose_name='Тип интеграции'
+    # Токены доступа
+    access_token = models.TextField(
+        verbose_name='Access Token',
+        help_text='Постоянный токен доступа от Meta (System User Token)'
+    )
+    
+    # Webhook настройки
+    webhook_verify_token = models.CharField(
+        max_length=255,
+        blank=True,
+        verbose_name='Webhook Verify Token',
+        help_text='Токен для верификации webhook от Meta'
+    )
+    webhook_secret = models.CharField(
+        max_length=255,
+        blank=True,
+        verbose_name='App Secret',
+        help_text='App Secret для проверки подписи webhook'
     )
     
     # Статус
-    is_active = models.BooleanField(default=True, verbose_name='Активна')
-    is_connected = models.BooleanField(default=False, verbose_name='Подключена')
-    last_sync = models.DateTimeField(null=True, blank=True, verbose_name='Последняя синхронизация')
+    is_active = models.BooleanField(default=True, verbose_name='Активен')
+    is_verified = models.BooleanField(default=False, verbose_name='Верифицирован')
     
-    # Дополнительные данные
+    # Метаданные
     metadata = models.JSONField(default=dict, blank=True, verbose_name='Метаданные')
     
     created_at = models.DateTimeField(auto_now_add=True, verbose_name='Дата создания')
     updated_at = models.DateTimeField(auto_now=True, verbose_name='Дата обновления')
 
     class Meta:
-        verbose_name = 'Wazzupp аккаунт'
-        verbose_name_plural = 'Wazzupp аккаунты'
+        verbose_name = 'Meta Business аккаунт'
+        verbose_name_plural = 'Meta Business аккаунты'
         ordering = ['-created_at']
         indexes = [
             models.Index(fields=['company', 'is_active']),
-            models.Index(fields=['integration_type']),
+            models.Index(fields=['business_id']),
+        ]
+        constraints = [
+            models.UniqueConstraint(
+                fields=['company', 'business_id'],
+                name='uq_meta_business_per_company'
+            ),
         ]
 
     def __str__(self):
-        return f"{self.get_integration_type_display()} - {self.company.name}"
+        return f"Meta Business: {self.business_name or self.business_id} ({self.company.name})"
 
 
-class WazzuppMessage(models.Model):
-    """Сообщение из Wazzupp (WhatsApp/Instagram)"""
+class WhatsAppBusinessAccount(models.Model):
+    """
+    WhatsApp Business Account (WABA) — подключенный через Meta Cloud API.
+    
+    Документация: https://developers.facebook.com/docs/whatsapp/cloud-api/get-started
+    """
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    account = models.ForeignKey(
-        WazzuppAccount,
+    meta_account = models.ForeignKey(
+        MetaBusinessAccount,
         on_delete=models.CASCADE,
-        related_name='messages',
-        verbose_name='Аккаунт Wazzupp'
+        related_name='whatsapp_accounts',
+        verbose_name='Meta Business аккаунт'
     )
+    
+    # WhatsApp Business Account ID
+    waba_id = models.CharField(
+        max_length=100,
+        verbose_name='WABA ID',
+        help_text='WhatsApp Business Account ID'
+    )
+    
+    # Phone Number ID (для отправки сообщений)
+    phone_number_id = models.CharField(
+        max_length=100,
+        verbose_name='Phone Number ID',
+        help_text='ID номера телефона в WhatsApp Business'
+    )
+    
+    # Отображаемые данные
+    phone_number = models.CharField(
+        max_length=20,
+        verbose_name='Номер телефона',
+        help_text='Номер в формате +7XXXXXXXXXX'
+    )
+    display_name = models.CharField(
+        max_length=255,
+        blank=True,
+        verbose_name='Отображаемое имя'
+    )
+    
+    # Качество аккаунта (от Meta)
+    QUALITY_CHOICES = [
+        ('green', 'Высокое'),
+        ('yellow', 'Среднее'),
+        ('red', 'Низкое'),
+        ('unknown', 'Неизвестно'),
+    ]
+    quality_rating = models.CharField(
+        max_length=20,
+        choices=QUALITY_CHOICES,
+        default='unknown',
+        verbose_name='Рейтинг качества'
+    )
+    
+    # Лимиты
+    messaging_limit = models.CharField(
+        max_length=50,
+        blank=True,
+        verbose_name='Лимит сообщений',
+        help_text='TIER_1K, TIER_10K, TIER_100K, UNLIMITED'
+    )
+    
+    # Статус
+    is_active = models.BooleanField(default=True, verbose_name='Активен')
+    is_verified = models.BooleanField(default=False, verbose_name='Номер верифицирован')
+    
+    created_at = models.DateTimeField(auto_now_add=True, verbose_name='Дата создания')
+    updated_at = models.DateTimeField(auto_now=True, verbose_name='Дата обновления')
+
+    class Meta:
+        verbose_name = 'WhatsApp Business аккаунт'
+        verbose_name_plural = 'WhatsApp Business аккаунты'
+        ordering = ['-created_at']
+        indexes = [
+            models.Index(fields=['meta_account', 'is_active']),
+            models.Index(fields=['waba_id']),
+            models.Index(fields=['phone_number_id']),
+            models.Index(fields=['phone_number']),
+        ]
+
+    def __str__(self):
+        return f"WhatsApp: {self.display_name or self.phone_number}"
+
+    @property
+    def company(self):
+        return self.meta_account.company
+
+
+class InstagramBusinessAccount(models.Model):
+    """
+    Instagram Business/Creator Account — подключенный через Instagram Graph API.
+    
+    Документация: https://developers.facebook.com/docs/instagram-api/guides/messaging
+    """
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    meta_account = models.ForeignKey(
+        MetaBusinessAccount,
+        on_delete=models.CASCADE,
+        related_name='instagram_accounts',
+        verbose_name='Meta Business аккаунт'
+    )
+    
+    # Instagram Business Account ID (IGBA)
+    instagram_id = models.CharField(
+        max_length=100,
+        verbose_name='Instagram Business ID',
+        help_text='ID бизнес-аккаунта Instagram'
+    )
+    
+    # Facebook Page ID (связанная страница)
+    facebook_page_id = models.CharField(
+        max_length=100,
+        blank=True,
+        verbose_name='Facebook Page ID',
+        help_text='ID связанной Facebook страницы'
+    )
+    
+    # Данные профиля
+    username = models.CharField(
+        max_length=100,
+        verbose_name='Username',
+        help_text='@username в Instagram'
+    )
+    name = models.CharField(
+        max_length=255,
+        blank=True,
+        verbose_name='Имя профиля'
+    )
+    profile_picture_url = models.URLField(
+        blank=True,
+        verbose_name='URL аватара'
+    )
+    
+    # Статистика
+    followers_count = models.PositiveIntegerField(default=0, verbose_name='Подписчиков')
+    
+    # Статус
+    is_active = models.BooleanField(default=True, verbose_name='Активен')
+    
+    created_at = models.DateTimeField(auto_now_add=True, verbose_name='Дата создания')
+    updated_at = models.DateTimeField(auto_now=True, verbose_name='Дата обновления')
+
+    class Meta:
+        verbose_name = 'Instagram Business аккаунт'
+        verbose_name_plural = 'Instagram Business аккаунты'
+        ordering = ['-created_at']
+        indexes = [
+            models.Index(fields=['meta_account', 'is_active']),
+            models.Index(fields=['instagram_id']),
+            models.Index(fields=['username']),
+        ]
+
+    def __str__(self):
+        return f"Instagram: @{self.username}"
+
+    @property
+    def company(self):
+        return self.meta_account.company
+
+
+class Conversation(models.Model):
+    """
+    Переписка (чат) с клиентом через WhatsApp или Instagram.
+    Объединяет сообщения в один тред.
+    """
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    company = models.ForeignKey(
+        Company,
+        on_delete=models.CASCADE,
+        related_name='conversations',
+        verbose_name='Компания'
+    )
+    
+    # Связь с аккаунтами (один из двух)
+    whatsapp_account = models.ForeignKey(
+        WhatsAppBusinessAccount,
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
+        related_name='conversations',
+        verbose_name='WhatsApp аккаунт'
+    )
+    instagram_account = models.ForeignKey(
+        InstagramBusinessAccount,
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
+        related_name='conversations',
+        verbose_name='Instagram аккаунт'
+    )
+    
+    # Связь с CRM
     contact = models.ForeignKey(
         Contact,
         on_delete=models.SET_NULL,
         null=True,
         blank=True,
-        related_name='wazzupp_messages',
+        related_name='conversations',
         verbose_name='Контакт'
     )
     lead = models.ForeignKey(
@@ -408,49 +614,219 @@ class WazzuppMessage(models.Model):
         on_delete=models.SET_NULL,
         null=True,
         blank=True,
-        related_name='wazzupp_messages',
+        related_name='conversations',
         verbose_name='Лид'
     )
     
-    # Данные сообщения
-    message_id = models.CharField(
+    # Канал
+    CHANNEL_CHOICES = [
+        ('whatsapp', 'WhatsApp'),
+        ('instagram', 'Instagram'),
+    ]
+    channel = models.CharField(
+        max_length=20,
+        choices=CHANNEL_CHOICES,
+        verbose_name='Канал'
+    )
+    
+    # Идентификатор клиента в канале
+    participant_id = models.CharField(
+        max_length=100,
+        verbose_name='ID участника',
+        help_text='Номер телефона (WhatsApp) или IGSID (Instagram)'
+    )
+    participant_name = models.CharField(
+        max_length=255,
+        blank=True,
+        verbose_name='Имя участника'
+    )
+    participant_username = models.CharField(
+        max_length=100,
+        blank=True,
+        verbose_name='Username (Instagram)'
+    )
+    
+    # Ответственный менеджер
+    assigned_to = models.ForeignKey(
+        User,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='assigned_conversations',
+        verbose_name='Ответственный'
+    )
+    
+    # Статус переписки
+    STATUS_CHOICES = [
+        ('active', 'Активная'),
+        ('pending', 'Ожидает ответа'),
+        ('resolved', 'Решена'),
+        ('archived', 'Архив'),
+    ]
+    status = models.CharField(
+        max_length=20,
+        choices=STATUS_CHOICES,
+        default='active',
+        verbose_name='Статус'
+    )
+    
+    # Окно сообщений (24 часа для WhatsApp)
+    window_expires_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        verbose_name='Окно истекает',
+        help_text='Время истечения 24-часового окна для бесплатных сообщений'
+    )
+    
+    # Счетчики
+    unread_count = models.PositiveIntegerField(default=0, verbose_name='Непрочитанных')
+    messages_count = models.PositiveIntegerField(default=0, verbose_name='Всего сообщений')
+    
+    # Последнее сообщение (для превью)
+    last_message_text = models.TextField(blank=True, verbose_name='Последнее сообщение')
+    last_message_at = models.DateTimeField(null=True, blank=True, verbose_name='Время последнего сообщения')
+    
+    created_at = models.DateTimeField(auto_now_add=True, verbose_name='Дата создания')
+    updated_at = models.DateTimeField(auto_now=True, verbose_name='Дата обновления')
+
+    class Meta:
+        verbose_name = 'Переписка'
+        verbose_name_plural = 'Переписки'
+        ordering = ['-last_message_at']
+        indexes = [
+            models.Index(fields=['company', 'status', 'last_message_at']),
+            models.Index(fields=['channel', 'participant_id']),
+            models.Index(fields=['contact']),
+            models.Index(fields=['assigned_to', 'status']),
+            models.Index(fields=['whatsapp_account', 'participant_id']),
+            models.Index(fields=['instagram_account', 'participant_id']),
+        ]
+        constraints = [
+            models.UniqueConstraint(
+                fields=['whatsapp_account', 'participant_id'],
+                condition=models.Q(whatsapp_account__isnull=False),
+                name='uq_conversation_whatsapp_participant'
+            ),
+            models.UniqueConstraint(
+                fields=['instagram_account', 'participant_id'],
+                condition=models.Q(instagram_account__isnull=False),
+                name='uq_conversation_instagram_participant'
+            ),
+        ]
+
+    def __str__(self):
+        channel_icon = "📱" if self.channel == 'whatsapp' else "📷"
+        return f"{channel_icon} {self.participant_name or self.participant_id}"
+
+    @property
+    def is_window_open(self):
+        """Проверяет, открыто ли 24-часовое окно для отправки сообщений"""
+        if not self.window_expires_at:
+            return False
+        return timezone.now() < self.window_expires_at
+
+
+class Message(models.Model):
+    """
+    Сообщение в переписке (WhatsApp или Instagram).
+    Соответствует формату Meta Webhook/API.
+    """
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    conversation = models.ForeignKey(
+        Conversation,
+        on_delete=models.CASCADE,
+        related_name='messages',
+        verbose_name='Переписка'
+    )
+    
+    # ID сообщения в Meta
+    meta_message_id = models.CharField(
         max_length=255,
         unique=True,
         db_index=True,
-        verbose_name='ID сообщения в Wazzupp'
+        verbose_name='Meta Message ID',
+        help_text='wamid для WhatsApp, mid для Instagram'
     )
-    from_number = models.CharField(max_length=20, verbose_name='От кого (номер/username)')
-    to_number = models.CharField(max_length=20, verbose_name='Кому (номер/username)')
     
-    # Тип сообщения
-    MESSAGE_TYPES = [
+    # Направление
+    DIRECTION_CHOICES = [
+        ('inbound', 'Входящее'),
+        ('outbound', 'Исходящее'),
+    ]
+    direction = models.CharField(
+        max_length=10,
+        choices=DIRECTION_CHOICES,
+        verbose_name='Направление'
+    )
+    
+    # Отправитель (для исходящих — наш сотрудник)
+    sender_user = models.ForeignKey(
+        User,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='sent_messages',
+        verbose_name='Отправитель (сотрудник)'
+    )
+    
+    # Тип сообщения (WhatsApp Cloud API types)
+    MESSAGE_TYPE_CHOICES = [
         ('text', 'Текст'),
         ('image', 'Изображение'),
         ('video', 'Видео'),
         ('audio', 'Аудио'),
         ('document', 'Документ'),
-        ('location', 'Локация'),
-        ('contact', 'Контакт'),
         ('sticker', 'Стикер'),
+        ('location', 'Геолокация'),
+        ('contacts', 'Контакты'),
+        ('interactive', 'Интерактивное'),
+        ('template', 'Шаблон'),
+        ('reaction', 'Реакция'),
+        ('unknown', 'Неизвестно'),
     ]
     message_type = models.CharField(
         max_length=20,
-        choices=MESSAGE_TYPES,
+        choices=MESSAGE_TYPE_CHOICES,
         default='text',
         verbose_name='Тип сообщения'
     )
     
     # Содержимое
-    text = models.TextField(blank=True, null=True, verbose_name='Текст сообщения')
-    media_url = models.URLField(blank=True, null=True, verbose_name='URL медиа')
-    caption = models.TextField(blank=True, null=True, verbose_name='Подпись к медиа')
+    text = models.TextField(blank=True, verbose_name='Текст')
     
-    # Направление
-    is_incoming = models.BooleanField(default=True, verbose_name='Входящее')
-    is_read = models.BooleanField(default=False, verbose_name='Прочитано')
+    # Медиа
+    media_id = models.CharField(max_length=255, blank=True, verbose_name='Media ID')
+    media_url = models.URLField(blank=True, verbose_name='URL медиа')
+    media_mime_type = models.CharField(max_length=100, blank=True, verbose_name='MIME тип')
+    media_filename = models.CharField(max_length=255, blank=True, verbose_name='Имя файла')
+    media_caption = models.TextField(blank=True, verbose_name='Подпись к медиа')
+    
+    # Локация (для location type)
+    location_latitude = models.DecimalField(
+        max_digits=10, decimal_places=7, null=True, blank=True, verbose_name='Широта'
+    )
+    location_longitude = models.DecimalField(
+        max_digits=10, decimal_places=7, null=True, blank=True, verbose_name='Долгота'
+    )
+    location_name = models.CharField(max_length=255, blank=True, verbose_name='Название места')
+    location_address = models.CharField(max_length=255, blank=True, verbose_name='Адрес')
+    
+    # Ответ на сообщение (reply)
+    reply_to = models.ForeignKey(
+        'self',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='replies',
+        verbose_name='В ответ на'
+    )
+    
+    # Контекст (для interactive messages)
+    context = models.JSONField(default=dict, blank=True, verbose_name='Контекст')
     
     # Статус доставки
     STATUS_CHOICES = [
+        ('pending', 'Отправляется'),
         ('sent', 'Отправлено'),
         ('delivered', 'Доставлено'),
         ('read', 'Прочитано'),
@@ -459,29 +835,142 @@ class WazzuppMessage(models.Model):
     status = models.CharField(
         max_length=20,
         choices=STATUS_CHOICES,
-        default='sent',
+        default='pending',
         verbose_name='Статус'
     )
+    error_code = models.CharField(max_length=50, blank=True, verbose_name='Код ошибки')
+    error_message = models.TextField(blank=True, verbose_name='Сообщение об ошибке')
+    
+    # Прочтение
+    is_read = models.BooleanField(default=False, verbose_name='Прочитано нами')
+    read_at = models.DateTimeField(null=True, blank=True, verbose_name='Время прочтения')
     
     # Метаданные
     metadata = models.JSONField(default=dict, blank=True, verbose_name='Метаданные')
+    
+    # Временные метки
     timestamp = models.DateTimeField(verbose_name='Время сообщения')
-    created_at = models.DateTimeField(auto_now_add=True, verbose_name='Дата создания в системе')
+    created_at = models.DateTimeField(auto_now_add=True, verbose_name='Создано в системе')
 
     class Meta:
-        verbose_name = 'Сообщение Wazzupp'
-        verbose_name_plural = 'Сообщения Wazzupp'
-        ordering = ['-timestamp']
+        verbose_name = 'Сообщение'
+        verbose_name_plural = 'Сообщения'
+        ordering = ['timestamp']
         indexes = [
-            models.Index(fields=['account', 'timestamp']),
-            models.Index(fields=['contact']),
-            models.Index(fields=['from_number']),
-            models.Index(fields=['is_incoming']),
+            models.Index(fields=['conversation', 'timestamp']),
+            models.Index(fields=['meta_message_id']),
+            models.Index(fields=['direction', 'status']),
+            models.Index(fields=['conversation', 'is_read']),
         ]
 
     def __str__(self):
-        direction = "→" if self.is_incoming else "←"
-        return f"{direction} {self.from_number}: {self.text[:50] if self.text else self.message_type}"
+        direction_icon = "←" if self.direction == 'inbound' else "→"
+        preview = (self.text[:50] + '...') if self.text and len(self.text) > 50 else (self.text or self.message_type)
+        return f"{direction_icon} {preview}"
+
+
+class MessageTemplate(models.Model):
+    """
+    Шаблон сообщения WhatsApp (HSM - Highly Structured Message).
+    Шаблоны должны быть одобрены Meta перед использованием.
+    
+    Документация: https://developers.facebook.com/docs/whatsapp/message-templates
+    """
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    whatsapp_account = models.ForeignKey(
+        WhatsAppBusinessAccount,
+        on_delete=models.CASCADE,
+        related_name='templates',
+        verbose_name='WhatsApp аккаунт'
+    )
+    
+    # Данные шаблона из Meta
+    template_id = models.CharField(
+        max_length=100,
+        verbose_name='Template ID',
+        help_text='ID шаблона в Meta'
+    )
+    name = models.CharField(
+        max_length=255,
+        verbose_name='Название шаблона',
+        help_text='Уникальное имя шаблона (lowercase, underscore)'
+    )
+    language = models.CharField(
+        max_length=10,
+        default='ru',
+        verbose_name='Язык',
+        help_text='Код языка: ru, en, kk и т.д.'
+    )
+    
+    # Категория
+    CATEGORY_CHOICES = [
+        ('AUTHENTICATION', 'Аутентификация'),
+        ('MARKETING', 'Маркетинг'),
+        ('UTILITY', 'Утилита'),
+    ]
+    category = models.CharField(
+        max_length=20,
+        choices=CATEGORY_CHOICES,
+        verbose_name='Категория'
+    )
+    
+    # Статус одобрения
+    STATUS_CHOICES = [
+        ('PENDING', 'На рассмотрении'),
+        ('APPROVED', 'Одобрен'),
+        ('REJECTED', 'Отклонен'),
+        ('PAUSED', 'Приостановлен'),
+        ('DISABLED', 'Отключен'),
+    ]
+    status = models.CharField(
+        max_length=20,
+        choices=STATUS_CHOICES,
+        default='PENDING',
+        verbose_name='Статус'
+    )
+    rejection_reason = models.TextField(blank=True, verbose_name='Причина отклонения')
+    
+    # Компоненты шаблона (header, body, footer, buttons)
+    components = models.JSONField(
+        default=list,
+        verbose_name='Компоненты',
+        help_text='JSON структура шаблона (header, body, footer, buttons)'
+    )
+    
+    # Примеры переменных (для отправки)
+    example_values = models.JSONField(
+        default=dict,
+        blank=True,
+        verbose_name='Примеры значений',
+        help_text='Примеры значений для {{1}}, {{2}} и т.д.'
+    )
+    
+    is_active = models.BooleanField(default=True, verbose_name='Активен')
+    
+    created_at = models.DateTimeField(auto_now_add=True, verbose_name='Дата создания')
+    updated_at = models.DateTimeField(auto_now=True, verbose_name='Дата обновления')
+
+    class Meta:
+        verbose_name = 'Шаблон сообщения'
+        verbose_name_plural = 'Шаблоны сообщений'
+        ordering = ['name']
+        indexes = [
+            models.Index(fields=['whatsapp_account', 'status']),
+            models.Index(fields=['name', 'language']),
+        ]
+        constraints = [
+            models.UniqueConstraint(
+                fields=['whatsapp_account', 'name', 'language'],
+                name='uq_template_per_account_name_lang'
+            ),
+        ]
+
+    def __str__(self):
+        return f"{self.name} ({self.language}) - {self.status}"
+
+    @property
+    def company(self):
+        return self.whatsapp_account.meta_account.company
 
 
 class Activity(models.Model):

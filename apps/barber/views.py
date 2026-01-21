@@ -4,7 +4,8 @@ from rest_framework.parsers import MultiPartParser, FormParser
 from rest_framework.exceptions import PermissionDenied, ValidationError
 from rest_framework.filters import SearchFilter, OrderingFilter
 from django.db.models.deletion import ProtectedError
-from django.db import IntegrityError
+from django.db import IntegrityError, models
+from django.db.models import Q, Prefetch
 
 from django_filters import rest_framework as filters
 from django_filters.rest_framework import DjangoFilterBackend
@@ -24,7 +25,10 @@ from .serializers import (
     ProductSalePayoutSerializer,
     OnlineBookingCreateSerializer,
     OnlineBookingSerializer,
-    OnlineBookingStatusUpdateSerializer
+    OnlineBookingStatusUpdateSerializer,
+    PublicServiceSerializer,
+    PublicServiceCategorySerializer,
+    PublicMasterSerializer
 )
 
 
@@ -632,3 +636,151 @@ class OnlineBookingStatusUpdateView(CompanyQuerysetMixin, generics.UpdateAPIView
     
     def get_serializer_class(self):
         return OnlineBookingStatusUpdateSerializer
+
+
+# ===========================
+# Публичные эндпоинты для онлайн-записи
+# ===========================
+class PublicServicesListView(generics.ListAPIView):
+    """
+    Публичный эндпоинт для получения услуг компании.
+    Доступен без авторизации, требует slug компании в URL.
+    URL: /api/barbershop/public/{company_slug}/services/
+    
+    Query params:
+        - branch: UUID филиала (опционально)
+    """
+    serializer_class = PublicServiceSerializer
+    permission_classes = [permissions.AllowAny]
+    authentication_classes = []
+    
+    def get_company(self):
+        """Получаем компанию по slug из URL"""
+        slug = self.kwargs.get('company_slug')
+        try:
+            return Company.objects.get(slug=slug)
+        except Company.DoesNotExist:
+            raise ValidationError({'detail': 'Компания не найдена'})
+    
+    def get_queryset(self):
+        company = self.get_company()
+        qs = Service.objects.filter(
+            company=company,
+            is_active=True
+        ).select_related('category').order_by('category__name', 'name')
+        
+        # Фильтрация по филиалу (если указан)
+        branch_id = self.request.query_params.get('branch')
+        if branch_id:
+            try:
+                branch = Branch.objects.get(id=branch_id, company=company)
+                # Показываем глобальные услуги + услуги филиала
+                qs = qs.filter(Q(branch__isnull=True) | Q(branch=branch))
+            except (Branch.DoesNotExist, ValueError):
+                # Если филиал не найден - показываем только глобальные
+                qs = qs.filter(branch__isnull=True)
+        
+        return qs
+
+
+class PublicServiceCategoriesListView(generics.ListAPIView):
+    """
+    Публичный эндпоинт для получения категорий услуг с услугами.
+    Доступен без авторизации, требует slug компании в URL.
+    URL: /api/barbershop/public/{company_slug}/service-categories/
+    
+    Query params:
+        - branch: UUID филиала (опционально)
+    """
+    serializer_class = PublicServiceCategorySerializer
+    permission_classes = [permissions.AllowAny]
+    authentication_classes = []
+    
+    def get_company(self):
+        """Получаем компанию по slug из URL"""
+        slug = self.kwargs.get('company_slug')
+        try:
+            return Company.objects.get(slug=slug)
+        except Company.DoesNotExist:
+            raise ValidationError({'detail': 'Компания не найдена'})
+    
+    def get_queryset(self):
+        company = self.get_company()
+        
+        # Фильтрация по филиалу
+        branch_id = self.request.query_params.get('branch')
+        branch_filter = Q(branch__isnull=True)
+        services_branch_filter = Q(branch__isnull=True)
+        
+        if branch_id:
+            try:
+                branch = Branch.objects.get(id=branch_id, company=company)
+                branch_filter = Q(branch__isnull=True) | Q(branch=branch)
+                services_branch_filter = Q(branch__isnull=True) | Q(branch=branch)
+            except (Branch.DoesNotExist, ValueError):
+                pass
+        
+        # Получаем категории с активными услугами
+        qs = ServiceCategory.objects.filter(
+            company=company,
+            is_active=True
+        ).filter(branch_filter).prefetch_related(
+            Prefetch(
+                'services',
+                queryset=Service.objects.filter(
+                    is_active=True,
+                    company=company
+                ).filter(services_branch_filter).order_by('name')
+            )
+        ).order_by('name')
+        
+        return qs
+
+
+class PublicMastersListView(generics.ListAPIView):
+    """
+    Публичный эндпоинт для получения мастеров компании.
+    Доступен без авторизации, требует slug компании в URL.
+    URL: /api/barbershop/public/{company_slug}/masters/
+    
+    Мастера - это пользователи (User) компании с правом can_view_barber_records.
+    
+    Query params:
+        - branch: UUID филиала (опционально)
+    """
+    serializer_class = PublicMasterSerializer
+    permission_classes = [permissions.AllowAny]
+    authentication_classes = []
+    
+    def get_company(self):
+        """Получаем компанию по slug из URL"""
+        slug = self.kwargs.get('company_slug')
+        try:
+            return Company.objects.get(slug=slug)
+        except Company.DoesNotExist:
+            raise ValidationError({'detail': 'Компания не найдена'})
+    
+    def get_queryset(self):
+        from apps.users.models import User
+        
+        company = self.get_company()
+        
+        # Получаем сотрудников компании, которые являются мастерами
+        # (имеют доступ к записям барбершопа)
+        qs = User.objects.filter(
+            company=company,
+            is_active=True,
+            can_view_barber_records=True
+        ).order_by('first_name', 'last_name')
+        
+        # Фильтрация по филиалу (если указан)
+        branch_id = self.request.query_params.get('branch')
+        if branch_id:
+            try:
+                branch = Branch.objects.get(id=branch_id, company=company)
+                # Показываем мастеров, привязанных к филиалу
+                qs = qs.filter(branches=branch)
+            except (Branch.DoesNotExist, ValueError):
+                pass
+        
+        return qs
