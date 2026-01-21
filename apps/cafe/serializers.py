@@ -219,7 +219,7 @@ class WarehouseSerializer(CompanyBranchReadOnlyMixin):
     class Meta:
         ref_name = "CafeWarehouse"
         model = Warehouse
-        fields = ["id", "company", "branch", "title", "unit", "remainder", "minimum"]
+        fields = ["id", "company", "branch", "title", "unit", "remainder", "minimum", "unit_price"]
         read_only_fields = ["id", "company", "branch"]
 
 
@@ -241,11 +241,18 @@ class CategorySerializer(CompanyBranchReadOnlyMixin):
 class IngredientInlineSerializer(serializers.ModelSerializer):
     product_title = serializers.CharField(source="product.title", read_only=True)
     product_unit = serializers.CharField(source="product.unit", read_only=True)
+    product_unit_price = serializers.DecimalField(
+        source="product.unit_price", max_digits=12, decimal_places=2, read_only=True
+    )
+    ingredient_cost = serializers.SerializerMethodField()
 
     class Meta:
         model = Ingredient
-        fields = ["id", "product", "product_title", "product_unit", "amount"]
-        read_only_fields = ["id", "product_title", "product_unit"]
+        fields = [
+            "id", "product", "product_title", "product_unit",
+            "product_unit_price", "amount", "ingredient_cost"
+        ]
+        read_only_fields = ["id", "product_title", "product_unit", "product_unit_price", "ingredient_cost"]
 
     def get_fields(self):
         fields = super().get_fields()
@@ -257,6 +264,12 @@ class IngredientInlineSerializer(serializers.ModelSerializer):
             # нет контекста/корня (Swagger) — безопасно отдаём пусто
             fields["product"].queryset = Warehouse.objects.none()
         return fields
+
+    def get_ingredient_cost(self, obj):
+        """Стоимость ингредиента = количество * цена за единицу"""
+        unit_price = obj.product.unit_price or Decimal("0.00")
+        amount = obj.amount or Decimal("0.00")
+        return (unit_price * amount).quantize(Decimal("0.01"))
 
     def validate(self, attrs):
         # model.clean() на связях добьёт; здесь ничего лишнего
@@ -277,6 +290,23 @@ class MenuItemSerializer(CompanyBranchReadOnlyMixin):
     ingredients = IngredientInlineSerializer(many=True, required=False)
     image = serializers.ImageField(required=False, allow_null=True)
     image_url = serializers.SerializerMethodField()
+    
+    # Новые поля для себестоимости
+    vat_percent = serializers.DecimalField(
+        max_digits=5, decimal_places=2, required=False, default=Decimal("0.00")
+    )
+    other_expenses = serializers.DecimalField(
+        max_digits=12, decimal_places=2, required=False, default=Decimal("0.00")
+    )
+    cost_price = serializers.DecimalField(
+        max_digits=12, decimal_places=2, read_only=True
+    )
+    
+    # Вычисляемые поля (read-only)
+    vat_amount = serializers.SerializerMethodField()
+    profit = serializers.SerializerMethodField()
+    margin_percent = serializers.SerializerMethodField()
+    ingredients_cost = serializers.SerializerMethodField()
 
     class Meta:
         model = MenuItem
@@ -286,9 +316,15 @@ class MenuItemSerializer(CompanyBranchReadOnlyMixin):
             "kitchen", "kitchen_title", "kitchen_number",
             "price", "is_active",
             "image", "image_url",
+            # Себестоимость и расходы
+            "vat_percent", "other_expenses", "cost_price",
+            "vat_amount", "profit", "margin_percent", "ingredients_cost",
             "created_at", "updated_at", "ingredients",
         ]
-        read_only_fields = ["id", "company", "branch", "created_at", "updated_at"]
+        read_only_fields = [
+            "id", "company", "branch", "created_at", "updated_at",
+            "cost_price", "vat_amount", "profit", "margin_percent", "ingredients_cost"
+        ]
 
     def get_fields(self):
         fields = super().get_fields()
@@ -302,6 +338,27 @@ class MenuItemSerializer(CompanyBranchReadOnlyMixin):
             url = obj.image.url
             return request.build_absolute_uri(url) if request else url
         return None
+
+    def get_vat_amount(self, obj):
+        """Сумма НДС от цены продажи"""
+        return obj.vat_amount
+
+    def get_profit(self, obj):
+        """Прибыль = Цена продажи - Себестоимость - НДС"""
+        return obj.profit
+
+    def get_margin_percent(self, obj):
+        """Маржа в процентах"""
+        return obj.margin_percent
+
+    def get_ingredients_cost(self, obj):
+        """Стоимость всех ингредиентов (без прочих расходов)"""
+        total = Decimal("0.00")
+        for ingredient in obj.ingredients.select_related('product').all():
+            unit_price = ingredient.product.unit_price or Decimal("0.00")
+            amount = ingredient.amount or Decimal("0.00")
+            total += unit_price * amount
+        return total.quantize(Decimal("0.01"))
 
     def validate(self, attrs):
         company = self._user_company() or getattr(self.instance, "company", None)
@@ -321,6 +378,18 @@ class MenuItemSerializer(CompanyBranchReadOnlyMixin):
             if tb is not None and kitchen.branch_id not in (None, tb.id):
                 raise serializers.ValidationError({"kitchen": "Кухня другого филиала."})
 
+        # Валидация НДС
+        vat = attrs.get("vat_percent")
+        if vat is not None and vat < 0:
+            raise serializers.ValidationError({"vat_percent": "НДС не может быть отрицательным."})
+        if vat is not None and vat > 100:
+            raise serializers.ValidationError({"vat_percent": "НДС не может быть больше 100%."})
+
+        # Валидация прочих расходов
+        other = attrs.get("other_expenses")
+        if other is not None and other < 0:
+            raise serializers.ValidationError({"other_expenses": "Прочие расходы не могут быть отрицательными."})
+
         return attrs
 
     def _upsert_ingredients(self, menu_item, ing_list):
@@ -334,11 +403,18 @@ class MenuItemSerializer(CompanyBranchReadOnlyMixin):
         if to_create:
             Ingredient.objects.bulk_create(to_create)
 
+    def _recalc_and_save_cost(self, menu_item):
+        """Пересчитать и сохранить себестоимость"""
+        menu_item.recalc_cost_price()
+        menu_item.save(update_fields=["cost_price"])
+
     def create(self, validated_data):
         ingredients = validated_data.pop("ingredients", [])
         obj = super().create(validated_data)
         if ingredients:
             self._upsert_ingredients(obj, ingredients)
+        # Пересчитываем себестоимость после добавления ингредиентов
+        self._recalc_and_save_cost(obj)
         return obj
 
     def update(self, instance, validated_data):
@@ -348,6 +424,8 @@ class MenuItemSerializer(CompanyBranchReadOnlyMixin):
             instance.ingredients.all().delete()
             if ingredients:
                 self._upsert_ingredients(instance, ingredients)
+        # Пересчитываем себестоимость после обновления
+        self._recalc_and_save_cost(obj)
         return obj
 
 

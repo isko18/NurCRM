@@ -414,6 +414,11 @@ class Warehouse(models.Model):
     unit = models.CharField(max_length=255, verbose_name="Ед. изм.")
     remainder = models.CharField(max_length=255, verbose_name="Остаток")
     minimum = models.CharField(max_length=255, verbose_name="Минимум")
+    unit_price = models.DecimalField(
+        "Цена за единицу", max_digits=12, decimal_places=2,
+        default=Decimal("0.00"),
+        help_text="Закупочная цена за единицу измерения (для расчета себестоимости блюд)"
+    )
 
     class Meta:
         verbose_name = 'Склад'
@@ -533,8 +538,26 @@ class MenuItem(models.Model):
         "Category", on_delete=models.CASCADE,
         related_name="items", verbose_name="Категория"
     )
-    price = models.DecimalField("Цена", max_digits=10, decimal_places=2)
+    price = models.DecimalField("Цена продажи", max_digits=10, decimal_places=2)
     is_active = models.BooleanField("Активно в продаже", default=True)
+
+    # Себестоимость и расходы
+    cost_price = models.DecimalField(
+        "Себестоимость", max_digits=12, decimal_places=2,
+        default=Decimal("0.00"),
+        help_text="Автоматически рассчитывается из ингредиентов + прочие расходы"
+    )
+    vat_percent = models.DecimalField(
+        "НДС (%)", max_digits=5, decimal_places=2,
+        default=Decimal("0.00"),
+        validators=[MinValueValidator(Decimal("0.00"))],
+        help_text="Процент налога на добавленную стоимость"
+    )
+    other_expenses = models.DecimalField(
+        "Прочие расходы", max_digits=12, decimal_places=2,
+        default=Decimal("0.00"),
+        help_text="Дополнительные расходы на блюдо (упаковка, доставка и т.д.)"
+    )
 
     image = models.ImageField("Изображение", upload_to="menu_items/", blank=True, null=True)
 
@@ -581,6 +604,39 @@ class MenuItem(models.Model):
 
     def __str__(self):
         return f"{self.title} ({self.category})"
+
+    def recalc_cost_price(self):
+        """
+        Пересчитать себестоимость блюда на основе ингредиентов и прочих расходов.
+        Себестоимость = сумма(количество ингредиента * цена за единицу) + прочие расходы
+        """
+        ingredients_cost = Decimal("0.00")
+        for ingredient in self.ingredients.select_related('product').all():
+            unit_price = ingredient.product.unit_price or Decimal("0.00")
+            amount = ingredient.amount or Decimal("0.00")
+            ingredients_cost += unit_price * amount
+        
+        self.cost_price = ingredients_cost + (self.other_expenses or Decimal("0.00"))
+        return self.cost_price
+
+    @property
+    def vat_amount(self):
+        """Сумма НДС от цены продажи"""
+        if not self.vat_percent or not self.price:
+            return Decimal("0.00")
+        return (self.price * self.vat_percent / Decimal("100")).quantize(Decimal("0.01"))
+
+    @property
+    def profit(self):
+        """Прибыль = Цена продажи - Себестоимость - НДС"""
+        return (self.price or Decimal("0.00")) - (self.cost_price or Decimal("0.00")) - self.vat_amount
+
+    @property
+    def margin_percent(self):
+        """Маржа в процентах = (Прибыль / Цена) * 100"""
+        if not self.price or self.price == 0:
+            return Decimal("0.00")
+        return ((self.profit / self.price) * Decimal("100")).quantize(Decimal("0.01"))
 
     def save(self, *args, **kwargs):
         """
