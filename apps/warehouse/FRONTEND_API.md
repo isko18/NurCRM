@@ -8,9 +8,30 @@
 Основные эндпойнты
 - Документы
   - GET/POST  /api/warehouse/documents/
+  - Отдельные списки по типам (удобно для отдельных вкладок/страниц):
+    - GET/POST /api/warehouse/documents/sale/
+    - GET/POST /api/warehouse/documents/purchase/
+    - GET/POST /api/warehouse/documents/sale-return/
+    - GET/POST /api/warehouse/documents/purchase-return/
+    - GET/POST /api/warehouse/documents/inventory/
+    - GET/POST /api/warehouse/documents/receipt/
+    - GET/POST /api/warehouse/documents/write-off/
+    - GET/POST /api/warehouse/documents/transfer/
   - GET/PUT/PATCH/DELETE  /api/warehouse/documents/{id}/
   - POST /api/warehouse/documents/{id}/post/  — провести документ
   - POST /api/warehouse/documents/{id}/unpost/ — отменить проведение
+
+- Денежные документы (приход/расход денег)
+  - Категории платежа:
+    - GET/POST /api/warehouse/money/categories/
+    - GET/PUT/PATCH/DELETE /api/warehouse/money/categories/{id}/
+  - Документы денег:
+    - GET/POST /api/warehouse/money/documents/
+    - GET/PUT/PATCH/DELETE /api/warehouse/money/documents/{id}/
+    - POST /api/warehouse/money/documents/{id}/post/ — провести
+    - POST /api/warehouse/money/documents/{id}/unpost/ — отменить проведение
+  - Операции по контрагенту (детализация):
+    - GET /api/warehouse/money/counterparties/{counterparty_id}/operations/
 
 - CRUD (простые)
   - Товары: GET/POST /api/warehouse/crud/products/  и GET/PUT/PATCH/DELETE /api/warehouse/crud/products/{id}/
@@ -20,6 +41,7 @@
 
 Фильтры и поиск
 - Документы: ?doc_type=SALE&status=POSTED&warehouse_from=<uuid>&warehouse_to=<uuid>&counterparty=<uuid>
+- Отдельные списки по типам: doc_type в query не нужен (сервер уже фильтрует по типу).
 - Даты: клиентская фильтрация или внедрите date_from/date_to
 - Пагинация: стандартный DRF paging (если включён)
 
@@ -37,6 +59,7 @@ JSON body:
 }
 
 - `number`, `status`, `total`, `date` — поля только для чтения. Номер генерируется при `post`.
+- Если используете эндпойнт по типу (например /documents/sale/), `doc_type` можно не передавать — сервер проставит сам.
 
 Проведение и отмена
 - Проведение: POST /api/warehouse/documents/{id}/post/  (без тела)
@@ -52,6 +75,18 @@ JSON body:
 - Для SALE/PURCHASE/... обязательно указать counterparty.
 - Нельзя проводить пустой документ.
 
+Денежные документы (приход/расход денег)
+- Типы:
+  - MONEY_RECEIPT — приход денег (получаем деньги от контрагента)
+  - MONEY_EXPENSE — расход денег (отправляем деньги контрагенту)
+- Обязательные поля:
+  - warehouse — счёт (на UI можно показывать как “Счёт”, в бекенде это склад)
+  - counterparty — контрагент
+  - payment_category — категория платежа
+  - amount — сумма > 0
+  - comment — опционально
+- Денежные документы не создают складских движений (StockMove) и не меняют остатки товаров.
+
 Валидации на сервере (повторите на фронте для UX)
 - items не пуст.
 - Для piece items (шт) — qty должно быть целым.
@@ -60,6 +95,20 @@ JSON body:
 - Повторное проведение запрещено.
 
 Формат ошибок
+
+Формат запроса — создание денежного документа (пример)
+POST /api/warehouse/money/documents/
+JSON body:
+{
+  "doc_type": "MONEY_RECEIPT",
+  "warehouse": "11111111-1111-1111-1111-111111111111",
+  "counterparty": "22222222-2222-2222-2222-222222222222",
+  "payment_category": "33333333-3333-3333-3333-333333333333",
+  "amount": "1500.00",
+  "comment": "Оплата от контрагента"
+}
+
+- `number`, `status`, `date`, `created_at`, `updated_at` — только для чтения. Номер генерируется при `post`.
 - Поле-валидация: 400, тело {"field": ["error1", ...]}
 - Бизнес-ошибки: 400, тело {"detail": "текст ошибки"}
 
@@ -82,6 +131,36 @@ export function unpostDocument(id) {
 
 export function listDocuments(params) {
   return api.get('documents/', { params }).then(r => r.data)
+}
+
+// --- typed lists ---
+export function listSales(params) {
+  return api.get('documents/sale/', { params }).then(r => r.data)
+}
+
+// --- money ---
+export function listMoneyDocuments(params) {
+  return api.get('money/documents/', { params }).then(r => r.data)
+}
+
+export function createMoneyDocument(payload) {
+  return api.post('money/documents/', payload).then(r => r.data)
+}
+
+export function postMoneyDocument(id) {
+  return api.post(`money/documents/${id}/post/`).then(r => r.data)
+}
+
+export function unpostMoneyDocument(id) {
+  return api.post(`money/documents/${id}/unpost/`).then(r => r.data)
+}
+
+export function listMoneyCategories(params) {
+  return api.get('money/categories/', { params }).then(r => r.data)
+}
+
+export function listMoneyOperationsByCounterparty(counterpartyId, params) {
+  return api.get(`money/counterparties/${counterpartyId}/operations/`, { params }).then(r => r.data)
 }
 ```
 

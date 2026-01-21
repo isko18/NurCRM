@@ -14,6 +14,15 @@ from .views_documents import (
     ProductListCreateView, ProductDetailView as ProductDetailViewCRUD,
     WarehouseListCreateView, WarehouseDetailView as WarehouseDetailViewCRUD,
     CounterpartyListCreateView, CounterpartyDetailView,
+    DocumentSaleListCreateView, DocumentPurchaseListCreateView,
+    DocumentSaleReturnListCreateView, DocumentPurchaseReturnListCreateView,
+    DocumentInventoryListCreateView, DocumentReceiptListCreateView,
+    DocumentWriteOffListCreateView, DocumentTransferListCreateView,
+)
+from .views_money import (
+    PaymentCategoryListCreateView, PaymentCategoryDetailView,
+    MoneyDocumentListCreateView, MoneyDocumentDetailView, MoneyDocumentPostView, MoneyDocumentUnpostView,
+    CounterpartyMoneyOperationsView,
 )
 
 urlpatterns = [
@@ -56,6 +65,14 @@ urlpatterns = [
 urlpatterns += [
     # documents
     path("documents/", DocumentListCreateView.as_view(), name="warehouse-documents"),
+    path("documents/sale/", DocumentSaleListCreateView.as_view(), name="warehouse-documents-sale"),
+    path("documents/purchase/", DocumentPurchaseListCreateView.as_view(), name="warehouse-documents-purchase"),
+    path("documents/sale-return/", DocumentSaleReturnListCreateView.as_view(), name="warehouse-documents-sale-return"),
+    path("documents/purchase-return/", DocumentPurchaseReturnListCreateView.as_view(), name="warehouse-documents-purchase-return"),
+    path("documents/inventory/", DocumentInventoryListCreateView.as_view(), name="warehouse-documents-inventory"),
+    path("documents/receipt/", DocumentReceiptListCreateView.as_view(), name="warehouse-documents-receipt"),
+    path("documents/write-off/", DocumentWriteOffListCreateView.as_view(), name="warehouse-documents-write-off"),
+    path("documents/transfer/", DocumentTransferListCreateView.as_view(), name="warehouse-documents-transfer"),
     path("documents/<uuid:pk>/", DocumentDetailView.as_view(), name="warehouse-document-detail"),
     path("documents/<uuid:pk>/post/", DocumentPostView.as_view(), name="warehouse-document-post"),
     path("documents/<uuid:pk>/unpost/", DocumentUnpostView.as_view(), name="warehouse-document-unpost"),
@@ -68,4 +85,23 @@ urlpatterns += [
 
     path("crud/counterparties/", CounterpartyListCreateView.as_view(), name="counterparties-crud"),
     path("crud/counterparties/<uuid:pk>/", CounterpartyDetailView.as_view(), name="counterparties-detail-crud"),
+]
+
+urlpatterns += [
+    # money categories
+    path("money/categories/", PaymentCategoryListCreateView.as_view(), name="money-categories"),
+    path("money/categories/<uuid:pk>/", PaymentCategoryDetailView.as_view(), name="money-category-detail"),
+
+    # money documents
+    path("money/documents/", MoneyDocumentListCreateView.as_view(), name="money-documents"),
+    path("money/documents/<uuid:pk>/", MoneyDocumentDetailView.as_view(), name="money-document-detail"),
+    path("money/documents/<uuid:pk>/post/", MoneyDocumentPostView.as_view(), name="money-document-post"),
+    path("money/documents/<uuid:pk>/unpost/", MoneyDocumentUnpostView.as_view(), name="money-document-unpost"),
+
+    # money operations by counterparty
+    path(
+        "money/counterparties/<uuid:counterparty_id>/operations/",
+        CounterpartyMoneyOperationsView.as_view(),
+        name="money-operations-by-counterparty",
+    ),
 ]
