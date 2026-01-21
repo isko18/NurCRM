@@ -36,6 +36,8 @@ urlpatterns = [
     path("public/<str:company_slug>/services/", views.PublicServicesListView.as_view(), name="public-services-list"),
     path("public/<str:company_slug>/service-categories/", views.PublicServiceCategoriesListView.as_view(), name="public-service-categories-list"),
     path("public/<str:company_slug>/masters/", views.PublicMastersListView.as_view(), name="public-masters-list"),
+    path("public/<str:company_slug>/masters/availability/", views.PublicMastersAvailabilityView.as_view(), name="public-masters-availability"),
+    path("public/<str:company_slug>/masters/<uuid:master_id>/schedule/", views.PublicMasterScheduleView.as_view(), name="public-master-schedule"),
     
     # Онлайн заявки (защищенные эндпоинты)
     path("bookings/", views.OnlineBookingListView.as_view(), name="online-booking-list"),
