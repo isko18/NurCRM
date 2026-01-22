@@ -7,7 +7,7 @@ from .views import (
     MetaBusinessAccountViewSet, WhatsAppBusinessAccountViewSet,
     InstagramBusinessAccountViewSet, ConversationViewSet,
     MessageViewSet, MessageTemplateViewSet,
-    MetaWebhookView
+    MetaWebhookView, MetaOAuthCallbackView, MetaOAuthExchangeView
 )
 
 router = DefaultRouter()
@@ -35,6 +35,14 @@ urlpatterns = [
     
     # Meta Webhook endpoint
     # URL: /api/crm/webhook/meta/<business_id>/
-    # Этот URL нужно указать в настройках приложения Meta
+    # Этот URL нужно указать в настройках приложения Meta → Webhooks
     path('webhook/meta/<str:business_id>/', MetaWebhookView.as_view(), name='meta-webhook'),
+    
+    # Meta OAuth endpoints
+    # Callback URL для Valid OAuth Redirect URIs в Meta App Settings → Basic
+    # Пример: https://nurcrm.kg/api/crm/oauth/meta/callback/
+    path('oauth/meta/callback/', MetaOAuthCallbackView.as_view(), name='meta-oauth-callback'),
+    
+    # Обмен authorization code на access_token
+    path('oauth/meta/exchange/', MetaOAuthExchangeView.as_view(), name='meta-oauth-exchange'),
 ]
