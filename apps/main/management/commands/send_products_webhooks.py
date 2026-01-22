@@ -3,7 +3,6 @@ from __future__ import annotations
 import time
 
 from django.core.management.base import BaseCommand
-from django.db.models import Prefetch
 from django.utils import timezone
 
 from apps.main.models import Product
@@ -14,6 +13,26 @@ class Command(BaseCommand):
     help = "Resend existing products to external webhook (SITE_WEBHOOK_URL)."
 
     def add_arguments(self, parser):
+        parser.add_argument(
+            "--company",
+            default="",
+            help="Filter by company UUID (optional).",
+        )
+        parser.add_argument(
+            "--branch",
+            default="",
+            help="Filter by branch UUID (optional).",
+        )
+        parser.add_argument(
+            "--product-ids",
+            default="",
+            help="Comma-separated product UUIDs to send (optional).",
+        )
+        parser.add_argument(
+            "--codes",
+            default="",
+            help="Comma-separated product codes to send (optional).",
+        )
         parser.add_argument(
             "--event",
             default="product.updated",
@@ -38,12 +57,30 @@ class Command(BaseCommand):
         )
 
     def handle(self, *args, **options):
+        company_raw = (options.get("company") or "").strip()
+        branch_raw = (options.get("branch") or "").strip()
+        product_ids_raw = (options.get("product_ids") or "").strip()
+        codes_raw = (options.get("codes") or "").strip()
+
         event = str(options["event"] or "product.updated")
         sleep_s = float(options["sleep"] or 0.0)
         limit = int(options["limit"] or 0)
         updated_since_raw = (options.get("updated_since") or "").strip()
 
         qs = Product.objects.all()
+
+        if company_raw:
+            qs = qs.filter(company_id=company_raw)
+        if branch_raw:
+            qs = qs.filter(branch_id=branch_raw)
+
+        if product_ids_raw:
+            ids = [x.strip() for x in product_ids_raw.split(",") if x.strip()]
+            qs = qs.filter(id__in=ids)
+
+        if codes_raw:
+            codes = [x.strip() for x in codes_raw.split(",") if x.strip()]
+            qs = qs.filter(code__in=codes)
 
         if updated_since_raw:
             try:
@@ -96,4 +133,3 @@ class Command(BaseCommand):
 
         elapsed = max(time.time() - started, 0.001)
         self.stdout.write(self.style.SUCCESS(f"Done. Sent {total} products in {elapsed:.1f}s"))
-
