@@ -586,9 +586,9 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
 
     # allow_null=True чтобы PATCH мог "очищать" значения
     purchase_price = serializers.DecimalField(max_digits=10, decimal_places=2, required=False, allow_null=True)
-    markup_percent = serializers.DecimalField(max_digits=5, decimal_places=2, required=False, allow_null=True)
+    markup_percent = serializers.DecimalField(max_digits=12, decimal_places=2, required=False, allow_null=True)
     price = serializers.DecimalField(max_digits=10, decimal_places=2, required=False, allow_null=True)
-    discount_percent = serializers.DecimalField(max_digits=5, decimal_places=2, required=False, allow_null=True)
+    discount_percent = serializers.DecimalField(max_digits=12, decimal_places=2, required=False, allow_null=True)
 
     country = serializers.CharField(required=False, allow_blank=True)
     expiration_date = serializers.DateField(required=False, allow_null=True)
@@ -809,6 +809,7 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
     def _sanitize_decimal_fields(self, instance):
         """Чистим потенциально битые Decimal, чтобы DRF не падал на quantize()."""
         for field, quant in (
+            ("quantity", self._Q2),
             ("purchase_price", self._Q2),
             ("markup_percent", self._Q2),
             ("price", self._Q2),
