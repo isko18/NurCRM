@@ -13,6 +13,9 @@ urlpatterns = [
     path('appointments/<uuid:pk>/', views.AppointmentRetrieveUpdateDestroyView.as_view(), name='appointment-detail'),
     path('appointments/my/', views.MyAppointmentListView.as_view(), name='my-appointment-list'),
     path('appointments/my/<uuid:pk>/', views.MyAppointmentDetailView.as_view(), name='my-appointment-detail'),
+
+    path('analytics/', views.BarberAnalyticsView.as_view(), name='barber-analytics'),
+    path('analytics/my/', views.MyBarberAnalyticsView.as_view(), name='barber-analytics-my'),
      
     path('folders/', views.FolderListCreateView.as_view(), name='folder-list'),
     path('folders/<uuid:pk>/', views.FolderRetrieveUpdateDestroyView.as_view(), name='folder-detail'),

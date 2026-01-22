@@ -1062,3 +1062,37 @@ class PublicMasterAvailabilitySerializer(serializers.Serializer):
     # Рабочие часы (можно расширить в будущем)
     work_start = serializers.TimeField(default="09:00")
     work_end = serializers.TimeField(default="21:00")
+
+
+# ===========================
+# Analytics (company + my)
+# ===========================
+class BarberAnalyticsTotalsSerializer(serializers.Serializer):
+    appointments_total = serializers.IntegerField()
+    appointments_completed = serializers.IntegerField()
+    appointments_canceled = serializers.IntegerField()
+    appointments_no_show = serializers.IntegerField()
+    revenue = serializers.DecimalField(max_digits=14, decimal_places=2)
+    avg_ticket = serializers.DecimalField(max_digits=14, decimal_places=2, allow_null=True)
+
+
+class BarberAnalyticsServiceRowSerializer(serializers.Serializer):
+    service_id = serializers.UUIDField()
+    name = serializers.CharField()
+    count = serializers.IntegerField()
+    revenue = serializers.DecimalField(max_digits=14, decimal_places=2)
+
+
+class BarberAnalyticsMasterRowSerializer(serializers.Serializer):
+    master_id = serializers.UUIDField()
+    master_name = serializers.CharField()
+    count = serializers.IntegerField()
+    revenue = serializers.DecimalField(max_digits=14, decimal_places=2)
+
+
+class BarberAnalyticsResponseSerializer(serializers.Serializer):
+    date_from = serializers.DateField()
+    date_to = serializers.DateField()
+    totals = BarberAnalyticsTotalsSerializer()
+    services = BarberAnalyticsServiceRowSerializer(many=True)
+    masters = BarberAnalyticsMasterRowSerializer(many=True, required=False)

@@ -2,6 +2,7 @@ from django.urls import path
 from .views import *
 from .pos_views import *
 from .analytics_market import *
+from .analytics_dashboard import *
 from .document import SaleReceiptAPIView, SaleInvoiceAPIView
 from apps.main.showcase.views_public import PublicCompanyProductDetailAPIView, PublicCompanyAPIView, PublicCompanyShowcaseAPIView
 
@@ -71,6 +72,8 @@ urlpatterns = [
     path('integrations/<uuid:pk>/', IntegrationRetrieveUpdateDestroyAPIView.as_view(), name='integration-detail'),
 
     path('analytics/', AnalyticsListAPIView.as_view(), name='analytics-list'),
+    path('analytics/dashboard/', OwnerDashboardAnalyticsAPIView.as_view(), name='analytics-dashboard'),
+    path('analytics/dashboard/my/', MyDashboardAnalyticsAPIView.as_view(), name='analytics-dashboard-my'),
 
     # 🔹 Отзывы
     path('reviews/', ReviewListCreateAPIView.as_view(), name='review-list-create'),
