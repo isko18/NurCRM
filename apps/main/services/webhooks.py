@@ -19,40 +19,14 @@ def _build_signature(secret: str, body: bytes) -> str:
     digest = hmac.new(secret.encode("utf-8"), body, hashlib.sha256).hexdigest()
     return f"sha256={digest}"
 
-
-def send_product_webhook(product, event: str, *, retries: int = 3, timeout: int = 5, backoff: float = 1.5) -> None:
-    """
-    Sends product webhook. Never raises.
-
-    Payload:
-      {
-        "event": "product.created" | "product.updated",
-        "data": <Product JSON as in GET /api/main/products/list/>
-      }
-    """
+def _send_payload(payload: dict, *, retries: int, timeout: int, backoff: float) -> None:
     url = getattr(settings, "SITE_WEBHOOK_URL", None)
     if not url:
         return
 
     secret = str(getattr(settings, "SITE_WEBHOOK_SECRET", "") or "")
 
-    try:
-        data = ProductSerializer(product, context={"request": None}).data
-    except Exception:
-        try:
-            data = ProductSerializer(product, context={}).data
-        except Exception:
-            logger.error(
-                "Failed to serialize product for webhook. product_id=%s event=%s",
-                getattr(product, "id", None),
-                event,
-                exc_info=True,
-            )
-            return
-
-    payload = {"event": event, "data": data}
     body = json.dumps(payload, ensure_ascii=False, separators=(",", ":"), default=str).encode("utf-8")
-
     headers = {
         "Content-Type": "application/json",
         "X-CRM-Signature": _build_signature(secret, body),
@@ -68,9 +42,8 @@ def send_product_webhook(product, event: str, *, retries: int = 3, timeout: int 
                 raise RuntimeError(f"Unexpected status code: {status}")
         except Exception:
             logger.error(
-                "Product webhook failed. product_id=%s event=%s url=%s attempt=%s/%s",
-                getattr(product, "id", None),
-                event,
+                "Product webhook failed. event=%s url=%s attempt=%s/%s",
+                payload.get("event"),
                 url,
                 attempt + 1,
                 retries,
@@ -78,3 +51,41 @@ def send_product_webhook(product, event: str, *, retries: int = 3, timeout: int 
             )
             if attempt + 1 < retries:
                 time.sleep(backoff ** attempt)
+
+
+def send_product_webhook_data(data: dict, event: str, *, retries: int = 3, timeout: int = 5, backoff: float = 1.5) -> None:
+    """
+    Same webhook format as send_product_webhook(), but accepts already-serialized product data.
+    Useful for delete events (when the instance is about to be removed).
+    """
+    try:
+        _send_payload({"event": event, "data": data}, retries=retries, timeout=timeout, backoff=backoff)
+    except Exception:
+        logger.error("Unexpected error sending product webhook payload. event=%s", event, exc_info=True)
+
+
+def send_product_webhook(product, event: str, *, retries: int = 3, timeout: int = 5, backoff: float = 1.5) -> None:
+    """
+    Sends product webhook. Never raises.
+
+    Payload:
+      {
+        "event": "product.created" | "product.updated",
+        "data": <Product JSON as in GET /api/main/products/list/>
+      }
+    """
+    try:
+        data = ProductSerializer(product, context={"request": None}).data
+    except Exception:
+        try:
+            data = ProductSerializer(product, context={}).data
+        except Exception:
+            logger.error(
+                "Failed to serialize product for webhook. product_id=%s event=%s",
+                getattr(product, "id", None),
+                event,
+                exc_info=True,
+            )
+            return
+
+    send_product_webhook_data(data, event, retries=retries, timeout=timeout, backoff=backoff)

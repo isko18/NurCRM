@@ -13,6 +13,7 @@ from django.core.files.base import ContentFile
 from PIL import Image
 from django.db.models.functions import Cast
 import io
+import logging
 
 from apps.users.models import Company, User, Branch
 from apps.consalting.models import ServicesConsalting
@@ -3002,6 +3003,26 @@ class ReturnFromAgent(models.Model):
             raise ValidationError({"qty": f"Можно принять максимум {locked_sub.qty_on_agent}."})
         product = locked_sub.product
         type(product).objects.select_for_update().filter(pk=product.pk).update(quantity=F("quantity") + self.qty)
+        prod_model = type(product)
+        prod_id = product.pk
+
+        def _send_webhook():
+            from apps.main.services.webhooks import send_product_webhook
+
+            try:
+                prod = prod_model.objects.get(pk=prod_id)
+                send_product_webhook(prod, "product.updated")
+            except Exception:
+                logging.getLogger("crm.webhooks").error(
+                    "Failed to send product.updated webhook after return accept. product_id=%s",
+                    prod_id,
+                    exc_info=True,
+                )
+
+        try:
+            transaction.on_commit(_send_webhook)
+        except Exception:
+            _send_webhook()
         ManufactureSubreal.objects.filter(pk=locked_sub.pk).update(qty_returned=F("qty_returned") + self.qty)
         self.status = self.Status.ACCEPTED
         self.accepted_by = by_user
@@ -3181,6 +3202,27 @@ class AgentRequestCart(models.Model):
 
             # списываем со склада
             locked_qs.update(quantity=F("quantity") - need_qty)
+
+            prod_model = type(prod)
+            prod_id = prod.pk
+
+            def _send_webhook():
+                from apps.main.services.webhooks import send_product_webhook
+
+                try:
+                    p = prod_model.objects.get(pk=prod_id)
+                    send_product_webhook(p, "product.updated")
+                except Exception:
+                    logging.getLogger("crm.webhooks").error(
+                        "Failed to send product.updated webhook after agent request approve. product_id=%s",
+                        prod_id,
+                        exc_info=True,
+                    )
+
+            try:
+                transaction.on_commit(_send_webhook)
+            except Exception:
+                _send_webhook()
 
             # создаём передачу агенту
             sub = ManufactureSubreal.objects.create(

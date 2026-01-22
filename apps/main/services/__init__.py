@@ -6,6 +6,8 @@ from django.db import transaction
 from django.utils import timezone
 from django.utils.dateparse import parse_date, parse_datetime
 
+import logging
+
 from apps.main.models import Cart, CartItem, Sale, SaleItem, Product
 
 
@@ -86,6 +88,26 @@ def checkout_cart(cart: Cart, department=None) -> Sale:
         changed.append(p)
     if changed:
         Product.objects.bulk_update(changed, ["quantity"])
+        changed_ids = [p.id for p in changed if getattr(p, "id", None)]
+
+        def _send_webhooks():
+            from apps.main.services.webhooks import send_product_webhook
+
+            for pid in changed_ids:
+                try:
+                    prod = Product.objects.get(pk=pid)
+                    send_product_webhook(prod, "product.updated")
+                except Exception:
+                    logging.getLogger("crm.webhooks").error(
+                        "Failed to send product.updated webhook after checkout. product_id=%s",
+                        pid,
+                        exc_info=True,
+                    )
+
+        try:
+            transaction.on_commit(_send_webhooks)
+        except Exception:
+            _send_webhooks()
 
     CartItem.objects.filter(cart=cart).delete()
     cart.status = Cart.Status.CHECKED_OUT
