@@ -2,7 +2,7 @@ from rest_framework import serializers
 from django.db import transaction
 from django.utils import timezone
 from django.db.models import Q
-from decimal import Decimal, ROUND_HALF_UP
+from decimal import Decimal, ROUND_HALF_UP, InvalidOperation
 from typing import Any, Dict
 from datetime import date as _date, datetime as _datetime
 from django.utils import timezone as dj_tz
@@ -788,6 +788,65 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
             return Decimal("0.00")
         mp = (price / purchase_price - Decimal("1")) * Decimal("100")
         return mp.quantize(cls._Q2, rounding=ROUND_HALF_UP)
+
+    # ====== SAFE DECIMAL OUTPUT ======
+    @staticmethod
+    def _safe_decimal(val, quant: Decimal):
+        """
+        Возвращает декремент для сериализации или None, если значение некорректное
+        (NaN/inf/строка/пусто). Делает quantize с указанной точностью.
+        """
+        if val in (None, "", "null"):
+            return None
+        try:
+            dec = Decimal(val)
+            if not dec.is_finite():
+                return None
+            return dec.quantize(quant, rounding=ROUND_HALF_UP)
+        except (InvalidOperation, ValueError, TypeError):
+            return None
+
+    def _sanitize_decimal_fields(self, instance):
+        """Чистим потенциально битые Decimal, чтобы DRF не падал на quantize()."""
+        for field, quant in (
+            ("purchase_price", self._Q2),
+            ("markup_percent", self._Q2),
+            ("price", self._Q2),
+            ("discount_percent", self._Q2),
+        ):
+            safe = self._safe_decimal(getattr(instance, field, None), quant)
+            setattr(instance, field, safe)
+
+        # характеристики товара (OneToOne)
+        chars = getattr(instance, "characteristics", None)
+        if chars:
+            for field, quant in (
+                ("height_cm", Decimal("0.01")),
+                ("width_cm", Decimal("0.01")),
+                ("depth_cm", Decimal("0.01")),
+                ("factual_weight_kg", Decimal("0.001")),
+            ):
+                safe = self._safe_decimal(getattr(chars, field, None), quant)
+                setattr(chars, field, safe)
+
+        # пакеты (prefetch_related уже есть, будет без доп. запросов)
+        try:
+            packages = list(instance.packages.all())
+        except Exception:
+            packages = []
+        for pkg in packages:
+            safe = self._safe_decimal(getattr(pkg, "quantity_in_package", None), Decimal("0.001"))
+            setattr(pkg, "quantity_in_package", safe)
+
+    def to_representation(self, instance):
+        # чистим проблемные Decimal перед сериализацией, чтобы избежать InvalidOperation
+        self._sanitize_decimal_fields(instance)
+        try:
+            return super().to_representation(instance)
+        except InvalidOperation:
+            # на всякий случай повторно чистим и сериализуем
+            self._sanitize_decimal_fields(instance)
+            return super().to_representation(instance)
 
     # ==== CREATE / UPDATE ====
 

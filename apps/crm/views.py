@@ -828,3 +828,204 @@ class MetaWebhookView(APIView):
             # Всё равно возвращаем 200, чтобы Meta не ретраила
         
         return Response({'status': 'ok'})
+
+
+class MetaOAuthCallbackView(APIView):
+    """
+    OAuth callback endpoint для Meta.
+    
+    URL: /api/crm/oauth/meta/callback/
+    
+    Этот URL нужно добавить в настройках приложения Meta:
+    Settings → Basic → Valid OAuth Redirect URIs
+    
+    Пример: https://your-domain.com/api/crm/oauth/meta/callback/
+    
+    После авторизации Meta перенаправит пользователя сюда с параметрами:
+    - code: Authorization code для обмена на access_token
+    - state: Состояние (используется для CSRF защиты)
+    """
+    permission_classes = [permissions.AllowAny]
+    
+    def get(self, request):
+        """
+        Обработка OAuth callback от Meta.
+        
+        Query params:
+        - code: Authorization code
+        - state: State parameter (содержит company_id или другие данные)
+        - error: Error code (если пользователь отказал в доступе)
+        - error_reason: Причина ошибки
+        - error_description: Описание ошибки
+        """
+        # Проверяем на ошибки
+        error = request.GET.get('error')
+        if error:
+            error_reason = request.GET.get('error_reason', '')
+            error_description = request.GET.get('error_description', '')
+            logger.warning(f"Meta OAuth error: {error} - {error_reason}: {error_description}")
+            
+            # Редирект на фронтенд с ошибкой
+            frontend_url = request.GET.get('redirect_uri', '/crm/settings/integrations')
+            return HttpResponse(
+                f'<html><body>'
+                f'<h1>Ошибка авторизации Meta</h1>'
+                f'<p>{error_description or error_reason or error}</p>'
+                f'<p><a href="{frontend_url}">Вернуться в настройки</a></p>'
+                f'</body></html>',
+                content_type='text/html'
+            )
+        
+        code = request.GET.get('code')
+        state = request.GET.get('state', '')
+        
+        if not code:
+            return HttpResponse(
+                '<html><body>'
+                '<h1>Ошибка</h1>'
+                '<p>Не получен authorization code от Meta</p>'
+                '</body></html>',
+                content_type='text/html',
+                status=400
+            )
+        
+        # State может содержать JSON с company_id и redirect_uri
+        import urllib.parse
+        try:
+            state_data = json.loads(urllib.parse.unquote(state)) if state else {}
+        except (json.JSONDecodeError, ValueError):
+            state_data = {'raw': state}
+        
+        company_id = state_data.get('company_id')
+        redirect_uri = state_data.get('redirect_uri', '/crm/settings/integrations')
+        
+        logger.info(f"Meta OAuth callback received. Code: {code[:20]}..., State: {state_data}")
+        
+        # Здесь нужно обменять code на access_token
+        # Это делается на фронтенде или в отдельном API endpoint,
+        # так как требуется app_secret
+        
+        # Возвращаем HTML страницу, которая передаст code на фронтенд
+        return HttpResponse(
+            f'''<!DOCTYPE html>
+<html>
+<head>
+    <title>Meta Authorization</title>
+    <script>
+        // Передаем данные в родительское окно (если это popup)
+        if (window.opener) {{
+            window.opener.postMessage({{
+                type: 'META_OAUTH_CALLBACK',
+                code: '{code}',
+                state: {json.dumps(state_data)}
+            }}, '*');
+            window.close();
+        }} else {{
+            // Или редиректим с параметрами
+            const redirectUrl = new URL('{redirect_uri}', window.location.origin);
+            redirectUrl.searchParams.set('meta_code', '{code}');
+            redirectUrl.searchParams.set('meta_state', '{state}');
+            window.location.href = redirectUrl.toString();
+        }}
+    </script>
+</head>
+<body>
+    <h1>Авторизация успешна</h1>
+    <p>Перенаправление...</p>
+    <noscript>
+        <p>JavaScript отключен. <a href="{redirect_uri}?meta_code={code}">Нажмите здесь</a> для продолжения.</p>
+    </noscript>
+</body>
+</html>''',
+            content_type='text/html'
+        )
+
+
+class MetaOAuthExchangeView(APIView):
+    """
+    Обмен authorization code на access_token.
+    
+    POST /api/crm/oauth/meta/exchange/
+    
+    Body:
+    {
+        "code": "authorization_code_from_callback",
+        "app_id": "your_meta_app_id",
+        "app_secret": "your_meta_app_secret",
+        "redirect_uri": "https://your-domain.com/api/crm/oauth/meta/callback/"
+    }
+    """
+    permission_classes = [permissions.IsAuthenticated]
+    
+    def post(self, request):
+        """Обменивает authorization code на access_token."""
+        code = request.data.get('code')
+        app_id = request.data.get('app_id')
+        app_secret = request.data.get('app_secret')
+        redirect_uri = request.data.get('redirect_uri')
+        
+        if not all([code, app_id, app_secret, redirect_uri]):
+            return Response(
+                {'error': 'Missing required parameters: code, app_id, app_secret, redirect_uri'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        import requests as http_requests
+        
+        try:
+            # Обмен code на short-lived token
+            response = http_requests.get(
+                'https://graph.facebook.com/v18.0/oauth/access_token',
+                params={
+                    'client_id': app_id,
+                    'client_secret': app_secret,
+                    'redirect_uri': redirect_uri,
+                    'code': code
+                },
+                timeout=30
+            )
+            
+            data = response.json()
+            
+            if 'error' in data:
+                return Response(
+                    {'error': data['error'].get('message', 'Unknown error')},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+            
+            short_lived_token = data.get('access_token')
+            
+            # Обмен short-lived token на long-lived token
+            response = http_requests.get(
+                'https://graph.facebook.com/v18.0/oauth/access_token',
+                params={
+                    'grant_type': 'fb_exchange_token',
+                    'client_id': app_id,
+                    'client_secret': app_secret,
+                    'fb_exchange_token': short_lived_token
+                },
+                timeout=30
+            )
+            
+            data = response.json()
+            
+            if 'error' in data:
+                # Возвращаем short-lived token если не удалось получить long-lived
+                return Response({
+                    'access_token': short_lived_token,
+                    'token_type': 'short_lived',
+                    'warning': 'Could not exchange for long-lived token'
+                })
+            
+            return Response({
+                'access_token': data.get('access_token'),
+                'token_type': data.get('token_type', 'bearer'),
+                'expires_in': data.get('expires_in')  # ~60 дней для long-lived
+            })
+            
+        except http_requests.exceptions.RequestException as e:
+            logger.exception(f"Meta OAuth exchange error: {e}")
+            return Response(
+                {'error': str(e)},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
