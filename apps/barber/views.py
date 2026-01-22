@@ -338,7 +338,7 @@ class AppointmentListCreateView(CompanyQuerysetMixin, generics.ListCreateAPIView
     queryset = (
         Appointment.objects
         .select_related("client", "barber")
-        .prefetch_related("services")
+        .prefetch_related(Prefetch("services", queryset=Service.objects.select_related("category")))
         .all()
     )
     serializer_class = AppointmentSerializer
@@ -363,7 +363,7 @@ class AppointmentRetrieveUpdateDestroyView(
     queryset = (
         Appointment.objects
         .select_related("client", "barber")
-        .prefetch_related("services")
+        .prefetch_related(Prefetch("services", queryset=Service.objects.select_related("category")))
         .all()
     )
     serializer_class = AppointmentSerializer

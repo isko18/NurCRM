@@ -271,12 +271,40 @@ class ClientSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
 # ===========================
 # Appointment
 # ===========================
+class AppointmentPublicServiceSerializer(serializers.ModelSerializer):
+    """Упрощённый вывод услуг для списка/деталей записей."""
+
+    category_name = serializers.CharField(source="category.name", read_only=True)
+
+    class Meta:
+        model = Service
+        fields = ["id", "name", "time", "price", "category", "category_name"]
+
+
+class AppointmentPublicMasterSerializer(serializers.Serializer):
+    """Упрощённый вывод мастера для списка/деталей записей."""
+
+    id = serializers.UUIDField()
+    first_name = serializers.CharField(allow_null=True, required=False, allow_blank=True)
+    last_name = serializers.CharField(allow_null=True, required=False, allow_blank=True)
+    full_name = serializers.SerializerMethodField()
+    avatar = serializers.URLField(allow_null=True, required=False)
+    phone_number = serializers.CharField(allow_null=True, required=False, allow_blank=True)
+
+    def get_full_name(self, obj):
+        first = getattr(obj, "first_name", None) or ""
+        last = getattr(obj, "last_name", None) or ""
+        full = f"{first} {last}".strip()
+        return full or getattr(obj, "email", "")
+
+
 class AppointmentSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
     company = serializers.ReadOnlyField(source="company.id")
     branch = serializers.ReadOnlyField(source="branch.id")
 
     client_name = serializers.CharField(source="client.full_name", read_only=True)
     barber_name = serializers.SerializerMethodField()
+    barber_public = AppointmentPublicMasterSerializer(source="barber", read_only=True)
     services = serializers.PrimaryKeyRelatedField(
         queryset=Service.objects.all(),
         many=True,
@@ -287,14 +315,15 @@ class AppointmentSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSeriali
         read_only=True,
         slug_field='name',
     )
+    services_public = AppointmentPublicServiceSerializer(source="services", many=True, read_only=True)
 
     class Meta:
         model = Appointment
         fields = [
             "id", "company", "branch",
             "client", "client_name",
-            "barber", "barber_name",
-            "services", "services_names",
+            "barber", "barber_name", "barber_public",
+            "services", "services_names", "services_public",
             "start_at", "end_at",
             "price", "discount",        # 👈 новые поля
             "status", "comment",
