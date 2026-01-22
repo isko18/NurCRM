@@ -39,6 +39,24 @@ class Command(BaseCommand):
             help="Webhook event name to send (default: product.updated).",
         )
         parser.add_argument(
+            "--timeout",
+            type=float,
+            default=30.0,
+            help="HTTP timeout seconds per request (default: 30).",
+        )
+        parser.add_argument(
+            "--retries",
+            type=int,
+            default=3,
+            help="Retries per product (default: 3).",
+        )
+        parser.add_argument(
+            "--backoff",
+            type=float,
+            default=1.5,
+            help="Backoff base for retries (default: 1.5).",
+        )
+        parser.add_argument(
             "--sleep",
             type=float,
             default=0.0,
@@ -63,6 +81,9 @@ class Command(BaseCommand):
         codes_raw = (options.get("codes") or "").strip()
 
         event = str(options["event"] or "product.updated")
+        timeout_s = float(options.get("timeout") or 30.0)
+        retries = int(options.get("retries") or 3)
+        backoff = float(options.get("backoff") or 1.5)
         sleep_s = float(options["sleep"] or 0.0)
         limit = int(options["limit"] or 0)
         updated_since_raw = (options.get("updated_since") or "").strip()
@@ -121,7 +142,13 @@ class Command(BaseCommand):
         started = time.time()
 
         for product in qs.iterator(chunk_size=200):
-            send_product_webhook(product, event)
+            send_product_webhook(
+                product,
+                event,
+                retries=retries,
+                timeout=timeout_s,
+                backoff=backoff,
+            )
             total += 1
 
             if sleep_s > 0:
