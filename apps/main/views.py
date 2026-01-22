@@ -10,6 +10,7 @@ from typing import List, Optional, Dict, Any
 from operator import attrgetter
 from datetime import datetime, date as _date
 from django.db.models.functions import Coalesce
+import logging
 
 from rest_framework import generics, permissions, filters, status
 from rest_framework.permissions import IsAuthenticated
@@ -2111,6 +2112,26 @@ class ManufactureSubrealListCreateAPIView(CompanyBranchRestrictedMixin, generics
         # минусуем склад (в той же транзакции)
         if qty and locked_qs is not None:
             locked_qs.update(quantity=F("quantity") - qty)
+            prod_model = type(product)
+            prod_id = product.pk
+
+            def _send_webhook():
+                from apps.main.services.webhooks import send_product_webhook
+
+                try:
+                    p = prod_model.objects.get(pk=prod_id)
+                    send_product_webhook(p, "product.updated")
+                except Exception:
+                    logging.getLogger("crm.webhooks").error(
+                        "Failed to send product.updated webhook after subreal create. product_id=%s",
+                        prod_id,
+                        exc_info=True,
+                    )
+
+            try:
+                transaction.on_commit(_send_webhook)
+            except Exception:
+                _send_webhook()
 
         # идемпотентный авто-приём, если is_sawmill=True
         if is_sawmill:
@@ -2383,6 +2404,26 @@ class ManufactureSubrealBulkCreateAPIView(APIView, CompanyBranchRestrictedMixin)
 
             # списываем со склада
             locked_qs.update(quantity=F("quantity") - qty)
+            prod_model = type(product)
+            prod_id = product.pk
+
+            def _send_webhook():
+                from apps.main.services.webhooks import send_product_webhook
+
+                try:
+                    p = prod_model.objects.get(pk=prod_id)
+                    send_product_webhook(p, "product.updated")
+                except Exception:
+                    logging.getLogger("crm.webhooks").error(
+                        "Failed to send product.updated webhook after subreal bulk create. product_id=%s",
+                        prod_id,
+                        exc_info=True,
+                    )
+
+            try:
+                transaction.on_commit(_send_webhook)
+            except Exception:
+                _send_webhook()
 
             sub = ManufactureSubreal.objects.create(
                 company=company,
