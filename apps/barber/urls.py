@@ -11,7 +11,9 @@ urlpatterns = [
 
     path('appointments/', views.AppointmentListCreateView.as_view(), name='appointment-list'),
     path('appointments/<uuid:pk>/', views.AppointmentRetrieveUpdateDestroyView.as_view(), name='appointment-detail'),
-    
+    path('appointments/my/', views.MyAppointmentListView.as_view(), name='my-appointment-list'),
+    path('appointments/my/<uuid:pk>/', views.MyAppointmentDetailView.as_view(), name='my-appointment-detail'),
+     
     path('folders/', views.FolderListCreateView.as_view(), name='folder-list'),
     path('folders/<uuid:pk>/', views.FolderRetrieveUpdateDestroyView.as_view(), name='folder-detail'),
     path('documents/', views.DocumentListCreateView.as_view(), name='document-list'),
