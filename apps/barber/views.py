@@ -370,6 +370,56 @@ class AppointmentRetrieveUpdateDestroyView(
     permission_classes = [permissions.IsAuthenticated]
 
 
+class MyAppointmentListView(CompanyQuerysetMixin, generics.ListAPIView):
+    """
+    Эндпоинт "мои записи" — возвращает только записи, где текущий пользователь = barber.
+    """
+
+    queryset = (
+        Appointment.objects
+        .select_related("client", "barber")
+        .prefetch_related(Prefetch("services", queryset=Service.objects.select_related("category")))
+        .all()
+    )
+    serializer_class = AppointmentSerializer
+    permission_classes = [permissions.IsAuthenticated]
+    filter_backends = [DjangoFilterBackend, SearchFilter, OrderingFilter]
+    filterset_fields = [
+        f.name for f in Appointment._meta.get_fields() if not f.is_relation or f.many_to_one
+    ]
+    search_fields = [
+        "client__full_name",
+        "comment",
+    ]
+    ordering_fields = ["start_at", "end_at", "status", "created_at"]
+    ordering = ["-start_at"]
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        user = getattr(self.request, "user", None)
+        return qs.filter(barber=user)
+
+
+class MyAppointmentDetailView(CompanyQuerysetMixin, generics.RetrieveAPIView):
+    """
+    Эндпоинт "моя запись" — детальный просмотр только своих записей.
+    """
+
+    queryset = (
+        Appointment.objects
+        .select_related("client", "barber")
+        .prefetch_related(Prefetch("services", queryset=Service.objects.select_related("category")))
+        .all()
+    )
+    serializer_class = AppointmentSerializer
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        user = getattr(self.request, "user", None)
+        return qs.filter(barber=user)
+
+
 # ==== Folder ====
 class FolderListCreateView(CompanyQuerysetMixin, generics.ListCreateAPIView):
     queryset = Folder.objects.select_related("parent").all()
