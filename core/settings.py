@@ -46,7 +46,7 @@ INSTALLED_APPS = [
     'rest_framework',
     'django_filters',
     
-    'apps.main',
+    'apps.main.apps.MainConfig',
     'apps.users',
     'apps.construction',
     'apps.booking',
@@ -366,5 +366,5 @@ LOGGING = {
 
 INSTAGRAM_POLL_SECONDS = 0.1
 
-SITE_WEBHOOK_URL = "https://ak-kagaz.webtm.ru/integrations/crm/products/"
+SITE_WEBHOOK_URL = "https://ak-kagaz.webtm.ru/api/catalog/integrations/crm/products/"
 SITE_WEBHOOK_SECRET = "supersecret"
