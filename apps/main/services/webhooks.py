@@ -58,10 +58,9 @@ def send_product_webhook(product, event: str, *, retries: int = 3, timeout: int 
         "X-CRM-Signature": _build_signature(secret, body),
     }
 
-    req = urllib.request.Request(url=url, data=body, headers=headers, method="POST")
-
     for attempt in range(retries):
         try:
+            req = urllib.request.Request(url=url, data=body, headers=headers, method="POST")
             with urllib.request.urlopen(req, timeout=timeout) as resp:
                 status = getattr(resp, "status", None) or 0
                 if 200 <= int(status) < 300:
@@ -79,4 +78,3 @@ def send_product_webhook(product, event: str, *, retries: int = 3, timeout: int 
             )
             if attempt + 1 < retries:
                 time.sleep(backoff ** attempt)
-
