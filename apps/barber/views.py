@@ -3,9 +3,12 @@ from rest_framework.response import Response
 from rest_framework.parsers import MultiPartParser, FormParser
 from rest_framework.exceptions import PermissionDenied, ValidationError
 from rest_framework.filters import SearchFilter, OrderingFilter
+from django.utils import timezone
+from django.utils.dateparse import parse_date
+from decimal import Decimal
 from django.db.models.deletion import ProtectedError
 from django.db import IntegrityError, models
-from django.db.models import Q, Prefetch
+from django.db.models import Q, Prefetch, Count, Sum, Avg, F, Value, DecimalField, ExpressionWrapper
 
 from django_filters import rest_framework as filters
 from django_filters.rest_framework import DjangoFilterBackend
@@ -30,7 +33,8 @@ from .serializers import (
     PublicServiceCategorySerializer,
     PublicMasterSerializer,
     PublicMasterScheduleSerializer,
-    PublicMasterAvailabilitySerializer
+    PublicMasterAvailabilitySerializer,
+    BarberAnalyticsResponseSerializer
 )
 
 
@@ -440,6 +444,172 @@ class FolderRetrieveUpdateDestroyView(
     queryset = Folder.objects.select_related("parent").all()
     serializer_class = FolderSerializer
     permission_classes = [permissions.IsAuthenticated]
+
+
+def _analytics_date_range(request):
+    """
+    date_from/date_to в формате YYYY-MM-DD.
+    По умолчанию: текущий месяц (с 1-го числа по сегодня).
+    """
+    today = timezone.localdate()
+
+    raw_from = request.query_params.get("date_from") if hasattr(request, "query_params") else request.GET.get("date_from")
+    raw_to = request.query_params.get("date_to") if hasattr(request, "query_params") else request.GET.get("date_to")
+
+    date_from = parse_date(raw_from) if raw_from else today.replace(day=1)
+    date_to = parse_date(raw_to) if raw_to else today
+
+    if not date_from:
+        raise ValidationError({"date_from": "Неверный формат даты. Используйте YYYY-MM-DD."})
+    if not date_to:
+        raise ValidationError({"date_to": "Неверный формат даты. Используйте YYYY-MM-DD."})
+    if date_to < date_from:
+        raise ValidationError({"date_to": "date_to должен быть >= date_from."})
+
+    return date_from, date_to
+
+
+def _can_view_barber_analytics(user) -> bool:
+    if not user or not getattr(user, "is_authenticated", False):
+        return False
+    if getattr(user, "is_superuser", False):
+        return True
+    role = str(getattr(user, "role", "") or "").strip().lower()
+    if role in {"admin", "owner"}:
+        return True
+    return bool(getattr(user, "can_view_barber_history", False) or getattr(user, "can_view_barber_records", False))
+
+
+def _build_barber_analytics(base_qs, date_from, date_to, include_masters: bool):
+    """
+    base_qs уже должен быть скоупнут по company/branch.
+    """
+    qs = base_qs.filter(start_at__date__gte=date_from, start_at__date__lte=date_to)
+
+    effective_price = ExpressionWrapper(
+        F("price") * (Value(Decimal("1")) - (F("discount") / Value(Decimal("100")))),
+        output_field=DecimalField(max_digits=14, decimal_places=6),
+    )
+
+    totals = qs.aggregate(
+        appointments_total=Count("id"),
+        appointments_completed=Count("id", filter=Q(status=Appointment.Status.COMPLETED)),
+        appointments_canceled=Count("id", filter=Q(status=Appointment.Status.CANCELED)),
+        appointments_no_show=Count("id", filter=Q(status=Appointment.Status.NO_SHOW)),
+        revenue=Sum(effective_price, filter=Q(status=Appointment.Status.COMPLETED)),
+        avg_ticket=Avg(effective_price, filter=Q(status=Appointment.Status.COMPLETED)),
+    )
+
+    totals["revenue"] = totals["revenue"] or 0
+
+    services_rows = (
+        Service.objects
+        .filter(appointments__in=qs.filter(status=Appointment.Status.COMPLETED))
+        .values("id", "name")
+        .annotate(
+            count=Count("appointments", distinct=True),
+            revenue=Sum("price"),
+        )
+        .order_by("-revenue", "-count", "name")
+    )
+
+    masters_rows = []
+    if include_masters:
+        masters_rows = list(
+            qs.filter(status=Appointment.Status.COMPLETED)
+            .values("barber_id", "barber__first_name", "barber__last_name", "barber__email")
+            .annotate(
+                count=Count("id"),
+                revenue=Sum(effective_price),
+            )
+            .order_by("-revenue", "-count")
+        )
+        for r in masters_rows:
+            first = r.pop("barber__first_name") or ""
+            last = r.pop("barber__last_name") or ""
+            email = r.pop("barber__email") or ""
+            full = f"{first} {last}".strip()
+            r["master_id"] = r.pop("barber_id")
+            r["master_name"] = full or email
+            r["revenue"] = r["revenue"] or 0
+
+    data = {
+        "date_from": date_from,
+        "date_to": date_to,
+        "totals": {
+            "appointments_total": totals["appointments_total"] or 0,
+            "appointments_completed": totals["appointments_completed"] or 0,
+            "appointments_canceled": totals["appointments_canceled"] or 0,
+            "appointments_no_show": totals["appointments_no_show"] or 0,
+            "revenue": totals["revenue"],
+            "avg_ticket": totals["avg_ticket"],
+        },
+        "services": [
+            {
+                "service_id": r["id"],
+                "name": r["name"],
+                "count": r["count"] or 0,
+                "revenue": r["revenue"] or 0,
+            }
+            for r in services_rows
+        ],
+    }
+    if include_masters:
+        data["masters"] = masters_rows
+    return data
+
+
+class BarberAnalyticsView(CompanyQuerysetMixin, generics.GenericAPIView):
+    """
+    Общая аналитика по барбершопу (по компании/филиалу).
+
+    Query params:
+      - date_from: YYYY-MM-DD (опционально)
+      - date_to: YYYY-MM-DD (опционально)
+      - branch: UUID (опционально, учитывается CompanyQuerysetMixin)
+    """
+
+    queryset = (
+        Appointment.objects
+        .select_related("barber", "client")
+        .prefetch_related("services")
+        .all()
+    )
+    serializer_class = BarberAnalyticsResponseSerializer
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request, *args, **kwargs):
+        if not _can_view_barber_analytics(getattr(request, "user", None)):
+            raise PermissionDenied("Нет доступа к аналитике барбершопа.")
+        date_from, date_to = _analytics_date_range(request)
+        data = _build_barber_analytics(self.get_queryset(), date_from, date_to, include_masters=True)
+        return Response(self.serializer_class(data).data)
+
+
+class MyBarberAnalyticsView(CompanyQuerysetMixin, generics.GenericAPIView):
+    """
+    Аналитика мастера (только по своим записям).
+
+    Query params:
+      - date_from: YYYY-MM-DD (опционально)
+      - date_to: YYYY-MM-DD (опционально)
+      - branch: UUID (опционально, учитывается CompanyQuerysetMixin)
+    """
+
+    queryset = (
+        Appointment.objects
+        .select_related("barber", "client")
+        .prefetch_related("services")
+        .all()
+    )
+    serializer_class = BarberAnalyticsResponseSerializer
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request, *args, **kwargs):
+        date_from, date_to = _analytics_date_range(request)
+        user = getattr(request, "user", None)
+        data = _build_barber_analytics(self.get_queryset().filter(barber=user), date_from, date_to, include_masters=False)
+        return Response(self.serializer_class(data).data)
 
 
 # ==== Document ====

@@ -1,34 +1,34 @@
-# # apps/main/signals.py
+from __future__ import annotations
 
-# from django.db.models.signals import post_save
-# from django.dispatch import receiver
-# from apps.main.models import Task, Product
-# from apps.construction.models import Department, Cashbox, CashFlow
-# from apps.main.tasks import create_task_notification
+import logging
 
-# @receiver(post_save, sender=Task)
-# def notify_assigned_user_async(sender, instance, created, **kwargs):
-#     if created and instance.assigned_to:
-#         create_task_notification.delay(str(instance.id))
-        
-        
-# @receiver(post_save, sender=Product)
-# def create_expense_on_purchase(sender, instance: Product, created, **kwargs):
-#     """
-#     Создаём расход по закупке товара.
-#     Только при создании или увеличении количества.
-#     """
-#     if created and instance.purchase_price > 0 and instance.quantity > 0:
-#         # находим отдел компании (например, первый)
-#         dept = Department.objects.filter(company=instance.company).first()
-#         if not dept:
-#             return
-#         cashbox, _ = Cashbox.objects.get_or_create(department=dept)
+from django.db import transaction
+from django.db.models.signals import post_save
+from django.dispatch import receiver
 
-#         # создаём расход
-#         CashFlow.objects.create(
-#             cashbox=cashbox,
-#             type="expense",
-#             name=f"Закупка товара: {instance.name}",
-#             amount=instance.purchase_price * instance.quantity,
-#         )
+from apps.main.models import Product
+
+logger = logging.getLogger("crm.webhooks")
+
+
+@receiver(post_save, sender=Product)
+def product_webhook_on_save(sender, instance: Product, created: bool, **kwargs):
+    event = "product.created" if created else "product.updated"
+
+    def _send():
+        try:
+            from apps.main.services.webhooks import send_product_webhook
+
+            send_product_webhook(instance, event)
+        except Exception:
+            logger.error(
+                "Unexpected error while preparing/sending product webhook. product_id=%s event=%s",
+                getattr(instance, "id", None),
+                event,
+                exc_info=True,
+            )
+
+    try:
+        transaction.on_commit(_send)
+    except Exception:
+        _send()
