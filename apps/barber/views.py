@@ -767,37 +767,41 @@ class PublicMastersListView(generics.ListAPIView):
     
     def get_queryset(self):
         from apps.users.models import User
-        
+         
         company = self.get_company()
-        
+         
         # Получаем ID пользователей, у которых есть записи как мастер
         masters_with_appointments = Appointment.objects.filter(
             company=company
         ).values_list('barber_id', flat=True).distinct()
-        
-        # Получаем сотрудников компании, которые являются мастерами по любому критерию:
-        # 1. Есть записи как мастер (barber)
-        # 2. Установлен флаг can_view_barber_records
-        # 3. Роль = barber или master
+         
+        # Получаем сотрудников компании, которые считаются мастерами по любому критерию:
+        # 1) Есть записи как мастер (barber)
+        # 2) У сотрудника есть доступ к модулям барбершопа (обычно ставится мастерам/админу)
+        # 3) Кастомная роль / роль в филиале указывает на мастера
         qs = User.objects.filter(
             company=company,
             is_active=True
         ).filter(
             Q(id__in=masters_with_appointments) |
             Q(can_view_barber_records=True) |
-            Q(role__in=['barber', 'master'])
+            Q(can_view_barber_services=True) |
+            Q(can_view_barber_clients=True) |
+            Q(can_view_barber_history=True) |
+            Q(custom_role__name__in=["barber", "master", "Барбер", "Мастер", "барбер", "мастер"]) |
+            Q(branch_memberships__role__in=["barber", "master", "Барбер", "Мастер", "барбер", "мастер"])
         ).distinct().order_by('first_name', 'last_name')
-        
+         
         # Фильтрация по филиалу (если указан)
         branch_id = self.request.query_params.get('branch')
         if branch_id:
             try:
                 branch = Branch.objects.get(id=branch_id, company=company)
-                # Показываем мастеров, привязанных к филиалу
-                qs = qs.filter(branches=branch)
+                # Показываем мастеров, привязанных к филиалу + "глобальных" (без филиалов)
+                qs = qs.filter(Q(branches=branch) | Q(branches__isnull=True)).distinct()
             except (Branch.DoesNotExist, ValueError):
                 pass
-        
+         
         return qs
 
 
@@ -926,15 +930,19 @@ class PublicMastersAvailabilityView(generics.GenericAPIView):
         ).filter(
             Q(id__in=masters_with_appointments) |
             Q(can_view_barber_records=True) |
-            Q(role__in=['barber', 'master'])
+            Q(can_view_barber_services=True) |
+            Q(can_view_barber_clients=True) |
+            Q(can_view_barber_history=True) |
+            Q(custom_role__name__in=["barber", "master", "Барбер", "Мастер", "барбер", "мастер"]) |
+            Q(branch_memberships__role__in=["barber", "master", "Барбер", "Мастер", "барбер", "мастер"])
         ).distinct()
-        
+         
         # Фильтрация по филиалу
         branch_id = request.query_params.get('branch')
         if branch_id:
             try:
                 branch = Branch.objects.get(id=branch_id, company=company)
-                masters_qs = masters_qs.filter(branches=branch)
+                masters_qs = masters_qs.filter(Q(branches=branch) | Q(branches__isnull=True)).distinct()
             except (Branch.DoesNotExist, ValueError):
                 pass
         
