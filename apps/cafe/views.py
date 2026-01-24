@@ -450,6 +450,24 @@ class MenuItemListCreateView(CompanyBranchQuerysetMixin, generics.ListCreateAPIV
     search_fields = ["title", "category__title"]
     ordering_fields = ["title", "price", "is_active", "id"]
 
+    def get_queryset(self):
+        """
+        Для меню обычно нужно видеть и "глобальные" позиции (branch=NULL),
+        даже когда выбран конкретный филиал (?branch=...).
+        """
+        qs = self.queryset.all()
+        company = self._user_company()
+        if not company:
+            return qs.none()
+
+        qs = qs.filter(company=company)
+
+        active_branch = self._active_branch()
+        if active_branch is not None:
+            qs = qs.filter(Q(branch=active_branch) | Q(branch__isnull=True))
+
+        return qs
+
 
 class MenuItemRetrieveUpdateDestroyView(CompanyBranchQuerysetMixin, generics.RetrieveUpdateDestroyAPIView):
     queryset = (
@@ -1141,6 +1159,24 @@ class KitchenListCreateView(CompanyBranchQuerysetMixin, generics.ListCreateAPIVi
     filterset_fields = ["title", "number"]
     search_fields = ["title"]
     ordering_fields = ["number", "title", "id"]
+
+    def get_queryset(self):
+        """
+        Аналогично menu-items: при выбранном филиале показываем и кухни компании
+        без филиала (branch=NULL), чтобы их можно было использовать во всех филиалах.
+        """
+        qs = self.queryset.all()
+        company = self._user_company()
+        if not company:
+            return qs.none()
+
+        qs = qs.filter(company=company)
+
+        active_branch = self._active_branch()
+        if active_branch is not None:
+            qs = qs.filter(Q(branch=active_branch) | Q(branch__isnull=True))
+
+        return qs
 
 
 class KitchenRetrieveUpdateDestroyView(CompanyBranchQuerysetMixin, generics.RetrieveUpdateDestroyAPIView):
