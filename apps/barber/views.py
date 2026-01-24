@@ -51,6 +51,21 @@ class DocumentFilter(filters.FilterSet):
         fields = ["name", "folder", "file_name", "created_at", "updated_at"]
 
 
+# ---- Appointment / visits history filters ----
+class _CharInFilter(filters.BaseInFilter, filters.CharFilter):
+    """Поддержка query param вида: ?status__in=completed,canceled,no_show"""
+
+
+class ClientVisitHistoryFilter(filters.FilterSet):
+    status__in = _CharInFilter(field_name="status", lookup_expr="in")
+    start_at_from = filters.DateTimeFilter(field_name="start_at", lookup_expr="gte")
+    start_at_to = filters.DateTimeFilter(field_name="start_at", lookup_expr="lte")
+
+    class Meta:
+        model = Appointment
+        fields = ["status", "barber", "start_at"]
+
+
 # ==== Company + Branch scoped mixin ====
 class CompanyQuerysetMixin:
     """
@@ -335,6 +350,55 @@ class ClientRetrieveUpdateDestroyView(
                 },
                 status=status.HTTP_409_CONFLICT,
             )
+
+
+class ClientVisitHistoryListView(CompanyQuerysetMixin, generics.ListAPIView):
+    """
+    История визитов конкретного клиента.
+
+    GET /api/barbershop/clients/<uuid:pk>/visits/history/
+      - по умолчанию возвращает только "исторические" статусы: completed/canceled/no_show
+      - можно переопределить через ?status=... или ?status__in=...
+      - можно ограничить по дате: ?start_at_from=...&start_at_to=...
+    """
+
+    queryset = (
+        Appointment.objects
+        .select_related("client", "barber")
+        .prefetch_related(Prefetch("services", queryset=Service.objects.select_related("category")))
+        .all()
+    )
+    serializer_class = AppointmentSerializer
+    permission_classes = [permissions.IsAuthenticated]
+    filter_backends = [DjangoFilterBackend, OrderingFilter]
+    filterset_class = ClientVisitHistoryFilter
+    ordering_fields = ["start_at", "end_at", "status", "created_at"]
+    ordering = ["-start_at"]
+
+    def get_queryset(self):
+        company = self._user_company()
+        if not company:
+            return self.queryset.none()
+
+        client = generics.get_object_or_404(Client, pk=self.kwargs["pk"], company=company)
+
+        qs = self.queryset.filter(company=company, client=client)
+
+        # Если выбран активный филиал — показываем и глобальные записи (branch=NULL)
+        active_branch = self._active_branch()
+        if active_branch is not None:
+            qs = qs.filter(Q(branch=active_branch) | Q(branch__isnull=True))
+
+        # Дефолт: история = завершённые/отменённые/не пришёл
+        qp = getattr(self.request, "query_params", {})
+        if "status" not in qp and "status__in" not in qp:
+            qs = qs.filter(status__in=[
+                Appointment.Status.COMPLETED,
+                Appointment.Status.CANCELED,
+                Appointment.Status.NO_SHOW,
+            ])
+
+        return qs
 
 
 # ==== Appointment ====
