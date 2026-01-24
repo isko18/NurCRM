@@ -368,3 +368,5 @@ INSTAGRAM_POLL_SECONDS = 0.1
 
 SITE_WEBHOOK_URL = "https://ak-kagaz.webtm.ru/api/catalog/integrations/crm/products"
 SITE_WEBHOOK_SECRET = "supersecret"
+# If set, webhooks are sent ONLY for this company (by company_id).
+SITE_WEBHOOK_COMPANY_ID = "af8cc7dd-6bb8-4298-b0a0-d98f9ddd4ce9"

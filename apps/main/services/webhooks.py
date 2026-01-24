@@ -19,6 +19,26 @@ def _build_signature(secret: str, body: bytes) -> str:
     digest = hmac.new(secret.encode("utf-8"), body, hashlib.sha256).hexdigest()
     return f"sha256={digest}"
 
+
+def _allowed_company_id() -> str | None:
+    """
+    Optional safety gate: if SITE_WEBHOOK_COMPANY_ID is set, webhooks are sent only for that company.
+    """
+    raw = getattr(settings, "SITE_WEBHOOK_COMPANY_ID", None)
+    if not raw:
+        return None
+    return str(raw).strip().lower()
+
+
+def _is_company_allowed(company_id) -> bool:
+    allowed = _allowed_company_id()
+    if not allowed:
+        return True
+    if not company_id:
+        return False
+    return str(company_id).strip().lower() == allowed
+
+
 def _send_payload(payload: dict, *, retries: int, timeout: int, backoff: float) -> None:
     url = getattr(settings, "SITE_WEBHOOK_URL", None)
     if not url:
@@ -59,6 +79,11 @@ def send_product_webhook_data(data: dict, event: str, *, retries: int = 3, timeo
     Useful for delete events (when the instance is about to be removed).
     """
     try:
+        if not _is_company_allowed((data or {}).get("company")):
+            return
+    except Exception:
+        return
+    try:
         _send_payload({"event": event, "data": data}, retries=retries, timeout=timeout, backoff=backoff)
     except Exception:
         logger.error("Unexpected error sending product webhook payload. event=%s", event, exc_info=True)
@@ -74,6 +99,12 @@ def send_product_webhook(product, event: str, *, retries: int = 3, timeout: int 
         "data": <Product JSON as in GET /api/main/products/list/>
       }
     """
+    try:
+        if not _is_company_allowed(getattr(product, "company_id", None)):
+            return
+    except Exception:
+        return
+
     try:
         data = ProductSerializer(product, context={"request": None}).data
     except Exception:
