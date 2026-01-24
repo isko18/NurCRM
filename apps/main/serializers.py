@@ -1920,9 +1920,13 @@ class ReturnCreateSerializer(serializers.ModelSerializer):
         super().__init__(*args, **kwargs)
         req = self.context.get("request")
         comp = getattr(getattr(req, "user", None), "company", None)
+        usr = getattr(req, "user", None)
         br = _active_branch(self)
         if comp and self.fields.get("subreal"):
+            # Возврат создаёт агент, поэтому ограничиваем subreal-ы его передачами.
             qs = ManufactureSubreal.objects.filter(company=comp)
+            if usr and getattr(usr, "id", None):
+                qs = qs.filter(agent_id=usr.id)
             if br is not None:
                 qs = qs.filter(branch=br)
             # если br None — все передачи компании
@@ -1932,6 +1936,7 @@ class ReturnCreateSerializer(serializers.ModelSerializer):
         request = self.context.get("request")
         user = getattr(request, "user", None) if request else None
         user_company_id = getattr(user, "company_id", None)
+        br = _active_branch(self)
 
         sub = attrs.get("subreal")
         qty = attrs.get("qty")
@@ -1939,45 +1944,54 @@ class ReturnCreateSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError({"subreal": "Обязательное поле."})
         if qty is None or qty < 1:
             raise serializers.ValidationError({"qty": "Минимум 1."})
-        
-        # Вычисляем количество на руках с учетом продаж
-        # Загружаем subreal с аннотацией sold_qty и prefetch sale_allocations
-        company_id = user_company_id or sub.company_id
-        alloc_qs = AgentSaleAllocation.objects.only("id", "subreal_id", "qty")
-        
-        sub_with_sold = (
-            ManufactureSubreal.objects
-            .filter(pk=sub.pk)
-            .annotate(
-                sold_qty=Coalesce(
-                    Sum("sale_allocations__qty", filter=Q(sale_allocations__company_id=company_id)),
-                    V(0),
-                )
-            )
-            .prefetch_related(
-                Prefetch("sale_allocations", queryset=alloc_qs, to_attr="prefetched_allocs")
-            )
-            .first()
-        )
-        
-        if not sub_with_sold:
-            raise serializers.ValidationError({"subreal": "Передача не найдена."})
-        
-        # Вычисляем количество на руках: accepted - returned - sold
-        accepted = int(sub_with_sold.qty_accepted or 0)
-        returned = int(sub_with_sold.qty_returned or 0)
-        sold = int(getattr(sub_with_sold, "sold_qty", 0) or 0)
-        
-        # Fallback: если sold_qty пустой, используем prefetched_allocs
-        if not sold and hasattr(sub_with_sold, "prefetched_allocs") and sub_with_sold.prefetched_allocs:
-            sold = sum(int(a.qty or 0) for a in sub_with_sold.prefetched_allocs)
-        
-        qty_on_hand = max(accepted - returned - sold, 0)
-        
-        if qty > qty_on_hand:
-            raise serializers.ValidationError({"qty": f"На руках {qty_on_hand}."})
+
+        # Безопасность: subreal должен быть из компании пользователя
         if user_company_id and sub.company_id != user_company_id:
             raise serializers.ValidationError({"subreal": "Передача из другой компании."})
+
+        # ВАЖНО: "на руках" считается по партиям (subreal) + продажи.
+        # Если фронт/пользователь выбрал subreal с нулём, попробуем автоматически подобрать
+        # другую партию агента по этому же товару, где есть остаток.
+        company_id = user_company_id or sub.company_id
+        agent_id = getattr(user, "id", None)
+        if not agent_id:
+            raise serializers.ValidationError({"returned_by": "Пользователь не определён."})
+
+        candidates = ManufactureSubreal.objects.filter(
+            company_id=company_id,
+            agent_id=agent_id,
+            product_id=sub.product_id,
+        )
+        if br is not None:
+            candidates = candidates.filter(branch=br)
+
+        candidates = candidates.annotate(
+            sold_qty=Coalesce(
+                Sum(
+                    "sale_allocations__qty",
+                    filter=Q(sale_allocations__company_id=company_id),
+                ),
+                V(0),
+            )
+        ).order_by("-created_at")
+
+        picked = None
+        total_on_hand = 0
+        for s in candidates:
+            accepted = int(s.qty_accepted or 0)
+            returned = int(s.qty_returned or 0)
+            sold = int(getattr(s, "sold_qty", 0) or 0)
+            on_hand = max(accepted - returned - sold, 0)
+            if on_hand > 0:
+                total_on_hand += on_hand
+            if picked is None and on_hand >= int(qty):
+                picked = s
+
+        if picked is None:
+            raise serializers.ValidationError({"qty": f"На руках {total_on_hand}."})
+
+        # Подменяем subreal на реальную партию, где хватает остатка.
+        attrs["subreal"] = picked
         return attrs
 
     def create(self, validated_data):
