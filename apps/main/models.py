@@ -1294,22 +1294,37 @@ class Cart(models.Model):
                 raise ValidationError({"user": "Корзина не принадлежит кассиру этой смены."})
 
     def save(self, *args, **kwargs):
+        update_fields = kwargs.get("update_fields")
+        touched = set()
+
         # shift есть → всё берём из смены
         if self.shift_id:
-            self.company_id = self.shift.company_id
-            self.branch_id = self.shift.branch_id
-            if not self.user_id:
+            if self.company_id != self.shift.company_id:
+                self.company_id = self.shift.company_id
+                touched.add("company")
+            if (self.branch_id or None) != (self.shift.branch_id or None):
+                self.branch_id = self.shift.branch_id
+                touched.add("branch")
+            if not self.user_id and self.shift.cashier_id:
                 self.user_id = self.shift.cashier_id
+                touched.add("user")
         else:
             # мягкий fallback (если вдруг создают без твоего mixin-а)
             if not self.company_id and self.user_id:
                 u_company_id = getattr(self.user, "company_id", None)
                 if u_company_id:
                     self.company_id = u_company_id
+                    touched.add("company")
             if self.branch_id is None and self.user_id:
                 u_branch_id = getattr(self.user, "branch_id", None)
                 if u_branch_id:
                     self.branch_id = u_branch_id
+                    touched.add("branch")
+
+        # если нас сохраняют через update_fields=["shift"], нужно дописать принудительные поля тоже
+        if update_fields is not None and touched:
+            # updated_at — auto_now, но Django не обновит его без явного включения в update_fields
+            kwargs["update_fields"] = list(set(update_fields) | touched | {"updated_at"})
 
         self.full_clean()
         return super().save(*args, **kwargs)
@@ -1491,20 +1506,35 @@ class Sale(models.Model):
                 raise ValidationError({"cashbox": "Касса другого филиала."})
 
     def save(self, *args, **kwargs):
+        update_fields = kwargs.get("update_fields")
+        touched = set()
+
         # shift есть → ЖЁСТКО всё берём из смены
         if self.shift_id:
-            self.company_id = self.shift.company_id
-            self.branch_id = self.shift.branch_id
-            self.cashbox_id = self.shift.cashbox_id  # ← важно: всегда, не только если пусто
-            if not self.user_id:
+            if self.company_id != self.shift.company_id:
+                self.company_id = self.shift.company_id
+                touched.add("company")
+            if (self.branch_id or None) != (self.shift.branch_id or None):
+                self.branch_id = self.shift.branch_id
+                touched.add("branch")
+            if self.cashbox_id != self.shift.cashbox_id:
+                self.cashbox_id = self.shift.cashbox_id  # ← важно: всегда, не только если пусто
+                touched.add("cashbox")
+            if not self.user_id and self.shift.cashier_id:
                 self.user_id = self.shift.cashier_id
+                touched.add("user")
 
         # shift нет → если cashbox указан, можно подтянуть company/branch (если пустые)
         elif self.cashbox_id:
             if not self.company_id:
                 self.company_id = self.cashbox.company_id
+                touched.add("company")
             if self.branch_id is None:
                 self.branch_id = self.cashbox.branch_id
+                touched.add("branch")
+
+        if update_fields is not None and touched:
+            kwargs["update_fields"] = list(set(update_fields) | touched)
 
         self.full_clean()
         return super().save(*args, **kwargs)
