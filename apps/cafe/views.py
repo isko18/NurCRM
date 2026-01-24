@@ -7,6 +7,7 @@ from django.db import transaction
 from django.db.models import Q, Count, Avg, ExpressionWrapper, DurationField, F
 from django.utils import timezone
 from django_filters.rest_framework import DjangoFilterBackend
+import django_filters
 from rest_framework import filters, generics, permissions, status
 from rest_framework.response import Response
 from rest_framework.views import APIView
@@ -219,6 +220,26 @@ class CafeClientRetrieveUpdateDestroyView(CompanyBranchQuerysetMixin, generics.R
     serializer_class = CafeClientSerializer
 
 
+# --------- Filters ---------
+class _CharInFilter(django_filters.BaseInFilter, django_filters.CharFilter):
+    """Поддержка query param вида: ?status__in=open,closed"""
+
+
+class OrderFilter(django_filters.FilterSet):
+    # статус (точно)
+    status = django_filters.CharFilter(field_name="status")
+    # статус (несколько)
+    status__in = _CharInFilter(field_name="status", lookup_expr="in")
+
+    # диапазон дат (удобные имена параметров)
+    created_at_from = django_filters.DateTimeFilter(field_name="created_at", lookup_expr="gte")
+    created_at_to = django_filters.DateTimeFilter(field_name="created_at", lookup_expr="lte")
+
+    class Meta:
+        model = Order
+        fields = ["table", "waiter", "client", "guests", "status"]
+
+
 class ClientOrderListCreateView(CompanyBranchQuerysetMixin, generics.ListCreateAPIView):
     """
     /cafe/clients/<uuid:pk>/orders/
@@ -232,7 +253,7 @@ class ClientOrderListCreateView(CompanyBranchQuerysetMixin, generics.ListCreateA
     )
     serializer_class = OrderSerializer
     filter_backends = [DjangoFilterBackend, filters.OrderingFilter]
-    filterset_fields = ["table", "waiter", "guests", "created_at"]
+    filterset_class = OrderFilter
     ordering_fields = ["created_at", "guests", "id"]
 
     def _get_client(self):
@@ -529,7 +550,7 @@ class OrderListCreateView(CompanyBranchQuerysetMixin, generics.ListCreateAPIView
     )
     serializer_class = OrderSerializer
     filter_backends = [DjangoFilterBackend, filters.OrderingFilter]
-    filterset_fields = ["table", "waiter", "client", "guests", "created_at"]
+    filterset_class = OrderFilter
     ordering_fields = ["created_at", "guests", "id"]
     
     def perform_create(self, serializer):
