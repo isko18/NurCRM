@@ -6,7 +6,7 @@ from django.core.validators import MinValueValidator
 from decimal import Decimal, ROUND_HALF_UP
 from dateutil.relativedelta import relativedelta
 from django.db import transaction, connection
-from django.db.models import Sum, F, Q, Max, IntegerField, Coalesce, Value as V, Prefetch
+from django.db.models import Sum, F, Q, Max, IntegerField
 from mptt.models import MPTTModel, TreeForeignKey
 import uuid, secrets
 from django.core.files.base import ContentFile
