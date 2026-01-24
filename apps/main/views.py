@@ -2496,7 +2496,21 @@ class AgentMyProductsListAPIView(APIView, CompanyBranchRestrictedMixin):
             .annotate(sold_qty=Coalesce(Sum("sale_allocations__qty"), V(0)))
             .order_by("product_id", "-created_at")
         )
-        return self._filter_qs_company_branch(base)
+        base = self._filter_qs_company_branch(base)
+
+        term = (request.query_params.get("search") or "").strip()
+        if term:
+            q = (
+                Q(product__name__icontains=term)
+                | Q(product__barcode__icontains=term)
+                | Q(product__article__icontains=term)
+                | Q(product__code__icontains=term)
+            )
+            if term.isdigit():
+                q |= Q(product__plu=int(term))
+            base = base.filter(q)
+
+        return base
 
     @staticmethod
     def _nz(v: Optional[int]) -> int:
@@ -2743,7 +2757,21 @@ class OwnerAgentsProductsListAPIView(APIView, CompanyBranchRestrictedMixin):
             .annotate(sold_qty=Coalesce(Sum("sale_allocations__qty"), V(0)))
             .order_by("agent_id", "product_id", "-created_at")
         )
-        return self._filter_qs_company_branch(base)
+        base = self._filter_qs_company_branch(base)
+
+        term = (request.query_params.get("search") or "").strip()
+        if term:
+            q = (
+                Q(product__name__icontains=term)
+                | Q(product__barcode__icontains=term)
+                | Q(product__article__icontains=term)
+                | Q(product__code__icontains=term)
+            )
+            if term.isdigit():
+                q |= Q(product__plu=int(term))
+            base = base.filter(q)
+
+        return base
 
     def _serialize_products_for_agent(self, subreals_qs) -> List[Dict[str, Any]]:
         def _sold_for_sub(s):
