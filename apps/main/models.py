@@ -6,7 +6,7 @@ from django.core.validators import MinValueValidator
 from decimal import Decimal, ROUND_HALF_UP
 from dateutil.relativedelta import relativedelta
 from django.db import transaction, connection
-from django.db.models import Sum, F, Q, Max, IntegerField
+from django.db.models import Sum, F, Q, Max, IntegerField, Coalesce, Value as V, Prefetch
 from mptt.models import MPTTModel, TreeForeignKey
 import uuid, secrets
 from django.core.files.base import ContentFile
@@ -2830,7 +2830,30 @@ class ManufactureSubreal(models.Model):
 
     @property
     def qty_on_agent(self) -> int:
+        """
+        Базовое свойство без учета продаж (для обратной совместимости).
+        Для правильного расчета используйте get_qty_on_hand_with_sales().
+        """
         return max((self.qty_accepted or 0) - (self.qty_returned or 0), 0)
+    
+    def get_qty_on_hand_with_sales(self, company_id=None) -> int:
+        """
+        Вычисляет количество на руках с учетом продаж через AgentSaleAllocation.
+        Если company_id не указан, используется self.company_id.
+        """
+        company_id = company_id or self.company_id
+        accepted = int(self.qty_accepted or 0)
+        returned = int(self.qty_returned or 0)
+        
+        # Вычисляем проданное количество
+        sold = (
+            AgentSaleAllocation.objects
+            .filter(subreal_id=self.pk, company_id=company_id)
+            .aggregate(total=Sum("qty"))["total"] or 0
+        )
+        sold = int(sold)
+        
+        return max(accepted - returned - sold, 0)
 
     def clean(self):
         if self.branch_id and self.branch.company_id != self.company_id:
@@ -2982,8 +3005,10 @@ class ReturnFromAgent(models.Model):
             raise ValidationError({"branch": "Филиал возврата должен совпадать с филиалом передачи."})
         if (self.qty or 0) < 1:
             raise ValidationError({"qty": "Минимум 1."})
-        if self.subreal and self.status == self.Status.PENDING and (self.qty or 0) > self.subreal.qty_on_agent:
-            raise ValidationError({"qty": f"Нельзя вернуть {self.qty}: на руках {self.subreal.qty_on_agent}."})
+        if self.subreal and self.status == self.Status.PENDING:
+            qty_on_hand = self.subreal.get_qty_on_hand_with_sales(company_id=self.company_id)
+            if (self.qty or 0) > qty_on_hand:
+                raise ValidationError({"qty": f"Нельзя вернуть {self.qty}: на руках {qty_on_hand}."})
 
     def save(self, *args, **kwargs):
         if self.subreal_id:
@@ -2999,8 +3024,9 @@ class ReturnFromAgent(models.Model):
         if self.status != self.Status.PENDING:
             raise ValidationError("Возврат уже обработан.")
         locked_sub = ManufactureSubreal.objects.select_for_update().get(pk=self.subreal_id)
-        if self.qty > locked_sub.qty_on_agent:
-            raise ValidationError({"qty": f"Можно принять максимум {locked_sub.qty_on_agent}."})
+        qty_on_hand = locked_sub.get_qty_on_hand_with_sales(company_id=self.company_id)
+        if self.qty > qty_on_hand:
+            raise ValidationError({"qty": f"Можно принять максимум {qty_on_hand}."})
         product = locked_sub.product
         type(product).objects.select_for_update().filter(pk=product.pk).update(quantity=F("quantity") + self.qty)
         prod_model = type(product)
