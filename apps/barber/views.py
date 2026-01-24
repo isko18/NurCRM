@@ -20,6 +20,7 @@ from .serializers import (
     ServiceSerializer,
     ClientSerializer,
     AppointmentSerializer,
+    AppointmentHistoryRowSerializer,
     FolderSerializer,
     DocumentSerializer,
     ServiceCategorySerializer,
@@ -64,6 +65,22 @@ class ClientVisitHistoryFilter(filters.FilterSet):
     class Meta:
         model = Appointment
         fields = ["status", "barber", "start_at"]
+
+
+class VisitHistoryFilter(filters.FilterSet):
+    """
+    Фильтры общего списка истории визитов.
+    """
+
+    status__in = _CharInFilter(field_name="status", lookup_expr="in")
+    start_at_from = filters.DateTimeFilter(field_name="start_at", lookup_expr="gte")
+    start_at_to = filters.DateTimeFilter(field_name="start_at", lookup_expr="lte")
+    client = filters.UUIDFilter(field_name="client_id")
+    barber = filters.UUIDFilter(field_name="barber_id")
+
+    class Meta:
+        model = Appointment
+        fields = ["status", "client", "barber", "start_at"]
 
 
 # ==== Company + Branch scoped mixin ====
@@ -383,6 +400,53 @@ class ClientVisitHistoryListView(CompanyQuerysetMixin, generics.ListAPIView):
         client = generics.get_object_or_404(Client, pk=self.kwargs["pk"], company=company)
 
         qs = self.queryset.filter(company=company, client=client)
+
+        # Если выбран активный филиал — показываем и глобальные записи (branch=NULL)
+        active_branch = self._active_branch()
+        if active_branch is not None:
+            qs = qs.filter(Q(branch=active_branch) | Q(branch__isnull=True))
+
+        # Дефолт: история = завершённые/отменённые/не пришёл
+        qp = getattr(self.request, "query_params", {})
+        if "status" not in qp and "status__in" not in qp:
+            qs = qs.filter(status__in=[
+                Appointment.Status.COMPLETED,
+                Appointment.Status.CANCELED,
+                Appointment.Status.NO_SHOW,
+            ])
+
+        return qs
+
+
+class VisitHistoryListView(CompanyQuerysetMixin, generics.ListAPIView):
+    """
+    Общая история визитов (по всем клиентам).
+
+    GET /api/barbershop/visits/history/
+      - по умолчанию возвращает только "исторические" статусы: completed/canceled/no_show
+      - можно переопределить через ?status=... или ?status__in=...
+      - можно ограничить по дате: ?start_at_from=...&start_at_to=...
+      - можно фильтровать по мастеру/клиенту: ?barber=<uuid>&client=<uuid>
+    """
+
+    queryset = (
+        Appointment.objects
+        .select_related("client", "barber")
+        .all()
+    )
+    serializer_class = AppointmentHistoryRowSerializer
+    permission_classes = [permissions.IsAuthenticated]
+    filter_backends = [DjangoFilterBackend, OrderingFilter]
+    filterset_class = VisitHistoryFilter
+    ordering_fields = ["start_at", "end_at", "status", "created_at"]
+    ordering = ["-start_at"]
+
+    def get_queryset(self):
+        company = self._user_company()
+        if not company:
+            return self.queryset.none()
+
+        qs = self.queryset.filter(company=company)
 
         # Если выбран активный филиал — показываем и глобальные записи (branch=NULL)
         active_branch = self._active_branch()

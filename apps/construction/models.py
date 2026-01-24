@@ -223,6 +223,32 @@ class CashShift(models.Model):
             if cashier_company_id and cashier_company_id != self.company_id:
                 raise ValidationError({"cashier": "Кассир другой компании."})
 
+    def save(self, *args, **kwargs):
+        """
+        Делаем смену самосогласованной:
+        - company/branch всегда берём из кассы
+        - поддерживаем save(update_fields=...), добавляя нужные поля, если мы их поправили
+        """
+        update_fields = kwargs.get("update_fields")
+        touched = set()
+
+        if self.cashbox_id:
+            cb_company_id = getattr(self.cashbox, "company_id", None)
+            cb_branch_id = getattr(self.cashbox, "branch_id", None)
+
+            if cb_company_id and self.company_id != cb_company_id:
+                self.company_id = cb_company_id
+                touched.add("company")
+            if (self.branch_id or None) != (cb_branch_id or None):
+                self.branch_id = cb_branch_id
+                touched.add("branch")
+
+        if update_fields is not None and touched:
+            kwargs["update_fields"] = list(set(update_fields) | touched)
+
+        self.full_clean()
+        return super().save(*args, **kwargs)
+
     def calc_live_totals(self) -> dict:
         z = Decimal("0.00")
 

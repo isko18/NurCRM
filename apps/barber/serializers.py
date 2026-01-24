@@ -442,6 +442,55 @@ class AppointmentSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSeriali
 
 
 # ===========================
+# Appointment history row (for table)
+# ===========================
+class AppointmentHistoryRowSerializer(serializers.ModelSerializer):
+    """
+    Упрощённый сериализатор строки истории визитов.
+    Поля рассчитаны под таблицу:
+      Дата | Сотрудник | Клиент | Итого | Статус
+    """
+
+    date = serializers.DateTimeField(source="start_at", read_only=True)
+    employee = serializers.SerializerMethodField()
+    client = serializers.CharField(source="client.full_name", read_only=True)
+    total = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Appointment
+        fields = [
+            "id",
+            "date",
+            "employee",
+            "client",
+            "total",
+            "status",
+        ]
+
+    def get_employee(self, obj):
+        b = getattr(obj, "barber", None)
+        if not b:
+            return None
+        first = getattr(b, "first_name", None) or ""
+        last = getattr(b, "last_name", None) or ""
+        full = f"{first} {last}".strip()
+        return full or getattr(b, "email", None)
+
+    def get_total(self, obj):
+        """
+        Итого = price * (1 - discount/100)
+        Возвращаем Decimal с 2 знаками (как деньги).
+        """
+        price = getattr(obj, "price", None) or Decimal("0")
+        discount = getattr(obj, "discount", None) or Decimal("0")
+        try:
+            total = price * (Decimal("1") - (Decimal(discount) / Decimal("100")))
+        except Exception:
+            total = price
+        return total.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+
+# ===========================
 # Folder
 # ===========================
 class FolderSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
