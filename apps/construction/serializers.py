@@ -434,6 +434,21 @@ class CashFlowSerializer(CompanyBranchReadOnlyMixin):
 
         cashbox = attrs.get("cashbox") or getattr(self.instance, "cashbox", None)
 
+        # amount: в БД стоит CheckConstraint amount__gt=0.
+        # На фронте часто отправляют отрицательное значение для "расхода" —
+        # нормализуем и сохраняем всегда положительное значение.
+        if "amount" in attrs:
+            amount = attrs.get("amount")
+            if amount is None:
+                raise serializers.ValidationError({"amount": "Обязательное поле."})
+            try:
+                amount = abs(amount)
+            except Exception:
+                raise serializers.ValidationError({"amount": "Некорректное значение суммы."})
+            if amount <= 0:
+                raise serializers.ValidationError({"amount": "Сумма должна быть больше 0."})
+            attrs["amount"] = amount
+
         # важно: различаем "shift не передали" и "shift=None"
         shift_provided = "shift" in attrs
         shift = attrs.get("shift") if shift_provided else getattr(self.instance, "shift", None)
