@@ -1,7 +1,7 @@
 from rest_framework import serializers
 from django.db import transaction
 from django.utils import timezone
-from django.db.models import Q
+from django.db.models import Q, Sum, Coalesce, Value as V, Prefetch
 from decimal import Decimal, ROUND_HALF_UP, InvalidOperation
 from typing import Any, Dict
 from datetime import date as _date, datetime as _datetime
@@ -14,7 +14,7 @@ from apps.main.models import (
     OrderItem, Client, GlobalProduct, CartItem, ClientDeal, Bid, SocialApplications,
     TransactionRecord, DealInstallment, ContractorWork, Debt, DebtPayment,
     ObjectItem, ObjectSale, ObjectSaleItem, ItemMake, ManufactureSubreal, Acceptance,
-    ReturnFromAgent, ProductImage, PromoRule, AgentRequestCart, AgentRequestItem, ProductPackage, ProductCharacteristics, DealPayment
+    ReturnFromAgent, ProductImage, PromoRule, AgentRequestCart, AgentRequestItem, ProductPackage, ProductCharacteristics, DealPayment, AgentSaleAllocation
 )
 
 from apps.consalting.models import ServicesConsalting
@@ -1938,8 +1938,43 @@ class ReturnCreateSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError({"subreal": "Обязательное поле."})
         if qty is None or qty < 1:
             raise serializers.ValidationError({"qty": "Минимум 1."})
-        if qty > sub.qty_on_agent:
-            raise serializers.ValidationError({"qty": f"На руках {sub.qty_on_agent}."})
+        
+        # Вычисляем количество на руках с учетом продаж
+        # Загружаем subreal с аннотацией sold_qty и prefetch sale_allocations
+        company_id = user_company_id or sub.company_id
+        alloc_qs = AgentSaleAllocation.objects.only("id", "subreal_id", "qty")
+        
+        sub_with_sold = (
+            ManufactureSubreal.objects
+            .filter(pk=sub.pk)
+            .annotate(
+                sold_qty=Coalesce(
+                    Sum("sale_allocations__qty", filter=Q(sale_allocations__company_id=company_id)),
+                    V(0),
+                )
+            )
+            .prefetch_related(
+                Prefetch("sale_allocations", queryset=alloc_qs, to_attr="prefetched_allocs")
+            )
+            .first()
+        )
+        
+        if not sub_with_sold:
+            raise serializers.ValidationError({"subreal": "Передача не найдена."})
+        
+        # Вычисляем количество на руках: accepted - returned - sold
+        accepted = int(sub_with_sold.qty_accepted or 0)
+        returned = int(sub_with_sold.qty_returned or 0)
+        sold = int(getattr(sub_with_sold, "sold_qty", 0) or 0)
+        
+        # Fallback: если sold_qty пустой, используем prefetched_allocs
+        if not sold and hasattr(sub_with_sold, "prefetched_allocs") and sub_with_sold.prefetched_allocs:
+            sold = sum(int(a.qty or 0) for a in sub_with_sold.prefetched_allocs)
+        
+        qty_on_hand = max(accepted - returned - sold, 0)
+        
+        if qty > qty_on_hand:
+            raise serializers.ValidationError({"qty": f"На руках {qty_on_hand}."})
         if user_company_id and sub.company_id != user_company_id:
             raise serializers.ValidationError({"subreal": "Передача из другой компании."})
         return attrs
