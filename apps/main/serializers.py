@@ -1,7 +1,8 @@
 from rest_framework import serializers
 from django.db import transaction
 from django.utils import timezone
-from django.db.models import Q, Sum, Coalesce, Value as V, Prefetch
+from django.db.models import Q, Sum, Value as V, Prefetch
+from django.db.models.functions import Coalesce
 from decimal import Decimal, ROUND_HALF_UP, InvalidOperation
 from typing import Any, Dict
 from datetime import date as _date, datetime as _datetime
