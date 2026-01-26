@@ -859,17 +859,27 @@ class KitchenTaskListView(CompanyBranchQuerysetMixin, generics.ListAPIView):
     queryset = KitchenTask.objects.select_related('order__table', 'menu_item', 'waiter', 'cook')
     serializer_class = KitchenTaskSerializer
     filter_backends = [DjangoFilterBackend, filters.OrderingFilter]
-    filterset_fields = ['status', 'cook', 'waiter', 'menu_item', 'order']
+    # status фильтруем вручную (поддержка списка через запятую), поэтому тут не включаем
+    filterset_fields = ['cook', 'waiter', 'menu_item', 'order']
     ordering_fields = ['created_at', 'started_at', 'finished_at', 'status']
 
     def get_queryset(self):
         qs = super().get_queryset()
         user = self.request.user
-        status_param = self.request.query_params.get('status')
+        # Поддерживаем:
+        #   - ?status=pending            (один статус)
+        #   - ?status=pending,in_progress (список через запятую)
+        #   - ?status=pending&status=in_progress (повторяющийся параметр)
+        status_list = self.request.query_params.getlist('status')
+        if len(status_list) == 1 and status_list[0] and ',' in status_list[0]:
+            status_list = [s.strip() for s in status_list[0].split(',') if s.strip()]
         mine = self.request.query_params.get('mine')
 
-        if status_param:
-            qs = qs.filter(status=status_param)
+        if status_list:
+            if len(status_list) == 1:
+                qs = qs.filter(status=status_list[0])
+            else:
+                qs = qs.filter(status__in=status_list)
         else:
             qs = qs.filter(status__in=[KitchenTask.Status.PENDING, KitchenTask.Status.IN_PROGRESS])
 
