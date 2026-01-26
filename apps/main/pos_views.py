@@ -1080,7 +1080,8 @@ class SaleStartAPIView(CompanyBranchRestrictedMixin, APIView):
         branch = self._auto_branch()
 
         cashbox_id = request.data.get("cashbox_id")
-        opening_cash = request.data.get("opening_cash")
+        # opening_cash НЕ используется тут намеренно:
+        # смена должна быть открыта отдельным действием, а start не открывает её автоматически.
 
         cashbox = _resolve_pos_cashbox(company, branch, cashbox_id=cashbox_id)
         if not cashbox:
@@ -1094,15 +1095,8 @@ class SaleStartAPIView(CompanyBranchRestrictedMixin, APIView):
         )
 
         if not shift:
-            opening_cash_val = _to_decimal(opening_cash, default=Decimal("0.00"))
-            shift = CashShift.objects.create(
-                company=company,
-                branch=branch,
-                cashbox=cashbox,
-                cashier=user,
-                status=CashShift.Status.OPEN,
-                opened_at=timezone.now(),
-                opening_cash=_q2(opening_cash_val),
+            raise ValidationError(
+                {"detail": "Смена не открыта. Сначала откройте смену на кассе, затем начните продажу."}
             )
 
         qs = (
@@ -1320,7 +1314,16 @@ class SaleCheckoutAPIView(APIView):
             if not cashbox:
                 raise ValidationError({"detail": "Нет кассы для этого филиала. Создай Cashbox."})
 
-            shift = _ensure_open_shift(company=company, branch=branch, cashier=request.user, cashbox=cashbox)
+            shift = (
+                CashShift.objects.select_for_update()
+                .filter(company=company, cashbox=cashbox, status=CashShift.Status.OPEN, cashier=request.user)
+                .order_by("-opened_at")
+                .first()
+            )
+            if not shift:
+                raise ValidationError(
+                    {"detail": "Смена не открыта. Сначала откройте смену на кассе, затем завершите продажу."}
+                )
             cart.shift = shift
             cart.save(update_fields=["shift"])
 
