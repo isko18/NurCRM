@@ -94,7 +94,7 @@ urlpatterns = [
     path("order-items/<uuid:pk>/", OrderItemRetrieveUpdateDestroyView.as_view(), name="orderitem-detail"),
 
     # ==================== Kitchen (повар) ====================
-    # Лента задач (pending + in_progress; ?mine=1, ?status=ready и т.п.)
+    # Лента задач (pending + in_progress; ?mine=1, ?status=ready или ?status=pending,in_progress)
     path("kitchen/tasks/", KitchenTaskListView.as_view(), name="kitchen-task-list"),
     # Получить/обновить/удалить задачу (PATCH для изменения статуса и других полей)
     path("kitchen/tasks/<uuid:pk>/", KitchenTaskRetrieveUpdateDestroyView.as_view(), name="kitchen-task-detail"),
