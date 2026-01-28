@@ -6,7 +6,7 @@ from django.utils import timezone
 from django.core.exceptions import ValidationError
 
 from apps.main.models import (
-    Sale, SaleItem, ManufactureSubreal, AgentSaleAllocation
+    Sale, SaleItem, ManufactureSubreal, AgentSaleAllocation, ReturnFromAgent
 )
 from apps.construction.models import Cashbox
 
@@ -147,20 +147,37 @@ def checkout_agent_cart(
 
         sold_map = (
             AgentSaleAllocation.objects
-            .filter(agent=acting_agent, company=company, product_id__in=product_ids)
+            .filter(
+                agent=acting_agent,
+                company=company,
+                product_id__in=product_ids,
+                sale__status__in=[Sale.Status.PAID, Sale.Status.DEBT],
+            )
             .values("subreal_id")
             .annotate(s=Sum("qty"))
         )
         sold_by_subreal = {r["subreal_id"]: int(r["s"] or 0) for r in sold_map}
+
+        # "Резерв" под возвраты: pending возвраты по этим subreal-ам уменьшают доступное у агента,
+        # чтобы нельзя было продать то, что уже оформлено на возврат.
+        reserved_map = (
+            ReturnFromAgent.objects
+            .filter(company=company, subreal_id__in=[s.id for s in subreals], status=ReturnFromAgent.Status.PENDING)
+            .values("subreal_id")
+            .annotate(s=Sum("qty"))
+        )
+        reserved_by_subreal = {r["subreal_id"]: int(r["s"] or 0) for r in reserved_map}
     else:
         subreals = []
         sold_by_subreal = {}
+        reserved_by_subreal = {}
 
     fifo = {}
     for s in subreals:
         free = max(
             0,
             int(s.qty_accepted or 0) - int(s.qty_returned or 0) - int(sold_by_subreal.get(s.id, 0))
+            - int(reserved_by_subreal.get(s.id, 0))
         )
         if free > 0:
             fifo.setdefault(str(s.product_id), []).append([s, free])

@@ -2866,10 +2866,16 @@ class ManufactureSubreal(models.Model):
         """
         return max((self.qty_accepted or 0) - (self.qty_returned or 0), 0)
     
-    def get_qty_on_hand_with_sales(self, company_id=None) -> int:
+    def get_qty_on_hand_with_sales(self, company_id=None, *, exclude_pending_return_id=None) -> int:
         """
         Вычисляет количество на руках с учетом продаж через AgentSaleAllocation.
         Если company_id не указан, используется self.company_id.
+
+        Также учитывает "резерв" под возвраты со статусом PENDING:
+          available = accepted - returned - sold(paid/debt) - pending_reserved
+
+        exclude_pending_return_id:
+          - полезно при approve конкретного возврата, чтобы не вычитать его самого из резерва.
         """
         company_id = company_id or self.company_id
         accepted = int(self.qty_accepted or 0)
@@ -2878,12 +2884,25 @@ class ManufactureSubreal(models.Model):
         # Вычисляем проданное количество
         sold = (
             AgentSaleAllocation.objects
-            .filter(subreal_id=self.pk, company_id=company_id)
+            .filter(
+                subreal_id=self.pk,
+                company_id=company_id,
+                sale__status__in=[Sale.Status.PAID, Sale.Status.DEBT],
+            )
             .aggregate(total=Sum("qty"))["total"] or 0
         )
         sold = int(sold)
-        
-        return max(accepted - returned - sold, 0)
+
+        pending_qs = ReturnFromAgent.objects.filter(
+            company_id=company_id,
+            subreal_id=self.pk,
+            status=ReturnFromAgent.Status.PENDING,
+        )
+        if exclude_pending_return_id:
+            pending_qs = pending_qs.exclude(pk=exclude_pending_return_id)
+        pending_reserved = int(pending_qs.aggregate(s=Sum("qty"))["s"] or 0)
+
+        return max(accepted - returned - sold - pending_reserved, 0)
 
     def clean(self):
         if self.branch_id and self.branch.company_id != self.company_id:
@@ -3036,7 +3055,10 @@ class ReturnFromAgent(models.Model):
         if (self.qty or 0) < 1:
             raise ValidationError({"qty": "Минимум 1."})
         if self.subreal and self.status == self.Status.PENDING:
-            qty_on_hand = self.subreal.get_qty_on_hand_with_sales(company_id=self.company_id)
+            qty_on_hand = self.subreal.get_qty_on_hand_with_sales(
+                company_id=self.company_id,
+                exclude_pending_return_id=self.pk,  # при апдейте не считаем резерв "самого себя"
+            )
             if (self.qty or 0) > qty_on_hand:
                 raise ValidationError({"qty": f"Нельзя вернуть {self.qty}: на руках {qty_on_hand}."})
 
@@ -3054,9 +3076,43 @@ class ReturnFromAgent(models.Model):
         if self.status != self.Status.PENDING:
             raise ValidationError("Возврат уже обработан.")
         locked_sub = ManufactureSubreal.objects.select_for_update().get(pk=self.subreal_id)
-        qty_on_hand = locked_sub.get_qty_on_hand_with_sales(company_id=self.company_id)
+        qty_on_hand = locked_sub.get_qty_on_hand_with_sales(
+            company_id=self.company_id,
+            exclude_pending_return_id=self.pk,
+        )
         if self.qty > qty_on_hand:
-            raise ValidationError({"qty": f"Можно принять максимум {qty_on_hand}."})
+            # расширенный ответ, чтобы было понятно почему 0
+            accepted = int(locked_sub.qty_accepted or 0)
+            returned = int(locked_sub.qty_returned or 0)
+            sold = (
+                AgentSaleAllocation.objects
+                .filter(
+                    subreal_id=locked_sub.pk,
+                    company_id=self.company_id,
+                    sale__status__in=[Sale.Status.PAID, Sale.Status.DEBT],
+                )
+                .aggregate(total=Sum("qty"))["total"] or 0
+            )
+            sold = int(sold)
+            pending_reserved_other = int(
+                ReturnFromAgent.objects.filter(
+                    company_id=self.company_id,
+                    subreal_id=locked_sub.pk,
+                    status=ReturnFromAgent.Status.PENDING,
+                )
+                .exclude(pk=self.pk)
+                .aggregate(s=Sum("qty"))["s"] or 0
+            )
+            raise ValidationError({
+                "qty": f"Можно принять максимум {qty_on_hand}.",
+                "debug": {
+                    "qty_accepted": accepted,
+                    "qty_returned": returned,
+                    "sold_paid_debt": sold,
+                    "pending_reserved_other": pending_reserved_other,
+                    "available_now": qty_on_hand,
+                }
+            })
         product = locked_sub.product
         type(product).objects.select_for_update().filter(pk=product.pk).update(quantity=F("quantity") + self.qty)
         prod_model = type(product)
