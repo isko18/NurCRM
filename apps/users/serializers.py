@@ -31,6 +31,22 @@ def _ensure_owner_or_admin(user):
 def _get_user_company(user):
     return getattr(user, "owned_company", None) or getattr(user, "company", None)
 
+def _is_market_company(company: Company) -> bool:
+    try:
+        return bool(company and getattr(company, "is_market", None) and company.is_market())
+    except Exception:
+        return False
+
+def _apply_market_cashier_gate(rep: dict, user: User):
+    """
+    Гейт "интерфейс кассира доступен только для сферы Маркет":
+    - если компания НЕ market -> can_view_cashier всегда False (даже если флаг True в БД)
+    """
+    company = _get_user_company(user)
+    if not _is_market_company(company):
+        rep["can_view_cashier"] = False
+    return rep
+
 
 def _validate_branch_ids_for_company(branch_ids, company):
     if not branch_ids:
@@ -255,6 +271,10 @@ class UserSerializer(serializers.ModelSerializer):
             instance.set_password(password)
         instance.save()
         return instance
+
+    def to_representation(self, instance):
+        rep = super().to_representation(instance)
+        return _apply_market_cashier_gate(rep, instance)
 
 
 # ======================
@@ -577,6 +597,10 @@ class UserListSerializer(serializers.ModelSerializer):
             "branch_ids", "primary_branch_id",
         ]
 
+    def to_representation(self, instance):
+        rep = super().to_representation(instance)
+        return _apply_market_cashier_gate(rep, instance)
+
 
 class UserWithPermissionsSerializer(serializers.ModelSerializer):
     role_display = serializers.CharField(read_only=True)
@@ -591,6 +615,10 @@ class UserWithPermissionsSerializer(serializers.ModelSerializer):
             *[f.name for f in User._meta.fields if f.name.startswith("can_view_")],
             "branch_ids", "primary_branch_id",
         ]
+
+    def to_representation(self, instance):
+        rep = super().to_representation(instance)
+        return _apply_market_cashier_gate(rep, instance)
 
 
 class SectorSerializer(serializers.ModelSerializer):
