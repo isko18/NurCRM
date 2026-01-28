@@ -4,6 +4,7 @@ from django.utils import timezone
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework import permissions
+from rest_framework.exceptions import PermissionDenied
 
 from apps.main.models import Sale
 from apps.main.utils_numbers import ensure_sale_doc_number
@@ -26,11 +27,35 @@ def safe_str(v, dash=None):
     s = "" if v is None else str(v).strip()
     return s if s else dash
 
+def _enforce_market_cashier(request):
+    """
+    Документы продажи (чек/накладная) — часть интерфейса кассира.
+    Разрешаем только для компаний со сферой "Маркет" и пользователей с доступом кассира.
+    """
+    user = getattr(request, "user", None)
+    if not user or not getattr(user, "is_authenticated", False):
+        return
+    if getattr(user, "is_superuser", False):
+        return
+
+    company = getattr(user, "owned_company", None) or getattr(user, "company", None)
+    if not (company and getattr(company, "is_market", None) and company.is_market()):
+        raise PermissionDenied("Интерфейс кассира доступен только для сферы Маркет.")
+
+    role = getattr(user, "role", None)
+    if not (
+        getattr(user, "can_view_cashier", False)
+        or role in ("owner", "admin")
+        or getattr(user, "is_staff", False)
+    ):
+        raise PermissionDenied("Нет доступа к интерфейсу кассира.")
+
 
 class SaleReceiptAPIView(APIView):
     permission_classes = [permissions.IsAuthenticated]
 
     def get(self, request, pk, *args, **kwargs):
+        _enforce_market_cashier(request)
         sale = get_object_or_404(
             Sale.objects.select_related("company", "user", "client").prefetch_related("items"),
             id=pk,
@@ -122,6 +147,7 @@ class SaleInvoiceAPIView(APIView):
     permission_classes = [permissions.IsAuthenticated]
 
     def get(self, request, pk, *args, **kwargs):
+        _enforce_market_cashier(request)
         sale = get_object_or_404(
             Sale.objects.select_related("company", "user", "client").prefetch_related("items"),
             id=pk,

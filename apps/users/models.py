@@ -123,6 +123,35 @@ class Company(models.Model):
             self.save(update_fields=["scale_api_token"])
         return self.scale_api_token
 
+    def is_market(self) -> bool:
+        """
+        True если компания относится к сфере "Маркет".
+
+        В проекте "сфера" задаётся через справочники:
+          - Company.industry (вид деятельности)
+          - Company.sector (отрасль)
+
+        Чтобы не зависеть от точного написания в БД, используем поиск по подстроке
+        ("market"/"маркет") в названии industry/sector.
+        """
+        names = []
+        try:
+            names.append(getattr(self.industry, "name", None))
+        except Exception:
+            pass
+        try:
+            names.append(getattr(self.sector, "name", None))
+        except Exception:
+            pass
+
+        for n in names:
+            s = (n or "").strip().casefold()
+            if not s:
+                continue
+            if "market" in s or "маркет" in s:
+                return True
+        return False
+
     def _generate_unique_slug(self) -> str:
         base = slugify(self.name)[:60] or "company"
         candidate = base

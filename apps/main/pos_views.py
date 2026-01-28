@@ -90,6 +90,43 @@ def register_fonts_if_needed():
 
 register_fonts_if_needed()
 
+def _is_market_company(company: Optional[Company]) -> bool:
+    try:
+        return bool(company and getattr(company, "is_market", None) and company.is_market())
+    except Exception:
+        return False
+
+
+class MarketCashierOnlyMixin:
+    """
+    Ограничение POS/кассирского функционала:
+    - доступно только компаниям со сферой "Маркет" (Company.is_market())
+    - и только пользователям с can_view_cashier (или owner/admin/staff/superuser)
+    """
+
+    def initial(self, request, *args, **kwargs):
+        super().initial(request, *args, **kwargs)
+
+        user = getattr(request, "user", None)
+        if not user or not getattr(user, "is_authenticated", False):
+            return
+
+        # system admin
+        if getattr(user, "is_superuser", False):
+            return
+
+        company = getattr(user, "owned_company", None) or getattr(user, "company", None)
+        if not _is_market_company(company):
+            raise PermissionDenied("Интерфейс кассира доступен только для сферы Маркет.")
+
+        role = getattr(user, "role", None)
+        if not (
+            getattr(user, "can_view_cashier", False)
+            or role in ("owner", "admin")
+            or getattr(user, "is_staff", False)
+        ):
+            raise PermissionDenied("Нет доступа к интерфейсу кассира.")
+
 
 def _set_font(p, name: str, size: int, fallback: str = "Helvetica"):
     """
@@ -1050,7 +1087,7 @@ class SaleInvoiceDownloadAPIView(APIView):
         return FileResponse(buffer, as_attachment=True, filename=f"invoice_{doc_no}.pdf")
 
 
-class SaleReceiptDataAPIView(APIView):
+class SaleReceiptDataAPIView(MarketCashierOnlyMixin, APIView):
     permission_classes = [permissions.IsAuthenticated]
 
     def get(self, request, pk, *args, **kwargs):
@@ -1070,7 +1107,7 @@ class SaleReceiptDataAPIView(APIView):
         return Response(payload, status=200)
 
 
-class SaleStartAPIView(CompanyBranchRestrictedMixin, APIView):
+class SaleStartAPIView(MarketCashierOnlyMixin, CompanyBranchRestrictedMixin, APIView):
     permission_classes = [permissions.IsAuthenticated]
 
     @transaction.atomic
@@ -1136,7 +1173,7 @@ class SaleStartAPIView(CompanyBranchRestrictedMixin, APIView):
         return Response(SaleCartSerializer(cart).data, status=status.HTTP_201_CREATED)
 
 
-class CartDetailAPIView(generics.RetrieveAPIView):
+class CartDetailAPIView(MarketCashierOnlyMixin, generics.RetrieveAPIView):
     serializer_class = SaleCartSerializer
     permission_classes = [permissions.IsAuthenticated]
 
@@ -1144,7 +1181,7 @@ class CartDetailAPIView(generics.RetrieveAPIView):
         return Cart.objects.filter(company=self.request.user.company)
 
 
-class SaleScanAPIView(APIView):
+class SaleScanAPIView(MarketCashierOnlyMixin, APIView):
     permission_classes = [permissions.IsAuthenticated]
 
     @transaction.atomic
@@ -1221,7 +1258,7 @@ class SaleScanAPIView(APIView):
         return Response(SaleCartSerializer(cart).data, status=status.HTTP_201_CREATED)
 
 
-class SaleAddItemAPIView(APIView):
+class SaleAddItemAPIView(MarketCashierOnlyMixin, APIView):
     permission_classes = [permissions.IsAuthenticated]
 
     @transaction.atomic
@@ -1285,7 +1322,7 @@ class SaleAddItemAPIView(APIView):
         return Response(SaleCartSerializer(cart).data, status=status.HTTP_201_CREATED)
 
 
-class SaleCheckoutAPIView(APIView):
+class SaleCheckoutAPIView(MarketCashierOnlyMixin, APIView):
     permission_classes = [permissions.IsAuthenticated]
 
     @transaction.atomic
@@ -1389,7 +1426,7 @@ class SaleCheckoutAPIView(APIView):
         return Response(payload, status=status.HTTP_201_CREATED)
 
 
-class SaleMobileScannerTokenAPIView(APIView):
+class SaleMobileScannerTokenAPIView(MarketCashierOnlyMixin, APIView):
     permission_classes = [permissions.IsAuthenticated]
 
     def post(self, request, pk, *args, **kwargs):
@@ -1403,7 +1440,7 @@ class SaleMobileScannerTokenAPIView(APIView):
         return Response(MobileScannerTokenSerializer(token).data, status=201)
 
 
-class ProductFindByBarcodeAPIView(APIView):
+class ProductFindByBarcodeAPIView(MarketCashierOnlyMixin, APIView):
     permission_classes = [permissions.IsAuthenticated]
 
     def get(self, request, *args, **kwargs):
@@ -1451,6 +1488,9 @@ class MobileScannerIngestAPIView(APIView):
             return Response({"detail": "token expired"}, status=410)
 
         cart = mt.cart
+        # POS доступен только для сферы Маркет
+        if not _is_market_company(getattr(cart, "company", None)):
+            return Response({"detail": "invalid token"}, status=404)
 
         # ✅ защита: нельзя сканить в уже закрытую/неактивную корзину
         if cart.status != Cart.Status.ACTIVE:
@@ -1482,7 +1522,7 @@ class MobileScannerIngestAPIView(APIView):
         return Response({"ok": True}, status=201)
 
 
-class SaleListAPIView(CompanyBranchRestrictedMixin, generics.ListAPIView):
+class SaleListAPIView(MarketCashierOnlyMixin, CompanyBranchRestrictedMixin, generics.ListAPIView):
     serializer_class = SaleListSerializer
     queryset = (
         Sale.objects.select_related("user")
@@ -1514,7 +1554,7 @@ class SaleListAPIView(CompanyBranchRestrictedMixin, generics.ListAPIView):
         return qs
 
 
-class SaleRetrieveAPIView(CompanyBranchRestrictedMixin, generics.RetrieveUpdateDestroyAPIView):
+class SaleRetrieveAPIView(MarketCashierOnlyMixin, CompanyBranchRestrictedMixin, generics.RetrieveUpdateDestroyAPIView):
     permission_classes = [permissions.IsAuthenticated]
     lookup_field = "id"
     lookup_url_kwarg = "pk"
@@ -1531,7 +1571,7 @@ class SaleRetrieveAPIView(CompanyBranchRestrictedMixin, generics.RetrieveUpdateD
         return SaleDetailSerializer
 
 
-class SaleBulkDeleteAPIView(CompanyBranchRestrictedMixin, APIView):
+class SaleBulkDeleteAPIView(MarketCashierOnlyMixin, CompanyBranchRestrictedMixin, APIView):
     permission_classes = [permissions.IsAuthenticated]
 
     @transaction.atomic
@@ -1576,7 +1616,7 @@ class SaleBulkDeleteAPIView(CompanyBranchRestrictedMixin, APIView):
         )
 
 
-class CartItemUpdateDestroyAPIView(APIView):
+class CartItemUpdateDestroyAPIView(MarketCashierOnlyMixin, APIView):
     permission_classes = [permissions.IsAuthenticated]
 
     def _get_active_cart(self, request, cart_id):
@@ -1632,7 +1672,7 @@ class CartItemUpdateDestroyAPIView(APIView):
         return Response(SaleCartSerializer(cart).data, status=200)
 
 
-class SaleAddCustomItemAPIView(APIView):
+class SaleAddCustomItemAPIView(MarketCashierOnlyMixin, APIView):
     permission_classes = [permissions.IsAuthenticated]
 
     @transaction.atomic
@@ -1810,7 +1850,7 @@ def _allocate_agent_sale(*, company, agent, sale: Sale):
             raise ValidationError({"detail": "Внутренняя ошибка распределения остатков по передачам."})
 
 
-class AgentCartStartAPIView(CompanyBranchRestrictedMixin, APIView):
+class AgentCartStartAPIView(MarketCashierOnlyMixin, CompanyBranchRestrictedMixin, APIView):
     permission_classes = [permissions.IsAuthenticated]
 
     @transaction.atomic
@@ -1856,7 +1896,7 @@ class AgentCartStartAPIView(CompanyBranchRestrictedMixin, APIView):
         return Response(SaleCartSerializer(cart).data, status=status.HTTP_201_CREATED)
 
 
-class AgentSaleScanAPIView(CompanyBranchRestrictedMixin, APIView):
+class AgentSaleScanAPIView(MarketCashierOnlyMixin, CompanyBranchRestrictedMixin, APIView):
     permission_classes = [permissions.IsAuthenticated]
 
     @transaction.atomic
@@ -1926,7 +1966,7 @@ class AgentSaleScanAPIView(CompanyBranchRestrictedMixin, APIView):
         return Response(SaleCartSerializer(cart).data, status=status.HTTP_201_CREATED)
 
 
-class AgentSaleAddItemAPIView(CompanyBranchRestrictedMixin, APIView):
+class AgentSaleAddItemAPIView(MarketCashierOnlyMixin, CompanyBranchRestrictedMixin, APIView):
     permission_classes = [permissions.IsAuthenticated]
 
     @transaction.atomic
@@ -2005,7 +2045,7 @@ class AgentSaleAddItemAPIView(CompanyBranchRestrictedMixin, APIView):
         return Response(SaleCartSerializer(cart).data, status=status.HTTP_201_CREATED)
 
 
-class AgentSaleAddCustomItemAPIView(CompanyBranchRestrictedMixin, APIView):
+class AgentSaleAddCustomItemAPIView(MarketCashierOnlyMixin, CompanyBranchRestrictedMixin, APIView):
     permission_classes = [permissions.IsAuthenticated]
 
     @transaction.atomic
@@ -2052,7 +2092,7 @@ class AgentSaleAddCustomItemAPIView(CompanyBranchRestrictedMixin, APIView):
         return Response(SaleCartSerializer(cart).data, status=status.HTTP_201_CREATED)
 
 
-class AgentSaleCheckoutAPIView(CompanyBranchRestrictedMixin, APIView):
+class AgentSaleCheckoutAPIView(MarketCashierOnlyMixin, CompanyBranchRestrictedMixin, APIView):
     permission_classes = [permissions.IsAuthenticated]
 
     @transaction.atomic
@@ -2161,7 +2201,7 @@ class AgentSaleCheckoutAPIView(CompanyBranchRestrictedMixin, APIView):
         return Response(payload, status=status.HTTP_201_CREATED)
 
 
-class AgentCartItemUpdateDestroyAPIView(APIView):
+class AgentCartItemUpdateDestroyAPIView(MarketCashierOnlyMixin, APIView):
     permission_classes = [permissions.IsAuthenticated]
 
     def _get_active_cart(self, request, cart_id):
