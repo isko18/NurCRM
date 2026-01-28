@@ -14,6 +14,7 @@ from PIL import Image
 from django.db.models.functions import Cast
 import io
 import logging
+import json
 
 from apps.users.models import Company, User, Branch
 from apps.consalting.models import ServicesConsalting
@@ -3103,16 +3104,20 @@ class ReturnFromAgent(models.Model):
                 .exclude(pk=self.pk)
                 .aggregate(s=Sum("qty"))["s"] or 0
             )
-            raise ValidationError({
-                "qty": f"Можно принять максимум {qty_on_hand}.",
-                "debug": {
-                    "qty_accepted": accepted,
-                    "qty_returned": returned,
-                    "sold_paid_debt": sold,
-                    "pending_reserved_other": pending_reserved_other,
-                    "available_now": qty_on_hand,
+            debug_payload = {
+                "qty_accepted": accepted,
+                "qty_returned": returned,
+                "sold_paid_debt": sold,
+                "pending_reserved_other": pending_reserved_other,
+                "available_now": qty_on_hand,
+            }
+            raise ValidationError(
+                {
+                    "qty": [f"Можно принять максимум {qty_on_hand}."],
+                    # Django ValidationError ожидает строку/список строк, не dict
+                    "debug": [json.dumps(debug_payload, ensure_ascii=False, default=str)],
                 }
-            })
+            )
         product = locked_sub.product
         type(product).objects.select_for_update().filter(pk=product.pk).update(quantity=F("quantity") + self.qty)
         prod_model = type(product)
