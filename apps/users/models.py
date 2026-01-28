@@ -144,11 +144,19 @@ class Company(models.Model):
         except Exception:
             pass
 
+        # Ключевые слова, которые на практике встречаются в названии сферы "Маркет".
+        # (у вас сфера хранится текстом в справочниках, поэтому делаем проверку "по смыслу")
+        keywords = (
+            "market", "маркет", "marketing", "маркетинг",
+            "shop", "store", "retail", "ритейл",
+            "магазин", "продукт", "супермаркет", "гипермаркет", "торгов",
+        )
+
         for n in names:
             s = (n or "").strip().casefold()
             if not s:
                 continue
-            if "market" in s or "маркет" in s:
+            if any(k in s for k in keywords):
                 return True
         return False
 

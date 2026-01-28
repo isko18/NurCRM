@@ -193,7 +193,7 @@ class CashShift(models.Model):
     noncash_sales_total = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal("0.00"), verbose_name="Безналичные продажи")
 
     class Meta:
-        verbose_name = "Кассовая сменаa"
+        verbose_name = "Кассовая смена"
         verbose_name_plural = "Кассовые смены"
         constraints = [
             # ✅ теперь можно много OPEN на 1 cashbox,
