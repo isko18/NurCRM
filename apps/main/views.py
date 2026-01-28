@@ -33,6 +33,7 @@ from apps.main.models import (
     ProductBrand, ProductCategory, Warehouse, WarehouseEvent, Client,
     GlobalProduct, GlobalBrand, GlobalCategory, ClientDeal, Bid, SocialApplications, TransactionRecord,
     ContractorWork, DealInstallment, DebtPayment, Debt, ObjectSaleItem, ObjectSale, ObjectItem, ItemMake,
+    Sale,
     ManufactureSubreal, Acceptance, ReturnFromAgent, AgentSaleAllocation, ProductImage,
     AgentRequestCart, AgentRequestItem, ProductPackage, ProductCharacteristics, DealPayment
 )
@@ -2493,7 +2494,15 @@ class AgentMyProductsListAPIView(APIView, CompanyBranchRestrictedMixin):
                     to_attr="prefetched_allocs",
                 ),
             )
-            .annotate(sold_qty=Coalesce(Sum("sale_allocations__qty"), V(0)))
+            .annotate(
+                sold_qty=Coalesce(
+                    Sum(
+                        "sale_allocations__qty",
+                        filter=Q(sale_allocations__sale__status__in=[Sale.Status.PAID, Sale.Status.DEBT]),
+                    ),
+                    V(0),
+                )
+            )
             .order_by("product_id", "-created_at")
         )
         base = self._filter_qs_company_branch(base)
@@ -2754,7 +2763,15 @@ class OwnerAgentsProductsListAPIView(APIView, CompanyBranchRestrictedMixin):
                     to_attr="prefetched_allocs",
                 ),
             )
-            .annotate(sold_qty=Coalesce(Sum("sale_allocations__qty"), V(0)))
+            .annotate(
+                sold_qty=Coalesce(
+                    Sum(
+                        "sale_allocations__qty",
+                        filter=Q(sale_allocations__sale__status__in=[Sale.Status.PAID, Sale.Status.DEBT]),
+                    ),
+                    V(0),
+                )
+            )
             .order_by("agent_id", "product_id", "-created_at")
         )
         base = self._filter_qs_company_branch(base)

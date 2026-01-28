@@ -14,6 +14,7 @@ from apps.main.models import (
     Notification, Event, Warehouse, WarehouseEvent, ProductCategory, ProductBrand,
     OrderItem, Client, GlobalProduct, CartItem, ClientDeal, Bid, SocialApplications,
     TransactionRecord, DealInstallment, ContractorWork, Debt, DebtPayment,
+    Sale,
     ObjectItem, ObjectSale, ObjectSaleItem, ItemMake, ManufactureSubreal, Acceptance,
     ReturnFromAgent, ProductImage, PromoRule, AgentRequestCart, AgentRequestItem, ProductPackage, ProductCharacteristics, DealPayment, AgentSaleAllocation
 )
@@ -1969,7 +1970,18 @@ class ReturnCreateSerializer(serializers.ModelSerializer):
             sold_qty=Coalesce(
                 Sum(
                     "sale_allocations__qty",
-                    filter=Q(sale_allocations__company_id=company_id),
+                    filter=Q(
+                        sale_allocations__company_id=company_id,
+                        sale_allocations__sale__status__in=[Sale.Status.PAID, Sale.Status.DEBT],
+                    ),
+                ),
+                V(0),
+            )
+        ).annotate(
+            reserved_qty=Coalesce(
+                Sum(
+                    "returns__qty",
+                    filter=Q(returns__company_id=company_id, returns__status=ReturnFromAgent.Status.PENDING),
                 ),
                 V(0),
             )
@@ -1981,7 +1993,8 @@ class ReturnCreateSerializer(serializers.ModelSerializer):
             accepted = int(s.qty_accepted or 0)
             returned = int(s.qty_returned or 0)
             sold = int(getattr(s, "sold_qty", 0) or 0)
-            on_hand = max(accepted - returned - sold, 0)
+            reserved = int(getattr(s, "reserved_qty", 0) or 0)
+            on_hand = max(accepted - returned - sold - reserved, 0)
             if on_hand > 0:
                 total_on_hand += on_hand
             if picked is None and on_hand >= int(qty):
