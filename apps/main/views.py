@@ -33,7 +33,6 @@ from apps.main.models import (
     ProductBrand, ProductCategory, Warehouse, WarehouseEvent, Client,
     GlobalProduct, GlobalBrand, GlobalCategory, ClientDeal, Bid, SocialApplications, TransactionRecord,
     ContractorWork, DealInstallment, DebtPayment, Debt, ObjectSaleItem, ObjectSale, ObjectItem, ItemMake,
-    Sale,
     ManufactureSubreal, Acceptance, ReturnFromAgent, AgentSaleAllocation, ProductImage,
     AgentRequestCart, AgentRequestItem, ProductPackage, ProductCharacteristics, DealPayment
 )
@@ -1898,7 +1897,7 @@ class DebtListCreateAPIView(CompanyBranchRestrictedMixin, generics.ListCreateAPI
 
     def get_queryset(self):
         return self._filter_qs_company_branch(
-            Debt.objects.select_related("company", "branch").all()
+            Debt.objects.select_related("company", "branch", "client").all()
         )
 
 
@@ -1910,7 +1909,7 @@ class DebtRetrieveUpdateDestroyAPIView(CompanyBranchRestrictedMixin, generics.Re
 
     def get_queryset(self):
         return self._filter_qs_company_branch(
-            Debt.objects.select_related("company", "branch").all()
+            Debt.objects.select_related("company", "branch", "client").all()
         )
 
 
@@ -1952,7 +1951,7 @@ class DebtPaymentListAPIView(CompanyBranchRestrictedMixin, generics.ListAPIView)
     def get_queryset(self):
         # платежи конкретного долга в рамках компании/филиала
         debt_qs = self._filter_qs_company_branch(
-            Debt.objects.select_related("company", "branch").all()
+            Debt.objects.select_related("company", "branch", "client").all()
         )
         debt = get_object_or_404(debt_qs, pk=self.kwargs["pk"])
         return DebtPayment.objects.filter(company=debt.company, debt=debt)
@@ -2494,15 +2493,7 @@ class AgentMyProductsListAPIView(APIView, CompanyBranchRestrictedMixin):
                     to_attr="prefetched_allocs",
                 ),
             )
-            .annotate(
-                sold_qty=Coalesce(
-                    Sum(
-                        "sale_allocations__qty",
-                        filter=Q(sale_allocations__sale__status__in=[Sale.Status.PAID, Sale.Status.DEBT]),
-                    ),
-                    V(0),
-                )
-            )
+            .annotate(sold_qty=Coalesce(Sum("sale_allocations__qty"), V(0)))
             .order_by("product_id", "-created_at")
         )
         base = self._filter_qs_company_branch(base)
@@ -2763,15 +2754,7 @@ class OwnerAgentsProductsListAPIView(APIView, CompanyBranchRestrictedMixin):
                     to_attr="prefetched_allocs",
                 ),
             )
-            .annotate(
-                sold_qty=Coalesce(
-                    Sum(
-                        "sale_allocations__qty",
-                        filter=Q(sale_allocations__sale__status__in=[Sale.Status.PAID, Sale.Status.DEBT]),
-                    ),
-                    V(0),
-                )
-            )
+            .annotate(sold_qty=Coalesce(Sum("sale_allocations__qty"), V(0)))
             .order_by("agent_id", "product_id", "-created_at")
         )
         base = self._filter_qs_company_branch(base)
