@@ -90,17 +90,9 @@ def register_fonts_if_needed():
 
 register_fonts_if_needed()
 
-def _is_market_company(company: Optional[Company]) -> bool:
-    try:
-        return bool(company and getattr(company, "is_market", None) and company.is_market())
-    except Exception:
-        return False
-
-
 class MarketCashierOnlyMixin:
     """
     Ограничение POS/кассирского функционала:
-    - доступно только компаниям со сферой "Маркет" (Company.is_market())
     - и только пользователям с can_view_cashier (или owner/admin/staff/superuser)
     """
 
@@ -114,10 +106,6 @@ class MarketCashierOnlyMixin:
         # system admin
         if getattr(user, "is_superuser", False):
             return
-
-        company = getattr(user, "owned_company", None) or getattr(user, "company", None)
-        if not _is_market_company(company):
-            raise PermissionDenied("Интерфейс кассира доступен только для сферы Маркет.")
 
         role = getattr(user, "role", None)
         if not (

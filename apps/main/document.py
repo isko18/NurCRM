@@ -30,17 +30,13 @@ def safe_str(v, dash=None):
 def _enforce_market_cashier(request):
     """
     Документы продажи (чек/накладная) — часть интерфейса кассира.
-    Разрешаем только для компаний со сферой "Маркет" и пользователей с доступом кассира.
+    Разрешаем только пользователям с доступом кассира.
     """
     user = getattr(request, "user", None)
     if not user or not getattr(user, "is_authenticated", False):
         return
     if getattr(user, "is_superuser", False):
         return
-
-    company = getattr(user, "owned_company", None) or getattr(user, "company", None)
-    if not (company and getattr(company, "is_market", None) and company.is_market()):
-        raise PermissionDenied("Интерфейс кассира доступен только для сферы Маркет.")
 
     role = getattr(user, "role", None)
     if not (
