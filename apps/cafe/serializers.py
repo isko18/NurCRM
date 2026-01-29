@@ -4,7 +4,7 @@ from django.db.models import Q
 from decimal import Decimal
 from rest_framework import serializers
 from django.core.exceptions import ValidationError as DjangoValidationError
-from django.db import transaction
+from django.db import transaction, IntegrityError
 
 from apps.cafe.models import (
     Zone, Table, Booking, Warehouse, Purchase,
@@ -168,11 +168,70 @@ class KitchenSerializer(CompanyBranchReadOnlyMixin):
         read_only_fields = ["id", "company", "branch"]
 
     def validate(self, attrs):
-        # Если хочешь запретить пустой title
-        title = (attrs.get("title") or "").strip()
+        title = (attrs.get("title") or getattr(self.instance, "title", "") or "").strip()
         if not title:
             raise serializers.ValidationError({"title": "Название кухни обязательно."})
+
+        number = attrs.get("number", getattr(self.instance, "number", None))
+        if self.instance is None and number is None:
+            raise serializers.ValidationError({"number": "Обязательное поле."})
+
+        company = self._user_company()
+        if not company:
+            raise serializers.ValidationError("Невозможно определить компанию пользователя.")
+
+        auto_branch = self._auto_branch()
+        branch_to_use = (
+            auto_branch
+            if auto_branch is not None
+            else getattr(self.instance, "branch", None)
+        )
+
+        qs = Kitchen.objects.filter(company=company)
+        if branch_to_use is None:
+            qs = qs.filter(branch__isnull=True)
+        else:
+            qs = qs.filter(branch=branch_to_use)
+
+        if number is not None:
+            num_qs = qs.filter(number=number)
+            if self.instance is not None:
+                num_qs = num_qs.exclude(pk=self.instance.pk)
+            if num_qs.exists():
+                raise serializers.ValidationError({"number": "Кухня с таким номером уже существует."})
+
+        title_qs = qs.filter(title=title)
+        if self.instance is not None:
+            title_qs = title_qs.exclude(pk=self.instance.pk)
+        if title_qs.exists():
+            raise serializers.ValidationError({"title": "Кухня с таким названием уже существует."})
+
         return attrs
+
+    def create(self, validated_data):
+        try:
+            with transaction.atomic():
+                return super().create(validated_data)
+        except IntegrityError as e:
+            # Дружелюбная ошибка вместо 500 IntegrityError (уникальные ограничения)
+            msg = str(e)
+            if "uniq_kitchen_number_" in msg:
+                raise serializers.ValidationError({"number": "Кухня с таким номером уже существует."})
+            if "uniq_kitchen_title_" in msg:
+                raise serializers.ValidationError({"title": "Кухня с таким названием уже существует."})
+            raise
+
+    def update(self, instance, validated_data):
+        try:
+            with transaction.atomic():
+                return super().update(instance, validated_data)
+        except IntegrityError as e:
+            msg = str(e)
+            if "uniq_kitchen_number_" in msg:
+                raise serializers.ValidationError({"number": "Кухня с таким номером уже существует."})
+            if "uniq_kitchen_title_" in msg:
+                raise serializers.ValidationError({"title": "Кухня с таким названием уже существует."})
+            raise
 
 # --- НОВОЕ: Notification (если нужно выводить списком) ---
 class NotificationCafeSerializer(serializers.ModelSerializer):

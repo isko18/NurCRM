@@ -3,7 +3,7 @@ from decimal import Decimal
 import json
 import uuid
 
-from django.db import transaction
+from django.db import transaction, IntegrityError
 from django.db.models import Q, Count, Avg, ExpressionWrapper, DurationField, F
 from django.utils import timezone
 from django_filters.rest_framework import DjangoFilterBackend
@@ -11,6 +11,7 @@ import django_filters
 from rest_framework import filters, generics, permissions, status
 from rest_framework.response import Response
 from rest_framework.views import APIView
+from rest_framework.exceptions import ValidationError
 from channels.layers import get_channel_layer
 from asgiref.sync import async_to_sync
 import logging
@@ -1208,6 +1209,17 @@ class KitchenListCreateView(CompanyBranchQuerysetMixin, generics.ListCreateAPIVi
             qs = qs.filter(Q(branch=active_branch) | Q(branch__isnull=True))
 
         return qs
+
+    def perform_create(self, serializer):
+        try:
+            serializer.save()
+        except IntegrityError as e:
+            msg = str(e)
+            if "uniq_kitchen_number_" in msg:
+                raise ValidationError({"number": "Кухня с таким номером уже существует."})
+            if "uniq_kitchen_title_" in msg:
+                raise ValidationError({"title": "Кухня с таким названием уже существует."})
+            raise
 
 
 class KitchenRetrieveUpdateDestroyView(CompanyBranchQuerysetMixin, generics.RetrieveUpdateDestroyAPIView):
