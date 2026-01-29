@@ -3146,6 +3146,19 @@ class ReturnFromAgent(models.Model):
         self.accepted_at = timezone.now()
         super().save(update_fields=["status", "accepted_by", "accepted_at"])
 
+    @transaction.atomic
+    def reject(self, by_user):
+        """
+        Владелец/админ отклонил возврат.
+        Товар на склад не возвращаем.
+        """
+        if self.status != self.Status.PENDING:
+            raise ValidationError("Возврат уже обработан.")
+        self.status = self.Status.REJECTED
+        self.accepted_by = by_user
+        self.accepted_at = timezone.now()
+        super().save(update_fields=["status", "accepted_by", "accepted_at"])
+
 
 class AgentSaleAllocation(models.Model):
     company   = models.ForeignKey("users.Company", on_delete=models.CASCADE)
