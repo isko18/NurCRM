@@ -1897,7 +1897,7 @@ class DebtListCreateAPIView(CompanyBranchRestrictedMixin, generics.ListCreateAPI
 
     def get_queryset(self):
         return self._filter_qs_company_branch(
-            Debt.objects.select_related("company", "branch", "client").all()
+            Debt.objects.select_related("company", "branch").all()
         )
 
 
@@ -1909,7 +1909,7 @@ class DebtRetrieveUpdateDestroyAPIView(CompanyBranchRestrictedMixin, generics.Re
 
     def get_queryset(self):
         return self._filter_qs_company_branch(
-            Debt.objects.select_related("company", "branch", "client").all()
+            Debt.objects.select_related("company", "branch").all()
         )
 
 
@@ -1951,7 +1951,7 @@ class DebtPaymentListAPIView(CompanyBranchRestrictedMixin, generics.ListAPIView)
     def get_queryset(self):
         # платежи конкретного долга в рамках компании/филиала
         debt_qs = self._filter_qs_company_branch(
-            Debt.objects.select_related("company", "branch", "client").all()
+            Debt.objects.select_related("company", "branch").all()
         )
         debt = get_object_or_404(debt_qs, pk=self.kwargs["pk"])
         return DebtPayment.objects.filter(company=debt.company, debt=debt)
