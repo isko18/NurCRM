@@ -2060,6 +2060,14 @@ class ReturnApproveSerializer(serializers.Serializer):
         return ret
 
 
+class ReturnRejectSerializer(serializers.Serializer):
+    def save(self, **kwargs):
+        ret: ReturnFromAgent = self.context["return_obj"]
+        user = self.context["request"].user
+        ret.reject(by_user=user)
+        return ret
+
+
 # ===========================
 # BULK выдача агенту
 # ===========================

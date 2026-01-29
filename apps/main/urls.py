@@ -206,6 +206,7 @@ urlpatterns = [
     path("returns/", ReturnFromAgentListCreateAPIView.as_view(), name="return-list-create"),
     path("returns/<uuid:pk>/", ReturnFromAgentRetrieveDestroyAPIView.as_view(), name="return-detail"),
     path("returns/<uuid:pk>/approve/", ReturnFromAgentApproveAPIView.as_view(), name="return-approve"),
+    path("returns/<uuid:pk>/reject/", ReturnFromAgentRejectAPIView.as_view(), name="return-reject"),
 
     # -------------------------
     # Агент: свои товары

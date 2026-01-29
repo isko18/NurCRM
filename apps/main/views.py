@@ -48,7 +48,7 @@ from apps.main.serializers import (
     ObjectItemSerializer, ObjectSaleSerializer, ObjectSaleItemSerializer,
     BulkIdsSerializer, ItemMakeSerializer,
     ManufactureSubrealSerializer, AcceptanceCreateSerializer, ReturnCreateSerializer,
-    BulkSubrealCreateSerializer, AcceptanceReadSerializer, ReturnApproveSerializer, ReturnReadSerializer,
+    BulkSubrealCreateSerializer, AcceptanceReadSerializer, ReturnApproveSerializer, ReturnRejectSerializer, ReturnReadSerializer,
     AgentProductOnHandSerializer, AgentWithProductsSerializer, GlobalProductReadSerializer,
     ProductImageSerializer,
     AgentRequestCartApproveSerializer, AgentRequestCartRejectSerializer,
@@ -2360,6 +2360,41 @@ class ReturnFromAgentApproveAPIView(APIView, CompanyBranchRestrictedMixin):
             return Response(ReturnReadSerializer(ret).data, status=status.HTTP_200_OK)
 
         ser = ReturnApproveSerializer(
+            data=request.data,
+            context={"request": request, "return_obj": ret},
+        )
+        ser.is_valid(raise_exception=True)
+        ret = ser.save()
+        return Response(ReturnReadSerializer(ret).data, status=status.HTTP_200_OK)
+
+
+# ===========================
+#  Return: reject (идемпотентно)
+# ===========================
+class ReturnFromAgentRejectAPIView(APIView, CompanyBranchRestrictedMixin):
+    """
+    POST /api/main/returns/<uuid:pk>/reject/
+    Отклонение возврата (статус -> rejected).
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    @transaction.atomic
+    def post(self, request, pk, *args, **kwargs):
+        try:
+            ret = (
+                ReturnFromAgent.objects
+                .select_for_update()
+                .select_related("subreal__product")
+                .get(pk=pk, company_id=self._company().id)
+            )
+        except ReturnFromAgent.DoesNotExist:
+            return Response({"detail": "Возврат не найден."}, status=status.HTTP_404_NOT_FOUND)
+
+        # идемпотентность: если уже не pending — просто вернуть текущее состояние
+        if ret.status != ReturnFromAgent.Status.PENDING:
+            return Response(ReturnReadSerializer(ret).data, status=status.HTTP_200_OK)
+
+        ser = ReturnRejectSerializer(
             data=request.data,
             context={"request": request, "return_obj": ret},
         )
