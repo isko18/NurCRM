@@ -10,10 +10,10 @@ from .models import (
     Zone,  Warehouse,
     KitchenTask, NotificationCafe,
     InventorySession, InventoryItem,
-    Equipment, EquipmentInventorySession, EquipmentInventoryItem,
+    Equipment, EquipmentInventorySession, EquipmentInventoryItem, Kitchen
 )
 
-
+admin.site.register(Kitchen)
 # -----------------------------
 # Zone
 # -----------------------------
