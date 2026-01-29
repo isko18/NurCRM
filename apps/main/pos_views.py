@@ -93,27 +93,12 @@ register_fonts_if_needed()
 class MarketCashierOnlyMixin:
     """
     Ограничение POS/кассирского функционала:
-    - и только пользователям с can_view_cashier (или owner/admin/staff/superuser)
+    - проверка доступа выполняется на фронте
     """
 
     def initial(self, request, *args, **kwargs):
         super().initial(request, *args, **kwargs)
-
-        user = getattr(request, "user", None)
-        if not user or not getattr(user, "is_authenticated", False):
-            return
-
-        # system admin
-        if getattr(user, "is_superuser", False):
-            return
-
-        role = getattr(user, "role", None)
-        if not (
-            getattr(user, "can_view_cashier", False)
-            or role in ("owner", "admin")
-            or getattr(user, "is_staff", False)
-        ):
-            raise PermissionDenied("Нет доступа к интерфейсу кассира.")
+        return
 
 
 def _set_font(p, name: str, size: int, fallback: str = "Helvetica"):
