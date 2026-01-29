@@ -30,21 +30,9 @@ def safe_str(v, dash=None):
 def _enforce_market_cashier(request):
     """
     Документы продажи (чек/накладная) — часть интерфейса кассира.
-    Разрешаем только пользователям с доступом кассира.
+    Проверка доступа выполняется на фронте.
     """
-    user = getattr(request, "user", None)
-    if not user or not getattr(user, "is_authenticated", False):
-        return
-    if getattr(user, "is_superuser", False):
-        return
-
-    role = getattr(user, "role", None)
-    if not (
-        getattr(user, "can_view_cashier", False)
-        or role in ("owner", "admin")
-        or getattr(user, "is_staff", False)
-    ):
-        raise PermissionDenied("Нет доступа к интерфейсу кассира.")
+    return
 
 
 class SaleReceiptAPIView(APIView):
