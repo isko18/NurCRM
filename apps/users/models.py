@@ -473,6 +473,13 @@ class User(AbstractBaseUser, PermissionsMixin):
         self.set_unusable_password()
         self.save(update_fields=["is_active", "deleted_at", "deleted_by", "email", "password"])
 
+    def save(self, *args, **kwargs):
+        # Доступ к кассе разрешён только для компаний со сферой "Маркет".
+        company = getattr(self, "company", None)
+        if not (company and getattr(company, "is_market", None) and company.is_market()):
+            self.can_view_cashier = False
+        super().save(*args, **kwargs)
+
 
 class BranchMembership(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False, verbose_name="ID")
