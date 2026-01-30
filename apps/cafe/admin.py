@@ -13,7 +13,13 @@ from .models import (
     Equipment, EquipmentInventorySession, EquipmentInventoryItem, Kitchen
 )
 
-admin.site.register(Kitchen)
+@admin.register(Kitchen)
+class KitchenAdmin(admin.ModelAdmin):
+    list_display = ("number", "title", "printer", "company", "branch")
+    list_filter = ("company", "branch")
+    search_fields = ("title", "printer")
+    ordering = ("company", "branch", "number")
+    list_select_related = ("company", "branch")
 # -----------------------------
 # Zone
 # -----------------------------

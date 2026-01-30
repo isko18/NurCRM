@@ -33,6 +33,7 @@ class Kitchen(models.Model):
 
     title = models.CharField("Кухня", max_length=255)
     number = models.PositiveIntegerField("Номер", validators=[MinValueValidator(1)], db_index=True)
+    printer = models.CharField("Принтер", max_length=255, blank=True, default="")
 
     class Meta:
         verbose_name = "Кухня"
