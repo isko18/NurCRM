@@ -164,7 +164,7 @@ class KitchenTaskSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSeriali
 class KitchenSerializer(CompanyBranchReadOnlyMixin):
     class Meta:
         model = Kitchen
-        fields = ["id", "company", "branch", "title", "number"]
+        fields = ["id", "company", "branch", "title", "number", "printer"]
         read_only_fields = ["id", "company", "branch"]
 
     def validate(self, attrs):
