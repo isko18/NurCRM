@@ -1,7 +1,7 @@
 # apps/logistics/serializers.py
 
 from rest_framework import serializers
-from .models import Logistics
+from .models import Logistics, LogisticsExpense
 from apps.users.models import Company, Branch, User
 from apps.main.models import Client
 
@@ -116,3 +116,18 @@ class LogisticsSerializer(serializers.ModelSerializer):
             validated_data["created_by"] = req.user
 
         return super().create(validated_data)
+
+
+class LogisticsExpenseSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = LogisticsExpense
+        fields = [
+            "id",
+            "company",
+            "branch",
+            "created_by",
+            "name",
+            "amount",
+            "created_at",
+        ]
+        read_only_fields = ("id", "company", "branch", "created_by", "created_at")

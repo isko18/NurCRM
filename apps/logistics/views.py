@@ -10,14 +10,14 @@ from django.db.models import (
     Value,
     ExpressionWrapper,
 )
-from django.db.models.functions import Coalesce, TruncDate
+from django.db.models.functions import Coalesce
 from rest_framework import generics, permissions
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from apps.users.models import Company, Branch
 from rest_framework.exceptions import ValidationError
-from .models import Logistics
-from .serializers import LogisticsSerializer
+from .models import Logistics, LogisticsExpense
+from .serializers import LogisticsSerializer, LogisticsExpenseSerializer
 
 from apps.main.views import CompanyBranchRestrictedMixin
 
@@ -90,6 +90,32 @@ class LogisticsDetailView(CompanyBranchRestrictedMixin, generics.RetrieveUpdateD
 
     def perform_update(self, serializer):
         self._save_with_company_branch(serializer)
+
+
+class LogisticsExpenseListCreateView(CompanyBranchRestrictedMixin, generics.ListCreateAPIView):
+    """
+    GET  /api/logistics/expenses/  -> список расходов (company/branch из миксина)
+    POST /api/logistics/expenses/  -> создать расход (поля: name, amount)
+    """
+
+    serializer_class = LogisticsExpenseSerializer
+    permission_classes = [permissions.IsAuthenticated]
+
+    queryset = (
+        LogisticsExpense.objects
+        .select_related("company", "branch", "created_by")
+        .all()
+    )
+
+    def get_queryset(self):
+        return self._filter_qs_company_branch(super().get_queryset())
+
+    def perform_create(self, serializer):
+        extra = {}
+        user = getattr(self.request, "user", None)
+        if user and user.is_authenticated:
+            extra["created_by"] = user
+        self._save_with_company_branch(serializer, **extra)
 
 
 class LogisticsAnalyticsView(CompanyBranchRestrictedMixin, APIView):
@@ -201,6 +227,21 @@ class LogisticsAnalyticsView(APIView):
         if date_to:
             qs = qs.filter(created_at__date__lte=date_to)
 
+        # Расходы (минусуются из карточки "Все заказы")
+        exp_qs = LogisticsExpense.objects.all()
+        if company:
+            exp_qs = exp_qs.filter(company=company)
+        if branch:
+            exp_qs = exp_qs.filter(branch=branch)
+        if date_from:
+            exp_qs = exp_qs.filter(created_at__date__gte=date_from)
+        if date_to:
+            exp_qs = exp_qs.filter(created_at__date__lte=date_to)
+
+        total_expenses = exp_qs.aggregate(
+            total_expenses=Coalesce(Sum("amount"), ZERO_DEC, output_field=DECIMAL_OUT),
+        )["total_expenses"]
+
         totals = qs.aggregate(
             total_orders=Coalesce(Count("id"), 0),
             total_revenue=Coalesce(Sum("revenue"), ZERO_DEC, output_field=DECIMAL_OUT),
@@ -208,6 +249,11 @@ class LogisticsAnalyticsView(APIView):
             total_car=Coalesce(Sum("price_car"), ZERO_DEC, output_field=DECIMAL_OUT),
             total_sale=Coalesce(Sum("sale_price"), ZERO_DEC, output_field=DECIMAL_OUT),
         )
+
+        # net_revenue = прибыль по логистике - расходы
+        net_revenue = (totals.get("total_revenue") or Decimal("0.00")) - (total_expenses or Decimal("0.00"))
+        totals["total_expenses"] = total_expenses
+        totals["net_revenue"] = net_revenue
 
         by_status_raw = list(
             qs.values("status")
@@ -271,8 +317,9 @@ class LogisticsAnalyticsView(APIView):
                     "all": {
                         "title": "Все заказы",
                         "orders": totals["total_orders"],
-                        "revenue": totals["total_revenue"],
+                        "revenue": net_revenue,
                         "service": totals["total_service"],
+                        "expenses": total_expenses,
                     },
                     "by_status": [
                         {
