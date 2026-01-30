@@ -121,3 +121,54 @@ class Logistics(models.Model):
 
     def __str__(self):
         return f"{self.title} ({self.get_status_display()})"
+
+
+class LogisticsExpense(models.Model):
+    """
+    Расходы по логистике (для аналитики).
+    Храним на уровне company/branch, чтобы можно было учитывать расходы в отчётах.
+    """
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+
+    company = models.ForeignKey(
+        Company,
+        on_delete=models.CASCADE,
+        related_name="logistics_expenses",
+        verbose_name="Компания",
+    )
+
+    branch = models.ForeignKey(
+        Branch,
+        on_delete=models.CASCADE,
+        related_name="logistics_expenses",
+        null=True,
+        blank=True,
+        db_index=True,
+        verbose_name="Филиал",
+    )
+
+    created_by = models.ForeignKey(
+        User,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="created_logistics_expenses",
+        verbose_name="Создал",
+    )
+
+    name = models.CharField(max_length=255, verbose_name="Наименование")
+    amount = models.DecimalField(max_digits=12, decimal_places=2, verbose_name="Сумма")
+    created_at = models.DateTimeField(auto_now_add=True, verbose_name="Создано")
+
+    class Meta:
+        verbose_name = "Расход логистики"
+        verbose_name_plural = "Расходы логистики"
+        ordering = ("-created_at",)
+        indexes = [
+            models.Index(fields=["company", "created_at"]),
+            models.Index(fields=["company", "branch", "created_at"]),
+        ]
+
+    def __str__(self):
+        return f"{self.name}: {self.amount}"
