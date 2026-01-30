@@ -235,10 +235,12 @@ class LogisticsAnalyticsView(APIView):
             for row in by_status_raw
         ]
 
+        # arrival_date в модели — CharField, поэтому TruncDate использовать нельзя.
+        # Группируем по строковому значению (обычно хранится как YYYY-MM-DD).
         by_arrival_date = list(
             qs.exclude(arrival_date__isnull=True)
-            .annotate(day=TruncDate("arrival_date"))
-            .values("day")
+            .exclude(arrival_date="")
+            .values(day=F("arrival_date"))
             .annotate(orders=Coalesce(Count("id"), 0))
             .order_by("day")
         )
