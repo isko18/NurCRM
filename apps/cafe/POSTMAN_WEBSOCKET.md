@@ -174,6 +174,33 @@ ws://localhost:8000/ws/cafe/tables/?token=eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9..
 }
 ```
 
+#### При готовности блюда (задачи кухни)
+
+**Событие:** `kitchen_task_ready`
+
+**Сообщение:**
+```json
+{
+  "type": "kitchen_task_ready",
+  "data": {
+    "task": {
+      "id": "uuid",
+      "status": "ready",
+      "order": "uuid",
+      "menu_item": "uuid",
+      "table_number": 1
+    },
+    "task_id": "uuid",
+    "order_id": "uuid",
+    "table": 1,
+    "menu_item": "Пицца",
+    "unit_index": 1,
+    "company_id": "uuid",
+    "branch_id": "uuid"
+  }
+}
+```
+
 #### При изменении статуса стола
 
 **Событие:** `table_status_changed`
@@ -261,6 +288,7 @@ Content-Type: application/json
 1. `connection_established` - при подключении
 2. `order_created` - при создании заказа
 3. `table_status_changed` - при изменении статуса стола (FREE → BUSY)
+4. `kitchen_task_ready` - при переводе задачи кухни в статус READY
 
 ### 8. Примеры для разных сценариев
 
@@ -291,6 +319,23 @@ Content-Type: application/json
 1. Подключитесь к `ws://localhost:8000/ws/cafe/tables/`
 2. Создайте/обновите заказ через HTTP API
 3. Получите уведомление `table_status_changed` с актуальным статусом стола
+
+#### Сценарий 4: Готовность блюда
+
+1. Подключитесь к `ws://localhost:8000/ws/cafe/orders/`
+2. Отметьте задачу кухни как готовую:
+   ```
+   POST http://localhost:8000/api/cafe/kitchen/tasks/<TASK_ID>/ready/
+   ```
+   или
+   ```
+   PATCH http://localhost:8000/api/cafe/kitchen/tasks/<TASK_ID>/
+   {
+     "status": "ready"
+   }
+   ```
+3. Получите уведомление:
+   - `kitchen_task_ready`
 
 ### 9. Troubleshooting
 

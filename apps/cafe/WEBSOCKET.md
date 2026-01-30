@@ -65,7 +65,24 @@ ws://your-domain/ws/cafe/orders/?token=<JWT>&branch_id=<uuid>
    }
    ```
 
-4. **table_status_changed** - Уведомление об изменении статуса стола (FREE/BUSY)
+4. **kitchen_task_ready** - Уведомление о готовности блюда (задачи кухни)
+   ```json
+   {
+     "type": "kitchen_task_ready",
+     "data": {
+       "task": { /* данные KitchenTask */ },
+       "task_id": "uuid",
+       "order_id": "uuid",
+       "table": 1,
+       "menu_item": "Пицца",
+       "unit_index": 1,
+       "company_id": "uuid",
+       "branch_id": "uuid"
+     }
+   }
+   ```
+
+5. **table_status_changed** - Уведомление об изменении статуса стола (FREE/BUSY)
    ```json
    {
      "type": "table_status_changed",
@@ -197,6 +214,10 @@ ws.onmessage = (event) => {
       console.log('Заказ обновлен:', data.data.order);
       // Обновить UI со списком заказов
       break;
+    case 'kitchen_task_ready':
+      console.log('Блюдо готово:', data.data);
+      // Обновить ленту задач кухни / уведомить поваров
+      break;
     case 'table_status_changed':
       console.log('Статус стола изменился:', data.data);
       // Обновить статус стола на карте зала
@@ -250,6 +271,7 @@ WebSocket использует группы Channels для отправки у�
 - При создании заказа через `ClientOrderListCreateView`
 - При обновлении заказа через `OrderRetrieveUpdateDestroyView`
 - При оплате заказа через `OrderPayView`
+- При переводе задачи кухни в статус `READY` (через `/cafe/kitchen/tasks/<id>/ready/` или PATCH)
 
 ### Столы (Tables):
 - При создании стола через `TableListCreateView`

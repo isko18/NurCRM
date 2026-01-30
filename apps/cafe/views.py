@@ -955,6 +955,9 @@ class KitchenTaskReadyView(CompanyBranchQuerysetMixin, APIView):
                     }
                 )
 
+        # Отправляем WebSocket событие о готовности блюда
+        send_kitchen_task_ready_notification(task)
+
         return Response(KitchenTaskSerializer(task, context={'request': request}).data)
 
 
@@ -1014,6 +1017,10 @@ class KitchenTaskRetrieveUpdateDestroyView(CompanyBranchQuerysetMixin, generics.
                     "unit_index": task.unit_index,
                 }
             )
+
+        # WebSocket событие о готовности блюда (для поваров/монитора)
+        if new_status == KitchenTask.Status.READY and old_status != new_status:
+            send_kitchen_task_ready_notification(task)
 
 
 class KitchenTaskMonitorView(CompanyBranchQuerysetMixin, generics.ListAPIView):
@@ -1324,6 +1331,58 @@ def send_order_updated_notification(order):
         logger.info(f"[send_order_updated_notification] Message sent to channel layer: group={group_name}")
     except Exception as e:
         logger.error(f"[send_order_updated_notification] Error sending notification: {e}", exc_info=True)
+
+
+def send_kitchen_task_ready_notification(task):
+    """
+    Отправляет WebSocket уведомление о готовности блюда (задачи кухни).
+    Событие уходит в группу заказов по компании/филиалу.
+    """
+    try:
+        logger.info(f"[send_kitchen_task_ready_notification] Starting: task_id={task.id}")
+        channel_layer = get_channel_layer()
+        if not channel_layer:
+            logger.warning("[send_kitchen_task_ready_notification] Channel layer not configured")
+            return
+
+        company_id = str(task.company_id)
+        branch_id = str(task.branch_id) if task.branch_id else None
+
+        # Формируем имя группы
+        if branch_id:
+            group_name = f"cafe_orders_{company_id}_{branch_id}"
+        else:
+            group_name = f"cafe_orders_{company_id}"
+
+        # Сериализуем данные задачи кухни
+        from .serializers import KitchenTaskSerializer
+        serializer = KitchenTaskSerializer(task)
+        task_data = serializer.data
+
+        # Конвертируем UUID и Decimal в строки для msgpack сериализации
+        task_data = json.loads(json.dumps(task_data, default=str))
+
+        payload = {
+            "task": task_data,
+            "task_id": str(task.id),
+            "order_id": str(task.order_id),
+            "table": (task.order.table.number if task.order_id and task.order.table_id else None),
+            "menu_item": (task.menu_item.title if task.menu_item_id else None),
+            "unit_index": task.unit_index,
+            "company_id": company_id,
+            "branch_id": branch_id,
+        }
+
+        async_to_sync(channel_layer.group_send)(
+            group_name,
+            {
+                "type": "kitchen_task_ready",
+                "payload": payload,
+            }
+        )
+        logger.info(f"[send_kitchen_task_ready_notification] Message sent to channel layer: group={group_name}")
+    except Exception as e:
+        logger.error(f"[send_kitchen_task_ready_notification] Error sending notification: {e}", exc_info=True)
 
 
 def send_table_created_notification(table):

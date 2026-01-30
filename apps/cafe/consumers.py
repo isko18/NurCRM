@@ -134,6 +134,20 @@ class CafeOrderConsumer(AsyncWebsocketConsumer):
             logger.info(f"[CafeOrderConsumer] Sent table_status_changed notification to client")
         except Exception as e:
             logger.error(f"[CafeOrderConsumer] Error in table_status_changed: {e}", exc_info=True)
+
+    async def kitchen_task_ready(self, event):
+        """Отправка уведомления о готовности блюда (задачи кухни)"""
+        try:
+            payload = event.get("payload", {})
+            task_id = payload.get("task_id") or payload.get("task", {}).get("id")
+            logger.info(f"[CafeOrderConsumer] Received kitchen_task_ready event: task_id={task_id}, group={self.group_name}")
+            await self.send(json.dumps({
+                "type": "kitchen_task_ready",
+                "data": payload
+            }))
+            logger.info(f"[CafeOrderConsumer] Sent kitchen_task_ready notification to client")
+        except Exception as e:
+            logger.error(f"[CafeOrderConsumer] Error in kitchen_task_ready: {e}", exc_info=True)
     
     @database_sync_to_async
     def _get_user_company_and_branch(self, user):
