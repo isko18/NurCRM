@@ -1,6 +1,6 @@
 # apps/cafe/routing.py
 from django.urls import re_path
-from .consumers import CafeOrderConsumer, CafeTableConsumer
+from .consumers import CafeOrderConsumer, CafeTableConsumer, CafeKitchenConsumer
 
 websocket_urlpatterns = [
     re_path(
@@ -12,5 +12,10 @@ websocket_urlpatterns = [
         r"^ws/cafe/tables/$",
         CafeTableConsumer.as_asgi(),
         name="ws-cafe-tables"
+    ),
+    re_path(
+        r"^ws/cafe/kitchen/$",
+        CafeKitchenConsumer.as_asgi(),
+        name="ws-cafe-kitchen"
     ),
 ]
