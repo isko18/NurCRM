@@ -1110,6 +1110,15 @@ class ProductImage(models.Model):
                 raise ValidationError({"branch": "Филиал изображения должен совпадать с филиалом товара (или быть глобальным вместе с ним)."})
 
     def save(self, *args, **kwargs):
+        # ВАЖНО: уникальный constraint разрешает только одну is_primary=True на продукт.
+        # Поэтому при попытке сохранить новую/обновлённую primary-картинку
+        # нужно СНАЧАЛА снять primary со старой, иначе INSERT/UPDATE упадёт с IntegrityError.
+        if self.product_id and self.is_primary:
+            (type(self).objects
+                .filter(product_id=self.product_id, is_primary=True)
+                .exclude(pk=self.pk)
+                .update(is_primary=False))
+
         # Подставим company/branch от продукта если не заданы
         if self.product_id:
             if not self.company_id:
@@ -1125,13 +1134,6 @@ class ProductImage(models.Model):
                 raise ValidationError({"image": f"Не удалось конвертировать в WebP: {e}"})
 
         super().save(*args, **kwargs)
-
-        # Если отмечено как основное — снимем флаг у остальных
-        if self.is_primary:
-            (type(self).objects
-                .filter(product=self.product, is_primary=True)
-                .exclude(pk=self.pk)
-                .update(is_primary=False))
 
     def delete(self, *args, **kwargs):
         storage = self.image.storage if self.image else None

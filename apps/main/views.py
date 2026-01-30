@@ -2967,11 +2967,6 @@ class ProductImageListCreateAPIView(CompanyBranchRestrictedMixin, generics.ListC
 
         obj = serializer.save(product=product)
 
-        # если эта картинка помечена как основная —
-        # снимаем is_primary со всех остальных
-        if getattr(obj, "is_primary", False):
-            ProductImage.objects.filter(product=product).exclude(pk=obj.pk).update(is_primary=False)
-
 
 class ProductImageRetrieveUpdateDestroyAPIView(
     CompanyBranchRestrictedMixin,
@@ -3007,10 +3002,6 @@ class ProductImageRetrieveUpdateDestroyAPIView(
     @transaction.atomic
     def perform_update(self, serializer):
         obj = serializer.save()
-
-        # гарантируем, что только одна картинка у продукта будет is_primary=True
-        if getattr(obj, "is_primary", False):
-            ProductImage.objects.filter(product=obj.product).exclude(pk=obj.pk).update(is_primary=False)
 
 
 # ===========================
