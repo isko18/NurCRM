@@ -815,8 +815,10 @@ class OrderPayView(CompanyBranchQuerysetMixin, APIView):
             # Забираем заказ с блокировкой, чтобы не было двойной оплаты/списания
             locked_qs = (
                 Order.objects
-                .select_for_update()
-                .select_related("table", "client", "waiter")
+                # В Postgres нельзя FOR UPDATE на nullable side OUTER JOIN,
+                # поэтому лочим только сам Order (без client/waiter).
+                .select_for_update(of=("self",))
+                .select_related("table")
                 .prefetch_related("items__menu_item__ingredients__product")
                 .filter(company=company)
             )
