@@ -443,7 +443,8 @@ class CashShiftListView(CompanyBranchScopedMixin, generics.ListAPIView):
         if status_q in ("open", "closed"):
             qs = qs.filter(status=status_q)
 
-        return qs
+        # Новые смены сверху
+        return qs.order_by("-opened_at", "-id")
 
 
 class CashShiftDetailView(CompanyBranchScopedMixin, generics.RetrieveAPIView):
