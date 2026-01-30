@@ -1336,7 +1336,9 @@ def send_order_updated_notification(order):
 def send_kitchen_task_ready_notification(task):
     """
     Отправляет WebSocket уведомление о готовности блюда (задачи кухни).
-    Событие уходит в группу заказов по компании/филиалу.
+    Событие уходит:
+      - в группу заказов (для официантов/зала): cafe_orders_{company_id}_{branch_id?}
+      - в группу кухни (для поваров/монитора кухни): cafe_kitchen_{company_id}_{branch_id?}
     """
     try:
         logger.info(f"[send_kitchen_task_ready_notification] Starting: task_id={task.id}")
@@ -1348,11 +1350,17 @@ def send_kitchen_task_ready_notification(task):
         company_id = str(task.company_id)
         branch_id = str(task.branch_id) if task.branch_id else None
 
-        # Формируем имя группы
+        # Формируем имя группы заказов
         if branch_id:
-            group_name = f"cafe_orders_{company_id}_{branch_id}"
+            orders_group_name = f"cafe_orders_{company_id}_{branch_id}"
         else:
-            group_name = f"cafe_orders_{company_id}"
+            orders_group_name = f"cafe_orders_{company_id}"
+
+        # Формируем имя группы кухни
+        if branch_id:
+            kitchen_group_name = f"cafe_kitchen_{company_id}_{branch_id}"
+        else:
+            kitchen_group_name = f"cafe_kitchen_{company_id}"
 
         # Сериализуем данные задачи кухни
         from .serializers import KitchenTaskSerializer
@@ -1373,14 +1381,15 @@ def send_kitchen_task_ready_notification(task):
             "branch_id": branch_id,
         }
 
-        async_to_sync(channel_layer.group_send)(
-            group_name,
-            {
-                "type": "kitchen_task_ready",
-                "payload": payload,
-            }
-        )
-        logger.info(f"[send_kitchen_task_ready_notification] Message sent to channel layer: group={group_name}")
+        message = {"type": "kitchen_task_ready", "payload": payload}
+
+        # 1) официанты/заказы
+        async_to_sync(channel_layer.group_send)(orders_group_name, message)
+        logger.info(f"[send_kitchen_task_ready_notification] Message sent to channel layer: group={orders_group_name}")
+
+        # 2) кухня/повара
+        async_to_sync(channel_layer.group_send)(kitchen_group_name, message)
+        logger.info(f"[send_kitchen_task_ready_notification] Message sent to channel layer: group={kitchen_group_name}")
     except Exception as e:
         logger.error(f"[send_kitchen_task_ready_notification] Error sending notification: {e}", exc_info=True)
 

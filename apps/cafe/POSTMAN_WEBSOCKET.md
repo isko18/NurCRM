@@ -61,6 +61,29 @@ ws://localhost:8000/ws/cafe/tables/?token=eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9..
 ws://localhost:8000/ws/cafe/tables/?token=eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9...&branch_id=123e4567-e89b-12d3-a456-426614174001
 ```
 
+#### C. WebSocket для кухни (Kitchen / повара)
+
+**URL:**
+```
+ws://localhost:8000/ws/cafe/kitchen/
+```
+
+**Query Parameters:**
+```
+token=<JWT_TOKEN>
+branch_id=<UUID> (опционально, только для owner/admin)
+```
+
+**Полный URL пример (минимальный):**
+```
+ws://localhost:8000/ws/cafe/kitchen/?token=eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9...
+```
+
+**Полный URL пример (с выбором филиала для owner/admin):**
+```
+ws://localhost:8000/ws/cafe/kitchen/?token=eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9...&branch_id=123e4567-e89b-12d3-a456-426614174001
+```
+
 **Важно:** 
 - `company_id` и `branch_id` определяются автоматически из JWT токена пользователя
 - Для обычных сотрудников используется их филиал
