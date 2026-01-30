@@ -1,7 +1,8 @@
 # apps/cafe/views.py
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 import json
 import uuid
+import re
 
 from django.db import transaction, IntegrityError
 from django.db.models import Q, Count, Avg, ExpressionWrapper, DurationField, F
@@ -39,6 +40,88 @@ from .serializers import (
     EquipmentInventorySessionSerializer, KitchenSerializer,
     OrderPaySerializer
 )
+
+
+_NUM_RE = re.compile(r"[-+]?\d+(?:[.,]\d+)?")
+
+
+def _decimal_from_warehouse_remainder(raw) -> Decimal:
+    """
+    Warehouse.remainder в cafe — CharField. На практике там часто лежит число строкой,
+    иногда с пробелами/единицами. Пробуем вытащить первое число.
+    """
+    if raw is None:
+        return Decimal("0")
+    if isinstance(raw, Decimal):
+        return raw
+    s = str(raw).strip()
+    if not s:
+        return Decimal("0")
+    m = _NUM_RE.search(s)
+    if not m:
+        return Decimal("0")
+    try:
+        return Decimal(m.group(0).replace(",", "."))
+    except InvalidOperation:
+        return Decimal("0")
+
+
+def deduct_ingredients_for_order(order: Order):
+    """
+    Списывает со склада ингредиенты по заказу.
+    Запускать ТОЛЬКО внутри transaction.atomic().
+    """
+    # Соберём расход по каждому складу (Warehouse)
+    usage_by_product_id: dict = {}
+
+    items = (
+        order.items
+        .select_related("menu_item")
+        .prefetch_related("menu_item__ingredients__product")
+        .all()
+    )
+    for it in items:
+        qty = Decimal(str(it.quantity or 0))
+        if qty <= 0:
+            continue
+        for ing in it.menu_item.ingredients.all():
+            need = (ing.amount or Decimal("0")) * qty
+            if need <= 0:
+                continue
+            usage_by_product_id[ing.product_id] = usage_by_product_id.get(ing.product_id, Decimal("0")) + need
+
+    if not usage_by_product_id:
+        return
+
+    # Залочим нужные строки склада
+    products = (
+        Warehouse.objects
+        .select_for_update()
+        .filter(id__in=list(usage_by_product_id.keys()))
+    )
+    products_by_id = {p.id: p for p in products}
+
+    # Проверка: все ингредиенты должны существовать на складе
+    missing = [str(pid) for pid in usage_by_product_id.keys() if pid not in products_by_id]
+    if missing:
+        raise ValidationError({"detail": f"Не найдены товары склада для ингредиентов: {', '.join(missing)}"})
+
+    # Проверяем остатки и применяем списание
+    for pid, need in usage_by_product_id.items():
+        p = products_by_id[pid]
+        have = _decimal_from_warehouse_remainder(p.remainder)
+        new_val = have - need
+        if new_val < 0:
+            raise ValidationError({
+                "detail": (
+                    f"Недостаточно на складе: {p.title}. "
+                    f"Нужно: {need} {p.unit or ''}, доступно: {have} {p.unit or ''}"
+                ).strip()
+            })
+
+        # remainder хранится строкой
+        p.remainder = str(new_val)
+        p.save(update_fields=["remainder"])
 
 try:
     from apps.users.permissions import IsCompanyOwnerOrAdmin
@@ -721,11 +804,6 @@ class OrderPayView(CompanyBranchQuerysetMixin, APIView):
         if active_branch is not None:
             qs = qs.filter(branch=active_branch)
 
-        order = generics.get_object_or_404(qs, pk=pk)
-
-        if getattr(order, "is_paid", False):
-            return Response({"detail": "Заказ уже оплачен."}, status=status.HTTP_400_BAD_REQUEST)
-
         ser = OrderPaySerializer(data=request.data)
         ser.is_valid(raise_exception=True)
 
@@ -734,10 +812,28 @@ class OrderPayView(CompanyBranchQuerysetMixin, APIView):
         close_order = ser.validated_data.get("close_order", True)
 
         with transaction.atomic():
+            # Забираем заказ с блокировкой, чтобы не было двойной оплаты/списания
+            locked_qs = (
+                Order.objects
+                .select_for_update()
+                .select_related("table", "client", "waiter")
+                .prefetch_related("items__menu_item__ingredients__product")
+                .filter(company=company)
+            )
+            if active_branch is not None:
+                locked_qs = locked_qs.filter(branch=active_branch)
+            order = generics.get_object_or_404(locked_qs, pk=pk)
+
+            if getattr(order, "is_paid", False):
+                return Response({"detail": "Заказ уже оплачен."}, status=status.HTTP_400_BAD_REQUEST)
+
             order.recalc_total()
 
             if discount_amount and discount_amount > order.total_amount:
                 return Response({"detail": "Скидка больше суммы заказа."}, status=status.HTTP_400_BAD_REQUEST)
+
+            # Списываем ингредиенты "по продаже" — в момент оплаты (один раз).
+            deduct_ingredients_for_order(order)
 
             order.discount_amount = discount_amount or Decimal("0")
             order.is_paid = True
