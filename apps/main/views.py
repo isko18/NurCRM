@@ -877,6 +877,7 @@ class ProductCreateManualAPIView(CompanyBranchRestrictedMixin, generics.CreateAP
 
         # ====== FIX: двусторонняя логика price <-> markup_percent ======
         price_raw = data.get("price", None)
+        price_provided = price_raw not in (None, "")
         if price_raw not in (None, ""):
             try:
                 price = _to_dec(price_raw)
@@ -943,7 +944,7 @@ class ProductCreateManualAPIView(CompanyBranchRestrictedMixin, generics.CreateAP
         if not isinstance(packages_input, list):
             packages_input = []
 
-        product = Product.objects.create(
+        product = Product(
             company=company,
             branch=branch,
             kind=kind_value,
@@ -975,6 +976,9 @@ class ProductCreateManualAPIView(CompanyBranchRestrictedMixin, generics.CreateAP
 
             created_by=request.user,
         )
+        if price_provided:
+            setattr(product, "_manual_price", True)
+        product.save()
 
         # characteristics
         chars_data = data.get("characteristics")
