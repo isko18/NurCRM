@@ -847,6 +847,12 @@ class Product(models.Model):
         base = self.purchase_price or Decimal("0")
         percent = self.markup_percent or Decimal("0")
 
+        # Если цена задана вручную в конкретном код-пути (например create-manual),
+        # не пересчитываем её из наценки, чтобы не появлялись «копейки» из-за округлений.
+        if getattr(self, "_manual_price", False) and self.price is not None:
+            self.price = Decimal(self.price).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+            return
+
         # ✅ уважай ручную цену даже если price=0
         if self.price is not None and percent == Decimal("0"):
             self.price = Decimal(self.price).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
