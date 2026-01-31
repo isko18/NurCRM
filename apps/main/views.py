@@ -66,6 +66,7 @@ from apps.main.services import _parse_bool_like, _parse_date_to_aware_datetime, 
 #  Company + Branch mixin (как в barber)
 # ===========================
 _Q2 = Decimal("0.01")
+_Q4 = Decimal("0.0001")
 
 
 def _to_dec(v, default=Decimal("0")):
@@ -83,7 +84,9 @@ def _calc_markup(purchase_price: Decimal, price: Decimal) -> Decimal:
     if purchase_price <= 0:
         return Decimal("0.00")
     mp = (price / purchase_price - Decimal("1")) * Decimal("100")
-    return mp.quantize(_Q2, rounding=ROUND_HALF_UP)
+    # ВАЖНО: наценка хранится точнее (4 знака), иначе при обратном пересчёте цены
+    # (purchase_price + markup_percent) будут появляться «копейки» из-за округления процента.
+    return mp.quantize(_Q4, rounding=ROUND_HALF_UP)
 
 class AgentCartLockMixin:
     """

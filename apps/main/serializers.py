@@ -588,7 +588,8 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
 
     # allow_null=True чтобы PATCH мог "очищать" значения
     purchase_price = serializers.DecimalField(max_digits=10, decimal_places=2, required=False, allow_null=True)
-    markup_percent = serializers.DecimalField(max_digits=12, decimal_places=2, required=False, allow_null=True)
+    # model.Product.markup_percent имеет decimal_places=4
+    markup_percent = serializers.DecimalField(max_digits=12, decimal_places=4, required=False, allow_null=True)
     price = serializers.DecimalField(max_digits=10, decimal_places=2, required=False, allow_null=True)
     discount_percent = serializers.DecimalField(max_digits=12, decimal_places=2, required=False, allow_null=True)
 
@@ -772,6 +773,7 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
     # ====== PRICE <-> MARKUP helper ======
 
     _Q2 = Decimal("0.01")
+    _Q4 = Decimal("0.0001")
 
     @staticmethod
     def _to_dec(v, default=Decimal("0")):
@@ -789,7 +791,9 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
         if purchase_price <= 0:
             return Decimal("0.00")
         mp = (price / purchase_price - Decimal("1")) * Decimal("100")
-        return mp.quantize(cls._Q2, rounding=ROUND_HALF_UP)
+        # Храним/считаем наценку точнее (4 знака), чтобы обратный пересчёт цены
+        # не давал «копейки» из-за округления процента.
+        return mp.quantize(cls._Q4, rounding=ROUND_HALF_UP)
 
     # ====== SAFE DECIMAL OUTPUT ======
     @staticmethod
@@ -813,7 +817,7 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
         for field, quant in (
             ("quantity", self._Q2),
             ("purchase_price", self._Q2),
-            ("markup_percent", self._Q2),
+            ("markup_percent", self._Q4),
             ("price", self._Q2),
             ("discount_percent", self._Q2),
         ):
