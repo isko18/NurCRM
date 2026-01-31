@@ -706,7 +706,7 @@ class Product(models.Model):
     price = models.DecimalField(
         "Цена продажи",
         max_digits=10,
-        decimal_places=2,
+        decimal_places=3,
         default=0,
         help_text="Считается автоматически из закупки и наценки",
     )
