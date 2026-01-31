@@ -505,10 +505,28 @@ class WarehouseListCreateView(CompanyBranchQuerysetMixin, generics.ListCreateAPI
     search_fields = ["title", "unit"]
     ordering_fields = ["title", "id"]
 
+    def perform_create(self, serializer):
+        try:
+            serializer.save()
+        except IntegrityError as e:
+            msg = str(e)
+            if "uniq_warehouse_title_" in msg:
+                raise ValidationError({"title": "Склад с таким названием уже существует в этой компании или филиале."})
+            raise
+
 
 class WarehouseRetrieveUpdateDestroyView(CompanyBranchQuerysetMixin, generics.RetrieveUpdateDestroyAPIView):
     queryset = Warehouse.objects.all()
     serializer_class = WarehouseSerializer
+
+    def perform_update(self, serializer):
+        try:
+            serializer.save()
+        except IntegrityError as e:
+            msg = str(e)
+            if "uniq_warehouse_title_" in msg:
+                raise ValidationError({"title": "Склад с таким названием уже существует в этой компании или филиале."})
+            raise
 
 
 # ==================== Purchase ====================
