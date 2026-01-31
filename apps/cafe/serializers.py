@@ -281,6 +281,28 @@ class WarehouseSerializer(CompanyBranchReadOnlyMixin):
         fields = ["id", "company", "branch", "title", "unit", "remainder", "minimum", "unit_price"]
         read_only_fields = ["id", "company", "branch"]
 
+    def validate(self, attrs):
+        title = attrs.get("title")
+        if title is None:
+            return attrs
+        company = self._user_company()
+        if not company:
+            return attrs
+        branch = self._auto_branch() if self.instance is None else (getattr(self.instance, "branch", None))
+        qs = Warehouse.objects.filter(company=company, title=title)
+        if branch is not None:
+            qs = qs.filter(branch=branch)
+        else:
+            qs = qs.filter(branch__isnull=True)
+        if self.instance is not None:
+            qs = qs.exclude(pk=self.instance.pk)
+        if qs.exists():
+            scope = "филиале" if branch else "компании (глобальный склад)"
+            raise serializers.ValidationError({
+                "title": f"Склад с названием «{title}» уже существует в этом {scope}."
+            })
+        return attrs
+
 
 class PurchaseSerializer(CompanyBranchReadOnlyMixin):
     class Meta:
