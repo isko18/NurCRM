@@ -1403,7 +1403,10 @@ class CartItem(models.Model):
             self.branch_id = self.cart.branch_id
 
         if self.unit_price is None:
-            self.unit_price = self.product.price if self.product else Decimal("0.00")
+            # Product.price может иметь 3 знака после запятой, а unit_price — 2.
+            self.unit_price = self.product.price if self.product else Decimal("0")
+        # На всякий случай нормализуем в денежный формат (2 знака)
+        self.unit_price = _money(self.unit_price)
 
         self.full_clean()
         super().save(*args, **kwargs)
@@ -1651,6 +1654,7 @@ class SaleItem(models.Model):
 
                 # ✅ НЕ "not self.unit_price", а именно None
                 if self.unit_price is None:
+                    # Product.price может иметь 3 знака после запятой, а unit_price — 2.
                     self.unit_price = self.product.price
 
                 if not (self.barcode_snapshot or "").strip():
@@ -1663,6 +1667,12 @@ class SaleItem(models.Model):
                 # если товар не выбран — себестоимость неизвестна
                 if self.purchase_price_snapshot is None:
                     self.purchase_price_snapshot = Decimal("0.00")
+
+        # нормализуем денежные поля перед валидацией (иначе падаем на 3-х знаках у Product.price)
+        if self.unit_price is not None:
+            self.unit_price = _money(self.unit_price)
+        if self.purchase_price_snapshot is not None:
+            self.purchase_price_snapshot = _money(self.purchase_price_snapshot)
 
         self.full_clean()
         return super().save(*args, **kwargs)
@@ -2799,6 +2809,9 @@ class ObjectSaleItem(models.Model):
                 self.name_snapshot = self.object_item.name
             if not self.unit_price:
                 self.unit_price = self.object_item.price
+
+        if self.unit_price is not None:
+            self.unit_price = _money(self.unit_price)
         super().save(*args, **kwargs)
         if creating:
             self.object_item.quantity = max(0, self.object_item.quantity - self.quantity)
