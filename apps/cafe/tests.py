@@ -4,6 +4,7 @@ from django.test import TestCase, TransactionTestCase
 from django.contrib.auth import get_user_model
 from django.db import transaction
 from django.utils import timezone
+from rest_framework.test import APIRequestFactory, force_authenticate
 
 from apps.users.models import Company, Branch
 from apps.cafe.models import (
@@ -13,6 +14,8 @@ from apps.cafe.views import (
     send_order_created_notification,
     send_order_updated_notification,
     send_table_status_changed_notification,
+    OrderPayView,
+    OrderRetrieveUpdateDestroyView,
 )
 
 User = get_user_model()
@@ -77,6 +80,8 @@ class CafeTableStatusTestCase(TransactionTestCase):
             name="Test Client",
             phone="+79991234567"
         )
+
+        self.api_factory = APIRequestFactory()
     
     def test_table_becomes_busy_on_order_creation(self):
         """Тест: стол становится занятым при создании заказа"""
@@ -245,6 +250,84 @@ class CafeTableStatusTestCase(TransactionTestCase):
         
         self.table.refresh_from_db()
         self.assertEqual(self.table.status, Table.Status.FREE)
+
+    def test_table_stays_busy_on_order_close_via_api_with_multiple_open_orders(self):
+        """
+        Регрессия: если на столе есть несколько OPEN-заказов, закрытие одного через API
+        НЕ должно делать стол FREE.
+        """
+        order1 = Order.objects.create(
+            company=self.company,
+            branch=self.branch,
+            table=self.table,
+            client=self.client,
+            waiter=self.user,
+            guests=2,
+            status=Order.Status.OPEN,
+        )
+        Order.objects.create(
+            company=self.company,
+            branch=self.branch,
+            table=self.table,
+            client=self.client,
+            waiter=self.user,
+            guests=3,
+            status=Order.Status.OPEN,
+        )
+
+        self.table.status = Table.Status.BUSY
+        self.table.save(update_fields=["status"])
+
+        request = self.api_factory.patch(
+            f"/cafe/orders/{order1.id}/",
+            {"status": Order.Status.CLOSED},
+            format="json",
+        )
+        force_authenticate(request, user=self.user)
+        response = OrderRetrieveUpdateDestroyView.as_view()(request, pk=str(order1.id))
+        self.assertEqual(response.status_code, 200)
+
+        self.table.refresh_from_db()
+        self.assertEqual(self.table.status, Table.Status.BUSY)
+
+    def test_table_stays_busy_on_order_pay_close_via_api_with_multiple_open_orders(self):
+        """
+        Регрессия: оплата+закрытие одного заказа через /pay/ не должна освобождать стол,
+        если есть другой OPEN-заказ на этом же столе.
+        """
+        order1 = Order.objects.create(
+            company=self.company,
+            branch=self.branch,
+            table=self.table,
+            client=self.client,
+            waiter=self.user,
+            guests=2,
+            status=Order.Status.OPEN,
+        )
+        Order.objects.create(
+            company=self.company,
+            branch=self.branch,
+            table=self.table,
+            client=self.client,
+            waiter=self.user,
+            guests=3,
+            status=Order.Status.OPEN,
+        )
+
+        self.table.status = Table.Status.BUSY
+        self.table.save(update_fields=["status"])
+
+        request = self.api_factory.post(
+            f"/cafe/orders/{order1.id}/pay/",
+            {"payment_method": "cash", "discount_amount": "0.00", "close_order": True},
+            format="json",
+        )
+        force_authenticate(request, user=self.user)
+        response = OrderPayView.as_view()(request, pk=str(order1.id))
+        self.assertEqual(response.status_code, 200)
+
+        self.table.refresh_from_db()
+        self.assertEqual(self.table.status, Table.Status.BUSY)
 
 
 class CafeWebSocketNotificationsTestCase(TestCase):
