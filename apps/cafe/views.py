@@ -360,13 +360,7 @@ class ClientOrderListCreateView(CompanyBranchQuerysetMixin, generics.ListCreateA
         
         # Устанавливаем стол как занятый при создании заказа
         if order.table_id:
-            with transaction.atomic():
-                table = Table.objects.select_for_update().get(id=order.table_id)
-                if table.status != Table.Status.BUSY:
-                    table.status = Table.Status.BUSY
-                    table.save(update_fields=["status"])
-                    # Отправляем уведомление об изменении статуса стола
-                    send_table_status_changed_notification(table)
+            _sync_table_status(order.table_id)
         
         # Отправляем WebSocket уведомление о создании заказа
         send_order_created_notification(order)
@@ -643,6 +637,31 @@ class IngredientRetrieveUpdateDestroyView(CompanyBranchQuerysetMixin, generics.R
         return qs.filter(menu_item__branch__isnull=True, product__branch__isnull=True)
 
 
+def _sync_table_status(table_id):
+    """
+    Синхронизировать статус стола по факту наличия открытых заказов.
+
+    Правило:
+      - если есть хотя бы один Order(status=OPEN) на этом столе -> BUSY
+      - иначе -> FREE
+    """
+    if not table_id:
+        return
+
+    with transaction.atomic():
+        table = Table.objects.select_for_update().get(id=table_id)
+        has_open_orders = Order.objects.filter(
+            table_id=table_id,
+            status=Order.Status.OPEN,
+        ).exists()
+
+        new_status = Table.Status.BUSY if has_open_orders else Table.Status.FREE
+        if table.status != new_status:
+            table.status = new_status
+            table.save(update_fields=["status"])
+            send_table_status_changed_notification(table)
+
+
 # ==================== Order ====================
 class OrderListCreateView(CompanyBranchQuerysetMixin, generics.ListCreateAPIView):
     queryset = (
@@ -664,13 +683,7 @@ class OrderListCreateView(CompanyBranchQuerysetMixin, generics.ListCreateAPIView
         
         # Устанавливаем стол как занятый при создании заказа
         if order.table_id:
-            with transaction.atomic():
-                table = Table.objects.select_for_update().get(id=order.table_id)
-                if table.status != Table.Status.BUSY:
-                    table.status = Table.Status.BUSY
-                    table.save(update_fields=["status"])
-                    # Отправляем уведомление об изменении статуса стола
-                    send_table_status_changed_notification(table)
+            _sync_table_status(order.table_id)
         
         # Отправляем WebSocket уведомление о создании заказа
         send_order_created_notification(order)
@@ -696,37 +709,25 @@ class OrderRetrieveUpdateDestroyView(CompanyBranchQuerysetMixin, generics.Retrie
         # Пересчитываем сумму заказа при обновлении
         order.recalc_total()
         order.save(update_fields=["total_amount"])
-        
-        # Если заказ закрыт или отменен - освобождаем стол и отменяем незавершенные задачи кухни
+
+        # Если заказ закрыт или отменен - отменяем незавершенные задачи кухни
         if order.status in [Order.Status.CLOSED, Order.Status.CANCELLED]:
-            # Отменяем незавершенные задачи кухни (pending и in_progress)
             if old_status not in [Order.Status.CLOSED, Order.Status.CANCELLED]:
                 unfinished_tasks = KitchenTask.objects.filter(
                     order=order,
-                    status__in=[KitchenTask.Status.PENDING, KitchenTask.Status.IN_PROGRESS]
+                    status__in=[KitchenTask.Status.PENDING, KitchenTask.Status.IN_PROGRESS],
                 )
                 if unfinished_tasks.exists():
                     unfinished_tasks.update(status=KitchenTask.Status.CANCELLED)
-            
-            if order.table_id:
-                with transaction.atomic():
-                    table = Table.objects.select_for_update().get(id=order.table_id)
-                    if table.status != Table.Status.FREE:
-                        table.status = Table.Status.FREE
-                        table.save(update_fields=["status"])
-                        # Отправляем уведомление об изменении статуса стола
-                        send_table_status_changed_notification(table)
-        
-        # Если статус изменился с закрытого/отмененного на открытый - занимаем стол
-        elif order.status == Order.Status.OPEN and old_status in [Order.Status.CLOSED, Order.Status.CANCELLED]:
-            if order.table_id:
-                with transaction.atomic():
-                    table = Table.objects.select_for_update().get(id=order.table_id)
-                    if table.status != Table.Status.BUSY:
-                        table.status = Table.Status.BUSY
-                        table.save(update_fields=["status"])
-                        # Отправляем уведомление об изменении статуса стола
-                        send_table_status_changed_notification(table)
+
+        # Синхронизируем статус стола(ов) по факту открытых заказов.
+        affected_table_ids = set()
+        if old_table_id:
+            affected_table_ids.add(old_table_id)
+        if order.table_id:
+            affected_table_ids.add(order.table_id)
+        for table_id in affected_table_ids:
+            _sync_table_status(table_id)
         
         # Отправляем WebSocket уведомление об обновлении заказа
         send_order_updated_notification(order)
@@ -737,20 +738,7 @@ class OrderRetrieveUpdateDestroyView(CompanyBranchQuerysetMixin, generics.Retrie
         
         # При удалении заказа освобождаем стол, если нет других открытых заказов на этот стол
         if table_id:
-            with transaction.atomic():
-                # Проверяем, есть ли другие открытые заказы на этот стол
-                has_open_orders = Order.objects.filter(
-                    table_id=table_id,
-                    status=Order.Status.OPEN
-                ).exists()
-                
-                if not has_open_orders:
-                    table = Table.objects.select_for_update().get(id=table_id)
-                    if table.status != Table.Status.FREE:
-                        table.status = Table.Status.FREE
-                        table.save(update_fields=["status"])
-                        # Отправляем уведомление об изменении статуса стола
-                        send_table_status_changed_notification(table)
+            _sync_table_status(table_id)
 
 
 # ==================== OrderItem ====================
@@ -879,13 +867,8 @@ class OrderPayView(CompanyBranchQuerysetMixin, APIView):
                 if unfinished_tasks.exists():
                     unfinished_tasks.update(status=KitchenTask.Status.CANCELLED)
 
-            if close_order and order.table_id:
-                with transaction.atomic():
-                    table = Table.objects.select_for_update().get(id=order.table_id)
-                    table.status = Table.Status.FREE
-                    table.save(update_fields=["status"])
-                    # Отправляем уведомление об изменении статуса стола
-                    send_table_status_changed_notification(table)
+            if order.table_id:
+                _sync_table_status(order.table_id)
 
             # ---------- ARCHIVE (OrderHistory) ----------
             waiter_label = ""
