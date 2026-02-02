@@ -3285,7 +3285,12 @@ class AgentRequestCart(models.Model):
             )
             it.gift_quantity = gift_qty
             it.total_quantity = base_qty + gift_qty
-            it.price_snapshot = it.price_snapshot or (it.product.price if it.product else Decimal("0.00"))
+            # price_snapshot хранится с 2 знаками после запятой (денежный формат),
+            # а Product.price может быть с 3 знаками -> округляем.
+            if not it.price_snapshot:
+                it.price_snapshot = _money(it.product.price if it.product else Decimal("0"))
+            else:
+                it.price_snapshot = _money(it.price_snapshot)
             it.save(update_fields=["gift_quantity", "total_quantity", "price_snapshot", "updated_at"])
 
     @transaction.atomic
@@ -3499,7 +3504,10 @@ class AgentRequestItem(models.Model):
         if cart_status == AgentRequestCart.Status.DRAFT:
             # зафиксируем price_snapshot если не задан
             if not self.price_snapshot:
-                self.price_snapshot = self.product.price or Decimal("0.00")
+                # Product.price может иметь 3 знака после запятой, а снапшот — 2.
+                self.price_snapshot = _money(self.product.price if self.product_id else Decimal("0"))
+            else:
+                self.price_snapshot = _money(self.price_snapshot)
             # обычная валидация
             self.full_clean()
             return super().save(*args, **kwargs)
@@ -3527,6 +3535,9 @@ class AgentRequestItem(models.Model):
                 # если ВСЕ поля, которые хотят сохранить — из разрешённого списка,
                 # то даём сохранить без full_clean (чтобы не упасть на статусе).
                 if allowed_fields.issubset(allowed_service_fields):
+                    # если апдейтим price_snapshot после submit — приводим к денежному формату (2 знака)
+                    if "price_snapshot" in allowed_fields:
+                        self.price_snapshot = _money(self.price_snapshot)
                     return super().save(*args, **kwargs)
 
                 # кто-то пытается поменять product, quantity_requested и т.д.

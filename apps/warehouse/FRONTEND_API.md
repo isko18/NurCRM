@@ -1,174 +1,475 @@
 Документация API для фронтенда — модуль склада (apps/warehouse)
 
-Введение
-- Все запросы требуют аутентификации (Token/Bearer/Session).
-- Базовый префикс: /api/warehouse/ (используйте ваш основной префикс API).
-- Эндпойнты ограничены `CompanyBranchRestrictedMixin`: пользователь видит данные своей компании/филиала.
+> Цель: дать фронту один “источник правды” по тому, как работать со складом: справочники (склады/бренды/категории), товары (включая фото/упаковки/характеристики), складские документы (проведение/отмена), денежные документы.
 
-Основные эндпойнты
-- Документы
-  - GET/POST  /api/warehouse/documents/
-  - Отдельные списки по типам (удобно для отдельных вкладок/страниц):
-    - GET/POST /api/warehouse/documents/sale/
-    - GET/POST /api/warehouse/documents/purchase/
-    - GET/POST /api/warehouse/documents/sale-return/
-    - GET/POST /api/warehouse/documents/purchase-return/
-    - GET/POST /api/warehouse/documents/inventory/
-    - GET/POST /api/warehouse/documents/receipt/
-    - GET/POST /api/warehouse/documents/write-off/
-    - GET/POST /api/warehouse/documents/transfer/
-  - GET/PUT/PATCH/DELETE  /api/warehouse/documents/{id}/
-  - POST /api/warehouse/documents/{id}/post/  — провести документ
-  - POST /api/warehouse/documents/{id}/unpost/ — отменить проведение
+## 1) База и общие правила
 
-- Денежные документы (приход/расход денег)
-  - Категории платежа:
-    - GET/POST /api/warehouse/money/categories/
-    - GET/PUT/PATCH/DELETE /api/warehouse/money/categories/{id}/
-  - Документы денег:
-    - GET/POST /api/warehouse/money/documents/
-    - GET/PUT/PATCH/DELETE /api/warehouse/money/documents/{id}/
-    - POST /api/warehouse/money/documents/{id}/post/ — провести
-    - POST /api/warehouse/money/documents/{id}/unpost/ — отменить проведение
-  - Операции по контрагенту (детализация):
-    - GET /api/warehouse/money/counterparties/{counterparty_id}/operations/
+### Базовый префикс
+- Все эндпойнты модуля: `/api/warehouse/`
 
-- CRUD (простые)
-  - Товары: GET/POST /api/warehouse/crud/products/  и GET/PUT/PATCH/DELETE /api/warehouse/crud/products/{id}/
-    - Поиск: ?search=text (по name/article/barcode)
-  - Склады: /api/warehouse/crud/warehouses/
-  - Контрагенты: /api/warehouse/crud/counterparties/
+### Аутентификация
+- Используется JWT (см. настройки): заголовок `Authorization: Bearer <access_token>`
 
-Фильтры и поиск
-- Документы: ?doc_type=SALE&status=POSTED&warehouse_from=<uuid>&warehouse_to=<uuid>&counterparty=<uuid>
-- Отдельные списки по типам: doc_type в query не нужен (сервер уже фильтрует по типу).
-- Даты: клиентская фильтрация или внедрите date_from/date_to
-- Пагинация: стандартный DRF paging (если включён)
+### Скоуп по компании/филиалу (важно)
+Все вьюхи склада используют ограничение `CompanyBranchRestrictedMixin`:
+- **company** берётся из пользователя.
+- **branch (филиал)** выбирается автоматически:
+  - если пользователь “жёстко” привязан к филиалу (например `user.primary_branch()` / `user.branch`) — используется он;
+  - иначе можно передавать `?branch=<uuid>` в query.
 
-Формат запроса — создание документа (пример)
-POST /api/warehouse/documents/
-JSON body:
+Рекомендация фронту:
+- всегда держать “активный филиал” и прокидывать `branch` в запросы, если у пользователя нет фиксированного филиала.
+
+### Пагинация (DRF PageNumberPagination)
+В списках возвращается объект вида:
+```json
+{
+  "count": 123,
+  "next": "http://.../api/warehouse/documents/?page=2",
+  "previous": null,
+  "results": [ ... ]
+}
+```
+Параметры:
+- `?page=1|2|...`
+
+### Ошибки
+- **401**: нет/невалидный токен.
+- **403**: нет прав (или попытка доступа к чужим данным).
+- **404**: объект не найден.
+- **400**:
+  - field-validation: `{"field": ["ошибка"]}`
+  - business-validation: `{"detail": "текст ошибки"}`
+
+## 2) Справочники (склады / бренды / категории / контрагенты)
+
+### 2.1 Склады (полный CRUD)
+Эндпойнты:
+- `GET /api/warehouse/` — список складов
+- `POST /api/warehouse/` — создать склад
+- `GET /api/warehouse/{warehouse_uuid}/` — детали
+- `PATCH/PUT /api/warehouse/{warehouse_uuid}/` — обновить
+- `DELETE /api/warehouse/{warehouse_uuid}/` — удалить
+
+Сериализатор (ответ/тело):
+```json
+{
+  "id": "uuid",
+  "name": "string|null",
+  "location": "string",
+  "status": "active|inactive",
+  "company": "uuid (read-only)",
+  "branch": "uuid|null (read-only)"
+}
+```
+
+Фильтры списка (`GET /api/warehouse/`):
+- `name` (icontains)
+- `status` (`active|inactive`)
+- `created_after` (datetime, `created_date__gte`)
+- `created_before` (datetime, `created_date__lte`)
+- `company`, `branch` — технически есть в filterset, но фактически доступ ограничен текущим пользователем (обычно фронту не нужно).
+
+### 2.2 Бренды
+Эндпойнты:
+- `GET /api/warehouse/brands/`
+- `POST /api/warehouse/brands/`
+- `GET/PATCH/PUT/DELETE /api/warehouse/brands/{brand_uuid}/`
+
+Тело/ответ:
+```json
+{
+  "id": "uuid",
+  "company": "uuid (read-only)",
+  "branch": "uuid|null (read-only)",
+  "name": "string",
+  "parent": "uuid|null"
+}
+```
+
+Фильтр:
+- `name` (icontains)
+
+### 2.3 Категории
+Эндпойнты:
+- `GET /api/warehouse/category/`
+- `POST /api/warehouse/category/`
+- `GET/PATCH/PUT/DELETE /api/warehouse/category/{category_uuid}/`
+
+Тело/ответ:
+```json
+{
+  "id": "uuid",
+  "company": "uuid (read-only)",
+  "branch": "uuid|null (read-only)",
+  "name": "string",
+  "parent": "uuid|null"
+}
+```
+
+Примечание:
+- В текущей реализации на списке категорий фильтры не подключены (вьюха без `filterset_class`).
+
+### 2.4 Контрагенты (только “simple CRUD” для документов)
+Эндпойнты:
+- `GET /api/warehouse/crud/counterparties/`
+- `POST /api/warehouse/crud/counterparties/`
+- `GET/PATCH/PUT/DELETE /api/warehouse/crud/counterparties/{id}/`
+
+Тело/ответ:
+```json
+{
+  "id": "uuid",
+  "name": "string",
+  "type": "CLIENT|SUPPLIER|BOTH"
+}
+```
+
+## 3) Товары (основной CRUD + вложенные сущности)
+
+### 3.1 Товары по складу (основной API)
+Эндпойнты:
+- `GET /api/warehouse/{warehouse_uuid}/products/` — список товаров склада
+- `POST /api/warehouse/{warehouse_uuid}/products/` — создать товар в этом складе
+- `GET /api/warehouse/products/{product_uuid}/` — детали товара (глобально по uuid товара)
+- `PATCH/PUT/DELETE /api/warehouse/products/{product_uuid}/` — обновить/удалить
+
+Сериализатор товара (ответ):
+```json
+{
+  "id": "uuid",
+  "name": "string",
+  "article": "string|null",
+  "description": "string|null",
+  "barcode": "string|null",
+  "code": "string|null",
+  "unit": "string",
+  "is_weight": true,
+  "quantity": "0.000",
+  "purchase_price": "0.00",
+  "markup_percent": "0.00",
+  "price": "0.00",
+  "discount_percent": "0.00",
+  "plu": 123,
+  "country": "string|null",
+  "status": "pending|accepted|rejected|null",
+  "stock": false,
+  "expiration_date": "YYYY-MM-DD|null",
+  "brand": "uuid|null",
+  "category": "uuid",
+  "warehouse": "uuid",
+  "characteristics": {
+    "height_cm": "0.00|null",
+    "width_cm": "0.00|null",
+    "depth_cm": "0.00|null",
+    "factual_weight_kg": "0.000|null",
+    "description": "string"
+  },
+  "images": [
+    {
+      "id": "uuid",
+      "product": "uuid",
+      "image_url": "https://.../media/products/...webp",
+      "is_primary": true,
+      "alt": "string",
+      "created_at": "2026-02-01T12:00:00Z"
+    }
+  ],
+  "packages": [
+    {
+      "id": "uuid",
+      "product": "uuid",
+      "name": "коробка",
+      "quantity_in_package": "10.000",
+      "unit": "шт.",
+      "created_at": "2026-02-01T12:00:00Z"
+    }
+  ]
+}
+```
+
+Особенности (важно для UI/логики):
+- `code` может автогенерироваться (уникален в рамках склада).
+- для весовых товаров (`is_weight=true`) может автогенерироваться `plu` (уникален в рамках склада).
+- `price` может пересчитываться автоматически из `purchase_price` и `markup_percent`.
+- `barcode`, `code`, `article`, `country` нормализуются (пустая строка → `null`).
+
+Фильтры списка товаров склада (`GET /api/warehouse/{warehouse_uuid}/products/`):
+- `name` (icontains)
+- `article` (icontains)
+- `price_min`, `price_max`
+- `purchase_price_min`, `purchase_price_max`
+- `markup_min`, `markup_max`
+- `brand`, `category`, `warehouse` (как id)
+- `status` (`pending|accepted|rejected`)
+- `stock` (boolean)
+
+### 3.2 Фото товара
+Эндпойнты:
+- `GET /api/warehouse/products/{product_uuid}/images/`
+- `POST /api/warehouse/products/{product_uuid}/images/`
+- `GET/PATCH/PUT/DELETE /api/warehouse/products/{product_uuid}/images/{image_uuid}/`
+
+Создание/обновление:
+- `Content-Type: multipart/form-data`
+- поле `image` — обязательно (JPG/PNG/WEBP; сервер конвертирует в WEBP)
+- опционально: `alt`, `is_primary`
+
+Ответ включает:
+- `image_url` (абсолютный URL, если доступен `request`)
+
+### 3.3 Упаковки товара
+Эндпойнты:
+- `GET /api/warehouse/products/{product_uuid}/packages/`
+- `POST /api/warehouse/products/{product_uuid}/packages/`
+- `GET/PATCH/PUT/DELETE /api/warehouse/products/{product_uuid}/packages/{package_uuid}/`
+
+Тело/ответ:
+```json
+{
+  "id": "uuid",
+  "product": "uuid",
+  "name": "string",
+  "quantity_in_package": "0.000",
+  "unit": "string",
+  "created_at": "2026-02-01T12:00:00Z"
+}
+```
+
+Валидация:
+- `quantity_in_package` > 0
+
+### 3.4 “Простой” CRUD товаров (для выбора в документах / быстрый поиск)
+Эндпойнты:
+- `GET /api/warehouse/crud/products/`
+- `POST /api/warehouse/crud/products/`
+- `GET/PATCH/PUT/DELETE /api/warehouse/crud/products/{id}/`
+
+Тело/ответ (упрощённый):
+```json
+{
+  "id": "uuid",
+  "name": "string",
+  "article": "string",
+  "barcode": "string|null",
+  "unit": "string",
+  "quantity": "0.000"
+}
+```
+
+Поиск:
+- `?search=text` (ищет по `name/article/barcode`)
+
+Примечание:
+- для поиска по штрихкоду сервер использует кэш (если `search` достаточно длинный).
+
+### 3.5 “Простой” CRUD складов (для селектов)
+- `GET /api/warehouse/crud/warehouses/`
+- `POST /api/warehouse/crud/warehouses/`
+- `GET/PATCH/PUT/DELETE /api/warehouse/crud/warehouses/{id}/`
+
+Ответ:
+```json
+{ "id": "uuid", "name": "string" }
+```
+
+## 4) Складские документы (товарные)
+
+### 4.1 Типы и статусы
+- `doc_type`:
+  - `SALE` (Продажа)
+  - `PURCHASE` (Покупка)
+  - `SALE_RETURN` (Возврат продажи)
+  - `PURCHASE_RETURN` (Возврат покупки)
+  - `INVENTORY` (Инвентаризация)
+  - `RECEIPT` (Приход)
+  - `WRITE_OFF` (Списание)
+  - `TRANSFER` (Перемещение)
+- `status`: `DRAFT` | `POSTED`
+
+### 4.2 Эндпойнты документов
+Базовый список:
+- `GET /api/warehouse/documents/`
+- `POST /api/warehouse/documents/`
+
+Отдельные списки по типам (удобно для вкладок/страниц):
+- `GET/POST /api/warehouse/documents/sale/`
+- `GET/POST /api/warehouse/documents/purchase/`
+- `GET/POST /api/warehouse/documents/sale-return/`
+- `GET/POST /api/warehouse/documents/purchase-return/`
+- `GET/POST /api/warehouse/documents/inventory/`
+- `GET/POST /api/warehouse/documents/receipt/`
+- `GET/POST /api/warehouse/documents/write-off/`
+- `GET/POST /api/warehouse/documents/transfer/`
+
+Детали:
+- `GET/PATCH/PUT/DELETE /api/warehouse/documents/{id}/`
+
+Проведение/отмена:
+- `POST /api/warehouse/documents/{id}/post/`
+- `POST /api/warehouse/documents/{id}/unpost/`
+
+### 4.3 Формат документа (сериализатор)
+```json
+{
+  "id": "uuid",
+  "doc_type": "SALE",
+  "status": "DRAFT|POSTED",
+  "number": "SALE-20260201-0001|null",
+  "date": "2026-02-01T12:00:00Z",
+  "warehouse_from": "uuid|null",
+  "warehouse_to": "uuid|null",
+  "counterparty": "uuid|null",
+  "counterparty_display_name": "string|null",
+  "comment": "string",
+  "total": "0.00",
+  "items": [
+    {
+      "id": "uuid",
+      "product": "uuid",
+      "qty": "1.000",
+      "price": "150.00",
+      "discount_percent": "0.00",
+      "line_total": "150.00"
+    }
+  ]
+}
+```
+
+Read-only поля:
+- `number`, `total`, `status`, `date`
+
+### 4.4 Создание документа (пример)
+`POST /api/warehouse/documents/`
+```json
 {
   "doc_type": "SALE",
   "warehouse_from": "11111111-1111-1111-1111-111111111111",
   "counterparty": "22222222-2222-2222-2222-222222222222",
   "comment": "Продажа",
   "items": [
-    {"product": "33333333-3333-3333-3333-333333333333", "qty": "3", "price": "150.00", "discount_percent": "0"}
+    {
+      "product": "33333333-3333-3333-3333-333333333333",
+      "qty": "3",
+      "price": "150.00",
+      "discount_percent": "0"
+    }
   ]
-}
-
-- `number`, `status`, `total`, `date` — поля только для чтения. Номер генерируется при `post`.
-- Если используете эндпойнт по типу (например /documents/sale/), `doc_type` можно не передавать — сервер проставит сам.
-
-Проведение и отмена
-- Проведение: POST /api/warehouse/documents/{id}/post/  (без тела)
-  - При успехе: 200 + сериализованный документ (status: POSTED, number сгенерирован)
-- Отмена: POST /api/warehouse/documents/{id}/unpost/  (без тела)
-  - При успехе: документ возвращается в DRAFT, движения удалены, остатки откатились
-
-Правила по типам документов (важно для фронта)
-- TRANSFER: требует warehouse_from и warehouse_to (и они должны быть разными). При проведении создаются 2 движения: -qty на from и +qty на to.
-- INVENTORY: items[].qty — фактический остаток; при проведении delta = fact - current.
-- SALE / WRITE_OFF / PURCHASE_RETURN: уменьшают остаток (qty_delta = -qty) на warehouse_from.
-- PURCHASE / RECEIPT / SALE_RETURN: увеличивают остаток (qty_delta = +qty) на warehouse_from.
-- Для SALE/PURCHASE/... обязательно указать counterparty.
-- Нельзя проводить пустой документ.
-
-Денежные документы (приход/расход денег)
-- Типы:
-  - MONEY_RECEIPT — приход денег (получаем деньги от контрагента)
-  - MONEY_EXPENSE — расход денег (отправляем деньги контрагенту)
-- Обязательные поля:
-  - warehouse — счёт (на UI можно показывать как “Счёт”, в бекенде это склад)
-  - counterparty — контрагент
-  - payment_category — категория платежа
-  - amount — сумма > 0
-  - comment — опционально
-- Денежные документы не создают складских движений (StockMove) и не меняют остатки товаров.
-
-Валидации на сервере (повторите на фронте для UX)
-- items не пуст.
-- Для piece items (шт) — qty должно быть целым.
-- discount_percent в диапазоне 0..100.
-- Нельзя проводить, если операция приведёт к отрицательному остатку и ALLOW_NEGATIVE_STOCK=False.
-- Повторное проведение запрещено.
-
-Формат ошибок
-
-Формат запроса — создание денежного документа (пример)
-POST /api/warehouse/money/documents/
-JSON body:
-{
-  "doc_type": "MONEY_RECEIPT",
-  "warehouse": "11111111-1111-1111-1111-111111111111",
-  "counterparty": "22222222-2222-2222-2222-222222222222",
-  "payment_category": "33333333-3333-3333-3333-333333333333",
-  "amount": "1500.00",
-  "comment": "Оплата от контрагента"
-}
-
-- `number`, `status`, `date`, `created_at`, `updated_at` — только для чтения. Номер генерируется при `post`.
-- Поле-валидация: 400, тело {"field": ["error1", ...]}
-- Бизнес-ошибки: 400, тело {"detail": "текст ошибки"}
-
-Примеры вызовов (axios)
-```javascript
-import axios from 'axios'
-const api = axios.create({ baseURL: '/api/warehouse/', headers: { Authorization: `Token ${token}` } })
-
-export function createDocument(payload) {
-  return api.post('documents/', payload).then(r => r.data)
-}
-
-export function postDocument(id) {
-  return api.post(`documents/${id}/post/`).then(r => r.data)
-}
-
-export function unpostDocument(id) {
-  return api.post(`documents/${id}/unpost/`).then(r => r.data)
-}
-
-export function listDocuments(params) {
-  return api.get('documents/', { params }).then(r => r.data)
-}
-
-// --- typed lists ---
-export function listSales(params) {
-  return api.get('documents/sale/', { params }).then(r => r.data)
-}
-
-// --- money ---
-export function listMoneyDocuments(params) {
-  return api.get('money/documents/', { params }).then(r => r.data)
-}
-
-export function createMoneyDocument(payload) {
-  return api.post('money/documents/', payload).then(r => r.data)
-}
-
-export function postMoneyDocument(id) {
-  return api.post(`money/documents/${id}/post/`).then(r => r.data)
-}
-
-export function unpostMoneyDocument(id) {
-  return api.post(`money/documents/${id}/unpost/`).then(r => r.data)
-}
-
-export function listMoneyCategories(params) {
-  return api.get('money/categories/', { params }).then(r => r.data)
-}
-
-export function listMoneyOperationsByCounterparty(counterpartyId, params) {
-  return api.get(`money/counterparties/${counterpartyId}/operations/`, { params }).then(r => r.data)
 }
 ```
 
-UI/UX рекомендации
-- Отдельный экран/модал для редактирования items (таблица с добавлением/удалением строк).
-- Локальная валидация qty (целое для шт), discount_percent.
-- Подтверждение перед `post`/`unpost`.
-- Обновление списка остатков после `post` (или перезагрузка данных).
+Если используете typed-endpoint (например `/documents/sale/`):
+- `doc_type` можно не передавать — сервер проставит сам.
 
-Дополнительно
-- Могу сгенерировать OpenAPI/Swagger фрагмент или готовые frontend‑helpers (TypeScript). Напишите, что нужно.
+### 4.5 Обновление документа (важно)
+`PATCH/PUT /api/warehouse/documents/{id}/`
+- если документ **POSTED** → сервер вернёт 400: нельзя изменять проведённый документ.
+- если вы передаёте `items`, сервер:
+  - удаляет все старые строки,
+  - создаёт новые строки из массива `items`.
+
+Рекомендация фронту:
+- редактировать строки локально и отправлять полный `items[]` одним запросом.
+
+### 4.6 Фильтры и поиск по документам
+Список (`/documents/` и typed endpoints):
+- фильтры: `doc_type`, `status`, `warehouse_from`, `warehouse_to`, `counterparty`
+- поиск: `?search=...` (по `number` и `comment`)
+
+### 4.7 Проведение и отмена
+Проведение:
+- `POST /api/warehouse/documents/{id}/post/`
+- тело **может** содержать `allow_negative` (boolean или строка `"true"|"1"|"yes"`) для обхода проверки отрицательных остатков:
+```json
+{ "allow_negative": true }
+```
+- при успехе: 200 + сериализованный документ (status станет `POSTED`, `number` будет сгенерирован).
+
+Отмена:
+- `POST /api/warehouse/documents/{id}/unpost/`
+- при успехе: документ возвращается в `DRAFT`, движения удаляются, остатки откатываются.
+
+### 4.8 Бизнес-правила по типам документов (для UI)
+- `TRANSFER`: обязательно `warehouse_from` и `warehouse_to` (и они должны быть разными).
+- `INVENTORY`: `items[].qty` — фактический остаток; при проведении создаётся движение на \(\Delta = fact - current\).
+- `SALE`, `WRITE_OFF`, `PURCHASE_RETURN`: уменьшают остаток на `warehouse_from`.
+- `PURCHASE`, `RECEIPT`, `SALE_RETURN`: увеличивают остаток на `warehouse_from`.
+- для `SALE/PURCHASE/SALE_RETURN/PURCHASE_RETURN` обязательны: `warehouse_from` и `counterparty`.
+- нельзя проводить пустой документ.
+- для “штучных” товаров количество (`qty`) должно быть целым (сервер проверяет; фронту лучше валидировать заранее).
+
+## 5) Денежные документы (приход/расход денег)
+
+### 5.1 Категории платежей
+- `GET/POST /api/warehouse/money/categories/`
+- `GET/PATCH/PUT/DELETE /api/warehouse/money/categories/{id}/`
+
+Фильтры/поиск:
+- фильтры: `company`, `branch` (обычно не нужны фронту)
+- поиск: `?search=...` (по `title`)
+
+Ответ:
+```json
+{ "id": "uuid", "company": "uuid", "branch": "uuid|null", "title": "string" }
+```
+
+### 5.2 Денежные документы
+- `GET/POST /api/warehouse/money/documents/`
+- `GET/PATCH/PUT/DELETE /api/warehouse/money/documents/{id}/`
+- `POST /api/warehouse/money/documents/{id}/post/`
+- `POST /api/warehouse/money/documents/{id}/unpost/`
+
+Типы:
+- `MONEY_RECEIPT` — приход
+- `MONEY_EXPENSE` — расход
+
+Статусы:
+- `DRAFT` | `POSTED`
+
+Формат (ответ):
+```json
+{
+  "id": "uuid",
+  "company": "uuid",
+  "branch": "uuid|null",
+  "doc_type": "MONEY_RECEIPT|MONEY_EXPENSE",
+  "status": "DRAFT|POSTED",
+  "number": "MONEY_RECEIPT-20260201-0001|null",
+  "date": "2026-02-01T12:00:00Z",
+  "warehouse": "uuid",
+  "warehouse_name": "string|null",
+  "counterparty": "uuid",
+  "counterparty_display_name": "string|null",
+  "payment_category": "uuid",
+  "payment_category_title": "string|null",
+  "amount": "1500.00",
+  "comment": "string",
+  "created_at": "2026-02-01T12:00:00Z",
+  "updated_at": "2026-02-01T12:10:00Z"
+}
+```
+
+Read-only поля:
+- `number`, `status`, `date`, `created_at`, `updated_at`
+
+Важные правила:
+- после `POSTED` документ нельзя менять, пока не выполните `unpost`.
+- денежные документы **не создают** складских движений по товарам и **не меняют** остатки.
+
+Фильтры/поиск:
+- фильтры: `doc_type`, `status`, `warehouse`, `counterparty`, `payment_category`
+- поиск: `?search=...` (по `number`, `comment`, `counterparty__name`)
+
+### 5.3 Денежные операции по контрагенту
+- `GET /api/warehouse/money/counterparties/{counterparty_id}/operations/`
+
+Работает как список money-документов по одному контрагенту + фильтры/поиск:
+- фильтры: `doc_type`, `status`, `warehouse`, `payment_category`
+- поиск: `?search=...` (по `number`, `comment`)
+
+## 6) UI/UX рекомендации (коротко)
+- Документы: отдельный экран/модал для редактирования `items[]` (таблица с добавлением/удалением строк).
+- Перед `post/unpost`: показывать подтверждение (необратимые бизнес‑эффекты).
+- При работе с товарами:
+  - для “штучных” — валидировать целое `qty`;
+  - для фото — отправлять `multipart/form-data`, показывать `image_url`.
