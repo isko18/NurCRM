@@ -243,6 +243,19 @@ def _resolve_pos_cashbox(company, branch, cashbox_id=None):
     return cb
 
 
+def _find_open_shift_for_cashier(*, company, cashier, cashbox=None, branch=None):
+    qs = CashShift.objects.select_for_update().filter(
+        company=company,
+        status=CashShift.Status.OPEN,
+        cashier=cashier,
+    )
+    if cashbox is not None:
+        qs = qs.filter(cashbox=cashbox)
+    elif branch is not None:
+        qs = qs.filter(branch=branch)
+    return qs.order_by("-opened_at").first()
+
+
 def _ensure_open_shift(*, company, branch, cashier, cashbox, opening_cash=None):
     """
     Возвращает открытую смену ТОЛЬКО этого cashier в этой cashbox.
@@ -1094,15 +1107,22 @@ class SaleStartAPIView(MarketCashierOnlyMixin, CompanyBranchRestrictedMixin, API
         # смена должна быть открыта отдельным действием, а start не открывает её автоматически.
 
         cashbox = _resolve_pos_cashbox(company, branch, cashbox_id=cashbox_id)
-        if not cashbox:
+        if not cashbox and not cashbox_id:
+            shift = _find_open_shift_for_cashier(company=company, cashier=user, branch=branch)
+            if shift:
+                cashbox = shift.cashbox
+                branch = shift.branch
+            else:
+                raise ValidationError({"detail": "Нет кассы для этого филиала. Создай Cashbox."})
+        elif not cashbox:
             raise ValidationError({"detail": "Нет кассы для этого филиала. Создай Cashbox."})
 
-        shift = (
-            CashShift.objects.select_for_update()
-            .filter(company=company, cashbox=cashbox, status=CashShift.Status.OPEN, cashier=user)
-            .order_by("-opened_at")
-            .first()
-        )
+        shift = _find_open_shift_for_cashier(company=company, cashier=user, cashbox=cashbox)
+        if not shift and not cashbox_id:
+            shift = _find_open_shift_for_cashier(company=company, cashier=user, branch=branch)
+            if shift:
+                cashbox = shift.cashbox
+                branch = shift.branch
 
         if not shift:
             raise ValidationError(
@@ -1121,7 +1141,7 @@ class SaleStartAPIView(MarketCashierOnlyMixin, CompanyBranchRestrictedMixin, API
                 company=company,
                 user=user,
                 status=Cart.Status.ACTIVE,
-                branch=branch,
+                branch=branch or shift.branch,
                 shift=shift,
             )
         else:
@@ -1131,6 +1151,9 @@ class SaleStartAPIView(MarketCashierOnlyMixin, CompanyBranchRestrictedMixin, API
                     status=Cart.Status.CHECKED_OUT,
                     updated_at=timezone.now(),
                 )
+            if (branch or shift.branch) and cart.branch_id != getattr(shift.branch, "id", None):
+                cart.branch = branch or shift.branch
+                cart.save(update_fields=["branch"])
 
         opts = StartCartOptionsSerializer(data=request.data)
         opts.is_valid(raise_exception=True)
@@ -1321,21 +1344,33 @@ class SaleCheckoutAPIView(MarketCashierOnlyMixin, APIView):
             company = cart.company
             branch = getattr(cart, "branch", None)
             cashbox = _resolve_pos_cashbox(company, branch, cashbox_id=cashbox_id)
-            if not cashbox:
+            if not cashbox and not cashbox_id:
+                shift = _find_open_shift_for_cashier(company=company, cashier=request.user, branch=branch)
+                if shift:
+                    cashbox = shift.cashbox
+                    branch = shift.branch
+                else:
+                    raise ValidationError({"detail": "Нет кассы для этого филиала. Создай Cashbox."})
+            elif not cashbox:
                 raise ValidationError({"detail": "Нет кассы для этого филиала. Создай Cashbox."})
 
-            shift = (
-                CashShift.objects.select_for_update()
-                .filter(company=company, cashbox=cashbox, status=CashShift.Status.OPEN, cashier=request.user)
-                .order_by("-opened_at")
-                .first()
-            )
+            shift = _find_open_shift_for_cashier(company=company, cashier=request.user, cashbox=cashbox)
+            if not shift and not cashbox_id:
+                shift = _find_open_shift_for_cashier(company=company, cashier=request.user, branch=branch)
+                if shift:
+                    cashbox = shift.cashbox
+                    branch = shift.branch
+
             if not shift:
                 raise ValidationError(
                     {"detail": "Смена не открыта. Сначала откройте смену на кассе, затем завершите продажу."}
                 )
             cart.shift = shift
-            cart.save(update_fields=["shift"])
+            if (branch or shift.branch) and cart.branch_id != getattr(shift.branch, "id", None):
+                cart.branch = branch or shift.branch
+                cart.save(update_fields=["shift", "branch"])
+            else:
+                cart.save(update_fields=["shift"])
 
         cart.recalc()
         if payment_method == Sale.PaymentMethod.CASH and cash_received < cart.total:
