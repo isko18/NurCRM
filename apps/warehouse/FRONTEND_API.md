@@ -309,6 +309,16 @@
 - `POST /api/warehouse/documents/{id}/post/`
 - `POST /api/warehouse/documents/{id}/unpost/`
 
+### 4.2.1 Документы агента (по своим товарам)
+Эндпойнты:
+- `GET /api/warehouse/agent/documents/`
+- `POST /api/warehouse/agent/documents/`
+- `GET/PATCH/PUT/DELETE /api/warehouse/agent/documents/{id}/`
+
+Важно:
+- `agent` проставляется сервером (текущий пользователь).
+- Для агента нельзя `TRANSFER` и `INVENTORY`.
+
 ### 4.3 Формат документа (сериализатор)
 ```json
 {
@@ -320,6 +330,7 @@
   "warehouse_from": "uuid|null",
   "warehouse_to": "uuid|null",
   "counterparty": "uuid|null",
+  "agent": "uuid|null",
   "counterparty_display_name": "string|null",
   "comment": "string",
   "total": "0.00",
@@ -391,12 +402,15 @@ Read-only поля:
 
 ### 4.8 Бизнес-правила по типам документов (для UI)
 - `TRANSFER`: обязательно `warehouse_from` и `warehouse_to` (и они должны быть разными).
+- `TRANSFER`: товар **должен** принадлежать складу-источнику (`warehouse_from`).
+- `TRANSFER`: при проведении создаётся/находится товар на складе-получателе и остаток уходит на него.
 - `INVENTORY`: `items[].qty` — фактический остаток; при проведении создаётся движение на \(\Delta = fact - current\).
 - `SALE`, `WRITE_OFF`, `PURCHASE_RETURN`: уменьшают остаток на `warehouse_from`.
 - `PURCHASE`, `RECEIPT`, `SALE_RETURN`: увеличивают остаток на `warehouse_from`.
 - для `SALE/PURCHASE/SALE_RETURN/PURCHASE_RETURN` обязательны: `warehouse_from` и `counterparty`.
 - нельзя проводить пустой документ.
 - для “штучных” товаров количество (`qty`) должно быть целым (сервер проверяет; фронту лучше валидировать заранее).
+- если в документе указан `agent`, операции идут по остаткам агента (склад не меняется).
 
 ## 5) Денежные документы (приход/расход денег)
 
@@ -467,7 +481,122 @@ Read-only поля:
 - фильтры: `doc_type`, `status`, `warehouse`, `payment_category`
 - поиск: `?search=...` (по `number`, `comment`)
 
-## 6) UI/UX рекомендации (коротко)
+## 6) Агенты: заявки и остатки
+
+### 6.1 Заявки агента на товар
+Эндпойнты:
+- `GET /api/warehouse/agent-carts/` — список заявок (агент видит только свои)
+- `POST /api/warehouse/agent-carts/` — создать заявку (agent проставится автоматически)
+- `GET/PATCH/PUT/DELETE /api/warehouse/agent-carts/{id}/`
+- `POST /api/warehouse/agent-carts/{id}/submit/` — отправить владельцу
+- `POST /api/warehouse/agent-carts/{id}/approve/` — одобрить (только владелец/админ)
+- `POST /api/warehouse/agent-carts/{id}/reject/` — отклонить (только владелец/админ)
+
+Формат заявки:
+```json
+{
+  "id": "uuid",
+  "agent": "uuid",
+  "warehouse": "uuid",
+  "status": "draft|submitted|approved|rejected",
+  "note": "string",
+  "submitted_at": "2026-02-01T12:00:00Z|null",
+  "approved_at": "2026-02-01T12:00:00Z|null",
+  "approved_by": "uuid|null",
+  "created_date": "2026-02-01T12:00:00Z",
+  "updated_date": "2026-02-01T12:10:00Z",
+  "items": [ ... ]
+}
+```
+
+### 6.2 Позиции заявки
+Эндпойнты:
+- `GET /api/warehouse/agent-cart-items/?cart={uuid}`
+- `POST /api/warehouse/agent-cart-items/`
+- `GET/PATCH/PUT/DELETE /api/warehouse/agent-cart-items/{id}/`
+
+Формат позиции:
+```json
+{
+  "id": "uuid",
+  "cart": "uuid",
+  "product": "uuid",
+  "quantity_requested": "10.000",
+  "created_date": "2026-02-01T12:00:00Z",
+  "updated_date": "2026-02-01T12:10:00Z"
+}
+```
+
+Важные правила:
+- позиции можно менять **только** пока заявка `draft`.
+- при `approve` со склада списывается товар, у агента увеличиваются остатки.
+
+### 6.3 Остатки у агента
+Эндпойнты:
+- `GET /api/warehouse/agents/me/products/`
+- `GET /api/warehouse/owner/agents/products/` (только владелец/админ)
+
+Ответ:
+```json
+{
+  "id": "uuid",
+  "agent": "uuid",
+  "warehouse": "uuid",
+  "product": "uuid",
+  "product_name": "string",
+  "product_article": "string|null",
+  "product_unit": "string",
+  "qty": "5.000"
+}
+```
+
+## 7) Аналитика склада (для владельца и агента)
+
+### 7.1 Аналитика владельца (общая)
+`GET /api/warehouse/owner/analytics/`
+
+Параметры:
+- `period=day|week|month|custom`
+- `date`, `date_from`, `date_to`
+
+Ответ (основные поля):
+```json
+{
+  "period": "month",
+  "date_from": "2026-02-01",
+  "date_to": "2026-02-29",
+  "summary": {
+    "requests_approved": 10,
+    "items_approved": "120.000",
+    "sales_count": 45,
+    "sales_amount": "15000.00",
+    "on_hand_qty": "80.000",
+    "on_hand_amount": "6400.00"
+  },
+  "charts": {
+    "sales_by_date": [ ... ]
+  },
+  "top_agents": {
+    "by_sales": [ ... ],
+    "by_received": [ ... ]
+  }
+}
+```
+
+### 7.2 Аналитика агента (по себе)
+`GET /api/warehouse/agents/me/analytics/`
+
+### 7.3 Аналитика по конкретному агенту
+`GET /api/warehouse/owner/agents/{agent_id}/analytics/`
+
+Ответы у агента:
+- заявки (submitted/approved/rejected)
+- выданные товары
+- продажи/возвраты/списания
+- остатки на руках
+- графики по заявкам/продажам
+
+## 8) UI/UX рекомендации (коротко)
 - Документы: отдельный экран/модал для редактирования `items[]` (таблица с добавлением/удалением строк).
 - Перед `post/unpost`: показывать подтверждение (необратимые бизнес‑эффекты).
 - При работе с товарами:
