@@ -34,6 +34,11 @@ from .views_money import (
     MoneyDocumentListCreateView, MoneyDocumentDetailView, MoneyDocumentPostView, MoneyDocumentUnpostView,
     CounterpartyMoneyOperationsView,
 )
+from .views_analytics import (
+    WarehouseAgentMyAnalyticsAPIView,
+    WarehouseOwnerAgentAnalyticsAPIView,
+    WarehouseOwnerOverallAnalyticsAPIView,
+)
 
 urlpatterns = [
     # warehouses
@@ -93,6 +98,13 @@ urlpatterns += [
     # agent documents
     path("agent/documents/", AgentDocumentListCreateView.as_view(), name="warehouse-agent-documents"),
     path("agent/documents/<uuid:pk>/", AgentDocumentDetailView.as_view(), name="warehouse-agent-document-detail"),
+]
+
+urlpatterns += [
+    # analytics
+    path("agents/me/analytics/", WarehouseAgentMyAnalyticsAPIView.as_view(), name="warehouse-agent-my-analytics"),
+    path("owner/agents/<uuid:agent_id>/analytics/", WarehouseOwnerAgentAnalyticsAPIView.as_view(), name="warehouse-owner-agent-analytics"),
+    path("owner/analytics/", WarehouseOwnerOverallAnalyticsAPIView.as_view(), name="warehouse-owner-analytics"),
 ]
 
 urlpatterns += [

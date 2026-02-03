@@ -150,7 +150,65 @@ def post_document(document: models.Document, allow_negative: bool = None) -> mod
 
         # create moves according to type
         elif document.doc_type == document.DocType.TRANSFER:
+            def _get_or_create_transfer_product(source: models.WarehouseProduct, warehouse_to: models.Warehouse):
+                qs = models.WarehouseProduct.objects.filter(company_id=source.company_id, warehouse=warehouse_to)
+
+                if source.barcode:
+                    existing = qs.filter(barcode=source.barcode).first()
+                    if existing:
+                        return existing
+
+                if source.code:
+                    existing = qs.filter(code=source.code).first()
+                    if existing:
+                        return existing
+
+                if source.article:
+                    existing = qs.filter(article=source.article, name=source.name).first()
+                    if existing:
+                        return existing
+
+                if source.name:
+                    existing = qs.filter(name=source.name).first()
+                    if existing:
+                        return existing
+
+                code = source.code
+                if code and qs.filter(code=code).exists():
+                    code = None
+
+                plu = getattr(source, "plu", None)
+                if plu is not None and qs.filter(plu=plu).exists():
+                    plu = None
+
+                return models.WarehouseProduct.objects.create(
+                    company=warehouse_to.company,
+                    branch=warehouse_to.branch,
+                    warehouse=warehouse_to,
+                    brand=source.brand,
+                    category=source.category,
+                    article=source.article,
+                    name=source.name,
+                    description=source.description,
+                    barcode=source.barcode,
+                    code=code,
+                    unit=source.unit,
+                    is_weight=source.is_weight,
+                    purchase_price=source.purchase_price,
+                    markup_percent=source.markup_percent,
+                    price=source.price,
+                    discount_percent=source.discount_percent,
+                    plu=plu,
+                    country=source.country,
+                    status=source.status,
+                    stock=source.stock,
+                    expiration_date=source.expiration_date,
+                    quantity=Decimal("0.000"),
+                )
+
             for item in items:
+                if item.product.warehouse_id != document.warehouse_from_id:
+                    raise ValueError("Transfer requires product from warehouse_from")
                 # Проверка остатков перед созданием moves
                 if not allow_negative:
                     bal_from = models.StockBalance.objects.select_for_update().filter(
@@ -183,11 +241,12 @@ def post_document(document: models.Document, allow_negative: bool = None) -> mod
                     product=item.product,
                     qty_delta=-(item.qty),
                 )
-                # to
+                # to (product in destination warehouse)
+                dest_product = _get_or_create_transfer_product(item.product, document.warehouse_to)
                 mv2 = models.StockMove.objects.create(
                     document=document,
                     warehouse=document.warehouse_to,
-                    product=item.product,
+                    product=dest_product,
                     qty_delta=(item.qty),
                 )
                 # apply moves

@@ -57,7 +57,8 @@ class DocumentsTests(TestCase):
         moves = list(models.StockMove.objects.filter(document=doc))
         self.assertEqual(len(moves), 2)
         b1 = models.StockBalance.objects.get(warehouse=self.wh, product=self.prod)
-        b2 = models.StockBalance.objects.get(warehouse=wh2, product=self.prod)
+        dest_prod = models.WarehouseProduct.objects.get(warehouse=wh2, barcode=self.prod.barcode)
+        b2 = models.StockBalance.objects.get(warehouse=wh2, product=dest_prod)
         self.assertEqual(b1.qty, Decimal("1.000"))
         self.assertEqual(b2.qty, Decimal("5.000"))
 
