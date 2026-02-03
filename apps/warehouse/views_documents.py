@@ -22,6 +22,18 @@ class DocumentListCreateView(CompanyBranchRestrictedMixin, generics.ListCreateAP
         ).prefetch_related("items__product").order_by("-date")
 
 
+class AgentDocumentListCreateView(DocumentListCreateView):
+    """
+    Документы агента (операции по своим товарам).
+    """
+    def get_queryset(self):
+        qs = super().get_queryset()
+        return qs.filter(agent=self.request.user)
+
+    def perform_create(self, serializer):
+        serializer.save(agent=self.request.user)
+
+
 class _DocumentTypedListCreateView(DocumentListCreateView):
     """
     Базовый класс для списков по одному типу документа.
@@ -81,6 +93,12 @@ class DocumentDetailView(CompanyBranchRestrictedMixin, generics.RetrieveUpdateDe
         return models.Document.objects.select_related(
             "warehouse_from", "warehouse_to", "counterparty"
         ).prefetch_related("items__product", "items__product__brand", "items__product__category")
+
+
+class AgentDocumentDetailView(DocumentDetailView):
+    def get_queryset(self):
+        qs = super().get_queryset()
+        return qs.filter(agent=self.request.user)
 
 
 class DocumentPostView(CompanyBranchRestrictedMixin, generics.GenericAPIView):

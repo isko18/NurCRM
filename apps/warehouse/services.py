@@ -4,6 +4,7 @@ from django.utils import timezone
 from django.conf import settings
 
 from . import models
+from .models import q_qty
 
 
 def _ensure_number(document: models.Document):
@@ -49,6 +50,23 @@ def _apply_move(move: models.StockMove):
         bal.qty = initial_qty
     bal.qty = Decimal(bal.qty or 0) + Decimal(move.qty_delta or 0)
     bal.save()
+    if move.product.warehouse_id == move.warehouse_id:
+        type(move.product).objects.filter(pk=move.product_id).update(quantity=q_qty(bal.qty))
+
+
+def _apply_agent_move(move: models.AgentStockMove):
+    bal, _ = models.AgentStockBalance.objects.select_for_update().get_or_create(
+        agent=move.agent,
+        warehouse=move.warehouse,
+        product=move.product,
+        defaults={
+            "qty": Decimal("0.000"),
+            "company": move.warehouse.company,
+            "branch": move.warehouse.branch,
+        },
+    )
+    bal.qty = Decimal(bal.qty or 0) + Decimal(move.qty_delta or 0)
+    bal.save()
 
 
 def post_document(document: models.Document, allow_negative: bool = None) -> models.Document:
@@ -83,9 +101,55 @@ def post_document(document: models.Document, allow_negative: bool = None) -> mod
     with transaction.atomic():
         # Оптимизация: предзагружаем items с продуктами
         items = list(document.items.select_related("product", "product__warehouse", "product__brand", "product__category").all())
-        
+
+        if document.agent_id:
+            if document.doc_type in (document.DocType.TRANSFER, document.DocType.INVENTORY):
+                raise ValueError("Agent documents cannot be TRANSFER or INVENTORY")
+
+            sign_map = {
+                document.DocType.SALE: Decimal("-1"),
+                document.DocType.PURCHASE: Decimal("1"),
+                document.DocType.SALE_RETURN: Decimal("1"),
+                document.DocType.PURCHASE_RETURN: Decimal("-1"),
+                document.DocType.RECEIPT: Decimal("1"),
+                document.DocType.WRITE_OFF: Decimal("-1"),
+            }
+            sign = sign_map.get(document.doc_type)
+            if sign is None:
+                raise ValueError("Unsupported document type for agent posting")
+
+            for item in items:
+                delta = sign * Decimal(item.qty)
+                bal, _ = models.AgentStockBalance.objects.select_for_update().get_or_create(
+                    agent_id=document.agent_id,
+                    warehouse=document.warehouse_from,
+                    product=item.product,
+                    defaults={
+                        "qty": Decimal("0.000"),
+                        "company": document.warehouse_from.company,
+                        "branch": document.warehouse_from.branch,
+                    },
+                )
+                cur = Decimal(bal.qty or 0)
+                if not allow_negative and cur + delta < 0:
+                    product_display = item.product.article if item.product.article else item.product.name
+                    if not product_display:
+                        product_display = f"ID {item.product_id}"
+                    raise ValueError(
+                        f"Недостаточно у агента для товара '{product_display}'. Доступно: {cur}, требуется: {abs(delta)}"
+                    )
+
+                mv = models.AgentStockMove.objects.create(
+                    document=document,
+                    agent_id=document.agent_id,
+                    warehouse=document.warehouse_from,
+                    product=item.product,
+                    qty_delta=delta,
+                )
+                _apply_agent_move(mv)
+
         # create moves according to type
-        if document.doc_type == document.DocType.TRANSFER:
+        elif document.doc_type == document.DocType.TRANSFER:
             for item in items:
                 # Проверка остатков перед созданием moves
                 if not allow_negative:
@@ -218,25 +282,54 @@ def unpost_document(document: models.Document) -> models.Document:
         raise ValueError("Document is not posted")
 
     with transaction.atomic():
-        # Оптимизация: предзагружаем moves с продуктами и складами
-        moves = list(document.moves.select_related("warehouse", "product", "product__warehouse").select_for_update())
-        for mv in moves:
-            # Получаем или создаем StockBalance (на случай если был удален)
-            bal, _ = models.StockBalance.objects.select_for_update().get_or_create(
-                warehouse=mv.warehouse, 
-                product=mv.product, 
-                defaults={"qty": Decimal("0.000")}
-            )
-            cur = Decimal(bal.qty or 0)
-            # reverse: вычитаем qty_delta (т.к. при post мы добавляли)
-            bal.qty = cur - Decimal(mv.qty_delta or 0)
-            if bal.qty < 0:
-                # Логируем предупреждение, но не блокируем отмену
-                import logging
-                logger = logging.getLogger(__name__)
-                logger.warning(f"Unposting document {document.number} results in negative balance {bal.qty} for product {mv.product_id} at warehouse {mv.warehouse_id}")
-            bal.save()
-            mv.delete()
+        if document.agent_id:
+            moves = list(document.agent_moves.select_related("warehouse", "product").select_for_update())
+            for mv in moves:
+                bal, _ = models.AgentStockBalance.objects.select_for_update().get_or_create(
+                    agent=mv.agent,
+                    warehouse=mv.warehouse,
+                    product=mv.product,
+                    defaults={
+                        "qty": Decimal("0.000"),
+                        "company": mv.warehouse.company,
+                        "branch": mv.warehouse.branch,
+                    },
+                )
+                cur = Decimal(bal.qty or 0)
+                bal.qty = cur - Decimal(mv.qty_delta or 0)
+                if bal.qty < 0:
+                    import logging
+                    logger = logging.getLogger(__name__)
+                    logger.warning(
+                        f"Unposting agent document {document.number} results in negative balance {bal.qty} "
+                        f"for product {mv.product_id} at warehouse {mv.warehouse_id}"
+                    )
+                bal.save()
+                if mv.product.warehouse_id == mv.warehouse_id:
+                    type(mv.product).objects.filter(pk=mv.product_id).update(quantity=q_qty(bal.qty))
+                mv.delete()
+        else:
+            # Оптимизация: предзагружаем moves с продуктами и складами
+            moves = list(document.moves.select_related("warehouse", "product", "product__warehouse").select_for_update())
+            for mv in moves:
+                # Получаем или создаем StockBalance (на случай если был удален)
+                bal, _ = models.StockBalance.objects.select_for_update().get_or_create(
+                    warehouse=mv.warehouse, 
+                    product=mv.product, 
+                    defaults={"qty": Decimal("0.000")}
+                )
+                cur = Decimal(bal.qty or 0)
+                # reverse: вычитаем qty_delta (т.к. при post мы добавляли)
+                bal.qty = cur - Decimal(mv.qty_delta or 0)
+                if bal.qty < 0:
+                    # Логируем предупреждение, но не блокируем отмену
+                    import logging
+                    logger = logging.getLogger(__name__)
+                    logger.warning(f"Unposting document {document.number} results in negative balance {bal.qty} for product {mv.product_id} at warehouse {mv.warehouse_id}")
+                bal.save()
+                if mv.product.warehouse_id == mv.warehouse_id:
+                    type(mv.product).objects.filter(pk=mv.product_id).update(quantity=q_qty(bal.qty))
+                mv.delete()
 
         document.status = document.Status.DRAFT
         document.save()

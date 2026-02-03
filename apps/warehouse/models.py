@@ -3,10 +3,12 @@ from decimal import Decimal, ROUND_HALF_UP
 from io import BytesIO
 
 from django.db import models, transaction, connection
+from django.conf import settings
 from django.db.models import Q, Max, IntegerField
 from django.db.models.functions import Cast
 from django.core.exceptions import ValidationError
 from django.core.files.base import ContentFile
+from django.utils import timezone
 
 from PIL import Image
 
@@ -627,7 +629,6 @@ class WarehouseProductPackage(BaseModelId, BaseModelCompanyBranch):
 # -----------------------
 # Documents / stock models
 # -----------------------
-from django.conf import settings
 
 
 class StockBalance(models.Model):
@@ -643,6 +644,56 @@ class StockBalance(models.Model):
 
     def __str__(self):
         return f"Balance {self.warehouse} / {self.product} = {self.qty}"
+
+
+class AgentStockBalance(BaseModelId, BaseModelCompanyBranch):
+    """
+    Остатки товаров на руках у агента.
+    """
+    agent = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="warehouse_agent_balances")
+    warehouse = models.ForeignKey("warehouse.Warehouse", on_delete=models.CASCADE, related_name="agent_balances")
+    product = models.ForeignKey("warehouse.WarehouseProduct", on_delete=models.CASCADE, related_name="agent_balances")
+    qty = models.DecimalField(max_digits=18, decimal_places=3, default=Decimal("0.000"), verbose_name="Количество")
+
+    class Meta:
+        verbose_name = "Остаток у агента"
+        verbose_name_plural = "Остатки у агентов"
+        unique_together = ("agent", "warehouse", "product")
+        indexes = [
+            models.Index(fields=["company", "agent", "warehouse"]),
+            models.Index(fields=["company", "agent", "product"]),
+        ]
+
+    def __str__(self):
+        return f"AgentBalance {self.agent_id} / {self.product_id} = {self.qty}"
+
+    def clean(self):
+        if self.warehouse_id and self.company_id and self.warehouse.company_id != self.company_id:
+            raise ValidationError({"warehouse": "Склад принадлежит другой компании."})
+        if self.product_id and self.company_id and self.product.company_id != self.company_id:
+            raise ValidationError({"product": "Товар принадлежит другой компании."})
+        if self.branch_id and self.warehouse_id and self.warehouse.branch_id not in (None, self.branch_id):
+            raise ValidationError({"warehouse": "Склад другого филиала."})
+        if self.branch_id and self.product_id and self.product.branch_id not in (None, self.branch_id):
+            raise ValidationError({"product": "Товар другого филиала."})
+
+
+class AgentStockMove(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    document = models.ForeignKey("warehouse.Document", on_delete=models.CASCADE, related_name="agent_moves", verbose_name="Документ")
+    agent = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="warehouse_agent_moves")
+    warehouse = models.ForeignKey("warehouse.Warehouse", on_delete=models.CASCADE, verbose_name="Склад")
+    product = models.ForeignKey("warehouse.WarehouseProduct", on_delete=models.CASCADE, verbose_name="Товар")
+    qty_delta = models.DecimalField(max_digits=18, decimal_places=3, verbose_name="Изменение количества")
+    created_at = models.DateTimeField(auto_now_add=True, verbose_name="Дата создания")
+
+    class Meta:
+        verbose_name = "Движение товара у агента"
+        verbose_name_plural = "Движения товаров у агентов"
+        indexes = [models.Index(fields=["agent", "warehouse", "product", "created_at"])]
+
+    def __str__(self):
+        return f"AgentMove {self.document.number} {self.product} {self.qty_delta} @ {self.agent_id}"
 
 
 class Counterparty(models.Model):
@@ -698,6 +749,14 @@ class Document(models.Model):
     warehouse_from = models.ForeignKey("warehouse.Warehouse", on_delete=models.SET_NULL, null=True, blank=True, related_name="documents_from", verbose_name="Склад-источник")
     warehouse_to = models.ForeignKey("warehouse.Warehouse", on_delete=models.SET_NULL, null=True, blank=True, related_name="documents_to", verbose_name="Склад-приемник")
     counterparty = models.ForeignKey("warehouse.Counterparty", on_delete=models.SET_NULL, null=True, blank=True, verbose_name="Контрагент")
+    agent = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="warehouse_documents",
+        verbose_name="Агент",
+    )
 
     comment = models.TextField(blank=True, verbose_name="Комментарий")
     total = models.DecimalField(max_digits=18, decimal_places=2, default=Decimal("0.00"), verbose_name="Итого")
@@ -719,6 +778,15 @@ class Document(models.Model):
                 raise ValidationError("TRANSFER requires both warehouse_from and warehouse_to")
             if self.warehouse_from_id == self.warehouse_to_id:
                 raise ValidationError("warehouse_from and warehouse_to must be different")
+
+        if self.agent_id:
+            if self.doc_type in (self.DocType.TRANSFER, self.DocType.INVENTORY):
+                raise ValidationError("Agent documents cannot be TRANSFER or INVENTORY")
+            if not self.warehouse_from:
+                raise ValidationError("Agent document requires warehouse_from")
+            if getattr(self.agent, "company_id", None) and self.warehouse_from:
+                if self.agent.company_id != self.warehouse_from.company_id:
+                    raise ValidationError("Agent belongs to another company")
 
         if self.doc_type in (self.DocType.SALE, self.DocType.SALE_RETURN, self.DocType.PURCHASE, self.DocType.PURCHASE_RETURN, self.DocType.RECEIPT, self.DocType.WRITE_OFF):
             # require warehouse_from for most operations (warehouse where stock changes).
@@ -804,6 +872,190 @@ class DocumentItem(models.Model):
         p = Decimal(self.price or 0)
         dp = Decimal(self.discount_percent or 0) / Decimal("100")
         self.line_total = (p * q * (Decimal("1") - dp)).quantize(Decimal("0.01"))
+        super().save(*args, **kwargs)
+
+
+class AgentRequestCart(BaseModelId, BaseModelDate, BaseModelCompanyBranch):
+    """
+    Заявка агента на получение товара со склада.
+    """
+    class Status(models.TextChoices):
+        DRAFT = "draft", "Черновик"
+        SUBMITTED = "submitted", "Отправлено владельцу"
+        APPROVED = "approved", "Одобрено и выдано"
+        REJECTED = "rejected", "Отклонено"
+
+    agent = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.PROTECT,
+        related_name="warehouse_agent_carts",
+        verbose_name="Агент",
+    )
+    warehouse = models.ForeignKey(
+        "warehouse.Warehouse",
+        on_delete=models.PROTECT,
+        related_name="agent_request_carts",
+        verbose_name="Склад",
+    )
+    status = models.CharField(max_length=16, choices=Status.choices, default=Status.DRAFT)
+    note = models.CharField(max_length=255, blank=True, verbose_name="Комментарий агента")
+
+    submitted_at = models.DateTimeField(null=True, blank=True)
+    approved_at = models.DateTimeField(null=True, blank=True)
+    approved_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name="warehouse_approved_agent_carts",
+        verbose_name="Кем одобрено",
+    )
+
+    class Meta:
+        verbose_name = "Заявка агента (склад)"
+        verbose_name_plural = "Заявки агентов (склад)"
+        ordering = ["-created_date"]
+        indexes = [
+            models.Index(fields=["company", "status"]),
+            models.Index(fields=["company", "branch", "status"]),
+            models.Index(fields=["agent", "status"]),
+        ]
+
+    def __str__(self):
+        return f"Заявка {self.id} от {getattr(self.agent, 'username', self.agent_id)} [{self.get_status_display()}]"
+
+    def clean(self):
+        if self.branch_id and self.branch.company_id != self.company_id:
+            raise ValidationError({"branch": "Филиал принадлежит другой компании."})
+        if self.warehouse_id and self.company_id and self.warehouse.company_id != self.company_id:
+            raise ValidationError({"warehouse": "Склад принадлежит другой компании."})
+        if self.branch_id and self.warehouse_id and self.warehouse.branch_id not in (None, self.branch_id):
+            raise ValidationError({"warehouse": "Склад другого филиала."})
+        if self.agent_id and getattr(self.agent, "company_id", None) not in (None, self.company_id):
+            raise ValidationError({"agent": "Агент принадлежит другой компании."})
+
+    def is_editable(self) -> bool:
+        return self.status == self.Status.DRAFT
+
+    @transaction.atomic
+    def submit(self):
+        if self.status != self.Status.DRAFT:
+            raise ValidationError("Можно отправить только черновик.")
+        if not self.items.exists():
+            raise ValidationError("Нельзя отправить пустую заявку.")
+        self.status = self.Status.SUBMITTED
+        self.submitted_at = timezone.now()
+        self.full_clean()
+        self.save(update_fields=["status", "submitted_at", "updated_date"])
+
+    @transaction.atomic
+    def approve(self, by_user):
+        if self.status != self.Status.SUBMITTED:
+            raise ValidationError("Можно одобрить только заявку в статусе 'submitted'.")
+        if not self.items.exists():
+            raise ValidationError("Нельзя одобрить пустую заявку.")
+
+        for it in self.items.select_related("product"):
+            prod = it.product
+            need_qty = q_qty(Decimal(it.quantity_requested or 0))
+            if need_qty <= 0:
+                continue
+
+            bal, created = StockBalance.objects.select_for_update().get_or_create(
+                warehouse=self.warehouse,
+                product=prod,
+                defaults={"qty": Decimal("0.000")},
+            )
+            if created and prod.warehouse_id == self.warehouse_id:
+                bal.qty = Decimal(prod.quantity or 0)
+
+            cur_qty = Decimal(bal.qty or 0)
+            if cur_qty < need_qty:
+                raise ValidationError({
+                    "items": f"Недостаточно на складе для {prod.name}: нужно {need_qty}, доступно {cur_qty}."
+                })
+
+            bal.qty = cur_qty - need_qty
+            bal.save(update_fields=["qty"])
+            if prod.warehouse_id == self.warehouse_id:
+                type(prod).objects.filter(pk=prod.pk).update(quantity=q_qty(bal.qty))
+
+            stock, _ = AgentStockBalance.objects.select_for_update().get_or_create(
+                agent=self.agent,
+                warehouse=self.warehouse,
+                product=prod,
+                defaults={
+                    "qty": Decimal("0.000"),
+                    "company": self.company,
+                    "branch": self.branch,
+                },
+            )
+            stock.qty = q_qty(Decimal(stock.qty or 0) + need_qty)
+            stock.save(update_fields=["qty"])
+
+        self.status = self.Status.APPROVED
+        self.approved_at = timezone.now()
+        self.approved_by = by_user
+        self.full_clean()
+        self.save(update_fields=["status", "approved_at", "approved_by", "updated_date"])
+
+    @transaction.atomic
+    def reject(self, by_user):
+        if self.status != self.Status.SUBMITTED:
+            raise ValidationError("Можно отклонить только заявку в статусе 'submitted'.")
+        self.status = self.Status.REJECTED
+        self.approved_at = timezone.now()
+        self.approved_by = by_user
+        self.full_clean()
+        self.save(update_fields=["status", "approved_at", "approved_by", "updated_date"])
+
+
+class AgentRequestItem(BaseModelId, BaseModelDate, BaseModelCompanyBranch):
+    cart = models.ForeignKey(
+        AgentRequestCart,
+        on_delete=models.CASCADE,
+        related_name="items",
+        verbose_name="Заявка",
+    )
+    product = models.ForeignKey(
+        "warehouse.WarehouseProduct",
+        on_delete=models.PROTECT,
+        related_name="agent_request_items",
+        verbose_name="Товар",
+    )
+    quantity_requested = models.DecimalField(max_digits=18, decimal_places=3, verbose_name="Запрошено")
+
+    class Meta:
+        verbose_name = "Позиция заявки агента (склад)"
+        verbose_name_plural = "Позиции заявок агента (склад)"
+        indexes = [
+            models.Index(fields=["cart", "product"]),
+        ]
+
+    def __str__(self):
+        return f"{self.cart_id} · {self.product_id} · {self.quantity_requested}"
+
+    def clean(self):
+        if self.quantity_requested is None or Decimal(self.quantity_requested) <= 0:
+            raise ValidationError({"quantity_requested": "Количество должно быть больше 0."})
+
+        if self.cart_id and self.cart.status != AgentRequestCart.Status.DRAFT:
+            raise ValidationError({"cart": "Нельзя редактировать позиции, когда заявка не в черновике."})
+
+        if self.cart_id and self.product_id:
+            if self.cart.company_id and self.product.company_id != self.cart.company_id:
+                raise ValidationError({"product": "Товар другой компании."})
+            if self.cart.branch_id and self.product.branch_id not in (None, self.cart.branch_id):
+                raise ValidationError({"product": "Товар другого филиала."})
+            if self.cart.warehouse_id and self.product.warehouse_id != self.cart.warehouse_id:
+                raise ValidationError({"product": "Товар должен принадлежать выбранному складу."})
+
+    def save(self, *args, **kwargs):
+        if self.cart_id:
+            if not self.company_id:
+                self.company_id = self.cart.company_id
+            if self.branch_id is None:
+                self.branch_id = self.cart.branch_id
         super().save(*args, **kwargs)
 
 

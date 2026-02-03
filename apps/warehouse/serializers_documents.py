@@ -16,6 +16,7 @@ class DocumentSerializer(serializers.ModelSerializer):
         read_only=True,
         allow_null=True
     )
+    agent = serializers.PrimaryKeyRelatedField(read_only=True)
 
     class Meta:
         ref_name = "WarehouseDocumentSerializer"
@@ -29,6 +30,7 @@ class DocumentSerializer(serializers.ModelSerializer):
             "warehouse_from",
             "warehouse_to",
             "counterparty",
+            "agent",
             "counterparty_display_name",
             "comment",
             "total",
