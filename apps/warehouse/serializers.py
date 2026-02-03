@@ -1,6 +1,7 @@
 from io import BytesIO
 from decimal import Decimal
 from PIL import Image
+from django.db import transaction
 
 from django.apps import apps
 from django.core.files.base import ContentFile
