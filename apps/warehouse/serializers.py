@@ -328,12 +328,14 @@ class AgentRequestItemSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSe
 
 class AgentRequestCartSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
     items = AgentRequestItemSerializer(many=True, read_only=True)
+    agent_display = serializers.SerializerMethodField()
 
     class Meta:
         model = m.AgentRequestCart
         fields = (
             "id",
             "agent",
+            "agent_display",
             "warehouse",
             "status",
             "note",
@@ -346,6 +348,21 @@ class AgentRequestCartSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSe
         )
         read_only_fields = ("id", "status", "submitted_at", "approved_at", "approved_by", "created_date", "updated_date")
 
+    def get_agent_display(self, obj):
+        agent = getattr(obj, "agent", None)
+        if not agent:
+            return None
+        full_name = ""
+        if hasattr(agent, "get_full_name"):
+            try:
+                full_name = agent.get_full_name() or ""
+            except Exception:
+                full_name = ""
+        if not full_name:
+            first = getattr(agent, "first_name", "") or ""
+            last = getattr(agent, "last_name", "") or ""
+            full_name = f"{first} {last}".strip()
+        return full_name or getattr(agent, "username", None) or getattr(agent, "email", None) or str(getattr(agent, "id", ""))
 
 class AgentRequestCartActionSerializer(serializers.Serializer):
     # placeholder for submit/approve/reject
