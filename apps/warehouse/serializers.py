@@ -312,3 +312,61 @@ class WarehouseProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSe
         instance.save()
         self._upsert_characteristics(instance, characteristics_data)
         return instance
+
+
+# ----------------
+# Agent flows
+# ----------------
+
+
+class AgentRequestItemSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
+    class Meta:
+        model = m.AgentRequestItem
+        fields = ("id", "cart", "product", "quantity_requested", "created_date", "updated_date")
+        read_only_fields = ("id", "created_date", "updated_date")
+
+
+class AgentRequestCartSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
+    items = AgentRequestItemSerializer(many=True, read_only=True)
+
+    class Meta:
+        model = m.AgentRequestCart
+        fields = (
+            "id",
+            "agent",
+            "warehouse",
+            "status",
+            "note",
+            "submitted_at",
+            "approved_at",
+            "approved_by",
+            "created_date",
+            "updated_date",
+            "items",
+        )
+        read_only_fields = ("id", "status", "submitted_at", "approved_at", "approved_by", "created_date", "updated_date")
+
+
+class AgentRequestCartActionSerializer(serializers.Serializer):
+    # placeholder for submit/approve/reject
+    pass
+
+
+class AgentStockBalanceSerializer(serializers.ModelSerializer):
+    product_name = serializers.CharField(source="product.name", read_only=True)
+    product_article = serializers.CharField(source="product.article", read_only=True)
+    product_unit = serializers.CharField(source="product.unit", read_only=True)
+
+    class Meta:
+        model = m.AgentStockBalance
+        fields = (
+            "id",
+            "agent",
+            "warehouse",
+            "product",
+            "product_name",
+            "product_article",
+            "product_unit",
+            "qty",
+        )
+        read_only_fields = fields

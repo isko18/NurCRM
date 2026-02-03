@@ -1,6 +1,9 @@
 from typing import Optional
 
-from rest_framework import generics, permissions
+from rest_framework import generics, permissions, status
+from rest_framework.response import Response
+from rest_framework.views import APIView
+from rest_framework.exceptions import PermissionDenied, ValidationError
 from django_filters.rest_framework import DjangoFilterBackend
 from django.shortcuts import get_object_or_404
 
@@ -13,6 +16,10 @@ from .serializers import (
     WarehouseProductSerializer,
     WarehouseProductImageSerializer,
     WarehouseProductPackageSerializer,
+    AgentRequestCartSerializer,
+    AgentRequestItemSerializer,
+    AgentRequestCartActionSerializer,
+    AgentStockBalanceSerializer,
 )
 
 from apps.warehouse import models as m
@@ -21,6 +28,7 @@ from apps.warehouse.filters import (
     BrandFilter,
     ProductFilter,
 )
+from apps.utils import _is_owner_like
 
 
 # ---- Company/branch mixin (copied/adapted) ----
@@ -352,3 +360,174 @@ class ProductPackageDetailView(CompanyBranchRestrictedMixin, generics.RetrieveUp
 
     def get_queryset(self):
         return m.WarehouseProductPackage.objects.filter(product_id=self.kwargs.get("product_uuid"))
+
+
+# ----------------
+# Agent requests / stock
+# ----------------
+
+
+class AgentRequestCartListCreateAPIView(CompanyBranchRestrictedMixin, generics.ListCreateAPIView):
+    serializer_class = AgentRequestCartSerializer
+
+    def get_queryset(self):
+        qs = m.AgentRequestCart.objects.select_related("agent", "warehouse", "approved_by")
+        qs = self._filter_qs_company_branch(qs)
+        user = self.request.user
+        if not _is_owner_like(user):
+            qs = qs.filter(agent=user)
+        return qs
+
+    def perform_create(self, serializer):
+        user = self.request.user
+        if _is_owner_like(user) and serializer.validated_data.get("agent"):
+            agent = serializer.validated_data.get("agent")
+        else:
+            agent = user
+        self._save_with_company_branch(serializer, agent=agent)
+
+
+class AgentRequestCartRetrieveUpdateDestroyAPIView(CompanyBranchRestrictedMixin, generics.RetrieveUpdateDestroyAPIView):
+    serializer_class = AgentRequestCartSerializer
+
+    def get_queryset(self):
+        qs = m.AgentRequestCart.objects.select_related("agent", "warehouse", "approved_by")
+        qs = self._filter_qs_company_branch(qs)
+        user = self.request.user
+        if not _is_owner_like(user):
+            qs = qs.filter(agent=user)
+        return qs
+
+    def perform_update(self, serializer):
+        instance = self.get_object()
+        user = self.request.user
+        if not _is_owner_like(user) and instance.agent_id != user.id:
+            raise PermissionDenied("Нет доступа к заявке.")
+        if instance.status != m.AgentRequestCart.Status.DRAFT:
+            raise ValidationError("Можно изменять только черновик.")
+        serializer.save()
+
+    def perform_destroy(self, instance):
+        user = self.request.user
+        if not _is_owner_like(user) and instance.agent_id != user.id:
+            raise PermissionDenied("Нет доступа к заявке.")
+        if instance.status != m.AgentRequestCart.Status.DRAFT:
+            raise ValidationError("Можно удалять только черновик.")
+        instance.delete()
+
+
+class AgentRequestCartSubmitAPIView(CompanyBranchRestrictedMixin, APIView):
+    def post(self, request, pk=None, *args, **kwargs):
+        qs = self._filter_qs_company_branch(m.AgentRequestCart.objects.select_related("agent", "warehouse"))
+        cart = get_object_or_404(qs, pk=pk)
+        user = request.user
+        if not _is_owner_like(user) and cart.agent_id != user.id:
+            return Response({"detail": "Нет доступа."}, status=status.HTTP_403_FORBIDDEN)
+        ser = AgentRequestCartActionSerializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+        cart.submit()
+        out = AgentRequestCartSerializer(cart, context={"request": request}).data
+        return Response(out)
+
+
+class AgentRequestCartApproveAPIView(CompanyBranchRestrictedMixin, APIView):
+    def post(self, request, pk=None, *args, **kwargs):
+        qs = self._filter_qs_company_branch(m.AgentRequestCart.objects.select_related("agent", "warehouse"))
+        cart = get_object_or_404(qs, pk=pk)
+        user = request.user
+        if not _is_owner_like(user):
+            return Response({"detail": "Только владелец/админ."}, status=status.HTTP_403_FORBIDDEN)
+        ser = AgentRequestCartActionSerializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+        cart.approve(user)
+        out = AgentRequestCartSerializer(cart, context={"request": request}).data
+        return Response(out)
+
+
+class AgentRequestCartRejectAPIView(CompanyBranchRestrictedMixin, APIView):
+    def post(self, request, pk=None, *args, **kwargs):
+        qs = self._filter_qs_company_branch(m.AgentRequestCart.objects.select_related("agent", "warehouse"))
+        cart = get_object_or_404(qs, pk=pk)
+        user = request.user
+        if not _is_owner_like(user):
+            return Response({"detail": "Только владелец/админ."}, status=status.HTTP_403_FORBIDDEN)
+        ser = AgentRequestCartActionSerializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+        cart.reject(user)
+        out = AgentRequestCartSerializer(cart, context={"request": request}).data
+        return Response(out)
+
+
+class AgentRequestItemListCreateAPIView(CompanyBranchRestrictedMixin, generics.ListCreateAPIView):
+    serializer_class = AgentRequestItemSerializer
+
+    def get_queryset(self):
+        qs = m.AgentRequestItem.objects.select_related("cart", "cart__agent", "product")
+        qs = self._filter_qs_company_branch(qs)
+        cart_id = self.request.query_params.get("cart")
+        if cart_id:
+            qs = qs.filter(cart_id=cart_id)
+        user = self.request.user
+        if not _is_owner_like(user):
+            qs = qs.filter(cart__agent=user)
+        return qs
+
+    def perform_create(self, serializer):
+        user = self.request.user
+        cart = serializer.validated_data.get("cart")
+        if not cart:
+            raise ValidationError("Укажите cart.")
+        if not _is_owner_like(user) and cart.agent_id != user.id:
+            raise PermissionDenied("Нет доступа к заявке.")
+        if cart.status != m.AgentRequestCart.Status.DRAFT:
+            raise ValidationError("Можно добавлять позиции только в черновик.")
+        self._save_with_company_branch(serializer)
+
+
+class AgentRequestItemDetailAPIView(CompanyBranchRestrictedMixin, generics.RetrieveUpdateDestroyAPIView):
+    serializer_class = AgentRequestItemSerializer
+
+    def get_queryset(self):
+        qs = m.AgentRequestItem.objects.select_related("cart", "cart__agent", "product")
+        qs = self._filter_qs_company_branch(qs)
+        user = self.request.user
+        if not _is_owner_like(user):
+            qs = qs.filter(cart__agent=user)
+        return qs
+
+    def perform_update(self, serializer):
+        instance = self.get_object()
+        user = self.request.user
+        if not _is_owner_like(user) and instance.cart.agent_id != user.id:
+            raise PermissionDenied("Нет доступа к заявке.")
+        if instance.cart.status != m.AgentRequestCart.Status.DRAFT:
+            raise ValidationError("Можно менять позиции только в черновике.")
+        serializer.save()
+
+    def perform_destroy(self, instance):
+        user = self.request.user
+        if not _is_owner_like(user) and instance.cart.agent_id != user.id:
+            raise PermissionDenied("Нет доступа к заявке.")
+        if instance.cart.status != m.AgentRequestCart.Status.DRAFT:
+            raise ValidationError("Можно удалять позиции только в черновике.")
+        instance.delete()
+
+
+class AgentMyProductsListAPIView(CompanyBranchRestrictedMixin, APIView):
+    def get(self, request, *args, **kwargs):
+        user = request.user
+        qs = m.AgentStockBalance.objects.select_related("product", "warehouse").filter(agent=user)
+        qs = self._filter_qs_company_branch(qs)
+        data = AgentStockBalanceSerializer(qs, many=True).data
+        return Response(data)
+
+
+class OwnerAgentsProductsListAPIView(CompanyBranchRestrictedMixin, APIView):
+    def get(self, request, *args, **kwargs):
+        user = request.user
+        if not _is_owner_like(user):
+            return Response({"detail": "Только владелец/админ."}, status=status.HTTP_403_FORBIDDEN)
+        qs = m.AgentStockBalance.objects.select_related("agent", "product", "warehouse")
+        qs = self._filter_qs_company_branch(qs)
+        data = AgentStockBalanceSerializer(qs, many=True).data
+        return Response(data)

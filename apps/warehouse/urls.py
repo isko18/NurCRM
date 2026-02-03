@@ -7,10 +7,20 @@ from .views import (
     ProductView, ProductDetailView,
     ProductImagesView, ProductImageDetailView,
     ProductPackagesView, ProductPackageDetailView,
+    AgentRequestCartListCreateAPIView,
+    AgentRequestCartRetrieveUpdateDestroyAPIView,
+    AgentRequestCartSubmitAPIView,
+    AgentRequestCartApproveAPIView,
+    AgentRequestCartRejectAPIView,
+    AgentRequestItemListCreateAPIView,
+    AgentRequestItemDetailAPIView,
+    AgentMyProductsListAPIView,
+    OwnerAgentsProductsListAPIView,
     # legacy views
 )
 from .views_documents import (
     DocumentListCreateView, DocumentDetailView, DocumentPostView, DocumentUnpostView,
+    AgentDocumentListCreateView, AgentDocumentDetailView,
     ProductListCreateView, ProductDetailView as ProductDetailViewCRUD,
     WarehouseListCreateView, WarehouseDetailView as WarehouseDetailViewCRUD,
     CounterpartyListCreateView, CounterpartyDetailView,
@@ -62,6 +72,29 @@ urlpatterns = [
 ]
 
 # register viewsets for documents and simple CRUD
+urlpatterns += [
+    # agent carts
+    path("agent-carts/", AgentRequestCartListCreateAPIView.as_view(), name="warehouse-agent-carts"),
+    path("agent-carts/<uuid:pk>/", AgentRequestCartRetrieveUpdateDestroyAPIView.as_view(), name="warehouse-agent-cart-detail"),
+    path("agent-carts/<uuid:pk>/submit/", AgentRequestCartSubmitAPIView.as_view(), name="warehouse-agent-cart-submit"),
+    path("agent-carts/<uuid:pk>/approve/", AgentRequestCartApproveAPIView.as_view(), name="warehouse-agent-cart-approve"),
+    path("agent-carts/<uuid:pk>/reject/", AgentRequestCartRejectAPIView.as_view(), name="warehouse-agent-cart-reject"),
+
+    # agent cart items
+    path("agent-cart-items/", AgentRequestItemListCreateAPIView.as_view(), name="warehouse-agent-cart-items"),
+    path("agent-cart-items/<uuid:pk>/", AgentRequestItemDetailAPIView.as_view(), name="warehouse-agent-cart-item-detail"),
+
+    # agent stock
+    path("agents/me/products/", AgentMyProductsListAPIView.as_view(), name="warehouse-agent-my-products"),
+    path("owner/agents/products/", OwnerAgentsProductsListAPIView.as_view(), name="warehouse-owner-agents-products"),
+]
+
+urlpatterns += [
+    # agent documents
+    path("agent/documents/", AgentDocumentListCreateView.as_view(), name="warehouse-agent-documents"),
+    path("agent/documents/<uuid:pk>/", AgentDocumentDetailView.as_view(), name="warehouse-agent-document-detail"),
+]
+
 urlpatterns += [
     # documents
     path("documents/", DocumentListCreateView.as_view(), name="warehouse-documents"),
