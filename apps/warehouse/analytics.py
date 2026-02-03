@@ -135,13 +135,17 @@ def build_agent_warehouse_analytics_payload(
     )["s"] or Decimal("0.000")
 
     sales_qs = wm.Document.objects.filter(
-        company=company,
+        warehouse_from__company=company,
         agent=agent,
         status=wm.Document.Status.POSTED,
         doc_type=wm.Document.DocType.SALE,
         date__gte=dt_from,
         date__lt=dt_to_excl,
     )
+    if branch is not None:
+        sales_qs = sales_qs.filter(warehouse_from__branch=branch)
+    else:
+        sales_qs = sales_qs.filter(warehouse_from__branch__isnull=True)
     sales_count = sales_qs.count()
     sales_amount = sales_qs.aggregate(s=Coalesce(Sum("total"), ZERO_MONEY))["s"] or Decimal("0.00")
 
@@ -151,24 +155,32 @@ def build_agent_warehouse_analytics_payload(
     )["s"] or Decimal("0.000")
 
     returns_qs = wm.Document.objects.filter(
-        company=company,
+        warehouse_from__company=company,
         agent=agent,
         status=wm.Document.Status.POSTED,
         doc_type=wm.Document.DocType.SALE_RETURN,
         date__gte=dt_from,
         date__lt=dt_to_excl,
     )
+    if branch is not None:
+        returns_qs = returns_qs.filter(warehouse_from__branch=branch)
+    else:
+        returns_qs = returns_qs.filter(warehouse_from__branch__isnull=True)
     returns_count = returns_qs.count()
     returns_amount = returns_qs.aggregate(s=Coalesce(Sum("total"), ZERO_MONEY))["s"] or Decimal("0.00")
 
     write_off_qs = wm.Document.objects.filter(
-        company=company,
+        warehouse_from__company=company,
         agent=agent,
         status=wm.Document.Status.POSTED,
         doc_type=wm.Document.DocType.WRITE_OFF,
         date__gte=dt_from,
         date__lt=dt_to_excl,
     )
+    if branch is not None:
+        write_off_qs = write_off_qs.filter(warehouse_from__branch=branch)
+    else:
+        write_off_qs = write_off_qs.filter(warehouse_from__branch__isnull=True)
     write_off_count = write_off_qs.count()
     write_off_qty = wm.DocumentItem.objects.filter(document__in=write_off_qs).aggregate(
         s=Coalesce(Sum("qty", output_field=QTY_FIELD), ZERO_QTY)
@@ -288,13 +300,17 @@ def build_owner_warehouse_analytics_payload(
     )["s"] or Decimal("0.000")
 
     sales_qs = wm.Document.objects.filter(
-        company=company,
+        warehouse_from__company=company,
         agent__isnull=False,
         status=wm.Document.Status.POSTED,
         doc_type=wm.Document.DocType.SALE,
         date__gte=dt_from,
         date__lt=dt_to_excl,
     )
+    if branch is not None:
+        sales_qs = sales_qs.filter(warehouse_from__branch=branch)
+    else:
+        sales_qs = sales_qs.filter(warehouse_from__branch__isnull=True)
     sales_count = sales_qs.count()
     sales_amount = sales_qs.aggregate(s=Coalesce(Sum("total"), ZERO_MONEY))["s"] or Decimal("0.00")
 

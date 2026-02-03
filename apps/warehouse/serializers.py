@@ -374,12 +374,14 @@ class AgentStockBalanceSerializer(serializers.ModelSerializer):
     product_name = serializers.CharField(source="product.name", read_only=True)
     product_article = serializers.CharField(source="product.article", read_only=True)
     product_unit = serializers.CharField(source="product.unit", read_only=True)
+    agent_display = serializers.SerializerMethodField()
 
     class Meta:
         model = m.AgentStockBalance
         fields = (
             "id",
             "agent",
+            "agent_display",
             "warehouse",
             "product",
             "product_name",
@@ -388,3 +390,19 @@ class AgentStockBalanceSerializer(serializers.ModelSerializer):
             "qty",
         )
         read_only_fields = fields
+
+    def get_agent_display(self, obj):
+        agent = getattr(obj, "agent", None)
+        if not agent:
+            return None
+        full_name = ""
+        if hasattr(agent, "get_full_name"):
+            try:
+                full_name = agent.get_full_name() or ""
+            except Exception:
+                full_name = ""
+        if not full_name:
+            first = getattr(agent, "first_name", "") or ""
+            last = getattr(agent, "last_name", "") or ""
+            full_name = f"{first} {last}".strip()
+        return full_name or getattr(agent, "username", None) or getattr(agent, "email", None) or str(getattr(agent, "id", ""))
