@@ -351,7 +351,8 @@ class WarehouseComprehensiveTests(TestCase):
         
         # Проверяем остатки
         bal1 = models.StockBalance.objects.get(warehouse=self.wh1, product=self.prod1)
-        bal2 = models.StockBalance.objects.get(warehouse=self.wh2, product=self.prod1)
+        dest_prod = models.WarehouseProduct.objects.get(warehouse=self.wh2, barcode=self.prod1.barcode)
+        bal2 = models.StockBalance.objects.get(warehouse=self.wh2, product=dest_prod)
         self.assertEqual(bal1.qty, Decimal("60.000"))
         self.assertEqual(bal2.qty, Decimal("40.000"))
     
@@ -403,7 +404,8 @@ class WarehouseComprehensiveTests(TestCase):
         services.post_document(doc)
         
         bal1 = models.StockBalance.objects.get(warehouse=self.wh1, product=self.prod1)
-        bal2 = models.StockBalance.objects.get(warehouse=self.wh2, product=self.prod1)
+        dest_prod = models.WarehouseProduct.objects.get(warehouse=self.wh2, barcode=self.prod1.barcode)
+        bal2 = models.StockBalance.objects.get(warehouse=self.wh2, product=dest_prod)
         self.assertEqual(bal1.qty, Decimal("70.000"))
         self.assertEqual(bal2.qty, Decimal("30.000"))
         
@@ -1174,7 +1176,8 @@ class WarehouseComprehensiveTests(TestCase):
         services.post_document(doc1)
         
         bal1 = models.StockBalance.objects.get(warehouse=self.wh1, product=self.prod1)
-        bal2 = models.StockBalance.objects.get(warehouse=self.wh2, product=self.prod1)
+        dest_prod = models.WarehouseProduct.objects.get(warehouse=self.wh2, barcode=self.prod1.barcode)
+        bal2 = models.StockBalance.objects.get(warehouse=self.wh2, product=dest_prod)
         self.assertEqual(bal1.qty, Decimal("70.000"))
         self.assertEqual(bal2.qty, Decimal("30.000"))
         
@@ -1186,7 +1189,7 @@ class WarehouseComprehensiveTests(TestCase):
         )
         models.DocumentItem.objects.create(
             document=doc2,
-            product=self.prod1,
+            product=dest_prod,
             qty=Decimal("10.000"),
             price=Decimal("0.00")
         )

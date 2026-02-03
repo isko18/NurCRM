@@ -778,6 +778,9 @@ class Document(models.Model):
                 raise ValidationError("TRANSFER requires both warehouse_from and warehouse_to")
             if self.warehouse_from_id == self.warehouse_to_id:
                 raise ValidationError("warehouse_from and warehouse_to must be different")
+            if self.warehouse_from and self.warehouse_to:
+                if self.warehouse_from.company_id != self.warehouse_to.company_id:
+                    raise ValidationError("TRANSFER requires warehouses from the same company")
 
         if self.agent_id:
             if self.doc_type in (self.DocType.TRANSFER, self.DocType.INVENTORY):
@@ -830,8 +833,12 @@ class DocumentItem(models.Model):
                 # Документ еще не сохранен - проверяем по warehouse_from_id напрямую
                 if hasattr(doc, 'warehouse_from_id') and doc.warehouse_from_id:
                     prod = self.product
-                    if prod.warehouse_id != doc.warehouse_from_id and doc.doc_type != doc.DocType.TRANSFER:
-                        raise ValidationError({"product": "Товар должен принадлежать складу документа."})
+                    if doc.doc_type == doc.DocType.TRANSFER:
+                        if prod.warehouse_id != doc.warehouse_from_id:
+                            raise ValidationError({"product": "Товар должен принадлежать складу-источнику перемещения."})
+                    else:
+                        if prod.warehouse_id != doc.warehouse_from_id:
+                            raise ValidationError({"product": "Товар должен принадлежать складу документа."})
             elif hasattr(doc, 'pk') and doc.pk:
                 # Документ сохранен - полная проверка
                 prod = self.product
@@ -850,10 +857,9 @@ class DocumentItem(models.Model):
                         warehouse_name = doc.warehouse_from.name if hasattr(doc, 'warehouse_from') and doc.warehouse_from else "документа"
                         raise ValidationError({"product": f"Товар должен принадлежать складу '{warehouse_name}'."})
                 else:
-                    # Для TRANSFER товар должен быть на одном из складов
-                    if doc.warehouse_from_id and doc.warehouse_to_id:
-                        if prod.warehouse_id not in (doc.warehouse_from_id, doc.warehouse_to_id):
-                            raise ValidationError({"product": "Товар должен принадлежать одному из складов перемещения."})
+                    # Для TRANSFER товар должен принадлежать складу-источнику
+                    if doc.warehouse_from_id and prod.warehouse_id != doc.warehouse_from_id:
+                        raise ValidationError({"product": "Товар должен принадлежать складу-источнику перемещения."})
 
         # integral check for PCS
         try:
