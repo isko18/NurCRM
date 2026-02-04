@@ -410,7 +410,11 @@ class OrderItemSerializer(serializers.ModelSerializer):
         super().__init__(*args, **kwargs)
         req = self.context.get("request")
         user = getattr(req, "user", None) if req else None
-        comp = getattr(user, "company", None)
+        comp = (
+            getattr(user, "company", None)
+            or getattr(user, "owned_company", None)
+            or getattr(getattr(user, "branch", None), "company", None)
+        )
         br = _active_branch(self)
         if comp and self.fields.get("product"):
             qs = Product.objects.filter(company=comp)
