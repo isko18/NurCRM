@@ -2333,9 +2333,8 @@ class AgentRequestItemSerializer(serializers.ModelSerializer):
 
         if comp and self.fields.get("cart"):
             cart_qs = AgentRequestCart.objects.filter(company=comp)
-            if br is not None:
-                cart_qs = cart_qs.filter(Q(branch=br) | Q(branch__isnull=True))
-            # если br None — все корзины компании
+            # корзины берем по компании без ограничения по филиалу:
+            # доступ к чужому филиалу все равно ограничен на уровне view/queryset
 
             # агент может создавать строки только в своих корзинах
             if user and not getattr(user, "is_superuser", False) and not getattr(user, "is_owner", False):
