@@ -325,6 +325,7 @@ class WarehouseProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSe
 class AgentRequestItemSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
     class Meta:
         model = m.AgentRequestItem
+        ref_name = "WarehouseAgentRequestItem"
         fields = ("id", "cart", "product", "quantity_requested", "created_date", "updated_date")
         read_only_fields = ("id", "created_date", "updated_date")
 
@@ -335,6 +336,7 @@ class AgentRequestCartSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSe
 
     class Meta:
         model = m.AgentRequestCart
+        ref_name = "WarehouseAgentRequestCart"
         fields = (
             "id",
             "agent",
