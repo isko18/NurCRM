@@ -161,11 +161,24 @@ class KitchenTaskSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSeriali
         fn = getattr(w, 'get_full_name', lambda: '')() or ''
         return fn or getattr(w, 'email', '') or str(w.pk)
 
+def _strip_null_bytes(value):
+    """Убирает нуль-байты из строки (Django/CharField их не допускает)."""
+    if isinstance(value, str):
+        return value.replace("\x00", "")
+    return value
+
+
 class KitchenSerializer(CompanyBranchReadOnlyMixin):
     class Meta:
         model = Kitchen
         fields = ["id", "company", "branch", "title", "number", "printer"]
         read_only_fields = ["id", "company", "branch"]
+
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        if "printer" in data and data["printer"] is not None:
+            data["printer"] = _strip_null_bytes(data["printer"])
+        return data
 
     def validate(self, attrs):
         title = (attrs.get("title") or getattr(self.instance, "title", "") or "").strip()
@@ -205,6 +218,13 @@ class KitchenSerializer(CompanyBranchReadOnlyMixin):
             title_qs = title_qs.exclude(pk=self.instance.pk)
         if title_qs.exists():
             raise serializers.ValidationError({"title": "Кухня с таким названием уже существует."})
+
+        # Убираем нуль-байты из printer (в БД могли остаться, Django их не допускает)
+        if "printer" in attrs:
+            attrs["printer"] = _strip_null_bytes(attrs["printer"] or "")
+        elif self.instance is not None:
+            current = getattr(self.instance, "printer", None) or ""
+            attrs["printer"] = _strip_null_bytes(current)
 
         return attrs
 
