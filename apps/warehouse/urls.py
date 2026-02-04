@@ -35,6 +35,10 @@ from .views_money import (
     MoneyDocumentListCreateView, MoneyDocumentDetailView, MoneyDocumentPostView, MoneyDocumentUnpostView,
     CounterpartyMoneyOperationsView,
 )
+from .views_reconciliation import (
+    CounterpartyReconciliationClassicAPIView,
+    CounterpartyReconciliationJSONAPIView,
+)
 from .views_analytics import (
     WarehouseAgentMyAnalyticsAPIView,
     WarehouseOwnerAgentAnalyticsAPIView,
@@ -150,5 +154,19 @@ urlpatterns += [
         "money/counterparties/<uuid:counterparty_id>/operations/",
         CounterpartyMoneyOperationsView.as_view(),
         name="money-operations-by-counterparty",
+    ),
+]
+
+urlpatterns += [
+    # reconciliation
+    path(
+        "counterparties/<uuid:counterparty_id>/reconciliation/",
+        CounterpartyReconciliationClassicAPIView.as_view(),
+        name="counterparty-reconciliation",
+    ),
+    path(
+        "counterparties/<uuid:counterparty_id>/reconciliation/json/",
+        CounterpartyReconciliationJSONAPIView.as_view(),
+        name="counterparty-reconciliation-json",
     ),
 ]
