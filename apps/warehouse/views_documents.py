@@ -6,6 +6,7 @@ from django.shortcuts import get_object_or_404
 from django_filters.rest_framework import DjangoFilterBackend
 
 from . import models, serializers_documents, services
+from rest_framework.exceptions import ValidationError as DRFValidationError
 from .views import CompanyBranchRestrictedMixin
 
 
@@ -139,6 +140,54 @@ class DocumentUnpostView(CompanyBranchRestrictedMixin, generics.GenericAPIView):
         except Exception as e:
             return Response({"detail": str(e)}, status=status.HTTP_400_BAD_REQUEST)
         return Response(self.get_serializer(doc).data)
+
+
+class DocumentTransferCreateAPIView(CompanyBranchRestrictedMixin, APIView):
+    """
+    Быстрое перемещение товара (создает документ TRANSFER и сразу проводит).
+    POST /api/warehouse/transfer/
+    """
+    def post(self, request, *args, **kwargs):
+        ser = serializers_documents.TransferCreateSerializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+
+        company = self._company()
+        branch = self._auto_branch()
+        wh_from = ser.validated_data["warehouse_from"]
+        wh_to = ser.validated_data["warehouse_to"]
+
+        if company and (wh_from.company_id != company.id or wh_to.company_id != company.id):
+            raise DRFValidationError({"warehouse": "Склад принадлежит другой компании."})
+
+        if branch is not None:
+            if wh_from.branch_id not in (None, branch.id) or wh_to.branch_id not in (None, branch.id):
+                raise DRFValidationError({"warehouse": "Склад другого филиала."})
+        else:
+            if wh_from.branch_id is not None or wh_to.branch_id is not None:
+                raise DRFValidationError({"warehouse": "Склад другого филиала."})
+
+        doc = models.Document.objects.create(
+            doc_type=models.Document.DocType.TRANSFER,
+            warehouse_from=wh_from,
+            warehouse_to=wh_to,
+            comment=ser.validated_data.get("comment") or "",
+        )
+
+        for it in ser.validated_data["items"]:
+            item = models.DocumentItem(document=doc, **it)
+            try:
+                item.clean()
+            except Exception as e:
+                raise DRFValidationError(getattr(e, "message_dict", {"detail": str(e)}))
+            item.save()
+
+        try:
+            services.post_document(doc)
+        except Exception as e:
+            raise DRFValidationError({"detail": str(e)})
+
+        out = serializers_documents.DocumentSerializer(doc, context={"request": request}).data
+        return Response(out, status=status.HTTP_201_CREATED)
 
 
 class ProductListCreateView(CompanyBranchRestrictedMixin, generics.ListCreateAPIView):

@@ -1,3 +1,4 @@
+from decimal import Decimal
 from rest_framework import serializers
 from django.core.exceptions import ValidationError as DjangoValidationError
 from . import models
@@ -92,6 +93,27 @@ class DocumentSerializer(serializers.ModelSerializer):
                 item.save()
         
         return instance
+
+
+class TransferItemInputSerializer(serializers.Serializer):
+    product = serializers.PrimaryKeyRelatedField(queryset=models.WarehouseProduct.objects.all())
+    qty = serializers.DecimalField(max_digits=18, decimal_places=3)
+    price = serializers.DecimalField(max_digits=18, decimal_places=2, required=False, default=Decimal("0.00"))
+
+
+class TransferCreateSerializer(serializers.Serializer):
+    warehouse_from = serializers.PrimaryKeyRelatedField(queryset=models.Warehouse.objects.all())
+    warehouse_to = serializers.PrimaryKeyRelatedField(queryset=models.Warehouse.objects.all())
+    comment = serializers.CharField(required=False, allow_blank=True)
+    items = TransferItemInputSerializer(many=True)
+
+    def validate(self, attrs):
+        items = attrs.get("items") or []
+        if not items:
+            raise serializers.ValidationError({"items": "Нельзя проводить пустое перемещение."})
+        if attrs["warehouse_from"] == attrs["warehouse_to"]:
+            raise serializers.ValidationError({"warehouse_to": "Склад-источник и склад-приемник должны быть разными."})
+        return attrs
 
 
 class ProductSimpleSerializer(serializers.ModelSerializer):

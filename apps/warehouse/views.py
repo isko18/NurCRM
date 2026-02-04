@@ -6,6 +6,8 @@ from rest_framework.views import APIView
 from rest_framework.exceptions import PermissionDenied, ValidationError
 from django_filters.rest_framework import DjangoFilterBackend
 from django.shortcuts import get_object_or_404
+from django.db.models import Count, Sum, DecimalField, Value as V
+from django.db.models.functions import Coalesce
 
 from apps.users.models import Branch
 
@@ -230,12 +232,32 @@ class WarehouseView(CompanyBranchRestrictedMixin, generics.ListCreateAPIView):
     filter_backends = [DjangoFilterBackend]
     filterset_class = WarehouseFilter
 
+    def get_queryset(self):
+        qs = super().get_queryset()
+        return qs.annotate(
+            products_count=Count("products", distinct=True),
+            products_qty_total=Coalesce(
+                Sum("products__quantity", output_field=DecimalField(max_digits=18, decimal_places=3)),
+                V(0),
+            ),
+        )
+
 
 class WarehouseDetailView(CompanyBranchRestrictedMixin, generics.RetrieveUpdateDestroyAPIView):
     serializer_class = WarehouseSerializer
     queryset = m.Warehouse.objects.select_related("company", "branch").all()
     lookup_field = "id"
     lookup_url_kwarg = "warehouse_uuid"
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        return qs.annotate(
+            products_count=Count("products", distinct=True),
+            products_qty_total=Coalesce(
+                Sum("products__quantity", output_field=DecimalField(max_digits=18, decimal_places=3)),
+                V(0),
+            ),
+        )
 
 
 # ==== Brand ====

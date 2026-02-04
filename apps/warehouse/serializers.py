@@ -48,10 +48,12 @@ class CompanyBranchReadOnlyMixin:
 class WarehouseSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
     company = serializers.ReadOnlyField(source='company.id')
     branch = serializers.ReadOnlyField(source='branch.id')
+    products_count = serializers.IntegerField(read_only=True)
+    products_qty_total = serializers.DecimalField(max_digits=18, decimal_places=3, read_only=True)
 
     class Meta:
         model = m.Warehouse
-        fields = ("id", "name", "location", "status", "company", "branch")
+        fields = ("id", "name", "location", "status", "company", "branch", "products_count", "products_qty_total")
         ref_name = "WarehouseWarehouseSerializer"
 
 

@@ -21,6 +21,7 @@ from .views import (
 from .views_documents import (
     DocumentListCreateView, DocumentDetailView, DocumentPostView, DocumentUnpostView,
     AgentDocumentListCreateView, AgentDocumentDetailView,
+    DocumentTransferCreateAPIView,
     ProductListCreateView, ProductDetailView as ProductDetailViewCRUD,
     WarehouseListCreateView, WarehouseDetailView as WarehouseDetailViewCRUD,
     CounterpartyListCreateView, CounterpartyDetailView,
@@ -110,6 +111,7 @@ urlpatterns += [
 urlpatterns += [
     # documents
     path("documents/", DocumentListCreateView.as_view(), name="warehouse-documents"),
+    path("transfer/", DocumentTransferCreateAPIView.as_view(), name="warehouse-transfer"),
     path("documents/sale/", DocumentSaleListCreateView.as_view(), name="warehouse-documents-sale"),
     path("documents/purchase/", DocumentPurchaseListCreateView.as_view(), name="warehouse-documents-purchase"),
     path("documents/sale-return/", DocumentSaleReturnListCreateView.as_view(), name="warehouse-documents-sale-return"),
