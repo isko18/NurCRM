@@ -4,7 +4,7 @@ from datetime import date, timedelta, datetime
 from decimal import Decimal
 
 from django.conf import settings
-from django.db.models import Sum, Count, Value as V, F, DecimalField
+from django.db.models import Sum, Count, Value as V, F, DecimalField, Q
 from django.db.models.functions import Coalesce, TruncDate, TruncWeek, TruncMonth
 from django.utils import timezone
 
@@ -153,6 +153,46 @@ def build_agent_warehouse_analytics_payload(
     sales_qty = sales_items_qs.aggregate(
         s=Coalesce(Sum("qty", output_field=QTY_FIELD), ZERO_QTY)
     )["s"] or Decimal("0.000")
+    sales_by_product_qs = (
+        sales_items_qs
+        .values("product_id", "product__name")
+        .annotate(
+            qty=Coalesce(Sum("qty", output_field=QTY_FIELD), ZERO_QTY),
+            amount=Coalesce(
+                Sum(F("qty") * F("price"), output_field=MONEY_FIELD),
+                ZERO_MONEY,
+            ),
+        )
+        .order_by("-amount", "-qty")[:100]
+    )
+    sales_by_product = [
+        {
+            "product_id": str(r["product_id"]),
+            "product_name": r["product__name"],
+            "qty": str(r["qty"]),
+            "amount": _money_str(r["amount"]),
+        }
+        for r in sales_by_product_qs
+    ]
+
+    sales_by_warehouse_qs = (
+        sales_qs
+        .values("warehouse_from_id", "warehouse_from__name")
+        .annotate(
+            sales_count=Count("id"),
+            sales_amount=Coalesce(Sum("total"), ZERO_MONEY),
+        )
+        .order_by("-sales_amount", "-sales_count")
+    )
+    sales_by_warehouse = [
+        {
+            "warehouse_id": str(r["warehouse_from_id"]),
+            "warehouse_name": r["warehouse_from__name"],
+            "sales_count": r["sales_count"],
+            "sales_amount": _money_str(r["sales_amount"]),
+        }
+        for r in sales_by_warehouse_qs
+    ]
 
     returns_qs = wm.Document.objects.filter(
         warehouse_from__company=company,
@@ -265,6 +305,10 @@ def build_agent_warehouse_analytics_payload(
             "requests_by_date": requests_by_date,
             "sales_by_date": sales_by_date,
         },
+        "details": {
+            "sales_by_product": sales_by_product,
+            "sales_by_warehouse": sales_by_warehouse,
+        },
     }
 
 
@@ -347,6 +391,29 @@ def build_owner_warehouse_analytics_payload(
         for row in sales_by_date_qs
     ]
 
+    sales_items_qs = wm.DocumentItem.objects.filter(document__in=sales_qs)
+    sales_by_product_qs = (
+        sales_items_qs
+        .values("product_id", "product__name")
+        .annotate(
+            qty=Coalesce(Sum("qty", output_field=QTY_FIELD), ZERO_QTY),
+            amount=Coalesce(
+                Sum(F("qty") * F("price"), output_field=MONEY_FIELD),
+                ZERO_MONEY,
+            ),
+        )
+        .order_by("-amount", "-qty")[:100]
+    )
+    sales_by_product = [
+        {
+            "product_id": str(r["product_id"]),
+            "product_name": r["product__name"],
+            "qty": str(r["qty"]),
+            "amount": _money_str(r["amount"]),
+        }
+        for r in sales_by_product_qs
+    ]
+
     top_agents_by_sales_qs = (
         sales_qs
         .values("agent_id", "agent__first_name", "agent__last_name")
@@ -389,6 +456,77 @@ def build_owner_warehouse_analytics_payload(
         for r in top_agents_by_received_qs
     ]
 
+    # per-warehouse details
+    approved_by_wh = {
+        r["cart__warehouse_id"]: {
+            "items_approved": r["items_approved"],
+            "carts_approved": r["carts_approved"],
+        }
+        for r in (
+            approved_items_qs
+            .values("cart__warehouse_id")
+            .annotate(
+                items_approved=Coalesce(Sum("quantity_requested", output_field=QTY_FIELD), ZERO_QTY),
+                carts_approved=Count("cart_id", distinct=True),
+            )
+        )
+    }
+
+    sales_by_wh = {
+        r["warehouse_from_id"]: {
+            "sales_count": r["sales_count"],
+            "sales_amount": r["sales_amount"],
+        }
+        for r in (
+            sales_qs
+            .values("warehouse_from_id")
+            .annotate(
+                sales_count=Count("id"),
+                sales_amount=Coalesce(Sum("total"), ZERO_MONEY),
+            )
+        )
+    }
+
+    on_hand_by_wh = {
+        r["warehouse_id"]: {
+            "on_hand_qty": r["on_hand_qty"],
+            "on_hand_amount": r["on_hand_amount"],
+        }
+        for r in (
+            on_hand_qs
+            .values("warehouse_id")
+            .annotate(
+                on_hand_qty=Coalesce(Sum("qty", output_field=QTY_FIELD), ZERO_QTY),
+                on_hand_amount=Coalesce(
+                    Sum(F("qty") * F("product__price"), output_field=MONEY_FIELD),
+                    ZERO_MONEY,
+                ),
+            )
+        )
+    }
+
+    warehouses_qs = wm.Warehouse.objects.filter(company=company)
+    if branch is not None:
+        warehouses_qs = warehouses_qs.filter(branch=branch)
+    else:
+        warehouses_qs = warehouses_qs.filter(branch__isnull=True)
+
+    warehouses = []
+    for wh in warehouses_qs:
+        approved = approved_by_wh.get(wh.id, {})
+        sales = sales_by_wh.get(wh.id, {})
+        on_hand = on_hand_by_wh.get(wh.id, {})
+        warehouses.append({
+            "warehouse_id": str(wh.id),
+            "warehouse_name": wh.name,
+            "carts_approved": approved.get("carts_approved", 0),
+            "items_approved": str(approved.get("items_approved", Decimal("0.000"))),
+            "sales_count": sales.get("sales_count", 0),
+            "sales_amount": _money_str(sales.get("sales_amount", Decimal("0.00"))),
+            "on_hand_qty": str(on_hand.get("on_hand_qty", Decimal("0.000"))),
+            "on_hand_amount": _money_str(on_hand.get("on_hand_amount", Decimal("0.00"))),
+        })
+
     return {
         "period": period,
         "date_from": str(date_from),
@@ -407,5 +545,9 @@ def build_owner_warehouse_analytics_payload(
         "top_agents": {
             "by_sales": top_agents_by_sales,
             "by_received": top_agents_by_received,
+        },
+        "details": {
+            "warehouses": warehouses,
+            "sales_by_product": sales_by_product,
         },
     }
