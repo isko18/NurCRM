@@ -87,6 +87,7 @@ class Company(models.Model):
     sector = models.ForeignKey("Sector", on_delete=models.SET_NULL, null=True, blank=True, verbose_name="Отрасль")
     phone = models.CharField(max_length=60, verbose_name="Номер телефона", null=True, blank=True)
     phones_howcase = models.CharField(max_length=60, verbose_name="Номер для обращения по витрине", null=True, blank=True)
+    whatsapp_phone = models.CharField(max_length=60, verbose_name="Номер для WhatsApp", null=True, blank=True)
 
     owner = models.OneToOneField("User", on_delete=models.CASCADE, related_name="owned_company", verbose_name="Владелец компании")
 

@@ -659,7 +659,7 @@ class CompanySerializer(serializers.ModelSerializer):
         model = Company
         fields = [
             "id", "name","slug",
-            "industry", "sector", "phone", "phones_howcase", "subscription_plan",
+            "industry", "sector", "phone", "phones_howcase", "whatsapp_phone", "subscription_plan",
             "owner",
             "created_at", "start_date", "end_date",
             "can_view_documents", "can_view_whatsapp", "can_view_instagram", "can_view_telegram", "can_view_showcase",
@@ -699,7 +699,7 @@ _OPTIONAL_TEXT = ("llc", "inn", "okpo", "score", "bik", "address")
 class CompanyUpdateSerializer(serializers.ModelSerializer):
     class Meta:
         model = Company
-        fields = ["name", "llc", "inn", "okpo", "score", "bik", "address"]
+        fields = ["name", "llc", "inn", "okpo", "score", "bik", "address", "whatsapp_phone"]
 
     def validate(self, attrs):
         for f in _OPTIONAL_TEXT:

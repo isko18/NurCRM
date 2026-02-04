@@ -9,7 +9,7 @@ from ..models import Product, ProductCharacteristics, ProductPackage
 class PublicCompanySerializer(serializers.ModelSerializer):
     class Meta:
         model = Company
-        fields = ["id", "name", "slug"]
+        fields = ["id", "name", "slug", "phones_howcase"]
 
 
 class PublicProductPackageSerializer(serializers.ModelSerializer):

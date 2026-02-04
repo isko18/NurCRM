@@ -275,6 +275,7 @@ class CompanyAdmin(admin.ModelAdmin):
         "owner",
         "phone",
         "phones_howcase",
+        "whatsapp_phone",
         "subscription_plan",
         "industry",
         "sector",
@@ -297,7 +298,7 @@ class CompanyAdmin(admin.ModelAdmin):
         "can_view_telegram",
         "can_view_showcase",
     )
-    search_fields = ("name", "slug", "owner__email", "phone", "phones_howcase", "llc", "inn", "address")
+    search_fields = ("name", "slug", "owner__email", "phone", "phones_howcase", "whatsapp_phone", "llc", "inn", "address")
     readonly_fields = ("created_at",)
     autocomplete_fields = ("owner", "subscription_plan", "industry", "sector")
 
@@ -310,6 +311,7 @@ class CompanyAdmin(admin.ModelAdmin):
                     "slug",
                     "phone",
                     "phones_howcase",
+                    "whatsapp_phone",
                     "owner",
                     "subscription_plan",
                     "industry",
