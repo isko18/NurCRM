@@ -579,6 +579,28 @@ Read-only поля:
   "top_agents": {
     "by_sales": [ ... ],
     "by_received": [ ... ]
+  },
+  "details": {
+    "warehouses": [
+      {
+        "warehouse_id": "uuid",
+        "warehouse_name": "string",
+        "carts_approved": 3,
+        "items_approved": "30.000",
+        "sales_count": 12,
+        "sales_amount": "3400.00",
+        "on_hand_qty": "15.000",
+        "on_hand_amount": "1200.00"
+      }
+    ],
+    "sales_by_product": [
+      {
+        "product_id": "uuid",
+        "product_name": "string",
+        "qty": "10.000",
+        "amount": "1500.00"
+      }
+    ]
   }
 }
 ```
@@ -595,6 +617,24 @@ Read-only поля:
 - продажи/возвраты/списания
 - остатки на руках
 - графики по заявкам/продажам
+
+Детально:
+- `details.sales_by_product[]` — продажи по товарам
+- `details.sales_by_warehouse[]` — продажи по складам
+
+Пример `details` агента:
+```json
+{
+  "details": {
+    "sales_by_product": [
+      { "product_id": "uuid", "product_name": "string", "qty": "5.000", "amount": "500.00" }
+    ],
+    "sales_by_warehouse": [
+      { "warehouse_id": "uuid", "warehouse_name": "string", "sales_count": 3, "sales_amount": "700.00" }
+    ]
+  }
+}
+```
 
 ## 8) UI/UX рекомендации (коротко)
 - Документы: отдельный экран/модал для редактирования `items[]` (таблица с добавлением/удалением строк).
