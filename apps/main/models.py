@@ -1184,7 +1184,7 @@ class ItemMake(models.Model):
     name = models.CharField("Название", max_length=255)
     price = models.DecimalField("Цена", max_digits=10, decimal_places=2, default=0)
     unit = models.CharField("Единица измерения", max_length=50)
-    quantity = models.PositiveIntegerField("Количество", default=0)
+    quantity = models.DecimalField("Количество", max_digits=18, decimal_places=3, default=Decimal("0.000"))
 
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
