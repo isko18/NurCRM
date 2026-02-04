@@ -2335,10 +2335,10 @@ class AgentRequestItemSerializer(serializers.ModelSerializer):
             # если br None — все товары компании
             self.fields["product"].queryset = prod_qs
 
-        if comp and self.fields.get("cart"):
-            cart_qs = AgentRequestCart.objects.filter(company=comp)
-            # корзины берем по компании без ограничения по филиалу:
-            # доступ к чужому филиалу все равно ограничен на уровне view/queryset
+        if self.fields.get("cart"):
+            # Не ограничиваем по company/branch на этом уровне,
+            # чтобы не получать ложные "не существует".
+            cart_qs = AgentRequestCart.objects.all()
 
             # агент может создавать строки только в своих корзинах
             if user and not getattr(user, "is_superuser", False) and not getattr(user, "is_owner", False):
@@ -2396,6 +2396,16 @@ class AgentRequestItemSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError({"product": "Товар другой компании."})
         if cart.branch_id and product.branch_id not in (None, cart.branch_id):
             raise serializers.ValidationError({"product": "Товар другого филиала."})
+
+        # защита от чужой компании
+        comp = (
+            getattr(self.context.get("request", None), "user", None) and
+            (getattr(self.context["request"].user, "company", None)
+             or getattr(self.context["request"].user, "owned_company", None)
+             or getattr(getattr(self.context["request"].user, "branch", None), "company", None))
+        )
+        if comp and cart.company_id != comp.id:
+            raise serializers.ValidationError({"cart": "Корзина другой компании."})
 
         if qty is None or qty < 1:
             raise serializers.ValidationError({"quantity_requested": "Количество должно быть ≥ 1."})
