@@ -6,6 +6,7 @@
 
 ### Базовый префикс
 - Все эндпойнты модуля: `/api/warehouse/`
+- Prod backend: `https://app.nurcrm.kg` → полный путь: `https://app.nurcrm.kg/api/warehouse/`
 
 ### Аутентификация
 - Используется JWT (см. настройки): заголовок `Authorization: Bearer <access_token>`
