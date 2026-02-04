@@ -21,6 +21,7 @@ from apps.main.models import (
 
 from apps.consalting.models import ServicesConsalting
 from apps.users.models import User, Company, Branch
+from apps.utils import _is_owner_like
 
 
 # ===========================
@@ -2341,7 +2342,7 @@ class AgentRequestItemSerializer(serializers.ModelSerializer):
             cart_qs = AgentRequestCart.objects.all()
 
             # агент может создавать строки только в своих корзинах
-            if user and not getattr(user, "is_superuser", False) and not getattr(user, "is_owner", False):
+            if user and not _is_owner_like(user):
                 cart_qs = cart_qs.filter(agent=user)
 
             self.fields["cart"].queryset = cart_qs
