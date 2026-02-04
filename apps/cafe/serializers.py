@@ -168,7 +168,23 @@ def _strip_null_bytes(value):
     return value
 
 
+class NullByteSafeCharField(serializers.CharField):
+    """CharField, убирающий нуль-байты до валидации и при выводе (избегает ошибки Django)."""
+
+    def to_internal_value(self, data):
+        if isinstance(data, str):
+            data = data.replace("\x00", "")
+        return super().to_internal_value(data)
+
+    def to_representation(self, value):
+        if value is not None and isinstance(value, str):
+            value = value.replace("\x00", "")
+        return super().to_representation(value)
+
+
 class KitchenSerializer(CompanyBranchReadOnlyMixin):
+    printer = NullByteSafeCharField(required=False, allow_blank=True, max_length=255)
+
     class Meta:
         model = Kitchen
         fields = ["id", "company", "branch", "title", "number", "printer"]
