@@ -34,6 +34,35 @@ from apps.warehouse.filters import (
 from apps.utils import _is_owner_like
 
 
+# ---- Barcode helpers ----
+def _parse_scale_barcode(barcode: str):
+    """
+    EAN-13 весовой штрихкод формата:
+    PP CCCCC WWWWW K
+    """
+    if not barcode or len(barcode) != 13 or not barcode.isdigit():
+        return None
+
+    prefix = barcode[0:2]
+    plu_digits = barcode[2:7]
+    weight_digits = barcode[7:12]
+
+    try:
+        plu_int = int(plu_digits)
+        weight_raw = int(weight_digits)
+    except ValueError:
+        return None
+
+    weight_kg = Decimal(weight_raw) / Decimal("1000")
+
+    return {
+        "prefix": prefix,
+        "plu": plu_int,
+        "weight_raw": weight_raw,
+        "weight_kg": weight_kg,
+    }
+
+
 # ---- Company/branch mixin (copied/adapted) ----
 class CompanyBranchRestrictedMixin:
     permission_classes = [permissions.IsAuthenticated]
@@ -335,6 +364,60 @@ class ProductDetailView(CompanyBranchRestrictedMixin, generics.RetrieveUpdateDes
         serializer.validated_data.pop("company", None)
         serializer.validated_data.pop("branch", None)
         serializer.save()
+
+
+class ProductScanView(CompanyBranchRestrictedMixin, APIView):
+    def _get_warehouse(self):
+        return get_object_or_404(m.Warehouse, id=self.kwargs.get("warehouse_uuid"))
+
+    def _base_products_qs(self):
+        return (
+            m.WarehouseProduct.objects
+            .select_related("brand", "category", "warehouse", "company", "branch", "characteristics")
+            .prefetch_related("images", "packages")
+        )
+
+    def post(self, request, *args, **kwargs):
+        barcode = (request.data.get("barcode") or "").strip()
+        if not barcode:
+            raise ValidationError({"barcode": "Обязательное поле."})
+
+        warehouse = self._get_warehouse()
+        qs = self._base_products_qs().filter(warehouse=warehouse)
+
+        scan_qty = None
+        product = qs.filter(barcode=barcode).first()
+        if not product:
+            scale_data = _parse_scale_barcode(barcode)
+            if scale_data:
+                scan_qty = m.q_qty(Decimal(scale_data["weight_kg"]))
+                product = qs.filter(plu=scale_data["plu"]).first()
+
+        if product:
+            payload = WarehouseProductSerializer(product, context={"request": request}).data
+            return Response(
+                {
+                    "product": payload,
+                    "created": False,
+                    "scan_qty": str(scan_qty) if scan_qty is not None else None,
+                },
+                status=status.HTTP_200_OK,
+            )
+
+        data = request.data.copy()
+        data["barcode"] = barcode
+        ser = WarehouseProductSerializer(data=data, context={"request": request})
+        ser.is_valid(raise_exception=True)
+        product = ser.save(warehouse=warehouse, company=warehouse.company, branch=warehouse.branch)
+
+        return Response(
+            {
+                "product": WarehouseProductSerializer(product, context={"request": request}).data,
+                "created": True,
+                "scan_qty": None,
+            },
+            status=status.HTTP_201_CREATED,
+        )
 
 
 class ProductImagesView(CompanyBranchRestrictedMixin, generics.ListCreateAPIView):
