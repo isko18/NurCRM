@@ -2636,7 +2636,6 @@ class Debt(models.Model):
         verbose_name = "Долг"
         verbose_name_plural = "Долги"
         ordering = ["-created_at"]
-        unique_together = (("company", "phone"),)
         indexes = [
             models.Index(fields=["company", "phone"]),
             models.Index(fields=["company", "branch", "created_at"]),

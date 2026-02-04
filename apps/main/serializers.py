@@ -1593,18 +1593,7 @@ class DebtSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
         return Decimal(v).quantize(Decimal("0.01"))
 
     def validate_phone(self, value: str) -> str:
-        value = normalize_phone(value)
-
-        # важно: company у тебя read-only, значит берём компанию из миксина/контекста
-        company = self._user_company()  # предполагаю, что CompanyBranchReadOnlyMixin это даёт
-        qs = Debt.objects.filter(company=company, phone=value)
-        if self.instance:
-            qs = qs.exclude(pk=self.instance.pk)
-
-        if qs.exists():
-            raise serializers.ValidationError("В вашей компании уже есть долг с таким телефоном.")
-
-        return value
+        return normalize_phone(value)
 
 
 class DebtPaymentSerializer(serializers.ModelSerializer):
