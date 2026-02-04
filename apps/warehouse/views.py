@@ -6,6 +6,7 @@ from rest_framework.views import APIView
 from rest_framework.exceptions import PermissionDenied, ValidationError
 from django_filters.rest_framework import DjangoFilterBackend
 from django.shortcuts import get_object_or_404
+from decimal import Decimal
 from django.db.models import Count, Sum, DecimalField, Value as V
 from django.db.models.functions import Coalesce
 
@@ -238,7 +239,7 @@ class WarehouseView(CompanyBranchRestrictedMixin, generics.ListCreateAPIView):
             products_count=Count("products", distinct=True),
             products_qty_total=Coalesce(
                 Sum("products__quantity", output_field=DecimalField(max_digits=18, decimal_places=3)),
-                V(0),
+                V(Decimal("0.000"), output_field=DecimalField(max_digits=18, decimal_places=3)),
             ),
         )
 
@@ -255,7 +256,7 @@ class WarehouseDetailView(CompanyBranchRestrictedMixin, generics.RetrieveUpdateD
             products_count=Count("products", distinct=True),
             products_qty_total=Coalesce(
                 Sum("products__quantity", output_field=DecimalField(max_digits=18, decimal_places=3)),
-                V(0),
+                V(Decimal("0.000"), output_field=DecimalField(max_digits=18, decimal_places=3)),
             ),
         )
 
