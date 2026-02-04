@@ -2298,6 +2298,7 @@ class AgentRequestItemSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = AgentRequestItem
+        ref_name = "MainAgentRequestItem"
         fields = [
             "id",
             "cart",
