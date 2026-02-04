@@ -2334,7 +2334,7 @@ class AgentRequestItemSerializer(serializers.ModelSerializer):
         if comp and self.fields.get("cart"):
             cart_qs = AgentRequestCart.objects.filter(company=comp)
             if br is not None:
-                cart_qs = cart_qs.filter(branch=br)
+                cart_qs = cart_qs.filter(Q(branch=br) | Q(branch__isnull=True))
             # если br None — все корзины компании
 
             # агент может создавать строки только в своих корзинах
