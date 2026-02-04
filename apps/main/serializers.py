@@ -2339,7 +2339,7 @@ class AgentRequestItemSerializer(serializers.ModelSerializer):
 
             # агент может создавать строки только в своих корзинах
             if user and not getattr(user, "is_superuser", False) and not getattr(user, "is_owner", False):
-                cart_qs = cart_qs.filter(agent=user, status=AgentRequestCart.Status.DRAFT)
+                cart_qs = cart_qs.filter(agent=user)
 
             self.fields["cart"].queryset = cart_qs
 
@@ -2383,8 +2383,8 @@ class AgentRequestItemSerializer(serializers.ModelSerializer):
         if not cart:
             raise serializers.ValidationError({"cart": "Обязательное поле."})
 
-        if cart.status != AgentRequestCart.Status.DRAFT:
-            raise serializers.ValidationError("Нельзя менять позиции: корзина не в черновике.")
+        if cart.status not in (AgentRequestCart.Status.DRAFT, AgentRequestCart.Status.SUBMITTED):
+            raise serializers.ValidationError("Нельзя менять позиции: корзина не в черновике или отправлена.")
 
         if not product:
             raise serializers.ValidationError({"product": "Обязательное поле."})
@@ -2408,16 +2408,16 @@ class AgentRequestItemSerializer(serializers.ModelSerializer):
     @transaction.atomic
     def create(self, validated_data):
         cart = validated_data["cart"]
-        if cart.status != AgentRequestCart.Status.DRAFT:
-            raise serializers.ValidationError("Добавлять можно только в черновик.")
+        if cart.status not in (AgentRequestCart.Status.DRAFT, AgentRequestCart.Status.SUBMITTED):
+            raise serializers.ValidationError("Добавлять можно только в черновик или отправленную заявку.")
         # вручную подарки не ставим — они рассчитываются на submit()
         return super().create(validated_data)
 
     @transaction.atomic
     def update(self, instance, validated_data):
         cart = instance.cart
-        if cart.status != AgentRequestCart.Status.DRAFT:
-            raise serializers.ValidationError("Редактировать можно только черновик.")
+        if cart.status not in (AgentRequestCart.Status.DRAFT, AgentRequestCart.Status.SUBMITTED):
+            raise serializers.ValidationError("Редактировать можно только черновик или отправленную заявку.")
         instance.product = validated_data.get("product", instance.product)
         instance.quantity_requested = validated_data.get("quantity_requested", instance.quantity_requested)
         instance.save(update_fields=["product", "quantity_requested", "updated_at"])
