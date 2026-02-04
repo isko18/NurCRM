@@ -550,7 +550,90 @@ Read-only поля:
 }
 ```
 
-## 7) Аналитика склада (для владельца и агента)
+## 7) Акт сверки с контрагентом (как 1С)
+
+Эндпойнты:
+- `GET /api/warehouse/counterparties/{counterparty_id}/reconciliation/` → PDF (скачивание)
+- `GET /api/warehouse/counterparties/{counterparty_id}/reconciliation/json/` → JSON
+
+Параметры:
+- `start` (обязательный) — `YYYY-MM-DD` или ISO datetime
+- `end` (обязательный) — `YYYY-MM-DD` или ISO datetime
+- `currency` (опционально, по умолчанию `KGS`)
+- `branch` (опционально, если нет фиксированного филиала у пользователя)
+
+Логика расчёта:
+- учитываются **только проведённые** документы и операции.
+- складские документы:
+  - дебет: `SALE`, `PURCHASE_RETURN`
+  - кредит: `PURCHASE`, `SALE_RETURN`
+- денежные документы:
+  - дебет: `MONEY_EXPENSE`
+  - кредит: `MONEY_RECEIPT`
+- смысл по долгам:
+  - `MONEY_RECEIPT` (приход от контрагента) **уменьшает** его долг перед нами.
+  - `MONEY_EXPENSE` (расход) — это наша оплата контрагенту, **уменьшает** наш долг перед ним.
+- фильтрация по компании и активному филиалу (если филиал не указан и не фиксирован — берутся только глобальные записи).
+
+Ответ JSON:
+```json
+{
+  "company": {
+    "id": "uuid",
+    "name": "string",
+    "inn": "string",
+    "okpo": "string",
+    "score": "string",
+    "bik": "string",
+    "address": "string",
+    "phone": "string",
+    "email": "string"
+  },
+  "counterparty": {
+    "id": "uuid",
+    "name": "string",
+    "type": "CLIENT|SUPPLIER|BOTH"
+  },
+  "period": {
+    "start": "2026-02-01",
+    "end": "2026-02-29",
+    "currency": "KGS"
+  },
+  "opening_balance": "0.00",
+  "entries": [
+    {
+      "date": "2026-02-05T12:30:00+06:00",
+      "title": "Продажа SALE-20260205-0003",
+      "a_debit": "1500.00",
+      "a_credit": "0.00",
+      "b_debit": "0.00",
+      "b_credit": "1500.00",
+      "ref_type": "document:SALE",
+      "ref_id": "uuid",
+      "running_balance_after": "1500.00"
+    }
+  ],
+  "totals": {
+    "a_debit": "1500.00",
+    "a_credit": "0.00",
+    "b_debit": "0.00",
+    "b_credit": "1500.00"
+  },
+  "closing_balance": "1500.00",
+  "as_of_date": "2026-03-01",
+  "debt": {
+    "debtor": "Контрагент",
+    "creditor": "Компания",
+    "amount": "1500.00",
+    "currency": "KGS"
+  }
+}
+```
+
+Ошибки:
+- `400` если `start/end` не заданы или в неверном формате.
+
+## 8) Аналитика склада (для владельца и агента)
 
 ### 7.1 Аналитика владельца (общая)
 `GET /api/warehouse/owner/analytics/`
@@ -636,7 +719,7 @@ Read-only поля:
 }
 ```
 
-## 8) UI/UX рекомендации (коротко)
+## 9) UI/UX рекомендации (коротко)
 - Документы: отдельный экран/модал для редактирования `items[]` (таблица с добавлением/удалением строк).
 - Перед `post/unpost`: показывать подтверждение (необратимые бизнес‑эффекты).
 - При работе с товарами:
