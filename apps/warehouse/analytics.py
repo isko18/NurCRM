@@ -4,7 +4,7 @@ from datetime import date, timedelta, datetime
 from decimal import Decimal
 
 from django.conf import settings
-from django.db.models import Sum, Count, Value as V, F, DecimalField, Q
+from django.db.models import Sum, Count, Value as V, F, DecimalField, Q, ExpressionWrapper
 from django.db.models.functions import Coalesce, TruncDate, TruncWeek, TruncMonth
 from django.utils import timezone
 
@@ -157,19 +157,21 @@ def build_agent_warehouse_analytics_payload(
         sales_items_qs
         .values("product_id", "product__name")
         .annotate(
-            qty=Coalesce(Sum("qty", output_field=QTY_FIELD), ZERO_QTY),
+            qty_sum=Coalesce(Sum("qty", output_field=QTY_FIELD), ZERO_QTY),
             amount=Coalesce(
-                Sum(F("qty") * F("price"), output_field=MONEY_FIELD),
+                Sum(
+                    ExpressionWrapper(F("qty") * F("price"), output_field=MONEY_FIELD),
+                ),
                 ZERO_MONEY,
             ),
         )
-        .order_by("-amount", "-qty")[:100]
+        .order_by("-amount", "-qty_sum")[:100]
     )
     sales_by_product = [
         {
             "product_id": str(r["product_id"]),
             "product_name": r["product__name"],
-            "qty": str(r["qty"]),
+            "qty": str(r["qty_sum"]),
             "amount": _money_str(r["amount"]),
         }
         for r in sales_by_product_qs
@@ -396,19 +398,21 @@ def build_owner_warehouse_analytics_payload(
         sales_items_qs
         .values("product_id", "product__name")
         .annotate(
-            qty=Coalesce(Sum("qty", output_field=QTY_FIELD), ZERO_QTY),
+            qty_sum=Coalesce(Sum("qty", output_field=QTY_FIELD), ZERO_QTY),
             amount=Coalesce(
-                Sum(F("qty") * F("price"), output_field=MONEY_FIELD),
+                Sum(
+                    ExpressionWrapper(F("qty") * F("price"), output_field=MONEY_FIELD),
+                ),
                 ZERO_MONEY,
             ),
         )
-        .order_by("-amount", "-qty")[:100]
+        .order_by("-amount", "-qty_sum")[:100]
     )
     sales_by_product = [
         {
             "product_id": str(r["product_id"]),
             "product_name": r["product__name"],
-            "qty": str(r["qty"]),
+            "qty": str(r["qty_sum"]),
             "amount": _money_str(r["amount"]),
         }
         for r in sales_by_product_qs
