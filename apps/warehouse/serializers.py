@@ -336,6 +336,7 @@ class AgentRequestCartSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSe
 
     class Meta:
         model = m.AgentRequestCart
+        ref_name = "WarehouseAgentRequestCart"
         fields = (
             "id",
             "agent",
