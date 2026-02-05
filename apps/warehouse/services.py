@@ -97,6 +97,8 @@ def post_document(document: models.Document, allow_negative: bool = None) -> mod
     # Если allow_negative не передан явно, берем из настроек
     if allow_negative is None:
         allow_negative = getattr(settings, "ALLOW_NEGATIVE_STOCK", False)
+    if document.agent_id:
+        allow_negative = False
 
     with transaction.atomic():
         # Оптимизация: предзагружаем items с продуктами
