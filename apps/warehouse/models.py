@@ -703,15 +703,50 @@ class Counterparty(models.Model):
         BOTH = "BOTH", "Оба"
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    company = models.ForeignKey(
+        "users.Company",
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
+        db_index=True,
+        verbose_name="Компания",
+    )
+    branch = models.ForeignKey(
+        "users.Branch",
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
+        db_index=True,
+        verbose_name="Филиал",
+    )
+    agent = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="warehouse_counterparties",
+        verbose_name="Агент",
+    )
     name = models.CharField(max_length=255, verbose_name="Название")
     type = models.CharField(max_length=16, choices=Type.choices, default=Type.BOTH, verbose_name="Тип")
 
     class Meta:
         verbose_name = "Контрагент"
         verbose_name_plural = "Контрагенты"
+        indexes = [
+            models.Index(fields=["company", "branch"]),
+            models.Index(fields=["company", "agent"]),
+            models.Index(fields=["agent", "name"]),
+        ]
 
     def __str__(self):
         return self.name
+
+    def clean(self):
+        if self.branch_id and self.company_id and self.branch.company_id != self.company_id:
+            raise ValidationError({"branch": "Филиал принадлежит другой компании."})
+        if self.agent_id and self.company_id and getattr(self.agent, "company_id", None) not in (None, self.company_id):
+            raise ValidationError({"agent": "Агент принадлежит другой компании."})
 
 
 class DocumentSequence(models.Model):
@@ -790,6 +825,10 @@ class Document(models.Model):
             if getattr(self.agent, "company_id", None) and self.warehouse_from:
                 if self.agent.company_id != self.warehouse_from.company_id:
                     raise ValidationError("Agent belongs to another company")
+            if self.counterparty_id:
+                cp_agent_id = getattr(self.counterparty, "agent_id", None)
+                if cp_agent_id != self.agent_id:
+                    raise ValidationError({"counterparty": "Контрагент не принадлежит агенту."})
 
         if self.doc_type in (self.DocType.SALE, self.DocType.SALE_RETURN, self.DocType.PURCHASE, self.DocType.PURCHASE_RETURN, self.DocType.RECEIPT, self.DocType.WRITE_OFF):
             # require warehouse_from for most operations (warehouse where stock changes).
@@ -860,6 +899,15 @@ class DocumentItem(models.Model):
                     # Для TRANSFER товар должен принадлежать складу-источнику
                     if doc.warehouse_from_id and prod.warehouse_id != doc.warehouse_from_id:
                         raise ValidationError({"product": "Товар должен принадлежать складу-источнику перемещения."})
+
+            if doc.agent_id and doc.warehouse_from_id:
+                has_balance = AgentStockBalance.objects.filter(
+                    agent_id=doc.agent_id,
+                    warehouse_id=doc.warehouse_from_id,
+                    product_id=self.product_id,
+                ).exists()
+                if not has_balance:
+                    raise ValidationError({"product": "Товар отсутствует в остатках агента."})
 
         # integral check for PCS
         try:

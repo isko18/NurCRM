@@ -129,6 +129,10 @@ class WarehouseSimpleSerializer(serializers.ModelSerializer):
 
 
 class CounterpartySerializer(serializers.ModelSerializer):
+    company = serializers.ReadOnlyField(source="company.id")
+    branch = serializers.ReadOnlyField(source="branch.id")
+    agent = serializers.ReadOnlyField(source="agent.id")
+
     class Meta:
         model = models.Counterparty
-        fields = ("id", "name", "type")
+        fields = ("id", "name", "type", "company", "branch", "agent")
