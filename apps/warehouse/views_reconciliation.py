@@ -117,13 +117,14 @@ class _CounterpartyReconciliationBase(CompanyBranchRestrictedMixin, APIView):
         company = self._company()
         branch = self._auto_branch()
 
+        if company is None:
+            return qs.none()
+
         if company is not None:
             qs = qs.filter(warehouse_from__company=company)
 
         if branch is not None:
             qs = qs.filter(warehouse_from__branch=branch)
-        elif company is not None:
-            qs = qs.filter(warehouse_from__branch__isnull=True)
 
         return qs
 
@@ -131,13 +132,14 @@ class _CounterpartyReconciliationBase(CompanyBranchRestrictedMixin, APIView):
         company = self._company()
         branch = self._auto_branch()
 
+        if company is None:
+            return qs.none()
+
         if company is not None:
             qs = qs.filter(company=company)
 
         if branch is not None:
             qs = qs.filter(branch=branch)
-        elif company is not None:
-            qs = qs.filter(branch__isnull=True)
 
         return qs
 

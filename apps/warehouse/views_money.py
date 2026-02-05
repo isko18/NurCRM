@@ -41,9 +41,10 @@ class MoneyDocumentPostView(CompanyBranchRestrictedMixin, generics.GenericAPIVie
     serializer_class = serializers_money.MoneyDocumentSerializer
 
     def get_queryset(self):
-        return models.MoneyDocument.objects.select_related(
+        qs = models.MoneyDocument.objects.select_related(
             "warehouse", "counterparty", "payment_category", "company", "branch"
         )
+        return self._filter_qs_company_branch(qs)
 
     def post(self, request, pk=None):
         doc = self.get_object()
@@ -58,9 +59,10 @@ class MoneyDocumentUnpostView(CompanyBranchRestrictedMixin, generics.GenericAPIV
     serializer_class = serializers_money.MoneyDocumentSerializer
 
     def get_queryset(self):
-        return models.MoneyDocument.objects.select_related(
+        qs = models.MoneyDocument.objects.select_related(
             "warehouse", "counterparty", "payment_category", "company", "branch"
         )
+        return self._filter_qs_company_branch(qs)
 
     def post(self, request, pk=None):
         doc = self.get_object()

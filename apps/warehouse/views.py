@@ -79,8 +79,6 @@ class CompanyBranchRestrictedMixin:
         u = self._user()
         if not u or not getattr(u, "is_authenticated", False):
             return None
-        if getattr(u, "is_superuser", False):
-            return None
 
         company = getattr(u, "owned_company", None) or getattr(u, "company", None)
         if company:
@@ -204,39 +202,13 @@ class CompanyBranchRestrictedMixin:
         branch = self._auto_branch()
         model = qs.model
 
-        if company is not None:
-            if company_field:
-                qs = qs.filter(**{company_field: company})
-            elif self._model_has_field(model, "company"):
-                qs = qs.filter(company=company)
+        if company is None:
+            return qs.none()
 
-        if branch_field:
-            if branch is not None:
-                qs = qs.filter(**{branch_field: branch})
-            else:
-                qs = qs.filter(**{f"{branch_field}__isnull": True})
-        elif self._model_has_field(model, "branch"):
-            if branch is not None:
-                qs = qs.filter(branch=branch)
-            else:
-                qs = qs.filter(branch__isnull=True)
-
-        return qs
-
-    def _filter_qs_company_branch_relaxed(self, qs, company_field: Optional[str] = None, branch_field: Optional[str] = None):
-        """
-        Как _filter_qs_company_branch, но если активного филиала нет —
-        не фильтруем по branch (показываем всю компанию).
-        """
-        company = self._company()
-        branch = self._auto_branch()
-        model = qs.model
-
-        if company is not None:
-            if company_field:
-                qs = qs.filter(**{company_field: company})
-            elif self._model_has_field(model, "company"):
-                qs = qs.filter(company=company)
+        if company_field:
+            qs = qs.filter(**{company_field: company})
+        elif self._model_has_field(model, "company"):
+            qs = qs.filter(company=company)
 
         if branch_field:
             if branch is not None:
@@ -245,6 +217,13 @@ class CompanyBranchRestrictedMixin:
             qs = qs.filter(branch=branch)
 
         return qs
+
+    def _filter_qs_company_branch_relaxed(self, qs, company_field: Optional[str] = None, branch_field: Optional[str] = None):
+        """
+        Как _filter_qs_company_branch, но если активного филиала нет —
+        не фильтруем по branch (показываем всю компанию).
+        """
+        return self._filter_qs_company_branch(qs, company_field=company_field, branch_field=branch_field)
 
     def get_queryset(self):
         assert hasattr(self, "queryset") and self.queryset is not None, (
@@ -351,7 +330,8 @@ class ProductView(CompanyBranchRestrictedMixin, generics.ListCreateAPIView):
     filter_backends = [DjangoFilterBackend]
 
     def _get_warehouse(self):
-        return get_object_or_404(m.Warehouse, id=self.kwargs.get("warehouse_uuid"))
+        qs = self._filter_qs_company_branch(m.Warehouse.objects.all())
+        return get_object_or_404(qs, id=self.kwargs.get("warehouse_uuid"))
 
     def get_queryset(self):
         wh = self._get_warehouse()
@@ -377,11 +357,12 @@ class ProductDetailView(CompanyBranchRestrictedMixin, generics.RetrieveUpdateDes
     lookup_url_kwarg = "product_uuid"
 
     def get_queryset(self):
-        return (
+        qs = (
             m.WarehouseProduct.objects
             .select_related("brand", "category", "warehouse", "company", "branch", "characteristics")
             .prefetch_related("images", "packages")
         )
+        return self._filter_qs_company_branch(qs)
 
     def perform_update(self, serializer):
         serializer.validated_data.pop("warehouse", None)
@@ -392,7 +373,8 @@ class ProductDetailView(CompanyBranchRestrictedMixin, generics.RetrieveUpdateDes
 
 class ProductScanView(CompanyBranchRestrictedMixin, APIView):
     def _get_warehouse(self):
-        return get_object_or_404(m.Warehouse, id=self.kwargs.get("warehouse_uuid"))
+        qs = self._filter_qs_company_branch(m.Warehouse.objects.all())
+        return get_object_or_404(qs, id=self.kwargs.get("warehouse_uuid"))
 
     def _base_products_qs(self):
         return (
@@ -448,7 +430,8 @@ class ProductImagesView(CompanyBranchRestrictedMixin, generics.ListCreateAPIView
     serializer_class = WarehouseProductImageSerializer
 
     def _get_product(self):
-        return get_object_or_404(m.WarehouseProduct, id=self.kwargs.get("product_uuid"))
+        qs = self._filter_qs_company_branch(m.WarehouseProduct.objects.all())
+        return get_object_or_404(qs, id=self.kwargs.get("product_uuid"))
 
     def get_queryset(self):
         product = self._get_product()
@@ -464,15 +447,21 @@ class ProductImageDetailView(CompanyBranchRestrictedMixin, generics.RetrieveUpda
     lookup_field = "id"
     lookup_url_kwarg = "image_uuid"
 
+    def _get_product(self):
+        qs = self._filter_qs_company_branch(m.WarehouseProduct.objects.all())
+        return get_object_or_404(qs, id=self.kwargs.get("product_uuid"))
+
     def get_queryset(self):
-        return m.WarehouseProductImage.objects.filter(product_id=self.kwargs.get("product_uuid"))
+        product = self._get_product()
+        return m.WarehouseProductImage.objects.filter(product=product)
 
 
 class ProductPackagesView(CompanyBranchRestrictedMixin, generics.ListCreateAPIView):
     serializer_class = WarehouseProductPackageSerializer
 
     def _get_product(self):
-        return get_object_or_404(m.WarehouseProduct, id=self.kwargs.get("product_uuid"))
+        qs = self._filter_qs_company_branch(m.WarehouseProduct.objects.all())
+        return get_object_or_404(qs, id=self.kwargs.get("product_uuid"))
 
     def get_queryset(self):
         product = self._get_product()
@@ -488,8 +477,13 @@ class ProductPackageDetailView(CompanyBranchRestrictedMixin, generics.RetrieveUp
     lookup_field = "id"
     lookup_url_kwarg = "package_uuid"
 
+    def _get_product(self):
+        qs = self._filter_qs_company_branch(m.WarehouseProduct.objects.all())
+        return get_object_or_404(qs, id=self.kwargs.get("product_uuid"))
+
     def get_queryset(self):
-        return m.WarehouseProductPackage.objects.filter(product_id=self.kwargs.get("product_uuid"))
+        product = self._get_product()
+        return m.WarehouseProductPackage.objects.filter(product=product)
 
 
 # ----------------

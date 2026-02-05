@@ -3,6 +3,7 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 from rest_framework import generics
 from django.shortcuts import get_object_or_404
+from django.db.models import Q
 from django_filters.rest_framework import DjangoFilterBackend
 
 from . import models, serializers_documents, services
@@ -17,11 +18,28 @@ class DocumentListCreateView(CompanyBranchRestrictedMixin, generics.ListCreateAP
     filterset_fields = ["doc_type", "status", "warehouse_from", "warehouse_to", "counterparty"]
     search_fields = ["number", "comment"]
     
+    def _filter_company_branch(self, qs):
+        company = self._company()
+        if company is None:
+            return qs.none()
+
+        qs = qs.filter(
+            Q(warehouse_from__company=company) | Q(warehouse_to__company=company)
+        )
+
+        branch = self._auto_branch()
+        if branch is not None:
+            qs = qs.filter(
+                Q(warehouse_from__branch=branch) | Q(warehouse_to__branch=branch)
+            )
+        return qs
+
     def get_queryset(self):
         # Оптимизация: предзагружаем связанные объекты
         qs = models.Document.objects.select_related(
             "warehouse_from", "warehouse_to", "counterparty"
         ).prefetch_related("items__product").order_by("-date")
+        qs = self._filter_company_branch(qs)
         user = self.request.user
         if not _is_owner_like(user):
             qs = qs.filter(agent=user)
@@ -110,6 +128,7 @@ class DocumentDetailView(CompanyBranchRestrictedMixin, generics.RetrieveUpdateDe
         qs = models.Document.objects.select_related(
             "warehouse_from", "warehouse_to", "counterparty"
         ).prefetch_related("items__product", "items__product__brand", "items__product__category")
+        qs = DocumentListCreateView._filter_company_branch(self, qs)
         user = self.request.user
         if not _is_owner_like(user):
             qs = qs.filter(agent=user)
@@ -131,6 +150,7 @@ class DocumentPostView(CompanyBranchRestrictedMixin, generics.GenericAPIView):
             "warehouse_from", "warehouse_to", "counterparty"
         ).prefetch_related("items__product", "items__product__warehouse")
         user = self.request.user
+        qs = DocumentListCreateView._filter_company_branch(self, qs)
         if not _is_owner_like(user):
             qs = qs.filter(agent=user)
         return qs
@@ -156,6 +176,7 @@ class DocumentUnpostView(CompanyBranchRestrictedMixin, generics.GenericAPIView):
         qs = models.Document.objects.select_related(
             "warehouse_from", "warehouse_to", "counterparty"
         ).prefetch_related("moves__warehouse", "moves__product")
+        qs = DocumentListCreateView._filter_company_branch(self, qs)
         user = self.request.user
         if not _is_owner_like(user):
             qs = qs.filter(agent=user)
@@ -181,6 +202,8 @@ class DocumentTransferCreateAPIView(CompanyBranchRestrictedMixin, APIView):
 
         company = self._company()
         branch = self._auto_branch()
+        if not company:
+            raise DRFValidationError({"company": "Компания не найдена."})
         wh_from = ser.validated_data["warehouse_from"]
         wh_to = ser.validated_data["warehouse_to"]
 
@@ -228,6 +251,7 @@ class ProductListCreateView(CompanyBranchRestrictedMixin, generics.ListCreateAPI
         qs = models.WarehouseProduct.objects.select_related(
             "warehouse", "brand", "category", "company", "branch"
         )
+        qs = self._filter_qs_company_branch(qs)
         
         # Кэширование поиска по barcode
         search = self.request.query_params.get("search", "").strip()
@@ -240,11 +264,10 @@ class ProductListCreateView(CompanyBranchRestrictedMixin, generics.ListCreateAPI
                 if cached_product_id:
                     # Если найден в кэше - возвращаем только этот товар
                     return qs.filter(pk=cached_product_id)
-                else:
-                    # Ищем товар и кэшируем его ID
-                    product = qs.filter(barcode=search).first()
-                    if product:
-                        cache.set(cache_key, product.id, 300)  # Кэш на 5 минут
+                # Ищем товар и кэшируем его ID
+                product = qs.filter(barcode=search).first()
+                if product:
+                    cache.set(cache_key, product.id, 300)  # Кэш на 5 минут
         
         return qs
 
@@ -254,9 +277,10 @@ class ProductDetailView(CompanyBranchRestrictedMixin, generics.RetrieveUpdateDes
     
     def get_queryset(self):
         # Оптимизация: предзагружаем связанные объекты
-        return models.WarehouseProduct.objects.select_related(
+        qs = models.WarehouseProduct.objects.select_related(
             "warehouse", "brand", "category", "company", "branch"
         )
+        return self._filter_qs_company_branch(qs)
 
 
 class WarehouseListCreateView(CompanyBranchRestrictedMixin, generics.ListCreateAPIView):
@@ -264,7 +288,8 @@ class WarehouseListCreateView(CompanyBranchRestrictedMixin, generics.ListCreateA
     
     def get_queryset(self):
         # Оптимизация: предзагружаем связанные объекты
-        return models.Warehouse.objects.select_related("company", "branch")
+        qs = models.Warehouse.objects.select_related("company", "branch")
+        return self._filter_qs_company_branch(qs)
 
 
 class WarehouseDetailView(CompanyBranchRestrictedMixin, generics.RetrieveUpdateDestroyAPIView):
@@ -272,7 +297,8 @@ class WarehouseDetailView(CompanyBranchRestrictedMixin, generics.RetrieveUpdateD
     
     def get_queryset(self):
         # Оптимизация: предзагружаем связанные объекты
-        return models.Warehouse.objects.select_related("company", "branch")
+        qs = models.Warehouse.objects.select_related("company", "branch")
+        return self._filter_qs_company_branch(qs)
 
 
 class CounterpartyListCreateView(CompanyBranchRestrictedMixin, generics.ListCreateAPIView):
