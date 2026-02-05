@@ -333,6 +333,7 @@ class AgentRequestItemSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSe
 class AgentRequestCartSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
     items = AgentRequestItemSerializer(many=True, read_only=True)
     agent_display = serializers.SerializerMethodField()
+    note = serializers.CharField(required=False, allow_blank=True)
 
     class Meta:
         model = m.AgentRequestCart
