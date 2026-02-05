@@ -555,7 +555,7 @@ Read-only поля:
   "agent": "uuid",
   "warehouse": "uuid",
   "status": "draft|submitted|approved|rejected",
-  "note": "string",
+  "note": "string|null",
   "submitted_at": "2026-02-01T12:00:00Z|null",
   "approved_at": "2026-02-01T12:00:00Z|null",
   "approved_by": "uuid|null",
@@ -564,6 +564,9 @@ Read-only поля:
   "items": [ ... ]
 }
 ```
+
+Примечание:
+- `company` и `branch` не передаются: сервер берёт их из выбранного `warehouse`.
 
 ### 6.2 Позиции заявки
 Эндпойнты:

@@ -514,7 +514,23 @@ class AgentRequestCartListCreateAPIView(CompanyBranchRestrictedMixin, generics.L
             agent = serializer.validated_data.get("agent")
         else:
             agent = user
-        self._save_with_company_branch(serializer, agent=agent)
+        warehouse = serializer.validated_data.get("warehouse")
+        if not warehouse:
+            raise ValidationError({"warehouse": "Укажите склад."})
+
+        company = self._company()
+        if company and warehouse.company_id != company.id:
+            raise ValidationError({"warehouse": "Склад принадлежит другой компании."})
+
+        active_branch = self._auto_branch()
+        if active_branch is not None and warehouse.branch_id not in (None, active_branch.id):
+            raise ValidationError({"warehouse": "Склад другого филиала."})
+
+        serializer.save(
+            agent=agent,
+            company=warehouse.company,
+            branch=warehouse.branch,
+        )
 
 
 class AgentRequestCartRetrieveUpdateDestroyAPIView(CompanyBranchRestrictedMixin, generics.RetrieveUpdateDestroyAPIView):
@@ -626,7 +642,10 @@ class AgentRequestItemListCreateAPIView(CompanyBranchRestrictedMixin, generics.L
             raise PermissionDenied("Нет доступа к заявке.")
         if cart.status != m.AgentRequestCart.Status.DRAFT:
             raise ValidationError("Можно добавлять позиции только в черновик.")
-        self._save_with_company_branch(serializer)
+        serializer.save(
+            company=cart.company,
+            branch=cart.branch,
+        )
 
 
 class AgentRequestItemDetailAPIView(CompanyBranchRestrictedMixin, generics.RetrieveUpdateDestroyAPIView):
