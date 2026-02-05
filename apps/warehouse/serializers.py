@@ -353,6 +353,9 @@ class AgentRequestCartSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSe
             "items",
         )
         read_only_fields = ("id", "status", "submitted_at", "approved_at", "approved_by", "created_date", "updated_date")
+        extra_kwargs = {
+            "agent": {"required": False},
+        }
 
     def get_agent_display(self, obj):
         agent = getattr(obj, "agent", None)
