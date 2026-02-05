@@ -19,9 +19,20 @@ class DocumentListCreateView(CompanyBranchRestrictedMixin, generics.ListCreateAP
     
     def get_queryset(self):
         # Оптимизация: предзагружаем связанные объекты
-        return models.Document.objects.select_related(
+        qs = models.Document.objects.select_related(
             "warehouse_from", "warehouse_to", "counterparty"
         ).prefetch_related("items__product").order_by("-date")
+        user = self.request.user
+        if not _is_owner_like(user):
+            qs = qs.filter(agent=user)
+        return qs
+
+    def perform_create(self, serializer):
+        user = self.request.user
+        if _is_owner_like(user):
+            self._save_with_company_branch(serializer)
+            return
+        self._save_with_company_branch(serializer, agent=user)
 
 
 class AgentDocumentListCreateView(DocumentListCreateView):
@@ -52,7 +63,11 @@ class _DocumentTypedListCreateView(DocumentListCreateView):
         extra = {}
         if self.DOC_TYPE:
             extra["doc_type"] = self.DOC_TYPE
-        self._save_with_company_branch(serializer, **extra)
+        user = self.request.user
+        if _is_owner_like(user):
+            self._save_with_company_branch(serializer, **extra)
+            return
+        self._save_with_company_branch(serializer, agent=user, **extra)
 
 
 class DocumentSaleListCreateView(_DocumentTypedListCreateView):
@@ -92,9 +107,13 @@ class DocumentDetailView(CompanyBranchRestrictedMixin, generics.RetrieveUpdateDe
     
     def get_queryset(self):
         # Оптимизация: предзагружаем связанные объекты
-        return models.Document.objects.select_related(
+        qs = models.Document.objects.select_related(
             "warehouse_from", "warehouse_to", "counterparty"
         ).prefetch_related("items__product", "items__product__brand", "items__product__category")
+        user = self.request.user
+        if not _is_owner_like(user):
+            qs = qs.filter(agent=user)
+        return qs
 
 
 class AgentDocumentDetailView(DocumentDetailView):
@@ -108,9 +127,13 @@ class DocumentPostView(CompanyBranchRestrictedMixin, generics.GenericAPIView):
     
     def get_queryset(self):
         # Оптимизация: предзагружаем items с продуктами
-        return models.Document.objects.select_related(
+        qs = models.Document.objects.select_related(
             "warehouse_from", "warehouse_to", "counterparty"
         ).prefetch_related("items__product", "items__product__warehouse")
+        user = self.request.user
+        if not _is_owner_like(user):
+            qs = qs.filter(agent=user)
+        return qs
 
     def post(self, request, pk=None):
         doc = self.get_object()
@@ -130,9 +153,13 @@ class DocumentUnpostView(CompanyBranchRestrictedMixin, generics.GenericAPIView):
     
     def get_queryset(self):
         # Оптимизация: предзагружаем moves с продуктами и складами
-        return models.Document.objects.select_related(
+        qs = models.Document.objects.select_related(
             "warehouse_from", "warehouse_to", "counterparty"
         ).prefetch_related("moves__warehouse", "moves__product")
+        user = self.request.user
+        if not _is_owner_like(user):
+            qs = qs.filter(agent=user)
+        return qs
 
     def post(self, request, pk=None):
         doc = self.get_object()
