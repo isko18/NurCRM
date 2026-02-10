@@ -1,0 +1,10 @@
+{
+  "python.analysis.extraPaths": [
+    "./",
+    "./apps",
+    "./venv/Lib/site-packages"
+  ],
+  "python.analysis.diagnosticSeverityOverrides": {
+    "reportMissingImports": "none"
+  }
+}

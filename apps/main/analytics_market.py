@@ -444,8 +444,14 @@ class AnalyticsView(APIView):
             data = self._cashboxes(request, company, branch, period)
         elif tab == "shifts":
             data = self._shifts(request, company, branch, period)
+        elif tab == "products":
+            data = self._products_analytics(request, company, branch, period)
+        elif tab == "users":
+            data = self._users_analytics(request, company, branch, period)
+        elif tab == "finance":
+            data = self._finance(request, company, branch, period)
         else:
-            return Response({"detail": "Unknown tab. Use: sales|stock|cashboxes|shifts"}, status=400)
+            return Response({"detail": "Unknown tab. Use: sales|stock|cashboxes|shifts|products|users|finance"}, status=400)
 
         ttl = getattr(settings, "CACHE_TIMEOUT_ANALYTICS", getattr(settings, "CACHE_TIMEOUT_MEDIUM", 300))
         cache.set(ck, data, ttl)
@@ -537,6 +543,30 @@ class AnalyticsView(APIView):
             )
             daily = [{"date": r["d"].isoformat(), "value": str(_money(r["v"]))} for r in daily_rows if r["d"]]
 
+            # ── Payment Method Breakdown ──
+            payment_breakdown = []
+            if _model_has_field(Sale, "payment_method"):
+                payment_rows = (
+                    qs.values("payment_method")
+                    .annotate(
+                        count=Count("id"),
+                        total=Coalesce(
+                            Sum("total"),
+                            Value(Z_MONEY, output_field=MONEY_FIELD),
+                            output_field=MONEY_FIELD,
+                        ),
+                    )
+                    .order_by("-total")
+                )
+                payment_breakdown = [
+                    {
+                        "method": r.get("payment_method") or "unknown",
+                        "count": r.get("count") or 0,
+                        "total": str(_money(r.get("total") or Z_MONEY)),
+                    }
+                    for r in payment_rows
+                ]
+
             if SaleItem is not None and _model_has_field(SaleItem, "sale"):
                 item_qs = SaleItem.objects.filter(sale__in=qs)
 
@@ -607,7 +637,10 @@ class AnalyticsView(APIView):
                 "margin_percent": margin_percent,
                 "cogs_warning": cogs_warning,
             },
-            "charts": {"sales_dynamics": daily},
+            "charts": {
+                "sales_dynamics": daily,
+                "payment_methods": payment_breakdown,
+            },
             "tables": {"top_products": top_products, "documents": documents},
         }
 
@@ -1274,4 +1307,506 @@ class AnalyticsView(APIView):
             },
             "charts": {"sales_by_shift_bucket": sales_by_shift_bucket},
             "tables": {"active_shifts": active_rows, "best_cashiers": best_cashiers},
+        }
+
+    # ─────────────────────────────────────────────────────────
+    # PRODUCTS ANALYTICS
+    # ─────────────────────────────────────────────────────────
+    def _products_analytics(self, request, company, branch, period: Period):
+        Product = None
+        ProductCategory = None
+        ProductBrand = None
+        try:
+            Product = apps.get_model("main.Product")
+            ProductCategory = apps.get_model("main.ProductCategory")
+            ProductBrand = apps.get_model("main.ProductBrand")
+        except Exception:
+            pass
+
+        # Параметры для лимита результатов (по умолчанию показываем ВСЕ)
+        limit_param = request.query_params.get("limit")
+        limit = int(limit_param) if limit_param and limit_param.isdigit() else None  # None = все записи
+        
+        top_products_by_revenue = []
+        top_products_by_qty = []
+        categories_performance = []
+        brands_performance = []
+        stock_value = Z_MONEY
+        low_stock_count = 0
+        low_stock_products = []  # НОВОЕ: полный список товаров с низким остатком
+
+        Sale, SaleItem = get_sale_models()
+        if Sale and SaleItem and Product:
+            paid_value = _choice_value(Sale, "Status", "PAID", "paid")
+            dt_field = "paid_at" if _model_has_field(Sale, "paid_at") else "created_at"
+            
+            sqs = Sale.objects.filter(company=company, status=paid_value)
+            if branch and _model_has_field(Sale, "branch"):
+                if self._include_global(request):
+                    sqs = sqs.filter(Q(branch=branch) | Q(branch__isnull=True))
+                else:
+                    sqs = sqs.filter(branch=branch)
+            sqs = sqs.filter(**{f"{dt_field}__gte": period.start, f"{dt_field}__lt": period.end})
+
+            # Top Products by Revenue - ДЕТАЛЬНО со всеми полями
+            if _model_has_field(SaleItem, "unit_price"):
+                revenue_expr = ExpressionWrapper(F("quantity") * F("unit_price"), output_field=MONEY_FIELD)
+                top_by_rev_query = (
+                    SaleItem.objects.filter(sale__in=sqs)
+                    .values(
+                        "product_id", 
+                        "name_snapshot",
+                        "product__code",
+                        "product__article",
+                        "product__barcode",
+                        "product__category__name",
+                        "product__brand__name",
+                        "product__quantity",
+                        "product__price",
+                        "product__purchase_price",
+                    )
+                    .annotate(
+                        revenue=Coalesce(Sum(revenue_expr), Value(Z_MONEY, output_field=MONEY_FIELD), output_field=MONEY_FIELD),
+                        qty_sold=Coalesce(Sum("quantity"), Value(Z_QTY, output_field=QTY_FIELD), output_field=QTY_FIELD),
+                        tx_count=Count("sale_id", distinct=True),
+                    )
+                    .order_by("-revenue")
+                )
+                if limit:
+                    top_by_rev_query = top_by_rev_query[:limit]
+                
+                top_products_by_revenue = [
+                    {
+                        "product_id": str(r["product_id"]) if r["product_id"] else None,
+                        "name": r["name_snapshot"] or "Товар",
+                        "code": r["product__code"],
+                        "article": r["product__article"],
+                        "barcode": r["product__barcode"],
+                        "category": r["product__category__name"],
+                        "brand": r["product__brand__name"],
+                        "current_stock": str(Decimal(r["product__quantity"] or 0).quantize(Decimal("0.001"))),
+                        "price": str(_money(r["product__price"] or 0)),
+                        "purchase_price": str(_money(r["product__purchase_price"] or 0)),
+                        "revenue": str(_money(r["revenue"])),
+                        "qty_sold": str(r["qty_sold"].quantize(Decimal("0.001"))),
+                        "transactions": r["tx_count"],
+                    }
+                    for r in top_by_rev_query
+                ]
+
+            # Top Products by Quantity - ДЕТАЛЬНО
+            top_by_qty_query = (
+                SaleItem.objects.filter(sale__in=sqs)
+                .values(
+                    "product_id", 
+                    "name_snapshot",
+                    "product__code",
+                    "product__category__name",
+                    "product__brand__name",
+                    "product__quantity",
+                    "product__price",
+                )
+                .annotate(
+                    qty_sold=Coalesce(Sum("quantity"), Value(Z_QTY, output_field=QTY_FIELD), output_field=QTY_FIELD),
+                    tx_count=Count("sale_id", distinct=True),
+                )
+                .order_by("-qty_sold")
+            )
+            if limit:
+                top_by_qty_query = top_by_qty_query[:limit]
+                
+            top_products_by_qty = [
+                {
+                    "product_id": str(r["product_id"]) if r["product_id"] else None,
+                    "name": r["name_snapshot"] or "Товар",
+                    "code": r["product__code"],
+                    "category": r["product__category__name"],
+                    "brand": r["product__brand__name"],
+                    "current_stock": str(Decimal(r["product__quantity"] or 0).quantize(Decimal("0.001"))),
+                    "price": str(_money(r["product__price"] or 0)),
+                    "qty_sold": str(r["qty_sold"].quantize(Decimal("0.001"))),
+                    "transactions": r["tx_count"],
+                }
+                for r in top_by_qty_query
+            ]
+
+            # Categories Performance - ДЕТАЛЬНО с количеством товаров в каждой
+            if _model_has_field(SaleItem, "product") and _model_has_field(Product, "category"):
+                if _model_has_field(SaleItem, "unit_price"):
+                    cat_query = (
+                        SaleItem.objects.filter(sale__in=sqs, product__isnull=False)
+                        .values("product__category__id", "product__category__name")
+                        .annotate(
+                            revenue=Coalesce(Sum(revenue_expr), Value(Z_MONEY, output_field=MONEY_FIELD), output_field=MONEY_FIELD),
+                            qty_sold=Coalesce(Sum("quantity"), Value(Z_QTY, output_field=QTY_FIELD), output_field=QTY_FIELD),
+                            products_count=Count("product_id", distinct=True),
+                            tx_count=Count("sale_id", distinct=True),
+                        )
+                        .order_by("-revenue")
+                    )
+                    if limit:
+                        cat_query = cat_query[:limit]
+                        
+                    categories_performance = [
+                        {
+                            "category_id": str(r["product__category__id"]) if r["product__category__id"] else None,
+                            "category": r["product__category__name"] or "Без категории",
+                            "revenue": str(_money(r["revenue"])),
+                            "qty_sold": str(r["qty_sold"].quantize(Decimal("0.001"))),
+                            "products_count": r["products_count"],
+                            "transactions": r["tx_count"],
+                        }
+                        for r in cat_query
+                    ]
+
+            # Brands Performance - ДЕТАЛЬНО
+            if _model_has_field(SaleItem, "product") and _model_has_field(Product, "brand"):
+                if _model_has_field(SaleItem, "unit_price"):
+                    brand_query = (
+                        SaleItem.objects.filter(sale__in=sqs, product__isnull=False)
+                        .values("product__brand__id", "product__brand__name")
+                        .annotate(
+                            revenue=Coalesce(Sum(revenue_expr), Value(Z_MONEY, output_field=MONEY_FIELD), output_field=MONEY_FIELD),
+                            qty_sold=Coalesce(Sum("quantity"), Value(Z_QTY, output_field=QTY_FIELD), output_field=QTY_FIELD),
+                            products_count=Count("product_id", distinct=True),
+                            tx_count=Count("sale_id", distinct=True),
+                        )
+                        .order_by("-revenue")
+                    )
+                    if limit:
+                        brand_query = brand_query[:limit]
+                        
+                    brands_performance = [
+                        {
+                            "brand_id": str(r["product__brand__id"]) if r["product__brand__id"] else None,
+                            "brand": r["product__brand__name"] or "Без бренда",
+                            "revenue": str(_money(r["revenue"])),
+                            "qty_sold": str(r["qty_sold"].quantize(Decimal("0.001"))),
+                            "products_count": r["products_count"],
+                            "transactions": r["tx_count"],
+                        }
+                        for r in brand_query
+                    ]
+
+        # Stock Analysis - ПОЛНЫЙ СПИСОК товаров с низким остатком
+        if Product:
+            pqs = Product.objects.filter(company=company)
+            if branch and _model_has_field(Product, "branch"):
+                if self._include_global(request):
+                    pqs = pqs.filter(Q(branch=branch) | Q(branch__isnull=True))
+                else:
+                    pqs = pqs.filter(branch=branch)
+            
+            qty_field = "quantity" if _model_has_field(Product, "quantity") else None
+            pp_field = "purchase_price" if _model_has_field(Product, "purchase_price") else None
+            price_field = "price" if _model_has_field(Product, "price") else None
+            
+            if qty_field and pp_field:
+                inv_expr = ExpressionWrapper(F(qty_field) * F(pp_field), output_field=MONEY_FIELD)
+                stock_value = pqs.aggregate(v=Coalesce(Sum(inv_expr), Value(Z_MONEY, output_field=MONEY_FIELD), output_field=MONEY_FIELD))["v"] or Z_MONEY
+                
+                # Товары с низким остатком - ВСЕ 71 товар! (или сколько их есть)
+                low_stock_qs = pqs.filter(**{f"{qty_field}__lte": 5}).order_by(qty_field)
+                low_stock_count = low_stock_qs.count()
+                
+                # Применяем лимит только если он задан
+                if limit:
+                    low_stock_qs = low_stock_qs[:limit]
+                
+                low_stock_products = [
+                    {
+                        "id": str(p.id),
+                        "name": p.name,
+                        "code": getattr(p, "code", None),
+                        "article": getattr(p, "article", None),
+                        "barcode": getattr(p, "barcode", None),
+                        "category": getattr(p.category, "name", None) if hasattr(p, "category") and p.category else None,
+                        "brand": getattr(p.brand, "name", None) if hasattr(p, "brand") and p.brand else None,
+                        "quantity": str(Decimal(getattr(p, qty_field, 0) or 0).quantize(Decimal("0.001"))),
+                        "price": str(_money(getattr(p, price_field, 0) or 0)) if price_field else None,
+                        "purchase_price": str(_money(getattr(p, pp_field, 0) or 0)),
+                        "stock_value": str(_money(Decimal(getattr(p, qty_field, 0) or 0) * Decimal(getattr(p, pp_field, 0) or 0))),
+                        "status": "critical" if Decimal(getattr(p, qty_field, 0) or 0) <= 1 else "low",
+                    }
+                    for p in low_stock_qs
+                ]
+
+        return {
+            "tab": "products",
+            "period": {"from": period.start.isoformat(), "to": period.end.isoformat()},
+            "filters": {
+                "branch": str(getattr(branch, "id", "")) if branch else None,
+                "limit": limit,
+            },
+            "cards": {
+                "stock_value": str(_money(stock_value)),
+                "low_stock_count": low_stock_count,
+            },
+            "tables": {
+                "top_by_revenue": top_products_by_revenue,
+                "top_by_quantity": top_products_by_qty,
+                "categories": categories_performance,
+                "brands": brands_performance,
+                "low_stock_products": low_stock_products,  # НОВОЕ: полный список с деталями
+            },
+        }
+
+    # ─────────────────────────────────────────────────────────
+    # USERS ANALYTICS
+    # ─────────────────────────────────────────────────────────
+    def _users_analytics(self, request, company, branch, period: Period):
+        # Параметры для лимита результатов
+        limit_param = request.query_params.get("limit")
+        limit = int(limit_param) if limit_param and limit_param.isdigit() else None
+        
+        users_performance = []
+        shift_stats = {}
+
+        Sale, _ = get_sale_models()
+        if Sale and _model_has_field(Sale, "user"):
+            paid_value = _choice_value(Sale, "Status", "PAID", "paid")
+            dt_field = "paid_at" if _model_has_field(Sale, "paid_at") else "created_at"
+            
+            sqs = Sale.objects.filter(company=company, status=paid_value)
+            if branch and _model_has_field(Sale, "branch"):
+                if self._include_global(request):
+                    sqs = sqs.filter(Q(branch=branch) | Q(branch__isnull=True))
+                else:
+                    sqs = sqs.filter(branch=branch)
+            sqs = sqs.filter(**{f"{dt_field}__gte": period.start, f"{dt_field}__lt": period.end})
+
+            # User Performance - ДЕТАЛЬНО ВСЕ сотрудники
+            user_query = (
+                sqs.values(
+                    "user_id",
+                    "user__first_name",
+                    "user__last_name",
+                    "user__email",
+                    "user__phone_number",
+                )
+                .annotate(
+                    revenue=Coalesce(Sum("total"), Value(Z_MONEY, output_field=MONEY_FIELD), output_field=MONEY_FIELD),
+                    tx_count=Count("id"),
+                )
+                .order_by("-revenue")
+            )
+            if limit:
+                user_query = user_query[:limit]
+            
+            for r in user_query:
+                rev = _money(r["revenue"])
+                txc = r["tx_count"] or 0
+                users_performance.append({
+                    "user_id": str(r["user_id"]) if r["user_id"] else None,
+                    "user": _user_label(
+                        None,
+                        first_name=r.get("user__first_name"),
+                        last_name=r.get("user__last_name"),
+                        email=r.get("user__email"),
+                        phone=r.get("user__phone_number"),
+                        user_id=r.get("user_id"),
+                    ),
+                    "email": r.get("user__email"),
+                    "phone": r.get("user__phone_number"),
+                    "revenue": str(rev),
+                    "transactions": txc,
+                    "avg_check": str(_safe_div(rev, txc)),
+                })
+
+        # Shift Performance - ПОЛНАЯ информация
+        shifts_qs = CashShift.objects.filter(company=company)
+        if branch:
+            shifts_qs = shifts_qs.filter(Q(branch=branch) | Q(branch__isnull=True))
+        shifts_qs = shifts_qs.filter(opened_at__gte=period.start, opened_at__lt=period.end)
+        
+        total_shifts = shifts_qs.count()
+        closed_shifts = shifts_qs.filter(status=CashShift.Status.CLOSED).count()
+        
+        # Cash discrepancies - ВСЕ расхождения с деталями
+        closed_with_data = shifts_qs.filter(status=CashShift.Status.CLOSED, closing_cash__isnull=False).order_by("-opened_at")
+        discrepancies = []
+        all_discrepancies_qs = []
+        
+        for shift in closed_with_data:
+            diff = shift.cash_diff
+            if abs(diff) > Decimal("0.01"):
+                all_discrepancies_qs.append(shift)
+        
+        # Применяем лимит только если задан
+        if limit:
+            all_discrepancies_qs = all_discrepancies_qs[:limit]
+            
+        for shift in all_discrepancies_qs:
+            diff = shift.cash_diff
+            discrepancies.append({
+                "shift_id": str(shift.id),
+                "cashier": _user_label(shift.cashier) if shift.cashier else "Unknown",
+                "cashbox": shift.cashbox.name if shift.cashbox else None,
+                "opened_at": shift.opened_at.isoformat() if shift.opened_at else None,
+                "closed_at": shift.closed_at.isoformat() if shift.closed_at else None,
+                "expected_cash": str(_money(shift.expected_cash or Z_MONEY)),
+                "closing_cash": str(_money(shift.closing_cash or Z_MONEY)),
+                "diff": str(_money(diff)),
+                "type": "shortage" if diff < 0 else "overage",
+            })
+
+        shift_stats = {
+            "total": total_shifts,
+            "closed": closed_shifts,
+            "open": total_shifts - closed_shifts,
+            "discrepancies_count": len(all_discrepancies_qs) if not limit else None,  # общее количество расхождений
+        }
+
+        return {
+            "tab": "users",
+            "period": {"from": period.start.isoformat(), "to": period.end.isoformat()},
+            "filters": {
+                "branch": str(getattr(branch, "id", "")) if branch else None,
+                "limit": limit,
+            },
+            "cards": shift_stats,
+            "tables": {
+                "users_performance": users_performance,
+                "shift_discrepancies": discrepancies,
+            },
+        }
+
+    # ─────────────────────────────────────────────────────────
+    # FINANCE ANALYTICS
+    # ─────────────────────────────────────────────────────────
+    def _finance(self, request, company, branch, period: Period):
+        from apps.construction.models import CashFlow
+        
+        # Параметры для лимита результатов
+        limit_param = request.query_params.get("limit")
+        limit = int(limit_param) if limit_param and limit_param.isdigit() else None
+
+        income_total = Z_MONEY
+        expense_total = Z_MONEY
+        net_flow = Z_MONEY
+        expense_breakdown = []
+        income_breakdown = []
+        expense_items = []  # НОВОЕ: полный детальный список расходов
+        income_items = []   # НОВОЕ: полный детальный список доходов
+
+        # CashFlow Analysis
+        cfqs = CashFlow.objects.filter(company=company, status=CashFlow.Status.APPROVED)
+        if branch:
+            cfqs = cfqs.filter(Q(branch=branch) | Q(branch__isnull=True))
+        cfqs = cfqs.filter(created_at__gte=period.start, created_at__lt=period.end)
+
+        income_total = (
+            cfqs.filter(type=CashFlow.Type.INCOME)
+            .aggregate(v=Coalesce(Sum("amount"), Value(Z_MONEY, output_field=MONEY_FIELD), output_field=MONEY_FIELD))["v"]
+            or Z_MONEY
+        )
+        expense_total = (
+            cfqs.filter(type=CashFlow.Type.EXPENSE)
+            .aggregate(v=Coalesce(Sum("amount"), Value(Z_MONEY, output_field=MONEY_FIELD), output_field=MONEY_FIELD))["v"]
+            or Z_MONEY
+        )
+        net_flow = _money(income_total - expense_total)
+
+        # Expense Breakdown by Name - ДЕТАЛЬНО
+        exp_query = (
+            cfqs.filter(type=CashFlow.Type.EXPENSE)
+            .values("name")
+            .annotate(
+                total=Coalesce(Sum("amount"), Value(Z_MONEY, output_field=MONEY_FIELD), output_field=MONEY_FIELD),
+                count=Count("id"),
+            )
+            .order_by("-total")
+        )
+        if limit:
+            exp_query = exp_query[:limit]
+            
+        expense_breakdown = [
+            {
+                "name": r["name"] or "Без названия",
+                "total": str(_money(r["total"])),
+                "count": r["count"],
+            }
+            for r in exp_query
+        ]
+
+        # Income Breakdown by Name - ДЕТАЛЬНО
+        inc_query = (
+            cfqs.filter(type=CashFlow.Type.INCOME)
+            .values("name")
+            .annotate(
+                total=Coalesce(Sum("amount"), Value(Z_MONEY, output_field=MONEY_FIELD), output_field=MONEY_FIELD),
+                count=Count("id"),
+            )
+            .order_by("-total")
+        )
+        if limit:
+            inc_query = inc_query[:limit]
+            
+        income_breakdown = [
+            {
+                "name": r["name"] or "Без названия",
+                "total": str(_money(r["total"])),
+                "count": r["count"],
+            }
+            for r in inc_query
+        ]
+        
+        # ПОЛНЫЙ список всех расходов с деталями
+        expense_qs = cfqs.filter(type=CashFlow.Type.EXPENSE).order_by("-created_at")
+        if limit:
+            expense_qs = expense_qs[:limit]
+            
+        expense_items = [
+            {
+                "id": str(cf.id),
+                "name": cf.name or "Без названия",
+                "amount": str(_money(cf.amount)),
+                "cashbox": cf.cashbox.name if cf.cashbox else None,
+                "shift": str(cf.shift_id) if hasattr(cf, "shift_id") and cf.shift_id else None,
+                "created_at": cf.created_at.isoformat() if cf.created_at else None,
+                "created_by": _user_label(cf.created_by) if hasattr(cf, "created_by") and cf.created_by else None,
+                "description": getattr(cf, "description", None) or getattr(cf, "comment", None),
+            }
+            for cf in expense_qs
+        ]
+        
+        # ПОЛНЫЙ список всех доходов с деталями
+        income_qs = cfqs.filter(type=CashFlow.Type.INCOME).order_by("-created_at")
+        if limit:
+            income_qs = income_qs[:limit]
+            
+        income_items = [
+            {
+                "id": str(cf.id),
+                "name": cf.name or "Без названия",
+                "amount": str(_money(cf.amount)),
+                "cashbox": cf.cashbox.name if cf.cashbox else None,
+                "shift": str(cf.shift_id) if hasattr(cf, "shift_id") and cf.shift_id else None,
+                "created_at": cf.created_at.isoformat() if cf.created_at else None,
+                "created_by": _user_label(cf.created_by) if hasattr(cf, "created_by") and cf.created_by else None,
+                "description": getattr(cf, "description", None) or getattr(cf, "comment", None),
+            }
+            for cf in income_qs
+        ]
+
+        return {
+            "tab": "finance",
+            "period": {"from": period.start.isoformat(), "to": period.end.isoformat()},
+            "filters": {
+                "branch": str(getattr(branch, "id", "")) if branch else None,
+                "limit": limit,
+            },
+            "cards": {
+                "income_total": str(_money(income_total)),
+                "expense_total": str(_money(expense_total)),
+                "net_flow": str(net_flow),
+                "income_count": cfqs.filter(type=CashFlow.Type.INCOME).count(),
+                "expense_count": cfqs.filter(type=CashFlow.Type.EXPENSE).count(),
+            },
+            "tables": {
+                "expense_breakdown": expense_breakdown,
+                "income_breakdown": income_breakdown,
+                "expense_items": expense_items,  # НОВОЕ: полный детальный список
+                "income_items": income_items,    # НОВОЕ: полный детальный список
+            },
         }
