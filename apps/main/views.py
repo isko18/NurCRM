@@ -2309,6 +2309,21 @@ class ReturnFromAgentListCreateAPIView(CompanyBranchRestrictedMixin, generics.Li
     def perform_create(self, serializer):
         serializer.save(company=self._company(), returned_by=self._user())
 
+    def list(self, request, *args, **kwargs):
+        response = super().list(request, *args, **kwargs)
+        qs = self._filter_qs_company_branch(ReturnFromAgent.objects.all())
+        pending = qs.filter(status=ReturnFromAgent.Status.PENDING).aggregate(
+            pending_count=Count("id"),
+            pending_qty=Coalesce(Sum("qty"), 0),
+        )
+        summary = {
+            "pending_count": pending["pending_count"] or 0,
+            "pending_qty": int(pending["pending_qty"] or 0),
+        }
+        if isinstance(response.data, dict):
+            response.data["returns_summary"] = summary
+        return response
+
 
 # ===========================
 #  Return: retrieve/destroy
