@@ -372,6 +372,7 @@
   "status": "DRAFT|POSTED",
   "number": "SALE-20260201-0001|null",
   "date": "2026-02-01T12:00:00Z",
+  "payment_kind": "cash|credit|null",
   "warehouse_from": "uuid|null",
   "warehouse_to": "uuid|null",
   "counterparty": "uuid|null",
@@ -395,14 +396,21 @@
 Read-only поля:
 - `number`, `total`, `status`, `date`
 
+**Оплата (продажа/покупка в долг):**
+- `payment_kind` — только для типов `SALE`, `PURCHASE`, `SALE_RETURN`, `PURCHASE_RETURN`.
+  - `cash` — оплата сразу (по умолчанию).
+  - `credit` — **в долг**: при продаже клиент должен нам (задолженность погашается приходом денег от контрагента); при покупке мы должны поставщику (погашается расходом денег контрагенту). Имеет смысл проводить документ как обычно, а долг учитывается в акте сверки с контрагентом.
+- Для остальных типов документов поле можно не передавать (или `null`).
+
 ### 4.4 Создание документа (пример)
 `POST /api/warehouse/documents/`
 ```json
 {
   "doc_type": "SALE",
+  "payment_kind": "credit",
   "warehouse_from": "11111111-1111-1111-1111-111111111111",
   "counterparty": "22222222-2222-2222-2222-222222222222",
-  "comment": "Продажа",
+  "comment": "Продажа в долг",
   "items": [
     {
       "product": "33333333-3333-3333-3333-333333333333",
@@ -429,7 +437,7 @@ Read-only поля:
 
 ### 4.6 Фильтры и поиск по документам
 Список (`/documents/` и typed endpoints):
-- фильтры: `doc_type`, `status`, `warehouse_from`, `warehouse_to`, `counterparty`
+- фильтры: `doc_type`, `status`, `payment_kind` (`cash`|`credit`), `warehouse_from`, `warehouse_to`, `counterparty`
 - поиск: `?search=...` (по `number` и `comment`)
 
 ### 4.7 Проведение и отмена

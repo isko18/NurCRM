@@ -864,11 +864,26 @@ class Document(models.Model):
         DRAFT = "DRAFT", "Черновик"
         POSTED = "POSTED", "Проведен"
 
+    class PaymentKind(models.TextChoices):
+        """Способ оплаты по документу (для SALE/PURCHASE и возвратов)."""
+        CASH = "cash", "Оплата сразу"
+        CREDIT = "credit", "В долг"
+
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     doc_type = models.CharField(max_length=32, choices=DocType.choices, verbose_name="Тип документа")
     status = models.CharField(max_length=16, choices=Status.choices, default=Status.DRAFT, verbose_name="Статус")
     number = models.CharField(max_length=64, unique=True, null=True, blank=True, verbose_name="Номер")
     date = models.DateTimeField(auto_now_add=True, verbose_name="Дата")
+
+    payment_kind = models.CharField(
+        max_length=16,
+        choices=PaymentKind.choices,
+        default=PaymentKind.CASH,
+        blank=True,
+        null=True,
+        verbose_name="Оплата",
+        help_text="Для продажи/покупки и возвратов: оплата сразу или в долг.",
+    )
 
     warehouse_from = models.ForeignKey("warehouse.Warehouse", on_delete=models.SET_NULL, null=True, blank=True, related_name="documents_from", verbose_name="Склад-источник")
     warehouse_to = models.ForeignKey("warehouse.Warehouse", on_delete=models.SET_NULL, null=True, blank=True, related_name="documents_to", verbose_name="Склад-приемник")
@@ -925,6 +940,10 @@ class Document(models.Model):
                 raise ValidationError("Document requires warehouse_from")
             if self.doc_type in (self.DocType.SALE, self.DocType.PURCHASE, self.DocType.SALE_RETURN, self.DocType.PURCHASE_RETURN) and not self.counterparty:
                 raise ValidationError("Document requires counterparty")
+
+        if self.doc_type in (self.DocType.SALE, self.DocType.PURCHASE, self.DocType.SALE_RETURN, self.DocType.PURCHASE_RETURN):
+            if self.payment_kind and self.payment_kind not in (self.PaymentKind.CASH, self.PaymentKind.CREDIT):
+                raise ValidationError({"payment_kind": "Укажите cash (оплата сразу) или credit (в долг)."})
 
 
 class DocumentItem(models.Model):

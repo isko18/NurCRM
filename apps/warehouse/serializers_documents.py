@@ -28,6 +28,7 @@ class DocumentSerializer(serializers.ModelSerializer):
             "status",
             "number",
             "date",
+            "payment_kind",
             "warehouse_from",
             "warehouse_to",
             "counterparty",

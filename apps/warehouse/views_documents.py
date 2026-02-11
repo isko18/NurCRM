@@ -15,7 +15,7 @@ from apps.utils import _is_owner_like
 class DocumentListCreateView(CompanyBranchRestrictedMixin, generics.ListCreateAPIView):
     serializer_class = serializers_documents.DocumentSerializer
     filter_backends = [DjangoFilterBackend, filters.SearchFilter]
-    filterset_fields = ["doc_type", "status", "warehouse_from", "warehouse_to", "counterparty"]
+    filterset_fields = ["doc_type", "status", "payment_kind", "warehouse_from", "warehouse_to", "counterparty"]
     search_fields = ["number", "comment"]
     
     def _filter_company_branch(self, qs):
