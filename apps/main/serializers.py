@@ -2022,12 +2022,13 @@ class ReturnReadSerializer(serializers.ModelSerializer):
     agent = serializers.SerializerMethodField()
     returned_by_name = serializers.SerializerMethodField()
     accepted_by_name = serializers.SerializerMethodField()
+    status_display = serializers.CharField(source="get_status_display", read_only=True)
 
     class Meta:
         model = ReturnFromAgent
         fields = [
             "id", "company", "subreal_id", "product", "agent",
-            "qty", "status",
+            "qty", "status", "status_display",
             "returned_by", "returned_by_name",
             "accepted_by", "accepted_by_name",
             "returned_at", "accepted_at",

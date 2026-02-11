@@ -209,9 +209,10 @@ urlpatterns = [
     path("returns/<uuid:pk>/reject/", ReturnFromAgentRejectAPIView.as_view(), name="return-reject"),
 
     # -------------------------
-    # Агент: свои товары
+    # Агент: свои товары и возвраты
     # -------------------------
     path("agents/me/products/", AgentMyProductsListAPIView.as_view(), name="agent-my-products"),
+    path("agents/me/returns/", AgentMyReturnsListCreateAPIView.as_view(), name="agent-my-returns"),
     path(
         "owners/agents/products/",
         OwnerAgentsProductsListAPIView.as_view(),

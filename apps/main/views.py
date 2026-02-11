@@ -2309,6 +2309,38 @@ class ReturnFromAgentListCreateAPIView(CompanyBranchRestrictedMixin, generics.Li
     def perform_create(self, serializer):
         serializer.save(company=self._company(), returned_by=self._user())
 
+    def list(self, request, *args, **kwargs):
+        response = super().list(request, *args, **kwargs)
+        # Сводка по тем же фильтрам, что и список (для агента: ?returned_by=me → только его возвраты)
+        qs = self.filter_queryset(self.get_queryset())
+        pending = qs.filter(status=ReturnFromAgent.Status.PENDING).aggregate(
+            pending_count=Count("id"),
+            pending_qty=Coalesce(Sum("qty"), 0),
+        )
+        summary = {
+            "pending_count": pending["pending_count"] or 0,
+            "pending_qty": int(pending["pending_qty"] or 0),
+        }
+        if isinstance(response.data, dict):
+            response.data["returns_summary"] = summary
+        return response
+
+
+# ===========================
+#  Agent: мои возвраты (только свои, со сводкой)
+# ===========================
+class AgentMyReturnsListCreateAPIView(ReturnFromAgentListCreateAPIView):
+    """
+    GET  /api/main/agents/me/returns/
+    POST /api/main/agents/me/returns/
+    Список и создание возвратов только текущего агента. В ответе GET — returns_summary
+    (pending_count, pending_qty) по возвратам агента.
+    """
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        return qs.filter(returned_by=self.request.user)
+
 
 # ===========================
 #  Return: retrieve/destroy
