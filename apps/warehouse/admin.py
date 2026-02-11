@@ -33,6 +33,14 @@ class CounterpartyAdmin(admin.ModelAdmin):
 	search_fields = ("name",)
 
 
+@admin.register(models.WarehouseProductGroup)
+class WarehouseProductGroupAdmin(admin.ModelAdmin):
+    list_display = ("name", "warehouse", "parent", "company", "branch")
+    list_filter = ("warehouse", "company", "branch")
+    search_fields = ("name",)
+    raw_id_fields = ("warehouse", "parent")
+
+
 @admin.register(models.PaymentCategory)
 class PaymentCategoryAdmin(admin.ModelAdmin):
 	list_display = ("title", "company", "branch")

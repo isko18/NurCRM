@@ -111,6 +111,9 @@
 Примечание:
 - В текущей реализации на списке категорий фильтры не подключены (вьюха без `filterset_class`).
 
+### 2.3.1 Группы товаров внутри склада (как в 1С)
+Иерархия групп по складу: `GET/POST /api/warehouse/{warehouse_uuid}/groups/`, `GET/PATCH/DELETE .../groups/{group_uuid}/`. Тело: `name`, `parent` (uuid|null). В ответе: `products_count`. У товара поле `product_group`; фильтр `?product_group=<uuid>`.
+
 ### 2.4 Контрагенты (только “simple CRUD” для документов)
 Эндпойнты:
 - `GET /api/warehouse/crud/counterparties/`

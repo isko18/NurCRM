@@ -102,6 +102,38 @@ class CategorySerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer
         _restrict_pk_queryset_strict(self.fields.get("parent"), m.WarehouseProductCategory.objects.all(), comp, br)
 
 
+class WarehouseProductGroupSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
+    """Группа товаров внутри склада (иерархия как в 1С)."""
+    company = serializers.ReadOnlyField(source="company.id")
+    branch = serializers.ReadOnlyField(source="branch.id")
+    warehouse = serializers.PrimaryKeyRelatedField(queryset=m.Warehouse.objects.all(), required=False)
+    parent = serializers.PrimaryKeyRelatedField(
+        queryset=m.WarehouseProductGroup.objects.all(),
+        allow_null=True,
+        required=False,
+    )
+    products_count = serializers.IntegerField(read_only=True)
+
+    class Meta:
+        model = m.WarehouseProductGroup
+        fields = ["id", "company", "branch", "warehouse", "name", "parent", "products_count"]
+        read_only_fields = ["id", "company", "branch"]
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        warehouse = self.context.get("warehouse")
+        if warehouse:
+            self.fields["warehouse"].queryset = m.Warehouse.objects.filter(pk=warehouse.pk)
+            qs = m.WarehouseProductGroup.objects.filter(warehouse=warehouse)
+            self.fields["parent"].queryset = qs
+
+    def create(self, validated_data):
+        warehouse = self.context.get("warehouse")
+        if warehouse:
+            validated_data["warehouse"] = warehouse
+        return super().create(validated_data)
+
+
 # ----------------
 # Product related
 # ----------------
@@ -205,6 +237,12 @@ class WarehouseProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSe
     images = WarehouseProductImageSerializer(many=True, read_only=True)
     packages = WarehouseProductPackageSerializer(many=True, read_only=True)
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        warehouse = self.context.get("warehouse")
+        if warehouse and "product_group" in self.fields:
+            self.fields["product_group"].queryset = m.WarehouseProductGroup.objects.filter(warehouse=warehouse)
+
     class Meta:
         ref_name = "WarehouseProductSerializer"
         model = m.WarehouseProduct
@@ -229,6 +267,7 @@ class WarehouseProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSe
             "expiration_date",
             "brand",
             "category",
+            "product_group",
             "warehouse",
             "characteristics",
             "images",
