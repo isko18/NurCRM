@@ -17,6 +17,7 @@ from .serializers import (
     WarehouseSerializer,
     BrandSerializer,
     CategorySerializer,
+    WarehouseProductGroupSerializer,
     WarehouseProductSerializer,
     WarehouseProductImageSerializer,
     WarehouseProductPackageSerializer,
@@ -323,6 +324,62 @@ class CategoryDetailView(CompanyBranchRestrictedMixin, generics.RetrieveUpdateDe
     lookup_url_kwarg = "category_uuid"
 
 
+# ==== Product groups (inside warehouse, like 1C) ====
+class ProductGroupView(CompanyBranchRestrictedMixin, generics.ListCreateAPIView):
+    serializer_class = WarehouseProductGroupSerializer
+    lookup_url_kwarg = "group_uuid"
+
+    def _get_warehouse(self):
+        qs = self._filter_qs_company_branch(m.Warehouse.objects.all())
+        return get_object_or_404(qs, id=self.kwargs.get("warehouse_uuid"))
+
+    def get_queryset(self):
+        wh = self._get_warehouse()
+        return (
+            m.WarehouseProductGroup.objects
+            .filter(warehouse=wh)
+            .annotate(products_count=Count("products", distinct=True))
+            .select_related("warehouse", "company", "branch", "parent")
+        )
+
+    def get_serializer_context(self):
+        ctx = super().get_serializer_context()
+        ctx["warehouse"] = self._get_warehouse()
+        return ctx
+
+    def perform_create(self, serializer):
+        wh = self._get_warehouse()
+        serializer.save(warehouse=wh, company=wh.company, branch=wh.branch)
+
+
+class ProductGroupDetailView(CompanyBranchRestrictedMixin, generics.RetrieveUpdateDestroyAPIView):
+    serializer_class = WarehouseProductGroupSerializer
+    lookup_field = "id"
+    lookup_url_kwarg = "group_uuid"
+
+    def _get_warehouse(self):
+        qs = self._filter_qs_company_branch(m.Warehouse.objects.all())
+        return get_object_or_404(qs, id=self.kwargs.get("warehouse_uuid"))
+
+    def get_queryset(self):
+        wh = self._get_warehouse()
+        return (
+            m.WarehouseProductGroup.objects
+            .filter(warehouse=wh)
+            .annotate(products_count=Count("products", distinct=True))
+            .select_related("warehouse", "company", "branch", "parent")
+        )
+
+    def get_serializer_context(self):
+        ctx = super().get_serializer_context()
+        ctx["warehouse"] = self._get_warehouse()
+        return ctx
+
+    def perform_update(self, serializer):
+        serializer.validated_data.pop("warehouse", None)
+        serializer.save()
+
+
 # ==== Products ====
 class ProductView(CompanyBranchRestrictedMixin, generics.ListCreateAPIView):
     serializer_class = WarehouseProductSerializer
@@ -337,10 +394,15 @@ class ProductView(CompanyBranchRestrictedMixin, generics.ListCreateAPIView):
         wh = self._get_warehouse()
         return (
             m.WarehouseProduct.objects
-            .select_related("brand", "category", "warehouse", "company", "branch", "characteristics")
+            .select_related("brand", "category", "product_group", "warehouse", "company", "branch", "characteristics")
             .prefetch_related("images", "packages")
             .filter(warehouse=wh)
         )
+
+    def get_serializer_context(self):
+        ctx = super().get_serializer_context()
+        ctx["warehouse"] = self._get_warehouse()
+        return ctx
 
     def perform_create(self, serializer):
         wh = self._get_warehouse()
@@ -359,10 +421,17 @@ class ProductDetailView(CompanyBranchRestrictedMixin, generics.RetrieveUpdateDes
     def get_queryset(self):
         qs = (
             m.WarehouseProduct.objects
-            .select_related("brand", "category", "warehouse", "company", "branch", "characteristics")
+            .select_related("brand", "category", "product_group", "warehouse", "company", "branch", "characteristics")
             .prefetch_related("images", "packages")
         )
         return self._filter_qs_company_branch(qs)
+
+    def get_serializer_context(self):
+        ctx = super().get_serializer_context()
+        obj = self.get_object()
+        if obj and getattr(obj, "warehouse", None):
+            ctx["warehouse"] = obj.warehouse
+        return ctx
 
     def perform_update(self, serializer):
         serializer.validated_data.pop("warehouse", None)

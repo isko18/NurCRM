@@ -177,6 +177,81 @@ class WarehouseProductCategory(BaseModelId, BaseModelCompanyBranch):
 
 
 # -----------------------
+# Warehouse product group (grouping inside warehouse, like 1C)
+# -----------------------
+
+
+class WarehouseProductGroup(BaseModelId, BaseModelCompanyBranch):
+    """
+    Группа товаров внутри склада (иерархия как в 1С).
+    Одна группа может содержать подгруппы и/или товары.
+    """
+    warehouse = models.ForeignKey(
+        "warehouse.Warehouse",
+        on_delete=models.CASCADE,
+        related_name="product_groups",
+        verbose_name="Склад",
+    )
+    name = models.CharField(max_length=128, verbose_name="Название")
+
+    parent = TreeForeignKey(
+        "self",
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
+        related_name="children",
+        verbose_name="Родительская группа",
+    )
+
+    class MPTTMeta:
+        order_insertion_by = ["name"]
+
+    class Meta:
+        verbose_name = "Группа товаров (склад)"
+        verbose_name_plural = "Группы товаров (склад)"
+        constraints = [
+            models.UniqueConstraint(
+                fields=("warehouse", "name"),
+                condition=Q(parent__isnull=True),
+                name="uq_wh_product_group_root_name_per_warehouse",
+            ),
+            models.UniqueConstraint(
+                fields=("parent", "name"),
+                condition=Q(parent__isnull=False),
+                name="uq_wh_product_group_child_name_per_parent",
+            ),
+        ]
+        indexes = [
+            models.Index(fields=["warehouse"]),
+            models.Index(fields=["company", "warehouse"]),
+        ]
+
+    def __str__(self):
+        return self.name
+
+    def clean(self):
+        if self.warehouse_id and self.company_id and self.warehouse.company_id != self.company_id:
+            raise ValidationError({"warehouse": "Склад принадлежит другой компании."})
+        if self.branch_id and self.warehouse_id and self.warehouse.branch_id not in (None, self.branch_id):
+            raise ValidationError({"warehouse": "Склад другого филиала."})
+        if self.parent_id:
+            if self.parent.warehouse_id != self.warehouse_id:
+                raise ValidationError({"parent": "Родительская группа должна принадлежать тому же складу."})
+            if self.parent.company_id != self.company_id:
+                raise ValidationError({"parent": "Родительская группа другой компании."})
+            if (self.parent.branch_id or None) != (self.branch_id or None):
+                raise ValidationError({"parent": "Родительская группа другого филиала."})
+
+    def save(self, *args, **kwargs):
+        if self.warehouse_id:
+            if not self.company_id:
+                self.company_id = self.warehouse.company_id
+            if self.branch_id is None:
+                self.branch_id = self.warehouse.branch_id
+        super().save(*args, **kwargs)
+
+
+# -----------------------
 # Product and related
 # -----------------------
 
@@ -216,6 +291,16 @@ class WarehouseProduct(BaseModelId, BaseModelDate, BaseModelCompanyBranch):
         "warehouse.WarehouseProductCategory",
         on_delete=models.CASCADE,
         verbose_name="Категория",
+    )
+
+    product_group = models.ForeignKey(
+        "warehouse.WarehouseProductGroup",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="products",
+        verbose_name="Группа (склад)",
+        help_text="Группировка товаров внутри склада (как в 1С).",
     )
 
     warehouse = models.ForeignKey(
@@ -411,6 +496,10 @@ class WarehouseProduct(BaseModelId, BaseModelDate, BaseModelCompanyBranch):
                 raise ValidationError({name: "Объект принадлежит другой компании."})
             if self.branch_id and rel and getattr(rel, "branch_id", None) not in (None, self.branch_id):
                 raise ValidationError({name: "Объект другого филиала."})
+
+        if self.product_group_id and self.warehouse_id:
+            if self.product_group.warehouse_id != self.warehouse_id:
+                raise ValidationError({"product_group": "Группа должна принадлежать тому же складу, что и товар."})
 
         if self.discount_percent is not None:
             dp = Decimal(self.discount_percent)

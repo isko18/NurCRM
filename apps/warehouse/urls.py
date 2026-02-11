@@ -4,6 +4,7 @@ from .views import (
     WarehouseView, WarehouseDetailView,
     BrandView, BrandDetailView,
     CategoryView, CategoryDetailView,
+    ProductGroupView, ProductGroupDetailView,
     ProductView, ProductDetailView,
     ProductScanView,
     ProductImagesView, ProductImageDetailView,
@@ -58,6 +59,10 @@ urlpatterns = [
     # categories
     path("category/", CategoryView.as_view(), name="warehouse-category"),
     path("category/<uuid:category_uuid>/", CategoryDetailView.as_view(), name="warehouse-category-detail"),
+
+    # product groups (inside warehouse, like 1C)
+    path("<uuid:warehouse_uuid>/groups/", ProductGroupView.as_view(), name="warehouse-product-groups"),
+    path("<uuid:warehouse_uuid>/groups/<uuid:group_uuid>/", ProductGroupDetailView.as_view(), name="warehouse-product-group-detail"),
 
     # products in warehouse
     path("<uuid:warehouse_uuid>/products/", ProductView.as_view(), name="warehouse-products"),

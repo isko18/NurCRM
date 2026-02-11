@@ -20,9 +20,10 @@ class ProductFilter(django_filters.FilterSet):
     markup_max = django_filters.NumberFilter(field_name="markup_percent", lookup_expr="lte")
     
     # FK поля
-    brand = django_filters.ModelChoiceFilter(queryset=WarehouseProduct.objects.values_list('brand', flat=True))
-    category = django_filters.ModelChoiceFilter(queryset=WarehouseProduct.objects.values_list('category', flat=True))
-    warehouse = django_filters.ModelChoiceFilter(queryset=WarehouseProduct.objects.values_list('warehouse', flat=True))
+    brand = django_filters.ModelChoiceFilter(queryset=WarehouseProduct.objects.all())
+    category = django_filters.ModelChoiceFilter(queryset=WarehouseProduct.objects.all())
+    warehouse = django_filters.ModelChoiceFilter(queryset=WarehouseProduct.objects.all())
+    product_group = django_filters.UUIDFilter(field_name="product_group_id")
     
     # Прочее
     status = django_filters.ChoiceFilter(choices=WarehouseProduct.Status.choices)
@@ -38,6 +39,7 @@ class ProductFilter(django_filters.FilterSet):
             "brand",
             "category",
             "warehouse",
+            "product_group",
             "status",
             "stock",
             "name",
