@@ -375,6 +375,8 @@
   "payment_kind": "cash|credit|null",
   "warehouse_from": "uuid|null",
   "warehouse_to": "uuid|null",
+  "warehouse_from_name": "string|null",
+  "warehouse_to_name": "string|null",
   "counterparty": "uuid|null",
   "agent": "uuid|null",
   "counterparty_display_name": "string|null",
@@ -386,6 +388,8 @@
     {
       "id": "uuid",
       "product": "uuid",
+      "product_name": "string|null",
+      "product_article": "string|null",
       "qty": "1.000",
       "price": "150.00",
       "discount_percent": "0.00",

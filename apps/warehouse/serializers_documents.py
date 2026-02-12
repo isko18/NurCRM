@@ -5,17 +5,34 @@ from . import models
 
 
 class DocumentItemSerializer(serializers.ModelSerializer):
+    product_name = serializers.CharField(source="product.name", read_only=True, allow_null=True)
+    product_article = serializers.CharField(source="product.article", read_only=True, allow_null=True)
+
     class Meta:
         model = models.DocumentItem
-        fields = ("id", "product", "qty", "price", "discount_percent", "discount_amount", "line_total")
+        fields = (
+            "id",
+            "product",
+            "product_name",
+            "product_article",
+            "qty",
+            "price",
+            "discount_percent",
+            "discount_amount",
+            "line_total",
+        )
 
 
 class DocumentSerializer(serializers.ModelSerializer):
     items = DocumentItemSerializer(many=True)
     counterparty_display_name = serializers.CharField(
-        source='counterparty.name',
-        read_only=True,
-        allow_null=True
+        source="counterparty.name", read_only=True, allow_null=True
+    )
+    warehouse_from_name = serializers.CharField(
+        source="warehouse_from.name", read_only=True, allow_null=True
+    )
+    warehouse_to_name = serializers.CharField(
+        source="warehouse_to.name", read_only=True, allow_null=True
     )
     agent = serializers.PrimaryKeyRelatedField(read_only=True)
 
@@ -31,6 +48,8 @@ class DocumentSerializer(serializers.ModelSerializer):
             "payment_kind",
             "warehouse_from",
             "warehouse_to",
+            "warehouse_from_name",
+            "warehouse_to_name",
             "counterparty",
             "agent",
             "counterparty_display_name",
