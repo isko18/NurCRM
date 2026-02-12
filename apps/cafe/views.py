@@ -26,7 +26,8 @@ from .models import (
     Order, OrderItem, CafeClient,
     OrderHistory, OrderItemHistory,
     KitchenTask, NotificationCafe,
-    InventorySession, Equipment, EquipmentInventorySession, Kitchen
+    InventorySession, Equipment, EquipmentInventorySession, Kitchen,
+    CafeReceiptPrinterSettings,
 )
 from .serializers import (
     ZoneSerializer, TableSerializer, BookingSerializer,
@@ -38,7 +39,8 @@ from .serializers import (
     KitchenTaskSerializer, NotificationCafeSerializer,
     InventorySessionSerializer, EquipmentSerializer,
     EquipmentInventorySessionSerializer, KitchenSerializer,
-    OrderPaySerializer
+    OrderPaySerializer,
+    CafeReceiptPrinterSettingsSerializer,
 )
 
 
@@ -287,6 +289,69 @@ class CompanyBranchQuerysetMixin:
         if not company:
             raise permissions.PermissionDenied("У пользователя не задана компания.")
         serializer.save(company=company)
+
+
+# ==================== Настройки принтера кассы (чековый принтер) ====================
+class ReceiptPrinterSettingsView(CompanyBranchQuerysetMixin, APIView):
+    """
+    GET  /cafe/receipt-printer/ — получить настройки принтера кассы (по компании).
+    PATCH /cafe/receipt-printer/ — сохранить/обновить настройки (printer обязателен).
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request):
+        company = self._user_company()
+        if not company:
+            return Response(
+                {"ok": False, "error": "У пользователя не задана компания."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+        try:
+            settings_obj = CafeReceiptPrinterSettings.objects.get(company=company)
+        except CafeReceiptPrinterSettings.DoesNotExist:
+            return Response(
+                {"printer": "", "bridge_url": "", "updated_at": None},
+                status=status.HTTP_200_OK,
+            )
+        serializer = CafeReceiptPrinterSettingsSerializer(instance=settings_obj)
+        return Response(serializer.data, status=status.HTTP_200_OK)
+
+    def patch(self, request):
+        company = self._user_company()
+        if not company:
+            return Response(
+                {"ok": False, "error": "У пользователя не задана компания."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+        printer_raw = request.data.get("printer")
+        if printer_raw is None or not str(printer_raw).strip():
+            return Response(
+                {"ok": False, "error": "Поле printer обязательно."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        serializer = CafeReceiptPrinterSettingsSerializer(
+            data=request.data,
+            partial=True,
+            context={"request": request},
+        )
+        if not serializer.is_valid():
+            errors = serializer.errors
+            msg = errors.get("printer", errors.get("bridge_url", errors))
+            if isinstance(msg, list):
+                msg = msg[0] if msg else "Ошибка валидации."
+            return Response(
+                {"ok": False, "error": str(msg)},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        settings_obj, _ = CafeReceiptPrinterSettings.objects.get_or_create(
+            company=company,
+            defaults={"printer": "", "bridge_url": ""},
+        )
+        settings_obj.printer = serializer.validated_data.get("printer", "")
+        settings_obj.bridge_url = serializer.validated_data.get("bridge_url", "")
+        settings_obj.save(update_fields=["printer", "bridge_url", "updated_at"])
+        out = CafeReceiptPrinterSettingsSerializer(instance=settings_obj).data
+        return Response(out, status=status.HTTP_200_OK)
 
 
 # ==================== CafeClient ====================

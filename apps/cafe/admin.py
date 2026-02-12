@@ -10,8 +10,17 @@ from .models import (
     Zone,  Warehouse,
     KitchenTask, NotificationCafe,
     InventorySession, InventoryItem,
-    Equipment, EquipmentInventorySession, EquipmentInventoryItem, Kitchen
+    Equipment, EquipmentInventorySession, EquipmentInventoryItem, Kitchen,
+    CafeReceiptPrinterSettings,
 )
+
+@admin.register(CafeReceiptPrinterSettings)
+class CafeReceiptPrinterSettingsAdmin(admin.ModelAdmin):
+    list_display = ("company", "printer", "bridge_url", "updated_at")
+    list_filter = ("company",)
+    search_fields = ("printer", "bridge_url")
+    raw_id_fields = ("company",)
+
 
 @admin.register(Kitchen)
 class KitchenAdmin(admin.ModelAdmin):

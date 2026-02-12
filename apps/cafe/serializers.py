@@ -1,4 +1,5 @@
 # apps/cafe/serializers.py
+import re
 from django.contrib.auth import get_user_model
 from django.db.models import Q
 from decimal import Decimal
@@ -10,7 +11,8 @@ from apps.cafe.models import (
     Zone, Table, Booking, Warehouse, Purchase,
     Category, MenuItem, Ingredient,
     Order, OrderItem, CafeClient,
-    OrderHistory, OrderItemHistory, KitchenTask, NotificationCafe, InventorySession, InventoryItem, Equipment, EquipmentInventoryItem, EquipmentInventorySession, Kitchen
+    OrderHistory, OrderItemHistory, KitchenTask, NotificationCafe, InventorySession, InventoryItem, Equipment, EquipmentInventoryItem, EquipmentInventorySession, Kitchen,
+    CafeReceiptPrinterSettings,
 )
 from apps.users.models import Branch
 
@@ -959,3 +961,101 @@ class EquipmentInventorySessionSerializer(CompanyBranchReadOnlyMixin):
                     ))
                 EquipmentInventoryItem.objects.bulk_create(bulk)
         return obj
+
+
+# ===== Настройки принтера кассы (чековый принтер) =====
+
+# IPv4: 1-3 цифр в каждой группе, 4 группы
+_PRINTER_IPV4_RE = re.compile(r"^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$")
+_PRINTER_USB_RE = re.compile(r"^[0-9a-fA-F]{1,4}:[0-9a-fA-F]{1,4}:.+$")  # vid:pid:serial
+
+
+def _validate_printer_binding(value):
+    """Проверка формата binding: ip/<ipv4>[:port] или usb/<vid>:<pid>:<serial>."""
+    if not value or not isinstance(value, str):
+        return
+    s = value.strip()
+    if not s:
+        return
+    if s.startswith("ip/"):
+        rest = s[3:].strip()
+        if ":" in rest:
+            host, port_str = rest.rsplit(":", 1)
+            host = host.strip()
+            try:
+                port = int(port_str.strip())
+                if port < 1 or port > 65535:
+                    raise serializers.ValidationError(
+                        "Некорректный printer: порт должен быть от 1 до 65535."
+                    )
+            except ValueError:
+                raise serializers.ValidationError(
+                    "Некорректный printer: порт должен быть числом."
+                )
+        else:
+            host = rest
+        m = _PRINTER_IPV4_RE.match(host)
+        if not m:
+            raise serializers.ValidationError(
+                "Некорректный printer: для Wi‑Fi укажите ip/<IPv4> или ip/<IPv4>:<порт>."
+            )
+        for g in m.groups():
+            if int(g) > 255:
+                raise serializers.ValidationError(
+                    "Некорректный printer: неверный IPv4-адрес."
+                )
+    elif s.startswith("usb/"):
+        rest = s[4:].strip()
+        if not rest or ":" not in rest or rest.count(":") < 2:
+            raise serializers.ValidationError(
+                "Некорректный printer: для USB укажите usb/<vid>:<pid>:<serial> (например usb/1fc9:2016:noserial)."
+            )
+        parts = rest.split(":", 2)
+        try:
+            int(parts[0], 16)
+            int(parts[1], 16)
+        except ValueError:
+            raise serializers.ValidationError(
+                "Некорректный printer: vid и pid должны быть hex-числами."
+            )
+    else:
+        raise serializers.ValidationError(
+            "Некорректный printer: укажите ip/<IPv4>[:порт] или usb/<vid>:<pid>:<serial>."
+        )
+
+
+def _validate_bridge_url(value):
+    """Если указан непустой URL — проверяем формат (http/https)."""
+    if not value or not isinstance(value, str):
+        return
+    s = value.strip()
+    if not s:
+        return
+    if not (s.startswith("http://") or s.startswith("https://")):
+        raise serializers.ValidationError(
+            "Некорректный bridge_url: укажите URL (http:// или https://)."
+        )
+
+
+class CafeReceiptPrinterSettingsSerializer(serializers.ModelSerializer):
+    """Настройки принтера кассы: printer (binding) и bridge_url."""
+
+    class Meta:
+        model = CafeReceiptPrinterSettings
+        fields = ["printer", "bridge_url", "updated_at"]
+        read_only_fields = ["updated_at"]
+
+    def validate_printer(self, value):
+        if value is not None and str(value).strip():
+            _validate_printer_binding(value)
+        return value or ""
+
+    def validate_bridge_url(self, value):
+        if value is not None:
+            _validate_bridge_url(value)
+        return value or ""
+
+    def to_representation(self, instance):
+        if instance is None:
+            return {"printer": "", "bridge_url": "", "updated_at": None}
+        return super().to_representation(instance)

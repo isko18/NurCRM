@@ -1214,3 +1214,43 @@ class EquipmentInventoryItem(models.Model):
 
     def __str__(self):
         return f"{self.equipment} — {self.get_condition_display()} ({'есть' if self.is_present else 'нет'})"
+
+
+# ==========================
+# Настройки принтера кассы (чековый принтер)
+# ==========================
+
+
+class CafeReceiptPrinterSettings(models.Model):
+    """
+    Настройки принтера кассы (чековый принтер) — одна запись на компанию.
+    Фронт: binding принтера (ip/... или usb/...) и URL printer-bridge.
+    """
+    company = models.OneToOneField(
+        Company,
+        on_delete=models.CASCADE,
+        related_name="cafe_receipt_printer_settings",
+        verbose_name="Компания",
+    )
+    printer = models.CharField(
+        "Привязка принтера (binding)",
+        max_length=512,
+        blank=True,
+        default="",
+        help_text="ip/<ip>:<port> или usb/<vid>:<pid>:<serial>",
+    )
+    bridge_url = models.CharField(
+        "URL printer-bridge",
+        max_length=512,
+        blank=True,
+        default="",
+        help_text="URL локального printer-bridge для Wi‑Fi печати; для USB может быть пустым.",
+    )
+    updated_at = models.DateTimeField("Обновлено", auto_now=True)
+
+    class Meta:
+        verbose_name = "Настройки принтера кассы (кафе)"
+        verbose_name_plural = "Настройки принтеров кассы (кафе)"
+
+    def __str__(self):
+        return f"Принтер кассы: {self.company}"
