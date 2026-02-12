@@ -379,6 +379,8 @@
   "agent": "uuid|null",
   "counterparty_display_name": "string|null",
   "comment": "string",
+  "discount_percent": "0.00",
+  "discount_amount": "0.00",
   "total": "0.00",
   "items": [
     {
@@ -387,6 +389,7 @@
       "qty": "1.000",
       "price": "150.00",
       "discount_percent": "0.00",
+      "discount_amount": "0.00",
       "line_total": "150.00"
     }
   ]

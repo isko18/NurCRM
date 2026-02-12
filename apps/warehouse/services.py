@@ -21,19 +21,30 @@ def _ensure_number(document: models.Document):
 
 
 def recalc_document_totals(document: models.Document) -> models.Document:
-    total = Decimal("0.00")
-    # Оптимизация: используем select_related для продукта
-    # Пересчитываем line_total для каждого item, если нужно
+    # Пересчитываем line_total для каждого item (скидка на товар: percent + amount)
     for item in document.items.select_related("product").all():
-        # Убеждаемся, что line_total рассчитан правильно
-        if not item.line_total or item.line_total == Decimal("0.00"):
-            q = Decimal(item.qty or 0)
-            p = Decimal(item.price or 0)
-            dp = Decimal(item.discount_percent or 0) / Decimal("100")
-            item.line_total = (p * q * (Decimal("1") - dp)).quantize(Decimal("0.01"))
+        q = Decimal(item.qty or 0)
+        p = Decimal(item.price or 0)
+        dp = Decimal(item.discount_percent or 0) / Decimal("100")
+        da = Decimal(item.discount_amount or 0)
+        subtotal = (p * q * (Decimal("1") - dp)).quantize(Decimal("0.01"))
+        new_line_total = max(Decimal("0.00"), (subtotal - da).quantize(Decimal("0.01")))
+        if item.line_total != new_line_total:
+            item.line_total = new_line_total
             item.save(update_fields=["line_total"])
-        total += (item.line_total or Decimal("0.00"))
-    document.total = total.quantize(Decimal("0.01"))
+
+    # Сумма по строкам (суммарная стоимость товаров до общей скидки)
+    subtotal = sum(
+        (item.line_total or Decimal("0.00"))
+        for item in document.items.all()
+    )
+    subtotal = subtotal.quantize(Decimal("0.01"))
+
+    # Общая скидка на документ: percent + amount
+    doc_dp = Decimal(document.discount_percent or 0) / Decimal("100")
+    doc_da = Decimal(document.discount_amount or 0)
+    total = max(Decimal("0.00"), (subtotal * (Decimal("1") - doc_dp) - doc_da).quantize(Decimal("0.01")))
+    document.total = total
     document.save(update_fields=["total"])
     return document
 
