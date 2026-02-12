@@ -4,14 +4,14 @@ from . import models
 
 @admin.register(models.Document)
 class DocumentAdmin(admin.ModelAdmin):
-	list_display = ("number", "doc_type", "status", "date", "warehouse_from", "warehouse_to", "counterparty", "total")
+	list_display = ("number", "doc_type", "status", "date", "warehouse_from", "warehouse_to", "counterparty", "discount_percent", "discount_amount", "total")
 	list_filter = ("doc_type", "status")
 	search_fields = ("number", "comment")
 
 
 @admin.register(models.DocumentItem)
 class DocumentItemAdmin(admin.ModelAdmin):
-	list_display = ("document", "product", "qty", "price", "line_total")
+	list_display = ("document", "product", "qty", "price", "discount_percent", "discount_amount", "line_total")
 	search_fields = ("product__name",)
 
 

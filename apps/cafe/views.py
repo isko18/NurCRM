@@ -1090,7 +1090,7 @@ class KitchenTaskClaimBulkView(CompanyBranchQuerysetMixin, APIView):
 
         with transaction.atomic():
             to_claim = list(
-                KitchenTask.objects.select_for_update().select_related(
+                KitchenTask.objects.select_for_update(of=("self",)).select_related(
                     "order__table", "menu_item", "waiter", "cook"
                 ).filter(base_q, pk__in=task_ids)
             )
@@ -1186,7 +1186,7 @@ class KitchenTaskReadyBulkView(CompanyBranchQuerysetMixin, APIView):
         user = request.user
         with transaction.atomic():
             tasks = list(
-                KitchenTask.objects.select_for_update().select_related(
+                KitchenTask.objects.select_for_update(of=("self",)).select_related(
                     "order__table", "menu_item", "waiter", "cook"
                 ).filter(
                     pk__in=task_ids,
@@ -1212,7 +1212,7 @@ class KitchenTaskReadyView(CompanyBranchQuerysetMixin, APIView):
         user = request.user
         with transaction.atomic():
             task = generics.get_object_or_404(
-                KitchenTask.objects.select_for_update().select_related(
+                KitchenTask.objects.select_for_update(of=("self",)).select_related(
                     "order__table", "menu_item", "waiter", "cook"
                 ),
                 pk=pk, company=company, cook=user, status=KitchenTask.Status.IN_PROGRESS

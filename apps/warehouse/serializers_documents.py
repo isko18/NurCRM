@@ -7,7 +7,7 @@ from . import models
 class DocumentItemSerializer(serializers.ModelSerializer):
     class Meta:
         model = models.DocumentItem
-        fields = ("id", "product", "qty", "price", "discount_percent", "line_total")
+        fields = ("id", "product", "qty", "price", "discount_percent", "discount_amount", "line_total")
 
 
 class DocumentSerializer(serializers.ModelSerializer):
@@ -35,6 +35,8 @@ class DocumentSerializer(serializers.ModelSerializer):
             "agent",
             "counterparty_display_name",
             "comment",
+            "discount_percent",
+            "discount_amount",
             "total",
             "items",
         )
@@ -100,6 +102,8 @@ class TransferItemInputSerializer(serializers.Serializer):
     product = serializers.PrimaryKeyRelatedField(queryset=models.WarehouseProduct.objects.all())
     qty = serializers.DecimalField(max_digits=18, decimal_places=3)
     price = serializers.DecimalField(max_digits=18, decimal_places=2, required=False, default=Decimal("0.00"))
+    discount_percent = serializers.DecimalField(max_digits=5, decimal_places=2, required=False, default=Decimal("0.00"))
+    discount_amount = serializers.DecimalField(max_digits=18, decimal_places=2, required=False, default=Decimal("0.00"))
 
 
 class TransferCreateSerializer(serializers.Serializer):

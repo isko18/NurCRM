@@ -899,6 +899,14 @@ class Document(models.Model):
 
     comment = models.TextField(blank=True, verbose_name="Комментарий")
     total = models.DecimalField(max_digits=18, decimal_places=2, default=Decimal("0.00"), verbose_name="Итого")
+    discount_percent = models.DecimalField(
+        max_digits=5, decimal_places=2, default=Decimal("0.00"),
+        verbose_name="Общая скидка, %", help_text="Скидка на весь документ в процентах"
+    )
+    discount_amount = models.DecimalField(
+        max_digits=18, decimal_places=2, default=Decimal("0.00"),
+        verbose_name="Общая скидка, сумма", help_text="Фиксированная скидка на весь документ"
+    )
     created_at = models.DateTimeField(auto_now_add=True, verbose_name="Дата создания")
     updated_at = models.DateTimeField(auto_now=True, verbose_name="Дата обновления")
 
@@ -945,6 +953,14 @@ class Document(models.Model):
             if self.payment_kind and self.payment_kind not in (self.PaymentKind.CASH, self.PaymentKind.CREDIT):
                 raise ValidationError({"payment_kind": "Укажите cash (оплата сразу) или credit (в долг)."})
 
+        # Общая скидка на документ
+        dp = Decimal(getattr(self, "discount_percent", None) or 0)
+        if not (Decimal("0") <= dp <= Decimal("100")):
+            raise ValidationError({"discount_percent": "Общая скидка должна быть от 0 до 100%."})
+        da = Decimal(getattr(self, "discount_amount", None) or 0)
+        if da < 0:
+            raise ValidationError({"discount_amount": "Общая скидка не может быть отрицательной."})
+
 
 class DocumentItem(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
@@ -952,7 +968,13 @@ class DocumentItem(models.Model):
     product = models.ForeignKey("warehouse.WarehouseProduct", on_delete=models.PROTECT, verbose_name="Товар")
     qty = models.DecimalField(max_digits=18, decimal_places=3, verbose_name="Количество")
     price = models.DecimalField(max_digits=18, decimal_places=2, default=Decimal("0.00"), verbose_name="Цена")
-    discount_percent = models.DecimalField(max_digits=5, decimal_places=2, default=Decimal("0.00"), verbose_name="Скидка, %")
+    discount_percent = models.DecimalField(
+        max_digits=5, decimal_places=2, default=Decimal("0.00"), verbose_name="Скидка на товар, %"
+    )
+    discount_amount = models.DecimalField(
+        max_digits=18, decimal_places=2, default=Decimal("0.00"),
+        verbose_name="Скидка на товар, сумма", help_text="Фиксированная скидка по строке"
+    )
     line_total = models.DecimalField(max_digits=18, decimal_places=2, default=Decimal("0.00"), verbose_name="Итого по строке")
 
     class Meta:
@@ -969,7 +991,12 @@ class DocumentItem(models.Model):
             self.discount_percent = Decimal("0.00")
         dp = Decimal(self.discount_percent)
         if not (Decimal("0") <= dp <= Decimal("100")):
-            raise ValidationError({"discount_percent": "Must be between 0 and 100"})
+            raise ValidationError({"discount_percent": "Скидка должна быть от 0 до 100%."})
+        if self.discount_amount is None:
+            self.discount_amount = Decimal("0.00")
+        da = Decimal(self.discount_amount)
+        if da < 0:
+            raise ValidationError({"discount_amount": "Скидка по строке не может быть отрицательной."})
 
         # Проверка соответствия товара складу документа
         # Проверяем только если document уже сохранен (имеет pk) или передан напрямую
@@ -1029,11 +1056,13 @@ class DocumentItem(models.Model):
                 raise ValidationError({"qty": "Quantity must be integer for piece items"})
 
     def save(self, *args, **kwargs):
-        # compute line total: price * qty * (1 - discount)
+        # compute line total: price * qty * (1 - discount_percent) - discount_amount
         q = Decimal(self.qty or 0)
         p = Decimal(self.price or 0)
         dp = Decimal(self.discount_percent or 0) / Decimal("100")
-        self.line_total = (p * q * (Decimal("1") - dp)).quantize(Decimal("0.01"))
+        da = Decimal(self.discount_amount or 0)
+        subtotal = (p * q * (Decimal("1") - dp)).quantize(Decimal("0.01"))
+        self.line_total = max(Decimal("0.00"), (subtotal - da).quantize(Decimal("0.01")))
         super().save(*args, **kwargs)
 
 
