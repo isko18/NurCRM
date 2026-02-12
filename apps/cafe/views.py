@@ -1059,18 +1059,30 @@ class KitchenTaskClaimView(CompanyBranchQuerysetMixin, APIView):
     """
     POST /cafe/kitchen/tasks/<uuid:pk>/claim/
     Берёт задачу в работу: pending -> in_progress, cook = request.user
+    Учитывает branch: если у пользователя выбран филиал — только задачи этого филиала (или branch=NULL).
     """
     def post(self, request, pk):
         company = self._user_company()
+        if not company:
+            return Response(
+                {"detail": "У пользователя не задана компания."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
         user = request.user
+
+        # Фильтр по branch (как в KitchenTaskMonitorView / KitchenTaskListView)
+        base_q = Q(pk=pk, company=company, status=KitchenTask.Status.PENDING, cook__isnull=True)
+        active_branch = self._active_branch()
+        if active_branch is not None:
+            base_q &= (Q(branch=active_branch) | Q(branch__isnull=True))
+        else:
+            base_q &= Q(branch__isnull=True)
+
         with transaction.atomic():
             updated = (
                 KitchenTask.objects
                 .select_for_update()
-                .filter(
-                    pk=pk, company=company,
-                    status=KitchenTask.Status.PENDING, cook__isnull=True
-                )
+                .filter(base_q)
                 .update(
                     status=KitchenTask.Status.IN_PROGRESS,
                     cook=user, started_at=timezone.now()
