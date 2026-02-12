@@ -1055,6 +1055,55 @@ class KitchenTaskListView(CompanyBranchQuerysetMixin, generics.ListAPIView):
         return qs
 
 
+def _claim_base_q(company, active_branch):
+    """Базовый Q для claim: pending, cook пустой, компания и branch."""
+    base_q = Q(company=company, status=KitchenTask.Status.PENDING, cook__isnull=True)
+    if active_branch is not None:
+        base_q &= (Q(branch=active_branch) | Q(branch__isnull=True))
+    else:
+        base_q &= Q(branch__isnull=True)
+    return base_q
+
+
+class KitchenTaskClaimBulkView(CompanyBranchQuerysetMixin, APIView):
+    """
+    POST /cafe/kitchen/tasks/claim/
+    Bulk: взять несколько задач в работу. Тело: {"task_ids": ["uuid", ...]}.
+    Только задачи в статусе pending без назначенного повара (и по branch пользователя).
+    """
+    def post(self, request):
+        company = self._user_company()
+        if not company:
+            return Response(
+                {"ok": False, "error": "У пользователя не задана компания."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+        task_ids = request.data.get("task_ids") if isinstance(request.data, dict) else None
+        if not task_ids or not isinstance(task_ids, list):
+            return Response(
+                {"ok": False, "error": "Передайте массив task_ids."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        user = request.user
+        active_branch = self._active_branch()
+        base_q = _claim_base_q(company, active_branch)
+
+        with transaction.atomic():
+            to_claim = list(
+                KitchenTask.objects.select_for_update().select_related(
+                    "order__table", "menu_item", "waiter", "cook"
+                ).filter(base_q, pk__in=task_ids)
+            )
+            now = timezone.now()
+            for task in to_claim:
+                task.status = KitchenTask.Status.IN_PROGRESS
+                task.cook = user
+                task.started_at = now
+                task.save(update_fields=["status", "cook", "started_at"])
+            updated = [KitchenTaskSerializer(t, context={"request": request}).data for t in to_claim]
+        return Response({"claimed": updated, "count": len(updated)}, status=status.HTTP_200_OK)
+
+
 class KitchenTaskClaimView(CompanyBranchQuerysetMixin, APIView):
     """
     POST /cafe/kitchen/tasks/<uuid:pk>/claim/
@@ -1069,14 +1118,7 @@ class KitchenTaskClaimView(CompanyBranchQuerysetMixin, APIView):
                 status=status.HTTP_403_FORBIDDEN,
             )
         user = request.user
-
-        # Фильтр по branch (как в KitchenTaskMonitorView / KitchenTaskListView)
-        base_q = Q(pk=pk, company=company, status=KitchenTask.Status.PENDING, cook__isnull=True)
-        active_branch = self._active_branch()
-        if active_branch is not None:
-            base_q &= (Q(branch=active_branch) | Q(branch__isnull=True))
-        else:
-            base_q &= Q(branch__isnull=True)
+        base_q = _claim_base_q(company, self._active_branch()) & Q(pk=pk)
 
         with transaction.atomic():
             updated = (
