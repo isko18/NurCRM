@@ -21,7 +21,7 @@ from .views import (
     OrderItemListCreateView, OrderItemRetrieveUpdateDestroyView,
 
     # Kitchen / notifications / analytics
-    KitchenTaskListView, KitchenTaskClaimView, KitchenTaskReadyView, KitchenTaskRetrieveUpdateDestroyView, KitchenTaskMonitorView,
+    KitchenTaskListView, KitchenTaskClaimView, KitchenTaskReadyView, KitchenTaskReadyBulkView, KitchenTaskRetrieveUpdateDestroyView, KitchenTaskMonitorView,
     KitchenAnalyticsByCookView, KitchenAnalyticsByWaiterView,
     NotificationListView, InventorySessionListCreateView, InventorySessionRetrieveView, InventorySessionConfirmView,
     EquipmentListCreateView, EquipmentRetrieveUpdateDestroyView,
@@ -101,11 +101,13 @@ urlpatterns = [
     # ==================== Kitchen (повар) ====================
     # Лента задач (pending + in_progress; ?mine=1, ?status=ready или ?status=pending,in_progress)
     path("kitchen/tasks/", KitchenTaskListView.as_view(), name="kitchen-task-list"),
+    # Bulk: отметить несколько задач как готовые (POST body: {"task_ids": ["uuid", ...]})
+    path("kitchen/tasks/ready/", KitchenTaskReadyBulkView.as_view(), name="kitchen-task-ready-bulk"),
     # Получить/обновить/удалить задачу (PATCH для изменения статуса и других полей)
     path("kitchen/tasks/<uuid:pk>/", KitchenTaskRetrieveUpdateDestroyView.as_view(), name="kitchen-task-detail"),
     # Взять задачу в работу
     path("kitchen/tasks/<uuid:pk>/claim/", KitchenTaskClaimView.as_view(), name="kitchen-task-claim"),
-    # Отметить как готово (уведомляет официанта)
+    # Отметить одну задачу как готово (уведомляет официанта)
     path("kitchen/tasks/<uuid:pk>/ready/", KitchenTaskReadyView.as_view(), name="kitchen-task-ready"),
     # Мониторинг задач для владельца/админа
     path("kitchen/tasks/monitor/", KitchenTaskMonitorView.as_view(), name="kitchen-task-monitor"),
