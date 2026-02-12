@@ -2,6 +2,8 @@
 from django.urls import path
 
 from .views import (
+    # Receipt printer settings
+    ReceiptPrinterSettingsView,
     # Clients + nested client orders
     CafeClientListCreateView, CafeClientRetrieveUpdateDestroyView, ClientOrderListCreateView,
     ClientOrderHistoryListView, OrderHistoryListView,
@@ -40,6 +42,9 @@ from apps.cafe.showcase.views_public import PublicCafeInfoAPIView, PublicCafeMen
 app_name = "cafe"
 
 urlpatterns = [
+    # === Настройки принтера кассы (чековый принтер) ===
+    path("receipt-printer/", ReceiptPrinterSettingsView.as_view(), name="receipt-printer-settings"),
+
     # === Clients ===
     path("clients/", CafeClientListCreateView.as_view(), name="client-list"),
     path("clients/<uuid:pk>/", CafeClientRetrieveUpdateDestroyView.as_view(), name="client-detail"),
