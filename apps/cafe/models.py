@@ -681,7 +681,7 @@ class Ingredient(models.Model):
     product = models.ForeignKey(
         "Warehouse", on_delete=models.CASCADE, related_name="used_in", verbose_name="Товар со склада"
     )
-    amount = models.DecimalField("Норма (в ед. товара)", max_digits=10, decimal_places=2)
+    amount = models.DecimalField("Норма (в ед. товара)", max_digits=12, decimal_places=5)
 
     class Meta:
         verbose_name = "Ингредиент"
