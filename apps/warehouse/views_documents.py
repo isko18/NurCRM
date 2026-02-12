@@ -117,7 +117,24 @@ class DocumentWriteOffListCreateView(_DocumentTypedListCreateView):
 
 
 class DocumentTransferListCreateView(_DocumentTypedListCreateView):
+    """
+    Документы перемещения. При создании автоматически проводится —
+    остатки снимаются со склада-источника и добавляются на склад-приёмник.
+    """
     DOC_TYPE = models.Document.DocType.TRANSFER
+
+    def perform_create(self, serializer):
+        super().perform_create(serializer)
+        doc = serializer.instance
+        if doc and doc.status == doc.Status.DRAFT:
+            try:
+                allow_negative = self.request.data.get("allow_negative", False)
+                if isinstance(allow_negative, str):
+                    allow_negative = allow_negative.lower() in ("true", "1", "yes")
+                services.post_document(doc, allow_negative=allow_negative)
+                doc.refresh_from_db()
+            except Exception as e:
+                raise DRFValidationError({"detail": str(e)})
 
 
 class DocumentDetailView(CompanyBranchRestrictedMixin, generics.RetrieveUpdateDestroyAPIView):
