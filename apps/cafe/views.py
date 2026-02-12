@@ -1086,6 +1086,68 @@ class KitchenTaskClaimView(CompanyBranchQuerysetMixin, APIView):
         return Response(KitchenTaskSerializer(obj, context={'request': request}).data)
 
 
+def _mark_task_ready(task, request):
+    """Отмечает одну задачу как готовую, создаёт уведомление и отправляет WebSocket. Вызывать внутри atomic по необходимости."""
+    task.status = KitchenTask.Status.READY
+    task.finished_at = timezone.now()
+    task.save(update_fields=["status", "finished_at"])
+    if task.waiter_id:
+        NotificationCafe.objects.create(
+            company=task.company,
+            branch=task.branch,
+            recipient=task.waiter,
+            type="kitchen_ready",
+            message=f"Готово: {task.menu_item.title} (стол {task.order.table.number})",
+            payload={
+                "task_id": str(task.id),
+                "order_id": str(task.order_id),
+                "table": task.order.table.number,
+                "menu_item": task.menu_item.title,
+                "unit_index": task.unit_index,
+            },
+        )
+    send_kitchen_task_ready_notification(task)
+    return KitchenTaskSerializer(task, context={"request": request}).data
+
+
+class KitchenTaskReadyBulkView(CompanyBranchQuerysetMixin, APIView):
+    """
+    POST /cafe/kitchen/tasks/ready/
+    Bulk: отметить несколько задач как готовые. Тело: {"task_ids": ["uuid", ...]}.
+    Только задачи в статусе in_progress и с cook = текущий пользователь.
+    """
+    def post(self, request):
+        company = self._user_company()
+        if not company:
+            return Response(
+                {"ok": False, "error": "У пользователя не задана компания."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+        task_ids = request.data.get("task_ids") if isinstance(request.data, dict) else None
+        if not task_ids or not isinstance(task_ids, list):
+            return Response(
+                {"ok": False, "error": "Передайте массив task_ids."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        user = request.user
+        with transaction.atomic():
+            tasks = list(
+                KitchenTask.objects.select_for_update().select_related(
+                    "order__table", "menu_item", "waiter", "cook"
+                ).filter(
+                    pk__in=task_ids,
+                    company=company,
+                    cook=user,
+                    status=KitchenTask.Status.IN_PROGRESS,
+                )
+            )
+            updated = []
+            for task in tasks:
+                _mark_task_ready(task, request)
+                updated.append(KitchenTaskSerializer(task, context={"request": request}).data)
+        return Response({"updated": updated, "count": len(updated)}, status=status.HTTP_200_OK)
+
+
 class KitchenTaskReadyView(CompanyBranchQuerysetMixin, APIView):
     """
     POST /cafe/kitchen/tasks/<uuid:pk>/ready/
@@ -1096,33 +1158,13 @@ class KitchenTaskReadyView(CompanyBranchQuerysetMixin, APIView):
         user = request.user
         with transaction.atomic():
             task = generics.get_object_or_404(
-                KitchenTask.objects.select_for_update(),
+                KitchenTask.objects.select_for_update().select_related(
+                    "order__table", "menu_item", "waiter", "cook"
+                ),
                 pk=pk, company=company, cook=user, status=KitchenTask.Status.IN_PROGRESS
             )
-            task.status = KitchenTask.Status.READY
-            task.finished_at = timezone.now()
-            task.save(update_fields=['status', 'finished_at'])
-
-            if task.waiter_id:
-                NotificationCafe.objects.create(
-                    company=task.company,
-                    branch=task.branch,
-                    recipient=task.waiter,
-                    type='kitchen_ready',
-                    message=f'Готово: {task.menu_item.title} (стол {task.order.table.number})',
-                    payload={
-                        "task_id": str(task.id),
-                        "order_id": str(task.order_id),
-                        "table": task.order.table.number,
-                        "menu_item": task.menu_item.title,
-                        "unit_index": task.unit_index,
-                    }
-                )
-
-        # Отправляем WebSocket событие о готовности блюда
-        send_kitchen_task_ready_notification(task)
-
-        return Response(KitchenTaskSerializer(task, context={'request': request}).data)
+            data = _mark_task_ready(task, request)
+        return Response(data)
 
 
 class KitchenTaskRetrieveUpdateDestroyView(CompanyBranchQuerysetMixin, generics.RetrieveUpdateDestroyAPIView):
