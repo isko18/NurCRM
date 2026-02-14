@@ -1,3 +1,5 @@
+from decimal import Decimal
+
 from rest_framework import status, filters
 from rest_framework.response import Response
 from rest_framework import generics
@@ -5,6 +7,59 @@ from django_filters.rest_framework import DjangoFilterBackend
 
 from .views import CompanyBranchRestrictedMixin
 from . import models, serializers_money, services_money
+
+
+class CashRegisterListCreateView(CompanyBranchRestrictedMixin, generics.ListCreateAPIView):
+    serializer_class = serializers_money.CashRegisterSerializer
+    queryset = models.CashRegister.objects.select_related("company", "branch").order_by("name")
+    filter_backends = [DjangoFilterBackend, filters.SearchFilter]
+    filterset_fields = ["company", "branch"]
+    search_fields = ["name", "location"]
+
+
+class CashRegisterDetailView(CompanyBranchRestrictedMixin, generics.RetrieveUpdateDestroyAPIView):
+    serializer_class = serializers_money.CashRegisterSerializer
+    queryset = models.CashRegister.objects.select_related("company", "branch")
+
+
+class CashRegisterOperationsView(CompanyBranchRestrictedMixin, generics.RetrieveAPIView):
+    """
+    Детали кассы с балансом, приходами и расходами.
+    GET /api/warehouse/cash-registers/{id}/operations/
+    """
+
+    queryset = models.CashRegister.objects.select_related("company", "branch")
+
+    def retrieve(self, request, *args, **kwargs):
+        instance = self.get_object()
+        docs = list(
+            models.MoneyDocument.objects.filter(
+                cash_register=instance,
+                status=models.MoneyDocument.Status.POSTED,
+            ).select_related("cash_register", "counterparty", "payment_category").order_by("-date")
+        )
+        receipts = []
+        expenses = []
+        receipts_sum = Decimal("0.00")
+        expenses_sum = Decimal("0.00")
+        for d in docs:
+            data = serializers_money.MoneyDocumentSerializer(d).data
+            if d.doc_type == models.MoneyDocument.DocType.MONEY_RECEIPT:
+                receipts.append(data)
+                receipts_sum += Decimal(d.amount or 0)
+            else:
+                expenses.append(data)
+                expenses_sum += Decimal(d.amount or 0)
+        balance = receipts_sum - expenses_sum
+
+        data = serializers_money.CashRegisterSerializer(instance).data
+        data["balance"] = str(balance)
+        data["receipts"] = receipts
+        data["expenses"] = expenses
+        data["receipts_total"] = str(receipts_sum)
+        data["expenses_total"] = str(expenses_sum)
+
+        return Response(data)
 
 
 class PaymentCategoryListCreateView(CompanyBranchRestrictedMixin, generics.ListCreateAPIView):
@@ -23,17 +78,17 @@ class PaymentCategoryDetailView(CompanyBranchRestrictedMixin, generics.RetrieveU
 class MoneyDocumentListCreateView(CompanyBranchRestrictedMixin, generics.ListCreateAPIView):
     serializer_class = serializers_money.MoneyDocumentSerializer
     queryset = models.MoneyDocument.objects.select_related(
-        "warehouse", "counterparty", "payment_category", "company", "branch"
+        "cash_register", "warehouse", "counterparty", "payment_category", "company", "branch"
     ).order_by("-date")
     filter_backends = [DjangoFilterBackend, filters.SearchFilter]
-    filterset_fields = ["doc_type", "status", "warehouse", "counterparty", "payment_category"]
+    filterset_fields = ["doc_type", "status", "cash_register", "warehouse", "counterparty", "payment_category"]
     search_fields = ["number", "comment", "counterparty__name"]
 
 
 class MoneyDocumentDetailView(CompanyBranchRestrictedMixin, generics.RetrieveUpdateDestroyAPIView):
     serializer_class = serializers_money.MoneyDocumentSerializer
     queryset = models.MoneyDocument.objects.select_related(
-        "warehouse", "counterparty", "payment_category", "company", "branch"
+        "cash_register", "warehouse", "counterparty", "payment_category", "company", "branch"
     )
 
 
@@ -42,7 +97,7 @@ class MoneyDocumentPostView(CompanyBranchRestrictedMixin, generics.GenericAPIVie
 
     def get_queryset(self):
         qs = models.MoneyDocument.objects.select_related(
-            "warehouse", "counterparty", "payment_category", "company", "branch"
+            "cash_register", "warehouse", "counterparty", "payment_category", "company", "branch"
         )
         return self._filter_qs_company_branch(qs)
 
@@ -60,7 +115,7 @@ class MoneyDocumentUnpostView(CompanyBranchRestrictedMixin, generics.GenericAPIV
 
     def get_queryset(self):
         qs = models.MoneyDocument.objects.select_related(
-            "warehouse", "counterparty", "payment_category", "company", "branch"
+            "cash_register", "warehouse", "counterparty", "payment_category", "company", "branch"
         )
         return self._filter_qs_company_branch(qs)
 
@@ -80,13 +135,13 @@ class CounterpartyMoneyOperationsView(CompanyBranchRestrictedMixin, generics.Lis
 
     serializer_class = serializers_money.MoneyDocumentSerializer
     filter_backends = [DjangoFilterBackend, filters.SearchFilter]
-    filterset_fields = ["doc_type", "status", "warehouse", "payment_category"]
+    filterset_fields = ["doc_type", "status", "cash_register", "warehouse", "payment_category"]
     search_fields = ["number", "comment"]
 
     def get_queryset(self):
         counterparty_id = self.kwargs.get("counterparty_id")
         qs = models.MoneyDocument.objects.select_related(
-            "warehouse", "counterparty", "payment_category", "company", "branch"
+            "cash_register", "warehouse", "counterparty", "payment_category", "company", "branch"
         ).filter(counterparty_id=counterparty_id).order_by("-date")
         return self._filter_qs_company_branch(qs)
 

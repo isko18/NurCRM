@@ -1297,8 +1297,31 @@ class StockMove(models.Model):
 
 
 # -----------------------
-# Money documents
+# Cash register (касса) and money documents
 # -----------------------
+
+
+class CashRegister(BaseModelId, BaseModelCompanyBranch):
+    """
+    Касса — место учёта наличных. Сюда попадают приходы и расходы (MoneyDocument).
+    """
+
+    name = models.CharField(max_length=128, verbose_name="Название")
+    location = models.TextField(blank=True, verbose_name="Расположение")
+
+    class Meta:
+        verbose_name = "Касса"
+        verbose_name_plural = "Кассы"
+        indexes = [
+            models.Index(fields=["company", "branch"]),
+        ]
+
+    def __str__(self):
+        return self.name or str(self.id)
+
+    def clean(self):
+        if self.branch_id and self.branch.company_id != self.company_id:
+            raise ValidationError({"branch": "Филиал принадлежит другой компании."})
 
 
 class PaymentCategory(BaseModelId, BaseModelCompanyBranch):
@@ -1338,9 +1361,9 @@ class PaymentCategory(BaseModelId, BaseModelCompanyBranch):
 
 class MoneyDocument(BaseModelCompanyBranch):
     """
-    Денежные документы:
-    - MONEY_RECEIPT: получаем деньги от контрагента
-    - MONEY_EXPENSE: отправляем деньги контрагенту
+    Денежные документы (приходы и расходы по кассе):
+    - MONEY_RECEIPT: приход денег в кассу от контрагента
+    - MONEY_EXPENSE: расход денег из кассы контрагенту
 
     В отличие от товарных документов, здесь нет items и нет StockMove.
     """
@@ -1359,13 +1382,22 @@ class MoneyDocument(BaseModelCompanyBranch):
     number = models.CharField(max_length=64, unique=True, null=True, blank=True, verbose_name="Номер")
     date = models.DateTimeField(auto_now_add=True, verbose_name="Дата")
 
+    cash_register = models.ForeignKey(
+        "warehouse.CashRegister",
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name="money_documents",
+        verbose_name="Касса",
+    )
+
     warehouse = models.ForeignKey(
         "warehouse.Warehouse",
         on_delete=models.SET_NULL,
         null=True,
         blank=True,
         related_name="money_documents",
-        verbose_name="Счёт (склад)",
+        verbose_name="Счёт (склад, устаревшее)",
     )
 
     counterparty = models.ForeignKey(
@@ -1398,6 +1430,7 @@ class MoneyDocument(BaseModelCompanyBranch):
         indexes = [
             models.Index(fields=["doc_type", "status", "date"]),
             models.Index(fields=["counterparty", "date"]),
+            models.Index(fields=["cash_register", "date"]),
             models.Index(fields=["warehouse", "date"]),
             models.Index(fields=["payment_category", "date"]),
         ]
@@ -1407,9 +1440,11 @@ class MoneyDocument(BaseModelCompanyBranch):
 
     def clean(self):
         super().clean()
-        # warehouse is required for both money operations (account)
-        if not self.warehouse_id:
-            raise ValidationError({"warehouse": "Укажите счёт (склад)."})
+        # cash_register is required for money operations (касса)
+        if not self.cash_register_id and not self.warehouse_id:
+            raise ValidationError({"cash_register": "Укажите кассу."})
+        if self.cash_register_id and self.company_id and self.cash_register.company_id != self.company_id:
+            raise ValidationError({"cash_register": "Касса принадлежит другой компании."})
 
         if self.doc_type in (self.DocType.MONEY_RECEIPT, self.DocType.MONEY_EXPENSE):
             if not self.counterparty_id:
@@ -1420,7 +1455,6 @@ class MoneyDocument(BaseModelCompanyBranch):
         if self.amount is None or Decimal(self.amount) <= 0:
             raise ValidationError({"amount": "Сумма должна быть больше 0."})
 
-        # company/branch consistency (based on warehouse)
         if self.company_id and self.branch_id and self.branch.company_id != self.company_id:
             raise ValidationError({"branch": "Филиал принадлежит другой компании."})
 

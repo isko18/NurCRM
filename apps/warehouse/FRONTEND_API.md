@@ -483,7 +483,39 @@ Read-only поля:
 - для “штучных” товаров количество (`qty`) должно быть целым (сервер проверяет; фронту лучше валидировать заранее).
 - если в документе указан `agent`, операции идут по остаткам агента (склад не меняется).
 
-## 5) Денежные документы (приход/расход денег)
+## 5) Касса и денежные документы (приход/расход)
+
+### 5.0 Касса (cash register)
+В кассу попадают приходы и расходы денег.
+
+- `GET/POST /api/warehouse/cash-registers/` — список касс / создать кассу
+- `GET/PATCH/PUT/DELETE /api/warehouse/cash-registers/{id}/` — детали кассы
+- `GET /api/warehouse/cash-registers/{id}/operations/` — касса с балансом, приходами и расходами
+
+Формат кассы:
+```json
+{ "id": "uuid", "company": "uuid", "branch": "uuid|null", "name": "string", "location": "string" }
+```
+
+Ответ `operations/`:
+```json
+{
+  "id": "uuid",
+  "name": "Основная касса",
+  "company": "uuid",
+  "branch": "uuid|null",
+  "location": "",
+  "balance": "1500.00",
+  "receipts_total": "5000.00",
+  "expenses_total": "3500.00",
+  "receipts": [ /* массив денежных документов MONEY_RECEIPT */ ],
+  "expenses": [ /* массив денежных документов MONEY_EXPENSE */ ]
+}
+```
+
+- `balance` = приходы − расходы по проведённым документам
+- `receipts` — приходы (MONEY_RECEIPT)
+- `expenses` — расходы (MONEY_EXPENSE)
 
 ### 5.1 Категории платежей
 - `GET/POST /api/warehouse/money/categories/`
@@ -521,7 +553,9 @@ Read-only поля:
   "status": "DRAFT|POSTED",
   "number": "MONEY_RECEIPT-20260201-0001|null",
   "date": "2026-02-01T12:00:00Z",
-  "warehouse": "uuid",
+  "cash_register": "uuid",
+  "cash_register_name": "string|null",
+  "warehouse": "uuid|null",
   "warehouse_name": "string|null",
   "counterparty": "uuid",
   "counterparty_display_name": "string|null",
@@ -542,14 +576,16 @@ Read-only поля:
 - денежные документы **не создают** складских движений по товарам и **не меняют** остатки.
 
 Фильтры/поиск:
-- фильтры: `doc_type`, `status`, `warehouse`, `counterparty`, `payment_category`
+- фильтры: `doc_type`, `status`, `cash_register`, `warehouse`, `counterparty`, `payment_category`
 - поиск: `?search=...` (по `number`, `comment`, `counterparty__name`)
+
+**Важно:** при создании денежного документа укажите `cash_register` — кассу, в которую попадает приход или расход.
 
 ### 5.3 Денежные операции по контрагенту
 - `GET /api/warehouse/money/counterparties/{counterparty_id}/operations/`
 
 Работает как список money-документов по одному контрагенту + фильтры/поиск:
-- фильтры: `doc_type`, `status`, `warehouse`, `payment_category`
+- фильтры: `doc_type`, `status`, `cash_register`, `warehouse`, `payment_category`
 - поиск: `?search=...` (по `number`, `comment`)
 
 ## 6) Агенты: заявки и остатки
