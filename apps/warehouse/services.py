@@ -152,12 +152,14 @@ def post_document(document: models.Document, allow_negative: bool = None) -> mod
                         f"Недостаточно у агента для товара '{product_display}'. Доступно: {cur}, требуется: {abs(delta)}"
                     )
 
+                move_kind = models.AgentStockMove.MoveKind.RECEIPT if delta > 0 else models.AgentStockMove.MoveKind.EXPENSE
                 mv = models.AgentStockMove.objects.create(
                     document=document,
                     agent_id=document.agent_id,
                     warehouse=document.warehouse_from,
                     product=item.product,
                     qty_delta=delta,
+                    move_kind=move_kind,
                 )
                 _apply_agent_move(mv)
 
@@ -247,20 +249,22 @@ def post_document(document: models.Document, allow_negative: bool = None) -> mod
                         warehouse_name = document.warehouse_from.name if document.warehouse_from else "не указан"
                         raise ValueError(f"Недостаточно товара '{product_display}' на складе '{warehouse_name}'. Доступно: {cur_from}, требуется: {qty_to_move}")
                 
-                # from
+                # from — расход со склада-источника
                 mv1 = models.StockMove.objects.create(
                     document=document,
                     warehouse=document.warehouse_from,
                     product=item.product,
                     qty_delta=-(item.qty),
+                    move_kind=models.StockMove.MoveKind.EXPENSE,
                 )
-                # to (product in destination warehouse)
+                # to — приход на склад-приёмник (product in destination warehouse)
                 dest_product = _get_or_create_transfer_product(item.product, document.warehouse_to)
                 mv2 = models.StockMove.objects.create(
                     document=document,
                     warehouse=document.warehouse_to,
                     product=dest_product,
                     qty_delta=(item.qty),
+                    move_kind=models.StockMove.MoveKind.RECEIPT,
                 )
                 # apply moves
                 _apply_move(mv1)
@@ -291,11 +295,13 @@ def post_document(document: models.Document, allow_negative: bool = None) -> mod
                         product_display = f"ID {item.product_id}"
                     warehouse_name = document.warehouse_from.name if document.warehouse_from else "не указан"
                     raise ValueError(f"Инвентаризация приведет к отрицательному остатку для товара '{product_display}' на складе '{warehouse_name}'. Текущий остаток: {cur}, устанавливается: {item.qty}")
+                move_kind = models.StockMove.MoveKind.RECEIPT if delta > 0 else models.StockMove.MoveKind.EXPENSE
                 mv = models.StockMove.objects.create(
                     document=document,
                     warehouse=document.warehouse_from,
                     product=item.product,
                     qty_delta=delta,
+                    move_kind=move_kind,
                 )
                 _apply_move(mv)
 
@@ -335,11 +341,13 @@ def post_document(document: models.Document, allow_negative: bool = None) -> mod
                             product_display = f"ID {item.product_id}"
                         warehouse_name = document.warehouse_from.name if document.warehouse_from else "не указан"
                         raise ValueError(f"Недостаточно товара '{product_display}' на складе '{warehouse_name}'. Доступно: {cur}, требуется: {abs(delta)}")
+                move_kind = models.StockMove.MoveKind.RECEIPT if delta > 0 else models.StockMove.MoveKind.EXPENSE
                 mv = models.StockMove.objects.create(
                     document=document,
                     warehouse=document.warehouse_from,
                     product=item.product,
                     qty_delta=delta,
+                    move_kind=move_kind,
                 )
                 _apply_move(mv)
 

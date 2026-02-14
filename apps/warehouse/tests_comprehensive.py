@@ -944,7 +944,8 @@ class WarehouseComprehensiveTests(TestCase):
             document=doc,
             warehouse=self.wh1,
             product=self.prod1,
-            qty_delta=Decimal("30.000")
+            qty_delta=Decimal("30.000"),
+            move_kind=models.StockMove.MoveKind.RECEIPT,
         )
         models.StockBalance.objects.create(
             warehouse=self.wh1,

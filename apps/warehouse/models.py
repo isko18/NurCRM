@@ -768,18 +768,32 @@ class AgentStockBalance(BaseModelId, BaseModelCompanyBranch):
 
 
 class AgentStockMove(models.Model):
+    """Движение товара у агента. Каждое движение — приход или расход."""
+
+    class MoveKind(models.TextChoices):
+        RECEIPT = "RECEIPT", "Приход"
+        EXPENSE = "EXPENSE", "Расход"
+
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     document = models.ForeignKey("warehouse.Document", on_delete=models.CASCADE, related_name="agent_moves", verbose_name="Документ")
     agent = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="warehouse_agent_moves")
     warehouse = models.ForeignKey("warehouse.Warehouse", on_delete=models.CASCADE, verbose_name="Склад")
     product = models.ForeignKey("warehouse.WarehouseProduct", on_delete=models.CASCADE, verbose_name="Товар")
     qty_delta = models.DecimalField(max_digits=18, decimal_places=3, verbose_name="Изменение количества")
+    move_kind = models.CharField(
+        max_length=16,
+        choices=MoveKind.choices,
+        verbose_name="Вид движения",
+    )
     created_at = models.DateTimeField(auto_now_add=True, verbose_name="Дата создания")
 
     class Meta:
         verbose_name = "Движение товара у агента"
         verbose_name_plural = "Движения товаров у агентов"
-        indexes = [models.Index(fields=["agent", "warehouse", "product", "created_at"])]
+        indexes = [
+            models.Index(fields=["agent", "warehouse", "product", "created_at"]),
+            models.Index(fields=["document", "move_kind"]),
+        ]
 
     def __str__(self):
         return f"AgentMove {self.document.number} {self.product} {self.qty_delta} @ {self.agent_id}"
@@ -1251,17 +1265,32 @@ class AgentRequestItem(BaseModelId, BaseModelDate, BaseModelCompanyBranch):
 
 
 class StockMove(models.Model):
+    """Движение товара. Каждое движение — приход или расход."""
+
+    class MoveKind(models.TextChoices):
+        RECEIPT = "RECEIPT", "Приход"
+        EXPENSE = "EXPENSE", "Расход"
+
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     document = models.ForeignKey(Document, on_delete=models.CASCADE, related_name="moves", verbose_name="Документ")
     warehouse = models.ForeignKey("warehouse.Warehouse", on_delete=models.CASCADE, verbose_name="Склад")
     product = models.ForeignKey("warehouse.WarehouseProduct", on_delete=models.CASCADE, verbose_name="Товар")
     qty_delta = models.DecimalField(max_digits=18, decimal_places=3, verbose_name="Изменение количества")
+    move_kind = models.CharField(
+        max_length=16,
+        choices=MoveKind.choices,
+        verbose_name="Вид движения",
+        help_text="Приход (увеличение остатка) или Расход (уменьшение остатка)",
+    )
     created_at = models.DateTimeField(auto_now_add=True, verbose_name="Дата создания")
 
     class Meta:
         verbose_name = "Движение товара"
         verbose_name_plural = "Движения товаров"
-        indexes = [models.Index(fields=["warehouse", "product", "created_at"])]
+        indexes = [
+            models.Index(fields=["warehouse", "product", "created_at"]),
+            models.Index(fields=["document", "move_kind"]),
+        ]
 
     def __str__(self):
         return f"Move {self.document.number} {self.product} {self.qty_delta} @ {self.warehouse}"
