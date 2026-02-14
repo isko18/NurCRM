@@ -41,6 +41,13 @@ class WarehouseProductGroupAdmin(admin.ModelAdmin):
     raw_id_fields = ("warehouse", "parent")
 
 
+@admin.register(models.CashRegister)
+class CashRegisterAdmin(admin.ModelAdmin):
+    list_display = ("name", "company", "branch", "location")
+    list_filter = ("company", "branch")
+    search_fields = ("name",)
+
+
 @admin.register(models.PaymentCategory)
 class PaymentCategoryAdmin(admin.ModelAdmin):
 	list_display = ("title", "company", "branch")
@@ -50,6 +57,6 @@ class PaymentCategoryAdmin(admin.ModelAdmin):
 
 @admin.register(models.MoneyDocument)
 class MoneyDocumentAdmin(admin.ModelAdmin):
-	list_display = ("number", "doc_type", "status", "date", "warehouse", "counterparty", "payment_category", "amount")
-	list_filter = ("doc_type", "status", "company", "branch", "warehouse", "payment_category")
-	search_fields = ("number", "comment", "counterparty__name")
+    list_display = ("number", "doc_type", "status", "date", "cash_register", "warehouse", "counterparty", "payment_category", "amount")
+    list_filter = ("doc_type", "status", "company", "branch", "cash_register", "warehouse", "payment_category")
+    search_fields = ("number", "comment", "counterparty__name")

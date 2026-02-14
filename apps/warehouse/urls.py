@@ -33,8 +33,15 @@ from .views_documents import (
     DocumentWriteOffListCreateView, DocumentTransferListCreateView,
 )
 from .views_money import (
-    PaymentCategoryListCreateView, PaymentCategoryDetailView,
-    MoneyDocumentListCreateView, MoneyDocumentDetailView, MoneyDocumentPostView, MoneyDocumentUnpostView,
+    CashRegisterListCreateView,
+    CashRegisterDetailView,
+    CashRegisterOperationsView,
+    PaymentCategoryListCreateView,
+    PaymentCategoryDetailView,
+    MoneyDocumentListCreateView,
+    MoneyDocumentDetailView,
+    MoneyDocumentPostView,
+    MoneyDocumentUnpostView,
     CounterpartyMoneyOperationsView,
 )
 from .views_reconciliation import (
@@ -146,6 +153,11 @@ urlpatterns += [
 ]
 
 urlpatterns += [
+    # cash registers (касса)
+    path("cash-registers/", CashRegisterListCreateView.as_view(), name="cash-registers"),
+    path("cash-registers/<uuid:pk>/", CashRegisterDetailView.as_view(), name="cash-register-detail"),
+    path("cash-registers/<uuid:pk>/operations/", CashRegisterOperationsView.as_view(), name="cash-register-operations"),
+
     # money categories
     path("money/categories/", PaymentCategoryListCreateView.as_view(), name="money-categories"),
     path("money/categories/<uuid:pk>/", PaymentCategoryDetailView.as_view(), name="money-category-detail"),

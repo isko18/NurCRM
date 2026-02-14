@@ -4,6 +4,24 @@ from django.core.exceptions import ValidationError as DjangoValidationError
 from . import models
 
 
+class CashRegisterSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = models.CashRegister
+        fields = ("id", "company", "branch", "name", "location")
+        read_only_fields = ("id",)
+
+
+class CashRegisterDetailSerializer(CashRegisterSerializer):
+    """Касса с балансом, приходами и расходами."""
+
+    balance = serializers.DecimalField(max_digits=18, decimal_places=2, read_only=True)
+    receipts = serializers.ListField(read_only=True)
+    expenses = serializers.ListField(read_only=True)
+
+    class Meta(CashRegisterSerializer.Meta):
+        fields = CashRegisterSerializer.Meta.fields + ("balance", "receipts", "expenses")
+
+
 class PaymentCategorySerializer(serializers.ModelSerializer):
     company = serializers.ReadOnlyField(source="company.id")
     branch = serializers.ReadOnlyField(source="branch.id")
@@ -31,6 +49,11 @@ class MoneyDocumentSerializer(serializers.ModelSerializer):
         allow_null=True,
     )
 
+    cash_register_name = serializers.CharField(
+        source="cash_register.name",
+        read_only=True,
+        allow_null=True,
+    )
     warehouse_name = serializers.CharField(
         source="warehouse.name",
         read_only=True,
@@ -47,6 +70,8 @@ class MoneyDocumentSerializer(serializers.ModelSerializer):
             "status",
             "number",
             "date",
+            "cash_register",
+            "cash_register_name",
             "warehouse",
             "warehouse_name",
             "counterparty",
@@ -75,4 +100,11 @@ class MoneyDocumentSerializer(serializers.ModelSerializer):
         except DjangoValidationError as e:
             raise serializers.ValidationError(getattr(e, "message_dict", {"detail": str(e)}))
         return attrs
+
+    def create(self, validated_data):
+        cash_register = validated_data.get("cash_register")
+        if cash_register:
+            validated_data.setdefault("company", cash_register.company)
+            validated_data.setdefault("branch", cash_register.branch)
+        return super().create(validated_data)
 
