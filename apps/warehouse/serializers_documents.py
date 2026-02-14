@@ -4,6 +4,29 @@ from django.core.exceptions import ValidationError as DjangoValidationError
 from . import models
 
 
+class StockMoveSerializer(serializers.ModelSerializer):
+    """Сериализатор движения товара с видом: приход или расход."""
+
+    warehouse_name = serializers.CharField(source="warehouse.name", read_only=True)
+    product_name = serializers.CharField(source="product.name", read_only=True)
+    product_article = serializers.CharField(source="product.article", read_only=True)
+
+    class Meta:
+        model = models.StockMove
+        fields = (
+            "id",
+            "document",
+            "warehouse",
+            "warehouse_name",
+            "product",
+            "product_name",
+            "product_article",
+            "qty_delta",
+            "move_kind",
+            "created_at",
+        )
+
+
 class DocumentItemSerializer(serializers.ModelSerializer):
     product_name = serializers.CharField(source="product.name", read_only=True, allow_null=True)
     product_article = serializers.CharField(source="product.article", read_only=True, allow_null=True)
@@ -25,6 +48,10 @@ class DocumentItemSerializer(serializers.ModelSerializer):
 
 class DocumentSerializer(serializers.ModelSerializer):
     items = DocumentItemSerializer(many=True)
+    moves = StockMoveSerializer(many=True, read_only=True)
+    receipts = serializers.SerializerMethodField()
+    expenses = serializers.SerializerMethodField()
+
     counterparty_display_name = serializers.CharField(
         source="counterparty.name", read_only=True, allow_null=True
     )
@@ -58,7 +85,28 @@ class DocumentSerializer(serializers.ModelSerializer):
             "discount_amount",
             "total",
             "items",
+            "moves",
+            "receipts",
+            "expenses",
         )
+
+    def get_receipts(self, obj):
+        """Приходы — движения с move_kind=RECEIPT."""
+        moves = getattr(obj, "_receipts_moves", None)
+        if moves is None and hasattr(obj, "moves"):
+            moves = [m for m in obj.moves.all() if m.move_kind == models.StockMove.MoveKind.RECEIPT]
+        if moves is None:
+            return []
+        return StockMoveSerializer(moves, many=True).data
+
+    def get_expenses(self, obj):
+        """Расходы — движения с move_kind=EXPENSE."""
+        moves = getattr(obj, "_expenses_moves", None)
+        if moves is None and hasattr(obj, "moves"):
+            moves = [m for m in obj.moves.all() if m.move_kind == models.StockMove.MoveKind.EXPENSE]
+        if moves is None:
+            return []
+        return StockMoveSerializer(moves, many=True).data
         read_only_fields = ("number", "total", "status", "date")
 
     def create(self, validated_data):

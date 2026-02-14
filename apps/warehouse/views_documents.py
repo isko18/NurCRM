@@ -38,7 +38,11 @@ class DocumentListCreateView(CompanyBranchRestrictedMixin, generics.ListCreateAP
         # Оптимизация: предзагружаем связанные объекты
         qs = models.Document.objects.select_related(
             "warehouse_from", "warehouse_to", "counterparty"
-        ).prefetch_related("items__product").order_by("-date")
+        ).prefetch_related(
+            "items__product",
+            "moves__warehouse",
+            "moves__product",
+        ).order_by("-date")
         qs = self._filter_company_branch(qs)
         user = self.request.user
         if not _is_owner_like(user):
@@ -144,7 +148,13 @@ class DocumentDetailView(CompanyBranchRestrictedMixin, generics.RetrieveUpdateDe
         # Оптимизация: предзагружаем связанные объекты
         qs = models.Document.objects.select_related(
             "warehouse_from", "warehouse_to", "counterparty"
-        ).prefetch_related("items__product", "items__product__brand", "items__product__category")
+        ).prefetch_related(
+            "items__product",
+            "items__product__brand",
+            "items__product__category",
+            "moves__warehouse",
+            "moves__product",
+        )
         qs = DocumentListCreateView._filter_company_branch(self, qs)
         user = self.request.user
         if not _is_owner_like(user):

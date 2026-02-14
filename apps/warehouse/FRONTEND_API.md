@@ -384,21 +384,32 @@
   "discount_percent": "0.00",
   "discount_amount": "0.00",
   "total": "0.00",
-  "items": [
+  "items": [...],
+  "moves": [
     {
       "id": "uuid",
+      "document": "uuid",
+      "warehouse": "uuid",
+      "warehouse_name": "string",
       "product": "uuid",
-      "product_name": "string|null",
+      "product_name": "string",
       "product_article": "string|null",
-      "qty": "1.000",
-      "price": "150.00",
-      "discount_percent": "0.00",
-      "discount_amount": "0.00",
-      "line_total": "150.00"
+      "qty_delta": "1.000|-1.000",
+      "move_kind": "RECEIPT|EXPENSE",
+      "created_at": "2026-02-01T12:00:00Z"
     }
-  ]
+  ],
+  "receipts": [...],
+  "expenses": [...]
 }
 ```
+
+**Приходы и расходы:**
+- `moves` — все движения товара по документу (создаются при проведении).
+- `move_kind`: `RECEIPT` — приход (увеличение остатка), `EXPENSE` — расход (уменьшение остатка).
+- `receipts` — подмножество moves с `move_kind=RECEIPT`.
+- `expenses` — подмножество moves с `move_kind=EXPENSE`.
+- Документ TRANSFER содержит и приходы (на склад-приёмник), и расходы (со склада-источника). SALE — только расходы, PURCHASE/RECEIPT — только приходы.
 
 Read-only поля:
 - `number`, `total`, `status`, `date`
