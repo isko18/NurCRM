@@ -330,16 +330,17 @@ class KitchenTaskAdmin(admin.ModelAdmin):
             ready_count += 1
 
             if task.waiter_id:
+                table_num = task.order.table.number if task.order.table_id else None
                 notifications.append(NotificationCafe(
                     company=task.company,
                     branch=task.branch,
                     recipient=task.waiter,
                     type='kitchen_ready',
-                    message=f'Готово: {task.menu_item.title} (стол {task.order.table.number})',
+                    message=f'Готово: {task.menu_item.title} (стол {table_num or "—"})',
                     payload={
                         "task_id": str(task.id),
                         "order_id": str(task.order_id),
-                        "table": task.order.table.number,
+                        "table": table_num,
                         "menu_item": task.menu_item.title,
                         "unit_index": task.unit_index,
                     }
