@@ -1146,16 +1146,17 @@ def _mark_task_ready(task, request):
     task.finished_at = timezone.now()
     task.save(update_fields=["status", "finished_at"])
     if task.waiter_id:
+        table_num = task.order.table.number if task.order_id and task.order.table_id else None
         NotificationCafe.objects.create(
             company=task.company,
             branch=task.branch,
             recipient=task.waiter,
             type="kitchen_ready",
-            message=f"Готово: {task.menu_item.title} (стол {task.order.table.number})",
+            message=f"Готово: {task.menu_item.title} (стол {table_num or '—'})",
             payload={
                 "task_id": str(task.id),
                 "order_id": str(task.order_id),
-                "table": task.order.table.number,
+                "table": table_num,
                 "menu_item": task.menu_item.title,
                 "unit_index": task.unit_index,
             },
@@ -1263,16 +1264,17 @@ class KitchenTaskRetrieveUpdateDestroyView(CompanyBranchQuerysetMixin, generics.
         
         # Отправляем уведомление официанту при переходе в READY
         if new_status == KitchenTask.Status.READY and old_status != new_status and task.waiter_id:
+            table_num = task.order.table.number if task.order_id and task.order.table_id else None
             NotificationCafe.objects.create(
                 company=task.company,
                 branch=task.branch,
                 recipient=task.waiter,
                 type='kitchen_ready',
-                message=f'Готово: {task.menu_item.title} (стол {task.order.table.number})',
+                message=f'Готово: {task.menu_item.title} (стол {table_num or "—"})',
                 payload={
                     "task_id": str(task.id),
                     "order_id": str(task.order_id),
-                    "table": task.order.table.number,
+                    "table": table_num,
                     "menu_item": task.menu_item.title,
                     "unit_index": task.unit_index,
                 }

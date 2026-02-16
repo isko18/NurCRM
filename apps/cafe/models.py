@@ -139,7 +139,8 @@ class KitchenTask(models.Model):
             raise ValidationError('order_item не соответствует order/menu_item.')
 
     def __str__(self):
-        return f'[{self.get_status_display()}] {self.menu_item.title} (стол {self.order.table.number})'
+        table_info = f"стол {self.order.table.number}" if self.order.table_id else "без стола"
+        return f'[{self.get_status_display()}] {self.menu_item.title} ({table_info})'
 
 
 class NotificationCafe(models.Model):
@@ -709,7 +710,12 @@ class Order(models.Model):
         OPEN = "open", "Открыт"
         CLOSED = "closed", "Закрыт"
         CANCELLED = "cancelled", "Отменен"
-        
+
+    class PaymentMethod(models.TextChoices):
+        CASH = "cash", "Наличные"
+        CARD = "card", "Безналичный (карта)"
+        TRANSFER = "transfer", "Безналичный (перевод)"
+
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     company = models.ForeignKey(
         Company, on_delete=models.CASCADE, related_name='cafe_orders', verbose_name='Компания'
@@ -719,7 +725,8 @@ class Order(models.Model):
         verbose_name='Филиал', null=True, blank=True, db_index=True
     )
     table = models.ForeignKey(
-        Table, on_delete=models.PROTECT, related_name='orders', verbose_name='Стол'
+        Table, on_delete=models.PROTECT, related_name='orders', verbose_name='Стол',
+        null=True, blank=True,
     )
     client = models.ForeignKey(
         CafeClient, on_delete=models.SET_NULL,
@@ -737,7 +744,13 @@ class Order(models.Model):
 
     is_paid = models.BooleanField("Оплачен", default=False, db_index=True)
     paid_at = models.DateTimeField("Оплачен в", null=True, blank=True)
-    payment_method = models.CharField("Способ оплаты", max_length=32, blank=True, default="")
+    payment_method = models.CharField(
+        "Способ оплаты (нал/безнал)",
+        max_length=32,
+        blank=True,
+        default="",
+        choices=PaymentMethod.choices,
+    )
 
     total_amount = models.DecimalField("Сумма", max_digits=12, decimal_places=2, default=Decimal("0"))
     discount_amount = models.DecimalField("Скидка", max_digits=12, decimal_places=2, default=Decimal("0"))
@@ -755,7 +768,7 @@ class Order(models.Model):
         ]
 
     def __str__(self):
-        return f'Order {str(self.id)[:8]} — {self.table}'
+        return f'Order {str(self.id)[:8]} — {self.table or "—"}'
     
     def recalc_total(self):
         total = Decimal("0")

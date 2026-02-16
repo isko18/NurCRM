@@ -132,7 +132,7 @@ def _scope_queryset_by_context(qs, serializer: CompanyBranchReadOnlyMixin):
 
 
 class KitchenTaskSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
-    table_number = serializers.IntegerField(source='order.table.number', read_only=True)
+    table_number = serializers.SerializerMethodField()
     guest = serializers.SerializerMethodField()
     waiter_label = serializers.SerializerMethodField()
     menu_item_title = serializers.CharField(source='menu_item.title', read_only=True)
@@ -152,6 +152,9 @@ class KitchenTaskSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSeriali
             'order', 'order_item', 'menu_item', 'table_number', 'guest',
             'waiter', 'waiter_label', 'menu_item_title', 'price'
         ]
+
+    def get_table_number(self, obj):
+        return obj.order.table.number if obj.order_id and obj.order.table_id else None
 
     def get_guest(self, obj):
         return getattr(obj.order, 'client', None) and (obj.order.client.name or obj.order.client.phone) or ''
@@ -597,11 +600,14 @@ class OrderItemInlineSerializer(serializers.ModelSerializer):
 
 
 class OrderBriefSerializer(serializers.ModelSerializer):
-    table_number = serializers.IntegerField(source="table.number", read_only=True)
+    table_number = serializers.SerializerMethodField()
 
     class Meta:
         model = Order
         fields = ["id", "table_number", "guests", "waiter", "created_at"]
+
+    def get_table_number(self, obj):
+        return obj.table.number if obj.table_id else None
 
 
 class OrderItemHistorySerializer(serializers.ModelSerializer):
@@ -642,7 +648,9 @@ class CafeClientSerializer(CompanyBranchReadOnlyMixin):
 
 
 class OrderSerializer(CompanyBranchReadOnlyMixin):
-    table = serializers.PrimaryKeyRelatedField(queryset=Table.objects.all())
+    table = serializers.PrimaryKeyRelatedField(
+        queryset=Table.objects.all(), required=False, allow_null=True
+    )
     client = serializers.PrimaryKeyRelatedField(queryset=CafeClient.objects.all(), required=False, allow_null=True)
     waiter = serializers.PrimaryKeyRelatedField(queryset=User.objects.all(), allow_null=True, required=False)
     items = OrderItemInlineSerializer(many=True, required=False)
@@ -655,7 +663,7 @@ class OrderSerializer(CompanyBranchReadOnlyMixin):
         "status","is_paid","paid_at","payment_method","total_amount","discount_amount",
         "items"
         ]
-        read_only_fields = ["is_paid","paid_at","payment_method","total_amount","discount_amount"]
+        read_only_fields = ["is_paid","paid_at","payment_method","total_amount"]
 
     def get_fields(self):
         fields = super().get_fields()
@@ -687,6 +695,10 @@ class OrderSerializer(CompanyBranchReadOnlyMixin):
                 raise serializers.ValidationError({"table": "Стол другого филиала."})
             if client and client.branch_id not in (None, tb_id):
                 raise serializers.ValidationError({"client": "Клиент другого филиала."})
+
+        discount = attrs.get("discount_amount")
+        if discount is not None and discount < 0:
+            raise serializers.ValidationError({"discount_amount": "Скидка не может быть отрицательной."})
         return attrs
 
     def _upsert_items(self, order, items):
@@ -805,12 +817,21 @@ class OrderSerializer(CompanyBranchReadOnlyMixin):
     
 
 class OrderPaySerializer(serializers.Serializer):
+    """Оплата заказа: способ оплаты (нал/безнал), скидка, закрыть заказ."""
     payment_method = serializers.ChoiceField(
-        choices=[("cash", "cash"), ("card", "card"), ("transfer", "transfer")],
+        choices=[
+            ("cash", "Наличные"),
+            ("card", "Безналичный (карта)"),
+            ("transfer", "Безналичный (перевод)"),
+        ],
         required=False,
         default="cash",
+        help_text="Способ оплаты: cash — наличные, card/transfer — безнал. Обязательно указывать при оплате.",
     )
-    discount_amount = serializers.DecimalField(max_digits=12, decimal_places=2, required=False, default=Decimal("0"))
+    discount_amount = serializers.DecimalField(
+        max_digits=12, decimal_places=2, required=False, default=Decimal("0"),
+        help_text="Скидка на заказ (можно задать также при создании/редактировании заказа).",
+    )
     close_order = serializers.BooleanField(required=False, default=True)
 
     def validate_discount_amount(self, v):
