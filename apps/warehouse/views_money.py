@@ -3,6 +3,7 @@ from decimal import Decimal
 from rest_framework import status, filters
 from rest_framework.response import Response
 from rest_framework import generics
+from rest_framework.exceptions import ValidationError
 from django_filters.rest_framework import DjangoFilterBackend
 
 from .views import CompanyBranchRestrictedMixin
@@ -15,6 +16,14 @@ class CashRegisterListCreateView(CompanyBranchRestrictedMixin, generics.ListCrea
     filter_backends = [DjangoFilterBackend, filters.SearchFilter]
     filterset_fields = ["company", "branch"]
     search_fields = ["name", "location"]
+
+    def perform_create(self, serializer):
+        company = self._company()
+        branch = self._auto_branch()
+        if not company:
+            # на всякий случай (не должно происходить при IsAuthenticated)
+            raise ValidationError({"company": "Обязательное поле."})
+        serializer.save(company=company, branch=branch)
 
 
 class CashRegisterDetailView(CompanyBranchRestrictedMixin, generics.RetrieveUpdateDestroyAPIView):
