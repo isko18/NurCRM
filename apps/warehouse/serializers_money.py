@@ -5,10 +5,13 @@ from . import models
 
 
 class CashRegisterSerializer(serializers.ModelSerializer):
+    company = serializers.ReadOnlyField(source="company.id")
+    branch = serializers.ReadOnlyField(source="branch.id")
+
     class Meta:
         model = models.CashRegister
         fields = ("id", "company", "branch", "name", "location")
-        read_only_fields = ("id",)
+        read_only_fields = ("id", "company", "branch")
 
 
 class CashRegisterDetailSerializer(CashRegisterSerializer):

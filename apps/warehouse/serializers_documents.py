@@ -208,3 +208,4 @@ class CounterpartySerializer(serializers.ModelSerializer):
     class Meta:
         model = models.Counterparty
         fields = ("id", "name", "type", "company", "branch", "agent")
+        read_only_fields = ("id", "company", "branch", "agent")
