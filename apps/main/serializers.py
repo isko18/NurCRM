@@ -16,7 +16,9 @@ from apps.main.models import (
     TransactionRecord, DealInstallment, ContractorWork, Debt, DebtPayment,
     Sale,
     ObjectItem, ObjectSale, ObjectSaleItem, ItemMake, ManufactureSubreal, Acceptance,
-    ReturnFromAgent, ProductImage, PromoRule, AgentRequestCart, AgentRequestItem, ProductPackage, ProductCharacteristics, DealPayment, AgentSaleAllocation
+    ReturnFromAgent, ProductImage, PromoRule, AgentRequestCart, AgentRequestItem,
+    ProductPackage, ProductCharacteristics, DealPayment, AgentSaleAllocation,
+    ProductRecipeItem,
 )
 
 from apps.consalting.models import ServicesConsalting
@@ -538,6 +540,25 @@ class ProductPackageSerializer(serializers.ModelSerializer):
         read_only_fields = ["id"]
 
 
+class RecipeItemSerializer(serializers.Serializer):
+    """Read/write сериализатор для одной позиции рецепта."""
+    id = serializers.CharField(help_text="item_make.id")
+    qty_per_unit = serializers.DecimalField(max_digits=12, decimal_places=3)
+    name = serializers.CharField(read_only=True, required=False)
+
+
+class RecipeItemReadSerializer(serializers.ModelSerializer):
+    """Read-only представление позиции рецепта для ответа API."""
+    id = serializers.CharField(source="item_make_id")
+    name = serializers.CharField(source="item_make.name", read_only=True)
+    qty_per_unit = serializers.DecimalField(max_digits=12, decimal_places=3)
+
+    class Meta:
+        model = ProductRecipeItem
+        fields = ["id", "name", "qty_per_unit"]
+        read_only_fields = fields
+
+
 class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
     # ====== базовые поля компании/филиала ======
     company = serializers.ReadOnlyField(source="company.id")
@@ -562,6 +583,9 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
         write_only=True,
         required=False,
     )
+
+    # ====== рецепт (сырьё + расход на 1 ед.) ======
+    recipe = RecipeItemReadSerializer(source="recipe_items", many=True, read_only=True)
 
     # ====== клиент ======
     client = serializers.PrimaryKeyRelatedField(
@@ -633,6 +657,7 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
             "category", "category_name",
             "unit", "is_weight",
             "item_make", "item_make_ids",
+            "recipe",
             "quantity",
             "purchase_price",
             "markup_percent",
@@ -658,7 +683,7 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
             "company", "branch",
             "brand", "category",
             "client_name", "status_display",
-            "item_make", "date",
+            "item_make", "recipe", "date",
             "created_by", "created_by_name",
             "images",
             "code",

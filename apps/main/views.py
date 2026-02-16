@@ -34,7 +34,8 @@ from apps.main.models import (
     GlobalProduct, GlobalBrand, GlobalCategory, ClientDeal, Bid, SocialApplications, TransactionRecord,
     ContractorWork, DealInstallment, DebtPayment, Debt, ObjectSaleItem, ObjectSale, ObjectItem, ItemMake,
     ManufactureSubreal, Acceptance, ReturnFromAgent, AgentSaleAllocation, ProductImage,
-    AgentRequestCart, AgentRequestItem, ProductPackage, ProductCharacteristics, DealPayment
+    AgentRequestCart, AgentRequestItem, ProductPackage, ProductCharacteristics, DealPayment,
+    ProductRecipeItem,
 )
 from apps.main.serializers import (
     ContactSerializer, PipelineSerializer, DealSerializer, TaskSerializer,
@@ -597,7 +598,8 @@ class ProductListView(CompanyBranchRestrictedMixin, generics.ListAPIView):
             .prefetch_related(
                 "item_make",
                 "packages",
-                product_images_prefetch,  # как было, твой Prefetch для images
+                "recipe_items__item_make",
+                product_images_prefetch,
             )
         )
         return self._filter_qs_company_branch(qs)
@@ -996,23 +998,114 @@ class ProductCreateManualAPIView(CompanyBranchRestrictedMixin, generics.CreateAP
                 },
             )
 
-        # item_make
-        item_make_input = data.get("item_make") or data.get("item_make_ids")
-        if item_make_input:
-            if isinstance(item_make_input, str):
-                item_make_ids = [item_make_input]
-            elif isinstance(item_make_input, (list, tuple)):
-                item_make_ids = list(item_make_input)
-            else:
-                item_make_ids = []
+        # ====== recipe (приоритет над item_make) ======
+        recipe_input = data.get("recipe")
+        if recipe_input and isinstance(recipe_input, list):
+            # Validate recipe entries
+            seen_ids = set()
+            recipe_entries = []
+            for idx, entry in enumerate(recipe_input):
+                if not isinstance(entry, dict):
+                    return Response(
+                        {"recipe": f"Элемент #{idx}: ожидается объект."},
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
+                raw_id = entry.get("id")
+                raw_qty = entry.get("qty_per_unit")
+                if not raw_id:
+                    return Response(
+                        {"recipe": f"Элемент #{idx}: отсутствует id."},
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
+                if raw_qty is None:
+                    return Response(
+                        {"recipe": f"Элемент #{idx}: отсутствует qty_per_unit."},
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
+                try:
+                    qty_per_unit = Decimal(str(raw_qty))
+                except Exception:
+                    return Response(
+                        {"recipe": f"Элемент #{idx}: qty_per_unit — неверный формат числа."},
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
+                if qty_per_unit <= 0:
+                    return Response(
+                        {"recipe": f"Элемент #{idx}: qty_per_unit должен быть > 0."},
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
+                str_id = str(raw_id)
+                if str_id in seen_ids:
+                    return Response(
+                        {"recipe": f"Элемент #{idx}: дубликат id={raw_id}."},
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
+                seen_ids.add(str_id)
+                recipe_entries.append({"id": str_id, "qty_per_unit": qty_per_unit})
 
-            ims = ItemMake.objects.filter(id__in=item_make_ids, company=company)
-            if len(item_make_ids) != ims.count():
+            # Verify all item_make ids exist and belong to company
+            im_ids = [e["id"] for e in recipe_entries]
+            ims_qs = ItemMake.objects.filter(id__in=im_ids, company=company).select_for_update()
+            ims_map = {str(im.id): im for im in ims_qs}
+            missing = [eid for eid in im_ids if eid not in ims_map]
+            if missing:
                 return Response(
-                    {"item_make": "Один или несколько item_make не найдены или принадлежат другой компании."},
-                    status=status.HTTP_400_BAD_REQUEST
+                    {"recipe": f"Сырьё не найдено или принадлежит другой компании: {missing}"},
+                    status=status.HTTP_400_BAD_REQUEST,
                 )
-            product.item_make.set(ims)
+
+            product_qty = Decimal(str(product.quantity or 0))
+
+            # Check stock sufficiency and deduct
+            for entry in recipe_entries:
+                im = ims_map[entry["id"]]
+                required = entry["qty_per_unit"] * product_qty
+                if im.quantity < required:
+                    return Response(
+                        {"recipe": (
+                            f"Недостаточно сырья «{im.name}»: "
+                            f"требуется {required}, доступно {im.quantity}."
+                        )},
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
+
+            # Deduct raw materials and save recipe
+            recipe_objects = []
+            for entry in recipe_entries:
+                im = ims_map[entry["id"]]
+                required = entry["qty_per_unit"] * product_qty
+                im.quantity -= required
+                im.save(update_fields=["quantity", "updated_at"])
+                recipe_objects.append(
+                    ProductRecipeItem(
+                        product=product,
+                        item_make=im,
+                        qty_per_unit=entry["qty_per_unit"],
+                    )
+                )
+            ProductRecipeItem.objects.bulk_create(recipe_objects)
+
+            # Also set the M2M item_make for backward compat
+            product.item_make.set(list(ims_map.values()))
+
+        else:
+            # Backward compatibility: handle old item_make field (no recipe)
+            item_make_input = data.get("item_make") or data.get("item_make_ids")
+            if item_make_input:
+                if isinstance(item_make_input, str):
+                    item_make_ids = [item_make_input]
+                elif isinstance(item_make_input, (list, tuple)):
+                    item_make_ids = list(item_make_input)
+                else:
+                    item_make_ids = []
+
+                ims = ItemMake.objects.filter(id__in=item_make_ids, company=company)
+                if len(item_make_ids) != ims.count():
+                    return Response(
+                        {"item_make": "Один или несколько item_make не найдены или принадлежат другой компании."},
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
+                product.item_make.set(ims)
 
         # packages
         packages_to_create = []
@@ -1049,6 +1142,13 @@ class ProductCreateManualAPIView(CompanyBranchRestrictedMixin, generics.CreateAP
                 defaults={"name": name, "brand": g_brand, "category": g_category},
             )
 
+        # Refetch with all related data for serialization
+        product = (
+            Product.objects
+            .select_related("company", "branch", "brand", "category", "client", "created_by", "characteristics")
+            .prefetch_related("item_make", "packages", "recipe_items__item_make", product_images_prefetch)
+            .get(pk=product.pk)
+        )
         ser = self.get_serializer(product, context=self.get_serializer_context())
         return Response(ser.data, status=status.HTTP_201_CREATED)
 
@@ -1070,10 +1170,172 @@ class ProductRetrieveUpdateDestroyAPIView(CompanyBranchRestrictedMixin, generics
         .prefetch_related(
             "item_make",
             "packages",
+            "recipe_items__item_make",
             product_images_prefetch,
         )
         .all()
     )
+
+    @transaction.atomic
+    def update(self, request, *args, **kwargs):
+        partial = kwargs.pop("partial", False)
+        instance = self.get_object()
+        data = request.data
+
+        recipe_input = data.get("recipe")
+        has_recipe = recipe_input is not None
+
+        if has_recipe:
+            if not isinstance(recipe_input, list):
+                return Response(
+                    {"recipe": "Ожидается массив."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            # Parse and validate new recipe
+            seen_ids = set()
+            new_recipe_entries = []
+            for idx, entry in enumerate(recipe_input):
+                if not isinstance(entry, dict):
+                    return Response(
+                        {"recipe": f"Элемент #{idx}: ожидается объект."},
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
+                raw_id = entry.get("id")
+                raw_qty = entry.get("qty_per_unit")
+                if not raw_id:
+                    return Response(
+                        {"recipe": f"Элемент #{idx}: отсутствует id."},
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
+                if raw_qty is None:
+                    return Response(
+                        {"recipe": f"Элемент #{idx}: отсутствует qty_per_unit."},
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
+                try:
+                    qty_per_unit = Decimal(str(raw_qty))
+                except Exception:
+                    return Response(
+                        {"recipe": f"Элемент #{idx}: qty_per_unit — неверный формат."},
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
+                if qty_per_unit <= 0:
+                    return Response(
+                        {"recipe": f"Элемент #{idx}: qty_per_unit должен быть > 0."},
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
+                str_id = str(raw_id)
+                if str_id in seen_ids:
+                    return Response(
+                        {"recipe": f"Элемент #{idx}: дубликат id={raw_id}."},
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
+                seen_ids.add(str_id)
+                new_recipe_entries.append({"id": str_id, "qty_per_unit": qty_per_unit})
+
+        # ---- Read old state ----
+        old_quantity = Decimal(str(instance.quantity or 0))
+        old_recipe_qs = ProductRecipeItem.objects.filter(product=instance).select_related("item_make")
+        old_recipe_map = {str(ri.item_make_id): ri.qty_per_unit for ri in old_recipe_qs}
+
+        # ---- Determine new state ----
+        new_quantity_raw = data.get("quantity")
+        new_quantity = Decimal(str(new_quantity_raw)) if new_quantity_raw is not None else old_quantity
+
+        if has_recipe:
+            new_recipe_map = {e["id"]: e["qty_per_unit"] for e in new_recipe_entries}
+        else:
+            new_recipe_map = dict(old_recipe_map)
+
+        # ---- Compute deltas ----
+        all_item_ids = set(old_recipe_map.keys()) | set(new_recipe_map.keys())
+        deltas = {}
+        for im_id in all_item_ids:
+            old_req = old_recipe_map.get(im_id, Decimal("0")) * old_quantity
+            new_req = new_recipe_map.get(im_id, Decimal("0")) * new_quantity
+            delta = new_req - old_req
+            if delta != 0:
+                deltas[im_id] = delta
+
+        if deltas:
+            company = self._company()
+            # Lock rows for concurrent safety
+            ims_qs = (
+                ItemMake.objects
+                .filter(id__in=deltas.keys(), company=company)
+                .select_for_update()
+            )
+            ims_map = {str(im.id): im for im in ims_qs}
+
+            # Check all exist
+            missing = [eid for eid in deltas if eid not in ims_map]
+            if missing:
+                return Response(
+                    {"recipe": f"Сырьё не найдено: {missing}"},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            # Check stock sufficiency for items that need deduction (delta > 0)
+            for im_id, delta in deltas.items():
+                if delta > 0:
+                    im = ims_map[im_id]
+                    if im.quantity < delta:
+                        return Response(
+                            {"recipe": (
+                                f"Недостаточно сырья «{im.name}»: "
+                                f"нужно досписать {delta}, доступно {im.quantity}."
+                            )},
+                            status=status.HTTP_400_BAD_REQUEST,
+                        )
+
+            # Apply deltas
+            for im_id, delta in deltas.items():
+                im = ims_map[im_id]
+                im.quantity -= delta
+                im.save(update_fields=["quantity", "updated_at"])
+
+        # ---- Update recipe rows ----
+        if has_recipe:
+            ProductRecipeItem.objects.filter(product=instance).delete()
+            if new_recipe_entries:
+                company = self._company()
+                ims_qs = ItemMake.objects.filter(
+                    id__in=[e["id"] for e in new_recipe_entries],
+                    company=company,
+                )
+                ims_map_for_recipe = {str(im.id): im for im in ims_qs}
+                ProductRecipeItem.objects.bulk_create([
+                    ProductRecipeItem(
+                        product=instance,
+                        item_make=ims_map_for_recipe[e["id"]],
+                        qty_per_unit=e["qty_per_unit"],
+                    )
+                    for e in new_recipe_entries
+                ])
+                # Update M2M for backward compat
+                instance.item_make.set(list(ims_map_for_recipe.values()))
+
+        # ---- Let DRF serializer handle all other fields ----
+        # Remove recipe from data so the serializer doesn't choke on it
+        mutable_data = data.copy() if hasattr(data, "copy") else dict(data)
+        mutable_data.pop("recipe", None)
+
+        serializer = self.get_serializer(instance, data=mutable_data, partial=True)
+        serializer.is_valid(raise_exception=True)
+        self.perform_update(serializer)
+
+        # Refetch with all prefetches
+        instance = (
+            Product.objects
+            .select_related("company", "branch", "brand", "category", "client", "created_by", "characteristics")
+            .prefetch_related("item_make", "packages", "recipe_items__item_make", product_images_prefetch)
+            .get(pk=instance.pk)
+        )
+        return Response(
+            self.get_serializer(instance).data,
+            status=status.HTTP_200_OK,
+        )
 
 
 class ProductBulkDeleteAPIView(CompanyBranchRestrictedMixin, APIView):

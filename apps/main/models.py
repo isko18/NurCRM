@@ -1205,6 +1205,53 @@ class ItemMake(models.Model):
             raise ValidationError({'branch': 'Филиал принадлежит другой компании.'})
 
 
+class ProductRecipeItem(models.Model):
+    """
+    Рецепт готового товара: связь Product <-> ItemMake с нормой расхода.
+    qty_per_unit — расход сырья на 1 единицу готового товара.
+    """
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+
+    product = models.ForeignKey(
+        Product,
+        on_delete=models.CASCADE,
+        related_name="recipe_items",
+        verbose_name="Готовый товар",
+    )
+    item_make = models.ForeignKey(
+        ItemMake,
+        on_delete=models.PROTECT,
+        related_name="recipe_usages",
+        verbose_name="Сырьё",
+    )
+    qty_per_unit = models.DecimalField(
+        "Расход на 1 ед. товара",
+        max_digits=12,
+        decimal_places=3,
+        help_text="Количество сырья, необходимое для производства 1 единицы готового товара",
+    )
+
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = "Позиция рецепта"
+        verbose_name_plural = "Позиции рецептов"
+        constraints = [
+            models.UniqueConstraint(
+                fields=("product", "item_make"),
+                name="uq_product_recipe_item",
+            ),
+            models.CheckConstraint(
+                check=models.Q(qty_per_unit__gt=0),
+                name="ck_recipe_qty_per_unit_positive",
+            ),
+        ]
+
+    def __str__(self):
+        return f"{self.product.name} <- {self.item_make.name} x{self.qty_per_unit}"
+
+
 # ==========================
 # Cart / CartItem / Sale / SaleItem / MobileScannerToken
 # ==========================
