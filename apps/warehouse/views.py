@@ -8,6 +8,7 @@ from django.core.exceptions import ValidationError as DjangoValidationError
 from django_filters.rest_framework import DjangoFilterBackend
 from django.shortcuts import get_object_or_404
 from decimal import Decimal
+from django.db import IntegrityError
 from django.db.models import Count, Sum, DecimalField, Value as V
 from django.db.models.functions import Coalesce
 
@@ -301,12 +302,36 @@ class BrandView(CompanyBranchRestrictedMixin, generics.ListCreateAPIView):
     filter_backends = [DjangoFilterBackend]
     filterset_class = BrandFilter
 
+    def perform_create(self, serializer):
+        try:
+            self._save_with_company_branch(serializer)
+        except IntegrityError as e:
+            msg = str(e)
+            if (
+                "uq_warehouse_brand_name_global_per_company" in msg
+                or "uq_warehouse_brand_name_per_branch" in msg
+            ):
+                raise ValidationError({"name": "Бренд с таким названием уже существует."})
+            raise
+
 
 class BrandDetailView(CompanyBranchRestrictedMixin, generics.RetrieveUpdateDestroyAPIView):
     serializer_class = BrandSerializer
     queryset = m.WarehouseProductBrand.objects.select_related("company", "branch").all()
     lookup_field = "id"
     lookup_url_kwarg = "brand_uuid"
+
+    def perform_update(self, serializer):
+        try:
+            self._save_with_company_branch(serializer)
+        except IntegrityError as e:
+            msg = str(e)
+            if (
+                "uq_warehouse_brand_name_global_per_company" in msg
+                or "uq_warehouse_brand_name_per_branch" in msg
+            ):
+                raise ValidationError({"name": "Бренд с таким названием уже существует."})
+            raise
 
 
 # ==== Category ====
@@ -316,12 +341,36 @@ class CategoryView(CompanyBranchRestrictedMixin, generics.ListCreateAPIView):
     filter_backends = [DjangoFilterBackend]
     filterset_class = None
 
+    def perform_create(self, serializer):
+        try:
+            self._save_with_company_branch(serializer)
+        except IntegrityError as e:
+            msg = str(e)
+            if (
+                "uq_warehouse_category_name_global_per_company" in msg
+                or "uq_warehouse_category_name_per_branch" in msg
+            ):
+                raise ValidationError({"name": "Категория с таким названием уже существует."})
+            raise
+
 
 class CategoryDetailView(CompanyBranchRestrictedMixin, generics.RetrieveUpdateDestroyAPIView):
     serializer_class = CategorySerializer
     queryset = m.WarehouseProductCategory.objects.select_related("company", "branch").all()
     lookup_field = "id"
     lookup_url_kwarg = "category_uuid"
+
+    def perform_update(self, serializer):
+        try:
+            self._save_with_company_branch(serializer)
+        except IntegrityError as e:
+            msg = str(e)
+            if (
+                "uq_warehouse_category_name_global_per_company" in msg
+                or "uq_warehouse_category_name_per_branch" in msg
+            ):
+                raise ValidationError({"name": "Категория с таким названием уже существует."})
+            raise
 
 
 # ==== Product groups (inside warehouse, like 1C) ====

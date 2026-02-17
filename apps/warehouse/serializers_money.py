@@ -81,12 +81,13 @@ class MoneyDocumentSerializer(serializers.ModelSerializer):
             "counterparty_display_name",
             "payment_category",
             "payment_category_title",
+            "source_document",
             "amount",
             "comment",
             "created_at",
             "updated_at",
         )
-        read_only_fields = ("number", "status", "date", "created_at", "updated_at")
+        read_only_fields = ("number", "status", "date", "created_at", "updated_at", "source_document")
         ref_name = "WarehouseMoneyDocumentSerializer"
 
     def validate(self, attrs):

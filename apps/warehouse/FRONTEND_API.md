@@ -91,6 +91,12 @@
 Фильтр:
 - `name` (icontains)
 
+Ошибки:
+- **400** при попытке создать/переименовать бренд в дубль в рамках текущего `company/branch`:
+```json
+{ "name": "Бренд с таким названием уже существует." }
+```
+
 ### 2.3 Категории
 Эндпойнты:
 - `GET /api/warehouse/category/`
@@ -110,6 +116,12 @@
 
 Примечание:
 - В текущей реализации на списке категорий фильтры не подключены (вьюха без `filterset_class`).
+
+Ошибки:
+- **400** при попытке создать/переименовать категорию в дубль в рамках текущего `company/branch`:
+```json
+{ "name": "Категория с таким названием уже существует." }
+```
 
 ### 2.3.1 Группы товаров внутри склада (как в 1С)
 Иерархия групп по складу: `GET/POST /api/warehouse/{warehouse_uuid}/groups/`, `GET/PATCH/DELETE .../groups/{group_uuid}/`. Тело: `name`, `parent` (uuid|null). В ответе: `products_count`. У товара поле `product_group`; фильтр `?product_group=<uuid>`.
@@ -328,7 +340,7 @@
   - `RECEIPT` (Приход)
   - `WRITE_OFF` (Списание)
   - `TRANSFER` (Перемещение)
-- `status`: `DRAFT` | `POSTED`
+- `status`: `DRAFT` | `CASH_PENDING` | `POSTED` | `REJECTED`
 
 ### 4.2 Эндпойнты документов
 Базовый список:
@@ -351,6 +363,8 @@
 Проведение/отмена:
 - `POST /api/warehouse/documents/{id}/post/`
 - `POST /api/warehouse/documents/{id}/unpost/`
+- `POST /api/warehouse/documents/{id}/cash/approve/`
+- `POST /api/warehouse/documents/{id}/cash/reject/`
 
 ### 4.2.1 Документы агента (по своим товарам)
 Эндпойнты:
@@ -369,7 +383,7 @@
 {
   "id": "uuid",
   "doc_type": "SALE",
-  "status": "DRAFT|POSTED",
+  "status": "DRAFT|CASH_PENDING|POSTED|REJECTED",
   "number": "SALE-20260201-0001|null",
   "date": "2026-02-01T12:00:00Z",
   "payment_kind": "cash|credit|null",
@@ -378,6 +392,11 @@
   "warehouse_from_name": "string|null",
   "warehouse_to_name": "string|null",
   "counterparty": "uuid|null",
+  "cash_register": "uuid|null",
+  "cash_register_name": "string|null",
+  "payment_category": "uuid|null",
+  "payment_category_title": "string|null",
+  "cash_request_status": "PENDING|APPROVED|REJECTED|null",
   "agent": "uuid|null",
   "counterparty_display_name": "string|null",
   "comment": "string",
@@ -419,6 +438,28 @@ Read-only поля:
   - `cash` — оплата сразу (по умолчанию).
   - `credit` — **в долг**: при продаже клиент должен нам (задолженность погашается приходом денег от контрагента); при покупке мы должны поставщику (погашается расходом денег контрагенту). Имеет смысл проводить документ как обычно, а долг учитывается в акте сверки с контрагентом.
 - Для остальных типов документов поле можно не передавать (или `null`).
+
+**Касса (важно):**
+- Любой складской документ после `post` сначала попадает в статус `CASH_PENDING` (ожидает решения по кассе).
+- На этом этапе склад уже проведён (созданы `moves`, остатки изменены), но финальное решение принимает касса:
+  - `POST /documents/{id}/cash/approve/` — подтвердить.
+  - `POST /documents/{id}/cash/reject/` — отклонить.
+- Если отклонить (`cash/reject`):
+  - складские движения откатываются,
+  - документ получает статус `REJECTED`,
+  - в кассу ничего не попадает.
+- Если подтвердить (`cash/approve`) и `payment_kind="cash"`:
+  - создаётся и проводится денежный документ:
+    - `SALE` → `MONEY_RECEIPT`
+    - `PURCHASE` → `MONEY_EXPENSE`
+    - `SALE_RETURN` → `MONEY_EXPENSE`
+    - `PURCHASE_RETURN` → `MONEY_RECEIPT`
+    - `RECEIPT` → `MONEY_RECEIPT`
+    - `WRITE_OFF` → `MONEY_EXPENSE`
+  - документ получает статус `POSTED`.
+- Для `cash/approve` с денежным движением нужны `cash_register` и `payment_category`:
+  - если в текущем company/branch ровно одна касса/категория — сервер подставит автоматически;
+  - если несколько — укажите явно в документе (`PATCH /documents/{id}/`) до `cash/approve`.
 
 ### 4.4 Создание документа (пример)
 `POST /api/warehouse/documents/`
@@ -465,11 +506,57 @@ Read-only поля:
 ```json
 { "allow_negative": true }
 ```
-- при успехе: 200 + сериализованный документ (status станет `POSTED`, `number` будет сгенерирован).
+- при успехе: 200 + сериализованный документ (status станет `CASH_PENDING`, `number` будет сгенерирован).
 
 Отмена:
 - `POST /api/warehouse/documents/{id}/unpost/`
 - при успехе: документ возвращается в `DRAFT`, движения удаляются, остатки откатываются.
+
+Подтверждение/отклонение кассой:
+- `POST /api/warehouse/documents/{id}/cash/approve/`
+  - опционально `{"note": "комментарий"}`
+  - подтверждает кассовый запрос; при необходимости создаёт `MONEY_RECEIPT/MONEY_EXPENSE`; статус документа -> `POSTED`.
+- `POST /api/warehouse/documents/{id}/cash/reject/`
+  - опционально `{"note": "причина отказа"}`
+  - отклоняет кассовый запрос; склад откатывается; статус документа -> `REJECTED`.
+
+Inbox для кассира (работа с запросами кассы):
+- `GET /api/warehouse/cash/requests/`
+  - фильтры: `status`, `requires_money`, `money_doc_type`, `document__doc_type`, `document__payment_kind`
+  - поиск: `?search=...` (по `document.number`, `document.comment`, `document.counterparty.name`)
+- `POST /api/warehouse/cash/requests/{request_id}/approve/`
+- `POST /api/warehouse/cash/requests/{request_id}/reject/`
+
+Формат элемента в `GET /cash/requests/`:
+```json
+{
+  "id": "request-uuid",
+  "status": "PENDING|APPROVED|REJECTED",
+  "requires_money": true,
+  "money_doc_type": "MONEY_RECEIPT|MONEY_EXPENSE|null",
+  "amount": "1500.00",
+  "decision_note": "",
+  "requested_at": "2026-02-17T18:00:00Z",
+  "decided_at": null,
+  "decided_by_id": null,
+  "money_document_id": null,
+  "document": {
+    "id": "doc-uuid",
+    "number": "SALE-20260217-0001",
+    "doc_type": "SALE",
+    "status": "CASH_PENDING",
+    "payment_kind": "cash",
+    "date": "2026-02-17T17:59:00Z",
+    "total": "1500.00",
+    "warehouse_from": "uuid",
+    "warehouse_from_name": "Основной склад",
+    "counterparty": "uuid",
+    "counterparty_display_name": "Клиент",
+    "cash_register": "uuid|null",
+    "payment_category": "uuid|null"
+  }
+}
+```
 
 ### 4.8 Бизнес-правила по типам документов (для UI)
 - `TRANSFER`: обязательно `warehouse_from` и `warehouse_to` (и они должны быть разными).
@@ -497,6 +584,20 @@ Read-only поля:
 { "id": "uuid", "company": "uuid", "branch": "uuid|null", "name": "string", "location": "string" }
 ```
 
+Read-only поля:
+- `company`, `branch` — сервер проставляет автоматически.
+
+Создание кассы (`POST /api/warehouse/cash-registers/`):
+- тело:
+```json
+{ "name": "Основная касса", "location": "офис" }
+```
+- сервер сам проставит `company` и (если выбран активный филиал) `branch`.
+
+Фильтры/поиск (`GET /api/warehouse/cash-registers/`):
+- фильтры: `company`, `branch` (обычно фронту не нужны — доступ и так ограничен текущей компанией/филиалом)
+- поиск: `?search=...` (по `name`, `location`)
+
 Ответ `operations/`:
 ```json
 {
@@ -513,9 +614,13 @@ Read-only поля:
 }
 ```
 
-- `balance` = приходы − расходы по проведённым документам
+- `balance` = приходы − расходы **только по проведённым** (`status=POSTED`) денежным документам этой кассы
 - `receipts` — приходы (MONEY_RECEIPT)
 - `expenses` — расходы (MONEY_EXPENSE)
+
+Важно:
+- баланс **не хранится** отдельным полем — вычисляется из проведённых документов;
+- в `operations/` попадают **только** документы с `cash_register = эта касса` (документы с заполненным `warehouse` без `cash_register` сюда не попадают).
 
 ### 5.1 Категории платежей
 - `GET/POST /api/warehouse/money/categories/`
@@ -528,6 +633,15 @@ Read-only поля:
 Ответ:
 ```json
 { "id": "uuid", "company": "uuid", "branch": "uuid|null", "title": "string" }
+```
+
+Read-only поля:
+- `company`, `branch` — сервер проставляет автоматически.
+
+Ошибки:
+- **400** при попытке создать/переименовать категорию платежа в дубль в рамках текущего `company/branch`:
+```json
+{ "title": "Категория платежа с таким названием уже существует." }
 ```
 
 ### 5.2 Денежные документы
@@ -574,6 +688,59 @@ Read-only поля:
 Важные правила:
 - после `POSTED` документ нельзя менять, пока не выполните `unpost`.
 - денежные документы **не создают** складских движений по товарам и **не меняют** остатки.
+
+Дополнительные правила (как сейчас работает сервер):
+- `number` генерируется при проведении (формат: `TYPE-YYYYMMDD-0001`), до проведения может быть `null`.
+- обязательные поля для `MONEY_RECEIPT` и `MONEY_EXPENSE`:
+  - `cash_register` (рекомендуется всегда; поле `warehouse` — устаревшее/legacy)
+  - `counterparty`
+  - `payment_category`
+  - `amount` \(> 0\)
+
+Ошибки (типичные 400):
+- если не указана касса и не указан `warehouse` (legacy):
+```json
+{ "cash_register": "Укажите кассу." }
+```
+- если не указан контрагент/категория платежа:
+```json
+{ "counterparty": "Укажите контрагента." }
+```
+```json
+{ "payment_category": "Укажите категорию платежа." }
+```
+- если `amount <= 0`:
+```json
+{ "amount": "Сумма должна быть больше 0." }
+```
+- попытка изменить проведённый документ:
+```json
+{ "status": "Нельзя изменять проведенный документ. Сначала отмените проведение." }
+```
+
+Базовое создание в черновик (`POST /api/warehouse/money/documents/`):
+```json
+{
+  "doc_type": "MONEY_RECEIPT",
+  "cash_register": "uuid",
+  "counterparty": "uuid",
+  "payment_category": "uuid",
+  "amount": "1500.00",
+  "comment": "оплата"
+}
+```
+
+Проведение / отмена:
+- `POST /api/warehouse/money/documents/{id}/post/`:
+  - переводит документ в `POSTED`
+  - если `number` пустой — генерирует номер
+- `POST /api/warehouse/money/documents/{id}/unpost/`:
+  - возвращает документ в `DRAFT` (номер при этом остаётся как был)
+
+Авто-проведение при create/update (backward compatible):
+- можно сразу провести документ при создании/обновлении, если:
+  - отправить `{"post": true}` или `{"status": "POSTED"}` в body, **или**
+  - передать `?post=1` в querystring
 
 Фильтры/поиск:
 - фильтры: `doc_type`, `status`, `cash_register`, `warehouse`, `counterparty`, `payment_category`

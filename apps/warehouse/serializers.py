@@ -78,6 +78,42 @@ class BrandSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
         br = self._auto_branch()
         _restrict_pk_queryset_strict(self.fields.get("parent"), m.WarehouseProductBrand.objects.all(), comp, br)
 
+    def validate(self, attrs):
+        """
+        Валидируем уникальность имени до INSERT, чтобы не ловить 500 IntegrityError.
+        Логика соответствует constraints в модели:
+          - если branch != NULL -> уникальность (branch, name)
+          - если branch == NULL -> уникальность (company, name) среди branch IS NULL
+        """
+        attrs = super().validate(attrs)
+
+        name = attrs.get("name")
+        if name is None:
+            return attrs
+
+        name = name.strip()
+        attrs["name"] = name
+
+        company = self._user_company()
+        branch = self._auto_branch()
+
+        qs = m.WarehouseProductBrand.objects.all()
+        if self.instance is not None:
+            qs = qs.exclude(pk=self.instance.pk)
+
+        if branch is not None:
+            qs = qs.filter(branch=branch, name=name)
+        else:
+            if company is not None:
+                qs = qs.filter(company=company, branch__isnull=True, name=name)
+            else:
+                qs = qs.filter(branch__isnull=True, name=name)
+
+        if qs.exists():
+            raise serializers.ValidationError({"name": "Бренд с таким названием уже существует."})
+
+        return attrs
+
 
 class CategorySerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
     company = serializers.ReadOnlyField(source="company.id")
@@ -100,6 +136,42 @@ class CategorySerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer
         comp = self._user_company()
         br = self._auto_branch()
         _restrict_pk_queryset_strict(self.fields.get("parent"), m.WarehouseProductCategory.objects.all(), comp, br)
+
+    def validate(self, attrs):
+        """
+        Валидируем уникальность имени до INSERT, чтобы не ловить 500 IntegrityError.
+        Логика соответствует constraints в модели:
+          - если branch != NULL -> уникальность (branch, name)
+          - если branch == NULL -> уникальность (company, name) среди branch IS NULL
+        """
+        attrs = super().validate(attrs)
+
+        name = attrs.get("name")
+        if name is None:
+            return attrs
+
+        name = name.strip()
+        attrs["name"] = name
+
+        company = self._user_company()
+        branch = self._auto_branch()
+
+        qs = m.WarehouseProductCategory.objects.all()
+        if self.instance is not None:
+            qs = qs.exclude(pk=self.instance.pk)
+
+        if branch is not None:
+            qs = qs.filter(branch=branch, name=name)
+        else:
+            if company is not None:
+                qs = qs.filter(company=company, branch__isnull=True, name=name)
+            else:
+                qs = qs.filter(branch__isnull=True, name=name)
+
+        if qs.exists():
+            raise serializers.ValidationError({"name": "Категория с таким названием уже существует."})
+
+        return attrs
 
 
 class WarehouseProductGroupSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):

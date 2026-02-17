@@ -876,7 +876,9 @@ class Document(models.Model):
 
     class Status(models.TextChoices):
         DRAFT = "DRAFT", "Черновик"
+        CASH_PENDING = "CASH_PENDING", "Ожидает решения кассы"
         POSTED = "POSTED", "Проведен"
+        REJECTED = "REJECTED", "Отклонен"
 
     class PaymentKind(models.TextChoices):
         """Способ оплаты по документу (для SALE/PURCHASE и возвратов)."""
@@ -902,6 +904,24 @@ class Document(models.Model):
     warehouse_from = models.ForeignKey("warehouse.Warehouse", on_delete=models.SET_NULL, null=True, blank=True, related_name="documents_from", verbose_name="Склад-источник")
     warehouse_to = models.ForeignKey("warehouse.Warehouse", on_delete=models.SET_NULL, null=True, blank=True, related_name="documents_to", verbose_name="Склад-приемник")
     counterparty = models.ForeignKey("warehouse.Counterparty", on_delete=models.SET_NULL, null=True, blank=True, verbose_name="Контрагент")
+    cash_register = models.ForeignKey(
+        "warehouse.CashRegister",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="warehouse_documents",
+        verbose_name="Касса",
+        help_text="Если payment_kind=cash и включена автокасса — по этой кассе будет создан MONEY_RECEIPT/MONEY_EXPENSE.",
+    )
+    payment_category = models.ForeignKey(
+        "warehouse.PaymentCategory",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="warehouse_documents",
+        verbose_name="Категория платежа",
+        help_text="Категория для автосоздаваемого денежного документа при payment_kind=cash.",
+    )
     agent = models.ForeignKey(
         settings.AUTH_USER_MODEL,
         on_delete=models.SET_NULL,
@@ -1359,6 +1379,59 @@ class PaymentCategory(BaseModelId, BaseModelCompanyBranch):
             raise ValidationError({"branch": "Филиал принадлежит другой компании."})
 
 
+class CashApprovalRequest(models.Model):
+    class Status(models.TextChoices):
+        PENDING = "PENDING", "Ожидает решения"
+        APPROVED = "APPROVED", "Подтверждено"
+        REJECTED = "REJECTED", "Отклонено"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    document = models.OneToOneField(
+        "warehouse.Document",
+        on_delete=models.CASCADE,
+        related_name="cash_request",
+        verbose_name="Складской документ",
+    )
+    status = models.CharField(max_length=16, choices=Status.choices, default=Status.PENDING, verbose_name="Статус")
+    requires_money = models.BooleanField(default=False, verbose_name="Нужно создавать денежный документ")
+    money_doc_type = models.CharField(
+        max_length=32,
+        blank=True,
+        null=True,
+        verbose_name="Тип денежного документа",
+    )
+    amount = models.DecimalField(max_digits=18, decimal_places=2, default=Decimal("0.00"), verbose_name="Сумма")
+    decision_note = models.TextField(blank=True, verbose_name="Комментарий решения")
+    requested_at = models.DateTimeField(auto_now_add=True, verbose_name="Дата запроса")
+    decided_at = models.DateTimeField(null=True, blank=True, verbose_name="Дата решения")
+    decided_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="warehouse_cash_decisions",
+        verbose_name="Кем решено",
+    )
+    money_document = models.OneToOneField(
+        "warehouse.MoneyDocument",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="cash_request",
+        verbose_name="Созданный денежный документ",
+    )
+
+    class Meta:
+        verbose_name = "Запрос на проведение в кассе"
+        verbose_name_plural = "Запросы на проведение в кассе"
+        indexes = [
+            models.Index(fields=["status", "requested_at"]),
+        ]
+
+    def __str__(self):
+        return f"{self.document_id} [{self.status}]"
+
+
 class MoneyDocument(BaseModelCompanyBranch):
     """
     Денежные документы (приходы и расходы по кассе):
@@ -1418,6 +1491,16 @@ class MoneyDocument(BaseModelCompanyBranch):
         verbose_name="Категория платежа",
     )
 
+    source_document = models.OneToOneField(
+        "warehouse.Document",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="money_document",
+        verbose_name="Основание (складской документ)",
+        help_text="Если документ создан автоматически из складского документа — здесь ссылка на него.",
+    )
+
     amount = models.DecimalField(max_digits=18, decimal_places=2, default=Decimal("0.00"), verbose_name="Сумма")
     comment = models.TextField(blank=True, verbose_name="Комментарий")
 
@@ -1447,7 +1530,8 @@ class MoneyDocument(BaseModelCompanyBranch):
             raise ValidationError({"cash_register": "Касса принадлежит другой компании."})
 
         if self.doc_type in (self.DocType.MONEY_RECEIPT, self.DocType.MONEY_EXPENSE):
-            if not self.counterparty_id:
+            # Для авто-документов из склада контрагент может отсутствовать (например WRITE_OFF/RECEIPT).
+            if not self.counterparty_id and not self.source_document_id:
                 raise ValidationError({"counterparty": "Укажите контрагента."})
             if not self.payment_category_id:
                 raise ValidationError({"payment_category": "Укажите категорию платежа."})

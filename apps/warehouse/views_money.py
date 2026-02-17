@@ -4,7 +4,7 @@ from rest_framework import status, filters
 from rest_framework.response import Response
 from rest_framework import generics
 from rest_framework.exceptions import ValidationError
-from django.db import transaction
+from django.db import transaction, IntegrityError
 from django_filters.rest_framework import DjangoFilterBackend
 
 from .views import CompanyBranchRestrictedMixin
@@ -79,10 +79,34 @@ class PaymentCategoryListCreateView(CompanyBranchRestrictedMixin, generics.ListC
     filterset_fields = ["company", "branch"]
     search_fields = ["title"]
 
+    def perform_create(self, serializer):
+        try:
+            self._save_with_company_branch(serializer)
+        except IntegrityError as e:
+            msg = str(e)
+            if (
+                "uq_wh_payment_category_title_per_branch" in msg
+                or "uq_wh_payment_category_title_global_per_company" in msg
+            ):
+                raise ValidationError({"title": "Категория платежа с таким названием уже существует."})
+            raise
+
 
 class PaymentCategoryDetailView(CompanyBranchRestrictedMixin, generics.RetrieveUpdateDestroyAPIView):
     serializer_class = serializers_money.PaymentCategorySerializer
     queryset = models.PaymentCategory.objects.all()
+
+    def perform_update(self, serializer):
+        try:
+            self._save_with_company_branch(serializer)
+        except IntegrityError as e:
+            msg = str(e)
+            if (
+                "uq_wh_payment_category_title_per_branch" in msg
+                or "uq_wh_payment_category_title_global_per_company" in msg
+            ):
+                raise ValidationError({"title": "Категория платежа с таким названием уже существует."})
+            raise
 
 
 class MoneyDocumentListCreateView(CompanyBranchRestrictedMixin, generics.ListCreateAPIView):

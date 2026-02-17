@@ -22,6 +22,8 @@ from .views import (
 )
 from .views_documents import (
     DocumentListCreateView, DocumentDetailView, DocumentPostView, DocumentUnpostView,
+    DocumentCashApproveView, DocumentCashRejectView,
+    CashApprovalRequestListView, CashApprovalRequestApproveView, CashApprovalRequestRejectView,
     AgentDocumentListCreateView, AgentDocumentDetailView,
     DocumentTransferCreateAPIView,
     ProductListCreateView, ProductDetailView as ProductDetailViewCRUD,
@@ -141,6 +143,11 @@ urlpatterns += [
     path("documents/<uuid:pk>/", DocumentDetailView.as_view(), name="warehouse-document-detail"),
     path("documents/<uuid:pk>/post/", DocumentPostView.as_view(), name="warehouse-document-post"),
     path("documents/<uuid:pk>/unpost/", DocumentUnpostView.as_view(), name="warehouse-document-unpost"),
+    path("documents/<uuid:pk>/cash/approve/", DocumentCashApproveView.as_view(), name="warehouse-document-cash-approve"),
+    path("documents/<uuid:pk>/cash/reject/", DocumentCashRejectView.as_view(), name="warehouse-document-cash-reject"),
+    path("cash/requests/", CashApprovalRequestListView.as_view(), name="warehouse-cash-requests"),
+    path("cash/requests/<uuid:pk>/approve/", CashApprovalRequestApproveView.as_view(), name="warehouse-cash-request-approve"),
+    path("cash/requests/<uuid:pk>/reject/", CashApprovalRequestRejectView.as_view(), name="warehouse-cash-request-reject"),
 
     # simple CRUD for products/warehouses/counterparties
     path("crud/products/", ProductListCreateView.as_view(), name="warehouse-products-crud"),
