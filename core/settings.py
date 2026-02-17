@@ -49,6 +49,7 @@ INSTALLED_APPS = [
     'apps.main.apps.MainConfig',
     'apps.users',
     'apps.construction',
+    'apps.building',
     'apps.booking',
     'apps.barber',
     'apps.education',
