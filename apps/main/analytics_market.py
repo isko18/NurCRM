@@ -98,8 +98,15 @@ def _get_period(request) -> Period:
     tz = timezone.get_current_timezone()
     now = timezone.now().astimezone(tz)
 
-    df = _parse_dt(request.query_params.get("date_from"))
-    dt = _parse_dt(request.query_params.get("date_to"))
+    # Backward/forward compatibility:
+    # - older clients: date_from/date_to
+    # - newer clients: period_start/period_end
+    qp = request.query_params
+    raw_from = qp.get("date_from") or qp.get("period_start")
+    raw_to = qp.get("date_to") or qp.get("period_end")
+
+    df = _parse_dt(raw_from)
+    dt = _parse_dt(raw_to)
 
     if df and timezone.is_naive(df):
         df = timezone.make_aware(df, tz)
@@ -108,7 +115,8 @@ def _get_period(request) -> Period:
 
     if df and dt:
         # если date_to пришёл как дата — делаем +1 день (exclusive)
-        if request.query_params.get("date_to") and len(request.query_params.get("date_to")) == 10:
+        # (поддерживаем и period_end)
+        if raw_to and len(raw_to) == 10:
             dt = dt + timedelta(days=1)
         return Period(start=df, end=dt)
 
