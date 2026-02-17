@@ -344,8 +344,22 @@ class User(AbstractBaseUser, PermissionsMixin):
     can_view_settings = models.BooleanField(default=False, blank=True, null=True, verbose_name="Доступ к настройкам")
     can_view_sale = models.BooleanField(default=False, blank=True, null=True, verbose_name="Доступ к продажам")
 
-    can_view_building_work_process = models.BooleanField(default=False, blank=True, null=True, verbose_name="Доступ к процессам строительства")
-    can_view_building_objects = models.BooleanField(default=False, blank=True, null=True, verbose_name="Доступ к объектам")
+    # Building permissions (CRM) — ключи для profile, меню Building и роутинга
+    can_view_building_analytics = models.BooleanField(default=False, blank=True, null=True, verbose_name="Building: Аналитика")
+    can_view_building_cash_register = models.BooleanField(default=False, blank=True, null=True, verbose_name="Building: Касса")
+    can_view_building_clients = models.BooleanField(default=False, blank=True, null=True, verbose_name="Building: Клиенты")
+    can_view_building_department = models.BooleanField(default=False, blank=True, null=True, verbose_name="Building: Отделы")
+    can_view_building_employess = models.BooleanField(default=False, blank=True, null=True, verbose_name="Building: Сотрудники")
+    can_view_building_notification = models.BooleanField(default=False, blank=True, null=True, verbose_name="Building: Уведомления")
+    can_view_building_procurement = models.BooleanField(default=False, blank=True, null=True, verbose_name="Building: Закупки")
+    can_view_building_projects = models.BooleanField(default=False, blank=True, null=True, verbose_name="Building: Проекты")
+    can_view_building_salary = models.BooleanField(default=False, blank=True, null=True, verbose_name="Building: Зарплата")
+    can_view_building_sell = models.BooleanField(default=False, blank=True, null=True, verbose_name="Building: Продажи")
+    can_view_building_stock = models.BooleanField(default=False, blank=True, null=True, verbose_name="Building: Склад")
+    can_view_building_treaty = models.BooleanField(default=False, blank=True, null=True, verbose_name="Building: Договора")
+    can_view_building_work_process = models.BooleanField(default=False, blank=True, null=True, verbose_name="Building: Процесс работы")
+    can_view_building_objects = models.BooleanField(default=False, blank=True, null=True, verbose_name="Building: Квартиры/Объекты")
+
     can_view_additional_services = models.BooleanField(default=False, blank=True, null=True, verbose_name="Доступ к доп. услугам")
     can_view_debts = models.BooleanField(default=False, blank=True, null=True, verbose_name="Доступ к долгам")
 
