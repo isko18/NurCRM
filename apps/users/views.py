@@ -425,6 +425,12 @@ class BranchListCreateAPIView(generics.ListCreateAPIView):
     serializer_class = BranchSerializer
     permission_classes = [IsAuthenticated, IsCompanyOwnerOrAdmin]
 
+    def get_serializer_class(self):
+        # На создание нужен сериализатор, который проставляет company из текущего пользователя
+        if self.request.method in ("POST", "PUT", "PATCH"):
+            return BranchCreateUpdateSerializer
+        return BranchSerializer
+
     def get_queryset(self):
         if getattr(self, "swagger_fake_view", False):
             return Branch.objects.none()
