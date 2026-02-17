@@ -2,11 +2,12 @@
 
 from django.db.models import Q, Prefetch
 from django.http import Http404
+from django.db.utils import ProgrammingError
 
 from rest_framework import generics, permissions, status
 from rest_framework.permissions import IsAuthenticated, AllowAny
 from rest_framework.response import Response
-from rest_framework.exceptions import NotFound, PermissionDenied
+from rest_framework.exceptions import NotFound, PermissionDenied, ValidationError
 from rest_framework_simplejwt.views import TokenObtainPairView
 
 from .models import User, Industry, SubscriptionPlan, Feature, Sector, CustomRole, Company, Branch, BranchMembership
@@ -467,7 +468,22 @@ class BranchDetailAPIView(generics.RetrieveUpdateDestroyAPIView):
         user = self.request.user
         if not (user.is_superuser or getattr(user, "role", None) in ("owner", "admin")):
             raise PermissionDenied("Недостаточно прав для удаления филиала.")
-        instance.delete()
+        try:
+            instance.delete()
+        except ProgrammingError as e:
+            msg = str(e)
+            # Частый кейс на проде: в БД не применены миграции одного из apps,
+            # который содержит FK на Branch (например apps.crm -> crm_contact).
+            if 'relation "crm_contact" does not exist' in msg or "crm_contact" in msg:
+                raise ValidationError({
+                    "detail": (
+                        "Ошибка базы данных: отсутствует таблица crm_contact. "
+                        "Это означает, что миграции приложения CRM не применены. "
+                        "Примените миграции на сервере (например: `python manage.py migrate crm`) "
+                        "и повторите удаление филиала."
+                    )
+                })
+            raise
 
 
 # =========================

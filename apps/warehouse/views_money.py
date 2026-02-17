@@ -4,6 +4,7 @@ from rest_framework import status, filters
 from rest_framework.response import Response
 from rest_framework import generics
 from rest_framework.exceptions import ValidationError
+from django.db import transaction
 from django_filters.rest_framework import DjangoFilterBackend
 
 from .views import CompanyBranchRestrictedMixin
@@ -93,12 +94,82 @@ class MoneyDocumentListCreateView(CompanyBranchRestrictedMixin, generics.ListCre
     filterset_fields = ["doc_type", "status", "cash_register", "warehouse", "counterparty", "payment_category"]
     search_fields = ["number", "comment", "counterparty__name"]
 
+    @staticmethod
+    def _wants_post(request) -> bool:
+        """
+        Backward compatible:
+          - if client sends {"status": "POSTED"} on create/update, auto-post it
+          - or {"post": true}
+          - or ?post=1
+        """
+        data = getattr(request, "data", {}) or {}
+        raw_status = data.get("status")
+        raw_post = data.get("post")
+        qp = getattr(request, "query_params", None)
+        raw_qp = qp.get("post") if qp is not None else None
+
+        if isinstance(raw_post, bool):
+            return raw_post
+        if isinstance(raw_post, str) and raw_post.strip().lower() in ("1", "true", "yes", "y"):
+            return True
+        if isinstance(raw_qp, str) and raw_qp.strip().lower() in ("1", "true", "yes", "y"):
+            return True
+        return str(raw_status).upper() == models.MoneyDocument.Status.POSTED
+
+    def create(self, request, *args, **kwargs):
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        wants_post = self._wants_post(request)
+        with transaction.atomic():
+            # save with company/branch from mixin
+            self._save_with_company_branch(serializer)
+            doc = serializer.instance
+            if wants_post:
+                try:
+                    services_money.post_money_document(doc)
+                except Exception as e:
+                    raise ValidationError({"detail": str(e)})
+
+        # refetch for consistent response
+        doc = (
+            models.MoneyDocument.objects
+            .select_related("cash_register", "warehouse", "counterparty", "payment_category", "company", "branch")
+            .get(pk=serializer.instance.pk)
+        )
+        out = self.get_serializer(doc)
+        headers = self.get_success_headers(out.data)
+        return Response(out.data, status=status.HTTP_201_CREATED, headers=headers)
+
 
 class MoneyDocumentDetailView(CompanyBranchRestrictedMixin, generics.RetrieveUpdateDestroyAPIView):
     serializer_class = serializers_money.MoneyDocumentSerializer
     queryset = models.MoneyDocument.objects.select_related(
         "cash_register", "warehouse", "counterparty", "payment_category", "company", "branch"
     )
+
+    def update(self, request, *args, **kwargs):
+        partial = kwargs.pop("partial", False)
+        instance = self.get_object()
+
+        serializer = self.get_serializer(instance, data=request.data, partial=partial)
+        serializer.is_valid(raise_exception=True)
+
+        wants_post = MoneyDocumentListCreateView._wants_post(request)
+        with transaction.atomic():
+            self.perform_update(serializer)
+            if wants_post and serializer.instance.status != models.MoneyDocument.Status.POSTED:
+                try:
+                    services_money.post_money_document(serializer.instance)
+                except Exception as e:
+                    raise ValidationError({"detail": str(e)})
+
+        instance = (
+            models.MoneyDocument.objects
+            .select_related("cash_register", "warehouse", "counterparty", "payment_category", "company", "branch")
+            .get(pk=serializer.instance.pk)
+        )
+        return Response(self.get_serializer(instance).data, status=status.HTTP_200_OK)
 
 
 class MoneyDocumentPostView(CompanyBranchRestrictedMixin, generics.GenericAPIView):
