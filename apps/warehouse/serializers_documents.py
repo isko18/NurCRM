@@ -52,6 +52,10 @@ class DocumentSerializer(serializers.ModelSerializer):
     receipts = serializers.SerializerMethodField()
     expenses = serializers.SerializerMethodField()
 
+    cash_register_name = serializers.CharField(source="cash_register.name", read_only=True, allow_null=True)
+    payment_category_title = serializers.CharField(source="payment_category.title", read_only=True, allow_null=True)
+    cash_request_status = serializers.SerializerMethodField()
+
     counterparty_display_name = serializers.CharField(
         source="counterparty.name", read_only=True, allow_null=True
     )
@@ -78,6 +82,11 @@ class DocumentSerializer(serializers.ModelSerializer):
             "warehouse_from_name",
             "warehouse_to_name",
             "counterparty",
+            "cash_register",
+            "cash_register_name",
+            "payment_category",
+            "payment_category_title",
+            "cash_request_status",
             "agent",
             "counterparty_display_name",
             "comment",
@@ -89,6 +98,11 @@ class DocumentSerializer(serializers.ModelSerializer):
             "receipts",
             "expenses",
         )
+        read_only_fields = ("number", "total", "status", "date", "cash_request_status")
+
+    def get_cash_request_status(self, obj):
+        req = getattr(obj, "cash_request", None)
+        return getattr(req, "status", None)
 
     def get_receipts(self, obj):
         """Приходы — движения с move_kind=RECEIPT."""
@@ -107,7 +121,6 @@ class DocumentSerializer(serializers.ModelSerializer):
         if moves is None:
             return []
         return StockMoveSerializer(moves, many=True).data
-        read_only_fields = ("number", "total", "status", "date")
 
     def create(self, validated_data):
         items = validated_data.pop("items", [])
@@ -136,8 +149,10 @@ class DocumentSerializer(serializers.ModelSerializer):
         items = validated_data.pop("items", None)
         
         # Проверяем, что документ не проведен
-        if instance.status == instance.Status.POSTED:
-            raise serializers.ValidationError({"status": "Нельзя изменять проведенный документ. Сначала отмените проведение."})
+        if instance.status in (instance.Status.POSTED, instance.Status.CASH_PENDING):
+            raise serializers.ValidationError(
+                {"status": "Нельзя изменять проведенный/ожидающий кассу документ. Сначала отмените проведение."}
+            )
         
         # Валидация документа перед обновлением
         for key, value in validated_data.items():
@@ -163,6 +178,55 @@ class DocumentSerializer(serializers.ModelSerializer):
                 item.save()
         
         return instance
+
+
+class CashRequestDocumentMiniSerializer(serializers.ModelSerializer):
+    warehouse_from_name = serializers.CharField(source="warehouse_from.name", read_only=True, allow_null=True)
+    counterparty_display_name = serializers.CharField(source="counterparty.name", read_only=True, allow_null=True)
+
+    class Meta:
+        model = models.Document
+        fields = (
+            "id",
+            "number",
+            "doc_type",
+            "status",
+            "payment_kind",
+            "date",
+            "total",
+            "warehouse_from",
+            "warehouse_from_name",
+            "counterparty",
+            "counterparty_display_name",
+            "cash_register",
+            "payment_category",
+        )
+
+
+class CashApprovalRequestSerializer(serializers.ModelSerializer):
+    document = CashRequestDocumentMiniSerializer(read_only=True)
+    money_document_id = serializers.UUIDField(source="money_document.id", read_only=True, allow_null=True)
+    decided_by_id = serializers.UUIDField(source="decided_by.id", read_only=True, allow_null=True)
+
+    class Meta:
+        model = models.CashApprovalRequest
+        fields = (
+            "id",
+            "status",
+            "requires_money",
+            "money_doc_type",
+            "amount",
+            "decision_note",
+            "requested_at",
+            "decided_at",
+            "decided_by_id",
+            "money_document_id",
+            "document",
+        )
+
+
+class CashApprovalDecisionSerializer(serializers.Serializer):
+    note = serializers.CharField(required=False, allow_blank=True)
 
 
 class TransferItemInputSerializer(serializers.Serializer):

@@ -20,6 +20,9 @@ class DocumentsTests(TestCase):
         self.branch = Branch.objects.create(company=self.company, name="Main")
 
         self.wh = models.Warehouse.objects.create(name="W1", company=self.company, branch=self.branch, location="loc")
+        # one cash register + one payment category, so автокасса can auto-pick
+        self.cash = models.CashRegister.objects.create(company=self.company, branch=self.branch, name="Cash", location="")
+        self.paycat = models.PaymentCategory.objects.create(company=self.company, branch=self.branch, title="Оплата")
         # create category required by WarehouseProduct
         cat = models.WarehouseProductCategory.objects.create(name="Cat1", company=self.company, branch=self.branch)
         self.prod = models.WarehouseProduct.objects.create(
@@ -27,7 +30,7 @@ class DocumentsTests(TestCase):
             name="P1", code="P1", unit="pcs", quantity=Decimal("0"), purchase_price=Decimal("10.00"), price=Decimal("15.00")
         )
 
-    def test_post_sale_decreases_balance_and_unpost_restores(self):
+    def test_post_sale_creates_cash_request_and_approve_posts_money(self):
         # seed balance 10
         models.StockBalance.objects.create(warehouse=self.wh, product=self.prod, qty=Decimal("10.000"))
 
@@ -42,8 +45,51 @@ class DocumentsTests(TestCase):
         bal = models.StockBalance.objects.get(warehouse=self.wh, product=self.prod)
         self.assertEqual(bal.qty, Decimal("7.000"))
 
+        doc.refresh_from_db()
+        self.assertEqual(doc.status, models.Document.Status.CASH_PENDING)
+        req = doc.cash_request
+        self.assertEqual(req.status, models.CashApprovalRequest.Status.PENDING)
+        self.assertEqual(req.requires_money, True)
+        self.assertEqual(req.money_doc_type, models.MoneyDocument.DocType.MONEY_RECEIPT)
+
+        services.approve_cash_request(doc)
+        doc.refresh_from_db()
+        self.assertEqual(doc.status, models.Document.Status.POSTED)
+        req.refresh_from_db()
+        self.assertEqual(req.status, models.CashApprovalRequest.Status.APPROVED)
+        money_doc = req.money_document
+        self.assertEqual(money_doc.doc_type, models.MoneyDocument.DocType.MONEY_RECEIPT)
+        self.assertEqual(money_doc.status, models.MoneyDocument.Status.POSTED)
+        self.assertEqual(money_doc.cash_register_id, self.cash.id)
+        self.assertEqual(money_doc.payment_category_id, self.paycat.id)
+        self.assertEqual(Decimal(money_doc.amount), Decimal("45.00"))
+
         services.unpost_document(doc)
         bal.refresh_from_db()
+        self.assertEqual(bal.qty, Decimal("10.000"))
+        doc.refresh_from_db()
+        self.assertEqual(doc.status, models.Document.Status.DRAFT)
+
+    def test_reject_cash_request_sets_document_rejected(self):
+        models.StockBalance.objects.create(warehouse=self.wh, product=self.prod, qty=Decimal("10.000"))
+        cp = models.Counterparty.objects.create(name="C1", type=models.Counterparty.Type.CLIENT, company=self.company, branch=self.branch)
+        doc = models.Document.objects.create(
+            doc_type=models.Document.DocType.SALE,
+            warehouse_from=self.wh,
+            counterparty=cp,
+        )
+        models.DocumentItem.objects.create(document=doc, product=self.prod, qty=Decimal("2"), price=Decimal("15"))
+
+        services.post_document(doc)
+        doc.refresh_from_db()
+        self.assertEqual(doc.status, models.Document.Status.CASH_PENDING)
+
+        services.reject_cash_request(doc, note="Отказано кассиром")
+        doc.refresh_from_db()
+        self.assertEqual(doc.status, models.Document.Status.REJECTED)
+        req = doc.cash_request
+        self.assertEqual(req.status, models.CashApprovalRequest.Status.REJECTED)
+        bal = models.StockBalance.objects.get(warehouse=self.wh, product=self.prod)
         self.assertEqual(bal.qty, Decimal("10.000"))
 
     def test_transfer_creates_two_moves(self):

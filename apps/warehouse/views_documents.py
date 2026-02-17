@@ -218,6 +218,168 @@ class DocumentUnpostView(CompanyBranchRestrictedMixin, generics.GenericAPIView):
         return Response(self.get_serializer(doc).data)
 
 
+class DocumentCashApproveView(CompanyBranchRestrictedMixin, generics.GenericAPIView):
+    serializer_class = serializers_documents.DocumentSerializer
+
+    def get_queryset(self):
+        qs = models.Document.objects.select_related(
+            "warehouse_from", "warehouse_to", "counterparty", "cash_register", "payment_category"
+        )
+        qs = DocumentListCreateView._filter_company_branch(self, qs)
+        user = self.request.user
+        if not _is_owner_like(user):
+            qs = qs.filter(agent=user)
+        return qs
+
+    def post(self, request, pk=None):
+        doc = self.get_object()
+        note = (request.data.get("note") or "").strip()
+        try:
+            services.approve_cash_request(doc, decided_by=request.user, note=note)
+        except Exception as e:
+            return Response({"detail": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+        doc.refresh_from_db()
+        return Response(self.get_serializer(doc).data, status=status.HTTP_200_OK)
+
+
+class DocumentCashRejectView(CompanyBranchRestrictedMixin, generics.GenericAPIView):
+    serializer_class = serializers_documents.DocumentSerializer
+
+    def get_queryset(self):
+        qs = models.Document.objects.select_related(
+            "warehouse_from", "warehouse_to", "counterparty", "cash_register", "payment_category"
+        )
+        qs = DocumentListCreateView._filter_company_branch(self, qs)
+        user = self.request.user
+        if not _is_owner_like(user):
+            qs = qs.filter(agent=user)
+        return qs
+
+    def post(self, request, pk=None):
+        doc = self.get_object()
+        note = (request.data.get("note") or "").strip()
+        try:
+            services.reject_cash_request(doc, decided_by=request.user, note=note)
+        except Exception as e:
+            return Response({"detail": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+        doc.refresh_from_db()
+        return Response(self.get_serializer(doc).data, status=status.HTTP_200_OK)
+
+
+class CashApprovalRequestListView(CompanyBranchRestrictedMixin, generics.ListAPIView):
+    """
+    Входящие запросы кассы (CASH_PENDING) с фильтрами/поиском.
+    """
+    serializer_class = serializers_documents.CashApprovalRequestSerializer
+    filter_backends = [DjangoFilterBackend, filters.SearchFilter]
+    filterset_fields = ["status", "requires_money", "money_doc_type", "document__doc_type", "document__payment_kind"]
+    search_fields = ["document__number", "document__comment", "document__counterparty__name"]
+
+    def get_queryset(self):
+        company = self._company()
+        if company is None:
+            return models.CashApprovalRequest.objects.none()
+
+        branch = self._auto_branch()
+        qs = (
+            models.CashApprovalRequest.objects
+            .select_related(
+                "document",
+                "document__warehouse_from",
+                "document__counterparty",
+                "document__cash_register",
+                "document__payment_category",
+                "money_document",
+                "decided_by",
+            )
+            .filter(
+                Q(document__warehouse_from__company=company) | Q(document__warehouse_to__company=company)
+            )
+            .order_by("-requested_at")
+        )
+        if branch is not None:
+            qs = qs.filter(
+                Q(document__warehouse_from__branch=branch) | Q(document__warehouse_to__branch=branch)
+            )
+        return qs
+
+
+class CashApprovalRequestApproveView(CompanyBranchRestrictedMixin, generics.GenericAPIView):
+    serializer_class = serializers_documents.CashApprovalRequestSerializer
+
+    def get_queryset(self):
+        company = self._company()
+        if company is None:
+            return models.CashApprovalRequest.objects.none()
+
+        branch = self._auto_branch()
+        qs = (
+            models.CashApprovalRequest.objects
+            .select_related("document__warehouse_from", "document__warehouse_to")
+            .filter(
+                Q(document__warehouse_from__company=company) | Q(document__warehouse_to__company=company)
+            )
+        )
+        if branch is not None:
+            qs = qs.filter(
+                Q(document__warehouse_from__branch=branch) | Q(document__warehouse_to__branch=branch)
+            )
+        return qs
+
+    def post(self, request, pk=None):
+        cash_request = self.get_object()
+        ser = serializers_documents.CashApprovalDecisionSerializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+        note = (ser.validated_data.get("note") or "").strip()
+
+        try:
+            services.approve_cash_request(cash_request.document, decided_by=request.user, note=note)
+        except Exception as e:
+            return Response({"detail": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+        cash_request.refresh_from_db()
+        out = serializers_documents.CashApprovalRequestSerializer(cash_request, context={"request": request}).data
+        return Response(out, status=status.HTTP_200_OK)
+
+
+class CashApprovalRequestRejectView(CompanyBranchRestrictedMixin, generics.GenericAPIView):
+    serializer_class = serializers_documents.CashApprovalRequestSerializer
+
+    def get_queryset(self):
+        company = self._company()
+        if company is None:
+            return models.CashApprovalRequest.objects.none()
+
+        branch = self._auto_branch()
+        qs = (
+            models.CashApprovalRequest.objects
+            .select_related("document__warehouse_from", "document__warehouse_to")
+            .filter(
+                Q(document__warehouse_from__company=company) | Q(document__warehouse_to__company=company)
+            )
+        )
+        if branch is not None:
+            qs = qs.filter(
+                Q(document__warehouse_from__branch=branch) | Q(document__warehouse_to__branch=branch)
+            )
+        return qs
+
+    def post(self, request, pk=None):
+        cash_request = self.get_object()
+        ser = serializers_documents.CashApprovalDecisionSerializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+        note = (ser.validated_data.get("note") or "").strip()
+
+        try:
+            services.reject_cash_request(cash_request.document, decided_by=request.user, note=note)
+        except Exception as e:
+            return Response({"detail": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+        cash_request.refresh_from_db()
+        out = serializers_documents.CashApprovalRequestSerializer(cash_request, context={"request": request}).data
+        return Response(out, status=status.HTTP_200_OK)
+
+
 class DocumentTransferCreateAPIView(CompanyBranchRestrictedMixin, APIView):
     """
     Быстрое перемещение товара (создает документ TRANSFER и сразу проводит).

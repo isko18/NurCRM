@@ -80,8 +80,143 @@ def _apply_agent_move(move: models.AgentStockMove):
     bal.save()
 
 
+def _resolve_money_doc_type(doc_type: str):
+    """
+    Для каждой складской операции определяем, какой денежный документ нужен.
+    None = кассовый документ не создается, но решение approve/reject все равно требуется.
+    """
+    mapping = {
+        models.Document.DocType.SALE: models.MoneyDocument.DocType.MONEY_RECEIPT,
+        models.Document.DocType.PURCHASE: models.MoneyDocument.DocType.MONEY_EXPENSE,
+        models.Document.DocType.SALE_RETURN: models.MoneyDocument.DocType.MONEY_EXPENSE,
+        models.Document.DocType.PURCHASE_RETURN: models.MoneyDocument.DocType.MONEY_RECEIPT,
+        models.Document.DocType.RECEIPT: models.MoneyDocument.DocType.MONEY_RECEIPT,
+        models.Document.DocType.WRITE_OFF: models.MoneyDocument.DocType.MONEY_EXPENSE,
+        # INVENTORY / TRANSFER - без денежного движения (только подтверждение/отклонение).
+    }
+    return mapping.get(doc_type)
+
+
+def _pick_single(qs, *, what: str):
+    """
+    Возвращает единственный объект из qs, иначе:
+      - None, если пусто
+      - ValueError, если найдено больше одного (неоднозначно)
+    """
+    objs = list(qs[:2])
+    if len(objs) == 1:
+        return objs[0]
+    if len(objs) == 0:
+        return None
+    raise ValueError(f"Найдено несколько объектов ({what}). Укажите явно в документе.")
+
+
+def _create_or_reset_cash_request(document: models.Document):
+    """
+    После проведения создается запрос на кассовое подтверждение.
+    Денежный документ будет создан только на approve.
+    """
+    money_doc_type = _resolve_money_doc_type(document.doc_type)
+    requires_money = (
+        document.payment_kind == models.Document.PaymentKind.CASH
+        and money_doc_type is not None
+        and not document.agent_id
+    )
+    amount = Decimal(document.total or 0).quantize(Decimal("0.01"))
+
+    req, _created = models.CashApprovalRequest.objects.update_or_create(
+        document=document,
+        defaults={
+            "status": models.CashApprovalRequest.Status.PENDING,
+            "requires_money": requires_money,
+            "money_doc_type": money_doc_type if requires_money else None,
+            "amount": amount,
+            "decision_note": "",
+            "decided_at": None,
+            "decided_by": None,
+            "money_document": None,
+        },
+    )
+    return req
+
+
+def _create_money_document_for_request(document: models.Document, request_obj: models.CashApprovalRequest):
+    if not request_obj.requires_money:
+        return None
+
+    money_doc_type = request_obj.money_doc_type
+    if not money_doc_type:
+        raise ValueError("Не удалось определить тип денежного документа.")
+
+    if not document.counterparty_id and document.doc_type in (
+        models.Document.DocType.SALE,
+        models.Document.DocType.PURCHASE,
+        models.Document.DocType.SALE_RETURN,
+        models.Document.DocType.PURCHASE_RETURN,
+    ):
+        raise ValueError("Для проведения в кассу укажите контрагента в документе.")
+
+    amount = Decimal(request_obj.amount or 0).quantize(Decimal("0.01"))
+    if amount <= 0:
+        raise ValueError("Сумма для кассы должна быть больше 0.")
+
+    warehouse = document.warehouse_from
+    if not warehouse:
+        raise ValueError("Для автокассы нужен warehouse_from.")
+
+    company = warehouse.company
+    branch = warehouse.branch
+
+    # cash register: from document or auto-pick if unique
+    cash_register = getattr(document, "cash_register", None)
+    if cash_register is None:
+        qs = models.CashRegister.objects.filter(company=company)
+        qs = qs.filter(branch=branch) if branch is not None else qs.filter(branch__isnull=True)
+        cash_register = _pick_single(qs, what="касс")
+        if cash_register is None:
+            raise ValueError("Не найдена касса. Создайте кассу или укажите cash_register в документе.")
+
+    if cash_register.company_id != company.id:
+        raise ValueError("Касса принадлежит другой компании.")
+    if (branch is None and cash_register.branch_id is not None) or (branch is not None and cash_register.branch_id != branch.id):
+        raise ValueError("Касса принадлежит другому филиалу.")
+
+    # payment category: from document or auto-pick if unique
+    payment_category = getattr(document, "payment_category", None)
+    if payment_category is None:
+        qs = models.PaymentCategory.objects.filter(company=company)
+        qs = qs.filter(branch=branch) if branch is not None else qs.filter(branch__isnull=True)
+        payment_category = _pick_single(qs, what="категорий платежа")
+        if payment_category is None:
+            raise ValueError(
+                "Не найдена категория платежа. Создайте категорию или укажите payment_category в документе."
+            )
+
+    if payment_category.company_id != company.id:
+        raise ValueError("Категория платежа принадлежит другой компании.")
+    if (branch is None and payment_category.branch_id is not None) or (branch is not None and payment_category.branch_id != branch.id):
+        raise ValueError("Категория платежа принадлежит другому филиалу.")
+
+    from . import services_money
+
+    money_doc = models.MoneyDocument.objects.create(
+        doc_type=request_obj.money_doc_type,
+        status=models.MoneyDocument.Status.DRAFT,
+        cash_register=cash_register,
+        counterparty=document.counterparty,
+        payment_category=payment_category,
+        amount=amount,
+        comment=f"АВТО: {document.doc_type} {document.number or document.id}",
+        company=company,
+        branch=branch,
+        source_document=document,
+    )
+    services_money.post_money_document(money_doc)
+    return money_doc
+
+
 def post_document(document: models.Document, allow_negative: bool = None) -> models.Document:
-    if document.status == document.Status.POSTED:
+    if document.status in (document.Status.CASH_PENDING, document.Status.POSTED):
         raise ValueError("Document already posted")
 
     if not document.items.exists():
@@ -351,14 +486,17 @@ def post_document(document: models.Document, allow_negative: bool = None) -> mod
                 )
                 _apply_move(mv)
 
-        document.status = document.Status.POSTED
+        document.status = document.Status.CASH_PENDING
         document.save()
+
+        # На этапе post создаем запрос на решение по кассе.
+        _create_or_reset_cash_request(document)
 
     return document
 
 
 def unpost_document(document: models.Document) -> models.Document:
-    if document.status != document.Status.POSTED:
+    if document.status not in (document.Status.POSTED, document.Status.CASH_PENDING):
         raise ValueError("Document is not posted")
 
     with transaction.atomic():
@@ -411,7 +549,77 @@ def unpost_document(document: models.Document) -> models.Document:
                     type(mv.product).objects.filter(pk=mv.product_id).update(quantity=q_qty(bal.qty))
                 mv.delete()
 
+        # Если был уже создан денежный документ - откатим его.
+        try:
+            money_doc = getattr(document, "money_document", None)
+        except Exception:
+            money_doc = None
+        if money_doc is not None and money_doc.status == models.MoneyDocument.Status.POSTED:
+            from . import services_money
+            services_money.unpost_money_document(money_doc)
+
+        # Если был pending-запрос на кассу — пометим отклоненным.
+        try:
+            cash_req = getattr(document, "cash_request", None)
+        except Exception:
+            cash_req = None
+        if cash_req is not None and cash_req.status == models.CashApprovalRequest.Status.PENDING:
+            cash_req.status = models.CashApprovalRequest.Status.REJECTED
+            cash_req.decision_note = "Отклонено автоматически: документ распроведен."
+            cash_req.decided_at = timezone.now()
+            cash_req.save(update_fields=["status", "decision_note", "decided_at"])
+
         document.status = document.Status.DRAFT
         document.save()
+
+    return document
+
+
+def approve_cash_request(document: models.Document, *, decided_by=None, note: str = "") -> models.Document:
+    if document.status != document.Status.CASH_PENDING:
+        raise ValueError("Документ не ожидает решения кассы.")
+
+    request_obj = getattr(document, "cash_request", None)
+    if request_obj is None:
+        raise ValueError("Запрос в кассу не найден.")
+    if request_obj.status != models.CashApprovalRequest.Status.PENDING:
+        raise ValueError("Запрос в кассу уже обработан.")
+
+    with transaction.atomic():
+        money_doc = _create_money_document_for_request(document, request_obj)
+        request_obj.status = models.CashApprovalRequest.Status.APPROVED
+        request_obj.decision_note = note or ""
+        request_obj.decided_at = timezone.now()
+        request_obj.decided_by = decided_by
+        request_obj.money_document = money_doc
+        request_obj.save(update_fields=["status", "decision_note", "decided_at", "decided_by", "money_document"])
+
+        document.status = document.Status.POSTED
+        document.save(update_fields=["status"])
+
+    return document
+
+
+def reject_cash_request(document: models.Document, *, decided_by=None, note: str = "") -> models.Document:
+    if document.status != document.Status.CASH_PENDING:
+        raise ValueError("Документ не ожидает решения кассы.")
+
+    request_obj = getattr(document, "cash_request", None)
+    if request_obj is None:
+        raise ValueError("Запрос в кассу не найден.")
+    if request_obj.status != models.CashApprovalRequest.Status.PENDING:
+        raise ValueError("Запрос в кассу уже обработан.")
+
+    with transaction.atomic():
+        # Откатываем складские движения
+        unpost_document(document)
+        document.status = document.Status.REJECTED
+        document.save(update_fields=["status"])
+
+        request_obj.status = models.CashApprovalRequest.Status.REJECTED
+        request_obj.decision_note = note or ""
+        request_obj.decided_at = timezone.now()
+        request_obj.decided_by = decided_by
+        request_obj.save(update_fields=["status", "decision_note", "decided_at", "decided_by"])
 
     return document

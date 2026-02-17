@@ -60,3 +60,10 @@ class MoneyDocumentAdmin(admin.ModelAdmin):
     list_display = ("number", "doc_type", "status", "date", "cash_register", "warehouse", "counterparty", "payment_category", "amount")
     list_filter = ("doc_type", "status", "company", "branch", "cash_register", "warehouse", "payment_category")
     search_fields = ("number", "comment", "counterparty__name")
+
+
+@admin.register(models.CashApprovalRequest)
+class CashApprovalRequestAdmin(admin.ModelAdmin):
+    list_display = ("document", "status", "requires_money", "money_doc_type", "amount", "requested_at", "decided_at")
+    list_filter = ("status", "requires_money", "money_doc_type")
+    search_fields = ("document__number", "decision_note")
