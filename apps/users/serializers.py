@@ -205,6 +205,12 @@ class UserSerializer(serializers.ModelSerializer):
             "can_view_employees", "can_view_clients",
             "can_view_brand_category", "can_view_settings", "can_view_sale",
 
+            "can_view_building_analytics", "can_view_building_cash_register",
+            "can_view_building_clients", "can_view_building_department",
+            "can_view_building_employess", "can_view_building_notification",
+            "can_view_building_procurement", "can_view_building_projects",
+            "can_view_building_salary", "can_view_building_sell",
+            "can_view_building_stock", "can_view_building_treaty",
             "can_view_building_work_process", "can_view_building_objects",
             "can_view_additional_services", "can_view_debts",
 
