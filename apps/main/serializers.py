@@ -233,6 +233,43 @@ class ProductCategorySerializer(CompanyBranchReadOnlyMixin, serializers.ModelSer
         br = self._auto_branch()
         _restrict_pk_queryset_strict(self.fields.get("parent"), ProductCategory.objects.all(), comp, br)
 
+    def validate(self, attrs):
+        """
+        Превращаем DB IntegrityError (unique constraint) в нормальную 400-ошибку.
+        Повторяем логику constraints из модели:
+          - если branch != NULL -> уникальность (branch, name)
+          - если branch == NULL -> уникальность (company, name) среди branch IS NULL
+        """
+        attrs = super().validate(attrs)
+
+        name = attrs.get("name")
+        if name is None:
+            return attrs
+
+        name = name.strip()
+        attrs["name"] = name
+
+        company = self._user_company()
+        branch = self._auto_branch()
+
+        qs = ProductCategory.objects.all()
+        if self.instance is not None:
+            qs = qs.exclude(pk=self.instance.pk)
+
+        if branch is not None:
+            qs = qs.filter(branch=branch, name=name)
+        else:
+            # глобальная категория (branch is NULL) — уникальна в рамках компании
+            if company is not None:
+                qs = qs.filter(company=company, branch__isnull=True, name=name)
+            else:
+                qs = qs.filter(branch__isnull=True, name=name)
+
+        if qs.exists():
+            raise serializers.ValidationError({"name": "Категория с таким названием уже существует."})
+
+        return attrs
+
 
 class ProductBrandSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
     company = serializers.ReadOnlyField(source="company.id")
@@ -254,6 +291,39 @@ class ProductBrandSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerial
         comp = self._user_company()
         br = self._auto_branch()
         _restrict_pk_queryset_strict(self.fields.get("parent"), ProductBrand.objects.all(), comp, br)
+
+    def validate(self, attrs):
+        """
+        Аналогично ProductCategorySerializer.validate(), но для брендов.
+        """
+        attrs = super().validate(attrs)
+
+        name = attrs.get("name")
+        if name is None:
+            return attrs
+
+        name = name.strip()
+        attrs["name"] = name
+
+        company = self._user_company()
+        branch = self._auto_branch()
+
+        qs = ProductBrand.objects.all()
+        if self.instance is not None:
+            qs = qs.exclude(pk=self.instance.pk)
+
+        if branch is not None:
+            qs = qs.filter(branch=branch, name=name)
+        else:
+            if company is not None:
+                qs = qs.filter(company=company, branch__isnull=True, name=name)
+            else:
+                qs = qs.filter(branch__isnull=True, name=name)
+
+        if qs.exists():
+            raise serializers.ValidationError({"name": "Бренд с таким названием уже существует."})
+
+        return attrs
 
 
 # ===========================

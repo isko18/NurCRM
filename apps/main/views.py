@@ -1525,10 +1525,34 @@ class ProductCategoryListCreateAPIView(CompanyBranchRestrictedMixin, generics.Li
     search_fields = ["name"]
     filterset_fields = "__all__"
 
+    def perform_create(self, serializer):
+        try:
+            self._save_with_company_branch(serializer)
+        except IntegrityError as e:
+            msg = str(e)
+            if (
+                "uq_crm_category_name_global_per_company" in msg
+                or "uq_crm_category_name_per_branch" in msg
+            ):
+                raise ValidationError({"name": "Категория с таким названием уже существует."})
+            raise
+
 
 class ProductCategoryRetrieveUpdateDestroyAPIView(CompanyBranchRestrictedMixin, generics.RetrieveUpdateDestroyAPIView):
     serializer_class = ProductCategorySerializer
     queryset = ProductCategory.objects.select_related("company", "branch", "parent").all()
+
+    def perform_update(self, serializer):
+        try:
+            self._save_with_company_branch(serializer)
+        except IntegrityError as e:
+            msg = str(e)
+            if (
+                "uq_crm_category_name_global_per_company" in msg
+                or "uq_crm_category_name_per_branch" in msg
+            ):
+                raise ValidationError({"name": "Категория с таким названием уже существует."})
+            raise
 
 
 class ProductBrandListCreateAPIView(CompanyBranchRestrictedMixin, generics.ListCreateAPIView):
@@ -1538,10 +1562,34 @@ class ProductBrandListCreateAPIView(CompanyBranchRestrictedMixin, generics.ListC
     search_fields = ["name"]
     filterset_fields = "__all__"
 
+    def perform_create(self, serializer):
+        try:
+            self._save_with_company_branch(serializer)
+        except IntegrityError as e:
+            msg = str(e)
+            if (
+                "uq_crm_brand_name_global_per_company" in msg
+                or "uq_crm_brand_name_per_branch" in msg
+            ):
+                raise ValidationError({"name": "Бренд с таким названием уже существует."})
+            raise
+
 
 class ProductBrandRetrieveUpdateDestroyAPIView(CompanyBranchRestrictedMixin, generics.RetrieveUpdateDestroyAPIView):
     serializer_class = ProductBrandSerializer
     queryset = ProductBrand.objects.select_related("company", "branch").all()
+
+    def perform_update(self, serializer):
+        try:
+            self._save_with_company_branch(serializer)
+        except IntegrityError as e:
+            msg = str(e)
+            if (
+                "uq_crm_brand_name_global_per_company" in msg
+                or "uq_crm_brand_name_per_branch" in msg
+            ):
+                raise ValidationError({"name": "Бренд с таким названием уже существует."})
+            raise
 
 
 # ===========================
