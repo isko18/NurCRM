@@ -97,17 +97,20 @@ def _resolve_money_doc_type(doc_type: str):
     return mapping.get(doc_type)
 
 
-def _pick_single(qs, *, what: str):
+def _pick_single(qs, *, what: str, allow_multiple_take_first: bool = False):
     """
     Возвращает единственный объект из qs, иначе:
       - None, если пусто
-      - ValueError, если найдено больше одного (неоднозначно)
+      - ValueError, если найдено больше одного (неоднозначно), кроме случая allow_multiple_take_first=True
+      - при allow_multiple_take_first=True при нескольких объектах возвращает первый
     """
     objs = list(qs[:2])
     if len(objs) == 1:
         return objs[0]
     if len(objs) == 0:
         return None
+    if allow_multiple_take_first:
+        return qs.first()
     raise ValueError(f"Найдено несколько объектов ({what}). Укажите явно в документе.")
 
 
@@ -167,12 +170,12 @@ def _create_money_document_for_request(document: models.Document, request_obj: m
     company = warehouse.company
     branch = warehouse.branch
 
-    # cash register: from document or auto-pick if unique
+    # cash register: from document or auto-pick (при нескольких кассах берём первую)
     cash_register = getattr(document, "cash_register", None)
     if cash_register is None:
         qs = models.CashRegister.objects.filter(company=company)
         qs = qs.filter(branch=branch) if branch is not None else qs.filter(branch__isnull=True)
-        cash_register = _pick_single(qs, what="касс")
+        cash_register = _pick_single(qs, what="касс", allow_multiple_take_first=True)
         if cash_register is None:
             raise ValueError("Не найдена касса. Создайте кассу или укажите cash_register в документе.")
 

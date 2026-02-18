@@ -5,6 +5,7 @@ from rest_framework.response import Response
 from rest_framework import generics
 from rest_framework.exceptions import ValidationError
 from django.db import transaction, IntegrityError
+from django.db.models import Sum, Q
 from django_filters.rest_framework import DjangoFilterBackend
 
 from .views import CompanyBranchRestrictedMixin
@@ -25,6 +26,33 @@ class CashRegisterListCreateView(CompanyBranchRestrictedMixin, generics.ListCrea
             # на всякий случай (не должно происходить при IsAuthenticated)
             raise ValidationError({"company": "Обязательное поле."})
         serializer.save(company=company, branch=branch)
+
+    def list(self, request, *args, **kwargs):
+        response = super().list(request, *args, **kwargs)
+        qs = self.filter_queryset(self.get_queryset())
+        register_ids = list(qs.values_list("pk", flat=True))
+        if register_ids:
+            agg = models.MoneyDocument.objects.filter(
+                cash_register_id__in=register_ids,
+                status=models.MoneyDocument.Status.POSTED,
+            ).aggregate(
+                receipts_total=Sum(
+                    "amount",
+                    filter=Q(doc_type=models.MoneyDocument.DocType.MONEY_RECEIPT),
+                    default=Decimal("0.00"),
+                ),
+                expenses_total=Sum(
+                    "amount",
+                    filter=Q(doc_type=models.MoneyDocument.DocType.MONEY_EXPENSE),
+                    default=Decimal("0.00"),
+                ),
+            )
+            response.data["receipts_total"] = str(agg["receipts_total"] or Decimal("0.00"))
+            response.data["expenses_total"] = str(agg["expenses_total"] or Decimal("0.00"))
+        else:
+            response.data["receipts_total"] = "0.00"
+            response.data["expenses_total"] = "0.00"
+        return response
 
 
 class CashRegisterDetailView(CompanyBranchRestrictedMixin, generics.RetrieveUpdateDestroyAPIView):
