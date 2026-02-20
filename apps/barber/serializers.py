@@ -264,7 +264,31 @@ class ClientSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
         """
         Клиент создаётся глобально или в текущем филиале пользователя.
         Поле branch read-only, поэтому клиент не может его подменить.
+        Проверяем уникальность телефона в рамках компании (глобально или по филиалу).
         """
+        phone = (attrs.get("phone") or "").strip() if attrs.get("phone") else None
+        if not phone:
+            return attrs
+
+        company = self._user_company()
+        # Use branch from view context (ClientListCreateView) so validation matches save()
+        branch = self.context.get("active_branch")
+        if branch is None:
+            branch = self._auto_branch()
+        if not company:
+            return attrs
+
+        qs = Client.objects.filter(company=company, phone=phone)
+        if branch is not None:
+            qs = qs.filter(branch=branch)
+        else:
+            qs = qs.filter(branch__isnull=True)
+        if self.instance is not None:
+            qs = qs.exclude(pk=self.instance.pk)
+        if qs.exists():
+            raise serializers.ValidationError(
+                {"phone": "Клиент с таким номером телефона уже существует в этой компании (или в выбранном филиале)."}
+            )
         return attrs
 
 

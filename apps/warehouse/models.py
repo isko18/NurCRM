@@ -289,7 +289,9 @@ class WarehouseProduct(BaseModelId, BaseModelDate, BaseModelCompanyBranch):
 
     category = models.ForeignKey(
         "warehouse.WarehouseProductCategory",
-        on_delete=models.CASCADE,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
         verbose_name="Категория",
     )
 
@@ -848,8 +850,84 @@ class Counterparty(models.Model):
     def clean(self):
         if self.branch_id and self.company_id and self.branch.company_id != self.company_id:
             raise ValidationError({"branch": "Филиал принадлежит другой компании."})
-        if self.agent_id and self.company_id and getattr(self.agent, "company_id", None) not in (None, self.company_id):
-            raise ValidationError({"agent": "Агент принадлежит другой компании."})
+        if self.agent_id and self.company_id:
+            agent_company_id = getattr(self.agent, "company_id", None)
+            if agent_company_id == self.company_id:
+                return
+            if CompanyWarehouseAgent.objects.filter(
+                user=self.agent,
+                company_id=self.company_id,
+                status=CompanyWarehouseAgent.Status.ACTIVE,
+            ).exists():
+                return
+            raise ValidationError({"agent": "Агент должен быть сотрудником или активным агентом этой компании."})
+
+
+class CompanyWarehouseAgent(models.Model):
+    """
+    Заявка/членство: пользователь как агент склада компании.
+    Агент может сам отправить заявку (pending), владелец/админ принимает (active)
+    или отказывает (rejected). Позже владелец может отстранить агента (removed).
+    """
+    class Status(models.TextChoices):
+        PENDING = "pending", "Ожидает решения"
+        ACTIVE = "active", "Активен (сотрудник компании)"
+        REJECTED = "rejected", "Отклонён"
+        REMOVED = "removed", "Отстранён"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    company = models.ForeignKey(
+        "users.Company",
+        on_delete=models.CASCADE,
+        related_name="warehouse_agent_requests",
+        verbose_name="Компания",
+    )
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="warehouse_company_agent_memberships",
+        verbose_name="Агент (пользователь)",
+    )
+    status = models.CharField(
+        max_length=16,
+        choices=Status.choices,
+        default=Status.PENDING,
+        db_index=True,
+        verbose_name="Статус",
+    )
+    note = models.CharField(
+        max_length=512,
+        blank=True,
+        verbose_name="Сообщение от агента при запросе",
+    )
+    created_at = models.DateTimeField(auto_now_add=True, verbose_name="Дата запроса")
+    updated_at = models.DateTimeField(auto_now=True, verbose_name="Дата обновления")
+    decided_at = models.DateTimeField(null=True, blank=True, verbose_name="Дата решения")
+    decided_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="warehouse_agent_decisions",
+        verbose_name="Кем решено",
+    )
+
+    class Meta:
+        verbose_name = "Агент склада (заявка в компанию)"
+        verbose_name_plural = "Агенты складов (заявки в компании)"
+        constraints = [
+            models.UniqueConstraint(
+                fields=("company", "user"),
+                name="uq_warehouse_company_warehouse_agent_company_user",
+            ),
+        ]
+        indexes = [
+            models.Index(fields=["company", "status"]),
+            models.Index(fields=["user", "status"]),
+        ]
+
+    def __str__(self):
+        return f"{self.user_id} → {self.company_id} [{self.status}]"
 
 
 class DocumentSequence(models.Model):
@@ -1156,7 +1234,9 @@ class AgentRequestCart(BaseModelId, BaseModelDate, BaseModelCompanyBranch):
             raise ValidationError({"warehouse": "Склад принадлежит другой компании."})
         if self.branch_id and self.warehouse_id and self.warehouse.branch_id not in (None, self.branch_id):
             raise ValidationError({"warehouse": "Склад другого филиала."})
-        if self.agent_id and getattr(self.agent, "company_id", None) not in (None, self.company_id):
+        # Агент без компании (company_id=None) может быть агентом по заявке (CompanyWarehouseAgent) — доступ проверяется в API
+        agent_company_id = getattr(self.agent, "company_id", None)
+        if self.agent_id and self.company_id and agent_company_id is not None and agent_company_id != self.company_id:
             raise ValidationError({"agent": "Агент принадлежит другой компании."})
 
     def is_editable(self) -> bool:

@@ -11,6 +11,7 @@ from decimal import Decimal
 from django.db import IntegrityError
 from django.db.models import Count, Sum, DecimalField, Value as V
 from django.db.models.functions import Coalesce
+from django.utils import timezone
 
 from apps.users.models import Branch
 
@@ -26,6 +27,7 @@ from .serializers import (
     AgentRequestItemSerializer,
     AgentRequestCartActionSerializer,
     AgentStockBalanceSerializer,
+    CompanyWarehouseAgentSerializer,
 )
 
 from apps.warehouse import models as m
@@ -35,6 +37,31 @@ from apps.warehouse.filters import (
     ProductFilter,
 )
 from apps.utils import _is_owner_like
+
+
+def _company_ids_for_warehouse_access(user):
+    """
+    Список id компаний, к складам которых пользователь имеет доступ:
+    владелец (owned_company), сотрудник (company) или активный агент (CompanyWarehouseAgent).
+    """
+    if not user or not getattr(user, "is_authenticated", False):
+        return []
+    ids = set()
+    owned = getattr(user, "owned_company_id", None) or (
+        getattr(user, "owned_company", None) and getattr(user.owned_company, "id", None)
+    )
+    if owned:
+        ids.add(owned)
+    emp = getattr(user, "company_id", None)
+    if emp:
+        ids.add(emp)
+    qs = m.CompanyWarehouseAgent.objects.filter(
+        user=user,
+        status=m.CompanyWarehouseAgent.Status.ACTIVE,
+    ).values_list("company_id", flat=True)
+    for cid in qs:
+        ids.add(cid)
+    return list(ids)
 
 
 # ---- Barcode helpers ----
@@ -90,6 +117,13 @@ class CompanyBranchRestrictedMixin:
         if br is not None:
             return getattr(br, "company", None)
 
+        # Агент без своей компании: первая компания, где он активный агент (для контекста)
+        first = m.CompanyWarehouseAgent.objects.filter(
+            user=u,
+            status=m.CompanyWarehouseAgent.Status.ACTIVE,
+        ).select_related("company").first()
+        if first:
+            return first.company
         return None
 
     def _fixed_branch_from_user(self, company) -> Optional[Branch]:
@@ -203,14 +237,21 @@ class CompanyBranchRestrictedMixin:
         company = self._company()
         branch = self._auto_branch()
         model = qs.model
+        user = self._user()
 
-        if company is None:
+        company_ids = _company_ids_for_warehouse_access(user) if user else []
+        if company is None and not company_ids:
+            return qs.none()
+
+        if company is not None:
+            company_ids = [company.id]
+        elif not company_ids:
             return qs.none()
 
         if company_field:
-            qs = qs.filter(**{company_field: company})
+            qs = qs.filter(**{f"{company_field}__in": company_ids})
         elif self._model_has_field(model, "company"):
-            qs = qs.filter(company=company)
+            qs = qs.filter(company_id__in=company_ids)
 
         if branch_field:
             if branch is not None:
@@ -630,9 +671,9 @@ class AgentRequestCartListCreateAPIView(CompanyBranchRestrictedMixin, generics.L
         if not warehouse:
             raise ValidationError({"warehouse": "Укажите склад."})
 
-        company = self._company()
-        if company and warehouse.company_id != company.id:
-            raise ValidationError({"warehouse": "Склад принадлежит другой компании."})
+        company_ids = _company_ids_for_warehouse_access(user)
+        if company_ids and warehouse.company_id not in company_ids:
+            raise ValidationError({"warehouse": "Склад принадлежит другой компании или у вас нет доступа."})
 
         active_branch = self._auto_branch()
         if active_branch is not None and warehouse.branch_id not in (None, active_branch.id):
@@ -807,3 +848,145 @@ class OwnerAgentsProductsListAPIView(CompanyBranchRestrictedMixin, APIView):
         qs = self._filter_qs_company_branch_relaxed(qs)
         data = AgentStockBalanceSerializer(qs, many=True).data
         return Response(data)
+
+
+# ----------------
+# Агенты склада: поиск компаний, заявки в компанию, приём/отклонение/отстранение
+# ----------------
+
+
+class CompaniesSearchForAgentsAPIView(APIView):
+    """Поиск компаний для отправки заявки стать агентом. Доступно любому аутентифицированному пользователю."""
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request, *args, **kwargs):
+        from apps.users.models import Company
+        search = (request.query_params.get("search") or "").strip()[:128]
+        qs = Company.objects.all().order_by("name")
+        if search:
+            qs = qs.filter(name__icontains=search)
+        qs = qs[:50]
+        data = [{"id": str(c.id), "name": c.name, "slug": getattr(c, "slug", "") or ""} for c in qs]
+        return Response(data)
+
+
+class CompanyWarehouseAgentRequestListCreateAPIView(APIView):
+    """Список моих заявок в компании (агент) или заявок в мою компанию (владелец). Создание заявки (агент)."""
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get_queryset(self):
+        user = self.request.user
+        qs = m.CompanyWarehouseAgent.objects.select_related("company", "user", "decided_by").order_by("-created_at")
+        if _is_owner_like(user):
+            company = getattr(user, "owned_company", None) or getattr(user, "company", None)
+            if company:
+                qs = qs.filter(company=company)
+            else:
+                qs = qs.none()
+        else:
+            qs = qs.filter(user=user)
+        return qs
+
+    def get(self, request, *args, **kwargs):
+        status_filter = request.query_params.get("status")
+        qs = self.get_queryset()
+        if status_filter:
+            qs = qs.filter(status=status_filter)
+        data = CompanyWarehouseAgentSerializer(qs, many=True).data
+        return Response(data)
+
+    def post(self, request, *args, **kwargs):
+        if _is_owner_like(request.user):
+            return Response({"detail": "Владелец/админ не отправляет заявку в свою компанию."}, status=status.HTTP_400_BAD_REQUEST)
+        company_id = request.data.get("company")
+        if not company_id:
+            raise ValidationError({"company": "Укажите компанию (id)."})
+        from apps.users.models import Company
+        try:
+            company = Company.objects.get(id=company_id)
+        except (Company.DoesNotExist, ValueError, TypeError):
+            raise ValidationError({"company": "Компания не найдена."})
+        note = (request.data.get("note") or "").strip()[:512]
+        obj, created = m.CompanyWarehouseAgent.objects.get_or_create(
+            company=company,
+            user=request.user,
+            defaults={"status": m.CompanyWarehouseAgent.Status.PENDING, "note": note},
+        )
+        if not created:
+            if obj.status == m.CompanyWarehouseAgent.Status.PENDING:
+                return Response(CompanyWarehouseAgentSerializer(obj).data, status=status.HTTP_200_OK)
+            if obj.status == m.CompanyWarehouseAgent.Status.ACTIVE:
+                raise ValidationError({"detail": "Вы уже являетесь агентом этой компании."})
+            if obj.status == m.CompanyWarehouseAgent.Status.REJECTED:
+                raise ValidationError({"detail": "Заявка была отклонена. Повторная заявка не предусмотрена."})
+            if obj.status == m.CompanyWarehouseAgent.Status.REMOVED:
+                obj.status = m.CompanyWarehouseAgent.Status.PENDING
+                obj.note = note
+                obj.decided_at = None
+                obj.decided_by = None
+                obj.save(update_fields=["status", "note", "decided_at", "decided_by", "updated_at"])
+        data = CompanyWarehouseAgentSerializer(obj).data
+        return Response(data, status=status.HTTP_201_CREATED if created else status.HTTP_200_OK)
+
+
+class CompanyWarehouseAgentAcceptAPIView(APIView):
+    """Принять заявку агента (только владелец/админ компании)."""
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request, pk=None, *args, **kwargs):
+        if not _is_owner_like(request.user):
+            return Response({"detail": "Только владелец/админ."}, status=status.HTTP_403_FORBIDDEN)
+        company = getattr(request.user, "owned_company", None) or getattr(request.user, "company", None)
+        if not company:
+            return Response({"detail": "Нет компании."}, status=status.HTTP_403_FORBIDDEN)
+        obj = get_object_or_404(
+            m.CompanyWarehouseAgent.objects.filter(company=company, status=m.CompanyWarehouseAgent.Status.PENDING),
+            pk=pk,
+        )
+        obj.status = m.CompanyWarehouseAgent.Status.ACTIVE
+        obj.decided_at = timezone.now()
+        obj.decided_by = request.user
+        obj.save(update_fields=["status", "decided_at", "decided_by", "updated_at"])
+        return Response(CompanyWarehouseAgentSerializer(obj).data)
+
+
+class CompanyWarehouseAgentRejectAPIView(APIView):
+    """Отклонить заявку агента (только владелец/админ компании)."""
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request, pk=None, *args, **kwargs):
+        if not _is_owner_like(request.user):
+            return Response({"detail": "Только владелец/админ."}, status=status.HTTP_403_FORBIDDEN)
+        company = getattr(request.user, "owned_company", None) or getattr(request.user, "company", None)
+        if not company:
+            return Response({"detail": "Нет компании."}, status=status.HTTP_403_FORBIDDEN)
+        obj = get_object_or_404(
+            m.CompanyWarehouseAgent.objects.filter(company=company, status=m.CompanyWarehouseAgent.Status.PENDING),
+            pk=pk,
+        )
+        obj.status = m.CompanyWarehouseAgent.Status.REJECTED
+        obj.decided_at = timezone.now()
+        obj.decided_by = request.user
+        obj.save(update_fields=["status", "decided_at", "decided_by", "updated_at"])
+        return Response(CompanyWarehouseAgentSerializer(obj).data)
+
+
+class CompanyWarehouseAgentRemoveAPIView(APIView):
+    """Отстранить агента от компании (только владелец/админ). После этого агент теряет доступ к складам компании."""
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request, pk=None, *args, **kwargs):
+        if not _is_owner_like(request.user):
+            return Response({"detail": "Только владелец/админ."}, status=status.HTTP_403_FORBIDDEN)
+        company = getattr(request.user, "owned_company", None) or getattr(request.user, "company", None)
+        if not company:
+            return Response({"detail": "Нет компании."}, status=status.HTTP_403_FORBIDDEN)
+        obj = get_object_or_404(
+            m.CompanyWarehouseAgent.objects.filter(company=company, status=m.CompanyWarehouseAgent.Status.ACTIVE),
+            pk=pk,
+        )
+        obj.status = m.CompanyWarehouseAgent.Status.REMOVED
+        obj.decided_at = timezone.now()
+        obj.decided_by = request.user
+        obj.save(update_fields=["status", "decided_at", "decided_by", "updated_at"])
+        return Response(CompanyWarehouseAgentSerializer(obj).data)

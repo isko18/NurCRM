@@ -318,6 +318,23 @@ class ClientListCreateView(CompanyQuerysetMixin, generics.ListCreateAPIView):
     ordering_fields = ["full_name", "created_at", "status"]
     ordering = ["-created_at"]
 
+    def get_serializer_context(self):
+        context = super().get_serializer_context()
+        if self.request.method == "POST":
+            context["active_branch"] = self._active_branch()
+        return context
+
+    def create(self, request, *args, **kwargs):
+        try:
+            return super().create(request, *args, **kwargs)
+        except IntegrityError as e:
+            s = str(e)
+            if "uniq_client_phone_global_per_company" in s or "uniq_client_phone_per_branch" in s:
+                raise ValidationError(
+                    {"phone": "Клиент с таким номером телефона уже существует в этой компании (или в выбранном филиале)."}
+                )
+            raise
+
 
 class ClientRetrieveUpdateDestroyView(
     CompanyQuerysetMixin, generics.RetrieveUpdateDestroyAPIView
