@@ -147,6 +147,19 @@ def _create_money_document_for_request(document: models.Document, request_obj: m
     if not request_obj.requires_money:
         return None
 
+    # Идемпотентность: если денежный документ по этому складу уже есть — не создаём дубликат
+    existing = getattr(document, "money_document", None)
+    if existing is None:
+        try:
+            existing = models.MoneyDocument.objects.get(source_document_id=document.id)
+        except models.MoneyDocument.DoesNotExist:
+            pass
+    if existing is not None:
+        from . import services_money
+        if existing.status == models.MoneyDocument.Status.DRAFT:
+            services_money.post_money_document(existing)
+        return existing
+
     money_doc_type = request_obj.money_doc_type
     if not money_doc_type:
         raise ValueError("Не удалось определить тип денежного документа.")

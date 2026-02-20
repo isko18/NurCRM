@@ -346,6 +346,10 @@ class WarehouseProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSe
             "packages",
         ]
         read_only_fields = ["id", "company", "branch"]
+        extra_kwargs = {
+            "category": {"required": False, "allow_null": True},
+            "characteristics": {"required": False},
+        }
 
     def validate(self, attrs):
         if "barcode" in attrs:
@@ -483,6 +487,51 @@ class AgentRequestCartSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSe
             last = getattr(agent, "last_name", "") or ""
             full_name = f"{first} {last}".strip()
         return full_name or getattr(agent, "username", None) or getattr(agent, "email", None) or str(getattr(agent, "id", ""))
+
+
+# ----------------
+# Company / Agent membership (заявки агентов в компании)
+# ----------------
+
+
+class CompanyWarehouseAgentSerializer(serializers.ModelSerializer):
+    company_name = serializers.CharField(source="company.name", read_only=True)
+    user_display = serializers.SerializerMethodField()
+    decided_by_display = serializers.SerializerMethodField()
+
+    class Meta:
+        model = m.CompanyWarehouseAgent
+        fields = (
+            "id",
+            "company",
+            "company_name",
+            "user",
+            "user_display",
+            "status",
+            "note",
+            "created_at",
+            "updated_at",
+            "decided_at",
+            "decided_by",
+            "decided_by_display",
+        )
+        read_only_fields = ("id", "status", "created_at", "updated_at", "decided_at", "decided_by")
+        extra_kwargs = {"company": {"required": True}, "user": {"required": False}, "note": {"required": False, "allow_blank": True}}
+
+    def get_user_display(self, obj):
+        u = getattr(obj, "user", None)
+        if not u:
+            return None
+        if hasattr(u, "get_full_name") and u.get_full_name():
+            return u.get_full_name()
+        return f"{getattr(u, 'first_name', '')} {getattr(u, 'last_name', '')}".strip() or getattr(u, "email", "") or str(u.id)
+
+    def get_decided_by_display(self, obj):
+        u = getattr(obj, "decided_by", None)
+        if not u:
+            return None
+        return getattr(u, "email", None) or str(u.id)
+
 
 class AgentRequestCartActionSerializer(serializers.Serializer):
     # placeholder for submit/approve/reject

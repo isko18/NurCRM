@@ -1,7 +1,10 @@
 from decimal import Decimal
 from rest_framework import serializers
 from django.core.exceptions import ValidationError as DjangoValidationError
+from django.contrib.auth import get_user_model
 from . import models
+
+User = get_user_model()
 
 
 class StockMoveSerializer(serializers.ModelSerializer):
@@ -267,9 +270,23 @@ class WarehouseSimpleSerializer(serializers.ModelSerializer):
 class CounterpartySerializer(serializers.ModelSerializer):
     company = serializers.ReadOnlyField(source="company.id")
     branch = serializers.ReadOnlyField(source="branch.id")
-    agent = serializers.ReadOnlyField(source="agent.id")
+    agent_display = serializers.SerializerMethodField()
+    agent = serializers.PrimaryKeyRelatedField(
+        queryset=User.objects.all(),
+        allow_null=True,
+        required=False,
+        help_text="Назначить контрагента агенту (только владелец/админ). Агент видит только контрагентов, назначенных ему.",
+    )
 
     class Meta:
         model = models.Counterparty
-        fields = ("id", "name", "type", "company", "branch", "agent")
-        read_only_fields = ("id", "company", "branch", "agent")
+        fields = ("id", "name", "type", "company", "branch", "agent", "agent_display")
+        read_only_fields = ("id", "company", "branch")
+
+    def get_agent_display(self, obj):
+        u = getattr(obj, "agent", None)
+        if not u:
+            return None
+        if hasattr(u, "get_full_name") and u.get_full_name():
+            return u.get_full_name()
+        return f"{getattr(u, 'first_name', '')} {getattr(u, 'last_name', '')}".strip() or getattr(u, "email", "") or str(u.id)

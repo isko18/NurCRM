@@ -18,7 +18,11 @@ from .views import (
     AgentRequestItemDetailAPIView,
     AgentMyProductsListAPIView,
     OwnerAgentsProductsListAPIView,
-    # legacy views
+    CompaniesSearchForAgentsAPIView,
+    CompanyWarehouseAgentRequestListCreateAPIView,
+    CompanyWarehouseAgentAcceptAPIView,
+    CompanyWarehouseAgentRejectAPIView,
+    CompanyWarehouseAgentRemoveAPIView,
 )
 from .views_documents import (
     DocumentListCreateView, DocumentDetailView, DocumentPostView, DocumentUnpostView,
@@ -113,6 +117,13 @@ urlpatterns += [
     # agent stock
     path("agents/me/products/", AgentMyProductsListAPIView.as_view(), name="warehouse-agent-my-products"),
     path("owner/agents/products/", OwnerAgentsProductsListAPIView.as_view(), name="warehouse-owner-agents-products"),
+
+    # агенты: поиск компаний и заявки в компанию
+    path("agents/companies/search/", CompaniesSearchForAgentsAPIView.as_view(), name="warehouse-agents-companies-search"),
+    path("agents/company-requests/", CompanyWarehouseAgentRequestListCreateAPIView.as_view(), name="warehouse-agents-company-requests"),
+    path("agents/company-requests/<uuid:pk>/accept/", CompanyWarehouseAgentAcceptAPIView.as_view(), name="warehouse-agents-company-request-accept"),
+    path("agents/company-requests/<uuid:pk>/reject/", CompanyWarehouseAgentRejectAPIView.as_view(), name="warehouse-agents-company-request-reject"),
+    path("agents/company-requests/<uuid:pk>/remove/", CompanyWarehouseAgentRemoveAPIView.as_view(), name="warehouse-agents-company-request-remove"),
 ]
 
 urlpatterns += [

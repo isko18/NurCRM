@@ -33,6 +33,14 @@ class CounterpartyAdmin(admin.ModelAdmin):
 	search_fields = ("name",)
 
 
+@admin.register(models.CompanyWarehouseAgent)
+class CompanyWarehouseAgentAdmin(admin.ModelAdmin):
+	list_display = ("user", "company", "status", "created_at", "decided_at", "decided_by")
+	list_filter = ("status", "company")
+	search_fields = ("user__email", "company__name", "note")
+	raw_id_fields = ("user", "company", "decided_by")
+
+
 @admin.register(models.WarehouseProductGroup)
 class WarehouseProductGroupAdmin(admin.ModelAdmin):
     list_display = ("name", "warehouse", "parent", "company", "branch")

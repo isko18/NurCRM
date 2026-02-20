@@ -12,6 +12,19 @@ from .views import CompanyBranchRestrictedMixin
 from apps.utils import _is_owner_like
 
 
+def _agent_allowed_for_company(agent_user, company):
+    """Агент допустим для компании: сотрудник (company_id) или активный агент (CompanyWarehouseAgent)."""
+    if not agent_user or not company:
+        return False
+    if getattr(agent_user, "company_id", None) == getattr(company, "id", None):
+        return True
+    return models.CompanyWarehouseAgent.objects.filter(
+        user=agent_user,
+        company=company,
+        status=models.CompanyWarehouseAgent.Status.ACTIVE,
+    ).exists()
+
+
 class DocumentListCreateView(CompanyBranchRestrictedMixin, generics.ListCreateAPIView):
     serializer_class = serializers_documents.DocumentSerializer
     filter_backends = [DjangoFilterBackend, filters.SearchFilter]
@@ -504,6 +517,12 @@ class CounterpartyListCreateView(CompanyBranchRestrictedMixin, generics.ListCrea
     def perform_create(self, serializer):
         user = self.request.user
         if _is_owner_like(user):
+            company = self._company()
+            agent = serializer.validated_data.get("agent")
+            if agent and company and not _agent_allowed_for_company(agent, company):
+                raise DRFValidationError(
+                    {"agent": "Агент должен быть сотрудником или активным агентом этой компании."}
+                )
             self._save_with_company_branch(serializer)
             return
         self._save_with_company_branch(serializer, agent=user)
@@ -519,3 +538,18 @@ class CounterpartyDetailView(CompanyBranchRestrictedMixin, generics.RetrieveUpda
         if not _is_owner_like(user):
             qs = qs.filter(agent=user)
         return qs
+
+    def perform_update(self, serializer):
+        user = self.request.user
+        instance = serializer.instance
+        if _is_owner_like(user):
+            company = getattr(instance, "company", None) or self._company()
+            agent = serializer.validated_data.get("agent")
+            if agent is not None and company and not _agent_allowed_for_company(agent, company):
+                raise DRFValidationError(
+                    {"agent": "Агент должен быть сотрудником или активным агентом этой компании."}
+                )
+            self._save_with_company_branch(serializer)
+            return
+        serializer.validated_data["agent"] = getattr(instance, "agent", None) or user
+        serializer.save()
