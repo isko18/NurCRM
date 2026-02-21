@@ -69,6 +69,7 @@ class DocumentSerializer(serializers.ModelSerializer):
         source="warehouse_to.name", read_only=True, allow_null=True
     )
     agent = serializers.PrimaryKeyRelatedField(read_only=True)
+    agent_display = serializers.SerializerMethodField()
 
     class Meta:
         ref_name = "WarehouseDocumentSerializer"
@@ -91,6 +92,7 @@ class DocumentSerializer(serializers.ModelSerializer):
             "payment_category_title",
             "cash_request_status",
             "agent",
+            "agent_display",
             "counterparty_display_name",
             "comment",
             "discount_percent",
@@ -102,6 +104,19 @@ class DocumentSerializer(serializers.ModelSerializer):
             "expenses",
         )
         read_only_fields = ("number", "total", "status", "date", "cash_request_status")
+
+    def get_agent_display(self, obj):
+        u = getattr(obj, "agent", None)
+        if not u:
+            return None
+        if hasattr(u, "get_full_name") and u.get_full_name():
+            return u.get_full_name()
+        return (
+            f"{getattr(u, 'first_name', '')} {getattr(u, 'last_name', '')}".strip()
+            or getattr(u, "username", None)
+            or getattr(u, "email", None)
+            or str(getattr(u, "id", ""))
+        )
 
     def get_cash_request_status(self, obj):
         req = getattr(obj, "cash_request", None)
