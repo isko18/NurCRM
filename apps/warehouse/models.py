@@ -383,7 +383,7 @@ class WarehouseProduct(BaseModelId, BaseModelDate, BaseModelCompanyBranch):
         help_text="Номер ПЛУ для весов (можно не заполнять). Уникален в рамках склада.",
     )
 
-    country = models.CharField("Страна происхождения", max_length=64, blank=True)
+    country = models.CharField("Страна происхождения", max_length=64, blank=True, null=True)
 
     status = models.CharField(
         "Статус",

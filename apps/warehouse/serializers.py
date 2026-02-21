@@ -305,7 +305,7 @@ def _get_characteristics_model():
 
 
 class WarehouseProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
-    characteristics = WarehouseProductCharacteristicsSerializer(required=False)
+    characteristics = WarehouseProductCharacteristicsSerializer(required=False, allow_null=True)
     images = WarehouseProductImageSerializer(many=True, read_only=True)
     packages = WarehouseProductPackageSerializer(many=True, read_only=True)
 
@@ -348,7 +348,8 @@ class WarehouseProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSe
         read_only_fields = ["id", "company", "branch"]
         extra_kwargs = {
             "category": {"required": False, "allow_null": True},
-            "characteristics": {"required": False},
+            "country": {"required": False, "allow_null": True},
+            "characteristics": {"required": False, "allow_null": True},
         }
 
     def validate(self, attrs):

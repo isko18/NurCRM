@@ -180,7 +180,7 @@
   "stock": false,
   "expiration_date": "YYYY-MM-DD|null",
   "brand": "uuid|null",
-  "category": "uuid",
+  "category": "uuid|null",
   "warehouse": "uuid",
   "characteristics": {
     "height_cm": "0.00|null",
@@ -217,6 +217,7 @@
 - для весовых товаров (`is_weight=true`) может автогенерироваться `plu` (уникален в рамках склада).
 - `price` может пересчитываться автоматически из `purchase_price` и `markup_percent`.
 - `barcode`, `code`, `article`, `country` нормализуются (пустая строка → `null`).
+- `category`, `country`, `characteristics` можно не передавать при создании; в ответе они могут быть `null`.
 
 Фильтры списка товаров склада (`GET /api/warehouse/{warehouse_uuid}/products/`):
 - `name` (icontains)
@@ -237,14 +238,14 @@
 {
   "barcode": "string",
   "name": "string",
-  "category": "uuid"
+  "category": "uuid|null"
 }
 ```
 
 Поведение:
 - если товар с таким `barcode` найден в этом складе → вернёт его (`created=false`);
 - если `barcode` похож на весовой EAN-13 → пытается найти товар по `plu`, вернёт `scan_qty`;
-- если товар не найден → создаст (нужны `name` + `category`, остальные поля как в обычном POST).
+- если товар не найден → создаст (нужен `name`, остальные поля как в обычном POST).
 
 Ответ:
 ```json
