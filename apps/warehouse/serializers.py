@@ -348,6 +348,7 @@ class WarehouseProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSe
         read_only_fields = ["id", "company", "branch"]
         extra_kwargs = {
             "category": {"required": False, "allow_null": True},
+            "article": {"required": False, "allow_null": True},
             "country": {"required": False, "allow_null": True},
             "characteristics": {"required": False, "allow_null": True},
         }
@@ -358,9 +359,9 @@ class WarehouseProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSe
         if "code" in attrs:
             attrs["code"] = _norm_str(attrs.get("code"))
         if "article" in attrs:
-            attrs["article"] = _norm_str(attrs.get("article"))
+            attrs["article"] = (attrs.get("article") or "").strip()
         if "country" in attrs:
-            attrs["country"] = _norm_str(attrs.get("country"))
+            attrs["country"] = (attrs.get("country") or "").strip()
 
         for f in ("quantity", "purchase_price", "markup_percent", "price", "discount_percent"):
             if f in attrs:
