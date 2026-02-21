@@ -92,6 +92,28 @@ class DocumentsTests(TestCase):
         bal = models.StockBalance.objects.get(warehouse=self.wh, product=self.prod)
         self.assertEqual(bal.qty, Decimal("10.000"))
 
+    def test_credit_sale_posts_immediately_and_creates_no_money_request(self):
+        models.StockBalance.objects.create(warehouse=self.wh, product=self.prod, qty=Decimal("10.000"))
+        cp = models.Counterparty.objects.create(name="C1", type=models.Counterparty.Type.CLIENT, company=self.company, branch=self.branch)
+        doc = models.Document.objects.create(
+            doc_type=models.Document.DocType.SALE,
+            warehouse_from=self.wh,
+            counterparty=cp,
+            payment_kind=models.Document.PaymentKind.CREDIT,
+        )
+        models.DocumentItem.objects.create(document=doc, product=self.prod, qty=Decimal("3"), price=Decimal("15"))
+
+        services.post_document(doc)
+        doc.refresh_from_db()
+        self.assertEqual(doc.status, models.Document.Status.POSTED)
+
+        # Не должно требовать кассового подтверждения
+        with self.assertRaises(models.CashApprovalRequest.DoesNotExist):
+            _ = doc.cash_request
+
+        # Денежного документа тоже не создаём
+        self.assertFalse(models.MoneyDocument.objects.filter(source_document_id=doc.id).exists())
+
     def test_transfer_creates_two_moves(self):
         wh2 = models.Warehouse.objects.create(name="W2", company=self.company, branch=self.branch, location="loc2")
         doc = models.Document.objects.create(doc_type=models.Document.DocType.TRANSFER, warehouse_from=self.wh, warehouse_to=wh2)

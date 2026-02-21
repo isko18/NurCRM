@@ -120,8 +120,9 @@ def _create_or_reset_cash_request(document: models.Document):
     Денежный документ будет создан только на approve.
     """
     money_doc_type = _resolve_money_doc_type(document.doc_type)
+    payment_kind = document.payment_kind or models.Document.PaymentKind.CASH
     requires_money = (
-        document.payment_kind == models.Document.PaymentKind.CASH
+        payment_kind == models.Document.PaymentKind.CASH
         and money_doc_type is not None
         and not document.agent_id
     )
@@ -502,11 +503,52 @@ def post_document(document: models.Document, allow_negative: bool = None) -> mod
                 )
                 _apply_move(mv)
 
-        document.status = document.Status.CASH_PENDING
-        document.save()
+        # Деньги создаём/подтверждаем только для payment_kind=cash.
+        # Для credit (и для типов без денежного движения) документ сразу считается проведённым.
+        money_doc_type = _resolve_money_doc_type(document.doc_type)
+        payment_kind = document.payment_kind or models.Document.PaymentKind.CASH
+        requires_money = (
+            payment_kind == models.Document.PaymentKind.CASH
+            and money_doc_type is not None
+            and not document.agent_id
+        )
 
-        # На этапе post создаем запрос на решение по кассе.
-        _create_or_reset_cash_request(document)
+        if requires_money:
+            document.status = document.Status.CASH_PENDING
+            document.save(update_fields=["status"])
+            # На этапе post создаем запрос на решение по кассе.
+            _create_or_reset_cash_request(document)
+        else:
+            # Если по документу раньше был кассовый запрос (например, сменили payment_kind),
+            # помечаем его как обработанный, чтобы не висел в PENDING.
+            try:
+                req = document.cash_request
+            except Exception:
+                req = None
+            if req is not None:
+                req.status = models.CashApprovalRequest.Status.APPROVED
+                req.requires_money = False
+                req.money_doc_type = None
+                req.amount = Decimal(document.total or 0).quantize(Decimal("0.01"))
+                req.decision_note = "Авто: касса не требуется."
+                req.decided_at = timezone.now()
+                req.decided_by = None
+                req.money_document = None
+                req.save(
+                    update_fields=[
+                        "status",
+                        "requires_money",
+                        "money_doc_type",
+                        "amount",
+                        "decision_note",
+                        "decided_at",
+                        "decided_by",
+                        "money_document",
+                    ]
+                )
+
+            document.status = document.Status.POSTED
+            document.save(update_fields=["status"])
 
     return document
 
