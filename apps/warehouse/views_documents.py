@@ -50,7 +50,7 @@ class DocumentListCreateView(CompanyBranchRestrictedMixin, generics.ListCreateAP
     def get_queryset(self):
         # Оптимизация: предзагружаем связанные объекты
         qs = models.Document.objects.select_related(
-            "warehouse_from", "warehouse_to", "counterparty"
+            "warehouse_from", "warehouse_to", "counterparty", "agent"
         ).prefetch_related(
             "items__product",
             "moves__warehouse",
@@ -160,7 +160,7 @@ class DocumentDetailView(CompanyBranchRestrictedMixin, generics.RetrieveUpdateDe
     def get_queryset(self):
         # Оптимизация: предзагружаем связанные объекты
         qs = models.Document.objects.select_related(
-            "warehouse_from", "warehouse_to", "counterparty"
+            "warehouse_from", "warehouse_to", "counterparty", "agent"
         ).prefetch_related(
             "items__product",
             "items__product__brand",
@@ -187,7 +187,7 @@ class DocumentPostView(CompanyBranchRestrictedMixin, generics.GenericAPIView):
     def get_queryset(self):
         # Оптимизация: предзагружаем items с продуктами
         qs = models.Document.objects.select_related(
-            "warehouse_from", "warehouse_to", "counterparty"
+            "warehouse_from", "warehouse_to", "counterparty", "agent"
         ).prefetch_related("items__product", "items__product__warehouse")
         user = self.request.user
         qs = DocumentListCreateView._filter_company_branch(self, qs)
@@ -214,7 +214,7 @@ class DocumentUnpostView(CompanyBranchRestrictedMixin, generics.GenericAPIView):
     def get_queryset(self):
         # Оптимизация: предзагружаем moves с продуктами и складами
         qs = models.Document.objects.select_related(
-            "warehouse_from", "warehouse_to", "counterparty"
+            "warehouse_from", "warehouse_to", "counterparty", "agent"
         ).prefetch_related("moves__warehouse", "moves__product")
         qs = DocumentListCreateView._filter_company_branch(self, qs)
         user = self.request.user
@@ -236,7 +236,7 @@ class DocumentCashApproveView(CompanyBranchRestrictedMixin, generics.GenericAPIV
 
     def get_queryset(self):
         qs = models.Document.objects.select_related(
-            "warehouse_from", "warehouse_to", "counterparty", "cash_register", "payment_category"
+            "warehouse_from", "warehouse_to", "counterparty", "cash_register", "payment_category", "agent"
         )
         qs = DocumentListCreateView._filter_company_branch(self, qs)
         user = self.request.user
@@ -260,7 +260,7 @@ class DocumentCashRejectView(CompanyBranchRestrictedMixin, generics.GenericAPIVi
 
     def get_queryset(self):
         qs = models.Document.objects.select_related(
-            "warehouse_from", "warehouse_to", "counterparty", "cash_register", "payment_category"
+            "warehouse_from", "warehouse_to", "counterparty", "cash_register", "payment_category", "agent"
         )
         qs = DocumentListCreateView._filter_company_branch(self, qs)
         user = self.request.user
