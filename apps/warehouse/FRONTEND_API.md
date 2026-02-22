@@ -756,6 +756,12 @@ Read-only поля:
 - фильтры: `doc_type`, `status`, `cash_register`, `warehouse`, `payment_category`
 - поиск: `?search=...` (по `number`, `comment`)
 
+Дополнительно (для UI долгов):
+- если передать `?include_debts=1`, ответ будет объектом, где:
+  - `money` — исходный список денежных документов (как раньше, с пагинацией если она включена),
+  - `debt_operations` — кредитные складские документы (`SALE/PURCHASE/...` с `payment_kind="credit"` и `status="POSTED"`),
+  - `operations` — объединённый список (`money` + `debt_operations`) с полями `source`, `amount`, `debt_delta`.
+
 ## 6) Агенты: заявки и остатки
 
 > **Подробная документация по системе агентов склада** (самостоятельная регистрация, заявки в компании, приём/отклонение/отстранение, доступ к операциям): см. **[WAREHOUSE_AGENTS.md](./WAREHOUSE_AGENTS.md)**.

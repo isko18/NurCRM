@@ -277,3 +277,119 @@ class CounterpartyMoneyOperationsView(CompanyBranchRestrictedMixin, generics.Lis
         ).filter(counterparty_id=counterparty_id).order_by("-date")
         return self._filter_qs_company_branch(qs)
 
+    @staticmethod
+    def _truthy(v) -> bool:
+        if isinstance(v, bool):
+            return v
+        if v is None:
+            return False
+        return str(v).strip().lower() in ("1", "true", "yes", "y", "on")
+
+    def list(self, request, *args, **kwargs):
+        """
+        Backward compatible:
+        - default: returns the same list of MoneyDocument as before.
+        - if ?include_debts=1: returns an object with merged operations (money + кредитные складские документы).
+        """
+        include_debts = self._truthy(request.query_params.get("include_debts"))
+        if not include_debts:
+            return super().list(request, *args, **kwargs)
+
+        # 1) money operations (respect existing filters/pagination/search)
+        money_resp = super().list(request, *args, **kwargs)
+        money_payload = money_resp.data
+
+        # Flatten money results for merging
+        if isinstance(money_payload, dict) and "results" in money_payload:
+            money_items = list(money_payload.get("results") or [])
+        else:
+            money_items = list(money_payload or [])
+
+        # 2) debt operations from warehouse documents (credit only)
+        counterparty_id = self.kwargs.get("counterparty_id")
+        doc_qs = (
+            models.Document.objects
+            .select_related("warehouse_from", "counterparty")
+            .filter(
+                counterparty_id=counterparty_id,
+                status=models.Document.Status.POSTED,
+                payment_kind=models.Document.PaymentKind.CREDIT,
+                doc_type__in=(
+                    models.Document.DocType.SALE,
+                    models.Document.DocType.PURCHASE,
+                    models.Document.DocType.SALE_RETURN,
+                    models.Document.DocType.PURCHASE_RETURN,
+                ),
+            )
+            .order_by("-date")
+        )
+        doc_qs = self._filter_qs_company_branch(
+            doc_qs,
+            company_field="warehouse_from__company_id",
+            branch_field="warehouse_from__branch",
+        )
+
+        def _doc_debt_delta(doc) -> Decimal:
+            amt = Decimal(getattr(doc, "total", None) or 0).quantize(Decimal("0.01"))
+            # Consistent with reconciliation: debit increases counterparty debt to company; credit decreases it.
+            if doc.doc_type in (models.Document.DocType.SALE, models.Document.DocType.PURCHASE_RETURN):
+                return amt
+            return -amt
+
+        debt_ops = []
+        for d in doc_qs:
+            amt = Decimal(getattr(d, "total", None) or 0).quantize(Decimal("0.01"))
+            debt_ops.append(
+                {
+                    "source": "document",
+                    "id": str(d.id),
+                    "date": d.date.isoformat() if getattr(d, "date", None) else None,
+                    "number": d.number,
+                    "status": d.status,
+                    "doc_type": d.doc_type,
+                    "payment_kind": d.payment_kind,
+                    "amount": str(amt),
+                    "debt_delta": str(_doc_debt_delta(d)),
+                    "comment": (d.comment or ""),
+                    "cash_register": None,
+                    "payment_category": None,
+                }
+            )
+
+        def _money_debt_delta(item: dict) -> Decimal:
+            amt = Decimal(str(item.get("amount") or "0")).quantize(Decimal("0.01"))
+            if item.get("doc_type") == models.MoneyDocument.DocType.MONEY_EXPENSE:
+                return amt
+            return -amt
+
+        merged = []
+        for it in money_items:
+            merged.append(
+                {
+                    "source": "money",
+                    "id": str(it.get("id")),
+                    "date": it.get("date"),
+                    "number": it.get("number"),
+                    "status": it.get("status"),
+                    "doc_type": it.get("doc_type"),
+                    "payment_kind": None,
+                    "amount": str(it.get("amount")),
+                    "debt_delta": str(_money_debt_delta(it)),
+                    "comment": it.get("comment") or "",
+                    "cash_register": it.get("cash_register"),
+                    "payment_category": it.get("payment_category"),
+                }
+            )
+        merged.extend(debt_ops)
+        merged.sort(key=lambda x: x.get("date") or "", reverse=True)
+
+        return Response(
+            {
+                "money": money_payload,
+                "debt_operations": debt_ops,
+                "operations": merged,
+            },
+            status=money_resp.status_code,
+            headers=getattr(money_resp, "headers", None),
+        )
+
