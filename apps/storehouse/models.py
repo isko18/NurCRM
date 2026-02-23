@@ -133,11 +133,11 @@ class Product(models.Model):
 
     unit = models.CharField(max_length=32, verbose_name="Ед. изм.", default="шт")
     purchase_price = models.DecimalField(
-        max_digits=12, decimal_places=2, verbose_name="Цена закупки",
+        max_digits=13, decimal_places=3, verbose_name="Цена закупки",
         default=0, validators=[MinValueValidator(Decimal("0"))]
     )
     selling_price = models.DecimalField(
-        max_digits=12, decimal_places=2, verbose_name="Цена продажи",
+        max_digits=13, decimal_places=3, verbose_name="Цена продажи",
         default=0, validators=[MinValueValidator(Decimal("0"))]
     )
     is_active = models.BooleanField(default=True, verbose_name="Активен")
@@ -292,7 +292,7 @@ class StockInItem(models.Model):
         validators=[MinValueValidator(Decimal("0.01"))]
     )
     price = models.DecimalField(
-        max_digits=12, decimal_places=2, verbose_name="Цена закупки",
+        max_digits=13, decimal_places=3, verbose_name="Цена закупки",
         validators=[MinValueValidator(Decimal("0"))]
     )
 

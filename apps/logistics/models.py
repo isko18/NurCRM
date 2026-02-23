@@ -73,8 +73,8 @@ class Logistics(models.Model):
         verbose_name="Стоимость услуги",
     )
     sale_price = models.DecimalField(
-        max_digits=12,
-        decimal_places=2,
+        max_digits=13,
+        decimal_places=3,
         null=True,
         blank=True,
         verbose_name="Цена продажи",

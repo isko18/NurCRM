@@ -364,6 +364,40 @@ class CheckoutSerializer(serializers.Serializer):
         return attrs
 
 
+class PayDebtSerializer(serializers.Serializer):
+    """
+    Оплата ранее оформленной продажи "в долг" (Sale.status=DEBT).
+    Делает продажу PAID и тем самым она начинает учитываться в кассе/сменах/аналитике.
+    """
+
+    payment_method = serializers.ChoiceField(
+        choices=[c for c in Sale.PaymentMethod.choices if c[0] != Sale.PaymentMethod.DEBT],
+        required=True,
+    )
+    cash_received = MoneyField(required=False, allow_null=True)
+
+    def validate(self, attrs):
+        sale = self.context.get("sale")
+        if sale is None:
+            raise serializers.ValidationError("Serializer context должен содержать sale.")
+
+        pm = attrs.get("payment_method")
+        cash_received = attrs.get("cash_received")
+
+        if pm == Sale.PaymentMethod.CASH:
+            if cash_received is None:
+                raise serializers.ValidationError({"cash_received": "Укажите сумму, принятую наличными."})
+            if cash_received < 0:
+                raise serializers.ValidationError({"cash_received": "Не может быть отрицательной."})
+            if cash_received < (sale.total or Decimal("0.00")):
+                raise serializers.ValidationError({"cash_received": "Сумма, полученная наличными, меньше суммы долга."})
+        else:
+            # Для безналичных методов наличных нет
+            attrs["cash_received"] = Decimal("0.00")
+
+        return attrs
+
+
 class MobileScannerTokenSerializer(serializers.ModelSerializer):
     class Meta:
         model = MobileScannerToken

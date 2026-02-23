@@ -257,7 +257,7 @@ class WarehouseProductGroup(BaseModelId, BaseModelCompanyBranch):
 
 
 QTY3 = Decimal("0.001")
-MONEY = Decimal("0.01")
+MONEY = Decimal("0.001")
 
 
 def q_money(x: Decimal) -> Decimal:
@@ -349,8 +349,8 @@ class WarehouseProduct(BaseModelId, BaseModelDate, BaseModelCompanyBranch):
 
     purchase_price = models.DecimalField(
         "Цена закупки",
-        max_digits=10,
-        decimal_places=2,
+        max_digits=11,
+        decimal_places=3,
         default=Decimal("0.00"),
     )
 
@@ -363,8 +363,8 @@ class WarehouseProduct(BaseModelId, BaseModelDate, BaseModelCompanyBranch):
 
     price = models.DecimalField(
         "Цена продажи",
-        max_digits=10,
-        decimal_places=2,
+        max_digits=11,
+        decimal_places=3,
         default=Decimal("0.00"),
         help_text="Считается автоматически из закупки и наценки (если наценка > 0).",
     )
