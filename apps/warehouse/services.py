@@ -621,11 +621,17 @@ def unpost_document(document: models.Document) -> models.Document:
             cash_req = getattr(document, "cash_request", None)
         except Exception:
             cash_req = None
-        if cash_req is not None and cash_req.status == models.CashApprovalRequest.Status.PENDING:
+        # Важно: если запрос уже был APPROVED и потом документ распроводят,
+        # запрос тоже должен отражать отмену (иначе в UI будет "подтверждено", но документ уже DRAFT).
+        if cash_req is not None and cash_req.status in (
+            models.CashApprovalRequest.Status.PENDING,
+            models.CashApprovalRequest.Status.APPROVED,
+        ):
             cash_req.status = models.CashApprovalRequest.Status.REJECTED
-            cash_req.decision_note = "Отклонено автоматически: документ распроведен."
+            cash_req.decision_note = "Отменено автоматически: документ распроведен."
             cash_req.decided_at = timezone.now()
-            cash_req.save(update_fields=["status", "decision_note", "decided_at"])
+            cash_req.decided_by = None
+            cash_req.save(update_fields=["status", "decision_note", "decided_at", "decided_by"])
 
         document.status = document.Status.DRAFT
         document.save()
