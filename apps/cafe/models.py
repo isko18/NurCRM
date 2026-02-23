@@ -540,7 +540,7 @@ class MenuItem(models.Model):
         "Category", on_delete=models.CASCADE,
         related_name="items", verbose_name="Категория"
     )
-    price = models.DecimalField("Цена продажи", max_digits=10, decimal_places=2)
+    price = models.DecimalField("Цена продажи", max_digits=11, decimal_places=3)
     is_active = models.BooleanField("Активно в продаже", default=True)
 
     # Себестоимость и расходы

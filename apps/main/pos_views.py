@@ -52,6 +52,7 @@ from .pos_serializers import (
     ScanRequestSerializer,
     AddItemSerializer,
     CheckoutSerializer,
+    PayDebtSerializer,
     MobileScannerTokenSerializer,
     SaleListSerializer,
     SaleDetailSerializer,
@@ -1427,11 +1428,47 @@ class SaleCheckoutAPIView(MarketCashierOnlyMixin, APIView):
             if sale.payment_method == Sale.PaymentMethod.CASH:
                 totals.append(f"ПОЛУЧЕНО НАЛИЧНЫМИ: {fmt_money(sale.cash_received)}")
                 totals.append(f"СДАЧА: {fmt_money(sale.change)}")
+            elif sale.payment_method == Sale.PaymentMethod.DEBT:
+                totals.append("ПРОДАЖА В ДОЛГ")
             else:
-                totals.append("ОПЛАТА ПЕРЕВОДОМ")
+                totals.append(f"ОПЛАТА: {sale.get_payment_method_display()}")
             payload["receipt_text"] = "ЧЕК\n" + "\n".join(lines) + "\n" + "\n".join(totals)
 
         return Response(payload, status=status.HTTP_201_CREATED)
+
+
+class SalePayDebtAPIView(MarketCashierOnlyMixin, CompanyBranchRestrictedMixin, APIView):
+    """
+    Оплатить ранее оформленную продажу "в долг".
+    POST /api/main/pos/sales/<sale_id>/pay-debt/
+    Body: { "payment_method": "cash|transfer|mbank|...", "cash_received": "..."(только для cash) }
+    """
+
+    permission_classes = [permissions.IsAuthenticated]
+
+    @transaction.atomic
+    def post(self, request, pk, *args, **kwargs):
+        qs = (
+            Sale.objects.select_for_update()
+            .select_related("shift", "cashbox", "client", "user")
+            .prefetch_related("items")
+        )
+        qs = self._filter_qs_company_branch(qs)
+        sale = get_object_or_404(qs, id=pk)
+
+        if sale.status != Sale.Status.DEBT:
+            raise ValidationError({"detail": "Продажа не находится в статусе 'Долг'."})
+
+        ser = PayDebtSerializer(data=request.data, context={"sale": sale})
+        ser.is_valid(raise_exception=True)
+
+        sale.mark_paid(
+            payment_method=ser.validated_data["payment_method"],
+            cash_received=ser.validated_data.get("cash_received"),
+        )
+
+        sale.refresh_from_db()
+        return Response(SaleDetailSerializer(sale, context={"request": request}).data, status=status.HTTP_200_OK)
 
 
 class SaleMobileScannerTokenAPIView(MarketCashierOnlyMixin, APIView):
@@ -2202,8 +2239,13 @@ class AgentSaleCheckoutAPIView(MarketCashierOnlyMixin, CompanyBranchRestrictedMi
             if getattr(sale, "payment_method", payment_method) == Sale.PaymentMethod.CASH:
                 totals.append(f"ПОЛУЧЕНО НАЛИЧНЫМИ: {getattr(sale, 'cash_received', cash_received):.2f}")
                 totals.append(f"СДАЧА: {getattr(sale, 'change', Decimal('0.00')):.2f}")
+            elif getattr(sale, "payment_method", payment_method) == Sale.PaymentMethod.DEBT:
+                totals.append("ПРОДАЖА В ДОЛГ")
             else:
-                totals.append("ОПЛАТА ПЕРЕВОДОМ")
+                try:
+                    totals.append(f"ОПЛАТА: {sale.get_payment_method_display()}")
+                except Exception:
+                    totals.append("ОПЛАТА")
             payload["receipt_text"] = "ЧЕК\n" + "\n".join(lines) + "\n" + "\n".join(totals)
 
         return Response(payload, status=status.HTTP_201_CREATED)

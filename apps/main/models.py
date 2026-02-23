@@ -692,8 +692,8 @@ class Product(models.Model):
     # ---- Цены / наценка / скидка ----
     purchase_price = models.DecimalField(
         "Цена закупки",
-        max_digits=10,
-        decimal_places=2,
+        max_digits=11,
+        decimal_places=3,
         default=0,
     )
     markup_percent = models.DecimalField(
@@ -1611,10 +1611,23 @@ class Sale(models.Model):
         if payment_method is not None:
             self.payment_method = payment_method
 
+        # Если продажа оформлена "в долг", она НЕ должна попадать в кассу/смену как оплаченная.
+        # В кассу она попадёт только когда её оплатят отдельным действием (смена статуса на PAID).
+        if self.payment_method == self.PaymentMethod.DEBT:
+            self.status = Sale.Status.DEBT
+            self.paid_at = None
+            self.cash_received = Decimal("0.00")
+            self.save(update_fields=["status", "paid_at", "payment_method", "cash_received"])
+            return
+
         if cash_received is not None:
             if self.payment_method == self.PaymentMethod.CASH:
                 self.cash_received = cash_received
             else:
+                self.cash_received = Decimal("0.00")
+        else:
+            # Для безналичных методов cash_received не имеет смысла — держим 0.
+            if self.payment_method != self.PaymentMethod.CASH:
                 self.cash_received = Decimal("0.00")
 
         self.status = Sale.Status.PAID
