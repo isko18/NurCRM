@@ -113,13 +113,6 @@ def deduct_ingredients_for_order(order: Order):
         p = products_by_id[pid]
         have = _decimal_from_warehouse_remainder(p.remainder)
         new_val = have - need
-        if new_val < 0:
-            raise ValidationError({
-                "detail": (
-                    f"Недостаточно на складе: {p.title}. "
-                    f"Нужно: {need} {p.unit or ''}, доступно: {have} {p.unit or ''}"
-                ).strip()
-            })
 
         # remainder хранится строкой
         p.remainder = str(new_val)
