@@ -114,6 +114,44 @@ class DocumentsTests(TestCase):
         # Денежного документа тоже не создаём
         self.assertFalse(models.MoneyDocument.objects.filter(source_document_id=doc.id).exists())
 
+    def test_credit_sale_with_prepayment_creates_posted_money_document(self):
+        models.StockBalance.objects.create(warehouse=self.wh, product=self.prod, qty=Decimal("10.000"))
+        cp = models.Counterparty.objects.create(
+            name="C1",
+            type=models.Counterparty.Type.CLIENT,
+            company=self.company,
+            branch=self.branch,
+        )
+        doc = models.Document.objects.create(
+            doc_type=models.Document.DocType.SALE,
+            warehouse_from=self.wh,
+            counterparty=cp,
+            payment_kind=models.Document.PaymentKind.CREDIT,
+            prepayment_amount=Decimal("10.00"),
+        )
+        models.DocumentItem.objects.create(document=doc, product=self.prod, qty=Decimal("3"), price=Decimal("15"))
+
+        services.post_document(doc)
+        doc.refresh_from_db()
+        self.assertEqual(doc.status, models.Document.Status.POSTED)
+
+        # Кассового подтверждения не требуется
+        with self.assertRaises(models.CashApprovalRequest.DoesNotExist):
+            _ = doc.cash_request
+
+        money_doc = doc.money_document
+        self.assertEqual(money_doc.doc_type, models.MoneyDocument.DocType.MONEY_RECEIPT)
+        self.assertEqual(money_doc.status, models.MoneyDocument.Status.POSTED)
+        self.assertEqual(Decimal(money_doc.amount), Decimal("10.00"))
+        self.assertEqual(money_doc.cash_register_id, self.cash.id)
+        self.assertEqual(money_doc.payment_category_id, self.paycat.id)
+
+        services.unpost_document(doc)
+        doc.refresh_from_db()
+        self.assertEqual(doc.status, models.Document.Status.DRAFT)
+        money_doc.refresh_from_db()
+        self.assertEqual(money_doc.status, models.MoneyDocument.Status.DRAFT)
+
     def test_transfer_creates_two_moves(self):
         wh2 = models.Warehouse.objects.create(name="W2", company=self.company, branch=self.branch, location="loc2")
         doc = models.Document.objects.create(doc_type=models.Document.DocType.TRANSFER, warehouse_from=self.wh, warehouse_to=wh2)

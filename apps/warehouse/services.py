@@ -503,6 +503,92 @@ def post_document(document: models.Document, allow_negative: bool = None) -> mod
                 )
                 _apply_move(mv)
 
+        # Предоплата для credit-документов: создаём и сразу проводим денежный документ на сумму предоплаты.
+        prepayment = Decimal(getattr(document, "prepayment_amount", None) or 0).quantize(Decimal("0.01"))
+        if prepayment > 0:
+            if document.agent_id:
+                raise ValueError("Предоплата не поддерживается для документов агента.")
+
+            payment_kind = document.payment_kind or models.Document.PaymentKind.CASH
+            if payment_kind != models.Document.PaymentKind.CREDIT:
+                raise ValueError("Предоплата возможна только при payment_kind=credit.")
+
+            total = Decimal(document.total or 0).quantize(Decimal("0.01"))
+            if prepayment > total:
+                raise ValueError("Предоплата не может быть больше суммы документа.")
+
+            money_doc_type = _resolve_money_doc_type(document.doc_type)
+            if not money_doc_type:
+                raise ValueError("Для этого типа документа предоплата недоступна.")
+
+            if not document.counterparty_id and document.doc_type in (
+                models.Document.DocType.SALE,
+                models.Document.DocType.PURCHASE,
+                models.Document.DocType.SALE_RETURN,
+                models.Document.DocType.PURCHASE_RETURN,
+            ):
+                raise ValueError("Для предоплаты укажите контрагента в документе.")
+
+            warehouse = document.warehouse_from
+            if not warehouse:
+                raise ValueError("Для предоплаты нужен warehouse_from.")
+
+            company = warehouse.company
+            branch = warehouse.branch
+
+            cash_register = getattr(document, "cash_register", None)
+            if cash_register is None:
+                qs = models.CashRegister.objects.filter(company=company)
+                qs = qs.filter(branch=branch) if branch is not None else qs.filter(branch__isnull=True)
+                cash_register = _pick_single(qs, what="касс", allow_multiple_take_first=True)
+                if cash_register is None:
+                    raise ValueError("Не найдена касса. Создайте кассу или укажите cash_register в документе.")
+
+            payment_category = getattr(document, "payment_category", None)
+            if payment_category is None:
+                qs = models.PaymentCategory.objects.filter(company=company)
+                qs = qs.filter(branch=branch) if branch is not None else qs.filter(branch__isnull=True)
+                payment_category = _pick_single(qs, what="категорий платежа")
+                if payment_category is None:
+                    raise ValueError(
+                        "Не найдена категория платежа. Создайте категорию или укажите payment_category в документе."
+                    )
+
+            # Идемпотентность: используем OneToOne money_document (source_document)
+            money_doc = getattr(document, "money_document", None)
+            if money_doc is None:
+                money_doc = models.MoneyDocument.objects.create(
+                    doc_type=money_doc_type,
+                    status=models.MoneyDocument.Status.DRAFT,
+                    cash_register=cash_register,
+                    counterparty=document.counterparty,
+                    payment_category=payment_category,
+                    amount=prepayment,
+                    comment=f"ПРЕДОПЛАТА: {document.doc_type} {document.number or document.id}",
+                    company=company,
+                    branch=branch,
+                    source_document=document,
+                )
+            else:
+                # Обновление возможно только если денежный документ ещё не проведён
+                if money_doc.status == models.MoneyDocument.Status.POSTED:
+                    # если уже проведено — считаем, что предоплата уже учтена
+                    pass
+                else:
+                    money_doc.doc_type = money_doc_type
+                    money_doc.cash_register = cash_register
+                    money_doc.counterparty = document.counterparty
+                    money_doc.payment_category = payment_category
+                    money_doc.amount = prepayment
+                    money_doc.comment = f"ПРЕДОПЛАТА: {document.doc_type} {document.number or document.id}"
+                    money_doc.company = company
+                    money_doc.branch = branch
+                    money_doc.save()
+
+            if money_doc.status == models.MoneyDocument.Status.DRAFT:
+                from . import services_money
+                services_money.post_money_document(money_doc)
+
         # Деньги создаём/подтверждаем только для payment_kind=cash.
         # Для credit (и для типов без денежного движения) документ сразу считается проведённым.
         money_doc_type = _resolve_money_doc_type(document.doc_type)
