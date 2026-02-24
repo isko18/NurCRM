@@ -979,6 +979,14 @@ class Document(models.Model):
         help_text="Для продажи/покупки и возвратов: оплата сразу или в долг.",
     )
 
+    prepayment_amount = models.DecimalField(
+        max_digits=18,
+        decimal_places=2,
+        default=Decimal("0.00"),
+        verbose_name="Предоплата",
+        help_text="Для payment_kind=credit: сумма предоплаты по документу (создаст денежный документ при проведении).",
+    )
+
     warehouse_from = models.ForeignKey("warehouse.Warehouse", on_delete=models.SET_NULL, null=True, blank=True, related_name="documents_from", verbose_name="Склад-источник")
     warehouse_to = models.ForeignKey("warehouse.Warehouse", on_delete=models.SET_NULL, null=True, blank=True, related_name="documents_to", verbose_name="Склад-приемник")
     counterparty = models.ForeignKey("warehouse.Counterparty", on_delete=models.SET_NULL, null=True, blank=True, verbose_name="Контрагент")
@@ -1032,6 +1040,10 @@ class Document(models.Model):
     def clean(self):
         from django.core.exceptions import ValidationError
 
+        prepayment = Decimal(getattr(self, "prepayment_amount", None) or 0)
+        if prepayment < 0:
+            raise ValidationError({"prepayment_amount": "Предоплата не может быть отрицательной."})
+
         if self.doc_type == self.DocType.TRANSFER:
             if not self.warehouse_from or not self.warehouse_to:
                 raise ValidationError("TRANSFER requires both warehouse_from and warehouse_to")
@@ -1064,6 +1076,15 @@ class Document(models.Model):
         if self.doc_type in (self.DocType.SALE, self.DocType.PURCHASE, self.DocType.SALE_RETURN, self.DocType.PURCHASE_RETURN):
             if self.payment_kind and self.payment_kind not in (self.PaymentKind.CASH, self.PaymentKind.CREDIT):
                 raise ValidationError({"payment_kind": "Укажите cash (оплата сразу) или credit (в долг)."})
+        else:
+            # Предоплата имеет смысл только для документов с payment_kind (продажа/покупка и возвраты).
+            if prepayment > 0:
+                raise ValidationError({"prepayment_amount": "Предоплата доступна только для SALE/PURCHASE и возвратов."})
+
+        if prepayment > 0:
+            pk = self.payment_kind or self.PaymentKind.CASH
+            if pk != self.PaymentKind.CREDIT:
+                raise ValidationError({"prepayment_amount": "Предоплата возможна только при payment_kind=credit."})
 
         # Общая скидка на документ
         dp = Decimal(getattr(self, "discount_percent", None) or 0)

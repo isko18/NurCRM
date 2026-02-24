@@ -55,6 +55,17 @@ class DocumentSerializer(serializers.ModelSerializer):
     receipts = serializers.SerializerMethodField()
     expenses = serializers.SerializerMethodField()
 
+    money_document_id = serializers.UUIDField(source="money_document.id", read_only=True, allow_null=True)
+    money_document_number = serializers.CharField(source="money_document.number", read_only=True, allow_null=True)
+    money_document_status = serializers.CharField(source="money_document.status", read_only=True, allow_null=True)
+    money_document_amount = serializers.DecimalField(
+        source="money_document.amount",
+        max_digits=18,
+        decimal_places=2,
+        read_only=True,
+        allow_null=True,
+    )
+
     cash_register_name = serializers.CharField(source="cash_register.name", read_only=True, allow_null=True)
     payment_category_title = serializers.CharField(source="payment_category.title", read_only=True, allow_null=True)
     cash_request_status = serializers.SerializerMethodField()
@@ -81,6 +92,7 @@ class DocumentSerializer(serializers.ModelSerializer):
             "number",
             "date",
             "payment_kind",
+            "prepayment_amount",
             "warehouse_from",
             "warehouse_to",
             "warehouse_from_name",
@@ -91,6 +103,10 @@ class DocumentSerializer(serializers.ModelSerializer):
             "payment_category",
             "payment_category_title",
             "cash_request_status",
+            "money_document_id",
+            "money_document_number",
+            "money_document_status",
+            "money_document_amount",
             "agent",
             "agent_display",
             "counterparty_display_name",
