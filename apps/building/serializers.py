@@ -1,6 +1,18 @@
 from rest_framework import serializers
 
-from .models import ResidentialComplex
+from .models import (
+    ResidentialComplex,
+    ResidentialComplexDrawing,
+    ResidentialComplexWarehouse,
+    BuildingProcurementRequest,
+    BuildingProcurementItem,
+    BuildingProcurementCashDecision,
+    BuildingTransferRequest,
+    BuildingTransferItem,
+    BuildingWarehouseStockItem,
+    BuildingWarehouseStockMove,
+    BuildingWorkflowEvent,
+)
 
 
 class ResidentialComplexSerializer(serializers.ModelSerializer):
@@ -43,3 +55,276 @@ class ResidentialComplexCreateSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError({"company": "У пользователя не указана компания."})
         validated_data["company_id"] = company.id
         return super().create(validated_data)
+
+
+class ResidentialComplexDrawingSerializer(serializers.ModelSerializer):
+    file_url = serializers.SerializerMethodField(read_only=True)
+
+    class Meta:
+        model = ResidentialComplexDrawing
+        fields = [
+            "id",
+            "residential_complex",
+            "title",
+            "file",
+            "file_url",
+            "description",
+            "is_active",
+            "created_at",
+            "updated_at",
+        ]
+        read_only_fields = ["id", "file_url", "created_at", "updated_at"]
+
+    def get_file_url(self, obj):
+        request = self.context.get("request")
+        if not getattr(obj, "file", None):
+            return None
+        url = obj.file.url
+        return request.build_absolute_uri(url) if request else url
+
+    def validate_residential_complex(self, value):
+        user = self.context["request"].user
+        if not getattr(user, "is_staff", False) and not getattr(user, "is_superuser", False):
+            user_company_id = getattr(user, "company_id", None)
+            if not user_company_id:
+                raise serializers.ValidationError("У пользователя не указана компания.")
+            if value.company_id != user_company_id:
+                raise serializers.ValidationError("ЖК принадлежит другой компании.")
+        return value
+
+
+class ResidentialComplexWarehouseSerializer(serializers.ModelSerializer):
+    residential_complex_name = serializers.CharField(source="residential_complex.name", read_only=True)
+
+    class Meta:
+        model = ResidentialComplexWarehouse
+        fields = [
+            "id",
+            "residential_complex",
+            "residential_complex_name",
+            "name",
+            "is_active",
+            "created_at",
+            "updated_at",
+        ]
+        read_only_fields = ["id", "created_at", "updated_at"]
+
+
+class BuildingProcurementItemSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = BuildingProcurementItem
+        fields = [
+            "id",
+            "procurement",
+            "name",
+            "unit",
+            "quantity",
+            "price",
+            "line_total",
+            "order",
+            "note",
+            "created_at",
+            "updated_at",
+        ]
+        read_only_fields = ["id", "line_total", "created_at", "updated_at"]
+
+
+class BuildingProcurementCashDecisionSerializer(serializers.ModelSerializer):
+    decided_by_display = serializers.SerializerMethodField()
+
+    class Meta:
+        model = BuildingProcurementCashDecision
+        fields = ["id", "procurement", "decision", "reason", "decided_by", "decided_by_display", "decided_at"]
+        read_only_fields = ["id", "decided_at", "decided_by_display"]
+
+    def get_decided_by_display(self, obj):
+        user = getattr(obj, "decided_by", None)
+        if not user:
+            return None
+        full_name = f"{getattr(user, 'first_name', '')} {getattr(user, 'last_name', '')}".strip()
+        return full_name or getattr(user, "email", None) or str(getattr(user, "id", ""))
+
+
+class BuildingTransferItemSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = BuildingTransferItem
+        fields = [
+            "id",
+            "transfer",
+            "procurement_item",
+            "name",
+            "unit",
+            "quantity",
+            "price",
+            "line_total",
+            "order",
+            "created_at",
+            "updated_at",
+        ]
+        read_only_fields = ["id", "line_total", "created_at", "updated_at"]
+
+
+class BuildingTransferSerializer(serializers.ModelSerializer):
+    items = BuildingTransferItemSerializer(many=True, read_only=True)
+    warehouse_name = serializers.CharField(source="warehouse.name", read_only=True)
+    procurement_title = serializers.CharField(source="procurement.title", read_only=True)
+
+    class Meta:
+        model = BuildingTransferRequest
+        fields = [
+            "id",
+            "procurement",
+            "procurement_title",
+            "warehouse",
+            "warehouse_name",
+            "created_by",
+            "decided_by",
+            "status",
+            "note",
+            "rejection_reason",
+            "total_amount",
+            "accepted_at",
+            "rejected_at",
+            "created_at",
+            "updated_at",
+            "items",
+        ]
+        read_only_fields = [
+            "id",
+            "created_by",
+            "decided_by",
+            "status",
+            "rejection_reason",
+            "total_amount",
+            "accepted_at",
+            "rejected_at",
+            "created_at",
+            "updated_at",
+            "items",
+        ]
+
+
+class BuildingProcurementSerializer(serializers.ModelSerializer):
+    residential_complex_name = serializers.CharField(source="residential_complex.name", read_only=True)
+    initiator_display = serializers.SerializerMethodField()
+    cash_decision = BuildingProcurementCashDecisionSerializer(read_only=True)
+    transfers = BuildingTransferSerializer(many=True, read_only=True)
+    items = BuildingProcurementItemSerializer(many=True, read_only=True)
+
+    class Meta:
+        model = BuildingProcurementRequest
+        fields = [
+            "id",
+            "residential_complex",
+            "residential_complex_name",
+            "initiator",
+            "initiator_display",
+            "title",
+            "comment",
+            "status",
+            "total_amount",
+            "submitted_to_cash_at",
+            "cash_decided_at",
+            "cash_decided_by",
+            "created_at",
+            "updated_at",
+            "cash_decision",
+            "items",
+            "transfers",
+        ]
+        read_only_fields = [
+            "id",
+            "initiator",
+            "status",
+            "total_amount",
+            "submitted_to_cash_at",
+            "cash_decided_at",
+            "cash_decided_by",
+            "created_at",
+            "updated_at",
+            "cash_decision",
+            "items",
+            "transfers",
+        ]
+
+    def get_initiator_display(self, obj):
+        user = getattr(obj, "initiator", None)
+        if not user:
+            return None
+        full_name = f"{getattr(user, 'first_name', '')} {getattr(user, 'last_name', '')}".strip()
+        return full_name or getattr(user, "email", None) or str(getattr(user, "id", ""))
+
+
+class BuildingWorkflowEventSerializer(serializers.ModelSerializer):
+    actor_display = serializers.SerializerMethodField()
+
+    class Meta:
+        model = BuildingWorkflowEvent
+        fields = [
+            "id",
+            "procurement",
+            "procurement_item",
+            "transfer",
+            "transfer_item",
+            "warehouse",
+            "stock_item",
+            "actor",
+            "actor_display",
+            "action",
+            "from_status",
+            "to_status",
+            "message",
+            "payload",
+            "created_at",
+        ]
+        read_only_fields = fields
+
+    def get_actor_display(self, obj):
+        user = getattr(obj, "actor", None)
+        if not user:
+            return None
+        full_name = f"{getattr(user, 'first_name', '')} {getattr(user, 'last_name', '')}".strip()
+        return full_name or getattr(user, "email", None) or str(getattr(user, "id", ""))
+
+
+class BuildingWarehouseStockItemSerializer(serializers.ModelSerializer):
+    warehouse_name = serializers.CharField(source="warehouse.name", read_only=True)
+
+    class Meta:
+        model = BuildingWarehouseStockItem
+        fields = ["id", "warehouse", "warehouse_name", "name", "unit", "quantity", "last_price", "created_at", "updated_at"]
+        read_only_fields = fields
+
+
+class BuildingWarehouseStockMoveSerializer(serializers.ModelSerializer):
+    warehouse_name = serializers.CharField(source="warehouse.name", read_only=True)
+    stock_item_name = serializers.CharField(source="stock_item.name", read_only=True)
+
+    class Meta:
+        model = BuildingWarehouseStockMove
+        fields = [
+            "id",
+            "warehouse",
+            "warehouse_name",
+            "stock_item",
+            "stock_item_name",
+            "transfer",
+            "move_type",
+            "quantity_delta",
+            "price",
+            "created_by",
+            "created_at",
+        ]
+        read_only_fields = fields
+
+
+class BuildingReasonSerializer(serializers.Serializer):
+    reason = serializers.CharField(required=True, allow_blank=False)
+
+
+class BuildingTransferCreateSerializer(serializers.Serializer):
+    note = serializers.CharField(required=False, allow_blank=True)
+
+
+class BuildingTransferAcceptSerializer(serializers.Serializer):
+    note = serializers.CharField(required=False, allow_blank=True)
