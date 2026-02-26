@@ -65,6 +65,93 @@
 
 ## Endpoints
 
+## Warehouse-style purchase API (for procurement department)
+
+Этот блок сделан специально, чтобы отдел закупок работал по паттерну `warehouse/documents/purchase`.
+
+- `GET /documents/purchase/` - список документов закупки
+- `POST /documents/purchase/` - создать документ закупки с позициями
+- `GET /documents/purchase/{id}/` - детали документа
+- `PATCH /documents/purchase/{id}/` - обновить документ (только `draft`)
+- `DELETE /documents/purchase/{id}/` - удалить документ
+- `POST /documents/purchase/{id}/cash/approve/` - подтверждение кассой
+- `POST /documents/purchase/{id}/cash/reject/` - отказ кассой
+
+Формат документа:
+- `doc_type = "PURCHASE"`
+- `status` (внутренние статусы `building`)
+- `date`, `total`, `items` (вложенный список)
+
+Пример create:
+```json
+{
+  "residential_complex": "e5f3...uuid",
+  "comment": "Закупка на этап отделки",
+  "items": [
+    {
+      "product": "b3ab...uuid",
+      "name": "Краска фасадная",
+      "unit": "банка",
+      "qty": "30.000",
+      "price": "1200.00",
+      "order": 1,
+      "note": "Белая матовая"
+    },
+    {
+      "name": "Грунтовка",
+      "unit": "канистра",
+      "qty": "20.000",
+      "price": "900.00",
+      "order": 2
+    }
+  ]
+}
+```
+
+Пример approve:
+```json
+{
+  "note": "Согласовано кассой"
+}
+```
+
+Пример reject:
+```json
+{
+  "reason": "Превышен лимит бюджета"
+}
+```
+
+Важно:
+- в позициях `product` можно передавать как в `warehouse`-логике;
+- если `product` передан, `name/unit` можно не передавать (подставятся из товара).
+
+### Каталог товаров (как в warehouse)
+
+- `GET /products/`
+- `POST /products/`
+- `GET /products/{id}/`
+- `PATCH /products/{id}/`
+- `DELETE /products/{id}/`
+
+Поиск:
+- `GET /products/?search=цемент`
+- `GET /products/?search=123456789` (штрихкод)
+
+Пример create товара:
+```json
+{
+  "name": "Цемент М500",
+  "article": "CEM-M500",
+  "barcode": "111222333444",
+  "unit": "мешок",
+  "description": "Сухая смесь",
+  "is_active": true
+}
+```
+
+---
+
 ## 1) ЖК и склады ЖК
 
 ### ЖК (базовые)

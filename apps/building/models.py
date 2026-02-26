@@ -104,6 +104,44 @@ class ResidentialComplexWarehouse(models.Model):
         return f"{self.name} ({self.residential_complex.name})"
 
 
+class BuildingProduct(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False, verbose_name="ID")
+    company = models.ForeignKey(
+        Company,
+        on_delete=models.CASCADE,
+        related_name="building_products",
+        verbose_name="Компания",
+    )
+    name = models.CharField(max_length=255, verbose_name="Название")
+    article = models.CharField(max_length=64, blank=True, verbose_name="Артикул")
+    barcode = models.CharField(max_length=64, blank=True, verbose_name="Штрихкод")
+    unit = models.CharField(max_length=64, default="шт.", verbose_name="Единица измерения")
+    description = models.TextField(blank=True, verbose_name="Описание")
+    is_active = models.BooleanField(default=True, verbose_name="Активен")
+    created_at = models.DateTimeField(auto_now_add=True, verbose_name="Дата создания")
+    updated_at = models.DateTimeField(auto_now=True, verbose_name="Дата обновления")
+
+    class Meta:
+        verbose_name = "Товар (Building)"
+        verbose_name_plural = "Товары (Building)"
+        ordering = ["-created_at"]
+        indexes = [
+            models.Index(fields=["company", "name"]),
+            models.Index(fields=["company", "barcode"]),
+            models.Index(fields=["company", "is_active"]),
+        ]
+        constraints = [
+            models.UniqueConstraint(
+                fields=("company", "barcode"),
+                condition=~models.Q(barcode=""),
+                name="uq_building_product_company_barcode_not_empty",
+            )
+        ]
+
+    def __str__(self):
+        return self.name
+
+
 class BuildingProcurementRequest(models.Model):
     class Status(models.TextChoices):
         DRAFT = "draft", "Черновик"
@@ -179,6 +217,14 @@ class BuildingProcurementItem(models.Model):
         related_name="items",
         verbose_name="Закупка",
     )
+    product = models.ForeignKey(
+        BuildingProduct,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="procurement_items",
+        verbose_name="Товар",
+    )
     name = models.CharField(max_length=255, verbose_name="Наименование")
     unit = models.CharField(max_length=64, verbose_name="Единица измерения")
     quantity = models.DecimalField(max_digits=16, decimal_places=3, verbose_name="Количество")
@@ -195,12 +241,18 @@ class BuildingProcurementItem(models.Model):
         ordering = ["order", "created_at"]
         indexes = [
             models.Index(fields=["procurement", "order"]),
+            models.Index(fields=["product"]),
         ]
 
     def __str__(self):
         return f"{self.name} ({self.quantity} {self.unit})"
 
     def save(self, *args, **kwargs):
+        if self.product_id:
+            if not self.name:
+                self.name = self.product.name
+            if not self.unit:
+                self.unit = self.product.unit
         qty = Decimal(self.quantity or 0)
         price = Decimal(self.price or 0)
         self.line_total = (qty * price).quantize(Decimal("0.01"))

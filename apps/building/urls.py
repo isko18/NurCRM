@@ -7,6 +7,8 @@ from .views import (
     ResidentialComplexDrawingDetailView,
     ResidentialComplexWarehouseListCreateView,
     ResidentialComplexWarehouseDetailView,
+    BuildingProductListCreateView,
+    BuildingProductDetailView,
     BuildingProcurementListCreateView,
     BuildingProcurementDetailView,
     BuildingProcurementItemListCreateView,
@@ -23,6 +25,10 @@ from .views import (
     BuildingWorkflowEventListView,
     BuildingWarehouseStockItemListView,
     BuildingWarehouseStockMoveListView,
+    BuildingPurchaseDocumentListCreateView,
+    BuildingPurchaseDocumentDetailView,
+    BuildingPurchaseDocumentCashApproveView,
+    BuildingPurchaseDocumentCashRejectView,
 )
 
 app_name = "building"
@@ -34,6 +40,8 @@ urlpatterns = [
     path("drawings/<uuid:pk>/", ResidentialComplexDrawingDetailView.as_view(), name="residential-complex-drawing-detail"),
     path("warehouses/", ResidentialComplexWarehouseListCreateView.as_view(), name="residential-complex-warehouse-list-create"),
     path("warehouses/<uuid:pk>/", ResidentialComplexWarehouseDetailView.as_view(), name="residential-complex-warehouse-detail"),
+    path("products/", BuildingProductListCreateView.as_view(), name="building-product-list-create"),
+    path("products/<uuid:pk>/", BuildingProductDetailView.as_view(), name="building-product-detail"),
 
     path("procurements/", BuildingProcurementListCreateView.as_view(), name="building-procurement-list-create"),
     path("procurements/<uuid:pk>/", BuildingProcurementDetailView.as_view(), name="building-procurement-detail"),
@@ -54,4 +62,10 @@ urlpatterns = [
     path("workflow-events/", BuildingWorkflowEventListView.as_view(), name="building-workflow-event-list"),
     path("warehouse-stock/items/", BuildingWarehouseStockItemListView.as_view(), name="building-warehouse-stock-item-list"),
     path("warehouse-stock/moves/", BuildingWarehouseStockMoveListView.as_view(), name="building-warehouse-stock-move-list"),
+
+    # purchase documents (warehouse-like contract for procurement department)
+    path("documents/purchase/", BuildingPurchaseDocumentListCreateView.as_view(), name="building-documents-purchase"),
+    path("documents/purchase/<uuid:pk>/", BuildingPurchaseDocumentDetailView.as_view(), name="building-document-purchase-detail"),
+    path("documents/purchase/<uuid:pk>/cash/approve/", BuildingPurchaseDocumentCashApproveView.as_view(), name="building-document-purchase-cash-approve"),
+    path("documents/purchase/<uuid:pk>/cash/reject/", BuildingPurchaseDocumentCashRejectView.as_view(), name="building-document-purchase-cash-reject"),
 ]

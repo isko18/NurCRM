@@ -1,9 +1,11 @@
 from rest_framework import serializers
+from django.db import transaction
 
 from .models import (
     ResidentialComplex,
     ResidentialComplexDrawing,
     ResidentialComplexWarehouse,
+    BuildingProduct,
     BuildingProcurementRequest,
     BuildingProcurementItem,
     BuildingProcurementCashDecision,
@@ -110,12 +112,36 @@ class ResidentialComplexWarehouseSerializer(serializers.ModelSerializer):
         read_only_fields = ["id", "created_at", "updated_at"]
 
 
+class BuildingProductSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = BuildingProduct
+        fields = [
+            "id",
+            "company",
+            "name",
+            "article",
+            "barcode",
+            "unit",
+            "description",
+            "is_active",
+            "created_at",
+            "updated_at",
+        ]
+        read_only_fields = ["id", "company", "created_at", "updated_at"]
+
+
 class BuildingProcurementItemSerializer(serializers.ModelSerializer):
+    product_name = serializers.CharField(source="product.name", read_only=True)
+    product_article = serializers.CharField(source="product.article", read_only=True)
+
     class Meta:
         model = BuildingProcurementItem
         fields = [
             "id",
             "procurement",
+            "product",
+            "product_name",
+            "product_article",
             "name",
             "unit",
             "quantity",
@@ -127,6 +153,17 @@ class BuildingProcurementItemSerializer(serializers.ModelSerializer):
             "updated_at",
         ]
         read_only_fields = ["id", "line_total", "created_at", "updated_at"]
+
+    def validate(self, attrs):
+        attrs = super().validate(attrs)
+        procurement = attrs.get("procurement") or getattr(self.instance, "procurement", None)
+        product = attrs.get("product")
+        if product and procurement and product.company_id != procurement.residential_complex.company_id:
+            raise serializers.ValidationError({"product": "Товар принадлежит другой компании."})
+        if product:
+            attrs.setdefault("name", product.name)
+            attrs.setdefault("unit", product.unit)
+        return attrs
 
 
 class BuildingProcurementCashDecisionSerializer(serializers.ModelSerializer):
@@ -328,3 +365,96 @@ class BuildingTransferCreateSerializer(serializers.Serializer):
 
 class BuildingTransferAcceptSerializer(serializers.Serializer):
     note = serializers.CharField(required=False, allow_blank=True)
+
+
+class BuildingPurchaseDocumentItemSerializer(serializers.ModelSerializer):
+    qty = serializers.DecimalField(source="quantity", max_digits=16, decimal_places=3)
+    product_name = serializers.CharField(source="product.name", read_only=True)
+    product_article = serializers.CharField(source="product.article", read_only=True)
+
+    class Meta:
+        model = BuildingProcurementItem
+        fields = ["id", "product", "product_name", "product_article", "name", "unit", "qty", "price", "line_total", "order", "note"]
+        read_only_fields = ["id", "line_total"]
+
+
+class BuildingPurchaseDocumentSerializer(serializers.ModelSerializer):
+    doc_type = serializers.CharField(read_only=True, default="PURCHASE")
+    date = serializers.DateTimeField(source="created_at", read_only=True)
+    total = serializers.DecimalField(source="total_amount", max_digits=16, decimal_places=2, read_only=True)
+    number = serializers.CharField(read_only=True, allow_blank=True, default="")
+    residential_complex_name = serializers.CharField(source="residential_complex.name", read_only=True)
+    items = BuildingPurchaseDocumentItemSerializer(many=True)
+
+    class Meta:
+        model = BuildingProcurementRequest
+        fields = [
+            "id",
+            "doc_type",
+            "status",
+            "number",
+            "date",
+            "residential_complex",
+            "residential_complex_name",
+            "comment",
+            "total",
+            "items",
+        ]
+        read_only_fields = ["id", "doc_type", "status", "number", "date", "total", "residential_complex_name"]
+
+    def create(self, validated_data):
+        items_data = validated_data.pop("items", [])
+        if not items_data:
+            raise serializers.ValidationError({"items": "Нельзя создать закупку без позиций."})
+
+        request = self.context.get("request")
+        initiator = getattr(request, "user", None) if request else None
+        with transaction.atomic():
+            procurement = BuildingProcurementRequest.objects.create(initiator=initiator, **validated_data)
+            for idx, item in enumerate(items_data, start=1):
+                quantity = item.pop("quantity")
+                product = item.get("product")
+                if product and product.company_id != procurement.residential_complex.company_id:
+                    raise serializers.ValidationError({"items": "Один из товаров принадлежит другой компании."})
+                if product:
+                    item.setdefault("name", product.name)
+                    item.setdefault("unit", product.unit)
+                BuildingProcurementItem.objects.create(
+                    procurement=procurement,
+                    quantity=quantity,
+                    order=item.get("order", idx),
+                    **item,
+                )
+            procurement.recalculate_totals()
+        return procurement
+
+    def update(self, instance, validated_data):
+        items_data = validated_data.pop("items", None)
+        if instance.status != BuildingProcurementRequest.Status.DRAFT:
+            raise serializers.ValidationError({"status": "Можно изменять только закупку в статусе draft."})
+
+        with transaction.atomic():
+            for attr, value in validated_data.items():
+                setattr(instance, attr, value)
+            instance.save()
+
+            if items_data is not None:
+                if not items_data:
+                    raise serializers.ValidationError({"items": "Нельзя оставить закупку без позиций."})
+                instance.items.all().delete()
+                for idx, item in enumerate(items_data, start=1):
+                    quantity = item.pop("quantity")
+                    product = item.get("product")
+                    if product and product.company_id != instance.residential_complex.company_id:
+                        raise serializers.ValidationError({"items": "Один из товаров принадлежит другой компании."})
+                    if product:
+                        item.setdefault("name", product.name)
+                        item.setdefault("unit", product.unit)
+                    BuildingProcurementItem.objects.create(
+                        procurement=instance,
+                        quantity=quantity,
+                        order=item.get("order", idx),
+                        **item,
+                    )
+                instance.recalculate_totals()
+        return instance
