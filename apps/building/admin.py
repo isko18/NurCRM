@@ -3,6 +3,7 @@ from .models import (
     ResidentialComplex,
     ResidentialComplexDrawing,
     ResidentialComplexWarehouse,
+    BuildingProduct,
     BuildingProcurementRequest,
     BuildingProcurementItem,
     BuildingProcurementCashDecision,
@@ -35,6 +36,14 @@ class ResidentialComplexWarehouseAdmin(admin.ModelAdmin):
     list_display = ("name", "residential_complex", "is_active", "created_at")
     list_filter = ("residential_complex__company", "is_active")
     search_fields = ("name", "residential_complex__name")
+    readonly_fields = ("id", "created_at", "updated_at")
+
+
+@admin.register(BuildingProduct)
+class BuildingProductAdmin(admin.ModelAdmin):
+    list_display = ("name", "company", "article", "barcode", "unit", "is_active", "created_at")
+    list_filter = ("company", "is_active")
+    search_fields = ("name", "article", "barcode")
     readonly_fields = ("id", "created_at", "updated_at")
 
 

@@ -9,6 +9,7 @@ from .models import (
     ResidentialComplex,
     ResidentialComplexDrawing,
     ResidentialComplexWarehouse,
+    BuildingProduct,
     BuildingProcurementRequest,
     BuildingProcurementItem,
     BuildingTransferRequest,
@@ -21,6 +22,7 @@ from .serializers import (
     ResidentialComplexCreateSerializer,
     ResidentialComplexDrawingSerializer,
     ResidentialComplexWarehouseSerializer,
+    BuildingProductSerializer,
     BuildingProcurementSerializer,
     BuildingProcurementItemSerializer,
     BuildingTransferSerializer,
@@ -30,6 +32,7 @@ from .serializers import (
     BuildingReasonSerializer,
     BuildingTransferCreateSerializer,
     BuildingTransferAcceptSerializer,
+    BuildingPurchaseDocumentSerializer,
 )
 from . import services
 
@@ -153,6 +156,46 @@ class ResidentialComplexWarehouseDetailView(CompanyQuerysetMixin, generics.Retri
         user = self.request.user
         if user.is_authenticated and getattr(user, "company_id", None):
             return qs.filter(residential_complex__company_id=user.company_id)
+        if not getattr(user, "is_staff", False) and not getattr(user, "is_superuser", False):
+            return qs.none()
+        return qs
+
+
+class BuildingProductListCreateView(CompanyQuerysetMixin, generics.ListCreateAPIView):
+    permission_classes = [permissions.IsAuthenticated]
+    serializer_class = BuildingProductSerializer
+    queryset = BuildingProduct.objects.all()
+    filter_backends = [DjangoFilterBackend, filters.SearchFilter]
+    filterset_fields = ["is_active"]
+    search_fields = ["name", "article", "barcode", "unit"]
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        user = self.request.user
+        if user.is_authenticated and getattr(user, "company_id", None):
+            return qs.filter(company_id=user.company_id)
+        if not getattr(user, "is_staff", False) and not getattr(user, "is_superuser", False):
+            return qs.none()
+        return qs
+
+    def perform_create(self, serializer):
+        user = self.request.user
+        company_id = getattr(user, "company_id", None)
+        if not company_id and not getattr(user, "is_superuser", False):
+            raise PermissionDenied("У пользователя не указана компания.")
+        serializer.save(company_id=company_id)
+
+
+class BuildingProductDetailView(CompanyQuerysetMixin, generics.RetrieveUpdateDestroyAPIView):
+    permission_classes = [permissions.IsAuthenticated]
+    serializer_class = BuildingProductSerializer
+    queryset = BuildingProduct.objects.all()
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        user = self.request.user
+        if user.is_authenticated and getattr(user, "company_id", None):
+            return qs.filter(company_id=user.company_id)
         if not getattr(user, "is_staff", False) and not getattr(user, "is_superuser", False):
             return qs.none()
         return qs
@@ -551,3 +594,104 @@ class BuildingWarehouseStockMoveListView(CompanyQuerysetMixin, generics.ListAPIV
         if not getattr(user, "is_staff", False) and not getattr(user, "is_superuser", False):
             return qs.none()
         return qs
+
+
+class BuildingPurchaseDocumentListCreateView(CompanyQuerysetMixin, generics.ListCreateAPIView):
+    """
+    Совместимый с warehouse формат закупок:
+    GET/POST /api/building/documents/purchase/
+    """
+    permission_classes = [permissions.IsAuthenticated]
+    serializer_class = BuildingPurchaseDocumentSerializer
+    queryset = BuildingProcurementRequest.objects.select_related("residential_complex", "initiator").prefetch_related("items")
+    filter_backends = [DjangoFilterBackend, filters.SearchFilter]
+    filterset_fields = ["status", "residential_complex"]
+    search_fields = ["comment", "title", "residential_complex__name"]
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        user = self.request.user
+        if user.is_authenticated and getattr(user, "company_id", None):
+            return qs.filter(residential_complex__company_id=user.company_id)
+        if not getattr(user, "is_staff", False) and not getattr(user, "is_superuser", False):
+            return qs.none()
+        return qs
+
+    def perform_create(self, serializer):
+        rc = serializer.validated_data["residential_complex"]
+        user = self.request.user
+        if not getattr(user, "is_superuser", False) and rc.company_id != getattr(user, "company_id", None):
+            raise PermissionDenied("ЖК принадлежит другой компании.")
+        doc = serializer.save()
+        services.log_event(action="procurement_created", actor=user, procurement=doc)
+
+
+class BuildingPurchaseDocumentDetailView(CompanyQuerysetMixin, generics.RetrieveUpdateDestroyAPIView):
+    """
+    Совместимый с warehouse формат закупки:
+    GET/PATCH/PUT/DELETE /api/building/documents/purchase/<uuid:pk>/
+    """
+    permission_classes = [permissions.IsAuthenticated]
+    serializer_class = BuildingPurchaseDocumentSerializer
+    queryset = BuildingProcurementRequest.objects.select_related("residential_complex", "initiator").prefetch_related("items")
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        user = self.request.user
+        if user.is_authenticated and getattr(user, "company_id", None):
+            return qs.filter(residential_complex__company_id=user.company_id)
+        if not getattr(user, "is_staff", False) and not getattr(user, "is_superuser", False):
+            return qs.none()
+        return qs
+
+
+class BuildingPurchaseDocumentCashApproveView(CompanyQuerysetMixin, generics.GenericAPIView):
+    permission_classes = [permissions.IsAuthenticated]
+    serializer_class = BuildingPurchaseDocumentSerializer
+    queryset = BuildingProcurementRequest.objects.select_related("residential_complex")
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        user = self.request.user
+        if user.is_authenticated and getattr(user, "company_id", None):
+            return qs.filter(residential_complex__company_id=user.company_id)
+        if not getattr(user, "is_staff", False) and not getattr(user, "is_superuser", False):
+            return qs.none()
+        return qs
+
+    def post(self, request, pk=None):
+        doc = self.get_object()
+        reason = (request.data.get("note") or request.data.get("reason") or "").strip()
+        if doc.status == BuildingProcurementRequest.Status.DRAFT:
+            services.submit_procurement_to_cash(doc, request.user)
+            doc.refresh_from_db()
+        services.approve_procurement_cash(doc, request.user, reason=reason)
+        doc.refresh_from_db()
+        return Response(self.get_serializer(doc).data, status=status.HTTP_200_OK)
+
+
+class BuildingPurchaseDocumentCashRejectView(CompanyQuerysetMixin, generics.GenericAPIView):
+    permission_classes = [permissions.IsAuthenticated]
+    serializer_class = BuildingPurchaseDocumentSerializer
+    queryset = BuildingProcurementRequest.objects.select_related("residential_complex")
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        user = self.request.user
+        if user.is_authenticated and getattr(user, "company_id", None):
+            return qs.filter(residential_complex__company_id=user.company_id)
+        if not getattr(user, "is_staff", False) and not getattr(user, "is_superuser", False):
+            return qs.none()
+        return qs
+
+    def post(self, request, pk=None):
+        doc = self.get_object()
+        reason = (request.data.get("note") or request.data.get("reason") or "").strip()
+        if not reason:
+            return Response({"reason": ["Укажите причину отказа."]}, status=status.HTTP_400_BAD_REQUEST)
+        if doc.status == BuildingProcurementRequest.Status.DRAFT:
+            services.submit_procurement_to_cash(doc, request.user)
+            doc.refresh_from_db()
+        services.reject_procurement_cash(doc, request.user, reason=reason)
+        doc.refresh_from_db()
+        return Response(self.get_serializer(doc).data, status=status.HTTP_200_OK)
