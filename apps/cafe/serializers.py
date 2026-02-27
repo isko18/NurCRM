@@ -532,23 +532,42 @@ class MenuItemSerializer(CompanyBranchReadOnlyMixin):
 
     def create(self, validated_data):
         ingredients = validated_data.pop("ingredients", [])
-        obj = super().create(validated_data)
-        if ingredients:
-            self._upsert_ingredients(obj, ingredients)
-        # Пересчитываем себестоимость после добавления ингредиентов
-        self._recalc_and_save_cost(obj)
-        return obj
+        try:
+            with transaction.atomic():
+                obj = super().create(validated_data)
+                if ingredients:
+                    self._upsert_ingredients(obj, ingredients)
+                # Пересчитываем себестоимость после добавления ингредиентов
+                self._recalc_and_save_cost(obj)
+                return obj
+        except IntegrityError as e:
+            # Дружелюбная ошибка вместо 500 IntegrityError (уникальные ограничения по названию)
+            msg = str(e)
+            if "uniq_menuitem_title_" in msg:
+                raise serializers.ValidationError(
+                    {"title": "Позиция меню с таким названием уже существует."}
+                )
+            raise
 
     def update(self, instance, validated_data):
         ingredients = validated_data.pop("ingredients", None)
-        obj = super().update(instance, validated_data)
-        if ingredients is not None:
-            instance.ingredients.all().delete()
-            if ingredients:
-                self._upsert_ingredients(instance, ingredients)
-        # Пересчитываем себестоимость после обновления
-        self._recalc_and_save_cost(obj)
-        return obj
+        try:
+            with transaction.atomic():
+                obj = super().update(instance, validated_data)
+                if ingredients is not None:
+                    instance.ingredients.all().delete()
+                    if ingredients:
+                        self._upsert_ingredients(instance, ingredients)
+                # Пересчитываем себестоимость после обновления
+                self._recalc_and_save_cost(obj)
+                return obj
+        except IntegrityError as e:
+            msg = str(e)
+            if "uniq_menuitem_title_" in msg:
+                raise serializers.ValidationError(
+                    {"title": "Позиция меню с таким названием уже существует."}
+                )
+            raise
 
 
 
