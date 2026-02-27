@@ -1,4 +1,7 @@
+import os
 from decimal import Decimal
+
+import httpx
 
 from django.db import transaction
 from django.utils import timezone
@@ -12,6 +15,7 @@ from .models import (
     BuildingWarehouseStockItem,
     BuildingWarehouseStockMove,
     BuildingWorkflowEvent,
+    BuildingTreaty,
     ResidentialComplexWarehouse,
 )
 
@@ -47,6 +51,27 @@ def _require_warehouse_perm(user):
         return
     if not getattr(user, "can_view_building_stock", False):
         raise ValidationError({"detail": "Нет прав складского ответственного."})
+
+
+def _require_clients_perm(user):
+    if _is_owner_like(user):
+        return
+    if not getattr(user, "can_view_building_clients", False):
+        raise ValidationError({"detail": "Нет прав на клиентов (Building)."})
+
+
+def _require_treaty_perm(user):
+    if _is_owner_like(user):
+        return
+    if not getattr(user, "can_view_building_treaty", False):
+        raise ValidationError({"detail": "Нет прав на договора (Building)."})
+
+
+def _require_work_process_perm(user):
+    if _is_owner_like(user):
+        return
+    if not getattr(user, "can_view_building_work_process", False):
+        raise ValidationError({"detail": "Нет прав на процесс работы (Building)."})
 
 
 def _same_company_or_raise(user, company_id):
@@ -381,3 +406,68 @@ def reject_transfer(transfer: BuildingTransferRequest, actor, reason: str):
         message=reason,
     )
     return transfer
+
+
+@transaction.atomic
+def request_treaty_create_in_erp(treaty: BuildingTreaty, actor):
+    """
+    Запросить создание договора в ERP.
+
+    Интеграция сделана безопасно: если ERP не настроена, просто фиксируем статус и ошибку.
+    """
+    _require_treaty_perm(actor)
+    _same_company_or_raise(actor, treaty.residential_complex.company_id)
+
+    endpoint = (os.getenv("BUILDING_ERP_TREATY_ENDPOINT") or "").strip()
+    token = (os.getenv("BUILDING_ERP_TOKEN") or "").strip()
+    now = timezone.now()
+
+    treaty.erp_requested_at = now
+    if not endpoint:
+        treaty.erp_sync_status = BuildingTreaty.ErpSyncStatus.NOT_CONFIGURED
+        treaty.erp_last_error = "ERP endpoint не настроен (env BUILDING_ERP_TREATY_ENDPOINT)."
+        treaty.save(update_fields=["erp_requested_at", "erp_sync_status", "erp_last_error", "updated_at"])
+        return treaty
+
+    # Помечаем как "requested" до попытки вызова
+    treaty.erp_sync_status = BuildingTreaty.ErpSyncStatus.REQUESTED
+    treaty.erp_last_error = ""
+    treaty.save(update_fields=["erp_requested_at", "erp_sync_status", "erp_last_error", "updated_at"])
+
+    payload = {
+        "id": str(treaty.id),
+        "number": treaty.number,
+        "title": treaty.title,
+        "description": treaty.description,
+        "amount": str(treaty.amount),
+        "status": treaty.status,
+        "residential_complex_id": str(treaty.residential_complex_id),
+        "residential_complex_name": getattr(treaty.residential_complex, "name", ""),
+        "client_id": str(treaty.client_id) if treaty.client_id else None,
+        "client_name": getattr(treaty.client, "name", None) if treaty.client_id else None,
+    }
+
+    headers = {"Content-Type": "application/json"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+
+    try:
+        resp = httpx.post(endpoint, json=payload, headers=headers, timeout=30.0)
+        resp.raise_for_status()
+        data = {}
+        try:
+            data = resp.json() or {}
+        except Exception:
+            data = {}
+
+        treaty.erp_sync_status = BuildingTreaty.ErpSyncStatus.SYNCED
+        treaty.erp_external_id = (data.get("external_id") or data.get("id") or treaty.erp_external_id or "").strip()
+        treaty.erp_last_error = ""
+        treaty.erp_synced_at = now
+        treaty.save(update_fields=["erp_sync_status", "erp_external_id", "erp_last_error", "erp_synced_at", "updated_at"])
+        return treaty
+    except Exception as e:
+        treaty.erp_sync_status = BuildingTreaty.ErpSyncStatus.FAILED
+        treaty.erp_last_error = str(e)
+        treaty.save(update_fields=["erp_sync_status", "erp_last_error", "updated_at"])
+        return treaty

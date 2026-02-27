@@ -12,6 +12,11 @@ from .models import (
     BuildingWarehouseStockItem,
     BuildingWarehouseStockMove,
     BuildingWorkflowEvent,
+    BuildingClient,
+    BuildingTreaty,
+    BuildingTreatyFile,
+    BuildingWorkEntry,
+    BuildingWorkEntryPhoto,
 )
 
 
@@ -107,3 +112,57 @@ class BuildingWorkflowEventAdmin(admin.ModelAdmin):
     list_filter = ("action", "created_at")
     search_fields = ("action", "message", "procurement__title", "warehouse__name")
     readonly_fields = ("id", "created_at", "payload")
+
+
+class BuildingTreatyFileInline(admin.TabularInline):
+    model = BuildingTreatyFile
+    extra = 0
+    readonly_fields = ("id", "created_at")
+
+
+@admin.register(BuildingTreaty)
+class BuildingTreatyAdmin(admin.ModelAdmin):
+    list_display = ("id", "number", "title", "residential_complex", "client", "status", "amount", "erp_sync_status", "created_at")
+    list_filter = ("status", "erp_sync_status", "residential_complex__company")
+    search_fields = ("number", "title", "description", "residential_complex__name")
+    readonly_fields = ("id", "created_at", "updated_at", "erp_requested_at", "erp_synced_at")
+    inlines = [BuildingTreatyFileInline]
+
+
+@admin.register(BuildingTreatyFile)
+class BuildingTreatyFileAdmin(admin.ModelAdmin):
+    list_display = ("id", "treaty", "title", "created_by", "created_at")
+    list_filter = ("treaty__residential_complex__company", "created_at")
+    search_fields = ("title", "file", "treaty__number", "treaty__title")
+    readonly_fields = ("id", "created_at")
+
+
+@admin.register(BuildingClient)
+class BuildingClientAdmin(admin.ModelAdmin):
+    list_display = ("id", "name", "company", "phone", "email", "is_active", "created_at")
+    list_filter = ("company", "is_active")
+    search_fields = ("name", "phone", "email", "inn")
+    readonly_fields = ("id", "created_at", "updated_at")
+
+
+class BuildingWorkEntryPhotoInline(admin.TabularInline):
+    model = BuildingWorkEntryPhoto
+    extra = 0
+    readonly_fields = ("id", "created_at")
+
+
+@admin.register(BuildingWorkEntry)
+class BuildingWorkEntryAdmin(admin.ModelAdmin):
+    list_display = ("id", "residential_complex", "category", "title", "created_by", "occurred_at", "created_at")
+    list_filter = ("category", "residential_complex__company")
+    search_fields = ("title", "description", "residential_complex__name")
+    readonly_fields = ("id", "created_at", "updated_at")
+    inlines = [BuildingWorkEntryPhotoInline]
+
+
+@admin.register(BuildingWorkEntryPhoto)
+class BuildingWorkEntryPhotoAdmin(admin.ModelAdmin):
+    list_display = ("id", "entry", "caption", "created_by", "created_at")
+    list_filter = ("entry__residential_complex__company", "created_at")
+    search_fields = ("caption", "image", "entry__title")
+    readonly_fields = ("id", "created_at")

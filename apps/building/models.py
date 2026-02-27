@@ -5,6 +5,7 @@ from django.conf import settings
 from django.db import models
 from django.db.models import Sum
 from django.db.models.functions import Coalesce
+from django.utils import timezone
 
 from apps.users.models import Company
 
@@ -580,3 +581,265 @@ class BuildingWorkflowEvent(models.Model):
 
     def __str__(self):
         return f"{self.action} ({self.created_at:%Y-%m-%d %H:%M:%S})"
+
+
+class BuildingClient(models.Model):
+    """
+    Клиент (в рамках building).
+
+    Не зависит от CRM, чтобы модуль building был самодостаточным.
+    """
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False, verbose_name="ID")
+    company = models.ForeignKey(
+        Company,
+        on_delete=models.CASCADE,
+        related_name="building_clients",
+        verbose_name="Компания",
+    )
+    name = models.CharField(max_length=255, verbose_name="Клиент (ФИО/компания)")
+    phone = models.CharField(max_length=32, blank=True, verbose_name="Телефон")
+    email = models.EmailField(blank=True, verbose_name="Email")
+    inn = models.CharField(max_length=32, blank=True, verbose_name="ИНН")
+    address = models.CharField(max_length=512, blank=True, verbose_name="Адрес")
+    notes = models.TextField(blank=True, verbose_name="Заметки")
+    is_active = models.BooleanField(default=True, verbose_name="Активен")
+    created_at = models.DateTimeField(auto_now_add=True, verbose_name="Дата создания")
+    updated_at = models.DateTimeField(auto_now=True, verbose_name="Дата обновления")
+
+    class Meta:
+        verbose_name = "Клиент (Building)"
+        verbose_name_plural = "Клиенты (Building)"
+        ordering = ["-created_at"]
+        indexes = [
+            models.Index(fields=["company", "is_active"]),
+            models.Index(fields=["company", "name"]),
+            models.Index(fields=["company", "phone"]),
+        ]
+
+    def __str__(self):
+        return self.name
+
+
+def building_treaty_file_upload_to(instance, filename: str) -> str:
+    ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else "bin"
+    return f"building/treaties/{instance.treaty_id}/files/{uuid.uuid4().hex}.{ext}"
+
+
+class BuildingTreaty(models.Model):
+    """
+    Договор (в рамках building).
+    """
+
+    class Status(models.TextChoices):
+        DRAFT = "draft", "Черновик"
+        ACTIVE = "active", "Активен"
+        SIGNED = "signed", "Подписан"
+        CANCELLED = "cancelled", "Отменён"
+
+    class ErpSyncStatus(models.TextChoices):
+        NOT_REQUESTED = "not_requested", "Не отправляли"
+        REQUESTED = "requested", "Запрошено"
+        SYNCED = "synced", "Создано в ERP"
+        FAILED = "failed", "Ошибка"
+        NOT_CONFIGURED = "not_configured", "ERP не настроена"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False, verbose_name="ID")
+    residential_complex = models.ForeignKey(
+        ResidentialComplex,
+        on_delete=models.CASCADE,
+        related_name="treaties",
+        verbose_name="Жилой комплекс",
+    )
+    client = models.ForeignKey(
+        BuildingClient,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="treaties",
+        verbose_name="Клиент",
+    )
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="building_treaties_created",
+        verbose_name="Кто создал",
+    )
+
+    number = models.CharField(max_length=64, blank=True, verbose_name="Номер договора")
+    title = models.CharField(max_length=255, blank=True, verbose_name="Название")
+    description = models.TextField(blank=True, verbose_name="Описание/условия")
+    amount = models.DecimalField(max_digits=16, decimal_places=2, default=Decimal("0.00"), verbose_name="Сумма")
+    status = models.CharField(max_length=32, choices=Status.choices, default=Status.DRAFT, db_index=True, verbose_name="Статус")
+    signed_at = models.DateTimeField(null=True, blank=True, verbose_name="Дата подписания")
+
+    auto_create_in_erp = models.BooleanField(default=False, verbose_name="Автосоздание в ERP")
+    erp_sync_status = models.CharField(
+        max_length=32,
+        choices=ErpSyncStatus.choices,
+        default=ErpSyncStatus.NOT_REQUESTED,
+        db_index=True,
+        verbose_name="ERP: статус",
+    )
+    erp_external_id = models.CharField(max_length=128, blank=True, verbose_name="ERP: внешний ID")
+    erp_last_error = models.TextField(blank=True, verbose_name="ERP: последняя ошибка")
+    erp_requested_at = models.DateTimeField(null=True, blank=True, verbose_name="ERP: запрос отправки")
+    erp_synced_at = models.DateTimeField(null=True, blank=True, verbose_name="ERP: синхронизировано")
+
+    created_at = models.DateTimeField(auto_now_add=True, verbose_name="Дата создания")
+    updated_at = models.DateTimeField(auto_now=True, verbose_name="Дата обновления")
+
+    class Meta:
+        verbose_name = "Договор (Building)"
+        verbose_name_plural = "Договоры (Building)"
+        ordering = ["-created_at"]
+        indexes = [
+            models.Index(fields=["residential_complex", "status"]),
+            models.Index(fields=["erp_sync_status", "created_at"]),
+        ]
+
+    def __str__(self):
+        base = self.number or (self.title or "Договор")
+        return f"{base} ({self.residential_complex.name})"
+
+
+class BuildingTreatyFile(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False, verbose_name="ID")
+    treaty = models.ForeignKey(
+        BuildingTreaty,
+        on_delete=models.CASCADE,
+        related_name="files",
+        verbose_name="Договор",
+    )
+    title = models.CharField(max_length=255, blank=True, verbose_name="Название файла")
+    file = models.FileField(upload_to=building_treaty_file_upload_to, verbose_name="Файл")
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="building_treaty_files_created",
+        verbose_name="Кто загрузил",
+    )
+    created_at = models.DateTimeField(auto_now_add=True, verbose_name="Дата загрузки")
+
+    class Meta:
+        verbose_name = "Файл договора (Building)"
+        verbose_name_plural = "Файлы договоров (Building)"
+        ordering = ["-created_at"]
+        indexes = [
+            models.Index(fields=["treaty", "created_at"]),
+        ]
+
+    def __str__(self):
+        return self.title or str(getattr(self.file, "name", "")) or str(self.id)
+
+
+def building_work_entry_photo_upload_to(instance, filename: str) -> str:
+    ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else "jpg"
+    return f"building/work-entries/{instance.entry_id}/photos/{uuid.uuid4().hex}.{ext}"
+
+
+class BuildingWorkEntry(models.Model):
+    """
+    Запись в "процессе работ" по ЖК.
+    Мастера/прорабы/технадзор пишут свои работы, владелец видит весь процесс.
+    """
+
+    class Category(models.TextChoices):
+        NOTE = "note", "Заметка"
+        TREATY = "treaty", "Договор"
+        DEFECT = "defect", "Недостатки/дефекты"
+        REPORT = "report", "Отчёт"
+        OTHER = "other", "Другое"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False, verbose_name="ID")
+    residential_complex = models.ForeignKey(
+        ResidentialComplex,
+        on_delete=models.CASCADE,
+        related_name="work_entries",
+        verbose_name="Жилой комплекс",
+    )
+    client = models.ForeignKey(
+        BuildingClient,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="work_entries",
+        verbose_name="Клиент",
+    )
+    treaty = models.ForeignKey(
+        BuildingTreaty,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="work_entries",
+        verbose_name="Договор",
+    )
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="building_work_entries_created",
+        verbose_name="Кто добавил",
+    )
+    category = models.CharField(
+        max_length=32,
+        choices=Category.choices,
+        default=Category.NOTE,
+        db_index=True,
+        verbose_name="Категория",
+    )
+    title = models.CharField(max_length=255, blank=True, verbose_name="Заголовок")
+    description = models.TextField(blank=True, verbose_name="Описание")
+    occurred_at = models.DateTimeField(default=timezone.now, verbose_name="Дата/время события")
+    created_at = models.DateTimeField(auto_now_add=True, verbose_name="Дата создания")
+    updated_at = models.DateTimeField(auto_now=True, verbose_name="Дата обновления")
+
+    class Meta:
+        verbose_name = "Процесс работ: запись"
+        verbose_name_plural = "Процесс работ: записи"
+        ordering = ["-occurred_at", "-created_at"]
+        indexes = [
+            models.Index(fields=["residential_complex", "occurred_at"]),
+            models.Index(fields=["residential_complex", "category", "occurred_at"]),
+            models.Index(fields=["created_by", "occurred_at"]),
+        ]
+
+    def __str__(self):
+        return self.title or f"{self.get_category_display()} ({self.residential_complex.name})"
+
+
+class BuildingWorkEntryPhoto(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False, verbose_name="ID")
+    entry = models.ForeignKey(
+        BuildingWorkEntry,
+        on_delete=models.CASCADE,
+        related_name="photos",
+        verbose_name="Запись процесса работ",
+    )
+    image = models.ImageField(upload_to=building_work_entry_photo_upload_to, verbose_name="Фото")
+    caption = models.CharField(max_length=255, blank=True, verbose_name="Подпись")
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="building_work_entry_photos_created",
+        verbose_name="Кто загрузил",
+    )
+    created_at = models.DateTimeField(auto_now_add=True, verbose_name="Дата загрузки")
+
+    class Meta:
+        verbose_name = "Фото процесса работ"
+        verbose_name_plural = "Фото процесса работ"
+        ordering = ["-created_at"]
+        indexes = [
+            models.Index(fields=["entry", "created_at"]),
+        ]
+
+    def __str__(self):
+        return self.caption or str(getattr(self.image, "name", "")) or str(self.id)
