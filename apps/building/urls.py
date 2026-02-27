@@ -29,6 +29,15 @@ from .views import (
     BuildingPurchaseDocumentDetailView,
     BuildingPurchaseDocumentCashApproveView,
     BuildingPurchaseDocumentCashRejectView,
+    BuildingWorkEntryListCreateView,
+    BuildingWorkEntryDetailView,
+    BuildingWorkEntryPhotoAddView,
+    BuildingClientListCreateView,
+    BuildingClientDetailView,
+    BuildingTreatyListCreateView,
+    BuildingTreatyDetailView,
+    BuildingTreatyFileAddView,
+    BuildingTreatyErpCreateView,
 )
 
 app_name = "building"
@@ -68,4 +77,19 @@ urlpatterns = [
     path("documents/purchase/<uuid:pk>/", BuildingPurchaseDocumentDetailView.as_view(), name="building-document-purchase-detail"),
     path("documents/purchase/<uuid:pk>/cash/approve/", BuildingPurchaseDocumentCashApproveView.as_view(), name="building-document-purchase-cash-approve"),
     path("documents/purchase/<uuid:pk>/cash/reject/", BuildingPurchaseDocumentCashRejectView.as_view(), name="building-document-purchase-cash-reject"),
+
+    # work process
+    path("work-entries/", BuildingWorkEntryListCreateView.as_view(), name="building-work-entry-list-create"),
+    path("work-entries/<uuid:pk>/", BuildingWorkEntryDetailView.as_view(), name="building-work-entry-detail"),
+    path("work-entries/<uuid:pk>/photos/", BuildingWorkEntryPhotoAddView.as_view(), name="building-work-entry-photo-add"),
+
+    # clients
+    path("clients/", BuildingClientListCreateView.as_view(), name="building-client-list-create"),
+    path("clients/<uuid:pk>/", BuildingClientDetailView.as_view(), name="building-client-detail"),
+
+    # treaties (contracts)
+    path("treaties/", BuildingTreatyListCreateView.as_view(), name="building-treaty-list-create"),
+    path("treaties/<uuid:pk>/", BuildingTreatyDetailView.as_view(), name="building-treaty-detail"),
+    path("treaties/<uuid:pk>/files/", BuildingTreatyFileAddView.as_view(), name="building-treaty-file-add"),
+    path("treaties/<uuid:pk>/erp/create/", BuildingTreatyErpCreateView.as_view(), name="building-treaty-erp-create"),
 ]

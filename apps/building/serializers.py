@@ -14,6 +14,11 @@ from .models import (
     BuildingWarehouseStockItem,
     BuildingWarehouseStockMove,
     BuildingWorkflowEvent,
+    BuildingClient,
+    BuildingTreaty,
+    BuildingTreatyFile,
+    BuildingWorkEntry,
+    BuildingWorkEntryPhoto,
 )
 
 
@@ -365,6 +370,160 @@ class BuildingTransferCreateSerializer(serializers.Serializer):
 
 class BuildingTransferAcceptSerializer(serializers.Serializer):
     note = serializers.CharField(required=False, allow_blank=True)
+
+
+class BuildingClientSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = BuildingClient
+        fields = [
+            "id",
+            "company",
+            "name",
+            "phone",
+            "email",
+            "inn",
+            "address",
+            "notes",
+            "is_active",
+            "created_at",
+            "updated_at",
+        ]
+        read_only_fields = ["id", "company", "created_at", "updated_at"]
+
+
+class BuildingTreatyFileSerializer(serializers.ModelSerializer):
+    file_url = serializers.SerializerMethodField(read_only=True)
+
+    class Meta:
+        model = BuildingTreatyFile
+        fields = ["id", "treaty", "title", "file", "file_url", "created_by", "created_at"]
+        read_only_fields = ["id", "created_by", "created_at", "file_url"]
+
+    def get_file_url(self, obj):
+        request = self.context.get("request")
+        if not getattr(obj, "file", None):
+            return None
+        url = obj.file.url
+        return request.build_absolute_uri(url) if request else url
+
+
+class BuildingTreatyFileCreateSerializer(serializers.Serializer):
+    file = serializers.FileField(required=True)
+    title = serializers.CharField(required=False, allow_blank=True)
+
+
+class BuildingTreatySerializer(serializers.ModelSerializer):
+    residential_complex_name = serializers.CharField(source="residential_complex.name", read_only=True)
+    client_name = serializers.CharField(source="client.name", read_only=True)
+    files = BuildingTreatyFileSerializer(many=True, read_only=True)
+    created_by_display = serializers.SerializerMethodField()
+
+    class Meta:
+        model = BuildingTreaty
+        fields = [
+            "id",
+            "residential_complex",
+            "residential_complex_name",
+            "client",
+            "client_name",
+            "created_by",
+            "created_by_display",
+            "number",
+            "title",
+            "description",
+            "amount",
+            "status",
+            "signed_at",
+            "auto_create_in_erp",
+            "erp_sync_status",
+            "erp_external_id",
+            "erp_last_error",
+            "erp_requested_at",
+            "erp_synced_at",
+            "created_at",
+            "updated_at",
+            "files",
+        ]
+        read_only_fields = [
+            "id",
+            "created_by",
+            "created_by_display",
+            "erp_sync_status",
+            "erp_external_id",
+            "erp_last_error",
+            "erp_requested_at",
+            "erp_synced_at",
+            "created_at",
+            "updated_at",
+            "files",
+            "residential_complex_name",
+            "client_name",
+        ]
+
+    def get_created_by_display(self, obj):
+        user = getattr(obj, "created_by", None)
+        if not user:
+            return None
+        full_name = f"{getattr(user, 'first_name', '')} {getattr(user, 'last_name', '')}".strip()
+        return full_name or getattr(user, "email", None) or str(getattr(user, "id", ""))
+
+
+class BuildingWorkEntryPhotoSerializer(serializers.ModelSerializer):
+    image_url = serializers.SerializerMethodField(read_only=True)
+
+    class Meta:
+        model = BuildingWorkEntryPhoto
+        fields = ["id", "entry", "image", "image_url", "caption", "created_by", "created_at"]
+        read_only_fields = ["id", "created_by", "created_at", "image_url"]
+
+    def get_image_url(self, obj):
+        request = self.context.get("request")
+        if not getattr(obj, "image", None):
+            return None
+        url = obj.image.url
+        return request.build_absolute_uri(url) if request else url
+
+
+class BuildingWorkEntrySerializer(serializers.ModelSerializer):
+    residential_complex_name = serializers.CharField(source="residential_complex.name", read_only=True)
+    client_name = serializers.CharField(source="client.name", read_only=True)
+    treaty_number = serializers.CharField(source="treaty.number", read_only=True)
+    created_by_display = serializers.SerializerMethodField()
+    photos = BuildingWorkEntryPhotoSerializer(many=True, read_only=True)
+
+    class Meta:
+        model = BuildingWorkEntry
+        fields = [
+            "id",
+            "residential_complex",
+            "residential_complex_name",
+            "client",
+            "client_name",
+            "treaty",
+            "treaty_number",
+            "created_by",
+            "created_by_display",
+            "category",
+            "title",
+            "description",
+            "occurred_at",
+            "created_at",
+            "updated_at",
+            "photos",
+        ]
+        read_only_fields = ["id", "created_by", "created_by_display", "created_at", "updated_at", "photos"]
+
+    def get_created_by_display(self, obj):
+        user = getattr(obj, "created_by", None)
+        if not user:
+            return None
+        full_name = f"{getattr(user, 'first_name', '')} {getattr(user, 'last_name', '')}".strip()
+        return full_name or getattr(user, "email", None) or str(getattr(user, "id", ""))
+
+
+class BuildingWorkEntryPhotoCreateSerializer(serializers.Serializer):
+    image = serializers.ImageField(required=True)
+    caption = serializers.CharField(required=False, allow_blank=True)
 
 
 class BuildingPurchaseDocumentItemSerializer(serializers.ModelSerializer):
