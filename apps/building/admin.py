@@ -3,6 +3,7 @@ from .models import (
     ResidentialComplex,
     ResidentialComplexDrawing,
     ResidentialComplexWarehouse,
+    ResidentialComplexApartment,
     BuildingProduct,
     BuildingProcurementRequest,
     BuildingProcurementItem,
@@ -13,10 +14,20 @@ from .models import (
     BuildingWarehouseStockMove,
     BuildingWorkflowEvent,
     BuildingClient,
+    BuildingTreatyNumberSequence,
     BuildingTreaty,
+    BuildingTreatyInstallment,
     BuildingTreatyFile,
     BuildingWorkEntry,
     BuildingWorkEntryPhoto,
+    BuildingTask,
+    BuildingTaskAssignee,
+    BuildingTaskChecklistItem,
+    BuildingEmployeeCompensation,
+    BuildingPayrollPeriod,
+    BuildingPayrollLine,
+    BuildingPayrollAdjustment,
+    BuildingPayrollPayment,
 )
 
 
@@ -41,6 +52,14 @@ class ResidentialComplexWarehouseAdmin(admin.ModelAdmin):
     list_display = ("name", "residential_complex", "is_active", "created_at")
     list_filter = ("residential_complex__company", "is_active")
     search_fields = ("name", "residential_complex__name")
+    readonly_fields = ("id", "created_at", "updated_at")
+
+
+@admin.register(ResidentialComplexApartment)
+class ResidentialComplexApartmentAdmin(admin.ModelAdmin):
+    list_display = ("number", "floor", "residential_complex", "status", "price", "area", "rooms", "updated_at")
+    list_filter = ("residential_complex__company", "residential_complex", "status", "floor")
+    search_fields = ("number", "notes", "residential_complex__name")
     readonly_fields = ("id", "created_at", "updated_at")
 
 
@@ -120,13 +139,39 @@ class BuildingTreatyFileInline(admin.TabularInline):
     readonly_fields = ("id", "created_at")
 
 
+class BuildingTreatyInstallmentInline(admin.TabularInline):
+    model = BuildingTreatyInstallment
+    extra = 0
+    readonly_fields = ("id", "created_at", "updated_at")
+
+
+@admin.register(BuildingTreatyNumberSequence)
+class BuildingTreatyNumberSequenceAdmin(admin.ModelAdmin):
+    list_display = ("company", "next_value", "updated_at")
+    list_filter = ("company",)
+    readonly_fields = ("id", "updated_at")
+
+
 @admin.register(BuildingTreaty)
 class BuildingTreatyAdmin(admin.ModelAdmin):
-    list_display = ("id", "number", "title", "residential_complex", "client", "status", "amount", "erp_sync_status", "created_at")
-    list_filter = ("status", "erp_sync_status", "residential_complex__company")
-    search_fields = ("number", "title", "description", "residential_complex__name")
+    list_display = (
+        "id",
+        "number",
+        "title",
+        "residential_complex",
+        "apartment",
+        "client",
+        "operation_type",
+        "payment_type",
+        "status",
+        "amount",
+        "erp_sync_status",
+        "created_at",
+    )
+    list_filter = ("status", "operation_type", "payment_type", "erp_sync_status", "residential_complex__company")
+    search_fields = ("number", "title", "description", "residential_complex__name", "apartment__number")
     readonly_fields = ("id", "created_at", "updated_at", "erp_requested_at", "erp_synced_at")
-    inlines = [BuildingTreatyFileInline]
+    inlines = [BuildingTreatyFileInline, BuildingTreatyInstallmentInline]
 
 
 @admin.register(BuildingTreatyFile)
@@ -165,4 +210,101 @@ class BuildingWorkEntryPhotoAdmin(admin.ModelAdmin):
     list_display = ("id", "entry", "caption", "created_by", "created_at")
     list_filter = ("entry__residential_complex__company", "created_at")
     search_fields = ("caption", "image", "entry__title")
+    readonly_fields = ("id", "created_at")
+
+
+class BuildingTaskAssigneeInline(admin.TabularInline):
+    model = BuildingTaskAssignee
+    extra = 0
+    readonly_fields = ("id", "created_at")
+
+
+class BuildingTaskChecklistInline(admin.TabularInline):
+    model = BuildingTaskChecklistItem
+    extra = 0
+    readonly_fields = ("id", "created_at", "updated_at", "done_at")
+
+
+@admin.register(BuildingTask)
+class BuildingTaskAdmin(admin.ModelAdmin):
+    list_display = ("id", "title", "company", "status", "due_at", "created_by", "created_at")
+    list_filter = ("company", "status")
+    search_fields = ("title", "description")
+    readonly_fields = ("id", "created_at", "updated_at", "completed_at")
+    inlines = [BuildingTaskAssigneeInline, BuildingTaskChecklistInline]
+
+
+@admin.register(BuildingTaskAssignee)
+class BuildingTaskAssigneeAdmin(admin.ModelAdmin):
+    list_display = ("id", "task", "user", "added_by", "created_at")
+    list_filter = ("created_at",)
+    search_fields = ("task__title",)
+    readonly_fields = ("id", "created_at")
+
+
+@admin.register(BuildingTaskChecklistItem)
+class BuildingTaskChecklistItemAdmin(admin.ModelAdmin):
+    list_display = ("id", "task", "text", "is_done", "order", "done_by", "done_at", "updated_at")
+    list_filter = ("is_done", "created_at")
+    search_fields = ("text", "task__title")
+    readonly_fields = ("id", "created_at", "updated_at", "done_at")
+
+
+@admin.register(BuildingEmployeeCompensation)
+class BuildingEmployeeCompensationAdmin(admin.ModelAdmin):
+    list_display = ("id", "company", "user", "salary_type", "base_salary", "is_active", "updated_at")
+    list_filter = ("company", "salary_type", "is_active")
+    search_fields = ("user__email", "user__first_name", "user__last_name")
+    readonly_fields = ("id", "created_at", "updated_at")
+
+
+class BuildingPayrollLineInline(admin.TabularInline):
+    model = BuildingPayrollLine
+    extra = 0
+    readonly_fields = ("id", "bonus_total", "deduction_total", "advance_total", "net_to_pay", "paid_total", "created_at", "updated_at")
+
+
+@admin.register(BuildingPayrollPeriod)
+class BuildingPayrollPeriodAdmin(admin.ModelAdmin):
+    list_display = ("id", "company", "title", "period_start", "period_end", "status", "created_by", "approved_by", "approved_at")
+    list_filter = ("company", "status")
+    search_fields = ("title",)
+    readonly_fields = ("id", "created_at", "updated_at", "approved_at")
+    inlines = [BuildingPayrollLineInline]
+
+
+class BuildingPayrollAdjustmentInline(admin.TabularInline):
+    model = BuildingPayrollAdjustment
+    extra = 0
+    readonly_fields = ("id", "created_at")
+
+
+class BuildingPayrollPaymentInline(admin.TabularInline):
+    model = BuildingPayrollPayment
+    extra = 0
+    readonly_fields = ("id", "created_at")
+
+
+@admin.register(BuildingPayrollLine)
+class BuildingPayrollLineAdmin(admin.ModelAdmin):
+    list_display = ("id", "payroll", "employee", "base_amount", "net_to_pay", "paid_total", "updated_at")
+    list_filter = ("payroll__company", "payroll__status")
+    search_fields = ("employee__email", "employee__first_name", "employee__last_name")
+    readonly_fields = ("id", "bonus_total", "deduction_total", "advance_total", "net_to_pay", "paid_total", "created_at", "updated_at")
+    inlines = [BuildingPayrollAdjustmentInline, BuildingPayrollPaymentInline]
+
+
+@admin.register(BuildingPayrollAdjustment)
+class BuildingPayrollAdjustmentAdmin(admin.ModelAdmin):
+    list_display = ("id", "line", "type", "amount", "title", "created_by", "created_at")
+    list_filter = ("type", "created_at")
+    search_fields = ("title", "line__employee__email")
+    readonly_fields = ("id", "created_at")
+
+
+@admin.register(BuildingPayrollPayment)
+class BuildingPayrollPaymentAdmin(admin.ModelAdmin):
+    list_display = ("id", "line", "amount", "paid_at", "cashbox", "status", "paid_by", "created_at")
+    list_filter = ("status", "paid_at")
+    search_fields = ("line__employee__email",)
     readonly_fields = ("id", "created_at")

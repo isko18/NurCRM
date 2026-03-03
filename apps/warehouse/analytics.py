@@ -88,11 +88,45 @@ def _money_str(x) -> str:
     if x is None:
         return "0.00"
     if isinstance(x, Decimal):
-        return str(x)
+        try:
+            return str(x.quantize(Decimal("0.01")))
+        except Exception:
+            return str(x)
     try:
-        return str(Decimal(str(x)))
+        return str(Decimal(str(x)).quantize(Decimal("0.01")))
     except Exception:
         return str(x)
+
+
+def _build_sales_by_group(*, sales_items_qs, limit: int = 100):
+    """
+    Сводка продаж по "группам товаров внутри склада" (WarehouseProductGroup).
+    amount считаем по line_total (учитывает скидку строки), qty — по qty.
+    """
+    qs = (
+        sales_items_qs.values("product__product_group_id", "product__product_group__name")
+        .annotate(
+            docs_count=Count("document_id", distinct=True),
+            qty_sum=Coalesce(Sum("qty", output_field=QTY_FIELD), ZERO_QTY),
+            amount=Coalesce(Sum("line_total", output_field=MONEY_FIELD), ZERO_MONEY),
+        )
+        .order_by("-amount", "-qty_sum")[:limit]
+    )
+    rows = []
+    for r in qs:
+        gid = r["product__product_group_id"]
+        name = r["product__product_group__name"] or "Без группы"
+        rows.append(
+            {
+                "group_id": str(gid) if gid else None,
+                "group_name": name,
+                "docs_count": r["docs_count"],
+                "qty": str(r["qty_sum"]),
+                "amount": _money_str(r["amount"]),
+            }
+        )
+    top = rows[0] if rows else None
+    return rows, top
 
 
 @cached_result(timeout=settings.CACHE_TIMEOUT_ANALYTICS, key_prefix="warehouse_analytics_agent")
@@ -176,6 +210,8 @@ def build_agent_warehouse_analytics_payload(
         }
         for r in sales_by_product_qs
     ]
+
+    sales_by_group, top_sales_group = _build_sales_by_group(sales_items_qs=sales_items_qs, limit=100)
 
     sales_by_warehouse_qs = (
         sales_qs
@@ -310,6 +346,8 @@ def build_agent_warehouse_analytics_payload(
         "details": {
             "sales_by_product": sales_by_product,
             "sales_by_warehouse": sales_by_warehouse,
+            "sales_by_group": sales_by_group,
+            "top_sales_group": top_sales_group,
         },
     }
 
@@ -417,6 +455,8 @@ def build_owner_warehouse_analytics_payload(
         }
         for r in sales_by_product_qs
     ]
+
+    sales_by_group, top_sales_group = _build_sales_by_group(sales_items_qs=sales_items_qs, limit=100)
 
     top_agents_by_sales_qs = (
         sales_qs
@@ -553,5 +593,7 @@ def build_owner_warehouse_analytics_payload(
         "details": {
             "warehouses": warehouses,
             "sales_by_product": sales_by_product,
+            "sales_by_group": sales_by_group,
+            "top_sales_group": top_sales_group,
         },
     }
