@@ -3,10 +3,13 @@ from django.urls import path
 from .views import (
     ResidentialComplexListCreateView,
     ResidentialComplexDetailView,
+    ResidentialComplexFloorsView,
     ResidentialComplexDrawingListCreateView,
     ResidentialComplexDrawingDetailView,
     ResidentialComplexWarehouseListCreateView,
     ResidentialComplexWarehouseDetailView,
+    ResidentialComplexApartmentListCreateView,
+    ResidentialComplexApartmentDetailView,
     BuildingProductListCreateView,
     BuildingProductDetailView,
     BuildingProcurementListCreateView,
@@ -38,6 +41,21 @@ from .views import (
     BuildingTreatyDetailView,
     BuildingTreatyFileAddView,
     BuildingTreatyErpCreateView,
+    BuildingTaskListCreateView,
+    BuildingTaskDetailView,
+    BuildingTaskChecklistItemAddView,
+    BuildingTaskChecklistItemDetailView,
+    BuildingSalaryEmployeeListView,
+    BuildingEmployeeCompensationUpsertView,
+    BuildingPayrollPeriodListCreateView,
+    BuildingPayrollPeriodDetailView,
+    BuildingPayrollPeriodApproveView,
+    BuildingPayrollLineListCreateView,
+    BuildingPayrollLineDetailView,
+    BuildingPayrollAdjustmentCreateView,
+    BuildingPayrollAdjustmentDetailView,
+    BuildingPayrollPaymentListCreateView,
+    BuildingPayrollMyLinesView,
 )
 
 app_name = "building"
@@ -45,10 +63,13 @@ app_name = "building"
 urlpatterns = [
     path("objects/", ResidentialComplexListCreateView.as_view(), name="residential-complex-list-create"),
     path("objects/<uuid:pk>/", ResidentialComplexDetailView.as_view(), name="residential-complex-detail"),
+    path("objects/<uuid:pk>/floors/", ResidentialComplexFloorsView.as_view(), name="residential-complex-floors"),
     path("drawings/", ResidentialComplexDrawingListCreateView.as_view(), name="residential-complex-drawing-list-create"),
     path("drawings/<uuid:pk>/", ResidentialComplexDrawingDetailView.as_view(), name="residential-complex-drawing-detail"),
     path("warehouses/", ResidentialComplexWarehouseListCreateView.as_view(), name="residential-complex-warehouse-list-create"),
     path("warehouses/<uuid:pk>/", ResidentialComplexWarehouseDetailView.as_view(), name="residential-complex-warehouse-detail"),
+    path("apartments/", ResidentialComplexApartmentListCreateView.as_view(), name="residential-complex-apartment-list-create"),
+    path("apartments/<uuid:pk>/", ResidentialComplexApartmentDetailView.as_view(), name="residential-complex-apartment-detail"),
     path("products/", BuildingProductListCreateView.as_view(), name="building-product-list-create"),
     path("products/<uuid:pk>/", BuildingProductDetailView.as_view(), name="building-product-detail"),
 
@@ -92,4 +113,27 @@ urlpatterns = [
     path("treaties/<uuid:pk>/", BuildingTreatyDetailView.as_view(), name="building-treaty-detail"),
     path("treaties/<uuid:pk>/files/", BuildingTreatyFileAddView.as_view(), name="building-treaty-file-add"),
     path("treaties/<uuid:pk>/erp/create/", BuildingTreatyErpCreateView.as_view(), name="building-treaty-erp-create"),
+
+    # tasks / reminders
+    path("tasks/", BuildingTaskListCreateView.as_view(), name="building-task-list-create"),
+    path("tasks/<uuid:pk>/", BuildingTaskDetailView.as_view(), name="building-task-detail"),
+    path("tasks/<uuid:pk>/checklist-items/", BuildingTaskChecklistItemAddView.as_view(), name="building-task-checklist-item-add"),
+    path("task-checklist-items/<uuid:pk>/", BuildingTaskChecklistItemDetailView.as_view(), name="building-task-checklist-item-detail"),
+
+    # salary / payroll
+    path("salary/employees/", BuildingSalaryEmployeeListView.as_view(), name="building-salary-employees"),
+    path(
+        "salary/employees/<uuid:user_id>/compensation/",
+        BuildingEmployeeCompensationUpsertView.as_view(),
+        name="building-salary-employee-compensation",
+    ),
+    path("salary/payrolls/", BuildingPayrollPeriodListCreateView.as_view(), name="building-salary-payrolls"),
+    path("salary/payrolls/<uuid:pk>/", BuildingPayrollPeriodDetailView.as_view(), name="building-salary-payroll-detail"),
+    path("salary/payrolls/<uuid:pk>/approve/", BuildingPayrollPeriodApproveView.as_view(), name="building-salary-payroll-approve"),
+    path("salary/payrolls/<uuid:payroll_id>/lines/", BuildingPayrollLineListCreateView.as_view(), name="building-salary-payroll-lines"),
+    path("salary/payroll-lines/<uuid:pk>/", BuildingPayrollLineDetailView.as_view(), name="building-salary-payroll-line-detail"),
+    path("salary/payroll-lines/<uuid:pk>/adjustments/", BuildingPayrollAdjustmentCreateView.as_view(), name="building-salary-payroll-adjustment-create"),
+    path("salary/payroll-adjustments/<uuid:pk>/", BuildingPayrollAdjustmentDetailView.as_view(), name="building-salary-payroll-adjustment-detail"),
+    path("salary/payroll-lines/<uuid:pk>/payments/", BuildingPayrollPaymentListCreateView.as_view(), name="building-salary-payroll-payments"),
+    path("salary/my/lines/", BuildingPayrollMyLinesView.as_view(), name="building-salary-my-lines"),
 ]

@@ -1000,7 +1000,23 @@ Read-only поля:
         "qty": "10.000",
         "amount": "1500.00"
       }
-    ]
+    ],
+    "sales_by_group": [
+      {
+        "group_id": "uuid|null",
+        "group_name": "string",
+        "docs_count": 12,
+        "qty": "10.000",
+        "amount": "1500.00"
+      }
+    ],
+    "top_sales_group": {
+      "group_id": "uuid|null",
+      "group_name": "string",
+      "docs_count": 12,
+      "qty": "10.000",
+      "amount": "1500.00"
+    }
   }
 }
 ```
@@ -1021,6 +1037,8 @@ Read-only поля:
 Детально:
 - `details.sales_by_product[]` — продажи по товарам
 - `details.sales_by_warehouse[]` — продажи по складам
+- `details.sales_by_group[]` — продажи по группам товаров внутри склада (`product_group` у товара)
+- `details.top_sales_group` — группа‑лидер по сумме продаж за период (может быть `null`)
 
 Пример `details` агента:
 ```json
@@ -1031,7 +1049,11 @@ Read-only поля:
     ],
     "sales_by_warehouse": [
       { "warehouse_id": "uuid", "warehouse_name": "string", "sales_count": 3, "sales_amount": "700.00" }
-    ]
+    ],
+    "sales_by_group": [
+      { "group_id": "uuid|null", "group_name": "string", "docs_count": 3, "qty": "5.000", "amount": "500.00" }
+    ],
+    "top_sales_group": { "group_id": "uuid|null", "group_name": "string", "docs_count": 3, "qty": "5.000", "amount": "500.00" }
   }
 }
 ```

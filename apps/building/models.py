@@ -105,6 +105,63 @@ class ResidentialComplexWarehouse(models.Model):
         return f"{self.name} ({self.residential_complex.name})"
 
 
+class ResidentialComplexApartment(models.Model):
+    """
+    Квартира в рамках конкретного ЖК.
+    Используется для продажи/брони через BuildingTreaty.
+    """
+
+    class Status(models.TextChoices):
+        AVAILABLE = "available", "Доступна"
+        RESERVED = "reserved", "Забронирована"
+        SOLD = "sold", "Продана"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False, verbose_name="ID")
+    residential_complex = models.ForeignKey(
+        ResidentialComplex,
+        on_delete=models.CASCADE,
+        related_name="apartments",
+        verbose_name="Жилой комплекс",
+    )
+
+    floor = models.IntegerField(verbose_name="Этаж")
+    number = models.CharField(max_length=32, verbose_name="Номер квартиры")
+
+    rooms = models.PositiveSmallIntegerField(null=True, blank=True, verbose_name="Кол-во комнат")
+    area = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True, verbose_name="Площадь (м²)")
+    price = models.DecimalField(max_digits=16, decimal_places=2, default=Decimal("0.00"), verbose_name="Цена")
+
+    status = models.CharField(
+        max_length=16,
+        choices=Status.choices,
+        default=Status.AVAILABLE,
+        db_index=True,
+        verbose_name="Статус",
+    )
+    notes = models.TextField(blank=True, verbose_name="Заметки")
+
+    created_at = models.DateTimeField(auto_now_add=True, verbose_name="Дата создания")
+    updated_at = models.DateTimeField(auto_now=True, verbose_name="Дата обновления")
+
+    class Meta:
+        verbose_name = "Квартира (Building)"
+        verbose_name_plural = "Квартиры (Building)"
+        ordering = ["residential_complex", "floor", "number"]
+        indexes = [
+            models.Index(fields=["residential_complex", "floor"]),
+            models.Index(fields=["residential_complex", "status"]),
+        ]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["residential_complex", "number"],
+                name="uq_building_apartment_per_complex_number",
+            )
+        ]
+
+    def __str__(self):
+        return f"Кв. {self.number}, {self.floor} этаж ({self.residential_complex.name})"
+
+
 class BuildingProduct(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False, verbose_name="ID")
     company = models.ForeignKey(
@@ -621,6 +678,29 @@ class BuildingClient(models.Model):
         return self.name
 
 
+class BuildingTreatyNumberSequence(models.Model):
+    """
+    Счётчик для безопасной автогенерации номера договора внутри компании.
+    """
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False, verbose_name="ID")
+    company = models.OneToOneField(
+        Company,
+        on_delete=models.CASCADE,
+        related_name="building_treaty_sequence",
+        verbose_name="Компания",
+    )
+    next_value = models.PositiveIntegerField(default=1, verbose_name="Следующее значение")
+    updated_at = models.DateTimeField(auto_now=True, verbose_name="Дата обновления")
+
+    class Meta:
+        verbose_name = "Счётчик номера договора (Building)"
+        verbose_name_plural = "Счётчики номеров договоров (Building)"
+
+    def __str__(self):
+        return f"{self.company.name}: next={self.next_value}"
+
+
 def building_treaty_file_upload_to(instance, filename: str) -> str:
     ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else "bin"
     return f"building/treaties/{instance.treaty_id}/files/{uuid.uuid4().hex}.{ext}"
@@ -630,6 +710,14 @@ class BuildingTreaty(models.Model):
     """
     Договор (в рамках building).
     """
+
+    class OperationType(models.TextChoices):
+        SALE = "sale", "Продажа"
+        BOOKING = "booking", "Бронь"
+
+    class PaymentType(models.TextChoices):
+        FULL = "full", "Полная оплата"
+        INSTALLMENT = "installment", "Рассрочка"
 
     class Status(models.TextChoices):
         DRAFT = "draft", "Черновик"
@@ -672,6 +760,32 @@ class BuildingTreaty(models.Model):
     title = models.CharField(max_length=255, blank=True, verbose_name="Название")
     description = models.TextField(blank=True, verbose_name="Описание/условия")
     amount = models.DecimalField(max_digits=16, decimal_places=2, default=Decimal("0.00"), verbose_name="Сумма")
+
+    apartment = models.ForeignKey(
+        ResidentialComplexApartment,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="treaties",
+        verbose_name="Квартира",
+    )
+    operation_type = models.CharField(
+        max_length=16,
+        choices=OperationType.choices,
+        default=OperationType.SALE,
+        db_index=True,
+        verbose_name="Тип операции",
+    )
+    payment_type = models.CharField(
+        max_length=16,
+        choices=PaymentType.choices,
+        default=PaymentType.FULL,
+        db_index=True,
+        verbose_name="Тип оплаты",
+    )
+    down_payment = models.DecimalField(max_digits=16, decimal_places=2, default=Decimal("0.00"), verbose_name="Первоначальный взнос")
+    payment_terms = models.TextField(blank=True, verbose_name="Условия оплаты")
+
     status = models.CharField(max_length=32, choices=Status.choices, default=Status.DRAFT, db_index=True, verbose_name="Статус")
     signed_at = models.DateTimeField(null=True, blank=True, verbose_name="Дата подписания")
 
@@ -697,12 +811,53 @@ class BuildingTreaty(models.Model):
         ordering = ["-created_at"]
         indexes = [
             models.Index(fields=["residential_complex", "status"]),
+            models.Index(fields=["residential_complex", "operation_type", "created_at"]),
+            models.Index(fields=["residential_complex", "payment_type", "created_at"]),
             models.Index(fields=["erp_sync_status", "created_at"]),
         ]
 
     def __str__(self):
         base = self.number or (self.title or "Договор")
         return f"{base} ({self.residential_complex.name})"
+
+
+class BuildingTreatyInstallment(models.Model):
+    """
+    Платёж рассрочки по договору.
+    """
+
+    class Status(models.TextChoices):
+        PLANNED = "planned", "Запланирован"
+        PAID = "paid", "Оплачен"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False, verbose_name="ID")
+    treaty = models.ForeignKey(
+        BuildingTreaty,
+        on_delete=models.CASCADE,
+        related_name="installments",
+        verbose_name="Договор",
+    )
+    order = models.PositiveIntegerField(default=0, verbose_name="Порядок")
+    due_date = models.DateField(verbose_name="Дата платежа")
+    amount = models.DecimalField(max_digits=16, decimal_places=2, verbose_name="Сумма")
+    status = models.CharField(max_length=16, choices=Status.choices, default=Status.PLANNED, db_index=True, verbose_name="Статус")
+    paid_amount = models.DecimalField(max_digits=16, decimal_places=2, default=Decimal("0.00"), verbose_name="Оплачено")
+    paid_at = models.DateTimeField(null=True, blank=True, verbose_name="Дата оплаты")
+    created_at = models.DateTimeField(auto_now_add=True, verbose_name="Дата создания")
+    updated_at = models.DateTimeField(auto_now=True, verbose_name="Дата обновления")
+
+    class Meta:
+        verbose_name = "Платёж рассрочки (Building)"
+        verbose_name_plural = "Платежи рассрочки (Building)"
+        ordering = ["order", "due_date", "created_at"]
+        indexes = [
+            models.Index(fields=["treaty", "order"]),
+            models.Index(fields=["treaty", "due_date"]),
+            models.Index(fields=["status", "due_date"]),
+        ]
+
+    def __str__(self):
+        return f"{self.treaty_id}: {self.due_date} / {self.amount}"
 
 
 class BuildingTreatyFile(models.Model):
@@ -843,3 +998,460 @@ class BuildingWorkEntryPhoto(models.Model):
 
     def __str__(self):
         return self.caption or str(getattr(self.image, "name", "")) or str(self.id)
+
+
+class BuildingTask(models.Model):
+    """
+    Напоминание/задача внутри компании (Building).
+
+    Задача видна:
+    - автору
+    - отмеченным сотрудникам (assignees)
+    - owner/admin/superuser (в пределах компании)
+    """
+
+    class Status(models.TextChoices):
+        OPEN = "open", "Открыта"
+        DONE = "done", "Выполнена"
+        CANCELLED = "cancelled", "Отменена"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False, verbose_name="ID")
+
+    company = models.ForeignKey(
+        Company,
+        on_delete=models.CASCADE,
+        related_name="building_tasks",
+        verbose_name="Компания",
+    )
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="building_tasks_created",
+        verbose_name="Кто создал",
+    )
+
+    residential_complex = models.ForeignKey(
+        ResidentialComplex,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="tasks",
+        verbose_name="Жилой комплекс",
+    )
+    client = models.ForeignKey(
+        BuildingClient,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="tasks",
+        verbose_name="Клиент",
+    )
+    treaty = models.ForeignKey(
+        BuildingTreaty,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="tasks",
+        verbose_name="Договор",
+    )
+
+    title = models.CharField(max_length=255, verbose_name="Задача")
+    description = models.TextField(blank=True, verbose_name="Описание")
+    status = models.CharField(max_length=16, choices=Status.choices, default=Status.OPEN, db_index=True, verbose_name="Статус")
+    due_at = models.DateTimeField(null=True, blank=True, db_index=True, verbose_name="Срок")
+    completed_at = models.DateTimeField(null=True, blank=True, verbose_name="Выполнено")
+
+    created_at = models.DateTimeField(auto_now_add=True, verbose_name="Дата создания")
+    updated_at = models.DateTimeField(auto_now=True, verbose_name="Дата обновления")
+
+    class Meta:
+        verbose_name = "Задача/напоминание (Building)"
+        verbose_name_plural = "Задачи/напоминания (Building)"
+        ordering = ["status", "due_at", "-created_at"]
+        indexes = [
+            models.Index(fields=["company", "status"]),
+            models.Index(fields=["company", "due_at"]),
+            models.Index(fields=["company", "created_at"]),
+        ]
+
+    def __str__(self):
+        return self.title
+
+
+class BuildingTaskAssignee(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False, verbose_name="ID")
+    task = models.ForeignKey(
+        BuildingTask,
+        on_delete=models.CASCADE,
+        related_name="assignees",
+        verbose_name="Задача",
+    )
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="building_tasks_assigned",
+        verbose_name="Сотрудник",
+    )
+    added_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="building_task_assignees_added",
+        verbose_name="Кто отметил",
+    )
+    created_at = models.DateTimeField(auto_now_add=True, verbose_name="Дата добавления")
+
+    class Meta:
+        verbose_name = "Исполнитель задачи (Building)"
+        verbose_name_plural = "Исполнители задач (Building)"
+        constraints = [
+            models.UniqueConstraint(fields=["task", "user"], name="uq_building_task_assignee_task_user"),
+        ]
+        indexes = [
+            models.Index(fields=["user", "created_at"]),
+            models.Index(fields=["task", "created_at"]),
+        ]
+
+    def __str__(self):
+        return f"{self.task_id} -> {self.user_id}"
+
+
+class BuildingTaskChecklistItem(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False, verbose_name="ID")
+    task = models.ForeignKey(
+        BuildingTask,
+        on_delete=models.CASCADE,
+        related_name="checklist_items",
+        verbose_name="Задача",
+    )
+    text = models.CharField(max_length=255, verbose_name="Пункт")
+    is_done = models.BooleanField(default=False, db_index=True, verbose_name="Выполнено")
+    order = models.PositiveIntegerField(default=0, verbose_name="Порядок")
+    done_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="building_task_checklist_done",
+        verbose_name="Кто отметил",
+    )
+    done_at = models.DateTimeField(null=True, blank=True, verbose_name="Когда отметил")
+    created_at = models.DateTimeField(auto_now_add=True, verbose_name="Дата создания")
+    updated_at = models.DateTimeField(auto_now=True, verbose_name="Дата обновления")
+
+    class Meta:
+        verbose_name = "Чек-лист задачи (Building)"
+        verbose_name_plural = "Чек-листы задач (Building)"
+        ordering = ["order", "created_at"]
+        indexes = [
+            models.Index(fields=["task", "order"]),
+            models.Index(fields=["task", "is_done"]),
+        ]
+
+    def __str__(self):
+        return self.text
+
+
+class BuildingEmployeeCompensation(models.Model):
+    class SalaryType(models.TextChoices):
+        MONTHLY = "monthly", "Оклад (месяц)"
+        DAILY = "daily", "Ставка (день)"
+        HOURLY = "hourly", "Ставка (час)"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False, verbose_name="ID")
+    company = models.ForeignKey(
+        Company,
+        on_delete=models.CASCADE,
+        related_name="building_employee_compensations",
+        verbose_name="Компания",
+    )
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="building_compensation",
+        verbose_name="Сотрудник",
+    )
+    salary_type = models.CharField(max_length=16, choices=SalaryType.choices, default=SalaryType.MONTHLY, verbose_name="Тип оплаты")
+    base_salary = models.DecimalField(max_digits=16, decimal_places=2, default=Decimal("0.00"), verbose_name="Оклад/ставка")
+    is_active = models.BooleanField(default=True, verbose_name="Активно")
+    notes = models.TextField(blank=True, verbose_name="Заметки")
+    created_at = models.DateTimeField(auto_now_add=True, verbose_name="Дата создания")
+    updated_at = models.DateTimeField(auto_now=True, verbose_name="Дата обновления")
+
+    class Meta:
+        verbose_name = "ЗП: настройки сотрудника (Building)"
+        verbose_name_plural = "ЗП: настройки сотрудников (Building)"
+        ordering = ["-created_at"]
+        constraints = [
+            models.UniqueConstraint(fields=["company", "user"], name="uq_building_compensation_company_user"),
+        ]
+        indexes = [
+            models.Index(fields=["company", "is_active"]),
+            models.Index(fields=["user", "is_active"]),
+        ]
+
+    def __str__(self):
+        return f"{self.user_id} / {self.company_id}"
+
+
+class BuildingPayrollPeriod(models.Model):
+    class Status(models.TextChoices):
+        DRAFT = "draft", "Черновик"
+        APPROVED = "approved", "Начислено"
+        PAID = "paid", "Выплачено"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False, verbose_name="ID")
+    company = models.ForeignKey(
+        Company,
+        on_delete=models.CASCADE,
+        related_name="building_payroll_periods",
+        verbose_name="Компания",
+    )
+    title = models.CharField(max_length=255, blank=True, verbose_name="Название")
+    period_start = models.DateField(verbose_name="Период с")
+    period_end = models.DateField(verbose_name="Период по")
+    status = models.CharField(max_length=16, choices=Status.choices, default=Status.DRAFT, db_index=True, verbose_name="Статус")
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="building_payrolls_created",
+        verbose_name="Кто создал",
+    )
+    approved_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="building_payrolls_approved",
+        verbose_name="Кто начислил",
+    )
+    approved_at = models.DateTimeField(null=True, blank=True, verbose_name="Дата начисления")
+    created_at = models.DateTimeField(auto_now_add=True, verbose_name="Дата создания")
+    updated_at = models.DateTimeField(auto_now=True, verbose_name="Дата обновления")
+
+    class Meta:
+        verbose_name = "ЗП: период начисления (Building)"
+        verbose_name_plural = "ЗП: периоды начислений (Building)"
+        ordering = ["-period_end", "-created_at"]
+        indexes = [
+            models.Index(fields=["company", "status", "period_end"]),
+            models.Index(fields=["company", "period_start", "period_end"]),
+        ]
+
+    def __str__(self):
+        return self.title or f"{self.period_start} - {self.period_end}"
+
+    def try_mark_paid(self):
+        """
+        Помечаем период как paid, если по всем строкам выплачено полностью.
+        """
+        if self.status == self.Status.PAID:
+            return
+        has_open = self.lines.filter(net_to_pay__gt=models.F("paid_total")).exists()
+        if not has_open and self.lines.exists():
+            type(self).objects.filter(pk=self.pk).update(status=self.Status.PAID, updated_at=timezone.now())
+            self.status = self.Status.PAID
+
+
+class BuildingPayrollLine(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False, verbose_name="ID")
+    payroll = models.ForeignKey(
+        BuildingPayrollPeriod,
+        on_delete=models.CASCADE,
+        related_name="lines",
+        verbose_name="Период",
+    )
+    employee = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="building_payroll_lines",
+        verbose_name="Сотрудник",
+    )
+    base_amount = models.DecimalField(max_digits=16, decimal_places=2, default=Decimal("0.00"), verbose_name="Оклад/база")
+    bonus_total = models.DecimalField(max_digits=16, decimal_places=2, default=Decimal("0.00"), verbose_name="Бонусы")
+    deduction_total = models.DecimalField(max_digits=16, decimal_places=2, default=Decimal("0.00"), verbose_name="Удержания")
+    advance_total = models.DecimalField(max_digits=16, decimal_places=2, default=Decimal("0.00"), verbose_name="Авансы")
+    net_to_pay = models.DecimalField(max_digits=16, decimal_places=2, default=Decimal("0.00"), verbose_name="К выплате")
+    paid_total = models.DecimalField(max_digits=16, decimal_places=2, default=Decimal("0.00"), verbose_name="Выплачено")
+    comment = models.TextField(blank=True, verbose_name="Комментарий")
+    created_at = models.DateTimeField(auto_now_add=True, verbose_name="Дата создания")
+    updated_at = models.DateTimeField(auto_now=True, verbose_name="Дата обновления")
+
+    class Meta:
+        verbose_name = "ЗП: строка начисления (Building)"
+        verbose_name_plural = "ЗП: строки начислений (Building)"
+        ordering = ["employee_id", "created_at"]
+        constraints = [
+            models.UniqueConstraint(fields=["payroll", "employee"], name="uq_building_payroll_line_payroll_employee"),
+        ]
+        indexes = [
+            models.Index(fields=["payroll", "employee"]),
+            models.Index(fields=["employee", "created_at"]),
+        ]
+
+    def __str__(self):
+        return f"{self.payroll_id} / {self.employee_id}"
+
+    def recalculate_totals(self):
+        a = self.adjustments.aggregate(
+            bonus=Coalesce(Sum("amount", filter=models.Q(type=BuildingPayrollAdjustment.Type.BONUS)), Decimal("0.00")),
+            deduction=Coalesce(Sum("amount", filter=models.Q(type=BuildingPayrollAdjustment.Type.DEDUCTION)), Decimal("0.00")),
+            advance=Coalesce(Sum("amount", filter=models.Q(type=BuildingPayrollAdjustment.Type.ADVANCE)), Decimal("0.00")),
+        )
+        bonus = a.get("bonus") or Decimal("0.00")
+        deduction = a.get("deduction") or Decimal("0.00")
+        advance = a.get("advance") or Decimal("0.00")
+        net = (Decimal(self.base_amount or 0) + Decimal(bonus or 0) - Decimal(deduction or 0) - Decimal(advance or 0)).quantize(Decimal("0.01"))
+        type(self).objects.filter(pk=self.pk).update(
+            bonus_total=bonus,
+            deduction_total=deduction,
+            advance_total=advance,
+            net_to_pay=net,
+            updated_at=timezone.now(),
+        )
+        self.bonus_total = bonus
+        self.deduction_total = deduction
+        self.advance_total = advance
+        self.net_to_pay = net
+        return net
+
+    def recalculate_paid_total(self):
+        paid = self.payments.filter(status=BuildingPayrollPayment.Status.POSTED).aggregate(
+            s=Coalesce(Sum("amount"), Decimal("0.00"))
+        ).get("s") or Decimal("0.00")
+        paid = Decimal(paid or 0).quantize(Decimal("0.01"))
+        type(self).objects.filter(pk=self.pk).update(paid_total=paid, updated_at=timezone.now())
+        self.paid_total = paid
+        return paid
+
+
+class BuildingPayrollAdjustment(models.Model):
+    class Type(models.TextChoices):
+        BONUS = "bonus", "Бонус"
+        DEDUCTION = "deduction", "Удержание"
+        ADVANCE = "advance", "Аванс"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False, verbose_name="ID")
+    line = models.ForeignKey(
+        BuildingPayrollLine,
+        on_delete=models.CASCADE,
+        related_name="adjustments",
+        verbose_name="Строка начисления",
+    )
+    type = models.CharField(max_length=16, choices=Type.choices, db_index=True, verbose_name="Тип")
+    title = models.CharField(max_length=255, blank=True, verbose_name="Название")
+    amount = models.DecimalField(max_digits=16, decimal_places=2, verbose_name="Сумма")
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="building_payroll_adjustments_created",
+        verbose_name="Кто добавил",
+    )
+    created_at = models.DateTimeField(auto_now_add=True, verbose_name="Дата создания")
+
+    class Meta:
+        verbose_name = "ЗП: корректировка (Building)"
+        verbose_name_plural = "ЗП: корректировки (Building)"
+        ordering = ["-created_at"]
+        indexes = [
+            models.Index(fields=["line", "type"]),
+            models.Index(fields=["type", "created_at"]),
+        ]
+        constraints = [
+            models.CheckConstraint(check=models.Q(amount__gt=0), name="ck_building_payroll_adjustment_amount_positive"),
+        ]
+
+    def __str__(self):
+        return self.title or f"{self.get_type_display()} {self.amount}"
+
+    def save(self, *args, **kwargs):
+        super().save(*args, **kwargs)
+        if self.line_id:
+            self.line.recalculate_totals()
+
+    def delete(self, *args, **kwargs):
+        line = self.line
+        super().delete(*args, **kwargs)
+        if line:
+            line.recalculate_totals()
+
+
+class BuildingPayrollPayment(models.Model):
+    class Status(models.TextChoices):
+        POSTED = "posted", "Проведено"
+        VOID = "void", "Отменено"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False, verbose_name="ID")
+    line = models.ForeignKey(
+        BuildingPayrollLine,
+        on_delete=models.CASCADE,
+        related_name="payments",
+        verbose_name="Строка начисления",
+    )
+    amount = models.DecimalField(max_digits=16, decimal_places=2, verbose_name="Сумма")
+    paid_at = models.DateTimeField(default=timezone.now, verbose_name="Дата выплаты")
+    paid_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="building_payroll_payments_made",
+        verbose_name="Кто выплатил",
+    )
+    cashbox = models.ForeignKey(
+        "construction.Cashbox",
+        on_delete=models.PROTECT,
+        related_name="building_salary_payments",
+        verbose_name="Касса",
+    )
+    shift = models.ForeignKey(
+        "construction.CashShift",
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name="building_salary_payments",
+        verbose_name="Смена",
+    )
+    cashflow = models.ForeignKey(
+        "construction.CashFlow",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="building_salary_payments",
+        verbose_name="Движение кассы",
+    )
+    status = models.CharField(max_length=16, choices=Status.choices, default=Status.POSTED, db_index=True, verbose_name="Статус")
+    void_reason = models.TextField(blank=True, verbose_name="Причина отмены")
+    voided_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="building_payroll_payments_voided",
+        verbose_name="Кто отменил",
+    )
+    voided_at = models.DateTimeField(null=True, blank=True, verbose_name="Когда отменил")
+    created_at = models.DateTimeField(auto_now_add=True, verbose_name="Дата создания")
+
+    class Meta:
+        verbose_name = "ЗП: выплата (Building)"
+        verbose_name_plural = "ЗП: выплаты (Building)"
+        ordering = ["-paid_at", "-created_at"]
+        indexes = [
+            models.Index(fields=["line", "paid_at"]),
+            models.Index(fields=["status", "paid_at"]),
+            models.Index(fields=["cashbox", "paid_at"]),
+        ]
+        constraints = [
+            models.CheckConstraint(check=models.Q(amount__gt=0), name="ck_building_payroll_payment_amount_positive"),
+        ]
+
+    def __str__(self):
+        return f"{self.line_id}: {self.amount} ({self.get_status_display()})"
