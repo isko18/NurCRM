@@ -654,6 +654,9 @@ class ProductPackageDetailView(CompanyBranchRestrictedMixin, generics.RetrieveUp
 
 class AgentRequestCartListCreateAPIView(CompanyBranchRestrictedMixin, generics.ListCreateAPIView):
     serializer_class = AgentRequestCartSerializer
+    filter_backends = [DjangoFilterBackend]
+    # Фильтры для фронта: ?status=approved, ?warehouse=<uuid> и т.д.
+    filterset_fields = ["status", "warehouse", "agent", "sale_document", "submitted_at", "approved_at"]
 
     def get_queryset(self):
         qs = m.AgentRequestCart.objects.select_related("agent", "warehouse", "approved_by")
