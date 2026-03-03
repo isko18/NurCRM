@@ -802,6 +802,14 @@ Read-only поля:
 - `POST /api/warehouse/agent-carts/{id}/reject/` — отклонить (только владелец/админ)
 - `POST /api/warehouse/agent-carts/{id}/create-sale/` — создать документ `SALE` по позициям заявки (только владелец/админ)
 
+Фильтры (GET /api/warehouse/agent-carts/):
+- `status` — `draft|submitted|approved|rejected`
+- `warehouse` — UUID склада
+- `agent` — UUID агента (для owner/admin; у агента автоматически ограничено собой)
+- `sale_document` — UUID документа продажи (если привязан)
+- `submitted_at` — datetime ISO (фильтр по точному значению)
+- `approved_at` — datetime ISO (фильтр по точному значению)
+
 `create-sale` body:
 ```json
 {
