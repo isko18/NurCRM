@@ -8,7 +8,7 @@ from django.core.exceptions import ValidationError as DjangoValidationError
 from django_filters.rest_framework import DjangoFilterBackend
 from django.shortcuts import get_object_or_404
 from decimal import Decimal
-from django.db import IntegrityError
+from django.db import IntegrityError, transaction
 from django.db.models import Count, Sum, DecimalField, Value as V
 from django.db.models.functions import Coalesce
 from django.utils import timezone
@@ -26,11 +26,13 @@ from .serializers import (
     AgentRequestCartSerializer,
     AgentRequestItemSerializer,
     AgentRequestCartActionSerializer,
+    AgentRequestCartCreateSaleSerializer,
     AgentStockBalanceSerializer,
     CompanyWarehouseAgentSerializer,
 )
 
 from apps.warehouse import models as m
+from apps.warehouse import services, serializers_documents
 from apps.warehouse.filters import (
     WarehouseFilter,
     BrandFilter,
@@ -770,6 +772,85 @@ class AgentRequestCartRejectAPIView(CompanyBranchRestrictedMixin, APIView):
             raise ValidationError(getattr(exc, "message_dict", {"detail": str(exc)}))
         out = AgentRequestCartSerializer(cart, context={"request": request}).data
         return Response(out)
+
+
+class AgentRequestCartCreateSaleAPIView(CompanyBranchRestrictedMixin, APIView):
+    """
+    Создать документ SALE по позициям заявки агента и привязать продажу к агенту.
+
+    POST /api/warehouse/agent-carts/<id>/create-sale/
+    body: { counterparty, post?, payment_kind?, prepayment_amount?, discount_percent?, discount_amount?, comment? }
+    """
+
+    def post(self, request, pk=None, *args, **kwargs):
+        user = request.user
+        if not _is_owner_like(user):
+            return Response({"detail": "Только владелец/админ."}, status=status.HTTP_403_FORBIDDEN)
+
+        qs = self._filter_qs_company_branch_relaxed(
+            m.AgentRequestCart.objects.select_related("agent", "warehouse").prefetch_related("items__product")
+        )
+        cart = get_object_or_404(qs, pk=pk)
+
+        if cart.status != m.AgentRequestCart.Status.APPROVED:
+            raise ValidationError({"status": "Создать продажу можно только по одобренной заявке (approved)."})
+        if cart.sale_document_id:
+            raise ValidationError({"sale_document": "По этой заявке уже создан документ продажи."})
+
+        ser = AgentRequestCartCreateSaleSerializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+        counterparty = ser.validated_data["counterparty"]
+
+        if counterparty.agent_id != cart.agent_id:
+            raise ValidationError({"counterparty": "Контрагент не принадлежит этому агенту."})
+
+        if not cart.items.exists():
+            raise ValidationError({"items": "Нельзя создать продажу по пустой заявке."})
+
+        should_post = bool(ser.validated_data.get("post") or False)
+
+        with transaction.atomic():
+            doc = m.Document.objects.create(
+                doc_type=m.Document.DocType.SALE,
+                status=m.Document.Status.DRAFT,
+                warehouse_from=cart.warehouse,
+                counterparty=counterparty,
+                agent=cart.agent,
+                payment_kind=ser.validated_data.get("payment_kind") or m.Document.PaymentKind.CASH,
+                prepayment_amount=ser.validated_data.get("prepayment_amount") or Decimal("0.00"),
+                discount_percent=ser.validated_data.get("discount_percent") or Decimal("0.00"),
+                discount_amount=ser.validated_data.get("discount_amount") or Decimal("0.00"),
+                comment=(ser.validated_data.get("comment") or "").strip(),
+            )
+
+            for it in cart.items.select_related("product").all():
+                product = it.product
+                price = Decimal(getattr(product, "price", None) or 0).quantize(Decimal("0.01"))
+                item = m.DocumentItem(
+                    document=doc,
+                    product=product,
+                    qty=it.quantity_requested,
+                    price=price,
+                    discount_percent=Decimal("0.00"),
+                    discount_amount=Decimal("0.00"),
+                )
+                try:
+                    item.clean()
+                except DjangoValidationError as exc:
+                    raise ValidationError(getattr(exc, "message_dict", {"detail": str(exc)}))
+                item.save()
+
+            services.recalc_document_totals(doc)
+
+            cart.sale_document = doc
+            cart.save(update_fields=["sale_document"])
+
+            if should_post:
+                services.post_document(doc)
+                doc.refresh_from_db()
+
+        out = serializers_documents.DocumentSerializer(doc, context={"request": request}).data
+        return Response(out, status=status.HTTP_201_CREATED)
 
 
 class AgentRequestItemListCreateAPIView(CompanyBranchRestrictedMixin, generics.ListCreateAPIView):

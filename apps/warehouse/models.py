@@ -1235,6 +1235,16 @@ class AgentRequestCart(BaseModelId, BaseModelDate, BaseModelCompanyBranch):
         verbose_name="Кем одобрено",
     )
 
+    sale_document = models.OneToOneField(
+        "warehouse.Document",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="source_agent_cart",
+        verbose_name="Документ продажи",
+        help_text="Если по заявке оформлена продажа — ссылка на документ SALE, привязанный к агенту.",
+    )
+
     class Meta:
         verbose_name = "Заявка агента (склад)"
         verbose_name_plural = "Заявки агентов (склад)"

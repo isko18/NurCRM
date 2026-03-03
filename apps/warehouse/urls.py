@@ -14,6 +14,7 @@ from .views import (
     AgentRequestCartSubmitAPIView,
     AgentRequestCartApproveAPIView,
     AgentRequestCartRejectAPIView,
+    AgentRequestCartCreateSaleAPIView,
     AgentRequestItemListCreateAPIView,
     AgentRequestItemDetailAPIView,
     AgentMyProductsListAPIView,
@@ -57,6 +58,7 @@ from .views_reconciliation import (
 from .views_analytics import (
     WarehouseAgentMyAnalyticsAPIView,
     WarehouseOwnerAgentAnalyticsAPIView,
+    WarehouseOwnerAgentsSalesAnalyticsAPIView,
     WarehouseOwnerOverallAnalyticsAPIView,
 )
 
@@ -109,6 +111,7 @@ urlpatterns += [
     path("agent-carts/<uuid:pk>/submit/", AgentRequestCartSubmitAPIView.as_view(), name="warehouse-agent-cart-submit"),
     path("agent-carts/<uuid:pk>/approve/", AgentRequestCartApproveAPIView.as_view(), name="warehouse-agent-cart-approve"),
     path("agent-carts/<uuid:pk>/reject/", AgentRequestCartRejectAPIView.as_view(), name="warehouse-agent-cart-reject"),
+    path("agent-carts/<uuid:pk>/create-sale/", AgentRequestCartCreateSaleAPIView.as_view(), name="warehouse-agent-cart-create-sale"),
 
     # agent cart items
     path("agent-cart-items/", AgentRequestItemListCreateAPIView.as_view(), name="warehouse-agent-cart-items"),
@@ -136,6 +139,7 @@ urlpatterns += [
     # analytics
     path("agents/me/analytics/", WarehouseAgentMyAnalyticsAPIView.as_view(), name="warehouse-agent-my-analytics"),
     path("owner/agents/<uuid:agent_id>/analytics/", WarehouseOwnerAgentAnalyticsAPIView.as_view(), name="warehouse-owner-agent-analytics"),
+    path("owner/agents/analytics/", WarehouseOwnerAgentsSalesAnalyticsAPIView.as_view(), name="warehouse-owner-agents-sales-analytics"),
     path("owner/analytics/", WarehouseOwnerOverallAnalyticsAPIView.as_view(), name="warehouse-owner-analytics"),
 ]
 

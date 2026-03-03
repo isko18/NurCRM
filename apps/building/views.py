@@ -14,6 +14,7 @@ from apps.construction.models import Cashbox, CashShift, CashFlow
 
 from .models import (
     ResidentialComplex,
+    ResidentialComplexMember,
     ResidentialComplexDrawing,
     ResidentialComplexWarehouse,
     ResidentialComplexApartment,
@@ -40,6 +41,8 @@ from .models import (
 from .serializers import (
     ResidentialComplexSerializer,
     ResidentialComplexCreateSerializer,
+    ResidentialComplexMemberSerializer,
+    ResidentialComplexMemberCreateSerializer,
     ResidentialComplexDrawingSerializer,
     ResidentialComplexWarehouseSerializer,
     ResidentialComplexApartmentSerializer,
@@ -131,6 +134,36 @@ def _require_cash_register_perm(user):
     if not getattr(user, "can_view_building_cash_register", False):
         raise PermissionDenied("Нет прав кассы (Building).")
 
+
+def _require_building_employees_perm(user):
+    if _is_owner_like(user) or getattr(user, "is_superuser", False):
+        return
+    if not getattr(user, "can_view_building_employess", False) and not getattr(user, "can_view_employees", False):
+        raise PermissionDenied("Нет прав на сотрудников (Building).")
+
+
+def _allowed_residential_complex_ids(user):
+    """
+    Если у пользователя есть активные назначения на ЖК, то возвращаем список этих ЖК.
+    Если назначений нет — возвращаем None (ограничение не применяется).
+    owner/admin/superuser — None.
+    """
+    if not user or not getattr(user, "is_authenticated", False):
+        return None
+    if _is_owner_like(user) or getattr(user, "is_superuser", False):
+        return None
+    company_id = getattr(user, "company_id", None)
+    if not company_id:
+        return None
+    ids = list(
+        ResidentialComplexMember.objects.filter(
+            user_id=getattr(user, "id", None),
+            is_active=True,
+            residential_complex__company_id=company_id,
+        ).values_list("residential_complex_id", flat=True)
+    )
+    return ids or None
+
 class ResidentialComplexListCreateView(CompanyQuerysetMixin, generics.ListCreateAPIView):
     """
     GET  /api/building/objects/  — список ЖК компании.
@@ -144,6 +177,14 @@ class ResidentialComplexListCreateView(CompanyQuerysetMixin, generics.ListCreate
             return ResidentialComplexCreateSerializer
         return ResidentialComplexSerializer
 
+    def get_queryset(self):
+        qs = super().get_queryset()
+        user = self.request.user
+        allowed_ids = _allowed_residential_complex_ids(user)
+        if allowed_ids:
+            qs = qs.filter(id__in=allowed_ids)
+        return qs
+
 
 class ResidentialComplexDetailView(CompanyQuerysetMixin, generics.RetrieveUpdateDestroyAPIView):
     """
@@ -155,6 +196,77 @@ class ResidentialComplexDetailView(CompanyQuerysetMixin, generics.RetrieveUpdate
     permission_classes = [permissions.IsAuthenticated]
     queryset = ResidentialComplex.objects.all()
     serializer_class = ResidentialComplexSerializer
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        user = self.request.user
+        allowed_ids = _allowed_residential_complex_ids(user)
+        if allowed_ids:
+            qs = qs.filter(id__in=allowed_ids)
+        return qs
+
+
+class ResidentialComplexMembersView(CompanyQuerysetMixin, generics.GenericAPIView):
+    """
+    Назначения сотрудников на ЖК:
+    - GET  /api/building/objects/<uuid:pk>/members/
+    - POST /api/building/objects/<uuid:pk>/members/  {user, is_active?}
+    - DELETE /api/building/objects/<uuid:pk>/members/<uuid:user_id>/
+    """
+
+    permission_classes = [permissions.IsAuthenticated]
+    queryset = ResidentialComplex.objects.all()
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        user = self.request.user
+        # назначениями управляют owner/admin/superuser или с правом employees
+        if self.request.method in ("POST", "DELETE"):
+            _require_building_employees_perm(user)
+        allowed_ids = _allowed_residential_complex_ids(user)
+        if allowed_ids:
+            qs = qs.filter(id__in=allowed_ids)
+        return qs
+
+    def get(self, request, pk=None):
+        rc = self.get_object()
+        _require_building_employees_perm(request.user)
+        memberships = (
+            ResidentialComplexMember.objects
+            .select_related("user", "added_by", "residential_complex")
+            .filter(residential_complex=rc)
+            .order_by("-created_at")
+        )
+        return Response(ResidentialComplexMemberSerializer(memberships, many=True, context={"request": request}).data, status=status.HTTP_200_OK)
+
+    @transaction.atomic
+    def post(self, request, pk=None):
+        rc = self.get_object()
+        _require_building_employees_perm(request.user)
+        ser = ResidentialComplexMemberCreateSerializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+
+        company_id = getattr(request.user, "company_id", None)
+        user_obj = User.objects.filter(id=ser.validated_data["user"], company_id=company_id).first()
+        if not user_obj:
+            raise ValidationError({"user": "Сотрудник не найден (или другой компании)."})
+
+        obj, _ = ResidentialComplexMember.objects.update_or_create(
+            residential_complex=rc,
+            user=user_obj,
+            defaults={
+                "is_active": bool(ser.validated_data.get("is_active", True)),
+                "added_by": request.user,
+            },
+        )
+        return Response(ResidentialComplexMemberSerializer(obj, context={"request": request}).data, status=status.HTTP_201_CREATED)
+
+    @transaction.atomic
+    def delete(self, request, pk=None, user_id=None):
+        rc = self.get_object()
+        _require_building_employees_perm(request.user)
+        ResidentialComplexMember.objects.filter(residential_complex=rc, user_id=user_id).delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)
 
 
 class ResidentialComplexDrawingListCreateView(CompanyQuerysetMixin, generics.ListCreateAPIView):
@@ -174,10 +286,24 @@ class ResidentialComplexDrawingListCreateView(CompanyQuerysetMixin, generics.Lis
         qs = super().get_queryset()
         user = self.request.user
         if user.is_authenticated and getattr(user, "company_id", None):
-            return qs.filter(residential_complex__company_id=user.company_id)
+            qs = qs.filter(residential_complex__company_id=user.company_id)
+            allowed_ids = _allowed_residential_complex_ids(user)
+            if allowed_ids:
+                qs = qs.filter(residential_complex_id__in=allowed_ids)
+            return qs
         if not getattr(user, "is_staff", False) and not getattr(user, "is_superuser", False):
             return qs.none()
         return qs
+
+    def perform_create(self, serializer):
+        user = self.request.user
+        rc = serializer.validated_data["residential_complex"]
+        if not getattr(user, "is_superuser", False) and rc.company_id != getattr(user, "company_id", None):
+            raise PermissionDenied("ЖК принадлежит другой компании.")
+        allowed_ids = _allowed_residential_complex_ids(user)
+        if allowed_ids and rc.id not in set(allowed_ids):
+            raise PermissionDenied("Нет доступа к этому ЖК.")
+        serializer.save()
 
 
 class ResidentialComplexDrawingDetailView(CompanyQuerysetMixin, generics.RetrieveUpdateDestroyAPIView):
@@ -196,7 +322,11 @@ class ResidentialComplexDrawingDetailView(CompanyQuerysetMixin, generics.Retriev
         qs = super().get_queryset()
         user = self.request.user
         if user.is_authenticated and getattr(user, "company_id", None):
-            return qs.filter(residential_complex__company_id=user.company_id)
+            qs = qs.filter(residential_complex__company_id=user.company_id)
+            allowed_ids = _allowed_residential_complex_ids(user)
+            if allowed_ids:
+                qs = qs.filter(residential_complex_id__in=allowed_ids)
+            return qs
         if not getattr(user, "is_staff", False) and not getattr(user, "is_superuser", False):
             return qs.none()
         return qs
@@ -214,7 +344,11 @@ class ResidentialComplexWarehouseListCreateView(CompanyQuerysetMixin, generics.L
         qs = super().get_queryset()
         user = self.request.user
         if user.is_authenticated and getattr(user, "company_id", None):
-            return qs.filter(residential_complex__company_id=user.company_id)
+            qs = qs.filter(residential_complex__company_id=user.company_id)
+            allowed_ids = _allowed_residential_complex_ids(user)
+            if allowed_ids:
+                qs = qs.filter(residential_complex_id__in=allowed_ids)
+            return qs
         if not getattr(user, "is_staff", False) and not getattr(user, "is_superuser", False):
             return qs.none()
         return qs
@@ -224,6 +358,9 @@ class ResidentialComplexWarehouseListCreateView(CompanyQuerysetMixin, generics.L
         user = self.request.user
         if not getattr(user, "is_superuser", False) and residential_complex.company_id != getattr(user, "company_id", None):
             raise PermissionDenied("ЖК принадлежит другой компании.")
+        allowed_ids = _allowed_residential_complex_ids(user)
+        if allowed_ids and residential_complex.id not in set(allowed_ids):
+            raise PermissionDenied("Нет доступа к этому ЖК.")
         serializer.save()
 
 
@@ -236,7 +373,11 @@ class ResidentialComplexWarehouseDetailView(CompanyQuerysetMixin, generics.Retri
         qs = super().get_queryset()
         user = self.request.user
         if user.is_authenticated and getattr(user, "company_id", None):
-            return qs.filter(residential_complex__company_id=user.company_id)
+            qs = qs.filter(residential_complex__company_id=user.company_id)
+            allowed_ids = _allowed_residential_complex_ids(user)
+            if allowed_ids:
+                qs = qs.filter(residential_complex_id__in=allowed_ids)
+            return qs
         if not getattr(user, "is_staff", False) and not getattr(user, "is_superuser", False):
             return qs.none()
         return qs
@@ -262,7 +403,11 @@ class ResidentialComplexApartmentListCreateView(CompanyQuerysetMixin, generics.L
             raise PermissionDenied("Нет прав на продажи/договора (Building).")
         qs = super().get_queryset()
         if user.is_authenticated and getattr(user, "company_id", None):
-            return qs.filter(residential_complex__company_id=user.company_id)
+            qs = qs.filter(residential_complex__company_id=user.company_id)
+            allowed_ids = _allowed_residential_complex_ids(user)
+            if allowed_ids:
+                qs = qs.filter(residential_complex_id__in=allowed_ids)
+            return qs
         if not getattr(user, "is_staff", False) and not getattr(user, "is_superuser", False):
             return qs.none()
         return qs
@@ -274,6 +419,9 @@ class ResidentialComplexApartmentListCreateView(CompanyQuerysetMixin, generics.L
         rc = serializer.validated_data["residential_complex"]
         if not getattr(user, "is_superuser", False) and rc.company_id != getattr(user, "company_id", None):
             raise PermissionDenied("ЖК принадлежит другой компании.")
+        allowed_ids = _allowed_residential_complex_ids(user)
+        if allowed_ids and rc.id not in set(allowed_ids):
+            raise PermissionDenied("Нет доступа к этому ЖК.")
         serializer.save()
 
 
@@ -292,7 +440,11 @@ class ResidentialComplexApartmentDetailView(CompanyQuerysetMixin, generics.Retri
             raise PermissionDenied("Нет прав на продажи/договора (Building).")
         qs = super().get_queryset()
         if user.is_authenticated and getattr(user, "company_id", None):
-            return qs.filter(residential_complex__company_id=user.company_id)
+            qs = qs.filter(residential_complex__company_id=user.company_id)
+            allowed_ids = _allowed_residential_complex_ids(user)
+            if allowed_ids:
+                qs = qs.filter(residential_complex_id__in=allowed_ids)
+            return qs
         if not getattr(user, "is_staff", False) and not getattr(user, "is_superuser", False):
             return qs.none()
         return qs
@@ -311,7 +463,11 @@ class ResidentialComplexFloorsView(CompanyQuerysetMixin, generics.GenericAPIView
         qs = super().get_queryset()
         user = self.request.user
         if user.is_authenticated and getattr(user, "company_id", None):
-            return qs.filter(company_id=user.company_id)
+            qs = qs.filter(company_id=user.company_id)
+            allowed_ids = _allowed_residential_complex_ids(user)
+            if allowed_ids:
+                qs = qs.filter(id__in=allowed_ids)
+            return qs
         if not getattr(user, "is_staff", False) and not getattr(user, "is_superuser", False):
             return qs.none()
         return qs
@@ -387,7 +543,11 @@ class BuildingProcurementListCreateView(CompanyQuerysetMixin, generics.ListCreat
         qs = super().get_queryset()
         user = self.request.user
         if user.is_authenticated and getattr(user, "company_id", None):
-            return qs.filter(residential_complex__company_id=user.company_id)
+            qs = qs.filter(residential_complex__company_id=user.company_id)
+            allowed_ids = _allowed_residential_complex_ids(user)
+            if allowed_ids:
+                qs = qs.filter(residential_complex_id__in=allowed_ids)
+            return qs
         if not getattr(user, "is_staff", False) and not getattr(user, "is_superuser", False):
             return qs.none()
         return qs
@@ -397,6 +557,9 @@ class BuildingProcurementListCreateView(CompanyQuerysetMixin, generics.ListCreat
         user = self.request.user
         if not getattr(user, "is_superuser", False) and rc.company_id != getattr(user, "company_id", None):
             raise PermissionDenied("ЖК принадлежит другой компании.")
+        allowed_ids = _allowed_residential_complex_ids(user)
+        if allowed_ids and rc.id not in set(allowed_ids):
+            raise PermissionDenied("Нет доступа к этому ЖК.")
         serializer.save(initiator=user)
         services.log_event(action="procurement_created", actor=user, procurement=serializer.instance)
 
@@ -410,7 +573,11 @@ class BuildingProcurementDetailView(CompanyQuerysetMixin, generics.RetrieveUpdat
         qs = super().get_queryset()
         user = self.request.user
         if user.is_authenticated and getattr(user, "company_id", None):
-            return qs.filter(residential_complex__company_id=user.company_id)
+            qs = qs.filter(residential_complex__company_id=user.company_id)
+            allowed_ids = _allowed_residential_complex_ids(user)
+            if allowed_ids:
+                qs = qs.filter(residential_complex_id__in=allowed_ids)
+            return qs
         if not getattr(user, "is_staff", False) and not getattr(user, "is_superuser", False):
             return qs.none()
         return qs
@@ -428,7 +595,11 @@ class BuildingProcurementItemListCreateView(CompanyQuerysetMixin, generics.ListC
         qs = super().get_queryset()
         user = self.request.user
         if user.is_authenticated and getattr(user, "company_id", None):
-            return qs.filter(procurement__residential_complex__company_id=user.company_id)
+            qs = qs.filter(procurement__residential_complex__company_id=user.company_id)
+            allowed_ids = _allowed_residential_complex_ids(user)
+            if allowed_ids:
+                qs = qs.filter(procurement__residential_complex_id__in=allowed_ids)
+            return qs
         if not getattr(user, "is_staff", False) and not getattr(user, "is_superuser", False):
             return qs.none()
         return qs
@@ -466,7 +637,11 @@ class BuildingProcurementItemDetailView(CompanyQuerysetMixin, generics.RetrieveU
         qs = super().get_queryset()
         user = self.request.user
         if user.is_authenticated and getattr(user, "company_id", None):
-            return qs.filter(procurement__residential_complex__company_id=user.company_id)
+            qs = qs.filter(procurement__residential_complex__company_id=user.company_id)
+            allowed_ids = _allowed_residential_complex_ids(user)
+            if allowed_ids:
+                qs = qs.filter(procurement__residential_complex_id__in=allowed_ids)
+            return qs
         if not getattr(user, "is_staff", False) and not getattr(user, "is_superuser", False):
             return qs.none()
         return qs
@@ -513,7 +688,11 @@ class BuildingProcurementSubmitToCashView(CompanyQuerysetMixin, generics.Generic
         qs = super().get_queryset()
         user = self.request.user
         if user.is_authenticated and getattr(user, "company_id", None):
-            return qs.filter(residential_complex__company_id=user.company_id)
+            qs = qs.filter(residential_complex__company_id=user.company_id)
+            allowed_ids = _allowed_residential_complex_ids(user)
+            if allowed_ids:
+                qs = qs.filter(residential_complex_id__in=allowed_ids)
+            return qs
         if not getattr(user, "is_staff", False) and not getattr(user, "is_superuser", False):
             return qs.none()
         return qs
@@ -534,7 +713,11 @@ class BuildingCashPendingProcurementListView(CompanyQuerysetMixin, generics.List
         qs = super().get_queryset().filter(status=BuildingProcurementRequest.Status.SUBMITTED_TO_CASH)
         user = self.request.user
         if user.is_authenticated and getattr(user, "company_id", None):
-            return qs.filter(residential_complex__company_id=user.company_id)
+            qs = qs.filter(residential_complex__company_id=user.company_id)
+            allowed_ids = _allowed_residential_complex_ids(user)
+            if allowed_ids:
+                qs = qs.filter(residential_complex_id__in=allowed_ids)
+            return qs
         if not getattr(user, "is_staff", False) and not getattr(user, "is_superuser", False):
             return qs.none()
         return qs
@@ -549,7 +732,11 @@ class BuildingCashApproveProcurementView(CompanyQuerysetMixin, generics.GenericA
         qs = super().get_queryset()
         user = self.request.user
         if user.is_authenticated and getattr(user, "company_id", None):
-            return qs.filter(residential_complex__company_id=user.company_id)
+            qs = qs.filter(residential_complex__company_id=user.company_id)
+            allowed_ids = _allowed_residential_complex_ids(user)
+            if allowed_ids:
+                qs = qs.filter(residential_complex_id__in=allowed_ids)
+            return qs
         if not getattr(user, "is_staff", False) and not getattr(user, "is_superuser", False):
             return qs.none()
         return qs
@@ -571,7 +758,11 @@ class BuildingCashRejectProcurementView(CompanyQuerysetMixin, generics.GenericAP
         qs = super().get_queryset()
         user = self.request.user
         if user.is_authenticated and getattr(user, "company_id", None):
-            return qs.filter(residential_complex__company_id=user.company_id)
+            qs = qs.filter(residential_complex__company_id=user.company_id)
+            allowed_ids = _allowed_residential_complex_ids(user)
+            if allowed_ids:
+                qs = qs.filter(residential_complex_id__in=allowed_ids)
+            return qs
         if not getattr(user, "is_staff", False) and not getattr(user, "is_superuser", False):
             return qs.none()
         return qs
@@ -594,7 +785,11 @@ class BuildingTransferCreateView(CompanyQuerysetMixin, generics.GenericAPIView):
         qs = super().get_queryset()
         user = self.request.user
         if user.is_authenticated and getattr(user, "company_id", None):
-            return qs.filter(residential_complex__company_id=user.company_id)
+            qs = qs.filter(residential_complex__company_id=user.company_id)
+            allowed_ids = _allowed_residential_complex_ids(user)
+            if allowed_ids:
+                qs = qs.filter(residential_complex_id__in=allowed_ids)
+            return qs
         if not getattr(user, "is_staff", False) and not getattr(user, "is_superuser", False):
             return qs.none()
         return qs
@@ -626,6 +821,9 @@ class BuildingTransferListView(CompanyQuerysetMixin, generics.ListAPIView):
         user = self.request.user
         if user.is_authenticated and getattr(user, "company_id", None):
             qs = qs.filter(warehouse__residential_complex__company_id=user.company_id)
+            allowed_ids = _allowed_residential_complex_ids(user)
+            if allowed_ids:
+                qs = qs.filter(warehouse__residential_complex_id__in=allowed_ids)
         elif not getattr(user, "is_staff", False) and not getattr(user, "is_superuser", False):
             return qs.none()
         incoming_only = self.request.query_params.get("incoming")
@@ -649,7 +847,11 @@ class BuildingTransferDetailView(CompanyQuerysetMixin, generics.RetrieveAPIView)
         qs = super().get_queryset()
         user = self.request.user
         if user.is_authenticated and getattr(user, "company_id", None):
-            return qs.filter(warehouse__residential_complex__company_id=user.company_id)
+            qs = qs.filter(warehouse__residential_complex__company_id=user.company_id)
+            allowed_ids = _allowed_residential_complex_ids(user)
+            if allowed_ids:
+                qs = qs.filter(warehouse__residential_complex_id__in=allowed_ids)
+            return qs
         if not getattr(user, "is_staff", False) and not getattr(user, "is_superuser", False):
             return qs.none()
         return qs
@@ -664,7 +866,11 @@ class BuildingTransferAcceptView(CompanyQuerysetMixin, generics.GenericAPIView):
         qs = super().get_queryset()
         user = self.request.user
         if user.is_authenticated and getattr(user, "company_id", None):
-            return qs.filter(warehouse__residential_complex__company_id=user.company_id)
+            qs = qs.filter(warehouse__residential_complex__company_id=user.company_id)
+            allowed_ids = _allowed_residential_complex_ids(user)
+            if allowed_ids:
+                qs = qs.filter(warehouse__residential_complex_id__in=allowed_ids)
+            return qs
         if not getattr(user, "is_staff", False) and not getattr(user, "is_superuser", False):
             return qs.none()
         return qs
@@ -687,7 +893,11 @@ class BuildingTransferRejectView(CompanyQuerysetMixin, generics.GenericAPIView):
         qs = super().get_queryset()
         user = self.request.user
         if user.is_authenticated and getattr(user, "company_id", None):
-            return qs.filter(warehouse__residential_complex__company_id=user.company_id)
+            qs = qs.filter(warehouse__residential_complex__company_id=user.company_id)
+            allowed_ids = _allowed_residential_complex_ids(user)
+            if allowed_ids:
+                qs = qs.filter(warehouse__residential_complex_id__in=allowed_ids)
+            return qs
         if not getattr(user, "is_staff", False) and not getattr(user, "is_superuser", False):
             return qs.none()
         return qs
@@ -720,10 +930,17 @@ class BuildingWorkflowEventListView(CompanyQuerysetMixin, generics.ListAPIView):
         qs = super().get_queryset()
         user = self.request.user
         if user.is_authenticated and getattr(user, "company_id", None):
-            return qs.filter(
+            qs = qs.filter(
                 Q(procurement__residential_complex__company_id=user.company_id)
                 | Q(transfer__warehouse__residential_complex__company_id=user.company_id)
             )
+            allowed_ids = _allowed_residential_complex_ids(user)
+            if allowed_ids:
+                qs = qs.filter(
+                    Q(procurement__residential_complex_id__in=allowed_ids)
+                    | Q(transfer__warehouse__residential_complex_id__in=allowed_ids)
+                )
+            return qs
         if not getattr(user, "is_staff", False) and not getattr(user, "is_superuser", False):
             return qs.none()
         return qs
@@ -741,7 +958,11 @@ class BuildingWarehouseStockItemListView(CompanyQuerysetMixin, generics.ListAPIV
         qs = super().get_queryset()
         user = self.request.user
         if user.is_authenticated and getattr(user, "company_id", None):
-            return qs.filter(warehouse__residential_complex__company_id=user.company_id)
+            qs = qs.filter(warehouse__residential_complex__company_id=user.company_id)
+            allowed_ids = _allowed_residential_complex_ids(user)
+            if allowed_ids:
+                qs = qs.filter(warehouse__residential_complex_id__in=allowed_ids)
+            return qs
         if not getattr(user, "is_staff", False) and not getattr(user, "is_superuser", False):
             return qs.none()
         return qs
@@ -764,7 +985,11 @@ class BuildingWarehouseStockMoveListView(CompanyQuerysetMixin, generics.ListAPIV
         qs = super().get_queryset()
         user = self.request.user
         if user.is_authenticated and getattr(user, "company_id", None):
-            return qs.filter(warehouse__residential_complex__company_id=user.company_id)
+            qs = qs.filter(warehouse__residential_complex__company_id=user.company_id)
+            allowed_ids = _allowed_residential_complex_ids(user)
+            if allowed_ids:
+                qs = qs.filter(warehouse__residential_complex_id__in=allowed_ids)
+            return qs
         if not getattr(user, "is_staff", False) and not getattr(user, "is_superuser", False):
             return qs.none()
         return qs
@@ -786,7 +1011,11 @@ class BuildingPurchaseDocumentListCreateView(CompanyQuerysetMixin, generics.List
         qs = super().get_queryset()
         user = self.request.user
         if user.is_authenticated and getattr(user, "company_id", None):
-            return qs.filter(residential_complex__company_id=user.company_id)
+            qs = qs.filter(residential_complex__company_id=user.company_id)
+            allowed_ids = _allowed_residential_complex_ids(user)
+            if allowed_ids:
+                qs = qs.filter(residential_complex_id__in=allowed_ids)
+            return qs
         if not getattr(user, "is_staff", False) and not getattr(user, "is_superuser", False):
             return qs.none()
         return qs
@@ -796,6 +1025,9 @@ class BuildingPurchaseDocumentListCreateView(CompanyQuerysetMixin, generics.List
         user = self.request.user
         if not getattr(user, "is_superuser", False) and rc.company_id != getattr(user, "company_id", None):
             raise PermissionDenied("ЖК принадлежит другой компании.")
+        allowed_ids = _allowed_residential_complex_ids(user)
+        if allowed_ids and rc.id not in set(allowed_ids):
+            raise PermissionDenied("Нет доступа к этому ЖК.")
         doc = serializer.save()
         services.log_event(action="procurement_created", actor=user, procurement=doc)
 
@@ -813,7 +1045,11 @@ class BuildingPurchaseDocumentDetailView(CompanyQuerysetMixin, generics.Retrieve
         qs = super().get_queryset()
         user = self.request.user
         if user.is_authenticated and getattr(user, "company_id", None):
-            return qs.filter(residential_complex__company_id=user.company_id)
+            qs = qs.filter(residential_complex__company_id=user.company_id)
+            allowed_ids = _allowed_residential_complex_ids(user)
+            if allowed_ids:
+                qs = qs.filter(residential_complex_id__in=allowed_ids)
+            return qs
         if not getattr(user, "is_staff", False) and not getattr(user, "is_superuser", False):
             return qs.none()
         return qs
@@ -828,7 +1064,11 @@ class BuildingPurchaseDocumentCashApproveView(CompanyQuerysetMixin, generics.Gen
         qs = super().get_queryset()
         user = self.request.user
         if user.is_authenticated and getattr(user, "company_id", None):
-            return qs.filter(residential_complex__company_id=user.company_id)
+            qs = qs.filter(residential_complex__company_id=user.company_id)
+            allowed_ids = _allowed_residential_complex_ids(user)
+            if allowed_ids:
+                qs = qs.filter(residential_complex_id__in=allowed_ids)
+            return qs
         if not getattr(user, "is_staff", False) and not getattr(user, "is_superuser", False):
             return qs.none()
         return qs
@@ -853,7 +1093,11 @@ class BuildingPurchaseDocumentCashRejectView(CompanyQuerysetMixin, generics.Gene
         qs = super().get_queryset()
         user = self.request.user
         if user.is_authenticated and getattr(user, "company_id", None):
-            return qs.filter(residential_complex__company_id=user.company_id)
+            qs = qs.filter(residential_complex__company_id=user.company_id)
+            allowed_ids = _allowed_residential_complex_ids(user)
+            if allowed_ids:
+                qs = qs.filter(residential_complex_id__in=allowed_ids)
+            return qs
         if not getattr(user, "is_staff", False) and not getattr(user, "is_superuser", False):
             return qs.none()
         return qs
@@ -890,7 +1134,11 @@ class BuildingWorkEntryListCreateView(CompanyQuerysetMixin, generics.ListCreateA
             raise PermissionDenied("Нет прав на процесс работы (Building).")
         qs = super().get_queryset()
         if user.is_authenticated and getattr(user, "company_id", None):
-            return qs.filter(residential_complex__company_id=user.company_id)
+            qs = qs.filter(residential_complex__company_id=user.company_id)
+            allowed_ids = _allowed_residential_complex_ids(user)
+            if allowed_ids:
+                qs = qs.filter(residential_complex_id__in=allowed_ids)
+            return qs
         if not getattr(user, "is_staff", False) and not getattr(user, "is_superuser", False):
             return qs.none()
         return qs
@@ -903,6 +1151,9 @@ class BuildingWorkEntryListCreateView(CompanyQuerysetMixin, generics.ListCreateA
         rc = serializer.validated_data["residential_complex"]
         if not getattr(user, "is_superuser", False) and rc.company_id != getattr(user, "company_id", None):
             raise PermissionDenied("ЖК принадлежит другой компании.")
+        allowed_ids = _allowed_residential_complex_ids(user)
+        if allowed_ids and rc.id not in set(allowed_ids):
+            raise PermissionDenied("Нет доступа к этому ЖК.")
 
         client = serializer.validated_data.get("client")
         if client and client.company_id != rc.company_id:
@@ -931,7 +1182,11 @@ class BuildingWorkEntryDetailView(CompanyQuerysetMixin, generics.RetrieveUpdateD
             raise PermissionDenied("Нет прав на процесс работы (Building).")
         qs = super().get_queryset()
         if user.is_authenticated and getattr(user, "company_id", None):
-            return qs.filter(residential_complex__company_id=user.company_id)
+            qs = qs.filter(residential_complex__company_id=user.company_id)
+            allowed_ids = _allowed_residential_complex_ids(user)
+            if allowed_ids:
+                qs = qs.filter(residential_complex_id__in=allowed_ids)
+            return qs
         if not getattr(user, "is_staff", False) and not getattr(user, "is_superuser", False):
             return qs.none()
         return qs
@@ -973,7 +1228,11 @@ class BuildingWorkEntryPhotoAddView(CompanyQuerysetMixin, generics.GenericAPIVie
         qs = super().get_queryset()
         user = self.request.user
         if user.is_authenticated and getattr(user, "company_id", None):
-            return qs.filter(residential_complex__company_id=user.company_id)
+            qs = qs.filter(residential_complex__company_id=user.company_id)
+            allowed_ids = _allowed_residential_complex_ids(user)
+            if allowed_ids:
+                qs = qs.filter(residential_complex_id__in=allowed_ids)
+            return qs
         if not getattr(user, "is_staff", False) and not getattr(user, "is_superuser", False):
             return qs.none()
         return qs
@@ -1013,7 +1272,11 @@ class BuildingClientListCreateView(CompanyQuerysetMixin, generics.ListCreateAPIV
             raise PermissionDenied("Нет прав на клиентов (Building).")
         qs = super().get_queryset()
         if user.is_authenticated and getattr(user, "company_id", None):
-            return qs.filter(company_id=user.company_id)
+            qs = qs.filter(company_id=user.company_id)
+            allowed_ids = _allowed_residential_complex_ids(user)
+            if allowed_ids:
+                qs = qs.filter(treaties__residential_complex_id__in=allowed_ids).distinct()
+            return qs
         if not getattr(user, "is_staff", False) and not getattr(user, "is_superuser", False):
             return qs.none()
         return qs
@@ -1039,7 +1302,11 @@ class BuildingClientDetailView(CompanyQuerysetMixin, generics.RetrieveUpdateDest
             raise PermissionDenied("Нет прав на клиентов (Building).")
         qs = super().get_queryset()
         if user.is_authenticated and getattr(user, "company_id", None):
-            return qs.filter(company_id=user.company_id)
+            qs = qs.filter(company_id=user.company_id)
+            allowed_ids = _allowed_residential_complex_ids(user)
+            if allowed_ids:
+                qs = qs.filter(treaties__residential_complex_id__in=allowed_ids).distinct()
+            return qs
         if not getattr(user, "is_staff", False) and not getattr(user, "is_superuser", False):
             return qs.none()
         return qs
@@ -1059,7 +1326,11 @@ class BuildingTreatyListCreateView(CompanyQuerysetMixin, generics.ListCreateAPIV
             raise PermissionDenied("Нет прав на договора (Building).")
         qs = super().get_queryset()
         if user.is_authenticated and getattr(user, "company_id", None):
-            return qs.filter(residential_complex__company_id=user.company_id)
+            qs = qs.filter(residential_complex__company_id=user.company_id)
+            allowed_ids = _allowed_residential_complex_ids(user)
+            if allowed_ids:
+                qs = qs.filter(residential_complex_id__in=allowed_ids)
+            return qs
         if not getattr(user, "is_staff", False) and not getattr(user, "is_superuser", False):
             return qs.none()
         return qs
@@ -1072,6 +1343,9 @@ class BuildingTreatyListCreateView(CompanyQuerysetMixin, generics.ListCreateAPIV
         rc = serializer.validated_data["residential_complex"]
         if not getattr(user, "is_superuser", False) and rc.company_id != getattr(user, "company_id", None):
             raise PermissionDenied("ЖК принадлежит другой компании.")
+        allowed_ids = _allowed_residential_complex_ids(user)
+        if allowed_ids and rc.id not in set(allowed_ids):
+            raise PermissionDenied("Нет доступа к этому ЖК.")
 
         client = serializer.validated_data.get("client")
         if client and client.company_id != rc.company_id:
@@ -1115,7 +1389,11 @@ class BuildingTreatyDetailView(CompanyQuerysetMixin, generics.RetrieveUpdateDest
             raise PermissionDenied("Нет прав на договора (Building).")
         qs = super().get_queryset()
         if user.is_authenticated and getattr(user, "company_id", None):
-            return qs.filter(residential_complex__company_id=user.company_id)
+            qs = qs.filter(residential_complex__company_id=user.company_id)
+            allowed_ids = _allowed_residential_complex_ids(user)
+            if allowed_ids:
+                qs = qs.filter(residential_complex_id__in=allowed_ids)
+            return qs
         if not getattr(user, "is_staff", False) and not getattr(user, "is_superuser", False):
             return qs.none()
         return qs
@@ -1198,7 +1476,11 @@ class BuildingTreatyFileAddView(CompanyQuerysetMixin, generics.GenericAPIView):
         qs = super().get_queryset()
         user = self.request.user
         if user.is_authenticated and getattr(user, "company_id", None):
-            return qs.filter(residential_complex__company_id=user.company_id)
+            qs = qs.filter(residential_complex__company_id=user.company_id)
+            allowed_ids = _allowed_residential_complex_ids(user)
+            if allowed_ids:
+                qs = qs.filter(residential_complex_id__in=allowed_ids)
+            return qs
         if not getattr(user, "is_staff", False) and not getattr(user, "is_superuser", False):
             return qs.none()
         return qs
@@ -1234,7 +1516,11 @@ class BuildingTreatyErpCreateView(CompanyQuerysetMixin, generics.GenericAPIView)
         qs = super().get_queryset()
         user = self.request.user
         if user.is_authenticated and getattr(user, "company_id", None):
-            return qs.filter(residential_complex__company_id=user.company_id)
+            qs = qs.filter(residential_complex__company_id=user.company_id)
+            allowed_ids = _allowed_residential_complex_ids(user)
+            if allowed_ids:
+                qs = qs.filter(residential_complex_id__in=allowed_ids)
+            return qs
         if not getattr(user, "is_staff", False) and not getattr(user, "is_superuser", False):
             return qs.none()
         return qs
@@ -1279,6 +1565,13 @@ class BuildingTaskListCreateView(CompanyQuerysetMixin, generics.ListCreateAPIVie
             return qs.none()
 
         qs = qs.filter(company_id=company_id)
+
+        allowed_ids = _allowed_residential_complex_ids(user)
+        if allowed_ids:
+            # если задача привязана к ЖК — показываем только назначенные ЖК;
+            # задачи без ЖК оставляем видимыми (личные/общие)
+            qs = qs.filter(Q(residential_complex_id__in=allowed_ids) | Q(residential_complex__isnull=True))
+
         if _is_owner_like(user):
             return qs
 
@@ -1314,6 +1607,9 @@ class BuildingTaskDetailView(CompanyQuerysetMixin, generics.RetrieveUpdateDestro
         obj = super().get_object()
         if not _can_access_task(self.request.user, obj):
             raise PermissionDenied("Нет доступа к задаче.")
+        allowed_ids = _allowed_residential_complex_ids(self.request.user)
+        if allowed_ids and obj.residential_complex_id and obj.residential_complex_id not in set(allowed_ids):
+            raise PermissionDenied("Нет доступа к этому ЖК.")
         return obj
 
     def perform_update(self, serializer):
