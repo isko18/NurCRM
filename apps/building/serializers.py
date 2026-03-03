@@ -9,6 +9,7 @@ from django.utils import timezone
 
 from .models import (
     ResidentialComplex,
+    ResidentialComplexMember,
     ResidentialComplexDrawing,
     ResidentialComplexWarehouse,
     ResidentialComplexApartment,
@@ -81,6 +82,42 @@ class ResidentialComplexCreateSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError({"company": "У пользователя не указана компания."})
         validated_data["company_id"] = company.id
         return super().create(validated_data)
+
+
+class ResidentialComplexMemberSerializer(serializers.ModelSerializer):
+    user_display = serializers.SerializerMethodField(read_only=True)
+    added_by_display = serializers.SerializerMethodField(read_only=True)
+
+    class Meta:
+        model = ResidentialComplexMember
+        fields = [
+            "id",
+            "residential_complex",
+            "user",
+            "user_display",
+            "is_active",
+            "added_by",
+            "added_by_display",
+            "created_at",
+        ]
+        read_only_fields = ["id", "user_display", "added_by", "added_by_display", "created_at"]
+
+    def _display_user(self, u):
+        if not u:
+            return None
+        full_name = f"{getattr(u, 'first_name', '')} {getattr(u, 'last_name', '')}".strip()
+        return full_name or getattr(u, "email", None) or getattr(u, "username", None) or str(getattr(u, "id", ""))
+
+    def get_user_display(self, obj):
+        return self._display_user(getattr(obj, "user", None))
+
+    def get_added_by_display(self, obj):
+        return self._display_user(getattr(obj, "added_by", None))
+
+
+class ResidentialComplexMemberCreateSerializer(serializers.Serializer):
+    user = serializers.UUIDField(required=True)
+    is_active = serializers.BooleanField(required=False, default=True)
 
 
 class ResidentialComplexDrawingSerializer(serializers.ModelSerializer):
@@ -443,6 +480,21 @@ class BuildingClientDetailSerializer(BuildingClientSerializer):
         if treaties is None:
             return []
         qs = treaties.select_related("residential_complex", "apartment", "created_by").prefetch_related("files", "installments")
+
+        request = self.context.get("request")
+        user = getattr(request, "user", None) if request else None
+        if user and getattr(user, "is_authenticated", False) and not getattr(user, "is_superuser", False):
+            # если у сотрудника есть назначения на ЖК — показываем договора только по этим ЖК
+            if getattr(user, "role", None) not in ("owner", "admin") and not getattr(user, "owned_company_id", None):
+                allowed = ResidentialComplexMember.objects.filter(
+                    user_id=getattr(user, "id", None),
+                    is_active=True,
+                    residential_complex__company_id=getattr(user, "company_id", None),
+                ).values_list("residential_complex_id", flat=True)
+                allowed_ids = list(allowed)
+                if allowed_ids:
+                    qs = qs.filter(residential_complex_id__in=allowed_ids)
+
         return BuildingTreatySerializer(qs, many=True, context=self.context).data
 
 

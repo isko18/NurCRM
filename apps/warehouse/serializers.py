@@ -451,6 +451,7 @@ class AgentRequestCartSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSe
     items = AgentRequestItemSerializer(many=True, read_only=True)
     agent_display = serializers.SerializerMethodField()
     note = serializers.CharField(required=False, allow_blank=True)
+    sale_document_number = serializers.CharField(source="sale_document.number", read_only=True, allow_null=True)
 
     class Meta:
         model = m.AgentRequestCart
@@ -465,11 +466,23 @@ class AgentRequestCartSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSe
             "submitted_at",
             "approved_at",
             "approved_by",
+            "sale_document",
+            "sale_document_number",
             "created_date",
             "updated_date",
             "items",
         )
-        read_only_fields = ("id", "status", "submitted_at", "approved_at", "approved_by", "created_date", "updated_date")
+        read_only_fields = (
+            "id",
+            "status",
+            "submitted_at",
+            "approved_at",
+            "approved_by",
+            "sale_document",
+            "sale_document_number",
+            "created_date",
+            "updated_date",
+        )
         extra_kwargs = {
             "agent": {"required": False},
         }
@@ -538,6 +551,21 @@ class CompanyWarehouseAgentSerializer(serializers.ModelSerializer):
 class AgentRequestCartActionSerializer(serializers.Serializer):
     # placeholder for submit/approve/reject
     pass
+
+
+class AgentRequestCartCreateSaleSerializer(serializers.Serializer):
+    """
+    Создание документа SALE по позициям заявки агента (AgentRequestCart).
+    Делает документ, привязанный к agent, чтобы аналитика считала продажи агента.
+    """
+
+    counterparty = serializers.PrimaryKeyRelatedField(queryset=m.Counterparty.objects.all())
+    post = serializers.BooleanField(required=False, default=False)
+    payment_kind = serializers.ChoiceField(choices=m.Document.PaymentKind.choices, required=False)
+    prepayment_amount = serializers.DecimalField(max_digits=18, decimal_places=2, required=False, default=Decimal("0.00"))
+    discount_percent = serializers.DecimalField(max_digits=5, decimal_places=2, required=False, default=Decimal("0.00"))
+    discount_amount = serializers.DecimalField(max_digits=18, decimal_places=2, required=False, default=Decimal("0.00"))
+    comment = serializers.CharField(required=False, allow_blank=True, allow_null=True)
 
 
 class AgentStockBalanceSerializer(serializers.ModelSerializer):

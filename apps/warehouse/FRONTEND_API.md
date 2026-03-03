@@ -800,6 +800,26 @@ Read-only поля:
 - `POST /api/warehouse/agent-carts/{id}/submit/` — отправить владельцу
 - `POST /api/warehouse/agent-carts/{id}/approve/` — одобрить (только владелец/админ)
 - `POST /api/warehouse/agent-carts/{id}/reject/` — отклонить (только владелец/админ)
+- `POST /api/warehouse/agent-carts/{id}/create-sale/` — создать документ `SALE` по позициям заявки (только владелец/админ)
+
+`create-sale` body:
+```json
+{
+  "counterparty": "uuid",
+  "post": false,
+  "payment_kind": "cash|credit",
+  "prepayment_amount": "0.00",
+  "discount_percent": "0.00",
+  "discount_amount": "0.00",
+  "comment": "string"
+}
+```
+
+Правила `create-sale`:
+- заявка должна быть `approved`;
+- `counterparty` должен принадлежать агенту заявки (иначе 400);
+- создаётся `Document` типа `SALE` с `agent=cart.agent`, позиции берутся из `cart.items`;
+- если `post=true` — документ сразу проводится (списывает с остатков агента).
 
 Формат заявки:
 ```json
@@ -812,6 +832,8 @@ Read-only поля:
   "submitted_at": "2026-02-01T12:00:00Z|null",
   "approved_at": "2026-02-01T12:00:00Z|null",
   "approved_by": "uuid|null",
+  "sale_document": "uuid|null",
+  "sale_document_number": "SALE-20260303-0001|null",
   "created_date": "2026-02-01T12:00:00Z",
   "updated_date": "2026-02-01T12:10:00Z",
   "items": [ ... ]
@@ -1018,6 +1040,35 @@ Read-only поля:
       "amount": "1500.00"
     }
   }
+}
+```
+
+### 7.1.1 Аналитика по агентам (список продаж за период)
+`GET /api/warehouse/owner/agents/analytics/`
+
+Параметры:
+- `period=day|week|month|custom`
+- `date`, `date_from`, `date_to`
+- `limit` (по умолчанию 200, максимум 1000)
+- `offset` (по умолчанию 0)
+- `order_by=sales_amount|sales_count|sales_qty` (по умолчанию `sales_amount`)
+
+Ответ (основные поля):
+```json
+{
+  "period": "month",
+  "date_from": "2026-02-01",
+  "date_to": "2026-02-29",
+  "summary": {
+    "sales_count": 45,
+    "sales_qty": "120.000",
+    "sales_amount": "15000.00",
+    "agents_with_sales": 7
+  },
+  "pagination": { "limit": 200, "offset": 0, "total": 7, "order_by": "sales_amount" },
+  "agents": [
+    { "agent_id": "uuid", "agent_name": "Иван Иванов", "sales_count": 10, "sales_qty": "25.000", "sales_amount": "3500.00" }
+  ]
 }
 ```
 

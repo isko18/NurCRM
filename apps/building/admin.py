@@ -1,6 +1,7 @@
 from django.contrib import admin
 from .models import (
     ResidentialComplex,
+    ResidentialComplexMember,
     ResidentialComplexDrawing,
     ResidentialComplexWarehouse,
     ResidentialComplexApartment,
@@ -37,6 +38,14 @@ class ResidentialComplexAdmin(admin.ModelAdmin):
     list_filter = ("company", "is_active")
     search_fields = ("name", "address")
     readonly_fields = ("id", "created_at", "updated_at")
+
+
+@admin.register(ResidentialComplexMember)
+class ResidentialComplexMemberAdmin(admin.ModelAdmin):
+    list_display = ("id", "residential_complex", "user", "is_active", "added_by", "created_at")
+    list_filter = ("is_active", "created_at", "residential_complex__company")
+    search_fields = ("residential_complex__name", "user__email", "user__first_name", "user__last_name")
+    readonly_fields = ("id", "created_at")
 
 
 @admin.register(ResidentialComplexDrawing)

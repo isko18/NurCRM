@@ -45,6 +45,54 @@ class ResidentialComplex(models.Model):
         return f"{self.name} ({self.company.name})"
 
 
+class ResidentialComplexMember(models.Model):
+    """
+    Назначение сотрудника на конкретный ЖК.
+
+    Если у пользователя есть хотя бы одно активное назначение,
+    то в building он видит данные только по назначенным ЖК.
+    """
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False, verbose_name="ID")
+    residential_complex = models.ForeignKey(
+        ResidentialComplex,
+        on_delete=models.CASCADE,
+        related_name="memberships",
+        verbose_name="Жилой комплекс",
+    )
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="building_residential_complex_memberships",
+        verbose_name="Сотрудник",
+    )
+    is_active = models.BooleanField(default=True, db_index=True, verbose_name="Активно")
+    added_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="building_residential_complex_memberships_added",
+        verbose_name="Кто назначил",
+    )
+    created_at = models.DateTimeField(auto_now_add=True, verbose_name="Дата назначения")
+
+    class Meta:
+        verbose_name = "Сотрудник ЖК (Building)"
+        verbose_name_plural = "Сотрудники ЖК (Building)"
+        ordering = ["-created_at"]
+        constraints = [
+            models.UniqueConstraint(fields=["residential_complex", "user"], name="uq_building_rc_member_rc_user"),
+        ]
+        indexes = [
+            models.Index(fields=["user", "is_active"]),
+            models.Index(fields=["residential_complex", "is_active"]),
+        ]
+
+    def __str__(self):
+        return f"{self.residential_complex_id} -> {self.user_id}"
+
+
 def residential_complex_drawing_upload_to(instance, filename: str) -> str:
     ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else "bin"
     return f"building/residential-complexes/{instance.residential_complex_id}/drawings/{uuid.uuid4().hex}.{ext}"

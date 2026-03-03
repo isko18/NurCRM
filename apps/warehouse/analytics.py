@@ -597,3 +597,110 @@ def build_owner_warehouse_analytics_payload(
             "top_sales_group": top_sales_group,
         },
     }
+
+
+@cached_result(timeout=settings.CACHE_TIMEOUT_ANALYTICS, key_prefix="warehouse_analytics_owner_agents_sales")
+def build_owner_agents_sales_analytics_payload(
+    *,
+    company_id: str,
+    branch_id: str | None,
+    period: str,
+    date_from: date,
+    date_to: date,
+    group_by: str = "day",  # kept for signature consistency; not used in this payload
+    limit: int = 200,
+    offset: int = 0,
+    order_by: str = "sales_amount",
+):
+    """
+    Агентская аналитика для владельца: список агентов с продажами за период.
+    Считаем только проведённые продажи (Document.POSTED, doc_type=SALE) где agent != null.
+    """
+    company = Company.objects.get(id=company_id)
+    branch = Branch.objects.get(id=branch_id) if branch_id else None
+    dt_from, dt_to_excl = _dt_range(date_from, date_to)
+
+    sales_qs = wm.Document.objects.filter(
+        warehouse_from__company=company,
+        agent__isnull=False,
+        status=wm.Document.Status.POSTED,
+        doc_type=wm.Document.DocType.SALE,
+        date__gte=dt_from,
+        date__lt=dt_to_excl,
+    )
+    if branch is not None:
+        sales_qs = sales_qs.filter(warehouse_from__branch=branch)
+    else:
+        sales_qs = sales_qs.filter(warehouse_from__branch__isnull=True)
+
+    summary_sales_count = sales_qs.count()
+    summary_sales_amount = sales_qs.aggregate(s=Coalesce(Sum("total"), ZERO_MONEY))["s"] or Decimal("0.00")
+    summary_sales_qty = wm.DocumentItem.objects.filter(document__in=sales_qs).aggregate(
+        s=Coalesce(Sum("qty", output_field=QTY_FIELD), ZERO_QTY)
+    )["s"] or Decimal("0.000")
+
+    agents_qs = (
+        sales_qs.values(
+            "agent_id",
+            "agent__first_name",
+            "agent__last_name",
+            "agent__username",
+            "agent__email",
+        )
+        .annotate(
+            sales_count=Count("id"),
+            sales_amount=Coalesce(Sum("total"), ZERO_MONEY),
+            sales_qty=Coalesce(Sum("items__qty", output_field=QTY_FIELD), ZERO_QTY),
+        )
+    )
+
+    order_key = (order_by or "sales_amount").strip().lower()
+    if order_key == "sales_count":
+        agents_qs = agents_qs.order_by("-sales_count", "-sales_amount")
+    elif order_key == "sales_qty":
+        agents_qs = agents_qs.order_by("-sales_qty", "-sales_amount")
+    else:
+        agents_qs = agents_qs.order_by("-sales_amount", "-sales_count")
+
+    total_agents = agents_qs.count()
+    if offset and offset > 0:
+        agents_qs = agents_qs[offset:]
+    if limit and limit > 0:
+        agents_qs = agents_qs[:limit]
+
+    agents = []
+    for r in agents_qs:
+        name = (
+            f"{(r['agent__first_name'] or '').strip()} {(r['agent__last_name'] or '').strip()}".strip()
+            or (r.get("agent__username") or "").strip()
+            or (r.get("agent__email") or "").strip()
+            or "Агент"
+        )
+        agents.append(
+            {
+                "agent_id": str(r["agent_id"]),
+                "agent_name": name,
+                "sales_count": r["sales_count"],
+                "sales_qty": str(r["sales_qty"]),
+                "sales_amount": _money_str(r["sales_amount"]),
+            }
+        )
+
+    return {
+        "period": period,
+        "date_from": str(date_from),
+        "date_to": str(date_to),
+        "summary": {
+            "sales_count": summary_sales_count,
+            "sales_qty": str(summary_sales_qty),
+            "sales_amount": _money_str(summary_sales_amount),
+            "agents_with_sales": total_agents,
+        },
+        "pagination": {
+            "limit": int(limit),
+            "offset": int(offset),
+            "total": int(total_agents),
+            "order_by": order_key,
+        },
+        "agents": agents,
+    }
