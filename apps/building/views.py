@@ -1878,10 +1878,17 @@ class BuildingPayrollLineListCreateView(CompanyQuerysetMixin, generics.ListCreat
         _require_salary_perm(self.request.user)
         qs = super().get_queryset()
         user = self.request.user
+        # фильтрация по компании + по конкретному payroll_id из URL
         if getattr(user, "is_superuser", False):
-            return qs
-        company_id = getattr(user, "company_id", None)
-        return qs.filter(payroll__company_id=company_id) if company_id else qs.none()
+            base_qs = qs
+        else:
+            company_id = getattr(user, "company_id", None)
+            base_qs = qs.filter(payroll__company_id=company_id) if company_id else qs.none()
+
+        payroll_id = self.kwargs.get("payroll_id")
+        if payroll_id:
+            base_qs = base_qs.filter(payroll_id=payroll_id)
+        return base_qs
 
     @transaction.atomic
     def post(self, request, payroll_id=None):
