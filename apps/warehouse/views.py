@@ -661,7 +661,11 @@ class AgentRequestCartListCreateAPIView(CompanyBranchRestrictedMixin, generics.L
     filterset_fields = ["status", "warehouse", "agent", "sale_document", "submitted_at", "approved_at"]
 
     def get_queryset(self):
-        qs = m.AgentRequestCart.objects.select_related("agent", "warehouse", "approved_by")
+        qs = (
+            m.AgentRequestCart.objects
+            .select_related("agent", "warehouse", "approved_by")
+            .prefetch_related("items__product")
+        )
         qs = self._filter_qs_company_branch_relaxed(qs)
         user = self.request.user
         if not _is_owner_like(user):
@@ -697,7 +701,11 @@ class AgentRequestCartRetrieveUpdateDestroyAPIView(CompanyBranchRestrictedMixin,
     serializer_class = AgentRequestCartSerializer
 
     def get_queryset(self):
-        qs = m.AgentRequestCart.objects.select_related("agent", "warehouse", "approved_by")
+        qs = (
+            m.AgentRequestCart.objects
+            .select_related("agent", "warehouse", "approved_by")
+            .prefetch_related("items__product")
+        )
         qs = self._filter_qs_company_branch_relaxed(qs)
         user = self.request.user
         if not _is_owner_like(user):

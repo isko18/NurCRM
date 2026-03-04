@@ -858,17 +858,28 @@ Read-only поля:
 - `POST /api/warehouse/agent-cart-items/`
 - `GET/PATCH/PUT/DELETE /api/warehouse/agent-cart-items/{id}/`
 
-Формат позиции:
+Формат позиции (в списке заявок `items[]` и в ответах по позициям — полная информация из товара):
 ```json
 {
   "id": "uuid",
   "cart": "uuid",
   "product": "uuid",
+  "product_name": "string",
+  "product_article": "string",
+  "product_unit": "шт.",
   "quantity_requested": "10.000",
+  "qty": "10.000",
+  "price": "100.00",
+  "discount_percent": "10.00",
+  "discount_amount": "100.00",
+  "line_total": "900.00",
   "created_date": "2026-02-01T12:00:00Z",
   "updated_date": "2026-02-01T12:10:00Z"
 }
 ```
+- `price`, `discount_percent` — из карточки товара (WarehouseProduct).
+- `discount_amount` = (price × quantity_requested × discount_percent / 100).
+- `line_total` = (price × quantity_requested) − discount_amount.
 
 Важные правила:
 - позиции можно менять **только** пока заявка `draft`.
