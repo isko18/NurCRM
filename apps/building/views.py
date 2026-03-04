@@ -1718,7 +1718,7 @@ class BuildingSalaryEmployeeListView(generics.ListAPIView):
         if not company_id and not getattr(request.user, "is_superuser", False):
             raise PermissionDenied("У пользователя не указана компания.")
 
-        users = User.objects.filter(company_id=company_id).only("id", "first_name", "last_name", "email", "username").order_by("last_name", "first_name")
+        users = User.objects.filter(company_id=company_id).only("id", "first_name", "last_name", "email").order_by("last_name", "first_name")
         comps = {
             str(c.user_id): c
             for c in BuildingEmployeeCompensation.objects.filter(company_id=company_id).only("id", "user_id", "salary_type", "base_salary", "is_active")
@@ -1727,7 +1727,7 @@ class BuildingSalaryEmployeeListView(generics.ListAPIView):
         rows = []
         for u in users:
             full_name = f"{getattr(u, 'first_name', '')} {getattr(u, 'last_name', '')}".strip()
-            display = full_name or getattr(u, "email", None) or getattr(u, "username", None) or str(u.id)
+            display = full_name or getattr(u, "email", None) or str(u.id)
             c = comps.get(str(u.id))
             rows.append(
                 {
