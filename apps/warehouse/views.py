@@ -946,7 +946,8 @@ class AgentMyProductsListAPIView(CompanyBranchRestrictedMixin, APIView):
                 elif order_by == "-date":
                     prod_qs = prod_qs.order_by("-created_date", "-id")
                 else:
-                    prod_qs = prod_qs.order_by("name", "id")
+                    # по умолчанию — по дате создания (сначала новые)
+                    prod_qs = prod_qs.order_by("-created_date", "id")
                 prod_qs = self._filter_qs_company_branch_relaxed(prod_qs)
                 rows = [
                     CommonWarehouseBalanceSerializer.make_row(
@@ -976,7 +977,8 @@ class AgentMyProductsListAPIView(CompanyBranchRestrictedMixin, APIView):
         elif order_by == "-date":
             qs = qs.order_by("-last_movement_at", "product__name", "id")
         else:
-            qs = qs.order_by("product__name", "id")
+            # по умолчанию — по дате (последнее движение), сначала новые
+            qs = qs.order_by("-last_movement_at", "product__name", "id")
         return Response(AgentStockBalanceSerializer(qs, many=True).data)
 
 
@@ -1002,7 +1004,8 @@ class OwnerAgentsProductsListAPIView(CompanyBranchRestrictedMixin, APIView):
         elif order_by == "-date":
             qs = qs.order_by("-last_movement_at", "agent_id", "product__name", "id")
         else:
-            qs = qs.order_by("agent_id", "product__name", "id")
+            # по умолчанию — по дате (последнее движение), сначала новые
+            qs = qs.order_by("-last_movement_at", "agent_id", "product__name", "id")
         data = AgentStockBalanceSerializer(qs, many=True).data
         return Response(data)
 
