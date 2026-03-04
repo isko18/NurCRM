@@ -9,7 +9,7 @@ from django_filters.rest_framework import DjangoFilterBackend
 from django.shortcuts import get_object_or_404
 from decimal import Decimal
 from django.db import IntegrityError, transaction
-from django.db.models import Count, Sum, DecimalField, Value as V
+from django.db.models import Count, OuterRef, Subquery, Sum, DecimalField, Value as V
 from django.db.models.functions import Coalesce
 from django.utils import timezone
 
@@ -28,7 +28,9 @@ from .serializers import (
     AgentRequestCartActionSerializer,
     AgentRequestCartCreateSaleSerializer,
     AgentStockBalanceSerializer,
+    CommonWarehouseBalanceSerializer,
     CompanyWarehouseAgentSerializer,
+    CompanyWarehouseAgentCommonAccessUpdateSerializer,
 )
 
 from apps.warehouse import models as m
@@ -917,10 +919,65 @@ class AgentRequestItemDetailAPIView(CompanyBranchRestrictedMixin, generics.Retri
 class AgentMyProductsListAPIView(CompanyBranchRestrictedMixin, APIView):
     def get(self, request, *args, **kwargs):
         user = request.user
-        qs = m.AgentStockBalance.objects.select_related("product", "warehouse").filter(agent=user)
+        company = self._company()
+        if company is not None:
+            membership = (
+                m.CompanyWarehouseAgent.objects
+                .filter(
+                    company=company,
+                    user=user,
+                    status=m.CompanyWarehouseAgent.Status.ACTIVE,
+                    common_access_enabled=True,
+                    common_warehouse__isnull=False,
+                )
+                .select_related("common_warehouse")
+                .first()
+            )
+            if membership and membership.common_warehouse_id:
+                wh = membership.common_warehouse
+                prod_qs = (
+                    m.WarehouseProduct.objects
+                    .filter(warehouse=wh)
+                    .only("id", "name", "article", "unit", "quantity", "warehouse_id", "created_date", "updated_date")
+                )
+                order_by = (request.query_params.get("order_by") or "").strip().lower()
+                if order_by == "date":
+                    prod_qs = prod_qs.order_by("created_date", "id")
+                elif order_by == "-date":
+                    prod_qs = prod_qs.order_by("-created_date", "-id")
+                else:
+                    prod_qs = prod_qs.order_by("name", "id")
+                prod_qs = self._filter_qs_company_branch_relaxed(prod_qs)
+                rows = [
+                    CommonWarehouseBalanceSerializer.make_row(
+                        agent_id=user.id,
+                        warehouse_id=wh.id,
+                        product=p,
+                    )
+                    for p in prod_qs
+                ]
+                return Response(CommonWarehouseBalanceSerializer(rows, many=True).data)
+
+        move_subq = m.AgentStockMove.objects.filter(
+            agent=OuterRef("agent"),
+            warehouse=OuterRef("warehouse"),
+            product=OuterRef("product"),
+        ).order_by("-created_at").values("created_at")[:1]
+        qs = (
+            m.AgentStockBalance.objects
+            .filter(agent=user)
+            .select_related("product", "warehouse")
+            .annotate(last_movement_at=Subquery(move_subq))
+        )
         qs = self._filter_qs_company_branch_relaxed(qs)
-        data = AgentStockBalanceSerializer(qs, many=True).data
-        return Response(data)
+        order_by = (request.query_params.get("order_by") or "").strip().lower()
+        if order_by == "date":
+            qs = qs.order_by("last_movement_at", "product__name", "id")
+        elif order_by == "-date":
+            qs = qs.order_by("-last_movement_at", "product__name", "id")
+        else:
+            qs = qs.order_by("product__name", "id")
+        return Response(AgentStockBalanceSerializer(qs, many=True).data)
 
 
 class OwnerAgentsProductsListAPIView(CompanyBranchRestrictedMixin, APIView):
@@ -928,8 +985,24 @@ class OwnerAgentsProductsListAPIView(CompanyBranchRestrictedMixin, APIView):
         user = request.user
         if not _is_owner_like(user):
             return Response({"detail": "Только владелец/админ."}, status=status.HTTP_403_FORBIDDEN)
-        qs = m.AgentStockBalance.objects.select_related("agent", "product", "warehouse")
+        move_subq = m.AgentStockMove.objects.filter(
+            agent=OuterRef("agent"),
+            warehouse=OuterRef("warehouse"),
+            product=OuterRef("product"),
+        ).order_by("-created_at").values("created_at")[:1]
+        qs = (
+            m.AgentStockBalance.objects
+            .select_related("agent", "product", "warehouse")
+            .annotate(last_movement_at=Subquery(move_subq))
+        )
         qs = self._filter_qs_company_branch_relaxed(qs)
+        order_by = (request.query_params.get("order_by") or "").strip().lower()
+        if order_by == "date":
+            qs = qs.order_by("last_movement_at", "agent_id", "product__name", "id")
+        elif order_by == "-date":
+            qs = qs.order_by("-last_movement_at", "agent_id", "product__name", "id")
+        else:
+            qs = qs.order_by("agent_id", "product__name", "id")
         data = AgentStockBalanceSerializer(qs, many=True).data
         return Response(data)
 
@@ -1073,4 +1146,34 @@ class CompanyWarehouseAgentRemoveAPIView(APIView):
         obj.decided_at = timezone.now()
         obj.decided_by = request.user
         obj.save(update_fields=["status", "decided_at", "decided_by", "updated_at"])
+        return Response(CompanyWarehouseAgentSerializer(obj).data)
+
+
+class CompanyWarehouseAgentCommonAccessUpdateAPIView(APIView):
+    """
+    Владелец/админ включает агенту доступ к общему товару и выбирает склад.
+
+    PATCH /api/warehouse/agents/company-requests/{id}/common-access/
+    body:
+      - common_access_enabled: bool
+      - common_warehouse: uuid|null (обязателен если common_access_enabled=true)
+    """
+
+    permission_classes = [permissions.IsAuthenticated]
+
+    def patch(self, request, pk=None, *args, **kwargs):
+        if not _is_owner_like(request.user):
+            return Response({"detail": "Только владелец/админ."}, status=status.HTTP_403_FORBIDDEN)
+        company = getattr(request.user, "owned_company", None) or getattr(request.user, "company", None)
+        if not company:
+            return Response({"detail": "Нет компании."}, status=status.HTTP_403_FORBIDDEN)
+
+        obj = get_object_or_404(
+            m.CompanyWarehouseAgent.objects.filter(company=company, status=m.CompanyWarehouseAgent.Status.ACTIVE),
+            pk=pk,
+        )
+
+        ser = CompanyWarehouseAgentCommonAccessUpdateSerializer(instance=obj, data=request.data, partial=False)
+        ser.is_valid(raise_exception=True)
+        ser.save()
         return Response(CompanyWarehouseAgentSerializer(obj).data)

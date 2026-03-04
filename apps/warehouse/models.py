@@ -912,6 +912,21 @@ class CompanyWarehouseAgent(models.Model):
         verbose_name="Кем решено",
     )
 
+    common_access_enabled = models.BooleanField(
+        "Доступ к общему товару",
+        default=False,
+        help_text="Если включено — агент может работать с общим остатком выбранного склада (продажи со склада).",
+    )
+    common_warehouse = models.ForeignKey(
+        "warehouse.Warehouse",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="common_access_agents",
+        verbose_name="Склад общего доступа",
+        help_text="Склад, по которому агенту открыт общий доступ (если common_access_enabled=true).",
+    )
+
     class Meta:
         verbose_name = "Агент склада (заявка в компанию)"
         verbose_name_plural = "Агенты складов (заявки в компании)"
@@ -1015,6 +1030,13 @@ class Document(models.Model):
         blank=True,
         related_name="warehouse_documents",
         verbose_name="Агент",
+    )
+
+    use_common_stock = models.BooleanField(
+        "Использовать общий товар со склада",
+        default=False,
+        db_index=True,
+        help_text="Для документов агента: списывать со склада (общий товар), а не с остатков агента.",
     )
 
     comment = models.TextField(blank=True, verbose_name="Комментарий")

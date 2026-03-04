@@ -1,3 +1,4 @@
+import uuid
 from io import BytesIO
 from decimal import Decimal
 from PIL import Image
@@ -513,6 +514,8 @@ class CompanyWarehouseAgentSerializer(serializers.ModelSerializer):
     company_name = serializers.CharField(source="company.name", read_only=True)
     user_display = serializers.SerializerMethodField()
     decided_by_display = serializers.SerializerMethodField()
+    common_access_enabled = serializers.BooleanField(read_only=True)
+    common_warehouse = serializers.PrimaryKeyRelatedField(read_only=True)
 
     class Meta:
         model = m.CompanyWarehouseAgent
@@ -524,14 +527,56 @@ class CompanyWarehouseAgentSerializer(serializers.ModelSerializer):
             "user_display",
             "status",
             "note",
+            "common_access_enabled",
+            "common_warehouse",
             "created_at",
             "updated_at",
             "decided_at",
             "decided_by",
             "decided_by_display",
         )
-        read_only_fields = ("id", "status", "created_at", "updated_at", "decided_at", "decided_by")
+        read_only_fields = (
+            "id",
+            "status",
+            "common_access_enabled",
+            "common_warehouse",
+            "created_at",
+            "updated_at",
+            "decided_at",
+            "decided_by",
+        )
         extra_kwargs = {"company": {"required": True}, "user": {"required": False}, "note": {"required": False, "allow_blank": True}}
+
+
+class CompanyWarehouseAgentCommonAccessUpdateSerializer(serializers.ModelSerializer):
+    common_access_enabled = serializers.BooleanField(required=True)
+    common_warehouse = serializers.PrimaryKeyRelatedField(
+        queryset=m.Warehouse.objects.all(),
+        required=False,
+        allow_null=True,
+    )
+
+    class Meta:
+        model = m.CompanyWarehouseAgent
+        fields = ("common_access_enabled", "common_warehouse")
+
+    def validate(self, attrs):
+        attrs = super().validate(attrs)
+        enabled = attrs.get("common_access_enabled")
+        warehouse = attrs.get("common_warehouse")
+
+        if enabled and warehouse is None:
+            raise serializers.ValidationError({"common_warehouse": "Укажите склад, если включен общий доступ."})
+        if not enabled:
+            attrs["common_warehouse"] = None
+
+        inst = getattr(self, "instance", None)
+        company = getattr(inst, "company", None)
+        if enabled and warehouse is not None and company is not None:
+            if getattr(warehouse, "company_id", None) != getattr(company, "id", None):
+                raise serializers.ValidationError({"common_warehouse": "Склад принадлежит другой компании."})
+
+        return attrs
 
     def get_user_display(self, obj):
         u = getattr(obj, "user", None)
@@ -573,6 +618,7 @@ class AgentStockBalanceSerializer(serializers.ModelSerializer):
     product_article = serializers.CharField(source="product.article", read_only=True)
     product_unit = serializers.CharField(source="product.unit", read_only=True)
     agent_display = serializers.SerializerMethodField()
+    last_movement_at = serializers.DateTimeField(read_only=True, allow_null=True)
 
     class Meta:
         model = m.AgentStockBalance
@@ -586,6 +632,7 @@ class AgentStockBalanceSerializer(serializers.ModelSerializer):
             "product_article",
             "product_unit",
             "qty",
+            "last_movement_at",
         )
         read_only_fields = fields
 
@@ -604,3 +651,40 @@ class AgentStockBalanceSerializer(serializers.ModelSerializer):
             last = getattr(agent, "last_name", "") or ""
             full_name = f"{first} {last}".strip()
         return full_name or getattr(agent, "username", None) or getattr(agent, "email", None) or str(getattr(agent, "id", ""))
+
+
+class CommonWarehouseBalanceSerializer(serializers.Serializer):
+    """
+    Ответ совместим с форматом /agents/me/products, но qty берётся из общего остатка склада
+    (WarehouseProduct.quantity), а id генерируется детерминированно.
+    """
+
+    id = serializers.UUIDField()
+    agent = serializers.UUIDField()
+    warehouse = serializers.UUIDField()
+    product = serializers.UUIDField()
+    product_name = serializers.CharField()
+    product_article = serializers.CharField(allow_null=True, required=False)
+    product_unit = serializers.CharField()
+    qty = serializers.DecimalField(max_digits=18, decimal_places=3)
+    created_date = serializers.DateTimeField(allow_null=True, required=False)
+    updated_date = serializers.DateTimeField(allow_null=True, required=False)
+
+    @staticmethod
+    def make_row(*, agent_id, warehouse_id, product: m.WarehouseProduct):
+        sid = uuid.uuid5(
+            uuid.NAMESPACE_URL,
+            f"nurcrm:common_stock:{warehouse_id}:{product.id}",
+        )
+        return {
+            "id": sid,
+            "agent": agent_id,
+            "warehouse": warehouse_id,
+            "product": product.id,
+            "product_name": product.name,
+            "product_article": getattr(product, "article", None),
+            "product_unit": getattr(product, "unit", "") or "",
+            "qty": getattr(product, "quantity", None) or Decimal("0.000"),
+            "created_date": getattr(product, "created_date", None),
+            "updated_date": getattr(product, "updated_date", None),
+        }
