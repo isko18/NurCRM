@@ -441,11 +441,65 @@ class WarehouseProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSe
 
 
 class AgentRequestItemSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
+    product_name = serializers.CharField(source="product.name", read_only=True)
+    product_article = serializers.CharField(source="product.article", read_only=True, allow_blank=True)
+    product_unit = serializers.CharField(source="product.unit", read_only=True, default="шт.")
+    qty = serializers.DecimalField(
+        source="quantity_requested",
+        max_digits=18,
+        decimal_places=3,
+        read_only=True,
+    )
+    price = serializers.DecimalField(
+        source="product.price",
+        max_digits=11,
+        decimal_places=3,
+        read_only=True,
+    )
+    discount_percent = serializers.DecimalField(
+        source="product.discount_percent",
+        max_digits=12,
+        decimal_places=2,
+        read_only=True,
+    )
+    discount_amount = serializers.SerializerMethodField()
+    line_total = serializers.SerializerMethodField()
+
     class Meta:
         model = m.AgentRequestItem
         ref_name = "WarehouseAgentRequestItem"
-        fields = ("id", "cart", "product", "quantity_requested", "created_date", "updated_date")
+        fields = (
+            "id",
+            "cart",
+            "product",
+            "product_name",
+            "product_article",
+            "product_unit",
+            "quantity_requested",
+            "qty",
+            "price",
+            "discount_percent",
+            "discount_amount",
+            "line_total",
+            "created_date",
+            "updated_date",
+        )
         read_only_fields = ("id", "created_date", "updated_date")
+
+    def get_discount_amount(self, obj):
+        price = getattr(obj.product, "price", None) or Decimal("0")
+        qty = getattr(obj, "quantity_requested", None) or Decimal("0")
+        pct = getattr(obj.product, "discount_percent", None) or Decimal("0")
+        subtotal = price * qty
+        return (subtotal * pct / Decimal("100")).quantize(Decimal("0.01"))
+
+    def get_line_total(self, obj):
+        price = getattr(obj.product, "price", None) or Decimal("0")
+        qty = getattr(obj, "quantity_requested", None) or Decimal("0")
+        pct = getattr(obj.product, "discount_percent", None) or Decimal("0")
+        subtotal = price * qty
+        discount = subtotal * pct / Decimal("100")
+        return (subtotal - discount).quantize(Decimal("0.01"))
 
 
 class AgentRequestCartSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
