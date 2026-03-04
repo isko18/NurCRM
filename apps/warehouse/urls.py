@@ -24,6 +24,7 @@ from .views import (
     CompanyWarehouseAgentAcceptAPIView,
     CompanyWarehouseAgentRejectAPIView,
     CompanyWarehouseAgentRemoveAPIView,
+    CompanyWarehouseAgentCommonAccessUpdateAPIView,
 )
 from .views_documents import (
     DocumentListCreateView, DocumentDetailView, DocumentPostView, DocumentUnpostView,
@@ -127,6 +128,7 @@ urlpatterns += [
     path("agents/company-requests/<uuid:pk>/accept/", CompanyWarehouseAgentAcceptAPIView.as_view(), name="warehouse-agents-company-request-accept"),
     path("agents/company-requests/<uuid:pk>/reject/", CompanyWarehouseAgentRejectAPIView.as_view(), name="warehouse-agents-company-request-reject"),
     path("agents/company-requests/<uuid:pk>/remove/", CompanyWarehouseAgentRemoveAPIView.as_view(), name="warehouse-agents-company-request-remove"),
+    path("agents/company-requests/<uuid:pk>/common-access/", CompanyWarehouseAgentCommonAccessUpdateAPIView.as_view(), name="warehouse-agents-company-request-common-access"),
 ]
 
 urlpatterns += [

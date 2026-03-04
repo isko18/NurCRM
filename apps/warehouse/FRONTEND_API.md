@@ -880,22 +880,33 @@ Read-only поля:
 - `GET /api/warehouse/agents/me/products/`
 - `GET /api/warehouse/owner/agents/products/` (только владелец/админ)
 
-Ответ:
+Параметры (опционально):
+- `order_by=date` — сортировка по дате по возрастанию (сначала старые).
+- `order_by=-date` — сортировка по дате по убыванию (сначала новые).
+
+Ответ (остатки агента — `AgentStockBalance`):
 ```json
 {
   "id": "uuid",
   "agent": "uuid",
+  "agent_display": "string",
   "warehouse": "uuid",
   "product": "uuid",
   "product_name": "string",
   "product_article": "string|null",
   "product_unit": "string",
-  "qty": "5.000"
+  "qty": "5.000",
+  "last_movement_at": "2026-03-04T12:00:00Z|null"
 }
 ```
 
+Ответ при доступе к общему товару склада (режим common_access): те же поля, плюс вместо `last_movement_at` — поля дат товара:
+- `created_date` — дата создания товара (ISO datetime или null)
+- `updated_date` — дата обновления товара (ISO datetime или null)
+
 Примечание:
 - для `agents/me/products` агент определяется токеном, вручную не передается.
+- при сортировке по дате: для остатков агента используется дата последнего движения (`last_movement_at`); для общего склада — `created_date` товара.
 
 ## 7) Акт сверки с контрагентом (как 1С)
 
