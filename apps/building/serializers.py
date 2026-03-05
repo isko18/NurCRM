@@ -53,6 +53,7 @@ class ResidentialComplexSerializer(serializers.ModelSerializer):
             "name",
             "address",
             "description",
+            "salary_cashbox",
             "is_active",
             "created_at",
             "updated_at",
@@ -71,6 +72,7 @@ class ResidentialComplexCreateSerializer(serializers.ModelSerializer):
             "address",
             "description",
             "is_active",
+            "salary_cashbox",
             "created_at",
             "updated_at",
         ]
