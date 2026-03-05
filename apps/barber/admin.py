@@ -8,9 +8,10 @@ from .models import (
     Service,
     Client,
     Appointment,
+    AppointmentService,
     Folder,
     Document,
-    ServiceCategory,   # 👈 добавили
+    ServiceCategory,
 )
 
 
@@ -165,6 +166,14 @@ class ClientAdmin(CompanyScopedAdmin):
     ordering = ("full_name",)
 
 
+# ===== AppointmentService (inline для записей) =====
+class AppointmentServiceInline(admin.TabularInline):
+    model = AppointmentService
+    extra = 0
+    ordering = ("position",)
+    autocomplete_fields = ("service",)
+
+
 # ===== Appointment =====
 @admin.register(Appointment)
 class AppointmentAdmin(CompanyScopedAdmin):
@@ -180,7 +189,7 @@ class AppointmentAdmin(CompanyScopedAdmin):
         "branch",
         "company",
     )
-    list_filter = ("status", "barber")  # branch/company добавятся для суперюзера
+    list_filter = ("status", "barber")
     search_fields = (
         "client__full_name", "client__phone",
         "barber__first_name", "barber__last_name", "barber__email",
@@ -188,11 +197,13 @@ class AppointmentAdmin(CompanyScopedAdmin):
     )
     list_select_related = ("client", "barber", "company", "branch")
     autocomplete_fields = ("client", "barber",)
-    filter_horizontal = ("services",)
+    inlines = [AppointmentServiceInline]
 
     def get_services(self, obj):
-        """Красиво выводит список услуг через запятую."""
-        return ", ".join(s.name for s in obj.services.all())
+        """Список услуг по позициям (одна и та же услуга может быть несколько раз)."""
+        return ", ".join(
+            item.service.name for item in obj.appointment_services.order_by("position")
+        )
     get_services.short_description = "Услуги"
 
 

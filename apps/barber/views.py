@@ -14,7 +14,7 @@ from django_filters import rest_framework as filters
 from django_filters.rest_framework import DjangoFilterBackend
 
 from apps.users.models import Branch, Company
-from .models import Service, Client, Appointment, Document, Folder, ServiceCategory, Payout, PayoutSale, ProductSalePayout, OnlineBooking
+from .models import Service, Client, Appointment, AppointmentService, Document, Folder, ServiceCategory, Payout, PayoutSale, ProductSalePayout, OnlineBooking
 
 from .serializers import (
     ServiceSerializer,
@@ -352,7 +352,9 @@ class ClientRetrieveUpdateDestroyView(
                 Appointment.objects
                 .filter(client=instance)
                 .select_related("barber")
-                .prefetch_related("services")
+                .prefetch_related(
+                    Prefetch("appointment_services", queryset=AppointmentService.objects.order_by("position").select_related("service"))
+                )
                 .order_by("-start_at")
             )
             examples = []
@@ -363,7 +365,7 @@ class ClientRetrieveUpdateDestroyView(
                         barber_name = f"{a.barber.first_name} {a.barber.last_name}".strip()
                     else:
                         barber_name = a.barber.email
-                service_names = list(a.services.values_list("name", flat=True))
+                service_names = [item.service.name for item in a.appointment_services.order_by("position")]
                 examples.append(
                     {
                         "start_at": a.start_at,
@@ -399,7 +401,12 @@ class ClientVisitHistoryListView(CompanyQuerysetMixin, generics.ListAPIView):
     queryset = (
         Appointment.objects
         .select_related("client", "barber")
-        .prefetch_related(Prefetch("services", queryset=Service.objects.select_related("category")))
+        .prefetch_related(
+            Prefetch(
+                "appointment_services",
+                queryset=AppointmentService.objects.order_by("position").select_related("service__category"),
+            )
+        )
         .all()
     )
     serializer_class = AppointmentSerializer
@@ -487,7 +494,12 @@ class AppointmentListCreateView(CompanyQuerysetMixin, generics.ListCreateAPIView
     queryset = (
         Appointment.objects
         .select_related("client", "barber")
-        .prefetch_related(Prefetch("services", queryset=Service.objects.select_related("category")))
+        .prefetch_related(
+            Prefetch(
+                "appointment_services",
+                queryset=AppointmentService.objects.order_by("position").select_related("service__category"),
+            )
+        )
         .all()
     )
     serializer_class = AppointmentSerializer
@@ -512,7 +524,12 @@ class AppointmentRetrieveUpdateDestroyView(
     queryset = (
         Appointment.objects
         .select_related("client", "barber")
-        .prefetch_related(Prefetch("services", queryset=Service.objects.select_related("category")))
+        .prefetch_related(
+            Prefetch(
+                "appointment_services",
+                queryset=AppointmentService.objects.order_by("position").select_related("service__category"),
+            )
+        )
         .all()
     )
     serializer_class = AppointmentSerializer
@@ -527,7 +544,12 @@ class MyAppointmentListView(CompanyQuerysetMixin, generics.ListAPIView):
     queryset = (
         Appointment.objects
         .select_related("client", "barber")
-        .prefetch_related(Prefetch("services", queryset=Service.objects.select_related("category")))
+        .prefetch_related(
+            Prefetch(
+                "appointment_services",
+                queryset=AppointmentService.objects.order_by("position").select_related("service__category"),
+            )
+        )
         .all()
     )
     serializer_class = AppointmentSerializer
@@ -557,7 +579,12 @@ class MyAppointmentDetailView(CompanyQuerysetMixin, generics.RetrieveAPIView):
     queryset = (
         Appointment.objects
         .select_related("client", "barber")
-        .prefetch_related(Prefetch("services", queryset=Service.objects.select_related("category")))
+        .prefetch_related(
+            Prefetch(
+                "appointment_services",
+                queryset=AppointmentService.objects.order_by("position").select_related("service__category"),
+            )
+        )
         .all()
     )
     serializer_class = AppointmentSerializer
@@ -717,7 +744,12 @@ class BarberAnalyticsView(CompanyQuerysetMixin, generics.GenericAPIView):
     queryset = (
         Appointment.objects
         .select_related("barber", "client")
-        .prefetch_related("services")
+        .prefetch_related(
+            Prefetch(
+                "appointment_services",
+                queryset=AppointmentService.objects.order_by("position").select_related("service__category"),
+            )
+        )
         .all()
     )
     serializer_class = BarberAnalyticsResponseSerializer
@@ -744,7 +776,12 @@ class MyBarberAnalyticsView(CompanyQuerysetMixin, generics.GenericAPIView):
     queryset = (
         Appointment.objects
         .select_related("barber", "client")
-        .prefetch_related("services")
+        .prefetch_related(
+            Prefetch(
+                "appointment_services",
+                queryset=AppointmentService.objects.order_by("position").select_related("service__category"),
+            )
+        )
         .all()
     )
     serializer_class = BarberAnalyticsResponseSerializer
