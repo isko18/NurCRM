@@ -42,6 +42,7 @@ from .views import (
     BuildingTreatyDetailView,
     BuildingTreatyFileAddView,
     BuildingTreatyErpCreateView,
+    BuildingTreatyInstallmentPaymentView,
     BuildingTaskListCreateView,
     BuildingTaskDetailView,
     BuildingTaskChecklistItemAddView,
@@ -116,6 +117,11 @@ urlpatterns = [
     path("treaties/<uuid:pk>/", BuildingTreatyDetailView.as_view(), name="building-treaty-detail"),
     path("treaties/<uuid:pk>/files/", BuildingTreatyFileAddView.as_view(), name="building-treaty-file-add"),
     path("treaties/<uuid:pk>/erp/create/", BuildingTreatyErpCreateView.as_view(), name="building-treaty-erp-create"),
+    path(
+        "treaty-installments/<uuid:pk>/payments/",
+        BuildingTreatyInstallmentPaymentView.as_view(),
+        name="building-treaty-installment-payments",
+    ),
 
     # tasks / reminders
     path("tasks/", BuildingTaskListCreateView.as_view(), name="building-task-list-create"),

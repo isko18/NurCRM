@@ -320,13 +320,38 @@
 - `installments` можно передавать только при `payment_type=installment`.
 - сумма `down_payment + sum(installments.amount)` должна быть равна `amount`.
 
-### 4.2) Редактирование рассрочки
+### 4.2) Оплата рассрочки
+
+Отдельный платёж по конкретному взносу рассрочки:
+
+- `GET /treaty-installments/{id}/payments/` — получить состояние платежа рассрочки
+- `POST /treaty-installments/{id}/payments/` — частичная/полная оплата
+
+Поля `POST`:
+
+```json
+{
+  "amount": "10000.00",
+  "cashbox": "uuid-кассы",
+  "shift": "uuid-смены-кассира-опционально",
+  "paid_at": "2026-04-01T10:00:00+06:00"
+}
+```
+
+Бизнес-правила:
+
+- требуется доступ к договорам (`can_view_building_treaty`) и кассе (`can_view_building_cash_register`) или роль owner/admin/superuser;
+- нельзя оплатить больше остатка: `amount <= (installment.amount - installment.paid_amount)`;
+- при каждой оплате поле `paid_amount` накапливает сумму всех оплат по этому взносу;
+- когда `paid_amount >= amount`, статус (`installment.status`) становится `paid`, а `paid_at` фиксируется по последней оплате.
+
+### 4.3) Редактирование рассрочки
 
 Редактирование идет через `PATCH /treaties/{id}/`:
 - при `payment_type=installment` и наличии поля `installments` график **перезаписывается целиком**.
 - если поменять `payment_type` на `full`, рассрочка очищается.
 
-### 4.3) Файлы договора
+### 4.4) Файлы договора
 
 Загрузка файла:
 - `POST /treaties/{id}/files/` (multipart/form-data)
@@ -338,7 +363,7 @@
 Ответ:
 - список `files` с `file_url` (если доступно)
 
-### 4.4) ERP
+### 4.5) ERP
 
 - `POST /treaties/{id}/erp/create/`
 
