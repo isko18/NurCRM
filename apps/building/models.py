@@ -27,6 +27,16 @@ class ResidentialComplex(models.Model):
     address = models.CharField(max_length=512, blank=True, null=True, verbose_name="Адрес")
     description = models.TextField(blank=True, null=True, verbose_name="Описание")
 
+    # Касса, из которой по умолчанию идут выплаты ЗП по этому ЖК
+    salary_cashbox = models.ForeignKey(
+        "construction.Cashbox",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="building_residential_complexes",
+        verbose_name="Касса для ЗП по ЖК",
+    )
+
     is_active = models.BooleanField(default=True, verbose_name="Активен")
 
     created_at = models.DateTimeField(auto_now_add=True, verbose_name="Дата создания")
