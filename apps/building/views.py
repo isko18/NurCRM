@@ -27,6 +27,7 @@ from .models import (
     BuildingWarehouseStockMove,
     BuildingClient,
     BuildingTreaty,
+    BuildingTreatyInstallment,
     BuildingTreatyFile,
     BuildingWorkEntry,
     BuildingWorkEntryPhoto,
@@ -60,6 +61,8 @@ from .serializers import (
     BuildingClientSerializer,
     BuildingClientDetailSerializer,
     BuildingTreatySerializer,
+    BuildingTreatyInstallmentSerializer,
+    BuildingTreatyInstallmentPaymentCreateSerializer,
     BuildingTreatyFileCreateSerializer,
     BuildingWorkEntrySerializer,
     BuildingWorkEntryPhotoCreateSerializer,
@@ -1535,6 +1538,128 @@ class BuildingTreatyErpCreateView(CompanyQuerysetMixin, generics.GenericAPIView)
         treaty.refresh_from_db()
         return Response(BuildingTreatySerializer(treaty, context={"request": request}).data, status=status.HTTP_200_OK)
 
+
+class BuildingTreatyInstallmentPaymentView(CompanyQuerysetMixin, generics.GenericAPIView):
+    permission_classes = [permissions.IsAuthenticated]
+    serializer_class = BuildingTreatyInstallmentPaymentCreateSerializer
+    queryset = BuildingTreatyInstallment.objects.select_related("treaty", "treaty__residential_complex")
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        user = self.request.user
+        if not (_is_owner_like(user) or getattr(user, "can_view_building_treaty", False)):
+            raise PermissionDenied("Нет прав на договора (Building).")
+        if user.is_authenticated and getattr(user, "company_id", None):
+            qs = qs.filter(treaty__residential_complex__company_id=user.company_id)
+            allowed_ids = _allowed_residential_complex_ids(user)
+            if allowed_ids:
+                qs = qs.filter(treaty__residential_complex_id__in=allowed_ids)
+            return qs
+        if not getattr(user, "is_staff", False) and not getattr(user, "is_superuser", False):
+            return qs.none()
+        return qs
+
+    def get(self, request, pk=None):
+        installment = self.get_object()
+        return Response(
+            BuildingTreatyInstallmentSerializer(installment, context={"request": request}).data,
+            status=status.HTTP_200_OK,
+        )
+
+    @transaction.atomic
+    def post(self, request, pk=None):
+        user = request.user
+        if not (_is_owner_like(user) or getattr(user, "can_view_building_treaty", False)):
+            raise PermissionDenied("Нет прав на договора (Building).")
+        _require_cash_register_perm(user)
+
+        base_obj = self.get_object()
+        installment = (
+            BuildingTreatyInstallment.objects.select_for_update()
+            .select_related("treaty", "treaty__residential_complex")
+            .get(pk=base_obj.pk)
+        )
+
+        ser = self.get_serializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+
+        amount = ser.validated_data["amount"]
+        if amount <= 0:
+            raise ValidationError({"amount": "Сумма должна быть > 0."})
+
+        treaty = installment.treaty
+        rc = treaty.residential_complex
+
+        if not getattr(user, "is_superuser", False) and rc.company_id != getattr(user, "company_id", None):
+            raise PermissionDenied("Договор другой компании.")
+
+        # проверяем остаток по платежу
+        remaining = (Decimal(installment.amount or 0) - Decimal(installment.paid_amount or 0)).quantize(Decimal("0.01"))
+        if remaining <= 0:
+            raise ValidationError({"amount": "По этому платежу уже всё оплачено."})
+        if amount > remaining:
+            raise ValidationError({"amount": f"Нельзя оплатить больше остатка ({remaining})."})
+
+        cashbox = Cashbox.objects.select_related("company").filter(id=ser.validated_data["cashbox"]).first()
+        if not cashbox:
+            raise ValidationError({"cashbox": "Касса не найдена."})
+        if not getattr(user, "is_superuser", False) and cashbox.company_id != getattr(user, "company_id", None):
+            raise PermissionDenied("Касса другой компании.")
+
+        shift = None
+        shift_id = ser.validated_data.get("shift")
+        if shift_id:
+            shift = CashShift.objects.select_related("cashbox").filter(id=shift_id).first()
+            if not shift:
+                raise ValidationError({"shift": "Смена не найдена."})
+            if shift.cashbox_id != cashbox.id:
+                raise ValidationError({"shift": "Смена относится к другой кассе."})
+            if shift.status != CashShift.Status.OPEN:
+                raise ValidationError({"shift": "Нельзя принять оплату в закрытой смене."})
+            if (not _is_owner_like(user)) and shift.cashier_id != user.id:
+                raise ValidationError({"shift": "Это не ваша смена."})
+
+        paid_at = ser.validated_data.get("paid_at") or timezone.now()
+
+        # создаём движение по кассе (приход)
+        client_name = getattr(treaty.client, "name", "") if getattr(treaty, "client_id", None) else ""
+        apt_number = getattr(treaty.apartment, "number", "") if getattr(treaty, "apartment_id", None) else ""
+        name_parts = ["Рассрочка по договору", treaty.number or str(treaty.id)]
+        if client_name:
+            name_parts.append(client_name)
+        if apt_number:
+            name_parts.append(f"кв. {apt_number}")
+        flow_name = " / ".join([p for p in name_parts if p])
+
+        cf = CashFlow.objects.create(
+            cashbox=cashbox,
+            shift=shift,
+            type=CashFlow.Type.INCOME,
+            name=flow_name,
+            amount=abs(amount),
+            status=CashFlow.Status.APPROVED,
+            source_business_operation_id=str(installment.id),
+        )
+
+        # обновляем сумму оплаты по платежу
+        new_paid = (Decimal(installment.paid_amount or 0) + Decimal(amount or 0)).quantize(Decimal("0.01"))
+        installment.paid_amount = new_paid
+        if new_paid >= Decimal(installment.amount or 0):
+            installment.status = BuildingTreatyInstallment.Status.PAID
+            installment.paid_at = paid_at
+            installment.save(update_fields=["paid_amount", "status", "paid_at", "updated_at"])
+        else:
+            installment.save(update_fields=["paid_amount", "updated_at"])
+
+        # можно в будущем добавить агрегацию по договору (общая оплаченная сумма и т.п.)
+
+        return Response(
+            {
+                "installment": BuildingTreatyInstallmentSerializer(installment, context={"request": request}).data,
+                "cashflow_id": str(cf.id),
+            },
+            status=status.HTTP_201_CREATED,
+        )
 
 class BuildingTaskListCreateView(CompanyQuerysetMixin, generics.ListCreateAPIView):
     """

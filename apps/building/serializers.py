@@ -776,6 +776,13 @@ class BuildingTreatyInstallmentSerializer(serializers.ModelSerializer):
         read_only_fields = ["id", "treaty", "status", "paid_amount", "paid_at", "created_at", "updated_at"]
 
 
+class BuildingTreatyInstallmentPaymentCreateSerializer(serializers.Serializer):
+    amount = serializers.DecimalField(max_digits=16, decimal_places=2)
+    cashbox = serializers.UUIDField(required=True)
+    shift = serializers.UUIDField(required=False, allow_null=True)
+    paid_at = serializers.DateTimeField(required=False)
+
+
 class BuildingTaskChecklistItemSerializer(serializers.ModelSerializer):
     done_by_display = serializers.SerializerMethodField(read_only=True)
 
