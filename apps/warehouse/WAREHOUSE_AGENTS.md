@@ -290,6 +290,64 @@ POST /api/warehouse/agents/company-requests/660e8400-e29b-41d4-a716-446655440001
 
 ---
 
+### 4.7 Прямое назначение агента владельцем/админом (без заявки)
+
+Иногда владельцу/админу удобнее **самому выбрать пользователя и сразу выдать ему доступ к складу**, без того чтобы пользователь сначала отправлял заявку.
+
+Для этого есть отдельный эндпойнт:
+
+**`POST /api/warehouse/agents/company-memberships/`**
+
+- Доступ: **владелец или администратор** компании.
+- Компания берётся из текущего пользователя (`owned_company` или `company`).
+- Работает как “создать или обновить” запись `CompanyWarehouseAgent` для указанного пользователя.
+
+**Тело запроса (JSON):**
+
+| Поле | Тип | Обязательное | Описание |
+|------|-----|--------------|----------|
+| `user` | UUID | да | Пользователь, которого назначаем агентом склада компании |
+| `common_access_enabled` | bool | нет | Включить (`true`) или нет (`false`) общий доступ к складу (по умолчанию `false`) |
+| `common_warehouse` | UUID \| null | условно | Обязателен, если `common_access_enabled=true`; склад должен принадлежать компании владельца |
+
+**Поведение:**
+
+- Если записи `(company, user)` ещё нет:
+  - создаётся `CompanyWarehouseAgent` со `status="active"`;
+  - при передаче `common_access_enabled/common_warehouse` они сохраняются (валидируются так же, как в `common-access`).
+- Если запись уже есть (в любом статусе):
+  - применяются настройки `common_access_enabled/common_warehouse` (те же правила, что в 4.6 для `common-access`);
+  - статус принудительно приводится к `active` (агент активирован), а поля `decided_at/decided_by` заполняются текущим владельцем/админом.
+
+**Пример запроса:**
+```http
+POST /api/warehouse/agents/company-memberships/
+Content-Type: application/json
+Authorization: Bearer <owner_or_admin_token>
+
+{
+  "user": "22222222-2222-2222-2222-222222222222",
+  "common_access_enabled": true,
+  "common_warehouse": "11111111-1111-1111-1111-111111111111"
+}
+```
+
+**Пример ответа (200/201):**
+
+- Возвращается объект `CompanyWarehouseAgent` так же, как в списке/деталях заявок, со статусом `active` и полями `common_access_enabled/common_warehouse`.
+
+**Типичные ошибки:**
+
+- `403` — пользователь не владелец/админ или у него нет компании.
+- `400` — не указан `user` или пользователь не найден:
+  - `{"user": "Укажите пользователя (id)."}`  
+  - `{"user": "Пользователь не найден."}`
+- `400` — некорректные настройки общего доступа:
+  - `{"common_warehouse": "Укажите склад, если включен общий доступ."}`
+  - `{"common_warehouse": "Склад принадлежит другой компании."}`
+
+---
+
 ## 5. Сводка эндпоинтов
 
 | Метод | URL | Кто вызывает | Назначение |
@@ -300,6 +358,7 @@ POST /api/warehouse/agents/company-requests/660e8400-e29b-41d4-a716-446655440001
 | POST | `/api/warehouse/agents/company-requests/{id}/accept/` | Владелец/админ | Принять заявку |
 | POST | `/api/warehouse/agents/company-requests/{id}/reject/` | Владелец/админ | Отклонить заявку |
 | POST | `/api/warehouse/agents/company-requests/{id}/remove/` | Владелец/админ | Отстранить агента |
+| POST | `/api/warehouse/agents/company-memberships/` | Владелец/админ | Напрямую назначить/активировать агента и настроить общий доступ к складу |
 
 Имена маршрутов (Django):
 - `warehouse-agents-companies-search`

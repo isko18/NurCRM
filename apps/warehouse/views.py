@@ -12,6 +12,7 @@ from django.db import IntegrityError, transaction
 from django.db.models import Count, OuterRef, Subquery, Sum, DecimalField, Value as V
 from django.db.models.functions import Coalesce
 from django.utils import timezone
+from django.contrib.auth import get_user_model
 
 from apps.users.models import Branch
 
@@ -1187,4 +1188,64 @@ class CompanyWarehouseAgentCommonAccessUpdateAPIView(APIView):
         ser = CompanyWarehouseAgentCommonAccessUpdateSerializer(instance=obj, data=request.data, partial=False)
         ser.is_valid(raise_exception=True)
         ser.save()
+        return Response(CompanyWarehouseAgentSerializer(obj).data)
+
+
+class CompanyWarehouseAgentAdminAssignAPIView(APIView):
+    """
+    Владелец/админ напрямую назначает/включает агента склада без заявки.
+
+    POST /api/warehouse/agents/company-memberships/
+    body:
+      - user: uuid пользователя
+      - common_access_enabled: bool (опционально)
+      - common_warehouse: uuid|null (опционально, обязателен если common_access_enabled=true)
+    """
+
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request, *args, **kwargs):
+        user = request.user
+        if not _is_owner_like(user):
+            return Response({"detail": "Только владелец/админ."}, status=status.HTTP_403_FORBIDDEN)
+
+        company = getattr(user, "owned_company", None) or getattr(user, "company", None)
+        if not company:
+            return Response({"detail": "Нет компании."}, status=status.HTTP_403_FORBIDDEN)
+
+        user_id = request.data.get("user")
+        if not user_id:
+            raise ValidationError({"user": "Укажите пользователя (id)."})
+
+        UserModel = get_user_model()
+        try:
+            target_user = UserModel.objects.get(id=user_id)
+        except (UserModel.DoesNotExist, ValueError, TypeError):
+            raise ValidationError({"user": "Пользователь не найден."})
+
+        obj, created = m.CompanyWarehouseAgent.objects.get_or_create(
+            company=company,
+            user=target_user,
+            defaults={
+                "status": m.CompanyWarehouseAgent.Status.ACTIVE,
+            },
+        )
+
+        # Применяем настройки общего доступа к складу, если они переданы
+        if "common_access_enabled" in request.data or "common_warehouse" in request.data:
+            ser = CompanyWarehouseAgentCommonAccessUpdateSerializer(
+                instance=obj,
+                data=request.data,
+                partial=True,
+            )
+            ser.is_valid(raise_exception=True)
+            ser.save()
+
+        # Гарантируем активный статус после назначения
+        if obj.status != m.CompanyWarehouseAgent.Status.ACTIVE:
+            obj.status = m.CompanyWarehouseAgent.Status.ACTIVE
+            obj.decided_at = timezone.now()
+            obj.decided_by = user
+            obj.save(update_fields=["status", "decided_at", "decided_by", "updated_at"])
+
         return Response(CompanyWarehouseAgentSerializer(obj).data)
