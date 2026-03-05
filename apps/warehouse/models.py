@@ -357,7 +357,7 @@ class WarehouseProduct(BaseModelId, BaseModelDate, BaseModelCompanyBranch):
     markup_percent = models.DecimalField(
         "Наценка, %",
         max_digits=12,
-        decimal_places=2,
+        decimal_places=3,
         default=Decimal("0.00"),
     )
 
