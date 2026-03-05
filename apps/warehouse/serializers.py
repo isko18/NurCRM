@@ -601,6 +601,24 @@ class CompanyWarehouseAgentSerializer(serializers.ModelSerializer):
         )
         extra_kwargs = {"company": {"required": True}, "user": {"required": False}, "note": {"required": False, "allow_blank": True}}
 
+    def get_user_display(self, obj):
+        u = getattr(obj, "user", None)
+        if not u:
+            return None
+        if hasattr(u, "get_full_name") and u.get_full_name():
+            return u.get_full_name()
+        return (
+            f"{getattr(u, 'first_name', '')} {getattr(u, 'last_name', '')}".strip()
+            or getattr(u, "email", "")
+            or str(u.id)
+        )
+
+    def get_decided_by_display(self, obj):
+        u = getattr(obj, "decided_by", None)
+        if not u:
+            return None
+        return getattr(u, "email", None) or str(u.id)
+
 
 class CompanyWarehouseAgentCommonAccessUpdateSerializer(serializers.ModelSerializer):
     common_access_enabled = serializers.BooleanField(required=True)
@@ -631,20 +649,6 @@ class CompanyWarehouseAgentCommonAccessUpdateSerializer(serializers.ModelSeriali
                 raise serializers.ValidationError({"common_warehouse": "Склад принадлежит другой компании."})
 
         return attrs
-
-    def get_user_display(self, obj):
-        u = getattr(obj, "user", None)
-        if not u:
-            return None
-        if hasattr(u, "get_full_name") and u.get_full_name():
-            return u.get_full_name()
-        return f"{getattr(u, 'first_name', '')} {getattr(u, 'last_name', '')}".strip() or getattr(u, "email", "") or str(u.id)
-
-    def get_decided_by_display(self, obj):
-        u = getattr(obj, "decided_by", None)
-        if not u:
-            return None
-        return getattr(u, "email", None) or str(u.id)
 
 
 class AgentRequestCartActionSerializer(serializers.Serializer):
