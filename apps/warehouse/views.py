@@ -9,10 +9,11 @@ from django_filters.rest_framework import DjangoFilterBackend
 from django.shortcuts import get_object_or_404
 from decimal import Decimal
 from django.db import IntegrityError, transaction
-from django.db.models import Count, OuterRef, Subquery, Sum, DecimalField, Value as V
+from django.db.models import Count, OuterRef, Subquery, Sum, DecimalField, Value as V, Q
 from django.db.models.functions import Coalesce
 from django.utils import timezone
 from django.contrib.auth import get_user_model
+from rest_framework.pagination import PageNumberPagination
 
 from apps.users.models import Branch
 
@@ -926,6 +927,27 @@ class AgentRequestItemDetailAPIView(CompanyBranchRestrictedMixin, generics.Retri
 
 
 class AgentMyProductsListAPIView(CompanyBranchRestrictedMixin, APIView):
+    """
+    Остатки агента:
+    - при включённом общем доступе (common_access_enabled=true) — остатки общего склада (WarehouseProduct.quantity)
+    - иначе — его персональные остатки (AgentStockBalance)
+    Поддерживает:
+      - ?search=<text> по названию/артикулу/штрихкоду товара
+      - пагинацию PageNumberPagination (?page=, ?page_size=)
+      - order_by=date|-date (как раньше)
+    """
+
+    class _Paginator(PageNumberPagination):
+        page_size_query_param = "page_size"
+
+    pagination_class = _Paginator
+
+    def _paginate_and_respond(self, rows, serializer_class):
+        paginator = self.pagination_class()
+        page = paginator.paginate_queryset(rows, self.request, view=self)
+        ser = serializer_class(page, many=True)
+        return paginator.get_paginated_response(ser.data)
+
     def get(self, request, *args, **kwargs):
         user = request.user
         company = self._company()
@@ -950,6 +972,14 @@ class AgentMyProductsListAPIView(CompanyBranchRestrictedMixin, APIView):
                 .filter(warehouse=wh)
                 .only("id", "name", "article", "unit", "quantity", "warehouse_id", "created_date", "updated_date")
             )
+            # Поиск по товарам общего склада
+            search = (request.query_params.get("search") or "").strip()
+            if search:
+                prod_qs = prod_qs.filter(
+                    Q(name__icontains=search)
+                    | Q(article__icontains=search)
+                    | Q(barcode__icontains=search)
+                )
             order_by = (request.query_params.get("order_by") or "").strip().lower()
             if order_by == "date":
                 prod_qs = prod_qs.order_by("created_date", "id")
@@ -967,7 +997,7 @@ class AgentMyProductsListAPIView(CompanyBranchRestrictedMixin, APIView):
                 )
                 for p in prod_qs
             ]
-            return Response(CommonWarehouseBalanceSerializer(rows, many=True).data)
+            return self._paginate_and_respond(rows, CommonWarehouseBalanceSerializer)
 
         move_subq = m.AgentStockMove.objects.filter(
             agent=OuterRef("agent"),
@@ -981,6 +1011,14 @@ class AgentMyProductsListAPIView(CompanyBranchRestrictedMixin, APIView):
             .annotate(last_movement_at=Subquery(move_subq))
         )
         qs = self._filter_qs_company_branch_relaxed(qs)
+        # Поиск по товарам агента
+        search = (request.query_params.get("search") or "").strip()
+        if search:
+            qs = qs.filter(
+                Q(product__name__icontains=search)
+                | Q(product__article__icontains=search)
+                | Q(product__barcode__icontains=search)
+            )
         order_by = (request.query_params.get("order_by") or "").strip().lower()
         if order_by == "date":
             qs = qs.order_by("last_movement_at", "product__name", "id")
@@ -989,7 +1027,7 @@ class AgentMyProductsListAPIView(CompanyBranchRestrictedMixin, APIView):
         else:
             # по умолчанию — по дате (последнее движение), сначала новые
             qs = qs.order_by("-last_movement_at", "product__name", "id")
-        return Response(AgentStockBalanceSerializer(qs, many=True).data)
+        return self._paginate_and_respond(qs, AgentStockBalanceSerializer)
 
 
 class OwnerAgentsProductsListAPIView(CompanyBranchRestrictedMixin, APIView):

@@ -1,11 +1,20 @@
 
 import django_filters
-from apps.warehouse.models import WarehouseProduct
+from django.db.models import Q
+
+from apps.warehouse.models import (
+    WarehouseProduct,
+    WarehouseProductBrand,
+    WarehouseProductCategory,
+    Warehouse,
+)
 
 class ProductFilter(django_filters.FilterSet):
     # Поиск по имени или артикулу (частичное совпадение)
     name = django_filters.CharFilter(field_name="name", lookup_expr="icontains")
     article = django_filters.CharFilter(field_name="article", lookup_expr="icontains")
+    # Универсальный поиск: name / article / barcode
+    search = django_filters.CharFilter(method="filter_search")
     
     # Фильтрация по диапазону цены
     price_min = django_filters.NumberFilter(field_name="price", lookup_expr="gte")
@@ -20,9 +29,9 @@ class ProductFilter(django_filters.FilterSet):
     markup_max = django_filters.NumberFilter(field_name="markup_percent", lookup_expr="lte")
     
     # FK поля
-    brand = django_filters.ModelChoiceFilter(queryset=WarehouseProduct.objects.all())
-    category = django_filters.ModelChoiceFilter(queryset=WarehouseProduct.objects.all())
-    warehouse = django_filters.ModelChoiceFilter(queryset=WarehouseProduct.objects.all())
+    brand = django_filters.ModelChoiceFilter(queryset=WarehouseProductBrand.objects.all())
+    category = django_filters.ModelChoiceFilter(queryset=WarehouseProductCategory.objects.all())
+    warehouse = django_filters.ModelChoiceFilter(queryset=Warehouse.objects.all())
     product_group = django_filters.UUIDFilter(field_name="product_group_id")
     
     # Прочее
@@ -44,6 +53,7 @@ class ProductFilter(django_filters.FilterSet):
             "stock",
             "name",
             "article",
+            "search",
             "price_min",
             "price_max",
             "purchase_price_min",
@@ -53,3 +63,21 @@ class ProductFilter(django_filters.FilterSet):
             "created_after",
             "created_before",
         ]
+
+    def filter_search(self, queryset, name, value):
+        """
+        Универсальный поиск по товару:
+        - name
+        - article
+        - barcode
+        """
+        if not value:
+            return queryset
+        value = value.strip()
+        if not value:
+            return queryset
+        return queryset.filter(
+            Q(name__icontains=value)
+            | Q(article__icontains=value)
+            | Q(barcode__icontains=value)
+        )
