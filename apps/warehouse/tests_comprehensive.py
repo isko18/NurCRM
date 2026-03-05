@@ -112,11 +112,13 @@ class WarehouseComprehensiveTests(TestCase):
         # Контрагенты
         self.client = models.Counterparty.objects.create(
             name="Клиент 1",
-            type=models.Counterparty.Type.CLIENT
+            phone="+996700000010",
+            type=models.Counterparty.Type.CLIENT,
         )
         self.supplier = models.Counterparty.objects.create(
             name="Поставщик 1",
-            type=models.Counterparty.Type.SUPPLIER
+            phone="+996700000011",
+            type=models.Counterparty.Type.SUPPLIER,
         )
         
         # Очистка кэша перед каждым тестом

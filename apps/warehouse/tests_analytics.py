@@ -65,7 +65,11 @@ class WarehouseAnalyticsByGroupTests(TestCase):
             product_group=None,
         )
 
-        self.client = wm.Counterparty.objects.create(name="Client", type=wm.Counterparty.Type.CLIENT)
+        self.client = wm.Counterparty.objects.create(
+            name="Client",
+            phone="+996700000020",
+            type=wm.Counterparty.Type.CLIENT,
+        )
 
         # Make a posted SALE for the agent with items from different groups
         d = wm.Document.objects.create(
