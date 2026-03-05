@@ -274,7 +274,14 @@ class Appointment(models.Model):
         related_name="appointments",
         verbose_name="Мастер",
     )
-    services = models.ManyToManyField(Service, related_name="appointments", verbose_name="Услуги", null=True, blank=True)
+    services = models.ManyToManyField(
+        Service,
+        through="AppointmentService",
+        through_fields=("appointment", "service"),
+        related_name="appointments",
+        verbose_name="Услуги",
+        blank=True,
+    )
 
     start_at = models.DateTimeField(verbose_name="Начало")
     end_at = models.DateTimeField(verbose_name="Конец")
@@ -348,24 +355,28 @@ class Appointment(models.Model):
                 raise ValidationError({"client": "Клиент принадлежит другому филиалу."})
         # ВАЖНО: услуги НЕ проверяем здесь — M2M ещё не проставлен при create()
 
-# Глобальный валидатор M2M: проверяет услуги при добавлении/замене
-@receiver(m2m_changed, sender=Appointment.services.through)
-def validate_appointment_services(sender, instance: Appointment, action, pk_set, **kwargs):
-    if action not in ('pre_add', 'pre_set') or not pk_set:
-        return
-    svcs = Service.objects.filter(pk__in=pk_set)
 
-    # company
-    if any(s.company_id != instance.company_id for s in svcs):
-        raise DjangoValidationError({'services': 'Услуга принадлежит другой компании.'})
+# Позиция услуги в записи (одна и та же услуга может быть несколько раз — каждая отдельной позицией)
+class AppointmentService(models.Model):
+    appointment = models.ForeignKey(
+        Appointment,
+        on_delete=models.CASCADE,
+        related_name="appointment_services",
+        verbose_name="Запись",
+    )
+    service = models.ForeignKey(
+        Service,
+        on_delete=models.CASCADE,
+        related_name="appointment_service_items",
+        verbose_name="Услуга",
+    )
+    position = models.PositiveIntegerField(default=0, verbose_name="Порядок")
 
-    # branch
-    if instance.branch_id and any(s.branch_id not in (None, instance.branch_id) for s in svcs):
-        raise DjangoValidationError({'services': 'Услуга принадлежит другому филиалу.'})
-
-    def save(self, *args, **kwargs):
-        self.full_clean()
-        return super().save(*args, **kwargs)
+    class Meta:
+        ordering = ["appointment_id", "position"]
+        verbose_name = "Услуга в записи"
+        verbose_name_plural = "Услуги в записи"
+        # без unique_together — одна услуга может быть в записи несколько раз
 
 
 # ===========================

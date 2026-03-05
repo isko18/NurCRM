@@ -6,6 +6,7 @@ from .models import (
     Service,
     Client,
     Appointment,
+    AppointmentService,
     Document,
     Folder,
     ServiceCategory,
@@ -322,6 +323,37 @@ class AppointmentPublicMasterSerializer(serializers.Serializer):
         return full or getattr(obj, "email", "")
 
 
+class AppointmentServicesListField(serializers.Field):
+    """
+    Поле services: массив ID услуг. Повторяющиеся ID — отдельные позиции.
+    Чтение: список ID в порядке позиций (с дубликатами).
+    Запись: список ID — каждая позиция сохраняется отдельно.
+    """
+
+    def to_representation(self, value):
+        # value — queryset appointment_services (through), уже может быть prefetched
+        if hasattr(value, "order_by"):
+            qs = value.order_by("position")
+        else:
+            qs = value or []
+        if hasattr(qs, "values_list"):
+            return list(qs.values_list("service_id", flat=True))
+        return [item.service_id for item in qs]
+
+    def to_internal_value(self, data):
+        if not isinstance(data, list):
+            raise serializers.ValidationError("Ожидается массив ID услуг.")
+        services = []
+        qs = Service.objects.filter(pk__in=data)
+        by_pk = {str(s.pk): s for s in qs}
+        for i, pk in enumerate(data):
+            spk = str(pk) if pk is not None else None
+            if spk not in by_pk:
+                raise serializers.ValidationError(f"Услуга с id {pk} не найдена или недоступна.")
+            services.append(by_pk[spk])
+        return services
+
+
 class AppointmentSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
     company = serializers.ReadOnlyField(source="company.id")
     branch = serializers.ReadOnlyField(source="branch.id")
@@ -329,17 +361,9 @@ class AppointmentSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSeriali
     client_name = serializers.CharField(source="client.full_name", read_only=True)
     barber_name = serializers.SerializerMethodField()
     barber_public = AppointmentPublicMasterSerializer(source="barber", read_only=True)
-    services = serializers.PrimaryKeyRelatedField(
-        queryset=Service.objects.all(),
-        many=True,
-    )
-    services_names = serializers.SlugRelatedField(
-        source='services',
-        many=True,
-        read_only=True,
-        slug_field='name',
-    )
-    services_public = AppointmentPublicServiceSerializer(source="services", many=True, read_only=True)
+    services = AppointmentServicesListField(source="appointment_services", required=False)
+    services_names = serializers.SerializerMethodField()
+    services_public = serializers.SerializerMethodField()
 
     class Meta:
         model = Appointment
@@ -362,17 +386,36 @@ class AppointmentSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSeriali
             return f"{obj.barber.first_name or ''} {obj.barber.last_name or ''}".strip()
         return obj.barber.email
 
+    def get_services_names(self, obj):
+        qs = getattr(obj, "appointment_services", None) or []
+        if hasattr(qs, "order_by"):
+            qs = qs.order_by("position")
+        if hasattr(qs, "select_related"):
+            qs = qs.select_related("service")
+        return [item.service.name for item in qs]
+
+    def get_services_public(self, obj):
+        qs = getattr(obj, "appointment_services", None) or []
+        if hasattr(qs, "order_by"):
+            qs = qs.order_by("position")
+        if hasattr(qs, "select_related"):
+            qs = qs.select_related("service__category")
+        return [AppointmentPublicServiceSerializer(item.service).data for item in qs]
+
     def create(self, validated_data):
         services = validated_data.pop("services", [])
         instance = super().create(validated_data)
-        instance.services.set(services)
+        for position, service in enumerate(services):
+            AppointmentService.objects.create(appointment=instance, service=service, position=position)
         return instance
 
     def update(self, instance, validated_data):
         services = validated_data.pop("services", None)
         instance = super().update(instance, validated_data)
         if services is not None:
-            instance.services.set(services)
+            AppointmentService.objects.filter(appointment=instance).delete()
+            for position, service in enumerate(services):
+                AppointmentService.objects.create(appointment=instance, service=service, position=position)
         return instance
 
     def _parse_minutes(self, s: str) -> int:
@@ -407,10 +450,16 @@ class AppointmentSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSeriali
         company_id = getattr(user_company, "id", None)
         target_branch = self._auto_branch()
 
-        # текущее значение client/barber/services с учётом partial
+        # текущее значение client/barber/services с учётом partial (services — с дубликатами по позициям)
         client = attrs.get("client") or getattr(self.instance, "client", None)
         barber = attrs.get("barber") or getattr(self.instance, "barber", None)
-        services = attrs.get("services") or (self.instance.services.all() if self.instance else [])
+        if attrs.get("services") is not None:
+            services = attrs["services"]
+        elif self.instance:
+            order_qs = self.instance.appointment_services.order_by("position").select_related("service")
+            services = [item.service for item in order_qs]
+        else:
+            services = []
 
         # --- company проверки ---
         for obj, name in [(client, "client"), (barber, "barber")]:
