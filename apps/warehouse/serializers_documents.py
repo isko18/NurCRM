@@ -311,8 +311,11 @@ class CounterpartySerializer(serializers.ModelSerializer):
 
     class Meta:
         model = models.Counterparty
-        fields = ("id", "name", "type", "company", "branch", "agent", "agent_display")
+        fields = ("id", "name", "phone", "type", "company", "branch", "agent", "agent_display")
         read_only_fields = ("id", "company", "branch")
+        extra_kwargs = {
+            "phone": {"required": True},
+        }
 
     def get_agent_display(self, obj):
         u = getattr(obj, "agent", None)

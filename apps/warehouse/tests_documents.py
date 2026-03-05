@@ -36,7 +36,11 @@ class DocumentsTests(TestCase):
 
         doc = models.Document.objects.create(doc_type=models.Document.DocType.SALE, warehouse_from=self.wh, counterparty=None)
         # add required counterparty for sale
-        cp = models.Counterparty.objects.create(name="C1", type=models.Counterparty.Type.CLIENT)
+        cp = models.Counterparty.objects.create(
+            name="C1",
+            phone="+996700000001",
+            type=models.Counterparty.Type.CLIENT,
+        )
         doc.counterparty = cp
         doc.save()
         models.DocumentItem.objects.create(document=doc, product=self.prod, qty=Decimal("3"), price=Decimal("15"))
@@ -72,7 +76,13 @@ class DocumentsTests(TestCase):
 
     def test_reject_cash_request_sets_document_rejected(self):
         models.StockBalance.objects.create(warehouse=self.wh, product=self.prod, qty=Decimal("10.000"))
-        cp = models.Counterparty.objects.create(name="C1", type=models.Counterparty.Type.CLIENT, company=self.company, branch=self.branch)
+        cp = models.Counterparty.objects.create(
+            name="C1",
+            phone="+996700000002",
+            type=models.Counterparty.Type.CLIENT,
+            company=self.company,
+            branch=self.branch,
+        )
         doc = models.Document.objects.create(
             doc_type=models.Document.DocType.SALE,
             warehouse_from=self.wh,
@@ -94,7 +104,13 @@ class DocumentsTests(TestCase):
 
     def test_credit_sale_posts_immediately_and_creates_no_money_request(self):
         models.StockBalance.objects.create(warehouse=self.wh, product=self.prod, qty=Decimal("10.000"))
-        cp = models.Counterparty.objects.create(name="C1", type=models.Counterparty.Type.CLIENT, company=self.company, branch=self.branch)
+        cp = models.Counterparty.objects.create(
+            name="C1",
+            phone="+996700000003",
+            type=models.Counterparty.Type.CLIENT,
+            company=self.company,
+            branch=self.branch,
+        )
         doc = models.Document.objects.create(
             doc_type=models.Document.DocType.SALE,
             warehouse_from=self.wh,
@@ -118,6 +134,7 @@ class DocumentsTests(TestCase):
         models.StockBalance.objects.create(warehouse=self.wh, product=self.prod, qty=Decimal("10.000"))
         cp = models.Counterparty.objects.create(
             name="C1",
+            phone="+996700000004",
             type=models.Counterparty.Type.CLIENT,
             company=self.company,
             branch=self.branch,
@@ -184,7 +201,11 @@ class DocumentsTests(TestCase):
             settings.ALLOW_NEGATIVE_STOCK = False
             models.StockBalance.objects.create(warehouse=self.wh, product=self.prod, qty=Decimal("1.000"))
             doc = models.Document.objects.create(doc_type=models.Document.DocType.SALE, warehouse_from=self.wh)
-            cp = models.Counterparty.objects.create(name="C1", type=models.Counterparty.Type.CLIENT)
+            cp = models.Counterparty.objects.create(
+                name="C1",
+                phone="+996700000005",
+                type=models.Counterparty.Type.CLIENT,
+            )
             doc.counterparty = cp
             doc.save()
             models.DocumentItem.objects.create(document=doc, product=self.prod, qty=Decimal("5"), price=Decimal("0"))
