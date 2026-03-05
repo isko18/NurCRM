@@ -929,44 +929,45 @@ class AgentMyProductsListAPIView(CompanyBranchRestrictedMixin, APIView):
     def get(self, request, *args, **kwargs):
         user = request.user
         company = self._company()
+        # Пытаемся найти настройку общего доступа к складу для агента.
+        # Не ограничиваемся только "текущей" компанией, чтобы работать
+        # даже если у пользователя несколько компаний/ролей.
+        membership_qs = m.CompanyWarehouseAgent.objects.filter(
+            user=user,
+            status=m.CompanyWarehouseAgent.Status.ACTIVE,
+            common_access_enabled=True,
+            common_warehouse__isnull=False,
+        )
+        # Если _company() определена, по возможности предпочитаем её.
         if company is not None:
-            membership = (
-                m.CompanyWarehouseAgent.objects
-                .filter(
-                    company=company,
-                    user=user,
-                    status=m.CompanyWarehouseAgent.Status.ACTIVE,
-                    common_access_enabled=True,
-                    common_warehouse__isnull=False,
-                )
-                .select_related("common_warehouse")
-                .first()
+            membership_qs = membership_qs.filter(company=company)
+
+        membership = membership_qs.select_related("common_warehouse").first()
+        if membership and membership.common_warehouse_id:
+            wh = membership.common_warehouse
+            prod_qs = (
+                m.WarehouseProduct.objects
+                .filter(warehouse=wh)
+                .only("id", "name", "article", "unit", "quantity", "warehouse_id", "created_date", "updated_date")
             )
-            if membership and membership.common_warehouse_id:
-                wh = membership.common_warehouse
-                prod_qs = (
-                    m.WarehouseProduct.objects
-                    .filter(warehouse=wh)
-                    .only("id", "name", "article", "unit", "quantity", "warehouse_id", "created_date", "updated_date")
+            order_by = (request.query_params.get("order_by") or "").strip().lower()
+            if order_by == "date":
+                prod_qs = prod_qs.order_by("created_date", "id")
+            elif order_by == "-date":
+                prod_qs = prod_qs.order_by("-created_date", "-id")
+            else:
+                # по умолчанию — по дате создания (сначала новые)
+                prod_qs = prod_qs.order_by("-created_date", "id")
+            prod_qs = self._filter_qs_company_branch_relaxed(prod_qs)
+            rows = [
+                CommonWarehouseBalanceSerializer.make_row(
+                    agent_id=user.id,
+                    warehouse_id=wh.id,
+                    product=p,
                 )
-                order_by = (request.query_params.get("order_by") or "").strip().lower()
-                if order_by == "date":
-                    prod_qs = prod_qs.order_by("created_date", "id")
-                elif order_by == "-date":
-                    prod_qs = prod_qs.order_by("-created_date", "-id")
-                else:
-                    # по умолчанию — по дате создания (сначала новые)
-                    prod_qs = prod_qs.order_by("-created_date", "id")
-                prod_qs = self._filter_qs_company_branch_relaxed(prod_qs)
-                rows = [
-                    CommonWarehouseBalanceSerializer.make_row(
-                        agent_id=user.id,
-                        warehouse_id=wh.id,
-                        product=p,
-                    )
-                    for p in prod_qs
-                ]
-                return Response(CommonWarehouseBalanceSerializer(rows, many=True).data)
+                for p in prod_qs
+            ]
+            return Response(CommonWarehouseBalanceSerializer(rows, many=True).data)
 
         move_subq = m.AgentStockMove.objects.filter(
             agent=OuterRef("agent"),
