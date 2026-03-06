@@ -398,7 +398,9 @@ class ResidentialComplexApartmentListCreateView(CompanyQuerysetMixin, generics.L
 
     permission_classes = [permissions.IsAuthenticated]
     serializer_class = ResidentialComplexApartmentSerializer
-    queryset = ResidentialComplexApartment.objects.select_related("residential_complex")
+    queryset = ResidentialComplexApartment.objects.select_related("residential_complex").prefetch_related(
+        "treaties__client"
+    )
     filter_backends = [DjangoFilterBackend, filters.SearchFilter]
     filterset_fields = ["residential_complex", "floor", "status"]
     search_fields = ["number", "notes"]
@@ -438,7 +440,9 @@ class ResidentialComplexApartmentDetailView(CompanyQuerysetMixin, generics.Retri
 
     permission_classes = [permissions.IsAuthenticated]
     serializer_class = ResidentialComplexApartmentSerializer
-    queryset = ResidentialComplexApartment.objects.select_related("residential_complex")
+    queryset = ResidentialComplexApartment.objects.select_related("residential_complex").prefetch_related(
+        "treaties__client"
+    )
 
     def get_queryset(self):
         user = self.request.user
