@@ -970,7 +970,7 @@ class AgentMyProductsListAPIView(CompanyBranchRestrictedMixin, APIView):
             prod_qs = (
                 m.WarehouseProduct.objects
                 .filter(warehouse=wh)
-                .only("id", "name", "article", "unit", "quantity", "warehouse_id", "created_date", "updated_date")
+                .only("id", "name", "article", "unit", "price", "quantity", "warehouse_id", "created_date", "updated_date")
             )
             # Поиск по товарам общего склада
             search = (request.query_params.get("search") or "").strip()

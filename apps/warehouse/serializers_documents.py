@@ -287,9 +287,12 @@ class TransferCreateSerializer(serializers.Serializer):
 
 
 class ProductSimpleSerializer(serializers.ModelSerializer):
+    group = serializers.UUIDField(source="group.id", read_only=True)
+    group_name = serializers.CharField(source="group.name", read_only=True)
+
     class Meta:
         model = models.WarehouseProduct
-        fields = ("id", "name", "article", "barcode", "unit", "quantity")
+        fields = ("id", "name", "article", "barcode", "unit", "quantity", "group", "group_name")
 
 
 class WarehouseSimpleSerializer(serializers.ModelSerializer):
