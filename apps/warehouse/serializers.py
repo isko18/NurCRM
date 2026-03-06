@@ -675,6 +675,7 @@ class AgentStockBalanceSerializer(serializers.ModelSerializer):
     product_name = serializers.CharField(source="product.name", read_only=True)
     product_article = serializers.CharField(source="product.article", read_only=True)
     product_unit = serializers.CharField(source="product.unit", read_only=True)
+    product_price = serializers.DecimalField(source="product.price", max_digits=18, decimal_places=3, read_only=True)
     agent_display = serializers.SerializerMethodField()
     last_movement_at = serializers.DateTimeField(read_only=True, allow_null=True)
 
@@ -689,6 +690,7 @@ class AgentStockBalanceSerializer(serializers.ModelSerializer):
             "product_name",
             "product_article",
             "product_unit",
+            "product_price",
             "qty",
             "last_movement_at",
         )
@@ -724,6 +726,7 @@ class CommonWarehouseBalanceSerializer(serializers.Serializer):
     product_name = serializers.CharField()
     product_article = serializers.CharField(allow_null=True, required=False)
     product_unit = serializers.CharField()
+    product_price = serializers.DecimalField(max_digits=18, decimal_places=3)
     qty = serializers.DecimalField(max_digits=18, decimal_places=3)
     created_date = serializers.DateTimeField(allow_null=True, required=False)
     updated_date = serializers.DateTimeField(allow_null=True, required=False)
@@ -742,6 +745,7 @@ class CommonWarehouseBalanceSerializer(serializers.Serializer):
             "product_name": product.name,
             "product_article": getattr(product, "article", None),
             "product_unit": getattr(product, "unit", "") or "",
+            "product_price": getattr(product, "price", None) or Decimal("0.000"),
             "qty": getattr(product, "quantity", None) or Decimal("0.000"),
             "created_date": getattr(product, "created_date", None),
             "updated_date": getattr(product, "updated_date", None),

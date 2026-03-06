@@ -908,12 +908,13 @@ Read-only поля:
   "product_name": "string",
   "product_article": "string|null",
   "product_unit": "string",
+  "product_price": "100.000",
   "qty": "5.000",
   "last_movement_at": "2026-03-04T12:00:00Z|null"
 }
 ```
 
-Ответ при доступе к общему товару склада (режим common_access): те же поля, плюс вместо `last_movement_at` — поля дат товара:
+Ответ при доступе к общему товару склада (режим common_access): формат тот же (`product_price` берётся из `WarehouseProduct.price`), плюс вместо `last_movement_at` — поля дат товара:
 - `created_date` — дата создания товара (ISO datetime или null)
 - `updated_date` — дата обновления товара (ISO datetime или null)
 

@@ -451,7 +451,7 @@ class ProductListCreateView(CompanyBranchRestrictedMixin, generics.ListCreateAPI
     def get_queryset(self):
         # Оптимизация: предзагружаем связанные объекты
         qs = models.WarehouseProduct.objects.select_related(
-            "warehouse", "brand", "category", "company", "branch"
+            "warehouse", "brand", "category", "company", "branch", "group"
         )
         qs = self._filter_qs_company_branch(qs)
         
