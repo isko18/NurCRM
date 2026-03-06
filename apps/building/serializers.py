@@ -178,7 +178,7 @@ class ResidentialComplexWarehouseSerializer(serializers.ModelSerializer):
 
 class ResidentialComplexApartmentSerializer(serializers.ModelSerializer):
     residential_complex_name = serializers.CharField(source="residential_complex.name", read_only=True)
-     client_id = serializers.SerializerMethodField(read_only=True)
+    client_id = serializers.SerializerMethodField(read_only=True)
 
     class Meta:
         model = ResidentialComplexApartment
