@@ -178,6 +178,7 @@ class ResidentialComplexWarehouseSerializer(serializers.ModelSerializer):
 
 class ResidentialComplexApartmentSerializer(serializers.ModelSerializer):
     residential_complex_name = serializers.CharField(source="residential_complex.name", read_only=True)
+     client_id = serializers.SerializerMethodField(read_only=True)
 
     class Meta:
         model = ResidentialComplexApartment
@@ -194,8 +195,25 @@ class ResidentialComplexApartmentSerializer(serializers.ModelSerializer):
             "notes",
             "created_at",
             "updated_at",
+            "client_id",
         ]
-        read_only_fields = ["id", "created_at", "updated_at", "residential_complex_name"]
+        read_only_fields = ["id", "created_at", "updated_at", "residential_complex_name", "client_id"]
+
+    def get_client_id(self, obj):
+        # Определяем клиента по последнему договору по этой квартире (если есть).
+        treaty = None
+
+        # Если prefetch_related уже подтянул treaties, используем их, чтобы избежать доп. запросов.
+        rel = getattr(obj, "treaties", None)
+        if hasattr(rel, "all"):
+            treaty = rel.order_by("-created_at").first()
+        else:
+            treaty = BuildingTreaty.objects.filter(apartment_id=obj.id).order_by("-created_at").first()
+
+        client = getattr(treaty, "client", None) if treaty else None
+        if not client:
+            return None
+        return str(getattr(client, "id", None)) or None
 
 
 class BuildingProductSerializer(serializers.ModelSerializer):
