@@ -21,6 +21,7 @@ from .models import (
     BuildingTreatyFile,
     BuildingWorkEntry,
     BuildingWorkEntryPhoto,
+    BuildingWorkEntryFile,
     BuildingTask,
     BuildingTaskAssignee,
     BuildingTaskChecklistItem,
@@ -205,13 +206,19 @@ class BuildingWorkEntryPhotoInline(admin.TabularInline):
     readonly_fields = ("id", "created_at")
 
 
+class BuildingWorkEntryFileInline(admin.TabularInline):
+    model = BuildingWorkEntryFile
+    extra = 0
+    readonly_fields = ("id", "created_at")
+
+
 @admin.register(BuildingWorkEntry)
 class BuildingWorkEntryAdmin(admin.ModelAdmin):
     list_display = ("id", "residential_complex", "category", "title", "created_by", "occurred_at", "created_at")
     list_filter = ("category", "residential_complex__company")
     search_fields = ("title", "description", "residential_complex__name")
     readonly_fields = ("id", "created_at", "updated_at")
-    inlines = [BuildingWorkEntryPhotoInline]
+    inlines = [BuildingWorkEntryPhotoInline, BuildingWorkEntryFileInline]
 
 
 @admin.register(BuildingWorkEntryPhoto)
@@ -219,6 +226,14 @@ class BuildingWorkEntryPhotoAdmin(admin.ModelAdmin):
     list_display = ("id", "entry", "caption", "created_by", "created_at")
     list_filter = ("entry__residential_complex__company", "created_at")
     search_fields = ("caption", "image", "entry__title")
+    readonly_fields = ("id", "created_at")
+
+
+@admin.register(BuildingWorkEntryFile)
+class BuildingWorkEntryFileAdmin(admin.ModelAdmin):
+    list_display = ("id", "entry", "title", "created_by", "created_at")
+    list_filter = ("entry__residential_complex__company", "created_at")
+    search_fields = ("title", "entry__title")
     readonly_fields = ("id", "created_at")
 
 

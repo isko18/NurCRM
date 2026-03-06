@@ -1058,6 +1058,44 @@ class BuildingWorkEntryPhoto(models.Model):
         return self.caption or str(getattr(self.image, "name", "")) or str(self.id)
 
 
+def building_work_entry_file_upload_to(instance, filename: str) -> str:
+    ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else "bin"
+    return f"building/work-entries/{instance.entry_id}/files/{uuid.uuid4().hex}.{ext}"
+
+
+class BuildingWorkEntryFile(models.Model):
+    """Файл (документ), прикреплённый к записи процесса работ."""
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False, verbose_name="ID")
+    entry = models.ForeignKey(
+        BuildingWorkEntry,
+        on_delete=models.CASCADE,
+        related_name="files",
+        verbose_name="Запись процесса работ",
+    )
+    title = models.CharField(max_length=255, blank=True, verbose_name="Название файла")
+    file = models.FileField(upload_to=building_work_entry_file_upload_to, verbose_name="Файл")
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="building_work_entry_files_created",
+        verbose_name="Кто загрузил",
+    )
+    created_at = models.DateTimeField(auto_now_add=True, verbose_name="Дата загрузки")
+
+    class Meta:
+        verbose_name = "Файл процесса работ"
+        verbose_name_plural = "Файлы процесса работ"
+        ordering = ["-created_at"]
+        indexes = [
+            models.Index(fields=["entry", "created_at"]),
+        ]
+
+    def __str__(self):
+        return self.title or str(getattr(self.file, "name", "")) or str(self.id)
+
+
 class BuildingTask(models.Model):
     """
     Напоминание/задача внутри компании (Building).

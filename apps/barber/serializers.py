@@ -341,17 +341,18 @@ class AppointmentServicesListField(serializers.Field):
         return [item.service_id for item in qs]
 
     def to_internal_value(self, data):
+        """Возвращаем список ID (не объекты Service), чтобы в модель не попадали Service при create/update."""
         if not isinstance(data, list):
             raise serializers.ValidationError("Ожидается массив ID услуг.")
-        services = []
         qs = Service.objects.filter(pk__in=data)
-        by_pk = {str(s.pk): s for s in qs}
-        for i, pk in enumerate(data):
+        by_pk = {str(s.pk): s.pk for s in qs}
+        ids = []
+        for pk in data:
             spk = str(pk) if pk is not None else None
             if spk not in by_pk:
                 raise serializers.ValidationError(f"Услуга с id {pk} не найдена или недоступна.")
-            services.append(by_pk[spk])
-        return services
+            ids.append(by_pk[spk])
+        return ids
 
 
 class AppointmentSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
@@ -403,19 +404,29 @@ class AppointmentSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSeriali
         return [AppointmentPublicServiceSerializer(item.service).data for item in qs]
 
     def create(self, validated_data):
-        services = validated_data.pop("services", [])
+        service_ids = validated_data.pop("services", [])
+        validated_data.pop("appointment_services", None)
         instance = super().create(validated_data)
-        for position, service in enumerate(services):
-            AppointmentService.objects.create(appointment=instance, service=service, position=position)
+        if service_ids:
+            by_pk = {str(s.pk): s for s in Service.objects.filter(pk__in=service_ids)}
+            for position, sid in enumerate(service_ids):
+                service = by_pk.get(str(sid))
+                if service:
+                    AppointmentService.objects.create(appointment=instance, service=service, position=position)
         return instance
 
     def update(self, instance, validated_data):
-        services = validated_data.pop("services", None)
+        service_ids = validated_data.pop("services", None)
+        validated_data.pop("appointment_services", None)
         instance = super().update(instance, validated_data)
-        if services is not None:
+        if service_ids is not None:
             AppointmentService.objects.filter(appointment=instance).delete()
-            for position, service in enumerate(services):
-                AppointmentService.objects.create(appointment=instance, service=service, position=position)
+            if service_ids:
+                by_pk = {str(s.pk): s for s in Service.objects.filter(pk__in=service_ids)}
+                for position, sid in enumerate(service_ids):
+                    service = by_pk.get(str(sid))
+                    if service:
+                        AppointmentService.objects.create(appointment=instance, service=service, position=position)
         return instance
 
     def _parse_minutes(self, s: str) -> int:
@@ -450,11 +461,14 @@ class AppointmentSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSeriali
         company_id = getattr(user_company, "id", None)
         target_branch = self._auto_branch()
 
-        # текущее значение client/barber/services с учётом partial (services — с дубликатами по позициям)
+        # текущее значение client/barber/services с учётом partial (services в attrs — список ID; для проверок нужны объекты Service)
         client = attrs.get("client") or getattr(self.instance, "client", None)
         barber = attrs.get("barber") or getattr(self.instance, "barber", None)
         if attrs.get("services") is not None:
-            services = attrs["services"]
+            service_ids = attrs["services"]
+            services = list(Service.objects.filter(pk__in=service_ids)) if service_ids else []
+            by_pk = {str(s.pk): s for s in services}
+            services = [by_pk[str(sid)] for sid in service_ids if str(sid) in by_pk]
         elif self.instance:
             order_qs = self.instance.appointment_services.order_by("position").select_related("service")
             services = [item.service for item in order_qs]

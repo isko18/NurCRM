@@ -36,6 +36,7 @@ from .views import (
     BuildingWorkEntryListCreateView,
     BuildingWorkEntryDetailView,
     BuildingWorkEntryPhotoAddView,
+    BuildingWorkEntryFileAddView,
     BuildingClientListCreateView,
     BuildingClientDetailView,
     BuildingTreatyListCreateView,
@@ -107,6 +108,7 @@ urlpatterns = [
     path("work-entries/", BuildingWorkEntryListCreateView.as_view(), name="building-work-entry-list-create"),
     path("work-entries/<uuid:pk>/", BuildingWorkEntryDetailView.as_view(), name="building-work-entry-detail"),
     path("work-entries/<uuid:pk>/photos/", BuildingWorkEntryPhotoAddView.as_view(), name="building-work-entry-photo-add"),
+    path("work-entries/<uuid:pk>/files/", BuildingWorkEntryFileAddView.as_view(), name="building-work-entry-file-add"),
 
     # clients
     path("clients/", BuildingClientListCreateView.as_view(), name="building-client-list-create"),

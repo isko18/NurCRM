@@ -29,6 +29,7 @@ from .models import (
     BuildingTreatyFile,
     BuildingWorkEntry,
     BuildingWorkEntryPhoto,
+    BuildingWorkEntryFile,
     BuildingTask,
     BuildingTaskAssignee,
     BuildingTaskChecklistItem,
@@ -486,7 +487,7 @@ class BuildingClientDetailSerializer(BuildingClientSerializer):
         request = self.context.get("request")
         user = getattr(request, "user", None) if request else None
         if user and getattr(user, "is_authenticated", False) and not getattr(user, "is_superuser", False):
-            # если у сотрудника есть назначения на ЖК — показываем договора только по этим ЖК
+            # сотрудник (не owner/admin): только договора по назначенным ЖК; без назначений — ничего
             if getattr(user, "role", None) not in ("owner", "admin") and not getattr(user, "owned_company_id", None):
                 allowed = ResidentialComplexMember.objects.filter(
                     user_id=getattr(user, "id", None),
@@ -494,8 +495,7 @@ class BuildingClientDetailSerializer(BuildingClientSerializer):
                     residential_complex__company_id=getattr(user, "company_id", None),
                 ).values_list("residential_complex_id", flat=True)
                 allowed_ids = list(allowed)
-                if allowed_ids:
-                    qs = qs.filter(residential_complex_id__in=allowed_ids)
+                qs = qs.filter(residential_complex_id__in=allowed_ids)
 
         return BuildingTreatySerializer(qs, many=True, context=self.context).data
 
@@ -1215,12 +1215,29 @@ class BuildingWorkEntryPhotoSerializer(serializers.ModelSerializer):
         return request.build_absolute_uri(url) if request else url
 
 
+class BuildingWorkEntryFileSerializer(serializers.ModelSerializer):
+    file_url = serializers.SerializerMethodField(read_only=True)
+
+    class Meta:
+        model = BuildingWorkEntryFile
+        fields = ["id", "entry", "title", "file", "file_url", "created_by", "created_at"]
+        read_only_fields = ["id", "created_by", "created_at", "file_url"]
+
+    def get_file_url(self, obj):
+        request = self.context.get("request")
+        if not getattr(obj, "file", None):
+            return None
+        url = obj.file.url
+        return request.build_absolute_uri(url) if request else url
+
+
 class BuildingWorkEntrySerializer(serializers.ModelSerializer):
     residential_complex_name = serializers.CharField(source="residential_complex.name", read_only=True)
     client_name = serializers.CharField(source="client.name", read_only=True)
     treaty_number = serializers.CharField(source="treaty.number", read_only=True)
     created_by_display = serializers.SerializerMethodField()
     photos = BuildingWorkEntryPhotoSerializer(many=True, read_only=True)
+    files = BuildingWorkEntryFileSerializer(many=True, read_only=True)
 
     class Meta:
         model = BuildingWorkEntry
@@ -1241,8 +1258,9 @@ class BuildingWorkEntrySerializer(serializers.ModelSerializer):
             "created_at",
             "updated_at",
             "photos",
+            "files",
         ]
-        read_only_fields = ["id", "created_by", "created_by_display", "created_at", "updated_at", "photos"]
+        read_only_fields = ["id", "created_by", "created_by_display", "created_at", "updated_at", "photos", "files"]
 
     def get_created_by_display(self, obj):
         user = getattr(obj, "created_by", None)
@@ -1255,6 +1273,11 @@ class BuildingWorkEntrySerializer(serializers.ModelSerializer):
 class BuildingWorkEntryPhotoCreateSerializer(serializers.Serializer):
     image = serializers.ImageField(required=True)
     caption = serializers.CharField(required=False, allow_blank=True)
+
+
+class BuildingWorkEntryFileCreateSerializer(serializers.Serializer):
+    file = serializers.FileField(required=True)
+    title = serializers.CharField(required=False, allow_blank=True)
 
 
 class BuildingPurchaseDocumentItemSerializer(serializers.ModelSerializer):
