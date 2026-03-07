@@ -1,7 +1,6 @@
 from django.contrib import admin
 from .models import (
     BuildingCashbox,
-    BuildingCashShift,
     BuildingCashFlow,
     ResidentialComplex,
     ResidentialComplexMember,
@@ -44,17 +43,9 @@ class BuildingCashboxAdmin(admin.ModelAdmin):
     readonly_fields = ("id", "created_at", "updated_at")
 
 
-@admin.register(BuildingCashShift)
-class BuildingCashShiftAdmin(admin.ModelAdmin):
-    list_display = ("cashbox", "cashier", "status", "opened_at", "closed_at", "opening_cash", "closing_cash")
-    list_filter = ("status", "cashbox__company")
-    search_fields = ("cashier__email", "cashbox__name")
-    readonly_fields = ("id", "opened_at", "closed_at")
-
-
 @admin.register(BuildingCashFlow)
 class BuildingCashFlowAdmin(admin.ModelAdmin):
-    list_display = ("cashbox", "type", "name", "amount", "status", "created_at", "shift", "cashier")
+    list_display = ("cashbox", "type", "name", "amount", "status", "created_at", "cashier")
     list_filter = ("type", "status", "cashbox__company")
     search_fields = ("name",)
     readonly_fields = ("id", "created_at")
