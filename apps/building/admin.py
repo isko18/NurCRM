@@ -1,5 +1,7 @@
 from django.contrib import admin
 from .models import (
+    BuildingCashbox,
+    BuildingCashFlow,
     ResidentialComplex,
     ResidentialComplexMember,
     ResidentialComplexDrawing,
@@ -31,6 +33,22 @@ from .models import (
     BuildingPayrollAdjustment,
     BuildingPayrollPayment,
 )
+
+
+@admin.register(BuildingCashbox)
+class BuildingCashboxAdmin(admin.ModelAdmin):
+    list_display = ("name", "company", "branch", "created_at")
+    list_filter = ("company", "branch")
+    search_fields = ("name",)
+    readonly_fields = ("id", "created_at", "updated_at")
+
+
+@admin.register(BuildingCashFlow)
+class BuildingCashFlowAdmin(admin.ModelAdmin):
+    list_display = ("cashbox", "type", "name", "amount", "status", "created_at", "cashier")
+    list_filter = ("type", "status", "cashbox__company")
+    search_fields = ("name",)
+    readonly_fields = ("id", "created_at")
 
 
 @admin.register(ResidentialComplex)

@@ -8,6 +8,8 @@ from django.contrib.auth import get_user_model
 from django.utils import timezone
 
 from .models import (
+    BuildingCashbox,
+    BuildingCashFlow,
     ResidentialComplex,
     ResidentialComplexMember,
     ResidentialComplexDrawing,
@@ -797,7 +799,6 @@ class BuildingTreatyInstallmentSerializer(serializers.ModelSerializer):
 class BuildingTreatyInstallmentPaymentCreateSerializer(serializers.Serializer):
     amount = serializers.DecimalField(max_digits=16, decimal_places=2)
     cashbox = serializers.UUIDField(required=True)
-    shift = serializers.UUIDField(required=False, allow_null=True)
     paid_at = serializers.DateTimeField(required=False)
 
 
@@ -1057,7 +1058,6 @@ class BuildingPayrollPaymentSerializer(serializers.ModelSerializer):
             "paid_by",
             "paid_by_display",
             "cashbox",
-            "shift",
             "cashflow",
             "advance_adjustment",
             "status",
@@ -1210,14 +1210,12 @@ class BuildingPayrollAdjustmentCreateSerializer(serializers.Serializer):
     comment = serializers.CharField(required=False, allow_blank=True)
     amount = serializers.DecimalField(max_digits=16, decimal_places=2)
     cashbox = serializers.UUIDField(required=False, allow_null=True)
-    shift = serializers.UUIDField(required=False, allow_null=True)
     paid_at = serializers.DateTimeField(required=False, allow_null=True)
 
 
 class BuildingPayrollPaymentCreateSerializer(serializers.Serializer):
     amount = serializers.DecimalField(max_digits=16, decimal_places=2)
     cashbox = serializers.UUIDField(required=True)
-    shift = serializers.UUIDField(required=False, allow_null=True)
     paid_at = serializers.DateTimeField(required=False)
 
 
@@ -1423,3 +1421,101 @@ class BuildingPurchaseDocumentSerializer(serializers.ModelSerializer):
                     )
                 instance.recalculate_totals()
         return instance
+
+
+# -----------------------
+# Building Cash (касса Building)
+# -----------------------
+
+
+class BuildingCashboxSerializer(serializers.ModelSerializer):
+    """Сериализатор кассы Building."""
+
+    class Meta:
+        model = BuildingCashbox
+        fields = ["id", "company", "branch", "name", "created_at", "updated_at"]
+        read_only_fields = ["id", "company", "created_at", "updated_at"]
+
+
+class BuildingCashFlowSerializer(serializers.ModelSerializer):
+    """Движение по кассе Building."""
+
+    cashbox = serializers.PrimaryKeyRelatedField(queryset=BuildingCashbox.objects.none(), required=True)
+    cashbox_name = serializers.SerializerMethodField()
+    cashier_display = serializers.SerializerMethodField()
+
+    class Meta:
+        model = BuildingCashFlow
+        fields = [
+            "id",
+            "company",
+            "branch",
+            "cashbox",
+            "cashbox_name",
+            "type",
+            "name",
+            "amount",
+            "created_at",
+            "status",
+            "source_business_operation_id",
+            "cashier",
+            "cashier_display",
+        ]
+        read_only_fields = [
+            "id",
+            "created_at",
+            "cashbox_name",
+            "company",
+            "branch",
+            "cashier",
+            "cashier_display",
+        ]
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        request = self.context.get("request")
+        if not request:
+            return
+        user = getattr(request, "user", None)
+        company_id = getattr(user, "company_id", None)
+        if not company_id:
+            return
+        self.fields["cashbox"].queryset = BuildingCashbox.objects.filter(company_id=company_id)
+
+    def create(self, validated_data):
+        cashbox = validated_data.get("cashbox")
+        if cashbox:
+            validated_data["company"] = cashbox.company
+            validated_data["branch"] = cashbox.branch
+        return super().create(validated_data)
+
+    def get_cashbox_name(self, obj):
+        if obj.cashbox and obj.cashbox.branch:
+            return f"Касса Building филиала {obj.cashbox.branch.name}"
+        return getattr(obj.cashbox, "name", None) or "Касса Building"
+
+    def get_cashier_display(self, obj):
+        u = getattr(obj, "cashier", None)
+        if not u:
+            return None
+        return (
+            getattr(u, "get_full_name", lambda: "")()
+            or getattr(u, "email", None)
+            or getattr(u, "username", None)
+        )
+
+
+class BuildingCashFlowBulkStatusItemSerializer(serializers.Serializer):
+    id = serializers.UUIDField()
+    status = serializers.ChoiceField(choices=BuildingCashFlow.Status.choices)
+
+
+class BuildingCashFlowBulkStatusSerializer(serializers.Serializer):
+    items = BuildingCashFlowBulkStatusItemSerializer(many=True)
+
+    def validate_items(self, items):
+        if not items:
+            raise serializers.ValidationError("Пустой список.")
+        if len(items) > 50000:
+            raise serializers.ValidationError("Слишком много. Максимум 50 000 за раз.")
+        return items

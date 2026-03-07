@@ -1,6 +1,11 @@
 from django.urls import path
 
 from .views import (
+    BuildingCashboxListCreateView,
+    BuildingCashboxDetailView,
+    BuildingCashFlowListCreateView,
+    BuildingCashFlowDetailView,
+    BuildingCashFlowBulkStatusUpdateView,
     ResidentialComplexListCreateView,
     ResidentialComplexDetailView,
     ResidentialComplexFloorsView,
@@ -64,6 +69,13 @@ from .views import (
 app_name = "building"
 
 urlpatterns = [
+    # Касса Building (своя система)
+    path("cashboxes/", BuildingCashboxListCreateView.as_view(), name="building-cashbox-list-create"),
+    path("cashboxes/<uuid:pk>/", BuildingCashboxDetailView.as_view(), name="building-cashbox-detail"),
+    path("cash/flows/", BuildingCashFlowListCreateView.as_view(), name="building-cash-flow-list-create"),
+    path("cash/flows/<uuid:pk>/", BuildingCashFlowDetailView.as_view(), name="building-cash-flow-detail"),
+    path("cash/flows/bulk/status/", BuildingCashFlowBulkStatusUpdateView.as_view(), name="building-cash-flow-bulk-status"),
+
     path("objects/", ResidentialComplexListCreateView.as_view(), name="residential-complex-list-create"),
     path("objects/<uuid:pk>/", ResidentialComplexDetailView.as_view(), name="residential-complex-detail"),
     path("objects/<uuid:pk>/floors/", ResidentialComplexFloorsView.as_view(), name="residential-complex-floors"),
