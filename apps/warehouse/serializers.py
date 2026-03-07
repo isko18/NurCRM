@@ -676,6 +676,10 @@ class AgentStockBalanceSerializer(serializers.ModelSerializer):
     product_article = serializers.CharField(source="product.article", read_only=True)
     product_unit = serializers.CharField(source="product.unit", read_only=True)
     product_price = serializers.DecimalField(source="product.price", max_digits=18, decimal_places=3, read_only=True)
+    product_group = serializers.SerializerMethodField()
+    product_group_name = serializers.SerializerMethodField()
+    product_category = serializers.SerializerMethodField()
+    product_category_name = serializers.SerializerMethodField()
     agent_display = serializers.SerializerMethodField()
     last_movement_at = serializers.DateTimeField(read_only=True, allow_null=True)
 
@@ -691,10 +695,42 @@ class AgentStockBalanceSerializer(serializers.ModelSerializer):
             "product_article",
             "product_unit",
             "product_price",
+            "product_group",
+            "product_group_name",
+            "product_category",
+            "product_category_name",
             "qty",
             "last_movement_at",
         )
         read_only_fields = fields
+
+    def _get_product_group(self, product):
+        if not product:
+            return None, None
+        group = getattr(product, "product_group", None)
+        if group is None:
+            return None, None
+        return str(group.id), getattr(group, "name", "") or ""
+
+    def _get_product_category(self, product):
+        if not product:
+            return None, None
+        cat = getattr(product, "category", None)
+        if cat is None:
+            return None, None
+        return str(cat.id), getattr(cat, "name", "") or ""
+
+    def get_product_group(self, obj):
+        return self._get_product_group(getattr(obj, "product", None))[0]
+
+    def get_product_group_name(self, obj):
+        return self._get_product_group(getattr(obj, "product", None))[1]
+
+    def get_product_category(self, obj):
+        return self._get_product_category(getattr(obj, "product", None))[0]
+
+    def get_product_category_name(self, obj):
+        return self._get_product_category(getattr(obj, "product", None))[1]
 
     def get_agent_display(self, obj):
         agent = getattr(obj, "agent", None)
@@ -727,6 +763,10 @@ class CommonWarehouseBalanceSerializer(serializers.Serializer):
     product_article = serializers.CharField(allow_null=True, required=False)
     product_unit = serializers.CharField()
     product_price = serializers.DecimalField(max_digits=18, decimal_places=3)
+    product_group = serializers.UUIDField(allow_null=True, required=False)
+    product_group_name = serializers.CharField(allow_null=True, required=False)
+    product_category = serializers.UUIDField(allow_null=True, required=False)
+    product_category_name = serializers.CharField(allow_null=True, required=False)
     qty = serializers.DecimalField(max_digits=18, decimal_places=3)
     created_date = serializers.DateTimeField(allow_null=True, required=False)
     updated_date = serializers.DateTimeField(allow_null=True, required=False)
@@ -737,6 +777,8 @@ class CommonWarehouseBalanceSerializer(serializers.Serializer):
             uuid.NAMESPACE_URL,
             f"nurcrm:common_stock:{warehouse_id}:{product.id}",
         )
+        product_group = getattr(product, "product_group", None)
+        category = getattr(product, "category", None)
         return {
             "id": sid,
             "agent": agent_id,
@@ -746,6 +788,10 @@ class CommonWarehouseBalanceSerializer(serializers.Serializer):
             "product_article": getattr(product, "article", None),
             "product_unit": getattr(product, "unit", "") or "",
             "product_price": getattr(product, "price", None) or Decimal("0.000"),
+            "product_group": product_group.id if product_group else None,
+            "product_group_name": (getattr(product_group, "name", "") or "") if product_group else None,
+            "product_category": category.id if category else None,
+            "product_category_name": (getattr(category, "name", "") or "") if category else None,
             "qty": getattr(product, "quantity", None) or Decimal("0.000"),
             "created_date": getattr(product, "created_date", None),
             "updated_date": getattr(product, "updated_date", None),

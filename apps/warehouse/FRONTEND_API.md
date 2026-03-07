@@ -909,10 +909,15 @@ Read-only поля:
   "product_article": "string|null",
   "product_unit": "string",
   "product_price": "100.000",
+  "product_group": "uuid|null",
+  "product_group_name": "string|null",
+  "product_category": "uuid|null",
+  "product_category_name": "string|null",
   "qty": "5.000",
   "last_movement_at": "2026-03-04T12:00:00Z|null"
 }
 ```
+Поля `product_group` / `product_group_name` и `product_category` / `product_category_name` — группа и категория товара (для отображения по папкам).
 
 Ответ при доступе к общему товару склада (режим common_access): формат тот же (`product_price` берётся из `WarehouseProduct.price`), плюс вместо `last_movement_at` — поля дат товара:
 - `created_date` — дата создания товара (ISO datetime или null)

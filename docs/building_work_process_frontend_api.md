@@ -282,6 +282,57 @@
 Автогенерация номера:
 - поле `number` можно не передавать — номер сгенерируется автоматически в формате `ДГ-000001` (по компании).
 
+### 4.0) Поля договора в ответе (продажа/бронь)
+
+Эндпоинты `GET /treaties/` и `GET /treaties/{id}/` возвращают один и тот же формат объекта договора как для продажи (`operation_type=sale`), так и для брони (`operation_type=booking`):
+
+- **Идентификаторы и связи**
+  - `id` — UUID договора
+  - `residential_complex` — UUID ЖК
+  - `residential_complex_name` — название ЖК (string, только для чтения)
+  - `client` — UUID клиента (может быть `null`)
+  - `client_name` — имя клиента (string, только для чтения)
+  - `apartment` — UUID квартиры (может быть `null`)
+  - `apartment_number` — номер квартиры (string, только для чтения)
+  - `apartment_floor` — этаж (number, только для чтения)
+  - `created_by` — UUID пользователя, кто создал
+  - `created_by_display` — отображаемое имя создавшего (string, только для чтения)
+
+- **Основные реквизиты договора**
+  - `number` — номер договора (string, может быть сгенерирован)
+  - `title` — заголовок/название сделки (string)
+  - `description` — текстовые условия/описание (string)
+  - `amount` — общая сумма договора (string, Decimal)
+  - `operation_type` — `"sale"` или `"booking"`
+  - `payment_type` — `"full"` или `"installment"`
+  - `down_payment` — первоначальный взнос (string, Decimal)
+  - `payment_terms` — текстовые условия оплаты (string)
+  - `status` — статус договора (`draft/active/signed/cancelled`)
+  - `signed_at` — дата подписания (datetime, может быть `null`)
+
+- **ERP‑интеграция**
+  - `auto_create_in_erp` — создавать ли в ERP автоматически (bool)
+  - `erp_sync_status` — статус синхронизации (`not_requested/requested/synced/failed/not_configured`)
+  - `erp_external_id` — внешний ID в ERP (string)
+  - `erp_last_error` — последнее сообщение об ошибке (string)
+  - `erp_requested_at` — когда запросили создание (datetime, `null` если ещё нет)
+  - `erp_synced_at` — когда успешно синхронизировали (datetime, `null` если ещё нет)
+
+- **Служебные поля**
+  - `created_at` — дата создания договора (datetime)
+  - `updated_at` — дата последнего обновления (datetime)
+
+- **Файлы и рассрочка**
+  - `files` — массив файлов договора:
+    - `id`, `treaty`, `title`, `file`, `file_url`, `created_by`, `created_at`
+  - `installments` — массив платежей по рассрочке (только для чтения):
+    - `id`, `treaty`, `order`, `due_date`, `amount`, `status`, `paid_amount`, `paid_at`, `created_at`, `updated_at`
+
+**Разница между продажей и бронью на фронте:**
+- продажа: `operation_type = "sale"` (квартира обычно в статусе `sold`);
+- бронь: `operation_type = "booking"` (квартира обычно в статусе `reserved`);
+- все остальные поля и формат ответа совпадают, поэтому UI может отличаться только текстами/стилями в зависимости от `operation_type`.
+
 ### 4.1) Создание договора (продажа/бронь)
 
 Поля (ключевые):
