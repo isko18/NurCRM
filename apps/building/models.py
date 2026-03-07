@@ -138,7 +138,7 @@ class BuildingCashFlow(models.Model):
             models.Index(fields=["company", "branch", "created_at"]),
             models.Index(fields=["cashbox", "created_at"]),
             models.Index(fields=["status"]),
-            models.Index(fields=["cashbox", "status", "type", "created_at"], name="ix_building_flow_cb_stat_type_created"),
+            models.Index(fields=["cashbox", "status", "type", "created_at"], name="ix_bld_flow_cb_stat_type"),
             models.Index(fields=["cashier", "created_at"]),
         ]
         constraints = [
