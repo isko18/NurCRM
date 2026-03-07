@@ -970,7 +970,8 @@ class AgentMyProductsListAPIView(CompanyBranchRestrictedMixin, APIView):
             prod_qs = (
                 m.WarehouseProduct.objects
                 .filter(warehouse=wh)
-                .only("id", "name", "article", "unit", "price", "quantity", "warehouse_id", "created_date", "updated_date")
+                .select_related("product_group", "category")
+                .only("id", "name", "article", "unit", "price", "quantity", "warehouse_id", "created_date", "updated_date", "product_group_id", "category_id")
             )
             # Поиск по товарам общего склада
             search = (request.query_params.get("search") or "").strip()
@@ -1007,7 +1008,7 @@ class AgentMyProductsListAPIView(CompanyBranchRestrictedMixin, APIView):
         qs = (
             m.AgentStockBalance.objects
             .filter(agent=user)
-            .select_related("product", "warehouse")
+            .select_related("product", "product__product_group", "product__category", "warehouse")
             .annotate(last_movement_at=Subquery(move_subq))
         )
         qs = self._filter_qs_company_branch_relaxed(qs)
@@ -1042,7 +1043,7 @@ class OwnerAgentsProductsListAPIView(CompanyBranchRestrictedMixin, APIView):
         ).order_by("-created_at").values("created_at")[:1]
         qs = (
             m.AgentStockBalance.objects
-            .select_related("agent", "product", "warehouse")
+            .select_related("agent", "product", "product__product_group", "product__category", "warehouse")
             .annotate(last_movement_at=Subquery(move_subq))
         )
         qs = self._filter_qs_company_branch_relaxed(qs)

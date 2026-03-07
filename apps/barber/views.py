@@ -517,6 +517,20 @@ class AppointmentListCreateView(CompanyQuerysetMixin, generics.ListCreateAPIView
     ordering_fields = ["start_at", "end_at", "status", "created_at"]
     ordering = ["-start_at"]
 
+    def create(self, request, *args, **kwargs):
+        """После создания перезагружаем запись с prefetch appointment_services, чтобы в ответе были services и services_names."""
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        self.perform_create(serializer)
+        instance = serializer.instance
+        qs = self.get_queryset().filter(pk=instance.pk)
+        instance = qs.first()
+        if instance is None:
+            instance = serializer.instance
+        output_serializer = AppointmentSerializer(instance, context=self.get_serializer_context())
+        headers = self.get_success_headers(output_serializer.data)
+        return Response(output_serializer.data, status=status.HTTP_201_CREATED, headers=headers)
+
 
 class AppointmentRetrieveUpdateDestroyView(
     CompanyQuerysetMixin, generics.RetrieveUpdateDestroyAPIView
