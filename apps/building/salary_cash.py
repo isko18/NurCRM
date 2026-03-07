@@ -1,5 +1,5 @@
 # Обработка одобрения операций ЗП в кассе.
-# Вызывается при переводе CashFlow в статус APPROVED (из construction или по post_save).
+# Вызывается при переводе BuildingCashFlow в статус APPROVED.
 
 from django.db import transaction
 

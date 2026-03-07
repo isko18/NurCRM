@@ -7,7 +7,279 @@ from django.db.models import Sum
 from django.db.models.functions import Coalesce
 from django.utils import timezone
 
-from apps.users.models import Company
+from django.db.models import Q
+from django.core.exceptions import ValidationError
+
+from apps.users.models import Company, Branch
+
+
+# -----------------------
+# Касса Building (собственная система, не зависит от construction)
+# -----------------------
+
+
+class BuildingCashbox(models.Model):
+    """Касса модуля Building — учёт наличных для ЗП, рассрочек и т.п."""
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False, verbose_name="ID")
+
+    company = models.ForeignKey(
+        Company,
+        on_delete=models.CASCADE,
+        related_name="building_cashboxes",
+        verbose_name="Компания",
+    )
+    branch = models.ForeignKey(
+        Branch,
+        on_delete=models.CASCADE,
+        related_name="building_cashboxes",
+        null=True,
+        blank=True,
+        db_index=True,
+        verbose_name="Филиал",
+    )
+
+    name = models.CharField(max_length=255, blank=True, null=True, verbose_name="Название кассы")
+
+    created_at = models.DateTimeField(auto_now_add=True, db_index=True, null=True, blank=True, verbose_name="Дата создания")
+    updated_at = models.DateTimeField(auto_now=True, null=True, blank=True, verbose_name="Дата обновления")
+
+    class Meta:
+        verbose_name = "Касса (Building)"
+        verbose_name_plural = "Кассы (Building)"
+        indexes = [
+            models.Index(fields=["company"]),
+            models.Index(fields=["company", "branch"]),
+        ]
+        constraints = [
+            models.UniqueConstraint(
+                fields=("branch", "name"),
+                name="uq_building_cashbox_name_per_branch",
+                condition=Q(branch__isnull=False) & Q(name__isnull=False),
+            ),
+            models.UniqueConstraint(
+                fields=("company", "name"),
+                name="uq_building_cashbox_name_global_per_company",
+                condition=Q(branch__isnull=True) & Q(name__isnull=False),
+            ),
+        ]
+
+    def clean(self):
+        if self.branch_id and self.branch.company_id != self.company_id:
+            raise ValidationError({"branch": "Филиал принадлежит другой компании."})
+
+    def __str__(self):
+        if self.branch_id:
+            base = f"Касса Building филиала {self.branch.name}"
+            return f"{base}{f' ({self.name})' if self.name else ''}"
+        return self.name or f"Касса Building {self.company.name}"
+
+
+class BuildingCashShift(models.Model):
+    """Кассовая смена (Building)."""
+
+    class Status(models.TextChoices):
+        OPEN = "open", "Открыта"
+        CLOSED = "closed", "Закрыта"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False, verbose_name="ID")
+
+    company = models.ForeignKey(
+        Company,
+        on_delete=models.CASCADE,
+        related_name="building_shifts",
+        verbose_name="Компания",
+    )
+    branch = models.ForeignKey(
+        Branch,
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
+        related_name="building_shifts",
+        db_index=True,
+        verbose_name="Филиал",
+    )
+
+    cashbox = models.ForeignKey(
+        BuildingCashbox,
+        on_delete=models.PROTECT,
+        related_name="shifts",
+        verbose_name="Касса",
+    )
+    cashier = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.PROTECT,
+        related_name="building_shifts",
+        verbose_name="Кассир",
+    )
+
+    status = models.CharField(max_length=10, choices=Status.choices, default=Status.OPEN, db_index=True, verbose_name="Статус")
+    opened_at = models.DateTimeField(auto_now_add=True, verbose_name="Дата открытия")
+    closed_at = models.DateTimeField(null=True, blank=True, verbose_name="Дата закрытия")
+
+    opening_cash = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal("0.00"), verbose_name="Начальная сумма")
+    closing_cash = models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True, verbose_name="Конечная сумма")
+
+    income_total = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal("0.00"), verbose_name="Итого приходов")
+    expense_total = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal("0.00"), verbose_name="Итого расходов")
+
+    class Meta:
+        verbose_name = "Кассовая смена (Building)"
+        verbose_name_plural = "Кассовые смены (Building)"
+        constraints = [
+            models.UniqueConstraint(
+                fields=("cashbox", "cashier"),
+                condition=Q(status="open"),
+                name="uq_building_open_shift_per_cashbox_cashier",
+            ),
+        ]
+        indexes = [
+            models.Index(fields=["company", "branch", "opened_at"]),
+            models.Index(fields=["cashbox", "opened_at"]),
+            models.Index(fields=["cashier", "opened_at"]),
+            models.Index(fields=["status", "opened_at"]),
+        ]
+
+    def clean(self):
+        if self.cashbox_id:
+            if self.company_id != self.cashbox.company_id:
+                raise ValidationError({"company": "Компания смены должна совпадать с компанией кассы."})
+            if (self.branch_id or None) != (self.cashbox.branch_id or None):
+                raise ValidationError({"branch": "Филиал смены должен совпадать с филиалом кассы (или оба None)."})
+        if self.cashier_id:
+            cashier_company_id = getattr(self.cashier, "company_id", None)
+            if cashier_company_id and cashier_company_id != self.company_id:
+                raise ValidationError({"cashier": "Кассир другой компании."})
+
+    def save(self, *args, **kwargs):
+        update_fields = kwargs.get("update_fields")
+        touched = set()
+        if self.cashbox_id:
+            cb_company_id = getattr(self.cashbox, "company_id", None)
+            cb_branch_id = getattr(self.cashbox, "branch_id", None)
+            if cb_company_id and self.company_id != cb_company_id:
+                self.company_id = cb_company_id
+                touched.add("company")
+            if (self.branch_id or None) != (cb_branch_id or None):
+                self.branch_id = cb_branch_id
+                touched.add("branch")
+        if update_fields is not None and touched:
+            kwargs["update_fields"] = list(set(update_fields) | touched)
+        self.full_clean()
+        return super().save(*args, **kwargs)
+
+    def __str__(self):
+        return f"Смена Building {self.cashier} / {self.cashbox} ({self.status})"
+
+
+class BuildingCashFlow(models.Model):
+    """Движение по кассе (Building)."""
+
+    class Type(models.TextChoices):
+        INCOME = "income", "Приход"
+        EXPENSE = "expense", "Расход"
+
+    class Status(models.TextChoices):
+        PENDING = "pending", "В ожидании"
+        APPROVED = "approved", "Успешно"
+        REJECTED = "rejected", "Отклонено"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False, verbose_name="ID")
+
+    company = models.ForeignKey(
+        Company,
+        on_delete=models.CASCADE,
+        related_name="building_cashflows",
+        verbose_name="Компания",
+    )
+    branch = models.ForeignKey(
+        Branch,
+        on_delete=models.CASCADE,
+        related_name="building_cashflows",
+        null=True,
+        blank=True,
+        db_index=True,
+        verbose_name="Филиал",
+    )
+
+    cashbox = models.ForeignKey(
+        BuildingCashbox,
+        on_delete=models.CASCADE,
+        related_name="flows",
+        verbose_name="Касса",
+    )
+    type = models.CharField(max_length=10, choices=Type.choices, verbose_name="Тип")
+    name = models.CharField(max_length=255, null=True, blank=True, verbose_name="Наименование")
+    amount = models.DecimalField(max_digits=12, decimal_places=2, verbose_name="Сумма")
+    created_at = models.DateTimeField(auto_now_add=True, verbose_name="Дата создания")
+
+    status = models.CharField(max_length=10, choices=Status.choices, default=Status.PENDING, db_index=True, verbose_name="Статус")
+
+    source_business_operation_id = models.CharField(max_length=36, null=True, blank=True, verbose_name="ID бизнес-операции")
+
+    shift = models.ForeignKey(
+        BuildingCashShift,
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name="shift_flows",
+        db_index=True,
+        verbose_name="Смена",
+    )
+    cashier = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="building_cash_flows",
+        verbose_name="Кассир",
+    )
+
+    class Meta:
+        verbose_name = "Движение по кассе (Building)"
+        verbose_name_plural = "Движения по кассе (Building)"
+        ordering = ["-created_at"]
+        indexes = [
+            models.Index(fields=["company", "created_at"]),
+            models.Index(fields=["company", "branch", "created_at"]),
+            models.Index(fields=["cashbox", "created_at"]),
+            models.Index(fields=["status"]),
+            models.Index(fields=["cashbox", "status", "type", "created_at"], name="ix_building_flow_cb_stat_type_created"),
+            models.Index(fields=["shift", "created_at"]),
+            models.Index(fields=["cashier", "created_at"]),
+        ]
+        constraints = [
+            models.CheckConstraint(check=Q(amount__gt=0), name="ck_building_cashflow_amount_positive"),
+        ]
+
+    def clean(self):
+        if self.cashbox_id:
+            if self.company_id != self.cashbox.company_id:
+                raise ValidationError({"company": "Компания движения должна совпадать с компанией кассы."})
+            if (self.branch_id or None) != (self.cashbox.branch_id or None):
+                raise ValidationError({"branch": "Филиал движения должен совпадать с филиалом кассы (или оба None)."})
+        if self.shift_id:
+            if self.shift.cashbox_id != self.cashbox_id:
+                raise ValidationError({"shift": "Смена относится к другой кассе."})
+            if self.cashier_id and self.cashier_id != self.shift.cashier_id:
+                raise ValidationError({"cashier": "Кассир не совпадает с кассиром смены."})
+
+    def save(self, *args, **kwargs):
+        if self.cashbox_id:
+            self.company_id = self.cashbox.company_id
+            self.branch_id = self.cashbox.branch_id
+        if self.shift_id:
+            self.cashier_id = self.shift.cashier_id
+        self.full_clean()
+        return super().save(*args, **kwargs)
+
+    def __str__(self):
+        return f"{self.get_type_display()} {self.amount} ({self.status})"
+
+
+# -----------------------
+# Residential complex and related
+# -----------------------
 
 
 class ResidentialComplex(models.Model):
@@ -29,7 +301,7 @@ class ResidentialComplex(models.Model):
 
     # Касса, из которой по умолчанию идут выплаты ЗП по этому ЖК
     salary_cashbox = models.ForeignKey(
-        "construction.Cashbox",
+        BuildingCashbox,
         on_delete=models.SET_NULL,
         null=True,
         blank=True,
@@ -1563,13 +1835,13 @@ class BuildingPayrollPayment(models.Model):
         verbose_name="Кто выплатил",
     )
     cashbox = models.ForeignKey(
-        "construction.Cashbox",
+        BuildingCashbox,
         on_delete=models.PROTECT,
         related_name="building_salary_payments",
         verbose_name="Касса",
     )
     shift = models.ForeignKey(
-        "construction.CashShift",
+        BuildingCashShift,
         on_delete=models.PROTECT,
         null=True,
         blank=True,
@@ -1577,7 +1849,7 @@ class BuildingPayrollPayment(models.Model):
         verbose_name="Смена",
     )
     cashflow = models.ForeignKey(
-        "construction.CashFlow",
+        BuildingCashFlow,
         on_delete=models.SET_NULL,
         null=True,
         blank=True,

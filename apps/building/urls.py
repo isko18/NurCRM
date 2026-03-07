@@ -1,6 +1,14 @@
 from django.urls import path
 
 from .views import (
+    BuildingCashboxListCreateView,
+    BuildingCashboxDetailView,
+    BuildingCashShiftListView,
+    BuildingCashShiftOpenView,
+    BuildingCashShiftCloseView,
+    BuildingCashFlowListCreateView,
+    BuildingCashFlowDetailView,
+    BuildingCashFlowBulkStatusUpdateView,
     ResidentialComplexListCreateView,
     ResidentialComplexDetailView,
     ResidentialComplexFloorsView,
@@ -64,6 +72,16 @@ from .views import (
 app_name = "building"
 
 urlpatterns = [
+    # Касса Building (своя система)
+    path("cashboxes/", BuildingCashboxListCreateView.as_view(), name="building-cashbox-list-create"),
+    path("cashboxes/<uuid:pk>/", BuildingCashboxDetailView.as_view(), name="building-cashbox-detail"),
+    path("cash/shifts/", BuildingCashShiftListView.as_view(), name="building-cash-shift-list"),
+    path("cash/shifts/open/", BuildingCashShiftOpenView.as_view(), name="building-cash-shift-open"),
+    path("cash/shifts/<uuid:pk>/close/", BuildingCashShiftCloseView.as_view(), name="building-cash-shift-close"),
+    path("cash/flows/", BuildingCashFlowListCreateView.as_view(), name="building-cash-flow-list-create"),
+    path("cash/flows/<uuid:pk>/", BuildingCashFlowDetailView.as_view(), name="building-cash-flow-detail"),
+    path("cash/flows/bulk/status/", BuildingCashFlowBulkStatusUpdateView.as_view(), name="building-cash-flow-bulk-status"),
+
     path("objects/", ResidentialComplexListCreateView.as_view(), name="residential-complex-list-create"),
     path("objects/<uuid:pk>/", ResidentialComplexDetailView.as_view(), name="residential-complex-detail"),
     path("objects/<uuid:pk>/floors/", ResidentialComplexFloorsView.as_view(), name="residential-complex-floors"),

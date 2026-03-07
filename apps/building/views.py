@@ -1,7 +1,8 @@
 from decimal import Decimal
 
 from django.db import transaction
-from django.db.models import Q, Count
+from django.db.models import Q, Count, Case, When, Value
+from django.db.models.fields import CharField
 from django.contrib.auth import get_user_model
 from django.utils import timezone
 from rest_framework import generics, permissions, filters, status
@@ -10,9 +11,10 @@ from rest_framework.response import Response
 from rest_framework.exceptions import PermissionDenied, ValidationError
 from django_filters.rest_framework import DjangoFilterBackend
 
-from apps.construction.models import Cashbox, CashShift, CashFlow
-
 from .models import (
+    BuildingCashbox,
+    BuildingCashShift,
+    BuildingCashFlow,
     ResidentialComplex,
     ResidentialComplexMember,
     ResidentialComplexDrawing,
@@ -82,6 +84,11 @@ from .serializers import (
     BuildingPayrollPaymentSerializer,
     BuildingPayrollPaymentCreateSerializer,
     BuildingPayrollMyLineSerializer,
+    BuildingCashboxSerializer,
+    BuildingCashShiftListSerializer,
+    BuildingCashShiftOpenSerializer,
+    BuildingCashFlowSerializer,
+    BuildingCashFlowBulkStatusSerializer,
 )
 from . import services
 
@@ -1678,7 +1685,7 @@ class BuildingTreatyInstallmentPaymentView(CompanyQuerysetMixin, generics.Generi
         if amount > remaining:
             raise ValidationError({"amount": f"Нельзя оплатить больше остатка ({remaining})."})
 
-        cashbox = Cashbox.objects.select_related("company").filter(id=ser.validated_data["cashbox"]).first()
+        cashbox = BuildingCashbox.objects.select_related("company").filter(id=ser.validated_data["cashbox"]).first()
         if not cashbox:
             raise ValidationError({"cashbox": "Касса не найдена."})
         if not getattr(user, "is_superuser", False) and cashbox.company_id != getattr(user, "company_id", None):
@@ -1687,12 +1694,12 @@ class BuildingTreatyInstallmentPaymentView(CompanyQuerysetMixin, generics.Generi
         shift = None
         shift_id = ser.validated_data.get("shift")
         if shift_id:
-            shift = CashShift.objects.select_related("cashbox").filter(id=shift_id).first()
+            shift = BuildingCashShift.objects.select_related("cashbox").filter(id=shift_id).first()
             if not shift:
                 raise ValidationError({"shift": "Смена не найдена."})
             if shift.cashbox_id != cashbox.id:
                 raise ValidationError({"shift": "Смена относится к другой кассе."})
-            if shift.status != CashShift.Status.OPEN:
+            if shift.status != BuildingCashShift.Status.OPEN:
                 raise ValidationError({"shift": "Нельзя принять оплату в закрытой смене."})
             if (not _is_owner_like(user)) and shift.cashier_id != user.id:
                 raise ValidationError({"shift": "Это не ваша смена."})
@@ -1709,13 +1716,13 @@ class BuildingTreatyInstallmentPaymentView(CompanyQuerysetMixin, generics.Generi
             name_parts.append(f"кв. {apt_number}")
         flow_name = " / ".join([p for p in name_parts if p])
 
-        cf = CashFlow.objects.create(
+        cf = BuildingCashFlow.objects.create(
             cashbox=cashbox,
             shift=shift,
-            type=CashFlow.Type.INCOME,
+            type=BuildingCashFlow.Type.INCOME,
             name=flow_name,
             amount=abs(amount),
-            status=CashFlow.Status.APPROVED,
+            status=BuildingCashFlow.Status.APPROVED,
             source_business_operation_id=str(installment.id),
         )
 
@@ -2275,7 +2282,7 @@ class BuildingPayrollAdjustmentCreateView(CompanyQuerysetMixin, generics.Generic
             cashbox_id = ser.validated_data.get("cashbox")
             if not cashbox_id:
                 raise ValidationError({"cashbox": "Для аванса укажите кассу."})
-            cashbox = Cashbox.objects.select_related("company").filter(id=cashbox_id).first()
+            cashbox = BuildingCashbox.objects.select_related("company").filter(id=cashbox_id).first()
             if not cashbox:
                 raise ValidationError({"cashbox": "Касса не найдена."})
             if not getattr(request.user, "is_superuser", False) and cashbox.company_id != getattr(request.user, "company_id", None):
@@ -2283,12 +2290,12 @@ class BuildingPayrollAdjustmentCreateView(CompanyQuerysetMixin, generics.Generic
             shift = None
             shift_id = ser.validated_data.get("shift")
             if shift_id:
-                shift = CashShift.objects.select_related("cashbox").filter(id=shift_id).first()
+                shift = BuildingCashShift.objects.select_related("cashbox").filter(id=shift_id).first()
                 if not shift:
                     raise ValidationError({"shift": "Смена не найдена."})
                 if shift.cashbox_id != cashbox.id:
                     raise ValidationError({"shift": "Смена относится к другой кассе."})
-                if shift.status != CashShift.Status.OPEN:
+                if shift.status != BuildingCashShift.Status.OPEN:
                     raise ValidationError({"shift": "Нельзя выплатить из закрытой смены."})
                 if (not _is_owner_like(request.user)) and shift.cashier_id != request.user.id:
                     raise ValidationError({"shift": "Это не ваша смена."})
@@ -2315,13 +2322,13 @@ class BuildingPayrollAdjustmentCreateView(CompanyQuerysetMixin, generics.Generic
                 status=BuildingPayrollPayment.Status.PENDING,
                 advance_adjustment=adj,
             )
-            cf = CashFlow.objects.create(
+            cf = BuildingCashFlow.objects.create(
                 cashbox=cashbox,
                 shift=shift,
-                type=CashFlow.Type.EXPENSE,
+                type=BuildingCashFlow.Type.EXPENSE,
                 name=f"ЗП аванс: {emp_display}",
                 amount=abs(amount),
-                status=CashFlow.Status.PENDING,
+                status=BuildingCashFlow.Status.PENDING,
                 source_business_operation_id=str(payment.id),
             )
             payment.cashflow = cf
@@ -2418,7 +2425,7 @@ class BuildingPayrollPaymentListCreateView(CompanyQuerysetMixin, generics.Generi
         if amount > remaining:
             raise ValidationError({"amount": f"Нельзя выплатить больше остатка ({remaining})."})
 
-        cashbox = Cashbox.objects.select_related("company").filter(id=ser.validated_data["cashbox"]).first()
+        cashbox = BuildingCashbox.objects.select_related("company").filter(id=ser.validated_data["cashbox"]).first()
         if not cashbox:
             raise ValidationError({"cashbox": "Касса не найдена."})
         if not getattr(request.user, "is_superuser", False) and cashbox.company_id != getattr(request.user, "company_id", None):
@@ -2427,12 +2434,12 @@ class BuildingPayrollPaymentListCreateView(CompanyQuerysetMixin, generics.Generi
         shift = None
         shift_id = ser.validated_data.get("shift")
         if shift_id:
-            shift = CashShift.objects.select_related("cashbox").filter(id=shift_id).first()
+            shift = BuildingCashShift.objects.select_related("cashbox").filter(id=shift_id).first()
             if not shift:
                 raise ValidationError({"shift": "Смена не найдена."})
             if shift.cashbox_id != cashbox.id:
                 raise ValidationError({"shift": "Смена относится к другой кассе."})
-            if shift.status != CashShift.Status.OPEN:
+            if shift.status != BuildingCashShift.Status.OPEN:
                 raise ValidationError({"shift": "Нельзя выплатить из закрытой смены."})
             if (not _is_owner_like(request.user)) and shift.cashier_id != request.user.id:
                 raise ValidationError({"shift": "Это не ваша смена."})
@@ -2451,13 +2458,13 @@ class BuildingPayrollPaymentListCreateView(CompanyQuerysetMixin, generics.Generi
         emp = line.employee
         emp_name = f"{getattr(emp, 'first_name', '')} {getattr(emp, 'last_name', '')}".strip() if emp else ""
         emp_display = emp_name or getattr(emp, "email", None) or getattr(emp, "username", None) or str(getattr(emp, "id", ""))
-        cf = CashFlow.objects.create(
+        cf = BuildingCashFlow.objects.create(
             cashbox=cashbox,
             shift=shift,
-            type=CashFlow.Type.EXPENSE,
+            type=BuildingCashFlow.Type.EXPENSE,
             name=f"ЗП: {emp_display} / {payroll.period_start} - {payroll.period_end}",
             amount=abs(amount),
-            status=CashFlow.Status.PENDING,
+            status=BuildingCashFlow.Status.PENDING,
             source_business_operation_id=str(payment.id),
         )
         payment.cashflow = cf
@@ -2484,4 +2491,214 @@ class BuildingPayrollMyLinesView(CompanyQuerysetMixin, generics.ListAPIView):
         if allowed_ids is not None:
             qs = qs.filter(payroll__residential_complex_id__in=allowed_ids)
         return qs
+
+
+# -----------------------
+# Building Cash API (касса Building — своя система)
+# -----------------------
+
+
+class BuildingCashboxListCreateView(CompanyQuerysetMixin, generics.ListCreateAPIView):
+    """Список и создание касс Building."""
+    permission_classes = [permissions.IsAuthenticated]
+    serializer_class = BuildingCashboxSerializer
+    queryset = BuildingCashbox.objects.select_related("company", "branch")
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        user = self.request.user
+        if getattr(user, "is_superuser", False):
+            return qs
+        company_id = getattr(user, "company_id", None)
+        return qs.filter(company_id=company_id) if company_id else qs.none()
+
+    def perform_create(self, serializer):
+        user = self.request.user
+        if not getattr(user, "company_id", None) and not getattr(user, "is_superuser", False):
+            raise PermissionDenied("У пользователя не указана компания.")
+        serializer.save(company_id=user.company_id)
+
+
+class BuildingCashboxDetailView(CompanyQuerysetMixin, generics.RetrieveUpdateDestroyAPIView):
+    """Детали кассы Building."""
+    permission_classes = [permissions.IsAuthenticated]
+    serializer_class = BuildingCashboxSerializer
+    queryset = BuildingCashbox.objects.select_related("company", "branch")
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        user = self.request.user
+        if getattr(user, "is_superuser", False):
+            return qs
+        company_id = getattr(user, "company_id", None)
+        return qs.filter(company_id=company_id) if company_id else qs.none()
+
+
+class BuildingCashShiftListView(CompanyQuerysetMixin, generics.ListAPIView):
+    """Список смен Building."""
+    permission_classes = [permissions.IsAuthenticated]
+    serializer_class = BuildingCashShiftListSerializer
+    queryset = BuildingCashShift.objects.select_related("company", "branch", "cashbox", "cashier")
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        user = self.request.user
+        if getattr(user, "is_superuser", False):
+            pass
+        else:
+            company_id = getattr(user, "company_id", None)
+            qs = qs.filter(company_id=company_id) if company_id else qs.none()
+        if not _is_owner_like(user):
+            qs = qs.filter(cashier=user)
+        cashbox_id = self.request.query_params.get("cashbox")
+        status_q = self.request.query_params.get("status")
+        if cashbox_id:
+            qs = qs.filter(cashbox_id=cashbox_id)
+        if status_q in ("open", "closed"):
+            qs = qs.filter(status=status_q)
+        return qs.order_by("-opened_at", "-id")
+
+
+class BuildingCashShiftOpenView(CompanyQuerysetMixin, generics.CreateAPIView):
+    """Открыть смену Building."""
+    permission_classes = [permissions.IsAuthenticated]
+    serializer_class = BuildingCashShiftOpenSerializer
+
+    @transaction.atomic
+    def create(self, request, *args, **kwargs):
+        serializer = self.get_serializer(data=request.data, context={"request": request})
+        serializer.is_valid(raise_exception=True)
+        shift = serializer.save()
+        return Response(
+            BuildingCashShiftListSerializer(shift, context={"request": request}).data,
+            status=status.HTTP_201_CREATED,
+        )
+
+
+class BuildingCashShiftCloseView(CompanyQuerysetMixin, generics.GenericAPIView):
+    """Закрыть смену Building."""
+    permission_classes = [permissions.IsAuthenticated]
+
+    @transaction.atomic
+    def post(self, request, pk):
+        from django.shortcuts import get_object_or_404
+
+        company_id = getattr(request.user, "company_id", None)
+        if not company_id and not getattr(request.user, "is_superuser", False):
+            raise PermissionDenied("У пользователя не настроена компания.")
+
+        qs = BuildingCashShift.objects.select_related("company", "cashier", "cashbox").filter(id=pk)
+        if not getattr(request.user, "is_superuser", False) and company_id:
+            qs = qs.filter(company_id=company_id)
+        shift = get_object_or_404(qs)
+        if not _is_owner_like(request.user) and shift.cashier_id != request.user.id:
+            raise PermissionDenied("Нельзя закрыть чужую смену.")
+
+        closing_cash = request.data.get("closing_cash")
+        if closing_cash is None:
+            raise ValidationError({"closing_cash": "Укажите конечную сумму."})
+        try:
+            closing_cash = Decimal(str(closing_cash))
+        except (TypeError, ValueError):
+            raise ValidationError({"closing_cash": "Некорректная сумма."})
+
+        if shift.status != BuildingCashShift.Status.OPEN:
+            raise ValidationError({"status": "Смена уже закрыта."})
+
+        shift.closing_cash = closing_cash
+        shift.closed_at = timezone.now()
+        shift.status = BuildingCashShift.Status.CLOSED
+        shift.save(update_fields=["closing_cash", "closed_at", "status"])
+
+        return Response(
+            BuildingCashShiftListSerializer(shift, context={"request": request}).data,
+            status=status.HTTP_200_OK,
+        )
+
+
+class BuildingCashFlowListCreateView(CompanyQuerysetMixin, generics.ListCreateAPIView):
+    """Список и создание движений Building."""
+    permission_classes = [permissions.IsAuthenticated]
+    serializer_class = BuildingCashFlowSerializer
+    queryset = BuildingCashFlow.objects.select_related(
+        "company", "branch", "cashbox", "shift", "shift__cashier", "cashier"
+    )
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        user = self.request.user
+        if getattr(user, "is_superuser", False):
+            pass
+        else:
+            company_id = getattr(user, "company_id", None)
+            qs = qs.filter(company_id=company_id) if company_id else qs.none()
+        cashbox_id = self.request.query_params.get("cashbox")
+        shift_id = self.request.query_params.get("shift")
+        if cashbox_id:
+            qs = qs.filter(cashbox_id=cashbox_id)
+        if shift_id:
+            qs = qs.filter(shift_id=shift_id)
+        return qs.order_by("-created_at")
+
+    def perform_create(self, serializer):
+        user = self.request.user
+        cashbox = serializer.validated_data.get("cashbox")
+        if cashbox:
+            serializer.save(company=cashbox.company, branch=cashbox.branch)
+        else:
+            serializer.save()
+
+
+class BuildingCashFlowDetailView(CompanyQuerysetMixin, generics.RetrieveUpdateDestroyAPIView):
+    """Детали движения Building."""
+    permission_classes = [permissions.IsAuthenticated]
+    serializer_class = BuildingCashFlowSerializer
+    queryset = BuildingCashFlow.objects.select_related(
+        "company", "branch", "cashbox", "shift", "shift__cashier", "cashier"
+    )
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        user = self.request.user
+        if getattr(user, "is_superuser", False):
+            return qs
+        company_id = getattr(user, "company_id", None)
+        return qs.filter(company_id=company_id) if company_id else qs.none()
+
+
+class BuildingCashFlowBulkStatusUpdateView(CompanyQuerysetMixin, generics.GenericAPIView):
+    """Массовое обновление статуса движений (одобрение/отклонение)."""
+    permission_classes = [permissions.IsAuthenticated]
+    serializer_class = BuildingCashFlowBulkStatusSerializer
+
+    @transaction.atomic
+    def patch(self, request, *args, **kwargs):
+        _require_cash_register_perm(request.user)
+        ser = self.get_serializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+
+        items = ser.validated_data.get("items") or []
+        if not items:
+            return Response({"count": 0, "updated_ids": []}, status=status.HTTP_200_OK)
+
+        id_to_status = {it["id"]: it["status"] for it in items}
+        ids = list(id_to_status.keys())
+
+        qs = BuildingCashFlow.objects.filter(id__in=ids)
+        company_id = getattr(request.user, "company_id", None)
+        if not getattr(request.user, "is_superuser", False) and company_id:
+            qs = qs.filter(company_id=company_id)
+
+        existing_ids = set(qs.values_list("id", flat=True))
+        missing = [str(i) for i in ids if i not in existing_ids]
+        if missing:
+            raise ValidationError({"missing_ids": missing})
+
+        whens = [When(id=_id, then=Value(id_to_status[_id])) for _id in ids]
+        qs.update(status=Case(*whens, output_field=CharField()))
+
+        return Response(
+            {"count": len(ids), "updated_ids": [str(x) for x in ids]},
+            status=status.HTTP_200_OK,
+        )
 

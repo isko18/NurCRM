@@ -9,15 +9,11 @@ class BuildingConfig(AppConfig):
     def ready(self):
         from django.db.models.signals import post_save
 
-        try:
-            from apps.construction.models import CashFlow
-        except ImportError:
-            return
-
+        from .models import BuildingCashFlow
         from .salary_cash import on_cashflow_approved
 
         def _on_cashflow_save(sender, instance, **kwargs):
-            if instance.status == CashFlow.Status.APPROVED and getattr(instance, "source_business_operation_id", None):
+            if instance.status == BuildingCashFlow.Status.APPROVED and getattr(instance, "source_business_operation_id", None):
                 on_cashflow_approved(instance)
 
-        post_save.connect(_on_cashflow_save, sender=CashFlow)
+        post_save.connect(_on_cashflow_save, sender=BuildingCashFlow)
