@@ -362,7 +362,11 @@ class AppointmentSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSeriali
     client_name = serializers.CharField(source="client.full_name", read_only=True)
     barber_name = serializers.SerializerMethodField()
     barber_public = AppointmentPublicMasterSerializer(source="barber", read_only=True)
-    services = AppointmentServicesListField(source="appointment_services", required=False)
+    services = AppointmentServicesListField(
+        source="appointment_services",
+        required=False,
+        help_text="Массив ID услуг. Один и тот же ID можно указать несколько раз — каждая позиция будет отдельной строкой в записи (например: [uuid1, uuid1, uuid2]).",
+    )
     services_names = serializers.SerializerMethodField()
     services_public = serializers.SerializerMethodField()
 
