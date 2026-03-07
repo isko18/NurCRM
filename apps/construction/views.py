@@ -557,6 +557,17 @@ class CashFlowBulkStatusUpdateView(CompanyBranchScopedMixin, generics.GenericAPI
             )
             updated_ids.extend([str(x) for x in chunk_ids])
 
+        # При одобрении в кассе — провести связанные операции ЗП (building)
+        for _id in ids:
+            if id_to_status.get(_id) == CashFlow.Status.APPROVED:
+                cf = CashFlow.objects.filter(id=_id).first()
+                if cf and getattr(cf, "source_business_operation_id", None):
+                    try:
+                        from apps.building.salary_cash import on_cashflow_approved
+                        on_cashflow_approved(cf)
+                    except ImportError:
+                        pass
+
         return Response(
             {"count": updated_count, "updated_ids": updated_ids},
             status=200

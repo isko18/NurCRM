@@ -994,12 +994,26 @@ class BuildingSalaryEmployeeSerializer(serializers.Serializer):
     salary_type = serializers.CharField(allow_blank=True, allow_null=True)
     base_salary = serializers.DecimalField(max_digits=16, decimal_places=2, allow_null=True)
     is_active = serializers.BooleanField(allow_null=True)
+    sale_commission_type = serializers.CharField(allow_blank=True, allow_null=True)
+    sale_commission_value = serializers.DecimalField(max_digits=16, decimal_places=2, allow_null=True)
 
 
 class BuildingEmployeeCompensationSerializer(serializers.ModelSerializer):
     class Meta:
         model = BuildingEmployeeCompensation
-        fields = ["id", "company", "user", "salary_type", "base_salary", "is_active", "notes", "created_at", "updated_at"]
+        fields = [
+            "id",
+            "company",
+            "user",
+            "salary_type",
+            "base_salary",
+            "is_active",
+            "notes",
+            "sale_commission_type",
+            "sale_commission_value",
+            "created_at",
+            "updated_at",
+        ]
         read_only_fields = ["id", "company", "user", "created_at", "updated_at"]
 
 
@@ -1008,8 +1022,19 @@ class BuildingPayrollAdjustmentSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = BuildingPayrollAdjustment
-        fields = ["id", "line", "type", "title", "amount", "created_by", "created_by_display", "created_at"]
-        read_only_fields = ["id", "line", "created_by", "created_by_display", "created_at"]
+        fields = [
+            "id",
+            "line",
+            "type",
+            "status",
+            "title",
+            "amount",
+            "source_treaty",
+            "created_by",
+            "created_by_display",
+            "created_at",
+        ]
+        read_only_fields = ["id", "line", "status", "source_treaty", "created_by", "created_by_display", "created_at"]
 
     def get_created_by_display(self, obj):
         u = getattr(obj, "created_by", None)
@@ -1034,13 +1059,14 @@ class BuildingPayrollPaymentSerializer(serializers.ModelSerializer):
             "cashbox",
             "shift",
             "cashflow",
+            "advance_adjustment",
             "status",
             "void_reason",
             "voided_by",
             "voided_at",
             "created_at",
         ]
-        read_only_fields = ["id", "line", "paid_by", "paid_by_display", "cashflow", "status", "voided_by", "voided_at", "created_at"]
+        read_only_fields = ["id", "line", "paid_by", "paid_by_display", "cashflow", "advance_adjustment", "status", "voided_by", "voided_at", "created_at"]
 
     def get_paid_by_display(self, obj):
         u = getattr(obj, "paid_by", None)
@@ -1099,6 +1125,7 @@ class BuildingPayrollLineSerializer(serializers.ModelSerializer):
 class BuildingPayrollPeriodSerializer(serializers.ModelSerializer):
     created_by_display = serializers.SerializerMethodField(read_only=True)
     approved_by_display = serializers.SerializerMethodField(read_only=True)
+    residential_complex_name = serializers.CharField(source="residential_complex.name", read_only=True, allow_null=True)
     totals = serializers.SerializerMethodField(read_only=True)
     lines = BuildingPayrollLineSerializer(many=True, read_only=True)
 
@@ -1107,6 +1134,8 @@ class BuildingPayrollPeriodSerializer(serializers.ModelSerializer):
         fields = [
             "id",
             "company",
+            "residential_complex",
+            "residential_complex_name",
             "title",
             "period_start",
             "period_end",
@@ -1133,6 +1162,7 @@ class BuildingPayrollPeriodSerializer(serializers.ModelSerializer):
             "updated_at",
             "totals",
             "lines",
+            "residential_complex_name",
         ]
 
     def get_created_by_display(self, obj):
@@ -1177,7 +1207,11 @@ class BuildingPayrollLineCreateSerializer(serializers.Serializer):
 class BuildingPayrollAdjustmentCreateSerializer(serializers.Serializer):
     type = serializers.ChoiceField(choices=BuildingPayrollAdjustment.Type.choices)
     title = serializers.CharField(required=False, allow_blank=True)
+    comment = serializers.CharField(required=False, allow_blank=True)
     amount = serializers.DecimalField(max_digits=16, decimal_places=2)
+    cashbox = serializers.UUIDField(required=False, allow_null=True)
+    shift = serializers.UUIDField(required=False, allow_null=True)
+    paid_at = serializers.DateTimeField(required=False, allow_null=True)
 
 
 class BuildingPayrollPaymentCreateSerializer(serializers.Serializer):

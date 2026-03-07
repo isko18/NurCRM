@@ -8,6 +8,10 @@ from django.utils import timezone
 from rest_framework.exceptions import ValidationError
 
 from .models import (
+    BuildingEmployeeCompensation,
+    BuildingPayrollAdjustment,
+    BuildingPayrollLine,
+    BuildingPayrollPeriod,
     BuildingProcurementCashDecision,
     BuildingProcurementRequest,
     BuildingTransferItem,
@@ -471,3 +475,66 @@ def request_treaty_create_in_erp(treaty: BuildingTreaty, actor):
         treaty.erp_last_error = str(e)
         treaty.save(update_fields=["erp_sync_status", "erp_last_error", "updated_at"])
         return treaty
+
+
+@transaction.atomic
+def create_sale_commission_adjustment(treaty: BuildingTreaty):
+    """
+    При продаже (договор подписан/активен, тип SALE): создать премию в строке начисления
+    ответственного (created_by), если у него настроено начисление от продаж.
+    Идемпотентно: не создаёт повторно по одному и тому же договору.
+    """
+    if treaty.operation_type != BuildingTreaty.OperationType.SALE:
+        return
+    if treaty.status not in (BuildingTreaty.Status.ACTIVE, BuildingTreaty.Status.SIGNED):
+        return
+    employee_id = treaty.created_by_id
+    if not employee_id:
+        return
+    comp = (
+        BuildingEmployeeCompensation.objects.filter(
+            company_id=treaty.residential_complex.company_id,
+            user_id=employee_id,
+            is_active=True,
+        )
+        .exclude(sale_commission_type=BuildingEmployeeCompensation.SaleCommissionType.NONE)
+        .exclude(sale_commission_type="")
+        .first()
+    )
+    if not comp or not comp.sale_commission_value:
+        return
+    sale_date = (treaty.signed_at or treaty.created_at) or timezone.now()
+    sale_date = sale_date.date() if hasattr(sale_date, "date") else sale_date
+    period = (
+        BuildingPayrollPeriod.objects.filter(
+            residential_complex=treaty.residential_complex,
+            status__in=(BuildingPayrollPeriod.Status.DRAFT, BuildingPayrollPeriod.Status.APPROVED),
+            period_start__lte=sale_date,
+            period_end__gte=sale_date,
+        )
+        .order_by("-period_end")
+        .first()
+    )
+    if not period:
+        return
+    line = BuildingPayrollLine.objects.filter(payroll=period, employee_id=employee_id).first()
+    if not line:
+        return
+    if BuildingPayrollAdjustment.objects.filter(line=line, source_treaty=treaty).exists():
+        return
+    if comp.sale_commission_type == BuildingEmployeeCompensation.SaleCommissionType.FIXED:
+        amount = comp.sale_commission_value
+    else:
+        amount = (Decimal(treaty.amount or 0) * (comp.sale_commission_value / Decimal("100"))).quantize(Decimal("0.01"))
+    if amount <= 0:
+        return
+    treaty_number = treaty.number or str(treaty.id)
+    title = f"От продажи № {treaty_number}"
+    BuildingPayrollAdjustment.objects.create(
+        line=line,
+        type=BuildingPayrollAdjustment.Type.BONUS,
+        status=BuildingPayrollAdjustment.Status.COMPLETED,
+        title=title,
+        amount=amount,
+        source_treaty=treaty,
+    )
