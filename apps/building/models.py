@@ -1257,6 +1257,11 @@ class BuildingEmployeeCompensation(models.Model):
         DAILY = "daily", "Ставка (день)"
         HOURLY = "hourly", "Ставка (час)"
 
+    class SaleCommissionType(models.TextChoices):
+        NONE = "none", "Нет"
+        FIXED = "fixed", "Фикс за сделку"
+        PERCENT = "percent", "Процент от продажи"
+
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False, verbose_name="ID")
     company = models.ForeignKey(
         Company,
@@ -1274,6 +1279,20 @@ class BuildingEmployeeCompensation(models.Model):
     base_salary = models.DecimalField(max_digits=16, decimal_places=2, default=Decimal("0.00"), verbose_name="Оклад/ставка")
     is_active = models.BooleanField(default=True, verbose_name="Активно")
     notes = models.TextField(blank=True, verbose_name="Заметки")
+    sale_commission_type = models.CharField(
+        max_length=16,
+        choices=SaleCommissionType.choices,
+        default=SaleCommissionType.NONE,
+        blank=True,
+        verbose_name="Начисление от продаж: тип",
+    )
+    sale_commission_value = models.DecimalField(
+        max_digits=16,
+        decimal_places=2,
+        null=True,
+        blank=True,
+        verbose_name="Начисление от продаж: значение (сумма или %)",
+    )
     created_at = models.DateTimeField(auto_now_add=True, verbose_name="Дата создания")
     updated_at = models.DateTimeField(auto_now=True, verbose_name="Дата обновления")
 
@@ -1306,6 +1325,14 @@ class BuildingPayrollPeriod(models.Model):
         related_name="building_payroll_periods",
         verbose_name="Компания",
     )
+    residential_complex = models.ForeignKey(
+        ResidentialComplex,
+        on_delete=models.CASCADE,
+        related_name="payroll_periods",
+        null=True,
+        blank=True,
+        verbose_name="Жилой комплекс",
+    )
     title = models.CharField(max_length=255, blank=True, verbose_name="Название")
     period_start = models.DateField(verbose_name="Период с")
     period_end = models.DateField(verbose_name="Период по")
@@ -1337,6 +1364,7 @@ class BuildingPayrollPeriod(models.Model):
         indexes = [
             models.Index(fields=["company", "status", "period_end"]),
             models.Index(fields=["company", "period_start", "period_end"]),
+            models.Index(fields=["residential_complex", "status", "period_end"]),
         ]
 
     def __str__(self):
@@ -1397,7 +1425,16 @@ class BuildingPayrollLine(models.Model):
         a = self.adjustments.aggregate(
             bonus=Coalesce(Sum("amount", filter=models.Q(type=BuildingPayrollAdjustment.Type.BONUS)), Decimal("0.00")),
             deduction=Coalesce(Sum("amount", filter=models.Q(type=BuildingPayrollAdjustment.Type.DEDUCTION)), Decimal("0.00")),
-            advance=Coalesce(Sum("amount", filter=models.Q(type=BuildingPayrollAdjustment.Type.ADVANCE)), Decimal("0.00")),
+            advance=Coalesce(
+                Sum(
+                    "amount",
+                    filter=models.Q(
+                        type=BuildingPayrollAdjustment.Type.ADVANCE,
+                        status=BuildingPayrollAdjustment.Status.COMPLETED,
+                    ),
+                ),
+                Decimal("0.00"),
+            ),
         )
         bonus = a.get("bonus") or Decimal("0.00")
         deduction = a.get("deduction") or Decimal("0.00")
@@ -1432,6 +1469,11 @@ class BuildingPayrollAdjustment(models.Model):
         DEDUCTION = "deduction", "Удержание"
         ADVANCE = "advance", "Аванс"
 
+    class Status(models.TextChoices):
+        PENDING = "pending", "Ожидает"
+        COMPLETED = "completed", "Проведено"
+        REJECTED = "rejected", "Отклонено"
+
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False, verbose_name="ID")
     line = models.ForeignKey(
         BuildingPayrollLine,
@@ -1440,8 +1482,23 @@ class BuildingPayrollAdjustment(models.Model):
         verbose_name="Строка начисления",
     )
     type = models.CharField(max_length=16, choices=Type.choices, db_index=True, verbose_name="Тип")
+    status = models.CharField(
+        max_length=16,
+        choices=Status.choices,
+        default=Status.COMPLETED,
+        db_index=True,
+        verbose_name="Статус (для аванса: проведён/отклонён)",
+    )
     title = models.CharField(max_length=255, blank=True, verbose_name="Название")
     amount = models.DecimalField(max_digits=16, decimal_places=2, verbose_name="Сумма")
+    source_treaty = models.ForeignKey(
+        BuildingTreaty,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="payroll_adjustments",
+        verbose_name="Источник: договор (начисление от продажи)",
+    )
     created_by = models.ForeignKey(
         settings.AUTH_USER_MODEL,
         on_delete=models.SET_NULL,
@@ -1459,6 +1516,7 @@ class BuildingPayrollAdjustment(models.Model):
         indexes = [
             models.Index(fields=["line", "type"]),
             models.Index(fields=["type", "created_at"]),
+            models.Index(fields=["source_treaty"]),
         ]
         constraints = [
             models.CheckConstraint(check=models.Q(amount__gt=0), name="ck_building_payroll_adjustment_amount_positive"),
@@ -1469,7 +1527,9 @@ class BuildingPayrollAdjustment(models.Model):
 
     def save(self, *args, **kwargs):
         super().save(*args, **kwargs)
-        if self.line_id:
+        if self.line_id and self.type != self.Type.ADVANCE:
+            self.line.recalculate_totals()
+        elif self.line_id and self.type == self.Type.ADVANCE and self.status == self.Status.COMPLETED:
             self.line.recalculate_totals()
 
     def delete(self, *args, **kwargs):
@@ -1481,6 +1541,7 @@ class BuildingPayrollAdjustment(models.Model):
 
 class BuildingPayrollPayment(models.Model):
     class Status(models.TextChoices):
+        PENDING = "pending", "Ожидает одобрения в кассе"
         POSTED = "posted", "Проведено"
         VOID = "void", "Отменено"
 
@@ -1523,7 +1584,15 @@ class BuildingPayrollPayment(models.Model):
         related_name="building_salary_payments",
         verbose_name="Движение кассы",
     )
-    status = models.CharField(max_length=16, choices=Status.choices, default=Status.POSTED, db_index=True, verbose_name="Статус")
+    advance_adjustment = models.ForeignKey(
+        BuildingPayrollAdjustment,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="payment",
+        verbose_name="Аванс (если это выплата аванса)",
+    )
+    status = models.CharField(max_length=16, choices=Status.choices, default=Status.PENDING, db_index=True, verbose_name="Статус")
     void_reason = models.TextField(blank=True, verbose_name="Причина отмены")
     voided_by = models.ForeignKey(
         settings.AUTH_USER_MODEL,

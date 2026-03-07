@@ -1438,6 +1438,16 @@ class BuildingTreatyListCreateView(CompanyQuerysetMixin, generics.ListCreateAPIV
             except Exception:
                 pass
 
+        # Автоначисление от продажи (премия ответственному)
+        if treaty.operation_type == BuildingTreaty.OperationType.SALE and treaty.status in (
+            BuildingTreaty.Status.ACTIVE,
+            BuildingTreaty.Status.SIGNED,
+        ):
+            try:
+                services.create_sale_commission_adjustment(treaty)
+            except Exception:
+                pass
+
 
 class BuildingTreatyDetailView(CompanyQuerysetMixin, generics.RetrieveUpdateDestroyAPIView):
     permission_classes = [permissions.IsAuthenticated]
@@ -1505,6 +1515,16 @@ class BuildingTreatyDetailView(CompanyQuerysetMixin, generics.RetrieveUpdateDest
                         if apt.status != desired and (obj.operation_type != old_operation or obj.status != old_status):
                             apt.status = desired
                             apt.save(update_fields=["status", "updated_at"])
+
+            # Автоначисление от продажи (премия ответственному)
+            if obj.operation_type == BuildingTreaty.OperationType.SALE and obj.status in (
+                BuildingTreaty.Status.ACTIVE,
+                BuildingTreaty.Status.SIGNED,
+            ):
+                try:
+                    services.create_sale_commission_adjustment(obj)
+                except Exception:
+                    pass
 
     def perform_destroy(self, instance):
         user = self.request.user
@@ -1892,6 +1912,7 @@ class BuildingTaskChecklistItemDetailView(CompanyQuerysetMixin, generics.Retriev
 class BuildingSalaryEmployeeListView(generics.ListAPIView):
     """
     Список сотрудников компании для начисления ЗП (с настройками оклада/ставки).
+    ?residential_complex=<uuid> — только сотрудники, назначенные на этот ЖК.
     """
 
     permission_classes = [permissions.IsAuthenticated]
@@ -1904,10 +1925,27 @@ class BuildingSalaryEmployeeListView(generics.ListAPIView):
         if not company_id and not getattr(request.user, "is_superuser", False):
             raise PermissionDenied("У пользователя не указана компания.")
 
-        users = User.objects.filter(company_id=company_id).only("id", "first_name", "last_name", "email").order_by("last_name", "first_name")
+        users_qs = User.objects.filter(company_id=company_id).only("id", "first_name", "last_name", "email").order_by("last_name", "first_name")
+        rc_id = request.query_params.get("residential_complex")
+        if rc_id:
+            allowed_ids = _allowed_residential_complex_ids(request.user)
+            if allowed_ids is not None and rc_id and str(rc_id) not in {str(i) for i in allowed_ids}:
+                raise PermissionDenied("Нет доступа к этому ЖК.")
+            member_user_ids = list(
+                ResidentialComplexMember.objects.filter(
+                    residential_complex_id=rc_id,
+                    is_active=True,
+                ).values_list("user_id", flat=True)
+            )
+            users_qs = users_qs.filter(id__in=member_user_ids)
+
+        users = list(users_qs)
         comps = {
             str(c.user_id): c
-            for c in BuildingEmployeeCompensation.objects.filter(company_id=company_id).only("id", "user_id", "salary_type", "base_salary", "is_active")
+            for c in BuildingEmployeeCompensation.objects.filter(
+                company_id=company_id,
+                user_id__in=[u.id for u in users],
+            ).only("id", "user_id", "salary_type", "base_salary", "is_active", "sale_commission_type", "sale_commission_value")
         }
 
         rows = []
@@ -1923,6 +1961,8 @@ class BuildingSalaryEmployeeListView(generics.ListAPIView):
                     "salary_type": getattr(c, "salary_type", None),
                     "base_salary": getattr(c, "base_salary", None),
                     "is_active": getattr(c, "is_active", None),
+                    "sale_commission_type": getattr(c, "sale_commission_type", None) or "",
+                    "sale_commission_value": getattr(c, "sale_commission_value", None),
                 }
             )
 
@@ -1953,13 +1993,18 @@ class BuildingEmployeeCompensationUpsertView(generics.GenericAPIView):
 class BuildingPayrollPeriodListCreateView(CompanyQuerysetMixin, generics.ListCreateAPIView):
     permission_classes = [permissions.IsAuthenticated]
     serializer_class = BuildingPayrollPeriodSerializer
-    queryset = BuildingPayrollPeriod.objects.select_related("company", "created_by", "approved_by").prefetch_related(
+    queryset = BuildingPayrollPeriod.objects.select_related(
+        "company",
+        "residential_complex",
+        "created_by",
+        "approved_by",
+    ).prefetch_related(
         "lines__employee",
         "lines__adjustments",
         "lines__payments",
     )
     filter_backends = [DjangoFilterBackend, filters.SearchFilter]
-    filterset_fields = ["status", "period_start", "period_end"]
+    filterset_fields = ["status", "period_start", "period_end", "residential_complex"]
     search_fields = ["title"]
 
     def get_queryset(self):
@@ -1969,26 +2014,73 @@ class BuildingPayrollPeriodListCreateView(CompanyQuerysetMixin, generics.ListCre
         if getattr(user, "is_superuser", False):
             return qs
         company_id = getattr(user, "company_id", None)
-        return qs.filter(company_id=company_id) if company_id else qs.none()
+        qs = qs.filter(company_id=company_id) if company_id else qs.none()
+        allowed_ids = _allowed_residential_complex_ids(user)
+        if allowed_ids is not None:
+            qs = qs.filter(Q(residential_complex_id__in=allowed_ids) | Q(residential_complex__isnull=True))
+        return qs
 
+    @transaction.atomic
     def perform_create(self, serializer):
         _require_salary_perm(self.request.user)
-        company_id = getattr(self.request.user, "company_id", None)
-        if not company_id and not getattr(self.request.user, "is_superuser", False):
+        user = self.request.user
+        company_id = getattr(user, "company_id", None)
+        if not company_id and not getattr(user, "is_superuser", False):
             raise PermissionDenied("У пользователя не указана компания.")
+
+        rc = serializer.validated_data.get("residential_complex")
+        if not rc:
+            raise ValidationError({"residential_complex": "Укажите жилой комплекс (ЖК)."})
+        if not getattr(user, "is_superuser", False) and rc.company_id != company_id:
+            raise PermissionDenied("ЖК принадлежит другой компании.")
+        allowed_ids = _allowed_residential_complex_ids(user)
+        if allowed_ids is not None and rc.id not in set(allowed_ids):
+            raise PermissionDenied("Нет доступа к этому ЖК.")
 
         ps = serializer.validated_data["period_start"]
         pe = serializer.validated_data["period_end"]
         if ps > pe:
             raise ValidationError({"period_end": "period_end должен быть >= period_start"})
 
-        serializer.save(company_id=company_id, created_by=self.request.user)
+        payroll = serializer.save(
+            company_id=rc.company_id,
+            residential_complex=rc,
+            created_by=user,
+        )
+        members = list(
+            ResidentialComplexMember.objects.filter(
+                residential_complex=rc,
+                is_active=True,
+            ).select_related("user").values_list("user_id", flat=True)
+        )
+        comps = {
+            str(c.user_id): c
+            for c in BuildingEmployeeCompensation.objects.filter(
+                company_id=rc.company_id,
+                user_id__in=members,
+            )
+        }
+        for user_id in members:
+            comp = comps.get(str(user_id))
+            base_amount = (getattr(comp, "base_salary", None) or Decimal("0.00")) if comp else Decimal("0.00")
+            line = BuildingPayrollLine.objects.create(
+                payroll=payroll,
+                employee_id=user_id,
+                base_amount=base_amount,
+            )
+            line.recalculate_totals()
+            line.recalculate_paid_total()
 
 
 class BuildingPayrollPeriodDetailView(CompanyQuerysetMixin, generics.RetrieveUpdateDestroyAPIView):
     permission_classes = [permissions.IsAuthenticated]
     serializer_class = BuildingPayrollPeriodSerializer
-    queryset = BuildingPayrollPeriod.objects.select_related("company", "created_by", "approved_by").prefetch_related(
+    queryset = BuildingPayrollPeriod.objects.select_related(
+        "company",
+        "residential_complex",
+        "created_by",
+        "approved_by",
+    ).prefetch_related(
         "lines__employee",
         "lines__adjustments",
         "lines__payments",
@@ -2165,19 +2257,88 @@ class BuildingPayrollAdjustmentCreateView(CompanyQuerysetMixin, generics.Generic
         ser = self.get_serializer(data=request.data)
         ser.is_valid(raise_exception=True)
 
-        adj = BuildingPayrollAdjustment.objects.create(
-            line=line,
-            type=ser.validated_data["type"],
-            title=(ser.validated_data.get("title") or "").strip(),
-            amount=ser.validated_data["amount"],
-            created_by=request.user,
-        )
-        line.refresh_from_db()
-        line.recalculate_totals()
-        line.recalculate_paid_total()
+        adj_type = ser.validated_data["type"]
+        title = (ser.validated_data.get("comment") or ser.validated_data.get("title") or "").strip()
+        amount = ser.validated_data["amount"]
 
-        if line.net_to_pay < line.paid_total:
-            raise ValidationError({"amount": "Корректировка приводит к переплате (paid_total > net_to_pay)."})
+        if adj_type == BuildingPayrollAdjustment.Type.ADVANCE:
+            _require_cash_register_perm(request.user)
+            if line.payroll.status != BuildingPayrollPeriod.Status.APPROVED:
+                raise PermissionDenied("Авансы разрешены только в периоде со статусом approved.")
+            line.recalculate_totals()
+            line.recalculate_paid_total()
+            remaining = (Decimal(line.net_to_pay or 0) - Decimal(line.paid_total or 0)).quantize(Decimal("0.01"))
+            if remaining <= 0:
+                raise ValidationError({"amount": "По строке не осталось суммы к выплате."})
+            if amount > remaining:
+                raise ValidationError({"amount": f"Сумма аванса не должна превышать остаток ({remaining})."})
+            cashbox_id = ser.validated_data.get("cashbox")
+            if not cashbox_id:
+                raise ValidationError({"cashbox": "Для аванса укажите кассу."})
+            cashbox = Cashbox.objects.select_related("company").filter(id=cashbox_id).first()
+            if not cashbox:
+                raise ValidationError({"cashbox": "Касса не найдена."})
+            if not getattr(request.user, "is_superuser", False) and cashbox.company_id != getattr(request.user, "company_id", None):
+                raise PermissionDenied("Касса другой компании.")
+            shift = None
+            shift_id = ser.validated_data.get("shift")
+            if shift_id:
+                shift = CashShift.objects.select_related("cashbox").filter(id=shift_id).first()
+                if not shift:
+                    raise ValidationError({"shift": "Смена не найдена."})
+                if shift.cashbox_id != cashbox.id:
+                    raise ValidationError({"shift": "Смена относится к другой кассе."})
+                if shift.status != CashShift.Status.OPEN:
+                    raise ValidationError({"shift": "Нельзя выплатить из закрытой смены."})
+                if (not _is_owner_like(request.user)) and shift.cashier_id != request.user.id:
+                    raise ValidationError({"shift": "Это не ваша смена."})
+            paid_at = ser.validated_data.get("paid_at") or timezone.now()
+
+            adj = BuildingPayrollAdjustment.objects.create(
+                line=line,
+                type=BuildingPayrollAdjustment.Type.ADVANCE,
+                status=BuildingPayrollAdjustment.Status.PENDING,
+                title=title or "Аванс",
+                amount=amount,
+                created_by=request.user,
+            )
+            emp = line.employee
+            emp_name = f"{getattr(emp, 'first_name', '')} {getattr(emp, 'last_name', '')}".strip() if emp else ""
+            emp_display = emp_name or getattr(emp, "email", None) or getattr(emp, "username", None) or str(getattr(emp, "id", ""))
+            payment = BuildingPayrollPayment.objects.create(
+                line=line,
+                amount=amount,
+                paid_at=paid_at,
+                paid_by=request.user,
+                cashbox=cashbox,
+                shift=shift,
+                status=BuildingPayrollPayment.Status.PENDING,
+                advance_adjustment=adj,
+            )
+            cf = CashFlow.objects.create(
+                cashbox=cashbox,
+                shift=shift,
+                type=CashFlow.Type.EXPENSE,
+                name=f"ЗП аванс: {emp_display}",
+                amount=abs(amount),
+                status=CashFlow.Status.PENDING,
+                source_business_operation_id=str(payment.id),
+            )
+            payment.cashflow = cf
+            payment.save(update_fields=["cashflow"])
+        else:
+            adj = BuildingPayrollAdjustment.objects.create(
+                line=line,
+                type=adj_type,
+                title=title,
+                amount=amount,
+                created_by=request.user,
+            )
+            line.refresh_from_db()
+            line.recalculate_totals()
+            line.recalculate_paid_total()
+            if line.net_to_pay < line.paid_total:
+                raise ValidationError({"amount": "Корректировка приводит к переплате (paid_total > net_to_pay)."})
 
         return Response(BuildingPayrollAdjustmentSerializer(adj, context={"request": request}).data, status=status.HTTP_201_CREATED)
 
@@ -2201,6 +2362,8 @@ class BuildingPayrollAdjustmentDetailView(CompanyQuerysetMixin, generics.Retriev
         _require_salary_perm(self.request.user)
         if instance.line.payroll.status == BuildingPayrollPeriod.Status.PAID:
             raise PermissionDenied("Нельзя менять начисления в периоде paid.")
+        if instance.type == BuildingPayrollAdjustment.Type.ADVANCE and instance.status == BuildingPayrollAdjustment.Status.COMPLETED:
+            raise PermissionDenied("Нельзя отменить проведённый аванс (уже выплачен через кассу).")
         line = instance.line
         instance.delete()
         line.refresh_from_db()
@@ -2283,9 +2446,8 @@ class BuildingPayrollPaymentListCreateView(CompanyQuerysetMixin, generics.Generi
             paid_by=request.user,
             cashbox=cashbox,
             shift=shift,
-            status=BuildingPayrollPayment.Status.POSTED,
+            status=BuildingPayrollPayment.Status.PENDING,
         )
-
         emp = line.employee
         emp_name = f"{getattr(emp, 'first_name', '')} {getattr(emp, 'last_name', '')}".strip() if emp else ""
         emp_display = emp_name or getattr(emp, "email", None) or getattr(emp, "username", None) or str(getattr(emp, "id", ""))
@@ -2295,14 +2457,11 @@ class BuildingPayrollPaymentListCreateView(CompanyQuerysetMixin, generics.Generi
             type=CashFlow.Type.EXPENSE,
             name=f"ЗП: {emp_display} / {payroll.period_start} - {payroll.period_end}",
             amount=abs(amount),
-            status=CashFlow.Status.APPROVED,
+            status=CashFlow.Status.PENDING,
             source_business_operation_id=str(payment.id),
         )
         payment.cashflow = cf
         payment.save(update_fields=["cashflow"])
-
-        line.recalculate_paid_total()
-        payroll.try_mark_paid()
 
         return Response(BuildingPayrollPaymentSerializer(payment, context={"request": request}).data, status=status.HTTP_201_CREATED)
 
@@ -2310,7 +2469,7 @@ class BuildingPayrollPaymentListCreateView(CompanyQuerysetMixin, generics.Generi
 class BuildingPayrollMyLinesView(CompanyQuerysetMixin, generics.ListAPIView):
     permission_classes = [permissions.IsAuthenticated]
     serializer_class = BuildingPayrollMyLineSerializer
-    queryset = BuildingPayrollLine.objects.select_related("payroll").prefetch_related("payments")
+    queryset = BuildingPayrollLine.objects.select_related("payroll", "payroll__residential_complex").prefetch_related("payments")
     filter_backends = [DjangoFilterBackend]
     filterset_fields = ["payroll__status"]
 
@@ -2320,5 +2479,9 @@ class BuildingPayrollMyLinesView(CompanyQuerysetMixin, generics.ListAPIView):
         if getattr(user, "is_superuser", False):
             return qs
         company_id = getattr(user, "company_id", None)
-        return qs.filter(payroll__company_id=company_id) if company_id else qs.none()
+        qs = qs.filter(payroll__company_id=company_id) if company_id else qs.none()
+        allowed_ids = _allowed_residential_complex_ids(user)
+        if allowed_ids is not None:
+            qs = qs.filter(payroll__residential_complex_id__in=allowed_ids)
+        return qs
 
