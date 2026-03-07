@@ -331,14 +331,16 @@ class AppointmentServicesListField(serializers.Field):
     """
 
     def to_representation(self, value):
-        # value — queryset appointment_services (through), уже может быть prefetched
+        # value — manager (appointment_services) или prefetched list
+        if value is None:
+            return []
         if hasattr(value, "order_by"):
             qs = value.order_by("position")
-        else:
-            qs = value or []
-        if hasattr(qs, "values_list"):
-            return list(qs.values_list("service_id", flat=True))
-        return [item.service_id for item in qs]
+            if hasattr(qs, "values_list"):
+                return list(qs.values_list("service_id", flat=True))
+        if hasattr(value, "__iter__") and not hasattr(value, "values_list"):
+            return [getattr(item, "service_id", None) for item in value]
+        return []
 
     def to_internal_value(self, data):
         """Возвращаем список ID (не объекты Service), чтобы в модель не попадали Service при create/update."""
@@ -391,25 +393,28 @@ class AppointmentSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSeriali
             return f"{obj.barber.first_name or ''} {obj.barber.last_name or ''}".strip()
         return obj.barber.email
 
+    def _get_appointment_services_ordered(self, obj):
+        """Возвращает список AppointmentService по порядку position (всегда из БД при необходимости)."""
+        rel = getattr(obj, "appointment_services", None)
+        if rel is None:
+            return []
+        if hasattr(rel, "order_by"):
+            return list(rel.order_by("position").select_related("service", "service__category"))
+        return list(rel) if hasattr(rel, "__iter__") else []
+
     def get_services_names(self, obj):
-        qs = getattr(obj, "appointment_services", None) or []
-        if hasattr(qs, "order_by"):
-            qs = qs.order_by("position")
-        if hasattr(qs, "select_related"):
-            qs = qs.select_related("service")
-        return [item.service.name for item in qs]
+        items = self._get_appointment_services_ordered(obj)
+        return [getattr(item.service, "name", "") for item in items if getattr(item, "service", None)]
 
     def get_services_public(self, obj):
-        qs = getattr(obj, "appointment_services", None) or []
-        if hasattr(qs, "order_by"):
-            qs = qs.order_by("position")
-        if hasattr(qs, "select_related"):
-            qs = qs.select_related("service__category")
-        return [AppointmentPublicServiceSerializer(item.service).data for item in qs]
+        items = self._get_appointment_services_ordered(obj)
+        return [AppointmentPublicServiceSerializer(item.service).data for item in items if getattr(item, "service", None)]
 
     def create(self, validated_data):
-        service_ids = validated_data.pop("services", [])
-        validated_data.pop("appointment_services", None)
+        # DRF при source="appointment_services" кладёт значение в ключ "appointment_services"
+        service_ids = validated_data.pop("appointment_services", None)
+        if service_ids is None:
+            service_ids = validated_data.pop("services", [])
         instance = super().create(validated_data)
         if service_ids:
             by_pk = {str(s.pk): s for s in Service.objects.filter(pk__in=service_ids)}
@@ -420,8 +425,10 @@ class AppointmentSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSeriali
         return instance
 
     def update(self, instance, validated_data):
-        service_ids = validated_data.pop("services", None)
-        validated_data.pop("appointment_services", None)
+        # DRF при source="appointment_services" кладёт значение в ключ "appointment_services"
+        service_ids = validated_data.pop("appointment_services", None)
+        if service_ids is None:
+            service_ids = validated_data.pop("services", None)
         instance = super().update(instance, validated_data)
         if service_ids is not None:
             AppointmentService.objects.filter(appointment=instance).delete()
@@ -465,11 +472,11 @@ class AppointmentSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSeriali
         company_id = getattr(user_company, "id", None)
         target_branch = self._auto_branch()
 
-        # текущее значение client/barber/services с учётом partial (services в attrs — список ID; для проверок нужны объекты Service)
+        # текущее значение client/barber/services (DRF при source кладёт в attrs ключ "appointment_services")
         client = attrs.get("client") or getattr(self.instance, "client", None)
         barber = attrs.get("barber") or getattr(self.instance, "barber", None)
-        if attrs.get("services") is not None:
-            service_ids = attrs["services"]
+        service_ids = attrs.get("appointment_services", attrs.get("services"))
+        if service_ids is not None:
             services = list(Service.objects.filter(pk__in=service_ids)) if service_ids else []
             by_pk = {str(s.pk): s for s in services}
             services = [by_pk[str(sid)] for sid in service_ids if str(sid) in by_pk]

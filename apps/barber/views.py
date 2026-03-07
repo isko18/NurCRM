@@ -549,6 +549,14 @@ class AppointmentRetrieveUpdateDestroyView(
     serializer_class = AppointmentSerializer
     permission_classes = [permissions.IsAuthenticated]
 
+    def update(self, request, *args, **kwargs):
+        """После PATCH перезагружаем запись с prefetch appointment_services для полного ответа."""
+        response = super().update(request, *args, **kwargs)
+        instance = self.get_object()
+        output_serializer = AppointmentSerializer(instance, context=self.get_serializer_context())
+        response.data = output_serializer.data
+        return response
+
 
 class MyAppointmentListView(CompanyQuerysetMixin, generics.ListAPIView):
     """
