@@ -51,6 +51,7 @@ from .pos_serializers import (
     SaleItemSerializer,
     ScanRequestSerializer,
     AddItemSerializer,
+    CartItemPatchSerializer,
     CheckoutSerializer,
     PayDebtSerializer,
     MobileScannerTokenSerializer,
@@ -1291,6 +1292,15 @@ class SaleAddItemAPIView(MarketCashierOnlyMixin, APIView):
             else:
                 calculated_unit_price = product.price
 
+        # Цена продажи не ниже цены товара (можно выше, нельзя ниже)
+        min_price = _q2(Decimal(str(product.price or 0)))
+        final_unit_price = _q2(calculated_unit_price or unit_price)
+        if final_unit_price < min_price:
+            return Response(
+                {"unit_price": f"Цена продажи не может быть ниже цены товара ({min_price})."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
         # Блокируем корзину для предотвращения race conditions
         cart = Cart.objects.select_for_update().get(id=cart.id)
         
@@ -1301,7 +1311,7 @@ class SaleAddItemAPIView(MarketCashierOnlyMixin, APIView):
                 "company": cart.company,
                 "branch": getattr(cart, "branch", None),
                 "quantity": qty3(qty),
-                "unit_price": calculated_unit_price or unit_price,
+                "unit_price": final_unit_price,
             },
         )
         
@@ -1311,7 +1321,7 @@ class SaleAddItemAPIView(MarketCashierOnlyMixin, APIView):
             
             # Обновляем цену только если она была явно указана (unit_price или discount_total)
             if unit_price is not None or line_discount is not None:
-                item.unit_price = calculated_unit_price or unit_price
+                item.unit_price = final_unit_price
             
             item.save(update_fields=["quantity", "unit_price"])
 
@@ -1673,38 +1683,74 @@ class CartItemUpdateDestroyAPIView(MarketCashierOnlyMixin, APIView):
         )
 
     def _get_item_in_cart(self, cart, item_or_product_id):
-        item = CartItem.objects.filter(cart=cart, id=item_or_product_id).first()
+        item = CartItem.objects.filter(cart=cart, id=item_or_product_id).select_related("product").first()
         if item:
             return item
 
-        item = CartItem.objects.filter(cart=cart, product_id=item_or_product_id).first()
+        item = CartItem.objects.filter(cart=cart, product_id=item_or_product_id).select_related("product").first()
         if item:
             return item
 
         raise Http404("CartItem not found in this cart.")
+
+    def _apply_min_price(self, item, unit_price):
+        """Цена продажи не ниже цены товара: unit_price >= product.price."""
+        if not item.product_id:
+            return unit_price
+        min_price = _q2(Decimal(str(item.product.price or 0)))
+        if unit_price < min_price:
+            return min_price
+        return unit_price
 
     @transaction.atomic
     def patch(self, request, cart_id, item_id, *args, **kwargs):
         cart = self._get_active_cart(request, cart_id)
         item = self._get_item_in_cart(cart, item_id)
 
-        raw = request.data.get("quantity")
-        qty = _to_decimal(raw, default=None)
-        if qty is None:
-            return Response({"quantity": "Укажите число >= 0."}, status=400)
+        ser = CartItemPatchSerializer(data=request.data, partial=True)
+        ser.is_valid(raise_exception=True)
+        data = ser.validated_data
 
-        qty = qty3(qty)
+        qty = data.get("quantity")
+        if qty is not None:
+            qty = qty3(qty)
+            if qty < 0:
+                return Response({"quantity": "Количество не может быть отрицательным."}, status=400)
+            if qty == 0:
+                item.delete()
+                cart.recalc()
+                return Response(SaleCartSerializer(cart).data, status=200)
+            item.quantity = qty
 
-        if qty < 0:
-            return Response({"quantity": "Количество не может быть отрицательным."}, status=400)
+        unit_price = data.get("unit_price")
+        line_discount = data.get("discount_total")
+        if unit_price is not None and line_discount is not None:
+            return Response(
+                {"detail": "Передавайте либо unit_price, либо discount_total."},
+                status=400,
+            )
 
-        if qty == 0:
-            item.delete()
-            cart.recalc()
-            return Response(SaleCartSerializer(cart).data, status=200)
+        if unit_price is not None or line_discount is not None:
+            qty_for_price = Decimal(str(item.quantity or 1))
+            if unit_price is not None:
+                new_price = _q2(unit_price)
+            else:
+                per_unit_disc = _q2(Decimal(str(line_discount)) / qty_for_price)
+                new_price = _q2(
+                    Decimal(str(item.product.price if item.product_id else 0)) - per_unit_disc
+                )
+                if new_price < 0:
+                    new_price = Decimal("0.00")
+            new_price = self._apply_min_price(item, new_price)
+            item.unit_price = new_price
 
-        item.quantity = qty
-        item.save(update_fields=["quantity"])
+        update_fields = []
+        if qty is not None:
+            update_fields.append("quantity")
+        if unit_price is not None or line_discount is not None:
+            update_fields.append("unit_price")
+        if update_fields:
+            item.save(update_fields=update_fields)
         cart.recalc()
         return Response(SaleCartSerializer(cart).data, status=200)
 
@@ -2063,6 +2109,15 @@ class AgentSaleAddItemAPIView(MarketCashierOnlyMixin, CompanyBranchRestrictedMix
             else:
                 calculated_unit_price = product.price
 
+        # Цена продажи не ниже цены товара (можно выше, нельзя ниже)
+        min_price = money(Decimal(str(product.price or 0)))
+        final_unit_price = money(calculated_unit_price or unit_price)
+        if final_unit_price < min_price:
+            return Response(
+                {"unit_price": f"Цена продажи не может быть ниже цены товара ({min_price})."},
+                status=400,
+            )
+
         # Блокируем корзину для предотвращения race conditions
         cart = Cart.objects.select_for_update().get(id=cart.id)
         
@@ -2073,7 +2128,7 @@ class AgentSaleAddItemAPIView(MarketCashierOnlyMixin, CompanyBranchRestrictedMix
                 "company": cart.company,
                 "branch": getattr(cart, "branch", None),
                 "quantity": qty3(qty),
-                "unit_price": calculated_unit_price or unit_price,
+                "unit_price": final_unit_price,
             },
         )
         if not created:
@@ -2082,7 +2137,7 @@ class AgentSaleAddItemAPIView(MarketCashierOnlyMixin, CompanyBranchRestrictedMix
             
             # Обновляем цену только если она была явно указана (unit_price или discount_total)
             if unit_price is not None or line_discount is not None:
-                item.unit_price = calculated_unit_price or unit_price
+                item.unit_price = final_unit_price
             
             item.save(update_fields=["quantity", "unit_price"])
 
@@ -2264,36 +2319,72 @@ class AgentCartItemUpdateDestroyAPIView(MarketCashierOnlyMixin, APIView):
         )
 
     def _get_item_in_cart(self, cart, item_or_product_id):
-        item = CartItem.objects.filter(cart=cart, id=item_or_product_id).first()
+        item = CartItem.objects.filter(cart=cart, id=item_or_product_id).select_related("product").first()
         if item:
             return item
-        item = CartItem.objects.filter(cart=cart, product_id=item_or_product_id).first()
+        item = CartItem.objects.filter(cart=cart, product_id=item_or_product_id).select_related("product").first()
         if item:
             return item
         raise Http404("CartItem not found in this cart.")
+
+    def _apply_min_price(self, item, unit_price):
+        """Цена продажи не ниже цены товара: unit_price >= product.price."""
+        if not item.product_id:
+            return unit_price
+        min_price = _q2(Decimal(str(item.product.price or 0)))
+        if unit_price < min_price:
+            return min_price
+        return unit_price
 
     @transaction.atomic
     def patch(self, request, cart_id, item_id, *args, **kwargs):
         cart = self._get_active_cart(request, cart_id)
         item = self._get_item_in_cart(cart, item_id)
 
-        raw = request.data.get("quantity")
-        qty = _to_decimal(raw, default=None)
-        if qty is None:
-            return Response({"quantity": "Укажите число >= 0."}, status=400)
+        ser = CartItemPatchSerializer(data=request.data, partial=True)
+        ser.is_valid(raise_exception=True)
+        data = ser.validated_data
 
-        qty = qty3(qty)
+        qty = data.get("quantity")
+        if qty is not None:
+            qty = qty3(qty)
+            if qty < 0:
+                return Response({"quantity": "Количество не может быть отрицательным."}, status=400)
+            if qty == 0:
+                item.delete()
+                cart.recalc()
+                return Response(SaleCartSerializer(cart).data, status=200)
+            item.quantity = qty
 
-        if qty < 0:
-            return Response({"quantity": "Количество не может быть отрицательным."}, status=400)
+        unit_price = data.get("unit_price")
+        line_discount = data.get("discount_total")
+        if unit_price is not None and line_discount is not None:
+            return Response(
+                {"detail": "Передавайте либо unit_price, либо discount_total."},
+                status=400,
+            )
 
-        if qty == 0:
-            item.delete()
-            cart.recalc()
-            return Response(SaleCartSerializer(cart).data, status=200)
+        if unit_price is not None or line_discount is not None:
+            qty_for_price = Decimal(str(item.quantity or 1))
+            if unit_price is not None:
+                new_price = _q2(unit_price)
+            else:
+                per_unit_disc = _q2(Decimal(str(line_discount)) / qty_for_price)
+                new_price = _q2(
+                    Decimal(str(item.product.price if item.product_id else 0)) - per_unit_disc
+                )
+                if new_price < 0:
+                    new_price = Decimal("0.00")
+            new_price = self._apply_min_price(item, new_price)
+            item.unit_price = new_price
 
-        item.quantity = qty
-        item.save(update_fields=["quantity"])
+        update_fields = []
+        if qty is not None:
+            update_fields.append("quantity")
+        if unit_price is not None or line_discount is not None:
+            update_fields.append("unit_price")
+        if update_fields:
+            item.save(update_fields=update_fields)
         cart.recalc()
         return Response(SaleCartSerializer(cart).data, status=200)
 

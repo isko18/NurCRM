@@ -214,6 +214,27 @@ class AddItemSerializer(serializers.Serializer):
         attrs["quantity"] = qty
         return attrs
 
+
+class CartItemPatchSerializer(serializers.Serializer):
+    """PATCH позиции корзины: количество (0 = удалить), цена или скидка на позицию."""
+    quantity = serializers.DecimalField(
+        max_digits=12, decimal_places=3, required=False, min_value=Decimal("0"),
+    )
+    unit_price = MoneyField(required=False)
+    discount_total = MoneyField(required=False)
+
+    def validate(self, attrs):
+        up = attrs.get("unit_price")
+        disc = attrs.get("discount_total")
+        if up is not None and up < 0:
+            raise serializers.ValidationError({"unit_price": "Должна быть ≥ 0."})
+        if disc is not None and disc < 0:
+            raise serializers.ValidationError({"discount_total": "Должна быть ≥ 0."})
+        if up is not None and disc is not None:
+            raise serializers.ValidationError("Передавайте либо unit_price, либо discount_total.")
+        return attrs
+
+
 class OptionalUUIDField(serializers.UUIDField):
     def to_internal_value(self, data):
         if data in (None, "", "null", "None"):
