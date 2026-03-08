@@ -1045,6 +1045,53 @@ class BuildingPayrollAdjustmentSerializer(serializers.ModelSerializer):
         return full_name or getattr(u, "email", None) or getattr(u, "username", None) or str(getattr(u, "id", ""))
 
 
+class AdvanceRequestSerializer(serializers.Serializer):
+    """Заявка на аванс для оператора кассы."""
+
+    id = serializers.UUIDField()
+    payroll_line_id = serializers.UUIDField(source="line_id")
+    employee = serializers.UUIDField(source="line.employee_id")
+    employee_display = serializers.SerializerMethodField()
+    amount = serializers.DecimalField(max_digits=16, decimal_places=2)
+    cashbox = serializers.SerializerMethodField()
+    cashbox_display = serializers.SerializerMethodField()
+    created_at = serializers.DateTimeField()
+    requested_at = serializers.DateTimeField(source="created_at")
+    status = serializers.CharField()
+    residential_complex = serializers.UUIDField(source="line.payroll.residential_complex_id", allow_null=True)
+    payroll = serializers.UUIDField(source="line.payroll_id")
+    period_start = serializers.DateField(source="line.payroll.period_start")
+    period_end = serializers.DateField(source="line.payroll.period_end")
+
+    def _get_payment(self, obj):
+        payments = obj.payment.all() if hasattr(obj, "payment") else []
+        return payments[0] if payments else None
+
+    def get_employee_display(self, obj):
+        emp = getattr(obj.line, "employee", None) if obj.line_id else None
+        if not emp:
+            return None
+        full_name = f"{getattr(emp, 'first_name', '')} {getattr(emp, 'last_name', '')}".strip()
+        return full_name or getattr(emp, "email", None) or getattr(emp, "username", None) or str(getattr(emp, "id", ""))
+
+    def get_cashbox(self, obj):
+        payment = self._get_payment(obj)
+        return payment.cashbox_id if payment and payment.cashbox_id else None
+
+    def get_cashbox_display(self, obj):
+        payment = self._get_payment(obj)
+        if not payment or not payment.cashbox_id:
+            return None
+        cashbox = getattr(payment, "cashbox", None)
+        if not cashbox:
+            return None
+        return getattr(cashbox, "name", None) or str(cashbox.id)
+
+
+class AdvanceRequestApproveSerializer(serializers.Serializer):
+    paid_at = serializers.DateTimeField(required=False, allow_null=True)
+
+
 class BuildingPayrollPaymentSerializer(serializers.ModelSerializer):
     paid_by_display = serializers.SerializerMethodField(read_only=True)
 
