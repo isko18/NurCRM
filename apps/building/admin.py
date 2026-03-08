@@ -294,7 +294,7 @@ class BuildingTaskChecklistItemAdmin(admin.ModelAdmin):
 
 @admin.register(BuildingEmployeeCompensation)
 class BuildingEmployeeCompensationAdmin(admin.ModelAdmin):
-    list_display = ("id", "company", "user", "salary_type", "base_salary", "is_active", "updated_at")
+    list_display = ("id", "company", "user", "salary_type", "base_salary", "sale_commission_type", "sale_commission_value", "is_active", "updated_at")
     list_filter = ("company", "salary_type", "is_active")
     search_fields = ("user__email", "user__first_name", "user__last_name")
     readonly_fields = ("id", "created_at", "updated_at")

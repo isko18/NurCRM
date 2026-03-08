@@ -1411,6 +1411,7 @@ class BuildingTaskChecklistItem(models.Model):
 class BuildingEmployeeCompensation(models.Model):
     class SalaryType(models.TextChoices):
         MONTHLY = "monthly", "Оклад (месяц)"
+        MONTHLY_PLUS_PERCENT = "monthly_pct", "Оклад + % от продаж"
         DAILY = "daily", "Ставка (день)"
         HOURLY = "hourly", "Ставка (час)"
 

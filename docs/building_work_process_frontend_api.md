@@ -500,16 +500,20 @@
 Ответ (пример полей):
 - `id`, `display`
 - `compensation_id` (если настройки есть)
-- `salary_type`, `base_salary`, `is_active`
+- `salary_type`, `base_salary`, `sale_commission_type`, `sale_commission_value`, `is_active`
 
 Настроить оклад/ставку:
 - `PATCH /salary/employees/{user_id}/compensation/`
 
 Поля:
-- `salary_type`: `monthly|daily|hourly`
-- `base_salary`: сумма
+- `salary_type`: `monthly` | `monthly_pct` (оклад + % от продаж) | `daily` | `hourly`
+- `base_salary`: сумма (оклад)
+- `sale_commission_type`: `none` | `fixed` | `percent` — начисление от продаж
+- `sale_commission_value`: сумма или % (при `percent` — например 2.5 для 2.5%)
 - `is_active`: bool
 - `notes`: строка
+
+**Оклад + %:** при `salary_type=monthly_pct` укажите `sale_commission_type=percent` и `sale_commission_value`. При подписании договора продажи ответственный получит премию в строку начисления.
 
 ### 7.2) Периоды начислений
 
