@@ -381,7 +381,11 @@
 ### Сотрудники
 
 - `GET /salary/employees/`
-- `PATCH /salary/employees/{user_id}/compensation/` — оклад: `salary_type`, `base_salary`, `is_active`, `notes`
+- `PATCH /salary/employees/{user_id}/compensation/` — настройки ЗП: `salary_type`, `base_salary`, `sale_commission_type`, `sale_commission_value`, `is_active`, `notes`
+
+**Типы оплаты (`salary_type`):** `monthly` (оклад месяц), `monthly_pct` (оклад + % от продаж), `daily` (ставка день), `hourly` (ставка час).
+
+**Оклад + % (`monthly_pct`):** при выборе указывайте `sale_commission_type` = `percent` и `sale_commission_value` (например `2.5` для 2.5%). При подписании договора продажи автоматически создаётся премия в строке начисления ответственного.
 
 ### Периоды
 
