@@ -1,7 +1,7 @@
 from decimal import Decimal
 
 from django.db import transaction
-from django.db.models import Q, Count, Case, When, Value
+from django.db.models import Q, Count, Case, When, Value, Prefetch
 from django.db.models.fields import CharField
 from django.contrib.auth import get_user_model
 from django.utils import timezone
@@ -83,6 +83,8 @@ from .serializers import (
     BuildingPayrollPaymentSerializer,
     BuildingPayrollPaymentCreateSerializer,
     BuildingPayrollMyLineSerializer,
+    AdvanceRequestSerializer,
+    AdvanceRequestApproveSerializer,
     BuildingCashboxSerializer,
     BuildingCashFlowSerializer,
     BuildingCashFlowBulkStatusSerializer,
@@ -2457,6 +2459,147 @@ class BuildingPayrollMyLinesView(CompanyQuerysetMixin, generics.ListAPIView):
         if allowed_ids is not None:
             qs = qs.filter(payroll__residential_complex_id__in=allowed_ids)
         return qs
+
+
+class AdvanceRequestListView(CompanyQuerysetMixin, generics.ListAPIView):
+    """
+    Список заявок на аванс (pending) для оператора кассы.
+    GET /salary/advance-requests/
+    """
+    permission_classes = [permissions.IsAuthenticated]
+    serializer_class = AdvanceRequestSerializer
+    queryset = BuildingPayrollAdjustment.objects.filter(
+        type=BuildingPayrollAdjustment.Type.ADVANCE,
+        status=BuildingPayrollAdjustment.Status.PENDING,
+    ).select_related(
+        "line",
+        "line__employee",
+        "line__payroll",
+        "line__payroll__residential_complex",
+    ).prefetch_related(
+        Prefetch(
+            "payment",
+            queryset=BuildingPayrollPayment.objects.select_related("cashbox"),
+        ),
+    ).order_by("-created_at")
+
+    def get_queryset(self):
+        _require_cash_register_perm(self.request.user)
+        qs = super().get_queryset()
+        user = self.request.user
+        if not getattr(user, "is_superuser", False):
+            company_id = getattr(user, "company_id", None)
+            if company_id:
+                qs = qs.filter(line__payroll__company_id=company_id)
+            else:
+                qs = qs.none()
+        cashbox = self.request.query_params.get("cashbox")
+        if cashbox:
+            qs = qs.filter(payment__cashbox_id=cashbox)
+        residential_complex = self.request.query_params.get("residential_complex")
+        if residential_complex:
+            qs = qs.filter(line__payroll__residential_complex_id=residential_complex)
+        payroll = self.request.query_params.get("payroll")
+        if payroll:
+            qs = qs.filter(line__payroll_id=payroll)
+        return qs.distinct()
+
+
+class AdvanceRequestApproveView(CompanyQuerysetMixin, generics.GenericAPIView):
+    """
+    Одобрить заявку на аванс. Сумма снимается с net_to_pay, движение кассы проводится.
+    POST /salary/advance-requests/{id}/approve/
+    """
+    permission_classes = [permissions.IsAuthenticated]
+    serializer_class = AdvanceRequestApproveSerializer
+    queryset = BuildingPayrollAdjustment.objects.filter(
+        type=BuildingPayrollAdjustment.Type.ADVANCE,
+        status=BuildingPayrollAdjustment.Status.PENDING,
+    ).select_related("line", "line__payroll")
+
+    def get_queryset(self):
+        _require_cash_register_perm(self.request.user)
+        qs = super().get_queryset()
+        user = self.request.user
+        if not getattr(user, "is_superuser", False):
+            company_id = getattr(user, "company_id", None)
+            if company_id:
+                qs = qs.filter(line__payroll__company_id=company_id)
+            else:
+                qs = qs.none()
+        return qs
+
+    @transaction.atomic
+    def post(self, request, pk=None):
+        _require_cash_register_perm(request.user)
+        adj = self.get_object()
+        payment = adj.payment.first()
+        if not payment:
+            raise ValidationError({"detail": "У заявки нет связанной выплаты."})
+        if payment.status != BuildingPayrollPayment.Status.PENDING:
+            raise ValidationError({"detail": "Заявка уже обработана."})
+        cf = payment.cashflow
+        if not cf:
+            raise ValidationError({"detail": "У выплаты нет движения кассы."})
+
+        ser = self.get_serializer(data=request.data or {}, partial=True)
+        ser.is_valid(raise_exception=True)
+        paid_at = ser.validated_data.get("paid_at")
+        if paid_at:
+            payment.paid_at = paid_at
+            payment.save(update_fields=["paid_at"])
+
+        cf.status = BuildingCashFlow.Status.APPROVED
+        cf.save(update_fields=["status"])
+        # post_save signal вызовет on_cashflow_approved
+
+        adj.refresh_from_db()
+        adj = BuildingPayrollAdjustment.objects.select_related(
+            "line", "line__employee", "line__payroll", "line__payroll__residential_complex"
+        ).prefetch_related(
+            Prefetch("payment", queryset=BuildingPayrollPayment.objects.select_related("cashbox")),
+        ).get(pk=adj.pk)
+        return Response(
+            AdvanceRequestSerializer(adj, context={"request": request}).data,
+            status=status.HTTP_200_OK,
+        )
+
+
+class AdvanceRequestRejectView(CompanyQuerysetMixin, generics.GenericAPIView):
+    """
+    Отклонить заявку на аванс.
+    POST /salary/advance-requests/{id}/reject/
+    """
+    permission_classes = [permissions.IsAuthenticated]
+    queryset = BuildingPayrollAdjustment.objects.filter(
+        type=BuildingPayrollAdjustment.Type.ADVANCE,
+        status=BuildingPayrollAdjustment.Status.PENDING,
+    ).select_related("line", "line__payroll")
+
+    def get_queryset(self):
+        _require_cash_register_perm(self.request.user)
+        qs = super().get_queryset()
+        user = self.request.user
+        if not getattr(user, "is_superuser", False):
+            company_id = getattr(user, "company_id", None)
+            if company_id:
+                qs = qs.filter(line__payroll__company_id=company_id)
+            else:
+                qs = qs.none()
+        return qs
+
+    @transaction.atomic
+    def post(self, request, pk=None):
+        _require_cash_register_perm(request.user)
+        adj = self.get_object()
+        payment = adj.payment.first()
+        if payment and payment.cashflow_id:
+            cf = payment.cashflow
+            cf.status = BuildingCashFlow.Status.REJECTED
+            cf.save(update_fields=["status"])
+        adj.status = BuildingPayrollAdjustment.Status.REJECTED
+        adj.save(update_fields=["status"])
+        return Response({"status": "rejected"}, status=status.HTTP_200_OK)
 
 
 # -----------------------

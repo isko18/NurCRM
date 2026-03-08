@@ -64,6 +64,9 @@ from .views import (
     BuildingPayrollAdjustmentDetailView,
     BuildingPayrollPaymentListCreateView,
     BuildingPayrollMyLinesView,
+    AdvanceRequestListView,
+    AdvanceRequestApproveView,
+    AdvanceRequestRejectView,
 )
 
 app_name = "building"
@@ -159,4 +162,7 @@ urlpatterns = [
     path("salary/payroll-adjustments/<uuid:pk>/", BuildingPayrollAdjustmentDetailView.as_view(), name="building-salary-payroll-adjustment-detail"),
     path("salary/payroll-lines/<uuid:pk>/payments/", BuildingPayrollPaymentListCreateView.as_view(), name="building-salary-payroll-payments"),
     path("salary/my/lines/", BuildingPayrollMyLinesView.as_view(), name="building-salary-my-lines"),
+    path("salary/advance-requests/", AdvanceRequestListView.as_view(), name="building-salary-advance-requests"),
+    path("salary/advance-requests/<uuid:pk>/approve/", AdvanceRequestApproveView.as_view(), name="building-salary-advance-request-approve"),
+    path("salary/advance-requests/<uuid:pk>/reject/", AdvanceRequestRejectView.as_view(), name="building-salary-advance-request-reject"),
 ]

@@ -441,6 +441,16 @@
 
 - `GET /salary/my/lines/` — сотрудник видит только свои строки
 
+### Заявки на аванс (для кассы)
+
+Оператор кассы (`can_view_building_cash_register`) просматривает и обрабатывает заявки на аванс.
+
+- `GET /salary/advance-requests/` — список заявок со статусом `pending`
+  - Фильтры: `?cashbox=uuid`, `?residential_complex=uuid`, `?payroll=uuid`
+- `POST /salary/advance-requests/{id}/approve/` — одобрить (сумма снимается с net_to_pay, движение кассы проводится)
+  - Тело (опционально): `{"paid_at": "2026-03-10T14:00:00+06:00"}`
+- `POST /salary/advance-requests/{id}/reject/` — отклонить
+
 ---
 
 ## 10) Ограничения по ЖК
@@ -491,6 +501,9 @@
 | | DELETE | `/salary/payroll-adjustments/{id}/` |
 | | GET/POST | `/salary/payroll-lines/{id}/payments/` |
 | | GET | `/salary/my/lines/` |
+| | GET | `/salary/advance-requests/` |
+| | POST | `/salary/advance-requests/{id}/approve/` |
+| | POST | `/salary/advance-requests/{id}/reject/` |
 | **Задачи** | GET/POST | `/tasks/` |
 | | GET/PATCH/DELETE | `/tasks/{id}/` |
 | | POST | `/tasks/{id}/checklist-items/` |
