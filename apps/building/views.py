@@ -2237,6 +2237,15 @@ class BuildingPayrollAdjustmentCreateView(CompanyQuerysetMixin, generics.Generic
         company_id = getattr(user, "company_id", None)
         return qs.filter(payroll__company_id=company_id) if company_id else qs.none()
 
+    def get(self, request, pk=None):
+        _require_salary_perm(request.user)
+        line = self.get_object()
+        adjustments = line.adjustments.select_related("created_by", "source_treaty").order_by("-created_at")
+        return Response(
+            BuildingPayrollAdjustmentSerializer(adjustments, many=True, context={"request": request}).data,
+            status=status.HTTP_200_OK,
+        )
+
     @transaction.atomic
     def post(self, request, pk=None):
         _require_salary_perm(request.user)

@@ -398,6 +398,7 @@
 
 ### Корректировки
 
+- `GET /salary/payroll-lines/{id}/adjustments/` — список корректировок
 - `POST /salary/payroll-lines/{id}/adjustments/` — типы: `bonus`, `deduction`, `advance`
 - `DELETE /salary/payroll-adjustments/{id}/`
 
@@ -482,7 +483,7 @@
 | | POST | `/salary/payrolls/{id}/approve/` |
 | | GET/POST | `/salary/payrolls/{id}/lines/` |
 | | GET/PATCH/DELETE | `/salary/payroll-lines/{id}/` |
-| | POST | `/salary/payroll-lines/{id}/adjustments/` |
+| | GET/POST | `/salary/payroll-lines/{id}/adjustments/` |
 | | DELETE | `/salary/payroll-adjustments/{id}/` |
 | | GET/POST | `/salary/payroll-lines/{id}/payments/` |
 | | GET | `/salary/my/lines/` |

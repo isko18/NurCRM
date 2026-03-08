@@ -559,6 +559,7 @@
 Если `base_amount` не передан — берется `base_salary` из настроек сотрудника (если есть), иначе `0.00`.
 
 Корректировки:
+- список: `GET /salary/payroll-lines/{id}/adjustments/`
 - добавить: `POST /salary/payroll-lines/{id}/adjustments/`
 - удалить: `DELETE /salary/payroll-adjustments/{id}/`
 
