@@ -1,3 +1,4 @@
+import calendar
 import os
 from decimal import Decimal
 
@@ -483,6 +484,7 @@ def create_sale_commission_adjustment(treaty: BuildingTreaty):
     При продаже (договор подписан/активен, тип SALE): создать премию в строке начисления
     ответственного (created_by), если у него настроено начисление от продаж.
     Идемпотентно: не создаёт повторно по одному и тому же договору.
+    Если период или строка начисления не существуют — создаёт их автоматически.
     """
     if treaty.operation_type != BuildingTreaty.OperationType.SALE:
         return
@@ -491,9 +493,10 @@ def create_sale_commission_adjustment(treaty: BuildingTreaty):
     employee_id = treaty.created_by_id
     if not employee_id:
         return
+    rc = treaty.residential_complex
     comp = (
         BuildingEmployeeCompensation.objects.filter(
-            company_id=treaty.residential_complex.company_id,
+            company_id=rc.company_id,
             user_id=employee_id,
             is_active=True,
         )
@@ -505,9 +508,10 @@ def create_sale_commission_adjustment(treaty: BuildingTreaty):
         return
     sale_date = (treaty.signed_at or treaty.created_at) or timezone.now()
     sale_date = sale_date.date() if hasattr(sale_date, "date") else sale_date
+
     period = (
         BuildingPayrollPeriod.objects.filter(
-            residential_complex=treaty.residential_complex,
+            residential_complex=rc,
             status__in=(BuildingPayrollPeriod.Status.DRAFT, BuildingPayrollPeriod.Status.APPROVED),
             period_start__lte=sale_date,
             period_end__gte=sale_date,
@@ -516,10 +520,29 @@ def create_sale_commission_adjustment(treaty: BuildingTreaty):
         .first()
     )
     if not period:
-        return
+        _, last_day = calendar.monthrange(sale_date.year, sale_date.month)
+        period_start = sale_date.replace(day=1)
+        period_end = sale_date.replace(day=last_day)
+        period = BuildingPayrollPeriod.objects.create(
+            company_id=rc.company_id,
+            residential_complex=rc,
+            title=f"ЗП {period_start.strftime('%Y-%m')}",
+            period_start=period_start,
+            period_end=period_end,
+            status=BuildingPayrollPeriod.Status.DRAFT,
+        )
+
     line = BuildingPayrollLine.objects.filter(payroll=period, employee_id=employee_id).first()
     if not line:
-        return
+        base_amount = getattr(comp, "base_salary", None) or Decimal("0.00")
+        line = BuildingPayrollLine.objects.create(
+            payroll=period,
+            employee_id=employee_id,
+            base_amount=base_amount,
+        )
+        line.recalculate_totals()
+        line.recalculate_paid_total()
+
     if BuildingPayrollAdjustment.objects.filter(line=line, source_treaty=treaty).exists():
         return
     if comp.sale_commission_type == BuildingEmployeeCompensation.SaleCommissionType.FIXED:
@@ -538,3 +561,5 @@ def create_sale_commission_adjustment(treaty: BuildingTreaty):
         amount=amount,
         source_treaty=treaty,
     )
+    line.recalculate_totals()
+    line.recalculate_paid_total()
