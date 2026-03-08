@@ -2262,8 +2262,11 @@ class BuildingPayrollAdjustmentCreateView(CompanyQuerysetMixin, generics.Generic
 
         if adj_type == BuildingPayrollAdjustment.Type.ADVANCE:
             _require_cash_register_perm(request.user)
-            if line.payroll.status != BuildingPayrollPeriod.Status.APPROVED:
-                raise PermissionDenied("Авансы разрешены только в периоде со статусом approved.")
+            if line.payroll.status not in (
+                BuildingPayrollPeriod.Status.DRAFT,
+                BuildingPayrollPeriod.Status.APPROVED,
+            ):
+                raise PermissionDenied("Авансы разрешены только в периоде draft или approved.")
             line.recalculate_totals()
             line.recalculate_paid_total()
             remaining = (Decimal(line.net_to_pay or 0) - Decimal(line.paid_total or 0)).quantize(Decimal("0.01"))
