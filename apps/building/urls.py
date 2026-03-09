@@ -26,6 +26,7 @@ from .views import (
     BuildingProductDetailView,
     BuildingProcurementListCreateView,
     BuildingProcurementDetailView,
+    BuildingProcurementFileAddView,
     BuildingProcurementItemListCreateView,
     BuildingProcurementItemDetailView,
     BuildingProcurementSubmitToCashView,
@@ -111,6 +112,7 @@ urlpatterns = [
 
     path("procurements/", BuildingProcurementListCreateView.as_view(), name="building-procurement-list-create"),
     path("procurements/<uuid:pk>/", BuildingProcurementDetailView.as_view(), name="building-procurement-detail"),
+    path("procurements/<uuid:pk>/files/", BuildingProcurementFileAddView.as_view(), name="building-procurement-file-add"),
     path("procurement-items/", BuildingProcurementItemListCreateView.as_view(), name="building-procurement-item-list-create"),
     path("procurement-items/<uuid:pk>/", BuildingProcurementItemDetailView.as_view(), name="building-procurement-item-detail"),
     path("procurements/<uuid:pk>/submit-to-cash/", BuildingProcurementSubmitToCashView.as_view(), name="building-procurement-submit-to-cash"),
