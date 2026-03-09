@@ -17,6 +17,20 @@ from .models import (
     BuildingCashFlowFile,
     BuildingCashRegisterRequest,
     BuildingCashRegisterRequestFile,
+    BuildingContractor,
+    BuildingContractorFile,
+    BuildingSupplier,
+    BuildingSupplierFile,
+    BuildingTransferRequest,
+    BuildingTransferRequestFile,
+    BuildingWarehouseRequest,
+    BuildingWarehouseRequestItem,
+    BuildingReconciliationAct,
+    BuildingReconciliationActItem,
+    BuildingWarehouseMovement,
+    BuildingWarehouseMovementItem,
+    BuildingWarehouseMovementFile,
+    BuildingWarehouseStockItem,
     ResidentialComplex,
     ResidentialComplexMember,
     ResidentialComplexDrawing,
@@ -101,6 +115,17 @@ from .serializers import (
     BuildingCashRegisterRequestFileCreateSerializer,
     BuildingCashFlowFileSerializer,
     BuildingCashFlowFileCreateSerializer,
+    BuildingContractorSerializer,
+    BuildingContractorCreateSerializer,
+    BuildingSupplierSerializer,
+    BuildingSupplierCreateSerializer,
+    BuildingWarehouseRequestSerializer,
+    BuildingWarehouseRequestCreateSerializer,
+    BuildingReconciliationActSerializer,
+    BuildingReconciliationActCreateSerializer,
+    BuildingWarehouseMovementSerializer,
+    BuildingWarehouseMovementWriteOffSerializer,
+    BuildingWarehouseMovementTransferSerializer,
 )
 from . import services
 
@@ -563,7 +588,7 @@ class BuildingProductDetailView(CompanyQuerysetMixin, generics.RetrieveUpdateDes
 class BuildingProcurementListCreateView(CompanyQuerysetMixin, generics.ListCreateAPIView):
     permission_classes = [permissions.IsAuthenticated]
     serializer_class = BuildingProcurementSerializer
-    queryset = BuildingProcurementRequest.objects.select_related("residential_complex", "initiator").prefetch_related("items", "files")
+    queryset = BuildingProcurementRequest.objects.select_related("residential_complex", "initiator", "supplier").prefetch_related("items", "files")
     filter_backends = [DjangoFilterBackend, filters.SearchFilter]
     filterset_fields = ["residential_complex", "status"]
     search_fields = ["title", "comment", "residential_complex__name"]
@@ -596,7 +621,7 @@ class BuildingProcurementListCreateView(CompanyQuerysetMixin, generics.ListCreat
 class BuildingProcurementDetailView(CompanyQuerysetMixin, generics.RetrieveUpdateDestroyAPIView):
     permission_classes = [permissions.IsAuthenticated]
     serializer_class = BuildingProcurementSerializer
-    queryset = BuildingProcurementRequest.objects.select_related("residential_complex", "initiator").prefetch_related("items", "files")
+    queryset = BuildingProcurementRequest.objects.select_related("residential_complex", "initiator", "supplier").prefetch_related("items", "files")
 
     def get_queryset(self):
         qs = super().get_queryset()
@@ -776,7 +801,7 @@ class BuildingProcurementSubmitToCashView(CompanyQuerysetMixin, generics.Generic
 class BuildingCashPendingProcurementListView(CompanyQuerysetMixin, generics.ListAPIView):
     permission_classes = [permissions.IsAuthenticated]
     serializer_class = BuildingProcurementSerializer
-    queryset = BuildingProcurementRequest.objects.select_related("residential_complex", "initiator").prefetch_related("items", "files")
+    queryset = BuildingProcurementRequest.objects.select_related("residential_complex", "initiator", "supplier").prefetch_related("items", "files")
 
     def get_queryset(self):
         qs = super().get_queryset().filter(status=BuildingProcurementRequest.Status.SUBMITTED_TO_CASH)
@@ -880,7 +905,7 @@ class BuildingTransferListView(CompanyQuerysetMixin, generics.ListAPIView):
         "warehouse",
         "created_by",
         "decided_by",
-    ).prefetch_related("items")
+    ).prefetch_related("items", "files")
     filter_backends = [DjangoFilterBackend, filters.SearchFilter]
     filterset_fields = ["status", "warehouse", "procurement"]
     search_fields = ["note", "warehouse__name", "procurement__title", "procurement__residential_complex__name"]
@@ -910,7 +935,7 @@ class BuildingTransferDetailView(CompanyQuerysetMixin, generics.RetrieveAPIView)
         "warehouse",
         "created_by",
         "decided_by",
-    ).prefetch_related("items")
+    ).prefetch_related("items", "files")
 
     def get_queryset(self):
         qs = super().get_queryset()
@@ -978,6 +1003,189 @@ class BuildingTransferRejectView(CompanyQuerysetMixin, generics.GenericAPIView):
         services.reject_transfer(transfer, request.user, reason=ser.validated_data["reason"])
         transfer.refresh_from_db()
         return Response(self.get_serializer(transfer).data, status=status.HTTP_200_OK)
+
+
+class BuildingTransferFileAddView(CompanyQuerysetMixin, generics.GenericAPIView):
+    """Загрузить файл к передаче на склад (warehouse-receipt)."""
+    permission_classes = [permissions.IsAuthenticated]
+    serializer_class = BuildingTreatyFileCreateSerializer
+    parser_classes = [MultiPartParser, FormParser]
+    queryset = BuildingTransferRequest.objects.select_related("warehouse__residential_complex")
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        user = self.request.user
+        if user.is_authenticated and getattr(user, "company_id", None):
+            qs = qs.filter(warehouse__residential_complex__company_id=user.company_id)
+            allowed_ids = _allowed_residential_complex_ids(user)
+            if allowed_ids is not None:
+                qs = qs.filter(warehouse__residential_complex_id__in=allowed_ids)
+        elif not getattr(user, "is_staff", False) and not getattr(user, "is_superuser", False):
+            return qs.none()
+        return qs
+
+    def post(self, request, pk=None):
+        if not (_is_owner_like(request.user) or getattr(request.user, "can_view_building_procurement", False)):
+            raise PermissionDenied("Нет прав на закупки/склад (Building).")
+        transfer = self.get_object()
+        ser = self.get_serializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+        BuildingTransferRequestFile.objects.create(
+            transfer=transfer,
+            file=ser.validated_data["file"],
+            title=(ser.validated_data.get("title") or "").strip(),
+            created_by=request.user,
+        )
+        transfer.refresh_from_db()
+        return Response(
+            BuildingTransferSerializer(transfer, context={"request": request}).data,
+            status=status.HTTP_201_CREATED,
+        )
+
+
+# -----------------------
+# Contractors
+# -----------------------
+
+
+class BuildingContractorListCreateView(CompanyQuerysetMixin, generics.ListCreateAPIView):
+    permission_classes = [permissions.IsAuthenticated]
+    serializer_class = BuildingContractorSerializer
+    queryset = BuildingContractor.objects.prefetch_related("files")
+    filter_backends = [DjangoFilterBackend, filters.SearchFilter]
+    filterset_fields = ["status", "contractor_type"]
+    search_fields = ["company_name", "contact_person", "phone", "email"]
+
+    def get_serializer_class(self):
+        if self.request.method == "POST":
+            return BuildingContractorCreateSerializer
+        return BuildingContractorSerializer
+
+
+class BuildingContractorDetailView(CompanyQuerysetMixin, generics.RetrieveUpdateDestroyAPIView):
+    permission_classes = [permissions.IsAuthenticated]
+    serializer_class = BuildingContractorSerializer
+    queryset = BuildingContractor.objects.prefetch_related("files")
+
+
+class BuildingContractorFileAddView(CompanyQuerysetMixin, generics.GenericAPIView):
+    permission_classes = [permissions.IsAuthenticated]
+    serializer_class = BuildingTreatyFileCreateSerializer
+    parser_classes = [MultiPartParser, FormParser]
+    queryset = BuildingContractor.objects.all()
+
+    def post(self, request, pk=None):
+        contractor = self.get_object()
+        ser = self.get_serializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+        BuildingContractorFile.objects.create(
+            contractor=contractor,
+            file=ser.validated_data["file"],
+            title=(ser.validated_data.get("title") or "").strip(),
+            created_by=request.user,
+        )
+        contractor.refresh_from_db()
+        return Response(
+            BuildingContractorSerializer(contractor, context={"request": request}).data,
+            status=status.HTTP_201_CREATED,
+        )
+
+
+class BuildingContractorWorkHistoryView(CompanyQuerysetMixin, generics.ListAPIView):
+    """История процессов работ подрядчика."""
+    permission_classes = [permissions.IsAuthenticated]
+    serializer_class = BuildingWorkEntrySerializer
+    queryset = BuildingWorkEntry.objects.select_related(
+        "residential_complex", "client", "treaty", "contractor", "created_by"
+    ).prefetch_related("photos", "files")
+    filter_backends = [DjangoFilterBackend]
+    filterset_fields = ["residential_complex", "work_status"]
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        contractor_id = self.kwargs.get("pk")
+        qs = qs.filter(contractor_id=contractor_id)
+        user = self.request.user
+        if user.is_authenticated and getattr(user, "company_id", None):
+            qs = qs.filter(residential_complex__company_id=user.company_id)
+            allowed_ids = _allowed_residential_complex_ids(user)
+            if allowed_ids is not None:
+                qs = qs.filter(residential_complex_id__in=allowed_ids)
+        elif not getattr(user, "is_staff", False) and not getattr(user, "is_superuser", False):
+            return qs.none()
+        return qs
+
+
+# -----------------------
+# Suppliers
+# -----------------------
+
+
+class BuildingSupplierListCreateView(CompanyQuerysetMixin, generics.ListCreateAPIView):
+    permission_classes = [permissions.IsAuthenticated]
+    serializer_class = BuildingSupplierSerializer
+    queryset = BuildingSupplier.objects.prefetch_related("files")
+    filter_backends = [DjangoFilterBackend, filters.SearchFilter]
+    filterset_fields = ["status", "supplier_type"]
+    search_fields = ["company_name", "contact_person", "phone", "email"]
+
+    def get_serializer_class(self):
+        if self.request.method == "POST":
+            return BuildingSupplierCreateSerializer
+        return BuildingSupplierSerializer
+
+
+class BuildingSupplierDetailView(CompanyQuerysetMixin, generics.RetrieveUpdateDestroyAPIView):
+    permission_classes = [permissions.IsAuthenticated]
+    serializer_class = BuildingSupplierSerializer
+    queryset = BuildingSupplier.objects.prefetch_related("files")
+
+
+class BuildingSupplierFileAddView(CompanyQuerysetMixin, generics.GenericAPIView):
+    permission_classes = [permissions.IsAuthenticated]
+    serializer_class = BuildingTreatyFileCreateSerializer
+    parser_classes = [MultiPartParser, FormParser]
+    queryset = BuildingSupplier.objects.all()
+
+    def post(self, request, pk=None):
+        supplier = self.get_object()
+        ser = self.get_serializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+        BuildingSupplierFile.objects.create(
+            supplier=supplier,
+            file=ser.validated_data["file"],
+            title=(ser.validated_data.get("title") or "").strip(),
+            created_by=request.user,
+        )
+        supplier.refresh_from_db()
+        return Response(
+            BuildingSupplierSerializer(supplier, context={"request": request}).data,
+            status=status.HTTP_201_CREATED,
+        )
+
+
+class BuildingSupplierPurchaseHistoryView(CompanyQuerysetMixin, generics.ListAPIView):
+    """История закупок поставщика."""
+    permission_classes = [permissions.IsAuthenticated]
+    serializer_class = BuildingProcurementSerializer
+    queryset = BuildingProcurementRequest.objects.select_related(
+        "residential_complex", "initiator"
+    ).prefetch_related("items", "files")
+    filter_backends = [DjangoFilterBackend]
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        supplier_id = self.kwargs.get("pk")
+        qs = qs.filter(supplier_id=supplier_id)
+        user = self.request.user
+        if user.is_authenticated and getattr(user, "company_id", None):
+            qs = qs.filter(residential_complex__company_id=user.company_id)
+            allowed_ids = _allowed_residential_complex_ids(user)
+            if allowed_ids is not None:
+                qs = qs.filter(residential_complex_id__in=allowed_ids)
+        elif not getattr(user, "is_staff", False) and not getattr(user, "is_superuser", False):
+            return qs.none()
+        return qs
 
 
 class BuildingWorkflowEventListView(CompanyQuerysetMixin, generics.ListAPIView):
@@ -1071,7 +1279,7 @@ class BuildingPurchaseDocumentListCreateView(CompanyQuerysetMixin, generics.List
     """
     permission_classes = [permissions.IsAuthenticated]
     serializer_class = BuildingPurchaseDocumentSerializer
-    queryset = BuildingProcurementRequest.objects.select_related("residential_complex", "initiator").prefetch_related("items", "files")
+    queryset = BuildingProcurementRequest.objects.select_related("residential_complex", "initiator", "supplier").prefetch_related("items", "files")
     filter_backends = [DjangoFilterBackend, filters.SearchFilter]
     filterset_fields = ["status", "residential_complex"]
     search_fields = ["comment", "title", "residential_complex__name"]
@@ -1108,7 +1316,7 @@ class BuildingPurchaseDocumentDetailView(CompanyQuerysetMixin, generics.Retrieve
     """
     permission_classes = [permissions.IsAuthenticated]
     serializer_class = BuildingPurchaseDocumentSerializer
-    queryset = BuildingProcurementRequest.objects.select_related("residential_complex", "initiator").prefetch_related("items", "files")
+    queryset = BuildingProcurementRequest.objects.select_related("residential_complex", "initiator", "supplier").prefetch_related("items", "files")
 
     def get_queryset(self):
         qs = super().get_queryset()
@@ -1192,10 +1400,11 @@ class BuildingWorkEntryListCreateView(CompanyQuerysetMixin, generics.ListCreateA
         "residential_complex",
         "client",
         "treaty",
+        "contractor",
         "created_by",
     ).prefetch_related("photos", "files")
     filter_backends = [DjangoFilterBackend, filters.SearchFilter]
-    filterset_fields = ["residential_complex", "category", "created_by", "client", "treaty"]
+    filterset_fields = ["residential_complex", "category", "created_by", "client", "treaty", "contractor", "work_status"]
     search_fields = ["title", "description", "residential_complex__name", "client__name", "treaty__number"]
 
     def get_queryset(self):
@@ -1249,6 +1458,7 @@ class BuildingWorkEntryDetailView(CompanyQuerysetMixin, generics.RetrieveUpdateD
         "residential_complex",
         "client",
         "treaty",
+        "contractor",
         "created_by",
     ).prefetch_related("photos", "files")
 
@@ -1285,7 +1495,36 @@ class BuildingWorkEntryDetailView(CompanyQuerysetMixin, generics.RetrieveUpdateD
         if treaty and treaty.residential_complex.company_id != rc.company_id:
             raise PermissionDenied("Договор принадлежит другой компании.")
 
+        old_status = obj.work_status
         serializer.save()
+
+        new_status = serializer.instance.work_status
+        if (
+            old_status != BuildingWorkEntry.WorkStatus.COMPLETED
+            and new_status == BuildingWorkEntry.WorkStatus.COMPLETED
+            and serializer.instance.contractor_id
+            and serializer.instance.contract_amount
+        ):
+            if not BuildingCashRegisterRequest.objects.filter(
+                work_entry=serializer.instance,
+                request_type=BuildingCashRegisterRequest.RequestType.CONTRACTOR_PAYMENT,
+            ).exists():
+                cashbox = rc.salary_cashbox or BuildingCashbox.objects.filter(
+                    company_id=rc.company_id
+                ).first()
+                if cashbox:
+                    BuildingCashRegisterRequest.objects.create(
+                        company_id=rc.company_id,
+                        work_entry=serializer.instance,
+                        request_type=BuildingCashRegisterRequest.RequestType.CONTRACTOR_PAYMENT,
+                        status=BuildingCashRegisterRequest.Status.PENDING,
+                        amount=serializer.instance.contract_amount,
+                        comment=f"Оплата подрядчику по процессу работ: {serializer.instance.title or serializer.instance.id}",
+                        cashbox=cashbox,
+                        contractor=serializer.instance.contractor,
+                        residential_complex=rc,
+                        created_by=user,
+                    )
 
     def perform_destroy(self, instance):
         user = self.request.user
@@ -1376,6 +1615,360 @@ class BuildingWorkEntryFileAddView(CompanyQuerysetMixin, generics.GenericAPIView
             BuildingWorkEntryFile.objects.create(entry=entry, file=f, title="", created_by=user)
         entry.refresh_from_db()
         return Response(BuildingWorkEntrySerializer(entry, context={"request": request}).data, status=status.HTTP_201_CREATED)
+
+
+class BuildingWorkEntryWarehouseRequestCreateView(CompanyQuerysetMixin, generics.GenericAPIView):
+    """Создать заявку на выдачу материалов со склада из процесса работ."""
+    permission_classes = [permissions.IsAuthenticated]
+    serializer_class = BuildingWarehouseRequestCreateSerializer
+    queryset = BuildingWorkEntry.objects.select_related("residential_complex")
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        user = self.request.user
+        if user.is_authenticated and getattr(user, "company_id", None):
+            qs = qs.filter(residential_complex__company_id=user.company_id)
+            allowed_ids = _allowed_residential_complex_ids(user)
+            if allowed_ids is not None:
+                qs = qs.filter(residential_complex_id__in=allowed_ids)
+        elif not getattr(user, "is_staff", False) and not getattr(user, "is_superuser", False):
+            return qs.none()
+        return qs
+
+    def post(self, request, pk=None):
+        if not (_is_owner_like(request.user) or getattr(request.user, "can_view_building_work_process", False)):
+            raise PermissionDenied("Нет прав на процесс работ (Building).")
+        entry = self.get_object()
+        ser = self.get_serializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+        warehouse = ResidentialComplexWarehouse.objects.filter(
+            id=ser.validated_data["warehouse"]
+        ).filter(residential_complex=entry.residential_complex).first()
+        if not warehouse:
+            raise ValidationError({"warehouse": "Склад не найден или не принадлежит ЖК процесса работ."})
+        with transaction.atomic():
+            req = BuildingWarehouseRequest.objects.create(
+                work_entry=entry,
+                warehouse=warehouse,
+                comment=ser.validated_data.get("comment", ""),
+                status=BuildingWarehouseRequest.Status.PENDING,
+                created_by=request.user,
+            )
+            for item in ser.validated_data["items"]:
+                stock_item = BuildingWarehouseStockItem.objects.get(id=item["stock_item"])
+                if stock_item.warehouse_id != warehouse.id:
+                    raise ValidationError({"items": f"Позиция {stock_item.name} не принадлежит выбранному складу."})
+                BuildingWarehouseRequestItem.objects.create(
+                    request=req,
+                    stock_item=stock_item,
+                    quantity=item["quantity"],
+                    unit=item.get("unit", "шт"),
+                )
+        req.refresh_from_db()
+        return Response(
+            BuildingWarehouseRequestSerializer(req, context={"request": request}).data,
+            status=status.HTTP_201_CREATED,
+        )
+
+
+class BuildingWorkEntryReconciliationActCreateView(CompanyQuerysetMixin, generics.GenericAPIView):
+    """Создать акт сверки материалов при завершении/отмене процесса работ."""
+    permission_classes = [permissions.IsAuthenticated]
+    serializer_class = BuildingReconciliationActCreateSerializer
+    queryset = BuildingWorkEntry.objects.select_related("residential_complex")
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        user = self.request.user
+        if user.is_authenticated and getattr(user, "company_id", None):
+            qs = qs.filter(residential_complex__company_id=user.company_id)
+            allowed_ids = _allowed_residential_complex_ids(user)
+            if allowed_ids is not None:
+                qs = qs.filter(residential_complex_id__in=allowed_ids)
+        elif not getattr(user, "is_staff", False) and not getattr(user, "is_superuser", False):
+            return qs.none()
+        return qs
+
+    def post(self, request, pk=None):
+        if not (_is_owner_like(request.user) or getattr(request.user, "can_view_building_work_process", False)):
+            raise PermissionDenied("Нет прав на процесс работ (Building).")
+        entry = self.get_object()
+        ser = self.get_serializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+        with transaction.atomic():
+            act = BuildingReconciliationAct.objects.create(
+                work_entry=entry,
+                comment=ser.validated_data.get("comment", ""),
+                status=BuildingReconciliationAct.Status.DRAFT,
+                created_by=request.user,
+            )
+            for item in ser.validated_data["returned_items"]:
+                stock_item = BuildingWarehouseStockItem.objects.get(id=item["stock_item"])
+                BuildingReconciliationActItem.objects.create(
+                    act=act,
+                    stock_item=stock_item,
+                    quantity=item["quantity"],
+                    unit=item.get("unit", "шт"),
+                )
+        act.refresh_from_db()
+        return Response(
+            BuildingReconciliationActSerializer(act, context={"request": request}).data,
+            status=status.HTTP_201_CREATED,
+        )
+
+
+# -----------------------
+# Warehouse movements (write-off, transfer)
+# -----------------------
+
+
+class BuildingWarehouseMovementWriteOffView(CompanyQuerysetMixin, generics.GenericAPIView):
+    """Списание со склада."""
+    permission_classes = [permissions.IsAuthenticated]
+    serializer_class = BuildingWarehouseMovementWriteOffSerializer
+    queryset = ResidentialComplexWarehouse.objects.select_related("residential_complex")
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        user = self.request.user
+        if user.is_authenticated and getattr(user, "company_id", None):
+            qs = qs.filter(residential_complex__company_id=user.company_id)
+            allowed_ids = _allowed_residential_complex_ids(user)
+            if allowed_ids is not None:
+                qs = qs.filter(residential_complex_id__in=allowed_ids)
+        elif not getattr(user, "is_staff", False) and not getattr(user, "is_superuser", False):
+            return qs.none()
+        return qs
+
+    def post(self, request):
+        if not (_is_owner_like(request.user) or getattr(request.user, "can_view_building_stock", False)):
+            raise PermissionDenied("Нет прав на склад (Building).")
+        ser = self.get_serializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+        warehouse = ResidentialComplexWarehouse.objects.filter(
+            id=ser.validated_data["warehouse"]
+        ).first()
+        if not warehouse or warehouse not in self.get_queryset():
+            raise ValidationError({"warehouse": "Склад не найден."})
+        company = warehouse.residential_complex.company
+        with transaction.atomic():
+            movement = BuildingWarehouseMovement.objects.create(
+                company=company,
+                warehouse=warehouse,
+                movement_type=BuildingWarehouseMovement.MovementType.WRITE_OFF,
+                reason=ser.validated_data.get("reason", ""),
+                created_by=request.user,
+            )
+            for item in ser.validated_data["items"]:
+                stock_item = BuildingWarehouseStockItem.objects.get(id=item["stock_item"])
+                if stock_item.warehouse_id != warehouse.id:
+                    raise ValidationError({"items": f"Позиция {stock_item.name} не принадлежит выбранному складу."})
+                qty = Decimal(item["quantity"])
+                if qty <= 0:
+                    raise ValidationError({"items": "Количество должно быть положительным."})
+                BuildingWarehouseMovementItem.objects.create(
+                    movement=movement,
+                    stock_item=stock_item,
+                    quantity=qty,
+                )
+                stock_item.quantity -= qty
+                stock_item.save(update_fields=["quantity", "updated_at"])
+                BuildingWarehouseStockMove.objects.create(
+                    warehouse=warehouse,
+                    stock_item=stock_item,
+                    movement=movement,
+                    move_type=BuildingWarehouseStockMove.MoveType.WRITE_OFF,
+                    quantity_delta=-qty,
+                    price=stock_item.last_price,
+                    created_by=request.user,
+                )
+        movement.refresh_from_db()
+        return Response(
+            BuildingWarehouseMovementSerializer(movement, context={"request": request}).data,
+            status=status.HTTP_201_CREATED,
+        )
+
+
+class BuildingWarehouseMovementTransferToContractorView(CompanyQuerysetMixin, generics.GenericAPIView):
+    """Передача материалов подрядчику."""
+    permission_classes = [permissions.IsAuthenticated]
+    serializer_class = BuildingWarehouseMovementTransferSerializer
+    queryset = ResidentialComplexWarehouse.objects.select_related("residential_complex")
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        user = self.request.user
+        if user.is_authenticated and getattr(user, "company_id", None):
+            qs = qs.filter(residential_complex__company_id=user.company_id)
+            allowed_ids = _allowed_residential_complex_ids(user)
+            if allowed_ids is not None:
+                qs = qs.filter(residential_complex_id__in=allowed_ids)
+        elif not getattr(user, "is_staff", False) and not getattr(user, "is_superuser", False):
+            return qs.none()
+        return qs
+
+    def post(self, request):
+        if not (_is_owner_like(request.user) or getattr(request.user, "can_view_building_stock", False)):
+            raise PermissionDenied("Нет прав на склад (Building).")
+        contractor_id = request.data.get("contractor")
+        if not contractor_id:
+            raise ValidationError({"contractor": "Укажите подрядчика."})
+        contractor = BuildingContractor.objects.filter(id=contractor_id, company_id=request.user.company_id).first()
+        if not contractor:
+            raise ValidationError({"contractor": "Подрядчик не найден."})
+        ser = self.get_serializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+        warehouse = ResidentialComplexWarehouse.objects.filter(
+            id=ser.validated_data["warehouse"]
+        ).first()
+        if not warehouse or warehouse not in self.get_queryset():
+            raise ValidationError({"warehouse": "Склад не найден."})
+        company = warehouse.residential_complex.company
+        with transaction.atomic():
+            movement = BuildingWarehouseMovement.objects.create(
+                company=company,
+                warehouse=warehouse,
+                movement_type=BuildingWarehouseMovement.MovementType.TRANSFER_TO_CONTRACTOR,
+                contractor=contractor,
+                reason=ser.validated_data.get("comment", ""),
+                created_by=request.user,
+            )
+            for item in ser.validated_data["items"]:
+                stock_item = BuildingWarehouseStockItem.objects.get(id=item["stock_item"])
+                if stock_item.warehouse_id != warehouse.id:
+                    raise ValidationError({"items": f"Позиция {stock_item.name} не принадлежит выбранному складу."})
+                qty = Decimal(item["quantity"])
+                if qty <= 0:
+                    raise ValidationError({"items": "Количество должно быть положительным."})
+                BuildingWarehouseMovementItem.objects.create(movement=movement, stock_item=stock_item, quantity=qty)
+                stock_item.quantity -= qty
+                stock_item.save(update_fields=["quantity", "updated_at"])
+                BuildingWarehouseStockMove.objects.create(
+                    warehouse=warehouse,
+                    stock_item=stock_item,
+                    movement=movement,
+                    contractor=contractor,
+                    move_type=BuildingWarehouseStockMove.MoveType.TRANSFER_TO_CONTRACTOR,
+                    quantity_delta=-qty,
+                    price=stock_item.last_price,
+                    created_by=request.user,
+                )
+        movement.refresh_from_db()
+        return Response(
+            BuildingWarehouseMovementSerializer(movement, context={"request": request}).data,
+            status=status.HTTP_201_CREATED,
+        )
+
+
+class BuildingWarehouseMovementTransferToWorkEntryView(CompanyQuerysetMixin, generics.GenericAPIView):
+    """Передача материалов в процесс работ."""
+    permission_classes = [permissions.IsAuthenticated]
+    serializer_class = BuildingWarehouseMovementTransferSerializer
+    queryset = ResidentialComplexWarehouse.objects.select_related("residential_complex")
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        user = self.request.user
+        if user.is_authenticated and getattr(user, "company_id", None):
+            qs = qs.filter(residential_complex__company_id=user.company_id)
+            allowed_ids = _allowed_residential_complex_ids(user)
+            if allowed_ids is not None:
+                qs = qs.filter(residential_complex_id__in=allowed_ids)
+        elif not getattr(user, "is_staff", False) and not getattr(user, "is_superuser", False):
+            return qs.none()
+        return qs
+
+    def post(self, request):
+        if not (_is_owner_like(request.user) or getattr(request.user, "can_view_building_stock", False)):
+            raise PermissionDenied("Нет прав на склад (Building).")
+        work_entry_id = request.data.get("work_entry")
+        if not work_entry_id:
+            raise ValidationError({"work_entry": "Укажите процесс работ."})
+        work_entry = BuildingWorkEntry.objects.filter(
+            id=work_entry_id,
+            residential_complex__company_id=request.user.company_id,
+        ).first()
+        if not work_entry:
+            raise ValidationError({"work_entry": "Процесс работ не найден."})
+        ser = self.get_serializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+        warehouse = ResidentialComplexWarehouse.objects.filter(
+            id=ser.validated_data["warehouse"]
+        ).first()
+        if not warehouse or warehouse not in self.get_queryset():
+            raise ValidationError({"warehouse": "Склад не найден."})
+        if warehouse.residential_complex_id != work_entry.residential_complex_id:
+            raise ValidationError({"warehouse": "Склад должен принадлежать ЖК процесса работ."})
+        company = warehouse.residential_complex.company
+        with transaction.atomic():
+            movement = BuildingWarehouseMovement.objects.create(
+                company=company,
+                warehouse=warehouse,
+                movement_type=BuildingWarehouseMovement.MovementType.TRANSFER_TO_WORK_ENTRY,
+                work_entry=work_entry,
+                reason=ser.validated_data.get("comment", ""),
+                created_by=request.user,
+            )
+            for item in ser.validated_data["items"]:
+                stock_item = BuildingWarehouseStockItem.objects.get(id=item["stock_item"])
+                if stock_item.warehouse_id != warehouse.id:
+                    raise ValidationError({"items": f"Позиция {stock_item.name} не принадлежит выбранному складу."})
+                qty = Decimal(item["quantity"])
+                if qty <= 0:
+                    raise ValidationError({"items": "Количество должно быть положительным."})
+                BuildingWarehouseMovementItem.objects.create(movement=movement, stock_item=stock_item, quantity=qty)
+                stock_item.quantity -= qty
+                stock_item.save(update_fields=["quantity", "updated_at"])
+                BuildingWarehouseStockMove.objects.create(
+                    warehouse=warehouse,
+                    stock_item=stock_item,
+                    movement=movement,
+                    work_entry=work_entry,
+                    move_type=BuildingWarehouseStockMove.MoveType.TRANSFER_TO_WORK_ENTRY,
+                    quantity_delta=-qty,
+                    price=stock_item.last_price,
+                    created_by=request.user,
+                )
+        movement.refresh_from_db()
+        return Response(
+            BuildingWarehouseMovementSerializer(movement, context={"request": request}).data,
+            status=status.HTTP_201_CREATED,
+        )
+
+
+class BuildingWarehouseMovementFileAddView(CompanyQuerysetMixin, generics.GenericAPIView):
+    """Загрузить файл к движению склада."""
+    permission_classes = [permissions.IsAuthenticated]
+    serializer_class = BuildingTreatyFileCreateSerializer
+    parser_classes = [MultiPartParser, FormParser]
+    queryset = BuildingWarehouseMovement.objects.select_related("warehouse__residential_complex")
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        user = self.request.user
+        if user.is_authenticated and getattr(user, "company_id", None):
+            qs = qs.filter(company_id=user.company_id)
+        elif not getattr(user, "is_staff", False) and not getattr(user, "is_superuser", False):
+            return qs.none()
+        return qs
+
+    def post(self, request, pk=None):
+        if not (_is_owner_like(request.user) or getattr(request.user, "can_view_building_stock", False)):
+            raise PermissionDenied("Нет прав на склад (Building).")
+        movement = self.get_object()
+        ser = self.get_serializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+        BuildingWarehouseMovementFile.objects.create(
+            movement=movement,
+            file=ser.validated_data["file"],
+            title=(ser.validated_data.get("title") or "").strip(),
+            created_by=request.user,
+        )
+        movement.refresh_from_db()
+        return Response(
+            BuildingWarehouseMovementSerializer(movement, context={"request": request}).data,
+            status=status.HTTP_201_CREATED,
+        )
 
 
 class BuildingClientListCreateView(CompanyQuerysetMixin, generics.ListCreateAPIView):

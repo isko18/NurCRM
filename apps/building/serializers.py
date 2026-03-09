@@ -13,6 +13,18 @@ from .models import (
     BuildingCashFlowFile,
     BuildingCashRegisterRequest,
     BuildingCashRegisterRequestFile,
+    BuildingContractor,
+    BuildingContractorFile,
+    BuildingSupplier,
+    BuildingSupplierFile,
+    BuildingTransferRequestFile,
+    BuildingWarehouseRequest,
+    BuildingWarehouseRequestItem,
+    BuildingReconciliationAct,
+    BuildingReconciliationActItem,
+    BuildingWarehouseMovement,
+    BuildingWarehouseMovementItem,
+    BuildingWarehouseMovementFile,
     BuildingClient,
     BuildingClientFile,
     BuildingTaskFile,
@@ -224,6 +236,262 @@ class ResidentialComplexApartmentSerializer(serializers.ModelSerializer):
         return str(getattr(client, "id", None)) or None
 
 
+# -----------------------
+# Contractors
+# -----------------------
+
+
+class BuildingContractorFileSerializer(serializers.ModelSerializer):
+    file_url = serializers.SerializerMethodField()
+
+    class Meta:
+        model = BuildingContractorFile
+        fields = ["id", "file", "file_url", "title", "created_at"]
+        read_only_fields = ["id", "created_at"]
+
+    def get_file_url(self, obj):
+        if obj.file:
+            request = self.context.get("request")
+            if request:
+                return request.build_absolute_uri(obj.file.url)
+            return obj.file.url
+        return None
+
+
+class BuildingContractorSerializer(serializers.ModelSerializer):
+    files = BuildingContractorFileSerializer(many=True, read_only=True)
+
+    class Meta:
+        model = BuildingContractor
+        fields = [
+            "id", "company", "company_name", "contractor_type", "tax_id", "registration_number",
+            "year_founded", "contact_person", "phone", "email", "city", "address",
+            "specializations", "employees", "equipment", "status",
+            "created_at", "updated_at", "files",
+        ]
+        read_only_fields = ["id", "company", "created_at", "updated_at", "files"]
+
+
+class BuildingContractorCreateSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = BuildingContractor
+        fields = [
+            "company_name", "contractor_type", "tax_id", "registration_number", "year_founded",
+            "contact_person", "phone", "email", "city", "address",
+            "specializations", "employees", "equipment", "status",
+        ]
+
+    def create(self, validated_data):
+        company = self.context["request"].user.company
+        if not company:
+            raise serializers.ValidationError({"company": "У пользователя не указана компания."})
+        validated_data["company_id"] = company.id
+        return super().create(validated_data)
+
+
+# -----------------------
+# Suppliers
+# -----------------------
+
+
+class BuildingSupplierFileSerializer(serializers.ModelSerializer):
+    file_url = serializers.SerializerMethodField()
+
+    class Meta:
+        model = BuildingSupplierFile
+        fields = ["id", "file", "file_url", "title", "created_at"]
+        read_only_fields = ["id", "created_at"]
+
+    def get_file_url(self, obj):
+        if obj.file:
+            request = self.context.get("request")
+            if request:
+                return request.build_absolute_uri(obj.file.url)
+            return obj.file.url
+        return None
+
+
+class BuildingSupplierSerializer(serializers.ModelSerializer):
+    files = BuildingSupplierFileSerializer(many=True, read_only=True)
+
+    class Meta:
+        model = BuildingSupplier
+        fields = [
+            "id", "company", "company_name", "supplier_type", "tax_id", "registration_number",
+            "year_founded", "contact_person", "position", "phone", "email", "website",
+            "city", "address", "postal_code", "bank_details", "supplied_materials",
+            "delivery", "warehouse", "rating", "completed_orders", "status",
+            "created_at", "updated_at", "files",
+        ]
+        read_only_fields = ["id", "company", "created_at", "updated_at", "files"]
+
+
+class BuildingSupplierCreateSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = BuildingSupplier
+        fields = [
+            "company_name", "supplier_type", "tax_id", "registration_number", "year_founded",
+            "contact_person", "position", "phone", "email", "website",
+            "city", "address", "postal_code", "bank_details", "supplied_materials",
+            "delivery", "warehouse", "rating", "completed_orders", "status",
+        ]
+
+    def create(self, validated_data):
+        company = self.context["request"].user.company
+        if not company:
+            raise serializers.ValidationError({"company": "У пользователя не указана компания."})
+        validated_data["company_id"] = company.id
+        return super().create(validated_data)
+
+
+# -----------------------
+# Warehouse requests, reconciliation, movements
+# -----------------------
+
+
+class BuildingWarehouseRequestItemSerializer(serializers.ModelSerializer):
+    stock_item_name = serializers.CharField(source="stock_item.name", read_only=True)
+
+    class Meta:
+        model = BuildingWarehouseRequestItem
+        fields = ["id", "stock_item", "stock_item_name", "quantity", "unit", "approved_quantity", "created_at"]
+        read_only_fields = ["id", "created_at"]
+
+
+class BuildingWarehouseRequestSerializer(serializers.ModelSerializer):
+    items = BuildingWarehouseRequestItemSerializer(many=True, read_only=True)
+    warehouse_name = serializers.CharField(source="warehouse.name", read_only=True)
+
+    class Meta:
+        model = BuildingWarehouseRequest
+        fields = ["id", "work_entry", "warehouse", "warehouse_name", "comment", "status", "items", "created_by", "created_at", "updated_at"]
+        read_only_fields = ["id", "created_at", "updated_at"]
+
+
+class BuildingWarehouseRequestCreateSerializer(serializers.Serializer):
+    warehouse = serializers.UUIDField()
+    items = serializers.ListField(
+        child=serializers.DictField()
+    )
+    comment = serializers.CharField(required=False, allow_blank=True)
+
+    def validate_items(self, value):
+        for i, item in enumerate(value):
+            if "stock_item" not in item or "quantity" not in item:
+                raise serializers.ValidationError(f"Позиция {i}: укажите stock_item и quantity.")
+            if "unit" not in item:
+                item["unit"] = "шт"
+        return value
+
+
+class BuildingReconciliationActItemSerializer(serializers.ModelSerializer):
+    stock_item_name = serializers.CharField(source="stock_item.name", read_only=True)
+
+    class Meta:
+        model = BuildingReconciliationActItem
+        fields = ["id", "stock_item", "stock_item_name", "quantity", "unit", "created_at"]
+        read_only_fields = ["id", "created_at"]
+
+
+class BuildingReconciliationActSerializer(serializers.ModelSerializer):
+    returned_items = BuildingReconciliationActItemSerializer(many=True, read_only=True)
+
+    class Meta:
+        model = BuildingReconciliationAct
+        fields = ["id", "work_entry", "comment", "status", "returned_items", "created_by", "created_at", "updated_at"]
+        read_only_fields = ["id", "created_at", "updated_at"]
+
+
+class BuildingReconciliationActCreateSerializer(serializers.Serializer):
+    returned_items = serializers.ListField(
+        child=serializers.DictField()
+    )
+    comment = serializers.CharField(required=False, allow_blank=True)
+
+    def validate_returned_items(self, value):
+        for i, item in enumerate(value):
+            if "stock_item" not in item or "quantity" not in item:
+                raise serializers.ValidationError(f"Позиция {i}: укажите stock_item и quantity.")
+            if "unit" not in item:
+                item["unit"] = "шт"
+        return value
+
+
+class BuildingWarehouseMovementItemSerializer(serializers.ModelSerializer):
+    stock_item_name = serializers.CharField(source="stock_item.name", read_only=True)
+
+    class Meta:
+        model = BuildingWarehouseMovementItem
+        fields = ["id", "stock_item", "stock_item_name", "quantity", "created_at"]
+        read_only_fields = ["id", "created_at"]
+
+
+class BuildingWarehouseMovementFileSerializer(serializers.ModelSerializer):
+    file_url = serializers.SerializerMethodField()
+
+    class Meta:
+        model = BuildingWarehouseMovementFile
+        fields = ["id", "file", "file_url", "title", "created_at"]
+        read_only_fields = ["id", "created_at"]
+
+    def get_file_url(self, obj):
+        if obj.file:
+            request = self.context.get("request")
+            if request:
+                return request.build_absolute_uri(obj.file.url)
+            return obj.file.url
+        return None
+
+
+class BuildingWarehouseMovementSerializer(serializers.ModelSerializer):
+    items = BuildingWarehouseMovementItemSerializer(many=True, read_only=True)
+    files = BuildingWarehouseMovementFileSerializer(many=True, read_only=True)
+    warehouse_name = serializers.CharField(source="warehouse.name", read_only=True)
+
+    class Meta:
+        model = BuildingWarehouseMovement
+        fields = [
+            "id", "company", "warehouse", "warehouse_name", "movement_type",
+            "contractor", "work_entry", "reason", "items", "files",
+            "created_by", "created_at",
+        ]
+        read_only_fields = ["id", "created_at"]
+
+
+class BuildingWarehouseMovementWriteOffSerializer(serializers.Serializer):
+    warehouse = serializers.UUIDField()
+    items = serializers.ListField(
+        child=serializers.DictField(child=serializers.CharField())
+    )
+    reason = serializers.CharField(required=False, allow_blank=True)
+
+
+class BuildingWarehouseMovementTransferSerializer(serializers.Serializer):
+    warehouse = serializers.UUIDField()
+    items = serializers.ListField(
+        child=serializers.DictField(child=serializers.CharField())
+    )
+    comment = serializers.CharField(required=False, allow_blank=True)
+    # contractor or work_entry - one of them required for transfer
+
+
+class BuildingTransferRequestFileSerializer(serializers.ModelSerializer):
+    file_url = serializers.SerializerMethodField()
+
+    class Meta:
+        model = BuildingTransferRequestFile
+        fields = ["id", "file", "file_url", "title", "created_at"]
+        read_only_fields = ["id", "created_at"]
+
+    def get_file_url(self, obj):
+        if obj.file:
+            request = self.context.get("request")
+            if request:
+                return request.build_absolute_uri(obj.file.url)
+            return obj.file.url
+        return None
+
+
 class BuildingProductSerializer(serializers.ModelSerializer):
     class Meta:
         model = BuildingProduct
@@ -315,6 +583,7 @@ class BuildingTransferItemSerializer(serializers.ModelSerializer):
 
 class BuildingTransferSerializer(serializers.ModelSerializer):
     items = BuildingTransferItemSerializer(many=True, read_only=True)
+    files = BuildingTransferRequestFileSerializer(many=True, read_only=True)
     warehouse_name = serializers.CharField(source="warehouse.name", read_only=True)
     procurement_title = serializers.CharField(source="procurement.title", read_only=True)
 
@@ -337,6 +606,7 @@ class BuildingTransferSerializer(serializers.ModelSerializer):
             "created_at",
             "updated_at",
             "items",
+            "files",
         ]
         read_only_fields = [
             "id",
@@ -372,6 +642,7 @@ class BuildingProcurementFileSerializer(serializers.ModelSerializer):
 
 class BuildingProcurementSerializer(serializers.ModelSerializer):
     residential_complex_name = serializers.CharField(source="residential_complex.name", read_only=True)
+    supplier_name = serializers.CharField(source="supplier.company_name", read_only=True)
     initiator_display = serializers.SerializerMethodField()
     cash_decision = BuildingProcurementCashDecisionSerializer(read_only=True)
     transfers = BuildingTransferSerializer(many=True, read_only=True)
@@ -384,6 +655,8 @@ class BuildingProcurementSerializer(serializers.ModelSerializer):
             "id",
             "residential_complex",
             "residential_complex_name",
+            "supplier",
+            "supplier_name",
             "initiator",
             "initiator_display",
             "title",
@@ -1413,6 +1686,7 @@ class BuildingWorkEntrySerializer(serializers.ModelSerializer):
     residential_complex_name = serializers.CharField(source="residential_complex.name", read_only=True)
     client_name = serializers.CharField(source="client.name", read_only=True)
     treaty_number = serializers.CharField(source="treaty.number", read_only=True)
+    contractor_name = serializers.CharField(source="contractor.company_name", read_only=True)
     created_by_display = serializers.SerializerMethodField()
     photos = BuildingWorkEntryPhotoSerializer(many=True, read_only=True)
     files = BuildingWorkEntryFileSerializer(many=True, read_only=True)
@@ -1423,6 +1697,12 @@ class BuildingWorkEntrySerializer(serializers.ModelSerializer):
             "id",
             "residential_complex",
             "residential_complex_name",
+            "contractor",
+            "contractor_name",
+            "contract_amount",
+            "contract_term_start",
+            "contract_term_end",
+            "work_status",
             "client",
             "client_name",
             "treaty",

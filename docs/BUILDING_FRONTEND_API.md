@@ -528,17 +528,39 @@
 
 ---
 
-## 11) Планируемые эндпоинты (по спецификации)
+## 11) Подрядчики и поставщики
 
-По `building_cash_register_backend_spec.md` — в разработке:
+### Подрядчики (Contractors)
 
-| Модуль | Эндпоинты | Описание |
-|--------|-----------|----------|
-| **Подрядчики** | `GET/POST /contractors/`, `GET/PATCH/DELETE /contractors/{id}/`, `POST /contractors/{id}/files/`, `GET /contractors/{id}/work-history/` | Справочник подрядчиков, специализации, оборудование |
-| **Поставщики** | `GET/POST /suppliers/`, `GET/PATCH/DELETE /suppliers/{id}/`, `POST /suppliers/{id}/files/`, `GET /suppliers/{id}/purchase-history/` | Справочник поставщиков, материалы |
-| **Приёмка на склад** | `POST /warehouse-receipts/{id}/files/` | Файлы к документу приёмки |
-| **Процесс работ** | `POST /work-entries/{id}/warehouse-requests/`, `POST /work-entries/{id}/reconciliation-act/` | Заявки на материалы, акт сверки |
-| **Склад** | `POST /warehouse-movements/write-off/`, `POST /warehouse-movements/transfer-to-contractor/`, `POST /warehouse-movements/transfer-to-work-entry/`, `POST /warehouse-movements/{id}/files/` | Списание, передача, файлы к движениям |
+- `GET /contractors/`, `POST /contractors/`
+- `GET /contractors/{id}/`, `PATCH /contractors/{id}/`, `DELETE /contractors/{id}/`
+- `POST /contractors/{id}/files/` — multipart: `file`, `title`
+- `GET /contractors/{id}/work-history/` — история процессов работ подрядчика (фильтры: `residential_complex`, `work_status`)
+
+### Поставщики (Suppliers)
+
+- `GET /suppliers/`, `POST /suppliers/`
+- `GET /suppliers/{id}/`, `PATCH /suppliers/{id}/`, `DELETE /suppliers/{id}/`
+- `POST /suppliers/{id}/files/` — multipart: `file`, `title`
+- `GET /suppliers/{id}/purchase-history/` — история закупок поставщика
+
+### Процесс работ — расширения
+
+- `POST /work-entries/{id}/warehouse-requests/` — заявка на материалы со склада (тело: `warehouse`, `items` [{stock_item, quantity, unit}], `comment`)
+- `POST /work-entries/{id}/reconciliation-act/` — акт сверки материалов (тело: `returned_items` [{stock_item, quantity, unit}], `comment`)
+
+При переводе процесса работ в статус `completed` с указанным подрядчиком и суммой договора автоматически создаётся заявка на кассу (`contractor_payment`).
+
+### Движения склада
+
+- `POST /warehouse-movements/write-off/` — списание (тело: `warehouse`, `items` [{stock_item, quantity}], `reason`)
+- `POST /warehouse-movements/transfer-to-contractor/` — передача подрядчику (тело: `warehouse`, `contractor`, `items`, `comment`)
+- `POST /warehouse-movements/transfer-to-work-entry/` — передача в процесс работ (тело: `warehouse`, `work_entry`, `items`, `comment`)
+- `POST /warehouse-movements/{id}/files/` — multipart: `file`, `title`
+
+### Файлы к передаче на склад
+
+- `POST /warehouse-transfers/{id}/files/` — multipart: `file`, `title` (аналог warehouse-receipts files)
 
 ---
 
@@ -593,10 +615,20 @@
 | | POST | `/tasks/{id}/files/` |
 | | POST | `/tasks/{id}/checklist-items/` |
 | | PATCH/DELETE | `/task-checklist-items/{id}/` |
+| **Подрядчики** | GET/POST | `/contractors/` |
+| | GET/PATCH/DELETE | `/contractors/{id}/` |
+| | POST | `/contractors/{id}/files/` |
+| | GET | `/contractors/{id}/work-history/` |
+| **Поставщики** | GET/POST | `/suppliers/` |
+| | GET/PATCH/DELETE | `/suppliers/{id}/` |
+| | POST | `/suppliers/{id}/files/` |
+| | GET | `/suppliers/{id}/purchase-history/` |
 | **Процесс работ** | GET/POST | `/work-entries/` |
 | | GET/PATCH/DELETE | `/work-entries/{id}/` |
 | | POST | `/work-entries/{id}/photos/` |
 | | POST | `/work-entries/{id}/files/` |
+| | POST | `/work-entries/{id}/warehouse-requests/` |
+| | POST | `/work-entries/{id}/reconciliation-act/` |
 | **Закупки** | GET/POST | `/procurements/` |
 | | GET/PATCH/DELETE | `/procurements/{id}/` |
 | | POST | `/procurements/{id}/submit-to-cash/` |
@@ -611,6 +643,11 @@
 | | GET | `/warehouse-transfers/{id}/` |
 | | POST | `/warehouse-transfers/{id}/accept/` |
 | | POST | `/warehouse-transfers/{id}/reject/` |
+| | POST | `/warehouse-transfers/{id}/files/` |
+| | POST | `/warehouse-movements/write-off/` |
+| | POST | `/warehouse-movements/transfer-to-contractor/` |
+| | POST | `/warehouse-movements/transfer-to-work-entry/` |
+| | POST | `/warehouse-movements/{id}/files/` |
 | | GET/POST | `/documents/purchase/` |
 | | GET/PATCH/DELETE | `/documents/purchase/{id}/` |
 | | POST | `/documents/purchase/{id}/cash/approve/` |

@@ -290,6 +290,14 @@ class BuildingCashRegisterRequest(models.Model):
         related_name="cash_register_requests",
         verbose_name="Процесс работ",
     )
+    contractor = models.ForeignKey(
+        "BuildingContractor",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="cash_register_requests",
+        verbose_name="Подрядчик",
+    )
 
     cashflow = models.OneToOneField(
         BuildingCashFlow,
@@ -619,6 +627,226 @@ class ResidentialComplexApartment(models.Model):
         return f"Кв. {self.number}, {self.floor} этаж ({self.residential_complex.name})"
 
 
+# -----------------------
+# Подрядчики (Contractors)
+# -----------------------
+
+
+class BuildingContractor(models.Model):
+    """Подрядчик — справочник для процесса работ и оплат."""
+
+    class ContractorType(models.TextChoices):
+        SUBCONTRACTOR = "subcontractor", "Субподрядчик"
+        GENERAL_CONTRACTOR = "general_contractor", "Генподрядчик"
+        OTHER = "other", "Другое"
+
+    class Status(models.TextChoices):
+        ACTIVE = "active", "Активен"
+        INACTIVE = "inactive", "Неактивен"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False, verbose_name="ID")
+    company = models.ForeignKey(
+        Company,
+        on_delete=models.CASCADE,
+        related_name="building_contractors",
+        verbose_name="Компания",
+    )
+    company_name = models.CharField(max_length=255, verbose_name="Название организации")
+    contractor_type = models.CharField(
+        max_length=32,
+        choices=ContractorType.choices,
+        default=ContractorType.SUBCONTRACTOR,
+        verbose_name="Тип подрядчика",
+    )
+    tax_id = models.CharField(max_length=32, blank=True, verbose_name="ИНН")
+    registration_number = models.CharField(max_length=64, blank=True, verbose_name="Рег. номер")
+    year_founded = models.PositiveIntegerField(null=True, blank=True, verbose_name="Год основания")
+
+    contact_person = models.CharField(max_length=255, blank=True, verbose_name="Контактное лицо")
+    phone = models.CharField(max_length=64, blank=True, verbose_name="Телефон")
+    email = models.EmailField(blank=True, verbose_name="Email")
+
+    city = models.CharField(max_length=128, blank=True, verbose_name="Город")
+    address = models.CharField(max_length=512, blank=True, verbose_name="Адрес")
+
+    specializations = models.JSONField(default=list, blank=True, verbose_name="Специализации")
+    employees = models.PositiveIntegerField(null=True, blank=True, verbose_name="Кол-во сотрудников")
+    equipment = models.JSONField(default=list, blank=True, verbose_name="Оборудование")
+
+    status = models.CharField(
+        max_length=16,
+        choices=Status.choices,
+        default=Status.ACTIVE,
+        db_index=True,
+        verbose_name="Статус",
+    )
+    created_at = models.DateTimeField(auto_now_add=True, verbose_name="Дата создания")
+    updated_at = models.DateTimeField(auto_now=True, verbose_name="Дата обновления")
+
+    class Meta:
+        verbose_name = "Подрядчик (Building)"
+        verbose_name_plural = "Подрядчики (Building)"
+        ordering = ["company_name"]
+        indexes = [
+            models.Index(fields=["company", "status"]),
+            models.Index(fields=["company", "company_name"]),
+        ]
+
+    def __str__(self):
+        return self.company_name
+
+
+def building_contractor_file_upload_to(instance, filename: str) -> str:
+    ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else "bin"
+    return f"building/contractors/{instance.contractor_id}/files/{uuid.uuid4().hex}.{ext}"
+
+
+class BuildingContractorFile(models.Model):
+    """Файл, прикреплённый к подрядчику."""
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False, verbose_name="ID")
+    contractor = models.ForeignKey(
+        BuildingContractor,
+        on_delete=models.CASCADE,
+        related_name="files",
+        verbose_name="Подрядчик",
+    )
+    title = models.CharField(max_length=255, blank=True, verbose_name="Название файла")
+    file = models.FileField(upload_to=building_contractor_file_upload_to, verbose_name="Файл")
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="building_contractor_files_created",
+        verbose_name="Кто загрузил",
+    )
+    created_at = models.DateTimeField(auto_now_add=True, verbose_name="Дата загрузки")
+
+    class Meta:
+        verbose_name = "Файл подрядчика"
+        verbose_name_plural = "Файлы подрядчиков"
+        ordering = ["-created_at"]
+
+    def __str__(self):
+        return self.title or str(getattr(self.file, "name", "")) or str(self.id)
+
+
+# -----------------------
+# Поставщики (Suppliers)
+# -----------------------
+
+
+class BuildingSupplier(models.Model):
+    """Поставщик строительных материалов."""
+
+    class SupplierType(models.TextChoices):
+        MATERIALS_SUPPLIER = "materials_supplier", "Поставщик материалов"
+        EQUIPMENT_SUPPLIER = "equipment_supplier", "Поставщик оборудования"
+        OTHER = "other", "Другое"
+
+    class Status(models.TextChoices):
+        ACTIVE = "active", "Активен"
+        INACTIVE = "inactive", "Неактивен"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False, verbose_name="ID")
+    company = models.ForeignKey(
+        Company,
+        on_delete=models.CASCADE,
+        related_name="building_suppliers",
+        verbose_name="Компания",
+    )
+    company_name = models.CharField(max_length=255, verbose_name="Название организации")
+    supplier_type = models.CharField(
+        max_length=32,
+        choices=SupplierType.choices,
+        default=SupplierType.MATERIALS_SUPPLIER,
+        verbose_name="Тип поставщика",
+    )
+    tax_id = models.CharField(max_length=32, blank=True, verbose_name="ИНН")
+    registration_number = models.CharField(max_length=64, blank=True, verbose_name="Рег. номер")
+    year_founded = models.PositiveIntegerField(null=True, blank=True, verbose_name="Год основания")
+
+    contact_person = models.CharField(max_length=255, blank=True, verbose_name="Контактное лицо")
+    position = models.CharField(max_length=128, blank=True, verbose_name="Должность")
+    phone = models.CharField(max_length=64, blank=True, verbose_name="Телефон")
+    email = models.EmailField(blank=True, verbose_name="Email")
+    website = models.URLField(blank=True, verbose_name="Сайт")
+
+    city = models.CharField(max_length=128, blank=True, verbose_name="Город")
+    address = models.CharField(max_length=512, blank=True, verbose_name="Адрес")
+    postal_code = models.CharField(max_length=32, blank=True, verbose_name="Индекс")
+
+    bank_details = models.JSONField(default=dict, blank=True, verbose_name="Банковские реквизиты")
+    supplied_materials = models.JSONField(default=list, blank=True, verbose_name="Поставляемые материалы")
+    delivery = models.JSONField(default=dict, blank=True, verbose_name="Доставка")
+    warehouse = models.JSONField(default=dict, blank=True, verbose_name="Склад")
+
+    rating = models.DecimalField(max_digits=3, decimal_places=1, null=True, blank=True, verbose_name="Рейтинг")
+    completed_orders = models.PositiveIntegerField(default=0, verbose_name="Выполнено заказов")
+
+    status = models.CharField(
+        max_length=16,
+        choices=Status.choices,
+        default=Status.ACTIVE,
+        db_index=True,
+        verbose_name="Статус",
+    )
+    created_at = models.DateTimeField(auto_now_add=True, verbose_name="Дата создания")
+    updated_at = models.DateTimeField(auto_now=True, verbose_name="Дата обновления")
+
+    class Meta:
+        verbose_name = "Поставщик (Building)"
+        verbose_name_plural = "Поставщики (Building)"
+        ordering = ["company_name"]
+        indexes = [
+            models.Index(fields=["company", "status"]),
+            models.Index(fields=["company", "company_name"]),
+        ]
+
+    def __str__(self):
+        return self.company_name
+
+
+def building_supplier_file_upload_to(instance, filename: str) -> str:
+    ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else "bin"
+    return f"building/suppliers/{instance.supplier_id}/files/{uuid.uuid4().hex}.{ext}"
+
+
+class BuildingSupplierFile(models.Model):
+    """Файл, прикреплённый к поставщику."""
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False, verbose_name="ID")
+    supplier = models.ForeignKey(
+        BuildingSupplier,
+        on_delete=models.CASCADE,
+        related_name="files",
+        verbose_name="Поставщик",
+    )
+    title = models.CharField(max_length=255, blank=True, verbose_name="Название файла")
+    file = models.FileField(upload_to=building_supplier_file_upload_to, verbose_name="Файл")
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="building_supplier_files_created",
+        verbose_name="Кто загрузил",
+    )
+    created_at = models.DateTimeField(auto_now_add=True, verbose_name="Дата загрузки")
+
+    class Meta:
+        verbose_name = "Файл поставщика"
+        verbose_name_plural = "Файлы поставщиков"
+        ordering = ["-created_at"]
+
+    def __str__(self):
+        return self.title or str(getattr(self.file, "name", "")) or str(self.id)
+
+
+# -----------------------
+# Товары (Products)
+# -----------------------
+
+
 class BuildingProduct(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False, verbose_name="ID")
     company = models.ForeignKey(
@@ -673,6 +901,14 @@ class BuildingProcurementRequest(models.Model):
         on_delete=models.CASCADE,
         related_name="procurements",
         verbose_name="Жилой комплекс",
+    )
+    supplier = models.ForeignKey(
+        "BuildingSupplier",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="procurements",
+        verbose_name="Поставщик",
     )
     initiator = models.ForeignKey(
         settings.AUTH_USER_MODEL,
@@ -976,6 +1212,356 @@ class BuildingTransferItem(models.Model):
             transfer.recalculate_totals()
 
 
+def building_transfer_file_upload_to(instance, filename: str) -> str:
+    ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else "bin"
+    return f"building/transfers/{instance.transfer_id}/files/{uuid.uuid4().hex}.{ext}"
+
+
+class BuildingTransferRequestFile(models.Model):
+    """Файл, прикреплённый к передаче на склад (приёмка)."""
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False, verbose_name="ID")
+    transfer = models.ForeignKey(
+        BuildingTransferRequest,
+        on_delete=models.CASCADE,
+        related_name="files",
+        verbose_name="Передача",
+    )
+    title = models.CharField(max_length=255, blank=True, verbose_name="Название файла")
+    file = models.FileField(upload_to=building_transfer_file_upload_to, verbose_name="Файл")
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="building_transfer_files_created",
+        verbose_name="Кто загрузил",
+    )
+    created_at = models.DateTimeField(auto_now_add=True, verbose_name="Дата загрузки")
+
+    class Meta:
+        verbose_name = "Файл передачи на склад"
+        verbose_name_plural = "Файлы передач на склад"
+        ordering = ["-created_at"]
+
+    def __str__(self):
+        return self.title or str(getattr(self.file, "name", "")) or str(self.id)
+
+
+# -----------------------
+# Заявки на материалы со склада (из процесса работ)
+# -----------------------
+
+
+class BuildingWarehouseRequest(models.Model):
+    """Заявка на выдачу материалов со склада из процесса работ."""
+
+    class Status(models.TextChoices):
+        PENDING = "pending", "Ожидает одобрения"
+        APPROVED = "approved", "Одобрено"
+        REJECTED = "rejected", "Отклонено"
+        PARTIALLY_APPROVED = "partially_approved", "Частично одобрено"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False, verbose_name="ID")
+    work_entry = models.ForeignKey(
+        "BuildingWorkEntry",
+        on_delete=models.CASCADE,
+        related_name="warehouse_requests",
+        verbose_name="Процесс работ",
+    )
+    warehouse = models.ForeignKey(
+        ResidentialComplexWarehouse,
+        on_delete=models.CASCADE,
+        related_name="warehouse_requests",
+        verbose_name="Склад",
+    )
+    comment = models.TextField(blank=True, verbose_name="Комментарий")
+    status = models.CharField(
+        max_length=24,
+        choices=Status.choices,
+        default=Status.PENDING,
+        db_index=True,
+        verbose_name="Статус",
+    )
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="building_warehouse_requests_created",
+        verbose_name="Кто создал",
+    )
+    decided_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="building_warehouse_requests_decided",
+        verbose_name="Кто принял решение",
+    )
+    created_at = models.DateTimeField(auto_now_add=True, verbose_name="Дата создания")
+    updated_at = models.DateTimeField(auto_now=True, verbose_name="Дата обновления")
+
+    class Meta:
+        verbose_name = "Заявка на материалы со склада"
+        verbose_name_plural = "Заявки на материалы со склада"
+        ordering = ["-created_at"]
+        indexes = [
+            models.Index(fields=["work_entry", "status"]),
+            models.Index(fields=["warehouse", "status"]),
+        ]
+
+    def __str__(self):
+        return f"Заявка {self.id} ({self.get_status_display()})"
+
+
+class BuildingWarehouseRequestItem(models.Model):
+    """Позиция заявки на материалы."""
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False, verbose_name="ID")
+    request = models.ForeignKey(
+        BuildingWarehouseRequest,
+        on_delete=models.CASCADE,
+        related_name="items",
+        verbose_name="Заявка",
+    )
+    stock_item = models.ForeignKey(
+        "BuildingWarehouseStockItem",
+        on_delete=models.CASCADE,
+        related_name="warehouse_request_items",
+        verbose_name="Позиция склада",
+    )
+    quantity = models.DecimalField(max_digits=16, decimal_places=3, verbose_name="Количество")
+    unit = models.CharField(max_length=64, verbose_name="Единица измерения")
+    approved_quantity = models.DecimalField(
+        max_digits=16,
+        decimal_places=3,
+        null=True,
+        blank=True,
+        verbose_name="Одобрено количество",
+    )
+    created_at = models.DateTimeField(auto_now_add=True, verbose_name="Дата создания")
+
+    class Meta:
+        verbose_name = "Позиция заявки на материалы"
+        verbose_name_plural = "Позиции заявок на материалы"
+        ordering = ["request", "created_at"]
+
+    def __str__(self):
+        return f"{self.stock_item.name} x {self.quantity}"
+
+
+# -----------------------
+# Акт сверки материалов (из процесса работ)
+# -----------------------
+
+
+class BuildingReconciliationAct(models.Model):
+    """Акт сверки материалов при завершении/отмене процесса работ."""
+
+    class Status(models.TextChoices):
+        DRAFT = "draft", "Черновик"
+        APPROVED = "approved", "Одобрено"
+        REJECTED = "rejected", "Отклонено"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False, verbose_name="ID")
+    work_entry = models.ForeignKey(
+        "BuildingWorkEntry",
+        on_delete=models.CASCADE,
+        related_name="reconciliation_acts",
+        verbose_name="Процесс работ",
+    )
+    comment = models.TextField(blank=True, verbose_name="Комментарий")
+    status = models.CharField(
+        max_length=16,
+        choices=Status.choices,
+        default=Status.DRAFT,
+        db_index=True,
+        verbose_name="Статус",
+    )
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="building_reconciliation_acts_created",
+        verbose_name="Кто создал",
+    )
+    created_at = models.DateTimeField(auto_now_add=True, verbose_name="Дата создания")
+    updated_at = models.DateTimeField(auto_now=True, verbose_name="Дата обновления")
+
+    class Meta:
+        verbose_name = "Акт сверки материалов"
+        verbose_name_plural = "Акты сверки материалов"
+        ordering = ["-created_at"]
+        indexes = [
+            models.Index(fields=["work_entry"]),
+        ]
+
+    def __str__(self):
+        return f"Акт сверки {self.id} ({self.work_entry_id})"
+
+
+class BuildingReconciliationActItem(models.Model):
+    """Возвращаемая позиция в акте сверки."""
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False, verbose_name="ID")
+    act = models.ForeignKey(
+        BuildingReconciliationAct,
+        on_delete=models.CASCADE,
+        related_name="returned_items",
+        verbose_name="Акт сверки",
+    )
+    stock_item = models.ForeignKey(
+        "BuildingWarehouseStockItem",
+        on_delete=models.CASCADE,
+        related_name="reconciliation_act_items",
+        verbose_name="Позиция склада",
+    )
+    quantity = models.DecimalField(max_digits=16, decimal_places=3, verbose_name="Количество")
+    unit = models.CharField(max_length=64, verbose_name="Единица измерения")
+    created_at = models.DateTimeField(auto_now_add=True, verbose_name="Дата создания")
+
+    class Meta:
+        verbose_name = "Возврат в акте сверки"
+        verbose_name_plural = "Возвраты в актах сверки"
+        ordering = ["act", "created_at"]
+
+    def __str__(self):
+        return f"{self.stock_item.name} x {self.quantity}"
+
+
+# -----------------------
+# Движения склада (списание, передача)
+# -----------------------
+
+
+class BuildingWarehouseMovement(models.Model):
+    """Движение по складу: списание, передача подрядчику, передача в процесс работ."""
+
+    class MovementType(models.TextChoices):
+        WRITE_OFF = "write_off", "Списание"
+        TRANSFER_TO_CONTRACTOR = "transfer_to_contractor", "Передача подрядчику"
+        TRANSFER_TO_WORK_ENTRY = "transfer_to_work_entry", "Передача в процесс работ"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False, verbose_name="ID")
+    company = models.ForeignKey(
+        Company,
+        on_delete=models.CASCADE,
+        related_name="building_warehouse_movements",
+        verbose_name="Компания",
+    )
+    warehouse = models.ForeignKey(
+        ResidentialComplexWarehouse,
+        on_delete=models.CASCADE,
+        related_name="warehouse_movements",
+        verbose_name="Склад",
+    )
+    movement_type = models.CharField(
+        max_length=32,
+        choices=MovementType.choices,
+        db_index=True,
+        verbose_name="Тип движения",
+    )
+    contractor = models.ForeignKey(
+        "BuildingContractor",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="warehouse_movements",
+        verbose_name="Подрядчик",
+    )
+    work_entry = models.ForeignKey(
+        "BuildingWorkEntry",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="warehouse_movements",
+        verbose_name="Процесс работ",
+    )
+    reason = models.TextField(blank=True, verbose_name="Причина/комментарий")
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="building_warehouse_movements_created",
+        verbose_name="Кто создал",
+    )
+    created_at = models.DateTimeField(auto_now_add=True, verbose_name="Дата создания")
+
+    class Meta:
+        verbose_name = "Движение склада (Building)"
+        verbose_name_plural = "Движения склада (Building)"
+        ordering = ["-created_at"]
+        indexes = [
+            models.Index(fields=["company", "movement_type"]),
+            models.Index(fields=["warehouse", "created_at"]),
+        ]
+
+    def __str__(self):
+        return f"{self.get_movement_type_display()} {self.id}"
+
+
+class BuildingWarehouseMovementItem(models.Model):
+    """Позиция движения склада."""
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False, verbose_name="ID")
+    movement = models.ForeignKey(
+        BuildingWarehouseMovement,
+        on_delete=models.CASCADE,
+        related_name="items",
+        verbose_name="Движение",
+    )
+    stock_item = models.ForeignKey(
+        "BuildingWarehouseStockItem",
+        on_delete=models.CASCADE,
+        related_name="movement_items",
+        verbose_name="Позиция склада",
+    )
+    quantity = models.DecimalField(max_digits=16, decimal_places=3, verbose_name="Количество")
+    created_at = models.DateTimeField(auto_now_add=True, verbose_name="Дата создания")
+
+    class Meta:
+        verbose_name = "Позиция движения склада"
+        verbose_name_plural = "Позиции движений склада"
+        ordering = ["movement", "created_at"]
+
+    def __str__(self):
+        return f"{self.stock_item.name} x {self.quantity}"
+
+
+def building_warehouse_movement_file_upload_to(instance, filename: str) -> str:
+    ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else "bin"
+    return f"building/warehouse-movements/{instance.movement_id}/files/{uuid.uuid4().hex}.{ext}"
+
+
+class BuildingWarehouseMovementFile(models.Model):
+    """Файл, прикреплённый к движению склада."""
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False, verbose_name="ID")
+    movement = models.ForeignKey(
+        BuildingWarehouseMovement,
+        on_delete=models.CASCADE,
+        related_name="files",
+        verbose_name="Движение",
+    )
+    title = models.CharField(max_length=255, blank=True, verbose_name="Название файла")
+    file = models.FileField(upload_to=building_warehouse_movement_file_upload_to, verbose_name="Файл")
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="building_warehouse_movement_files_created",
+        verbose_name="Кто загрузил",
+    )
+    created_at = models.DateTimeField(auto_now_add=True, verbose_name="Дата загрузки")
+
+    class Meta:
+        verbose_name = "Файл движения склада"
+        verbose_name_plural = "Файлы движений склада"
+        ordering = ["-created_at"]
+
+    def __str__(self):
+        return self.title or str(getattr(self.file, "name", "")) or str(self.id)
+
+
 class BuildingWarehouseStockItem(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False, verbose_name="ID")
     warehouse = models.ForeignKey(
@@ -1011,6 +1597,9 @@ class BuildingWarehouseStockItem(models.Model):
 class BuildingWarehouseStockMove(models.Model):
     class MoveType(models.TextChoices):
         INCOMING = "incoming", "Приход"
+        WRITE_OFF = "write_off", "Списание"
+        TRANSFER_TO_CONTRACTOR = "transfer_to_contractor", "Передача подрядчику"
+        TRANSFER_TO_WORK_ENTRY = "transfer_to_work_entry", "Передача в процесс работ"
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False, verbose_name="ID")
     warehouse = models.ForeignKey(
@@ -1033,7 +1622,31 @@ class BuildingWarehouseStockMove(models.Model):
         related_name="stock_moves",
         verbose_name="Передача",
     )
-    move_type = models.CharField(max_length=16, choices=MoveType.choices, verbose_name="Тип движения")
+    movement = models.ForeignKey(
+        "BuildingWarehouseMovement",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="stock_moves",
+        verbose_name="Движение склада",
+    )
+    contractor = models.ForeignKey(
+        "BuildingContractor",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="warehouse_stock_moves",
+        verbose_name="Подрядчик",
+    )
+    work_entry = models.ForeignKey(
+        "BuildingWorkEntry",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="warehouse_stock_moves",
+        verbose_name="Процесс работ",
+    )
+    move_type = models.CharField(max_length=32, choices=MoveType.choices, verbose_name="Тип движения")
     quantity_delta = models.DecimalField(max_digits=16, decimal_places=3, verbose_name="Изменение количества")
     price = models.DecimalField(max_digits=16, decimal_places=2, default=Decimal("0.00"), verbose_name="Цена")
     created_by = models.ForeignKey(
@@ -1443,12 +2056,43 @@ class BuildingWorkEntry(models.Model):
         REPORT = "report", "Отчёт"
         OTHER = "other", "Другое"
 
+    class WorkStatus(models.TextChoices):
+        PLANNED = "planned", "Запланировано"
+        IN_PROGRESS = "in_progress", "В работе"
+        PAUSED = "paused", "Приостановлено"
+        COMPLETED = "completed", "Завершено"
+        CANCELLED = "cancelled", "Отменено"
+
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False, verbose_name="ID")
     residential_complex = models.ForeignKey(
         ResidentialComplex,
         on_delete=models.CASCADE,
         related_name="work_entries",
         verbose_name="Жилой комплекс",
+    )
+    contractor = models.ForeignKey(
+        "BuildingContractor",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="work_entries",
+        verbose_name="Подрядчик",
+    )
+    contract_amount = models.DecimalField(
+        max_digits=16,
+        decimal_places=2,
+        null=True,
+        blank=True,
+        verbose_name="Сумма договора",
+    )
+    contract_term_start = models.DateField(null=True, blank=True, verbose_name="Начало работ")
+    contract_term_end = models.DateField(null=True, blank=True, verbose_name="Окончание работ")
+    work_status = models.CharField(
+        max_length=16,
+        choices=WorkStatus.choices,
+        default=WorkStatus.PLANNED,
+        db_index=True,
+        verbose_name="Статус работ",
     )
     client = models.ForeignKey(
         BuildingClient,
@@ -1495,6 +2139,8 @@ class BuildingWorkEntry(models.Model):
             models.Index(fields=["residential_complex", "occurred_at"]),
             models.Index(fields=["residential_complex", "category", "occurred_at"]),
             models.Index(fields=["created_by", "occurred_at"]),
+            models.Index(fields=["contractor", "occurred_at"]),
+            models.Index(fields=["work_status"]),
         ]
 
     def __str__(self):

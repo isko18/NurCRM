@@ -5,6 +5,18 @@ from .models import (
     BuildingCashFlowFile,
     BuildingCashRegisterRequest,
     BuildingCashRegisterRequestFile,
+    BuildingContractor,
+    BuildingContractorFile,
+    BuildingSupplier,
+    BuildingSupplierFile,
+    BuildingTransferRequestFile,
+    BuildingWarehouseRequest,
+    BuildingWarehouseRequestItem,
+    BuildingReconciliationAct,
+    BuildingReconciliationActItem,
+    BuildingWarehouseMovement,
+    BuildingWarehouseMovementItem,
+    BuildingWarehouseMovementFile,
     ResidentialComplex,
     ResidentialComplexMember,
     ResidentialComplexDrawing,
@@ -122,6 +134,36 @@ class BuildingProductAdmin(admin.ModelAdmin):
     list_filter = ("company", "is_active")
     search_fields = ("name", "article", "barcode")
     readonly_fields = ("id", "created_at", "updated_at")
+
+
+class BuildingContractorFileInline(admin.TabularInline):
+    model = BuildingContractorFile
+    extra = 0
+    readonly_fields = ("id", "created_at")
+
+
+@admin.register(BuildingContractor)
+class BuildingContractorAdmin(admin.ModelAdmin):
+    list_display = ("company_name", "company", "contractor_type", "status", "contact_person", "phone", "created_at")
+    list_filter = ("company", "contractor_type", "status")
+    search_fields = ("company_name", "contact_person", "phone", "email")
+    readonly_fields = ("id", "created_at", "updated_at")
+    inlines = [BuildingContractorFileInline]
+
+
+class BuildingSupplierFileInline(admin.TabularInline):
+    model = BuildingSupplierFile
+    extra = 0
+    readonly_fields = ("id", "created_at")
+
+
+@admin.register(BuildingSupplier)
+class BuildingSupplierAdmin(admin.ModelAdmin):
+    list_display = ("company_name", "company", "supplier_type", "status", "contact_person", "phone", "created_at")
+    list_filter = ("company", "supplier_type", "status")
+    search_fields = ("company_name", "contact_person", "phone", "email")
+    readonly_fields = ("id", "created_at", "updated_at")
+    inlines = [BuildingSupplierFileInline]
 
 
 class BuildingProcurementItemInline(admin.TabularInline):
