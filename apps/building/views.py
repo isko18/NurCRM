@@ -14,6 +14,9 @@ from django_filters.rest_framework import DjangoFilterBackend
 from .models import (
     BuildingCashbox,
     BuildingCashFlow,
+    BuildingCashFlowFile,
+    BuildingCashRegisterRequest,
+    BuildingCashRegisterRequestFile,
     ResidentialComplex,
     ResidentialComplexMember,
     ResidentialComplexDrawing,
@@ -27,6 +30,8 @@ from .models import (
     BuildingWarehouseStockItem,
     BuildingWarehouseStockMove,
     BuildingClient,
+    BuildingClientFile,
+    BuildingTaskFile,
     BuildingTreaty,
     BuildingTreatyInstallment,
     BuildingTreatyFile,
@@ -88,6 +93,13 @@ from .serializers import (
     BuildingCashboxSerializer,
     BuildingCashFlowSerializer,
     BuildingCashFlowBulkStatusSerializer,
+    BuildingCashRegisterRequestSerializer,
+    BuildingCashRegisterRequestCreateSerializer,
+    BuildingCashRegisterRequestApproveSerializer,
+    BuildingCashRegisterRequestRejectSerializer,
+    BuildingCashRegisterRequestFileCreateSerializer,
+    BuildingCashFlowFileSerializer,
+    BuildingCashFlowFileCreateSerializer,
 )
 from . import services
 
@@ -1361,7 +1373,7 @@ class BuildingClientListCreateView(CompanyQuerysetMixin, generics.ListCreateAPIV
 class BuildingClientDetailView(CompanyQuerysetMixin, generics.RetrieveUpdateDestroyAPIView):
     permission_classes = [permissions.IsAuthenticated]
     serializer_class = BuildingClientDetailSerializer
-    queryset = BuildingClient.objects.all()
+    queryset = BuildingClient.objects.prefetch_related("files", "treaties")
 
     def get_queryset(self):
         user = self.request.user
@@ -1377,6 +1389,46 @@ class BuildingClientDetailView(CompanyQuerysetMixin, generics.RetrieveUpdateDest
         if not getattr(user, "is_staff", False) and not getattr(user, "is_superuser", False):
             return qs.none()
         return qs
+
+
+class BuildingClientFileAddView(CompanyQuerysetMixin, generics.GenericAPIView):
+    """Загрузить файл к клиенту."""
+    permission_classes = [permissions.IsAuthenticated]
+    serializer_class = BuildingTreatyFileCreateSerializer
+    parser_classes = [MultiPartParser, FormParser]
+    queryset = BuildingClient.objects.all()
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        user = self.request.user
+        if not (_is_owner_like(user) or getattr(user, "can_view_building_clients", False)):
+            return qs.none()
+        if user.is_authenticated and getattr(user, "company_id", None):
+            qs = qs.filter(company_id=user.company_id)
+            allowed_ids = _allowed_residential_complex_ids(user)
+            if allowed_ids is not None:
+                qs = qs.filter(treaties__residential_complex_id__in=allowed_ids).distinct()
+            return qs
+        return qs.none()
+
+    def post(self, request, pk=None):
+        user = request.user
+        if not (_is_owner_like(user) or getattr(user, "can_view_building_clients", False)):
+            raise PermissionDenied("Нет прав на клиентов (Building).")
+        client = self.get_object()
+        ser = self.get_serializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+        BuildingClientFile.objects.create(
+            client=client,
+            file=ser.validated_data["file"],
+            title=(ser.validated_data.get("title") or "").strip(),
+            created_by=user,
+        )
+        client.refresh_from_db()
+        return Response(
+            BuildingClientDetailSerializer(client, context={"request": request}).data,
+            status=status.HTTP_201_CREATED,
+        )
 
 
 class BuildingTreatyListCreateView(CompanyQuerysetMixin, generics.ListCreateAPIView):
@@ -1743,6 +1795,7 @@ class BuildingTaskListCreateView(CompanyQuerysetMixin, generics.ListCreateAPIVie
     queryset = BuildingTask.objects.select_related("company", "created_by", "residential_complex", "client", "treaty").prefetch_related(
         "assignees__user",
         "checklist_items",
+        "files",
     )
     filter_backends = [DjangoFilterBackend, filters.SearchFilter]
     filterset_fields = ["status", "residential_complex", "client", "treaty", "created_by"]
@@ -1789,6 +1842,7 @@ class BuildingTaskDetailView(CompanyQuerysetMixin, generics.RetrieveUpdateDestro
     queryset = BuildingTask.objects.select_related("company", "created_by", "residential_complex", "client", "treaty").prefetch_related(
         "assignees__user",
         "checklist_items",
+        "files",
     )
 
     def get_queryset(self):
@@ -1809,6 +1863,40 @@ class BuildingTaskDetailView(CompanyQuerysetMixin, generics.RetrieveUpdateDestro
         if allowed_ids is not None and obj.residential_complex_id and obj.residential_complex_id not in set(allowed_ids):
             raise PermissionDenied("Нет доступа к этому ЖК.")
         return obj
+
+
+class BuildingTaskFileAddView(CompanyQuerysetMixin, generics.GenericAPIView):
+    """Загрузить файл к задаче."""
+    permission_classes = [permissions.IsAuthenticated]
+    serializer_class = BuildingTreatyFileCreateSerializer
+    parser_classes = [MultiPartParser, FormParser]
+    queryset = BuildingTask.objects.select_related("company")
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        user = self.request.user
+        if getattr(user, "is_superuser", False):
+            return qs
+        company_id = getattr(user, "company_id", None)
+        return qs.filter(company_id=company_id) if company_id else qs.none()
+
+    def post(self, request, pk=None):
+        task = self.get_object()
+        if not _can_access_task(request.user, task):
+            raise PermissionDenied("Нет доступа к задаче.")
+        ser = self.get_serializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+        BuildingTaskFile.objects.create(
+            task=task,
+            file=ser.validated_data["file"],
+            title=(ser.validated_data.get("title") or "").strip(),
+            created_by=request.user,
+        )
+        task.refresh_from_db()
+        return Response(
+            BuildingTaskSerializer(task, context={"request": request}).data,
+            status=status.HTTP_201_CREATED,
+        )
 
     def perform_update(self, serializer):
         obj = self.get_object()
@@ -2649,7 +2737,7 @@ class BuildingCashFlowListCreateView(CompanyQuerysetMixin, generics.ListCreateAP
     serializer_class = BuildingCashFlowSerializer
     queryset = BuildingCashFlow.objects.select_related(
         "company", "branch", "cashbox", "cashier"
-    )
+    ).prefetch_related("files")
 
     def get_queryset(self):
         qs = super().get_queryset()
@@ -2679,7 +2767,7 @@ class BuildingCashFlowDetailView(CompanyQuerysetMixin, generics.RetrieveUpdateDe
     serializer_class = BuildingCashFlowSerializer
     queryset = BuildingCashFlow.objects.select_related(
         "company", "branch", "cashbox", "cashier"
-    )
+    ).prefetch_related("files")
 
     def get_queryset(self):
         qs = super().get_queryset()
@@ -2725,4 +2813,268 @@ class BuildingCashFlowBulkStatusUpdateView(CompanyQuerysetMixin, generics.Generi
             {"count": len(ids), "updated_ids": [str(x) for x in ids]},
             status=status.HTTP_200_OK,
         )
+
+
+# -----------------------
+# Cash Register Requests
+# -----------------------
+
+
+def _cash_register_request_queryset(user):
+    qs = BuildingCashRegisterRequest.objects.select_related(
+        "company", "branch", "cashbox", "residential_complex", "treaty", "apartment", "client",
+        "installment", "work_entry", "cashflow", "approved_by", "created_by",
+    ).prefetch_related("files")
+    if getattr(user, "is_superuser", False):
+        return qs
+    company_id = getattr(user, "company_id", None)
+    if company_id:
+        return qs.filter(company_id=company_id)
+    return qs.none()
+
+
+class CashRegisterRequestListCreateView(CompanyQuerysetMixin, generics.ListCreateAPIView):
+    """Список и создание заявок на кассу."""
+    permission_classes = [permissions.IsAuthenticated]
+    filter_backends = [DjangoFilterBackend]
+    filterset_fields = ["request_type", "status", "cashbox", "residential_complex", "treaty", "client"]
+
+    def get_queryset(self):
+        return _cash_register_request_queryset(self.request.user).order_by("-created_at")
+
+    def get_serializer_class(self):
+        if self.request.method == "POST":
+            return BuildingCashRegisterRequestCreateSerializer
+        return BuildingCashRegisterRequestSerializer
+
+    def create(self, request, *args, **kwargs):
+        _require_cash_register_perm(request.user)
+        ser = BuildingCashRegisterRequestCreateSerializer(data=request.data, context={"request": request})
+        ser.is_valid(raise_exception=True)
+        data = ser.validated_data
+
+        cashbox = data["cashbox"]
+        company = cashbox.company
+        branch = cashbox.branch
+
+        residential_complex = None
+        if data.get("treaty"):
+            residential_complex = data["treaty"].residential_complex
+        elif data.get("apartment"):
+            residential_complex = data["apartment"].residential_complex
+        elif data.get("installment"):
+            residential_complex = data["installment"].treaty.residential_complex
+        elif data.get("work_entry"):
+            residential_complex = data["work_entry"].residential_complex
+
+        allowed_rc = _allowed_residential_complex_ids(request.user)
+        if allowed_rc is not None and residential_complex and residential_complex.id not in allowed_rc:
+            raise PermissionDenied("Нет доступа к этому ЖК.")
+
+        req = BuildingCashRegisterRequest.objects.create(
+            company=company,
+            branch=branch,
+            request_type=data["request_type"],
+            status=BuildingCashRegisterRequest.Status.PENDING,
+            amount=data["amount"],
+            comment=data.get("comment") or "",
+            cashbox=cashbox,
+            shift=data.get("shift") or None,
+            residential_complex=residential_complex,
+            treaty=data.get("treaty"),
+            apartment=data.get("apartment"),
+            client=data.get("client"),
+            installment=data.get("installment"),
+            work_entry=data.get("work_entry"),
+            created_by=request.user,
+        )
+        req.refresh_from_db()
+        return Response(
+            BuildingCashRegisterRequestSerializer(req, context={"request": request}).data,
+            status=status.HTTP_201_CREATED,
+        )
+
+
+class CashRegisterRequestDetailView(CompanyQuerysetMixin, generics.RetrieveAPIView):
+    """Детали заявки на кассу."""
+    permission_classes = [permissions.IsAuthenticated]
+    serializer_class = BuildingCashRegisterRequestSerializer
+    queryset = BuildingCashRegisterRequest.objects.all()
+
+    def get_queryset(self):
+        return _cash_register_request_queryset(self.request.user)
+
+
+class CashRegisterRequestApproveView(CompanyQuerysetMixin, generics.GenericAPIView):
+    """Одобрить заявку на кассу."""
+    permission_classes = [permissions.IsAuthenticated]
+    serializer_class = BuildingCashRegisterRequestApproveSerializer
+    queryset = BuildingCashRegisterRequest.objects.select_related(
+        "company", "cashbox", "treaty", "installment", "work_entry"
+    )
+
+    def get_queryset(self):
+        return _cash_register_request_queryset(self.request.user)
+
+    @transaction.atomic
+    def post(self, request, pk=None):
+        _require_cash_register_perm(request.user)
+        req = self.get_object()
+        if req.status != BuildingCashRegisterRequest.Status.PENDING:
+            raise ValidationError({"status": "Заявка уже обработана."})
+
+        ser = BuildingCashRegisterRequestApproveSerializer(data=request.data, context={"request": request})
+        ser.is_valid(raise_exception=True)
+        data = ser.validated_data
+
+        cashbox = data.get("cashbox") or req.cashbox
+        paid_at = data.get("paid_at") or timezone.now()
+
+        is_income = req.request_type in (
+            BuildingCashRegisterRequest.RequestType.APARTMENT_SALE,
+            BuildingCashRegisterRequest.RequestType.INSTALLMENT_INITIAL_PAYMENT,
+            BuildingCashRegisterRequest.RequestType.INSTALLMENT_PAYMENT,
+        )
+        flow_type = BuildingCashFlow.Type.INCOME if is_income else BuildingCashFlow.Type.EXPENSE
+
+        source_id = None
+        name_parts = [req.get_request_type_display(), str(req.amount)]
+        if req.treaty_id:
+            source_id = str(req.treaty_id)
+            name_parts.insert(0, f"Договор {req.treaty.number or req.treaty_id}")
+        elif req.installment_id:
+            source_id = str(req.installment_id)
+            name_parts.insert(0, f"Рассрочка {req.installment_id}")
+        elif req.work_entry_id:
+            source_id = str(req.work_entry_id)
+            name_parts.insert(0, f"Работы {req.work_entry_id}")
+
+        cf = BuildingCashFlow.objects.create(
+            cashbox=cashbox,
+            type=flow_type,
+            name=" / ".join(name_parts),
+            amount=req.amount,
+            status=BuildingCashFlow.Status.APPROVED,
+            source_business_operation_id=source_id or str(req.id),
+            cashier=request.user,
+        )
+
+        req.cashflow = cf
+        req.status = BuildingCashRegisterRequest.Status.APPROVED
+        req.approved_at = paid_at
+        req.approved_by = request.user
+        req.reject_reason = ""
+        req.save(update_fields=["cashflow", "status", "approved_at", "approved_by", "reject_reason", "updated_at"])
+
+        if req.request_type == BuildingCashRegisterRequest.RequestType.INSTALLMENT_PAYMENT and req.installment_id:
+            inst = req.installment
+            new_paid = (Decimal(inst.paid_amount or 0) + req.amount).quantize(Decimal("0.01"))
+            inst.paid_amount = new_paid
+            if new_paid >= Decimal(inst.amount or 0):
+                inst.status = BuildingTreatyInstallment.Status.PAID
+                inst.paid_at = paid_at
+                inst.save(update_fields=["paid_amount", "status", "paid_at", "updated_at"])
+            else:
+                inst.save(update_fields=["paid_amount", "updated_at"])
+
+        elif req.request_type == BuildingCashRegisterRequest.RequestType.INSTALLMENT_INITIAL_PAYMENT and req.treaty_id:
+            treaty = req.treaty
+            if treaty.down_payment and req.amount >= treaty.down_payment:
+                pass
+
+        req.refresh_from_db()
+        return Response(
+            BuildingCashRegisterRequestSerializer(req, context={"request": request}).data,
+            status=status.HTTP_200_OK,
+        )
+
+
+class CashRegisterRequestRejectView(CompanyQuerysetMixin, generics.GenericAPIView):
+    """Отклонить заявку на кассу."""
+    permission_classes = [permissions.IsAuthenticated]
+    serializer_class = BuildingCashRegisterRequestRejectSerializer
+    queryset = BuildingCashRegisterRequest.objects.all()
+
+    def get_queryset(self):
+        return _cash_register_request_queryset(self.request.user)
+
+    def post(self, request, pk=None):
+        _require_cash_register_perm(request.user)
+        req = self.get_object()
+        if req.status != BuildingCashRegisterRequest.Status.PENDING:
+            raise ValidationError({"status": "Заявка уже обработана."})
+
+        reason = ""
+        if request.data and isinstance(request.data, dict):
+            reason = (request.data.get("reason") or "").strip()
+
+        req.status = BuildingCashRegisterRequest.Status.REJECTED
+        req.reject_reason = reason
+        req.save(update_fields=["status", "reject_reason", "updated_at"])
+
+        req.refresh_from_db()
+        return Response(
+            BuildingCashRegisterRequestSerializer(req, context={"request": request}).data,
+            status=status.HTTP_200_OK,
+        )
+
+
+class CashRegisterRequestFileAddView(CompanyQuerysetMixin, generics.GenericAPIView):
+    """Загрузить файл к заявке на кассу."""
+    permission_classes = [permissions.IsAuthenticated]
+    serializer_class = BuildingCashRegisterRequestFileCreateSerializer
+    parser_classes = [MultiPartParser, FormParser]
+    queryset = BuildingCashRegisterRequest.objects.all()
+
+    def get_queryset(self):
+        return _cash_register_request_queryset(self.request.user)
+
+    def post(self, request, pk=None):
+        _require_cash_register_perm(request.user)
+        req = self.get_object()
+        ser = self.get_serializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+
+        BuildingCashRegisterRequestFile.objects.create(
+            request=req,
+            file=ser.validated_data["file"],
+            title=(ser.validated_data.get("title") or "").strip(),
+            created_by=request.user,
+        )
+        req.refresh_from_db()
+        return Response(
+            BuildingCashRegisterRequestSerializer(req, context={"request": request}).data,
+            status=status.HTTP_201_CREATED,
+        )
+
+
+class CashFlowFileAddView(CompanyQuerysetMixin, generics.GenericAPIView):
+    """Загрузить файл к движению по кассе."""
+    permission_classes = [permissions.IsAuthenticated]
+    serializer_class = BuildingCashFlowFileCreateSerializer
+    parser_classes = [MultiPartParser, FormParser]
+    queryset = BuildingCashFlow.objects.select_related("company").prefetch_related("files")
+
+    def get_queryset(self):
+        qs = BuildingCashFlow.objects.select_related("company").prefetch_related("files")
+        if getattr(self.request.user, "is_superuser", False):
+            return qs
+        company_id = getattr(self.request.user, "company_id", None)
+        return qs.filter(company_id=company_id) if company_id else qs.none()
+
+    def post(self, request, pk=None):
+        _require_cash_register_perm(request.user)
+        cf = self.get_object()
+        ser = self.get_serializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+
+        BuildingCashFlowFile.objects.create(
+            cashflow=cf,
+            file=ser.validated_data["file"],
+            title=(ser.validated_data.get("title") or "").strip(),
+            created_by=request.user,
+        )
+        cf.refresh_from_db()
+        files_data = [BuildingCashFlowFileSerializer(f, context={"request": request}).data for f in cf.files.all()]
+        return Response({"files": files_data}, status=status.HTTP_201_CREATED)
 

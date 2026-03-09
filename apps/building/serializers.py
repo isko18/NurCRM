@@ -10,6 +10,12 @@ from django.utils import timezone
 from .models import (
     BuildingCashbox,
     BuildingCashFlow,
+    BuildingCashFlowFile,
+    BuildingCashRegisterRequest,
+    BuildingCashRegisterRequestFile,
+    BuildingClient,
+    BuildingClientFile,
+    BuildingTaskFile,
     ResidentialComplex,
     ResidentialComplexMember,
     ResidentialComplexDrawing,
@@ -24,7 +30,6 @@ from .models import (
     BuildingWarehouseStockItem,
     BuildingWarehouseStockMove,
     BuildingWorkflowEvent,
-    BuildingClient,
     BuildingTreatyNumberSequence,
     BuildingTreaty,
     BuildingTreatyInstallment,
@@ -491,11 +496,35 @@ class BuildingClientSerializer(serializers.ModelSerializer):
         ]
         read_only_fields = ["id", "company", "created_at", "updated_at"]
 
+class BuildingClientFileSerializer(serializers.ModelSerializer):
+    file_url = serializers.SerializerMethodField()
+
+    class Meta:
+        model = BuildingClientFile
+        fields = ["id", "file_url", "title", "created_at"]
+        read_only_fields = fields
+
+    def get_file_url(self, obj):
+        if obj.file:
+            request = self.context.get("request")
+            if request:
+                return request.build_absolute_uri(obj.file.url)
+            return obj.file.url
+        return None
+
+
 class BuildingClientDetailSerializer(BuildingClientSerializer):
     treaties = serializers.SerializerMethodField(read_only=True)
+    files = serializers.SerializerMethodField(read_only=True)
 
     class Meta(BuildingClientSerializer.Meta):
-        fields = BuildingClientSerializer.Meta.fields + ["treaties"]
+        fields = BuildingClientSerializer.Meta.fields + ["treaties", "files"]
+
+    def get_files(self, obj):
+        files_qs = getattr(obj, "files", None)
+        if files_qs is None:
+            return []
+        return BuildingClientFileSerializer(files_qs.all(), many=True, context=self.context).data
 
     def get_treaties(self, obj):
         # В карточке клиента возвращаем договора/сделки по квартирам вместе с файлами и рассрочкой.
@@ -829,6 +858,23 @@ class BuildingTaskChecklistItemSerializer(serializers.ModelSerializer):
         return full_name or getattr(u, "email", None) or getattr(u, "username", None) or str(getattr(u, "id", ""))
 
 
+class BuildingTaskFileSerializer(serializers.ModelSerializer):
+    file_url = serializers.SerializerMethodField()
+
+    class Meta:
+        model = BuildingTaskFile
+        fields = ["id", "file_url", "title", "created_at"]
+        read_only_fields = fields
+
+    def get_file_url(self, obj):
+        if obj.file:
+            request = self.context.get("request")
+            if request:
+                return request.build_absolute_uri(obj.file.url)
+            return obj.file.url
+        return None
+
+
 class BuildingTaskSerializer(serializers.ModelSerializer):
     assignee_ids = serializers.ListField(
         child=serializers.UUIDField(),
@@ -838,6 +884,7 @@ class BuildingTaskSerializer(serializers.ModelSerializer):
     )
     assignees = serializers.SerializerMethodField(read_only=True)
     checklist_items = BuildingTaskChecklistItemSerializer(many=True, read_only=True)
+    files = serializers.SerializerMethodField(read_only=True)
 
     created_by_display = serializers.SerializerMethodField(read_only=True)
 
@@ -861,8 +908,15 @@ class BuildingTaskSerializer(serializers.ModelSerializer):
             "assignee_ids",
             "assignees",
             "checklist_items",
+            "files",
         ]
-        read_only_fields = ["id", "company", "created_by", "created_by_display", "completed_at", "created_at", "updated_at", "assignees", "checklist_items"]
+        read_only_fields = ["id", "company", "created_by", "created_by_display", "completed_at", "created_at", "updated_at", "assignees", "checklist_items", "files"]
+
+    def get_files(self, obj):
+        files_qs = getattr(obj, "files", None)
+        if files_qs is None:
+            return []
+        return BuildingTaskFileSerializer(files_qs.all(), many=True, context=self.context).data
 
     def get_created_by_display(self, obj):
         u = getattr(obj, "created_by", None)
@@ -1490,6 +1544,7 @@ class BuildingCashFlowSerializer(serializers.ModelSerializer):
     cashbox = serializers.PrimaryKeyRelatedField(queryset=BuildingCashbox.objects.none(), required=True)
     cashbox_name = serializers.SerializerMethodField()
     cashier_display = serializers.SerializerMethodField()
+    files = serializers.SerializerMethodField()
 
     class Meta:
         model = BuildingCashFlow
@@ -1507,6 +1562,7 @@ class BuildingCashFlowSerializer(serializers.ModelSerializer):
             "source_business_operation_id",
             "cashier",
             "cashier_display",
+            "files",
         ]
         read_only_fields = [
             "id",
@@ -1516,6 +1572,7 @@ class BuildingCashFlowSerializer(serializers.ModelSerializer):
             "branch",
             "cashier",
             "cashier_display",
+            "files",
         ]
 
     def __init__(self, *args, **kwargs):
@@ -1551,6 +1608,12 @@ class BuildingCashFlowSerializer(serializers.ModelSerializer):
             or getattr(u, "username", None)
         )
 
+    def get_files(self, obj):
+        files_qs = getattr(obj, "files", None)
+        if files_qs is None:
+            return []
+        return BuildingCashFlowFileSerializer(files_qs.all(), many=True, context=self.context).data
+
 
 class BuildingCashFlowBulkStatusItemSerializer(serializers.Serializer):
     id = serializers.UUIDField()
@@ -1566,3 +1629,180 @@ class BuildingCashFlowBulkStatusSerializer(serializers.Serializer):
         if len(items) > 50000:
             raise serializers.ValidationError("Слишком много. Максимум 50 000 за раз.")
         return items
+
+
+# -----------------------
+# Cash Register Requests
+# -----------------------
+
+
+class BuildingCashRegisterRequestFileSerializer(serializers.ModelSerializer):
+    file_url = serializers.SerializerMethodField()
+
+    class Meta:
+        model = BuildingCashRegisterRequestFile
+        fields = ["id", "file_url", "title", "created_at"]
+        read_only_fields = fields
+
+    def get_file_url(self, obj):
+        if obj.file:
+            request = self.context.get("request")
+            if request:
+                return request.build_absolute_uri(obj.file.url)
+            return obj.file.url
+        return None
+
+
+class BuildingCashFlowFileSerializer(serializers.ModelSerializer):
+    file_url = serializers.SerializerMethodField()
+
+    class Meta:
+        model = BuildingCashFlowFile
+        fields = ["id", "file_url", "title", "created_at"]
+        read_only_fields = fields
+
+    def get_file_url(self, obj):
+        if obj.file:
+            request = self.context.get("request")
+            if request:
+                return request.build_absolute_uri(obj.file.url)
+            return obj.file.url
+        return None
+
+
+class BuildingCashRegisterRequestCreateSerializer(serializers.Serializer):
+    request_type = serializers.ChoiceField(choices=BuildingCashRegisterRequest.RequestType.choices)
+    treaty = serializers.PrimaryKeyRelatedField(
+        queryset=BuildingTreaty.objects.none(), required=False, allow_null=True
+    )
+    apartment = serializers.PrimaryKeyRelatedField(
+        queryset=ResidentialComplexApartment.objects.none(), required=False, allow_null=True
+    )
+    client = serializers.PrimaryKeyRelatedField(
+        queryset=BuildingClient.objects.none(), required=False, allow_null=True
+    )
+    installment = serializers.PrimaryKeyRelatedField(
+        queryset=BuildingTreatyInstallment.objects.none(), required=False, allow_null=True
+    )
+    work_entry = serializers.PrimaryKeyRelatedField(
+        queryset=BuildingWorkEntry.objects.none(), required=False, allow_null=True
+    )
+    cashbox = serializers.PrimaryKeyRelatedField(queryset=BuildingCashbox.objects.none(), required=True)
+    shift = serializers.CharField(required=False, allow_blank=True, allow_null=True)
+    amount = serializers.DecimalField(max_digits=16, decimal_places=2)
+    comment = serializers.CharField(required=False, allow_blank=True, default="")
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        request = self.context.get("request")
+        if not request:
+            return
+        user = getattr(request, "user", None)
+        company_id = getattr(user, "company_id", None)
+        if not company_id:
+            return
+        self.fields["treaty"].queryset = BuildingTreaty.objects.filter(
+            residential_complex__company_id=company_id
+        )
+        self.fields["apartment"].queryset = ResidentialComplexApartment.objects.filter(
+            residential_complex__company_id=company_id
+        )
+        self.fields["client"].queryset = BuildingClient.objects.filter(company_id=company_id)
+        self.fields["installment"].queryset = BuildingTreatyInstallment.objects.filter(
+            treaty__residential_complex__company_id=company_id
+        )
+        self.fields["work_entry"].queryset = BuildingWorkEntry.objects.filter(
+            residential_complex__company_id=company_id
+        )
+        self.fields["cashbox"].queryset = BuildingCashbox.objects.filter(company_id=company_id)
+
+
+class BuildingCashRegisterRequestSerializer(serializers.ModelSerializer):
+    files = BuildingCashRegisterRequestFileSerializer(many=True, read_only=True)
+    source = serializers.SerializerMethodField()
+    cashbox_name = serializers.SerializerMethodField()
+
+    class Meta:
+        model = BuildingCashRegisterRequest
+        fields = [
+            "id",
+            "request_type",
+            "status",
+            "amount",
+            "comment",
+            "cashbox",
+            "cashbox_name",
+            "shift",
+            "residential_complex",
+            "treaty",
+            "apartment",
+            "client",
+            "installment",
+            "work_entry",
+            "cashflow",
+            "reject_reason",
+            "approved_at",
+            "approved_by",
+            "created_by",
+            "created_at",
+            "updated_at",
+            "files",
+            "source",
+        ]
+        read_only_fields = [
+            "id",
+            "status",
+            "cashflow",
+            "approved_at",
+            "approved_by",
+            "created_at",
+            "updated_at",
+        ]
+
+    def get_source(self, obj):
+        d = {}
+        if obj.treaty_id:
+            d["treaty"] = str(obj.treaty_id)
+        if obj.apartment_id:
+            d["apartment"] = str(obj.apartment_id)
+        if obj.client_id:
+            d["client"] = str(obj.client_id)
+        if obj.installment_id:
+            d["installment"] = str(obj.installment_id)
+        if obj.work_entry_id:
+            d["work_entry"] = str(obj.work_entry_id)
+        return d
+
+    def get_cashbox_name(self, obj):
+        return getattr(obj.cashbox, "name", None) or "Касса"
+
+
+class BuildingCashRegisterRequestApproveSerializer(serializers.Serializer):
+    cashbox = serializers.PrimaryKeyRelatedField(
+        queryset=BuildingCashbox.objects.none(), required=False, allow_null=True
+    )
+    shift = serializers.CharField(required=False, allow_blank=True, allow_null=True)
+    paid_at = serializers.DateTimeField(required=False, allow_null=True)
+    comment = serializers.CharField(required=False, allow_blank=True, default="")
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        request = self.context.get("request")
+        if request and getattr(request.user, "company_id", None):
+            self.fields["cashbox"].queryset = BuildingCashbox.objects.filter(
+                company_id=request.user.company_id
+            )
+
+
+class BuildingCashRegisterRequestRejectSerializer(serializers.Serializer):
+    reason = serializers.CharField(required=False, allow_blank=True, default="")
+
+
+class BuildingCashRegisterRequestFileCreateSerializer(serializers.Serializer):
+    file = serializers.FileField()
+    title = serializers.CharField(required=False, allow_blank=True, default="")
+
+
+class BuildingCashFlowFileCreateSerializer(serializers.Serializer):
+    file = serializers.FileField()
+    title = serializers.CharField(required=False, allow_blank=True, default="")
