@@ -163,6 +163,248 @@ class BuildingCashFlow(models.Model):
 
 
 # -----------------------
+# Заявки на кассу (Cash Register Requests)
+# -----------------------
+
+
+def building_cash_register_request_file_upload_to(instance, filename: str) -> str:
+    ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else "bin"
+    return f"building/cash-register-requests/{instance.request_id}/files/{uuid.uuid4().hex}.{ext}"
+
+
+def building_cashflow_file_upload_to(instance, filename: str) -> str:
+    ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else "bin"
+    return f"building/cashflows/{instance.cashflow_id}/files/{uuid.uuid4().hex}.{ext}"
+
+
+class BuildingCashRegisterRequest(models.Model):
+    """
+    Заявка на кассу — создаётся бизнес-модулем (продажа, рассрочка, оплата подрядчику и т.д.)
+    и должна быть одобрена кассой перед созданием CashFlow.
+    """
+
+    class RequestType(models.TextChoices):
+        APARTMENT_SALE = "apartment_sale", "Продажа квартиры"
+        INSTALLMENT_INITIAL_PAYMENT = "installment_initial_payment", "Первоначальный взнос по рассрочке"
+        INSTALLMENT_PAYMENT = "installment_payment", "Платёж по рассрочке"
+        CONTRACTOR_PAYMENT = "contractor_payment", "Оплата подрядчику"
+        PROCUREMENT_PAYMENT = "procurement_payment", "Оплата закупки"
+        ADVANCE = "advance", "Аванс по ЗП"
+        OTHER = "other", "Другое"
+
+    class Status(models.TextChoices):
+        PENDING = "pending", "Ожидает одобрения"
+        APPROVED = "approved", "Одобрено"
+        REJECTED = "rejected", "Отклонено"
+        CANCELLED = "cancelled", "Отменено"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False, verbose_name="ID")
+
+    company = models.ForeignKey(
+        Company,
+        on_delete=models.CASCADE,
+        related_name="building_cash_register_requests",
+        verbose_name="Компания",
+    )
+    branch = models.ForeignKey(
+        Branch,
+        on_delete=models.CASCADE,
+        related_name="building_cash_register_requests",
+        null=True,
+        blank=True,
+        db_index=True,
+        verbose_name="Филиал",
+    )
+
+    request_type = models.CharField(
+        max_length=32,
+        choices=RequestType.choices,
+        db_index=True,
+        verbose_name="Тип заявки",
+    )
+    status = models.CharField(
+        max_length=16,
+        choices=Status.choices,
+        default=Status.PENDING,
+        db_index=True,
+        verbose_name="Статус",
+    )
+
+    amount = models.DecimalField(max_digits=16, decimal_places=2, verbose_name="Сумма")
+    comment = models.TextField(blank=True, verbose_name="Комментарий")
+
+    cashbox = models.ForeignKey(
+        BuildingCashbox,
+        on_delete=models.CASCADE,
+        related_name="cash_register_requests",
+        verbose_name="Касса",
+    )
+    shift = models.CharField(max_length=36, blank=True, null=True, verbose_name="UUID смены (опционально)")
+
+    # Связи с бизнес-объектами (в зависимости от request_type)
+    residential_complex = models.ForeignKey(
+        "ResidentialComplex",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="cash_register_requests",
+        verbose_name="Жилой комплекс",
+    )
+    treaty = models.ForeignKey(
+        "BuildingTreaty",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="cash_register_requests",
+        verbose_name="Договор",
+    )
+    apartment = models.ForeignKey(
+        "ResidentialComplexApartment",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="cash_register_requests",
+        verbose_name="Квартира",
+    )
+    client = models.ForeignKey(
+        "BuildingClient",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="cash_register_requests",
+        verbose_name="Клиент",
+    )
+    installment = models.ForeignKey(
+        "BuildingTreatyInstallment",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="cash_register_requests",
+        verbose_name="Платёж рассрочки",
+    )
+    work_entry = models.ForeignKey(
+        "BuildingWorkEntry",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="cash_register_requests",
+        verbose_name="Процесс работ",
+    )
+
+    cashflow = models.OneToOneField(
+        BuildingCashFlow,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="cash_register_request",
+        verbose_name="Созданное движение",
+    )
+
+    reject_reason = models.TextField(blank=True, verbose_name="Причина отклонения")
+    approved_at = models.DateTimeField(null=True, blank=True, verbose_name="Дата одобрения")
+    approved_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="building_cash_register_requests_approved",
+        verbose_name="Кто одобрил",
+    )
+
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="building_cash_register_requests_created",
+        verbose_name="Кто создал",
+    )
+    created_at = models.DateTimeField(auto_now_add=True, verbose_name="Дата создания")
+    updated_at = models.DateTimeField(auto_now=True, verbose_name="Дата обновления")
+
+    class Meta:
+        verbose_name = "Заявка на кассу (Building)"
+        verbose_name_plural = "Заявки на кассу (Building)"
+        ordering = ["-created_at"]
+        indexes = [
+            models.Index(fields=["company", "status"]),
+            models.Index(fields=["company", "request_type", "status"]),
+            models.Index(fields=["cashbox", "status"]),
+            models.Index(fields=["residential_complex", "created_at"]),
+            models.Index(fields=["treaty", "created_at"]),
+        ]
+
+    def __str__(self):
+        return f"{self.get_request_type_display()} {self.amount} ({self.status})"
+
+
+class BuildingCashRegisterRequestFile(models.Model):
+    """Файл, прикреплённый к заявке на кассу."""
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False, verbose_name="ID")
+    request = models.ForeignKey(
+        BuildingCashRegisterRequest,
+        on_delete=models.CASCADE,
+        related_name="files",
+        verbose_name="Заявка",
+    )
+    title = models.CharField(max_length=255, blank=True, verbose_name="Название файла")
+    file = models.FileField(upload_to=building_cash_register_request_file_upload_to, verbose_name="Файл")
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="building_cash_register_request_files_created",
+        verbose_name="Кто загрузил",
+    )
+    created_at = models.DateTimeField(auto_now_add=True, verbose_name="Дата загрузки")
+
+    class Meta:
+        verbose_name = "Файл заявки на кассу"
+        verbose_name_plural = "Файлы заявок на кассу"
+        ordering = ["-created_at"]
+        indexes = [
+            models.Index(fields=["request", "created_at"]),
+        ]
+
+    def __str__(self):
+        return self.title or str(getattr(self.file, "name", "")) or str(self.id)
+
+
+class BuildingCashFlowFile(models.Model):
+    """Файл, прикреплённый к движению по кассе (CashFlow)."""
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False, verbose_name="ID")
+    cashflow = models.ForeignKey(
+        BuildingCashFlow,
+        on_delete=models.CASCADE,
+        related_name="files",
+        verbose_name="Движение по кассе",
+    )
+    title = models.CharField(max_length=255, blank=True, verbose_name="Название файла")
+    file = models.FileField(upload_to=building_cashflow_file_upload_to, verbose_name="Файл")
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="building_cashflow_files_created",
+        verbose_name="Кто загрузил",
+    )
+    created_at = models.DateTimeField(auto_now_add=True, verbose_name="Дата загрузки")
+
+    class Meta:
+        verbose_name = "Файл движения по кассе"
+        verbose_name_plural = "Файлы движений по кассе"
+        ordering = ["-created_at"]
+        indexes = [
+            models.Index(fields=["cashflow", "created_at"]),
+        ]
+
+    def __str__(self):
+        return self.title or str(getattr(self.file, "name", "")) or str(self.id)
+
+
+# -----------------------
 # Residential complex and related
 # -----------------------
 
@@ -893,6 +1135,44 @@ class BuildingClient(models.Model):
         return self.name
 
 
+def building_client_file_upload_to(instance, filename: str) -> str:
+    ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else "bin"
+    return f"building/clients/{instance.client_id}/files/{uuid.uuid4().hex}.{ext}"
+
+
+class BuildingClientFile(models.Model):
+    """Файл, прикреплённый к клиенту."""
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False, verbose_name="ID")
+    client = models.ForeignKey(
+        BuildingClient,
+        on_delete=models.CASCADE,
+        related_name="files",
+        verbose_name="Клиент",
+    )
+    title = models.CharField(max_length=255, blank=True, verbose_name="Название файла")
+    file = models.FileField(upload_to=building_client_file_upload_to, verbose_name="Файл")
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="building_client_files_created",
+        verbose_name="Кто загрузил",
+    )
+    created_at = models.DateTimeField(auto_now_add=True, verbose_name="Дата загрузки")
+
+    class Meta:
+        verbose_name = "Файл клиента (Building)"
+        verbose_name_plural = "Файлы клиентов (Building)"
+        ordering = ["-created_at"]
+        indexes = [
+            models.Index(fields=["client", "created_at"]),
+        ]
+
+    def __str__(self):
+        return self.title or str(getattr(self.file, "name", "")) or str(self.id)
+
+
 class BuildingTreatyNumberSequence(models.Model):
     """
     Счётчик для безопасной автогенерации номера договора внутри компании.
@@ -1331,6 +1611,44 @@ class BuildingTask(models.Model):
 
     def __str__(self):
         return self.title
+
+
+def building_task_file_upload_to(instance, filename: str) -> str:
+    ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else "bin"
+    return f"building/tasks/{instance.task_id}/files/{uuid.uuid4().hex}.{ext}"
+
+
+class BuildingTaskFile(models.Model):
+    """Файл, прикреплённый к задаче."""
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False, verbose_name="ID")
+    task = models.ForeignKey(
+        BuildingTask,
+        on_delete=models.CASCADE,
+        related_name="files",
+        verbose_name="Задача",
+    )
+    title = models.CharField(max_length=255, blank=True, verbose_name="Название файла")
+    file = models.FileField(upload_to=building_task_file_upload_to, verbose_name="Файл")
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="building_task_files_created",
+        verbose_name="Кто загрузил",
+    )
+    created_at = models.DateTimeField(auto_now_add=True, verbose_name="Дата загрузки")
+
+    class Meta:
+        verbose_name = "Файл задачи (Building)"
+        verbose_name_plural = "Файлы задач (Building)"
+        ordering = ["-created_at"]
+        indexes = [
+            models.Index(fields=["task", "created_at"]),
+        ]
+
+    def __str__(self):
+        return self.title or str(getattr(self.file, "name", "")) or str(self.id)
 
 
 class BuildingTaskAssignee(models.Model):

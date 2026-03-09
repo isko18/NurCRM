@@ -2,6 +2,11 @@
 
 Документация API модуля Building для фронтенда: ЖК, квартиры, договора, закупки, склад, касса, зарплата, задачи и процесс работ.
 
+**Связанные спецификации:**
+- `building_cash_register_backend_spec.md` — backend-спецификация кассы (заявки, CashFlow, файлы, подрядчики, поставщики)
+- `building_procurement_frontend_api.md` — закупки и склад
+- `building_work_process_frontend_api.md` — процесс работ
+
 ---
 
 ## Базовые настройки
@@ -191,6 +196,59 @@
 - При одобрении (`approved`) движения с `source_business_operation_id` (выплата ЗП) автоматически проводится связанная операция.
 - Оплата рассрочки создаёт приход сразу в статусе `approved`.
 
+**Файлы к движению (CashFlow):**
+- `POST /cash-register/cashflows/{id}/files/` (multipart: `file`, `title`)
+- В ответе `GET /cash/flows/{id}/` возвращается поле `files` со списком прикреплённых файлов.
+
+### 1.3) Заявки на кассу (Cash Register Requests)
+
+Заявки создаются бизнес-модулями (продажа, рассрочка, оплата подрядчику) и должны быть одобрены кассой перед созданием CashFlow.
+
+- `GET /cash-register/requests/` — список заявок
+- `POST /cash-register/requests/` — создать заявку
+- `GET /cash-register/requests/{id}/` — детали
+- `POST /cash-register/requests/{id}/approve/` — одобрить
+- `POST /cash-register/requests/{id}/reject/` — отклонить
+- `POST /cash-register/requests/{id}/files/` — загрузить файл (multipart: `file`, `title`)
+
+**Фильтры `GET /cash-register/requests/`:**
+- `request_type`, `status`, `cashbox`, `residential_complex`, `treaty`, `client`
+
+**Типы заявок:** `apartment_sale`, `installment_initial_payment`, `installment_payment`, `contractor_payment`, `procurement_payment`, `advance`, `other`
+
+**Статусы:** `pending` | `approved` | `rejected` | `cancelled`
+
+Тело создания заявки:
+```json
+{
+  "request_type": "apartment_sale",
+  "treaty": "uuid-договора",
+  "apartment": "uuid-квартиры",
+  "client": "uuid-клиента",
+  "cashbox": "uuid-кассы",
+  "shift": "uuid-смены или null",
+  "amount": "1000000.00",
+  "comment": "Оплата по договору №123"
+}
+```
+
+Тело одобрения (опционально):
+```json
+{
+  "cashbox": "uuid-кассы",
+  "shift": "uuid-смены",
+  "paid_at": "2026-03-10T12:00:00+06:00",
+  "comment": "Оплата получена"
+}
+```
+
+Тело отклонения (опционально):
+```json
+{
+  "reason": "Клиент отказался от оплаты"
+}
+```
+
 ---
 
 ## 2) Квартиры (ResidentialComplexApartment)
@@ -237,9 +295,10 @@
 
 - `GET /clients/`
 - `POST /clients/`
-- `GET /clients/{id}/` — с вложенными `treaties`
+- `GET /clients/{id}/` — с вложенными `treaties` и `files`
 - `PATCH /clients/{id}/`
 - `DELETE /clients/{id}/`
+- `POST /clients/{id}/files/` — загрузить файл (multipart: `file`, `title`)
 
 **Фильтры:** `is_active`, `search` (name/phone/email/inn)
 
@@ -363,10 +422,11 @@
 - `GET /tasks/{id}/`
 - `PATCH /tasks/{id}/`
 - `DELETE /tasks/{id}/`
+- `POST /tasks/{id}/files/` — загрузить файл (multipart: `file`, `title`)
 
 **Статусы:** `open` | `done` | `cancelled`
 
-**Поля:** `assignee_ids` (write), `assignees` (read), `checklist_items` (read)
+**Поля:** `assignee_ids` (write), `assignees` (read), `checklist_items` (read), `files` (read)
 
 **Чек-лист:**
 - `POST /tasks/{task_id}/checklist-items/` — добавить: `{"text": "...", "order": 1}`
@@ -474,6 +534,12 @@
 | | GET/POST | `/cash/flows/` |
 | | GET/PATCH/DELETE | `/cash/flows/{id}/` |
 | | PATCH | `/cash/flows/bulk/status/` |
+| | GET/POST | `/cash-register/requests/` |
+| | GET | `/cash-register/requests/{id}/` |
+| | POST | `/cash-register/requests/{id}/approve/` |
+| | POST | `/cash-register/requests/{id}/reject/` |
+| | POST | `/cash-register/requests/{id}/files/` |
+| | POST | `/cash-register/cashflows/{id}/files/` |
 | **ЖК** | GET/POST | `/objects/` |
 | | GET/PATCH/DELETE | `/objects/{id}/` |
 | | GET | `/objects/{id}/floors/` |
@@ -485,6 +551,7 @@
 | | GET/PATCH/DELETE | `/drawings/{id}/` |
 | **Клиенты** | GET/POST | `/clients/` |
 | | GET/PATCH/DELETE | `/clients/{id}/` |
+| | POST | `/clients/{id}/files/` |
 | **Договора** | GET/POST | `/treaties/` |
 | | GET/PATCH/DELETE | `/treaties/{id}/` |
 | | POST | `/treaties/{id}/files/` |
@@ -506,6 +573,7 @@
 | | POST | `/salary/advance-requests/{id}/reject/` |
 | **Задачи** | GET/POST | `/tasks/` |
 | | GET/PATCH/DELETE | `/tasks/{id}/` |
+| | POST | `/tasks/{id}/files/` |
 | | POST | `/tasks/{id}/checklist-items/` |
 | | PATCH/DELETE | `/task-checklist-items/{id}/` |
 | **Процесс работ** | GET/POST | `/work-entries/` |

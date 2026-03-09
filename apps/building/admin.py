@@ -2,6 +2,9 @@ from django.contrib import admin
 from .models import (
     BuildingCashbox,
     BuildingCashFlow,
+    BuildingCashFlowFile,
+    BuildingCashRegisterRequest,
+    BuildingCashRegisterRequestFile,
     ResidentialComplex,
     ResidentialComplexMember,
     ResidentialComplexDrawing,
@@ -17,6 +20,8 @@ from .models import (
     BuildingWarehouseStockMove,
     BuildingWorkflowEvent,
     BuildingClient,
+    BuildingClientFile,
+    BuildingTaskFile,
     BuildingTreatyNumberSequence,
     BuildingTreaty,
     BuildingTreatyInstallment,
@@ -49,6 +54,25 @@ class BuildingCashFlowAdmin(admin.ModelAdmin):
     list_filter = ("type", "status", "cashbox__company")
     search_fields = ("name",)
     readonly_fields = ("id", "created_at")
+
+
+@admin.register(BuildingCashRegisterRequest)
+class BuildingCashRegisterRequestAdmin(admin.ModelAdmin):
+    list_display = ("request_type", "status", "amount", "cashbox", "created_at", "approved_by")
+    list_filter = ("request_type", "status", "cashbox__company")
+    search_fields = ("comment",)
+    readonly_fields = ("id", "created_at", "updated_at", "approved_at")
+
+
+@admin.register(BuildingCashRegisterRequestFile)
+class BuildingCashRegisterRequestFileAdmin(admin.ModelAdmin):
+    list_display = ("request", "title", "created_at")
+    list_filter = ("request__request_type",)
+
+
+@admin.register(BuildingCashFlowFile)
+class BuildingCashFlowFileAdmin(admin.ModelAdmin):
+    list_display = ("cashflow", "title", "created_at")
 
 
 @admin.register(ResidentialComplex)
@@ -216,6 +240,18 @@ class BuildingClientAdmin(admin.ModelAdmin):
     list_filter = ("company", "is_active")
     search_fields = ("name", "phone", "email", "inn")
     readonly_fields = ("id", "created_at", "updated_at")
+
+
+@admin.register(BuildingClientFile)
+class BuildingClientFileAdmin(admin.ModelAdmin):
+    list_display = ("id", "client", "title", "created_at")
+    list_filter = ("client__company",)
+
+
+@admin.register(BuildingTaskFile)
+class BuildingTaskFileAdmin(admin.ModelAdmin):
+    list_display = ("id", "task", "title", "created_at")
+    list_filter = ("task__company",)
 
 
 class BuildingWorkEntryPhotoInline(admin.TabularInline):

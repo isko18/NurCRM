@@ -6,6 +6,12 @@ from .views import (
     BuildingCashFlowListCreateView,
     BuildingCashFlowDetailView,
     BuildingCashFlowBulkStatusUpdateView,
+    CashRegisterRequestListCreateView,
+    CashRegisterRequestDetailView,
+    CashRegisterRequestApproveView,
+    CashRegisterRequestRejectView,
+    CashRegisterRequestFileAddView,
+    CashFlowFileAddView,
     ResidentialComplexListCreateView,
     ResidentialComplexDetailView,
     ResidentialComplexFloorsView,
@@ -44,6 +50,7 @@ from .views import (
     BuildingWorkEntryFileAddView,
     BuildingClientListCreateView,
     BuildingClientDetailView,
+    BuildingClientFileAddView,
     BuildingTreatyListCreateView,
     BuildingTreatyDetailView,
     BuildingTreatyFileAddView,
@@ -51,6 +58,7 @@ from .views import (
     BuildingTreatyInstallmentPaymentView,
     BuildingTaskListCreateView,
     BuildingTaskDetailView,
+    BuildingTaskFileAddView,
     BuildingTaskChecklistItemAddView,
     BuildingTaskChecklistItemDetailView,
     BuildingSalaryEmployeeListView,
@@ -78,6 +86,14 @@ urlpatterns = [
     path("cash/flows/", BuildingCashFlowListCreateView.as_view(), name="building-cash-flow-list-create"),
     path("cash/flows/<uuid:pk>/", BuildingCashFlowDetailView.as_view(), name="building-cash-flow-detail"),
     path("cash/flows/bulk/status/", BuildingCashFlowBulkStatusUpdateView.as_view(), name="building-cash-flow-bulk-status"),
+
+    # Cash Register Requests (заявки на кассу)
+    path("cash-register/requests/", CashRegisterRequestListCreateView.as_view(), name="cash-register-request-list-create"),
+    path("cash-register/requests/<uuid:pk>/", CashRegisterRequestDetailView.as_view(), name="cash-register-request-detail"),
+    path("cash-register/requests/<uuid:pk>/approve/", CashRegisterRequestApproveView.as_view(), name="cash-register-request-approve"),
+    path("cash-register/requests/<uuid:pk>/reject/", CashRegisterRequestRejectView.as_view(), name="cash-register-request-reject"),
+    path("cash-register/requests/<uuid:pk>/files/", CashRegisterRequestFileAddView.as_view(), name="cash-register-request-files"),
+    path("cash-register/cashflows/<uuid:pk>/files/", CashFlowFileAddView.as_view(), name="cash-register-cashflow-files"),
 
     path("objects/", ResidentialComplexListCreateView.as_view(), name="residential-complex-list-create"),
     path("objects/<uuid:pk>/", ResidentialComplexDetailView.as_view(), name="residential-complex-detail"),
@@ -128,6 +144,7 @@ urlpatterns = [
     # clients
     path("clients/", BuildingClientListCreateView.as_view(), name="building-client-list-create"),
     path("clients/<uuid:pk>/", BuildingClientDetailView.as_view(), name="building-client-detail"),
+    path("clients/<uuid:pk>/files/", BuildingClientFileAddView.as_view(), name="building-client-file-add"),
 
     # treaties (contracts)
     path("treaties/", BuildingTreatyListCreateView.as_view(), name="building-treaty-list-create"),
@@ -143,6 +160,7 @@ urlpatterns = [
     # tasks / reminders
     path("tasks/", BuildingTaskListCreateView.as_view(), name="building-task-list-create"),
     path("tasks/<uuid:pk>/", BuildingTaskDetailView.as_view(), name="building-task-detail"),
+    path("tasks/<uuid:pk>/files/", BuildingTaskFileAddView.as_view(), name="building-task-file-add"),
     path("tasks/<uuid:pk>/checklist-items/", BuildingTaskChecklistItemAddView.as_view(), name="building-task-checklist-item-add"),
     path("task-checklist-items/<uuid:pk>/", BuildingTaskChecklistItemDetailView.as_view(), name="building-task-checklist-item-detail"),
 
