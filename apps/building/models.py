@@ -782,6 +782,44 @@ class BuildingProcurementItem(models.Model):
             procurement.recalculate_totals()
 
 
+def building_procurement_file_upload_to(instance, filename: str) -> str:
+    ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else "bin"
+    return f"building/procurements/{instance.procurement_id}/files/{uuid.uuid4().hex}.{ext}"
+
+
+class BuildingProcurementFile(models.Model):
+    """Файл, прикреплённый к закупке (счета, договоры, накладные)."""
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False, verbose_name="ID")
+    procurement = models.ForeignKey(
+        BuildingProcurementRequest,
+        on_delete=models.CASCADE,
+        related_name="files",
+        verbose_name="Закупка",
+    )
+    title = models.CharField(max_length=255, blank=True, verbose_name="Название файла")
+    file = models.FileField(upload_to=building_procurement_file_upload_to, verbose_name="Файл")
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="building_procurement_files_created",
+        verbose_name="Кто загрузил",
+    )
+    created_at = models.DateTimeField(auto_now_add=True, verbose_name="Дата загрузки")
+
+    class Meta:
+        verbose_name = "Файл закупки (Building)"
+        verbose_name_plural = "Файлы закупок (Building)"
+        ordering = ["-created_at"]
+        indexes = [
+            models.Index(fields=["procurement", "created_at"]),
+        ]
+
+    def __str__(self):
+        return self.title or str(getattr(self.file, "name", "")) or str(self.id)
+
+
 class BuildingProcurementCashDecision(models.Model):
     class Decision(models.TextChoices):
         APPROVED = "approved", "Одобрено"

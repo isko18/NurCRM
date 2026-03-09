@@ -24,6 +24,7 @@ from .models import (
     BuildingProduct,
     BuildingProcurementRequest,
     BuildingProcurementItem,
+    BuildingProcurementFile,
     BuildingProcurementCashDecision,
     BuildingTransferRequest,
     BuildingTransferItem,
@@ -352,12 +353,30 @@ class BuildingTransferSerializer(serializers.ModelSerializer):
         ]
 
 
+class BuildingProcurementFileSerializer(serializers.ModelSerializer):
+    file_url = serializers.SerializerMethodField()
+
+    class Meta:
+        model = BuildingProcurementFile
+        fields = ["id", "file_url", "title", "created_at"]
+        read_only_fields = fields
+
+    def get_file_url(self, obj):
+        if obj.file:
+            request = self.context.get("request")
+            if request:
+                return request.build_absolute_uri(obj.file.url)
+            return obj.file.url
+        return None
+
+
 class BuildingProcurementSerializer(serializers.ModelSerializer):
     residential_complex_name = serializers.CharField(source="residential_complex.name", read_only=True)
     initiator_display = serializers.SerializerMethodField()
     cash_decision = BuildingProcurementCashDecisionSerializer(read_only=True)
     transfers = BuildingTransferSerializer(many=True, read_only=True)
     items = BuildingProcurementItemSerializer(many=True, read_only=True)
+    files = serializers.SerializerMethodField(read_only=True)
 
     class Meta:
         model = BuildingProcurementRequest
@@ -379,6 +398,7 @@ class BuildingProcurementSerializer(serializers.ModelSerializer):
             "cash_decision",
             "items",
             "transfers",
+            "files",
         ]
         read_only_fields = [
             "id",
@@ -393,7 +413,14 @@ class BuildingProcurementSerializer(serializers.ModelSerializer):
             "cash_decision",
             "items",
             "transfers",
+            "files",
         ]
+
+    def get_files(self, obj):
+        files_qs = getattr(obj, "files", None)
+        if files_qs is None:
+            return []
+        return BuildingProcurementFileSerializer(files_qs.all(), many=True, context=self.context).data
 
     def get_initiator_display(self, obj):
         user = getattr(obj, "initiator", None)

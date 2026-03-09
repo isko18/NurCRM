@@ -13,6 +13,7 @@ from .models import (
     BuildingProduct,
     BuildingProcurementRequest,
     BuildingProcurementItem,
+    BuildingProcurementFile,
     BuildingProcurementCashDecision,
     BuildingTransferRequest,
     BuildingTransferItem,
@@ -129,13 +130,19 @@ class BuildingProcurementItemInline(admin.TabularInline):
     readonly_fields = ("id", "line_total", "created_at", "updated_at")
 
 
+class BuildingProcurementFileInline(admin.TabularInline):
+    model = BuildingProcurementFile
+    extra = 0
+    readonly_fields = ("id", "created_at")
+
+
 @admin.register(BuildingProcurementRequest)
 class BuildingProcurementRequestAdmin(admin.ModelAdmin):
     list_display = ("id", "title", "residential_complex", "status", "total_amount", "initiator", "created_at")
     list_filter = ("status", "residential_complex__company")
     search_fields = ("title", "comment", "residential_complex__name")
     readonly_fields = ("id", "total_amount", "submitted_to_cash_at", "cash_decided_at", "created_at", "updated_at")
-    inlines = [BuildingProcurementItemInline]
+    inlines = [BuildingProcurementItemInline, BuildingProcurementFileInline]
 
 
 @admin.register(BuildingProcurementCashDecision)

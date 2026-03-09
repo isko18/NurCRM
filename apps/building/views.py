@@ -25,6 +25,7 @@ from .models import (
     BuildingProduct,
     BuildingProcurementRequest,
     BuildingProcurementItem,
+    BuildingProcurementFile,
     BuildingTransferRequest,
     BuildingWorkflowEvent,
     BuildingWarehouseStockItem,
@@ -562,7 +563,7 @@ class BuildingProductDetailView(CompanyQuerysetMixin, generics.RetrieveUpdateDes
 class BuildingProcurementListCreateView(CompanyQuerysetMixin, generics.ListCreateAPIView):
     permission_classes = [permissions.IsAuthenticated]
     serializer_class = BuildingProcurementSerializer
-    queryset = BuildingProcurementRequest.objects.select_related("residential_complex", "initiator").prefetch_related("items")
+    queryset = BuildingProcurementRequest.objects.select_related("residential_complex", "initiator").prefetch_related("items", "files")
     filter_backends = [DjangoFilterBackend, filters.SearchFilter]
     filterset_fields = ["residential_complex", "status"]
     search_fields = ["title", "comment", "residential_complex__name"]
@@ -595,7 +596,7 @@ class BuildingProcurementListCreateView(CompanyQuerysetMixin, generics.ListCreat
 class BuildingProcurementDetailView(CompanyQuerysetMixin, generics.RetrieveUpdateDestroyAPIView):
     permission_classes = [permissions.IsAuthenticated]
     serializer_class = BuildingProcurementSerializer
-    queryset = BuildingProcurementRequest.objects.select_related("residential_complex", "initiator").prefetch_related("items")
+    queryset = BuildingProcurementRequest.objects.select_related("residential_complex", "initiator").prefetch_related("items", "files")
 
     def get_queryset(self):
         qs = super().get_queryset()
@@ -609,6 +610,46 @@ class BuildingProcurementDetailView(CompanyQuerysetMixin, generics.RetrieveUpdat
         if not getattr(user, "is_staff", False) and not getattr(user, "is_superuser", False):
             return qs.none()
         return qs
+
+
+class BuildingProcurementFileAddView(CompanyQuerysetMixin, generics.GenericAPIView):
+    """Загрузить файл к закупке."""
+    permission_classes = [permissions.IsAuthenticated]
+    serializer_class = BuildingTreatyFileCreateSerializer
+    parser_classes = [MultiPartParser, FormParser]
+    queryset = BuildingProcurementRequest.objects.select_related("residential_complex")
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        user = self.request.user
+        if user.is_authenticated and getattr(user, "company_id", None):
+            qs = qs.filter(residential_complex__company_id=user.company_id)
+            allowed_ids = _allowed_residential_complex_ids(user)
+            if allowed_ids is not None:
+                qs = qs.filter(residential_complex_id__in=allowed_ids)
+            return qs
+        if not getattr(user, "is_staff", False) and not getattr(user, "is_superuser", False):
+            return qs.none()
+        return qs
+
+    def post(self, request, pk=None):
+        user = request.user
+        if not (_is_owner_like(user) or getattr(user, "can_view_building_procurement", False)):
+            raise PermissionDenied("Нет прав на закупки (Building).")
+        procurement = self.get_object()
+        ser = self.get_serializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+        BuildingProcurementFile.objects.create(
+            procurement=procurement,
+            file=ser.validated_data["file"],
+            title=(ser.validated_data.get("title") or "").strip(),
+            created_by=user,
+        )
+        procurement.refresh_from_db()
+        return Response(
+            BuildingProcurementSerializer(procurement, context={"request": request}).data,
+            status=status.HTTP_201_CREATED,
+        )
 
 
 class BuildingProcurementItemListCreateView(CompanyQuerysetMixin, generics.ListCreateAPIView):
@@ -735,7 +776,7 @@ class BuildingProcurementSubmitToCashView(CompanyQuerysetMixin, generics.Generic
 class BuildingCashPendingProcurementListView(CompanyQuerysetMixin, generics.ListAPIView):
     permission_classes = [permissions.IsAuthenticated]
     serializer_class = BuildingProcurementSerializer
-    queryset = BuildingProcurementRequest.objects.select_related("residential_complex", "initiator").prefetch_related("items")
+    queryset = BuildingProcurementRequest.objects.select_related("residential_complex", "initiator").prefetch_related("items", "files")
 
     def get_queryset(self):
         qs = super().get_queryset().filter(status=BuildingProcurementRequest.Status.SUBMITTED_TO_CASH)
@@ -1030,7 +1071,7 @@ class BuildingPurchaseDocumentListCreateView(CompanyQuerysetMixin, generics.List
     """
     permission_classes = [permissions.IsAuthenticated]
     serializer_class = BuildingPurchaseDocumentSerializer
-    queryset = BuildingProcurementRequest.objects.select_related("residential_complex", "initiator").prefetch_related("items")
+    queryset = BuildingProcurementRequest.objects.select_related("residential_complex", "initiator").prefetch_related("items", "files")
     filter_backends = [DjangoFilterBackend, filters.SearchFilter]
     filterset_fields = ["status", "residential_complex"]
     search_fields = ["comment", "title", "residential_complex__name"]
@@ -1067,7 +1108,7 @@ class BuildingPurchaseDocumentDetailView(CompanyQuerysetMixin, generics.Retrieve
     """
     permission_classes = [permissions.IsAuthenticated]
     serializer_class = BuildingPurchaseDocumentSerializer
-    queryset = BuildingProcurementRequest.objects.select_related("residential_complex", "initiator").prefetch_related("items")
+    queryset = BuildingProcurementRequest.objects.select_related("residential_complex", "initiator").prefetch_related("items", "files")
 
     def get_queryset(self):
         qs = super().get_queryset()
