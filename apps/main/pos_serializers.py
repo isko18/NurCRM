@@ -43,12 +43,35 @@ class QtyField(serializers.DecimalField):
 
 
 class StartCartOptionsSerializer(serializers.Serializer):
-    order_discount_total = MoneyField(required=False)
+    """
+    Настройки корзины перед продажей:
+    - order_discount_total — фиксированная скидка на чек (сумма)
+    - order_discount_percent — скидка на чек в процентах (0–100)
 
-    def validate_order_discount_total(self, v):
-        if v is not None and v < 0:
-            raise serializers.ValidationError("Должна быть ≥ 0.")
-        return v
+    Используется только ОДИН вариант: либо сумма, либо процент.
+    """
+
+    order_discount_total = MoneyField(required=False)
+    order_discount_percent = serializers.DecimalField(
+        max_digits=5, decimal_places=2, required=False
+    )
+
+    def validate(self, attrs):
+        total = attrs.get("order_discount_total")
+        percent = attrs.get("order_discount_percent")
+
+        if total is not None and total < 0:
+            raise serializers.ValidationError({"order_discount_total": "Должна быть ≥ 0."})
+        if percent is not None and percent < 0:
+            raise serializers.ValidationError({"order_discount_percent": "Должна быть ≥ 0."})
+        if percent is not None and percent > 100:
+            raise serializers.ValidationError({"order_discount_percent": "Не больше 100%."})
+        if total is not None and percent is not None:
+            raise serializers.ValidationError(
+                "Выберите либо фиксированную скидку (order_discount_total), либо скидку в процентах (order_discount_percent)."
+            )
+
+        return attrs
 
 
 class CustomCartItemCreateSerializer(serializers.Serializer):
