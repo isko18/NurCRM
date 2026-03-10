@@ -699,13 +699,36 @@ class ChangePasswordSerializer(serializers.Serializer):
         user.save(update_fields=["password"])
         return user
 
-_OPTIONAL_TEXT = ("llc", "inn", "okpo", "score", "bik", "address")
+_OPTIONAL_TEXT = (
+    "llc",
+    "inn",
+    "okpo",
+    "score",
+    "bik",
+    "address",
+    "phone",
+    "phones_howcase",
+    "whatsapp_phone",
+)
 
 
 class CompanyUpdateSerializer(serializers.ModelSerializer):
     class Meta:
         model = Company
-        fields = ["name", "llc", "inn", "okpo", "score", "bik", "address", "whatsapp_phone"]
+        fields = [
+            "name",
+            "llc",
+            "inn",
+            "okpo",
+            "score",
+            "bik",
+            "address",
+            "phone",
+            "phones_howcase",
+            "whatsapp_phone",
+            "industry",
+            "sector",
+        ]
 
     def validate(self, attrs):
         for f in _OPTIONAL_TEXT:

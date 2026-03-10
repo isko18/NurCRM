@@ -1160,11 +1160,20 @@ class SaleStartAPIView(MarketCashierOnlyMixin, CompanyBranchRestrictedMixin, API
         opts = StartCartOptionsSerializer(data=request.data)
         opts.is_valid(raise_exception=True)
 
-        order_disc = opts.validated_data.get("order_discount_total")
-        if order_disc is None:
-            order_disc = Decimal("0.00")
+        # Сначала пересчитываем корзину, чтобы получить актуальный subtotal
+        cart.recalc()
 
-        cart.order_discount_total = _q2(order_disc)
+        order_disc_total = opts.validated_data.get("order_discount_total")
+        order_disc_percent = opts.validated_data.get("order_discount_percent")
+
+        if order_disc_percent is not None:
+            # Скидка в процентах на весь чек: считаем как % от суммы до общей скидки
+            base_subtotal = cart.subtotal or Decimal("0.00")
+            order_disc_total = _q2(base_subtotal * Decimal(str(order_disc_percent)) / Decimal("100"))
+        elif order_disc_total is None:
+            order_disc_total = Decimal("0.00")
+
+        cart.order_discount_total = _q2(order_disc_total)
         cart.save(update_fields=["order_discount_total", "updated_at"])
 
         cart.recalc()
@@ -1654,12 +1663,23 @@ class SaleBulkDeleteAPIView(MarketCashierOnlyMixin, CompanyBranchRestrictedMixin
         base_qs = Sale.objects.filter(id__in=valid_ids)
         base_qs = self._filter_qs_company_branch(base_qs)
 
+        paid_ids = list(base_qs.filter(status=Sale.Status.PAID).values_list("id", flat=True))
+        if paid_ids and not allow_paid:
+            return Response(
+                {
+                    "detail": "Среди переданных продаж есть оплаченные. "
+                              "Если хочешь удалить их тоже, передай allow_paid=true.",
+                    "paid_ids": [str(x) for x in paid_ids],
+                },
+                status=400,
+            )
+
         if allow_paid:
             deletable_qs = base_qs
             not_allowed_ids = []
         else:
             deletable_qs = base_qs.exclude(status=Sale.Status.PAID)
-            not_allowed_ids = list(base_qs.filter(status=Sale.Status.PAID).values_list("id", flat=True))
+            not_allowed_ids = []
 
         found_ids = set(str(sid) for sid in base_qs.values_list("id", flat=True))
         not_found_ids = [str(x) for x in valid_ids if str(x) not in found_ids]
@@ -1992,9 +2012,18 @@ class AgentCartStartAPIView(MarketCashierOnlyMixin, CompanyBranchRestrictedMixin
 
         opts = StartCartOptionsSerializer(data=request.data)
         if opts.is_valid():
-            order_disc = opts.validated_data.get("order_discount_total")
-            if order_disc is not None:
-                cart.order_discount_total = money(order_disc)
+            # Пересчитываем, чтобы взять актуальный subtotal
+            cart.recalc()
+
+            order_disc_total = opts.validated_data.get("order_discount_total")
+            order_disc_percent = opts.validated_data.get("order_discount_percent")
+
+            if order_disc_percent is not None:
+                base_subtotal = cart.subtotal or Decimal("0.00")
+                order_disc_total = money(base_subtotal * Decimal(str(order_disc_percent)) / Decimal("100"))
+
+            if order_disc_total is not None:
+                cart.order_discount_total = money(order_disc_total)
                 cart.save(update_fields=["order_discount_total"])
 
         cart.recalc()
