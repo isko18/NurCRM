@@ -1627,12 +1627,17 @@ class SaleRetrieveAPIView(MarketCashierOnlyMixin, CompanyBranchRestrictedMixin, 
 
 
 class SaleBulkDeleteAPIView(MarketCashierOnlyMixin, CompanyBranchRestrictedMixin, APIView):
+    """
+    Массовое удаление продаж.
+    Поддерживает DELETE и POST (многие клиенты/прокси не передают body с DELETE).
+    Body: {"ids": ["uuid", ...], "allow_paid": false}
+    """
     permission_classes = [permissions.IsAuthenticated]
 
-    @transaction.atomic
-    def delete(self, request, *args, **kwargs):
-        ids = request.data.get("ids")
-        allow_paid = bool(request.data.get("allow_paid", False))
+    def _perform_bulk_delete(self, request):
+        data = request.data or {}
+        ids = data.get("ids")
+        allow_paid = bool(data.get("allow_paid", False))
         if not isinstance(ids, list) or not ids:
             return Response({"detail": "Укажите непустой список 'ids'."}, status=400)
 
@@ -1669,6 +1674,14 @@ class SaleBulkDeleteAPIView(MarketCashierOnlyMixin, CompanyBranchRestrictedMixin
             },
             status=200,
         )
+
+    @transaction.atomic
+    def delete(self, request, *args, **kwargs):
+        return self._perform_bulk_delete(request)
+
+    @transaction.atomic
+    def post(self, request, *args, **kwargs):
+        return self._perform_bulk_delete(request)
 
 
 class CartItemUpdateDestroyAPIView(MarketCashierOnlyMixin, APIView):
@@ -1734,14 +1747,15 @@ class CartItemUpdateDestroyAPIView(MarketCashierOnlyMixin, APIView):
             qty_for_price = Decimal(str(item.quantity or 1))
             if unit_price is not None:
                 new_price = _q2(unit_price)
+                new_price = self._apply_min_price(item, new_price)
             else:
+                # discount_total: скидка применяется, min_price не блокирует (продажа со скидкой)
                 per_unit_disc = _q2(Decimal(str(line_discount)) / qty_for_price)
                 new_price = _q2(
                     Decimal(str(item.product.price if item.product_id else 0)) - per_unit_disc
                 )
                 if new_price < 0:
                     new_price = Decimal("0.00")
-            new_price = self._apply_min_price(item, new_price)
             item.unit_price = new_price
 
         update_fields = []
@@ -2368,14 +2382,15 @@ class AgentCartItemUpdateDestroyAPIView(MarketCashierOnlyMixin, APIView):
             qty_for_price = Decimal(str(item.quantity or 1))
             if unit_price is not None:
                 new_price = _q2(unit_price)
+                new_price = self._apply_min_price(item, new_price)
             else:
+                # discount_total: скидка применяется, min_price не блокирует (продажа со скидкой)
                 per_unit_disc = _q2(Decimal(str(line_discount)) / qty_for_price)
                 new_price = _q2(
                     Decimal(str(item.product.price if item.product_id else 0)) - per_unit_disc
                 )
                 if new_price < 0:
                     new_price = Decimal("0.00")
-            new_price = self._apply_min_price(item, new_price)
             item.unit_price = new_price
 
         update_fields = []
