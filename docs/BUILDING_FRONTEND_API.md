@@ -4,6 +4,7 @@
 
 **Связанные спецификации:**
 - `building_cash_register_backend_spec.md` — backend-спецификация кассы (заявки, CashFlow, файлы, подрядчики, поставщики)
+- `building_backend_salary_and_stock.md` — backend API: зарплата + склад (кратко)
 - `building_procurement_frontend_api.md` — закупки и склад
 - `building_work_process_frontend_api.md` — процесс работ
 

@@ -48,6 +48,8 @@ from .views import (
     BuildingSupplierFileAddView,
     BuildingSupplierPurchaseHistoryView,
     BuildingWorkEntryWarehouseRequestCreateView,
+    BuildingWarehouseRequestListView,
+    BuildingWarehouseRequestDetailView,
     BuildingWorkEntryReconciliationActCreateView,
     BuildingWarehouseMovementWriteOffView,
     BuildingWarehouseMovementTransferToContractorView,
@@ -91,6 +93,7 @@ from .views import (
     AdvanceRequestListView,
     AdvanceRequestApproveView,
     AdvanceRequestRejectView,
+    BuildingPayrollPaymentApproveView,
 )
 
 app_name = "building"
@@ -154,6 +157,8 @@ urlpatterns = [
     path("suppliers/<uuid:pk>/purchase-history/", BuildingSupplierPurchaseHistoryView.as_view(), name="building-supplier-purchase-history"),
 
     path("work-entries/<uuid:pk>/warehouse-requests/", BuildingWorkEntryWarehouseRequestCreateView.as_view(), name="building-work-entry-warehouse-request"),
+    path("work-entries/warehouse-requests/", BuildingWarehouseRequestListView.as_view(), name="building-warehouse-request-list"),
+    path("work-entries/warehouse-requests/<uuid:pk>/", BuildingWarehouseRequestDetailView.as_view(), name="building-warehouse-request-detail"),
     path("work-entries/<uuid:pk>/reconciliation-act/", BuildingWorkEntryReconciliationActCreateView.as_view(), name="building-work-entry-reconciliation-act"),
 
     path("warehouse-movements/write-off/", BuildingWarehouseMovementWriteOffView.as_view(), name="building-warehouse-movement-write-off"),
@@ -215,6 +220,7 @@ urlpatterns = [
     path("salary/payroll-lines/<uuid:pk>/adjustments/", BuildingPayrollAdjustmentCreateView.as_view(), name="building-salary-payroll-adjustment-create"),
     path("salary/payroll-adjustments/<uuid:pk>/", BuildingPayrollAdjustmentDetailView.as_view(), name="building-salary-payroll-adjustment-detail"),
     path("salary/payroll-lines/<uuid:pk>/payments/", BuildingPayrollPaymentListCreateView.as_view(), name="building-salary-payroll-payments"),
+    path("salary/payments/<uuid:pk>/approve/", BuildingPayrollPaymentApproveView.as_view(), name="building-salary-payment-approve"),
     path("salary/my/lines/", BuildingPayrollMyLinesView.as_view(), name="building-salary-my-lines"),
     path("salary/advance-requests/", AdvanceRequestListView.as_view(), name="building-salary-advance-requests"),
     path("salary/advance-requests/<uuid:pk>/approve/", AdvanceRequestApproveView.as_view(), name="building-salary-advance-request-approve"),

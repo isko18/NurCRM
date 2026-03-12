@@ -361,24 +361,38 @@ class BuildingWarehouseRequestItemSerializer(serializers.ModelSerializer):
 class BuildingWarehouseRequestSerializer(serializers.ModelSerializer):
     items = BuildingWarehouseRequestItemSerializer(many=True, read_only=True)
     warehouse_name = serializers.CharField(source="warehouse.name", read_only=True)
+    work_entry_title = serializers.CharField(source="work_entry.title", read_only=True)
 
     class Meta:
         model = BuildingWarehouseRequest
-        fields = ["id", "work_entry", "warehouse", "warehouse_name", "comment", "status", "items", "created_by", "created_at", "updated_at"]
-        read_only_fields = ["id", "created_at", "updated_at"]
+        fields = [
+            "id",
+            "work_entry",
+            "work_entry_title",
+            "warehouse",
+            "warehouse_name",
+            "comment",
+            "status",
+            "items",
+            "created_by",
+            "created_at",
+            "updated_at",
+        ]
+        read_only_fields = ["id", "created_at", "updated_at", "work_entry_title", "warehouse_name"]
 
 
 class BuildingWarehouseRequestCreateSerializer(serializers.Serializer):
     warehouse = serializers.UUIDField()
-    items = serializers.ListField(
-        child=serializers.DictField()
-    )
+    items = serializers.ListField(child=serializers.DictField())
     comment = serializers.CharField(required=False, allow_blank=True)
 
     def validate_items(self, value):
         for i, item in enumerate(value):
-            if "stock_item" not in item or "quantity" not in item:
-                raise serializers.ValidationError(f"Позиция {i}: укажите stock_item и quantity.")
+            # Поддерживаем как старое поле `stock_item`, так и новое `nomenclature`.
+            stock_item = item.get("stock_item") or item.get("nomenclature")
+            if not stock_item or "quantity" not in item:
+                raise serializers.ValidationError(f"Позиция {i}: укажите nomenclature/stock_item и quantity.")
+            item["stock_item"] = stock_item
             if "unit" not in item:
                 item["unit"] = "шт"
         return value
@@ -468,11 +482,18 @@ class BuildingWarehouseMovementWriteOffSerializer(serializers.Serializer):
 
 class BuildingWarehouseMovementTransferSerializer(serializers.Serializer):
     warehouse = serializers.UUIDField()
-    items = serializers.ListField(
-        child=serializers.DictField(child=serializers.CharField())
-    )
+    warehouse_request = serializers.UUIDField(required=False, allow_null=True)
+    items = serializers.ListField(child=serializers.DictField())
     comment = serializers.CharField(required=False, allow_blank=True)
-    # contractor or work_entry - one of them required for transfer
+    # contractor or work_entry / warehouse_request - one of them required for transfer
+
+    def validate_items(self, value):
+        for i, item in enumerate(value):
+            stock_item = item.get("stock_item") or item.get("nomenclature")
+            if not stock_item or "quantity" not in item:
+                raise serializers.ValidationError(f"Позиция {i}: укажите nomenclature/stock_item и quantity.")
+            item["stock_item"] = stock_item
+        return value
 
 
 class BuildingTransferRequestFileSerializer(serializers.ModelSerializer):
@@ -1618,6 +1639,15 @@ class BuildingPayrollPaymentCreateSerializer(serializers.Serializer):
     amount = serializers.DecimalField(max_digits=16, decimal_places=2)
     cashbox = serializers.UUIDField(required=True)
     paid_at = serializers.DateTimeField(required=False)
+    status = serializers.ChoiceField(
+        choices=[("draft", "Черновик"), ("approved", "Одобрено")],
+        required=False,
+        help_text="Статус выплаты: draft (без движения кассы) или approved (сразу провести). По умолчанию approved.",
+    )
+
+
+class BuildingPayrollPaymentApproveSerializer(serializers.Serializer):
+    paid_at = serializers.DateTimeField(required=False, allow_null=True)
 
 
 class BuildingPayrollMyLineSerializer(serializers.ModelSerializer):

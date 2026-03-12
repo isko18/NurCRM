@@ -1256,10 +1256,11 @@ class BuildingWarehouseRequest(models.Model):
     """Заявка на выдачу материалов со склада из процесса работ."""
 
     class Status(models.TextChoices):
-        PENDING = "pending", "Ожидает одобрения"
+        PENDING = "pending", "Ожидает обработки"
         APPROVED = "approved", "Одобрено"
         REJECTED = "rejected", "Отклонено"
-        PARTIALLY_APPROVED = "partially_approved", "Частично одобрено"
+        PARTIALLY_APPROVED = "partially_approved", "Частично обработано"
+        COMPLETED = "completed", "Завершена (всё выдано)"
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False, verbose_name="ID")
     work_entry = models.ForeignKey(
@@ -1475,6 +1476,14 @@ class BuildingWarehouseMovement(models.Model):
         blank=True,
         related_name="warehouse_movements",
         verbose_name="Процесс работ",
+    )
+    warehouse_request = models.ForeignKey(
+        "BuildingWarehouseRequest",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="movements",
+        verbose_name="Заявка на материалы",
     )
     reason = models.TextField(blank=True, verbose_name="Причина/комментарий")
     created_by = models.ForeignKey(
