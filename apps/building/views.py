@@ -1,7 +1,8 @@
 from decimal import Decimal
 
 from django.db import transaction
-from django.db.models import Q, Count, Case, When, Value, Prefetch
+from django.db.models import Q, Count, Case, When, Value, Prefetch, Sum
+from django.db.models.functions import Coalesce
 from django.db.models.fields import CharField
 from django.contrib.auth import get_user_model
 from django.utils import timezone
@@ -102,6 +103,7 @@ from .serializers import (
     BuildingPayrollAdjustmentCreateSerializer,
     BuildingPayrollPaymentSerializer,
     BuildingPayrollPaymentCreateSerializer,
+    BuildingPayrollPaymentApproveSerializer,
     BuildingPayrollMyLineSerializer,
     AdvanceRequestSerializer,
     AdvanceRequestApproveSerializer,
@@ -126,6 +128,7 @@ from .serializers import (
     BuildingWarehouseMovementSerializer,
     BuildingWarehouseMovementWriteOffSerializer,
     BuildingWarehouseMovementTransferSerializer,
+    BuildingPayrollPaymentApproveSerializer,
 )
 from . import services
 
@@ -1671,6 +1674,79 @@ class BuildingWorkEntryWarehouseRequestCreateView(CompanyQuerysetMixin, generics
         )
 
 
+class BuildingWarehouseRequestListView(CompanyQuerysetMixin, generics.ListAPIView):
+    """
+    Список заявок на материалы для склада.
+    GET /work-entries/warehouse-requests/
+    """
+
+    permission_classes = [permissions.IsAuthenticated]
+    serializer_class = BuildingWarehouseRequestSerializer
+    queryset = BuildingWarehouseRequest.objects.select_related(
+        "work_entry",
+        "work_entry__residential_complex",
+        "warehouse",
+    ).prefetch_related(
+        "items",
+        "items__stock_item",
+    )
+    filter_backends = [DjangoFilterBackend]
+    filterset_fields = ["warehouse", "status", "work_entry"]
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        user = self.request.user
+        if not (_is_owner_like(user) or getattr(user, "can_view_building_stock", False)):
+            raise PermissionDenied("Нет прав на склад (Building).")
+        if user.is_authenticated and getattr(user, "company_id", None):
+            qs = qs.filter(warehouse__residential_complex__company_id=user.company_id)
+            allowed_ids = _allowed_residential_complex_ids(user)
+            if allowed_ids is not None:
+                qs = qs.filter(warehouse__residential_complex_id__in=allowed_ids)
+        elif not getattr(user, "is_staff", False) and not getattr(user, "is_superuser", False):
+            return qs.none()
+
+        # Дополнительный фильтр по ЖК
+        rc = self.request.query_params.get("residential_complex")
+        if rc:
+            qs = qs.filter(warehouse__residential_complex_id=rc)
+        return qs
+
+
+class BuildingWarehouseRequestDetailView(CompanyQuerysetMixin, generics.RetrieveAPIView):
+    """
+    Детали заявки на материалы.
+    GET /work-entries/warehouse-requests/{id}/
+    """
+
+    permission_classes = [permissions.IsAuthenticated]
+    serializer_class = BuildingWarehouseRequestSerializer
+    queryset = BuildingWarehouseRequest.objects.select_related(
+        "work_entry",
+        "work_entry__residential_complex",
+        "warehouse",
+    ).prefetch_related(
+        "items",
+        "items__stock_item",
+        "movements",
+    )
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        user = self.request.user
+        if not (_is_owner_like(user) or getattr(user, "can_view_building_stock", False)):
+            raise PermissionDenied("Нет прав на склад (Building).")
+        if user.is_authenticated and getattr(user, "company_id", None):
+            qs = qs.filter(warehouse__residential_complex__company_id=user.company_id)
+            allowed_ids = _allowed_residential_complex_ids(user)
+            if allowed_ids is not None:
+                qs = qs.filter(warehouse__residential_complex_id__in=allowed_ids)
+            return qs
+        if not getattr(user, "is_staff", False) and not getattr(user, "is_superuser", False):
+            return qs.none()
+        return qs
+
+
 class BuildingWorkEntryReconciliationActCreateView(CompanyQuerysetMixin, generics.GenericAPIView):
     """Создать акт сверки материалов при завершении/отмене процесса работ."""
     permission_classes = [permissions.IsAuthenticated]
@@ -1890,7 +1966,16 @@ class BuildingWarehouseMovementTransferToWorkEntryView(CompanyQuerysetMixin, gen
         ).first()
         if not work_entry:
             raise ValidationError({"work_entry": "Процесс работ не найден."})
-        ser = self.get_serializer(data=request.data)
+
+        # Поддержка поля nomenclature для items (alias к stock_item)
+        data = request.data.copy()
+        items = data.get("items") or []
+        if isinstance(items, list):
+            for item in items:
+                if isinstance(item, dict) and "stock_item" not in item and "nomenclature" in item:
+                    item["stock_item"] = item.get("nomenclature")
+
+        ser = self.get_serializer(data=data)
         ser.is_valid(raise_exception=True)
         warehouse = ResidentialComplexWarehouse.objects.filter(
             id=ser.validated_data["warehouse"]
@@ -1900,15 +1985,31 @@ class BuildingWarehouseMovementTransferToWorkEntryView(CompanyQuerysetMixin, gen
         if warehouse.residential_complex_id != work_entry.residential_complex_id:
             raise ValidationError({"warehouse": "Склад должен принадлежать ЖК процесса работ."})
         company = warehouse.residential_complex.company
+        warehouse_request = None
+        warehouse_request_id = ser.validated_data.get("warehouse_request")
+
         with transaction.atomic():
+            if warehouse_request_id:
+                warehouse_request = BuildingWarehouseRequest.objects.select_for_update().filter(
+                    id=warehouse_request_id
+                ).first()
+                if not warehouse_request:
+                    raise ValidationError({"warehouse_request": "Заявка на материалы не найдена."})
+                if warehouse_request.work_entry_id != work_entry.id:
+                    raise ValidationError({"warehouse_request": "Заявка принадлежит другому процессу работ."})
+                if warehouse_request.warehouse_id != warehouse.id:
+                    raise ValidationError({"warehouse_request": "Заявка принадлежит другому складу."})
+
             movement = BuildingWarehouseMovement.objects.create(
                 company=company,
                 warehouse=warehouse,
                 movement_type=BuildingWarehouseMovement.MovementType.TRANSFER_TO_WORK_ENTRY,
                 work_entry=work_entry,
+                warehouse_request=warehouse_request,
                 reason=ser.validated_data.get("comment", ""),
                 created_by=request.user,
             )
+
             for item in ser.validated_data["items"]:
                 stock_item = BuildingWarehouseStockItem.objects.get(id=item["stock_item"])
                 if stock_item.warehouse_id != warehouse.id:
@@ -1916,6 +2017,26 @@ class BuildingWarehouseMovementTransferToWorkEntryView(CompanyQuerysetMixin, gen
                 qty = Decimal(item["quantity"])
                 if qty <= 0:
                     raise ValidationError({"items": "Количество должно быть положительным."})
+
+                if warehouse_request:
+                    # Проверяем, что не выдаём больше, чем запрошено по заявке
+                    try:
+                        req_item = warehouse_request.items.get(stock_item=stock_item)
+                    except BuildingWarehouseRequestItem.DoesNotExist:
+                        raise ValidationError({"items": f"Позиция {stock_item.name} отсутствует в заявке."})
+                    already_issued = (
+                        BuildingWarehouseMovementItem.objects.filter(
+                            movement__warehouse_request=warehouse_request,
+                            stock_item=stock_item,
+                        ).aggregate(s=Coalesce(Sum("quantity"), Decimal("0.00"))).get("s")
+                        or Decimal("0.00")
+                    )
+                    remaining = (req_item.quantity - already_issued).quantize(Decimal("0.001"))
+                    if qty > remaining:
+                        raise ValidationError(
+                            {"items": f"Нельзя выдать больше остатка по заявке для {stock_item.name} (осталось {remaining})."}
+                        )
+
                 BuildingWarehouseMovementItem.objects.create(movement=movement, stock_item=stock_item, quantity=qty)
                 stock_item.quantity -= qty
                 stock_item.save(update_fields=["quantity", "updated_at"])
@@ -1929,6 +2050,33 @@ class BuildingWarehouseMovementTransferToWorkEntryView(CompanyQuerysetMixin, gen
                     price=stock_item.last_price,
                     created_by=request.user,
                 )
+
+            if warehouse_request:
+                # Обновляем статус заявки в зависимости от выданных количеств
+                all_full = True
+                any_issued = False
+                for req_item in warehouse_request.items.all():
+                    issued = (
+                        BuildingWarehouseMovementItem.objects.filter(
+                            movement__warehouse_request=warehouse_request,
+                            stock_item=req_item.stock_item,
+                        ).aggregate(s=Coalesce(Sum("quantity"), Decimal("0.00"))).get("s")
+                        or Decimal("0.00")
+                    )
+                    issued = issued.quantize(Decimal("0.001"))
+                    if issued > 0:
+                        any_issued = True
+                    if issued < req_item.quantity:
+                        all_full = False
+
+                if not any_issued:
+                    warehouse_request.status = BuildingWarehouseRequest.Status.PENDING
+                elif all_full:
+                    warehouse_request.status = BuildingWarehouseRequest.Status.COMPLETED
+                else:
+                    warehouse_request.status = BuildingWarehouseRequest.Status.PARTIALLY_APPROVED
+                warehouse_request.decided_by = request.user
+                warehouse_request.save(update_fields=["status", "decided_by", "updated_at"])
         movement.refresh_from_db()
         return Response(
             BuildingWarehouseMovementSerializer(movement, context={"request": request}).data,
@@ -3137,30 +3285,60 @@ class BuildingPayrollPaymentListCreateView(CompanyQuerysetMixin, generics.Generi
             raise PermissionDenied("Касса другой компании.")
 
         paid_at = ser.validated_data.get("paid_at") or timezone.now()
+        status_flag = (ser.validated_data.get("status") or "approved").lower()
 
-        payment = BuildingPayrollPayment.objects.create(
-            line=line,
-            amount=amount,
-            paid_at=paid_at,
-            paid_by=request.user,
-            cashbox=cashbox,
-            status=BuildingPayrollPayment.Status.PENDING,
-        )
-        emp = line.employee
-        emp_name = f"{getattr(emp, 'first_name', '')} {getattr(emp, 'last_name', '')}".strip() if emp else ""
-        emp_display = emp_name or getattr(emp, "email", None) or getattr(emp, "username", None) or str(getattr(emp, "id", ""))
-        cf = BuildingCashFlow.objects.create(
-            cashbox=cashbox,
-            type=BuildingCashFlow.Type.EXPENSE,
-            name=f"ЗП: {emp_display} / {payroll.period_start} - {payroll.period_end}",
-            amount=abs(amount),
-            status=BuildingCashFlow.Status.PENDING,
-            source_business_operation_id=str(payment.id),
-        )
-        payment.cashflow = cf
-        payment.save(update_fields=["cashflow"])
+        with transaction.atomic():
+            payment = BuildingPayrollPayment.objects.create(
+                line=line,
+                amount=amount,
+                paid_at=paid_at,
+                paid_by=request.user,
+                cashbox=cashbox,
+                status=BuildingPayrollPayment.Status.PENDING,
+            )
 
-        return Response(BuildingPayrollPaymentSerializer(payment, context={"request": request}).data, status=status.HTTP_201_CREATED)
+            # Черновик: не создаём движение кассы, не трогаем paid_total.
+            if status_flag == "draft":
+                return Response(
+                    BuildingPayrollPaymentSerializer(payment, context={"request": request}).data,
+                    status=status.HTTP_201_CREATED,
+                )
+
+            # Одобренная выплата: сразу создаём одобренный CashFlow и проводим выплату.
+            emp = line.employee
+            emp_name = (
+                f"{getattr(emp, 'first_name', '')} {getattr(emp, 'last_name', '')}".strip() if emp else ""
+            )
+            emp_display = (
+                emp_name
+                or getattr(emp, "email", None)
+                or getattr(emp, "username", None)
+                or str(getattr(emp, "id", ""))
+            )
+            cf = BuildingCashFlow.objects.create(
+                company=cashbox.company,
+                branch=cashbox.branch,
+                cashbox=cashbox,
+                type=BuildingCashFlow.Type.EXPENSE,
+                name=f"ЗП: {emp_display} / {payroll.period_start} - {payroll.period_end}",
+                amount=abs(amount),
+                status=BuildingCashFlow.Status.APPROVED,
+                source_business_operation_id=str(payment.id),
+                cashier=request.user if getattr(request.user, "id", None) else None,
+            )
+            payment.cashflow = cf
+            payment.save(update_fields=["cashflow"])
+
+            # Сразу проводим выплату так же, как при on_cashflow_approved.
+            from .salary_cash import on_cashflow_approved
+
+            on_cashflow_approved(cf)
+            payment.refresh_from_db()
+
+        return Response(
+            BuildingPayrollPaymentSerializer(payment, context={"request": request}).data,
+            status=status.HTTP_201_CREATED,
+        )
 
 
 class BuildingPayrollMyLinesView(CompanyQuerysetMixin, generics.ListAPIView):
@@ -3225,6 +3403,100 @@ class AdvanceRequestListView(CompanyQuerysetMixin, generics.ListAPIView):
         if payroll:
             qs = qs.filter(line__payroll_id=payroll)
         return qs.distinct()
+
+
+class BuildingPayrollPaymentApproveView(CompanyQuerysetMixin, generics.GenericAPIView):
+    """
+    Одобрить черновую выплату ЗП.
+    POST /salary/payments/{id}/approve/
+    """
+
+    permission_classes = [permissions.IsAuthenticated]
+    serializer_class = BuildingPayrollPaymentApproveSerializer
+    queryset = BuildingPayrollPayment.objects.select_related(
+        "line",
+        "line__payroll",
+        "line__payroll__company",
+        "cashbox",
+    )
+
+    def get_queryset(self):
+        _require_salary_perm(self.request.user)
+        _require_cash_register_perm(self.request.user)
+        qs = super().get_queryset()
+        user = self.request.user
+        if getattr(user, "is_superuser", False):
+            return qs
+        company_id = getattr(user, "company_id", None)
+        return qs.filter(line__payroll__company_id=company_id) if company_id else qs.none()
+
+    @transaction.atomic
+    def post(self, request, pk=None):
+        _require_salary_perm(request.user)
+        _require_cash_register_perm(request.user)
+        payment = self.get_object()
+        line = payment.line
+        payroll = BuildingPayrollPeriod.objects.select_for_update().get(id=line.payroll_id)
+        if payroll.status != BuildingPayrollPeriod.Status.APPROVED:
+            raise PermissionDenied("Выплачивать можно только из периода в статусе approved.")
+        if payment.status != BuildingPayrollPayment.Status.PENDING:
+            raise ValidationError({"detail": "Выплата уже проведена или отменена."})
+        if payment.cashflow_id:
+            raise ValidationError({"detail": "Для выплаты уже существует движение кассы."})
+
+        # Пересчитываем остаток перед проведением
+        line.recalculate_totals()
+        line.recalculate_paid_total()
+        remaining = (Decimal(line.net_to_pay or 0) - Decimal(line.paid_total or 0)).quantize(Decimal("0.01"))
+        if payment.amount > remaining:
+            raise ValidationError({"amount": f"Нельзя провести выплату больше остатка ({remaining})."})
+
+        ser = self.get_serializer(data=request.data or {}, partial=True)
+        ser.is_valid(raise_exception=True)
+        paid_at = ser.validated_data.get("paid_at") or payment.paid_at or timezone.now()
+        payment.paid_at = paid_at
+        payment.save(update_fields=["paid_at"])
+
+        cashbox = payment.cashbox
+        if not getattr(request.user, "is_superuser", False) and cashbox.company_id != getattr(
+            request.user, "company_id", None
+        ):
+            raise PermissionDenied("Касса другой компании.")
+
+        emp = line.employee
+        emp_name = (
+            f"{getattr(emp, 'first_name', '')} {getattr(emp, 'last_name', '')}".strip() if emp else ""
+        )
+        emp_display = (
+            emp_name
+            or getattr(emp, "email", None)
+            or getattr(emp, "username", None)
+            or str(getattr(emp, "id", ""))
+        )
+
+        cf = BuildingCashFlow.objects.create(
+            company=cashbox.company,
+            branch=cashbox.branch,
+            cashbox=cashbox,
+            type=BuildingCashFlow.Type.EXPENSE,
+            name=f"ЗП: {emp_display} / {payroll.period_start} - {payroll.period_end}",
+            amount=abs(payment.amount),
+            status=BuildingCashFlow.Status.APPROVED,
+            source_business_operation_id=str(payment.id),
+            cashier=request.user if getattr(request.user, "id", None) else None,
+        )
+        payment.cashflow = cf
+        payment.save(update_fields=["cashflow"])
+
+        from .salary_cash import on_cashflow_approved
+
+        on_cashflow_approved(cf)
+        payment.refresh_from_db()
+
+        return Response(
+            BuildingPayrollPaymentSerializer(payment, context={"request": request}).data,
+            status=status.HTTP_200_OK,
+        )
 
 
 class AdvanceRequestApproveView(CompanyQuerysetMixin, generics.GenericAPIView):
