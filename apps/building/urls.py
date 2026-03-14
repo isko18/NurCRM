@@ -47,6 +47,10 @@ from .views import (
     BuildingSupplierDetailView,
     BuildingSupplierFileAddView,
     BuildingSupplierPurchaseHistoryView,
+    BuildingSupplierBarterSettlementListCreateView,
+    BuildingSupplierBarterSettlementDetailView,
+    BuildingSupplierBarterSettlementConfirmView,
+    BuildingSupplierBarterSettlementCancelView,
     BuildingWorkEntryWarehouseRequestCreateView,
     BuildingWarehouseRequestListView,
     BuildingWarehouseRequestDetailView,
@@ -155,6 +159,11 @@ urlpatterns = [
     path("suppliers/<uuid:pk>/", BuildingSupplierDetailView.as_view(), name="building-supplier-detail"),
     path("suppliers/<uuid:pk>/files/", BuildingSupplierFileAddView.as_view(), name="building-supplier-file-add"),
     path("suppliers/<uuid:pk>/purchase-history/", BuildingSupplierPurchaseHistoryView.as_view(), name="building-supplier-purchase-history"),
+
+    path("barter-settlements/", BuildingSupplierBarterSettlementListCreateView.as_view(), name="building-supplier-barter-settlement-list-create"),
+    path("barter-settlements/<uuid:pk>/", BuildingSupplierBarterSettlementDetailView.as_view(), name="building-supplier-barter-settlement-detail"),
+    path("barter-settlements/<uuid:pk>/confirm/", BuildingSupplierBarterSettlementConfirmView.as_view(), name="building-supplier-barter-settlement-confirm"),
+    path("barter-settlements/<uuid:pk>/cancel/", BuildingSupplierBarterSettlementCancelView.as_view(), name="building-supplier-barter-settlement-cancel"),
 
     path("work-entries/<uuid:pk>/warehouse-requests/", BuildingWorkEntryWarehouseRequestCreateView.as_view(), name="building-work-entry-warehouse-request"),
     path("work-entries/warehouse-requests/", BuildingWarehouseRequestListView.as_view(), name="building-warehouse-request-list"),

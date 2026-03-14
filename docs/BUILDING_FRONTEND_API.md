@@ -313,12 +313,24 @@
 - `PATCH /treaties/{id}/`
 - `DELETE /treaties/{id}/`
 
-**Фильтры:** `residential_complex`, `client`, `status`, `operation_type`, `payment_type`, `apartment`, `search`
+**Фильтры:** `residential_complex`, `client`, `status`, `operation_type`, `payment_type`, `apartment`, `erp_sync_status`, `search`
 
 **Перечисления:**
-- `operation_type`: `sale` | `booking`
+- `operation_type`: `sale` | `booking` | `other`
 - `payment_type`: `full` | `installment`
 - `status`: `draft` | `active` | `signed` | `cancelled`
+
+### Тип договора (operation_type)
+
+| Значение | Описание |
+|----------|----------|
+| `booking` | Бронь |
+| `sale` | Продажа |
+| `other` | Прочие |
+
+**Для `booking` и `sale`** обязательны: `residential_complex`, `client`, `apartment`, `amount`, `operation_type`, `payment_type`.
+
+**Для `other`** поля `apartment`, `client`, `client_name`, `residential_complex`, `amount` опциональны. Можно создать договор без квартиры и без привязки к клиенту; при необходимости указывается произвольное название контрагента в `client_name` или описание в `title`/`description`.
 
 ### Оплата рассрочки
 
@@ -543,7 +555,54 @@
 - `GET /suppliers/`, `POST /suppliers/`
 - `GET /suppliers/{id}/`, `PATCH /suppliers/{id}/`, `DELETE /suppliers/{id}/`
 - `POST /suppliers/{id}/files/` — multipart: `file`, `title`
-- `GET /suppliers/{id}/purchase-history/` — история закупок поставщика
+- `GET /suppliers/{id}/purchase-history/` — история закупок и расчётов с поставщиком (в т.ч. бартер)
+
+### Бартерные расчёты с поставщиками
+
+Бартер — это взаимозачёт: мы гасим долг перед поставщиком по закупкам не деньгами, а встречной поставкой/услугой.
+
+#### Модель
+
+- Сущность `BarterSettlement`:
+  - `id`
+  - `supplier` — поставщик
+  - `residential_complex` — ЖК (для привязки к объекту)
+  - `date` — дата зачёта
+  - `status` — `draft` / `confirmed` / `cancelled`
+  - `amount_total` — сумма зачёта в деньгах (эквивалент)
+  - `currency`
+  - `comment`
+- Строки зачёта:
+  - `barter_purchase_items` — какие закупки гасим:
+    - `[{ procurement_item, amount }]`
+  - `barter_counter_deliveries` — чем гасим (свободное описание, без жёсткой структуры на фронте):
+    - `[{ description, amount }]`
+
+#### Эндпоинты
+
+- `GET /barter-settlements/` — список бартерных зачётов (фильтры: `supplier`, `residential_complex`, `status`, `date_from`, `date_to`)
+- `POST /barter-settlements/` — создание зачёта
+- `GET /barter-settlements/{id}/` — детальная карточка зачёта
+- `PATCH /barter-settlements/{id}/` — правка в статусе `draft`
+- `DELETE /barter-settlements/{id}/` — удаление в статусе `draft`
+- `POST /barter-settlements/{id}/confirm/` — подтверждение зачёта (фиксируется как «оплата бартером» по выбранным закупкам)
+- `POST /barter-settlements/{id}/cancel/` — отмена зачёта
+
+#### Логика и UX на фронте (Building)
+
+- В карточке закупки / документа покупки (`/procurements/`, `/documents/purchase/`) добавить поле:
+  - `payment_type`: `cash` / `non_cash` / `barter`
+- Если выбрано `payment_type = barter`:
+  - не создавать заявку в кассу
+  - отображать кнопку **«Создать бартерный зачёт»**, которая:
+    - открывает форму `BarterSettlement` с предзаполненными:
+      - `supplier` (из закупки/документа)
+      - `residential_complex`
+      - `barter_purchase_items` (список строк закупок/документа)
+- В карточке поставщика:
+  - на вкладке истории (`GET /suppliers/{id}/purchase-history/`) показывать строки не только по закупкам и денежным оплатам, но и по бартеру:
+    - тип движения: `purchase` / `cash_payment` / `barter`
+    - ссылка на `BarterSettlement` при типе `barter`
 
 ### Процесс работ — расширения
 
@@ -624,6 +683,10 @@
 | | GET/PATCH/DELETE | `/suppliers/{id}/` |
 | | POST | `/suppliers/{id}/files/` |
 | | GET | `/suppliers/{id}/purchase-history/` |
+| **Бартер с поставщиками** | GET/POST | `/barter-settlements/` |
+| | GET/PATCH/DELETE | `/barter-settlements/{id}/` |
+| | POST | `/barter-settlements/{id}/confirm/` |
+| | POST | `/barter-settlements/{id}/cancel/` |
 | **Процесс работ** | GET/POST | `/work-entries/` |
 | | GET/PATCH/DELETE | `/work-entries/{id}/` |
 | | POST | `/work-entries/{id}/photos/` |

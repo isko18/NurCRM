@@ -22,6 +22,7 @@ from .models import (
     BuildingContractorFile,
     BuildingSupplier,
     BuildingSupplierFile,
+    BuildingSupplierBarterSettlement,
     BuildingTransferRequest,
     BuildingTransferRequestFile,
     BuildingWarehouseRequest,
@@ -121,6 +122,8 @@ from .serializers import (
     BuildingContractorCreateSerializer,
     BuildingSupplierSerializer,
     BuildingSupplierCreateSerializer,
+    BuildingSupplierBarterSettlementSerializer,
+    BuildingSupplierBarterSettlementCreateUpdateSerializer,
     BuildingWarehouseRequestSerializer,
     BuildingWarehouseRequestCreateSerializer,
     BuildingReconciliationActSerializer,
@@ -1191,6 +1194,93 @@ class BuildingSupplierPurchaseHistoryView(CompanyQuerysetMixin, generics.ListAPI
         return qs
 
 
+class BuildingSupplierBarterSettlementListCreateView(CompanyQuerysetMixin, generics.ListCreateAPIView):
+    """Список и создание бартерных зачётов с поставщиками."""
+
+    permission_classes = [permissions.IsAuthenticated]
+    serializer_class = BuildingSupplierBarterSettlementSerializer
+    queryset = BuildingSupplierBarterSettlement.objects.select_related(
+        "supplier",
+        "residential_complex",
+        "created_by",
+    )
+    filter_backends = [DjangoFilterBackend]
+    filterset_fields = ["supplier", "residential_complex", "status", "date"]
+
+    def get_serializer_class(self):
+        if self.request.method == "POST":
+            return BuildingSupplierBarterSettlementCreateUpdateSerializer
+        return BuildingSupplierBarterSettlementSerializer
+
+
+class BuildingSupplierBarterSettlementDetailView(CompanyQuerysetMixin, generics.RetrieveUpdateDestroyAPIView):
+    """Детали/редактирование/удаление бартерного зачёта."""
+
+    permission_classes = [permissions.IsAuthenticated]
+    serializer_class = BuildingSupplierBarterSettlementSerializer
+    queryset = BuildingSupplierBarterSettlement.objects.select_related(
+        "supplier",
+        "residential_complex",
+        "created_by",
+    ).prefetch_related("purchase_items", "counter_deliveries")
+
+    def get_serializer_class(self):
+        if self.request.method in ("PATCH", "PUT"):
+            return BuildingSupplierBarterSettlementCreateUpdateSerializer
+        return BuildingSupplierBarterSettlementSerializer
+
+    def perform_destroy(self, instance):
+        if instance.status != BuildingSupplierBarterSettlement.Status.DRAFT:
+            raise PermissionDenied("Удалять можно только бартерный зачёт в статусе draft.")
+        return super().perform_destroy(instance)
+
+
+class BuildingSupplierBarterSettlementConfirmView(CompanyQuerysetMixin, generics.GenericAPIView):
+    """Подтверждение бартерного зачёта (фиксируем как проведённый)."""
+
+    permission_classes = [permissions.IsAuthenticated]
+    serializer_class = BuildingSupplierBarterSettlementSerializer
+    queryset = BuildingSupplierBarterSettlement.objects.select_related("supplier", "residential_complex")
+
+    def post(self, request, pk=None):
+        settlement = self.get_object()
+        if settlement.status != BuildingSupplierBarterSettlement.Status.DRAFT:
+            return Response(
+                {"status": ["Подтвердить можно только зачёт в статусе draft."]},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        settlement.status = BuildingSupplierBarterSettlement.Status.CONFIRMED
+        settlement.save(update_fields=["status", "updated_at"])
+        return Response(
+            BuildingSupplierBarterSettlementSerializer(settlement, context={"request": request}).data
+        )
+
+
+class BuildingSupplierBarterSettlementCancelView(CompanyQuerysetMixin, generics.GenericAPIView):
+    """Отмена бартерного зачёта."""
+
+    permission_classes = [permissions.IsAuthenticated]
+    serializer_class = BuildingSupplierBarterSettlementSerializer
+    queryset = BuildingSupplierBarterSettlement.objects.select_related("supplier", "residential_complex")
+
+    def post(self, request, pk=None):
+        settlement = self.get_object()
+        if settlement.status == BuildingSupplierBarterSettlement.Status.CANCELLED:
+            return Response(
+                BuildingSupplierBarterSettlementSerializer(settlement, context={"request": request}).data
+            )
+        if settlement.status != BuildingSupplierBarterSettlement.Status.DRAFT:
+            return Response(
+                {"status": ["Отменить можно только зачёт в статусе draft."]},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        settlement.status = BuildingSupplierBarterSettlement.Status.CANCELLED
+        settlement.save(update_fields=["status", "updated_at"])
+        return Response(
+            BuildingSupplierBarterSettlementSerializer(settlement, context={"request": request}).data
+        )
+
+
 class BuildingWorkflowEventListView(CompanyQuerysetMixin, generics.ListAPIView):
     permission_classes = [permissions.IsAuthenticated]
     serializer_class = BuildingWorkflowEventSerializer
@@ -2216,10 +2306,10 @@ class BuildingClientFileAddView(CompanyQuerysetMixin, generics.GenericAPIView):
 class BuildingTreatyListCreateView(CompanyQuerysetMixin, generics.ListCreateAPIView):
     permission_classes = [permissions.IsAuthenticated]
     serializer_class = BuildingTreatySerializer
-    queryset = BuildingTreaty.objects.select_related("residential_complex", "client", "created_by", "apartment").prefetch_related("files", "installments")
+    queryset = BuildingTreaty.objects.select_related("residential_complex", "client", "created_by", "apartment", "company").prefetch_related("files", "installments")
     filter_backends = [DjangoFilterBackend, filters.SearchFilter]
     filterset_fields = ["residential_complex", "client", "status", "erp_sync_status", "auto_create_in_erp", "operation_type", "payment_type", "apartment"]
-    search_fields = ["number", "title", "description", "residential_complex__name", "client__name", "apartment__number"]
+    search_fields = ["number", "title", "description", "residential_complex__name", "client__name", "client_name", "apartment__number"]
 
     def get_queryset(self):
         user = self.request.user
@@ -2227,10 +2317,14 @@ class BuildingTreatyListCreateView(CompanyQuerysetMixin, generics.ListCreateAPIV
             raise PermissionDenied("Нет прав на договора (Building).")
         qs = super().get_queryset()
         if user.is_authenticated and getattr(user, "company_id", None):
-            qs = qs.filter(residential_complex__company_id=user.company_id)
+            qs = qs.filter(
+                Q(residential_complex__company_id=user.company_id) | Q(company_id=user.company_id)
+            )
             allowed_ids = _allowed_residential_complex_ids(user)
             if allowed_ids is not None:
-                qs = qs.filter(residential_complex_id__in=allowed_ids)
+                qs = qs.filter(
+                    Q(residential_complex_id__in=allowed_ids) | Q(residential_complex_id__isnull=True)
+                )
             return qs
         if not getattr(user, "is_staff", False) and not getattr(user, "is_superuser", False):
             return qs.none()
@@ -2241,35 +2335,38 @@ class BuildingTreatyListCreateView(CompanyQuerysetMixin, generics.ListCreateAPIV
         if not (_is_owner_like(user) or getattr(user, "can_view_building_treaty", False)):
             raise PermissionDenied("Нет прав на договора (Building).")
 
-        rc = serializer.validated_data["residential_complex"]
-        if not getattr(user, "is_superuser", False) and rc.company_id != getattr(user, "company_id", None):
-            raise PermissionDenied("ЖК принадлежит другой компании.")
-        allowed_ids = _allowed_residential_complex_ids(user)
-        if allowed_ids is not None and rc.id not in set(allowed_ids):
-            raise PermissionDenied("Нет доступа к этому ЖК.")
+        rc = serializer.validated_data.get("residential_complex")
+        if rc:
+            if not getattr(user, "is_superuser", False) and rc.company_id != getattr(user, "company_id", None):
+                raise PermissionDenied("ЖК принадлежит другой компании.")
+            allowed_ids = _allowed_residential_complex_ids(user)
+            if allowed_ids is not None and rc.id not in set(allowed_ids):
+                raise PermissionDenied("Нет доступа к этому ЖК.")
 
         client = serializer.validated_data.get("client")
-        if client and client.company_id != rc.company_id:
+        if client and rc and client.company_id != rc.company_id:
+            raise PermissionDenied("Клиент принадлежит другой компании.")
+        if client and not rc and client.company_id != getattr(user, "company_id", None):
             raise PermissionDenied("Клиент принадлежит другой компании.")
 
         treaty = serializer.save(created_by=user)
 
-        # Автоматически фиксируем событие в процессе работ
-        try:
-            if getattr(user, "can_view_building_work_process", False) or _is_owner_like(user):
-                BuildingWorkEntry.objects.create(
-                    residential_complex=rc,
-                    client=client,
-                    treaty=treaty,
-                    created_by=user,
-                    category=BuildingWorkEntry.Category.TREATY,
-                    title=(treaty.title or treaty.number or "Договор"),
-                    description=treaty.description or "",
-                    occurred_at=getattr(treaty, "created_at", None) or None,
-                )
-        except Exception:
-            # Не блокируем создание договора из-за ошибок вторичной записи в work process
-            pass
+        # Автоматически фиксируем событие в процессе работ (только при наличии ЖК)
+        if rc:
+            try:
+                if getattr(user, "can_view_building_work_process", False) or _is_owner_like(user):
+                    BuildingWorkEntry.objects.create(
+                        residential_complex=rc,
+                        client=client,
+                        treaty=treaty,
+                        created_by=user,
+                        category=BuildingWorkEntry.Category.TREATY,
+                        title=(treaty.title or treaty.number or "Договор"),
+                        description=treaty.description or "",
+                        occurred_at=getattr(treaty, "created_at", None) or None,
+                    )
+            except Exception:
+                pass
 
         # Автосоздание в ERP (если включено и настроено)
         if getattr(treaty, "auto_create_in_erp", False):
@@ -2292,7 +2389,7 @@ class BuildingTreatyListCreateView(CompanyQuerysetMixin, generics.ListCreateAPIV
 class BuildingTreatyDetailView(CompanyQuerysetMixin, generics.RetrieveUpdateDestroyAPIView):
     permission_classes = [permissions.IsAuthenticated]
     serializer_class = BuildingTreatySerializer
-    queryset = BuildingTreaty.objects.select_related("residential_complex", "client", "created_by", "apartment").prefetch_related("files", "installments")
+    queryset = BuildingTreaty.objects.select_related("residential_complex", "client", "created_by", "apartment", "company").prefetch_related("files", "installments")
 
     def get_queryset(self):
         user = self.request.user
@@ -2300,10 +2397,14 @@ class BuildingTreatyDetailView(CompanyQuerysetMixin, generics.RetrieveUpdateDest
             raise PermissionDenied("Нет прав на договора (Building).")
         qs = super().get_queryset()
         if user.is_authenticated and getattr(user, "company_id", None):
-            qs = qs.filter(residential_complex__company_id=user.company_id)
+            qs = qs.filter(
+                Q(residential_complex__company_id=user.company_id) | Q(company_id=user.company_id)
+            )
             allowed_ids = _allowed_residential_complex_ids(user)
             if allowed_ids is not None:
-                qs = qs.filter(residential_complex_id__in=allowed_ids)
+                qs = qs.filter(
+                    Q(residential_complex_id__in=allowed_ids) | Q(residential_complex_id__isnull=True)
+                )
             return qs
         if not getattr(user, "is_staff", False) and not getattr(user, "is_superuser", False):
             return qs.none()
@@ -2316,11 +2417,13 @@ class BuildingTreatyDetailView(CompanyQuerysetMixin, generics.RetrieveUpdateDest
             raise PermissionDenied("Изменять договор может только автор или владелец.")
 
         rc = serializer.validated_data.get("residential_complex") or obj.residential_complex
-        if not getattr(user, "is_superuser", False) and rc.company_id != getattr(user, "company_id", None):
+        if rc and not getattr(user, "is_superuser", False) and rc.company_id != getattr(user, "company_id", None):
             raise PermissionDenied("ЖК принадлежит другой компании.")
 
         client = serializer.validated_data.get("client")
-        if client and client.company_id != rc.company_id:
+        if client and rc and client.company_id != rc.company_id:
+            raise PermissionDenied("Клиент принадлежит другой компании.")
+        if client and not rc and client.company_id != getattr(user, "company_id", None):
             raise PermissionDenied("Клиент принадлежит другой компании.")
 
         with transaction.atomic():
@@ -2335,18 +2438,19 @@ class BuildingTreatyDetailView(CompanyQuerysetMixin, generics.RetrieveUpdateDest
             if old_apartment_id:
                 apt = ResidentialComplexApartment.objects.select_for_update().filter(id=old_apartment_id).first()
                 if apt:
-                    if obj.status == BuildingTreaty.Status.CANCELLED:
+                    if obj.status == BuildingTreaty.Status.CANCELLED or obj.operation_type == BuildingTreaty.OperationType.OTHER:
                         has_other = (
                             BuildingTreaty.objects
                             .filter(apartment_id=apt.id)
                             .exclude(id=obj.id)
                             .exclude(status=BuildingTreaty.Status.CANCELLED)
+                            .exclude(operation_type=BuildingTreaty.OperationType.OTHER)
                             .exists()
                         )
                         if not has_other:
                             apt.status = ResidentialComplexApartment.Status.AVAILABLE
                             apt.save(update_fields=["status", "updated_at"])
-                    else:
+                    elif obj.operation_type in (BuildingTreaty.OperationType.SALE, BuildingTreaty.OperationType.BOOKING):
                         desired = (
                             ResidentialComplexApartment.Status.SOLD
                             if obj.operation_type == BuildingTreaty.OperationType.SALE
@@ -2391,16 +2495,20 @@ class BuildingTreatyFileAddView(CompanyQuerysetMixin, generics.GenericAPIView):
     permission_classes = [permissions.IsAuthenticated]
     serializer_class = BuildingTreatyFileCreateSerializer
     parser_classes = [MultiPartParser, FormParser]
-    queryset = BuildingTreaty.objects.select_related("residential_complex")
+    queryset = BuildingTreaty.objects.select_related("residential_complex", "company")
 
     def get_queryset(self):
         qs = super().get_queryset()
         user = self.request.user
         if user.is_authenticated and getattr(user, "company_id", None):
-            qs = qs.filter(residential_complex__company_id=user.company_id)
+            qs = qs.filter(
+                Q(residential_complex__company_id=user.company_id) | Q(company_id=user.company_id)
+            )
             allowed_ids = _allowed_residential_complex_ids(user)
             if allowed_ids is not None:
-                qs = qs.filter(residential_complex_id__in=allowed_ids)
+                qs = qs.filter(
+                    Q(residential_complex_id__in=allowed_ids) | Q(residential_complex_id__isnull=True)
+                )
             return qs
         if not getattr(user, "is_staff", False) and not getattr(user, "is_superuser", False):
             return qs.none()
@@ -2412,7 +2520,8 @@ class BuildingTreatyFileAddView(CompanyQuerysetMixin, generics.GenericAPIView):
             raise PermissionDenied("Нет прав на договора (Building).")
 
         treaty = self.get_object()
-        if not getattr(user, "is_superuser", False) and treaty.residential_complex.company_id != getattr(user, "company_id", None):
+        treaty_company_id = getattr(treaty.residential_complex, "company_id", None) if treaty.residential_complex_id else getattr(treaty, "company_id", None)
+        if not getattr(user, "is_superuser", False) and treaty_company_id != getattr(user, "company_id", None):
             raise PermissionDenied("Договор другой компании.")
 
         ser = self.get_serializer(data=request.data)
@@ -2431,16 +2540,20 @@ class BuildingTreatyFileAddView(CompanyQuerysetMixin, generics.GenericAPIView):
 class BuildingTreatyErpCreateView(CompanyQuerysetMixin, generics.GenericAPIView):
     permission_classes = [permissions.IsAuthenticated]
     serializer_class = BuildingTreatySerializer
-    queryset = BuildingTreaty.objects.select_related("residential_complex")
+    queryset = BuildingTreaty.objects.select_related("residential_complex", "company")
 
     def get_queryset(self):
         qs = super().get_queryset()
         user = self.request.user
         if user.is_authenticated and getattr(user, "company_id", None):
-            qs = qs.filter(residential_complex__company_id=user.company_id)
+            qs = qs.filter(
+                Q(residential_complex__company_id=user.company_id) | Q(company_id=user.company_id)
+            )
             allowed_ids = _allowed_residential_complex_ids(user)
             if allowed_ids is not None:
-                qs = qs.filter(residential_complex_id__in=allowed_ids)
+                qs = qs.filter(
+                    Q(residential_complex_id__in=allowed_ids) | Q(residential_complex_id__isnull=True)
+                )
             return qs
         if not getattr(user, "is_staff", False) and not getattr(user, "is_superuser", False):
             return qs.none()
@@ -2460,7 +2573,7 @@ class BuildingTreatyErpCreateView(CompanyQuerysetMixin, generics.GenericAPIView)
 class BuildingTreatyInstallmentPaymentView(CompanyQuerysetMixin, generics.GenericAPIView):
     permission_classes = [permissions.IsAuthenticated]
     serializer_class = BuildingTreatyInstallmentPaymentCreateSerializer
-    queryset = BuildingTreatyInstallment.objects.select_related("treaty", "treaty__residential_complex")
+    queryset = BuildingTreatyInstallment.objects.select_related("treaty", "treaty__residential_complex", "treaty__company")
 
     def get_queryset(self):
         qs = super().get_queryset()
@@ -2468,10 +2581,14 @@ class BuildingTreatyInstallmentPaymentView(CompanyQuerysetMixin, generics.Generi
         if not (_is_owner_like(user) or getattr(user, "can_view_building_treaty", False)):
             raise PermissionDenied("Нет прав на договора (Building).")
         if user.is_authenticated and getattr(user, "company_id", None):
-            qs = qs.filter(treaty__residential_complex__company_id=user.company_id)
+            qs = qs.filter(
+                Q(treaty__residential_complex__company_id=user.company_id) | Q(treaty__company_id=user.company_id)
+            )
             allowed_ids = _allowed_residential_complex_ids(user)
             if allowed_ids is not None:
-                qs = qs.filter(treaty__residential_complex_id__in=allowed_ids)
+                qs = qs.filter(
+                    Q(treaty__residential_complex_id__in=allowed_ids) | Q(treaty__residential_complex_id__isnull=True)
+                )
             return qs
         if not getattr(user, "is_staff", False) and not getattr(user, "is_superuser", False):
             return qs.none()
