@@ -842,6 +842,137 @@ class BuildingSupplierFile(models.Model):
         return self.title or str(getattr(self.file, "name", "")) or str(self.id)
 
 
+class BuildingSupplierBarterSettlement(models.Model):
+    """Бартерный взаимозачёт с поставщиком в разрезе ЖК."""
+
+    class Status(models.TextChoices):
+        DRAFT = "draft", "Черновик"
+        CONFIRMED = "confirmed", "Подтверждён"
+        CANCELLED = "cancelled", "Отменён"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False, verbose_name="ID")
+    company = models.ForeignKey(
+        Company,
+        on_delete=models.CASCADE,
+        related_name="building_supplier_barter_settlements",
+        verbose_name="Компания",
+    )
+    supplier = models.ForeignKey(
+        BuildingSupplier,
+        on_delete=models.CASCADE,
+        related_name="barter_settlements",
+        verbose_name="Поставщик",
+    )
+    residential_complex = models.ForeignKey(
+        "ResidentialComplex",
+        on_delete=models.CASCADE,
+        related_name="supplier_barter_settlements",
+        verbose_name="Жилой комплекс",
+    )
+    date = models.DateField(default=timezone.now, verbose_name="Дата зачёта")
+    status = models.CharField(
+        max_length=16,
+        choices=Status.choices,
+        default=Status.DRAFT,
+        db_index=True,
+        verbose_name="Статус",
+    )
+    amount_total = models.DecimalField(
+        max_digits=16,
+        decimal_places=2,
+        default=Decimal("0.00"),
+        verbose_name="Сумма зачёта",
+    )
+    currency = models.CharField(max_length=8, default="KZT", verbose_name="Валюта")
+    comment = models.TextField(blank=True, verbose_name="Комментарий")
+
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="building_supplier_barter_settlements_created",
+        verbose_name="Кто создал",
+    )
+    created_at = models.DateTimeField(auto_now_add=True, verbose_name="Дата создания")
+    updated_at = models.DateTimeField(auto_now=True, verbose_name="Дата обновления")
+
+    class Meta:
+        verbose_name = "Бартерный зачёт с поставщиком"
+        verbose_name_plural = "Бартерные зачёты с поставщиками"
+        ordering = ["-date", "-created_at"]
+        indexes = [
+            models.Index(fields=["company", "supplier", "date"]),
+            models.Index(fields=["company", "residential_complex", "date"]),
+            models.Index(fields=["status", "date"]),
+        ]
+
+    def __str__(self):
+        return f"Бартер {self.supplier} на {self.amount_total} {self.currency} от {self.date}"
+
+
+class BuildingSupplierBarterPurchaseItem(models.Model):
+    """Строка закупки, погашаемая бартерным зачётом."""
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False, verbose_name="ID")
+    settlement = models.ForeignKey(
+        BuildingSupplierBarterSettlement,
+        on_delete=models.CASCADE,
+        related_name="purchase_items",
+        verbose_name="Бартерный зачёт",
+    )
+    procurement_item = models.ForeignKey(
+        "BuildingProcurementItem",
+        on_delete=models.CASCADE,
+        related_name="barter_items",
+        verbose_name="Позиция закупки",
+    )
+    amount = models.DecimalField(
+        max_digits=16,
+        decimal_places=2,
+        verbose_name="Сумма по строке в зачёте",
+    )
+
+    class Meta:
+        verbose_name = "Строка закупки в бартерном зачёте"
+        verbose_name_plural = "Строки закупок в бартерных зачётах"
+        indexes = [
+            models.Index(fields=["settlement"]),
+            models.Index(fields=["procurement_item"]),
+        ]
+
+    def __str__(self):
+        return f"{self.procurement_item_id}: {self.amount}"
+
+
+class BuildingSupplierBarterCounterDelivery(models.Model):
+    """Встречная поставка/услуга в рамках бартерного зачёта."""
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False, verbose_name="ID")
+    settlement = models.ForeignKey(
+        BuildingSupplierBarterSettlement,
+        on_delete=models.CASCADE,
+        related_name="counter_deliveries",
+        verbose_name="Бартерный зачёт",
+    )
+    description = models.CharField(max_length=512, verbose_name="Описание")
+    amount = models.DecimalField(
+        max_digits=16,
+        decimal_places=2,
+        verbose_name="Сумма по встречной поставке",
+    )
+
+    class Meta:
+        verbose_name = "Встречная поставка по бартеру"
+        verbose_name_plural = "Встречные поставки по бартеру"
+        indexes = [
+            models.Index(fields=["settlement"]),
+        ]
+
+    def __str__(self):
+        return f"{self.description} ({self.amount})"
+
+
 # -----------------------
 # Товары (Products)
 # -----------------------
@@ -1869,6 +2000,7 @@ class BuildingTreaty(models.Model):
     class OperationType(models.TextChoices):
         SALE = "sale", "Продажа"
         BOOKING = "booking", "Бронь"
+        OTHER = "other", "Прочие"
 
     class PaymentType(models.TextChoices):
         FULL = "full", "Полная оплата"
@@ -1888,10 +2020,21 @@ class BuildingTreaty(models.Model):
         NOT_CONFIGURED = "not_configured", "ERP не настроена"
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False, verbose_name="ID")
+    company = models.ForeignKey(
+        Company,
+        on_delete=models.CASCADE,
+        related_name="building_treaties",
+        null=True,
+        blank=True,
+        db_index=True,
+        verbose_name="Компания",
+    )
     residential_complex = models.ForeignKey(
         ResidentialComplex,
         on_delete=models.CASCADE,
         related_name="treaties",
+        null=True,
+        blank=True,
         verbose_name="Жилой комплекс",
     )
     client = models.ForeignKey(
@@ -1912,6 +2055,7 @@ class BuildingTreaty(models.Model):
     )
 
     number = models.CharField(max_length=64, blank=True, verbose_name="Номер договора")
+    client_name = models.CharField(max_length=255, blank=True, verbose_name="Название контрагента (если нет client)")
     title = models.CharField(max_length=255, blank=True, verbose_name="Название")
     description = models.TextField(blank=True, verbose_name="Описание/условия")
     amount = models.DecimalField(max_digits=16, decimal_places=2, default=Decimal("0.00"), verbose_name="Сумма")
@@ -1965,6 +2109,7 @@ class BuildingTreaty(models.Model):
         verbose_name_plural = "Договоры (Building)"
         ordering = ["-created_at"]
         indexes = [
+            models.Index(fields=["company", "status"]),
             models.Index(fields=["residential_complex", "status"]),
             models.Index(fields=["residential_complex", "operation_type", "created_at"]),
             models.Index(fields=["residential_complex", "payment_type", "created_at"]),
@@ -1973,7 +2118,8 @@ class BuildingTreaty(models.Model):
 
     def __str__(self):
         base = self.number or (self.title or "Договор")
-        return f"{base} ({self.residential_complex.name})"
+        rc_name = self.residential_complex.name if self.residential_complex_id else (self.company.name if self.company_id else "")
+        return f"{base} ({rc_name})" if rc_name else base
 
 
 class BuildingTreatyInstallment(models.Model):

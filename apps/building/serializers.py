@@ -17,6 +17,9 @@ from .models import (
     BuildingContractorFile,
     BuildingSupplier,
     BuildingSupplierFile,
+    BuildingSupplierBarterSettlement,
+    BuildingSupplierBarterPurchaseItem,
+    BuildingSupplierBarterCounterDelivery,
     BuildingTransferRequestFile,
     BuildingWarehouseRequest,
     BuildingWarehouseRequestItem,
@@ -342,6 +345,180 @@ class BuildingSupplierCreateSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError({"company": "У пользователя не указана компания."})
         validated_data["company_id"] = company.id
         return super().create(validated_data)
+
+
+class BuildingSupplierBarterPurchaseItemSerializer(serializers.ModelSerializer):
+    procurement_id = serializers.UUIDField(source="procurement_item.procurement_id", read_only=True)
+
+    class Meta:
+        model = BuildingSupplierBarterPurchaseItem
+        fields = ["id", "procurement_item", "procurement_id", "amount"]
+        read_only_fields = ["id", "procurement_id"]
+
+
+class BuildingSupplierBarterCounterDeliverySerializer(serializers.ModelSerializer):
+    class Meta:
+        model = BuildingSupplierBarterCounterDelivery
+        fields = ["id", "description", "amount"]
+        read_only_fields = ["id"]
+
+
+class BuildingSupplierBarterSettlementSerializer(serializers.ModelSerializer):
+    supplier_name = serializers.CharField(source="supplier.company_name", read_only=True)
+    residential_complex_name = serializers.CharField(source="residential_complex.name", read_only=True)
+    created_by_display = serializers.SerializerMethodField(read_only=True)
+    purchase_items = BuildingSupplierBarterPurchaseItemSerializer(many=True, read_only=True)
+    counter_deliveries = BuildingSupplierBarterCounterDeliverySerializer(many=True, read_only=True)
+
+    class Meta:
+        model = BuildingSupplierBarterSettlement
+        fields = [
+            "id",
+            "company",
+            "supplier",
+            "supplier_name",
+            "residential_complex",
+            "residential_complex_name",
+            "date",
+            "status",
+            "amount_total",
+            "currency",
+            "comment",
+            "created_by",
+            "created_by_display",
+            "created_at",
+            "updated_at",
+            "purchase_items",
+            "counter_deliveries",
+        ]
+        read_only_fields = [
+            "id",
+            "company",
+            "created_by",
+            "created_by_display",
+            "created_at",
+            "updated_at",
+            "supplier_name",
+            "residential_complex_name",
+            "purchase_items",
+            "counter_deliveries",
+        ]
+
+    def get_created_by_display(self, obj):
+        u = getattr(obj, "created_by", None)
+        if not u:
+            return None
+        full_name = f"{getattr(u, 'first_name', '')} {getattr(u, 'last_name', '')}".strip()
+        return full_name or getattr(u, "email", None) or getattr(u, "username", None) or str(getattr(u, "id", ""))
+
+
+class BuildingSupplierBarterSettlementCreateUpdateSerializer(serializers.ModelSerializer):
+    purchase_items = serializers.ListField(
+        child=serializers.DictField(),
+        required=False,
+        allow_empty=True,
+    )
+    counter_deliveries = serializers.ListField(
+        child=serializers.DictField(),
+        required=False,
+        allow_empty=True,
+    )
+
+    class Meta:
+        model = BuildingSupplierBarterSettlement
+        fields = [
+            "id",
+            "supplier",
+            "residential_complex",
+            "date",
+            "amount_total",
+            "currency",
+            "comment",
+            "purchase_items",
+            "counter_deliveries",
+        ]
+        read_only_fields = ["id"]
+
+    def validate(self, attrs):
+        attrs = super().validate(attrs)
+        supplier = attrs.get("supplier") or getattr(self.instance, "supplier", None)
+        rc = attrs.get("residential_complex") or getattr(self.instance, "residential_complex", None)
+
+        if supplier and rc and supplier.company_id != rc.company_id:
+            raise serializers.ValidationError({"residential_complex": "ЖК принадлежит другой компании, чем поставщик."})
+
+        request = self.context.get("request")
+        user = getattr(request, "user", None) if request else None
+        company_id = getattr(user, "company_id", None)
+        if company_id and supplier and supplier.company_id != company_id and not getattr(user, "is_superuser", False):
+            raise serializers.ValidationError({"supplier": "Поставщик принадлежит другой компании."})
+
+        return attrs
+
+    def _sync_nested(self, settlement, purchase_items, counter_deliveries):
+        if purchase_items is not None:
+            BuildingSupplierBarterPurchaseItem.objects.filter(settlement=settlement).delete()
+            for i, raw in enumerate(purchase_items, start=1):
+                procurement_item = raw.get("procurement_item")
+                amount = raw.get("amount")
+                if not procurement_item or amount in (None, ""):
+                    raise serializers.ValidationError(
+                        {"purchase_items": f"Строка #{i}: укажите procurement_item и amount."}
+                    )
+                BuildingSupplierBarterPurchaseItem.objects.create(
+                    settlement=settlement,
+                    procurement_item=procurement_item,
+                    amount=amount,
+                )
+
+        if counter_deliveries is not None:
+            BuildingSupplierBarterCounterDelivery.objects.filter(settlement=settlement).delete()
+            for i, raw in enumerate(counter_deliveries, start=1):
+                description = (raw.get("description") or "").strip()
+                amount = raw.get("amount")
+                if not description or amount in (None, ""):
+                    raise serializers.ValidationError(
+                        {"counter_deliveries": f"Строка #{i}: укажите description и amount."}
+                    )
+                BuildingSupplierBarterCounterDelivery.objects.create(
+                    settlement=settlement,
+                    description=description,
+                    amount=amount,
+                )
+
+    @transaction.atomic
+    def create(self, validated_data):
+        purchase_items = validated_data.pop("purchase_items", [])
+        counter_deliveries = validated_data.pop("counter_deliveries", [])
+
+        request = self.context.get("request")
+        user = getattr(request, "user", None) if request else None
+        company_id = getattr(user, "company_id", None)
+        if not company_id and not getattr(user, "is_superuser", False):
+            raise serializers.ValidationError({"company": "У пользователя не указана компания."})
+
+        settlement = BuildingSupplierBarterSettlement.objects.create(
+            company_id=company_id,
+            created_by=user,
+            **validated_data,
+        )
+        self._sync_nested(settlement, purchase_items, counter_deliveries)
+        return settlement
+
+    @transaction.atomic
+    def update(self, instance, validated_data):
+        if instance.status != BuildingSupplierBarterSettlement.Status.DRAFT:
+            raise serializers.ValidationError({"status": "Менять можно только черновик бартерного зачёта."})
+
+        purchase_items = validated_data.pop("purchase_items", None)
+        counter_deliveries = validated_data.pop("counter_deliveries", None)
+
+        for attr, value in validated_data.items():
+            setattr(instance, attr, value)
+        instance.save()
+
+        self._sync_nested(instance, purchase_items, counter_deliveries)
+        return instance
 
 
 # -----------------------
@@ -892,10 +1069,10 @@ class BuildingTreatyFileCreateSerializer(serializers.Serializer):
 
 
 class BuildingTreatySerializer(serializers.ModelSerializer):
-    residential_complex_name = serializers.CharField(source="residential_complex.name", read_only=True)
-    client_name = serializers.CharField(source="client.name", read_only=True)
-    apartment_number = serializers.CharField(source="apartment.number", read_only=True)
-    apartment_floor = serializers.IntegerField(source="apartment.floor", read_only=True)
+    residential_complex_name = serializers.CharField(source="residential_complex.name", read_only=True, allow_null=True)
+    client_name = serializers.SerializerMethodField(read_only=True)
+    apartment_number = serializers.CharField(source="apartment.number", read_only=True, allow_null=True)
+    apartment_floor = serializers.IntegerField(source="apartment.floor", read_only=True, allow_null=True)
     files = BuildingTreatyFileSerializer(many=True, read_only=True)
     created_by_display = serializers.SerializerMethodField()
     installments = serializers.SerializerMethodField(read_only=True)
@@ -913,6 +1090,7 @@ class BuildingTreatySerializer(serializers.ModelSerializer):
         model = BuildingTreaty
         fields = [
             "id",
+            "company",
             "residential_complex",
             "residential_complex_name",
             "client",
@@ -945,6 +1123,7 @@ class BuildingTreatySerializer(serializers.ModelSerializer):
         ]
         read_only_fields = [
             "id",
+            "company",
             "created_by",
             "created_by_display",
             "erp_sync_status",
@@ -956,11 +1135,17 @@ class BuildingTreatySerializer(serializers.ModelSerializer):
             "updated_at",
             "files",
             "residential_complex_name",
-            "client_name",
             "apartment_number",
             "apartment_floor",
             "installments",
         ]
+
+    def get_client_name(self, obj):
+        """Возвращает имя клиента: из карточки client или из поля client_name."""
+        client = getattr(obj, "client", None)
+        if client:
+            return getattr(client, "name", None) or ""
+        return getattr(obj, "client_name", None) or ""
 
     def get_created_by_display(self, obj):
         user = getattr(obj, "created_by", None)
@@ -972,8 +1157,36 @@ class BuildingTreatySerializer(serializers.ModelSerializer):
     def validate(self, attrs):
         attrs = super().validate(attrs)
 
+        operation_type = attrs.get("operation_type") or getattr(self.instance, "operation_type", None)
         payment_type = attrs.get("payment_type") or getattr(self.instance, "payment_type", None)
         installments_data = self.initial_data.get("installments", None)
+
+        # Обязательность полей по типу договора (booking/sale vs other)
+        is_booking_or_sale = operation_type in (
+            BuildingTreaty.OperationType.BOOKING,
+            BuildingTreaty.OperationType.SALE,
+        )
+        if is_booking_or_sale:
+            rc = attrs.get("residential_complex") or getattr(self.instance, "residential_complex", None)
+            if not rc:
+                raise serializers.ValidationError({"residential_complex": "Для брони и продажи обязателен ЖК."})
+            if not attrs.get("client") and not getattr(self.instance, "client", None):
+                raise serializers.ValidationError({"client": "Для брони и продажи обязателен клиент."})
+            apt = attrs.get("apartment") or getattr(self.instance, "apartment", None)
+            if not apt:
+                raise serializers.ValidationError({"apartment": "Для брони и продажи обязательна квартира."})
+            amt = attrs.get("amount")
+            if amt is None:
+                amt = getattr(self.instance, "amount", None)
+            if amt is None or (hasattr(amt, "__float__") and float(amt) <= 0):
+                raise serializers.ValidationError({"amount": "Для брони и продажи обязательна сумма."})
+            if not operation_type:
+                raise serializers.ValidationError({"operation_type": "Обязателен тип договора."})
+            if not payment_type:
+                raise serializers.ValidationError({"payment_type": "Обязателен тип оплаты."})
+        else:
+            # other: residential_complex и amount опциональны; apartment, client — опциональны
+            pass
 
         # На чтение installments идёт отдельным полем; на запись принимаем как list[...]
         if installments_data is not None:
@@ -1040,18 +1253,33 @@ class BuildingTreatySerializer(serializers.ModelSerializer):
 
         request = self.context.get("request")
         user = getattr(request, "user", None) if request else None
+        user_company_id = getattr(user, "company_id", None) if user else None
 
-        rc = validated_data["residential_complex"]
-        if not (validated_data.get("number") or "").strip():
-            validated_data["number"] = self._next_number(rc.company_id)
+        rc = validated_data.get("residential_complex")
+        operation_type = validated_data.get("operation_type") or BuildingTreaty.OperationType.SALE
+
+        # company_id: из ЖК или из пользователя (для other без ЖК)
+        if rc:
+            validated_data["company_id"] = rc.company_id
+        elif user_company_id:
+            validated_data["company_id"] = user_company_id
+        elif not getattr(user, "is_superuser", False):
+            raise serializers.ValidationError(
+                {"residential_complex": "Укажите ЖК или убедитесь, что у пользователя указана компания (для прочих договоров)."}
+            )
+
+        company_id = validated_data.get("company_id")
+        if not (validated_data.get("number") or "").strip() and company_id:
+            validated_data["number"] = self._next_number(company_id)
 
         apartment = validated_data.get("apartment")
-        if apartment:
+        if apartment and rc:
             apartment = ResidentialComplexApartment.objects.select_for_update().get(pk=apartment.pk)
             if apartment.residential_complex_id != rc.id:
                 raise serializers.ValidationError({"apartment": "Квартира относится к другому ЖК."})
-            if apartment.status != ResidentialComplexApartment.Status.AVAILABLE:
-                raise serializers.ValidationError({"apartment": "Квартира недоступна для продажи/брони (статус не available)."})
+            if operation_type in (BuildingTreaty.OperationType.BOOKING, BuildingTreaty.OperationType.SALE):
+                if apartment.status != ResidentialComplexApartment.Status.AVAILABLE:
+                    raise serializers.ValidationError({"apartment": "Квартира недоступна для продажи/брони (статус не available)."})
             validated_data["apartment"] = apartment
 
         payment_type = validated_data.get("payment_type") or BuildingTreaty.PaymentType.FULL
@@ -1081,7 +1309,7 @@ class BuildingTreatySerializer(serializers.ModelSerializer):
                     {"installments": "Сумма (down_payment + installments) должна быть равна amount."}
                 )
 
-        if apartment:
+        if apartment and treaty.operation_type in (BuildingTreaty.OperationType.BOOKING, BuildingTreaty.OperationType.SALE):
             new_status = (
                 ResidentialComplexApartment.Status.SOLD
                 if treaty.operation_type == BuildingTreaty.OperationType.SALE
@@ -1102,6 +1330,10 @@ class BuildingTreatySerializer(serializers.ModelSerializer):
         installments_data = self._parse_installments()
 
         payment_type = validated_data.get("payment_type") or instance.payment_type
+        operation_type = validated_data.get("operation_type") or instance.operation_type
+
+        # При смене с other на booking/sale — валидация в validate() потребует заполнения apartment/client/amount
+
         if payment_type == BuildingTreaty.PaymentType.INSTALLMENT and installments_data is None:
             # не передали installments — не трогаем существующие
             pass
