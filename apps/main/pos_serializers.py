@@ -201,6 +201,7 @@ class SaleCartSerializer(serializers.ModelSerializer):
             "subtotal",
             "discount_total",
             "order_discount_total",
+            "order_discount_percent",
             "tax_total",
             "total",
             "items",
