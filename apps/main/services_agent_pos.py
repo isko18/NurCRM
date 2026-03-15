@@ -122,15 +122,18 @@ def checkout_agent_cart(
     needs = {}
     for it in cart.items.select_related("product"):
         qty_int = _to_int_qty(getattr(it, "quantity", None))
+        qty_dec = Decimal(str(it.quantity or 1))
+        line_disc = Decimal(str(getattr(it, "line_discount", None) or 0))
+        effective_unit = (it.unit_price or Decimal("0")) - (line_disc / qty_dec) if qty_dec else (it.unit_price or Decimal("0"))
 
         if it.product is None:
-            key = f"custom:{it.custom_name}:{it.unit_price}"
-            row = needs.setdefault(key, {"custom_name": it.custom_name, "unit_price": it.unit_price, "qty": 0})
+            key = f"custom:{it.custom_name}:{effective_unit}"
+            row = needs.setdefault(key, {"custom_name": it.custom_name, "unit_price": effective_unit, "qty": 0})
             row["qty"] += qty_int
             continue
 
         pid = str(it.product_id)
-        row = needs.setdefault(pid, {"product": it.product, "unit_price": it.unit_price, "qty": 0})
+        row = needs.setdefault(pid, {"product": it.product, "unit_price": effective_unit, "qty": 0})
         row["qty"] += qty_int
 
     # --- 2) готовим FIFO остатки агента по продуктам ---

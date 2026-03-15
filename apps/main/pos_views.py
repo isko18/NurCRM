@@ -1290,19 +1290,15 @@ class SaleAddItemAPIView(MarketCashierOnlyMixin, APIView):
         unit_price = ser.validated_data.get("unit_price")
         line_discount = ser.validated_data.get("discount_total")
 
-        # База: unit_price или product.price
+        # unit_price — база, line_discount — скидка на строку (хранятся отдельно)
         base_price = _q2(unit_price) if unit_price is not None else _q2(Decimal(str(product.price or 0)))
-        if line_discount is not None:
-            per_unit_disc = _q2(Decimal(line_discount) / Decimal(qty))
-            final_unit_price = _q2(base_price - per_unit_disc)
-            if final_unit_price < 0:
-                final_unit_price = Decimal("0.00")
-        else:
-            final_unit_price = base_price
+        disc_total = _q2(Decimal(str(line_discount))) if line_discount is not None else Decimal("0.00")
 
-        # Цена продажи не ниже закупочной (можно выше, нельзя ниже)
+        # Цена продажи (с учётом скидки) не ниже закупочной
         min_price = _q2(Decimal(str(getattr(product, "purchase_price", None) or 0)))
-        if final_unit_price < min_price:
+        qty_dec = Decimal(str(qty))
+        effective_unit = base_price - (disc_total / qty_dec) if qty_dec else base_price
+        if effective_unit < min_price:
             return Response(
                 {"unit_price": f"Цена продажи не может быть ниже закупочной ({min_price})."},
                 status=status.HTTP_400_BAD_REQUEST,
@@ -1318,19 +1314,23 @@ class SaleAddItemAPIView(MarketCashierOnlyMixin, APIView):
                 "company": cart.company,
                 "branch": getattr(cart, "branch", None),
                 "quantity": qty3(qty),
-                "unit_price": final_unit_price,
+                "unit_price": base_price,
+                "line_discount": disc_total,
             },
         )
         
         if not created:
-            # Округляем количество после сложения
             item.quantity = qty3(item.quantity + qty)
-            
-            # Обновляем цену только если она была явно указана (unit_price или discount_total)
-            if unit_price is not None or line_discount is not None:
-                item.unit_price = final_unit_price
-            
-            item.save(update_fields=["quantity", "unit_price"])
+            if unit_price is not None:
+                item.unit_price = base_price
+            if line_discount is not None:
+                item.line_discount = (Decimal(str(item.line_discount or 0)) + disc_total)
+            update_f = ["quantity"]
+            if unit_price is not None:
+                update_f.append("unit_price")
+            if line_discount is not None:
+                update_f.append("line_discount")
+            item.save(update_fields=update_f)
 
         cart.recalc()
         return Response(SaleCartSerializer(cart).data, status=status.HTTP_201_CREATED)
@@ -1756,27 +1756,26 @@ class CartItemUpdateDestroyAPIView(MarketCashierOnlyMixin, APIView):
         unit_price = data.get("unit_price")
         line_discount = data.get("discount_total")
 
-        if unit_price is not None or line_discount is not None:
-            qty_for_price = Decimal(str(item.quantity or 1))
-            min_price = _q2(Decimal(str(getattr(item.product, "purchase_price", None) or 0))) if item.product_id else Decimal("0")
-            # База для скидки: unit_price если передан, иначе текущая цена в корзине
-            base_price = _q2(unit_price) if unit_price is not None else Decimal(str(item.unit_price or 0))
-            if line_discount is not None:
-                per_unit_disc = _q2(Decimal(str(line_discount)) / qty_for_price)
-                new_price = _q2(base_price - per_unit_disc)
-                if new_price < 0:
-                    new_price = Decimal("0.00")
-                if new_price < min_price:
-                    new_price = min_price
-            else:
-                new_price = self._apply_min_price(item, base_price)
-            item.unit_price = new_price
+        # Цена и скидка меняются независимо: unit_price — база, line_discount — скидка на строку
+        if unit_price is not None:
+            item.unit_price = self._apply_min_price(item, _q2(unit_price))
+        if line_discount is not None:
+            item.line_discount = _q2(Decimal(str(line_discount)))
+            # Проверка: эффективная цена не ниже закупочной
+            if item.product_id:
+                qty_for_price = Decimal(str(item.quantity or 1))
+                effective = item.unit_price - (item.line_discount / qty_for_price) if qty_for_price else item.unit_price
+                min_price = _q2(Decimal(str(getattr(item.product, "purchase_price", None) or 0)))
+                if effective < min_price:
+                    item.line_discount = _q2(max(Decimal("0"), (item.unit_price - min_price) * qty_for_price))
 
         update_fields = []
         if qty is not None:
             update_fields.append("quantity")
-        if unit_price is not None or line_discount is not None:
+        if unit_price is not None:
             update_fields.append("unit_price")
+        if line_discount is not None:
+            update_fields.append("line_discount")
         if update_fields:
             item.save(update_fields=update_fields)
         cart.recalc()
@@ -2135,19 +2134,15 @@ class AgentSaleAddItemAPIView(MarketCashierOnlyMixin, CompanyBranchRestrictedMix
         unit_price = ser.validated_data.get("unit_price")
         line_discount = ser.validated_data.get("discount_total")
 
-        # База: unit_price или product.price
+        # unit_price — база, line_discount — скидка на строку (хранятся отдельно)
         base_price = money(unit_price) if unit_price is not None else money(Decimal(str(product.price or 0)))
-        if line_discount is not None:
-            per_unit_disc = money(Decimal(line_discount) / Decimal(qty))
-            final_unit_price = money(base_price - per_unit_disc)
-            if final_unit_price < 0:
-                final_unit_price = Decimal("0.00")
-        else:
-            final_unit_price = base_price
+        disc_total = money(Decimal(str(line_discount))) if line_discount is not None else Decimal("0.00")
 
-        # Цена продажи не ниже закупочной (можно выше, нельзя ниже)
+        # Цена продажи (с учётом скидки) не ниже закупочной
         min_price = money(Decimal(str(getattr(product, "purchase_price", None) or 0)))
-        if final_unit_price < min_price:
+        qty_dec = Decimal(str(qty))
+        effective_unit = base_price - (disc_total / qty_dec) if qty_dec else base_price
+        if effective_unit < min_price:
             return Response(
                 {"unit_price": f"Цена продажи не может быть ниже закупочной ({min_price})."},
                 status=400,
@@ -2163,18 +2158,22 @@ class AgentSaleAddItemAPIView(MarketCashierOnlyMixin, CompanyBranchRestrictedMix
                 "company": cart.company,
                 "branch": getattr(cart, "branch", None),
                 "quantity": qty3(qty),
-                "unit_price": final_unit_price,
+                "unit_price": base_price,
+                "line_discount": disc_total,
             },
         )
         if not created:
-            # Округляем количество после сложения
             item.quantity = qty3(item.quantity + qty)
-            
-            # Обновляем цену только если она была явно указана (unit_price или discount_total)
-            if unit_price is not None or line_discount is not None:
-                item.unit_price = final_unit_price
-            
-            item.save(update_fields=["quantity", "unit_price"])
+            if unit_price is not None:
+                item.unit_price = base_price
+            if line_discount is not None:
+                item.line_discount = (Decimal(str(getattr(item, "line_discount", 0) or 0)) + disc_total)
+            update_f = ["quantity"]
+            if unit_price is not None:
+                update_f.append("unit_price")
+            if line_discount is not None:
+                update_f.append("line_discount")
+            item.save(update_fields=update_f)
 
         cart.recalc()
         return Response(SaleCartSerializer(cart).data, status=status.HTTP_201_CREATED)
@@ -2394,27 +2393,26 @@ class AgentCartItemUpdateDestroyAPIView(MarketCashierOnlyMixin, APIView):
         unit_price = data.get("unit_price")
         line_discount = data.get("discount_total")
 
-        if unit_price is not None or line_discount is not None:
-            qty_for_price = Decimal(str(item.quantity or 1))
-            min_price = _q2(Decimal(str(getattr(item.product, "purchase_price", None) or 0))) if item.product_id else Decimal("0")
-            # База для скидки: unit_price если передан, иначе текущая цена в корзине
-            base_price = _q2(unit_price) if unit_price is not None else Decimal(str(item.unit_price or 0))
-            if line_discount is not None:
-                per_unit_disc = _q2(Decimal(str(line_discount)) / qty_for_price)
-                new_price = _q2(base_price - per_unit_disc)
-                if new_price < 0:
-                    new_price = Decimal("0.00")
-                if new_price < min_price:
-                    new_price = min_price
-            else:
-                new_price = self._apply_min_price(item, base_price)
-            item.unit_price = new_price
+        # Цена и скидка меняются независимо: unit_price — база, line_discount — скидка на строку
+        if unit_price is not None:
+            item.unit_price = self._apply_min_price(item, _q2(unit_price))
+        if line_discount is not None:
+            item.line_discount = _q2(Decimal(str(line_discount)))
+            # Проверка: эффективная цена не ниже закупочной
+            if item.product_id:
+                qty_for_price = Decimal(str(item.quantity or 1))
+                effective = item.unit_price - (item.line_discount / qty_for_price) if qty_for_price else item.unit_price
+                min_price = _q2(Decimal(str(getattr(item.product, "purchase_price", None) or 0)))
+                if effective < min_price:
+                    item.line_discount = _q2(max(Decimal("0"), (item.unit_price - min_price) * qty_for_price))
 
         update_fields = []
         if qty is not None:
             update_fields.append("quantity")
-        if unit_price is not None or line_discount is not None:
+        if unit_price is not None:
             update_fields.append("unit_price")
+        if line_discount is not None:
+            update_fields.append("line_discount")
         if update_fields:
             item.save(update_fields=update_fields)
         cart.recalc()

@@ -152,20 +152,17 @@ def add_item_to_cart(
     if getattr(product, "branch_id", None) is not None and product.branch_id != cart.branch_id:
         raise ValidationError("Товар другого филиала и не глобальный.")
 
-    # вычисляем итоговую цену за 1 шт
+    # unit_price — база, line_discount — скидка на строку (хранятся отдельно)
     base_price = _money(unit_price) if unit_price is not None else _money(product.price or Decimal("0.00"))
-    min_price = _money(getattr(product, "purchase_price", None) or Decimal("0.00"))
-    if discount_total is not None:
-        # discount_total — скидка на всю строку, делим на qty для цены за единицу
-        per_unit_disc = _money(Decimal(discount_total) / int(quantity))
-        final_price = _money(max(Decimal("0.00"), base_price - per_unit_disc))
-    else:
-        final_price = base_price
+    line_disc = _money(discount_total) if discount_total is not None else Decimal("0.00")
 
-    if final_price < min_price:
-        raise ValidationError(
-            f"Цена продажи не может быть ниже закупочной ({min_price})."
-        )
+    min_price = _money(getattr(product, "purchase_price", None) or Decimal("0.00"))
+    if quantity:
+        effective = base_price - (line_disc / int(quantity))
+        if effective < min_price:
+            raise ValidationError(
+                f"Цена продажи не может быть ниже закупочной ({min_price})."
+            )
 
     item = (
         CartItem.objects
@@ -176,8 +173,14 @@ def add_item_to_cart(
 
     if item:
         item.quantity = int(item.quantity or 0) + int(quantity)
-        item.unit_price = final_price
-        item.save(update_fields=["quantity", "unit_price"])
+        update_f = ["quantity"]
+        if unit_price is not None:
+            item.unit_price = base_price
+            update_f.append("unit_price")
+        if discount_total is not None:
+            item.line_discount = (Decimal(str(getattr(item, "line_discount", 0) or 0)) + line_disc)
+            update_f.append("line_discount")
+        item.save(update_fields=update_f)
     else:
         item = CartItem.objects.create(
             cart=cart,
@@ -185,7 +188,8 @@ def add_item_to_cart(
             branch=cart.branch,
             product=product,
             quantity=quantity,
-            unit_price=final_price,
+            unit_price=base_price,
+            line_discount=line_disc,
         )
 
     cart.recalc()

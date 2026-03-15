@@ -102,7 +102,7 @@ class SaleItemSerializer(serializers.ModelSerializer):
     display_name = serializers.SerializerMethodField()
     primary_image_url = serializers.SerializerMethodField(read_only=True)
     images = ProductImageReadSerializer(many=True, read_only=True, source="product.images")
-    line_discount = serializers.SerializerMethodField(read_only=True)
+    # line_discount — поле модели (хранится отдельно от unit_price)
 
     # ✅ важно: quantity должен быть Decimal(3), а не int
     quantity = QtyField()
@@ -137,14 +137,6 @@ class SaleItemSerializer(serializers.ModelSerializer):
         request = self.context.get("request")
         url = im.image.url
         return request.build_absolute_uri(url) if request else url
-
-    def get_line_discount(self, obj):
-        """Скидка на позицию: (base_price - unit_price) * quantity."""
-        base = getattr(getattr(obj, "product", None), "price", None) or Decimal("0")
-        unit = getattr(obj, "unit_price", None) or Decimal("0")
-        qty = getattr(obj, "quantity", None) or Decimal("1")
-        diff = (Decimal(str(base)) - Decimal(str(unit))) * Decimal(str(qty))
-        return str(max(Decimal("0"), diff).quantize(Decimal("0.01")))
 
     def _validate_company_branch(self, cart: Cart, product: Product):
         cart_company_id = get_attr(cart, "company_id")
