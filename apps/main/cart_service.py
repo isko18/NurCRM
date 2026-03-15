@@ -124,7 +124,8 @@ def add_item_to_cart(
 ) -> CartItem:
     """
     Добавляет/обновляет позицию в корзине.
-    unit_price или discount_total (скидка на 1 шт) — одно из двух.
+    unit_price — базовая цена; discount_total — скидка на строку (вычитается из базы).
+    Можно передать оба: final = (unit_price или product.price) - discount_total/qty.
     """
     if cart.status != Cart.Status.ACTIVE:
         raise ValidationError("Корзина не активна.")
@@ -142,8 +143,6 @@ def add_item_to_cart(
         raise ValidationError("unit_price должна быть ≥ 0.")
     if discount_total is not None and discount_total < 0:
         raise ValidationError("discount_total должна быть ≥ 0.")
-    if unit_price is not None and discount_total is not None:
-        raise ValidationError("Передай либо unit_price, либо discount_total.")
 
     # лочим корзину и строку, чтобы 2 клика не раздвоили позиции
     Cart.objects.select_for_update().filter(id=cart.id).values("id").first()
@@ -154,14 +153,14 @@ def add_item_to_cart(
         raise ValidationError("Товар другого филиала и не глобальный.")
 
     # вычисляем итоговую цену за 1 шт
-    base_price = product.price or Decimal("0.00")
+    base_price = _money(unit_price) if unit_price is not None else _money(product.price or Decimal("0.00"))
     min_price = _money(getattr(product, "purchase_price", None) or Decimal("0.00"))
-    if unit_price is not None:
-        final_price = _money(unit_price)
-    elif discount_total is not None:
-        final_price = _money(max(Decimal("0.00"), base_price - discount_total))
+    if discount_total is not None:
+        # discount_total — скидка на всю строку, делим на qty для цены за единицу
+        per_unit_disc = _money(Decimal(discount_total) / int(quantity))
+        final_price = _money(max(Decimal("0.00"), base_price - per_unit_disc))
     else:
-        final_price = _money(base_price)
+        final_price = base_price
 
     if final_price < min_price:
         raise ValidationError(

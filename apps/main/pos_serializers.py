@@ -236,8 +236,6 @@ class AddItemSerializer(serializers.Serializer):
             raise serializers.ValidationError({"unit_price": "Должна быть ≥ 0."})
         if disc is not None and disc < 0:
             raise serializers.ValidationError({"discount_total": "Должна быть ≥ 0."})
-        if up is not None and disc is not None:
-            raise serializers.ValidationError("Передавайте либо unit_price, либо discount_total.")
 
         qty = qty3(Decimal(str(qty)))
         if qty <= 0:
@@ -262,8 +260,6 @@ class CartItemPatchSerializer(serializers.Serializer):
             raise serializers.ValidationError({"unit_price": "Должна быть ≥ 0."})
         if disc is not None and disc < 0:
             raise serializers.ValidationError({"discount_total": "Должна быть ≥ 0."})
-        if up is not None and disc is not None:
-            raise serializers.ValidationError("Передавайте либо unit_price, либо discount_total.")
         return attrs
 
 
