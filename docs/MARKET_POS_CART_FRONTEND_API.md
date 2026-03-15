@@ -26,6 +26,7 @@
   "subtotal": "100.00",
   "discount_total": "10.00",
   "order_discount_total": "0.00",
+  "order_discount_percent": "10.00",
   "tax_total": "0.00",
   "total": "90.00",
   "items": [
@@ -135,6 +136,43 @@ line_total = (unit_price × quantity) - line_discount
 ### DELETE `/api/main/pos/carts/<cart_id>/items/<item_id>/`
 
 Удаляет позицию из корзины.
+
+---
+
+## Скидка на чек (order-level)
+
+### order_discount_total и order_discount_percent
+
+Корзина поддерживает скидку на весь чек:
+- **order_discount_total** — фиксированная сумма
+- **order_discount_percent** — процент от subtotal (0–100)
+
+Передаётся **либо** сумма, **либо** процент (не оба).
+
+### Когда задавать
+
+1. **При старте** — `POST /api/main/pos/sales/start/` с телом:
+   ```json
+   { "order_discount_percent": "10" }
+   ```
+   или
+   ```json
+   { "order_discount_total": "50.00" }
+   ```
+
+2. **После добавления товаров** — `PATCH /api/main/pos/carts/<cart_id>/` с тем же телом.
+
+### Важно про order_discount_percent
+
+- Процент хранится в корзине и **пересчитывается при каждом recalc** от текущего subtotal.
+- При добавлении/удалении товаров скидка в % автоматически пересчитывается.
+- При фиксированной сумме (`order_discount_total`) значение не меняется при изменении состава корзины.
+
+### Ответ корзины
+
+В ответе приходят оба поля:
+- `order_discount_total` — текущая сумма скидки на чек (для процента — пересчитанная)
+- `order_discount_percent` — заданный процент или `null`
 
 ---
 

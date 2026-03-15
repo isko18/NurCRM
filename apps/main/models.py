@@ -1292,6 +1292,11 @@ class Cart(models.Model):
     total = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal("0.00"))
 
     order_discount_total = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal("0.00"))
+    # Скидка на чек в % (0–100). Если задана — пересчитывается в recalc от subtotal
+    order_discount_percent = models.DecimalField(
+        max_digits=5, decimal_places=2, null=True, blank=True, default=None,
+        verbose_name="Скидка на чек, %",
+    )
 
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
@@ -1405,7 +1410,12 @@ class Cart(models.Model):
         subtotal = _money(subtotal)
         line_discount_total = _money(line_discount_total)
 
-        requested_extra = _money(self.order_discount_total or Decimal("0"))
+        # Скидка на чек: либо % от subtotal, либо фиксированная сумма
+        order_percent = getattr(self, "order_discount_percent", None)
+        if order_percent is not None and Decimal(str(order_percent)) > 0:
+            requested_extra = _money(subtotal * Decimal(str(order_percent)) / Decimal("100"))
+        else:
+            requested_extra = _money(self.order_discount_total or Decimal("0"))
         max_extra = max(Decimal("0"), subtotal - line_discount_total)
         extra_discount = min(requested_extra, max_extra)
 

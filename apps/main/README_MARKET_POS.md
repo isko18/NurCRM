@@ -76,9 +76,12 @@
 ```json
 {
   "cashbox_id": "uuid-кассы (опционально)",
-  "order_discount_total": "0.00 (опционально)"
+  "order_discount_total": "0.00 (опционально — фиксированная скидка)",
+  "order_discount_percent": "10 (опционально — скидка в % от subtotal)"
 }
 ```
+
+Передаётся **либо** `order_discount_total`, **либо** `order_discount_percent`. Скидка в % пересчитывается при каждом изменении корзины.
 
 Правила:
 - **не открывает смену автоматически** — если у кассира нет OPEN смены в кассе, вернёт:
@@ -163,6 +166,24 @@
 - `unit_price` — базовая цена; `discount_total` — скидка на строку (хранятся отдельно).
 
 `DELETE /api/main/pos/carts/<cart_id>/items/<item_id>/` — удалить позицию.
+
+### 2.5.1 Изменить скидку на чек
+`PATCH /api/main/pos/carts/<cart_id>/`
+
+Тело:
+```json
+{
+  "order_discount_percent": "10"
+}
+```
+или
+```json
+{
+  "order_discount_total": "50.00"
+}
+```
+
+Скидка в % пересчитывается от текущего subtotal при каждом recalc (добавление/удаление товаров).
 
 Подробнее: `docs/MARKET_POS_CART_FRONTEND_API.md`
 

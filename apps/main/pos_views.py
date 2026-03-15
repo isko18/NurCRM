@@ -1167,14 +1167,12 @@ class SaleStartAPIView(MarketCashierOnlyMixin, CompanyBranchRestrictedMixin, API
         order_disc_percent = opts.validated_data.get("order_discount_percent")
 
         if order_disc_percent is not None:
-            # Скидка в процентах на весь чек: считаем как % от суммы до общей скидки
-            base_subtotal = cart.subtotal or Decimal("0.00")
-            order_disc_total = _q2(base_subtotal * Decimal(str(order_disc_percent)) / Decimal("100"))
-        elif order_disc_total is None:
-            order_disc_total = Decimal("0.00")
-
-        cart.order_discount_total = _q2(order_disc_total)
-        cart.save(update_fields=["order_discount_total", "updated_at"])
+            cart.order_discount_percent = _q2(Decimal(str(order_disc_percent)))
+            cart.order_discount_total = Decimal("0.00")
+        else:
+            cart.order_discount_percent = None
+            cart.order_discount_total = _q2(order_disc_total or Decimal("0.00"))
+        cart.save(update_fields=["order_discount_total", "order_discount_percent", "updated_at"])
 
         cart.recalc()
         return Response(SaleCartSerializer(cart).data, status=status.HTTP_201_CREATED)
@@ -1186,6 +1184,26 @@ class CartDetailAPIView(MarketCashierOnlyMixin, generics.RetrieveAPIView):
 
     def get_queryset(self):
         return Cart.objects.filter(company=self.request.user.company)
+
+    def patch(self, request, *args, **kwargs):
+        """Обновить скидку на чек: order_discount_total или order_discount_percent."""
+        cart = self.get_object()
+        if cart.status != Cart.Status.ACTIVE:
+            return Response({"detail": "Корзина не активна."}, status=400)
+        opts = StartCartOptionsSerializer(data=request.data, partial=True)
+        opts.is_valid(raise_exception=True)
+        order_disc_total = opts.validated_data.get("order_discount_total")
+        order_disc_percent = opts.validated_data.get("order_discount_percent")
+        if order_disc_percent is not None:
+            cart.order_discount_percent = _q2(Decimal(str(order_disc_percent)))
+            cart.order_discount_total = Decimal("0.00")
+        elif order_disc_total is not None:
+            cart.order_discount_percent = None
+            cart.order_discount_total = _q2(order_disc_total)
+        if order_disc_total is not None or order_disc_percent is not None:
+            cart.save(update_fields=["order_discount_total", "order_discount_percent", "updated_at"])
+        cart.recalc()
+        return Response(SaleCartSerializer(cart).data, status=200)
 
 
 class SaleScanAPIView(MarketCashierOnlyMixin, APIView):
@@ -2005,19 +2023,17 @@ class AgentCartStartAPIView(MarketCashierOnlyMixin, CompanyBranchRestrictedMixin
 
         opts = StartCartOptionsSerializer(data=request.data)
         if opts.is_valid():
-            # Пересчитываем, чтобы взять актуальный subtotal
-            cart.recalc()
-
             order_disc_total = opts.validated_data.get("order_discount_total")
             order_disc_percent = opts.validated_data.get("order_discount_percent")
 
             if order_disc_percent is not None:
-                base_subtotal = cart.subtotal or Decimal("0.00")
-                order_disc_total = money(base_subtotal * Decimal(str(order_disc_percent)) / Decimal("100"))
-
-            if order_disc_total is not None:
+                cart.order_discount_percent = money(Decimal(str(order_disc_percent)))
+                cart.order_discount_total = Decimal("0.00")
+            elif order_disc_total is not None:
+                cart.order_discount_percent = None
                 cart.order_discount_total = money(order_disc_total)
-                cart.save(update_fields=["order_discount_total"])
+            if order_disc_total is not None or order_disc_percent is not None:
+                cart.save(update_fields=["order_discount_total", "order_discount_percent"])
 
         cart.recalc()
         return Response(SaleCartSerializer(cart).data, status=status.HTTP_201_CREATED)
