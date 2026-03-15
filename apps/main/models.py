@@ -1394,7 +1394,9 @@ class Cart(models.Model):
             base_unit = getattr(it.product, "price", None) or (it.unit_price or Decimal("0"))
             line_base = base_unit * qty
             line_actual = (it.unit_price or Decimal("0")) * qty
-            subtotal += line_base
+            # subtotal = сумма фактических сумм по строкам (unit_price * qty)
+            # при unit_price > product.price — используем unit_price; при скидке — line_base для расчёта discount
+            subtotal += max(line_base, line_actual)
             diff = line_base - line_actual
             if diff > 0:
                 line_discount_total += diff
