@@ -20,7 +20,8 @@ POST /api/main/pos/sales/<sale_id>/return/
 POST /api/main/agents/me/sales/<sale_id>/return/
 ```
 
-Оба эндпоинта выполняют одну и ту же операцию.
+- **Владелец** — может вернуть любую продажу компании.
+- **Агент** — может вернуть только свои продажи (где есть AgentSaleAllocation или user=agent).
 
 ---
 
