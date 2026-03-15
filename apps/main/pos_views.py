@@ -1564,6 +1564,59 @@ class SaleReturnAPIView(MarketCashierOnlyMixin, CompanyBranchRestrictedMixin, AP
         )
 
 
+class AgentSaleReturnAPIView(SaleReturnAPIView):
+    """
+    Возврат продажи агента — только свои.
+    POST /api/main/agents/me/sales/<pk>/return/
+    """
+
+    @transaction.atomic
+    def post(self, request, pk, *args, **kwargs):
+        qs = (
+            Sale.objects.filter(
+                Q(agent_allocations__agent=request.user) | Q(user=request.user)
+            )
+            .select_for_update()
+            .select_related("company", "branch", "user")
+            .prefetch_related("items__product", "agent_allocations")
+            .distinct()
+        )
+        qs = self._filter_qs_company_branch(qs)
+        sale = get_object_or_404(qs, id=pk)
+
+        if sale.status == Sale.Status.CANCELED:
+            return Response(
+                {"detail": "Продажа уже отменена."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if sale.status not in (Sale.Status.PAID, Sale.Status.DEBT):
+            return Response(
+                {"detail": "Возврат возможен только для оплаченных или долговых продаж."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        is_agent_sale = sale.agent_allocations.exists()
+        if is_agent_sale:
+            AgentSaleAllocation.objects.filter(sale=sale).delete()
+        else:
+            items = sale.items.filter(product_id__isnull=False).select_related("product")
+            for item in items:
+                qty = Decimal(str(item.quantity or 0))
+                if qty <= 0:
+                    continue
+                Product.objects.filter(pk=item.product_id).update(
+                    quantity=F("quantity") + qty
+                )
+
+        sale.status = Sale.Status.CANCELED
+        sale.save(update_fields=["status"])
+        sale.refresh_from_db()
+        return Response(
+            SaleDetailSerializer(sale, context={"request": request}).data,
+            status=status.HTTP_200_OK,
+        )
+
+
 class SaleMobileScannerTokenAPIView(MarketCashierOnlyMixin, APIView):
     permission_classes = [permissions.IsAuthenticated]
 
@@ -1776,6 +1829,70 @@ class SaleBulkDeleteAPIView(MarketCashierOnlyMixin, CompanyBranchRestrictedMixin
     @transaction.atomic
     def post(self, request, *args, **kwargs):
         return self._perform_bulk_delete(request)
+
+
+class AgentMySalesListAPIView(MarketCashierOnlyMixin, CompanyBranchRestrictedMixin, generics.ListAPIView):
+    """
+    История продаж агента — только свои продажи.
+    GET /api/main/agents/me/sales/
+
+    Показывает продажи, где агент имеет AgentSaleAllocation или является кассиром (user).
+    """
+    serializer_class = SaleListSerializer
+    permission_classes = [permissions.IsAuthenticated]
+    filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
+    filterset_fields = ("status", "user")
+    search_fields = ("id",)
+    ordering_fields = ("created_at", "total", "status")
+    ordering = ("-created_at",)
+
+    def get_queryset(self):
+        user = self.request.user
+        qs = (
+            Sale.objects.filter(
+                Q(agent_allocations__agent=user) | Q(user=user)
+            )
+            .select_related("user")
+            .prefetch_related("items__product")
+            .distinct()
+        )
+        qs = self._filter_qs_company_branch(qs)
+
+        start_dt = _parse_range_dt(self.request.query_params.get("start"), end=False)
+        end_dt = _parse_range_dt(self.request.query_params.get("end"), end=True)
+        if start_dt:
+            qs = qs.filter(created_at__gte=start_dt)
+        if end_dt:
+            qs = qs.filter(created_at__lte=end_dt)
+
+        paid_only = self.request.query_params.get("paid")
+        if paid_only in ("1", "true", "True"):
+            qs = qs.filter(status=Sale.Status.PAID)
+
+        return qs.order_by("-created_at")
+
+
+class AgentMySaleRetrieveAPIView(MarketCashierOnlyMixin, CompanyBranchRestrictedMixin, generics.RetrieveAPIView):
+    """
+    Детали продажи агента — только свои.
+    GET /api/main/agents/me/sales/<pk>/
+    """
+    serializer_class = SaleDetailSerializer
+    permission_classes = [permissions.IsAuthenticated]
+    lookup_field = "id"
+    lookup_url_kwarg = "pk"
+
+    def get_queryset(self):
+        user = self.request.user
+        qs = (
+            Sale.objects.filter(
+                Q(agent_allocations__agent=user) | Q(user=user)
+            )
+            .select_related("user")
+            .prefetch_related("items__product")
+            .distinct()
+        )
+        return self._filter_qs_company_branch(qs)
 
 
 class CartItemUpdateDestroyAPIView(MarketCashierOnlyMixin, APIView):

@@ -226,7 +226,9 @@ urlpatterns = [
     path("agents/me/carts/<uuid:pk>/add-item/", AgentSaleAddItemAPIView.as_view()),
     path("agents/me/carts/<uuid:pk>/custom-item/", AgentSaleAddCustomItemAPIView.as_view()),
     path("agents/me/carts/<uuid:pk>/checkout/", AgentSaleCheckoutAPIView.as_view()),
-    path("agents/me/sales/<uuid:pk>/return/", SaleReturnAPIView.as_view(), name="agent-sale-return"),
+    path("agents/me/sales/", AgentMySalesListAPIView.as_view(), name="agent-my-sales-list"),
+    path("agents/me/sales/<uuid:pk>/", AgentMySaleRetrieveAPIView.as_view(), name="agent-my-sale-detail"),
+    path("agents/me/sales/<uuid:pk>/return/", AgentSaleReturnAPIView.as_view(), name="agent-sale-return"),
     path("agents/me/carts/<uuid:cart_id>/items/<uuid:item_id>/", AgentCartItemUpdateDestroyAPIView.as_view(),name="agent-cart-item-update-destroy", ),
     
     
