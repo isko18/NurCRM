@@ -1572,17 +1572,24 @@ class AgentSaleReturnAPIView(SaleReturnAPIView):
 
     @transaction.atomic
     def post(self, request, pk, *args, **kwargs):
-        qs = (
+        # Проверка доступа без select_for_update (DISTINCT + FOR UPDATE несовместимы в PostgreSQL)
+        allowed_qs = (
             Sale.objects.filter(
                 Q(agent_allocations__agent=request.user) | Q(user=request.user)
             )
-            .select_for_update()
-            .select_related("company", "branch", "user")
-            .prefetch_related("items__product", "agent_allocations")
+            .filter(id=pk)
             .distinct()
         )
-        qs = self._filter_qs_company_branch(qs)
-        sale = get_object_or_404(qs, id=pk)
+        allowed_qs = self._filter_qs_company_branch(allowed_qs)
+        if not allowed_qs.exists():
+            raise Http404("Продажа не найдена или не принадлежит агенту.")
+
+        sale = (
+            Sale.objects.select_for_update()
+            .select_related("company", "branch", "user")
+            .prefetch_related("items__product", "agent_allocations")
+            .get(id=pk)
+        )
 
         if sale.status == Sale.Status.CANCELED:
             return Response(
