@@ -119,14 +119,16 @@
 {
   "product_id": "uuid-товара",
   "quantity": "1.000 (опционально)",
-  "unit_price": "опционально",
-  "discount_total": "опционально"
+  "unit_price": "опционально — базовая цена",
+  "discount_total": "опционально — скидка на строку"
 }
 ```
 
 Правила:
-- **нельзя** одновременно передать `unit_price` и `discount_total`;
-- если передан `discount_total`, то `unit_price` пересчитывается как `product.price - discount_per_unit`.
+- можно передать `unit_price`, `discount_total` или **оба**;
+- `unit_price` — базовая цена; `discount_total` — скидка на строку (хранятся отдельно);
+- эффективная цена за единицу = `unit_price - (discount_total / quantity)`;
+- эффективная цена не может быть ниже закупочной (`product.purchase_price`).
 
 ### 2.4 Добавить позицию «вручную без товара» (кастом)
 `POST /api/main/pos/carts/<cart_id>/custom-item/`
@@ -147,14 +149,22 @@
 
 Тело:
 ```json
-{ "quantity": "2.500" }
+{
+  "quantity": "2.500",
+  "unit_price": "100.00",
+  "discount_total": "10.00"
+}
 ```
 
 Правила:
 - `quantity = 0` → позиция удаляется;
-- `quantity < 0` → ошибка.
+- `quantity < 0` → ошибка;
+- **цена и скидка меняются независимо**: можно передать только `unit_price`, только `discount_total` или оба;
+- `unit_price` — базовая цена; `discount_total` — скидка на строку (хранятся отдельно).
 
 `DELETE /api/main/pos/carts/<cart_id>/items/<item_id>/` — удалить позицию.
+
+Подробнее: `docs/MARKET_POS_CART_FRONTEND_API.md`
 
 ### 2.6 Завершить продажу (оплата)
 `POST /api/main/pos/sales/<cart_id>/checkout/`

@@ -62,6 +62,9 @@ def checkout_cart(cart: Cart, department=None) -> Sale:
         p = it.product
         name_snap = (getattr(p, "name", None) or getattr(it, "custom_name", None) or "Позиция")
         barcode_snap = getattr(p, "barcode", None) or ""
+        qty = Decimal(str(it.quantity or 1))
+        line_disc = Decimal(str(getattr(it, "line_discount", None) or 0))
+        effective_unit = (it.unit_price or Decimal("0.00")) - (line_disc / qty) if qty else (it.unit_price or Decimal("0.00"))
         sale_items.append(
             SaleItem(
                 company=cart.company,
@@ -70,7 +73,7 @@ def checkout_cart(cart: Cart, department=None) -> Sale:
                 product=p,
                 name_snapshot=name_snap,
                 barcode_snapshot=barcode_snap,
-                unit_price=it.unit_price or Decimal("0.00"),
+                unit_price=effective_unit,
                 quantity=it.quantity,
             )
         )

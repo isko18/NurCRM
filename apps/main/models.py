@@ -1391,11 +1391,12 @@ class Cart(models.Model):
 
         for it in self.items.select_related("product"):
             qty = Decimal(it.quantity or 0)
-            base_unit = getattr(it.product, "price", None) or (it.unit_price or Decimal("0"))
+            unit = Decimal(it.unit_price or 0)
+            line_disc = Decimal(getattr(it, "line_discount", None) or 0)
+            # Фактическая сумма: (unit_price - line_discount/qty) * qty = unit_price*qty - line_discount
+            line_actual = unit * qty - line_disc
+            base_unit = getattr(it.product, "price", None) or unit
             line_base = base_unit * qty
-            line_actual = (it.unit_price or Decimal("0")) * qty
-            # subtotal = сумма фактических сумм по строкам (unit_price * qty)
-            # при unit_price > product.price — используем unit_price; при скидке — line_base для расчёта discount
             subtotal += max(line_base, line_actual)
             diff = line_base - line_actual
             if diff > 0:
@@ -1430,6 +1431,8 @@ class CartItem(models.Model):
     custom_name = models.CharField(max_length=255, blank=True)
     quantity = models.DecimalField(max_digits=12, decimal_places=3, default=Decimal("1.000"))
     unit_price = models.DecimalField(max_digits=12, decimal_places=2)
+    # Скидка на строку (хранится отдельно от цены — можно менять цену и скидку независимо)
+    line_discount = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal("0.00"))
 
     class Meta:
         unique_together = (("cart", "product"),)
@@ -1446,10 +1449,13 @@ class CartItem(models.Model):
         if self.quantity is None or Decimal(self.quantity) <= 0:
             raise ValidationError({"quantity": "Количество должно быть > 0."})
 
-        # ✅ цена продажи не ниже закупочной
+        # ✅ цена продажи (с учётом скидки) не ниже закупочной
         if self.product_id and self.unit_price is not None:
             purchase_price = getattr(self.product, "purchase_price", None) or Decimal("0")
-            if Decimal(str(self.unit_price)) < Decimal(str(purchase_price)):
+            qty = Decimal(str(self.quantity or 1))
+            line_disc = Decimal(str(getattr(self, "line_discount", None) or 0))
+            effective_unit = Decimal(str(self.unit_price)) - (line_disc / qty) if qty else Decimal(str(self.unit_price))
+            if effective_unit < Decimal(str(purchase_price)):
                 raise ValidationError({
                     "unit_price": f"Цена продажи не может быть ниже закупочной ({purchase_price}).",
                 })
@@ -1464,6 +1470,8 @@ class CartItem(models.Model):
             self.unit_price = self.product.price if self.product else Decimal("0")
         # На всякий случай нормализуем в денежный формат (2 знака)
         self.unit_price = _money(self.unit_price)
+        if hasattr(self, "line_discount"):
+            self.line_discount = _money(getattr(self, "line_discount", None) or Decimal("0.00"))
 
         self.full_clean()
         super().save(*args, **kwargs)
