@@ -1507,6 +1507,63 @@ class SalePayDebtAPIView(MarketCashierOnlyMixin, CompanyBranchRestrictedMixin, A
         return Response(SaleDetailSerializer(sale, context={"request": request}).data, status=status.HTTP_200_OK)
 
 
+class SaleReturnAPIView(MarketCashierOnlyMixin, CompanyBranchRestrictedMixin, APIView):
+    """
+    Возврат продажи (владелец и агент).
+    POST /api/main/pos/sales/<pk>/return/
+
+    Отменяет оплаченную или долговую продажу:
+    - для обычных продаж: возвращает товар на склад (Product.quantity)
+    - для агентских продаж: удаляет AgentSaleAllocation (товар снова у агента)
+    """
+
+    permission_classes = [permissions.IsAuthenticated]
+
+    @transaction.atomic
+    def post(self, request, pk, *args, **kwargs):
+        qs = (
+            Sale.objects.select_for_update()
+            .select_related("company", "branch", "user")
+            .prefetch_related("items__product", "agent_allocations")
+        )
+        qs = self._filter_qs_company_branch(qs)
+        sale = get_object_or_404(qs, id=pk)
+
+        if sale.status == Sale.Status.CANCELED:
+            return Response(
+                {"detail": "Продажа уже отменена."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if sale.status not in (Sale.Status.PAID, Sale.Status.DEBT):
+            return Response(
+                {"detail": "Возврат возможен только для оплаченных или долговых продаж."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        is_agent_sale = sale.agent_allocations.exists()
+
+        if is_agent_sale:
+            AgentSaleAllocation.objects.filter(sale=sale).delete()
+        else:
+            items = sale.items.filter(product_id__isnull=False).select_related("product")
+            for item in items:
+                qty = Decimal(str(item.quantity or 0))
+                if qty <= 0:
+                    continue
+                Product.objects.filter(pk=item.product_id).update(
+                    quantity=F("quantity") + qty
+                )
+
+        sale.status = Sale.Status.CANCELED
+        sale.save(update_fields=["status"])
+
+        sale.refresh_from_db()
+        return Response(
+            SaleDetailSerializer(sale, context={"request": request}).data,
+            status=status.HTTP_200_OK,
+        )
+
+
 class SaleMobileScannerTokenAPIView(MarketCashierOnlyMixin, APIView):
     permission_classes = [permissions.IsAuthenticated]
 

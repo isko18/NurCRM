@@ -1,12 +1,13 @@
 from datetime import date, datetime, timedelta
 from decimal import Decimal
 
-from django.db.models import Sum, Count, Value as V, F, DecimalField
+from django.db.models import Sum, Count, Value as V, F, DecimalField, Subquery, OuterRef, Q
 from django.db.models.functions import Coalesce, TruncDate, TruncWeek, TruncMonth
 from django.utils import timezone
 
 from apps.users.models import User
-from .models import ManufactureSubreal, Acceptance, Sale, SaleItem
+from apps.construction.models import CashFlow
+from .models import ManufactureSubreal, Acceptance, Sale, SaleItem, Debt, DebtPayment, Product
 
 
 # ─────────────────────────────────────────────────────────────
@@ -255,6 +256,100 @@ def build_owner_analytics_payload(*, company, branch, period, date_from, date_to
                 "percent": round(amt * 100.0 / sales_amount_float, 2),
             })
 
+    # ======================================================
+    # Gross profit (валовая прибыль): revenue - COGS
+    # ======================================================
+    items_agg = items_qs.aggregate(
+        revenue=Coalesce(
+            Sum(F("quantity") * F("unit_price"), output_field=MONEY_FIELD),
+            ZERO_MONEY,
+        ),
+        cogs=Coalesce(
+            Sum(
+                F("quantity") * Coalesce(F("purchase_price_snapshot"), V(Decimal("0"), output_field=MONEY_FIELD)),
+                output_field=MONEY_FIELD,
+            ),
+            ZERO_MONEY,
+        ),
+    )
+    revenue_dec = items_agg["revenue"] or Decimal("0.00")
+    cogs_dec = items_agg["cogs"] or Decimal("0.00")
+    gross_profit_dec = revenue_dec - cogs_dec
+
+    # ======================================================
+    # Stock value (стоимость склада): sum(quantity * purchase_price)
+    # ======================================================
+    products_qs = Product.objects.filter(company=company)
+    if branch is not None:
+        products_qs = products_qs.filter(Q(branch=branch) | Q(branch__isnull=True))
+    else:
+        products_qs = products_qs.filter(branch__isnull=True)
+    stock_value_dec = (
+        products_qs.aggregate(
+            v=Coalesce(
+                Sum(
+                    Coalesce(F("quantity"), V(Decimal("0"), output_field=QTY_FIELD))
+                    * F("purchase_price"),
+                    output_field=MONEY_FIELD,
+                ),
+                ZERO_MONEY,
+            )
+        )["v"]
+        or Decimal("0.00")
+    )
+
+    # ======================================================
+    # Total debt (общий долг): sum(amount - paid) per debt
+    # ======================================================
+    debts_qs = Debt.objects.filter(company=company)
+    if branch is not None:
+        debts_qs = debts_qs.filter(branch=branch)
+    else:
+        debts_qs = debts_qs.filter(branch__isnull=True)
+    paid_subq = (
+        DebtPayment.objects.filter(debt_id=OuterRef("pk"))
+        .values("debt_id")
+        .annotate(s=Sum("amount"))
+        .values("s")[:1]
+    )
+    total_debt_dec = (
+        debts_qs.annotate(paid=Coalesce(Subquery(paid_subq), V(Decimal("0"), output_field=MONEY_FIELD)))
+        .annotate(remaining=F("amount") - F("paid"))
+        .aggregate(t=Sum("remaining"))["t"]
+        or Decimal("0.00")
+    )
+
+    # ======================================================
+    # Expense breakdown (статья расходов): CashFlow by name
+    # ======================================================
+    cfqs = CashFlow.objects.filter(
+        company=company,
+        type=CashFlow.Type.EXPENSE,
+        status=CashFlow.Status.APPROVED,
+        created_at__gte=dt_from,
+        created_at__lt=dt_to_excl,
+    )
+    if branch is not None:
+        cfqs = cfqs.filter(Q(branch=branch) | Q(branch__isnull=True))
+    else:
+        cfqs = cfqs.filter(branch__isnull=True)
+    expense_breakdown_qs = (
+        cfqs.values("name")
+        .annotate(
+            total=Coalesce(Sum("amount"), ZERO_MONEY),
+            count=Count("id"),
+        )
+        .order_by("-total")
+    )
+    expense_breakdown = [
+        {
+            "name": r["name"] or "Без названия",
+            "total": _money_str(r["total"]),
+            "count": r["count"],
+        }
+        for r in expense_breakdown_qs
+    ]
+
     users_count = User.objects.filter(company=company).count()
 
     return {
@@ -271,6 +366,9 @@ def build_owner_analytics_payload(*, company, branch, period, date_from, date_to
             "items_transferred": items_transferred,
             "sales_count": sales_count,
             "sales_amount": _money_str(sales_amount_dec),
+            "gross_profit": _money_str(gross_profit_dec),
+            "stock_value": _money_str(stock_value_dec),
+            "total_debt": _money_str(total_debt_dec),
         },
         "charts": {
             "sales_by_date": sales_by_date,
@@ -279,5 +377,6 @@ def build_owner_analytics_payload(*, company, branch, period, date_from, date_to
             "top_users_by_sales": top_users_by_sales,
             "top_users_by_transfers": top_users_by_transfers,
             "sales_distribution_by_product": sales_distribution_by_product,
+            "expense_breakdown": expense_breakdown,
         },
     }
