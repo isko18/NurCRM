@@ -155,12 +155,18 @@ def add_item_to_cart(
 
     # вычисляем итоговую цену за 1 шт
     base_price = product.price or Decimal("0.00")
+    min_price = _money(getattr(product, "purchase_price", None) or Decimal("0.00"))
     if unit_price is not None:
         final_price = _money(unit_price)
     elif discount_total is not None:
         final_price = _money(max(Decimal("0.00"), base_price - discount_total))
     else:
         final_price = _money(base_price)
+
+    if final_price < min_price:
+        raise ValidationError(
+            f"Цена продажи не может быть ниже закупочной ({min_price})."
+        )
 
     item = (
         CartItem.objects
