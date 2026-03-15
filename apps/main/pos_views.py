@@ -1312,15 +1312,16 @@ class SaleAddItemAPIView(MarketCashierOnlyMixin, APIView):
         base_price = _q2(unit_price) if unit_price is not None else _q2(Decimal(str(product.price or 0)))
         disc_total = _q2(Decimal(str(line_discount))) if line_discount is not None else Decimal("0.00")
 
-        # Цена продажи (с учётом скидки) не ниже закупочной
-        min_price = _q2(Decimal(str(getattr(product, "purchase_price", None) or 0)))
-        qty_dec = Decimal(str(qty))
-        effective_unit = base_price - (disc_total / qty_dec) if qty_dec else base_price
-        if effective_unit < min_price:
-            return Response(
-                {"unit_price": f"Цена продажи не может быть ниже закупочной ({min_price})."},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
+        # Цена продажи не ниже закупочной, кроме случая со скидкой (со скидкой можно ниже)
+        if disc_total <= 0:
+            min_price = _q2(Decimal(str(getattr(product, "purchase_price", None) or 0)))
+            qty_dec = Decimal(str(qty))
+            effective_unit = base_price - (disc_total / qty_dec) if qty_dec else base_price
+            if effective_unit < min_price:
+                return Response(
+                    {"unit_price": f"Цена продажи не может быть ниже закупочной ({min_price})."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
 
         # Блокируем корзину для предотвращения race conditions
         cart = Cart.objects.select_for_update().get(id=cart.id)
@@ -1743,8 +1744,10 @@ class CartItemUpdateDestroyAPIView(MarketCashierOnlyMixin, APIView):
         raise Http404("CartItem not found in this cart.")
 
     def _apply_min_price(self, item, unit_price):
-        """Цена продажи не ниже закупочной: unit_price >= product.purchase_price."""
+        """Цена продажи не ниже закупочной. Со скидкой (line_discount > 0) можно ниже."""
         if not item.product_id:
+            return unit_price
+        if Decimal(str(getattr(item, "line_discount", None) or 0)) > 0:
             return unit_price
         min_price = _q2(Decimal(str(getattr(item.product, "purchase_price", None) or 0)))
         if unit_price < min_price:
@@ -1774,18 +1777,11 @@ class CartItemUpdateDestroyAPIView(MarketCashierOnlyMixin, APIView):
         unit_price = data.get("unit_price")
         line_discount = data.get("discount_total")
 
-        # Цена и скидка меняются независимо: unit_price — база, line_discount — скидка на строку
+        # Цена и скидка меняются независимо. Со скидкой можно продавать ниже закупочной.
         if unit_price is not None:
             item.unit_price = self._apply_min_price(item, _q2(unit_price))
         if line_discount is not None:
             item.line_discount = _q2(Decimal(str(line_discount)))
-            # Проверка: эффективная цена не ниже закупочной
-            if item.product_id:
-                qty_for_price = Decimal(str(item.quantity or 1))
-                effective = item.unit_price - (item.line_discount / qty_for_price) if qty_for_price else item.unit_price
-                min_price = _q2(Decimal(str(getattr(item.product, "purchase_price", None) or 0)))
-                if effective < min_price:
-                    item.line_discount = _q2(max(Decimal("0"), (item.unit_price - min_price) * qty_for_price))
 
         update_fields = []
         if qty is not None:
@@ -2154,15 +2150,16 @@ class AgentSaleAddItemAPIView(MarketCashierOnlyMixin, CompanyBranchRestrictedMix
         base_price = money(unit_price) if unit_price is not None else money(Decimal(str(product.price or 0)))
         disc_total = money(Decimal(str(line_discount))) if line_discount is not None else Decimal("0.00")
 
-        # Цена продажи (с учётом скидки) не ниже закупочной
-        min_price = money(Decimal(str(getattr(product, "purchase_price", None) or 0)))
-        qty_dec = Decimal(str(qty))
-        effective_unit = base_price - (disc_total / qty_dec) if qty_dec else base_price
-        if effective_unit < min_price:
-            return Response(
-                {"unit_price": f"Цена продажи не может быть ниже закупочной ({min_price})."},
-                status=400,
-            )
+        # Цена продажи не ниже закупочной, кроме случая со скидкой (со скидкой можно ниже)
+        if disc_total <= 0:
+            min_price = money(Decimal(str(getattr(product, "purchase_price", None) or 0)))
+            qty_dec = Decimal(str(qty))
+            effective_unit = base_price - (disc_total / qty_dec) if qty_dec else base_price
+            if effective_unit < min_price:
+                return Response(
+                    {"unit_price": f"Цена продажи не может быть ниже закупочной ({min_price})."},
+                    status=400,
+                )
 
         # Блокируем корзину для предотвращения race conditions
         cart = Cart.objects.select_for_update().get(id=cart.id)
@@ -2378,8 +2375,10 @@ class AgentCartItemUpdateDestroyAPIView(MarketCashierOnlyMixin, APIView):
         raise Http404("CartItem not found in this cart.")
 
     def _apply_min_price(self, item, unit_price):
-        """Цена продажи не ниже закупочной: unit_price >= product.purchase_price."""
+        """Цена продажи не ниже закупочной. Со скидкой (line_discount > 0) можно ниже."""
         if not item.product_id:
+            return unit_price
+        if Decimal(str(getattr(item, "line_discount", None) or 0)) > 0:
             return unit_price
         min_price = _q2(Decimal(str(getattr(item.product, "purchase_price", None) or 0)))
         if unit_price < min_price:
@@ -2409,18 +2408,11 @@ class AgentCartItemUpdateDestroyAPIView(MarketCashierOnlyMixin, APIView):
         unit_price = data.get("unit_price")
         line_discount = data.get("discount_total")
 
-        # Цена и скидка меняются независимо: unit_price — база, line_discount — скидка на строку
+        # Цена и скидка меняются независимо. Со скидкой можно продавать ниже закупочной.
         if unit_price is not None:
             item.unit_price = self._apply_min_price(item, _q2(unit_price))
         if line_discount is not None:
             item.line_discount = _q2(Decimal(str(line_discount)))
-            # Проверка: эффективная цена не ниже закупочной
-            if item.product_id:
-                qty_for_price = Decimal(str(item.quantity or 1))
-                effective = item.unit_price - (item.line_discount / qty_for_price) if qty_for_price else item.unit_price
-                min_price = _q2(Decimal(str(getattr(item.product, "purchase_price", None) or 0)))
-                if effective < min_price:
-                    item.line_discount = _q2(max(Decimal("0"), (item.unit_price - min_price) * qty_for_price))
 
         update_fields = []
         if qty is not None:

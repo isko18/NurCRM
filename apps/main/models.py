@@ -1459,16 +1459,17 @@ class CartItem(models.Model):
         if self.quantity is None or Decimal(self.quantity) <= 0:
             raise ValidationError({"quantity": "Количество должно быть > 0."})
 
-        # ✅ цена продажи (с учётом скидки) не ниже закупочной
+        # ✅ цена продажи не ниже закупочной, кроме случая со скидкой (со скидкой можно ниже)
         if self.product_id and self.unit_price is not None:
-            purchase_price = getattr(self.product, "purchase_price", None) or Decimal("0")
-            qty = Decimal(str(self.quantity or 1))
             line_disc = Decimal(str(getattr(self, "line_discount", None) or 0))
-            effective_unit = Decimal(str(self.unit_price)) - (line_disc / qty) if qty else Decimal(str(self.unit_price))
-            if effective_unit < Decimal(str(purchase_price)):
-                raise ValidationError({
-                    "unit_price": f"Цена продажи не может быть ниже закупочной ({purchase_price}).",
-                })
+            if line_disc <= 0:
+                purchase_price = getattr(self.product, "purchase_price", None) or Decimal("0")
+                qty = Decimal(str(self.quantity or 1))
+                effective_unit = Decimal(str(self.unit_price)) - (line_disc / qty) if qty else Decimal(str(self.unit_price))
+                if effective_unit < Decimal(str(purchase_price)):
+                    raise ValidationError({
+                        "unit_price": f"Цена продажи не может быть ниже закупочной ({purchase_price}).",
+                    })
 
     def save(self, *args, **kwargs):
         if self.cart_id:

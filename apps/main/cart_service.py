@@ -156,8 +156,9 @@ def add_item_to_cart(
     base_price = _money(unit_price) if unit_price is not None else _money(product.price or Decimal("0.00"))
     line_disc = _money(discount_total) if discount_total is not None else Decimal("0.00")
 
-    min_price = _money(getattr(product, "purchase_price", None) or Decimal("0.00"))
-    if quantity:
+    # Со скидкой можно продавать ниже закупочной
+    if line_disc <= 0 and quantity:
+        min_price = _money(getattr(product, "purchase_price", None) or Decimal("0.00"))
         effective = base_price - (line_disc / int(quantity))
         if effective < min_price:
             raise ValidationError(
