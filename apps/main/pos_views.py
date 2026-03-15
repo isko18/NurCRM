@@ -1301,12 +1301,12 @@ class SaleAddItemAPIView(MarketCashierOnlyMixin, APIView):
             else:
                 calculated_unit_price = product.price
 
-        # Цена продажи не ниже цены товара (можно выше, нельзя ниже)
-        min_price = _q2(Decimal(str(product.price or 0)))
+        # Цена продажи не ниже закупочной (можно выше, нельзя ниже)
+        min_price = _q2(Decimal(str(getattr(product, "purchase_price", None) or 0)))
         final_unit_price = _q2(calculated_unit_price or unit_price)
         if final_unit_price < min_price:
             return Response(
-                {"unit_price": f"Цена продажи не может быть ниже цены товара ({min_price})."},
+                {"unit_price": f"Цена продажи не может быть ниже закупочной ({min_price})."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
@@ -1727,10 +1727,10 @@ class CartItemUpdateDestroyAPIView(MarketCashierOnlyMixin, APIView):
         raise Http404("CartItem not found in this cart.")
 
     def _apply_min_price(self, item, unit_price):
-        """Цена продажи не ниже цены товара: unit_price >= product.price."""
+        """Цена продажи не ниже закупочной: unit_price >= product.purchase_price."""
         if not item.product_id:
             return unit_price
-        min_price = _q2(Decimal(str(item.product.price or 0)))
+        min_price = _q2(Decimal(str(getattr(item.product, "purchase_price", None) or 0)))
         if unit_price < min_price:
             return min_price
         return unit_price
@@ -1765,17 +1765,20 @@ class CartItemUpdateDestroyAPIView(MarketCashierOnlyMixin, APIView):
 
         if unit_price is not None or line_discount is not None:
             qty_for_price = Decimal(str(item.quantity or 1))
+            min_price = _q2(Decimal(str(getattr(item.product, "purchase_price", None) or 0))) if item.product_id else Decimal("0")
             if unit_price is not None:
                 new_price = _q2(unit_price)
                 new_price = self._apply_min_price(item, new_price)
             else:
-                # discount_total: скидка применяется, min_price не блокирует (продажа со скидкой)
+                # discount_total: скидка применяется, но не ниже закупочной
                 per_unit_disc = _q2(Decimal(str(line_discount)) / qty_for_price)
                 new_price = _q2(
                     Decimal(str(item.product.price if item.product_id else 0)) - per_unit_disc
                 )
                 if new_price < 0:
                     new_price = Decimal("0.00")
+                if new_price < min_price:
+                    new_price = min_price
             item.unit_price = new_price
 
         update_fields = []
@@ -2152,12 +2155,12 @@ class AgentSaleAddItemAPIView(MarketCashierOnlyMixin, CompanyBranchRestrictedMix
             else:
                 calculated_unit_price = product.price
 
-        # Цена продажи не ниже цены товара (можно выше, нельзя ниже)
-        min_price = money(Decimal(str(product.price or 0)))
+        # Цена продажи не ниже закупочной (можно выше, нельзя ниже)
+        min_price = money(Decimal(str(getattr(product, "purchase_price", None) or 0)))
         final_unit_price = money(calculated_unit_price or unit_price)
         if final_unit_price < min_price:
             return Response(
-                {"unit_price": f"Цена продажи не может быть ниже цены товара ({min_price})."},
+                {"unit_price": f"Цена продажи не может быть ниже закупочной ({min_price})."},
                 status=400,
             )
 
@@ -2371,10 +2374,10 @@ class AgentCartItemUpdateDestroyAPIView(MarketCashierOnlyMixin, APIView):
         raise Http404("CartItem not found in this cart.")
 
     def _apply_min_price(self, item, unit_price):
-        """Цена продажи не ниже цены товара: unit_price >= product.price."""
+        """Цена продажи не ниже закупочной: unit_price >= product.purchase_price."""
         if not item.product_id:
             return unit_price
-        min_price = _q2(Decimal(str(item.product.price or 0)))
+        min_price = _q2(Decimal(str(getattr(item.product, "purchase_price", None) or 0)))
         if unit_price < min_price:
             return min_price
         return unit_price
@@ -2409,17 +2412,20 @@ class AgentCartItemUpdateDestroyAPIView(MarketCashierOnlyMixin, APIView):
 
         if unit_price is not None or line_discount is not None:
             qty_for_price = Decimal(str(item.quantity or 1))
+            min_price = _q2(Decimal(str(getattr(item.product, "purchase_price", None) or 0))) if item.product_id else Decimal("0")
             if unit_price is not None:
                 new_price = _q2(unit_price)
                 new_price = self._apply_min_price(item, new_price)
             else:
-                # discount_total: скидка применяется, min_price не блокирует (продажа со скидкой)
+                # discount_total: скидка применяется, но не ниже закупочной
                 per_unit_disc = _q2(Decimal(str(line_discount)) / qty_for_price)
                 new_price = _q2(
                     Decimal(str(item.product.price if item.product_id else 0)) - per_unit_disc
                 )
                 if new_price < 0:
                     new_price = Decimal("0.00")
+                if new_price < min_price:
+                    new_price = min_price
             item.unit_price = new_price
 
         update_fields = []
