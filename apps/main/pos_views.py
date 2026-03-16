@@ -1584,12 +1584,9 @@ class AgentSaleReturnAPIView(SaleReturnAPIView):
         if not allowed_qs.exists():
             raise Http404("Продажа не найдена или не принадлежит агенту.")
 
-        sale = (
-            Sale.objects.select_for_update()
-            .select_related("company", "branch", "user")
-            .prefetch_related("items__product", "agent_allocations")
-            .get(id=pk)
-        )
+        # Важно: блокируем только саму Sale без join'ов, чтобы избежать
+        # ошибок БД вида "FOR UPDATE cannot be applied to the nullable side of an outer join".
+        sale = Sale.objects.select_for_update().get(id=pk)
 
         if sale.status == Sale.Status.CANCELED:
             return Response(
