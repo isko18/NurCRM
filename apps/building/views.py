@@ -452,7 +452,7 @@ class ResidentialComplexApartmentListCreateView(CompanyQuerysetMixin, generics.L
         "treaties__client"
     )
     filter_backends = [DjangoFilterBackend, filters.SearchFilter]
-    filterset_fields = ["residential_complex", "floor", "status"]
+    filterset_fields = {"residential_complex": ["exact"], "floor": ["exact"], "status": ["exact"], "block": ["exact", "in"]}
     search_fields = ["number", "notes"]
 
     def get_queryset(self):
@@ -548,6 +548,50 @@ class ResidentialComplexFloorsView(CompanyQuerysetMixin, generics.GenericAPIView
                 sold=Count("id", filter=Q(status=ResidentialComplexApartment.Status.SOLD)),
             )
             .order_by("floor")
+        )
+        return Response(list(qs), status=status.HTTP_200_OK)
+
+
+class ResidentialComplexBlocksStatsView(CompanyQuerysetMixin, generics.GenericAPIView):
+    """
+    Статистика по блокам (аналогично этажам):
+    GET /api/building/objects/<uuid:pk>/blocks/stats/
+    """
+
+    permission_classes = [permissions.IsAuthenticated]
+    queryset = ResidentialComplex.objects.all()
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        user = self.request.user
+        if user.is_authenticated and getattr(user, "company_id", None):
+            qs = qs.filter(company_id=user.company_id)
+            allowed_ids = _allowed_residential_complex_ids(user)
+            if allowed_ids is not None:
+                qs = qs.filter(id__in=allowed_ids)
+            return qs
+        if not getattr(user, "is_staff", False) and not getattr(user, "is_superuser", False):
+            return qs.none()
+        return qs
+
+    def get(self, request, pk=None):
+        user = request.user
+        if not (_is_owner_like(user) or getattr(user, "can_view_building_treaty", False)):
+            raise PermissionDenied("Нет прав на продажи/договора (Building).")
+
+        rc = self.get_object()
+        qs = (
+            ResidentialComplexApartment.objects.filter(residential_complex=rc)
+            .exclude(block__isnull=True)
+            .exclude(block__exact="")
+            .values("block")
+            .annotate(
+                total=Count("id"),
+                available=Count("id", filter=Q(status=ResidentialComplexApartment.Status.AVAILABLE)),
+                reserved=Count("id", filter=Q(status=ResidentialComplexApartment.Status.RESERVED)),
+                sold=Count("id", filter=Q(status=ResidentialComplexApartment.Status.SOLD)),
+            )
+            .order_by("block")
         )
         return Response(list(qs), status=status.HTTP_200_OK)
 

@@ -833,7 +833,7 @@ class Counterparty(models.Model):
         verbose_name="Агент",
     )
     name = models.CharField(max_length=255, verbose_name="Название")
-    phone = models.CharField(max_length=32, verbose_name="Телефон")
+    phone = models.CharField(max_length=32, verbose_name="Телефон", blank=True, default="")
     type = models.CharField(max_length=16, choices=Type.choices, default=Type.BOTH, verbose_name="Тип")
 
     class Meta:
