@@ -592,6 +592,17 @@ class ResidentialComplexApartment(models.Model):
     floor = models.IntegerField(verbose_name="Этаж")
     number = models.CharField(max_length=32, verbose_name="Номер квартиры")
 
+    # Блок/подъезд/секция — вводится вручную, отдельной сущности не создаём.
+    block = models.CharField(max_length=64, null=True, blank=True, db_index=True, verbose_name="Блок")
+    block_normalized = models.CharField(
+        max_length=64,
+        null=True,
+        blank=True,
+        db_index=True,
+        verbose_name="Блок (норм.)",
+        help_text="Для устойчивой фильтрации (lowercase/trim). Заполняется автоматически.",
+    )
+
     rooms = models.PositiveSmallIntegerField(null=True, blank=True, verbose_name="Кол-во комнат")
     area = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True, verbose_name="Площадь (м²)")
     price = models.DecimalField(max_digits=16, decimal_places=2, default=Decimal("0.00"), verbose_name="Цена")
@@ -625,6 +636,15 @@ class ResidentialComplexApartment(models.Model):
 
     def __str__(self):
         return f"Кв. {self.number}, {self.floor} этаж ({self.residential_complex.name})"
+
+    def save(self, *args, **kwargs):
+        if self.block is not None:
+            b = (self.block or "").strip()
+            self.block = b or None
+            self.block_normalized = (b.lower() if b else None)
+        else:
+            self.block_normalized = None
+        super().save(*args, **kwargs)
 
 
 # -----------------------

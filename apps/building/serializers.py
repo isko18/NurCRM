@@ -211,6 +211,7 @@ class ResidentialComplexApartmentSerializer(serializers.ModelSerializer):
             "residential_complex_name",
             "floor",
             "number",
+            "block",
             "rooms",
             "area",
             "price",
