@@ -14,6 +14,7 @@ from django.db.models.functions import Coalesce
 from django.utils import timezone
 from django.contrib.auth import get_user_model
 from rest_framework.pagination import PageNumberPagination
+from uuid import UUID
 
 from apps.users.models import Branch
 
@@ -951,6 +952,13 @@ class AgentMyProductsListAPIView(CompanyBranchRestrictedMixin, APIView):
     def get(self, request, *args, **kwargs):
         user = request.user
         company = self._company()
+        product_group_raw = (request.query_params.get("product_group") or "").strip()
+        product_group_id = None
+        if product_group_raw:
+            try:
+                product_group_id = UUID(product_group_raw)
+            except Exception:
+                raise ValidationError({"product_group": "Неверный UUID."})
         # Пытаемся найти настройку общего доступа к складу для агента.
         # Не ограничиваемся только "текущей" компанией, чтобы работать
         # даже если у пользователя несколько компаний/ролей.
@@ -973,6 +981,8 @@ class AgentMyProductsListAPIView(CompanyBranchRestrictedMixin, APIView):
                 .select_related("product_group", "category")
                 .only("id", "name", "article", "unit", "price", "quantity", "warehouse_id", "created_date", "updated_date", "product_group_id", "category_id")
             )
+            if product_group_id:
+                prod_qs = prod_qs.filter(product_group_id=product_group_id)
             # Поиск по товарам общего склада
             search = (request.query_params.get("search") or "").strip()
             if search:
@@ -1012,6 +1022,8 @@ class AgentMyProductsListAPIView(CompanyBranchRestrictedMixin, APIView):
             .annotate(last_movement_at=Subquery(move_subq))
         )
         qs = self._filter_qs_company_branch_relaxed(qs)
+        if product_group_id:
+            qs = qs.filter(product__product_group_id=product_group_id)
         # Поиск по товарам агента
         search = (request.query_params.get("search") or "").strip()
         if search:
