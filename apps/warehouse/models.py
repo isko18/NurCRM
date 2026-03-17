@@ -1192,13 +1192,17 @@ class DocumentItem(models.Model):
                         raise ValidationError({"product": "Товар должен принадлежать складу-источнику перемещения."})
 
             if doc.agent_id and doc.warehouse_from_id:
-                has_balance = AgentStockBalance.objects.filter(
-                    agent_id=doc.agent_id,
-                    warehouse_id=doc.warehouse_from_id,
-                    product_id=self.product_id,
-                ).exists()
-                if not has_balance:
-                    raise ValidationError({"product": "Товар отсутствует в остатках агента."})
+                # Для документов агента возможны два режима списания:
+                # - use_common_stock=True: списываем со склада (общий товар) — не требуем AgentStockBalance
+                # - use_common_stock=False: списываем с остатков агента — требуем AgentStockBalance
+                if not bool(getattr(doc, "use_common_stock", False)):
+                    has_balance = AgentStockBalance.objects.filter(
+                        agent_id=doc.agent_id,
+                        warehouse_id=doc.warehouse_from_id,
+                        product_id=self.product_id,
+                    ).exists()
+                    if not has_balance:
+                        raise ValidationError({"product": "Товар отсутствует в остатках агента."})
 
         # integral check for PCS
         try:
