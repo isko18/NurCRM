@@ -79,6 +79,9 @@ from .views import (
     BuildingTreatyFileAddView,
     BuildingTreatyErpCreateView,
     BuildingTreatyInstallmentPaymentView,
+    BuildingTreatyGroupListCreateView,
+    BuildingTreatyGroupDetailView,
+    BuildingTreatyMoveView,
     BuildingTaskListCreateView,
     BuildingTaskDetailView,
     BuildingTaskFileAddView,
@@ -99,6 +102,16 @@ from .views import (
     AdvanceRequestApproveView,
     AdvanceRequestRejectView,
     BuildingPayrollPaymentApproveView,
+    BuildingWorkEntryWarehouseReceiptsView,
+    BuildingWorkEntryAcceptanceView,
+    BuildingWorkEntryAcceptanceFileAddView,
+    BuildingDebtsLedgerListCreateView,
+    BuildingDebtsLedgerFileAddView,
+    BuildingDebtsSummaryView,
+    BuildingDebtsCounterpartySummaryView,
+    BuildingBarterItemsUpsertView,
+    BuildingBarterItemDetailView,
+    BuildingBarterFileAddView,
 )
 
 app_name = "building"
@@ -203,11 +216,36 @@ urlpatterns = [
     path("treaties/<uuid:pk>/", BuildingTreatyDetailView.as_view(), name="building-treaty-detail"),
     path("treaties/<uuid:pk>/files/", BuildingTreatyFileAddView.as_view(), name="building-treaty-file-add"),
     path("treaties/<uuid:pk>/erp/create/", BuildingTreatyErpCreateView.as_view(), name="building-treaty-erp-create"),
+    path("treaties/move/", BuildingTreatyMoveView.as_view(), name="building-treaty-move"),
     path(
         "treaty-installments/<uuid:pk>/payments/",
         BuildingTreatyInstallmentPaymentView.as_view(),
         name="building-treaty-installment-payments",
     ),
+
+    # treaty groups (folders)
+    path("treaty-groups/", BuildingTreatyGroupListCreateView.as_view(), name="building-treaty-group-list-create"),
+    path("treaty-groups/<uuid:pk>/", BuildingTreatyGroupDetailView.as_view(), name="building-treaty-group-detail"),
+
+    # debts ledger
+    path("debts/ledger/", BuildingDebtsLedgerListCreateView.as_view(), name="building-debts-ledger"),
+    path("debts/ledger/<uuid:pk>/files/", BuildingDebtsLedgerFileAddView.as_view(), name="building-debts-ledger-files"),
+    path("debts/summary/", BuildingDebtsSummaryView.as_view(), name="building-debts-summary"),
+    path(
+        "debts/summary/<str:counterparty_type>/<uuid:counterparty_id>/",
+        BuildingDebtsCounterpartySummaryView.as_view(),
+        name="building-debts-summary-counterparty",
+    ),
+
+    # work entry: warehouse receipts + acceptance (AVR)
+    path("work-entries/<uuid:pk>/warehouse-receipts/", BuildingWorkEntryWarehouseReceiptsView.as_view(), name="building-work-entry-warehouse-receipts"),
+    path("work-entries/<uuid:pk>/acceptance/", BuildingWorkEntryAcceptanceView.as_view(), name="building-work-entry-acceptance"),
+    path("work-entry-acceptance/<uuid:pk>/files/", BuildingWorkEntryAcceptanceFileAddView.as_view(), name="building-work-entry-acceptance-files"),
+
+    # barter
+    path("barter/<str:source_type>/<uuid:source_id>/items/", BuildingBarterItemsUpsertView.as_view(), name="building-barter-items-upsert"),
+    path("barter/items/<uuid:pk>/", BuildingBarterItemDetailView.as_view(), name="building-barter-item-detail"),
+    path("barter/<str:source_type>/<uuid:source_id>/files/", BuildingBarterFileAddView.as_view(), name="building-barter-files"),
 
     # tasks / reminders
     path("tasks/", BuildingTaskListCreateView.as_view(), name="building-task-list-create"),

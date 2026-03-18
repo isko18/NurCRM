@@ -21,6 +21,7 @@ from .models import (
     BuildingWarehouseStockMove,
     BuildingWorkflowEvent,
     BuildingTreaty,
+    BuildingDebtLedgerEntry,
     ResidentialComplexWarehouse,
 )
 
@@ -346,6 +347,28 @@ def accept_transfer(transfer: BuildingTransferRequest, actor, note: str = ""):
     old_proc_status = procurement.status
     procurement.status = BuildingProcurementRequest.Status.TRANSFERRED
     procurement.save(update_fields=["status", "updated_at"])
+
+    # Закупка "в долг": создаём запись долга (мы должны поставщику)
+    try:
+        if (getattr(procurement, "payment_mode", None) in ("debt", "mixed")) and procurement.supplier_id and procurement.total_amount:
+            BuildingDebtLedgerEntry.objects.create(
+                company_id=procurement.residential_complex.company_id,
+                direction=BuildingDebtLedgerEntry.Direction.PAYABLE,
+                counterparty_type=BuildingDebtLedgerEntry.CounterpartyType.SUPPLIER,
+                counterparty_id=procurement.supplier_id,
+                entry_type=BuildingDebtLedgerEntry.EntryType.CHARGE,
+                amount=procurement.total_amount,
+                currency="KGS",
+                status=BuildingDebtLedgerEntry.Status.APPROVED,
+                residential_complex=procurement.residential_complex,
+                source_type="procurement",
+                source_id=procurement.id,
+                comment=f"Закупка в долг: {procurement.title or procurement.id}",
+                occurred_at=timezone.now(),
+                created_by=actor,
+            )
+    except Exception:
+        pass
 
     log_event(
         action="transfer_accepted",

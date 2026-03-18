@@ -49,10 +49,18 @@ from .models import (
     BuildingTreatyNumberSequence,
     BuildingTreaty,
     BuildingTreatyInstallment,
+    BuildingTreatyInstallmentPayment,
+    BuildingTreatyGroup,
     BuildingTreatyFile,
+    BuildingDebtLedgerEntry,
+    BuildingDebtLedgerFile,
+    BuildingBarterItem,
+    BuildingBarterFile,
     BuildingWorkEntry,
     BuildingWorkEntryPhoto,
     BuildingWorkEntryFile,
+    BuildingWorkEntryAcceptance,
+    BuildingWorkEntryAcceptanceFile,
     BuildingTask,
     BuildingTaskAssignee,
     BuildingTaskChecklistItem,
@@ -644,7 +652,7 @@ class BuildingWarehouseMovementSerializer(serializers.ModelSerializer):
         model = BuildingWarehouseMovement
         fields = [
             "id", "company", "warehouse", "warehouse_name", "movement_type",
-            "contractor", "work_entry", "reason", "items", "files",
+            "contractor", "work_entry", "warehouse_request", "issued_to", "reason", "items", "files",
             "created_by", "created_at",
         ]
         read_only_fields = ["id", "created_at"]
@@ -661,6 +669,7 @@ class BuildingWarehouseMovementWriteOffSerializer(serializers.Serializer):
 class BuildingWarehouseMovementTransferSerializer(serializers.Serializer):
     warehouse = serializers.UUIDField()
     warehouse_request = serializers.UUIDField(required=False, allow_null=True)
+    issued_to = serializers.CharField(required=False, allow_blank=True, allow_null=True)
     items = serializers.ListField(child=serializers.DictField())
     comment = serializers.CharField(required=False, allow_blank=True)
     # contractor or work_entry / warehouse_request - one of them required for transfer
@@ -860,6 +869,11 @@ class BuildingProcurementSerializer(serializers.ModelSerializer):
             "initiator_display",
             "title",
             "comment",
+            "payment_mode",
+            "treaty",
+            "treaty_auto_create",
+            "treaty_type",
+            "treaty_title",
             "status",
             "total_amount",
             "submitted_to_cash_at",
@@ -1102,11 +1116,14 @@ class BuildingTreatySerializer(serializers.ModelSerializer):
             "title",
             "description",
             "amount",
+            "treaty_type",
             "apartment",
             "apartment_number",
             "apartment_floor",
             "operation_type",
             "payment_type",
+            "payment_mode",
+            "group",
             "down_payment",
             "payment_terms",
             "status",
@@ -1383,6 +1400,191 @@ class BuildingTreatyInstallmentPaymentCreateSerializer(serializers.Serializer):
     amount = serializers.DecimalField(max_digits=16, decimal_places=2)
     cashbox = serializers.UUIDField(required=True)
     paid_at = serializers.DateTimeField(required=False)
+    external_payment_id = serializers.CharField(required=False, allow_blank=True, allow_null=True)
+
+
+class BuildingTreatyGroupSerializer(serializers.ModelSerializer):
+    children = serializers.SerializerMethodField(read_only=True)
+
+    class Meta:
+        model = BuildingTreatyGroup
+        fields = ["id", "company", "residential_complex", "parent", "title", "order", "is_active", "children", "created_at", "updated_at"]
+        read_only_fields = ["id", "company", "children", "created_at", "updated_at"]
+
+    def get_children(self, obj):
+        rel = getattr(obj, "children", None)
+        if rel is None:
+            return []
+        qs = rel.all().order_by("order", "title")
+        return BuildingTreatyGroupSerializer(qs, many=True, context=self.context).data
+
+
+class BuildingTreatyGroupCreateUpdateSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = BuildingTreatyGroup
+        fields = ["id", "residential_complex", "parent", "title", "order", "is_active"]
+        read_only_fields = ["id"]
+
+
+class BuildingTreatyMoveSerializer(serializers.Serializer):
+    treaty_ids = serializers.ListField(child=serializers.UUIDField(), allow_empty=False)
+    target_group = serializers.UUIDField(allow_null=True, required=False)
+
+
+class BuildingDebtLedgerFileSerializer(serializers.ModelSerializer):
+    file_url = serializers.SerializerMethodField(read_only=True)
+
+    class Meta:
+        model = BuildingDebtLedgerFile
+        fields = ["id", "file", "file_url", "title", "created_at"]
+        read_only_fields = ["id", "created_at", "file_url"]
+
+    def get_file_url(self, obj):
+        request = self.context.get("request")
+        if not getattr(obj, "file", None):
+            return None
+        url = obj.file.url
+        return request.build_absolute_uri(url) if request else url
+
+
+class BuildingDebtLedgerEntrySerializer(serializers.ModelSerializer):
+    files = BuildingDebtLedgerFileSerializer(many=True, read_only=True)
+
+    class Meta:
+        model = BuildingDebtLedgerEntry
+        fields = [
+            "id",
+            "company",
+            "direction",
+            "counterparty_type",
+            "counterparty_id",
+            "entry_type",
+            "amount",
+            "currency",
+            "status",
+            "residential_complex",
+            "source_type",
+            "source_id",
+            "comment",
+            "occurred_at",
+            "created_by",
+            "created_at",
+            "updated_at",
+            "files",
+        ]
+        read_only_fields = ["id", "company", "created_by", "created_at", "updated_at", "files"]
+
+
+class BuildingDebtLedgerEntryCreateSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = BuildingDebtLedgerEntry
+        fields = [
+            "direction",
+            "counterparty_type",
+            "counterparty_id",
+            "entry_type",
+            "amount",
+            "currency",
+            "status",
+            "residential_complex",
+            "source_type",
+            "source_id",
+            "comment",
+            "occurred_at",
+        ]
+
+
+class BuildingDebtLedgerFileCreateSerializer(serializers.Serializer):
+    file = serializers.FileField(required=True)
+    title = serializers.CharField(required=False, allow_blank=True)
+
+
+class BuildingBarterItemSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = BuildingBarterItem
+        fields = [
+            "id",
+            "company",
+            "title",
+            "quantity",
+            "unit",
+            "unit_price",
+            "total_price",
+            "currency",
+            "comment",
+            "source_type",
+            "source_id",
+            "created_at",
+            "updated_at",
+        ]
+        read_only_fields = ["id", "company", "created_at", "updated_at"]
+
+
+class BuildingBarterItemUpsertSerializer(serializers.Serializer):
+    title = serializers.CharField()
+    quantity = serializers.DecimalField(max_digits=16, decimal_places=3, required=False, allow_null=True)
+    unit = serializers.CharField(required=False, allow_blank=True, allow_null=True)
+    unit_price = serializers.DecimalField(max_digits=16, decimal_places=2, required=False, allow_null=True)
+    total_price = serializers.DecimalField(max_digits=16, decimal_places=2)
+    currency = serializers.CharField(required=False, allow_blank=True, allow_null=True)
+    comment = serializers.CharField(required=False, allow_blank=True, allow_null=True)
+
+
+class BuildingBarterFileSerializer(serializers.ModelSerializer):
+    file_url = serializers.SerializerMethodField(read_only=True)
+
+    class Meta:
+        model = BuildingBarterFile
+        fields = ["id", "file", "file_url", "title", "created_at", "source_type", "source_id"]
+        read_only_fields = ["id", "created_at", "file_url"]
+
+    def get_file_url(self, obj):
+        request = self.context.get("request")
+        if not getattr(obj, "file", None):
+            return None
+        url = obj.file.url
+        return request.build_absolute_uri(url) if request else url
+
+
+class BuildingBarterFileCreateSerializer(serializers.Serializer):
+    file = serializers.FileField(required=True)
+    title = serializers.CharField(required=False, allow_blank=True)
+
+
+class BuildingWorkEntryAcceptanceFileSerializer(serializers.ModelSerializer):
+    file_url = serializers.SerializerMethodField(read_only=True)
+
+    class Meta:
+        model = BuildingWorkEntryAcceptanceFile
+        fields = ["id", "file", "file_url", "title", "created_at"]
+        read_only_fields = ["id", "created_at", "file_url"]
+
+    def get_file_url(self, obj):
+        request = self.context.get("request")
+        if not getattr(obj, "file", None):
+            return None
+        url = obj.file.url
+        return request.build_absolute_uri(url) if request else url
+
+
+class BuildingWorkEntryAcceptanceSerializer(serializers.ModelSerializer):
+    files = BuildingWorkEntryAcceptanceFileSerializer(many=True, read_only=True)
+
+    class Meta:
+        model = BuildingWorkEntryAcceptance
+        fields = ["id", "work_entry", "status", "comment", "created_at", "signed_at", "files"]
+        read_only_fields = ["id", "work_entry", "created_at", "files"]
+
+
+class BuildingWorkEntryAcceptanceUpsertSerializer(serializers.Serializer):
+    status = serializers.ChoiceField(choices=BuildingWorkEntryAcceptance.Status.choices, required=False)
+    comment = serializers.CharField(required=False, allow_blank=True)
+    signed_at = serializers.DateTimeField(required=False, allow_null=True)
+
+
+class BuildingWorkEntryAcceptanceFileCreateSerializer(serializers.Serializer):
+    file = serializers.FileField(required=True)
+    title = serializers.CharField(required=False, allow_blank=True)
 
 
 class BuildingTaskChecklistItemSerializer(serializers.ModelSerializer):
@@ -1970,6 +2172,10 @@ class BuildingWorkEntrySerializer(serializers.ModelSerializer):
             "client_name",
             "treaty",
             "treaty_number",
+            "payment_mode",
+            "treaty_auto_create",
+            "treaty_type",
+            "treaty_title",
             "created_by",
             "created_by_display",
             "category",
