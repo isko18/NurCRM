@@ -37,6 +37,7 @@ import qrcode
 from apps.users.models import Roles, User, Company
 from apps.main.models import Cart, CartItem, Sale, Product, MobileScannerToken, Client
 from apps.main.models import ManufactureSubreal, AgentSaleAllocation
+from apps.main.cache_utils import invalidate_cache_pattern
 from apps.main.services import checkout_cart, NotEnoughStock
 from apps.main.services_agent_pos import checkout_agent_cart, AgentNotEnoughStock
 from apps.main.utils_numbers import ensure_sale_doc_number
@@ -1557,6 +1558,12 @@ class SaleReturnAPIView(MarketCashierOnlyMixin, CompanyBranchRestrictedMixin, AP
         sale.status = Sale.Status.CANCELED
         sale.save(update_fields=["status"])
 
+        # Инвалидируем кэши аналитики/списков, чтобы цифры обновлялись сразу после возврата.
+        # (market analytics кэшируется по ключам nurcrm:analytics:market:... )
+        invalidate_cache_pattern(f"analytics:market:{sale.company_id}:")
+        # списки товаров/остатков тоже могут быть кэшированы
+        invalidate_cache_pattern(f"products:list:{sale.company_id}:")
+
         sale.refresh_from_db()
         return Response(
             SaleDetailSerializer(sale, context={"request": request}).data,
@@ -1614,6 +1621,8 @@ class AgentSaleReturnAPIView(SaleReturnAPIView):
 
         sale.status = Sale.Status.CANCELED
         sale.save(update_fields=["status"])
+        invalidate_cache_pattern(f"analytics:market:{sale.company_id}:")
+        invalidate_cache_pattern(f"products:list:{sale.company_id}:")
         sale.refresh_from_db()
         return Response(
             SaleDetailSerializer(sale, context={"request": request}).data,
