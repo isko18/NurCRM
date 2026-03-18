@@ -51,10 +51,18 @@ from .models import (
     BuildingTaskFile,
     BuildingTreaty,
     BuildingTreatyInstallment,
+    BuildingTreatyInstallmentPayment,
+    BuildingTreatyGroup,
     BuildingTreatyFile,
+    BuildingDebtLedgerEntry,
+    BuildingDebtLedgerFile,
+    BuildingBarterItem,
+    BuildingBarterFile,
     BuildingWorkEntry,
     BuildingWorkEntryPhoto,
     BuildingWorkEntryFile,
+    BuildingWorkEntryAcceptance,
+    BuildingWorkEntryAcceptanceFile,
     BuildingTask,
     BuildingTaskChecklistItem,
     BuildingEmployeeCompensation,
@@ -88,9 +96,23 @@ from .serializers import (
     BuildingTreatyInstallmentSerializer,
     BuildingTreatyInstallmentPaymentCreateSerializer,
     BuildingTreatyFileCreateSerializer,
+    BuildingTreatyGroupSerializer,
+    BuildingTreatyGroupCreateUpdateSerializer,
+    BuildingTreatyMoveSerializer,
+    BuildingDebtLedgerEntrySerializer,
+    BuildingDebtLedgerEntryCreateSerializer,
+    BuildingDebtLedgerFileCreateSerializer,
+    BuildingBarterItemSerializer,
+    BuildingBarterItemUpsertSerializer,
+    BuildingBarterFileSerializer,
+    BuildingBarterFileCreateSerializer,
     BuildingWorkEntrySerializer,
     BuildingWorkEntryPhotoCreateSerializer,
     BuildingWorkEntryFileCreateSerializer,
+    BuildingWorkEntryAcceptanceSerializer,
+    BuildingWorkEntryAcceptanceUpsertSerializer,
+    BuildingWorkEntryAcceptanceFileSerializer,
+    BuildingWorkEntryAcceptanceFileCreateSerializer,
     BuildingTaskSerializer,
     BuildingTaskChecklistItemSerializer,
     BuildingTaskChecklistItemUpdateSerializer,
@@ -714,12 +736,47 @@ class BuildingProcurementFileAddView(CompanyQuerysetMixin, generics.GenericAPIVi
         procurement = self.get_object()
         ser = self.get_serializer(data=request.data)
         ser.is_valid(raise_exception=True)
-        BuildingProcurementFile.objects.create(
+        pf = BuildingProcurementFile.objects.create(
             procurement=procurement,
             file=ser.validated_data["file"],
             title=(ser.validated_data.get("title") or "").strip(),
             created_by=user,
         )
+        # Автосоздание договора из файлов (двухшаговый сценарий)
+        try:
+            if getattr(procurement, "treaty_auto_create", False) and not procurement.treaty_id:
+                t_type = (getattr(procurement, "treaty_type", "") or "").strip() or BuildingTreaty.TreatyType.PROCUREMENT
+                t_title = (getattr(procurement, "treaty_title", "") or "").strip() or (procurement.title or "Договор закупки")
+                treaty = BuildingTreaty.objects.create(
+                    residential_complex=procurement.residential_complex,
+                    client=None,
+                    title=t_title,
+                    description="",
+                    amount=Decimal(procurement.total_amount or 0).quantize(Decimal("0.01")),
+                    treaty_type=t_type,
+                    operation_type=BuildingTreaty.OperationType.OTHER,
+                    payment_type=BuildingTreaty.PaymentType.FULL,
+                    payment_mode=BuildingTreaty.PaymentMode.CASH,
+                    created_by=user,
+                )
+                BuildingTreatyFile.objects.create(
+                    treaty=treaty,
+                    file=pf.file,
+                    title=pf.title or "",
+                    created_by=user,
+                )
+                procurement.treaty = treaty
+                procurement.save(update_fields=["treaty", "updated_at"])
+            elif procurement.treaty_id:
+                # Если договор уже выбран/создан — поднимаем файл в договор (для аудита)
+                BuildingTreatyFile.objects.create(
+                    treaty=procurement.treaty,
+                    file=pf.file,
+                    title=pf.title or "",
+                    created_by=user,
+                )
+        except Exception:
+            pass
         procurement.refresh_from_db()
         return Response(
             BuildingProcurementSerializer(procurement, context={"request": request}).data,
@@ -1642,6 +1699,34 @@ class BuildingWorkEntryDetailView(CompanyQuerysetMixin, generics.RetrieveUpdateD
             and serializer.instance.contractor_id
             and serializer.instance.contract_amount
         ):
+            # Автоматически создаём черновик АВР
+            try:
+                BuildingWorkEntryAcceptance.objects.get_or_create(work_entry=serializer.instance)
+            except Exception:
+                pass
+
+            # Процесс работ "в долг": создаём запись долга (мы должны подрядчику)
+            try:
+                if getattr(serializer.instance, "payment_mode", None) in ("debt", "mixed"):
+                    BuildingDebtLedgerEntry.objects.create(
+                        company_id=rc.company_id,
+                        direction=BuildingDebtLedgerEntry.Direction.PAYABLE,
+                        counterparty_type=BuildingDebtLedgerEntry.CounterpartyType.CONTRACTOR,
+                        counterparty_id=serializer.instance.contractor_id,
+                        entry_type=BuildingDebtLedgerEntry.EntryType.CHARGE,
+                        amount=serializer.instance.contract_amount,
+                        currency="KGS",
+                        status=BuildingDebtLedgerEntry.Status.APPROVED,
+                        residential_complex=rc,
+                        source_type="work_entry",
+                        source_id=serializer.instance.id,
+                        comment=f"Работы в долг: {serializer.instance.title or serializer.instance.id}",
+                        occurred_at=timezone.now(),
+                        created_by=user,
+                    )
+            except Exception:
+                pass
+
             if not BuildingCashRegisterRequest.objects.filter(
                 work_entry=serializer.instance,
                 request_type=BuildingCashRegisterRequest.RequestType.CONTRACTOR_PAYMENT,
@@ -1748,8 +1833,36 @@ class BuildingWorkEntryFileAddView(CompanyQuerysetMixin, generics.GenericAPIView
         if not uploaded:
             raise ValidationError({"files": "Нужен хотя бы один файл (files или file)."})
 
+        created_files = []
         for f in uploaded:
-            BuildingWorkEntryFile.objects.create(entry=entry, file=f, title="", created_by=user)
+            created_files.append(BuildingWorkEntryFile.objects.create(entry=entry, file=f, title="", created_by=user))
+
+        # Автосоздание/поднятие договора из файлов
+        try:
+            if getattr(entry, "treaty_auto_create", False) and not entry.treaty_id:
+                t_type = (getattr(entry, "treaty_type", "") or "").strip() or BuildingTreaty.TreatyType.CONSTRUCTION_DEPARTMENT
+                t_title = (getattr(entry, "treaty_title", "") or "").strip() or (entry.title or "Договор по работам")
+                treaty = BuildingTreaty.objects.create(
+                    residential_complex=entry.residential_complex,
+                    client=entry.client,
+                    title=t_title,
+                    description="",
+                    amount=Decimal(entry.contract_amount or 0).quantize(Decimal("0.01")) if entry.contract_amount else Decimal("0.00"),
+                    treaty_type=t_type,
+                    operation_type=BuildingTreaty.OperationType.OTHER,
+                    payment_type=BuildingTreaty.PaymentType.FULL,
+                    payment_mode=BuildingTreaty.PaymentMode.CASH,
+                    created_by=user,
+                )
+                for wf in created_files:
+                    BuildingTreatyFile.objects.create(treaty=treaty, file=wf.file, title=wf.title or "", created_by=user)
+                entry.treaty = treaty
+                entry.save(update_fields=["treaty", "updated_at"])
+            elif entry.treaty_id:
+                for wf in created_files:
+                    BuildingTreatyFile.objects.create(treaty=entry.treaty, file=wf.file, title=wf.title or "", created_by=user)
+        except Exception:
+            pass
         entry.refresh_from_db()
         return Response(BuildingWorkEntrySerializer(entry, context={"request": request}).data, status=status.HTTP_201_CREATED)
 
@@ -2092,14 +2205,16 @@ class BuildingWarehouseMovementTransferToWorkEntryView(CompanyQuerysetMixin, gen
         if not (_is_owner_like(request.user) or getattr(request.user, "can_view_building_stock", False)):
             raise PermissionDenied("Нет прав на склад (Building).")
         work_entry_id = request.data.get("work_entry")
-        if not work_entry_id:
-            raise ValidationError({"work_entry": "Укажите процесс работ."})
-        work_entry = BuildingWorkEntry.objects.filter(
-            id=work_entry_id,
-            residential_complex__company_id=request.user.company_id,
-        ).first()
-        if not work_entry:
-            raise ValidationError({"work_entry": "Процесс работ не найден."})
+        warehouse_request_id_raw = request.data.get("warehouse_request")
+
+        work_entry = None
+        if work_entry_id:
+            work_entry = BuildingWorkEntry.objects.filter(
+                id=work_entry_id,
+                residential_complex__company_id=request.user.company_id,
+            ).first()
+            if not work_entry:
+                raise ValidationError({"work_entry": "Процесс работ не найден."})
 
         # Поддержка поля nomenclature для items (alias к stock_item)
         data = request.data.copy()
@@ -2116,11 +2231,10 @@ class BuildingWarehouseMovementTransferToWorkEntryView(CompanyQuerysetMixin, gen
         ).first()
         if not warehouse or warehouse not in self.get_queryset():
             raise ValidationError({"warehouse": "Склад не найден."})
-        if warehouse.residential_complex_id != work_entry.residential_complex_id:
-            raise ValidationError({"warehouse": "Склад должен принадлежать ЖК процесса работ."})
-        company = warehouse.residential_complex.company
         warehouse_request = None
-        warehouse_request_id = ser.validated_data.get("warehouse_request")
+        warehouse_request_id = ser.validated_data.get("warehouse_request") or warehouse_request_id_raw
+        issued_to = (ser.validated_data.get("issued_to") or "").strip() or None
+        company = warehouse.residential_complex.company
 
         with transaction.atomic():
             if warehouse_request_id:
@@ -2129,10 +2243,17 @@ class BuildingWarehouseMovementTransferToWorkEntryView(CompanyQuerysetMixin, gen
                 ).first()
                 if not warehouse_request:
                     raise ValidationError({"warehouse_request": "Заявка на материалы не найдена."})
-                if warehouse_request.work_entry_id != work_entry.id:
-                    raise ValidationError({"warehouse_request": "Заявка принадлежит другому процессу работ."})
                 if warehouse_request.warehouse_id != warehouse.id:
                     raise ValidationError({"warehouse_request": "Заявка принадлежит другому складу."})
+                if not work_entry:
+                    work_entry = warehouse_request.work_entry
+                if warehouse_request.work_entry_id != getattr(work_entry, "id", None):
+                    raise ValidationError({"warehouse_request": "Заявка принадлежит другому процессу работ."})
+            if not work_entry:
+                raise ValidationError({"work_entry": "Укажите work_entry или warehouse_request (по заявке определим work_entry)."})
+
+            if warehouse.residential_complex_id != work_entry.residential_complex_id:
+                raise ValidationError({"warehouse": "Склад должен принадлежать ЖК процесса работ."})
 
             movement = BuildingWarehouseMovement.objects.create(
                 company=company,
@@ -2140,6 +2261,7 @@ class BuildingWarehouseMovementTransferToWorkEntryView(CompanyQuerysetMixin, gen
                 movement_type=BuildingWarehouseMovement.MovementType.TRANSFER_TO_WORK_ENTRY,
                 work_entry=work_entry,
                 warehouse_request=warehouse_request,
+                issued_to=issued_to,
                 reason=ser.validated_data.get("comment", ""),
                 created_by=request.user,
             )
@@ -2364,7 +2486,18 @@ class BuildingTreatyListCreateView(CompanyQuerysetMixin, generics.ListCreateAPIV
     serializer_class = BuildingTreatySerializer
     queryset = BuildingTreaty.objects.select_related("residential_complex", "client", "created_by", "apartment", "company").prefetch_related("files", "installments")
     filter_backends = [DjangoFilterBackend, filters.SearchFilter]
-    filterset_fields = ["residential_complex", "client", "status", "erp_sync_status", "auto_create_in_erp", "operation_type", "payment_type", "apartment"]
+    filterset_fields = [
+        "residential_complex",
+        "client",
+        "status",
+        "erp_sync_status",
+        "auto_create_in_erp",
+        "operation_type",
+        "payment_type",
+        "apartment",
+        "treaty_type",
+        "group",
+    ]
     search_fields = ["number", "title", "description", "residential_complex__name", "client__name", "client_name", "apartment__number"]
 
     def get_queryset(self):
@@ -2381,6 +2514,17 @@ class BuildingTreatyListCreateView(CompanyQuerysetMixin, generics.ListCreateAPIV
                 qs = qs.filter(
                     Q(residential_complex_id__in=allowed_ids) | Q(residential_complex_id__isnull=True)
                 )
+            # include_descendants для групп/папок
+            group_id = self.request.query_params.get("group")
+            include_desc = (self.request.query_params.get("include_descendants") or "").lower() in ("1", "true", "yes")
+            if group_id and include_desc:
+                try:
+                    grp = BuildingTreatyGroup.objects.filter(id=group_id, company_id=user.company_id).first()
+                    if grp:
+                        ids = list(grp.get_descendants(include_self=True).values_list("id", flat=True))
+                        qs = qs.filter(group_id__in=ids)
+                except Exception:
+                    pass
             return qs
         if not getattr(user, "is_staff", False) and not getattr(user, "is_superuser", False):
             return qs.none()
@@ -2686,12 +2830,45 @@ class BuildingTreatyInstallmentPaymentView(CompanyQuerysetMixin, generics.Generi
         if not getattr(user, "is_superuser", False) and rc.company_id != getattr(user, "company_id", None):
             raise PermissionDenied("Договор другой компании.")
 
-        # проверяем остаток по платежу
-        remaining = (Decimal(installment.amount or 0) - Decimal(installment.paid_amount or 0)).quantize(Decimal("0.01"))
-        if remaining <= 0:
-            raise ValidationError({"amount": "По этому платежу уже всё оплачено."})
-        if amount > remaining:
-            raise ValidationError({"amount": f"Нельзя оплатить больше остатка ({remaining})."})
+        external_payment_id = (ser.validated_data.get("external_payment_id") or "").strip()
+        if external_payment_id:
+            existing = BuildingTreatyInstallmentPayment.objects.filter(external_payment_id=external_payment_id).select_related("installment")
+            if existing.exists():
+                applied = []
+                for p in existing.order_by("paid_at", "created_at"):
+                    inst = p.installment
+                    applied.append(
+                        {
+                            "installment_id": str(inst.id),
+                            "amount": str(p.amount),
+                            "paid_total_after": str(inst.paid_amount),
+                            "status": inst.status,
+                        }
+                    )
+                return Response(
+                    {
+                        "applied": applied,
+                        "input_amount": str(amount),
+                        "unused_amount": "0.00",
+                        "idempotent": True,
+                    },
+                    status=status.HTTP_200_OK,
+                )
+
+        # распределяем оплату по текущему и следующим взносам
+        all_installments = list(
+            BuildingTreatyInstallment.objects.select_for_update()
+            .filter(treaty_id=treaty.id)
+            .order_by("order", "due_date", "created_at")
+        )
+        if not all_installments:
+            raise ValidationError({"detail": "У договора нет графика рассрочки."})
+        idx = next((i for i, x in enumerate(all_installments) if x.id == installment.id), None)
+        if idx is None:
+            raise ValidationError({"installment": "Платёж не найден в графике договора."})
+
+        left = Decimal(amount).quantize(Decimal("0.01"))
+        applied = []
 
         cashbox = BuildingCashbox.objects.select_related("company").filter(id=ser.validated_data["cashbox"]).first()
         if not cashbox:
@@ -2701,41 +2878,68 @@ class BuildingTreatyInstallmentPaymentView(CompanyQuerysetMixin, generics.Generi
 
         paid_at = ser.validated_data.get("paid_at") or timezone.now()
 
-        # создаём движение по кассе (приход)
         client_name = getattr(treaty.client, "name", "") if getattr(treaty, "client_id", None) else ""
         apt_number = getattr(treaty.apartment, "number", "") if getattr(treaty, "apartment_id", None) else ""
-        name_parts = ["Рассрочка по договору", treaty.number or str(treaty.id)]
-        if client_name:
-            name_parts.append(client_name)
-        if apt_number:
-            name_parts.append(f"кв. {apt_number}")
-        flow_name = " / ".join([p for p in name_parts if p])
+        treaty_base = treaty.number or str(treaty.id)
 
-        cf = BuildingCashFlow.objects.create(
-            cashbox=cashbox,
-            type=BuildingCashFlow.Type.INCOME,
-            name=flow_name,
-            amount=abs(amount),
-            status=BuildingCashFlow.Status.APPROVED,
-            source_business_operation_id=str(installment.id),
-        )
+        for inst in all_installments[idx:]:
+            if left <= 0:
+                break
+            inst_remaining = (Decimal(inst.amount or 0) - Decimal(inst.paid_amount or 0)).quantize(Decimal("0.01"))
+            if inst_remaining <= 0:
+                continue
+            part = left if left <= inst_remaining else inst_remaining
+            left = (left - part).quantize(Decimal("0.01"))
 
-        # обновляем сумму оплаты по платежу
-        new_paid = (Decimal(installment.paid_amount or 0) + Decimal(amount or 0)).quantize(Decimal("0.01"))
-        installment.paid_amount = new_paid
-        if new_paid >= Decimal(installment.amount or 0):
-            installment.status = BuildingTreatyInstallment.Status.PAID
-            installment.paid_at = paid_at
-            installment.save(update_fields=["paid_amount", "status", "paid_at", "updated_at"])
-        else:
-            installment.save(update_fields=["paid_amount", "updated_at"])
+            name_parts = ["Рассрочка", treaty_base, f"взнос {inst.order or ''}".strip()]
+            if client_name:
+                name_parts.append(client_name)
+            if apt_number:
+                name_parts.append(f"кв. {apt_number}")
+            flow_name = " / ".join([p for p in name_parts if p])
 
-        # можно в будущем добавить агрегацию по договору (общая оплаченная сумма и т.п.)
+            cf = BuildingCashFlow.objects.create(
+                cashbox=cashbox,
+                type=BuildingCashFlow.Type.INCOME,
+                name=flow_name,
+                amount=abs(part),
+                status=BuildingCashFlow.Status.APPROVED,
+                source_business_operation_id=str(inst.id),
+            )
+
+            new_paid = (Decimal(inst.paid_amount or 0) + part).quantize(Decimal("0.01"))
+            inst.paid_amount = new_paid
+            if new_paid >= Decimal(inst.amount or 0):
+                inst.status = BuildingTreatyInstallment.Status.PAID
+                inst.paid_at = paid_at
+                inst.save(update_fields=["paid_amount", "status", "paid_at", "updated_at"])
+            else:
+                inst.save(update_fields=["paid_amount", "updated_at"])
+
+            BuildingTreatyInstallmentPayment.objects.create(
+                installment=inst,
+                amount=part,
+                paid_at=paid_at,
+                cashbox=cashbox,
+                cashflow=cf,
+                external_payment_id=external_payment_id,
+                created_by=user,
+            )
+
+            applied.append(
+                {
+                    "installment_id": str(inst.id),
+                    "amount": str(part),
+                    "paid_total_after": str(inst.paid_amount),
+                    "status": inst.status,
+                }
+            )
 
         return Response(
             {
-                "installment": BuildingTreatyInstallmentSerializer(installment, context={"request": request}).data,
-                "cashflow_id": str(cf.id),
+                "applied": applied,
+                "input_amount": str(Decimal(amount).quantize(Decimal("0.01"))),
+                "unused_amount": str(left.quantize(Decimal("0.01"))),
             },
             status=status.HTTP_201_CREATED,
         )
@@ -4158,4 +4362,479 @@ class CashFlowFileAddView(CompanyQuerysetMixin, generics.GenericAPIView):
         cf.refresh_from_db()
         files_data = [BuildingCashFlowFileSerializer(f, context={"request": request}).data for f in cf.files.all()]
         return Response({"files": files_data}, status=status.HTTP_201_CREATED)
+
+
+# -----------------------
+# Treaty groups / move
+# -----------------------
+
+
+class BuildingTreatyGroupListCreateView(CompanyQuerysetMixin, generics.GenericAPIView):
+    permission_classes = [permissions.IsAuthenticated]
+    queryset = BuildingTreatyGroup.objects.all()
+
+    def get(self, request):
+        user = request.user
+        if not (_is_owner_like(user) or getattr(user, "can_view_building_treaty", False)):
+            raise PermissionDenied("Нет прав на договора (Building).")
+        if not getattr(user, "company_id", None) and not getattr(user, "is_superuser", False):
+            return Response([], status=status.HTTP_200_OK)
+
+        qs = BuildingTreatyGroup.objects.filter(company_id=user.company_id)
+        rc = request.query_params.get("residential_complex")
+        if rc:
+            qs = qs.filter(residential_complex_id=rc)
+        tree = (request.query_params.get("tree") or "").lower() in ("1", "true", "yes")
+        if tree:
+            qs = qs.filter(parent__isnull=True).order_by("order", "title")
+            return Response(BuildingTreatyGroupSerializer(qs, many=True, context={"request": request}).data, status=status.HTTP_200_OK)
+        qs = qs.order_by("tree_id", "lft")
+        return Response(BuildingTreatyGroupSerializer(qs, many=True, context={"request": request}).data, status=status.HTTP_200_OK)
+
+    def post(self, request):
+        user = request.user
+        if not (_is_owner_like(user) or getattr(user, "can_view_building_treaty", False)):
+            raise PermissionDenied("Нет прав на договора (Building).")
+        ser = BuildingTreatyGroupCreateUpdateSerializer(data=request.data, context={"request": request})
+        ser.is_valid(raise_exception=True)
+        rc = ser.validated_data.get("residential_complex")
+        if rc and rc.company_id != getattr(user, "company_id", None) and not getattr(user, "is_superuser", False):
+            raise PermissionDenied("ЖК принадлежит другой компании.")
+        obj = ser.save(company_id=user.company_id)
+        return Response(BuildingTreatyGroupSerializer(obj, context={"request": request}).data, status=status.HTTP_201_CREATED)
+
+
+class BuildingTreatyGroupDetailView(CompanyQuerysetMixin, generics.GenericAPIView):
+    permission_classes = [permissions.IsAuthenticated]
+    queryset = BuildingTreatyGroup.objects.all()
+
+    def get_object(self):
+        obj = super().get_object()
+        user = self.request.user
+        if not getattr(user, "is_superuser", False) and obj.company_id != getattr(user, "company_id", None):
+            raise PermissionDenied("Объект другой компании.")
+        return obj
+
+    def get(self, request, pk=None):
+        user = request.user
+        if not (_is_owner_like(user) or getattr(user, "can_view_building_treaty", False)):
+            raise PermissionDenied("Нет прав на договора (Building).")
+        obj = self.get_object()
+        return Response(BuildingTreatyGroupSerializer(obj, context={"request": request}).data, status=status.HTTP_200_OK)
+
+    def patch(self, request, pk=None):
+        user = request.user
+        if not (_is_owner_like(user) or getattr(user, "can_view_building_treaty", False)):
+            raise PermissionDenied("Нет прав на договора (Building).")
+        obj = self.get_object()
+        ser = BuildingTreatyGroupCreateUpdateSerializer(obj, data=request.data, partial=True, context={"request": request})
+        ser.is_valid(raise_exception=True)
+        rc = ser.validated_data.get("residential_complex")
+        if rc and rc.company_id != getattr(user, "company_id", None) and not getattr(user, "is_superuser", False):
+            raise PermissionDenied("ЖК принадлежит другой компании.")
+        obj = ser.save()
+        return Response(BuildingTreatyGroupSerializer(obj, context={"request": request}).data, status=status.HTTP_200_OK)
+
+    def delete(self, request, pk=None):
+        user = request.user
+        if not (_is_owner_like(user) or getattr(user, "can_view_building_treaty", False)):
+            raise PermissionDenied("Нет прав на договора (Building).")
+        obj = self.get_object()
+        if obj.get_children().exists():
+            raise ValidationError({"detail": "Нельзя удалить папку с дочерними папками."})
+        if obj.treaties.exists():
+            raise ValidationError({"detail": "Нельзя удалить папку с договорами."})
+        obj.delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+class BuildingTreatyMoveView(CompanyQuerysetMixin, generics.GenericAPIView):
+    permission_classes = [permissions.IsAuthenticated]
+    serializer_class = BuildingTreatyMoveSerializer
+
+    @transaction.atomic
+    def post(self, request):
+        user = request.user
+        if not (_is_owner_like(user) or getattr(user, "can_view_building_treaty", False)):
+            raise PermissionDenied("Нет прав на договора (Building).")
+        ser = self.get_serializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+        treaty_ids = [str(x) for x in ser.validated_data["treaty_ids"]]
+        target_group = ser.validated_data.get("target_group")
+
+        qs = BuildingTreaty.objects.filter(id__in=treaty_ids).select_related("residential_complex", "company")
+        if not getattr(user, "is_superuser", False) and getattr(user, "company_id", None):
+            qs = qs.filter(Q(residential_complex__company_id=user.company_id) | Q(company_id=user.company_id))
+
+        group_obj = None
+        if target_group:
+            group_obj = BuildingTreatyGroup.objects.filter(id=target_group, company_id=user.company_id).first()
+            if not group_obj:
+                raise ValidationError({"target_group": "Папка не найдена."})
+
+        updated = qs.update(group=group_obj, updated_at=timezone.now())
+        return Response({"moved": updated}, status=status.HTTP_200_OK)
+
+
+# -----------------------
+# WorkEntry: receipts from warehouse + acceptance (АВР)
+# -----------------------
+
+
+class BuildingWorkEntryWarehouseReceiptsView(CompanyQuerysetMixin, generics.GenericAPIView):
+    permission_classes = [permissions.IsAuthenticated]
+    queryset = BuildingWorkEntry.objects.select_related("residential_complex")
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        user = self.request.user
+        if not (_is_owner_like(user) or getattr(user, "can_view_building_work_process", False)):
+            raise PermissionDenied("Нет прав на процесс работы (Building).")
+        if user.is_authenticated and getattr(user, "company_id", None):
+            qs = qs.filter(residential_complex__company_id=user.company_id)
+            allowed_ids = _allowed_residential_complex_ids(user)
+            if allowed_ids is not None:
+                qs = qs.filter(residential_complex_id__in=allowed_ids)
+            return qs
+        return qs.none()
+
+    def get(self, request, pk=None):
+        we = self.get_object()
+        movements = (
+            BuildingWarehouseMovement.objects.filter(
+                movement_type=BuildingWarehouseMovement.MovementType.TRANSFER_TO_WORK_ENTRY,
+                work_entry_id=we.id,
+            )
+            .select_related("warehouse")
+            .prefetch_related("items__stock_item", "files")
+            .order_by("-created_at")
+        )
+        results = []
+        for m in movements:
+            items = []
+            for it in m.items.all():
+                si = it.stock_item
+                items.append(
+                    {
+                        "nomenclature": str(si.id),
+                        "name": getattr(si, "name", ""),
+                        "quantity": str(it.quantity),
+                        "unit": getattr(si, "unit", None) or "",
+                    }
+                )
+            files = [BuildingWarehouseMovementFileSerializer(f, context={"request": request}).data for f in m.files.all()]
+            results.append(
+                {
+                    "warehouse_movement_id": str(m.id),
+                    "warehouse": str(m.warehouse_id),
+                    "issued_to": m.issued_to,
+                    "issued_at": m.created_at,
+                    "items": items,
+                    "files": files,
+                }
+            )
+        return Response({"work_entry": str(we.id), "results": results}, status=status.HTTP_200_OK)
+
+
+class BuildingWorkEntryAcceptanceView(CompanyQuerysetMixin, generics.GenericAPIView):
+    permission_classes = [permissions.IsAuthenticated]
+    serializer_class = BuildingWorkEntryAcceptanceUpsertSerializer
+    queryset = BuildingWorkEntry.objects.select_related("residential_complex").prefetch_related("acceptance__files")
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        user = self.request.user
+        if not (_is_owner_like(user) or getattr(user, "can_view_building_work_process", False)):
+            raise PermissionDenied("Нет прав на процесс работы (Building).")
+        if user.is_authenticated and getattr(user, "company_id", None):
+            qs = qs.filter(residential_complex__company_id=user.company_id)
+            allowed_ids = _allowed_residential_complex_ids(user)
+            if allowed_ids is not None:
+                qs = qs.filter(residential_complex_id__in=allowed_ids)
+            return qs
+        return qs.none()
+
+    def get(self, request, pk=None):
+        we = self.get_object()
+        acc = getattr(we, "acceptance", None)
+        if not acc:
+            return Response(None, status=status.HTTP_200_OK)
+        return Response(BuildingWorkEntryAcceptanceSerializer(acc, context={"request": request}).data, status=status.HTTP_200_OK)
+
+    @transaction.atomic
+    def post(self, request, pk=None):
+        we = self.get_object()
+        ser = self.get_serializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+        acc, _ = BuildingWorkEntryAcceptance.objects.select_for_update().get_or_create(work_entry=we)
+        if "comment" in ser.validated_data:
+            acc.comment = ser.validated_data.get("comment") or ""
+        if "status" in ser.validated_data:
+            acc.status = ser.validated_data["status"]
+            if acc.status == BuildingWorkEntryAcceptance.Status.SIGNED and not acc.signed_at:
+                acc.signed_at = ser.validated_data.get("signed_at") or timezone.now()
+        if "signed_at" in ser.validated_data and ser.validated_data.get("signed_at"):
+            acc.signed_at = ser.validated_data["signed_at"]
+        acc.save()
+        acc.refresh_from_db()
+        return Response(BuildingWorkEntryAcceptanceSerializer(acc, context={"request": request}).data, status=status.HTTP_201_CREATED)
+
+
+class BuildingWorkEntryAcceptanceFileAddView(CompanyQuerysetMixin, generics.GenericAPIView):
+    permission_classes = [permissions.IsAuthenticated]
+    serializer_class = BuildingWorkEntryAcceptanceFileCreateSerializer
+    parser_classes = [MultiPartParser, FormParser]
+    queryset = BuildingWorkEntryAcceptance.objects.select_related("work_entry__residential_complex").prefetch_related("files")
+
+    def get_object(self):
+        obj = super().get_object()
+        user = self.request.user
+        rc = obj.work_entry.residential_complex
+        if not (_is_owner_like(user) or getattr(user, "can_view_building_work_process", False)):
+            raise PermissionDenied("Нет прав на процесс работы (Building).")
+        if not getattr(user, "is_superuser", False) and rc.company_id != getattr(user, "company_id", None):
+            raise PermissionDenied("Объект другой компании.")
+        allowed = _allowed_residential_complex_ids(user)
+        if allowed is not None and rc.id not in allowed:
+            raise PermissionDenied("Нет доступа к этому ЖК.")
+        return obj
+
+    def post(self, request, pk=None):
+        acc = self.get_object()
+        ser = self.get_serializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+        BuildingWorkEntryAcceptanceFile.objects.create(
+            acceptance=acc,
+            file=ser.validated_data["file"],
+            title=(ser.validated_data.get("title") or "").strip(),
+            created_by=request.user,
+        )
+        acc.refresh_from_db()
+        return Response(BuildingWorkEntryAcceptanceSerializer(acc, context={"request": request}).data, status=status.HTTP_201_CREATED)
+
+
+# -----------------------
+# Debts ledger API
+# -----------------------
+
+
+class BuildingDebtsLedgerListCreateView(CompanyQuerysetMixin, generics.ListCreateAPIView):
+    permission_classes = [permissions.IsAuthenticated]
+    queryset = BuildingDebtLedgerEntry.objects.all().prefetch_related("files")
+    filter_backends = [DjangoFilterBackend, filters.SearchFilter]
+    filterset_fields = ["direction", "counterparty_type", "counterparty_id", "status", "residential_complex", "source_type", "source_id"]
+    search_fields = ["comment", "source_type"]
+
+    def get_serializer_class(self):
+        if self.request.method == "POST":
+            return BuildingDebtLedgerEntryCreateSerializer
+        return BuildingDebtLedgerEntrySerializer
+
+    def get_queryset(self):
+        user = self.request.user
+        if not (_is_owner_like(user) or getattr(user, "can_view_building_procurement", False) or getattr(user, "can_view_building_work_process", False)):
+            raise PermissionDenied("Нет прав на долги (Building).")
+        qs = super().get_queryset()
+        if getattr(user, "is_superuser", False):
+            return qs
+        company_id = getattr(user, "company_id", None)
+        if not company_id:
+            return qs.none()
+        qs = qs.filter(company_id=company_id)
+        allowed = _allowed_residential_complex_ids(user)
+        if allowed is not None:
+            qs = qs.filter(Q(residential_complex_id__in=allowed) | Q(residential_complex_id__isnull=True))
+        return qs
+
+    def perform_create(self, serializer):
+        user = self.request.user
+        company_id = getattr(user, "company_id", None)
+        if not company_id and not getattr(user, "is_superuser", False):
+            raise PermissionDenied("У пользователя не указана компания.")
+        serializer.save(company_id=company_id, created_by=user)
+
+
+class BuildingDebtsLedgerFileAddView(CompanyQuerysetMixin, generics.GenericAPIView):
+    permission_classes = [permissions.IsAuthenticated]
+    serializer_class = BuildingDebtLedgerFileCreateSerializer
+    parser_classes = [MultiPartParser, FormParser]
+    queryset = BuildingDebtLedgerEntry.objects.all().prefetch_related("files")
+
+    def get_object(self):
+        obj = super().get_object()
+        user = self.request.user
+        if not getattr(user, "is_superuser", False) and obj.company_id != getattr(user, "company_id", None):
+            raise PermissionDenied("Объект другой компании.")
+        return obj
+
+    def post(self, request, pk=None):
+        entry = self.get_object()
+        ser = self.get_serializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+        BuildingDebtLedgerFile.objects.create(
+            entry=entry,
+            file=ser.validated_data["file"],
+            title=(ser.validated_data.get("title") or "").strip(),
+            created_by=request.user,
+        )
+        entry.refresh_from_db()
+        return Response(BuildingDebtLedgerEntrySerializer(entry, context={"request": request}).data, status=status.HTTP_201_CREATED)
+
+
+class BuildingDebtsSummaryView(CompanyQuerysetMixin, generics.GenericAPIView):
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request):
+        user = request.user
+        if not (_is_owner_like(user) or getattr(user, "can_view_building_procurement", False) or getattr(user, "can_view_building_work_process", False)):
+            raise PermissionDenied("Нет прав на долги (Building).")
+        company_id = getattr(user, "company_id", None)
+        if not company_id and not getattr(user, "is_superuser", False):
+            return Response([], status=status.HTTP_200_OK)
+
+        qs = BuildingDebtLedgerEntry.objects.filter(company_id=company_id, status=BuildingDebtLedgerEntry.Status.APPROVED)
+        allowed = _allowed_residential_complex_ids(user)
+        if allowed is not None:
+            qs = qs.filter(Q(residential_complex_id__in=allowed) | Q(residential_complex_id__isnull=True))
+
+        # balance = charges - payments - barter - writeoff (+/- adjustments) within direction+counterparty
+        agg = qs.values("direction", "counterparty_type", "counterparty_id").annotate(
+            charges=Coalesce(Sum("amount", filter=Q(entry_type=BuildingDebtLedgerEntry.EntryType.CHARGE)), Decimal("0.00")),
+            payments=Coalesce(Sum("amount", filter=Q(entry_type=BuildingDebtLedgerEntry.EntryType.PAYMENT)), Decimal("0.00")),
+            barter=Coalesce(Sum("amount", filter=Q(entry_type=BuildingDebtLedgerEntry.EntryType.BARTER)), Decimal("0.00")),
+            writeoff=Coalesce(Sum("amount", filter=Q(entry_type=BuildingDebtLedgerEntry.EntryType.WRITEOFF)), Decimal("0.00")),
+            adjustments=Coalesce(Sum("amount", filter=Q(entry_type=BuildingDebtLedgerEntry.EntryType.ADJUSTMENT)), Decimal("0.00")),
+        )
+        out = []
+        for r in agg:
+            balance = (r["charges"] - r["payments"] - r["barter"] - r["writeoff"] + r["adjustments"]).quantize(Decimal("0.01"))
+            out.append(
+                {
+                    "direction": r["direction"],
+                    "counterparty_type": r["counterparty_type"],
+                    "counterparty_id": str(r["counterparty_id"]),
+                    "balance": str(balance),
+                    "charges": str(r["charges"].quantize(Decimal("0.01"))),
+                    "payments": str(r["payments"].quantize(Decimal("0.01"))),
+                    "barter": str(r["barter"].quantize(Decimal("0.01"))),
+                    "writeoff": str(r["writeoff"].quantize(Decimal("0.01"))),
+                    "adjustments": str(r["adjustments"].quantize(Decimal("0.01"))),
+                }
+            )
+        return Response(out, status=status.HTTP_200_OK)
+
+
+class BuildingDebtsCounterpartySummaryView(CompanyQuerysetMixin, generics.GenericAPIView):
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request, counterparty_type: str, counterparty_id):
+        user = request.user
+        if not (_is_owner_like(user) or getattr(user, "can_view_building_procurement", False) or getattr(user, "can_view_building_work_process", False)):
+            raise PermissionDenied("Нет прав на долги (Building).")
+        company_id = getattr(user, "company_id", None)
+        qs = BuildingDebtLedgerEntry.objects.filter(
+            company_id=company_id,
+            status=BuildingDebtLedgerEntry.Status.APPROVED,
+            counterparty_type=counterparty_type,
+            counterparty_id=counterparty_id,
+        )
+        agg = qs.values("direction").annotate(
+            charges=Coalesce(Sum("amount", filter=Q(entry_type=BuildingDebtLedgerEntry.EntryType.CHARGE)), Decimal("0.00")),
+            payments=Coalesce(Sum("amount", filter=Q(entry_type=BuildingDebtLedgerEntry.EntryType.PAYMENT)), Decimal("0.00")),
+            barter=Coalesce(Sum("amount", filter=Q(entry_type=BuildingDebtLedgerEntry.EntryType.BARTER)), Decimal("0.00")),
+            writeoff=Coalesce(Sum("amount", filter=Q(entry_type=BuildingDebtLedgerEntry.EntryType.WRITEOFF)), Decimal("0.00")),
+            adjustments=Coalesce(Sum("amount", filter=Q(entry_type=BuildingDebtLedgerEntry.EntryType.ADJUSTMENT)), Decimal("0.00")),
+        )
+        out = []
+        for r in agg:
+            balance = (r["charges"] - r["payments"] - r["barter"] - r["writeoff"] + r["adjustments"]).quantize(Decimal("0.01"))
+            out.append({"direction": r["direction"], "balance": str(balance)})
+        return Response({"counterparty_type": counterparty_type, "counterparty_id": str(counterparty_id), "results": out}, status=status.HTTP_200_OK)
+
+
+# -----------------------
+# Barter API (generic)
+# -----------------------
+
+
+class BuildingBarterItemsUpsertView(CompanyQuerysetMixin, generics.GenericAPIView):
+    permission_classes = [permissions.IsAuthenticated]
+
+    @transaction.atomic
+    def post(self, request, source_type: str, source_id: str):
+        user = request.user
+        company_id = getattr(user, "company_id", None)
+        if not company_id and not getattr(user, "is_superuser", False):
+            raise PermissionDenied("У пользователя не указана компания.")
+        items = request.data if isinstance(request.data, list) else request.data.get("items")
+        if not isinstance(items, list):
+            raise ValidationError({"items": "Ожидается список items."})
+        BuildingBarterItem.objects.filter(company_id=company_id, source_type=source_type, source_id=source_id).delete()
+        created = []
+        for raw in items:
+            ser = BuildingBarterItemUpsertSerializer(data=raw)
+            ser.is_valid(raise_exception=True)
+            v = ser.validated_data
+            created.append(
+                BuildingBarterItem.objects.create(
+                    company_id=company_id,
+                    source_type=source_type,
+                    source_id=source_id,
+                    title=(v["title"] or "").strip(),
+                    quantity=v.get("quantity"),
+                    unit=(v.get("unit") or "").strip() or None,
+                    unit_price=v.get("unit_price"),
+                    total_price=v["total_price"],
+                    currency=(v.get("currency") or "KGS").strip() or "KGS",
+                    comment=(v.get("comment") or "").strip(),
+                )
+            )
+        return Response(BuildingBarterItemSerializer(created, many=True, context={"request": request}).data, status=status.HTTP_201_CREATED)
+
+
+class BuildingBarterItemDetailView(CompanyQuerysetMixin, generics.GenericAPIView):
+    permission_classes = [permissions.IsAuthenticated]
+    queryset = BuildingBarterItem.objects.all()
+
+    def get_object(self):
+        obj = super().get_object()
+        user = self.request.user
+        if not getattr(user, "is_superuser", False) and obj.company_id != getattr(user, "company_id", None):
+            raise PermissionDenied("Объект другой компании.")
+        return obj
+
+    def patch(self, request, pk=None):
+        obj = self.get_object()
+        ser = BuildingBarterItemSerializer(obj, data=request.data, partial=True, context={"request": request})
+        ser.is_valid(raise_exception=True)
+        obj = ser.save()
+        return Response(BuildingBarterItemSerializer(obj, context={"request": request}).data, status=status.HTTP_200_OK)
+
+    def delete(self, request, pk=None):
+        obj = self.get_object()
+        obj.delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+class BuildingBarterFileAddView(CompanyQuerysetMixin, generics.GenericAPIView):
+    permission_classes = [permissions.IsAuthenticated]
+    serializer_class = BuildingBarterFileCreateSerializer
+    parser_classes = [MultiPartParser, FormParser]
+
+    def post(self, request, source_type: str, source_id: str):
+        user = request.user
+        company_id = getattr(user, "company_id", None)
+        if not company_id and not getattr(user, "is_superuser", False):
+            raise PermissionDenied("У пользователя не указана компания.")
+        ser = self.get_serializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+        obj = BuildingBarterFile.objects.create(
+            company_id=company_id,
+            source_type=source_type,
+            source_id=source_id,
+            file=ser.validated_data["file"],
+            title=(ser.validated_data.get("title") or "").strip(),
+            created_by=user,
+        )
+        return Response(BuildingBarterFileSerializer(obj, context={"request": request}).data, status=status.HTTP_201_CREATED)
 

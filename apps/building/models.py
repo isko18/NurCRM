@@ -11,6 +11,7 @@ from django.db.models import Q
 from django.core.exceptions import ValidationError
 
 from apps.users.models import Company, Branch
+from mptt.models import MPTTModel, TreeForeignKey
 
 
 # -----------------------
@@ -1037,6 +1038,11 @@ class BuildingProduct(models.Model):
 
 
 class BuildingProcurementRequest(models.Model):
+    class PaymentMode(models.TextChoices):
+        CASH = "cash", "Наличные"
+        DEBT = "debt", "В долг"
+        MIXED = "mixed", "Смешанная"
+
     class Status(models.TextChoices):
         DRAFT = "draft", "Черновик"
         SUBMITTED_TO_CASH = "submitted_to_cash", "Отправлено в кассу"
@@ -1071,6 +1077,24 @@ class BuildingProcurementRequest(models.Model):
     )
     title = models.CharField(max_length=255, blank=True, verbose_name="Название закупки")
     comment = models.TextField(blank=True, verbose_name="Комментарий")
+    payment_mode = models.CharField(
+        max_length=16,
+        choices=PaymentMode.choices,
+        default=PaymentMode.CASH,
+        db_index=True,
+        verbose_name="Режим оплаты",
+    )
+    treaty = models.ForeignKey(
+        "BuildingTreaty",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="procurements",
+        verbose_name="Договор",
+    )
+    treaty_auto_create = models.BooleanField(default=False, verbose_name="Автосоздать договор")
+    treaty_type = models.CharField(max_length=32, blank=True, verbose_name="Тип создаваемого договора")
+    treaty_title = models.CharField(max_length=255, blank=True, verbose_name="Название создаваемого договора")
     status = models.CharField(
         max_length=32,
         choices=Status.choices,
@@ -1099,6 +1123,8 @@ class BuildingProcurementRequest(models.Model):
         indexes = [
             models.Index(fields=["residential_complex", "status"]),
             models.Index(fields=["status", "created_at"]),
+            models.Index(fields=["residential_complex", "payment_mode"]),
+            models.Index(fields=["treaty"]),
         ]
 
     def __str__(self):
@@ -1636,6 +1662,13 @@ class BuildingWarehouseMovement(models.Model):
         related_name="movements",
         verbose_name="Заявка на материалы",
     )
+    issued_to = models.CharField(
+        max_length=255,
+        null=True,
+        blank=True,
+        verbose_name="Кому передали",
+        help_text="Свободная строка (ФИО/кому выдали материалы).",
+    )
     reason = models.TextField(blank=True, verbose_name="Причина/комментарий")
     created_by = models.ForeignKey(
         settings.AUTH_USER_MODEL,
@@ -2022,9 +2055,22 @@ class BuildingTreaty(models.Model):
         BOOKING = "booking", "Бронь"
         OTHER = "other", "Прочие"
 
+    class TreatyType(models.TextChoices):
+        CONSTRUCTION_DEPARTMENT = "construction_department", "Строительный отдел"
+        SALE = "sale", "Продажа"
+        BOOKING = "booking", "Бронь"
+        PROCUREMENT = "procurement", "Закупки"
+        OTHER = "other", "Прочее"
+
     class PaymentType(models.TextChoices):
         FULL = "full", "Полная оплата"
         INSTALLMENT = "installment", "Рассрочка"
+
+    class PaymentMode(models.TextChoices):
+        CASH = "cash", "Деньги"
+        INSTALLMENT = "installment", "Рассрочка"
+        BARTER = "barter", "Бартер"
+        MIXED = "mixed", "Смешанная"
 
     class Status(models.TextChoices):
         DRAFT = "draft", "Черновик"
@@ -2080,6 +2126,15 @@ class BuildingTreaty(models.Model):
     description = models.TextField(blank=True, verbose_name="Описание/условия")
     amount = models.DecimalField(max_digits=16, decimal_places=2, default=Decimal("0.00"), verbose_name="Сумма")
 
+    # Бизнес-категория договора (строительство/продажа/закупки и т.п.). Не путать с operation_type.
+    treaty_type = models.CharField(
+        max_length=32,
+        choices=TreatyType.choices,
+        default=TreatyType.SALE,
+        db_index=True,
+        verbose_name="Категория договора",
+    )
+
     apartment = models.ForeignKey(
         ResidentialComplexApartment,
         on_delete=models.SET_NULL,
@@ -2102,6 +2157,25 @@ class BuildingTreaty(models.Model):
         db_index=True,
         verbose_name="Тип оплаты",
     )
+
+    payment_mode = models.CharField(
+        max_length=16,
+        choices=PaymentMode.choices,
+        default=PaymentMode.CASH,
+        db_index=True,
+        verbose_name="Режим оплаты",
+        help_text="cash/installment/barter/mixed — для поддержки бартера и смешанных оплат.",
+    )
+
+    group = models.ForeignKey(
+        "BuildingTreatyGroup",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="treaties",
+        verbose_name="Папка/группа",
+    )
+
     down_payment = models.DecimalField(max_digits=16, decimal_places=2, default=Decimal("0.00"), verbose_name="Первоначальный взнос")
     payment_terms = models.TextField(blank=True, verbose_name="Условия оплаты")
 
@@ -2133,6 +2207,8 @@ class BuildingTreaty(models.Model):
             models.Index(fields=["residential_complex", "status"]),
             models.Index(fields=["residential_complex", "operation_type", "created_at"]),
             models.Index(fields=["residential_complex", "payment_type", "created_at"]),
+            models.Index(fields=["residential_complex", "treaty_type", "created_at"]),
+            models.Index(fields=["group", "created_at"]),
             models.Index(fields=["erp_sync_status", "created_at"]),
         ]
 
@@ -2176,6 +2252,127 @@ class BuildingTreatyInstallment(models.Model):
             models.Index(fields=["treaty", "due_date"]),
             models.Index(fields=["status", "due_date"]),
         ]
+
+
+class BuildingTreatyInstallmentPayment(models.Model):
+    """История оплат по взносам рассрочки (отдельные записи)."""
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False, verbose_name="ID")
+    installment = models.ForeignKey(
+        BuildingTreatyInstallment,
+        on_delete=models.CASCADE,
+        related_name="payments",
+        verbose_name="Взнос",
+    )
+    amount = models.DecimalField(max_digits=16, decimal_places=2, verbose_name="Сумма оплаты")
+    paid_at = models.DateTimeField(default=timezone.now, verbose_name="Дата оплаты")
+    cashbox = models.ForeignKey(
+        "BuildingCashbox",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="treaty_installment_payments",
+        verbose_name="Касса",
+    )
+    cashflow = models.ForeignKey(
+        "BuildingCashFlow",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="treaty_installment_payments",
+        verbose_name="Движение по кассе",
+    )
+    external_payment_id = models.CharField(
+        max_length=128,
+        blank=True,
+        db_index=True,
+        verbose_name="Внешний ID платежа",
+        help_text="Для идемпотентности (если передаётся).",
+    )
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="building_treaty_installment_payments_created",
+        verbose_name="Кто провёл",
+    )
+    created_at = models.DateTimeField(auto_now_add=True, verbose_name="Создано")
+
+    class Meta:
+        verbose_name = "Оплата взноса рассрочки"
+        verbose_name_plural = "Оплаты взносов рассрочки"
+        ordering = ["-paid_at", "-created_at"]
+        indexes = [
+            models.Index(fields=["installment", "paid_at"]),
+            models.Index(fields=["external_payment_id"]),
+        ]
+
+    def clean(self):
+        super().clean()
+        if self.amount is None or Decimal(self.amount or 0) <= 0:
+            raise ValidationError({"amount": "Сумма должна быть > 0."})
+
+
+class BuildingTreatyGroup(MPTTModel):
+    """Группы/папки договоров (иерархия)."""
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False, verbose_name="ID")
+    company = models.ForeignKey(
+        Company,
+        on_delete=models.CASCADE,
+        related_name="building_treaty_groups",
+        verbose_name="Компания",
+    )
+    residential_complex = models.ForeignKey(
+        "ResidentialComplex",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="treaty_groups",
+        verbose_name="ЖК (опционально)",
+    )
+    parent = TreeForeignKey(
+        "self",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="children",
+        verbose_name="Родительская папка",
+    )
+    title = models.CharField(max_length=255, verbose_name="Название")
+    order = models.IntegerField(null=True, blank=True, verbose_name="Порядок")
+    is_active = models.BooleanField(default=True, db_index=True, verbose_name="Активна")
+    created_at = models.DateTimeField(auto_now_add=True, verbose_name="Дата создания")
+    updated_at = models.DateTimeField(auto_now=True, verbose_name="Дата обновления")
+
+    class MPTTMeta:
+        order_insertion_by = ["order", "title"]
+
+    class Meta:
+        verbose_name = "Папка договоров (Building)"
+        verbose_name_plural = "Папки договоров (Building)"
+        ordering = ["tree_id", "lft"]
+        indexes = [
+            models.Index(fields=["company", "is_active"]),
+            models.Index(fields=["company", "residential_complex"]),
+        ]
+
+    def clean(self):
+        super().clean()
+        # Защита от циклов (MPTT тоже контролирует, но даём понятную ошибку).
+        if self.parent_id and self.pk and self.parent_id == self.pk:
+            raise ValidationError({"parent": "Нельзя указать папку родителем самой себя."})
+        if self.parent_id and self.pk:
+            p = self.parent
+            while p is not None:
+                if p.pk == self.pk:
+                    raise ValidationError({"parent": "Нельзя создать цикл в дереве папок."})
+                p = p.parent
+
+    def save(self, *args, **kwargs):
+        self.title = (self.title or "").strip()
+        super().save(*args, **kwargs)
 
     def __str__(self):
         return f"{self.treaty_id}: {self.due_date} / {self.amount}"
@@ -2238,6 +2435,11 @@ class BuildingWorkEntry(models.Model):
         COMPLETED = "completed", "Завершено"
         CANCELLED = "cancelled", "Отменено"
 
+    class PaymentMode(models.TextChoices):
+        CASH = "cash", "Наличные"
+        DEBT = "debt", "В долг"
+        MIXED = "mixed", "Смешанная"
+
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False, verbose_name="ID")
     residential_complex = models.ForeignKey(
         ResidentialComplex,
@@ -2285,6 +2487,16 @@ class BuildingWorkEntry(models.Model):
         related_name="work_entries",
         verbose_name="Договор",
     )
+    payment_mode = models.CharField(
+        max_length=16,
+        choices=PaymentMode.choices,
+        default=PaymentMode.CASH,
+        db_index=True,
+        verbose_name="Режим оплаты",
+    )
+    treaty_auto_create = models.BooleanField(default=False, verbose_name="Автосоздать договор")
+    treaty_type = models.CharField(max_length=32, blank=True, verbose_name="Тип создаваемого договора")
+    treaty_title = models.CharField(max_length=255, blank=True, verbose_name="Название создаваемого договора")
     created_by = models.ForeignKey(
         settings.AUTH_USER_MODEL,
         on_delete=models.SET_NULL,
@@ -2947,3 +3159,256 @@ class BuildingPayrollPayment(models.Model):
 
     def __str__(self):
         return f"{self.line_id}: {self.amount} ({self.get_status_display()})"
+
+
+# -----------------------
+# Долги (единый ledger AP/AR)
+# -----------------------
+
+
+def building_debt_file_upload_to(instance, filename: str) -> str:
+    ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else "bin"
+    return f"building/debts/{instance.entry_id}/files/{uuid.uuid4().hex}.{ext}"
+
+
+class BuildingDebtLedgerEntry(models.Model):
+    class Direction(models.TextChoices):
+        PAYABLE = "payable", "Мы должны"
+        RECEIVABLE = "receivable", "Нам должны"
+
+    class EntryType(models.TextChoices):
+        CHARGE = "charge", "Начисление"
+        PAYMENT = "payment", "Оплата"
+        BARTER = "barter", "Бартер"
+        ADJUSTMENT = "adjustment", "Корректировка"
+        WRITEOFF = "writeoff", "Списание"
+
+    class Status(models.TextChoices):
+        DRAFT = "draft", "Черновик"
+        APPROVED = "approved", "Подтверждено"
+        CANCELLED = "cancelled", "Отменено"
+
+    class CounterpartyType(models.TextChoices):
+        CLIENT = "client", "Клиент"
+        SUPPLIER = "supplier", "Поставщик"
+        CONTRACTOR = "contractor", "Подрядчик"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False, verbose_name="ID")
+    company = models.ForeignKey(
+        Company,
+        on_delete=models.CASCADE,
+        related_name="building_debt_entries",
+        verbose_name="Компания",
+    )
+    direction = models.CharField(max_length=16, choices=Direction.choices, db_index=True, verbose_name="Направление")
+    counterparty_type = models.CharField(max_length=16, choices=CounterpartyType.choices, db_index=True, verbose_name="Тип контрагента")
+    counterparty_id = models.UUIDField(db_index=True, verbose_name="ID контрагента")
+
+    entry_type = models.CharField(max_length=16, choices=EntryType.choices, db_index=True, verbose_name="Тип записи")
+    amount = models.DecimalField(max_digits=16, decimal_places=2, verbose_name="Сумма")
+    currency = models.CharField(max_length=8, default="KGS", verbose_name="Валюта")
+    status = models.CharField(max_length=16, choices=Status.choices, default=Status.APPROVED, db_index=True, verbose_name="Статус")
+
+    residential_complex = models.ForeignKey(
+        "ResidentialComplex",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="debt_entries",
+        verbose_name="ЖК",
+    )
+    source_type = models.CharField(max_length=32, blank=True, db_index=True, verbose_name="Источник (тип)")
+    source_id = models.UUIDField(null=True, blank=True, db_index=True, verbose_name="Источник (id)")
+
+    comment = models.TextField(blank=True, verbose_name="Комментарий")
+    occurred_at = models.DateTimeField(default=timezone.now, db_index=True, verbose_name="Дата операции")
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="building_debt_entries_created",
+        verbose_name="Кто создал",
+    )
+    created_at = models.DateTimeField(auto_now_add=True, verbose_name="Дата создания")
+    updated_at = models.DateTimeField(auto_now=True, verbose_name="Дата обновления")
+
+    class Meta:
+        verbose_name = "Долг: запись реестра"
+        verbose_name_plural = "Долги: реестр"
+        ordering = ["-occurred_at", "-created_at"]
+        indexes = [
+            models.Index(fields=["company", "direction", "counterparty_type", "counterparty_id"]),
+            models.Index(fields=["company", "status", "occurred_at"]),
+            models.Index(fields=["source_type", "source_id"]),
+            models.Index(fields=["residential_complex", "occurred_at"]),
+        ]
+        constraints = [
+            models.CheckConstraint(check=models.Q(amount__gt=0), name="ck_building_debt_amount_positive"),
+        ]
+
+    def __str__(self):
+        return f"{self.counterparty_type}:{self.counterparty_id} {self.entry_type} {self.amount}"
+
+
+class BuildingDebtLedgerFile(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False, verbose_name="ID")
+    entry = models.ForeignKey(
+        BuildingDebtLedgerEntry,
+        on_delete=models.CASCADE,
+        related_name="files",
+        verbose_name="Запись реестра",
+    )
+    title = models.CharField(max_length=255, blank=True, verbose_name="Название файла")
+    file = models.FileField(upload_to=building_debt_file_upload_to, verbose_name="Файл")
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="building_debt_files_created",
+        verbose_name="Кто загрузил",
+    )
+    created_at = models.DateTimeField(auto_now_add=True, verbose_name="Дата загрузки")
+
+    class Meta:
+        verbose_name = "Долг: файл"
+        verbose_name_plural = "Долги: файлы"
+        ordering = ["-created_at"]
+        indexes = [
+            models.Index(fields=["entry", "created_at"]),
+        ]
+
+
+# -----------------------
+# Бартер (унифицированные позиции)
+# -----------------------
+
+
+def building_barter_file_upload_to(instance, filename: str) -> str:
+    ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else "bin"
+    return f"building/barter/{instance.source_type}/{instance.source_id}/files/{uuid.uuid4().hex}.{ext}"
+
+
+class BuildingBarterItem(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False, verbose_name="ID")
+    company = models.ForeignKey(
+        Company,
+        on_delete=models.CASCADE,
+        related_name="building_barter_items",
+        verbose_name="Компания",
+    )
+    title = models.CharField(max_length=255, verbose_name="Название")
+    quantity = models.DecimalField(max_digits=16, decimal_places=3, null=True, blank=True, verbose_name="Количество")
+    unit = models.CharField(max_length=64, null=True, blank=True, verbose_name="Ед. изм.")
+    unit_price = models.DecimalField(max_digits=16, decimal_places=2, null=True, blank=True, verbose_name="Цена за ед.")
+    total_price = models.DecimalField(max_digits=16, decimal_places=2, verbose_name="Итог (оценка)")
+    currency = models.CharField(max_length=8, default="KGS", verbose_name="Валюта")
+    comment = models.TextField(blank=True, verbose_name="Комментарий")
+    source_type = models.CharField(max_length=32, db_index=True, verbose_name="Источник (тип)")
+    source_id = models.UUIDField(db_index=True, verbose_name="Источник (id)")
+    created_at = models.DateTimeField(auto_now_add=True, verbose_name="Дата создания")
+    updated_at = models.DateTimeField(auto_now=True, verbose_name="Дата обновления")
+
+    class Meta:
+        verbose_name = "Бартер: позиция"
+        verbose_name_plural = "Бартер: позиции"
+        ordering = ["-created_at"]
+        indexes = [
+            models.Index(fields=["company", "source_type", "source_id"]),
+        ]
+        constraints = [
+            models.CheckConstraint(check=models.Q(total_price__gt=0), name="ck_building_barter_total_positive"),
+        ]
+
+
+class BuildingBarterFile(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False, verbose_name="ID")
+    company = models.ForeignKey(
+        Company,
+        on_delete=models.CASCADE,
+        related_name="building_barter_files",
+        verbose_name="Компания",
+    )
+    source_type = models.CharField(max_length=32, db_index=True, verbose_name="Источник (тип)")
+    source_id = models.UUIDField(db_index=True, verbose_name="Источник (id)")
+    title = models.CharField(max_length=255, blank=True, verbose_name="Название файла")
+    file = models.FileField(upload_to=building_barter_file_upload_to, verbose_name="Файл")
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="building_barter_files_created",
+        verbose_name="Кто загрузил",
+    )
+    created_at = models.DateTimeField(auto_now_add=True, verbose_name="Дата загрузки")
+
+    class Meta:
+        verbose_name = "Бартер: файл"
+        verbose_name_plural = "Бартер: файлы"
+        ordering = ["-created_at"]
+        indexes = [
+            models.Index(fields=["company", "source_type", "source_id"]),
+        ]
+
+
+# -----------------------
+# АВР (акт выполненных работ) для WorkEntry
+# -----------------------
+
+
+def building_work_entry_acceptance_file_upload_to(instance, filename: str) -> str:
+    ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else "bin"
+    return f"building/work-entry-acceptance/{instance.acceptance_id}/files/{uuid.uuid4().hex}.{ext}"
+
+
+class BuildingWorkEntryAcceptance(models.Model):
+    class Status(models.TextChoices):
+        DRAFT = "draft", "Черновик"
+        SIGNED = "signed", "Подписан"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False, verbose_name="ID")
+    work_entry = models.OneToOneField(
+        "BuildingWorkEntry",
+        on_delete=models.CASCADE,
+        related_name="acceptance",
+        verbose_name="Процесс работ",
+    )
+    status = models.CharField(max_length=16, choices=Status.choices, default=Status.DRAFT, db_index=True, verbose_name="Статус")
+    comment = models.TextField(blank=True, verbose_name="Комментарий")
+    created_at = models.DateTimeField(auto_now_add=True, verbose_name="Дата создания")
+    signed_at = models.DateTimeField(null=True, blank=True, verbose_name="Дата подписания")
+
+    class Meta:
+        verbose_name = "АВР (акт выполненных работ)"
+        verbose_name_plural = "АВР (акты выполненных работ)"
+
+
+class BuildingWorkEntryAcceptanceFile(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False, verbose_name="ID")
+    acceptance = models.ForeignKey(
+        BuildingWorkEntryAcceptance,
+        on_delete=models.CASCADE,
+        related_name="files",
+        verbose_name="АВР",
+    )
+    title = models.CharField(max_length=255, blank=True, verbose_name="Название файла")
+    file = models.FileField(upload_to=building_work_entry_acceptance_file_upload_to, verbose_name="Файл")
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="building_work_entry_acceptance_files_created",
+        verbose_name="Кто загрузил",
+    )
+    created_at = models.DateTimeField(auto_now_add=True, verbose_name="Дата загрузки")
+
+    class Meta:
+        verbose_name = "Файл АВР"
+        verbose_name_plural = "Файлы АВР"
+        ordering = ["-created_at"]
+        indexes = [
+            models.Index(fields=["acceptance", "created_at"]),
+        ]
