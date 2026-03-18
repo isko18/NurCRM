@@ -1472,6 +1472,7 @@ class CartItem(models.Model):
                     })
 
     def save(self, *args, **kwargs):
+        skip_full_clean = bool(kwargs.pop("skip_full_clean", False))
         if self.cart_id:
             self.company_id = self.cart.company_id
             self.branch_id = self.cart.branch_id
@@ -1484,7 +1485,8 @@ class CartItem(models.Model):
         if hasattr(self, "line_discount"):
             self.line_discount = _money(getattr(self, "line_discount", None) or Decimal("0.00"))
 
-        self.full_clean()
+        if not skip_full_clean:
+            self.full_clean()
         super().save(*args, **kwargs)
         self.cart.recalc()
 
