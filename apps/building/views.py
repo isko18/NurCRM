@@ -2154,10 +2154,22 @@ class BuildingWarehouseMovementTransferToWorkEntryView(CompanyQuerysetMixin, gen
 
                 if warehouse_request:
                     # Проверяем, что не выдаём больше, чем запрошено по заявке
-                    try:
-                        req_item = warehouse_request.items.get(stock_item=stock_item)
-                    except BuildingWarehouseRequestItem.DoesNotExist:
+                    req_items_qs = warehouse_request.items.select_for_update().filter(stock_item=stock_item)
+                    req_item = req_items_qs.first()
+                    if not req_item:
                         raise ValidationError({"items": f"Позиция {stock_item.name} отсутствует в заявке."})
+                    # If the DB contains duplicates, return a friendly 400 instead of 500.
+                    if req_items_qs.count() > 1:
+                        dup_ids = list(req_items_qs.values_list("id", flat=True)[:10])
+                        raise ValidationError(
+                            {
+                                "items": (
+                                    f"В заявке есть дубликаты позиции {stock_item.name}. "
+                                    f"Найдены строки: {', '.join([str(i) for i in dup_ids])}. "
+                                    "Удалите/объедините дубликаты и повторите операцию."
+                                )
+                            }
+                        )
                     already_issued = (
                         BuildingWarehouseMovementItem.objects.filter(
                             movement__warehouse_request=warehouse_request,
@@ -2653,11 +2665,14 @@ class BuildingTreatyInstallmentPaymentView(CompanyQuerysetMixin, generics.Generi
         _require_cash_register_perm(user)
 
         base_obj = self.get_object()
-        installment = (
-            BuildingTreatyInstallment.objects.select_for_update()
-            .select_related("treaty", "treaty__residential_complex")
-            .get(pk=base_obj.pk)
-        )
+        # Postgres forbids `FOR UPDATE` on the nullable side of an OUTER JOIN.
+        # `select_related()` can introduce LEFT OUTER JOINs when related FKs are nullable,
+        # so we lock the installment row only and fetch related objects separately.
+        installment = BuildingTreatyInstallment.objects.select_for_update(of=("self",)).get(pk=base_obj.pk)
+        treaty = BuildingTreaty.objects.select_related("residential_complex").filter(pk=installment.treaty_id).first()
+        if not treaty:
+            raise ValidationError({"treaty": "Договор не найден."})
+        installment.treaty = treaty
 
         ser = self.get_serializer(data=request.data)
         ser.is_valid(raise_exception=True)
@@ -2666,7 +2681,6 @@ class BuildingTreatyInstallmentPaymentView(CompanyQuerysetMixin, generics.Generi
         if amount <= 0:
             raise ValidationError({"amount": "Сумма должна быть > 0."})
 
-        treaty = installment.treaty
         rc = treaty.residential_complex
 
         if not getattr(user, "is_superuser", False) and rc.company_id != getattr(user, "company_id", None):
