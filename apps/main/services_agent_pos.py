@@ -6,7 +6,7 @@ from django.utils import timezone
 from django.core.exceptions import ValidationError
 
 from apps.main.models import (
-    Sale, SaleItem, ManufactureSubreal, AgentSaleAllocation, ReturnFromAgent
+    Sale, SaleItem, ManufactureSubreal, AgentSaleAllocation, ReturnFromAgent, Product
 )
 from apps.construction.models import Cashbox
 
@@ -97,6 +97,7 @@ def checkout_agent_cart(
     *,
     department=None,
     agent=None,
+    use_main_stock=False,
     cashbox_id=None,
     payment_method=None,
     cash_received=None,
@@ -136,10 +137,17 @@ def checkout_agent_cart(
         row = needs.setdefault(pid, {"product": it.product, "unit_price": effective_unit, "qty": 0})
         row["qty"] += qty_int
 
-    # --- 2) готовим FIFO остатки агента по продуктам ---
+    # --- 2) готовим источник остатков ---
     product_ids = [v["product"].id for k, v in needs.items() if not k.startswith("custom:")]
 
-    if product_ids:
+    products_by_id = {}
+    if use_main_stock and product_ids:
+        locked_products = Product.objects.select_for_update().filter(id__in=product_ids, company=company)
+        products_by_id = {p.id: p for p in locked_products}
+        subreals = []
+        sold_by_subreal = {}
+        reserved_by_subreal = {}
+    elif product_ids:
         subreals = (
             ManufactureSubreal.objects
             .select_for_update()
@@ -191,11 +199,19 @@ def checkout_agent_cart(
             continue
         pid = str(v["product"].id)
         need = int(v["qty"] or 0)
-        have = sum(q for _, q in fifo.get(pid, []))
-        if need > have:
-            raise AgentNotEnoughStock(
-                f"Недостаточно у агента: «{v['product'].name}». Нужно {need}, доступно {have}."
-            )
+        if use_main_stock:
+            p = products_by_id.get(v["product"].id)
+            have = int(Decimal(str(getattr(p, "quantity", 0) or 0)))
+            if need > have:
+                raise AgentNotEnoughStock(
+                    f"Недостаточно на основном складе: «{v['product'].name}». Нужно {need}, доступно {have}."
+                )
+        else:
+            have = sum(q for _, q in fifo.get(pid, []))
+            if need > have:
+                raise AgentNotEnoughStock(
+                    f"Недостаточно у агента: «{v['product'].name}». Нужно {need}, доступно {have}."
+                )
 
     # --- 4) создаём Sale (БЕЗ shift) ---
     create_kwargs = dict(
@@ -263,41 +279,59 @@ def checkout_agent_cart(
         )
         subtotal += (price or Decimal("0.00")) * qty
 
-        left = qty
-        queue = fifo.get(str(product.id), [])
-        while left > 0 and queue:
-            subr, free = queue[0]
-            take = min(left, free)
+        if not use_main_stock:
+            left = qty
+            queue = fifo.get(str(product.id), [])
+            while left > 0 and queue:
+                subr, free = queue[0]
+                take = min(left, free)
 
-            try:
-                alloc, created = AgentSaleAllocation.objects.get_or_create(
-                    company=company,
-                    agent=acting_agent,
-                    subreal=subr,
-                    sale=sale,
-                    sale_item=sitem,
-                    product=product,
-                    defaults={"qty": take},
-                )
-                if not created:
+                try:
+                    alloc, created = AgentSaleAllocation.objects.get_or_create(
+                        company=company,
+                        agent=acting_agent,
+                        subreal=subr,
+                        sale=sale,
+                        sale_item=sitem,
+                        product=product,
+                        defaults={"qty": take},
+                    )
+                    if not created:
+                        AgentSaleAllocation.objects.filter(pk=alloc.pk).update(qty=models.F("qty") + take)
+                except IntegrityError:
+                    alloc = AgentSaleAllocation.objects.get(
+                        company=company,
+                        agent=acting_agent,
+                        subreal=subr,
+                        sale=sale,
+                        sale_item=sitem,
+                        product=product,
+                    )
                     AgentSaleAllocation.objects.filter(pk=alloc.pk).update(qty=models.F("qty") + take)
-            except IntegrityError:
-                alloc = AgentSaleAllocation.objects.get(
-                    company=company,
-                    agent=acting_agent,
-                    subreal=subr,
-                    sale=sale,
-                    sale_item=sitem,
-                    product=product,
-                )
-                AgentSaleAllocation.objects.filter(pk=alloc.pk).update(qty=models.F("qty") + take)
 
-            free -= take
-            left -= take
-            if free == 0:
-                queue.pop(0)
-            else:
-                queue[0][1] = free
+                free -= take
+                left -= take
+                if free == 0:
+                    queue.pop(0)
+                else:
+                    queue[0][1] = free
+
+    if use_main_stock and product_ids:
+        changed_products = []
+        for k, v in needs.items():
+            if k.startswith("custom:"):
+                continue
+            p = products_by_id.get(v["product"].id)
+            if p is None:
+                raise AgentNotEnoughStock(f"Товар «{v['product'].name}» не найден на складе.")
+            p.quantity = Decimal(str(getattr(p, "quantity", 0) or 0)) - Decimal(int(v["qty"] or 0))
+            if p.quantity < 0:
+                raise AgentNotEnoughStock(
+                    f"Недостаточно на основном складе: «{v['product'].name}»."
+                )
+            changed_products.append(p)
+        if changed_products:
+            Product.objects.bulk_update(changed_products, ["quantity"])
 
     # --- 6) итоги + “оплата” ---
     sale.subtotal = subtotal

@@ -1818,15 +1818,43 @@ class ItemMakeSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer
     company = serializers.ReadOnlyField(source="company.id")
     branch = serializers.ReadOnlyField(source="branch.id")
     products = ProductNestedSerializer(many=True, read_only=True)
+    supplier_name = serializers.CharField(source="supplier.full_name", read_only=True)
 
     class Meta:
         model = ItemMake
         fields = [
             "id", "company", "branch",
-            "name", "price", "unit", "quantity",
+            "name", "supplier", "supplier_name", "price", "unit", "quantity",
             "products",
             "created_at", "updated_at",
         ]
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        company = self._user_company()
+        branch = self._auto_branch()
+
+        supplier_qs = Client.objects.filter(type=Client.StatusClient.SUPPLIERS)
+        if company:
+            supplier_qs = supplier_qs.filter(company=company)
+        if branch:
+            supplier_qs = supplier_qs.filter(branch__in=[None, branch])
+        self.fields["supplier"].queryset = supplier_qs
+
+    def validate(self, attrs):
+        company = self._user_company()
+        branch = self._auto_branch()
+        supplier = attrs.get("supplier", getattr(self.instance, "supplier", None))
+
+        if supplier is not None:
+            if supplier.type != Client.StatusClient.SUPPLIERS:
+                raise serializers.ValidationError({"supplier": "Выберите клиента с типом 'Поставщики'."})
+            if company and supplier.company_id != company.id:
+                raise serializers.ValidationError({"supplier": "Поставщик другой компании."})
+            if branch and supplier.branch_id not in (None, branch.id):
+                raise serializers.ValidationError({"supplier": "Поставщик другого филиала."})
+
+        return attrs
 
 
 # ===========================

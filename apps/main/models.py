@@ -1182,6 +1182,14 @@ class ItemMake(models.Model):
     )
 
     name = models.CharField("Название", max_length=255)
+    supplier = models.ForeignKey(
+        "main.Client",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="item_makes",
+        verbose_name="Поставщик",
+    )
     price = models.DecimalField("Цена", max_digits=10, decimal_places=2, default=0)
     unit = models.CharField("Единица измерения", max_length=50)
     quantity = models.DecimalField("Количество", max_digits=18, decimal_places=3, default=Decimal("0.000"))
