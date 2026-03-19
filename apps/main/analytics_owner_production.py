@@ -7,7 +7,7 @@ from django.utils import timezone
 
 from apps.users.models import User
 from apps.construction.models import CashFlow
-from .models import ManufactureSubreal, Acceptance, Sale, SaleItem, Debt, DebtPayment, Product
+from .models import ManufactureSubreal, Acceptance, Sale, SaleItem, ClientDeal, DealInstallment, Product
 
 
 # ─────────────────────────────────────────────────────────────
@@ -299,24 +299,26 @@ def build_owner_analytics_payload(*, company, branch, period, date_from, date_to
     )
 
     # ======================================================
-    # Total debt (общий долг): sum(amount - paid) per debt
+    # Total debt (общий долг по клиентам):
+    #   sum((deal.amount - deal.prepayment) - paid_per_deal_installment)
     # ======================================================
-    debts_qs = Debt.objects.filter(company=company)
+    deals_qs = ClientDeal.objects.filter(company=company, kind=ClientDeal.Kind.DEBT)
     if branch is not None:
         # В других метриках (например, stock_value) включают и филиальные, и глобальные записи.
-        # Для долгов это тоже должно работать, иначе total_debt возвращается 0 при наличии только global-branch долгов.
-        debts_qs = debts_qs.filter(Q(branch=branch) | Q(branch__isnull=True))
+        deals_qs = deals_qs.filter(Q(branch=branch) | Q(branch__isnull=True))
     else:
-        debts_qs = debts_qs.filter(branch__isnull=True)
+        deals_qs = deals_qs.filter(branch__isnull=True)
+
     paid_subq = (
-        DebtPayment.objects.filter(debt_id=OuterRef("pk"))
-        .values("debt_id")
-        .annotate(s=Sum("amount"))
+        DealInstallment.objects.filter(deal_id=OuterRef("pk"))
+        .values("deal_id")
+        .annotate(s=Sum("paid_amount"))
         .values("s")[:1]
     )
+
     total_debt_dec = (
-        debts_qs.annotate(paid=Coalesce(Subquery(paid_subq), V(Decimal("0"), output_field=MONEY_FIELD)))
-        .annotate(remaining=F("amount") - F("paid"))
+        deals_qs.annotate(paid=Coalesce(Subquery(paid_subq), V(Decimal("0.00"), output_field=MONEY_FIELD)))
+        .annotate(remaining=(F("amount") - F("prepayment")) - F("paid"))
         .aggregate(t=Sum("remaining"))["t"]
         or Decimal("0.00")
     )
