@@ -2089,6 +2089,10 @@ def _resolve_acting_agent(request, cart, *, allow_owner_override=True):
     return user
 
 
+def _should_use_main_stock_in_agent_sale(*, user, acting_agent) -> bool:
+    return _is_owner(user) and getattr(acting_agent, "id", None) == getattr(user, "id", None)
+
+
 @transaction.atomic
 def _allocate_agent_sale(*, company, agent, sale: Sale):
     items = sale.items.select_related("product").all()
@@ -2254,9 +2258,14 @@ class AgentSaleScanAPIView(MarketCashierOnlyMixin, CompanyBranchRestrictedMixin,
             return Response({"not_found": True, "message": "Товар не найден"}, status=404)
 
         acting_agent = _resolve_acting_agent(request, cart, allow_owner_override=True)
+        use_main_stock = _should_use_main_stock_in_agent_sale(user=request.user, acting_agent=acting_agent)
 
         # ✅ типобезопасно: int/Decimal не смешиваем
-        available = Decimal(_agent_available_qty(acting_agent, cart.company, product.id))
+        available = (
+            Decimal(str(getattr(product, "quantity", 0) or 0))
+            if use_main_stock
+            else Decimal(_agent_available_qty(acting_agent, cart.company, product.id))
+        )
         in_cart = _as_decimal(
             CartItem.objects.filter(cart=cart, product=product).aggregate(s=Sum("quantity"))["s"] or 0,
             default=Decimal("0"),
@@ -2266,7 +2275,13 @@ class AgentSaleScanAPIView(MarketCashierOnlyMixin, CompanyBranchRestrictedMixin,
         if req + in_cart > available:
             remaining = max(Decimal("0"), available - in_cart)
             return Response(
-                {"detail": f"Недостаточно у агента. Доступно: {qty3(remaining)}."},
+                {
+                    "detail": (
+                        f"Недостаточно на основном складе. Доступно: {qty3(remaining)}."
+                        if use_main_stock
+                        else f"Недостаточно у агента. Доступно: {qty3(remaining)}."
+                    )
+                },
                 status=400,
             )
 
@@ -2314,9 +2329,14 @@ class AgentSaleAddItemAPIView(MarketCashierOnlyMixin, CompanyBranchRestrictedMix
         qty = ser.validated_data["quantity"]
 
         acting_agent = _resolve_acting_agent(request, cart, allow_owner_override=True)
+        use_main_stock = _should_use_main_stock_in_agent_sale(user=request.user, acting_agent=acting_agent)
 
         # ✅ типобезопасно: int/Decimal не смешиваем
-        available = Decimal(_agent_available_qty(acting_agent, cart.company, product.id))
+        available = (
+            Decimal(str(getattr(product, "quantity", 0) or 0))
+            if use_main_stock
+            else Decimal(_agent_available_qty(acting_agent, cart.company, product.id))
+        )
         in_cart = _as_decimal(
             CartItem.objects.filter(cart=cart, product=product).aggregate(s=Sum("quantity"))["s"] or 0,
             default=Decimal("0"),
@@ -2326,7 +2346,13 @@ class AgentSaleAddItemAPIView(MarketCashierOnlyMixin, CompanyBranchRestrictedMix
         if req + in_cart > available:
             remaining = max(Decimal("0"), available - in_cart)
             return Response(
-                {"detail": f"Недостаточно у агента. Доступно: {qty3(remaining)}."},
+                {
+                    "detail": (
+                        f"Недостаточно на основном складе. Доступно: {qty3(remaining)}."
+                        if use_main_stock
+                        else f"Недостаточно у агента. Доступно: {qty3(remaining)}."
+                    )
+                },
                 status=400,
             )
 
@@ -2449,6 +2475,7 @@ class AgentSaleCheckoutAPIView(MarketCashierOnlyMixin, CompanyBranchRestrictedMi
                 cart.save(update_fields=["client"])
 
         acting_agent = _resolve_acting_agent(request, cart, allow_owner_override=True)
+        use_main_stock = _should_use_main_stock_in_agent_sale(user=request.user, acting_agent=acting_agent)
 
         cart.recalc()
         if payment_method == Sale.PaymentMethod.CASH and cash_received < cart.total:
@@ -2459,6 +2486,7 @@ class AgentSaleCheckoutAPIView(MarketCashierOnlyMixin, CompanyBranchRestrictedMi
             sale = checkout_agent_cart(
                 cart,
                 agent=acting_agent,
+                use_main_stock=use_main_stock,
                 cashbox_id=cashbox_id,  # можно сохранить кассу в Sale, но без смен
                 payment_method=payment_method,
                 cash_received=cash_received,

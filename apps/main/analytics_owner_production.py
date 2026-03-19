@@ -303,7 +303,9 @@ def build_owner_analytics_payload(*, company, branch, period, date_from, date_to
     # ======================================================
     debts_qs = Debt.objects.filter(company=company)
     if branch is not None:
-        debts_qs = debts_qs.filter(branch=branch)
+        # В других метриках (например, stock_value) включают и филиальные, и глобальные записи.
+        # Для долгов это тоже должно работать, иначе total_debt возвращается 0 при наличии только global-branch долгов.
+        debts_qs = debts_qs.filter(Q(branch=branch) | Q(branch__isnull=True))
     else:
         debts_qs = debts_qs.filter(branch__isnull=True)
     paid_subq = (

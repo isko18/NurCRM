@@ -2355,8 +2355,8 @@ class ItemListCreateAPIView(CompanyBranchRestrictedMixin, generics.ListCreateAPI
     serializer_class = ItemMakeSerializer
     queryset = ItemMake.objects.all()
     filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
-    search_fields = ["name", "products__name"]
-    filterset_fields = ["unit", "price", "quantity", "products"]
+    search_fields = ["name", "supplier__full_name", "products__name"]
+    filterset_fields = ["unit", "price", "quantity", "products", "supplier"]
     ordering_fields = ["created_at", "updated_at", "price", "quantity", "name"]
     ordering = ["-created_at"]
 
