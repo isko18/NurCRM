@@ -5,9 +5,16 @@ from django.db.models import Sum, Count, Value as V, F, DecimalField, Subquery, 
 from django.db.models.functions import Coalesce, TruncDate, TruncWeek, TruncMonth
 from django.utils import timezone
 
+from django.db.models.expressions import ExpressionWrapper
+
 from apps.users.models import User
 from apps.construction.models import CashFlow
 from .models import ManufactureSubreal, Acceptance, Sale, SaleItem, ClientDeal, DealInstallment, Product
+
+try:
+    from apps.warehouse.models import Document as WarehouseStockDocument
+except Exception:  # pragma: no cover - склад может быть отключён в тестах без миграций
+    WarehouseStockDocument = None
 
 
 # ─────────────────────────────────────────────────────────────
@@ -275,6 +282,41 @@ def build_owner_analytics_payload(*, company, branch, period, date_from, date_to
     revenue_dec = items_agg["revenue"] or Decimal("0.00")
     cogs_dec = items_agg["cogs"] or Decimal("0.00")
     gross_profit_dec = revenue_dec - cogs_dec
+    gross_margin_pct = Decimal("0.00")
+    if revenue_dec and revenue_dec > 0:
+        gross_margin_pct = (gross_profit_dec / revenue_dec * Decimal("100")).quantize(Decimal("0.01"))
+
+    trunc_gp = _trunc_by_group("sale__created_at", group_by)
+    gross_profit_by_period_qs = (
+        items_qs.annotate(period=trunc_gp)
+        .values("period")
+        .annotate(
+            revenue_p=Coalesce(
+                Sum(F("quantity") * F("unit_price"), output_field=MONEY_FIELD),
+                ZERO_MONEY,
+            ),
+            cogs_p=Coalesce(
+                Sum(
+                    F("quantity")
+                    * Coalesce(F("purchase_price_snapshot"), V(Decimal("0"), output_field=MONEY_FIELD)),
+                    output_field=MONEY_FIELD,
+                ),
+                ZERO_MONEY,
+            ),
+        )
+        .order_by("period")
+    )
+    gross_profit_by_date = [
+        {
+            "date": row["period"],
+            "revenue": _money_str(row["revenue_p"] or Decimal("0.00")),
+            "cost_of_goods_sold": _money_str(row["cogs_p"] or Decimal("0.00")),
+            "gross_profit": _money_str(
+                (row["revenue_p"] or Decimal("0.00")) - (row["cogs_p"] or Decimal("0.00"))
+            ),
+        }
+        for row in gross_profit_by_period_qs
+    ]
 
     # ======================================================
     # Stock value (стоимость склада): sum(quantity * purchase_price)
@@ -316,12 +358,49 @@ def build_owner_analytics_payload(*, company, branch, period, date_from, date_to
         .values("s")[:1]
     )
 
-    total_debt_dec = (
+    client_deals_receivable_dec = (
         deals_qs.annotate(paid=Coalesce(Subquery(paid_subq), V(Decimal("0.00"), output_field=MONEY_FIELD)))
         .annotate(remaining=(F("amount") - F("prepayment")) - F("paid"))
         .aggregate(t=Sum("remaining"))["t"]
         or Decimal("0.00")
     )
+
+    # Продажи POS/маркет «в долг» (клиент должен компании)
+    sales_debt_qs = Sale.objects.filter(company=company, status=Sale.Status.DEBT)
+    if branch is not None:
+        sales_debt_qs = sales_debt_qs.filter(Q(branch=branch) | Q(branch__isnull=True))
+    else:
+        sales_debt_qs = sales_debt_qs.filter(branch__isnull=True)
+    pos_sales_receivable_dec = sales_debt_qs.aggregate(s=Coalesce(Sum("total"), ZERO_MONEY))["s"] or Decimal(
+        "0.00"
+    )
+
+    accounts_receivable_dec = client_deals_receivable_dec + pos_sales_receivable_dec
+
+    # Кредиторская задолженность: проведённые закупки в долг (склад), остаток total − предоплата
+    accounts_payable_dec = Decimal("0.00")
+    if WarehouseStockDocument is not None:
+        ap_qs = WarehouseStockDocument.objects.filter(
+            doc_type=WarehouseStockDocument.DocType.PURCHASE,
+            status=WarehouseStockDocument.Status.POSTED,
+            payment_kind=WarehouseStockDocument.PaymentKind.CREDIT,
+            warehouse_to__company=company,
+        )
+        if branch is not None:
+            ap_qs = ap_qs.filter(Q(warehouse_to__branch=branch) | Q(warehouse_to__branch__isnull=True))
+        else:
+            ap_qs = ap_qs.filter(warehouse_to__branch__isnull=True)
+        due_expr = ExpressionWrapper(
+            F("total") - Coalesce(F("prepayment_amount"), V(Decimal("0"), output_field=MONEY_FIELD)),
+            output_field=MONEY_FIELD,
+        )
+        accounts_payable_dec = (
+            ap_qs.annotate(due=due_expr)
+            .aggregate(s=Coalesce(Sum("due"), ZERO_MONEY))["s"]
+            or Decimal("0.00")
+        )
+        if accounts_payable_dec < 0:
+            accounts_payable_dec = Decimal("0.00")
 
     # ======================================================
     # Expense breakdown (статья расходов): CashFlow by name
@@ -370,12 +449,24 @@ def build_owner_analytics_payload(*, company, branch, period, date_from, date_to
             "items_transferred": items_transferred,
             "sales_count": sales_count,
             "sales_amount": _money_str(sales_amount_dec),
+            # Валовая прибыль (оплаченные продажи за период): выручка − себестоимость
+            "revenue": _money_str(revenue_dec),
+            "cost_of_goods_sold": _money_str(cogs_dec),
             "gross_profit": _money_str(gross_profit_dec),
+            "gross_margin_percent": _money_str(gross_margin_pct),
             "stock_value": _money_str(stock_value_dec),
-            "total_debt": _money_str(total_debt_dec),
+            # Дебиторская: долги клиентов (CRM-сделки + продажи «в долг»)
+            "accounts_receivable": _money_str(accounts_receivable_dec),
+            "accounts_receivable_client_deals": _money_str(client_deals_receivable_dec),
+            "accounts_receivable_pos_sales": _money_str(pos_sales_receivable_dec),
+            # Кредиторская: долг перед поставщиками по закупкам в кредит (склад)
+            "accounts_payable": _money_str(accounts_payable_dec),
+            # Совместимость: раньше только остаток по рассрочке ClientDeal
+            "total_debt": _money_str(client_deals_receivable_dec),
         },
         "charts": {
             "sales_by_date": sales_by_date,
+            "gross_profit_by_date": gross_profit_by_date,
             "transfers_by_date": transfers_by_date,
             "top_products_by_sales": top_products_by_sales,
             "top_users_by_sales": top_users_by_sales,
