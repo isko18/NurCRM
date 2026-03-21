@@ -986,7 +986,20 @@ class AgentMyProductsListAPIView(CompanyBranchRestrictedMixin, APIView):
                 m.WarehouseProduct.objects
                 .filter(warehouse=wh)
                 .select_related("product_group", "category")
-                .only("id", "name", "article", "unit", "price", "quantity", "warehouse_id", "created_date", "updated_date", "product_group_id", "category_id")
+                .only(
+                    "id",
+                    "name",
+                    "article",
+                    "unit",
+                    "price",
+                    "discount_percent",
+                    "quantity",
+                    "warehouse_id",
+                    "created_date",
+                    "updated_date",
+                    "product_group_id",
+                    "category_id",
+                )
             )
             if product_group_id:
                 prod_qs = prod_qs.filter(product_group_id=product_group_id)
