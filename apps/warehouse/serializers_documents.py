@@ -7,6 +7,36 @@ from . import models
 User = get_user_model()
 
 
+def _merge_product_discount_into_item(item_data: dict) -> dict:
+    """
+    Если клиент не задал скидку по строке (поле нет или null) — берём процент с карточки товара.
+    Явный 0% в запросе не заменяем.
+    """
+    if "discount_percent" in item_data and item_data.get("discount_percent") is not None:
+        return item_data
+    product = item_data.get("product")
+    if product is None:
+        return item_data
+    if hasattr(product, "discount_percent"):
+        pct = getattr(product, "discount_percent", None) or Decimal("0")
+    else:
+        row = (
+            models.WarehouseProduct.objects.filter(pk=product)
+            .values_list("discount_percent", flat=True)
+            .first()
+        )
+        pct = row or Decimal("0")
+    pct = Decimal(str(pct))
+    if pct > 0:
+        merged = dict(item_data)
+        merged["discount_percent"] = pct
+        return merged
+    merged = dict(item_data)
+    if merged.get("discount_percent") is None:
+        merged["discount_percent"] = Decimal("0.00")
+    return merged
+
+
 class StockMoveSerializer(serializers.ModelSerializer):
     """Сериализатор движения товара с видом: приход или расход."""
 
@@ -33,6 +63,19 @@ class StockMoveSerializer(serializers.ModelSerializer):
 class DocumentItemSerializer(serializers.ModelSerializer):
     product_name = serializers.CharField(source="product.name", read_only=True, allow_null=True)
     product_article = serializers.CharField(source="product.article", read_only=True, allow_null=True)
+    product_discount_percent = serializers.DecimalField(
+        source="product.discount_percent",
+        max_digits=5,
+        decimal_places=2,
+        read_only=True,
+    )
+    product_discount_amount = serializers.SerializerMethodField()
+    discount_percent = serializers.DecimalField(
+        max_digits=5, decimal_places=2, required=False, allow_null=True
+    )
+    discount_amount = serializers.DecimalField(
+        max_digits=18, decimal_places=2, required=False, allow_null=True
+    )
 
     class Meta:
         model = models.DocumentItem
@@ -41,12 +84,24 @@ class DocumentItemSerializer(serializers.ModelSerializer):
             "product",
             "product_name",
             "product_article",
+            "product_discount_percent",
+            "product_discount_amount",
             "qty",
             "price",
             "discount_percent",
             "discount_amount",
             "line_total",
         )
+
+    def get_product_discount_amount(self, obj):
+        """Сумма скидки по проценту с карточки товара для текущих цены и количества в строке."""
+        p = getattr(obj, "product", None)
+        if not p:
+            return Decimal("0.00").quantize(Decimal("0.01"))
+        price = Decimal(obj.price or 0)
+        qty = Decimal(obj.qty or 0)
+        pct = Decimal(getattr(p, "discount_percent", None) or 0)
+        return (price * qty * pct / Decimal("100")).quantize(Decimal("0.01"))
 
 
 class DocumentSerializer(serializers.ModelSerializer):
@@ -170,6 +225,7 @@ class DocumentSerializer(serializers.ModelSerializer):
         
         # Валидация и создание items
         for it in items:
+            it = _merge_product_discount_into_item(dict(it))
             item = models.DocumentItem(document=doc, **it)
             try:
                 item.clean()
@@ -204,6 +260,7 @@ class DocumentSerializer(serializers.ModelSerializer):
             
             # Валидация и создание новых items
             for it in items:
+                it = _merge_product_discount_into_item(dict(it))
                 item = models.DocumentItem(document=instance, **it)
                 try:
                     item.clean()
