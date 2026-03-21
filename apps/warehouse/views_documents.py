@@ -84,18 +84,11 @@ class AgentDocumentListCreateView(DocumentListCreateView):
 
         use_common_stock = bool(serializer.validated_data.get("use_common_stock", False))
         if not use_common_stock and wh_from is not None:
-            membership = (
-                models.CompanyWarehouseAgent.objects
-                .filter(
-                    user=user,
-                    status=models.CompanyWarehouseAgent.Status.ACTIVE,
-                    common_access_enabled=True,
-                    common_warehouse=wh_from,
-                )
-                .select_related("common_warehouse")
-                .first()
-            )
-            if membership is not None:
+            if services.agent_has_common_access_to_warehouse(
+                user=user,
+                warehouse=wh_from,
+                company=getattr(wh_from, "company", None),
+            ):
                 use_common_stock = True
 
         serializer.save(agent=user, use_common_stock=use_common_stock)
@@ -121,7 +114,15 @@ class _DocumentTypedListCreateView(DocumentListCreateView):
         if _is_owner_like(user):
             self._save_with_company_branch(serializer, **extra)
             return
-        self._save_with_company_branch(serializer, agent=user, **extra)
+        wh_from = serializer.validated_data.get("warehouse_from")
+        use_common_stock = False
+        if wh_from is not None and services.agent_has_common_access_to_warehouse(
+            user=user,
+            warehouse=wh_from,
+            company=getattr(wh_from, "company", None),
+        ):
+            use_common_stock = True
+        self._save_with_company_branch(serializer, agent=user, use_common_stock=use_common_stock, **extra)
 
 
 class DocumentSaleListCreateView(_DocumentTypedListCreateView):

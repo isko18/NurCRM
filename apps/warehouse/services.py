@@ -7,6 +7,21 @@ from . import models
 from .models import q_qty
 
 
+def agent_has_common_access_to_warehouse(*, user, warehouse, company=None) -> bool:
+    """Активное членство агента с общим доступом к указанному складу (продажи с остатка склада)."""
+    if user is None or warehouse is None:
+        return False
+    qs = models.CompanyWarehouseAgent.objects.filter(
+        user=user,
+        status=models.CompanyWarehouseAgent.Status.ACTIVE,
+        common_access_enabled=True,
+        common_warehouse=warehouse,
+    )
+    if company is not None:
+        qs = qs.filter(company=company)
+    return qs.exists()
+
+
 def _ensure_number(document: models.Document):
     # generate number like TYPE-YYYYMMDD-0001 per day+type
     today = timezone.now().date()
@@ -260,14 +275,18 @@ def post_document(document: models.Document, allow_negative: bool = None) -> mod
     # Если allow_negative не передан явно, берем из настроек
     if allow_negative is None:
         allow_negative = getattr(settings, "ALLOW_NEGATIVE_STOCK", False)
-    if document.agent_id:
+    # Персональный остаток агента — без минуса; общий склад (use_common_stock) — как у обычного документа
+    if document.agent_id and not bool(getattr(document, "use_common_stock", False)):
         allow_negative = False
 
     with transaction.atomic():
         # Оптимизация: предзагружаем items с продуктами
         items = list(document.items.select_related("product", "product__warehouse", "product__brand", "product__category").all())
 
-        if document.agent_id:
+        agent_personal_stock = bool(
+            document.agent_id and not bool(getattr(document, "use_common_stock", False))
+        )
+        if agent_personal_stock:
             if document.doc_type in (document.DocType.TRANSFER, document.DocType.INVENTORY):
                 raise ValueError("Agent documents cannot be TRANSFER or INVENTORY")
 
@@ -644,7 +663,10 @@ def unpost_document(document: models.Document) -> models.Document:
         raise ValueError("Document is not posted")
 
     with transaction.atomic():
-        if document.agent_id:
+        agent_personal_stock = bool(
+            document.agent_id and not bool(getattr(document, "use_common_stock", False))
+        )
+        if agent_personal_stock:
             moves = list(document.agent_moves.select_related("warehouse", "product").select_for_update())
             for mv in moves:
                 bal, _ = models.AgentStockBalance.objects.select_for_update().get_or_create(

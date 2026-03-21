@@ -826,12 +826,18 @@ class AgentRequestCartCreateSaleAPIView(CompanyBranchRestrictedMixin, APIView):
         should_post = bool(ser.validated_data.get("post") or False)
 
         with transaction.atomic():
+            use_common_stock = services.agent_has_common_access_to_warehouse(
+                user=cart.agent,
+                warehouse=cart.warehouse,
+                company=cart.company,
+            )
             doc = m.Document.objects.create(
                 doc_type=m.Document.DocType.SALE,
                 status=m.Document.Status.DRAFT,
                 warehouse_from=cart.warehouse,
                 counterparty=counterparty,
                 agent=cart.agent,
+                use_common_stock=use_common_stock,
                 payment_kind=ser.validated_data.get("payment_kind") or m.Document.PaymentKind.CASH,
                 prepayment_amount=ser.validated_data.get("prepayment_amount") or Decimal("0.00"),
                 discount_percent=ser.validated_data.get("discount_percent") or Decimal("0.00"),
