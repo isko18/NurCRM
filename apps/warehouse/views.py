@@ -848,12 +848,13 @@ class AgentRequestCartCreateSaleAPIView(CompanyBranchRestrictedMixin, APIView):
             for it in cart.items.select_related("product").all():
                 product = it.product
                 price = Decimal(getattr(product, "price", None) or 0).quantize(Decimal("0.01"))
+                line_dp = Decimal(getattr(product, "discount_percent", None) or 0).quantize(Decimal("0.01"))
                 item = m.DocumentItem(
                     document=doc,
                     product=product,
                     qty=it.quantity_requested,
                     price=price,
-                    discount_percent=Decimal("0.00"),
+                    discount_percent=line_dp,
                     discount_amount=Decimal("0.00"),
                 )
                 try:

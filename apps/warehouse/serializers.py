@@ -676,6 +676,9 @@ class AgentStockBalanceSerializer(serializers.ModelSerializer):
     product_article = serializers.CharField(source="product.article", read_only=True)
     product_unit = serializers.CharField(source="product.unit", read_only=True)
     product_price = serializers.DecimalField(source="product.price", max_digits=18, decimal_places=3, read_only=True)
+    product_discount_percent = serializers.DecimalField(
+        source="product.discount_percent", max_digits=12, decimal_places=2, read_only=True
+    )
     product_group = serializers.SerializerMethodField()
     product_group_name = serializers.SerializerMethodField()
     product_category = serializers.SerializerMethodField()
@@ -695,6 +698,7 @@ class AgentStockBalanceSerializer(serializers.ModelSerializer):
             "product_article",
             "product_unit",
             "product_price",
+            "product_discount_percent",
             "product_group",
             "product_group_name",
             "product_category",
@@ -763,6 +767,7 @@ class CommonWarehouseBalanceSerializer(serializers.Serializer):
     product_article = serializers.CharField(allow_null=True, required=False)
     product_unit = serializers.CharField()
     product_price = serializers.DecimalField(max_digits=18, decimal_places=3)
+    product_discount_percent = serializers.DecimalField(max_digits=12, decimal_places=2)
     product_group = serializers.UUIDField(allow_null=True, required=False)
     product_group_name = serializers.CharField(allow_null=True, required=False)
     product_category = serializers.UUIDField(allow_null=True, required=False)
@@ -788,6 +793,7 @@ class CommonWarehouseBalanceSerializer(serializers.Serializer):
             "product_article": getattr(product, "article", None),
             "product_unit": getattr(product, "unit", "") or "",
             "product_price": getattr(product, "price", None) or Decimal("0.000"),
+            "product_discount_percent": getattr(product, "discount_percent", None) or Decimal("0.00"),
             "product_group": product_group.id if product_group else None,
             "product_group_name": (getattr(product_group, "name", "") or "") if product_group else None,
             "product_category": category.id if category else None,
