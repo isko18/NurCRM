@@ -350,7 +350,11 @@ def accept_transfer(transfer: BuildingTransferRequest, actor, note: str = ""):
 
     # Закупка "в долг": создаём запись долга (мы должны поставщику)
     try:
-        if (getattr(procurement, "payment_mode", None) in ("debt", "mixed")) and procurement.supplier_id and procurement.total_amount:
+        if (
+            getattr(procurement, "payment_mode", None) in ("debt", "mixed", "barter")
+            and procurement.supplier_id
+            and procurement.total_amount
+        ):
             BuildingDebtLedgerEntry.objects.create(
                 company_id=procurement.residential_complex.company_id,
                 direction=BuildingDebtLedgerEntry.Direction.PAYABLE,

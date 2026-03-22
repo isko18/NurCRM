@@ -1296,17 +1296,18 @@ class BuildingSupplierPurchaseHistoryView(CompanyQuerysetMixin, generics.ListAPI
 
 
 class BuildingSupplierBarterSettlementListCreateView(CompanyQuerysetMixin, generics.ListCreateAPIView):
-    """Список и создание бартерных зачётов с поставщиками."""
+    """Список и создание бартерных зачётов (поставщик или подрядчик)."""
 
     permission_classes = [permissions.IsAuthenticated]
     serializer_class = BuildingSupplierBarterSettlementSerializer
     queryset = BuildingSupplierBarterSettlement.objects.select_related(
         "supplier",
+        "contractor",
         "residential_complex",
         "created_by",
     )
     filter_backends = [DjangoFilterBackend]
-    filterset_fields = ["supplier", "residential_complex", "status", "date"]
+    filterset_fields = ["supplier", "contractor", "residential_complex", "status", "date"]
 
     def get_serializer_class(self):
         if self.request.method == "POST":
@@ -1321,6 +1322,7 @@ class BuildingSupplierBarterSettlementDetailView(CompanyQuerysetMixin, generics.
     serializer_class = BuildingSupplierBarterSettlementSerializer
     queryset = BuildingSupplierBarterSettlement.objects.select_related(
         "supplier",
+        "contractor",
         "residential_complex",
         "created_by",
     ).prefetch_related("purchase_items", "counter_deliveries")
@@ -1341,8 +1343,11 @@ class BuildingSupplierBarterSettlementConfirmView(CompanyQuerysetMixin, generics
 
     permission_classes = [permissions.IsAuthenticated]
     serializer_class = BuildingSupplierBarterSettlementSerializer
-    queryset = BuildingSupplierBarterSettlement.objects.select_related("supplier", "residential_complex")
+    queryset = BuildingSupplierBarterSettlement.objects.select_related(
+        "supplier", "contractor", "residential_complex"
+    )
 
+    @transaction.atomic
     def post(self, request, pk=None):
         settlement = self.get_object()
         if settlement.status != BuildingSupplierBarterSettlement.Status.DRAFT:
@@ -1350,8 +1355,32 @@ class BuildingSupplierBarterSettlementConfirmView(CompanyQuerysetMixin, generics
                 {"status": ["Подтвердить можно только зачёт в статусе draft."]},
                 status=status.HTTP_400_BAD_REQUEST,
             )
+        if settlement.amount_total and Decimal(str(settlement.amount_total)) > 0:
+            counterparty_type = (
+                BuildingDebtLedgerEntry.CounterpartyType.CONTRACTOR
+                if settlement.contractor_id
+                else BuildingDebtLedgerEntry.CounterpartyType.SUPPLIER
+            )
+            counterparty_id = settlement.contractor_id or settlement.supplier_id
+            BuildingDebtLedgerEntry.objects.create(
+                company_id=settlement.company_id,
+                direction=BuildingDebtLedgerEntry.Direction.PAYABLE,
+                counterparty_type=counterparty_type,
+                counterparty_id=counterparty_id,
+                entry_type=BuildingDebtLedgerEntry.EntryType.BARTER,
+                amount=Decimal(str(settlement.amount_total)).quantize(Decimal("0.01")),
+                currency=(settlement.currency or "KGS")[:8],
+                status=BuildingDebtLedgerEntry.Status.APPROVED,
+                residential_complex=settlement.residential_complex,
+                source_type="barter_settlement",
+                source_id=settlement.id,
+                comment=(settlement.comment or f"Бартерный зачёт {settlement.id}")[:1024],
+                occurred_at=timezone.now(),
+                created_by=request.user if request.user.is_authenticated else None,
+            )
         settlement.status = BuildingSupplierBarterSettlement.Status.CONFIRMED
         settlement.save(update_fields=["status", "updated_at"])
+        settlement.refresh_from_db()
         return Response(
             BuildingSupplierBarterSettlementSerializer(settlement, context={"request": request}).data
         )
@@ -1362,7 +1391,7 @@ class BuildingSupplierBarterSettlementCancelView(CompanyQuerysetMixin, generics.
 
     permission_classes = [permissions.IsAuthenticated]
     serializer_class = BuildingSupplierBarterSettlementSerializer
-    queryset = BuildingSupplierBarterSettlement.objects.select_related("supplier", "residential_complex")
+    queryset = BuildingSupplierBarterSettlement.objects.select_related("supplier", "contractor", "residential_complex")
 
     def post(self, request, pk=None):
         settlement = self.get_object()
@@ -1707,7 +1736,7 @@ class BuildingWorkEntryDetailView(CompanyQuerysetMixin, generics.RetrieveUpdateD
 
             # Процесс работ "в долг": создаём запись долга (мы должны подрядчику)
             try:
-                if getattr(serializer.instance, "payment_mode", None) in ("debt", "mixed"):
+                if getattr(serializer.instance, "payment_mode", None) in ("debt", "mixed", "barter"):
                     BuildingDebtLedgerEntry.objects.create(
                         company_id=rc.company_id,
                         direction=BuildingDebtLedgerEntry.Direction.PAYABLE,
@@ -1727,7 +1756,7 @@ class BuildingWorkEntryDetailView(CompanyQuerysetMixin, generics.RetrieveUpdateD
             except Exception:
                 pass
 
-            if not BuildingCashRegisterRequest.objects.filter(
+            if getattr(serializer.instance, "payment_mode", None) != "barter" and not BuildingCashRegisterRequest.objects.filter(
                 work_entry=serializer.instance,
                 request_type=BuildingCashRegisterRequest.RequestType.CONTRACTOR_PAYMENT,
             ).exists():
