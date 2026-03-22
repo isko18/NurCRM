@@ -263,8 +263,15 @@ def build_owner_analytics_payload(*, company, branch, period, date_from, date_to
                 "percent": round(amt * 100.0 / sales_amount_float, 2),
             })
 
+    # Эффективная закупочная для COGS: снапшот строки, иначе текущая закупка товара (как при создании SaleItem)
+    _unit_purchase = Coalesce(
+        F("purchase_price_snapshot"),
+        F("product__purchase_price"),
+        V(Decimal("0"), output_field=MONEY_FIELD),
+    )
+
     # ======================================================
-    # Gross profit (валовая прибыль): revenue - COGS
+    # Gross profit (валовая прибыль): revenue − COGS; маржа % = прибыль / выручка × 100
     # ======================================================
     items_agg = items_qs.aggregate(
         revenue=Coalesce(
@@ -272,10 +279,7 @@ def build_owner_analytics_payload(*, company, branch, period, date_from, date_to
             ZERO_MONEY,
         ),
         cogs=Coalesce(
-            Sum(
-                F("quantity") * Coalesce(F("purchase_price_snapshot"), V(Decimal("0"), output_field=MONEY_FIELD)),
-                output_field=MONEY_FIELD,
-            ),
+            Sum(F("quantity") * _unit_purchase, output_field=MONEY_FIELD),
             ZERO_MONEY,
         ),
     )
@@ -296,11 +300,7 @@ def build_owner_analytics_payload(*, company, branch, period, date_from, date_to
                 ZERO_MONEY,
             ),
             cogs_p=Coalesce(
-                Sum(
-                    F("quantity")
-                    * Coalesce(F("purchase_price_snapshot"), V(Decimal("0"), output_field=MONEY_FIELD)),
-                    output_field=MONEY_FIELD,
-                ),
+                Sum(F("quantity") * _unit_purchase, output_field=MONEY_FIELD),
                 ZERO_MONEY,
             ),
         )

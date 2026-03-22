@@ -2468,10 +2468,11 @@ class AgentSaleCheckoutAPIView(MarketCashierOnlyMixin, CompanyBranchRestrictedMi
         cash_received = ser.validated_data.get("cash_received") or Decimal("0.00")
         cashbox_id = ser.validated_data.get("cashbox_id")  # опционально
 
+        resolved_client = None
         if client_id:
-            client = get_object_or_404(Client, id=client_id, company=company)
+            resolved_client = get_object_or_404(Client, id=client_id, company=company)
             if hasattr(cart, "client_id"):
-                cart.client = client
+                cart.client = resolved_client
                 cart.save(update_fields=["client"])
 
         acting_agent = _resolve_acting_agent(request, cart, allow_owner_override=True)
@@ -2490,6 +2491,7 @@ class AgentSaleCheckoutAPIView(MarketCashierOnlyMixin, CompanyBranchRestrictedMi
                 cashbox_id=cashbox_id,  # можно сохранить кассу в Sale, но без смен
                 payment_method=payment_method,
                 cash_received=cash_received,
+                client=resolved_client,
             )
         except Exception as e:
             raise ValidationError({"detail": str(e)})
