@@ -612,6 +612,8 @@ class ReceiptSerializer(serializers.Serializer):
 class AgentCheckoutSerializer(serializers.Serializer):
     print_receipt = serializers.BooleanField(default=False)
     client_id = OptionalUUIDField(required=False, allow_null=True)
+    # алиас для клиентов, которые шлют `client` вместо `client_id`
+    client = OptionalUUIDField(required=False, allow_null=True, write_only=True)
 
     payment_method = serializers.ChoiceField(
         choices=Sale.PaymentMethod.choices,
@@ -624,6 +626,11 @@ class AgentCheckoutSerializer(serializers.Serializer):
     cashbox_id = OptionalUUIDField(required=False, allow_null=True)
 
     def validate(self, attrs):
+        if attrs.get("client_id") is None and attrs.get("client") is not None:
+            attrs["client_id"] = attrs.pop("client")
+        elif "client" in attrs:
+            attrs.pop("client", None)
+
         pm = attrs.get("payment_method") or Sale.PaymentMethod.CASH
         cr = attrs.get("cash_received")
 

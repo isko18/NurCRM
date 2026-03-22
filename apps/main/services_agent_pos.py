@@ -101,6 +101,7 @@ def checkout_agent_cart(
     cashbox_id=None,
     payment_method=None,
     cash_received=None,
+    client=None,
 ):
     """
     Чекаут корзины от лица АГЕНТА.
@@ -219,7 +220,8 @@ def checkout_agent_cart(
         user=operator,
         status=Sale.Status.NEW,  # дальше mark_paid()
         subtotal=Decimal("0.00"),
-        discount_total=getattr(cart, "order_discount_total", None) or Decimal("0.00"),
+        # Итоги перезаписываются после строк из cart.recalc() (строковые + чековые скидки)
+        discount_total=Decimal("0.00"),
         tax_total=Decimal("0.00"),
         total=Decimal("0.00"),
     )
@@ -227,8 +229,12 @@ def checkout_agent_cart(
     if model_has_field(Sale, "branch"):
         create_kwargs["branch"] = branch
 
-    if model_has_field(Sale, "client") and getattr(cart, "client", None) is not None:
-        create_kwargs["client"] = cart.client
+    # Клиент: явный аргумент (checkout) или поле корзины, если оно есть в модели
+    sale_client = client
+    if sale_client is None and model_has_field(Sale, "client"):
+        sale_client = getattr(cart, "client", None)
+    if model_has_field(Sale, "client") and sale_client is not None:
+        create_kwargs["client"] = sale_client
 
     if model_has_field(Sale, "department") and department is not None:
         create_kwargs["department"] = department
@@ -334,10 +340,13 @@ def checkout_agent_cart(
             Product.objects.bulk_update(changed_products, ["quantity"])
 
     # --- 6) итоги + “оплата” ---
-    sale.subtotal = subtotal
-    total = subtotal - (getattr(cart, "order_discount_total", None) or Decimal("0.00"))
-    sale.total = total if total > 0 else Decimal("0.00")
-    sale.save(update_fields=["subtotal", "discount_total", "total"])
+    # Суммы чека как в корзине: строковые скидки + скидка на чек (% или сумма) уже в cart.discount_total
+    cart.recalc()
+    sale.subtotal = cart.subtotal
+    sale.discount_total = cart.discount_total
+    sale.tax_total = getattr(cart, "tax_total", None) or Decimal("0.00")
+    sale.total = cart.total if cart.total > 0 else Decimal("0.00")
+    sale.save(update_fields=["subtotal", "discount_total", "tax_total", "total"])
 
     pm = payment_method or (getattr(Sale, "PaymentMethod", None) and Sale.PaymentMethod.CASH) or "cash"
     if pm == getattr(Sale.PaymentMethod, "CASH", "cash"):
