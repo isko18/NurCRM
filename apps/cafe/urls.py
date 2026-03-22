@@ -32,7 +32,7 @@ from .views import (
 
 from apps.cafe.analytics import (
     KitchenAnalyticsByCookView, KitchenAnalyticsByWaiterView,
-    SalesSummaryView, SalesByMenuItemView,
+    SalesSummaryView, SalesByMenuItemView, SalesByCategoryView,
     PurchasesSummaryView, PurchasesBySupplierView,
     WarehouseLowStockView,
 )
@@ -141,6 +141,7 @@ urlpatterns = [
 
     path("analytics/sales/summary/", SalesSummaryView.as_view()),
     path("analytics/sales/items/", SalesByMenuItemView.as_view()),
+    path("analytics/sales/categories/", SalesByCategoryView.as_view(), name="cafe-analytics-sales-categories"),
 
     path("analytics/purchases/summary/", PurchasesSummaryView.as_view()),
     path("analytics/purchases/suppliers/", PurchasesBySupplierView.as_view()),

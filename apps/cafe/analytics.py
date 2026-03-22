@@ -296,6 +296,65 @@ class SalesByMenuItemView(CompanyBranchQuerysetMixin, APIView):
         return Response(result)
 
 
+class SalesByCategoryView(CompanyBranchQuerysetMixin, APIView):
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request):
+        company = self._user_company()
+        if not company:
+            return Response([])
+
+        df = request.query_params.get("date_from")
+        dt = request.query_params.get("date_to")
+        limit_raw = request.query_params.get("limit")
+        try:
+            limit = max(1, min(int(limit_raw or 50), 200))
+        except Exception:
+            limit = 50
+
+        branch = self._active_branch()
+        key = _cache_key(
+            "sales:categories",
+            company_id=str(company.id),
+            branch_id=str(branch.id) if branch else None,
+            params={"date_from": df, "date_to": dt, "limit": limit},
+        )
+        hit = _cache_get(key)
+        if hit is not None:
+            return Response(hit)
+
+        qs = (OrderItem.objects
+              .select_related("order", "menu_item", "menu_item__category")
+              .filter(order__company=company, menu_item__company=company))
+
+        if branch is not None:
+            qs = qs.filter(order__branch=branch)
+
+        qs = _apply_date_range(qs, "order__created_at", df, dt)
+
+        line_total = ExpressionWrapper(
+            F("quantity") * F("menu_item__price"),
+            output_field=DecimalField(max_digits=14, decimal_places=2),
+        )
+
+        data = (qs.values("menu_item__category_id", "menu_item__category__title")
+                  .annotate(qty=Sum("quantity"), revenue=Sum(line_total))
+                  .order_by("-revenue", "-qty")[:limit])
+
+        result = []
+        for row in data:
+            cid = row["menu_item__category_id"]
+            result.append({
+                "category_id": str(cid) if cid is not None else None,
+                "title": row["menu_item__category__title"] or "",
+                "qty": int(row["qty"] or 0),
+                "revenue": f"{_to_decimal(row['revenue']):.2f}",
+            })
+
+        _cache_set(key, result, _analytics_ttl())
+        return Response(result)
+
+
 # ==========================
 # PURCHASES ANALYTICS (created_at exists now)
 # ==========================
