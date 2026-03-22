@@ -864,7 +864,7 @@ class BuildingSupplierFile(models.Model):
 
 
 class BuildingSupplierBarterSettlement(models.Model):
-    """Бартерный взаимозачёт с поставщиком в разрезе ЖК."""
+    """Бартерный взаимозачёт с поставщиком или подрядчиком в разрезе ЖК."""
 
     class Status(models.TextChoices):
         DRAFT = "draft", "Черновик"
@@ -881,8 +881,18 @@ class BuildingSupplierBarterSettlement(models.Model):
     supplier = models.ForeignKey(
         BuildingSupplier,
         on_delete=models.CASCADE,
+        null=True,
+        blank=True,
         related_name="barter_settlements",
         verbose_name="Поставщик",
+    )
+    contractor = models.ForeignKey(
+        "BuildingContractor",
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
+        related_name="barter_settlements",
+        verbose_name="Подрядчик",
     )
     residential_complex = models.ForeignKey(
         "ResidentialComplex",
@@ -919,17 +929,28 @@ class BuildingSupplierBarterSettlement(models.Model):
     updated_at = models.DateTimeField(auto_now=True, verbose_name="Дата обновления")
 
     class Meta:
-        verbose_name = "Бартерный зачёт с поставщиком"
-        verbose_name_plural = "Бартерные зачёты с поставщиками"
+        verbose_name = "Бартерный зачёт"
+        verbose_name_plural = "Бартерные зачёты"
         ordering = ["-date", "-created_at"]
         indexes = [
             models.Index(fields=["company", "supplier", "date"]),
+            models.Index(fields=["company", "contractor", "date"]),
             models.Index(fields=["company", "residential_complex", "date"]),
             models.Index(fields=["status", "date"]),
         ]
+        constraints = [
+            models.CheckConstraint(
+                check=(
+                    models.Q(supplier__isnull=False, contractor__isnull=True)
+                    | models.Q(supplier__isnull=True, contractor__isnull=False)
+                ),
+                name="ck_barter_settlement_supplier_xor_contractor",
+            ),
+        ]
 
     def __str__(self):
-        return f"Бартер {self.supplier} на {self.amount_total} {self.currency} от {self.date}"
+        who = self.supplier or self.contractor
+        return f"Бартер {who} на {self.amount_total} {self.currency} от {self.date}"
 
 
 class BuildingSupplierBarterPurchaseItem(models.Model):
@@ -1041,6 +1062,7 @@ class BuildingProcurementRequest(models.Model):
     class PaymentMode(models.TextChoices):
         CASH = "cash", "Наличные"
         DEBT = "debt", "В долг"
+        BARTER = "barter", "Бартер"
         MIXED = "mixed", "Смешанная"
 
     class Status(models.TextChoices):
@@ -2438,6 +2460,7 @@ class BuildingWorkEntry(models.Model):
     class PaymentMode(models.TextChoices):
         CASH = "cash", "Наличные"
         DEBT = "debt", "В долг"
+        BARTER = "barter", "Бартер"
         MIXED = "mixed", "Смешанная"
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False, verbose_name="ID")

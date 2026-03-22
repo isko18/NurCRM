@@ -373,7 +373,8 @@ class BuildingSupplierBarterCounterDeliverySerializer(serializers.ModelSerialize
 
 
 class BuildingSupplierBarterSettlementSerializer(serializers.ModelSerializer):
-    supplier_name = serializers.CharField(source="supplier.company_name", read_only=True)
+    supplier_name = serializers.SerializerMethodField(read_only=True)
+    contractor_name = serializers.SerializerMethodField(read_only=True)
     residential_complex_name = serializers.CharField(source="residential_complex.name", read_only=True)
     created_by_display = serializers.SerializerMethodField(read_only=True)
     purchase_items = BuildingSupplierBarterPurchaseItemSerializer(many=True, read_only=True)
@@ -386,6 +387,8 @@ class BuildingSupplierBarterSettlementSerializer(serializers.ModelSerializer):
             "company",
             "supplier",
             "supplier_name",
+            "contractor",
+            "contractor_name",
             "residential_complex",
             "residential_complex_name",
             "date",
@@ -408,10 +411,19 @@ class BuildingSupplierBarterSettlementSerializer(serializers.ModelSerializer):
             "created_at",
             "updated_at",
             "supplier_name",
+            "contractor_name",
             "residential_complex_name",
             "purchase_items",
             "counter_deliveries",
         ]
+
+    def get_supplier_name(self, obj):
+        s = getattr(obj, "supplier", None)
+        return s.company_name if s else None
+
+    def get_contractor_name(self, obj):
+        c = getattr(obj, "contractor", None)
+        return c.company_name if c else None
 
     def get_created_by_display(self, obj):
         u = getattr(obj, "created_by", None)
@@ -438,6 +450,7 @@ class BuildingSupplierBarterSettlementCreateUpdateSerializer(serializers.ModelSe
         fields = [
             "id",
             "supplier",
+            "contractor",
             "residential_complex",
             "date",
             "amount_total",
@@ -450,35 +463,68 @@ class BuildingSupplierBarterSettlementCreateUpdateSerializer(serializers.ModelSe
 
     def validate(self, attrs):
         attrs = super().validate(attrs)
-        supplier = attrs.get("supplier") or getattr(self.instance, "supplier", None)
-        rc = attrs.get("residential_complex") or getattr(self.instance, "residential_complex", None)
+        inst = self.instance
+        if "supplier" in attrs:
+            supplier = attrs["supplier"]
+        elif inst:
+            supplier = inst.supplier
+        else:
+            supplier = None
+        if "contractor" in attrs:
+            contractor = attrs["contractor"]
+        elif inst:
+            contractor = inst.contractor
+        else:
+            contractor = None
+
+        rc = attrs.get("residential_complex") or getattr(inst, "residential_complex", None)
+
+        if bool(supplier) == bool(contractor):
+            raise serializers.ValidationError(
+                {"non_field_errors": "Укажите ровно одного контрагента: supplier или contractor."}
+            )
 
         if supplier and rc and supplier.company_id != rc.company_id:
             raise serializers.ValidationError({"residential_complex": "ЖК принадлежит другой компании, чем поставщик."})
+        if contractor and rc and contractor.company_id != rc.company_id:
+            raise serializers.ValidationError({"residential_complex": "ЖК принадлежит другой компании, чем подрядчик."})
 
         request = self.context.get("request")
         user = getattr(request, "user", None) if request else None
         company_id = getattr(user, "company_id", None)
         if company_id and supplier and supplier.company_id != company_id and not getattr(user, "is_superuser", False):
             raise serializers.ValidationError({"supplier": "Поставщик принадлежит другой компании."})
+        if company_id and contractor and contractor.company_id != company_id and not getattr(user, "is_superuser", False):
+            raise serializers.ValidationError({"contractor": "Подрядчик принадлежит другой компании."})
+
+        if supplier and not contractor:
+            attrs["contractor"] = None
+        elif contractor and not supplier:
+            attrs["supplier"] = None
 
         return attrs
 
     def _sync_nested(self, settlement, purchase_items, counter_deliveries):
+        is_contractor = bool(settlement.contractor_id)
         if purchase_items is not None:
-            BuildingSupplierBarterPurchaseItem.objects.filter(settlement=settlement).delete()
-            for i, raw in enumerate(purchase_items, start=1):
-                procurement_item = raw.get("procurement_item")
-                amount = raw.get("amount")
-                if not procurement_item or amount in (None, ""):
-                    raise serializers.ValidationError(
-                        {"purchase_items": f"Строка #{i}: укажите procurement_item и amount."}
-                    )
-                BuildingSupplierBarterPurchaseItem.objects.create(
-                    settlement=settlement,
-                    procurement_item=procurement_item,
-                    amount=amount,
+            if is_contractor and purchase_items:
+                raise serializers.ValidationError(
+                    {"purchase_items": "Для зачёта с подрядчиком строки закупок не задаются."}
                 )
+            BuildingSupplierBarterPurchaseItem.objects.filter(settlement=settlement).delete()
+            if not is_contractor:
+                for i, raw in enumerate(purchase_items, start=1):
+                    procurement_item = raw.get("procurement_item")
+                    amount = raw.get("amount")
+                    if not procurement_item or amount in (None, ""):
+                        raise serializers.ValidationError(
+                            {"purchase_items": f"Строка #{i}: укажите procurement_item и amount."}
+                        )
+                    BuildingSupplierBarterPurchaseItem.objects.create(
+                        settlement=settlement,
+                        procurement_item=procurement_item,
+                        amount=amount,
+                    )
 
         if counter_deliveries is not None:
             BuildingSupplierBarterCounterDelivery.objects.filter(settlement=settlement).delete()
