@@ -99,9 +99,9 @@ def _set_primary_branch(user: User, branch_id):
         BranchMembership.objects.filter(user=user, branch_id=branch_id).update(is_primary=True)
 
 
-def _generate_password(length=10):
-    alphabet = string.ascii_letters + string.digits
-    return "".join(secrets.choice(alphabet) for _ in range(length))
+def _generate_password(length=6):
+    """Простой пароль из цифр (легче ввести и запомнить)."""
+    return "".join(secrets.choice(string.digits) for _ in range(length))
 
 
 # ======================
@@ -442,7 +442,7 @@ class EmployeeCreateSerializer(serializers.ModelSerializer):
 
         branches_objects = validated_data.pop("_branches_objects", [])
 
-        generated_password = _generate_password(10)
+        generated_password = _generate_password()
 
         # заберём все can_view_* (опциональные) и не дадим им попасть в User.objects.create если хочешь
         access_flags = {}

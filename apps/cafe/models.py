@@ -537,8 +537,9 @@ class MenuItem(models.Model):
     )
     title = models.CharField("Название", max_length=255)
     category = models.ForeignKey(
-        "Category", on_delete=models.CASCADE,
-        related_name="items", verbose_name="Категория"
+        "Category", on_delete=models.SET_NULL,
+        related_name="items", verbose_name="Категория",
+        null=True, blank=True,
     )
     price = models.DecimalField("Цена продажи", max_digits=11, decimal_places=3)
     is_active = models.BooleanField("Активно в продаже", default=True)
@@ -605,7 +606,7 @@ class MenuItem(models.Model):
                 raise ValidationError({"kitchen": "Кухня другого филиала."})
 
     def __str__(self):
-        return f"{self.title} ({self.category})"
+        return f"{self.title} ({self.category or 'Без категории'})"
 
     def recalc_cost_price(self):
         """
