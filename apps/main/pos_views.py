@@ -1522,13 +1522,15 @@ class SaleReturnAPIView(MarketCashierOnlyMixin, CompanyBranchRestrictedMixin, AP
 
     @transaction.atomic
     def post(self, request, pk, *args, **kwargs):
-        qs = (
-            Sale.objects.select_for_update()
-            .select_related("company", "branch", "user")
-            .prefetch_related("items__product", "agent_allocations")
-        )
-        qs = self._filter_qs_company_branch(qs)
-        sale = get_object_or_404(qs, id=pk)
+        # Важно: `select_for_update()` нельзя применять к queryset'у с `select_related`/`prefetch_related`,
+        # потому что Django может сгенерировать `LEFT OUTER JOIN` на nullable связях,
+        # а PostgreSQL запрещает `FOR UPDATE` на nullable стороне такого join.
+        #
+        # Поэтому сначала блокируем только строку Sale без join'ов,
+        # а связанные объекты подтягиваем уже обычными запросами.
+        locked_qs = Sale.objects.select_for_update()
+        locked_qs = self._filter_qs_company_branch(locked_qs)
+        sale = get_object_or_404(locked_qs, id=pk)
 
         if sale.status == Sale.Status.CANCELED:
             return Response(
