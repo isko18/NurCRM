@@ -13,21 +13,63 @@ https://docs.djangoproject.com/en/5.2/ref/settings/
 from pathlib import Path
 from datetime import timedelta
 import os
+from typing import List
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
+
+
+def _get_bool_env(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _get_int_env(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return default
+
+
+def _get_list_env(name: str, default: List[str]) -> List[str]:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return [item.strip() for item in raw.split(",") if item.strip()]
+
+
+DEBUG = _get_bool_env("DJANGO_DEBUG", False)
+DEV_ALLOWED_HOSTS = ["127.0.0.1", "localhost"]
+DEV_CORS_ORIGINS = [
+    "http://localhost:3000",
+    "http://localhost:5173",
+    "http://127.0.0.1:8000",
+]
+DEFAULT_ALLOWED_HOSTS = DEV_ALLOWED_HOSTS if DEBUG else ["nurcrm.kg", "app.nurcrm.kg"]
+DEFAULT_CORS_ORIGINS = (
+    DEV_CORS_ORIGINS
+    if DEBUG
+    else [
+        "https://nurcrm.kg",
+        "https://app.nurcrm.kg",
+    ]
+)
 
 
 # Quick-start development settings - unsuitable for production
 # See https://docs.djangoproject.com/en/5.2/howto/deployment/checklist/
 
 # SECURITY WARNING: keep the secret key used in production secret!
-SECRET_KEY = 'django-insecure-zzvirtj5xn4r6+s&l&!jt-bj(v)pm6u%zkvdls(u1m%rzi9)i9'
+SECRET_KEY = os.getenv("DJANGO_SECRET_KEY", "django-insecure-dev-only-change-me")
 
 # SECURITY WARNING: don't run with debug turned on in production!
-DEBUG = True
-
-ALLOWED_HOSTS = ["*"]
+ALLOWED_HOSTS = _get_list_env("DJANGO_ALLOWED_HOSTS", DEFAULT_ALLOWED_HOSTS)
+CSRF_TRUSTED_ORIGINS = _get_list_env("DJANGO_CSRF_TRUSTED_ORIGINS", DEFAULT_CORS_ORIGINS)
 
 
 # Application definition
@@ -106,16 +148,6 @@ DATABASES = {
         'NAME': BASE_DIR / 'db.sqlite3',
     }
 }
-# DATABASES = {
-#     'default': {
-#         'ENGINE': 'django.db.backends.postgresql',
-#         'NAME': 'nurcrm2',
-#         'USER': 'nuruser',
-#         'PASSWORD': 'nurpass2025',
-#         'HOST': '127.0.0.1',
-#         'PORT': '5432',
-#     }
-# }
 
 
 
@@ -176,6 +208,7 @@ SWAGGER_SETTINGS = {
         }
     }
 }
+ENABLE_API_DOCS = _get_bool_env('ENABLE_API_DOCS', DEBUG)
 
 
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
@@ -186,6 +219,15 @@ REST_FRAMEWORK = {
     'DEFAULT_AUTHENTICATION_CLASSES': (
         'rest_framework_simplejwt.authentication.JWTAuthentication',
     ),
+    'DEFAULT_THROTTLE_CLASSES': [
+        'rest_framework.throttling.AnonRateThrottle',
+        'rest_framework.throttling.UserRateThrottle',
+    ],
+    'DEFAULT_THROTTLE_RATES': {
+        'anon': os.getenv('DRF_THROTTLE_ANON', '60/minute'),
+        'user': os.getenv('DRF_THROTTLE_USER', '300/minute'),
+        'login': os.getenv('DRF_THROTTLE_LOGIN', '10/minute'),
+    },
     'DEFAULT_FILTER_BACKENDS': [
         'django_filters.rest_framework.DjangoFilterBackend',
         'rest_framework.filters.SearchFilter',
@@ -201,13 +243,13 @@ REST_FRAMEWORK = {
 
 
 SIMPLE_JWT = {
-    'ACCESS_TOKEN_LIFETIME': timedelta(days=3),
-    'REFRESH_TOKEN_LIFETIME': timedelta(days=120),
-    'ROTATE_REFRESH_TOKENS': False,
+    'ACCESS_TOKEN_LIFETIME': timedelta(minutes=_get_int_env('JWT_ACCESS_TOKEN_MINUTES', 15)),
+    'REFRESH_TOKEN_LIFETIME': timedelta(days=_get_int_env('JWT_REFRESH_TOKEN_DAYS', 7)),
+    'ROTATE_REFRESH_TOKENS': _get_bool_env('JWT_ROTATE_REFRESH_TOKENS', True),
     'BLACKLIST_AFTER_ROTATION': True,
 
     'ALGORITHM': 'HS256',
-    'SIGNING_KEY': 'devjwtsecret',
+    'SIGNING_KEY': os.getenv('JWT_SIGNING_KEY', SECRET_KEY),
     'VERIFYING_KEY': None,
     'AUDIENCE': None,
     'ISSUER': None,
@@ -269,27 +311,16 @@ CACHE_TIMEOUT_LONG = 3600  # 1 час - для статических данны
 CACHE_TIMEOUT_ANALYTICS = 600  # 10 минут - для аналитики агентов
 
 
-CORS_ORIGIN_ALLOW_ALL = True
-CORS_ALLOW_CREDENTIALS = True  
+CORS_ORIGIN_ALLOW_ALL = _get_bool_env('CORS_ALLOW_ALL', False)
+CORS_ALLOW_CREDENTIALS = _get_bool_env('CORS_ALLOW_CREDENTIALS', True)
 
-CORS_ALLOWED_ORIGINS = [
-    "http://localhost:3000",
-    "http://localhost:5173",
-    'http://127.0.0.1:8000',
-    'https://nurcrm.kg',
-    "http://app.nurcrm.kg",
-]
+CORS_ALLOWED_ORIGINS = _get_list_env('CORS_ALLOWED_ORIGINS', DEFAULT_CORS_ORIGINS)
 
-SESSION_COOKIE_SAMESITE = "None"
-SESSION_COOKIE_SECURE = True
-CSRF_COOKIE_SAMESITE   = "None"
-CSRF_COOKIE_SECURE     = True
-
-CORS_ORIGIN_WRITELIST = (
-    'http://localhost:3000',
-    'http://localhost:',
-    'https://nurcrm.kg'
-)
+SESSION_COOKIE_SAMESITE = os.getenv('SESSION_COOKIE_SAMESITE', 'Lax' if DEBUG else 'None')
+SESSION_COOKIE_SECURE = _get_bool_env('SESSION_COOKIE_SECURE', not DEBUG)
+SESSION_COOKIE_HTTPONLY = True
+CSRF_COOKIE_SAMESITE = os.getenv('CSRF_COOKIE_SAMESITE', 'Lax' if DEBUG else 'None')
+CSRF_COOKIE_SECURE = _get_bool_env('CSRF_COOKIE_SECURE', not DEBUG)
 
 CORS_ALLOW_HEADERS = (
     'content-disposition', 'accept-encoding',
@@ -306,16 +337,22 @@ CORS_ALLOW_METHODS = (
     "PUT",
 )
 SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
+SECURE_SSL_REDIRECT = _get_bool_env('SECURE_SSL_REDIRECT', not DEBUG)
+SECURE_HSTS_SECONDS = _get_int_env('SECURE_HSTS_SECONDS', 0 if DEBUG else 31536000)
+SECURE_HSTS_INCLUDE_SUBDOMAINS = _get_bool_env('SECURE_HSTS_INCLUDE_SUBDOMAINS', not DEBUG)
+SECURE_HSTS_PRELOAD = _get_bool_env('SECURE_HSTS_PRELOAD', not DEBUG)
+SECURE_CONTENT_TYPE_NOSNIFF = True
+SECURE_REFERRER_POLICY = os.getenv('SECURE_REFERRER_POLICY', 'strict-origin-when-cross-origin')
+X_FRAME_OPTIONS = os.getenv('X_FRAME_OPTIONS', 'DENY')
 
-EMAIL_BACKEND = 'django.core.mail.backends.smtp.EmailBackend'
-EMAIL_HOST = 'smtp.gmail.com'
-EMAIL_PORT = 587
-EMAIL_USE_TLS = True
-EMAIL_HOST_USER = 'nurcrm2025@gmail.com'
-EMAIL_HOST_PASSWORD = 'yljz yusd uzjd itmo'
-DEFAULT_FROM_EMAIL = 'nurcrm2025@gmail.com'
-
-import os
+EMAIL_BACKEND = os.getenv('EMAIL_BACKEND', 'django.core.mail.backends.smtp.EmailBackend')
+EMAIL_HOST = os.getenv('EMAIL_HOST', 'smtp.gmail.com')
+EMAIL_PORT = _get_int_env('EMAIL_PORT', 587)
+EMAIL_USE_TLS = _get_bool_env('EMAIL_USE_TLS', True)
+EMAIL_HOST_USER = os.getenv('EMAIL_HOST_USER', '')
+EMAIL_HOST_PASSWORD = os.getenv('EMAIL_HOST_PASSWORD', '')
+DEFAULT_FROM_EMAIL = os.getenv('DEFAULT_FROM_EMAIL', EMAIL_HOST_USER or 'webmaster@localhost')
+WHATSAPP_NODE_TOKEN = os.getenv('WHATSAPP_NODE_TOKEN', '')
 
 
 CHANNEL_LAYERS = {
@@ -367,7 +404,7 @@ LOGGING = {
 
 INSTAGRAM_POLL_SECONDS = 0.1
 
-SITE_WEBHOOK_URL = "https://ak-kagaz.webtm.ru/api/catalog/integrations/crm/products"
-SITE_WEBHOOK_SECRET = "supersecret"
+SITE_WEBHOOK_URL = os.getenv("SITE_WEBHOOK_URL", "")
+SITE_WEBHOOK_SECRET = os.getenv("SITE_WEBHOOK_SECRET", "")
 # If set, webhooks are sent ONLY for this company (by company_id).
-SITE_WEBHOOK_COMPANY_ID = "af8cc7dd-6bb8-4298-b0a0-d98f9ddd4ce9"
+SITE_WEBHOOK_COMPANY_ID = os.getenv("SITE_WEBHOOK_COMPANY_ID", "")
