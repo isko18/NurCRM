@@ -399,7 +399,11 @@ class IngredientInlineSerializer(serializers.ModelSerializer):
 
 
 class MenuItemSerializer(CompanyBranchReadOnlyMixin):
-    category = serializers.PrimaryKeyRelatedField(queryset=Category.objects.all())
+    category = serializers.PrimaryKeyRelatedField(
+        queryset=Category.objects.all(),
+        required=False,
+        allow_null=True,
+    )
 
     kitchen = serializers.PrimaryKeyRelatedField(
         queryset=Kitchen.objects.all(),

@@ -23,7 +23,10 @@ class PublicKitchenSerializer(serializers.ModelSerializer):
 
 
 class PublicMenuItemSerializer(serializers.ModelSerializer):
-    category_title = serializers.CharField(source="category.title", read_only=True)
+    category_title = serializers.SerializerMethodField()
+
+    def get_category_title(self, obj):
+        return obj.category.title if obj.category else "Без категории"
     kitchen_title = serializers.CharField(source="kitchen.title", read_only=True)
     kitchen_number = serializers.IntegerField(source="kitchen.number", read_only=True)
 
