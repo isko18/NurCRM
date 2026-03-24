@@ -1,8 +1,8 @@
 from django.urls import path
-from rest_framework_simplejwt.views import TokenRefreshView
 from .views import (
     RegisterAPIView,
     CustomTokenObtainPairView,
+    CustomTokenRefreshView,
     EmployeeListAPIView,
     EmployeeCreateAPIView,
     CurrentUserAPIView,
@@ -32,7 +32,7 @@ urlpatterns = [
     # 🔐 Авторизация / регистрация
     path('auth/register/', RegisterAPIView.as_view(), name='user-register'),
     path('auth/login/', CustomTokenObtainPairView.as_view(), name='token_obtain_pair'),
-    path('auth/refresh/', TokenRefreshView.as_view(), name='token_refresh'),
+    path('auth/refresh/', CustomTokenRefreshView.as_view(), name='token_refresh'),
     
     path("scales/token/", get_scale_api_token, name="scale-api-token"),
     path("scales/register/", register_scale, name="scale-api-register"),
