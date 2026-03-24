@@ -3,12 +3,14 @@
 from django.db.models import Q, Prefetch
 from django.http import Http404
 from django.db.utils import ProgrammingError
+import logging
 
 from rest_framework import generics, permissions, status
 from rest_framework.permissions import IsAuthenticated, AllowAny
 from rest_framework.response import Response
 from rest_framework.exceptions import NotFound, PermissionDenied, ValidationError
-from rest_framework_simplejwt.views import TokenObtainPairView
+from rest_framework_simplejwt.views import TokenObtainPairView, TokenRefreshView
+from rest_framework_simplejwt.exceptions import InvalidToken, TokenError
 
 from .models import User, Industry, SubscriptionPlan, Feature, Sector, CustomRole, Company, Branch, BranchMembership
 from .serializers import (
@@ -31,6 +33,8 @@ from .serializers import (
     BranchCreateUpdateSerializer,
 )
 from .permissions import IsCompanyOwner, IsCompanyOwnerOrAdmin
+
+logger = logging.getLogger(__name__)
 
 
 # =========================
@@ -192,6 +196,28 @@ class RegisterAPIView(generics.CreateAPIView):
 class CustomTokenObtainPairView(TokenObtainPairView):
     serializer_class = CustomTokenObtainPairSerializer
     permission_classes = [AllowAny]
+
+
+class CustomTokenRefreshView(TokenRefreshView):
+    """
+    Защитная обертка над стандартным refresh:
+    - некорректный/просроченный refresh -> 401
+    - инфраструктурные ошибки (БД/blacklist таблицы) -> 503 вместо HTML 500
+    """
+    permission_classes = [AllowAny]
+
+    def post(self, request, *args, **kwargs):
+        try:
+            return super().post(request, *args, **kwargs)
+        except (TokenError, InvalidToken):
+            return Response({"detail": "Token is invalid or expired"}, status=status.HTTP_401_UNAUTHORIZED)
+        except Exception as exc:
+            # Не ломаем клиент HTML-ошибкой: отдаем JSON с явной причиной.
+            logger.exception("Token refresh failed: %s", exc)
+            return Response(
+                {"detail": "Token refresh temporarily unavailable"},
+                status=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
 
 
 # =========================
