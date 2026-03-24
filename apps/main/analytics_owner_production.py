@@ -384,12 +384,20 @@ def build_owner_analytics_payload(*, company, branch, period, date_from, date_to
             doc_type=WarehouseStockDocument.DocType.PURCHASE,
             status=WarehouseStockDocument.Status.POSTED,
             payment_kind=WarehouseStockDocument.PaymentKind.CREDIT,
-            warehouse_to__company=company,
+        ).filter(
+            Q(warehouse_from__company=company)
+            | Q(warehouse_from__isnull=True, warehouse_to__company=company)
         )
         if branch is not None:
-            ap_qs = ap_qs.filter(Q(warehouse_to__branch=branch) | Q(warehouse_to__branch__isnull=True))
+            ap_qs = ap_qs.filter(
+                Q(warehouse_from__branch=branch)
+                | Q(warehouse_from__isnull=True, warehouse_to__branch=branch)
+            )
         else:
-            ap_qs = ap_qs.filter(warehouse_to__branch__isnull=True)
+            ap_qs = ap_qs.filter(
+                Q(warehouse_from__branch__isnull=True)
+                | Q(warehouse_from__isnull=True, warehouse_to__branch__isnull=True)
+            )
         due_expr = ExpressionWrapper(
             F("total") - Coalesce(F("prepayment_amount"), V(Decimal("0"), output_field=MONEY_FIELD)),
             output_field=MONEY_FIELD,
