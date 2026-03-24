@@ -4,6 +4,8 @@ from __future__ import annotations
 from decimal import Decimal, InvalidOperation
 import hashlib
 import json
+from io import BytesIO
+from datetime import datetime
 
 from rest_framework import permissions
 from rest_framework.views import APIView
@@ -11,13 +13,15 @@ from rest_framework.response import Response
 
 from django.conf import settings
 from django.core.cache import cache
+from django.http import HttpResponse
 from django.db.models import (
     Q, Count, Avg, Sum, F,
     ExpressionWrapper, DurationField, DecimalField
 )
 
-from apps.cafe.models import KitchenTask, OrderItem, Purchase, Warehouse
+from apps.cafe.models import KitchenTask, OrderItem, Purchase, Warehouse, Order
 from apps.cafe.views import CompanyBranchQuerysetMixin
+from openpyxl import Workbook
 
 
 # ==========================
@@ -499,3 +503,259 @@ class WarehouseLowStockView(CompanyBranchQuerysetMixin, APIView):
 
         _cache_set(key, out, _analytics_ttl())
         return Response(out)
+
+
+def _safe_filename_part(value: str | None, fallback: str) -> str:
+    raw = (value or "").strip()
+    if not raw:
+        return fallback
+    cleaned = "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in raw)
+    return cleaned[:48] or fallback
+
+
+class CafeAnalyticsExportView(CompanyBranchQuerysetMixin, APIView):
+    """
+    Экспорт аналитики/кассы:
+      GET /cafe/analytics/export/?report=analytics|cash&format=excel|word&date_from=YYYY-MM-DD&date_to=YYYY-MM-DD
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    def _analytics_payload(self, company, branch, date_from, date_to):
+        qs_items = (
+            OrderItem.objects
+            .select_related("order", "menu_item")
+            .filter(order__company=company, menu_item__company=company)
+        )
+        qs_purchases = Purchase.objects.filter(company=company)
+        qs_warehouse = Warehouse.objects.filter(company=company)
+
+        if branch is not None:
+            qs_items = qs_items.filter(order__branch=branch)
+            qs_purchases = qs_purchases.filter(branch=branch)
+            qs_warehouse = qs_warehouse.filter(branch=branch)
+
+        qs_items = _apply_date_range(qs_items, "order__created_at", date_from, date_to)
+        qs_purchases = _apply_date_range(qs_purchases, "created_at", date_from, date_to)
+
+        line_total = ExpressionWrapper(
+            F("quantity") * F("menu_item__price"),
+            output_field=DecimalField(max_digits=14, decimal_places=2),
+        )
+
+        sales_agg = qs_items.aggregate(
+            orders_count=Count("order_id", distinct=True),
+            items_qty=Sum("quantity"),
+            revenue=Sum(line_total),
+        )
+        purchases_agg = qs_purchases.aggregate(
+            purchases_count=Count("id"),
+            purchases_sum=Sum("price"),
+        )
+
+        low_stock_count = 0
+        for w in qs_warehouse.only("remainder", "minimum"):
+            rem = _to_decimal(w.remainder)
+            mn = _to_decimal(w.minimum)
+            if mn > 0 and rem < mn:
+                low_stock_count += 1
+
+        top_items_qs = (
+            qs_items.values("menu_item__title")
+            .annotate(qty=Sum("quantity"), revenue=Sum(line_total))
+            .order_by("-revenue", "-qty")[:10]
+        )
+
+        return {
+            "date_from": date_from or "",
+            "date_to": date_to or "",
+            "orders_count": int(sales_agg.get("orders_count") or 0),
+            "items_qty": int(sales_agg.get("items_qty") or 0),
+            "revenue": f"{_to_decimal(sales_agg.get('revenue')):.2f}",
+            "purchases_count": int(purchases_agg.get("purchases_count") or 0),
+            "purchases_sum": f"{_to_decimal(purchases_agg.get('purchases_sum')):.2f}",
+            "low_stock_count": low_stock_count,
+            "top_items": [
+                {
+                    "title": row["menu_item__title"] or "",
+                    "qty": int(row["qty"] or 0),
+                    "revenue": f"{_to_decimal(row['revenue']):.2f}",
+                }
+                for row in top_items_qs
+            ],
+        }
+
+    def _cash_payload(self, company, branch, date_from, date_to):
+        qs = Order.objects.filter(company=company, is_paid=True)
+        if branch is not None:
+            qs = qs.filter(branch=branch)
+        qs = _apply_date_range(qs, "paid_at", date_from, date_to)
+
+        final_total_expr = ExpressionWrapper(
+            F("total_amount") - F("discount_amount"),
+            output_field=DecimalField(max_digits=14, decimal_places=2),
+        )
+
+        orders_qs = (
+            qs.annotate(final_amount=final_total_expr)
+            .values("id", "paid_at", "payment_method", "final_amount")
+            .order_by("-paid_at")[:500]
+        )
+
+        totals = {
+            "cash": Decimal("0"),
+            "card": Decimal("0"),
+            "transfer": Decimal("0"),
+            "other": Decimal("0"),
+            "all": Decimal("0"),
+        }
+
+        rows = []
+        for row in orders_qs:
+            method = (row.get("payment_method") or "").strip().lower()
+            amount = _to_decimal(row.get("final_amount"))
+            if method in ("cash", "card", "transfer"):
+                totals[method] += amount
+            else:
+                totals["other"] += amount
+            totals["all"] += amount
+            rows.append(
+                {
+                    "order_id": str(row["id"]),
+                    "paid_at": row["paid_at"],
+                    "payment_method": method or "unknown",
+                    "final_amount": f"{amount:.2f}",
+                }
+            )
+
+        return {
+            "date_from": date_from or "",
+            "date_to": date_to or "",
+            "totals": {k: f"{v:.2f}" for k, v in totals.items()},
+            "rows": rows,
+        }
+
+    def _build_excel(self, report_type: str, payload: dict) -> bytes:
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "Report"
+
+        if report_type == "analytics":
+            ws.append(["Cafe analytics report"])
+            ws.append(["date_from", payload["date_from"]])
+            ws.append(["date_to", payload["date_to"]])
+            ws.append(["orders_count", payload["orders_count"]])
+            ws.append(["items_qty", payload["items_qty"]])
+            ws.append(["revenue", payload["revenue"]])
+            ws.append(["purchases_count", payload["purchases_count"]])
+            ws.append(["purchases_sum", payload["purchases_sum"]])
+            ws.append(["low_stock_count", payload["low_stock_count"]])
+            ws.append([])
+            ws.append(["Top menu items"])
+            ws.append(["title", "qty", "revenue"])
+            for row in payload["top_items"]:
+                ws.append([row["title"], row["qty"], row["revenue"]])
+        else:
+            ws.append(["Cafe cash report"])
+            ws.append(["date_from", payload["date_from"]])
+            ws.append(["date_to", payload["date_to"]])
+            ws.append(["total_all", payload["totals"]["all"]])
+            ws.append(["total_cash", payload["totals"]["cash"]])
+            ws.append(["total_card", payload["totals"]["card"]])
+            ws.append(["total_transfer", payload["totals"]["transfer"]])
+            ws.append(["total_other", payload["totals"]["other"]])
+            ws.append([])
+            ws.append(["order_id", "paid_at", "payment_method", "final_amount"])
+            for row in payload["rows"]:
+                ws.append([row["order_id"], str(row["paid_at"] or ""), row["payment_method"], row["final_amount"]])
+
+        buf = BytesIO()
+        wb.save(buf)
+        return buf.getvalue()
+
+    def _build_word_html(self, report_type: str, payload: dict) -> bytes:
+        if report_type == "analytics":
+            rows = "".join(
+                f"<tr><td>{r['title']}</td><td>{r['qty']}</td><td>{r['revenue']}</td></tr>"
+                for r in payload["top_items"]
+            )
+            html = f"""
+<html><head><meta charset="utf-8"></head><body>
+<h2>Cafe analytics report</h2>
+<p>date_from: {payload["date_from"]}</p>
+<p>date_to: {payload["date_to"]}</p>
+<p>orders_count: {payload["orders_count"]}</p>
+<p>items_qty: {payload["items_qty"]}</p>
+<p>revenue: {payload["revenue"]}</p>
+<p>purchases_count: {payload["purchases_count"]}</p>
+<p>purchases_sum: {payload["purchases_sum"]}</p>
+<p>low_stock_count: {payload["low_stock_count"]}</p>
+<h3>Top menu items</h3>
+<table border="1" cellspacing="0" cellpadding="4">
+<tr><th>title</th><th>qty</th><th>revenue</th></tr>
+{rows}
+</table>
+</body></html>
+"""
+        else:
+            rows = "".join(
+                f"<tr><td>{r['order_id']}</td><td>{r['paid_at']}</td><td>{r['payment_method']}</td><td>{r['final_amount']}</td></tr>"
+                for r in payload["rows"]
+            )
+            html = f"""
+<html><head><meta charset="utf-8"></head><body>
+<h2>Cafe cash report</h2>
+<p>date_from: {payload["date_from"]}</p>
+<p>date_to: {payload["date_to"]}</p>
+<p>total_all: {payload["totals"]["all"]}</p>
+<p>total_cash: {payload["totals"]["cash"]}</p>
+<p>total_card: {payload["totals"]["card"]}</p>
+<p>total_transfer: {payload["totals"]["transfer"]}</p>
+<p>total_other: {payload["totals"]["other"]}</p>
+<h3>Orders</h3>
+<table border="1" cellspacing="0" cellpadding="4">
+<tr><th>order_id</th><th>paid_at</th><th>payment_method</th><th>final_amount</th></tr>
+{rows}
+</table>
+</body></html>
+"""
+        return html.encode("utf-8")
+
+    def get(self, request):
+        company = self._user_company()
+        if not company:
+            return Response({"detail": "Компания не найдена."}, status=403)
+
+        report_type = (request.query_params.get("report") or "analytics").strip().lower()
+        export_format = (request.query_params.get("format") or "excel").strip().lower()
+        date_from = request.query_params.get("date_from")
+        date_to = request.query_params.get("date_to")
+        branch = self._active_branch()
+
+        if report_type not in {"analytics", "cash"}:
+            return Response({"detail": "report должен быть analytics или cash"}, status=400)
+        if export_format not in {"excel", "word"}:
+            return Response({"detail": "format должен быть excel или word"}, status=400)
+
+        payload = (
+            self._analytics_payload(company, branch, date_from, date_to)
+            if report_type == "analytics"
+            else self._cash_payload(company, branch, date_from, date_to)
+        )
+
+        date_tag = datetime.now().strftime("%Y%m%d_%H%M")
+        branch_tag = _safe_filename_part(str(getattr(branch, "id", "") or "global"), "global")
+        base_name = f"cafe_{report_type}_{branch_tag}_{date_tag}"
+
+        if export_format == "excel":
+            content = self._build_excel(report_type, payload)
+            response = HttpResponse(
+                content,
+                content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+            response["Content-Disposition"] = f'attachment; filename="{base_name}.xlsx"'
+            return response
+
+        content = self._build_word_html(report_type, payload)
+        response = HttpResponse(content, content_type="application/msword; charset=utf-8")
+        response["Content-Disposition"] = f'attachment; filename="{base_name}.doc"'
+        return response
