@@ -34,7 +34,7 @@ from apps.cafe.analytics import (
     KitchenAnalyticsByCookView, KitchenAnalyticsByWaiterView,
     SalesSummaryView, SalesByMenuItemView, SalesByCategoryView,
     PurchasesSummaryView, PurchasesBySupplierView,
-    WarehouseLowStockView,
+    WarehouseLowStockView, CafeAnalyticsExportView,
 )
 
 from apps.cafe.showcase.views_public import PublicCafeInfoAPIView, PublicCafeMenuAPIView, PublicCafeMenuItemsAPIView
@@ -147,6 +147,7 @@ urlpatterns = [
     path("analytics/purchases/suppliers/", PurchasesBySupplierView.as_view()),
 
     path("analytics/warehouse/low-stock/", WarehouseLowStockView.as_view()),
+    path("analytics/export/", CafeAnalyticsExportView.as_view(), name="cafe-analytics-export"),
 
     path("public/cafe/<slug:company_slug>/", PublicCafeInfoAPIView.as_view(), name="public_cafe_info"),
     path("public/cafe/<slug:company_slug>/menu/", PublicCafeMenuAPIView.as_view(), name="public_cafe_menu"),
