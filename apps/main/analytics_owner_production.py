@@ -16,6 +16,11 @@ try:
 except Exception:  # pragma: no cover - склад может быть отключён в тестах без миграций
     WarehouseStockDocument = None
 
+try:
+    from apps.building.models import BuildingDebtLedgerEntry
+except Exception:  # pragma: no cover - building может быть отключён в тестах без миграций
+    BuildingDebtLedgerEntry = None
+
 
 # ─────────────────────────────────────────────────────────────
 # typed zeros (важно: mixed types fix)
@@ -377,7 +382,9 @@ def build_owner_analytics_payload(*, company, branch, period, date_from, date_to
 
     accounts_receivable_dec = client_deals_receivable_dec + pos_sales_receivable_dec
 
-    # Кредиторская задолженность: проведённые закупки в долг (склад), остаток total − предоплата
+    # Кредиторская задолженность:
+    # - проведённые закупки в долг (склад), остаток total − предоплата
+    # - долги поставщикам из строительного реестра (building debt ledger)
     accounts_payable_dec = Decimal("0.00")
     if WarehouseStockDocument is not None:
         ap_qs = WarehouseStockDocument.objects.filter(
@@ -409,6 +416,44 @@ def build_owner_analytics_payload(*, company, branch, period, date_from, date_to
         )
         if accounts_payable_dec < 0:
             accounts_payable_dec = Decimal("0.00")
+
+    if BuildingDebtLedgerEntry is not None:
+        building_agg = BuildingDebtLedgerEntry.objects.filter(
+            company=company,
+            status=BuildingDebtLedgerEntry.Status.APPROVED,
+            direction=BuildingDebtLedgerEntry.Direction.PAYABLE,
+            counterparty_type=BuildingDebtLedgerEntry.CounterpartyType.SUPPLIER,
+        ).aggregate(
+            charges=Coalesce(
+                Sum("amount", filter=Q(entry_type=BuildingDebtLedgerEntry.EntryType.CHARGE)),
+                ZERO_MONEY,
+            ),
+            payments=Coalesce(
+                Sum("amount", filter=Q(entry_type=BuildingDebtLedgerEntry.EntryType.PAYMENT)),
+                ZERO_MONEY,
+            ),
+            barter=Coalesce(
+                Sum("amount", filter=Q(entry_type=BuildingDebtLedgerEntry.EntryType.BARTER)),
+                ZERO_MONEY,
+            ),
+            writeoff=Coalesce(
+                Sum("amount", filter=Q(entry_type=BuildingDebtLedgerEntry.EntryType.WRITEOFF)),
+                ZERO_MONEY,
+            ),
+            adjustments=Coalesce(
+                Sum("amount", filter=Q(entry_type=BuildingDebtLedgerEntry.EntryType.ADJUSTMENT)),
+                ZERO_MONEY,
+            ),
+        )
+        building_accounts_payable_dec = (
+            (building_agg["charges"] or Decimal("0.00"))
+            - (building_agg["payments"] or Decimal("0.00"))
+            - (building_agg["barter"] or Decimal("0.00"))
+            - (building_agg["writeoff"] or Decimal("0.00"))
+            + (building_agg["adjustments"] or Decimal("0.00"))
+        )
+        if building_accounts_payable_dec > 0:
+            accounts_payable_dec += building_accounts_payable_dec
 
     # ======================================================
     # Expense breakdown (статья расходов): CashFlow by name

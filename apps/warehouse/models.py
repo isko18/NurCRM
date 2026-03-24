@@ -970,6 +970,7 @@ class Document(models.Model):
 
     class Status(models.TextChoices):
         DRAFT = "DRAFT", "Черновик"
+        SALE_REQUEST = "SALE_REQUEST", "Заявка на продажу"
         CASH_PENDING = "CASH_PENDING", "Ожидает решения кассы"
         POSTED = "POSTED", "Проведен"
         REJECTED = "REJECTED", "Отклонен"
@@ -1038,6 +1039,11 @@ class Document(models.Model):
         default=False,
         db_index=True,
         help_text="Для документов агента: списывать со склада (общий товар), а не с остатков агента.",
+    )
+    is_sale_request = models.BooleanField(
+        "Заявка на продажу",
+        default=False,
+        help_text="Если включено для документа SALE — статус документа будет 'Заявка на продажу'.",
     )
 
     comment = models.TextField(blank=True, verbose_name="Комментарий")

@@ -164,6 +164,7 @@ class DocumentSerializer(serializers.ModelSerializer):
             "money_document_amount",
             "agent",
             "agent_display",
+            "is_sale_request",
             "counterparty_display_name",
             "comment",
             "discount_percent",
@@ -175,6 +176,12 @@ class DocumentSerializer(serializers.ModelSerializer):
             "expenses",
         )
         read_only_fields = ("number", "total", "status", "date", "cash_request_status")
+
+    @staticmethod
+    def _resolve_sale_status(doc_type, is_sale_request):
+        if doc_type == models.Document.DocType.SALE and bool(is_sale_request):
+            return models.Document.Status.SALE_REQUEST
+        return models.Document.Status.DRAFT
 
     def get_agent_display(self, obj):
         u = getattr(obj, "agent", None)
@@ -213,6 +220,9 @@ class DocumentSerializer(serializers.ModelSerializer):
 
     def create(self, validated_data):
         items = validated_data.pop("items", [])
+        doc_type = validated_data.get("doc_type")
+        is_sale_request = validated_data.get("is_sale_request", False)
+        validated_data["status"] = self._resolve_sale_status(doc_type, is_sale_request)
         
         # Валидация документа перед созданием
         doc = models.Document(**validated_data)
@@ -247,6 +257,8 @@ class DocumentSerializer(serializers.ModelSerializer):
         # Валидация документа перед обновлением
         for key, value in validated_data.items():
             setattr(instance, key, value)
+        if ("is_sale_request" in validated_data) or ("doc_type" in validated_data):
+            instance.status = self._resolve_sale_status(instance.doc_type, instance.is_sale_request)
         try:
             instance.clean()
         except DjangoValidationError as e:

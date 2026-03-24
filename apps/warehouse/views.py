@@ -824,6 +824,7 @@ class AgentRequestCartCreateSaleAPIView(CompanyBranchRestrictedMixin, APIView):
             raise ValidationError({"items": "Нельзя создать продажу по пустой заявке."})
 
         should_post = bool(ser.validated_data.get("post") or False)
+        is_sale_request = bool(ser.validated_data.get("is_sale_request") or False)
 
         with transaction.atomic():
             use_common_stock = services.agent_has_common_access_to_warehouse(
@@ -833,11 +834,12 @@ class AgentRequestCartCreateSaleAPIView(CompanyBranchRestrictedMixin, APIView):
             )
             doc = m.Document.objects.create(
                 doc_type=m.Document.DocType.SALE,
-                status=m.Document.Status.DRAFT,
+                status=(m.Document.Status.SALE_REQUEST if is_sale_request else m.Document.Status.DRAFT),
                 warehouse_from=cart.warehouse,
                 counterparty=counterparty,
                 agent=cart.agent,
                 use_common_stock=use_common_stock,
+                is_sale_request=is_sale_request,
                 payment_kind=ser.validated_data.get("payment_kind") or m.Document.PaymentKind.CASH,
                 prepayment_amount=ser.validated_data.get("prepayment_amount") or Decimal("0.00"),
                 discount_percent=ser.validated_data.get("discount_percent") or Decimal("0.00"),

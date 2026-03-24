@@ -673,6 +673,7 @@ class AgentRequestCartCreateSaleSerializer(serializers.Serializer):
 
     counterparty = serializers.PrimaryKeyRelatedField(queryset=m.Counterparty.objects.all())
     post = serializers.BooleanField(required=False, default=False)
+    is_sale_request = serializers.BooleanField(required=False, default=False)
     payment_kind = serializers.ChoiceField(choices=m.Document.PaymentKind.choices, required=False)
     prepayment_amount = serializers.DecimalField(max_digits=18, decimal_places=2, required=False, default=Decimal("0.00"))
     discount_percent = serializers.DecimalField(max_digits=5, decimal_places=2, required=False, default=Decimal("0.00"))
