@@ -67,8 +67,6 @@ urlpatterns = [
 
     # Подключение API
     path('', include(api_urlpatterns)),
-    # Совместимость: часть клиентов обращается к cafe без /api
-    path('cafe/', include('apps.cafe.urls')),
 ]
 
 if settings.ENABLE_API_DOCS:
