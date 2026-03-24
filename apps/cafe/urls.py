@@ -1,5 +1,5 @@
 # cafe/urls.py
-from django.urls import path
+from django.urls import path, re_path
 
 from .views import (
     # Receipt printer settings
@@ -147,7 +147,7 @@ urlpatterns = [
     path("analytics/purchases/suppliers/", PurchasesBySupplierView.as_view()),
 
     path("analytics/warehouse/low-stock/", WarehouseLowStockView.as_view()),
-    path("analytics/export/", CafeAnalyticsExportView.as_view(), name="cafe-analytics-export"),
+    re_path(r"^analytics/export/?$", CafeAnalyticsExportView.as_view(), name="cafe-analytics-export"),
 
     path("public/cafe/<slug:company_slug>/", PublicCafeInfoAPIView.as_view(), name="public_cafe_info"),
     path("public/cafe/<slug:company_slug>/menu/", PublicCafeMenuAPIView.as_view(), name="public_cafe_menu"),
