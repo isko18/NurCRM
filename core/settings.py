@@ -260,7 +260,9 @@ REST_FRAMEWORK = {
 SIMPLE_JWT = {
     'ACCESS_TOKEN_LIFETIME': timedelta(minutes=_get_int_env('JWT_ACCESS_TOKEN_MINUTES', 15)),
     'REFRESH_TOKEN_LIFETIME': timedelta(days=_get_int_env('JWT_REFRESH_TOKEN_DAYS', 7)),
-    'ROTATE_REFRESH_TOKENS': _get_bool_env('JWT_ROTATE_REFRESH_TOKENS', True),
+    # По умолчанию False: при True без приложения token_blacklist и миграций refresh
+    # часто падает с ошибкой БД (OutstandingToken и т.п.). Включайте через env осознанно.
+    'ROTATE_REFRESH_TOKENS': _get_bool_env('JWT_ROTATE_REFRESH_TOKENS', False),
     # Avoid 500 on /auth/refresh when token_blacklist app is not installed.
     # Can be enabled explicitly via env when blacklist app is configured.
     'BLACKLIST_AFTER_ROTATION': _get_bool_env('JWT_BLACKLIST_AFTER_ROTATION', False),

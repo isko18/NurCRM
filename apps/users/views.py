@@ -2,7 +2,7 @@
 
 from django.db.models import Q, Prefetch
 from django.http import Http404
-from django.db.utils import ProgrammingError
+from django.db.utils import OperationalError, ProgrammingError
 import logging
 
 from rest_framework import generics, permissions, status
@@ -211,6 +211,21 @@ class CustomTokenRefreshView(TokenRefreshView):
             return super().post(request, *args, **kwargs)
         except (TokenError, InvalidToken):
             return Response({"detail": "Token is invalid or expired"}, status=status.HTTP_401_UNAUTHORIZED)
+        except ValidationError as exc:
+            return Response(exc.detail, status=status.HTTP_400_BAD_REQUEST)
+        except (ProgrammingError, OperationalError) as exc:
+            logger.exception("Token refresh DB error: %s", exc)
+            return Response(
+                {
+                    "detail": "Token refresh failed due to a database error.",
+                    "hint": (
+                        "Скорее всего ROTATE_REFRESH_TOKENS=true без миграций SimpleJWT blacklist. "
+                        "Варианты: установить JWT_ROTATE_REFRESH_TOKENS=false на сервере и перезапустить приложение; "
+                        "либо добавить rest_framework_simplejwt.token_blacklist в INSTALLED_APPS и выполнить migrate."
+                    ),
+                },
+                status=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
         except Exception as exc:
             # Не ломаем клиент HTML-ошибкой: отдаем JSON с явной причиной.
             logger.exception("Token refresh failed: %s", exc)
