@@ -234,15 +234,6 @@ REST_FRAMEWORK = {
     'DEFAULT_AUTHENTICATION_CLASSES': (
         'rest_framework_simplejwt.authentication.JWTAuthentication',
     ),
-
-    'DEFAULT_PERMISSION_CLASSES': [
-        'rest_framework.permissions.IsAuthenticated',
-    ],
-
-    'DEFAULT_RENDERER_CLASSES': [
-        'rest_framework.renderers.JSONRenderer',
-    ],
-
     'DEFAULT_THROTTLE_CLASSES': [
         'rest_framework.throttling.AnonRateThrottle',
         'rest_framework.throttling.UserRateThrottle',
@@ -252,15 +243,12 @@ REST_FRAMEWORK = {
         'user': os.getenv('DRF_THROTTLE_USER', '300/minute'),
         'login': os.getenv('DRF_THROTTLE_LOGIN', '10/minute'),
     },
-
     'DEFAULT_FILTER_BACKENDS': [
         'django_filters.rest_framework.DjangoFilterBackend',
         'rest_framework.filters.SearchFilter',
     ],
-
     'DEFAULT_PAGINATION_CLASS': 'rest_framework.pagination.PageNumberPagination',
     'PAGE_SIZE': 100,
-
     'DEFAULT_PARSER_CLASSES': [
         'rest_framework.parsers.JSONParser',
         'rest_framework.parsers.FormParser',
@@ -270,7 +258,7 @@ REST_FRAMEWORK = {
 
 
 SIMPLE_JWT = {
-    'ACCESS_TOKEN_LIFETIME': timedelta(days=_get_int_env('JWT_ACCESS_TOKEN_DAYS', 15)),
+    'ACCESS_TOKEN_LIFETIME': timedelta(minutes=_get_int_env('JWT_ACCESS_TOKEN_MINUTES', 15)),
     'REFRESH_TOKEN_LIFETIME': timedelta(days=_get_int_env('JWT_REFRESH_TOKEN_DAYS', 7)),
     'ROTATE_REFRESH_TOKENS': _get_bool_env('JWT_ROTATE_REFRESH_TOKENS', True),
     'BLACKLIST_AFTER_ROTATION': True,
