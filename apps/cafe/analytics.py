@@ -10,6 +10,7 @@ from datetime import datetime
 from rest_framework import permissions
 from rest_framework.views import APIView
 from rest_framework.response import Response
+from rest_framework.renderers import BaseRenderer, JSONRenderer
 
 from django.conf import settings
 from django.core.cache import cache
@@ -22,6 +23,38 @@ from django.db.models import (
 from apps.cafe.models import KitchenTask, OrderItem, Purchase, Warehouse, Order
 from apps.cafe.views import CompanyBranchQuerysetMixin
 from openpyxl import Workbook
+
+
+class _BinaryExcelRenderer(BaseRenderer):
+    media_type = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    format = "excel"
+    charset = None
+    render_style = "binary"
+
+    def render(self, data, accepted_media_type=None, renderer_context=None):
+        if data is None:
+            return b""
+        if isinstance(data, (bytes, bytearray)):
+            return bytes(data)
+        if isinstance(data, str):
+            return data.encode("utf-8")
+        return json.dumps(data, ensure_ascii=False).encode("utf-8")
+
+
+class _BinaryWordRenderer(BaseRenderer):
+    media_type = "application/msword"
+    format = "word"
+    charset = None
+    render_style = "binary"
+
+    def render(self, data, accepted_media_type=None, renderer_context=None):
+        if data is None:
+            return b""
+        if isinstance(data, (bytes, bytearray)):
+            return bytes(data)
+        if isinstance(data, str):
+            return data.encode("utf-8")
+        return json.dumps(data, ensure_ascii=False).encode("utf-8")
 
 
 # ==========================
@@ -519,6 +552,7 @@ class CafeAnalyticsExportView(CompanyBranchQuerysetMixin, APIView):
       GET /cafe/analytics/export/?report=analytics|cash&format=excel|word&date_from=YYYY-MM-DD&date_to=YYYY-MM-DD
     """
     permission_classes = [permissions.IsAuthenticated]
+    renderer_classes = [JSONRenderer, _BinaryExcelRenderer, _BinaryWordRenderer]
 
     def _analytics_payload(self, company, branch, date_from, date_to):
         qs_items = (
