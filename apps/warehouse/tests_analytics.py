@@ -2,9 +2,11 @@ from decimal import Decimal
 
 from django.test import TestCase
 from django.utils import timezone
+from django.core.cache import cache
 
 from apps.users.models import Company, Branch, User
 from apps.warehouse import models as wm
+from apps.warehouse import services as warehouse_services
 from apps.warehouse.analytics import build_agent_warehouse_analytics_payload, build_owner_warehouse_analytics_payload
 
 
@@ -130,3 +132,74 @@ class WarehouseAnalyticsByGroupTests(TestCase):
         self.assertTrue(any(r["group_name"] == "Group A" for r in rows))
         self.assertTrue(any(r["group_name"] == "Group B" for r in rows))
         self.assertTrue(any(r["group_name"] == "Без группы" for r in rows))
+
+    def test_agent_analytics_includes_counterparty_debts(self):
+        cp = wm.Counterparty.objects.create(
+            name="Должник",
+            phone="+996700000021",
+            company=self.company,
+            branch=self.branch,
+            agent=self.agent,
+            type=wm.Counterparty.Type.CLIENT,
+        )
+        d = wm.Document.objects.create(
+            doc_type=wm.Document.DocType.SALE,
+            status=wm.Document.Status.POSTED,
+            payment_kind=wm.Document.PaymentKind.CREDIT,
+            warehouse_from=self.wh,
+            counterparty=cp,
+            agent=self.agent,
+        )
+        wm.Document.objects.filter(pk=d.pk).update(date=timezone.now())
+        wm.DocumentItem.objects.create(document=d, product=self.p_a, qty=Decimal("1"), price=Decimal("100.00"))
+        warehouse_services.recalc_document_totals(d)
+
+        today = timezone.localdate()
+        data = build_agent_warehouse_analytics_payload(
+            company_id=str(self.company.id),
+            branch_id=str(self.branch.id),
+            agent_id=str(self.agent.id),
+            period="day",
+            date_from=today,
+            date_to=today,
+            group_by="day",
+        )
+        self.assertEqual(data["summary"]["counterparties_debt_total"], "100.00")
+        self.assertEqual(data["summary"]["counterparties_payable_total"], "0.00")
+        self.assertEqual(data["summary"]["counterparty_debts_company_name"], "Test Co")
+        self.assertEqual(data["summary"]["counterparty_debts_branch_name"], "Main")
+        self.assertIn("formula_ru", data["details"]["counterparties_debt_notes"])
+        debts = data["details"]["counterparties_debt"]
+        self.assertEqual(len(debts), 1)
+        self.assertEqual(debts[0]["counterparty_id"], str(cp.id))
+        self.assertEqual(debts[0]["balance"], "100.00")
+        self.assertEqual(debts[0]["abs_amount"], "100.00")
+        self.assertEqual(debts[0]["direction"], "counterparty_owes_company")
+        self.assertEqual(debts[0]["debtor"]["role"], "counterparty")
+        self.assertEqual(debts[0]["creditor"]["role"], "company")
+        self.assertIn("Должник", debts[0]["summary_ru"])
+        self.assertEqual(debts[0]["breakdown"]["sale_and_purchase_return"], "100.00")
+        self.assertEqual(debts[0]["breakdown"]["money_receipt"], "0.00")
+
+        wm.MoneyDocument.objects.create(
+            company=self.company,
+            branch=self.branch,
+            doc_type=wm.MoneyDocument.DocType.MONEY_RECEIPT,
+            status=wm.MoneyDocument.Status.POSTED,
+            counterparty=cp,
+            amount=Decimal("40.00"),
+        )
+        cache.clear()
+        data2 = build_agent_warehouse_analytics_payload(
+            company_id=str(self.company.id),
+            branch_id=str(self.branch.id),
+            agent_id=str(self.agent.id),
+            period="day",
+            date_from=today,
+            date_to=today,
+            group_by="day",
+        )
+        self.assertEqual(data2["summary"]["counterparties_debt_total"], "60.00")
+        row = data2["details"]["counterparties_debt"][0]
+        self.assertEqual(row["balance"], "60.00")
+        self.assertEqual(row["breakdown"]["money_receipt"], "40.00")

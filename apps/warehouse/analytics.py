@@ -98,6 +98,181 @@ def _money_str(x) -> str:
         return str(x)
 
 
+# Сальдо с контрагентом (как в сверке / views_reconciliation): дебет увеличивает долг контрагента перед компанией.
+_CP_DOC_DEBIT_TYPES = frozenset(
+    {
+        wm.Document.DocType.SALE,
+        wm.Document.DocType.PURCHASE_RETURN,
+    }
+)
+_CP_DOC_CREDIT_TYPES = frozenset(
+    {
+        wm.Document.DocType.PURCHASE,
+        wm.Document.DocType.SALE_RETURN,
+    }
+)
+
+
+def _sum_by_counterparty_id(qs, *, doc_types, amount_field: str):
+    rows = (
+        qs.filter(doc_type__in=tuple(doc_types))
+        .values("counterparty_id")
+        .annotate(s=Coalesce(Sum(amount_field), ZERO_MONEY))
+    )
+    out = {}
+    for r in rows:
+        cid = r["counterparty_id"]
+        if cid is None:
+            continue
+        out[cid] = (r["s"] or Decimal("0.00")).quantize(Decimal("0.01"))
+    return out
+
+
+def _company_display_name(company) -> str:
+    return (getattr(company, "llc", None) or getattr(company, "name", None) or "").strip() or "Компания"
+
+
+def _build_agent_counterparty_debts(*, company, branch, agent, limit: int = 200):
+    """
+    Текущие сальдо по контрагентам агента (проведённые товарные и денежные документы).
+    balance > 0 — контрагент должен компании (дебиторка); balance < 0 — компания должна контрагенту.
+    """
+    company_name = _company_display_name(company)
+    branch_name = (branch.name.strip() if branch and getattr(branch, "name", None) else "") or None
+
+    cp_qs = wm.Counterparty.objects.filter(company=company, agent=agent)
+    if branch is not None:
+        cp_qs = cp_qs.filter(branch=branch)
+    else:
+        cp_qs = cp_qs.filter(branch__isnull=True)
+
+    if not cp_qs.exists():
+        return {
+            "company_name": company_name,
+            "branch_name": branch_name,
+            "counterparties_debt_total": "0.00",
+            "counterparties_payable_total": "0.00",
+            "counterparties": [],
+        }
+
+    docs_qs = wm.Document.objects.filter(
+        warehouse_from__company=company,
+        agent=agent,
+        status=wm.Document.Status.POSTED,
+        doc_type__in=tuple(_CP_DOC_DEBIT_TYPES | _CP_DOC_CREDIT_TYPES),
+        counterparty__in=cp_qs,
+    )
+    if branch is not None:
+        docs_qs = docs_qs.filter(warehouse_from__branch=branch)
+    else:
+        docs_qs = docs_qs.filter(warehouse_from__branch__isnull=True)
+
+    money_qs = wm.MoneyDocument.objects.filter(
+        company=company,
+        status=wm.MoneyDocument.Status.POSTED,
+        counterparty__in=cp_qs,
+        doc_type__in=(
+            wm.MoneyDocument.DocType.MONEY_EXPENSE,
+            wm.MoneyDocument.DocType.MONEY_RECEIPT,
+        ),
+    )
+    if branch is not None:
+        money_qs = money_qs.filter(branch=branch)
+    else:
+        money_qs = money_qs.filter(branch__isnull=True)
+
+    deb = _sum_by_counterparty_id(docs_qs, doc_types=_CP_DOC_DEBIT_TYPES, amount_field="total")
+    cred = _sum_by_counterparty_id(docs_qs, doc_types=_CP_DOC_CREDIT_TYPES, amount_field="total")
+    m_exp = _sum_by_counterparty_id(
+        money_qs, doc_types=frozenset({wm.MoneyDocument.DocType.MONEY_EXPENSE}), amount_field="amount"
+    )
+    m_rec = _sum_by_counterparty_id(
+        money_qs, doc_types=frozenset({wm.MoneyDocument.DocType.MONEY_RECEIPT}), amount_field="amount"
+    )
+
+    cp_ids = set(cp_qs.values_list("id", flat=True))
+    balances = []
+    for cid in cp_ids:
+        bal = (
+            deb.get(cid, Decimal("0.00"))
+            - cred.get(cid, Decimal("0.00"))
+            + m_exp.get(cid, Decimal("0.00"))
+            - m_rec.get(cid, Decimal("0.00"))
+        ).quantize(Decimal("0.01"))
+        balances.append((bal, cid))
+
+    balances.sort(key=lambda x: x[0], reverse=True)
+
+    id_to_cp = {cp.id: cp for cp in cp_qs}
+    counterparties = []
+    total_receivable = Decimal("0.00")
+    total_payable = Decimal("0.00")
+    for bal, cid in balances:
+        if bal == Decimal("0.00"):
+            continue
+        if bal > 0:
+            total_receivable += bal
+        else:
+            total_payable += abs(bal)
+        cp = id_to_cp.get(cid)
+        if cp is None:
+            continue
+
+        cp_nm = (cp.name or "").strip() or "Контрагент"
+        d_sale_pr = deb.get(cid, Decimal("0.00"))
+        d_pur_sr = cred.get(cid, Decimal("0.00"))
+        d_mexp = m_exp.get(cid, Decimal("0.00"))
+        d_mrec = m_rec.get(cid, Decimal("0.00"))
+        abs_amt = abs(bal)
+
+        if bal > 0:
+            direction = "counterparty_owes_company"
+            summary_ru = f"Контрагент «{cp_nm}» должен компании «{company_name}» {_money_str(abs_amt)}."
+            debtor = {"role": "counterparty", "name": cp_nm, "counterparty_id": str(cp.id)}
+            creditor = {"role": "company", "name": company_name}
+        else:
+            direction = "company_owes_counterparty"
+            summary_ru = f"Компания «{company_name}» должна контрагенту «{cp_nm}» {_money_str(abs_amt)}."
+            debtor = {"role": "company", "name": company_name}
+            creditor = {"role": "counterparty", "name": cp_nm, "counterparty_id": str(cp.id)}
+
+        counterparties.append(
+            {
+                "counterparty_id": str(cp.id),
+                "name": cp.name,
+                "phone": cp.phone or "",
+                "balance": _money_str(bal),
+                "abs_amount": _money_str(abs_amt),
+                "direction": direction,
+                "debtor": debtor,
+                "creditor": creditor,
+                "summary_ru": summary_ru,
+                "breakdown": {
+                    "sale_and_purchase_return": _money_str(d_sale_pr),
+                    "purchase_and_sale_return": _money_str(d_pur_sr),
+                    "money_expense": _money_str(d_mexp),
+                    "money_receipt": _money_str(d_mrec),
+                    "labels_ru": {
+                        "sale_and_purchase_return": "Продажи и возвраты поставщику (увеличивают долг контрагента перед компанией)",
+                        "purchase_and_sale_return": "Покупки и возвраты от покупателя (уменьшают этот долг)",
+                        "money_expense": "Расход денег из кассы контрагенту",
+                        "money_receipt": "Приход денег от контрагента в кассу",
+                    },
+                },
+            }
+        )
+        if limit and len(counterparties) >= limit:
+            break
+
+    return {
+        "company_name": company_name,
+        "branch_name": branch_name,
+        "counterparties_debt_total": _money_str(total_receivable),
+        "counterparties_payable_total": _money_str(total_payable),
+        "counterparties": counterparties,
+    }
+
+
 def _build_sales_by_group(*, sales_items_qs, limit: int = 100):
     """
     Сводка продаж по "группам товаров внутри склада" (WarehouseProductGroup).
@@ -320,6 +495,8 @@ def build_agent_warehouse_analytics_payload(
         for row in sales_by_date_qs
     ]
 
+    cp_debts = _build_agent_counterparty_debts(company=company, branch=branch, agent=agent)
+
     return {
         "period": period,
         "date_from": str(date_from),
@@ -338,6 +515,10 @@ def build_agent_warehouse_analytics_payload(
             "write_off_qty": str(write_off_qty),
             "on_hand_qty": str(on_hand_qty),
             "on_hand_amount": _money_str(on_hand_amount),
+            "counterparties_debt_total": cp_debts["counterparties_debt_total"],
+            "counterparties_payable_total": cp_debts["counterparties_payable_total"],
+            "counterparty_debts_company_name": cp_debts["company_name"],
+            "counterparty_debts_branch_name": cp_debts["branch_name"],
         },
         "charts": {
             "requests_by_date": requests_by_date,
@@ -348,6 +529,14 @@ def build_agent_warehouse_analytics_payload(
             "sales_by_warehouse": sales_by_warehouse,
             "sales_by_group": sales_by_group,
             "top_sales_group": top_sales_group,
+            "counterparties_debt": cp_debts["counterparties"],
+            "counterparties_debt_notes": {
+                "formula_ru": (
+                    "Сальдо = (продажи + возврат поставщику) − (покупки + возврат от покупателя) "
+                    "+ расход денег из кассы контрагенту − приход денег от контрагента в кассу. "
+                    "Положительное сальдо: контрагент должен компании. Отрицательное: компания должна контрагенту."
+                ),
+            },
         },
     }
 

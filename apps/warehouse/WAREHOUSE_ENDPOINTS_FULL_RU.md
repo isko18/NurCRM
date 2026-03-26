@@ -486,10 +486,36 @@
 - Query: `period=day|week|month|custom`, `date`, `date_from`, `date_to`.
 - Ответ `200`: summary/charts/details.
 
+**Долги по контрагентам агента** (текущее сальдо, не ограничено выбранным периодом графиков — считается по всем проведённым документам в контексте компании/филиала):
+
+- Логика совпадает со **сверкой контрагента** (товарные документы + денежные):  
+  `сальдо = (продажи + возврат поставщику) − (покупки + возврат от покупателя) + расход кассы контрагенту − приход от контрагента`.
+- Учитываются только контрагенты с `company`, `branch` и **`agent` = этот агент**.
+
+В **`summary`** дополнительно:
+| Поле | Смысл |
+|------|--------|
+| `counterparties_debt_total` | Сумма положительных сальдо: **контрагенты должны компании** |
+| `counterparties_payable_total` | Сумма модулей отрицательных сальдо: **компания должна контрагентам** |
+| `counterparty_debts_company_name` | Название компании для подписей (`llc` или `name`) |
+| `counterparty_debts_branch_name` | Название филиала или `null` |
+
+В **`details.counterparties_debt`** — массив (до 200 записей, сначала крупнейшие долги по знаку сальдо), по каждому контрагенту с ненулевым сальдо:
+| Поле | Смысл |
+|------|--------|
+| `balance` | Сальдо со знаком (строка с 2 знаками) |
+| `abs_amount` | Модуль суммы |
+| `direction` | `counterparty_owes_company` или `company_owes_counterparty` |
+| `debtor`, `creditor` | Кто должник / кредитор: `role` (`company` \| `counterparty`), `name`, у контрагента — `counterparty_id` |
+| `summary_ru` | Краткая фраза «кто кому сколько» |
+| `breakdown` | Суммы по видам: `sale_and_purchase_return`, `purchase_and_sale_return`, `money_expense`, `money_receipt` и `labels_ru` с пояснениями |
+
+В **`details.counterparties_debt_notes.formula_ru`** — текстовая формула расчёта и знака сальдо.
+
 ### 12.2 `GET /api/warehouse/owner/agents/{agent_id}/analytics/`
 - Назначение: аналитика конкретного агента для owner/admin.
 - Query: как выше.
-- Ответ `200`.
+- Ответ `200`: тот же формат, что и у `agents/me/analytics/`, включая блок долгов по контрагентам этого агента.
 
 ### 12.3 `GET /api/warehouse/owner/agents/analytics/`
 - Назначение: свод по продажам агентов.
