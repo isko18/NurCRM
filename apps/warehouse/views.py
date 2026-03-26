@@ -871,7 +871,10 @@ class AgentRequestCartCreateSaleAPIView(CompanyBranchRestrictedMixin, APIView):
             cart.save(update_fields=["sale_document"])
 
             if should_post:
-                services.post_document(doc)
+                try:
+                    services.post_document(doc)
+                except ValueError as exc:
+                    raise ValidationError({"detail": str(exc)})
                 doc.refresh_from_db()
 
         out = serializers_documents.DocumentSerializer(doc, context={"request": request}).data

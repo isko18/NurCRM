@@ -1,6 +1,7 @@
 from decimal import Decimal
 from rest_framework import serializers
 from django.core.exceptions import ValidationError as DjangoValidationError
+from django.core.exceptions import ObjectDoesNotExist
 from django.contrib.auth import get_user_model
 from . import models
 
@@ -110,16 +111,10 @@ class DocumentSerializer(serializers.ModelSerializer):
     receipts = serializers.SerializerMethodField()
     expenses = serializers.SerializerMethodField()
 
-    money_document_id = serializers.UUIDField(source="money_document.id", read_only=True, allow_null=True)
-    money_document_number = serializers.CharField(source="money_document.number", read_only=True, allow_null=True)
-    money_document_status = serializers.CharField(source="money_document.status", read_only=True, allow_null=True)
-    money_document_amount = serializers.DecimalField(
-        source="money_document.amount",
-        max_digits=18,
-        decimal_places=2,
-        read_only=True,
-        allow_null=True,
-    )
+    money_document_id = serializers.SerializerMethodField()
+    money_document_number = serializers.SerializerMethodField()
+    money_document_status = serializers.SerializerMethodField()
+    money_document_amount = serializers.SerializerMethodField()
 
     cash_register_name = serializers.CharField(source="cash_register.name", read_only=True, allow_null=True)
     payment_category_title = serializers.CharField(source="payment_category.title", read_only=True, allow_null=True)
@@ -196,9 +191,33 @@ class DocumentSerializer(serializers.ModelSerializer):
             or str(getattr(u, "id", ""))
         )
 
+    @staticmethod
+    def _safe_one_to_one(obj, attr: str):
+        """Обратная OneToOne без записи бросает RelatedObjectDoesNotExist — getattr это не ловит."""
+        try:
+            return getattr(obj, attr)
+        except ObjectDoesNotExist:
+            return None
+
+    def get_money_document_id(self, obj):
+        md = self._safe_one_to_one(obj, "money_document")
+        return md.id if md else None
+
+    def get_money_document_number(self, obj):
+        md = self._safe_one_to_one(obj, "money_document")
+        return md.number if md else None
+
+    def get_money_document_status(self, obj):
+        md = self._safe_one_to_one(obj, "money_document")
+        return md.status if md else None
+
+    def get_money_document_amount(self, obj):
+        md = self._safe_one_to_one(obj, "money_document")
+        return md.amount if md else None
+
     def get_cash_request_status(self, obj):
-        req = getattr(obj, "cash_request", None)
-        return getattr(req, "status", None)
+        req = self._safe_one_to_one(obj, "cash_request")
+        return getattr(req, "status", None) if req else None
 
     def get_receipts(self, obj):
         """Приходы — движения с move_kind=RECEIPT."""
