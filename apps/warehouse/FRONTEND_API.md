@@ -1122,12 +1122,17 @@ Read-only поля:
 - продажи/возвраты/списания
 - остатки на руках
 - графики по заявкам/продажам
+- **долги по контрагентам этого агента** (текущее сальдо; логика как у сверки контрагента, см. ниже)
 
 Детально:
 - `details.sales_by_product[]` — продажи по товарам
 - `details.sales_by_warehouse[]` — продажи по складам
 - `details.sales_by_group[]` — продажи по группам товаров внутри склада (`product_group` у товара)
 - `details.top_sales_group` — группа‑лидер по сумме продаж за период (может быть `null`)
+- **`details.counterparties_debt[]`** — по каждому контрагенту агента с ненулевым сальдо: `balance`, `abs_amount`, `direction` (`counterparty_owes_company` | `company_owes_counterparty`), `debtor` / `creditor`, `summary_ru`, `breakdown` (суммы по видам документов и денег + `labels_ru`)
+- **`details.counterparties_debt_notes.formula_ru`** — пояснение формулы сальдо
+
+В **`summary`** дополнительно: `counterparties_debt_total` (нам должны контрагенты), `counterparties_payable_total` (мы должны контрагентам), `counterparty_debts_company_name`, `counterparty_debts_branch_name`.
 
 Пример `details` агента:
 ```json
@@ -1142,7 +1147,30 @@ Read-only поля:
     "sales_by_group": [
       { "group_id": "uuid|null", "group_name": "string", "docs_count": 3, "qty": "5.000", "amount": "500.00" }
     ],
-    "top_sales_group": { "group_id": "uuid|null", "group_name": "string", "docs_count": 3, "qty": "5.000", "amount": "500.00" }
+    "top_sales_group": { "group_id": "uuid|null", "group_name": "string", "docs_count": 3, "qty": "5.000", "amount": "500.00" },
+    "counterparties_debt": [
+      {
+        "counterparty_id": "uuid",
+        "name": "string",
+        "phone": "string",
+        "balance": "100.00",
+        "abs_amount": "100.00",
+        "direction": "counterparty_owes_company",
+        "debtor": { "role": "counterparty", "name": "string", "counterparty_id": "uuid" },
+        "creditor": { "role": "company", "name": "string" },
+        "summary_ru": "Контрагент «…» должен компании «…» 100.00.",
+        "breakdown": {
+          "sale_and_purchase_return": "100.00",
+          "purchase_and_sale_return": "0.00",
+          "money_expense": "0.00",
+          "money_receipt": "0.00",
+          "labels_ru": { }
+        }
+      }
+    ],
+    "counterparties_debt_notes": {
+      "formula_ru": "Сальдо = (продажи + возврат поставщику) − …"
+    }
   }
 }
 ```
