@@ -117,6 +117,8 @@ class PaymentCategoryListCreateView(CompanyBranchRestrictedMixin, generics.ListC
                 or "uq_wh_payment_category_title_global_per_company" in msg
             ):
                 raise ValidationError({"title": "Категория платежа с таким названием уже существует."})
+            if "uq_wh_payment_category_system_code_per_scope" in msg:
+                raise ValidationError({"detail": "Системная категория для этой области уже существует."})
             raise
 
 
@@ -125,6 +127,8 @@ class PaymentCategoryDetailView(CompanyBranchRestrictedMixin, generics.RetrieveU
     queryset = models.PaymentCategory.objects.all()
 
     def perform_update(self, serializer):
+        if serializer.instance.system_code:
+            raise ValidationError({"detail": "Системную категорию платежа нельзя изменять."})
         try:
             self._save_with_company_branch(serializer)
         except IntegrityError as e:
@@ -135,6 +139,11 @@ class PaymentCategoryDetailView(CompanyBranchRestrictedMixin, generics.RetrieveU
             ):
                 raise ValidationError({"title": "Категория платежа с таким названием уже существует."})
             raise
+
+    def perform_destroy(self, instance):
+        if instance.system_code:
+            raise ValidationError({"detail": "Системную категорию платежа нельзя удалить."})
+        super().perform_destroy(instance)
 
 
 class MoneyDocumentListCreateView(CompanyBranchRestrictedMixin, generics.ListCreateAPIView):

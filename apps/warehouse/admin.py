@@ -58,9 +58,10 @@ class CashRegisterAdmin(admin.ModelAdmin):
 
 @admin.register(models.PaymentCategory)
 class PaymentCategoryAdmin(admin.ModelAdmin):
-	list_display = ("title", "company", "branch")
+	list_display = ("title", "system_code", "company", "branch")
 	search_fields = ("title",)
-	list_filter = ("company", "branch")
+	list_filter = ("company", "branch", "system_code")
+	readonly_fields = ("system_code",)
 
 
 @admin.register(models.MoneyDocument)

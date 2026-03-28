@@ -1491,9 +1491,24 @@ class CashRegister(BaseModelId, BaseModelCompanyBranch):
 class PaymentCategory(BaseModelId, BaseModelCompanyBranch):
     """
     Категория платежа для денежных документов (приход/расход).
+
+    Системные категории (system_code задан) создаются автоматически для компании/филиала
+    и не редактируются через API: «Продажа», «Долги».
     """
 
+    class SystemCode(models.TextChoices):
+        SALE = "sale", "Продажа"
+        DEBT = "debt", "Долги"
+
     title = models.CharField(max_length=255, verbose_name="Название")
+    system_code = models.CharField(
+        max_length=16,
+        choices=SystemCode.choices,
+        null=True,
+        blank=True,
+        verbose_name="Системный код",
+        help_text="Если задан — встроенная категория (нельзя удалить или переименовать через API).",
+    )
 
     class Meta:
         verbose_name = "Категория платежа"
@@ -1508,6 +1523,11 @@ class PaymentCategory(BaseModelId, BaseModelCompanyBranch):
                 fields=("company", "title"),
                 name="uq_wh_payment_category_title_global_per_company",
                 condition=models.Q(branch__isnull=True),
+            ),
+            models.UniqueConstraint(
+                fields=("company", "branch", "system_code"),
+                name="uq_wh_payment_category_system_code_per_scope",
+                condition=models.Q(system_code__isnull=False),
             ),
         ]
         indexes = [
@@ -1677,7 +1697,8 @@ class MoneyDocument(BaseModelCompanyBranch):
             # Для авто-документов из склада контрагент может отсутствовать (например WRITE_OFF/RECEIPT).
             if not self.counterparty_id and not self.source_document_id:
                 raise ValidationError({"counterparty": "Укажите контрагента."})
-            if not self.payment_category_id:
+            # Категория обязательна только для денежных документов, созданных вручную (без складского основания).
+            if not self.payment_category_id and not self.source_document_id:
                 raise ValidationError({"payment_category": "Укажите категорию платежа."})
 
         if self.amount is None or Decimal(self.amount) <= 0:

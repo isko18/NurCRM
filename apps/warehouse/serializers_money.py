@@ -31,8 +31,8 @@ class PaymentCategorySerializer(serializers.ModelSerializer):
 
     class Meta:
         model = models.PaymentCategory
-        fields = ("id", "company", "branch", "title")
-        read_only_fields = ("id", "company", "branch")
+        fields = ("id", "company", "branch", "title", "system_code")
+        read_only_fields = ("id", "company", "branch", "system_code")
         ref_name = "WarehousePaymentCategorySerializer"
 
 
