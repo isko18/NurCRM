@@ -519,13 +519,14 @@ class WarehouseLowStockView(CompanyBranchQuerysetMixin, APIView):
             qs = qs.filter(branch=branch)
 
         out = []
-        for w in qs.only("id", "title", "unit", "remainder", "minimum"):
+        for w in qs.only("id", "title", "supplier", "unit", "remainder", "minimum"):
             rem = _to_decimal(w.remainder)
             mn = _to_decimal(w.minimum)
             if mn > 0 and rem < mn:
                 out.append({
                     "id": str(w.id),
                     "title": w.title,
+                    "supplier": str(w.supplier or ""),
                     "unit": w.unit,
                     "remainder": str(w.remainder or ""),
                     "minimum": str(w.minimum or ""),

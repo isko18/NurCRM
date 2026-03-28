@@ -413,6 +413,7 @@ class Warehouse(models.Model):
         verbose_name='Филиал', null=True, blank=True, db_index=True
     )
     title = models.CharField(max_length=255, verbose_name="Название")
+    supplier = models.CharField(max_length=255, blank=True, default="", verbose_name="Поставщик")
     unit = models.CharField(max_length=255, verbose_name="Ед. изм.")
     remainder = models.CharField(max_length=255, verbose_name="Остаток")
     minimum = models.CharField(max_length=255, verbose_name="Минимум")
