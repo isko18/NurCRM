@@ -213,21 +213,22 @@ def _create_money_document_for_request(document: models.Document, request_obj: m
     if (branch is None and cash_register.branch_id is not None) or (branch is not None and cash_register.branch_id != branch.id):
         raise ValueError("Касса принадлежит другому филиалу.")
 
-    # payment category: from document or auto-pick if unique
+    # payment category: с документа или автовыбор (как касса — при нескольких берём первую); можно не указывать
     payment_category = getattr(document, "payment_category", None)
     if payment_category is None:
         qs = models.PaymentCategory.objects.filter(company=company)
         qs = qs.filter(branch=branch) if branch is not None else qs.filter(branch__isnull=True)
-        payment_category = _pick_single(qs, what="категорий платежа")
-        if payment_category is None:
-            raise ValueError(
-                "Не найдена категория платежа. Создайте категорию или укажите payment_category в документе."
-            )
+        payment_category = _pick_single(
+            qs, what="категорий платежа", allow_multiple_take_first=True
+        )
 
-    if payment_category.company_id != company.id:
-        raise ValueError("Категория платежа принадлежит другой компании.")
-    if (branch is None and payment_category.branch_id is not None) or (branch is not None and payment_category.branch_id != branch.id):
-        raise ValueError("Категория платежа принадлежит другому филиалу.")
+    if payment_category is not None:
+        if payment_category.company_id != company.id:
+            raise ValueError("Категория платежа принадлежит другой компании.")
+        if (branch is None and payment_category.branch_id is not None) or (
+            branch is not None and payment_category.branch_id != branch.id
+        ):
+            raise ValueError("Категория платежа принадлежит другому филиалу.")
 
     from . import services_money
 
@@ -567,11 +568,9 @@ def post_document(document: models.Document, allow_negative: bool = None) -> mod
             if payment_category is None:
                 qs = models.PaymentCategory.objects.filter(company=company)
                 qs = qs.filter(branch=branch) if branch is not None else qs.filter(branch__isnull=True)
-                payment_category = _pick_single(qs, what="категорий платежа")
-                if payment_category is None:
-                    raise ValueError(
-                        "Не найдена категория платежа. Создайте категорию или укажите payment_category в документе."
-                    )
+                payment_category = _pick_single(
+                    qs, what="категорий платежа", allow_multiple_take_first=True
+                )
 
             # Идемпотентность: используем OneToOne money_document (source_document)
             money_doc = getattr(document, "money_document", None)
