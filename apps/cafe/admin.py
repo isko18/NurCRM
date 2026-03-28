@@ -434,7 +434,7 @@ class EquipmentInventorySessionAdmin(admin.ModelAdmin):
     
 @admin.register(Warehouse)
 class WarehouseAdmin(admin.ModelAdmin):
-    list_display = ("title", "company", "branch", "unit", "remainder", "minimum")
+    list_display = ("title", "supplier", "company", "branch", "unit", "remainder", "minimum")
     list_filter = ("company", "branch", "unit")
-    search_fields = ("title", "unit")     # <- обязательно для автокомплита
+    search_fields = ("title", "unit", "supplier")     # <- обязательно для автокомплита
     ordering = ("company", "branch", "title")

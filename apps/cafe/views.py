@@ -553,8 +553,8 @@ class WarehouseListCreateView(CompanyBranchQuerysetMixin, generics.ListCreateAPI
     queryset = Warehouse.objects.all()
     serializer_class = WarehouseSerializer
     filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
-    filterset_fields = ["title", "unit"]
-    search_fields = ["title", "unit"]
+    filterset_fields = ["title", "unit", "supplier"]
+    search_fields = ["title", "unit", "supplier"]
     ordering_fields = ["title", "id"]
 
     def perform_create(self, serializer):

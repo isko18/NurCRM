@@ -319,7 +319,7 @@ class WarehouseSerializer(CompanyBranchReadOnlyMixin):
     class Meta:
         ref_name = "CafeWarehouse"
         model = Warehouse
-        fields = ["id", "company", "branch", "title", "unit", "remainder", "minimum", "unit_price"]
+        fields = ["id", "company", "branch", "title", "supplier", "unit", "remainder", "minimum", "unit_price"]
         read_only_fields = ["id", "company", "branch"]
 
     def validate(self, attrs):
