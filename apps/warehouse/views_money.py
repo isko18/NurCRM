@@ -271,7 +271,8 @@ class MoneyDocumentUnpostView(CompanyBranchRestrictedMixin, generics.GenericAPIV
 
 class CounterpartyMoneyOperationsView(CompanyBranchRestrictedMixin, generics.ListAPIView):
     """
-    Подробный список денежных операций по контрагенту.
+    Операции по контрагенту: денежные документы; с ?include_debts=1 или ?include_documents=1 —
+    ещё и складские продажи/покупки/возвраты (наличные и в долг, в т.ч. ожидающие кассу).
     """
 
     serializer_class = serializers_money.MoneyDocumentSerializer
@@ -298,10 +299,13 @@ class CounterpartyMoneyOperationsView(CompanyBranchRestrictedMixin, generics.Lis
         """
         Backward compatible:
         - default: returns the same list of MoneyDocument as before.
-        - if ?include_debts=1: returns an object with merged operations (money + кредитные складские документы).
+        - if ?include_debts=1 or ?include_documents=1: money + складские товарные документы
+          (POSTED и CASH_PENDING: продажа/покупка/возвраты, оплата сразу и в долг) + объединённая лента.
         """
-        include_debts = self._truthy(request.query_params.get("include_debts"))
-        if not include_debts:
+        include_docs = self._truthy(request.query_params.get("include_debts")) or self._truthy(
+            request.query_params.get("include_documents")
+        )
+        if not include_docs:
             return super().list(request, *args, **kwargs)
 
         # 1) money operations (respect existing filters/pagination/search)
@@ -314,21 +318,26 @@ class CounterpartyMoneyOperationsView(CompanyBranchRestrictedMixin, generics.Lis
         else:
             money_items = list(money_payload or [])
 
-        # 2) debt operations from warehouse documents (credit only)
+        # 2) Складские товарные документы по контрагенту (как в акте сверки: все проведённые
+        #    продажи/покупки/возвраты независимо от способа оплаты + ожидающие кассу).
         counterparty_id = self.kwargs.get("counterparty_id")
+        trade_doc_types = (
+            models.Document.DocType.SALE,
+            models.Document.DocType.PURCHASE,
+            models.Document.DocType.SALE_RETURN,
+            models.Document.DocType.PURCHASE_RETURN,
+        )
         doc_qs = (
-            models.Document.objects
-            .select_related("warehouse_from", "counterparty")
+            models.Document.objects.select_related(
+                "warehouse_from", "counterparty", "payment_category", "cash_register"
+            )
             .filter(
                 counterparty_id=counterparty_id,
-                status=models.Document.Status.POSTED,
-                payment_kind=models.Document.PaymentKind.CREDIT,
-                doc_type__in=(
-                    models.Document.DocType.SALE,
-                    models.Document.DocType.PURCHASE,
-                    models.Document.DocType.SALE_RETURN,
-                    models.Document.DocType.PURCHASE_RETURN,
+                status__in=(
+                    models.Document.Status.POSTED,
+                    models.Document.Status.CASH_PENDING,
                 ),
+                doc_type__in=trade_doc_types,
             )
             .order_by("-date")
         )
@@ -348,6 +357,8 @@ class CounterpartyMoneyOperationsView(CompanyBranchRestrictedMixin, generics.Lis
         debt_ops = []
         for d in doc_qs:
             amt = Decimal(getattr(d, "total", None) or 0).quantize(Decimal("0.01"))
+            pc = getattr(d, "payment_category", None)
+            cr = getattr(d, "cash_register", None)
             debt_ops.append(
                 {
                     "source": "document",
@@ -356,12 +367,18 @@ class CounterpartyMoneyOperationsView(CompanyBranchRestrictedMixin, generics.Lis
                     "number": d.number,
                     "status": d.status,
                     "doc_type": d.doc_type,
+                    "doc_type_display": d.get_doc_type_display(),
                     "payment_kind": d.payment_kind,
+                    "payment_kind_display": d.get_payment_kind_display()
+                    if getattr(d, "payment_kind", None)
+                    else None,
                     "amount": str(amt),
                     "debt_delta": str(_doc_debt_delta(d)),
                     "comment": (d.comment or ""),
-                    "cash_register": None,
-                    "payment_category": None,
+                    "cash_register": str(cr.id) if cr else None,
+                    "cash_register_name": cr.name if cr else None,
+                    "payment_category": str(pc.id) if pc else None,
+                    "payment_category_title": pc.title if pc else None,
                 }
             )
 
@@ -371,8 +388,10 @@ class CounterpartyMoneyOperationsView(CompanyBranchRestrictedMixin, generics.Lis
                 return amt
             return -amt
 
+        money_type_labels = dict(models.MoneyDocument.DocType.choices)
         merged = []
         for it in money_items:
+            md_t = it.get("doc_type")
             merged.append(
                 {
                     "source": "money",
@@ -380,13 +399,18 @@ class CounterpartyMoneyOperationsView(CompanyBranchRestrictedMixin, generics.Lis
                     "date": it.get("date"),
                     "number": it.get("number"),
                     "status": it.get("status"),
-                    "doc_type": it.get("doc_type"),
+                    "doc_type": md_t,
+                    "doc_type_display": money_type_labels.get(md_t, md_t),
                     "payment_kind": None,
+                    "payment_kind_display": None,
                     "amount": str(it.get("amount")),
                     "debt_delta": str(_money_debt_delta(it)),
                     "comment": it.get("comment") or "",
                     "cash_register": it.get("cash_register"),
+                    "cash_register_name": it.get("cash_register_name"),
                     "payment_category": it.get("payment_category"),
+                    "payment_category_title": it.get("payment_category_title"),
+                    "source_document": it.get("source_document"),
                 }
             )
         merged.extend(debt_ops)
