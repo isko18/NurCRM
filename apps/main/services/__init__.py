@@ -40,8 +40,6 @@ def checkout_cart(cart: Cart, department=None) -> Sale:
         p = products.get(it.product_id)
         if not p:
             raise ValueError("Товар позиции не найден.")
-        if Decimal(str(p.quantity or 0)) < qty_need:
-            raise NotEnoughStock(f"Недостаточно на складе: «{p.name}». Нужно {qty_need}, доступно {p.quantity}.")
 
     sale = Sale.objects.create(
         company=cart.company,
@@ -86,8 +84,6 @@ def checkout_cart(cart: Cart, department=None) -> Sale:
         qty_need = Decimal(str(it.quantity or 0))
         p = products[it.product_id]
         p.quantity = Decimal(str(p.quantity or 0)) - qty_need
-        if p.quantity < 0:
-            raise NotEnoughStock(f"Недостаточно на складе при списании: «{p.name}».")
         changed.append(p)
     if changed:
         Product.objects.bulk_update(changed, ["quantity"])
