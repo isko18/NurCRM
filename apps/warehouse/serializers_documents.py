@@ -4,6 +4,7 @@ from django.core.exceptions import ValidationError as DjangoValidationError
 from django.core.exceptions import ObjectDoesNotExist
 from django.contrib.auth import get_user_model
 from . import models
+from . import services as warehouse_services
 
 User = get_user_model()
 
@@ -77,6 +78,7 @@ class DocumentItemSerializer(serializers.ModelSerializer):
     discount_amount = serializers.DecimalField(
         max_digits=18, decimal_places=2, required=False, allow_null=True
     )
+    effective_discount_percent = serializers.SerializerMethodField()
 
     class Meta:
         model = models.DocumentItem
@@ -91,8 +93,15 @@ class DocumentItemSerializer(serializers.ModelSerializer):
             "price",
             "discount_percent",
             "discount_amount",
+            "effective_discount_percent",
             "line_total",
         )
+
+    def get_effective_discount_percent(self, obj):
+        doc = getattr(obj, "document", None)
+        doc_dp = Decimal(getattr(doc, "discount_percent", None) or 0) if doc else Decimal("0")
+        eff = warehouse_services.effective_document_line_discount_percent(obj.discount_percent, doc_dp)
+        return eff.quantize(Decimal("0.01"))
 
     def get_product_discount_amount(self, obj):
         """Сумма скидки по проценту с карточки товара для текущих цены и количества в строке."""
@@ -261,7 +270,9 @@ class DocumentSerializer(serializers.ModelSerializer):
             except DjangoValidationError as e:
                 raise serializers.ValidationError(getattr(e, "message_dict", {"detail": str(e)}))
             item.save()
-        
+
+        warehouse_services.recalc_document_totals(doc)
+        doc.refresh_from_db()
         return doc
 
     def update(self, instance, validated_data):
@@ -298,7 +309,9 @@ class DocumentSerializer(serializers.ModelSerializer):
                 except DjangoValidationError as e:
                     raise serializers.ValidationError(getattr(e, "message_dict", {"detail": str(e)}))
                 item.save()
-        
+
+        warehouse_services.recalc_document_totals(instance)
+        instance.refresh_from_db()
         return instance
 
 

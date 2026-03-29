@@ -750,15 +750,59 @@ class WarehouseComprehensiveTests(TestCase):
         )
         
         services.recalc_document_totals(doc)
-        
+
         doc.refresh_from_db()
-        expected_total = (
-            Decimal("150.00") * Decimal("10.000") +
-            Decimal("150.00") * Decimal("5.000") * Decimal("0.90")
-        ).quantize(Decimal("0.01"))
-        
+        item1.refresh_from_db()
+        item2.refresh_from_db()
+        self.assertEqual(item1.line_total, (Decimal("150.00") * Decimal("10.000")).quantize(Decimal("0.01")))
+        self.assertEqual(item2.line_total, (Decimal("150.00") * Decimal("5.000") * Decimal("0.90")).quantize(Decimal("0.01")))
+        expected_total = item1.line_total + item2.line_total
         self.assertEqual(doc.total, expected_total)
-    
+
+    def test_recalc_document_totals_document_discount_as_line_fallback(self):
+        """Общая скидка документа подставляется в строку, если у позиции discount_percent = 0."""
+        doc = models.Document.objects.create(
+            doc_type=models.Document.DocType.SALE,
+            warehouse_from=self.wh1,
+            counterparty=self.client,
+            discount_percent=Decimal("10.00"),
+        )
+        item = models.DocumentItem.objects.create(
+            document=doc,
+            product=self.prod1,
+            qty=Decimal("3.000"),
+            price=Decimal("1450.02"),
+            discount_percent=Decimal("0.00"),
+        )
+        services.recalc_document_totals(doc)
+        item.refresh_from_db()
+        doc.refresh_from_db()
+        expected_line = (Decimal("3.000") * Decimal("1450.02") * Decimal("0.90")).quantize(Decimal("0.01"))
+        self.assertEqual(item.line_total, expected_line)
+        self.assertEqual(doc.total, expected_line)
+
+    def test_recalc_document_totals_line_discount_overrides_document(self):
+        """Индивидуальная скидка строки имеет приоритет над общей скидкой документа."""
+        doc = models.Document.objects.create(
+            doc_type=models.Document.DocType.SALE,
+            warehouse_from=self.wh1,
+            counterparty=self.client,
+            discount_percent=Decimal("10.00"),
+        )
+        item = models.DocumentItem.objects.create(
+            document=doc,
+            product=self.prod1,
+            qty=Decimal("3.000"),
+            price=Decimal("1450.02"),
+            discount_percent=Decimal("5.00"),
+        )
+        services.recalc_document_totals(doc)
+        item.refresh_from_db()
+        doc.refresh_from_db()
+        expected_line = (Decimal("3.000") * Decimal("1450.02") * Decimal("0.95")).quantize(Decimal("0.01"))
+        self.assertEqual(item.line_total, expected_line)
+        self.assertEqual(doc.total, expected_line)
+
     # ==================== ТЕСТЫ НОМЕРАЦИИ ДОКУМЕНТОВ ====================
     
     def test_document_number_generation(self):
