@@ -22,6 +22,20 @@ def agent_has_common_access_to_warehouse(*, user, warehouse, company=None) -> bo
     return qs.exists()
 
 
+def effective_document_line_discount_percent(
+    line_discount_percent,
+    document_discount_percent,
+) -> Decimal:
+    """
+    Скидка по строке: если задан процент на товар — он главный; иначе подставляется общая скидка документа.
+    Не суммирует и не перемножает обе скидки.
+    """
+    ld = Decimal(line_discount_percent or 0)
+    if ld > 0:
+        return ld
+    return Decimal(document_discount_percent or 0)
+
+
 def _ensure_number(document: models.Document):
     # generate number like TYPE-YYYYMMDD-0001 per day+type
     today = timezone.now().date()
@@ -36,11 +50,13 @@ def _ensure_number(document: models.Document):
 
 
 def recalc_document_totals(document: models.Document) -> models.Document:
-    # Пересчитываем line_total для каждого item (скидка на товар: percent + amount)
+    # line_total: один процент скидки — строковый или (если 0) общий по документу; затем минус discount_amount строки
+    doc_dp = Decimal(document.discount_percent or 0)
     for item in document.items.select_related("product").all():
         q = Decimal(item.qty or 0)
         p = Decimal(item.price or 0)
-        dp = Decimal(item.discount_percent or 0) / Decimal("100")
+        eff_pct = effective_document_line_discount_percent(item.discount_percent, doc_dp)
+        dp = eff_pct / Decimal("100")
         da = Decimal(item.discount_amount or 0)
         subtotal = (p * q * (Decimal("1") - dp)).quantize(Decimal("0.01"))
         new_line_total = max(Decimal("0.00"), (subtotal - da).quantize(Decimal("0.01")))
@@ -48,17 +64,15 @@ def recalc_document_totals(document: models.Document) -> models.Document:
             item.line_total = new_line_total
             item.save(update_fields=["line_total"])
 
-    # Сумма по строкам (суммарная стоимость товаров до общей скидки)
+    # Процент общей скидки уже учтён в строках (fallback для позиций без своего %); итог = сумма строк минус сумма документа
     subtotal = sum(
         (item.line_total or Decimal("0.00"))
         for item in document.items.all()
     )
     subtotal = subtotal.quantize(Decimal("0.01"))
 
-    # Общая скидка на документ: percent + amount
-    doc_dp = Decimal(document.discount_percent or 0) / Decimal("100")
     doc_da = Decimal(document.discount_amount or 0)
-    total = max(Decimal("0.00"), (subtotal * (Decimal("1") - doc_dp) - doc_da).quantize(Decimal("0.01")))
+    total = max(Decimal("0.00"), (subtotal - doc_da).quantize(Decimal("0.01")))
     document.total = total
     document.save(update_fields=["total"])
     return document

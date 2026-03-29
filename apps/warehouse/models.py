@@ -1222,10 +1222,14 @@ class DocumentItem(models.Model):
                 raise ValidationError({"qty": "Quantity must be integer for piece items"})
 
     def save(self, *args, **kwargs):
-        # compute line total: price * qty * (1 - discount_percent) - discount_amount
+        from apps.warehouse.services import effective_document_line_discount_percent
+
         q = Decimal(self.qty or 0)
         p = Decimal(self.price or 0)
-        dp = Decimal(self.discount_percent or 0) / Decimal("100")
+        doc = getattr(self, "document", None)
+        doc_dp = Decimal(getattr(doc, "discount_percent", None) or 0) if doc is not None else Decimal("0")
+        eff_pct = effective_document_line_discount_percent(self.discount_percent, doc_dp)
+        dp = eff_pct / Decimal("100")
         da = Decimal(self.discount_amount or 0)
         subtotal = (p * q * (Decimal("1") - dp)).quantize(Decimal("0.01"))
         self.line_total = max(Decimal("0.00"), (subtotal - da).quantize(Decimal("0.01")))
