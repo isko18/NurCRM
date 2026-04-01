@@ -295,8 +295,9 @@ class MoneyDocumentUnpostView(CompanyBranchRestrictedMixin, generics.GenericAPIV
 
 class CounterpartyMoneyOperationsView(CompanyBranchRestrictedMixin, generics.ListAPIView):
     """
-    Операции по контрагенту: денежные документы; с ?include_debts=1 или ?include_documents=1 —
-    ещё и складские продажи/покупки/возвраты (наличные и в долг, в т.ч. ожидающие кассу).
+    Операции по контрагенту: только проведённые денежные документы (без черновиков);
+    с ?include_debts=1 или ?include_documents=1 — ещё и складские продажи/покупки/возвраты
+    (POSTED и CASH_PENDING: наличные и в долг).
     """
 
     serializer_class = serializers_money.MoneyDocumentSerializer
@@ -308,7 +309,10 @@ class CounterpartyMoneyOperationsView(CompanyBranchRestrictedMixin, generics.Lis
         counterparty_id = self.kwargs.get("counterparty_id")
         qs = models.MoneyDocument.objects.select_related(
             "cash_register", "warehouse", "counterparty", "payment_category", "company", "branch"
-        ).filter(counterparty_id=counterparty_id).order_by("-date")
+        ).filter(
+            counterparty_id=counterparty_id,
+            status=models.MoneyDocument.Status.POSTED,
+        ).order_by("-date")
         return filter_qs_company_branch_or_global(self, qs)
 
     @staticmethod
@@ -335,10 +339,9 @@ class CounterpartyMoneyOperationsView(CompanyBranchRestrictedMixin, generics.Lis
 
     def list(self, request, *args, **kwargs):
         """
-        Backward compatible:
-        - default: returns the same list of MoneyDocument as before.
-        - if ?include_debts=1 or ?include_documents=1: money + складские товарные документы
-          (POSTED и CASH_PENDING: продажа/покупка/возвраты, оплата сразу и в долг) + объединённая лента.
+        - default: список проведённых MoneyDocument по контрагенту (черновики не включаются).
+        - if ?include_debts=1 or ?include_documents=1: те же деньги + складские товарные документы
+          (POSTED и CASH_PENDING) + объединённая лента и analytics.
         """
         include_docs = self._truthy(request.query_params.get("include_debts")) or self._truthy(
             request.query_params.get("include_documents")
