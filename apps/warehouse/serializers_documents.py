@@ -406,6 +406,7 @@ class CounterpartySerializer(serializers.ModelSerializer):
     company = serializers.ReadOnlyField(source="company.id")
     branch = serializers.ReadOnlyField(source="branch.id")
     agent_display = serializers.SerializerMethodField()
+    analytics = serializers.SerializerMethodField()
     agent = serializers.PrimaryKeyRelatedField(
         queryset=User.objects.all(),
         allow_null=True,
@@ -415,8 +416,8 @@ class CounterpartySerializer(serializers.ModelSerializer):
 
     class Meta:
         model = models.Counterparty
-        fields = ("id", "name", "phone", "type", "company", "branch", "agent", "agent_display")
-        read_only_fields = ("id", "company", "branch")
+        fields = ("id", "name", "phone", "type", "company", "branch", "agent", "agent_display", "analytics")
+        read_only_fields = ("id", "company", "branch", "analytics")
         extra_kwargs = {
             "phone": {"required": True},
         }
@@ -428,3 +429,9 @@ class CounterpartySerializer(serializers.ModelSerializer):
         if hasattr(u, "get_full_name") and u.get_full_name():
             return u.get_full_name()
         return f"{getattr(u, 'first_name', '')} {getattr(u, 'last_name', '')}".strip() or getattr(u, "email", "") or str(u.id)
+
+    def get_analytics(self, obj):
+        m = self.context.get("counterparty_analytics_map")
+        if not m:
+            return None
+        return m.get(obj.pk) or m.get(str(obj.pk))

@@ -257,7 +257,14 @@ GET /api/v1/main/analytics/market/?tab=users&limit=20
       "phone": "+7 700 123 4567",
       "revenue": "450000.00",
       "transactions": 320,
-      "avg_check": "1406.25"
+      "avg_check": "1406.25",
+      "units_sold": "1840.000",
+      "products_sold_count": 42,
+      "product_names": ["Вода 1.5л", "Сигареты X", "..."],
+      "sold_products": [
+        {"name": "Вода 1.5л", "quantity": "520.000"},
+        {"name": "Сигареты X", "quantity": "180.000"}
+      ]
     }],
     "shift_discrepancies": [{
       "shift_id": "uuid-shift-1",
@@ -276,6 +283,10 @@ GET /api/v1/main/analytics/market/?tab=users&limit=20
 
 ### Особенности
 - `users_performance` - **ВСЕ** сотрудники с продажами
+- `units_sold` — сумма `quantity` по всем позициям оплаченных чеков сотрудника за период
+- `products_sold_count` — число разных товаров (по `product_id` и отдельно кастомные позиции по `name_snapshot`)
+- `product_names` — названия в порядке убывания проданного количества (то же упорядочивание, что у `sold_products`)
+- `sold_products` — список `{ "name", "quantity" }` по каждому товару/позиции
 - `shift_discrepancies` - **ВСЕ** расхождения в кассах
 - Полная детализация по каждой смене
 

@@ -35,7 +35,7 @@ import requests
 import qrcode
 
 from apps.users.models import Roles, User, Company
-from apps.main.models import Cart, CartItem, Sale, Product, MobileScannerToken, Client
+from apps.main.models import Cart, CartItem, Sale, Product, ProductPackage, MobileScannerToken, Client
 from apps.main.models import ManufactureSubreal, AgentSaleAllocation
 from apps.main.cache_utils import invalidate_cache_pattern
 from apps.main.services import checkout_cart, NotEnoughStock
@@ -44,7 +44,20 @@ from apps.main.utils_numbers import ensure_sale_doc_number
 from apps.main.views import CompanyBranchRestrictedMixin
 from apps.construction.models import Cashbox, CashShift
 from .pos_utils import (
-    money, qty3, q2, fmt_money, fmt, to_decimal, as_decimal, _q2, Q2, Q3
+    money,
+    qty3,
+    q2,
+    fmt_money,
+    fmt,
+    to_decimal,
+    as_decimal,
+    _q2,
+    Q2,
+    Q3,
+    line_qty_consume_units,
+    default_unit_price_for_package,
+    total_cart_consume_packs_for_product,
+    cart_item_stock_consume_units,
 )
 
 from .pos_serializers import (
@@ -1308,14 +1321,31 @@ class SaleAddItemAPIView(MarketCashierOnlyMixin, APIView):
 
         unit_price = ser.validated_data.get("unit_price")
         line_discount = ser.validated_data.get("discount_total")
+        sale_package_id = ser.validated_data.get("sale_package_id")
+        pkg = None
+        if sale_package_id:
+            pkg = get_object_or_404(
+                ProductPackage.objects.filter(
+                    id=sale_package_id,
+                    product_id=product.id,
+                    company=cart.company,
+                )
+            )
 
         # unit_price — база, line_discount — скидка на строку (хранятся отдельно)
-        base_price = _q2(unit_price) if unit_price is not None else _q2(Decimal(str(product.price or 0)))
+        base_price = (
+            _q2(unit_price)
+            if unit_price is not None
+            else _q2(default_unit_price_for_package(product, pkg))
+        )
         disc_total = _q2(Decimal(str(line_discount))) if line_discount is not None else Decimal("0.00")
 
         # Цена продажи не ниже закупочной, кроме случая со скидкой (со скидкой можно ниже)
         if disc_total <= 0:
             min_price = _q2(Decimal(str(getattr(product, "purchase_price", None) or 0)))
+            if pkg:
+                ipp = Decimal(str(pkg.quantity_in_package or 0))
+                min_price = _q2(min_price / ipp) if ipp > 0 else min_price
             qty_dec = Decimal(str(qty))
             effective_unit = base_price - (disc_total / qty_dec) if qty_dec else base_price
             if effective_unit < min_price:
@@ -1326,10 +1356,34 @@ class SaleAddItemAPIView(MarketCashierOnlyMixin, APIView):
 
         # Блокируем корзину для предотвращения race conditions
         cart = Cart.objects.select_for_update().get(id=cart.id)
-        
+
+        other = total_cart_consume_packs_for_product(cart.id, product.id)
+        target = (
+            CartItem.objects.filter(cart=cart, product=product, sale_package=pkg)
+            .select_related("sale_package")
+            .first()
+        )
+        if target:
+            other = qty3(other - cart_item_stock_consume_units(target))
+            combined_consume = line_qty_consume_units(target.quantity + qty, pkg)
+        else:
+            combined_consume = line_qty_consume_units(qty, pkg)
+        have = Decimal(str(product.quantity or 0))
+        if qty3(other + combined_consume) > have:
+            return Response(
+                {
+                    "detail": (
+                        "Недостаточно остатка (учёт в пачках). "
+                        f"Доступно не более {qty3(max(Decimal('0'), have - other))} условных пачек с учётом корзины."
+                    )
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
         item, created = CartItem.objects.select_for_update().get_or_create(
             cart=cart,
             product=product,
+            sale_package=pkg,
             defaults={
                 "company": cart.company,
                 "branch": getattr(cart, "branch", None),
@@ -2333,44 +2387,80 @@ class AgentSaleAddItemAPIView(MarketCashierOnlyMixin, CompanyBranchRestrictedMix
         acting_agent = _resolve_acting_agent(request, cart, allow_owner_override=True)
         use_main_stock = _should_use_main_stock_in_agent_sale(user=request.user, acting_agent=acting_agent)
 
-        # ✅ типобезопасно: int/Decimal не смешиваем
-        available = (
-            Decimal(str(getattr(product, "quantity", 0) or 0))
-            if use_main_stock
-            else Decimal(_agent_available_qty(acting_agent, cart.company, product.id))
-        )
-        in_cart = _as_decimal(
-            CartItem.objects.filter(cart=cart, product=product).aggregate(s=Sum("quantity"))["s"] or 0,
-            default=Decimal("0"),
-        )
-        req = _as_decimal(qty, default=Decimal("0"))
-
-        if req + in_cart > available:
-            remaining = max(Decimal("0"), available - in_cart)
+        # Поштучная продажа из пачки — только обычная касса / checkout_cart.
+        if ser.validated_data.get("sale_package_id"):
             return Response(
                 {
-                    "detail": (
-                        f"Недостаточно на основном складе. Доступно: {qty3(remaining)}."
-                        if use_main_stock
-                        else f"Недостаточно у агента. Доступно: {qty3(remaining)}."
-                    )
+                    "sale_package_id": (
+                        "Поштучная продажа из упаковки оформляется только через обычную кассу со сменой, "
+                        "не через агентскую корзину."
+                    ),
                 },
-                status=400,
+                status=status.HTTP_400_BAD_REQUEST,
             )
 
         unit_price = ser.validated_data.get("unit_price")
         line_discount = ser.validated_data.get("discount_total")
 
-        # unit_price — база, line_discount — скидка на строку (хранятся отдельно)
-        base_price = money(unit_price) if unit_price is not None else money(Decimal(str(product.price or 0)))
+        base_price = (
+            money(unit_price)
+            if unit_price is not None
+            else money(getattr(product, "price", None) or Decimal("0"))
+        )
         disc_total = money(Decimal(str(line_discount))) if line_discount is not None else Decimal("0.00")
 
-        # Блокируем корзину для предотвращения race conditions
+        if disc_total <= 0:
+            min_price = money(Decimal(str(getattr(product, "purchase_price", None) or 0)))
+            qty_dec = Decimal(str(qty))
+            effective_unit = base_price - (disc_total / qty_dec) if qty_dec else base_price
+            if effective_unit < min_price:
+                return Response(
+                    {"unit_price": f"Цена продажи не может быть ниже закупочной ({min_price})."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
         cart = Cart.objects.select_for_update().get(id=cart.id)
+
+        if use_main_stock:
+            available = Decimal(str(getattr(product, "quantity", 0) or 0))
+            in_cart = _as_decimal(
+                CartItem.objects.filter(
+                    cart=cart, product=product, sale_package__isnull=True
+                ).aggregate(s=Sum("quantity"))["s"]
+                or 0,
+                default=Decimal("0"),
+            )
+            req = _as_decimal(qty, default=Decimal("0"))
+            if req + in_cart > available:
+                return Response(
+                    {
+                        "detail": (
+                            f"Недостаточно на основном складе. "
+                            f"Доступно: {qty3(max(Decimal('0'), available - in_cart))}."
+                        ),
+                    },
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+        else:
+            available = Decimal(str(_agent_available_qty(acting_agent, cart.company, product.id)))
+            in_cart = _as_decimal(
+                CartItem.objects.filter(
+                    cart=cart, product=product, sale_package__isnull=True
+                ).aggregate(s=Sum("quantity"))["s"]
+                or 0,
+                default=Decimal("0"),
+            )
+            req = _as_decimal(qty, default=Decimal("0"))
+            if req + in_cart > available:
+                remaining = max(Decimal("0"), available - in_cart)
+                return Response(
+                    {"detail": f"Недостаточно у агента. Доступно: {qty3(remaining)}."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
 
         item = (
             CartItem.objects.select_for_update()
-            .filter(cart=cart, product=product)
+            .filter(cart=cart, product=product, sale_package__isnull=True)
             .first()
         )
         if item:
@@ -2391,6 +2481,7 @@ class AgentSaleAddItemAPIView(MarketCashierOnlyMixin, CompanyBranchRestrictedMix
                 company=cart.company,
                 branch=getattr(cart, "branch", None),
                 product=product,
+                sale_package=None,
                 quantity=qty3(qty),
                 unit_price=base_price,
                 line_discount=disc_total,

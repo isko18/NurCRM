@@ -107,12 +107,15 @@ class SaleItemSerializer(serializers.ModelSerializer):
     # ✅ важно: quantity должен быть Decimal(3), а не int
     quantity = QtyField()
 
+    sale_package = serializers.UUIDField(source="sale_package_id", read_only=True, allow_null=True)
+
     class Meta:
         model = CartItem
         fields = (
             "id", "cart", "product",
             "product_name", "barcode",
             "quantity", "unit_price", "line_discount",
+            "sale_package",
             "display_name",
             "primary_image_url",
             "images",
@@ -120,6 +123,7 @@ class SaleItemSerializer(serializers.ModelSerializer):
         read_only_fields = (
             "id", "product_name", "barcode",
             "display_name", "primary_image_url", "images",
+            "sale_package",
         )
 
     def get_display_name(self, obj):
@@ -219,6 +223,8 @@ class AddItemSerializer(serializers.Serializer):
     quantity = QtyField(required=False, default=Decimal("1.000"))
     unit_price = MoneyField(required=False)
     discount_total = MoneyField(required=False)
+    # Продажа поштучно из пачки: id упаковки ProductPackage (quantity_in_package = шт в пачке)
+    sale_package_id = serializers.UUIDField(required=False, allow_null=True)
 
     def validate(self, attrs):
         up = attrs.get("unit_price")

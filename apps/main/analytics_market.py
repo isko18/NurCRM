@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timedelta, time
 from decimal import Decimal
@@ -53,6 +54,76 @@ def _safe_div(a: Decimal, b: int | Decimal) -> Decimal:
     if not b:
         return Z_MONEY
     return _money(Decimal(a) / Decimal(b))
+
+
+def _qty_str(x) -> str:
+    try:
+        return str(Decimal(str(x or 0)).quantize(Decimal("0.001")))
+    except Exception:
+        return "0.000"
+
+
+def _users_sold_products_by_user(si_qs, SaleItem):
+    """
+    По queryset строк чеков (SaleItem с отфильтрованными sale) строит:
+    - units_by_user: user_id -> сумма quantity по всем строкам
+    - products_by_user: user_id -> список {"name", "quantity"} по убыванию quantity
+    - names_by_user: user_id -> список имён в том же порядке
+    """
+    units_by_user: dict = {}
+    for row in si_qs.values("sale__user_id").annotate(
+        tq=Coalesce(Sum("quantity"), Value(Z_QTY, output_field=QTY_FIELD), output_field=QTY_FIELD),
+    ):
+        uid = row["sale__user_id"]
+        if uid is not None:
+            units_by_user[uid] = Decimal(str(row["tq"] or 0))
+
+    bucket_qty: dict = defaultdict(lambda: defaultdict(lambda: Decimal("0")))
+    bucket_name: dict = {}
+
+    if _model_has_field(SaleItem, "product"):
+        for row in (
+            si_qs.filter(product__isnull=False)
+            .values("sale__user_id", "product_id", "product__name")
+            .annotate(
+                sq=Coalesce(Sum("quantity"), Value(Z_QTY, output_field=QTY_FIELD), output_field=QTY_FIELD),
+            )
+        ):
+            uid = row["sale__user_id"]
+            if uid is None or not row.get("product_id"):
+                continue
+            key = ("p", str(row["product_id"]))
+            bucket_qty[uid][key] += Decimal(str(row["sq"] or 0))
+            disp = (row.get("product__name") or "").strip()
+            bucket_name[(uid, key)] = disp or "—"
+
+    if _model_has_field(SaleItem, "name_snapshot"):
+        for row in (
+            si_qs.filter(product__isnull=True)
+            .values("sale__user_id", "name_snapshot")
+            .annotate(
+                sq=Coalesce(Sum("quantity"), Value(Z_QTY, output_field=QTY_FIELD), output_field=QTY_FIELD),
+            )
+        ):
+            uid = row["sale__user_id"]
+            if uid is None:
+                continue
+            snap = (row.get("name_snapshot") or "").strip() or "Позиция"
+            key = ("c", snap)
+            bucket_qty[uid][key] += Decimal(str(row["sq"] or 0))
+            bucket_name[(uid, key)] = snap
+
+    products_by_user: dict = {}
+    names_by_user: dict = {}
+    for uid, keys in bucket_qty.items():
+        rows = []
+        for key, q in keys.items():
+            rows.append({"name": bucket_name.get((uid, key), "—"), "quantity": _qty_str(q)})
+        rows.sort(key=lambda x: Decimal(x["quantity"]), reverse=True)
+        products_by_user[uid] = rows
+        names_by_user[uid] = [r["name"] for r in rows]
+
+    return units_by_user, products_by_user, names_by_user
 
 
 def _pct(a: Decimal, b: Decimal) -> float | None:
@@ -420,6 +491,20 @@ class AnalyticsView(APIView):
 
         return qs
 
+    def _market_products_queryset(self, request, company, branch):
+        """Товары маркета в области компании/филиала (как на вкладке stock)."""
+        try:
+            Product = apps.get_model("main.Product")
+        except Exception:
+            return None
+        pqs = Product.objects.filter(company=company)
+        if branch is not None and _model_has_field(Product, "branch"):
+            if self._include_global(request):
+                pqs = pqs.filter(Q(branch=branch) | Q(branch__isnull=True))
+            else:
+                pqs = pqs.filter(branch=branch)
+        return pqs
+
     def _cache_hash_from_query(self, request) -> str:
         qp = {k: request.query_params.getlist(k) for k in request.query_params.keys()}
         raw = json.dumps(qp, ensure_ascii=False, sort_keys=True)
@@ -479,6 +564,56 @@ class AnalyticsView(APIView):
         gross_profit = None
         margin_percent = None
         cogs_warning = None
+
+        products_stock = []
+        catalog_products_count = 0
+        total_stock_quantity = None
+
+        pqs_catalog = self._market_products_queryset(request, company, branch)
+        if pqs_catalog is not None:
+            ProductModel = pqs_catalog.model
+            catalog_products_count = pqs_catalog.count()
+            if _model_has_field(ProductModel, "quantity"):
+                sum_row = pqs_catalog.aggregate(
+                    s=Coalesce(
+                        Sum("quantity"),
+                        Value(Z_QTY, output_field=QTY_FIELD),
+                        output_field=QTY_FIELD,
+                    )
+                )
+                sq = sum_row.get("s")
+                total_stock_quantity = str(
+                    (sq if sq is not None else Z_QTY).quantize(Decimal("0.01"))
+                )
+                vf = ["id", "name", "quantity"]
+                if _model_has_field(ProductModel, "code"):
+                    vf.append("code")
+                if _model_has_field(ProductModel, "unit"):
+                    vf.append("unit")
+                if _model_has_field(ProductModel, "kind"):
+                    vf.append("kind")
+                if _model_has_field(ProductModel, "barcode"):
+                    vf.append("barcode")
+                for row in pqs_catalog.order_by("name").values(*vf):
+                    q = row.get("quantity")
+                    try:
+                        qd = Decimal(q) if q is not None else Z_QTY
+                    except Exception:
+                        qd = Z_QTY
+                    item = {
+                        "id": str(row["id"]),
+                        "name": (row.get("name") or "Товар").strip() or "Товар",
+                        "quantity": str(qd.quantize(Decimal("0.01"))),
+                    }
+                    if "code" in vf:
+                        item["code"] = row.get("code") or ""
+                    if "unit" in vf:
+                        item["unit"] = row.get("unit") or ""
+                    if "kind" in vf:
+                        item["kind"] = row.get("kind") or ""
+                    if "barcode" in vf:
+                        item["barcode"] = row.get("barcode") or ""
+                    products_stock.append(item)
 
         Sale, SaleItem = get_sale_models()
         if Sale is not None:
@@ -644,12 +779,18 @@ class AnalyticsView(APIView):
                 "gross_profit": str(_money(gross_profit)) if gross_profit is not None else None,
                 "margin_percent": margin_percent,
                 "cogs_warning": cogs_warning,
+                "catalog_products_count": catalog_products_count,
+                "total_stock_quantity": total_stock_quantity,
             },
             "charts": {
                 "sales_dynamics": daily,
                 "payment_methods": payment_breakdown,
             },
-            "tables": {"top_products": top_products, "documents": documents},
+            "tables": {
+                "top_products": top_products,
+                "documents": documents,
+                "products_stock": products_stock,
+            },
         }
 
     # ─────────────────────────────────────────────────────────
@@ -1570,7 +1711,10 @@ class AnalyticsView(APIView):
         users_performance = []
         shift_stats = {}
 
-        Sale, _ = get_sale_models()
+        Sale, SaleItem = get_sale_models()
+        units_by_user: dict = {}
+        products_by_user: dict = {}
+        names_by_user: dict = {}
         if Sale and _model_has_field(Sale, "user"):
             paid_value = _choice_value(Sale, "Status", "PAID", "paid")
             dt_field = "paid_at" if _model_has_field(Sale, "paid_at") else "created_at"
@@ -1582,6 +1726,14 @@ class AnalyticsView(APIView):
                 else:
                     sqs = sqs.filter(branch=branch)
             sqs = sqs.filter(**{f"{dt_field}__gte": period.start, f"{dt_field}__lt": period.end})
+
+            if (
+                SaleItem is not None
+                and _model_has_field(SaleItem, "sale")
+                and _model_has_field(SaleItem, "quantity")
+            ):
+                si_qs = SaleItem.objects.filter(sale__in=sqs)
+                units_by_user, products_by_user, names_by_user = _users_sold_products_by_user(si_qs, SaleItem)
 
             # User Performance - ДЕТАЛЬНО ВСЕ сотрудники
             user_query = (
@@ -1604,21 +1756,27 @@ class AnalyticsView(APIView):
             for r in user_query:
                 rev = _money(r["revenue"])
                 txc = r["tx_count"] or 0
+                uid = r["user_id"]
+                sold_list = products_by_user.get(uid, []) if uid is not None else []
                 users_performance.append({
-                    "user_id": str(r["user_id"]) if r["user_id"] else None,
+                    "user_id": str(uid) if uid else None,
                     "user": _user_label(
                         None,
                         first_name=r.get("user__first_name"),
                         last_name=r.get("user__last_name"),
                         email=r.get("user__email"),
                         phone=r.get("user__phone_number"),
-                        user_id=r.get("user_id"),
+                        user_id=uid,
                     ),
                     "email": r.get("user__email"),
                     "phone": r.get("user__phone_number"),
                     "revenue": str(rev),
                     "transactions": txc,
                     "avg_check": str(_safe_div(rev, txc)),
+                    "units_sold": _qty_str(units_by_user.get(uid, Z_QTY) if uid is not None else Z_QTY),
+                    "products_sold_count": len(sold_list),
+                    "product_names": names_by_user.get(uid, []) if uid is not None else [],
+                    "sold_products": sold_list,
                 })
 
         # Shift Performance - ПОЛНАЯ информация

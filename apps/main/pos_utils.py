@@ -25,6 +25,45 @@ def money(x: Optional[Decimal]) -> Decimal:
     return (x or Decimal("0")).quantize(Q2, rounding=ROUND_HALF_UP)
 
 
+def cart_item_stock_consume_units(item) -> Decimal:
+    """
+    Сколько единиц остатка Product.quantity списать для строки корзины.
+    Без sale_package: quantity уже в учётных единицах (например пачки).
+    С sale_package: quantity — в штуках внутри упаковки, списание = quantity / quantity_in_package.
+    """
+    q = Decimal(str(getattr(item, "quantity", None) or 0))
+    sp_id = getattr(item, "sale_package_id", None)
+    if not sp_id:
+        return qty3(q)
+    sp = getattr(item, "sale_package", None)
+    ipp = Decimal(str(getattr(sp, "quantity_in_package", None) or 0)) if sp is not None else Decimal("0")
+    if ipp <= 0:
+        raise ValueError("У упаковки должно быть quantity_in_package > 0 для поштучной продажи.")
+    return qty3(q / ipp)
+
+
+def line_qty_consume_units(qty: Decimal, sale_package) -> Decimal:
+    """Списание в пачках для количества qty и опциональной упаковки (как cart_item_stock_consume_units без item)."""
+    q = qty3(Decimal(str(qty or 0)))
+    if sale_package is None:
+        return q
+    ipp = Decimal(str(getattr(sale_package, "quantity_in_package", None) or 0))
+    if ipp <= 0:
+        raise ValueError("У упаковки должно быть quantity_in_package > 0.")
+    return qty3(q / ipp)
+
+
+def default_unit_price_for_package(product, sale_package) -> Decimal:
+    """Цена за штуку при продаже из пачки: цена пачки / штук в пачке."""
+    pack_price = Decimal(str(getattr(product, "price", None) or 0))
+    if sale_package is None:
+        return money(pack_price)
+    ipp = Decimal(str(getattr(sale_package, "quantity_in_package", None) or 0))
+    if ipp <= 0:
+        return money(pack_price)
+    return money(pack_price / ipp)
+
+
 def qty3(x: Optional[Decimal]) -> Decimal:
     """
     Округляет Decimal до 3 знаков после запятой (для количества товаров).
@@ -37,6 +76,16 @@ def qty3(x: Optional[Decimal]) -> Decimal:
         Decimal округленное до 3 знаков
     """
     return (x or Decimal("0")).quantize(Q3, rounding=ROUND_HALF_UP)
+
+
+def total_cart_consume_packs_for_product(cart_id, product_id) -> Decimal:
+    """Суммарное списание в учётных единицах товара (пачках) по всем строкам корзины."""
+    from apps.main.models import CartItem
+
+    total = Decimal("0")
+    for ci in CartItem.objects.filter(cart_id=cart_id, product_id=product_id).select_related("sale_package"):
+        total += cart_item_stock_consume_units(ci)
+    return qty3(total)
 
 
 def q2(x: Optional[Decimal]) -> Decimal:

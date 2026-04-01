@@ -40,7 +40,7 @@ from apps.main.models import (
 from apps.main.serializers import (
     ContactSerializer, PipelineSerializer, DealSerializer, TaskSerializer,
     IntegrationSerializer, AnalyticsSerializer, OrderSerializer, ProductSerializer,
-    ProductListSerializer,
+    ProductListSerializer, sync_product_promotion_tiers,
     ReviewSerializer, NotificationSerializer, EventSerializer,
     WarehouseSerializer, WarehouseEventSerializer,
     ProductCategorySerializer, ProductBrandSerializer,
@@ -767,6 +767,7 @@ class ProductCreateByBarcodeAPIView(CompanyBranchRestrictedMixin, generics.Creat
 
             date=date_value,
             created_by=request.user,
+            stock=_parse_bool_like(data.get("stock", False)),
         )
 
         # characteristics
@@ -812,6 +813,22 @@ class ProductCreateByBarcodeAPIView(CompanyBranchRestrictedMixin, generics.Creat
 
         if packages_to_create:
             ProductPackage.objects.bulk_create(packages_to_create)
+
+        raw_promo = data.get("promotion_rules_input")
+        if raw_promo is None:
+            raw_promo = data.get("promotion_rules")
+        try:
+            sync_product_promotion_tiers(
+                product,
+                raw_promo,
+                stock_enabled=bool(product.stock),
+                partial=False,
+            )
+        except serializers.ValidationError as ve:
+            return Response(
+                ve.detail if isinstance(ve.detail, dict) else {"detail": ve.detail},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
 
         ser = self.get_serializer(product, context=self.get_serializer_context())
         return Response(ser.data, status=status.HTTP_201_CREATED)
@@ -977,6 +994,7 @@ class ProductCreateManualAPIView(CompanyBranchRestrictedMixin, generics.CreateAP
             expiration_date=expiration_date,
 
             created_by=request.user,
+            stock=_parse_bool_like(data.get("stock", False)),
         )
         if price_provided:
             setattr(product, "_manual_price", True)
@@ -1135,6 +1153,22 @@ class ProductCreateManualAPIView(CompanyBranchRestrictedMixin, generics.CreateAP
         if packages_to_create:
             ProductPackage.objects.bulk_create(packages_to_create)
 
+        raw_promo = data.get("promotion_rules_input")
+        if raw_promo is None:
+            raw_promo = data.get("promotion_rules")
+        try:
+            sync_product_promotion_tiers(
+                product,
+                raw_promo,
+                stock_enabled=bool(product.stock),
+                partial=False,
+            )
+        except serializers.ValidationError as ve:
+            return Response(
+                ve.detail if isinstance(ve.detail, dict) else {"detail": ve.detail},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
         # add to global product base (optional)
         if barcode:
             GlobalProduct.objects.get_or_create(
@@ -1146,7 +1180,13 @@ class ProductCreateManualAPIView(CompanyBranchRestrictedMixin, generics.CreateAP
         product = (
             Product.objects
             .select_related("company", "branch", "brand", "category", "client", "created_by", "characteristics")
-            .prefetch_related("item_make", "packages", "recipe_items__item_make", product_images_prefetch)
+            .prefetch_related(
+                "item_make",
+                "packages",
+                "recipe_items__item_make",
+                "promotion_tiers",
+                product_images_prefetch,
+            )
             .get(pk=product.pk)
         )
         ser = self.get_serializer(product, context=self.get_serializer_context())
@@ -1171,6 +1211,7 @@ class ProductRetrieveUpdateDestroyAPIView(CompanyBranchRestrictedMixin, generics
             "item_make",
             "packages",
             "recipe_items__item_make",
+            "promotion_tiers",
             product_images_prefetch,
         )
         .all()
@@ -1329,7 +1370,13 @@ class ProductRetrieveUpdateDestroyAPIView(CompanyBranchRestrictedMixin, generics
         instance = (
             Product.objects
             .select_related("company", "branch", "brand", "category", "client", "created_by", "characteristics")
-            .prefetch_related("item_make", "packages", "recipe_items__item_make", product_images_prefetch)
+            .prefetch_related(
+                "item_make",
+                "packages",
+                "recipe_items__item_make",
+                "promotion_tiers",
+                product_images_prefetch,
+            )
             .get(pk=instance.pk)
         )
         return Response(

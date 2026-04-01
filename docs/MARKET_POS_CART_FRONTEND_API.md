@@ -2,6 +2,8 @@
 
 Документация API корзины (Cart) и позиций (CartItem) для кассовых продаж. Цена и скидка хранятся **отдельно** — можно менять их независимо.
 
+**Продажа пачки поштучно** (остаток в пачках, в корзине — штуки): см. [pos_pack_piece_sale.md](./pos_pack_piece_sale.md).
+
 ---
 
 ## Базовый URL
@@ -39,6 +41,7 @@
       "quantity": "1.000",
       "unit_price": "100.00",
       "line_discount": "10.00",
+      "sale_package": null,
       "display_name": "помидор",
       "primary_image_url": null,
       "images": []
@@ -59,6 +62,7 @@
 | `quantity` | string | Количество (Decimal, 3 знака) |
 | `unit_price` | string | **Базовая цена** за единицу (до скидки) |
 | `line_discount` | string | **Скидка на строку** (сумма, не процент) |
+| `sale_package` | uuid \| null | Упаковка для поштучной продажи из пачки; `null` — quantity в единицах склада (см. [pos_pack_piece_sale.md](./pos_pack_piece_sale.md)) |
 | `display_name` | string | Отображаемое название |
 
 ### Расчёт суммы по позиции
@@ -92,6 +96,7 @@ line_total = (unit_price × quantity) - line_discount
 | `quantity` | нет | По умолчанию `1.000` |
 | `unit_price` | нет | Базовая цена. Если не передано — берётся `product.price` |
 | `discount_total` | нет | Скидка на строку (сумма) |
+| `sale_package_id` | нет | UUID `ProductPackage` — поштучная продажа из пачки; подробно в [pos_pack_piece_sale.md](./pos_pack_piece_sale.md) |
 
 **Логика:**
 - `unit_price` — базовая цена позиции

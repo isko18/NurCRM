@@ -743,8 +743,12 @@ class Product(models.Model):
         null=True,
     )
 
-    # ✅ фикс: без null=True
-    stock = models.BooleanField("Акционный товар", default=False)
+    # ✅ фикс: без null=True — «акция»: см. также ProductPromotionTier (ступени сумма → скидка %)
+    stock = models.BooleanField(
+        "Акционный товар",
+        default=False,
+        help_text="Включите и передайте promotion_rules_input: для каждой ступени — min_amount, discount_percent, при необходимости promo_quantity.",
+    )
 
     item_make = models.ManyToManyField(
         "ItemMake",
@@ -903,7 +907,57 @@ class Product(models.Model):
                 cache.delete(f"product_plu:{self.company_id}:{old_plu}")
             if self.plu:
                 cache.delete(f"product_plu:{self.company_id}:{self.plu}")
-            
+
+
+class ProductPromotionTier(models.Model):
+    """
+    Ступени акции для товара (галочка «Акционный товар» на Product.stock):
+    от какой суммы строки в чеке — какая скидка в %, опционально лимит количества единиц по этой ступени.
+    """
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    product = models.ForeignKey(
+        "Product",
+        on_delete=models.CASCADE,
+        related_name="promotion_tiers",
+        verbose_name="Товар",
+    )
+    position = models.PositiveSmallIntegerField("Порядок", default=0)
+    min_amount = models.DecimalField(
+        "Сумма позиции от",
+        max_digits=14,
+        decimal_places=2,
+        help_text="Минимальная сумма строки (цена × количество), с которой действует скидка.",
+    )
+    discount_percent = models.DecimalField("Скидка, %", max_digits=5, decimal_places=2)
+    promo_quantity = models.PositiveIntegerField(
+        "Лимит по акции, шт.",
+        null=True,
+        blank=True,
+        help_text="Сколько единиц товара по этой ступени; пусто — без ограничения.",
+    )
+
+    class Meta:
+        ordering = ["position", "id"]
+        verbose_name = "Ступень акции товара"
+        verbose_name_plural = "Ступени акции товара"
+        indexes = [
+            models.Index(fields=["product", "position"]),
+        ]
+
+    def __str__(self):
+        return f"{self.product_id}: от {self.min_amount} → {self.discount_percent}%"
+
+    def clean(self):
+        if self.min_amount is not None and self.min_amount < 0:
+            raise ValidationError({"min_amount": "Сумма не может быть отрицательной."})
+        dp = self.discount_percent
+        if dp is None or dp <= 0 or dp > 100:
+            raise ValidationError({"discount_percent": "Скидка должна быть от 0.01 до 100%."})
+        if self.promo_quantity is not None and self.promo_quantity < 1:
+            raise ValidationError({"promo_quantity": "Лимит должен быть ≥ 1."})
+
+
 class ProductCharacteristics(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
 
@@ -1451,9 +1505,29 @@ class CartItem(models.Model):
     unit_price = models.DecimalField(max_digits=12, decimal_places=2)
     # Скидка на строку (хранится отдельно от цены — можно менять цену и скидку независимо)
     line_discount = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal("0.00"))
+    # Продажа поштучно из пачки: quantity — в штуках, списание остатка = quantity / quantity_in_package
+    sale_package = models.ForeignKey(
+        "main.ProductPackage",
+        null=True,
+        blank=True,
+        on_delete=models.PROTECT,
+        related_name="cart_items",
+        verbose_name="Упаковка (поштучно)",
+    )
 
     class Meta:
-        unique_together = (("cart", "product"),)
+        constraints = [
+            models.UniqueConstraint(
+                fields=["cart", "product"],
+                condition=models.Q(sale_package__isnull=True, product__isnull=False),
+                name="uniq_cartitem_cart_product_pack_sale",
+            ),
+            models.UniqueConstraint(
+                fields=["cart", "product", "sale_package"],
+                condition=models.Q(sale_package__isnull=False),
+                name="uniq_cartitem_cart_product_piece_pkg",
+            ),
+        ]
 
     def clean(self):
         if self.cart_id and self.company_id and self.cart.company_id != self.company_id:
@@ -1462,6 +1536,13 @@ class CartItem(models.Model):
             raise ValidationError({"branch": "Филиал позиции должен совпадать с филиалом корзины."})
         if self.product_id and self.company_id and self.product.company_id != self.company_id:
             raise ValidationError({"product": "Товар принадлежит другой компании."})
+
+        if self.sale_package_id and not self.product_id:
+            raise ValidationError({"sale_package": "Поштучная продажа возможна только для строки с товаром."})
+        if self.sale_package_id and self.product_id and self.sale_package.product_id != self.product_id:
+            raise ValidationError({"sale_package": "Упаковка не относится к этому товару."})
+        if self.sale_package_id and self.company_id and self.sale_package.company_id != self.company_id:
+            raise ValidationError({"sale_package": "Упаковка другой компании."})
 
         # ✅ запрет 0 и минуса
         if self.quantity is None or Decimal(self.quantity) <= 0:
@@ -1472,11 +1553,16 @@ class CartItem(models.Model):
             line_disc = Decimal(str(getattr(self, "line_discount", None) or 0))
             if line_disc <= 0:
                 purchase_price = getattr(self.product, "purchase_price", None) or Decimal("0")
+                if self.sale_package_id:
+                    ipp = Decimal(str(self.sale_package.quantity_in_package or 0))
+                    min_unit = (purchase_price / ipp) if ipp > 0 else purchase_price
+                else:
+                    min_unit = purchase_price
                 qty = Decimal(str(self.quantity or 1))
                 effective_unit = Decimal(str(self.unit_price)) - (line_disc / qty) if qty else Decimal(str(self.unit_price))
-                if effective_unit < Decimal(str(purchase_price)):
+                if effective_unit < Decimal(str(min_unit)):
                     raise ValidationError({
-                        "unit_price": f"Цена продажи не может быть ниже закупочной ({purchase_price}).",
+                        "unit_price": f"Цена продажи не может быть ниже закупочной ({min_unit}).",
                     })
 
     def save(self, *args, **kwargs):
@@ -1702,6 +1788,15 @@ class SaleItem(models.Model):
     unit_price = models.DecimalField(max_digits=12, decimal_places=2)
     quantity = models.DecimalField(max_digits=12, decimal_places=3, default=Decimal("1.000"))
 
+    sale_package = models.ForeignKey(
+        "main.ProductPackage",
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="sale_items",
+        verbose_name="Упаковка (поштучно)",
+    )
+
     # ✅ себестоимость единицы на момент продажи (для маржи)
     purchase_price_snapshot = models.DecimalField(
         "Себестоимость (снапшот)",
@@ -1759,9 +1854,16 @@ class SaleItem(models.Model):
                 if not (self.barcode_snapshot or "").strip():
                     self.barcode_snapshot = self.product.barcode
 
-                # ✅ ключевое для маржи
+                # ✅ ключевое для маржи (за штуку при поштучной продаже из пачки)
                 if self.purchase_price_snapshot is None:
-                    self.purchase_price_snapshot = self.product.purchase_price or Decimal("0.00")
+                    pp = self.product.purchase_price or Decimal("0.00")
+                    if self.sale_package_id:
+                        ipp = Decimal(str(self.sale_package.quantity_in_package or 0))
+                        self.purchase_price_snapshot = (
+                            _money(pp / ipp) if ipp > 0 else _money(pp)
+                        )
+                    else:
+                        self.purchase_price_snapshot = _money(pp)
             else:
                 # если товар не выбран — себестоимость неизвестна
                 if self.purchase_price_snapshot is None:

@@ -120,6 +120,14 @@ def checkout_agent_cart(
     if model_has_field(Sale, "cashbox"):
         cashbox = _resolve_cashbox(company, branch, cashbox_id=cashbox_id)
 
+    # Поштучная продажа из пачки (sale_package) поддерживается только в checkout_cart (касса со сменой).
+    for it in cart.items.all():
+        if getattr(it, "sale_package_id", None):
+            raise ValidationError(
+                "Поштучная продажа из упаковки (поле sale_package) оформляется только через обычную кассу "
+                "и checkout_cart. Уберите такие позиции из корзины или оформите продажу через смену."
+            )
+
     # --- 1) агрегируем потребности корзины ---
     needs = {}
     for it in cart.items.select_related("product"):
@@ -253,8 +261,6 @@ def checkout_agent_cart(
 
     sale = Sale.objects.create(**create_kwargs)
 
-    subtotal = Decimal("0.00")
-
     # --- 5) переносим позиции и делаем FIFO-аллокации ---
     for k, v in needs.items():
         if k.startswith("custom:"):
@@ -268,7 +274,6 @@ def checkout_agent_cart(
                 unit_price=price,
                 quantity=qty,
             )
-            subtotal += (price or Decimal("0.00")) * qty
             continue
 
         product = v["product"]
@@ -283,7 +288,6 @@ def checkout_agent_cart(
             unit_price=price,
             quantity=qty,
         )
-        subtotal += (price or Decimal("0.00")) * qty
 
         if not use_main_stock:
             left = qty

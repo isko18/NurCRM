@@ -18,7 +18,7 @@ from apps.main.models import (
     ObjectItem, ObjectSale, ObjectSaleItem, ItemMake, ManufactureSubreal, Acceptance,
     ReturnFromAgent, ProductImage, PromoRule, AgentRequestCart, AgentRequestItem,
     ProductPackage, ProductCharacteristics, DealPayment, AgentSaleAllocation,
-    ProductRecipeItem,
+    ProductRecipeItem, ProductPromotionTier,
 )
 
 from apps.consalting.models import ServicesConsalting
@@ -610,6 +610,116 @@ class ProductPackageSerializer(serializers.ModelSerializer):
         read_only_fields = ["id"]
 
 
+MAX_PRODUCT_PROMOTION_TIERS = 30
+
+
+class ProductPromotionTierSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = ProductPromotionTier
+        fields = ["id", "position", "min_amount", "discount_percent", "promo_quantity"]
+        read_only_fields = ["id"]
+
+
+def parse_product_promotion_tiers_payload(raw):
+    """Парсит JSON-массив ступеней акции; пустой список или None → []."""
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        raise serializers.ValidationError({"promotion_rules_input": "Ожидается массив правил акции."})
+    if len(raw) > MAX_PRODUCT_PROMOTION_TIERS:
+        raise serializers.ValidationError({
+            "promotion_rules_input": f"Не более {MAX_PRODUCT_PROMOTION_TIERS} ступеней на один товар.",
+        })
+    out = []
+    for i, row in enumerate(raw):
+        if not isinstance(row, dict):
+            raise serializers.ValidationError(
+                {"promotion_rules_input": f"Элемент #{i + 1}: ожидается объект."}
+            )
+        min_raw = row.get("min_amount")
+        disc_raw = row.get("discount_percent")
+        pq_raw = row.get("promo_quantity")
+        pos = row.get("position", i)
+        try:
+            min_amount = Decimal(str(min_raw)) if min_raw is not None and min_raw != "" else None
+        except Exception:
+            raise serializers.ValidationError(
+                {"promotion_rules_input": f"Элемент #{i + 1}: min_amount — неверное число."}
+            )
+        try:
+            discount_percent = Decimal(str(disc_raw)) if disc_raw is not None and disc_raw != "" else None
+        except Exception:
+            raise serializers.ValidationError(
+                {"promotion_rules_input": f"Элемент #{i + 1}: discount_percent — неверное число."}
+            )
+        pq = None
+        if pq_raw is not None and pq_raw != "":
+            try:
+                pq = int(pq_raw)
+            except (TypeError, ValueError):
+                raise serializers.ValidationError(
+                    {"promotion_rules_input": f"Элемент #{i + 1}: promo_quantity — целое число ≥ 1."}
+                )
+            if pq < 1:
+                raise serializers.ValidationError(
+                    {"promotion_rules_input": f"Элемент #{i + 1}: promo_quantity — целое число ≥ 1."}
+                )
+        if min_amount is None or min_amount < 0:
+            raise serializers.ValidationError(
+                {"promotion_rules_input": f"Элемент #{i + 1}: укажите min_amount ≥ 0."}
+            )
+        if discount_percent is None or discount_percent <= 0 or discount_percent > 100:
+            raise serializers.ValidationError(
+                {"promotion_rules_input": f"Элемент #{i + 1}: discount_percent от 0.01 до 100."}
+            )
+        try:
+            pos_i = int(pos)
+        except Exception:
+            pos_i = i
+        out.append(
+            {
+                "position": max(0, min(pos_i, 32767)),
+                "min_amount": min_amount,
+                "discount_percent": discount_percent,
+                "promo_quantity": pq,
+            }
+        )
+    return out
+
+
+def sync_product_promotion_tiers(product, raw, *, stock_enabled: bool, partial: bool = False):
+    """
+    partial=True и raw is None — не трогаем ступени (PATCH без promotion_rules_input).
+    """
+    if partial and raw is None:
+        if not stock_enabled:
+            ProductPromotionTier.objects.filter(product=product).delete()
+        return
+    ProductPromotionTier.objects.filter(product=product).delete()
+    if not stock_enabled:
+        return
+    rows = parse_product_promotion_tiers_payload(raw if raw is not None else [])
+    if not rows:
+        raise serializers.ValidationError({
+            "promotion_rules_input": (
+                "Для акционного товара укажите хотя бы одну ступень: "
+                "min_amount (сумма строки от), discount_percent (%), при необходимости promo_quantity (лимит шт.)."
+            ),
+        })
+    ProductPromotionTier.objects.bulk_create(
+        [
+            ProductPromotionTier(
+                product=product,
+                position=r["position"],
+                min_amount=r["min_amount"],
+                discount_percent=r["discount_percent"],
+                promo_quantity=r["promo_quantity"],
+            )
+            for r in rows
+        ]
+    )
+
+
 class RecipeItemSerializer(serializers.Serializer):
     """Read/write сериализатор для одной позиции рецепта."""
     id = serializers.CharField(help_text="item_make.id")
@@ -677,6 +787,16 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
 
     stock = serializers.BooleanField(required=False)
 
+    promotion_rules = ProductPromotionTierSerializer(
+        many=True, read_only=True, source="promotion_tiers"
+    )
+    promotion_rules_input = serializers.ListField(
+        child=serializers.DictField(allow_empty=True),
+        write_only=True,
+        required=False,
+        allow_null=True,
+    )
+
     # ====== новые поля модели ======
     code = serializers.CharField(read_only=True)  # генерится в модели
     article = serializers.CharField(required=False, allow_blank=True)
@@ -738,7 +858,7 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
             "expiration_date",
             "status", "status_display",
             "client", "client_name",
-            "stock", "date",
+            "stock", "promotion_rules", "promotion_rules_input", "date",
             "created_by", "created_by_name",
             "created_at", "updated_at",
             "images",
@@ -759,6 +879,7 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
             "code",
             "characteristics",
             "packages",
+            "promotion_rules",
             "plu",
             "weight_kg", "total_price",
         ]
@@ -780,6 +901,44 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
         br = self._auto_branch()
         _restrict_pk_queryset_strict(self.fields.get("item_make_ids"), ItemMake.objects.all(), comp, br)
         _restrict_pk_queryset_strict(self.fields.get("client"), Client.objects.all(), comp, br)
+
+    def validate(self, attrs):
+        data = self.initial_data if isinstance(getattr(self, "initial_data", None), dict) else {}
+        promo_in = "promotion_rules_input" in data or "promotion_rules" in data
+        raw = None
+        if promo_in:
+            raw = data.get("promotion_rules_input", data.get("promotion_rules"))
+
+        stock = attrs.get("stock")
+        if stock is None and self.instance is not None:
+            stock = self.instance.stock
+        if stock is None:
+            stock = False
+
+        if self.instance is None:
+            if stock and (not promo_in or not isinstance(raw, list) or len(raw) == 0):
+                raise serializers.ValidationError({
+                    "promotion_rules_input": (
+                        "Для акционного товара передайте непустой promotion_rules_input "
+                        "(список объектов с min_amount, discount_percent; опционально promo_quantity)."
+                    ),
+                })
+        else:
+            if promo_in and isinstance(raw, list) and len(raw) == 0 and stock:
+                raise serializers.ValidationError({
+                    "promotion_rules_input": "Для акции укажите хотя бы одну ступень или снимите галочку акции.",
+                })
+            if (
+                attrs.get("stock") is True
+                and not promo_in
+                and not self.instance.promotion_tiers.exists()
+            ):
+                raise serializers.ValidationError({
+                    "promotion_rules_input": (
+                        "При включении акции укажите promotion_rules_input или сначала сохраните ступени."
+                    ),
+                })
+        return attrs
 
     # ==== ДАННЫЕ С ВЕСОВ ====
 
@@ -961,6 +1120,8 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
     def create(self, validated_data):
         item_make_data = validated_data.pop("item_make_ids", [])
         packages_data = validated_data.pop("packages_input", [])
+        promotion_in = "promotion_rules_input" in validated_data
+        promotion_raw = validated_data.pop("promotion_rules_input", None) if promotion_in else None
 
         company = self._user_company()
         branch = self._auto_branch()
@@ -1059,6 +1220,13 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
                 unit=(pkg.get("unit") or "").strip(),
             )
 
+        sync_product_promotion_tiers(
+            product,
+            promotion_raw if promotion_in else [],
+            stock_enabled=bool(product.stock),
+            partial=False,
+        )
+
         return product
 
     @transaction.atomic
@@ -1067,6 +1235,19 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
         branch = self._auto_branch()
 
         packages_data = validated_data.pop("packages_input", None)
+        promotion_in = "promotion_rules_input" in validated_data
+        promotion_raw = validated_data.pop("promotion_rules_input", None) if promotion_in else None
+        if promotion_in and promotion_raw:
+            try:
+                pr_rows = parse_product_promotion_tiers_payload(promotion_raw)
+            except serializers.ValidationError:
+                raise
+            if pr_rows:
+                if validated_data.get("stock") is False:
+                    raise serializers.ValidationError({
+                        "stock": "Нельзя передать ступени акции при stock=false.",
+                    })
+                validated_data.setdefault("stock", True)
 
         # бренд/категория через *_name
         brand_name = (validated_data.pop("brand_name", "") or "").strip()
@@ -1175,6 +1356,16 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
                     quantity_in_package=pkg.get("quantity_in_package"),
                     unit=(pkg.get("unit") or "").strip(),
                 )
+
+        if promotion_in:
+            sync_product_promotion_tiers(
+                instance,
+                promotion_raw,
+                stock_enabled=bool(instance.stock),
+                partial=False,
+            )
+        elif "stock" in validated_data and validated_data.get("stock") is False:
+            sync_product_promotion_tiers(instance, None, stock_enabled=False, partial=True)
 
         return instance
 # ===========================

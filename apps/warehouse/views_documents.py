@@ -6,7 +6,7 @@ from django.shortcuts import get_object_or_404
 from django.db.models import Q
 from django_filters.rest_framework import DjangoFilterBackend
 
-from . import models, serializers_documents, services
+from . import models, serializers_documents, services, services_money
 from rest_framework.exceptions import ValidationError as DRFValidationError
 from .views import CompanyBranchRestrictedMixin, filter_qs_company_branch_or_global
 from apps.utils import _is_owner_like
@@ -530,6 +530,31 @@ class CounterpartyListCreateView(CompanyBranchRestrictedMixin, generics.ListCrea
     filterset_fields = ["agent", "type"]
     search_fields = ["name", "phone"]
 
+    def get_serializer_context(self):
+        ctx = super().get_serializer_context()
+        m = getattr(self, "_counterparty_analytics_map", None)
+        if m is not None:
+            ctx["counterparty_analytics_map"] = m
+        return ctx
+
+    def list(self, request, *args, **kwargs):
+        queryset = self.filter_queryset(self.get_queryset())
+        page = self.paginate_queryset(queryset)
+        try:
+            if page is not None:
+                self._counterparty_analytics_map = services_money.bulk_counterparty_mini_analytics(
+                    self, [o.pk for o in page]
+                )
+                serializer = self.get_serializer(page, many=True)
+                return self.get_paginated_response(serializer.data)
+            self._counterparty_analytics_map = services_money.bulk_counterparty_mini_analytics(
+                self, [o.pk for o in queryset]
+            )
+            serializer = self.get_serializer(queryset, many=True)
+            return Response(serializer.data)
+        finally:
+            self._counterparty_analytics_map = None
+
     def get_queryset(self):
         qs = filter_qs_company_branch_or_global(self, models.Counterparty.objects.all())
         user = self.request.user
@@ -554,6 +579,14 @@ class CounterpartyListCreateView(CompanyBranchRestrictedMixin, generics.ListCrea
 class CounterpartyDetailView(CompanyBranchRestrictedMixin, generics.RetrieveUpdateDestroyAPIView):
     queryset = models.Counterparty.objects.all()
     serializer_class = serializers_documents.CounterpartySerializer
+
+    def get_serializer_context(self):
+        ctx = super().get_serializer_context()
+        if self.request.method == "GET" and self.kwargs.get("pk"):
+            ctx["counterparty_analytics_map"] = services_money.bulk_counterparty_mini_analytics(
+                self, [self.kwargs["pk"]]
+            )
+        return ctx
 
     def get_queryset(self):
         qs = filter_qs_company_branch_or_global(self, models.Counterparty.objects.all())
