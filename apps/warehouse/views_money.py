@@ -1,5 +1,6 @@
 from decimal import Decimal
 
+import django_filters
 from rest_framework import status, filters
 from rest_framework.response import Response
 from rest_framework import generics
@@ -8,8 +9,25 @@ from django.db import transaction, IntegrityError
 from django.db.models import Sum, Q
 from django_filters.rest_framework import DjangoFilterBackend
 
-from .views import CompanyBranchRestrictedMixin
+from .views import CompanyBranchRestrictedMixin, filter_qs_company_branch_or_global
 from . import models, serializers_money, services_money
+
+
+class MoneyDocumentFilter(django_filters.FilterSet):
+    """Параметр ?agent= — агент контрагента (у MoneyDocument нет поля agent)."""
+
+    agent = django_filters.UUIDFilter(field_name="counterparty__agent")
+
+    class Meta:
+        model = models.MoneyDocument
+        fields = {
+            "doc_type": ["exact"],
+            "status": ["exact"],
+            "cash_register": ["exact"],
+            "warehouse": ["exact"],
+            "counterparty": ["exact"],
+            "payment_category": ["exact"],
+        }
 
 
 class CashRegisterListCreateView(CompanyBranchRestrictedMixin, generics.ListCreateAPIView):
@@ -152,8 +170,11 @@ class MoneyDocumentListCreateView(CompanyBranchRestrictedMixin, generics.ListCre
         "cash_register", "warehouse", "counterparty", "payment_category", "company", "branch"
     ).order_by("-date")
     filter_backends = [DjangoFilterBackend, filters.SearchFilter]
-    filterset_fields = ["doc_type", "status", "cash_register", "warehouse", "counterparty", "payment_category"]
+    filterset_class = MoneyDocumentFilter
     search_fields = ["number", "comment", "counterparty__name"]
+
+    def get_queryset(self):
+        return filter_qs_company_branch_or_global(self, self.queryset.all())
 
     @staticmethod
     def _wants_post(request) -> bool:
@@ -209,6 +230,9 @@ class MoneyDocumentDetailView(CompanyBranchRestrictedMixin, generics.RetrieveUpd
         "cash_register", "warehouse", "counterparty", "payment_category", "company", "branch"
     )
 
+    def get_queryset(self):
+        return filter_qs_company_branch_or_global(self, self.queryset.all())
+
     def update(self, request, *args, **kwargs):
         partial = kwargs.pop("partial", False)
         instance = self.get_object()
@@ -240,7 +264,7 @@ class MoneyDocumentPostView(CompanyBranchRestrictedMixin, generics.GenericAPIVie
         qs = models.MoneyDocument.objects.select_related(
             "cash_register", "warehouse", "counterparty", "payment_category", "company", "branch"
         )
-        return self._filter_qs_company_branch(qs)
+        return filter_qs_company_branch_or_global(self, qs)
 
     def post(self, request, pk=None):
         doc = self.get_object()
@@ -258,7 +282,7 @@ class MoneyDocumentUnpostView(CompanyBranchRestrictedMixin, generics.GenericAPIV
         qs = models.MoneyDocument.objects.select_related(
             "cash_register", "warehouse", "counterparty", "payment_category", "company", "branch"
         )
-        return self._filter_qs_company_branch(qs)
+        return filter_qs_company_branch_or_global(self, qs)
 
     def post(self, request, pk=None):
         doc = self.get_object()
@@ -285,7 +309,7 @@ class CounterpartyMoneyOperationsView(CompanyBranchRestrictedMixin, generics.Lis
         qs = models.MoneyDocument.objects.select_related(
             "cash_register", "warehouse", "counterparty", "payment_category", "company", "branch"
         ).filter(counterparty_id=counterparty_id).order_by("-date")
-        return self._filter_qs_company_branch(qs)
+        return filter_qs_company_branch_or_global(self, qs)
 
     @staticmethod
     def _truthy(v) -> bool:
@@ -305,111 +329,9 @@ class CounterpartyMoneyOperationsView(CompanyBranchRestrictedMixin, generics.Lis
         Сводка по контрагенту в том же company/branch scope, что и списки:
         продажи, движение кассы (проведённые деньги), сальдо взаиморасчёта (как в акте сверки).
         """
-        trade_doc_types = (
-            models.Document.DocType.SALE,
-            models.Document.DocType.PURCHASE,
-            models.Document.DocType.SALE_RETURN,
-            models.Document.DocType.PURCHASE_RETURN,
-        )
-        doc_debit_types = (
-            models.Document.DocType.SALE,
-            models.Document.DocType.PURCHASE_RETURN,
-        )
-        doc_credit_types = (
-            models.Document.DocType.PURCHASE,
-            models.Document.DocType.SALE_RETURN,
-        )
-
-        docs_posted = models.Document.objects.filter(
-            counterparty_id=counterparty_id,
-            status=models.Document.Status.POSTED,
-            doc_type__in=trade_doc_types,
-        )
-        docs_posted = self._filter_qs_company_branch(
-            docs_posted,
-            company_field="warehouse_from__company_id",
-            branch_field="warehouse_from__branch",
-        )
-
-        sales_qs = models.Document.objects.filter(
-            counterparty_id=counterparty_id,
-            doc_type=models.Document.DocType.SALE,
-            status__in=(
-                models.Document.Status.POSTED,
-                models.Document.Status.CASH_PENDING,
-            ),
-        )
-        sales_qs = self._filter_qs_company_branch(
-            sales_qs,
-            company_field="warehouse_from__company_id",
-            branch_field="warehouse_from__branch",
-        )
-
-        money_posted = models.MoneyDocument.objects.filter(
-            counterparty_id=counterparty_id,
-            status=models.MoneyDocument.Status.POSTED,
-            doc_type__in=(
-                models.MoneyDocument.DocType.MONEY_RECEIPT,
-                models.MoneyDocument.DocType.MONEY_EXPENSE,
-            ),
-        )
-        money_posted = self._filter_qs_company_branch(money_posted)
-
-        sales_total = sales_qs.aggregate(s=Sum("total")).get("s")
-        sales_credit_total = (
-            sales_qs.filter(payment_kind=models.Document.PaymentKind.CREDIT).aggregate(s=Sum("total")).get("s")
-        )
-        sales_cash_total = (
-            sales_qs.exclude(payment_kind=models.Document.PaymentKind.CREDIT)
-            .aggregate(s=Sum("total"))
-            .get("s")
-        )
-        pending_cash_qs = sales_qs.filter(status=models.Document.Status.CASH_PENDING)
-        pending_cash_total = pending_cash_qs.aggregate(s=Sum("total")).get("s")
-
-        doc_debit_sum = docs_posted.filter(doc_type__in=doc_debit_types).aggregate(s=Sum("total")).get("s")
-        doc_credit_sum = docs_posted.filter(doc_type__in=doc_credit_types).aggregate(s=Sum("total")).get("s")
-
-        received = (
-            money_posted.filter(doc_type=models.MoneyDocument.DocType.MONEY_RECEIPT)
-            .aggregate(s=Sum("amount"))
-            .get("s")
-        )
-        paid_out = (
-            money_posted.filter(doc_type=models.MoneyDocument.DocType.MONEY_EXPENSE)
-            .aggregate(s=Sum("amount"))
-            .get("s")
-        )
-
-        d_deb = self._dec_q2(doc_debit_sum)
-        d_cre = self._dec_q2(doc_credit_sum)
-        m_rec = self._dec_q2(received)
-        m_paid = self._dec_q2(paid_out)
-        # Как в акте сверки: дебет (продажи/расход денег) минус кредит (покупки/приход денег)
-        balance = self._dec_q2((d_deb + m_paid) - (d_cre + m_rec))
-
-        return {
-            "sales": {
-                "total": str(self._dec_q2(sales_total)),
-                "count": sales_qs.count(),
-                "cash_total": str(self._dec_q2(sales_cash_total)),
-                "credit_total": str(self._dec_q2(sales_credit_total)),
-                "pending_cash": {
-                    "count": pending_cash_qs.count(),
-                    "total": str(self._dec_q2(pending_cash_total)),
-                },
-            },
-            "cash": {
-                "received": str(m_rec),
-                "paid": str(m_paid),
-                "net": str(self._dec_q2(m_rec - m_paid)),
-            },
-            "debts": {
-                "balance": str(balance),
-                "counterparty_owes_company": str(self._dec_q2(balance if balance > 0 else 0)),
-                "company_owes_counterparty": str(self._dec_q2((-balance) if balance < 0 else 0)),
-            },
-        }
+        cpid = services_money.norm_counterparty_id(counterparty_id)
+        d = services_money.bulk_counterparty_mini_analytics(self, [cpid])
+        return d.get(cpid) or services_money.empty_counterparty_mini_analytics()
 
     def list(self, request, *args, **kwargs):
         """

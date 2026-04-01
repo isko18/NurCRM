@@ -9,6 +9,7 @@ from django.utils.dateparse import parse_date, parse_datetime
 import logging
 
 from apps.main.models import Cart, CartItem, Sale, SaleItem, Product
+from apps.main.pos_utils import cart_item_stock_consume_units, money as pos_money
 
 
 class NotEnoughStock(Exception):
@@ -19,7 +20,9 @@ class NotEnoughStock(Exception):
 def checkout_cart(cart: Cart, department=None) -> Sale:
     cart.recalc()
 
-    items = list(cart.items.select_related("product", "product__brand", "product__category"))
+    items = list(
+        cart.items.select_related("product", "product__brand", "product__category", "sale_package")
+    )
     if not items:
         raise ValueError("Корзина пуста.")
 
@@ -36,7 +39,10 @@ def checkout_cart(cart: Cart, department=None) -> Sale:
     for it in items:
         if not it.product_id:
             continue
-        qty_need = Decimal(str(it.quantity or 0))
+        try:
+            qty_need = cart_item_stock_consume_units(it)
+        except ValueError as e:
+            raise ValueError(str(e)) from e
         p = products.get(it.product_id)
         if not p:
             raise ValueError("Товар позиции не найден.")
@@ -63,6 +69,12 @@ def checkout_cart(cart: Cart, department=None) -> Sale:
         qty = Decimal(str(it.quantity or 1))
         line_disc = Decimal(str(getattr(it, "line_discount", None) or 0))
         effective_unit = (it.unit_price or Decimal("0.00")) - (line_disc / qty) if qty else (it.unit_price or Decimal("0.00"))
+        pp = (p.purchase_price or Decimal("0.00")) if p else Decimal("0.00")
+        if it.sale_package_id:
+            ipp = Decimal(str(it.sale_package.quantity_in_package or 0))
+            snap = pos_money(pp / ipp) if ipp > 0 else pos_money(pp)
+        else:
+            snap = pos_money(pp)
         sale_items.append(
             SaleItem(
                 company=cart.company,
@@ -73,6 +85,8 @@ def checkout_cart(cart: Cart, department=None) -> Sale:
                 barcode_snapshot=barcode_snap,
                 unit_price=effective_unit,
                 quantity=it.quantity,
+                sale_package_id=it.sale_package_id,
+                purchase_price_snapshot=snap,
             )
         )
     SaleItem.objects.bulk_create(sale_items)
@@ -81,7 +95,10 @@ def checkout_cart(cart: Cart, department=None) -> Sale:
     for it in items:
         if not it.product_id:
             continue
-        qty_need = Decimal(str(it.quantity or 0))
+        try:
+            qty_need = cart_item_stock_consume_units(it)
+        except ValueError as e:
+            raise ValueError(str(e)) from e
         p = products[it.product_id]
         p.quantity = Decimal(str(p.quantity or 0)) - qty_need
         changed.append(p)

@@ -308,6 +308,29 @@ class CompanyBranchRestrictedMixin:
         self._save_with_company_branch(serializer)
 
 
+def filter_qs_company_branch_or_global(view, qs):
+    """
+    Как CompanyBranchRestrictedMixin по компании, но по филиалу:
+    при выбранном филиале включаем и записи с branch=NULL (общие на компанию).
+    Иначе денежные документы и контрагенты без филиала не попадают в queryset, и query-параметры
+    кажутся «не работающими».
+    """
+    company = view._company()
+    user = view._user()
+    company_ids = _company_ids_for_warehouse_access(user) if user else []
+    if company is None and not company_ids:
+        return qs.none()
+    if company is not None:
+        company_ids = [company.id]
+    elif not company_ids:
+        return qs.none()
+    qs = qs.filter(company_id__in=company_ids)
+    branch = view._auto_branch()
+    if branch is not None and CompanyBranchRestrictedMixin._model_has_field(qs.model, "branch"):
+        qs = qs.filter(Q(branch=branch) | Q(branch__isnull=True))
+    return qs
+
+
 # ==== Warehouse views ====
 class WarehouseView(CompanyBranchRestrictedMixin, generics.ListCreateAPIView):
     serializer_class = WarehouseSerializer
