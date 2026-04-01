@@ -138,7 +138,12 @@ class DocumentSerializer(serializers.ModelSerializer):
     warehouse_to_name = serializers.CharField(
         source="warehouse_to.name", read_only=True, allow_null=True
     )
-    agent = serializers.PrimaryKeyRelatedField(read_only=True)
+    agent = serializers.PrimaryKeyRelatedField(
+        queryset=User.objects.all(),
+        allow_null=True,
+        required=False,
+        help_text="Агент по документу; при указании контрагент должен быть закреплён за этим агентом.",
+    )
     agent_display = serializers.SerializerMethodField()
 
     class Meta:
