@@ -1,5 +1,6 @@
 from decimal import Decimal
 
+import django_filters
 from rest_framework import status, filters
 from rest_framework.response import Response
 from rest_framework import generics
@@ -8,8 +9,25 @@ from django.db import transaction, IntegrityError
 from django.db.models import Sum, Q
 from django_filters.rest_framework import DjangoFilterBackend
 
-from .views import CompanyBranchRestrictedMixin
+from .views import CompanyBranchRestrictedMixin, filter_qs_company_branch_or_global
 from . import models, serializers_money, services_money
+
+
+class MoneyDocumentFilter(django_filters.FilterSet):
+    """Параметр ?agent= — агент контрагента (у MoneyDocument нет поля agent)."""
+
+    agent = django_filters.UUIDFilter(field_name="counterparty__agent")
+
+    class Meta:
+        model = models.MoneyDocument
+        fields = {
+            "doc_type": ["exact"],
+            "status": ["exact"],
+            "cash_register": ["exact"],
+            "warehouse": ["exact"],
+            "counterparty": ["exact"],
+            "payment_category": ["exact"],
+        }
 
 
 class CashRegisterListCreateView(CompanyBranchRestrictedMixin, generics.ListCreateAPIView):
@@ -152,8 +170,11 @@ class MoneyDocumentListCreateView(CompanyBranchRestrictedMixin, generics.ListCre
         "cash_register", "warehouse", "counterparty", "payment_category", "company", "branch"
     ).order_by("-date")
     filter_backends = [DjangoFilterBackend, filters.SearchFilter]
-    filterset_fields = ["doc_type", "status", "cash_register", "warehouse", "counterparty", "payment_category"]
+    filterset_class = MoneyDocumentFilter
     search_fields = ["number", "comment", "counterparty__name"]
+
+    def get_queryset(self):
+        return filter_qs_company_branch_or_global(self, self.queryset.all())
 
     @staticmethod
     def _wants_post(request) -> bool:
@@ -209,6 +230,9 @@ class MoneyDocumentDetailView(CompanyBranchRestrictedMixin, generics.RetrieveUpd
         "cash_register", "warehouse", "counterparty", "payment_category", "company", "branch"
     )
 
+    def get_queryset(self):
+        return filter_qs_company_branch_or_global(self, self.queryset.all())
+
     def update(self, request, *args, **kwargs):
         partial = kwargs.pop("partial", False)
         instance = self.get_object()
@@ -240,7 +264,7 @@ class MoneyDocumentPostView(CompanyBranchRestrictedMixin, generics.GenericAPIVie
         qs = models.MoneyDocument.objects.select_related(
             "cash_register", "warehouse", "counterparty", "payment_category", "company", "branch"
         )
-        return self._filter_qs_company_branch(qs)
+        return filter_qs_company_branch_or_global(self, qs)
 
     def post(self, request, pk=None):
         doc = self.get_object()
@@ -258,7 +282,7 @@ class MoneyDocumentUnpostView(CompanyBranchRestrictedMixin, generics.GenericAPIV
         qs = models.MoneyDocument.objects.select_related(
             "cash_register", "warehouse", "counterparty", "payment_category", "company", "branch"
         )
-        return self._filter_qs_company_branch(qs)
+        return filter_qs_company_branch_or_global(self, qs)
 
     def post(self, request, pk=None):
         doc = self.get_object()
@@ -285,7 +309,7 @@ class CounterpartyMoneyOperationsView(CompanyBranchRestrictedMixin, generics.Lis
         qs = models.MoneyDocument.objects.select_related(
             "cash_register", "warehouse", "counterparty", "payment_category", "company", "branch"
         ).filter(counterparty_id=counterparty_id).order_by("-date")
-        return self._filter_qs_company_branch(qs)
+        return filter_qs_company_branch_or_global(self, qs)
 
     @staticmethod
     def _truthy(v) -> bool:

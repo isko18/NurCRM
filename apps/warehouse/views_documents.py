@@ -8,7 +8,7 @@ from django_filters.rest_framework import DjangoFilterBackend
 
 from . import models, serializers_documents, services
 from rest_framework.exceptions import ValidationError as DRFValidationError
-from .views import CompanyBranchRestrictedMixin
+from .views import CompanyBranchRestrictedMixin, filter_qs_company_branch_or_global
 from apps.utils import _is_owner_like
 
 
@@ -526,9 +526,12 @@ class WarehouseDetailView(CompanyBranchRestrictedMixin, generics.RetrieveUpdateD
 class CounterpartyListCreateView(CompanyBranchRestrictedMixin, generics.ListCreateAPIView):
     queryset = models.Counterparty.objects.all()
     serializer_class = serializers_documents.CounterpartySerializer
+    filter_backends = [DjangoFilterBackend, filters.SearchFilter]
+    filterset_fields = ["agent", "type"]
+    search_fields = ["name", "phone"]
 
     def get_queryset(self):
-        qs = super().get_queryset()
+        qs = filter_qs_company_branch_or_global(self, models.Counterparty.objects.all())
         user = self.request.user
         if not _is_owner_like(user):
             qs = qs.filter(agent=user)
@@ -553,7 +556,7 @@ class CounterpartyDetailView(CompanyBranchRestrictedMixin, generics.RetrieveUpda
     serializer_class = serializers_documents.CounterpartySerializer
 
     def get_queryset(self):
-        qs = super().get_queryset()
+        qs = filter_qs_company_branch_or_global(self, models.Counterparty.objects.all())
         user = self.request.user
         if not _is_owner_like(user):
             qs = qs.filter(agent=user)
