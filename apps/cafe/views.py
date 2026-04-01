@@ -5,6 +5,7 @@ import uuid
 import re
 
 from django.db import transaction, IntegrityError
+from django.db.models.deletion import ProtectedError
 from django.db.models import Q, Count, Avg, ExpressionWrapper, DurationField, F
 from django.utils import timezone
 from django_filters.rest_framework import DjangoFilterBackend
@@ -652,6 +653,23 @@ class MenuItemRetrieveUpdateDestroyView(CompanyBranchQuerysetMixin, generics.Ret
         .all()
     )
     serializer_class = MenuItemSerializer
+
+    def destroy(self, request, *args, **kwargs):
+        instance = self.get_object()
+        try:
+            return super().destroy(request, *args, **kwargs)
+        except ProtectedError:
+            return Response(
+                {
+                    "detail": (
+                        "Нельзя удалить позицию меню: она указана в заказах или в задачах кухни. "
+                        "Сначала удалите или измените связанные заказы, либо деактивируйте позицию (is_active=false)."
+                    ),
+                    "order_items_count": instance.order_items.count(),
+                    "kitchen_tasks_count": instance.kitchen_tasks.count(),
+                },
+                status=status.HTTP_409_CONFLICT,
+            )
 
 
 # ==================== Ingredient ====================
