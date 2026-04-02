@@ -193,12 +193,25 @@ line_total = (unit_price × quantity) - line_discount
 
 ## Агентские продажи (Agent)
 
-Те же эндпоинты с префиксом `/api/main/pos/agent/`:
-- `POST /api/main/pos/agent/sales/<cart_id>/add-item/`
-- `PATCH /api/main/pos/agent/carts/<cart_id>/items/<item_id>/`
-- `DELETE /api/main/pos/agent/carts/<cart_id>/items/<item_id>/`
+Префикс: `/api/main/agents/me/` (не путать с обычным POS).
 
-Логика цены и скидки совпадает с обычным POS.
+- `POST /api/main/agents/me/carts/<cart_id>/add-item/`
+- `PATCH /api/main/agents/me/carts/<cart_id>/items/<item_id>/`
+- `DELETE /api/main/agents/me/carts/<cart_id>/items/<item_id>/`
+- `POST /api/main/agents/me/carts/<cart_id>/checkout/` → сервер вызывает **`checkout_agent_cart`** (без смены, без списания основного `Product.quantity` по правилам агента).
+
+Логика **базовой** цены и скидки на строку совпадает с обычным POS, **кроме поштучной продажи из пачки**.
+
+### Поштучная продажа из упаковки (`sale_package_id`) — только обычная касса
+
+Продажа «штуки из пачки» (сигареты и т.п., см. [pos_pack_piece_sale.md](./pos_pack_piece_sale.md)) делается **только** через обычный POS:
+
+1. Корзина со **сменой** (`shift`), оформление через **`checkout_cart`** (эндпоинт чекаута обычной кассы, не агентский).
+2. В агентской корзине:
+   - при **`POST .../add-item/`** с полем **`sale_package_id`** ответ **400** с пояснением в `sale_package_id`;
+   - при **`checkout`** если в корзине уже есть строка с `sale_package` — **ValidationError** (оформление через агента невозможно).
+
+Для продажи целыми пачками в агентском потоке **`sale_package_id` не передаётся** (количество в тех же единицах, что и склад/остаток агента).
 
 ---
 
