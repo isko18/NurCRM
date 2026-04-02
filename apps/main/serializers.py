@@ -1,7 +1,7 @@
 from rest_framework import serializers
 from django.db import transaction
 from django.utils import timezone
-from django.db.models import Q, Sum, Value as V, Prefetch
+from django.db.models import Q, Sum, Value as V, Prefetch, ProtectedError
 from django.db.models.functions import Coalesce
 from decimal import Decimal, ROUND_HALF_UP, InvalidOperation
 from typing import Any, Dict
@@ -599,6 +599,14 @@ class ProductCharacteristicsSerializer(serializers.ModelSerializer):
 
 
 class ProductPackageSerializer(serializers.ModelSerializer):
+    piece_unit_price = serializers.DecimalField(
+        max_digits=10,
+        decimal_places=2,
+        required=False,
+        allow_null=True,
+        min_value=Decimal("0"),
+    )
+
     class Meta:
         model = ProductPackage
         fields = [
@@ -606,11 +614,26 @@ class ProductPackageSerializer(serializers.ModelSerializer):
             "name",
             "quantity_in_package",
             "unit",
+            "piece_unit_price",
         ]
         read_only_fields = ["id"]
 
 
 MAX_PRODUCT_PROMOTION_TIERS = 30
+
+
+def _package_row_piece_unit_price(pkg) -> object:
+    """Достаёт piece_unit_price из строки packages_input; None / пустая строка → «не задано»."""
+    if not hasattr(pkg, "get"):
+        raise serializers.ValidationError(
+            {"packages_input": "Каждый элемент packages_input должен быть объектом с полями упаковки."}
+        )
+    pup = pkg.get("piece_unit_price")
+    if pup in (None, ""):
+        return None
+    if isinstance(pup, str) and not str(pup).strip():
+        return None
+    return pup
 
 
 class ProductPromotionTierSerializer(serializers.ModelSerializer):
@@ -1121,6 +1144,8 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
         for pkg in packages:
             safe = self._safe_decimal(getattr(pkg, "quantity_in_package", None), Decimal("0.001"))
             setattr(pkg, "quantity_in_package", safe)
+            pup = self._safe_decimal(getattr(pkg, "piece_unit_price", None), self._Q2)
+            setattr(pkg, "piece_unit_price", pup)
 
     def to_representation(self, instance):
         # чистим проблемные Decimal перед сериализацией, чтобы избежать InvalidOperation
@@ -1230,12 +1255,20 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
         if item_make_data:
             product.item_make.set(item_make_data)
 
+        if packages_data and not isinstance(packages_data, (list, tuple)):
+            raise serializers.ValidationError({"packages_input": "Ожидается массив упаковок."})
         for pkg in packages_data:
+            pup = _package_row_piece_unit_price(pkg)
+            if pup is None:
+                raise serializers.ValidationError({
+                    "packages_input": "Для каждой упаковки укажите piece_unit_price (цена за штуку при поштучной продаже).",
+                })
             ProductPackage.objects.create(
                 product=product,
                 name=(pkg.get("name") or "").strip(),
                 quantity_in_package=pkg.get("quantity_in_package"),
                 unit=(pkg.get("unit") or "").strip(),
+                piece_unit_price=pup,
             )
 
         sync_product_promotion_tiers(
@@ -1366,13 +1399,29 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
 
         # PACKAGES перезаписываем ТОЛЬКО если реально пришли в PATCH
         if packages_data is not None:
-            instance.packages.all().delete()
+            if not isinstance(packages_data, (list, tuple)):
+                raise serializers.ValidationError({"packages_input": "Ожидается массив упаковок."})
+            try:
+                instance.packages.all().delete()
+            except ProtectedError:
+                raise serializers.ValidationError({
+                    "packages_input": (
+                        "Нельзя заменить упаковки: они привязаны к позициям в корзинах кассы "
+                        "(поштучная продажа). Удалите или измените такие позиции в корзинах и повторите."
+                    ),
+                })
             for pkg in packages_data:
+                pup = _package_row_piece_unit_price(pkg)
+                if pup is None:
+                    raise serializers.ValidationError({
+                        "packages_input": "Для каждой упаковки укажите piece_unit_price (цена за штуку при поштучной продаже).",
+                    })
                 ProductPackage.objects.create(
                     product=instance,
                     name=(pkg.get("name") or "").strip(),
                     quantity_in_package=pkg.get("quantity_in_package"),
                     unit=(pkg.get("unit") or "").strip(),
+                    piece_unit_price=pup,
                 )
 
         if promotion_in:

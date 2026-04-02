@@ -799,6 +799,27 @@ class ProductCreateByBarcodeAPIView(CompanyBranchRestrictedMixin, generics.Creat
             except (TypeError, ValueError):
                 continue
             unit_pkg = (pkg.get("unit") or "").strip()
+            piece_raw = pkg.get("piece_unit_price")
+            if piece_raw in (None, "", "null"):
+                return Response(
+                    {
+                        "packages_input": "Для каждой упаковки укажите piece_unit_price (цена за штуку при поштучной продаже).",
+                    },
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            try:
+                piece_unit_price = Decimal(str(piece_raw))
+            except Exception:
+                return Response(
+                    {"packages_input": "Неверный формат piece_unit_price в упаковке."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            if piece_unit_price < 0:
+                return Response(
+                    {"packages_input": "piece_unit_price не может быть отрицательной."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            piece_unit_price = piece_unit_price.quantize(_Q2, rounding=ROUND_HALF_UP)
 
             packages_to_create.append(
                 ProductPackage(
@@ -808,6 +829,7 @@ class ProductCreateByBarcodeAPIView(CompanyBranchRestrictedMixin, generics.Creat
                     name=name,
                     quantity_in_package=qip,
                     unit=unit_pkg,
+                    piece_unit_price=piece_unit_price,
                 )
             )
 
@@ -1138,6 +1160,27 @@ class ProductCreateManualAPIView(CompanyBranchRestrictedMixin, generics.CreateAP
             except (TypeError, ValueError):
                 continue
             unit_pkg = (pkg.get("unit") or "").strip()
+            piece_raw = pkg.get("piece_unit_price")
+            if piece_raw in (None, "", "null"):
+                return Response(
+                    {
+                        "packages_input": "Для каждой упаковки укажите piece_unit_price (цена за штуку при поштучной продаже).",
+                    },
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            try:
+                piece_unit_price = Decimal(str(piece_raw))
+            except Exception:
+                return Response(
+                    {"packages_input": "Неверный формат piece_unit_price в упаковке."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            if piece_unit_price < 0:
+                return Response(
+                    {"packages_input": "piece_unit_price не может быть отрицательной."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            piece_unit_price = piece_unit_price.quantize(_Q2, rounding=ROUND_HALF_UP)
 
             packages_to_create.append(
                 ProductPackage(
@@ -1147,6 +1190,7 @@ class ProductCreateManualAPIView(CompanyBranchRestrictedMixin, generics.CreateAP
                     name=name_pkg,
                     quantity_in_package=qip,
                     unit=unit_pkg,
+                    piece_unit_price=piece_unit_price,
                 )
             )
 
