@@ -25,7 +25,7 @@ from .models import (
     Zone, Table, Booking, Warehouse, Purchase,
     Category, MenuItem, Ingredient,
     Order, OrderItem, CafeClient,
-    OrderHistory, OrderItemHistory,
+    OrderHistory, OrderItemHistory, OrderDebtPayment,
     KitchenTask, NotificationCafe,
     InventorySession, Equipment, EquipmentInventorySession, Kitchen,
     CafeReceiptPrinterSettings,
@@ -41,6 +41,7 @@ from .serializers import (
     InventorySessionSerializer, EquipmentSerializer,
     EquipmentInventorySessionSerializer, KitchenSerializer,
     OrderPaySerializer,
+    OrderPayDebtSerializer,
     CafeReceiptPrinterSettingsSerializer,
 )
 
@@ -858,15 +859,92 @@ class OrderItemRetrieveUpdateDestroyView(CompanyBranchQuerysetMixin, generics.Re
         return qs.filter(order__branch__isnull=True, menu_item__branch__isnull=True)
 
 
+def _cafe_clients_in_scope(company, active_branch):
+    qs = CafeClient.objects.filter(company=company)
+    if active_branch is not None:
+        qs = qs.filter(Q(branch=active_branch) | Q(branch__isnull=True))
+    return qs
+
+
+def _cafe_order_checkout_payload(order: Order) -> dict:
+    disc = order.discount_amount or Decimal("0")
+    final_amt = (order.total_amount or Decimal("0")) - disc
+    return {
+        "id": str(order.id),
+        "status": order.status,
+        "is_paid": order.is_paid,
+        "paid_at": order.paid_at,
+        "payment_method": order.payment_method,
+        "total_amount": str(order.total_amount),
+        "discount_amount": str(disc),
+        "final_amount": str(final_amt),
+        "paid_amount": str(order.paid_amount or Decimal("0")),
+        "balance_due": str(order.balance_due),
+    }
+
+
+def _cafe_archive_order_snapshot(order: Order):
+    waiter_label = ""
+    if order.waiter_id:
+        full = getattr(order.waiter, "get_full_name", lambda: "")() or ""
+        email = getattr(order.waiter, "email", "") or ""
+        waiter_label = full or email or str(order.waiter_id)
+
+    oh, _created = OrderHistory.objects.update_or_create(
+        original_order_id=order.id,
+        defaults={
+            "company": order.company,
+            "branch": order.branch,
+            "client": order.client,
+            "table": order.table,
+            "table_number": (order.table.number if order.table_id else None),
+            "waiter": order.waiter,
+            "waiter_label": waiter_label,
+            "guests": order.guests,
+            "created_at": order.created_at,
+            "status": order.status,
+            "is_paid": order.is_paid,
+            "paid_at": order.paid_at,
+            "payment_method": order.payment_method,
+            "total_amount": order.total_amount,
+            "discount_amount": order.discount_amount,
+            "paid_amount": order.paid_amount or Decimal("0"),
+        },
+    )
+
+    OrderItemHistory.objects.filter(order_history=oh).delete()
+    items = [
+        OrderItemHistory(
+            order_history=oh,
+            menu_item=it.menu_item,
+            menu_item_title=it.menu_item.title,
+            menu_item_price=it.menu_item.price,
+            quantity=it.quantity,
+        )
+        for it in order.items.select_related("menu_item")
+    ]
+    if items:
+        OrderItemHistory.objects.bulk_create(items)
+
+
 class OrderPayView(CompanyBranchQuerysetMixin, APIView):
     """
     POST /cafe/orders/<uuid:pk>/pay/
-    body:
-      {
-        "payment_method": "cash|card|transfer",
-        "discount_amount": "0.00",
-        "close_order": true
-      }
+
+    Полная оплата (как раньше):
+      {"payment_method": "cash|card|transfer", "discount_amount": "0.00", "close_order": true}
+
+    В долг (нужен клиент кафе — в заказе или client_id):
+      {"payment_method": "debt", "discount_amount": "0", "close_order": true}
+
+    Предоплата + долг (payment_method=debt):
+      {"payment_method": "debt", "prepaid_amount": "500.00", "prepaid_payment_method": "cash",
+       "idempotency_key": "<uuid>", ...}
+
+    Обычная оплата не на полную сумму (остаток в долг):
+      {"payment_method": "cash", "pay_now": "300.00", "idempotency_key": "<uuid>", "client_id": "..."}
+
+    Дальнейшие взносы: POST /cafe/orders/<id>/pay-debt/
 
     ВАЖНО: архивируем в OrderHistory сразу (история НЕ зависит от удаления заказа).
     """
@@ -875,16 +953,7 @@ class OrderPayView(CompanyBranchQuerysetMixin, APIView):
         if not company:
             return Response({"detail": "Компания не найдена."}, status=status.HTTP_403_FORBIDDEN)
 
-        qs = (
-            Order.objects
-            .select_related("table", "client", "waiter")
-            .prefetch_related("items__menu_item")
-            .filter(company=company)
-        )
-
         active_branch = self._active_branch()
-        if active_branch is not None:
-            qs = qs.filter(branch=active_branch)
 
         ser = OrderPaySerializer(data=request.data)
         ser.is_valid(raise_exception=True)
@@ -892,15 +961,17 @@ class OrderPayView(CompanyBranchQuerysetMixin, APIView):
         payment_method = ser.validated_data.get("payment_method", "cash")
         discount_amount = ser.validated_data.get("discount_amount", Decimal("0"))
         close_order = ser.validated_data.get("close_order", True)
+        client_id = ser.validated_data.get("client_id")
+        pay_now = ser.validated_data.get("pay_now")
+        prepaid_amount = ser.validated_data.get("prepaid_amount")
+        prepaid_pm = ser.validated_data.get("prepaid_payment_method")
+        idem = ser.validated_data.get("idempotency_key")
 
         with transaction.atomic():
-            # Забираем заказ с блокировкой, чтобы не было двойной оплаты/списания
             locked_qs = (
                 Order.objects
-                # В Postgres нельзя FOR UPDATE на nullable side OUTER JOIN,
-                # поэтому лочим только сам Order (без client/waiter).
                 .select_for_update(of=("self",))
-                .select_related("table")
+                .select_related("table", "client", "waiter")
                 .prefetch_related("items__menu_item__ingredients__product")
                 .filter(company=company)
             )
@@ -908,37 +979,156 @@ class OrderPayView(CompanyBranchQuerysetMixin, APIView):
                 locked_qs = locked_qs.filter(branch=active_branch)
             order = generics.get_object_or_404(locked_qs, pk=pk)
 
-            if getattr(order, "is_paid", False):
+            if order.is_paid:
                 return Response({"detail": "Заказ уже оплачен."}, status=status.HTTP_400_BAD_REQUEST)
+
+            if order.status == Order.Status.CLOSED and not order.is_paid:
+                return Response(
+                    {
+                        "detail": "Заказ закрыт с долгом. Дальнейшая оплата — POST "
+                        f"/cafe/orders/{order.id}/pay-debt/"
+                    },
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            if (order.paid_amount or Decimal("0")) > 0 and not order.is_paid:
+                return Response(
+                    {
+                        "detail": "Уже есть внесённые суммы по долгу. Используйте POST "
+                        f"/cafe/orders/{order.id}/pay-debt/"
+                    },
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            if client_id:
+                client = generics.get_object_or_404(_cafe_clients_in_scope(company, active_branch), pk=client_id)
+                order.client = client
 
             order.recalc_total()
 
             if discount_amount and discount_amount > order.total_amount:
                 return Response({"detail": "Скидка больше суммы заказа."}, status=status.HTTP_400_BAD_REQUEST)
 
-            # Списываем ингредиенты "по продаже" — в момент оплаты (один раз).
-            deduct_ingredients_for_order(order)
+            final_amt = ((order.total_amount or Decimal("0")) - (discount_amount or Decimal("0"))).quantize(
+                Decimal("0.01")
+            )
+            if final_amt < 0:
+                return Response(
+                    {"detail": "Итог после скидки не может быть отрицательным."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
 
             order.discount_amount = discount_amount or Decimal("0")
-            order.is_paid = True
-            order.paid_at = timezone.now()
-            order.payment_method = payment_method
+
+            def _record_prepay(amount: Decimal, pm: str, idempotency_key):
+                if not idempotency_key:
+                    raise ValidationError(
+                        {"idempotency_key": "Обязателен при внесении денег в счёт долга (предоплата / pay_now)."}
+                    )
+                if OrderDebtPayment.objects.filter(order=order, idempotency_key=idempotency_key).exists():
+                    order.refresh_from_db()
+                    return True
+                try:
+                    with transaction.atomic():
+                        OrderDebtPayment.objects.create(
+                            company=order.company,
+                            branch=order.branch,
+                            order=order,
+                            amount=amount,
+                            payment_method=pm,
+                            idempotency_key=idempotency_key,
+                            created_by=request.user if request.user.is_authenticated else None,
+                            note="",
+                        )
+                except IntegrityError:
+                    order.refresh_from_db()
+                    return True
+                return False
+
+            if payment_method == Order.PaymentMethod.DEBT:
+                prepaid = (prepaid_amount if prepaid_amount is not None else Decimal("0")).quantize(Decimal("0.01"))
+                if prepaid < 0 or prepaid > final_amt:
+                    return Response(
+                        {"detail": "Некорректная предоплата относительно итога."},
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
+                if prepaid < final_amt and not order.client_id:
+                    return Response(
+                        {"detail": "Для долга укажите гостя (client в заказе или client_id)."},
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
+                if prepaid >= final_amt:
+                    # Полностью закрыто предоплатой — без строки OrderDebtPayment (как обычная оплата).
+                    order.payment_method = prepaid_pm or Order.PaymentMethod.CASH
+                    order.paid_amount = final_amt
+                    order.is_paid = True
+                    order.paid_at = timezone.now()
+                else:
+                    if prepaid > 0:
+                        dup = _record_prepay(prepaid, prepaid_pm, idem)
+                        if dup:
+                            send_order_updated_notification(order)
+                            return Response(_cafe_order_checkout_payload(order), status=status.HTTP_200_OK)
+                    order.payment_method = Order.PaymentMethod.DEBT
+                    order.paid_amount = prepaid
+                    order.is_paid = False
+                    order.paid_at = None
+            else:
+                if pay_now is not None:
+                    pn = Decimal(str(pay_now)).quantize(Decimal("0.01"))
+                else:
+                    pn = final_amt
+                if pn < 0 or pn > final_amt:
+                    return Response(
+                        {"detail": "Сумма pay_now некорректна относительно итога."},
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
+                if pn < final_amt:
+                    if not order.client_id:
+                        return Response(
+                            {"detail": "Для частичной оплаты укажите гостя (client или client_id)."},
+                            status=status.HTTP_400_BAD_REQUEST,
+                        )
+                    dup = _record_prepay(pn, payment_method, idem)
+                    if dup:
+                        send_order_updated_notification(order)
+                        return Response(_cafe_order_checkout_payload(order), status=status.HTTP_200_OK)
+                    order.payment_method = Order.PaymentMethod.DEBT
+                    order.paid_amount = pn
+                    order.is_paid = False
+                    order.paid_at = None
+                else:
+                    order.payment_method = payment_method
+                    order.paid_amount = final_amt
+                    order.is_paid = True
+                    order.paid_at = timezone.now()
+
+            if not order.stock_deducted:
+                deduct_ingredients_for_order(order)
+                order.stock_deducted = True
 
             if close_order:
                 order.status = Order.Status.CLOSED
 
-            order.save(update_fields=[
-                "total_amount", "discount_amount",
-                "is_paid", "paid_at", "payment_method",
-                "status", "updated_at",
-            ])
+            order.save(
+                update_fields=[
+                    "total_amount",
+                    "discount_amount",
+                    "paid_amount",
+                    "stock_deducted",
+                    "is_paid",
+                    "paid_at",
+                    "payment_method",
+                    "status",
+                    "client",
+                    "updated_at",
+                ]
+            )
 
-            # При закрытии заказа отменяем незавершенные задачи кухни
             if close_order:
-                # Отменяем задачи в статусе PENDING и IN_PROGRESS
                 unfinished_tasks = KitchenTask.objects.filter(
                     order=order,
-                    status__in=[KitchenTask.Status.PENDING, KitchenTask.Status.IN_PROGRESS]
+                    status__in=[KitchenTask.Status.PENDING, KitchenTask.Status.IN_PROGRESS],
                 )
                 if unfinished_tasks.exists():
                     unfinished_tasks.update(status=KitchenTask.Status.CANCELLED)
@@ -946,61 +1136,106 @@ class OrderPayView(CompanyBranchQuerysetMixin, APIView):
             if order.table_id:
                 _sync_table_status(order.table_id)
 
-            # ---------- ARCHIVE (OrderHistory) ----------
-            waiter_label = ""
-            if order.waiter_id:
-                full = getattr(order.waiter, "get_full_name", lambda: "")() or ""
-                email = getattr(order.waiter, "email", "") or ""
-                waiter_label = full or email or str(order.waiter_id)
+            _cafe_archive_order_snapshot(order)
 
-            oh, _created = OrderHistory.objects.update_or_create(
-                original_order_id=order.id,
-                defaults={
-                    "company": order.company,
-                    "branch": order.branch,
-                    "client": order.client,
-                    "table": order.table,
-                    "table_number": (order.table.number if order.table_id else None),
-                    "waiter": order.waiter,
-                    "waiter_label": waiter_label,
-                    "guests": order.guests,
-                    "created_at": order.created_at,
-                    "status": order.status,
-                    "is_paid": order.is_paid,
-                    "paid_at": order.paid_at,
-                    "payment_method": order.payment_method,
-                    "total_amount": order.total_amount,
-                    "discount_amount": order.discount_amount,
-                }
-            )
-
-            OrderItemHistory.objects.filter(order_history=oh).delete()
-            items = [
-                OrderItemHistory(
-                    order_history=oh,
-                    menu_item=it.menu_item,
-                    menu_item_title=it.menu_item.title,
-                    menu_item_price=it.menu_item.price,
-                    quantity=it.quantity,
-                )
-                for it in order.items.select_related("menu_item")
-            ]
-            if items:
-                OrderItemHistory.objects.bulk_create(items)
-
-        # Отправляем WebSocket уведомление об обновлении заказа
         send_order_updated_notification(order)
-        
-        return Response({
-            "id": str(order.id),
-            "status": order.status,
-            "is_paid": order.is_paid,
-            "paid_at": order.paid_at,
-            "payment_method": order.payment_method,
-            "total_amount": str(order.total_amount),
-            "discount_amount": str(order.discount_amount),
-            "final_amount": str(order.total_amount - (order.discount_amount or Decimal("0"))),
-        }, status=status.HTTP_200_OK)
+
+        return Response(_cafe_order_checkout_payload(order), status=status.HTTP_200_OK)
+
+
+class OrderPayDebtView(CompanyBranchQuerysetMixin, APIView):
+    """
+    POST /cafe/orders/<uuid:pk>/pay-debt/
+    Частичное или полное погашение долга по заказу (после первичного pay с долгом).
+
+    Body:
+      {
+        "amount": "100.00",
+        "payment_method": "cash|card|transfer",
+        "idempotency_key": "<uuid>",
+        "note": "",
+        "cash_received": "100.00"   // только для cash
+      }
+    """
+
+    def post(self, request, pk):
+        company = self._user_company()
+        if not company:
+            return Response({"detail": "Компания не найдена."}, status=status.HTTP_403_FORBIDDEN)
+
+        active_branch = self._active_branch()
+        ser = OrderPayDebtSerializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+        amount = ser.validated_data["amount"].quantize(Decimal("0.01"))
+        pm = ser.validated_data["payment_method"]
+        idem = ser.validated_data["idempotency_key"]
+        note = ser.validated_data.get("note") or ""
+
+        with transaction.atomic():
+            locked_qs = (
+                Order.objects.select_for_update(of=("self",))
+                .select_related("table", "client", "waiter")
+                .prefetch_related("items__menu_item")
+                .filter(company=company)
+            )
+            if active_branch is not None:
+                locked_qs = locked_qs.filter(branch=active_branch)
+            order = generics.get_object_or_404(locked_qs, pk=pk)
+
+            if order.is_paid:
+                return Response({"detail": "Заказ уже полностью оплачен."}, status=status.HTTP_400_BAD_REQUEST)
+
+            order.recalc_total()
+            final_amt = order.final_amount.quantize(Decimal("0.01"))
+            paid_before = (order.paid_amount or Decimal("0")).quantize(Decimal("0.01"))
+            balance = (final_amt - paid_before).quantize(Decimal("0.01"))
+            if balance <= 0:
+                return Response({"detail": "Нечего гасить — остаток долга ноль."}, status=status.HTTP_400_BAD_REQUEST)
+            if amount > balance:
+                return Response(
+                    {"detail": f"Сумма больше остатка ({balance})."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            if OrderDebtPayment.objects.filter(order=order, idempotency_key=idem).exists():
+                order.refresh_from_db()
+                _cafe_archive_order_snapshot(order)
+                send_order_updated_notification(order)
+                return Response(_cafe_order_checkout_payload(order), status=status.HTTP_200_OK)
+
+            try:
+                with transaction.atomic():
+                    OrderDebtPayment.objects.create(
+                        company=order.company,
+                        branch=order.branch,
+                        order=order,
+                        amount=amount,
+                        payment_method=pm,
+                        idempotency_key=idem,
+                        created_by=request.user if request.user.is_authenticated else None,
+                        note=note,
+                    )
+            except IntegrityError:
+                order.refresh_from_db()
+                _cafe_archive_order_snapshot(order)
+                send_order_updated_notification(order)
+                return Response(_cafe_order_checkout_payload(order), status=status.HTTP_200_OK)
+
+            new_paid = (paid_before + amount).quantize(Decimal("0.01"))
+            order.paid_amount = new_paid
+            if new_paid >= final_amt:
+                order.is_paid = True
+                order.paid_at = timezone.now()
+                order.payment_method = pm
+            order.save(update_fields=["paid_amount", "is_paid", "paid_at", "payment_method", "updated_at"])
+
+            if order.table_id:
+                _sync_table_status(order.table_id)
+
+            _cafe_archive_order_snapshot(order)
+
+        send_order_updated_notification(order)
+        return Response(_cafe_order_checkout_payload(order), status=status.HTTP_200_OK)
 
 
 class OrderClosedListView(CompanyBranchQuerysetMixin, generics.ListAPIView):

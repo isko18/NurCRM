@@ -649,7 +649,7 @@ class OrderHistorySerializer(serializers.ModelSerializer):
             "id", "original_order_id", "company", "branch", "client",
             "table", "table_number", "waiter", "waiter_label",
             "guests", "created_at", "archived_at", "items",
-              "status","is_paid","paid_at","payment_method","total_amount","discount_amount", "items"
+            "status", "is_paid", "paid_at", "payment_method", "total_amount", "discount_amount", "paid_amount",
         ]
         read_only_fields = fields
 
@@ -677,6 +677,9 @@ class OrderSerializer(CompanyBranchReadOnlyMixin):
     client = serializers.PrimaryKeyRelatedField(queryset=CafeClient.objects.all(), required=False, allow_null=True)
     waiter = serializers.PrimaryKeyRelatedField(queryset=User.objects.all(), allow_null=True, required=False)
     items = OrderItemInlineSerializer(many=True, required=False)
+    balance_due = serializers.DecimalField(
+        max_digits=12, decimal_places=2, read_only=True, source="balance_due",
+    )
 
     class Meta:
         ref_name = "CafeOrder"
@@ -684,9 +687,10 @@ class OrderSerializer(CompanyBranchReadOnlyMixin):
         fields = [
         "id","company","branch","table","client","waiter","guests","created_at",
         "status","is_paid","paid_at","payment_method","total_amount","discount_amount",
+        "paid_amount","balance_due",
         "items"
         ]
-        read_only_fields = ["is_paid","paid_at","payment_method","total_amount"]
+        read_only_fields = ["is_paid","paid_at","payment_method","total_amount","paid_amount","balance_due"]
 
     def get_fields(self):
         fields = super().get_fields()
@@ -840,22 +844,50 @@ class OrderSerializer(CompanyBranchReadOnlyMixin):
     
 
 class OrderPaySerializer(serializers.Serializer):
-    """Оплата заказа: способ оплаты (нал/безнал), скидка, закрыть заказ."""
+    """
+    Оплата заказа: полная оплата, долг, предоплата + долг (клиент /cafe/clients/).
+    - payment_method=debt: полный долг или prepaid_amount + prepaid_payment_method.
+    - payment_method=cash|card|transfer и pay_now < итога: остаток в долг (нужен client на заказе или client_id).
+    При внесении суммы в долг (предоплата или pay_now) нужен idempotency_key (UUID).
+    """
     payment_method = serializers.ChoiceField(
         choices=[
             ("cash", "Наличные"),
             ("card", "Безналичный (карта)"),
             ("transfer", "Безналичный (перевод)"),
+            ("debt", "Долг"),
         ],
         required=False,
         default="cash",
-        help_text="Способ оплаты: cash — наличные, card/transfer — безнал. Обязательно указывать при оплате.",
+        help_text="debt — в долг (опционально с предоплатой); иначе нал/безнал.",
     )
     discount_amount = serializers.DecimalField(
         max_digits=12, decimal_places=2, required=False, default=Decimal("0"),
         help_text="Скидка на заказ (можно задать также при создании/редактировании заказа).",
     )
     close_order = serializers.BooleanField(required=False, default=True)
+    client_id = serializers.UUIDField(required=False, allow_null=True, help_text="Гость кафе, если долг и не привязан к заказу.")
+    pay_now = serializers.DecimalField(
+        max_digits=12, decimal_places=2, required=False, allow_null=True,
+        help_text="Внести сейчас (cash|card|transfer); если меньше итога после скидки — остаток в долг.",
+    )
+    prepaid_amount = serializers.DecimalField(
+        max_digits=12, decimal_places=2, required=False, allow_null=True,
+        help_text="Только с payment_method=debt: сумма, внесённая сейчас до оформления долга на остаток.",
+    )
+    prepaid_payment_method = serializers.ChoiceField(
+        choices=[
+            ("cash", "Наличные"),
+            ("card", "Безналичный (карта)"),
+            ("transfer", "Безналичный (перевод)"),
+        ],
+        required=False,
+        allow_null=True,
+    )
+    idempotency_key = serializers.UUIDField(
+        required=False, allow_null=True,
+        help_text="Обязателен при первом внесении денег в счёт долга (предоплата или pay_now < итога).",
+    )
 
     def validate_discount_amount(self, v):
         if v is None:
@@ -863,6 +895,54 @@ class OrderPaySerializer(serializers.Serializer):
         if v < 0:
             raise serializers.ValidationError("discount_amount не может быть отрицательным.")
         return v
+
+    def validate(self, attrs):
+        pm = attrs.get("payment_method") or "cash"
+        if pm == "debt" and attrs.get("pay_now") is not None:
+            raise serializers.ValidationError({"pay_now": "С payment_method=debt используйте prepaid_amount, не pay_now."})
+        if pm != "debt":
+            if attrs.get("prepaid_amount") is not None:
+                raise serializers.ValidationError({"prepaid_amount": "Только при payment_method=debt."})
+            if attrs.get("prepaid_payment_method"):
+                raise serializers.ValidationError({"prepaid_payment_method": "Только при payment_method=debt."})
+        prepaid = attrs.get("prepaid_amount")
+        if pm == "debt" and prepaid is not None and prepaid > 0 and not attrs.get("prepaid_payment_method"):
+            raise serializers.ValidationError(
+                {"prepaid_payment_method": "Укажите способ внесения предоплаты (cash|card|transfer)."}
+            )
+        return attrs
+
+
+class OrderPayDebtSerializer(serializers.Serializer):
+    """Частичное или полное погашение долга по заказу: POST .../orders/<id>/pay-debt/"""
+    amount = serializers.DecimalField(max_digits=12, decimal_places=2)
+    payment_method = serializers.ChoiceField(
+        choices=[
+            ("cash", "Наличные"),
+            ("card", "Безналичный (карта)"),
+            ("transfer", "Безналичный (перевод)"),
+        ],
+    )
+    idempotency_key = serializers.UUIDField()
+    note = serializers.CharField(required=False, allow_blank=True, default="")
+    cash_received = serializers.DecimalField(
+        max_digits=12, decimal_places=2, required=False, allow_null=True,
+        help_text="Для cash: принято наличными (не меньше amount).",
+    )
+
+    def validate_amount(self, v):
+        if v is None or v <= 0:
+            raise serializers.ValidationError("Сумма должна быть больше нуля.")
+        return v
+
+    def validate(self, attrs):
+        if attrs.get("payment_method") == "cash":
+            cr = attrs.get("cash_received")
+            if cr is None:
+                raise serializers.ValidationError({"cash_received": "Для наличных укажите cash_received."})
+            if cr < attrs["amount"]:
+                raise serializers.ValidationError({"cash_received": "Меньше суммы платежа."})
+        return attrs
 
 class InventoryItemSerializer(serializers.ModelSerializer):
     product_title = serializers.CharField(source="product.title", read_only=True)

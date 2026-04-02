@@ -674,7 +674,10 @@ class Product(models.Model):
         "Единица измерения",
         max_length=32,
         default="шт.",
-        help_text="Вводится вручную: шт., кг, м, упак., л и т.д.",
+        help_text=(
+            "Вводится вручную: шт., кг, м, упак., пачка, л и т.д. "
+            "Если остаток ведёте в пачках — укажите пачку/упак.; цена и закупка тогда за одну такую единицу."
+        ),
     )
     is_weight = models.BooleanField(
         "Весовой товар",
@@ -686,7 +689,10 @@ class Product(models.Model):
         "Количество/Остаток",
         max_digits=12,
         decimal_places=2,
-        default=0, null=True, blank=True
+        default=0,
+        null=True,
+        blank=True,
+        help_text="В единицах unit (например пачки или шт.); поштучная продажа из пачки — через ProductPackage и sale_package на кассе.",
     )
 
     # ---- Цены / наценка / скидка ----
@@ -695,6 +701,11 @@ class Product(models.Model):
         max_digits=11,
         decimal_places=3,
         default=0,
+        help_text=(
+            "За одну учётную единицу товара (как в поле «Количество/Остаток» и unit). "
+            "Если остаток в пачках и заведена упаковка ProductPackage для поштучной продажи "
+            "(например сигареты), закупка указывается за пачку; закупка за штуку на кассе = закупка пачки / quantity_in_package."
+        ),
     )
     markup_percent = models.DecimalField(
         "Наценка, %",
@@ -708,7 +719,11 @@ class Product(models.Model):
         max_digits=10,
         decimal_places=3,
         default=0,
-        help_text="Считается автоматически из закупки и наценки",
+        help_text=(
+            "За одну учётную единицу (как остаток). При продаже поштучно из пачки через sale_package "
+            "цена за штуку = эта цена / quantity_in_package соответствующей упаковки. "
+            "Иначе считается из закупки и наценки, если не задана вручную."
+        ),
     )
     discount_percent = models.DecimalField(
         "Скидка, %",
