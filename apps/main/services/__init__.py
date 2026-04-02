@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import defaultdict
 from decimal import Decimal
 
 from django.db import transaction
@@ -36,16 +37,25 @@ def checkout_cart(cart: Cart, department=None) -> Sale:
     prod_ids = [it.product_id for it in items if it.product_id]
     products = {p.id: p for p in Product.objects.select_for_update().filter(id__in=prod_ids)}
 
+    consume_by_pid: dict = defaultdict(lambda: Decimal("0"))
     for it in items:
         if not it.product_id:
             continue
+        if it.product_id not in products:
+            raise ValueError("Товар позиции не найден.")
         try:
-            qty_need = cart_item_stock_consume_units(it)
+            consume_by_pid[it.product_id] += cart_item_stock_consume_units(it)
         except ValueError as e:
             raise ValueError(str(e)) from e
-        p = products.get(it.product_id)
-        if not p:
-            raise ValueError("Товар позиции не найден.")
+
+    for pid, need in consume_by_pid.items():
+        p = products[pid]
+        have = Decimal(str(p.quantity or 0))
+        if need > have:
+            raise NotEnoughStock(
+                f"Недостаточно остатка для «{getattr(p, 'name', '') or p.id}». "
+                f"Требуется {need} (в учётных единицах склада), доступно {have}."
+            )
 
     sale = Sale.objects.create(
         company=cart.company,
