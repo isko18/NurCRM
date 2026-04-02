@@ -1106,6 +1106,18 @@ class ProductPackage(models.Model):
         help_text="Если пусто — берём единицу товара",
     )
 
+    piece_unit_price = models.DecimalField(
+        "Цена за штуку (поштучно)",
+        max_digits=10,
+        decimal_places=2,
+        null=True,
+        blank=True,
+        help_text=(
+            "Розничная цена одной штуки при продаже через sale_package на кассе. "
+            "Если задано — используется вместо product.price / quantity_in_package."
+        ),
+    )
+
     created_at = models.DateTimeField("Создано", auto_now_add=True)
 
     class Meta:
@@ -1120,6 +1132,8 @@ class ProductPackage(models.Model):
             raise ValidationError(
                 {"quantity_in_package": "Количество в упаковке должно быть больше 0."}
             )
+        if self.piece_unit_price is not None and Decimal(str(self.piece_unit_price)) < 0:
+            raise ValidationError({"piece_unit_price": "Цена за штуку не может быть отрицательной."})
 
         if self.product_id:
             if self.company_id and self.product.company_id != self.company_id:
@@ -1587,8 +1601,14 @@ class CartItem(models.Model):
             self.branch_id = self.cart.branch_id
 
         if self.unit_price is None:
-            # Product.price может иметь 3 знака после запятой, а unit_price — 2.
-            self.unit_price = self.product.price if self.product else Decimal("0")
+            if self.product_id and self.sale_package_id:
+                from apps.main.pos_utils import default_unit_price_for_package
+
+                sp = self.sale_package
+                self.unit_price = default_unit_price_for_package(self.product, sp)
+            else:
+                # Product.price может иметь 3 знака после запятой, а unit_price — 2.
+                self.unit_price = self.product.price if self.product else Decimal("0")
         # На всякий случай нормализуем в денежный формат (2 знака)
         self.unit_price = _money(self.unit_price)
         if hasattr(self, "line_discount"):

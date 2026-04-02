@@ -385,7 +385,7 @@ class ProductCharacteristicsAdmin(admin.ModelAdmin):
 
 @admin.register(ProductPackage)
 class ProductPackageAdmin(admin.ModelAdmin):
-    list_display = ("product", "name", "quantity_in_package", "unit", "company", "branch", "created_at")
+    list_display = ("product", "name", "quantity_in_package", "piece_unit_price", "unit", "company", "branch", "created_at")
     list_filter = ("company", "branch")
     search_fields = ("product__name", "product__barcode", "name")
     list_select_related = ("product", "company", "branch")

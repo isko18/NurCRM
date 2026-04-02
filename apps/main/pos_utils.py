@@ -54,10 +54,13 @@ def line_qty_consume_units(qty: Decimal, sale_package) -> Decimal:
 
 
 def default_unit_price_for_package(product, sale_package) -> Decimal:
-    """Цена за штуку при продаже из пачки: цена пачки / штук в пачке."""
+    """Цена за штуку при продаже из пачки: приоритет piece_unit_price упаковки, иначе цена пачки / штук в пачке."""
     pack_price = Decimal(str(getattr(product, "price", None) or 0))
     if sale_package is None:
         return money(pack_price)
+    piece = getattr(sale_package, "piece_unit_price", None)
+    if piece is not None:
+        return money(Decimal(str(piece)))
     ipp = Decimal(str(getattr(sale_package, "quantity_in_package", None) or 0))
     if ipp <= 0:
         return money(pack_price)

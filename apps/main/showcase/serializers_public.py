@@ -15,7 +15,7 @@ class PublicCompanySerializer(serializers.ModelSerializer):
 class PublicProductPackageSerializer(serializers.ModelSerializer):
     class Meta:
         model = ProductPackage
-        fields = ["id", "name", "quantity_in_package", "unit"]
+        fields = ["id", "name", "quantity_in_package", "unit", "piece_unit_price"]
 
 
 class PublicProductCharacteristicsSerializer(serializers.ModelSerializer):

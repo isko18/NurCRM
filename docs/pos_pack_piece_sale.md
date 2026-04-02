@@ -2,7 +2,18 @@
 
 Документ описывает, как в Market POS учитывается товар, у которого **остаток на складе ведётся в пачках** (или другой «упаковке»), а на кассе нужно продавать **отдельные штуки**.
 
-Связанные файлы в коде: `apps/main/models.py` (`ProductPackage`, `CartItem.sale_package`, `SaleItem.sale_package`), `apps/main/pos_utils.py`, `apps/main/services/__init__.py` (`checkout_cart`), `apps/main/pos_views.py` (`SaleAddItemAPIView`).
+Связанные файлы в коде: `apps/main/models.py` (`Product`, `ProductPackage`, `CartItem.sale_package`, `SaleItem.sale_package`), `apps/main/serializers.py` (`ProductSerializer`: поля `price`, `purchase_price`), `apps/main/pos_utils.py`, `apps/main/services/__init__.py` (`checkout_cart`), `apps/main/pos_views.py` (`SaleAddItemAPIView`).
+
+---
+
+## Создание товара в main (CRM): цена и закупка за учётную единицу
+
+**Правило:** поля `Product.price` и `Product.purchase_price` задаются **за одну учётную единицу** — ту же, в которой ведётся `Product.quantity` и которая отражена в `Product.unit`.
+
+- Если остаток в **пачках** (сигареты и т.п.), в карточке указывают, например, `unit` = пачка/упак., `quantity` = число пачек, **`price` / `purchase_price` = за одну пачку**.
+- Для поштучной продажи на кассе заводят `ProductPackage` с `quantity_in_package` и обязательным **`piece_unit_price`** — **розничная цена одной штуки**, задаётся вручную в CRM (поле в упаковке). При создании/обновлении товара через API, если передаётся хотя бы одна упаковка в `packages_input`, у **каждой** строки должен быть заполнен `piece_unit_price` (≥ 0).
+
+В коде семантика «цена за пачку» на товаре зафиксирована в **`help_text`** у полей `Product` и в `ProductSerializer`.
 
 ---
 
@@ -24,8 +35,11 @@
 | `product` | Товар, к которому относится упаковка |
 | `name` | Подпись (например, «Пачка») |
 | `quantity_in_package` | **Сколько «штук» в одной учётной единице** (для сигарет в пачке — обычно `20`) |
+| `piece_unit_price` | **Цена продажи за одну штуку** при строке с `sale_package`; задаётся вручную при заведении упаковки в CRM |
 
 `quantity_in_package` **обязан быть > 0**, иначе поштучная продажа по этой упаковке невозможна (ошибка при чекауте и при проверке остатка).
+
+**Устаревшие записи** в БД с `piece_unit_price = null`: на кассе цена за штуку по умолчанию считается как `product.price / quantity_in_package`, пока карточку не обновят с явным `piece_unit_price`.
 
 ---
 
@@ -60,11 +74,14 @@
 
 ## Цены и закупка
 
-- **Цена по умолчанию за штуку** (если не передали `unit_price`):  
-  `default_unit_price_for_package` = **`product.price / quantity_in_package`** (цена пачки делится на число штук в пачке).
-- **Минимальная продажная (без скидки на строку):** закупочная за штуку = **`purchase_price / quantity_in_package`** (аналогично в `CartItem.clean` и в `SaleAddItemAPIView`).
+- **Цена по умолчанию за штуку на кассе** (если не передали `unit_price` в `add-item`):  
+  - если у упаковки задан **`piece_unit_price`** — используется он;  
+  - иначе (старые данные) — **`product.price / quantity_in_package`**.
+- **Минимальная продажная (без скидки на строку):** закупочная за штуку = **`purchase_price / quantity_in_package`** (`CartItem.clean`, `SaleAddItemAPIView`).
 
-Эффективная цена за штуку по-прежнему:  
+В запросе **add-item** поле **`unit_price`** по-прежнему переопределяет цену за штуку для этой операции.
+
+Эффективная цена за штуку по строке:  
 `unit_price - (line_discount / quantity)`.
 
 ---
@@ -78,6 +95,7 @@
 | Поле | Обязательное | Описание |
 |------|--------------|----------|
 | `sale_package_id` | нет | UUID `ProductPackage` этого товара и компании. Если передан — строка считается **поштучной** из указанной упаковки. |
+| `unit_price` | нет | Явная цена за **штуку** для строки; если не передана — берётся `piece_unit_price` упаковки или расчёт от цены пачки (см. выше). |
 
 Пример: 7 сигарет из пачки по 20 шт.
 
@@ -116,8 +134,20 @@
 
 ## Чеклист для внедрения на товаре
 
-1. У товара заведена упаковка `ProductPackage` с корректным `quantity_in_package`.
-2. На кассе при продаже «шт из пачки» передаётся `sale_package_id` этой упаковки.
-3. Для продажи целыми пачками `sale_package_id` не передаётся (как раньше).
+1. В карточке товара: `unit` и остаток согласованы с тем, **за что** заданы `price` и `purchase_price` (для пачек — за пачку).
+2. У товара заведена упаковка `ProductPackage` с `quantity_in_package` и **`piece_unit_price`** (цена за штуку в CRM).
+3. На кассе при продаже «шт из пачки» передаётся `sale_package_id` этой упаковки.
+4. Для продажи целыми пачками `sale_package_id` не передаётся (как раньше).
+
+Пример фрагмента `packages_input` при создании/обновлении товара:
+
+```json
+{
+  "name": "Пачка",
+  "quantity_in_package": 20,
+  "unit": "шт.",
+  "piece_unit_price": "15.00"
+}
+```
 
 Подробности общего API корзины см. [MARKET_POS_CART_FRONTEND_API.md](./MARKET_POS_CART_FRONTEND_API.md).
