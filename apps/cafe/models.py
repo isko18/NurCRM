@@ -717,6 +717,7 @@ class Order(models.Model):
         CASH = "cash", "Наличные"
         CARD = "card", "Безналичный (карта)"
         TRANSFER = "transfer", "Безналичный (перевод)"
+        DEBT = "debt", "Долг"
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     company = models.ForeignKey(
@@ -757,6 +758,14 @@ class Order(models.Model):
     total_amount = models.DecimalField("Сумма", max_digits=12, decimal_places=2, default=Decimal("0"))
     discount_amount = models.DecimalField("Скидка", max_digits=12, decimal_places=2, default=Decimal("0"))
 
+    # Внесено по заказу (предоплата при оформлении долга + частичные погашения через pay-debt).
+    paid_amount = models.DecimalField(
+        "Оплачено по заказу", max_digits=12, decimal_places=2, default=Decimal("0"),
+        validators=[MinValueValidator(Decimal("0"))],
+    )
+    # Списание ингредиентов при первой оплате — только один раз.
+    stock_deducted = models.BooleanField("Склад списан по оплате", default=False, db_index=True)
+
     updated_at = models.DateTimeField("Обновлено", auto_now=True)
 
     class Meta:
@@ -778,6 +787,15 @@ class Order(models.Model):
             total += (it.menu_item.price or Decimal("0")) * Decimal(it.quantity or 0)
         self.total_amount = total
         return total
+
+    @property
+    def final_amount(self) -> Decimal:
+        return (self.total_amount or Decimal("0")) - (self.discount_amount or Decimal("0"))
+
+    @property
+    def balance_due(self) -> Decimal:
+        due = self.final_amount - (self.paid_amount or Decimal("0"))
+        return due.quantize(Decimal("0.01")) if due > 0 else Decimal("0")
     
     def clean(self):
         if self.company_id:
@@ -877,6 +895,7 @@ class OrderHistory(models.Model):
     payment_method = models.CharField(max_length=32, blank=True, default="")
     total_amount = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal("0"))
     discount_amount = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal("0"))
+    paid_amount = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal("0"))
 
     class Meta:
         verbose_name = 'Архив заказа'
@@ -915,6 +934,73 @@ class OrderItemHistory(models.Model):
         return f'{self.menu_item_title} × {self.quantity}'
 
 
+class OrderDebtPayment(models.Model):
+    """
+    Частичное погашение долга по заказу кафе (и при необходимости — фиксация предоплаты при открытии долга).
+    Идемпотентность: пара (order, idempotency_key) уникальна.
+    """
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    company = models.ForeignKey(
+        Company, on_delete=models.CASCADE, related_name="cafe_order_debt_payments", verbose_name="Компания"
+    )
+    branch = models.ForeignKey(
+        Branch, on_delete=models.CASCADE, related_name="cafe_order_debt_payments",
+        verbose_name="Филиал", null=True, blank=True, db_index=True,
+    )
+    order = models.ForeignKey(
+        Order, on_delete=models.CASCADE, related_name="debt_payments", verbose_name="Заказ"
+    )
+    amount = models.DecimalField(
+        "Сумма", max_digits=12, decimal_places=2, validators=[MinValueValidator(Decimal("0.01"))]
+    )
+    payment_method = models.CharField(
+        "Способ оплаты",
+        max_length=32,
+        choices=[
+            ("cash", "Наличные"),
+            ("card", "Безналичный (карта)"),
+            ("transfer", "Безналичный (перевод)"),
+        ],
+    )
+    paid_at = models.DateTimeField("Оплачено", auto_now_add=True)
+    idempotency_key = models.UUIDField("Ключ идемпотентности")
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL,
+        null=True, blank=True, related_name="cafe_order_debt_payments", verbose_name="Кассир",
+    )
+    note = models.CharField("Примечание", max_length=500, blank=True, default="")
+
+    class Meta:
+        verbose_name = "Платёж по долгу заказа кафе"
+        verbose_name_plural = "Платежи по долгам заказов кафе"
+        ordering = ["-paid_at"]
+        constraints = [
+            models.UniqueConstraint(fields=["order", "idempotency_key"], name="uniq_cafe_order_debt_payment_idem"),
+        ]
+        indexes = [
+            models.Index(fields=["company", "paid_at"]),
+            models.Index(fields=["order", "paid_at"]),
+        ]
+
+    def clean(self):
+        if self.order_id and self.company_id and self.order.company_id != self.company_id:
+            raise ValidationError({"order": "Заказ другой компании."})
+        if self.branch_id and self.order_id and self.order.branch_id not in (None, self.branch_id):
+            raise ValidationError({"branch": "Филиал платежа не совпадает с заказом."})
+
+    def save(self, *args, **kwargs):
+        if self.order_id:
+            if not self.company_id:
+                self.company_id = self.order.company_id
+            if self.branch_id is None:
+                self.branch_id = self.order.branch_id
+        self.full_clean()
+        super().save(*args, **kwargs)
+
+    def __str__(self):
+        return f"{self.amount} → order {str(self.order_id)[:8]}"
+
+
 # ==========================
 # Сигналы: архив + синхронизация задач кухни
 # ==========================
@@ -950,6 +1036,7 @@ def archive_order_before_delete(sender, instance: Order, **kwargs):
                 payment_method=instance.payment_method,
                 total_amount=instance.total_amount,
                 discount_amount=instance.discount_amount,
+                paid_amount=instance.paid_amount or Decimal("0"),
             )
         except IntegrityError:
             return

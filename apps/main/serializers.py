@@ -806,10 +806,28 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
     is_weight = serializers.BooleanField(required=False)
 
     # allow_null=True чтобы PATCH мог "очищать" значения
-    purchase_price = serializers.DecimalField(max_digits=10, decimal_places=2, required=False, allow_null=True)
+    purchase_price = serializers.DecimalField(
+        max_digits=10,
+        decimal_places=2,
+        required=False,
+        allow_null=True,
+        help_text=(
+            "За учётную единицу (как quantity на складе). Для товара «пачка» — за пачку; "
+            "при поштучной продаже через packages + sale_package закуп за шт. = это значение / quantity_in_package."
+        ),
+    )
     # model.Product.markup_percent имеет decimal_places=4
     markup_percent = serializers.DecimalField(max_digits=12, decimal_places=4, required=False, allow_null=True)
-    price = serializers.DecimalField(max_digits=10, decimal_places=2, required=False, allow_null=True)
+    price = serializers.DecimalField(
+        max_digits=10,
+        decimal_places=2,
+        required=False,
+        allow_null=True,
+        help_text=(
+            "Розница за учётную единицу (как quantity). Для пачки сигарет — цена пачки; "
+            "на кассе за штуку по умолчанию = price / quantity_in_package выбранной упаковки."
+        ),
+    )
     discount_percent = serializers.DecimalField(max_digits=12, decimal_places=2, required=False, allow_null=True)
 
     country = serializers.CharField(required=False, allow_blank=True)

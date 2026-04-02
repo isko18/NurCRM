@@ -27,7 +27,7 @@ from .views import (
     EquipmentListCreateView, EquipmentRetrieveUpdateDestroyView,
     EquipmentInventorySessionListCreateView, EquipmentInventorySessionRetrieveView, EquipmentInventorySessionConfirmView,
 
-    KitchenListCreateView, KitchenRetrieveUpdateDestroyView, OrderClosedListView, OrderPayView
+    KitchenListCreateView, KitchenRetrieveUpdateDestroyView, OrderClosedListView, OrderPayView, OrderPayDebtView,
 )
 
 from apps.cafe.analytics import (
@@ -90,6 +90,7 @@ urlpatterns = [
     path("orders/<uuid:pk>/", OrderRetrieveUpdateDestroyView.as_view(), name="order-detail"),
 
     path("orders/<uuid:pk>/pay/", OrderPayView.as_view(), name="cafe_order_pay"),
+    path("orders/<uuid:pk>/pay-debt/", OrderPayDebtView.as_view(), name="cafe_order_pay_debt"),
     path("orders/closed/", OrderClosedListView.as_view(), name="cafe_orders_closed"),
     # Общая история заказов компании
     path("orders/history/", OrderHistoryListView.as_view(), name="order-history"),

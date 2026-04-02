@@ -1,4 +1,5 @@
 # apps/cafe/tests.py
+import uuid
 from decimal import Decimal
 from django.test import TestCase, TransactionTestCase
 from django.contrib.auth import get_user_model
@@ -8,13 +9,14 @@ from rest_framework.test import APIRequestFactory, force_authenticate
 
 from apps.users.models import Company, Branch
 from apps.cafe.models import (
-    Zone, Table, Order, OrderItem, MenuItem, Category, CafeClient, Kitchen
+    Zone, Table, Order, OrderItem, MenuItem, Category, CafeClient, Kitchen, OrderDebtPayment,
 )
 from apps.cafe.views import (
     send_order_created_notification,
     send_order_updated_notification,
     send_table_status_changed_notification,
     OrderPayView,
+    OrderPayDebtView,
     OrderRetrieveUpdateDestroyView,
 )
 
@@ -706,3 +708,123 @@ class CafeOrderIntegrationTestCase(TransactionTestCase):
         
         self.table.refresh_from_db()
         self.assertEqual(self.table.status, Table.Status.FREE)
+
+
+class CafeOrderDebtAPITestCase(TransactionTestCase):
+    """Оплата в долг и частичное погашение через /pay/ и /pay-debt/."""
+
+    def setUp(self):
+        self.owner = User.objects.create_user(email="owner-debt@test.com", password="testpass123")
+        self.company = Company.objects.create(name="Debt Cafe Co", owner=self.owner)
+        self.branch = Branch.objects.create(name="Branch D", company=self.company)
+        self.user = User.objects.create_user(email="waiter-debt@test.com", password="testpass123")
+        self.user.company = self.company
+        self.user.save()
+        self.zone = Zone.objects.create(company=self.company, branch=self.branch, title="Z")
+        self.table = Table.objects.create(
+            company=self.company, branch=self.branch, zone=self.zone, number=9, places=4, status=Table.Status.BUSY
+        )
+        self.category = Category.objects.create(company=self.company, branch=self.branch, title="Drinks")
+        self.menu_item = MenuItem.objects.create(
+            company=self.company,
+            branch=self.branch,
+            category=self.category,
+            title="Tea",
+            price=Decimal("100.00"),
+            is_active=True,
+        )
+        self.cafe_client = CafeClient.objects.create(
+            company=self.company, branch=self.branch, name="Debt Guest", phone="+70001112233"
+        )
+        self.api_factory = APIRequestFactory()
+
+    def test_full_debt_then_pay_in_two_parts(self):
+        order = Order.objects.create(
+            company=self.company,
+            branch=self.branch,
+            table=self.table,
+            client=self.cafe_client,
+            waiter=self.user,
+            guests=1,
+            status=Order.Status.OPEN,
+        )
+        OrderItem.objects.create(company=self.company, order=order, menu_item=self.menu_item, quantity=3)
+
+        req = self.api_factory.post(
+            f"/cafe/orders/{order.id}/pay/",
+            {"payment_method": "debt", "discount_amount": "0.00", "close_order": True},
+            format="json",
+        )
+        force_authenticate(req, user=self.user)
+        r1 = OrderPayView.as_view()(req, pk=str(order.id))
+        self.assertEqual(r1.status_code, 200, getattr(r1, "data", r1.content))
+        self.assertFalse(r1.data["is_paid"])
+        self.assertEqual(r1.data["payment_method"], "debt")
+        self.assertEqual(Decimal(r1.data["final_amount"]), Decimal("300.00"))
+        self.assertEqual(Decimal(r1.data["balance_due"]), Decimal("300.00"))
+
+        order.refresh_from_db()
+        self.assertTrue(order.stock_deducted)
+
+        req2 = self.api_factory.post(
+            f"/cafe/orders/{order.id}/pay-debt/",
+            {
+                "amount": "100.00",
+                "payment_method": "transfer",
+                "idempotency_key": str(uuid.uuid4()),
+            },
+            format="json",
+        )
+        force_authenticate(req2, user=self.user)
+        r2 = OrderPayDebtView.as_view()(req2, pk=str(order.id))
+        self.assertEqual(r2.status_code, 200)
+        self.assertEqual(Decimal(r2.data["balance_due"]), Decimal("200.00"))
+
+        req3 = self.api_factory.post(
+            f"/cafe/orders/{order.id}/pay-debt/",
+            {
+                "amount": "200.00",
+                "payment_method": "card",
+                "idempotency_key": str(uuid.uuid4()),
+            },
+            format="json",
+        )
+        force_authenticate(req3, user=self.user)
+        r3 = OrderPayDebtView.as_view()(req3, pk=str(order.id))
+        self.assertEqual(r3.status_code, 200)
+        self.assertTrue(r3.data["is_paid"])
+        self.assertEqual(Decimal(r3.data["balance_due"]), Decimal("0"))
+
+        self.assertEqual(OrderDebtPayment.objects.filter(order=order).count(), 2)
+
+    def test_prepaid_and_debt_on_pay(self):
+        order = Order.objects.create(
+            company=self.company,
+            branch=self.branch,
+            table=self.table,
+            client=self.cafe_client,
+            waiter=self.user,
+            guests=1,
+            status=Order.Status.OPEN,
+        )
+        OrderItem.objects.create(company=self.company, order=order, menu_item=self.menu_item, quantity=2)
+
+        idem = uuid.uuid4()
+        req = self.api_factory.post(
+            f"/cafe/orders/{order.id}/pay/",
+            {
+                "payment_method": "debt",
+                "prepaid_amount": "50.00",
+                "prepaid_payment_method": "cash",
+                "idempotency_key": str(idem),
+                "discount_amount": "0",
+                "close_order": True,
+            },
+            format="json",
+        )
+        force_authenticate(req, user=self.user)
+        r = OrderPayView.as_view()(req, pk=str(order.id))
+        self.assertEqual(r.status_code, 200, getattr(r, "data", r.content))
+        self.assertFalse(r.data["is_paid"])
+        self.assertEqual(Decimal(r.data["paid_amount"]), Decimal("50.00"))
+        self.assertEqual(Decimal(r.data["balance_due"]), Decimal("150.00"))
