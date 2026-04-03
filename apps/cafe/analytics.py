@@ -17,10 +17,14 @@ from django.core.cache import cache
 from django.http import HttpResponse
 from django.db.models import (
     Q, Count, Avg, Sum, F,
-    ExpressionWrapper, DurationField, DecimalField
+    ExpressionWrapper, DurationField, DecimalField, Value,
 )
+from django.db.models.functions import Coalesce
 
-from apps.cafe.models import KitchenTask, OrderItem, Purchase, Warehouse, Order
+from apps.cafe.models import (
+    KitchenTask, OrderItem, Purchase, Warehouse, Order,
+    CafeExpense, CafeWaiterPayProfile,
+)
 from apps.cafe.views import CompanyBranchQuerysetMixin
 from openpyxl import Workbook
 
@@ -80,6 +84,42 @@ def _apply_date_range(qs, field_name: str, date_from: str | None, date_to: str |
     if date_to:
         qs = qs.filter(**{f"{field_name}__date__lte": date_to})
     return qs
+
+
+def _paid_order_lines_qs(company, branch):
+    """Оплаченные заказы: выручка по факту оплаты, без отказов гостя."""
+    qs = OrderItem.objects.select_related(
+        "order", "menu_item", "menu_item__category", "menu_item__kitchen",
+    ).filter(
+        order__company=company,
+        order__is_paid=True,
+        is_rejected=False,
+    )
+    if branch is not None:
+        qs = qs.filter(order__branch=branch)
+    else:
+        qs = qs.filter(order__branch__isnull=True)
+    return qs
+
+
+def _line_revenue_expr():
+    return ExpressionWrapper(
+        F("quantity")
+        * Coalesce(
+            F("unit_price"),
+            F("menu_item__price"),
+            Value(Decimal("0")),
+            output_field=DecimalField(max_digits=14, decimal_places=2),
+        ),
+        output_field=DecimalField(max_digits=14, decimal_places=2),
+    )
+
+
+def _order_final_amount_expr():
+    return ExpressionWrapper(
+        F("total_amount") - F("discount_amount"),
+        output_field=DecimalField(max_digits=14, decimal_places=2),
+    )
 
 
 def _apply_branch_scope_for_kitchen_tasks(qs, mixin: CompanyBranchQuerysetMixin):
@@ -241,20 +281,9 @@ class SalesSummaryView(CompanyBranchQuerysetMixin, APIView):
         if hit is not None:
             return Response(hit)
 
-        qs = (OrderItem.objects
-              .select_related("order", "menu_item")
-              .filter(order__company=company, menu_item__company=company))
-
-        # продажи — строгий branch (как большинство CRUD у тебя)
-        if branch is not None:
-            qs = qs.filter(order__branch=branch)
-
-        qs = _apply_date_range(qs, "order__created_at", df, dt)
-
-        line_total = ExpressionWrapper(
-            F("quantity") * F("menu_item__price"),
-            output_field=DecimalField(max_digits=14, decimal_places=2),
-        )
+        qs = _paid_order_lines_qs(company, branch)
+        qs = _apply_date_range(qs, "order__paid_at", df, dt)
+        line_total = _line_revenue_expr()
 
         agg = qs.aggregate(
             orders_count=Count("order_id", distinct=True),
@@ -266,6 +295,7 @@ class SalesSummaryView(CompanyBranchQuerysetMixin, APIView):
         payload = {
             "date_from": df,
             "date_to": dt,
+            "basis": "paid_at",
             "orders_count": int(agg.get("orders_count") or 0),
             "items_qty": int(agg.get("items_qty") or 0),
             "revenue": f"{revenue:.2f}",
@@ -302,19 +332,12 @@ class SalesByMenuItemView(CompanyBranchQuerysetMixin, APIView):
         if hit is not None:
             return Response(hit)
 
-        qs = (OrderItem.objects
-              .select_related("order", "menu_item")
-              .filter(order__company=company, menu_item__company=company))
-
-        if branch is not None:
-            qs = qs.filter(order__branch=branch)
-
-        qs = _apply_date_range(qs, "order__created_at", df, dt)
-
-        line_total = ExpressionWrapper(
-            F("quantity") * F("menu_item__price"),
-            output_field=DecimalField(max_digits=14, decimal_places=2),
+        qs = _paid_order_lines_qs(company, branch).filter(
+            line_kind=OrderItem.LineKind.MENU,
+            menu_item_id__isnull=False,
         )
+        qs = _apply_date_range(qs, "order__paid_at", df, dt)
+        line_total = _line_revenue_expr()
 
         data = (qs.values("menu_item_id", "menu_item__title")
                   .annotate(qty=Sum("quantity"), revenue=Sum(line_total))
@@ -360,19 +383,12 @@ class SalesByCategoryView(CompanyBranchQuerysetMixin, APIView):
         if hit is not None:
             return Response(hit)
 
-        qs = (OrderItem.objects
-              .select_related("order", "menu_item", "menu_item__category")
-              .filter(order__company=company, menu_item__company=company))
-
-        if branch is not None:
-            qs = qs.filter(order__branch=branch)
-
-        qs = _apply_date_range(qs, "order__created_at", df, dt)
-
-        line_total = ExpressionWrapper(
-            F("quantity") * F("menu_item__price"),
-            output_field=DecimalField(max_digits=14, decimal_places=2),
+        qs = _paid_order_lines_qs(company, branch).filter(
+            line_kind=OrderItem.LineKind.MENU,
+            menu_item_id__isnull=False,
         )
+        qs = _apply_date_range(qs, "order__paid_at", df, dt)
+        line_total = _line_revenue_expr()
 
         data = (qs.values("menu_item__category_id", "menu_item__category__title")
                   .annotate(qty=Sum("quantity"), revenue=Sum(line_total))
@@ -389,6 +405,490 @@ class SalesByCategoryView(CompanyBranchQuerysetMixin, APIView):
             })
 
         _cache_set(key, result, _analytics_ttl())
+        return Response(result)
+
+
+class SalesByKitchenView(CompanyBranchQuerysetMixin, APIView):
+    """Выручка по кухням (из MenuItem.kitchen), только оплаченные заказы без отказов."""
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request):
+        company = self._user_company()
+        if not company:
+            return Response([])
+
+        df = request.query_params.get("date_from")
+        dt = request.query_params.get("date_to")
+        branch = self._active_branch()
+        key = _cache_key(
+            "sales:kitchens",
+            company_id=str(company.id),
+            branch_id=str(branch.id) if branch else None,
+            params={"date_from": df, "date_to": dt},
+        )
+        hit = _cache_get(key)
+        if hit is not None:
+            return Response(hit)
+
+        qs = _paid_order_lines_qs(company, branch).filter(
+            line_kind=OrderItem.LineKind.MENU,
+            menu_item_id__isnull=False,
+        )
+        qs = _apply_date_range(qs, "order__paid_at", df, dt)
+        line_total = _line_revenue_expr()
+
+        data = (
+            qs.values("menu_item__kitchen_id", "menu_item__kitchen__title", "menu_item__kitchen__number")
+            .annotate(qty=Sum("quantity"), revenue=Sum(line_total))
+            .order_by("-revenue", "-qty")
+        )
+
+        result = []
+        for row in data:
+            kid = row["menu_item__kitchen_id"]
+            result.append({
+                "kitchen_id": str(kid) if kid else None,
+                "title": row["menu_item__kitchen__title"] or "—",
+                "number": row["menu_item__kitchen__number"],
+                "qty": int(row["qty"] or 0),
+                "revenue": f"{_to_decimal(row['revenue']):.2f}",
+            })
+
+        _cache_set(key, result, _analytics_ttl())
+        return Response(result)
+
+
+class RevenueInflowView(CompanyBranchQuerysetMixin, APIView):
+    """
+    Приход по способам оплаты (как сводка маркета): только полностью оплаченные заказы, по дате paid_at.
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request):
+        company = self._user_company()
+        if not company:
+            return Response({"basis": "paid_at", "payment_methods": [], "totals": {}})
+
+        df = request.query_params.get("date_from")
+        dt = request.query_params.get("date_to")
+        branch = self._active_branch()
+
+        qs = Order.objects.filter(company=company, is_paid=True)
+        if branch is not None:
+            qs = qs.filter(branch=branch)
+        else:
+            qs = qs.filter(branch__isnull=True)
+        qs = _apply_date_range(qs, "paid_at", df, dt)
+
+        final_expr = _order_final_amount_expr()
+        rows = (
+            qs.annotate(final_amount=final_expr)
+            .values("payment_method")
+            .annotate(count=Count("id"), total=Sum("final_amount"))
+            .order_by("-total")
+        )
+
+        methods = []
+        grand = Decimal("0")
+        for row in rows:
+            m = (row.get("payment_method") or "").strip() or "unknown"
+            t = _to_decimal(row.get("total"))
+            grand += t
+            methods.append({
+                "method": m,
+                "method_label": dict(Order.PaymentMethod.choices).get(m, m),
+                "count": int(row.get("count") or 0),
+                "total": f"{t:.2f}",
+            })
+
+        return Response({
+            "date_from": df,
+            "date_to": dt,
+            "basis": "paid_at",
+            "payment_methods": methods,
+            "grand_total": f"{grand:.2f}",
+        })
+
+
+class RejectionsAnalyticsView(CompanyBranchQuerysetMixin, APIView):
+    """Отказы гостя: количество и суммы (по цене на момент отказа не пересчитываем — считаем потенциальную выручку)."""
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request):
+        company = self._user_company()
+        if not company:
+            return Response([])
+
+        df = request.query_params.get("date_from")
+        dt = request.query_params.get("date_to")
+        branch = self._active_branch()
+
+        qs = OrderItem.objects.select_related("order", "menu_item").filter(
+            company=company,
+            is_rejected=True,
+        )
+        if branch is not None:
+            qs = qs.filter(Q(order__branch=branch) | Q(order__branch__isnull=True))
+        else:
+            qs = qs.filter(order__branch__isnull=True)
+        qs = _apply_date_range(qs, "rejected_at", df, dt)
+
+        line_total = _line_revenue_expr()
+        by_reason = (
+            qs.values("rejection_reason")
+            .annotate(qty=Sum("quantity"), lost_revenue=Sum(line_total))
+            .order_by("-lost_revenue")[:200]
+        )
+
+        return Response([
+            {
+                "rejection_reason": (row["rejection_reason"] or "").strip() or "—",
+                "qty": int(row["qty"] or 0),
+                "lost_revenue": f"{_to_decimal(row['lost_revenue']):.2f}",
+            }
+            for row in by_reason
+        ])
+
+
+class CafeExpensesSummaryView(CompanyBranchQuerysetMixin, APIView):
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request):
+        company = self._user_company()
+        if not company:
+            return Response({"expenses_count": 0, "expenses_sum": "0.00"})
+
+        df = request.query_params.get("date_from")
+        dt = request.query_params.get("date_to")
+        branch = self._active_branch()
+
+        qs = CafeExpense.objects.filter(company=company)
+        if branch is not None:
+            qs = qs.filter(Q(branch=branch) | Q(branch__isnull=True))
+        else:
+            qs = qs.filter(branch__isnull=True)
+        qs = _apply_date_range(qs, "expense_date", df, dt)
+
+        agg = qs.aggregate(c=Count("id"), s=Sum("amount"))
+        return Response({
+            "date_from": df,
+            "date_to": dt,
+            "expenses_count": int(agg.get("c") or 0),
+            "expenses_sum": f"{_to_decimal(agg.get('s')):.2f}",
+        })
+
+
+class CafeDebtAnalyticsView(CompanyBranchQuerysetMixin, APIView):
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request):
+        company = self._user_company()
+        if not company:
+            return Response({"open_debt_orders": 0, "balance_due_total": "0.00", "rows": []})
+
+        branch = self._active_branch()
+        qs = (
+            Order.objects.filter(company=company, is_paid=False)
+            .exclude(status=Order.Status.CANCELLED)
+            .select_related("client", "table", "waiter")
+        )
+        if branch is not None:
+            qs = qs.filter(branch=branch)
+        else:
+            qs = qs.filter(branch__isnull=True)
+
+        rows_out = []
+        total_due = Decimal("0")
+        for o in qs.order_by("-created_at")[:500]:
+            due = o.balance_due
+            if due <= 0:
+                continue
+            total_due += due
+            rows_out.append({
+                "order_id": str(o.id),
+                "created_at": o.created_at,
+                "client_id": str(o.client_id) if o.client_id else None,
+                "table_id": str(o.table_id) if o.table_id else None,
+                "waiter_id": str(o.waiter_id) if o.waiter_id else None,
+                "final_amount": str(o.final_amount),
+                "paid_amount": str(o.paid_amount or Decimal("0")),
+                "balance_due": str(due),
+                "payment_method": o.payment_method,
+            })
+
+        return Response({
+            "open_debt_orders": len(rows_out),
+            "balance_due_total": f"{total_due:.2f}",
+            "rows": rows_out,
+        })
+
+
+class CafeShiftReportView(CompanyBranchQuerysetMixin, APIView):
+    """Сводка по кафе для кассовой смены: заказы с привязкой cash_shift_id."""
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request):
+        from apps.construction.models import CashShift
+
+        company = self._user_company()
+        if not company:
+            return Response({"detail": "Компания не найдена."}, status=403)
+
+        shift_id = request.query_params.get("shift")
+        if not shift_id:
+            return Response({"detail": "Укажите query-параметр shift=<uuid>."}, status=400)
+
+        shift = CashShift.objects.filter(pk=shift_id, company=company).first()
+        if not shift:
+            return Response({"detail": "Смена не найдена."}, status=404)
+
+        branch = self._active_branch()
+        qs = Order.objects.filter(company=company, cash_shift_id=shift.id, is_paid=True)
+        if branch is not None:
+            qs = qs.filter(branch=branch)
+
+        final_expr = _order_final_amount_expr()
+        by_pm = (
+            qs.annotate(fa=final_expr)
+            .values("payment_method")
+            .annotate(count=Count("id"), total=Sum("fa"))
+        )
+
+        methods = []
+        g = Decimal("0")
+        for row in by_pm:
+            m = (row.get("payment_method") or "").strip() or "unknown"
+            t = _to_decimal(row.get("total"))
+            g += t
+            methods.append({
+                "method": m,
+                "method_label": dict(Order.PaymentMethod.choices).get(m, m),
+                "count": int(row.get("count") or 0),
+                "total": f"{t:.2f}",
+            })
+
+        return Response({
+            "shift_id": str(shift.id),
+            "shift_status": shift.status,
+            "opened_at": shift.opened_at,
+            "closed_at": shift.closed_at,
+            "cafe_orders_paid": qs.count(),
+            "revenue_total": f"{g:.2f}",
+            "by_payment_method": methods,
+        })
+
+
+class CafeDailyCloseReportView(CompanyBranchQuerysetMixin, APIView):
+    """Ежедневный отчёт: оплаченные заказы кафе за календарную дату (paid_at)."""
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request):
+        company = self._user_company()
+        if not company:
+            return Response({"detail": "Компания не найдена."}, status=403)
+
+        day = request.query_params.get("date")
+        if not day:
+            return Response({"detail": "Укажите date=YYYY-MM-DD."}, status=400)
+
+        branch = self._active_branch()
+        qs = Order.objects.filter(company=company, is_paid=True, paid_at__date=day)
+        if branch is not None:
+            qs = qs.filter(branch=branch)
+        else:
+            qs = qs.filter(branch__isnull=True)
+
+        final_expr = _order_final_amount_expr()
+        by_pm = (
+            qs.annotate(fa=final_expr)
+            .values("payment_method")
+            .annotate(count=Count("id"), total=Sum("fa"))
+        )
+        methods = []
+        g = Decimal("0")
+        for row in by_pm:
+            m = (row.get("payment_method") or "").strip() or "unknown"
+            t = _to_decimal(row.get("total"))
+            g += t
+            methods.append({
+                "method": m,
+                "method_label": dict(Order.PaymentMethod.choices).get(m, m),
+                "count": int(row.get("count") or 0),
+                "total": f"{t:.2f}",
+            })
+
+        return Response({
+            "date": day,
+            "orders_count": qs.count(),
+            "revenue_total": f"{g:.2f}",
+            "by_payment_method": methods,
+        })
+
+
+class CafeWaiterSalaryReportView(CompanyBranchQuerysetMixin, APIView):
+    """
+    Расчёт: пропорциональный оклад за период (monthly_base * days / 30) + revenue_percent% от выручки
+    по заказам официанта (оплачено, paid_at, итог после скидки).
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request):
+        company = self._user_company()
+        df = request.query_params.get("date_from")
+        dt = request.query_params.get("date_to")
+        if not company:
+            return Response({"date_from": df, "date_to": dt, "rows": []})
+
+        if not df or not dt:
+            return Response({"detail": "Нужны date_from и date_to (YYYY-MM-DD)."}, status=400)
+
+        branch = self._active_branch()
+        from datetime import date as date_cls
+
+        try:
+            d0 = date_cls.fromisoformat(df)
+            d1 = date_cls.fromisoformat(dt)
+        except ValueError:
+            return Response({"detail": "Неверный формат даты."}, status=400)
+
+        days = (d1 - d0).days + 1
+        if days < 1:
+            return Response({"detail": "date_to раньше date_from."}, status=400)
+
+        prof_qs = CafeWaiterPayProfile.objects.filter(company=company)
+        if branch is not None:
+            prof_qs = prof_qs.filter(Q(branch=branch) | Q(branch__isnull=True))
+        else:
+            prof_qs = prof_qs.filter(branch__isnull=True)
+
+        final_expr = _order_final_amount_expr()
+        out = []
+        effective_profiles = {}
+        for prof in prof_qs.select_related("user").order_by("user_id", "-branch_id"):
+            # Для филиала предпочитаем branch-specific профиль над глобальным.
+            if prof.user_id not in effective_profiles or prof.branch_id is not None:
+                effective_profiles[prof.user_id] = prof
+
+        for prof in effective_profiles.values():
+            oq = Order.objects.filter(
+                company=company,
+                waiter_id=prof.user_id,
+                is_paid=True,
+            )
+            if branch is not None:
+                oq = oq.filter(branch=branch)
+            else:
+                oq = oq.filter(branch__isnull=True)
+            oq = _apply_date_range(oq, "paid_at", df, dt)
+            agg = oq.aggregate(s=Sum(final_expr))
+            waiter_rev = _to_decimal(agg.get("s"))
+            base_part = (prof.monthly_base_salary or Decimal("0")) * Decimal(days) / Decimal("30")
+            pct = (prof.revenue_percent or Decimal("0")) / Decimal("100")
+            bonus = (waiter_rev * pct).quantize(Decimal("0.01"))
+            total_pay = (base_part + bonus).quantize(Decimal("0.01"))
+            user = prof.user
+            waiter_label = (
+                getattr(user, "get_full_name", lambda: "")() or getattr(user, "email", "") or str(prof.user_id)
+            )
+            out.append({
+                "user_id": str(prof.user_id),
+                "waiter_label": waiter_label,
+                "profile_scope": "branch" if prof.branch_id else "global",
+                "monthly_base_salary": str(prof.monthly_base_salary),
+                "revenue_percent": str(prof.revenue_percent),
+                "period_days": days,
+                "base_prorated": f"{base_part.quantize(Decimal('0.01')):.2f}",
+                "waiter_revenue_period": f"{waiter_rev:.2f}",
+                "percent_bonus": f"{bonus:.2f}",
+                "total": f"{total_pay:.2f}",
+            })
+
+        return Response({"date_from": df, "date_to": dt, "rows": out})
+
+
+class CafeUnifiedAnalyticsView(CompanyBranchQuerysetMixin, APIView):
+    """
+    Единая точка аналитики кафе (по аналогии с маркетом): tab=revenue|dishes|kitchens|waiters|...
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request):
+        tab = (request.query_params.get("tab") or "revenue").strip().lower()
+        company = self._user_company()
+        if not company:
+            return Response({"tab": tab, "detail": "Компания не найдена."}, status=403)
+
+        http_req = getattr(request, "_request", request)
+
+        if tab == "revenue":
+            return RevenueInflowView.as_view()(http_req)
+        if tab == "dishes":
+            return SalesByMenuItemView.as_view()(http_req)
+        if tab == "kitchens":
+            return SalesByKitchenView.as_view()(http_req)
+        if tab == "waiters":
+            return CafeWaiterSalesView.as_view()(http_req)
+        if tab == "sales_summary":
+            return SalesSummaryView.as_view()(http_req)
+        if tab == "categories":
+            return SalesByCategoryView.as_view()(http_req)
+        if tab == "purchases":
+            return PurchasesSummaryView.as_view()(http_req)
+        if tab == "expenses":
+            return CafeExpensesSummaryView.as_view()(http_req)
+        if tab == "debts":
+            return CafeDebtAnalyticsView.as_view()(http_req)
+        if tab == "rejections":
+            return RejectionsAnalyticsView.as_view()(http_req)
+        if tab == "salary":
+            return CafeWaiterSalaryReportView.as_view()(http_req)
+        if tab == "daily_close":
+            return CafeDailyCloseReportView.as_view()(http_req)
+        if tab == "shift":
+            return CafeShiftReportView.as_view()(http_req)
+
+        return Response({"detail": f"Неизвестный tab={tab}"}, status=400)
+
+
+class CafeWaiterSalesView(CompanyBranchQuerysetMixin, APIView):
+    """Выручка по официантам (оплаченные заказы, итог после скидки, paid_at)."""
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request):
+        company = self._user_company()
+        if not company:
+            return Response([])
+
+        df = request.query_params.get("date_from")
+        dt = request.query_params.get("date_to")
+        branch = self._active_branch()
+
+        qs = Order.objects.filter(company=company, is_paid=True)
+        if branch is not None:
+            qs = qs.filter(branch=branch)
+        else:
+            qs = qs.filter(branch__isnull=True)
+        qs = _apply_date_range(qs, "paid_at", df, dt)
+
+        final_expr = _order_final_amount_expr()
+        data = (
+            qs.values("waiter_id", "waiter__first_name", "waiter__last_name", "waiter__email")
+            .annotate(orders_count=Count("id"), revenue=Sum(final_expr))
+            .order_by("-revenue")
+        )
+
+        result = []
+        for row in data:
+            wid = row["waiter_id"]
+            full_name = " ".join(
+                part for part in [row.get("waiter__first_name") or "", row.get("waiter__last_name") or ""] if part
+            ).strip()
+            result.append({
+                "waiter_id": str(wid) if wid else None,
+                "waiter_label": full_name or (row.get("waiter__email") or "") or (str(wid) if wid else "—"),
+                "orders_count": int(row["orders_count"] or 0),
+                "revenue": f"{_to_decimal(row['revenue']):.2f}",
+            })
         return Response(result)
 
 
@@ -556,26 +1056,23 @@ class CafeAnalyticsExportView(CompanyBranchQuerysetMixin, APIView):
     renderer_classes = [JSONRenderer, _BinaryExcelRenderer, _BinaryWordRenderer]
 
     def _analytics_payload(self, company, branch, date_from, date_to):
-        qs_items = (
-            OrderItem.objects
-            .select_related("order", "menu_item")
-            .filter(order__company=company, menu_item__company=company)
-        )
+        qs_items = _paid_order_lines_qs(company, branch)
         qs_purchases = Purchase.objects.filter(company=company)
         qs_warehouse = Warehouse.objects.filter(company=company)
+        qs_exp = CafeExpense.objects.filter(company=company)
 
         if branch is not None:
-            qs_items = qs_items.filter(order__branch=branch)
             qs_purchases = qs_purchases.filter(branch=branch)
             qs_warehouse = qs_warehouse.filter(branch=branch)
+            qs_exp = qs_exp.filter(Q(branch=branch) | Q(branch__isnull=True))
+        else:
+            qs_exp = qs_exp.filter(branch__isnull=True)
 
-        qs_items = _apply_date_range(qs_items, "order__created_at", date_from, date_to)
+        qs_items = _apply_date_range(qs_items, "order__paid_at", date_from, date_to)
         qs_purchases = _apply_date_range(qs_purchases, "created_at", date_from, date_to)
+        qs_exp = _apply_date_range(qs_exp, "expense_date", date_from, date_to)
 
-        line_total = ExpressionWrapper(
-            F("quantity") * F("menu_item__price"),
-            output_field=DecimalField(max_digits=14, decimal_places=2),
-        )
+        line_total = _line_revenue_expr()
 
         sales_agg = qs_items.aggregate(
             orders_count=Count("order_id", distinct=True),
@@ -586,6 +1083,7 @@ class CafeAnalyticsExportView(CompanyBranchQuerysetMixin, APIView):
             purchases_count=Count("id"),
             purchases_sum=Sum("price"),
         )
+        exp_agg = qs_exp.aggregate(expenses_count=Count("id"), expenses_sum=Sum("amount"))
 
         low_stock_count = 0
         for w in qs_warehouse.only("remainder", "minimum"):
@@ -595,7 +1093,8 @@ class CafeAnalyticsExportView(CompanyBranchQuerysetMixin, APIView):
                 low_stock_count += 1
 
         top_items_qs = (
-            qs_items.values("menu_item__title")
+            qs_items.filter(line_kind=OrderItem.LineKind.MENU, menu_item_id__isnull=False)
+            .values("menu_item__title")
             .annotate(qty=Sum("quantity"), revenue=Sum(line_total))
             .order_by("-revenue", "-qty")[:10]
         )
@@ -603,11 +1102,14 @@ class CafeAnalyticsExportView(CompanyBranchQuerysetMixin, APIView):
         return {
             "date_from": date_from or "",
             "date_to": date_to or "",
+            "basis": "paid_at",
             "orders_count": int(sales_agg.get("orders_count") or 0),
             "items_qty": int(sales_agg.get("items_qty") or 0),
             "revenue": f"{_to_decimal(sales_agg.get('revenue')):.2f}",
             "purchases_count": int(purchases_agg.get("purchases_count") or 0),
             "purchases_sum": f"{_to_decimal(purchases_agg.get('purchases_sum')):.2f}",
+            "cafe_expenses_count": int(exp_agg.get("expenses_count") or 0),
+            "cafe_expenses_sum": f"{_to_decimal(exp_agg.get('expenses_sum')):.2f}",
             "low_stock_count": low_stock_count,
             "top_items": [
                 {
@@ -678,11 +1180,14 @@ class CafeAnalyticsExportView(CompanyBranchQuerysetMixin, APIView):
             ws.append(["Cafe analytics report"])
             ws.append(["date_from", payload["date_from"]])
             ws.append(["date_to", payload["date_to"]])
+            ws.append(["basis", payload.get("basis", "paid_at")])
             ws.append(["orders_count", payload["orders_count"]])
             ws.append(["items_qty", payload["items_qty"]])
             ws.append(["revenue", payload["revenue"]])
             ws.append(["purchases_count", payload["purchases_count"]])
             ws.append(["purchases_sum", payload["purchases_sum"]])
+            ws.append(["cafe_expenses_count", payload.get("cafe_expenses_count", 0)])
+            ws.append(["cafe_expenses_sum", payload.get("cafe_expenses_sum", "0.00")])
             ws.append(["low_stock_count", payload["low_stock_count"]])
             ws.append([])
             ws.append(["Top menu items"])
@@ -718,11 +1223,14 @@ class CafeAnalyticsExportView(CompanyBranchQuerysetMixin, APIView):
 <h2>Cafe analytics report</h2>
 <p>date_from: {payload["date_from"]}</p>
 <p>date_to: {payload["date_to"]}</p>
+<p>basis: {payload.get("basis", "paid_at")}</p>
 <p>orders_count: {payload["orders_count"]}</p>
 <p>items_qty: {payload["items_qty"]}</p>
 <p>revenue: {payload["revenue"]}</p>
 <p>purchases_count: {payload["purchases_count"]}</p>
 <p>purchases_sum: {payload["purchases_sum"]}</p>
+<p>cafe_expenses_count: {payload.get("cafe_expenses_count", 0)}</p>
+<p>cafe_expenses_sum: {payload.get("cafe_expenses_sum", "0.00")}</p>
 <p>low_stock_count: {payload["low_stock_count"]}</p>
 <h3>Top menu items</h3>
 <table border="1" cellspacing="0" cellpadding="4">

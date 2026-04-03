@@ -22,7 +22,7 @@ from decimal import Decimal, ROUND_HALF_UP
 from datetime import timedelta, datetime, date, time as dtime
 import io, os, uuid
 
-from django.db.models import Q, F, Value as V, Sum
+from django.db.models import Q, F, Value as V, Sum, Prefetch
 from django.db.models.functions import Coalesce
 from django.utils.timezone import is_aware, make_aware, get_current_timezone
 
@@ -57,7 +57,6 @@ from .pos_utils import (
     line_qty_consume_units,
     default_unit_price_for_package,
     total_cart_consume_packs_for_product,
-    cart_item_stock_consume_units,
 )
 
 from .pos_serializers import (
@@ -131,6 +130,29 @@ def _set_font(p, name: str, size: int, fallback: str = "Helvetica"):
 # Алиасы для обратной совместимости (используются в коде)
 _to_decimal = to_decimal
 _as_decimal = as_decimal
+
+
+def _cart_queryset_for_response():
+    item_qs = (
+        CartItem.objects.select_related("product", "sale_package")
+        .prefetch_related("product__images")
+        .order_by("id")
+    )
+    return Cart.objects.select_related("shift").prefetch_related(
+        Prefetch("items", queryset=item_qs)
+    )
+
+
+def _cart_response(request, cart_id, *, status_code=status.HTTP_200_OK):
+    cart = get_object_or_404(
+        _cart_queryset_for_response(),
+        id=cart_id,
+        company=request.user.company,
+    )
+    return Response(
+        SaleCartSerializer(cart, context={"request": request}).data,
+        status=status_code,
+    )
 
 
 def _aware(dt_or_date, end=False):
@@ -1189,7 +1211,7 @@ class SaleStartAPIView(MarketCashierOnlyMixin, CompanyBranchRestrictedMixin, API
         cart.save(update_fields=["order_discount_total", "order_discount_percent", "updated_at"])
 
         cart.recalc()
-        return Response(SaleCartSerializer(cart).data, status=status.HTTP_201_CREATED)
+        return _cart_response(request, cart.id, status_code=status.HTTP_201_CREATED)
 
 
 class CartDetailAPIView(MarketCashierOnlyMixin, generics.RetrieveAPIView):
@@ -1197,7 +1219,7 @@ class CartDetailAPIView(MarketCashierOnlyMixin, generics.RetrieveAPIView):
     permission_classes = [permissions.IsAuthenticated]
 
     def get_queryset(self):
-        return Cart.objects.filter(company=self.request.user.company)
+        return _cart_queryset_for_response().filter(company=self.request.user.company)
 
     def patch(self, request, *args, **kwargs):
         """Обновить скидку на чек: order_discount_total или order_discount_percent."""
@@ -1217,7 +1239,7 @@ class CartDetailAPIView(MarketCashierOnlyMixin, generics.RetrieveAPIView):
         if order_disc_total is not None or order_disc_percent is not None:
             cart.save(update_fields=["order_discount_total", "order_discount_percent", "updated_at"])
         cart.recalc()
-        return Response(SaleCartSerializer(cart).data, status=200)
+        return _cart_response(request, cart.id, status_code=200)
 
 
 class SaleScanAPIView(MarketCashierOnlyMixin, APIView):
@@ -1241,16 +1263,15 @@ class SaleScanAPIView(MarketCashierOnlyMixin, APIView):
         product = None
         scale_data = None
 
-        # Оптимизация: используем select_related для связанных объектов и кэширование
         cache_key = f"product_barcode:{cart.company_id}:{barcode}"
         product = cache.get(cache_key)
         
         if product is None:
             try:
-                product = Product.objects.select_related("brand", "category").get(
-                    company=cart.company, barcode=barcode
+                product = Product.objects.get(
+                    company_id=cart.company_id,
+                    barcode=barcode,
                 )
-                # Кэшируем на 5 минут
                 cache.set(cache_key, product, 300)
             except Product.DoesNotExist:
                 scale_data = _parse_scale_barcode(barcode)
@@ -1262,8 +1283,9 @@ class SaleScanAPIView(MarketCashierOnlyMixin, APIView):
                     plu_cache_key = f"product_plu:{cart.company_id}:{plu}"
                     product = cache.get(plu_cache_key)
                     if product is None:
-                        product = Product.objects.select_related("brand", "category").get(
-                            company=cart.company, plu=plu
+                        product = Product.objects.get(
+                            company_id=cart.company_id,
+                            plu=plu,
                         )
                         cache.set(plu_cache_key, product, 300)
                 except Product.DoesNotExist:
@@ -1277,24 +1299,26 @@ class SaleScanAPIView(MarketCashierOnlyMixin, APIView):
         # Блокируем корзину для предотвращения race conditions
         cart = Cart.objects.select_for_update().get(id=cart.id)
         
-        item, created = CartItem.objects.select_for_update().get_or_create(
-            cart=cart,
-            product=product,
-            defaults={
-                "company": cart.company,
-                "branch": getattr(cart, "branch", None),
-                "quantity": qty3(effective_qty),
-                "unit_price": product.price,
-            },
+        item = (
+            CartItem.objects.select_for_update()
+            .filter(cart=cart, product=product, sale_package__isnull=True)
+            .first()
         )
-
-        if not created:
-            # Округляем количество после сложения
+        if item:
             item.quantity = qty3(item.quantity + effective_qty)
-            item.save(update_fields=["quantity"])
+            item.save(update_fields=["quantity"], skip_full_clean=True)
+        else:
+            item = CartItem(
+                cart=cart,
+                company=cart.company,
+                branch=getattr(cart, "branch", None),
+                product=product,
+                quantity=qty3(effective_qty),
+                unit_price=product.price,
+            )
+            item.save(skip_full_clean=True)
 
-        cart.recalc()
-        return Response(SaleCartSerializer(cart).data, status=status.HTTP_201_CREATED)
+        return _cart_response(request, cart.id, status_code=status.HTTP_201_CREATED)
 
 
 class SaleAddItemAPIView(MarketCashierOnlyMixin, APIView):
@@ -1303,8 +1327,7 @@ class SaleAddItemAPIView(MarketCashierOnlyMixin, APIView):
     @transaction.atomic
     def post(self, request, pk, *args, **kwargs):
         cart = get_object_or_404(
-            Cart.objects.select_related("company", "branch", "user", "shift")
-            .prefetch_related("items__product"),
+            Cart.objects.select_related("company", "branch", "user", "shift"),
             id=pk,
             company=request.user.company,
             status=Cart.Status.ACTIVE,
@@ -1315,7 +1338,7 @@ class SaleAddItemAPIView(MarketCashierOnlyMixin, APIView):
         product = get_object_or_404(
             Product,
             id=ser.validated_data["product_id"],
-            company=cart.company,
+            company_id=cart.company_id,
         )
         qty = ser.validated_data["quantity"]
 
@@ -1328,7 +1351,7 @@ class SaleAddItemAPIView(MarketCashierOnlyMixin, APIView):
                 ProductPackage.objects.filter(
                     id=sale_package_id,
                     product_id=product.id,
-                    company=cart.company,
+                    company_id=cart.company_id,
                 )
             )
 
@@ -1359,12 +1382,12 @@ class SaleAddItemAPIView(MarketCashierOnlyMixin, APIView):
 
         other = total_cart_consume_packs_for_product(cart.id, product.id)
         target = (
-            CartItem.objects.filter(cart=cart, product=product, sale_package=pkg)
-            .select_related("sale_package")
+            CartItem.objects.select_for_update()
+            .filter(cart=cart, product=product, sale_package=pkg)
             .first()
         )
         if target:
-            other = qty3(other - cart_item_stock_consume_units(target))
+            other = qty3(other - line_qty_consume_units(target.quantity, pkg))
             combined_consume = line_qty_consume_units(target.quantity + qty, pkg)
         else:
             combined_consume = line_qty_consume_units(qty, pkg)
@@ -1380,20 +1403,8 @@ class SaleAddItemAPIView(MarketCashierOnlyMixin, APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        item, created = CartItem.objects.select_for_update().get_or_create(
-            cart=cart,
-            product=product,
-            sale_package=pkg,
-            defaults={
-                "company": cart.company,
-                "branch": getattr(cart, "branch", None),
-                "quantity": qty3(qty),
-                "unit_price": base_price,
-                "line_discount": disc_total,
-            },
-        )
-        
-        if not created:
+        if target:
+            item = target
             item.quantity = qty3(item.quantity + qty)
             if unit_price is not None:
                 item.unit_price = base_price
@@ -1404,10 +1415,21 @@ class SaleAddItemAPIView(MarketCashierOnlyMixin, APIView):
                 update_f.append("unit_price")
             if line_discount is not None:
                 update_f.append("line_discount")
-            item.save(update_fields=update_f)
+            item.save(update_fields=update_f, skip_full_clean=True)
+        else:
+            item = CartItem(
+                cart=cart,
+                company=cart.company,
+                branch=getattr(cart, "branch", None),
+                product=product,
+                sale_package=pkg,
+                quantity=qty3(qty),
+                unit_price=base_price,
+                line_discount=disc_total,
+            )
+            item.save(skip_full_clean=True)
 
-        cart.recalc()
-        return Response(SaleCartSerializer(cart).data, status=status.HTTP_201_CREATED)
+        return _cart_response(request, cart.id, status_code=status.HTTP_201_CREATED)
 
 
 class SaleCheckoutAPIView(MarketCashierOnlyMixin, APIView):
@@ -1416,8 +1438,7 @@ class SaleCheckoutAPIView(MarketCashierOnlyMixin, APIView):
     @transaction.atomic
     def post(self, request, pk, *args, **kwargs):
         cart = get_object_or_404(
-            Cart.objects.select_related("company", "branch", "user", "shift")
-            .prefetch_related("items__product", "items__product__brand", "items__product__category"),
+            Cart.objects.select_related("company", "branch", "user", "shift"),
             id=pk,
             company=request.user.company,
             status=Cart.Status.ACTIVE,
@@ -1713,8 +1734,9 @@ class ProductFindByBarcodeAPIView(MarketCashierOnlyMixin, APIView):
         product = cache.get(cache_key)
         
         if product is None:
-            qs = Product.objects.select_related("brand", "category").filter(
-                company=request.user.company, barcode=barcode
+            qs = Product.objects.filter(
+                company_id=request.user.company_id,
+                barcode=barcode,
             )[:1]
             product = qs.first()
             if product:

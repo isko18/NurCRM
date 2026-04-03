@@ -28,11 +28,17 @@ from .views import (
     EquipmentInventorySessionListCreateView, EquipmentInventorySessionRetrieveView, EquipmentInventorySessionConfirmView,
 
     KitchenListCreateView, KitchenRetrieveUpdateDestroyView, OrderClosedListView, OrderPayView, OrderPayDebtView,
+    CafeExpenseListCreateView, CafeExpenseRetrieveUpdateDestroyView,
+    CafeWaiterPayProfileListCreateView, CafeWaiterPayProfileRetrieveUpdateDestroyView,
 )
 
 from apps.cafe.analytics import (
     KitchenAnalyticsByCookView, KitchenAnalyticsByWaiterView,
     SalesSummaryView, SalesByMenuItemView, SalesByCategoryView,
+    SalesByKitchenView, RevenueInflowView, RejectionsAnalyticsView,
+    CafeExpensesSummaryView, CafeDebtAnalyticsView,
+    CafeShiftReportView, CafeDailyCloseReportView, CafeWaiterSalaryReportView,
+    CafeUnifiedAnalyticsView, CafeWaiterSalesView,
     PurchasesSummaryView, PurchasesBySupplierView,
     WarehouseLowStockView, CafeAnalyticsExportView,
 )
@@ -72,6 +78,16 @@ urlpatterns = [
     # === Purchases ===
     path("purchases/", PurchaseListCreateView.as_view(), name="purchase-list"),
     path("purchases/<uuid:pk>/", PurchaseRetrieveUpdateDestroyView.as_view(), name="purchase-detail"),
+
+    path("expenses/", CafeExpenseListCreateView.as_view(), name="cafe-expense-list"),
+    path("expenses/<uuid:pk>/", CafeExpenseRetrieveUpdateDestroyView.as_view(), name="cafe-expense-detail"),
+
+    path("waiter-pay-profiles/", CafeWaiterPayProfileListCreateView.as_view(), name="cafe-waiter-pay-list"),
+    path(
+        "waiter-pay-profiles/<uuid:pk>/",
+        CafeWaiterPayProfileRetrieveUpdateDestroyView.as_view(),
+        name="cafe-waiter-pay-detail",
+    ),
 
     # === Categories ===
     path("categories/", CategoryListCreateView.as_view(), name="category-list"),
@@ -143,6 +159,16 @@ urlpatterns = [
     path("analytics/sales/summary/", SalesSummaryView.as_view()),
     path("analytics/sales/items/", SalesByMenuItemView.as_view()),
     path("analytics/sales/categories/", SalesByCategoryView.as_view(), name="cafe-analytics-sales-categories"),
+    path("analytics/sales/kitchens/", SalesByKitchenView.as_view(), name="cafe-analytics-sales-kitchens"),
+    path("analytics/revenue-inflow/", RevenueInflowView.as_view(), name="cafe-analytics-revenue-inflow"),
+    path("analytics/rejections/", RejectionsAnalyticsView.as_view(), name="cafe-analytics-rejections"),
+    path("analytics/expenses/summary/", CafeExpensesSummaryView.as_view(), name="cafe-analytics-expenses-summary"),
+    path("analytics/debts/", CafeDebtAnalyticsView.as_view(), name="cafe-analytics-debts"),
+    path("analytics/shift-report/", CafeShiftReportView.as_view(), name="cafe-analytics-shift-report"),
+    path("analytics/daily-close/", CafeDailyCloseReportView.as_view(), name="cafe-analytics-daily-close"),
+    path("analytics/waiter-sales/", CafeWaiterSalesView.as_view(), name="cafe-analytics-waiter-sales"),
+    path("analytics/waiter-salary/", CafeWaiterSalaryReportView.as_view(), name="cafe-analytics-waiter-salary"),
+    path("analytics/unified/", CafeUnifiedAnalyticsView.as_view(), name="cafe-analytics-unified"),
 
     path("analytics/purchases/summary/", PurchasesSummaryView.as_view()),
     path("analytics/purchases/suppliers/", PurchasesBySupplierView.as_view()),

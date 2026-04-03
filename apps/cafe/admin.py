@@ -12,6 +12,7 @@ from .models import (
     InventorySession, InventoryItem,
     Equipment, EquipmentInventorySession, EquipmentInventoryItem, Kitchen,
     CafeReceiptPrinterSettings,
+    CafeExpense, CafeWaiterPayProfile,
 )
 
 @admin.register(CafeReceiptPrinterSettings)
@@ -126,7 +127,7 @@ class OrderItemInline(admin.TabularInline):
     model = OrderItem
     extra = 0
     autocomplete_fields = ("menu_item",)
-    fields = ("menu_item", "quantity")
+    fields = ("line_kind", "menu_item", "service_title", "unit_price", "quantity", "is_rejected", "rejection_reason")
     # company у OrderItem ставится автоматически в save()
     inlines = []  # не вкладываем KitchenTaskInline внутрь inline-of-inline (не поддерживается админкой)
 
@@ -151,8 +152,8 @@ class OrderItemInline(admin.TabularInline):
 
 @admin.register(Order)
 class OrderAdmin(admin.ModelAdmin):
-    list_display = ("id", "company", "branch", "client", "table", "guests", "waiter", "created_at")
-    list_filter = ("company", "branch", "created_at")
+    list_display = ("id", "company", "branch", "client", "table", "guests", "waiter", "status", "is_paid", "created_at")
+    list_filter = ("company", "branch", "status", "is_paid", "created_at")
     # В search_fields используем только текстовые поля
     search_fields = ("client__name", "client__phone", "waiter__email")
     ordering = ("-created_at",)
@@ -210,10 +211,10 @@ class OrderAdmin(admin.ModelAdmin):
 
 @admin.register(OrderItem)
 class OrderItemAdmin(admin.ModelAdmin):
-    list_display = ("order", "menu_item", "quantity", "company")
-    list_filter = ("company", "order__branch")
+    list_display = ("order", "line_kind", "menu_item", "service_title", "quantity", "is_rejected", "company")
+    list_filter = ("company", "line_kind", "is_rejected", "order__branch")
     # текстовый поиск — по связанным текстовым полям
-    search_fields = ("order__client__name", "order__client__phone", "menu_item__title")
+    search_fields = ("order__client__name", "order__client__phone", "menu_item__title", "service_title", "rejection_reason")
     list_select_related = ("order", "menu_item")
     inlines = [KitchenTaskInline]
 
@@ -246,8 +247,8 @@ class OrderItemHistoryInline(admin.TabularInline):
     model = OrderItemHistory
     extra = 0
     can_delete = False
-    readonly_fields = ("menu_item", "menu_item_title", "menu_item_price", "quantity")
-    fields = ("menu_item_title", "menu_item_price", "quantity")
+    readonly_fields = ("line_kind", "menu_item", "menu_item_title", "menu_item_price", "quantity", "is_rejected", "rejection_reason")
+    fields = ("line_kind", "menu_item_title", "menu_item_price", "quantity", "is_rejected", "rejection_reason")
 
 
 @admin.register(OrderHistory)
@@ -438,3 +439,19 @@ class WarehouseAdmin(admin.ModelAdmin):
     list_filter = ("company", "branch", "unit")
     search_fields = ("title", "unit", "supplier")     # <- обязательно для автокомплита
     ordering = ("company", "branch", "title")
+
+
+@admin.register(CafeExpense)
+class CafeExpenseAdmin(admin.ModelAdmin):
+    list_display = ("title", "amount", "expense_date", "category", "company", "branch", "created_at")
+    list_filter = ("company", "branch", "expense_date")
+    search_fields = ("title", "category", "note")
+    ordering = ("-expense_date", "-created_at")
+    raw_id_fields = ("company", "branch", "created_by")
+
+
+@admin.register(CafeWaiterPayProfile)
+class CafeWaiterPayProfileAdmin(admin.ModelAdmin):
+    list_display = ("user", "company", "branch", "monthly_base_salary", "revenue_percent")
+    list_filter = ("company", "branch")
+    raw_id_fields = ("company", "branch", "user")

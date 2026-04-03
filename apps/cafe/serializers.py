@@ -6,6 +6,7 @@ from decimal import Decimal
 from rest_framework import serializers
 from django.core.exceptions import ValidationError as DjangoValidationError
 from django.db import transaction, IntegrityError
+from django.utils import timezone
 
 from apps.cafe.models import (
     Zone, Table, Booking, Warehouse, Purchase,
@@ -13,6 +14,7 @@ from apps.cafe.models import (
     Order, OrderItem, CafeClient,
     OrderHistory, OrderItemHistory, KitchenTask, NotificationCafe, InventorySession, InventoryItem, Equipment, EquipmentInventoryItem, EquipmentInventorySession, Kitchen,
     CafeReceiptPrinterSettings,
+    CafeExpense, CafeWaiterPayProfile,
 )
 from apps.users.models import Branch
 
@@ -618,29 +620,95 @@ class BookingSerializer(CompanyBranchReadOnlyMixin):
 
 
 # --------- Заказы ---------
-class OrderItemInlineSerializer(serializers.ModelSerializer):
-    menu_item_title = serializers.CharField(source="menu_item.title", read_only=True)
-    # Должно совпадать с MenuItem.price (11,3), иначе DRF падает при сериализации списка заказов.
+class OrderItemInlineSerializer(CompanyBranchReadOnlyMixin):
+    order = serializers.PrimaryKeyRelatedField(queryset=Order.objects.all(), required=False, allow_null=True)
+    menu_item_title = serializers.CharField(source="menu_item.title", read_only=True, default="")
     menu_item_price = serializers.DecimalField(
         source="menu_item.price",
         max_digits=11,
         decimal_places=3,
         read_only=True,
+        allow_null=True,
     )
 
     class Meta:
         model = OrderItem
-        fields = ["id", "menu_item", "menu_item_title", "menu_item_price", "quantity"]
-        read_only_fields = ["id", "menu_item_title", "menu_item_price"]
+        fields = [
+            "id", "order", "line_kind", "menu_item", "menu_item_title", "menu_item_price",
+            "service_title", "unit_price", "quantity",
+            "is_rejected", "rejection_reason", "rejected_at",
+        ]
+        read_only_fields = ["id", "menu_item_title", "menu_item_price", "rejected_at"]
+
+    def validate(self, attrs):
+        inst = self.instance
+        order = attrs.get("order") or (inst.order if inst else None)
+        if inst and "order" in attrs and attrs["order"] != inst.order:
+            raise serializers.ValidationError({"order": "Нельзя переносить позицию в другой заказ."})
+        if order is None and not isinstance(getattr(self, "parent", None), serializers.ListSerializer):
+            raise serializers.ValidationError({"order": "Укажите заказ."})
+        if order and (order.is_paid or order.status != Order.Status.OPEN):
+            raise serializers.ValidationError({"order": "Можно менять позиции только у открытого неоплаченного заказа."})
+        line_kind = attrs.get("line_kind", getattr(inst, "line_kind", OrderItem.LineKind.MENU) if inst else OrderItem.LineKind.MENU)
+        if line_kind == OrderItem.LineKind.SERVICE:
+            if attrs.get("menu_item") is not None:
+                raise serializers.ValidationError({"menu_item": "Для услуги не указывайте позицию меню."})
+            title = (attrs.get("service_title") or (getattr(inst, "service_title", None) if inst else None) or "").strip()
+            if not title:
+                raise serializers.ValidationError({"service_title": "Укажите название услуги."})
+            up = attrs.get("unit_price", getattr(inst, "unit_price", None) if inst else None)
+            if up is None:
+                raise serializers.ValidationError({"unit_price": "Укажите цену услуги."})
+        else:
+            menu_item = attrs.get("menu_item") or (inst.menu_item if inst else None)
+            if not menu_item:
+                raise serializers.ValidationError({"menu_item": "Выберите позицию меню."})
+        rej = attrs["is_rejected"] if "is_rejected" in attrs else (inst.is_rejected if inst else False)
+        if "rejection_reason" in attrs:
+            reason = attrs.get("rejection_reason") or ""
+        elif inst:
+            reason = inst.rejection_reason or ""
+        else:
+            reason = ""
+        if rej and not (reason or "").strip():
+            raise serializers.ValidationError({"rejection_reason": "Укажите причину отказа."})
+        return attrs
+
+    def create(self, validated_data):
+        from django.utils import timezone as dj_tz
+
+        if validated_data.get("is_rejected"):
+            validated_data.setdefault("rejected_at", dj_tz.now())
+        return super().create(validated_data)
+
+    def update(self, instance, validated_data):
+        from django.utils import timezone as dj_tz
+
+        if validated_data.get("line_kind") == OrderItem.LineKind.SERVICE:
+            validated_data["menu_item"] = None
+        elif validated_data.get("line_kind") == OrderItem.LineKind.MENU:
+            validated_data["service_title"] = ""
+            validated_data["unit_price"] = None
+        if validated_data.get("is_rejected") and not instance.is_rejected:
+            validated_data.setdefault("rejected_at", dj_tz.now())
+        if validated_data.get("is_rejected") is False:
+            validated_data["rejection_reason"] = ""
+            validated_data["rejected_at"] = None
+        return super().update(instance, validated_data)
 
     def get_fields(self):
         fields = super().get_fields()
-        # Раньше: order_serializer = self.parent.parent
-        holder = getattr(self, "root", None)
+        holder = getattr(self, "root", None) or self
         if isinstance(holder, CompanyBranchReadOnlyMixin):
+            fields["order"].queryset = _scope_queryset_by_context(Order.objects.all(), holder)
             fields["menu_item"].queryset = _scope_queryset_by_context(MenuItem.objects.all(), holder)
         else:
+            fields["order"].queryset = Order.objects.none()
             fields["menu_item"].queryset = MenuItem.objects.none()
+        fields["order"].required = False
+        fields["order"].allow_null = True
+        fields["menu_item"].required = False
+        fields["menu_item"].allow_null = True
         return fields
 
 
@@ -658,8 +726,11 @@ class OrderBriefSerializer(serializers.ModelSerializer):
 class OrderItemHistorySerializer(serializers.ModelSerializer):
     class Meta:
         model = OrderItemHistory
-        fields = ["id", "menu_item", "menu_item_title", "menu_item_price", "quantity"]
-        read_only_fields = ["id", "menu_item", "menu_item_title", "menu_item_price", "quantity"]
+        fields = [
+            "id", "line_kind", "menu_item", "menu_item_title", "menu_item_price", "quantity",
+            "is_rejected", "rejection_reason",
+        ]
+        read_only_fields = fields
 
 
 class OrderHistorySerializer(serializers.ModelSerializer):
@@ -700,17 +771,22 @@ class OrderSerializer(CompanyBranchReadOnlyMixin):
     waiter = serializers.PrimaryKeyRelatedField(queryset=User.objects.all(), allow_null=True, required=False)
     items = OrderItemInlineSerializer(many=True, required=False)
     balance_due = serializers.DecimalField(max_digits=12, decimal_places=2, read_only=True)
+    cash_shift_id = serializers.UUIDField(read_only=True, allow_null=True)
 
     class Meta:
         ref_name = "CafeOrder"
         model = Order
         fields = [
-        "id","company","branch","table","client","waiter","guests","created_at",
-        "status","is_paid","paid_at","payment_method","total_amount","discount_amount",
-        "paid_amount","balance_due",
-        "items"
+            "id", "company", "branch", "table", "client", "waiter", "guests", "created_at",
+            "table_session_id", "check_label",
+            "status", "is_paid", "paid_at", "payment_method", "total_amount", "discount_amount",
+            "paid_amount", "balance_due", "cash_shift_id",
+            "items",
         ]
-        read_only_fields = ["is_paid","paid_at","payment_method","total_amount","paid_amount","balance_due"]
+        read_only_fields = [
+            "is_paid", "paid_at", "payment_method", "total_amount", "paid_amount", "balance_due",
+            "cash_shift_id",
+        ]
 
     def get_fields(self):
         fields = super().get_fields()
@@ -750,14 +826,51 @@ class OrderSerializer(CompanyBranchReadOnlyMixin):
 
     def _upsert_items(self, order, items):
         for it in items:
-            menu_item = it["menu_item"]
+            line_kind = it.get("line_kind") or OrderItem.LineKind.MENU
+            is_rejected = bool(it.get("is_rejected", False))
+            rejection_reason = (it.get("rejection_reason") or "").strip()
+            rejected_at = timezone.now() if is_rejected else None
+            if line_kind == OrderItem.LineKind.SERVICE:
+                OrderItem.objects.create(
+                    order=order,
+                    company=order.company,
+                    line_kind=OrderItem.LineKind.SERVICE,
+                    service_title=(it.get("service_title") or "").strip(),
+                    unit_price=it.get("unit_price"),
+                    quantity=it.get("quantity", 1),
+                    is_rejected=is_rejected,
+                    rejection_reason=rejection_reason,
+                    rejected_at=rejected_at,
+                )
+                continue
+            menu_item = it.get("menu_item")
+            if not menu_item:
+                raise serializers.ValidationError({"items": "Для блюда укажите menu_item."})
             qty = it.get("quantity", 1)
-            existing = order.items.filter(menu_item=menu_item).first()
+            existing = order.items.filter(
+                menu_item=menu_item,
+                line_kind=OrderItem.LineKind.MENU,
+            ).first()
             if existing:
                 existing.quantity += qty
-                existing.save(update_fields=["quantity"])
+                if is_rejected:
+                    existing.is_rejected = True
+                    existing.rejection_reason = rejection_reason
+                    existing.rejected_at = existing.rejected_at or rejected_at
+                    existing.save(update_fields=["quantity", "is_rejected", "rejection_reason", "rejected_at"])
+                else:
+                    existing.save(update_fields=["quantity"])
             else:
-                OrderItem.objects.create(order=order, menu_item=menu_item, quantity=qty, company=order.company)
+                OrderItem.objects.create(
+                    order=order,
+                    menu_item=menu_item,
+                    quantity=qty,
+                    company=order.company,
+                    line_kind=OrderItem.LineKind.MENU,
+                    is_rejected=is_rejected,
+                    rejection_reason=rejection_reason,
+                    rejected_at=rejected_at,
+                )
 
     def create(self, validated_data):
         items = validated_data.pop("items", [])
@@ -768,6 +881,8 @@ class OrderSerializer(CompanyBranchReadOnlyMixin):
 
     def update(self, instance, validated_data):
         items = validated_data.pop("items", None)
+        if items is not None and (instance.is_paid or instance.status != Order.Status.OPEN):
+            raise serializers.ValidationError({"items": "Изменение позиций доступно только у открытого неоплаченного заказа."})
         with transaction.atomic():
             instance = super().update(instance, validated_data)
             if items is not None:
@@ -785,7 +900,10 @@ class OrderSerializer(CompanyBranchReadOnlyMixin):
                 # Сохраняем активные задачи по menu_item_id и unit_index
                 active_tasks_by_menu = {}
                 for task in active_tasks:
-                    key = (task['menu_item_id'], task['unit_index'])
+                    mid = task["menu_item_id"]
+                    if not mid:
+                        continue
+                    key = (mid, task["unit_index"])
                     active_tasks_by_menu[key] = task
                 
                 # Удаляем все items (каскадом удалятся KitchenTask)
@@ -800,6 +918,8 @@ class OrderSerializer(CompanyBranchReadOnlyMixin):
                     # Получаем созданные items, сгруппированные по menu_item_id
                     created_items_by_menu = {}
                     for item in instance.items.select_related('menu_item').all():
+                        if not item.menu_item_id:
+                            continue
                         if item.menu_item_id not in created_items_by_menu:
                             created_items_by_menu[item.menu_item_id] = []
                         created_items_by_menu[item.menu_item_id].append(item)
@@ -908,6 +1028,10 @@ class OrderPaySerializer(serializers.Serializer):
         required=False, allow_null=True,
         help_text="Обязателен при первом внесении денег в счёт долга (предоплата или pay_now < итога).",
     )
+    cash_shift_id = serializers.UUIDField(
+        required=False, allow_null=True,
+        help_text="Опционально: привязать оплату к кассовой смене (construction), для отчёта смены.",
+    )
 
     def validate_discount_amount(self, v):
         if v is None:
@@ -945,6 +1069,7 @@ class OrderPayDebtSerializer(serializers.Serializer):
     )
     idempotency_key = serializers.UUIDField()
     note = serializers.CharField(required=False, allow_blank=True, default="")
+    cash_shift_id = serializers.UUIDField(required=False, allow_null=True)
     cash_received = serializers.DecimalField(
         max_digits=12, decimal_places=2, required=False, allow_null=True,
         help_text="Для cash: принято наличными (не меньше amount).",
@@ -1203,3 +1328,38 @@ class CafeReceiptPrinterSettingsSerializer(serializers.ModelSerializer):
         if instance is None:
             return {"printer": "", "bridge_url": "", "updated_at": None}
         return super().to_representation(instance)
+
+
+class CafeExpenseSerializer(CompanyBranchReadOnlyMixin):
+    created_by = serializers.PrimaryKeyRelatedField(read_only=True)
+
+    class Meta:
+        model = CafeExpense
+        fields = [
+            "id", "company", "branch", "title", "amount", "category",
+            "expense_date", "note", "created_by", "created_at",
+        ]
+        read_only_fields = ["id", "company", "created_by", "created_at"]
+
+    def create(self, validated_data):
+        req = self.context.get("request")
+        if req and req.user.is_authenticated:
+            validated_data["created_by"] = req.user
+        return super().create(validated_data)
+
+
+class CafeWaiterPayProfileSerializer(CompanyBranchReadOnlyMixin):
+    class Meta:
+        model = CafeWaiterPayProfile
+        fields = [
+            "id", "company", "branch", "user",
+            "monthly_base_salary", "revenue_percent",
+        ]
+        read_only_fields = ["id", "company"]
+
+    def get_fields(self):
+        fields = super().get_fields()
+        company = self._user_company()
+        if company and hasattr(User, "company_id"):
+            fields["user"].queryset = User.objects.filter(company_id=company.id)
+        return fields
