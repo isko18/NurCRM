@@ -3,15 +3,18 @@
 Покрывает все типы документов, валидацию, проведение и отмену.
 """
 from django.test import TestCase
+from django.urls import reverse
 from decimal import Decimal
 from django.contrib.auth import get_user_model
 from django.core.exceptions import ValidationError
 from django.core.cache import cache
 from django.conf import settings
+from rest_framework.test import APIClient
 
 from apps.warehouse import models
 from apps.warehouse import services
 from django.apps import apps
+from apps.users.models import Roles
 
 
 User = get_user_model()
@@ -1292,3 +1295,39 @@ class WarehouseComprehensiveTests(TestCase):
         services.unpost_document(doc_purchase)
         bal.refresh_from_db()
         self.assertEqual(bal.qty, Decimal("0.000"))
+
+    def test_owner_can_create_sale_when_payload_contains_self_as_agent(self):
+        """Владелец с agent=self не должен переводить документ в агентский режим."""
+        self.user.role = Roles.OWNER
+        self.user.save(update_fields=["role"])
+
+        models.StockBalance.objects.create(
+            warehouse=self.wh1,
+            product=self.prod1,
+            qty=Decimal("10.000"),
+        )
+
+        api_client = APIClient()
+        api_client.force_authenticate(user=self.user)
+
+        response = api_client.post(
+            reverse("warehouse-documents-sale"),
+            {
+                "warehouse_from": str(self.wh1.id),
+                "counterparty": str(self.client.id),
+                "agent": str(self.user.id),
+                "items": [
+                    {
+                        "product": str(self.prod1.id),
+                        "qty": "1.000",
+                        "price": "150.00",
+                    }
+                ],
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 201, response.data)
+        doc = models.Document.objects.get(id=response.data["id"])
+        self.assertIsNone(doc.agent_id)
+        self.assertFalse(doc.use_common_stock)
