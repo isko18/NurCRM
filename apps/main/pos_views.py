@@ -2194,7 +2194,9 @@ def _resolve_acting_agent(request, cart, *, allow_owner_override=True):
 
 
 def _should_use_main_stock_in_agent_sale(*, user, acting_agent) -> bool:
-    return _is_owner(user) and getattr(acting_agent, "id", None) == getattr(user, "id", None)
+    # If the operator is the owner, agent selection only affects attribution,
+    # while product availability must still come from the main stock.
+    return _is_owner(user)
 
 
 @transaction.atomic
