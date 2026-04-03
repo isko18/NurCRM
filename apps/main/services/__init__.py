@@ -22,7 +22,7 @@ def checkout_cart(cart: Cart, department=None) -> Sale:
     cart.recalc()
 
     items = list(
-        cart.items.select_related("product", "product__brand", "product__category", "sale_package")
+        cart.items.select_related("product", "sale_package")
     )
     if not items:
         raise ValueError("Корзина пуста.")
@@ -44,9 +44,10 @@ def checkout_cart(cart: Cart, department=None) -> Sale:
         if it.product_id not in products:
             raise ValueError("Товар позиции не найден.")
         try:
-            consume_by_pid[it.product_id] += cart_item_stock_consume_units(it)
+            item_consume = cart_item_stock_consume_units(it)
         except ValueError as e:
             raise ValueError(str(e)) from e
+        consume_by_pid[it.product_id] += item_consume
 
     for pid, need in consume_by_pid.items():
         p = products[pid]
@@ -102,14 +103,8 @@ def checkout_cart(cart: Cart, department=None) -> Sale:
     SaleItem.objects.bulk_create(sale_items)
 
     changed = []
-    for it in items:
-        if not it.product_id:
-            continue
-        try:
-            qty_need = cart_item_stock_consume_units(it)
-        except ValueError as e:
-            raise ValueError(str(e)) from e
-        p = products[it.product_id]
+    for pid, qty_need in consume_by_pid.items():
+        p = products[pid]
         p.quantity = Decimal(str(p.quantity or 0)) - qty_need
         changed.append(p)
     if changed:

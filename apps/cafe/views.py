@@ -29,6 +29,7 @@ from .models import (
     KitchenTask, NotificationCafe,
     InventorySession, Equipment, EquipmentInventorySession, Kitchen,
     CafeReceiptPrinterSettings,
+    CafeExpense, CafeWaiterPayProfile,
 )
 from .serializers import (
     ZoneSerializer, TableSerializer, BookingSerializer,
@@ -43,6 +44,7 @@ from .serializers import (
     OrderPaySerializer,
     OrderPayDebtSerializer,
     CafeReceiptPrinterSettingsSerializer,
+    CafeExpenseSerializer, CafeWaiterPayProfileSerializer,
 )
 
 
@@ -85,6 +87,8 @@ def deduct_ingredients_for_order(order: Order):
         .all()
     )
     for it in items:
+        if it.is_rejected or it.line_kind == OrderItem.LineKind.SERVICE or not it.menu_item_id:
+            continue
         qty = Decimal(str(it.quantity or 0))
         if qty <= 0:
             continue
@@ -119,6 +123,21 @@ def deduct_ingredients_for_order(order: Order):
         # remainder хранится строкой
         p.remainder = str(new_val)
         p.save(update_fields=["remainder"])
+
+
+def _cafe_assign_cash_shift(order: Order, shift_id, company, active_branch):
+    """Опциональная привязка заказа к смене construction.CashShift (для отчёта смены)."""
+    if not shift_id:
+        return
+    from apps.construction.models import CashShift
+
+    sh = CashShift.objects.filter(pk=shift_id, company=company).first()
+    if not sh:
+        raise ValidationError({"cash_shift_id": "Смена не найдена."})
+    if active_branch is not None and sh.branch_id not in (None, active_branch.id):
+        raise ValidationError({"cash_shift_id": "Смена привязана к другому филиалу."})
+    order.cash_shift_id = sh.id
+
 
 try:
     from apps.users.permissions import IsCompanyOwnerOrAdmin
@@ -379,9 +398,11 @@ class OrderFilter(django_filters.FilterSet):
     created_at_from = django_filters.DateTimeFilter(field_name="created_at", lookup_expr="gte")
     created_at_to = django_filters.DateTimeFilter(field_name="created_at", lookup_expr="lte")
 
+    table_session_id = django_filters.UUIDFilter(field_name="table_session_id")
+
     class Meta:
         model = Order
-        fields = ["table", "waiter", "client", "guests", "status"]
+        fields = ["table", "waiter", "client", "guests", "status", "table_session_id"]
 
 
 class ClientOrderListCreateView(CompanyBranchQuerysetMixin, generics.ListCreateAPIView):
@@ -596,6 +617,77 @@ class PurchaseListCreateView(CompanyBranchQuerysetMixin, generics.ListCreateAPIV
 class PurchaseRetrieveUpdateDestroyView(CompanyBranchQuerysetMixin, generics.RetrieveUpdateDestroyAPIView):
     queryset = Purchase.objects.all()
     serializer_class = PurchaseSerializer
+
+
+# ==================== Cafe operational expenses / зарплата официантов ====================
+class CafeExpenseListCreateView(CompanyBranchQuerysetMixin, generics.ListCreateAPIView):
+    serializer_class = CafeExpenseSerializer
+    filter_backends = [DjangoFilterBackend, filters.OrderingFilter]
+    filterset_fields = ["category", "branch"]
+    ordering_fields = ["expense_date", "created_at", "amount", "id"]
+
+    def get_queryset(self):
+        company = self._user_company()
+        if not company:
+            return CafeExpense.objects.none()
+        qs = CafeExpense.objects.filter(company=company)
+        b = self._active_branch()
+        if b is not None:
+            qs = qs.filter(Q(branch=b) | Q(branch__isnull=True))
+        else:
+            qs = qs.filter(branch__isnull=True)
+        return qs.order_by("-expense_date", "-created_at")
+
+
+class CafeExpenseRetrieveUpdateDestroyView(CompanyBranchQuerysetMixin, generics.RetrieveUpdateDestroyAPIView):
+    serializer_class = CafeExpenseSerializer
+
+    def get_queryset(self):
+        company = self._user_company()
+        if not company:
+            return CafeExpense.objects.none()
+        qs = CafeExpense.objects.filter(company=company)
+        b = self._active_branch()
+        if b is not None:
+            qs = qs.filter(Q(branch=b) | Q(branch__isnull=True))
+        else:
+            qs = qs.filter(branch__isnull=True)
+        return qs
+
+
+class CafeWaiterPayProfileListCreateView(CompanyBranchQuerysetMixin, generics.ListCreateAPIView):
+    serializer_class = CafeWaiterPayProfileSerializer
+    filter_backends = [DjangoFilterBackend, filters.OrderingFilter]
+    filterset_fields = ["user", "branch"]
+    ordering_fields = ["id"]
+
+    def get_queryset(self):
+        company = self._user_company()
+        if not company:
+            return CafeWaiterPayProfile.objects.none()
+        qs = CafeWaiterPayProfile.objects.filter(company=company)
+        b = self._active_branch()
+        if b is not None:
+            qs = qs.filter(Q(branch=b) | Q(branch__isnull=True))
+        else:
+            qs = qs.filter(branch__isnull=True)
+        return qs
+
+
+class CafeWaiterPayProfileRetrieveUpdateDestroyView(CompanyBranchQuerysetMixin, generics.RetrieveUpdateDestroyAPIView):
+    serializer_class = CafeWaiterPayProfileSerializer
+
+    def get_queryset(self):
+        company = self._user_company()
+        if not company:
+            return CafeWaiterPayProfile.objects.none()
+        qs = CafeWaiterPayProfile.objects.filter(company=company)
+        b = self._active_branch()
+        if b is not None:
+            qs = qs.filter(Q(branch=b) | Q(branch__isnull=True))
+        else:
+            qs = qs.filter(branch__isnull=True)
+        return qs
 
 
 # ==================== Category ====================
@@ -826,6 +918,31 @@ class OrderRetrieveUpdateDestroyView(CompanyBranchQuerysetMixin, generics.Retrie
             _sync_table_status(table_id)
 
 
+def _order_items_queryset_for_user(company, active_branch):
+    qs = OrderItem.objects.select_related("order", "menu_item").filter(order__company=company, company=company)
+    menu_branch_ok = (
+        Q(line_kind=OrderItem.LineKind.SERVICE)
+        | Q(menu_item__branch=active_branch)
+        | Q(menu_item__branch__isnull=True)
+    )
+    if active_branch is not None:
+        return qs.filter(Q(order__branch=active_branch) | Q(order__branch__isnull=True)).filter(menu_branch_ok)
+    return qs.filter(order__branch__isnull=True).filter(
+        Q(line_kind=OrderItem.LineKind.SERVICE) | Q(menu_item__branch__isnull=True)
+    )
+
+
+def _recalc_order_after_items_change(order_id):
+    order = Order.objects.filter(pk=order_id).first()
+    if not order:
+        return
+    order.recalc_total()
+    order.save(update_fields=["total_amount", "updated_at"])
+    if order.is_paid or order.status != Order.Status.OPEN:
+        _cafe_archive_order_snapshot(order)
+    send_order_updated_notification(order)
+
+
 # ==================== OrderItem ====================
 class OrderItemListCreateView(CompanyBranchQuerysetMixin, generics.ListCreateAPIView):
     serializer_class = OrderItemInlineSerializer
@@ -837,15 +954,11 @@ class OrderItemListCreateView(CompanyBranchQuerysetMixin, generics.ListCreateAPI
         company = self._user_company()
         if not company:
             return OrderItem.objects.none()
-        active_branch = self._active_branch()
-        qs = OrderItem.objects.select_related("order", "menu_item")
-        qs = qs.filter(order__company=company, menu_item__company=company)
-        if active_branch is not None:
-            return qs.filter(
-                Q(order__branch=active_branch) | Q(order__branch__isnull=True),
-                Q(menu_item__branch=active_branch) | Q(menu_item__branch__isnull=True),
-            )
-        return qs.filter(order__branch__isnull=True, menu_item__branch__isnull=True)
+        return _order_items_queryset_for_user(company, self._active_branch())
+
+    def perform_create(self, serializer):
+        super().perform_create(serializer)
+        _recalc_order_after_items_change(serializer.instance.order_id)
 
 
 class OrderItemRetrieveUpdateDestroyView(CompanyBranchQuerysetMixin, generics.RetrieveUpdateDestroyAPIView):
@@ -855,16 +968,18 @@ class OrderItemRetrieveUpdateDestroyView(CompanyBranchQuerysetMixin, generics.Re
         company = self._user_company()
         if not company:
             return OrderItem.objects.none()
-        active_branch = self._active_branch()
-        qs = OrderItem.objects.select_related("order", "menu_item").filter(
-            order__company=company, menu_item__company=company
-        )
-        if active_branch is not None:
-            return qs.filter(
-                Q(order__branch=active_branch) | Q(order__branch__isnull=True),
-                Q(menu_item__branch=active_branch) | Q(menu_item__branch__isnull=True),
-            )
-        return qs.filter(order__branch__isnull=True, menu_item__branch__isnull=True)
+        return _order_items_queryset_for_user(company, self._active_branch())
+
+    def perform_update(self, serializer):
+        super().perform_update(serializer)
+        _recalc_order_after_items_change(serializer.instance.order_id)
+
+    def perform_destroy(self, instance):
+        if instance.order.is_paid or instance.order.status != Order.Status.OPEN:
+            raise ValidationError({"detail": "Можно менять позиции только у открытого неоплаченного заказа."})
+        oid = instance.order_id
+        super().perform_destroy(instance)
+        _recalc_order_after_items_change(oid)
 
 
 def _cafe_clients_in_scope(company, active_branch):
@@ -877,17 +992,21 @@ def _cafe_clients_in_scope(company, active_branch):
 def _cafe_order_checkout_payload(order: Order) -> dict:
     disc = order.discount_amount or Decimal("0")
     final_amt = (order.total_amount or Decimal("0")) - disc
+    pm = order.payment_method or ""
+    pm_labels = dict(Order.PaymentMethod.choices)
     return {
         "id": str(order.id),
         "status": order.status,
         "is_paid": order.is_paid,
         "paid_at": order.paid_at,
-        "payment_method": order.payment_method,
+        "payment_method": pm,
+        "payment_method_label": pm_labels.get(pm, pm),
         "total_amount": str(order.total_amount),
         "discount_amount": str(disc),
         "final_amount": str(final_amt),
         "paid_amount": str(order.paid_amount or Decimal("0")),
         "balance_due": str(order.balance_due),
+        "cash_shift_id": str(order.cash_shift_id) if order.cash_shift_id else None,
     }
 
 
@@ -921,16 +1040,35 @@ def _cafe_archive_order_snapshot(order: Order):
     )
 
     OrderItemHistory.objects.filter(order_history=oh).delete()
-    items = [
-        OrderItemHistory(
-            order_history=oh,
-            menu_item=it.menu_item,
-            menu_item_title=it.menu_item.title,
-            menu_item_price=it.menu_item.price,
-            quantity=it.quantity,
-        )
-        for it in order.items.select_related("menu_item")
-    ]
+    items = []
+    for it in order.items.select_related("menu_item"):
+        if it.line_kind == OrderItem.LineKind.SERVICE:
+            items.append(
+                OrderItemHistory(
+                    order_history=oh,
+                    menu_item=None,
+                    line_kind=it.line_kind,
+                    menu_item_title=(it.service_title or "").strip() or "Услуга",
+                    menu_item_price=it.unit_price or Decimal("0"),
+                    quantity=it.quantity,
+                    is_rejected=it.is_rejected,
+                    rejection_reason=it.rejection_reason or "",
+                )
+            )
+        else:
+            mi = it.menu_item
+            items.append(
+                OrderItemHistory(
+                    order_history=oh,
+                    menu_item=mi,
+                    line_kind=it.line_kind,
+                    menu_item_title=mi.title if mi else "",
+                    menu_item_price=mi.price if mi else Decimal("0"),
+                    quantity=it.quantity,
+                    is_rejected=it.is_rejected,
+                    rejection_reason=it.rejection_reason or "",
+                )
+            )
     if items:
         OrderItemHistory.objects.bulk_create(items)
 
@@ -974,6 +1112,7 @@ class OrderPayView(CompanyBranchQuerysetMixin, APIView):
         prepaid_amount = ser.validated_data.get("prepaid_amount")
         prepaid_pm = ser.validated_data.get("prepaid_payment_method")
         idem = ser.validated_data.get("idempotency_key")
+        cash_shift_id = ser.validated_data.get("cash_shift_id")
 
         with transaction.atomic():
             locked_qs = (
@@ -1027,6 +1166,9 @@ class OrderPayView(CompanyBranchQuerysetMixin, APIView):
                 )
 
             order.discount_amount = discount_amount or Decimal("0")
+
+            if cash_shift_id:
+                _cafe_assign_cash_shift(order, cash_shift_id, company, active_branch)
 
             def _record_prepay(amount: Decimal, pm: str, idempotency_key):
                 if not idempotency_key:
@@ -1118,20 +1260,21 @@ class OrderPayView(CompanyBranchQuerysetMixin, APIView):
             if close_order:
                 order.status = Order.Status.CLOSED
 
-            order.save(
-                update_fields=[
-                    "total_amount",
-                    "discount_amount",
-                    "paid_amount",
-                    "stock_deducted",
-                    "is_paid",
-                    "paid_at",
-                    "payment_method",
-                    "status",
-                    "client",
-                    "updated_at",
-                ]
-            )
+            _pay_uf = [
+                "total_amount",
+                "discount_amount",
+                "paid_amount",
+                "stock_deducted",
+                "is_paid",
+                "paid_at",
+                "payment_method",
+                "status",
+                "client",
+                "updated_at",
+            ]
+            if order.cash_shift_id:
+                _pay_uf.append("cash_shift_id")
+            order.save(update_fields=_pay_uf)
 
             if close_order:
                 unfinished_tasks = KitchenTask.objects.filter(
@@ -1178,6 +1321,7 @@ class OrderPayDebtView(CompanyBranchQuerysetMixin, APIView):
         pm = ser.validated_data["payment_method"]
         idem = ser.validated_data["idempotency_key"]
         note = ser.validated_data.get("note") or ""
+        debt_shift_id = ser.validated_data.get("cash_shift_id")
 
         with transaction.atomic():
             locked_qs = (
@@ -1204,6 +1348,10 @@ class OrderPayDebtView(CompanyBranchQuerysetMixin, APIView):
                     {"detail": f"Сумма больше остатка ({balance})."},
                     status=status.HTTP_400_BAD_REQUEST,
                 )
+
+            if debt_shift_id and not order.cash_shift_id:
+                _cafe_assign_cash_shift(order, debt_shift_id, company, active_branch)
+                order.save(update_fields=["cash_shift_id", "updated_at"])
 
             if OrderDebtPayment.objects.filter(order=order, idempotency_key=idem).exists():
                 order.refresh_from_db()
@@ -1235,7 +1383,10 @@ class OrderPayDebtView(CompanyBranchQuerysetMixin, APIView):
                 order.is_paid = True
                 order.paid_at = timezone.now()
                 order.payment_method = pm
-            order.save(update_fields=["paid_amount", "is_paid", "paid_at", "payment_method", "updated_at"])
+            _debt_uf = ["paid_amount", "is_paid", "paid_at", "payment_method", "updated_at"]
+            if order.cash_shift_id:
+                _debt_uf.append("cash_shift_id")
+            order.save(update_fields=_debt_uf)
 
             if order.table_id:
                 _sync_table_status(order.table_id)

@@ -131,11 +131,22 @@ class SaleItemSerializer(serializers.ModelSerializer):
             get_attr(obj, "custom_name", "") or ""
         )
 
+    def _get_product_images(self, product):
+        if not product:
+            return []
+        prefetched = getattr(product, "_prefetched_objects_cache", {})
+        if "images" in prefetched:
+            return list(prefetched["images"])
+        return list(product.images.all())
+
     def get_primary_image_url(self, obj):
         prod = getattr(obj, "product", None)
         if not prod:
             return None
-        im = prod.images.filter(is_primary=True).first() or prod.images.first()
+        images = self._get_product_images(prod)
+        im = next((image for image in images if getattr(image, "is_primary", False)), None)
+        if im is None and images:
+            im = images[0]
         if not (im and im.image):
             return None
         request = self.context.get("request")

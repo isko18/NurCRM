@@ -768,6 +768,21 @@ class Order(models.Model):
 
     updated_at = models.DateTimeField("Обновлено", auto_now=True)
 
+    # Несколько чеков за один стол: общий UUID сессии + подпись чека (опционально).
+    table_session_id = models.UUIDField(
+        "Сессия стола (разделение чеков)", null=True, blank=True, db_index=True,
+    )
+    check_label = models.CharField("Метка чека", max_length=64, blank=True, default="")
+
+    cash_shift = models.ForeignKey(
+        "construction.CashShift",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="cafe_orders",
+        verbose_name="Кассовая смена",
+    )
+
     class Meta:
         verbose_name = 'Заказ'
         verbose_name_plural = 'Заказы'
@@ -776,6 +791,7 @@ class Order(models.Model):
             models.Index(fields=['company', 'created_at']),
             models.Index(fields=['company', 'branch', 'created_at']),
             models.Index(fields=['client', 'created_at']),
+            models.Index(fields=['company', 'table_session_id']),
         ]
 
     def __str__(self):
@@ -784,7 +800,16 @@ class Order(models.Model):
     def recalc_total(self):
         total = Decimal("0")
         for it in self.items.select_related("menu_item").all():
-            total += (it.menu_item.price or Decimal("0")) * Decimal(it.quantity or 0)
+            if it.is_rejected:
+                continue
+            if it.line_kind == OrderItem.LineKind.SERVICE:
+                unit = it.unit_price or Decimal("0")
+            else:
+                if it.unit_price is not None:
+                    unit = it.unit_price
+                else:
+                    unit = (it.menu_item.price if it.menu_item_id else Decimal("0"))
+            total += unit * Decimal(it.quantity or 0)
         self.total_amount = total
         return total
 
@@ -803,14 +828,22 @@ class Order(models.Model):
                 raise ValidationError({'table': 'Стол принадлежит другой компании.'})
             if self.client and self.client.company_id != self.company_id:
                 raise ValidationError({'client': 'Клиент принадлежит другой компании.'})
+            if self.cash_shift and self.cash_shift.company_id != self.company_id:
+                raise ValidationError({'cash_shift': 'Смена принадлежит другой компании.'})
         if self.branch_id:
             if self.table and self.table.branch_id not in (None, self.branch_id):
                 raise ValidationError({'table': 'Стол другого филиала.'})
             if self.client and self.client.branch_id not in (None, self.branch_id):
                 raise ValidationError({'client': 'Клиент другого филиала.'})
+            if self.cash_shift and self.cash_shift.branch_id not in (None, self.branch_id):
+                raise ValidationError({'cash_shift': 'Смена другого филиала.'})
 
 
 class OrderItem(models.Model):
+    class LineKind(models.TextChoices):
+        MENU = "menu", "Меню"
+        SERVICE = "service", "Услуга"
+
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     company = models.ForeignKey(
         Company, on_delete=models.CASCADE,
@@ -819,28 +852,59 @@ class OrderItem(models.Model):
     order = models.ForeignKey(
         Order, on_delete=models.CASCADE, related_name='items', verbose_name='Заказ'
     )
+    line_kind = models.CharField(
+        "Тип строки", max_length=16, choices=LineKind.choices,
+        default=LineKind.MENU, db_index=True,
+    )
     menu_item = models.ForeignKey(
-        'MenuItem', on_delete=models.PROTECT, related_name='order_items', verbose_name='Позиция меню'
+        'MenuItem', on_delete=models.PROTECT,
+        related_name='order_items', verbose_name='Позиция меню',
+        null=True, blank=True,
+    )
+    service_title = models.CharField("Услуга (название)", max_length=255, blank=True, default="")
+    unit_price = models.DecimalField(
+        "Цена за ед.", max_digits=12, decimal_places=2, null=True, blank=True,
     )
     quantity = models.PositiveIntegerField('Кол-во', default=1, validators=[MinValueValidator(1)])
+
+    is_rejected = models.BooleanField("Отказ гостя", default=False, db_index=True)
+    rejection_reason = models.CharField("Причина отказа", max_length=500, blank=True, default="")
+    rejected_at = models.DateTimeField("Отказано в", null=True, blank=True)
 
     class Meta:
         verbose_name = 'Позиция заказа'
         verbose_name_plural = 'Позиции заказа'
         constraints = [
-            models.UniqueConstraint(fields=['order', 'menu_item'], name='uniq_order_menuitem'),
+            models.UniqueConstraint(
+                fields=['order', 'menu_item'],
+                condition=Q(menu_item__isnull=False),
+                name='uniq_order_menuitem_when_menu',
+            ),
         ]
         indexes = [
             models.Index(fields=['company']),
             models.Index(fields=['order']),
+            models.Index(fields=['order', 'is_rejected']),
         ]
 
     def clean(self):
-        if self.order and self.menu_item:
-            if self.order.company_id != self.menu_item.company_id:
-                raise ValidationError({'menu_item': 'Позиция меню из другой компании.'})
-            if (self.order.branch_id or None) != (self.menu_item.branch_id or None):
-                raise ValidationError({'menu_item': 'Позиция меню другого филиала.'})
+        if self.line_kind == self.LineKind.SERVICE:
+            if not (self.service_title or "").strip():
+                raise ValidationError({'service_title': 'Укажите название услуги.'})
+            if self.unit_price is None:
+                raise ValidationError({'unit_price': 'Укажите цену услуги.'})
+            if self.menu_item_id:
+                raise ValidationError({'menu_item': 'Для услуги не указывайте позицию меню.'})
+        else:
+            if not self.menu_item_id:
+                raise ValidationError({'menu_item': 'Выберите позицию меню.'})
+            if self.order and self.menu_item:
+                if self.order.company_id != self.menu_item.company_id:
+                    raise ValidationError({'menu_item': 'Позиция меню из другой компании.'})
+                if (self.order.branch_id or None) != (self.menu_item.branch_id or None):
+                    raise ValidationError({'menu_item': 'Позиция меню другого филиала.'})
+        if self.is_rejected and not (self.rejection_reason or "").strip():
+            raise ValidationError({'rejection_reason': 'Укажите причину отказа.'})
 
     def save(self, *args, **kwargs):
         if self.order_id:
@@ -850,7 +914,11 @@ class OrderItem(models.Model):
         super().save(*args, **kwargs)
 
     def __str__(self):
-        return f'{self.menu_item.title} × {self.quantity}'
+        if self.line_kind == self.LineKind.SERVICE:
+            return f'{self.service_title} × {self.quantity}'
+        if self.menu_item_id:
+            return f'{self.menu_item.title} × {self.quantity}'
+        return f'× {self.quantity}'
 
 
 # ==========================
@@ -921,9 +989,15 @@ class OrderItemHistory(models.Model):
         MenuItem, on_delete=models.SET_NULL, null=True, blank=True,
         related_name='archived_items', verbose_name='Позиция (ref)'
     )
+    line_kind = models.CharField(
+        "Тип строки", max_length=16,
+        choices=OrderItem.LineKind.choices, default=OrderItem.LineKind.MENU,
+    )
     menu_item_title = models.CharField('Название позиции (снапшот)', max_length=255)
     menu_item_price = models.DecimalField('Цена (снапшот)', max_digits=10, decimal_places=2)
     quantity = models.PositiveIntegerField('Кол-во', default=1)
+    is_rejected = models.BooleanField("Отказ", default=False)
+    rejection_reason = models.CharField("Причина отказа", max_length=500, blank=True, default="")
 
     class Meta:
         verbose_name = 'Архив позиции заказа'
@@ -1001,6 +1075,115 @@ class OrderDebtPayment(models.Model):
         return f"{self.amount} → order {str(self.order_id)[:8]}"
 
 
+class CafeExpense(models.Model):
+    """Операционные расходы кафе (не закупки Purchase)."""
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    company = models.ForeignKey(
+        Company, on_delete=models.CASCADE,
+        related_name="cafe_expenses", verbose_name="Компания",
+    )
+    branch = models.ForeignKey(
+        Branch, on_delete=models.CASCADE,
+        related_name="cafe_expenses", verbose_name="Филиал",
+        null=True, blank=True, db_index=True,
+    )
+    title = models.CharField("Статья / описание", max_length=255)
+    amount = models.DecimalField(
+        "Сумма", max_digits=12, decimal_places=2,
+        validators=[MinValueValidator(Decimal("0.01"))],
+    )
+    category = models.CharField("Категория", max_length=128, blank=True, default="")
+    expense_date = models.DateField("Дата расхода", db_index=True)
+    note = models.TextField("Примечание", blank=True, default="")
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL,
+        null=True, blank=True, related_name="cafe_expenses_created", verbose_name="Создал",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        verbose_name = "Расход кафе"
+        verbose_name_plural = "Расходы кафе"
+        ordering = ["-expense_date", "-created_at"]
+        indexes = [
+            models.Index(fields=["company", "expense_date"]),
+            models.Index(fields=["company", "branch", "expense_date"]),
+        ]
+
+    def clean(self):
+        if self.branch_id and self.branch.company_id != self.company_id:
+            raise ValidationError({"branch": "Филиал другой компании."})
+
+    def save(self, *args, **kwargs):
+        self.full_clean()
+        super().save(*args, **kwargs)
+
+    def __str__(self):
+        return f"{self.title} — {self.amount}"
+
+
+class CafeWaiterPayProfile(models.Model):
+    """Оклад (в месяц) + процент от выручки официанта за период (см. аналитику зарплаты)."""
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    company = models.ForeignKey(
+        Company, on_delete=models.CASCADE,
+        related_name="cafe_waiter_pay_profiles", verbose_name="Компания",
+    )
+    branch = models.ForeignKey(
+        Branch, on_delete=models.CASCADE,
+        related_name="cafe_waiter_pay_profiles", verbose_name="Филиал",
+        null=True, blank=True, db_index=True,
+    )
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.CASCADE,
+        related_name="cafe_waiter_pay_profiles", verbose_name="Сотрудник",
+    )
+    monthly_base_salary = models.DecimalField(
+        "Оклад в месяц", max_digits=12, decimal_places=2, default=Decimal("0"),
+        validators=[MinValueValidator(Decimal("0"))],
+    )
+    revenue_percent = models.DecimalField(
+        "Процент от личной выручки", max_digits=5, decimal_places=2, default=Decimal("0"),
+        validators=[MinValueValidator(Decimal("0"))],
+    )
+
+    class Meta:
+        verbose_name = "Настройка зарплаты официанта"
+        verbose_name_plural = "Настройки зарплат официантов"
+        constraints = [
+            models.UniqueConstraint(
+                fields=["company", "branch", "user"],
+                name="uniq_cafe_waiter_pay_company_branch_user",
+                condition=Q(branch__isnull=False),
+            ),
+            models.UniqueConstraint(
+                fields=["company", "user"],
+                name="uniq_cafe_waiter_pay_company_user_global_branch",
+                condition=Q(branch__isnull=True),
+            ),
+        ]
+        indexes = [
+            models.Index(fields=["company", "user"]),
+        ]
+
+    def clean(self):
+        if self.user_id and self.company_id:
+            uid = getattr(self.user, "company_id", None)
+            if uid and uid != self.company_id:
+                raise ValidationError({"user": "Пользователь другой компании."})
+        if self.branch_id and self.branch.company_id != self.company_id:
+            raise ValidationError({"branch": "Филиал другой компании."})
+        if self.revenue_percent > Decimal("100"):
+            raise ValidationError({"revenue_percent": "Не больше 100%."})
+
+    def save(self, *args, **kwargs):
+        self.full_clean()
+        super().save(*args, **kwargs)
+
+    def __str__(self):
+        return f"{self.user_id} @ {self.company_id}"
+
+
 # ==========================
 # Сигналы: архив + синхронизация задач кухни
 # ==========================
@@ -1041,16 +1224,35 @@ def archive_order_before_delete(sender, instance: Order, **kwargs):
         except IntegrityError:
             return
 
-        items = [
-            OrderItemHistory(
-                order_history=oh,
-                menu_item=it.menu_item,
-                menu_item_title=it.menu_item.title,
-                menu_item_price=it.menu_item.price,
-                quantity=it.quantity,
-            )
-            for it in instance.items.select_related("menu_item")
-        ]
+        items = []
+        for it in instance.items.select_related("menu_item"):
+            if it.line_kind == OrderItem.LineKind.SERVICE:
+                items.append(
+                    OrderItemHistory(
+                        order_history=oh,
+                        menu_item=None,
+                        line_kind=it.line_kind,
+                        menu_item_title=(it.service_title or "").strip() or "Услуга",
+                        menu_item_price=it.unit_price or Decimal("0"),
+                        quantity=it.quantity,
+                        is_rejected=it.is_rejected,
+                        rejection_reason=it.rejection_reason or "",
+                    )
+                )
+            else:
+                mi = it.menu_item
+                items.append(
+                    OrderItemHistory(
+                        order_history=oh,
+                        menu_item=mi,
+                        line_kind=it.line_kind,
+                        menu_item_title=mi.title if mi else "",
+                        menu_item_price=mi.price if mi else Decimal("0"),
+                        quantity=it.quantity,
+                        is_rejected=it.is_rejected,
+                        rejection_reason=it.rejection_reason or "",
+                    )
+                )
         if items:
             OrderItemHistory.objects.bulk_create(items)
 
@@ -1063,6 +1265,14 @@ def ensure_kitchen_tasks_for_order_item(sender, instance: "OrderItem", created, 
     - Создаём отсутствующие unit_index (не по count).
     - При уменьшении quantity удаляем лишние только в PENDING.
     """
+    if instance.line_kind == OrderItem.LineKind.SERVICE or not instance.menu_item_id:
+        KitchenTask.objects.filter(order_item=instance).delete()
+        return
+
+    if instance.is_rejected:
+        KitchenTask.objects.filter(order_item=instance).update(status=KitchenTask.Status.CANCELLED)
+        return
+
     need = int(instance.quantity or 0)
     if need <= 0:
         return
