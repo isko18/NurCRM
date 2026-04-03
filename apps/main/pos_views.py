@@ -132,6 +132,13 @@ _to_decimal = to_decimal
 _as_decimal = as_decimal
 
 
+def _is_market_company(company: Company) -> bool:
+    try:
+        return bool(company and getattr(company, "is_market", None) and company.is_market())
+    except Exception:
+        return False
+
+
 def _cart_queryset_for_response():
     image_qs = ProductImage.objects.only("id", "product_id", "image", "alt", "is_primary").order_by("id")
     item_qs = (
