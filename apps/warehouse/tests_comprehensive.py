@@ -1,14 +1,13 @@
-"""
-Полный набор тестов для приложения Warehouse.
-Покрывает все типы документов, валидацию, проведение и отмену.
-"""
+from decimal import Decimal
+from datetime import datetime
+
 from django.test import TestCase
 from django.urls import reverse
-from decimal import Decimal
 from django.contrib.auth import get_user_model
 from django.core.exceptions import ValidationError
 from django.core.cache import cache
 from django.conf import settings
+from django.utils import timezone
 from rest_framework.test import APIClient
 
 from apps.warehouse import models
@@ -1331,3 +1330,66 @@ class WarehouseComprehensiveTests(TestCase):
         doc = models.Document.objects.get(id=response.data["id"])
         self.assertIsNone(doc.agent_id)
         self.assertFalse(doc.use_common_stock)
+
+    def test_counterparties_crud_filters_by_activity_date_range(self):
+        """Список контрагентов должен учитывать date_from/date_to по связанным операциям."""
+        self.user.role = Roles.OWNER
+        self.user.save(update_fields=["role"])
+
+        cp_in_range = models.Counterparty.objects.create(
+            company=self.company,
+            branch=self.branch,
+            name="Контрагент в периоде",
+            phone="+996700000101",
+            type=models.Counterparty.Type.CLIENT,
+        )
+        cp_out_range = models.Counterparty.objects.create(
+            company=self.company,
+            branch=self.branch,
+            name="Контрагент вне периода",
+            phone="+996700000102",
+            type=models.Counterparty.Type.CLIENT,
+        )
+
+        in_range_doc = models.Document.objects.create(
+            doc_type=models.Document.DocType.SALE,
+            status=models.Document.Status.POSTED,
+            warehouse_from=self.wh1,
+            counterparty=cp_in_range,
+            total=Decimal("100.00"),
+        )
+        out_range_doc = models.Document.objects.create(
+            doc_type=models.Document.DocType.SALE,
+            status=models.Document.Status.POSTED,
+            warehouse_from=self.wh1,
+            counterparty=cp_out_range,
+            total=Decimal("200.00"),
+        )
+
+        models.Document.objects.filter(pk=in_range_doc.pk).update(
+            date=timezone.make_aware(datetime(2026, 4, 5, 12, 0, 0))
+        )
+        models.Document.objects.filter(pk=out_range_doc.pk).update(
+            date=timezone.make_aware(datetime(2026, 3, 20, 12, 0, 0))
+        )
+
+        api_client = APIClient()
+        api_client.force_authenticate(user=self.user)
+
+        response = api_client.get(
+            reverse("counterparties-crud"),
+            {
+                "date_from": "2026-04-01",
+                "date_to": "2026-04-11",
+            },
+        )
+
+        self.assertEqual(response.status_code, 200, response.data)
+        payload = response.data.get("results", response.data)
+        ids = {row["id"] for row in payload}
+        self.assertIn(str(cp_in_range.id), ids)
+        self.assertNotIn(str(cp_out_range.id), ids)
+
+        row = next(item for item in payload if item["id"] == str(cp_in_range.id))
+        self.assertEqual(row["analytics"]["sales"]["count"], 1)
+        self.assertEqual(row["analytics"]["sales"]["total"], "100.00")

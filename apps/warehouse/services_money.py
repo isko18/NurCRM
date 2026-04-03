@@ -4,6 +4,7 @@ from uuid import UUID
 from django.db import transaction
 from django.db.models import Count, DecimalField, Q, Sum, Value
 from django.db.models.functions import Coalesce
+from django.utils.dateparse import parse_date
 from django.utils import timezone
 
 from . import models
@@ -39,6 +40,32 @@ def norm_counterparty_id(pk):
     return pk if isinstance(pk, UUID) else UUID(str(pk))
 
 
+def get_requested_date_range(mixin):
+    request = getattr(mixin, "request", None)
+    qp = getattr(request, "query_params", None)
+    if qp is None:
+        return None, None
+
+    raw_from = qp.get("date_from") or qp.get("period_start")
+    raw_to = qp.get("date_to") or qp.get("period_end")
+
+    date_from = parse_date(raw_from) if raw_from else None
+    date_to = parse_date(raw_to) if raw_to else None
+
+    if date_from and date_to and date_to < date_from:
+        date_from, date_to = date_to, date_from
+    return date_from, date_to
+
+
+def apply_requested_date_range(qs, field_name: str, mixin):
+    date_from, date_to = get_requested_date_range(mixin)
+    if date_from:
+        qs = qs.filter(**{f"{field_name}__date__gte": date_from})
+    if date_to:
+        qs = qs.filter(**{f"{field_name}__date__lte": date_to})
+    return qs
+
+
 def bulk_counterparty_mini_analytics(mixin, counterparty_ids) -> dict:
     """
     Та же сводка, что CounterpartyMoneyOperationsView._counterparty_mini_analytics,
@@ -72,6 +99,7 @@ def bulk_counterparty_mini_analytics(mixin, counterparty_ids) -> dict:
         status__in=(Doc.Status.POSTED, Doc.Status.CASH_PENDING),
     )
     sales_qs = f(sales_qs, company_field="warehouse_from__company_id", branch_field="warehouse_from__branch")
+    sales_qs = apply_requested_date_range(sales_qs, "date", mixin)
 
     for row in sales_qs.values("counterparty_id").annotate(
         sales_total=Coalesce(Sum("total"), zero_money),
@@ -101,6 +129,7 @@ def bulk_counterparty_mini_analytics(mixin, counterparty_ids) -> dict:
         doc_type__in=trade_doc_types,
     )
     docs_qs = f(docs_qs, company_field="warehouse_from__company_id", branch_field="warehouse_from__branch")
+    docs_qs = apply_requested_date_range(docs_qs, "date", mixin)
 
     doc_map = {
         r["counterparty_id"]: r
@@ -116,6 +145,7 @@ def bulk_counterparty_mini_analytics(mixin, counterparty_ids) -> dict:
         doc_type__in=(MD.DocType.MONEY_RECEIPT, MD.DocType.MONEY_EXPENSE),
     )
     money_qs = f(money_qs)
+    money_qs = apply_requested_date_range(money_qs, "date", mixin)
 
     money_map = {
         r["counterparty_id"]: r

@@ -564,6 +564,22 @@ class CounterpartyListCreateView(CompanyBranchRestrictedMixin, generics.ListCrea
         user = self.request.user
         if not _is_owner_like(user):
             qs = qs.filter(agent=user)
+        date_from, date_to = services_money.get_requested_date_range(self)
+        if date_from or date_to:
+            doc_qs = models.Document.objects.filter(counterparty_id__isnull=False)
+            doc_qs = self._filter_qs_company_branch(
+                doc_qs,
+                company_field="warehouse_from__company_id",
+                branch_field="warehouse_from__branch",
+            )
+            doc_qs = services_money.apply_requested_date_range(doc_qs, "date", self)
+
+            money_qs = self._filter_qs_company_branch(models.MoneyDocument.objects.filter(counterparty_id__isnull=False))
+            money_qs = services_money.apply_requested_date_range(money_qs, "date", self)
+
+            qs = qs.filter(
+                Q(pk__in=doc_qs.values("counterparty_id")) | Q(pk__in=money_qs.values("counterparty_id"))
+            ).distinct()
         return qs
 
     def perform_create(self, serializer):
