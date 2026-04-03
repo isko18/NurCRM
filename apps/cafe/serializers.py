@@ -321,11 +321,22 @@ class TableSerializer(CompanyBranchReadOnlyMixin):
 
 
 class WarehouseSerializer(CompanyBranchReadOnlyMixin):
+    supplier = serializers.CharField(
+        max_length=255,
+        allow_blank=True,
+        allow_null=True,
+        required=False,
+        default="",
+    )
+
     class Meta:
         ref_name = "CafeWarehouse"
         model = Warehouse
         fields = ["id", "company", "branch", "title", "supplier", "unit", "remainder", "minimum", "unit_price"]
         read_only_fields = ["id", "company", "branch"]
+
+    def validate_supplier(self, value):
+        return "" if value is None else value
 
     def validate(self, attrs):
         title = attrs.get("title")
