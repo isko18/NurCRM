@@ -112,6 +112,10 @@ class _DocumentTypedListCreateView(DocumentListCreateView):
             extra["doc_type"] = self.DOC_TYPE
         user = self.request.user
         if _is_owner_like(user):
+            validated_agent = serializer.validated_data.get("agent")
+            if getattr(validated_agent, "id", None) == getattr(user, "id", None):
+                # Owner sale must use warehouse stock even if the client sends agent=self.
+                extra["agent"] = None
             self._save_with_company_branch(serializer, **extra)
             return
         wh_from = serializer.validated_data.get("warehouse_from")
