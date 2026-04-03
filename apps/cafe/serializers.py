@@ -688,9 +688,7 @@ class OrderSerializer(CompanyBranchReadOnlyMixin):
     client = serializers.PrimaryKeyRelatedField(queryset=CafeClient.objects.all(), required=False, allow_null=True)
     waiter = serializers.PrimaryKeyRelatedField(queryset=User.objects.all(), allow_null=True, required=False)
     items = OrderItemInlineSerializer(many=True, required=False)
-    balance_due = serializers.DecimalField(
-        max_digits=12, decimal_places=2, read_only=True, source="balance_due",
-    )
+    balance_due = serializers.DecimalField(max_digits=12, decimal_places=2, read_only=True)
 
     class Meta:
         ref_name = "CafeOrder"
