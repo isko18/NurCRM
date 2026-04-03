@@ -6,12 +6,12 @@ from django.core.validators import MinValueValidator
 from decimal import Decimal, ROUND_HALF_UP
 from dateutil.relativedelta import relativedelta
 from django.db import transaction, connection
-from django.db.models import Sum, F, Q, Max, IntegerField
+from django.db.models import Sum, F, Q, Max, IntegerField, Value, ExpressionWrapper
 from mptt.models import MPTTModel, TreeForeignKey
 import uuid, secrets
 from django.core.files.base import ContentFile
 from PIL import Image
-from django.db.models.functions import Cast
+from django.db.models.functions import Cast, Coalesce, Greatest
 import io
 import logging
 import json
@@ -1482,24 +1482,22 @@ class Cart(models.Model):
         return super().save(*args, **kwargs)
 
     def recalc(self):
-        subtotal = Decimal("0")
-        line_discount_total = Decimal("0")
+        calc_field = models.DecimalField(max_digits=24, decimal_places=6)
+        zero = Value(Decimal("0.00"), output_field=calc_field)
+        base_unit = Coalesce(F("product__price"), F("unit_price"), output_field=calc_field)
+        line_base = ExpressionWrapper(base_unit * F("quantity"), output_field=calc_field)
+        line_actual = ExpressionWrapper(
+            (F("unit_price") * F("quantity")) - Coalesce(F("line_discount"), zero, output_field=calc_field),
+            output_field=calc_field,
+        )
+        line_diff = ExpressionWrapper(line_base - line_actual, output_field=calc_field)
 
-        for it in self.items.select_related("product"):
-            qty = Decimal(it.quantity or 0)
-            unit = Decimal(it.unit_price or 0)
-            line_disc = Decimal(getattr(it, "line_discount", None) or 0)
-            # Фактическая сумма: (unit_price - line_discount/qty) * qty = unit_price*qty - line_discount
-            line_actual = unit * qty - line_disc
-            base_unit = getattr(it.product, "price", None) or unit
-            line_base = base_unit * qty
-            subtotal += max(line_base, line_actual)
-            diff = line_base - line_actual
-            if diff > 0:
-                line_discount_total += diff
-
-        subtotal = _money(subtotal)
-        line_discount_total = _money(line_discount_total)
+        aggregated = self.items.aggregate(
+            subtotal=Sum(Greatest(line_base, line_actual)),
+            line_discount_total=Sum(Greatest(line_diff, zero)),
+        )
+        subtotal = _money(aggregated.get("subtotal") or Decimal("0"))
+        line_discount_total = _money(aggregated.get("line_discount_total") or Decimal("0"))
 
         # Скидка на чек: либо % от subtotal, либо фиксированная сумма
         order_percent = getattr(self, "order_discount_percent", None)
