@@ -747,8 +747,16 @@ class OrderListCreateView(CompanyBranchQuerysetMixin, generics.ListCreateAPIView
         .prefetch_related("items__menu_item")
     )
     serializer_class = OrderSerializer
-    filter_backends = [DjangoFilterBackend, filters.OrderingFilter]
+    filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
     filterset_class = OrderFilter
+    # Параметр ?search= с фронта (целое число стола через SearchFilter не ищем — у Table.number IntegerField).
+    search_fields = [
+        "client__name",
+        "client__phone",
+        "waiter__email",
+        "waiter__first_name",
+        "waiter__last_name",
+    ]
     ordering_fields = ["created_at", "guests", "id"]
     
     def perform_create(self, serializer):

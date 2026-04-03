@@ -136,7 +136,12 @@ class KitchenTaskSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSeriali
     guest = serializers.SerializerMethodField()
     waiter_label = serializers.SerializerMethodField()
     menu_item_title = serializers.CharField(source='menu_item.title', read_only=True)
-    price = serializers.DecimalField(source='menu_item.price', max_digits=10, decimal_places=2, read_only=True)
+    price = serializers.DecimalField(
+        source="menu_item.price",
+        max_digits=11,
+        decimal_places=3,
+        read_only=True,
+    )
 
     class Meta:
         model = KitchenTask
@@ -604,7 +609,13 @@ class BookingSerializer(CompanyBranchReadOnlyMixin):
 # --------- Заказы ---------
 class OrderItemInlineSerializer(serializers.ModelSerializer):
     menu_item_title = serializers.CharField(source="menu_item.title", read_only=True)
-    menu_item_price = serializers.DecimalField(source="menu_item.price", max_digits=10, decimal_places=2, read_only=True)
+    # Должно совпадать с MenuItem.price (11,3), иначе DRF падает при сериализации списка заказов.
+    menu_item_price = serializers.DecimalField(
+        source="menu_item.price",
+        max_digits=11,
+        decimal_places=3,
+        read_only=True,
+    )
 
     class Meta:
         model = OrderItem
