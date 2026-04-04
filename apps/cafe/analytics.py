@@ -122,6 +122,37 @@ def _order_final_amount_expr():
     )
 
 
+def _is_owner_like(user) -> bool:
+    if not user or not getattr(user, "is_authenticated", False):
+        return False
+    if getattr(user, "is_superuser", False):
+        return True
+    if getattr(user, "role", None) in ("owner", "admin"):
+        return True
+    if getattr(user, "owned_company", None):
+        return True
+    return False
+
+
+def _analytics_waiter_scope(request):
+    """
+    Для сотрудников без owner/admin прав аналитика в кафе должна быть только по их заказам.
+    """
+    user = getattr(request, "user", None)
+    if not user or not getattr(user, "is_authenticated", False):
+        return None
+    if _is_owner_like(user):
+        return None
+    return getattr(user, "id", None)
+
+
+def _apply_waiter_scope(qs, request, field_name: str):
+    waiter_id = _analytics_waiter_scope(request)
+    if waiter_id:
+        qs = qs.filter(**{field_name: waiter_id})
+    return qs, waiter_id
+
+
 def _apply_branch_scope_for_kitchen_tasks(qs, mixin: CompanyBranchQuerysetMixin):
     """
     Оставляем твою старую логику для kitchen analytics:
@@ -199,13 +230,18 @@ class KitchenAnalyticsBaseView(CompanyBranchQuerysetMixin, APIView):
 
         df = request.query_params.get("date_from")
         dt = request.query_params.get("date_to")
+        waiter_scope_id = _analytics_waiter_scope(request) if self.group_field == "waiter" else None
 
         branch = self._active_branch()
         key = _cache_key(
             f"kitchen:{self.group_field}",
             company_id=str(company.id),
             branch_id=str(branch.id) if branch else None,
-            params={"date_from": df, "date_to": dt},
+            params={
+                "date_from": df,
+                "date_to": dt,
+                "waiter_scope_id": str(waiter_scope_id) if waiter_scope_id else None,
+            },
         )
         hit = _cache_get(key)
         if hit is not None:
@@ -213,6 +249,8 @@ class KitchenAnalyticsBaseView(CompanyBranchQuerysetMixin, APIView):
 
         qs = KitchenTask.objects.filter(company=company)
         qs = _apply_branch_scope_for_kitchen_tasks(qs, self)
+        if waiter_scope_id:
+            qs = qs.filter(waiter_id=waiter_scope_id)
         qs = _apply_date_range(qs, "created_at", df, dt)
 
         lead_time = ExpressionWrapper(F("finished_at") - F("started_at"), output_field=DurationField())
@@ -269,19 +307,25 @@ class SalesSummaryView(CompanyBranchQuerysetMixin, APIView):
 
         df = request.query_params.get("date_from")
         dt = request.query_params.get("date_to")
+        waiter_scope_id = _analytics_waiter_scope(request)
 
         branch = self._active_branch()
         key = _cache_key(
             "sales:summary",
             company_id=str(company.id),
             branch_id=str(branch.id) if branch else None,
-            params={"date_from": df, "date_to": dt},
+            params={
+                "date_from": df,
+                "date_to": dt,
+                "waiter_scope_id": str(waiter_scope_id) if waiter_scope_id else None,
+            },
         )
         hit = _cache_get(key)
         if hit is not None:
             return Response(hit)
 
         qs = _paid_order_lines_qs(company, branch)
+        qs, _ = _apply_waiter_scope(qs, request, "order__waiter_id")
         qs = _apply_date_range(qs, "order__paid_at", df, dt)
         line_total = _line_revenue_expr()
 
@@ -320,13 +364,19 @@ class SalesByMenuItemView(CompanyBranchQuerysetMixin, APIView):
             limit = max(1, min(int(limit_raw or 10), 200))
         except Exception:
             limit = 10
+        waiter_scope_id = _analytics_waiter_scope(request)
 
         branch = self._active_branch()
         key = _cache_key(
             "sales:items",
             company_id=str(company.id),
             branch_id=str(branch.id) if branch else None,
-            params={"date_from": df, "date_to": dt, "limit": limit},
+            params={
+                "date_from": df,
+                "date_to": dt,
+                "limit": limit,
+                "waiter_scope_id": str(waiter_scope_id) if waiter_scope_id else None,
+            },
         )
         hit = _cache_get(key)
         if hit is not None:
@@ -336,6 +386,7 @@ class SalesByMenuItemView(CompanyBranchQuerysetMixin, APIView):
             line_kind=OrderItem.LineKind.MENU,
             menu_item_id__isnull=False,
         )
+        qs, _ = _apply_waiter_scope(qs, request, "order__waiter_id")
         qs = _apply_date_range(qs, "order__paid_at", df, dt)
         line_total = _line_revenue_expr()
 
@@ -371,13 +422,19 @@ class SalesByCategoryView(CompanyBranchQuerysetMixin, APIView):
             limit = max(1, min(int(limit_raw or 50), 200))
         except Exception:
             limit = 50
+        waiter_scope_id = _analytics_waiter_scope(request)
 
         branch = self._active_branch()
         key = _cache_key(
             "sales:categories",
             company_id=str(company.id),
             branch_id=str(branch.id) if branch else None,
-            params={"date_from": df, "date_to": dt, "limit": limit},
+            params={
+                "date_from": df,
+                "date_to": dt,
+                "limit": limit,
+                "waiter_scope_id": str(waiter_scope_id) if waiter_scope_id else None,
+            },
         )
         hit = _cache_get(key)
         if hit is not None:
@@ -387,6 +444,7 @@ class SalesByCategoryView(CompanyBranchQuerysetMixin, APIView):
             line_kind=OrderItem.LineKind.MENU,
             menu_item_id__isnull=False,
         )
+        qs, _ = _apply_waiter_scope(qs, request, "order__waiter_id")
         qs = _apply_date_range(qs, "order__paid_at", df, dt)
         line_total = _line_revenue_expr()
 
@@ -419,12 +477,17 @@ class SalesByKitchenView(CompanyBranchQuerysetMixin, APIView):
 
         df = request.query_params.get("date_from")
         dt = request.query_params.get("date_to")
+        waiter_scope_id = _analytics_waiter_scope(request)
         branch = self._active_branch()
         key = _cache_key(
             "sales:kitchens",
             company_id=str(company.id),
             branch_id=str(branch.id) if branch else None,
-            params={"date_from": df, "date_to": dt},
+            params={
+                "date_from": df,
+                "date_to": dt,
+                "waiter_scope_id": str(waiter_scope_id) if waiter_scope_id else None,
+            },
         )
         hit = _cache_get(key)
         if hit is not None:
@@ -434,6 +497,7 @@ class SalesByKitchenView(CompanyBranchQuerysetMixin, APIView):
             line_kind=OrderItem.LineKind.MENU,
             menu_item_id__isnull=False,
         )
+        qs, _ = _apply_waiter_scope(qs, request, "order__waiter_id")
         qs = _apply_date_range(qs, "order__paid_at", df, dt)
         line_total = _line_revenue_expr()
 
@@ -478,6 +542,7 @@ class RevenueInflowView(CompanyBranchQuerysetMixin, APIView):
             qs = qs.filter(branch=branch)
         else:
             qs = qs.filter(branch__isnull=True)
+        qs, _ = _apply_waiter_scope(qs, request, "waiter_id")
         qs = _apply_date_range(qs, "paid_at", df, dt)
 
         final_expr = _order_final_amount_expr()
@@ -531,6 +596,7 @@ class RejectionsAnalyticsView(CompanyBranchQuerysetMixin, APIView):
             qs = qs.filter(Q(order__branch=branch) | Q(order__branch__isnull=True))
         else:
             qs = qs.filter(order__branch__isnull=True)
+        qs, _ = _apply_waiter_scope(qs, request, "order__waiter_id")
         qs = _apply_date_range(qs, "rejected_at", df, dt)
 
         line_total = _line_revenue_expr()
@@ -596,6 +662,7 @@ class CafeDebtAnalyticsView(CompanyBranchQuerysetMixin, APIView):
             qs = qs.filter(branch=branch)
         else:
             qs = qs.filter(branch__isnull=True)
+        qs, _ = _apply_waiter_scope(qs, request, "waiter_id")
 
         rows_out = []
         total_due = Decimal("0")
@@ -646,6 +713,7 @@ class CafeShiftReportView(CompanyBranchQuerysetMixin, APIView):
         qs = Order.objects.filter(company=company, cash_shift_id=shift.id, is_paid=True)
         if branch is not None:
             qs = qs.filter(branch=branch)
+        qs, _ = _apply_waiter_scope(qs, request, "waiter_id")
 
         final_expr = _order_final_amount_expr()
         by_pm = (
@@ -697,6 +765,7 @@ class CafeDailyCloseReportView(CompanyBranchQuerysetMixin, APIView):
             qs = qs.filter(branch=branch)
         else:
             qs = qs.filter(branch__isnull=True)
+        qs, _ = _apply_waiter_scope(qs, request, "waiter_id")
 
         final_expr = _order_final_amount_expr()
         by_pm = (
@@ -756,6 +825,9 @@ class CafeWaiterSalaryReportView(CompanyBranchQuerysetMixin, APIView):
             return Response({"detail": "date_to раньше date_from."}, status=400)
 
         prof_qs = CafeWaiterPayProfile.objects.filter(company=company)
+        waiter_scope_id = _analytics_waiter_scope(request)
+        if waiter_scope_id:
+            prof_qs = prof_qs.filter(user_id=waiter_scope_id)
         if branch is not None:
             prof_qs = prof_qs.filter(Q(branch=branch) | Q(branch__isnull=True))
         else:
@@ -868,6 +940,7 @@ class CafeWaiterSalesView(CompanyBranchQuerysetMixin, APIView):
             qs = qs.filter(branch=branch)
         else:
             qs = qs.filter(branch__isnull=True)
+        qs, _ = _apply_waiter_scope(qs, request, "waiter_id")
         qs = _apply_date_range(qs, "paid_at", df, dt)
 
         final_expr = _order_final_amount_expr()
