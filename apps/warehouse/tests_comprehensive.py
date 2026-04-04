@@ -1393,3 +1393,76 @@ class WarehouseComprehensiveTests(TestCase):
         row = next(item for item in payload if item["id"] == str(cp_in_range.id))
         self.assertEqual(row["analytics"]["sales"]["count"], 1)
         self.assertEqual(row["analytics"]["sales"]["total"], "100.00")
+
+    def test_owner_can_assign_agent_to_specific_warehouse_via_api(self):
+        self.user.role = Roles.OWNER
+        self.user.save(update_fields=["role"])
+
+        agent = User.objects.create_user(
+            email="warehouse-agent@example.com",
+            password="testpass123",
+            first_name="Warehouse",
+            last_name="Agent",
+        )
+
+        api_client = APIClient()
+        api_client.force_authenticate(user=self.user)
+
+        response = api_client.post(
+            reverse("warehouse-agents-company-memberships"),
+            {
+                "user": str(agent.id),
+                "assigned_warehouse": str(self.wh1.id),
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 201, response.data)
+        membership = models.CompanyWarehouseAgent.objects.get(company=self.company, user=agent)
+        self.assertEqual(membership.status, models.CompanyWarehouseAgent.Status.ACTIVE)
+        self.assertEqual(membership.assigned_warehouse_id, self.wh1.id)
+        self.assertEqual(response.data["assigned_warehouse"], str(self.wh1.id))
+
+    def test_agent_with_assigned_warehouse_sees_only_allowed_warehouse_and_cannot_use_other(self):
+        agent = User.objects.create_user(
+            email="warehouse-scope-agent@example.com",
+            password="testpass123",
+            first_name="Scoped",
+            last_name="Agent",
+        )
+        models.CompanyWarehouseAgent.objects.create(
+            company=self.company,
+            user=agent,
+            status=models.CompanyWarehouseAgent.Status.ACTIVE,
+            assigned_warehouse=self.wh1,
+        )
+
+        api_client = APIClient()
+        api_client.force_authenticate(user=agent)
+
+        response = api_client.get(reverse("warehouse"))
+        self.assertEqual(response.status_code, 200, response.data)
+        warehouse_ids = {row["id"] for row in response.data}
+        self.assertEqual(warehouse_ids, {str(self.wh1.id)})
+
+        forbidden_cart_response = api_client.post(
+            reverse("warehouse-agent-carts"),
+            {
+                "warehouse": str(self.wh2.id),
+                "note": "Попытка доступа к чужому складу",
+            },
+            format="json",
+        )
+        self.assertEqual(forbidden_cart_response.status_code, 400, forbidden_cart_response.data)
+        self.assertIn("warehouse", forbidden_cart_response.data)
+
+        allowed_cart_response = api_client.post(
+            reverse("warehouse-agent-carts"),
+            {
+                "warehouse": str(self.wh1.id),
+                "note": "Доступный склад",
+            },
+            format="json",
+        )
+        self.assertEqual(allowed_cart_response.status_code, 201, allowed_cart_response.data)
+        self.assertEqual(allowed_cart_response.data["warehouse"], str(self.wh1.id))

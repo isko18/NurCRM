@@ -45,6 +45,9 @@ class DocumentListCreateView(CompanyBranchRestrictedMixin, generics.ListCreateAP
             qs = qs.filter(
                 Q(warehouse_from__branch=branch) | Q(warehouse_to__branch=branch)
             )
+        assigned_warehouse_id = self._assigned_agent_warehouse_id(company=company)
+        if assigned_warehouse_id and not _is_owner_like(self.request.user):
+            qs = qs.filter(warehouse_from_id=assigned_warehouse_id)
         return qs
 
     def get_queryset(self):
@@ -65,8 +68,12 @@ class DocumentListCreateView(CompanyBranchRestrictedMixin, generics.ListCreateAP
     def perform_create(self, serializer):
         user = self.request.user
         if _is_owner_like(user):
+            self._ensure_agent_can_access_warehouse(serializer.validated_data.get("warehouse_from"), field_name="warehouse_from")
+            self._ensure_agent_can_access_warehouse(serializer.validated_data.get("warehouse_to"), field_name="warehouse_to")
             self._save_with_company_branch(serializer)
             return
+        self._ensure_agent_can_access_warehouse(serializer.validated_data.get("warehouse_from"), field_name="warehouse_from")
+        self._ensure_agent_can_access_warehouse(serializer.validated_data.get("warehouse_to"), field_name="warehouse_to")
         self._save_with_company_branch(serializer, agent=user)
 
 
@@ -81,6 +88,7 @@ class AgentDocumentListCreateView(DocumentListCreateView):
     def perform_create(self, serializer):
         user = self.request.user
         wh_from = serializer.validated_data.get("warehouse_from")
+        self._ensure_agent_can_access_warehouse(wh_from, field_name="warehouse_from")
 
         use_common_stock = bool(serializer.validated_data.get("use_common_stock", False))
         if not use_common_stock and wh_from is not None:
@@ -111,6 +119,8 @@ class _DocumentTypedListCreateView(DocumentListCreateView):
         if self.DOC_TYPE:
             extra["doc_type"] = self.DOC_TYPE
         user = self.request.user
+        self._ensure_agent_can_access_warehouse(serializer.validated_data.get("warehouse_from"), field_name="warehouse_from")
+        self._ensure_agent_can_access_warehouse(serializer.validated_data.get("warehouse_to"), field_name="warehouse_to")
         if _is_owner_like(user):
             validated_agent = serializer.validated_data.get("agent")
             if getattr(validated_agent, "id", None) == getattr(user, "id", None):
@@ -432,6 +442,8 @@ class DocumentTransferCreateAPIView(CompanyBranchRestrictedMixin, APIView):
             raise DRFValidationError({"company": "Компания не найдена."})
         wh_from = ser.validated_data["warehouse_from"]
         wh_to = ser.validated_data["warehouse_to"]
+        self._ensure_agent_can_access_warehouse(wh_from, field_name="warehouse_from")
+        self._ensure_agent_can_access_warehouse(wh_to, field_name="warehouse_to")
 
         if company and (wh_from.company_id != company.id or wh_to.company_id != company.id):
             raise DRFValidationError({"warehouse": "Склад принадлежит другой компании."})

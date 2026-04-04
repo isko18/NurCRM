@@ -577,6 +577,7 @@ class CompanyWarehouseAgentSerializer(serializers.ModelSerializer):
     company_name = serializers.CharField(source="company.name", read_only=True)
     user_display = serializers.SerializerMethodField()
     decided_by_display = serializers.SerializerMethodField()
+    assigned_warehouse = serializers.PrimaryKeyRelatedField(read_only=True)
     common_access_enabled = serializers.BooleanField(read_only=True)
     common_warehouse = serializers.PrimaryKeyRelatedField(read_only=True)
 
@@ -590,6 +591,7 @@ class CompanyWarehouseAgentSerializer(serializers.ModelSerializer):
             "user_display",
             "status",
             "note",
+            "assigned_warehouse",
             "common_access_enabled",
             "common_warehouse",
             "created_at",
@@ -601,6 +603,7 @@ class CompanyWarehouseAgentSerializer(serializers.ModelSerializer):
         read_only_fields = (
             "id",
             "status",
+            "assigned_warehouse",
             "common_access_enabled",
             "common_warehouse",
             "created_at",
@@ -630,7 +633,12 @@ class CompanyWarehouseAgentSerializer(serializers.ModelSerializer):
 
 
 class CompanyWarehouseAgentCommonAccessUpdateSerializer(serializers.ModelSerializer):
-    common_access_enabled = serializers.BooleanField(required=True)
+    assigned_warehouse = serializers.PrimaryKeyRelatedField(
+        queryset=m.Warehouse.objects.all(),
+        required=False,
+        allow_null=True,
+    )
+    common_access_enabled = serializers.BooleanField(required=False)
     common_warehouse = serializers.PrimaryKeyRelatedField(
         queryset=m.Warehouse.objects.all(),
         required=False,
@@ -639,23 +647,33 @@ class CompanyWarehouseAgentCommonAccessUpdateSerializer(serializers.ModelSeriali
 
     class Meta:
         model = m.CompanyWarehouseAgent
-        fields = ("common_access_enabled", "common_warehouse")
+        fields = ("assigned_warehouse", "common_access_enabled", "common_warehouse")
 
     def validate(self, attrs):
         attrs = super().validate(attrs)
-        enabled = attrs.get("common_access_enabled")
-        warehouse = attrs.get("common_warehouse")
+        inst = getattr(self, "instance", None)
+        enabled = attrs.get("common_access_enabled", getattr(inst, "common_access_enabled", False))
+        warehouse = attrs.get("common_warehouse", getattr(inst, "common_warehouse", None))
+        assigned_warehouse = attrs.get("assigned_warehouse", getattr(inst, "assigned_warehouse", None))
 
         if enabled and warehouse is None:
             raise serializers.ValidationError({"common_warehouse": "Укажите склад, если включен общий доступ."})
         if not enabled:
             attrs["common_warehouse"] = None
+            warehouse = None
 
-        inst = getattr(self, "instance", None)
         company = getattr(inst, "company", None)
-        if enabled and warehouse is not None and company is not None:
-            if getattr(warehouse, "company_id", None) != getattr(company, "id", None):
+        company_id = getattr(company, "id", None)
+        if assigned_warehouse is not None and company_id is not None:
+            if getattr(assigned_warehouse, "company_id", None) != company_id:
+                raise serializers.ValidationError({"assigned_warehouse": "Склад принадлежит другой компании."})
+        if enabled and warehouse is not None and company_id is not None:
+            if getattr(warehouse, "company_id", None) != company_id:
                 raise serializers.ValidationError({"common_warehouse": "Склад принадлежит другой компании."})
+        if assigned_warehouse is not None and warehouse is not None and getattr(assigned_warehouse, "id", None) != getattr(warehouse, "id", None):
+            raise serializers.ValidationError(
+                {"common_warehouse": "Общий доступ можно открыть только к назначенному складу агента."}
+            )
 
         return attrs
 

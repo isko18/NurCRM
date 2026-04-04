@@ -46,6 +46,7 @@ from .serializers import (
     CafeReceiptPrinterSettingsSerializer,
     CafeExpenseSerializer, CafeWaiterPayProfileSerializer,
 )
+from apps.utils import _is_owner_like
 
 
 _NUM_RE = re.compile(r"[-+]?\d+(?:[.,]\d+)?")
@@ -975,7 +976,7 @@ class OrderItemRetrieveUpdateDestroyView(CompanyBranchQuerysetMixin, generics.Re
         _recalc_order_after_items_change(serializer.instance.order_id)
 
     def perform_destroy(self, instance):
-        if instance.order.is_paid or instance.order.status != Order.Status.OPEN:
+        if not _is_owner_like(self.request.user) and (instance.order.is_paid or instance.order.status != Order.Status.OPEN):
             raise ValidationError({"detail": "Можно менять позиции только у открытого неоплаченного заказа."})
         oid = instance.order_id
         super().perform_destroy(instance)

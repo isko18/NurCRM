@@ -17,6 +17,7 @@ from apps.cafe.models import (
     CafeExpense, CafeWaiterPayProfile,
 )
 from apps.users.models import Branch
+from apps.utils import _is_owner_like
 
 User = get_user_model()
 
@@ -643,11 +644,12 @@ class OrderItemInlineSerializer(CompanyBranchReadOnlyMixin):
     def validate(self, attrs):
         inst = self.instance
         order = attrs.get("order") or (inst.order if inst else None)
+        can_edit_closed_order = _is_owner_like(self._user())
         if inst and "order" in attrs and attrs["order"] != inst.order:
             raise serializers.ValidationError({"order": "Нельзя переносить позицию в другой заказ."})
         if order is None and not isinstance(getattr(self, "parent", None), serializers.ListSerializer):
             raise serializers.ValidationError({"order": "Укажите заказ."})
-        if order and (order.is_paid or order.status != Order.Status.OPEN):
+        if order and not can_edit_closed_order and (order.is_paid or order.status != Order.Status.OPEN):
             raise serializers.ValidationError({"order": "Можно менять позиции только у открытого неоплаченного заказа."})
         line_kind = attrs.get("line_kind", getattr(inst, "line_kind", OrderItem.LineKind.MENU) if inst else OrderItem.LineKind.MENU)
         if line_kind == OrderItem.LineKind.SERVICE:
@@ -881,7 +883,8 @@ class OrderSerializer(CompanyBranchReadOnlyMixin):
 
     def update(self, instance, validated_data):
         items = validated_data.pop("items", None)
-        if items is not None and (instance.is_paid or instance.status != Order.Status.OPEN):
+        can_edit_closed_order = _is_owner_like(self._user())
+        if items is not None and not can_edit_closed_order and (instance.is_paid or instance.status != Order.Status.OPEN):
             raise serializers.ValidationError({"items": "Изменение позиций доступно только у открытого неоплаченного заказа."})
         with transaction.atomic():
             instance = super().update(instance, validated_data)
