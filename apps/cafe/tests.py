@@ -10,7 +10,9 @@ from rest_framework.test import APIRequestFactory, force_authenticate
 from apps.users.models import Company, Branch
 from apps.cafe.models import (
     Zone, Table, Order, OrderItem, MenuItem, Category, CafeClient, Kitchen, OrderDebtPayment,
+    CafeWaiterPayProfile,
 )
+from apps.cafe.analytics import SalesSummaryView, CafeWaiterSalaryReportView
 from apps.cafe.views import (
     send_order_created_notification,
     send_order_updated_notification,
@@ -828,3 +830,153 @@ class CafeOrderDebtAPITestCase(TransactionTestCase):
         self.assertFalse(r.data["is_paid"])
         self.assertEqual(Decimal(r.data["paid_amount"]), Decimal("50.00"))
         self.assertEqual(Decimal(r.data["balance_due"]), Decimal("150.00"))
+
+
+class CafeWaiterAnalyticsScopeTestCase(TestCase):
+    def setUp(self):
+        self.owner = User.objects.create_user(email="owner-analytics@test.com", password="testpass123")
+        self.owner.role = "owner"
+        self.owner.save(update_fields=["role"])
+
+        self.company = Company.objects.create(name="Analytics Cafe Co", owner=self.owner)
+        self.branch = Branch.objects.create(name="Analytics Branch", company=self.company)
+
+        self.waiter1 = User.objects.create_user(email="waiter-1@test.com", password="testpass123")
+        self.waiter1.company = self.company
+        self.waiter1.save(update_fields=["company"])
+
+        self.waiter2 = User.objects.create_user(email="waiter-2@test.com", password="testpass123")
+        self.waiter2.company = self.company
+        self.waiter2.save(update_fields=["company"])
+
+        self.zone = Zone.objects.create(company=self.company, branch=self.branch, title="Main zone")
+        self.table1 = Table.objects.create(
+            company=self.company,
+            branch=self.branch,
+            zone=self.zone,
+            number=1,
+            places=4,
+            status=Table.Status.FREE,
+        )
+        self.table2 = Table.objects.create(
+            company=self.company,
+            branch=self.branch,
+            zone=self.zone,
+            number=2,
+            places=4,
+            status=Table.Status.FREE,
+        )
+        self.category = Category.objects.create(company=self.company, branch=self.branch, title="Drinks")
+        self.menu_item = MenuItem.objects.create(
+            company=self.company,
+            branch=self.branch,
+            category=self.category,
+            title="Coffee",
+            price=Decimal("100.00"),
+            is_active=True,
+        )
+        self.client1 = CafeClient.objects.create(
+            company=self.company,
+            branch=self.branch,
+            name="Guest 1",
+            phone="+70000000001",
+        )
+        self.client2 = CafeClient.objects.create(
+            company=self.company,
+            branch=self.branch,
+            name="Guest 2",
+            phone="+70000000002",
+        )
+        self.api_factory = APIRequestFactory()
+        self.period_day = timezone.localdate().isoformat()
+
+    def _create_paid_order(self, *, waiter, table, client, quantity):
+        order = Order.objects.create(
+            company=self.company,
+            branch=self.branch,
+            table=table,
+            client=client,
+            waiter=waiter,
+            guests=1,
+            status=Order.Status.OPEN,
+        )
+        OrderItem.objects.create(
+            company=self.company,
+            order=order,
+            menu_item=self.menu_item,
+            quantity=quantity,
+        )
+        order.recalc_total()
+        order.is_paid = True
+        order.paid_at = timezone.now()
+        order.payment_method = "cash"
+        order.status = Order.Status.CLOSED
+        order.save(update_fields=["total_amount", "is_paid", "paid_at", "payment_method", "status"])
+        return order
+
+    def test_waiter_sales_summary_is_scoped_to_current_waiter(self):
+        self._create_paid_order(waiter=self.waiter1, table=self.table1, client=self.client1, quantity=1)
+        self._create_paid_order(waiter=self.waiter2, table=self.table2, client=self.client2, quantity=2)
+
+        request = self.api_factory.get(
+            f"/cafe/analytics/sales/summary/?branch={self.branch.id}&date_from={self.period_day}&date_to={self.period_day}"
+        )
+        force_authenticate(request, user=self.waiter1)
+        response = SalesSummaryView.as_view()(request)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["orders_count"], 1)
+        self.assertEqual(response.data["items_qty"], 1)
+        self.assertEqual(response.data["revenue"], "100.00")
+
+    def test_owner_sales_summary_sees_all_waiters(self):
+        self._create_paid_order(waiter=self.waiter1, table=self.table1, client=self.client1, quantity=1)
+        self._create_paid_order(waiter=self.waiter2, table=self.table2, client=self.client2, quantity=2)
+
+        request = self.api_factory.get(
+            f"/cafe/analytics/sales/summary/?branch={self.branch.id}&date_from={self.period_day}&date_to={self.period_day}"
+        )
+        force_authenticate(request, user=self.owner)
+        response = SalesSummaryView.as_view()(request)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["orders_count"], 2)
+        self.assertEqual(response.data["items_qty"], 3)
+        self.assertEqual(response.data["revenue"], "300.00")
+
+    def test_waiter_salary_report_returns_only_own_base_plus_percent(self):
+        self._create_paid_order(waiter=self.waiter1, table=self.table1, client=self.client1, quantity=1)
+        self._create_paid_order(waiter=self.waiter2, table=self.table2, client=self.client2, quantity=2)
+
+        CafeWaiterPayProfile.objects.create(
+            company=self.company,
+            branch=self.branch,
+            user=self.waiter1,
+            monthly_base_salary=Decimal("3000.00"),
+            revenue_percent=Decimal("10.00"),
+        )
+        CafeWaiterPayProfile.objects.create(
+            company=self.company,
+            branch=self.branch,
+            user=self.waiter2,
+            monthly_base_salary=Decimal("6000.00"),
+            revenue_percent=Decimal("20.00"),
+        )
+
+        request = self.api_factory.get(
+            f"/cafe/analytics/waiter-salary/?branch={self.branch.id}&date_from={self.period_day}&date_to={self.period_day}"
+        )
+        force_authenticate(request, user=self.waiter1)
+        response = CafeWaiterSalaryReportView.as_view()(request)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.data["rows"]), 1)
+
+        row = response.data["rows"][0]
+        self.assertEqual(row["user_id"], str(self.waiter1.id))
+        self.assertEqual(row["monthly_base_salary"], "3000.00")
+        self.assertEqual(row["revenue_percent"], "10.00")
+        self.assertEqual(row["base_prorated"], "100.00")
+        self.assertEqual(row["waiter_revenue_period"], "100.00")
+        self.assertEqual(row["percent_bonus"], "10.00")
+        self.assertEqual(row["total"], "110.00")
