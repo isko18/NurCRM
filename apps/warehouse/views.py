@@ -71,6 +71,21 @@ def _company_ids_for_warehouse_access(user):
     return list(ids)
 
 
+def _agent_membership_for_company(user, company):
+    if not user or not getattr(user, "is_authenticated", False) or company is None:
+        return None
+    return (
+        m.CompanyWarehouseAgent.objects
+        .filter(
+            user=user,
+            company=company,
+            status=m.CompanyWarehouseAgent.Status.ACTIVE,
+        )
+        .select_related("assigned_warehouse")
+        .first()
+    )
+
+
 # ---- Barcode helpers ----
 def _parse_scale_barcode(barcode: str):
     """
@@ -132,6 +147,34 @@ class CompanyBranchRestrictedMixin:
         if first:
             return first.company
         return None
+
+    def _agent_membership(self, company=None):
+        user = self._user()
+        if not user or not getattr(user, "is_authenticated", False):
+            return None
+        if _is_owner_like(user) or getattr(user, "company_id", None):
+            return None
+        company = company or self._company()
+        if company is None:
+            return None
+        return _agent_membership_for_company(user, company)
+
+    def _assigned_agent_warehouse_id(self, company=None):
+        membership = self._agent_membership(company=company)
+        if membership is None:
+            return None
+        return getattr(membership, "assigned_warehouse_id", None)
+
+    def _ensure_agent_can_access_warehouse(self, warehouse, *, field_name="warehouse"):
+        user = self._user()
+        if warehouse is None or not user or _is_owner_like(user) or getattr(user, "company_id", None):
+            return
+        membership = _agent_membership_for_company(user, getattr(warehouse, "company", None))
+        if membership is None:
+            raise ValidationError({field_name: "Склад принадлежит другой компании или у вас нет доступа."})
+        assigned_warehouse_id = getattr(membership, "assigned_warehouse_id", None)
+        if assigned_warehouse_id and assigned_warehouse_id != getattr(warehouse, "id", None):
+            raise ValidationError({field_name: "Вам назначен доступ только к другому складу."})
 
     def _fixed_branch_from_user(self, company) -> Optional[Branch]:
         req = self._request()
@@ -266,6 +309,13 @@ class CompanyBranchRestrictedMixin:
         elif self._model_has_field(model, "branch") and branch is not None:
             qs = qs.filter(branch=branch)
 
+        assigned_warehouse_id = self._assigned_agent_warehouse_id(company=company)
+        if assigned_warehouse_id:
+            if self._model_has_field(model, "warehouse"):
+                qs = qs.filter(warehouse_id=assigned_warehouse_id)
+            elif model is m.Warehouse:
+                qs = qs.filter(id=assigned_warehouse_id)
+
         return qs
 
     def _filter_qs_company_branch_relaxed(self, qs, company_field: Optional[str] = None, branch_field: Optional[str] = None):
@@ -328,6 +378,9 @@ def filter_qs_company_branch_or_global(view, qs):
     branch = view._auto_branch()
     if branch is not None and CompanyBranchRestrictedMixin._model_has_field(qs.model, "branch"):
         qs = qs.filter(Q(branch=branch) | Q(branch__isnull=True))
+    assigned_warehouse_id = view._assigned_agent_warehouse_id(company=company)
+    if assigned_warehouse_id and CompanyBranchRestrictedMixin._model_has_field(qs.model, "warehouse"):
+        qs = qs.filter(warehouse_id=assigned_warehouse_id)
     return qs
 
 
@@ -711,6 +764,7 @@ class AgentRequestCartListCreateAPIView(CompanyBranchRestrictedMixin, generics.L
         company_ids = _company_ids_for_warehouse_access(user)
         if company_ids and warehouse.company_id not in company_ids:
             raise ValidationError({"warehouse": "Склад принадлежит другой компании или у вас нет доступа."})
+        self._ensure_agent_can_access_warehouse(warehouse, field_name="warehouse")
 
         active_branch = self._auto_branch()
         if active_branch is not None and warehouse.branch_id not in (None, active_branch.id):
@@ -916,6 +970,9 @@ class AgentRequestItemListCreateAPIView(CompanyBranchRestrictedMixin, generics.L
         user = self.request.user
         if not _is_owner_like(user):
             qs = qs.filter(cart__agent=user)
+            assigned_warehouse_id = self._assigned_agent_warehouse_id()
+            if assigned_warehouse_id:
+                qs = qs.filter(cart__warehouse_id=assigned_warehouse_id)
         return qs
 
     def perform_create(self, serializer):
@@ -925,6 +982,7 @@ class AgentRequestItemListCreateAPIView(CompanyBranchRestrictedMixin, generics.L
             raise ValidationError("Укажите cart.")
         if not _is_owner_like(user) and cart.agent_id != user.id:
             raise PermissionDenied("Нет доступа к заявке.")
+        self._ensure_agent_can_access_warehouse(getattr(cart, "warehouse", None), field_name="cart")
         if cart.status != m.AgentRequestCart.Status.DRAFT:
             raise ValidationError("Можно добавлять позиции только в черновик.")
         serializer.save(
@@ -942,6 +1000,9 @@ class AgentRequestItemDetailAPIView(CompanyBranchRestrictedMixin, generics.Retri
         user = self.request.user
         if not _is_owner_like(user):
             qs = qs.filter(cart__agent=user)
+            assigned_warehouse_id = self._assigned_agent_warehouse_id()
+            if assigned_warehouse_id:
+                qs = qs.filter(cart__warehouse_id=assigned_warehouse_id)
         return qs
 
     def perform_update(self, serializer):
@@ -1263,10 +1324,11 @@ class CompanyWarehouseAgentRemoveAPIView(APIView):
 
 class CompanyWarehouseAgentCommonAccessUpdateAPIView(APIView):
     """
-    Владелец/админ включает агенту доступ к общему товару и выбирает склад.
+    Владелец/админ обновляет складской доступ агента.
 
     PATCH /api/warehouse/agents/company-requests/{id}/common-access/
     body:
+      - assigned_warehouse: uuid|null
       - common_access_enabled: bool
       - common_warehouse: uuid|null (обязателен если common_access_enabled=true)
     """
@@ -1285,7 +1347,7 @@ class CompanyWarehouseAgentCommonAccessUpdateAPIView(APIView):
             pk=pk,
         )
 
-        ser = CompanyWarehouseAgentCommonAccessUpdateSerializer(instance=obj, data=request.data, partial=False)
+        ser = CompanyWarehouseAgentCommonAccessUpdateSerializer(instance=obj, data=request.data, partial=True)
         ser.is_valid(raise_exception=True)
         ser.save()
         return Response(CompanyWarehouseAgentSerializer(obj).data)
@@ -1298,6 +1360,7 @@ class CompanyWarehouseAgentAdminAssignAPIView(APIView):
     POST /api/warehouse/agents/company-memberships/
     body:
       - user: uuid пользователя
+      - assigned_warehouse: uuid|null (опционально)
       - common_access_enabled: bool (опционально)
       - common_warehouse: uuid|null (опционально, обязателен если common_access_enabled=true)
     """
@@ -1332,7 +1395,11 @@ class CompanyWarehouseAgentAdminAssignAPIView(APIView):
         )
 
         # Применяем настройки общего доступа к складу, если они переданы
-        if "common_access_enabled" in request.data or "common_warehouse" in request.data:
+        if (
+            "assigned_warehouse" in request.data
+            or "common_access_enabled" in request.data
+            or "common_warehouse" in request.data
+        ):
             ser = CompanyWarehouseAgentCommonAccessUpdateSerializer(
                 instance=obj,
                 data=request.data,

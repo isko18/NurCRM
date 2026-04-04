@@ -19,7 +19,11 @@ def agent_has_common_access_to_warehouse(*, user, warehouse, company=None) -> bo
     )
     if company is not None:
         qs = qs.filter(company=company)
-    return qs.exists()
+    membership = qs.only("assigned_warehouse_id").first()
+    if membership is None:
+        return False
+    assigned_warehouse_id = getattr(membership, "assigned_warehouse_id", None)
+    return assigned_warehouse_id in (None, warehouse.id)
 
 
 def effective_document_line_discount_percent(

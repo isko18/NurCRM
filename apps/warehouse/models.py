@@ -912,6 +912,15 @@ class CompanyWarehouseAgent(models.Model):
         related_name="warehouse_agent_decisions",
         verbose_name="Кем решено",
     )
+    assigned_warehouse = models.ForeignKey(
+        "warehouse.Warehouse",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="assigned_company_agents",
+        verbose_name="Назначенный склад",
+        help_text="Если указан — агент работает только с этим складом в рамках компании.",
+    )
 
     common_access_enabled = models.BooleanField(
         "Доступ к общему товару",
