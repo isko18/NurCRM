@@ -294,6 +294,30 @@ class CafeTableStatusTestCase(TransactionTestCase):
         self.table.refresh_from_db()
         self.assertEqual(self.table.status, Table.Status.BUSY)
 
+    def test_order_cancel_sets_canceled_by_and_time_via_api(self):
+        order = Order.objects.create(
+            company=self.company,
+            branch=self.branch,
+            table=self.table,
+            client=self.client,
+            waiter=self.user,
+            guests=2,
+            status=Order.Status.OPEN,
+        )
+
+        request = self.api_factory.patch(
+            f"/cafe/orders/{order.id}/",
+            {"status": Order.Status.CANCELLED},
+            format="json",
+        )
+        force_authenticate(request, user=self.user)
+        response = OrderRetrieveUpdateDestroyView.as_view()(request, pk=str(order.id))
+        self.assertEqual(response.status_code, 200)
+
+        order.refresh_from_db()
+        self.assertIsNotNone(order.canceled_at)
+        self.assertEqual(order.canceled_by_id, self.user.id)
+
     def test_table_stays_busy_on_order_pay_close_via_api_with_multiple_open_orders(self):
         """
         Регрессия: оплата+закрытие одного заказа через /pay/ не должна освобождать стол,

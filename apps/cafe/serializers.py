@@ -745,6 +745,7 @@ class OrderHistorySerializer(serializers.ModelSerializer):
             "table", "table_number", "waiter", "waiter_label",
             "guests", "created_at", "archived_at", "items",
             "status", "is_paid", "paid_at", "payment_method", "total_amount", "discount_amount", "paid_amount",
+            "canceled_at", "canceled_by", "canceled_by_label",
         ]
         read_only_fields = fields
 
@@ -774,6 +775,7 @@ class OrderSerializer(CompanyBranchReadOnlyMixin):
     items = OrderItemInlineSerializer(many=True, required=False)
     balance_due = serializers.DecimalField(max_digits=12, decimal_places=2, read_only=True)
     cash_shift_id = serializers.UUIDField(read_only=True, allow_null=True)
+    canceled_by_label = serializers.SerializerMethodField()
 
     class Meta:
         ref_name = "CafeOrder"
@@ -783,12 +785,24 @@ class OrderSerializer(CompanyBranchReadOnlyMixin):
             "table_session_id", "check_label",
             "status", "is_paid", "paid_at", "payment_method", "total_amount", "discount_amount",
             "paid_amount", "balance_due", "cash_shift_id",
+            "canceled_at", "canceled_by", "canceled_by_label",
             "items",
         ]
         read_only_fields = [
             "is_paid", "paid_at", "payment_method", "total_amount", "paid_amount", "balance_due",
             "cash_shift_id",
+            "canceled_at", "canceled_by", "canceled_by_label",
         ]
+
+    def get_canceled_by_label(self, obj):
+        if not getattr(obj, "canceled_by_id", None):
+            return ""
+        u = getattr(obj, "canceled_by", None)
+        if not u:
+            return str(obj.canceled_by_id)
+        full = getattr(u, "get_full_name", lambda: "")() or ""
+        email = getattr(u, "email", "") or ""
+        return full or email or str(obj.canceled_by_id)
 
     def get_fields(self):
         fields = super().get_fields()
