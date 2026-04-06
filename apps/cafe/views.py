@@ -26,7 +26,7 @@ from .models import (
     Category, MenuItem, Ingredient,
     Order, OrderItem, CafeClient,
     OrderHistory, OrderItemHistory, OrderDebtPayment,
-    OrderRefund,
+    OrderRefund, OrderItemRefund,
     KitchenTask, NotificationCafe,
     InventorySession, Equipment, EquipmentInventorySession, Kitchen,
     CafeReceiptPrinterSettings,
@@ -992,6 +992,16 @@ class OrderItemRetrieveUpdateDestroyView(CompanyBranchQuerysetMixin, generics.Re
         _recalc_order_after_items_change(oid)
 
 
+def _cafe_order_item_unit_price(it: OrderItem) -> Decimal:
+    if it.line_kind == OrderItem.LineKind.SERVICE:
+        return it.unit_price or Decimal("0")
+    if it.unit_price is not None:
+        return it.unit_price
+    if it.menu_item_id:
+        return it.menu_item.price
+    return Decimal("0")
+
+
 def _cafe_clients_in_scope(company, active_branch):
     qs = CafeClient.objects.filter(company=company)
     if active_branch is not None:
@@ -1077,6 +1087,7 @@ def _cafe_archive_order_snapshot(order: Order):
                     menu_item_title=(it.service_title or "").strip() or "Услуга",
                     menu_item_price=it.unit_price or Decimal("0"),
                     quantity=it.quantity,
+                    refunded_quantity=getattr(it, "refunded_quantity", 0) or 0,
                     is_rejected=it.is_rejected,
                     rejection_reason=it.rejection_reason or "",
                 )
@@ -1091,6 +1102,7 @@ def _cafe_archive_order_snapshot(order: Order):
                     menu_item_title=mi.title if mi else "",
                     menu_item_price=mi.price if mi else Decimal("0"),
                     quantity=it.quantity,
+                    refunded_quantity=getattr(it, "refunded_quantity", 0) or 0,
                     is_rejected=it.is_rejected,
                     rejection_reason=it.rejection_reason or "",
                 )
@@ -1447,7 +1459,7 @@ class OrderClosedListView(CompanyBranchQuerysetMixin, generics.ListAPIView):
 class OrderRefundView(CompanyBranchQuerysetMixin, APIView):
     """
     POST /cafe/orders/<uuid:pk>/refund/
-    Частичный/полный возврат денег по заказу.
+    Возврат денег по сумме чека (без привязки к строке). Для возврата конкретного блюда см. .../refund-item/.
 
     Body:
       {
@@ -1520,6 +1532,126 @@ class OrderRefundView(CompanyBranchQuerysetMixin, APIView):
                 return Response(_cafe_order_checkout_payload(order), status=status.HTTP_200_OK)
 
             order.refunded_amount = (refunded + amount).quantize(Decimal("0.01"))
+            order.save(update_fields=["refunded_amount", "updated_at"])
+            _cafe_archive_order_snapshot(order)
+
+        send_order_updated_notification(order)
+        return Response(_cafe_order_checkout_payload(order), status=status.HTTP_200_OK)
+
+
+class OrderItemRefundView(CompanyBranchQuerysetMixin, APIView):
+    """
+    POST /cafe/orders/<uuid:pk>/refund-item/
+    Возврат по одной позиции заказа (например, 1 из 4 блюд).
+
+    Body:
+      {
+        "order_item_id": "<uuid>",
+        "quantity": 1,
+        "payment_method": "cash|card|transfer",
+        "idempotency_key": "<uuid>",
+        "note": ""
+      }
+    quantity — необязательно; по умолчанию возвращается оставшееся количество по строке.
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request, pk):
+        company = self._user_company()
+        if not company:
+            return Response({"detail": "Компания не найдена."}, status=status.HTTP_403_FORBIDDEN)
+
+        active_branch = self._active_branch()
+        from .serializers import OrderItemRefundSerializer
+        ser = OrderItemRefundSerializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+
+        order_item_id = ser.validated_data["order_item_id"]
+        qty_req = ser.validated_data.get("quantity")
+        pm = ser.validated_data["payment_method"]
+        idem = ser.validated_data["idempotency_key"]
+        note = ser.validated_data.get("note") or ""
+
+        with transaction.atomic():
+            locked_qs = (
+                Order.objects.select_for_update(of=("self",))
+                .select_related("table", "client", "waiter")
+                .prefetch_related("items__menu_item")
+                .filter(company=company)
+            )
+            if active_branch is not None:
+                locked_qs = locked_qs.filter(branch=active_branch)
+            order = generics.get_object_or_404(locked_qs, pk=pk)
+
+            if not order.is_paid:
+                return Response({"detail": "Возврат доступен только для полностью оплаченного заказа."}, status=400)
+
+            item = OrderItem.objects.select_for_update(of=("self",)).select_related("menu_item").filter(
+                pk=order_item_id, order_id=order.id, company=company,
+            ).first()
+            if not item:
+                return Response({"detail": "Позиция не найдена или не из этого заказа."}, status=404)
+
+            if item.is_rejected:
+                return Response({"detail": "По отказанной позиции возврат не оформляется."}, status=400)
+
+            remaining = (item.quantity or 0) - (item.refunded_quantity or 0)
+            if remaining <= 0:
+                return Response({"detail": "По этой строке уже всё возвращено."}, status=400)
+
+            if qty_req is None:
+                qty = remaining
+            else:
+                qty = int(qty_req)
+                if qty < 1 or qty > remaining:
+                    return Response(
+                        {"detail": f"Некорректное количество (доступно к возврату: {remaining})."},
+                        status=400,
+                    )
+
+            unit = _cafe_order_item_unit_price(item).quantize(Decimal("0.01"))
+            line_amt = (unit * Decimal(qty)).quantize(Decimal("0.01"))
+            if line_amt <= 0:
+                return Response({"detail": "Некорректная сумма строки для возврата."}, status=400)
+
+            gross_paid = (order.paid_amount or Decimal("0")).quantize(Decimal("0.01"))
+            refunded = (order.refunded_amount or Decimal("0")).quantize(Decimal("0.01"))
+            refundable = (gross_paid - refunded).quantize(Decimal("0.01"))
+            if line_amt > refundable:
+                return Response(
+                    {"detail": f"Сумма возврата больше доступной по чеку ({refundable})."},
+                    status=400,
+                )
+
+            if OrderItemRefund.objects.filter(order_item=item, idempotency_key=idem).exists():
+                order.refresh_from_db()
+                _cafe_archive_order_snapshot(order)
+                send_order_updated_notification(order)
+                return Response(_cafe_order_checkout_payload(order), status=status.HTTP_200_OK)
+
+            try:
+                with transaction.atomic():
+                    OrderItemRefund.objects.create(
+                        company=order.company,
+                        branch=order.branch,
+                        order=order,
+                        order_item=item,
+                        quantity=qty,
+                        amount=line_amt,
+                        payment_method=pm,
+                        idempotency_key=idem,
+                        created_by=request.user if request.user.is_authenticated else None,
+                        note=note,
+                    )
+            except IntegrityError:
+                order.refresh_from_db()
+                _cafe_archive_order_snapshot(order)
+                send_order_updated_notification(order)
+                return Response(_cafe_order_checkout_payload(order), status=status.HTTP_200_OK)
+
+            item.refunded_quantity = (item.refunded_quantity or 0) + qty
+            item.save(update_fields=["refunded_quantity"])
+            order.refunded_amount = (refunded + line_amt).quantize(Decimal("0.01"))
             order.save(update_fields=["refunded_amount", "updated_at"])
             _cafe_archive_order_snapshot(order)
 
