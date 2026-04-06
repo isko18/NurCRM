@@ -891,6 +891,10 @@ class OrderItem(models.Model):
     rejection_reason = models.CharField("Причина отказа", max_length=500, blank=True, default="")
     rejected_at = models.DateTimeField("Отказано в", null=True, blank=True)
 
+    refunded_quantity = models.PositiveIntegerField(
+        "Возвращено (шт.)", default=0, validators=[MinValueValidator(0)],
+    )
+
     class Meta:
         verbose_name = 'Позиция заказа'
         verbose_name_plural = 'Позиции заказа'
@@ -925,6 +929,8 @@ class OrderItem(models.Model):
                     raise ValidationError({'menu_item': 'Позиция меню другого филиала.'})
         if self.is_rejected and not (self.rejection_reason or "").strip():
             raise ValidationError({'rejection_reason': 'Укажите причину отказа.'})
+        if (self.refunded_quantity or 0) > (self.quantity or 0):
+            raise ValidationError({"refunded_quantity": "Возврат не может превышать количество в строке."})
 
     def save(self, *args, **kwargs):
         if self.order_id:
@@ -1028,6 +1034,7 @@ class OrderItemHistory(models.Model):
     menu_item_title = models.CharField('Название позиции (снапшот)', max_length=255)
     menu_item_price = models.DecimalField('Цена (снапшот)', max_digits=10, decimal_places=2)
     quantity = models.PositiveIntegerField('Кол-во', default=1)
+    refunded_quantity = models.PositiveIntegerField("Возвращено (шт.)", default=0)
     is_rejected = models.BooleanField("Отказ", default=False)
     rejection_reason = models.CharField("Причина отказа", max_length=500, blank=True, default="")
 
@@ -1101,6 +1108,77 @@ class OrderDebtPayment(models.Model):
             if self.branch_id is None:
                 self.branch_id = self.order.branch_id
         self.full_clean()
+        super().save(*args, **kwargs)
+
+
+class OrderItemRefund(models.Model):
+    """
+    Возврат денег по конкретной позиции заказа (часть количества или вся строка).
+    """
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    company = models.ForeignKey(
+        Company, on_delete=models.CASCADE, related_name="cafe_order_item_refunds", verbose_name="Компания"
+    )
+    branch = models.ForeignKey(
+        Branch, on_delete=models.CASCADE, related_name="cafe_order_item_refunds",
+        verbose_name="Филиал", null=True, blank=True, db_index=True,
+    )
+    order = models.ForeignKey(
+        Order, on_delete=models.CASCADE, related_name="item_refunds", verbose_name="Заказ"
+    )
+    order_item = models.ForeignKey(
+        "OrderItem", on_delete=models.CASCADE, related_name="refunds", verbose_name="Позиция заказа"
+    )
+    quantity = models.PositiveIntegerField("Кол-во к возврату", validators=[MinValueValidator(1)])
+    amount = models.DecimalField(
+        "Сумма возврата", max_digits=12, decimal_places=2, validators=[MinValueValidator(Decimal("0.01"))]
+    )
+    payment_method = models.CharField(
+        "Способ возврата",
+        max_length=32,
+        choices=[
+            ("cash", "Наличные"),
+            ("card", "Безналичный (карта)"),
+            ("transfer", "Безналичный (перевод)"),
+        ],
+    )
+    refunded_at = models.DateTimeField("Возврат в", auto_now_add=True, db_index=True)
+    idempotency_key = models.UUIDField("Ключ идемпотентности")
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL,
+        null=True, blank=True, related_name="cafe_order_item_refunds", verbose_name="Кассир",
+    )
+    note = models.CharField("Примечание", max_length=500, blank=True, default="")
+
+    class Meta:
+        verbose_name = "Возврат по позиции заказа кафе"
+        verbose_name_plural = "Возвраты по позициям заказов кафе"
+        ordering = ["-refunded_at"]
+        constraints = [
+            models.UniqueConstraint(fields=["order_item", "idempotency_key"], name="uniq_cafe_order_item_refund_idem"),
+        ]
+        indexes = [
+            models.Index(fields=["company", "refunded_at"]),
+            models.Index(fields=["order", "refunded_at"]),
+            models.Index(fields=["order_item", "refunded_at"]),
+        ]
+
+    def clean(self):
+        if self.order_id and self.company_id and self.order.company_id != self.company_id:
+            raise ValidationError({"order": "Заказ другой компании."})
+        if self.order_item_id and self.order_id and self.order_item.order_id != self.order_id:
+            raise ValidationError({"order_item": "Позиция не из этого заказа."})
+        if self.branch_id and self.order_id and self.order.branch_id not in (None, self.branch_id):
+            raise ValidationError({"branch": "Филиал возврата не совпадает с заказом."})
+
+    def save(self, *args, **kwargs):
+        if self.order_item_id:
+            if not self.order_id:
+                self.order_id = self.order_item.order_id
+            if not self.company_id:
+                self.company_id = self.order_item.company_id
+            if self.branch_id is None and self.order_id:
+                self.branch_id = self.order.branch_id
         super().save(*args, **kwargs)
 
 

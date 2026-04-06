@@ -28,7 +28,7 @@ from .views import (
     EquipmentInventorySessionListCreateView, EquipmentInventorySessionRetrieveView, EquipmentInventorySessionConfirmView,
 
     KitchenListCreateView, KitchenRetrieveUpdateDestroyView, OrderClosedListView, OrderPayView, OrderPayDebtView,
-    OrderRefundView,
+    OrderRefundView, OrderItemRefundView,
     CafeExpenseListCreateView, CafeExpenseRetrieveUpdateDestroyView,
     CafeWaiterPayProfileListCreateView, CafeWaiterPayProfileRetrieveUpdateDestroyView,
 )
@@ -111,6 +111,7 @@ urlpatterns = [
     path("orders/<uuid:pk>/pay/", OrderPayView.as_view(), name="cafe_order_pay"),
     path("orders/<uuid:pk>/pay-debt/", OrderPayDebtView.as_view(), name="cafe_order_pay_debt"),
     path("orders/<uuid:pk>/refund/", OrderRefundView.as_view(), name="cafe_order_refund"),
+    path("orders/<uuid:pk>/refund-item/", OrderItemRefundView.as_view(), name="cafe_order_refund_item"),
     path("orders/closed/", OrderClosedListView.as_view(), name="cafe_orders_closed"),
     # Общая история заказов компании
     path("orders/history/", OrderHistoryListView.as_view(), name="order-history"),

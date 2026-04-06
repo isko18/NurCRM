@@ -631,15 +631,25 @@ class OrderItemInlineSerializer(CompanyBranchReadOnlyMixin):
         read_only=True,
         allow_null=True,
     )
+    refundable_quantity = serializers.SerializerMethodField()
 
     class Meta:
         model = OrderItem
         fields = [
             "id", "order", "line_kind", "menu_item", "menu_item_title", "menu_item_price",
             "service_title", "unit_price", "quantity",
+            "refunded_quantity", "refundable_quantity",
             "is_rejected", "rejection_reason", "rejected_at",
         ]
-        read_only_fields = ["id", "menu_item_title", "menu_item_price", "rejected_at"]
+        read_only_fields = [
+            "id", "menu_item_title", "menu_item_price", "rejected_at",
+            "refunded_quantity", "refundable_quantity",
+        ]
+
+    def get_refundable_quantity(self, obj):
+        q = obj.quantity or 0
+        r = getattr(obj, "refunded_quantity", 0) or 0
+        return max(0, int(q - r))
 
     def validate(self, attrs):
         inst = self.instance
@@ -730,6 +740,7 @@ class OrderItemHistorySerializer(serializers.ModelSerializer):
         model = OrderItemHistory
         fields = [
             "id", "line_kind", "menu_item", "menu_item_title", "menu_item_price", "quantity",
+            "refunded_quantity",
             "is_rejected", "rejection_reason",
         ]
         read_only_fields = fields
@@ -1124,6 +1135,22 @@ class OrderRefundSerializer(serializers.Serializer):
         if v is None or v <= 0:
             raise serializers.ValidationError("Сумма должна быть больше нуля.")
         return v
+
+
+class OrderItemRefundSerializer(serializers.Serializer):
+    """Возврат по строке заказа: POST .../orders/<id>/refund-item/"""
+    order_item_id = serializers.UUIDField()
+    quantity = serializers.IntegerField(required=False, allow_null=True, min_value=1)
+    payment_method = serializers.ChoiceField(
+        choices=[
+            ("cash", "Наличные"),
+            ("card", "Безналичный (карта)"),
+            ("transfer", "Безналичный (перевод)"),
+        ],
+    )
+    idempotency_key = serializers.UUIDField()
+    note = serializers.CharField(required=False, allow_blank=True, default="")
+
 
 class InventoryItemSerializer(serializers.ModelSerializer):
     product_title = serializers.CharField(source="product.title", read_only=True)
