@@ -26,6 +26,7 @@ from .models import (
     Category, MenuItem, Ingredient,
     Order, OrderItem, CafeClient,
     OrderHistory, OrderItemHistory, OrderDebtPayment,
+    OrderRefund,
     KitchenTask, NotificationCafe,
     InventorySession, Equipment, EquipmentInventorySession, Kitchen,
     CafeReceiptPrinterSettings,
@@ -1014,6 +1015,8 @@ def _cafe_order_checkout_payload(order: Order) -> dict:
         "discount_amount": str(disc),
         "final_amount": str(final_amt),
         "paid_amount": str(order.paid_amount or Decimal("0")),
+        "refunded_amount": str(order.refunded_amount or Decimal("0")),
+        "net_paid_amount": str(order.net_paid_amount),
         "balance_due": str(order.balance_due),
         "cash_shift_id": str(order.cash_shift_id) if order.cash_shift_id else None,
     }
@@ -1055,6 +1058,7 @@ def _cafe_archive_order_snapshot(order: Order):
             "total_amount": order.total_amount,
             "discount_amount": order.discount_amount,
             "paid_amount": order.paid_amount or Decimal("0"),
+            "refunded_amount": getattr(order, "refunded_amount", None) or Decimal("0"),
             "canceled_at": getattr(order, "canceled_at", None),
             "canceled_by": getattr(order, "canceled_by", None),
             "canceled_by_label": canceled_by_label,
@@ -1438,6 +1442,89 @@ class OrderClosedListView(CompanyBranchQuerysetMixin, generics.ListAPIView):
     def get_queryset(self):
         qs = super().get_queryset()
         return qs.filter(Q(status__in=[Order.Status.CLOSED, Order.Status.CANCELLED]) | Q(is_paid=True))
+
+
+class OrderRefundView(CompanyBranchQuerysetMixin, APIView):
+    """
+    POST /cafe/orders/<uuid:pk>/refund/
+    Частичный/полный возврат денег по заказу.
+
+    Body:
+      {
+        "amount": "100.00",
+        "payment_method": "cash|card|transfer",
+        "idempotency_key": "<uuid>",
+        "note": ""
+      }
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request, pk):
+        company = self._user_company()
+        if not company:
+            return Response({"detail": "Компания не найдена."}, status=status.HTTP_403_FORBIDDEN)
+
+        active_branch = self._active_branch()
+        from .serializers import OrderRefundSerializer
+        ser = OrderRefundSerializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+
+        amount = ser.validated_data["amount"].quantize(Decimal("0.01"))
+        pm = ser.validated_data["payment_method"]
+        idem = ser.validated_data["idempotency_key"]
+        note = ser.validated_data.get("note") or ""
+
+        with transaction.atomic():
+            locked_qs = (
+                Order.objects.select_for_update(of=("self",))
+                .select_related("table", "client", "waiter")
+                .filter(company=company)
+            )
+            if active_branch is not None:
+                locked_qs = locked_qs.filter(branch=active_branch)
+            order = generics.get_object_or_404(locked_qs, pk=pk)
+
+            if not order.is_paid:
+                return Response({"detail": "Возврат доступен только для полностью оплаченного заказа."}, status=400)
+
+            gross_paid = (order.paid_amount or Decimal("0")).quantize(Decimal("0.01"))
+            refunded = (order.refunded_amount or Decimal("0")).quantize(Decimal("0.01"))
+            refundable = (gross_paid - refunded).quantize(Decimal("0.01"))
+            if refundable <= 0:
+                return Response({"detail": "Нечего возвращать — сумма возврата уже равна оплате."}, status=400)
+            if amount > refundable:
+                return Response({"detail": f"Сумма больше доступного возврата ({refundable})."}, status=400)
+
+            if OrderRefund.objects.filter(order=order, idempotency_key=idem).exists():
+                order.refresh_from_db()
+                _cafe_archive_order_snapshot(order)
+                send_order_updated_notification(order)
+                return Response(_cafe_order_checkout_payload(order), status=status.HTTP_200_OK)
+
+            try:
+                with transaction.atomic():
+                    OrderRefund.objects.create(
+                        company=order.company,
+                        branch=order.branch,
+                        order=order,
+                        amount=amount,
+                        payment_method=pm,
+                        idempotency_key=idem,
+                        created_by=request.user if request.user.is_authenticated else None,
+                        note=note,
+                    )
+            except IntegrityError:
+                order.refresh_from_db()
+                _cafe_archive_order_snapshot(order)
+                send_order_updated_notification(order)
+                return Response(_cafe_order_checkout_payload(order), status=status.HTTP_200_OK)
+
+            order.refunded_amount = (refunded + amount).quantize(Decimal("0.01"))
+            order.save(update_fields=["refunded_amount", "updated_at"])
+            _cafe_archive_order_snapshot(order)
+
+        send_order_updated_notification(order)
+        return Response(_cafe_order_checkout_payload(order), status=status.HTTP_200_OK)
 
 
 # ==================== Kitchen (повар) ====================

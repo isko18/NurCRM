@@ -1106,6 +1106,25 @@ class OrderPayDebtSerializer(serializers.Serializer):
                 raise serializers.ValidationError({"cash_received": "Меньше суммы платежа."})
         return attrs
 
+
+class OrderRefundSerializer(serializers.Serializer):
+    """Частичный/полный возврат: POST .../orders/<id>/refund/"""
+    amount = serializers.DecimalField(max_digits=12, decimal_places=2)
+    payment_method = serializers.ChoiceField(
+        choices=[
+            ("cash", "Наличные"),
+            ("card", "Безналичный (карта)"),
+            ("transfer", "Безналичный (перевод)"),
+        ],
+    )
+    idempotency_key = serializers.UUIDField()
+    note = serializers.CharField(required=False, allow_blank=True, default="")
+
+    def validate_amount(self, v):
+        if v is None or v <= 0:
+            raise serializers.ValidationError("Сумма должна быть больше нуля.")
+        return v
+
 class InventoryItemSerializer(serializers.ModelSerializer):
     product_title = serializers.CharField(source="product.title", read_only=True)
     product_unit = serializers.CharField(source="product.unit", read_only=True)
