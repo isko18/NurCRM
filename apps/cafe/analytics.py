@@ -762,6 +762,93 @@ class RejectionsAnalyticsView(CompanyBranchQuerysetMixin, APIView):
         ])
 
 
+class CancelledOrdersAnalyticsView(CompanyBranchQuerysetMixin, APIView):
+    """
+    Отменённые заказы: кто отменил и когда.
+
+    Query params:
+      - date_from=YYYY-MM-DD
+      - date_to=YYYY-MM-DD
+      - limit (default=200, max=1000)
+      - offset (default=0)
+    Фильтрация по дате идёт по Order.canceled_at (если null — по updated_at как запасной вариант).
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request):
+        company = self._user_company()
+        if not company:
+            return Response({"date_from": None, "date_to": None, "basis": "canceled_at", "rows": []})
+
+        df = request.query_params.get("date_from")
+        dt = request.query_params.get("date_to")
+        limit_raw = request.query_params.get("limit")
+        offset_raw = request.query_params.get("offset")
+        try:
+            limit = max(1, min(int(limit_raw or 200), 1000))
+        except Exception:
+            limit = 200
+        try:
+            offset = max(0, int(offset_raw or 0))
+        except Exception:
+            offset = 0
+
+        branch = self._active_branch()
+
+        qs = Order.objects.select_related("table", "waiter", "canceled_by").filter(
+            company=company,
+            status=Order.Status.CANCELLED,
+        )
+        if branch is not None:
+            qs = qs.filter(branch=branch)
+        else:
+            qs = qs.filter(branch__isnull=True)
+
+        qs, waiter_scope_id = _apply_waiter_scope(qs, request, "waiter_id")
+
+        # Prefer canceled_at; fallback to updated_at for legacy rows without canceled_at.
+        if df:
+            qs = qs.filter(Q(canceled_at__date__gte=df) | Q(canceled_at__isnull=True, updated_at__date__gte=df))
+        if dt:
+            qs = qs.filter(Q(canceled_at__date__lte=dt) | Q(canceled_at__isnull=True, updated_at__date__lte=dt))
+
+        rows = []
+        for o in qs.order_by("-canceled_at", "-updated_at")[offset: offset + limit]:
+            canceled_at = o.canceled_at or o.updated_at
+            who = ""
+            if getattr(o, "canceled_by_id", None):
+                u = o.canceled_by
+                if u:
+                    full = getattr(u, "get_full_name", lambda: "")() or ""
+                    email = getattr(u, "email", "") or ""
+                    who = full or email or str(o.canceled_by_id)
+                else:
+                    who = str(o.canceled_by_id)
+            rows.append({
+                "order_id": str(o.id),
+                "table_number": (o.table.number if o.table_id else None),
+                "waiter_id": str(o.waiter_id) if o.waiter_id else None,
+                "canceled_at": canceled_at,
+                "canceled_by_id": str(o.canceled_by_id) if o.canceled_by_id else None,
+                "canceled_by_label": who,
+                "total_amount": str(o.total_amount),
+                "discount_amount": str(o.discount_amount),
+                "final_amount": str(o.final_amount),
+                "is_paid": bool(o.is_paid),
+                "paid_at": o.paid_at,
+            })
+
+        return Response({
+            "date_from": df,
+            "date_to": dt,
+            "basis": "canceled_at",
+            "offset": offset,
+            "limit": limit,
+            "waiter_scope_id": str(waiter_scope_id) if waiter_scope_id else None,
+            "rows": rows,
+        })
+
+
 class CafeExpensesSummaryView(CompanyBranchQuerysetMixin, APIView):
     permission_classes = [permissions.IsAuthenticated]
 
