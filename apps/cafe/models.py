@@ -768,6 +768,16 @@ class Order(models.Model):
 
     updated_at = models.DateTimeField("Обновлено", auto_now=True)
 
+    canceled_at = models.DateTimeField("Отменен в", null=True, blank=True, db_index=True)
+    canceled_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="cafe_cancelled_orders",
+        verbose_name="Кто отменил",
+    )
+
     # Несколько чеков за один стол: общий UUID сессии + подпись чека (опционально).
     table_session_id = models.UUIDField(
         "Сессия стола (разделение чеков)", null=True, blank=True, db_index=True,
@@ -964,6 +974,17 @@ class OrderHistory(models.Model):
     total_amount = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal("0"))
     discount_amount = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal("0"))
     paid_amount = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal("0"))
+
+    canceled_at = models.DateTimeField("Отменен в", null=True, blank=True, db_index=True)
+    canceled_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="cafe_cancelled_orders_history",
+        verbose_name="Кто отменил (ref)",
+    )
+    canceled_by_label = models.CharField("Метка отменившего", max_length=255, blank=True, default="")
 
     class Meta:
         verbose_name = 'Архив заказа'

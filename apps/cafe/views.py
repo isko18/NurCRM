@@ -884,6 +884,14 @@ class OrderRetrieveUpdateDestroyView(CompanyBranchQuerysetMixin, generics.Retrie
         
         super().perform_update(serializer)
         order = serializer.instance
+
+        # Фиксируем отмену: кто и когда отменил
+        if order.status == Order.Status.CANCELLED and old_status != Order.Status.CANCELLED:
+            order.canceled_at = order.canceled_at or timezone.now()
+            if getattr(self.request, "user", None) and getattr(self.request.user, "is_authenticated", False):
+                order.canceled_by = self.request.user
+            order.save(update_fields=["canceled_at", "canceled_by", "updated_at"])
+
         # Пересчитываем сумму заказа при обновлении
         order.recalc_total()
         order.save(update_fields=["total_amount"])
@@ -1018,6 +1026,16 @@ def _cafe_archive_order_snapshot(order: Order):
         email = getattr(order.waiter, "email", "") or ""
         waiter_label = full or email or str(order.waiter_id)
 
+    canceled_by_label = ""
+    if getattr(order, "canceled_by_id", None):
+        u = getattr(order, "canceled_by", None)
+        if u:
+            full = getattr(u, "get_full_name", lambda: "")() or ""
+            email = getattr(u, "email", "") or ""
+            canceled_by_label = full or email or str(order.canceled_by_id)
+        else:
+            canceled_by_label = str(order.canceled_by_id)
+
     oh, _created = OrderHistory.objects.update_or_create(
         original_order_id=order.id,
         defaults={
@@ -1037,6 +1055,9 @@ def _cafe_archive_order_snapshot(order: Order):
             "total_amount": order.total_amount,
             "discount_amount": order.discount_amount,
             "paid_amount": order.paid_amount or Decimal("0"),
+            "canceled_at": getattr(order, "canceled_at", None),
+            "canceled_by": getattr(order, "canceled_by", None),
+            "canceled_by_label": canceled_by_label,
         },
     )
 
