@@ -20,6 +20,7 @@ from django.db.models import (
     ExpressionWrapper, DurationField, DecimalField, Value,
 )
 from django.db.models.functions import Coalesce
+from django.utils import timezone
 
 from apps.cafe.models import (
     KitchenTask, OrderItem, Purchase, Warehouse, Order, MenuItem,
@@ -728,13 +729,7 @@ class RejectionsAnalyticsView(CompanyBranchQuerysetMixin, APIView):
     def get(self, request):
         company = self._user_company()
         if not company:
-            return Response({
-                "date_from": request.query_params.get("date_from"),
-                "date_to": request.query_params.get("date_to"),
-                "basis": "rejected_at / canceled_at",
-                "rejections": [],
-                "cancelled_orders": [],
-            })
+            return Response([])
 
         df = request.query_params.get("date_from")
         dt = request.query_params.get("date_to")
@@ -748,7 +743,7 @@ class RejectionsAnalyticsView(CompanyBranchQuerysetMixin, APIView):
             qs = qs.filter(Q(order__branch=branch) | Q(order__branch__isnull=True))
         else:
             qs = qs.filter(order__branch__isnull=True)
-        qs, waiter_scope_id = _apply_waiter_scope(qs, request, "order__waiter_id")
+        qs, _waiter_scope_id = _apply_waiter_scope(qs, request, "order__waiter_id")
         qs = _apply_date_range(qs, "rejected_at", df, dt)
 
         line_total = _line_revenue_expr()
@@ -758,64 +753,24 @@ class RejectionsAnalyticsView(CompanyBranchQuerysetMixin, APIView):
             .order_by("-lost_revenue")[:200]
         )
 
-        rejections = [
+        now = timezone.now()
+        user = getattr(request, "user", None)
+        employee_name = ""
+        if user and getattr(user, "is_authenticated", False):
+            full = getattr(user, "get_full_name", lambda: "")() or ""
+            email = getattr(user, "email", "") or ""
+            employee_name = full or email or str(getattr(user, "id", "") or "")
+
+        return Response([
             {
                 "rejection_reason": (row["rejection_reason"] or "").strip() or "—",
                 "qty": int(row["qty"] or 0),
                 "lost_revenue": f"{_to_decimal(row['lost_revenue']):.2f}",
+                "employee_name": employee_name,
+                "created_at": now,
             }
             for row in by_reason
-        ]
-
-        # Также отдаем отмены заказов (кто/когда) в этом же эндпоинте.
-        # Фильтр по датам — по canceled_at; если его нет (старые записи) — по updated_at.
-        oqs = Order.objects.select_related("table", "waiter", "canceled_by").filter(
-            company=company,
-            status=Order.Status.CANCELLED,
-        )
-        if branch is not None:
-            oqs = oqs.filter(branch=branch)
-        else:
-            oqs = oqs.filter(branch__isnull=True)
-        if waiter_scope_id:
-            oqs = oqs.filter(waiter_id=waiter_scope_id)
-        if df:
-            oqs = oqs.filter(Q(canceled_at__date__gte=df) | Q(canceled_at__isnull=True, updated_at__date__gte=df))
-        if dt:
-            oqs = oqs.filter(Q(canceled_at__date__lte=dt) | Q(canceled_at__isnull=True, updated_at__date__lte=dt))
-
-        cancelled_orders = []
-        for o in oqs.order_by("-canceled_at", "-updated_at")[:200]:
-            canceled_at = o.canceled_at or o.updated_at
-            who = ""
-            if getattr(o, "canceled_by_id", None):
-                u = o.canceled_by
-                if u:
-                    full = getattr(u, "get_full_name", lambda: "")() or ""
-                    email = getattr(u, "email", "") or ""
-                    who = full or email or str(o.canceled_by_id)
-                else:
-                    who = str(o.canceled_by_id)
-            cancelled_orders.append({
-                "order_id": str(o.id),
-                "table_number": (o.table.number if o.table_id else None),
-                "waiter_id": str(o.waiter_id) if o.waiter_id else None,
-                "canceled_at": canceled_at,
-                "canceled_by_id": str(o.canceled_by_id) if o.canceled_by_id else None,
-                "canceled_by_label": who,
-                "final_amount": str(o.final_amount),
-                "is_paid": bool(o.is_paid),
-                "paid_at": o.paid_at,
-            })
-
-        return Response({
-            "date_from": df,
-            "date_to": dt,
-            "basis": "rejected_at / canceled_at",
-            "waiter_scope_id": str(waiter_scope_id) if waiter_scope_id else None,
-            "rejections": rejections,
-            "cancelled_orders": cancelled_orders,
-        })
+        ])
 
 
 class CancelledOrdersAnalyticsView(CompanyBranchQuerysetMixin, APIView):
