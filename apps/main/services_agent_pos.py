@@ -98,6 +98,7 @@ def checkout_agent_cart(
     department=None,
     agent=None,
     use_main_stock=False,
+    allow_negative_stock: bool = False,
     cashbox_id=None,
     payment_method=None,
     cash_received=None,
@@ -209,6 +210,8 @@ def checkout_agent_cart(
         pid = str(v["product"].id)
         need = int(v["qty"] or 0)
         if use_main_stock:
+            if allow_negative_stock:
+                continue
             p = products_by_id.get(v["product"].id)
             have = int(Decimal(str(getattr(p, "quantity", 0) or 0)))
             if need > have:
@@ -335,7 +338,7 @@ def checkout_agent_cart(
             if p is None:
                 raise AgentNotEnoughStock(f"Товар «{v['product'].name}» не найден на складе.")
             p.quantity = Decimal(str(getattr(p, "quantity", 0) or 0)) - Decimal(int(v["qty"] or 0))
-            if p.quantity < 0:
+            if (not allow_negative_stock) and p.quantity < 0:
                 raise AgentNotEnoughStock(
                     f"Недостаточно на основном складе: «{v['product'].name}»."
                 )

@@ -18,7 +18,7 @@ class NotEnoughStock(Exception):
 
 
 @transaction.atomic
-def checkout_cart(cart: Cart, department=None) -> Sale:
+def checkout_cart(cart: Cart, department=None, allow_negative_stock: bool = False) -> Sale:
     cart.recalc()
 
     items = list(
@@ -49,14 +49,15 @@ def checkout_cart(cart: Cart, department=None) -> Sale:
             raise ValueError(str(e)) from e
         consume_by_pid[it.product_id] += item_consume
 
-    for pid, need in consume_by_pid.items():
-        p = products[pid]
-        have = Decimal(str(p.quantity or 0))
-        if need > have:
-            raise NotEnoughStock(
-                f"Недостаточно остатка для «{getattr(p, 'name', '') or p.id}». "
-                f"Требуется {need} (в учётных единицах склада), доступно {have}."
-            )
+    if not allow_negative_stock:
+        for pid, need in consume_by_pid.items():
+            p = products[pid]
+            have = Decimal(str(p.quantity or 0))
+            if need > have:
+                raise NotEnoughStock(
+                    f"Недостаточно остатка для «{getattr(p, 'name', '') or p.id}». "
+                    f"Требуется {need} (в учётных единицах склада), доступно {have}."
+                )
 
     sale = Sale.objects.create(
         company=cart.company,
