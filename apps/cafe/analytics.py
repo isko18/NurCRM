@@ -22,7 +22,7 @@ from django.db.models import (
 from django.db.models.functions import Coalesce
 
 from apps.cafe.models import (
-    KitchenTask, OrderItem, Purchase, Warehouse, Order,
+    KitchenTask, OrderItem, Purchase, Warehouse, Order, MenuItem,
     CafeExpense, CafeWaiterPayProfile,
 )
 from apps.cafe.views import CompanyBranchQuerysetMixin
@@ -405,6 +405,152 @@ class SalesByMenuItemView(CompanyBranchQuerysetMixin, APIView):
 
         _cache_set(key, result, _analytics_ttl())
         return Response(result)
+
+
+class MenuAnalyticsAllView(CompanyBranchQuerysetMixin, APIView):
+    """
+    Общая аналитика по меню (все блюда, не только топ).
+
+    Query params:
+      - date_from=YYYY-MM-DD (по paid_at)
+      - date_to=YYYY-MM-DD
+      - limit (default=500, max=5000)
+      - offset (default=0)
+      - include_inactive=1 (если передано -> включать неактивные; по умолчанию включаем все)
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request):
+        company = self._user_company()
+        if not company:
+            return Response({
+                "date_from": request.query_params.get("date_from"),
+                "date_to": request.query_params.get("date_to"),
+                "basis": "paid_at",
+                "offset": 0,
+                "limit": 0,
+                "total_items": 0,
+                "rows": [],
+                "grand_revenue": "0.00",
+                "grand_qty": 0,
+            })
+
+        df = request.query_params.get("date_from")
+        dt = request.query_params.get("date_to")
+        include_inactive = str(request.query_params.get("include_inactive") or "").strip() in ("1", "true", "yes", "on")
+        limit_raw = request.query_params.get("limit")
+        offset_raw = request.query_params.get("offset")
+        try:
+            limit = max(1, min(int(limit_raw or 500), 5000))
+        except Exception:
+            limit = 500
+        try:
+            offset = max(0, int(offset_raw or 0))
+        except Exception:
+            offset = 0
+
+        waiter_scope_id = _analytics_waiter_scope(request)
+        branch = self._active_branch()
+
+        key = _cache_key(
+            "menu:all",
+            company_id=str(company.id),
+            branch_id=str(branch.id) if branch else None,
+            params={
+                "date_from": df,
+                "date_to": dt,
+                "limit": limit,
+                "offset": offset,
+                "include_inactive": include_inactive,
+                "waiter_scope_id": str(waiter_scope_id) if waiter_scope_id else None,
+            },
+        )
+        hit = _cache_get(key)
+        if hit is not None:
+            return Response(hit)
+
+        # scope menu items
+        mi_qs = MenuItem.objects.select_related("category", "kitchen").filter(company=company)
+        if branch is not None:
+            mi_qs = mi_qs.filter(branch=branch)
+        else:
+            mi_qs = mi_qs.filter(branch__isnull=True)
+        if not include_inactive:
+            # по умолчанию показываем всё меню, включая неактивные — но если явно не просили,
+            # оставим обратную совместимость: include_inactive=0 -> только активные
+            mi_qs = mi_qs.filter(is_active=True)
+
+        # build order line filter for aggregation (paid, non-rejected, menu lines)
+        line_filter = Q(order_items__order__is_paid=True) & Q(order_items__is_rejected=False)
+        line_filter &= Q(order_items__line_kind=OrderItem.LineKind.MENU)
+        line_filter &= Q(order_items__order__company=company)
+        if branch is not None:
+            line_filter &= Q(order_items__order__branch=branch)
+        else:
+            line_filter &= Q(order_items__order__branch__isnull=True)
+        if waiter_scope_id:
+            line_filter &= Q(order_items__order__waiter_id=waiter_scope_id)
+        if df:
+            line_filter &= Q(order_items__order__paid_at__date__gte=df)
+        if dt:
+            line_filter &= Q(order_items__order__paid_at__date__lte=dt)
+
+        # qty & revenue
+        revenue_expr = ExpressionWrapper(
+            F("order_items__quantity")
+            * Coalesce(
+                F("order_items__unit_price"),
+                F("price"),
+                Value(Decimal("0")),
+                output_field=DecimalField(max_digits=14, decimal_places=2),
+            ),
+            output_field=DecimalField(max_digits=14, decimal_places=2),
+        )
+
+        mi_qs = mi_qs.annotate(
+            qty=Coalesce(Sum("order_items__quantity", filter=line_filter), Value(0)),
+            revenue=Coalesce(Sum(revenue_expr, filter=line_filter), Value(Decimal("0.00"))),
+        ).order_by("-revenue", "-qty", "title")
+
+        total_items = mi_qs.count()
+        page = list(mi_qs[offset: offset + limit])
+
+        rows = []
+        grand_revenue = Decimal("0.00")
+        grand_qty = 0
+        for mi in page:
+            qty = int(getattr(mi, "qty", 0) or 0)
+            rev = _to_decimal(getattr(mi, "revenue", None))
+            grand_revenue += rev
+            grand_qty += qty
+            avg = (rev / Decimal(qty)) if qty else Decimal("0")
+            rows.append({
+                "menu_item_id": str(mi.id),
+                "title": mi.title,
+                "category_id": str(mi.category_id) if mi.category_id else None,
+                "category_title": (mi.category.title if mi.category_id else "") or "",
+                "kitchen_id": str(mi.kitchen_id) if mi.kitchen_id else None,
+                "kitchen_title": (mi.kitchen.title if mi.kitchen_id else "") or "",
+                "price": str(mi.price),
+                "is_active": bool(mi.is_active),
+                "qty": qty,
+                "revenue": f"{rev:.2f}",
+                "avg_unit_price": f"{avg:.2f}",
+            })
+
+        payload = {
+            "date_from": df,
+            "date_to": dt,
+            "basis": "paid_at",
+            "offset": offset,
+            "limit": limit,
+            "total_items": int(total_items),
+            "rows": rows,
+            "page_revenue": f"{grand_revenue:.2f}",
+            "page_qty": int(grand_qty),
+        }
+        _cache_set(key, payload, _analytics_ttl())
+        return Response(payload)
 
 
 class SalesByCategoryView(CompanyBranchQuerysetMixin, APIView):

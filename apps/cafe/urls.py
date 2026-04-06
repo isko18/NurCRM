@@ -41,6 +41,7 @@ from apps.cafe.analytics import (
     CafeUnifiedAnalyticsView, CafeWaiterSalesView,
     PurchasesSummaryView, PurchasesBySupplierView,
     WarehouseLowStockView, CafeAnalyticsExportView,
+    MenuAnalyticsAllView,
 )
 
 from apps.cafe.showcase.views_public import PublicCafeInfoAPIView, PublicCafeMenuAPIView, PublicCafeMenuItemsAPIView
@@ -158,6 +159,7 @@ urlpatterns = [
 
     path("analytics/sales/summary/", SalesSummaryView.as_view()),
     path("analytics/sales/items/", SalesByMenuItemView.as_view()),
+    path("analytics/menu/all/", MenuAnalyticsAllView.as_view(), name="cafe-analytics-menu-all"),
     path("analytics/sales/categories/", SalesByCategoryView.as_view(), name="cafe-analytics-sales-categories"),
     path("analytics/sales/kitchens/", SalesByKitchenView.as_view(), name="cafe-analytics-sales-kitchens"),
     path("analytics/revenue-inflow/", RevenueInflowView.as_view(), name="cafe-analytics-revenue-inflow"),
