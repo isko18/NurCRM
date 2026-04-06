@@ -1,5 +1,5 @@
 from rest_framework.permissions import BasePermission
-from apps.construction.models import Cashbox, CashFlow
+from apps.construction.models import Cashbox, CashFlow, CashFlowCategory
 
 # Department был удален, но оставляем проверки для совместимости
 try:
@@ -34,6 +34,9 @@ def _get_obj_company(obj):
         # fallback, если вдруг у самой записи есть company
         return getattr(obj, "company", None)
 
+    if isinstance(obj, CashFlowCategory):
+        return getattr(obj, "company", None)
+
     # на всякий случай для других моделей
     return getattr(obj, "company", None)
 
@@ -55,6 +58,9 @@ def _get_obj_department(obj):
         cashbox = getattr(obj, "cashbox", None)
         if cashbox is not None:
             return getattr(cashbox, "department", None)
+
+    if isinstance(obj, CashFlowCategory):
+        return None
 
     return None
 

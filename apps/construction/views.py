@@ -12,11 +12,12 @@ from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework.exceptions import PermissionDenied, ValidationError
 
-from apps.construction.models import Cashbox, CashFlow, CashShift
+from apps.construction.models import Cashbox, CashFlow, CashFlowCategory, CashShift
 
 from apps.construction.serializers import (
     CashboxSerializer,
     CashFlowSerializer,
+    CashFlowCategorySerializer,
     CashboxWithFlowsSerializer,
     CashShiftListSerializer,
     CashShiftOpenSerializer,
@@ -323,7 +324,11 @@ class CashboxListCreateView(CompanyBranchScopedMixin, generics.ListCreateAPIView
 
 
 class CashboxDetailView(CompanyBranchScopedMixin, generics.RetrieveUpdateDestroyAPIView):
-    queryset = Cashbox.objects.select_related("company", "branch")
+    queryset = Cashbox.objects.select_related("company", "branch").prefetch_related(
+        "flows__category",
+        "flows__cashier",
+        "flows__shift",
+    )
     serializer_class = CashboxWithFlowsSerializer
 
     def get_queryset(self):
@@ -339,6 +344,7 @@ class CashFlowListCreateView(CompanyBranchScopedMixin, generics.ListCreateAPIVie
         "cashbox", "cashbox__branch",
         "shift", "shift__cashier",
         "cashier",
+        "category",
     )
     serializer_class = CashFlowSerializer
     pagination_class = None
@@ -368,6 +374,11 @@ class CashFlowListCreateView(CompanyBranchScopedMixin, generics.ListCreateAPIVie
         if cashier_id:
             qs = qs.filter(cashier_id=cashier_id)
 
+        # ✅ по категории: ?category=<uuid>
+        category_id = qp.get("category")
+        if category_id:
+            qs = qs.filter(category_id=category_id)
+
         return qs
 
     def perform_create(self, serializer):
@@ -379,8 +390,34 @@ class CashFlowDetailView(CompanyBranchScopedMixin, generics.RetrieveUpdateDestro
         "cashbox", "cashbox__branch",
         "shift", "shift__cashier",
         "cashier",
+        "category",
     )
     serializer_class = CashFlowSerializer
+
+    def get_queryset(self):
+        return self._scoped_queryset(super().get_queryset())
+
+
+class CashFlowCategoryListCreateView(CompanyBranchScopedMixin, generics.ListCreateAPIView):
+    queryset = CashFlowCategory.objects.select_related("company", "branch")
+    serializer_class = CashFlowCategorySerializer
+    pagination_class = None
+
+    def get_queryset(self):
+        qs = self._scoped_queryset(super().get_queryset()).order_by("title")
+        q = (self.request.query_params.get("search") or "").strip()
+        if q:
+            qs = qs.filter(title__icontains=q)
+        return qs
+
+    def perform_create(self, serializer):
+        # Категория: company/branch задаются в CashFlowCategorySerializer (branch опционально, null = на всю компанию).
+        serializer.save()
+
+
+class CashFlowCategoryDetailView(CompanyBranchScopedMixin, generics.RetrieveUpdateDestroyAPIView):
+    queryset = CashFlowCategory.objects.select_related("company", "branch")
+    serializer_class = CashFlowCategorySerializer
 
     def get_queryset(self):
         return self._scoped_queryset(super().get_queryset())

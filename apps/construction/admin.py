@@ -3,7 +3,7 @@ from django.contrib import admin
 from django.core.exceptions import PermissionDenied
 from django.db.models import Q
 
-from apps.construction.models import Cashbox, CashFlow, CashShift
+from apps.construction.models import Cashbox, CashFlow, CashFlowCategory, CashShift
 
 from apps.construction.utils import (
     get_company_from_user as _user_company,
@@ -162,14 +162,24 @@ class CashboxAdmin(CompanyBranchScopedAdminMixin, admin.ModelAdmin):
     ordering = ("name",)
 
 
+# ── CashFlowCategory ───────────────────────────────────────────────
+@admin.register(CashFlowCategory)
+class CashFlowCategoryAdmin(CompanyBranchScopedAdminMixin, admin.ModelAdmin):
+    list_display = ("title", "company", "branch", "created_at")
+    list_filter = ("company", "branch")
+    search_fields = ("title", "company__name", "branch__name")
+    autocomplete_fields = ("company", "branch")
+    ordering = ("title",)
+
+
 # ── CashFlow ──────────────────────────────────────────────────────
 @admin.register(CashFlow)
 class CashFlowAdmin(CompanyBranchScopedAdminMixin, admin.ModelAdmin):
-    list_display = ("cashbox", "company", "branch", "type", "name", "amount", "created_at")
+    list_display = ("cashbox", "company", "branch", "type", "category", "name", "amount", "created_at")
     list_filter = ("company", "branch", "type", "created_at")
     search_fields = ("name", "cashbox__name")
     date_hierarchy = "created_at"
-    autocomplete_fields = ("company", "branch", "cashbox")
+    autocomplete_fields = ("company", "branch", "cashbox", "category")
     ordering = ("-created_at",)
 
     def formfield_for_foreignkey(self, db_field, request, **kwargs):
@@ -190,6 +200,18 @@ class CashFlowAdmin(CompanyBranchScopedAdminMixin, admin.ModelAdmin):
                     else:
                         qs = qs.filter(branch__isnull=True)
 
+                ff.queryset = qs
+
+        if db_field.name == "category" and hasattr(ff, "queryset") and ff.queryset is not None:
+            company = _user_company(request.user)
+            if company:
+                qs = ff.queryset.filter(company=company)
+                if not _is_owner_like(request.user):
+                    br = _active_branch(request)
+                    if br is not None:
+                        qs = qs.filter(Q(branch__isnull=True) | Q(branch=br))
+                    else:
+                        qs = qs.filter(branch__isnull=True)
                 ff.queryset = qs
 
         return ff
