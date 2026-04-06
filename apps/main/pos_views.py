@@ -74,7 +74,8 @@ from .pos_serializers import (
     CustomCartItemCreateSerializer,
     SaleStatusUpdateSerializer,
     ReceiptSerializer,
-    AgentCheckoutSerializer
+    AgentCheckoutSerializer,
+    _is_owner_like,
 )
 
 try:
@@ -137,6 +138,97 @@ def _is_market_company(company: Company) -> bool:
         return bool(company and getattr(company, "is_market", None) and company.is_market())
     except Exception:
         return False
+
+
+def _build_physical_receipt_text(sale, *, payment_method=None, cash_received=None, change=None, include_shift=True) -> str:
+    ensure_sale_doc_number(sale)
+
+    created_at = timezone.localtime(sale.created_at) if getattr(sale, "created_at", None) else timezone.localtime()
+    company_name = (
+        getattr(getattr(sale, "company", None), "llc", None)
+        or getattr(getattr(sale, "company", None), "name", None)
+        or "Компания"
+    )
+    cashier_name = ""
+    if getattr(sale, "user", None):
+        cashier_name = (
+            getattr(sale.user, "get_full_name", lambda: "")()
+            or getattr(sale.user, "full_name", None)
+            or getattr(sale.user, "username", None)
+            or ""
+        )
+
+    payment_method_value = payment_method or getattr(sale, "payment_method", None)
+    payment_label = None
+    try:
+        payment_label = sale.get_payment_method_display()
+    except Exception:
+        payment_label = payment_method_value or ""
+
+    cash_received_value = getattr(sale, "cash_received", None)
+    if cash_received_value in (None, ""):
+        cash_received_value = cash_received if cash_received is not None else Decimal("0.00")
+
+    change_value = getattr(sale, "change", None)
+    if change_value in (None, ""):
+        change_value = change if change is not None else Decimal("0.00")
+
+    lines = [
+        company_name,
+        f"Чек № {getattr(sale, 'doc_no', None) or sale.id}",
+        created_at.strftime("%d.%m.%Y %H:%M"),
+    ]
+    if cashier_name:
+        lines.append(f"Кассир: {cashier_name}")
+    if include_shift and getattr(sale, "shift_id", None):
+        lines.append(f"Смена: {sale.shift_id}")
+    if getattr(sale, "cashbox_id", None):
+        lines.append(f"Касса: {sale.cashbox_id}")
+    if getattr(sale, "client", None):
+        client_name = (
+            getattr(sale.client, "full_name", None)
+            or getattr(sale.client, "llc", None)
+            or getattr(sale.client, "enterprise", None)
+            or ""
+        )
+        if client_name:
+            lines.append(f"Клиент: {client_name}")
+
+    lines.extend([
+        "-" * 32,
+        "Товары",
+    ])
+
+    for idx, it in enumerate(sale.items.all(), start=1):
+        item_name = (getattr(it, "name_snapshot", None) or getattr(it, "custom_name", None) or "Товар").strip()
+        qty = fmt(getattr(it, "quantity", 0))
+        unit_price = fmt_money(getattr(it, "unit_price", 0))
+        line_total = fmt_money((getattr(it, "unit_price", 0) or 0) * (getattr(it, "quantity", 0) or 0))
+        lines.append(f"{idx}. {item_name}")
+        lines.append(f"   {qty} x {unit_price} = {line_total}")
+
+    lines.extend([
+        "-" * 32,
+        f"Сумма: {fmt_money(sale.subtotal)}",
+    ])
+    if sale.discount_total and sale.discount_total > 0:
+        lines.append(f"Скидка: {fmt_money(sale.discount_total)}")
+    if sale.tax_total and sale.tax_total > 0:
+        lines.append(f"Налог: {fmt_money(sale.tax_total)}")
+    lines.append(f"Итого: {fmt_money(sale.total)}")
+
+    if payment_method_value == Sale.PaymentMethod.CASH:
+        lines.append("Оплата: Наличные")
+        lines.append(f"Получено: {fmt_money(cash_received_value)}")
+        lines.append(f"Сдача: {fmt_money(change_value)}")
+    elif payment_method_value == Sale.PaymentMethod.DEBT:
+        lines.append("Оплата: В долг")
+    elif payment_label:
+        lines.append(f"Оплата: {payment_label}")
+
+    lines.append("-" * 32)
+    lines.append("Спасибо за покупку")
+    return "\n".join(lines)
 
 
 def _cart_queryset_for_response():
@@ -1376,6 +1468,8 @@ class SaleAddItemAPIView(MarketCashierOnlyMixin, APIView):
             company_id=cart.company_id,
         )
         qty = ser.validated_data["quantity"]
+        allow_minus = bool(ser.validated_data.get("allow_minus"))
+        can_minus = allow_minus and _is_owner_like(request.user)
 
         unit_price = ser.validated_data.get("unit_price")
         line_discount = ser.validated_data.get("discount_total")
@@ -1427,7 +1521,7 @@ class SaleAddItemAPIView(MarketCashierOnlyMixin, APIView):
         else:
             combined_consume = line_qty_consume_units(qty, pkg)
         have = Decimal(str(product.quantity or 0))
-        if qty3(other + combined_consume) > have:
+        if (not can_minus) and qty3(other + combined_consume) > have:
             return Response(
                 {
                     "detail": (
@@ -1483,6 +1577,8 @@ class SaleCheckoutAPIView(MarketCashierOnlyMixin, APIView):
         ser.is_valid(raise_exception=True)
 
         print_receipt = ser.validated_data["print_receipt"]
+        allow_minus = bool(ser.validated_data.get("allow_minus"))
+        can_minus = allow_minus and _is_owner_like(request.user)
         client_id = ser.validated_data.get("client_id")
         payment_method = ser.validated_data.get("payment_method") or Sale.PaymentMethod.CASH
         cash_received = ser.validated_data.get("cash_received") or Decimal("0.00")
@@ -1528,7 +1624,7 @@ class SaleCheckoutAPIView(MarketCashierOnlyMixin, APIView):
             )
 
         try:
-            sale = checkout_cart(cart)
+            sale = checkout_cart(cart, allow_negative_stock=can_minus)
         except NotEnoughStock as e:
             return Response({"detail": str(e)}, status=status.HTTP_400_BAD_REQUEST)
         except ValueError as e:
@@ -1562,24 +1658,13 @@ class SaleCheckoutAPIView(MarketCashierOnlyMixin, APIView):
         }
 
         if print_receipt:
-            lines = [
-                f"{(it.name_snapshot or '')[:40]} x{it.quantity} = {fmt_money((it.unit_price or 0) * (it.quantity or 0))}"
-                for it in sale.items.all()
-            ]
-            totals = [f"СУММА: {fmt_money(sale.subtotal)}"]
-            if sale.discount_total and sale.discount_total > 0:
-                totals.append(f"СКИДКА: {fmt_money(sale.discount_total)}")
-            if sale.tax_total and sale.tax_total > 0:
-                totals.append(f"НАЛОГ: {fmt_money(sale.tax_total)}")
-            totals.append(f"ИТОГО: {fmt_money(sale.total)}")
-            if sale.payment_method == Sale.PaymentMethod.CASH:
-                totals.append(f"ПОЛУЧЕНО НАЛИЧНЫМИ: {fmt_money(sale.cash_received)}")
-                totals.append(f"СДАЧА: {fmt_money(sale.change)}")
-            elif sale.payment_method == Sale.PaymentMethod.DEBT:
-                totals.append("ПРОДАЖА В ДОЛГ")
-            else:
-                totals.append(f"ОПЛАТА: {sale.get_payment_method_display()}")
-            payload["receipt_text"] = "ЧЕК\n" + "\n".join(lines) + "\n" + "\n".join(totals)
+            payload["receipt_text"] = _build_physical_receipt_text(
+                sale,
+                payment_method=sale.payment_method,
+                cash_received=sale.cash_received,
+                change=sale.change,
+                include_shift=True,
+            )
 
         return Response(payload, status=status.HTTP_201_CREATED)
 
@@ -2414,6 +2499,8 @@ class AgentSaleAddItemAPIView(MarketCashierOnlyMixin, CompanyBranchRestrictedMix
             company=cart.company,
         )
         qty = ser.validated_data["quantity"]
+        allow_minus = bool(ser.validated_data.get("allow_minus"))
+        can_minus = allow_minus and _is_owner_like(request.user)
 
         acting_agent = _resolve_acting_agent(request, cart, allow_owner_override=True)
         use_main_stock = _should_use_main_stock_in_agent_sale(user=request.user, acting_agent=acting_agent)
@@ -2462,7 +2549,7 @@ class AgentSaleAddItemAPIView(MarketCashierOnlyMixin, CompanyBranchRestrictedMix
                 default=Decimal("0"),
             )
             req = _as_decimal(qty, default=Decimal("0"))
-            if req + in_cart > available:
+            if (not can_minus) and req + in_cart > available:
                 return Response(
                     {
                         "detail": (
@@ -2482,7 +2569,7 @@ class AgentSaleAddItemAPIView(MarketCashierOnlyMixin, CompanyBranchRestrictedMix
                 default=Decimal("0"),
             )
             req = _as_decimal(qty, default=Decimal("0"))
-            if req + in_cart > available:
+            if (not can_minus) and req + in_cart > available:
                 remaining = max(Decimal("0"), available - in_cart)
                 return Response(
                     {"detail": f"Недостаточно у агента. Доступно: {qty3(remaining)}."},
@@ -2587,6 +2674,8 @@ class AgentSaleCheckoutAPIView(MarketCashierOnlyMixin, CompanyBranchRestrictedMi
         ser.is_valid(raise_exception=True)
 
         print_receipt = ser.validated_data["print_receipt"]
+        allow_minus = bool(ser.validated_data.get("allow_minus"))
+        can_minus = allow_minus and _is_owner_like(request.user)
         client_id = ser.validated_data.get("client_id")
         payment_method = ser.validated_data.get("payment_method") or Sale.PaymentMethod.CASH
         cash_received = ser.validated_data.get("cash_received") or Decimal("0.00")
@@ -2612,6 +2701,7 @@ class AgentSaleCheckoutAPIView(MarketCashierOnlyMixin, CompanyBranchRestrictedMi
                 cart,
                 agent=acting_agent,
                 use_main_stock=use_main_stock,
+                allow_negative_stock=bool(can_minus and use_main_stock),
                 cashbox_id=cashbox_id,  # можно сохранить кассу в Sale, но без смен
                 payment_method=payment_method,
                 cash_received=cash_received,
@@ -2663,27 +2753,13 @@ class AgentSaleCheckoutAPIView(MarketCashierOnlyMixin, CompanyBranchRestrictedMi
         }
 
         if print_receipt:
-            lines = [
-                f"{(it.name_snapshot or '')[:40]} x{it.quantity} = {(it.unit_price or 0) * (it.quantity or 0):.2f}"
-                for it in sale.items.all()
-            ]
-            totals = [f"СУММА: {sale.subtotal:.2f}"]
-            if sale.discount_total and sale.discount_total > 0:
-                totals.append(f"СКИДКА: {sale.discount_total:.2f}")
-            if sale.tax_total and sale.tax_total > 0:
-                totals.append(f"НАЛОГ: {sale.tax_total:.2f}")
-            totals.append(f"ИТОГО: {sale.total:.2f}")
-            if getattr(sale, "payment_method", payment_method) == Sale.PaymentMethod.CASH:
-                totals.append(f"ПОЛУЧЕНО НАЛИЧНЫМИ: {getattr(sale, 'cash_received', cash_received):.2f}")
-                totals.append(f"СДАЧА: {getattr(sale, 'change', Decimal('0.00')):.2f}")
-            elif getattr(sale, "payment_method", payment_method) == Sale.PaymentMethod.DEBT:
-                totals.append("ПРОДАЖА В ДОЛГ")
-            else:
-                try:
-                    totals.append(f"ОПЛАТА: {sale.get_payment_method_display()}")
-                except Exception:
-                    totals.append("ОПЛАТА")
-            payload["receipt_text"] = "ЧЕК\n" + "\n".join(lines) + "\n" + "\n".join(totals)
+            payload["receipt_text"] = _build_physical_receipt_text(
+                sale,
+                payment_method=getattr(sale, "payment_method", payment_method),
+                cash_received=getattr(sale, "cash_received", cash_received),
+                change=getattr(sale, "change", Decimal("0.00")),
+                include_shift=False,
+            )
 
         return Response(payload, status=status.HTTP_201_CREATED)
 

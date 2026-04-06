@@ -236,6 +236,9 @@ class AddItemSerializer(serializers.Serializer):
     discount_total = MoneyField(required=False)
     # Продажа поштучно из пачки: id упаковки ProductPackage (quantity_in_package = шт в пачке)
     sale_package_id = serializers.UUIDField(required=False, allow_null=True)
+    # Разрешить продажу "в минус" (игнорировать проверку остатка).
+    # Будет применено только для owner/admin (см. pos_views).
+    allow_minus = serializers.BooleanField(required=False, default=False)
 
     def validate(self, attrs):
         up = attrs.get("unit_price")
@@ -302,6 +305,8 @@ class CheckoutSerializer(serializers.Serializer):
     print_receipt = serializers.BooleanField(default=False)
     client_id = OptionalUUIDField(required=False, allow_null=True)
     department_id = OptionalUUIDField(required=False, allow_null=True)
+    # Разрешить списание "в минус" при закрытии чека (только owner/admin).
+    allow_minus = serializers.BooleanField(required=False, default=False)
 
     # если смены нет — можно передать кассу (или автоподбор)
     cashbox_id = OptionalUUIDField(required=False, allow_null=True)
@@ -631,6 +636,8 @@ class AgentCheckoutSerializer(serializers.Serializer):
     client_id = OptionalUUIDField(required=False, allow_null=True)
     # алиас для клиентов, которые шлют `client` вместо `client_id`
     client = OptionalUUIDField(required=False, allow_null=True, write_only=True)
+    # Разрешить "в минус" при оформлении агентской продажи (только owner/admin).
+    allow_minus = serializers.BooleanField(required=False, default=False)
 
     payment_method = serializers.ChoiceField(
         choices=Sale.PaymentMethod.choices,
