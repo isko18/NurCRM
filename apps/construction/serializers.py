@@ -4,7 +4,8 @@ from django.db.models import Q
 from rest_framework import serializers
 from django.contrib.auth import get_user_model
 
-from apps.construction.models import Cashbox, CashFlow, CashShift
+from apps.construction.models import Cashbox, CashFlow, CashFlowCategory, CashShift
+from apps.users.models import Branch
 
 from apps.construction.utils import (
     get_company_from_user as _get_company_from_user,
@@ -249,6 +250,17 @@ class CashShiftCloseSerializer(serializers.Serializer):
 # ─────────────────────────────────────────────────────────────
 class CashFlowInsideCashboxSerializer(serializers.ModelSerializer):
     cashier_display = serializers.SerializerMethodField()
+    category_title = serializers.CharField(source="category.title", read_only=True, default="")
+
+    def get_cashier_display(self, obj):
+        u = getattr(obj, "cashier", None)
+        if not u:
+            return None
+        return (
+            getattr(u, "get_full_name", lambda: "")()
+            or getattr(u, "email", None)
+            or getattr(u, "username", None)
+        )
 
     class Meta:
         model = CashFlow
@@ -264,17 +276,10 @@ class CashFlowInsideCashboxSerializer(serializers.ModelSerializer):
             "shift",
             "cashier",
             "cashier_display",
+            "category",
+            "category_title",
         ]
-
-    def get_cashier_display(self, obj):
-        u = getattr(obj, "cashier", None)
-        if not u:
-            return None
-        return (
-            getattr(u, "get_full_name", lambda: "")()
-            or getattr(u, "email", None)
-            or getattr(u, "username", None)
-        )
+        read_only_fields = fields
 
 
 class CashboxWithFlowsSerializer(CompanyBranchReadOnlyMixin):
@@ -344,6 +349,65 @@ class CashboxSerializer(CompanyBranchReadOnlyMixin):
 
 
 # ─────────────────────────────────────────────────────────────
+# CashFlowCategory
+# ─────────────────────────────────────────────────────────────
+class CashFlowCategorySerializer(CompanyBranchReadOnlyMixin):
+    """Категория опционально привязана к филиалу: branch=null — на всю компанию."""
+
+    branch = serializers.PrimaryKeyRelatedField(
+        queryset=Branch.objects.all(), required=False, allow_null=True
+    )
+
+    class Meta:
+        model = CashFlowCategory
+        fields = ["id", "company", "branch", "title", "created_at"]
+        read_only_fields = ["id", "company", "created_at"]
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        request = self.context.get("request")
+        user = getattr(request, "user", None) if request else None
+        company = _get_company_from_user(user) if user else None
+        if company and "branch" in self.fields:
+            self.fields["branch"].queryset = Branch.objects.filter(company=company)
+
+    def validate_title(self, value):
+        v = (value or "").strip()
+        if not v:
+            raise serializers.ValidationError("Укажите название категории.")
+        return v
+
+    def validate(self, attrs):
+        br = attrs.get("branch")
+        request = self.context.get("request")
+        user = getattr(request, "user", None) if request else None
+        company = _get_company_from_user(user) if user else None
+        if br is not None and company and br.company_id != company.id:
+            raise serializers.ValidationError({"branch": "Филиал другой компании."})
+        return attrs
+
+    def create(self, validated_data):
+        request = self.context.get("request")
+        user = getattr(request, "user", None) if request else None
+        if user:
+            company = _get_company_from_user(user)
+            if company is not None:
+                validated_data["company"] = company
+        if "branch" not in validated_data:
+            validated_data["branch"] = self._auto_branch()
+        return serializers.ModelSerializer.create(self, validated_data)
+
+    def update(self, instance, validated_data):
+        request = self.context.get("request")
+        user = getattr(request, "user", None) if request else None
+        if user:
+            company = _get_company_from_user(user)
+            if company is not None:
+                validated_data["company"] = company
+        return serializers.ModelSerializer.update(self, instance, validated_data)
+
+
+# ─────────────────────────────────────────────────────────────
 # CashFlow
 # ─────────────────────────────────────────────────────────────
 class CashFlowSerializer(CompanyBranchReadOnlyMixin):
@@ -355,6 +419,13 @@ class CashFlowSerializer(CompanyBranchReadOnlyMixin):
         required=False,
         allow_null=True,
     )
+    category = serializers.PrimaryKeyRelatedField(
+        queryset=CashFlowCategory.objects.all(),
+        required=False,
+        allow_null=True,
+    )
+    category_title = serializers.CharField(source="category.title", read_only=True, default="")
+
     cashier = serializers.ReadOnlyField(source="cashier.id")
     cashier_display = serializers.SerializerMethodField()
 
@@ -374,6 +445,8 @@ class CashFlowSerializer(CompanyBranchReadOnlyMixin):
             "source_cashbox_flow_id",
             "source_business_operation_id",
             "shift",
+            "category",
+            "category_title",
             "cashier",
             "cashier_display",
         ]
@@ -385,6 +458,7 @@ class CashFlowSerializer(CompanyBranchReadOnlyMixin):
             "branch",
             "cashier",
             "cashier_display",
+            "category_title",
         ]
 
     def __init__(self, *args, **kwargs):
@@ -413,6 +487,11 @@ class CashFlowSerializer(CompanyBranchReadOnlyMixin):
             sh_qs = sh_qs.filter(cashier=user)
         self.fields["shift"].queryset = sh_qs
 
+        cat_qs = CashFlowCategory.objects.filter(company=company)
+        if target_branch is not None:
+            cat_qs = cat_qs.filter(Q(branch__isnull=True) | Q(branch=target_branch))
+        self.fields["category"].queryset = cat_qs
+
     def get_cashbox_name(self, obj):
         if obj.cashbox and obj.cashbox.branch:
             return f"Касса филиала {obj.cashbox.branch.name}"
@@ -433,6 +512,19 @@ class CashFlowSerializer(CompanyBranchReadOnlyMixin):
         user = getattr(request, "user", None) if request else None
 
         cashbox = attrs.get("cashbox") or getattr(self.instance, "cashbox", None)
+
+        category = attrs.get("category") if "category" in attrs else getattr(self.instance, "category", None)
+        if category is not None:
+            company = _get_company_from_user(user) if user else None
+            if company and category.company_id != company.id:
+                raise serializers.ValidationError({"category": "Категория другой компании."})
+            if cashbox:
+                cb_br = cashbox.branch_id
+                cat_br = category.branch_id
+                if cat_br is not None and cat_br != cb_br:
+                    raise serializers.ValidationError(
+                        {"category": "Категория привязана к другому филиалу. Выберите общую категорию или категорию этого филиала."}
+                    )
 
         # amount: в БД стоит CheckConstraint amount__gt=0.
         # На фронте часто отправляют отрицательное значение для "расхода" —

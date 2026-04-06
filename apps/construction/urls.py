@@ -4,6 +4,8 @@ from apps.construction.views import (
     CashboxDetailView,
     CashFlowListCreateView,
     CashFlowDetailView,
+    CashFlowCategoryListCreateView,
+    CashFlowCategoryDetailView,
     CashboxOwnerDetailView,
     CashboxOwnerDetailSingleView,
     CashShiftListView,
@@ -20,6 +22,9 @@ urlpatterns = [
     path("cashflows/", CashFlowListCreateView.as_view(), name="cashflow-list-create"),
     path("cashflows/<uuid:pk>/", CashFlowDetailView.as_view(), name="cashflow-detail"),
     path("cashflows/bulk/status/", CashFlowBulkStatusUpdateView.as_view(), name="cashflow-bulk-status"),
+
+    path("cashflow-categories/", CashFlowCategoryListCreateView.as_view(), name="cashflow-category-list-create"),
+    path("cashflow-categories/<uuid:pk>/", CashFlowCategoryDetailView.as_view(), name="cashflow-category-detail"),
 
     path("cashboxes/detail/owner/", CashboxOwnerDetailView.as_view(), name="owner-cashboxes"),
     path("cashboxes/<uuid:pk>/detail/owner/", CashboxOwnerDetailSingleView.as_view(), name="owner-cashbox-detail"),

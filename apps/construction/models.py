@@ -10,6 +10,55 @@ from django.utils import timezone
 from apps.users.models import Company, Branch
 
 
+class CashFlowCategory(models.Model):
+    """Пользовательские категории движений по кассе (компания / филиал)."""
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    company = models.ForeignKey(
+        Company,
+        on_delete=models.CASCADE,
+        related_name="cashflow_categories",
+        verbose_name="Компания",
+    )
+    branch = models.ForeignKey(
+        Branch,
+        on_delete=models.CASCADE,
+        related_name="cashflow_categories",
+        null=True,
+        blank=True,
+        db_index=True,
+        verbose_name="Филиал",
+    )
+    title = models.CharField(max_length=128, verbose_name="Название")
+    created_at = models.DateTimeField(auto_now_add=True, verbose_name="Создано")
+
+    class Meta:
+        verbose_name = "Категория движения по кассе"
+        verbose_name_plural = "Категории движений по кассе"
+        ordering = ["title"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=("company", "branch", "title"),
+                name="uq_cashflow_category_title_per_scope",
+            ),
+        ]
+        indexes = [
+            models.Index(fields=["company", "created_at"]),
+            models.Index(fields=["company", "branch", "created_at"]),
+        ]
+
+    def clean(self):
+        if self.branch_id and self.branch.company_id != self.company_id:
+            raise ValidationError({"branch": "Филиал принадлежит другой компании."})
+
+    def save(self, *args, **kwargs):
+        self.full_clean()
+        return super().save(*args, **kwargs)
+
+    def __str__(self):
+        return self.title
+
+
 class Cashbox(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
 
@@ -396,6 +445,14 @@ class CashFlow(models.Model):
         related_name="cash_flows",
         verbose_name="Кассир",
     )
+    category = models.ForeignKey(
+        "CashFlowCategory",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="cashflows",
+        verbose_name="Категория",
+    )
 
     class Meta:
         verbose_name = "Движение по кассе"
@@ -426,6 +483,14 @@ class CashFlow(models.Model):
                 raise ValidationError({"shift": "Смена относится к другой кассе."})
             if self.cashier_id and self.cashier_id != self.shift.cashier_id:
                 raise ValidationError({"cashier": "Кассир не совпадает с кассиром смены."})
+
+        if self.category_id:
+            if self.category.company_id != self.company_id:
+                raise ValidationError({"category": "Категория другой компании."})
+            cb_br = self.cashbox.branch_id if self.cashbox_id else None
+            cat_br = self.category.branch_id
+            if cat_br is not None and cat_br != cb_br:
+                raise ValidationError({"category": "Категория другого филиала (или укажите общую категорию без филиала)."})
 
     def save(self, *args, **kwargs):
         if self.cashbox_id:
