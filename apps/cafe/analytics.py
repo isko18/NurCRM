@@ -16,8 +16,8 @@ from django.conf import settings
 from django.core.cache import cache
 from django.http import HttpResponse
 from django.db.models import (
-    Q, Count, Avg, Sum, F,
-    ExpressionWrapper, DurationField, DecimalField, Value,
+    Q, Count, Avg, Sum, F, Case, When,
+    ExpressionWrapper, DurationField, DecimalField, Value, IntegerField,
 )
 from django.db.models.functions import Coalesce
 from django.utils import timezone
@@ -116,9 +116,46 @@ def _line_revenue_expr():
     )
 
 
-def _order_final_amount_expr():
+def _line_net_quantity_expr():
+    """Проданное количество за вычетом возвратов по строке (позиционные возвраты)."""
     return ExpressionWrapper(
-        F("total_amount") - F("discount_amount"),
+        F("quantity") - Coalesce(F("refunded_quantity"), Value(0)),
+        output_field=IntegerField(),
+    )
+
+
+def _line_net_revenue_expr():
+    """Выручка по строке после позиционных возвратов (кол-во нетто × цена)."""
+    unit = Coalesce(
+        F("unit_price"),
+        F("menu_item__price"),
+        Value(Decimal("0")),
+        output_field=DecimalField(max_digits=14, decimal_places=2),
+    )
+    return ExpressionWrapper(
+        (F("quantity") - Coalesce(F("refunded_quantity"), Value(0))) * unit,
+        output_field=DecimalField(max_digits=14, decimal_places=2),
+    )
+
+
+def _order_net_revenue_expr():
+    """
+    Деньги, оставшиеся по оплаченному заказу: оплата минус возвраты.
+    Если paid_amount не заполнен (старые данные), берём итог после скидки минус возвраты.
+    """
+    ref = Coalesce(
+        F("refunded_amount"),
+        Value(Decimal("0")),
+        output_field=DecimalField(max_digits=12, decimal_places=2),
+    )
+    paid_net = ExpressionWrapper(F("paid_amount") - ref, output_field=DecimalField(max_digits=14, decimal_places=2))
+    final_net = ExpressionWrapper(
+        (F("total_amount") - F("discount_amount")) - ref,
+        output_field=DecimalField(max_digits=14, decimal_places=2),
+    )
+    return Case(
+        When(paid_amount__gt=0, then=paid_net),
+        default=final_net,
         output_field=DecimalField(max_digits=14, decimal_places=2),
     )
 
@@ -325,24 +362,32 @@ class SalesSummaryView(CompanyBranchQuerysetMixin, APIView):
         if hit is not None:
             return Response(hit)
 
+        oq = Order.objects.filter(company=company, is_paid=True)
+        if branch is not None:
+            oq = oq.filter(branch=branch)
+        else:
+            oq = oq.filter(branch__isnull=True)
+        oq, _ = _apply_waiter_scope(oq, request, "waiter_id")
+        oq = _apply_date_range(oq, "paid_at", df, dt)
+
         qs = _paid_order_lines_qs(company, branch)
         qs, _ = _apply_waiter_scope(qs, request, "order__waiter_id")
         qs = _apply_date_range(qs, "order__paid_at", df, dt)
-        line_total = _line_revenue_expr()
+        net_qty = _line_net_quantity_expr()
 
-        agg = qs.aggregate(
-            orders_count=Count("order_id", distinct=True),
-            items_qty=Sum("quantity"),
-            revenue=Sum(line_total),
+        order_agg = oq.aggregate(
+            orders_count=Count("id"),
+            revenue=Sum(_order_net_revenue_expr()),
         )
+        line_agg = qs.aggregate(items_qty=Sum(net_qty))
 
-        revenue = _to_decimal(agg.get("revenue"))
+        revenue = _to_decimal(order_agg.get("revenue"))
         payload = {
             "date_from": df,
             "date_to": dt,
             "basis": "paid_at",
-            "orders_count": int(agg.get("orders_count") or 0),
-            "items_qty": int(agg.get("items_qty") or 0),
+            "orders_count": int(order_agg.get("orders_count") or 0),
+            "items_qty": int(line_agg.get("items_qty") or 0),
             "revenue": f"{revenue:.2f}",
         }
 
@@ -389,10 +434,11 @@ class SalesByMenuItemView(CompanyBranchQuerysetMixin, APIView):
         )
         qs, _ = _apply_waiter_scope(qs, request, "order__waiter_id")
         qs = _apply_date_range(qs, "order__paid_at", df, dt)
-        line_total = _line_revenue_expr()
+        line_net = _line_net_revenue_expr()
+        net_qty = _line_net_quantity_expr()
 
         data = (qs.values("menu_item_id", "menu_item__title")
-                  .annotate(qty=Sum("quantity"), revenue=Sum(line_total))
+                  .annotate(qty=Sum(net_qty), revenue=Sum(line_net))
                   .order_by("-revenue", "-qty")[:limit])
 
         result = []
@@ -496,9 +542,13 @@ class MenuAnalyticsAllView(CompanyBranchQuerysetMixin, APIView):
         if dt:
             line_filter &= Q(order_items__order__paid_at__date__lte=dt)
 
-        # qty & revenue
+        # qty & revenue (нетто по возвратам позиций)
+        net_qty_expr = ExpressionWrapper(
+            F("order_items__quantity") - Coalesce(F("order_items__refunded_quantity"), Value(0)),
+            output_field=IntegerField(),
+        )
         revenue_expr = ExpressionWrapper(
-            F("order_items__quantity")
+            (F("order_items__quantity") - Coalesce(F("order_items__refunded_quantity"), Value(0)))
             * Coalesce(
                 F("order_items__unit_price"),
                 F("price"),
@@ -509,7 +559,7 @@ class MenuAnalyticsAllView(CompanyBranchQuerysetMixin, APIView):
         )
 
         mi_qs = mi_qs.annotate(
-            qty=Coalesce(Sum("order_items__quantity", filter=line_filter), Value(0)),
+            qty=Coalesce(Sum(net_qty_expr, filter=line_filter), Value(0)),
             revenue=Coalesce(Sum(revenue_expr, filter=line_filter), Value(Decimal("0.00"))),
         ).order_by("-revenue", "-qty", "title")
 
@@ -593,10 +643,11 @@ class SalesByCategoryView(CompanyBranchQuerysetMixin, APIView):
         )
         qs, _ = _apply_waiter_scope(qs, request, "order__waiter_id")
         qs = _apply_date_range(qs, "order__paid_at", df, dt)
-        line_total = _line_revenue_expr()
+        line_net = _line_net_revenue_expr()
+        net_qty = _line_net_quantity_expr()
 
         data = (qs.values("menu_item__category_id", "menu_item__category__title")
-                  .annotate(qty=Sum("quantity"), revenue=Sum(line_total))
+                  .annotate(qty=Sum(net_qty), revenue=Sum(line_net))
                   .order_by("-revenue", "-qty")[:limit])
 
         result = []
@@ -614,7 +665,7 @@ class SalesByCategoryView(CompanyBranchQuerysetMixin, APIView):
 
 
 class SalesByKitchenView(CompanyBranchQuerysetMixin, APIView):
-    """Выручка по кухням (из MenuItem.kitchen), только оплаченные заказы без отказов."""
+    """Выручка по кухням (из MenuItem.kitchen): оплаченные строки без отказов, кол-во и сумма нетто по возвратам позиций."""
     permission_classes = [permissions.IsAuthenticated]
 
     def get(self, request):
@@ -646,11 +697,12 @@ class SalesByKitchenView(CompanyBranchQuerysetMixin, APIView):
         )
         qs, _ = _apply_waiter_scope(qs, request, "order__waiter_id")
         qs = _apply_date_range(qs, "order__paid_at", df, dt)
-        line_total = _line_revenue_expr()
+        line_net = _line_net_revenue_expr()
+        net_qty = _line_net_quantity_expr()
 
         data = (
             qs.values("menu_item__kitchen_id", "menu_item__kitchen__title", "menu_item__kitchen__number")
-            .annotate(qty=Sum("quantity"), revenue=Sum(line_total))
+            .annotate(qty=Sum(net_qty), revenue=Sum(line_net))
             .order_by("-revenue", "-qty")
         )
 
@@ -671,7 +723,7 @@ class SalesByKitchenView(CompanyBranchQuerysetMixin, APIView):
 
 class RevenueInflowView(CompanyBranchQuerysetMixin, APIView):
     """
-    Приход по способам оплаты (как сводка маркета): только полностью оплаченные заказы, по дате paid_at.
+    Приход по способам оплаты: оплаченные заказы по дате paid_at, суммы нетто (оплата минус возвраты по чеку).
     """
     permission_classes = [permissions.IsAuthenticated]
 
@@ -692,11 +744,11 @@ class RevenueInflowView(CompanyBranchQuerysetMixin, APIView):
         qs, _ = _apply_waiter_scope(qs, request, "waiter_id")
         qs = _apply_date_range(qs, "paid_at", df, dt)
 
-        final_expr = _order_final_amount_expr()
+        net_expr = _order_net_revenue_expr()
         rows = (
-            qs.annotate(final_amount=final_expr)
+            qs.annotate(net_captured=net_expr)
             .values("payment_method")
-            .annotate(count=Count("id"), total=Sum("final_amount"))
+            .annotate(count=Count("id"), total=Sum("net_captured"))
             .order_by("-total")
         )
 
@@ -959,9 +1011,9 @@ class CafeShiftReportView(CompanyBranchQuerysetMixin, APIView):
             qs = qs.filter(branch=branch)
         qs, _ = _apply_waiter_scope(qs, request, "waiter_id")
 
-        final_expr = _order_final_amount_expr()
+        net_expr = _order_net_revenue_expr()
         by_pm = (
-            qs.annotate(fa=final_expr)
+            qs.annotate(fa=net_expr)
             .values("payment_method")
             .annotate(count=Count("id"), total=Sum("fa"))
         )
@@ -1011,9 +1063,9 @@ class CafeDailyCloseReportView(CompanyBranchQuerysetMixin, APIView):
             qs = qs.filter(branch__isnull=True)
         qs, _ = _apply_waiter_scope(qs, request, "waiter_id")
 
-        final_expr = _order_final_amount_expr()
+        net_expr = _order_net_revenue_expr()
         by_pm = (
-            qs.annotate(fa=final_expr)
+            qs.annotate(fa=net_expr)
             .values("payment_method")
             .annotate(count=Count("id"), total=Sum("fa"))
         )
@@ -1041,7 +1093,7 @@ class CafeDailyCloseReportView(CompanyBranchQuerysetMixin, APIView):
 class CafeWaiterSalaryReportView(CompanyBranchQuerysetMixin, APIView):
     """
     Расчёт: пропорциональный оклад за период (monthly_base * days / 30) + revenue_percent% от выручки
-    по заказам официанта (оплачено, paid_at, итог после скидки).
+    по заказам официанта (оплачено, paid_at, нетто после возвратов).
     """
     permission_classes = [permissions.IsAuthenticated]
 
@@ -1077,7 +1129,6 @@ class CafeWaiterSalaryReportView(CompanyBranchQuerysetMixin, APIView):
         else:
             prof_qs = prof_qs.filter(branch__isnull=True)
 
-        final_expr = _order_final_amount_expr()
         out = []
         effective_profiles = {}
         for prof in prof_qs.select_related("user").order_by("user_id", "-branch_id"):
@@ -1096,7 +1147,7 @@ class CafeWaiterSalaryReportView(CompanyBranchQuerysetMixin, APIView):
             else:
                 oq = oq.filter(branch__isnull=True)
             oq = _apply_date_range(oq, "paid_at", df, dt)
-            agg = oq.aggregate(s=Sum(final_expr))
+            agg = oq.annotate(_nr=_order_net_revenue_expr()).aggregate(s=Sum("_nr"))
             waiter_rev = _to_decimal(agg.get("s"))
             base_part = (prof.monthly_base_salary or Decimal("0")) * Decimal(days) / Decimal("30")
             pct = (prof.revenue_percent or Decimal("0")) / Decimal("100")
@@ -1167,7 +1218,7 @@ class CafeUnifiedAnalyticsView(CompanyBranchQuerysetMixin, APIView):
 
 
 class CafeWaiterSalesView(CompanyBranchQuerysetMixin, APIView):
-    """Выручка по официантам (оплаченные заказы, итог после скидки, paid_at)."""
+    """Выручка по официантам: оплаченные заказы по paid_at, сумма нетто (оплата минус возвраты)."""
     permission_classes = [permissions.IsAuthenticated]
 
     def get(self, request):
@@ -1187,10 +1238,11 @@ class CafeWaiterSalesView(CompanyBranchQuerysetMixin, APIView):
         qs, _ = _apply_waiter_scope(qs, request, "waiter_id")
         qs = _apply_date_range(qs, "paid_at", df, dt)
 
-        final_expr = _order_final_amount_expr()
+        net_expr = _order_net_revenue_expr()
         data = (
-            qs.values("waiter_id", "waiter__first_name", "waiter__last_name", "waiter__email")
-            .annotate(orders_count=Count("id"), revenue=Sum(final_expr))
+            qs.annotate(net_captured=net_expr)
+            .values("waiter_id", "waiter__first_name", "waiter__last_name", "waiter__email")
+            .annotate(orders_count=Count("id"), revenue=Sum("net_captured"))
             .order_by("-revenue")
         )
 
@@ -1389,13 +1441,22 @@ class CafeAnalyticsExportView(CompanyBranchQuerysetMixin, APIView):
         qs_purchases = _apply_date_range(qs_purchases, "created_at", date_from, date_to)
         qs_exp = _apply_date_range(qs_exp, "expense_date", date_from, date_to)
 
-        line_total = _line_revenue_expr()
+        oq = Order.objects.filter(company=company, is_paid=True)
+        if branch is not None:
+            oq = oq.filter(branch=branch)
+        else:
+            oq = oq.filter(branch__isnull=True)
+        oq = _apply_date_range(oq, "paid_at", date_from, date_to)
 
-        sales_agg = qs_items.aggregate(
-            orders_count=Count("order_id", distinct=True),
-            items_qty=Sum("quantity"),
-            revenue=Sum(line_total),
+        line_net = _line_net_revenue_expr()
+        net_qty = _line_net_quantity_expr()
+
+        line_part = qs_items.aggregate(items_qty=Sum(net_qty))
+        order_part = oq.aggregate(
+            orders_count=Count("id"),
+            revenue=Sum(_order_net_revenue_expr()),
         )
+        sales_agg = {**line_part, **order_part}
         purchases_agg = qs_purchases.aggregate(
             purchases_count=Count("id"),
             purchases_sum=Sum("price"),
@@ -1412,7 +1473,7 @@ class CafeAnalyticsExportView(CompanyBranchQuerysetMixin, APIView):
         top_items_qs = (
             qs_items.filter(line_kind=OrderItem.LineKind.MENU, menu_item_id__isnull=False)
             .values("menu_item__title")
-            .annotate(qty=Sum("quantity"), revenue=Sum(line_total))
+            .annotate(qty=Sum(net_qty), revenue=Sum(line_net))
             .order_by("-revenue", "-qty")[:10]
         )
 
@@ -1444,14 +1505,9 @@ class CafeAnalyticsExportView(CompanyBranchQuerysetMixin, APIView):
             qs = qs.filter(branch=branch)
         qs = _apply_date_range(qs, "paid_at", date_from, date_to)
 
-        final_total_expr = ExpressionWrapper(
-            F("total_amount") - F("discount_amount"),
-            output_field=DecimalField(max_digits=14, decimal_places=2),
-        )
-
         orders_qs = (
-            qs.annotate(final_amount=final_total_expr)
-            .values("id", "paid_at", "payment_method", "final_amount")
+            qs.annotate(row_net=_order_net_revenue_expr())
+            .values("id", "paid_at", "payment_method", "row_net")
             .order_by("-paid_at")[:500]
         )
 
@@ -1466,7 +1522,7 @@ class CafeAnalyticsExportView(CompanyBranchQuerysetMixin, APIView):
         rows = []
         for row in orders_qs:
             method = (row.get("payment_method") or "").strip().lower()
-            amount = _to_decimal(row.get("final_amount"))
+            amount = _to_decimal(row.get("row_net"))
             if method in ("cash", "card", "transfer"):
                 totals[method] += amount
             else:
