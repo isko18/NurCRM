@@ -931,11 +931,23 @@ class CafeWaiterAnalyticsScopeTestCase(TestCase):
             quantity=quantity,
         )
         order.recalc_total()
+        order.discount_amount = order.discount_amount or Decimal("0")
+        order.paid_amount = (order.total_amount or Decimal("0")) - order.discount_amount
         order.is_paid = True
         order.paid_at = timezone.now()
         order.payment_method = "cash"
         order.status = Order.Status.CLOSED
-        order.save(update_fields=["total_amount", "is_paid", "paid_at", "payment_method", "status"])
+        order.save(
+            update_fields=[
+                "total_amount",
+                "discount_amount",
+                "paid_amount",
+                "is_paid",
+                "paid_at",
+                "payment_method",
+                "status",
+            ]
+        )
         return order
 
     def test_waiter_sales_summary_is_scoped_to_current_waiter(self):
@@ -967,6 +979,27 @@ class CafeWaiterAnalyticsScopeTestCase(TestCase):
         self.assertEqual(response.data["orders_count"], 2)
         self.assertEqual(response.data["items_qty"], 3)
         self.assertEqual(response.data["revenue"], "300.00")
+
+    def test_sales_summary_net_after_position_refund(self):
+        order = self._create_paid_order(
+            waiter=self.waiter1, table=self.table1, client=self.client1, quantity=2
+        )
+        item = order.items.first()
+        item.refunded_quantity = 1
+        item.save(update_fields=["refunded_quantity"])
+        order.refunded_amount = Decimal("100.00")
+        order.save(update_fields=["refunded_amount"])
+
+        request = self.api_factory.get(
+            f"/cafe/analytics/sales/summary/?branch={self.branch.id}&date_from={self.period_day}&date_to={self.period_day}"
+        )
+        force_authenticate(request, user=self.owner)
+        response = SalesSummaryView.as_view()(request)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["orders_count"], 1)
+        self.assertEqual(response.data["items_qty"], 1)
+        self.assertEqual(response.data["revenue"], "100.00")
 
     def test_waiter_salary_report_returns_only_own_base_plus_percent(self):
         self._create_paid_order(waiter=self.waiter1, table=self.table1, client=self.client1, quantity=1)
