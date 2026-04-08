@@ -108,6 +108,14 @@ class Company(models.Model):
     can_view_telegram = models.BooleanField(default=False, verbose_name="Доступ к telegram")
     can_view_showcase = models.BooleanField(default=False, verbose_name="Доступ к витрине")
 
+    cashier_password = models.CharField(
+        "Пароль для кассы",
+        max_length=128,
+        null=True,
+        blank=True,
+        default=None,
+    )
+
 
     scale_api_token = models.CharField(
         max_length=64,
