@@ -197,3 +197,28 @@ def get_attr(obj: Optional[object], name: str, default=None):
         Значение атрибута или default
     """
     return getattr(obj, name, default) if obj is not None else default
+
+
+def log_cart_item_deletion(*, item, deleted_by) -> None:
+    """Запись в журнал при удалении позиции из корзины POS (до вызова item.delete())."""
+    if deleted_by is None or not getattr(deleted_by, "is_authenticated", False):
+        return
+    from apps.main.models import CartItemDeletionLog  # локальный импорт — избегаем циклов
+
+    name = ""
+    prod = getattr(item, "product", None)
+    if prod is not None:
+        name = (getattr(prod, "name", None) or "").strip()
+    if not name:
+        name = (getattr(item, "custom_name", None) or "").strip() or "Позиция"
+
+    CartItemDeletionLog.objects.create(
+        company_id=item.company_id,
+        branch_id=getattr(item, "branch_id", None),
+        cart_id=item.cart_id,
+        cart_item_id=item.pk,
+        product_id=item.product_id,
+        product_name=name[:255],
+        quantity=item.quantity,
+        deleted_by=deleted_by,
+    )

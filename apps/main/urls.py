@@ -161,6 +161,11 @@ urlpatterns = [
         CartItemUpdateDestroyAPIView.as_view(),
         name="pos-cart-item-update-destroy",
     ),
+    path(
+        "pos/cart-item-deletions/",
+        CartItemDeletionLogListAPIView.as_view(),
+        name="pos-cart-item-deletions",
+    ),
     path("pos/sales/<uuid:pk>/receipt/", SaleReceiptDataAPIView.as_view(), name="sale-receipt-download"),
     path("sales/<uuid:pk>/invoice/", SaleInvoiceDownloadAPIView.as_view()),
     

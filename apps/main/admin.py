@@ -16,7 +16,7 @@ from .models import (
     # Extra product models
     ProductImage, ProductCharacteristics, ProductPackage,
     # POS
-    Cart, CartItem, MobileScannerToken, Sale, SaleItem,
+    Cart, CartItem, CartItemDeletionLog, MobileScannerToken, Sale, SaleItem,
     # Others
     Review, Notification, Integration, Analytics, Event,
     # Warehouse
@@ -417,6 +417,34 @@ class CartItemAdmin(admin.ModelAdmin):
     search_fields = ("cart__id", "product__name", "product__barcode", "custom_name")
     list_select_related = ("cart", "product", "company", "branch")
     autocomplete_fields = ("cart", "product", "company", "branch")
+
+
+@admin.register(CartItemDeletionLog)
+class CartItemDeletionLogAdmin(admin.ModelAdmin):
+    list_display = (
+        "product_name",
+        "quantity",
+        "deleted_by",
+        "created_at",
+        "company",
+        "branch",
+        "cart_id",
+    )
+    list_filter = ("company", "branch", "created_at")
+    search_fields = ("product_name", "deleted_by__email", "cart_id", "cart_item_id")
+    list_select_related = ("company", "branch", "deleted_by", "cart")
+    readonly_fields = (
+        "company",
+        "branch",
+        "cart",
+        "cart_item_id",
+        "product",
+        "product_name",
+        "quantity",
+        "deleted_by",
+        "created_at",
+    )
+    autocomplete_fields = ("company", "branch", "cart", "product", "deleted_by")
 
 
 @admin.register(Sale)

@@ -3,7 +3,14 @@ from rest_framework import serializers
 
 from apps.construction.models import Cashbox, CashShift
 from .models import (
-    Product, Cart, CartItem, Sale, SaleItem, MobileScannerToken, ProductImage
+    Product,
+    Cart,
+    CartItem,
+    CartItemDeletionLog,
+    Sale,
+    SaleItem,
+    MobileScannerToken,
+    ProductImage,
 )
 from .pos_utils import (
     money, qty3, has_field, get_attr, Q2, Q3
@@ -467,6 +474,35 @@ class MobileScannerTokenSerializer(serializers.ModelSerializer):
         model = MobileScannerToken
         fields = ("token", "expires_at")
         read_only_fields = ("token", "expires_at")
+
+
+class CartItemDeletionLogSerializer(serializers.ModelSerializer):
+    """Журнал удалений позиций из корзины: товар, количество, кто, время."""
+
+    deleted_by_display = serializers.SerializerMethodField(read_only=True)
+
+    class Meta:
+        model = CartItemDeletionLog
+        fields = (
+            "id",
+            "cart_id",
+            "product",
+            "product_name",
+            "quantity",
+            "deleted_by",
+            "deleted_by_display",
+            "created_at",
+        )
+        read_only_fields = fields
+
+    def get_deleted_by_display(self, obj):
+        u = obj.deleted_by
+        if not u:
+            return None
+        name = getattr(u, "get_full_name", lambda: "")() or ""
+        if name.strip():
+            return name.strip()
+        return getattr(u, "email", None) or str(getattr(u, "pk", ""))
 
 
 class SaleListSerializer(serializers.ModelSerializer):

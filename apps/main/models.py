@@ -1648,6 +1648,72 @@ class CartItem(models.Model):
         self.cart.recalc()
 
 
+class CartItemDeletionLog(models.Model):
+    """
+    Журнал: удаление позиции из корзины POS (товар, количество, кто, время).
+    """
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    company = models.ForeignKey(
+        Company,
+        on_delete=models.CASCADE,
+        related_name="cart_item_deletion_logs",
+        verbose_name="Компания",
+    )
+    branch = models.ForeignKey(
+        Branch,
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
+        related_name="cart_item_deletion_logs",
+        verbose_name="Филиал",
+    )
+    cart = models.ForeignKey(
+        Cart,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="item_deletion_logs",
+        verbose_name="Корзина",
+    )
+    cart_item_id = models.UUIDField(null=True, blank=True, verbose_name="ID позиции (до удаления)")
+    product = models.ForeignKey(
+        "main.Product",
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="cart_item_deletion_logs",
+        verbose_name="Товар",
+    )
+    product_name = models.CharField("Товар (название)", max_length=255)
+    quantity = models.DecimalField(
+        "Количество",
+        max_digits=12,
+        decimal_places=3,
+    )
+    deleted_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="cart_item_deletion_logs",
+        verbose_name="Кто удалил",
+    )
+    created_at = models.DateTimeField("Время", auto_now_add=True, db_index=True)
+
+    class Meta:
+        verbose_name = "Журнал: удаление из корзины"
+        verbose_name_plural = "Журнал: удаления из корзины"
+        ordering = ["-created_at"]
+        indexes = [
+            models.Index(fields=["company", "created_at"]),
+            models.Index(fields=["company", "branch", "created_at"]),
+        ]
+
+    def __str__(self):
+        return f"{self.product_name} × {self.quantity} @ {self.created_at}"
+
+
 class Sale(models.Model):
     class Status(models.TextChoices):
         NEW = "new", "Новый"

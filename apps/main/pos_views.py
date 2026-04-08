@@ -35,7 +35,17 @@ import requests
 import qrcode
 
 from apps.users.models import Roles, User, Company
-from apps.main.models import Cart, CartItem, Sale, Product, ProductPackage, MobileScannerToken, Client, ProductImage
+from apps.main.models import (
+    Cart,
+    CartItem,
+    CartItemDeletionLog,
+    Sale,
+    Product,
+    ProductPackage,
+    MobileScannerToken,
+    Client,
+    ProductImage,
+)
 from apps.main.models import ManufactureSubreal, AgentSaleAllocation
 from apps.main.cache_utils import invalidate_cache_pattern
 from apps.main.services import checkout_cart, NotEnoughStock
@@ -57,6 +67,7 @@ from .pos_utils import (
     line_qty_consume_units,
     default_unit_price_for_package,
     total_cart_consume_packs_for_product,
+    log_cart_item_deletion,
 )
 
 from .pos_serializers import (
@@ -76,6 +87,7 @@ from .pos_serializers import (
     ReceiptSerializer,
     AgentCheckoutSerializer,
     _is_owner_like,
+    CartItemDeletionLogSerializer,
 )
 
 try:
@@ -2151,6 +2163,7 @@ class CartItemUpdateDestroyAPIView(MarketCashierOnlyMixin, APIView):
             if qty < 0:
                 return Response({"quantity": "Количество не может быть отрицательным."}, status=400)
             if qty == 0:
+                log_cart_item_deletion(item=item, deleted_by=request.user)
                 item.delete()
                 cart.recalc()
                 return Response(SaleCartSerializer(cart).data, status=200)
@@ -2181,9 +2194,25 @@ class CartItemUpdateDestroyAPIView(MarketCashierOnlyMixin, APIView):
     def delete(self, request, cart_id, item_id, *args, **kwargs):
         cart = self._get_active_cart(request, cart_id)
         item = self._get_item_in_cart(cart, item_id)
+        log_cart_item_deletion(item=item, deleted_by=request.user)
         item.delete()
         cart.recalc()
         return Response(SaleCartSerializer(cart).data, status=200)
+
+
+class CartItemDeletionLogListAPIView(MarketCashierOnlyMixin, CompanyBranchRestrictedMixin, generics.ListAPIView):
+    """
+    GET /api/main/pos/cart-item-deletions/
+    Журнал удалений позиций из корзины (товар, количество, кто удалил, время).
+    """
+
+    permission_classes = [permissions.IsAuthenticated]
+    serializer_class = CartItemDeletionLogSerializer
+    ordering = ["-created_at"]
+
+    def get_queryset(self):
+        qs = CartItemDeletionLog.objects.select_related("deleted_by", "product", "cart").all()
+        return self._filter_qs_company_branch(qs)
 
 
 class SaleAddCustomItemAPIView(MarketCashierOnlyMixin, APIView):
@@ -2806,6 +2835,7 @@ class AgentCartItemUpdateDestroyAPIView(MarketCashierOnlyMixin, APIView):
             if qty < 0:
                 return Response({"quantity": "Количество не может быть отрицательным."}, status=400)
             if qty == 0:
+                log_cart_item_deletion(item=item, deleted_by=request.user)
                 item.delete()
                 cart.recalc()
                 return Response(SaleCartSerializer(cart).data, status=200)
@@ -2836,6 +2866,7 @@ class AgentCartItemUpdateDestroyAPIView(MarketCashierOnlyMixin, APIView):
     def delete(self, request, cart_id, item_id, *args, **kwargs):
         cart = self._get_active_cart(request, cart_id)
         item = self._get_item_in_cart(cart, item_id)
+        log_cart_item_deletion(item=item, deleted_by=request.user)
         item.delete()
         cart.recalc()
         return Response(SaleCartSerializer(cart).data, status=200)
