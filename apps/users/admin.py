@@ -62,6 +62,9 @@ BASE_PERMS = (
     "can_view_sale",
     "can_view_document",
     "can_view_market_scales",
+    "can_view_market_discount",
+    "can_view_market_edit_price",
+    "can_view_market_delete_cart_item",
 )
 
 BUILDING_PERMS = (
@@ -171,6 +174,9 @@ class UserAdmin(CompanyScopedFKMixin, BaseUserAdmin):
         "can_view_clients",
         "can_view_settings",
         "can_view_sale",
+        "can_view_market_discount",
+        "can_view_market_edit_price",
+        "can_view_market_delete_cart_item",
         "is_staff",
         "is_active",
     )
