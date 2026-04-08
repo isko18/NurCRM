@@ -19,6 +19,12 @@ class NotEnoughStock(Exception):
 
 @transaction.atomic
 def checkout_cart(cart: Cart, department=None, allow_negative_stock: bool = False) -> Sale:
+    """
+    Перенос корзины в Sale (статус NEW) и списание остатков.
+
+    Оплата — через ``sale.mark_paid()`` в POS-вьюхе. После успешной оплаты (не «долг»)
+    ``mark_paid`` ставит в очередь фискализацию eKassa (``transaction.on_commit``).
+    """
     cart.recalc()
 
     items = list(

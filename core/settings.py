@@ -108,6 +108,7 @@ INSTALLED_APPS = [
     'apps.warehouse',
     # "apps.instagram_mcp",
     'apps.consalting',
+    'apps.ekassa',
     # 'apps.crm',
 ]
 
@@ -438,3 +439,8 @@ INSTAGRAM_POLL_SECONDS = 0.1
 SITE_WEBHOOK_URL = "https://ak-kagaz.webtm.ru/api/catalog/integrations/crm/products"
 SITE_WEBHOOK_SECRET = "supersecret"
 SITE_WEBHOOK_COMPANY_ID = "af8cc7dd-6bb8-4298-b0a0-d98f9ddd4ce9"
+
+# eKassa (облако ОФД КР) — см. docs/Интеграция_1.14.pdf
+EKASSA_DEFAULT_BASE_URL = os.getenv("EKASSA_DEFAULT_BASE_URL", "https://ofddev.ekassa.kg").strip().rstrip("/")
+EKASSA_REQUEST_TIMEOUT = _get_int_env("EKASSA_REQUEST_TIMEOUT", 45)
+EKASSA_TOKEN_CACHE_SECONDS = _get_int_env("EKASSA_TOKEN_CACHE_SECONDS", 300)

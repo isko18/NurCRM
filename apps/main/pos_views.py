@@ -49,6 +49,16 @@ from apps.main.models import (
 from apps.main.models import ManufactureSubreal, AgentSaleAllocation
 from apps.main.cache_utils import invalidate_cache_pattern
 from apps.main.services import checkout_cart, NotEnoughStock
+
+
+def _ekassa_checkout_hint(company):
+    """Если у компании включена eKassa — клиенту можно показать, что чек уходит в ОФД."""
+    from apps.ekassa.services import get_integration
+
+    cfg = get_integration(company)
+    if cfg and cfg.is_ready():
+        return {"queued": True}
+    return None
 from apps.main.services_agent_pos import checkout_agent_cart, AgentNotEnoughStock
 from apps.main.utils_numbers import ensure_sale_doc_number
 from apps.main.views import CompanyBranchRestrictedMixin
@@ -1684,6 +1694,10 @@ class SaleCheckoutAPIView(MarketCashierOnlyMixin, APIView):
                 include_shift=True,
             )
 
+        hint = _ekassa_checkout_hint(sale.company)
+        if hint:
+            payload["ekassa"] = hint
+
         return Response(payload, status=status.HTTP_201_CREATED)
 
 
@@ -2795,6 +2809,10 @@ class AgentSaleCheckoutAPIView(MarketCashierOnlyMixin, CompanyBranchRestrictedMi
                 change=getattr(sale, "change", Decimal("0.00")),
                 include_shift=False,
             )
+
+        hint = _ekassa_checkout_hint(sale.company)
+        if hint:
+            payload["ekassa"] = hint
 
         return Response(payload, status=status.HTTP_201_CREATED)
 

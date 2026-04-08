@@ -234,6 +234,7 @@ class UserSerializer(serializers.ModelSerializer):
             "can_view_agent", "can_view_catalog",
             "can_view_branch", "can_view_logistics", "can_view_request", "can_view_shifts",
             "can_view_cashier", "can_view_document", "can_view_market_scales", "can_view_market_label",
+            "can_view_market_discount", "can_view_market_edit_price", "can_view_market_delete_cart_item",
 
             "branch_ids", "primary_branch_id",
             "created_at", "updated_at",
