@@ -574,6 +574,18 @@ class OrderRetrieveUpdateDestroyAPIView(CompanyBranchRestrictedMixin, generics.R
     queryset = Order.objects.all().prefetch_related("items__product")
 
 
+def _annotate_product_is_favorite(qs):
+    """is_favorite: избранное привязано к компании товара (общее для всех сотрудников)."""
+    return qs.annotate(
+        is_favorite=Exists(
+            ProductFavorite.objects.filter(
+                product_id=OuterRef("pk"),
+                company_id=OuterRef("company_id"),
+            )
+        )
+    )
+
+
 # ===========================
 #  Product create by barcode (ручной view)
 # ===========================
@@ -585,7 +597,6 @@ class ProductListView(CompanyBranchRestrictedMixin, generics.ListAPIView):
     ordering = ["-created_at"]
 
     def get_queryset(self):
-        user = self.request.user
         qs = (
             Product.objects
             .select_related(
@@ -605,15 +616,7 @@ class ProductListView(CompanyBranchRestrictedMixin, generics.ListAPIView):
             )
         )
         qs = self._filter_qs_company_branch(qs)
-        if user and getattr(user, "is_authenticated", False):
-            qs = qs.annotate(
-                is_favorite=Exists(
-                    ProductFavorite.objects.filter(user=user, product_id=OuterRef("pk"))
-                )
-            )
-        else:
-            qs = qs.annotate(is_favorite=V(False))
-        return qs
+        return _annotate_product_is_favorite(qs)
 
     def filter_queryset(self, queryset):
         qs = super().filter_queryset(queryset)
@@ -640,12 +643,19 @@ class ProductCompactListView(CompanyBranchRestrictedMixin, generics.ListAPIView)
     ordering = ["-created_at"]
 
     def get_queryset(self):
-        user = self.request.user
         qs = (
             Product.objects
             .select_related("brand", "category")  # Оптимизация: загружаем brand и category одним запросом (на случай будущего использования)
             .only(
-                "id", "name", "price", "quantity", "brand_id", "category_id", "code", "article",
+                "id",
+                "name",
+                "price",
+                "quantity",
+                "brand_id",
+                "category_id",
+                "code",
+                "article",
+                "company_id",
             )
             .prefetch_related(
                 Prefetch(
@@ -655,15 +665,7 @@ class ProductCompactListView(CompanyBranchRestrictedMixin, generics.ListAPIView)
             )
         )
         qs = self._filter_qs_company_branch(qs)
-        if user and getattr(user, "is_authenticated", False):
-            qs = qs.annotate(
-                is_favorite=Exists(
-                    ProductFavorite.objects.filter(user=user, product_id=OuterRef("pk"))
-                )
-            )
-        else:
-            qs = qs.annotate(is_favorite=V(False))
-        return qs
+        return _annotate_product_is_favorite(qs)
 
     def filter_queryset(self, queryset):
         qs = super().filter_queryset(queryset)
@@ -671,7 +673,8 @@ class ProductCompactListView(CompanyBranchRestrictedMixin, generics.ListAPIView)
         if not any("is_favorite" in o for o in current):
             qs = qs.order_by("-is_favorite", *current)
         return qs
-    
+
+
 class ProductCreateByBarcodeAPIView(CompanyBranchRestrictedMixin, generics.CreateAPIView):
     """
     Создание товара только по штрих-коду (если найден в глобальной базе).
@@ -710,49 +713,6 @@ class ProductCreateByBarcodeAPIView(CompanyBranchRestrictedMixin, generics.Creat
                 {"barcode": "Товар с таким штрих-кодом не найден в глобальной базе. Заполните карточку вручную."},
                 status=status.HTTP_404_NOT_FOUND,
             )
-
-
-class ProductFavoriteAPIView(CompanyBranchRestrictedMixin, APIView):
-    """
-    POST /api/main/products/<product_id>/favorite/
-    body: { "is_favorite": true|false }  (если не передали — переключает)
-    """
-
-    permission_classes = [permissions.IsAuthenticated]
-
-    @transaction.atomic
-    def post(self, request, product_id, *args, **kwargs):
-        product = get_object_or_404(
-            self._filter_qs_company_branch(Product.objects.all()),
-            id=product_id,
-        )
-
-        raw = request.data.get("is_favorite", None) if isinstance(request.data, dict) else None
-        if raw is None:
-            # toggle
-            exists = ProductFavorite.objects.filter(user=request.user, product=product).exists()
-            if exists:
-                ProductFavorite.objects.filter(user=request.user, product=product).delete()
-                return Response({"product_id": str(product.id), "is_favorite": False}, status=status.HTTP_200_OK)
-            ProductFavorite.objects.create(user=request.user, product=product)
-            return Response({"product_id": str(product.id), "is_favorite": True}, status=status.HTTP_200_OK)
-
-        if isinstance(raw, bool):
-            is_fav = raw
-        else:
-            s = str(raw).strip().lower()
-            if s in ("1", "true", "yes", "y", "да", "on"):
-                is_fav = True
-            elif s in ("0", "false", "no", "n", "нет", "off"):
-                is_fav = False
-            else:
-                raise ValidationError({"is_favorite": "Ожидается boolean (true/false)."})
-        if is_fav:
-            ProductFavorite.objects.get_or_create(user=request.user, product=product)
-        else:
-            ProductFavorite.objects.filter(user=request.user, product=product).delete()
-
-        return Response({"product_id": str(product.id), "is_favorite": is_fav}, status=status.HTTP_200_OK)
 
         # kind
         kind_value = _parse_kind(data.get("kind"), Product)
@@ -932,8 +892,72 @@ class ProductFavoriteAPIView(CompanyBranchRestrictedMixin, APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
+        product = (
+            _annotate_product_is_favorite(
+                Product.objects.filter(pk=product.pk)
+                .select_related("company", "branch", "brand", "category", "client", "created_by", "characteristics")
+                .prefetch_related(
+                    "item_make",
+                    "packages",
+                    "recipe_items__item_make",
+                    "promotion_tiers",
+                    product_images_prefetch,
+                )
+            )
+            .get()
+        )
         ser = self.get_serializer(product, context=self.get_serializer_context())
         return Response(ser.data, status=status.HTTP_201_CREATED)
+
+
+class ProductFavoriteAPIView(CompanyBranchRestrictedMixin, APIView):
+    """
+    POST /api/main/products/<product_id>/favorite/
+    body: { "is_favorite": true|false }  (если не передали — переключает)
+
+    Избранное общее на компанию товара (все сотрудники видят одно и то же).
+    """
+
+    permission_classes = [permissions.IsAuthenticated]
+
+    @transaction.atomic
+    def post(self, request, product_id, *args, **kwargs):
+        product = get_object_or_404(
+            self._filter_qs_company_branch(Product.objects.all()),
+            id=product_id,
+        )
+
+        req_company = self._company()
+        if req_company is not None and req_company.id != product.company_id:
+            raise PermissionDenied("Товар не принадлежит вашей компании.")
+
+        fav_company = product.company
+
+        raw = request.data.get("is_favorite", None) if isinstance(request.data, dict) else None
+        if raw is None:
+            exists = ProductFavorite.objects.filter(company=fav_company, product=product).exists()
+            if exists:
+                ProductFavorite.objects.filter(company=fav_company, product=product).delete()
+                return Response({"product_id": str(product.id), "is_favorite": False}, status=status.HTTP_200_OK)
+            ProductFavorite.objects.create(company=fav_company, product=product)
+            return Response({"product_id": str(product.id), "is_favorite": True}, status=status.HTTP_200_OK)
+
+        if isinstance(raw, bool):
+            is_fav = raw
+        else:
+            s = str(raw).strip().lower()
+            if s in ("1", "true", "yes", "y", "да", "on"):
+                is_fav = True
+            elif s in ("0", "false", "no", "n", "нет", "off"):
+                is_fav = False
+            else:
+                raise ValidationError({"is_favorite": "Ожидается boolean (true/false)."})
+        if is_fav:
+            ProductFavorite.objects.get_or_create(company=fav_company, product=product)
+        else:
+            ProductFavorite.objects.filter(company=fav_company, product=product).delete()
+
+        return Response({"product_id": str(product.id), "is_favorite": is_fav}, status=status.HTTP_200_OK)
 
 
 # ==========================
@@ -1302,16 +1326,18 @@ class ProductCreateManualAPIView(CompanyBranchRestrictedMixin, generics.CreateAP
 
         # Refetch with all related data for serialization
         product = (
-            Product.objects
-            .select_related("company", "branch", "brand", "category", "client", "created_by", "characteristics")
-            .prefetch_related(
-                "item_make",
-                "packages",
-                "recipe_items__item_make",
-                "promotion_tiers",
-                product_images_prefetch,
+            _annotate_product_is_favorite(
+                Product.objects.filter(pk=product.pk)
+                .select_related("company", "branch", "brand", "category", "client", "created_by", "characteristics")
+                .prefetch_related(
+                    "item_make",
+                    "packages",
+                    "recipe_items__item_make",
+                    "promotion_tiers",
+                    product_images_prefetch,
+                )
             )
-            .get(pk=product.pk)
+            .get()
         )
         ser = self.get_serializer(product, context=self.get_serializer_context())
         return Response(ser.data, status=status.HTTP_201_CREATED)
@@ -1340,6 +1366,9 @@ class ProductRetrieveUpdateDestroyAPIView(CompanyBranchRestrictedMixin, generics
         )
         .all()
     )
+
+    def get_queryset(self):
+        return _annotate_product_is_favorite(super().get_queryset())
 
     @transaction.atomic
     def update(self, request, *args, **kwargs):
@@ -1492,16 +1521,18 @@ class ProductRetrieveUpdateDestroyAPIView(CompanyBranchRestrictedMixin, generics
 
         # Refetch with all prefetches
         instance = (
-            Product.objects
-            .select_related("company", "branch", "brand", "category", "client", "created_by", "characteristics")
-            .prefetch_related(
-                "item_make",
-                "packages",
-                "recipe_items__item_make",
-                "promotion_tiers",
-                product_images_prefetch,
+            _annotate_product_is_favorite(
+                Product.objects.filter(pk=instance.pk)
+                .select_related("company", "branch", "brand", "category", "client", "created_by", "characteristics")
+                .prefetch_related(
+                    "item_make",
+                    "packages",
+                    "recipe_items__item_make",
+                    "promotion_tiers",
+                    product_images_prefetch,
+                )
             )
-            .get(pk=instance.pk)
+            .get()
         )
         return Response(
             self.get_serializer(instance).data,
@@ -1587,7 +1618,7 @@ class ProductByBarcodeAPIView(CompanyBranchRestrictedMixin, generics.RetrieveAPI
             )
             .all()
         )
-        return self._filter_qs_company_branch(qs)
+        return _annotate_product_is_favorite(self._filter_qs_company_branch(qs))
 
     def get_object(self):
         from rest_framework.exceptions import NotFound

@@ -926,12 +926,12 @@ class Product(models.Model):
 
 class ProductFavorite(models.Model):
     """
-    Избранное пользователя для товаров.
+    Избранное компании для товаров (один набор на компанию, видят все сотрудники).
     """
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    user = models.ForeignKey(
-        settings.AUTH_USER_MODEL,
+    company = models.ForeignKey(
+        Company,
         on_delete=models.CASCADE,
         related_name="favorite_products",
         db_index=True,
@@ -946,10 +946,13 @@ class ProductFavorite(models.Model):
 
     class Meta:
         constraints = [
-            models.UniqueConstraint(fields=["user", "product"], name="uq_product_favorite_user_product"),
+            models.UniqueConstraint(
+                fields=["company", "product"],
+                name="uq_product_favorite_company_product",
+            ),
         ]
         indexes = [
-            models.Index(fields=["user", "created_at"]),
+            models.Index(fields=["company", "created_at"]),
             models.Index(fields=["product", "created_at"]),
         ]
 
