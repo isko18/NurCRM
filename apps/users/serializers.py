@@ -669,6 +669,7 @@ class CompanySerializer(serializers.ModelSerializer):
             "owner",
             "created_at", "start_date", "end_date",
             "can_view_documents", "can_view_whatsapp", "can_view_instagram", "can_view_telegram", "can_view_showcase",
+            "cashier_password",
             "llc", "inn", "okpo", "score", "bik", "address",
         ]
 
