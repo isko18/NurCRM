@@ -809,6 +809,7 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
     images = ProductImageSerializer(many=True, read_only=True)
 
     stock = serializers.BooleanField(required=False)
+    is_favorite = serializers.BooleanField(read_only=True)
 
     promotion_rules = ProductPromotionTierSerializer(
         many=True, read_only=True, source="promotion_tiers"
@@ -902,6 +903,7 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
             "stock", "promotion_rules", "promotion_rules_input", "date",
             "created_by", "created_by_name",
             "created_at", "updated_at",
+            "is_favorite",
             "images",
             "characteristics",
             "packages",
@@ -2050,10 +2052,11 @@ class ProductNestedSerializer(serializers.ModelSerializer):
 # Лёгкий сериализатор для списка товаров (минимальный набор полей)
 class ProductListSerializer(serializers.ModelSerializer):
     image_url = serializers.SerializerMethodField()
+    is_favorite = serializers.BooleanField(read_only=True)
 
     class Meta:
         model = Product
-        fields = ["id", "name", "code", "article", "price", "quantity", "brand", "category", "image_url"]
+        fields = ["id", "name", "code", "article", "price", "quantity", "brand", "category", "image_url", "is_favorite"]
 
     def get_image_url(self, obj):
         imgs = getattr(obj, "images", None)

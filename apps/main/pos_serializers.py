@@ -540,6 +540,7 @@ class SaleItemReadSerializer(serializers.ModelSerializer):
             "name_snapshot",
             "barcode_snapshot",
             "unit_price",
+            "line_discount",
             "quantity",
             "line_total",
         )
@@ -549,8 +550,9 @@ class SaleItemReadSerializer(serializers.ModelSerializer):
         return get_attr(get_attr(obj, "product", None), "name", None) or obj.name_snapshot
 
     def get_line_total(self, obj):
-        total = (obj.unit_price or Decimal("0")) * Decimal(obj.quantity or 0)
-        return money(total)
+        base = (obj.unit_price or Decimal("0")) * Decimal(obj.quantity or 0)
+        disc = Decimal(str(getattr(obj, "line_discount", None) or 0))
+        return money(base - disc)
 
 
 class SaleDetailSerializer(serializers.ModelSerializer):

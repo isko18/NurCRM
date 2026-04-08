@@ -203,7 +203,9 @@ def _build_physical_receipt_text(sale, *, payment_method=None, cash_received=Non
         item_name = (getattr(it, "name_snapshot", None) or getattr(it, "custom_name", None) or "Товар").strip()
         qty = fmt(getattr(it, "quantity", 0))
         unit_price = fmt_money(getattr(it, "unit_price", 0))
-        line_total = fmt_money((getattr(it, "unit_price", 0) or 0) * (getattr(it, "quantity", 0) or 0))
+        line_base = (getattr(it, "unit_price", 0) or 0) * (getattr(it, "quantity", 0) or 0)
+        line_disc = getattr(it, "line_discount", None) or 0
+        line_total = fmt_money(line_base - line_disc)
         lines.append(f"{idx}. {item_name}")
         lines.append(f"   {qty} x {unit_price} = {line_total}")
 
@@ -1228,7 +1230,11 @@ class SaleInvoiceDownloadAPIView(APIView):
             p.drawString(20 * mm, y, (it.name_snapshot or "")[:60])
             p.drawRightString(140 * mm, y, str(it.quantity))
             p.drawRightString(160 * mm, y, fmt_money(it.unit_price))
-            p.drawRightString(190 * mm, y, fmt_money(it.unit_price * it.quantity))
+            p.drawRightString(
+                190 * mm,
+                y,
+                fmt_money((it.unit_price * it.quantity) - (getattr(it, "line_discount", None) or 0)),
+            )
             y -= 7 * mm
             if y < 60 * mm:
                 p.showPage()
