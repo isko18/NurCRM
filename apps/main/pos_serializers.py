@@ -622,6 +622,7 @@ class SaleDetailSerializer(serializers.ModelSerializer):
             "shift",
             "cashbox",
             "cashbox_name",
+            "ekassa_fiscal",
         )
         read_only_fields = fields
 

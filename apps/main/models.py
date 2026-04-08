@@ -1773,6 +1773,14 @@ class Sale(models.Model):
     created_at = models.DateTimeField(auto_now_add=True)
     paid_at = models.DateTimeField(null=True, blank=True)
 
+    # Фискализация eKassa (после успешной оплаты, вне транзакции чекаута)
+    ekassa_fiscal = models.JSONField(
+        null=True,
+        blank=True,
+        verbose_name="eKassa: фискальный чек",
+        help_text="Статус, newid, номер ФД и служебные данные ответа API.",
+    )
+
     class Meta:
         indexes = [
             models.Index(fields=["company", "created_at"]),
@@ -1887,6 +1895,15 @@ class Sale(models.Model):
         self.status = Sale.Status.PAID
         self.paid_at = timezone.now()
         self.save(update_fields=["status", "paid_at", "payment_method", "cash_received"])
+
+        sale_pk = self.pk
+
+        def _queue_ekassa_fiscal():
+            from apps.ekassa.sale_bridge import try_fiscalize_pos_sale
+
+            try_fiscalize_pos_sale(sale_pk)
+
+        transaction.on_commit(_queue_ekassa_fiscal)
 
 
 class SaleItem(models.Model):
