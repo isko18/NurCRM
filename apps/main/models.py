@@ -924,6 +924,36 @@ class Product(models.Model):
                 cache.delete(f"product_plu:{self.company_id}:{self.plu}")
 
 
+class ProductFavorite(models.Model):
+    """
+    Избранное пользователя для товаров.
+    """
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="favorite_products",
+        db_index=True,
+    )
+    product = models.ForeignKey(
+        "main.Product",
+        on_delete=models.CASCADE,
+        related_name="favorites",
+        db_index=True,
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(fields=["user", "product"], name="uq_product_favorite_user_product"),
+        ]
+        indexes = [
+            models.Index(fields=["user", "created_at"]),
+            models.Index(fields=["product", "created_at"]),
+        ]
+
+
 class ProductPromotionTier(models.Model):
     """
     Ступени акции для товара (галочка «Акционный товар» на Product.stock):
@@ -1820,6 +1850,8 @@ class SaleItem(models.Model):
 
     unit_price = models.DecimalField(max_digits=12, decimal_places=2)
     quantity = models.DecimalField(max_digits=12, decimal_places=3, default=Decimal("1.000"))
+    # Скидка на строку (сумма). Храним отдельно от unit_price, как и в CartItem.
+    line_discount = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal("0.00"))
 
     sale_package = models.ForeignKey(
         "main.ProductPackage",
@@ -1905,6 +1937,8 @@ class SaleItem(models.Model):
         # нормализуем денежные поля перед валидацией (иначе падаем на 3-х знаках у Product.price)
         if self.unit_price is not None:
             self.unit_price = _money(self.unit_price)
+        if hasattr(self, "line_discount"):
+            self.line_discount = _money(getattr(self, "line_discount", None) or Decimal("0.00"))
         if self.purchase_price_snapshot is not None:
             self.purchase_price_snapshot = _money(self.purchase_price_snapshot)
 
@@ -1913,7 +1947,9 @@ class SaleItem(models.Model):
 
     @property
     def line_total(self) -> Decimal:
-        return (Decimal(self.unit_price or 0) * Decimal(self.quantity or 0)).quantize(Decimal("0.01"))
+        base = Decimal(self.unit_price or 0) * Decimal(self.quantity or 0)
+        disc = Decimal(getattr(self, "line_discount", None) or 0)
+        return (base - disc).quantize(Decimal("0.01"))
 
     @property
     def line_cogs(self) -> Decimal:

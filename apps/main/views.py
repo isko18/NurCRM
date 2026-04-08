@@ -2,7 +2,7 @@ from decimal import Decimal, ROUND_HALF_UP
 from uuid import UUID
 
 from django.db import transaction, IntegrityError
-from django.db.models import Sum, Count, Avg, F, Q, Prefetch, Value as V
+from django.db.models import Sum, Count, Avg, F, Q, Prefetch, Value as V, Exists, OuterRef
 from django.utils.dateparse import parse_date, parse_datetime
 from django.utils import timezone
 from itertools import groupby
@@ -36,6 +36,7 @@ from apps.main.models import (
     ManufactureSubreal, Acceptance, ReturnFromAgent, AgentSaleAllocation, ProductImage,
     AgentRequestCart, AgentRequestItem, ProductPackage, ProductCharacteristics, DealPayment,
     ProductRecipeItem,
+    ProductFavorite,
 )
 from apps.main.serializers import (
     ContactSerializer, PipelineSerializer, DealSerializer, TaskSerializer,
@@ -584,6 +585,7 @@ class ProductListView(CompanyBranchRestrictedMixin, generics.ListAPIView):
     ordering = ["-created_at"]
 
     def get_queryset(self):
+        user = self.request.user
         qs = (
             Product.objects
             .select_related(
@@ -602,7 +604,25 @@ class ProductListView(CompanyBranchRestrictedMixin, generics.ListAPIView):
                 product_images_prefetch,
             )
         )
-        return self._filter_qs_company_branch(qs)
+        qs = self._filter_qs_company_branch(qs)
+        if user and getattr(user, "is_authenticated", False):
+            qs = qs.annotate(
+                is_favorite=Exists(
+                    ProductFavorite.objects.filter(user=user, product_id=OuterRef("pk"))
+                )
+            )
+        else:
+            qs = qs.annotate(is_favorite=V(False))
+        return qs
+
+    def filter_queryset(self, queryset):
+        qs = super().filter_queryset(queryset)
+        # Всегда: избранные сверху. Дальше — стандартная сортировка (ordering filter / default ordering).
+        current = list(qs.query.order_by) or []
+        # если уже есть сортировка по is_favorite — не дублируем
+        if not any("is_favorite" in o for o in current):
+            qs = qs.order_by("-is_favorite", *current)
+        return qs
 
 
 class CompactProductCursorPagination(CursorPagination):
@@ -620,6 +640,7 @@ class ProductCompactListView(CompanyBranchRestrictedMixin, generics.ListAPIView)
     ordering = ["-created_at"]
 
     def get_queryset(self):
+        user = self.request.user
         qs = (
             Product.objects
             .select_related("brand", "category")  # Оптимизация: загружаем brand и category одним запросом (на случай будущего использования)
@@ -633,7 +654,23 @@ class ProductCompactListView(CompanyBranchRestrictedMixin, generics.ListAPIView)
                 ),
             )
         )
-        return self._filter_qs_company_branch(qs)
+        qs = self._filter_qs_company_branch(qs)
+        if user and getattr(user, "is_authenticated", False):
+            qs = qs.annotate(
+                is_favorite=Exists(
+                    ProductFavorite.objects.filter(user=user, product_id=OuterRef("pk"))
+                )
+            )
+        else:
+            qs = qs.annotate(is_favorite=V(False))
+        return qs
+
+    def filter_queryset(self, queryset):
+        qs = super().filter_queryset(queryset)
+        current = list(qs.query.order_by) or []
+        if not any("is_favorite" in o for o in current):
+            qs = qs.order_by("-is_favorite", *current)
+        return qs
     
 class ProductCreateByBarcodeAPIView(CompanyBranchRestrictedMixin, generics.CreateAPIView):
     """
@@ -673,6 +710,49 @@ class ProductCreateByBarcodeAPIView(CompanyBranchRestrictedMixin, generics.Creat
                 {"barcode": "Товар с таким штрих-кодом не найден в глобальной базе. Заполните карточку вручную."},
                 status=status.HTTP_404_NOT_FOUND,
             )
+
+
+class ProductFavoriteAPIView(CompanyBranchRestrictedMixin, APIView):
+    """
+    POST /api/main/products/<product_id>/favorite/
+    body: { "is_favorite": true|false }  (если не передали — переключает)
+    """
+
+    permission_classes = [permissions.IsAuthenticated]
+
+    @transaction.atomic
+    def post(self, request, product_id, *args, **kwargs):
+        product = get_object_or_404(
+            self._filter_qs_company_branch(Product.objects.all()),
+            id=product_id,
+        )
+
+        raw = request.data.get("is_favorite", None) if isinstance(request.data, dict) else None
+        if raw is None:
+            # toggle
+            exists = ProductFavorite.objects.filter(user=request.user, product=product).exists()
+            if exists:
+                ProductFavorite.objects.filter(user=request.user, product=product).delete()
+                return Response({"product_id": str(product.id), "is_favorite": False}, status=status.HTTP_200_OK)
+            ProductFavorite.objects.create(user=request.user, product=product)
+            return Response({"product_id": str(product.id), "is_favorite": True}, status=status.HTTP_200_OK)
+
+        if isinstance(raw, bool):
+            is_fav = raw
+        else:
+            s = str(raw).strip().lower()
+            if s in ("1", "true", "yes", "y", "да", "on"):
+                is_fav = True
+            elif s in ("0", "false", "no", "n", "нет", "off"):
+                is_fav = False
+            else:
+                raise ValidationError({"is_favorite": "Ожидается boolean (true/false)."})
+        if is_fav:
+            ProductFavorite.objects.get_or_create(user=request.user, product=product)
+        else:
+            ProductFavorite.objects.filter(user=request.user, product=product).delete()
+
+        return Response({"product_id": str(product.id), "is_favorite": is_fav}, status=status.HTTP_200_OK)
 
         # kind
         kind_value = _parse_kind(data.get("kind"), Product)
@@ -1765,6 +1845,16 @@ class OrderAnalyticsView(APIView, CompanyBranchRestrictedMixin):
 # ===========================
 #  Clients
 # ===========================
+def _filter_clients_visible_for_user(qs, user):
+    """
+    Agents (не owner/admin) видят только своих клиентов.
+    Owner/admin видят всех клиентов компании/филиала (фильтр CompanyBranchRestrictedMixin остаётся).
+    """
+    if user and not _is_owner_like(user):
+        return qs.filter(salesperson=user)
+    return qs
+
+
 class ClientListCreateAPIView(CompanyBranchRestrictedMixin, generics.ListCreateAPIView):
     """
     GET  /api/main/clients/
@@ -1778,9 +1868,18 @@ class ClientListCreateAPIView(CompanyBranchRestrictedMixin, generics.ListCreateA
     ordering = ["-created_at"]
 
     def get_queryset(self):
-        return self._filter_qs_company_branch(
+        qs = self._filter_qs_company_branch(
             Client.objects.select_related("company", "branch").all()
         )
+        return _filter_clients_visible_for_user(qs, self.request.user)
+
+    def perform_create(self, serializer):
+        # Агенту нельзя создавать "чужих" клиентов — привязываем к нему.
+        if not _is_owner_like(self.request.user):
+            self._save_with_company_branch(serializer, salesperson=self.request.user)
+            return
+        # owner/admin может назначать salesperson через payload (или оставить пустым)
+        self._save_with_company_branch(serializer)
 
 
 class ClientRetrieveUpdateDestroyAPIView(CompanyBranchRestrictedMixin, generics.RetrieveUpdateDestroyAPIView):
@@ -1793,9 +1892,17 @@ class ClientRetrieveUpdateDestroyAPIView(CompanyBranchRestrictedMixin, generics.
     serializer_class = ClientSerializer
 
     def get_queryset(self):
-        return self._filter_qs_company_branch(
+        qs = self._filter_qs_company_branch(
             Client.objects.select_related("company", "branch").all()
         )
+        return _filter_clients_visible_for_user(qs, self.request.user)
+
+    def perform_update(self, serializer):
+        # Агенту нельзя "перекидывать" клиента на другого salesperson.
+        if not _is_owner_like(self.request.user):
+            self._save_with_company_branch(serializer, salesperson=self.request.user)
+            return
+        self._save_with_company_branch(serializer)
 
 
 def _deal_prefetch():
@@ -1831,6 +1938,8 @@ class ClientDealListCreateAPIView(CompanyBranchRestrictedMixin, generics.ListCre
             .prefetch_related(*_deal_prefetch())
         )
         qs = self._filter_qs_company_branch(qs)
+        if not _is_owner_like(self.request.user):
+            qs = qs.filter(client__salesperson=self.request.user)
 
         client_id = self.kwargs.get("client_id")
         if client_id:
@@ -1843,12 +1952,16 @@ class ClientDealListCreateAPIView(CompanyBranchRestrictedMixin, generics.ListCre
         company = self._company()
         branch = self._auto_branch()
         client_id = self.kwargs.get("client_id")
+        user = self.request.user
 
         if not company:
             raise serializers.ValidationError({"company": "У пользователя не задана компания."})
 
         if client_id:
-            client = get_object_or_404(Client, id=client_id, company=company)
+            client_qs = Client.objects.filter(company=company)
+            if not _is_owner_like(user):
+                client_qs = client_qs.filter(salesperson=user)
+            client = get_object_or_404(client_qs, id=client_id)
 
             # клиент может быть общий (branch=None)
             if branch is not None and client.branch_id not in (None, branch.id):
@@ -1860,6 +1973,8 @@ class ClientDealListCreateAPIView(CompanyBranchRestrictedMixin, generics.ListCre
         client = serializer.validated_data.get("client")
         if not client or client.company_id != company.id:
             raise serializers.ValidationError({"client": "Клиент не найден в вашей компании."})
+        if not _is_owner_like(user) and client.salesperson_id != user.id:
+            raise serializers.ValidationError({"client": "Доступ запрещён: это не ваш клиент."})
 
         if branch is not None and client.branch_id not in (None, branch.id):
             raise serializers.ValidationError({"client": "Клиент другого филиала."})
@@ -1888,6 +2003,8 @@ class ClientDealRetrieveUpdateDestroyAPIView(
             .prefetch_related(*_deal_prefetch())
         )
         qs = self._filter_qs_company_branch(qs)
+        if not _is_owner_like(self.request.user):
+            qs = qs.filter(client__salesperson=self.request.user)
 
         client_id = self.kwargs.get("client_id")
         if client_id:
@@ -1899,6 +2016,7 @@ class ClientDealRetrieveUpdateDestroyAPIView(
     def perform_update(self, serializer):
         company = self._company()
         branch = self._auto_branch()
+        user = self.request.user
 
         if not company:
             raise serializers.ValidationError({"company": "У пользователя не задана компания."})
@@ -1907,6 +2025,8 @@ class ClientDealRetrieveUpdateDestroyAPIView(
         if new_client:
             if new_client.company_id != company.id:
                 raise serializers.ValidationError({"client": "Клиент принадлежит другой компании."})
+            if not _is_owner_like(user) and new_client.salesperson_id != user.id:
+                raise serializers.ValidationError({"client": "Доступ запрещён: это не ваш клиент."})
             if branch is not None and new_client.branch_id not in (None, branch.id):
                 raise serializers.ValidationError({"client": "Клиент другого филиала."})
 
@@ -1942,6 +2062,8 @@ class ClientDealPayAPIView(APIView, CompanyBranchRestrictedMixin):
         deal_qs = self._filter_qs_company_branch(
             ClientDeal.objects.select_related("client").prefetch_related(*_deal_prefetch())
         ).filter(pk=pk)
+        if not _is_owner_like(request.user):
+            deal_qs = deal_qs.filter(client__salesperson=request.user)
 
         if client_id:
             deal_qs = deal_qs.filter(client_id=client_id)
@@ -2053,6 +2175,8 @@ class ClientDealRefundAPIView(APIView, CompanyBranchRestrictedMixin):
         deal_qs = self._filter_qs_company_branch(
             ClientDeal.objects.select_related("client").prefetch_related(*_deal_prefetch())
         ).filter(pk=pk)
+        if not _is_owner_like(request.user):
+            deal_qs = deal_qs.filter(client__salesperson=request.user)
 
         if client_id:
             deal_qs = deal_qs.filter(client_id=client_id)
@@ -2144,6 +2268,7 @@ class ClientWithDebtsListAPIView(CompanyBranchRestrictedMixin, generics.ListAPIV
         qs = self._filter_qs_company_branch(
             Client.objects.select_related("company", "branch").all()
         )
+        qs = _filter_clients_visible_for_user(qs, self.request.user)
         # unpaid = paid_on is null (включая частично оплаченные)
         qs = qs.filter(
             deals__kind=ClientDeal.Kind.DEBT,
