@@ -1514,17 +1514,16 @@ class OrderRefundView(CompanyBranchQuerysetMixin, APIView):
                 return Response(_cafe_order_checkout_payload(order), status=status.HTTP_200_OK)
 
             try:
-                with transaction.atomic():
-                    OrderRefund.objects.create(
-                        company=order.company,
-                        branch=order.branch,
-                        order=order,
-                        amount=amount,
-                        payment_method=pm,
-                        idempotency_key=idem,
-                        created_by=request.user if request.user.is_authenticated else None,
-                        note=note,
-                    )
+                OrderRefund.objects.create(
+                    company=order.company,
+                    branch=order.branch,
+                    order=order,
+                    amount=amount,
+                    payment_method=pm,
+                    idempotency_key=idem,
+                    created_by=request.user if request.user.is_authenticated else None,
+                    note=note,
+                )
             except IntegrityError:
                 order.refresh_from_db()
                 _cafe_archive_order_snapshot(order)
@@ -1630,19 +1629,18 @@ class OrderItemRefundView(CompanyBranchQuerysetMixin, APIView):
                 return Response(_cafe_order_checkout_payload(order), status=status.HTTP_200_OK)
 
             try:
-                with transaction.atomic():
-                    OrderItemRefund.objects.create(
-                        company=order.company,
-                        branch=order.branch,
-                        order=order,
-                        order_item=item,
-                        quantity=qty,
-                        amount=line_amt,
-                        payment_method=pm,
-                        idempotency_key=idem,
-                        created_by=request.user if request.user.is_authenticated else None,
-                        note=note,
-                    )
+                OrderItemRefund.objects.create(
+                    company=order.company,
+                    branch=order.branch,
+                    order=order,
+                    order_item=item,
+                    quantity=qty,
+                    amount=line_amt,
+                    payment_method=pm,
+                    idempotency_key=idem,
+                    created_by=request.user if request.user.is_authenticated else None,
+                    note=note,
+                )
             except IntegrityError:
                 order.refresh_from_db()
                 _cafe_archive_order_snapshot(order)

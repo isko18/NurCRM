@@ -18,6 +18,7 @@ from django.http import HttpResponse
 from django.db.models import (
     Q, Count, Avg, Sum, Max, F, Case, When,
     ExpressionWrapper, DurationField, DecimalField, Value, IntegerField,
+    OuterRef, Subquery,
 )
 from django.db.models.functions import Coalesce
 from django.utils import timezone
@@ -168,6 +169,81 @@ def _order_net_revenue_expr():
         When(paid_amount__gt=0, then=paid_net),
         default=final_net,
         output_field=DecimalField(max_digits=14, decimal_places=2),
+    )
+
+
+def _order_line_level_net_revenue_expr():
+    """
+    Нетто по заказу (оплата минус возвраты) в контексте OrderItem: те же правила, что у Order.
+    Нужно, чтобы учитывать POST .../refund/ (возврат по сумме чека без привязки к строкам).
+    """
+    ref = Coalesce(
+        F("order__refunded_amount"),
+        Value(Decimal("0")),
+        output_field=DecimalField(max_digits=12, decimal_places=2),
+    )
+    paid_net = ExpressionWrapper(
+        F("order__paid_amount") - ref,
+        output_field=DecimalField(max_digits=14, decimal_places=2),
+    )
+    final_net = ExpressionWrapper(
+        (F("order__total_amount") - F("order__discount_amount")) - ref,
+        output_field=DecimalField(max_digits=14, decimal_places=2),
+    )
+    return Case(
+        When(order__paid_amount__gt=0, then=paid_net),
+        default=final_net,
+        output_field=DecimalField(max_digits=14, decimal_places=2),
+    )
+
+
+def _order_lines_net_sum_subquery():
+    """
+    Сумма «строковой» выручки по всем позициям заказа (после позиционных возвратов).
+    Используется как знаменатель для распределения заказового возврата между строками.
+    """
+    line_net = _line_net_revenue_expr()
+    return Subquery(
+        OrderItem.objects.filter(
+            order_id=OuterRef("order_id"),
+            company_id=OuterRef("company_id"),
+            order__is_paid=True,
+            is_rejected=False,
+        )
+        .values("order_id")
+        .annotate(_oln_sum=Sum(line_net))
+        .values("_oln_sum")[:1],
+        output_field=DecimalField(max_digits=20, decimal_places=6),
+    )
+
+
+def _annotate_allocated_line_revenue(qs):
+    """
+    Выручка строки для аналитики:
+      - позиционные возвраты (refunded_quantity) как в _line_net_revenue_expr;
+      - плюс доля заказового возврата (refunded_amount без разбивки по позициям),
+        пропорционально доле строки в сумме нетто-строк заказа.
+    """
+    line_net = _line_net_revenue_expr()
+    net_qty = _line_net_quantity_expr()
+    qs = qs.annotate(
+        _ord_lines_net_sum=_order_lines_net_sum_subquery(),
+        _ord_net_after_refunds=_order_line_level_net_revenue_expr(),
+        _line_net_base=line_net,
+        _line_net_qty=net_qty,
+    )
+    return qs.annotate(
+        _alloc_line_revenue=Case(
+            When(
+                Q(_ord_lines_net_sum__isnull=True) | Q(_ord_lines_net_sum=0),
+                then=F("_line_net_base"),
+            ),
+            default=ExpressionWrapper(
+                F("_line_net_base") * F("_ord_net_after_refunds") / F("_ord_lines_net_sum"),
+                output_field=DecimalField(max_digits=20, decimal_places=6),
+            ),
+            output_field=DecimalField(max_digits=20, decimal_places=6),
+        ),
     )
 
 
@@ -445,11 +521,10 @@ class SalesByMenuItemView(CompanyBranchQuerysetMixin, APIView):
         )
         qs, _ = _apply_waiter_scope(qs, request, "order__waiter_id")
         qs = _apply_date_range(qs, "order__paid_at", df, dt)
-        line_net = _line_net_revenue_expr()
-        net_qty = _line_net_quantity_expr()
+        qs = _annotate_allocated_line_revenue(qs)
 
         data = (qs.values("menu_item_id", "menu_item__title")
-                  .annotate(qty=Sum(net_qty), revenue=Sum(line_net))
+                  .annotate(qty=Sum("_line_net_qty"), revenue=Sum("_alloc_line_revenue"))
                   .order_by("-revenue", "-qty")[:limit])
 
         result = []
@@ -538,51 +613,35 @@ class MenuAnalyticsAllView(CompanyBranchQuerysetMixin, APIView):
             # оставим обратную совместимость: include_inactive=0 -> только активные
             mi_qs = mi_qs.filter(is_active=True)
 
-        # build order line filter for aggregation (paid, non-rejected, menu lines)
-        line_filter = Q(order_items__order__is_paid=True) & Q(order_items__is_rejected=False)
-        line_filter &= Q(order_items__line_kind=OrderItem.LineKind.MENU)
-        line_filter &= Q(order_items__order__company=company)
-        if branch is not None:
-            line_filter &= Q(order_items__order__branch=branch)
-        else:
-            line_filter &= Q(order_items__order__branch__isnull=True)
+        line_qs = _paid_order_lines_qs(company, branch).filter(
+            line_kind=OrderItem.LineKind.MENU,
+            menu_item_id__isnull=False,
+        )
         if waiter_scope_id:
-            line_filter &= Q(order_items__order__waiter_id=waiter_scope_id)
-        if df:
-            line_filter &= Q(order_items__order__paid_at__date__gte=df)
-        if dt:
-            line_filter &= Q(order_items__order__paid_at__date__lte=dt)
-
-        # qty & revenue (нетто по возвратам позиций)
-        net_qty_expr = ExpressionWrapper(
-            F("order_items__quantity") - Coalesce(F("order_items__refunded_quantity"), Value(0)),
-            output_field=IntegerField(),
+            line_qs = line_qs.filter(order__waiter_id=waiter_scope_id)
+        line_qs = _apply_date_range(line_qs, "order__paid_at", df, dt)
+        line_qs = _annotate_allocated_line_revenue(line_qs)
+        stats_rows = (
+            line_qs.values("menu_item_id")
+            .annotate(qty=Sum("_line_net_qty"), revenue=Sum("_alloc_line_revenue"))
         )
-        revenue_expr = ExpressionWrapper(
-            (F("order_items__quantity") - Coalesce(F("order_items__refunded_quantity"), Value(0)))
-            * Coalesce(
-                F("order_items__unit_price"),
-                F("price"),
-                Value(Decimal("0")),
-                output_field=DecimalField(max_digits=14, decimal_places=2),
-            ),
-            output_field=DecimalField(max_digits=14, decimal_places=2),
-        )
+        stats_by_mid = {row["menu_item_id"]: row for row in stats_rows}
 
-        mi_qs = mi_qs.annotate(
-            qty=Coalesce(Sum(net_qty_expr, filter=line_filter), Value(0)),
-            revenue=Coalesce(Sum(revenue_expr, filter=line_filter), Value(Decimal("0.00"))),
-        ).order_by("-revenue", "-qty", "title")
+        decorated = []
+        for mi in mi_qs.select_related("category", "kitchen").order_by("title"):
+            st = stats_by_mid.get(mi.id) or {}
+            qty = int(st.get("qty") or 0)
+            rev = _to_decimal(st.get("revenue"))
+            decorated.append((mi, qty, rev))
+        decorated.sort(key=lambda t: (-t[2], -t[1], (t[0].title or "").lower()))
 
-        total_items = mi_qs.count()
-        page = list(mi_qs[offset: offset + limit])
+        total_items = len(decorated)
+        page = decorated[offset: offset + limit]
 
         rows = []
         grand_revenue = Decimal("0.00")
         grand_qty = 0
-        for mi in page:
-            qty = int(getattr(mi, "qty", 0) or 0)
-            rev = _to_decimal(getattr(mi, "revenue", None))
+        for mi, qty, rev in page:
             grand_revenue += rev
             grand_qty += qty
             avg = (rev / Decimal(qty)) if qty else Decimal("0")
@@ -654,11 +713,10 @@ class SalesByCategoryView(CompanyBranchQuerysetMixin, APIView):
         )
         qs, _ = _apply_waiter_scope(qs, request, "order__waiter_id")
         qs = _apply_date_range(qs, "order__paid_at", df, dt)
-        line_net = _line_net_revenue_expr()
-        net_qty = _line_net_quantity_expr()
+        qs = _annotate_allocated_line_revenue(qs)
 
         data = (qs.values("menu_item__category_id", "menu_item__category__title")
-                  .annotate(qty=Sum(net_qty), revenue=Sum(line_net))
+                  .annotate(qty=Sum("_line_net_qty"), revenue=Sum("_alloc_line_revenue"))
                   .order_by("-revenue", "-qty")[:limit])
 
         result = []
@@ -708,12 +766,11 @@ class SalesByKitchenView(CompanyBranchQuerysetMixin, APIView):
         )
         qs, _ = _apply_waiter_scope(qs, request, "order__waiter_id")
         qs = _apply_date_range(qs, "order__paid_at", df, dt)
-        line_net = _line_net_revenue_expr()
-        net_qty = _line_net_quantity_expr()
+        qs = _annotate_allocated_line_revenue(qs)
 
         data = (
             qs.values("menu_item__kitchen_id", "menu_item__kitchen__title", "menu_item__kitchen__number")
-            .annotate(qty=Sum(net_qty), revenue=Sum(line_net))
+            .annotate(qty=Sum("_line_net_qty"), revenue=Sum("_alloc_line_revenue"))
             .order_by("-revenue", "-qty")
         )
 
@@ -1463,7 +1520,6 @@ class CafeAnalyticsExportView(CompanyBranchQuerysetMixin, APIView):
             oq = oq.filter(branch__isnull=True)
         oq = _apply_date_range(oq, "paid_at", date_from, date_to)
 
-        line_net = _line_net_revenue_expr()
         net_qty = _line_net_quantity_expr()
 
         line_part = qs_items.aggregate(items_qty=Sum(net_qty))
@@ -1485,10 +1541,12 @@ class CafeAnalyticsExportView(CompanyBranchQuerysetMixin, APIView):
             if mn > 0 and rem < mn:
                 low_stock_count += 1
 
-        top_items_qs = (
+        top_lines = _annotate_allocated_line_revenue(
             qs_items.filter(line_kind=OrderItem.LineKind.MENU, menu_item_id__isnull=False)
-            .values("menu_item__title")
-            .annotate(qty=Sum(net_qty), revenue=Sum(line_net))
+        )
+        top_items_qs = (
+            top_lines.values("menu_item__title")
+            .annotate(qty=Sum("_line_net_qty"), revenue=Sum("_alloc_line_revenue"))
             .order_by("-revenue", "-qty")[:10]
         )
 

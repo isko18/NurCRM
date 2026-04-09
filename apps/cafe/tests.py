@@ -16,6 +16,7 @@ from rest_framework.request import Request
 
 from apps.cafe.analytics import (
     SalesSummaryView,
+    SalesByMenuItemView,
     CafeWaiterSalaryReportView,
     CafeUnifiedAnalyticsView,
 )
@@ -1006,6 +1007,24 @@ class CafeWaiterAnalyticsScopeTestCase(TestCase):
         self.assertEqual(response.data["orders_count"], 1)
         self.assertEqual(response.data["items_qty"], 1)
         self.assertEqual(response.data["revenue"], "100.00")
+
+    def test_menu_item_sales_reflects_order_level_refund(self):
+        """Возврат по чеку (без refunded_quantity) уменьшает выручку в разрезе блюд пропорционально."""
+        self._create_paid_order(waiter=self.waiter1, table=self.table1, client=self.client1, quantity=1)
+        order = Order.objects.filter(company=self.company, branch=self.branch).order_by("-paid_at").first()
+        order.refunded_amount = Decimal("30.00")
+        order.save(update_fields=["refunded_amount"])
+
+        request = self.api_factory.get(
+            f"/cafe/analytics/sales/items/?branch={self.branch.id}&date_from={self.period_day}&date_to={self.period_day}"
+        )
+        force_authenticate(request, user=self.owner)
+        response = SalesByMenuItemView.as_view()(request)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.data), 1)
+        self.assertEqual(response.data[0]["qty"], 1)
+        self.assertEqual(response.data[0]["revenue"], "70.00")
 
     def test_waiter_salary_report_returns_only_own_base_plus_percent(self):
         self._create_paid_order(waiter=self.waiter1, table=self.table1, client=self.client1, quantity=1)
