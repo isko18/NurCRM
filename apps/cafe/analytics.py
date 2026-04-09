@@ -79,6 +79,17 @@ def _to_decimal(x) -> Decimal:
         return Decimal("0")
 
 
+def _query_params(request):
+    """
+    QueryDict для аналитики: прямые вызовы API идут с DRF Request (.query_params),
+    а CafeUnifiedAnalyticsView делегирует во вложенные APIView с django HttpRequest (только .GET).
+    """
+    qp = getattr(request, "query_params", None)
+    if qp is not None:
+        return qp
+    return request.GET
+
+
 def _apply_date_range(qs, field_name: str, date_from: str | None, date_to: str | None):
     if date_from:
         qs = qs.filter(**{f"{field_name}__date__gte": date_from})
@@ -266,8 +277,8 @@ class KitchenAnalyticsBaseView(CompanyBranchQuerysetMixin, APIView):
         if not company:
             return Response([])
 
-        df = request.query_params.get("date_from")
-        dt = request.query_params.get("date_to")
+        df = _query_params(request).get("date_from")
+        dt = _query_params(request).get("date_to")
         waiter_scope_id = _analytics_waiter_scope(request) if self.group_field == "waiter" else None
 
         branch = self._active_branch()
@@ -343,8 +354,8 @@ class SalesSummaryView(CompanyBranchQuerysetMixin, APIView):
         if not company:
             return Response({"orders_count": 0, "items_qty": 0, "revenue": "0.00"})
 
-        df = request.query_params.get("date_from")
-        dt = request.query_params.get("date_to")
+        df = _query_params(request).get("date_from")
+        dt = _query_params(request).get("date_to")
         waiter_scope_id = _analytics_waiter_scope(request)
 
         branch = self._active_branch()
@@ -403,9 +414,9 @@ class SalesByMenuItemView(CompanyBranchQuerysetMixin, APIView):
         if not company:
             return Response([])
 
-        df = request.query_params.get("date_from")
-        dt = request.query_params.get("date_to")
-        limit_raw = request.query_params.get("limit")
+        df = _query_params(request).get("date_from")
+        dt = _query_params(request).get("date_to")
+        limit_raw = _query_params(request).get("limit")
         try:
             limit = max(1, min(int(limit_raw or 10), 200))
         except Exception:
@@ -471,8 +482,8 @@ class MenuAnalyticsAllView(CompanyBranchQuerysetMixin, APIView):
         company = self._user_company()
         if not company:
             return Response({
-                "date_from": request.query_params.get("date_from"),
-                "date_to": request.query_params.get("date_to"),
+                "date_from": _query_params(request).get("date_from"),
+                "date_to": _query_params(request).get("date_to"),
                 "basis": "paid_at",
                 "offset": 0,
                 "limit": 0,
@@ -482,11 +493,11 @@ class MenuAnalyticsAllView(CompanyBranchQuerysetMixin, APIView):
                 "grand_qty": 0,
             })
 
-        df = request.query_params.get("date_from")
-        dt = request.query_params.get("date_to")
-        include_inactive = str(request.query_params.get("include_inactive") or "").strip() in ("1", "true", "yes", "on")
-        limit_raw = request.query_params.get("limit")
-        offset_raw = request.query_params.get("offset")
+        df = _query_params(request).get("date_from")
+        dt = _query_params(request).get("date_to")
+        include_inactive = str(_query_params(request).get("include_inactive") or "").strip() in ("1", "true", "yes", "on")
+        limit_raw = _query_params(request).get("limit")
+        offset_raw = _query_params(request).get("offset")
         try:
             limit = max(1, min(int(limit_raw or 500), 5000))
         except Exception:
@@ -612,9 +623,9 @@ class SalesByCategoryView(CompanyBranchQuerysetMixin, APIView):
         if not company:
             return Response([])
 
-        df = request.query_params.get("date_from")
-        dt = request.query_params.get("date_to")
-        limit_raw = request.query_params.get("limit")
+        df = _query_params(request).get("date_from")
+        dt = _query_params(request).get("date_to")
+        limit_raw = _query_params(request).get("limit")
         try:
             limit = max(1, min(int(limit_raw or 50), 200))
         except Exception:
@@ -673,8 +684,8 @@ class SalesByKitchenView(CompanyBranchQuerysetMixin, APIView):
         if not company:
             return Response([])
 
-        df = request.query_params.get("date_from")
-        dt = request.query_params.get("date_to")
+        df = _query_params(request).get("date_from")
+        dt = _query_params(request).get("date_to")
         waiter_scope_id = _analytics_waiter_scope(request)
         branch = self._active_branch()
         key = _cache_key(
@@ -732,8 +743,8 @@ class RevenueInflowView(CompanyBranchQuerysetMixin, APIView):
         if not company:
             return Response({"basis": "paid_at", "payment_methods": [], "totals": {}})
 
-        df = request.query_params.get("date_from")
-        dt = request.query_params.get("date_to")
+        df = _query_params(request).get("date_from")
+        dt = _query_params(request).get("date_to")
         branch = self._active_branch()
 
         qs = Order.objects.filter(company=company, is_paid=True)
@@ -783,8 +794,8 @@ class RejectionsAnalyticsView(CompanyBranchQuerysetMixin, APIView):
         if not company:
             return Response([])
 
-        df = request.query_params.get("date_from")
-        dt = request.query_params.get("date_to")
+        df = _query_params(request).get("date_from")
+        dt = _query_params(request).get("date_to")
         branch = self._active_branch()
 
         qs = OrderItem.objects.select_related("order", "menu_item").filter(
@@ -843,10 +854,10 @@ class CancelledOrdersAnalyticsView(CompanyBranchQuerysetMixin, APIView):
         if not company:
             return Response({"date_from": None, "date_to": None, "basis": "canceled_at", "rows": []})
 
-        df = request.query_params.get("date_from")
-        dt = request.query_params.get("date_to")
-        limit_raw = request.query_params.get("limit")
-        offset_raw = request.query_params.get("offset")
+        df = _query_params(request).get("date_from")
+        dt = _query_params(request).get("date_to")
+        limit_raw = _query_params(request).get("limit")
+        offset_raw = _query_params(request).get("offset")
         try:
             limit = max(1, min(int(limit_raw or 200), 1000))
         except Exception:
@@ -920,8 +931,8 @@ class CafeExpensesSummaryView(CompanyBranchQuerysetMixin, APIView):
         if not company:
             return Response({"expenses_count": 0, "expenses_sum": "0.00"})
 
-        df = request.query_params.get("date_from")
-        dt = request.query_params.get("date_to")
+        df = _query_params(request).get("date_from")
+        dt = _query_params(request).get("date_to")
         branch = self._active_branch()
 
         qs = CafeExpense.objects.filter(company=company)
@@ -997,7 +1008,7 @@ class CafeShiftReportView(CompanyBranchQuerysetMixin, APIView):
         if not company:
             return Response({"detail": "Компания не найдена."}, status=403)
 
-        shift_id = request.query_params.get("shift")
+        shift_id = _query_params(request).get("shift")
         if not shift_id:
             return Response({"detail": "Укажите query-параметр shift=<uuid>."}, status=400)
 
@@ -1051,7 +1062,7 @@ class CafeDailyCloseReportView(CompanyBranchQuerysetMixin, APIView):
         if not company:
             return Response({"detail": "Компания не найдена."}, status=403)
 
-        day = request.query_params.get("date")
+        day = _query_params(request).get("date")
         if not day:
             return Response({"detail": "Укажите date=YYYY-MM-DD."}, status=400)
 
@@ -1099,8 +1110,8 @@ class CafeWaiterSalaryReportView(CompanyBranchQuerysetMixin, APIView):
 
     def get(self, request):
         company = self._user_company()
-        df = request.query_params.get("date_from")
-        dt = request.query_params.get("date_to")
+        df = _query_params(request).get("date_from")
+        dt = _query_params(request).get("date_to")
         if not company:
             return Response({"date_from": df, "date_to": dt, "rows": []})
 
@@ -1180,7 +1191,7 @@ class CafeUnifiedAnalyticsView(CompanyBranchQuerysetMixin, APIView):
     permission_classes = [permissions.IsAuthenticated]
 
     def get(self, request):
-        tab = (request.query_params.get("tab") or "revenue").strip().lower()
+        tab = (_query_params(request).get("tab") or "revenue").strip().lower()
         company = self._user_company()
         if not company:
             return Response({"tab": tab, "detail": "Компания не найдена."}, status=403)
@@ -1226,8 +1237,8 @@ class CafeWaiterSalesView(CompanyBranchQuerysetMixin, APIView):
         if not company:
             return Response([])
 
-        df = request.query_params.get("date_from")
-        dt = request.query_params.get("date_to")
+        df = _query_params(request).get("date_from")
+        dt = _query_params(request).get("date_to")
         branch = self._active_branch()
 
         qs = Order.objects.filter(company=company, is_paid=True)
@@ -1272,8 +1283,8 @@ class PurchasesSummaryView(CompanyBranchQuerysetMixin, APIView):
         if not company:
             return Response({"purchases_count": 0, "purchases_sum": "0.00"})
 
-        df = request.query_params.get("date_from")
-        dt = request.query_params.get("date_to")
+        df = _query_params(request).get("date_from")
+        dt = _query_params(request).get("date_to")
 
         branch = self._active_branch()
         key = _cache_key(
@@ -1316,9 +1327,9 @@ class PurchasesBySupplierView(CompanyBranchQuerysetMixin, APIView):
         if not company:
             return Response([])
 
-        df = request.query_params.get("date_from")
-        dt = request.query_params.get("date_to")
-        limit_raw = request.query_params.get("limit")
+        df = _query_params(request).get("date_from")
+        dt = _query_params(request).get("date_to")
+        limit_raw = _query_params(request).get("limit")
         try:
             limit = max(1, min(int(limit_raw or 10), 200))
         except Exception:
@@ -1641,10 +1652,10 @@ class CafeAnalyticsExportView(CompanyBranchQuerysetMixin, APIView):
         if not company:
             return Response({"detail": "Компания не найдена."}, status=403)
 
-        report_type = (request.query_params.get("report") or "analytics").strip().lower()
-        export_format = (request.query_params.get("format") or "excel").strip().lower()
-        date_from = request.query_params.get("date_from")
-        date_to = request.query_params.get("date_to")
+        report_type = (_query_params(request).get("report") or "analytics").strip().lower()
+        export_format = (_query_params(request).get("format") or "excel").strip().lower()
+        date_from = _query_params(request).get("date_from")
+        date_to = _query_params(request).get("date_to")
         branch = self._active_branch()
 
         if report_type not in {"analytics", "cash"}:
