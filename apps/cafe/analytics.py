@@ -4,6 +4,7 @@ from __future__ import annotations
 from decimal import Decimal, InvalidOperation
 import hashlib
 import json
+from html import escape
 from io import BytesIO
 from datetime import datetime, time, timedelta
 
@@ -15,6 +16,7 @@ from rest_framework.renderers import BaseRenderer, JSONRenderer
 
 from django.conf import settings
 from django.core.cache import cache
+from django.core.exceptions import FieldDoesNotExist, ObjectDoesNotExist
 from django.http import HttpResponse
 from django.db.models import (
     Q, Count, Avg, Sum, Max, F, Case, When,
@@ -99,11 +101,39 @@ def _django_http_request(request):
     return request
 
 
+def _resolve_leaf_field(model, field_path: str):
+    """Цепочка FK (например order__paid_at) → конечное поле модели."""
+    parts = field_path.split("__")
+    for bit in parts[:-1]:
+        rel = model._meta.get_field(bit)
+        related = getattr(rel, "related_model", None)
+        if related is None:
+            raise FieldDoesNotExist(f"{model.__name__} has no forward relation {bit!r} in {field_path!r}")
+        model = related
+    return model._meta.get_field(parts[-1])
+
+
 def _apply_date_range(qs, field_name: str, date_from: str | None, date_to: str | None):
+    """
+    Фильтр по календарным дням YYYY-MM-DD.
+    Для DateTimeField — lookup __date (как раньше).
+    Для DateField — прямое __gte/__lte: __date на DateField на части бэкендов даёт неверный SQL / ошибку.
+    """
+    from django.db.models import DateTimeField
+
+    use_date_transform = True
+    try:
+        leaf = _resolve_leaf_field(qs.model, field_name)
+        use_date_transform = isinstance(leaf, DateTimeField)
+    except (FieldDoesNotExist, AttributeError, LookupError, ValueError):
+        use_date_transform = True
+
     if date_from:
-        qs = qs.filter(**{f"{field_name}__date__gte": date_from})
+        suf = "__date__gte" if use_date_transform else "__gte"
+        qs = qs.filter(**{f"{field_name}{suf}": date_from})
     if date_to:
-        qs = qs.filter(**{f"{field_name}__date__lte": date_to})
+        suf = "__date__lte" if use_date_transform else "__lte"
+        qs = qs.filter(**{f"{field_name}{suf}": date_to})
     return qs
 
 
@@ -886,7 +916,7 @@ def _refund_rows_by_payment_method(item_refund_qs, order_refund_qs):
     acc: dict[str, dict] = {}
     for src in (item_refund_qs, order_refund_qs):
         for row in src.values("payment_method").annotate(t=Sum("amount"), c=Count("id")):
-            m = (row.get("payment_method") or "").strip() or "unknown"
+            m = str(row.get("payment_method") or "").strip() or "unknown"
             if m not in acc:
                 acc[m] = {"total": Decimal("0"), "count": 0}
             acc[m]["total"] += _to_decimal(row.get("t"))
@@ -942,7 +972,7 @@ class RevenueInflowView(CompanyBranchQuerysetMixin, APIView):
         methods = []
         grand = Decimal("0")
         for row in rows:
-            m = (row.get("payment_method") or "").strip() or "unknown"
+            m = str(row.get("payment_method") or "").strip() or "unknown"
             t = _to_decimal(row.get("total"))
             grand += t
             methods.append({
@@ -1199,7 +1229,7 @@ class CancelledOrdersAnalyticsView(CompanyBranchQuerysetMixin, APIView):
                     who = str(o.canceled_by_id)
             rows.append({
                 "order_id": str(o.id),
-                "table_number": (o.table.number if o.table_id else None),
+                "table_number": _safe_order_table_number(o),
                 "waiter_id": str(o.waiter_id) if o.waiter_id else None,
                 "canceled_at": canceled_at,
                 "canceled_by_id": str(o.canceled_by_id) if o.canceled_by_id else None,
@@ -1349,7 +1379,7 @@ class CafeFinanceAnalyticsView(CompanyBranchQuerysetMixin, APIView):
         pm_labels = dict(Order.PaymentMethod.choices)
         income_breakdown = []
         for row in pm_rows:
-            m = (row.get("payment_method") or "").strip() or "unknown"
+            m = str(row.get("payment_method") or "").strip() or "unknown"
             t = _to_decimal(row.get("total"))
             income_breakdown.append({
                 "method": m,
@@ -1367,7 +1397,7 @@ class CafeFinanceAnalyticsView(CompanyBranchQuerysetMixin, APIView):
                 "payment_method": o.payment_method or "",
                 "payment_method_label": pm_labels.get(o.payment_method or "", o.payment_method or ""),
                 "amount": f"{_to_decimal(o.net_captured):.2f}",
-                "table_number": o.table.number if o.table_id else None,
+                "table_number": _safe_order_table_number(o),
             })
 
         other_expenses_items = []
@@ -1563,7 +1593,7 @@ class CafeShiftReportView(CompanyBranchQuerysetMixin, APIView):
         methods = []
         g = Decimal("0")
         for row in by_pm:
-            m = (row.get("payment_method") or "").strip() or "unknown"
+            m = str(row.get("payment_method") or "").strip() or "unknown"
             t = _to_decimal(row.get("total"))
             g += t
             methods.append({
@@ -1614,7 +1644,7 @@ class CafeDailyCloseReportView(CompanyBranchQuerysetMixin, APIView):
         methods = []
         g = Decimal("0")
         for row in by_pm:
-            m = (row.get("payment_method") or "").strip() or "unknown"
+            m = str(row.get("payment_method") or "").strip() or "unknown"
             t = _to_decimal(row.get("total"))
             g += t
             methods.append({
@@ -1955,6 +1985,30 @@ def _safe_filename_part(value: str | None, fallback: str) -> str:
     return cleaned[:48] or fallback
 
 
+def _export_html_escape(value) -> str:
+    """Экранирование для Word HTML-экспорта + защита от суррогатов при последующем encode('utf-8')."""
+    if value is None:
+        s = ""
+    else:
+        s = str(value)
+    s = s.encode("utf-8", errors="replace").decode("utf-8")
+    return escape(s, quote=True)
+
+
+def _safe_order_table_number(order) -> int | None:
+    if not getattr(order, "table_id", None):
+        return None
+    try:
+        return order.table.number
+    except ObjectDoesNotExist:
+        return None
+
+
+def _safe_order_table_number_export(order) -> str:
+    n = _safe_order_table_number(order)
+    return "" if n is None else str(n)
+
+
 class CafeAnalyticsExportView(CompanyBranchQuerysetMixin, APIView):
     """
     Экспорт аналитики/кассы:
@@ -2052,7 +2106,7 @@ class CafeAnalyticsExportView(CompanyBranchQuerysetMixin, APIView):
                 "payment_method": (o.payment_method or ""),
                 "payment_method_label": pm_labels.get(o.payment_method or "", o.payment_method or ""),
                 "amount": f"{_to_decimal(o.net_captured):.2f}",
-                "table_number": o.table.number if o.table_id else "",
+                "table_number": _safe_order_table_number_export(o),
             })
 
         purchase_rows = []
@@ -2174,7 +2228,7 @@ class CafeAnalyticsExportView(CompanyBranchQuerysetMixin, APIView):
 
         rows = []
         for row in orders_qs:
-            method = (row.get("payment_method") or "").strip().lower()
+            method = str(row.get("payment_method") or "").strip().lower()
             amount = _to_decimal(row.get("row_net"))
             if method in ("cash", "card", "transfer"):
                 totals[method] += amount
@@ -2339,34 +2393,37 @@ class CafeAnalyticsExportView(CompanyBranchQuerysetMixin, APIView):
         return buf.getvalue()
 
     def _build_word_html(self, report_type: str, payload: dict) -> bytes:
+        h = _export_html_escape
         if report_type == "analytics":
             rows = "".join(
-                f"<tr><td>{r['title']}</td><td>{r['qty']}</td><td>{r['revenue']}</td></tr>"
+                f"<tr><td>{h(r['title'])}</td><td>{h(r['qty'])}</td><td>{h(r['revenue'])}</td></tr>"
                 for r in payload["top_items"]
             )
             inc = "".join(
-                f"<tr><td>{r['order_id']}</td><td>{r['paid_at']}</td><td>{r.get('payment_method_label', r['payment_method'])}</td><td>{r['amount']}</td></tr>"
+                f"<tr><td>{h(r['order_id'])}</td><td>{h(r['paid_at'])}</td>"
+                f"<td>{h(r.get('payment_method_label') or r.get('payment_method') or '')}</td>"
+                f"<td>{h(r['amount'])}</td></tr>"
                 for r in (payload.get("income_rows") or [])[:200]
             )
             html = f"""
 <html><head><meta charset="utf-8"></head><body>
 <h2>Cafe analytics report</h2>
-<p>date_from: {payload["date_from"]}</p>
-<p>date_to: {payload["date_to"]}</p>
-<p>basis: {payload.get("basis", "paid_at")}</p>
-<p>orders_count: {payload["orders_count"]}</p>
-<p>items_qty: {payload["items_qty"]}</p>
-<p>revenue: {payload["revenue"]}</p>
-<p>cogs_sold: {payload.get("cogs_sold", "0.00")}</p>
-<p>gross_profit: {payload.get("gross_profit", "0.00")}</p>
-<p>margin_percent: {payload.get("margin_percent", 0)}</p>
-<p>net_profit: {payload.get("net_profit", "0.00")}</p>
-<p>purchases_count: {payload["purchases_count"]}</p>
-<p>purchases_sum: {payload["purchases_sum"]}</p>
-<p>cafe_expenses_count: {payload.get("cafe_expenses_count", 0)}</p>
-<p>cafe_expenses_sum: {payload.get("cafe_expenses_sum", "0.00")}</p>
-<p>refunds_total: {payload.get("refunds_total", "0.00")}</p>
-<p>low_stock_count: {payload["low_stock_count"]}</p>
+<p>date_from: {h(payload["date_from"])}</p>
+<p>date_to: {h(payload["date_to"])}</p>
+<p>basis: {h(payload.get("basis", "paid_at"))}</p>
+<p>orders_count: {h(payload["orders_count"])}</p>
+<p>items_qty: {h(payload["items_qty"])}</p>
+<p>revenue: {h(payload["revenue"])}</p>
+<p>cogs_sold: {h(payload.get("cogs_sold", "0.00"))}</p>
+<p>gross_profit: {h(payload.get("gross_profit", "0.00"))}</p>
+<p>margin_percent: {h(payload.get("margin_percent", 0))}</p>
+<p>net_profit: {h(payload.get("net_profit", "0.00"))}</p>
+<p>purchases_count: {h(payload["purchases_count"])}</p>
+<p>purchases_sum: {h(payload["purchases_sum"])}</p>
+<p>cafe_expenses_count: {h(payload.get("cafe_expenses_count", 0))}</p>
+<p>cafe_expenses_sum: {h(payload.get("cafe_expenses_sum", "0.00"))}</p>
+<p>refunds_total: {h(payload.get("refunds_total", "0.00"))}</p>
+<p>low_stock_count: {h(payload["low_stock_count"])}</p>
 <h3>Приходы (фрагмент)</h3>
 <table border="1" cellspacing="0" cellpadding="4">
 <tr><th>order_id</th><th>paid_at</th><th>method</th><th>amount</th></tr>
@@ -2381,24 +2438,26 @@ class CafeAnalyticsExportView(CompanyBranchQuerysetMixin, APIView):
 """
         else:
             rows = "".join(
-                f"<tr><td>{r['order_id']}</td><td>{r['paid_at']}</td><td>{r['payment_method']}</td><td>{r['final_amount']}</td></tr>"
+                f"<tr><td>{h(r['order_id'])}</td><td>{h(r['paid_at'])}</td>"
+                f"<td>{h(r['payment_method'])}</td><td>{h(r['final_amount'])}</td></tr>"
                 for r in payload["rows"]
             )
             rrows = "".join(
-                f"<tr><td>{r.get('kind')}</td><td>{r['order_id']}</td><td>{r['refunded_at']}</td><td>{r['amount']}</td></tr>"
+                f"<tr><td>{h(r.get('kind'))}</td><td>{h(r['order_id'])}</td>"
+                f"<td>{h(r['refunded_at'])}</td><td>{h(r['amount'])}</td></tr>"
                 for r in (payload.get("refund_rows") or [])[:200]
             )
             html = f"""
 <html><head><meta charset="utf-8"></head><body>
 <h2>Cafe cash report</h2>
-<p>date_from: {payload["date_from"]}</p>
-<p>date_to: {payload["date_to"]}</p>
-<p>total_all: {payload["totals"]["all"]}</p>
-<p>total_cash: {payload["totals"]["cash"]}</p>
-<p>total_card: {payload["totals"]["card"]}</p>
-<p>total_transfer: {payload["totals"]["transfer"]}</p>
-<p>total_other: {payload["totals"]["other"]}</p>
-<p>refunds_total: {payload.get("refunds_total", "0.00")}</p>
+<p>date_from: {h(payload["date_from"])}</p>
+<p>date_to: {h(payload["date_to"])}</p>
+<p>total_all: {h(payload["totals"]["all"])}</p>
+<p>total_cash: {h(payload["totals"]["cash"])}</p>
+<p>total_card: {h(payload["totals"]["card"])}</p>
+<p>total_transfer: {h(payload["totals"]["transfer"])}</p>
+<p>total_other: {h(payload["totals"]["other"])}</p>
+<p>refunds_total: {h(payload.get("refunds_total", "0.00"))}</p>
 <h3>Orders</h3>
 <table border="1" cellspacing="0" cellpadding="4">
 <tr><th>order_id</th><th>paid_at</th><th>payment_method</th><th>final_amount</th></tr>
@@ -2411,7 +2470,7 @@ class CafeAnalyticsExportView(CompanyBranchQuerysetMixin, APIView):
 </table>
 </body></html>
 """
-        return html.encode("utf-8")
+        return html.encode("utf-8", errors="replace")
 
     def get(self, request):
         company = self._user_company()
