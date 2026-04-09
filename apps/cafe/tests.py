@@ -12,7 +12,13 @@ from apps.cafe.models import (
     Zone, Table, Order, OrderItem, MenuItem, Category, CafeClient, Kitchen, OrderDebtPayment,
     CafeWaiterPayProfile,
 )
-from apps.cafe.analytics import SalesSummaryView, CafeWaiterSalaryReportView
+from rest_framework.request import Request
+
+from apps.cafe.analytics import (
+    SalesSummaryView,
+    CafeWaiterSalaryReportView,
+    CafeUnifiedAnalyticsView,
+)
 from apps.cafe.views import (
     send_order_created_notification,
     send_order_updated_notification,
@@ -1037,3 +1043,33 @@ class CafeWaiterAnalyticsScopeTestCase(TestCase):
         self.assertEqual(row["waiter_revenue_period"], "100.00")
         self.assertEqual(row["percent_bonus"], "10.00")
         self.assertEqual(row["total"], "110.00")
+
+    def test_unified_analytics_delegation_preserves_query_params(self):
+        """
+        CafeUnifiedAnalyticsView передаёт во вложенные вьюхи django HttpRequest; параметры периода и branch
+        должны читаться через GET, иначе вкладки unified возвращают пустую аналитику / падают.
+        """
+        self._create_paid_order(waiter=self.waiter1, table=self.table1, client=self.client1, quantity=1)
+        self._create_paid_order(waiter=self.waiter2, table=self.table2, client=self.client2, quantity=2)
+
+        unified_wsgi = self.api_factory.get(
+            "/cafe/analytics/unified/",
+            {
+                "tab": "sales_summary",
+                "branch": str(self.branch.id),
+                "date_from": self.period_day,
+                "date_to": self.period_day,
+            },
+        )
+        force_authenticate(unified_wsgi, user=self.owner)
+        unified_resp = CafeUnifiedAnalyticsView.as_view()(Request(unified_wsgi))
+
+        direct = self.api_factory.get(
+            f"/cafe/analytics/sales/summary/?branch={self.branch.id}&date_from={self.period_day}&date_to={self.period_day}"
+        )
+        force_authenticate(direct, user=self.owner)
+        direct_resp = SalesSummaryView.as_view()(direct)
+
+        self.assertEqual(unified_resp.status_code, 200, getattr(unified_resp, "data", unified_resp.content))
+        self.assertEqual(direct_resp.status_code, 200)
+        self.assertEqual(unified_resp.data, direct_resp.data)
