@@ -325,6 +325,51 @@ def _apply_waiter_scope(qs, request, field_name: str):
     return qs, waiter_id
 
 
+def _scoped_purchase_qs(company, branch):
+    qs = Purchase.objects.filter(company=company)
+    if branch is not None:
+        qs = qs.filter(branch=branch)
+    else:
+        qs = qs.filter(branch__isnull=True)
+    return qs
+
+
+def _scoped_cafe_expense_qs(company, branch):
+    qs = CafeExpense.objects.filter(company=company)
+    if branch is not None:
+        qs = qs.filter(Q(branch=branch) | Q(branch__isnull=True))
+    else:
+        qs = qs.filter(branch__isnull=True)
+    return qs
+
+
+def _cogs_sold_sum(company, branch, date_from, date_to, request) -> Decimal:
+    """
+    Учётная себестоимость проданных блюд: Σ (нетто-шт × menu_item.cost_price).
+    """
+    qs = _paid_order_lines_qs(company, branch).filter(
+        line_kind=OrderItem.LineKind.MENU,
+        menu_item_id__isnull=False,
+    )
+    qs, _ = _apply_waiter_scope(qs, request, "order__waiter_id")
+    qs = _apply_date_range(qs, "order__paid_at", date_from, date_to)
+    nq = _line_net_quantity_expr()
+    cp = Coalesce(
+        F("menu_item__cost_price"),
+        Value(Decimal("0")),
+        output_field=DecimalField(max_digits=14, decimal_places=4),
+    )
+    qs = qs.annotate(_nq=nq)
+    qs = qs.annotate(
+        _line_cogs=ExpressionWrapper(
+            F("_nq") * cp,
+            output_field=DecimalField(max_digits=24, decimal_places=8),
+        )
+    )
+    agg = qs.aggregate(s=Sum("_line_cogs"))
+    return _to_decimal(agg.get("s"))
+
+
 def _apply_branch_scope_for_kitchen_tasks(qs, mixin: CompanyBranchQuerysetMixin):
     """
     Оставляем твою старую логику для kitchen analytics:
@@ -1183,25 +1228,257 @@ class CafeExpensesSummaryView(CompanyBranchQuerysetMixin, APIView):
     def get(self, request):
         company = self._user_company()
         if not company:
-            return Response({"expenses_count": 0, "expenses_sum": "0.00"})
+            return Response({"expenses_count": 0, "expenses_sum": "0.00", "items": [], "expenses_by_day": []})
 
-        df = _query_params(request).get("date_from")
-        dt = _query_params(request).get("date_to")
+        qp = _query_params(request)
+        df = qp.get("date_from")
+        dt = qp.get("date_to")
+        try:
+            limit = max(1, min(int(qp.get("limit") or 500), 2000))
+        except Exception:
+            limit = 500
+
         branch = self._active_branch()
-
-        qs = CafeExpense.objects.filter(company=company)
-        if branch is not None:
-            qs = qs.filter(Q(branch=branch) | Q(branch__isnull=True))
-        else:
-            qs = qs.filter(branch__isnull=True)
+        qs = _scoped_cafe_expense_qs(company, branch)
         qs = _apply_date_range(qs, "expense_date", df, dt)
 
         agg = qs.aggregate(c=Count("id"), s=Sum("amount"))
+        expenses_sum = _to_decimal(agg.get("s"))
+        expenses_count = int(agg.get("c") or 0)
+
+        by_day_qs = (
+            qs.values("expense_date")
+            .annotate(day_total=Sum("amount"), day_count=Count("id"))
+            .order_by("expense_date")
+        )
+        expenses_by_day = [
+            {
+                "date": str(r["expense_date"]),
+                "total": f"{_to_decimal(r['day_total']):.2f}",
+                "count": int(r["day_count"] or 0),
+            }
+            for r in by_day_qs
+        ]
+
+        items = []
+        for e in qs.select_related("created_by").order_by("-expense_date", "-created_at")[:limit]:
+            cb = ""
+            if e.created_by_id:
+                u = e.created_by
+                cb = (getattr(u, "get_full_name", lambda: "")() or getattr(u, "email", "") or str(e.created_by_id))
+            items.append({
+                "id": str(e.id),
+                "title": e.title,
+                "amount": f"{_to_decimal(e.amount):.2f}",
+                "category": e.category or "",
+                "expense_date": str(e.expense_date),
+                "note": (e.note or "")[:500],
+                "created_by": cb,
+            })
+
         return Response({
             "date_from": df,
             "date_to": dt,
-            "expenses_count": int(agg.get("c") or 0),
-            "expenses_sum": f"{_to_decimal(agg.get('s')):.2f}",
+            "basis": "expense_date",
+            "expenses_count": expenses_count,
+            "expenses_sum": f"{expenses_sum:.2f}",
+            "other_expenses_section": {
+                "title": "Прочие расходы",
+                "items": items,
+                "expenses_by_day": expenses_by_day,
+            },
+            "items": items,
+            "expenses_by_day": expenses_by_day,
+        })
+
+
+class CafeFinanceAnalyticsView(CompanyBranchQuerysetMixin, APIView):
+    """
+    Финансы кафе в духе маркета (tab=finance): детальные приходы, прочие расходы, закупки, возвраты,
+    валовая прибыль и маржа по учётной себестоимости блюд (cost_price × нетто-продажи).
+    Чистая прибыль в cards.net_profit = валовая − прочие операционные расходы (CafeExpense), без суммы закупок.
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request):
+        company = self._user_company()
+        if not company:
+            return Response({"detail": "Компания не найдена."}, status=403)
+
+        qp = _query_params(request)
+        df = (qp.get("date_from") or "").strip() or None
+        dt = (qp.get("date_to") or "").strip() or None
+        try:
+            limit = max(1, min(int(qp.get("limit") or 500), 2000))
+        except Exception:
+            limit = 500
+
+        branch = self._active_branch()
+
+        oq = Order.objects.filter(company=company, is_paid=True)
+        if branch is not None:
+            oq = oq.filter(branch=branch)
+        else:
+            oq = oq.filter(branch__isnull=True)
+        oq, _ = _apply_waiter_scope(oq, request, "waiter_id")
+        oq = _apply_date_range(oq, "paid_at", df, dt)
+
+        revenue = _to_decimal(oq.aggregate(s=Sum(_order_net_revenue_expr()))["s"])
+        cogs = _cogs_sold_sum(company, branch, df, dt, request)
+        gross = revenue - cogs
+        margin_pct = float((gross / revenue * Decimal("100")).quantize(Decimal("0.01"))) if revenue > 0 else 0.0
+
+        pqs = _scoped_purchase_qs(company, branch)
+        pqs = _apply_date_range(pqs, "created_at", df, dt)
+        purchases_sum = _to_decimal(pqs.aggregate(s=Sum("price"))["s"])
+        purchases_count = int(pqs.aggregate(c=Count("id"))["c"] or 0)
+
+        eqs = _scoped_cafe_expense_qs(company, branch)
+        eqs = _apply_date_range(eqs, "expense_date", df, dt)
+        expenses_sum = _to_decimal(eqs.aggregate(s=Sum("amount"))["s"])
+        expenses_count = int(eqs.aggregate(c=Count("id"))["c"] or 0)
+        net_profit = gross - expenses_sum
+
+        net_expr = _order_net_revenue_expr()
+        pm_rows = (
+            oq.annotate(net_captured=net_expr)
+            .values("payment_method")
+            .annotate(count=Count("id"), total=Sum("net_captured"))
+            .order_by("-total")
+        )
+        pm_labels = dict(Order.PaymentMethod.choices)
+        income_breakdown = []
+        for row in pm_rows:
+            m = (row.get("payment_method") or "").strip() or "unknown"
+            t = _to_decimal(row.get("total"))
+            income_breakdown.append({
+                "method": m,
+                "method_label": pm_labels.get(m, m),
+                "count": int(row.get("count") or 0),
+                "total": f"{t:.2f}",
+            })
+
+        income_items = []
+        for o in oq.annotate(net_captured=net_expr).select_related("table", "waiter").order_by("-paid_at")[:limit]:
+            income_items.append({
+                "kind": "order_payment",
+                "id": str(o.id),
+                "paid_at": o.paid_at.isoformat() if o.paid_at else None,
+                "payment_method": o.payment_method or "",
+                "payment_method_label": pm_labels.get(o.payment_method or "", o.payment_method or ""),
+                "amount": f"{_to_decimal(o.net_captured):.2f}",
+                "table_number": o.table.number if o.table_id else None,
+            })
+
+        other_expenses_items = []
+        for e in eqs.select_related("created_by").order_by("-expense_date", "-created_at")[:limit]:
+            cb = ""
+            if e.created_by_id:
+                u = e.created_by
+                cb = (getattr(u, "get_full_name", lambda: "")() or getattr(u, "email", "") or str(e.created_by_id))
+            other_expenses_items.append({
+                "id": str(e.id),
+                "kind": "cafe_expense",
+                "title": e.title,
+                "amount": f"{_to_decimal(e.amount):.2f}",
+                "category": e.category or "",
+                "expense_date": str(e.expense_date),
+                "note": (e.note or "")[:500],
+                "created_by": cb,
+            })
+
+        by_day_qs = (
+            eqs.values("expense_date")
+            .annotate(day_total=Sum("amount"), day_count=Count("id"))
+            .order_by("expense_date")
+        )
+        expenses_by_day = [
+            {
+                "date": str(r["expense_date"]),
+                "total": f"{_to_decimal(r['day_total']):.2f}",
+                "count": int(r["day_count"] or 0),
+            }
+            for r in by_day_qs
+        ]
+
+        purchase_items = []
+        for p in pqs.order_by("-created_at")[:limit]:
+            purchase_items.append({
+                "id": str(p.id),
+                "kind": "purchase",
+                "supplier": p.supplier,
+                "amount": f"{_to_decimal(p.price):.2f}",
+                "positions": p.positions,
+                "created_at": p.created_at.isoformat() if p.created_at else None,
+            })
+
+        ir_qs = OrderItemRefund.objects.filter(company=company)
+        or_qs = OrderRefund.objects.filter(company=company)
+        if branch is not None:
+            ir_qs = ir_qs.filter(Q(order__branch=branch) | Q(order__branch__isnull=True))
+            or_qs = or_qs.filter(Q(order__branch=branch) | Q(order__branch__isnull=True))
+        else:
+            ir_qs = ir_qs.filter(order__branch__isnull=True)
+            or_qs = or_qs.filter(order__branch__isnull=True)
+        ir_qs, _ = _apply_waiter_scope(ir_qs, request, "order__waiter_id")
+        or_qs, _ = _apply_waiter_scope(or_qs, request, "order__waiter_id")
+        ir_qs = _apply_datetime_range_calendar_days(ir_qs, "refunded_at", df, dt)
+        or_qs = _apply_datetime_range_calendar_days(or_qs, "refunded_at", df, dt)
+
+        refund_items = []
+        for r in or_qs.select_related("order").order_by("-refunded_at")[:limit]:
+            refund_items.append({
+                "kind": "order_refund",
+                "id": str(r.id),
+                "order_id": str(r.order_id),
+                "amount": f"{_to_decimal(r.amount):.2f}",
+                "payment_method": r.payment_method,
+                "refunded_at": r.refunded_at.isoformat() if r.refunded_at else None,
+                "note": r.note or "",
+            })
+        for r in ir_qs.select_related("order").order_by("-refunded_at")[:limit]:
+            refund_items.append({
+                "kind": "item_refund",
+                "id": str(r.id),
+                "order_id": str(r.order_id),
+                "amount": f"{_to_decimal(r.amount):.2f}",
+                "payment_method": r.payment_method,
+                "refunded_at": r.refunded_at.isoformat() if r.refunded_at else None,
+                "note": r.note or "",
+            })
+        refund_items.sort(key=lambda x: x.get("refunded_at") or "", reverse=True)
+        refund_items = refund_items[:limit]
+
+        refunds_by_method, refunds_total = _refund_rows_by_payment_method(ir_qs, or_qs)
+
+        return Response({
+            "tab": "finance",
+            "date_from": df,
+            "date_to": dt,
+            "basis": "paid_at",
+            "refunds_basis": "refunded_at",
+            "cards": {
+                "revenue": f"{revenue:.2f}",
+                "cogs_sold": f"{cogs:.2f}",
+                "gross_profit": f"{gross:.2f}",
+                "margin_percent": margin_pct,
+                "purchases_sum": f"{purchases_sum:.2f}",
+                "purchases_count": purchases_count,
+                "other_expenses_sum": f"{expenses_sum:.2f}",
+                "other_expenses_count": expenses_count,
+                "net_profit": f"{net_profit:.2f}",
+            },
+            "income_breakdown": income_breakdown,
+            "income_items": income_items,
+            "other_expenses_section": {
+                "title": "Прочие расходы",
+                "items": other_expenses_items,
+                "expenses_by_day": expenses_by_day,
+            },
+            "purchase_items": purchase_items,
+            "refund_items": refund_items,
+            "refunds_by_method": refunds_by_method,
+            "refunds_total": f"{refunds_total:.2f}",
         })
 
 
@@ -1440,7 +1717,8 @@ class CafeWaiterSalaryReportView(CompanyBranchQuerysetMixin, APIView):
 
 class CafeUnifiedAnalyticsView(CompanyBranchQuerysetMixin, APIView):
     """
-    Единая точка аналитики кафе (по аналогии с маркетом): tab=revenue|dishes|kitchens|waiters|...
+    Единая точка аналитики кафе (по аналогии с маркетом):
+    tab=revenue|finance|dishes|kitchens|waiters|sales_summary|categories|purchases|expenses|debts|rejections|salary|daily_close|shift
     """
     permission_classes = [permissions.IsAuthenticated]
 
@@ -1468,6 +1746,8 @@ class CafeUnifiedAnalyticsView(CompanyBranchQuerysetMixin, APIView):
             return PurchasesSummaryView.as_view()(http_req)
         if tab == "expenses":
             return CafeExpensesSummaryView.as_view()(http_req)
+        if tab == "finance":
+            return CafeFinanceAnalyticsView.as_view()(http_req)
         if tab == "debts":
             return CafeDebtAnalyticsView.as_view()(http_req)
         if tab == "rejections":
@@ -1551,10 +1831,7 @@ class PurchasesSummaryView(CompanyBranchQuerysetMixin, APIView):
         if hit is not None:
             return Response(hit)
 
-        qs = Purchase.objects.filter(company=company)
-        if branch is not None:
-            qs = qs.filter(branch=branch)
-
+        qs = _scoped_purchase_qs(company, branch)
         qs = _apply_date_range(qs, "created_at", df, dt)
 
         agg = qs.aggregate(
@@ -1600,10 +1877,7 @@ class PurchasesBySupplierView(CompanyBranchQuerysetMixin, APIView):
         if hit is not None:
             return Response(hit)
 
-        qs = Purchase.objects.filter(company=company)
-        if branch is not None:
-            qs = qs.filter(branch=branch)
-
+        qs = _scoped_purchase_qs(company, branch)
         qs = _apply_date_range(qs, "created_at", df, dt)
 
         data = (qs.values("supplier")
@@ -1685,22 +1959,40 @@ class CafeAnalyticsExportView(CompanyBranchQuerysetMixin, APIView):
     """
     Экспорт аналитики/кассы:
       GET /cafe/analytics/export/?report=analytics|cash&format=excel|word&date_from=YYYY-MM-DD&date_to=YYYY-MM-DD
+
+    Excel (analytics): листы «Сводка», «Приходы», «Закупки», «Прочие расходы», «Возвраты», «Расходы по дням», «Топ блюд».
+    Касса: те же правила филиала и официанта, что и в /analytics/revenue-inflow/ (раньше при глобальном филиале
+    попадали все заказы компании — исправлено).
     """
     permission_classes = [permissions.IsAuthenticated]
     renderer_classes = [JSONRenderer, _BinaryExcelRenderer, _BinaryWordRenderer]
+    _export_row_limit = 2000
 
-    def _analytics_payload(self, company, branch, date_from, date_to):
+    def _refund_qs_for_export(self, company, branch, date_from, date_to, request):
+        ir_qs = OrderItemRefund.objects.filter(company=company)
+        or_qs = OrderRefund.objects.filter(company=company)
+        if branch is not None:
+            ir_qs = ir_qs.filter(Q(order__branch=branch) | Q(order__branch__isnull=True))
+            or_qs = or_qs.filter(Q(order__branch=branch) | Q(order__branch__isnull=True))
+        else:
+            ir_qs = ir_qs.filter(order__branch__isnull=True)
+            or_qs = or_qs.filter(order__branch__isnull=True)
+        ir_qs, _ = _apply_waiter_scope(ir_qs, request, "order__waiter_id")
+        or_qs, _ = _apply_waiter_scope(or_qs, request, "order__waiter_id")
+        ir_qs = _apply_datetime_range_calendar_days(ir_qs, "refunded_at", date_from, date_to)
+        or_qs = _apply_datetime_range_calendar_days(or_qs, "refunded_at", date_from, date_to)
+        return ir_qs, or_qs
+
+    def _analytics_payload(self, company, branch, date_from, date_to, request):
+        lim = self._export_row_limit
         qs_items = _paid_order_lines_qs(company, branch)
-        qs_purchases = Purchase.objects.filter(company=company)
+        qs_items, _ = _apply_waiter_scope(qs_items, request, "order__waiter_id")
+        qs_purchases = _scoped_purchase_qs(company, branch)
         qs_warehouse = Warehouse.objects.filter(company=company)
-        qs_exp = CafeExpense.objects.filter(company=company)
+        qs_exp = _scoped_cafe_expense_qs(company, branch)
 
         if branch is not None:
-            qs_purchases = qs_purchases.filter(branch=branch)
             qs_warehouse = qs_warehouse.filter(branch=branch)
-            qs_exp = qs_exp.filter(Q(branch=branch) | Q(branch__isnull=True))
-        else:
-            qs_exp = qs_exp.filter(branch__isnull=True)
 
         qs_items = _apply_date_range(qs_items, "order__paid_at", date_from, date_to)
         qs_purchases = _apply_date_range(qs_purchases, "created_at", date_from, date_to)
@@ -1711,10 +2003,10 @@ class CafeAnalyticsExportView(CompanyBranchQuerysetMixin, APIView):
             oq = oq.filter(branch=branch)
         else:
             oq = oq.filter(branch__isnull=True)
+        oq, _ = _apply_waiter_scope(oq, request, "waiter_id")
         oq = _apply_date_range(oq, "paid_at", date_from, date_to)
 
         net_qty = _line_net_quantity_expr()
-
         line_part = qs_items.aggregate(items_qty=Sum(net_qty))
         order_part = oq.aggregate(
             orders_count=Count("id"),
@@ -1726,6 +2018,13 @@ class CafeAnalyticsExportView(CompanyBranchQuerysetMixin, APIView):
             purchases_sum=Sum("price"),
         )
         exp_agg = qs_exp.aggregate(expenses_count=Count("id"), expenses_sum=Sum("amount"))
+
+        revenue_d = _to_decimal(sales_agg.get("revenue"))
+        cogs = _cogs_sold_sum(company, branch, date_from, date_to, request)
+        gross = revenue_d - cogs
+        margin_pct = float((gross / revenue_d * Decimal("100")).quantize(Decimal("0.01"))) if revenue_d > 0 else 0.0
+        expenses_d = _to_decimal(exp_agg.get("expenses_sum"))
+        net_profit = gross - expenses_d
 
         low_stock_count = 0
         for w in qs_warehouse.only("remainder", "minimum"):
@@ -1743,17 +2042,95 @@ class CafeAnalyticsExportView(CompanyBranchQuerysetMixin, APIView):
             .order_by("-revenue", "-qty")[:10]
         )
 
+        net_expr = _order_net_revenue_expr()
+        pm_labels = dict(Order.PaymentMethod.choices)
+        income_rows = []
+        for o in oq.annotate(net_captured=net_expr).select_related("table").order_by("-paid_at")[:lim]:
+            income_rows.append({
+                "order_id": str(o.id),
+                "paid_at": str(o.paid_at or ""),
+                "payment_method": (o.payment_method or ""),
+                "payment_method_label": pm_labels.get(o.payment_method or "", o.payment_method or ""),
+                "amount": f"{_to_decimal(o.net_captured):.2f}",
+                "table_number": o.table.number if o.table_id else "",
+            })
+
+        purchase_rows = []
+        for p in qs_purchases.order_by("-created_at")[:lim]:
+            purchase_rows.append({
+                "id": str(p.id),
+                "created_at": str(p.created_at or ""),
+                "supplier": p.supplier,
+                "positions": p.positions,
+                "amount": f"{_to_decimal(p.price):.2f}",
+            })
+
+        expense_rows = []
+        for e in qs_exp.order_by("-expense_date", "-created_at")[:lim]:
+            expense_rows.append({
+                "id": str(e.id),
+                "expense_date": str(e.expense_date),
+                "title": e.title,
+                "category": e.category or "",
+                "amount": f"{_to_decimal(e.amount):.2f}",
+                "note": (e.note or "")[:200],
+            })
+
+        ir_qs, or_qs = self._refund_qs_for_export(company, branch, date_from, date_to, request)
+        refunds_by_method, refunds_grand = _refund_rows_by_payment_method(ir_qs, or_qs)
+
+        refund_rows = []
+        for r in or_qs.order_by("-refunded_at")[:lim]:
+            refund_rows.append({
+                "kind": "order_refund",
+                "id": str(r.id),
+                "order_id": str(r.order_id),
+                "refunded_at": str(r.refunded_at or ""),
+                "payment_method": r.payment_method,
+                "amount": f"{_to_decimal(r.amount):.2f}",
+                "note": (r.note or "")[:120],
+            })
+        for r in ir_qs.order_by("-refunded_at")[:lim]:
+            refund_rows.append({
+                "kind": "item_refund",
+                "id": str(r.id),
+                "order_id": str(r.order_id),
+                "refunded_at": str(r.refunded_at or ""),
+                "payment_method": r.payment_method,
+                "amount": f"{_to_decimal(r.amount):.2f}",
+                "note": (r.note or "")[:120],
+            })
+
+        exp_by_day = (
+            qs_exp.values("expense_date")
+            .annotate(day_total=Sum("amount"), day_count=Count("id"))
+            .order_by("expense_date")
+        )
+        expenses_by_day_export = [
+            {
+                "date": str(r["expense_date"]),
+                "total": f"{_to_decimal(r['day_total']):.2f}",
+                "count": int(r["day_count"] or 0),
+            }
+            for r in exp_by_day
+        ]
+
         return {
             "date_from": date_from or "",
             "date_to": date_to or "",
             "basis": "paid_at",
             "orders_count": int(sales_agg.get("orders_count") or 0),
             "items_qty": int(sales_agg.get("items_qty") or 0),
-            "revenue": f"{_to_decimal(sales_agg.get('revenue')):.2f}",
+            "revenue": f"{revenue_d:.2f}",
+            "cogs_sold": f"{cogs:.2f}",
+            "gross_profit": f"{gross:.2f}",
+            "margin_percent": margin_pct,
+            "net_profit": f"{net_profit:.2f}",
             "purchases_count": int(purchases_agg.get("purchases_count") or 0),
             "purchases_sum": f"{_to_decimal(purchases_agg.get('purchases_sum')):.2f}",
             "cafe_expenses_count": int(exp_agg.get("expenses_count") or 0),
-            "cafe_expenses_sum": f"{_to_decimal(exp_agg.get('expenses_sum')):.2f}",
+            "cafe_expenses_sum": f"{expenses_d:.2f}",
+            "refunds_total": f"{refunds_grand:.2f}",
             "low_stock_count": low_stock_count,
             "top_items": [
                 {
@@ -1763,18 +2140,28 @@ class CafeAnalyticsExportView(CompanyBranchQuerysetMixin, APIView):
                 }
                 for row in top_items_qs
             ],
+            "income_rows": income_rows,
+            "purchase_rows": purchase_rows,
+            "expense_rows": expense_rows,
+            "refund_rows": refund_rows,
+            "refunds_by_method": refunds_by_method,
+            "expenses_by_day": expenses_by_day_export,
         }
 
-    def _cash_payload(self, company, branch, date_from, date_to):
+    def _cash_payload(self, company, branch, date_from, date_to, request):
+        lim = self._export_row_limit
         qs = Order.objects.filter(company=company, is_paid=True)
         if branch is not None:
             qs = qs.filter(branch=branch)
+        else:
+            qs = qs.filter(branch__isnull=True)
+        qs, _ = _apply_waiter_scope(qs, request, "waiter_id")
         qs = _apply_date_range(qs, "paid_at", date_from, date_to)
 
         orders_qs = (
             qs.annotate(row_net=_order_net_revenue_expr())
             .values("id", "paid_at", "payment_method", "row_net")
-            .order_by("-paid_at")[:500]
+            .order_by("-paid_at")[:lim]
         )
 
         totals = {
@@ -1803,38 +2190,118 @@ class CafeAnalyticsExportView(CompanyBranchQuerysetMixin, APIView):
                 }
             )
 
+        ir_qs, or_qs = self._refund_qs_for_export(company, branch, date_from, date_to, request)
+        refunds_by_method, refunds_grand = _refund_rows_by_payment_method(ir_qs, or_qs)
+
+        refund_rows = []
+        for r in or_qs.order_by("-refunded_at")[:lim]:
+            refund_rows.append({
+                "kind": "order_refund",
+                "id": str(r.id),
+                "order_id": str(r.order_id),
+                "refunded_at": str(r.refunded_at or ""),
+                "payment_method": r.payment_method,
+                "amount": f"{_to_decimal(r.amount):.2f}",
+                "note": (r.note or "")[:120],
+            })
+        for r in ir_qs.order_by("-refunded_at")[:lim]:
+            refund_rows.append({
+                "kind": "item_refund",
+                "id": str(r.id),
+                "order_id": str(r.order_id),
+                "refunded_at": str(r.refunded_at or ""),
+                "payment_method": r.payment_method,
+                "amount": f"{_to_decimal(r.amount):.2f}",
+                "note": (r.note or "")[:120],
+            })
+
         return {
             "date_from": date_from or "",
             "date_to": date_to or "",
             "totals": {k: f"{v:.2f}" for k, v in totals.items()},
             "rows": rows,
+            "refunds_total": f"{refunds_grand:.2f}",
+            "refunds_by_method": refunds_by_method,
+            "refund_rows": refund_rows,
         }
 
     def _build_excel(self, report_type: str, payload: dict) -> bytes:
         wb = Workbook()
-        ws = wb.active
-        ws.title = "Report"
 
         if report_type == "analytics":
-            ws.append(["Cafe analytics report"])
+            ws = wb.active
+            ws.title = "Сводка"
+            ws.append(["Аналитика кафе — сводка"])
             ws.append(["date_from", payload["date_from"]])
             ws.append(["date_to", payload["date_to"]])
             ws.append(["basis", payload.get("basis", "paid_at")])
             ws.append(["orders_count", payload["orders_count"]])
             ws.append(["items_qty", payload["items_qty"]])
             ws.append(["revenue", payload["revenue"]])
+            ws.append(["cogs_sold", payload.get("cogs_sold", "0.00")])
+            ws.append(["gross_profit", payload.get("gross_profit", "0.00")])
+            ws.append(["margin_percent", payload.get("margin_percent", 0)])
+            ws.append(["net_profit", payload.get("net_profit", "0.00")])
             ws.append(["purchases_count", payload["purchases_count"]])
             ws.append(["purchases_sum", payload["purchases_sum"]])
             ws.append(["cafe_expenses_count", payload.get("cafe_expenses_count", 0)])
             ws.append(["cafe_expenses_sum", payload.get("cafe_expenses_sum", "0.00")])
+            ws.append(["refunds_total", payload.get("refunds_total", "0.00")])
             ws.append(["low_stock_count", payload["low_stock_count"]])
             ws.append([])
-            ws.append(["Top menu items"])
-            ws.append(["title", "qty", "revenue"])
+            ws.append(["Возвраты по способу (refunded_at)"])
+            ws.append(["method", "method_label", "count", "total"])
+            for r in payload.get("refunds_by_method") or []:
+                ws.append([r.get("method"), r.get("method_label"), r.get("count"), r.get("total")])
+
+            w_in = wb.create_sheet("Приходы")
+            w_in.append(["order_id", "paid_at", "payment_method", "payment_method_label", "amount", "table_number"])
+            for row in payload.get("income_rows") or []:
+                w_in.append([
+                    row["order_id"],
+                    row["paid_at"],
+                    row["payment_method"],
+                    row.get("payment_method_label", ""),
+                    row["amount"],
+                    row.get("table_number", ""),
+                ])
+
+            w_pu = wb.create_sheet("Закупки")
+            w_pu.append(["id", "created_at", "supplier", "positions", "amount"])
+            for row in payload.get("purchase_rows") or []:
+                w_pu.append([row["id"], row["created_at"], row["supplier"], row["positions"], row["amount"]])
+
+            w_ex = wb.create_sheet("Прочие расходы")
+            w_ex.append(["id", "expense_date", "title", "category", "amount", "note"])
+            for row in payload.get("expense_rows") or []:
+                w_ex.append([row["id"], row["expense_date"], row["title"], row["category"], row["amount"], row["note"]])
+
+            w_rf = wb.create_sheet("Возвраты")
+            w_rf.append(["kind", "id", "order_id", "refunded_at", "payment_method", "amount", "note"])
+            for row in payload.get("refund_rows") or []:
+                w_rf.append([
+                    row["kind"],
+                    row["id"],
+                    row["order_id"],
+                    row["refunded_at"],
+                    row["payment_method"],
+                    row["amount"],
+                    row.get("note", ""),
+                ])
+
+            w_ed = wb.create_sheet("Расходы по дням")
+            w_ed.append(["date", "total", "count"])
+            for row in payload.get("expenses_by_day") or []:
+                w_ed.append([row["date"], row["total"], row["count"]])
+
+            w_top = wb.create_sheet("Топ блюд")
+            w_top.append(["title", "qty", "revenue"])
             for row in payload["top_items"]:
-                ws.append([row["title"], row["qty"], row["revenue"]])
+                w_top.append([row["title"], row["qty"], row["revenue"]])
         else:
-            ws.append(["Cafe cash report"])
+            ws = wb.active
+            ws.title = "Сводка"
+            ws.append(["Касса — сводка"])
             ws.append(["date_from", payload["date_from"]])
             ws.append(["date_to", payload["date_to"]])
             ws.append(["total_all", payload["totals"]["all"]])
@@ -1842,10 +2309,30 @@ class CafeAnalyticsExportView(CompanyBranchQuerysetMixin, APIView):
             ws.append(["total_card", payload["totals"]["card"]])
             ws.append(["total_transfer", payload["totals"]["transfer"]])
             ws.append(["total_other", payload["totals"]["other"]])
+            ws.append(["refunds_total", payload.get("refunds_total", "0.00")])
             ws.append([])
-            ws.append(["order_id", "paid_at", "payment_method", "final_amount"])
+            ws.append(["Возвраты по способу"])
+            ws.append(["method", "method_label", "count", "total"])
+            for r in payload.get("refunds_by_method") or []:
+                ws.append([r.get("method"), r.get("method_label"), r.get("count"), r.get("total")])
+
+            w_ord = wb.create_sheet("Оплаты")
+            w_ord.append(["order_id", "paid_at", "payment_method", "final_amount"])
             for row in payload["rows"]:
-                ws.append([row["order_id"], str(row["paid_at"] or ""), row["payment_method"], row["final_amount"]])
+                w_ord.append([row["order_id"], str(row["paid_at"] or ""), row["payment_method"], row["final_amount"]])
+
+            w_rf = wb.create_sheet("Возвраты")
+            w_rf.append(["kind", "id", "order_id", "refunded_at", "payment_method", "amount", "note"])
+            for row in payload.get("refund_rows") or []:
+                w_rf.append([
+                    row["kind"],
+                    row["id"],
+                    row["order_id"],
+                    row["refunded_at"],
+                    row["payment_method"],
+                    row["amount"],
+                    row.get("note", ""),
+                ])
 
         buf = BytesIO()
         wb.save(buf)
@@ -1857,6 +2344,10 @@ class CafeAnalyticsExportView(CompanyBranchQuerysetMixin, APIView):
                 f"<tr><td>{r['title']}</td><td>{r['qty']}</td><td>{r['revenue']}</td></tr>"
                 for r in payload["top_items"]
             )
+            inc = "".join(
+                f"<tr><td>{r['order_id']}</td><td>{r['paid_at']}</td><td>{r.get('payment_method_label', r['payment_method'])}</td><td>{r['amount']}</td></tr>"
+                for r in (payload.get("income_rows") or [])[:200]
+            )
             html = f"""
 <html><head><meta charset="utf-8"></head><body>
 <h2>Cafe analytics report</h2>
@@ -1866,11 +2357,21 @@ class CafeAnalyticsExportView(CompanyBranchQuerysetMixin, APIView):
 <p>orders_count: {payload["orders_count"]}</p>
 <p>items_qty: {payload["items_qty"]}</p>
 <p>revenue: {payload["revenue"]}</p>
+<p>cogs_sold: {payload.get("cogs_sold", "0.00")}</p>
+<p>gross_profit: {payload.get("gross_profit", "0.00")}</p>
+<p>margin_percent: {payload.get("margin_percent", 0)}</p>
+<p>net_profit: {payload.get("net_profit", "0.00")}</p>
 <p>purchases_count: {payload["purchases_count"]}</p>
 <p>purchases_sum: {payload["purchases_sum"]}</p>
 <p>cafe_expenses_count: {payload.get("cafe_expenses_count", 0)}</p>
 <p>cafe_expenses_sum: {payload.get("cafe_expenses_sum", "0.00")}</p>
+<p>refunds_total: {payload.get("refunds_total", "0.00")}</p>
 <p>low_stock_count: {payload["low_stock_count"]}</p>
+<h3>Приходы (фрагмент)</h3>
+<table border="1" cellspacing="0" cellpadding="4">
+<tr><th>order_id</th><th>paid_at</th><th>method</th><th>amount</th></tr>
+{inc}
+</table>
 <h3>Top menu items</h3>
 <table border="1" cellspacing="0" cellpadding="4">
 <tr><th>title</th><th>qty</th><th>revenue</th></tr>
@@ -1883,6 +2384,10 @@ class CafeAnalyticsExportView(CompanyBranchQuerysetMixin, APIView):
                 f"<tr><td>{r['order_id']}</td><td>{r['paid_at']}</td><td>{r['payment_method']}</td><td>{r['final_amount']}</td></tr>"
                 for r in payload["rows"]
             )
+            rrows = "".join(
+                f"<tr><td>{r.get('kind')}</td><td>{r['order_id']}</td><td>{r['refunded_at']}</td><td>{r['amount']}</td></tr>"
+                for r in (payload.get("refund_rows") or [])[:200]
+            )
             html = f"""
 <html><head><meta charset="utf-8"></head><body>
 <h2>Cafe cash report</h2>
@@ -1893,10 +2398,16 @@ class CafeAnalyticsExportView(CompanyBranchQuerysetMixin, APIView):
 <p>total_card: {payload["totals"]["card"]}</p>
 <p>total_transfer: {payload["totals"]["transfer"]}</p>
 <p>total_other: {payload["totals"]["other"]}</p>
+<p>refunds_total: {payload.get("refunds_total", "0.00")}</p>
 <h3>Orders</h3>
 <table border="1" cellspacing="0" cellpadding="4">
 <tr><th>order_id</th><th>paid_at</th><th>payment_method</th><th>final_amount</th></tr>
 {rows}
+</table>
+<h3>Возвраты</h3>
+<table border="1" cellspacing="0" cellpadding="4">
+<tr><th>kind</th><th>order_id</th><th>refunded_at</th><th>amount</th></tr>
+{rrows}
 </table>
 </body></html>
 """
@@ -1919,9 +2430,9 @@ class CafeAnalyticsExportView(CompanyBranchQuerysetMixin, APIView):
             return Response({"detail": "format должен быть excel или word"}, status=400)
 
         payload = (
-            self._analytics_payload(company, branch, date_from, date_to)
+            self._analytics_payload(company, branch, date_from, date_to, request)
             if report_type == "analytics"
-            else self._cash_payload(company, branch, date_from, date_to)
+            else self._cash_payload(company, branch, date_from, date_to, request)
         )
 
         date_tag = datetime.now().strftime("%Y%m%d_%H%M")

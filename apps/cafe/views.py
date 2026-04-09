@@ -39,7 +39,7 @@ from .serializers import (
     CategorySerializer, MenuItemSerializer, IngredientInlineSerializer,
     OrderSerializer, OrderItemInlineSerializer,
     CafeClientSerializer,
-    OrderHistorySerializer,
+    OrderHistorySerializer, OrderHistoryUpdateSerializer,
     KitchenTaskSerializer, NotificationCafeSerializer,
     InventorySessionSerializer, EquipmentSerializer,
     EquipmentInventorySessionSerializer, KitchenSerializer,
@@ -517,6 +517,41 @@ class OrderHistoryListView(CompanyBranchQuerysetMixin, generics.ListAPIView):
         return qs.order_by("-created_at")
 
 
+class OrderHistoryRetrieveUpdateView(CompanyBranchQuerysetMixin, generics.RetrieveUpdateAPIView):
+    """
+    GET/PATCH /cafe/orders/history/<uuid:pk>/
+    Чтение — как у списка; правка снимка — только владелец/админ/staff.
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get_serializer_class(self):
+        if self.request.method in ("PUT", "PATCH"):
+            return OrderHistoryUpdateSerializer
+        return OrderHistorySerializer
+
+    def get_queryset(self):
+        company = self._user_company()
+        if not company:
+            return OrderHistory.objects.none()
+        qs = (
+            OrderHistory.objects.filter(company=company)
+            .select_related("client", "table", "waiter", "company")
+            .prefetch_related("items")
+        )
+        active_branch = self._active_branch()
+        if active_branch is not None:
+            qs = qs.filter(Q(branch=active_branch) | Q(branch__isnull=True))
+        return qs.order_by("-created_at")
+
+    def update(self, request, *args, **kwargs):
+        if not _is_owner_like(request.user):
+            return Response(
+                {"detail": "Редактирование архива доступно только владельцу или администратору."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+        return super().update(request, *args, **kwargs)
+
+
 # ==================== Zone ====================
 class ZoneListCreateView(CompanyBranchQuerysetMixin, generics.ListCreateAPIView):
     queryset = Zone.objects.all()
@@ -605,6 +640,58 @@ class WarehouseRetrieveUpdateDestroyView(CompanyBranchQuerysetMixin, generics.Re
             if "uniq_warehouse_title_" in msg:
                 raise ValidationError({"title": "Склад с таким названием уже существует в этой компании или филиале."})
             raise
+
+
+class WarehouseStockAdjustView(CompanyBranchQuerysetMixin, APIView):
+    """
+    POST /cafe/warehouse/<uuid:pk>/adjust/
+    Тело: {"remainder": "12.5"} — зафиксировать остаток, или {"adjust_by": "-0.5"} — изменить на дельту.
+    Доступ: владелец / администратор / staff (см. apps.utils._is_owner_like).
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request, pk):
+        if not _is_owner_like(request.user):
+            return Response(
+                {"detail": "Недостаточно прав для корректировки склада."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+        company = self._user_company()
+        if not company:
+            return Response({"detail": "Компания не найдена."}, status=status.HTTP_403_FORBIDDEN)
+        wh = generics.get_object_or_404(Warehouse.objects.filter(company=company), pk=pk)
+        active_branch = self._active_branch()
+        if active_branch is not None:
+            if wh.branch_id not in (None, active_branch.id):
+                return Response({"detail": "Позиция другого филиала."}, status=status.HTTP_404_NOT_FOUND)
+        else:
+            if wh.branch_id is not None:
+                return Response(
+                    {"detail": "Позиция привязана к филиалу — выберите филиал в контексте запроса."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+        current = _decimal_from_warehouse_remainder(wh.remainder)
+        new_val = None
+        if "remainder" in request.data and request.data.get("remainder") is not None:
+            try:
+                raw = request.data.get("remainder")
+                new_val = Decimal(str(raw).replace(",", ".").strip())
+            except Exception:
+                return Response({"detail": "Некорректное значение remainder."}, status=status.HTTP_400_BAD_REQUEST)
+        elif "adjust_by" in request.data and request.data.get("adjust_by") is not None:
+            try:
+                delta = Decimal(str(request.data.get("adjust_by")).replace(",", ".").strip())
+            except Exception:
+                return Response({"detail": "Некорректное значение adjust_by."}, status=status.HTTP_400_BAD_REQUEST)
+            new_val = current + delta
+        else:
+            return Response({"detail": "Укажите remainder или adjust_by."}, status=status.HTTP_400_BAD_REQUEST)
+
+        wh.remainder = str(new_val)
+        wh.save(update_fields=["remainder"])
+        invalidate_cafe_analytics_cache(company.id)
+        return Response(WarehouseSerializer(wh, context={"request": request}).data, status=status.HTTP_200_OK)
 
 
 # ==================== Purchase ====================

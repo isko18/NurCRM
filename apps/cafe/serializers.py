@@ -530,10 +530,12 @@ class MenuItemSerializer(CompanyBranchReadOnlyMixin):
         if vat is not None and vat > 100:
             raise serializers.ValidationError({"vat_percent": "НДС не может быть больше 100%."})
 
-        # Валидация прочих расходов
+        # Валидация прочих расходов (отрицательные — только владелец/админ/staff)
         other = attrs.get("other_expenses")
-        if other is not None and other < 0:
-            raise serializers.ValidationError({"other_expenses": "Прочие расходы не могут быть отрицательными."})
+        if other is not None and other < 0 and not _is_owner_like(self._user()):
+            raise serializers.ValidationError(
+                {"other_expenses": "Отрицательные прочие расходы доступны только владельцу или администратору."}
+            )
 
         return attrs
 
@@ -763,6 +765,24 @@ class OrderHistorySerializer(serializers.ModelSerializer):
             "canceled_at", "canceled_by", "canceled_by_label",
         ]
         read_only_fields = fields
+
+
+class OrderHistoryUpdateSerializer(serializers.ModelSerializer):
+    """Корректировка снимка архива (только владелец/админ; проверка во view)."""
+
+    class Meta:
+        model = OrderHistory
+        fields = [
+            "waiter_label", "table_number", "guests",
+            "total_amount", "discount_amount", "paid_amount", "refunded_amount",
+            "payment_method", "status", "is_paid", "paid_at",
+        ]
+
+    def validate_status(self, value):
+        allowed = {c[0] for c in OrderHistory.STATUS_CHOICES}
+        if value not in allowed:
+            raise serializers.ValidationError("Недопустимый статус.")
+        return value
 
 
 class CafeClientSerializer(CompanyBranchReadOnlyMixin):

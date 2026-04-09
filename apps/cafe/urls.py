@@ -6,13 +6,13 @@ from .views import (
     ReceiptPrinterSettingsView,
     # Clients + nested client orders
     CafeClientListCreateView, CafeClientRetrieveUpdateDestroyView, ClientOrderListCreateView,
-    ClientOrderHistoryListView, OrderHistoryListView,
+    ClientOrderHistoryListView, OrderHistoryListView, OrderHistoryRetrieveUpdateView,
 
     # Zones / Tables / Bookings / Warehouse / Purchases / Categories / Menu Items / Ingredients / Orders / Order Items
     ZoneListCreateView, ZoneRetrieveUpdateDestroyView,
     TableListCreateView, TableRetrieveUpdateDestroyView,
     BookingListCreateView, BookingRetrieveUpdateDestroyView,
-    WarehouseListCreateView, WarehouseRetrieveUpdateDestroyView,
+    WarehouseListCreateView, WarehouseRetrieveUpdateDestroyView, WarehouseStockAdjustView,
     PurchaseListCreateView, PurchaseRetrieveUpdateDestroyView,
     CategoryListCreateView, CategoryRetrieveUpdateDestroyView,
     MenuItemListCreateView, MenuItemRetrieveUpdateDestroyView,
@@ -38,7 +38,7 @@ from apps.cafe.analytics import (
     SalesSummaryView, SalesByMenuItemView, SalesByCategoryView,
     SalesByKitchenView, RevenueInflowView, RejectionsAnalyticsView,
     CancelledOrdersAnalyticsView,
-    CafeExpensesSummaryView, CafeDebtAnalyticsView,
+    CafeExpensesSummaryView, CafeFinanceAnalyticsView, CafeDebtAnalyticsView,
     CafeShiftReportView, CafeDailyCloseReportView, CafeWaiterSalaryReportView,
     CafeUnifiedAnalyticsView, CafeWaiterSalesView,
     PurchasesSummaryView, PurchasesBySupplierView,
@@ -77,6 +77,7 @@ urlpatterns = [
     # === Warehouse ===
     path("warehouse/", WarehouseListCreateView.as_view(), name="warehouse-list"),
     path("warehouse/<uuid:pk>/", WarehouseRetrieveUpdateDestroyView.as_view(), name="warehouse-detail"),
+    path("warehouse/<uuid:pk>/adjust/", WarehouseStockAdjustView.as_view(), name="warehouse-stock-adjust"),
 
     # === Purchases ===
     path("purchases/", PurchaseListCreateView.as_view(), name="purchase-list"),
@@ -115,6 +116,7 @@ urlpatterns = [
     path("orders/closed/", OrderClosedListView.as_view(), name="cafe_orders_closed"),
     # Общая история заказов компании
     path("orders/history/", OrderHistoryListView.as_view(), name="order-history"),
+    path("orders/history/<uuid:pk>/", OrderHistoryRetrieveUpdateView.as_view(), name="order-history-detail"),
 
     # === Order items ===
     path("order-items/", OrderItemListCreateView.as_view(), name="orderitem-list"),
@@ -170,6 +172,7 @@ urlpatterns = [
     path("analytics/rejections/", RejectionsAnalyticsView.as_view(), name="cafe-analytics-rejections"),
     path("analytics/orders/cancelled/", CancelledOrdersAnalyticsView.as_view(), name="cafe-analytics-orders-cancelled"),
     path("analytics/expenses/summary/", CafeExpensesSummaryView.as_view(), name="cafe-analytics-expenses-summary"),
+    path("analytics/finance/", CafeFinanceAnalyticsView.as_view(), name="cafe-analytics-finance"),
     path("analytics/debts/", CafeDebtAnalyticsView.as_view(), name="cafe-analytics-debts"),
     path("analytics/shift-report/", CafeShiftReportView.as_view(), name="cafe-analytics-shift-report"),
     path("analytics/daily-close/", CafeDailyCloseReportView.as_view(), name="cafe-analytics-daily-close"),
