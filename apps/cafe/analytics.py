@@ -25,7 +25,7 @@ from django.utils import timezone
 
 from apps.cafe.models import (
     KitchenTask, OrderItem, Purchase, Warehouse, Order, MenuItem,
-    CafeExpense, CafeWaiterPayProfile,
+    CafeExpense, CafeWaiterPayProfile, OrderItemRefund, OrderRefund,
 )
 from apps.cafe.views import CompanyBranchQuerysetMixin
 from openpyxl import Workbook
@@ -843,7 +843,12 @@ class RevenueInflowView(CompanyBranchQuerysetMixin, APIView):
 
 
 class RejectionsAnalyticsView(CompanyBranchQuerysetMixin, APIView):
-    """Отказы гостя: количество и суммы (по цене на момент отказа не пересчитываем — считаем потенциальную выручку)."""
+    """
+    Отказы гостя + денежные возвраты (по позиции и по чеку) за период по дате события.
+
+    Отказы: rejected_at, потенциальная выручка по цене строки.
+    Возвраты: refunded_at, сумма фактического возврата; группировка по примечанию и способу возврата.
+    """
     permission_classes = [permissions.IsAuthenticated]
 
     def get(self, request):
@@ -874,7 +879,7 @@ class RejectionsAnalyticsView(CompanyBranchQuerysetMixin, APIView):
                 lost_revenue=Sum(line_total),
                 last_rejected_at=Max("rejected_at"),
             )
-            .order_by("-lost_revenue")[:200]
+            .order_by("-lost_revenue")
         )
 
         user = getattr(request, "user", None)
@@ -884,17 +889,74 @@ class RejectionsAnalyticsView(CompanyBranchQuerysetMixin, APIView):
             email = getattr(user, "email", "") or ""
             employee_name = full or email or str(getattr(user, "id", "") or "")
 
-        return Response([
+        pm_labels = dict(OrderRefund._meta.get_field("payment_method").choices)
+
+        ir_qs = OrderItemRefund.objects.filter(company=company)
+        if branch is not None:
+            ir_qs = ir_qs.filter(Q(order__branch=branch) | Q(order__branch__isnull=True))
+        else:
+            ir_qs = ir_qs.filter(order__branch__isnull=True)
+        ir_qs, _ = _apply_waiter_scope(ir_qs, request, "order__waiter_id")
+        ir_qs = _apply_date_range(ir_qs, "refunded_at", df, dt)
+        by_item_refund = ir_qs.values("note", "payment_method").annotate(
+            qty=Sum("quantity"),
+            lost_revenue=Sum("amount"),
+            last_refunded_at=Max("refunded_at"),
+        )
+
+        or_qs = OrderRefund.objects.filter(company=company)
+        if branch is not None:
+            or_qs = or_qs.filter(Q(order__branch=branch) | Q(order__branch__isnull=True))
+        else:
+            or_qs = or_qs.filter(order__branch__isnull=True)
+        or_qs, _ = _apply_waiter_scope(or_qs, request, "order__waiter_id")
+        or_qs = _apply_date_range(or_qs, "refunded_at", df, dt)
+        by_order_refund = or_qs.values("note", "payment_method").annotate(
+            qty=Count("id"),
+            lost_revenue=Sum("amount"),
+            last_refunded_at=Max("refunded_at"),
+        )
+
+        rows = [
             {
                 "rejection_reason": (row["rejection_reason"] or "").strip() or "—",
                 "qty": int(row["qty"] or 0),
                 "lost_revenue": f"{_to_decimal(row['lost_revenue']):.2f}",
                 "employee_name": employee_name,
-                # раньше подставлялся timezone.now() — дата менялась при каждом обновлении страницы
                 "created_at": row["last_rejected_at"],
+                "row_kind": "guest_rejection",
             }
             for row in by_reason
-        ])
+        ]
+
+        for row in by_item_refund:
+            note = (row.get("note") or "").strip()
+            pm = pm_labels.get(row.get("payment_method") or "", row.get("payment_method") or "")
+            reason = f"Возврат по позиции: {note} ({pm})" if note else f"Возврат по позиции ({pm})"
+            rows.append({
+                "rejection_reason": reason,
+                "qty": int(row["qty"] or 0),
+                "lost_revenue": f"{_to_decimal(row['lost_revenue']):.2f}",
+                "employee_name": employee_name,
+                "created_at": row["last_refunded_at"],
+                "row_kind": "item_refund",
+            })
+
+        for row in by_order_refund:
+            note = (row.get("note") or "").strip()
+            pm = pm_labels.get(row.get("payment_method") or "", row.get("payment_method") or "")
+            reason = f"Возврат по чеку: {note} ({pm})" if note else f"Возврат по чеку ({pm})"
+            rows.append({
+                "rejection_reason": reason,
+                "qty": int(row["qty"] or 0),
+                "lost_revenue": f"{_to_decimal(row['lost_revenue']):.2f}",
+                "employee_name": employee_name,
+                "created_at": row["last_refunded_at"],
+                "row_kind": "order_refund",
+            })
+
+        rows.sort(key=lambda r: _to_decimal(r["lost_revenue"]), reverse=True)
+        return Response(rows[:200])
 
 
 class CancelledOrdersAnalyticsView(CompanyBranchQuerysetMixin, APIView):
