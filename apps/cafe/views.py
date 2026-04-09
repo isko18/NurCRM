@@ -21,6 +21,7 @@ import logging
 logger = logging.getLogger(__name__)
 
 from apps.users.models import Branch
+from .cache_utils import invalidate_cafe_analytics_cache
 from .models import (
     Zone, Table, Booking, Warehouse, Purchase,
     Category, MenuItem, Ingredient,
@@ -1027,6 +1028,8 @@ def _cafe_order_checkout_payload(order: Order) -> dict:
         "paid_amount": str(order.paid_amount or Decimal("0")),
         "refunded_amount": str(order.refunded_amount or Decimal("0")),
         "net_paid_amount": str(order.net_paid_amount),
+        "has_refunds": order.has_refunds,
+        "is_fully_refunded": order.is_fully_refunded,
         "balance_due": str(order.balance_due),
         "cash_shift_id": str(order.cash_shift_id) if order.cash_shift_id else None,
     }
@@ -1327,6 +1330,7 @@ class OrderPayView(CompanyBranchQuerysetMixin, APIView):
 
             _cafe_archive_order_snapshot(order)
 
+        invalidate_cafe_analytics_cache(order.company_id)
         send_order_updated_notification(order)
 
         return Response(_cafe_order_checkout_payload(order), status=status.HTTP_200_OK)
@@ -1431,6 +1435,7 @@ class OrderPayDebtView(CompanyBranchQuerysetMixin, APIView):
 
             _cafe_archive_order_snapshot(order)
 
+        invalidate_cafe_analytics_cache(order.company_id)
         send_order_updated_notification(order)
         return Response(_cafe_order_checkout_payload(order), status=status.HTTP_200_OK)
 
@@ -1534,6 +1539,7 @@ class OrderRefundView(CompanyBranchQuerysetMixin, APIView):
             order.save(update_fields=["refunded_amount", "updated_at"])
             _cafe_archive_order_snapshot(order)
 
+        invalidate_cafe_analytics_cache(order.company_id)
         send_order_updated_notification(order)
         return Response(_cafe_order_checkout_payload(order), status=status.HTTP_200_OK)
 
@@ -1653,6 +1659,7 @@ class OrderItemRefundView(CompanyBranchQuerysetMixin, APIView):
             order.save(update_fields=["refunded_amount", "updated_at"])
             _cafe_archive_order_snapshot(order)
 
+        invalidate_cafe_analytics_cache(order.company_id)
         send_order_updated_notification(order)
         return Response(_cafe_order_checkout_payload(order), status=status.HTTP_200_OK)
 

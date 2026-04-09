@@ -748,6 +748,11 @@ class OrderItemHistorySerializer(serializers.ModelSerializer):
 
 class OrderHistorySerializer(serializers.ModelSerializer):
     items = OrderItemHistorySerializer(many=True, read_only=True)
+    net_paid_amount = serializers.DecimalField(
+        max_digits=12, decimal_places=2, read_only=True, source="net_paid_amount"
+    )
+    has_refunds = serializers.BooleanField(read_only=True)
+    is_fully_refunded = serializers.BooleanField(read_only=True)
 
     class Meta:
         model = OrderHistory
@@ -755,7 +760,8 @@ class OrderHistorySerializer(serializers.ModelSerializer):
             "id", "original_order_id", "company", "branch", "client",
             "table", "table_number", "waiter", "waiter_label",
             "guests", "created_at", "archived_at", "items",
-            "status", "is_paid", "paid_at", "payment_method", "total_amount", "discount_amount", "paid_amount",
+            "status", "is_paid", "paid_at", "payment_method", "total_amount", "discount_amount",
+            "paid_amount", "refunded_amount", "net_paid_amount", "has_refunds", "is_fully_refunded",
             "canceled_at", "canceled_by", "canceled_by_label",
         ]
         read_only_fields = fields
@@ -785,6 +791,10 @@ class OrderSerializer(CompanyBranchReadOnlyMixin):
     waiter = serializers.PrimaryKeyRelatedField(queryset=User.objects.all(), allow_null=True, required=False)
     items = OrderItemInlineSerializer(many=True, required=False)
     balance_due = serializers.DecimalField(max_digits=12, decimal_places=2, read_only=True)
+    refunded_amount = serializers.DecimalField(max_digits=12, decimal_places=2, read_only=True)
+    net_paid_amount = serializers.DecimalField(max_digits=12, decimal_places=2, read_only=True, source="net_paid_amount")
+    has_refunds = serializers.BooleanField(read_only=True)
+    is_fully_refunded = serializers.BooleanField(read_only=True)
     cash_shift_id = serializers.UUIDField(read_only=True, allow_null=True)
     canceled_by_label = serializers.SerializerMethodField()
 
@@ -795,13 +805,15 @@ class OrderSerializer(CompanyBranchReadOnlyMixin):
             "id", "company", "branch", "table", "client", "waiter", "guests", "created_at",
             "table_session_id", "check_label",
             "status", "is_paid", "paid_at", "payment_method", "total_amount", "discount_amount",
-            "paid_amount", "balance_due", "cash_shift_id",
+            "paid_amount", "refunded_amount", "net_paid_amount", "has_refunds", "is_fully_refunded",
+            "balance_due", "cash_shift_id",
             "canceled_at", "canceled_by", "canceled_by_label",
             "items",
         ]
         read_only_fields = [
-            "is_paid", "paid_at", "payment_method", "total_amount", "paid_amount", "balance_due",
-            "cash_shift_id",
+            "is_paid", "paid_at", "payment_method", "total_amount", "paid_amount",
+            "refunded_amount", "net_paid_amount", "has_refunds", "is_fully_refunded",
+            "balance_due", "cash_shift_id",
             "canceled_at", "canceled_by", "canceled_by_label",
         ]
 

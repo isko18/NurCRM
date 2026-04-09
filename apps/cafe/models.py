@@ -709,6 +709,8 @@ class Ingredient(models.Model):
 # ==========================
 class Order(models.Model):
     class Status(models.TextChoices):
+        # «Отменён» — заказ не проведён как продажа (до оплаты / void). Возврат денег после оплаты
+        # статус не меняет: остаётся «Закрыт», учёт — в refunded_amount и записях возврата.
         OPEN = "open", "Открыт"
         CLOSED = "closed", "Закрыт"
         CANCELLED = "cancelled", "Отменен"
@@ -841,7 +843,18 @@ class Order(models.Model):
         """Оплачено за вычетом возвратов (без создания долга)."""
         net = (self.paid_amount or Decimal("0")) - (self.refunded_amount or Decimal("0"))
         return net.quantize(Decimal("0.01")) if net > 0 else Decimal("0")
-    
+
+    @property
+    def has_refunds(self) -> bool:
+        return (self.refunded_amount or Decimal("0")) > Decimal("0")
+
+    @property
+    def is_fully_refunded(self) -> bool:
+        """Все внесённые по заказу деньги возвращены (заказ при этом остаётся closed)."""
+        paid = (self.paid_amount or Decimal("0")).quantize(Decimal("0.01"))
+        ref = (self.refunded_amount or Decimal("0")).quantize(Decimal("0.01"))
+        return paid > Decimal("0") and ref >= paid
+
     def clean(self):
         if self.company_id:
             if self.table and self.table.company_id != self.company_id:
@@ -1016,6 +1029,21 @@ class OrderHistory(models.Model):
 
     def __str__(self):
         return f'OrderHistory {str(self.original_order_id)[:8]} — клиент: {self.client or "—"}'
+
+    @property
+    def net_paid_amount(self) -> Decimal:
+        net = (self.paid_amount or Decimal("0")) - (self.refunded_amount or Decimal("0"))
+        return net.quantize(Decimal("0.01")) if net > 0 else Decimal("0")
+
+    @property
+    def has_refunds(self) -> bool:
+        return (self.refunded_amount or Decimal("0")) > Decimal("0")
+
+    @property
+    def is_fully_refunded(self) -> bool:
+        paid = (self.paid_amount or Decimal("0")).quantize(Decimal("0.01"))
+        ref = (self.refunded_amount or Decimal("0")).quantize(Decimal("0.01"))
+        return paid > Decimal("0") and ref >= paid
 
 
 class OrderItemHistory(models.Model):

@@ -137,6 +137,15 @@ def _apply_datetime_range_calendar_days(qs, field_name: str, date_from: str | No
     return qs
 
 
+def _rejections_row_sort_key(row: dict):
+    """Сортировка строк отчёта отказов/возвратов: сначала по дате (новее выше), затем по сумме."""
+    ev = row.get("created_at")
+    rev = _to_decimal(row.get("lost_revenue"))
+    if isinstance(ev, datetime):
+        return (True, ev, rev)
+    return (False, None, rev)
+
+
 def _paid_order_lines_qs(company, branch):
     """Оплаченные заказы: выручка по факту оплаты, без отказов гостя."""
     qs = OrderItem.objects.select_related(
@@ -1057,7 +1066,7 @@ class RejectionsAnalyticsView(CompanyBranchQuerysetMixin, APIView):
                 "row_kind": "order_refund",
             })
 
-        rows.sort(key=lambda r: _to_decimal(r["lost_revenue"]), reverse=True)
+        rows.sort(key=_rejections_row_sort_key, reverse=True)
         rows = rows[:200]
 
         item_refunds_total = _to_decimal(ir_qs.aggregate(t=Sum("amount")).get("t"))
