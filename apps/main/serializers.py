@@ -18,7 +18,7 @@ from apps.main.models import (
     ObjectItem, ObjectSale, ObjectSaleItem, ItemMake, ManufactureSubreal, Acceptance,
     ReturnFromAgent, ProductImage, PromoRule, AgentRequestCart, AgentRequestItem,
     ProductPackage, ProductCharacteristics, DealPayment, AgentSaleAllocation,
-    ProductRecipeItem, ProductPromotionTier,
+    ProductRecipeItem, ProductPromotionTier, MarketSaleEmployeePayProfile,
 )
 
 from apps.consalting.models import ServicesConsalting
@@ -2952,3 +2952,58 @@ class AgentRequestCartSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSe
         super().update(instance, {})  # чтобы миксин прописал company/branch
         instance.save(update_fields=["client", "note", "branch", "updated_at"])
         return instance
+
+
+class MarketSaleEmployeePayProfileSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
+    company = serializers.ReadOnlyField(source="company.id")
+    branch = serializers.ReadOnlyField(source="branch.id")
+
+    class Meta:
+        model = MarketSaleEmployeePayProfile
+        fields = [
+            "id",
+            "company",
+            "branch",
+            "user",
+            "pay_scheme",
+            "monthly_base_salary",
+            "sales_percent",
+        ]
+        read_only_fields = ["id", "company"]
+
+    def get_fields(self):
+        fields = super().get_fields()
+        company = self._user_company()
+        if company and hasattr(User, "company_id"):
+            fields["user"].queryset = User.objects.filter(company_id=company.id)
+        return fields
+
+    def validate(self, attrs):
+        data = super().validate(attrs)
+        scheme = data.get("pay_scheme")
+        if scheme is None and self.instance:
+            scheme = self.instance.pay_scheme
+        base = data.get("monthly_base_salary")
+        if base is None and self.instance:
+            base = self.instance.monthly_base_salary
+        pct = data.get("sales_percent")
+        if pct is None and self.instance:
+            pct = self.instance.sales_percent
+        base = base or Decimal("0")
+        pct = pct or Decimal("0")
+        if scheme == MarketSaleEmployeePayProfile.PayScheme.SALARY:
+            if base <= 0:
+                raise serializers.ValidationError(
+                    {"monthly_base_salary": "Для схемы «Оклад» укажите оклад больше 0."}
+                )
+        elif scheme == MarketSaleEmployeePayProfile.PayScheme.PERCENT:
+            if pct <= 0:
+                raise serializers.ValidationError(
+                    {"sales_percent": "Для схемы «Процент» укажите процент больше 0."}
+                )
+        elif scheme == MarketSaleEmployeePayProfile.PayScheme.SALARY_PLUS_PERCENT:
+            if base <= 0 or pct <= 0:
+                raise serializers.ValidationError(
+                    "Для схемы «Оклад + процент» задайте и оклад, и процент больше 0."
+                )
+        return data

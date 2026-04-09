@@ -543,8 +543,13 @@ class AnalyticsView(APIView):
             data = self._users_analytics(request, company, branch, period)
         elif tab == "finance":
             data = self._finance(request, company, branch, period)
+        elif tab == "salary":
+            data = self._salary(request, company, branch, period)
         else:
-            return Response({"detail": "Unknown tab. Use: sales|stock|cashboxes|shifts|products|users|finance"}, status=400)
+            return Response(
+                {"detail": "Unknown tab. Use: sales|stock|cashboxes|shifts|products|users|finance|salary"},
+                status=400,
+            )
 
         ttl = getattr(settings, "CACHE_TIMEOUT_ANALYTICS", getattr(settings, "CACHE_TIMEOUT_MEDIUM", 300))
         cache.set(ck, data, ttl)
@@ -1975,4 +1980,103 @@ class AnalyticsView(APIView):
                 "expense_items": expense_items,  # НОВОЕ: полный детальный список
                 "income_items": income_items,    # НОВОЕ: полный детальный список
             },
+        }
+
+    # ─────────────────────────────────────────────────────────
+    # SALARY (продавцы по чекам Sale.user)
+    # ─────────────────────────────────────────────────────────
+    def _salary(self, request, company, branch, period: Period):
+        from apps.main.models import MarketSaleEmployeePayProfile
+
+        Sale, _sale_item = get_sale_models()
+        days = (period.end - period.start).days
+        if days < 1:
+            days = 1
+
+        if Sale is None:
+            return {
+                "tab": "salary",
+                "period": {"from": period.start.isoformat(), "to": period.end.isoformat()},
+                "rows": [],
+                "detail": "Модель продаж не найдена.",
+            }
+
+        prof_qs = MarketSaleEmployeePayProfile.objects.filter(company=company)
+        if branch is not None:
+            prof_qs = prof_qs.filter(Q(branch=branch) | Q(branch__isnull=True))
+        else:
+            prof_qs = prof_qs.filter(branch__isnull=True)
+
+        effective_profiles: dict = {}
+        for prof in prof_qs.select_related("user").order_by("user_id", "-branch_id"):
+            if prof.user_id not in effective_profiles or prof.branch_id is not None:
+                effective_profiles[prof.user_id] = prof
+
+        paid_value = _choice_value(Sale, "Status", "PAID", "paid")
+        dt_field = "paid_at" if _model_has_field(Sale, "paid_at") else "created_at"
+
+        rows = []
+        for prof in effective_profiles.values():
+            sq = Sale.objects.filter(company=company, user_id=prof.user_id)
+            sq = sq.filter(status=paid_value)
+            sq = sq.filter(**{f"{dt_field}__gte": period.start, f"{dt_field}__lt": period.end})
+
+            if branch is not None and _model_has_field(Sale, "branch"):
+                if self._include_global(request):
+                    sq = sq.filter(Q(branch=branch) | Q(branch__isnull=True))
+                else:
+                    sq = sq.filter(branch=branch)
+            elif branch is None and _model_has_field(Sale, "branch"):
+                sq = sq.filter(branch__isnull=True)
+
+            agg = sq.aggregate(
+                s=Coalesce(
+                    Sum("total"),
+                    Value(Z_MONEY, output_field=MONEY_FIELD),
+                    output_field=MONEY_FIELD,
+                )
+            )
+            sales_total = agg["s"] or Z_MONEY
+
+            base_part = ((prof.monthly_base_salary or Z_MONEY) * Decimal(days) / Decimal("30")).quantize(
+                Decimal("0.01")
+            )
+            pct = (prof.sales_percent or Z_MONEY) / Decimal("100")
+            bonus = (sales_total * pct).quantize(Decimal("0.01"))
+
+            scheme = prof.pay_scheme
+            if scheme == MarketSaleEmployeePayProfile.PayScheme.SALARY:
+                total_pay = base_part
+            elif scheme == MarketSaleEmployeePayProfile.PayScheme.PERCENT:
+                total_pay = bonus
+            else:
+                total_pay = (base_part + bonus).quantize(Decimal("0.01"))
+
+            user = prof.user
+            label = _user_label(user)
+            rows.append(
+                {
+                    "user_id": str(prof.user_id),
+                    "employee_label": label,
+                    "profile_scope": "branch" if prof.branch_id else "global",
+                    "pay_scheme": prof.pay_scheme,
+                    "pay_scheme_label": prof.get_pay_scheme_display(),
+                    "monthly_base_salary": str(prof.monthly_base_salary),
+                    "sales_percent": str(prof.sales_percent),
+                    "period_days": days,
+                    "base_prorated": str(base_part),
+                    "employee_sales_period": str(_money(sales_total)),
+                    "percent_bonus": str(bonus),
+                    "total": str(total_pay),
+                }
+            )
+
+        rows.sort(key=lambda r: r["employee_label"].lower())
+        return {
+            "tab": "salary",
+            "period": {"from": period.start.isoformat(), "to": period.end.isoformat()},
+            "filters": {
+                "branch": str(getattr(branch, "id", "")) if branch else None,
+            },
+            "rows": rows,
         }

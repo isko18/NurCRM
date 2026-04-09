@@ -255,6 +255,16 @@ urlpatterns = [
     
     
     path("analytics/market/", AnalyticsView.as_view(), name="analytics"),
+    path(
+        "market-sale-employee-pay-profiles/",
+        MarketSaleEmployeePayProfileListCreateAPIView.as_view(),
+        name="market-sale-employee-pay-profile-list",
+    ),
+    path(
+        "market-sale-employee-pay-profiles/<uuid:pk>/",
+        MarketSaleEmployeePayProfileRetrieveUpdateDestroyAPIView.as_view(),
+        name="market-sale-employee-pay-profile-detail",
+    ),
 
     path("public/companies/<slug:slug>/", PublicCompanyAPIView.as_view()),
     path("public/companies/<slug:slug>/showcase/", PublicCompanyShowcaseAPIView.as_view()),

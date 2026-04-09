@@ -37,6 +37,7 @@ from apps.main.models import (
     AgentRequestCart, AgentRequestItem, ProductPackage, ProductCharacteristics, DealPayment,
     ProductRecipeItem,
     ProductFavorite,
+    MarketSaleEmployeePayProfile,
 )
 from apps.main.serializers import (
     ContactSerializer, PipelineSerializer, DealSerializer, TaskSerializer,
@@ -54,7 +55,8 @@ from apps.main.serializers import (
     AgentProductOnHandSerializer, AgentWithProductsSerializer, GlobalProductReadSerializer,
     ProductImageSerializer,
     AgentRequestCartApproveSerializer, AgentRequestCartRejectSerializer,
-    AgentRequestCartSerializer, AgentRequestCartSubmitSerializer, AgentRequestItemSerializer, DealPayInputSerializer, DealRefundInputSerializer
+    AgentRequestCartSerializer, AgentRequestCartSubmitSerializer, AgentRequestItemSerializer, DealPayInputSerializer, DealRefundInputSerializer,
+    MarketSaleEmployeePayProfileSerializer,
 )
 from django.db.models import ProtectedError
 from apps.utils import product_images_prefetch, _is_owner_like
@@ -958,6 +960,46 @@ class ProductFavoriteAPIView(CompanyBranchRestrictedMixin, APIView):
             ProductFavorite.objects.filter(company=fav_company, product=product).delete()
 
         return Response({"product_id": str(product.id), "is_favorite": is_fav}, status=status.HTTP_200_OK)
+
+
+class MarketSaleEmployeePayProfileListCreateAPIView(CompanyBranchRestrictedMixin, generics.ListCreateAPIView):
+    serializer_class = MarketSaleEmployeePayProfileSerializer
+    permission_classes = [permissions.IsAuthenticated]
+    filter_backends = [DjangoFilterBackend, filters.OrderingFilter]
+    filterset_fields = ["user", "branch"]
+    ordering_fields = ["id"]
+
+    def get_queryset(self):
+        company = self._company()
+        if not company:
+            return MarketSaleEmployeePayProfile.objects.none()
+        qs = MarketSaleEmployeePayProfile.objects.filter(company=company)
+        branch = self._auto_branch()
+        if branch is not None:
+            qs = qs.filter(Q(branch=branch) | Q(branch__isnull=True))
+        else:
+            qs = qs.filter(branch__isnull=True)
+        return qs.select_related("user", "branch").order_by("user_id", "-branch_id")
+
+    def perform_create(self, serializer):
+        serializer.save()
+
+
+class MarketSaleEmployeePayProfileRetrieveUpdateDestroyAPIView(CompanyBranchRestrictedMixin, generics.RetrieveUpdateDestroyAPIView):
+    serializer_class = MarketSaleEmployeePayProfileSerializer
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get_queryset(self):
+        company = self._company()
+        if not company:
+            return MarketSaleEmployeePayProfile.objects.none()
+        qs = MarketSaleEmployeePayProfile.objects.filter(company=company)
+        branch = self._auto_branch()
+        if branch is not None:
+            qs = qs.filter(Q(branch=branch) | Q(branch__isnull=True))
+        else:
+            qs = qs.filter(branch__isnull=True)
+        return qs.select_related("user", "branch")
 
 
 # ==========================

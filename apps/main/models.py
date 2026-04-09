@@ -3560,6 +3560,110 @@ class AgentSaleAllocation(models.Model):
         ]
 
 
+class MarketSaleEmployeePayProfile(models.Model):
+    """
+    Схема ЗП продавца по чекам main.Sale (поле user): оклад / % от личных продаж / оклад + %.
+    Расчёт периода — см. analytics_market AnalyticsView tab=salary.
+    """
+
+    class PayScheme(models.TextChoices):
+        SALARY = "salary", "Оклад"
+        PERCENT = "percent", "Процент от продаж"
+        SALARY_PLUS_PERCENT = "salary_plus_percent", "Оклад + процент от продаж"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    company = models.ForeignKey(
+        Company,
+        on_delete=models.CASCADE,
+        related_name="market_sale_employee_pay_profiles",
+        verbose_name="Компания",
+    )
+    branch = models.ForeignKey(
+        Branch,
+        on_delete=models.CASCADE,
+        related_name="market_sale_employee_pay_profiles",
+        verbose_name="Филиал",
+        null=True,
+        blank=True,
+        db_index=True,
+    )
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="market_sale_employee_pay_profiles",
+        verbose_name="Сотрудник",
+    )
+    pay_scheme = models.CharField(
+        max_length=24,
+        choices=PayScheme.choices,
+        default=PayScheme.SALARY_PLUS_PERCENT,
+        verbose_name="Схема оплаты",
+    )
+    monthly_base_salary = models.DecimalField(
+        "Оклад в месяц",
+        max_digits=12,
+        decimal_places=2,
+        default=Decimal("0"),
+        validators=[MinValueValidator(Decimal("0"))],
+    )
+    sales_percent = models.DecimalField(
+        "Процент от личных продаж",
+        max_digits=5,
+        decimal_places=2,
+        default=Decimal("0"),
+        validators=[MinValueValidator(Decimal("0"))],
+    )
+
+    class Meta:
+        verbose_name = "Зарплата продавца (маркет)"
+        verbose_name_plural = "Зарплаты продавцов (маркет)"
+        constraints = [
+            models.UniqueConstraint(
+                fields=["company", "branch", "user"],
+                name="uniq_market_sale_pay_company_branch_user",
+                condition=Q(branch__isnull=False),
+            ),
+            models.UniqueConstraint(
+                fields=["company", "user"],
+                name="uniq_market_sale_pay_company_user_global_branch",
+                condition=Q(branch__isnull=True),
+            ),
+        ]
+        indexes = [
+            models.Index(fields=["company", "user"]),
+        ]
+
+    def clean(self):
+        if self.user_id and self.company_id:
+            uid = getattr(self.user, "company_id", None)
+            if uid and uid != self.company_id:
+                raise ValidationError({"user": "Пользователь другой компании."})
+        if self.branch_id and self.branch.company_id != self.company_id:
+            raise ValidationError({"branch": "Филиал другой компании."})
+        if self.sales_percent > Decimal("100"):
+            raise ValidationError({"sales_percent": "Не больше 100%."})
+        if self.pay_scheme == self.PayScheme.SALARY:
+            if (self.monthly_base_salary or Decimal("0")) <= 0:
+                raise ValidationError({"monthly_base_salary": "Для схемы «Оклад» укажите оклад больше 0."})
+        elif self.pay_scheme == self.PayScheme.PERCENT:
+            if (self.sales_percent or Decimal("0")) <= 0:
+                raise ValidationError({"sales_percent": "Для схемы «Процент» укажите процент больше 0."})
+        elif self.pay_scheme == self.PayScheme.SALARY_PLUS_PERCENT:
+            if (self.monthly_base_salary or Decimal("0")) <= 0 or (self.sales_percent or Decimal("0")) <= 0:
+                raise ValidationError(
+                    {
+                        "pay_scheme": "Для схемы «Оклад + процент» задайте и оклад, и процент больше 0.",
+                    }
+                )
+
+    def save(self, *args, **kwargs):
+        self.full_clean()
+        super().save(*args, **kwargs)
+
+    def __str__(self):
+        return f"{self.user_id} @ {self.company_id}"
+
+
 class AgentRequestCart(models.Model):
     """
     Заявка агента на получение товара.
