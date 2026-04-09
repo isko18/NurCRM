@@ -8,6 +8,7 @@ from io import BytesIO
 from datetime import datetime, time, timedelta
 
 from rest_framework import permissions
+from rest_framework.request import Request as DRFRequest
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework.renderers import BaseRenderer, JSONRenderer
@@ -89,6 +90,13 @@ def _query_params(request):
     if qp is not None:
         return qp
     return request.GET
+
+
+def _django_http_request(request):
+    """Вложенные APIView.as_view() ожидают django HttpRequest; снимаем обёртки DRF Request."""
+    while isinstance(request, DRFRequest):
+        request = request._request
+    return request
 
 
 def _apply_date_range(qs, field_name: str, date_from: str | None, date_to: str | None):
@@ -921,21 +929,34 @@ class RejectionsAnalyticsView(CompanyBranchQuerysetMixin, APIView):
     """
     Отказы гостя + денежные возвраты (по позиции и по чеку) за период по дате события.
 
-    Отказы: rejected_at, потенциальная выручка по цене строки.
-    Возвраты: refunded_at, сумма фактического возврата; группировка по примечанию и способу возврата.
-
-    По умолчанию ответ — массив строк (как раньше). С ?totals=1 — объект с полем totals
-    (суммы по отказам и по возвратам) и rows.
+    Ответ: объект с date_from, date_to, totals (в т.ч. суммы возвратов), rows (до 200 строк).
+    Обратная совместимость: ?flat=1 — только массив rows (как раньше).
     """
     permission_classes = [permissions.IsAuthenticated]
 
     def get(self, request):
+        qp = _query_params(request)
+        flat_only = str(qp.get("flat") or "").strip().lower() in ("1", "true", "yes", "on")
+
         company = self._user_company()
         if not company:
-            return Response([])
+            if flat_only:
+                return Response([])
+            return Response({
+                "date_from": None,
+                "date_to": None,
+                "basis": "rejected_at / refunded_at",
+                "totals": {
+                    "guest_rejections_lost": "0.00",
+                    "item_refunds": "0.00",
+                    "order_refunds": "0.00",
+                    "refunds_total": "0.00",
+                },
+                "rows": [],
+            })
 
-        df = (_query_params(request).get("date_from") or "").strip() or None
-        dt = (_query_params(request).get("date_to") or "").strip() or None
+        df = (qp.get("date_from") or "").strip() or None
+        dt = (qp.get("date_to") or "").strip() or None
         branch = self._active_branch()
 
         qs = OrderItem.objects.select_related("order", "menu_item").filter(
@@ -1055,9 +1076,9 @@ class RejectionsAnalyticsView(CompanyBranchQuerysetMixin, APIView):
             },
             "rows": rows,
         }
-        if str(_query_params(request).get("totals") or "").strip().lower() in ("1", "true", "yes", "on"):
-            return Response(payload)
-        return Response(rows)
+        if flat_only:
+            return Response(rows)
+        return Response(payload)
 
 
 class CancelledOrdersAnalyticsView(CompanyBranchQuerysetMixin, APIView):
@@ -1420,7 +1441,7 @@ class CafeUnifiedAnalyticsView(CompanyBranchQuerysetMixin, APIView):
         if not company:
             return Response({"tab": tab, "detail": "Компания не найдена."}, status=403)
 
-        http_req = getattr(request, "_request", request)
+        http_req = _django_http_request(request)
 
         if tab == "revenue":
             return RevenueInflowView.as_view()(http_req)

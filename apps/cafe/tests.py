@@ -12,8 +12,6 @@ from apps.cafe.models import (
     Zone, Table, Order, OrderItem, MenuItem, Category, CafeClient, Kitchen, OrderDebtPayment,
     CafeWaiterPayProfile,
 )
-from rest_framework.request import Request
-
 from apps.cafe.analytics import (
     SalesSummaryView,
     SalesByMenuItemView,
@@ -1081,7 +1079,8 @@ class CafeWaiterAnalyticsScopeTestCase(TestCase):
             },
         )
         force_authenticate(unified_wsgi, user=self.owner)
-        unified_resp = CafeUnifiedAnalyticsView.as_view()(Request(unified_wsgi))
+        # Как у реального WSGI: в APIView.dispatch попадает HttpRequest, не вложенный DRF Request.
+        unified_resp = CafeUnifiedAnalyticsView.as_view()(unified_wsgi)
 
         direct = self.api_factory.get(
             f"/cafe/analytics/sales/summary/?branch={self.branch.id}&date_from={self.period_day}&date_to={self.period_day}"
@@ -1089,6 +1088,6 @@ class CafeWaiterAnalyticsScopeTestCase(TestCase):
         force_authenticate(direct, user=self.owner)
         direct_resp = SalesSummaryView.as_view()(direct)
 
-        self.assertEqual(unified_resp.status_code, 200, getattr(unified_resp, "data", unified_resp.content))
+        self.assertEqual(unified_resp.status_code, 200, getattr(unified_resp, "data", None))
         self.assertEqual(direct_resp.status_code, 200)
         self.assertEqual(unified_resp.data, direct_resp.data)
