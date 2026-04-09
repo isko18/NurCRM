@@ -748,9 +748,7 @@ class OrderItemHistorySerializer(serializers.ModelSerializer):
 
 class OrderHistorySerializer(serializers.ModelSerializer):
     items = OrderItemHistorySerializer(many=True, read_only=True)
-    net_paid_amount = serializers.DecimalField(
-        max_digits=12, decimal_places=2, read_only=True, source="net_paid_amount"
-    )
+    net_paid_amount = serializers.DecimalField(max_digits=12, decimal_places=2, read_only=True)
     has_refunds = serializers.BooleanField(read_only=True)
     is_fully_refunded = serializers.BooleanField(read_only=True)
 
@@ -792,7 +790,7 @@ class OrderSerializer(CompanyBranchReadOnlyMixin):
     items = OrderItemInlineSerializer(many=True, required=False)
     balance_due = serializers.DecimalField(max_digits=12, decimal_places=2, read_only=True)
     refunded_amount = serializers.DecimalField(max_digits=12, decimal_places=2, read_only=True)
-    net_paid_amount = serializers.DecimalField(max_digits=12, decimal_places=2, read_only=True, source="net_paid_amount")
+    net_paid_amount = serializers.DecimalField(max_digits=12, decimal_places=2, read_only=True)
     has_refunds = serializers.BooleanField(read_only=True)
     is_fully_refunded = serializers.BooleanField(read_only=True)
     cash_shift_id = serializers.UUIDField(read_only=True, allow_null=True)
