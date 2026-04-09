@@ -16,7 +16,7 @@ from django.conf import settings
 from django.core.cache import cache
 from django.http import HttpResponse
 from django.db.models import (
-    Q, Count, Avg, Sum, F, Case, When,
+    Q, Count, Avg, Sum, Max, F, Case, When,
     ExpressionWrapper, DurationField, DecimalField, Value, IntegerField,
 )
 from django.db.models.functions import Coalesce
@@ -812,11 +812,14 @@ class RejectionsAnalyticsView(CompanyBranchQuerysetMixin, APIView):
         line_total = _line_revenue_expr()
         by_reason = (
             qs.values("rejection_reason")
-            .annotate(qty=Sum("quantity"), lost_revenue=Sum(line_total))
+            .annotate(
+                qty=Sum("quantity"),
+                lost_revenue=Sum(line_total),
+                last_rejected_at=Max("rejected_at"),
+            )
             .order_by("-lost_revenue")[:200]
         )
 
-        now = timezone.now()
         user = getattr(request, "user", None)
         employee_name = ""
         if user and getattr(user, "is_authenticated", False):
@@ -830,7 +833,8 @@ class RejectionsAnalyticsView(CompanyBranchQuerysetMixin, APIView):
                 "qty": int(row["qty"] or 0),
                 "lost_revenue": f"{_to_decimal(row['lost_revenue']):.2f}",
                 "employee_name": employee_name,
-                "created_at": now,
+                # раньше подставлялся timezone.now() — дата менялась при каждом обновлении страницы
+                "created_at": row["last_rejected_at"],
             }
             for row in by_reason
         ])
