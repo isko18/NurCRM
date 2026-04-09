@@ -1993,13 +1993,43 @@ class AnalyticsView(APIView):
         if days < 1:
             days = 1
 
+        period_meta = {
+            "from": period.start.isoformat(),
+            "to": period.end.isoformat(),
+        }
+        filters_meta = {
+            "branch": str(getattr(branch, "id", "")) if branch else None,
+            "include_global": self._include_global(request),
+        }
+
         if Sale is None:
             return {
                 "tab": "salary",
-                "period": {"from": period.start.isoformat(), "to": period.end.isoformat()},
+                "period": period_meta,
+                "filters": filters_meta,
+                "cards": {},
+                "charts": {},
+                "tables": {},
                 "rows": [],
                 "detail": "Модель продаж не найдена.",
             }
+
+        paid_value = _choice_value(Sale, "Status", "PAID", "paid")
+        dt_field = "paid_at" if _model_has_field(Sale, "paid_at") else "created_at"
+
+        def _apply_sale_branch(qs):
+            if branch is not None and _model_has_field(Sale, "branch"):
+                if self._include_global(request):
+                    return qs.filter(Q(branch=branch) | Q(branch__isnull=True))
+                return qs.filter(branch=branch)
+            if branch is None and _model_has_field(Sale, "branch"):
+                return qs.filter(branch__isnull=True)
+            return qs
+
+        def _sale_qs_period():
+            q = Sale.objects.filter(company=company, status=paid_value)
+            q = q.filter(**{f"{dt_field}__gte": period.start, f"{dt_field}__lt": period.end})
+            return _apply_sale_branch(q)
 
         prof_qs = MarketSaleEmployeePayProfile.objects.filter(company=company)
         if branch is not None:
@@ -2012,31 +2042,22 @@ class AnalyticsView(APIView):
             if prof.user_id not in effective_profiles or prof.branch_id is not None:
                 effective_profiles[prof.user_id] = prof
 
-        paid_value = _choice_value(Sale, "Status", "PAID", "paid")
-        dt_field = "paid_at" if _model_has_field(Sale, "paid_at") else "created_at"
+        payroll_user_ids = list(effective_profiles.keys())
 
         rows = []
         for prof in effective_profiles.values():
-            sq = Sale.objects.filter(company=company, user_id=prof.user_id)
-            sq = sq.filter(status=paid_value)
-            sq = sq.filter(**{f"{dt_field}__gte": period.start, f"{dt_field}__lt": period.end})
-
-            if branch is not None and _model_has_field(Sale, "branch"):
-                if self._include_global(request):
-                    sq = sq.filter(Q(branch=branch) | Q(branch__isnull=True))
-                else:
-                    sq = sq.filter(branch=branch)
-            elif branch is None and _model_has_field(Sale, "branch"):
-                sq = sq.filter(branch__isnull=True)
+            sq = _sale_qs_period().filter(user_id=prof.user_id)
 
             agg = sq.aggregate(
                 s=Coalesce(
                     Sum("total"),
                     Value(Z_MONEY, output_field=MONEY_FIELD),
                     output_field=MONEY_FIELD,
-                )
+                ),
+                c=Count("id"),
             )
             sales_total = agg["s"] or Z_MONEY
+            sale_count = int(agg["c"] or 0)
 
             base_part = ((prof.monthly_base_salary or Z_MONEY) * Decimal(days) / Decimal("30")).quantize(
                 Decimal("0.01")
@@ -2068,15 +2089,134 @@ class AnalyticsView(APIView):
                     "employee_sales_period": str(_money(sales_total)),
                     "percent_bonus": str(bonus),
                     "total": str(total_pay),
+                    "sales_count": sale_count,
                 }
             )
 
         rows.sort(key=lambda r: r["employee_label"].lower())
+
+        total_payroll = Z_MONEY
+        total_base_prorated = Z_MONEY
+        total_percent_bonus = Z_MONEY
+        total_staff_sales = Z_MONEY
+        total_sales_count = 0
+        for r in rows:
+            total_payroll += Decimal(r["total"])
+            total_base_prorated += Decimal(r["base_prorated"])
+            total_percent_bonus += Decimal(r["percent_bonus"])
+            total_staff_sales += Decimal(r["employee_sales_period"])
+            total_sales_count += int(r.get("sales_count") or 0)
+
+        total_payroll = _money(total_payroll)
+        total_base_prorated = _money(total_base_prorated)
+        total_percent_bonus = _money(total_percent_bonus)
+        total_staff_sales = _money(total_staff_sales)
+
+        by_scheme_map: dict[str, dict] = {}
+        for r in rows:
+            key = r["pay_scheme"]
+            if key not in by_scheme_map:
+                by_scheme_map[key] = {
+                    "pay_scheme": key,
+                    "pay_scheme_label": r["pay_scheme_label"],
+                    "employees_count": 0,
+                    "total_pay": Z_MONEY,
+                    "total_base_prorated": Z_MONEY,
+                    "total_percent_bonus": Z_MONEY,
+                    "total_employee_sales": Z_MONEY,
+                    "sales_count": 0,
+                }
+            b = by_scheme_map[key]
+            b["employees_count"] += 1
+            b["total_pay"] += Decimal(r["total"])
+            b["total_base_prorated"] += Decimal(r["base_prorated"])
+            b["total_percent_bonus"] += Decimal(r["percent_bonus"])
+            b["total_employee_sales"] += Decimal(r["employee_sales_period"])
+            b["sales_count"] += int(r.get("sales_count") or 0)
+
+        by_scheme = []
+        for b in by_scheme_map.values():
+            by_scheme.append(
+                {
+                    **b,
+                    "total_pay": str(_money(b["total_pay"])),
+                    "total_base_prorated": str(_money(b["total_base_prorated"])),
+                    "total_percent_bonus": str(_money(b["total_percent_bonus"])),
+                    "total_employee_sales": str(_money(b["total_employee_sales"])),
+                }
+            )
+        by_scheme.sort(key=lambda x: x["pay_scheme_label"])
+
+        avg_per_employee = _safe_div(total_payroll, len(rows)) if rows else Z_MONEY
+
+        blended_commission_pct = None
+        if total_staff_sales > 0:
+            blended_commission_pct = float(
+                (total_percent_bonus / total_staff_sales * Decimal("100")).quantize(Decimal("0.01"))
+            )
+
+        staff_sales_by_day = []
+        if payroll_user_ids:
+            dq = (
+                _sale_qs_period()
+                .filter(user_id__in=payroll_user_ids)
+                .annotate(d=TruncDate(dt_field))
+                .values("d")
+                .annotate(
+                    v=Coalesce(
+                        Sum("total"),
+                        Value(Z_MONEY, output_field=MONEY_FIELD),
+                        output_field=MONEY_FIELD,
+                    ),
+                    c=Count("id"),
+                )
+                .order_by("d")
+            )
+            staff_sales_by_day = [
+                {
+                    "date": r["d"].isoformat(),
+                    "sales_total": str(_money(r["v"])),
+                    "sales_count": r["c"] or 0,
+                }
+                for r in dq
+                if r["d"]
+            ]
+
+        top_by_payroll = sorted(
+            rows,
+            key=lambda x: Decimal(x["total"]),
+            reverse=True,
+        )[:15]
+        top_by_payroll = [
+            {
+                "user_id": r["user_id"],
+                "employee_label": r["employee_label"],
+                "total": r["total"],
+                "pay_scheme": r["pay_scheme"],
+            }
+            for r in top_by_payroll
+        ]
+
         return {
             "tab": "salary",
-            "period": {"from": period.start.isoformat(), "to": period.end.isoformat()},
-            "filters": {
-                "branch": str(getattr(branch, "id", "")) if branch else None,
+            "period": period_meta,
+            "filters": filters_meta,
+            "cards": {
+                "employees_with_profile": len(rows),
+                "total_payroll": str(total_payroll),
+                "total_base_prorated": str(total_base_prorated),
+                "total_percent_bonus": str(total_percent_bonus),
+                "total_employee_sales": str(total_staff_sales),
+                "sales_count": total_sales_count,
+                "avg_payroll_per_employee": str(_money(avg_per_employee)),
+                "blended_commission_rate_pct": blended_commission_pct,
+            },
+            "charts": {
+                "staff_sales_by_day": staff_sales_by_day,
+            },
+            "tables": {
+                "by_pay_scheme": by_scheme,
+                "top_by_payroll": top_by_payroll,
             },
             "rows": rows,
         }

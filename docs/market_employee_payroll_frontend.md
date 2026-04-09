@@ -143,6 +143,8 @@ Content-Type: application/json
 
 ### Успешный ответ (структура)
 
+Ответ включает **детальные строки** (`rows`), **сводные карточки** (`cards`), **графики** (`charts`) и **таблицы** (`tables`).
+
 ```json
 {
   "tab": "salary",
@@ -151,7 +153,45 @@ Content-Type: application/json
     "to": "2026-05-01T00:00:00+06:00"
   },
   "filters": {
-    "branch": "uuid или null"
+    "branch": "uuid или null",
+    "include_global": false
+  },
+  "cards": {
+    "employees_with_profile": 5,
+    "total_payroll": "150000.00",
+    "total_base_prorated": "120000.00",
+    "total_percent_bonus": "30000.00",
+    "total_employee_sales": "500000.00",
+    "sales_count": 142,
+    "avg_payroll_per_employee": "30000.00",
+    "blended_commission_rate_pct": 6.0
+  },
+  "charts": {
+    "staff_sales_by_day": [
+      { "date": "2026-04-01", "sales_total": "12000.00", "sales_count": 8 }
+    ]
+  },
+  "tables": {
+    "by_pay_scheme": [
+      {
+        "pay_scheme": "salary_plus_percent",
+        "pay_scheme_label": "Оклад + процент от продаж",
+        "employees_count": 3,
+        "total_pay": "90000.00",
+        "total_base_prorated": "70000.00",
+        "total_percent_bonus": "20000.00",
+        "total_employee_sales": "300000.00",
+        "sales_count": 90
+      }
+    ],
+    "top_by_payroll": [
+      {
+        "user_id": "uuid",
+        "employee_label": "Иван Иванов",
+        "total": "45000.00",
+        "pay_scheme": "salary_plus_percent"
+      }
+    ]
   },
   "rows": [
     {
@@ -166,11 +206,44 @@ Content-Type: application/json
       "base_prorated": "30000.00",
       "employee_sales_period": "125000.50",
       "percent_bonus": "2500.01",
-      "total": "32500.01"
+      "total": "32500.01",
+      "sales_count": 24
     }
   ]
 }
 ```
+
+### `filters`
+
+| Поле | Смысл |
+|------|--------|
+| `branch` | UUID активного филиала или `null` |
+| `include_global` | Учитывались ли чеки без филиала вместе с выбранным филиалом |
+
+### `cards` (сводка по ЗП и продажам сотрудников с профилем)
+
+| Поле | Смысл |
+|------|--------|
+| `employees_with_profile` | Сколько сотрудников попало в отчёт (есть профиль ЗП в текущем контексте) |
+| `total_payroll` | Сумма итоговых `total` по всем строкам (фактическая «ЗП к начислению» за период по правилам схем) |
+| `total_base_prorated` | Сумма пропорциональных окладов за период (по полю `base_prorated`, в т.ч. для схемы только % — оклад всё равно считается как компонент, но в `total` может не входить) |
+| `total_percent_bonus` | Сумма `percent_bonus` по всем |
+| `total_employee_sales` | Сумма личных продаж (`employee_sales_period`) по сотрудникам из отчёта |
+| `sales_count` | Число оплаченных чеков этих сотрудников за период (сумма по строкам) |
+| `avg_payroll_per_employee` | `total_payroll / employees_with_profile` |
+| `blended_commission_rate_pct` | `total_percent_bonus / total_employee_sales * 100` по всему отчёту; `null`, если продаж нет |
+
+### `charts.staff_sales_by_day`
+
+По **всем** сотрудникам из отчёта вместе: оплаченные чеки за период с теми же фильтрами филиала, группировка по календарному дню (`paid_at` / `created_at`). Удобно для линейного графика «оборот кассиров с настроенной ЗП».
+
+### `tables.by_pay_scheme`
+
+Агрегаты по значению `pay_scheme`: сколько человек, суммы ЗП, окладной части, бонусов, продаж, число чеков.
+
+### `tables.top_by_payroll`
+
+До **15** сотрудников с наибольшим полем `total` (итоговая ЗП за период).
 
 ### Поля строки `rows[]`
 
@@ -188,8 +261,9 @@ Content-Type: application/json
 | `employee_sales_period` | Сумма `total` оплаченных чеков сотрудника за период |
 | `percent_bonus` | `employee_sales_period * sales_percent / 100` |
 | `total` | Итог по схеме: только оклад, только бонус, или сумма (для `salary_plus_percent`) |
+| `sales_count` | Число оплаченных чеков сотрудника за период |
 
-При отсутствии модели продаж возможен ответ с `"rows": []` и полем `"detail"` (текст ошибки) — на практике для маркета не ожидается.
+При отсутствии модели продаж: `"rows": []`, пустые `cards` / `charts` / `tables`, поле `"detail"` с текстом — на практике для маркета не ожидается.
 
 ### Приоритет профилей (филиал vs глобальный)
 
@@ -200,7 +274,7 @@ Content-Type: application/json
 ## 3. Рекомендации для UI
 
 1. **Форма профиля:** три радиокнопки / селект по `pay_scheme`; показывать/прятать или подсвечивать поля `monthly_base_salary` и `sales_percent` в зависимости от схемы (см. таблицу обязательных полей).
-2. **Отчёт:** таблица по `rows`, колонки можно маппить 1:1 с полями; итоговая ЗП — `total`.
+2. **Отчёт:** сверху — карточки из `cards` (итого ЗП, средняя, продажи); круговая/столбчатая — `tables.by_pay_scheme`; график по дням — `charts.staff_sales_by_day`; мини-рейтинг — `tables.top_by_payroll`; полная таблица — `rows` (колонка `sales_count` при желании).
 3. **Согласованность периода:** использовать те же `date_from`/`date_to` (или `period_*`), что на остальных вкладках маркет-аналитики, чтобы пользователь видел один и тот же интервал.
 
 ---
