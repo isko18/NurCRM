@@ -5,7 +5,7 @@ from decimal import Decimal, InvalidOperation
 import hashlib
 import json
 from io import BytesIO
-from datetime import datetime
+from datetime import datetime, time, timedelta
 
 from rest_framework import permissions
 from rest_framework.views import APIView
@@ -96,6 +96,36 @@ def _apply_date_range(qs, field_name: str, date_from: str | None, date_to: str |
         qs = qs.filter(**{f"{field_name}__date__gte": date_from})
     if date_to:
         qs = qs.filter(**{f"{field_name}__date__lte": date_to})
+    return qs
+
+
+def _apply_datetime_range_calendar_days(qs, field_name: str, date_from: str | None, date_to: str | None):
+    """
+    DateTimeField: включительно по календарным дням YYYY-MM-DD в TIME_ZONE проекта (начало дня … конец дня).
+    Устраняет сдвиг границ при lookup вида __date__ на aware-datetime в другой TZ.
+    Без обоих параметров — фильтр не накладывается.
+    """
+    df = (date_from or "").strip() or None
+    dt = (date_to or "").strip() or None
+    if not df and not dt:
+        return qs
+
+    tz = timezone.get_current_timezone()
+
+    def _parse_ymd(s: str):
+        return datetime.strptime(s.strip()[:10], "%Y-%m-%d").date()
+
+    try:
+        if df:
+            lo = _parse_ymd(df)
+            start = timezone.make_aware(datetime.combine(lo, time.min), tz)
+            qs = qs.filter(**{f"{field_name}__gte": start})
+        if dt:
+            hi = _parse_ymd(dt)
+            end_exclusive = timezone.make_aware(datetime.combine(hi + timedelta(days=1), time.min), tz)
+            qs = qs.filter(**{f"{field_name}__lt": end_exclusive})
+    except ValueError:
+        pass
     return qs
 
 
@@ -789,9 +819,36 @@ class SalesByKitchenView(CompanyBranchQuerysetMixin, APIView):
         return Response(result)
 
 
+def _refund_rows_by_payment_method(item_refund_qs, order_refund_qs):
+    """Суммы и количество операций возврата по способу (нал/карта/перевод)."""
+    acc: dict[str, dict] = {}
+    for src in (item_refund_qs, order_refund_qs):
+        for row in src.values("payment_method").annotate(t=Sum("amount"), c=Count("id")):
+            m = (row.get("payment_method") or "").strip() or "unknown"
+            if m not in acc:
+                acc[m] = {"total": Decimal("0"), "count": 0}
+            acc[m]["total"] += _to_decimal(row.get("t"))
+            acc[m]["count"] += int(row.get("c") or 0)
+    pm_labels = dict(OrderRefund._meta.get_field("payment_method").choices)
+    out = []
+    grand = Decimal("0")
+    for m, v in sorted(acc.items(), key=lambda x: -x[1]["total"]):
+        grand += v["total"]
+        out.append({
+            "method": m,
+            "method_label": pm_labels.get(m, m),
+            "count": v["count"],
+            "total": f"{v['total']:.2f}",
+        })
+    return out, grand
+
+
 class RevenueInflowView(CompanyBranchQuerysetMixin, APIView):
     """
     Приход по способам оплаты: оплаченные заказы по дате paid_at, суммы нетто (оплата минус возвраты по чеку).
+
+    Дополнительно — возвраты денег за период по дате refunded_at и фактическому способу возврата
+    (refunds_by_method, refunds_total), чтобы картина по кассе была полной.
     """
     permission_classes = [permissions.IsAuthenticated]
 
@@ -800,8 +857,8 @@ class RevenueInflowView(CompanyBranchQuerysetMixin, APIView):
         if not company:
             return Response({"basis": "paid_at", "payment_methods": [], "totals": {}})
 
-        df = _query_params(request).get("date_from")
-        dt = _query_params(request).get("date_to")
+        df = (_query_params(request).get("date_from") or "").strip() or None
+        dt = (_query_params(request).get("date_to") or "").strip() or None
         branch = self._active_branch()
 
         qs = Order.objects.filter(company=company, is_paid=True)
@@ -833,12 +890,30 @@ class RevenueInflowView(CompanyBranchQuerysetMixin, APIView):
                 "total": f"{t:.2f}",
             })
 
+        ir_qs = OrderItemRefund.objects.filter(company=company)
+        or_qs = OrderRefund.objects.filter(company=company)
+        if branch is not None:
+            ir_qs = ir_qs.filter(Q(order__branch=branch) | Q(order__branch__isnull=True))
+            or_qs = or_qs.filter(Q(order__branch=branch) | Q(order__branch__isnull=True))
+        else:
+            ir_qs = ir_qs.filter(order__branch__isnull=True)
+            or_qs = or_qs.filter(order__branch__isnull=True)
+        ir_qs, _ = _apply_waiter_scope(ir_qs, request, "order__waiter_id")
+        or_qs, _ = _apply_waiter_scope(or_qs, request, "order__waiter_id")
+        ir_qs = _apply_datetime_range_calendar_days(ir_qs, "refunded_at", df, dt)
+        or_qs = _apply_datetime_range_calendar_days(or_qs, "refunded_at", df, dt)
+
+        refunds_by_method, refunds_grand = _refund_rows_by_payment_method(ir_qs, or_qs)
+
         return Response({
             "date_from": df,
             "date_to": dt,
             "basis": "paid_at",
+            "refunds_basis": "refunded_at",
             "payment_methods": methods,
             "grand_total": f"{grand:.2f}",
+            "refunds_by_method": refunds_by_method,
+            "refunds_total": f"{refunds_grand:.2f}",
         })
 
 
@@ -848,6 +923,9 @@ class RejectionsAnalyticsView(CompanyBranchQuerysetMixin, APIView):
 
     Отказы: rejected_at, потенциальная выручка по цене строки.
     Возвраты: refunded_at, сумма фактического возврата; группировка по примечанию и способу возврата.
+
+    По умолчанию ответ — массив строк (как раньше). С ?totals=1 — объект с полем totals
+    (суммы по отказам и по возвратам) и rows.
     """
     permission_classes = [permissions.IsAuthenticated]
 
@@ -856,8 +934,8 @@ class RejectionsAnalyticsView(CompanyBranchQuerysetMixin, APIView):
         if not company:
             return Response([])
 
-        df = _query_params(request).get("date_from")
-        dt = _query_params(request).get("date_to")
+        df = (_query_params(request).get("date_from") or "").strip() or None
+        dt = (_query_params(request).get("date_to") or "").strip() or None
         branch = self._active_branch()
 
         qs = OrderItem.objects.select_related("order", "menu_item").filter(
@@ -869,9 +947,12 @@ class RejectionsAnalyticsView(CompanyBranchQuerysetMixin, APIView):
         else:
             qs = qs.filter(order__branch__isnull=True)
         qs, _waiter_scope_id = _apply_waiter_scope(qs, request, "order__waiter_id")
-        qs = _apply_date_range(qs, "rejected_at", df, dt)
+        if df or dt:
+            qs = qs.filter(rejected_at__isnull=False)
+        qs = _apply_datetime_range_calendar_days(qs, "rejected_at", df, dt)
 
         line_total = _line_revenue_expr()
+        guest_lost_total = _to_decimal(qs.aggregate(t=Sum(line_total)).get("t"))
         by_reason = (
             qs.values("rejection_reason")
             .annotate(
@@ -897,7 +978,7 @@ class RejectionsAnalyticsView(CompanyBranchQuerysetMixin, APIView):
         else:
             ir_qs = ir_qs.filter(order__branch__isnull=True)
         ir_qs, _ = _apply_waiter_scope(ir_qs, request, "order__waiter_id")
-        ir_qs = _apply_date_range(ir_qs, "refunded_at", df, dt)
+        ir_qs = _apply_datetime_range_calendar_days(ir_qs, "refunded_at", df, dt)
         by_item_refund = ir_qs.values("note", "payment_method").annotate(
             qty=Sum("quantity"),
             lost_revenue=Sum("amount"),
@@ -910,7 +991,7 @@ class RejectionsAnalyticsView(CompanyBranchQuerysetMixin, APIView):
         else:
             or_qs = or_qs.filter(order__branch__isnull=True)
         or_qs, _ = _apply_waiter_scope(or_qs, request, "order__waiter_id")
-        or_qs = _apply_date_range(or_qs, "refunded_at", df, dt)
+        or_qs = _apply_datetime_range_calendar_days(or_qs, "refunded_at", df, dt)
         by_order_refund = or_qs.values("note", "payment_method").annotate(
             qty=Count("id"),
             lost_revenue=Sum("amount"),
@@ -956,7 +1037,27 @@ class RejectionsAnalyticsView(CompanyBranchQuerysetMixin, APIView):
             })
 
         rows.sort(key=lambda r: _to_decimal(r["lost_revenue"]), reverse=True)
-        return Response(rows[:200])
+        rows = rows[:200]
+
+        item_refunds_total = _to_decimal(ir_qs.aggregate(t=Sum("amount")).get("t"))
+        order_refunds_total = _to_decimal(or_qs.aggregate(t=Sum("amount")).get("t"))
+        refunds_total = (item_refunds_total + order_refunds_total).quantize(Decimal("0.01"))
+
+        payload = {
+            "date_from": df,
+            "date_to": dt,
+            "basis": "rejected_at / refunded_at",
+            "totals": {
+                "guest_rejections_lost": f"{guest_lost_total:.2f}",
+                "item_refunds": f"{item_refunds_total:.2f}",
+                "order_refunds": f"{order_refunds_total:.2f}",
+                "refunds_total": f"{refunds_total:.2f}",
+            },
+            "rows": rows,
+        }
+        if str(_query_params(request).get("totals") or "").strip().lower() in ("1", "true", "yes", "on"):
+            return Response(payload)
+        return Response(rows)
 
 
 class CancelledOrdersAnalyticsView(CompanyBranchQuerysetMixin, APIView):
