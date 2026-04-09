@@ -2009,6 +2009,38 @@ def _safe_order_table_number_export(order) -> str:
     return "" if n is None else str(n)
 
 
+def _export_basis_label_ru(basis: str | None) -> str:
+    b = (basis or "").strip()
+    if b == "paid_at":
+        return "Дата оплаты (paid_at)"
+    return b
+
+
+def _export_refund_kind_ru(kind: str | None) -> str:
+    k = (kind or "").strip()
+    if k == "order_refund":
+        return "Возврат по заказу"
+    if k == "item_refund":
+        return "Возврат по позиции"
+    return k or ""
+
+
+def _export_refund_payment_method_ru(code: str | None) -> str:
+    c = str(code or "").strip()
+    if not c:
+        return ""
+    choices = dict(OrderRefund._meta.get_field("payment_method").choices)
+    return choices.get(c, c)
+
+
+def _export_order_payment_method_ru(code: str | None) -> str:
+    c = str(code or "").strip()
+    if not c:
+        return ""
+    pm = dict(Order.PaymentMethod.choices)
+    return pm.get(c, c)
+
+
 class CafeAnalyticsExportView(CompanyBranchQuerysetMixin, APIView):
     """
     Экспорт аналитики/кассы:
@@ -2286,30 +2318,30 @@ class CafeAnalyticsExportView(CompanyBranchQuerysetMixin, APIView):
             ws = wb.active
             ws.title = "Сводка"
             ws.append(["Аналитика кафе — сводка"])
-            ws.append(["date_from", payload["date_from"]])
-            ws.append(["date_to", payload["date_to"]])
-            ws.append(["basis", payload.get("basis", "paid_at")])
-            ws.append(["orders_count", payload["orders_count"]])
-            ws.append(["items_qty", payload["items_qty"]])
-            ws.append(["revenue", payload["revenue"]])
-            ws.append(["cogs_sold", payload.get("cogs_sold", "0.00")])
-            ws.append(["gross_profit", payload.get("gross_profit", "0.00")])
-            ws.append(["margin_percent", payload.get("margin_percent", 0)])
-            ws.append(["net_profit", payload.get("net_profit", "0.00")])
-            ws.append(["purchases_count", payload["purchases_count"]])
-            ws.append(["purchases_sum", payload["purchases_sum"]])
-            ws.append(["cafe_expenses_count", payload.get("cafe_expenses_count", 0)])
-            ws.append(["cafe_expenses_sum", payload.get("cafe_expenses_sum", "0.00")])
-            ws.append(["refunds_total", payload.get("refunds_total", "0.00")])
-            ws.append(["low_stock_count", payload["low_stock_count"]])
+            ws.append(["Дата с", payload["date_from"]])
+            ws.append(["Дата по", payload["date_to"]])
+            ws.append(["База расчёта", _export_basis_label_ru(payload.get("basis", "paid_at"))])
+            ws.append(["Заказов", payload["orders_count"]])
+            ws.append(["Позиций (шт.)", payload["items_qty"]])
+            ws.append(["Выручка", payload["revenue"]])
+            ws.append(["Себестоимость продаж", payload.get("cogs_sold", "0.00")])
+            ws.append(["Валовая прибыль", payload.get("gross_profit", "0.00")])
+            ws.append(["Маржа, %", payload.get("margin_percent", 0)])
+            ws.append(["Чистая прибыль", payload.get("net_profit", "0.00")])
+            ws.append(["Закупок (операций)", payload["purchases_count"]])
+            ws.append(["Сумма закупок", payload["purchases_sum"]])
+            ws.append(["Прочих расходов (операций)", payload.get("cafe_expenses_count", 0)])
+            ws.append(["Сумма прочих расходов", payload.get("cafe_expenses_sum", "0.00")])
+            ws.append(["Возвраты (сумма)", payload.get("refunds_total", "0.00")])
+            ws.append(["Позиций на складе ниже минимума", payload["low_stock_count"]])
             ws.append([])
-            ws.append(["Возвраты по способу (refunded_at)"])
-            ws.append(["method", "method_label", "count", "total"])
+            ws.append(["Возвраты по способу (дата возврата)"])
+            ws.append(["Код", "Способ", "Кол-во", "Сумма"])
             for r in payload.get("refunds_by_method") or []:
                 ws.append([r.get("method"), r.get("method_label"), r.get("count"), r.get("total")])
 
             w_in = wb.create_sheet("Приходы")
-            w_in.append(["order_id", "paid_at", "payment_method", "payment_method_label", "amount", "table_number"])
+            w_in.append(["ID заказа", "Дата оплаты", "Код способа", "Способ оплаты", "Сумма", "Стол"])
             for row in payload.get("income_rows") or []:
                 w_in.append([
                     row["order_id"],
@@ -2321,69 +2353,74 @@ class CafeAnalyticsExportView(CompanyBranchQuerysetMixin, APIView):
                 ])
 
             w_pu = wb.create_sheet("Закупки")
-            w_pu.append(["id", "created_at", "supplier", "positions", "amount"])
+            w_pu.append(["ID", "Дата", "Поставщик", "Позиции", "Сумма"])
             for row in payload.get("purchase_rows") or []:
                 w_pu.append([row["id"], row["created_at"], row["supplier"], row["positions"], row["amount"]])
 
             w_ex = wb.create_sheet("Прочие расходы")
-            w_ex.append(["id", "expense_date", "title", "category", "amount", "note"])
+            w_ex.append(["ID", "Дата", "Статья", "Категория", "Сумма", "Примечание"])
             for row in payload.get("expense_rows") or []:
                 w_ex.append([row["id"], row["expense_date"], row["title"], row["category"], row["amount"], row["note"]])
 
             w_rf = wb.create_sheet("Возвраты")
-            w_rf.append(["kind", "id", "order_id", "refunded_at", "payment_method", "amount", "note"])
+            w_rf.append(["Тип", "ID", "Заказ", "Дата возврата", "Способ", "Сумма", "Примечание"])
             for row in payload.get("refund_rows") or []:
                 w_rf.append([
-                    row["kind"],
+                    _export_refund_kind_ru(row["kind"]),
                     row["id"],
                     row["order_id"],
                     row["refunded_at"],
-                    row["payment_method"],
+                    _export_refund_payment_method_ru(row["payment_method"]),
                     row["amount"],
                     row.get("note", ""),
                 ])
 
             w_ed = wb.create_sheet("Расходы по дням")
-            w_ed.append(["date", "total", "count"])
+            w_ed.append(["Дата", "Сумма", "Кол-во"])
             for row in payload.get("expenses_by_day") or []:
                 w_ed.append([row["date"], row["total"], row["count"]])
 
             w_top = wb.create_sheet("Топ блюд")
-            w_top.append(["title", "qty", "revenue"])
+            w_top.append(["Блюдо", "Кол-во", "Выручка"])
             for row in payload["top_items"]:
                 w_top.append([row["title"], row["qty"], row["revenue"]])
         else:
             ws = wb.active
             ws.title = "Сводка"
             ws.append(["Касса — сводка"])
-            ws.append(["date_from", payload["date_from"]])
-            ws.append(["date_to", payload["date_to"]])
-            ws.append(["total_all", payload["totals"]["all"]])
-            ws.append(["total_cash", payload["totals"]["cash"]])
-            ws.append(["total_card", payload["totals"]["card"]])
-            ws.append(["total_transfer", payload["totals"]["transfer"]])
-            ws.append(["total_other", payload["totals"]["other"]])
-            ws.append(["refunds_total", payload.get("refunds_total", "0.00")])
+            ws.append(["Дата с", payload["date_from"]])
+            ws.append(["Дата по", payload["date_to"]])
+            ws.append(["Всего", payload["totals"]["all"]])
+            ws.append(["Наличные", payload["totals"]["cash"]])
+            ws.append(["Карта", payload["totals"]["card"]])
+            ws.append(["Перевод", payload["totals"]["transfer"]])
+            ws.append(["Прочее", payload["totals"]["other"]])
+            ws.append(["Возвраты (сумма)", payload.get("refunds_total", "0.00")])
             ws.append([])
             ws.append(["Возвраты по способу"])
-            ws.append(["method", "method_label", "count", "total"])
+            ws.append(["Код", "Способ", "Кол-во", "Сумма"])
             for r in payload.get("refunds_by_method") or []:
                 ws.append([r.get("method"), r.get("method_label"), r.get("count"), r.get("total")])
 
             w_ord = wb.create_sheet("Оплаты")
-            w_ord.append(["order_id", "paid_at", "payment_method", "final_amount"])
+            w_ord.append(["ID заказа", "Дата оплаты", "Способ оплаты", "Сумма"])
             for row in payload["rows"]:
-                w_ord.append([row["order_id"], str(row["paid_at"] or ""), row["payment_method"], row["final_amount"]])
+                w_ord.append([
+                    row["order_id"],
+                    str(row["paid_at"] or ""),
+                    _export_order_payment_method_ru(row["payment_method"]),
+                    row["final_amount"],
+                ])
 
             w_rf = wb.create_sheet("Возвраты")
-            w_rf.append(["kind", "id", "order_id", "refunded_at", "payment_method", "amount", "note"])
+            w_rf.append(["Тип", "ID", "Заказ", "Дата возврата", "Способ", "Сумма", "Примечание"])
             for row in payload.get("refund_rows") or []:
                 w_rf.append([
-                    row["kind"],
+                    _export_refund_kind_ru(row["kind"]),
                     row["id"],
                     row["order_id"],
                     row["refunded_at"],
-                    row["payment_method"],
+                    _export_refund_payment_method_ru(row["payment_method"]),
                     row["amount"],
                     row.get("note", ""),
                 ])
@@ -2407,31 +2444,31 @@ class CafeAnalyticsExportView(CompanyBranchQuerysetMixin, APIView):
             )
             html = f"""
 <html><head><meta charset="utf-8"></head><body>
-<h2>Cafe analytics report</h2>
-<p>date_from: {h(payload["date_from"])}</p>
-<p>date_to: {h(payload["date_to"])}</p>
-<p>basis: {h(payload.get("basis", "paid_at"))}</p>
-<p>orders_count: {h(payload["orders_count"])}</p>
-<p>items_qty: {h(payload["items_qty"])}</p>
-<p>revenue: {h(payload["revenue"])}</p>
-<p>cogs_sold: {h(payload.get("cogs_sold", "0.00"))}</p>
-<p>gross_profit: {h(payload.get("gross_profit", "0.00"))}</p>
-<p>margin_percent: {h(payload.get("margin_percent", 0))}</p>
-<p>net_profit: {h(payload.get("net_profit", "0.00"))}</p>
-<p>purchases_count: {h(payload["purchases_count"])}</p>
-<p>purchases_sum: {h(payload["purchases_sum"])}</p>
-<p>cafe_expenses_count: {h(payload.get("cafe_expenses_count", 0))}</p>
-<p>cafe_expenses_sum: {h(payload.get("cafe_expenses_sum", "0.00"))}</p>
-<p>refunds_total: {h(payload.get("refunds_total", "0.00"))}</p>
-<p>low_stock_count: {h(payload["low_stock_count"])}</p>
+<h2>Отчёт по аналитике кафе</h2>
+<p>Дата с: {h(payload["date_from"])}</p>
+<p>Дата по: {h(payload["date_to"])}</p>
+<p>База расчёта: {h(_export_basis_label_ru(payload.get("basis", "paid_at")))}</p>
+<p>Заказов: {h(payload["orders_count"])}</p>
+<p>Позиций (шт.): {h(payload["items_qty"])}</p>
+<p>Выручка: {h(payload["revenue"])}</p>
+<p>Себестоимость продаж: {h(payload.get("cogs_sold", "0.00"))}</p>
+<p>Валовая прибыль: {h(payload.get("gross_profit", "0.00"))}</p>
+<p>Маржа, %: {h(payload.get("margin_percent", 0))}</p>
+<p>Чистая прибыль: {h(payload.get("net_profit", "0.00"))}</p>
+<p>Закупок (операций): {h(payload["purchases_count"])}</p>
+<p>Сумма закупок: {h(payload["purchases_sum"])}</p>
+<p>Прочих расходов (операций): {h(payload.get("cafe_expenses_count", 0))}</p>
+<p>Сумма прочих расходов: {h(payload.get("cafe_expenses_sum", "0.00"))}</p>
+<p>Возвраты (сумма): {h(payload.get("refunds_total", "0.00"))}</p>
+<p>Позиций на складе ниже минимума: {h(payload["low_stock_count"])}</p>
 <h3>Приходы (фрагмент)</h3>
 <table border="1" cellspacing="0" cellpadding="4">
-<tr><th>order_id</th><th>paid_at</th><th>method</th><th>amount</th></tr>
+<tr><th>ID заказа</th><th>Дата оплаты</th><th>Способ оплаты</th><th>Сумма</th></tr>
 {inc}
 </table>
-<h3>Top menu items</h3>
+<h3>Топ блюд</h3>
 <table border="1" cellspacing="0" cellpadding="4">
-<tr><th>title</th><th>qty</th><th>revenue</th></tr>
+<tr><th>Блюдо</th><th>Кол-во</th><th>Выручка</th></tr>
 {rows}
 </table>
 </body></html>
@@ -2439,33 +2476,34 @@ class CafeAnalyticsExportView(CompanyBranchQuerysetMixin, APIView):
         else:
             rows = "".join(
                 f"<tr><td>{h(r['order_id'])}</td><td>{h(r['paid_at'])}</td>"
-                f"<td>{h(r['payment_method'])}</td><td>{h(r['final_amount'])}</td></tr>"
+                f"<td>{h(_export_order_payment_method_ru(r.get('payment_method')))}</td><td>{h(r['final_amount'])}</td></tr>"
                 for r in payload["rows"]
             )
             rrows = "".join(
-                f"<tr><td>{h(r.get('kind'))}</td><td>{h(r['order_id'])}</td>"
-                f"<td>{h(r['refunded_at'])}</td><td>{h(r['amount'])}</td></tr>"
+                f"<tr><td>{h(_export_refund_kind_ru(r.get('kind')))}</td><td>{h(r['order_id'])}</td>"
+                f"<td>{h(r['refunded_at'])}</td><td>{h(_export_refund_payment_method_ru(r.get('payment_method')))}</td>"
+                f"<td>{h(r['amount'])}</td></tr>"
                 for r in (payload.get("refund_rows") or [])[:200]
             )
             html = f"""
 <html><head><meta charset="utf-8"></head><body>
-<h2>Cafe cash report</h2>
-<p>date_from: {h(payload["date_from"])}</p>
-<p>date_to: {h(payload["date_to"])}</p>
-<p>total_all: {h(payload["totals"]["all"])}</p>
-<p>total_cash: {h(payload["totals"]["cash"])}</p>
-<p>total_card: {h(payload["totals"]["card"])}</p>
-<p>total_transfer: {h(payload["totals"]["transfer"])}</p>
-<p>total_other: {h(payload["totals"]["other"])}</p>
-<p>refunds_total: {h(payload.get("refunds_total", "0.00"))}</p>
-<h3>Orders</h3>
+<h2>Отчёт по кассе кафе</h2>
+<p>Дата с: {h(payload["date_from"])}</p>
+<p>Дата по: {h(payload["date_to"])}</p>
+<p>Всего: {h(payload["totals"]["all"])}</p>
+<p>Наличные: {h(payload["totals"]["cash"])}</p>
+<p>Карта: {h(payload["totals"]["card"])}</p>
+<p>Перевод: {h(payload["totals"]["transfer"])}</p>
+<p>Прочее: {h(payload["totals"]["other"])}</p>
+<p>Возвраты (сумма): {h(payload.get("refunds_total", "0.00"))}</p>
+<h3>Оплаты</h3>
 <table border="1" cellspacing="0" cellpadding="4">
-<tr><th>order_id</th><th>paid_at</th><th>payment_method</th><th>final_amount</th></tr>
+<tr><th>ID заказа</th><th>Дата оплаты</th><th>Способ оплаты</th><th>Сумма</th></tr>
 {rows}
 </table>
 <h3>Возвраты</h3>
 <table border="1" cellspacing="0" cellpadding="4">
-<tr><th>kind</th><th>order_id</th><th>refunded_at</th><th>amount</th></tr>
+<tr><th>Тип</th><th>Заказ</th><th>Дата возврата</th><th>Способ</th><th>Сумма</th></tr>
 {rrows}
 </table>
 </body></html>
