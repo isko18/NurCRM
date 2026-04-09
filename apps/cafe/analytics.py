@@ -8,6 +8,7 @@ from io import BytesIO
 from datetime import datetime
 
 from rest_framework import permissions
+from rest_framework.request import Request as DRFRequest
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework.renderers import BaseRenderer, JSONRenderer
@@ -89,6 +90,13 @@ def _query_params(request):
     if qp is not None:
         return qp
     return request.GET
+
+
+def _django_http_request(request):
+    """Вложенные APIView.as_view() ожидают django HttpRequest; снимаем обёртки DRF Request."""
+    while isinstance(request, DRFRequest):
+        request = request._request
+    return request
 
 
 def _apply_date_range(qs, field_name: str, date_from: str | None, date_to: str | None):
@@ -1319,7 +1327,7 @@ class CafeUnifiedAnalyticsView(CompanyBranchQuerysetMixin, APIView):
         if not company:
             return Response({"tab": tab, "detail": "Компания не найдена."}, status=403)
 
-        http_req = getattr(request, "_request", request)
+        http_req = _django_http_request(request)
 
         if tab == "revenue":
             return RevenueInflowView.as_view()(http_req)
