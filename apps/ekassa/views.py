@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import logging
+import uuid
+from decimal import Decimal, InvalidOperation
 from typing import Any
 
 import requests
@@ -17,6 +19,7 @@ from apps.ekassa.serializers import (
     EkassaIntegrationWriteSerializer,
     default_settings_payload,
 )
+from apps.ekassa.sale_bridge import _som_to_tyiyun_int
 from apps.ekassa.services import client_for, get_integration, inject_fiscal_number
 from apps.users.permissions import IsCompanyOwnerOrAdmin
 
@@ -37,6 +40,10 @@ def _resolve_company(user):
 
 def _ekassa_timeout() -> int:
     return int(getattr(settings, "EKASSA_REQUEST_TIMEOUT", 45) or 45)
+
+
+def _ekassa_test_receipt_allowed() -> bool:
+    return bool(getattr(settings, "EKASSA_ALLOW_TEST_RECEIPT", False))
 
 
 def _disabled_response():
@@ -90,6 +97,93 @@ class EkassaSettingsView(APIView):
         ser.save()
         obj.refresh_from_db()
         return Response(EkassaIntegrationReadSerializer(obj).data)
+
+
+class EkassaTestReceiptView(APIView):
+    """
+    Тестовая «оплата»: один фискальный чек INCOME в eKassa (как при реальной продаже, без Sale в БД).
+
+    POST /api/ekassa/test-receipt/
+    Тело (опционально): {"amount_som": "1.00", "cash": true, "name": "Тестовая оплата"}
+
+    Включение: EKASSA_ALLOW_TEST_RECEIPT=1 или DEBUG=true (см. settings).
+    Права: владелец/админ компании; интеграция eKassa должна быть настроена (как для receipt/).
+    """
+
+    permission_classes = [IsAuthenticated, IsCompanyOwnerOrAdmin]
+
+    def post(self, request):
+        if not _ekassa_test_receipt_allowed():
+            return Response(
+                {
+                    "detail": "Тестовые чеки eKassa отключены. Задайте EKASSA_ALLOW_TEST_RECEIPT=1 или включите DEBUG.",
+                    "code": "ekassa_test_disabled",
+                },
+                status=status.HTTP_403_FORBIDDEN,
+            )
+        company = _resolve_company(request.user)
+        if not company:
+            return Response({"detail": "Компания для текущего пользователя не найдена."}, status=404)
+        try:
+            cli = client_for(company)
+        except EkassaConfigurationError:
+            return _disabled_response()
+
+        cfg = get_integration(company)
+        fiscal = (cfg.fiscal_number or "").strip() if cfg else ""
+        if not fiscal:
+            return _disabled_response()
+
+        data = request.data if isinstance(request.data, dict) else {}
+        cash = data.get("cash", True)
+        if isinstance(cash, str):
+            cash = cash.strip().lower() in ("1", "true", "yes", "on")
+
+        raw_amount = data.get("amount_som", "1.00")
+        try:
+            amount = Decimal(str(raw_amount))
+        except (InvalidOperation, TypeError, ValueError):
+            return Response({"detail": "Некорректное amount_som.", "code": "invalid_amount"}, status=400)
+        if amount < Decimal("0.01") or amount > Decimal("500000"):
+            return Response(
+                {"detail": "amount_som должен быть от 0.01 до 500000.", "code": "invalid_amount"},
+                status=400,
+            )
+
+        name = (data.get("name") or "Тестовая оплата nurCRM")[:255]
+        price_ty = _som_to_tyiyun_int(amount)
+        if price_ty < 1:
+            return Response({"detail": "Сумма слишком мала.", "code": "invalid_amount"}, status=400)
+
+        newid = str(uuid.uuid4())
+        body = {
+            "fiscal_number": fiscal,
+            "newid": newid,
+            "operation": "INCOME",
+            "cash": bool(cash),
+            "goods": [
+                {
+                    "calcItemAttributeCode": 0,
+                    "name": name,
+                    "sgtin": "TESTNURCRM",
+                    "price": price_ty,
+                    "quantity": 1.0,
+                    "unit": "шт.",
+                    "st": 0,
+                    "vat": 0,
+                }
+            ],
+        }
+        if bool(cash):
+            body["received"] = str(price_ty)
+
+        try:
+            resp = cli.request_json("POST", "/api/v2/receipt", json_body=body)
+        except EkassaAPIError as e:
+            return _handle_ekassa_error(e)
+        out = dict(resp) if isinstance(resp, dict) else {"data": resp}
+        out["test_meta"] = {"newid": newid, "amount_som": str(amount.quantize(Decimal("0.01"))), "cash": bool(cash)}
+        return Response(out)
 
 
 class EkassaPingView(APIView):
