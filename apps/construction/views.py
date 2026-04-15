@@ -14,6 +14,8 @@ from rest_framework.exceptions import PermissionDenied, ValidationError
 
 from apps.construction.models import Cashbox, CashFlow, CashFlowCategory, CashShift
 
+from apps.ekassa.shift_bridge import sync_ekassa_after_local_shift_close, sync_ekassa_after_local_shift_open
+
 from apps.construction.serializers import (
     CashboxSerializer,
     CashFlowSerializer,
@@ -514,6 +516,7 @@ class CashShiftOpenView(CompanyBranchScopedMixin, generics.CreateAPIView):
         serializer = self.get_serializer(data=request.data, context={"request": request})
         serializer.is_valid(raise_exception=True)
         shift = serializer.save()
+        transaction.on_commit(lambda s=shift: sync_ekassa_after_local_shift_open(s))
         out = CashShiftListSerializer(shift, context={"request": request}).data
         return Response(out, status=201)
 
@@ -545,6 +548,7 @@ class CashShiftCloseView(APIView):
         except Exception as e:
             raise ValidationError(str(e))
 
+        transaction.on_commit(lambda s=shift: sync_ekassa_after_local_shift_close(s))
         out = CashShiftListSerializer(shift, context={"request": request}).data
         return Response(out, status=200)
 

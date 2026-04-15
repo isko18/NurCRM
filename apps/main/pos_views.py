@@ -49,6 +49,7 @@ from apps.main.models import (
 from apps.main.models import ManufactureSubreal, AgentSaleAllocation
 from apps.main.cache_utils import invalidate_cache_pattern
 from apps.main.services import checkout_cart, NotEnoughStock
+from apps.ekassa.shift_bridge import sync_ekassa_after_local_shift_open
 
 
 def _ekassa_checkout_hint(company):
@@ -501,7 +502,7 @@ def _ensure_open_shift(*, company, branch, cashier, cashbox, opening_cash=None):
     if shift:
         return shift
 
-    return CashShift.objects.create(
+    shift = CashShift.objects.create(
         company=company,
         branch=branch,
         cashbox=cashbox,
@@ -510,6 +511,8 @@ def _ensure_open_shift(*, company, branch, cashier, cashbox, opening_cash=None):
         opened_at=timezone.now(),
         opening_cash=opening_cash,
     )
+    transaction.on_commit(lambda s=shift: sync_ekassa_after_local_shift_open(s))
+    return shift
 
 
 class ClientReconciliationJSONAPIView(APIView):
