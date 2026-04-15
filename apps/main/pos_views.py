@@ -49,7 +49,8 @@ from apps.main.models import (
 from apps.main.models import ManufactureSubreal, AgentSaleAllocation
 from apps.main.cache_utils import invalidate_cache_pattern
 from apps.main.services import checkout_cart, NotEnoughStock
-from apps.ekassa.shift_bridge import sync_ekassa_after_local_shift_open
+from apps.ekassa.runtime import schedule_after_commit
+from apps.ekassa.shift_bridge import sync_ekassa_after_local_shift_open_by_id
 
 
 def _ekassa_checkout_hint(company):
@@ -511,7 +512,7 @@ def _ensure_open_shift(*, company, branch, cashier, cashbox, opening_cash=None):
         opened_at=timezone.now(),
         opening_cash=opening_cash,
     )
-    transaction.on_commit(lambda s=shift: sync_ekassa_after_local_shift_open(s))
+    schedule_after_commit(sync_ekassa_after_local_shift_open_by_id, shift.id)
     return shift
 
 

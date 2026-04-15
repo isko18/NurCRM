@@ -1901,12 +1901,10 @@ class Sale(models.Model):
 
         sale_pk = self.pk
 
-        def _queue_ekassa_fiscal():
-            from apps.ekassa.sale_bridge import try_fiscalize_pos_sale
+        from apps.ekassa.runtime import schedule_after_commit
+        from apps.ekassa.sale_bridge import try_fiscalize_pos_sale
 
-            try_fiscalize_pos_sale(sale_pk)
-
-        transaction.on_commit(_queue_ekassa_fiscal)
+        schedule_after_commit(try_fiscalize_pos_sale, sale_pk)
 
 
 class SaleItem(models.Model):

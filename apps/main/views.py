@@ -2742,11 +2742,14 @@ class SupplierReceiptAPIView(CompanyBranchRestrictedMixin, APIView):
         if wrong_supplier:
             raise ValidationError({"items": [f"Товары не принадлежат выбранному поставщику: {', '.join(wrong_supplier)}"]})
 
-        # увеличиваем остатки
+        # обновляем цены (если переданы) и увеличиваем остатки
         for it in items:
             pid = it["product"].id
             qty = int(it["qty"])
-            type(by_id[pid]).objects.filter(id=pid).update(quantity=F("quantity") + qty)
+            upd = {"quantity": F("quantity") + qty}
+            if "purchase_price" in it and it["purchase_price"] is not None:
+                upd["purchase_price"] = it["purchase_price"]
+            type(by_id[pid]).objects.filter(id=pid).update(**upd)
 
         # вернём актуальные данные по товарам
         refreshed = list(self._filter_qs_company_branch(Product.objects.all()).filter(id__in=product_ids))

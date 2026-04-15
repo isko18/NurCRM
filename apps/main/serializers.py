@@ -2056,7 +2056,12 @@ class ProductListSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = Product
-        fields = ["id", "name", "code", "article", "price", "quantity", "brand", "category", "image_url", "is_favorite"]
+        fields = [
+            "id", "name", "code", "article",
+            "price", "purchase_price",
+            "quantity", "brand", "category",
+            "image_url", "is_favorite",
+        ]
 
     def get_image_url(self, obj):
         imgs = getattr(obj, "images", None)
@@ -2299,6 +2304,12 @@ class AcceptanceReadSerializer(serializers.ModelSerializer):
 class SupplierReceiptItemSerializer(serializers.Serializer):
     product = serializers.PrimaryKeyRelatedField(queryset=Product.objects.all())
     qty = serializers.IntegerField(min_value=1)
+    purchase_price = serializers.DecimalField(
+        max_digits=11,
+        decimal_places=3,
+        required=False,
+        allow_null=True,
+    )
 
 
 class SupplierReceiptCreateSerializer(serializers.Serializer):

@@ -22,6 +22,23 @@ def _shift_body(fiscal_number: str) -> dict:
     return {"fiscal_number": (fiscal_number or "").strip(), "html": "false", "css": "false"}
 
 
+def sync_ekassa_after_local_shift_open_by_id(shift_id) -> None:
+    """Вызов из фона по id смены (свежее состояние из БД)."""
+    from apps.construction.models import CashShift
+
+    sh = CashShift.objects.filter(pk=shift_id).select_related("company").first()
+    if sh:
+        sync_ekassa_after_local_shift_open(sh)
+
+
+def sync_ekassa_after_local_shift_close_by_id(shift_id) -> None:
+    from apps.construction.models import CashShift
+
+    sh = CashShift.objects.filter(pk=shift_id).select_related("company").first()
+    if sh:
+        sync_ekassa_after_local_shift_close(sh)
+
+
 def sync_ekassa_after_local_shift_open(shift) -> None:
     """После commit открытия смены в CRM."""
     from apps.construction.models import CashShift
