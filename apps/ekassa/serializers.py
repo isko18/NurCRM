@@ -55,6 +55,26 @@ class EkassaIntegrationWriteSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError({"login_email": "Обязательно при включённой интеграции."})
         if not str(pwd_in).strip() and not has_old:
             raise serializers.ValidationError({"password": "Укажите пароль eKassa."})
+
+        # Смена email без нового пароля: в БД остаётся старый cipher → логин в eKassa даёт 401 / Credentials mismatch
+        if self.instance and is_enabled:
+            old_email = (self.instance.login_email or "").strip().lower()
+            new_email = str(email).strip().lower()
+            if old_email != new_email:
+                pwd_from_request = ""
+                init = getattr(self, "initial_data", None)
+                if isinstance(init, dict):
+                    pwd_from_request = str(init.get("password") or "").strip()
+                if not pwd_from_request:
+                    raise serializers.ValidationError(
+                        {
+                            "password": (
+                                "При смене login_email обязательно передайте пароль от учётной записи eKassa "
+                                "(под этим email)."
+                            )
+                        }
+                    )
+
         return attrs
 
     def create(self, validated_data):
