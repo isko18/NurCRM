@@ -2293,6 +2293,23 @@ class AcceptanceReadSerializer(serializers.ModelSerializer):
         return self._full_or_username(getattr(obj, "accepted_by", None))
 
 
+# ===========================
+# Supplier: receipt (оприходование)
+# ===========================
+class SupplierReceiptItemSerializer(serializers.Serializer):
+    product = serializers.PrimaryKeyRelatedField(queryset=Product.objects.all())
+    qty = serializers.IntegerField(min_value=1)
+
+
+class SupplierReceiptCreateSerializer(serializers.Serializer):
+    items = SupplierReceiptItemSerializer(many=True)
+
+    def validate_items(self, items):
+        if not items:
+            raise serializers.ValidationError("items не может быть пустым.")
+        return items
+
+
 class ReturnCreateSerializer(serializers.ModelSerializer):
     class Meta:
         model = ReturnFromAgent

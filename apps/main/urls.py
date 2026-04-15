@@ -196,6 +196,13 @@ urlpatterns = [
     
     path("items-make/", ItemListCreateAPIView.as_view(), name="item-make-list-create"),
     path("items-make/<uuid:pk>/", ItemRetrieveUpdateDestroyAPIView.as_view(), name="item-make-detail"),
+
+    # -------------------------
+    # Поставщики -> товары -> оприходование
+    # -------------------------
+    path("suppliers/", SupplierListAPIView.as_view(), name="supplier-list"),
+    path("suppliers/<uuid:supplier_id>/products/", SupplierProductsListAPIView.as_view(), name="supplier-products"),
+    path("suppliers/<uuid:supplier_id>/receipt/", SupplierReceiptAPIView.as_view(), name="supplier-receipt"),
     
     
     path("subreals/", ManufactureSubrealListCreateAPIView.as_view(), name="subreal-list-create"),

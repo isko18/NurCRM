@@ -57,6 +57,7 @@ from apps.main.serializers import (
     AgentRequestCartApproveSerializer, AgentRequestCartRejectSerializer,
     AgentRequestCartSerializer, AgentRequestCartSubmitSerializer, AgentRequestItemSerializer, DealPayInputSerializer, DealRefundInputSerializer,
     MarketSaleEmployeePayProfileSerializer,
+    SupplierReceiptCreateSerializer,
 )
 from django.db.models import ProtectedError
 from apps.utils import product_images_prefetch, _is_owner_like
@@ -2663,6 +2664,99 @@ class ItemRetrieveUpdateDestroyAPIView(CompanyBranchRestrictedMixin, generics.Re
     def get_queryset(self):
         qs = super().get_queryset()
         return qs
+
+
+# ===========================
+#  Supplier (Client.type=suppliers) -> products -> receipt (оприходование)
+# ===========================
+class SupplierListAPIView(CompanyBranchRestrictedMixin, generics.ListAPIView):
+    """
+    GET /api/main/suppliers/
+    """
+    permission_classes = [permissions.IsAuthenticated]
+    serializer_class = ClientSerializer
+    filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
+    search_fields = ["full_name", "phone", "llc", "inn"]
+    ordering_fields = ["created_at", "full_name"]
+    ordering = ["-created_at"]
+
+    def get_queryset(self):
+        qs = Client.objects.filter(type=Client.StatusClient.SUPPLIERS)
+        return self._filter_qs_company_branch(qs)
+
+
+class SupplierProductsListAPIView(CompanyBranchRestrictedMixin, generics.ListAPIView):
+    """
+    GET /api/main/suppliers/<uuid:supplier_id>/products/
+    """
+    permission_classes = [permissions.IsAuthenticated]
+    serializer_class = ProductListSerializer
+    filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
+    search_fields = ["name", "barcode", "article", "code"]
+    ordering_fields = ["created_at", "updated_at", "name", "price", "quantity"]
+    ordering = ["-created_at"]
+
+    def get_queryset(self):
+        supplier_id = self.kwargs.get("supplier_id")
+        sup_qs = self._filter_qs_company_branch(Client.objects.all())
+        supplier = get_object_or_404(sup_qs, id=supplier_id, type=Client.StatusClient.SUPPLIERS)
+
+        prod_qs = self._filter_qs_company_branch(Product.objects.all())
+        return prod_qs.filter(client_id=supplier.id)
+
+
+class SupplierReceiptAPIView(CompanyBranchRestrictedMixin, APIView):
+    """
+    POST /api/main/suppliers/<uuid:supplier_id>/receipt/
+    Body:
+      {
+        "items": [
+          {"product": "<uuid>", "qty": 10},
+          {"product": "<uuid>", "qty": 3}
+        ]
+      }
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    @transaction.atomic
+    def post(self, request, supplier_id):
+        sup_qs = self._filter_qs_company_branch(Client.objects.all())
+        supplier = get_object_or_404(sup_qs, id=supplier_id, type=Client.StatusClient.SUPPLIERS)
+
+        ser = SupplierReceiptCreateSerializer(data=request.data, context={"request": request})
+        ser.is_valid(raise_exception=True)
+
+        items = ser.validated_data["items"]
+        product_ids = [it["product"].id for it in items]
+
+        prod_qs = self._filter_qs_company_branch(Product.objects.all()).select_for_update()
+        products = list(prod_qs.filter(id__in=product_ids))
+        by_id = {p.id: p for p in products}
+
+        missing = [str(pid) for pid in product_ids if pid not in by_id]
+        if missing:
+            raise ValidationError({"items": [f"Товары не найдены/не доступны: {', '.join(missing)}"]})
+
+        # проверим принадлежность поставщику
+        wrong_supplier = [str(p.id) for p in products if p.client_id != supplier.id]
+        if wrong_supplier:
+            raise ValidationError({"items": [f"Товары не принадлежат выбранному поставщику: {', '.join(wrong_supplier)}"]})
+
+        # увеличиваем остатки
+        for it in items:
+            pid = it["product"].id
+            qty = int(it["qty"])
+            type(by_id[pid]).objects.filter(id=pid).update(quantity=F("quantity") + qty)
+
+        # вернём актуальные данные по товарам
+        refreshed = list(self._filter_qs_company_branch(Product.objects.all()).filter(id__in=product_ids))
+        return Response(
+            {
+                "supplier": str(supplier.id),
+                "products": ProductListSerializer(refreshed, many=True, context={"request": request}).data,
+            },
+            status=status.HTTP_200_OK,
+        )
 
 
 # ===========================
