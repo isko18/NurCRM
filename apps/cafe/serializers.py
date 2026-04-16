@@ -379,30 +379,6 @@ class CategorySerializer(CompanyBranchReadOnlyMixin):
 
 
 # --------- Меню и ингредиенты ---------
-class _IngredientContextDecimalField(serializers.DecimalField):
-    """
-    Поле, которое:
-    - на входе валидируется как Decimal (как обычное DecimalField)
-    - на выходе берёт значение из контекста сериализатора (payload ingredients),
-      потому что в cafe-моделях эти значения не хранятся.
-    """
-
-    def __init__(self, *args, context_key: str, default_on_missing=None, **kwargs):
-        self._context_key = context_key
-        self._default_on_missing = default_on_missing
-        super().__init__(*args, **kwargs)
-
-    def get_attribute(self, instance):
-        parent = getattr(self, "parent", None)
-        if parent is None:
-            return self._default_on_missing
-        getter = getattr(parent, "_get_payload_value", None)
-        if callable(getter):
-            v = getter(instance, self._context_key, default=self._default_on_missing)
-            return v
-        return self._default_on_missing
-
-
 class IngredientInlineSerializer(serializers.ModelSerializer):
     product_title = serializers.CharField(source="product.title", read_only=True)
     product_unit = serializers.CharField(source="product.unit", read_only=True)
@@ -410,26 +386,17 @@ class IngredientInlineSerializer(serializers.ModelSerializer):
         source="product.unit_price", max_digits=12, decimal_places=2, read_only=True
     )
     ingredient_cost = serializers.SerializerMethodField()
-    unit = serializers.CharField(source="product.unit", read_only=True)
-    quantity_in_package = _IngredientContextDecimalField(
-        max_digits=12, decimal_places=3, required=False, allow_null=True,
-        context_key="quantity_in_package", default_on_missing=Decimal("0"),
-    )
-    gross_unit = serializers.SerializerMethodField()
-    gross_kg = serializers.SerializerMethodField()
-    cold_loss_percent = _IngredientContextDecimalField(
-        max_digits=5, decimal_places=2, required=False, allow_null=True,
-        context_key="cold_loss_percent", default_on_missing=Decimal("0"),
-    )
-    net_kg = serializers.SerializerMethodField()
-    hot_loss_percent = _IngredientContextDecimalField(
-        max_digits=5, decimal_places=2, required=False, allow_null=True,
-        context_key="hot_loss_percent", default_on_missing=Decimal("0"),
-    )
-    output_ready_kg = serializers.SerializerMethodField()
-    cost_price_rub = serializers.SerializerMethodField()
-    cost_per_unit_rub = serializers.SerializerMethodField()
-    cost_per_unit_weight_rub = serializers.SerializerMethodField()
+    unit = serializers.CharField(read_only=True)
+    quantity_in_package = serializers.DecimalField(max_digits=12, decimal_places=3, required=False)
+    gross_unit = serializers.DecimalField(max_digits=12, decimal_places=5, read_only=True)
+    gross_kg = serializers.DecimalField(max_digits=12, decimal_places=3, read_only=True, allow_null=True)
+    cold_loss_percent = serializers.DecimalField(max_digits=5, decimal_places=2, required=False)
+    net_kg = serializers.DecimalField(max_digits=12, decimal_places=3, read_only=True, allow_null=True)
+    hot_loss_percent = serializers.DecimalField(max_digits=5, decimal_places=2, required=False)
+    output_ready_kg = serializers.DecimalField(max_digits=12, decimal_places=3, read_only=True, allow_null=True)
+    cost_price_rub = serializers.DecimalField(max_digits=12, decimal_places=2, read_only=True)
+    cost_per_unit_rub = serializers.DecimalField(max_digits=12, decimal_places=2, read_only=True)
+    cost_per_unit_weight_rub = serializers.DecimalField(max_digits=12, decimal_places=2, read_only=True, allow_null=True)
 
     class Meta:
         model = Ingredient
@@ -456,12 +423,9 @@ class IngredientInlineSerializer(serializers.ModelSerializer):
             "product_unit_price",
             "ingredient_cost",
             "unit",
-            "quantity_in_package",
             "gross_unit",
             "gross_kg",
-            "cold_loss_percent",
             "net_kg",
-            "hot_loss_percent",
             "output_ready_kg",
             "cost_price_rub",
             "cost_per_unit_rub",
@@ -484,71 +448,6 @@ class IngredientInlineSerializer(serializers.ModelSerializer):
         unit_price = obj.product.unit_price or Decimal("0.00")
         amount = obj.amount or Decimal("0.00")
         return (unit_price * amount).quantize(Decimal("0.01"))
-
-    def _get_payload_value(self, obj, key: str, default=None):
-        """
-        Берём входные значения из payload (ingredients) по product_id,
-        чтобы можно было делать расчёты "у нас" без сохранения в БД.
-        """
-        m = self.context.get("_ingredient_inputs") or {}
-        if not getattr(obj, "product_id", None):
-            return default
-        rec = m.get(str(obj.product_id))
-        if not isinstance(rec, dict):
-            return default
-        val = rec.get(key, default)
-        return default if val is None else val
-
-    @staticmethod
-    def _to_kg(amount: Decimal, unit: str | None) -> Decimal | None:
-        if amount is None:
-            return None
-        u = (unit or "").strip().lower()
-        if not u:
-            return None
-        if u in ("кг", "kg"):
-            return amount
-        if u in ("г", "гр", "g"):
-            return (amount / Decimal("1000"))
-        return None
-
-    def get_gross_unit(self, obj):
-        # Брутто в базовой ед. изм. товара
-        return obj.amount or Decimal("0")
-
-    def get_gross_kg(self, obj):
-        kg = self._to_kg(obj.amount or Decimal("0"), getattr(obj.product, "unit", None))
-        return kg.quantize(Decimal("0.001")) if kg is not None else None
-
-    def get_net_kg(self, obj):
-        gross_kg = self._to_kg(obj.amount or Decimal("0"), getattr(obj.product, "unit", None))
-        if gross_kg is None:
-            return None
-        cold_loss = self._get_payload_value(obj, "cold_loss_percent", default=Decimal("0")) or Decimal("0")
-        net = gross_kg * (Decimal("1") - (cold_loss / Decimal("100")))
-        return net.quantize(Decimal("0.001"))
-
-    def get_output_ready_kg(self, obj):
-        net_kg = self.get_net_kg(obj)
-        if net_kg is None:
-            return None
-        hot_loss = self._get_payload_value(obj, "hot_loss_percent", default=Decimal("0")) or Decimal("0")
-        out = net_kg * (Decimal("1") - (hot_loss / Decimal("100")))
-        return out.quantize(Decimal("0.001"))
-
-    def get_cost_price_rub(self, obj):
-        # Себестоимость ингредиента (р.) = количество * цена за единицу
-        return self.get_ingredient_cost(obj)
-
-    def get_cost_per_unit_rub(self, obj):
-        return (obj.product.unit_price or Decimal("0.00")).quantize(Decimal("0.01"))
-
-    def get_cost_per_unit_weight_rub(self, obj):
-        out_kg = self.get_output_ready_kg(obj)
-        if not out_kg or out_kg == 0:
-            return None
-        cost = (obj.product.unit_price or Decimal("0.00")) * (obj.amount or Decimal("0"))
-        return (cost / out_kg).quantize(Decimal("0.01"))
 
     def validate(self, attrs):
         # model.clean() на связях добьёт; здесь ничего лишнего
@@ -678,32 +577,18 @@ class MenuItemSerializer(CompanyBranchReadOnlyMixin):
         return attrs
 
     def _upsert_ingredients(self, menu_item, ing_list):
-        to_create = []
         for ing in ing_list:
-            to_create.append(Ingredient(
+            qty_in_pack = ing.get("quantity_in_package", Decimal("0"))
+            cold = ing.get("cold_loss_percent", Decimal("0"))
+            hot = ing.get("hot_loss_percent", Decimal("0"))
+            Ingredient.objects.create(
                 menu_item=menu_item,
                 product=ing["product"],
-                amount=ing["amount"]
-            ))
-        if to_create:
-            Ingredient.objects.bulk_create(to_create)
-
-    def _remember_ingredient_inputs(self, ing_list):
-        """
-        Запоминаем входные поля ингредиентов (не храним в БД),
-        чтобы вернуть расчёты в ответе API после save().
-        """
-        m = {}
-        for ing in ing_list or []:
-            prod = ing.get("product")
-            if not prod:
-                continue
-            m[str(prod.id)] = {
-                "quantity_in_package": ing.get("quantity_in_package"),
-                "cold_loss_percent": ing.get("cold_loss_percent"),
-                "hot_loss_percent": ing.get("hot_loss_percent"),
-            }
-        self.context["_ingredient_inputs"] = m
+                amount=ing["amount"],
+                quantity_in_package=qty_in_pack,
+                cold_loss_percent=cold,
+                hot_loss_percent=hot,
+            )
 
     def _recalc_and_save_cost(self, menu_item):
         """Пересчитать и сохранить себестоимость"""
@@ -716,7 +601,6 @@ class MenuItemSerializer(CompanyBranchReadOnlyMixin):
             with transaction.atomic():
                 obj = super().create(validated_data)
                 if ingredients:
-                    self._remember_ingredient_inputs(ingredients)
                     self._upsert_ingredients(obj, ingredients)
                 # Пересчитываем себестоимость после добавления ингредиентов
                 self._recalc_and_save_cost(obj)
@@ -736,7 +620,6 @@ class MenuItemSerializer(CompanyBranchReadOnlyMixin):
             with transaction.atomic():
                 obj = super().update(instance, validated_data)
                 if ingredients is not None:
-                    self._remember_ingredient_inputs(ingredients)
                     instance.ingredients.all().delete()
                     if ingredients:
                         self._upsert_ingredients(instance, ingredients)

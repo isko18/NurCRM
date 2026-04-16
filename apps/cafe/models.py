@@ -686,6 +686,39 @@ class Ingredient(models.Model):
     )
     amount = models.DecimalField("Норма (в ед. товара)", max_digits=12, decimal_places=5)
 
+    # Хранимые поля техкарты (ввод с фронта + расчёты)
+    unit = models.CharField("Ед. изм.", max_length=32, blank=True, default="")
+    quantity_in_package = models.DecimalField(
+        "Количество в фасовке", max_digits=12, decimal_places=3, default=Decimal("0")
+    )
+    gross_unit = models.DecimalField(
+        "Брутто, ед. изм.", max_digits=12, decimal_places=5, default=Decimal("0")
+    )
+    gross_kg = models.DecimalField(
+        "Брутто, кг.", max_digits=12, decimal_places=3, null=True, blank=True
+    )
+    cold_loss_percent = models.DecimalField(
+        "Потери при холодной обработке, %", max_digits=5, decimal_places=2, default=Decimal("0")
+    )
+    net_kg = models.DecimalField(
+        "Нетто, кг.", max_digits=12, decimal_places=3, null=True, blank=True
+    )
+    hot_loss_percent = models.DecimalField(
+        "Потери при горячей обработке, %", max_digits=5, decimal_places=2, default=Decimal("0")
+    )
+    output_ready_kg = models.DecimalField(
+        "Выход готового продукта, кг.", max_digits=12, decimal_places=3, null=True, blank=True
+    )
+    cost_price_rub = models.DecimalField(
+        "Себестоимость, р.", max_digits=12, decimal_places=2, default=Decimal("0.00")
+    )
+    cost_per_unit_rub = models.DecimalField(
+        "Стоимость за ед., р.", max_digits=12, decimal_places=2, default=Decimal("0.00")
+    )
+    cost_per_unit_weight_rub = models.DecimalField(
+        "Стоимость за ед. веса, р.", max_digits=12, decimal_places=2, null=True, blank=True
+    )
+
     class Meta:
         verbose_name = "Ингредиент"
         verbose_name_plural = "Ингредиенты"
@@ -702,6 +735,62 @@ class Ingredient(models.Model):
 
     def __str__(self):
         return f"{self.product.title} ({self.amount} {self.product.unit})"
+
+    @staticmethod
+    def _to_kg(amount: Decimal, unit: str | None) -> Decimal | None:
+        if amount is None:
+            return None
+        u = (unit or "").strip().lower()
+        if not u:
+            return None
+        if u in ("кг", "kg"):
+            return amount
+        if u in ("г", "гр", "g"):
+            return (amount / Decimal("1000"))
+        return None
+
+    def recalc_tech_fields(self):
+        """
+        Пересчёт хранимых тех. полей на основе:
+        - product.unit, product.unit_price
+        - amount
+        - quantity_in_package, cold_loss_percent, hot_loss_percent (как введено)
+        """
+        prod_unit = getattr(self.product, "unit", "") or ""
+        self.unit = (self.unit or prod_unit) or prod_unit
+
+        self.gross_unit = self.amount or Decimal("0")
+
+        gross_kg = self._to_kg(self.amount or Decimal("0"), prod_unit)
+        self.gross_kg = gross_kg.quantize(Decimal("0.001")) if gross_kg is not None else None
+
+        if self.gross_kg is not None:
+            cold = self.cold_loss_percent or Decimal("0")
+            net = self.gross_kg * (Decimal("1") - (cold / Decimal("100")))
+            self.net_kg = net.quantize(Decimal("0.001"))
+        else:
+            self.net_kg = None
+
+        if self.net_kg is not None:
+            hot = self.hot_loss_percent or Decimal("0")
+            out = self.net_kg * (Decimal("1") - (hot / Decimal("100")))
+            self.output_ready_kg = out.quantize(Decimal("0.001"))
+        else:
+            self.output_ready_kg = None
+
+        unit_price = getattr(self.product, "unit_price", None) or Decimal("0.00")
+        self.cost_per_unit_rub = Decimal(unit_price).quantize(Decimal("0.01"))
+        self.cost_price_rub = (Decimal(unit_price) * (self.amount or Decimal("0"))).quantize(Decimal("0.01"))
+
+        if self.output_ready_kg and self.output_ready_kg != 0:
+            self.cost_per_unit_weight_rub = (self.cost_price_rub / self.output_ready_kg).quantize(Decimal("0.01"))
+        else:
+            self.cost_per_unit_weight_rub = None
+
+    def save(self, *args, **kwargs):
+        if self.product_id:
+            self.recalc_tech_fields()
+        super().save(*args, **kwargs)
 
 
 # ==========================
