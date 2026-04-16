@@ -75,6 +75,7 @@ urlpatterns = [
     path('analytics/', AnalyticsListAPIView.as_view(), name='analytics-list'),
     path('analytics/dashboard/', OwnerDashboardAnalyticsAPIView.as_view(), name='analytics-dashboard'),
     path('analytics/dashboard/my/', MyDashboardAnalyticsAPIView.as_view(), name='analytics-dashboard-my'),
+    path("analytics/cards/details/", AnalyticsCardDetailsAPIView.as_view(), name="analytics-card-details"),
 
     # 🔹 Отзывы
     path('reviews/', ReviewListCreateAPIView.as_view(), name='review-list-create'),

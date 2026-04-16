@@ -13,6 +13,8 @@ from django.db.models import (
     Value as V,
     F,
     DecimalField,
+    Subquery,
+    OuterRef,
     Q,
 )
 from django.db.models.functions import Coalesce, TruncDate
@@ -25,6 +27,9 @@ from .models import (
     AgentSaleAllocation,
     Sale,
     SaleItem,
+    Client,
+    ClientDeal,
+    DealInstallment,
 )
 from apps.users.models import User
 
@@ -276,6 +281,26 @@ def build_agent_analytics_payload(
     )["s"] or Decimal("0.00")
     sales_amount = float(sales_amount_dec)
 
+    # ---------------- 0) методы оплаты ----------------
+    payment_breakdown_qs = (
+        sales_qs.values("payment_method")
+        .annotate(
+            sales_count=Count("id"),
+            sales_amount=Coalesce(Sum("total"), ZERO_MONEY),
+        )
+        .order_by("-sales_amount")
+    )
+    payment_labels = {k: v for k, v in Sale.PaymentMethod.choices}
+    payment_breakdown = [
+        {
+            "payment_method": row["payment_method"],
+            "payment_method_label": payment_labels.get(row["payment_method"], row["payment_method"]),
+            "sales_count": row["sales_count"],
+            "sales_amount": float(row["sales_amount"] or Decimal("0.00")),
+        }
+        for row in payment_breakdown_qs
+    ]
+
     items_qs = SaleItem.objects.filter(sale__in=sales_qs)
 
     # ---------------- 1) продажи по товарам ----------------
@@ -344,6 +369,47 @@ def build_agent_analytics_payload(
     #        Т О В А Р Ы  Н А  Р У К А Х
     # ======================================================
     on_hand = _compute_agent_on_hand(company=company, branch=branch, agent=agent)
+
+    # ======================================================
+    #      Д О Л Г  К Л И Е Н Т О В  А Г Е Н Т А  (текущий)
+    # ======================================================
+    # Клиенты агента: Client.salesperson = agent
+    clients_qs = Client.objects.filter(company=company, salesperson=agent)
+    if branch is not None:
+        clients_qs = clients_qs.filter(branch=branch)
+    else:
+        clients_qs = clients_qs.filter(branch__isnull=True)
+
+    # Долги по рассрочкам/сделкам (ClientDeal.Kind.DEBT): остаток = (amount-prepayment) - sum(paid_installments)
+    deals_qs = ClientDeal.objects.filter(company=company, kind=ClientDeal.Kind.DEBT, client__in=clients_qs)
+    if branch is not None:
+        deals_qs = deals_qs.filter(branch=branch)
+    else:
+        deals_qs = deals_qs.filter(branch__isnull=True)
+
+    paid_subq = (
+        DealInstallment.objects.filter(deal_id=OuterRef("pk"))
+        .values("deal_id")
+        .annotate(s=Sum("paid_amount"))
+        .values("s")[:1]
+    )
+    deals_remaining_dec = (
+        deals_qs
+        .annotate(paid=Coalesce(Subquery(paid_subq), V(Decimal("0.00"), output_field=MONEY_FIELD)))
+        .annotate(remaining=(F("amount") - F("prepayment")) - F("paid"))
+        .aggregate(t=Coalesce(Sum("remaining"), ZERO_MONEY))["t"]
+        or Decimal("0.00")
+    )
+
+    # Долги по продажам POS агента со статусом DEBT (не оплачены)
+    sales_debt_qs = Sale.objects.filter(company=company, user=agent, status=Sale.Status.DEBT)
+    if branch is not None:
+        sales_debt_qs = sales_debt_qs.filter(branch=branch)
+    else:
+        sales_debt_qs = sales_debt_qs.filter(branch__isnull=True)
+    pos_sales_debt_dec = sales_debt_qs.aggregate(s=Coalesce(Sum("total"), ZERO_MONEY))["s"] or Decimal("0.00")
+
+    accounts_receivable_dec = (deals_remaining_dec or Decimal("0.00")) + (pos_sales_debt_dec or Decimal("0.00"))
 
     # ======================================================
     #      П Е Р Е Д А Ч И  П О  Д Н Я М
@@ -420,11 +486,15 @@ def build_agent_analytics_payload(
             "sales_amount": sales_amount,
             "items_on_hand_qty": on_hand["total_qty"],
             "items_on_hand_amount": on_hand["total_amount"],
+            "accounts_receivable": float(accounts_receivable_dec),
+            "accounts_receivable_client_deals": float(deals_remaining_dec or Decimal("0.00")),
+            "accounts_receivable_pos_sales": float(pos_sales_debt_dec or Decimal("0.00")),
         },
         "charts": {
             "sales_by_date": sales_by_date,
             "sales_by_product_amount": sales_by_product_amount,
             "sales_distribution_by_product": sales_distribution_by_product,
+            "sales_by_payment_method": payment_breakdown,
             "on_hand_by_product_qty": on_hand["by_product_qty"],
             "on_hand_by_product_amount": on_hand["by_product_amount"],
             "transfers_by_date": transfers_by_date,

@@ -1,5 +1,5 @@
 from decimal import Decimal, ROUND_HALF_UP
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from django.db import transaction, IntegrityError
 from django.db.models import Sum, Count, Avg, F, Q, Prefetch, Value as V, Exists, OuterRef
@@ -1432,44 +1432,39 @@ class ProductRetrieveUpdateDestroyAPIView(CompanyBranchRestrictedMixin, generics
             # Parse and validate new recipe
             seen_ids = set()
             new_recipe_entries = []
+            recipe_errors = []
             for idx, entry in enumerate(recipe_input):
                 if not isinstance(entry, dict):
-                    return Response(
-                        {"recipe": f"Элемент #{idx}: ожидается объект."},
-                        status=status.HTTP_400_BAD_REQUEST,
-                    )
+                    recipe_errors.append(f"Элемент #{idx}: ожидается объект.")
+                    continue
                 raw_id = entry.get("id")
                 raw_qty = entry.get("qty_per_unit")
                 if not raw_id:
-                    return Response(
-                        {"recipe": f"Элемент #{idx}: отсутствует id."},
-                        status=status.HTTP_400_BAD_REQUEST,
-                    )
+                    recipe_errors.append(f"Элемент #{idx}: отсутствует id.")
+                    continue
                 if raw_qty is None:
-                    return Response(
-                        {"recipe": f"Элемент #{idx}: отсутствует qty_per_unit."},
-                        status=status.HTTP_400_BAD_REQUEST,
-                    )
+                    recipe_errors.append(f"Элемент #{idx}: отсутствует qty_per_unit.")
+                    continue
                 try:
                     qty_per_unit = Decimal(str(raw_qty))
                 except Exception:
-                    return Response(
-                        {"recipe": f"Элемент #{idx}: qty_per_unit — неверный формат."},
-                        status=status.HTTP_400_BAD_REQUEST,
-                    )
+                    recipe_errors.append(f"Элемент #{idx}: qty_per_unit — неверный формат.")
+                    continue
                 if qty_per_unit <= 0:
-                    return Response(
-                        {"recipe": f"Элемент #{idx}: qty_per_unit должен быть > 0."},
-                        status=status.HTTP_400_BAD_REQUEST,
-                    )
+                    recipe_errors.append(f"Элемент #{idx}: qty_per_unit должен быть > 0.")
+                    continue
                 str_id = str(raw_id)
                 if str_id in seen_ids:
-                    return Response(
-                        {"recipe": f"Элемент #{idx}: дубликат id={raw_id}."},
-                        status=status.HTTP_400_BAD_REQUEST,
-                    )
+                    recipe_errors.append(f"Элемент #{idx}: дубликат id={raw_id}.")
+                    continue
                 seen_ids.add(str_id)
                 new_recipe_entries.append({"id": str_id, "qty_per_unit": qty_per_unit})
+
+            if recipe_errors:
+                return Response(
+                    {"recipe": recipe_errors},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
 
         # ---- Read old state ----
         old_quantity = Decimal(str(instance.quantity or 0))
@@ -1514,17 +1509,21 @@ class ProductRetrieveUpdateDestroyAPIView(CompanyBranchRestrictedMixin, generics
                 )
 
             # Check stock sufficiency for items that need deduction (delta > 0)
+            insufficiency_errors = []
             for im_id, delta in deltas.items():
                 if delta > 0:
                     im = ims_map[im_id]
                     if im.quantity < delta:
-                        return Response(
-                            {"recipe": (
-                                f"Недостаточно сырья «{im.name}»: "
-                                f"нужно досписать {delta}, доступно {im.quantity}."
-                            )},
-                            status=status.HTTP_400_BAD_REQUEST,
+                        insufficiency_errors.append(
+                            f"Недостаточно сырья «{im.name}»: "
+                            f"нужно досписать {delta}, доступно {im.quantity}."
                         )
+
+            if insufficiency_errors:
+                return Response(
+                    {"recipe": insufficiency_errors},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
 
             # Apply deltas
             for im_id, delta in deltas.items():
@@ -2769,7 +2768,7 @@ class ManufactureSubrealListCreateAPIView(CompanyBranchRestrictedMixin, generics
     permission_classes = [permissions.IsAuthenticated]
     serializer_class = ManufactureSubrealSerializer
     filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
-    filterset_fields = ["agent", "product", "status", "created_at"]
+    filterset_fields = ["agent", "product", "status", "created_at", "external_ref"]
     # если нужен трек-номер, добавьте "agent__track_number"
     search_fields = ["product__name", "agent__username", "agent__first_name", "agent__last_name"]
     ordering_fields = ["created_at", "qty_transferred", "qty_accepted", "status"]
@@ -3157,6 +3156,7 @@ class ManufactureSubrealBulkCreateAPIView(APIView, CompanyBranchRestrictedMixin)
         user = self._user()
         company = self._company()
         branch = self._auto_branch()
+        transfer_ref = str(uuid4())
 
         created_objs = []
 
@@ -3201,6 +3201,7 @@ class ManufactureSubrealBulkCreateAPIView(APIView, CompanyBranchRestrictedMixin)
                 user=user,
                 agent=agent,
                 product=product,
+                external_ref=transfer_ref,
                 qty_transferred=qty,
                 is_sawmill=is_sawmill,
             )
@@ -4174,3 +4175,135 @@ class OwnerOverallAnalyticsAPIView(CompanyBranchRestrictedMixin, APIView):
             **period_params,
         )
         return Response(data, status=status.HTTP_200_OK)
+
+
+class AnalyticsCardDetailsAPIView(CompanyBranchRestrictedMixin, APIView):
+    """
+    GET /api/main/analytics/cards/details/?card=<key>
+
+    Деталка для модалки по клику на карточку в аналитике.
+    Доступ: любой авторизованный пользователь (агенты тоже).
+
+    Поддерживаемые card:
+      - stock_purchase_value (alias: stock_value)
+      - stock_retail_value
+      - raw_material_value
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request, *args, **kwargs):
+        card = (request.query_params.get("card") or "").strip()
+        if not card:
+            raise ValidationError({"card": "Required. Example: card=stock_purchase_value"})
+
+        # простая пагинация под модалку (не DRF pagination, чтобы фронту было проще)
+        limit = _parse_int_nonneg(request.query_params.get("limit"), default=200, maximum=1000)
+        offset = _parse_int_nonneg(request.query_params.get("offset"), default=0, maximum=1000000)
+
+        company = self._company()
+        if company is None:
+            return Response({"detail": "У вас не задана компания."}, status=status.HTTP_400_BAD_REQUEST)
+
+        # branch фильтруем так же, как products/list и items-make (через миксин)
+        branch = self._auto_branch()
+
+        # ----- stock: products -----
+        if card in ("stock_purchase_value", "stock_value", "stock_retail_value"):
+            qs = Product.objects.all()
+            qs = self._filter_qs_company_branch(qs)
+            qs = qs.order_by("name", "id")
+
+            total_count = qs.count()
+            page = list(qs[offset: offset + limit].values(
+                "id", "name", "quantity", "purchase_price", "price", "unit", "kind",
+            ))
+
+            items = []
+            total_purchase = Decimal("0.00")
+            total_retail = Decimal("0.00")
+            for p in page:
+                qty = _to_dec(p.get("quantity"), default=Decimal("0"))
+                purchase_price = _to_dec(p.get("purchase_price"), default=Decimal("0"))
+                retail_price = _to_dec(p.get("price"), default=Decimal("0"))
+                purchase_sum = (qty * purchase_price).quantize(_Q2, rounding=ROUND_HALF_UP)
+                retail_sum = (qty * retail_price).quantize(_Q2, rounding=ROUND_HALF_UP)
+                total_purchase += purchase_sum
+                total_retail += retail_sum
+                items.append({
+                    "id": str(p["id"]),
+                    "name": p["name"],
+                    "unit": p.get("unit"),
+                    "kind": p.get("kind"),
+                    "quantity": str(qty),
+                    "purchase_price": str(purchase_price),
+                    "retail_price": str(retail_price),
+                    "purchase_sum": str(purchase_sum),
+                    "retail_sum": str(retail_sum),
+                })
+
+            return Response({
+                "card": card,
+                "branch_id": str(getattr(branch, "id", "")) if branch else None,
+                "count": total_count,
+                "offset": offset,
+                "limit": limit,
+                "totals": {
+                    "purchase_sum": str(total_purchase.quantize(_Q2, rounding=ROUND_HALF_UP)),
+                    "retail_sum": str(total_retail.quantize(_Q2, rounding=ROUND_HALF_UP)),
+                },
+                "items": items,
+            })
+
+        # ----- raw materials: item make -----
+        if card == "raw_material_value":
+            qs = ItemMake.objects.select_related("supplier").all()
+            qs = self._filter_qs_company_branch(qs)
+            qs = qs.order_by("name", "id")
+
+            total_count = qs.count()
+            page = list(qs[offset: offset + limit].values(
+                "id", "name", "quantity", "unit", "price",
+                "supplier_id", "supplier__full_name",
+            ))
+
+            items = []
+            total_sum = Decimal("0.00")
+            for it in page:
+                qty = _to_dec(it.get("quantity"), default=Decimal("0"))
+                price = _to_dec(it.get("price"), default=Decimal("0"))
+                s = (qty * price).quantize(_Q2, rounding=ROUND_HALF_UP)
+                total_sum += s
+                items.append({
+                    "id": str(it["id"]),
+                    "name": it["name"],
+                    "unit": it.get("unit"),
+                    "quantity": str(qty),
+                    "price": str(price),
+                    "sum": str(s),
+                    "supplier": (
+                        {"id": str(it["supplier_id"]), "full_name": it.get("supplier__full_name")}
+                        if it.get("supplier_id") else None
+                    ),
+                })
+
+            return Response({
+                "card": card,
+                "branch_id": str(getattr(branch, "id", "")) if branch else None,
+                "count": total_count,
+                "offset": offset,
+                "limit": limit,
+                "totals": {
+                    "sum": str(total_sum.quantize(_Q2, rounding=ROUND_HALF_UP)),
+                },
+                "items": items,
+            })
+
+        raise ValidationError({
+            "card": f"Unsupported card: {card}",
+            "supported": [
+                "stock_purchase_value",
+                "stock_retail_value",
+                "raw_material_value",
+                "stock_value",
+            ],
+        })

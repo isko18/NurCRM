@@ -10,6 +10,37 @@ API общей аналитики владельца компании. Дост�
 GET /api/main/owners/analytics/
 ```
 
+## Детализация карточек (для модалки)
+
+Отдельный эндпоинт для получения подробного списка по карточке (кликабельные карточки).
+Доступен всем авторизованным пользователям (включая агентов).
+
+```
+GET /api/main/analytics/cards/details/?card=<key>
+```
+
+### Параметры
+
+| Параметр | Тип | Описание | Обязательный | По умолчанию |
+|----------|-----|----------|---------------|--------------|
+| `card` | string | Ключ карточки | Да | — |
+| `limit` | int | Лимит строк | Нет | 200 |
+| `offset` | int | Смещение | Нет | 0 |
+| `branch` | uuid | ID филиала (через миксин) | Нет | — |
+
+### Поддерживаемые `card`
+
+- `stock_purchase_value` (alias: `stock_value`) — **Закупочная цена склада**
+- `stock_retail_value` — **Розничная цена склада**
+- `raw_material_value` — **Цена сырья**
+
+### Примеры
+
+```http
+GET /api/main/analytics/cards/details/?card=stock_purchase_value&limit=200&offset=0
+GET /api/main/analytics/cards/details/?card=raw_material_value
+```
+
 ## Параметры запроса
 
 | Параметр | Тип | Описание | Обязательный | По умолчанию |
@@ -64,7 +95,9 @@ GET /api/main/owners/analytics/?period=day&date=2024-03-15
     "sales_count": 340,
     "sales_amount": "1250000.00",
     "gross_profit": "380000.00",
-    "stock_value": "890000.00",
+    "stock_purchase_value": "890000.00",
+    "stock_retail_value": "1240000.00",
+    "raw_material_value": "210000.00",
     "total_debt": "45000.00"
   },
   "charts": {
@@ -92,13 +125,17 @@ GET /api/main/owners/analytics/?period=day&date=2024-03-15
 | `sales_count` | integer | Количество оплаченных продаж |
 | `sales_amount` | string | Сумма продаж (Decimal) |
 | **`gross_profit`** | string | **Валовая прибыль** (выручка − себестоимость) |
-| **`stock_value`** | string | **Стоимость склада** (остатки × закупочная цена) |
+| **`stock_purchase_value`** | string | **Закупочная цена склада** (остатки × закупочная цена) |
+| **`stock_retail_value`** | string | **Розничная цена склада** (остатки × розничная цена) |
+| **`raw_material_value`** | string | **Цена сырья** (остатки сырья × цена сырья) |
 | **`total_debt`** | string | **Общий долг** (сумма непогашенных долгов) |
 
 ### Расчёт показателей
 
 - **gross_profit** — по оплаченным продажам: `Σ(quantity × unit_price) − Σ(quantity × purchase_price_snapshot)`
-- **stock_value** — по товарам: `Σ(quantity × purchase_price)`
+- **stock_purchase_value** — по товарам: `Σ(quantity × purchase_price)`
+- **stock_retail_value** — по товарам: `Σ(quantity × price)`
+- **raw_material_value** — по сырью (ItemMake): `Σ(quantity × price)`
 - **total_debt** — по долгам: `Σ(amount − paid)` для каждого долга
 
 ---

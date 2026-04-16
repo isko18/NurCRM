@@ -9,12 +9,18 @@ from django.db.models.expressions import ExpressionWrapper
 
 from apps.users.models import User
 from apps.construction.models import CashFlow
-from .models import ManufactureSubreal, Acceptance, Sale, SaleItem, ClientDeal, DealInstallment, Product
+from .models import ManufactureSubreal, Acceptance, Sale, SaleItem, ClientDeal, DealInstallment, Product, ItemMake
 
 try:
     from apps.warehouse.models import Document as WarehouseStockDocument
 except Exception:  # pragma: no cover - склад может быть отключён в тестах без миграций
     WarehouseStockDocument = None
+
+try:
+    from apps.warehouse.models import MoneyDocument as WarehouseMoneyDocument, Counterparty as WarehouseCounterparty
+except Exception:  # pragma: no cover
+    WarehouseMoneyDocument = None
+    WarehouseCounterparty = None
 
 try:
     from apps.building.models import BuildingDebtLedgerEntry
@@ -278,9 +284,14 @@ def build_owner_analytics_payload(*, company, branch, period, date_from, date_to
     # ======================================================
     # Gross profit (валовая прибыль): revenue − COGS; маржа % = прибыль / выручка × 100
     # ======================================================
+    # Выручка должна учитывать скидки по строкам (line_discount), иначе валовая прибыль завышается.
+    revenue_expr = ExpressionWrapper(
+        (F("quantity") * F("unit_price")) - Coalesce(F("line_discount"), ZERO_MONEY),
+        output_field=MONEY_FIELD,
+    )
     items_agg = items_qs.aggregate(
         revenue=Coalesce(
-            Sum(F("quantity") * F("unit_price"), output_field=MONEY_FIELD),
+            Sum(revenue_expr, output_field=MONEY_FIELD),
             ZERO_MONEY,
         ),
         cogs=Coalesce(
@@ -301,7 +312,7 @@ def build_owner_analytics_payload(*, company, branch, period, date_from, date_to
         .values("period")
         .annotate(
             revenue_p=Coalesce(
-                Sum(F("quantity") * F("unit_price"), output_field=MONEY_FIELD),
+                Sum(revenue_expr, output_field=MONEY_FIELD),
                 ZERO_MONEY,
             ),
             cogs_p=Coalesce(
@@ -328,7 +339,9 @@ def build_owner_analytics_payload(*, company, branch, period, date_from, date_to
     # ======================================================
     products_qs = Product.objects.filter(company=company)
     if branch is not None:
-        products_qs = products_qs.filter(Q(branch=branch) | Q(branch__isnull=True))
+        # важно: как в ProductListView через CompanyBranchRestrictedMixin
+        # при выбранном филиале берём ТОЛЬКО его записи (без branch=NULL)
+        products_qs = products_qs.filter(branch=branch)
     else:
         products_qs = products_qs.filter(branch__isnull=True)
     stock_value_dec = (
@@ -337,6 +350,43 @@ def build_owner_analytics_payload(*, company, branch, period, date_from, date_to
                 Sum(
                     Coalesce(F("quantity"), V(Decimal("0"), output_field=QTY_FIELD))
                     * F("purchase_price"),
+                    output_field=MONEY_FIELD,
+                ),
+                ZERO_MONEY,
+            )
+        )["v"]
+        or Decimal("0.00")
+    )
+
+    # Стоимость склада по розничной цене: sum(quantity * price)
+    stock_retail_value_dec = (
+        products_qs.aggregate(
+            v=Coalesce(
+                Sum(
+                    Coalesce(F("quantity"), V(Decimal("0"), output_field=QTY_FIELD))
+                    * F("price"),
+                    output_field=MONEY_FIELD,
+                ),
+                ZERO_MONEY,
+            )
+        )["v"]
+        or Decimal("0.00")
+    )
+
+    # Стоимость сырья: sum(quantity * price) по ItemMake
+    item_make_qs = ItemMake.objects.filter(company=company)
+    if branch is not None:
+        # важно: как в ItemListCreateAPIView через CompanyBranchRestrictedMixin
+        item_make_qs = item_make_qs.filter(branch=branch)
+    else:
+        item_make_qs = item_make_qs.filter(branch__isnull=True)
+
+    raw_material_value_dec = (
+        item_make_qs.aggregate(
+            v=Coalesce(
+                Sum(
+                    Coalesce(F("quantity"), V(Decimal("0"), output_field=QTY_FIELD))
+                    * F("price"),
                     output_field=MONEY_FIELD,
                 ),
                 ZERO_MONEY,
@@ -383,37 +433,72 @@ def build_owner_analytics_payload(*, company, branch, period, date_from, date_to
     accounts_receivable_dec = client_deals_receivable_dec + pos_sales_receivable_dec
 
     # Кредиторская задолженность:
-    # - проведённые закупки в долг (склад), остаток total − предоплата
+    # - поставщики (склад): считаем сальдо по контрагентам как в сверке склада
+    #   company_owes_counterparty = max( -( (doc_debit + money_expense) - (doc_credit + money_receipt) ), 0 )
     # - долги поставщикам из строительного реестра (building debt ledger)
     accounts_payable_dec = Decimal("0.00")
-    if WarehouseStockDocument is not None:
-        ap_qs = WarehouseStockDocument.objects.filter(
-            doc_type=WarehouseStockDocument.DocType.PURCHASE,
-            status=WarehouseStockDocument.Status.POSTED,
-            payment_kind=WarehouseStockDocument.PaymentKind.CREDIT,
-        ).filter(
-            Q(warehouse_from__company=company)
-            | Q(warehouse_from__isnull=True, warehouse_to__company=company)
+    if WarehouseStockDocument is not None and WarehouseMoneyDocument is not None and WarehouseCounterparty is not None:
+        # контрагенты-поставщики компании
+        cp_qs = WarehouseCounterparty.objects.filter(company=company).filter(
+            Q(type=WarehouseCounterparty.Type.SUPPLIER) | Q(type=WarehouseCounterparty.Type.BOTH)
         )
         if branch is not None:
-            ap_qs = ap_qs.filter(
-                Q(warehouse_from__branch=branch)
-                | Q(warehouse_from__isnull=True, warehouse_to__branch=branch)
-            )
+            cp_qs = cp_qs.filter(branch=branch)
         else:
-            ap_qs = ap_qs.filter(
-                Q(warehouse_from__branch__isnull=True)
-                | Q(warehouse_from__isnull=True, warehouse_to__branch__isnull=True)
-            )
-        due_expr = ExpressionWrapper(
-            F("total") - Coalesce(F("prepayment_amount"), V(Decimal("0"), output_field=MONEY_FIELD)),
-            output_field=MONEY_FIELD,
+            cp_qs = cp_qs.filter(branch__isnull=True)
+
+        # товарные документы (проведённые) с контрагентом
+        trade_doc_types = (
+            WarehouseStockDocument.DocType.SALE,
+            WarehouseStockDocument.DocType.PURCHASE,
+            WarehouseStockDocument.DocType.SALE_RETURN,
+            WarehouseStockDocument.DocType.PURCHASE_RETURN,
         )
-        accounts_payable_dec = (
-            ap_qs.annotate(due=due_expr)
-            .aggregate(s=Coalesce(Sum("due"), ZERO_MONEY))["s"]
-            or Decimal("0.00")
+        doc_debit_types = (WarehouseStockDocument.DocType.SALE, WarehouseStockDocument.DocType.PURCHASE_RETURN)
+        doc_credit_types = (WarehouseStockDocument.DocType.PURCHASE, WarehouseStockDocument.DocType.SALE_RETURN)
+
+        docs_qs = WarehouseStockDocument.objects.filter(
+            status=WarehouseStockDocument.Status.POSTED,
+            doc_type__in=trade_doc_types,
+            counterparty__in=cp_qs,
+            warehouse_from__company=company,
         )
+        if branch is not None:
+            docs_qs = docs_qs.filter(warehouse_from__branch=branch)
+        else:
+            docs_qs = docs_qs.filter(warehouse_from__branch__isnull=True)
+
+        docs_agg = docs_qs.aggregate(
+            doc_debit=Coalesce(Sum("total", filter=Q(doc_type__in=doc_debit_types)), ZERO_MONEY),
+            doc_credit=Coalesce(Sum("total", filter=Q(doc_type__in=doc_credit_types)), ZERO_MONEY),
+        )
+        doc_debit = docs_agg["doc_debit"] or Decimal("0.00")
+        doc_credit = docs_agg["doc_credit"] or Decimal("0.00")
+
+        money_qs = WarehouseMoneyDocument.objects.filter(
+            company=company,
+            status=WarehouseMoneyDocument.Status.POSTED,
+            counterparty__in=cp_qs,
+            doc_type__in=(
+                WarehouseMoneyDocument.DocType.MONEY_RECEIPT,
+                WarehouseMoneyDocument.DocType.MONEY_EXPENSE,
+            ),
+        )
+        if branch is not None:
+            money_qs = money_qs.filter(branch=branch)
+        else:
+            money_qs = money_qs.filter(branch__isnull=True)
+
+        money_agg = money_qs.aggregate(
+            m_rec=Coalesce(Sum("amount", filter=Q(doc_type=WarehouseMoneyDocument.DocType.MONEY_RECEIPT)), ZERO_MONEY),
+            m_paid=Coalesce(Sum("amount", filter=Q(doc_type=WarehouseMoneyDocument.DocType.MONEY_EXPENSE)), ZERO_MONEY),
+        )
+        m_rec = money_agg["m_rec"] or Decimal("0.00")
+        m_paid = money_agg["m_paid"] or Decimal("0.00")
+
+        # balance > 0: контрагент должен компании; balance < 0: компания должна контрагенту
+        balance = (doc_debit + m_paid) - (doc_credit + m_rec)
+        accounts_payable_dec = (-balance) if balance < 0 else Decimal("0.00")
         if accounts_payable_dec < 0:
             accounts_payable_dec = Decimal("0.00")
 
@@ -507,7 +592,12 @@ def build_owner_analytics_payload(*, company, branch, period, date_from, date_to
             "cost_of_goods_sold": _money_str(cogs_dec),
             "gross_profit": _money_str(gross_profit_dec),
             "gross_margin_percent": _money_str(gross_margin_pct),
-            "stock_value": _money_str(stock_value_dec),
+            # склад
+            "stock_value": _money_str(stock_value_dec),  # закупочная стоимость остатков
+            "stock_purchase_value": _money_str(stock_value_dec),  # alias для новой карточки
+            "stock_retail_value": _money_str(stock_retail_value_dec),
+            # сырьё
+            "raw_material_value": _money_str(raw_material_value_dec),
             # Дебиторская: долги клиентов (CRM-сделки + продажи «в долг»)
             "accounts_receivable": _money_str(accounts_receivable_dec),
             "accounts_receivable_client_deals": _money_str(client_deals_receivable_dec),

@@ -4,7 +4,7 @@ from django.utils import timezone
 from django.db.models import Q, Sum, Value as V, Prefetch, ProtectedError
 from django.db.models.functions import Coalesce
 from decimal import Decimal, ROUND_HALF_UP, InvalidOperation
-from typing import Any, Dict
+from typing import Any, Dict, List
 from datetime import date as _date, datetime as _datetime
 from django.utils import timezone as dj_tz
 from django.utils.dateparse import parse_datetime, parse_date
@@ -2140,6 +2140,7 @@ class ManufactureSubrealSerializer(CompanyBranchReadOnlyMixin, serializers.Model
     # вычисляемые — делаем через SerializerMethodField, чтобы не падать на None
     qty_remaining = serializers.SerializerMethodField()
     qty_on_agent = serializers.SerializerMethodField()
+    transferred_products = serializers.SerializerMethodField()
 
     # “пилорама” на уровне конкретной передачи (разрешим только при create)
     is_sawmill = serializers.BooleanField(required=False, default=False)
@@ -2148,19 +2149,20 @@ class ManufactureSubrealSerializer(CompanyBranchReadOnlyMixin, serializers.Model
         model = ManufactureSubreal
         fields = [
             "id", "company", "branch",
+            "external_ref",
             "user",
             "agent", "agent_first_name", "agent_last_name", "agent_track_number",
             "product", "product_name",
             "is_sawmill",
             "qty_transferred", "qty_accepted", "qty_returned",
-            "qty_remaining", "qty_on_agent",
+            "qty_remaining", "qty_on_agent", "transferred_products",
             "status", "created_at",
         ]
         read_only_fields = [
-            "id", "company", "branch", "user",
+            "id", "company", "branch", "external_ref", "user",
             "agent_first_name", "agent_last_name", "agent_track_number",
             "product_name",
-            "qty_remaining", "qty_on_agent",
+            "qty_remaining", "qty_on_agent", "transferred_products",
             "status", "created_at",
         ]
 
@@ -2170,6 +2172,28 @@ class ManufactureSubrealSerializer(CompanyBranchReadOnlyMixin, serializers.Model
 
     def get_qty_on_agent(self, obj) -> int:
         return int(getattr(obj, "qty_on_agent", 0) or 0)
+
+    def get_transferred_products(self, obj) -> List[Dict[str, Any]]:
+        ref = getattr(obj, "external_ref", None)
+        if ref:
+            rows = (
+                ManufactureSubreal.objects
+                .filter(company_id=obj.company_id, external_ref=ref)
+                .select_related("product")
+                .order_by("created_at", "id")
+            )
+        else:
+            rows = [obj]
+
+        return [
+            {
+                "subreal_id": row.id,
+                "product_id": row.product_id,
+                "product_name": getattr(getattr(row, "product", None), "name", "") or "",
+                "qty_transferred": int(getattr(row, "qty_transferred", 0) or 0),
+            }
+            for row in rows
+        ]
 
     # ---- init: ограничим queryset-ы по компании/филиалу ----
     def __init__(self, *args, **kwargs):
@@ -2376,35 +2400,14 @@ class ReturnCreateSerializer(serializers.ModelSerializer):
         if br is not None:
             candidates = candidates.filter(branch=br)
 
-        candidates = candidates.annotate(
-            sold_qty=Coalesce(
-                Sum(
-                    "sale_allocations__qty",
-                    filter=Q(
-                        sale_allocations__company_id=company_id,
-                        sale_allocations__sale__status__in=[Sale.Status.PAID, Sale.Status.DEBT],
-                    ),
-                ),
-                V(0),
-            )
-        ).annotate(
-            reserved_qty=Coalesce(
-                Sum(
-                    "returns__qty",
-                    filter=Q(returns__company_id=company_id, returns__status=ReturnFromAgent.Status.PENDING),
-                ),
-                V(0),
-            )
-        ).order_by("-created_at")
+        candidates = candidates.order_by("-created_at")
 
         picked = None
         total_on_hand = 0
         for s in candidates:
-            accepted = int(s.qty_accepted or 0)
-            returned = int(s.qty_returned or 0)
-            sold = int(getattr(s, "sold_qty", 0) or 0)
-            reserved = int(getattr(s, "reserved_qty", 0) or 0)
-            on_hand = max(accepted - returned - sold - reserved, 0)
+            # Используем единый расчёт остатка (как в модели ReturnFromAgent.clean),
+            # чтобы избежать расхождений и дублей сумм при JOIN-ах.
+            on_hand = int(s.get_qty_on_hand_with_sales(company_id=company_id) or 0)
             if on_hand > 0:
                 total_on_hand += on_hand
             if picked is None and on_hand >= int(qty):
