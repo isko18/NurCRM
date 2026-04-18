@@ -4245,8 +4245,12 @@ class AnalyticsCardDetailsAPIView(CompanyBranchRestrictedMixin, APIView):
             raise ValidationError({"card": "Required. Example: card=stock_purchase_value"})
 
         # простая пагинация под модалку (не DRF pagination, чтобы фронту было проще)
-        limit = _parse_int_nonneg(request.query_params.get("limit"), default=200, maximum=1000)
-        offset = _parse_int_nonneg(request.query_params.get("offset"), default=0, maximum=1000000)
+        limit = _parse_int_nonneg(
+            request.query_params.get("limit"), "limit", default=200, maximum=1000
+        )
+        offset = _parse_int_nonneg(
+            request.query_params.get("offset"), "offset", default=0, maximum=1000000
+        )
 
         company = self._company()
         if company is None:

@@ -170,13 +170,20 @@ def _parse_decimal(value, field_name):
         raise ValueError(field_name)
 
 
-def _parse_int_nonneg(value, field_name):
+def _parse_int_nonneg(value, field_name="value", *, default=None, maximum=None):
+    """
+    Целое >= 0. Пустое значение: при default — default, иначе 0 (как раньше).
+    maximum — верхняя граница (включительно), после парсинга.
+    """
     try:
         if value in (None, ""):
-            return 0
-        v = int(value)
+            v = int(default) if default is not None else 0
+        else:
+            v = int(value)
         if v < 0:
-            raise ValueError
+            raise ValueError(field_name)
+        if maximum is not None and v > int(maximum):
+            v = int(maximum)
         return v
     except Exception:
         raise ValueError(field_name)
