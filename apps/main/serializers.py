@@ -11,6 +11,7 @@ from django.utils.dateparse import parse_datetime, parse_date
 
 from apps.main.models import (
     Contact, Pipeline, Deal, Task, Integration, Analytics, Order, Product, Review,
+    ProductInventorySession, ProductInventoryItem,
     Notification, Event, Warehouse, WarehouseEvent, ProductCategory, ProductBrand,
     OrderItem, Client, GlobalProduct, CartItem, ClientDeal, Bid, SocialApplications,
     TransactionRecord, DealInstallment, ContractorWork, Debt, DebtPayment,
@@ -3052,3 +3053,70 @@ class MarketSaleEmployeePayProfileSerializer(CompanyBranchReadOnlyMixin, seriali
                     "Для схемы «Оклад + процент» задайте и оклад, и процент больше 0."
                 )
         return data
+
+
+# ===========================
+# Инвентаризация товаров (Product.quantity)
+# ===========================
+class ProductInventoryLineCreateSerializer(serializers.Serializer):
+    product_id = serializers.UUIDField()
+    quantity_fact = serializers.DecimalField(max_digits=12, decimal_places=2)
+
+
+class ProductInventorySessionCreateSerializer(serializers.Serializer):
+    note = serializers.CharField(required=False, allow_blank=True, default="")
+    items = ProductInventoryLineCreateSerializer(many=True)
+
+    def validate_items(self, value):
+        if not value:
+            raise serializers.ValidationError("Укажите хотя бы одну позицию.")
+        seen = set()
+        for row in value:
+            pid = row["product_id"]
+            if pid in seen:
+                raise serializers.ValidationError(f"Товар {pid} указан более одного раза.")
+            seen.add(pid)
+        return value
+
+
+class ProductInventoryLineReadSerializer(serializers.ModelSerializer):
+    product_name = serializers.CharField(source="product.name", read_only=True)
+    quantity_delta = serializers.SerializerMethodField()
+
+    class Meta:
+        model = ProductInventoryItem
+        fields = (
+            "id",
+            "product",
+            "product_name",
+            "quantity_before",
+            "quantity_fact",
+            "quantity_delta",
+        )
+        read_only_fields = fields
+
+    def get_quantity_delta(self, obj):
+        if obj.quantity_before is None:
+            return None
+        d = Decimal(str(obj.quantity_fact or 0)) - Decimal(str(obj.quantity_before or 0))
+        return str(d.quantize(Decimal("0.01")))
+
+
+class ProductInventorySessionReadSerializer(serializers.ModelSerializer):
+    lines = ProductInventoryLineReadSerializer(many=True, read_only=True)
+
+    class Meta:
+        model = ProductInventorySession
+        fields = (
+            "id",
+            "company",
+            "branch",
+            "status",
+            "note",
+            "created_by",
+            "applied_at",
+            "created_at",
+            "updated_at",
+            "lines",
+        )
+        read_only_fields = fields

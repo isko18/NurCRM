@@ -71,11 +71,29 @@ GET /api/v1/main/analytics/market/?tab=products
 
 # С лимитом
 GET /api/v1/main/analytics/market/?tab=products&limit=50
+
+# Фильтр по поставщику (поле товара client → Client с type=поставщики)
+GET /api/v1/main/analytics/market/?tab=products&supplier=<uuid>
+GET /api/v1/main/analytics/market/?tab=products&suppliers=<uuid1>,<uuid2>
 ```
+
+Параметры **`supplier`** и **`suppliers`** такие же по смыслу, как у `GET /api/main/products/list/`: учитываются только клиенты‑поставщики текущей компании (и филиала, если задан). В ответе в `filters` эхом возвращаются переданные строки.
+
+При активном фильтре по поставщику:
+
+- топы по выручке/количеству, категории, бренды — только продажи позиций с **`product.client_id`** из списка;
+- остатки, `catalog_products_count`, низкий остаток, «отказ» — только товары этого поставщика;
+- блок **`sales_without_catalog_product`** (строки без `Product`) **не заполняется** — он не привязан к поставщику.
 
 ### Ответ
 ```json
 {
+  "filters": {
+    "branch": null,
+    "limit": null,
+    "supplier": null,
+    "suppliers": null
+  },
   "cards": {
     "stock_value": "2500000.00",
     "low_stock_count": 71
@@ -132,6 +150,7 @@ GET /api/v1/main/analytics/market/?tab=products&limit=50
 - `low_stock_products` - **ВСЕ** товары с остатком ≤5
 - Без лимита возвращается **полный список** (например, все 71 товар)
 - Каждый товар содержит полную детализацию
+- Фильтр **`supplier` / `suppliers`** сужает все блоки вкладки к товарам выбранного поставщика (см. запросы выше)
 
 ---
 

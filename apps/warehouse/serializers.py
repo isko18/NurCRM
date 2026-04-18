@@ -314,10 +314,52 @@ def _get_characteristics_model():
     return None
 
 
+def _sync_warehouse_product_alternate_barcodes(product: m.WarehouseProduct, codes):
+    """
+    Полная замена доп. штрихкодов для товара. codes — список строк (уже нормализованных уникальных).
+    """
+    company = product.company
+    warehouse = product.warehouse
+    main = _norm_str(product.barcode)
+    for b in codes:
+        if main and b == main:
+            raise serializers.ValidationError(
+                {"alternate_barcodes": f"Код «{b}» совпадает с основным штрихкодом товара — оставьте его только в поле barcode."}
+            )
+        if (
+            m.WarehouseProduct.objects.filter(company=company, warehouse=warehouse, barcode=b)
+            .exclude(pk=product.pk)
+            .exists()
+        ):
+            raise serializers.ValidationError(
+                {"alternate_barcodes": f"Штрихкод «{b}» уже занят другим товаром на этом складе (основной код)."}
+            )
+        if (
+            m.WarehouseProductAlternateBarcode.objects.filter(
+                product__company=company,
+                product__warehouse=warehouse,
+                barcode=b,
+            )
+            .exclude(product_id=product.pk)
+            .exists()
+        ):
+            raise serializers.ValidationError(
+                {"alternate_barcodes": f"Штрихкод «{b}» уже привязан к другому товару на этом складе."}
+            )
+    product.alternate_barcodes.all().delete()
+    for b in codes:
+        m.WarehouseProductAlternateBarcode.objects.create(product=product, barcode=b)
+
+
 class WarehouseProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
     characteristics = WarehouseProductCharacteristicsSerializer(required=False, allow_null=True)
     images = WarehouseProductImageSerializer(many=True, read_only=True)
     packages = WarehouseProductPackageSerializer(many=True, read_only=True)
+    alternate_barcodes = serializers.ListField(
+        child=serializers.CharField(max_length=64),
+        required=False,
+        write_only=True,
+    )
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -354,6 +396,7 @@ class WarehouseProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSe
             "characteristics",
             "images",
             "packages",
+            "alternate_barcodes",
         ]
         read_only_fields = ["id", "company", "branch"]
         extra_kwargs = {
@@ -377,7 +420,25 @@ class WarehouseProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSe
             if f in attrs:
                 attrs[f] = _to_decimal(attrs.get(f), "0")
 
+        if "alternate_barcodes" in attrs and attrs["alternate_barcodes"] is not None:
+            seen = set()
+            norm_list = []
+            for raw in attrs["alternate_barcodes"]:
+                b = _norm_str(raw)
+                if not b or b in seen:
+                    continue
+                seen.add(b)
+                norm_list.append(b)
+            attrs["alternate_barcodes"] = norm_list
+
         return attrs
+
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        data["alternate_barcodes"] = list(
+            instance.alternate_barcodes.order_by("barcode").values_list("barcode", flat=True)
+        )
+        return data
 
     def _upsert_characteristics(self, product: m.WarehouseProduct, characteristics_data):
         if not characteristics_data:
@@ -396,6 +457,8 @@ class WarehouseProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSe
 
     def create(self, validated_data):
         characteristics_data = validated_data.pop("characteristics", None)
+        alternate_barcodes = validated_data.pop("alternate_barcodes", None)
+        has_alt = isinstance(getattr(self, "initial_data", None), dict) and "alternate_barcodes" in self.initial_data
 
         barcode = _norm_str(validated_data.get("barcode"))
         company = validated_data.get("company")
@@ -421,14 +484,20 @@ class WarehouseProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSe
                     existing.save()
 
                     self._upsert_characteristics(existing, characteristics_data)
+                    if has_alt:
+                        _sync_warehouse_product_alternate_barcodes(existing, alternate_barcodes or [])
                     return existing
 
             product = m.WarehouseProduct.objects.create(**validated_data)
             self._upsert_characteristics(product, characteristics_data)
+            if has_alt:
+                _sync_warehouse_product_alternate_barcodes(product, alternate_barcodes or [])
             return product
 
     def update(self, instance, validated_data):
         characteristics_data = validated_data.pop("characteristics", None)
+        alternate_barcodes = validated_data.pop("alternate_barcodes", None)
+        has_alt = isinstance(getattr(self, "initial_data", None), dict) and "alternate_barcodes" in self.initial_data
         validated_data.pop("warehouse", None)
         validated_data.pop("company", None)
         validated_data.pop("branch", None)
@@ -441,6 +510,8 @@ class WarehouseProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSe
 
         instance.save()
         self._upsert_characteristics(instance, characteristics_data)
+        if has_alt:
+            _sync_warehouse_product_alternate_barcodes(instance, alternate_barcodes or [])
         return instance
 
 

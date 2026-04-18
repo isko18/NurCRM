@@ -386,7 +386,7 @@ def post_document(document: models.Document, allow_negative: bool = None) -> mod
                 if plu is not None and qs.filter(plu=plu).exists():
                     plu = None
 
-                return models.WarehouseProduct.objects.create(
+                new_p = models.WarehouseProduct.objects.create(
                     company=warehouse_to.company,
                     branch=warehouse_to.branch,
                     warehouse=warehouse_to,
@@ -410,6 +410,17 @@ def post_document(document: models.Document, allow_negative: bool = None) -> mod
                     expiration_date=source.expiration_date,
                     quantity=Decimal("0.000"),
                 )
+                for link in source.alternate_barcodes.all():
+                    if not link.barcode:
+                        continue
+                    if models.WarehouseProductAlternateBarcode.objects.filter(
+                        product__company_id=new_p.company_id,
+                        product__warehouse=warehouse_to,
+                        barcode=link.barcode,
+                    ).exists():
+                        continue
+                    models.WarehouseProductAlternateBarcode.objects.create(product=new_p, barcode=link.barcode)
+                return new_p
 
             for item in items:
                 if item.product.warehouse_id != document.warehouse_from_id:

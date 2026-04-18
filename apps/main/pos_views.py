@@ -40,6 +40,7 @@ from apps.main.models import (
     CartItem,
     CartItemDeletionLog,
     Sale,
+    SaleItem,
     Product,
     ProductPackage,
     MobileScannerToken,
@@ -1739,6 +1740,170 @@ class SalePayDebtAPIView(MarketCashierOnlyMixin, CompanyBranchRestrictedMixin, A
         return Response(SaleDetailSerializer(sale, context={"request": request}).data, status=status.HTTP_200_OK)
 
 
+def _parse_partial_return_items(data) -> Optional[List[tuple]]:
+    """
+    None — полный возврат чека (как без тела запроса).
+    Список — частичный возврат: пары (sale_item_id UUID, quantity).
+    """
+    if not isinstance(data, dict):
+        return None
+    raw = data.get("items", None)
+    if raw is None:
+        return None
+    if not isinstance(raw, list):
+        raise ValidationError({"items": 'Ожидается список объектов с полями "sale_item_id" и "quantity".'})
+    if len(raw) == 0:
+        return None
+    merged: Dict[uuid.UUID, Decimal] = {}
+    for row in raw:
+        if not isinstance(row, dict):
+            raise ValidationError({"items": "Каждая позиция должна быть объектом."})
+        sid = row.get("sale_item_id") or row.get("id")
+        if sid in (None, ""):
+            raise ValidationError({"items": "Укажите sale_item_id (или id) для каждой строки."})
+        try:
+            uid = uuid.UUID(str(sid))
+        except (ValueError, TypeError, AttributeError):
+            raise ValidationError({"items": f"Некорректный sale_item_id: {sid!r}."})
+        try:
+            q = qty3(Decimal(str(row.get("quantity"))))
+        except Exception:
+            raise ValidationError({"items": "Некорректное quantity."})
+        if q <= 0:
+            raise ValidationError({"items": "quantity должно быть > 0."})
+        merged[uid] = merged.get(uid, Decimal("0")) + q
+    return [(k, merged[k]) for k in sorted(merged.keys())]
+
+
+def _restock_product_for_sale_item_return(item: SaleItem, return_qty: Decimal) -> None:
+    if not item.product_id:
+        return
+    stock_delta = line_qty_consume_units(return_qty, getattr(item, "sale_package", None))
+    if stock_delta <= 0:
+        return
+    Product.objects.filter(pk=item.product_id).update(quantity=F("quantity") + stock_delta)
+
+
+def _release_agent_allocations_for_qty(sale_item: SaleItem, return_qty_int: int) -> None:
+    if return_qty_int <= 0:
+        return
+    qs = (
+        AgentSaleAllocation.objects.select_for_update()
+        .filter(sale_item=sale_item)
+        .order_by("-id")
+    )
+    if not qs.exists():
+        return
+    remaining = return_qty_int
+    for alloc in qs:
+        if remaining <= 0:
+            break
+        take = min(int(alloc.qty), remaining)
+        new_q = int(alloc.qty) - take
+        if new_q <= 0:
+            AgentSaleAllocation.objects.filter(pk=alloc.pk).delete()
+        else:
+            AgentSaleAllocation.objects.filter(pk=alloc.pk).update(qty=new_q)
+        remaining -= take
+    if remaining > 0:
+        raise ValidationError(
+            {"items": "Недостаточно привязок по строке чека для агентского возврата (рассинхронизация данных)."}
+        )
+
+
+def _recalc_sale_headers_from_items(sale: Sale) -> None:
+    """Пересчитать суммы шапки чека по оставшимся строкам."""
+    rows = list(SaleItem.objects.filter(sale=sale).order_by("id"))
+    if not rows:
+        return
+    d0 = Decimal("0")
+    new_subtotal = money(sum((it.unit_price or d0) * Decimal(str(it.quantity or 0)) for it in rows))
+    new_line_disc = money(sum(Decimal(str(it.line_discount or 0)) for it in rows))
+    old_sub = sale.subtotal or d0
+    old_disc = sale.discount_total or d0
+    old_tax = sale.tax_total or d0
+    old_total = sale.total or d0
+    old_taxable = old_sub - old_disc
+    new_taxable = new_subtotal - new_line_disc
+    if old_taxable > 0:
+        new_tax = money(old_tax * (new_taxable / old_taxable))
+    elif old_taxable == 0 and new_taxable == 0:
+        new_tax = old_tax
+    else:
+        new_tax = d0
+    new_total = money(new_taxable + new_tax)
+    sale.subtotal = new_subtotal
+    sale.discount_total = new_line_disc
+    sale.tax_total = new_tax
+    sale.total = new_total
+    if old_total and old_total > 0:
+        cr = sale.cash_received or d0
+        sale.cash_received = money(cr * (new_total / old_total))
+    sale.save(update_fields=["subtotal", "discount_total", "tax_total", "total", "cash_received"])
+
+
+def _execute_sale_return(sale: Sale, partial_items: Optional[List[tuple]]) -> None:
+    """
+    partial_items=None — полный возврат (статус canceled, весь товар на склад / снятие аллокаций).
+    Иначе — частичный возврат по строкам; чек остаётся paid/debt, пока есть строки.
+    """
+    is_agent_sale = sale.agent_allocations.exists()
+
+    if not partial_items:
+        if is_agent_sale:
+            AgentSaleAllocation.objects.filter(sale=sale).delete()
+        else:
+            for item in sale.items.filter(product_id__isnull=False).select_related("sale_package"):
+                rq = qty3(Decimal(str(item.quantity or 0)))
+                if rq <= 0:
+                    continue
+                _restock_product_for_sale_item_return(item, rq)
+        sale.status = Sale.Status.CANCELED
+        sale.save(update_fields=["status"])
+        return
+
+    item_ids = [uid for uid, _ in partial_items]
+    found = set(SaleItem.objects.filter(sale=sale, id__in=item_ids).values_list("id", flat=True))
+    missing = set(item_ids) - found
+    if missing:
+        raise ValidationError({"items": "Есть позиции не из этого чека или несуществующие sale_item_id."})
+
+    for sid, rq in partial_items:
+        item = (
+            SaleItem.objects.select_for_update()
+            .select_related("product", "sale_package")
+            .get(pk=sid, sale=sale)
+        )
+        old_q = qty3(Decimal(str(item.quantity or 0)))
+        rq = qty3(rq)
+        if rq > old_q or rq <= 0:
+            raise ValidationError({"items": f"Некорректное количество возврата для позиции {sid}."})
+
+        if is_agent_sale:
+            if rq != rq.to_integral_value():
+                raise ValidationError({"items": "Для агентского чека количество возврата должно быть целым."})
+            _release_agent_allocations_for_qty(item, int(rq))
+        else:
+            _restock_product_for_sale_item_return(item, rq)
+
+        new_q = qty3(old_q - rq)
+        old_disc = Decimal(str(item.line_discount or 0))
+        new_disc = money(old_disc * (new_q / old_q)) if old_q > 0 else old_disc
+
+        if new_q <= 0:
+            item.delete()
+        else:
+            item.quantity = new_q
+            item.line_discount = new_disc
+            item.save(update_fields=["quantity", "line_discount"])
+
+    if not SaleItem.objects.filter(sale=sale).exists():
+        sale.status = Sale.Status.CANCELED
+        sale.save(update_fields=["status"])
+    else:
+        _recalc_sale_headers_from_items(sale)
+
+
 class SaleReturnAPIView(MarketCashierOnlyMixin, CompanyBranchRestrictedMixin, APIView):
     """
     Возврат продажи (владелец и агент).
@@ -1774,22 +1939,11 @@ class SaleReturnAPIView(MarketCashierOnlyMixin, CompanyBranchRestrictedMixin, AP
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        is_agent_sale = sale.agent_allocations.exists()
-
-        if is_agent_sale:
-            AgentSaleAllocation.objects.filter(sale=sale).delete()
-        else:
-            items = sale.items.filter(product_id__isnull=False).select_related("product")
-            for item in items:
-                qty = Decimal(str(item.quantity or 0))
-                if qty <= 0:
-                    continue
-                Product.objects.filter(pk=item.product_id).update(
-                    quantity=F("quantity") + qty
-                )
-
-        sale.status = Sale.Status.CANCELED
-        sale.save(update_fields=["status"])
+        try:
+            partial = _parse_partial_return_items(request.data)
+            _execute_sale_return(sale, partial)
+        except ValidationError as e:
+            return Response(e.detail, status=status.HTTP_400_BAD_REQUEST)
 
         # Инвалидируем кэши аналитики/списков, чтобы цифры обновлялись сразу после возврата.
         # (market analytics кэшируется по ключам nurcrm:analytics:market:... )
@@ -1839,21 +1993,12 @@ class AgentSaleReturnAPIView(SaleReturnAPIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        is_agent_sale = sale.agent_allocations.exists()
-        if is_agent_sale:
-            AgentSaleAllocation.objects.filter(sale=sale).delete()
-        else:
-            items = sale.items.filter(product_id__isnull=False).select_related("product")
-            for item in items:
-                qty = Decimal(str(item.quantity or 0))
-                if qty <= 0:
-                    continue
-                Product.objects.filter(pk=item.product_id).update(
-                    quantity=F("quantity") + qty
-                )
+        try:
+            partial = _parse_partial_return_items(request.data)
+            _execute_sale_return(sale, partial)
+        except ValidationError as e:
+            return Response(e.detail, status=status.HTTP_400_BAD_REQUEST)
 
-        sale.status = Sale.Status.CANCELED
-        sale.save(update_fields=["status"])
         invalidate_cache_pattern(f"analytics:market:{sale.company_id}:")
         invalidate_cache_pattern(f"products:list:{sale.company_id}:")
         sale.refresh_from_db()

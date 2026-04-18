@@ -80,4 +80,5 @@ class ProductFilter(django_filters.FilterSet):
             Q(name__icontains=value)
             | Q(article__icontains=value)
             | Q(barcode__icontains=value)
-        )
+            | Q(alternate_barcodes__barcode__icontains=value)
+        ).distinct()

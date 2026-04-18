@@ -506,6 +506,45 @@ class AnalyticsView(APIView):
                 pqs = pqs.filter(branch=branch)
         return pqs
 
+    def _products_tab_supplier_client_ids(self, request, company, branch):
+        """
+        Фильтр вкладки tab=products по поставщику (Product.client).
+        Параметры как у списка товаров: ?supplier=<uuid> или ?suppliers=id1,id2
+        Возвращает None — фильтр не задан; список uuid — разрешённые поставщики; [] — после разбора не осталось валидных id.
+        """
+        qp = request.query_params
+        suppliers_csv = (qp.get("suppliers") or "").strip()
+        supplier_one = (qp.get("supplier") or "").strip()
+        raw_ids = (
+            [x.strip() for x in suppliers_csv.split(",") if x.strip()]
+            if suppliers_csv
+            else ([supplier_one] if supplier_one else [])
+        )
+        if not raw_ids:
+            return None
+        try:
+            Client = apps.get_model("main.Client")
+        except Exception:
+            return []
+        from uuid import UUID
+
+        parsed = []
+        for s in raw_ids:
+            try:
+                parsed.append(UUID(str(s)))
+            except (ValueError, TypeError, AttributeError):
+                continue
+        if not parsed:
+            return []
+        supplier_qs = Client.objects.filter(
+            company=company,
+            type=Client.StatusClient.SUPPLIERS,
+            id__in=parsed,
+        )
+        if branch is not None and _model_has_field(Client, "branch"):
+            supplier_qs = supplier_qs.filter(branch__in=[None, branch])
+        return list(supplier_qs.values_list("id", flat=True))
+
     def _cache_hash_from_query(self, request) -> str:
         qp = {k: request.query_params.getlist(k) for k in request.query_params.keys()}
         raw = json.dumps(qp, ensure_ascii=False, sort_keys=True)
@@ -1498,6 +1537,10 @@ class AnalyticsView(APIView):
         rejected_catalog_products = []
         rejected_products_count = 0
 
+        supplier_ids = None
+        if Product and _model_has_field(Product, "client"):
+            supplier_ids = self._products_tab_supplier_client_ids(request, company, branch)
+
         Sale, SaleItem = get_sale_models()
         if Sale and SaleItem and Product:
             paid_value = _choice_value(Sale, "Status", "PAID", "paid")
@@ -1511,11 +1554,17 @@ class AnalyticsView(APIView):
                     sqs = sqs.filter(branch=branch)
             sqs = sqs.filter(**{f"{dt_field}__gte": period.start, f"{dt_field}__lt": period.end})
 
+            def _sale_items_products_tab(sale_qs):
+                qi = SaleItem.objects.filter(sale__in=sale_qs)
+                if supplier_ids is not None:
+                    qi = qi.filter(product__client_id__in=supplier_ids)
+                return qi
+
             # Top Products by Revenue - ДЕТАЛЬНО со всеми полями
             if _model_has_field(SaleItem, "unit_price"):
                 revenue_expr = ExpressionWrapper(F("quantity") * F("unit_price"), output_field=MONEY_FIELD)
                 top_by_rev_query = (
-                    SaleItem.objects.filter(sale__in=sqs)
+                    _sale_items_products_tab(sqs)
                     .values(
                         "product_id", 
                         "name_snapshot",
@@ -1559,7 +1608,7 @@ class AnalyticsView(APIView):
 
             # Top Products by Quantity - ДЕТАЛЬНО
             top_by_qty_query = (
-                SaleItem.objects.filter(sale__in=sqs)
+                _sale_items_products_tab(sqs)
                 .values(
                     "product_id", 
                     "name_snapshot",
@@ -1597,7 +1646,7 @@ class AnalyticsView(APIView):
             if _model_has_field(SaleItem, "product") and _model_has_field(Product, "category"):
                 if _model_has_field(SaleItem, "unit_price"):
                     cat_query = (
-                        SaleItem.objects.filter(sale__in=sqs, product__isnull=False)
+                        _sale_items_products_tab(sqs).filter(product__isnull=False)
                         .values("product__category__id", "product__category__name")
                         .annotate(
                             revenue=Coalesce(Sum(revenue_expr), Value(Z_MONEY, output_field=MONEY_FIELD), output_field=MONEY_FIELD),
@@ -1626,7 +1675,7 @@ class AnalyticsView(APIView):
             if _model_has_field(SaleItem, "product") and _model_has_field(Product, "brand"):
                 if _model_has_field(SaleItem, "unit_price"):
                     brand_query = (
-                        SaleItem.objects.filter(sale__in=sqs, product__isnull=False)
+                        _sale_items_products_tab(sqs).filter(product__isnull=False)
                         .values("product__brand__id", "product__brand__name")
                         .annotate(
                             revenue=Coalesce(Sum(revenue_expr), Value(Z_MONEY, output_field=MONEY_FIELD), output_field=MONEY_FIELD),
@@ -1652,7 +1701,8 @@ class AnalyticsView(APIView):
                     ]
 
             # Строки продаж без карточки товара (Product удалён → product=NULL, остаётся name_snapshot)
-            if _model_has_field(SaleItem, "name_snapshot"):
+            # При фильтре по поставщику не смешиваем с «призраками» без product.client
+            if _model_has_field(SaleItem, "name_snapshot") and supplier_ids is None:
                 ghost_base = SaleItem.objects.filter(sale__in=sqs, product__isnull=True)
                 sales_without_product_line_count = int(ghost_base.count() or 0)
                 gvals = ("name_snapshot", "barcode_snapshot")
@@ -1712,6 +1762,8 @@ class AnalyticsView(APIView):
                     pqs = pqs.filter(Q(branch=branch) | Q(branch__isnull=True))
                 else:
                     pqs = pqs.filter(branch=branch)
+            if supplier_ids is not None and _model_has_field(Product, "client"):
+                pqs = pqs.filter(client_id__in=supplier_ids)
             
             qty_field = "quantity" if _model_has_field(Product, "quantity") else None
             pp_field = "purchase_price" if _model_has_field(Product, "purchase_price") else None
@@ -1749,6 +1801,8 @@ class AnalyticsView(APIView):
 
         catalog_products_count = 0
         pqs_scope = self._market_products_queryset(request, company, branch)
+        if pqs_scope is not None and supplier_ids is not None and _model_has_field(pqs_scope.model, "client"):
+            pqs_scope = pqs_scope.filter(client_id__in=supplier_ids)
         if pqs_scope is not None:
             catalog_products_count = pqs_scope.count()
 
@@ -1761,6 +1815,8 @@ class AnalyticsView(APIView):
                     rj = rj.filter(Q(branch=branch) | Q(branch__isnull=True))
                 else:
                     rj = rj.filter(branch=branch)
+            if supplier_ids is not None and _model_has_field(Product, "client"):
+                rj = rj.filter(client_id__in=supplier_ids)
             rejected_products_count = rj.count()
             rlim = limit if limit is not None else 200
             for p in rj.select_related("category", "brand").order_by("-updated_at")[:rlim]:
@@ -1787,6 +1843,8 @@ class AnalyticsView(APIView):
             "filters": {
                 "branch": str(getattr(branch, "id", "")) if branch else None,
                 "limit": limit,
+                "supplier": (request.query_params.get("supplier") or "").strip() or None,
+                "suppliers": (request.query_params.get("suppliers") or "").strip() or None,
             },
             "cards": {
                 "stock_value": str(_money(stock_value)),

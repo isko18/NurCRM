@@ -2378,6 +2378,115 @@ class WarehouseEvent(models.Model):
 
 
 # ==========================
+# Инвентаризация товаров (остаток Product.quantity)
+# ==========================
+class ProductInventorySession(models.Model):
+    """
+    Акт инвентаризации: в черновике фиксируются товары и учётные количества (quantity_fact),
+    по кнопке «провести» остатки Product.quantity выравниваются под факт.
+    """
+
+    class Status(models.TextChoices):
+        DRAFT = "draft", "Черновик"
+        APPLIED = "applied", "Проведено"
+        CANCELED = "canceled", "Отменено"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    company = models.ForeignKey(Company, on_delete=models.CASCADE, related_name="product_inventory_sessions")
+    branch = models.ForeignKey(
+        Branch,
+        on_delete=models.CASCADE,
+        related_name="product_inventory_sessions",
+        null=True,
+        blank=True,
+        db_index=True,
+    )
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="product_inventory_sessions_created",
+    )
+    status = models.CharField(
+        max_length=16,
+        choices=Status.choices,
+        default=Status.DRAFT,
+        db_index=True,
+    )
+    note = models.TextField(blank=True, default="")
+    applied_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = "Инвентаризация товаров"
+        verbose_name_plural = "Инвентаризации товаров"
+        ordering = ["-created_at"]
+        indexes = [
+            models.Index(fields=["company", "created_at"]),
+            models.Index(fields=["company", "branch", "created_at"]),
+            models.Index(fields=["company", "status"]),
+        ]
+
+    def __str__(self):
+        return f"Инвентаризация {self.get_status_display()} ({self.created_at:%Y-%m-%d %H:%M})"
+
+    def clean(self):
+        if self.branch_id and self.branch.company_id != self.company_id:
+            raise ValidationError({"branch": "Филиал принадлежит другой компании."})
+
+
+class ProductInventoryItem(models.Model):
+    """Строка акта: товар и учётное количество после инвентаризации."""
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    session = models.ForeignKey(
+        ProductInventorySession,
+        on_delete=models.CASCADE,
+        related_name="lines",
+    )
+    product = models.ForeignKey(
+        "Product",
+        on_delete=models.CASCADE,
+        related_name="inventory_lines",
+    )
+    quantity_before = models.DecimalField(
+        "Было на момент проведения",
+        max_digits=12,
+        decimal_places=2,
+        null=True,
+        blank=True,
+    )
+    quantity_fact = models.DecimalField(
+        "Учётное количество (факт)",
+        max_digits=12,
+        decimal_places=2,
+    )
+
+    class Meta:
+        verbose_name = "Строка инвентаризации товара"
+        verbose_name_plural = "Строки инвентаризации товаров"
+        constraints = [
+            models.UniqueConstraint(fields=["session", "product"], name="uq_product_inventory_line_session_product"),
+        ]
+        indexes = [
+            models.Index(fields=["session", "product"]),
+        ]
+
+    def clean(self):
+        if self.session_id and self.product_id and self.product.company_id != self.session.company_id:
+            raise ValidationError({"product": "Товар другой компании."})
+        if self.session_id and self.product_id:
+            sb = self.session.branch_id
+            pb = self.product.branch_id
+            if sb is None and pb is not None:
+                raise ValidationError({"product": "В акте без филиала можно только глобальные товары (без филиала)."})
+            if sb is not None and pb not in (None, sb):
+                raise ValidationError({"product": "Товар другого филиала."})
+
+
+# ==========================
 # Client / ClientDeal / DealInstallment / Bids / SocialApplications
 # ==========================
 class Client(models.Model):

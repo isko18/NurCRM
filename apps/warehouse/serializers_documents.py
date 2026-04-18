@@ -395,10 +395,14 @@ class TransferCreateSerializer(serializers.Serializer):
 class ProductSimpleSerializer(serializers.ModelSerializer):
     group = serializers.UUIDField(source="group.id", read_only=True)
     group_name = serializers.CharField(source="group.name", read_only=True)
+    alternate_barcodes = serializers.SerializerMethodField()
 
     class Meta:
         model = models.WarehouseProduct
-        fields = ("id", "name", "article", "barcode", "unit", "quantity", "group", "group_name")
+        fields = ("id", "name", "article", "barcode", "unit", "quantity", "group", "group_name", "alternate_barcodes")
+
+    def get_alternate_barcodes(self, obj):
+        return list(obj.alternate_barcodes.order_by("barcode").values_list("barcode", flat=True))
 
 
 class WarehouseSimpleSerializer(serializers.ModelSerializer):

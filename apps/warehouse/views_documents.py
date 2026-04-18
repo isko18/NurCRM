@@ -486,8 +486,11 @@ class ProductListCreateView(CompanyBranchRestrictedMixin, generics.ListCreateAPI
     
     def get_queryset(self):
         # Оптимизация: предзагружаем связанные объекты
-        qs = models.WarehouseProduct.objects.select_related(
-            "warehouse", "brand", "category", "company", "branch", "group"
+        qs = (
+            models.WarehouseProduct.objects.select_related(
+                "warehouse", "brand", "category", "company", "branch", "group"
+            )
+            .prefetch_related("alternate_barcodes")
         )
         qs = self._filter_qs_company_branch(qs)
         
@@ -503,7 +506,7 @@ class ProductListCreateView(CompanyBranchRestrictedMixin, generics.ListCreateAPI
                     # Если найден в кэше - возвращаем только этот товар
                     return qs.filter(pk=cached_product_id)
                 # Ищем товар и кэшируем его ID
-                product = qs.filter(barcode=search).first()
+                product = qs.filter(Q(barcode=search) | Q(alternate_barcodes__barcode=search)).distinct().first()
                 if product:
                     cache.set(cache_key, product.id, 300)  # Кэш на 5 минут
         
@@ -515,8 +518,11 @@ class ProductDetailView(CompanyBranchRestrictedMixin, generics.RetrieveUpdateDes
     
     def get_queryset(self):
         # Оптимизация: предзагружаем связанные объекты
-        qs = models.WarehouseProduct.objects.select_related(
-            "warehouse", "brand", "category", "company", "branch"
+        qs = (
+            models.WarehouseProduct.objects.select_related(
+                "warehouse", "brand", "category", "company", "branch"
+            )
+            .prefetch_related("alternate_barcodes")
         )
         return self._filter_qs_company_branch(qs)
 

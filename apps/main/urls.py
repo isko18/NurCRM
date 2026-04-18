@@ -5,6 +5,12 @@ from .analytics_market import *
 from .analytics_dashboard import *
 from .document import SaleReceiptAPIView, SaleInvoiceAPIView
 from apps.main.showcase.views_public import PublicCompanyProductDetailAPIView, PublicCompanyAPIView, PublicCompanyShowcaseAPIView
+from apps.main.inventory_views import (
+    ProductInventorySessionListCreateAPIView,
+    ProductInventorySessionRetrieveAPIView,
+    ProductInventorySessionApplyAPIView,
+    ProductInventorySessionCancelAPIView,
+)
 
 
 urlpatterns = [
@@ -45,6 +51,12 @@ urlpatterns = [
     path('products/<uuid:pk>/', ProductRetrieveUpdateDestroyAPIView.as_view(), name='product-detail'),
     path("products/<uuid:product_id>/favorite/", ProductFavoriteAPIView.as_view(), name="product-favorite"),
     path("products/bulk-delete/", ProductBulkDeleteAPIView.as_view(), name="product-bulk-delete"),
+
+    # Инвентаризация товаров (остаток Product.quantity)
+    path("inventory/sessions/", ProductInventorySessionListCreateAPIView.as_view(), name="product-inventory-session-list"),
+    path("inventory/sessions/<uuid:pk>/", ProductInventorySessionRetrieveAPIView.as_view(), name="product-inventory-session-detail"),
+    path("inventory/sessions/<uuid:pk>/apply/", ProductInventorySessionApplyAPIView.as_view(), name="product-inventory-session-apply"),
+    path("inventory/sessions/<uuid:pk>/cancel/", ProductInventorySessionCancelAPIView.as_view(), name="product-inventory-session-cancel"),
     path('products/barcode/<str:barcode>/', ProductByBarcodeAPIView.as_view(), name='product-by-barcode'),
     path('products/global-barcode/<str:barcode>/', ProductByGlobalBarcodeAPIView.as_view(), name='product-by-barcode'),
     

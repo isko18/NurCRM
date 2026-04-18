@@ -550,6 +550,76 @@ class WarehouseProduct(BaseModelId, BaseModelDate, BaseModelCompanyBranch):
             return result
 
 
+class WarehouseProductAlternateBarcode(BaseModelId):
+    """
+    Дополнительные штрихкоды товара на складе (тот же учётный товар, несколько кодов для сканера).
+    Основной штрихкод хранится в WarehouseProduct.barcode.
+    """
+
+    product = models.ForeignKey(
+        "warehouse.WarehouseProduct",
+        on_delete=models.CASCADE,
+        related_name="alternate_barcodes",
+        verbose_name="Товар",
+    )
+    barcode = models.CharField("Штрихкод", max_length=64)
+
+    class Meta:
+        verbose_name = "Дополнительный штрихкод товара"
+        verbose_name_plural = "Дополнительные штрихкоды товаров"
+        constraints = [
+            models.UniqueConstraint(
+                fields=("product", "barcode"),
+                name="uq_wh_alt_barcode_per_product_line",
+            ),
+        ]
+        indexes = [
+            models.Index(fields=["barcode"]),
+            models.Index(fields=["product", "barcode"]),
+        ]
+
+    def __str__(self):
+        return f"{self.barcode} → {self.product_id}"
+
+    def clean(self):
+        b = (self.barcode or "").strip()
+        if not b:
+            raise ValidationError({"barcode": "Штрихкод не может быть пустым."})
+        self.barcode = b
+        if self.product_id:
+            main = (self.product.barcode or "").strip()
+            if main and b == main:
+                raise ValidationError({"barcode": "Дублирует основной штрихкод товара — укажите его только в поле barcode."})
+
+    def save(self, *args, **kwargs):
+        from django.core.cache import cache
+
+        self.barcode = (self.barcode or "").strip()
+        old_barcode = None
+        if self.pk:
+            try:
+                old = type(self).objects.get(pk=self.pk)
+                old_barcode = (old.barcode or "").strip() or None
+            except type(self).DoesNotExist:
+                pass
+        super().save(*args, **kwargs)
+        cid = getattr(self.product, "company_id", None)
+        if cid:
+            if old_barcode and old_barcode != self.barcode:
+                cache.delete(f"warehouse_product_barcode:{cid}:{old_barcode}")
+            if self.barcode:
+                cache.delete(f"warehouse_product_barcode:{cid}:{self.barcode}")
+
+    def delete(self, *args, **kwargs):
+        from django.core.cache import cache
+
+        cid = getattr(self.product, "company_id", None)
+        b = (self.barcode or "").strip()
+        super().delete(*args, **kwargs)
+        if cid and b:
+            cache.delete(f"warehouse_product_barcode:{cid}:{b}")
+
+
 class WarehouseProductCharasteristics(BaseModelId, BaseModelCompanyBranch, BaseModelDate):
     product = models.OneToOneField(
         "warehouse.WarehouseProduct",

@@ -568,7 +568,7 @@ class ProductView(CompanyBranchRestrictedMixin, generics.ListCreateAPIView):
         return (
             m.WarehouseProduct.objects
             .select_related("brand", "category", "product_group", "warehouse", "company", "branch", "characteristics")
-            .prefetch_related("images", "packages")
+            .prefetch_related("images", "packages", "alternate_barcodes")
             .filter(warehouse=wh)
         )
 
@@ -595,7 +595,7 @@ class ProductDetailView(CompanyBranchRestrictedMixin, generics.RetrieveUpdateDes
         qs = (
             m.WarehouseProduct.objects
             .select_related("brand", "category", "product_group", "warehouse", "company", "branch", "characteristics")
-            .prefetch_related("images", "packages")
+            .prefetch_related("images", "packages", "alternate_barcodes")
         )
         return self._filter_qs_company_branch(qs)
 
@@ -622,7 +622,7 @@ class ProductScanView(CompanyBranchRestrictedMixin, APIView):
         return (
             m.WarehouseProduct.objects
             .select_related("brand", "category", "warehouse", "company", "branch", "characteristics")
-            .prefetch_related("images", "packages")
+            .prefetch_related("images", "packages", "alternate_barcodes")
         )
 
     def post(self, request, *args, **kwargs):
@@ -634,7 +634,7 @@ class ProductScanView(CompanyBranchRestrictedMixin, APIView):
         qs = self._base_products_qs().filter(warehouse=warehouse)
 
         scan_qty = None
-        product = qs.filter(barcode=barcode).first()
+        product = qs.filter(Q(barcode=barcode) | Q(alternate_barcodes__barcode=barcode)).distinct().first()
         if not product:
             scale_data = _parse_scale_barcode(barcode)
             if scale_data:
