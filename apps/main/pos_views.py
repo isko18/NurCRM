@@ -1869,8 +1869,10 @@ def _execute_sale_return(sale: Sale, partial_items: Optional[List[tuple]]) -> No
         raise ValidationError({"items": "Есть позиции не из этого чека или несуществующие sale_item_id."})
 
     for sid, rq in partial_items:
+        # FOR UPDATE только по sale_item: иначе PostgreSQL ругается на nullable side of outer join
+        # при select_related(product, sale_package).
         item = (
-            SaleItem.objects.select_for_update()
+            SaleItem.objects.select_for_update(of=("self",))
             .select_related("product", "sale_package")
             .get(pk=sid, sale=sale)
         )
