@@ -596,6 +596,21 @@ class Product(models.Model):
         SERVICE = "service", "Услуга"
         BUNDLE = "bundle", "Комплект"
 
+    class HotkeyGroup(models.TextChoices):
+        """Статические группы для быстрых клавиш POS (F1…F12)."""
+        F1 = "F1", "F1"
+        F2 = "F2", "F2"
+        F3 = "F3", "F3"
+        F4 = "F4", "F4"
+        F5 = "F5", "F5"
+        F6 = "F6", "F6"
+        F7 = "F7", "F7"
+        F8 = "F8", "F8"
+        F9 = "F9", "F9"
+        F10 = "F10", "F10"
+        F11 = "F11", "F11"
+        F12 = "F12", "F12"
+
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
 
     company = models.ForeignKey(
@@ -758,6 +773,16 @@ class Product(models.Model):
         null=True,
     )
 
+    hotkey_group = models.CharField(
+        "Группа F1–F12",
+        max_length=3,
+        choices=HotkeyGroup.choices,
+        blank=True,
+        null=True,
+        db_index=True,
+        help_text="Статическая группа для кассы: GET /api/main/products/list/?hotkey_group=F4",
+    )
+
     # ✅ фикс: без null=True — «акция»: см. также ProductPromotionTier (ступени сумма → скидка %)
     stock = models.BooleanField(
         "Акционный товар",
@@ -786,6 +811,7 @@ class Product(models.Model):
         indexes = [
             models.Index(fields=["company", "status"]),
             models.Index(fields=["company", "branch", "status"]),
+            models.Index(fields=["company", "hotkey_group"]),
             models.Index(fields=["company", "plu"]),
             # Оптимизация для сканирования по штрих-коду
             models.Index(fields=["company", "barcode"], name="idx_product_company_barcode"),

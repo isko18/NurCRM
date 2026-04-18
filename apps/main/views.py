@@ -658,6 +658,10 @@ class ProductListView(CompanyBranchRestrictedMixin, generics.ListAPIView):
                     allowed = list(supplier_qs.values_list("id", flat=True))
                     qs = qs.filter(client_id__in=allowed) if allowed else qs.none()
 
+        hk = (qp.get("hotkey_group") or qp.get("group") or "").strip().upper()
+        if hk and any(hk == c[0] for c in Product.HotkeyGroup.choices):
+            qs = qs.filter(hotkey_group=hk)
+
         # Всегда: избранные сверху. Дальше — стандартная сортировка (ordering filter / default ordering).
         current = list(qs.query.order_by) or []
         # если уже есть сортировка по is_favorite — не дублируем
@@ -694,6 +698,7 @@ class ProductCompactListView(CompanyBranchRestrictedMixin, generics.ListAPIView)
                 "code",
                 "article",
                 "company_id",
+                "hotkey_group",
             )
             .prefetch_related(
                 Prefetch(
@@ -707,6 +712,10 @@ class ProductCompactListView(CompanyBranchRestrictedMixin, generics.ListAPIView)
 
     def filter_queryset(self, queryset):
         qs = super().filter_queryset(queryset)
+        qp = self.request.query_params
+        hk = (qp.get("hotkey_group") or qp.get("group") or "").strip().upper()
+        if hk and any(hk == c[0] for c in Product.HotkeyGroup.choices):
+            qs = qs.filter(hotkey_group=hk)
         current = list(qs.query.order_by) or []
         if not any("is_favorite" in o for o in current):
             qs = qs.order_by("-is_favorite", *current)

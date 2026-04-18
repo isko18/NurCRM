@@ -878,11 +878,19 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
         default=Product.Kind.PRODUCT,
     )
 
+    hotkey_group = serializers.ChoiceField(
+        choices=Product.HotkeyGroup.choices,
+        required=False,
+        allow_null=True,
+        allow_blank=True,
+    )
+
     class Meta:
         model = Product
         fields = [
             "id", "company", "branch",
             "kind",
+            "hotkey_group",
             "code", "article",
             "name", "description", "barcode",
             "brand", "brand_name",
@@ -944,6 +952,11 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
         br = self._auto_branch()
         _restrict_pk_queryset_strict(self.fields.get("item_make_ids"), ItemMake.objects.all(), comp, br)
         _restrict_pk_queryset_strict(self.fields.get("client"), Client.objects.all(), comp, br)
+
+    def validate_hotkey_group(self, value):
+        if value in (None, ""):
+            return None
+        return value
 
     def validate(self, attrs):
         data = self.initial_data if isinstance(getattr(self, "initial_data", None), dict) else {}
@@ -2060,6 +2073,7 @@ class ProductListSerializer(serializers.ModelSerializer):
             "id", "name", "code", "article",
             "price", "purchase_price",
             "quantity", "brand", "category",
+            "hotkey_group",
             "image_url", "is_favorite",
         ]
 
