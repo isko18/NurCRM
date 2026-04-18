@@ -366,7 +366,7 @@ def build_owner_analytics_payload(*, company, branch, period, date_from, date_to
     # ======================================================
     # Stock value (стоимость склада): sum(quantity * purchase_price)
     # ======================================================
-    products_qs = Product.objects.filter(company=company)
+    products_qs = Product.objects.filter(company=company).exclude(kind=Product.Kind.SERVICE)
     if branch is not None:
         # важно: как в ProductListView через CompanyBranchRestrictedMixin
         # при выбранном филиале берём ТОЛЬКО его записи (без branch=NULL)
@@ -602,6 +602,13 @@ def build_owner_analytics_payload(*, company, branch, period, date_from, date_to
 
     users_count = User.objects.filter(company=company).count()
 
+    # summary — ключи для карточек дашборда (подписи UI):
+    # users_count — пользователи компании; transfers_count / items_transferred — перемещения за период;
+    # acceptances_count — приёмки; defective_items — брак (возвраты агента, принятые); sales_count / sales_amount / discounts_total — продажи;
+    # revenue, cost_of_goods_sold, gross_profit, gross_margin_percent — выручка по строкам чека − COGS, маржа %;
+    # stock_value (=stock_purchase_value), stock_retail_value — Σ(quantity×цена) по Product (без kind=service);
+    # raw_material_value — Σ(quantity×price) по ItemMake; accounts_receivable (+ разбивка *_client_deals / *_pos_sales);
+    # accounts_payable — кредиторская (склад + building); total_debt — остаток рассрочки ClientDeal(kind=debt).
     return {
         "period": {
             "type": period,

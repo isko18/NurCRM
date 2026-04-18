@@ -12,36 +12,7 @@ GET /api/main/owners/analytics/
 
 ## Детализация карточек (для модалки)
 
-Отдельный эндпоинт для получения подробного списка по карточке (кликабельные карточки).
-Доступен всем авторизованным пользователям (включая агентов).
-
-```
-GET /api/main/analytics/cards/details/?card=<key>
-```
-
-### Параметры
-
-| Параметр | Тип | Описание | Обязательный | По умолчанию |
-|----------|-----|----------|---------------|--------------|
-| `card` | string | Ключ карточки | Да | — |
-| `limit` | int | Лимит строк | Нет | 200 |
-| `offset` | int | Смещение | Нет | 0 |
-| `branch` | uuid | ID филиала (через миксин) | Нет | — |
-
-### Поддерживаемые `card`
-
-- `stock_purchase_value` (alias: `stock_value`) — **Закупочная цена склада**
-- `stock_retail_value` — **Розничная цена склада**
-- `raw_material_value` — **Цена сырья**
-- `defective_items` — **Брак товаров** (принятые возвраты от агентов)
-
-### Примеры
-
-```http
-GET /api/main/analytics/cards/details/?card=stock_purchase_value&limit=200&offset=0
-GET /api/main/analytics/cards/details/?card=raw_material_value
-GET /api/main/analytics/cards/details/?card=defective_items&limit=200&offset=0
-```
+Эндпоинт `GET /api/main/analytics/cards/details/?card=<key>` — список строк для модалки по клику на карточку. Полное описание параметров, всех значений `card`, формата `items`/`totals` и прав доступа: **[analytics_cards_details_api.md](./analytics_cards_details_api.md)**.
 
 ## Параметры запроса
 
@@ -119,6 +90,8 @@ GET /api/main/owners/analytics/?period=day&date=2024-03-15
 
 ## Summary — сводные показатели
 
+Полное описание всех ключей `summary`, формул и нюансов (склад без услуг, `total_debt` vs дебиторская): **[owner_analytics_summary_ru.md](./owner_analytics_summary_ru.md)**.
+
 | Поле | Тип | Описание |
 |------|-----|----------|
 | `users_count` | integer | Количество пользователей компании |
@@ -136,56 +109,19 @@ GET /api/main/owners/analytics/?period=day&date=2024-03-15
 
 ### Расчёт показателей
 
-- **gross_profit** — по оплаченным продажам: `Σ(quantity × unit_price) − Σ(quantity × purchase_price_snapshot)`
-- **stock_purchase_value** — по товарам: `Σ(quantity × purchase_price)`
-- **stock_retail_value** — по товарам: `Σ(quantity × price)`
-- **raw_material_value** — по сырью (ItemMake): `Σ(quantity × price)`
-- **defective_items** — по принятым возвратам от агентов: `Σ(qty)` для `ReturnFromAgent(status=ACCEPTED)` за период
-- **total_debt** — по долгам: `Σ(amount − paid)` для каждого долга
+Точные формулы (выручка с `line_discount`, себестоимость, разница `total_debt` / `accounts_receivable`): **[owner_analytics_summary_ru.md](./owner_analytics_summary_ru.md)**.
+
+- **gross_profit** — выручка по строкам чека минус COGS (см. документ выше).
+- **stock_purchase_value** / **stock_retail_value** — по товарам `Product` **без** `kind=service`: `Σ(quantity × …)`.
+- **raw_material_value** — по сырью (ItemMake): `Σ(quantity × price)`.
+- **defective_items** — по принятым возвратам от агентов за период (`returned_at`).
+- **total_debt** — остаток только по `ClientDeal(kind=debt)`; POS-долг входит в `accounts_receivable`, но не в `total_debt`.
 
 ---
 
 ## Детализация карточки `defective_items` (Брак товаров)
 
-Запрос:
-
-```http
-GET /api/main/analytics/cards/details/?card=defective_items&limit=200&offset=0
-```
-
-Ответ (пример):
-
-```json
-{
-  "card": "defective_items",
-  "branch_id": "uuid | null",
-  "count": 2,
-  "offset": 0,
-  "limit": 200,
-  "totals": {
-    "qty": 17
-  },
-  "items": [
-    {
-      "product_id": "uuid",
-      "product_name": "Товар А",
-      "qty": 12,
-      "returns_count": 3
-    },
-    {
-      "product_id": "uuid",
-      "product_name": "Товар Б",
-      "qty": 5,
-      "returns_count": 1
-    }
-  ]
-}
-```
-
-Права/область данных:
-
-- Если запрос делает **owner/admin** — возвращается **весь** брак по компании (и branch-фильтру).
-- Если запрос делает **агент** — возвращается **только его** брак (его принятые возвраты).
+См. раздел **defective_items** в **[analytics_cards_details_api.md](./analytics_cards_details_api.md)** (пример ответа и разграничение owner vs агент).
 
 ---
 

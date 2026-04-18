@@ -4262,7 +4262,7 @@ class AnalyticsCardDetailsAPIView(CompanyBranchRestrictedMixin, APIView):
 
         # ----- stock: products -----
         if card in ("stock_purchase_value", "stock_value", "stock_retail_value"):
-            qs = Product.objects.all()
+            qs = Product.objects.all().exclude(kind=Product.Kind.SERVICE)
             qs = self._filter_qs_company_branch(qs)
             qs = qs.order_by("name", "id")
 
