@@ -38,6 +38,7 @@ from apps.main.models import (
     ProductRecipeItem,
     ProductFavorite,
     MarketSaleEmployeePayProfile,
+    Sale,
 )
 from apps.main.serializers import (
     ContactSerializer, PipelineSerializer, DealSerializer, TaskSerializer,
@@ -4188,6 +4189,8 @@ class AnalyticsCardDetailsAPIView(CompanyBranchRestrictedMixin, APIView):
       - stock_purchase_value (alias: stock_value)
       - stock_retail_value
       - raw_material_value
+      - defective_items
+      - discounts_total
     """
     permission_classes = [permissions.IsAuthenticated]
 
@@ -4298,6 +4301,134 @@ class AnalyticsCardDetailsAPIView(CompanyBranchRestrictedMixin, APIView):
                 "items": items,
             })
 
+        # ----- defective items: accepted returns from agents -----
+        if card == "defective_items":
+            qs = ReturnFromAgent.objects.filter(
+                company=company,
+                status=ReturnFromAgent.Status.ACCEPTED,
+            ).select_related("subreal__product")
+
+            # Агент видит только свои возвраты; владелец/админ — все
+            if not _is_owner_like(request.user):
+                qs = qs.filter(returned_by=request.user)
+
+            if branch is not None:
+                qs = qs.filter(branch=branch)
+            else:
+                qs = qs.filter(branch__isnull=True)
+
+            grouped_qs = (
+                qs.values("subreal__product_id", "subreal__product__name")
+                .annotate(
+                    qty=Coalesce(Sum("qty"), V(0)),
+                    returns_count=Count("id"),
+                )
+                .order_by("-qty", "subreal__product__name")
+            )
+
+            total_count = grouped_qs.count()
+            page = list(grouped_qs[offset: offset + limit])
+
+            items = [
+                {
+                    "product_id": str(r["subreal__product_id"]) if r["subreal__product_id"] else None,
+                    "product_name": r["subreal__product__name"] or "",
+                    "qty": int(r["qty"] or 0),
+                    "returns_count": int(r["returns_count"] or 0),
+                }
+                for r in page
+            ]
+            total_qty = int(
+                (grouped_qs.aggregate(s=Coalesce(Sum("qty"), V(0)))["s"]) or 0
+            )
+
+            return Response({
+                "card": card,
+                "branch_id": str(getattr(branch, "id", "")) if branch else None,
+                "count": total_count,
+                "offset": offset,
+                "limit": limit,
+                "totals": {
+                    "qty": total_qty,
+                },
+                "items": items,
+            })
+
+        # ----- discounts total: by employee and client -----
+        if card == "discounts_total":
+            # период берём из тех же query params, что и в аналитике
+            p = _parse_period(request)
+            date_from = p["date_from"]
+            date_to = p["date_to"]
+            dt_from = timezone.make_aware(datetime.combine(date_from, datetime.min.time()))
+            dt_to = timezone.make_aware(datetime.combine(date_to, datetime.max.time()))
+
+            money_field = DecimalField(max_digits=12, decimal_places=2)
+            zero_money = V(Decimal("0.00"), output_field=money_field)
+
+            qs = Sale.objects.filter(
+                company=company,
+                status=Sale.Status.PAID,
+                created_at__range=(dt_from, dt_to),
+            )
+
+            # Агент видит только свои продажи; владелец/админ — все
+            if not _is_owner_like(request.user):
+                qs = qs.filter(user=request.user)
+
+            if branch is not None:
+                qs = qs.filter(branch=branch)
+            else:
+                qs = qs.filter(branch__isnull=True)
+
+            grouped_qs = (
+                qs.filter(discount_total__gt=0)
+                .values(
+                    "user_id",
+                    "user__first_name",
+                    "user__last_name",
+                    "client_id",
+                    "client__full_name",
+                )
+                .annotate(
+                    sales_count=Count("id"),
+                    discounts_total=Coalesce(Sum("discount_total"), zero_money),
+                )
+                .order_by("-discounts_total")
+            )
+
+            total_count = grouped_qs.count()
+            page = list(grouped_qs[offset: offset + limit])
+
+            items = []
+            for r in page:
+                user_name = (
+                    f"{(r.get('user__first_name') or '').strip()} {(r.get('user__last_name') or '').strip()}".strip()
+                    or "Пользователь"
+                )
+                items.append({
+                    "user": {"id": str(r["user_id"]) if r.get("user_id") else None, "name": user_name},
+                    "client": {
+                        "id": str(r["client_id"]) if r.get("client_id") else None,
+                        "name": r.get("client__full_name") or "Без имени",
+                    },
+                    "sales_count": int(r.get("sales_count") or 0),
+                    "discounts_total": str((r.get("discounts_total") or Decimal("0.00")).quantize(_Q2, rounding=ROUND_HALF_UP)),
+                })
+
+            totals = grouped_qs.aggregate(s=Coalesce(Sum("discounts_total"), zero_money))["s"] or Decimal("0.00")
+
+            return Response({
+                "card": card,
+                "branch_id": str(getattr(branch, "id", "")) if branch else None,
+                "period": {"type": p["period"], "date_from": date_from, "date_to": date_to},
+                "count": total_count,
+                "offset": offset,
+                "limit": limit,
+                "totals": {"discounts_total": str(totals.quantize(_Q2, rounding=ROUND_HALF_UP))},
+                "items": items,
+            })
+
         raise ValidationError({
             "card": f"Unsupported card: {card}",
             "supported": [
@@ -4305,5 +4436,7 @@ class AnalyticsCardDetailsAPIView(CompanyBranchRestrictedMixin, APIView):
                 "stock_retail_value",
                 "raw_material_value",
                 "stock_value",
+                "defective_items",
+                "discounts_total",
             ],
         })

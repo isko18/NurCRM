@@ -2,7 +2,7 @@ from decimal import Decimal
 
 from django.apps import apps
 from django.db import transaction
-from django.db.models import Sum, Count, Q
+from django.db.models import Sum, Count, Q, Exists, OuterRef
 from django.db.models import Case, When, Value, CharField
 
 from django.shortcuts import get_object_or_404
@@ -170,7 +170,29 @@ class CashboxListCreateView(CompanyBranchScopedMixin, generics.ListCreateAPIView
     serializer_class = CashboxSerializer
 
     def get_queryset(self):
-        return self._scoped_queryset(super().get_queryset())
+        qs = self._scoped_queryset(super().get_queryset())
+        users_param = self.request.query_params.get("users")
+        if not users_param:
+            return qs
+        user_ids = [x.strip() for x in users_param.split(",") if x.strip()]
+        if not user_ids:
+            return qs
+
+        shift_exists = CashShift.objects.filter(cashbox_id=OuterRef("pk"), cashier_id__in=user_ids)
+        q = Q(Exists(shift_exists))
+
+        sale_model = get_sale_model()
+        if sale_model is not None:
+            fields = {f.name for f in sale_model._meta.concrete_fields}
+            if "user" in fields and "cashbox" in fields:
+                sale_qs = sale_model.objects.filter(user_id__in=user_ids)
+                if "shift" in fields:
+                    sale_qs = sale_qs.filter(Q(cashbox_id=OuterRef("pk")) | Q(shift__cashbox_id=OuterRef("pk")))
+                else:
+                    sale_qs = sale_qs.filter(cashbox_id=OuterRef("pk"))
+                q |= Q(Exists(sale_qs))
+
+        return qs.filter(q)
 
     def perform_create(self, serializer):
         self._inject_company_branch_on_save(serializer)

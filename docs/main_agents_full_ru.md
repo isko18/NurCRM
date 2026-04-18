@@ -669,6 +669,7 @@ Owner-view по всем агентам.
   - `transfers_count`
   - `acceptances_count`
   - `items_transferred`
+  - `defective_items` (брак товаров: принятые возвраты агента за период)
   - `sales_count`
   - `sales_amount`
   - `items_on_hand_qty`

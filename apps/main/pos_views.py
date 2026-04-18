@@ -1980,6 +1980,12 @@ class SaleListAPIView(MarketCashierOnlyMixin, CompanyBranchRestrictedMixin, gene
         if paid_only in ("1", "true", "True"):
             qs = qs.filter(status=Sale.Status.PAID)
 
+        users_param = self.request.query_params.get("users")
+        if users_param:
+            user_ids = [x.strip() for x in users_param.split(",") if x.strip()]
+            if user_ids:
+                qs = qs.filter(user_id__in=user_ids)
+
         return qs
 
 

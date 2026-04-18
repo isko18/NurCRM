@@ -33,12 +33,14 @@ GET /api/main/analytics/cards/details/?card=<key>
 - `stock_purchase_value` (alias: `stock_value`) — **Закупочная цена склада**
 - `stock_retail_value` — **Розничная цена склада**
 - `raw_material_value` — **Цена сырья**
+- `defective_items` — **Брак товаров** (принятые возвраты от агентов)
 
 ### Примеры
 
 ```http
 GET /api/main/analytics/cards/details/?card=stock_purchase_value&limit=200&offset=0
 GET /api/main/analytics/cards/details/?card=raw_material_value
+GET /api/main/analytics/cards/details/?card=defective_items&limit=200&offset=0
 ```
 
 ## Параметры запроса
@@ -92,6 +94,7 @@ GET /api/main/owners/analytics/?period=day&date=2024-03-15
     "transfers_count": 120,
     "acceptances_count": 85,
     "items_transferred": 1500,
+    "defective_items": 17,
     "sales_count": 340,
     "sales_amount": "1250000.00",
     "gross_profit": "380000.00",
@@ -122,6 +125,7 @@ GET /api/main/owners/analytics/?period=day&date=2024-03-15
 | `transfers_count` | integer | Количество передач за период |
 | `acceptances_count` | integer | Количество приёмок за период |
 | `items_transferred` | number | Объём переданных единиц |
+| **`defective_items`** | integer | **Брак товаров** (сумма `ReturnFromAgent.qty` со статусом `ACCEPTED` за период) |
 | `sales_count` | integer | Количество оплаченных продаж |
 | `sales_amount` | string | Сумма продаж (Decimal) |
 | **`gross_profit`** | string | **Валовая прибыль** (выручка − себестоимость) |
@@ -136,7 +140,52 @@ GET /api/main/owners/analytics/?period=day&date=2024-03-15
 - **stock_purchase_value** — по товарам: `Σ(quantity × purchase_price)`
 - **stock_retail_value** — по товарам: `Σ(quantity × price)`
 - **raw_material_value** — по сырью (ItemMake): `Σ(quantity × price)`
+- **defective_items** — по принятым возвратам от агентов: `Σ(qty)` для `ReturnFromAgent(status=ACCEPTED)` за период
 - **total_debt** — по долгам: `Σ(amount − paid)` для каждого долга
+
+---
+
+## Детализация карточки `defective_items` (Брак товаров)
+
+Запрос:
+
+```http
+GET /api/main/analytics/cards/details/?card=defective_items&limit=200&offset=0
+```
+
+Ответ (пример):
+
+```json
+{
+  "card": "defective_items",
+  "branch_id": "uuid | null",
+  "count": 2,
+  "offset": 0,
+  "limit": 200,
+  "totals": {
+    "qty": 17
+  },
+  "items": [
+    {
+      "product_id": "uuid",
+      "product_name": "Товар А",
+      "qty": 12,
+      "returns_count": 3
+    },
+    {
+      "product_id": "uuid",
+      "product_name": "Товар Б",
+      "qty": 5,
+      "returns_count": 1
+    }
+  ]
+}
+```
+
+Права/область данных:
+
+- Если запрос делает **owner/admin** — возвращается **весь** брак по компании (и branch-фильтру).
+- Если запрос делает **агент** — возвращается **только его** брак (его принятые возвраты).
 
 ---
 

@@ -4,6 +4,9 @@
 
 API возврата продажи. Доступен владельцам и агентам. Отменяет оплаченную или долговую продажу и возвращает товар на склад (обычные продажи) или агенту (агентские продажи).
 
+Агентские продажи, оформленные через `checkout_agent_cart` (см. `apps/main/services_agent_pos.py`), тоже поддерживаются:
+при чекауте создаются записи `AgentSaleAllocation`, и при возврате они удаляются — товар снова считается у агента.
+
 ---
 
 ## Эндпоинты
@@ -75,7 +78,7 @@ Authorization: Bearer <token>
 | Тип продажи | Действие |
 |--------------|----------|
 | **Обычная (владелец)** | `Product.quantity += item.quantity` по каждой позиции — товар возвращается на склад |
-| **Агентская** | Удаляются записи `AgentSaleAllocation` — товар снова считается у агента |
+| **Агентская** (в т.ч. из `checkout_agent_cart`) | Удаляются записи `AgentSaleAllocation` — товар снова считается у агента |
 
 После возврата статус продажи меняется на `canceled`.
 
@@ -113,6 +116,7 @@ Authorization: Bearer <token>
 
 - **View:** `apps/main/pos_views.py` → `SaleReturnAPIView`
 - **URL names:** `pos-sale-return`, `agent-sale-return`
+- **Agent checkout:** `apps/main/services_agent_pos.py` → `checkout_agent_cart`
 
 ### Модели
 

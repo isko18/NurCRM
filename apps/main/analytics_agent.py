@@ -260,6 +260,21 @@ def build_agent_analytics_payload(
     acceptances_count = acc_qs.count()
 
     # ======================================================
+    #              Б Р А К  (возвраты от агента, принятые)
+    # ======================================================
+    returns_qs = ReturnFromAgent.objects.filter(
+        company=company,
+        returned_by=agent,
+        status=ReturnFromAgent.Status.ACCEPTED,
+        returned_at__range=(dt_from, dt_to),
+    )
+    if branch is not None:
+        returns_qs = returns_qs.filter(branch=branch)
+    else:
+        returns_qs = returns_qs.filter(branch__isnull=True)
+    defective_items_qty = returns_qs.aggregate(s=Coalesce(Sum("qty"), V(0)))["s"] or 0
+
+    # ======================================================
     #              П Р О Д А Ж И
     # ======================================================
     sales_qs = Sale.objects.filter(
@@ -280,6 +295,10 @@ def build_agent_analytics_payload(
         s=Coalesce(Sum("total"), ZERO_MONEY)
     )["s"] or Decimal("0.00")
     sales_amount = float(sales_amount_dec)
+    discounts_total_dec = sales_qs.aggregate(
+        s=Coalesce(Sum("discount_total"), ZERO_MONEY)
+    )["s"] or Decimal("0.00")
+    discounts_total = float(discounts_total_dec)
 
     # ---------------- 0) методы оплаты ----------------
     payment_breakdown_qs = (
@@ -482,8 +501,10 @@ def build_agent_analytics_payload(
             "transfers_count": transfers_count,
             "acceptances_count": acceptances_count,
             "items_transferred": items_transferred,
+            "defective_items": defective_items_qty,
             "sales_count": sales_count,
             "sales_amount": sales_amount,
+            "discounts_total": discounts_total,
             "items_on_hand_qty": on_hand["total_qty"],
             "items_on_hand_amount": on_hand["total_amount"],
             "accounts_receivable": float(accounts_receivable_dec),

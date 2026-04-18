@@ -9,7 +9,17 @@ from django.db.models.expressions import ExpressionWrapper
 
 from apps.users.models import User
 from apps.construction.models import CashFlow
-from .models import ManufactureSubreal, Acceptance, Sale, SaleItem, ClientDeal, DealInstallment, Product, ItemMake
+from .models import (
+    ManufactureSubreal,
+    Acceptance,
+    ReturnFromAgent,
+    Sale,
+    SaleItem,
+    ClientDeal,
+    DealInstallment,
+    Product,
+    ItemMake,
+)
 
 try:
     from apps.warehouse.models import Document as WarehouseStockDocument
@@ -162,6 +172,22 @@ def build_owner_analytics_payload(*, company, branch, period, date_from, date_to
     acceptances_count = acc_qs.count()
 
     # ======================================================
+    # Defective items (возвраты от агентов, принятые)
+    # ======================================================
+    returns_qs = ReturnFromAgent.objects.filter(
+        company=company,
+        status=ReturnFromAgent.Status.ACCEPTED,
+        returned_at__gte=dt_from,
+        returned_at__lt=dt_to_excl,
+    )
+    if branch is not None:
+        returns_qs = returns_qs.filter(branch=branch)
+    else:
+        returns_qs = returns_qs.filter(branch__isnull=True)
+
+    defective_items_qty = returns_qs.aggregate(s=Coalesce(Sum("qty"), V(0)))["s"] or 0
+
+    # ======================================================
     # Sales (paid, all)
     # ======================================================
     sales_qs = Sale.objects.filter(
@@ -180,6 +206,9 @@ def build_owner_analytics_payload(*, company, branch, period, date_from, date_to
     # FIX: правильный Decimal-ноль с output_field
     sales_amount_dec = sales_qs.aggregate(
         s=Coalesce(Sum("total"), ZERO_MONEY)
+    )["s"] or Decimal("0.00")
+    discounts_total_dec = sales_qs.aggregate(
+        s=Coalesce(Sum("discount_total"), ZERO_MONEY)
     )["s"] or Decimal("0.00")
 
     items_qs = SaleItem.objects.filter(sale__in=sales_qs)
@@ -585,8 +614,10 @@ def build_owner_analytics_payload(*, company, branch, period, date_from, date_to
             "transfers_count": transfers_count,
             "acceptances_count": acceptances_count,
             "items_transferred": items_transferred,
+            "defective_items": defective_items_qty,
             "sales_count": sales_count,
             "sales_amount": _money_str(sales_amount_dec),
+            "discounts_total": _money_str(discounts_total_dec),
             # Валовая прибыль (оплаченные продажи за период): выручка − себестоимость
             "revenue": _money_str(revenue_dec),
             "cost_of_goods_sold": _money_str(cogs_dec),
