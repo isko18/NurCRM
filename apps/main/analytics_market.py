@@ -16,6 +16,7 @@ from django.db.models import (
     Value,
     DecimalField,
     ExpressionWrapper,
+    IntegerField,
 )
 from django.db.models.functions import TruncDate, ExtractHour, ExtractWeekDay, Coalesce
 from django.utils import timezone
@@ -541,6 +542,8 @@ class AnalyticsView(APIView):
             data = self._products_analytics(request, company, branch, period)
         elif tab == "suppliers":
             data = self._suppliers_analytics(request, company, branch, period)
+        elif tab == "procurement":
+            data = self._procurement(request, company, branch, period)
         elif tab == "users":
             data = self._users_analytics(request, company, branch, period)
         elif tab == "finance":
@@ -549,7 +552,7 @@ class AnalyticsView(APIView):
             data = self._salary(request, company, branch, period)
         else:
             return Response(
-                {"detail": "Unknown tab. Use: sales|stock|cashboxes|shifts|products|suppliers|users|finance|salary"},
+                {"detail": "Unknown tab. Use: sales|stock|cashboxes|shifts|products|suppliers|procurement|users|finance|salary"},
                 status=400,
             )
 
@@ -1490,6 +1493,10 @@ class AnalyticsView(APIView):
         stock_value = Z_MONEY
         low_stock_count = 0
         low_stock_products = []  # НОВОЕ: полный список товаров с низким остатком
+        sales_without_product = []
+        sales_without_product_line_count = 0
+        rejected_catalog_products = []
+        rejected_products_count = 0
 
         Sale, SaleItem = get_sale_models()
         if Sale and SaleItem and Product:
@@ -1644,6 +1651,59 @@ class AnalyticsView(APIView):
                         for r in brand_query
                     ]
 
+            # Строки продаж без карточки товара (Product удалён → product=NULL, остаётся name_snapshot)
+            if _model_has_field(SaleItem, "name_snapshot"):
+                ghost_base = SaleItem.objects.filter(sale__in=sqs, product__isnull=True)
+                sales_without_product_line_count = int(ghost_base.count() or 0)
+                gvals = ("name_snapshot", "barcode_snapshot")
+                if _model_has_field(SaleItem, "unit_price"):
+                    ghost_rev = ExpressionWrapper(
+                        F("quantity") * F("unit_price"),
+                        output_field=MONEY_FIELD,
+                    )
+                    gq = (
+                        ghost_base.values(*gvals)
+                        .annotate(
+                            qty_sold=Coalesce(
+                                Sum("quantity"),
+                                Value(Z_QTY, output_field=QTY_FIELD),
+                                output_field=QTY_FIELD,
+                            ),
+                            revenue=Coalesce(
+                                Sum(ghost_rev),
+                                Value(Z_MONEY, output_field=MONEY_FIELD),
+                                output_field=MONEY_FIELD,
+                            ),
+                            tx_count=Count("sale_id", distinct=True),
+                        )
+                        .order_by("-qty_sold")
+                    )
+                else:
+                    gq = (
+                        ghost_base.values(*gvals)
+                        .annotate(
+                            qty_sold=Coalesce(
+                                Sum("quantity"),
+                                Value(Z_QTY, output_field=QTY_FIELD),
+                                output_field=QTY_FIELD,
+                            ),
+                            tx_count=Count("sale_id", distinct=True),
+                        )
+                        .order_by("-qty_sold")
+                    )
+                if limit:
+                    gq = gq[:limit]
+                for r in gq:
+                    row = {
+                        "name": (r.get("name_snapshot") or "").strip() or "—",
+                        "barcode_snapshot": r.get("barcode_snapshot"),
+                        "qty_sold": str((r.get("qty_sold") or Z_QTY).quantize(Decimal("0.001"))),
+                        "transactions": int(r.get("tx_count") or 0),
+                    }
+                    if _model_has_field(SaleItem, "unit_price"):
+                        row["revenue"] = str(_money(r.get("revenue") or Z_MONEY))
+                    sales_without_product.append(row)
+
         # Stock Analysis - ПОЛНЫЙ СПИСОК товаров с низким остатком
         if Product:
             pqs = Product.objects.filter(company=company)
@@ -1687,6 +1747,40 @@ class AnalyticsView(APIView):
                     for p in low_stock_qs
                 ]
 
+        catalog_products_count = 0
+        pqs_scope = self._market_products_queryset(request, company, branch)
+        if pqs_scope is not None:
+            catalog_products_count = pqs_scope.count()
+
+        # Карточки товаров со статусом «Отказ» (в каталоге есть, на витрине «нет»)
+        if Product is not None and _model_has_field(Product, "status"):
+            rej_val = _choice_value(Product, "Status", "REJECTED", "rejected")
+            rj = Product.objects.filter(company=company, status=rej_val)
+            if branch and _model_has_field(Product, "branch"):
+                if self._include_global(request):
+                    rj = rj.filter(Q(branch=branch) | Q(branch__isnull=True))
+                else:
+                    rj = rj.filter(branch=branch)
+            rejected_products_count = rj.count()
+            rlim = limit if limit is not None else 200
+            for p in rj.select_related("category", "brand").order_by("-updated_at")[:rlim]:
+                rejected_catalog_products.append({
+                    "id": str(p.id),
+                    "name": getattr(p, "name", None) or "—",
+                    "code": getattr(p, "code", None),
+                    "article": getattr(p, "article", None),
+                    "barcode": getattr(p, "barcode", None),
+                    "quantity": (
+                        str(Decimal(str(getattr(p, "quantity", None) or 0)).quantize(Decimal("0.001")))
+                        if _model_has_field(Product, "quantity")
+                        else None
+                    ),
+                    "status": getattr(p, "status", None),
+                    "updated_at": p.updated_at.isoformat() if getattr(p, "updated_at", None) else None,
+                    "category": getattr(p.category, "name", None) if getattr(p, "category", None) else None,
+                    "brand": getattr(p.brand, "name", None) if getattr(p, "brand", None) else None,
+                })
+
         return {
             "tab": "products",
             "period": {"from": period.start.isoformat(), "to": period.end.isoformat()},
@@ -1697,6 +1791,9 @@ class AnalyticsView(APIView):
             "cards": {
                 "stock_value": str(_money(stock_value)),
                 "low_stock_count": low_stock_count,
+                "catalog_products_count": catalog_products_count,
+                "sales_lines_missing_product_count": sales_without_product_line_count,
+                "rejected_products_count": rejected_products_count,
             },
             "tables": {
                 "top_by_revenue": top_products_by_revenue,
@@ -1704,6 +1801,8 @@ class AnalyticsView(APIView):
                 "categories": categories_performance,
                 "brands": brands_performance,
                 "low_stock_products": low_stock_products,  # НОВОЕ: полный список с деталями
+                "sales_without_catalog_product": sales_without_product,
+                "rejected_products": rejected_catalog_products,
             },
         }
 
@@ -1734,7 +1833,7 @@ class AnalyticsView(APIView):
                     "branch": str(getattr(branch, "id", "")) if branch else None,
                     "limit": limit,
                 },
-                "cards": {},
+                "cards": {"catalog_products_count": 0},
                 "tables": {"suppliers": [], "suppliers_by_stock": []},
             }
 
@@ -1746,7 +1845,7 @@ class AnalyticsView(APIView):
                     "branch": str(getattr(branch, "id", "")) if branch else None,
                     "limit": limit,
                 },
-                "cards": {"suppliers_count": 0},
+                "cards": {"suppliers_count": 0, "catalog_products_count": 0},
                 "tables": {"suppliers": [], "suppliers_by_stock": []},
             }
 
@@ -1760,9 +1859,11 @@ class AnalyticsView(APIView):
                     "branch": str(getattr(branch, "id", "")) if branch else None,
                     "limit": limit,
                 },
-                "cards": {"suppliers_count": 0},
+                "cards": {"suppliers_count": 0, "catalog_products_count": 0},
                 "tables": {"suppliers": [], "suppliers_by_stock": []},
             }
+
+        catalog_products_count = pqs.count()
 
         p_sup = pqs.filter(
             client_id__isnull=False,
@@ -1945,6 +2046,7 @@ class AnalyticsView(APIView):
             },
             "cards": {
                 "suppliers_count": n_sup,
+                "catalog_products_count": catalog_products_count,
                 "total_stock_value": str(_money(total_stock_val)),
                 "total_period_qty_sold": _qty_str(tot_period_qty),
                 "total_period_revenue": str(_money(tot_period_rev)),
@@ -1952,6 +2054,230 @@ class AnalyticsView(APIView):
             "tables": {
                 "suppliers": items,
                 "suppliers_by_stock": suppliers_by_stock,
+            },
+        }
+
+    # ─────────────────────────────────────────────────────────
+    # PROCUREMENT (продажи vs отгрузка агентам; закупки от поставщика без журнала)
+    # ─────────────────────────────────────────────────────────
+    def _procurement(self, request, company, branch, period: Period):
+        from uuid import UUID as UUIDType
+
+        limit_param = request.query_params.get("limit")
+        limit = int(limit_param) if limit_param and limit_param.isdigit() else 50
+
+        Product = None
+        try:
+            Product = apps.get_model("main.Product")
+        except Exception:
+            pass
+        Subreal = None
+        try:
+            Subreal = apps.get_model("main.ManufactureSubreal")
+        except Exception:
+            pass
+
+        pqs = self._market_products_queryset(request, company, branch)
+        catalog_products_count = pqs.count() if pqs is not None else 0
+
+        zero_i = Value(0, output_field=IntegerField())
+
+        s_map: dict[str, dict] = {}
+        Sale, SaleItem = get_sale_models()
+
+        if (
+            Sale
+            and SaleItem
+            and Product
+            and pqs is not None
+            and _model_has_field(SaleItem, "product")
+            and _model_has_field(SaleItem, "quantity")
+        ):
+            paid_value = _choice_value(Sale, "Status", "PAID", "paid")
+            dt_field = "paid_at" if _model_has_field(Sale, "paid_at") else "created_at"
+            sqs = Sale.objects.filter(company=company, status=paid_value)
+            if branch and _model_has_field(Sale, "branch"):
+                if self._include_global(request):
+                    sqs = sqs.filter(Q(branch=branch) | Q(branch__isnull=True))
+                else:
+                    sqs = sqs.filter(branch=branch)
+            sqs = self._apply_sale_filters(request, sqs, Sale)
+            sqs = sqs.filter(**{f"{dt_field}__gte": period.start, f"{dt_field}__lt": period.end})
+
+            si = SaleItem.objects.filter(sale__in=sqs, product_id__in=pqs.values("id"), product__isnull=False)
+            base_vals = ("product_id", "product__name", "product__code")
+            if _model_has_field(SaleItem, "unit_price"):
+                rev_expr = ExpressionWrapper(
+                    F("quantity") * F("unit_price"),
+                    output_field=MONEY_FIELD,
+                )
+                rows = (
+                    si.values(*base_vals)
+                    .annotate(
+                        qty_sold=Coalesce(
+                            Sum("quantity"),
+                            Value(Z_QTY, output_field=QTY_FIELD),
+                            output_field=QTY_FIELD,
+                        ),
+                        revenue=Coalesce(
+                            Sum(rev_expr),
+                            Value(Z_MONEY, output_field=MONEY_FIELD),
+                            output_field=MONEY_FIELD,
+                        ),
+                    )
+                    .order_by("-qty_sold")
+                )
+            else:
+                rows = (
+                    si.values(*base_vals)
+                    .annotate(
+                        qty_sold=Coalesce(
+                            Sum("quantity"),
+                            Value(Z_QTY, output_field=QTY_FIELD),
+                            output_field=QTY_FIELD,
+                        ),
+                    )
+                    .order_by("-qty_sold")
+                )
+            for r in rows:
+                k = str(r["product_id"])
+                s_map[k] = {
+                    "product_id": k,
+                    "name": (r.get("product__name") or "").strip() or "—",
+                    "code": r.get("product__code"),
+                    "qty_sold_dec": Decimal(str(r.get("qty_sold") or 0)),
+                    "revenue_dec": _money(r.get("revenue") or Z_MONEY) if "revenue" in r else Z_MONEY,
+                }
+
+        t_map: dict[str, dict] = {}
+        if Subreal is not None and Product is not None and pqs is not None:
+            rq = Subreal.objects.filter(company=company)
+            if branch and _model_has_field(Subreal, "branch"):
+                if self._include_global(request):
+                    rq = rq.filter(Q(branch=branch) | Q(branch__isnull=True))
+                else:
+                    rq = rq.filter(branch=branch)
+            rq = rq.filter(
+                created_at__gte=period.start,
+                created_at__lt=period.end,
+                product_id__in=pqs.values("id"),
+            )
+            tr = (
+                rq.values("product_id", "product__name", "product__code")
+                .annotate(
+                    qty_transferred=Coalesce(
+                        Sum("qty_transferred"),
+                        zero_i,
+                        output_field=IntegerField(),
+                    ),
+                )
+                .order_by("-qty_transferred")
+            )
+            for r in tr:
+                k = str(r["product_id"])
+                t_map[k] = {
+                    "product_id": k,
+                    "name": (r.get("product__name") or "").strip() or "—",
+                    "code": r.get("product__code"),
+                    "qty_transferred_to_agents": int(r.get("qty_transferred") or 0),
+                }
+
+        all_ids = set(s_map) | set(t_map)
+        meta_prod: dict[str, dict] = {}
+        if pqs is not None and all_ids:
+            uuids = []
+            for x in all_ids:
+                try:
+                    uuids.append(UUIDType(x))
+                except Exception:
+                    pass
+            if uuids:
+                for p in pqs.filter(id__in=uuids).only("id", "name", "code", "quantity", "purchase_price"):
+                    meta_prod[str(p.id)] = {
+                        "name": (getattr(p, "name", None) or "").strip() or "—",
+                        "code": getattr(p, "code", None),
+                        "quantity": getattr(p, "quantity", None) or 0,
+                        "purchase_price": getattr(p, "purchase_price", None) or 0,
+                    }
+
+        combined_rows = []
+        for k in all_ids:
+            sd = s_map.get(k, {})
+            td = t_map.get(k, {})
+            mp = meta_prod.get(k, {})
+            name = sd.get("name") or td.get("name") or mp.get("name") or "—"
+            code = sd.get("code") if sd.get("code") is not None else td.get("code")
+            if code is None:
+                code = mp.get("code")
+            qty_s = sd.get("qty_sold_dec", Z_QTY)
+            rev = sd.get("revenue_dec", Z_MONEY)
+            qty_t = int(td.get("qty_transferred_to_agents", 0))
+            qcur = Decimal(str(mp.get("quantity", 0) or 0))
+            pp = Decimal(str(mp.get("purchase_price", 0) or 0))
+            stock_val = _money(qcur * pp)
+            combined_rows.append({
+                "product_id": k,
+                "name": name,
+                "code": code,
+                "qty_sold": _qty_str(qty_s),
+                "revenue": str(_money(rev)),
+                "qty_transferred_to_agents": qty_t,
+                "current_stock": _qty_str(qcur),
+                "stock_at_purchase_prices": str(stock_val),
+                "_activity": qty_s + Decimal(qty_t),
+            })
+
+        combined_rows.sort(key=lambda x: (-x["_activity"], -Decimal(str(x["qty_sold"]))))
+        for row in combined_rows:
+            del row["_activity"]
+
+        top_sold = []
+        for sd in sorted(s_map.values(), key=lambda x: -x["qty_sold_dec"])[:limit]:
+            top_sold.append({
+                "product_id": sd["product_id"],
+                "name": sd["name"],
+                "code": sd["code"],
+                "qty_sold": _qty_str(sd["qty_sold_dec"]),
+                "revenue": str(_money(sd["revenue_dec"])),
+            })
+
+        top_transfers = []
+        for td in sorted(t_map.values(), key=lambda x: -x["qty_transferred_to_agents"])[:limit]:
+            top_transfers.append({
+                "product_id": td["product_id"],
+                "name": td["name"],
+                "code": td["code"],
+                "qty_transferred_to_agents": td["qty_transferred_to_agents"],
+            })
+
+        combined_out = combined_rows[:limit]
+
+        tot_sold = sum((s_map[k]["qty_sold_dec"] for k in s_map), Z_QTY)
+        tot_tr = sum(int(t_map[k]["qty_transferred_to_agents"]) for k in t_map)
+
+        return {
+            "tab": "procurement",
+            "period": {"from": period.start.isoformat(), "to": period.end.isoformat()},
+            "filters": {
+                "branch": str(getattr(branch, "id", "")) if branch else None,
+                "limit": limit,
+            },
+            "meta": {
+                "purchase_note": (
+                    "Оприходование от поставщика (POST /api/main/suppliers/<id>/receipt/) не пишется в отдельный журнал; "
+                    "в отчёте «отгрузка» — сумма qty_transferred по передачам агентам (ManufactureSubreal) за период."
+                ),
+            },
+            "cards": {
+                "catalog_products_count": catalog_products_count,
+                "products_with_sales_or_transfers": len(all_ids),
+                "total_qty_sold_period": _qty_str(tot_sold),
+                "total_qty_transferred_to_agents_period": int(tot_tr),
+            },
+            "tables": {
+                "top_by_sales": top_sold,
+                "top_by_transfers_to_agents": top_transfers,
+                "sold_vs_transfers": combined_out,
             },
         }
 
