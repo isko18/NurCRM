@@ -62,7 +62,7 @@ from apps.main.serializers import (
 )
 from django.db.models import ProtectedError
 from apps.utils import product_images_prefetch, _is_owner_like
-from apps.main.analytics_agent import build_agent_analytics_payload, _parse_period
+from apps.main.analytics_agent import build_agent_analytics_payload, _parse_period, _compute_agent_on_hand
 from apps.main.analytics_owner_production import build_owner_analytics_payload, _dt_range
 from apps.main.services import _parse_bool_like, _parse_date_to_aware_datetime, _parse_kind, _parse_int_nonneg, _parse_decimal
     
@@ -4236,6 +4236,12 @@ class AnalyticsCardDetailsAPIView(CompanyBranchRestrictedMixin, APIView):
       - defective_items
       - discounts_total
       - transfers_count
+      - items_transferred
+      - acceptances_count
+      - sales_count
+      - sales_amount
+      - items_on_hand_qty
+      - items_on_hand_amount
       - users_count
     """
     permission_classes = [permissions.IsAuthenticated]
@@ -4404,8 +4410,8 @@ class AnalyticsCardDetailsAPIView(CompanyBranchRestrictedMixin, APIView):
                 "items": items,
             })
 
-        # ----- transfers: ManufactureSubreal (как summary transfers_count в аналитике) -----
-        if card == "transfers_count":
+        # ----- transfers: ManufactureSubreal (transfers_count и items_transferred — один список) -----
+        if card in ("transfers_count", "items_transferred"):
             p = _parse_period(request)
             date_from = p["date_from"]
             date_to = p["date_to"]
@@ -4467,6 +4473,196 @@ class AnalyticsCardDetailsAPIView(CompanyBranchRestrictedMixin, APIView):
                 "offset": offset,
                 "limit": limit,
                 "totals": {"items_transferred": items_transferred_total},
+                "items": items,
+            })
+
+        # ----- acceptances: Acceptance (как summary acceptances_count в аналитике) -----
+        if card == "acceptances_count":
+            p = _parse_period(request)
+            date_from = p["date_from"]
+            date_to = p["date_to"]
+
+            qs = Acceptance.objects.filter(company=company)
+            if not _is_owner_like(request.user):
+                qs = qs.filter(subreal__agent=request.user)
+
+            if _is_owner_like(request.user):
+                dt_from, dt_to_excl = _dt_range(date_from, date_to)
+                qs = qs.filter(accepted_at__gte=dt_from, accepted_at__lt=dt_to_excl)
+            else:
+                dt_from = timezone.make_aware(datetime.combine(date_from, datetime.min.time()))
+                dt_to = timezone.make_aware(datetime.combine(date_to, datetime.max.time()))
+                qs = qs.filter(accepted_at__gte=dt_from, accepted_at__lte=dt_to)
+
+            if branch is not None:
+                qs = qs.filter(subreal__branch=branch)
+            else:
+                qs = qs.filter(subreal__branch__isnull=True)
+
+            qs = qs.select_related("subreal", "subreal__agent", "subreal__product", "accepted_by").order_by(
+                "-accepted_at", "-id"
+            )
+            total_count = qs.count()
+            qty_accepted_total = int((qs.aggregate(s=Coalesce(Sum("qty"), V(0)))["s"]) or 0)
+            page = qs[offset: offset + limit]
+
+            items = []
+            for acc in page:
+                sr = acc.subreal
+                agent_u = sr.agent if sr else None
+                agent_name = (
+                    f"{(getattr(agent_u, 'first_name', None) or '').strip()} {(getattr(agent_u, 'last_name', None) or '').strip()}".strip()
+                    or getattr(agent_u, "username", None)
+                    or "Пользователь"
+                ) if agent_u else "Пользователь"
+                prod = sr.product if sr else None
+                accepter = acc.accepted_by
+                accepter_name = (
+                    f"{(getattr(accepter, 'first_name', None) or '').strip()} {(getattr(accepter, 'last_name', None) or '').strip()}".strip()
+                    or getattr(accepter, "username", None)
+                    or "Пользователь"
+                ) if accepter else "Пользователь"
+                items.append({
+                    "id": str(acc.id),
+                    "accepted_at": timezone.localtime(acc.accepted_at).isoformat() if acc.accepted_at else None,
+                    "qty": int(acc.qty or 0),
+                    "accepted_by": {"id": str(accepter.id), "name": accepter_name} if accepter else None,
+                    "agent": {"id": str(agent_u.id), "name": agent_name} if agent_u else None,
+                    "subreal": {"id": str(sr.id), "status": sr.status} if sr else None,
+                    "product": {"id": str(prod.id), "name": getattr(prod, "name", None) or ""} if prod else None,
+                })
+
+            return Response({
+                "card": card,
+                "branch_id": str(getattr(branch, "id", "")) if branch else None,
+                "period": {"type": p["period"], "date_from": date_from, "date_to": date_to},
+                "count": total_count,
+                "offset": offset,
+                "limit": limit,
+                "totals": {"qty_accepted": qty_accepted_total},
+                "items": items,
+            })
+
+        # ----- sales: список оплаченных продаж (sales_count / sales_amount в summary) -----
+        if card in ("sales_count", "sales_amount"):
+            p = _parse_period(request)
+            date_from = p["date_from"]
+            date_to = p["date_to"]
+
+            if _is_owner_like(request.user):
+                dt_from, dt_to_excl = _dt_range(date_from, date_to)
+                qs = Sale.objects.filter(
+                    company=company,
+                    status=Sale.Status.PAID,
+                    created_at__gte=dt_from,
+                    created_at__lt=dt_to_excl,
+                )
+            else:
+                dt_from = timezone.make_aware(datetime.combine(date_from, datetime.min.time()))
+                dt_to = timezone.make_aware(datetime.combine(date_to, datetime.max.time()))
+                qs = Sale.objects.filter(
+                    company=company,
+                    user=request.user,
+                    status=Sale.Status.PAID,
+                    created_at__gte=dt_from,
+                    created_at__lte=dt_to,
+                )
+
+            if branch is not None:
+                qs = qs.filter(branch=branch)
+            else:
+                qs = qs.filter(branch__isnull=True)
+
+            money_field = DecimalField(max_digits=12, decimal_places=2)
+            zero_money = V(Decimal("0.00"), output_field=money_field)
+            sales_amount_total = qs.aggregate(s=Coalesce(Sum("total"), zero_money))["s"] or Decimal("0.00")
+
+            qs = qs.select_related("user", "client").order_by("-created_at", "-id")
+            total_count = qs.count()
+            page = qs[offset: offset + limit]
+
+            items = []
+            for sale in page:
+                u = sale.user
+                user_name = (
+                    f"{(getattr(u, 'first_name', None) or '').strip()} {(getattr(u, 'last_name', None) or '').strip()}".strip()
+                    or getattr(u, "username", None)
+                    or "Пользователь"
+                ) if u else "Пользователь"
+                cl = sale.client
+                items.append({
+                    "id": str(sale.id),
+                    "created_at": timezone.localtime(sale.created_at).isoformat() if sale.created_at else None,
+                    "total": str((sale.total or Decimal("0.00")).quantize(_Q2, rounding=ROUND_HALF_UP)),
+                    "discount_total": str((sale.discount_total or Decimal("0.00")).quantize(_Q2, rounding=ROUND_HALF_UP)),
+                    "user": {"id": str(sale.user_id), "name": user_name} if sale.user_id else None,
+                    "client": (
+                        {"id": str(cl.id), "name": getattr(cl, "full_name", None) or ""}
+                        if cl else None
+                    ),
+                })
+
+            return Response({
+                "card": card,
+                "branch_id": str(getattr(branch, "id", "")) if branch else None,
+                "period": {"type": p["period"], "date_from": date_from, "date_to": date_to},
+                "count": total_count,
+                "offset": offset,
+                "limit": limit,
+                "totals": {
+                    "sales_amount": str(sales_amount_total.quantize(_Q2, rounding=ROUND_HALF_UP)),
+                },
+                "items": items,
+            })
+
+        # ----- остатки на руках у агента (как summary в analytics_agent) -----
+        if card in ("items_on_hand_qty", "items_on_hand_amount"):
+            if _is_owner_like(request.user):
+                return Response({
+                    "card": card,
+                    "branch_id": str(getattr(branch, "id", "")) if branch else None,
+                    "count": 0,
+                    "offset": offset,
+                    "limit": limit,
+                    "totals": {
+                        "qty_on_hand": 0,
+                        "amount": "0.00",
+                    },
+                    "items": [],
+                })
+
+            on_hand = _compute_agent_on_hand(company=company, branch=branch, agent=request.user)
+            if card == "items_on_hand_qty":
+                rows = list(on_hand["by_product_qty"])
+            else:
+                rows = list(on_hand["by_product_amount"])
+            rows.sort(key=lambda r: ((r.get("product_name") or ""), str(r.get("product_id") or "")))
+            total_count = len(rows)
+            page = rows[offset: offset + limit]
+            amt_total = Decimal(str(on_hand["total_amount"] or 0)).quantize(_Q2, rounding=ROUND_HALF_UP)
+            items = []
+            for r in page:
+                row = {
+                    "product_id": r.get("product_id"),
+                    "product_name": r.get("product_name") or "",
+                    "qty_on_hand": int(r.get("qty_on_hand") or 0),
+                }
+                if card == "items_on_hand_amount":
+                    row["amount"] = str(
+                        Decimal(str(r.get("amount") or 0)).quantize(_Q2, rounding=ROUND_HALF_UP)
+                    )
+                items.append(row)
+
+            return Response({
+                "card": card,
+                "branch_id": str(getattr(branch, "id", "")) if branch else None,
+                "count": total_count,
+                "offset": offset,
+                "limit": limit,
+                "totals": {
+                    "qty_on_hand": int(on_hand["total_qty"] or 0),
+                    "amount": str(amt_total),
+                },
                 "items": items,
             })
 
@@ -4585,6 +4781,12 @@ class AnalyticsCardDetailsAPIView(CompanyBranchRestrictedMixin, APIView):
                 "defective_items",
                 "discounts_total",
                 "transfers_count",
+                "items_transferred",
+                "acceptances_count",
+                "sales_count",
+                "sales_amount",
+                "items_on_hand_qty",
+                "items_on_hand_amount",
                 "users_count",
             ],
         })
