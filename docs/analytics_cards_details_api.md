@@ -22,11 +22,11 @@
 
 ## Период (`period`, `date`, `date_from`, `date_to`)
 
-Используется для **`transfers_count`**, **`items_transferred`**, **`acceptances_count`**, **`sales_count`**, **`sales_amount`** и **`discounts_total`**. Парсинг совпадает с [`_parse_period` в `analytics_agent.py`](../apps/main/analytics_agent.py): по умолчанию `period=month`, границы до 30 дней и т.д.
+Используется для **`transfers_count`**, **`items_transferred`**, **`acceptances_count`**, **`sales_count`**, **`sales_amount`**, **`discounts_total`**, а также **`revenue`**, **`cost_of_goods_sold`**, **`gross_profit`**, **`gross_margin_percent`** (разбивка по оплаченным продажам за период). Парсинг совпадает с [`_parse_period` в `analytics_agent.py`](../apps/main/analytics_agent.py): по умолчанию `period=month`, границы до 30 дней и т.д.
 
 Параметр **`group_by`** в URL для этого эндпоинта **не используется** (ответ не группирует строки по дням; только срез списка `items`).
 
-Для **`items_on_hand_qty`** / **`items_on_hand_amount`** период **не влияет** (снимок остатков «на руках» как в `analytics_agent`). Для остальных `card` без периода период в URL можно не учитывать.
+Для **`items_on_hand_qty`** / **`items_on_hand_amount`** период **не влияет** (снимок остатков «на руках» как в `analytics_agent`). Для **`accounts_receivable`**, **`accounts_payable`**, **`total_debt`** период в запросе **не используется** (текущие остатки/сальдо). Для остальных `card` без периода параметр `period` в URL можно не учитывать.
 
 ## Общая форма ответа
 
@@ -151,6 +151,62 @@
 
 ---
 
+### `revenue` / `cost_of_goods_sold` / `gross_profit` / `gross_margin_percent`
+
+Разбивка по **товару** (`SaleItem` оплаченных продаж за период), формулы как в `analytics_owner_production.py` / `analytics_agent.py`:
+
+- выручка по строке: `quantity × unit_price − line_discount`;
+- COGS: `quantity × coalesce(purchase_price_snapshot, product.purchase_price)`.
+
+- **Owner/admin:** интервал продаж как у **`sales_amount`** (`_dt_range` vs агент).
+- **Агент:** только свои оплаченные продажи.
+
+**`items`:** по строке товара: `product_id`, `product_name`, `revenue`, `cost_of_goods_sold`, `gross_profit`, `gross_margin_percent` (все суммы — строки decimal).
+
+Фильтр строк по карточке: для **`revenue`** — только с выручкой &gt; 0; для **`cost_of_goods_sold`** — с COGS &gt; 0; для **`gross_profit`** — с выручкой или COGS &gt; 0; для **`gross_margin_percent`** — только с выручкой &gt; 0.
+
+**`totals`:** сводные `revenue`, `cost_of_goods_sold`, `gross_profit`, `gross_margin_percent` по **всему** периоду (как на дашборде).
+
+---
+
+### `total_debt`
+
+Сделки **`ClientDeal`** с `kind = debt` и **остатком** `(amount − prepayment) − оплачено по графику` **&gt; 0**.
+
+- **Owner/admin:** по компании и филиалу (как в сводке владельца).
+- **Агент:** только сделки клиентов, у которых **`client.salesperson`** = текущий пользователь (как часть дебиторки агента).
+
+**`items`:** `id`, `title`, `client`, `amount`, `prepayment`, `paid`, `remaining`.
+
+**`totals`:** `total_debt` — сумма `remaining` по всем строкам.
+
+---
+
+### `accounts_receivable`
+
+Объединённый список (сортировка по сумме по убыванию):
+
+1. **`kind: "client_deal"`** — те же остатки по рассрочке, что для **`total_debt`** (у агента — только «свои» клиенты).
+2. **`kind: "sale_debt"`** — продажи **`Sale`** со статусом **`DEBT`** (у владельца — по компании/филиалу; у агента — только `user = текущий пользователь`).
+
+**`totals`:** `accounts_receivable`, `accounts_receivable_client_deals`, `accounts_receivable_pos_sales`.
+
+---
+
+### `accounts_payable`
+
+Только **owner/admin**: по каждому контрагенту склада (**поставщик** / **оба** типа) считается сальдо как в `analytics_owner_production` (товарные документы + денежные документы); в список попадают только контрагенты, которым компания **должна** (payable &gt; 0).
+
+**Агент:** пустой ответ, `totals.accounts_payable = "0.00"`.
+
+Если модуль склада недоступен — также пустой список.
+
+**`items`:** `counterparty_id`, `name`, `accounts_payable`.
+
+**`totals`:** `accounts_payable` — сумма по строкам (без отдельной строки building-ledger из сводки; при необходимости уточняйте в коде сводки).
+
+---
+
 ### `discounts_total`
 
 Оплаченные продажи (`Sale`, статус `PAID`) с `discount_total > 0` за период (`created_at` от начала `date_from` до конца `date_to` дня).
@@ -180,7 +236,7 @@
 
 Актуальный перечень дублируется в ответе API при неверном `card`:
 
-`stock_purchase_value`, `stock_retail_value`, `raw_material_value`, `stock_value`, `defective_items`, `discounts_total`, `transfers_count`, `items_transferred`, `acceptances_count`, `sales_count`, `sales_amount`, `items_on_hand_qty`, `items_on_hand_amount`, `users_count`.
+`stock_purchase_value`, `stock_retail_value`, `raw_material_value`, `stock_value`, `defective_items`, `discounts_total`, `transfers_count`, `items_transferred`, `acceptances_count`, `sales_count`, `sales_amount`, `items_on_hand_qty`, `items_on_hand_amount`, `revenue`, `cost_of_goods_sold`, `gross_profit`, `gross_margin_percent`, `accounts_receivable`, `accounts_payable`, `total_debt`, `users_count`.
 
 ## Примеры
 
@@ -194,4 +250,8 @@ GET /api/main/analytics/cards/details/?card=sales_amount&period=month
 GET /api/main/analytics/cards/details/?card=items_on_hand_qty
 GET /api/main/analytics/cards/details/?card=discounts_total&period=custom&date_from=2026-04-01&date_to=2026-04-18
 GET /api/main/analytics/cards/details/?card=users_count&limit=200&offset=0
+GET /api/main/analytics/cards/details/?card=gross_profit&period=month
+GET /api/main/analytics/cards/details/?card=accounts_receivable&limit=50&offset=0
+GET /api/main/analytics/cards/details/?card=total_debt
+GET /api/main/analytics/cards/details/?card=accounts_payable
 ```

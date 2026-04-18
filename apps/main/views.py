@@ -2,7 +2,7 @@ from decimal import Decimal, ROUND_HALF_UP
 from uuid import UUID, uuid4
 
 from django.db import transaction, IntegrityError
-from django.db.models import Sum, Count, Avg, F, Q, Prefetch, Value as V, Exists, OuterRef
+from django.db.models import Sum, Count, Avg, F, Q, Prefetch, Value as V, Exists, OuterRef, Subquery
 from django.utils.dateparse import parse_date, parse_datetime
 from django.utils import timezone
 from itertools import groupby
@@ -39,6 +39,7 @@ from apps.main.models import (
     ProductFavorite,
     MarketSaleEmployeePayProfile,
     Sale,
+    SaleItem,
 )
 from apps.main.serializers import (
     ContactSerializer, PipelineSerializer, DealSerializer, TaskSerializer,
@@ -4242,6 +4243,13 @@ class AnalyticsCardDetailsAPIView(CompanyBranchRestrictedMixin, APIView):
       - sales_amount
       - items_on_hand_qty
       - items_on_hand_amount
+      - revenue
+      - cost_of_goods_sold
+      - gross_profit
+      - gross_margin_percent
+      - accounts_receivable
+      - accounts_payable
+      - total_debt
       - users_count
     """
     permission_classes = [permissions.IsAuthenticated]
@@ -4741,6 +4749,442 @@ class AnalyticsCardDetailsAPIView(CompanyBranchRestrictedMixin, APIView):
                 "items": items,
             })
 
+        # ----- выручка / COGS / валовая / маржа (как summary в analytics_owner_production / analytics_agent) -----
+        if card in (
+            "revenue",
+            "cost_of_goods_sold",
+            "gross_profit",
+            "gross_margin_percent",
+        ):
+            p = _parse_period(request)
+            date_from = p["date_from"]
+            date_to = p["date_to"]
+
+            if _is_owner_like(request.user):
+                dt_from, dt_to_excl = _dt_range(date_from, date_to)
+                sales_qs = Sale.objects.filter(
+                    company=company,
+                    status=Sale.Status.PAID,
+                    created_at__gte=dt_from,
+                    created_at__lt=dt_to_excl,
+                )
+            else:
+                dt_from = timezone.make_aware(datetime.combine(date_from, datetime.min.time()))
+                dt_to = timezone.make_aware(datetime.combine(date_to, datetime.max.time()))
+                sales_qs = Sale.objects.filter(
+                    company=company,
+                    user=request.user,
+                    status=Sale.Status.PAID,
+                    created_at__gte=dt_from,
+                    created_at__lte=dt_to,
+                )
+
+            if branch is not None:
+                sales_qs = sales_qs.filter(branch=branch)
+            else:
+                sales_qs = sales_qs.filter(branch__isnull=True)
+
+            money_field = DecimalField(max_digits=12, decimal_places=2)
+            zero_money = V(Decimal("0.00"), output_field=money_field)
+            revenue_expr = ExpressionWrapper(
+                (F("quantity") * F("unit_price")) - Coalesce(F("line_discount"), zero_money),
+                output_field=money_field,
+            )
+            _unit_purchase = Coalesce(
+                F("purchase_price_snapshot"),
+                F("product__purchase_price"),
+                V(Decimal("0"), output_field=money_field),
+            )
+
+            items_qs = SaleItem.objects.filter(sale__in=sales_qs).select_related("product")
+
+            full_agg = items_qs.aggregate(
+                revenue=Coalesce(Sum(revenue_expr, output_field=money_field), zero_money),
+                cost_of_goods_sold=Coalesce(
+                    Sum(F("quantity") * _unit_purchase, output_field=money_field),
+                    zero_money,
+                ),
+            )
+            rev_t = full_agg["revenue"] or Decimal("0.00")
+            cogs_t = full_agg["cost_of_goods_sold"] or Decimal("0.00")
+            gp_t = rev_t - cogs_t
+            margin_t = (
+                (gp_t / rev_t * Decimal("100")).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+                if rev_t > 0
+                else Decimal("0.00")
+            )
+
+            grouped_qs = (
+                items_qs.values("product_id", "product__name")
+                .annotate(
+                    revenue=Coalesce(Sum(revenue_expr, output_field=money_field), zero_money),
+                    cost_of_goods_sold=Coalesce(
+                        Sum(F("quantity") * _unit_purchase, output_field=money_field),
+                        zero_money,
+                    ),
+                )
+                .annotate(
+                    gross_profit=ExpressionWrapper(
+                        F("revenue") - F("cost_of_goods_sold"),
+                        output_field=money_field,
+                    ),
+                )
+            )
+
+            if card == "revenue":
+                grouped_qs = grouped_qs.filter(revenue__gt=0).order_by("-revenue", "product_id")
+            elif card == "cost_of_goods_sold":
+                grouped_qs = grouped_qs.filter(cost_of_goods_sold__gt=0).order_by("-cost_of_goods_sold", "product_id")
+            elif card == "gross_profit":
+                grouped_qs = grouped_qs.filter(
+                    Q(revenue__gt=0) | Q(cost_of_goods_sold__gt=0)
+                ).order_by("-gross_profit", "product_id")
+            else:
+                grouped_qs = grouped_qs.filter(revenue__gt=0).order_by("-gross_profit", "product_id")
+
+            total_count = grouped_qs.count()
+            page = list(grouped_qs[offset: offset + limit])
+
+            items = []
+            for r in page:
+                rev = r.get("revenue") or Decimal("0.00")
+                cogs = r.get("cost_of_goods_sold") or Decimal("0.00")
+                gp = r.get("gross_profit") if r.get("gross_profit") is not None else (rev - cogs)
+                if not isinstance(gp, Decimal):
+                    gp = Decimal(str(gp))
+                m_pct = (
+                    (gp / rev * Decimal("100")).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+                    if rev > 0
+                    else Decimal("0.00")
+                )
+                items.append({
+                    "product_id": str(r["product_id"]) if r.get("product_id") else None,
+                    "product_name": r.get("product__name") or "",
+                    "revenue": str(rev.quantize(_Q2, rounding=ROUND_HALF_UP)),
+                    "cost_of_goods_sold": str(cogs.quantize(_Q2, rounding=ROUND_HALF_UP)),
+                    "gross_profit": str(gp.quantize(_Q2, rounding=ROUND_HALF_UP)),
+                    "gross_margin_percent": str(m_pct),
+                })
+
+            return Response({
+                "card": card,
+                "branch_id": str(getattr(branch, "id", "")) if branch else None,
+                "period": {"type": p["period"], "date_from": date_from, "date_to": date_to},
+                "count": total_count,
+                "offset": offset,
+                "limit": limit,
+                "totals": {
+                    "revenue": str(rev_t.quantize(_Q2, rounding=ROUND_HALF_UP)),
+                    "cost_of_goods_sold": str(cogs_t.quantize(_Q2, rounding=ROUND_HALF_UP)),
+                    "gross_profit": str(gp_t.quantize(_Q2, rounding=ROUND_HALF_UP)),
+                    "gross_margin_percent": str(margin_t),
+                },
+                "items": items,
+            })
+
+        # ----- total_debt: остаток по ClientDeal(kind=debt) -----
+        if card == "total_debt":
+            money_field_td = DecimalField(max_digits=12, decimal_places=2)
+            zero_money_td = V(Decimal("0.00"), output_field=money_field_td)
+
+            if _is_owner_like(request.user):
+                deals_qs = ClientDeal.objects.filter(company=company, kind=ClientDeal.Kind.DEBT)
+                if branch is not None:
+                    deals_qs = deals_qs.filter(Q(branch=branch) | Q(branch__isnull=True))
+                else:
+                    deals_qs = deals_qs.filter(branch__isnull=True)
+            else:
+                clients_scope = Client.objects.filter(company=company, salesperson=request.user)
+                if branch is not None:
+                    clients_scope = clients_scope.filter(branch=branch)
+                else:
+                    clients_scope = clients_scope.filter(branch__isnull=True)
+                deals_qs = ClientDeal.objects.filter(
+                    company=company,
+                    kind=ClientDeal.Kind.DEBT,
+                    client__in=clients_scope,
+                )
+                if branch is not None:
+                    deals_qs = deals_qs.filter(branch=branch)
+                else:
+                    deals_qs = deals_qs.filter(branch__isnull=True)
+
+            paid_subq = (
+                DealInstallment.objects.filter(deal_id=OuterRef("pk"))
+                .values("deal_id")
+                .annotate(s=Sum("paid_amount"))
+                .values("s")[:1]
+            )
+            deals_ann = (
+                deals_qs.select_related("client")
+                .annotate(paid=Coalesce(Subquery(paid_subq), V(Decimal("0.00"), output_field=money_field_td)))
+                .annotate(remaining=(F("amount") - F("prepayment")) - F("paid"))
+                .filter(remaining__gt=0)
+                .order_by("-remaining", "-id")
+            )
+            total_count = deals_ann.count()
+            total_remaining = (
+                deals_ann.aggregate(t=Coalesce(Sum("remaining"), zero_money_td))["t"] or Decimal("0.00")
+            )
+            page = deals_ann[offset: offset + limit]
+
+            items = []
+            for d in page:
+                cl = d.client
+                items.append({
+                    "id": str(d.id),
+                    "title": d.title,
+                    "client": (
+                        {"id": str(cl.id), "name": getattr(cl, "full_name", None) or ""}
+                        if cl else None
+                    ),
+                    "amount": str((d.amount or Decimal("0.00")).quantize(_Q2, rounding=ROUND_HALF_UP)),
+                    "prepayment": str((d.prepayment or Decimal("0.00")).quantize(_Q2, rounding=ROUND_HALF_UP)),
+                    "paid": str((d.paid or Decimal("0.00")).quantize(_Q2, rounding=ROUND_HALF_UP)),
+                    "remaining": str((d.remaining or Decimal("0.00")).quantize(_Q2, rounding=ROUND_HALF_UP)),
+                })
+
+            return Response({
+                "card": card,
+                "branch_id": str(getattr(branch, "id", "")) if branch else None,
+                "count": total_count,
+                "offset": offset,
+                "limit": limit,
+                "totals": {"total_debt": str(total_remaining.quantize(_Q2, rounding=ROUND_HALF_UP))},
+                "items": items,
+            })
+
+        # ----- accounts_receivable: сделки DEBT + продажи в долг -----
+        if card == "accounts_receivable":
+            money_field_ar = DecimalField(max_digits=12, decimal_places=2)
+            zero_money_ar = V(Decimal("0.00"), output_field=money_field_ar)
+
+            if _is_owner_like(request.user):
+                deals_qs = ClientDeal.objects.filter(company=company, kind=ClientDeal.Kind.DEBT)
+                if branch is not None:
+                    deals_qs = deals_qs.filter(Q(branch=branch) | Q(branch__isnull=True))
+                else:
+                    deals_qs = deals_qs.filter(branch__isnull=True)
+                sales_debt_qs = Sale.objects.filter(company=company, status=Sale.Status.DEBT)
+                if branch is not None:
+                    sales_debt_qs = sales_debt_qs.filter(Q(branch=branch) | Q(branch__isnull=True))
+                else:
+                    sales_debt_qs = sales_debt_qs.filter(branch__isnull=True)
+            else:
+                clients_scope = Client.objects.filter(company=company, salesperson=request.user)
+                if branch is not None:
+                    clients_scope = clients_scope.filter(branch=branch)
+                else:
+                    clients_scope = clients_scope.filter(branch__isnull=True)
+                deals_qs = ClientDeal.objects.filter(
+                    company=company,
+                    kind=ClientDeal.Kind.DEBT,
+                    client__in=clients_scope,
+                )
+                if branch is not None:
+                    deals_qs = deals_qs.filter(branch=branch)
+                else:
+                    deals_qs = deals_qs.filter(branch__isnull=True)
+                sales_debt_qs = Sale.objects.filter(
+                    company=company,
+                    user=request.user,
+                    status=Sale.Status.DEBT,
+                )
+                if branch is not None:
+                    sales_debt_qs = sales_debt_qs.filter(branch=branch)
+                else:
+                    sales_debt_qs = sales_debt_qs.filter(branch__isnull=True)
+
+            paid_subq_ar = (
+                DealInstallment.objects.filter(deal_id=OuterRef("pk"))
+                .values("deal_id")
+                .annotate(s=Sum("paid_amount"))
+                .values("s")[:1]
+            )
+            deal_rows = list(
+                deals_qs.select_related("client")
+                .annotate(paid=Coalesce(Subquery(paid_subq_ar), V(Decimal("0.00"), output_field=money_field_ar)))
+                .annotate(remaining=(F("amount") - F("prepayment")) - F("paid"))
+                .filter(remaining__gt=0)
+                .values("id", "title", "remaining", "client_id", "client__full_name")
+            )
+            sale_rows = list(
+                sales_debt_qs.select_related("client", "user")
+                .order_by("-total", "-id")
+                .values("id", "total", "created_at", "client_id", "client__full_name", "user_id")
+            )
+
+            merged = []
+            for r in deal_rows:
+                rem = r.get("remaining") or Decimal("0.00")
+                merged.append({
+                    "_sort": rem,
+                    "kind": "client_deal",
+                    "id": str(r["id"]),
+                    "title": r.get("title") or "",
+                    "amount": str(rem.quantize(_Q2, rounding=ROUND_HALF_UP)),
+                    "client": {
+                        "id": str(r["client_id"]) if r.get("client_id") else None,
+                        "name": r.get("client__full_name") or "",
+                    },
+                })
+            for r in sale_rows:
+                tot = r.get("total") or Decimal("0.00")
+                merged.append({
+                    "_sort": tot,
+                    "kind": "sale_debt",
+                    "id": str(r["id"]),
+                    "total": str(tot.quantize(_Q2, rounding=ROUND_HALF_UP)),
+                    "created_at": timezone.localtime(r["created_at"]).isoformat() if r.get("created_at") else None,
+                    "client": {
+                        "id": str(r["client_id"]) if r.get("client_id") else None,
+                        "name": r.get("client__full_name") or "Без имени",
+                    },
+                    "user_id": str(r["user_id"]) if r.get("user_id") else None,
+                })
+            merged.sort(key=lambda x: x["_sort"], reverse=True)
+            for x in merged:
+                x.pop("_sort", None)
+
+            client_deals_total = sum(
+                (Decimal(str(r["remaining"])) if r.get("remaining") is not None else Decimal("0"))
+                for r in deal_rows
+            )
+            pos_total = sum(
+                (Decimal(str(r["total"])) if r.get("total") is not None else Decimal("0"))
+                for r in sale_rows
+            )
+            ar_total = (client_deals_total + pos_total).quantize(_Q2, rounding=ROUND_HALF_UP)
+
+            total_count = len(merged)
+            page = merged[offset: offset + limit]
+
+            return Response({
+                "card": card,
+                "branch_id": str(getattr(branch, "id", "")) if branch else None,
+                "count": total_count,
+                "offset": offset,
+                "limit": limit,
+                "totals": {
+                    "accounts_receivable": str(ar_total),
+                    "accounts_receivable_client_deals": str(client_deals_total.quantize(_Q2, rounding=ROUND_HALF_UP)),
+                    "accounts_receivable_pos_sales": str(pos_total.quantize(_Q2, rounding=ROUND_HALF_UP)),
+                },
+                "items": page,
+            })
+
+        # ----- accounts_payable (owner): по контрагентам-поставщикам склада -----
+        if card == "accounts_payable":
+            if not _is_owner_like(request.user):
+                return Response({
+                    "card": card,
+                    "branch_id": str(getattr(branch, "id", "")) if branch else None,
+                    "count": 0,
+                    "offset": offset,
+                    "limit": limit,
+                    "totals": {"accounts_payable": "0.00"},
+                    "items": [],
+                })
+            try:
+                from apps.warehouse.models import Document as WDoc, MoneyDocument as WMoney, Counterparty as WCP
+            except Exception:
+                return Response({
+                    "card": card,
+                    "branch_id": str(getattr(branch, "id", "")) if branch else None,
+                    "count": 0,
+                    "offset": offset,
+                    "limit": limit,
+                    "totals": {"accounts_payable": "0.00"},
+                    "items": [],
+                })
+
+            cp_qs = WCP.objects.filter(company=company).filter(
+                Q(type=WCP.Type.SUPPLIER) | Q(type=WCP.Type.BOTH)
+            )
+            if branch is not None:
+                cp_qs = cp_qs.filter(branch=branch)
+            else:
+                cp_qs = cp_qs.filter(branch__isnull=True)
+
+            trade_doc_types = (
+                WDoc.DocType.SALE,
+                WDoc.DocType.PURCHASE,
+                WDoc.DocType.SALE_RETURN,
+                WDoc.DocType.PURCHASE_RETURN,
+            )
+            doc_debit_types = (WDoc.DocType.SALE, WDoc.DocType.PURCHASE_RETURN)
+            doc_credit_types = (WDoc.DocType.PURCHASE, WDoc.DocType.SALE_RETURN)
+
+            money_field_ap = DecimalField(max_digits=12, decimal_places=2)
+            zero_money_ap = V(Decimal("0.00"), output_field=money_field_ap)
+
+            rows_out = []
+            ap_sum = Decimal("0.00")
+            for cp in cp_qs.order_by("name", "id"):
+                docs_qs = WDoc.objects.filter(
+                    status=WDoc.Status.POSTED,
+                    doc_type__in=trade_doc_types,
+                    counterparty=cp,
+                    warehouse_from__company=company,
+                )
+                if branch is not None:
+                    docs_qs = docs_qs.filter(warehouse_from__branch=branch)
+                else:
+                    docs_qs = docs_qs.filter(warehouse_from__branch__isnull=True)
+
+                docs_agg = docs_qs.aggregate(
+                    doc_debit=Coalesce(Sum("total", filter=Q(doc_type__in=doc_debit_types)), zero_money_ap),
+                    doc_credit=Coalesce(Sum("total", filter=Q(doc_type__in=doc_credit_types)), zero_money_ap),
+                )
+                doc_debit = docs_agg["doc_debit"] or Decimal("0.00")
+                doc_credit = docs_agg["doc_credit"] or Decimal("0.00")
+
+                money_qs = WMoney.objects.filter(
+                    company=company,
+                    status=WMoney.Status.POSTED,
+                    counterparty=cp,
+                    doc_type__in=(
+                        WMoney.DocType.MONEY_RECEIPT,
+                        WMoney.DocType.MONEY_EXPENSE,
+                    ),
+                )
+                if branch is not None:
+                    money_qs = money_qs.filter(branch=branch)
+                else:
+                    money_qs = money_qs.filter(branch__isnull=True)
+
+                money_agg = money_qs.aggregate(
+                    m_rec=Coalesce(Sum("amount", filter=Q(doc_type=WMoney.DocType.MONEY_RECEIPT)), zero_money_ap),
+                    m_paid=Coalesce(Sum("amount", filter=Q(doc_type=WMoney.DocType.MONEY_EXPENSE)), zero_money_ap),
+                )
+                m_rec = money_agg["m_rec"] or Decimal("0.00")
+                m_paid = money_agg["m_paid"] or Decimal("0.00")
+
+                balance = (doc_debit + m_paid) - (doc_credit + m_rec)
+                if balance >= 0:
+                    continue
+                payable = (-balance).quantize(_Q2, rounding=ROUND_HALF_UP)
+                ap_sum += payable
+                rows_out.append({
+                    "counterparty_id": str(cp.id),
+                    "name": cp.name,
+                    "accounts_payable": str(payable),
+                })
+
+            rows_out.sort(key=lambda x: Decimal(x["accounts_payable"]), reverse=True)
+            total_count = len(rows_out)
+            page = rows_out[offset: offset + limit]
+
+            return Response({
+                "card": card,
+                "branch_id": str(getattr(branch, "id", "")) if branch else None,
+                "count": total_count,
+                "offset": offset,
+                "limit": limit,
+                "totals": {"accounts_payable": str(ap_sum.quantize(_Q2, rounding=ROUND_HALF_UP))},
+                "items": page,
+            })
+
         if card == "users_count":
             qs = User.objects.filter(company=company).order_by("last_name", "first_name", "email", "id")
             total_count = qs.count()
@@ -4787,6 +5231,13 @@ class AnalyticsCardDetailsAPIView(CompanyBranchRestrictedMixin, APIView):
                 "sales_amount",
                 "items_on_hand_qty",
                 "items_on_hand_amount",
+                "revenue",
+                "cost_of_goods_sold",
+                "gross_profit",
+                "gross_margin_percent",
+                "accounts_receivable",
+                "accounts_payable",
+                "total_debt",
                 "users_count",
             ],
         })
