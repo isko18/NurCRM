@@ -4236,6 +4236,7 @@ class AnalyticsCardDetailsAPIView(CompanyBranchRestrictedMixin, APIView):
       - defective_items
       - discounts_total
       - transfers_count
+      - users_count
     """
     permission_classes = [permissions.IsAuthenticated]
 
@@ -4544,6 +4545,36 @@ class AnalyticsCardDetailsAPIView(CompanyBranchRestrictedMixin, APIView):
                 "items": items,
             })
 
+        if card == "users_count":
+            qs = User.objects.filter(company=company).order_by("last_name", "first_name", "email", "id")
+            total_count = qs.count()
+            page = list(
+                qs[offset: offset + limit].values(
+                    "id", "email", "first_name", "last_name", "phone_number", "role", "is_active"
+                )
+            )
+            items = [
+                {
+                    "id": str(u["id"]),
+                    "email": u.get("email") or "",
+                    "first_name": u.get("first_name") or "",
+                    "last_name": u.get("last_name") or "",
+                    "phone_number": u.get("phone_number"),
+                    "role": u.get("role"),
+                    "is_active": bool(u.get("is_active")),
+                }
+                for u in page
+            ]
+            return Response({
+                "card": card,
+                "branch_id": str(getattr(branch, "id", "")) if branch else None,
+                "count": total_count,
+                "offset": offset,
+                "limit": limit,
+                "totals": {},
+                "items": items,
+            })
+
         raise ValidationError({
             "card": f"Unsupported card: {card}",
             "supported": [
@@ -4554,5 +4585,6 @@ class AnalyticsCardDetailsAPIView(CompanyBranchRestrictedMixin, APIView):
                 "defective_items",
                 "discounts_total",
                 "transfers_count",
+                "users_count",
             ],
         })
