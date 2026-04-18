@@ -539,6 +539,8 @@ class AnalyticsView(APIView):
             data = self._shifts(request, company, branch, period)
         elif tab == "products":
             data = self._products_analytics(request, company, branch, period)
+        elif tab == "suppliers":
+            data = self._suppliers_analytics(request, company, branch, period)
         elif tab == "users":
             data = self._users_analytics(request, company, branch, period)
         elif tab == "finance":
@@ -547,7 +549,7 @@ class AnalyticsView(APIView):
             data = self._salary(request, company, branch, period)
         else:
             return Response(
-                {"detail": "Unknown tab. Use: sales|stock|cashboxes|shifts|products|users|finance|salary"},
+                {"detail": "Unknown tab. Use: sales|stock|cashboxes|shifts|products|suppliers|users|finance|salary"},
                 status=400,
             )
 
@@ -1702,6 +1704,254 @@ class AnalyticsView(APIView):
                 "categories": categories_performance,
                 "brands": brands_performance,
                 "low_stock_products": low_stock_products,  # НОВОЕ: полный список с деталями
+            },
+        }
+
+    # ─────────────────────────────────────────────────────────
+    # SUPPLIERS (Client type=suppliers → Product.client)
+    # ─────────────────────────────────────────────────────────
+    def _suppliers_analytics(self, request, company, branch, period: Period):
+        """
+        Остатки по каталогу (sku с поставщиком), продажи за период, место и условный рейтинг по объёму продаж.
+        Отзывы Review не привязаны к товару — rating считается от ранга по period_qty_sold (1..5).
+        """
+        limit_param = request.query_params.get("limit")
+        limit = int(limit_param) if limit_param and limit_param.isdigit() else None
+
+        def _dec_qty(v) -> Decimal:
+            if isinstance(v, Decimal):
+                return v
+            return Decimal(str(v or 0))
+
+        try:
+            Client = apps.get_model("main.Client")
+            Product = apps.get_model("main.Product")
+        except Exception:
+            return {
+                "tab": "suppliers",
+                "period": {"from": period.start.isoformat(), "to": period.end.isoformat()},
+                "filters": {
+                    "branch": str(getattr(branch, "id", "")) if branch else None,
+                    "limit": limit,
+                },
+                "cards": {},
+                "tables": {"suppliers": [], "suppliers_by_stock": []},
+            }
+
+        if not _model_has_field(Product, "client"):
+            return {
+                "tab": "suppliers",
+                "period": {"from": period.start.isoformat(), "to": period.end.isoformat()},
+                "filters": {
+                    "branch": str(getattr(branch, "id", "")) if branch else None,
+                    "limit": limit,
+                },
+                "cards": {"suppliers_count": 0},
+                "tables": {"suppliers": [], "suppliers_by_stock": []},
+            }
+
+        sup_type = Client.StatusClient.SUPPLIERS
+        pqs = self._market_products_queryset(request, company, branch)
+        if pqs is None:
+            return {
+                "tab": "suppliers",
+                "period": {"from": period.start.isoformat(), "to": period.end.isoformat()},
+                "filters": {
+                    "branch": str(getattr(branch, "id", "")) if branch else None,
+                    "limit": limit,
+                },
+                "cards": {"suppliers_count": 0},
+                "tables": {"suppliers": [], "suppliers_by_stock": []},
+            }
+
+        p_sup = pqs.filter(
+            client_id__isnull=False,
+            client__type=sup_type,
+        )
+        if branch is not None and _model_has_field(Client, "branch"):
+            p_sup = p_sup.filter(Q(client__branch=branch) | Q(client__branch__isnull=True))
+
+        qty_field = "quantity" if _model_has_field(Product, "quantity") else None
+        pp_field = "purchase_price" if _model_has_field(Product, "purchase_price") else None
+
+        ann: dict = {"products_count": Count("id")}
+        if qty_field:
+            ann["stock_qty"] = Coalesce(
+                Sum(qty_field),
+                Value(Z_QTY, output_field=QTY_FIELD),
+                output_field=QTY_FIELD,
+            )
+        else:
+            ann["stock_qty"] = Value(Z_QTY, output_field=QTY_FIELD)
+        if qty_field and pp_field:
+            inv_expr = ExpressionWrapper(F(qty_field) * F(pp_field), output_field=MONEY_FIELD)
+            ann["stock_value"] = Coalesce(
+                Sum(inv_expr),
+                Value(Z_MONEY, output_field=MONEY_FIELD),
+                output_field=MONEY_FIELD,
+            )
+        else:
+            ann["stock_value"] = Value(Z_MONEY, output_field=MONEY_FIELD)
+
+        stock_qs = (
+            p_sup.values("client_id", "client__full_name", "client__llc", "client__phone")
+            .annotate(**ann)
+        )
+
+        by_id: dict[str, dict] = {}
+        total_stock_val = Z_MONEY
+        for r in stock_qs:
+            cid = r.get("client_id")
+            if not cid:
+                continue
+            k = str(cid)
+            sq_raw = r.get("stock_qty") or 0
+            sq_dec = _dec_qty(sq_raw)
+            sv = r.get("stock_value") or Z_MONEY
+            total_stock_val += _money(sv)
+            by_id[k] = {
+                "supplier_id": k,
+                "name": (
+                    (r.get("client__llc") or "").strip()
+                    or (r.get("client__full_name") or "").strip()
+                    or "—"
+                ),
+                "phone": (r.get("client__phone") or "") or "",
+                "products_count": int(r.get("products_count") or 0),
+                "_stock_dec": sq_dec,
+                "_sold_dec": Z_QTY,
+                "_rev_dec": Z_MONEY,
+                "stock_value": str(_money(sv)),
+                "period_transactions": 0,
+            }
+
+        Sale, SaleItem = get_sale_models()
+        if Sale and SaleItem and _model_has_field(SaleItem, "sale") and _model_has_field(SaleItem, "quantity"):
+            paid_value = _choice_value(Sale, "Status", "PAID", "paid")
+            dt_field = "paid_at" if _model_has_field(Sale, "paid_at") else "created_at"
+            sqs = Sale.objects.filter(company=company, status=paid_value)
+            if branch and _model_has_field(Sale, "branch"):
+                if self._include_global(request):
+                    sqs = sqs.filter(Q(branch=branch) | Q(branch__isnull=True))
+                else:
+                    sqs = sqs.filter(branch=branch)
+            sqs = self._apply_sale_filters(request, sqs, Sale)
+            sqs = sqs.filter(**{f"{dt_field}__gte": period.start, f"{dt_field}__lt": period.end})
+
+            si = SaleItem.objects.filter(sale__in=sqs, product_id__in=p_sup.values("id"))
+            if _model_has_field(SaleItem, "product"):
+                agg_kw: dict = {
+                    "qty_sold": Coalesce(
+                        Sum("quantity"),
+                        Value(Z_QTY, output_field=QTY_FIELD),
+                        output_field=QTY_FIELD,
+                    ),
+                    "tx_count": Count("sale_id", distinct=True),
+                }
+                if _model_has_field(SaleItem, "unit_price"):
+                    revenue_expr = ExpressionWrapper(
+                        F("quantity") * F("unit_price"),
+                        output_field=MONEY_FIELD,
+                    )
+                    agg_kw["revenue"] = Coalesce(
+                        Sum(revenue_expr),
+                        Value(Z_MONEY, output_field=MONEY_FIELD),
+                        output_field=MONEY_FIELD,
+                    )
+                sales_rows = si.values("product__client_id").annotate(**agg_kw)
+                for r in sales_rows:
+                    cid = r.get("product__client_id")
+                    if not cid:
+                        continue
+                    k = str(cid)
+                    if k not in by_id:
+                        cl = (
+                            Client.objects.filter(pk=cid, company=company, type=sup_type)
+                            .only("full_name", "llc", "phone")
+                            .first()
+                        )
+                        nm = "—"
+                        ph = ""
+                        if cl:
+                            nm = (getattr(cl, "llc", None) or "").strip() or (getattr(cl, "full_name", None) or "").strip() or "—"
+                            ph = getattr(cl, "phone", None) or ""
+                        by_id[k] = {
+                            "supplier_id": k,
+                            "name": nm,
+                            "phone": ph,
+                            "products_count": 0,
+                            "_stock_dec": Z_QTY,
+                            "_sold_dec": Z_QTY,
+                            "_rev_dec": Z_MONEY,
+                            "stock_value": str(Z_MONEY),
+                            "period_transactions": 0,
+                        }
+                    row = by_id[k]
+                    row["_sold_dec"] = _dec_qty(r.get("qty_sold"))
+                    row["period_transactions"] = int(r.get("tx_count") or 0)
+                    if "revenue" in r:
+                        row["_rev_dec"] = _money(r.get("revenue") or Z_MONEY)
+                    else:
+                        row["_rev_dec"] = Z_MONEY
+
+        items = list(by_id.values())
+        tot_period_qty = Z_QTY
+        tot_period_rev = Z_MONEY
+        for it in items:
+            tot_period_qty += it["_sold_dec"]
+            tot_period_rev += it["_rev_dec"]
+
+        n_sup = len(items)
+        items.sort(key=lambda x: (-x["_sold_dec"], -x["_stock_dec"]))
+        for i, it in enumerate(items):
+            it["rank_by_qty"] = i + 1
+            if n_sup <= 1:
+                it["rating"] = 5.0
+            else:
+                it["rating"] = round(float(Decimal("5") - Decimal("4") * Decimal(i) / Decimal(n_sup - 1)), 1)
+            it["period_qty_sold"] = _qty_str(it["_sold_dec"])
+            it["period_revenue"] = str(_money(it["_rev_dec"]))
+            it["stock_qty"] = _qty_str(it["_stock_dec"])
+            del it["_sold_dec"]
+            del it["_stock_dec"]
+            del it["_rev_dec"]
+
+        by_stock = sorted(items, key=lambda x: -Decimal(str(x["stock_qty"])))
+        for j, it in enumerate(by_stock, start=1):
+            it["rank_by_stock"] = j
+
+        suppliers_by_stock = [
+            {
+                "supplier_id": it["supplier_id"],
+                "name": it["name"],
+                "rank_by_stock": it["rank_by_stock"],
+                "stock_qty": it["stock_qty"],
+                "stock_value": it["stock_value"],
+                "products_count": it["products_count"],
+            }
+            for it in by_stock
+        ]
+
+        if limit:
+            items = items[:limit]
+            suppliers_by_stock = suppliers_by_stock[:limit]
+
+        return {
+            "tab": "suppliers",
+            "period": {"from": period.start.isoformat(), "to": period.end.isoformat()},
+            "filters": {
+                "branch": str(getattr(branch, "id", "")) if branch else None,
+                "limit": limit,
+            },
+            "cards": {
+                "suppliers_count": n_sup,
+                "total_stock_value": str(_money(total_stock_val)),
+                "total_period_qty_sold": _qty_str(tot_period_qty),
+                "total_period_revenue": str(_money(tot_period_rev)),
+            },
+            "tables": {
+                "suppliers": items,
+                "suppliers_by_stock": suppliers_by_stock,
             },
         }
 

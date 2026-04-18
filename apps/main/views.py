@@ -63,7 +63,7 @@ from apps.main.serializers import (
 from django.db.models import ProtectedError
 from apps.utils import product_images_prefetch, _is_owner_like
 from apps.main.analytics_agent import build_agent_analytics_payload, _parse_period
-from apps.main.analytics_owner_production import build_owner_analytics_payload
+from apps.main.analytics_owner_production import build_owner_analytics_payload, _dt_range
 from apps.main.services import _parse_bool_like, _parse_date_to_aware_datetime, _parse_kind, _parse_int_nonneg, _parse_decimal
     
 
@@ -624,6 +624,40 @@ class ProductListView(CompanyBranchRestrictedMixin, generics.ListAPIView):
 
     def filter_queryset(self, queryset):
         qs = super().filter_queryset(queryset)
+
+        qp = self.request.query_params
+        suppliers_csv = (qp.get("suppliers") or "").strip()
+        supplier_one = (qp.get("supplier") or "").strip()
+        supplier_ids = (
+            [x.strip() for x in suppliers_csv.split(",") if x.strip()]
+            if suppliers_csv
+            else ([supplier_one] if supplier_one else [])
+        )
+        if supplier_ids:
+            parsed_ids = []
+            for s in supplier_ids:
+                try:
+                    parsed_ids.append(UUID(str(s)))
+                except (ValueError, TypeError, AttributeError):
+                    continue
+            if not parsed_ids:
+                qs = qs.none()
+            else:
+                company = self._company()
+                if company is None:
+                    qs = qs.none()
+                else:
+                    supplier_qs = Client.objects.filter(
+                        company=company,
+                        type=Client.StatusClient.SUPPLIERS,
+                        id__in=parsed_ids,
+                    )
+                    branch = self._auto_branch()
+                    if branch is not None:
+                        supplier_qs = supplier_qs.filter(branch__in=[None, branch])
+                    allowed = list(supplier_qs.values_list("id", flat=True))
+                    qs = qs.filter(client_id__in=allowed) if allowed else qs.none()
+
         # Всегда: избранные сверху. Дальше — стандартная сортировка (ordering filter / default ordering).
         current = list(qs.query.order_by) or []
         # если уже есть сортировка по is_favorite — не дублируем
@@ -3161,7 +3195,7 @@ class ManufactureSubrealBulkCreateAPIView(APIView, CompanyBranchRestrictedMixin)
 
         created_objs = []
 
-        for item in items:
+        for idx, item in enumerate(items):
             product = item["product"]
             qty = int(item["qty_transferred"])
             is_sawmill = bool(item.get("is_sawmill", False))
@@ -3196,13 +3230,14 @@ class ManufactureSubrealBulkCreateAPIView(APIView, CompanyBranchRestrictedMixin)
             except Exception:
                 _send_webhook()
 
+            # Уникальный external_ref на строку: в БД uniq (company, external_ref) при non-null ref.
             sub = ManufactureSubreal.objects.create(
                 company=company,
                 branch=branch,
                 user=user,
                 agent=agent,
                 product=product,
-                external_ref=transfer_ref,
+                external_ref=f"{transfer_ref}:{idx}",
                 qty_transferred=qty,
                 is_sawmill=is_sawmill,
             )
@@ -4191,6 +4226,7 @@ class AnalyticsCardDetailsAPIView(CompanyBranchRestrictedMixin, APIView):
       - raw_material_value
       - defective_items
       - discounts_total
+      - transfers_count
     """
     permission_classes = [permissions.IsAuthenticated]
 
@@ -4354,6 +4390,72 @@ class AnalyticsCardDetailsAPIView(CompanyBranchRestrictedMixin, APIView):
                 "items": items,
             })
 
+        # ----- transfers: ManufactureSubreal (как summary transfers_count в аналитике) -----
+        if card == "transfers_count":
+            p = _parse_period(request)
+            date_from = p["date_from"]
+            date_to = p["date_to"]
+
+            if _is_owner_like(request.user):
+                dt_from, dt_to_excl = _dt_range(date_from, date_to)
+                qs = ManufactureSubreal.objects.filter(
+                    company=company,
+                    created_at__gte=dt_from,
+                    created_at__lt=dt_to_excl,
+                )
+            else:
+                dt_from = timezone.make_aware(datetime.combine(date_from, datetime.min.time()))
+                dt_to = timezone.make_aware(datetime.combine(date_to, datetime.max.time()))
+                qs = ManufactureSubreal.objects.filter(
+                    company=company,
+                    agent=request.user,
+                    created_at__gte=dt_from,
+                    created_at__lte=dt_to,
+                )
+
+            if branch is not None:
+                qs = qs.filter(branch=branch)
+            else:
+                qs = qs.filter(branch__isnull=True)
+
+            qs = qs.select_related("agent", "product", "user").order_by("-created_at", "-id")
+            total_count = qs.count()
+            items_transferred_total = int(
+                (qs.aggregate(s=Coalesce(Sum("qty_transferred"), V(0)))["s"]) or 0
+            )
+            page = qs[offset: offset + limit]
+
+            items = []
+            for tr in page:
+                agent_u = tr.agent
+                agent_name = (
+                    f"{(getattr(agent_u, 'first_name', None) or '').strip()} {(getattr(agent_u, 'last_name', None) or '').strip()}".strip()
+                    or getattr(agent_u, "username", None)
+                    or "Пользователь"
+                )
+                prod = tr.product
+                items.append({
+                    "id": str(tr.id),
+                    "created_at": timezone.localtime(tr.created_at).isoformat() if tr.created_at else None,
+                    "status": tr.status,
+                    "qty_transferred": int(tr.qty_transferred or 0),
+                    "qty_accepted": int(tr.qty_accepted or 0),
+                    "qty_returned": int(tr.qty_returned or 0),
+                    "agent": {"id": str(tr.agent_id), "name": agent_name},
+                    "product": {"id": str(tr.product_id), "name": getattr(prod, "name", None) or ""},
+                })
+
+            return Response({
+                "card": card,
+                "branch_id": str(getattr(branch, "id", "")) if branch else None,
+                "period": {"type": p["period"], "date_from": date_from, "date_to": date_to},
+                "count": total_count,
+                "offset": offset,
+                "limit": limit,
+                "totals": {"items_transferred": items_transferred_total},
+                "items": items,
+            })
+
         # ----- discounts total: by employee and client -----
         if card == "discounts_total":
             # период берём из тех же query params, что и в аналитике
@@ -4438,5 +4540,6 @@ class AnalyticsCardDetailsAPIView(CompanyBranchRestrictedMixin, APIView):
                 "stock_value",
                 "defective_items",
                 "discounts_total",
+                "transfers_count",
             ],
         })
