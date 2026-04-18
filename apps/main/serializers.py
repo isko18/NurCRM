@@ -1376,6 +1376,7 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
             "expiration_date",
             "client",
             "kind",
+            "hotkey_group",
         )
         for field in updatable_fields:
             if field in validated_data:
