@@ -150,6 +150,13 @@ def try_fiscalize_pos_sale(sale_id) -> None:
         except (TypeError, ValueError):
             fd_int = None
 
+    # Ключевые реквизиты для печати (см. PDF «Интеграция_1.14», раздел «Отправка чека»):
+    # 1037 — РН ККМ, 1041 — ФМ, 1040 — ФД, 1077 — ФПД; link — ссылка для проверки (QR)
+    kkm_reg_number = fields.get("1037")
+    fm_number = fields.get("1041")
+    fpd = fields.get("1077")
+    link = data.get("link")
+
     _merge_ekassa_meta(
         sale_id,
         {
@@ -158,6 +165,10 @@ def try_fiscalize_pos_sale(sale_id) -> None:
             "fd_number": fd_int,
             "ekassa_receipt_id": data.get("id"),
             "fields": fields,
+            "kkm_reg_number": kkm_reg_number,
+            "fm_number": fm_number,
+            "fpd": fpd,
+            "link": link,
             "message": resp.get("message"),
         },
     )

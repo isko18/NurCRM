@@ -267,10 +267,25 @@ def _build_physical_receipt_text(sale, *, payment_method=None, cash_received=Non
         status = meta.get("status")
         if status is not None:
             lines.append(f"status: {status}")
-        if meta.get("fd_number") is not None:
-            lines.append(f"fd_number: {meta.get('fd_number')}")
+        # Явные реквизиты (как в «Дубликат»)
+        kkm_reg = meta.get("kkm_reg_number")
+        fm_number = meta.get("fm_number")
+        fd_number = meta.get("fd_number") if meta.get("fd_number") is not None else meta.get("fields", {}).get("1040")
+        fpd = meta.get("fpd")
+        if kkm_reg:
+            lines.append(f"РН ККМ\t{kkm_reg}")
+        if fm_number:
+            lines.append(f"ФМ\t{fm_number}")
+        if fd_number is not None:
+            lines.append(f"ФД\t{fd_number}")
+        if fpd:
+            lines.append(f"ФПД\t{fpd}")
         if meta.get("ekassa_receipt_id") is not None:
             lines.append(f"receipt_id: {meta.get('ekassa_receipt_id')}")
+        # Данные для QR (ссылка из ответа eKassa)
+        link = meta.get("link")
+        if link:
+            lines.append(f"QR\t{link}")
         fields = meta.get("fields")
         if isinstance(fields, dict) and fields:
             lines.append("fields:")
