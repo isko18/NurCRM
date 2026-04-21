@@ -59,6 +59,10 @@ class SaleReceiptAPIView(APIView):
         company = sale.company
         client = sale.client
 
+        from apps.main.receipt_header import receipt_vendor_header
+
+        vh = receipt_vendor_header(sale)
+
         items = []
         for it in sale.items.all():
             qty = q_qty(getattr(it, "quantity", 0))
@@ -90,9 +94,9 @@ class SaleReceiptAPIView(APIView):
             },
             "company": {
                 "id": str(company.id),
-                "name": safe_str(getattr(company, "llc", None) or getattr(company, "name", None), dash=""),
-                "inn": safe_str(getattr(company, "inn", None)),
-                "address": safe_str(getattr(company, "address", None)),
+                "name": safe_str(vh.get("brand"), dash=""),
+                "inn": safe_str(vh.get("inn")),
+                "address": safe_str(vh.get("address")),
                 "phone": safe_str(getattr(company, "phone", None)),
             },
             "cashier": {

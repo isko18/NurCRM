@@ -63,7 +63,10 @@ def build_receipt_payload(sale, cashier_name=None, *, ensure_number: bool = True
 
     # 3) шапка/итоги
     created_at = getattr(sale, "created_at", None)
-    company_name = getattr(getattr(sale, "company", None), "name", "") or ""
+    from apps.main.receipt_header import receipt_vendor_header
+
+    vh = receipt_vendor_header(sale)
+    company_name = vh.get("brand") or ""
 
     payload = {
         # метка кодировки для фронта (браузерный клиент сможет выбрать UTF-8)
@@ -71,6 +74,8 @@ def build_receipt_payload(sale, cashier_name=None, *, ensure_number: bool = True
 
         "doc_no": doc_no,
         "company": company_name,
+        "inn": vh.get("inn") or None,
+        "address": vh.get("address") or None,
         "created_at": localtime(created_at).strftime("%Y-%m-%d %H:%M:%S") if created_at else None,
         "cashier_name": cashier_name,
 

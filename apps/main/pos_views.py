@@ -166,14 +166,13 @@ def _is_market_company(company: Company) -> bool:
 
 
 def _build_physical_receipt_text(sale, *, payment_method=None, cash_received=None, change=None, include_shift=True) -> str:
+    from apps.main.receipt_header import receipt_vendor_header
+
     ensure_sale_doc_number(sale)
 
     created_at = timezone.localtime(sale.created_at) if getattr(sale, "created_at", None) else timezone.localtime()
-    company_name = (
-        getattr(getattr(sale, "company", None), "llc", None)
-        or getattr(getattr(sale, "company", None), "name", None)
-        or "Компания"
-    )
+    vh = receipt_vendor_header(sale)
+    company_name = vh.get("brand") or "Компания"
     cashier_name = ""
     if getattr(sale, "user", None):
         cashier_name = (
@@ -198,11 +197,17 @@ def _build_physical_receipt_text(sale, *, payment_method=None, cash_received=Non
     if change_value in (None, ""):
         change_value = change if change is not None else Decimal("0.00")
 
-    lines = [
-        company_name,
-        f"Чек № {getattr(sale, 'doc_no', None) or sale.id}",
-        created_at.strftime("%d.%m.%Y %H:%M"),
-    ]
+    lines = [company_name]
+    if vh.get("inn"):
+        lines.append(f"ИНН {vh['inn']}")
+    if vh.get("address"):
+        lines.append(vh["address"])
+    lines.extend(
+        [
+            f"Чек № {getattr(sale, 'doc_no', None) or sale.id}",
+            created_at.strftime("%d.%m.%Y %H:%M"),
+        ]
+    )
     if cashier_name:
         lines.append(f"Кассир: {cashier_name}")
     if include_shift and getattr(sale, "shift_id", None):
