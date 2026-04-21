@@ -679,7 +679,7 @@ class OrderItemInlineSerializer(CompanyBranchReadOnlyMixin):
         model = OrderItem
         fields = [
             "id", "order", "line_kind", "menu_item", "menu_item_title", "menu_item_price",
-            "service_title", "unit_price", "quantity",
+            "service_title", "unit_price", "quantity", "comment",
             "refunded_quantity", "refundable_quantity",
             "is_rejected", "rejection_reason", "rejected_at",
         ]
@@ -862,7 +862,6 @@ class OrderSerializer(CompanyBranchReadOnlyMixin):
         fields = [
             "id", "company", "branch", "table", "client", "waiter", "guests", "created_at",
             "table_session_id", "check_label",
-            "comment",
             "status", "is_paid", "paid_at", "payment_method", "total_amount", "discount_amount",
             "paid_amount", "refunded_amount", "net_paid_amount", "has_refunds", "is_fully_refunded",
             "balance_due", "cash_shift_id",
@@ -927,6 +926,7 @@ class OrderSerializer(CompanyBranchReadOnlyMixin):
             line_kind = it.get("line_kind") or OrderItem.LineKind.MENU
             is_rejected = bool(it.get("is_rejected", False))
             rejection_reason = (it.get("rejection_reason") or "").strip()
+            item_comment = (it.get("comment") or "").strip()
             rejected_at = timezone.now() if is_rejected else None
             if line_kind == OrderItem.LineKind.SERVICE:
                 OrderItem.objects.create(
@@ -936,6 +936,7 @@ class OrderSerializer(CompanyBranchReadOnlyMixin):
                     service_title=(it.get("service_title") or "").strip(),
                     unit_price=it.get("unit_price"),
                     quantity=it.get("quantity", 1),
+                    comment=item_comment,
                     is_rejected=is_rejected,
                     rejection_reason=rejection_reason,
                     rejected_at=rejected_at,
@@ -951,13 +952,20 @@ class OrderSerializer(CompanyBranchReadOnlyMixin):
             ).first()
             if existing:
                 existing.quantity += qty
+                # Склеиваем комментарии в одну строку: "без лука; остро"
+                if item_comment:
+                    cur = (existing.comment or "").strip()
+                    if not cur:
+                        existing.comment = item_comment
+                    elif item_comment not in [p.strip() for p in cur.split(";") if p.strip()]:
+                        existing.comment = f"{cur}; {item_comment}"
                 if is_rejected:
                     existing.is_rejected = True
                     existing.rejection_reason = rejection_reason
                     existing.rejected_at = existing.rejected_at or rejected_at
-                    existing.save(update_fields=["quantity", "is_rejected", "rejection_reason", "rejected_at"])
+                    existing.save(update_fields=["quantity", "comment", "is_rejected", "rejection_reason", "rejected_at"])
                 else:
-                    existing.save(update_fields=["quantity"])
+                    existing.save(update_fields=["quantity", "comment"])
             else:
                 OrderItem.objects.create(
                     order=order,
@@ -965,6 +973,7 @@ class OrderSerializer(CompanyBranchReadOnlyMixin):
                     quantity=qty,
                     company=order.company,
                     line_kind=OrderItem.LineKind.MENU,
+                    comment=item_comment,
                     is_rejected=is_rejected,
                     rejection_reason=rejection_reason,
                     rejected_at=rejected_at,

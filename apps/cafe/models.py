@@ -832,7 +832,6 @@ class Order(models.Model):
     )
     guests = models.PositiveIntegerField('Количество гостей', default=1, validators=[MinValueValidator(1)])
     created_at = models.DateTimeField('Создано', auto_now_add=True)
-    comment = models.TextField("Комментарий", blank=True, default="")
     status = models.CharField(
         "Статус", max_length=16, choices=Status.choices, default=Status.OPEN, db_index=True
     )
@@ -989,6 +988,7 @@ class OrderItem(models.Model):
         "Цена за ед.", max_digits=12, decimal_places=2, null=True, blank=True,
     )
     quantity = models.PositiveIntegerField('Кол-во', default=1, validators=[MinValueValidator(1)])
+    comment = models.CharField("Комментарий", max_length=500, blank=True, default="")
 
     is_rejected = models.BooleanField("Отказ гостя", default=False, db_index=True)
     rejection_reason = models.CharField("Причина отказа", max_length=500, blank=True, default="")
