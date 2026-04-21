@@ -2400,9 +2400,8 @@ class ReturnCreateSerializer(serializers.ModelSerializer):
         if user_company_id and sub.company_id != user_company_id:
             raise serializers.ValidationError({"subreal": "Передача из другой компании."})
 
-        # ВАЖНО: "на руках" считается по партиям (subreal) + продажи.
-        # Если фронт/пользователь выбрал subreal с нулём, попробуем автоматически подобрать
-        # другую партию агента по этому же товару, где есть остаток.
+        # ВАЖНО: "на руках" считаем по ВСЕМ партиям (subreal) этого товара + продажи.
+        # Возврат может быть больше остатка по одной партии — тогда разбиваем по нескольким subreal.
         company_id = user_company_id or sub.company_id
         agent_id = getattr(user, "id", None)
         if not agent_id:
@@ -2416,24 +2415,29 @@ class ReturnCreateSerializer(serializers.ModelSerializer):
         if br is not None:
             candidates = candidates.filter(branch=br)
 
-        candidates = candidates.order_by("-created_at")
+        candidates = candidates.order_by("-created_at", "-id")
 
-        picked = None
+        need = int(qty)
         total_on_hand = 0
-        for s in candidates:
-            # Используем единый расчёт остатка (как в модели ReturnFromAgent.clean),
-            # чтобы избежать расхождений и дублей сумм при JOIN-ах.
-            on_hand = int(s.get_qty_on_hand_with_sales(company_id=company_id) or 0)
-            if on_hand > 0:
-                total_on_hand += on_hand
-            if picked is None and on_hand >= int(qty):
-                picked = s
+        split_plan = []  # list[(subreal, take_qty)]
 
-        if picked is None:
+        for s in candidates:
+            on_hand = int(s.get_qty_on_hand_with_sales(company_id=company_id) or 0)
+            if on_hand <= 0:
+                continue
+            total_on_hand += on_hand
+            if need <= 0:
+                continue
+            take = min(need, on_hand)
+            if take > 0:
+                split_plan.append((s, take))
+                need -= take
+
+        if int(qty) > total_on_hand:
             raise serializers.ValidationError({"qty": f"На руках {total_on_hand}."})
 
-        # Подменяем subreal на реальную партию, где хватает остатка.
-        attrs["subreal"] = picked
+        # сохраняем план разбиения для create()
+        attrs["_split_plan"] = split_plan
         return attrs
 
     def create(self, validated_data):
@@ -2442,9 +2446,25 @@ class ReturnCreateSerializer(serializers.ModelSerializer):
         company_id = getattr(user, "company_id", None)
         if not company_id:
             raise serializers.ValidationError({"company": "У пользователя не задана компания."})
-        validated_data["company_id"] = company_id
-        validated_data["returned_by"] = user
-        return super().create(validated_data)
+        split_plan = validated_data.pop("_split_plan", None) or []
+        qty_total = int(validated_data.get("qty") or 0)
+        if qty_total < 1:
+            raise serializers.ValidationError({"qty": "Минимум 1."})
+        if not split_plan:
+            raise serializers.ValidationError({"qty": "На руках 0."})
+
+        created = []
+        for subreal, take in split_plan:
+            obj = ReturnFromAgent.objects.create(
+                company_id=company_id,
+                branch_id=getattr(subreal, "branch_id", None),
+                subreal=subreal,
+                returned_by=user,
+                qty=int(take),
+                status=ReturnFromAgent.Status.PENDING,
+            )
+            created.append(obj)
+        return created
 
 
 class ReturnReadSerializer(serializers.ModelSerializer):

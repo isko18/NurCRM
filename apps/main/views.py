@@ -3045,6 +3045,22 @@ class ReturnFromAgentListCreateAPIView(CompanyBranchRestrictedMixin, generics.Li
     def get_serializer_class(self):
         return ReturnCreateSerializer if self.request.method == "POST" else ReturnReadSerializer
 
+    def create(self, request, *args, **kwargs):
+        """
+        POST /api/main/returns/
+        Может создать несколько ReturnFromAgent, если qty покрывается несколькими subreal.
+        """
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        created = serializer.save(company=self._company(), returned_by=self._user())
+
+        if isinstance(created, list):
+            out_ser = ReturnReadSerializer(created, many=True, context={"request": request})
+            return Response(out_ser.data, status=status.HTTP_201_CREATED)
+
+        out_ser = ReturnReadSerializer(created, context={"request": request})
+        return Response(out_ser.data, status=status.HTTP_201_CREATED)
+
     @transaction.atomic
     def perform_create(self, serializer):
         serializer.save(company=self._company(), returned_by=self._user())
@@ -3080,6 +3096,77 @@ class AgentMyReturnsListCreateAPIView(ReturnFromAgentListCreateAPIView):
     def get_queryset(self):
         qs = super().get_queryset()
         return qs.filter(returned_by=self.request.user)
+
+    def list(self, request, *args, **kwargs):
+        response = super().list(request, *args, **kwargs)
+
+        # Доп.данные для UI возвратов: "на руках" по товарам (суммарно по всем партиям subreal).
+        # Нужно, когда один и тот же товар был выдан в нескольких передачах: 30 + 40 -> показываем 70.
+        try:
+            company = self._company()
+            branch = self._auto_branch()
+            user = request.user
+
+            subreals_qs = ManufactureSubreal.objects.filter(company=company, agent=user)
+            if branch is not None:
+                subreals_qs = subreals_qs.filter(branch=branch)
+            else:
+                subreals_qs = subreals_qs.filter(branch__isnull=True)
+
+            base_rows = list(
+                subreals_qs.values("product_id", "product__name")
+                .annotate(
+                    accepted=Coalesce(Sum("qty_accepted"), V(0)),
+                    returned=Coalesce(Sum("qty_returned"), V(0)),
+                )
+            )
+
+            sold_rows = list(
+                AgentSaleAllocation.objects.filter(
+                    company=company,
+                    agent=user,
+                    sale__status__in=[Sale.Status.PAID, Sale.Status.DEBT],
+                )
+                .values("product_id")
+                .annotate(sold=Coalesce(Sum("qty"), V(0)))
+            )
+            sold_by_product = {r["product_id"]: int(r.get("sold") or 0) for r in sold_rows}
+
+            pending_rows = list(
+                ReturnFromAgent.objects.filter(
+                    company=company,
+                    status=ReturnFromAgent.Status.PENDING,
+                    subreal__agent=user,
+                )
+                .values("subreal__product_id")
+                .annotate(reserved=Coalesce(Sum("qty"), V(0)))
+            )
+            pending_by_product = {r["subreal__product_id"]: int(r.get("reserved") or 0) for r in pending_rows}
+
+            on_hand = []
+            for r in base_rows:
+                pid = r.get("product_id")
+                accepted = int(r.get("accepted") or 0)
+                returned = int(r.get("returned") or 0)
+                sold = int(sold_by_product.get(pid, 0) or 0)
+                reserved = int(pending_by_product.get(pid, 0) or 0)
+                qty_on_hand = max(accepted - returned - sold - reserved, 0)
+                if qty_on_hand <= 0:
+                    continue
+                on_hand.append({
+                    "product_id": str(pid) if pid else None,
+                    "product_name": r.get("product__name") or "",
+                    "qty_on_hand": qty_on_hand,
+                })
+            on_hand.sort(key=lambda x: x["qty_on_hand"], reverse=True)
+
+            if isinstance(response.data, dict):
+                response.data["on_hand_by_product"] = on_hand
+        except Exception:
+            # не ломаем endpoint из-за доп.раздела
+            pass
+
+        return response
 
 
 # ===========================
