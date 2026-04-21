@@ -3209,6 +3209,57 @@ class ReturnFromAgentApproveAPIView(APIView, CompanyBranchRestrictedMixin):
     """
     permission_classes = [permissions.IsAuthenticated]
 
+    def _relocate_return_subreal_if_needed(self, ret: ReturnFromAgent):
+        """
+        Если по текущей партии (subreal) уже нет остатка, пробуем найти другую партию
+        того же товара у того же агента, где остатка хватает.
+        """
+        company_id = ret.company_id
+        branch_id = ret.branch_id
+        product_id = getattr(getattr(ret, "subreal", None), "product_id", None)
+        agent_id = getattr(getattr(ret, "subreal", None), "agent_id", None)
+        if not (company_id and product_id and agent_id):
+            return
+
+        current_subreal_id = ret.subreal_id
+        try:
+            current = ManufactureSubreal.objects.get(pk=current_subreal_id)
+            on_hand_now = int(current.get_qty_on_hand_with_sales(company_id=company_id, exclude_pending_return_id=ret.pk) or 0)
+        except Exception:
+            on_hand_now = 0
+
+        if on_hand_now >= int(ret.qty or 0):
+            return
+
+        candidates = ManufactureSubreal.objects.filter(
+            company_id=company_id,
+            agent_id=agent_id,
+            product_id=product_id,
+        )
+        if branch_id is not None:
+            candidates = candidates.filter(branch_id=branch_id)
+        else:
+            candidates = candidates.filter(branch__isnull=True)
+        candidates = candidates.order_by("-created_at", "-id")
+
+        need = int(ret.qty or 0)
+        total = 0
+        picked = None
+        for s in candidates:
+            on_hand = int(s.get_qty_on_hand_with_sales(company_id=company_id, exclude_pending_return_id=ret.pk) or 0)
+            if on_hand <= 0:
+                continue
+            total += on_hand
+            if picked is None and on_hand >= need:
+                picked = s
+
+        if picked is None:
+            raise ValidationError({"qty": [f"Можно принять максимум {total}."]})
+
+        if picked.pk != current_subreal_id:
+            ret.subreal_id = picked.pk
+            ret.save(update_fields=["subreal"])
+
     @transaction.atomic
     def post(self, request, pk, *args, **kwargs):
         try:
@@ -3225,6 +3276,10 @@ class ReturnFromAgentApproveAPIView(APIView, CompanyBranchRestrictedMixin):
         if ret.status != ReturnFromAgent.Status.PENDING:
             return Response(ReturnReadSerializer(ret).data, status=status.HTTP_200_OK)
 
+        # Если партия, привязанная к возврату, уже "обнулилась", пробуем перепривязать к другой партии
+        # того же товара у агента (остаток считаем в целом).
+        self._relocate_return_subreal_if_needed(ret)
+
         ser = ReturnApproveSerializer(
             data=request.data,
             context={"request": request, "return_obj": ret},
@@ -3232,6 +3287,71 @@ class ReturnFromAgentApproveAPIView(APIView, CompanyBranchRestrictedMixin):
         ser.is_valid(raise_exception=True)
         ret = ser.save()
         return Response(ReturnReadSerializer(ret).data, status=status.HTTP_200_OK)
+
+
+# ===========================
+#  Return: bulk approve (owner/admin)
+# ===========================
+class ReturnFromAgentBulkApproveAPIView(APIView, CompanyBranchRestrictedMixin):
+    """
+    POST /api/main/returns/approve-bulk/
+    Принимает сразу несколько возвратов одним запросом.
+
+    Payload:
+      - либо {"ids": ["uuid", ...]}
+      - либо {"product_id": "<uuid>", "agent_id": "<uuid|optional>"} -> примет все PENDING по товару (и агенту, если задан)
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    @transaction.atomic
+    def post(self, request, *args, **kwargs):
+        if not _is_owner_like(request.user):
+            return Response({"detail": "Forbidden"}, status=status.HTTP_403_FORBIDDEN)
+
+        company = self._company()
+        data = request.data or {}
+        ids = data.get("ids")
+        product_id = data.get("product_id")
+        agent_id = data.get("agent_id")
+
+        if ids:
+            qs = ReturnFromAgent.objects.select_for_update().filter(company=company, status=ReturnFromAgent.Status.PENDING, id__in=ids)
+        elif product_id:
+            qs = ReturnFromAgent.objects.select_for_update().filter(
+                company=company,
+                status=ReturnFromAgent.Status.PENDING,
+                subreal__product_id=product_id,
+            )
+            if agent_id:
+                qs = qs.filter(subreal__agent_id=agent_id)
+        else:
+            raise ValidationError({"detail": "Передай ids[] или product_id."})
+
+        qs = qs.select_related("subreal__product")
+
+        approved = []
+        errors = []
+        helper = ReturnFromAgentApproveAPIView()
+        helper.request = request
+        helper.args = ()
+        helper.kwargs = {}
+
+        for ret in qs.order_by("returned_at", "id"):
+            try:
+                helper._relocate_return_subreal_if_needed(ret)
+                ser = ReturnApproveSerializer(data={}, context={"request": request, "return_obj": ret})
+                ser.is_valid(raise_exception=True)
+                approved_ret = ser.save()
+                approved.append(approved_ret)
+            except Exception as e:
+                errors.append({"id": str(ret.id), "error": str(e)})
+
+        return Response({
+            "approved_count": len(approved),
+            "errors_count": len(errors),
+            "errors": errors,
+            "items": ReturnReadSerializer(approved, many=True).data,
+        }, status=status.HTTP_200_OK)
 
 
 # ===========================
