@@ -106,6 +106,7 @@ class ProductImageReadSerializer(serializers.ModelSerializer):
 class SaleItemSerializer(serializers.ModelSerializer):
     product_name = serializers.CharField(source="product.name", read_only=True)
     barcode = serializers.CharField(source="product.barcode", read_only=True)
+    is_weight = serializers.BooleanField(source="product.is_weight", read_only=True)
     display_name = serializers.SerializerMethodField()
     primary_image_url = serializers.SerializerMethodField(read_only=True)
     images = ProductImageReadSerializer(many=True, read_only=True, source="product.images")
@@ -121,6 +122,7 @@ class SaleItemSerializer(serializers.ModelSerializer):
         fields = (
             "id", "cart", "product",
             "product_name", "barcode",
+            "is_weight",
             "quantity", "unit_price", "line_discount",
             "sale_package",
             "display_name",

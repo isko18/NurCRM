@@ -2133,6 +2133,10 @@ class SaleListAPIView(MarketCashierOnlyMixin, CompanyBranchRestrictedMixin, gene
             if user_ids:
                 qs = qs.filter(user_id__in=user_ids)
 
+        client_param = (self.request.query_params.get("client") or "").strip()
+        if client_param:
+            qs = qs.filter(client_id=client_param)
+
         return qs
 
 
