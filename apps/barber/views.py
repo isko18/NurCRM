@@ -14,11 +14,13 @@ from django_filters import rest_framework as filters
 from django_filters.rest_framework import DjangoFilterBackend
 
 from apps.users.models import Branch, Company
-from .models import Service, Client, Appointment, AppointmentService, Document, Folder, ServiceCategory, Payout, PayoutSale, ProductSalePayout, OnlineBooking
+from .models import Service, Client, Appointment, AppointmentService, Document, Folder, ServiceCategory, Payout, PayoutSale, ProductSalePayout, OnlineBooking, ClientDocument
 
 from .serializers import (
     ServiceSerializer,
     ClientSerializer,
+    ClientDetailSerializer,
+    ClientDocumentSerializer,
     AppointmentSerializer,
     AppointmentHistoryRowSerializer,
     FolderSerializer,
@@ -343,6 +345,12 @@ class ClientRetrieveUpdateDestroyView(
     serializer_class = ClientSerializer
     permission_classes = [permissions.IsAuthenticated]
 
+    def get_serializer_class(self):
+        # в карточке клиента нужен раздел "документы"
+        if self.request.method == "GET":
+            return ClientDetailSerializer
+        return ClientSerializer
+
     def destroy(self, request, *args, **kwargs):
         instance = self.get_object()
         try:
@@ -386,6 +394,59 @@ class ClientRetrieveUpdateDestroyView(
                 },
                 status=status.HTTP_409_CONFLICT,
             )
+
+
+class ClientDocumentListCreateView(CompanyQuerysetMixin, generics.ListCreateAPIView):
+    queryset = ClientDocument.objects.select_related("client").all()
+    serializer_class = ClientDocumentSerializer
+    permission_classes = [permissions.IsAuthenticated]
+    parser_classes = [MultiPartParser, FormParser]
+    filter_backends = [DjangoFilterBackend, OrderingFilter]
+    ordering_fields = ["file_create_date"]
+    ordering = ["-file_create_date"]
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        company = self._user_company()
+        if not company:
+            return qs.none()
+        client = generics.get_object_or_404(Client, pk=self.kwargs["pk"], company=company)
+        return qs.filter(client=client)
+
+    def perform_create(self, serializer):
+        company = self._user_company()
+        if not company:
+            raise PermissionDenied("У пользователя не задана компания.")
+        client = generics.get_object_or_404(Client, pk=self.kwargs["pk"], company=company)
+        serializer.save(company=company, branch=client.branch, client=client)
+
+
+class ClientDocumentRetrieveUpdateDestroyView(
+    CompanyQuerysetMixin, generics.RetrieveUpdateDestroyAPIView
+):
+    queryset = ClientDocument.objects.select_related("client").all()
+    serializer_class = ClientDocumentSerializer
+    permission_classes = [permissions.IsAuthenticated]
+    parser_classes = [MultiPartParser, FormParser]
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        company = self._user_company()
+        if not company:
+            return qs.none()
+        client = generics.get_object_or_404(Client, pk=self.kwargs["client_pk"], company=company)
+        return qs.filter(client=client)
+
+    def perform_update(self, serializer):
+        """
+        Разрешаем обновлять file и file_comment.
+        company/branch/client фиксируем, чтобы документ нельзя было "перенести" на другого клиента/филиал.
+        """
+        company = self._user_company()
+        if not company:
+            raise PermissionDenied("У пользователя не задана компания.")
+        instance = self.get_object()
+        serializer.save(company=company, branch=instance.client.branch, client=instance.client)
 
 
 class ClientVisitHistoryListView(CompanyQuerysetMixin, generics.ListAPIView):

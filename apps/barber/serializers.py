@@ -8,6 +8,7 @@ from .models import (
     Appointment,
     AppointmentService,
     Document,
+    ClientDocument,
     Folder,
     ServiceCategory,
     Payout,
@@ -291,6 +292,36 @@ class ClientSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
                 {"phone": "Клиент с таким номером телефона уже существует в этой компании (или в выбранном филиале)."}
             )
         return attrs
+
+
+# ===========================
+# ClientDocument
+# ===========================
+class ClientDocumentSerializer(serializers.ModelSerializer):
+    company = serializers.ReadOnlyField(source="company.id")
+    branch = serializers.ReadOnlyField(source="branch.id")
+    client = serializers.ReadOnlyField(source="client.id")
+
+    class Meta:
+        ref_name = "BarberClientDocument"
+        model = ClientDocument
+        fields = [
+            "id",
+            "company",
+            "branch",
+            "client",
+            "file",
+            "file_comment",
+            "file_create_date",
+        ]
+        read_only_fields = ["id", "company", "branch", "client", "file_create_date"]
+
+
+class ClientDetailSerializer(ClientSerializer):
+    documents = ClientDocumentSerializer(many=True, read_only=True)
+
+    class Meta(ClientSerializer.Meta):
+        fields = ClientSerializer.Meta.fields + ["documents"]
 
 
 # ===========================

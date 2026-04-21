@@ -8,6 +8,8 @@ urlpatterns = [
 
     path('clients/', views.ClientListCreateView.as_view(), name='client-list'),
     path('clients/<uuid:pk>/', views.ClientRetrieveUpdateDestroyView.as_view(), name='client-detail'),
+    path('clients/<uuid:pk>/documents/', views.ClientDocumentListCreateView.as_view(), name='client-document-list'),
+    path('clients/<uuid:client_pk>/documents/<uuid:pk>/', views.ClientDocumentRetrieveUpdateDestroyView.as_view(), name='client-document-detail'),
     path('clients/<uuid:pk>/visits/history/', views.ClientVisitHistoryListView.as_view(), name='client-visit-history'),
     path('visits/history/', views.VisitHistoryListView.as_view(), name='visit-history'),
 

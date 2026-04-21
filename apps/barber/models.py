@@ -233,6 +233,60 @@ class Client(models.Model):
 
 
 # ===========================
+# ClientDocument
+# ===========================
+class ClientDocument(models.Model):
+    """
+    Документ, привязанный к клиенту (много файлов на одного клиента).
+    """
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    company = models.ForeignKey(
+        Company,
+        on_delete=models.CASCADE,
+        related_name="barber_client_documents",
+        verbose_name="Компания",
+    )
+    branch = models.ForeignKey(
+        Branch,
+        on_delete=models.CASCADE,
+        related_name="barber_client_documents",
+        verbose_name="Филиал",
+        null=True,
+        blank=True,
+        db_index=True,
+    )
+    client = models.ForeignKey(
+        Client,
+        on_delete=models.CASCADE,
+        related_name="documents",
+        verbose_name="Клиент",
+    )
+    file = models.FileField("Файл", upload_to="client_documents/")
+    file_comment = models.TextField("Комментарий к файлу", blank=True, null=True)
+    file_create_date = models.DateTimeField("Дата создания файла", auto_now_add=True)
+
+    class Meta:
+        verbose_name = "Документ клиента"
+        verbose_name_plural = "Документы клиентов"
+        ordering = ["-file_create_date"]
+        indexes = [
+            models.Index(fields=["company", "client", "file_create_date"]),
+            models.Index(fields=["company", "branch", "client", "file_create_date"]),
+        ]
+
+    def __str__(self):
+        return self.file.name
+
+    def clean(self):
+        if self.branch_id and self.branch.company_id != self.company_id:
+            raise ValidationError({"branch": "Филиал принадлежит другой компании."})
+        if self.client and self.client.company_id != self.company_id:
+            raise ValidationError({"client": "Клиент принадлежит другой компании."})
+        if self.client and (self.client.branch_id or None) != (self.branch_id or None):
+            raise ValidationError({"branch": "Филиал документа должен совпадать с филиалом клиента."})
+
+
+# ===========================
 # Appointment
 # ===========================
 class Appointment(models.Model):
