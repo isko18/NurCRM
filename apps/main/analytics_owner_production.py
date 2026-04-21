@@ -15,6 +15,7 @@ from .models import (
     ReturnFromAgent,
     Sale,
     SaleItem,
+    Client,
     ClientDeal,
     DealInstallment,
     Product,
@@ -530,6 +531,34 @@ def build_owner_analytics_payload(*, company, branch, period, date_from, date_to
         accounts_payable_dec = (-balance) if balance < 0 else Decimal("0.00")
         if accounts_payable_dec < 0:
             accounts_payable_dec = Decimal("0.00")
+
+    # Кредиторка по CRM-поставщикам (Client.type=SUPPLIERS):
+    # считаем остаток по сделкам в долг (ClientDeal.Kind.DEBT) как обязательство компании.
+    supplier_deals_qs = ClientDeal.objects.filter(
+        company=company,
+        kind=ClientDeal.Kind.DEBT,
+        client__type=Client.StatusClient.SUPPLIERS,
+    )
+    if branch is not None:
+        supplier_deals_qs = supplier_deals_qs.filter(Q(branch=branch) | Q(branch__isnull=True))
+    else:
+        supplier_deals_qs = supplier_deals_qs.filter(branch__isnull=True)
+
+    supplier_paid_subq = (
+        DealInstallment.objects.filter(deal_id=OuterRef("pk"))
+        .values("deal_id")
+        .annotate(s=Sum("paid_amount"))
+        .values("s")[:1]
+    )
+    supplier_payable_dec = (
+        supplier_deals_qs
+        .annotate(paid=Coalesce(Subquery(supplier_paid_subq), V(Decimal("0.00"), output_field=MONEY_FIELD)))
+        .annotate(remaining=(F("amount") - F("prepayment")) - F("paid"))
+        .aggregate(t=Coalesce(Sum("remaining"), ZERO_MONEY))["t"]
+        or Decimal("0.00")
+    )
+    if supplier_payable_dec and supplier_payable_dec > 0:
+        accounts_payable_dec += supplier_payable_dec
 
     if BuildingDebtLedgerEntry is not None:
         building_agg = BuildingDebtLedgerEntry.objects.filter(

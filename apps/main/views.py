@@ -5171,6 +5171,55 @@ class AnalyticsCardDetailsAPIView(CompanyBranchRestrictedMixin, APIView):
                     "accounts_payable": str(payable),
                 })
 
+            # CRM-поставщики: Client.type=SUPPLIERS + сделки ClientDeal(kind=DEBT) → обязательства компании
+            try:
+                from apps.main.models import Client, ClientDeal, DealInstallment
+            except Exception:
+                Client = None
+                ClientDeal = None
+                DealInstallment = None
+
+            if Client and ClientDeal and DealInstallment:
+                supplier_clients_qs = Client.objects.filter(company=company, type=Client.StatusClient.SUPPLIERS)
+                if branch is not None:
+                    supplier_clients_qs = supplier_clients_qs.filter(Q(branch=branch) | Q(branch__isnull=True))
+                else:
+                    supplier_clients_qs = supplier_clients_qs.filter(branch__isnull=True)
+
+                supplier_deals_qs = ClientDeal.objects.filter(
+                    company=company,
+                    kind=ClientDeal.Kind.DEBT,
+                    client__in=supplier_clients_qs,
+                )
+                if branch is not None:
+                    supplier_deals_qs = supplier_deals_qs.filter(Q(branch=branch) | Q(branch__isnull=True))
+                else:
+                    supplier_deals_qs = supplier_deals_qs.filter(branch__isnull=True)
+
+                supplier_paid_subq = (
+                    DealInstallment.objects.filter(deal_id=OuterRef("pk"))
+                    .values("deal_id")
+                    .annotate(s=Sum("paid_amount"))
+                    .values("s")[:1]
+                )
+                supplier_rows = (
+                    supplier_deals_qs
+                    .annotate(paid=Coalesce(Subquery(supplier_paid_subq), V(Decimal("0.00"), output_field=money_field_ap)))
+                    .annotate(remaining=(F("amount") - F("prepayment")) - F("paid"))
+                    .values("client_id", "client__full_name")
+                    .annotate(remaining_total=Coalesce(Sum("remaining"), zero_money_ap))
+                )
+                for r in supplier_rows:
+                    rem = (r.get("remaining_total") or Decimal("0.00")).quantize(_Q2, rounding=ROUND_HALF_UP)
+                    if rem <= 0:
+                        continue
+                    ap_sum += rem
+                    rows_out.append({
+                        "counterparty_id": str(r["client_id"]),
+                        "name": r.get("client__full_name") or "Поставщик",
+                        "accounts_payable": str(rem),
+                    })
+
             rows_out.sort(key=lambda x: Decimal(x["accounts_payable"]), reverse=True)
             total_count = len(rows_out)
             page = rows_out[offset: offset + limit]
