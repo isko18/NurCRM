@@ -87,4 +87,12 @@ def build_receipt_payload(sale, cashier_name=None, *, ensure_number: bool = True
         "change": _to_float(getattr(sale, "change", 0)),
     }
 
+    # eKassa: отдаём то, что уже сохранено в Sale.ekassa_fiscal (если есть)
+    try:
+        ekassa_meta = getattr(sale, "ekassa_fiscal", None)
+    except Exception:
+        ekassa_meta = None
+    if ekassa_meta:
+        payload["ekassa"] = ekassa_meta
+
     return payload

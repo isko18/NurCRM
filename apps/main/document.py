@@ -124,6 +124,7 @@ class SaleReceiptAPIView(APIView):
                 "change": fmt_decimal(q2(getattr(sale, "change", 0))),
                 "paid_at": timezone.localtime(sale.paid_at).isoformat() if getattr(sale, "paid_at", None) else None,
             },
+            "ekassa": getattr(sale, "ekassa_fiscal", None),
         }
 
         return Response(payload, status=200)

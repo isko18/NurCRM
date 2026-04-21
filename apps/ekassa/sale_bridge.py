@@ -157,6 +157,7 @@ def try_fiscalize_pos_sale(sale_id) -> None:
             "newid": newid,
             "fd_number": fd_int,
             "ekassa_receipt_id": data.get("id"),
+            "fields": fields,
             "message": resp.get("message"),
         },
     )

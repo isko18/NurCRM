@@ -255,6 +255,30 @@ def _build_physical_receipt_text(sale, *, payment_method=None, cash_received=Non
 
     lines.append("-" * 32)
     lines.append("Спасибо за покупку")
+
+    # eKassa (если фискализация уже выполнена и данные сохранены в Sale.ekassa_fiscal)
+    try:
+        meta = getattr(sale, "ekassa_fiscal", None) or {}
+    except Exception:
+        meta = {}
+    if isinstance(meta, dict) and meta:
+        lines.append("-" * 32)
+        lines.append("eKassa")
+        status = meta.get("status")
+        if status is not None:
+            lines.append(f"status: {status}")
+        if meta.get("fd_number") is not None:
+            lines.append(f"fd_number: {meta.get('fd_number')}")
+        if meta.get("ekassa_receipt_id") is not None:
+            lines.append(f"receipt_id: {meta.get('ekassa_receipt_id')}")
+        fields = meta.get("fields")
+        if isinstance(fields, dict) and fields:
+            lines.append("fields:")
+            for k in sorted(fields.keys(), key=lambda x: str(x)):
+                v = fields.get(k)
+                if v is None or v == "":
+                    continue
+                lines.append(f"  {k}: {v}")
     return "\n".join(lines)
 
 
