@@ -430,6 +430,48 @@ def build_agent_analytics_payload(
 
     accounts_receivable_dec = (deals_remaining_dec or Decimal("0.00")) + (pos_sales_debt_dec or Decimal("0.00"))
 
+    # ------------------------------------------------------
+    # ДОЛГ ПО КЛИЕНТАМ (как в карточке клиента: сделки + POS-долги)
+    # ------------------------------------------------------
+    # 1) по сделкам: суммарный remaining по каждому client_id
+    deals_by_client_qs = (
+        deals_qs
+        .annotate(paid=Coalesce(Subquery(paid_subq), V(Decimal("0.00"), output_field=MONEY_FIELD)))
+        .annotate(remaining=(F("amount") - F("prepayment")) - F("paid"))
+        .values("client_id")
+        .annotate(remaining_total=Coalesce(Sum("remaining"), ZERO_MONEY))
+    )
+    deals_by_client = {row["client_id"]: (row["remaining_total"] or Decimal("0.00")) for row in deals_by_client_qs}
+
+    # 2) по продажам "в долг": sum(total) по каждому client_id
+    sales_debt_by_client_qs = (
+        sales_debt_qs
+        .exclude(client_id__isnull=True)
+        .values("client_id")
+        .annotate(debt_total=Coalesce(Sum("total"), ZERO_MONEY))
+    )
+    sales_debt_by_client = {row["client_id"]: (row["debt_total"] or Decimal("0.00")) for row in sales_debt_by_client_qs}
+
+    # 3) собираем список по всем клиентам агента (включая 0, чтобы фронт мог показать)
+    clients_list = list(clients_qs.values("id", "full_name", "phone"))
+    clients_debt = []
+    clients_debt_total_dec = Decimal("0.00")
+    for c in clients_list:
+        cid = c["id"]
+        deals_debt = deals_by_client.get(cid, Decimal("0.00")) or Decimal("0.00")
+        pos_debt = sales_debt_by_client.get(cid, Decimal("0.00")) or Decimal("0.00")
+        total_debt = (deals_debt + pos_debt).quantize(Decimal("0.01"))
+        clients_debt_total_dec += total_debt
+        clients_debt.append({
+            "client_id": str(cid),
+            "client_name": c.get("full_name") or "",
+            "client_phone": c.get("phone") or "",
+            "debt_total": float(total_debt),
+            "debt_client_deals": float(deals_debt),
+            "debt_pos_sales": float(pos_debt),
+        })
+    clients_debt.sort(key=lambda x: x["debt_total"], reverse=True)
+
     # ======================================================
     #      П Е Р Е Д А Ч И  П О  Д Н Я М
     # ======================================================
@@ -510,6 +552,7 @@ def build_agent_analytics_payload(
             "accounts_receivable": float(accounts_receivable_dec),
             "accounts_receivable_client_deals": float(deals_remaining_dec or Decimal("0.00")),
             "accounts_receivable_pos_sales": float(pos_sales_debt_dec or Decimal("0.00")),
+            "clients_debt_total": float(clients_debt_total_dec),
         },
         "charts": {
             "sales_by_date": sales_by_date,
@@ -520,6 +563,7 @@ def build_agent_analytics_payload(
             "on_hand_by_product_amount": on_hand["by_product_amount"],
             "transfers_by_date": transfers_by_date,
             "top_products_by_transfers": top_products_by_transfers,
+            "clients_debt": clients_debt,
         },
         "transfers_history": transfers_history,
     }
