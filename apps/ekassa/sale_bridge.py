@@ -1,12 +1,13 @@
 """
 Отправка оплаченной продажи (main.Sale) в eKassa после commit транзакции.
 
-Вызывается из Sale.mark_paid() через schedule_after_commit (фон после commit) или синхронно из POS
-при печати чека — после checkout_cart и mark_paid.
+Вызывается из Sale.mark_paid() через schedule_after_commit (фон после commit) или синхронно
+при запросе печати (GET receipt с wait_ekassa).
 """
 from __future__ import annotations
 
 import logging
+import time
 import uuid
 from decimal import Decimal
 
@@ -173,3 +174,34 @@ def try_fiscalize_pos_sale(sale_id) -> None:
             "message": resp.get("message"),
         },
     )
+
+
+def wait_for_pos_sale_ekassa(sale_id, *, timeout_sec: float = 45.0, poll_sec: float = 0.2) -> None:
+    """
+    Ждёт появления терминального состояния фискализации в Sale.ekassa_fiscal (фон после mark_paid
+    или повторный вызов try_fiscalize по таймауту).
+    """
+    from apps.main.models import Sale
+
+    sale = Sale.objects.filter(pk=sale_id).select_related("company").first()
+    if not sale:
+        return
+    if sale.status != Sale.Status.PAID or sale.payment_method == Sale.PaymentMethod.DEBT:
+        return
+    cfg = get_integration(sale.company)
+    if cfg is None or not cfg.is_ready():
+        return
+
+    deadline = time.monotonic() + float(timeout_sec)
+    while time.monotonic() < deadline:
+        row = Sale.objects.filter(pk=sale_id).only("ekassa_fiscal", "status", "payment_method").first()
+        if not row or row.status != Sale.Status.PAID or row.payment_method == Sale.PaymentMethod.DEBT:
+            return
+        meta = row.ekassa_fiscal or {}
+        if meta.get("fd_number") is not None or meta.get("status") == "ok":
+            return
+        if meta.get("status") == "error":
+            return
+        time.sleep(float(poll_sec))
+
+    try_fiscalize_pos_sale(sale_id)

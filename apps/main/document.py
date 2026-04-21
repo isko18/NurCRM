@@ -46,6 +46,13 @@ class SaleReceiptAPIView(APIView):
             company=request.user.company,
         )
 
+        qp = str(request.query_params.get("wait_ekassa", "") or "").strip().lower()
+        if qp in ("1", "true", "yes", "on"):
+            from apps.ekassa.sale_bridge import wait_for_pos_sale_ekassa
+
+            wait_for_pos_sale_ekassa(sale.pk)
+            sale.refresh_from_db()
+
         doc_no = ensure_sale_doc_number(sale)
         dt = timezone.localtime(sale.created_at) if sale.created_at else timezone.localtime()
 

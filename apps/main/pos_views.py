@@ -297,15 +297,8 @@ def _build_physical_receipt_text(sale, *, payment_method=None, cash_received=Non
     return "\n".join(lines)
 
 
-def _sync_ekassa_for_receipt_print(sale) -> None:
-    """После commit продажи: синхронная фискализация (для печати чека с реквизитами eKassa)."""
-    if getattr(sale, "payment_method", None) == Sale.PaymentMethod.DEBT:
-        return
-    if getattr(sale, "status", None) != Sale.Status.PAID:
-        return
-    from apps.ekassa.sale_bridge import try_fiscalize_pos_sale
-
-    try_fiscalize_pos_sale(sale.pk)
+def _truthy_query_param(val) -> bool:
+    return str(val or "").strip().lower() in ("1", "true", "yes", "on")
 
 
 def _cart_queryset_for_response():
@@ -1357,8 +1350,23 @@ class SaleReceiptDataAPIView(MarketCashierOnlyMixin, APIView):
             or getattr(request.user, "get_full_name", lambda: None)()
         )
         from apps.main.printers import build_receipt_payload
+        from apps.ekassa.sale_bridge import wait_for_pos_sale_ekassa
+
+        if _truthy_query_param(request.query_params.get("wait_ekassa")):
+            wait_for_pos_sale_ekassa(sale.pk)
+            sale.refresh_from_db()
 
         payload = build_receipt_payload(sale, cashier_name=cashier_name, ensure_number=True)
+
+        if _truthy_query_param(request.query_params.get("receipt_text")):
+            payload["receipt_text"] = _build_physical_receipt_text(
+                sale,
+                payment_method=sale.payment_method,
+                cash_received=sale.cash_received,
+                change=sale.change,
+                include_shift=bool(getattr(sale, "shift_id", None)),
+            )
+
         return Response(payload, status=200)
 
 
@@ -1716,7 +1724,6 @@ class SaleCheckoutAPIView(MarketCashierOnlyMixin, APIView):
                     allow_negative_stock=can_minus,
                     payment_method=payment_method,
                     cash_received=cash_received,
-                    skip_ekassa_schedule=print_receipt,
                     client=client_obj,
                 )
             except NotEnoughStock as e:
@@ -1740,22 +1747,14 @@ class SaleCheckoutAPIView(MarketCashierOnlyMixin, APIView):
                 "cashbox_id": str(sale.cashbox_id) if sale.cashbox_id else None,
             }
 
-        if print_receipt:
-            _sync_ekassa_for_receipt_print(sale)
-            sale.refresh_from_db()
-            payload["receipt_text"] = _build_physical_receipt_text(
-                sale,
-                payment_method=sale.payment_method,
-                cash_received=sale.cash_received,
-                change=sale.change,
-                include_shift=True,
-            )
+            if print_receipt:
+                payload["receipt_print_path"] = (
+                    f"/api/main/pos/sales/{sale.id}/receipt/?wait_ekassa=1&receipt_text=1"
+                )
 
         hint = _ekassa_checkout_hint(sale.company)
         if hint:
             payload["ekassa"] = hint
-        if print_receipt and getattr(sale, "ekassa_fiscal", None):
-            payload["ekassa"] = sale.ekassa_fiscal
 
         return Response(payload, status=status.HTTP_201_CREATED)
 
@@ -2986,11 +2985,7 @@ class AgentSaleCheckoutAPIView(MarketCashierOnlyMixin, CompanyBranchRestrictedMi
                 cr = Decimal("0.00")
 
             if hasattr(sale, "mark_paid") and callable(sale.mark_paid):
-                sale.mark_paid(
-                    payment_method=pm,
-                    cash_received=cr,
-                    skip_ekassa_schedule=print_receipt,
-                )
+                sale.mark_paid(payment_method=pm, cash_received=cr)
             else:
                 updates = []
                 if hasattr(sale, "payment_method"):
@@ -3024,22 +3019,14 @@ class AgentSaleCheckoutAPIView(MarketCashierOnlyMixin, CompanyBranchRestrictedMi
                 "cashbox_id": str(getattr(sale, "cashbox_id", None)) if getattr(sale, "cashbox_id", None) else None,
             }
 
-        if print_receipt:
-            _sync_ekassa_for_receipt_print(sale)
-            sale.refresh_from_db()
-            payload["receipt_text"] = _build_physical_receipt_text(
-                sale,
-                payment_method=getattr(sale, "payment_method", payment_method),
-                cash_received=getattr(sale, "cash_received", cash_received),
-                change=getattr(sale, "change", Decimal("0.00")),
-                include_shift=False,
-            )
+            if print_receipt:
+                payload["receipt_print_path"] = (
+                    f"/api/main/pos/sales/{sale.id}/receipt/?wait_ekassa=1&receipt_text=1"
+                )
 
         hint = _ekassa_checkout_hint(sale.company)
         if hint:
             payload["ekassa"] = hint
-        if print_receipt and getattr(sale, "ekassa_fiscal", None):
-            payload["ekassa"] = sale.ekassa_fiscal
 
         return Response(payload, status=status.HTTP_201_CREATED)
 

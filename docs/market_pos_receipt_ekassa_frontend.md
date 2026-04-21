@@ -2,116 +2,76 @@
 
 Кратко:
 
-- **`print_receipt: false`** — продажа фиксируется в БД как раньше; фискализация eKassa ставится **в фоне** после commit (ответ HTTP не ждёт OFD).
-- **`print_receipt: true`** — продажа **сначала** сохраняется и коммитится, затем сервер **синхронно** ждёт ответ eKassa и только после этого отдаёт **`receipt_text`** (и при успехе/ошибке — объект в **`ekassa`** из `sale.ekassa_fiscal`). HTTP-ответ дольше, но чек уже с реквизитами ОФД.
+- **Чекаут** (`POST .../checkout/`) **не ждёт** eKassa: продажа сохраняется, `mark_paid` ставит фискализацию **в фоне** после commit.
+- **Печать с реквизитами ОФД** — отдельный запрос: **`GET /api/main/pos/sales/<sale_id>/receipt/?wait_ekassa=1&receipt_text=1`** (сервер ждёт терминального состояния в `ekassa_fiscal`, затем отдаёт JSON и строку **`receipt_text`**).
 
 Базовый префикс: `/api/main/`. Авторизация: `Authorization: Bearer <token>`.
 
 ---
 
-## 1. Чекаут с текстом чека
+## 1. Чекаут
 
 ### `POST /api/main/pos/sales/<cart_id>/checkout/`
 
-Тело (фрагмент): `print_receipt: true` — в ответе будет строка **`receipt_text`** (формируется **после** завершения запроса к eKassa для оплаченных продаж, не «в долг»).
+- **`print_receipt: true`** — в ответе **нет** `receipt_text`; вместо этого поле **`receipt_print_path`**: относительный путь для GET печати (см. ниже).
+- **`print_receipt: false`** — поля `receipt_print_path` нет.
+- При готовой интеграции eKassa по-прежнему может быть **`ekassa: { "queued": true }`** — фискализация в фоне.
 
-В конце `receipt_text` (после «Спасибо за покупку»), если у продажи уже есть **`ekassa_fiscal`**, добавляется блок:
+### `POST /api/main/agents/me/carts/<cart_id>/checkout/`
 
-```
---------------------------------
-eKassa
-status: ok
-fd_number: 35
-receipt_id: <uuid из eKassa>
-fields:
-  1040: ...
-  ...
-```
-
-- **`fields`** — словарь кодов полей ответа eKassa (ключи — как пришли от API, часто строки вида `"1040"`).
-- При **`print_receipt: false`** блока eKassa в ответе чекаута нет; данные появятся позже в `GET .../receipt/` или в `ekassa_fiscal` у продажи.
-
-Дополнительно в JSON ответа чекаута:
-
-- при **`print_receipt: false`** и готовой интеграции: `ekassa: { "queued": true }` — фискализация в фоне;
-- при **`print_receipt: true`** и наличии результата: **`ekassa`** — содержимое `sale.ekassa_fiscal` (статус, `link`, `fields`, …); если интеграция не настроена — по-прежнему может быть только `{ "queued": true }`.
-
-Агентский чекаут: `POST /api/main/agents/me/carts/<cart_id>/checkout/` — те же правила для `print_receipt` и поля **`ekassa`**.
+Те же правила: при **`print_receipt: true`** отдаётся **`receipt_print_path`** (тот же шаблон URL, `sale_id` — созданная продажа).
 
 ---
 
-## 2. JSON для печати (POS)
+## 2. Печать (ожидание eKassa)
 
 ### `GET /api/main/pos/sales/<sale_id>/receipt/`
 
-Ответ — объект для печати. Ранее: `encoding`, `doc_no`, `company`, `items`, суммы и т.д.
+| Query | Назначение |
+|--------|------------|
+| **`wait_ekassa=1`** | Дождаться появления в БД финального результата фискализации (до ~45 с опроса; по таймауту — один повторный запрос к eKassa). Без параметра — ответ сразу, `ekassa` может быть ещё пустым. |
+| **`receipt_text=1`** | В JSON добавить поле **`receipt_text`** (тот же формат, что в POS для физической печати). Имеет смысл вместе с **`wait_ekassa=1`**, если нужны ФД/ФПД/QR в тексте. |
+| **`cashier_name`** | Опционально, как раньше. |
 
-**Добавлено:** если у продажи есть `ekassa_fiscal`, в корень кладётся:
+Пример для кассы после успешного чекаута с `print_receipt: true`:
 
-```json
-"ekassa": {
-  "status": "ok",
-  "newid": "uuid",
-  "fd_number": 35,
-  "ekassa_receipt_id": "uuid",
-  "message": "...",
-  "fields": { "1040": "35", "...": "..." }
-}
+```
+GET /api/main/pos/sales/<sale_id>/receipt/?wait_ekassa=1&receipt_text=1
 ```
 
-При ошибке фискализации возможны `status: "error"`, `message`, опционально `ekassa_payload`.
+В теле ответа: обычный **`build_receipt_payload`**, плюс при наличии данных — **`ekassa`**, при **`receipt_text=1`** — строка **`receipt_text`**.
 
 ---
 
-## 3. JSON документа «чек» (общий формат)
+## 3. JSON документа чека
 
 ### `GET /api/main/sales/json/<sale_id>/receipt/`
 
-В корне ответа добавлено поле **`ekassa`** — то же содержимое, что и `Sale.ekassa_fiscal` (или `null`, если данных ещё нет):
-
-```json
-{
-  "sale": { ... },
-  "company": { ... },
-  "items": [ ... ],
-  "totals": { ... },
-  "payment": { ... },
-  "ekassa": { ... }
-}
-```
+- Query **`wait_ekassa=1`** — перед сборкой ответа дождаться фискализации (та же логика, что для POS receipt).
+- Поле **`ekassa`** в корне — `sale.ekassa_fiscal` после ожидания (если было).
 
 ---
 
 ## 4. Структура `ekassa_fiscal` / `ekassa` (ориентир для UI)
 
-Поле хранится в модели продажи как JSON. Типичные ключи:
-
 | Ключ | Описание |
 |------|----------|
-| `status` | `"pending"` \| `"ok"` \| `"error"` (и др. по мере развития) |
-| `newid` | Идемпотентный UUID запроса к eKassa |
-| `fd_number` | Номер ФД (если удалось распарсить из `fields["1040"]`) |
-| `ekassa_receipt_id` | ID чека в ответе eKassa (`data.id`) |
-| `message` | Сообщение из ответа или текст ошибки |
-| `fields` | Словарь полей фискального документа из ответа API (для отображения «как в дубликате» — маппинг кодов на подписи делает фронт или отдельная спека по кодам ОФД) |
-| `kkm_reg_number` | РН ККМ (как правило, `fields["1037"]`) |
-| `fm_number` | ФМ (как правило, `fields["1041"]`) |
-| `fpd` | ФПД (как правило, `fields["1077"]`) |
-| `link` | Ссылка для проверки/отображения (её обычно кодируют в QR) |
-| `ekassa_payload` | При ошибке API — укороченный/полный payload ошибки (если сохранён) |
-
-Точный набор кодов в `fields` задаёт API eKassa; бэкенд сохраняет их **как есть** после успешной фискализации.
-
----
-
-## 5. Где ещё смотреть статус без печати
-
-Детальная карточка продажи в POS уже отдаёт поле **`ekassa_fiscal`** (см. `SaleDetailSerializer` в бэкенде) — удобно для опроса «появился ли ФД» после чекаута.
+| `status` | `"pending"` \| `"ok"` \| `"error"` |
+| `newid` | UUID запроса к eKassa |
+| `fd_number` | Номер ФД |
+| `ekassa_receipt_id` | ID чека в ответе eKassa |
+| `message` | Сообщение или текст ошибки |
+| `fields` | Словарь полей ФД из API |
+| `kkm_reg_number` | РН ККМ (`fields["1037"]`) |
+| `fm_number` | ФМ (`fields["1041"]`) |
+| `fpd` | ФПД (`fields["1077"]`) |
+| `link` | Ссылка для QR / проверки |
+| `ekassa_payload` | При ошибке API (если сохранён) |
 
 ---
 
 ## Рекомендация для UX
 
-1. Если нужен чек сразу с ФД/ФПД/QR — отправляйте **`print_receipt: true`** (ответ дождётся eKassa).
-2. Если важна скорость ответа — **`print_receipt: false`**, затем опрос `GET .../receipt/` или деталь продажи, пока в `ekassa_fiscal` не появится `status: "ok"`.
-3. Для печати «как дубликат» использовать **`ekassa.fields`**, **`link`** (QR), **`fd_number`** / **`ekassa_receipt_id`**.
+1. Чекаут — сразу показывать успех и `sale_id`.
+2. Если нужна печать с ОФД — **`GET`** по **`receipt_print_path`** из ответа (или собрать URL вручную с `wait_ekassa=1&receipt_text=1`).
+3. Пока `wait_ekassa` не вернулся — можно показать индикатор ожидания; по таймауту обработать пустой/частичный `ekassa`.
