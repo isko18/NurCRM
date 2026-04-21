@@ -4710,6 +4710,9 @@ class AnalyticsCardDetailsAPIView(CompanyBranchRestrictedMixin, APIView):
                     created_at__gte=dt_from,
                     created_at__lt=dt_to_excl,
                 )
+                agent_id = (request.query_params.get("agent_id") or "").strip()
+                if agent_id:
+                    qs = qs.filter(agent_id=agent_id)
             else:
                 dt_from = timezone.make_aware(datetime.combine(date_from, datetime.min.time()))
                 dt_to = timezone.make_aware(datetime.combine(date_to, datetime.max.time()))
