@@ -329,7 +329,8 @@ def build_owner_analytics_payload(*, company, branch, period, date_from, date_to
             ZERO_MONEY,
         ),
     )
-    revenue_dec = items_agg["revenue"] or Decimal("0.00")
+    # Выручка = продажи (Sale.total), не сумма строк (чтобы соответствовать "просто продажи − закупка").
+    revenue_dec = sales_amount_dec or Decimal("0.00")
     cogs_dec = items_agg["cogs"] or Decimal("0.00")
     gross_profit_dec = revenue_dec - cogs_dec
     gross_margin_pct = Decimal("0.00")

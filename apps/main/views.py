@@ -3576,6 +3576,31 @@ class OwnerAgentsProductsListAPIView(APIView, CompanyBranchRestrictedMixin):
         )
         base = self._filter_qs_company_branch(base)
 
+        # date filters (optional): ?date_from=YYYY-MM-DD&date_to=YYYY-MM-DD
+        q = getattr(request, "query_params", getattr(request, "GET", {}))
+        date_from_raw = (q.get("date_from") or "").strip()
+        date_to_raw = (q.get("date_to") or "").strip()
+        if date_from_raw or date_to_raw:
+            try:
+                df = _date.fromisoformat(date_from_raw) if date_from_raw else None
+            except Exception:
+                df = None
+            try:
+                dt = _date.fromisoformat(date_to_raw) if date_to_raw else None
+            except Exception:
+                dt = None
+
+            if df or dt:
+                today = timezone.localdate()
+                df = df or dt or today
+                dt = dt or df
+                if df > dt:
+                    df, dt = dt, df
+
+                dt_from = timezone.make_aware(datetime.combine(df, datetime.min.time()))
+                dt_to = timezone.make_aware(datetime.combine(dt, datetime.max.time()))
+                base = base.filter(created_at__range=(dt_from, dt_to))
+
         term = (request.query_params.get("search") or "").strip()
         if term:
             q = (
@@ -4370,7 +4395,7 @@ class AnalyticsCardDetailsAPIView(CompanyBranchRestrictedMixin, APIView):
             qs = ReturnFromAgent.objects.filter(
                 company=company,
                 status=ReturnFromAgent.Status.ACCEPTED,
-            ).select_related("subreal__product")
+            ).select_related("subreal__product", "returned_by")
 
             # Агент видит только свои возвраты; владелец/админ — все
             if not _is_owner_like(request.user):
@@ -4381,8 +4406,40 @@ class AnalyticsCardDetailsAPIView(CompanyBranchRestrictedMixin, APIView):
             else:
                 qs = qs.filter(branch__isnull=True)
 
+            # Клиент берётся из продажи (Sale.client) по этому subreal через последнюю аллокацию.
+            alloc_client_id_subq = (
+                AgentSaleAllocation.objects.filter(
+                    company_id=company.id,
+                    subreal_id=OuterRef("subreal_id"),
+                )
+                .exclude(sale__client_id__isnull=True)
+                .order_by("-created_at")
+                .values("sale__client_id")[:1]
+            )
+            alloc_client_name_subq = (
+                AgentSaleAllocation.objects.filter(
+                    company_id=company.id,
+                    subreal_id=OuterRef("subreal_id"),
+                )
+                .exclude(sale__client_id__isnull=True)
+                .order_by("-created_at")
+                .values("sale__client__full_name")[:1]
+            )
+
             grouped_qs = (
-                qs.values("subreal__product_id", "subreal__product__name")
+                qs.annotate(
+                    client_id=Subquery(alloc_client_id_subq),
+                    client_name=Subquery(alloc_client_name_subq),
+                )
+                .values(
+                    "subreal__product_id",
+                    "subreal__product__name",
+                    "returned_by_id",
+                    "returned_by__first_name",
+                    "returned_by__last_name",
+                    "client_id",
+                    "client_name",
+                )
                 .annotate(
                     qty=Coalesce(Sum("qty"), V(0)),
                     returns_count=Count("id"),
@@ -4393,15 +4450,30 @@ class AnalyticsCardDetailsAPIView(CompanyBranchRestrictedMixin, APIView):
             total_count = grouped_qs.count()
             page = list(grouped_qs[offset: offset + limit])
 
-            items = [
-                {
-                    "product_id": str(r["subreal__product_id"]) if r["subreal__product_id"] else None,
-                    "product_name": r["subreal__product__name"] or "",
-                    "qty": int(r["qty"] or 0),
-                    "returns_count": int(r["returns_count"] or 0),
-                }
-                for r in page
-            ]
+            items = []
+            for r in page:
+                agent_name = (
+                    f"{(r.get('returned_by__first_name') or '').strip()} {(r.get('returned_by__last_name') or '').strip()}".strip()
+                    or "Пользователь"
+                )
+                items.append({
+                    "product_id": str(r["subreal__product_id"]) if r.get("subreal__product_id") else None,
+                    "product_name": r.get("subreal__product__name") or "",
+                    "qty": int(r.get("qty") or 0),
+                    "returns_count": int(r.get("returns_count") or 0),
+                    "agent": {
+                        "id": str(r["returned_by_id"]) if r.get("returned_by_id") else None,
+                        "name": agent_name,
+                    },
+                    "client": (
+                        {
+                            "id": str(r["client_id"]) if r.get("client_id") else None,
+                            "name": r.get("client_name") or "",
+                        }
+                        if r.get("client_id") or r.get("client_name")
+                        else None
+                    ),
+                })
             total_qty = int(
                 (grouped_qs.aggregate(s=Coalesce(Sum("qty"), V(0)))["s"]) or 0
             )
@@ -4798,14 +4870,19 @@ class AnalyticsCardDetailsAPIView(CompanyBranchRestrictedMixin, APIView):
 
             items_qs = SaleItem.objects.filter(sale__in=sales_qs).select_related("product")
 
+            # Выручка = продажи (Sale.total), не сумма строк.
+            # Это соответствует "просто продажи − закупка".
+            sales_total_agg = sales_qs.aggregate(
+                revenue=Coalesce(Sum("total"), zero_money)
+            )
+            rev_t = sales_total_agg["revenue"] or Decimal("0.00")
+
             full_agg = items_qs.aggregate(
-                revenue=Coalesce(Sum(revenue_expr, output_field=money_field), zero_money),
                 cost_of_goods_sold=Coalesce(
                     Sum(F("quantity") * _unit_purchase, output_field=money_field),
                     zero_money,
                 ),
             )
-            rev_t = full_agg["revenue"] or Decimal("0.00")
             cogs_t = full_agg["cost_of_goods_sold"] or Decimal("0.00")
             gp_t = rev_t - cogs_t
             margin_t = (
