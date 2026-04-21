@@ -4491,6 +4491,8 @@ class AnalyticsCardDetailsAPIView(CompanyBranchRestrictedMixin, APIView):
         if not card:
             raise ValidationError({"card": "Required. Example: card=stock_purchase_value"})
 
+        agent_id = (request.query_params.get("agent_id") or "").strip()
+
         # простая пагинация под модалку (не DRF pagination, чтобы фронту было проще)
         limit = _parse_int_nonneg(
             request.query_params.get("limit"), "limit", default=200, maximum=1000
@@ -4607,6 +4609,8 @@ class AnalyticsCardDetailsAPIView(CompanyBranchRestrictedMixin, APIView):
             # Агент видит только свои возвраты; владелец/админ — все
             if not _is_owner_like(request.user):
                 qs = qs.filter(returned_by=request.user)
+            elif agent_id:
+                qs = qs.filter(returned_by_id=agent_id)
 
             if branch is not None:
                 qs = qs.filter(branch=branch)
@@ -4775,6 +4779,8 @@ class AnalyticsCardDetailsAPIView(CompanyBranchRestrictedMixin, APIView):
             qs = Acceptance.objects.filter(company=company)
             if not _is_owner_like(request.user):
                 qs = qs.filter(subreal__agent=request.user)
+            elif agent_id:
+                qs = qs.filter(subreal__agent_id=agent_id)
 
             if _is_owner_like(request.user):
                 dt_from, dt_to_excl = _dt_range(date_from, date_to)
@@ -4847,6 +4853,8 @@ class AnalyticsCardDetailsAPIView(CompanyBranchRestrictedMixin, APIView):
                     created_at__gte=dt_from,
                     created_at__lt=dt_to_excl,
                 )
+                if agent_id:
+                    qs = qs.filter(user_id=agent_id)
             else:
                 dt_from = timezone.make_aware(datetime.combine(date_from, datetime.min.time()))
                 dt_to = timezone.make_aware(datetime.combine(date_to, datetime.max.time()))
@@ -4908,20 +4916,24 @@ class AnalyticsCardDetailsAPIView(CompanyBranchRestrictedMixin, APIView):
         # ----- остатки на руках у агента (как summary в analytics_agent) -----
         if card in ("items_on_hand_qty", "items_on_hand_amount"):
             if _is_owner_like(request.user):
-                return Response({
-                    "card": card,
-                    "branch_id": str(getattr(branch, "id", "")) if branch else None,
-                    "count": 0,
-                    "offset": offset,
-                    "limit": limit,
-                    "totals": {
-                        "qty_on_hand": 0,
-                        "amount": "0.00",
-                    },
-                    "items": [],
-                })
+                if not agent_id:
+                    return Response({
+                        "card": card,
+                        "branch_id": str(getattr(branch, "id", "")) if branch else None,
+                        "count": 0,
+                        "offset": offset,
+                        "limit": limit,
+                        "totals": {
+                            "qty_on_hand": 0,
+                            "amount": "0.00",
+                        },
+                        "items": [],
+                    })
+                agent_obj = get_object_or_404(User.objects.filter(company=company), id=agent_id)
+            else:
+                agent_obj = request.user
 
-            on_hand = _compute_agent_on_hand(company=company, branch=branch, agent=request.user)
+            on_hand = _compute_agent_on_hand(company=company, branch=branch, agent=agent_obj)
             if card == "items_on_hand_qty":
                 rows = list(on_hand["by_product_qty"])
             else:
@@ -4977,6 +4989,8 @@ class AnalyticsCardDetailsAPIView(CompanyBranchRestrictedMixin, APIView):
             # Агент видит только свои продажи; владелец/админ — все
             if not _is_owner_like(request.user):
                 qs = qs.filter(user=request.user)
+            elif agent_id:
+                qs = qs.filter(user_id=agent_id)
 
             if branch is not None:
                 qs = qs.filter(branch=branch)
@@ -5050,6 +5064,8 @@ class AnalyticsCardDetailsAPIView(CompanyBranchRestrictedMixin, APIView):
                     created_at__gte=dt_from,
                     created_at__lt=dt_to_excl,
                 )
+                if agent_id:
+                    sales_qs = sales_qs.filter(user_id=agent_id)
             else:
                 dt_from = timezone.make_aware(datetime.combine(date_from, datetime.min.time()))
                 dt_to = timezone.make_aware(datetime.combine(date_to, datetime.max.time()))
