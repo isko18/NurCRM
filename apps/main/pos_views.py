@@ -297,6 +297,17 @@ def _build_physical_receipt_text(sale, *, payment_method=None, cash_received=Non
     return "\n".join(lines)
 
 
+def _sync_ekassa_for_receipt_print(sale) -> None:
+    """После commit продажи: синхронная фискализация (для печати чека с реквизитами eKassa)."""
+    if getattr(sale, "payment_method", None) == Sale.PaymentMethod.DEBT:
+        return
+    if getattr(sale, "status", None) != Sale.Status.PAID:
+        return
+    from apps.ekassa.sale_bridge import try_fiscalize_pos_sale
+
+    try_fiscalize_pos_sale(sale.pk)
+
+
 def _cart_queryset_for_response():
     image_qs = ProductImage.objects.only("id", "product_id", "image", "alt", "is_primary").order_by("id")
     item_qs = (
@@ -1636,100 +1647,102 @@ class SaleAddItemAPIView(MarketCashierOnlyMixin, APIView):
 class SaleCheckoutAPIView(MarketCashierOnlyMixin, APIView):
     permission_classes = [permissions.IsAuthenticated]
 
-    @transaction.atomic
     def post(self, request, pk, *args, **kwargs):
-        cart = get_object_or_404(
-            Cart.objects.select_related("company", "branch", "user", "shift"),
-            id=pk,
-            company=request.user.company,
-            status=Cart.Status.ACTIVE,
-        )
-
-        ser = CheckoutSerializer(data=request.data, context={"request": request, "cart": cart})
-        ser.is_valid(raise_exception=True)
-
-        print_receipt = ser.validated_data["print_receipt"]
-        allow_minus = bool(ser.validated_data.get("allow_minus"))
-        can_minus = allow_minus and _is_owner_like(request.user)
-        client_id = ser.validated_data.get("client_id")
-        payment_method = ser.validated_data.get("payment_method") or Sale.PaymentMethod.CASH
-        cash_received = ser.validated_data.get("cash_received") or Decimal("0.00")
-        cashbox_id = ser.validated_data.get("cashbox_id")
-
-        if not cart.shift_id:
-            company = cart.company
-            branch = getattr(cart, "branch", None)
-            cashbox = _resolve_pos_cashbox(company, branch, cashbox_id=cashbox_id)
-            if not cashbox and not cashbox_id:
-                shift = _find_open_shift_for_cashier(company=company, cashier=request.user, branch=branch)
-                if shift:
-                    cashbox = shift.cashbox
-                    branch = shift.branch
-                else:
-                    raise ValidationError({"detail": "Нет кассы для этого филиала. Создай Cashbox."})
-            elif not cashbox:
-                raise ValidationError({"detail": "Нет кассы для этого филиала. Создай Cashbox."})
-
-            shift = _find_open_shift_for_cashier(company=company, cashier=request.user, cashbox=cashbox)
-            if not shift and not cashbox_id:
-                shift = _find_open_shift_for_cashier(company=company, cashier=request.user, branch=branch)
-                if shift:
-                    cashbox = shift.cashbox
-                    branch = shift.branch
-
-            if not shift:
-                raise ValidationError(
-                    {"detail": "Смена не открыта. Сначала откройте смену на кассе, затем завершите продажу."}
-                )
-            cart.shift = shift
-            if (branch or shift.branch) and cart.branch_id != getattr(shift.branch, "id", None):
-                cart.branch = branch or shift.branch
-                cart.save(update_fields=["shift", "branch"])
-            else:
-                cart.save(update_fields=["shift"])
-
-        cart.recalc()
-        if payment_method == Sale.PaymentMethod.CASH and cash_received < cart.total:
-            return Response(
-                {"detail": "Сумма, полученная наличными, меньше суммы продажи."},
-                status=status.HTTP_400_BAD_REQUEST,
+        with transaction.atomic():
+            cart = get_object_or_404(
+                Cart.objects.select_related("company", "branch", "user", "shift"),
+                id=pk,
+                company=request.user.company,
+                status=Cart.Status.ACTIVE,
             )
 
-        try:
-            sale = checkout_cart(cart, allow_negative_stock=can_minus)
-        except NotEnoughStock as e:
-            return Response({"detail": str(e)}, status=status.HTTP_400_BAD_REQUEST)
-        except ValueError as e:
-            return Response({"detail": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+            ser = CheckoutSerializer(data=request.data, context={"request": request, "cart": cart})
+            ser.is_valid(raise_exception=True)
 
-        if cart.shift_id and sale.shift_id != cart.shift_id:
-            sale.shift_id = cart.shift_id
-            sale.save(update_fields=["shift"])
+            print_receipt = ser.validated_data["print_receipt"]
+            allow_minus = bool(ser.validated_data.get("allow_minus"))
+            can_minus = allow_minus and _is_owner_like(request.user)
+            client_id = ser.validated_data.get("client_id")
+            payment_method = ser.validated_data.get("payment_method") or Sale.PaymentMethod.CASH
+            cash_received = ser.validated_data.get("cash_received") or Decimal("0.00")
+            cashbox_id = ser.validated_data.get("cashbox_id")
 
-        if client_id:
-            client = get_object_or_404(Client, id=client_id, company=request.user.company)
-            sale.client = client
-            sale.save(update_fields=["client"])
+            if not cart.shift_id:
+                company = cart.company
+                branch = getattr(cart, "branch", None)
+                cashbox = _resolve_pos_cashbox(company, branch, cashbox_id=cashbox_id)
+                if not cashbox and not cashbox_id:
+                    shift = _find_open_shift_for_cashier(company=company, cashier=request.user, branch=branch)
+                    if shift:
+                        cashbox = shift.cashbox
+                        branch = shift.branch
+                    else:
+                        raise ValidationError({"detail": "Нет кассы для этого филиала. Создай Cashbox."})
+                elif not cashbox:
+                    raise ValidationError({"detail": "Нет кассы для этого филиала. Создай Cashbox."})
 
-        sale.mark_paid(payment_method=payment_method, cash_received=cash_received)
+                shift = _find_open_shift_for_cashier(company=company, cashier=request.user, cashbox=cashbox)
+                if not shift and not cashbox_id:
+                    shift = _find_open_shift_for_cashier(company=company, cashier=request.user, branch=branch)
+                    if shift:
+                        cashbox = shift.cashbox
+                        branch = shift.branch
 
-        payload = {
-            "sale_id": str(sale.id),
-            "status": sale.status,
-            "subtotal": fmt_money(sale.subtotal),
-            "discount_total": fmt_money(sale.discount_total),
-            "tax_total": fmt_money(sale.tax_total),
-            "total": fmt_money(sale.total),
-            "client": str(sale.client_id) if sale.client_id else None,
-            "client_name": getattr(sale.client, "full_name", None) if sale.client else None,
-            "payment_method": sale.payment_method,
-            "cash_received": fmt_money(sale.cash_received),
-            "change": fmt_money(sale.change),
-            "shift_id": str(sale.shift_id) if sale.shift_id else None,
-            "cashbox_id": str(sale.cashbox_id) if sale.cashbox_id else None,
-        }
+                if not shift:
+                    raise ValidationError(
+                        {"detail": "Смена не открыта. Сначала откройте смену на кассе, затем завершите продажу."}
+                    )
+                cart.shift = shift
+                if (branch or shift.branch) and cart.branch_id != getattr(shift.branch, "id", None):
+                    cart.branch = branch or shift.branch
+                    cart.save(update_fields=["shift", "branch"])
+                else:
+                    cart.save(update_fields=["shift"])
+
+            cart.recalc()
+            if payment_method == Sale.PaymentMethod.CASH and cash_received < cart.total:
+                return Response(
+                    {"detail": "Сумма, полученная наличными, меньше суммы продажи."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            client_obj = None
+            if client_id:
+                client_obj = get_object_or_404(Client, id=client_id, company=request.user.company)
+
+            try:
+                sale = checkout_cart(
+                    cart,
+                    allow_negative_stock=can_minus,
+                    payment_method=payment_method,
+                    cash_received=cash_received,
+                    skip_ekassa_schedule=print_receipt,
+                    client=client_obj,
+                )
+            except NotEnoughStock as e:
+                return Response({"detail": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+            except ValueError as e:
+                return Response({"detail": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+            payload = {
+                "sale_id": str(sale.id),
+                "status": sale.status,
+                "subtotal": fmt_money(sale.subtotal),
+                "discount_total": fmt_money(sale.discount_total),
+                "tax_total": fmt_money(sale.tax_total),
+                "total": fmt_money(sale.total),
+                "client": str(sale.client_id) if sale.client_id else None,
+                "client_name": getattr(sale.client, "full_name", None) if sale.client else None,
+                "payment_method": sale.payment_method,
+                "cash_received": fmt_money(sale.cash_received),
+                "change": fmt_money(sale.change),
+                "shift_id": str(sale.shift_id) if sale.shift_id else None,
+                "cashbox_id": str(sale.cashbox_id) if sale.cashbox_id else None,
+            }
 
         if print_receipt:
+            _sync_ekassa_for_receipt_print(sale)
+            sale.refresh_from_db()
             payload["receipt_text"] = _build_physical_receipt_text(
                 sale,
                 payment_method=sale.payment_method,
@@ -1741,6 +1754,8 @@ class SaleCheckoutAPIView(MarketCashierOnlyMixin, APIView):
         hint = _ekassa_checkout_hint(sale.company)
         if hint:
             payload["ekassa"] = hint
+        if print_receipt and getattr(sale, "ekassa_fiscal", None):
+            payload["ekassa"] = sale.ekassa_fiscal
 
         return Response(payload, status=status.HTTP_201_CREATED)
 
@@ -2909,99 +2924,109 @@ class AgentSaleAddCustomItemAPIView(MarketCashierOnlyMixin, CompanyBranchRestric
 class AgentSaleCheckoutAPIView(MarketCashierOnlyMixin, CompanyBranchRestrictedMixin, APIView):
     permission_classes = [permissions.IsAuthenticated]
 
-    @transaction.atomic
     def post(self, request, pk, *args, **kwargs):
-        company = self._company() or request.user.company
-        branch = self._auto_branch()
+        with transaction.atomic():
+            company = self._company() or request.user.company
+            branch = self._auto_branch()
 
-        cart_qs = Cart.objects.filter(id=pk, company=company, status=Cart.Status.ACTIVE)
-        if hasattr(Cart, "branch"):
-            cart_qs = cart_qs.filter(branch=branch) if branch is not None else cart_qs.filter(branch__isnull=True)
-        cart = get_object_or_404(cart_qs)
+            cart_qs = Cart.objects.filter(id=pk, company=company, status=Cart.Status.ACTIVE)
+            if hasattr(Cart, "branch"):
+                cart_qs = cart_qs.filter(branch=branch) if branch is not None else cart_qs.filter(branch__isnull=True)
+            cart = get_object_or_404(cart_qs)
 
-        ser = AgentCheckoutSerializer(data=request.data)
-        ser.is_valid(raise_exception=True)
+            ser = AgentCheckoutSerializer(data=request.data)
+            ser.is_valid(raise_exception=True)
 
-        print_receipt = ser.validated_data["print_receipt"]
-        allow_minus = bool(ser.validated_data.get("allow_minus"))
-        can_minus = allow_minus and _is_owner_like(request.user)
-        client_id = ser.validated_data.get("client_id")
-        payment_method = ser.validated_data.get("payment_method") or Sale.PaymentMethod.CASH
-        cash_received = ser.validated_data.get("cash_received") or Decimal("0.00")
-        cashbox_id = ser.validated_data.get("cashbox_id")  # опционально
+            print_receipt = ser.validated_data["print_receipt"]
+            allow_minus = bool(ser.validated_data.get("allow_minus"))
+            can_minus = allow_minus and _is_owner_like(request.user)
+            client_id = ser.validated_data.get("client_id")
+            payment_method = ser.validated_data.get("payment_method") or Sale.PaymentMethod.CASH
+            cash_received = ser.validated_data.get("cash_received") or Decimal("0.00")
+            cashbox_id = ser.validated_data.get("cashbox_id")  # опционально
 
-        resolved_client = None
-        if client_id:
-            resolved_client = get_object_or_404(Client, id=client_id, company=company)
-            if hasattr(cart, "client_id"):
-                cart.client = resolved_client
-                cart.save(update_fields=["client"])
+            resolved_client = None
+            if client_id:
+                resolved_client = get_object_or_404(Client, id=client_id, company=company)
+                if hasattr(cart, "client_id"):
+                    cart.client = resolved_client
+                    cart.save(update_fields=["client"])
 
-        acting_agent = _resolve_acting_agent(request, cart, allow_owner_override=True)
-        use_main_stock = _should_use_main_stock_in_agent_sale(user=request.user, acting_agent=acting_agent)
+            acting_agent = _resolve_acting_agent(request, cart, allow_owner_override=True)
+            use_main_stock = _should_use_main_stock_in_agent_sale(user=request.user, acting_agent=acting_agent)
 
-        cart.recalc()
-        if payment_method == Sale.PaymentMethod.CASH and cash_received < cart.total:
-            raise ValidationError({"detail": "Сумма, полученная наличными, меньше суммы продажи."})
+            cart.recalc()
+            if payment_method == Sale.PaymentMethod.CASH and cash_received < cart.total:
+                raise ValidationError({"detail": "Сумма, полученная наличными, меньше суммы продажи."})
 
-        # ✅ ВАЖНО: checkout_agent_cart должен НЕ требовать shift
-        try:
-            sale = checkout_agent_cart(
-                cart,
-                agent=acting_agent,
-                use_main_stock=use_main_stock,
-                allow_negative_stock=bool(can_minus and use_main_stock),
-                cashbox_id=cashbox_id,  # можно сохранить кассу в Sale, но без смен
-                payment_method=payment_method,
-                cash_received=cash_received,
-                client=resolved_client,
-            )
-        except Exception as e:
-            raise ValidationError({"detail": str(e)})
+            # ✅ ВАЖНО: checkout_agent_cart должен НЕ требовать shift
+            try:
+                sale = checkout_agent_cart(
+                    cart,
+                    agent=acting_agent,
+                    use_main_stock=use_main_stock,
+                    allow_negative_stock=bool(can_minus and use_main_stock),
+                    cashbox_id=cashbox_id,  # можно сохранить кассу в Sale, но без смен
+                    client=resolved_client,
+                )
+            except Exception as e:
+                raise ValidationError({"detail": str(e)})
 
-        # ✅ гарантируем, что смены нет
-        if getattr(sale, "shift_id", None):
-            sale.shift = None
-            sale.save(update_fields=["shift"])
+            # ✅ гарантируем, что смены нет
+            if getattr(sale, "shift_id", None):
+                sale.shift = None
+                sale.save(update_fields=["shift"])
 
-        # отмечаем оплату
-        if hasattr(sale, "mark_paid") and callable(sale.mark_paid):
-            if sale.status != Sale.Status.PAID:
-                sale.mark_paid(payment_method=payment_method, cash_received=cash_received)
-        else:
-            updates = []
-            if hasattr(sale, "payment_method"):
-                sale.payment_method = payment_method
-                updates.append("payment_method")
-            if hasattr(sale, "cash_received"):
-                sale.cash_received = cash_received
-                updates.append("cash_received")
-            if hasattr(sale, "paid_at") and not sale.paid_at:
-                sale.paid_at = timezone.now()
-                updates.append("paid_at")
-            if hasattr(sale, "status") and sale.status != Sale.Status.PAID:
-                sale.status = Sale.Status.PAID
-                updates.append("status")
-            if updates:
-                sale.save(update_fields=updates)
+            pm = payment_method or Sale.PaymentMethod.CASH
+            cr = cash_received
+            if pm == Sale.PaymentMethod.CASH:
+                if cr is None:
+                    cr = sale.total
+            else:
+                cr = Decimal("0.00")
 
-        payload = {
-            "sale_id": str(sale.id),
-            "status": sale.status,
-            "subtotal": f"{sale.subtotal:.2f}",
-            "discount_total": f"{sale.discount_total:.2f}",
-            "tax_total": f"{sale.tax_total:.2f}",
-            "total": f"{sale.total:.2f}",
-            "client": str(sale.client_id) if sale.client_id else None,
-            "client_name": getattr(sale.client, "full_name", None) if sale.client else None,
-            "payment_method": getattr(sale, "payment_method", payment_method),
-            "cash_received": f"{getattr(sale, 'cash_received', cash_received):.2f}",
-            "change": f"{getattr(sale, 'change', Decimal('0.00')):.2f}",
-            "shift_id": None,  # ✅ нет смен у агента
-            "cashbox_id": str(getattr(sale, "cashbox_id", None)) if getattr(sale, "cashbox_id", None) else None,
-        }
+            if hasattr(sale, "mark_paid") and callable(sale.mark_paid):
+                sale.mark_paid(
+                    payment_method=pm,
+                    cash_received=cr,
+                    skip_ekassa_schedule=print_receipt,
+                )
+            else:
+                updates = []
+                if hasattr(sale, "payment_method"):
+                    sale.payment_method = pm
+                    updates.append("payment_method")
+                if hasattr(sale, "cash_received"):
+                    sale.cash_received = cr
+                    updates.append("cash_received")
+                if hasattr(sale, "paid_at") and not sale.paid_at:
+                    sale.paid_at = timezone.now()
+                    updates.append("paid_at")
+                if hasattr(sale, "status") and sale.status != Sale.Status.PAID:
+                    sale.status = Sale.Status.PAID
+                    updates.append("status")
+                if updates:
+                    sale.save(update_fields=updates)
+
+            payload = {
+                "sale_id": str(sale.id),
+                "status": sale.status,
+                "subtotal": f"{sale.subtotal:.2f}",
+                "discount_total": f"{sale.discount_total:.2f}",
+                "tax_total": f"{sale.tax_total:.2f}",
+                "total": f"{sale.total:.2f}",
+                "client": str(sale.client_id) if sale.client_id else None,
+                "client_name": getattr(sale.client, "full_name", None) if sale.client else None,
+                "payment_method": getattr(sale, "payment_method", payment_method),
+                "cash_received": f"{getattr(sale, 'cash_received', cash_received):.2f}",
+                "change": f"{getattr(sale, 'change', Decimal('0.00')):.2f}",
+                "shift_id": None,  # ✅ нет смен у агента
+                "cashbox_id": str(getattr(sale, "cashbox_id", None)) if getattr(sale, "cashbox_id", None) else None,
+            }
 
         if print_receipt:
+            _sync_ekassa_for_receipt_print(sale)
+            sale.refresh_from_db()
             payload["receipt_text"] = _build_physical_receipt_text(
                 sale,
                 payment_method=getattr(sale, "payment_method", payment_method),
@@ -3013,6 +3038,8 @@ class AgentSaleCheckoutAPIView(MarketCashierOnlyMixin, CompanyBranchRestrictedMi
         hint = _ekassa_checkout_hint(sale.company)
         if hint:
             payload["ekassa"] = hint
+        if print_receipt and getattr(sale, "ekassa_fiscal", None):
+            payload["ekassa"] = sale.ekassa_fiscal
 
         return Response(payload, status=status.HTTP_201_CREATED)
 

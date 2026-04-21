@@ -100,8 +100,6 @@ def checkout_agent_cart(
     use_main_stock=False,
     allow_negative_stock: bool = False,
     cashbox_id=None,
-    payment_method=None,
-    cash_received=None,
     client=None,
 ):
     """
@@ -355,29 +353,7 @@ def checkout_agent_cart(
     sale.total = cart.total if cart.total > 0 else Decimal("0.00")
     sale.save(update_fields=["subtotal", "discount_total", "tax_total", "total"])
 
-    pm = payment_method or (getattr(Sale, "PaymentMethod", None) and Sale.PaymentMethod.CASH) or "cash"
-    if pm == getattr(Sale.PaymentMethod, "CASH", "cash"):
-        if cash_received is None:
-            cash_received = sale.total
-    else:
-        cash_received = Decimal("0.00")
-
-    if hasattr(sale, "mark_paid") and callable(getattr(sale, "mark_paid")):
-        sale.mark_paid(payment_method=pm, cash_received=cash_received)
-    else:
-        updates = []
-        if model_has_field(Sale, "payment_method"):
-            sale.payment_method = pm
-            updates.append("payment_method")
-        if model_has_field(Sale, "cash_received"):
-            sale.cash_received = cash_received
-            updates.append("cash_received")
-        if model_has_field(Sale, "paid_at"):
-            sale.paid_at = timezone.now()
-            updates.append("paid_at")
-        sale.status = Sale.Status.PAID
-        updates.append("status")
-        sale.save(update_fields=updates)
+    # Оплата — в POS-вьюхе через ``sale.mark_paid()`` (как обычная касса с ``checkout_cart``).
 
     # --- 7) закрываем корзину ---
     cart.status = cart.Status.CHECKED_OUT

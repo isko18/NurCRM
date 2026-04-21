@@ -1,7 +1,8 @@
 """
 Отправка оплаченной продажи (main.Sale) в eKassa после commit транзакции.
 
-Вызывается из Sale.mark_paid() через schedule_after_commit (фон после commit) — после checkout_cart и mark_paid.
+Вызывается из Sale.mark_paid() через schedule_after_commit (фон после commit) или синхронно из POS
+при печати чека — после checkout_cart и mark_paid.
 """
 from __future__ import annotations
 

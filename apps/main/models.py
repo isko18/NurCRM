@@ -1898,7 +1898,7 @@ class Sale(models.Model):
             return Decimal("0.00")
         return diff.quantize(_Q2, rounding=ROUND_HALF_UP)
 
-    def mark_paid(self, payment_method=None, cash_received=None):
+    def mark_paid(self, payment_method=None, cash_received=None, *, skip_ekassa_schedule=False):
         if payment_method is not None:
             self.payment_method = payment_method
 
@@ -1924,6 +1924,9 @@ class Sale(models.Model):
         self.status = Sale.Status.PAID
         self.paid_at = timezone.now()
         self.save(update_fields=["status", "paid_at", "payment_method", "cash_received"])
+
+        if skip_ekassa_schedule:
+            return
 
         sale_pk = self.pk
 

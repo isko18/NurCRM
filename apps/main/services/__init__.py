@@ -18,12 +18,21 @@ class NotEnoughStock(Exception):
 
 
 @transaction.atomic
-def checkout_cart(cart: Cart, department=None, allow_negative_stock: bool = False) -> Sale:
+def checkout_cart(
+    cart: Cart,
+    department=None,
+    allow_negative_stock: bool = False,
+    *,
+    payment_method=None,
+    cash_received=None,
+    skip_ekassa_schedule: bool = False,
+    client=None,
+) -> Sale:
     """
     Перенос корзины в Sale (статус NEW) и списание остатков.
 
-    Оплата — через ``sale.mark_paid()`` в POS-вьюхе. После успешной оплаты (не «долг»)
-    ``mark_paid`` ставит в очередь фискализацию eKassa в фоне (после commit, без ожидания HTTP к OFD).
+    Если переданы ``payment_method`` / ``cash_received``, в конце вызывается ``sale.mark_paid(...)``
+    (оплата и eKassa: ``skip_ekassa_schedule`` — см. ``SaleCheckoutAPIView`` при ``print_receipt``).
     """
     cart.recalc()
 
@@ -138,6 +147,21 @@ def checkout_cart(cart: Cart, department=None, allow_negative_stock: bool = Fals
     CartItem.objects.filter(cart=cart).delete()
     cart.status = Cart.Status.CHECKED_OUT
     cart.save(update_fields=["status", "updated_at"])
+
+    if getattr(cart, "shift_id", None) and sale.shift_id != cart.shift_id:
+        sale.shift_id = cart.shift_id
+        sale.save(update_fields=["shift"])
+
+    if client is not None:
+        sale.client = client
+        sale.save(update_fields=["client"])
+
+    if payment_method is not None:
+        sale.mark_paid(
+            payment_method=payment_method,
+            cash_received=cash_received,
+            skip_ekassa_schedule=skip_ekassa_schedule,
+        )
 
     return sale
 
