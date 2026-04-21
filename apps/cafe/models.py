@@ -832,6 +832,7 @@ class Order(models.Model):
     )
     guests = models.PositiveIntegerField('Количество гостей', default=1, validators=[MinValueValidator(1)])
     created_at = models.DateTimeField('Создано', auto_now_add=True)
+    comment = models.TextField("Комментарий", blank=True, default="")
     status = models.CharField(
         "Статус", max_length=16, choices=Status.choices, default=Status.OPEN, db_index=True
     )

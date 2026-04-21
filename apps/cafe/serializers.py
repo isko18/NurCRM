@@ -862,6 +862,7 @@ class OrderSerializer(CompanyBranchReadOnlyMixin):
         fields = [
             "id", "company", "branch", "table", "client", "waiter", "guests", "created_at",
             "table_session_id", "check_label",
+            "comment",
             "status", "is_paid", "paid_at", "payment_method", "total_amount", "discount_amount",
             "paid_amount", "refunded_amount", "net_paid_amount", "has_refunds", "is_fully_refunded",
             "balance_due", "cash_shift_id",
