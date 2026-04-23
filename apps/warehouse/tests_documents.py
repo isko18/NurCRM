@@ -213,3 +213,18 @@ class DocumentsTests(TestCase):
                 services.post_document(doc)
         finally:
             settings.ALLOW_NEGATIVE_STOCK = old
+
+    def test_commercial_offer_creates_and_cannot_be_posted(self):
+        doc = models.Document.objects.create(
+            doc_type=models.Document.DocType.COMMERCIAL_OFFER,
+            warehouse_from=self.wh,
+        )
+        models.DocumentItem.objects.create(document=doc, product=self.prod, qty=Decimal("2"), price=Decimal("15"))
+
+        # totals can be recalculated for quotation
+        services.recalc_document_totals(doc)
+        doc.refresh_from_db()
+        self.assertEqual(doc.total, Decimal("30.00"))
+
+        with self.assertRaises(Exception):
+            services.post_document(doc)

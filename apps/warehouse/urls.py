@@ -39,7 +39,7 @@ from .views_documents import (
     DocumentSaleListCreateView, DocumentPurchaseListCreateView,
     DocumentSaleReturnListCreateView, DocumentPurchaseReturnListCreateView,
     DocumentInventoryListCreateView, DocumentReceiptListCreateView,
-    DocumentWriteOffListCreateView, DocumentTransferListCreateView,
+    DocumentWriteOffListCreateView, DocumentCommercialOfferListCreateView, DocumentTransferListCreateView,
 )
 from .views_money import (
     CashRegisterListCreateView,
@@ -158,6 +158,7 @@ urlpatterns += [
     path("documents/inventory/", DocumentInventoryListCreateView.as_view(), name="warehouse-documents-inventory"),
     path("documents/receipt/", DocumentReceiptListCreateView.as_view(), name="warehouse-documents-receipt"),
     path("documents/write-off/", DocumentWriteOffListCreateView.as_view(), name="warehouse-documents-write-off"),
+    path("documents/commercial-offer/", DocumentCommercialOfferListCreateView.as_view(), name="warehouse-documents-commercial-offer"),
     path("documents/transfer/", DocumentTransferListCreateView.as_view(), name="warehouse-documents-transfer"),
     path("documents/<uuid:pk>/", DocumentDetailView.as_view(), name="warehouse-document-detail"),
     path("documents/<uuid:pk>/post/", DocumentPostView.as_view(), name="warehouse-document-post"),

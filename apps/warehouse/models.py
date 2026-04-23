@@ -1038,6 +1038,7 @@ class DocumentSequence(models.Model):
 
 class Document(models.Model):
     class DocType(models.TextChoices):
+        COMMERCIAL_OFFER = "COMMERCIAL_OFFER", "Коммерческое предложение"
         SALE = "SALE", "Продажа"
         PURCHASE = "PURCHASE", "Покупка"
         SALE_RETURN = "SALE_RETURN", "Возврат продажи"
@@ -1151,6 +1152,15 @@ class Document(models.Model):
         prepayment = Decimal(getattr(self, "prepayment_amount", None) or 0)
         if prepayment < 0:
             raise ValidationError({"prepayment_amount": "Предоплата не может быть отрицательной."})
+
+        if self.doc_type == self.DocType.COMMERCIAL_OFFER:
+            # Коммерческое предложение — только расчет, без проведения/остатков/кассы.
+            if not self.warehouse_from:
+                raise ValidationError("Document requires warehouse_from")
+            if prepayment > 0:
+                raise ValidationError({"prepayment_amount": "Предоплата недоступна для коммерческого предложения."})
+            # payment_kind не имеет смысла; оставляем как есть, но не валидируем дальше.
+            return
 
         if self.doc_type == self.DocType.TRANSFER:
             if not self.warehouse_from or not self.warehouse_to:
@@ -1777,9 +1787,6 @@ class MoneyDocument(BaseModelCompanyBranch):
             raise ValidationError({"cash_register": "Касса принадлежит другой компании."})
 
         if self.doc_type in (self.DocType.MONEY_RECEIPT, self.DocType.MONEY_EXPENSE):
-            # Для авто-документов из склада контрагент может отсутствовать (например WRITE_OFF/RECEIPT).
-            if not self.counterparty_id and not self.source_document_id:
-                raise ValidationError({"counterparty": "Укажите контрагента."})
             # Категория обязательна только для денежных документов, созданных вручную (без складского основания).
             if not self.payment_category_id and not self.source_document_id:
                 raise ValidationError({"payment_category": "Укажите категорию платежа."})

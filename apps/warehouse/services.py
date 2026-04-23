@@ -270,6 +270,9 @@ def post_document(document: models.Document, allow_negative: bool = None) -> mod
     if document.status in (document.Status.CASH_PENDING, document.Status.POSTED):
         raise ValueError("Document already posted")
 
+    if document.doc_type == document.DocType.COMMERCIAL_OFFER:
+        raise ValueError("Commercial offer cannot be posted")
+
     if not document.items.exists():
         raise ValueError("Cannot post empty document")
     

@@ -167,6 +167,13 @@ class DocumentWriteOffListCreateView(_DocumentTypedListCreateView):
     DOC_TYPE = models.Document.DocType.WRITE_OFF
 
 
+class DocumentCommercialOfferListCreateView(_DocumentTypedListCreateView):
+    """
+    Коммерческие предложения (без проведения/остатков).
+    """
+    DOC_TYPE = models.Document.DocType.COMMERCIAL_OFFER
+
+
 class DocumentTransferListCreateView(_DocumentTypedListCreateView):
     """
     Документы перемещения. При создании автоматически проводится —
