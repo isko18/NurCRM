@@ -98,6 +98,28 @@ def _money_str(x) -> str:
         return str(x)
 
 
+def _period_iso(p) -> str:
+    """
+    Normalize TruncDate/TruncWeek/TruncMonth result to ISO date string.
+    """
+    if p is None:
+        return ""
+    try:
+        # TruncWeek/TruncMonth usually return datetime
+        if hasattr(p, "date"):
+            d = p.date()
+            if hasattr(d, "isoformat"):
+                return d.isoformat()
+    except Exception:
+        pass
+    try:
+        if hasattr(p, "isoformat"):
+            return p.isoformat()
+    except Exception:
+        pass
+    return str(p)
+
+
 # Сальдо с контрагентом (как в сверке / views_reconciliation): дебет увеличивает долг контрагента перед компанией.
 _CP_DOC_DEBIT_TYPES = frozenset(
     {
@@ -468,7 +490,7 @@ def build_agent_warehouse_analytics_payload(
     )
     requests_by_date = [
         {
-            "date": row["period"],
+            "date": _period_iso(row["period"]),
             "carts_approved": row["carts_approved"],
             "items_approved": row["items_approved"],
         }
@@ -488,7 +510,7 @@ def build_agent_warehouse_analytics_payload(
     )
     sales_by_date = [
         {
-            "date": row["period"],
+            "date": _period_iso(row["period"]),
             "sales_count": row["sales_count"],
             "sales_amount": _money_str(row["sales_amount"]),
         }
@@ -613,7 +635,7 @@ def build_owner_warehouse_analytics_payload(
     )
     sales_by_date = [
         {
-            "date": row["period"],
+            "date": _period_iso(row["period"]),
             "sales_count": row["sales_count"],
             "sales_amount": _money_str(row["sales_amount"]),
         }
