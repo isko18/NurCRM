@@ -958,6 +958,37 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
             return None
         return value
 
+    def validate_plu(self, value):
+        """
+        PLU должен быть уникален в рамках компании (если задан).
+        """
+        if value in (None, ""):
+            return None
+
+        try:
+            value_int = int(value)
+        except Exception:
+            raise serializers.ValidationError("PLU должен быть числом.")
+
+        if value_int < 1:
+            raise serializers.ValidationError("PLU должен быть больше 0.")
+
+        company_id = getattr(getattr(self.instance, "company", None), "id", None)
+        if not company_id:
+            company_id = getattr(self.instance, "company_id", None)
+
+        # для create company может быть проставлена позже — тогда не валидируем тут
+        if not company_id:
+            return value_int
+
+        qs = Product.objects.filter(company_id=company_id, plu=value_int)
+        if self.instance is not None:
+            qs = qs.exclude(pk=self.instance.pk)
+        if qs.exists():
+            raise serializers.ValidationError("Этот PLU уже используется в вашей компании.")
+
+        return value_int
+
     def validate(self, attrs):
         data = self.initial_data if isinstance(getattr(self, "initial_data", None), dict) else {}
         promo_in = "promotion_rules_input" in data or "promotion_rules" in data
