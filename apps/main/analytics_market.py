@@ -1874,6 +1874,18 @@ class AnalyticsView(APIView):
         """
         limit_param = request.query_params.get("limit")
         limit = int(limit_param) if limit_param and limit_param.isdigit() else None
+        qp = request.query_params
+
+        purchase_raw_from = (qp.get("purchase_date_from") or qp.get("procurement_date_from") or "").strip() or None
+        purchase_raw_to = (qp.get("purchase_date_to") or qp.get("procurement_date_to") or "").strip() or None
+        purchase_df = _parse_dt(purchase_raw_from) if purchase_raw_from else None
+        purchase_dt = _parse_dt(purchase_raw_to) if purchase_raw_to else None
+        if purchase_df and timezone.is_naive(purchase_df):
+            purchase_df = timezone.make_aware(purchase_df, timezone.get_current_timezone())
+        if purchase_dt and timezone.is_naive(purchase_dt):
+            purchase_dt = timezone.make_aware(purchase_dt, timezone.get_current_timezone())
+        if purchase_dt and purchase_raw_to and len(purchase_raw_to) == 10:
+            purchase_dt = purchase_dt + timedelta(days=1)
 
         def _dec_qty(v) -> Decimal:
             if isinstance(v, Decimal):
@@ -1929,6 +1941,11 @@ class AnalyticsView(APIView):
         )
         if branch is not None and _model_has_field(Client, "branch"):
             p_sup = p_sup.filter(Q(client__branch=branch) | Q(client__branch__isnull=True))
+        if (purchase_df or purchase_dt) and _model_has_field(Product, "date"):
+            if purchase_df:
+                p_sup = p_sup.filter(date__gte=purchase_df)
+            if purchase_dt:
+                p_sup = p_sup.filter(date__lt=purchase_dt)
 
         qty_field = "quantity" if _model_has_field(Product, "quantity") else None
         pp_field = "purchase_price" if _model_has_field(Product, "purchase_price") else None
@@ -2101,6 +2118,8 @@ class AnalyticsView(APIView):
             "filters": {
                 "branch": str(getattr(branch, "id", "")) if branch else None,
                 "limit": limit,
+                "purchase_date_from": purchase_raw_from,
+                "purchase_date_to": purchase_raw_to,
             },
             "cards": {
                 "suppliers_count": n_sup,
