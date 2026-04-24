@@ -528,7 +528,7 @@ class DishIngredientProcessingSerializer(serializers.ModelSerializer):
         read_only_fields = ["id", "ingredient", "processing_type_name", "charge_type", "rate", "cost"]
 
 
-class DishIngredientSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
+class DishIngredientSerializer(serializers.ModelSerializer):
     product_title = serializers.CharField(source="product.title", read_only=True)
     preparation_name = serializers.CharField(source="preparation.name", read_only=True)
     processings = DishIngredientProcessingSerializer(many=True, read_only=True)
@@ -554,12 +554,37 @@ class DishIngredientSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSeri
             "processings",
         ]
 
+    def _user_company(self):
+        request = self.context.get("request")
+        user = getattr(request, "user", None) if request else None
+        return getattr(user, "company", None) or getattr(user, "owned_company", None)
+
     def get_fields(self):
         fields = super().get_fields()
-        # используем request из context (CompanyBranchReadOnlyMixin)
-        fields["dish"].queryset = _scope_queryset_by_context(MenuItem.objects.all(), self)
-        fields["product"].queryset = _scope_queryset_by_context(Warehouse.objects.all(), self)
-        fields["preparation"].queryset = _scope_queryset_by_context(Preparation.objects.all(), self)
+        company = self._user_company()
+        request = self.context.get("request")
+        active_branch = getattr(request, "branch", None) if request else None
+
+        if company:
+            dish_qs = MenuItem.objects.filter(company=company)
+            prod_qs = Warehouse.objects.filter(company=company)
+            prep_qs = Preparation.objects.filter(company=company)
+            if active_branch is not None:
+                dish_qs = dish_qs.filter(Q(branch=active_branch) | Q(branch__isnull=True))
+                prod_qs = prod_qs.filter(Q(branch=active_branch) | Q(branch__isnull=True))
+                prep_qs = prep_qs.filter(Q(branch=active_branch) | Q(branch__isnull=True))
+            else:
+                dish_qs = dish_qs.filter(branch__isnull=True)
+                prod_qs = prod_qs.filter(branch__isnull=True)
+                prep_qs = prep_qs.filter(branch__isnull=True)
+            fields["dish"].queryset = dish_qs
+            fields["product"].queryset = prod_qs
+            fields["preparation"].queryset = prep_qs
+        else:
+            fields["dish"].queryset = MenuItem.objects.none()
+            fields["product"].queryset = Warehouse.objects.none()
+            fields["preparation"].queryset = Preparation.objects.none()
+
         fields["product"].required = False
         fields["product"].allow_null = True
         fields["preparation"].required = False
@@ -586,16 +611,36 @@ class DishIngredientSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSeri
         return attrs
 
 
-class DishIngredientProcessingCreateSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
+class DishIngredientProcessingCreateSerializer(serializers.ModelSerializer):
     class Meta:
         model = DishIngredientProcessing
         fields = ["id", "ingredient", "processing_type"]
         read_only_fields = ["id"]
 
+    def _user_company(self):
+        request = self.context.get("request")
+        user = getattr(request, "user", None) if request else None
+        return getattr(user, "company", None) or getattr(user, "owned_company", None)
+
     def get_fields(self):
         fields = super().get_fields()
-        fields["ingredient"].queryset = _scope_queryset_by_context(DishIngredient.objects.all(), self)
-        fields["processing_type"].queryset = _scope_queryset_by_context(ProcessingType.objects.all(), self)
+        company = self._user_company()
+        request = self.context.get("request")
+        active_branch = getattr(request, "branch", None) if request else None
+        if company:
+            ing_qs = DishIngredient.objects.filter(dish__company=company)
+            pt_qs = ProcessingType.objects.filter(company=company)
+            if active_branch is not None:
+                ing_qs = ing_qs.filter(Q(dish__branch=active_branch) | Q(dish__branch__isnull=True))
+                pt_qs = pt_qs.filter(Q(branch=active_branch) | Q(branch__isnull=True))
+            else:
+                ing_qs = ing_qs.filter(dish__branch__isnull=True)
+                pt_qs = pt_qs.filter(branch__isnull=True)
+            fields["ingredient"].queryset = ing_qs
+            fields["processing_type"].queryset = pt_qs
+        else:
+            fields["ingredient"].queryset = DishIngredient.objects.none()
+            fields["processing_type"].queryset = ProcessingType.objects.none()
         return fields
 
 
