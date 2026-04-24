@@ -15,6 +15,7 @@ from apps.cafe.models import (
     OrderHistory, OrderItemHistory, KitchenTask, NotificationCafe, InventorySession, InventoryItem, Equipment, EquipmentInventoryItem, EquipmentInventorySession, Kitchen,
     CafeReceiptPrinterSettings,
     CafeExpense, CafeWaiterPayProfile,
+    Preparation, ProcessingType, DishIngredient, DishIngredientProcessing,
 )
 from apps.users.models import Branch
 from apps.utils import _is_owner_like
@@ -454,6 +455,185 @@ class IngredientInlineSerializer(serializers.ModelSerializer):
         return attrs
 
 
+class ProcessingTypeSerializer(CompanyBranchReadOnlyMixin):
+    class Meta:
+        model = ProcessingType
+        fields = ["id", "company", "branch", "name", "cost", "charge_type", "unit", "is_active"]
+        read_only_fields = ["id", "company", "branch"]
+
+    def validate(self, attrs):
+        name = (attrs.get("name") or getattr(self.instance, "name", "") or "").strip()
+        if not name:
+            raise serializers.ValidationError({"name": "Название обязательно."})
+        cost = attrs.get("cost", getattr(self.instance, "cost", Decimal("0.00")) if self.instance else Decimal("0.00"))
+        if cost is not None and cost < 0:
+            raise serializers.ValidationError({"cost": "Стоимость не может быть отрицательной."})
+        return attrs
+
+
+class PreparationSerializer(CompanyBranchReadOnlyMixin):
+    source_product_title = serializers.CharField(source="source_product.title", read_only=True)
+    source_product_unit = serializers.CharField(source="source_product.unit", read_only=True)
+    source_product_unit_price = serializers.DecimalField(source="source_product.unit_price", max_digits=12, decimal_places=2, read_only=True)
+
+    class Meta:
+        model = Preparation
+        fields = [
+            "id", "company", "branch",
+            "name",
+            "source_product", "source_product_title", "source_product_unit", "source_product_unit_price",
+            "input_quantity", "input_unit",
+            "output_quantity", "output_unit",
+            "loss_quantity", "loss_percent",
+            "raw_material_cost", "processing_cost", "total_cost", "unit_cost",
+            "stock_quantity",
+            "is_active",
+            "created_at", "updated_at",
+        ]
+        read_only_fields = [
+            "id", "company", "branch",
+            "loss_quantity", "loss_percent",
+            "raw_material_cost", "total_cost", "unit_cost",
+            "created_at", "updated_at",
+        ]
+
+    def get_fields(self):
+        fields = super().get_fields()
+        fields["source_product"].queryset = _scope_queryset_by_context(Warehouse.objects.all(), self)
+        return fields
+
+    def validate(self, attrs):
+        input_q = attrs.get("input_quantity", getattr(self.instance, "input_quantity", None) if self.instance else None)
+        output_q = attrs.get("output_quantity", getattr(self.instance, "output_quantity", None) if self.instance else None)
+        if input_q is not None and input_q <= 0:
+            raise serializers.ValidationError({"input_quantity": "Должно быть больше 0."})
+        if output_q is not None and output_q <= 0:
+            raise serializers.ValidationError({"output_quantity": "Должно быть больше 0."})
+        if input_q is not None and output_q is not None and output_q > input_q:
+            raise serializers.ValidationError({"output_quantity": "Выход не может быть больше входа."})
+        pcost = attrs.get("processing_cost")
+        if pcost is not None and pcost < 0:
+            raise serializers.ValidationError({"processing_cost": "Не может быть отрицательной."})
+        return attrs
+
+
+class DishIngredientProcessingSerializer(serializers.ModelSerializer):
+    processing_type_name = serializers.CharField(source="processing_type.name", read_only=True)
+    charge_type = serializers.CharField(source="processing_type.charge_type", read_only=True)
+    rate = serializers.DecimalField(source="processing_type.cost", max_digits=12, decimal_places=2, read_only=True)
+
+    class Meta:
+        model = DishIngredientProcessing
+        fields = ["id", "ingredient", "processing_type", "processing_type_name", "charge_type", "rate", "cost"]
+        read_only_fields = ["id", "ingredient", "processing_type_name", "charge_type", "rate", "cost"]
+
+
+class DishIngredientSerializer(serializers.ModelSerializer):
+    product_title = serializers.CharField(source="product.title", read_only=True)
+    preparation_name = serializers.CharField(source="preparation.name", read_only=True)
+    processings = DishIngredientProcessingSerializer(many=True, read_only=True)
+
+    class Meta:
+        model = DishIngredient
+        fields = [
+            "id",
+            "dish",
+            "ingredient_type",
+            "product", "product_title",
+            "preparation", "preparation_name",
+            "quantity", "unit",
+            "unit_cost", "ingredient_cost", "processing_cost", "total_cost",
+            "processings",
+            "created_at", "updated_at",
+        ]
+        read_only_fields = [
+            "id",
+            "unit_cost", "ingredient_cost", "processing_cost", "total_cost",
+            "created_at", "updated_at",
+            "product_title", "preparation_name",
+            "processings",
+        ]
+
+    def get_fields(self):
+        fields = super().get_fields()
+        holder = getattr(self, "root", None)
+        if isinstance(holder, CompanyBranchReadOnlyMixin):
+            fields["dish"].queryset = _scope_queryset_by_context(MenuItem.objects.all(), holder)
+            fields["product"].queryset = _scope_queryset_by_context(Warehouse.objects.all(), holder)
+            fields["preparation"].queryset = _scope_queryset_by_context(Preparation.objects.all(), holder)
+        else:
+            fields["dish"].queryset = MenuItem.objects.none()
+            fields["product"].queryset = Warehouse.objects.none()
+            fields["preparation"].queryset = Preparation.objects.none()
+        fields["product"].required = False
+        fields["product"].allow_null = True
+        fields["preparation"].required = False
+        fields["preparation"].allow_null = True
+        return fields
+
+    def validate(self, attrs):
+        qty = attrs.get("quantity", getattr(self.instance, "quantity", None) if self.instance else None)
+        if qty is not None and qty <= 0:
+            raise serializers.ValidationError({"quantity": "Должно быть больше 0."})
+
+        it = attrs.get("ingredient_type", getattr(self.instance, "ingredient_type", None) if self.instance else None)
+        product = attrs.get("product") if "product" in attrs else (getattr(self.instance, "product", None) if self.instance else None)
+        preparation = attrs.get("preparation") if "preparation" in attrs else (getattr(self.instance, "preparation", None) if self.instance else None)
+
+        if it == DishIngredient.IngredientType.PRODUCT:
+            if not product or preparation:
+                raise serializers.ValidationError({"product": "Укажите продукт (и не указывайте заготовку)."})
+        elif it == DishIngredient.IngredientType.PREPARATION:
+            if not preparation or product:
+                raise serializers.ValidationError({"preparation": "Укажите заготовку (и не указывайте продукт)."})
+        else:
+            raise serializers.ValidationError({"ingredient_type": "Некорректный тип."})
+        return attrs
+
+
+class DishIngredientProcessingCreateSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = DishIngredientProcessing
+        fields = ["id", "ingredient", "processing_type"]
+        read_only_fields = ["id"]
+
+    def get_fields(self):
+        fields = super().get_fields()
+        holder = getattr(self, "root", None)
+        if isinstance(holder, CompanyBranchReadOnlyMixin):
+            fields["ingredient"].queryset = _scope_queryset_by_context(DishIngredient.objects.all(), holder)
+            fields["processing_type"].queryset = _scope_queryset_by_context(ProcessingType.objects.all(), holder)
+        else:
+            fields["ingredient"].queryset = DishIngredient.objects.none()
+            fields["processing_type"].queryset = ProcessingType.objects.none()
+        return fields
+
+
+class DishCostSerializer(serializers.Serializer):
+    dish_id = serializers.UUIDField()
+    cost_price = serializers.DecimalField(max_digits=12, decimal_places=2)
+    sale_price = serializers.DecimalField(max_digits=11, decimal_places=3)
+    margin_amount = serializers.DecimalField(max_digits=12, decimal_places=2)
+    margin_percent = serializers.DecimalField(max_digits=6, decimal_places=2)
+
+
+class DishCalculatePreviewSerializer(serializers.Serializer):
+    """
+    Body:
+      {
+        "sale_price": "250.00",
+        "other_expenses": "0.00",
+        "ingredients": [
+          {"ingredient_type":"product","product":"<uuid>","quantity":"0.05","unit":"kg","processing_type_ids":["uuid", ...]},
+          {"ingredient_type":"preparation","preparation":"<uuid>","quantity":"0.3","unit":"kg","processing_type_ids":[]}
+        ]
+      }
+    """
+    sale_price = serializers.DecimalField(max_digits=11, decimal_places=3, required=False, allow_null=True)
+    other_expenses = serializers.DecimalField(max_digits=12, decimal_places=2, required=False, default=Decimal("0.00"))
+    ingredients = serializers.ListField(child=serializers.DictField(), allow_empty=True)
+
+
 class MenuItemSerializer(CompanyBranchReadOnlyMixin):
     category = serializers.PrimaryKeyRelatedField(
         queryset=Category.objects.all(),
@@ -483,6 +663,8 @@ class MenuItemSerializer(CompanyBranchReadOnlyMixin):
     cost_price = serializers.DecimalField(
         max_digits=12, decimal_places=2, read_only=True
     )
+    margin_amount = serializers.DecimalField(max_digits=12, decimal_places=2, read_only=True)
+    margin_percent_value = serializers.DecimalField(source="margin_percent", max_digits=6, decimal_places=2, read_only=True)
     
     # Вычисляемые поля (read-only)
     vat_amount = serializers.SerializerMethodField()
@@ -500,12 +682,14 @@ class MenuItemSerializer(CompanyBranchReadOnlyMixin):
             "image", "image_url",
             # Себестоимость и расходы
             "vat_percent", "other_expenses", "cost_price",
+            "margin_amount", "margin_percent_value",
             "vat_amount", "profit", "margin_percent", "ingredients_cost",
             "created_at", "updated_at", "ingredients",
         ]
         read_only_fields = [
             "id", "company", "branch", "created_at", "updated_at",
-            "cost_price", "vat_amount", "profit", "margin_percent", "ingredients_cost"
+            "cost_price", "margin_amount", "margin_percent_value",
+            "vat_amount", "profit", "margin_percent", "ingredients_cost"
         ]
 
     def get_fields(self):
@@ -593,7 +777,7 @@ class MenuItemSerializer(CompanyBranchReadOnlyMixin):
     def _recalc_and_save_cost(self, menu_item):
         """Пересчитать и сохранить себестоимость"""
         menu_item.recalc_cost_price()
-        menu_item.save(update_fields=["cost_price"])
+        menu_item.save(update_fields=["cost_price", "margin_amount", "margin_percent"])
 
     def create(self, validated_data):
         ingredients = validated_data.pop("ingredients", [])

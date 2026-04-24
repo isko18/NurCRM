@@ -563,6 +563,18 @@ class MenuItem(models.Model):
         help_text="Дополнительные расходы на блюдо (упаковка, доставка и т.д.)"
     )
 
+    # Маржинальность (новая логика кафе/ресторана)
+    margin_amount = models.DecimalField(
+        "Маржа (сумма)", max_digits=12, decimal_places=2,
+        default=Decimal("0.00"),
+        help_text="Цена продажи - Себестоимость",
+    )
+    margin_percent = models.DecimalField(
+        "Маржа (%)", max_digits=6, decimal_places=2,
+        default=Decimal("0.00"),
+        help_text="(Маржа / Цена продажи) * 100",
+    )
+
     image = models.ImageField("Изображение", upload_to="menu_items/", blank=True, null=True)
 
     created_at = models.DateTimeField("Дата создания", auto_now_add=True)
@@ -614,13 +626,11 @@ class MenuItem(models.Model):
         Пересчитать себестоимость блюда на основе ингредиентов и прочих расходов.
         Себестоимость = сумма(количество ингредиента * цена за единицу) + прочие расходы
         """
-        ingredients_cost = Decimal("0.00")
-        for ingredient in self.ingredients.select_related('product').all():
-            unit_price = ingredient.product.unit_price or Decimal("0.00")
-            amount = ingredient.amount or Decimal("0.00")
-            ingredients_cost += unit_price * amount
-        
-        self.cost_price = ingredients_cost + (self.other_expenses or Decimal("0.00"))
+        # Логика пересчёта вынесена в сервисы. Здесь оставляем совместимость
+        # для существующих вызовов (старые сериализаторы и админка).
+        from .services.costing import recalculate_dish
+
+        recalculate_dish(self, save=False)
         return self.cost_price
 
     @property
@@ -635,12 +645,7 @@ class MenuItem(models.Model):
         """Прибыль = Цена продажи - Себестоимость - НДС"""
         return (self.price or Decimal("0.00")) - (self.cost_price or Decimal("0.00")) - self.vat_amount
 
-    @property
-    def margin_percent(self):
-        """Маржа в процентах = (Прибыль / Цена) * 100"""
-        if not self.price or self.price == 0:
-            return Decimal("0.00")
-        return ((self.profit / self.price) * Decimal("100")).quantize(Decimal("0.01"))
+    # margin_amount/margin_percent теперь поля (см. выше) и пересчитываются сервисом.
 
     def save(self, *args, **kwargs):
         """
@@ -791,6 +796,231 @@ class Ingredient(models.Model):
         if self.product_id:
             self.recalc_tech_fields()
         super().save(*args, **kwargs)
+
+
+# ==========================
+# Новая калькуляция: заготовки + обработки + ингредиенты блюда
+# ==========================
+class ProcessingType(models.Model):
+    class ChargeType(models.TextChoices):
+        FIXED = "fixed", "fixed"
+        PER_UNIT = "per_unit", "per_unit"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    company = models.ForeignKey(
+        Company, on_delete=models.CASCADE, related_name="cafe_processing_types", verbose_name="Компания"
+    )
+    branch = models.ForeignKey(
+        Branch, on_delete=models.CASCADE, related_name="cafe_processing_types",
+        verbose_name="Филиал", null=True, blank=True, db_index=True
+    )
+    name = models.CharField("Название", max_length=255)
+    cost = models.DecimalField("Стоимость/ставка", max_digits=12, decimal_places=2, default=Decimal("0.00"))
+    charge_type = models.CharField("Тип начисления", max_length=16, choices=ChargeType.choices, default=ChargeType.FIXED)
+    unit = models.CharField("Ед. изм.", max_length=16, blank=True, default="")
+    is_active = models.BooleanField("Активно", default=True, db_index=True)
+
+    class Meta:
+        verbose_name = "Тип обработки"
+        verbose_name_plural = "Типы обработки"
+        indexes = [
+            models.Index(fields=["company", "is_active"]),
+            models.Index(fields=["company", "branch", "is_active"]),
+            models.Index(fields=["company", "name"]),
+        ]
+        constraints = [
+            models.UniqueConstraint(
+                fields=("branch", "name"),
+                name="uniq_cafe_processingtype_name_per_branch",
+                condition=Q(branch__isnull=False),
+            ),
+            models.UniqueConstraint(
+                fields=("company", "name"),
+                name="uniq_cafe_processingtype_name_global_per_company",
+                condition=Q(branch__isnull=True),
+            ),
+        ]
+
+    def clean(self):
+        if self.branch_id and self.branch.company_id != self.company_id:
+            raise ValidationError({"branch": "Филиал принадлежит другой компании."})
+        if self.cost is not None and self.cost < 0:
+            raise ValidationError({"cost": "Стоимость не может быть отрицательной."})
+
+    def __str__(self):
+        return self.name
+
+
+class Preparation(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    company = models.ForeignKey(
+        Company, on_delete=models.CASCADE, related_name="cafe_preparations", verbose_name="Компания"
+    )
+    branch = models.ForeignKey(
+        Branch, on_delete=models.CASCADE, related_name="cafe_preparations",
+        verbose_name="Филиал", null=True, blank=True, db_index=True
+    )
+
+    name = models.CharField("Название", max_length=255)
+    source_product = models.ForeignKey(
+        Warehouse, on_delete=models.PROTECT, related_name="preparations_source", verbose_name="Исходный продукт"
+    )
+
+    input_quantity = models.DecimalField("Вход", max_digits=14, decimal_places=6, validators=[MinValueValidator(Decimal("0.000001"))])
+    input_unit = models.CharField("Ед. входа", max_length=16)
+    output_quantity = models.DecimalField("Выход", max_digits=14, decimal_places=6, validators=[MinValueValidator(Decimal("0.000001"))])
+    output_unit = models.CharField("Ед. выхода", max_length=16)
+
+    loss_quantity = models.DecimalField("Потери", max_digits=14, decimal_places=6, default=Decimal("0"))
+    loss_percent = models.DecimalField("Потери (%)", max_digits=6, decimal_places=2, default=Decimal("0.00"))
+
+    raw_material_cost = models.DecimalField("Стоимость сырья", max_digits=12, decimal_places=2, default=Decimal("0.00"))
+    processing_cost = models.DecimalField("Стоимость обработки", max_digits=12, decimal_places=2, default=Decimal("0.00"))
+    total_cost = models.DecimalField("Итого", max_digits=12, decimal_places=2, default=Decimal("0.00"))
+    unit_cost = models.DecimalField("Себестоимость за единицу", max_digits=12, decimal_places=4, default=Decimal("0.0000"))
+
+    stock_quantity = models.DecimalField("Остаток", max_digits=14, decimal_places=6, default=Decimal("0"))
+    is_active = models.BooleanField("Активно", default=True, db_index=True)
+
+    created_at = models.DateTimeField("Создано", auto_now_add=True)
+    updated_at = models.DateTimeField("Обновлено", auto_now=True)
+
+    class Meta:
+        verbose_name = "Заготовка"
+        verbose_name_plural = "Заготовки"
+        indexes = [
+            models.Index(fields=["company", "is_active"]),
+            models.Index(fields=["company", "branch", "is_active"]),
+            models.Index(fields=["source_product"]),
+        ]
+        constraints = [
+            models.UniqueConstraint(
+                fields=("branch", "name"),
+                name="uniq_cafe_preparation_name_per_branch",
+                condition=Q(branch__isnull=False),
+            ),
+            models.UniqueConstraint(
+                fields=("company", "name"),
+                name="uniq_cafe_preparation_name_global_per_company",
+                condition=Q(branch__isnull=True),
+            ),
+        ]
+
+    def clean(self):
+        if self.branch_id and self.branch.company_id != self.company_id:
+            raise ValidationError({"branch": "Филиал принадлежит другой компании."})
+        if self.source_product_id and self.source_product.company_id != self.company_id:
+            raise ValidationError({"source_product": "Продукт со склада другой компании."})
+        if (self.branch_id or None) != (self.source_product.branch_id or None):
+            raise ValidationError({"source_product": "Продукт со склада другого филиала."})
+        if self.output_quantity and self.input_quantity and self.output_quantity > self.input_quantity:
+            raise ValidationError({"output_quantity": "Выход не может быть больше входа."})
+
+    def __str__(self):
+        return self.name
+
+
+class DishIngredient(models.Model):
+    class IngredientType(models.TextChoices):
+        PRODUCT = "product", "product"
+        PREPARATION = "preparation", "preparation"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    dish = models.ForeignKey(
+        MenuItem, on_delete=models.CASCADE, related_name="dish_ingredients", verbose_name="Блюдо"
+    )
+    ingredient_type = models.CharField("Тип", max_length=16, choices=IngredientType.choices)
+
+    product = models.ForeignKey(
+        Warehouse, on_delete=models.PROTECT,
+        related_name="dish_ingredients_product", verbose_name="Продукт",
+        null=True, blank=True,
+    )
+    preparation = models.ForeignKey(
+        Preparation, on_delete=models.PROTECT,
+        related_name="dish_ingredients_preparation", verbose_name="Заготовка",
+        null=True, blank=True,
+    )
+
+    quantity = models.DecimalField("Количество", max_digits=14, decimal_places=6, validators=[MinValueValidator(Decimal("0.000001"))])
+    unit = models.CharField("Ед. изм.", max_length=16)
+
+    unit_cost = models.DecimalField("Цена за единицу", max_digits=12, decimal_places=4, default=Decimal("0.0000"))
+    ingredient_cost = models.DecimalField("Стоимость ингредиента", max_digits=12, decimal_places=2, default=Decimal("0.00"))
+    processing_cost = models.DecimalField("Стоимость обработок", max_digits=12, decimal_places=2, default=Decimal("0.00"))
+    total_cost = models.DecimalField("Итого", max_digits=12, decimal_places=2, default=Decimal("0.00"))
+
+    created_at = models.DateTimeField("Создано", auto_now_add=True)
+    updated_at = models.DateTimeField("Обновлено", auto_now=True)
+
+    class Meta:
+        verbose_name = "Ингредиент блюда"
+        verbose_name_plural = "Ингредиенты блюда"
+        indexes = [
+            models.Index(fields=["dish"]),
+            models.Index(fields=["ingredient_type"]),
+            models.Index(fields=["product"]),
+            models.Index(fields=["preparation"]),
+        ]
+
+    def clean(self):
+        if self.dish_id and self.dish.company_id:
+            if self.product_id:
+                if self.product.company_id != self.dish.company_id:
+                    raise ValidationError({"product": "Продукт другой компании."})
+                if (self.product.branch_id or None) != (self.dish.branch_id or None):
+                    raise ValidationError({"product": "Продукт другого филиала."})
+            if self.preparation_id:
+                if self.preparation.company_id != self.dish.company_id:
+                    raise ValidationError({"preparation": "Заготовка другой компании."})
+                if (self.preparation.branch_id or None) != (self.dish.branch_id or None):
+                    raise ValidationError({"preparation": "Заготовка другого филиала."})
+
+        # Только один источник
+        if self.ingredient_type == self.IngredientType.PRODUCT:
+            if not self.product_id or self.preparation_id:
+                raise ValidationError({"product": "Укажите продукт и не указывайте заготовку."})
+        elif self.ingredient_type == self.IngredientType.PREPARATION:
+            if not self.preparation_id or self.product_id:
+                raise ValidationError({"preparation": "Укажите заготовку и не указывайте продукт."})
+        else:
+            raise ValidationError({"ingredient_type": "Некорректный тип ингредиента."})
+
+    def __str__(self):
+        src = self.product.title if self.product_id else (self.preparation.name if self.preparation_id else "")
+        return f"{src} ({self.quantity} {self.unit})"
+
+
+class DishIngredientProcessing(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    ingredient = models.ForeignKey(
+        DishIngredient, on_delete=models.CASCADE, related_name="processings", verbose_name="Ингредиент"
+    )
+    processing_type = models.ForeignKey(
+        ProcessingType, on_delete=models.PROTECT, related_name="dish_ingredient_processings", verbose_name="Тип обработки"
+    )
+    cost = models.DecimalField("Стоимость", max_digits=12, decimal_places=2, default=Decimal("0.00"))
+
+    class Meta:
+        verbose_name = "Обработка ингредиента"
+        verbose_name_plural = "Обработки ингредиента"
+        indexes = [
+            models.Index(fields=["ingredient"]),
+            models.Index(fields=["processing_type"]),
+        ]
+
+    def clean(self):
+        if self.cost is not None and self.cost < 0:
+            raise ValidationError({"cost": "Стоимость не может быть отрицательной."})
+        if self.ingredient_id and self.processing_type_id:
+            dish = self.ingredient.dish
+            if self.processing_type.company_id != dish.company_id:
+                raise ValidationError({"processing_type": "Тип обработки другой компании."})
+            if (self.processing_type.branch_id or None) != (dish.branch_id or None):
+                raise ValidationError({"processing_type": "Тип обработки другого филиала."})
+
+    def __str__(self):
+        return f"{self.processing_type.name} -> {self.cost}"
 
 
 # ==========================

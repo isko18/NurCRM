@@ -32,6 +32,7 @@ from .models import (
     InventorySession, Equipment, EquipmentInventorySession, Kitchen,
     CafeReceiptPrinterSettings,
     CafeExpense, CafeWaiterPayProfile,
+    Preparation, ProcessingType, DishIngredient, DishIngredientProcessing,
 )
 from .serializers import (
     ZoneSerializer, TableSerializer, BookingSerializer,
@@ -47,8 +48,14 @@ from .serializers import (
     OrderPayDebtSerializer,
     CafeReceiptPrinterSettingsSerializer,
     CafeExpenseSerializer, CafeWaiterPayProfileSerializer,
+    PreparationSerializer, ProcessingTypeSerializer,
+    DishIngredientSerializer, DishIngredientProcessingCreateSerializer,
+    DishCostSerializer, DishCalculatePreviewSerializer,
 )
 from apps.utils import _is_owner_like
+
+from .services.costing import recalculate_dish, calculate_preparation, calculate_margin, calculate_ingredient
+from .services.stock import consume_dish_for_order
 
 
 _NUM_RE = re.compile(r"[-+]?\d+(?:[.,]\d+)?")
@@ -80,13 +87,15 @@ def deduct_ingredients_for_order(order: Order):
     Списывает со склада ингредиенты по заказу.
     Запускать ТОЛЬКО внутри transaction.atomic().
     """
-    # Соберём расход по каждому складу (Warehouse)
-    usage_by_product_id: dict = {}
-
     items = (
         order.items
         .select_related("menu_item")
-        .prefetch_related("menu_item__ingredients__product")
+        .prefetch_related(
+            "menu_item__ingredients__product",
+            "menu_item__dish_ingredients__product",
+            "menu_item__dish_ingredients__preparation",
+            "menu_item__dish_ingredients__processings__processing_type",
+        )
         .all()
     )
     for it in items:
@@ -95,37 +104,7 @@ def deduct_ingredients_for_order(order: Order):
         qty = Decimal(str(it.quantity or 0))
         if qty <= 0:
             continue
-        for ing in it.menu_item.ingredients.all():
-            need = (ing.amount or Decimal("0")) * qty
-            if need <= 0:
-                continue
-            usage_by_product_id[ing.product_id] = usage_by_product_id.get(ing.product_id, Decimal("0")) + need
-
-    if not usage_by_product_id:
-        return
-
-    # Залочим нужные строки склада
-    products = (
-        Warehouse.objects
-        .select_for_update()
-        .filter(id__in=list(usage_by_product_id.keys()))
-    )
-    products_by_id = {p.id: p for p in products}
-
-    # Проверка: все ингредиенты должны существовать на складе
-    missing = [str(pid) for pid in usage_by_product_id.keys() if pid not in products_by_id]
-    if missing:
-        raise ValidationError({"detail": f"Не найдены товары склада для ингредиентов: {', '.join(missing)}"})
-
-    # Проверяем остатки и применяем списание
-    for pid, need in usage_by_product_id.items():
-        p = products_by_id[pid]
-        have = _decimal_from_warehouse_remainder(p.remainder)
-        new_val = have - need
-
-        # remainder хранится строкой
-        p.remainder = str(new_val)
-        p.save(update_fields=["remainder"])
+        consume_dish_for_order(it.menu_item, qty)
 
 
 def _cafe_assign_cash_shift(order: Order, shift_id, company, active_branch):
@@ -894,6 +873,323 @@ class IngredientRetrieveUpdateDestroyView(CompanyBranchQuerysetMixin, generics.R
                 Q(product__branch=active_branch) | Q(product__branch__isnull=True),
             )
         return qs.filter(menu_item__branch__isnull=True, product__branch__isnull=True)
+
+
+# ==================== Preparations ====================
+class PreparationListCreateView(CompanyBranchQuerysetMixin, generics.ListCreateAPIView):
+    serializer_class = PreparationSerializer
+    filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
+    filterset_fields = ["source_product", "is_active"]
+    search_fields = ["name"]
+    ordering_fields = ["name", "created_at", "id"]
+
+    def get_queryset(self):
+        company = self._user_company()
+        if not company:
+            return Preparation.objects.none()
+        b = self._active_branch()
+        qs = Preparation.objects.select_related("source_product").filter(company=company)
+        if b is not None:
+            return qs.filter(Q(branch=b) | Q(branch__isnull=True))
+        return qs.filter(branch__isnull=True)
+
+    def perform_create(self, serializer):
+        with transaction.atomic():
+            obj: Preparation = serializer.save()
+            # Расчёт полей заготовки
+            calc = calculate_preparation(obj)
+            obj.loss_quantity = calc["loss_quantity"]
+            obj.loss_percent = calc["loss_percent"]
+            obj.raw_material_cost = calc["raw_material_cost"]
+            obj.total_cost = calc["total_cost"]
+            obj.unit_cost = calc["unit_cost"]
+            obj.save(update_fields=["loss_quantity", "loss_percent", "raw_material_cost", "total_cost", "unit_cost", "updated_at"])
+
+
+class PreparationRetrieveUpdateDestroyView(CompanyBranchQuerysetMixin, generics.RetrieveUpdateDestroyAPIView):
+    serializer_class = PreparationSerializer
+
+    def get_queryset(self):
+        company = self._user_company()
+        if not company:
+            return Preparation.objects.none()
+        b = self._active_branch()
+        qs = Preparation.objects.select_related("source_product").filter(company=company)
+        if b is not None:
+            return qs.filter(Q(branch=b) | Q(branch__isnull=True))
+        return qs.filter(branch__isnull=True)
+
+    def perform_update(self, serializer):
+        with transaction.atomic():
+            obj: Preparation = serializer.save()
+            calc = calculate_preparation(obj)
+            obj.loss_quantity = calc["loss_quantity"]
+            obj.loss_percent = calc["loss_percent"]
+            obj.raw_material_cost = calc["raw_material_cost"]
+            obj.total_cost = calc["total_cost"]
+            obj.unit_cost = calc["unit_cost"]
+            obj.save(update_fields=["loss_quantity", "loss_percent", "raw_material_cost", "total_cost", "unit_cost", "updated_at"])
+
+            # Автопересчёт блюд, которые используют заготовку
+            dish_ids = list(
+                DishIngredient.objects.filter(preparation=obj).values_list("dish_id", flat=True).distinct()
+            )
+            if dish_ids:
+                for d in MenuItem.objects.filter(id__in=dish_ids).all():
+                    recalculate_dish(d, save=True)
+
+
+# ==================== Processing types ====================
+class ProcessingTypeListCreateView(CompanyBranchQuerysetMixin, generics.ListCreateAPIView):
+    serializer_class = ProcessingTypeSerializer
+    filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
+    filterset_fields = ["is_active", "charge_type"]
+    search_fields = ["name"]
+    ordering_fields = ["name", "id"]
+
+    def get_queryset(self):
+        company = self._user_company()
+        if not company:
+            return ProcessingType.objects.none()
+        b = self._active_branch()
+        qs = ProcessingType.objects.filter(company=company)
+        if b is not None:
+            return qs.filter(Q(branch=b) | Q(branch__isnull=True))
+        return qs.filter(branch__isnull=True)
+
+
+class ProcessingTypeRetrieveUpdateDestroyView(CompanyBranchQuerysetMixin, generics.RetrieveUpdateDestroyAPIView):
+    serializer_class = ProcessingTypeSerializer
+
+    def get_queryset(self):
+        company = self._user_company()
+        if not company:
+            return ProcessingType.objects.none()
+        b = self._active_branch()
+        qs = ProcessingType.objects.filter(company=company)
+        if b is not None:
+            return qs.filter(Q(branch=b) | Q(branch__isnull=True))
+        return qs.filter(branch__isnull=True)
+
+    def perform_update(self, serializer):
+        obj: ProcessingType = serializer.save()
+        # Автопересчёт блюд, где используется этот тип обработки
+        ing_ids = DishIngredientProcessing.objects.filter(processing_type=obj).values_list("ingredient_id", flat=True).distinct()
+        dish_ids = DishIngredient.objects.filter(id__in=ing_ids).values_list("dish_id", flat=True).distinct()
+        for d in MenuItem.objects.filter(id__in=dish_ids).all():
+            recalculate_dish(d, save=True)
+
+
+# ==================== Dish ingredients (new) ====================
+class DishIngredientCreateForDishView(CompanyBranchQuerysetMixin, APIView):
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request, pk):
+        company = self._user_company()
+        if not company:
+            return Response({"detail": "Компания не найдена."}, status=status.HTTP_403_FORBIDDEN)
+        b = self._active_branch()
+        dish = generics.get_object_or_404(MenuItem.objects.filter(company=company), pk=pk)
+        if b is not None and dish.branch_id not in (None, b.id):
+            return Response({"detail": "Блюдо другого филиала."}, status=status.HTTP_404_NOT_FOUND)
+
+        ser = DishIngredientSerializer(data={**request.data, "dish": str(dish.id)}, context={"request": request})
+        ser.is_valid(raise_exception=True)
+        with transaction.atomic():
+            ing: DishIngredient = ser.save()
+            recalculate_dish(dish, save=True)
+        return Response(DishIngredientSerializer(ing, context={"request": request}).data, status=status.HTTP_201_CREATED)
+
+
+class DishIngredientRetrieveUpdateDestroyView(CompanyBranchQuerysetMixin, generics.RetrieveUpdateDestroyAPIView):
+    serializer_class = DishIngredientSerializer
+
+    def get_queryset(self):
+        company = self._user_company()
+        if not company:
+            return DishIngredient.objects.none()
+        b = self._active_branch()
+        qs = DishIngredient.objects.select_related("dish", "product", "preparation").filter(dish__company=company)
+        if b is not None:
+            return qs.filter(Q(dish__branch=b) | Q(dish__branch__isnull=True))
+        return qs.filter(dish__branch__isnull=True)
+
+    def perform_update(self, serializer):
+        with transaction.atomic():
+            ing: DishIngredient = serializer.save()
+            recalculate_dish(ing.dish, save=True)
+
+    def perform_destroy(self, instance):
+        dish = instance.dish
+        with transaction.atomic():
+            super().perform_destroy(instance)
+            recalculate_dish(dish, save=True)
+
+
+class DishIngredientProcessingCreateView(CompanyBranchQuerysetMixin, APIView):
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request):
+        ser = DishIngredientProcessingCreateSerializer(data=request.data, context={"request": request})
+        ser.is_valid(raise_exception=True)
+        with transaction.atomic():
+            ing = ser.validated_data["ingredient"]
+            pt = ser.validated_data["processing_type"]
+            DishIngredientProcessing.objects.create(ingredient=ing, processing_type=pt, cost=Decimal("0.00"))
+            recalculate_dish(ing.dish, save=True)
+        return Response({"detail": "ok"}, status=status.HTTP_201_CREATED)
+
+
+class DishIngredientProcessingDeleteView(CompanyBranchQuerysetMixin, APIView):
+    permission_classes = [permissions.IsAuthenticated]
+
+    def delete(self, request, pk):
+        company = self._user_company()
+        if not company:
+            return Response({"detail": "Компания не найдена."}, status=status.HTTP_403_FORBIDDEN)
+        obj = generics.get_object_or_404(DishIngredientProcessing.objects.select_related("ingredient__dish"), pk=pk)
+        if obj.ingredient.dish.company_id != company.id:
+            return Response({"detail": "Не найдено."}, status=status.HTTP_404_NOT_FOUND)
+        with transaction.atomic():
+            dish = obj.ingredient.dish
+            obj.delete()
+            recalculate_dish(dish, save=True)
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+# ==================== Dish cost ====================
+class DishCostView(CompanyBranchQuerysetMixin, APIView):
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request, pk):
+        company = self._user_company()
+        if not company:
+            return Response({"detail": "Компания не найдена."}, status=status.HTTP_403_FORBIDDEN)
+        b = self._active_branch()
+        dish = generics.get_object_or_404(MenuItem.objects.filter(company=company), pk=pk)
+        if b is not None and dish.branch_id not in (None, b.id):
+            return Response({"detail": "Не найдено."}, status=status.HTTP_404_NOT_FOUND)
+
+        recalculate_dish(dish, save=True)
+        payload = {
+            "dish_id": dish.id,
+            "cost_price": dish.cost_price,
+            "sale_price": dish.price,
+            "margin_amount": dish.margin_amount,
+            "margin_percent": dish.margin_percent,
+        }
+        return Response(DishCostSerializer(payload).data, status=status.HTTP_200_OK)
+
+
+class DishCalculatePreviewView(CompanyBranchQuerysetMixin, APIView):
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request):
+        company = self._user_company()
+        if not company:
+            return Response({"detail": "Компания не найдена."}, status=status.HTTP_403_FORBIDDEN)
+
+        ser = DishCalculatePreviewSerializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+        other = ser.validated_data.get("other_expenses") or Decimal("0.00")
+        sale_price = ser.validated_data.get("sale_price")
+        ingredients = ser.validated_data.get("ingredients") or []
+
+        total = Decimal("0.00")
+        breakdown = []
+        b = self._active_branch()
+
+        for row in ingredients:
+            itype = (row.get("ingredient_type") or "").strip()
+            qty = Decimal(str(row.get("quantity") or "0").replace(",", "."))
+            unit = (row.get("unit") or "").strip().lower()
+            pt_ids = row.get("processing_type_ids") or []
+
+            ing = DishIngredient(
+                dish=MenuItem(company=company, branch=b),
+                ingredient_type=itype,
+                quantity=qty,
+                unit=unit,
+            )
+            if itype == DishIngredient.IngredientType.PRODUCT:
+                pid = row.get("product")
+                ing.product = Warehouse.objects.filter(company=company, id=pid).first()
+            elif itype == DishIngredient.IngredientType.PREPARATION:
+                prid = row.get("preparation")
+                ing.preparation = Preparation.objects.filter(company=company, id=prid).first()
+
+            # имитируем processings
+            ing._prefetched_objects_cache = {}
+            proc_list = []
+            pts = list(ProcessingType.objects.filter(company=company, id__in=pt_ids))
+            for pt in pts:
+                proc_list.append(DishIngredientProcessing(ingredient=ing, processing_type=pt, cost=Decimal("0.00")))
+            # подсунем их calculate_ingredient через related manager: проще пересчитать отдельно
+            # считаем cost вручную аналогично сервису
+            from .services.costing import _norm_unit as _nu
+            from .services.costing import convert_quantity as _cq
+
+            if itype == DishIngredient.IngredientType.PRODUCT and ing.product:
+                src_unit_cost = Decimal(ing.product.unit_price or 0).quantize(Decimal("0.0001"))
+                src_unit = _nu(ing.product.unit)
+                qty_in_src_unit = _cq(qty, unit, src_unit)
+                ingredient_cost = (src_unit_cost * qty_in_src_unit).quantize(Decimal("0.01"))
+                unit_cost = src_unit_cost
+            elif itype == DishIngredient.IngredientType.PREPARATION and ing.preparation:
+                src_unit_cost = Decimal(ing.preparation.unit_cost or 0).quantize(Decimal("0.0001"))
+                src_unit = _nu(ing.preparation.output_unit)
+                qty_in_src_unit = _cq(qty, unit, src_unit)
+                ingredient_cost = (src_unit_cost * qty_in_src_unit).quantize(Decimal("0.01"))
+                unit_cost = src_unit_cost
+            else:
+                raise ValidationError({"ingredients": "Некорректный источник ингредиента."})
+
+            processing_total = Decimal("0.00")
+            for p in proc_list:
+                pt = p.processing_type
+                if pt.charge_type == ProcessingType.ChargeType.FIXED:
+                    c = Decimal(pt.cost or 0)
+                else:
+                    c = Decimal(pt.cost or 0) * qty
+                processing_total += c
+            processing_total = processing_total.quantize(Decimal("0.01"))
+            row_total = (ingredient_cost + processing_total).quantize(Decimal("0.01"))
+
+            total += row_total
+            breakdown.append(
+                {
+                    "ingredient_type": itype,
+                    "quantity": str(qty),
+                    "unit": unit,
+                    "unit_cost": str(unit_cost),
+                    "ingredient_cost": str(ingredient_cost),
+                    "processing_cost": str(processing_total),
+                    "total_cost": str(row_total),
+                }
+            )
+
+        cost_price = (total + other).quantize(Decimal("0.01"))
+        if sale_price is not None:
+            sp = Decimal(sale_price).quantize(Decimal("0.001"))
+        else:
+            sp = None
+        if sp is not None:
+            margin_amount = (sp - cost_price).quantize(Decimal("0.01"))
+            margin_percent = (margin_amount / sp * Decimal("100")).quantize(Decimal("0.01")) if sp else Decimal("0.00")
+        else:
+            margin_amount = None
+            margin_percent = None
+        return Response(
+            {
+                "ingredients": breakdown,
+                "other_expenses": str(other),
+                "cost_price": str(cost_price),
+                "sale_price": (str(sp) if sp is not None else None),
+                "margin_amount": (str(margin_amount) if margin_amount is not None else None),
+                "margin_percent": (str(margin_percent) if margin_percent is not None else None),
+            },
+            status=status.HTTP_200_OK,
+        )
 
 
 def _sync_table_status(table_id):

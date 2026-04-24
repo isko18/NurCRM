@@ -11,6 +11,7 @@ from apps.users.models import Company, Branch
 from apps.cafe.models import (
     Zone, Table, Order, OrderItem, MenuItem, Category, CafeClient, Kitchen, OrderDebtPayment,
     CafeWaiterPayProfile,
+    Warehouse, Preparation, ProcessingType, DishIngredient, DishIngredientProcessing,
 )
 from apps.cafe.analytics import (
     SalesSummaryView,
@@ -26,6 +27,7 @@ from apps.cafe.views import (
     OrderPayDebtView,
     OrderRetrieveUpdateDestroyView,
 )
+from apps.cafe.services.costing import convert_quantity, calculate_preparation, recalculate_dish
 
 User = get_user_model()
 
@@ -1091,3 +1093,206 @@ class CafeWaiterAnalyticsScopeTestCase(TestCase):
         self.assertEqual(unified_resp.status_code, 200, getattr(unified_resp, "data", None))
         self.assertEqual(direct_resp.status_code, 200)
         self.assertEqual(unified_resp.data, direct_resp.data)
+
+
+class CafeCostingTZTestCase(TransactionTestCase):
+    """
+    Проверки по ТЗ новой системы калькуляции кафе/ресторана.
+    Если какие-то пункты не реализованы полностью — тесты это покажут.
+    """
+
+    def setUp(self):
+        self.owner = User.objects.create_user(email="owner-cost@test.com", password="testpass123")
+        self.company = Company.objects.create(name="Cost Cafe Co", owner=self.owner)
+        self.branch = Branch.objects.create(name="Cost Branch", company=self.company)
+        self.user = User.objects.create_user(email="waiter-cost@test.com", password="testpass123")
+        self.user.company = self.company
+        self.user.save(update_fields=["company"])
+
+        self.category = Category.objects.create(company=self.company, branch=self.branch, title="Food")
+
+        # складские позиции
+        self.potato_raw = Warehouse.objects.create(
+            company=self.company,
+            branch=self.branch,
+            title="Potato raw",
+            supplier="",
+            unit="kg",
+            remainder="10",
+            minimum="0",
+            unit_price=Decimal("100.00"),
+        )
+        self.salt = Warehouse.objects.create(
+            company=self.company,
+            branch=self.branch,
+            title="Salt",
+            supplier="",
+            unit="kg",
+            remainder="10",
+            minimum="0",
+            unit_price=Decimal("50.00"),
+        )
+
+        # базовое блюдо
+        self.dish = MenuItem.objects.create(
+            company=self.company,
+            branch=self.branch,
+            category=self.category,
+            title="Potato dish",
+            price=Decimal("300.00"),
+            is_active=True,
+            other_expenses=Decimal("0.00"),
+        )
+
+        self.api_factory = APIRequestFactory()
+
+    def test_convert_quantity_units(self):
+        self.assertEqual(convert_quantity(Decimal("1"), "kg", "g"), Decimal("1000"))
+        self.assertEqual(convert_quantity(Decimal("500"), "g", "kg"), Decimal("0.5"))
+        self.assertEqual(convert_quantity(Decimal("1"), "l", "ml"), Decimal("1000"))
+        self.assertEqual(convert_quantity(Decimal("250"), "ml", "l"), Decimal("0.25"))
+        self.assertEqual(convert_quantity(Decimal("2"), "pcs", "pcs"), Decimal("2"))
+
+    def test_preparation_potato_example_from_tz(self):
+        """
+        ТЗ:
+          1 кг = 100
+          выход 800 г
+          +10
+          total=110
+          unit_cost = 110 / 0.8 = 137.50 сом/кг
+        """
+        prep = Preparation(
+            company=self.company,
+            branch=self.branch,
+            name="Potato peeled",
+            source_product=self.potato_raw,
+            input_quantity=Decimal("1"),
+            input_unit="kg",
+            output_quantity=Decimal("800"),
+            output_unit="g",
+            processing_cost=Decimal("10.00"),
+            stock_quantity=Decimal("0"),
+            is_active=True,
+        )
+        calc = calculate_preparation(prep)
+        # unit_cost должен быть за кг результата
+        self.assertEqual(calc["total_cost"], Decimal("110.00"))
+        self.assertEqual(calc["unit_cost"], Decimal("137.5000"))
+
+    def test_product_without_processing(self):
+        """
+        Обычный продукт без обработки:
+          50 г соли, цена 50/кг => 2.50
+        """
+        ing = DishIngredient.objects.create(
+            dish=self.dish,
+            ingredient_type=DishIngredient.IngredientType.PRODUCT,
+            product=self.salt,
+            quantity=Decimal("50"),
+            unit="g",
+        )
+        recalculate_dish(self.dish, save=True)
+        ing.refresh_from_db()
+        self.assertEqual(ing.processing_cost, Decimal("0.00"))
+        self.assertEqual(ing.total_cost, Decimal("2.50"))
+
+    def test_preparation_with_processing_on_ingredient(self):
+        prep = Preparation.objects.create(
+            company=self.company,
+            branch=self.branch,
+            name="Potato peeled (stocked)",
+            source_product=self.potato_raw,
+            input_quantity=Decimal("1"),
+            input_unit="kg",
+            output_quantity=Decimal("0.8"),
+            output_unit="kg",
+            processing_cost=Decimal("10.00"),
+            stock_quantity=Decimal("2.0"),  # 2 кг заготовки на складе
+            is_active=True,
+            raw_material_cost=Decimal("100.00"),
+            total_cost=Decimal("110.00"),
+            unit_cost=Decimal("137.5000"),
+            loss_quantity=Decimal("0.2"),
+            loss_percent=Decimal("20.00"),
+        )
+        hot = ProcessingType.objects.create(
+            company=self.company,
+            branch=self.branch,
+            name="Hot processing",
+            cost=Decimal("10.00"),
+            charge_type=ProcessingType.ChargeType.FIXED,
+            unit="",
+            is_active=True,
+        )
+        ing = DishIngredient.objects.create(
+            dish=self.dish,
+            ingredient_type=DishIngredient.IngredientType.PREPARATION,
+            preparation=prep,
+            quantity=Decimal("300"),
+            unit="g",
+        )
+        DishIngredientProcessing.objects.create(ingredient=ing, processing_type=hot, cost=Decimal("0.00"))
+
+        recalculate_dish(self.dish, save=True)
+        ing.refresh_from_db()
+        self.dish.refresh_from_db()
+
+        # 300 г по 137.5/кг = 41.25 + fixed 10 = 51.25
+        self.assertEqual(ing.ingredient_cost, Decimal("41.25"))
+        self.assertEqual(ing.processing_cost, Decimal("10.00"))
+        self.assertEqual(ing.total_cost, Decimal("51.25"))
+        self.assertEqual(self.dish.cost_price, Decimal("51.25"))
+        self.assertEqual(self.dish.margin_amount, Decimal("248.75"))
+
+    def test_stock_deduction_on_order_pay_preparation(self):
+        """
+        Списание заготовки при продаже:
+          2 блюда * 300 г = 600 г
+        """
+        prep = Preparation.objects.create(
+            company=self.company,
+            branch=self.branch,
+            name="Potato peeled (for sale)",
+            source_product=self.potato_raw,
+            input_quantity=Decimal("1"),
+            input_unit="kg",
+            output_quantity=Decimal("1"),
+            output_unit="kg",
+            processing_cost=Decimal("0.00"),
+            stock_quantity=Decimal("2.0"),
+            is_active=True,
+            raw_material_cost=Decimal("100.00"),
+            total_cost=Decimal("100.00"),
+            unit_cost=Decimal("100.0000"),
+            loss_quantity=Decimal("0"),
+            loss_percent=Decimal("0"),
+        )
+        DishIngredient.objects.create(
+            dish=self.dish,
+            ingredient_type=DishIngredient.IngredientType.PREPARATION,
+            preparation=prep,
+            quantity=Decimal("300"),
+            unit="g",
+        )
+
+        order = Order.objects.create(
+            company=self.company,
+            branch=self.branch,
+            waiter=self.user,
+            guests=1,
+            status=Order.Status.OPEN,
+        )
+        OrderItem.objects.create(company=self.company, order=order, menu_item=self.dish, quantity=2)
+
+        request = self.api_factory.post(
+            f"/cafe/orders/{order.id}/pay/",
+            {"payment_method": "cash", "discount_amount": "0.00", "close_order": True},
+            format="json",
+        )
+        force_authenticate(request, user=self.user)
+        resp = OrderPayView.as_view()(request, pk=str(order.id))
+        self.assertEqual(resp.status_code, 200, getattr(resp, "data", resp.content))
+
+        prep.refresh_from_db()
+        self.assertEqual(prep.stock_quantity, Decimal("1.4"))

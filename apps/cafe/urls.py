@@ -31,6 +31,12 @@ from .views import (
     OrderRefundView, OrderItemRefundView,
     CafeExpenseListCreateView, CafeExpenseRetrieveUpdateDestroyView,
     CafeWaiterPayProfileListCreateView, CafeWaiterPayProfileRetrieveUpdateDestroyView,
+
+    PreparationListCreateView, PreparationRetrieveUpdateDestroyView,
+    ProcessingTypeListCreateView, ProcessingTypeRetrieveUpdateDestroyView,
+    DishIngredientCreateForDishView, DishIngredientRetrieveUpdateDestroyView,
+    DishIngredientProcessingCreateView, DishIngredientProcessingDeleteView,
+    DishCostView, DishCalculatePreviewView,
 )
 
 from apps.cafe.analytics import (
@@ -104,6 +110,21 @@ urlpatterns = [
     # === Ingredients ===
     path("ingredients/", IngredientListCreateView.as_view(), name="ingredient-list"),
     path("ingredients/<uuid:pk>/", IngredientRetrieveUpdateDestroyView.as_view(), name="ingredient-detail"),
+
+    # === Costing (new) ===
+    path("preparations/", PreparationListCreateView.as_view(), name="preparation-list"),
+    path("preparations/<uuid:pk>/", PreparationRetrieveUpdateDestroyView.as_view(), name="preparation-detail"),
+
+    path("processing-types/", ProcessingTypeListCreateView.as_view(), name="processing-type-list"),
+    path("processing-types/<uuid:pk>/", ProcessingTypeRetrieveUpdateDestroyView.as_view(), name="processing-type-detail"),
+
+    path("dishes/<uuid:pk>/ingredients/", DishIngredientCreateForDishView.as_view(), name="dish-ingredient-create"),
+    path("dish-ingredients/<uuid:pk>/", DishIngredientRetrieveUpdateDestroyView.as_view(), name="dish-ingredient-detail"),
+    path("dish-ingredient-processings/", DishIngredientProcessingCreateView.as_view(), name="dish-ingredient-processing-create"),
+    path("dish-ingredient-processings/<uuid:pk>/", DishIngredientProcessingDeleteView.as_view(), name="dish-ingredient-processing-delete"),
+
+    path("dishes/<uuid:pk>/cost/", DishCostView.as_view(), name="dish-cost"),
+    path("dishes/calculate-preview/", DishCalculatePreviewView.as_view(), name="dish-calc-preview"),
 
     # === Orders ===
     path("orders/", OrderListCreateView.as_view(), name="order-list"),
