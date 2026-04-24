@@ -111,6 +111,7 @@ CAFE_PERMS = (
     "can_view_cafe_tables",
     "can_view_cafe_cook",
     "can_view_cafe_inventory",
+    "can_view_cafe_calculation",
 )
 
 SCHOOL_PERMS = (
