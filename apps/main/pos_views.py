@@ -447,7 +447,7 @@ def _parse_scale_barcode(barcode: str):
     PP CCCCC WWWWW K
 
     - PP     : префикс (20/21/22/... — тут не валидируем жёстко)
-    - CCCCC  : ПЛУ товара (5 цифр)
+    - CCCCC  : код товара (5 цифр)
     - WWWWW  : вес в граммах (5 цифр, 00312 -> 0.312 кг)
     - K      : контрольная цифра (игнорируем)
 
@@ -457,11 +457,10 @@ def _parse_scale_barcode(barcode: str):
         return None
 
     prefix = barcode[0:2]
-    plu_digits = barcode[2:7]
+    raw_code = barcode[2:7]
     weight_digits = barcode[7:12]
 
     try:
-        plu_int = int(plu_digits)
         weight_raw = int(weight_digits)
     except ValueError:
         return None
@@ -470,7 +469,7 @@ def _parse_scale_barcode(barcode: str):
 
     return {
         "prefix": prefix,
-        "plu": plu_int,
+        "raw_code": raw_code,
         "weight_raw": weight_raw,
         "weight_kg": weight_kg,
     }
@@ -1522,18 +1521,37 @@ class SaleScanAPIView(MarketCashierOnlyMixin, APIView):
                 if not scale_data:
                     return Response({"not_found": True, "message": "Товар не найден"}, status=404)
 
-                plu = scale_data["plu"]
+                raw_code = scale_data["raw_code"]
                 try:
-                    plu_cache_key = f"product_plu:{cart.company_id}:{plu}"
-                    product = cache.get(plu_cache_key)
+                    normalized_code = str(int(raw_code))
+                except Exception:
+                    normalized_code = raw_code
+                try:
+                    # 1) normalized_code (00010 -> 10)
+                    code_cache_key = f"product_code:{cart.company_id}:{normalized_code}"
+                    product = cache.get(code_cache_key)
                     if product is None:
-                        product = Product.objects.only("id", "company_id", "price", "barcode", "plu").get(
+                        product = Product.objects.only("id", "company_id", "price", "barcode", "code").get(
                             company_id=cart.company_id,
-                            plu=plu,
+                            code=normalized_code,
                         )
-                        cache.set(plu_cache_key, product, 300)
+                        cache.set(code_cache_key, product, 300)
                 except Product.DoesNotExist:
-                    return Response({"not_found": True, "message": f"Товар с ПЛУ {plu} не найден"}, status=404)
+                    # 2) fallback raw_code (with leading zeros)
+                    try:
+                        raw_cache_key = f"product_code:{cart.company_id}:{raw_code}"
+                        product = cache.get(raw_cache_key)
+                        if product is None:
+                            product = Product.objects.only("id", "company_id", "price", "barcode", "code").get(
+                                company_id=cart.company_id,
+                                code=raw_code,
+                            )
+                            cache.set(raw_cache_key, product, 300)
+                    except Product.DoesNotExist:
+                        return Response(
+                            {"not_found": True, "message": f"Товар с кодом {normalized_code} / {raw_code} не найден"},
+                            status=404,
+                        )
 
         if scale_data:
             effective_qty = Decimal(str(scale_data["weight_kg"]))
