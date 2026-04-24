@@ -62,6 +62,8 @@ BASE_PERMS = (
     "can_view_sale",
     "can_view_document",
     "can_view_market_scales",
+    "can_view_market_procurement",
+    "can_view_market_supplier",
     "can_view_market_discount",
     "can_view_market_edit_price",
     "can_view_market_delete_cart_item",
