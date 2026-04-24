@@ -528,7 +528,7 @@ class DishIngredientProcessingSerializer(serializers.ModelSerializer):
         read_only_fields = ["id", "ingredient", "processing_type_name", "charge_type", "rate", "cost"]
 
 
-class DishIngredientSerializer(serializers.ModelSerializer):
+class DishIngredientSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
     product_title = serializers.CharField(source="product.title", read_only=True)
     preparation_name = serializers.CharField(source="preparation.name", read_only=True)
     processings = DishIngredientProcessingSerializer(many=True, read_only=True)
@@ -556,15 +556,10 @@ class DishIngredientSerializer(serializers.ModelSerializer):
 
     def get_fields(self):
         fields = super().get_fields()
-        holder = getattr(self, "root", None)
-        if isinstance(holder, CompanyBranchReadOnlyMixin):
-            fields["dish"].queryset = _scope_queryset_by_context(MenuItem.objects.all(), holder)
-            fields["product"].queryset = _scope_queryset_by_context(Warehouse.objects.all(), holder)
-            fields["preparation"].queryset = _scope_queryset_by_context(Preparation.objects.all(), holder)
-        else:
-            fields["dish"].queryset = MenuItem.objects.none()
-            fields["product"].queryset = Warehouse.objects.none()
-            fields["preparation"].queryset = Preparation.objects.none()
+        # используем request из context (CompanyBranchReadOnlyMixin)
+        fields["dish"].queryset = _scope_queryset_by_context(MenuItem.objects.all(), self)
+        fields["product"].queryset = _scope_queryset_by_context(Warehouse.objects.all(), self)
+        fields["preparation"].queryset = _scope_queryset_by_context(Preparation.objects.all(), self)
         fields["product"].required = False
         fields["product"].allow_null = True
         fields["preparation"].required = False
@@ -591,7 +586,7 @@ class DishIngredientSerializer(serializers.ModelSerializer):
         return attrs
 
 
-class DishIngredientProcessingCreateSerializer(serializers.ModelSerializer):
+class DishIngredientProcessingCreateSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
     class Meta:
         model = DishIngredientProcessing
         fields = ["id", "ingredient", "processing_type"]
@@ -599,13 +594,8 @@ class DishIngredientProcessingCreateSerializer(serializers.ModelSerializer):
 
     def get_fields(self):
         fields = super().get_fields()
-        holder = getattr(self, "root", None)
-        if isinstance(holder, CompanyBranchReadOnlyMixin):
-            fields["ingredient"].queryset = _scope_queryset_by_context(DishIngredient.objects.all(), holder)
-            fields["processing_type"].queryset = _scope_queryset_by_context(ProcessingType.objects.all(), holder)
-        else:
-            fields["ingredient"].queryset = DishIngredient.objects.none()
-            fields["processing_type"].queryset = ProcessingType.objects.none()
+        fields["ingredient"].queryset = _scope_queryset_by_context(DishIngredient.objects.all(), self)
+        fields["processing_type"].queryset = _scope_queryset_by_context(ProcessingType.objects.all(), self)
         return fields
 
 
