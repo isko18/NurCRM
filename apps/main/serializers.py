@@ -20,6 +20,7 @@ from apps.main.models import (
     ReturnFromAgent, ProductImage, PromoRule, AgentRequestCart, AgentRequestItem,
     ProductPackage, ProductCharacteristics, DealPayment, AgentSaleAllocation,
     ProductRecipeItem, ProductPromotionTier, MarketSaleEmployeePayProfile,
+    SupplierReceipt, SupplierReceiptItem,
 )
 
 from apps.consalting.models import ServicesConsalting
@@ -798,6 +799,13 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
         allow_null=True,
     )
     client_name = serializers.CharField(source="client.full_name", read_only=True)
+    supplier_ids = serializers.PrimaryKeyRelatedField(
+        queryset=Client.objects.all(),
+        many=True,
+        required=False,
+        write_only=True,
+    )
+    suppliers = serializers.SerializerMethodField(read_only=True)
 
     # ====== статус ======
     status = serializers.CharField(required=False, allow_null=True, allow_blank=True)
@@ -909,6 +917,7 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
             "expiration_date",
             "status", "status_display",
             "client", "client_name",
+            "supplier_ids", "suppliers",
             "stock", "promotion_rules", "promotion_rules_input", "date",
             "created_by", "created_by_name",
             "created_at", "updated_at",
@@ -952,6 +961,14 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
         br = self._auto_branch()
         _restrict_pk_queryset_strict(self.fields.get("item_make_ids"), ItemMake.objects.all(), comp, br)
         _restrict_pk_queryset_strict(self.fields.get("client"), Client.objects.all(), comp, br)
+        _restrict_pk_queryset_strict(self.fields.get("supplier_ids"), Client.objects.all(), comp, br)
+
+    def get_suppliers(self, obj):
+        try:
+            qs = obj.suppliers.all()
+            return [{"id": str(c.id), "name": c.full_name} for c in qs]
+        except Exception:
+            return []
 
     def validate_hotkey_group(self, value):
         if value in (None, ""):
@@ -1211,6 +1228,7 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
         packages_data = validated_data.pop("packages_input", [])
         promotion_in = "promotion_rules_input" in validated_data
         promotion_raw = validated_data.pop("promotion_rules_input", None) if promotion_in else None
+        supplier_ids = validated_data.pop("supplier_ids", None)
 
         company = self._user_company()
         branch = self._auto_branch()
@@ -1298,6 +1316,9 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
             stock=validated_data.get("stock", False),
         )
 
+        if supplier_ids is not None:
+            product.suppliers.set(supplier_ids)
+
         if item_make_data:
             product.item_make.set(item_make_data)
 
@@ -1332,6 +1353,7 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
         branch = self._auto_branch()
 
         packages_data = validated_data.pop("packages_input", None)
+        supplier_ids = validated_data.pop("supplier_ids", None)
         promotion_in = "promotion_rules_input" in validated_data
         promotion_raw = validated_data.pop("promotion_rules_input", None) if promotion_in else None
         if promotion_in and promotion_raw:
@@ -1444,6 +1466,9 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
                     })
 
         instance.save()
+
+        if supplier_ids is not None:
+            instance.suppliers.set(supplier_ids)
 
         # PACKAGES перезаписываем ТОЛЬКО если реально пришли в PATCH
         if packages_data is not None:
@@ -2390,6 +2415,42 @@ class SupplierReceiptCreateSerializer(serializers.Serializer):
         if not items:
             raise serializers.ValidationError("items не может быть пустым.")
         return items
+
+
+class SupplierReceiptItemReadSerializer(serializers.ModelSerializer):
+    product_id = serializers.UUIDField(source="product.id", read_only=True)
+    product_name = serializers.CharField(source="product.name", read_only=True)
+    product_code = serializers.CharField(source="product.code", read_only=True)
+
+    class Meta:
+        model = SupplierReceiptItem
+        fields = ["id", "product_id", "product_name", "product_code", "qty", "purchase_price"]
+
+
+class SupplierReceiptReadSerializer(serializers.ModelSerializer):
+    supplier_id = serializers.UUIDField(source="supplier.id", read_only=True)
+    supplier_name = serializers.CharField(source="supplier.full_name", read_only=True)
+    supplier_llc = serializers.CharField(source="supplier.llc", read_only=True)
+    supplier_phone = serializers.CharField(source="supplier.phone", read_only=True)
+    created_by_id = serializers.UUIDField(source="created_by.id", read_only=True)
+    created_by_name = serializers.CharField(source="created_by.email", read_only=True)
+    items = SupplierReceiptItemReadSerializer(many=True, read_only=True)
+
+    class Meta:
+        model = SupplierReceipt
+        fields = [
+            "id",
+            "company",
+            "branch",
+            "supplier_id",
+            "supplier_name",
+            "supplier_llc",
+            "supplier_phone",
+            "created_by_id",
+            "created_by_name",
+            "created_at",
+            "items",
+        ]
 
 
 class ReturnCreateSerializer(serializers.ModelSerializer):

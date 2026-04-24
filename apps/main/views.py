@@ -40,6 +40,8 @@ from apps.main.models import (
     MarketSaleEmployeePayProfile,
     Sale,
     SaleItem,
+    SupplierReceipt,
+    SupplierReceiptItem,
 )
 from apps.main.serializers import (
     ContactSerializer, PipelineSerializer, DealSerializer, TaskSerializer,
@@ -60,6 +62,7 @@ from apps.main.serializers import (
     AgentRequestCartSerializer, AgentRequestCartSubmitSerializer, AgentRequestItemSerializer, DealPayInputSerializer, DealRefundInputSerializer,
     MarketSaleEmployeePayProfileSerializer,
     SupplierReceiptCreateSerializer,
+    SupplierReceiptReadSerializer,
 )
 from django.db.models import ProtectedError
 from apps.utils import product_images_prefetch, _is_owner_like
@@ -2746,7 +2749,7 @@ class SupplierProductsListAPIView(CompanyBranchRestrictedMixin, generics.ListAPI
         supplier = get_object_or_404(sup_qs, id=supplier_id, type=Client.StatusClient.SUPPLIERS)
 
         prod_qs = self._filter_qs_company_branch(Product.objects.all())
-        return prod_qs.filter(client_id=supplier.id)
+        return prod_qs.filter(Q(suppliers=supplier) | Q(client_id=supplier.id)).distinct()
 
 
 class SupplierReceiptAPIView(CompanyBranchRestrictedMixin, APIView):
@@ -2764,6 +2767,9 @@ class SupplierReceiptAPIView(CompanyBranchRestrictedMixin, APIView):
 
     @transaction.atomic
     def post(self, request, supplier_id):
+        company = self._company()
+        branch = self._auto_branch()
+
         sup_qs = self._filter_qs_company_branch(Client.objects.all())
         supplier = get_object_or_404(sup_qs, id=supplier_id, type=Client.StatusClient.SUPPLIERS)
 
@@ -2782,11 +2788,28 @@ class SupplierReceiptAPIView(CompanyBranchRestrictedMixin, APIView):
             raise ValidationError({"items": [f"Товары не найдены/не доступны: {', '.join(missing)}"]})
 
         # проверим принадлежность поставщику
-        wrong_supplier = [str(p.id) for p in products if p.client_id != supplier.id]
+        wrong_supplier = []
+        for p in products:
+            ok = False
+            try:
+                ok = (p.client_id == supplier.id) or p.suppliers.filter(id=supplier.id).exists()
+            except Exception:
+                ok = (p.client_id == supplier.id)
+            if not ok:
+                wrong_supplier.append(str(p.id))
         if wrong_supplier:
             raise ValidationError({"items": [f"Товары не принадлежат выбранному поставщику: {', '.join(wrong_supplier)}"]})
 
+        # лог оприходования
+        receipt = SupplierReceipt.objects.create(
+            company=company,
+            branch=branch,
+            supplier=supplier,
+            created_by=getattr(request, "user", None),
+        )
+
         # обновляем цены (если переданы) и увеличиваем остатки
+        receipt_items = []
         for it in items:
             pid = it["product"].id
             qty = int(it["qty"])
@@ -2795,15 +2818,61 @@ class SupplierReceiptAPIView(CompanyBranchRestrictedMixin, APIView):
                 upd["purchase_price"] = it["purchase_price"]
             type(by_id[pid]).objects.filter(id=pid).update(**upd)
 
+            receipt_items.append(
+                SupplierReceiptItem(
+                    receipt=receipt,
+                    product=by_id[pid],
+                    qty=qty,
+                    purchase_price=it.get("purchase_price"),
+                )
+            )
+
+        if receipt_items:
+            SupplierReceiptItem.objects.bulk_create(receipt_items)
+
         # вернём актуальные данные по товарам
         refreshed = list(self._filter_qs_company_branch(Product.objects.all()).filter(id__in=product_ids))
         return Response(
             {
                 "supplier": str(supplier.id),
+                "receipt_id": str(receipt.id),
                 "products": ProductListSerializer(refreshed, many=True, context={"request": request}).data,
             },
             status=status.HTTP_200_OK,
         )
+
+
+class SupplierReceiptListAPIView(CompanyBranchRestrictedMixin, generics.ListAPIView):
+    """
+    GET /api/main/suppliers/receipts/?supplier_id=<uuid>&date_from=YYYY-MM-DD&date_to=YYYY-MM-DD
+    """
+
+    permission_classes = [permissions.IsAuthenticated]
+    serializer_class = SupplierReceiptReadSerializer
+
+    def get_queryset(self):
+        qs = SupplierReceipt.objects.select_related("supplier", "company", "branch", "created_by").prefetch_related(
+            "items",
+            "items__product",
+        )
+        qs = self._filter_qs_company_branch(qs)
+
+        qp = self.request.query_params
+        supplier_id = (qp.get("supplier_id") or "").strip()
+        if supplier_id:
+            qs = qs.filter(supplier_id=supplier_id)
+
+        # date filter (created_at)
+        df_raw = (qp.get("date_from") or qp.get("created_from") or "").strip()
+        dt_raw = (qp.get("date_to") or qp.get("created_to") or "").strip()
+        df = parse_date(df_raw) if df_raw else None
+        dt = parse_date(dt_raw) if dt_raw else None
+        if df:
+            qs = qs.filter(created_at__date__gte=df)
+        if dt:
+            qs = qs.filter(created_at__date__lte=dt)
+
+        return qs
 
 
 # ===========================

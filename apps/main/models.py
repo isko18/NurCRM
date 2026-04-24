@@ -646,6 +646,13 @@ class Product(models.Model):
         related_name="products",
         verbose_name="Клиент",
     )
+    suppliers = models.ManyToManyField(
+        "Client",
+        blank=True,
+        related_name="supplied_products",
+        verbose_name="Поставщики",
+        limit_choices_to=Q(type="suppliers"),
+    )
     created_by = models.ForeignKey(
         User,
         on_delete=models.SET_NULL,
@@ -2551,6 +2558,93 @@ class Client(models.Model):
             sp_company_id = getattr(self.salesperson, "company_id", None)
             if sp_company_id and sp_company_id != self.company_id:
                 raise ValidationError({'salesperson': 'Продавец другой компании.'})
+
+
+# ==========================
+# Supplier receipts (оприходования)
+# ==========================
+class SupplierReceipt(models.Model):
+    """
+    Журнал оприходований от поставщиков.
+    Создаётся в SupplierReceiptAPIView (POST /api/main/suppliers/<id>/receipt/).
+    """
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    company = models.ForeignKey(Company, on_delete=models.CASCADE, related_name="supplier_receipts", db_index=True)
+    branch = models.ForeignKey(
+        Branch,
+        on_delete=models.CASCADE,
+        related_name="supplier_receipts",
+        null=True,
+        blank=True,
+        db_index=True,
+    )
+    supplier = models.ForeignKey(
+        Client,
+        on_delete=models.CASCADE,
+        related_name="supplier_receipts",
+        db_index=True,
+        limit_choices_to=Q(type=Client.StatusClient.SUPPLIERS),
+    )
+    created_by = models.ForeignKey(
+        User,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="created_supplier_receipts",
+    )
+    created_at = models.DateTimeField(auto_now_add=True, db_index=True)
+
+    class Meta:
+        verbose_name = "Оприходование от поставщика"
+        verbose_name_plural = "Оприходования от поставщика"
+        ordering = ["-created_at"]
+        indexes = [
+            models.Index(fields=["company", "supplier", "created_at"]),
+            models.Index(fields=["company", "branch", "created_at"]),
+        ]
+
+    def clean(self):
+        if self.supplier_id and self.company_id and self.supplier.company_id != self.company_id:
+            raise ValidationError({"supplier": "Поставщик другой компании."})
+        if self.branch_id and self.company_id and self.branch.company_id != self.company_id:
+            raise ValidationError({"branch": "Филиал принадлежит другой компании."})
+
+
+class SupplierReceiptItem(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    receipt = models.ForeignKey(SupplierReceipt, on_delete=models.CASCADE, related_name="items", db_index=True)
+    product = models.ForeignKey(Product, on_delete=models.CASCADE, related_name="supplier_receipt_items", db_index=True)
+    qty = models.PositiveIntegerField()
+    purchase_price = models.DecimalField(max_digits=11, decimal_places=3, null=True, blank=True)
+
+    class Meta:
+        verbose_name = "Строка оприходования"
+        verbose_name_plural = "Строки оприходования"
+        indexes = [
+            models.Index(fields=["receipt", "product"]),
+        ]
+
+    def clean(self):
+        if self.receipt_id and self.product_id:
+            if self.product.company_id != self.receipt.company_id:
+                raise ValidationError({"product": "Товар другой компании."})
+            rb = self.receipt.branch_id
+            pb = self.product.branch_id
+            if rb is None and pb is not None:
+                raise ValidationError({"product": "В оприходовании без филиала можно только глобальные товары (без филиала)."})
+            if rb is not None and pb not in (None, rb):
+                raise ValidationError({"product": "Товар другого филиала."})
+            if self.receipt.supplier_id:
+                if getattr(self.product, "client_id", None) == self.receipt.supplier_id:
+                    return
+                try:
+                    if self.product.suppliers.filter(id=self.receipt.supplier_id).exists():
+                        return
+                except Exception:
+                    pass
+                raise ValidationError({"product": "Товар не принадлежит выбранному поставщику."})
+
 
 class ClientDeal(models.Model):
     class Kind(models.TextChoices):
