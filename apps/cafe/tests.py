@@ -1152,6 +1152,8 @@ class CafeCostingTZTestCase(TransactionTestCase):
         self.assertEqual(convert_quantity(Decimal("1"), "l", "ml"), Decimal("1000"))
         self.assertEqual(convert_quantity(Decimal("250"), "ml", "l"), Decimal("0.25"))
         self.assertEqual(convert_quantity(Decimal("2"), "pcs", "pcs"), Decimal("2"))
+        self.assertEqual(convert_quantity(Decimal("1"), "кг", "г"), Decimal("1000"))
+        self.assertEqual(convert_quantity(Decimal("3"), "шт", "pcs"), Decimal("3"))
 
     def test_preparation_potato_example_from_tz(self):
         """

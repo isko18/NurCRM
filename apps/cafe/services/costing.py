@@ -11,7 +11,40 @@ SUPPORTED_UNITS = {"kg", "g", "l", "ml", "pcs"}
 
 
 def _norm_unit(unit: str | None) -> str:
-    return (unit or "").strip().lower()
+    s = (unit or "").strip().lower()
+    s = s.replace(".", "").replace(",", "").strip()
+    if not s:
+        return ""
+    mapping = {
+        # weight
+        "кг": "kg",
+        "kg": "kg",
+        "килограмм": "kg",
+        "килограммы": "kg",
+        "г": "g",
+        "гр": "g",
+        "грамм": "g",
+        "граммы": "g",
+        "g": "g",
+        # volume
+        "л": "l",
+        "l": "l",
+        "литр": "l",
+        "литры": "l",
+        "мл": "ml",
+        "ml": "ml",
+        "миллилитр": "ml",
+        "миллилитры": "ml",
+        # pieces
+        "шт": "pcs",
+        "штука": "pcs",
+        "штуки": "pcs",
+        "piece": "pcs",
+        "pieces": "pcs",
+        "pc": "pcs",
+        "pcs": "pcs",
+    }
+    return mapping.get(s, s)
 
 
 def convert_quantity(quantity: Decimal, from_unit: str, to_unit: str) -> Decimal:

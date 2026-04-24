@@ -1526,6 +1526,7 @@ class SaleScanAPIView(MarketCashierOnlyMixin, APIView):
                     normalized_code = str(int(raw_code))
                 except Exception:
                     normalized_code = raw_code
+                padded_code = normalized_code.zfill(4) if normalized_code.isdigit() else normalized_code
                 try:
                     # 1) normalized_code (00010 -> 10)
                     code_cache_key = f"product_code:{cart.company_id}:{normalized_code}"
@@ -1548,10 +1549,24 @@ class SaleScanAPIView(MarketCashierOnlyMixin, APIView):
                             )
                             cache.set(raw_cache_key, product, 300)
                     except Product.DoesNotExist:
-                        return Response(
-                            {"not_found": True, "message": f"Товар с кодом {normalized_code} / {raw_code} не найден"},
-                            status=404,
-                        )
+                        # 3) fallback padded_code (e.g. 202 -> 0202)
+                        try:
+                            padded_cache_key = f"product_code:{cart.company_id}:{padded_code}"
+                            product = cache.get(padded_cache_key)
+                            if product is None:
+                                product = Product.objects.only("id", "company_id", "price", "barcode", "code").get(
+                                    company_id=cart.company_id,
+                                    code=padded_code,
+                                )
+                                cache.set(padded_cache_key, product, 300)
+                        except Product.DoesNotExist:
+                            return Response(
+                                {
+                                    "not_found": True,
+                                    "message": f"Товар с кодом {normalized_code} / {raw_code} / {padded_code} не найден",
+                                },
+                                status=404,
+                            )
 
         if scale_data:
             effective_qty = Decimal(str(scale_data["weight_kg"]))
