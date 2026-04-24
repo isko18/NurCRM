@@ -858,8 +858,8 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
     country = serializers.CharField(required=False, allow_blank=True)
     expiration_date = serializers.DateField(required=False, allow_null=True)
 
-    # ==== ПЛУ ====  — ТОЛЬКО READ-ONLY!
-    plu = serializers.IntegerField(read_only=True)
+    # ==== ПЛУ ====
+    plu = serializers.IntegerField(required=False, allow_null=True)
 
     # ==== ДАННЫЕ С ВЕСОВ ====
     weight_kg = serializers.SerializerMethodField(read_only=True)
@@ -932,7 +932,6 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
             "characteristics",
             "packages",
             "promotion_rules",
-            "plu",
             "weight_kg", "total_price",
         ]
         extra_kwargs = {

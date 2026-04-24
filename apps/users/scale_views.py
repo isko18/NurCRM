@@ -170,11 +170,17 @@ def send_products_to_scale(request):
                 used.add(int(plu_value))
                 cur_plu = max(cur_plu, int(plu_value) + 1)
 
+            code_value = None
+            try:
+                code_value = int(p.code) if (p.code or "").isdigit() else None
+            except Exception:
+                code_value = None
+
             items.append(
                 {
                     "product_uuid": str(p.id),
                     "plu_number": int(plu_value),
-                    "code": int(plu_value),
+                    "code": int(code_value) if code_value is not None else int(plu_value),
                     "name": name,
                     "price": price,
                     "shelf_life_days": shelf,
