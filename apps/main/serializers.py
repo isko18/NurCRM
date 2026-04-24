@@ -1371,6 +1371,7 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
             "article",
             "unit",
             "is_weight",
+            "plu",
             "country",
             "expiration_date",
             "client",
