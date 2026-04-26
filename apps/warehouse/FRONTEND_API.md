@@ -1031,10 +1031,24 @@ Read-only поля:
     "sales_count": 45,
     "sales_amount": "15000.00",
     "on_hand_qty": "80.000",
-    "on_hand_amount": "6400.00"
+    "on_hand_amount": "6400.00",
+
+    "money_docs_count": 18,
+    "money_receipt_amount": "5200.00",
+    "money_expense_amount": "3100.00",
+    "money_net_amount": "2100.00"
   },
   "charts": {
-    "sales_by_date": [ ... ]
+    "sales_by_date": [ ... ],
+    "money_by_date": [
+      {
+        "date": "2026-02-01",
+        "docs_count": 3,
+        "money_receipt_amount": "1200.00",
+        "money_expense_amount": "400.00",
+        "money_net_amount": "800.00"
+      }
+    ]
   },
   "top_agents": {
     "by_sales": [ ... ],
@@ -1052,6 +1066,23 @@ Read-only поля:
         "on_hand_qty": "15.000",
         "on_hand_amount": "1200.00"
       }
+    ],
+    "cash_by_register": [
+      {
+        "kind": "cash_register|warehouse_legacy",
+        "account_id": "uuid|null",
+        "account_name": "string",
+        "docs_count": 10,
+        "money_receipt_amount": "3400.00",
+        "money_expense_amount": "1200.00",
+        "money_net_amount": "2200.00"
+      }
+    ],
+    "money_receipts_by_category": [
+      { "category_id": "uuid|null", "category_title": "string", "docs_count": 5, "amount": "1500.00" }
+    ],
+    "money_expenses_by_category": [
+      { "category_id": "uuid|null", "category_title": "string", "docs_count": 7, "amount": "900.00" }
     ],
     "sales_by_product": [
       {

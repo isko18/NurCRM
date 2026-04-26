@@ -326,6 +326,151 @@ def _build_sales_by_group(*, sales_items_qs, limit: int = 100):
     return rows, top
 
 
+def _build_owner_cash_analytics(*, company, branch, dt_from, dt_to_excl, group_by: str):
+    """
+    Аналитика по кассе (MoneyDocument) для owner/admin.
+    Считаем только проведённые документы за период: приход/расход, сальдо,
+    разбивка по кассам и по категориям (отдельно приход/расход).
+    """
+    money_qs = wm.MoneyDocument.objects.filter(
+        company=company,
+        status=wm.MoneyDocument.Status.POSTED,
+        doc_type__in=(wm.MoneyDocument.DocType.MONEY_RECEIPT, wm.MoneyDocument.DocType.MONEY_EXPENSE),
+        date__gte=dt_from,
+        date__lt=dt_to_excl,
+    )
+    if branch is not None:
+        money_qs = money_qs.filter(branch=branch)
+    else:
+        money_qs = money_qs.filter(branch__isnull=True)
+
+    totals = money_qs.aggregate(
+        receipt=Coalesce(Sum("amount", filter=Q(doc_type=wm.MoneyDocument.DocType.MONEY_RECEIPT)), ZERO_MONEY),
+        expense=Coalesce(Sum("amount", filter=Q(doc_type=wm.MoneyDocument.DocType.MONEY_EXPENSE)), ZERO_MONEY),
+        docs_count=Count("id"),
+    )
+    receipt_total = (totals.get("receipt") or Decimal("0.00")).quantize(Decimal("0.01"))
+    expense_total = (totals.get("expense") or Decimal("0.00")).quantize(Decimal("0.01"))
+    net_total = (receipt_total - expense_total).quantize(Decimal("0.01"))
+
+    # by cash register (and legacy warehouse account if cash_register is null)
+    by_cash_register_qs = (
+        money_qs.values(
+            "cash_register_id",
+            "cash_register__name",
+            "warehouse_id",
+            "warehouse__name",
+        )
+        .annotate(
+            docs_count=Count("id"),
+            receipt=Coalesce(
+                Sum("amount", filter=Q(doc_type=wm.MoneyDocument.DocType.MONEY_RECEIPT), output_field=MONEY_FIELD),
+                ZERO_MONEY,
+            ),
+            expense=Coalesce(
+                Sum("amount", filter=Q(doc_type=wm.MoneyDocument.DocType.MONEY_EXPENSE), output_field=MONEY_FIELD),
+                ZERO_MONEY,
+            ),
+        )
+        .order_by("-receipt", "-expense", "-docs_count")
+    )
+    cash_by_register = []
+    for r in by_cash_register_qs:
+        cash_id = r.get("cash_register_id")
+        wh_id = r.get("warehouse_id")
+        if cash_id:
+            kind = "cash_register"
+            account_id = str(cash_id)
+            account_name = (r.get("cash_register__name") or "").strip() or "Касса"
+        else:
+            kind = "warehouse_legacy"
+            account_id = str(wh_id) if wh_id else None
+            account_name = (r.get("warehouse__name") or "").strip() or "Счёт"
+
+        rec = (r.get("receipt") or Decimal("0.00")).quantize(Decimal("0.01"))
+        exp = (r.get("expense") or Decimal("0.00")).quantize(Decimal("0.01"))
+        cash_by_register.append(
+            {
+                "kind": kind,
+                "account_id": account_id,
+                "account_name": account_name,
+                "docs_count": r["docs_count"],
+                "money_receipt_amount": _money_str(rec),
+                "money_expense_amount": _money_str(exp),
+                "money_net_amount": _money_str((rec - exp).quantize(Decimal("0.01"))),
+            }
+        )
+
+    def _by_category(doc_type):
+        qs = (
+            money_qs.filter(doc_type=doc_type)
+            .values("payment_category_id", "payment_category__title")
+            .annotate(
+                docs_count=Count("id"),
+                amount=Coalesce(Sum("amount", output_field=MONEY_FIELD), ZERO_MONEY),
+            )
+            .order_by("-amount", "-docs_count")
+        )
+        out = []
+        for row in qs:
+            cid = row.get("payment_category_id")
+            title = (row.get("payment_category__title") or "").strip() or "Без категории"
+            out.append(
+                {
+                    "category_id": str(cid) if cid else None,
+                    "category_title": title,
+                    "docs_count": row["docs_count"],
+                    "amount": _money_str(row["amount"]),
+                }
+            )
+        return out
+
+    money_receipts_by_category = _by_category(wm.MoneyDocument.DocType.MONEY_RECEIPT)
+    money_expenses_by_category = _by_category(wm.MoneyDocument.DocType.MONEY_EXPENSE)
+
+    trunc_money = _trunc_by_group("date", group_by)
+    money_by_date_qs = (
+        money_qs.annotate(period=trunc_money)
+        .values("period")
+        .annotate(
+            receipt=Coalesce(Sum("amount", filter=Q(doc_type=wm.MoneyDocument.DocType.MONEY_RECEIPT)), ZERO_MONEY),
+            expense=Coalesce(Sum("amount", filter=Q(doc_type=wm.MoneyDocument.DocType.MONEY_EXPENSE)), ZERO_MONEY),
+            docs_count=Count("id"),
+        )
+        .order_by("period")
+    )
+    money_by_date = []
+    for row in money_by_date_qs:
+        rec = (row.get("receipt") or Decimal("0.00")).quantize(Decimal("0.01"))
+        exp = (row.get("expense") or Decimal("0.00")).quantize(Decimal("0.01"))
+        money_by_date.append(
+            {
+                "date": _period_iso(row["period"]),
+                "docs_count": row["docs_count"],
+                "money_receipt_amount": _money_str(rec),
+                "money_expense_amount": _money_str(exp),
+                "money_net_amount": _money_str((rec - exp).quantize(Decimal("0.01"))),
+            }
+        )
+
+    return {
+        "summary": {
+            "money_docs_count": int(totals.get("docs_count") or 0),
+            "money_receipt_amount": _money_str(receipt_total),
+            "money_expense_amount": _money_str(expense_total),
+            "money_net_amount": _money_str(net_total),
+        },
+        "charts": {
+            "money_by_date": money_by_date,
+        },
+        "details": {
+            "cash_by_register": cash_by_register,
+            "money_receipts_by_category": money_receipts_by_category,
+            "money_expenses_by_category": money_expenses_by_category,
+        },
+    }
+
+
 @cached_result(timeout=settings.CACHE_TIMEOUT_ANALYTICS, key_prefix="warehouse_analytics_agent")
 def build_agent_warehouse_analytics_payload(
     *,
@@ -782,6 +927,14 @@ def build_owner_warehouse_analytics_payload(
             "on_hand_amount": _money_str(on_hand.get("on_hand_amount", Decimal("0.00"))),
         })
 
+    cash = _build_owner_cash_analytics(
+        company=company,
+        branch=branch,
+        dt_from=dt_from,
+        dt_to_excl=dt_to_excl,
+        group_by=group_by,
+    )
+
     return {
         "period": period,
         "date_from": str(date_from),
@@ -793,9 +946,11 @@ def build_owner_warehouse_analytics_payload(
             "sales_amount": _money_str(sales_amount),
             "on_hand_qty": str(on_hand_qty),
             "on_hand_amount": _money_str(on_hand_amount),
+            **cash["summary"],
         },
         "charts": {
             "sales_by_date": sales_by_date,
+            **cash["charts"],
         },
         "top_agents": {
             "by_sales": top_agents_by_sales,
@@ -806,6 +961,7 @@ def build_owner_warehouse_analytics_payload(
             "sales_by_product": sales_by_product,
             "sales_by_group": sales_by_group,
             "top_sales_group": top_sales_group,
+            **cash["details"],
         },
     }
 
