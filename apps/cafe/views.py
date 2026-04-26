@@ -779,7 +779,12 @@ class MenuItemListCreateView(CompanyBranchQuerysetMixin, generics.ListCreateAPIV
     queryset = (
         MenuItem.objects
         .select_related("category", "company")
-        .prefetch_related("ingredients__product")
+        .prefetch_related(
+            "ingredients__product",
+            "dish_ingredients__product",
+            "dish_ingredients__preparation",
+            "dish_ingredients__processings__processing_type",
+        )
         .all()
     )
     serializer_class = MenuItemSerializer
@@ -811,7 +816,12 @@ class MenuItemRetrieveUpdateDestroyView(CompanyBranchQuerysetMixin, generics.Ret
     queryset = (
         MenuItem.objects
         .select_related("category", "company")
-        .prefetch_related("ingredients__product")
+        .prefetch_related(
+            "ingredients__product",
+            "dish_ingredients__product",
+            "dish_ingredients__preparation",
+            "dish_ingredients__processings__processing_type",
+        )
         .all()
     )
     serializer_class = MenuItemSerializer
@@ -936,7 +946,10 @@ class PreparationRetrieveUpdateDestroyView(CompanyBranchQuerysetMixin, generics.
             )
             if dish_ids:
                 for d in MenuItem.objects.filter(id__in=dish_ids).all():
-                    recalculate_dish(d, save=True)
+                    try:
+                        recalculate_dish(d, save=True)
+                    except ValueError as e:
+                        raise ValidationError({"detail": str(e)})
 
 
 # ==================== Processing types ====================
@@ -977,7 +990,10 @@ class ProcessingTypeRetrieveUpdateDestroyView(CompanyBranchQuerysetMixin, generi
         ing_ids = DishIngredientProcessing.objects.filter(processing_type=obj).values_list("ingredient_id", flat=True).distinct()
         dish_ids = DishIngredient.objects.filter(id__in=ing_ids).values_list("dish_id", flat=True).distinct()
         for d in MenuItem.objects.filter(id__in=dish_ids).all():
-            recalculate_dish(d, save=True)
+            try:
+                recalculate_dish(d, save=True)
+            except ValueError as e:
+                raise ValidationError({"detail": str(e)})
 
 
 # ==================== Dish ingredients (new) ====================
@@ -997,7 +1013,10 @@ class DishIngredientCreateForDishView(CompanyBranchQuerysetMixin, APIView):
         ser.is_valid(raise_exception=True)
         with transaction.atomic():
             ing: DishIngredient = ser.save()
-            recalculate_dish(dish, save=True)
+            try:
+                recalculate_dish(dish, save=True)
+            except ValueError as e:
+                raise ValidationError({"detail": str(e)})
         return Response(DishIngredientSerializer(ing, context={"request": request}).data, status=status.HTTP_201_CREATED)
 
 
@@ -1017,13 +1036,19 @@ class DishIngredientRetrieveUpdateDestroyView(CompanyBranchQuerysetMixin, generi
     def perform_update(self, serializer):
         with transaction.atomic():
             ing: DishIngredient = serializer.save()
-            recalculate_dish(ing.dish, save=True)
+            try:
+                recalculate_dish(ing.dish, save=True)
+            except ValueError as e:
+                raise ValidationError({"detail": str(e)})
 
     def perform_destroy(self, instance):
         dish = instance.dish
         with transaction.atomic():
             super().perform_destroy(instance)
-            recalculate_dish(dish, save=True)
+            try:
+                recalculate_dish(dish, save=True)
+            except ValueError as e:
+                raise ValidationError({"detail": str(e)})
 
 
 class DishIngredientProcessingCreateView(CompanyBranchQuerysetMixin, APIView):
@@ -1036,7 +1061,10 @@ class DishIngredientProcessingCreateView(CompanyBranchQuerysetMixin, APIView):
             ing = ser.validated_data["ingredient"]
             pt = ser.validated_data["processing_type"]
             DishIngredientProcessing.objects.create(ingredient=ing, processing_type=pt, cost=Decimal("0.00"))
-            recalculate_dish(ing.dish, save=True)
+            try:
+                recalculate_dish(ing.dish, save=True)
+            except ValueError as e:
+                raise ValidationError({"detail": str(e)})
         return Response({"detail": "ok"}, status=status.HTTP_201_CREATED)
 
 
@@ -1053,7 +1081,10 @@ class DishIngredientProcessingDeleteView(CompanyBranchQuerysetMixin, APIView):
         with transaction.atomic():
             dish = obj.ingredient.dish
             obj.delete()
-            recalculate_dish(dish, save=True)
+            try:
+                recalculate_dish(dish, save=True)
+            except ValueError as e:
+                raise ValidationError({"detail": str(e)})
         return Response(status=status.HTTP_204_NO_CONTENT)
 
 
@@ -1070,7 +1101,10 @@ class DishCostView(CompanyBranchQuerysetMixin, APIView):
         if b is not None and dish.branch_id not in (None, b.id):
             return Response({"detail": "Не найдено."}, status=status.HTTP_404_NOT_FOUND)
 
-        recalculate_dish(dish, save=True)
+        try:
+            recalculate_dish(dish, save=True)
+        except ValueError as e:
+            raise ValidationError({"detail": str(e)})
         payload = {
             "dish_id": dish.id,
             "cost_price": dish.cost_price,

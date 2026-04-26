@@ -727,6 +727,24 @@ class MenuItemSerializer(CompanyBranchReadOnlyMixin):
             "vat_amount", "profit", "margin_percent", "ingredients_cost"
         ]
 
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        # Если блюдо использует новую схему DishIngredient — показываем её в поле "ingredients",
+        # чтобы фронт видел добавленные ингредиенты через /dishes/<id>/ingredients/.
+        try:
+            if getattr(instance, "dish_ingredients", None) is not None and instance.dish_ingredients.exists():
+                qs = (
+                    instance.dish_ingredients
+                    .select_related("product", "preparation")
+                    .prefetch_related("processings__processing_type")
+                    .all()
+                )
+                data["ingredients"] = DishIngredientSerializer(qs, many=True, context=self.context).data
+        except Exception:
+            # безопасно: в случае неожиданного состояния оставим legacy ingredients
+            pass
+        return data
+
     def get_fields(self):
         fields = super().get_fields()
         fields["category"].queryset = _scope_queryset_by_context(Category.objects.all(), self)
@@ -811,7 +829,10 @@ class MenuItemSerializer(CompanyBranchReadOnlyMixin):
 
     def _recalc_and_save_cost(self, menu_item):
         """Пересчитать и сохранить себестоимость"""
-        menu_item.recalc_cost_price()
+        try:
+            menu_item.recalc_cost_price()
+        except ValueError as e:
+            raise serializers.ValidationError({"detail": str(e)})
         menu_item.save(update_fields=["cost_price", "margin_amount", "margin_percent"])
 
     def create(self, validated_data):
