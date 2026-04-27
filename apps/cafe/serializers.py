@@ -587,14 +587,47 @@ class PreparationReceiveSerializer(serializers.Serializer):
 
 
 class DishIngredientProcessingSerializer(serializers.ModelSerializer):
-    processing_type_name = serializers.CharField(source="processing_type.name", read_only=True)
-    charge_type = serializers.CharField(source="processing_type.charge_type", read_only=True)
-    rate = serializers.DecimalField(source="processing_type.cost", max_digits=12, decimal_places=2, read_only=True)
+    processing_type_name = serializers.CharField(source="processing_type.name", read_only=True, allow_null=True)
+    preparation_processing_name = serializers.CharField(source="preparation_processing.name", read_only=True, allow_null=True)
+    charge_type = serializers.SerializerMethodField()
+    rate = serializers.SerializerMethodField()
 
     class Meta:
         model = DishIngredientProcessing
-        fields = ["id", "ingredient", "processing_type", "processing_type_name", "charge_type", "rate", "cost"]
-        read_only_fields = ["id", "ingredient", "processing_type_name", "charge_type", "rate", "cost"]
+        fields = [
+            "id",
+            "ingredient",
+            "processing_type",
+            "processing_type_name",
+            "preparation_processing",
+            "preparation_processing_name",
+            "charge_type",
+            "rate",
+            "cost",
+        ]
+        read_only_fields = [
+            "id",
+            "ingredient",
+            "processing_type_name",
+            "preparation_processing_name",
+            "charge_type",
+            "rate",
+            "cost",
+        ]
+
+    def get_charge_type(self, obj):
+        if obj.preparation_processing_id:
+            return obj.preparation_processing.charge_type
+        if obj.processing_type_id:
+            return obj.processing_type.charge_type
+        return None
+
+    def get_rate(self, obj):
+        if obj.preparation_processing_id:
+            return obj.preparation_processing.cost
+        if obj.processing_type_id:
+            return obj.processing_type.cost
+        return None
 
 
 class DishIngredientSerializer(serializers.ModelSerializer):
@@ -679,9 +712,16 @@ class DishIngredientSerializer(serializers.ModelSerializer):
 
 
 class DishIngredientProcessingCreateSerializer(serializers.ModelSerializer):
+    processing_type = serializers.PrimaryKeyRelatedField(
+        queryset=ProcessingType.objects.none(), required=False, allow_null=True
+    )
+    preparation_processing = serializers.PrimaryKeyRelatedField(
+        queryset=PreparationProcessing.objects.none(), required=False, allow_null=True
+    )
+
     class Meta:
         model = DishIngredientProcessing
-        fields = ["id", "ingredient", "processing_type"]
+        fields = ["id", "ingredient", "processing_type", "preparation_processing"]
         read_only_fields = ["id"]
 
     def _user_company(self):
@@ -695,19 +735,55 @@ class DishIngredientProcessingCreateSerializer(serializers.ModelSerializer):
         if company:
             ing_qs = DishIngredient.objects.filter(dish__company=company)
             pt_qs = ProcessingType.objects.filter(company=company)
+            pp_qs = PreparationProcessing.objects.select_related("preparation").filter(preparation__company=company)
             if active_branch is not None:
                 ing_qs = ing_qs.filter(Q(dish__branch=active_branch) | Q(dish__branch__isnull=True))
                 pt_qs = pt_qs.filter(Q(branch=active_branch) | Q(branch__isnull=True))
+                pp_qs = pp_qs.filter(
+                    Q(preparation__branch=active_branch) | Q(preparation__branch__isnull=True)
+                )
             else:
                 ing_qs = ing_qs.filter(dish__branch__isnull=True)
-                # Без активного филиала в контексте запроса — допускаем любой ProcessingType компании,
-                # иначе типы с branch_id попадают под «объект не существует» при POST без ?branch.
+                # processing_type: вся компания; preparation_processing: вся компания (валидация по заготовке)
             fields["ingredient"].queryset = ing_qs
             fields["processing_type"].queryset = pt_qs
+            fields["preparation_processing"].queryset = pp_qs
         else:
             fields["ingredient"].queryset = DishIngredient.objects.none()
             fields["processing_type"].queryset = ProcessingType.objects.none()
+            fields["preparation_processing"].queryset = PreparationProcessing.objects.none()
         return fields
+
+    def validate(self, attrs):
+        ing = attrs.get("ingredient")
+        pt = attrs.get("processing_type")
+        pp = attrs.get("preparation_processing")
+        has_pt = pt is not None
+        has_pp = pp is not None
+        if has_pt and has_pp:
+            raise serializers.ValidationError(
+                "Укажите только одно поле: processing_type или preparation_processing."
+            )
+        if not has_pt and not has_pp:
+            raise serializers.ValidationError(
+                "Укажите processing_type (для продукта) или preparation_processing (для заготовки)."
+            )
+        if ing:
+            if ing.ingredient_type == DishIngredient.IngredientType.PRODUCT:
+                if not has_pt or has_pp:
+                    raise serializers.ValidationError(
+                        {"processing_type": "Для ингредиента-продукта укажите тип обработки из справочника."}
+                    )
+            elif ing.ingredient_type == DishIngredient.IngredientType.PREPARATION:
+                if not has_pp or has_pt:
+                    raise serializers.ValidationError(
+                        {"preparation_processing": "Для ингредиента-заготовки укажите обработку этой заготовки."}
+                    )
+                if pp.preparation_id != ing.preparation_id:
+                    raise serializers.ValidationError(
+                        {"preparation_processing": "Можно выбрать только обработку из состава выбранной заготовки."}
+                    )
+        return attrs
 
 
 class DishCostSerializer(serializers.Serializer):
@@ -726,7 +802,7 @@ class DishCalculatePreviewSerializer(serializers.Serializer):
         "other_expenses": "0.00",
         "ingredients": [
           {"ingredient_type":"product","product":"<uuid>","quantity":"0.05","unit":"kg","processing_type_ids":["uuid", ...]},
-          {"ingredient_type":"preparation","preparation":"<uuid>","quantity":"0.3","unit":"kg","processing_type_ids":[]}
+          {"ingredient_type":"preparation","preparation":"<uuid>","quantity":"0.3","unit":"kg","preparation_processing_ids":["uuid", ...]}
         ]
       }
     """
@@ -802,7 +878,10 @@ class MenuItemSerializer(CompanyBranchReadOnlyMixin):
                 qs = (
                     instance.dish_ingredients
                     .select_related("product", "preparation")
-                    .prefetch_related("processings__processing_type")
+                    .prefetch_related(
+                        "processings__processing_type",
+                        "processings__preparation_processing",
+                    )
                     .all()
                 )
                 data["ingredients"] = DishIngredientSerializer(qs, many=True, context=self.context).data

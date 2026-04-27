@@ -32,7 +32,7 @@ from .models import (
     InventorySession, Equipment, EquipmentInventorySession, Kitchen,
     CafeReceiptPrinterSettings,
     CafeExpense, CafeWaiterPayProfile,
-    Preparation, ProcessingType, DishIngredient, DishIngredientProcessing,
+    Preparation, PreparationProcessing, ProcessingType, DishIngredient, DishIngredientProcessing,
 )
 from .serializers import (
     ZoneSerializer, TableSerializer, BookingSerializer,
@@ -95,6 +95,7 @@ def deduct_ingredients_for_order(order: Order):
             "menu_item__dish_ingredients__product",
             "menu_item__dish_ingredients__preparation",
             "menu_item__dish_ingredients__processings__processing_type",
+            "menu_item__dish_ingredients__processings__preparation_processing",
         )
         .all()
     )
@@ -784,6 +785,7 @@ class MenuItemListCreateView(CompanyBranchQuerysetMixin, generics.ListCreateAPIV
             "dish_ingredients__product",
             "dish_ingredients__preparation",
             "dish_ingredients__processings__processing_type",
+            "dish_ingredients__processings__preparation_processing",
         )
         .all()
     )
@@ -821,6 +823,7 @@ class MenuItemRetrieveUpdateDestroyView(CompanyBranchQuerysetMixin, generics.Ret
             "dish_ingredients__product",
             "dish_ingredients__preparation",
             "dish_ingredients__processings__processing_type",
+            "dish_ingredients__processings__preparation_processing",
         )
         .all()
     )
@@ -1275,8 +1278,12 @@ class DishIngredientProcessingCreateView(CompanyBranchQuerysetMixin, APIView):
         ser.is_valid(raise_exception=True)
         with transaction.atomic():
             ing = ser.validated_data["ingredient"]
-            pt = ser.validated_data["processing_type"]
-            DishIngredientProcessing.objects.create(ingredient=ing, processing_type=pt, cost=Decimal("0.00"))
+            kwargs = {"ingredient": ing, "cost": Decimal("0.00")}
+            if ser.validated_data.get("processing_type") is not None:
+                kwargs["processing_type"] = ser.validated_data["processing_type"]
+            if ser.validated_data.get("preparation_processing") is not None:
+                kwargs["preparation_processing"] = ser.validated_data["preparation_processing"]
+            DishIngredientProcessing.objects.create(**kwargs)
             try:
                 recalculate_dish(ing.dish, save=True)
             except ValueError as e:
@@ -1354,6 +1361,7 @@ class DishCalculatePreviewView(CompanyBranchQuerysetMixin, APIView):
             qty = Decimal(str(row.get("quantity") or "0").replace(",", "."))
             unit = (row.get("unit") or "").strip().lower()
             pt_ids = row.get("processing_type_ids") or []
+            pp_ids = row.get("preparation_processing_ids") or []
 
             ing = DishIngredient(
                 dish=MenuItem(company=company, branch=b),
@@ -1371,9 +1379,23 @@ class DishCalculatePreviewView(CompanyBranchQuerysetMixin, APIView):
             # имитируем processings
             ing._prefetched_objects_cache = {}
             proc_list = []
-            pts = list(ProcessingType.objects.filter(company=company, id__in=pt_ids))
-            for pt in pts:
-                proc_list.append(DishIngredientProcessing(ingredient=ing, processing_type=pt, cost=Decimal("0.00")))
+            if itype == DishIngredient.IngredientType.PRODUCT:
+                pts = list(ProcessingType.objects.filter(company=company, id__in=pt_ids))
+                for pt in pts:
+                    proc_list.append(DishIngredientProcessing(ingredient=ing, processing_type=pt, cost=Decimal("0.00")))
+            elif itype == DishIngredient.IngredientType.PREPARATION and ing.preparation_id:
+                pps = list(
+                    PreparationProcessing.objects.filter(
+                        id__in=pp_ids,
+                        preparation_id=ing.preparation_id,
+                    )
+                )
+                for pp in pps:
+                    proc_list.append(
+                        DishIngredientProcessing(
+                            ingredient=ing, preparation_processing=pp, cost=Decimal("0.00")
+                        )
+                    )
             # подсунем их calculate_ingredient через related manager: проще пересчитать отдельно
             # считаем cost вручную аналогично сервису
             from .services.costing import _norm_unit as _nu
@@ -1396,11 +1418,18 @@ class DishCalculatePreviewView(CompanyBranchQuerysetMixin, APIView):
 
             processing_total = Decimal("0.00")
             for p in proc_list:
-                pt = p.processing_type
-                if pt.charge_type == ProcessingType.ChargeType.FIXED:
-                    c = Decimal(pt.cost or 0)
+                if p.preparation_processing_id:
+                    rowp = p.preparation_processing
+                    if rowp.charge_type == PreparationProcessing.ChargeType.FIXED:
+                        c = Decimal(rowp.cost or 0)
+                    else:
+                        c = Decimal(rowp.cost or 0) * qty
                 else:
-                    c = Decimal(pt.cost or 0) * qty
+                    pt = p.processing_type
+                    if pt.charge_type == ProcessingType.ChargeType.FIXED:
+                        c = Decimal(pt.cost or 0)
+                    else:
+                        c = Decimal(pt.cost or 0) * qty
                 processing_total += c
             processing_total = processing_total.quantize(Decimal("0.01"))
             row_total = (ingredient_cost + processing_total).quantize(Decimal("0.01"))

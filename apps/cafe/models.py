@@ -1033,7 +1033,14 @@ class DishIngredientProcessing(models.Model):
         DishIngredient, on_delete=models.CASCADE, related_name="processings", verbose_name="Ингредиент"
     )
     processing_type = models.ForeignKey(
-        ProcessingType, on_delete=models.PROTECT, related_name="dish_ingredient_processings", verbose_name="Тип обработки"
+        ProcessingType, on_delete=models.PROTECT,
+        related_name="dish_ingredient_processings", verbose_name="Тип обработки (общий справочник)",
+        null=True, blank=True,
+    )
+    preparation_processing = models.ForeignKey(
+        PreparationProcessing, on_delete=models.PROTECT,
+        related_name="dish_ingredient_links", verbose_name="Обработка заготовки",
+        null=True, blank=True,
     )
     cost = models.DecimalField("Стоимость", max_digits=12, decimal_places=2, default=Decimal("0.00"))
 
@@ -1043,12 +1050,29 @@ class DishIngredientProcessing(models.Model):
         indexes = [
             models.Index(fields=["ingredient"]),
             models.Index(fields=["processing_type"]),
+            models.Index(fields=["preparation_processing"]),
         ]
 
     def clean(self):
         if self.cost is not None and self.cost < 0:
             raise ValidationError({"cost": "Стоимость не может быть отрицательной."})
-        if self.ingredient_id and self.processing_type_id:
+        has_pt = bool(self.processing_type_id)
+        has_pp = bool(self.preparation_processing_id)
+        if has_pt == has_pp:
+            raise ValidationError(
+                "Укажите ровно один источник: processing_type (продукт) или preparation_processing (заготовка)."
+            )
+        if self.ingredient_id:
+            ing = self.ingredient
+            if ing.ingredient_type == DishIngredient.IngredientType.PRODUCT:
+                if not has_pt or has_pp:
+                    raise ValidationError({"processing_type": "Для ингредиента-продукта укажите тип обработки из справочника."})
+            elif ing.ingredient_type == DishIngredient.IngredientType.PREPARATION:
+                if not has_pp or has_pt:
+                    raise ValidationError({"preparation_processing": "Для ингредиента-заготовки укажите обработку этой заготовки."})
+                if self.preparation_processing.preparation_id != ing.preparation_id:
+                    raise ValidationError({"preparation_processing": "Обработка должна принадлежать выбранной заготовке."})
+        if has_pt and self.ingredient_id:
             dish = self.ingredient.dish
             if self.processing_type.company_id != dish.company_id:
                 raise ValidationError({"processing_type": "Тип обработки другой компании."})
@@ -1056,7 +1080,11 @@ class DishIngredientProcessing(models.Model):
                 raise ValidationError({"processing_type": "Тип обработки другого филиала."})
 
     def __str__(self):
-        return f"{self.processing_type.name} -> {self.cost}"
+        if self.preparation_processing_id:
+            return f"{self.preparation_processing.name} -> {self.cost}"
+        if self.processing_type_id:
+            return f"{self.processing_type.name} -> {self.cost}"
+        return str(self.pk)
 
 
 # ==========================

@@ -151,14 +151,21 @@ def calculate_ingredient(ing: DishIngredient) -> dict:
         unit_cost = src_unit_cost
 
     processing_total = Decimal("0.00")
-    qs = ing.processings.select_related("processing_type").all()
+    qs = ing.processings.select_related("processing_type", "preparation_processing").all()
     for p in qs:
-        pt: ProcessingType = p.processing_type
-        if pt.charge_type == ProcessingType.ChargeType.FIXED:
-            c = Decimal(pt.cost or 0)
+        if p.preparation_processing_id:
+            row = p.preparation_processing
+            if row.charge_type == PreparationProcessing.ChargeType.FIXED:
+                c = Decimal(row.cost or 0)
+            else:
+                c = Decimal(row.cost or 0) * qty
         else:
-            # per_unit: ставка * quantity (в единицах ингредиента)
-            c = Decimal(pt.cost or 0) * qty
+            pt: ProcessingType = p.processing_type
+            if pt.charge_type == ProcessingType.ChargeType.FIXED:
+                c = Decimal(pt.cost or 0)
+            else:
+                # per_unit: ставка * quantity (в единицах ингредиента)
+                c = Decimal(pt.cost or 0) * qty
         processing_total += c
     processing_total = processing_total.quantize(Decimal("0.01"))
     total = (ingredient_cost + processing_total).quantize(Decimal("0.01"))
@@ -191,7 +198,10 @@ def recalculate_dish(dish: MenuItem, *, save: bool = True) -> MenuItem:
     other = Decimal(dish.other_expenses or 0)
     if dish.dish_ingredients.exists():
         total = Decimal("0.00")
-        for ing in dish.dish_ingredients.select_related("product", "preparation").prefetch_related("processings__processing_type"):
+        for ing in dish.dish_ingredients.select_related("product", "preparation").prefetch_related(
+            "processings__processing_type",
+            "processings__preparation_processing",
+        ):
             calc = calculate_ingredient(ing)
             ing.unit_cost = calc["unit_cost"]
             ing.ingredient_cost = calc["ingredient_cost"]
