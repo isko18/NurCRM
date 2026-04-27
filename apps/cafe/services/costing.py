@@ -4,7 +4,15 @@ from decimal import Decimal
 
 from django.db import transaction
 
-from apps.cafe.models import DishIngredient, DishIngredientProcessing, MenuItem, Preparation, ProcessingType, Warehouse
+from apps.cafe.models import (
+    DishIngredient,
+    DishIngredientProcessing,
+    MenuItem,
+    Preparation,
+    PreparationProcessing,
+    ProcessingType,
+    Warehouse,
+)
 
 
 SUPPORTED_UNITS = {"kg", "g", "l", "ml", "pcs"}
@@ -94,6 +102,13 @@ def calculate_preparation(prep: Preparation, *, raw_unit_cost: Decimal | None = 
 
     raw_cost = (raw_unit_cost * input_q).quantize(Decimal("0.01"))
     proc_cost = Decimal(prep.processing_cost or 0).quantize(Decimal("0.01"))
+    for row in prep.processings.all():
+        c = Decimal(row.cost or 0)
+        if row.charge_type == PreparationProcessing.ChargeType.FIXED:
+            proc_cost += c
+        else:
+            proc_cost += (c * output_q).quantize(Decimal("0.01"))
+    proc_cost = proc_cost.quantize(Decimal("0.01"))
     total_cost = (raw_cost + proc_cost).quantize(Decimal("0.01"))
     unit_cost = (total_cost / output_q).quantize(Decimal("0.0001"))
 

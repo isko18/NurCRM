@@ -920,6 +920,42 @@ class Preparation(models.Model):
         return self.name
 
 
+class PreparationProcessing(models.Model):
+    """Обработка заготовки: свои строки у каждой заготовки (не общий справочник)."""
+
+    class ChargeType(models.TextChoices):
+        FIXED = "fixed", "fixed"
+        PER_UNIT = "per_unit", "per_unit"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    preparation = models.ForeignKey(
+        Preparation, on_delete=models.CASCADE, related_name="processings", verbose_name="Заготовка"
+    )
+    name = models.CharField("Название", max_length=255)
+    cost = models.DecimalField("Стоимость/ставка", max_digits=12, decimal_places=2, default=Decimal("0.00"))
+    charge_type = models.CharField(
+        "Тип начисления", max_length=16, choices=ChargeType.choices, default=ChargeType.FIXED
+    )
+    unit = models.CharField("Ед. изм.", max_length=16, blank=True, default="")
+
+    created_at = models.DateTimeField("Создано", auto_now_add=True)
+    updated_at = models.DateTimeField("Обновлено", auto_now=True)
+
+    class Meta:
+        verbose_name = "Обработка заготовки"
+        verbose_name_plural = "Обработки заготовки"
+        indexes = [
+            models.Index(fields=["preparation"]),
+        ]
+
+    def clean(self):
+        if self.cost is not None and self.cost < 0:
+            raise ValidationError({"cost": "Стоимость не может быть отрицательной."})
+
+    def __str__(self):
+        return f"{self.preparation_id}: {self.name}"
+
+
 class DishIngredient(models.Model):
     class IngredientType(models.TextChoices):
         PRODUCT = "product", "product"

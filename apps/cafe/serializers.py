@@ -15,7 +15,7 @@ from apps.cafe.models import (
     OrderHistory, OrderItemHistory, KitchenTask, NotificationCafe, InventorySession, InventoryItem, Equipment, EquipmentInventoryItem, EquipmentInventorySession, Kitchen,
     CafeReceiptPrinterSettings,
     CafeExpense, CafeWaiterPayProfile,
-    Preparation, ProcessingType, DishIngredient, DishIngredientProcessing,
+    Preparation, PreparationProcessing, ProcessingType, DishIngredient, DishIngredientProcessing,
 )
 from apps.users.models import Branch
 from apps.utils import _is_owner_like
@@ -471,10 +471,27 @@ class ProcessingTypeSerializer(CompanyBranchReadOnlyMixin):
         return attrs
 
 
+class PreparationProcessingSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = PreparationProcessing
+        fields = ["id", "name", "cost", "charge_type", "unit", "created_at", "updated_at"]
+        read_only_fields = ["id", "created_at", "updated_at"]
+
+    def validate(self, attrs):
+        name = (attrs.get("name") or getattr(self.instance, "name", "") or "").strip()
+        if not name:
+            raise serializers.ValidationError({"name": "Название обязательно."})
+        cost = attrs.get("cost", getattr(self.instance, "cost", Decimal("0.00")) if self.instance else Decimal("0.00"))
+        if cost is not None and cost < 0:
+            raise serializers.ValidationError({"cost": "Стоимость не может быть отрицательной."})
+        return attrs
+
+
 class PreparationSerializer(CompanyBranchReadOnlyMixin):
     source_product_title = serializers.CharField(source="source_product.title", read_only=True)
     source_product_unit = serializers.CharField(source="source_product.unit", read_only=True)
     source_product_unit_price = serializers.DecimalField(source="source_product.unit_price", max_digits=12, decimal_places=2, read_only=True)
+    processings = PreparationProcessingSerializer(many=True, required=False)
 
     class Meta:
         model = Preparation
@@ -487,6 +504,7 @@ class PreparationSerializer(CompanyBranchReadOnlyMixin):
             "loss_quantity", "loss_percent",
             "raw_material_cost", "processing_cost", "total_cost", "unit_cost",
             "stock_quantity",
+            "processings",
             "is_active",
             "created_at", "updated_at",
         ]
@@ -515,6 +533,24 @@ class PreparationSerializer(CompanyBranchReadOnlyMixin):
         if pcost is not None and pcost < 0:
             raise serializers.ValidationError({"processing_cost": "Не может быть отрицательной."})
         return attrs
+
+    def create(self, validated_data):
+        rows = validated_data.pop("processings", [])
+        prep = Preparation.objects.create(**validated_data)
+        for row in rows:
+            PreparationProcessing.objects.create(preparation=prep, **row)
+        return prep
+
+    def update(self, instance, validated_data):
+        rows = validated_data.pop("processings", None)
+        for attr, value in validated_data.items():
+            setattr(instance, attr, value)
+        instance.save()
+        if rows is not None:
+            instance.processings.all().delete()
+            for row in rows:
+                PreparationProcessing.objects.create(preparation=instance, **row)
+        return instance
 
 
 class PreparationReceiveSerializer(serializers.Serializer):

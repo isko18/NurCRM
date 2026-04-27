@@ -898,7 +898,7 @@ class PreparationListCreateView(CompanyBranchQuerysetMixin, generics.ListCreateA
         if not company:
             return Preparation.objects.none()
         b = self._active_branch()
-        qs = Preparation.objects.select_related("source_product").filter(company=company)
+        qs = Preparation.objects.select_related("source_product").prefetch_related("processings").filter(company=company)
         if b is not None:
             return qs.filter(Q(branch=b) | Q(branch__isnull=True))
         return qs.filter(branch__isnull=True)
@@ -924,7 +924,7 @@ class PreparationRetrieveUpdateDestroyView(CompanyBranchQuerysetMixin, generics.
         if not company:
             return Preparation.objects.none()
         b = self._active_branch()
-        qs = Preparation.objects.select_related("source_product").filter(company=company)
+        qs = Preparation.objects.select_related("source_product").prefetch_related("processings").filter(company=company)
         if b is not None:
             return qs.filter(Q(branch=b) | Q(branch__isnull=True))
         return qs.filter(branch__isnull=True)
@@ -967,7 +967,7 @@ class PreparationReceiveView(CompanyBranchQuerysetMixin, APIView):
             return Response({"detail": "Компания не найдена."}, status=status.HTTP_403_FORBIDDEN)
 
         b = self._active_branch()
-        qs = Preparation.objects.select_related("source_product").filter(company=company)
+        qs = Preparation.objects.select_related("source_product").prefetch_related("processings").filter(company=company)
         if b is not None:
             qs = qs.filter(Q(branch=b) | Q(branch__isnull=True))
         else:
