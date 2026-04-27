@@ -6,7 +6,8 @@ import re
 
 from django.db import transaction, IntegrityError
 from django.db.models.deletion import ProtectedError
-from django.db.models import Q, Count, Avg, ExpressionWrapper, DurationField, F
+from django.db.models import Q, Count, Avg, ExpressionWrapper, DurationField, F, Value, DecimalField
+from django.db.models.functions import Coalesce
 from django.utils import timezone
 from django_filters.rest_framework import DjangoFilterBackend
 import django_filters
@@ -831,20 +832,43 @@ class MenuItemRetrieveUpdateDestroyView(CompanyBranchQuerysetMixin, generics.Ret
 
     def destroy(self, request, *args, **kwargs):
         instance = self.get_object()
+        snapshot_title = (instance.title or "").strip() or "Позиция меню"
+        snapshot_price = instance.price if instance.price is not None else Decimal("0")
+
         try:
-            return super().destroy(request, *args, **kwargs)
+            with transaction.atomic():
+                # Задачи кухни привязаны через PROTECT — удаляем (в т.ч. завершённые).
+                KitchenTask.objects.filter(menu_item=instance).delete()
+
+                # Строки заказов с этим блюдом → услуга с текстовым названием и ценой (снимок).
+                OrderItem.objects.filter(
+                    menu_item=instance,
+                    line_kind=OrderItem.LineKind.MENU,
+                ).update(
+                    line_kind=OrderItem.LineKind.SERVICE,
+                    menu_item=None,
+                    service_title=snapshot_title,
+                    unit_price=Coalesce(
+                        F("unit_price"),
+                        Value(snapshot_price, output_field=DecimalField(max_digits=12, decimal_places=2)),
+                    ),
+                )
+
+                instance.delete()
         except ProtectedError:
             return Response(
                 {
                     "detail": (
-                        "Нельзя удалить позицию меню: она указана в заказах или в задачах кухни. "
-                        "Сначала удалите или измените связанные заказы, либо деактивируйте позицию (is_active=false)."
+                        "Нельзя удалить позицию меню: остались связанные записи, которые не удалось отвязать. "
+                        "Попробуйте деактивировать позицию (is_active=false)."
                     ),
-                    "order_items_count": instance.order_items.count(),
-                    "kitchen_tasks_count": instance.kitchen_tasks.count(),
+                    "order_items_count": OrderItem.objects.filter(menu_item_id=instance.pk).count(),
+                    "kitchen_tasks_count": KitchenTask.objects.filter(menu_item_id=instance.pk).count(),
                 },
                 status=status.HTTP_409_CONFLICT,
             )
+
+        return Response(status=status.HTTP_204_NO_CONTENT)
 
 
 # ==================== Ingredient ====================
