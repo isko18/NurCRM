@@ -23,6 +23,20 @@ from apps.utils import _is_owner_like
 User = get_user_model()
 
 
+def _cafe_resolve_user_company(request):
+    """Компания пользователя — как CompanyBranchQuerysetMixin._user_company во views."""
+    user = getattr(request, "user", None) if request else None
+    if not user or not getattr(user, "is_authenticated", False):
+        return None
+    company = getattr(user, "company", None) or getattr(user, "owned_company", None)
+    if company:
+        return company
+    br = getattr(user, "branch", None)
+    if br is not None:
+        return getattr(br, "company", None)
+    return None
+
+
 # ===== company/branch mixin (как в барбере/букинге) =====
 class CompanyBranchReadOnlyMixin(serializers.ModelSerializer):
     company = serializers.ReadOnlyField(source="company.id")
@@ -32,8 +46,7 @@ class CompanyBranchReadOnlyMixin(serializers.ModelSerializer):
         return getattr(self.context.get("request"), "user", None)
 
     def _user_company(self):
-        u = self._user()
-        return getattr(u, "company", None) or getattr(u, "owned_company", None)
+        return _cafe_resolve_user_company(self.context.get("request"))
 
     def _auto_branch(self):
         """
@@ -611,9 +624,7 @@ class DishIngredientSerializer(serializers.ModelSerializer):
         ]
 
     def _user_company(self):
-        request = self.context.get("request")
-        user = getattr(request, "user", None) if request else None
-        return getattr(user, "company", None) or getattr(user, "owned_company", None)
+        return _cafe_resolve_user_company(self.context.get("request"))
 
     def get_fields(self):
         fields = super().get_fields()
@@ -674,9 +685,7 @@ class DishIngredientProcessingCreateSerializer(serializers.ModelSerializer):
         read_only_fields = ["id"]
 
     def _user_company(self):
-        request = self.context.get("request")
-        user = getattr(request, "user", None) if request else None
-        return getattr(user, "company", None) or getattr(user, "owned_company", None)
+        return _cafe_resolve_user_company(self.context.get("request"))
 
     def get_fields(self):
         fields = super().get_fields()
