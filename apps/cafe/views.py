@@ -48,14 +48,14 @@ from .serializers import (
     OrderPayDebtSerializer,
     CafeReceiptPrinterSettingsSerializer,
     CafeExpenseSerializer, CafeWaiterPayProfileSerializer,
-    PreparationSerializer, ProcessingTypeSerializer,
+    PreparationSerializer, PreparationReceiveSerializer, ProcessingTypeSerializer,
     DishIngredientSerializer, DishIngredientProcessingCreateSerializer,
     DishCostSerializer, DishCalculatePreviewSerializer,
 )
 from apps.utils import _is_owner_like
 
 from .services.costing import recalculate_dish, calculate_preparation, calculate_margin, calculate_ingredient
-from .services.stock import consume_dish_for_order
+from .services.stock import consume_dish_for_order, consume_product, add_preparation_stock
 
 
 _NUM_RE = re.compile(r"[-+]?\d+(?:[.,]\d+)?")
@@ -950,6 +950,71 @@ class PreparationRetrieveUpdateDestroyView(CompanyBranchQuerysetMixin, generics.
                         recalculate_dish(d, save=True)
                     except ValueError as e:
                         raise ValidationError({"detail": str(e)})
+
+
+class PreparationReceiveView(CompanyBranchQuerysetMixin, APIView):
+    """
+    POST /cafe/preparations/<uuid:pk>/receive/
+    Оприходовать (произвести) заготовку: списывает сырьё со склада по входу и
+    увеличивает остаток заготовки по выходу (накопительно).
+    """
+
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request, pk):
+        company = self._user_company()
+        if not company:
+            return Response({"detail": "Компания не найдена."}, status=status.HTTP_403_FORBIDDEN)
+
+        b = self._active_branch()
+        qs = Preparation.objects.select_related("source_product").filter(company=company)
+        if b is not None:
+            qs = qs.filter(Q(branch=b) | Q(branch__isnull=True))
+        else:
+            qs = qs.filter(branch__isnull=True)
+
+        ser = PreparationReceiveSerializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+
+        with transaction.atomic():
+            prep: Preparation = generics.get_object_or_404(qs.select_for_update(), pk=pk)
+
+            product = Warehouse.objects.select_for_update().filter(pk=prep.source_product_id, company=company).first()
+            if not product:
+                raise ValidationError({"detail": "Исходный продукт не найден."})
+            if (prep.branch_id or None) != (product.branch_id or None):
+                raise ValidationError({"detail": "Исходный продукт со склада другого филиала."})
+
+            prep.input_quantity = ser.validated_data["input_quantity"]
+            prep.output_quantity = ser.validated_data["output_quantity"]
+            if "processing_cost" in ser.validated_data and ser.validated_data["processing_cost"] is not None:
+                prep.processing_cost = ser.validated_data["processing_cost"]
+
+            calc = calculate_preparation(prep)
+            prep.loss_quantity = calc["loss_quantity"]
+            prep.loss_percent = calc["loss_percent"]
+            prep.raw_material_cost = calc["raw_material_cost"]
+            prep.total_cost = calc["total_cost"]
+            prep.unit_cost = calc["unit_cost"]
+
+            consume_product(product, prep.input_quantity, quantity_unit=prep.input_unit)
+            add_preparation_stock(prep, prep.output_quantity, quantity_unit=prep.output_unit)
+
+            prep.save(
+                update_fields=[
+                    "input_quantity",
+                    "output_quantity",
+                    "processing_cost",
+                    "loss_quantity",
+                    "loss_percent",
+                    "raw_material_cost",
+                    "total_cost",
+                    "unit_cost",
+                    "updated_at",
+                ]
+            )
+
+        return Response(PreparationSerializer(prep).data, status=status.HTTP_200_OK)
 
 
 # ==================== Processing types ====================

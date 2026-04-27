@@ -517,6 +517,26 @@ class PreparationSerializer(CompanyBranchReadOnlyMixin):
         return attrs
 
 
+class PreparationReceiveSerializer(serializers.Serializer):
+    input_quantity = serializers.DecimalField(max_digits=14, decimal_places=6)
+    output_quantity = serializers.DecimalField(max_digits=14, decimal_places=6)
+    processing_cost = serializers.DecimalField(max_digits=12, decimal_places=2, required=False, allow_null=True)
+
+    def validate(self, attrs):
+        iq = attrs.get("input_quantity")
+        oq = attrs.get("output_quantity")
+        if iq is None or iq <= 0:
+            raise serializers.ValidationError({"input_quantity": "Должно быть больше 0."})
+        if oq is None or oq <= 0:
+            raise serializers.ValidationError({"output_quantity": "Должно быть больше 0."})
+        if oq > iq:
+            raise serializers.ValidationError({"output_quantity": "Выход не может быть больше входа."})
+        pc = attrs.get("processing_cost")
+        if pc is not None and pc < 0:
+            raise serializers.ValidationError({"processing_cost": "Не может быть отрицательной."})
+        return attrs
+
+
 class DishIngredientProcessingSerializer(serializers.ModelSerializer):
     processing_type_name = serializers.CharField(source="processing_type.name", read_only=True)
     charge_type = serializers.CharField(source="processing_type.charge_type", read_only=True)

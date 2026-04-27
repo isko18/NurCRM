@@ -32,7 +32,7 @@ from .views import (
     CafeExpenseListCreateView, CafeExpenseRetrieveUpdateDestroyView,
     CafeWaiterPayProfileListCreateView, CafeWaiterPayProfileRetrieveUpdateDestroyView,
 
-    PreparationListCreateView, PreparationRetrieveUpdateDestroyView,
+    PreparationListCreateView, PreparationRetrieveUpdateDestroyView, PreparationReceiveView,
     ProcessingTypeListCreateView, ProcessingTypeRetrieveUpdateDestroyView,
     DishIngredientCreateForDishView, DishIngredientRetrieveUpdateDestroyView,
     DishIngredientProcessingCreateView, DishIngredientProcessingDeleteView,
@@ -114,6 +114,7 @@ urlpatterns = [
     # === Costing (new) ===
     path("preparations/", PreparationListCreateView.as_view(), name="preparation-list"),
     path("preparations/<uuid:pk>/", PreparationRetrieveUpdateDestroyView.as_view(), name="preparation-detail"),
+    path("preparations/<uuid:pk>/receive/", PreparationReceiveView.as_view(), name="preparation-receive"),
 
     path("processing-types/", ProcessingTypeListCreateView.as_view(), name="processing-type-list"),
     path("processing-types/<uuid:pk>/", ProcessingTypeRetrieveUpdateDestroyView.as_view(), name="processing-type-detail"),
