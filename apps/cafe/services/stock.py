@@ -68,7 +68,7 @@ def consume_dish_for_order(dish: MenuItem, dish_qty: Decimal):
 
     # Новая схема
     if dish.dish_ingredients.exists():
-        ings = dish.dish_ingredients.select_related("product", "preparation").select_for_update()
+        ings = dish.dish_ingredients.select_related("product", "preparation").select_for_update(of=("self",))
         for ing in ings:
             need = (Decimal(ing.quantity or 0) * qty)
             if need <= 0:
