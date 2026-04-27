@@ -904,8 +904,23 @@ class PreparationListCreateView(CompanyBranchQuerysetMixin, generics.ListCreateA
         return qs.filter(branch__isnull=True)
 
     def perform_create(self, serializer):
+        company = self._user_company()
+        if not company:
+            raise permissions.PermissionDenied("У пользователя не задана компания.")
+
+        try:
+            model_fields = set(f.name for f in serializer.Meta.model._meta.get_fields())
+        except Exception:
+            model_fields = set()
+
+        kwargs = {"company": company}
+        if "branch" in model_fields:
+            active_branch = self._active_branch()
+            if active_branch is not None:
+                kwargs["branch"] = active_branch
+
         with transaction.atomic():
-            obj: Preparation = serializer.save()
+            obj: Preparation = serializer.save(**kwargs)
             # Расчёт полей заготовки
             calc = calculate_preparation(obj)
             obj.loss_quantity = calc["loss_quantity"]
