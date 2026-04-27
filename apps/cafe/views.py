@@ -1268,6 +1268,9 @@ class DishIngredientProcessingCreateView(CompanyBranchQuerysetMixin, APIView):
     permission_classes = [permissions.IsAuthenticated]
 
     def post(self, request):
+        # Синхронизирует request.branch с ?branch= / филиалом пользователя — иначе валидатор
+        # processing_type отсекает филиальные ProcessingType (см. сериализатор).
+        self._active_branch()
         ser = DishIngredientProcessingCreateSerializer(data=request.data, context={"request": request})
         ser.is_valid(raise_exception=True)
         with transaction.atomic():

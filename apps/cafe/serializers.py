@@ -691,7 +691,8 @@ class DishIngredientProcessingCreateSerializer(serializers.ModelSerializer):
                 pt_qs = pt_qs.filter(Q(branch=active_branch) | Q(branch__isnull=True))
             else:
                 ing_qs = ing_qs.filter(dish__branch__isnull=True)
-                pt_qs = pt_qs.filter(branch__isnull=True)
+                # Без активного филиала в контексте запроса — допускаем любой ProcessingType компании,
+                # иначе типы с branch_id попадают под «объект не существует» при POST без ?branch.
             fields["ingredient"].queryset = ing_qs
             fields["processing_type"].queryset = pt_qs
         else:
