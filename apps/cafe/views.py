@@ -944,6 +944,23 @@ class PreparationRetrieveUpdateDestroyView(CompanyBranchQuerysetMixin, generics.
             return qs.filter(Q(branch=b) | Q(branch__isnull=True))
         return qs.filter(branch__isnull=True)
 
+    def destroy(self, request, *args, **kwargs):
+        instance = self.get_object()
+        try:
+            self.perform_destroy(instance)
+        except ProtectedError:
+            return Response(
+                {
+                    "detail": (
+                        "Нельзя удалить заготовку: она указана в техкартах блюд (ингредиент типа preparation). "
+                        "Сначала удалите её из состава этих блюд."
+                    ),
+                    "dish_ingredient_count": DishIngredient.objects.filter(preparation=instance).count(),
+                },
+                status=status.HTTP_409_CONFLICT,
+            )
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
     def perform_update(self, serializer):
         with transaction.atomic():
             obj: Preparation = serializer.save()
