@@ -1085,6 +1085,36 @@ class DishIngredientCreateForDishView(CompanyBranchQuerysetMixin, APIView):
         return Response(DishIngredientSerializer(ing, context={"request": request}).data, status=status.HTTP_201_CREATED)
 
 
+def _legacy_ingredient_as_dish_ingredient_dict(legacy: Ingredient) -> dict:
+    """
+    Совместимость API: фронт вызывает /dish-ingredients/<id>/, а старые блюда хранят строки в Ingredient (legacy).
+    Отдаём те же ключи, что DishIngredientSerializer.
+    """
+    legacy.refresh_from_db()
+    pr = legacy.product
+    amt = Decimal(legacy.amount or 0)
+    up = Decimal(pr.unit_price or 0)
+    ing_cost = (amt * up).quantize(Decimal("0.01"))
+    return {
+        "id": legacy.id,
+        "dish": legacy.menu_item_id,
+        "ingredient_type": DishIngredient.IngredientType.PRODUCT,
+        "product": legacy.product_id,
+        "product_title": pr.title,
+        "preparation": None,
+        "preparation_name": None,
+        "quantity": amt,
+        "unit": (legacy.unit or pr.unit or ""),
+        "unit_cost": up.quantize(Decimal("0.0001")),
+        "ingredient_cost": ing_cost,
+        "processing_cost": Decimal("0.00"),
+        "total_cost": ing_cost,
+        "processings": [],
+        "created_at": None,
+        "updated_at": None,
+    }
+
+
 class DishIngredientRetrieveUpdateDestroyView(CompanyBranchQuerysetMixin, generics.RetrieveUpdateDestroyAPIView):
     serializer_class = DishIngredientSerializer
 
@@ -1097,6 +1127,92 @@ class DishIngredientRetrieveUpdateDestroyView(CompanyBranchQuerysetMixin, generi
         if b is not None:
             return qs.filter(Q(dish__branch=b) | Q(dish__branch__isnull=True))
         return qs.filter(dish__branch__isnull=True)
+
+    def _legacy_ingredient_queryset(self):
+        """Тот же scope, что IngredientRetrieveUpdateDestroyView (старые ингредиенты блюда)."""
+        company = self._user_company()
+        if not company:
+            return Ingredient.objects.none()
+        active_branch = self._active_branch()
+        qs = Ingredient.objects.select_related("menu_item", "product").filter(
+            menu_item__company=company, product__company=company
+        )
+        if active_branch is not None:
+            return qs.filter(
+                Q(menu_item__branch=active_branch) | Q(menu_item__branch__isnull=True),
+                Q(product__branch=active_branch) | Q(product__branch__isnull=True),
+            )
+        return qs.filter(menu_item__branch__isnull=True, product__branch__isnull=True)
+
+    def retrieve(self, request, *args, **kwargs):
+        pk = kwargs.get("pk")
+        obj = self.get_queryset().filter(pk=pk).first()
+        if obj:
+            serializer = self.get_serializer(obj)
+            return Response(serializer.data)
+        legacy = self._legacy_ingredient_queryset().filter(pk=pk).first()
+        if legacy:
+            return Response(_legacy_ingredient_as_dish_ingredient_dict(legacy))
+        return Response({"detail": "No DishIngredient matches the given query."}, status=status.HTTP_404_NOT_FOUND)
+
+    def destroy(self, request, *args, **kwargs):
+        pk = kwargs.get("pk")
+        obj = self.get_queryset().filter(pk=pk).first()
+        if obj:
+            self.perform_destroy(obj)
+            return Response(status=status.HTTP_204_NO_CONTENT)
+        legacy = self._legacy_ingredient_queryset().filter(pk=pk).first()
+        if legacy:
+            dish = legacy.menu_item
+            with transaction.atomic():
+                legacy.delete()
+                try:
+                    recalculate_dish(dish, save=True)
+                except ValueError as e:
+                    raise ValidationError({"detail": str(e)})
+            return Response(status=status.HTTP_204_NO_CONTENT)
+        return Response({"detail": "No DishIngredient matches the given query."}, status=status.HTTP_404_NOT_FOUND)
+
+    def update(self, request, *args, **kwargs):
+        pk = kwargs.get("pk")
+        if self.get_queryset().filter(pk=pk).exists():
+            return super().update(request, *args, **kwargs)
+        return self._legacy_update(request, pk, partial=False)
+
+    def partial_update(self, request, *args, **kwargs):
+        pk = kwargs.get("pk")
+        if self.get_queryset().filter(pk=pk).exists():
+            return super().partial_update(request, *args, **kwargs)
+        return self._legacy_update(request, pk, partial=True)
+
+    def _legacy_update(self, request, pk, *, partial: bool):
+        legacy = self._legacy_ingredient_queryset().filter(pk=pk).first()
+        if not legacy:
+            return Response({"detail": "No DishIngredient matches the given query."}, status=status.HTTP_404_NOT_FOUND)
+        data = dict(request.data)
+        if data.get("ingredient_type") == DishIngredient.IngredientType.PREPARATION or data.get("preparation"):
+            raise ValidationError({"detail": "Для старого ингредиента (Ingredient) можно указать только продукт."})
+        if "quantity" in data and "amount" not in data:
+            data["amount"] = data.pop("quantity")
+        unit_override = data.pop("unit", None)
+        data.pop("dish", None)
+        data.pop("ingredient_type", None)
+        data.pop("preparation", None)
+        ser = IngredientInlineSerializer(
+            legacy, data=data, partial=partial, context={"request": request}
+        )
+        ser.is_valid(raise_exception=True)
+        with transaction.atomic():
+            ser.save()
+            if unit_override is not None:
+                legacy.unit = str(unit_override)
+                legacy.save(update_fields=["unit"])
+            try:
+                recalculate_dish(legacy.menu_item, save=True)
+            except ValueError as e:
+                raise ValidationError({"detail": str(e)})
+        legacy.refresh_from_db()
+        return Response(_legacy_ingredient_as_dish_ingredient_dict(legacy))
 
     def perform_update(self, serializer):
         with transaction.atomic():
