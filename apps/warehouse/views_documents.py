@@ -3,7 +3,7 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 from rest_framework import generics
 from django.shortcuts import get_object_or_404
-from django.db.models import Q
+from django.db.models import Q, Prefetch
 from django_filters.rest_framework import DjangoFilterBackend
 
 from . import models, serializers_documents, services, services_money
@@ -56,6 +56,10 @@ class DocumentListCreateView(CompanyBranchRestrictedMixin, generics.ListCreateAP
             "warehouse_from", "warehouse_to", "counterparty", "agent"
         ).prefetch_related(
             "items__product",
+            Prefetch(
+                "items__product__images",
+                queryset=models.WarehouseProductImage.objects.order_by("-is_primary", "created_at"),
+            ),
             "moves__warehouse",
             "moves__product",
         ).order_by("-date")
@@ -206,6 +210,10 @@ class DocumentDetailView(CompanyBranchRestrictedMixin, generics.RetrieveUpdateDe
             "items__product",
             "items__product__brand",
             "items__product__category",
+            Prefetch(
+                "items__product__images",
+                queryset=models.WarehouseProductImage.objects.order_by("-is_primary", "created_at"),
+            ),
             "moves__warehouse",
             "moves__product",
         )

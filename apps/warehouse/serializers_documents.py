@@ -65,6 +65,7 @@ class StockMoveSerializer(serializers.ModelSerializer):
 class DocumentItemSerializer(serializers.ModelSerializer):
     product_name = serializers.CharField(source="product.name", read_only=True, allow_null=True)
     product_article = serializers.CharField(source="product.article", read_only=True, allow_null=True)
+    product_image_url = serializers.SerializerMethodField()
     product_discount_percent = serializers.DecimalField(
         source="product.discount_percent",
         max_digits=5,
@@ -87,6 +88,7 @@ class DocumentItemSerializer(serializers.ModelSerializer):
             "product",
             "product_name",
             "product_article",
+            "product_image_url",
             "product_discount_percent",
             "product_discount_amount",
             "qty",
@@ -112,6 +114,27 @@ class DocumentItemSerializer(serializers.ModelSerializer):
         qty = Decimal(obj.qty or 0)
         pct = Decimal(getattr(p, "discount_percent", None) or 0)
         return (price * qty * pct / Decimal("100")).quantize(Decimal("0.01"))
+
+    def get_product_image_url(self, obj):
+        request = self.context.get("request")
+        p = getattr(obj, "product", None)
+        if not p:
+            return None
+        img_row = None
+        cache = getattr(p, "_prefetched_objects_cache", None)
+        if cache and "images" in cache:
+            imgs = list(p.images.all())
+            img_row = imgs[0] if imgs else None
+        else:
+            img_row = (
+                models.WarehouseProductImage.objects.filter(product=p)
+                .order_by("-is_primary", "created_at")
+                .first()
+            )
+        if not img_row or not getattr(img_row, "image", None):
+            return None
+        url = img_row.image.url
+        return request.build_absolute_uri(url) if request else url
 
 
 class DocumentSerializer(serializers.ModelSerializer):
