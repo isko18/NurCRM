@@ -485,10 +485,24 @@ class ProcessingTypeSerializer(CompanyBranchReadOnlyMixin):
 
 
 class PreparationProcessingSerializer(serializers.ModelSerializer):
+    id = serializers.UUIDField(required=False)
+
     class Meta:
         model = PreparationProcessing
-        fields = ["id", "name", "cost", "charge_type", "unit", "created_at", "updated_at"]
-        read_only_fields = ["id", "created_at", "updated_at"]
+        fields = [
+            "id",
+            "name",
+            "cost",
+            "charge_type",
+            "unit",
+            "input_quantity",
+            "input_unit",
+            "output_quantity",
+            "output_unit",
+            "created_at",
+            "updated_at",
+        ]
+        read_only_fields = ["created_at", "updated_at"]
 
     def validate(self, attrs):
         name = (attrs.get("name") or getattr(self.instance, "name", "") or "").strip()
@@ -497,6 +511,18 @@ class PreparationProcessingSerializer(serializers.ModelSerializer):
         cost = attrs.get("cost", getattr(self.instance, "cost", Decimal("0.00")) if self.instance else Decimal("0.00"))
         if cost is not None and cost < 0:
             raise serializers.ValidationError({"cost": "Стоимость не может быть отрицательной."})
+
+        iq = attrs.get("input_quantity", getattr(self.instance, "input_quantity", None) if self.instance else None)
+        oq = attrs.get("output_quantity", getattr(self.instance, "output_quantity", None) if self.instance else None)
+        iu = attrs.get("input_unit", getattr(self.instance, "input_unit", "") if self.instance else "")
+        ou = attrs.get("output_unit", getattr(self.instance, "output_unit", "") if self.instance else "")
+
+        if (iq is None) != (oq is None):
+            raise serializers.ValidationError({"detail": "Укажите одновременно вход и выход (или не указывайте оба)."})
+        if iq is not None and oq is not None and oq > iq:
+            raise serializers.ValidationError({"output_quantity": "Выход не может быть больше входа."})
+        if bool(iu) != bool(ou):
+            raise serializers.ValidationError({"detail": "Укажите единицы измерения для входа и выхода (или не указывайте обе)."})
         return attrs
 
 
@@ -560,9 +586,34 @@ class PreparationSerializer(CompanyBranchReadOnlyMixin):
             setattr(instance, attr, value)
         instance.save()
         if rows is not None:
-            instance.processings.all().delete()
+            existing = {str(p.id): p for p in instance.processings.all()}
+            incoming_ids = set()
+
             for row in rows:
-                PreparationProcessing.objects.create(preparation=instance, **row)
+                rid = row.pop("id", None)
+                if rid:
+                    rid_str = str(rid)
+                    incoming_ids.add(rid_str)
+                    obj = existing.get(rid_str)
+                    if not obj:
+                        raise serializers.ValidationError({"processings": f"Обработка не найдена: {rid_str}"})
+                    for k, v in row.items():
+                        setattr(obj, k, v)
+                    obj.save()
+                else:
+                    obj = PreparationProcessing.objects.create(preparation=instance, **row)
+                    incoming_ids.add(str(obj.id))
+
+            # удаляем только те, что не пришли и не используются в DishIngredientProcessing (PROTECT)
+            to_delete_ids = [pid for pid in existing.keys() if pid not in incoming_ids]
+            if to_delete_ids:
+                used_ids = set(
+                    DishIngredientProcessing.objects.filter(preparation_processing_id__in=to_delete_ids)
+                    .values_list("preparation_processing_id", flat=True)
+                )
+                safe_ids = [pid for pid in to_delete_ids if pid not in used_ids]
+                if safe_ids:
+                    PreparationProcessing.objects.filter(preparation=instance, id__in=safe_ids).delete()
         return instance
 
 
