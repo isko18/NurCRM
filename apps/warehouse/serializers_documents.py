@@ -5,6 +5,7 @@ from django.core.exceptions import ObjectDoesNotExist
 from django.contrib.auth import get_user_model
 from . import models
 from . import services as warehouse_services
+from .serializers import WarehouseProductCharacteristicsSerializer
 
 User = get_user_model()
 
@@ -66,6 +67,11 @@ class DocumentItemSerializer(serializers.ModelSerializer):
     product_name = serializers.CharField(source="product.name", read_only=True, allow_null=True)
     product_article = serializers.CharField(source="product.article", read_only=True, allow_null=True)
     product_image_url = serializers.SerializerMethodField()
+    product_characteristics = WarehouseProductCharacteristicsSerializer(
+        source="product.characteristics",
+        read_only=True,
+        allow_null=True,
+    )
     product_discount_percent = serializers.DecimalField(
         source="product.discount_percent",
         max_digits=5,
@@ -89,6 +95,7 @@ class DocumentItemSerializer(serializers.ModelSerializer):
             "product_name",
             "product_article",
             "product_image_url",
+            "product_characteristics",
             "product_discount_percent",
             "product_discount_amount",
             "qty",
