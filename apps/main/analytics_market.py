@@ -583,6 +583,8 @@ class AnalyticsView(APIView):
             data = self._suppliers_analytics(request, company, branch, period)
         elif tab == "procurement":
             data = self._procurement(request, company, branch, period)
+        elif tab == "purchases":
+            data = self._purchases(request, company, branch, period)
         elif tab == "users":
             data = self._users_analytics(request, company, branch, period)
         elif tab == "finance":
@@ -591,7 +593,7 @@ class AnalyticsView(APIView):
             data = self._salary(request, company, branch, period)
         else:
             return Response(
-                {"detail": "Unknown tab. Use: sales|stock|cashboxes|shifts|products|suppliers|procurement|users|finance|salary"},
+                {"detail": "Unknown tab. Use: sales|stock|cashboxes|shifts|products|suppliers|procurement|purchases|users|finance|salary"},
                 status=400,
             )
 
@@ -865,6 +867,8 @@ class AnalyticsView(APIView):
         category_pie = []
         movement = []
         low_list = []
+        total_stock_quantity = None
+        products_stock = []
 
         if Product is not None:
             pqs = Product.objects.filter(company=company)
@@ -899,6 +903,49 @@ class AnalyticsView(APIView):
             qty_field = "quantity" if _model_has_field(Product, "quantity") else None
             pp_field = "purchase_price" if _model_has_field(Product, "purchase_price") else None
             price_field = "price" if _model_has_field(Product, "price") else None
+
+            if qty_field:
+                sum_row = pqs.aggregate(
+                    s=Coalesce(
+                        Sum(qty_field),
+                        Value(Z_QTY, output_field=QTY_FIELD),
+                        output_field=QTY_FIELD,
+                    )
+                )
+                sq = sum_row.get("s")
+                total_stock_quantity = str(
+                    (sq if sq is not None else Z_QTY).quantize(Decimal("0.01"))
+                )
+
+                vf = ["id", "name", qty_field]
+                if _model_has_field(Product, "code"):
+                    vf.append("code")
+                if _model_has_field(Product, "unit"):
+                    vf.append("unit")
+                if _model_has_field(Product, "kind"):
+                    vf.append("kind")
+                if _model_has_field(Product, "barcode"):
+                    vf.append("barcode")
+                for row in pqs.order_by("name").values(*vf):
+                    q = row.get(qty_field)
+                    try:
+                        qd = Decimal(q) if q is not None else Z_QTY
+                    except Exception:
+                        qd = Z_QTY
+                    item = {
+                        "id": str(row["id"]),
+                        "name": (row.get("name") or "Товар").strip() or "Товар",
+                        "quantity": str(qd.quantize(Decimal("0.01"))),
+                    }
+                    if "code" in vf:
+                        item["code"] = row.get("code") or ""
+                    if "unit" in vf:
+                        item["unit"] = row.get("unit") or ""
+                    if "kind" in vf:
+                        item["kind"] = row.get("kind") or ""
+                    if "barcode" in vf:
+                        item["barcode"] = row.get("barcode") or ""
+                    products_stock.append(item)
 
             if qty_field and (pp_field or price_field):
                 mul_field = pp_field or price_field
@@ -1033,6 +1080,7 @@ class AnalyticsView(APIView):
                 "inventory_value": str(_money(inventory_value)),
                 "low_stock_count": low_count,
                 "turnover_days": turnover_days,
+                "total_stock_quantity": total_stock_quantity,
             },
             "charts": {
                 "category_distribution": category_pie,
@@ -1040,7 +1088,143 @@ class AnalyticsView(APIView):
             },
             "tables": {
                 "low_stock": low_list,
+                "products_stock": products_stock,
             },
+        }
+
+    # ─────────────────────────────────────────────────────────
+    # PURCHASES (закупки по полю Product.date)
+    # ─────────────────────────────────────────────────────────
+    def _purchases(self, request, company, branch, period: Period):
+        qp = request.query_params
+        raw_from = (qp.get("purchase_date_from") or qp.get("date_from") or "").strip() or None
+        raw_to = (qp.get("purchase_date_to") or qp.get("date_to") or "").strip() or None
+
+        df = _parse_dt(raw_from) if raw_from else period.start
+        dt = _parse_dt(raw_to) if raw_to else period.end
+        if df and timezone.is_naive(df):
+            df = timezone.make_aware(df, timezone.get_current_timezone())
+        if dt and timezone.is_naive(dt):
+            dt = timezone.make_aware(dt, timezone.get_current_timezone())
+        if dt and raw_to and len(raw_to) == 10:
+            dt = dt + timedelta(days=1)
+
+        pqs = self._market_products_queryset(request, company, branch)
+        if pqs is None:
+            return {
+                "tab": "purchases",
+                "period": {"from": df.isoformat(), "to": dt.isoformat()},
+                "filters": {
+                    "branch": str(getattr(branch, "id", "")) if branch else None,
+                    "include_global": self._include_global(request),
+                    "purchase_date_from": raw_from,
+                    "purchase_date_to": raw_to,
+                },
+                "meta": {"note": "Purchase analytics requires main.Product model."},
+                "cards": {"purchased_sku_count": 0, "purchased_units": "0.000", "purchased_value": "0.00"},
+                "tables": {"by_supplier": []},
+            }
+
+        Product = pqs.model
+        if not _model_has_field(Product, "date"):
+            return {
+                "tab": "purchases",
+                "period": {"from": df.isoformat(), "to": dt.isoformat()},
+                "filters": {
+                    "branch": str(getattr(branch, "id", "")) if branch else None,
+                    "include_global": self._include_global(request),
+                    "purchase_date_from": raw_from,
+                    "purchase_date_to": raw_to,
+                },
+                "meta": {"note": "Purchase analytics requires Product.date field (purchase date)."},
+                "cards": {"purchased_sku_count": 0, "purchased_units": "0.000", "purchased_value": "0.00"},
+                "tables": {"by_supplier": []},
+            }
+
+        qty_field = "quantity" if _model_has_field(Product, "quantity") else None
+        pp_field = "purchase_price" if _model_has_field(Product, "purchase_price") else None
+
+        pqs2 = pqs.filter(date__gte=df, date__lt=dt)
+
+        purchased_sku_count = int(pqs2.count() or 0)
+        purchased_units = Z_QTY
+        purchased_value = Z_MONEY
+
+        if qty_field:
+            purchased_units = (
+                pqs2.aggregate(
+                    s=Coalesce(
+                        Sum(qty_field),
+                        Value(Z_QTY, output_field=QTY_FIELD),
+                        output_field=QTY_FIELD,
+                    )
+                )["s"]
+                or Z_QTY
+            )
+
+        if qty_field and pp_field:
+            val_expr = ExpressionWrapper(F(qty_field) * F(pp_field), output_field=MONEY_FIELD)
+            purchased_value = (
+                pqs2.aggregate(
+                    s=Coalesce(
+                        Sum(val_expr),
+                        Value(Z_MONEY, output_field=MONEY_FIELD),
+                        output_field=MONEY_FIELD,
+                    )
+                )["s"]
+                or Z_MONEY
+            )
+
+        by_supplier = []
+        if _model_has_field(Product, "client"):
+            sup_rows = (
+                pqs2.values("client_id", "client__full_name", "client__llc", "client__phone")
+                .annotate(
+                    sku_count=Count("id"),
+                    units=Coalesce(
+                        Sum(qty_field),
+                        Value(Z_QTY, output_field=QTY_FIELD),
+                        output_field=QTY_FIELD,
+                    )
+                    if qty_field
+                    else Value(Z_QTY, output_field=QTY_FIELD),
+                    value=Coalesce(
+                        Sum(ExpressionWrapper(F(qty_field) * F(pp_field), output_field=MONEY_FIELD)),
+                        Value(Z_MONEY, output_field=MONEY_FIELD),
+                        output_field=MONEY_FIELD,
+                    )
+                    if (qty_field and pp_field)
+                    else Value(Z_MONEY, output_field=MONEY_FIELD),
+                )
+                .order_by("-value", "-units")
+            )
+            for r in sup_rows:
+                by_supplier.append(
+                    {
+                        "supplier_id": str(r.get("client_id")) if r.get("client_id") else None,
+                        "supplier": (r.get("client__full_name") or r.get("client__llc") or "—").strip() or "—",
+                        "phone": r.get("client__phone"),
+                        "sku_count": int(r.get("sku_count") or 0),
+                        "units": _qty_str(r.get("units") or Z_QTY),
+                        "value": str(_money(r.get("value") or Z_MONEY)),
+                    }
+                )
+
+        return {
+            "tab": "purchases",
+            "period": {"from": df.isoformat(), "to": dt.isoformat()},
+            "filters": {
+                "branch": str(getattr(branch, "id", "")) if branch else None,
+                "include_global": self._include_global(request),
+                "purchase_date_from": raw_from,
+                "purchase_date_to": raw_to,
+            },
+            "cards": {
+                "purchased_sku_count": purchased_sku_count,
+                "purchased_units": _qty_str(purchased_units),
+                "purchased_value": str(_money(purchased_value)),
+            },
+            "tables": {"by_supplier": by_supplier},
         }
 
     # ─────────────────────────────────────────────────────────
