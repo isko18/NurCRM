@@ -1183,6 +1183,7 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
             ("purchase_price", self._Q2),
             ("markup_percent", self._Q4),
             ("price", self._Q2),
+            ("wholesale_price", Decimal("0.001")),
             ("discount_percent", self._Q2),
         ):
             safe = self._safe_decimal(getattr(instance, field, None), quant)
@@ -1249,6 +1250,7 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
         purchase_price = self._to_dec(validated_data.pop("purchase_price", Decimal("0")))
         markup_percent = self._to_dec(validated_data.pop("markup_percent", Decimal("0")))
         price_in = validated_data.pop("price", None)
+        wholesale_in = validated_data.pop("wholesale_price", None)
 
         if price_in not in (None, ""):
             price = self._to_dec(price_in)
@@ -1256,6 +1258,7 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
         else:
             price = self._calc_price(purchase_price, markup_percent)
 
+        wholesale_price = self._to_dec(wholesale_in, default=Decimal("0")) if wholesale_in not in (None, "") else Decimal("0")
         discount_percent = self._to_dec(validated_data.pop("discount_percent", Decimal("0")))
 
         country = (validated_data.pop("country", "") or "").strip()
@@ -1303,6 +1306,7 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
             purchase_price=purchase_price,
             markup_percent=markup_percent,
             price=price,
+            wholesale_price=wholesale_price,
             discount_percent=discount_percent,
 
             quantity=validated_data.get("quantity", 0),
@@ -1431,10 +1435,19 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
             "client",
             "kind",
             "hotkey_group",
+            "wholesale_price",
         )
         for field in updatable_fields:
             if field in validated_data:
-                setattr(instance, field, validated_data[field])
+                if field == "wholesale_price":
+                    raw = validated_data[field]
+                    instance.wholesale_price = (
+                        self._to_dec(raw, default=Decimal("0"))
+                        if raw not in (None, "")
+                        else Decimal("0")
+                    )
+                else:
+                    setattr(instance, field, validated_data[field])
 
         if "stock" in validated_data:
             instance.stock = validated_data["stock"]
