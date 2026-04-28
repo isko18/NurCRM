@@ -383,6 +383,35 @@ def _upsert_scanned_cart_item(cart, product, quantity):
     return item
 
 
+def _reprice_cart_items_for_mode(cart: Cart) -> None:
+    items = list(cart.items.select_related("product", "sale_package"))
+    if not items:
+        return
+    changed = []
+    for it in items:
+        if not it.product_id or not it.product:
+            continue
+        p = it.product
+        if getattr(cart, "is_wholesale", False):
+            raw_wholesale = getattr(p, "wholesale_price", None)
+            raw_retail = getattr(p, "price", None)
+            pack_price = Decimal(str(raw_wholesale)) if raw_wholesale not in (None, 0, "0") else Decimal(str(raw_retail or 0))
+            if it.sale_package_id:
+                ipp = Decimal(str(it.sale_package.quantity_in_package or 0))
+                it.unit_price = _q2(pack_price / ipp) if ipp > 0 else _q2(pack_price)
+            else:
+                it.unit_price = _q2(pack_price)
+        else:
+            if it.sale_package_id:
+                it.unit_price = _q2(default_unit_price_for_package(p, it.sale_package))
+            else:
+                it.unit_price = _q2(Decimal(str(getattr(p, "price", None) or 0)))
+        changed.append(it)
+    if changed:
+        CartItem.objects.bulk_update(changed, ["unit_price"])
+        cart.recalc()
+
+
 def _aware(dt_or_date, end=False):
     tz = get_current_timezone()
     if isinstance(dt_or_date, datetime):
@@ -1429,6 +1458,7 @@ class SaleStartAPIView(MarketCashierOnlyMixin, CompanyBranchRestrictedMixin, API
             .order_by("-created_at")
         )
         cart = qs.first()
+        created = False
 
         if cart is None:
             cart = Cart.objects.create(
@@ -1439,6 +1469,7 @@ class SaleStartAPIView(MarketCashierOnlyMixin, CompanyBranchRestrictedMixin, API
                 shift=shift,
                 is_wholesale=bool(is_wholesale_req) if is_wholesale_req is not None else False,
             )
+            created = True
         else:
             extra_ids = list(qs.values_list("id", flat=True)[1:])
             if extra_ids:
@@ -1463,10 +1494,15 @@ class SaleStartAPIView(MarketCashierOnlyMixin, CompanyBranchRestrictedMixin, API
             cart.order_discount_percent = None
             cart.order_discount_total = _q2(order_disc_total or Decimal("0.00"))
         update_f = ["order_discount_total", "order_discount_percent", "updated_at"]
+        wholesale_changed = False
         if is_wholesale_req is not None and getattr(cart, "is_wholesale", False) != bool(is_wholesale_req):
             cart.is_wholesale = bool(is_wholesale_req)
             update_f.append("is_wholesale")
+            wholesale_changed = True
         cart.save(update_fields=update_f)
+        # при старте или переключении режима — пересчитать цены уже добавленных товаров
+        if created or wholesale_changed:
+            _reprice_cart_items_for_mode(cart)
 
         cart.recalc()
         return _cart_response(request, cart.id, status_code=status.HTTP_201_CREATED)
@@ -2709,12 +2745,23 @@ class AgentCartStartAPIView(MarketCashierOnlyMixin, CompanyBranchRestrictedMixin
 
         qs = qs.order_by("-created_at")
         cart = qs.first()
+        created = False
 
         if cart is None:
             create_kwargs = dict(company=company, user=user, status=Cart.Status.ACTIVE)
             if hasattr(Cart, "branch"):
                 create_kwargs["branch"] = branch
+            if hasattr(Cart, "is_wholesale"):
+                opts0 = StartCartOptionsSerializer(data=request.data)
+                if opts0.is_valid():
+                    is_wholesale0 = (
+                        bool(opts0.validated_data.get("is_wholesale"))
+                        if "is_wholesale" in opts0.validated_data
+                        else False
+                    )
+                    create_kwargs["is_wholesale"] = is_wholesale0
             cart = Cart.objects.create(**create_kwargs)
+            created = True
         else:
             extra_ids = list(qs.values_list("id", flat=True)[1:])
             if extra_ids:
@@ -2743,11 +2790,15 @@ class AgentCartStartAPIView(MarketCashierOnlyMixin, CompanyBranchRestrictedMixin
             update_fields = []
             if order_disc_total is not None or order_disc_percent is not None:
                 update_fields.extend(["order_discount_total", "order_discount_percent"])
+            wholesale_changed = False
             if is_wholesale_req is not None and getattr(cart, "is_wholesale", False) != bool(is_wholesale_req):
                 cart.is_wholesale = bool(is_wholesale_req)
                 update_fields.append("is_wholesale")
+                wholesale_changed = True
             if update_fields:
                 cart.save(update_fields=update_fields)
+            if created or wholesale_changed:
+                _reprice_cart_items_for_mode(cart)
 
         cart.recalc()
         return Response(SaleCartSerializer(cart).data, status=status.HTTP_201_CREATED)
