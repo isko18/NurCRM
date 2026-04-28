@@ -417,6 +417,7 @@ class User(AbstractBaseUser, PermissionsMixin):
     can_view_market_delete_cart_item = models.BooleanField(default=False, verbose_name="Маркет: доступ к удалению позиции из корзины")
     can_view_market_procurement = models.BooleanField(default=False, verbose_name="Маркет: доступ к закупкам")
     can_view_market_supplier = models.BooleanField(default=False, verbose_name="Маркет: доступ к поставщикам")
+    can_view_market_employee_return = models.BooleanField(default=False, verbose_name="Маркет: доступ к возврату сотрудника")
     
     branches = models.ManyToManyField(
         "Branch",
