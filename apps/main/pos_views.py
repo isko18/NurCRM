@@ -1415,6 +1415,14 @@ class SaleStartAPIView(MarketCashierOnlyMixin, CompanyBranchRestrictedMixin, API
                 {"detail": "Смена не открыта. Сначала откройте смену на кассе, затем начните продажу."}
             )
 
+        opts = StartCartOptionsSerializer(data=request.data)
+        opts.is_valid(raise_exception=True)
+        is_wholesale_req = (
+            bool(opts.validated_data.get("is_wholesale"))
+            if "is_wholesale" in opts.validated_data
+            else None
+        )
+
         qs = (
             Cart.objects.select_for_update()
             .filter(company=company, user=user, status=Cart.Status.ACTIVE, shift=shift)
@@ -1429,6 +1437,7 @@ class SaleStartAPIView(MarketCashierOnlyMixin, CompanyBranchRestrictedMixin, API
                 status=Cart.Status.ACTIVE,
                 branch=branch or shift.branch,
                 shift=shift,
+                is_wholesale=bool(is_wholesale_req) if is_wholesale_req is not None else False,
             )
         else:
             extra_ids = list(qs.values_list("id", flat=True)[1:])
@@ -1441,15 +1450,11 @@ class SaleStartAPIView(MarketCashierOnlyMixin, CompanyBranchRestrictedMixin, API
                 cart.branch = branch or shift.branch
                 cart.save(update_fields=["branch"])
 
-        opts = StartCartOptionsSerializer(data=request.data)
-        opts.is_valid(raise_exception=True)
-
         # Сначала пересчитываем корзину, чтобы получить актуальный subtotal
         cart.recalc()
 
         order_disc_total = opts.validated_data.get("order_discount_total")
         order_disc_percent = opts.validated_data.get("order_discount_percent")
-        is_wholesale = bool(opts.validated_data.get("is_wholesale")) if "is_wholesale" in opts.validated_data else None
 
         if order_disc_percent is not None:
             cart.order_discount_percent = _q2(Decimal(str(order_disc_percent)))
@@ -1458,8 +1463,8 @@ class SaleStartAPIView(MarketCashierOnlyMixin, CompanyBranchRestrictedMixin, API
             cart.order_discount_percent = None
             cart.order_discount_total = _q2(order_disc_total or Decimal("0.00"))
         update_f = ["order_discount_total", "order_discount_percent", "updated_at"]
-        if is_wholesale is not None and getattr(cart, "is_wholesale", False) != is_wholesale:
-            cart.is_wholesale = is_wholesale
+        if is_wholesale_req is not None and getattr(cart, "is_wholesale", False) != bool(is_wholesale_req):
+            cart.is_wholesale = bool(is_wholesale_req)
             update_f.append("is_wholesale")
         cart.save(update_fields=update_f)
 
@@ -2723,7 +2728,11 @@ class AgentCartStartAPIView(MarketCashierOnlyMixin, CompanyBranchRestrictedMixin
         if opts.is_valid():
             order_disc_total = opts.validated_data.get("order_discount_total")
             order_disc_percent = opts.validated_data.get("order_discount_percent")
-            is_wholesale = bool(opts.validated_data.get("is_wholesale")) if "is_wholesale" in opts.validated_data else None
+            is_wholesale_req = (
+                bool(opts.validated_data.get("is_wholesale"))
+                if "is_wholesale" in opts.validated_data
+                else None
+            )
 
             if order_disc_percent is not None:
                 cart.order_discount_percent = money(Decimal(str(order_disc_percent)))
@@ -2734,8 +2743,8 @@ class AgentCartStartAPIView(MarketCashierOnlyMixin, CompanyBranchRestrictedMixin
             update_fields = []
             if order_disc_total is not None or order_disc_percent is not None:
                 update_fields.extend(["order_discount_total", "order_discount_percent"])
-            if is_wholesale is not None and getattr(cart, "is_wholesale", False) != is_wholesale:
-                cart.is_wholesale = is_wholesale
+            if is_wholesale_req is not None and getattr(cart, "is_wholesale", False) != bool(is_wholesale_req):
+                cart.is_wholesale = bool(is_wholesale_req)
                 update_fields.append("is_wholesale")
             if update_fields:
                 cart.save(update_fields=update_fields)
