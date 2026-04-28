@@ -1682,10 +1682,18 @@ class CartItem(models.Model):
                 from apps.main.pos_utils import default_unit_price_for_package
 
                 sp = self.sale_package
-                self.unit_price = default_unit_price_for_package(self.product, sp)
+                if getattr(self.cart, "is_wholesale", False):
+                    pack_price = Decimal(str(getattr(self.product, "wholesale_price", None) or 0))
+                    ipp = Decimal(str(getattr(sp, "quantity_in_package", None) or 0))
+                    self.unit_price = (pack_price / ipp) if ipp > 0 else pack_price
+                else:
+                    self.unit_price = default_unit_price_for_package(self.product, sp)
             else:
                 # Product.price может иметь 3 знака после запятой, а unit_price — 2.
-                self.unit_price = self.product.price if self.product else Decimal("0")
+                if getattr(self.cart, "is_wholesale", False):
+                    self.unit_price = getattr(self.product, "wholesale_price", None) if self.product else Decimal("0")
+                else:
+                    self.unit_price = self.product.price if self.product else Decimal("0")
         # На всякий случай нормализуем в денежный формат (2 знака)
         self.unit_price = _money(self.unit_price)
         if hasattr(self, "line_discount"):

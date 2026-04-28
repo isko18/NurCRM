@@ -372,7 +372,7 @@ def _upsert_scanned_cart_item(cart, product, quantity):
         branch=getattr(cart, "branch", None),
         product=product,
         quantity=scanned_qty,
-        unit_price=product.price,
+        unit_price=(product.wholesale_price if getattr(cart, "is_wholesale", False) else product.price),
     )
     item.save(skip_full_clean=True)
     return item
@@ -1444,6 +1444,7 @@ class SaleStartAPIView(MarketCashierOnlyMixin, CompanyBranchRestrictedMixin, API
 
         order_disc_total = opts.validated_data.get("order_discount_total")
         order_disc_percent = opts.validated_data.get("order_discount_percent")
+        is_wholesale = bool(opts.validated_data.get("is_wholesale")) if "is_wholesale" in opts.validated_data else None
 
         if order_disc_percent is not None:
             cart.order_discount_percent = _q2(Decimal(str(order_disc_percent)))
@@ -1451,7 +1452,11 @@ class SaleStartAPIView(MarketCashierOnlyMixin, CompanyBranchRestrictedMixin, API
         else:
             cart.order_discount_percent = None
             cart.order_discount_total = _q2(order_disc_total or Decimal("0.00"))
-        cart.save(update_fields=["order_discount_total", "order_discount_percent", "updated_at"])
+        update_f = ["order_discount_total", "order_discount_percent", "updated_at"]
+        if is_wholesale is not None and getattr(cart, "is_wholesale", False) != is_wholesale:
+            cart.is_wholesale = is_wholesale
+            update_f.append("is_wholesale")
+        cart.save(update_fields=update_f)
 
         cart.recalc()
         return _cart_response(request, cart.id, status_code=status.HTTP_201_CREATED)
@@ -1614,11 +1619,18 @@ class SaleAddItemAPIView(MarketCashierOnlyMixin, APIView):
             )
 
         # unit_price — база, line_discount — скидка на строку (хранятся отдельно)
-        base_price = (
-            _q2(unit_price)
-            if unit_price is not None
-            else _q2(default_unit_price_for_package(product, pkg))
-        )
+        if unit_price is not None:
+            base_price = _q2(unit_price)
+        else:
+            if getattr(cart, "is_wholesale", False):
+                pack_price = Decimal(str(getattr(product, "wholesale_price", None) or 0))
+                if pkg:
+                    ipp = Decimal(str(pkg.quantity_in_package or 0))
+                    base_price = _q2(pack_price / ipp) if ipp > 0 else _q2(pack_price)
+                else:
+                    base_price = _q2(pack_price)
+            else:
+                base_price = _q2(default_unit_price_for_package(product, pkg))
         disc_total = _q2(Decimal(str(line_discount))) if line_discount is not None else Decimal("0.00")
 
         # Цена продажи не ниже закупочной, кроме случая со скидкой (со скидкой можно ниже)
@@ -2704,6 +2716,7 @@ class AgentCartStartAPIView(MarketCashierOnlyMixin, CompanyBranchRestrictedMixin
         if opts.is_valid():
             order_disc_total = opts.validated_data.get("order_discount_total")
             order_disc_percent = opts.validated_data.get("order_discount_percent")
+            is_wholesale = bool(opts.validated_data.get("is_wholesale")) if "is_wholesale" in opts.validated_data else None
 
             if order_disc_percent is not None:
                 cart.order_discount_percent = money(Decimal(str(order_disc_percent)))
@@ -2711,8 +2724,14 @@ class AgentCartStartAPIView(MarketCashierOnlyMixin, CompanyBranchRestrictedMixin
             elif order_disc_total is not None:
                 cart.order_discount_percent = None
                 cart.order_discount_total = money(order_disc_total)
+            update_fields = []
             if order_disc_total is not None or order_disc_percent is not None:
-                cart.save(update_fields=["order_discount_total", "order_discount_percent"])
+                update_fields.extend(["order_discount_total", "order_discount_percent"])
+            if is_wholesale is not None and getattr(cart, "is_wholesale", False) != is_wholesale:
+                cart.is_wholesale = is_wholesale
+                update_fields.append("is_wholesale")
+            if update_fields:
+                cart.save(update_fields=update_fields)
 
         cart.recalc()
         return Response(SaleCartSerializer(cart).data, status=status.HTTP_201_CREATED)

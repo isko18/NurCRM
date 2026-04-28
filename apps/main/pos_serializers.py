@@ -62,6 +62,7 @@ class StartCartOptionsSerializer(serializers.Serializer):
     order_discount_percent = serializers.DecimalField(
         max_digits=5, decimal_places=2, required=False
     )
+    is_wholesale = serializers.BooleanField(required=False)
 
     def validate(self, attrs):
         total = attrs.get("order_discount_total")
