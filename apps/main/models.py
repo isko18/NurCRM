@@ -6,7 +6,7 @@ from django.core.validators import MinValueValidator
 from decimal import Decimal, ROUND_HALF_UP
 from dateutil.relativedelta import relativedelta
 from django.db import transaction, connection
-from django.db.models import Sum, F, Q, Max, IntegerField, Value, ExpressionWrapper
+from django.db.models import Sum, F, Q, Max, IntegerField, Value, ExpressionWrapper, Case, When
 from mptt.models import MPTTModel, TreeForeignKey
 import uuid, secrets
 from django.core.files.base import ContentFile
@@ -747,6 +747,13 @@ class Product(models.Model):
             "Иначе считается из закупки и наценки, если не задана вручную."
         ),
     )
+    wholesale_price = models.DecimalField(
+        "Цена оптовой продажи",
+        max_digits=10,
+        decimal_places=3,
+        default=0,
+        help_text="Оптовая цена продажи за одну учётную единицу (как остаток).",
+    )
     discount_percent = models.DecimalField(
         "Скидка, %",
         max_digits=12,
@@ -1441,6 +1448,8 @@ class Cart(models.Model):
         verbose_name="Смена",
     )
 
+    is_wholesale = models.BooleanField(default=False, db_index=True, verbose_name="Оптовая продажа")
+
     status = models.CharField(max_length=16, choices=Status.choices, default=Status.ACTIVE, verbose_name="Статус")
 
     subtotal = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal("0.00"))
@@ -1550,7 +1559,11 @@ class Cart(models.Model):
     def recalc(self):
         calc_field = models.DecimalField(max_digits=24, decimal_places=6)
         zero = Value(Decimal("0.00"), output_field=calc_field)
-        base_unit = Coalesce(F("product__price"), F("unit_price"), output_field=calc_field)
+        base_unit = Case(
+            When(cart__is_wholesale=True, then=F("unit_price")),
+            default=Coalesce(F("product__price"), F("unit_price"), output_field=calc_field),
+            output_field=calc_field,
+        )
         line_base = ExpressionWrapper(base_unit * F("quantity"), output_field=calc_field)
         line_actual = ExpressionWrapper(
             (F("unit_price") * F("quantity")) - Coalesce(F("line_discount"), zero, output_field=calc_field),

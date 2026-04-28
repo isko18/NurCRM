@@ -51,6 +51,26 @@ def checkout_cart(
     prod_ids = [it.product_id for it in items if it.product_id]
     products = {p.id: p for p in Product.objects.select_for_update().filter(id__in=prod_ids)}
 
+    if getattr(cart, "is_wholesale", False):
+        changed_items = []
+        for it in items:
+            if not it.product_id:
+                continue
+            p = products.get(it.product_id)
+            if not p:
+                continue
+            pack_price = Decimal(str(getattr(p, "wholesale_price", None) or 0))
+            if it.sale_package_id:
+                ipp = Decimal(str(it.sale_package.quantity_in_package or 0))
+                it.unit_price = pos_money(pack_price / ipp) if ipp > 0 else pos_money(pack_price)
+            else:
+                it.unit_price = pos_money(pack_price)
+            changed_items.append(it)
+        if changed_items:
+            CartItem.objects.bulk_update(changed_items, ["unit_price"])
+        cart.recalc()
+        items = list(cart.items.select_related("product", "sale_package"))
+
     consume_by_pid: dict = defaultdict(lambda: Decimal("0"))
     for it in items:
         if not it.product_id:
