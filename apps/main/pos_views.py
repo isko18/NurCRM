@@ -330,6 +330,7 @@ def _cart_queryset_for_response():
         "id",
         "company_id",
         "status",
+        "is_wholesale",
         "shift_id",
         "subtotal",
         "discount_total",

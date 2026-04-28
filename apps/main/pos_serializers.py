@@ -222,6 +222,7 @@ class SaleCartSerializer(serializers.ModelSerializer):
         fields = (
             "id",
             "status",
+            "is_wholesale",
             "shift",
             "subtotal",
             "discount_total",
