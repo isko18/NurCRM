@@ -911,6 +911,7 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
             "purchase_price",
             "markup_percent",
             "price",
+            "wholesale_price",
             "discount_percent",
             "plu",
             "country",
@@ -2117,7 +2118,7 @@ class BulkIdsSerializer(serializers.Serializer):
 class ProductNestedSerializer(serializers.ModelSerializer):
     class Meta:
         model = Product
-        fields = ["id", "name", "barcode", "quantity", "price"]
+        fields = ["id", "name", "barcode", "quantity", "price", "wholesale_price"]
 
 
 # Лёгкий сериализатор для списка товаров (минимальный набор полей)
@@ -2129,7 +2130,7 @@ class ProductListSerializer(serializers.ModelSerializer):
         model = Product
         fields = [
             "id", "name", "code", "article",
-            "price", "purchase_price",
+            "price", "wholesale_price", "purchase_price",
             "quantity", "brand", "category",
             "hotkey_group",
             "image_url", "is_favorite",

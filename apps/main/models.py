@@ -1683,7 +1683,13 @@ class CartItem(models.Model):
 
                 sp = self.sale_package
                 if getattr(self.cart, "is_wholesale", False):
-                    pack_price = Decimal(str(getattr(self.product, "wholesale_price", None) or 0))
+                    raw_wholesale = getattr(self.product, "wholesale_price", None)
+                    raw_retail = getattr(self.product, "price", None)
+                    pack_price = (
+                        Decimal(str(raw_wholesale))
+                        if raw_wholesale not in (None, 0, "0")
+                        else Decimal(str(raw_retail or 0))
+                    )
                     ipp = Decimal(str(getattr(sp, "quantity_in_package", None) or 0))
                     self.unit_price = (pack_price / ipp) if ipp > 0 else pack_price
                 else:
@@ -1691,7 +1697,9 @@ class CartItem(models.Model):
             else:
                 # Product.price может иметь 3 знака после запятой, а unit_price — 2.
                 if getattr(self.cart, "is_wholesale", False):
-                    self.unit_price = getattr(self.product, "wholesale_price", None) if self.product else Decimal("0")
+                    raw_wholesale = getattr(self.product, "wholesale_price", None) if self.product else None
+                    raw_retail = getattr(self.product, "price", None) if self.product else None
+                    self.unit_price = raw_wholesale if raw_wholesale not in (None, 0, "0") else (raw_retail or Decimal("0"))
                 else:
                     self.unit_price = self.product.price if self.product else Decimal("0")
         # На всякий случай нормализуем в денежный формат (2 знака)

@@ -373,7 +373,11 @@ def _upsert_scanned_cart_item(cart, product, quantity):
         branch=getattr(cart, "branch", None),
         product=product,
         quantity=scanned_qty,
-        unit_price=(product.wholesale_price if getattr(cart, "is_wholesale", False) else product.price),
+        unit_price=(
+            (product.wholesale_price or product.price)
+            if getattr(cart, "is_wholesale", False)
+            else product.price
+        ),
     )
     item.save(skip_full_clean=True)
     return item
@@ -1624,7 +1628,9 @@ class SaleAddItemAPIView(MarketCashierOnlyMixin, APIView):
             base_price = _q2(unit_price)
         else:
             if getattr(cart, "is_wholesale", False):
-                pack_price = Decimal(str(getattr(product, "wholesale_price", None) or 0))
+                raw_wholesale = getattr(product, "wholesale_price", None)
+                raw_retail = getattr(product, "price", None)
+                pack_price = Decimal(str(raw_wholesale)) if raw_wholesale not in (None, 0, "0") else Decimal(str(raw_retail or 0))
                 if pkg:
                     ipp = Decimal(str(pkg.quantity_in_package or 0))
                     base_price = _q2(pack_price / ipp) if ipp > 0 else _q2(pack_price)

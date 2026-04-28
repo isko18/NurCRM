@@ -696,6 +696,7 @@ class ProductCompactListView(CompanyBranchRestrictedMixin, generics.ListAPIView)
                 "id",
                 "name",
                 "price",
+                "wholesale_price",
                 "quantity",
                 "brand_id",
                 "category_id",

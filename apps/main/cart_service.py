@@ -156,9 +156,13 @@ def add_item_to_cart(
     if unit_price is not None:
         base_price = _money(unit_price)
     else:
-        base_price = _money(
-            (product.wholesale_price if getattr(cart, "is_wholesale", False) else product.price) or Decimal("0.00")
-        )
+        if getattr(cart, "is_wholesale", False):
+            raw_wholesale = getattr(product, "wholesale_price", None)
+            raw_retail = getattr(product, "price", None)
+            chosen = raw_wholesale if raw_wholesale not in (None, 0, "0") else raw_retail
+            base_price = _money(chosen or Decimal("0.00"))
+        else:
+            base_price = _money(product.price or Decimal("0.00"))
     line_disc = _money(discount_total) if discount_total is not None else Decimal("0.00")
 
     # Со скидкой можно продавать ниже закупочной
