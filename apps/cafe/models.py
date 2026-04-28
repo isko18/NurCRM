@@ -938,25 +938,6 @@ class PreparationProcessing(models.Model):
     )
     unit = models.CharField("Ед. изм.", max_length=16, blank=True, default="")
 
-    input_quantity = models.DecimalField(
-        "Вход",
-        max_digits=14,
-        decimal_places=6,
-        validators=[MinValueValidator(Decimal("0.000001"))],
-        null=True,
-        blank=True,
-    )
-    input_unit = models.CharField("Ед. входа", max_length=16, blank=True, default="")
-    output_quantity = models.DecimalField(
-        "Выход",
-        max_digits=14,
-        decimal_places=6,
-        validators=[MinValueValidator(Decimal("0.000001"))],
-        null=True,
-        blank=True,
-    )
-    output_unit = models.CharField("Ед. выхода", max_length=16, blank=True, default="")
-
     created_at = models.DateTimeField("Создано", auto_now_add=True)
     updated_at = models.DateTimeField("Обновлено", auto_now=True)
 
@@ -970,15 +951,6 @@ class PreparationProcessing(models.Model):
     def clean(self):
         if self.cost is not None and self.cost < 0:
             raise ValidationError({"cost": "Стоимость не может быть отрицательной."})
-        has_iq = self.input_quantity is not None
-        has_oq = self.output_quantity is not None
-        if has_iq != has_oq:
-            raise ValidationError("Укажите одновременно вход и выход (или не указывайте оба).")
-        if self.input_quantity is not None and self.output_quantity is not None:
-            if self.output_quantity > self.input_quantity:
-                raise ValidationError({"output_quantity": "Выход не может быть больше входа."})
-            if bool(self.input_unit) != bool(self.output_unit):
-                raise ValidationError("Укажите единицы измерения для входа и выхода (или не указывайте обе).")
 
     def __str__(self):
         return f"{self.preparation_id}: {self.name}"

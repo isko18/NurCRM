@@ -107,13 +107,7 @@ def calculate_preparation(prep: Preparation, *, raw_unit_cost: Decimal | None = 
         if row.charge_type == PreparationProcessing.ChargeType.FIXED:
             proc_cost += c
         else:
-            if row.output_quantity is not None:
-                row_unit = _norm_unit(row.output_unit) or _norm_unit(prep.output_unit)
-                qty_in_prep_unit = convert_quantity(Decimal(row.output_quantity), row_unit, _norm_unit(prep.output_unit))
-                base_qty = qty_in_prep_unit
-            else:
-                base_qty = output_q
-            proc_cost += (c * base_qty).quantize(Decimal("0.01"))
+            proc_cost += (c * output_q).quantize(Decimal("0.01"))
     proc_cost = proc_cost.quantize(Decimal("0.01"))
     total_cost = (raw_cost + proc_cost).quantize(Decimal("0.01"))
     unit_cost = (total_cost / output_q).quantize(Decimal("0.0001"))
