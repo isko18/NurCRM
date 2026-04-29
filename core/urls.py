@@ -18,6 +18,7 @@ from django.contrib import admin
 from django.urls import path, include
 from django.conf.urls.static import static
 from django.conf import settings
+from .views_media_proxy import media_proxy
 
 if settings.ENABLE_API_DOCS:
     from rest_framework import permissions
@@ -59,6 +60,7 @@ apps_includes = [
 
 # API-роуты
 api_urlpatterns = [
+    path("api/media-proxy/", media_proxy, name="media-proxy"),
     path('api/', include(apps_includes)),
 ]
 
