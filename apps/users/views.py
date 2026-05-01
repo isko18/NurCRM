@@ -261,7 +261,13 @@ class CurrentUserAPIView(generics.RetrieveUpdateAPIView):
     permission_classes = [IsAuthenticated]
 
     def get_object(self):
-        return self.request.user
+        memberships_qs = BranchMembership.objects.select_related("branch")
+        return (
+            User.objects.filter(pk=self.request.user.pk)
+            .select_related("company", "custom_role")
+            .prefetch_related(Prefetch("branch_memberships", queryset=memberships_qs))
+            .get()
+        )
 
 
 class EmployeeCreateAPIView(generics.CreateAPIView):

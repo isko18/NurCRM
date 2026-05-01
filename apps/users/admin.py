@@ -2,6 +2,7 @@
 from django.contrib import admin
 from django.contrib.auth.admin import UserAdmin as BaseUserAdmin
 from django.db import models as dj_models
+from django.db.models import Prefetch
 
 from .models import (
     User,
@@ -193,6 +194,16 @@ class UserAdmin(CompanyScopedFKMixin, BaseUserAdmin):
     autocomplete_fields = ("company", "custom_role")
     list_select_related = ("company", "custom_role")
 
+    def get_queryset(self, request):
+        qs = super().get_queryset(request)
+        return qs.prefetch_related(
+            Prefetch(
+                "branch_memberships",
+                queryset=BranchMembership.objects.select_related("branch"),
+            ),
+            "branches",
+        )
+
     fieldsets = (
         (None, {"fields": ("email", "password")}),
         (
@@ -272,15 +283,20 @@ class UserAdmin(CompanyScopedFKMixin, BaseUserAdmin):
         super().save_model(request, obj, form, change)
 
     def primary_branch_display(self, obj):
-        mb = obj.branch_memberships.filter(is_primary=True).select_related("branch").first()
-        return mb.branch.name if mb and mb.branch else "-"
+        for mb in obj.branch_memberships.all():
+            if mb.is_primary:
+                return mb.branch.name if mb.branch else "-"
+        return "-"
 
     primary_branch_display.short_description = "Основной филиал"
 
     def branches_display(self, obj):
-        names = list(obj.branches.values_list("name", flat=True)[:5])
-        result = ", ".join(names) if names else "-"
-        total = obj.branches.count()
+        all_branches = list(obj.branches.all())
+        if not all_branches:
+            return "-"
+        names = [b.name for b in all_branches[:5]]
+        result = ", ".join(names)
+        total = len(all_branches)
         if total > 5:
             result += f" и ещё {total - 5}"
         return result

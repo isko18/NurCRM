@@ -7,6 +7,7 @@ from django.conf import settings
 from django.contrib.auth.password_validation import validate_password
 from django.core.mail import send_mail
 from django.db import transaction
+from django.db.models import Prefetch
 from django.utils import timezone
 
 from rest_framework import serializers
@@ -112,23 +113,42 @@ class CustomTokenObtainPairSerializer(TokenObtainPairSerializer):
     def validate(self, attrs):
         data = super().validate(attrs)
 
-        if not getattr(self.user, "is_active", True):
+        user = (
+            User.objects.filter(pk=self.user.pk)
+            .select_related("company", "custom_role")
+            .prefetch_related(
+                Prefetch(
+                    "branch_memberships",
+                    queryset=BranchMembership.objects.select_related("branch"),
+                ),
+            )
+            .first()
+        )
+        if user is None:
+            raise serializers.ValidationError("Пользователь не найден.")
+        self.user = user
+
+        if not getattr(user, "is_active", True):
             raise serializers.ValidationError("Аккаунт деактивирован.")
 
-        br = getattr(self.user, "primary_branch", None)
-        primary_branch_id = getattr(br, "id", None) if br else None
+        branch_ids = []
+        primary_branch_id = None
+        for mb in user.branch_memberships.all():
+            branch_ids.append(mb.branch_id)
+            if mb.is_primary:
+                primary_branch_id = mb.branch_id
 
         data.update({
-            "user_id": self.user.id,
-            "email": self.user.email,
-            "first_name": self.user.first_name,
-            "last_name": self.user.last_name,
-            "avatar": self.user.avatar,
-            "phone_number": self.user.phone_number,
-            "track_number": self.user.track_number,
-            "company": self.user.company.name if self.user.company else None,
-            "role": self.user.role_display,
-            "branch_ids": getattr(self.user, "allowed_branch_ids", []),
+            "user_id": user.id,
+            "email": user.email,
+            "first_name": user.first_name,
+            "last_name": user.last_name,
+            "avatar": user.avatar,
+            "phone_number": user.phone_number,
+            "track_number": user.track_number,
+            "company": user.company.name if user.company else None,
+            "role": user.role_display,
+            "branch_ids": branch_ids,
             "primary_branch_id": primary_branch_id,
         })
         return data
@@ -189,8 +209,24 @@ class UserSerializer(serializers.ModelSerializer):
     password = serializers.CharField(write_only=True, required=False, min_length=8, style={"input_type": "password"})
     role_display = serializers.CharField(read_only=True)
 
-    branch_ids = serializers.ListField(child=serializers.UUIDField(), read_only=True, source="allowed_branch_ids")
-    primary_branch_id = serializers.UUIDField(read_only=True, source="primary_branch.id")
+    branch_ids = serializers.SerializerMethodField()
+    primary_branch_id = serializers.SerializerMethodField()
+
+    def _memberships_once(self, obj):
+        cache = self.context.setdefault("_branch_memberships_cache", {})
+        oid = obj.pk
+        if oid not in cache:
+            cache[oid] = list(obj.branch_memberships.all())
+        return cache[oid]
+
+    def get_branch_ids(self, obj):
+        return [m.branch_id for m in self._memberships_once(obj)]
+
+    def get_primary_branch_id(self, obj):
+        for m in self._memberships_once(obj):
+            if m.is_primary:
+                return m.branch_id
+        return None
 
     class Meta:
         model = User
