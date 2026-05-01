@@ -5257,6 +5257,10 @@ class AnalyticsCardDetailsAPIView(CompanyBranchRestrictedMixin, APIView):
 
         # ----- total_debt: остаток по ClientDeal(kind=debt) -----
         if card == "total_debt":
+            p_td = _parse_period(request)
+            date_from_td = p_td["date_from"]
+            date_to_td = p_td["date_to"]
+
             money_field_td = DecimalField(max_digits=12, decimal_places=2)
             zero_money_td = V(Decimal("0.00"), output_field=money_field_td)
 
@@ -5320,6 +5324,7 @@ class AnalyticsCardDetailsAPIView(CompanyBranchRestrictedMixin, APIView):
             return Response({
                 "card": card,
                 "branch_id": str(getattr(branch, "id", "")) if branch else None,
+                "period": {"type": p_td["period"], "date_from": date_from_td, "date_to": date_to_td},
                 "count": total_count,
                 "offset": offset,
                 "limit": limit,
@@ -5329,6 +5334,10 @@ class AnalyticsCardDetailsAPIView(CompanyBranchRestrictedMixin, APIView):
 
         # ----- accounts_receivable: сделки DEBT + продажи в долг -----
         if card == "accounts_receivable":
+            p_ar = _parse_period(request)
+            date_from_ar = p_ar["date_from"]
+            date_to_ar = p_ar["date_to"]
+
             money_field_ar = DecimalField(max_digits=12, decimal_places=2)
             zero_money_ar = V(Decimal("0.00"), output_field=money_field_ar)
 
@@ -5384,9 +5393,14 @@ class AnalyticsCardDetailsAPIView(CompanyBranchRestrictedMixin, APIView):
 
             # Чтобы не было двойного учёта "остаток по сделке" + "весь POS-чек в долг",
             # исключаем POS-долги по клиентам с активной рассрочкой (remaining > 0).
-            deals_active_clients_subq = deals_ann_qs.values("client_id")
+            active_client_ids = list(
+                deals_ann_qs.exclude(client_id__isnull=True).values_list("client_id", flat=True).distinct()
+            )
+            sales_debt_filtered = sales_debt_qs
+            if active_client_ids:
+                sales_debt_filtered = sales_debt_qs.exclude(client_id__in=active_client_ids)
             sale_rows = list(
-                sales_debt_qs.exclude(client_id__in=Subquery(deals_active_clients_subq))
+                sales_debt_filtered
                 .select_related("client", "user")
                 .order_by("-total", "-id")
                 .values("id", "total", "created_at", "client_id", "client__full_name", "user_id")
@@ -5440,6 +5454,7 @@ class AnalyticsCardDetailsAPIView(CompanyBranchRestrictedMixin, APIView):
             return Response({
                 "card": card,
                 "branch_id": str(getattr(branch, "id", "")) if branch else None,
+                "period": {"type": p_ar["period"], "date_from": date_from_ar, "date_to": date_to_ar},
                 "count": total_count,
                 "offset": offset,
                 "limit": limit,
