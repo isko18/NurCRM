@@ -11,6 +11,7 @@ from rest_framework import generics, permissions
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework.exceptions import PermissionDenied, ValidationError
+from rest_framework.pagination import PageNumberPagination
 
 from apps.construction.models import Cashbox, CashFlow, CashFlowCategory, CashShift
 
@@ -25,6 +26,7 @@ from apps.construction.serializers import (
     CashFlowSerializer,
     CashFlowCategorySerializer,
     CashboxWithFlowsSerializer,
+    CashFlowInsideCashboxSerializer,
     CashShiftListSerializer,
     CashShiftOpenSerializer,
     CashShiftCloseSerializer,
@@ -471,6 +473,7 @@ class CashboxOwnerDetailView(CompanyBranchScopedMixin, generics.ListAPIView):
 
 class CashboxOwnerDetailSingleView(CompanyBranchScopedMixin, generics.RetrieveAPIView):
     serializer_class = CashboxWithFlowsSerializer
+    pagination_class = PageNumberPagination
 
     def get_queryset(self):
         user = self.request.user
@@ -482,6 +485,30 @@ class CashboxOwnerDetailSingleView(CompanyBranchScopedMixin, generics.RetrieveAP
                 return Cashbox.objects.none()
             qs = Cashbox.objects.filter(company=company).select_related("company", "branch")
         return self._scoped_queryset(qs)
+
+    def retrieve(self, request, *args, **kwargs):
+        instance = self.get_object()
+        flows_qs = (
+            CashFlow.objects.filter(cashbox_id=instance.id)
+            .select_related("category", "cashier", "shift", "shift__cashier")
+            .order_by("-created_at")
+        )
+        paginator = self.pagination_class()
+        page = paginator.paginate_queryset(flows_qs, request, view=self)
+        context = self.get_serializer_context()
+        flows_data = CashFlowInsideCashboxSerializer(page, many=True, context=context).data
+        payload = {
+            "id": instance.id,
+            "company": instance.company_id,
+            "branch": instance.branch_id,
+            "name": instance.name,
+            "is_consumption": instance.is_consumption,
+            "cashflows": flows_data,
+            "count": paginator.page.paginator.count,
+            "next": paginator.get_next_link(),
+            "previous": paginator.get_previous_link(),
+        }
+        return Response(payload)
 
 
 # ─────────────────────────────────────────────────────────────
