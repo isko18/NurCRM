@@ -5374,15 +5374,20 @@ class AnalyticsCardDetailsAPIView(CompanyBranchRestrictedMixin, APIView):
                 .annotate(s=Sum("paid_amount"))
                 .values("s")[:1]
             )
-            deal_rows = list(
+            deals_ann_qs = (
                 deals_qs.select_related("client")
                 .annotate(paid=Coalesce(Subquery(paid_subq_ar), V(Decimal("0.00"), output_field=money_field_ar)))
                 .annotate(remaining=(F("amount") - F("prepayment")) - F("paid"))
                 .filter(remaining__gt=0)
-                .values("id", "title", "remaining", "client_id", "client__full_name")
             )
+            deal_rows = list(deals_ann_qs.values("id", "title", "remaining", "client_id", "client__full_name"))
+
+            # Чтобы не было двойного учёта "остаток по сделке" + "весь POS-чек в долг",
+            # исключаем POS-долги по клиентам с активной рассрочкой (remaining > 0).
+            deals_active_clients_subq = deals_ann_qs.values("client_id")
             sale_rows = list(
-                sales_debt_qs.select_related("client", "user")
+                sales_debt_qs.exclude(client_id__in=Subquery(deals_active_clients_subq))
+                .select_related("client", "user")
                 .order_by("-total", "-id")
                 .values("id", "total", "created_at", "client_id", "client__full_name", "user_id")
             )

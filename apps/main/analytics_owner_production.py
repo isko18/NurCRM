@@ -457,6 +457,17 @@ def build_owner_analytics_payload(*, company, branch, period, date_from, date_to
         sales_debt_qs = sales_debt_qs.filter(Q(branch=branch) | Q(branch__isnull=True))
     else:
         sales_debt_qs = sales_debt_qs.filter(branch__isnull=True)
+
+    # Важно: чтобы не было двойного учёта одной и той же задолженности,
+    # исключаем POS-долги по клиентам, у которых уже есть активная рассрочка (ClientDeal.Kind.DEBT) с остатком > 0.
+    # Иначе получается "остаток по сделке" + "весь чек в долг" (пример: 12 + 24 = 36).
+    deals_active_clients_subq = (
+        deals_qs.annotate(paid=Coalesce(Subquery(paid_subq), V(Decimal("0.00"), output_field=MONEY_FIELD)))
+        .annotate(remaining=(F("amount") - F("prepayment")) - F("paid"))
+        .filter(remaining__gt=0)
+        .values("client_id")
+    )
+    sales_debt_qs = sales_debt_qs.exclude(client_id__in=Subquery(deals_active_clients_subq))
     pos_sales_receivable_dec = sales_debt_qs.aggregate(s=Coalesce(Sum("total"), ZERO_MONEY))["s"] or Decimal(
         "0.00"
     )
