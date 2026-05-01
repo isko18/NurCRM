@@ -258,6 +258,7 @@ class WarehouseProductGroup(BaseModelId, BaseModelCompanyBranch):
 
 QTY3 = Decimal("0.001")
 MONEY = Decimal("0.001")
+PCT3 = Decimal("0.001")
 
 
 def q_money(x: Decimal) -> Decimal:
@@ -266,6 +267,10 @@ def q_money(x: Decimal) -> Decimal:
 
 def q_qty(x: Decimal) -> Decimal:
     return (x or Decimal("0")).quantize(QTY3, rounding=ROUND_HALF_UP)
+
+
+def q_pct(x: Decimal) -> Decimal:
+    return (x or Decimal("0")).quantize(PCT3, rounding=ROUND_HALF_UP)
 
 
 class WarehouseProduct(BaseModelId, BaseModelDate, BaseModelCompanyBranch):
@@ -476,16 +481,57 @@ class WarehouseProduct(BaseModelId, BaseModelDate, BaseModelCompanyBranch):
         last_num = qs.aggregate(max_num=Max("code_int"))["max_num"] or 0
         self.code = f"{last_num + 1:04d}"
 
-    def _recalc_price(self):
-        base = Decimal(self.purchase_price or 0)
-        percent = Decimal(self.markup_percent or 0)
+    def _recalc_price(
+        self,
+        *,
+        old_price: Decimal | None = None,
+        old_purchase_price: Decimal | None = None,
+        old_markup_percent: Decimal | None = None,
+    ):
+        """
+        Правило пересчёта:
+        - если меняется price или purchase_price -> price главный, markup_percent пересчитываем из purchase_price→price
+        - если меняется только markup_percent -> пересчитываем price из purchase_price + markup_percent
+        - если ничего не менялось -> только нормализуем price
+        """
+        price = Decimal(self.price or 0)
+        purchase = Decimal(self.purchase_price or 0)
+        markup = Decimal(self.markup_percent or 0)
 
-        if percent == Decimal("0"):
-            self.price = q_money(Decimal(self.price or 0))
+        if old_price is None and old_purchase_price is None and old_markup_percent is None:
+            # create(): при создании считаем price главным, если задана закупка (иначе просто нормализуем)
+            self.price = q_money(price)
+            if purchase != 0:
+                self.markup_percent = q_pct(((price / purchase) - Decimal("1")) * Decimal("100"))
+            else:
+                self.markup_percent = q_pct(markup)
             return
 
-        result = base * (Decimal("1") + percent / Decimal("100"))
-        self.price = q_money(result)
+        old_price = Decimal(old_price or 0)
+        old_purchase = Decimal(old_purchase_price or 0)
+        old_markup = Decimal(old_markup_percent or 0)
+
+        price_changed = price != old_price
+        purchase_changed = purchase != old_purchase
+        markup_changed = markup != old_markup
+
+        if price_changed or purchase_changed:
+            self.price = q_money(price)
+            if purchase != 0:
+                self.markup_percent = q_pct(((price / purchase) - Decimal("1")) * Decimal("100"))
+            else:
+                self.markup_percent = q_pct(Decimal("0"))
+            return
+
+        if markup_changed:
+            if markup == Decimal("0"):
+                self.price = q_money(price)
+                return
+            result = purchase * (Decimal("1") + markup / Decimal("100"))
+            self.price = q_money(result)
+            return
+
+        self.price = q_money(price)
 
     def clean(self):
         super().clean()
@@ -515,15 +561,28 @@ class WarehouseProduct(BaseModelId, BaseModelDate, BaseModelCompanyBranch):
         # Инвалидация кэша при изменении barcode или plu
         old_barcode = None
         old_plu = None
+        old_price = None
+        old_purchase_price = None
+        old_markup_percent = None
         if self.pk:
             try:
                 old_instance = WarehouseProduct.objects.get(pk=self.pk)
                 old_barcode = old_instance.barcode
                 old_plu = old_instance.plu
+                old_price = old_instance.price
+                old_purchase_price = old_instance.purchase_price
+                old_markup_percent = old_instance.markup_percent
             except WarehouseProduct.DoesNotExist:
                 pass
-        
-        self._recalc_price()
+
+        if self.pk:
+            self._recalc_price(
+                old_price=old_price,
+                old_purchase_price=old_purchase_price,
+                old_markup_percent=old_markup_percent,
+            )
+        else:
+            self._recalc_price()
         self.quantity = q_qty(Decimal(self.quantity or 0))
 
         with transaction.atomic():
