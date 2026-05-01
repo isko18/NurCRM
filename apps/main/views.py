@@ -5566,22 +5566,22 @@ class AnalyticsCardDetailsAPIView(CompanyBranchRestrictedMixin, APIView):
 
             # CRM-поставщики: Client.type=SUPPLIERS + сделки ClientDeal(kind=DEBT) → обязательства компании
             try:
-                from apps.main.models import Client, ClientDeal, DealInstallment
+                from apps.main.models import Client as ClientModel, ClientDeal as ClientDealModel, DealInstallment as DealInstallmentModel
             except Exception:
-                Client = None
-                ClientDeal = None
-                DealInstallment = None
+                ClientModel = None
+                ClientDealModel = None
+                DealInstallmentModel = None
 
-            if Client and ClientDeal and DealInstallment:
-                supplier_clients_qs = Client.objects.filter(company=company, type=Client.StatusClient.SUPPLIERS)
+            if ClientModel and ClientDealModel and DealInstallmentModel:
+                supplier_clients_qs = ClientModel.objects.filter(company=company, type=ClientModel.StatusClient.SUPPLIERS)
                 if branch is not None:
                     supplier_clients_qs = supplier_clients_qs.filter(Q(branch=branch) | Q(branch__isnull=True))
                 else:
                     supplier_clients_qs = supplier_clients_qs.filter(branch__isnull=True)
 
-                supplier_deals_qs = ClientDeal.objects.filter(
+                supplier_deals_qs = ClientDealModel.objects.filter(
                     company=company,
-                    kind=ClientDeal.Kind.DEBT,
+                    kind=ClientDealModel.Kind.DEBT,
                     client__in=supplier_clients_qs,
                 )
                 if branch is not None:
@@ -5590,7 +5590,7 @@ class AnalyticsCardDetailsAPIView(CompanyBranchRestrictedMixin, APIView):
                     supplier_deals_qs = supplier_deals_qs.filter(branch__isnull=True)
 
                 supplier_paid_subq = (
-                    DealInstallment.objects.filter(deal_id=OuterRef("pk"))
+                    DealInstallmentModel.objects.filter(deal_id=OuterRef("pk"))
                     .values("deal_id")
                     .annotate(s=Sum("paid_amount"))
                     .values("s")[:1]
