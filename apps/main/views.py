@@ -5438,14 +5438,14 @@ class AnalyticsCardDetailsAPIView(CompanyBranchRestrictedMixin, APIView):
             for x in merged:
                 x.pop("_sort", None)
 
-            client_deals_total = sum(
+            client_deals_total = sum((
                 (Decimal(str(r["remaining"])) if r.get("remaining") is not None else Decimal("0"))
                 for r in deal_rows
-            )
-            pos_total = sum(
+            ), Decimal("0.00"))
+            pos_total = sum((
                 (Decimal(str(r["total"])) if r.get("total") is not None else Decimal("0"))
                 for r in sale_rows
-            )
+            ), Decimal("0.00"))
             ar_total = (client_deals_total + pos_total).quantize(_Q2, rounding=ROUND_HALF_UP)
 
             total_count = len(merged)
