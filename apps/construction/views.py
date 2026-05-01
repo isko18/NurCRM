@@ -368,6 +368,10 @@ class CashboxDetailView(CompanyBranchScopedMixin, generics.RetrieveUpdateDestroy
 # ─────────────────────────────────────────────────────────────
 # CASHFLOWS
 # ─────────────────────────────────────────────────────────────
+class CashFlowListPagination(PageNumberPagination):
+    page_size_query_param = "page_size"
+
+
 class CashFlowListCreateView(CompanyBranchScopedMixin, generics.ListCreateAPIView):
     queryset = CashFlow.objects.select_related(
         "company", "branch",
@@ -377,7 +381,7 @@ class CashFlowListCreateView(CompanyBranchScopedMixin, generics.ListCreateAPIVie
         "category",
     )
     serializer_class = CashFlowSerializer
-    pagination_class = None
+    pagination_class = CashFlowListPagination
 
     def get_queryset(self):
         qs = self._scoped_queryset(super().get_queryset())
