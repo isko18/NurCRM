@@ -1801,7 +1801,7 @@ class ClientDealSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializ
     client_full_name = serializers.CharField(source="client.full_name", read_only=True)
 
     debt_amount = serializers.DecimalField(max_digits=12, decimal_places=2, read_only=True)
-    monthly_payment = serializers.DecimalField(max_digits=12, decimal_places=2, read_only=True)
+    daily_payment = serializers.DecimalField(max_digits=12, decimal_places=2, read_only=True)
     remaining_debt = serializers.DecimalField(max_digits=12, decimal_places=2, read_only=True)
 
     installments = DealInstallmentSerializer(many=True, read_only=True)
@@ -1816,8 +1816,8 @@ class ClientDealSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializ
             "client", "client_full_name",
             "title", "kind",
             "amount", "prepayment",
-            "debt_months", "first_due_date",
-            "debt_amount", "monthly_payment", "remaining_debt",
+            "debt_days", "first_due_date",
+            "debt_amount", "daily_payment", "remaining_debt",
             "installments",
             "payments",
             "auto_schedule",
@@ -1827,7 +1827,7 @@ class ClientDealSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializ
             "id", "company", "branch",
             "created_at", "updated_at",
             "client_full_name",
-            "debt_amount", "monthly_payment", "remaining_debt",
+            "debt_amount", "daily_payment", "remaining_debt",
             "installments", "payments",
         ]
 
@@ -1883,7 +1883,7 @@ class ClientDealSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializ
         amount = attrs.get("amount", getattr(instance, "amount", None))
         prepayment = attrs.get("prepayment", getattr(instance, "prepayment", None))
         kind = attrs.get("kind", getattr(instance, "kind", None))
-        debt_months = attrs.get("debt_months", getattr(instance, "debt_months", None))
+        debt_days = attrs.get("debt_days", getattr(instance, "debt_days", None))
 
         errors = {}
 
@@ -1898,11 +1898,11 @@ class ClientDealSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializ
             debt_amt = (amount or Decimal("0")) - (prepayment or Decimal("0"))
             if debt_amt <= 0:
                 errors["prepayment"] = 'Для типа "Долг" сумма договора должна быть больше предоплаты.'
-            if not debt_months or debt_months <= 0:
-                errors["debt_months"] = "Укажите срок (в месяцах) для рассрочки."
+            if not debt_days or debt_days <= 0:
+                errors["debt_days"] = "Укажите срок (в днях) для рассрочки."
         else:
             # не долг -> чистим всё, как в модели
-            attrs["debt_months"] = None
+            attrs["debt_days"] = None
             attrs["first_due_date"] = None
             attrs["auto_schedule"] = False
 

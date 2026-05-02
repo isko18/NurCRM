@@ -4,6 +4,7 @@ from django.utils import timezone
 from django.conf import settings
 from django.core.validators import MinValueValidator
 from decimal import Decimal, ROUND_HALF_UP
+from datetime import timedelta
 from dateutil.relativedelta import relativedelta
 from django.db import transaction, connection
 from django.db.models import Sum, F, Q, Max, IntegerField, Value, ExpressionWrapper, Case, When
@@ -2722,7 +2723,12 @@ class ClientDeal(models.Model):
     amount = models.DecimalField("Сумма договора", max_digits=12, decimal_places=2, default=0)
     prepayment = models.DecimalField("Предоплата", max_digits=12, decimal_places=2, default=0)
 
-    debt_months = models.PositiveSmallIntegerField("Срок (мес.)", blank=True, null=True)
+    debt_days = models.PositiveSmallIntegerField(
+        "Срок (дн.)",
+        blank=True,
+        null=True,
+        db_column="debt_months",
+    )
     first_due_date = models.DateField("Первая дата оплаты", blank=True, null=True)
 
     auto_schedule = models.BooleanField(
@@ -2769,10 +2775,10 @@ class ClientDeal(models.Model):
         return (self.debt_amount - self.paid_total).quantize(Decimal("0.01"))
 
     @property
-    def monthly_payment(self) -> Decimal:
-        if not self.debt_months or self.debt_months <= 0:
+    def daily_payment(self) -> Decimal:
+        if not self.debt_days or self.debt_days <= 0:
             return Decimal("0.00")
-        return (self.debt_amount / Decimal(self.debt_months)).quantize(
+        return (self.debt_amount / Decimal(self.debt_days)).quantize(
             Decimal("0.01"),
             rounding=ROUND_HALF_UP,
         )
@@ -2804,7 +2810,7 @@ class ClientDeal(models.Model):
         # прод-аудит: если есть платежи — нельзя менять условия
         if self.pk:
             old = ClientDeal.objects.filter(pk=self.pk).values(
-                "kind", "amount", "prepayment", "debt_months", "first_due_date"
+                "kind", "amount", "prepayment", "debt_days", "first_due_date"
             ).first()
             if old:
                 has_payments = self.payments.exists()
@@ -2812,7 +2818,7 @@ class ClientDeal(models.Model):
                     self.kind != old["kind"]
                     or (self.amount or Decimal("0")) != (old["amount"] or Decimal("0"))
                     or (self.prepayment or Decimal("0")) != (old["prepayment"] or Decimal("0"))
-                    or (self.debt_months != old["debt_months"])
+                    or (self.debt_days != old["debt_days"])
                     or (self.first_due_date != old["first_due_date"])
                 )
                 if has_payments and changed_terms:
@@ -2821,16 +2827,16 @@ class ClientDeal(models.Model):
         if self.kind == self.Kind.DEBT:
             if (a - p) <= 0:
                 raise ValidationError({"prepayment": 'Для типа "Долг" сумма договора должна быть больше предоплаты.'})
-            if not self.debt_months or self.debt_months <= 0:
-                raise ValidationError({"debt_months": "Укажите срок (в месяцах) для рассрочки."})
+            if not self.debt_days or self.debt_days <= 0:
+                raise ValidationError({"debt_days": "Укажите срок (в днях) для рассрочки."})
         else:
-            self.debt_months = None
+            self.debt_days = None
             self.first_due_date = None
             self.auto_schedule = False
 
     # ===== schedule =====
     def rebuild_installments(self, force: bool = False):
-        if self.kind != self.Kind.DEBT or not self.debt_months or self.debt_months <= 0:
+        if self.kind != self.Kind.DEBT or not self.debt_days or self.debt_days <= 0:
             self.installments.all().delete()
             return
 
@@ -2842,9 +2848,9 @@ class ClientDeal(models.Model):
         if not force and self.payments.exists():
             raise ValidationError("Нельзя пересобрать график: по сделке уже есть платежи.")
 
-        start = self.first_due_date or (timezone.localdate() + relativedelta(months=+1))
+        start = self.first_due_date or (timezone.localdate() + timedelta(days=1))
 
-        base = (total / Decimal(self.debt_months)).quantize(
+        base = (total / Decimal(self.debt_days)).quantize(
             Decimal("0.01"),
             rounding=ROUND_HALF_UP,
         )
@@ -2852,10 +2858,10 @@ class ClientDeal(models.Model):
         paid = Decimal("0.00")
         items = []
 
-        for i in range(1, self.debt_months + 1):
-            amount_i = (total - paid) if i == self.debt_months else base
+        for i in range(1, self.debt_days + 1):
+            amount_i = (total - paid) if i == self.debt_days else base
             paid += amount_i
-            due = start + relativedelta(months=+(i - 1))
+            due = start + timedelta(days=(i - 1))
 
             items.append(
                 DealInstallment(
@@ -2875,7 +2881,7 @@ class ClientDeal(models.Model):
 
     def save(self, *args, **kwargs):
         if self.kind != self.Kind.DEBT:
-            self.debt_months = None
+            self.debt_days = None
             self.first_due_date = None
             self.auto_schedule = False
 

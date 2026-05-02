@@ -246,7 +246,7 @@ class ClientDealAdmin(admin.ModelAdmin):
     inlines = (DealInstallmentInline,)
     list_display = (
         "title", "client", "company", "branch", "kind", "amount", "prepayment",
-        "debt_months", "remaining_debt", "created_at",
+        "debt_days", "remaining_debt", "created_at",
     )
     list_filter = ("company", "branch", "kind", "created_at")
     search_fields = ("title", "note", "client__full_name")
