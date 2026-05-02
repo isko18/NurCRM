@@ -1984,7 +1984,7 @@ class ClientListCreateAPIView(CompanyBranchRestrictedMixin, generics.ListCreateA
     """
     serializer_class = ClientSerializer
     filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
-    filterset_fields = ["status", "date"]
+    filterset_fields = ["status", "date", "type"]
     search_fields = ["full_name", "phone", "email"]
     ordering_fields = ["created_at", "updated_at", "date"]
     ordering = ["-created_at"]
