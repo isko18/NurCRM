@@ -2850,6 +2850,8 @@ class SupplierReceiptListAPIView(CompanyBranchRestrictedMixin, generics.ListAPIV
 
     permission_classes = [permissions.IsAuthenticated]
     serializer_class = SupplierReceiptReadSerializer
+    # без глобальной PageNumberPagination: иначе ?page=2 при одной странице даёт 404
+    pagination_class = None
 
     def get_queryset(self):
         qs = SupplierReceipt.objects.select_related("supplier", "company", "branch", "created_by").prefetch_related(
