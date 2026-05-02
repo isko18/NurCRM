@@ -2442,11 +2442,11 @@ class SupplierReceiptItemReadSerializer(serializers.ModelSerializer):
 
 
 class SupplierReceiptReadSerializer(serializers.ModelSerializer):
-    supplier_id = serializers.UUIDField(source="supplier_id", read_only=True)
+    supplier_id = serializers.UUIDField(read_only=True)
     supplier_name = serializers.CharField(source="supplier.full_name", read_only=True)
     supplier_llc = serializers.CharField(source="supplier.llc", read_only=True, allow_null=True)
     supplier_phone = serializers.CharField(source="supplier.phone", read_only=True)
-    created_by_id = serializers.UUIDField(source="created_by_id", read_only=True, allow_null=True)
+    created_by_id = serializers.UUIDField(read_only=True, allow_null=True)
     created_by_name = serializers.SerializerMethodField()
     items = SupplierReceiptItemReadSerializer(many=True, read_only=True)
 
