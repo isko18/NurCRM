@@ -1118,6 +1118,7 @@ class Document(models.Model):
         """Способ оплаты по документу (для SALE/PURCHASE и возвратов)."""
         CASH = "cash", "Оплата сразу"
         CREDIT = "credit", "В долг"
+        EXTERNAL = "external", "Вне кассы"
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     doc_type = models.CharField(max_length=32, choices=DocType.choices, verbose_name="Тип документа")
@@ -1132,7 +1133,7 @@ class Document(models.Model):
         blank=True,
         null=True,
         verbose_name="Оплата",
-        help_text="Для продажи/покупки и возвратов: оплата сразу или в долг.",
+        help_text="Продажа/покупка/возвраты: cash или credit. Приход (RECEIPT): cash, credit или external (приход на склад без кассы).",
     )
 
     prepayment_amount = models.DecimalField(
@@ -1253,6 +1254,15 @@ class Document(models.Model):
         if self.doc_type in (self.DocType.SALE, self.DocType.PURCHASE, self.DocType.SALE_RETURN, self.DocType.PURCHASE_RETURN):
             if self.payment_kind and self.payment_kind not in (self.PaymentKind.CASH, self.PaymentKind.CREDIT):
                 raise ValidationError({"payment_kind": "Укажите cash (оплата сразу) или credit (в долг)."})
+        elif self.doc_type == self.DocType.RECEIPT:
+            if self.payment_kind and self.payment_kind not in (
+                self.PaymentKind.CASH,
+                self.PaymentKind.CREDIT,
+                self.PaymentKind.EXTERNAL,
+            ):
+                raise ValidationError(
+                    {"payment_kind": "Для прихода укажите cash, credit или external (без кассы / оплата иными средствами)."}
+                )
         else:
             # Предоплата имеет смысл только для документов с payment_kind (продажа/покупка и возвраты).
             if prepayment > 0:

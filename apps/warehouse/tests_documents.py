@@ -102,6 +102,27 @@ class DocumentsTests(TestCase):
         bal = models.StockBalance.objects.get(warehouse=self.wh, product=self.prod)
         self.assertEqual(bal.qty, Decimal("10.000"))
 
+    def test_receipt_external_posts_immediately_no_cash(self):
+        """Приход с payment_kind=external: склад проводится, касса и денежные документы не задействованы."""
+        models.StockBalance.objects.create(warehouse=self.wh, product=self.prod, qty=Decimal("10.000"))
+        doc = models.Document.objects.create(
+            doc_type=models.Document.DocType.RECEIPT,
+            warehouse_from=self.wh,
+            payment_kind=models.Document.PaymentKind.EXTERNAL,
+        )
+        models.DocumentItem.objects.create(
+            document=doc, product=self.prod, qty=Decimal("2"), price=Decimal("100.00")
+        )
+
+        services.post_document(doc)
+        doc.refresh_from_db()
+        self.assertEqual(doc.status, models.Document.Status.POSTED)
+        with self.assertRaises(models.CashApprovalRequest.DoesNotExist):
+            _ = doc.cash_request
+        self.assertFalse(models.MoneyDocument.objects.filter(source_document_id=doc.id).exists())
+        bal = models.StockBalance.objects.get(warehouse=self.wh, product=self.prod)
+        self.assertEqual(bal.qty, Decimal("12.000"))
+
     def test_credit_sale_posts_immediately_and_creates_no_money_request(self):
         models.StockBalance.objects.create(warehouse=self.wh, product=self.prod, qty=Decimal("10.000"))
         cp = models.Counterparty.objects.create(
