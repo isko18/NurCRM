@@ -1230,6 +1230,7 @@ class OrderSerializer(CompanyBranchReadOnlyMixin):
     table = serializers.PrimaryKeyRelatedField(
         queryset=Table.objects.all(), required=False, allow_null=True
     )
+    table_number = serializers.SerializerMethodField()
     client = serializers.PrimaryKeyRelatedField(queryset=CafeClient.objects.all(), required=False, allow_null=True)
     waiter = serializers.PrimaryKeyRelatedField(queryset=User.objects.all(), allow_null=True, required=False)
     items = OrderItemInlineSerializer(many=True, required=False)
@@ -1245,7 +1246,7 @@ class OrderSerializer(CompanyBranchReadOnlyMixin):
         ref_name = "CafeOrder"
         model = Order
         fields = [
-            "id", "company", "branch", "table", "client", "waiter", "guests", "created_at",
+            "id", "company", "branch", "table", "table_number", "client", "waiter", "guests", "created_at",
             "table_session_id", "check_label",
             "status", "is_paid", "paid_at", "payment_method", "total_amount", "discount_amount",
             "paid_amount", "refunded_amount", "net_paid_amount", "has_refunds", "is_fully_refunded",
@@ -1256,9 +1257,12 @@ class OrderSerializer(CompanyBranchReadOnlyMixin):
         read_only_fields = [
             "is_paid", "paid_at", "payment_method", "total_amount", "paid_amount",
             "refunded_amount", "net_paid_amount", "has_refunds", "is_fully_refunded",
-            "balance_due", "cash_shift_id",
+            "balance_due", "cash_shift_id", "table_number",
             "canceled_at", "canceled_by", "canceled_by_label",
         ]
+
+    def get_table_number(self, obj):
+        return obj.table.number if obj.table_id else None
 
     def get_canceled_by_label(self, obj):
         if not getattr(obj, "canceled_by_id", None):
