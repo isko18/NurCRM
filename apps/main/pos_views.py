@@ -237,6 +237,8 @@ def _build_physical_receipt_text(sale, *, payment_method=None, cash_received=Non
         line_disc = getattr(it, "line_discount", None) or 0
         line_total = fmt_money(line_base - line_disc)
         lines.append(f"{idx}. {item_name}")
+        if Decimal(str(line_disc or 0)) > 0:
+            lines.append(f"   Скидка: {fmt_money(line_disc)}")
         lines.append(f"   {qty} x {unit_price} = {line_total}")
 
     lines.extend([

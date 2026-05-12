@@ -68,7 +68,8 @@ class SaleReceiptAPIView(APIView):
             qty = q_qty(getattr(it, "quantity", 0))
             unit_price = q2(getattr(it, "unit_price", 0))
             line_disc = q2(getattr(it, "line_discount", 0))
-            total = q2(unit_price * qty)
+            line_base = q2(unit_price * qty)
+            total = q2(line_base - line_disc)
 
             items.append(
                 {
@@ -162,7 +163,9 @@ class SaleInvoiceAPIView(APIView):
         for it in sale.items.all():
             qty = q_qty(getattr(it, "quantity", 0))
             unit_price = q2(getattr(it, "unit_price", 0))
-            line_total = q2(unit_price * qty)
+            line_disc = q2(getattr(it, "line_discount", 0))
+            line_base = q2(unit_price * qty)
+            line_total = q2(line_base - line_disc)
 
             items.append(
                 {
@@ -174,6 +177,7 @@ class SaleInvoiceAPIView(APIView):
                     ),
                     "qty": fmt_decimal(qty),
                     "unit_price": fmt_decimal(unit_price),
+                    "line_discount": fmt_decimal(line_disc),
                     "total": fmt_decimal(line_total),
                 }
             )

@@ -59,7 +59,17 @@ def build_receipt_payload(sale, cashier_name=None, *, ensure_number: bool = True
             getattr(it, "price", None),
             default=0
         ))
-        items.append({"name": str(name), "qty": qty, "price": price})
+        line_disc = _to_float(getattr(it, "line_discount", 0))
+        line_total = qty * price - line_disc
+        items.append(
+            {
+                "name": str(name),
+                "qty": qty,
+                "price": price,
+                "line_discount": line_disc,
+                "line_total": line_total,
+            }
+        )
 
     # 3) шапка/итоги
     created_at = getattr(sale, "created_at", None)

@@ -659,6 +659,8 @@ class ReceiptItemSerializer(serializers.Serializer):
     name = serializers.CharField()
     qty = serializers.FloatField()
     price = serializers.FloatField()
+    line_discount = serializers.FloatField(required=False, default=0.0)
+    line_total = serializers.FloatField(required=False, default=0.0)
 
 
 class ReceiptSerializer(serializers.Serializer):
