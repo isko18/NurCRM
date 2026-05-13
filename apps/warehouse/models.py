@@ -964,6 +964,11 @@ class Counterparty(models.Model):
     name = models.CharField(max_length=255, verbose_name="Название")
     phone = models.CharField(max_length=32, verbose_name="Телефон", blank=True, default="")
     type = models.CharField(max_length=16, choices=Type.choices, default=Type.BOTH, verbose_name="Тип")
+    inn = models.CharField("ИНН", max_length=32, blank=True, default="")
+    okpo = models.CharField("ОКПО", max_length=32, blank=True, default="")
+    score = models.CharField("Расчетный счет", max_length=64, blank=True, default="")
+    bik = models.CharField("БИК", max_length=32, blank=True, default="")
+    address = models.CharField("Адрес", max_length=255, blank=True, default="")
 
     class Meta:
         verbose_name = "Контрагент"

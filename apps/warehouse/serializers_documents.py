@@ -455,7 +455,22 @@ class CounterpartySerializer(serializers.ModelSerializer):
 
     class Meta:
         model = models.Counterparty
-        fields = ("id", "name", "phone", "type", "company", "branch", "agent", "agent_display", "analytics")
+        fields = (
+            "id",
+            "name",
+            "phone",
+            "type",
+            "inn",
+            "okpo",
+            "score",
+            "bik",
+            "address",
+            "company",
+            "branch",
+            "agent",
+            "agent_display",
+            "analytics",
+        )
         read_only_fields = ("id", "company", "branch", "analytics")
         extra_kwargs = {
             "phone": {"required": True},
