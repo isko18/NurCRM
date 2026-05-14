@@ -1423,6 +1423,9 @@ def _cart_item_promotion_line_discount(product, unit_price: Decimal, quantity: D
     Порог min_amount сравнивается с суммой строки unit_price × quantity.
     Выбирается ступень с наибольшим min_amount, для которого сумма строки всё ещё ≥ min_amount.
     promo_quantity ограничивает количество учётных единиц, на которые начисляется процент скидки.
+
+    В Cart.recalc() по строкам с непустыми ступенями line_discount перезаписывается этим значением
+    (в т.ч. в 0, если порог больше не выполняется — см. смену количества).
     """
     if product is None or not getattr(product, "stock", False):
         return Decimal("0.00")
@@ -1603,13 +1606,21 @@ class Cart(models.Model):
         for item in items:
             if not item.product_id:
                 continue
+            p = item.product
+            if not getattr(p, "stock", False):
+                continue
+            tiers = list(p.promotion_tiers.all())
+            if not tiers:
+                continue
             promo_d = _cart_item_promotion_line_discount(
-                item.product,
+                p,
                 Decimal(str(item.unit_price or 0)),
                 Decimal(str(item.quantity or 0)),
             )
             cur = _money(Decimal(str(item.line_discount or 0)))
-            new_d = _money(max(cur, promo_d))
+            # Только из правил акции (при qty ниже порога min_amount → 0), иначе max(cur,0)
+            # оставляет «залипшую» скидку после 3 шт → 1 шт.
+            new_d = _money(promo_d)
             if new_d != cur:
                 CartItem.objects.filter(pk=item.pk).update(line_discount=new_d)
 
