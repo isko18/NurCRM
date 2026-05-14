@@ -1636,6 +1636,7 @@ class SaleScanAPIView(MarketCashierOnlyMixin, APIView):
             effective_qty = Decimal(str(qty))
 
         _upsert_scanned_cart_item(cart, product, effective_qty)
+        cart.recalc()
         return _cart_response(request, cart.id, status_code=status.HTTP_201_CREATED)
 
 
@@ -1758,6 +1759,7 @@ class SaleAddItemAPIView(MarketCashierOnlyMixin, APIView):
             )
             item.save(skip_full_clean=True)
 
+        cart.recalc()
         return _cart_response(request, cart.id, status_code=status.HTTP_201_CREATED)
 
 
@@ -2525,6 +2527,8 @@ class CartItemUpdateDestroyAPIView(MarketCashierOnlyMixin, APIView):
         if update_fields:
             item.save(update_fields=update_fields)
         cart.recalc()
+        if item.pk:
+            item.refresh_from_db()
         return Response(SaleCartSerializer(cart).data, status=200)
 
     @transaction.atomic
@@ -2874,6 +2878,7 @@ class AgentSaleScanAPIView(MarketCashierOnlyMixin, CompanyBranchRestrictedMixin,
             )
 
         _upsert_scanned_cart_item(cart, product, qty)
+        cart.recalc()
         return _cart_response(request, cart.id, status_code=status.HTTP_201_CREATED)
 
 
@@ -3227,6 +3232,8 @@ class AgentCartItemUpdateDestroyAPIView(MarketCashierOnlyMixin, APIView):
         if update_fields:
             item.save(update_fields=update_fields, skip_full_clean=True)
         cart.recalc()
+        if item.pk:
+            item.refresh_from_db()
         return Response(SaleCartSerializer(cart).data, status=200)
 
     @transaction.atomic

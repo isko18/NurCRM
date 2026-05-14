@@ -1417,6 +1417,44 @@ class ProductRecipeItem(models.Model):
         return f"{self.product.name} <- {self.item_make.name} x{self.qty_per_unit}"
 
 
+def _cart_item_promotion_line_discount(product, unit_price: Decimal, quantity: Decimal) -> Decimal:
+    """
+    Скидка по акции (Product.stock + ProductPromotionTier) для строки корзины.
+    Порог min_amount сравнивается с суммой строки unit_price × quantity.
+    Выбирается ступень с наибольшим min_amount, для которого сумма строки всё ещё ≥ min_amount.
+    promo_quantity ограничивает количество учётных единиц, на которые начисляется процент скидки.
+    """
+    if product is None or not getattr(product, "stock", False):
+        return Decimal("0.00")
+    tiers = list(product.promotion_tiers.all())
+    if not tiers:
+        return Decimal("0.00")
+    unit_price = Decimal(str(unit_price or 0))
+    quantity = Decimal(str(quantity or 0))
+    gross = _money(unit_price * quantity)
+    if gross <= 0:
+        return Decimal("0.00")
+    tiers.sort(key=lambda t: (-(t.min_amount or Decimal("0")), t.position, str(t.id)))
+    tier = None
+    for t in tiers:
+        if gross >= (t.min_amount or Decimal("0")):
+            tier = t
+            break
+    if tier is None:
+        return Decimal("0.00")
+    dp = tier.discount_percent or Decimal("0")
+    if dp <= 0:
+        return Decimal("0.00")
+    pq = tier.promo_quantity
+    if pq is not None:
+        cap = Decimal(int(pq))
+        q_eff = quantity if quantity <= cap else cap
+    else:
+        q_eff = quantity
+    base = unit_price * q_eff
+    return _money(base * dp / Decimal("100"))
+
+
 # ==========================
 # Cart / CartItem / Sale / SaleItem / MobileScannerToken
 # ==========================
@@ -1558,6 +1596,23 @@ class Cart(models.Model):
         return super().save(*args, **kwargs)
 
     def recalc(self):
+        # Автоскидка по ступеням акции (Product.stock + promotion_tiers) → line_discount
+        items = list(
+            self.items.select_related("product").prefetch_related("product__promotion_tiers")
+        )
+        for item in items:
+            if not item.product_id:
+                continue
+            promo_d = _cart_item_promotion_line_discount(
+                item.product,
+                Decimal(str(item.unit_price or 0)),
+                Decimal(str(item.quantity or 0)),
+            )
+            cur = _money(Decimal(str(item.line_discount or 0)))
+            new_d = _money(max(cur, promo_d))
+            if new_d != cur:
+                CartItem.objects.filter(pk=item.pk).update(line_discount=new_d)
+
         calc_field = models.DecimalField(max_digits=24, decimal_places=6)
         zero = Value(Decimal("0.00"), output_field=calc_field)
         base_unit = Case(

@@ -458,7 +458,8 @@ class WarehouseProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSe
     def create(self, validated_data):
         characteristics_data = validated_data.pop("characteristics", None)
         alternate_barcodes = validated_data.pop("alternate_barcodes", None)
-        has_alt = isinstance(getattr(self, "initial_data", None), dict) and "alternate_barcodes" in self.initial_data
+        # initial_data может быть dict (JSON) или QueryDict (form/multipart) — оба поддерживают `in`
+        has_alt = "alternate_barcodes" in self.initial_data
 
         barcode = _norm_str(validated_data.get("barcode"))
         company = validated_data.get("company")
@@ -497,7 +498,7 @@ class WarehouseProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSe
     def update(self, instance, validated_data):
         characteristics_data = validated_data.pop("characteristics", None)
         alternate_barcodes = validated_data.pop("alternate_barcodes", None)
-        has_alt = isinstance(getattr(self, "initial_data", None), dict) and "alternate_barcodes" in self.initial_data
+        has_alt = "alternate_barcodes" in self.initial_data
         validated_data.pop("warehouse", None)
         validated_data.pop("company", None)
         validated_data.pop("branch", None)
