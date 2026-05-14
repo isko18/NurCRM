@@ -520,6 +520,27 @@ def _parse_scale_barcode(barcode: str):
     }
 
 
+def _resolve_product_by_barcode_for_pos(company_id, barcode: str, *, only_fields):
+    """Товар по основному или дополнительному штрихкоду (кэш product_barcode:{company_id}:{code})."""
+    barcode = (barcode or "").strip()
+    if not barcode:
+        return None
+    cache_key = f"product_barcode:{company_id}:{barcode}"
+    product = cache.get(cache_key)
+    if product is not None:
+        return product
+    product = (
+        Product.objects.only(*only_fields)
+        .filter(company_id=company_id)
+        .filter(Q(barcode=barcode) | Q(alternate_barcodes__barcode=barcode))
+        .distinct()
+        .first()
+    )
+    if product:
+        cache.set(cache_key, product, 300)
+    return product
+
+
 def _resolve_pos_cashbox(company, branch, cashbox_id=None):
     """
     Правило:
@@ -1389,15 +1410,12 @@ class SaleReceiptDataAPIView(MarketCashierOnlyMixin, APIView):
 
     def get(self, request, pk, *args, **kwargs):
         sale = get_object_or_404(
-            Sale.objects.select_related("company").prefetch_related("items"),
+            Sale.objects.select_related("company", "user").prefetch_related("items"),
             id=pk,
             company=request.user.company,
         )
-        cashier_name = (
-            request.query_params.get("cashier_name")
-            or getattr(request.user, "full_name", None)
-            or getattr(request.user, "get_full_name", lambda: None)()
-        )
+        cashier_override = (request.query_params.get("cashier_name") or "").strip()
+        cashier_name = cashier_override if cashier_override else None
         from apps.main.printers import build_receipt_payload
         from apps.ekassa.sale_bridge import wait_for_pos_sale_ekassa
 
@@ -1570,65 +1588,64 @@ class SaleScanAPIView(MarketCashierOnlyMixin, APIView):
 
         cache_key = f"product_barcode:{cart.company_id}:{barcode}"
         product = cache.get(cache_key)
-        
         if product is None:
-            try:
-                product = Product.objects.only("id", "company_id", "price", "barcode", "plu").get(
-                    company_id=cart.company_id,
-                    barcode=barcode,
-                )
-                cache.set(cache_key, product, 300)
-            except Product.DoesNotExist:
-                scale_data = _parse_scale_barcode(barcode)
-                if not scale_data:
-                    return Response({"not_found": True, "message": "Товар не найден"}, status=404)
+            product = _resolve_product_by_barcode_for_pos(
+                cart.company_id,
+                barcode,
+                only_fields=("id", "company_id", "price", "barcode", "plu", "code", "is_weight"),
+            )
 
-                raw_code = scale_data["raw_code"]
+        if not product:
+            scale_data = _parse_scale_barcode(barcode)
+            if not scale_data:
+                return Response({"not_found": True, "message": "Товар не найден"}, status=404)
+
+            raw_code = scale_data["raw_code"]
+            try:
+                normalized_code = str(int(raw_code))
+            except Exception:
+                normalized_code = raw_code
+            padded_code = normalized_code.zfill(4) if normalized_code.isdigit() else normalized_code
+            try:
+                # 1) normalized_code (00010 -> 10)
+                code_cache_key = f"product_code:{cart.company_id}:{normalized_code}"
+                product = cache.get(code_cache_key)
+                if product is None:
+                    product = Product.objects.only("id", "company_id", "price", "barcode", "code").get(
+                        company_id=cart.company_id,
+                        code=normalized_code,
+                    )
+                    cache.set(code_cache_key, product, 300)
+            except Product.DoesNotExist:
+                # 2) fallback raw_code (with leading zeros)
                 try:
-                    normalized_code = str(int(raw_code))
-                except Exception:
-                    normalized_code = raw_code
-                padded_code = normalized_code.zfill(4) if normalized_code.isdigit() else normalized_code
-                try:
-                    # 1) normalized_code (00010 -> 10)
-                    code_cache_key = f"product_code:{cart.company_id}:{normalized_code}"
-                    product = cache.get(code_cache_key)
+                    raw_cache_key = f"product_code:{cart.company_id}:{raw_code}"
+                    product = cache.get(raw_cache_key)
                     if product is None:
                         product = Product.objects.only("id", "company_id", "price", "barcode", "code").get(
                             company_id=cart.company_id,
-                            code=normalized_code,
+                            code=raw_code,
                         )
-                        cache.set(code_cache_key, product, 300)
+                        cache.set(raw_cache_key, product, 300)
                 except Product.DoesNotExist:
-                    # 2) fallback raw_code (with leading zeros)
+                    # 3) fallback padded_code (e.g. 202 -> 0202)
                     try:
-                        raw_cache_key = f"product_code:{cart.company_id}:{raw_code}"
-                        product = cache.get(raw_cache_key)
+                        padded_cache_key = f"product_code:{cart.company_id}:{padded_code}"
+                        product = cache.get(padded_cache_key)
                         if product is None:
                             product = Product.objects.only("id", "company_id", "price", "barcode", "code").get(
                                 company_id=cart.company_id,
-                                code=raw_code,
+                                code=padded_code,
                             )
-                            cache.set(raw_cache_key, product, 300)
+                            cache.set(padded_cache_key, product, 300)
                     except Product.DoesNotExist:
-                        # 3) fallback padded_code (e.g. 202 -> 0202)
-                        try:
-                            padded_cache_key = f"product_code:{cart.company_id}:{padded_code}"
-                            product = cache.get(padded_cache_key)
-                            if product is None:
-                                product = Product.objects.only("id", "company_id", "price", "barcode", "code").get(
-                                    company_id=cart.company_id,
-                                    code=padded_code,
-                                )
-                                cache.set(padded_cache_key, product, 300)
-                        except Product.DoesNotExist:
-                            return Response(
-                                {
-                                    "not_found": True,
-                                    "message": f"Товар с кодом {normalized_code} / {raw_code} / {padded_code} не найден",
-                                },
-                                status=404,
-                            )
+                        return Response(
+                            {
+                                "not_found": True,
+                                "message": f"Товар с кодом {normalized_code} / {raw_code} / {padded_code} не найден",
+                            },
+                            status=404,
+                        )
 
         if scale_data:
             effective_qty = Decimal(str(scale_data["weight_kg"]))
@@ -2199,16 +2216,14 @@ class ProductFindByBarcodeAPIView(MarketCashierOnlyMixin, APIView):
         # Оптимизация: кэширование и select_related
         cache_key = f"product_barcode:{request.user.company_id}:{barcode}"
         product = cache.get(cache_key)
-        
+
         if product is None:
-            qs = Product.objects.filter(
-                company_id=request.user.company_id,
-                barcode=barcode,
-            )[:1]
-            product = qs.first()
-            if product:
-                cache.set(cache_key, product, 300)
-        
+            product = _resolve_product_by_barcode_for_pos(
+                request.user.company_id,
+                barcode,
+                only_fields=("id", "name", "barcode", "price"),
+            )
+
         if not product:
             return Response([], status=200)
         
@@ -2248,12 +2263,11 @@ class MobileScannerIngestAPIView(APIView):
         cache_key = f"product_barcode:{cart.company_id}:{barcode}"
         product = cache.get(cache_key)
         if product is None:
-            product = Product.objects.only("id", "company_id", "price", "barcode").filter(
-                company_id=cart.company_id,
-                barcode=barcode,
-            ).first()
-            if product:
-                cache.set(cache_key, product, 300)
+            product = _resolve_product_by_barcode_for_pos(
+                cart.company_id,
+                barcode,
+                only_fields=("id", "company_id", "price", "barcode"),
+            )
         if not product:
             return Response({"not_found": True, "message": "Товар не найден"}, status=404)
 
@@ -2837,15 +2851,14 @@ class AgentSaleScanAPIView(MarketCashierOnlyMixin, CompanyBranchRestrictedMixin,
 
         cache_key = f"product_barcode:{cart.company_id}:{barcode}"
         product = cache.get(cache_key)
-        
+
         if product is None:
-            product = Product.objects.only("id", "company_id", "price", "quantity", "barcode").filter(
-                company_id=cart.company_id,
-                barcode=barcode,
-            ).first()
-            if product:
-                cache.set(cache_key, product, 300)
-        
+            product = _resolve_product_by_barcode_for_pos(
+                cart.company_id,
+                barcode,
+                only_fields=("id", "company_id", "price", "quantity", "barcode"),
+            )
+
         if not product:
             return Response({"not_found": True, "message": "Товар не найден"}, status=404)
 

@@ -7,6 +7,7 @@ from rest_framework import permissions
 from rest_framework.exceptions import PermissionDenied
 
 from apps.main.models import Sale
+from apps.main.printers import _user_display_name
 from apps.main.utils_numbers import ensure_sale_doc_number
 
 Q2 = Decimal("0.01")      # деньги
@@ -102,12 +103,7 @@ class SaleReceiptAPIView(APIView):
             },
             "cashier": {
                 "id": str(sale.user_id) if getattr(sale, "user_id", None) else None,
-                "name": safe_str(
-                    getattr(sale.user, "full_name", None),
-                    dash=safe_str(getattr(sale.user, "username", None), dash=""),
-                )
-                if getattr(sale, "user", None)
-                else "",
+                "name": safe_str(_user_display_name(sale.user), dash="") if getattr(sale, "user", None) else "",
             },
             "client": (
                 {
@@ -231,10 +227,7 @@ class SaleInvoiceAPIView(APIView):
             },
             "meta": {
                 "cashier_id": str(sale.user_id) if getattr(sale, "user_id", None) else None,
-                "cashier_name": safe_str(
-                    getattr(sale.user, "full_name", None),
-                    dash=safe_str(getattr(sale.user, "username", None), dash=""),
-                )
+                "cashier_name": safe_str(_user_display_name(sale.user), dash="")
                 if getattr(sale, "user", None)
                 else "",
             },

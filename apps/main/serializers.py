@@ -19,7 +19,7 @@ from apps.main.models import (
     ObjectItem, ObjectSale, ObjectSaleItem, ItemMake, ManufactureSubreal, Acceptance,
     ReturnFromAgent, ProductImage, PromoRule, AgentRequestCart, AgentRequestItem,
     ProductPackage, ProductCharacteristics, DealPayment, AgentSaleAllocation,
-    ProductRecipeItem, ProductPromotionTier, MarketSaleEmployeePayProfile,
+    ProductRecipeItem, ProductPromotionTier, ProductAlternateBarcode, MarketSaleEmployeePayProfile,
     SupplierReceipt, SupplierReceiptItem,
 )
 
@@ -745,6 +745,60 @@ def sync_product_promotion_tiers(product, raw, *, stock_enabled: bool, partial: 
     )
 
 
+def sync_product_alternate_barcodes(product: Product, raw):
+    """
+    Полная замена списка доп. штрихкодов для товара.
+    raw — list[str] | None (пустой список очищает).
+    """
+    from django.core.cache import cache
+
+    company_id = product.company_id
+    main = (product.barcode or "").strip()
+    seen = set()
+    norm = []
+    for x in raw or []:
+        b = (str(x or "").strip())
+        if not b:
+            continue
+        if b in seen:
+            raise serializers.ValidationError({
+                "alternate_barcodes": f"Дубликат в списке: {b}.",
+            })
+        seen.add(b)
+        norm.append(b)
+
+    for b in norm:
+        if main and b == main:
+            raise serializers.ValidationError({
+                "alternate_barcodes": f"Доп. штрихкод «{b}» совпадает с основным штрихкодом товара.",
+            })
+        if Product.objects.filter(company_id=company_id, barcode=b).exclude(pk=product.pk).exists():
+            raise serializers.ValidationError({
+                "alternate_barcodes": f"Штрихкод «{b}» уже используется как основной у другого товара.",
+            })
+        if ProductAlternateBarcode.objects.filter(company_id=company_id, barcode=b).exclude(
+            product_id=product.pk
+        ).exists():
+            raise serializers.ValidationError({
+                "alternate_barcodes": f"Штрихкод «{b}» уже зарегистрирован как дополнительный у другого товара.",
+            })
+
+    old_codes = list(product.alternate_barcodes.values_list("barcode", flat=True))
+    product.alternate_barcodes.all().delete()
+    if norm:
+        ProductAlternateBarcode.objects.bulk_create(
+            [
+                ProductAlternateBarcode(product=product, company_id=company_id, barcode=b)
+                for b in norm
+            ]
+        )
+    for old in old_codes:
+        if old:
+            cache.delete(f"product_barcode:{company_id}:{old}")
+    for b in norm:
+        cache.delete(f"product_barcode:{company_id}:{b}")
+
+
 class RecipeItemSerializer(serializers.Serializer):
     """Read/write сериализатор для одной позиции рецепта."""
     id = serializers.CharField(help_text="item_make.id")
@@ -825,6 +879,12 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
     )
     promotion_rules_input = serializers.ListField(
         child=serializers.DictField(allow_empty=True),
+        write_only=True,
+        required=False,
+        allow_null=True,
+    )
+    alternate_barcodes = serializers.ListField(
+        child=serializers.CharField(max_length=64),
         write_only=True,
         required=False,
         allow_null=True,
@@ -919,7 +979,9 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
             "status", "status_display",
             "client", "client_name",
             "supplier_ids", "suppliers",
-            "stock", "promotion_rules", "promotion_rules_input", "date",
+            "stock", "promotion_rules", "promotion_rules_input",
+            "alternate_barcodes",
+            "date",
             "created_by", "created_by_name",
             "created_at", "updated_at",
             "is_favorite",
@@ -975,6 +1037,28 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
         if value in (None, ""):
             return None
         return value
+
+    def validate_barcode(self, value):
+        if value in (None, ""):
+            return value
+        b = str(value).strip()
+        if not b:
+            return None
+        company_id = getattr(self.instance, "company_id", None) if self.instance else None
+        if not company_id:
+            comp = self._user_company()
+            company_id = getattr(comp, "id", None)
+        if not company_id:
+            return b
+        pk = self.instance.pk if self.instance else None
+        qs = ProductAlternateBarcode.objects.filter(company_id=company_id, barcode=b)
+        if pk:
+            qs = qs.exclude(product_id=pk)
+        if qs.exists():
+            raise serializers.ValidationError(
+                "Этот штрих-код уже используется как дополнительный у другого товара."
+            )
+        return b
 
     def validate_plu(self, value):
         """
@@ -1216,11 +1300,17 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
         # чистим проблемные Decimal перед сериализацией, чтобы избежать InvalidOperation
         self._sanitize_decimal_fields(instance)
         try:
-            return super().to_representation(instance)
+            data = super().to_representation(instance)
         except InvalidOperation:
-            # на всякий случай повторно чистим и сериализуем
             self._sanitize_decimal_fields(instance)
-            return super().to_representation(instance)
+            data = super().to_representation(instance)
+        try:
+            data["alternate_barcodes"] = list(
+                instance.alternate_barcodes.order_by("barcode").values_list("barcode", flat=True)
+            )
+        except Exception:
+            data["alternate_barcodes"] = []
+        return data
 
     # ==== CREATE / UPDATE ====
 
@@ -1230,6 +1320,8 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
         packages_data = validated_data.pop("packages_input", [])
         promotion_in = "promotion_rules_input" in validated_data
         promotion_raw = validated_data.pop("promotion_rules_input", None) if promotion_in else None
+        alt_in = "alternate_barcodes" in getattr(self, "initial_data", {})
+        alternate_raw = validated_data.pop("alternate_barcodes", None) if alt_in else None
         supplier_ids = validated_data.pop("supplier_ids", None)
 
         company = self._user_company()
@@ -1349,6 +1441,11 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
             stock_enabled=bool(product.stock),
             partial=False,
         )
+        if alt_in:
+            sync_product_alternate_barcodes(
+                product,
+                alternate_raw if alternate_raw is not None else [],
+            )
 
         return product
 
@@ -1361,6 +1458,8 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
         supplier_ids = validated_data.pop("supplier_ids", None)
         promotion_in = "promotion_rules_input" in validated_data
         promotion_raw = validated_data.pop("promotion_rules_input", None) if promotion_in else None
+        alt_in = "alternate_barcodes" in getattr(self, "initial_data", {})
+        alternate_raw = validated_data.pop("alternate_barcodes", None) if alt_in else None
         if promotion_in and promotion_raw:
             try:
                 pr_rows = parse_product_promotion_tiers_payload(promotion_raw)
@@ -1520,6 +1619,12 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
             )
         elif "stock" in validated_data and validated_data.get("stock") is False:
             sync_product_promotion_tiers(instance, None, stock_enabled=False, partial=True)
+
+        if alt_in:
+            sync_product_alternate_barcodes(
+                instance,
+                alternate_raw if alternate_raw is not None else [],
+            )
 
         return instance
 # ===========================

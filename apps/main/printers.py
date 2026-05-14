@@ -1,6 +1,11 @@
 # apps/main/api/utils.py
+from typing import Optional
+
 from django.utils.timezone import localtime
 from decimal import Decimal
+
+from apps.main.models import Sale
+
 
 def _to_float(x):
     try:
@@ -16,6 +21,38 @@ def _pick(*vals, default=None):
             return v
     return default
 
+
+def _user_display_name(user) -> Optional[str]:
+    """Имя для чека: ФИО, иначе full_name / email / username."""
+    if not user:
+        return None
+    try:
+        fn = (user.get_full_name() or "").strip()
+    except Exception:
+        fn = ""
+    if fn:
+        return fn
+    for attr in ("full_name", "email", "username"):
+        v = getattr(user, attr, None)
+        if v and str(v).strip():
+            return str(v).strip()
+    return None
+
+
+def _receipt_paid_cash_card(sale: Sale) -> tuple:
+    """
+    Суммы для JSON чека: у модели Sale нет полей paid_cash/paid_card — выводим из payment_method и total.
+    Наличные → вся сумма в paid_cash; безнал (перевод, мбанк, …) → в paid_card; долг → оба 0.
+    """
+    total_f = _to_float(getattr(sale, "total", 0))
+    pm = getattr(sale, "payment_method", None) or Sale.PaymentMethod.CASH
+    if pm == Sale.PaymentMethod.DEBT:
+        return 0.0, 0.0
+    if pm == Sale.PaymentMethod.CASH:
+        return total_f, 0.0
+    return 0.0, total_f
+
+
 def build_receipt_payload(sale, cashier_name=None, *, ensure_number: bool = True):
     """
     Формирует JSON для печати чека.
@@ -25,6 +62,8 @@ def build_receipt_payload(sale, cashier_name=None, *, ensure_number: bool = True
     - Все денежные/числовые поля нормализуются в float.
     - Строки — в Unicode (JSON отдается UTF-8).
     - Добавлен флаг 'encoding': 'utf-8' для фронта.
+    - Кассир: если cashier_name не передан — берётся с sale.user (кто оформил продажу).
+    - Оплата: paid_cash / paid_card заполняются из payment_method и total (у Sale нет отдельных полей в БД).
     """
     # 1) гарантируем номер чека
     doc_no = str(getattr(sale, "doc_no", "") or "")
@@ -78,6 +117,17 @@ def build_receipt_payload(sale, cashier_name=None, *, ensure_number: bool = True
     vh = receipt_vendor_header(sale)
     company_name = vh.get("brand") or ""
 
+    resolved_cashier = (str(cashier_name).strip() if cashier_name is not None else "") or _user_display_name(
+        getattr(sale, "user", None)
+    )
+
+    paid_cash, paid_card = _receipt_paid_cash_card(sale)
+    pm = getattr(sale, "payment_method", None) or Sale.PaymentMethod.CASH
+    try:
+        pm_display = sale.get_payment_method_display()
+    except Exception:
+        pm_display = str(pm)
+
     payload = {
         # метка кодировки для фронта (браузерный клиент сможет выбрать UTF-8)
         "encoding": "utf-8",
@@ -87,7 +137,7 @@ def build_receipt_payload(sale, cashier_name=None, *, ensure_number: bool = True
         "inn": vh.get("inn") or None,
         "address": vh.get("address") or None,
         "created_at": localtime(created_at).strftime("%Y-%m-%d %H:%M:%S") if created_at else None,
-        "cashier_name": cashier_name,
+        "cashier_name": resolved_cashier,
 
         "items": items,
 
@@ -97,8 +147,11 @@ def build_receipt_payload(sale, cashier_name=None, *, ensure_number: bool = True
         "tax": _to_float(
             getattr(sale, "tax", getattr(sale, "tax_total", 0))
         ),
-        "paid_cash": _to_float(getattr(sale, "paid_cash", 0)),
-        "paid_card": _to_float(getattr(sale, "paid_card", 0)),
+        "payment_method": pm,
+        "payment_method_display": pm_display,
+        "paid_cash": paid_cash,
+        "paid_card": paid_card,
+        "cash_received": _to_float(getattr(sale, "cash_received", 0)) if pm == Sale.PaymentMethod.CASH else 0.0,
         "change": _to_float(getattr(sale, "change", 0)),
     }
 

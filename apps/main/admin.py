@@ -12,7 +12,7 @@ from .models import (
     # Global dictionaries
     GlobalBrand, GlobalCategory, GlobalProduct,
     # Company-scoped taxonomies & goods
-    ProductCategory, ProductBrand, Product, ProductPromotionTier, ItemMake,
+    ProductCategory, ProductBrand, Product, ProductPromotionTier, ProductAlternateBarcode, ItemMake,
     # Extra product models
     ProductImage, ProductCharacteristics, ProductPackage,
     # POS
@@ -316,6 +316,12 @@ class ProductPromotionTierInline(admin.TabularInline):
     ordering = ("position", "id")
 
 
+class ProductAlternateBarcodeInline(admin.TabularInline):
+    model = ProductAlternateBarcode
+    extra = 0
+    fields = ("barcode",)
+
+
 @admin.register(Product)
 class ProductAdmin(admin.ModelAdmin):
     list_display = (
@@ -332,7 +338,7 @@ class ProductAdmin(admin.ModelAdmin):
     )
     search_fields = ("name", "barcode", "plu", "code", "article")
     ordering = ("name",)
-    inlines = [ProductPromotionTierInline, ItemMakeInline, ProductImageInline]
+    inlines = [ProductPromotionTierInline, ProductAlternateBarcodeInline, ItemMakeInline, ProductImageInline]
     exclude = ("item_make",)
     readonly_fields = ("created_at", "updated_at")
     list_select_related = ("company", "branch", "brand", "category", "client")

@@ -36,6 +36,7 @@ from apps.main.models import (
     ManufactureSubreal, Acceptance, ReturnFromAgent, AgentSaleAllocation, ProductImage,
     AgentRequestCart, AgentRequestItem, ProductPackage, ProductCharacteristics, DealPayment,
     ProductRecipeItem,
+    ProductAlternateBarcode,
     ProductFavorite,
     MarketSaleEmployeePayProfile,
     Sale,
@@ -46,7 +47,7 @@ from apps.main.models import (
 from apps.main.serializers import (
     ContactSerializer, PipelineSerializer, DealSerializer, TaskSerializer,
     IntegrationSerializer, AnalyticsSerializer, OrderSerializer, ProductSerializer,
-    ProductListSerializer, sync_product_promotion_tiers,
+    ProductListSerializer, sync_product_promotion_tiers, sync_product_alternate_barcodes,
     ReviewSerializer, NotificationSerializer, EventSerializer,
     WarehouseSerializer, WarehouseEventSerializer,
     ProductCategorySerializer, ProductBrandSerializer,
@@ -753,6 +754,11 @@ class ProductCreateByBarcodeAPIView(CompanyBranchRestrictedMixin, generics.Creat
                 {"barcode": "В вашей компании уже есть товар с таким штрих-кодом."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
+        if ProductAlternateBarcode.objects.filter(company=company, barcode=barcode).exists():
+            return Response(
+                {"barcode": "Этот штрих-код уже занят как дополнительный у другого товара."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
 
         gp = (
             GlobalProduct.objects
@@ -944,6 +950,25 @@ class ProductCreateByBarcodeAPIView(CompanyBranchRestrictedMixin, generics.Creat
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
+        if "alternate_barcodes" in data:
+            raw_alts = data.get("alternate_barcodes")
+            if not isinstance(raw_alts, (list, tuple)):
+                raw_alts = []
+            seen_a = set()
+            alt_norm = []
+            for x in raw_alts:
+                b = (str(x or "").strip())
+                if b and b not in seen_a:
+                    seen_a.add(b)
+                    alt_norm.append(b)
+            try:
+                sync_product_alternate_barcodes(product, alt_norm)
+            except serializers.ValidationError as ve:
+                return Response(
+                    ve.detail if isinstance(ve.detail, dict) else {"detail": ve.detail},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
         product = (
             _annotate_product_is_favorite(
                 Product.objects.filter(pk=product.pk)
@@ -953,6 +978,7 @@ class ProductCreateByBarcodeAPIView(CompanyBranchRestrictedMixin, generics.Creat
                     "packages",
                     "recipe_items__item_make",
                     "promotion_tiers",
+                    "alternate_barcodes",
                     product_images_prefetch,
                 )
             )
@@ -1100,6 +1126,40 @@ class ProductCreateManualAPIView(CompanyBranchRestrictedMixin, generics.CreateAP
                 {"barcode": "В вашей компании уже есть товар с таким штрих-кодом."},
                 status=status.HTTP_400_BAD_REQUEST
             )
+        if barcode and ProductAlternateBarcode.objects.filter(company=company, barcode=barcode).exists():
+            return Response(
+                {"barcode": "Этот штрих-код уже занят как дополнительный у другого товара."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        alt_payload = None
+        if "alternate_barcodes" in data:
+            raw_alts = data.get("alternate_barcodes")
+            if not isinstance(raw_alts, (list, tuple)):
+                raw_alts = []
+            seen_a = set()
+            alt_payload = []
+            for x in raw_alts:
+                b = (str(x or "").strip())
+                if b and b not in seen_a:
+                    seen_a.add(b)
+                    alt_payload.append(b)
+            if barcode and barcode in seen_a:
+                return Response(
+                    {"alternate_barcodes": "Дополнительный штрих-код не может совпадать с основным."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            for b in alt_payload:
+                if Product.objects.filter(company=company, barcode=b).exists():
+                    return Response(
+                        {"alternate_barcodes": f"Штрихкод «{b}» уже основной у другого товара."},
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
+                if ProductAlternateBarcode.objects.filter(company=company, barcode=b).exists():
+                    return Response(
+                        {"alternate_barcodes": f"Штрихкод «{b}» уже дополнительный у другого товара."},
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
 
         # kind
         kind_value = _parse_kind(data.get("kind"), Product)
@@ -1409,6 +1469,15 @@ class ProductCreateManualAPIView(CompanyBranchRestrictedMixin, generics.CreateAP
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
+        if alt_payload is not None:
+            try:
+                sync_product_alternate_barcodes(product, alt_payload)
+            except serializers.ValidationError as ve:
+                return Response(
+                    ve.detail if isinstance(ve.detail, dict) else {"detail": ve.detail},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
         # add to global product base (optional)
         if barcode:
             GlobalProduct.objects.get_or_create(
@@ -1426,6 +1495,7 @@ class ProductCreateManualAPIView(CompanyBranchRestrictedMixin, generics.CreateAP
                     "packages",
                     "recipe_items__item_make",
                     "promotion_tiers",
+                    "alternate_barcodes",
                     product_images_prefetch,
                 )
             )
@@ -1454,6 +1524,7 @@ class ProductRetrieveUpdateDestroyAPIView(CompanyBranchRestrictedMixin, generics
             "packages",
             "recipe_items__item_make",
             "promotion_tiers",
+            "alternate_barcodes",
             product_images_prefetch,
         )
         .all()
@@ -1620,6 +1691,7 @@ class ProductRetrieveUpdateDestroyAPIView(CompanyBranchRestrictedMixin, generics
                     "packages",
                     "recipe_items__item_make",
                     "promotion_tiers",
+                    "alternate_barcodes",
                     product_images_prefetch,
                 )
             )
@@ -1705,6 +1777,9 @@ class ProductByBarcodeAPIView(CompanyBranchRestrictedMixin, generics.RetrieveAPI
             .prefetch_related(
                 "item_make",
                 "packages",
+                "recipe_items__item_make",
+                "promotion_tiers",
+                "alternate_barcodes",
                 product_images_prefetch,
             )
             .all()
@@ -1718,7 +1793,12 @@ class ProductByBarcodeAPIView(CompanyBranchRestrictedMixin, generics.RetrieveAPI
         if not barcode:
             raise NotFound(detail="Штрих-код не указан")
 
-        product = self.get_queryset().filter(barcode=barcode).first()
+        product = (
+            self.get_queryset()
+            .filter(Q(barcode=barcode) | Q(alternate_barcodes__barcode=barcode))
+            .distinct()
+            .first()
+        )
         if not product:
             raise NotFound(detail="Товар с таким штрих-кодом не найден")
         return product

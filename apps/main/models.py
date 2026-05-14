@@ -1047,6 +1047,62 @@ class ProductPromotionTier(models.Model):
             raise ValidationError({"promo_quantity": "Лимит должен быть ≥ 1."})
 
 
+class ProductAlternateBarcode(models.Model):
+    """
+    Дополнительные штрихкоды маркет-товара (Product): поиск на кассе и в API как по основному коду.
+    Уникальность значения в рамках компании (как у основного barcode у Product).
+    """
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    product = models.ForeignKey(
+        "Product",
+        on_delete=models.CASCADE,
+        related_name="alternate_barcodes",
+        verbose_name="Товар",
+    )
+    company = models.ForeignKey(
+        Company,
+        on_delete=models.CASCADE,
+        related_name="product_alternate_barcodes",
+        verbose_name="Компания",
+    )
+    barcode = models.CharField("Штрихкод", max_length=64)
+
+    class Meta:
+        verbose_name = "Дополнительный штрихкод товара"
+        verbose_name_plural = "Дополнительные штрихкоды товара"
+        constraints = [
+            models.UniqueConstraint(
+                fields=("company", "barcode"),
+                name="uq_main_paltbc_co_bc",
+            ),
+        ]
+        indexes = [
+            models.Index(fields=["company", "barcode"], name="main_paltbc_co_bc"),
+            models.Index(fields=["product", "barcode"], name="main_paltbc_pr_bc"),
+        ]
+
+    def save(self, *args, **kwargs):
+        if self.product_id and not self.company_id:
+            p = getattr(self, "product", None)
+            self.company_id = getattr(p, "company_id", None) or Product.objects.filter(
+                pk=self.product_id
+            ).values_list("company_id", flat=True).first()
+        super().save(*args, **kwargs)
+        from django.core.cache import cache
+
+        if self.company_id and (self.barcode or "").strip():
+            cache.delete(f"product_barcode:{self.company_id}:{self.barcode.strip()}")
+
+    def delete(self, *args, **kwargs):
+        cid, bc = self.company_id, (self.barcode or "").strip()
+        super().delete(*args, **kwargs)
+        from django.core.cache import cache
+
+        if cid and bc:
+            cache.delete(f"product_barcode:{cid}:{bc}")
+
+
 class ProductCharacteristics(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
 
