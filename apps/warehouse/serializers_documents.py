@@ -3,6 +3,7 @@ from rest_framework import serializers
 from django.core.exceptions import ValidationError as DjangoValidationError
 from django.core.exceptions import ObjectDoesNotExist
 from django.contrib.auth import get_user_model
+from apps.users.models import Company
 from . import models
 from . import services as warehouse_services
 from .serializers import WarehouseProductCharacteristicsSerializer
@@ -489,3 +490,44 @@ class CounterpartySerializer(serializers.ModelSerializer):
         if not m:
             return None
         return m.get(obj.pk) or m.get(str(obj.pk))
+
+
+class CompanyStockPartnershipRequestSerializer(serializers.ModelSerializer):
+    from_company_name = serializers.CharField(source="from_company.name", read_only=True)
+    to_company_name = serializers.CharField(source="to_company.name", read_only=True)
+    created_by_email = serializers.EmailField(source="created_by.email", read_only=True, allow_null=True)
+    decided_by_email = serializers.EmailField(source="decided_by.email", read_only=True, allow_null=True)
+
+    class Meta:
+        model = models.CompanyStockPartnershipRequest
+        fields = (
+            "id",
+            "from_company",
+            "from_company_name",
+            "to_company",
+            "to_company_name",
+            "status",
+            "note",
+            "created_by",
+            "created_by_email",
+            "decided_by",
+            "decided_by_email",
+            "created_at",
+            "decided_at",
+            "updated_at",
+        )
+        read_only_fields = (
+            "id",
+            "from_company",
+            "status",
+            "created_by",
+            "decided_by",
+            "created_at",
+            "decided_at",
+            "updated_at",
+        )
+
+
+class CompanyStockPartnershipRequestCreateSerializer(serializers.Serializer):
+    to_company = serializers.PrimaryKeyRelatedField(queryset=Company.objects.all())
+    note = serializers.CharField(required=False, allow_blank=True, max_length=512)

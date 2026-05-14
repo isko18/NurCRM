@@ -43,6 +43,7 @@ from apps.main.models import (
     SaleItem,
     Product,
     ProductPackage,
+    ProductPromotionTier,
     MobileScannerToken,
     Client,
     ProductImage,
@@ -310,6 +311,9 @@ def _truthy_query_param(val) -> bool:
 
 def _cart_queryset_for_response():
     image_qs = ProductImage.objects.only("id", "product_id", "image", "alt", "is_primary").order_by("id")
+    promo_tier_qs = ProductPromotionTier.objects.only(
+        "id", "product_id", "position", "min_amount", "discount_percent", "promo_quantity"
+    ).order_by("position", "id")
     item_qs = (
         CartItem.objects.select_related("product")
         .only(
@@ -324,8 +328,13 @@ def _cart_queryset_for_response():
             "product__id",
             "product__name",
             "product__barcode",
+            "product__stock",
+            "product__is_weight",
         )
-        .prefetch_related(Prefetch("product__images", queryset=image_qs))
+        .prefetch_related(
+            Prefetch("product__images", queryset=image_qs),
+            Prefetch("product__promotion_tiers", queryset=promo_tier_qs),
+        )
         .order_by("id")
     )
     return Cart.objects.select_related("shift").only(

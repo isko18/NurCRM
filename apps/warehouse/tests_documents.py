@@ -235,6 +235,48 @@ class DocumentsTests(TestCase):
         finally:
             settings.ALLOW_NEGATIVE_STOCK = old
 
+    def test_intercompany_transfer_with_partnership(self):
+        Company = apps.get_model("users", "Company")
+        Branch = apps.get_model("users", "Branch")
+        user_b = User.objects.create(
+            email="b@example.com", password="x", first_name="B", last_name="B", role="owner"
+        )
+        company_b = Company.objects.create(name="CB", owner=user_b)
+        branch_b = Branch.objects.create(company=company_b, name="BMain")
+        wh_b = models.Warehouse.objects.create(name="WB", company=company_b, branch=branch_b, location="")
+        cat_b = models.WarehouseProductCategory.objects.create(name="CB", company=company_b, branch=branch_b)
+        prod_b = models.WarehouseProduct.objects.create(
+            company=company_b,
+            branch=branch_b,
+            warehouse=wh_b,
+            category=cat_b,
+            name="PB",
+            code="PB",
+            barcode="1112223334444",
+            unit="pcs",
+            quantity=Decimal("0"),
+            purchase_price=Decimal("1.00"),
+            price=Decimal("2.00"),
+        )
+        models.StockBalance.objects.create(warehouse=wh_b, product=prod_b, qty=Decimal("4.000"))
+
+        id_lo, id_hi = models.canonical_company_pair_ids(self.company.id, company_b.id)
+        models.CompanyStockPartnership.objects.create(company_a_id=id_lo, company_b_id=id_hi)
+
+        doc = models.Document.objects.create(
+            doc_type=models.Document.DocType.TRANSFER,
+            warehouse_from=wh_b,
+            warehouse_to=self.wh,
+        )
+        models.DocumentItem.objects.create(document=doc, product=prod_b, qty=Decimal("2"), price=Decimal("0"))
+        services.post_document(doc)
+
+        b_from = models.StockBalance.objects.get(warehouse=wh_b, product=prod_b)
+        dest_prod = models.WarehouseProduct.objects.get(warehouse=self.wh, barcode=prod_b.barcode)
+        b_to = models.StockBalance.objects.get(warehouse=self.wh, product=dest_prod)
+        self.assertEqual(b_from.qty, Decimal("2.000"))
+        self.assertEqual(b_to.qty, Decimal("2.000"))
+
     def test_commercial_offer_creates_and_cannot_be_posted(self):
         doc = models.Document.objects.create(
             doc_type=models.Document.DocType.COMMERCIAL_OFFER,

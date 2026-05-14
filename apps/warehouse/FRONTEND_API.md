@@ -360,6 +360,9 @@
 - `GET/POST /api/warehouse/documents/write-off/`
 - `GET/POST /api/warehouse/documents/transfer/`
 
+Быстрое перемещение без черновика в списке документов:
+- `POST /api/warehouse/transfer/` — **только склады одной компании** (межкомпанейское — см. [документ по партнёрству](../../docs/warehouse_stock_partnership_frontend.md)).
+
 Детали:
 - `GET/PATCH/PUT/DELETE /api/warehouse/documents/{id}/`
 
@@ -380,6 +383,10 @@
 - Для агента нельзя `TRANSFER` и `INVENTORY`.
 - Контрагент должен принадлежать агенту.
 - Товары в `items[]` должны быть в остатках агента (иначе 400).
+
+### 4.2.2 Партнёрство компаний по складу (межюрлицо)
+
+Полное описание эндпойнтов, тел запросов и ограничений по ролям: **[docs/warehouse_stock_partnership_frontend.md](../../docs/warehouse_stock_partnership_frontend.md)**.
 
 ### 4.3 Формат документа (сериализатор)
 ```json

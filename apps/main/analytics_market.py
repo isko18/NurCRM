@@ -207,6 +207,29 @@ def _model_has_field(model, field_name: str) -> bool:
         return False
 
 
+def _sale_item_net_line_revenue_expr(SaleItem_model):
+    """
+    Сумма строки чека: quantity × unit_price − line_discount.
+    Без line_discount топы товаров и разрезы аналитики расходятся с реальной оплатой при акциях.
+    """
+    if SaleItem_model is None or not _model_has_field(SaleItem_model, "unit_price"):
+        return None
+    if _model_has_field(SaleItem_model, "line_discount"):
+        return ExpressionWrapper(
+            (F("quantity") * F("unit_price"))
+            - Coalesce(
+                F("line_discount"),
+                Value(Z_MONEY, output_field=MONEY_FIELD),
+                output_field=MONEY_FIELD,
+            ),
+            output_field=MONEY_FIELD,
+        )
+    return ExpressionWrapper(
+        F("quantity") * F("unit_price"),
+        output_field=MONEY_FIELD,
+    )
+
+
 def _choice_value(model, enum_name: str, member: str, fallback: str) -> str:
     enum = getattr(model, enum_name, None)
     v = getattr(enum, member, None)
@@ -764,8 +787,8 @@ class AnalyticsView(APIView):
             if SaleItem is not None and _model_has_field(SaleItem, "sale"):
                 item_qs = SaleItem.objects.filter(sale__in=qs)
 
-                if _model_has_field(SaleItem, "unit_price"):
-                    revenue_expr = ExpressionWrapper(F("quantity") * F("unit_price"), output_field=MONEY_FIELD)
+                revenue_expr = _sale_item_net_line_revenue_expr(SaleItem)
+                if revenue_expr is not None:
                     item_rows = (
                         item_qs.values("product_id", "name_snapshot")
                         .annotate(
@@ -1745,8 +1768,8 @@ class AnalyticsView(APIView):
                 return qi
 
             # Top Products by Revenue - ДЕТАЛЬНО со всеми полями
-            if _model_has_field(SaleItem, "unit_price"):
-                revenue_expr = ExpressionWrapper(F("quantity") * F("unit_price"), output_field=MONEY_FIELD)
+            revenue_expr = _sale_item_net_line_revenue_expr(SaleItem)
+            if revenue_expr is not None:
                 top_by_rev_query = (
                     _sale_items_products_tab(sqs)
                     .values(
@@ -1828,7 +1851,7 @@ class AnalyticsView(APIView):
 
             # Categories Performance - ДЕТАЛЬНО с количеством товаров в каждой
             if _model_has_field(SaleItem, "product") and _model_has_field(Product, "category"):
-                if _model_has_field(SaleItem, "unit_price"):
+                if revenue_expr is not None:
                     cat_query = (
                         _sale_items_products_tab(sqs).filter(product__isnull=False)
                         .values("product__category__id", "product__category__name")
@@ -1857,7 +1880,7 @@ class AnalyticsView(APIView):
 
             # Brands Performance - ДЕТАЛЬНО
             if _model_has_field(SaleItem, "product") and _model_has_field(Product, "brand"):
-                if _model_has_field(SaleItem, "unit_price"):
+                if revenue_expr is not None:
                     brand_query = (
                         _sale_items_products_tab(sqs).filter(product__isnull=False)
                         .values("product__brand__id", "product__brand__name")
@@ -1890,11 +1913,8 @@ class AnalyticsView(APIView):
                 ghost_base = SaleItem.objects.filter(sale__in=sqs, product__isnull=True)
                 sales_without_product_line_count = int(ghost_base.count() or 0)
                 gvals = ("name_snapshot", "barcode_snapshot")
-                if _model_has_field(SaleItem, "unit_price"):
-                    ghost_rev = ExpressionWrapper(
-                        F("quantity") * F("unit_price"),
-                        output_field=MONEY_FIELD,
-                    )
+                ghost_rev = _sale_item_net_line_revenue_expr(SaleItem)
+                if ghost_rev is not None:
                     gq = (
                         ghost_base.values(*gvals)
                         .annotate(
@@ -1934,7 +1954,7 @@ class AnalyticsView(APIView):
                         "qty_sold": str((r.get("qty_sold") or Z_QTY).quantize(Decimal("0.001"))),
                         "transactions": int(r.get("tx_count") or 0),
                     }
-                    if _model_has_field(SaleItem, "unit_price"):
+                    if ghost_rev is not None:
                         row["revenue"] = str(_money(r.get("revenue") or Z_MONEY))
                     sales_without_product.append(row)
 
@@ -2199,6 +2219,7 @@ class AnalyticsView(APIView):
             sqs = sqs.filter(**{f"{dt_field}__gte": period.start, f"{dt_field}__lt": period.end})
 
             si = SaleItem.objects.filter(sale__in=sqs, product_id__in=p_sup.values("id"))
+            revenue_expr = _sale_item_net_line_revenue_expr(SaleItem)
             if _model_has_field(SaleItem, "product"):
                 agg_kw: dict = {
                     "qty_sold": Coalesce(
@@ -2208,11 +2229,7 @@ class AnalyticsView(APIView):
                     ),
                     "tx_count": Count("sale_id", distinct=True),
                 }
-                if _model_has_field(SaleItem, "unit_price"):
-                    revenue_expr = ExpressionWrapper(
-                        F("quantity") * F("unit_price"),
-                        output_field=MONEY_FIELD,
-                    )
+                if revenue_expr is not None:
                     agg_kw["revenue"] = Coalesce(
                         Sum(revenue_expr),
                         Value(Z_MONEY, output_field=MONEY_FIELD),
@@ -2367,11 +2384,8 @@ class AnalyticsView(APIView):
 
             si = SaleItem.objects.filter(sale__in=sqs, product_id__in=pqs.values("id"), product__isnull=False)
             base_vals = ("product_id", "product__name", "product__code")
-            if _model_has_field(SaleItem, "unit_price"):
-                rev_expr = ExpressionWrapper(
-                    F("quantity") * F("unit_price"),
-                    output_field=MONEY_FIELD,
-                )
+            rev_expr = _sale_item_net_line_revenue_expr(SaleItem)
+            if rev_expr is not None:
                 rows = (
                     si.values(*base_vals)
                     .annotate(

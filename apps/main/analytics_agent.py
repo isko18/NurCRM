@@ -16,6 +16,7 @@ from django.db.models import (
     Subquery,
     OuterRef,
     Q,
+    ExpressionWrapper,
 )
 from django.db.models.functions import Coalesce, TruncDate
 from django.utils import timezone
@@ -322,6 +323,11 @@ def build_agent_analytics_payload(
 
     items_qs = SaleItem.objects.filter(sale__in=sales_qs)
 
+    _net_line = ExpressionWrapper(
+        (F("quantity") * F("unit_price")) - Coalesce(F("line_discount"), ZERO_MONEY),
+        output_field=MONEY_FIELD,
+    )
+
     # ---------------- 1) продажи по товарам ----------------
     sales_by_product_qs = (
         items_qs
@@ -330,7 +336,7 @@ def build_agent_analytics_payload(
             # FIX: quantity может быть DecimalField → Sum(quantity)=Decimal
             qty=Coalesce(Sum("quantity", output_field=QTY_FIELD), ZERO_QTY),
             amount=Coalesce(
-                Sum(F("quantity") * F("unit_price"), output_field=MONEY_FIELD),
+                Sum(_net_line, output_field=MONEY_FIELD),
                 ZERO_MONEY,
             ),
         )
@@ -356,7 +362,7 @@ def build_agent_analytics_payload(
             # FIX: quantity может быть DecimalField → Sum(quantity)=Decimal
             items_sold=Coalesce(Sum("quantity", output_field=QTY_FIELD), ZERO_QTY),
             amount=Coalesce(
-                Sum(F("quantity") * F("unit_price"), output_field=MONEY_FIELD),
+                Sum(_net_line, output_field=MONEY_FIELD),
                 ZERO_MONEY,
             ),
         )

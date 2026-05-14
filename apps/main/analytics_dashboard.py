@@ -232,7 +232,16 @@ def build_dashboard_payload(*, company, branch, period_params: dict, user=None, 
         items_qs.values("name_snapshot")
         .annotate(
             qty=Coalesce(Sum("quantity"), Value(Decimal("0.000"), output_field=DecimalField(max_digits=14, decimal_places=3))),
-            revenue=Coalesce(Sum(F("quantity") * F("unit_price"), output_field=MONEY_FIELD), ZERO_MONEY),
+            revenue=Coalesce(
+                Sum(
+                    ExpressionWrapper(
+                        (F("quantity") * F("unit_price")) - Coalesce(F("line_discount"), ZERO_MONEY),
+                        output_field=MONEY_FIELD,
+                    ),
+                    output_field=MONEY_FIELD,
+                ),
+                ZERO_MONEY,
+            ),
         )
         .order_by("-revenue")[:10]
     )

@@ -460,6 +460,14 @@ class DocumentTransferCreateAPIView(CompanyBranchRestrictedMixin, APIView):
         self._ensure_agent_can_access_warehouse(wh_from, field_name="warehouse_from")
         self._ensure_agent_can_access_warehouse(wh_to, field_name="warehouse_to")
 
+        if wh_from.company_id != wh_to.company_id:
+            raise DRFValidationError(
+                {
+                    "warehouse": "Межкомпанейское перемещение выполняйте через POST /api/warehouse/stock-partnerships/transfer/ "
+                    "(нужно активное партнёрство между компаниями)."
+                }
+            )
+
         if company and (wh_from.company_id != company.id or wh_to.company_id != company.id):
             raise DRFValidationError({"warehouse": "Склад принадлежит другой компании."})
 

@@ -33,6 +33,17 @@ class CounterpartyAdmin(admin.ModelAdmin):
 	search_fields = ("name",)
 
 
+@admin.register(models.CompanyStockPartnership)
+class CompanyStockPartnershipAdmin(admin.ModelAdmin):
+	list_display = ("company_a", "company_b", "created_at")
+
+
+@admin.register(models.CompanyStockPartnershipRequest)
+class CompanyStockPartnershipRequestAdmin(admin.ModelAdmin):
+	list_display = ("from_company", "to_company", "status", "created_at")
+	list_filter = ("status",)
+
+
 @admin.register(models.CompanyWarehouseAgent)
 class CompanyWarehouseAgentAdmin(admin.ModelAdmin):
     list_display = (

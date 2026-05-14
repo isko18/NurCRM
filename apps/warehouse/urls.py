@@ -57,6 +57,15 @@ from .views_reconciliation import (
     CounterpartyReconciliationClassicAPIView,
     CounterpartyReconciliationJSONAPIView,
 )
+from .views_partnership import (
+    CompanyStockPartnershipRequestListCreateAPIView,
+    CompanyStockPartnershipRequestAcceptAPIView,
+    CompanyStockPartnershipRequestRejectAPIView,
+    CompanyStockPartnershipRequestCancelAPIView,
+    PartnerCompaniesListAPIView,
+    PartnerCompanyCatalogAPIView,
+    DocumentPartnerTransferCreateAPIView,
+)
 from .views_analytics import (
     WarehouseAgentMyAnalyticsAPIView,
     WarehouseOwnerAgentAnalyticsAPIView,
@@ -151,6 +160,13 @@ urlpatterns += [
     # documents
     path("documents/", DocumentListCreateView.as_view(), name="warehouse-documents"),
     path("transfer/", DocumentTransferCreateAPIView.as_view(), name="warehouse-transfer"),
+    path("stock-partnership-requests/", CompanyStockPartnershipRequestListCreateAPIView.as_view(), name="warehouse-stock-partnership-requests"),
+    path("stock-partnership-requests/<uuid:pk>/accept/", CompanyStockPartnershipRequestAcceptAPIView.as_view(), name="warehouse-stock-partnership-request-accept"),
+    path("stock-partnership-requests/<uuid:pk>/reject/", CompanyStockPartnershipRequestRejectAPIView.as_view(), name="warehouse-stock-partnership-request-reject"),
+    path("stock-partnership-requests/<uuid:pk>/cancel/", CompanyStockPartnershipRequestCancelAPIView.as_view(), name="warehouse-stock-partnership-request-cancel"),
+    path("stock-partnerships/active/", PartnerCompaniesListAPIView.as_view(), name="warehouse-stock-partnerships-active"),
+    path("stock-partnerships/companies/<uuid:company_id>/catalog/", PartnerCompanyCatalogAPIView.as_view(), name="warehouse-stock-partnership-catalog"),
+    path("stock-partnerships/transfer/", DocumentPartnerTransferCreateAPIView.as_view(), name="warehouse-stock-partnership-transfer"),
     path("documents/sale/", DocumentSaleListCreateView.as_view(), name="warehouse-documents-sale"),
     path("documents/purchase/", DocumentPurchaseListCreateView.as_view(), name="warehouse-documents-purchase"),
     path("documents/sale-return/", DocumentSaleReturnListCreateView.as_view(), name="warehouse-documents-sale-return"),

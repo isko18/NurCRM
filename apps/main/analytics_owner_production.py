@@ -214,6 +214,11 @@ def build_owner_analytics_payload(*, company, branch, period, date_from, date_to
 
     items_qs = SaleItem.objects.filter(sale__in=sales_qs)
 
+    items_net_revenue = ExpressionWrapper(
+        (F("quantity") * F("unit_price")) - Coalesce(F("line_discount"), ZERO_MONEY),
+        output_field=MONEY_FIELD,
+    )
+
     trunc_sales = _trunc_by_group("sale__created_at", group_by)
     sales_by_period_qs = (
         items_qs
@@ -227,7 +232,7 @@ def build_owner_analytics_payload(*, company, branch, period, date_from, date_to
 
             # FIX: Coalesce для Decimal только с ZERO_MONEY
             amount=Coalesce(
-                Sum(F("quantity") * F("unit_price"), output_field=MONEY_FIELD),
+                Sum(items_net_revenue, output_field=MONEY_FIELD),
                 ZERO_MONEY,
             ),
         )
@@ -249,7 +254,7 @@ def build_owner_analytics_payload(*, company, branch, period, date_from, date_to
             # FIX: quantity → Decimal
             qty=Coalesce(Sum("quantity", output_field=QTY_FIELD), ZERO_QTY),
             amount=Coalesce(
-                Sum(F("quantity") * F("unit_price"), output_field=MONEY_FIELD),
+                Sum(items_net_revenue, output_field=MONEY_FIELD),
                 ZERO_MONEY,
             ),
         )

@@ -359,7 +359,24 @@ def post_document(document: models.Document, allow_negative: bool = None) -> mod
         # create moves according to type
         elif document.doc_type == document.DocType.TRANSFER:
             def _get_or_create_transfer_product(source: models.WarehouseProduct, warehouse_to: models.Warehouse):
-                qs = models.WarehouseProduct.objects.filter(company_id=source.company_id, warehouse=warehouse_to)
+                dest_company = warehouse_to.company
+                same_company = source.company_id == dest_company.id
+                qs = models.WarehouseProduct.objects.filter(company_id=dest_company.id, warehouse=warehouse_to)
+
+                if same_company:
+                    brand = source.brand
+                    category = source.category
+                else:
+                    brand = (
+                        source.brand
+                        if source.brand_id and getattr(source.brand, "company_id", None) == dest_company.id
+                        else None
+                    )
+                    category = (
+                        source.category
+                        if source.category_id and getattr(source.category, "company_id", None) == dest_company.id
+                        else None
+                    )
 
                 if source.barcode:
                     existing = qs.filter(barcode=source.barcode).first()
@@ -390,11 +407,11 @@ def post_document(document: models.Document, allow_negative: bool = None) -> mod
                     plu = None
 
                 new_p = models.WarehouseProduct.objects.create(
-                    company=warehouse_to.company,
+                    company=dest_company,
                     branch=warehouse_to.branch,
                     warehouse=warehouse_to,
-                    brand=source.brand,
-                    category=source.category,
+                    brand=brand,
+                    category=category,
                     article=source.article,
                     name=source.name,
                     description=source.description,

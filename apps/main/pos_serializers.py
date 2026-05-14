@@ -108,6 +108,10 @@ class SaleItemSerializer(serializers.ModelSerializer):
     product_name = serializers.CharField(source="product.name", read_only=True)
     barcode = serializers.CharField(source="product.barcode", read_only=True)
     is_weight = serializers.BooleanField(source="product.is_weight", read_only=True)
+    # Product.stock в карточке товара — «Акционный товар» (как в ProductSerializer)
+    stock = serializers.SerializerMethodField()
+    promotion_rules = serializers.SerializerMethodField()
+    line_total = serializers.SerializerMethodField()
     display_name = serializers.SerializerMethodField()
     primary_image_url = serializers.SerializerMethodField(read_only=True)
     images = ProductImageReadSerializer(many=True, read_only=True, source="product.images")
@@ -124,7 +128,8 @@ class SaleItemSerializer(serializers.ModelSerializer):
             "id", "cart", "product",
             "product_name", "barcode",
             "is_weight",
-            "quantity", "unit_price", "line_discount",
+            "stock", "promotion_rules",
+            "quantity", "unit_price", "line_discount", "line_total",
             "sale_package",
             "display_name",
             "primary_image_url",
@@ -132,14 +137,47 @@ class SaleItemSerializer(serializers.ModelSerializer):
         )
         read_only_fields = (
             "id", "product_name", "barcode",
+            "stock", "promotion_rules", "line_total",
             "display_name", "primary_image_url", "images",
             "sale_package",
         )
+
+    def get_stock(self, obj):
+        p = getattr(obj, "product", None)
+        return bool(getattr(p, "stock", False))
 
     def get_display_name(self, obj):
         return get_attr(get_attr(obj, "product", None), "name", None) or (
             get_attr(obj, "custom_name", "") or ""
         )
+
+    def get_line_total(self, obj):
+        base = Decimal(str(obj.unit_price or 0)) * Decimal(str(obj.quantity or 0))
+        disc = Decimal(str(getattr(obj, "line_discount", None) or 0))
+        return money(base - disc)
+
+    def get_promotion_rules(self, obj):
+        p = getattr(obj, "product", None)
+        if not p or not getattr(p, "stock", False):
+            return []
+        cache = getattr(p, "_prefetched_objects_cache", {})
+        tiers = cache.get("promotion_tiers")
+        if tiers is not None:
+            rows = list(tiers)
+        else:
+            rows = list(p.promotion_tiers.all())
+        out = []
+        for t in rows:
+            out.append(
+                {
+                    "id": str(t.id),
+                    "position": t.position,
+                    "min_amount": str(t.min_amount),
+                    "discount_percent": str(t.discount_percent),
+                    "promo_quantity": t.promo_quantity,
+                }
+            )
+        return out
 
     def _get_product_images(self, product):
         if not product:

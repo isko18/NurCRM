@@ -1089,6 +1089,122 @@ class CompanyWarehouseAgent(models.Model):
         return f"{self.user_id} → {self.company_id} [{self.status}]"
 
 
+class CompanyStockPartnership(models.Model):
+    """
+    Пара компаний с активным партнёрством по складу (как «филиал» между разными юрлицами).
+    Пара хранится в каноническом порядке company_a.id < company_b.id (лексикографически по str(uuid)).
+    """
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    company_a = models.ForeignKey(
+        "users.Company",
+        on_delete=models.CASCADE,
+        related_name="stock_partnerships_as_a",
+        verbose_name="Компания A",
+    )
+    company_b = models.ForeignKey(
+        "users.Company",
+        on_delete=models.CASCADE,
+        related_name="stock_partnerships_as_b",
+        verbose_name="Компания B",
+    )
+    created_at = models.DateTimeField(auto_now_add=True, verbose_name="Дата создания")
+
+    class Meta:
+        verbose_name = "Партнёрство складов (компании)"
+        verbose_name_plural = "Партнёрства складов (компании)"
+        constraints = [
+            models.UniqueConstraint(fields=("company_a", "company_b"), name="uq_stock_partnership_company_pair"),
+        ]
+        indexes = [
+            models.Index(fields=["company_a", "company_b"]),
+        ]
+
+    def __str__(self):
+        return f"{self.company_a_id} ↔ {self.company_b_id}"
+
+
+class CompanyStockPartnershipRequest(models.Model):
+    """Запрос на партнёрство: от одной компании к другой; после принятия создаётся CompanyStockPartnership."""
+
+    class Status(models.TextChoices):
+        PENDING = "PENDING", "Ожидает"
+        ACCEPTED = "ACCEPTED", "Принят"
+        REJECTED = "REJECTED", "Отклонён"
+        CANCELLED = "CANCELLED", "Отозван"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    from_company = models.ForeignKey(
+        "users.Company",
+        on_delete=models.CASCADE,
+        related_name="stock_partnership_requests_out",
+        verbose_name="От компании",
+    )
+    to_company = models.ForeignKey(
+        "users.Company",
+        on_delete=models.CASCADE,
+        related_name="stock_partnership_requests_in",
+        verbose_name="К компании",
+    )
+    status = models.CharField(
+        max_length=16,
+        choices=Status.choices,
+        default=Status.PENDING,
+        db_index=True,
+        verbose_name="Статус",
+    )
+    note = models.CharField(max_length=512, blank=True, verbose_name="Комментарий")
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="stock_partnership_requests_created",
+        verbose_name="Кто создал",
+    )
+    decided_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="stock_partnership_requests_decided",
+        verbose_name="Кто решил",
+    )
+    created_at = models.DateTimeField(auto_now_add=True, verbose_name="Дата создания")
+    decided_at = models.DateTimeField(null=True, blank=True, verbose_name="Дата решения")
+    updated_at = models.DateTimeField(auto_now=True, verbose_name="Дата обновления")
+
+    class Meta:
+        verbose_name = "Запрос партнёрства складов"
+        verbose_name_plural = "Запросы партнёрства складов"
+        constraints = [
+            models.UniqueConstraint(
+                fields=("from_company", "to_company"),
+                condition=models.Q(status="PENDING"),
+                name="uq_stock_partnership_req_pending_direction",
+            ),
+        ]
+        indexes = [
+            models.Index(fields=["from_company", "status"]),
+            models.Index(fields=["to_company", "status"]),
+        ]
+
+    def __str__(self):
+        return f"{self.from_company_id} → {self.to_company_id} [{self.status}]"
+
+
+def canonical_company_pair_ids(company_id_a, company_id_b):
+    """Два UUID компании в стабильном порядке для company_a / company_b."""
+    return sorted([company_id_a, company_id_b], key=str)
+
+
+def has_active_stock_partnership_between_ids(company_id_a, company_id_b) -> bool:
+    if not company_id_a or not company_id_b or str(company_id_a) == str(company_id_b):
+        return False
+    id_lo, id_hi = canonical_company_pair_ids(company_id_a, company_id_b)
+    return CompanyStockPartnership.objects.filter(company_a_id=id_lo, company_b_id=id_hi).exists()
+
+
 class DocumentSequence(models.Model):
     doc_type = models.CharField(max_length=32, verbose_name="Тип документа")
     date = models.DateField(verbose_name="Дата")
@@ -1233,8 +1349,15 @@ class Document(models.Model):
             if self.warehouse_from_id == self.warehouse_to_id:
                 raise ValidationError("warehouse_from and warehouse_to must be different")
             if self.warehouse_from and self.warehouse_to:
-                if self.warehouse_from.company_id != self.warehouse_to.company_id:
-                    raise ValidationError("TRANSFER requires warehouses from the same company")
+                cfrom = self.warehouse_from.company_id
+                cto = self.warehouse_to.company_id
+                if cfrom != cto:
+                    if not has_active_stock_partnership_between_ids(cfrom, cto):
+                        raise ValidationError(
+                            {
+                                "warehouse_to": "Межкомпанейское перемещение доступно только при принятом партнёрстве складов между компаниями."
+                            }
+                        )
 
         if self.agent_id:
             if self.doc_type in (self.DocType.TRANSFER, self.DocType.INVENTORY):
