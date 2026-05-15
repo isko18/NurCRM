@@ -11,8 +11,25 @@ from rest_framework.views import APIView
 
 from apps.users.models import Company
 from apps.utils import _is_owner_like
-from apps.warehouse import models, serializers_documents, services
+from apps.warehouse import models, serializers_documents, serializers_money, services, services_money
 from apps.warehouse.views import CompanyBranchRestrictedMixin
+
+
+def _partner_cash_registers_payload(partner_company):
+    rows = []
+    for cr in models.CashRegister.objects.filter(company=partner_company).select_related("branch").order_by("name"):
+        bal = services_money.cash_register_balance(cr)
+        rows.append(
+            {
+                "id": str(cr.id),
+                "name": cr.name,
+                "location": cr.location or "",
+                "branch_id": str(cr.branch_id) if cr.branch_id else None,
+                "branch_name": cr.branch.name if cr.branch_id else None,
+                "balance": str(bal),
+            }
+        )
+    return rows
 
 
 def _acting_company_for_user(user):
@@ -44,7 +61,7 @@ def user_can_decide_incoming_request(user, request_obj) -> bool:
 
 class CompanyStockPartnershipRequestListCreateAPIView(CompanyBranchRestrictedMixin, APIView):
     """
-    GET: входящие (ожидающие) и исходящие заявки на партнёрство по складу.
+    GET: входящие (ожидающие) и исходящие заявки на партнёрство (склад + касса / инкассация).
     POST: отправить заявку в другую компанию { "to_company": "<uuid>", "note": "..." }.
     """
 
@@ -258,6 +275,7 @@ class PartnerCompanyCatalogAPIView(CompanyBranchRestrictedMixin, APIView):
             {
                 "partner_company": {"id": str(partner.id), "name": partner.name},
                 "warehouses": warehouses_data,
+                "cash_registers": _partner_cash_registers_payload(partner),
             }
         )
 
@@ -319,4 +337,71 @@ class DocumentPartnerTransferCreateAPIView(CompanyBranchRestrictedMixin, APIView
             raise DRFValidationError({"detail": str(e)})
 
         out = serializers_documents.DocumentSerializer(doc, context={"request": request}).data
+        return Response(out, status=status.HTTP_201_CREATED)
+
+
+class PartnerCashIncassationListCreateAPIView(CompanyBranchRestrictedMixin, APIView):
+    """
+    GET — история инкассаций текущей компании (исходящие и входящие).
+    POST — перевод с кассы своей (или партнёрской) компании на кассу другой компании-партнёра.
+    """
+
+    def get(self, request, *args, **kwargs):
+        company = self._company()
+        if not company:
+            raise DRFValidationError({"company": "Компания не найдена."})
+        if not user_can_represent_company(request.user, company):
+            raise PermissionDenied()
+
+        qs = (
+            models.CompanyCashIncassation.objects.filter(
+                Q(from_company=company) | Q(to_company=company)
+            )
+            .select_related(
+                "from_company",
+                "to_company",
+                "cash_register_from",
+                "cash_register_to",
+                "expense_document",
+                "receipt_document",
+                "created_by",
+            )
+            .order_by("-created_at")[:200]
+        )
+        data = serializers_money.CompanyCashIncassationSerializer(qs, many=True).data
+        return Response({"results": data})
+
+    def post(self, request, *args, **kwargs):
+        if self._agent_membership() is not None:
+            raise PermissionDenied("Инкассация между компаниями недоступна для агентов.")
+
+        ser = serializers_money.PartnerCashIncassationCreateSerializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+
+        my_company = self._company()
+        if not my_company:
+            raise DRFValidationError({"company": "Компания не найдена."})
+        if not user_can_represent_company(request.user, my_company):
+            raise PermissionDenied()
+
+        cr_from = ser.validated_data["cash_register_from"]
+        cr_to = ser.validated_data["cash_register_to"]
+
+        if my_company.id not in (cr_from.company_id, cr_to.company_id):
+            raise DRFValidationError(
+                {"cash_register": "Одна из касс должна принадлежать вашей компании."}
+            )
+
+        try:
+            inc = services_money.post_partner_cash_incassation(
+                cash_register_from=cr_from,
+                cash_register_to=cr_to,
+                amount=ser.validated_data["amount"],
+                comment=ser.validated_data.get("comment") or "",
+                created_by=request.user,
+            )
+        except Exception as e:
+            raise DRFValidationError({"detail": str(e)})
+
+        out = serializers_money.CompanyCashIncassationSerializer(inc).data
         return Response(out, status=status.HTTP_201_CREATED)

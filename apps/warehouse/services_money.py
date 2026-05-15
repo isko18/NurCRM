@@ -220,3 +220,118 @@ def unpost_money_document(doc: models.MoneyDocument) -> models.MoneyDocument:
 
     return doc
 
+
+def cash_register_balance(cash_register) -> Decimal:
+    """Сальдо кассы по проведённым приходам и расходам."""
+    if cash_register is None:
+        return Decimal("0.00")
+    agg = models.MoneyDocument.objects.filter(
+        cash_register=cash_register,
+        status=models.MoneyDocument.Status.POSTED,
+    ).aggregate(
+        receipts=Coalesce(
+            Sum("amount", filter=Q(doc_type=models.MoneyDocument.DocType.MONEY_RECEIPT)),
+            Value(Decimal("0.00")),
+            output_field=DecimalField(max_digits=18, decimal_places=2),
+        ),
+        expenses=Coalesce(
+            Sum("amount", filter=Q(doc_type=models.MoneyDocument.DocType.MONEY_EXPENSE)),
+            Value(Decimal("0.00")),
+            output_field=DecimalField(max_digits=18, decimal_places=2),
+        ),
+    )
+    return _dec_q2(agg["receipts"]) - _dec_q2(agg["expenses"])
+
+
+def _payment_category_incassation(company, branch):
+    from .utils import ensure_system_payment_categories
+
+    ensure_system_payment_categories(company, branch)
+    cat = models.PaymentCategory.objects.filter(
+        company=company,
+        branch=branch,
+        system_code=models.PaymentCategory.SystemCode.INCASSATION,
+    ).first()
+    if not cat:
+        raise ValueError("Не найдена категория «Инкассация». Обратитесь к администратору.")
+    return cat
+
+
+def post_partner_cash_incassation(
+    *,
+    cash_register_from,
+    cash_register_to,
+    amount: Decimal,
+    comment: str = "",
+    created_by=None,
+) -> models.CompanyCashIncassation:
+    """
+    Инкассация между кассами партнёрских компаний: расход с кассы-источника, приход на кассу-приёмник.
+    """
+    amount = _dec_q2(amount)
+    if amount <= 0:
+        raise ValueError("Сумма должна быть больше 0.")
+
+    if cash_register_from.id == cash_register_to.id:
+        raise ValueError("Касса-источник и касса-приёмник должны быть разными.")
+
+    cfrom = cash_register_from.company_id
+    cto = cash_register_to.company_id
+    if cfrom == cto:
+        raise ValueError("Инкассация между компаниями: кассы должны принадлежать разным компаниям.")
+
+    if not models.has_active_stock_partnership_between_ids(cfrom, cto):
+        raise ValueError("Между компаниями этих касс нет принятого партнёрства.")
+
+    balance = cash_register_balance(cash_register_from)
+    if balance < amount:
+        raise ValueError(
+            f"Недостаточно средств в кассе «{cash_register_from.name}». Доступно: {balance}, требуется: {amount}."
+        )
+
+    from_co = cash_register_from.company
+    to_co = cash_register_to.company
+    base_comment = (comment or "").strip()
+    out_note = base_comment or f"Инкассация в «{to_co.name}», касса «{cash_register_to.name}»"
+    in_note = base_comment or f"Инкассация из «{from_co.name}», касса «{cash_register_from.name}»"
+
+    with transaction.atomic():
+        cat_out = _payment_category_incassation(cash_register_from.company, cash_register_from.branch)
+        cat_in = _payment_category_incassation(cash_register_to.company, cash_register_to.branch)
+
+        expense = models.MoneyDocument.objects.create(
+            doc_type=models.MoneyDocument.DocType.MONEY_EXPENSE,
+            status=models.MoneyDocument.Status.DRAFT,
+            cash_register=cash_register_from,
+            company=cash_register_from.company,
+            branch=cash_register_from.branch,
+            payment_category=cat_out,
+            amount=amount,
+            comment=out_note,
+        )
+        receipt = models.MoneyDocument.objects.create(
+            doc_type=models.MoneyDocument.DocType.MONEY_RECEIPT,
+            status=models.MoneyDocument.Status.DRAFT,
+            cash_register=cash_register_to,
+            company=cash_register_to.company,
+            branch=cash_register_to.branch,
+            payment_category=cat_in,
+            amount=amount,
+            comment=in_note,
+        )
+        post_money_document(expense)
+        post_money_document(receipt)
+
+        inc = models.CompanyCashIncassation.objects.create(
+            from_company=from_co,
+            to_company=to_co,
+            cash_register_from=cash_register_from,
+            cash_register_to=cash_register_to,
+            expense_document=expense,
+            receipt_document=receipt,
+            amount=amount,
+            comment=base_comment,
+            created_by=created_by,
+        )
+    return inc
+

@@ -1091,7 +1091,7 @@ class CompanyWarehouseAgent(models.Model):
 
 class CompanyStockPartnership(models.Model):
     """
-    Пара компаний с активным партнёрством по складу (как «филиал» между разными юрлицами).
+    Пара компаний с активным партнёрством: общий доступ к складам и кассам (инкассация между компаниями).
     Пара хранится в каноническом порядке company_a.id < company_b.id (лексикографически по str(uuid)).
     """
 
@@ -1111,8 +1111,8 @@ class CompanyStockPartnership(models.Model):
     created_at = models.DateTimeField(auto_now_add=True, verbose_name="Дата создания")
 
     class Meta:
-        verbose_name = "Партнёрство складов (компании)"
-        verbose_name_plural = "Партнёрства складов (компании)"
+        verbose_name = "Партнёрство компаний (склад и касса)"
+        verbose_name_plural = "Партнёрства компаний (склад и касса)"
         constraints = [
             models.UniqueConstraint(fields=("company_a", "company_b"), name="uq_stock_partnership_company_pair"),
         ]
@@ -1125,7 +1125,10 @@ class CompanyStockPartnership(models.Model):
 
 
 class CompanyStockPartnershipRequest(models.Model):
-    """Запрос на партнёрство: от одной компании к другой; после принятия создаётся CompanyStockPartnership."""
+    """
+    Запрос на партнёрство (склад + касса / инкассация): от одной компании к другой.
+    После принятия создаётся CompanyStockPartnership.
+    """
 
     class Status(models.TextChoices):
         PENDING = "PENDING", "Ожидает"
@@ -1175,8 +1178,8 @@ class CompanyStockPartnershipRequest(models.Model):
     updated_at = models.DateTimeField(auto_now=True, verbose_name="Дата обновления")
 
     class Meta:
-        verbose_name = "Запрос партнёрства складов"
-        verbose_name_plural = "Запросы партнёрства складов"
+        verbose_name = "Запрос партнёрства (склад и касса)"
+        verbose_name_plural = "Запросы партнёрства (склад и касса)"
         constraints = [
             models.UniqueConstraint(
                 fields=("from_company", "to_company"),
@@ -1191,6 +1194,73 @@ class CompanyStockPartnershipRequest(models.Model):
 
     def __str__(self):
         return f"{self.from_company_id} → {self.to_company_id} [{self.status}]"
+
+
+class CompanyCashIncassation(models.Model):
+    """
+    Инкассация: перевод наличных с кассы одной компании на кассу партнёрской компании.
+    Создаёт пару проведённых денежных документов (расход + приход).
+    """
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    from_company = models.ForeignKey(
+        "users.Company",
+        on_delete=models.CASCADE,
+        related_name="cash_incassations_out",
+        verbose_name="Компания-отправитель",
+    )
+    to_company = models.ForeignKey(
+        "users.Company",
+        on_delete=models.CASCADE,
+        related_name="cash_incassations_in",
+        verbose_name="Компания-получатель",
+    )
+    cash_register_from = models.ForeignKey(
+        "warehouse.CashRegister",
+        on_delete=models.PROTECT,
+        related_name="incassations_out",
+        verbose_name="Касса-источник",
+    )
+    cash_register_to = models.ForeignKey(
+        "warehouse.CashRegister",
+        on_delete=models.PROTECT,
+        related_name="incassations_in",
+        verbose_name="Касса-приёмник",
+    )
+    expense_document = models.OneToOneField(
+        "warehouse.MoneyDocument",
+        on_delete=models.PROTECT,
+        related_name="incassation_as_expense",
+        verbose_name="Расход (исходящий)",
+    )
+    receipt_document = models.OneToOneField(
+        "warehouse.MoneyDocument",
+        on_delete=models.PROTECT,
+        related_name="incassation_as_receipt",
+        verbose_name="Приход (входящий)",
+    )
+    amount = models.DecimalField(max_digits=18, decimal_places=2, verbose_name="Сумма")
+    comment = models.CharField(max_length=512, blank=True, verbose_name="Комментарий")
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="cash_incassations_created",
+        verbose_name="Кто создал",
+    )
+    created_at = models.DateTimeField(auto_now_add=True, verbose_name="Дата создания")
+
+    class Meta:
+        verbose_name = "Инкассация между компаниями"
+        verbose_name_plural = "Инкассации между компаниями"
+        indexes = [
+            models.Index(fields=["from_company", "created_at"]),
+            models.Index(fields=["to_company", "created_at"]),
+        ]
+
+    def __str__(self):
+        return f"{self.from_company_id} → {self.to_company_id} {self.amount}"
 
 
 def canonical_company_pair_ids(company_id_a, company_id_b):
@@ -1789,6 +1859,7 @@ class PaymentCategory(BaseModelId, BaseModelCompanyBranch):
     class SystemCode(models.TextChoices):
         SALE = "sale", "Продажа"
         DEBT = "debt", "Долги"
+        INCASSATION = "incassation", "Инкассация"
 
     title = models.CharField(max_length=255, verbose_name="Название")
     system_code = models.CharField(

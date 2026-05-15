@@ -94,7 +94,7 @@ def _restrict_pk_queryset_strict(field, base_qs, company, branch):
 
 def ensure_system_payment_categories(company, branch=None):
     """
-    Идемпотентно создаёт системные категории «Продажа» и «Долги» для компании или филиала.
+    Идемпотентно создаёт системные категории «Продажа», «Долги» и «Инкассация» для компании или филиала.
     Если уже есть запись с тем же title и без system_code — присваивает ей системный код.
     """
     from . import models

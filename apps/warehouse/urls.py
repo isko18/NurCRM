@@ -65,6 +65,7 @@ from .views_partnership import (
     PartnerCompaniesListAPIView,
     PartnerCompanyCatalogAPIView,
     DocumentPartnerTransferCreateAPIView,
+    PartnerCashIncassationListCreateAPIView,
 )
 from .views_analytics import (
     WarehouseAgentMyAnalyticsAPIView,
@@ -167,6 +168,7 @@ urlpatterns += [
     path("stock-partnerships/active/", PartnerCompaniesListAPIView.as_view(), name="warehouse-stock-partnerships-active"),
     path("stock-partnerships/companies/<uuid:company_id>/catalog/", PartnerCompanyCatalogAPIView.as_view(), name="warehouse-stock-partnership-catalog"),
     path("stock-partnerships/transfer/", DocumentPartnerTransferCreateAPIView.as_view(), name="warehouse-stock-partnership-transfer"),
+    path("stock-partnerships/cash-incassations/", PartnerCashIncassationListCreateAPIView.as_view(), name="warehouse-stock-partnership-cash-incassations"),
     path("documents/sale/", DocumentSaleListCreateView.as_view(), name="warehouse-documents-sale"),
     path("documents/purchase/", DocumentPurchaseListCreateView.as_view(), name="warehouse-documents-purchase"),
     path("documents/sale-return/", DocumentSaleReturnListCreateView.as_view(), name="warehouse-documents-sale-return"),

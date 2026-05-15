@@ -44,6 +44,12 @@ class CompanyStockPartnershipRequestAdmin(admin.ModelAdmin):
 	list_filter = ("status",)
 
 
+@admin.register(models.CompanyCashIncassation)
+class CompanyCashIncassationAdmin(admin.ModelAdmin):
+	list_display = ("from_company", "to_company", "amount", "cash_register_from", "cash_register_to", "created_at")
+	list_filter = ("from_company", "to_company")
+
+
 @admin.register(models.CompanyWarehouseAgent)
 class CompanyWarehouseAgentAdmin(admin.ModelAdmin):
     list_display = (

@@ -277,6 +277,44 @@ class DocumentsTests(TestCase):
         self.assertEqual(b_from.qty, Decimal("2.000"))
         self.assertEqual(b_to.qty, Decimal("2.000"))
 
+    def test_partner_cash_incassation(self):
+        Company = apps.get_model("users", "Company")
+        user_b = User.objects.create(
+            email="cashb@example.com", password="x", first_name="B", last_name="B", role="owner"
+        )
+        company_b = Company.objects.create(name="CB2", owner=user_b)
+        cash_a = models.CashRegister.objects.create(company=self.company, branch=self.branch, name="CashA")
+        cash_b = models.CashRegister.objects.create(company=company_b, branch=None, name="CashB")
+        cat_a = models.PaymentCategory.objects.create(
+            company=self.company, branch=self.branch, title="Инкассация", system_code="incassation"
+        )
+        models.PaymentCategory.objects.create(
+            company=company_b, branch=None, title="Инкассация", system_code="incassation"
+        )
+        models.MoneyDocument.objects.create(
+            doc_type=models.MoneyDocument.DocType.MONEY_RECEIPT,
+            status=models.MoneyDocument.Status.POSTED,
+            cash_register=cash_a,
+            company=self.company,
+            branch=self.branch,
+            payment_category=cat_a,
+            amount=Decimal("500.00"),
+        )
+        id_lo, id_hi = models.canonical_company_pair_ids(self.company.id, company_b.id)
+        models.CompanyStockPartnership.objects.create(company_a_id=id_lo, company_b_id=id_hi)
+
+        from apps.warehouse import services_money
+
+        inc = services_money.post_partner_cash_incassation(
+            cash_register_from=cash_a,
+            cash_register_to=cash_b,
+            amount=Decimal("200.00"),
+            created_by=self.user,
+        )
+        self.assertEqual(inc.amount, Decimal("200.00"))
+        self.assertEqual(services_money.cash_register_balance(cash_a), Decimal("300.00"))
+        self.assertEqual(services_money.cash_register_balance(cash_b), Decimal("200.00"))
+
     def test_commercial_offer_creates_and_cannot_be_posted(self):
         doc = models.Document.objects.create(
             doc_type=models.Document.DocType.COMMERCIAL_OFFER,

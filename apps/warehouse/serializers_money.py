@@ -1,3 +1,5 @@
+from decimal import Decimal
+
 from rest_framework import serializers
 from django.core.exceptions import ValidationError as DjangoValidationError
 
@@ -111,4 +113,64 @@ class MoneyDocumentSerializer(serializers.ModelSerializer):
             validated_data.setdefault("company", cash_register.company)
             validated_data.setdefault("branch", cash_register.branch)
         return super().create(validated_data)
+
+
+class PartnerCashIncassationCreateSerializer(serializers.Serializer):
+    cash_register_from = serializers.PrimaryKeyRelatedField(queryset=models.CashRegister.objects.all())
+    cash_register_to = serializers.PrimaryKeyRelatedField(queryset=models.CashRegister.objects.all())
+    amount = serializers.DecimalField(max_digits=18, decimal_places=2)
+    comment = serializers.CharField(required=False, allow_blank=True, max_length=512)
+
+
+class CompanyCashIncassationSerializer(serializers.ModelSerializer):
+    from_company_name = serializers.CharField(source="from_company.name", read_only=True)
+    to_company_name = serializers.CharField(source="to_company.name", read_only=True)
+    cash_register_from_name = serializers.CharField(source="cash_register_from.name", read_only=True)
+    cash_register_to_name = serializers.CharField(source="cash_register_to.name", read_only=True)
+    expense_document_number = serializers.CharField(source="expense_document.number", read_only=True)
+    receipt_document_number = serializers.CharField(source="receipt_document.number", read_only=True)
+    created_by_email = serializers.EmailField(source="created_by.email", read_only=True, allow_null=True)
+
+    class Meta:
+        model = models.CompanyCashIncassation
+        fields = (
+            "id",
+            "from_company",
+            "from_company_name",
+            "to_company",
+            "to_company_name",
+            "cash_register_from",
+            "cash_register_from_name",
+            "cash_register_to",
+            "cash_register_to_name",
+            "expense_document",
+            "expense_document_number",
+            "receipt_document",
+            "receipt_document_number",
+            "amount",
+            "comment",
+            "created_by",
+            "created_by_email",
+            "created_at",
+        )
+        read_only_fields = (
+            "id",
+            "from_company",
+            "from_company_name",
+            "to_company",
+            "to_company_name",
+            "cash_register_from",
+            "cash_register_from_name",
+            "cash_register_to",
+            "cash_register_to_name",
+            "expense_document",
+            "expense_document_number",
+            "receipt_document",
+            "receipt_document_number",
+            "amount",
+            "comment",
+            "created_by",
+            "created_by_email",
+            "created_at",
+        )
 
