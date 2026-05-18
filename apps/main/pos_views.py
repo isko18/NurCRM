@@ -582,6 +582,29 @@ def _find_open_shift_for_cashier(*, company, cashier, cashbox=None, branch=None)
     return qs.order_by("-opened_at").first()
 
 
+def _resolve_requested_open_shift(*, company, cashier, shift_id, cashbox_id=None):
+    try:
+        parsed_shift_id = uuid.UUID(str(shift_id))
+    except (TypeError, ValueError, AttributeError):
+        raise ValidationError({"shift": "Некорректный ID смены."})
+
+    shift = (
+        CashShift.objects.select_for_update()
+        .select_related("cashbox", "branch", "cashier")
+        .filter(id=parsed_shift_id, company=company)
+        .first()
+    )
+    if not shift or shift.status != CashShift.Status.OPEN:
+        raise ValidationError(
+            {"detail": "Смена не открыта. Сначала откройте смену на кассе, затем начните продажу."}
+        )
+    if cashbox_id and str(shift.cashbox_id) != str(cashbox_id):
+        raise ValidationError({"cashbox_id": "Переданная смена относится к другой кассе."})
+    if shift.cashier_id != getattr(cashier, "id", None):
+        raise ValidationError({"detail": "Переданная смена открыта другим кассиром."})
+    return shift
+
+
 def _ensure_open_shift(*, company, branch, cashier, cashbox, opening_cash=None):
     """
     Возвращает открытую смену ТОЛЬКО этого cashier в этой cashbox.
@@ -1447,31 +1470,47 @@ class SaleStartAPIView(MarketCashierOnlyMixin, CompanyBranchRestrictedMixin, API
         branch = self._auto_branch()
 
         cashbox_id = request.data.get("cashbox_id")
+        requested_shift_id = request.data.get("shift_id") or request.data.get("shift")
         # opening_cash НЕ используется тут намеренно:
         # смена должна быть открыта отдельным действием, а start не открывает её автоматически.
 
-        cashbox = _resolve_pos_cashbox(company, branch, cashbox_id=cashbox_id)
-        if not cashbox and not cashbox_id:
-            shift = _find_open_shift_for_cashier(company=company, cashier=user, branch=branch)
-            if shift:
-                cashbox = shift.cashbox
-                branch = shift.branch
-            else:
+        if requested_shift_id:
+            shift = _resolve_requested_open_shift(
+                company=company,
+                cashier=user,
+                shift_id=requested_shift_id,
+                cashbox_id=cashbox_id,
+            )
+            cashbox = shift.cashbox
+            branch = shift.branch
+        else:
+            cashbox = _resolve_pos_cashbox(company, branch, cashbox_id=cashbox_id)
+            if not cashbox and not cashbox_id:
+                shift = _find_open_shift_for_cashier(company=company, cashier=user, branch=branch)
+                if shift:
+                    cashbox = shift.cashbox
+                    branch = shift.branch
+                else:
+                    raise ValidationError({"detail": "Нет кассы для этого филиала. Создай Cashbox."})
+            elif not cashbox:
                 raise ValidationError({"detail": "Нет кассы для этого филиала. Создай Cashbox."})
-        elif not cashbox:
-            raise ValidationError({"detail": "Нет кассы для этого филиала. Создай Cashbox."})
 
-        shift = _find_open_shift_for_cashier(company=company, cashier=user, cashbox=cashbox)
-        if not shift and not cashbox_id:
-            shift = _find_open_shift_for_cashier(company=company, cashier=user, branch=branch)
-            if shift:
-                cashbox = shift.cashbox
-                branch = shift.branch
+            shift = _find_open_shift_for_cashier(company=company, cashier=user, cashbox=cashbox)
+            if not shift and not cashbox_id:
+                shift = _find_open_shift_for_cashier(company=company, cashier=user, branch=branch)
+                if shift:
+                    cashbox = shift.cashbox
+                    branch = shift.branch
 
         if not shift:
             raise ValidationError(
                 {"detail": "Смена не открыта. Сначала откройте смену на кассе, затем начните продажу."}
             )
+
+        if not cashbox:
+            cashbox = shift.cashbox
+            if shift:
+                branch = shift.branch
 
         opts = StartCartOptionsSerializer(data=request.data)
         opts.is_valid(raise_exception=True)
