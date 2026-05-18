@@ -590,7 +590,7 @@ def _resolve_requested_open_shift(*, company, cashier, shift_id, cashbox_id=None
 
     shift = (
         CashShift.objects.select_for_update()
-        .select_related("cashbox", "branch", "cashier")
+        .select_related("cashbox", "cashier")
         .filter(id=parsed_shift_id, company=company)
         .first()
     )
