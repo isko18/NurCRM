@@ -146,6 +146,7 @@ class CashShiftOpenSerializer(serializers.ModelSerializer):
     ✅ Разрешаем несколько OPEN смен на одну кассу.
     ✅ Запрещаем только повторную OPEN смену этому же кассиру на этой кассе.
     """
+    MAX_OPEN_COMPANY_SHIFTS = 3
 
     cashier = serializers.PrimaryKeyRelatedField(required=False, allow_null=True, queryset=User.objects.none())
     cashbox = serializers.PrimaryKeyRelatedField(queryset=Cashbox.objects.none())
@@ -216,6 +217,17 @@ class CashShiftOpenSerializer(serializers.ModelSerializer):
         )
         if existing:
             attrs["_existing_shift"] = existing
+            return attrs
+
+        open_shifts_count = (
+            CashShift.objects
+            .filter(company=company, status=CashShift.Status.OPEN)
+            .count()
+        )
+        if open_shifts_count >= self.MAX_OPEN_COMPANY_SHIFTS:
+            raise serializers.ValidationError(
+                {"shift": f"В компании уже открыто {self.MAX_OPEN_COMPANY_SHIFTS} смены. Закройте одну смену перед открытием новой."}
+            )
 
         return attrs
 

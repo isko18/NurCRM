@@ -573,7 +573,6 @@ def _find_open_shift_for_cashier(*, company, cashier, cashbox=None, branch=None)
     qs = CashShift.objects.select_for_update().filter(
         company=company,
         status=CashShift.Status.OPEN,
-        cashier=cashier,
     )
     if cashbox is not None:
         qs = qs.filter(cashbox=cashbox)
@@ -600,8 +599,6 @@ def _resolve_requested_open_shift(*, company, cashier, shift_id, cashbox_id=None
         )
     if cashbox_id and str(shift.cashbox_id) != str(cashbox_id):
         raise ValidationError({"cashbox_id": "Переданная смена относится к другой кассе."})
-    if shift.cashier_id != getattr(cashier, "id", None):
-        raise ValidationError({"detail": "Переданная смена открыта другим кассиром."})
     return shift
 
 

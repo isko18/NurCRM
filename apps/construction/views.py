@@ -529,11 +529,10 @@ class CashShiftListView(CompanyBranchScopedMixin, generics.ListAPIView):
         qs = self._scoped_queryset(qs)
 
         user = self.request.user
-        if not _is_owner_like(user):
-            qs = qs.filter(cashier=user)
-
         cashbox_id = self.request.query_params.get("cashbox")
         status_q = self.request.query_params.get("status")
+        if not _is_owner_like(user) and status_q != CashShift.Status.OPEN:
+            qs = qs.filter(cashier=user)
         if cashbox_id:
             qs = qs.filter(cashbox_id=cashbox_id)
         if status_q in ("open", "closed"):
@@ -554,7 +553,7 @@ class CashShiftDetailView(CompanyBranchScopedMixin, generics.RetrieveAPIView):
 
         user = self.request.user
         if not _is_owner_like(user):
-            qs = qs.filter(cashier=user)
+            qs = qs.filter(Q(status=CashShift.Status.OPEN) | Q(cashier=user))
 
         return qs
 

@@ -1615,8 +1615,6 @@ class Cart(models.Model):
                 raise ValidationError({"shift": "Смена другой компании."})
             if self.branch_id is not None and (self.shift.branch_id or None) != (self.branch_id or None):
                 raise ValidationError({"shift": "Смена другого филиала."})
-            if self.user_id and self.shift.cashier_id and self.user_id != self.shift.cashier_id:
-                raise ValidationError({"user": "Корзина не принадлежит кассиру этой смены."})
 
     def save(self, *args, **kwargs):
         update_fields = kwargs.get("update_fields")
@@ -1993,14 +1991,12 @@ class Sale(models.Model):
         if self.branch_id and self.client_id and self.client.branch_id not in (None, self.branch_id):
             raise ValidationError({"client": "Клиент другого филиала."})
 
-        # ✅ shift есть — строгие проверки + cashbox должен совпасть со сменой (если передан)
+        # ✅ shift есть — строгие проверки компании/филиала + cashbox должен совпасть со сменой (если передан)
         if self.shift_id:
             if self.company_id and self.shift.company_id != self.company_id:
                 raise ValidationError({"shift": "Смена другой компании."})
             if (self.branch_id or None) != (self.shift.branch_id or None):
                 raise ValidationError({"shift": "Смена другого филиала."})
-            if self.user_id and self.shift.cashier_id and self.user_id != self.shift.cashier_id:
-                raise ValidationError({"user": "Продажа не принадлежит кассиру этой смены."})
             if self.cashbox_id and self.cashbox_id != self.shift.cashbox_id:
                 raise ValidationError({"cashbox": "Касса продажи должна совпадать с кассой смены."})
 

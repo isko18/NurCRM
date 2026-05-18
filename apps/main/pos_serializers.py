@@ -411,12 +411,9 @@ class CheckoutSerializer(serializers.Serializer):
             if sh.status != CashShift.Status.OPEN:
                 raise serializers.ValidationError({"shift_id": "Смена закрыта. Нужна открытая смена."})
 
-            if user and (not _is_owner_like(user)) and sh.cashier_id != user.id:
-                raise serializers.ValidationError({"shift_id": "Нельзя оформить продажу в чужую смену."})
-
             return sh
 
-        # 2) shift_id не передали → берём открытую смену текущего пользователя в этой кассе
+        # 2) shift_id не передали → берём любую открытую смену компании в этой кассе
         if not user or not getattr(user, "is_authenticated", False):
             raise serializers.ValidationError({"shift_id": "Нужен пользователь для определения смены."})
 
@@ -427,7 +424,6 @@ class CheckoutSerializer(serializers.Serializer):
                 branch_id=cart.branch_id,
                 cashbox=cashbox,
                 status=CashShift.Status.OPEN,
-                cashier=user,
             )
             .order_by("-opened_at")
             .first()
