@@ -4407,3 +4407,49 @@ class AgentRequestItem(models.Model):
 
         # safety net
         raise ValidationError(f"Нельзя сохранить позицию при статусе {cart_status!r}.")
+
+
+class KnowledgeBaseCourse(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    title = models.CharField("Название курса", max_length=255, unique=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = "Курс базы знаний"
+        verbose_name_plural = "Курсы базы знаний"
+        ordering = ["-created_at"]
+        indexes = [
+            models.Index(fields=["created_at"]),
+            models.Index(fields=["title"]),
+        ]
+
+    def __str__(self):
+        return self.title
+
+
+class KnowledgeBaseLesson(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    course = models.ForeignKey(
+        KnowledgeBaseCourse,
+        on_delete=models.CASCADE,
+        related_name="lessons",
+        verbose_name="Курс",
+    )
+    title = models.CharField("Название урока", max_length=255)
+    description = models.TextField("Описание", blank=True)
+    url = models.URLField("Ссылка на урок", max_length=500)
+    order = models.PositiveIntegerField("Порядок", default=0)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = "Урок базы знаний"
+        verbose_name_plural = "Уроки базы знаний"
+        ordering = ["order", "created_at"]
+        indexes = [
+            models.Index(fields=["course", "order"]),
+        ]
+
+    def __str__(self):
+        return f"{self.course.title} — {self.title}"

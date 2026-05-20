@@ -21,6 +21,7 @@ from apps.main.models import (
     ProductPackage, ProductCharacteristics, DealPayment, AgentSaleAllocation,
     ProductRecipeItem, ProductPromotionTier, ProductAlternateBarcode, MarketSaleEmployeePayProfile,
     SupplierReceipt, SupplierReceiptItem,
+    KnowledgeBaseCourse, KnowledgeBaseLesson,
 )
 
 from apps.consalting.models import ServicesConsalting
@@ -209,6 +210,67 @@ class BidSerializers(serializers.ModelSerializer):
     class Meta:
         model = Bid
         fields = ['id', 'full_name', 'phone', 'text', 'status', 'created_at']
+
+
+class PublicKnowledgeBaseLessonSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = KnowledgeBaseLesson
+        fields = ["id", "title", "description", "url", "order", "created_at"]
+        read_only_fields = ["id", "order", "created_at"]
+
+
+class PublicKnowledgeBaseCourseSerializer(serializers.ModelSerializer):
+    lessons = PublicKnowledgeBaseLessonSerializer(many=True)
+
+    class Meta:
+        model = KnowledgeBaseCourse
+        fields = ["id", "title", "lessons", "created_at", "updated_at"]
+        read_only_fields = ["id", "created_at", "updated_at"]
+
+    def validate_lessons(self, value):
+        if not value:
+            raise serializers.ValidationError("Добавьте хотя бы один урок.")
+        return value
+
+    def validate_title(self, value):
+        qs = KnowledgeBaseCourse.objects.filter(title=value)
+        if self.instance is not None:
+            qs = qs.exclude(pk=self.instance.pk)
+        if qs.exists():
+            raise serializers.ValidationError("Курс с таким названием уже есть.")
+        return value
+
+    @transaction.atomic
+    def create(self, validated_data):
+        lessons_data = validated_data.pop("lessons")
+        course = KnowledgeBaseCourse.objects.create(**validated_data)
+        KnowledgeBaseLesson.objects.bulk_create(
+            KnowledgeBaseLesson(course=course, order=index, **lesson_data)
+            for index, lesson_data in enumerate(lessons_data)
+        )
+        return course
+
+    @transaction.atomic
+    def update(self, instance, validated_data):
+        lessons_data = validated_data.pop("lessons", None)
+
+        update_fields = []
+        if "title" in validated_data:
+            instance.title = validated_data["title"]
+            update_fields.extend(["title", "updated_at"])
+
+        if lessons_data is not None:
+            instance.lessons.all().delete()
+            KnowledgeBaseLesson.objects.bulk_create(
+                KnowledgeBaseLesson(course=instance, order=index, **lesson_data)
+                for index, lesson_data in enumerate(lessons_data)
+            )
+            if "updated_at" not in update_fields:
+                update_fields.append("updated_at")
+
+        if update_fields:
+            instance.save(update_fields=update_fields)
+        return instance
 
 
 # ===========================

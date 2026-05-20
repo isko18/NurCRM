@@ -43,6 +43,7 @@ from apps.main.models import (
     SaleItem,
     SupplierReceipt,
     SupplierReceiptItem,
+    KnowledgeBaseCourse,
 )
 from apps.main.serializers import (
     ContactSerializer, PipelineSerializer, DealSerializer, TaskSerializer,
@@ -64,6 +65,7 @@ from apps.main.serializers import (
     MarketSaleEmployeePayProfileSerializer,
     SupplierReceiptCreateSerializer,
     SupplierReceiptReadSerializer,
+    PublicKnowledgeBaseCourseSerializer,
 )
 from django.db.models import ProtectedError
 from apps.utils import product_images_prefetch, _is_owner_like
@@ -98,6 +100,26 @@ def _calc_markup(purchase_price: Decimal, price: Decimal) -> Decimal:
     # ВАЖНО: наценка хранится точнее (4 знака), иначе при обратном пересчёте цены
     # (purchase_price + markup_percent) будут появляться «копейки» из-за округления процента.
     return mp.quantize(_Q4, rounding=ROUND_HALF_UP)
+
+
+class PublicKnowledgeBaseMixin:
+    permission_classes = [permissions.AllowAny]
+    serializer_class = PublicKnowledgeBaseCourseSerializer
+
+    def get_queryset(self):
+        return (
+            KnowledgeBaseCourse.objects
+            .all()
+            .prefetch_related("lessons")
+        )
+
+
+class PublicKnowledgeBaseCourseListCreateAPIView(PublicKnowledgeBaseMixin, generics.ListCreateAPIView):
+    ordering = ["-created_at"]
+
+
+class PublicKnowledgeBaseCourseRetrieveAPIView(PublicKnowledgeBaseMixin, generics.RetrieveUpdateAPIView):
+    lookup_url_kwarg = "course_id"
 
 class AgentCartLockMixin:
     """

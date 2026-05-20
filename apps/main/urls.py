@@ -291,6 +291,9 @@ urlpatterns = [
     path("public/companies/<slug:slug>/", PublicCompanyAPIView.as_view()),
     path("public/companies/<slug:slug>/showcase/", PublicCompanyShowcaseAPIView.as_view()),
     path("public/companies/<slug:slug>/showcase/<uuid:product_id>/", PublicCompanyProductDetailAPIView.as_view()),
+    
+    path("public/knowledge-base/", PublicKnowledgeBaseCourseListCreateAPIView.as_view()),
+    path("public/knowledge-base/<uuid:course_id>/", PublicKnowledgeBaseCourseRetrieveAPIView.as_view()),
 
 ]
 

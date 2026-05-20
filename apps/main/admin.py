@@ -33,6 +33,7 @@ from .models import (
     ManufactureSubreal, Acceptance, ReturnFromAgent,
     # Промо и агентские заявки
     PromoRule, AgentRequestCart, AgentRequestItem, AgentSaleAllocation,
+    KnowledgeBaseCourse, KnowledgeBaseLesson,
 )
 
 admin.site.site_header = "nurCRM Admin"
@@ -152,6 +153,31 @@ class OrderItemInline(admin.TabularInline):
     autocomplete_fields = ("product",)
     fields = ("product", "quantity", "price", "total")
     readonly_fields = ("price", "total")
+
+
+class KnowledgeBaseLessonInline(admin.TabularInline):
+    model = KnowledgeBaseLesson
+    extra = 0
+    fields = ("title", "description", "url", "order")
+
+
+@admin.register(KnowledgeBaseCourse)
+class KnowledgeBaseCourseAdmin(admin.ModelAdmin):
+    list_display = ("title", "created_at", "updated_at")
+    list_filter = ("created_at",)
+    search_fields = ("title", "lessons__title")
+    readonly_fields = ("created_at", "updated_at")
+    inlines = [KnowledgeBaseLessonInline]
+
+
+@admin.register(KnowledgeBaseLesson)
+class KnowledgeBaseLessonAdmin(admin.ModelAdmin):
+    list_display = ("title", "course", "order", "created_at")
+    list_filter = ("created_at",)
+    search_fields = ("title", "description", "course__title")
+    list_select_related = ("course",)
+    autocomplete_fields = ("course",)
+    readonly_fields = ("created_at", "updated_at")
 
 # ========= Базовые справочники / деревья =========
 @admin.register(GlobalBrand)
