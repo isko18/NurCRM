@@ -13,7 +13,6 @@ from django.utils import timezone
 from rest_framework import serializers
 from rest_framework_simplejwt.serializers import TokenObtainPairSerializer
 
-from apps.construction.models import Cashbox
 from apps.users.models import (
     User, Company, Roles, Industry, SubscriptionPlan,
     Feature, Sector, CustomRole, Branch, BranchMembership
@@ -404,8 +403,9 @@ class OwnerRegisterSerializer(serializers.ModelSerializer):
         user.company = company
         user.save(update_fields=["company"])
 
-        if industry and (industry.name or "").lower() == "строительная компания":
-            Cashbox.objects.create(company=company)
+        # ВНИМАНИЕ: «Основная касса компании» создаётся сигналом
+        # apps/construction/signals.py::create_cashbox_for_company.
+        # Здесь дублирующее создание убрано, чтобы не плодить пустые кассы.
 
         return user
 

@@ -389,9 +389,14 @@ class CompanyBranchRestrictedMixin:
             company_field="cart__company"
             branch_field="cart__branch"
 
-        НОВАЯ ЛОГИКА:
-            - если branch определён → фильтруем по этому branch;
-            - если branch is None → показываем только записи с branch IS NULL.
+        Логика выборки (унифицирована с другими модулями: cafe/barber/warehouse,
+        а также с `_restrict_pk_queryset_strict` в serializers.py):
+            - если branch определён → показываем записи этого филиала
+              И глобальные записи без филиала (Q(branch=branch) | Q(branch__isnull=True));
+            - если branch is None → не фильтруем по branch вообще (вся компания).
+
+        Так старые аккаунты (где все данные с branch=NULL) продолжают видеть всё,
+        а новые аккаунты с филиалами не теряют видимость глобальных записей.
         """
 
         company = self._company()
@@ -408,16 +413,15 @@ class CompanyBranchRestrictedMixin:
         # branch
         if branch_field:
             if branch is not None:
-                # есть активный филиал → только он
-                qs = qs.filter(**{branch_field: branch})
-            else:
-                # филиал не выбран → только глобальные записи без филиала
-                qs = qs.filter(**{f"{branch_field}__isnull": True})
+                qs = qs.filter(
+                    Q(**{branch_field: branch})
+                    | Q(**{f"{branch_field}__isnull": True})
+                )
+            # branch is None → не фильтруем по branch
         elif self._model_has_field(model, "branch"):
             if branch is not None:
-                qs = qs.filter(branch=branch)
-            else:
-                qs = qs.filter(branch__isnull=True)
+                qs = qs.filter(Q(branch=branch) | Q(branch__isnull=True))
+            # branch is None → не фильтруем по branch
 
         return qs
 
@@ -617,6 +621,18 @@ def _annotate_product_is_favorite(qs):
     )
 
 
+def _filter_products_company_only(view, qs):
+    """
+    Products in main are company-level catalog items.
+    Do not restrict them by branch, otherwise products with branch_id disappear
+    for users whose active branch differs from the product branch.
+    """
+    company = view._company()
+    if company is not None:
+        qs = qs.filter(company=company)
+    return qs
+
+
 # ===========================
 #  Product create by barcode (ручной view)
 # ===========================
@@ -646,7 +662,7 @@ class ProductListView(CompanyBranchRestrictedMixin, generics.ListAPIView):
                 product_images_prefetch,
             )
         )
-        qs = self._filter_qs_company_branch(qs)
+        qs = _filter_products_company_only(self, qs)
         return _annotate_product_is_favorite(qs)
 
     def filter_queryset(self, queryset):
@@ -679,9 +695,6 @@ class ProductListView(CompanyBranchRestrictedMixin, generics.ListAPIView):
                         type=Client.StatusClient.SUPPLIERS,
                         id__in=parsed_ids,
                     )
-                    branch = self._auto_branch()
-                    if branch is not None:
-                        supplier_qs = supplier_qs.filter(branch__in=[None, branch])
                     allowed = list(supplier_qs.values_list("id", flat=True))
                     qs = qs.filter(client_id__in=allowed) if allowed else qs.none()
 
@@ -735,7 +748,7 @@ class ProductCompactListView(CompanyBranchRestrictedMixin, generics.ListAPIView)
                 ),
             )
         )
-        qs = self._filter_qs_company_branch(qs)
+        qs = _filter_products_company_only(self, qs)
         return _annotate_product_is_favorite(qs)
 
     def filter_queryset(self, queryset):
@@ -760,7 +773,7 @@ class ProductCreateByBarcodeAPIView(CompanyBranchRestrictedMixin, generics.Creat
     @transaction.atomic
     def create(self, request, *args, **kwargs):
         company = self._company()
-        branch = self._auto_branch()
+        branch = None
         data = request.data
 
         barcode = (data.get("barcode") or "").strip()
@@ -1023,7 +1036,7 @@ class ProductFavoriteAPIView(CompanyBranchRestrictedMixin, APIView):
     @transaction.atomic
     def post(self, request, product_id, *args, **kwargs):
         product = get_object_or_404(
-            self._filter_qs_company_branch(Product.objects.all()),
+            _filter_products_company_only(self, Product.objects.all()),
             id=product_id,
         )
 
@@ -1132,7 +1145,7 @@ class ProductCreateManualAPIView(CompanyBranchRestrictedMixin, generics.CreateAP
     @transaction.atomic
     def create(self, request, *args, **kwargs):
         company = self._company()
-        branch = self._auto_branch()
+        branch = None
         data = request.data
 
         name = (data.get("name") or "").strip()
@@ -1553,7 +1566,9 @@ class ProductRetrieveUpdateDestroyAPIView(CompanyBranchRestrictedMixin, generics
     )
 
     def get_queryset(self):
-        return _annotate_product_is_favorite(super().get_queryset())
+        return _annotate_product_is_favorite(
+            _filter_products_company_only(self, self.queryset.all())
+        )
 
     @transaction.atomic
     def update(self, request, *args, **kwargs):
@@ -1738,7 +1753,7 @@ class ProductBulkDeleteAPIView(CompanyBranchRestrictedMixin, APIView):
         require_all = serializer.validated_data["require_all"]
 
         # в рамках компании и текущего филиала/глобальных
-        qs = self._filter_qs_company_branch(Product.objects.all()).filter(id__in=ids)
+        qs = _filter_products_company_only(self, Product.objects.all()).filter(id__in=ids)
         found_map = {p.id: p for p in qs}
         not_found = [str(id_) for id_ in ids if id_ not in found_map]
 
@@ -1806,7 +1821,7 @@ class ProductByBarcodeAPIView(CompanyBranchRestrictedMixin, generics.RetrieveAPI
             )
             .all()
         )
-        return _annotate_product_is_favorite(self._filter_qs_company_branch(qs))
+        return _annotate_product_is_favorite(_filter_products_company_only(self, qs))
 
     def get_object(self):
         from rest_framework.exceptions import NotFound

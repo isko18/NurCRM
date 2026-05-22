@@ -105,9 +105,8 @@ def build_owner_analytics_payload(*, company, branch, period, date_from, date_to
         created_at__lt=dt_to_excl,
     )
     if branch is not None:
-        sub_qs = sub_qs.filter(branch=branch)
-    else:
-        sub_qs = sub_qs.filter(branch__isnull=True)
+        sub_qs = sub_qs.filter(Q(branch=branch) | Q(branch__isnull=True))
+    # branch is None → видим всю компанию (без фильтра по branch)
 
     transfers_count = sub_qs.count()
     items_transferred = sub_qs.aggregate(
@@ -166,9 +165,10 @@ def build_owner_analytics_payload(*, company, branch, period, date_from, date_to
         accepted_at__lt=dt_to_excl,
     )
     if branch is not None:
-        acc_qs = acc_qs.filter(subreal__branch=branch)
-    else:
-        acc_qs = acc_qs.filter(subreal__branch__isnull=True)
+        acc_qs = acc_qs.filter(
+            Q(subreal__branch=branch) | Q(subreal__branch__isnull=True)
+        )
+    # branch is None → видим всю компанию
 
     acceptances_count = acc_qs.count()
 
@@ -182,9 +182,8 @@ def build_owner_analytics_payload(*, company, branch, period, date_from, date_to
         returned_at__lt=dt_to_excl,
     )
     if branch is not None:
-        returns_qs = returns_qs.filter(branch=branch)
-    else:
-        returns_qs = returns_qs.filter(branch__isnull=True)
+        returns_qs = returns_qs.filter(Q(branch=branch) | Q(branch__isnull=True))
+    # branch is None → видим всю компанию
 
     defective_items_qty = returns_qs.aggregate(s=Coalesce(Sum("qty"), V(0)))["s"] or 0
 
@@ -198,9 +197,8 @@ def build_owner_analytics_payload(*, company, branch, period, date_from, date_to
         created_at__lt=dt_to_excl,
     )
     if branch is not None:
-        sales_qs = sales_qs.filter(branch=branch)
-    else:
-        sales_qs = sales_qs.filter(branch__isnull=True)
+        sales_qs = sales_qs.filter(Q(branch=branch) | Q(branch__isnull=True))
+    # branch is None → видим всю компанию
 
     sales_count = sales_qs.count()
 
@@ -375,11 +373,9 @@ def build_owner_analytics_payload(*, company, branch, period, date_from, date_to
     # ======================================================
     products_qs = Product.objects.filter(company=company).exclude(kind=Product.Kind.SERVICE)
     if branch is not None:
-        # важно: как в ProductListView через CompanyBranchRestrictedMixin
-        # при выбранном филиале берём ТОЛЬКО его записи (без branch=NULL)
-        products_qs = products_qs.filter(branch=branch)
-    else:
-        products_qs = products_qs.filter(branch__isnull=True)
+        # унифицировано с CompanyBranchRestrictedMixin: филиал + глобальные товары
+        products_qs = products_qs.filter(Q(branch=branch) | Q(branch__isnull=True))
+    # branch is None → видим всю компанию
     stock_value_dec = (
         products_qs.aggregate(
             v=Coalesce(
@@ -412,10 +408,9 @@ def build_owner_analytics_payload(*, company, branch, period, date_from, date_to
     # Стоимость сырья: sum(quantity * price) по ItemMake
     item_make_qs = ItemMake.objects.filter(company=company)
     if branch is not None:
-        # важно: как в ItemListCreateAPIView через CompanyBranchRestrictedMixin
-        item_make_qs = item_make_qs.filter(branch=branch)
-    else:
-        item_make_qs = item_make_qs.filter(branch__isnull=True)
+        # унифицировано с CompanyBranchRestrictedMixin
+        item_make_qs = item_make_qs.filter(Q(branch=branch) | Q(branch__isnull=True))
+    # branch is None → видим всю компанию
 
     raw_material_value_dec = (
         item_make_qs.aggregate(
@@ -437,10 +432,8 @@ def build_owner_analytics_payload(*, company, branch, period, date_from, date_to
     # ======================================================
     deals_qs = ClientDeal.objects.filter(company=company, kind=ClientDeal.Kind.DEBT)
     if branch is not None:
-        # В других метриках (например, stock_value) включают и филиальные, и глобальные записи.
         deals_qs = deals_qs.filter(Q(branch=branch) | Q(branch__isnull=True))
-    else:
-        deals_qs = deals_qs.filter(branch__isnull=True)
+    # branch is None → видим всю компанию
 
     paid_subq = (
         DealInstallment.objects.filter(deal_id=OuterRef("pk"))
@@ -460,8 +453,7 @@ def build_owner_analytics_payload(*, company, branch, period, date_from, date_to
     sales_debt_qs = Sale.objects.filter(company=company, status=Sale.Status.DEBT)
     if branch is not None:
         sales_debt_qs = sales_debt_qs.filter(Q(branch=branch) | Q(branch__isnull=True))
-    else:
-        sales_debt_qs = sales_debt_qs.filter(branch__isnull=True)
+    # branch is None → видим всю компанию
 
     # Важно: чтобы не было двойного учёта одной и той же задолженности,
     # исключаем POS-долги по клиентам, у которых уже есть активная рассрочка (ClientDeal.Kind.DEBT) с остатком > 0.
@@ -493,9 +485,8 @@ def build_owner_analytics_payload(*, company, branch, period, date_from, date_to
             Q(type=WarehouseCounterparty.Type.SUPPLIER) | Q(type=WarehouseCounterparty.Type.BOTH)
         )
         if branch is not None:
-            cp_qs = cp_qs.filter(branch=branch)
-        else:
-            cp_qs = cp_qs.filter(branch__isnull=True)
+            cp_qs = cp_qs.filter(Q(branch=branch) | Q(branch__isnull=True))
+        # branch is None → видим всю компанию
 
         # товарные документы (проведённые) с контрагентом
         trade_doc_types = (
@@ -514,9 +505,11 @@ def build_owner_analytics_payload(*, company, branch, period, date_from, date_to
             warehouse_from__company=company,
         )
         if branch is not None:
-            docs_qs = docs_qs.filter(warehouse_from__branch=branch)
-        else:
-            docs_qs = docs_qs.filter(warehouse_from__branch__isnull=True)
+            docs_qs = docs_qs.filter(
+                Q(warehouse_from__branch=branch)
+                | Q(warehouse_from__branch__isnull=True)
+            )
+        # branch is None → видим всю компанию
 
         docs_agg = docs_qs.aggregate(
             doc_debit=Coalesce(Sum("total", filter=Q(doc_type__in=doc_debit_types)), ZERO_MONEY),
@@ -535,9 +528,8 @@ def build_owner_analytics_payload(*, company, branch, period, date_from, date_to
             ),
         )
         if branch is not None:
-            money_qs = money_qs.filter(branch=branch)
-        else:
-            money_qs = money_qs.filter(branch__isnull=True)
+            money_qs = money_qs.filter(Q(branch=branch) | Q(branch__isnull=True))
+        # branch is None → видим всю компанию
 
         money_agg = money_qs.aggregate(
             m_rec=Coalesce(Sum("amount", filter=Q(doc_type=WarehouseMoneyDocument.DocType.MONEY_RECEIPT)), ZERO_MONEY),
@@ -561,8 +553,7 @@ def build_owner_analytics_payload(*, company, branch, period, date_from, date_to
     )
     if branch is not None:
         supplier_deals_qs = supplier_deals_qs.filter(Q(branch=branch) | Q(branch__isnull=True))
-    else:
-        supplier_deals_qs = supplier_deals_qs.filter(branch__isnull=True)
+    # branch is None → видим всю компанию
 
     supplier_paid_subq = (
         DealInstallment.objects.filter(deal_id=OuterRef("pk"))
@@ -630,8 +621,7 @@ def build_owner_analytics_payload(*, company, branch, period, date_from, date_to
     )
     if branch is not None:
         cfqs = cfqs.filter(Q(branch=branch) | Q(branch__isnull=True))
-    else:
-        cfqs = cfqs.filter(branch__isnull=True)
+    # branch is None → видим всю компанию
     expense_breakdown_qs = (
         cfqs.values("name")
         .annotate(

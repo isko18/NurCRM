@@ -147,11 +147,10 @@ def _compute_agent_on_hand(*, company, branch, agent) -> dict:
         .order_by("product_id", "-created_at")
     )
 
-    # ВАЖНО: та же логика, что и в миксине
+    # унифицировано с CompanyBranchRestrictedMixin
     if branch is not None:
-        base = base.filter(branch=branch)
-    else:
-        base = base.filter(branch__isnull=True)
+        base = base.filter(Q(branch=branch) | Q(branch__isnull=True))
+    # branch is None → видим всю компанию
 
     total_qty = 0
     total_amount = Decimal("0.00")
@@ -236,9 +235,8 @@ def build_agent_analytics_payload(
         created_at__range=(dt_from, dt_to),
     )
     if branch is not None:
-        sub_qs = sub_qs.filter(branch=branch)
-    else:
-        sub_qs = sub_qs.filter(branch__isnull=True)
+        sub_qs = sub_qs.filter(Q(branch=branch) | Q(branch__isnull=True))
+    # branch is None → видим всю компанию
 
     transfers_count = sub_qs.count()
     items_transferred = sub_qs.aggregate(
@@ -254,9 +252,10 @@ def build_agent_analytics_payload(
         accepted_at__range=(dt_from, dt_to),
     )
     if branch is not None:
-        acc_qs = acc_qs.filter(subreal__branch=branch)
-    else:
-        acc_qs = acc_qs.filter(subreal__branch__isnull=True)
+        acc_qs = acc_qs.filter(
+            Q(subreal__branch=branch) | Q(subreal__branch__isnull=True)
+        )
+    # branch is None → видим всю компанию
 
     acceptances_count = acc_qs.count()
 
@@ -270,9 +269,8 @@ def build_agent_analytics_payload(
         returned_at__range=(dt_from, dt_to),
     )
     if branch is not None:
-        returns_qs = returns_qs.filter(branch=branch)
-    else:
-        returns_qs = returns_qs.filter(branch__isnull=True)
+        returns_qs = returns_qs.filter(Q(branch=branch) | Q(branch__isnull=True))
+    # branch is None → видим всю компанию
     defective_items_qty = returns_qs.aggregate(s=Coalesce(Sum("qty"), V(0)))["s"] or 0
 
     # ======================================================
@@ -285,9 +283,8 @@ def build_agent_analytics_payload(
         status=Sale.Status.PAID,  # только оплаченные
     )
     if branch is not None:
-        sales_qs = sales_qs.filter(branch=branch)
-    else:
-        sales_qs = sales_qs.filter(branch__isnull=True)
+        sales_qs = sales_qs.filter(Q(branch=branch) | Q(branch__isnull=True))
+    # branch is None → видим всю компанию
 
     sales_count = sales_qs.count()
 
@@ -401,16 +398,14 @@ def build_agent_analytics_payload(
     # Клиенты агента: Client.salesperson = agent
     clients_qs = Client.objects.filter(company=company, salesperson=agent)
     if branch is not None:
-        clients_qs = clients_qs.filter(branch=branch)
-    else:
-        clients_qs = clients_qs.filter(branch__isnull=True)
+        clients_qs = clients_qs.filter(Q(branch=branch) | Q(branch__isnull=True))
+    # branch is None → видим всю компанию
 
     # Долги по рассрочкам/сделкам (ClientDeal.Kind.DEBT): остаток = (amount-prepayment) - sum(paid_installments)
     deals_qs = ClientDeal.objects.filter(company=company, kind=ClientDeal.Kind.DEBT, client__in=clients_qs)
     if branch is not None:
-        deals_qs = deals_qs.filter(branch=branch)
-    else:
-        deals_qs = deals_qs.filter(branch__isnull=True)
+        deals_qs = deals_qs.filter(Q(branch=branch) | Q(branch__isnull=True))
+    # branch is None → видим всю компанию
 
     paid_subq = (
         DealInstallment.objects.filter(deal_id=OuterRef("pk"))
@@ -429,9 +424,8 @@ def build_agent_analytics_payload(
     # Долги по продажам POS агента со статусом DEBT (не оплачены)
     sales_debt_qs = Sale.objects.filter(company=company, user=agent, status=Sale.Status.DEBT)
     if branch is not None:
-        sales_debt_qs = sales_debt_qs.filter(branch=branch)
-    else:
-        sales_debt_qs = sales_debt_qs.filter(branch__isnull=True)
+        sales_debt_qs = sales_debt_qs.filter(Q(branch=branch) | Q(branch__isnull=True))
+    # branch is None → видим всю компанию
     pos_sales_debt_dec = sales_debt_qs.aggregate(s=Coalesce(Sum("total"), ZERO_MONEY))["s"] or Decimal("0.00")
 
     accounts_receivable_dec = (deals_remaining_dec or Decimal("0.00")) + (pos_sales_debt_dec or Decimal("0.00"))

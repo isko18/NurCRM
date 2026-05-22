@@ -1387,7 +1387,7 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
         supplier_ids = validated_data.pop("supplier_ids", None)
 
         company = self._user_company()
-        branch = self._auto_branch()
+        branch = None
 
         client = validated_data.pop("client", None)
         brand_name = (validated_data.pop("brand_name", "") or "").strip()
@@ -1514,7 +1514,7 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
     @transaction.atomic
     def update(self, instance, validated_data):
         company = self._user_company()
-        branch = self._auto_branch()
+        branch = None
 
         packages_data = validated_data.pop("packages_input", None)
         supplier_ids = validated_data.pop("supplier_ids", None)
@@ -1547,7 +1547,7 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
         if item_make_data is not None:
             instance.item_make.set(item_make_data)
 
-        # если у тебя бизнес-логика такая — оставляем:
+        # Products in main are company-level catalog items; keep them visible company-wide.
         instance.branch = branch
 
         # ===== цены: двусторонняя логика =====
