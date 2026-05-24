@@ -1399,6 +1399,10 @@ class Document(models.Model):
 
     def clean(self):
         from django.core.exceptions import ValidationError
+        from .utils import normalize_payment_kind
+
+        if self.payment_kind:
+            self.payment_kind = normalize_payment_kind(self.payment_kind)
 
         prepayment = Decimal(getattr(self, "prepayment_amount", None) or 0)
         if prepayment < 0:

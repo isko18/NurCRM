@@ -190,6 +190,79 @@ class DocumentsTests(TestCase):
         money_doc.refresh_from_db()
         self.assertEqual(money_doc.status, models.MoneyDocument.Status.DRAFT)
 
+    def test_debt_alias_payment_kind_posts_as_credit_without_cash(self):
+        """payment_kind=debt (как в POS) должен проводиться как credit — без кассы."""
+        models.StockBalance.objects.create(warehouse=self.wh, product=self.prod, qty=Decimal("10.000"))
+        cp = models.Counterparty.objects.create(
+            name="C1",
+            phone="+996700000005",
+            type=models.Counterparty.Type.CLIENT,
+            company=self.company,
+            branch=self.branch,
+        )
+        doc = models.Document.objects.create(
+            doc_type=models.Document.DocType.SALE,
+            warehouse_from=self.wh,
+            counterparty=cp,
+            payment_kind="debt",
+        )
+        models.DocumentItem.objects.create(document=doc, product=self.prod, qty=Decimal("2"), price=Decimal("15"))
+        doc.clean()
+        doc.save(update_fields=["payment_kind"])
+
+        self.assertEqual(doc.payment_kind, models.Document.PaymentKind.CREDIT)
+        services.post_document(doc)
+        doc.refresh_from_db()
+        self.assertEqual(doc.status, models.Document.Status.POSTED)
+        with self.assertRaises(models.CashApprovalRequest.DoesNotExist):
+            _ = doc.cash_request
+
+    def test_post_endpoint_accepts_payment_kind_credit_in_body(self):
+        """При проведении можно передать payment_kind=credit/debt в теле POST /post/."""
+        models.StockBalance.objects.create(warehouse=self.wh, product=self.prod, qty=Decimal("10.000"))
+        cp = models.Counterparty.objects.create(
+            name="C1",
+            phone="+996700000006",
+            type=models.Counterparty.Type.CLIENT,
+            company=self.company,
+            branch=self.branch,
+        )
+        doc = models.Document.objects.create(
+            doc_type=models.Document.DocType.SALE,
+            warehouse_from=self.wh,
+            counterparty=cp,
+        )
+        models.DocumentItem.objects.create(document=doc, product=self.prod, qty=Decimal("1"), price=Decimal("20.00"))
+        services.recalc_document_totals(doc)
+
+        from apps.warehouse.utils import normalize_payment_kind
+
+        doc.payment_kind = normalize_payment_kind("debt")
+        doc.clean()
+        doc.save(update_fields=["payment_kind"])
+        services.post_document(doc)
+        doc.refresh_from_db()
+        self.assertEqual(doc.payment_kind, models.Document.PaymentKind.CREDIT)
+        self.assertEqual(doc.status, models.Document.Status.POSTED)
+
+        from apps.warehouse import services_money
+
+        analytics = services_money.bulk_counterparty_mini_analytics(
+            type(
+                "M",
+                (),
+                {
+                    "_filter_qs_company_branch": staticmethod(
+                        lambda qs, company_field=None, branch_field=None: qs
+                    ),
+                    "request": None,
+                },
+            )(),
+            [cp.id],
+        )[cp.id]
+        self.assertEqual(analytics["debts"]["balance"], "20.00")
+        self.assertEqual(analytics["debts"]["counterparty_owes_company"], "20.00")
+
     def test_transfer_creates_two_moves(self):
         wh2 = models.Warehouse.objects.create(name="W2", company=self.company, branch=self.branch, location="loc2")
         doc = models.Document.objects.create(doc_type=models.Document.DocType.TRANSFER, warehouse_from=self.wh, warehouse_to=wh2)

@@ -9,7 +9,7 @@ from django.core.files.base import ContentFile
 from rest_framework import serializers
 
 from apps.warehouse import models as m
-from apps.warehouse.utils import _active_branch, _restrict_pk_queryset_strict
+from apps.warehouse.utils import _active_branch, _restrict_pk_queryset_strict, normalize_payment_kind
 
 
 class CompanyBranchReadOnlyMixin:
@@ -764,11 +764,20 @@ class AgentRequestCartCreateSaleSerializer(serializers.Serializer):
     counterparty = serializers.PrimaryKeyRelatedField(queryset=m.Counterparty.objects.all())
     post = serializers.BooleanField(required=False, default=False)
     is_sale_request = serializers.BooleanField(required=False, default=False)
-    payment_kind = serializers.ChoiceField(choices=m.Document.PaymentKind.choices, required=False)
+    payment_kind = serializers.CharField(required=False, allow_null=True, allow_blank=True)
     prepayment_amount = serializers.DecimalField(max_digits=18, decimal_places=2, required=False, default=Decimal("0.00"))
     discount_percent = serializers.DecimalField(max_digits=5, decimal_places=2, required=False, default=Decimal("0.00"))
     discount_amount = serializers.DecimalField(max_digits=18, decimal_places=2, required=False, default=Decimal("0.00"))
     comment = serializers.CharField(required=False, allow_blank=True, allow_null=True)
+
+    def validate_payment_kind(self, value):
+        if value in (None, ""):
+            return None
+        normalized = normalize_payment_kind(value)
+        allowed = {choice for choice, _label in m.Document.PaymentKind.choices}
+        if normalized not in allowed:
+            raise serializers.ValidationError("Укажите cash, credit (или debt) либо external.")
+        return normalized
 
 
 class AgentStockBalanceSerializer(serializers.ModelSerializer):

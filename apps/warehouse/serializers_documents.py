@@ -7,8 +7,22 @@ from apps.users.models import Company
 from . import models
 from . import services as warehouse_services
 from .serializers import WarehouseProductCharacteristicsSerializer
+from .utils import normalize_payment_kind
 
 User = get_user_model()
+
+
+class PaymentKindField(serializers.CharField):
+    """Принимает credit/debt/cash и нормализует к Document.PaymentKind."""
+
+    def to_internal_value(self, data):
+        if data is None or data == "":
+            return None
+        normalized = normalize_payment_kind(data)
+        allowed = {choice for choice, _label in models.Document.PaymentKind.choices}
+        if normalized not in allowed:
+            raise serializers.ValidationError("Укажите cash, credit (или debt) либо external.")
+        return normalized
 
 
 def _merge_product_discount_into_item(item_data: dict) -> dict:
@@ -150,6 +164,7 @@ class DocumentSerializer(serializers.ModelSerializer):
     moves = StockMoveSerializer(many=True, read_only=True)
     receipts = serializers.SerializerMethodField()
     expenses = serializers.SerializerMethodField()
+    payment_kind = PaymentKindField(required=False, allow_null=True, allow_blank=True)
 
     money_document_id = serializers.SerializerMethodField()
     money_document_number = serializers.SerializerMethodField()

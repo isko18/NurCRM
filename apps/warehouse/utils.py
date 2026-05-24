@@ -1,6 +1,30 @@
 from rest_framework import serializers
 
 
+def normalize_payment_kind(value):
+    """
+    Приводит способ оплаты к значениям Document.PaymentKind.
+    Фронт/POS может прислать debt вместо credit.
+    """
+    if value is None or value == "":
+        return None
+    raw = str(value).strip().lower().replace("-", "_")
+    if raw in ("credit", "debt", "v_dolg", "v_dolgu", "dolg", "в_долг", "вдолг"):
+        return "credit"
+    if raw in ("cash", "nal", "nalichnye", "наличные", "нал"):
+        return "cash"
+    if raw == "external":
+        return "external"
+    return str(value).strip()
+
+
+def effective_payment_kind(value, *, default="cash"):
+    normalized = normalize_payment_kind(value)
+    if normalized is None:
+        return default
+    return normalized
+
+
 def _active_branch(serializer: serializers.Serializer):
     """
     Активный филиал:

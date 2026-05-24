@@ -90,6 +90,7 @@ def bulk_counterparty_mini_analytics(mixin, counterparty_ids) -> dict:
     doc_debit_types = (Doc.DocType.SALE, Doc.DocType.PURCHASE_RETURN)
     doc_credit_types = (Doc.DocType.PURCHASE, Doc.DocType.SALE_RETURN)
     credit = Doc.PaymentKind.CREDIT
+    credit_kinds = (credit, "debt")
 
     out = {cid: empty_counterparty_mini_analytics() for cid in ids}
 
@@ -104,8 +105,8 @@ def bulk_counterparty_mini_analytics(mixin, counterparty_ids) -> dict:
     for row in sales_qs.values("counterparty_id").annotate(
         sales_total=Coalesce(Sum("total"), zero_money),
         sales_count=Count("id"),
-        sales_cash_total=Coalesce(Sum("total", filter=~Q(payment_kind=credit)), zero_money),
-        sales_credit_total=Coalesce(Sum("total", filter=Q(payment_kind=credit)), zero_money),
+        sales_cash_total=Coalesce(Sum("total", filter=~Q(payment_kind__in=credit_kinds)), zero_money),
+        sales_credit_total=Coalesce(Sum("total", filter=Q(payment_kind__in=credit_kinds)), zero_money),
         pending_cash_count=Count("id", filter=Q(status=Doc.Status.CASH_PENDING)),
         pending_cash_total=Coalesce(Sum("total", filter=Q(status=Doc.Status.CASH_PENDING)), zero_money),
     ):

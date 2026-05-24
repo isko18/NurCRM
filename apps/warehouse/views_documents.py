@@ -8,6 +8,7 @@ from django_filters.rest_framework import DjangoFilterBackend
 
 from . import models, serializers_documents, services, services_money
 from rest_framework.exceptions import ValidationError as DRFValidationError
+from django.core.exceptions import ValidationError as DjangoValidationError
 from .views import CompanyBranchRestrictedMixin, filter_qs_company_branch_or_global
 from apps.utils import _is_owner_like
 
@@ -246,7 +247,34 @@ class DocumentPostView(CompanyBranchRestrictedMixin, generics.GenericAPIView):
 
     def post(self, request, pk=None):
         doc = self.get_object()
+        if doc.status not in (doc.Status.DRAFT, doc.Status.SALE_REQUEST):
+            return Response(
+                {"detail": "Провести можно только черновик или заявку на продажу."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
         try:
+            from decimal import Decimal, InvalidOperation
+            from .utils import normalize_payment_kind
+
+            update_fields = []
+            if "payment_kind" in request.data:
+                doc.payment_kind = normalize_payment_kind(request.data.get("payment_kind"))
+                update_fields.append("payment_kind")
+            if "prepayment_amount" in request.data:
+                try:
+                    doc.prepayment_amount = Decimal(str(request.data.get("prepayment_amount") or "0")).quantize(
+                        Decimal("0.01")
+                    )
+                except (InvalidOperation, TypeError, ValueError):
+                    return Response({"prepayment_amount": "Некорректная сумма предоплаты."}, status=status.HTTP_400_BAD_REQUEST)
+                update_fields.append("prepayment_amount")
+            if update_fields:
+                try:
+                    doc.clean()
+                except DjangoValidationError as exc:
+                    raise DRFValidationError(getattr(exc, "message_dict", {"detail": str(exc)}))
+                doc.save(update_fields=update_fields)
+
             # Позволяем передать allow_negative в теле запроса для обхода проверки остатков
             allow_negative = request.data.get('allow_negative', False)
             if isinstance(allow_negative, str):
@@ -254,6 +282,7 @@ class DocumentPostView(CompanyBranchRestrictedMixin, generics.GenericAPIView):
             services.post_document(doc, allow_negative=allow_negative)
         except Exception as e:
             return Response({"detail": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+        doc.refresh_from_db()
         return Response(self.get_serializer(doc).data)
 
 

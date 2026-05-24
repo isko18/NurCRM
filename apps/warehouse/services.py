@@ -5,6 +5,7 @@ from django.conf import settings
 
 from . import models
 from .models import q_qty
+from .utils import effective_payment_kind
 
 
 def agent_has_common_access_to_warehouse(*, user, warehouse, company=None) -> bool:
@@ -153,7 +154,7 @@ def _create_or_reset_cash_request(document: models.Document):
     Денежный документ будет создан только на approve.
     """
     money_doc_type = _resolve_money_doc_type(document.doc_type)
-    payment_kind = document.payment_kind or models.Document.PaymentKind.CASH
+    payment_kind = effective_payment_kind(document.payment_kind)
     requires_money = (
         payment_kind == models.Document.PaymentKind.CASH
         and money_doc_type is not None
@@ -578,7 +579,7 @@ def post_document(document: models.Document, allow_negative: bool = None) -> mod
             if document.agent_id:
                 raise ValueError("Предоплата не поддерживается для документов агента.")
 
-            payment_kind = document.payment_kind or models.Document.PaymentKind.CASH
+            payment_kind = effective_payment_kind(document.payment_kind)
             if payment_kind != models.Document.PaymentKind.CREDIT:
                 raise ValueError("Предоплата возможна только при payment_kind=credit.")
 
@@ -659,7 +660,7 @@ def post_document(document: models.Document, allow_negative: bool = None) -> mod
         # Деньги создаём/подтверждаем только для payment_kind=cash.
         # Для credit (и для типов без денежного движения) документ сразу считается проведённым.
         money_doc_type = _resolve_money_doc_type(document.doc_type)
-        payment_kind = document.payment_kind or models.Document.PaymentKind.CASH
+        payment_kind = effective_payment_kind(document.payment_kind)
         requires_money = (
             payment_kind == models.Document.PaymentKind.CASH
             and money_doc_type is not None
