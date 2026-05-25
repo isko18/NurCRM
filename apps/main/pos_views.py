@@ -401,7 +401,24 @@ def _normalize_pos_request_data(data):
         out["is_new"] = out["isNew"]
     if "saleId" in out and "sale_id" not in out:
         out["sale_id"] = out["saleId"]
+    if "isWholesale" in out and "is_wholesale" not in out:
+        out["is_wholesale"] = out["isWholesale"]
+    if "orderDiscountTotal" in out and "order_discount_total" not in out:
+        out["order_discount_total"] = out["orderDiscountTotal"]
+    if "orderDiscountPercent" in out and "order_discount_percent" not in out:
+        out["order_discount_percent"] = out["orderDiscountPercent"]
     return out
+
+
+def _pos_body_has_explicit_field(request, *field_names):
+    """Поле реально передано в теле запроса (не дефолт сериализатора)."""
+    raw = _normalize_pos_request_data(getattr(request, "data", {}) or {})
+    if not hasattr(raw, "get"):
+        return False
+    for name in field_names:
+        if name in raw and raw.get(name) not in (None, "", "null"):
+            return True
+    return False
 
 
 def _shift_carts_base_qs(company, user, shift):
@@ -425,6 +442,32 @@ def _shift_active_carts_qs(company, user, shift):
 def _lock_shift_carts_qs(company, user, shift):
     """Блокировка open-корзин смены без annotate."""
     return _shift_carts_base_qs(company, user, shift).select_for_update().order_by("created_at")
+
+
+def _find_locked_shift_cart(*, company, user, shift, sale_id=None):
+    """Одна open-корзина под FOR UPDATE; без Count/annotate (PostgreSQL)."""
+    base = _lock_shift_carts_qs(company, user, shift)
+    if sale_id:
+        return base.filter(id=sale_id).first()
+    cart = base.filter(is_default=True).order_by("-updated_at").first()
+    if cart:
+        return cart
+    return base.order_by("-updated_at").first()
+
+
+def _get_pos_open_cart_for_cashier(*, company, user, cart_id):
+    """Open-корзина кассира по id (GET вкладки / переключение)."""
+    return (
+        Cart.objects.filter(
+            id=cart_id,
+            company=company,
+            status=Cart.Status.ACTIVE,
+            shift__status=CashShift.Status.OPEN,
+        )
+        .filter(Q(user=user) | Q(shift__cashier=user))
+        .select_related("shift")
+        .first()
+    )
 
 
 def _pos_cart_tab_label(cart, ordered_carts):
@@ -785,18 +828,10 @@ def _lookup_product_for_pos_scan(company_id, barcode: str, *, only_fields=POS_SC
 
 def _lock_pos_target_cart(*, company, user, shift, sale_id=None):
     """Блокировка одной open-корзины без annotate (PostgreSQL: FOR UPDATE + GROUP BY запрещён)."""
-    base = _lock_shift_carts_qs(company, user, shift)
-    if sale_id:
-        cart = base.filter(id=sale_id).first()
-        if not cart:
-            raise ValidationError({"sale_id": "Открытая корзина не найдена в этой смене."})
-        return cart
-
-    cart = base.filter(is_default=True).order_by("-updated_at").first()
-    if cart:
-        return cart
-    cart = base.order_by("-updated_at").first()
+    cart = _find_locked_shift_cart(company=company, user=user, shift=shift, sale_id=sale_id)
     if not cart:
+        if sale_id:
+            raise ValidationError({"sale_id": "Открытая корзина не найдена в этой смене."})
         raise ValidationError({"detail": "Нет открытых корзин в смене."})
     return cart
 
@@ -1797,12 +1832,16 @@ class SaleStartAPIView(MarketCashierOnlyMixin, CompanyBranchRestrictedMixin, API
         is_new = bool(opts.validated_data.get("is_new"))
         requested_sale_id = opts.validated_data.get("sale_id")
 
-        qs = _lock_shift_carts_qs(company, user, shift)
         cart = None
         created = False
 
         if requested_sale_id:
-            cart = qs.filter(id=requested_sale_id).first()
+            cart = _find_locked_shift_cart(
+                company=company,
+                user=user,
+                shift=shift,
+                sale_id=requested_sale_id,
+            )
             if not cart:
                 raise ValidationError({"sale_id": "Открытая корзина не найдена в этой смене."})
         elif is_new:
@@ -1822,7 +1861,7 @@ class SaleStartAPIView(MarketCashierOnlyMixin, CompanyBranchRestrictedMixin, API
             )
             created = True
         else:
-            cart = qs.filter(is_default=True).first() or qs.order_by("-updated_at").first()
+            cart = _find_locked_shift_cart(company=company, user=user, shift=shift)
             if cart is None:
                 cart = Cart.objects.create(
                     company=company,
@@ -1844,22 +1883,36 @@ class SaleStartAPIView(MarketCashierOnlyMixin, CompanyBranchRestrictedMixin, API
         # Сначала пересчитываем корзину, чтобы получить актуальный subtotal
         cart.recalc()
 
-        order_disc_total = opts.validated_data.get("order_discount_total")
-        order_disc_percent = opts.validated_data.get("order_discount_percent")
-
-        if order_disc_percent is not None:
-            cart.order_discount_percent = _q2(Decimal(str(order_disc_percent)))
-            cart.order_discount_total = Decimal("0.00")
-        else:
-            cart.order_discount_percent = None
-            cart.order_discount_total = _q2(order_disc_total or Decimal("0.00"))
-        update_f = ["order_discount_total", "order_discount_percent", "updated_at"]
+        update_f = []
         wholesale_changed = False
-        if is_wholesale_req is not None and getattr(cart, "is_wholesale", False) != bool(is_wholesale_req):
-            cart.is_wholesale = bool(is_wholesale_req)
-            update_f.append("is_wholesale")
-            wholesale_changed = True
-        cart.save(update_fields=update_f)
+
+        if _pos_body_has_explicit_field(
+            request,
+            "order_discount_total",
+            "orderDiscountTotal",
+            "order_discount_percent",
+            "orderDiscountPercent",
+        ):
+            order_disc_total = opts.validated_data.get("order_discount_total")
+            order_disc_percent = opts.validated_data.get("order_discount_percent")
+            if order_disc_percent is not None:
+                cart.order_discount_percent = _q2(Decimal(str(order_disc_percent)))
+                cart.order_discount_total = Decimal("0.00")
+            else:
+                cart.order_discount_percent = None
+                cart.order_discount_total = _q2(order_disc_total or Decimal("0.00"))
+            update_f.extend(["order_discount_total", "order_discount_percent"])
+
+        if _pos_body_has_explicit_field(request, "is_wholesale", "isWholesale"):
+            is_wholesale = bool(opts.validated_data.get("is_wholesale"))
+            if getattr(cart, "is_wholesale", False) != is_wholesale:
+                cart.is_wholesale = is_wholesale
+                update_f.append("is_wholesale")
+                wholesale_changed = True
+
+        if update_f:
+            update_f.append("updated_at")
+            cart.save(update_fields=update_f)
         # при старте или переключении режима — пересчитать цены уже добавленных товаров
         if created or wholesale_changed:
             _reprice_cart_items_for_mode(cart)
@@ -2626,6 +2679,18 @@ class SaleRetrieveAPIView(MarketCashierOnlyMixin, CompanyBranchRestrictedMixin, 
         if self.request.method in ("PUT", "PATCH"):
             return SaleStatusUpdateSerializer
         return SaleDetailSerializer
+
+    def retrieve(self, request, *args, **kwargs):
+        pk = kwargs.get(self.lookup_url_kwarg or self.lookup_field)
+        user = request.user
+        company = self._company() or user.company
+
+        cart = _get_pos_open_cart_for_cashier(company=company, user=user, cart_id=pk)
+        if cart:
+            cart = get_object_or_404(_cart_queryset_for_response(), id=cart.id, company=company)
+            return _pos_multi_cart_response(request, cart)
+
+        return super().retrieve(request, *args, **kwargs)
 
 
 class SaleBulkDeleteAPIView(MarketCashierOnlyMixin, CompanyBranchRestrictedMixin, APIView):
