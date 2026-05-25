@@ -51,6 +51,7 @@ from apps.main.models import (
 from apps.main.models import ManufactureSubreal, AgentSaleAllocation
 from apps.main.cache_utils import invalidate_cache_pattern
 from apps.main.services import checkout_cart, NotEnoughStock
+from apps.main.cart_service import abandon_cart
 from apps.ekassa.runtime import schedule_after_commit
 from apps.ekassa.shift_bridge import sync_ekassa_after_local_shift_open_by_id
 
@@ -470,6 +471,34 @@ def _get_pos_open_cart_for_cashier(*, company, user, cart_id):
         .select_related("shift")
         .first()
     )
+
+
+def _abandon_pos_open_cart(*, company, user, cart):
+    """Закрыть open-корзину (вкладку кассы) — status=abandoned, не DELETE Sale."""
+    shift = cart.shift
+    cart = (
+        Cart.objects.select_for_update()
+        .select_related("shift")
+        .get(id=cart.id, company=company, status=Cart.Status.ACTIVE)
+    )
+    siblings = list(_lock_shift_carts_qs(company, user, shift))
+    was_default = bool(cart.is_default)
+    remaining = [c for c in siblings if c.id != cart.id]
+
+    abandon_cart(cart=cart)
+
+    if was_default and remaining:
+        new_default = remaining[0]
+        Cart.objects.filter(id__in=[c.id for c in remaining]).update(
+            is_default=False,
+            updated_at=timezone.now(),
+        )
+        Cart.objects.filter(id=new_default.id).update(
+            is_default=True,
+            updated_at=timezone.now(),
+        )
+
+    return shift
 
 
 def _pos_cart_tab_label(cart, ordered_carts):
@@ -2698,6 +2727,32 @@ class SaleRetrieveAPIView(MarketCashierOnlyMixin, CompanyBranchRestrictedMixin, 
             return _pos_multi_cart_response(request, cart)
 
         return super().retrieve(request, *args, **kwargs)
+
+    @transaction.atomic
+    def destroy(self, request, *args, **kwargs):
+        pk = kwargs.get(self.lookup_url_kwarg or self.lookup_field)
+        user = request.user
+        company = self._company() or user.company
+
+        cart = _get_pos_open_cart_for_cashier(company=company, user=user, cart_id=pk)
+        if cart:
+            shift = _abandon_pos_open_cart(company=company, user=user, cart=cart)
+            ordered = list(_shift_active_carts_qs(company, user, shift))
+            if not ordered:
+                return Response(
+                    {
+                        "sale": None,
+                        "active_sale_id": None,
+                        "id": None,
+                        "carts": [],
+                    },
+                    status=status.HTTP_200_OK,
+                )
+            active = next((c for c in ordered if c.is_default), ordered[0])
+            active = get_object_or_404(_cart_queryset_for_response(), id=active.id, company=company)
+            return _pos_multi_cart_response(request, active)
+
+        return super().destroy(request, *args, **kwargs)
 
 
 class SaleBulkDeleteAPIView(MarketCashierOnlyMixin, CompanyBranchRestrictedMixin, APIView):
