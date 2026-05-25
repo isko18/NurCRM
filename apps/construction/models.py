@@ -310,9 +310,29 @@ class CashShift(models.Model):
         Sale = self.sales.model
         sales_qs = Sale.objects.filter(shift_id=self.id, status=Sale.Status.PAID)
 
+        from apps.main.models import SalePayment
+
         sa = sales_qs.aggregate(
             cnt=Count("id"),
             total_sum=Sum("total"),
+        )
+
+        pay_agg = SalePayment.objects.filter(
+            sale__shift_id=self.id,
+            sale__status=Sale.Status.PAID,
+        ).aggregate(
+            cash_sum=Sum(
+                "amount",
+                filter=Q(method=Sale.PaymentMethod.CASH),
+            ),
+            noncash_sum=Sum(
+                "amount",
+                filter=~Q(method__in=[Sale.PaymentMethod.CASH, Sale.PaymentMethod.DEBT]),
+            ),
+        )
+
+        legacy_qs = sales_qs.annotate(pay_cnt=Count("payments")).filter(pay_cnt=0)
+        legacy_agg = legacy_qs.aggregate(
             cash_sum=Sum(
                 Case(
                     When(payment_method=Sale.PaymentMethod.CASH, then="total"),
@@ -322,7 +342,10 @@ class CashShift(models.Model):
             ),
             noncash_sum=Sum(
                 Case(
-                    When(~Q(payment_method=Sale.PaymentMethod.CASH), then="total"),
+                    When(
+                        ~Q(payment_method__in=[Sale.PaymentMethod.CASH, Sale.PaymentMethod.DEBT]),
+                        then="total",
+                    ),
                     default=Value(0),
                     output_field=DecimalField(max_digits=12, decimal_places=2),
                 )
@@ -333,8 +356,8 @@ class CashShift(models.Model):
         expense_total = fa["expense"] or z
         sales_count = sa["cnt"] or 0
         sales_total = sa["total_sum"] or z
-        cash_sales_total = sa["cash_sum"] or z
-        noncash_sales_total = sa["noncash_sum"] or z
+        cash_sales_total = (pay_agg["cash_sum"] or z) + (legacy_agg["cash_sum"] or z)
+        noncash_sales_total = (pay_agg["noncash_sum"] or z) + (legacy_agg["noncash_sum"] or z)
 
         expected_cash = (self.opening_cash or z) + cash_sales_total + income_total - expense_total
 

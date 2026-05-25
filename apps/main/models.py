@@ -938,11 +938,13 @@ class Product(models.Model):
         # Инвалидация кэша при изменении barcode или plu
         old_barcode = None
         old_plu = None
+        old_code = None
         if self.pk:
             try:
                 old_instance = Product.objects.get(pk=self.pk)
                 old_barcode = old_instance.barcode
                 old_plu = old_instance.plu
+                old_code = old_instance.code
             except Product.DoesNotExist:
                 pass
         
@@ -953,16 +955,25 @@ class Product(models.Model):
             self._auto_generate_plu()
             super().save(*args, **kwargs)
             
-            # Инвалидация кэша после сохранения
-            from django.core.cache import cache
-            if old_barcode and old_barcode != self.barcode:
-                cache.delete(f"product_barcode:{self.company_id}:{old_barcode}")
-            if self.barcode:
-                cache.delete(f"product_barcode:{self.company_id}:{self.barcode}")
-            if old_plu and old_plu != self.plu:
-                cache.delete(f"product_plu:{self.company_id}:{old_plu}")
-            if self.plu:
-                cache.delete(f"product_plu:{self.company_id}:{self.plu}")
+        # Инвалидация кэша после сохранения
+        from django.core.cache import cache
+        if old_barcode and old_barcode != self.barcode:
+            cache.delete(f"product_barcode:{self.company_id}:{old_barcode}")
+        if self.barcode:
+            cache.delete(f"product_barcode:{self.company_id}:{self.barcode}")
+        if old_plu and old_plu != self.plu:
+            cache.delete(f"product_plu:{self.company_id}:{old_plu}")
+        if self.plu:
+            cache.delete(f"product_plu:{self.company_id}:{self.plu}")
+        if old_code and old_code != self.code:
+            for code_value in {str(old_code), str(old_code).zfill(4) if str(old_code).isdigit() else None}:
+                if code_value:
+                    cache.delete(f"product_code:{self.company_id}:{code_value}")
+        if self.code:
+            code_str = str(self.code)
+            cache.delete(f"product_code:{self.company_id}:{code_str}")
+            if code_str.isdigit():
+                cache.delete(f"product_code:{self.company_id}:{code_str.zfill(4)}")
 
 
 class ProductFavorite(models.Model):
@@ -1547,6 +1558,12 @@ class Cart(models.Model):
     )
 
     is_wholesale = models.BooleanField(default=False, db_index=True, verbose_name="Оптовая продажа")
+    is_default = models.BooleanField(
+        default=False,
+        db_index=True,
+        verbose_name="Основная корзина смены",
+        help_text="Ровно одна основная (is_default=true) open-корзина на смену и кассира.",
+    )
 
     status = models.CharField(max_length=16, choices=Status.choices, default=Status.ACTIVE, verbose_name="Статус")
 
@@ -1574,11 +1591,11 @@ class Cart(models.Model):
             models.Index(fields=["shift", "user", "status"]),
         ]
         constraints = [
-            # 1) со сменой: одна активная на (shift,user)
+            # 1) со сменой: одна основная активная корзина на (shift,user)
             models.UniqueConstraint(
                 fields=("shift", "user"),
-                condition=Q(status="active") & Q(shift__isnull=False) & Q(user__isnull=False),
-                name="uq_active_cart_per_shift_user",
+                condition=Q(status="active") & Q(is_default=True) & Q(shift__isnull=False) & Q(user__isnull=False),
+                name="uq_default_active_cart_per_shift_user",
             ),
             # 2) без смены и branch НЕ NULL
             models.UniqueConstraint(
@@ -1915,6 +1932,7 @@ class Sale(models.Model):
         OPTIMA = "optima", "Оптима"
         OBANK = "obank", "Обанк"
         BAKAI = "bakai", "Бакай"
+        MIXED = "mixed", "Смешанная"
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
 
@@ -2046,39 +2064,139 @@ class Sale(models.Model):
 
     @property
     def change(self) -> Decimal:
-        if self.payment_method != self.PaymentMethod.CASH:
+        cash_portion = self.cash_payment_amount()
+        if cash_portion <= 0:
             return Decimal("0.00")
-        diff = (self.cash_received or Decimal("0")) - (self.total or Decimal("0"))
+        diff = (self.cash_received or Decimal("0")) - cash_portion
         if diff <= 0:
             return Decimal("0.00")
         return diff.quantize(_Q2, rounding=ROUND_HALF_UP)
 
-    def mark_paid(self, payment_method=None, cash_received=None, *, skip_ekassa_schedule=False):
-        if payment_method is not None:
-            self.payment_method = payment_method
+    def cash_payment_amount(self) -> Decimal:
+        rows = list(self.payments.all()) if hasattr(self, "payments") else []
+        if rows:
+            return sum(
+                (p.amount or Decimal("0.00") for p in rows if p.method == self.PaymentMethod.CASH),
+                Decimal("0.00"),
+            ).quantize(_Q2, rounding=ROUND_HALF_UP)
+        if self.payment_method == self.PaymentMethod.CASH:
+            return (self.total or Decimal("0.00")).quantize(_Q2, rounding=ROUND_HALF_UP)
+        return Decimal("0.00")
 
-        # Если продажа оформлена "в долг", она НЕ должна попадать в кассу/смену как оплаченная.
-        # В кассу она попадёт только когда её оплатят отдельным действием (смена статуса на PAID).
-        if self.payment_method == self.PaymentMethod.DEBT:
-            self.status = Sale.Status.DEBT
-            self.paid_at = None
-            self.cash_received = Decimal("0.00")
-            self.save(update_fields=["status", "paid_at", "payment_method", "cash_received"])
-            return
+    def noncash_payment_amount(self) -> Decimal:
+        rows = list(self.payments.all()) if hasattr(self, "payments") else []
+        if rows:
+            return sum(
+                (
+                    p.amount or Decimal("0.00")
+                    for p in rows
+                    if p.method not in (self.PaymentMethod.CASH, self.PaymentMethod.DEBT)
+                ),
+                Decimal("0.00"),
+            ).quantize(_Q2, rounding=ROUND_HALF_UP)
+        if self.payment_method in (self.PaymentMethod.DEBT, self.PaymentMethod.CASH):
+            return Decimal("0.00")
+        return (self.total or Decimal("0.00")).quantize(_Q2, rounding=ROUND_HALF_UP)
 
-        if cash_received is not None:
-            if self.payment_method == self.PaymentMethod.CASH:
-                self.cash_received = cash_received
+    def payment_lines(self):
+        rows = list(self.payments.all()) if hasattr(self, "payments") else []
+        if rows:
+            return rows
+        if self.status == self.Status.PAID and self.payment_method != self.PaymentMethod.DEBT:
+            return [
+                SalePayment(
+                    sale=self,
+                    company_id=self.company_id,
+                    method=self.payment_method,
+                    amount=self.total or Decimal("0.00"),
+                )
+            ]
+        return []
+
+    def mark_paid(
+        self,
+        payment_method=None,
+        cash_received=None,
+        *,
+        payments=None,
+        skip_ekassa_schedule=False,
+    ):
+        if payments:
+            total_paid = sum((p.get("amount") or Decimal("0.00") for p in payments), Decimal("0.00"))
+            sale_total = (self.total or Decimal("0.00")).quantize(_Q2, rounding=ROUND_HALF_UP)
+            if total_paid.quantize(_Q2, rounding=ROUND_HALF_UP) != sale_total:
+                raise ValueError(
+                    f"Сумма оплат ({total_paid}) не совпадает с суммой продажи ({sale_total})."
+                )
+
+            if len(payments) == 1:
+                self.payment_method = payments[0]["method"]
+            else:
+                self.payment_method = self.PaymentMethod.MIXED
+
+            cash_portion = sum(
+                (p["amount"] for p in payments if p["method"] == self.PaymentMethod.CASH),
+                Decimal("0.00"),
+            )
+            if cash_portion > 0:
+                if cash_received is not None:
+                    self.cash_received = cash_received
+                else:
+                    self.cash_received = cash_portion
+                if self.cash_received < cash_portion:
+                    raise ValueError("Сумма, полученная наличными, меньше наличной части оплаты.")
             else:
                 self.cash_received = Decimal("0.00")
-        else:
-            # Для безналичных методов cash_received не имеет смысла — держим 0.
-            if self.payment_method != self.PaymentMethod.CASH:
+
+            self.status = self.Status.PAID
+            self.paid_at = timezone.now()
+            self.save(update_fields=["status", "paid_at", "payment_method", "cash_received"])
+
+            self.payments.all().delete()
+            SalePayment.objects.bulk_create(
+                [
+                    SalePayment(
+                        sale=self,
+                        company_id=self.company_id,
+                        method=line["method"],
+                        amount=line["amount"],
+                    )
+                    for line in payments
+                ]
+            )
+        elif payment_method is not None:
+            self.payment_method = payment_method
+
+            if self.payment_method == self.PaymentMethod.DEBT:
+                self.status = self.Status.DEBT
+                self.paid_at = None
+                self.cash_received = Decimal("0.00")
+                self.save(update_fields=["status", "paid_at", "payment_method", "cash_received"])
+                return
+
+            if cash_received is not None:
+                if self.payment_method == self.PaymentMethod.CASH:
+                    self.cash_received = cash_received
+                else:
+                    self.cash_received = Decimal("0.00")
+            elif self.payment_method != self.PaymentMethod.CASH:
                 self.cash_received = Decimal("0.00")
 
-        self.status = Sale.Status.PAID
-        self.paid_at = timezone.now()
-        self.save(update_fields=["status", "paid_at", "payment_method", "cash_received"])
+            self.status = self.Status.PAID
+            self.paid_at = timezone.now()
+            self.save(update_fields=["status", "paid_at", "payment_method", "cash_received"])
+
+            self.payments.all().delete()
+            SalePayment.objects.create(
+                sale=self,
+                company_id=self.company_id,
+                method=self.payment_method,
+                amount=self.total or Decimal("0.00"),
+            )
+        else:
+            self.status = self.Status.PAID
+            self.paid_at = timezone.now()
+            self.save(update_fields=["status", "paid_at"])
 
         if skip_ekassa_schedule:
             return
@@ -2089,6 +2207,47 @@ class Sale(models.Model):
         from apps.ekassa.sale_bridge import try_fiscalize_pos_sale
 
         schedule_after_commit(try_fiscalize_pos_sale, sale_pk)
+
+
+class SalePayment(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    sale = models.ForeignKey(
+        Sale,
+        on_delete=models.CASCADE,
+        related_name="payments",
+        verbose_name="Продажа",
+    )
+    company = models.ForeignKey(
+        Company,
+        on_delete=models.CASCADE,
+        related_name="sale_payments",
+        verbose_name="Компания",
+    )
+    method = models.CharField(max_length=16, choices=Sale.PaymentMethod.choices, verbose_name="Способ оплаты")
+    amount = models.DecimalField(max_digits=12, decimal_places=2, verbose_name="Сумма")
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        indexes = [
+            models.Index(fields=["sale", "method"]),
+            models.Index(fields=["company", "created_at"]),
+        ]
+        verbose_name = "Оплата продажи"
+        verbose_name_plural = "Оплаты продажи"
+
+    def clean(self):
+        if self.sale_id and self.company_id and self.sale.company_id != self.company_id:
+            raise ValidationError({"company": "Компания оплаты должна совпадать с компанией продажи."})
+        if self.amount is not None and self.amount <= 0:
+            raise ValidationError({"amount": "Сумма должна быть > 0."})
+        if self.method == Sale.PaymentMethod.DEBT:
+            raise ValidationError({"method": "Долг нельзя указывать в строках оплаты."})
+
+    def save(self, *args, **kwargs):
+        if self.sale_id and not self.company_id:
+            self.company_id = self.sale.company_id
+        self.full_clean()
+        return super().save(*args, **kwargs)
 
 
 class SaleItem(models.Model):

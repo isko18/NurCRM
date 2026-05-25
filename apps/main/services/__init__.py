@@ -25,13 +25,14 @@ def checkout_cart(
     *,
     payment_method=None,
     cash_received=None,
+    payments=None,
     client=None,
 ) -> Sale:
     """
     Перенос корзины в Sale (статус NEW) и списание остатков.
 
-    Если переданы ``payment_method`` / ``cash_received``, в конце вызывается ``sale.mark_paid(...)``
-    (фискализация eKassa — в фоне после commit). Печать с реквизитами ОФД — отдельный GET receipt с ``wait_ekassa``.
+    Если переданы ``payments`` или ``payment_method`` / ``cash_received``, в конце вызывается
+    ``sale.mark_paid(...)`` (фискализация eKassa — в фоне после commit).
     """
     cart.recalc()
 
@@ -155,7 +156,9 @@ def checkout_cart(
         sale.client = client
         sale.save(update_fields=["client"])
 
-    if payment_method is not None:
+    if payments:
+        sale.mark_paid(payments=payments, cash_received=cash_received)
+    elif payment_method is not None:
         sale.mark_paid(payment_method=payment_method, cash_received=cash_received)
 
     return sale

@@ -69,7 +69,7 @@ def try_fiscalize_pos_sale(sale_id) -> None:
     sale = (
         Sale.objects.filter(pk=sale_id)
         .select_related("company", "client")
-        .prefetch_related("items__product")
+        .prefetch_related("items__product", "payments")
         .first()
     )
     if not sale:
@@ -95,11 +95,15 @@ def try_fiscalize_pos_sale(sale_id) -> None:
     newid = meta.get("newid") or str(uuid.uuid4())
     _merge_ekassa_meta(sale_id, {"status": "pending", "newid": newid})
 
+    cash_amount = sale.cash_payment_amount() if hasattr(sale, "cash_payment_amount") else Decimal("0.00")
+    if not cash_amount and sale.payment_method == Sale.PaymentMethod.CASH:
+        cash_amount = Decimal(str(sale.total or 0))
+
     body = {
         "fiscal_number": cfg.fiscal_number.strip(),
         "newid": newid,
         "operation": "INCOME",
-        "cash": sale.payment_method == Sale.PaymentMethod.CASH,
+        "cash": cash_amount >= Decimal(str(sale.total or 0)) and sale.noncash_payment_amount() <= 0,
         "goods": goods,
     }
 
@@ -107,8 +111,9 @@ def try_fiscalize_pos_sale(sale_id) -> None:
     if disc_ty > 0:
         body["discount"] = str(disc_ty)
 
-    if sale.payment_method == Sale.PaymentMethod.CASH and sale.cash_received:
-        body["received"] = str(_som_to_tyiyun_int(Decimal(str(sale.cash_received))))
+    if cash_amount > 0:
+        received = sale.cash_received if sale.cash_received else cash_amount
+        body["received"] = str(_som_to_tyiyun_int(Decimal(str(received))))
 
     client = sale.client
     if client is not None:

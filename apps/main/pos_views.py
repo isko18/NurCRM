@@ -22,7 +22,7 @@ from decimal import Decimal, ROUND_HALF_UP
 from datetime import timedelta, datetime, date, time as dtime
 import io, os, uuid
 
-from django.db.models import Q, F, Value as V, Sum, Prefetch
+from django.db.models import Q, F, Value as V, Sum, Prefetch, Count
 from django.db.models.functions import Coalesce
 from django.utils.timezone import is_aware, make_aware, get_current_timezone
 
@@ -252,7 +252,41 @@ def _build_physical_receipt_text(sale, *, payment_method=None, cash_received=Non
         lines.append(f"Налог: {fmt_money(sale.tax_total)}")
     lines.append(f"Итого: {fmt_money(sale.total)}")
 
-    if payment_method_value == Sale.PaymentMethod.CASH:
+    payment_lines = sale.payment_lines() if hasattr(sale, "payment_lines") else []
+    if payment_lines:
+        if len(payment_lines) > 1:
+            lines.append("Оплата:")
+            for line in payment_lines:
+                try:
+                    label = line.get_method_display()
+                except Exception:
+                    label = line.method
+                lines.append(f"  {label}: {fmt_money(line.amount)}")
+        else:
+            line = payment_lines[0]
+            try:
+                payment_label = line.get_method_display()
+            except Exception:
+                payment_label = line.method
+            if line.method == Sale.PaymentMethod.CASH:
+                lines.append("Оплата: Наличные")
+            elif line.method == Sale.PaymentMethod.DEBT:
+                lines.append("Оплата: В долг")
+            else:
+                lines.append(f"Оплата: {payment_label}")
+
+        cash_portion = sale.cash_payment_amount() if hasattr(sale, "cash_payment_amount") else Decimal("0.00")
+        if cash_portion > 0:
+            cash_received_value = getattr(sale, "cash_received", None)
+            if cash_received_value in (None, ""):
+                cash_received_value = cash_received if cash_received is not None else cash_portion
+            change_value = getattr(sale, "change", None)
+            if change_value in (None, ""):
+                change_value = change if change is not None else Decimal("0.00")
+            lines.append(f"Получено наличными: {fmt_money(cash_received_value)}")
+            if Decimal(str(change_value or 0)) > 0:
+                lines.append(f"Сдача: {fmt_money(change_value)}")
+    elif payment_method_value == Sale.PaymentMethod.CASH:
         lines.append("Оплата: Наличные")
         lines.append(f"Получено: {fmt_money(cash_received_value)}")
         lines.append(f"Сдача: {fmt_money(change_value)}")
@@ -342,6 +376,7 @@ def _cart_queryset_for_response():
         "company_id",
         "status",
         "is_wholesale",
+        "is_default",
         "shift_id",
         "subtotal",
         "discount_total",
@@ -354,12 +389,116 @@ def _cart_queryset_for_response():
     )
 
 
-def _cart_response(request, cart_id, *, status_code=status.HTTP_200_OK):
+MAX_OPEN_CARTS_PER_SHIFT = 10
+
+
+def _normalize_pos_request_data(data):
+    """Фронт может прислать camelCase (isNew, saleId)."""
+    if not hasattr(data, "get"):
+        return data
+    out = data.copy() if hasattr(data, "copy") else dict(data)
+    if "isNew" in out and "is_new" not in out:
+        out["is_new"] = out["isNew"]
+    if "saleId" in out and "sale_id" not in out:
+        out["sale_id"] = out["saleId"]
+    return out
+
+
+def _shift_active_carts_qs(company, user, shift, *, for_update=False):
+    qs = (
+        Cart.objects.filter(
+            company=company,
+            user=user,
+            shift=shift,
+            status=Cart.Status.ACTIVE,
+        )
+        .annotate(items_count=Count("items"))
+        .order_by("created_at")
+    )
+    if for_update:
+        qs = qs.select_for_update()
+    return qs
+
+
+def _pos_cart_tab_label(cart, ordered_carts):
+    if getattr(cart, "is_default", False):
+        return "Основная"
+    for idx, c in enumerate(ordered_carts):
+        if c.id == cart.id:
+            return f"Корзина {idx + 1}"
+    return "Корзина"
+
+
+def _serialize_pos_cart_tab(cart, ordered_carts):
+    return {
+        "id": str(cart.id),
+        "is_default": bool(getattr(cart, "is_default", False)),
+        "label": _pos_cart_tab_label(cart, ordered_carts),
+        "items_count": int(getattr(cart, "items_count", None) or cart.items.count()),
+        "total": fmt_money(cart.total),
+        "status": "open",
+    }
+
+
+def _serialize_pos_sale(request, cart):
+    data = SaleCartSerializer(cart, context={"request": request}).data
+    for field in (
+        "subtotal",
+        "discount_total",
+        "order_discount_total",
+        "order_discount_percent",
+        "tax_total",
+        "total",
+    ):
+        if field in data and data[field] is not None:
+            data[field] = fmt_money(data[field])
+    if data.get("shift"):
+        data["shift"] = str(data["shift"])
+    return data
+
+
+def _pos_multi_cart_response(request, active_cart, *, status_code=status.HTTP_200_OK):
+    shift = active_cart.shift
+    user = active_cart.user or request.user
+    company = active_cart.company
+    carts_qs = _shift_active_carts_qs(company, user, shift)
+    ordered = list(carts_qs)
+    return Response(
+        {
+            "sale": _serialize_pos_sale(request, active_cart),
+            "active_sale_id": str(active_cart.id),
+            "carts": [_serialize_pos_cart_tab(c, ordered) for c in ordered],
+        },
+        status=status_code,
+    )
+
+
+def _resolve_pos_target_cart(*, company, user, shift, sale_id=None, for_update=False):
+    if for_update:
+        return _lock_pos_target_cart(company=company, user=user, shift=shift, sale_id=sale_id)
+
+    qs = _shift_active_carts_qs(company, user, shift, for_update=False)
+
+    if sale_id:
+        cart = qs.filter(id=sale_id).first()
+        if not cart:
+            raise ValidationError({"sale_id": "Открытая корзина не найдена в этой смене."})
+        return cart
+
+    target = qs.filter(is_default=True).first() or qs.first()
+    if not target:
+        raise ValidationError({"detail": "Нет открытых корзин в смене."})
+    return target
+
+
+def _cart_response(request, cart_id, *, status_code=status.HTTP_200_OK, multi_cart=False):
     cart = get_object_or_404(
         _cart_queryset_for_response(),
         id=cart_id,
         company=request.user.company,
     )
+    if multi_cart and cart.shift_id:
+        return _pos_multi_cart_response(request, cart, status_code=status_code)
     return Response(
         SaleCartSerializer(cart, context={"request": request}).data,
         status=status_code,
@@ -491,8 +630,8 @@ def _parse_scale_barcode(barcode: str):
     Парсим EAN-13 весовой штрихкод формата:
     PP CCCCC WWWWW K
 
-    - PP     : префикс (20/21/22/... — тут не валидируем жёстко)
-    - CCCCC  : код товара (5 цифр)
+    - PP     : префикс 20–29 (переменный вес)
+    - CCCCC  : PLU товара (5 цифр)
     - WWWWW  : вес в граммах (5 цифр, 00312 -> 0.312 кг)
     - K      : контрольная цифра (игнорируем)
 
@@ -502,10 +641,18 @@ def _parse_scale_barcode(barcode: str):
         return None
 
     prefix = barcode[0:2]
+    try:
+        prefix_num = int(prefix)
+    except ValueError:
+        return None
+    if not (20 <= prefix_num <= 29):
+        return None
+
     raw_code = barcode[2:7]
     weight_digits = barcode[7:12]
 
     try:
+        plu = int(raw_code)
         weight_raw = int(weight_digits)
     except ValueError:
         return None
@@ -514,21 +661,46 @@ def _parse_scale_barcode(barcode: str):
 
     return {
         "prefix": prefix,
+        "plu": plu,
         "raw_code": raw_code,
         "weight_raw": weight_raw,
         "weight_kg": weight_kg,
     }
 
 
+POS_SCAN_PRODUCT_FIELDS = (
+    "id",
+    "company_id",
+    "price",
+    "barcode",
+    "plu",
+    "code",
+    "is_weight",
+)
+
+
+def _product_pk_from_cache(value):
+    """Поддержка legacy-кэша: раньше хранили ORM-объект, теперь — UUID строкой."""
+    if value is None:
+        return None
+    if isinstance(value, Product):
+        return value.pk
+    return value
+
+
 def _resolve_product_by_barcode_for_pos(company_id, barcode: str, *, only_fields):
-    """Товар по основному или дополнительному штрихкоду (кэш product_barcode:{company_id}:{code})."""
+    """Товар по основному или дополнительному штрихкоду. В кэше хранится только UUID."""
     barcode = (barcode or "").strip()
     if not barcode:
         return None
     cache_key = f"product_barcode:{company_id}:{barcode}"
-    product = cache.get(cache_key)
-    if product is not None:
-        return product
+    cached_id = _product_pk_from_cache(cache.get(cache_key))
+    if cached_id:
+        try:
+            return Product.objects.only(*only_fields).get(pk=cached_id, company_id=company_id)
+        except (Product.DoesNotExist, TypeError, ValueError):
+            cache.delete(cache_key)
+
     product = (
         Product.objects.only(*only_fields)
         .filter(company_id=company_id)
@@ -537,8 +709,93 @@ def _resolve_product_by_barcode_for_pos(company_id, barcode: str, *, only_fields
         .first()
     )
     if product:
-        cache.set(cache_key, product, 300)
+        cache.set(cache_key, str(product.pk), 300)
     return product
+
+
+def _resolve_product_by_plu_or_code_for_pos(company_id, scale_data: dict, *, only_fields):
+    """Весовой штрих: сначала PLU (как на складе), затем legacy-поиск по code."""
+    plu = scale_data.get("plu")
+    if plu is not None:
+        product = Product.objects.only(*only_fields).filter(company_id=company_id, plu=plu).first()
+        if product:
+            return product
+
+    raw_code = scale_data.get("raw_code") or ""
+    try:
+        normalized_code = str(int(raw_code))
+    except Exception:
+        normalized_code = raw_code
+    padded_code = normalized_code.zfill(4) if normalized_code.isdigit() else normalized_code
+
+    for code_value in (normalized_code, raw_code, padded_code):
+        if not code_value:
+            continue
+        cache_key = f"product_code:{company_id}:{code_value}"
+        cached_id = _product_pk_from_cache(cache.get(cache_key))
+        if cached_id:
+            try:
+                return Product.objects.only(*only_fields).get(pk=cached_id, company_id=company_id)
+            except (Product.DoesNotExist, TypeError, ValueError):
+                cache.delete(cache_key)
+        try:
+            product = Product.objects.only(*only_fields).get(
+                company_id=company_id,
+                code=code_value,
+            )
+            cache.set(cache_key, str(product.pk), 300)
+            return product
+        except Product.DoesNotExist:
+            continue
+    return None
+
+
+def _lookup_product_for_pos_scan(company_id, barcode: str, *, only_fields=POS_SCAN_PRODUCT_FIELDS):
+    """
+    Единый поиск товара для POS-скана.
+    Возвращает (product, scale_data|None, error_message|None).
+    """
+    barcode = (barcode or "").strip()
+    if not barcode:
+        return None, None, "Пустой штрихкод"
+
+    product = _resolve_product_by_barcode_for_pos(company_id, barcode, only_fields=only_fields)
+    if product:
+        return product, None, None
+
+    scale_data = _parse_scale_barcode(barcode)
+    if scale_data:
+        product = _resolve_product_by_plu_or_code_for_pos(company_id, scale_data, only_fields=only_fields)
+        if product:
+            return product, scale_data, None
+        plu = scale_data.get("plu")
+        raw_code = scale_data.get("raw_code")
+        return None, scale_data, f"Товар с PLU {plu} / кодом {raw_code} не найден"
+
+    return None, None, "Товар не найден"
+
+
+def _lock_pos_target_cart(*, company, user, shift, sale_id=None):
+    """Блокировка одной open-корзины без тяжёлого annotate (для scan/checkout)."""
+    base = Cart.objects.select_for_update().filter(
+        company=company,
+        user=user,
+        shift=shift,
+        status=Cart.Status.ACTIVE,
+    )
+    if sale_id:
+        cart = base.filter(id=sale_id).first()
+        if not cart:
+            raise ValidationError({"sale_id": "Открытая корзина не найдена в этой смене."})
+        return cart
+
+    cart = base.filter(is_default=True).order_by("-updated_at").first()
+    if cart:
+        return cart
+    cart = base.order_by("-updated_at").first()
+    if not cart:
+        raise ValidationError({"detail": "Нет открытых корзин в смене."})
+    return cart
 
 
 def _resolve_pos_cashbox(company, branch, cashbox_id=None):
@@ -1425,12 +1682,30 @@ class SaleInvoiceDownloadAPIView(APIView):
         return FileResponse(buffer, as_attachment=True, filename=f"invoice_{doc_no}.pdf")
 
 
+def _serialize_sale_payments(sale):
+    lines = sale.payment_lines()
+    out = []
+    for line in lines:
+        try:
+            method_display = line.get_method_display()
+        except Exception:
+            method_display = line.method
+        out.append(
+            {
+                "method": line.method,
+                "method_display": method_display,
+                "amount": fmt_money(line.amount),
+            }
+        )
+    return out
+
+
 class SaleReceiptDataAPIView(MarketCashierOnlyMixin, APIView):
     permission_classes = [permissions.IsAuthenticated]
 
     def get(self, request, pk, *args, **kwargs):
         sale = get_object_or_404(
-            Sale.objects.select_related("company", "user").prefetch_related("items"),
+            Sale.objects.select_related("company", "user").prefetch_related("items", "payments"),
             id=pk,
             company=request.user.company,
         )
@@ -1509,42 +1784,59 @@ class SaleStartAPIView(MarketCashierOnlyMixin, CompanyBranchRestrictedMixin, API
             if shift:
                 branch = shift.branch
 
-        opts = StartCartOptionsSerializer(data=request.data)
+        opts = StartCartOptionsSerializer(data=_normalize_pos_request_data(request.data))
         opts.is_valid(raise_exception=True)
         is_wholesale_req = (
             bool(opts.validated_data.get("is_wholesale"))
             if "is_wholesale" in opts.validated_data
             else None
         )
+        is_new = bool(opts.validated_data.get("is_new"))
+        requested_sale_id = opts.validated_data.get("sale_id")
 
-        qs = (
-            Cart.objects.select_for_update()
-            .filter(company=company, user=user, status=Cart.Status.ACTIVE, shift=shift)
-            .order_by("-created_at")
-        )
-        cart = qs.first()
+        qs = _shift_active_carts_qs(company, user, shift, for_update=True)
+        cart = None
         created = False
 
-        if cart is None:
+        if requested_sale_id:
+            cart = qs.filter(id=requested_sale_id).first()
+            if not cart:
+                raise ValidationError({"sale_id": "Открытая корзина не найдена в этой смене."})
+        elif is_new:
+            open_count = qs.count()
+            if open_count >= MAX_OPEN_CARTS_PER_SHIFT:
+                raise ValidationError(
+                    {"detail": f"Достигнут лимит открытых корзин ({MAX_OPEN_CARTS_PER_SHIFT})."}
+                )
             cart = Cart.objects.create(
                 company=company,
                 user=user,
                 status=Cart.Status.ACTIVE,
                 branch=branch or shift.branch,
                 shift=shift,
+                is_default=False,
                 is_wholesale=bool(is_wholesale_req) if is_wholesale_req is not None else False,
             )
             created = True
         else:
-            extra_ids = list(qs.values_list("id", flat=True)[1:])
-            if extra_ids:
-                Cart.objects.filter(id__in=extra_ids).update(
-                    status=Cart.Status.CHECKED_OUT,
-                    updated_at=timezone.now(),
+            cart = qs.filter(is_default=True).first() or qs.order_by("-updated_at").first()
+            if cart is None:
+                cart = Cart.objects.create(
+                    company=company,
+                    user=user,
+                    status=Cart.Status.ACTIVE,
+                    branch=branch or shift.branch,
+                    shift=shift,
+                    is_default=True,
+                    is_wholesale=bool(is_wholesale_req) if is_wholesale_req is not None else False,
                 )
-            if (branch or shift.branch) and cart.branch_id != getattr(shift.branch, "id", None):
+                created = True
+            elif (branch or shift.branch) and cart.branch_id != getattr(shift.branch, "id", None):
                 cart.branch = branch or shift.branch
                 cart.save(update_fields=["branch"])
+            elif not qs.filter(is_default=True).exists():
+                cart.is_default = True
+                cart.save(update_fields=["is_default", "updated_at"])
 
         # Сначала пересчитываем корзину, чтобы получить актуальный subtotal
         cart.recalc()
@@ -1570,7 +1862,8 @@ class SaleStartAPIView(MarketCashierOnlyMixin, CompanyBranchRestrictedMixin, API
             _reprice_cart_items_for_mode(cart)
 
         cart.recalc()
-        return _cart_response(request, cart.id, status_code=status.HTTP_201_CREATED)
+        cart = get_object_or_404(_cart_queryset_for_response(), id=cart.id, company=company)
+        return _pos_multi_cart_response(request, cart, status_code=status.HTTP_201_CREATED)
 
 
 class CartDetailAPIView(MarketCashierOnlyMixin, generics.RetrieveAPIView):
@@ -1604,93 +1897,45 @@ class CartDetailAPIView(MarketCashierOnlyMixin, generics.RetrieveAPIView):
 class SaleScanAPIView(MarketCashierOnlyMixin, APIView):
     permission_classes = [permissions.IsAuthenticated]
 
-    @transaction.atomic
     def post(self, request, pk, *args, **kwargs):
-        cart = get_object_or_404(
-            Cart.objects.select_for_update(),
+        url_cart = get_object_or_404(
+            Cart.objects.select_related("shift", "user"),
             id=pk,
             company=request.user.company,
             status=Cart.Status.ACTIVE,
         )
+        if not url_cart.shift_id:
+            raise ValidationError({"detail": "Корзина не привязана к смене."})
 
-        ser = ScanRequestSerializer(data=request.data)
+        ser = ScanRequestSerializer(data=_normalize_pos_request_data(request.data))
         ser.is_valid(raise_exception=True)
 
+        sale_id = ser.validated_data.get("sale_id")
         barcode = ser.validated_data["barcode"].strip()
         qty = ser.validated_data["quantity"]
 
-        product = None
-        scale_data = None
-
-        cache_key = f"product_barcode:{cart.company_id}:{barcode}"
-        product = cache.get(cache_key)
-        if product is None:
-            product = _resolve_product_by_barcode_for_pos(
-                cart.company_id,
-                barcode,
-                only_fields=("id", "company_id", "price", "barcode", "plu", "code", "is_weight"),
-            )
-
+        product, scale_data, lookup_error = _lookup_product_for_pos_scan(url_cart.company_id, barcode)
         if not product:
-            scale_data = _parse_scale_barcode(barcode)
-            if not scale_data:
-                return Response({"not_found": True, "message": "Товар не найден"}, status=404)
-
-            raw_code = scale_data["raw_code"]
-            try:
-                normalized_code = str(int(raw_code))
-            except Exception:
-                normalized_code = raw_code
-            padded_code = normalized_code.zfill(4) if normalized_code.isdigit() else normalized_code
-            try:
-                # 1) normalized_code (00010 -> 10)
-                code_cache_key = f"product_code:{cart.company_id}:{normalized_code}"
-                product = cache.get(code_cache_key)
-                if product is None:
-                    product = Product.objects.only("id", "company_id", "price", "barcode", "code").get(
-                        company_id=cart.company_id,
-                        code=normalized_code,
-                    )
-                    cache.set(code_cache_key, product, 300)
-            except Product.DoesNotExist:
-                # 2) fallback raw_code (with leading zeros)
-                try:
-                    raw_cache_key = f"product_code:{cart.company_id}:{raw_code}"
-                    product = cache.get(raw_cache_key)
-                    if product is None:
-                        product = Product.objects.only("id", "company_id", "price", "barcode", "code").get(
-                            company_id=cart.company_id,
-                            code=raw_code,
-                        )
-                        cache.set(raw_cache_key, product, 300)
-                except Product.DoesNotExist:
-                    # 3) fallback padded_code (e.g. 202 -> 0202)
-                    try:
-                        padded_cache_key = f"product_code:{cart.company_id}:{padded_code}"
-                        product = cache.get(padded_cache_key)
-                        if product is None:
-                            product = Product.objects.only("id", "company_id", "price", "barcode", "code").get(
-                                company_id=cart.company_id,
-                                code=padded_code,
-                            )
-                            cache.set(padded_cache_key, product, 300)
-                    except Product.DoesNotExist:
-                        return Response(
-                            {
-                                "not_found": True,
-                                "message": f"Товар с кодом {normalized_code} / {raw_code} / {padded_code} не найден",
-                            },
-                            status=404,
-                        )
+            return Response({"not_found": True, "message": lookup_error or "Товар не найден"}, status=404)
 
         if scale_data:
             effective_qty = Decimal(str(scale_data["weight_kg"]))
         else:
             effective_qty = Decimal(str(qty))
 
-        _upsert_scanned_cart_item(cart, product, effective_qty)
-        cart.recalc()
-        return _cart_response(request, cart.id, status_code=status.HTTP_201_CREATED)
+        with transaction.atomic():
+            cart = _lock_pos_target_cart(
+                company=request.user.company,
+                user=request.user,
+                shift=url_cart.shift,
+                sale_id=sale_id,
+            )
+            _upsert_scanned_cart_item(cart, product, effective_qty)
+            cart.recalc()
+            cart_id = cart.id
+
+        cart = get_object_or_404(_cart_queryset_for_response(), id=cart_id, company=request.user.company)
+        return _pos_multi_cart_response(request, cart, status_code=status.HTTP_201_CREATED)
 
 
 class SaleAddItemAPIView(MarketCashierOnlyMixin, APIView):
@@ -1837,6 +2082,7 @@ class SaleCheckoutAPIView(MarketCashierOnlyMixin, APIView):
             client_id = ser.validated_data.get("client_id")
             payment_method = ser.validated_data.get("payment_method") or Sale.PaymentMethod.CASH
             cash_received = ser.validated_data.get("cash_received") or Decimal("0.00")
+            payments = ser.validated_data.get("payments") or None
             cashbox_id = ser.validated_data.get("cashbox_id")
 
             if not cart.shift_id:
@@ -1872,7 +2118,7 @@ class SaleCheckoutAPIView(MarketCashierOnlyMixin, APIView):
                     cart.save(update_fields=["shift"])
 
             cart.recalc()
-            if payment_method == Sale.PaymentMethod.CASH and cash_received < cart.total:
+            if not payments and payment_method == Sale.PaymentMethod.CASH and cash_received < cart.total:
                 return Response(
                     {"detail": "Сумма, полученная наличными, меньше суммы продажи."},
                     status=status.HTTP_400_BAD_REQUEST,
@@ -1886,7 +2132,8 @@ class SaleCheckoutAPIView(MarketCashierOnlyMixin, APIView):
                 sale = checkout_cart(
                     cart,
                     allow_negative_stock=can_minus,
-                    payment_method=payment_method,
+                    payments=payments,
+                    payment_method=None if payments else payment_method,
                     cash_received=cash_received,
                     client=client_obj,
                 )
@@ -1907,6 +2154,7 @@ class SaleCheckoutAPIView(MarketCashierOnlyMixin, APIView):
                 "payment_method": sale.payment_method,
                 "cash_received": fmt_money(sale.cash_received),
                 "change": fmt_money(sale.change),
+                "payments": _serialize_sale_payments(sale),
                 "shift_id": str(sale.shift_id) if sale.shift_id else None,
                 "cashbox_id": str(sale.cashbox_id) if sale.cashbox_id else None,
             }
@@ -1915,6 +2163,20 @@ class SaleCheckoutAPIView(MarketCashierOnlyMixin, APIView):
                 payload["receipt_print_path"] = (
                     f"/api/main/pos/sales/{sale.id}/receipt/?wait_ekassa=1&receipt_text=1"
                 )
+
+            if cart.shift_id:
+                remaining_qs = _shift_active_carts_qs(cart.company, request.user, cart.shift)
+                ordered = list(remaining_qs)
+                if ordered:
+                    active_open = next((c for c in ordered if c.is_default), ordered[0])
+                    active_open = get_object_or_404(
+                        _cart_queryset_for_response(),
+                        id=active_open.id,
+                        company=request.user.company,
+                    )
+                    payload["active_sale_id"] = str(active_open.id)
+                    payload["sale"] = _serialize_pos_sale(request, active_open)
+                    payload["carts"] = [_serialize_pos_cart_tab(c, ordered) for c in ordered]
 
         hint = _ekassa_checkout_hint(sale.company)
         if hint:
@@ -2248,17 +2510,12 @@ class ProductFindByBarcodeAPIView(MarketCashierOnlyMixin, APIView):
         barcode = request.query_params.get("barcode", "").strip()
         if not barcode:
             return Response([], status=200)
-        
-        # Оптимизация: кэширование и select_related
-        cache_key = f"product_barcode:{request.user.company_id}:{barcode}"
-        product = cache.get(cache_key)
 
-        if product is None:
-            product = _resolve_product_by_barcode_for_pos(
-                request.user.company_id,
-                barcode,
-                only_fields=("id", "name", "barcode", "price"),
-            )
+        product = _resolve_product_by_barcode_for_pos(
+            request.user.company_id,
+            barcode,
+            only_fields=("id", "name", "barcode", "price"),
+        )
 
         if not product:
             return Response([], status=200)
@@ -2272,7 +2529,6 @@ class ProductFindByBarcodeAPIView(MarketCashierOnlyMixin, APIView):
 class MobileScannerIngestAPIView(APIView):
     permission_classes = [permissions.AllowAny]
 
-    @transaction.atomic
     def post(self, request, token, *args, **kwargs):
         barcode = request.data.get("barcode", "").strip()
         raw_qty = request.data.get("quantity", "1.000")
@@ -2296,19 +2552,17 @@ class MobileScannerIngestAPIView(APIView):
         if cart.status != Cart.Status.ACTIVE:
             return Response({"detail": "cart is not active"}, status=409)
 
-        cache_key = f"product_barcode:{cart.company_id}:{barcode}"
-        product = cache.get(cache_key)
-        if product is None:
-            product = _resolve_product_by_barcode_for_pos(
-                cart.company_id,
-                barcode,
-                only_fields=("id", "company_id", "price", "barcode"),
-            )
+        product, scale_data, lookup_error = _lookup_product_for_pos_scan(
+            cart.company_id,
+            barcode,
+            only_fields=("id", "company_id", "price", "barcode"),
+        )
         if not product:
-            return Response({"not_found": True, "message": "Товар не найден"}, status=404)
+            return Response({"not_found": True, "message": lookup_error or "Товар не найден"}, status=404)
 
-        cart = Cart.objects.select_for_update().get(id=cart.id)
-        _upsert_scanned_cart_item(cart, product, qty)
+        with transaction.atomic():
+            cart = Cart.objects.select_for_update().get(id=cart.id)
+            _upsert_scanned_cart_item(cart, product, qty)
         return Response({"ok": True}, status=201)
 
 
@@ -2885,18 +3139,13 @@ class AgentSaleScanAPIView(MarketCashierOnlyMixin, CompanyBranchRestrictedMixin,
         barcode = ser.validated_data["barcode"].strip()
         qty = ser.validated_data["quantity"]
 
-        cache_key = f"product_barcode:{cart.company_id}:{barcode}"
-        product = cache.get(cache_key)
-
-        if product is None:
-            product = _resolve_product_by_barcode_for_pos(
-                cart.company_id,
-                barcode,
-                only_fields=("id", "company_id", "price", "quantity", "barcode"),
-            )
-
+        product, _scale_data, lookup_error = _lookup_product_for_pos_scan(
+            cart.company_id,
+            barcode,
+            only_fields=("id", "company_id", "price", "quantity", "barcode", "plu", "code", "is_weight"),
+        )
         if not product:
-            return Response({"not_found": True, "message": "Товар не найден"}, status=404)
+            return Response({"not_found": True, "message": lookup_error or "Товар не найден"}, status=404)
 
         acting_agent = _resolve_acting_agent(request, cart, allow_owner_override=True)
         use_main_stock = _should_use_main_stock_in_agent_sale(user=request.user, acting_agent=acting_agent)

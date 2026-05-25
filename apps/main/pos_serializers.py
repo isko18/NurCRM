@@ -54,6 +54,8 @@ class StartCartOptionsSerializer(serializers.Serializer):
     Настройки корзины перед продажей:
     - order_discount_total — фиксированная скидка на чек (сумма)
     - order_discount_percent — скидка на чек в процентах (0–100)
+    - is_new — создать новую open-корзину (кнопка «Новая»)
+    - sale_id — активировать указанную open-корзину (переключение вкладки)
 
     Используется только ОДИН вариант: либо сумма, либо процент.
     """
@@ -63,6 +65,8 @@ class StartCartOptionsSerializer(serializers.Serializer):
         max_digits=5, decimal_places=2, required=False
     )
     is_wholesale = serializers.BooleanField(required=False)
+    is_new = serializers.BooleanField(required=False, default=False)
+    sale_id = serializers.UUIDField(required=False, allow_null=True)
 
     def validate(self, attrs):
         total = attrs.get("order_discount_total")
@@ -254,12 +258,14 @@ class SaleItemSerializer(serializers.ModelSerializer):
 class SaleCartSerializer(serializers.ModelSerializer):
     items = SaleItemSerializer(many=True, read_only=True)
     shift = serializers.PrimaryKeyRelatedField(read_only=True)
+    status = serializers.SerializerMethodField()
 
     class Meta:
         model = Cart
         fields = (
             "id",
             "status",
+            "is_default",
             "is_wholesale",
             "shift",
             "subtotal",
@@ -271,11 +277,17 @@ class SaleCartSerializer(serializers.ModelSerializer):
             "items",
         )
 
+    def get_status(self, obj):
+        if obj.status == Cart.Status.ACTIVE:
+            return "open"
+        return obj.status
+
 
 class ScanRequestSerializer(serializers.Serializer):
     barcode = serializers.CharField(max_length=64)
     # ✅ было IntegerField → стало Decimal 3 знака
     quantity = QtyField(required=False, default=Decimal("1.000"))
+    sale_id = serializers.UUIDField(required=False, allow_null=True)
 
 class AddItemSerializer(serializers.Serializer):
     product_id = serializers.UUIDField()
@@ -350,6 +362,13 @@ def _is_owner_like(user) -> bool:
     return False
 
 
+class CheckoutPaymentLineSerializer(serializers.Serializer):
+    method = serializers.ChoiceField(
+        choices=[c for c in Sale.PaymentMethod.choices if c[0] not in (Sale.PaymentMethod.DEBT, Sale.PaymentMethod.MIXED)],
+    )
+    amount = MoneyField()
+
+
 class CheckoutSerializer(serializers.Serializer):
     print_receipt = serializers.BooleanField(default=False)
     client_id = OptionalUUIDField(required=False, allow_null=True)
@@ -365,10 +384,11 @@ class CheckoutSerializer(serializers.Serializer):
 
     payment_method = serializers.ChoiceField(
         choices=Sale.PaymentMethod.choices,
-        default=Sale.PaymentMethod.CASH,
         required=False,
+        allow_null=True,
     )
     cash_received = MoneyField(required=False, allow_null=True)
+    payments = CheckoutPaymentLineSerializer(many=True, required=False)
 
     def _resolve_cashbox(self, cart: Cart, cashbox_id):
         if not cashbox_id:
@@ -443,20 +463,53 @@ class CheckoutSerializer(serializers.Serializer):
         request = self.context.get("request")
         user = getattr(request, "user", None) if request else None
 
-        # --- оплата ---
-        payment_method = attrs.get("payment_method") or Sale.PaymentMethod.CASH
-        cash_received = attrs.get("cash_received")
+        payments = attrs.get("payments") or []
+        cart.recalc()
+        sale_total = (cart.total or Decimal("0.00")).quantize(Decimal("0.01"))
+        raw = getattr(self, "initial_data", None) or {}
+        payment_method_in_request = "payment_method" in raw and raw.get("payment_method") not in (None, "", "null")
 
-        if payment_method == Sale.PaymentMethod.CASH:
-            if cash_received is None:
-                raise serializers.ValidationError({"cash_received": "Укажите сумму, принятую наличными."})
-            if cash_received < 0:
-                raise serializers.ValidationError({"cash_received": "Не может быть отрицательной."})
-        else:
-            if cash_received is None:
+        if payments:
+            if payment_method_in_request:
+                raise serializers.ValidationError(
+                    "Передайте либо payments[], либо payment_method, но не оба варианта."
+                )
+            if len(payments) < 1:
+                raise serializers.ValidationError({"payments": "Нужна хотя бы одна строка оплаты."})
+            paid_total = sum((p["amount"] for p in payments), Decimal("0.00")).quantize(Decimal("0.01"))
+            if paid_total != sale_total:
+                raise serializers.ValidationError(
+                    {"payments": f"Сумма оплат ({paid_total}) должна равняться сумме чека ({sale_total})."}
+                )
+            cash_portion = sum(
+                (p["amount"] for p in payments if p["method"] == Sale.PaymentMethod.CASH),
+                Decimal("0.00"),
+            )
+            cash_received = attrs.get("cash_received")
+            if cash_portion > 0:
+                if cash_received is None:
+                    attrs["cash_received"] = cash_portion
+                elif cash_received < cash_portion:
+                    raise serializers.ValidationError(
+                        {"cash_received": "Сумма, полученная наличными, меньше наличной части оплаты."}
+                    )
+            else:
                 attrs["cash_received"] = Decimal("0.00")
-            elif cash_received < 0:
-                raise serializers.ValidationError({"cash_received": "Не может быть отрицательной."})
+        else:
+            # --- оплата одним способом ---
+            payment_method = attrs.get("payment_method") or Sale.PaymentMethod.CASH
+            cash_received = attrs.get("cash_received")
+
+            if payment_method == Sale.PaymentMethod.CASH:
+                if cash_received is None:
+                    raise serializers.ValidationError({"cash_received": "Укажите сумму, принятую наличными."})
+                if cash_received < 0:
+                    raise serializers.ValidationError({"cash_received": "Не может быть отрицательной."})
+            else:
+                if cash_received is None:
+                    attrs["cash_received"] = Decimal("0.00")
+                elif cash_received < 0:
+                    raise serializers.ValidationError({"cash_received": "Не может быть отрицательной."})
 
         # --- касса/смена ---
         if getattr(cart, "shift_id", None):
@@ -629,11 +682,18 @@ class SaleItemReadSerializer(serializers.ModelSerializer):
         return money(base - disc)
 
 
+class SalePaymentReadSerializer(serializers.Serializer):
+    method = serializers.CharField()
+    method_display = serializers.CharField()
+    amount = serializers.CharField()
+
+
 class SaleDetailSerializer(serializers.ModelSerializer):
     user_display = serializers.SerializerMethodField(read_only=True)
     items = SaleItemReadSerializer(many=True, read_only=True)
     client_name = serializers.CharField(source="client.full_name", read_only=True)
     change = serializers.DecimalField(max_digits=12, decimal_places=2, read_only=True)
+    payments = serializers.SerializerMethodField(read_only=True)
 
     shift = serializers.PrimaryKeyRelatedField(read_only=True)
     cashbox = serializers.PrimaryKeyRelatedField(read_only=True)
@@ -657,12 +717,32 @@ class SaleDetailSerializer(serializers.ModelSerializer):
             "payment_method",
             "cash_received",
             "change",
+            "payments",
             "shift",
             "cashbox",
             "cashbox_name",
             "ekassa_fiscal",
         )
         read_only_fields = fields
+
+    def get_payments(self, obj):
+        from apps.main.pos_utils import fmt_money
+
+        lines = obj.payment_lines()
+        out = []
+        for line in lines:
+            try:
+                method_display = line.get_method_display()
+            except Exception:
+                method_display = line.method
+            out.append(
+                {
+                    "method": line.method,
+                    "method_display": method_display,
+                    "amount": fmt_money(line.amount),
+                }
+            )
+        return out
 
     def get_user_display(self, obj):
         u = obj.user

@@ -41,9 +41,15 @@ def _user_display_name(user) -> Optional[str]:
 
 def _receipt_paid_cash_card(sale: Sale) -> tuple:
     """
-    Суммы для JSON чека: у модели Sale нет полей paid_cash/paid_card — выводим из payment_method и total.
-    Наличные → вся сумма в paid_cash; безнал (перевод, мбанк, …) → в paid_card; долг → оба 0.
+    Суммы для JSON чека.
+    Если есть строки SalePayment — берём фактические суммы по методам.
+    Иначе — legacy-логика по payment_method.
     """
+    if hasattr(sale, "cash_payment_amount") and hasattr(sale, "noncash_payment_amount"):
+        lines = sale.payment_lines()
+        if lines:
+            return _to_float(sale.cash_payment_amount()), _to_float(sale.noncash_payment_amount())
+
     total_f = _to_float(getattr(sale, "total", 0))
     pm = getattr(sale, "payment_method", None) or Sale.PaymentMethod.CASH
     if pm == Sale.PaymentMethod.DEBT:
@@ -51,6 +57,24 @@ def _receipt_paid_cash_card(sale: Sale) -> tuple:
     if pm == Sale.PaymentMethod.CASH:
         return total_f, 0.0
     return 0.0, total_f
+
+
+def _receipt_payments_payload(sale: Sale) -> list:
+    lines = sale.payment_lines() if hasattr(sale, "payment_lines") else []
+    out = []
+    for line in lines:
+        try:
+            method_display = line.get_method_display()
+        except Exception:
+            method_display = str(line.method)
+        out.append(
+            {
+                "method": line.method,
+                "method_display": method_display,
+                "amount": _to_float(line.amount),
+            }
+        )
+    return out
 
 
 def build_receipt_payload(sale, cashier_name=None, *, ensure_number: bool = True):
@@ -128,6 +152,9 @@ def build_receipt_payload(sale, cashier_name=None, *, ensure_number: bool = True
     except Exception:
         pm_display = str(pm)
 
+    cash_received_val = _to_float(getattr(sale, "cash_received", 0))
+    cash_portion = _to_float(sale.cash_payment_amount()) if hasattr(sale, "cash_payment_amount") else paid_cash
+
     payload = {
         # метка кодировки для фронта (браузерный клиент сможет выбрать UTF-8)
         "encoding": "utf-8",
@@ -149,9 +176,10 @@ def build_receipt_payload(sale, cashier_name=None, *, ensure_number: bool = True
         ),
         "payment_method": pm,
         "payment_method_display": pm_display,
+        "payments": _receipt_payments_payload(sale),
         "paid_cash": paid_cash,
         "paid_card": paid_card,
-        "cash_received": _to_float(getattr(sale, "cash_received", 0)) if pm == Sale.PaymentMethod.CASH else 0.0,
+        "cash_received": cash_received_val if cash_portion > 0 else 0.0,
         "change": _to_float(getattr(sale, "change", 0)),
     }
 
