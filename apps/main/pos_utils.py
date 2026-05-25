@@ -15,14 +15,10 @@ Q3 = Decimal("0.001")  # Для количества (3 знака после з
 def money(x: Optional[Decimal]) -> Decimal:
     """
     Округляет Decimal до 2 знаков после запятой (для денежных сумм).
-    
-    Args:
-        x: Decimal значение или None
-        
-    Returns:
-        Decimal округленное до 2 знаков
+    Принимает Decimal, str, int, float (в т.ч. строки из DRF serializer.data).
     """
-    return (x or Decimal("0")).quantize(Q2, rounding=ROUND_HALF_UP)
+    val = to_decimal(x, default=Decimal("0")) or Decimal("0")
+    return val.quantize(Q2, rounding=ROUND_HALF_UP)
 
 
 def cart_item_stock_consume_units(item) -> Decimal:
@@ -104,7 +100,7 @@ def _q2(x: Optional[Decimal]) -> Decimal:
     Внутренняя функция округления до 2 знаков.
     Используется в некоторых местах для явного округления.
     """
-    return (x or Decimal("0")).quantize(Q2, rounding=ROUND_HALF_UP)
+    return money(x)
 
 
 def to_decimal(v: Union[str, int, float, Decimal, None], default: Optional[Decimal] = None) -> Optional[Decimal]:

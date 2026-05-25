@@ -453,12 +453,13 @@ def _serialize_pos_sale(request, cart):
         "subtotal",
         "discount_total",
         "order_discount_total",
-        "order_discount_percent",
         "tax_total",
         "total",
     ):
         if field in data and data[field] is not None:
             data[field] = fmt_money(data[field])
+    if data.get("order_discount_percent") is not None:
+        data["order_discount_percent"] = f"{money(data['order_discount_percent']):.2f}"
     if data.get("shift"):
         data["shift"] = str(data["shift"])
     return data
