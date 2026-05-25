@@ -780,6 +780,57 @@ def _parse_scale_barcode(barcode: str):
     }
 
 
+def _parse_scale_barcode_loose(barcode: str):
+    """
+    Как на складе (warehouse): любой 13-значный EAN → PLU + вес.
+    Используется только если прямой поиск по штрихкоду не дал результат.
+    """
+    if not barcode or len(barcode) != 13 or not barcode.isdigit():
+        return None
+
+    raw_code = barcode[2:7]
+    weight_digits = barcode[7:12]
+
+    try:
+        plu = int(raw_code)
+        weight_raw = int(weight_digits)
+    except ValueError:
+        return None
+
+    return {
+        "prefix": barcode[0:2],
+        "plu": plu,
+        "raw_code": raw_code,
+        "weight_raw": weight_raw,
+        "weight_kg": weight_raw / 1000.0,
+    }
+
+
+def _pos_barcode_lookup_candidates(barcode: str):
+    """Варианты штрихкода для поиска (ведущие нули, EAN-13 padding)."""
+    raw = (barcode or "").strip()
+    if not raw:
+        return []
+
+    candidates = []
+
+    def _add(value):
+        value = (value or "").strip()
+        if value and value not in candidates:
+            candidates.append(value)
+
+    _add(raw)
+    if raw.isdigit():
+        _add(raw.lstrip("0") or "0")
+        if len(raw) < 13:
+            _add(raw.zfill(13))
+        if len(raw) == 13 and raw.startswith("0"):
+            _add(raw[1:])
+        if len(raw) == 14 and raw.startswith("0"):
+            _add(raw[1:])
+    return candidates
+
+
 POS_SCAN_PRODUCT_FIELDS = (
     "id",
     "company_id",
@@ -802,26 +853,29 @@ def _product_pk_from_cache(value):
 
 def _resolve_product_by_barcode_for_pos(company_id, barcode: str, *, only_fields):
     """Товар по основному или дополнительному штрихкоду. В кэше хранится только UUID."""
-    barcode = (barcode or "").strip()
-    if not barcode:
+    candidates = _pos_barcode_lookup_candidates(barcode)
+    if not candidates:
         return None
-    cache_key = f"product_barcode:{company_id}:{barcode}"
-    cached_id = _product_pk_from_cache(cache.get(cache_key))
-    if cached_id:
-        try:
-            return Product.objects.only(*only_fields).get(pk=cached_id, company_id=company_id)
-        except (Product.DoesNotExist, TypeError, ValueError):
-            cache.delete(cache_key)
+
+    for candidate in candidates:
+        cache_key = f"product_barcode:{company_id}:{candidate}"
+        cached_id = _product_pk_from_cache(cache.get(cache_key))
+        if cached_id:
+            try:
+                return Product.objects.only(*only_fields).get(pk=cached_id, company_id=company_id)
+            except (Product.DoesNotExist, TypeError, ValueError):
+                cache.delete(cache_key)
 
     product = (
         Product.objects.only(*only_fields)
         .filter(company_id=company_id)
-        .filter(Q(barcode=barcode) | Q(alternate_barcodes__barcode=barcode))
+        .filter(Q(barcode__in=candidates) | Q(alternate_barcodes__barcode__in=candidates))
         .distinct()
         .first()
     )
     if product:
-        cache.set(cache_key, str(product.pk), 300)
+        for candidate in candidates:
+            cache.set(f"product_barcode:{company_id}:{candidate}", str(product.pk), 300)
     return product
 
 
@@ -875,6 +929,16 @@ def _lookup_product_for_pos_scan(company_id, barcode: str, *, only_fields=POS_SC
     if product:
         return product, None, None
 
+    # Прямой PLU (короткий числовой код с этикетки/весов)
+    if barcode.isdigit() and len(barcode) <= 7:
+        try:
+            plu_value = int(barcode)
+            product = Product.objects.only(*only_fields).filter(company_id=company_id, plu=plu_value).first()
+            if product:
+                return product, None, None
+        except ValueError:
+            pass
+
     scale_data = _parse_scale_barcode(barcode)
     if scale_data:
         product = _resolve_product_by_plu_or_code_for_pos(company_id, scale_data, only_fields=only_fields)
@@ -883,6 +947,30 @@ def _lookup_product_for_pos_scan(company_id, barcode: str, *, only_fields=POS_SC
         plu = scale_data.get("plu")
         raw_code = scale_data.get("raw_code")
         return None, scale_data, f"Товар с PLU {plu} / кодом {raw_code} не найден"
+
+    # Fallback как на складе: 13 цифр → PLU из середины штрихкода
+    scale_loose = _parse_scale_barcode_loose(barcode)
+    if scale_loose:
+        product = Product.objects.only(*only_fields).filter(
+            company_id=company_id,
+            plu=scale_loose["plu"],
+        ).first()
+        if product:
+            return product, scale_loose, None
+        plu = scale_loose.get("plu")
+        raw_code = scale_loose.get("raw_code")
+        return None, scale_loose, f"Товар с PLU {plu} / кодом {raw_code} не найден"
+
+    # Внутренний код товара (code), если штрихкод числовой
+    if barcode.isdigit():
+        code_candidates = [barcode, str(int(barcode)), barcode.zfill(4)]
+        for code_value in code_candidates:
+            product = Product.objects.only(*only_fields).filter(
+                company_id=company_id,
+                code=code_value,
+            ).first()
+            if product:
+                return product, None, None
 
     return None, None, "Товар не найден"
 

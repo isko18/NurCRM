@@ -6,7 +6,7 @@ import hashlib
 import json
 from html import escape
 from io import BytesIO
-from datetime import datetime, time, timedelta
+from datetime import datetime, time, timedelta, date
 
 from rest_framework import permissions
 from rest_framework.request import Request as DRFRequest
@@ -169,11 +169,28 @@ def _apply_datetime_range_calendar_days(qs, field_name: str, date_from: str | No
 
 def _rejections_row_sort_key(row: dict):
     """Сортировка строк отчёта отказов/возвратов: сначала по дате (новее выше), затем по сумме."""
-    ev = row.get("created_at")
+    ev = row.get("rejected_at") or row.get("created_at")
     rev = _to_decimal(row.get("lost_revenue"))
     if isinstance(ev, datetime):
         return (True, ev, rev)
     return (False, None, rev)
+
+
+def _order_item_title(item) -> str:
+    if getattr(item, "line_kind", None) == OrderItem.LineKind.SERVICE:
+        return (getattr(item, "service_title", "") or "").strip() or "—"
+    menu_item = getattr(item, "menu_item", None)
+    if menu_item is not None:
+        return (getattr(menu_item, "title", "") or "").strip() or "—"
+    return "—"
+
+
+def _user_display_name(user) -> str:
+    if not user:
+        return ""
+    full = getattr(user, "get_full_name", lambda: "")() or ""
+    email = getattr(user, "email", "") or ""
+    return full or email or str(getattr(user, "id", "") or "")
 
 
 def _paid_order_lines_qs(company, branch):
@@ -1014,6 +1031,7 @@ class RejectionsAnalyticsView(CompanyBranchQuerysetMixin, APIView):
     Отказы гостя + денежные возвраты (по позиции и по чеку) за период по дате события.
 
     Ответ: объект с date_from, date_to, totals (в т.ч. суммы возвратов), rows (до 200 строк).
+    Строки guest_rejection — по каждой отменённой позиции (блюдо, стол, rejected_at, причина).
     Обратная совместимость: ?flat=1 — только массив rows (как раньше).
     """
     permission_classes = [permissions.IsAuthenticated]
@@ -1043,7 +1061,9 @@ class RejectionsAnalyticsView(CompanyBranchQuerysetMixin, APIView):
         dt = (qp.get("date_to") or "").strip() or None
         branch = self._active_branch()
 
-        qs = OrderItem.objects.select_related("order", "menu_item").filter(
+        qs = OrderItem.objects.select_related(
+            "order", "order__table", "order__waiter", "menu_item",
+        ).filter(
             company=company,
             is_rejected=True,
         )
@@ -1057,23 +1077,11 @@ class RejectionsAnalyticsView(CompanyBranchQuerysetMixin, APIView):
         qs = _apply_datetime_range_calendar_days(qs, "rejected_at", df, dt)
 
         line_total = _line_revenue_expr()
-        guest_lost_total = _to_decimal(qs.aggregate(t=Sum(line_total)).get("t"))
-        by_reason = (
-            qs.values("rejection_reason")
-            .annotate(
-                qty=Sum("quantity"),
-                lost_revenue=Sum(line_total),
-                last_rejected_at=Max("rejected_at"),
-            )
-            .order_by("-lost_revenue")
-        )
+        qs = qs.annotate(line_revenue=line_total)
+        guest_lost_total = _to_decimal(qs.aggregate(t=Sum("line_revenue")).get("t"))
 
         user = getattr(request, "user", None)
-        employee_name = ""
-        if user and getattr(user, "is_authenticated", False):
-            full = getattr(user, "get_full_name", lambda: "")() or ""
-            email = getattr(user, "email", "") or ""
-            employee_name = full or email or str(getattr(user, "id", "") or "")
+        employee_name = _user_display_name(user) if user and getattr(user, "is_authenticated", False) else ""
 
         pm_labels = dict(OrderRefund._meta.get_field("payment_method").choices)
 
@@ -1105,14 +1113,19 @@ class RejectionsAnalyticsView(CompanyBranchQuerysetMixin, APIView):
 
         rows = [
             {
-                "rejection_reason": (row["rejection_reason"] or "").strip() or "—",
-                "qty": int(row["qty"] or 0),
-                "lost_revenue": f"{_to_decimal(row['lost_revenue']):.2f}",
-                "employee_name": employee_name,
-                "created_at": row["last_rejected_at"],
+                "order_id": str(item.order_id),
+                "item_id": str(item.id),
+                "dish_title": _order_item_title(item),
+                "table_number": _safe_order_table_number(item.order),
+                "rejection_reason": (item.rejection_reason or "").strip() or "—",
+                "qty": int(item.quantity or 0),
+                "lost_revenue": f"{_to_decimal(item.line_revenue):.2f}",
+                "employee_name": _user_display_name(getattr(item.order, "waiter", None)) or employee_name,
+                "rejected_at": item.rejected_at,
+                "created_at": item.rejected_at,
                 "row_kind": "guest_rejection",
             }
-            for row in by_reason
+            for item in qs.order_by("-rejected_at", "-id")
         ]
 
         for row in by_item_refund:
@@ -2041,6 +2054,88 @@ def _export_order_payment_method_ru(code: str | None) -> str:
     return pm.get(c, c)
 
 
+EXCEL_FMT_DATETIME = "DD.MM.YYYY HH:MM"
+EXCEL_FMT_DATE = "DD.MM.YYYY"
+EXCEL_FMT_MONEY = "#,##0.00"
+EXCEL_FMT_INT = "0"
+EXCEL_FMT_PERCENT = "0.00"
+
+
+def _export_excel_number(value):
+    if value is None or value == "":
+        return None
+    try:
+        return float(_to_decimal(value))
+    except (InvalidOperation, TypeError, ValueError):
+        return None
+
+
+def _export_excel_int(value):
+    if value is None or value == "":
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _export_excel_datetime(value):
+    if value is None or value == "":
+        return None
+    if isinstance(value, datetime):
+        dt = value
+    elif isinstance(value, date) and not isinstance(value, datetime):
+        return datetime.combine(value, time.min)
+    else:
+        raw = str(value).strip()
+        if not raw:
+            return None
+        try:
+            dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        except ValueError:
+            try:
+                d = date.fromisoformat(raw[:10])
+                return datetime.combine(d, time.min)
+            except ValueError:
+                return None
+    if timezone.is_aware(dt):
+        dt = timezone.localtime(dt)
+    return dt.replace(tzinfo=None)
+
+
+def _export_excel_date(value):
+    if value is None or value == "":
+        return None
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    raw = str(value).strip()
+    if not raw:
+        return None
+    try:
+        return date.fromisoformat(raw[:10])
+    except ValueError:
+        return None
+
+
+def _export_excel_apply_column_formats(ws, formats: dict[int, str], *, first_data_row: int = 2):
+    if ws.max_row < first_data_row:
+        return
+    for col_idx, fmt in formats.items():
+        for row_idx in range(first_data_row, ws.max_row + 1):
+            cell = ws.cell(row=row_idx, column=col_idx)
+            if cell.value is not None and cell.value != "":
+                cell.number_format = fmt
+
+
+def _export_excel_apply_cell_formats(ws, cell_formats: list[tuple[int, int, str]]):
+    for row_idx, col_idx, fmt in cell_formats:
+        cell = ws.cell(row=row_idx, column=col_idx)
+        if cell.value is not None and cell.value != "":
+            cell.number_format = fmt
+
+
 class CafeAnalyticsExportView(CompanyBranchQuerysetMixin, APIView):
     """
     Экспорт аналитики/кассы:
@@ -2318,49 +2413,89 @@ class CafeAnalyticsExportView(CompanyBranchQuerysetMixin, APIView):
             ws = wb.active
             ws.title = "Сводка"
             ws.append(["Аналитика кафе — сводка"])
-            ws.append(["Дата с", payload["date_from"]])
-            ws.append(["Дата по", payload["date_to"]])
+            ws.append(["Дата с", _export_excel_date(payload["date_from"])])
+            ws.append(["Дата по", _export_excel_date(payload["date_to"])])
             ws.append(["База расчёта", _export_basis_label_ru(payload.get("basis", "paid_at"))])
-            ws.append(["Заказов", payload["orders_count"]])
-            ws.append(["Позиций (шт.)", payload["items_qty"]])
-            ws.append(["Выручка", payload["revenue"]])
-            ws.append(["Себестоимость продаж", payload.get("cogs_sold", "0.00")])
-            ws.append(["Валовая прибыль", payload.get("gross_profit", "0.00")])
-            ws.append(["Маржа, %", payload.get("margin_percent", 0)])
-            ws.append(["Чистая прибыль", payload.get("net_profit", "0.00")])
-            ws.append(["Закупок (операций)", payload["purchases_count"]])
-            ws.append(["Сумма закупок", payload["purchases_sum"]])
-            ws.append(["Прочих расходов (операций)", payload.get("cafe_expenses_count", 0)])
-            ws.append(["Сумма прочих расходов", payload.get("cafe_expenses_sum", "0.00")])
-            ws.append(["Возвраты (сумма)", payload.get("refunds_total", "0.00")])
-            ws.append(["Позиций на складе ниже минимума", payload["low_stock_count"]])
+            ws.append(["Заказов", _export_excel_int(payload["orders_count"])])
+            ws.append(["Позиций (шт.)", _export_excel_int(payload["items_qty"])])
+            ws.append(["Выручка", _export_excel_number(payload["revenue"])])
+            ws.append(["Себестоимость продаж", _export_excel_number(payload.get("cogs_sold", "0.00"))])
+            ws.append(["Валовая прибыль", _export_excel_number(payload.get("gross_profit", "0.00"))])
+            ws.append(["Маржа, %", _export_excel_number(payload.get("margin_percent", 0))])
+            ws.append(["Чистая прибыль", _export_excel_number(payload.get("net_profit", "0.00"))])
+            ws.append(["Закупок (операций)", _export_excel_int(payload["purchases_count"])])
+            ws.append(["Сумма закупок", _export_excel_number(payload["purchases_sum"])])
+            ws.append(["Прочих расходов (операций)", _export_excel_int(payload.get("cafe_expenses_count", 0))])
+            ws.append(["Сумма прочих расходов", _export_excel_number(payload.get("cafe_expenses_sum", "0.00"))])
+            ws.append(["Возвраты (сумма)", _export_excel_number(payload.get("refunds_total", "0.00"))])
+            ws.append(["Позиций на складе ниже минимума", _export_excel_int(payload["low_stock_count"])])
             ws.append([])
             ws.append(["Возвраты по способу (дата возврата)"])
             ws.append(["Код", "Способ", "Кол-во", "Сумма"])
+            refunds_data_start = ws.max_row + 1
             for r in payload.get("refunds_by_method") or []:
-                ws.append([r.get("method"), r.get("method_label"), r.get("count"), r.get("total")])
+                ws.append([
+                    r.get("method"),
+                    r.get("method_label"),
+                    _export_excel_int(r.get("count")),
+                    _export_excel_number(r.get("total")),
+                ])
+            _export_excel_apply_cell_formats(ws, [
+                (2, 2, EXCEL_FMT_DATE),
+                (3, 2, EXCEL_FMT_DATE),
+                (5, 2, EXCEL_FMT_INT),
+                (6, 2, EXCEL_FMT_INT),
+                (7, 2, EXCEL_FMT_MONEY),
+                (8, 2, EXCEL_FMT_MONEY),
+                (9, 2, EXCEL_FMT_MONEY),
+                (10, 2, EXCEL_FMT_PERCENT),
+                (11, 2, EXCEL_FMT_MONEY),
+                (12, 2, EXCEL_FMT_INT),
+                (13, 2, EXCEL_FMT_MONEY),
+                (14, 2, EXCEL_FMT_INT),
+                (15, 2, EXCEL_FMT_MONEY),
+                (16, 2, EXCEL_FMT_MONEY),
+                (17, 2, EXCEL_FMT_INT),
+            ])
+            _export_excel_apply_column_formats(ws, {3: EXCEL_FMT_INT, 4: EXCEL_FMT_MONEY}, first_data_row=refunds_data_start)
 
             w_in = wb.create_sheet("Приходы")
             w_in.append(["ID заказа", "Дата оплаты", "Код способа", "Способ оплаты", "Сумма", "Стол"])
             for row in payload.get("income_rows") or []:
                 w_in.append([
                     row["order_id"],
-                    row["paid_at"],
+                    _export_excel_datetime(row["paid_at"]),
                     row["payment_method"],
                     row.get("payment_method_label", ""),
-                    row["amount"],
-                    row.get("table_number", ""),
+                    _export_excel_number(row["amount"]),
+                    _export_excel_int(row.get("table_number")),
                 ])
+            _export_excel_apply_column_formats(w_in, {2: EXCEL_FMT_DATETIME, 5: EXCEL_FMT_MONEY, 6: EXCEL_FMT_INT})
 
             w_pu = wb.create_sheet("Закупки")
             w_pu.append(["ID", "Дата", "Поставщик", "Позиции", "Сумма"])
             for row in payload.get("purchase_rows") or []:
-                w_pu.append([row["id"], row["created_at"], row["supplier"], row["positions"], row["amount"]])
+                w_pu.append([
+                    row["id"],
+                    _export_excel_datetime(row["created_at"]),
+                    row["supplier"],
+                    _export_excel_int(row["positions"]),
+                    _export_excel_number(row["amount"]),
+                ])
+            _export_excel_apply_column_formats(w_pu, {2: EXCEL_FMT_DATETIME, 4: EXCEL_FMT_INT, 5: EXCEL_FMT_MONEY})
 
             w_ex = wb.create_sheet("Прочие расходы")
             w_ex.append(["ID", "Дата", "Статья", "Категория", "Сумма", "Примечание"])
             for row in payload.get("expense_rows") or []:
-                w_ex.append([row["id"], row["expense_date"], row["title"], row["category"], row["amount"], row["note"]])
+                w_ex.append([
+                    row["id"],
+                    _export_excel_date(row["expense_date"]),
+                    row["title"],
+                    row["category"],
+                    _export_excel_number(row["amount"]),
+                    row["note"],
+                ])
+            _export_excel_apply_column_formats(w_ex, {2: EXCEL_FMT_DATE, 5: EXCEL_FMT_MONEY})
 
             w_rf = wb.create_sheet("Возвраты")
             w_rf.append(["Тип", "ID", "Заказ", "Дата возврата", "Способ", "Сумма", "Примечание"])
@@ -2369,48 +2504,77 @@ class CafeAnalyticsExportView(CompanyBranchQuerysetMixin, APIView):
                     _export_refund_kind_ru(row["kind"]),
                     row["id"],
                     row["order_id"],
-                    row["refunded_at"],
+                    _export_excel_datetime(row["refunded_at"]),
                     _export_refund_payment_method_ru(row["payment_method"]),
-                    row["amount"],
+                    _export_excel_number(row["amount"]),
                     row.get("note", ""),
                 ])
+            _export_excel_apply_column_formats(w_rf, {4: EXCEL_FMT_DATETIME, 6: EXCEL_FMT_MONEY})
 
             w_ed = wb.create_sheet("Расходы по дням")
             w_ed.append(["Дата", "Сумма", "Кол-во"])
             for row in payload.get("expenses_by_day") or []:
-                w_ed.append([row["date"], row["total"], row["count"]])
+                w_ed.append([
+                    _export_excel_date(row["date"]),
+                    _export_excel_number(row["total"]),
+                    _export_excel_int(row["count"]),
+                ])
+            _export_excel_apply_column_formats(w_ed, {1: EXCEL_FMT_DATE, 2: EXCEL_FMT_MONEY, 3: EXCEL_FMT_INT})
 
             w_top = wb.create_sheet("Топ блюд")
             w_top.append(["Блюдо", "Кол-во", "Выручка"])
             for row in payload["top_items"]:
-                w_top.append([row["title"], row["qty"], row["revenue"]])
+                w_top.append([
+                    row["title"],
+                    _export_excel_int(row["qty"]),
+                    _export_excel_number(row["revenue"]),
+                ])
+            _export_excel_apply_column_formats(w_top, {2: EXCEL_FMT_INT, 3: EXCEL_FMT_MONEY})
         else:
             ws = wb.active
             ws.title = "Сводка"
             ws.append(["Касса — сводка"])
-            ws.append(["Дата с", payload["date_from"]])
-            ws.append(["Дата по", payload["date_to"]])
-            ws.append(["Всего", payload["totals"]["all"]])
-            ws.append(["Наличные", payload["totals"]["cash"]])
-            ws.append(["Карта", payload["totals"]["card"]])
-            ws.append(["Перевод", payload["totals"]["transfer"]])
-            ws.append(["Прочее", payload["totals"]["other"]])
-            ws.append(["Возвраты (сумма)", payload.get("refunds_total", "0.00")])
+            ws.append(["Дата с", _export_excel_date(payload["date_from"])])
+            ws.append(["Дата по", _export_excel_date(payload["date_to"])])
+            ws.append(["Всего", _export_excel_number(payload["totals"]["all"])])
+            ws.append(["Наличные", _export_excel_number(payload["totals"]["cash"])])
+            ws.append(["Карта", _export_excel_number(payload["totals"]["card"])])
+            ws.append(["Перевод", _export_excel_number(payload["totals"]["transfer"])])
+            ws.append(["Прочее", _export_excel_number(payload["totals"]["other"])])
+            ws.append(["Возвраты (сумма)", _export_excel_number(payload.get("refunds_total", "0.00"))])
             ws.append([])
             ws.append(["Возвраты по способу"])
             ws.append(["Код", "Способ", "Кол-во", "Сумма"])
+            refunds_data_start = ws.max_row + 1
             for r in payload.get("refunds_by_method") or []:
-                ws.append([r.get("method"), r.get("method_label"), r.get("count"), r.get("total")])
+                ws.append([
+                    r.get("method"),
+                    r.get("method_label"),
+                    _export_excel_int(r.get("count")),
+                    _export_excel_number(r.get("total")),
+                ])
+            _export_excel_apply_cell_formats(ws, [
+                (2, 2, EXCEL_FMT_DATE),
+                (3, 2, EXCEL_FMT_DATE),
+                (4, 2, EXCEL_FMT_MONEY),
+                (5, 2, EXCEL_FMT_MONEY),
+                (6, 2, EXCEL_FMT_MONEY),
+                (7, 2, EXCEL_FMT_MONEY),
+                (8, 2, EXCEL_FMT_MONEY),
+                (9, 2, EXCEL_FMT_MONEY),
+            ])
+            _export_excel_apply_column_formats(ws, {3: EXCEL_FMT_INT, 4: EXCEL_FMT_MONEY}, first_data_row=refunds_data_start)
 
             w_ord = wb.create_sheet("Оплаты")
             w_ord.append(["ID заказа", "Дата оплаты", "Способ оплаты", "Сумма"])
             for row in payload["rows"]:
                 w_ord.append([
                     row["order_id"],
-                    str(row["paid_at"] or ""),
+                    _export_excel_datetime(row["paid_at"]),
                     _export_order_payment_method_ru(row["payment_method"]),
-                    row["final_amount"],
+                    _export_excel_number(row["final_amount"]),
                 ])
+            _export_excel_apply_column_formats(w_ord, {2: EXCEL_FMT_DATETIME, 4: EXCEL_FMT_MONEY})
 
             w_rf = wb.create_sheet("Возвраты")
             w_rf.append(["Тип", "ID", "Заказ", "Дата возврата", "Способ", "Сумма", "Примечание"])
@@ -2419,11 +2583,12 @@ class CafeAnalyticsExportView(CompanyBranchQuerysetMixin, APIView):
                     _export_refund_kind_ru(row["kind"]),
                     row["id"],
                     row["order_id"],
-                    row["refunded_at"],
+                    _export_excel_datetime(row["refunded_at"]),
                     _export_refund_payment_method_ru(row["payment_method"]),
-                    row["amount"],
+                    _export_excel_number(row["amount"]),
                     row.get("note", ""),
                 ])
+            _export_excel_apply_column_formats(w_rf, {4: EXCEL_FMT_DATETIME, 6: EXCEL_FMT_MONEY})
 
         buf = BytesIO()
         wb.save(buf)
