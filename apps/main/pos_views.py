@@ -404,20 +404,27 @@ def _normalize_pos_request_data(data):
     return out
 
 
-def _shift_active_carts_qs(company, user, shift, *, for_update=False):
-    qs = (
-        Cart.objects.filter(
-            company=company,
-            user=user,
-            shift=shift,
-            status=Cart.Status.ACTIVE,
-        )
+def _shift_carts_base_qs(company, user, shift):
+    return Cart.objects.filter(
+        company=company,
+        user=user,
+        shift=shift,
+        status=Cart.Status.ACTIVE,
+    )
+
+
+def _shift_active_carts_qs(company, user, shift):
+    """Список вкладок корзин (с items_count). Без select_for_update — несовместимо с GROUP BY в PostgreSQL."""
+    return (
+        _shift_carts_base_qs(company, user, shift)
         .annotate(items_count=Count("items"))
         .order_by("created_at")
     )
-    if for_update:
-        qs = qs.select_for_update()
-    return qs
+
+
+def _lock_shift_carts_qs(company, user, shift):
+    """Блокировка open-корзин смены без annotate."""
+    return _shift_carts_base_qs(company, user, shift).select_for_update().order_by("created_at")
 
 
 def _pos_cart_tab_label(cart, ordered_carts):
@@ -477,7 +484,7 @@ def _resolve_pos_target_cart(*, company, user, shift, sale_id=None, for_update=F
     if for_update:
         return _lock_pos_target_cart(company=company, user=user, shift=shift, sale_id=sale_id)
 
-    qs = _shift_active_carts_qs(company, user, shift, for_update=False)
+    qs = _shift_active_carts_qs(company, user, shift)
 
     if sale_id:
         cart = qs.filter(id=sale_id).first()
@@ -776,13 +783,8 @@ def _lookup_product_for_pos_scan(company_id, barcode: str, *, only_fields=POS_SC
 
 
 def _lock_pos_target_cart(*, company, user, shift, sale_id=None):
-    """Блокировка одной open-корзины без тяжёлого annotate (для scan/checkout)."""
-    base = Cart.objects.select_for_update().filter(
-        company=company,
-        user=user,
-        shift=shift,
-        status=Cart.Status.ACTIVE,
-    )
+    """Блокировка одной open-корзины без annotate (PostgreSQL: FOR UPDATE + GROUP BY запрещён)."""
+    base = _lock_shift_carts_qs(company, user, shift)
     if sale_id:
         cart = base.filter(id=sale_id).first()
         if not cart:
@@ -1794,7 +1796,7 @@ class SaleStartAPIView(MarketCashierOnlyMixin, CompanyBranchRestrictedMixin, API
         is_new = bool(opts.validated_data.get("is_new"))
         requested_sale_id = opts.validated_data.get("sale_id")
 
-        qs = _shift_active_carts_qs(company, user, shift, for_update=True)
+        qs = _lock_shift_carts_qs(company, user, shift)
         cart = None
         created = False
 
@@ -1803,7 +1805,7 @@ class SaleStartAPIView(MarketCashierOnlyMixin, CompanyBranchRestrictedMixin, API
             if not cart:
                 raise ValidationError({"sale_id": "Открытая корзина не найдена в этой смене."})
         elif is_new:
-            open_count = qs.count()
+            open_count = _shift_carts_base_qs(company, user, shift).count()
             if open_count >= MAX_OPEN_CARTS_PER_SHIFT:
                 raise ValidationError(
                     {"detail": f"Достигнут лимит открытых корзин ({MAX_OPEN_CARTS_PER_SHIFT})."}
@@ -1834,7 +1836,7 @@ class SaleStartAPIView(MarketCashierOnlyMixin, CompanyBranchRestrictedMixin, API
             elif (branch or shift.branch) and cart.branch_id != getattr(shift.branch, "id", None):
                 cart.branch = branch or shift.branch
                 cart.save(update_fields=["branch"])
-            elif not qs.filter(is_default=True).exists():
+            elif not _shift_carts_base_qs(company, user, shift).filter(is_default=True).exists():
                 cart.is_default = True
                 cart.save(update_fields=["is_default", "updated_at"])
 
