@@ -169,7 +169,7 @@ def _apply_datetime_range_calendar_days(qs, field_name: str, date_from: str | No
 
 def _rejections_row_sort_key(row: dict):
     """Сортировка строк отчёта отказов/возвратов: сначала по дате (новее выше), затем по сумме."""
-    ev = row.get("rejected_at") or row.get("created_at")
+    ev = row.get("rejected_at") or row.get("refunded_at") or row.get("created_at")
     rev = _to_decimal(row.get("lost_revenue"))
     if isinstance(ev, datetime):
         return (True, ev, rev)
@@ -1031,7 +1031,8 @@ class RejectionsAnalyticsView(CompanyBranchQuerysetMixin, APIView):
     Отказы гостя + денежные возвраты (по позиции и по чеку) за период по дате события.
 
     Ответ: объект с date_from, date_to, totals (в т.ч. суммы возвратов), rows (до 200 строк).
-    Строки guest_rejection — по каждой отменённой позиции (блюдо, стол, rejected_at, причина).
+    Строки guest_rejection / item_refund / order_refund — по каждой операции
+    (блюдо, стол, rejected_at или refunded_at, причина/примечание).
     Обратная совместимость: ?flat=1 — только массив rows (как раньше).
     """
     permission_classes = [permissions.IsAuthenticated]
@@ -1072,9 +1073,8 @@ class RejectionsAnalyticsView(CompanyBranchQuerysetMixin, APIView):
         else:
             qs = qs.filter(order__branch__isnull=True)
         qs, _waiter_scope_id = _apply_waiter_scope(qs, request, "order__waiter_id")
-        if df or dt:
-            qs = qs.filter(rejected_at__isnull=False)
-        qs = _apply_datetime_range_calendar_days(qs, "rejected_at", df, dt)
+        qs = qs.annotate(_rejection_event_at=Coalesce(F("rejected_at"), F("order__updated_at")))
+        qs = _apply_datetime_range_calendar_days(qs, "_rejection_event_at", df, dt)
 
         line_total = _line_revenue_expr()
         qs = qs.annotate(line_revenue=line_total)
@@ -1085,31 +1085,33 @@ class RejectionsAnalyticsView(CompanyBranchQuerysetMixin, APIView):
 
         pm_labels = dict(OrderRefund._meta.get_field("payment_method").choices)
 
-        ir_qs = OrderItemRefund.objects.filter(company=company)
+        ir_qs = OrderItemRefund.objects.select_related(
+            "order",
+            "order__table",
+            "order__waiter",
+            "order_item",
+            "order_item__menu_item",
+            "created_by",
+        ).filter(company=company)
         if branch is not None:
             ir_qs = ir_qs.filter(Q(order__branch=branch) | Q(order__branch__isnull=True))
         else:
             ir_qs = ir_qs.filter(order__branch__isnull=True)
         ir_qs, _ = _apply_waiter_scope(ir_qs, request, "order__waiter_id")
         ir_qs = _apply_datetime_range_calendar_days(ir_qs, "refunded_at", df, dt)
-        by_item_refund = ir_qs.values("note", "payment_method").annotate(
-            qty=Sum("quantity"),
-            lost_revenue=Sum("amount"),
-            last_refunded_at=Max("refunded_at"),
-        )
 
-        or_qs = OrderRefund.objects.filter(company=company)
+        or_qs = OrderRefund.objects.select_related(
+            "order",
+            "order__table",
+            "order__waiter",
+            "created_by",
+        ).filter(company=company)
         if branch is not None:
             or_qs = or_qs.filter(Q(order__branch=branch) | Q(order__branch__isnull=True))
         else:
             or_qs = or_qs.filter(order__branch__isnull=True)
         or_qs, _ = _apply_waiter_scope(or_qs, request, "order__waiter_id")
         or_qs = _apply_datetime_range_calendar_days(or_qs, "refunded_at", df, dt)
-        by_order_refund = or_qs.values("note", "payment_method").annotate(
-            qty=Count("id"),
-            lost_revenue=Sum("amount"),
-            last_refunded_at=Max("refunded_at"),
-        )
 
         rows = [
             {
@@ -1121,36 +1123,64 @@ class RejectionsAnalyticsView(CompanyBranchQuerysetMixin, APIView):
                 "qty": int(item.quantity or 0),
                 "lost_revenue": f"{_to_decimal(item.line_revenue):.2f}",
                 "employee_name": _user_display_name(getattr(item.order, "waiter", None)) or employee_name,
-                "rejected_at": item.rejected_at,
-                "created_at": item.rejected_at,
+                "rejected_at": item.rejected_at or getattr(item.order, "updated_at", None),
+                "created_at": item.rejected_at or getattr(item.order, "updated_at", None),
                 "row_kind": "guest_rejection",
             }
-            for item in qs.order_by("-rejected_at", "-id")
+            for item in qs.order_by("-_rejection_event_at", "-id")
         ]
 
-        for row in by_item_refund:
-            note = (row.get("note") or "").strip()
-            pm = pm_labels.get(row.get("payment_method") or "", row.get("payment_method") or "")
+        for refund in ir_qs.order_by("-refunded_at", "-id"):
+            order = refund.order
+            order_item = refund.order_item
+            note = (refund.note or "").strip()
+            pm = pm_labels.get(refund.payment_method or "", refund.payment_method or "")
             reason = f"Возврат по позиции: {note} ({pm})" if note else f"Возврат по позиции ({pm})"
             rows.append({
+                "order_id": str(refund.order_id),
+                "item_id": str(refund.order_item_id),
+                "refund_id": str(refund.id),
+                "dish_title": _order_item_title(order_item),
+                "table_number": _safe_order_table_number(order),
                 "rejection_reason": reason,
-                "qty": int(row["qty"] or 0),
-                "lost_revenue": f"{_to_decimal(row['lost_revenue']):.2f}",
-                "employee_name": employee_name,
-                "created_at": row["last_refunded_at"],
+                "note": note or "—",
+                "payment_method": refund.payment_method or "",
+                "payment_method_label": pm,
+                "qty": int(refund.quantity or 0),
+                "lost_revenue": f"{_to_decimal(refund.amount):.2f}",
+                "employee_name": (
+                    _user_display_name(refund.created_by)
+                    or _user_display_name(getattr(order, "waiter", None))
+                    or employee_name
+                ),
+                "refunded_at": refund.refunded_at,
+                "created_at": refund.refunded_at,
                 "row_kind": "item_refund",
             })
 
-        for row in by_order_refund:
-            note = (row.get("note") or "").strip()
-            pm = pm_labels.get(row.get("payment_method") or "", row.get("payment_method") or "")
+        for refund in or_qs.order_by("-refunded_at", "-id"):
+            order = refund.order
+            note = (refund.note or "").strip()
+            pm = pm_labels.get(refund.payment_method or "", refund.payment_method or "")
             reason = f"Возврат по чеку: {note} ({pm})" if note else f"Возврат по чеку ({pm})"
             rows.append({
+                "order_id": str(refund.order_id),
+                "refund_id": str(refund.id),
+                "dish_title": "—",
+                "table_number": _safe_order_table_number(order),
                 "rejection_reason": reason,
-                "qty": int(row["qty"] or 0),
-                "lost_revenue": f"{_to_decimal(row['lost_revenue']):.2f}",
-                "employee_name": employee_name,
-                "created_at": row["last_refunded_at"],
+                "note": note or "—",
+                "payment_method": refund.payment_method or "",
+                "payment_method_label": pm,
+                "qty": 1,
+                "lost_revenue": f"{_to_decimal(refund.amount):.2f}",
+                "employee_name": (
+                    _user_display_name(refund.created_by)
+                    or _user_display_name(getattr(order, "waiter", None))
+                    or employee_name
+                ),
+                "refunded_at": refund.refunded_at,
+                "created_at": refund.refunded_at,
                 "row_kind": "order_refund",
             })
 
