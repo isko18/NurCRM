@@ -442,20 +442,47 @@ def _shift_active_carts_qs(company, user, shift):
     )
 
 
-def _lock_shift_carts_qs(company, user, shift):
-    """Блокировка open-корзин смены без annotate."""
-    return _shift_carts_base_qs(company, user, shift).select_for_update().order_by("created_at")
+
+def _pick_shift_cart_id(*, company, user, shift, sale_id=None):
+    base = _shift_carts_base_qs(company, user, shift)
+    if sale_id:
+        return sale_id if base.filter(id=sale_id).exists() else None
+    cart_id = (
+        base.filter(is_default=True)
+        .order_by("-updated_at")
+        .values_list("id", flat=True)
+        .first()
+    )
+    if cart_id:
+        return cart_id
+    return base.order_by("-updated_at").values_list("id", flat=True).first()
+
+
+def _lock_single_shift_cart(*, company, user, shift, cart_id):
+    if not cart_id:
+        return None
+    return (
+        _shift_carts_base_qs(company, user, shift)
+        .select_for_update(of=("self",))
+        .filter(id=cart_id)
+        .first()
+    )
 
 
 def _find_locked_shift_cart(*, company, user, shift, sale_id=None):
-    """Одна open-корзина под FOR UPDATE; без Count/annotate (PostgreSQL)."""
-    base = _lock_shift_carts_qs(company, user, shift)
-    if sale_id:
-        return base.filter(id=sale_id).first()
-    cart = base.filter(is_default=True).order_by("-updated_at").first()
-    if cart:
-        return cart
-    return base.order_by("-updated_at").first()
+    """FOR UPDATE только одной корзины — не блокируем всю смену."""
+    cart_id = _pick_shift_cart_id(
+        company=company,
+        user=user,
+        shift=shift,
+        sale_id=sale_id,
+    )
+    return _lock_single_shift_cart(
+        company=company,
+        user=user,
+        shift=shift,
+        cart_id=cart_id,
+    )
 
 
 def _get_pos_open_cart_for_cashier(*, company, user, cart_id):
@@ -476,28 +503,26 @@ def _get_pos_open_cart_for_cashier(*, company, user, cart_id):
 def _abandon_pos_open_cart(*, company, user, cart):
     """Закрыть open-корзину (вкладку кассы) — status=abandoned, не DELETE Sale."""
     shift = cart.shift
-    cart = (
-        Cart.objects.select_for_update()
-        .select_related("shift")
-        .get(id=cart.id, company=company, status=Cart.Status.ACTIVE)
-    )
-    siblings = list(_lock_shift_carts_qs(company, user, shift))
-    was_default = bool(cart.is_default)
-    remaining = [c for c in siblings if c.id != cart.id]
-
-    abandon_cart(cart=cart)
-
-    if was_default and remaining:
-        new_default = remaining[0]
-        Cart.objects.filter(id__in=[c.id for c in remaining]).update(
-            is_default=False,
-            updated_at=timezone.now(),
+    with transaction.atomic():
+        cart = (
+            Cart.objects.select_for_update(of=("self",))
+            .select_related("shift")
+            .get(id=cart.id, company=company, status=Cart.Status.ACTIVE)
         )
-        Cart.objects.filter(id=new_default.id).update(
-            is_default=True,
-            updated_at=timezone.now(),
-        )
-
+        was_default = bool(cart.is_default)
+        abandon_cart(cart=cart)
+        if was_default:
+            new_default_id = (
+                _shift_carts_base_qs(company, user, shift)
+                .order_by("created_at")
+                .values_list("id", flat=True)
+                .first()
+            )
+            if new_default_id:
+                Cart.objects.filter(id=new_default_id).update(
+                    is_default=True,
+                    updated_at=timezone.now(),
+                )
     return shift
 
 
@@ -515,7 +540,7 @@ def _serialize_pos_cart_tab(cart, ordered_carts):
         "id": str(cart.id),
         "is_default": bool(getattr(cart, "is_default", False)),
         "label": _pos_cart_tab_label(cart, ordered_carts),
-        "items_count": int(getattr(cart, "items_count", None) or cart.items.count()),
+        "items_count": int(getattr(cart, "items_count", 0) or 0),
         "total": fmt_money(cart.total),
         "status": "open",
     }
@@ -900,11 +925,13 @@ def _resolve_pos_cashbox(company, branch, cashbox_id=None):
     return cb
 
 
-def _find_open_shift_for_cashier(*, company, cashier, cashbox=None, branch=None):
-    qs = CashShift.objects.select_for_update().filter(
+def _find_open_shift_for_cashier(*, company, cashier, cashbox=None, branch=None, for_update=False):
+    qs = CashShift.objects.filter(
         company=company,
         status=CashShift.Status.OPEN,
     )
+    if for_update:
+        qs = qs.select_for_update()
     if cashbox is not None:
         qs = qs.filter(cashbox=cashbox)
     elif branch is not None:
@@ -919,8 +946,7 @@ def _resolve_requested_open_shift(*, company, cashier, shift_id, cashbox_id=None
         raise ValidationError({"shift": "Некорректный ID смены."})
 
     shift = (
-        CashShift.objects.select_for_update()
-        .select_related("cashbox", "cashier")
+        CashShift.objects.select_related("cashbox", "cashier")
         .filter(id=parsed_shift_id, company=company)
         .first()
     )
@@ -1809,7 +1835,6 @@ class SaleReceiptDataAPIView(MarketCashierOnlyMixin, APIView):
 class SaleStartAPIView(MarketCashierOnlyMixin, CompanyBranchRestrictedMixin, APIView):
     permission_classes = [permissions.IsAuthenticated]
 
-    @transaction.atomic
     def post(self, request, *args, **kwargs):
         user = request.user
         company = self._company() or user.company
@@ -1868,93 +1893,94 @@ class SaleStartAPIView(MarketCashierOnlyMixin, CompanyBranchRestrictedMixin, API
         is_new = bool(opts.validated_data.get("is_new"))
         requested_sale_id = opts.validated_data.get("sale_id")
 
-        cart = None
-        created = False
+        with transaction.atomic():
+            cart = None
+            created = False
 
-        if requested_sale_id:
-            cart = _find_locked_shift_cart(
-                company=company,
-                user=user,
-                shift=shift,
-                sale_id=requested_sale_id,
-            )
-            if not cart:
-                raise ValidationError({"sale_id": "Открытая корзина не найдена в этой смене."})
-        elif is_new:
-            open_count = _shift_carts_base_qs(company, user, shift).count()
-            if open_count >= MAX_OPEN_CARTS_PER_SHIFT:
-                raise ValidationError(
-                    {"detail": f"Достигнут лимит открытых корзин ({MAX_OPEN_CARTS_PER_SHIFT})."}
+            if requested_sale_id:
+                cart = _find_locked_shift_cart(
+                    company=company,
+                    user=user,
+                    shift=shift,
+                    sale_id=requested_sale_id,
                 )
-            cart = Cart.objects.create(
-                company=company,
-                user=user,
-                status=Cart.Status.ACTIVE,
-                branch=branch or shift.branch,
-                shift=shift,
-                is_default=False,
-                is_wholesale=bool(is_wholesale_req) if is_wholesale_req is not None else False,
-            )
-            created = True
-        else:
-            cart = _find_locked_shift_cart(company=company, user=user, shift=shift)
-            if cart is None:
+                if not cart:
+                    raise ValidationError({"sale_id": "Открытая корзина не найдена в этой смене."})
+            elif is_new:
+                open_count = _shift_carts_base_qs(company, user, shift).count()
+                if open_count >= MAX_OPEN_CARTS_PER_SHIFT:
+                    raise ValidationError(
+                        {"detail": f"Достигнут лимит открытых корзин ({MAX_OPEN_CARTS_PER_SHIFT})."}
+                    )
                 cart = Cart.objects.create(
                     company=company,
                     user=user,
                     status=Cart.Status.ACTIVE,
                     branch=branch or shift.branch,
                     shift=shift,
-                    is_default=True,
+                    is_default=False,
                     is_wholesale=bool(is_wholesale_req) if is_wholesale_req is not None else False,
                 )
                 created = True
-            elif (branch or shift.branch) and cart.branch_id != getattr(shift.branch, "id", None):
-                cart.branch = branch or shift.branch
-                cart.save(update_fields=["branch"])
-            elif not _shift_carts_base_qs(company, user, shift).filter(is_default=True).exists():
-                cart.is_default = True
-                cart.save(update_fields=["is_default", "updated_at"])
-
-        # Сначала пересчитываем корзину, чтобы получить актуальный subtotal
-        cart.recalc()
-
-        update_f = []
-        wholesale_changed = False
-
-        if _pos_body_has_explicit_field(
-            request,
-            "order_discount_total",
-            "orderDiscountTotal",
-            "order_discount_percent",
-            "orderDiscountPercent",
-        ):
-            order_disc_total = opts.validated_data.get("order_discount_total")
-            order_disc_percent = opts.validated_data.get("order_discount_percent")
-            if order_disc_percent is not None:
-                cart.order_discount_percent = _q2(Decimal(str(order_disc_percent)))
-                cart.order_discount_total = Decimal("0.00")
             else:
-                cart.order_discount_percent = None
-                cart.order_discount_total = _q2(order_disc_total or Decimal("0.00"))
-            update_f.extend(["order_discount_total", "order_discount_percent"])
+                cart = _find_locked_shift_cart(company=company, user=user, shift=shift)
+                if cart is None:
+                    cart = Cart.objects.create(
+                        company=company,
+                        user=user,
+                        status=Cart.Status.ACTIVE,
+                        branch=branch or shift.branch,
+                        shift=shift,
+                        is_default=True,
+                        is_wholesale=bool(is_wholesale_req) if is_wholesale_req is not None else False,
+                    )
+                    created = True
+                elif (branch or shift.branch) and cart.branch_id != getattr(shift.branch, "id", None):
+                    cart.branch = branch or shift.branch
+                    cart.save(update_fields=["branch"])
+                elif not _shift_carts_base_qs(company, user, shift).filter(is_default=True).exists():
+                    cart.is_default = True
+                    cart.save(update_fields=["is_default", "updated_at"])
 
-        if _pos_body_has_explicit_field(request, "is_wholesale", "isWholesale"):
-            is_wholesale = bool(opts.validated_data.get("is_wholesale"))
-            if getattr(cart, "is_wholesale", False) != is_wholesale:
-                cart.is_wholesale = is_wholesale
-                update_f.append("is_wholesale")
-                wholesale_changed = True
+            cart.recalc()
 
-        if update_f:
-            update_f.append("updated_at")
-            cart.save(update_fields=update_f)
-        # при старте или переключении режима — пересчитать цены уже добавленных товаров
-        if created or wholesale_changed:
-            _reprice_cart_items_for_mode(cart)
+            update_f = []
+            wholesale_changed = False
 
-        cart.recalc()
-        cart = get_object_or_404(_cart_queryset_for_response(), id=cart.id, company=company)
+            if _pos_body_has_explicit_field(
+                request,
+                "order_discount_total",
+                "orderDiscountTotal",
+                "order_discount_percent",
+                "orderDiscountPercent",
+            ):
+                order_disc_total = opts.validated_data.get("order_discount_total")
+                order_disc_percent = opts.validated_data.get("order_discount_percent")
+                if order_disc_percent is not None:
+                    cart.order_discount_percent = _q2(Decimal(str(order_disc_percent)))
+                    cart.order_discount_total = Decimal("0.00")
+                else:
+                    cart.order_discount_percent = None
+                    cart.order_discount_total = _q2(order_disc_total or Decimal("0.00"))
+                update_f.extend(["order_discount_total", "order_discount_percent"])
+
+            if _pos_body_has_explicit_field(request, "is_wholesale", "isWholesale"):
+                is_wholesale = bool(opts.validated_data.get("is_wholesale"))
+                if getattr(cart, "is_wholesale", False) != is_wholesale:
+                    cart.is_wholesale = is_wholesale
+                    update_f.append("is_wholesale")
+                    wholesale_changed = True
+
+            if update_f:
+                update_f.append("updated_at")
+                cart.save(update_fields=update_f)
+            if created or wholesale_changed:
+                _reprice_cart_items_for_mode(cart)
+
+            cart.recalc()
+            cart_id = cart.id
+
+        cart = get_object_or_404(_cart_queryset_for_response(), id=cart_id, company=company)
         return _pos_multi_cart_response(request, cart, status_code=status.HTTP_201_CREATED)
 
 
@@ -2728,7 +2754,6 @@ class SaleRetrieveAPIView(MarketCashierOnlyMixin, CompanyBranchRestrictedMixin, 
 
         return super().retrieve(request, *args, **kwargs)
 
-    @transaction.atomic
     def destroy(self, request, *args, **kwargs):
         pk = kwargs.get(self.lookup_url_kwarg or self.lookup_field)
         user = request.user
