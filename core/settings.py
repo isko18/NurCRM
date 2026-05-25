@@ -405,6 +405,21 @@ LOGGING = {
         },
     },
     'loggers': {
+        'nurcrm.websocket.auth': {
+            'handlers': ['console'],
+            'level': 'INFO',
+            'propagate': False,
+        },
+        'nurcrm.websocket.cafe': {
+            'handlers': ['console'],
+            'level': 'INFO',
+            'propagate': False,
+        },
+        'nurcrm.websocket.consumer': {
+            'handlers': ['console'],
+            'level': 'INFO',
+            'propagate': False,
+        },
         'apps.cafe.consumers': {
             'handlers': ['console'],
             'level': 'INFO',

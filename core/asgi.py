@@ -9,7 +9,7 @@ django_asgi_app = get_asgi_application()
 from channels.routing import ProtocolTypeRouter, URLRouter
 from channels.security.websocket import AllowedHostsOriginValidator
 
-from apps.instagram.ws_jwt import JWTAuthMiddleware
+from core.ws_jwt import JWTAuthMiddleware
 from apps.instagram import routing as ig_routing
 from apps.scale import ws_routing as scale_ws_routing
 from apps.cafe import routing as cafe_routing

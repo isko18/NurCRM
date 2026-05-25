@@ -3,12 +3,16 @@ import json
 import logging
 from channels.generic.websocket import AsyncWebsocketConsumer
 from channels.db import database_sync_to_async
-from django.contrib.auth.models import AnonymousUser
-from rest_framework_simplejwt.tokens import AccessToken
 from django.contrib.auth import get_user_model
 
+from core.ws_consumer_utils import (
+    is_anonymous_scope_user,
+    reject_websocket_forbidden,
+    reject_websocket_unauthorized,
+)
+
 User = get_user_model()
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("nurcrm.websocket.cafe")
 
 
 class CafeOrderConsumer(AsyncWebsocketConsumer):
@@ -20,19 +24,21 @@ class CafeOrderConsumer(AsyncWebsocketConsumer):
     """
     
     async def connect(self):
-        # Получаем пользователя из scope (уже обработан JWTAuthMiddleware)
-        user = self.scope.get("user")
-        if not user or isinstance(user, AnonymousUser):
-            logger.warning(f"[CafeOrderConsumer] Connection rejected: No user")
-            await self.close(code=4003)
+        if is_anonymous_scope_user(self.scope):
+            await reject_websocket_unauthorized(self)
             return
+        
+        user = self.scope["user"]
         
         # Получаем company и branch из пользователя
         company, branch = await self._get_user_company_and_branch(user)
         
         if not company:
-            logger.warning(f"[CafeOrderConsumer] Connection rejected: User {user.id} has no company")
-            await self.close(code=4004, reason="User has no company")
+            logger.warning(
+                "websocket connect forbidden consumer=CafeOrderConsumer user_id=%s reason=no_company",
+                user.id,
+            )
+            await reject_websocket_forbidden(self, reason="no_company")
             return
         
         # Опционально можно указать branch_id в query для выбора конкретного филиала
@@ -64,7 +70,13 @@ class CafeOrderConsumer(AsyncWebsocketConsumer):
         await self.channel_layer.group_add(self.group_name, self.channel_name)
         await self.accept()
         
-        logger.info(f"[CafeOrderConsumer] Connected: user={user.id}, company={self.company_id}, branch={self.branch_id}, group={self.group_name}")
+        logger.info(
+            "websocket connected consumer=CafeOrderConsumer user_id=%s company_id=%s branch_id=%s group=%s",
+            user.id,
+            self.company_id,
+            self.branch_id,
+            self.group_name,
+        )
         
         # Отправляем подтверждение подключения
         await self.send(json.dumps({
@@ -76,7 +88,11 @@ class CafeOrderConsumer(AsyncWebsocketConsumer):
     
     async def disconnect(self, code):
         if hasattr(self, "group_name"):
-            logger.info(f"[CafeTableConsumer] Disconnected: group={self.group_name}, code={code}")
+            logger.info(
+                "websocket disconnected consumer=CafeOrderConsumer group=%s code=%s",
+                self.group_name,
+                code,
+            )
             await self.channel_layer.group_discard(
                 self.group_name, self.channel_name
             )
@@ -224,19 +240,20 @@ class CafeTableConsumer(AsyncWebsocketConsumer):
     """
     
     async def connect(self):
-        # Получаем пользователя из scope (уже обработан JWTAuthMiddleware)
-        user = self.scope.get("user")
-        if not user or isinstance(user, AnonymousUser):
-            logger.warning(f"[CafeTableConsumer] Connection rejected: No user")
-            await self.close(code=4003)
+        if is_anonymous_scope_user(self.scope):
+            await reject_websocket_unauthorized(self)
             return
-        
-        # Получаем company и branch из пользователя
+
+        user = self.scope["user"]
+
         company, branch = await self._get_user_company_and_branch(user)
-        
+
         if not company:
-            logger.warning(f"[CafeTableConsumer] Connection rejected: User {user.id} has no company")
-            await self.close(code=4004, reason="User has no company")
+            logger.warning(
+                "websocket connect forbidden consumer=CafeTableConsumer user_id=%s reason=no_company",
+                user.id,
+            )
+            await reject_websocket_forbidden(self, reason="no_company")
             return
         
         # Опционально можно указать branch_id в query для выбора конкретного филиала
@@ -268,7 +285,13 @@ class CafeTableConsumer(AsyncWebsocketConsumer):
         await self.channel_layer.group_add(self.group_name, self.channel_name)
         await self.accept()
         
-        logger.info(f"[CafeTableConsumer] Connected: user={user.id}, company={self.company_id}, branch={self.branch_id}, group={self.group_name}")
+        logger.info(
+            "websocket connected consumer=CafeTableConsumer user_id=%s company_id=%s branch_id=%s group=%s",
+            user.id,
+            self.company_id,
+            self.branch_id,
+            self.group_name,
+        )
         
         # Отправляем подтверждение подключения
         await self.send(json.dumps({
@@ -280,7 +303,11 @@ class CafeTableConsumer(AsyncWebsocketConsumer):
     
     async def disconnect(self, code):
         if hasattr(self, "group_name"):
-            logger.info(f"[CafeTableConsumer] Disconnected: group={self.group_name}, code={code}")
+            logger.info(
+                "websocket disconnected consumer=CafeTableConsumer group=%s code=%s",
+                self.group_name,
+                code,
+            )
             await self.channel_layer.group_discard(
                 self.group_name, self.channel_name
             )
@@ -418,16 +445,19 @@ class CafeKitchenConsumer(AsyncWebsocketConsumer):
     """
 
     async def connect(self):
-        user = self.scope.get("user")
-        if not user or isinstance(user, AnonymousUser):
-            logger.warning("[CafeKitchenConsumer] Connection rejected: No user")
-            await self.close(code=4003)
+        if is_anonymous_scope_user(self.scope):
+            await reject_websocket_unauthorized(self)
             return
+
+        user = self.scope["user"]
 
         company, branch = await self._get_user_company_and_branch(user)
         if not company:
-            logger.warning(f"[CafeKitchenConsumer] Connection rejected: User {user.id} has no company")
-            await self.close(code=4004, reason="User has no company")
+            logger.warning(
+                "websocket connect forbidden consumer=CafeKitchenConsumer user_id=%s reason=no_company",
+                user.id,
+            )
+            await reject_websocket_forbidden(self, reason="no_company")
             return
 
         # Опционально можно указать branch_id в query для выбора конкретного филиала
@@ -459,8 +489,11 @@ class CafeKitchenConsumer(AsyncWebsocketConsumer):
         await self.accept()
 
         logger.info(
-            f"[CafeKitchenConsumer] Connected: user={user.id}, company={self.company_id}, "
-            f"branch={self.branch_id}, group={self.group_name}"
+            "websocket connected consumer=CafeKitchenConsumer user_id=%s company_id=%s branch_id=%s group=%s",
+            user.id,
+            self.company_id,
+            self.branch_id,
+            self.group_name,
         )
 
         await self.send(json.dumps({
@@ -472,7 +505,11 @@ class CafeKitchenConsumer(AsyncWebsocketConsumer):
 
     async def disconnect(self, code):
         if hasattr(self, "group_name"):
-            logger.info(f"[CafeKitchenConsumer] Disconnected: group={self.group_name}, code={code}")
+            logger.info(
+                "websocket disconnected consumer=CafeKitchenConsumer group=%s code=%s",
+                self.group_name,
+                code,
+            )
             await self.channel_layer.group_discard(self.group_name, self.channel_name)
 
     async def receive(self, text_data=None, bytes_data=None):
