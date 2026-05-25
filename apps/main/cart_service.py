@@ -10,7 +10,7 @@ from django.db.models import Q
 from django.utils import timezone
 from django.core.exceptions import ValidationError
 
-from apps.construction.models import Cashbox, CashierShift, CashFlow
+from apps.construction.models import Cashbox, CashShift
 from .models import Cart, CartItem, Sale, SaleItem, Product
 
 
@@ -28,7 +28,7 @@ class CartOwner:
             raise ValidationError("Нужен user_id или session_key для владения корзиной.")
 
 
-def _resolve_open_shift(*, cashbox: Cashbox, owner: CartOwner) -> Optional[CashierShift]:
+def _resolve_open_shift(*, cashbox: Cashbox, owner: CartOwner) -> Optional[CashShift]:
     """
     Если require_shift=True → смена обязательна (и должна быть OPEN).
     Если False → смена опциональна (вернём открытую, если есть).
@@ -39,10 +39,10 @@ def _resolve_open_shift(*, cashbox: Cashbox, owner: CartOwner) -> Optional[Cashi
             raise ValidationError("Эта касса требует открытую смену, но нет кассира (user).")
         return None
 
-    qs = CashierShift.objects.filter(
+    qs = CashShift.objects.filter(
         cashbox_id=cashbox.id,
         cashier_id=owner.user_id,
-        status=CashierShift.Status.OPEN,
+        status=CashShift.Status.OPEN,
     ).order_by("-opened_at")
 
     shift = qs.first()
