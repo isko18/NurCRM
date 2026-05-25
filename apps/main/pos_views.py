@@ -422,12 +422,14 @@ def _pos_body_has_explicit_field(request, *field_names):
 
 
 def _shift_carts_base_qs(company, user, shift):
-    return Cart.objects.filter(
+    qs = Cart.objects.filter(
         company=company,
-        user=user,
         shift=shift,
         status=Cart.Status.ACTIVE,
     )
+    if user:
+        qs = qs.filter(Q(user=user) | Q(shift__cashier=user))
+    return qs
 
 
 def _shift_active_carts_qs(company, user, shift):
@@ -492,6 +494,8 @@ def _serialize_pos_cart_tab(cart, ordered_carts):
 
 def _serialize_pos_sale(request, cart):
     data = SaleCartSerializer(cart, context={"request": request}).data
+    if data.get("id") is not None:
+        data["id"] = str(data["id"])
     for field in (
         "subtotal",
         "discount_total",
@@ -514,10 +518,13 @@ def _pos_multi_cart_response(request, active_cart, *, status_code=status.HTTP_20
     company = active_cart.company
     carts_qs = _shift_active_carts_qs(company, user, shift)
     ordered = list(carts_qs)
+    active_id = str(active_cart.id)
     return Response(
         {
             "sale": _serialize_pos_sale(request, active_cart),
-            "active_sale_id": str(active_cart.id),
+            "active_sale_id": active_id,
+            # Старый фронт читал id корзины из корня ответа start/scan/GET.
+            "id": active_id,
             "carts": [_serialize_pos_cart_tab(c, ordered) for c in ordered],
         },
         status=status_code,
