@@ -1088,6 +1088,23 @@ class CompanyWarehouseAgent(models.Model):
     def __str__(self):
         return f"{self.user_id} → {self.company_id} [{self.status}]"
 
+    @classmethod
+    def ensure_active_for_warehouse(cls, user, warehouse):
+        """Проверяет, что пользователь — активный агент компании склада."""
+        if warehouse is None:
+            raise ValidationError({"warehouse": "Укажите склад."})
+        membership = cls.objects.filter(
+            company_id=warehouse.company_id,
+            user=user,
+            status=cls.Status.ACTIVE,
+        ).first()
+        if not membership:
+            raise ValidationError({"agent": "Пользователь не является активным агентом этой компании."})
+        assigned_id = membership.assigned_warehouse_id
+        if assigned_id and assigned_id != warehouse.id:
+            raise ValidationError({"agent": "Агенту назначен другой склад."})
+        return membership
+
 
 class CompanyStockPartnership(models.Model):
     """
@@ -1681,13 +1698,7 @@ class AgentRequestCart(BaseModelId, BaseModelDate, BaseModelCompanyBranch):
         self.full_clean()
         self.save(update_fields=["status", "submitted_at", "updated_date"])
 
-    @transaction.atomic
-    def approve(self, by_user):
-        if self.status != self.Status.SUBMITTED:
-            raise ValidationError("Можно одобрить только заявку в статусе 'submitted'.")
-        if not self.items.exists():
-            raise ValidationError("Нельзя одобрить пустую заявку.")
-
+    def _transfer_items_to_agent(self):
         for it in self.items.select_related("product"):
             prod = it.product
             need_qty = q_qty(Decimal(it.quantity_requested or 0))
@@ -1726,11 +1737,38 @@ class AgentRequestCart(BaseModelId, BaseModelDate, BaseModelCompanyBranch):
             stock.qty = q_qty(Decimal(stock.qty or 0) + need_qty)
             stock.save(update_fields=["qty"])
 
+    @transaction.atomic
+    def approve(self, by_user):
+        if self.status != self.Status.SUBMITTED:
+            raise ValidationError("Можно одобрить только заявку в статусе 'submitted'.")
+        if not self.items.exists():
+            raise ValidationError("Нельзя одобрить пустую заявку.")
+
+        self._transfer_items_to_agent()
+
         self.status = self.Status.APPROVED
         self.approved_at = timezone.now()
         self.approved_by = by_user
         self.full_clean()
         self.save(update_fields=["status", "approved_at", "approved_by", "updated_date"])
+
+    @transaction.atomic
+    def dispatch_by_owner(self, by_user):
+        """Владелец выдаёт товар агенту без предварительной заявки агента."""
+        if self.status != self.Status.DRAFT:
+            raise ValidationError("Можно выдать товар только из черновика.")
+        if not self.items.exists():
+            raise ValidationError("Нельзя выдать товар по пустой заявке.")
+
+        self._transfer_items_to_agent()
+
+        now = timezone.now()
+        self.status = self.Status.APPROVED
+        self.submitted_at = now
+        self.approved_at = now
+        self.approved_by = by_user
+        self.full_clean()
+        self.save(update_fields=["status", "submitted_at", "approved_at", "approved_by", "updated_date"])
 
     @transaction.atomic
     def reject(self, by_user):

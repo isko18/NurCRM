@@ -14,6 +14,7 @@ from .views import (
     AgentRequestCartSubmitAPIView,
     AgentRequestCartApproveAPIView,
     AgentRequestCartRejectAPIView,
+    AgentRequestCartDispatchAPIView,
     AgentRequestCartCreateSaleAPIView,
     AgentRequestItemListCreateAPIView,
     AgentRequestItemDetailAPIView,
@@ -123,6 +124,7 @@ urlpatterns += [
     path("agent-carts/<uuid:pk>/submit/", AgentRequestCartSubmitAPIView.as_view(), name="warehouse-agent-cart-submit"),
     path("agent-carts/<uuid:pk>/approve/", AgentRequestCartApproveAPIView.as_view(), name="warehouse-agent-cart-approve"),
     path("agent-carts/<uuid:pk>/reject/", AgentRequestCartRejectAPIView.as_view(), name="warehouse-agent-cart-reject"),
+    path("agent-carts/<uuid:pk>/dispatch/", AgentRequestCartDispatchAPIView.as_view(), name="warehouse-agent-cart-dispatch"),
     path("agent-carts/<uuid:pk>/create-sale/", AgentRequestCartCreateSaleAPIView.as_view(), name="warehouse-agent-cart-create-sale"),
 
     # agent cart items

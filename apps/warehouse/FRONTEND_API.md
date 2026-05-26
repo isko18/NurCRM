@@ -802,14 +802,44 @@ Read-only поля:
 5) отправить заявку владельцу (`submit`).
 
 ### 6.1 Заявки агента на товар
+
+#### 6.1.1 Сценарий агента (запрос → одобрение)
+
 Эндпойнты:
 - `GET /api/warehouse/agent-carts/` — список заявок (агент видит только свои)
-- `POST /api/warehouse/agent-carts/` — создать заявку (agent проставится автоматически)
+- `POST /api/warehouse/agent-carts/` — создать заявку (`agent` проставится автоматически)
 - `GET/PATCH/PUT/DELETE /api/warehouse/agent-carts/{id}/`
 - `POST /api/warehouse/agent-carts/{id}/submit/` — отправить владельцу
-- `POST /api/warehouse/agent-carts/{id}/approve/` — одобрить (только владелец/админ)
+- `POST /api/warehouse/agent-carts/{id}/approve/` — одобрить (только владелец/админ, статус `submitted`)
 - `POST /api/warehouse/agent-carts/{id}/reject/` — отклонить (только владелец/админ)
 - `POST /api/warehouse/agent-carts/{id}/create-sale/` — создать документ `SALE` по позициям заявки (только владелец/админ)
+
+#### 6.1.2 Сценарий владельца (сам выбирает агента и выдаёт товар)
+
+> Подробная документация для фронта: **[OWNER_AGENT_DISPATCH_FRONTEND.md](./OWNER_AGENT_DISPATCH_FRONTEND.md)**
+
+Короткий flow:
+1. `GET /api/warehouse/agents/company-requests/?status=active` — выбрать агента
+2. `POST /api/warehouse/agent-carts/` — создать заявку с полем **`agent`** (обязательно для owner/admin)
+3. `POST /api/warehouse/agent-cart-items/` — добавить позиции
+4. `POST /api/warehouse/agent-carts/{id}/dispatch/` — выдать товар (статус → `approved`)
+
+Body создания заявки владельцем:
+```json
+{
+  "warehouse": "uuid",
+  "agent": "uuid",
+  "note": "Выдача от владельца"
+}
+```
+
+`dispatch` body: `{}` (пустой объект или без body).
+
+Правила:
+- `dispatch` — только owner/admin, только из статуса `draft`;
+- `approve` — только owner/admin, только из статуса `submitted` (входящая заявка агента);
+- для owner/admin поле `agent` при создании **обязательно**;
+- для агента поле `agent` **не передаётся**.
 
 Фильтры (GET /api/warehouse/agent-carts/):
 - `status` — `draft|submitted|approved|rejected`
@@ -858,7 +888,8 @@ Read-only поля:
 ```
 
 Примечание:
-- `agent` не передается: сервер проставляет текущего пользователя.
+- для **агента** поле `agent` не передаётся: сервер проставляет текущего пользователя;
+- для **владельца/админа** поле `agent` **обязательно** при создании заявки;
 - `company` и `branch` не передаются: сервер берёт их из выбранного `warehouse`.
 
 ### 6.2 Позиции заявки

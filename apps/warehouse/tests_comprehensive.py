@@ -1466,3 +1466,91 @@ class WarehouseComprehensiveTests(TestCase):
         )
         self.assertEqual(allowed_cart_response.status_code, 201, allowed_cart_response.data)
         self.assertEqual(allowed_cart_response.data["warehouse"], str(self.wh1.id))
+
+    def test_owner_can_dispatch_goods_to_agent_without_agent_request(self):
+        self.user.role = Roles.OWNER
+        self.user.save(update_fields=["role"])
+
+        agent = User.objects.create_user(
+            email="dispatch-agent@example.com",
+            password="testpass123",
+            first_name="Dispatch",
+            last_name="Agent",
+        )
+        models.CompanyWarehouseAgent.objects.create(
+            company=self.company,
+            user=agent,
+            status=models.CompanyWarehouseAgent.Status.ACTIVE,
+            assigned_warehouse=self.wh1,
+        )
+
+        models.StockBalance.objects.create(
+            warehouse=self.wh1,
+            product=self.prod1,
+            qty=Decimal("50.000"),
+        )
+        self.prod1.quantity = Decimal("50.000")
+        self.prod1.save(update_fields=["quantity"])
+
+        owner_client = APIClient()
+        owner_client.force_authenticate(user=self.user)
+
+        cart_response = owner_client.post(
+            reverse("warehouse-agent-carts"),
+            {
+                "warehouse": str(self.wh1.id),
+                "agent": str(agent.id),
+                "note": "Выдача от владельца",
+            },
+            format="json",
+        )
+        self.assertEqual(cart_response.status_code, 201, cart_response.data)
+        cart_id = cart_response.data["id"]
+        self.assertEqual(cart_response.data["agent"], str(agent.id))
+
+        item_response = owner_client.post(
+            reverse("warehouse-agent-cart-items"),
+            {
+                "cart": cart_id,
+                "product": str(self.prod1.id),
+                "quantity_requested": "10.000",
+            },
+            format="json",
+        )
+        self.assertEqual(item_response.status_code, 201, item_response.data)
+
+        dispatch_response = owner_client.post(
+            reverse("warehouse-agent-cart-dispatch", kwargs={"pk": cart_id}),
+            {},
+            format="json",
+        )
+        self.assertEqual(dispatch_response.status_code, 200, dispatch_response.data)
+        self.assertEqual(dispatch_response.data["status"], models.AgentRequestCart.Status.APPROVED)
+
+        warehouse_bal = models.StockBalance.objects.get(warehouse=self.wh1, product=self.prod1)
+        self.assertEqual(warehouse_bal.qty, Decimal("40.000"))
+
+        agent_bal = models.AgentStockBalance.objects.get(
+            agent=agent,
+            warehouse=self.wh1,
+            product=self.prod1,
+        )
+        self.assertEqual(agent_bal.qty, Decimal("10.000"))
+
+    def test_owner_must_specify_agent_when_creating_cart(self):
+        self.user.role = Roles.OWNER
+        self.user.save(update_fields=["role"])
+
+        owner_client = APIClient()
+        owner_client.force_authenticate(user=self.user)
+
+        response = owner_client.post(
+            reverse("warehouse-agent-carts"),
+            {
+                "warehouse": str(self.wh1.id),
+                "note": "Без агента",
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, 400, response.data)
+        self.assertIn("agent", response.data)

@@ -5,11 +5,13 @@ from PIL import Image
 from django.db import transaction
 
 from django.apps import apps
+from django.core.exceptions import ValidationError as DjangoValidationError
 from django.core.files.base import ContentFile
 from rest_framework import serializers
 
 from apps.warehouse import models as m
 from apps.warehouse.utils import _active_branch, _restrict_pk_queryset_strict, normalize_payment_kind
+from apps.utils import _is_owner_like
 
 
 class CompanyBranchReadOnlyMixin:
@@ -622,6 +624,24 @@ class AgentRequestCartSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSe
         extra_kwargs = {
             "agent": {"required": False},
         }
+
+    def validate(self, attrs):
+        attrs = super().validate(attrs)
+        request = self.context.get("request")
+        user = getattr(request, "user", None) if request else None
+        if self.instance is not None or not user or not _is_owner_like(user):
+            return attrs
+
+        warehouse = attrs.get("warehouse")
+        agent = attrs.get("agent")
+        if not agent:
+            raise serializers.ValidationError({"agent": "Укажите агента, которому отправляете товар."})
+        if warehouse:
+            try:
+                m.CompanyWarehouseAgent.ensure_active_for_warehouse(agent, warehouse)
+            except DjangoValidationError as exc:
+                raise serializers.ValidationError(getattr(exc, "message_dict", {"agent": str(exc)}))
+        return attrs
 
     def get_agent_display(self, obj):
         agent = getattr(obj, "agent", None)

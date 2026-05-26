@@ -753,13 +753,20 @@ class AgentRequestCartListCreateAPIView(CompanyBranchRestrictedMixin, generics.L
 
     def perform_create(self, serializer):
         user = self.request.user
-        if _is_owner_like(user) and serializer.validated_data.get("agent"):
-            agent = serializer.validated_data.get("agent")
-        else:
-            agent = user
         warehouse = serializer.validated_data.get("warehouse")
         if not warehouse:
             raise ValidationError({"warehouse": "Укажите склад."})
+
+        if _is_owner_like(user):
+            agent = serializer.validated_data.get("agent")
+            if not agent:
+                raise ValidationError({"agent": "Укажите агента, которому отправляете товар."})
+            try:
+                m.CompanyWarehouseAgent.ensure_active_for_warehouse(agent, warehouse)
+            except DjangoValidationError as exc:
+                raise ValidationError(getattr(exc, "message_dict", {"detail": str(exc)}))
+        else:
+            agent = user
 
         company_ids = _company_ids_for_warehouse_access(user)
         if company_ids and warehouse.company_id not in company_ids:
@@ -861,6 +868,32 @@ class AgentRequestCartRejectAPIView(CompanyBranchRestrictedMixin, APIView):
         ser.is_valid(raise_exception=True)
         try:
             cart.reject(user)
+        except DjangoValidationError as exc:
+            raise ValidationError(getattr(exc, "message_dict", {"detail": str(exc)}))
+        out = AgentRequestCartSerializer(cart, context={"request": request}).data
+        return Response(out)
+
+
+class AgentRequestCartDispatchAPIView(CompanyBranchRestrictedMixin, APIView):
+    """
+    Владелец/админ выдаёт товар агенту без заявки агента.
+
+    POST /api/warehouse/agent-carts/<id>/dispatch/
+    """
+
+    def post(self, request, pk=None, *args, **kwargs):
+        user = request.user
+        if not _is_owner_like(user):
+            return Response({"detail": "Только владелец/админ."}, status=status.HTTP_403_FORBIDDEN)
+
+        qs = self._filter_qs_company_branch_relaxed(
+            m.AgentRequestCart.objects.select_related("agent", "warehouse").prefetch_related("items__product")
+        )
+        cart = get_object_or_404(qs, pk=pk)
+        ser = AgentRequestCartActionSerializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+        try:
+            cart.dispatch_by_owner(user)
         except DjangoValidationError as exc:
             raise ValidationError(getattr(exc, "message_dict", {"detail": str(exc)}))
         out = AgentRequestCartSerializer(cart, context={"request": request}).data

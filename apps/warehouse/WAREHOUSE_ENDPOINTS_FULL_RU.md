@@ -308,11 +308,19 @@
 
 ### 8.2 `POST /api/warehouse/agent-carts/`
 - Назначение: создать заявку.
-- Body:
+- Body (агент):
 ```json
 {
   "warehouse": "uuid",
   "note": "Прошу выдать товар"
+}
+```
+- Body (владелец/админ — поле `agent` обязательно):
+```json
+{
+  "warehouse": "uuid",
+  "agent": "uuid",
+  "note": "Выдача от владельца"
 }
 ```
 - Ответ `201`.
@@ -348,9 +356,27 @@
 ### 8.8 `POST /api/warehouse/agent-carts/{pk}/reject/`
 - Назначение: отклонить заявку.
 - Доступ: owner/admin.
+- Требования: статус `submitted`.
 - Ответ `200`.
 
-### 8.9 `POST /api/warehouse/agent-carts/{pk}/create-sale/`
+### 8.9 `POST /api/warehouse/agent-carts/{pk}/dispatch/` *(новое)*
+- Назначение: владелец/админ сам выдаёт товар агенту без заявки агента.
+- Доступ: owner/admin.
+- Требования:
+  - статус `draft`
+  - заявка создана с указанием `agent`
+  - есть хотя бы одна позиция
+  - достаточно остатка на складе
+- Действия:
+  - уменьшает `StockBalance`
+  - увеличивает `AgentStockBalance`
+  - статус -> `approved`
+- Body: `{}` (пустой)
+- Ответ `200`.
+
+Подробнее для фронта: **[OWNER_AGENT_DISPATCH_FRONTEND.md](./OWNER_AGENT_DISPATCH_FRONTEND.md)**
+
+### 8.10 `POST /api/warehouse/agent-carts/{pk}/create-sale/`
 - Назначение: создать документ SALE по заявке.
 - Body:
 ```json
