@@ -1687,12 +1687,74 @@ class AgentRequestCart(BaseModelId, BaseModelDate, BaseModelCompanyBranch):
     def is_editable(self) -> bool:
         return self.status == self.Status.DRAFT
 
+    def _warehouse_on_hand(self, product):
+        from apps.warehouse import services as warehouse_services
+
+        balance = StockBalance.objects.filter(warehouse=self.warehouse, product=product).first()
+        on_hand, _ = warehouse_services.resolve_warehouse_on_hand_qty(
+            warehouse=self.warehouse,
+            product=product,
+            balance=balance,
+            sync=False,
+        )
+        return on_hand
+
+    def _submitted_reserved_qty(self, product_id, *, exclude_cart_id=None):
+        qs = AgentRequestItem.objects.filter(
+            cart__warehouse_id=self.warehouse_id,
+            cart__status=self.Status.SUBMITTED,
+            product_id=product_id,
+        )
+        if exclude_cart_id:
+            qs = qs.exclude(cart_id=exclude_cart_id)
+        return q_qty(qs.aggregate(total=Sum("quantity_requested"))["total"] or 0)
+
+    def warehouse_available_qty(self, product, *, exclude_item_id=None):
+        """
+        Сколько ещё можно добавить в заявку с учётом:
+        - остатка на складе;
+        - других заявок в статусе submitted;
+        - других позиций этого же товара в текущем черновике.
+        """
+        on_hand = self._warehouse_on_hand(product)
+        reserved = self._submitted_reserved_qty(product.pk, exclude_cart_id=self.pk)
+        other_in_cart = Decimal("0.000")
+        if self.pk:
+            qs = AgentRequestItem.objects.filter(cart_id=self.pk, product_id=product.pk)
+            if exclude_item_id:
+                qs = qs.exclude(pk=exclude_item_id)
+            other_in_cart = q_qty(qs.aggregate(total=Sum("quantity_requested"))["total"] or 0)
+        return max(on_hand - reserved - other_in_cart, Decimal("0.000"))
+
+    def _validate_items_against_warehouse_stock(self):
+        totals = {}
+        products = {}
+        for it in self.items.select_related("product"):
+            pid = it.product_id
+            totals[pid] = totals.get(pid, Decimal("0.000")) + q_qty(Decimal(it.quantity_requested or 0))
+            products[pid] = it.product
+        for pid, need in totals.items():
+            if need <= 0:
+                continue
+            prod = products[pid]
+            on_hand = self._warehouse_on_hand(prod)
+            reserved = self._submitted_reserved_qty(pid, exclude_cart_id=self.pk)
+            available = max(on_hand - reserved, Decimal("0.000"))
+            if need > available:
+                raise ValidationError({
+                    "items": (
+                        f"Недостаточно на складе для {prod.name}: "
+                        f"запрошено {need}, доступно {available}."
+                    )
+                })
+
     @transaction.atomic
     def submit(self):
         if self.status != self.Status.DRAFT:
             raise ValidationError("Можно отправить только черновик.")
         if not self.items.exists():
             raise ValidationError("Нельзя отправить пустую заявку.")
+        self._validate_items_against_warehouse_stock()
         self.status = self.Status.SUBMITTED
         self.submitted_at = timezone.now()
         self.full_clean()
@@ -1764,6 +1826,7 @@ class AgentRequestCart(BaseModelId, BaseModelDate, BaseModelCompanyBranch):
         if not self.items.exists():
             raise ValidationError("Нельзя выдать товар по пустой заявке.")
 
+        self._validate_items_against_warehouse_stock()
         self._transfer_items_to_agent()
 
         now = timezone.now()
@@ -1825,12 +1888,24 @@ class AgentRequestItem(BaseModelId, BaseModelDate, BaseModelCompanyBranch):
             if self.cart.warehouse_id and self.product.warehouse_id != self.cart.warehouse_id:
                 raise ValidationError({"product": "Товар должен принадлежать выбранному складу."})
 
+            if self.cart.status == AgentRequestCart.Status.DRAFT:
+                need = q_qty(Decimal(self.quantity_requested or 0))
+                available = self.cart.warehouse_available_qty(self.product, exclude_item_id=self.pk)
+                if need > available:
+                    raise ValidationError({
+                        "quantity_requested": (
+                            f"Недостаточно на складе для {self.product.name}: "
+                            f"запрошено {need}, доступно {available}."
+                        )
+                    })
+
     def save(self, *args, **kwargs):
         if self.cart_id:
             if not self.company_id:
                 self.company_id = self.cart.company_id
             if self.branch_id is None:
                 self.branch_id = self.cart.branch_id
+        self.full_clean()
         super().save(*args, **kwargs)
 
 

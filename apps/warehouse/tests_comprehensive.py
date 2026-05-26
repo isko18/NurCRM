@@ -1526,6 +1526,43 @@ class WarehouseComprehensiveTests(TestCase):
         self.prod1.refresh_from_db()
         self.assertEqual(self.prod1.quantity, Decimal("1301.000"))
 
+    def test_agent_cannot_request_more_than_warehouse_stock(self):
+        agent = User.objects.create_user(
+            email="over-request-agent@example.com",
+            password="testpass123",
+        )
+        models.CompanyWarehouseAgent.objects.create(
+            company=self.company,
+            user=agent,
+            status=models.CompanyWarehouseAgent.Status.ACTIVE,
+            assigned_warehouse=self.wh1,
+        )
+        self.prod1.quantity = Decimal("177.000")
+        self.prod1.save(update_fields=["quantity"])
+
+        agent_client = APIClient()
+        agent_client.force_authenticate(user=agent)
+
+        cart_response = agent_client.post(
+            reverse("warehouse-agent-carts"),
+            {"warehouse": str(self.wh1.id)},
+            format="json",
+        )
+        self.assertEqual(cart_response.status_code, 201, cart_response.data)
+        cart_id = cart_response.data["id"]
+
+        item_response = agent_client.post(
+            reverse("warehouse-agent-cart-items"),
+            {
+                "cart": cart_id,
+                "product": str(self.prod1.id),
+                "quantity_requested": "200.000",
+            },
+            format="json",
+        )
+        self.assertEqual(item_response.status_code, 400, item_response.data)
+        self.assertIn("quantity_requested", item_response.data)
+
     def test_owner_can_dispatch_goods_to_agent_without_agent_request(self):
         self.user.role = Roles.OWNER
         self.user.save(update_fields=["role"])

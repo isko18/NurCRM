@@ -10,6 +10,7 @@ from django.core.files.base import ContentFile
 from rest_framework import serializers
 
 from apps.warehouse import models as m
+from apps.warehouse.models import q_qty
 from apps.warehouse.utils import _active_branch, _restrict_pk_queryset_strict, normalize_payment_kind
 from apps.utils import _is_owner_like
 
@@ -568,6 +569,29 @@ class AgentRequestItemSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSe
             "updated_date",
         )
         read_only_fields = ("id", "created_date", "updated_date")
+
+    def validate(self, attrs):
+        attrs = super().validate(attrs)
+        cart = attrs.get("cart") or getattr(getattr(self, "instance", None), "cart", None)
+        product = attrs.get("product") or getattr(getattr(self, "instance", None), "product", None)
+        qty = attrs.get("quantity_requested")
+        if qty is None and getattr(self, "instance", None) is not None:
+            qty = getattr(self.instance, "quantity_requested", None)
+        if not cart or not product or qty is None:
+            return attrs
+        if cart.status != m.AgentRequestCart.Status.DRAFT:
+            return attrs
+        need = q_qty(Decimal(qty or 0))
+        exclude_item_id = getattr(getattr(self, "instance", None), "pk", None)
+        available = cart.warehouse_available_qty(product, exclude_item_id=exclude_item_id)
+        if need > available:
+            raise serializers.ValidationError({
+                "quantity_requested": (
+                    f"Недостаточно на складе для {product.name}: "
+                    f"запрошено {need}, доступно {available}."
+                )
+            })
+        return attrs
 
     def get_discount_amount(self, obj):
         price = getattr(obj.product, "price", None) or Decimal("0")
