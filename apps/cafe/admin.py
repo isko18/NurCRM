@@ -442,6 +442,7 @@ class PreparationProcessingInline(admin.TabularInline):
 
 class PreparationIngredientInline(admin.TabularInline):
     model = PreparationIngredient
+    fk_name = "preparation"
     extra = 0
     fields = (
         "product", "child_preparation", "quantity", "unit", "waste_percent",
