@@ -49,6 +49,18 @@ from apps.warehouse.filters import (
 from apps.utils import _is_owner_like
 
 
+def _cleanup_empty_agent_request_draft(cart_id):
+    """Удаляет пустой черновик заявки, если добавление позиции не удалось."""
+    if not cart_id:
+        return
+    try:
+        cart = m.AgentRequestCart.objects.get(pk=cart_id, status=m.AgentRequestCart.Status.DRAFT)
+    except (m.AgentRequestCart.DoesNotExist, ValueError, TypeError):
+        return
+    if not cart.items.exists():
+        cart.delete()
+
+
 def _company_ids_for_warehouse_access(user):
     """
     Список id компаний, к складам которых пользователь имеет доступ:
@@ -786,6 +798,38 @@ class AgentRequestCartListCreateAPIView(CompanyBranchRestrictedMixin, generics.L
             branch=warehouse.branch,
         )
 
+    def create(self, request, *args, **kwargs):
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        items_data = list(serializer.validated_data.pop("items_input", []) or [])
+        try:
+            with transaction.atomic():
+                self.perform_create(serializer)
+                cart = serializer.instance
+                for row in items_data:
+                    item = m.AgentRequestItem(
+                        cart=cart,
+                        product=row["product"],
+                        quantity_requested=row["quantity_requested"],
+                        company=cart.company,
+                        branch=cart.branch,
+                    )
+                    item.full_clean()
+                    item.save()
+        except DjangoValidationError as exc:
+            raise ValidationError(getattr(exc, "message_dict", {"detail": str(exc)}))
+
+        cart = (
+            m.AgentRequestCart.objects
+            .select_related("agent", "warehouse", "approved_by")
+            .prefetch_related("items__product")
+            .get(pk=cart.pk)
+        )
+        out = AgentRequestCartSerializer(cart, context={"request": request}).data
+        headers = self.get_success_headers(out)
+        return Response(out, status=status.HTTP_201_CREATED, headers=headers)
+
 
 class AgentRequestCartRetrieveUpdateDestroyAPIView(CompanyBranchRestrictedMixin, generics.RetrieveUpdateDestroyAPIView):
     serializer_class = AgentRequestCartSerializer
@@ -834,7 +878,10 @@ class AgentRequestCartSubmitAPIView(CompanyBranchRestrictedMixin, APIView):
         try:
             cart.submit()
         except DjangoValidationError as exc:
-            raise ValidationError(getattr(exc, "message_dict", {"detail": str(exc)}))
+            err = getattr(exc, "message_dict", {})
+            if "items" in err:
+                cart.delete()
+            raise ValidationError(err or {"detail": str(exc)})
         out = AgentRequestCartSerializer(cart, context={"request": request}).data
         return Response(out)
 
@@ -1021,10 +1068,22 @@ class AgentRequestItemListCreateAPIView(CompanyBranchRestrictedMixin, generics.L
         self._ensure_agent_can_access_warehouse(getattr(cart, "warehouse", None), field_name="cart")
         if cart.status != m.AgentRequestCart.Status.DRAFT:
             raise ValidationError("Можно добавлять позиции только в черновик.")
-        serializer.save(
-            company=cart.company,
-            branch=cart.branch,
-        )
+        try:
+            serializer.save(
+                company=cart.company,
+                branch=cart.branch,
+            )
+        except DjangoValidationError as exc:
+            _cleanup_empty_agent_request_draft(getattr(cart, "pk", None))
+            raise ValidationError(getattr(exc, "message_dict", {"detail": str(exc)}))
+
+    def create(self, request, *args, **kwargs):
+        cart_id = request.data.get("cart")
+        try:
+            return super().create(request, *args, **kwargs)
+        except ValidationError:
+            _cleanup_empty_agent_request_draft(cart_id)
+            raise
 
 
 class AgentRequestItemDetailAPIView(CompanyBranchRestrictedMixin, generics.RetrieveUpdateDestroyAPIView):

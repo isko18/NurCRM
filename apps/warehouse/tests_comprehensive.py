@@ -1562,6 +1562,43 @@ class WarehouseComprehensiveTests(TestCase):
         )
         self.assertEqual(item_response.status_code, 400, item_response.data)
         self.assertIn("quantity_requested", item_response.data)
+        self.assertFalse(models.AgentRequestCart.objects.filter(pk=cart_id).exists())
+
+    def test_atomic_cart_create_rolls_back_on_invalid_item(self):
+        agent = User.objects.create_user(
+            email="atomic-cart-agent@example.com",
+            password="testpass123",
+        )
+        models.CompanyWarehouseAgent.objects.create(
+            company=self.company,
+            user=agent,
+            status=models.CompanyWarehouseAgent.Status.ACTIVE,
+            assigned_warehouse=self.wh1,
+        )
+        self.prod1.quantity = Decimal("177.000")
+        self.prod1.save(update_fields=["quantity"])
+
+        agent_client = APIClient()
+        agent_client.force_authenticate(user=agent)
+
+        response = agent_client.post(
+            reverse("warehouse-agent-carts"),
+            {
+                "warehouse": str(self.wh1.id),
+                "note": "Заявка",
+                "items_input": [
+                    {
+                        "product": str(self.prod1.id),
+                        "quantity_requested": "200.000",
+                    }
+                ],
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, 400, response.data)
+        self.assertFalse(
+            models.AgentRequestCart.objects.filter(agent=agent, warehouse=self.wh1).exists()
+        )
 
     def test_owner_can_dispatch_goods_to_agent_without_agent_request(self):
         self.user.role = Roles.OWNER

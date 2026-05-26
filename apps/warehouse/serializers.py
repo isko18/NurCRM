@@ -609,8 +609,15 @@ class AgentRequestItemSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSe
         return (subtotal - discount).quantize(Decimal("0.01"))
 
 
+class AgentRequestCartItemInputSerializer(serializers.Serializer):
+    """Позиция при создании заявки одним запросом вместе с cart."""
+    product = serializers.PrimaryKeyRelatedField(queryset=m.WarehouseProduct.objects.all())
+    quantity_requested = serializers.DecimalField(max_digits=18, decimal_places=3)
+
+
 class AgentRequestCartSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
     items = AgentRequestItemSerializer(many=True, read_only=True)
+    items_input = AgentRequestCartItemInputSerializer(many=True, required=False, write_only=True)
     agent_display = serializers.SerializerMethodField()
     note = serializers.CharField(required=False, allow_blank=True)
     sale_document_number = serializers.CharField(source="sale_document.number", read_only=True, allow_null=True)
@@ -633,6 +640,7 @@ class AgentRequestCartSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSe
             "created_date",
             "updated_date",
             "items",
+            "items_input",
         )
         read_only_fields = (
             "id",
