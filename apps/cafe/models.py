@@ -863,11 +863,16 @@ class Preparation(models.Model):
 
     name = models.CharField("Название", max_length=255)
     source_product = models.ForeignKey(
-        Warehouse, on_delete=models.PROTECT, related_name="preparations_source", verbose_name="Исходный продукт"
+        Warehouse, on_delete=models.PROTECT, related_name="preparations_source", verbose_name="Исходный продукт",
+        null=True, blank=True,
     )
 
-    input_quantity = models.DecimalField("Вход", max_digits=14, decimal_places=6, validators=[MinValueValidator(Decimal("0.000001"))])
-    input_unit = models.CharField("Ед. входа", max_length=16)
+    input_quantity = models.DecimalField(
+        "Вход", max_digits=14, decimal_places=6,
+        validators=[MinValueValidator(Decimal("0.000001"))],
+        default=Decimal("1"),
+    )
+    input_unit = models.CharField("Ед. входа", max_length=16, default="kg")
     output_quantity = models.DecimalField("Выход", max_digits=14, decimal_places=6, validators=[MinValueValidator(Decimal("0.000001"))])
     output_unit = models.CharField("Ед. выхода", max_length=16)
 
@@ -909,15 +914,99 @@ class Preparation(models.Model):
     def clean(self):
         if self.branch_id and self.branch.company_id != self.company_id:
             raise ValidationError({"branch": "Филиал принадлежит другой компании."})
-        if self.source_product_id and self.source_product.company_id != self.company_id:
-            raise ValidationError({"source_product": "Продукт со склада другой компании."})
-        if (self.branch_id or None) != (self.source_product.branch_id or None):
-            raise ValidationError({"source_product": "Продукт со склада другого филиала."})
+        if self.source_product_id:
+            if self.source_product.company_id != self.company_id:
+                raise ValidationError({"source_product": "Продукт со склада другой компании."})
+            if (self.branch_id or None) != (self.source_product.branch_id or None):
+                raise ValidationError({"source_product": "Продукт со склада другого филиала."})
         if self.output_quantity and self.input_quantity and self.output_quantity > self.input_quantity:
             raise ValidationError({"output_quantity": "Выход не может быть больше входа."})
 
     def __str__(self):
         return self.name
+
+
+class PreparationIngredient(models.Model):
+    """Строка техкарты заготовки: продукт со склада или вложенная заготовка."""
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    preparation = models.ForeignKey(
+        Preparation, on_delete=models.CASCADE, related_name="ingredients", verbose_name="Заготовка"
+    )
+    product = models.ForeignKey(
+        Warehouse, on_delete=models.PROTECT,
+        related_name="preparation_ingredients_product", verbose_name="Продукт",
+        null=True, blank=True,
+    )
+    child_preparation = models.ForeignKey(
+        Preparation, on_delete=models.PROTECT,
+        related_name="used_in_preparation_ingredients", verbose_name="Заготовка (вложенная)",
+        null=True, blank=True,
+    )
+
+    quantity = models.DecimalField(
+        "Количество", max_digits=14, decimal_places=6,
+        validators=[MinValueValidator(Decimal("0.000001"))],
+    )
+    unit = models.CharField("Ед. изм.", max_length=16)
+    waste_percent = models.DecimalField(
+        "Потери (%)", max_digits=6, decimal_places=2, default=Decimal("0.00"),
+    )
+
+    unit_cost = models.DecimalField("Цена за единицу", max_digits=12, decimal_places=4, default=Decimal("0.0000"))
+    ingredient_cost = models.DecimalField("Стоимость ингредиента", max_digits=12, decimal_places=2, default=Decimal("0.00"))
+    processing_cost = models.DecimalField("Стоимость обработок", max_digits=12, decimal_places=2, default=Decimal("0.00"))
+    total_cost = models.DecimalField("Итого", max_digits=12, decimal_places=2, default=Decimal("0.00"))
+
+    created_at = models.DateTimeField("Создано", auto_now_add=True)
+    updated_at = models.DateTimeField("Обновлено", auto_now=True)
+
+    class Meta:
+        verbose_name = "Ингредиент заготовки"
+        verbose_name_plural = "Ингредиенты заготовки"
+        indexes = [
+            models.Index(fields=["preparation"]),
+            models.Index(fields=["product"]),
+            models.Index(fields=["child_preparation"]),
+        ]
+
+    def clean(self):
+        has_product = bool(self.product_id)
+        has_child = bool(self.child_preparation_id)
+        if has_product == has_child:
+            raise ValidationError(
+                "Укажите ровно один источник: product или child_preparation."
+            )
+        if self.preparation_id and self.child_preparation_id:
+            if self.preparation_id == self.child_preparation_id:
+                raise ValidationError({"child_preparation": "Заготовка не может ссылаться на саму себя."})
+        if self.quantity is not None and self.quantity <= 0:
+            raise ValidationError({"quantity": "Количество должно быть больше 0."})
+        wp = Decimal(self.waste_percent or 0)
+        if wp < 0:
+            raise ValidationError({"waste_percent": "Не может быть отрицательным."})
+        if wp >= 100:
+            raise ValidationError({"waste_percent": "Должно быть меньше 100."})
+        if self.preparation_id:
+            prep = self.preparation
+            if has_product and self.product_id:
+                if self.product.company_id != prep.company_id:
+                    raise ValidationError({"product": "Продукт другой компании."})
+                if (self.product.branch_id or None) != (prep.branch_id or None):
+                    raise ValidationError({"product": "Продукт другого филиала."})
+            if has_child and self.child_preparation_id:
+                child = self.child_preparation
+                if child.company_id != prep.company_id:
+                    raise ValidationError({"child_preparation": "Заготовка другой компании."})
+                if (child.branch_id or None) != (prep.branch_id or None):
+                    raise ValidationError({"child_preparation": "Заготовка другого филиала."})
+
+    def __str__(self):
+        if self.product_id:
+            return f"{self.product.title} ({self.quantity} {self.unit})"
+        if self.child_preparation_id:
+            return f"{self.child_preparation.name} ({self.quantity} {self.unit})"
+        return f"({self.quantity} {self.unit})"
 
 
 class PreparationProcessing(models.Model):

@@ -15,7 +15,8 @@ from apps.cafe.models import (
     OrderHistory, OrderItemHistory, KitchenTask, NotificationCafe, InventorySession, InventoryItem, Equipment, EquipmentInventoryItem, EquipmentInventorySession, Kitchen,
     CafeReceiptPrinterSettings,
     CafeExpense, CafeWaiterPayProfile,
-    Preparation, PreparationProcessing, ProcessingType, DishIngredient, DishIngredientProcessing,
+    Preparation, PreparationIngredient, PreparationProcessing, ProcessingType,
+    DishIngredient, DishIngredientProcessing,
 )
 from apps.users.models import Branch
 from apps.utils import _is_owner_like
@@ -536,12 +537,19 @@ class PreparationSerializer(CompanyBranchReadOnlyMixin):
     def validate(self, attrs):
         input_q = attrs.get("input_quantity", getattr(self.instance, "input_quantity", None) if self.instance else None)
         output_q = attrs.get("output_quantity", getattr(self.instance, "output_quantity", None) if self.instance else None)
-        if input_q is not None and input_q <= 0:
-            raise serializers.ValidationError({"input_quantity": "Должно быть больше 0."})
+        source = attrs.get("source_product", getattr(self.instance, "source_product", None) if self.instance else None)
+        has_ingredients = bool(self.instance and self.instance.ingredients.exists()) if self.instance else False
+
         if output_q is not None and output_q <= 0:
             raise serializers.ValidationError({"output_quantity": "Должно быть больше 0."})
+        if input_q is not None and input_q <= 0:
+            raise serializers.ValidationError({"input_quantity": "Должно быть больше 0."})
         if input_q is not None and output_q is not None and output_q > input_q:
             raise serializers.ValidationError({"output_quantity": "Выход не может быть больше входа."})
+        if not has_ingredients and not source:
+            raise serializers.ValidationError(
+                {"source_product": "Укажите исходный продукт или добавьте строки техкарты (ingredients)."}
+            )
         pcost = attrs.get("processing_cost")
         if pcost is not None and pcost < 0:
             raise serializers.ValidationError({"processing_cost": "Не может быть отрицательной."})
@@ -567,23 +575,152 @@ class PreparationSerializer(CompanyBranchReadOnlyMixin):
 
 
 class PreparationReceiveSerializer(serializers.Serializer):
-    input_quantity = serializers.DecimalField(max_digits=14, decimal_places=6)
-    output_quantity = serializers.DecimalField(max_digits=14, decimal_places=6)
+    input_quantity = serializers.DecimalField(max_digits=14, decimal_places=6, required=False)
+    output_quantity = serializers.DecimalField(max_digits=14, decimal_places=6, required=False)
+    batch_output_quantity = serializers.DecimalField(max_digits=14, decimal_places=6, required=False)
     processing_cost = serializers.DecimalField(max_digits=12, decimal_places=2, required=False, allow_null=True)
 
     def validate(self, attrs):
         iq = attrs.get("input_quantity")
         oq = attrs.get("output_quantity")
-        if iq is None or iq <= 0:
+        batch = attrs.get("batch_output_quantity")
+        if iq is not None and iq <= 0:
             raise serializers.ValidationError({"input_quantity": "Должно быть больше 0."})
-        if oq is None or oq <= 0:
+        if oq is not None and oq <= 0:
             raise serializers.ValidationError({"output_quantity": "Должно быть больше 0."})
-        if oq > iq:
+        if batch is not None and batch <= 0:
+            raise serializers.ValidationError({"batch_output_quantity": "Должно быть больше 0."})
+        if iq is not None and oq is not None and oq > iq:
             raise serializers.ValidationError({"output_quantity": "Выход не может быть больше входа."})
         pc = attrs.get("processing_cost")
         if pc is not None and pc < 0:
             raise serializers.ValidationError({"processing_cost": "Не может быть отрицательной."})
         return attrs
+
+
+class PreparationIngredientSerializer(serializers.ModelSerializer):
+    product_title = serializers.CharField(source="product.title", read_only=True, allow_null=True)
+    child_preparation_name = serializers.CharField(source="child_preparation.name", read_only=True, allow_null=True)
+    ingredient_type = serializers.SerializerMethodField()
+
+    class Meta:
+        model = PreparationIngredient
+        fields = [
+            "id", "preparation",
+            "product", "product_title",
+            "child_preparation", "child_preparation_name",
+            "ingredient_type",
+            "quantity", "unit", "waste_percent",
+            "unit_cost", "ingredient_cost", "processing_cost", "total_cost",
+            "created_at", "updated_at",
+        ]
+        read_only_fields = [
+            "id", "preparation",
+            "unit_cost", "ingredient_cost", "processing_cost", "total_cost",
+            "created_at", "updated_at",
+        ]
+
+    def get_ingredient_type(self, obj):
+        if obj.product_id:
+            return "product"
+        if obj.child_preparation_id:
+            return "preparation"
+        return None
+
+
+class PreparationIngredientCreateUpdateSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = PreparationIngredient
+        fields = [
+            "id", "product", "child_preparation",
+            "quantity", "unit", "waste_percent",
+        ]
+        read_only_fields = ["id"]
+
+    def get_fields(self):
+        fields = super().get_fields()
+        holder = self
+        if "product" in fields:
+            fields["product"].queryset = _scope_queryset_by_context(Warehouse.objects.all(), holder)
+        if "child_preparation" in fields:
+            fields["child_preparation"].queryset = _scope_queryset_by_context(Preparation.objects.all(), holder)
+        return fields
+
+    def validate(self, attrs):
+        from apps.cafe.services.costing import check_preparation_cycle, convert_quantity, _norm_unit
+
+        product = attrs.get("product", getattr(self.instance, "product", None) if self.instance else None)
+        child = attrs.get(
+            "child_preparation",
+            getattr(self.instance, "child_preparation", None) if self.instance else None,
+        )
+        has_product = bool(product)
+        has_child = bool(child)
+        if has_product == has_child:
+            raise serializers.ValidationError(
+                "Укажите ровно один источник: product или child_preparation."
+            )
+
+        qty = attrs.get("quantity", getattr(self.instance, "quantity", None) if self.instance else None)
+        if qty is not None and qty <= 0:
+            raise serializers.ValidationError({"quantity": "Должно быть больше 0."})
+
+        wp = attrs.get(
+            "waste_percent",
+            getattr(self.instance, "waste_percent", Decimal("0")) if self.instance else Decimal("0"),
+        )
+        if wp is not None:
+            wp = Decimal(wp)
+            if wp < 0:
+                raise serializers.ValidationError({"waste_percent": "Не может быть отрицательным."})
+            if wp >= 100:
+                raise serializers.ValidationError({"waste_percent": "Должно быть меньше 100."})
+
+        unit = attrs.get("unit", getattr(self.instance, "unit", "") if self.instance else "")
+        if unit:
+            try:
+                if has_product:
+                    convert_quantity(Decimal("1"), _norm_unit(unit), _norm_unit(product.unit))
+                elif has_child:
+                    convert_quantity(Decimal("1"), _norm_unit(unit), _norm_unit(child.output_unit))
+            except ValueError as e:
+                raise serializers.ValidationError({"unit": str(e)})
+
+        preparation = self.context.get("preparation")
+        if preparation is None and self.instance:
+            preparation = self.instance.preparation
+        if preparation and has_child:
+            try:
+                check_preparation_cycle(preparation, child)
+            except ValueError as e:
+                raise serializers.ValidationError({"child_preparation": str(e)})
+
+        return attrs
+
+
+class PreparationTechCardItemSerializer(serializers.Serializer):
+    id = serializers.UUIDField()
+    type = serializers.CharField()
+    name = serializers.CharField()
+    quantity = serializers.DecimalField(max_digits=14, decimal_places=3)
+    unit = serializers.CharField()
+    waste_percent = serializers.DecimalField(max_digits=6, decimal_places=2)
+    unit_cost = serializers.DecimalField(max_digits=12, decimal_places=2)
+    ingredient_cost = serializers.DecimalField(max_digits=12, decimal_places=2)
+    processing_cost = serializers.DecimalField(max_digits=12, decimal_places=2)
+    total_cost = serializers.DecimalField(max_digits=12, decimal_places=2)
+
+
+class PreparationTechCardSerializer(serializers.Serializer):
+    id = serializers.UUIDField()
+    name = serializers.CharField()
+    type = serializers.CharField(default="preparation")
+    output_quantity = serializers.DecimalField(max_digits=14, decimal_places=3)
+    output_unit = serializers.CharField()
+    total_cost = serializers.DecimalField(max_digits=12, decimal_places=2)
+    unit_cost = serializers.DecimalField(max_digits=12, decimal_places=2)
+    stock_quantity = serializers.DecimalField(max_digits=14, decimal_places=3)
+    items = PreparationTechCardItemSerializer(many=True)
 
 
 class DishIngredientProcessingSerializer(serializers.ModelSerializer):

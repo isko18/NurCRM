@@ -7,12 +7,13 @@ from django.utils import timezone
 from .models import (
     CafeClient, Order, OrderItem, Table, MenuItem,
     OrderHistory, OrderItemHistory,
-    Zone,  Warehouse,
+    Zone, Warehouse,
     KitchenTask, NotificationCafe,
     InventorySession, InventoryItem,
     Equipment, EquipmentInventorySession, EquipmentInventoryItem, Kitchen,
     CafeReceiptPrinterSettings,
     CafeExpense, CafeWaiterPayProfile,
+    Preparation, PreparationIngredient, PreparationProcessing,
 )
 
 @admin.register(CafeReceiptPrinterSettings)
@@ -433,6 +434,36 @@ class EquipmentInventorySessionAdmin(admin.ModelAdmin):
     inlines = [EquipmentInventoryItemInline]
     ordering = ("-created_at",)
     
+class PreparationProcessingInline(admin.TabularInline):
+    model = PreparationProcessing
+    extra = 0
+    fields = ("name", "cost", "charge_type", "unit")
+
+
+class PreparationIngredientInline(admin.TabularInline):
+    model = PreparationIngredient
+    extra = 0
+    fields = (
+        "product", "child_preparation", "quantity", "unit", "waste_percent",
+        "unit_cost", "ingredient_cost", "processing_cost", "total_cost",
+    )
+    readonly_fields = ("unit_cost", "ingredient_cost", "processing_cost", "total_cost")
+    autocomplete_fields = ("product", "child_preparation")
+
+
+@admin.register(Preparation)
+class PreparationAdmin(admin.ModelAdmin):
+    list_display = ("name", "company", "branch", "output_quantity", "output_unit", "unit_cost", "stock_quantity", "is_active")
+    list_filter = ("company", "branch", "is_active")
+    search_fields = ("name",)
+    readonly_fields = (
+        "loss_quantity", "loss_percent", "raw_material_cost", "total_cost", "unit_cost",
+        "created_at", "updated_at",
+    )
+    inlines = [PreparationIngredientInline, PreparationProcessingInline]
+    raw_id_fields = ("source_product", "company", "branch")
+
+
 @admin.register(Warehouse)
 class WarehouseAdmin(admin.ModelAdmin):
     list_display = ("title", "supplier", "company", "branch", "unit", "remainder", "minimum")

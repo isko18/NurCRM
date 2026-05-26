@@ -33,7 +33,8 @@ from .models import (
     InventorySession, Equipment, EquipmentInventorySession, Kitchen,
     CafeReceiptPrinterSettings,
     CafeExpense, CafeWaiterPayProfile,
-    Preparation, PreparationProcessing, ProcessingType, DishIngredient, DishIngredientProcessing,
+    Preparation, PreparationIngredient, PreparationProcessing, ProcessingType,
+    DishIngredient, DishIngredientProcessing,
 )
 from .serializers import (
     ZoneSerializer, TableSerializer, BookingSerializer,
@@ -50,13 +51,22 @@ from .serializers import (
     CafeReceiptPrinterSettingsSerializer,
     CafeExpenseSerializer, CafeWaiterPayProfileSerializer,
     PreparationSerializer, PreparationReceiveSerializer, ProcessingTypeSerializer,
+    PreparationIngredientSerializer, PreparationIngredientCreateUpdateSerializer,
+    PreparationTechCardSerializer,
     DishIngredientSerializer, DishIngredientProcessingCreateSerializer,
     DishCostSerializer, DishCalculatePreviewSerializer,
 )
 from apps.utils import _is_owner_like
 
-from .services.costing import recalculate_dish, calculate_preparation, calculate_margin, calculate_ingredient
-from .services.stock import consume_dish_for_order, consume_product, add_preparation_stock
+from .services.costing import (
+    recalculate_dish,
+    recalculate_preparation,
+    recalculate_preparation_tree,
+    recalculate_preparations_for_warehouse,
+    calculate_margin,
+    calculate_ingredient,
+)
+from .services.stock import consume_dish_for_order, receive_preparation
 
 
 _NUM_RE = re.compile(r"[-+]?\d+(?:[.,]\d+)?")
@@ -614,13 +624,23 @@ class WarehouseRetrieveUpdateDestroyView(CompanyBranchQuerysetMixin, generics.Re
     serializer_class = WarehouseSerializer
 
     def perform_update(self, serializer):
+        old_price = None
+        if serializer.instance:
+            old_price = Decimal(serializer.instance.unit_price or 0)
         try:
-            serializer.save()
+            obj = serializer.save()
         except IntegrityError as e:
             msg = str(e)
             if "uniq_warehouse_title_" in msg:
                 raise ValidationError({"title": "Склад с таким названием уже существует в этой компании или филиале."})
             raise
+        new_price = Decimal(obj.unit_price or 0)
+        if old_price != new_price:
+            with transaction.atomic():
+                try:
+                    recalculate_preparations_for_warehouse(obj)
+                except ValueError as e:
+                    raise ValidationError({"detail": str(e)})
 
 
 class WarehouseStockAdjustView(CompanyBranchQuerysetMixin, APIView):
@@ -948,14 +968,10 @@ class PreparationListCreateView(CompanyBranchQuerysetMixin, generics.ListCreateA
 
         with transaction.atomic():
             obj: Preparation = serializer.save(**kwargs)
-            # Расчёт полей заготовки
-            calc = calculate_preparation(obj)
-            obj.loss_quantity = calc["loss_quantity"]
-            obj.loss_percent = calc["loss_percent"]
-            obj.raw_material_cost = calc["raw_material_cost"]
-            obj.total_cost = calc["total_cost"]
-            obj.unit_cost = calc["unit_cost"]
-            obj.save(update_fields=["loss_quantity", "loss_percent", "raw_material_cost", "total_cost", "unit_cost", "updated_at"])
+            try:
+                recalculate_preparation(obj, save=True)
+            except ValueError as e:
+                raise ValidationError({"detail": str(e)})
 
 
 class PreparationRetrieveUpdateDestroyView(CompanyBranchQuerysetMixin, generics.RetrieveUpdateDestroyAPIView):
@@ -991,24 +1007,164 @@ class PreparationRetrieveUpdateDestroyView(CompanyBranchQuerysetMixin, generics.
     def perform_update(self, serializer):
         with transaction.atomic():
             obj: Preparation = serializer.save()
-            calc = calculate_preparation(obj)
-            obj.loss_quantity = calc["loss_quantity"]
-            obj.loss_percent = calc["loss_percent"]
-            obj.raw_material_cost = calc["raw_material_cost"]
-            obj.total_cost = calc["total_cost"]
-            obj.unit_cost = calc["unit_cost"]
-            obj.save(update_fields=["loss_quantity", "loss_percent", "raw_material_cost", "total_cost", "unit_cost", "updated_at"])
+            try:
+                recalculate_preparation_tree(obj)
+            except ValueError as e:
+                raise ValidationError({"detail": str(e)})
 
-            # Автопересчёт блюд, которые используют заготовку
-            dish_ids = list(
-                DishIngredient.objects.filter(preparation=obj).values_list("dish_id", flat=True).distinct()
-            )
-            if dish_ids:
-                for d in MenuItem.objects.filter(id__in=dish_ids).all():
-                    try:
-                        recalculate_dish(d, save=True)
-                    except ValueError as e:
-                        raise ValidationError({"detail": str(e)})
+
+def _preparation_queryset_for_user(mixin, company):
+    b = mixin._active_branch()
+    qs = Preparation.objects.select_related("source_product").prefetch_related(
+        "processings", "ingredients__product", "ingredients__child_preparation",
+    ).filter(company=company)
+    if b is not None:
+        return qs.filter(Q(branch=b) | Q(branch__isnull=True))
+    return qs.filter(branch__isnull=True)
+
+
+def _build_preparation_tech_card(prep: Preparation) -> dict:
+    items = []
+    for row in prep.ingredients.select_related("product", "child_preparation").order_by("created_at"):
+        if row.product_id:
+            items.append({
+                "id": row.id,
+                "type": "product",
+                "name": row.product.title,
+                "quantity": row.quantity,
+                "unit": row.unit,
+                "waste_percent": row.waste_percent,
+                "unit_cost": row.unit_cost,
+                "ingredient_cost": row.ingredient_cost,
+                "processing_cost": row.processing_cost,
+                "total_cost": row.total_cost,
+            })
+        else:
+            items.append({
+                "id": row.id,
+                "type": "preparation",
+                "name": row.child_preparation.name,
+                "quantity": row.quantity,
+                "unit": row.unit,
+                "waste_percent": row.waste_percent,
+                "unit_cost": row.unit_cost,
+                "ingredient_cost": row.ingredient_cost,
+                "processing_cost": row.processing_cost,
+                "total_cost": row.total_cost,
+            })
+    return {
+        "id": prep.id,
+        "name": prep.name,
+        "type": "preparation",
+        "output_quantity": prep.output_quantity,
+        "output_unit": prep.output_unit,
+        "total_cost": prep.total_cost,
+        "unit_cost": prep.unit_cost,
+        "stock_quantity": prep.stock_quantity,
+        "items": items,
+    }
+
+
+class PreparationTechCardView(CompanyBranchQuerysetMixin, APIView):
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request, pk):
+        company = self._user_company()
+        if not company:
+            return Response({"detail": "Компания не найдена."}, status=status.HTTP_403_FORBIDDEN)
+        prep = generics.get_object_or_404(_preparation_queryset_for_user(self, company), pk=pk)
+        with transaction.atomic():
+            try:
+                recalculate_preparation_tree(prep)
+            except ValueError as e:
+                raise ValidationError({"detail": str(e)})
+        prep.refresh_from_db()
+        data = _build_preparation_tech_card(prep)
+        return Response(PreparationTechCardSerializer(data).data)
+
+
+class PreparationIngredientListCreateView(CompanyBranchQuerysetMixin, APIView):
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request, preparation_id):
+        company = self._user_company()
+        if not company:
+            return Response({"detail": "Компания не найдена."}, status=status.HTTP_403_FORBIDDEN)
+        prep = generics.get_object_or_404(_preparation_queryset_for_user(self, company), pk=preparation_id)
+        rows = prep.ingredients.select_related("product", "child_preparation").order_by("created_at")
+        return Response(
+            PreparationIngredientSerializer(rows, many=True, context={"request": request}).data
+        )
+
+    def post(self, request, preparation_id):
+        company = self._user_company()
+        if not company:
+            return Response({"detail": "Компания не найдена."}, status=status.HTTP_403_FORBIDDEN)
+        prep = generics.get_object_or_404(_preparation_queryset_for_user(self, company), pk=preparation_id)
+        ser = PreparationIngredientCreateUpdateSerializer(
+            data=request.data,
+            context={"request": request, "preparation": prep},
+        )
+        ser.is_valid(raise_exception=True)
+        with transaction.atomic():
+            row = PreparationIngredient.objects.create(preparation=prep, **ser.validated_data)
+            try:
+                recalculate_preparation_tree(prep)
+            except ValueError as e:
+                raise ValidationError({"detail": str(e)})
+        row.refresh_from_db()
+        return Response(
+            PreparationIngredientSerializer(row, context={"request": request}).data,
+            status=status.HTTP_201_CREATED,
+        )
+
+
+class PreparationIngredientRetrieveUpdateDestroyView(CompanyBranchQuerysetMixin, generics.RetrieveUpdateDestroyAPIView):
+    serializer_class = PreparationIngredientCreateUpdateSerializer
+
+    def get_serializer_class(self):
+        if self.request.method == "GET":
+            return PreparationIngredientSerializer
+        return PreparationIngredientCreateUpdateSerializer
+
+    def get_queryset(self):
+        company = self._user_company()
+        if not company:
+            return PreparationIngredient.objects.none()
+        b = self._active_branch()
+        qs = PreparationIngredient.objects.select_related(
+            "preparation", "product", "child_preparation",
+        ).filter(preparation__company=company)
+        if b is not None:
+            return qs.filter(Q(preparation__branch=b) | Q(preparation__branch__isnull=True))
+        return qs.filter(preparation__branch__isnull=True)
+
+    def get_serializer_context(self):
+        ctx = super().get_serializer_context()
+        if self.kwargs.get("pk"):
+            row = self.get_queryset().filter(pk=self.kwargs["pk"]).first()
+            if row:
+                ctx["preparation"] = row.preparation
+        return ctx
+
+    def perform_update(self, serializer):
+        prep = serializer.instance.preparation
+        serializer.context["preparation"] = prep
+        with transaction.atomic():
+            row: PreparationIngredient = serializer.save()
+            try:
+                recalculate_preparation_tree(row.preparation)
+            except ValueError as e:
+                raise ValidationError({"detail": str(e)})
+
+    def perform_destroy(self, instance):
+        prep = instance.preparation
+        with transaction.atomic():
+            super().perform_destroy(instance)
+            try:
+                recalculate_preparation_tree(prep)
+            except ValueError as e:
+                raise ValidationError({"detail": str(e)})
 
 
 class PreparationReceiveView(CompanyBranchQuerysetMixin, APIView):
@@ -1036,42 +1192,23 @@ class PreparationReceiveView(CompanyBranchQuerysetMixin, APIView):
         ser.is_valid(raise_exception=True)
 
         with transaction.atomic():
-            prep: Preparation = generics.get_object_or_404(qs.select_for_update(), pk=pk)
-
-            product = Warehouse.objects.select_for_update().filter(pk=prep.source_product_id, company=company).first()
-            if not product:
-                raise ValidationError({"detail": "Исходный продукт не найден."})
-            if (prep.branch_id or None) != (product.branch_id or None):
-                raise ValidationError({"detail": "Исходный продукт со склада другого филиала."})
-
-            prep.input_quantity = ser.validated_data["input_quantity"]
-            prep.output_quantity = ser.validated_data["output_quantity"]
-            if "processing_cost" in ser.validated_data and ser.validated_data["processing_cost"] is not None:
-                prep.processing_cost = ser.validated_data["processing_cost"]
-
-            calc = calculate_preparation(prep)
-            prep.loss_quantity = calc["loss_quantity"]
-            prep.loss_percent = calc["loss_percent"]
-            prep.raw_material_cost = calc["raw_material_cost"]
-            prep.total_cost = calc["total_cost"]
-            prep.unit_cost = calc["unit_cost"]
-
-            consume_product(product, prep.input_quantity, quantity_unit=prep.input_unit)
-            add_preparation_stock(prep, prep.output_quantity, quantity_unit=prep.output_unit)
-
-            prep.save(
-                update_fields=[
-                    "input_quantity",
-                    "output_quantity",
-                    "processing_cost",
-                    "loss_quantity",
-                    "loss_percent",
-                    "raw_material_cost",
-                    "total_cost",
-                    "unit_cost",
-                    "updated_at",
-                ]
+            prep: Preparation = generics.get_object_or_404(
+                qs.prefetch_related("ingredients").select_for_update(), pk=pk
             )
+            vd = ser.validated_data
+            try:
+                receive_preparation(
+                    prep,
+                    batch_output_quantity=vd.get("batch_output_quantity"),
+                    input_quantity=vd.get("input_quantity"),
+                    output_quantity=vd.get("output_quantity"),
+                    processing_cost=vd.get("processing_cost"),
+                )
+            except ValidationError:
+                raise
+            except ValueError as e:
+                raise ValidationError({"detail": str(e)})
+            prep.refresh_from_db()
 
         return Response(PreparationSerializer(prep).data, status=status.HTTP_200_OK)
 

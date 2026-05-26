@@ -11,7 +11,8 @@ from apps.users.models import Company, Branch
 from apps.cafe.models import (
     Zone, Table, Order, OrderItem, MenuItem, Category, CafeClient, Kitchen, OrderDebtPayment,
     CafeWaiterPayProfile,
-    Warehouse, Preparation, ProcessingType, DishIngredient, DishIngredientProcessing,
+    Warehouse, Preparation, PreparationIngredient, ProcessingType,
+    DishIngredient, DishIngredientProcessing,
 )
 from apps.cafe.analytics import (
     SalesSummaryView,
@@ -27,7 +28,16 @@ from apps.cafe.views import (
     OrderPayDebtView,
     OrderRetrieveUpdateDestroyView,
 )
-from apps.cafe.services.costing import convert_quantity, calculate_preparation, recalculate_dish
+from apps.cafe.services.costing import (
+    convert_quantity,
+    calculate_preparation,
+    recalculate_dish,
+    recalculate_preparation,
+    recalculate_preparation_tree,
+    check_preparation_cycle,
+    recalculate_preparations_for_warehouse,
+)
+from apps.cafe.services.stock import receive_preparation
 
 User = get_user_model()
 
@@ -1298,3 +1308,239 @@ class CafeCostingTZTestCase(TransactionTestCase):
 
         prep.refresh_from_db()
         self.assertEqual(prep.stock_quantity, Decimal("1.4"))
+
+
+class CafePreparationTechCardTestCase(TransactionTestCase):
+    def setUp(self):
+        self.owner = User.objects.create_user(email="owner-tech@test.com", password="testpass123")
+        self.company = Company.objects.create(name="Tech Cafe Co", owner=self.owner)
+        self.branch = Branch.objects.create(name="Tech Branch", company=self.company)
+
+        self.mayo = Warehouse.objects.create(
+            company=self.company,
+            branch=self.branch,
+            title="Mayo",
+            supplier="",
+            unit="kg",
+            remainder="10",
+            minimum="0",
+            unit_price=Decimal("300.00"),
+        )
+        self.garlic_raw = Warehouse.objects.create(
+            company=self.company,
+            branch=self.branch,
+            title="Garlic raw",
+            supplier="",
+            unit="kg",
+            remainder="5",
+            minimum="0",
+            unit_price=Decimal("100.00"),
+        )
+
+    def test_legacy_preparation_potato_formula(self):
+        prep = Preparation.objects.create(
+            company=self.company,
+            branch=self.branch,
+            name="Potato peeled legacy",
+            source_product=self.garlic_raw,
+            input_quantity=Decimal("1"),
+            input_unit="kg",
+            output_quantity=Decimal("0.8"),
+            output_unit="kg",
+            processing_cost=Decimal("10.00"),
+        )
+        recalculate_preparation(prep, save=True)
+        prep.refresh_from_db()
+        self.assertEqual(prep.total_cost, Decimal("110.00"))
+        self.assertEqual(prep.unit_cost, Decimal("137.5000"))
+
+    def test_tech_card_preparation_two_products(self):
+        sauce = Preparation.objects.create(
+            company=self.company,
+            branch=self.branch,
+            name="Caesar sauce PF",
+            output_quantity=Decimal("1"),
+            output_unit="kg",
+            processing_cost=Decimal("0"),
+        )
+        PreparationIngredient.objects.create(
+            preparation=sauce,
+            product=self.mayo,
+            quantity=Decimal("0.7"),
+            unit="kg",
+            waste_percent=Decimal("0"),
+        )
+        PreparationIngredient.objects.create(
+            preparation=sauce,
+            product=self.garlic_raw,
+            quantity=Decimal("0.1"),
+            unit="kg",
+            waste_percent=Decimal("0"),
+        )
+        recalculate_preparation(sauce, save=True)
+        sauce.refresh_from_db()
+        # 0.7*300 + 0.1*100 = 210 + 10 = 220
+        self.assertEqual(sauce.total_cost, Decimal("220.00"))
+        self.assertEqual(sauce.unit_cost, Decimal("220.0000"))
+
+    def test_nested_preparation_uses_child_unit_cost(self):
+        garlic_pf = Preparation.objects.create(
+            company=self.company,
+            branch=self.branch,
+            name="Garlic peeled PF",
+            source_product=self.garlic_raw,
+            input_quantity=Decimal("1"),
+            input_unit="kg",
+            output_quantity=Decimal("0.5"),
+            output_unit="kg",
+            processing_cost=Decimal("0"),
+        )
+        recalculate_preparation(garlic_pf, save=True)
+        garlic_pf.refresh_from_db()
+        # 100 / 0.5 = 200 per kg output
+        self.assertEqual(garlic_pf.unit_cost, Decimal("200.0000"))
+
+        sauce = Preparation.objects.create(
+            company=self.company,
+            branch=self.branch,
+            name="Sauce with garlic PF",
+            output_quantity=Decimal("1"),
+            output_unit="kg",
+        )
+        PreparationIngredient.objects.create(
+            preparation=sauce,
+            child_preparation=garlic_pf,
+            quantity=Decimal("0.05"),
+            unit="kg",
+            waste_percent=Decimal("0"),
+        )
+        recalculate_preparation(sauce, save=True)
+        sauce.refresh_from_db()
+        self.assertEqual(sauce.raw_material_cost, Decimal("10.00"))
+        self.assertEqual(sauce.total_cost, Decimal("10.00"))
+        self.assertEqual(sauce.unit_cost, Decimal("10.0000"))
+
+    def test_dish_uses_preparation_cost(self):
+        category = Category.objects.create(company=self.company, branch=self.branch, title="Main")
+        prep = Preparation.objects.create(
+            company=self.company,
+            branch=self.branch,
+            name="PF for dish",
+            source_product=self.garlic_raw,
+            input_quantity=Decimal("1"),
+            input_unit="kg",
+            output_quantity=Decimal("1"),
+            output_unit="kg",
+            processing_cost=Decimal("0"),
+        )
+        recalculate_preparation(prep, save=True)
+        dish = MenuItem.objects.create(
+            company=self.company,
+            branch=self.branch,
+            category=category,
+            title="Dish with PF",
+            price=Decimal("500"),
+            other_expenses=Decimal("0"),
+        )
+        DishIngredient.objects.create(
+            dish=dish,
+            ingredient_type=DishIngredient.IngredientType.PREPARATION,
+            preparation=prep,
+            quantity=Decimal("0.2"),
+            unit="kg",
+        )
+        recalculate_dish(dish, save=True)
+        dish.refresh_from_db()
+        self.assertEqual(dish.cost_price, Decimal("20.00"))
+
+    def test_warehouse_price_cascade(self):
+        garlic_pf = Preparation.objects.create(
+            company=self.company,
+            branch=self.branch,
+            name="Garlic PF cascade",
+            source_product=self.garlic_raw,
+            input_quantity=Decimal("1"),
+            input_unit="kg",
+            output_quantity=Decimal("1"),
+            output_unit="kg",
+        )
+        recalculate_preparation(garlic_pf, save=True)
+
+        parent = Preparation.objects.create(
+            company=self.company,
+            branch=self.branch,
+            name="Parent PF",
+            output_quantity=Decimal("1"),
+            output_unit="kg",
+        )
+        PreparationIngredient.objects.create(
+            preparation=parent,
+            child_preparation=garlic_pf,
+            quantity=Decimal("0.1"),
+            unit="kg",
+        )
+        recalculate_preparation_tree(parent)
+
+        category = Category.objects.create(company=self.company, branch=self.branch, title="C")
+        dish = MenuItem.objects.create(
+            company=self.company,
+            branch=self.branch,
+            category=category,
+            title="Cascade dish",
+            price=Decimal("100"),
+        )
+        DishIngredient.objects.create(
+            dish=dish,
+            ingredient_type=DishIngredient.IngredientType.PREPARATION,
+            preparation=parent,
+            quantity=Decimal("0.2"),
+            unit="kg",
+        )
+        recalculate_dish(dish, save=True)
+
+        self.garlic_raw.unit_price = Decimal("200.00")
+        self.garlic_raw.save(update_fields=["unit_price"])
+        recalculate_preparations_for_warehouse(self.garlic_raw)
+
+        garlic_pf.refresh_from_db()
+        parent.refresh_from_db()
+        dish.refresh_from_db()
+        self.assertEqual(garlic_pf.total_cost, Decimal("200.00"))
+        self.assertEqual(parent.total_cost, Decimal("20.00"))
+        self.assertEqual(dish.cost_price, Decimal("4.00"))
+
+    def test_preparation_cycle_forbidden(self):
+        a = Preparation.objects.create(
+            company=self.company, branch=self.branch, name="A", output_quantity=Decimal("1"), output_unit="kg",
+        )
+        b = Preparation.objects.create(
+            company=self.company, branch=self.branch, name="B", output_quantity=Decimal("1"), output_unit="kg",
+        )
+        PreparationIngredient.objects.create(
+            preparation=a, child_preparation=b, quantity=Decimal("0.1"), unit="kg",
+        )
+        with self.assertRaises(ValueError):
+            check_preparation_cycle(b, a)
+
+    def test_receive_with_tech_card_ingredients(self):
+        sauce = Preparation.objects.create(
+            company=self.company,
+            branch=self.branch,
+            name="Sauce receive",
+            output_quantity=Decimal("1"),
+            output_unit="kg",
+            stock_quantity=Decimal("0"),
+        )
+        PreparationIngredient.objects.create(
+            preparation=sauce, product=self.mayo, quantity=Decimal("0.5"), unit="kg",
+        )
+        recalculate_preparation(sauce, save=True)
+        mayo_before = Decimal(str(self.mayo.remainder).replace(",", "."))
+
+        receive_preparation(sauce, batch_output_quantity=Decimal("2"))
+        sauce.refresh_from_db()
+        self.mayo.refresh_from_db()
+
+        self.assertEqual(sauce.stock_quantity, Decimal("2"))
+        mayo_after = Decimal(str(self.mayo.remainder).replace(",", "."))
+        self.assertEqual(mayo_before - mayo_after, Decimal("1"))
