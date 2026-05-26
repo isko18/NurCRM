@@ -1467,6 +1467,65 @@ class WarehouseComprehensiveTests(TestCase):
         self.assertEqual(allowed_cart_response.status_code, 201, allowed_cart_response.data)
         self.assertEqual(allowed_cart_response.data["warehouse"], str(self.wh1.id))
 
+    def test_approve_agent_cart_uses_product_quantity_when_stock_balance_is_zero(self):
+        agent = User.objects.create_user(
+            email="sync-stock-agent@example.com",
+            password="testpass123",
+        )
+        models.CompanyWarehouseAgent.objects.create(
+            company=self.company,
+            user=agent,
+            status=models.CompanyWarehouseAgent.Status.ACTIVE,
+            assigned_warehouse=self.wh1,
+        )
+        models.StockBalance.objects.create(
+            warehouse=self.wh1,
+            product=self.prod1,
+            qty=Decimal("0.000"),
+        )
+        self.prod1.quantity = Decimal("1302.000")
+        self.prod1.save(update_fields=["quantity"])
+
+        agent_client = APIClient()
+        agent_client.force_authenticate(user=agent)
+
+        cart_response = agent_client.post(
+            reverse("warehouse-agent-carts"),
+            {"warehouse": str(self.wh1.id), "note": "Заявка"},
+            format="json",
+        )
+        self.assertEqual(cart_response.status_code, 201, cart_response.data)
+        cart_id = cart_response.data["id"]
+
+        agent_client.post(
+            reverse("warehouse-agent-cart-items"),
+            {
+                "cart": cart_id,
+                "product": str(self.prod1.id),
+                "quantity_requested": "1.000",
+            },
+            format="json",
+        )
+        agent_client.post(reverse("warehouse-agent-cart-submit", kwargs={"pk": cart_id}), {}, format="json")
+
+        self.user.role = Roles.OWNER
+        self.user.save(update_fields=["role"])
+        owner_client = APIClient()
+        owner_client.force_authenticate(user=self.user)
+
+        approve_response = owner_client.post(
+            reverse("warehouse-agent-cart-approve", kwargs={"pk": cart_id}),
+            {},
+            format="json",
+        )
+        self.assertEqual(approve_response.status_code, 200, approve_response.data)
+        self.assertEqual(approve_response.data["status"], models.AgentRequestCart.Status.APPROVED)
+
+        warehouse_bal = models.StockBalance.objects.get(warehouse=self.wh1, product=self.prod1)
+        self.assertEqual(warehouse_bal.qty, Decimal("1301.000"))
+        self.prod1.refresh_from_db()
+        self.assertEqual(self.prod1.quantity, Decimal("1301.000"))
+
     def test_owner_can_dispatch_goods_to_agent_without_agent_request(self):
         self.user.role = Roles.OWNER
         self.user.save(update_fields=["role"])
@@ -1554,3 +1613,93 @@ class WarehouseComprehensiveTests(TestCase):
         )
         self.assertEqual(response.status_code, 400, response.data)
         self.assertIn("agent", response.data)
+
+    def test_agent_return_flow_owner_accepts_goods_back_to_warehouse(self):
+        agent = User.objects.create_user(
+            email="return-agent@example.com",
+            password="testpass123",
+            first_name="Return",
+            last_name="Agent",
+        )
+        models.CompanyWarehouseAgent.objects.create(
+            company=self.company,
+            user=agent,
+            status=models.CompanyWarehouseAgent.Status.ACTIVE,
+            assigned_warehouse=self.wh1,
+        )
+        models.AgentStockBalance.objects.create(
+            company=self.company,
+            branch=self.branch,
+            agent=agent,
+            warehouse=self.wh1,
+            product=self.prod1,
+            qty=Decimal("20.000"),
+        )
+        models.StockBalance.objects.create(
+            warehouse=self.wh1,
+            product=self.prod1,
+            qty=Decimal("30.000"),
+        )
+        self.prod1.quantity = Decimal("30.000")
+        self.prod1.save(update_fields=["quantity"])
+
+        agent_client = APIClient()
+        agent_client.force_authenticate(user=agent)
+
+        cart_response = agent_client.post(
+            reverse("warehouse-agent-return-carts"),
+            {
+                "warehouse": str(self.wh1.id),
+                "note": "Возврат брака",
+            },
+            format="json",
+        )
+        self.assertEqual(cart_response.status_code, 201, cart_response.data)
+        cart_id = cart_response.data["id"]
+
+        item_response = agent_client.post(
+            reverse("warehouse-agent-return-cart-items"),
+            {
+                "cart": cart_id,
+                "product": str(self.prod1.id),
+                "quantity_returned": "5.000",
+            },
+            format="json",
+        )
+        self.assertEqual(item_response.status_code, 201, item_response.data)
+
+        submit_response = agent_client.post(
+            reverse("warehouse-agent-return-cart-submit", kwargs={"pk": cart_id}),
+            {},
+            format="json",
+        )
+        self.assertEqual(submit_response.status_code, 200, submit_response.data)
+        self.assertEqual(submit_response.data["status"], models.AgentReturnCart.Status.SUBMITTED)
+
+        self.user.role = Roles.OWNER
+        self.user.save(update_fields=["role"])
+        owner_client = APIClient()
+        owner_client.force_authenticate(user=self.user)
+
+        approve_response = owner_client.post(
+            reverse("warehouse-agent-return-cart-approve", kwargs={"pk": cart_id}),
+            {},
+            format="json",
+        )
+        self.assertEqual(approve_response.status_code, 200, approve_response.data)
+        self.assertEqual(approve_response.data["status"], models.AgentReturnCart.Status.APPROVED)
+
+        agent_bal = models.AgentStockBalance.objects.get(
+            agent=agent,
+            warehouse=self.wh1,
+            product=self.prod1,
+        )
+        self.assertEqual(agent_bal.qty, Decimal("15.000"))
+
+        warehouse_bal = models.StockBalance.objects.get(
+            warehouse=self.wh1,
+            product=self.prod1,
+        )
+        self.assertEqual(warehouse_bal.qty, Decimal("35.000"))
+        self.prod1.refresh_from_db()
+        self.assertEqual(self.prod1.quantity, Decimal("35.000"))

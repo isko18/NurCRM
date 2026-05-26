@@ -351,7 +351,26 @@ Body:
 - по одной заявке можно создать только один SALE-документ;
 - если `post=true`, документ сразу проводится.
 
-## 10. Контрагенты агента
+## 10. Возврат товара агентом на склад
+
+> Подробная документация: **[AGENT_RETURN_FRONTEND.md](../apps/warehouse/AGENT_RETURN_FRONTEND.md)**
+
+Flow: `draft -> submitted -> approved / rejected`
+
+| Метод | URL | Назначение |
+|-------|-----|------------|
+| GET | `/api/warehouse/agent-return-carts/` | Список возвратов |
+| POST | `/api/warehouse/agent-return-carts/` | Создать возврат (только агент) |
+| POST | `/api/warehouse/agent-return-carts/{id}/submit/` | Отправить владельцу |
+| POST | `/api/warehouse/agent-return-carts/{id}/approve/` | Принять (owner/admin) |
+| POST | `/api/warehouse/agent-return-carts/{id}/reject/` | Отклонить (owner/admin) |
+| POST | `/api/warehouse/agent-return-cart-items/` | Добавить позицию |
+
+При `approve` товар возвращается с `AgentStockBalance` на склад.
+
+**Не путать** с `/api/main/returns/` — тот API для старого manufacture-flow (`ManufactureSubreal`), не для warehouse-агентов.
+
+## 11. Контрагенты агента
 
 Контрагенты идут через общий CRUD:
 

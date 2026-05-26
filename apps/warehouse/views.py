@@ -34,6 +34,9 @@ from .serializers import (
     CommonWarehouseBalanceSerializer,
     CompanyWarehouseAgentSerializer,
     CompanyWarehouseAgentCommonAccessUpdateSerializer,
+    AgentReturnCartSerializer,
+    AgentReturnItemSerializer,
+    AgentReturnCartActionSerializer,
 )
 
 from apps.warehouse import models as m
@@ -1052,6 +1055,202 @@ class AgentRequestItemDetailAPIView(CompanyBranchRestrictedMixin, generics.Retri
         if not _is_owner_like(user) and instance.cart.agent_id != user.id:
             raise PermissionDenied("Нет доступа к заявке.")
         if instance.cart.status != m.AgentRequestCart.Status.DRAFT:
+            raise ValidationError("Можно удалять позиции только в черновике.")
+        instance.delete()
+
+
+class AgentReturnCartListCreateAPIView(CompanyBranchRestrictedMixin, generics.ListCreateAPIView):
+    serializer_class = AgentReturnCartSerializer
+    filter_backends = [DjangoFilterBackend]
+    filterset_fields = ["status", "warehouse", "agent", "submitted_at", "approved_at"]
+
+    def get_queryset(self):
+        qs = (
+            m.AgentReturnCart.objects
+            .select_related("agent", "warehouse", "approved_by")
+            .prefetch_related("items__product")
+        )
+        qs = self._filter_qs_company_branch_relaxed(qs)
+        user = self.request.user
+        if not _is_owner_like(user):
+            qs = qs.filter(agent=user)
+        return qs
+
+    def perform_create(self, serializer):
+        user = self.request.user
+        if _is_owner_like(user):
+            raise ValidationError({"detail": "Владелец/админ не создаёт возврат за агента. Возврат оформляет агент."})
+        warehouse = serializer.validated_data.get("warehouse")
+        if not warehouse:
+            raise ValidationError({"warehouse": "Укажите склад."})
+
+        company_ids = _company_ids_for_warehouse_access(user)
+        if company_ids and warehouse.company_id not in company_ids:
+            raise ValidationError({"warehouse": "Склад принадлежит другой компании или у вас нет доступа."})
+        self._ensure_agent_can_access_warehouse(warehouse, field_name="warehouse")
+
+        active_branch = self._auto_branch()
+        if active_branch is not None and warehouse.branch_id not in (None, active_branch.id):
+            raise ValidationError({"warehouse": "Склад другого филиала."})
+
+        serializer.save(
+            agent=user,
+            company=warehouse.company,
+            branch=warehouse.branch,
+        )
+
+
+class AgentReturnCartRetrieveUpdateDestroyAPIView(CompanyBranchRestrictedMixin, generics.RetrieveUpdateDestroyAPIView):
+    serializer_class = AgentReturnCartSerializer
+
+    def get_queryset(self):
+        qs = (
+            m.AgentReturnCart.objects
+            .select_related("agent", "warehouse", "approved_by")
+            .prefetch_related("items__product")
+        )
+        qs = self._filter_qs_company_branch_relaxed(qs)
+        user = self.request.user
+        if not _is_owner_like(user):
+            qs = qs.filter(agent=user)
+        return qs
+
+    def perform_update(self, serializer):
+        instance = self.get_object()
+        user = self.request.user
+        if not _is_owner_like(user) and instance.agent_id != user.id:
+            raise PermissionDenied("Нет доступа к возврату.")
+        if instance.status != m.AgentReturnCart.Status.DRAFT:
+            raise ValidationError("Можно изменять только черновик.")
+        serializer.save()
+
+    def perform_destroy(self, instance):
+        user = self.request.user
+        if not _is_owner_like(user) and instance.agent_id != user.id:
+            raise PermissionDenied("Нет доступа к возврату.")
+        if instance.status != m.AgentReturnCart.Status.DRAFT:
+            raise ValidationError("Можно удалять только черновик.")
+        instance.delete()
+
+
+class AgentReturnCartSubmitAPIView(CompanyBranchRestrictedMixin, APIView):
+    def post(self, request, pk=None, *args, **kwargs):
+        qs = self._filter_qs_company_branch_relaxed(
+            m.AgentReturnCart.objects.select_related("agent", "warehouse")
+        )
+        cart = get_object_or_404(qs, pk=pk)
+        user = request.user
+        if not _is_owner_like(user) and cart.agent_id != user.id:
+            return Response({"detail": "Нет доступа."}, status=status.HTTP_403_FORBIDDEN)
+        ser = AgentReturnCartActionSerializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+        try:
+            cart.submit()
+        except DjangoValidationError as exc:
+            raise ValidationError(getattr(exc, "message_dict", {"detail": str(exc)}))
+        out = AgentReturnCartSerializer(cart, context={"request": request}).data
+        return Response(out)
+
+
+class AgentReturnCartApproveAPIView(CompanyBranchRestrictedMixin, APIView):
+    def post(self, request, pk=None, *args, **kwargs):
+        qs = self._filter_qs_company_branch_relaxed(
+            m.AgentReturnCart.objects.select_related("agent", "warehouse").prefetch_related("items__product")
+        )
+        cart = get_object_or_404(qs, pk=pk)
+        user = request.user
+        if not _is_owner_like(user):
+            return Response({"detail": "Только владелец/админ."}, status=status.HTTP_403_FORBIDDEN)
+        ser = AgentReturnCartActionSerializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+        try:
+            cart.approve(user)
+        except DjangoValidationError as exc:
+            raise ValidationError(getattr(exc, "message_dict", {"detail": str(exc)}))
+        out = AgentReturnCartSerializer(cart, context={"request": request}).data
+        return Response(out)
+
+
+class AgentReturnCartRejectAPIView(CompanyBranchRestrictedMixin, APIView):
+    def post(self, request, pk=None, *args, **kwargs):
+        qs = self._filter_qs_company_branch_relaxed(
+            m.AgentReturnCart.objects.select_related("agent", "warehouse")
+        )
+        cart = get_object_or_404(qs, pk=pk)
+        user = request.user
+        if not _is_owner_like(user):
+            return Response({"detail": "Только владелец/админ."}, status=status.HTTP_403_FORBIDDEN)
+        ser = AgentReturnCartActionSerializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+        try:
+            cart.reject(user)
+        except DjangoValidationError as exc:
+            raise ValidationError(getattr(exc, "message_dict", {"detail": str(exc)}))
+        out = AgentReturnCartSerializer(cart, context={"request": request}).data
+        return Response(out)
+
+
+class AgentReturnItemListCreateAPIView(CompanyBranchRestrictedMixin, generics.ListCreateAPIView):
+    serializer_class = AgentReturnItemSerializer
+
+    def get_queryset(self):
+        qs = m.AgentReturnItem.objects.select_related("cart", "cart__agent", "product")
+        qs = self._filter_qs_company_branch_relaxed(qs)
+        cart_id = self.request.query_params.get("cart")
+        if cart_id:
+            qs = qs.filter(cart_id=cart_id)
+        user = self.request.user
+        if not _is_owner_like(user):
+            qs = qs.filter(cart__agent=user)
+            assigned_warehouse_id = self._assigned_agent_warehouse_id()
+            if assigned_warehouse_id:
+                qs = qs.filter(cart__warehouse_id=assigned_warehouse_id)
+        return qs
+
+    def perform_create(self, serializer):
+        user = self.request.user
+        cart = serializer.validated_data.get("cart")
+        if not cart:
+            raise ValidationError("Укажите cart.")
+        if not _is_owner_like(user) and cart.agent_id != user.id:
+            raise PermissionDenied("Нет доступа к возврату.")
+        self._ensure_agent_can_access_warehouse(getattr(cart, "warehouse", None), field_name="cart")
+        if cart.status != m.AgentReturnCart.Status.DRAFT:
+            raise ValidationError("Можно добавлять позиции только в черновик.")
+        serializer.save(
+            company=cart.company,
+            branch=cart.branch,
+        )
+
+
+class AgentReturnItemDetailAPIView(CompanyBranchRestrictedMixin, generics.RetrieveUpdateDestroyAPIView):
+    serializer_class = AgentReturnItemSerializer
+
+    def get_queryset(self):
+        qs = m.AgentReturnItem.objects.select_related("cart", "cart__agent", "product")
+        qs = self._filter_qs_company_branch_relaxed(qs)
+        user = self.request.user
+        if not _is_owner_like(user):
+            qs = qs.filter(cart__agent=user)
+            assigned_warehouse_id = self._assigned_agent_warehouse_id()
+            if assigned_warehouse_id:
+                qs = qs.filter(cart__warehouse_id=assigned_warehouse_id)
+        return qs
+
+    def perform_update(self, serializer):
+        instance = self.get_object()
+        user = self.request.user
+        if not _is_owner_like(user) and instance.cart.agent_id != user.id:
+            raise PermissionDenied("Нет доступа к возврату.")
+        if instance.cart.status != m.AgentReturnCart.Status.DRAFT:
+            raise ValidationError("Можно менять позиции только в черновике.")
+        serializer.save()
+
+    def perform_destroy(self, instance):
+        user = self.request.user
+        if not _is_owner_like(user) and instance.cart.agent_id != user.id:
+            raise PermissionDenied("Нет доступа к возврату.")
+        if instance.cart.status != m.AgentReturnCart.Status.DRAFT:
             raise ValidationError("Можно удалять позиции только в черновике.")
         instance.delete()
 

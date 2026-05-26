@@ -660,6 +660,99 @@ class AgentRequestCartSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSe
         return full_name or getattr(agent, "username", None) or getattr(agent, "email", None) or str(getattr(agent, "id", ""))
 
 
+class AgentReturnItemSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
+    product_name = serializers.CharField(source="product.name", read_only=True)
+    product_article = serializers.CharField(source="product.article", read_only=True, allow_blank=True)
+    product_unit = serializers.CharField(source="product.unit", read_only=True, default="шт.")
+    qty = serializers.DecimalField(
+        source="quantity_returned",
+        max_digits=18,
+        decimal_places=3,
+        read_only=True,
+    )
+    price = serializers.DecimalField(
+        source="product.price",
+        max_digits=11,
+        decimal_places=3,
+        read_only=True,
+    )
+
+    class Meta:
+        model = m.AgentReturnItem
+        ref_name = "WarehouseAgentReturnItem"
+        fields = (
+            "id",
+            "cart",
+            "product",
+            "product_name",
+            "product_article",
+            "product_unit",
+            "quantity_returned",
+            "qty",
+            "price",
+            "created_date",
+            "updated_date",
+        )
+        read_only_fields = ("id", "created_date", "updated_date")
+
+
+class AgentReturnCartSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
+    items = AgentReturnItemSerializer(many=True, read_only=True)
+    agent_display = serializers.SerializerMethodField()
+    note = serializers.CharField(required=False, allow_blank=True)
+
+    class Meta:
+        model = m.AgentReturnCart
+        ref_name = "WarehouseAgentReturnCart"
+        fields = (
+            "id",
+            "agent",
+            "agent_display",
+            "warehouse",
+            "status",
+            "note",
+            "submitted_at",
+            "approved_at",
+            "approved_by",
+            "created_date",
+            "updated_date",
+            "items",
+        )
+        read_only_fields = (
+            "id",
+            "agent",
+            "status",
+            "submitted_at",
+            "approved_at",
+            "approved_by",
+            "created_date",
+            "updated_date",
+        )
+        extra_kwargs = {
+            "warehouse": {"required": True},
+        }
+
+    def get_agent_display(self, obj):
+        agent = getattr(obj, "agent", None)
+        if not agent:
+            return None
+        full_name = ""
+        if hasattr(agent, "get_full_name"):
+            try:
+                full_name = agent.get_full_name() or ""
+            except Exception:
+                full_name = ""
+        if not full_name:
+            first = getattr(agent, "first_name", "") or ""
+            last = getattr(agent, "last_name", "") or ""
+            full_name = f"{first} {last}".strip()
+        return full_name or getattr(agent, "username", None) or getattr(agent, "email", None) or str(getattr(agent, "id", ""))
+
+
+class AgentReturnCartActionSerializer(serializers.Serializer):
+    pass
+
+
 # ----------------
 # Company / Agent membership (заявки агентов в компании)
 # ----------------

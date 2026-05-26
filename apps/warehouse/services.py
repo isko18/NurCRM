@@ -8,6 +8,38 @@ from .models import q_qty
 from .utils import effective_payment_kind
 
 
+def resolve_warehouse_on_hand_qty(*, warehouse, product, balance=None, sync=False):
+    """
+    Эффективный остаток на складе для проверок и списаний.
+
+    В UI и карточке товара показывается WarehouseProduct.quantity, а операции
+    часто смотрят StockBalance.qty. Если записи разошлись (balance=0, product>0),
+    берём max(...) для товара, привязанного к этому складу.
+    """
+    product_on_warehouse = getattr(product, "warehouse_id", None) == getattr(warehouse, "id", None)
+    prod_qty = q_qty(Decimal(getattr(product, "quantity", None) or 0)) if product_on_warehouse else Decimal("0.000")
+
+    if balance is not None:
+        bal_qty = q_qty(Decimal(getattr(balance, "qty", None) or 0))
+        effective = max(bal_qty, prod_qty) if product_on_warehouse else bal_qty
+        if sync and effective != bal_qty:
+            balance.qty = effective
+            balance.save(update_fields=["qty"])
+        return effective, balance
+
+    effective = prod_qty if product_on_warehouse else Decimal("0.000")
+    if sync and product_on_warehouse and effective > 0:
+        balance, _ = models.StockBalance.objects.get_or_create(
+            warehouse=warehouse,
+            product=product,
+            defaults={"qty": effective},
+        )
+        if q_qty(Decimal(balance.qty or 0)) != effective:
+            balance.qty = effective
+            balance.save(update_fields=["qty"])
+    return effective, balance
+
+
 def agent_has_common_access_to_warehouse(*, user, warehouse, company=None) -> bool:
     """Активное членство агента с общим доступом к указанному складу (продажи с остатка склада)."""
     if user is None or warehouse is None:
@@ -89,10 +121,11 @@ def _apply_move(move: models.StockMove):
     bal, created = models.StockBalance.objects.select_for_update().get_or_create(
         warehouse=move.warehouse, product=move.product, defaults={"qty": Decimal("0.000")}
     )
-    # Если StockBalance только что создан и товар принадлежит этому складу, инициализируем из quantity
-    if created and move.product.warehouse_id == move.warehouse_id:
-        initial_qty = Decimal(move.product.quantity) if move.product.quantity else Decimal("0.000")
-        bal.qty = initial_qty
+    if move.product.warehouse_id == move.warehouse_id:
+        prod_qty = q_qty(Decimal(move.product.quantity or 0))
+        bal_qty = q_qty(Decimal(bal.qty or 0))
+        if created or (bal_qty <= 0 and prod_qty > 0) or (prod_qty > bal_qty):
+            bal.qty = prod_qty
     bal.qty = Decimal(bal.qty or 0) + Decimal(move.qty_delta or 0)
     bal.save()
     if move.product.warehouse_id == move.warehouse_id:
@@ -543,16 +576,16 @@ def post_document(document: models.Document, allow_negative: bool = None) -> mod
             for item in items:
                 delta = sign * Decimal(item.qty)
                 if not allow_negative:
-                    # Проверяем остатки: сначала в StockBalance, если нет - используем WarehouseProduct.quantity
-                    bal = models.StockBalance.objects.select_for_update().filter(warehouse=document.warehouse_from, product=item.product).first()
-                    if bal:
-                        cur = Decimal(bal.qty) if bal.qty else Decimal("0")
-                    else:
-                        # Если StockBalance нет, проверяем quantity товара (если товар принадлежит этому складу)
-                        if item.product.warehouse_id == document.warehouse_from_id:
-                            cur = Decimal(item.product.quantity) if item.product.quantity else Decimal("0")
-                        else:
-                            cur = Decimal("0")
+                    bal = models.StockBalance.objects.select_for_update().filter(
+                        warehouse=document.warehouse_from,
+                        product=item.product,
+                    ).first()
+                    cur, _bal = resolve_warehouse_on_hand_qty(
+                        warehouse=document.warehouse_from,
+                        product=item.product,
+                        balance=bal,
+                        sync=True,
+                    )
                     if cur + delta < 0:
                         # Формируем информативное название товара: артикул или имя
                         if item.product:

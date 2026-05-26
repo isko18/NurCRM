@@ -4,7 +4,7 @@ from io import BytesIO
 
 from django.db import models, transaction, connection
 from django.conf import settings
-from django.db.models import Q, Max, IntegerField
+from django.db.models import Q, Max, IntegerField, Sum
 from django.db.models.functions import Cast
 from django.core.exceptions import ValidationError
 from django.core.files.base import ContentFile
@@ -1699,6 +1699,8 @@ class AgentRequestCart(BaseModelId, BaseModelDate, BaseModelCompanyBranch):
         self.save(update_fields=["status", "submitted_at", "updated_date"])
 
     def _transfer_items_to_agent(self):
+        from apps.warehouse import services as warehouse_services
+
         for it in self.items.select_related("product"):
             prod = it.product
             need_qty = q_qty(Decimal(it.quantity_requested or 0))
@@ -1710,10 +1712,12 @@ class AgentRequestCart(BaseModelId, BaseModelDate, BaseModelCompanyBranch):
                 product=prod,
                 defaults={"qty": Decimal("0.000")},
             )
-            if created and prod.warehouse_id == self.warehouse_id:
-                bal.qty = Decimal(prod.quantity or 0)
-
-            cur_qty = Decimal(bal.qty or 0)
+            cur_qty, bal = warehouse_services.resolve_warehouse_on_hand_qty(
+                warehouse=self.warehouse,
+                product=prod,
+                balance=bal,
+                sync=True,
+            )
             if cur_qty < need_qty:
                 raise ValidationError({
                     "items": f"Недостаточно на складе для {prod.name}: нужно {need_qty}, доступно {cur_qty}."
@@ -1820,6 +1824,240 @@ class AgentRequestItem(BaseModelId, BaseModelDate, BaseModelCompanyBranch):
                 raise ValidationError({"product": "Товар другого филиала."})
             if self.cart.warehouse_id and self.product.warehouse_id != self.cart.warehouse_id:
                 raise ValidationError({"product": "Товар должен принадлежать выбранному складу."})
+
+    def save(self, *args, **kwargs):
+        if self.cart_id:
+            if not self.company_id:
+                self.company_id = self.cart.company_id
+            if self.branch_id is None:
+                self.branch_id = self.cart.branch_id
+        super().save(*args, **kwargs)
+
+
+class AgentReturnCart(BaseModelId, BaseModelDate, BaseModelCompanyBranch):
+    """
+    Возврат товара от агента на склад компании.
+    """
+    class Status(models.TextChoices):
+        DRAFT = "draft", "Черновик"
+        SUBMITTED = "submitted", "Отправлено владельцу"
+        APPROVED = "approved", "Принято на склад"
+        REJECTED = "rejected", "Отклонено"
+
+    agent = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.PROTECT,
+        related_name="warehouse_agent_return_carts",
+        verbose_name="Агент",
+    )
+    warehouse = models.ForeignKey(
+        "warehouse.Warehouse",
+        on_delete=models.PROTECT,
+        related_name="agent_return_carts",
+        verbose_name="Склад",
+    )
+    status = models.CharField(max_length=16, choices=Status.choices, default=Status.DRAFT)
+    note = models.CharField(max_length=255, blank=True, verbose_name="Комментарий агента")
+
+    submitted_at = models.DateTimeField(null=True, blank=True)
+    approved_at = models.DateTimeField(null=True, blank=True)
+    approved_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name="warehouse_approved_agent_return_carts",
+        verbose_name="Кем принято",
+    )
+
+    class Meta:
+        verbose_name = "Возврат агента (склад)"
+        verbose_name_plural = "Возвраты агентов (склад)"
+        ordering = ["-created_date"]
+        indexes = [
+            models.Index(fields=["company", "status"]),
+            models.Index(fields=["company", "branch", "status"]),
+            models.Index(fields=["agent", "status"]),
+        ]
+
+    def __str__(self):
+        return f"Возврат {self.id} от {getattr(self.agent, 'username', self.agent_id)} [{self.get_status_display()}]"
+
+    def clean(self):
+        if self.branch_id and self.branch.company_id != self.company_id:
+            raise ValidationError({"branch": "Филиал принадлежит другой компании."})
+        if self.warehouse_id and self.company_id and self.warehouse.company_id != self.company_id:
+            raise ValidationError({"warehouse": "Склад принадлежит другой компании."})
+        if self.branch_id and self.warehouse_id and self.warehouse.branch_id not in (None, self.branch_id):
+            raise ValidationError({"warehouse": "Склад другого филиала."})
+        agent_company_id = getattr(self.agent, "company_id", None)
+        if self.agent_id and self.company_id and agent_company_id is not None and agent_company_id != self.company_id:
+            raise ValidationError({"agent": "Агент принадлежит другой компании."})
+
+    def is_editable(self) -> bool:
+        return self.status == self.Status.DRAFT
+
+    def _pending_return_qty(self, product_id, exclude_item_id=None):
+        qs = AgentReturnItem.objects.filter(
+            cart__agent_id=self.agent_id,
+            cart__warehouse_id=self.warehouse_id,
+            cart__status=self.Status.SUBMITTED,
+            product_id=product_id,
+        )
+        if self.pk:
+            qs = qs.exclude(cart_id=self.pk)
+        if exclude_item_id:
+            qs = qs.exclude(pk=exclude_item_id)
+        return q_qty(qs.aggregate(total=Sum("quantity_returned"))["total"] or Decimal("0"))
+
+    def _agent_available_qty(self, product, exclude_item_id=None):
+        stock = AgentStockBalance.objects.filter(
+            agent_id=self.agent_id,
+            warehouse_id=self.warehouse_id,
+            product_id=product.pk,
+        ).first()
+        cur = q_qty(Decimal(getattr(stock, "qty", None) or 0))
+        pending = self._pending_return_qty(product.pk, exclude_item_id=exclude_item_id)
+        return max(cur - pending, Decimal("0.000"))
+
+    def _transfer_items_from_agent_to_warehouse(self):
+        from apps.warehouse import services as warehouse_services
+
+        for it in self.items.select_related("product"):
+            prod = it.product
+            return_qty = q_qty(Decimal(it.quantity_returned or 0))
+            if return_qty <= 0:
+                continue
+
+            stock = AgentStockBalance.objects.select_for_update().filter(
+                agent=self.agent,
+                warehouse=self.warehouse,
+                product=prod,
+            ).first()
+            cur_agent_qty = q_qty(Decimal(getattr(stock, "qty", None) or 0))
+            if cur_agent_qty < return_qty:
+                raise ValidationError({
+                    "items": f"Недостаточно у агента для {prod.name}: нужно {return_qty}, доступно {cur_agent_qty}."
+                })
+
+            stock.qty = cur_agent_qty - return_qty
+            stock.save(update_fields=["qty"])
+
+            bal, created = StockBalance.objects.select_for_update().get_or_create(
+                warehouse=self.warehouse,
+                product=prod,
+                defaults={"qty": Decimal("0.000")},
+            )
+            cur_wh_qty, bal = warehouse_services.resolve_warehouse_on_hand_qty(
+                warehouse=self.warehouse,
+                product=prod,
+                balance=bal,
+                sync=True,
+            )
+            new_wh_qty = q_qty(cur_wh_qty + return_qty)
+            bal.qty = new_wh_qty
+            bal.save(update_fields=["qty"])
+            if prod.warehouse_id == self.warehouse_id:
+                type(prod).objects.filter(pk=prod.pk).update(quantity=new_wh_qty)
+
+    @transaction.atomic
+    def submit(self):
+        if self.status != self.Status.DRAFT:
+            raise ValidationError("Можно отправить только черновик.")
+        if not self.items.exists():
+            raise ValidationError("Нельзя отправить пустой возврат.")
+        for it in self.items.select_related("product"):
+            need = q_qty(Decimal(it.quantity_returned or 0))
+            if need <= 0:
+                continue
+            available = self._agent_available_qty(it.product, exclude_item_id=it.pk)
+            if need > available:
+                raise ValidationError({
+                    "items": (
+                        f"Недостаточно у агента для {it.product.name}: "
+                        f"нужно {need}, доступно {available}."
+                    )
+                })
+        self.status = self.Status.SUBMITTED
+        self.submitted_at = timezone.now()
+        self.full_clean()
+        self.save(update_fields=["status", "submitted_at", "updated_date"])
+
+    @transaction.atomic
+    def approve(self, by_user):
+        if self.status != self.Status.SUBMITTED:
+            raise ValidationError("Можно принять только возврат в статусе 'submitted'.")
+        if not self.items.exists():
+            raise ValidationError("Нельзя принять пустой возврат.")
+
+        self._transfer_items_from_agent_to_warehouse()
+
+        self.status = self.Status.APPROVED
+        self.approved_at = timezone.now()
+        self.approved_by = by_user
+        self.full_clean()
+        self.save(update_fields=["status", "approved_at", "approved_by", "updated_date"])
+
+    @transaction.atomic
+    def reject(self, by_user):
+        if self.status != self.Status.SUBMITTED:
+            raise ValidationError("Можно отклонить только возврат в статусе 'submitted'.")
+        self.status = self.Status.REJECTED
+        self.approved_at = timezone.now()
+        self.approved_by = by_user
+        self.full_clean()
+        self.save(update_fields=["status", "approved_at", "approved_by", "updated_date"])
+
+
+class AgentReturnItem(BaseModelId, BaseModelDate, BaseModelCompanyBranch):
+    cart = models.ForeignKey(
+        AgentReturnCart,
+        on_delete=models.CASCADE,
+        related_name="items",
+        verbose_name="Возврат",
+    )
+    product = models.ForeignKey(
+        "warehouse.WarehouseProduct",
+        on_delete=models.PROTECT,
+        related_name="agent_return_items",
+        verbose_name="Товар",
+    )
+    quantity_returned = models.DecimalField(max_digits=18, decimal_places=3, verbose_name="К возврату")
+
+    class Meta:
+        verbose_name = "Позиция возврата агента (склад)"
+        verbose_name_plural = "Позиции возвратов агента (склад)"
+        indexes = [
+            models.Index(fields=["cart", "product"]),
+        ]
+
+    def __str__(self):
+        return f"{self.cart_id} · {self.product_id} · {self.quantity_returned}"
+
+    def clean(self):
+        if self.quantity_returned is None or Decimal(self.quantity_returned) <= 0:
+            raise ValidationError({"quantity_returned": "Количество должно быть больше 0."})
+
+        if self.cart_id and self.cart.status != AgentReturnCart.Status.DRAFT:
+            raise ValidationError({"cart": "Нельзя редактировать позиции, когда возврат не в черновике."})
+
+        if self.cart_id and self.product_id:
+            if self.cart.company_id and self.product.company_id != self.cart.company_id:
+                raise ValidationError({"product": "Товар другой компании."})
+            if self.cart.branch_id and self.product.branch_id not in (None, self.cart.branch_id):
+                raise ValidationError({"product": "Товар другого филиала."})
+            if self.cart.warehouse_id and self.product.warehouse_id != self.cart.warehouse_id:
+                raise ValidationError({"product": "Товар должен принадлежать выбранному складу."})
+
+            need = q_qty(Decimal(self.quantity_returned or 0))
+            available = self.cart._agent_available_qty(self.product, exclude_item_id=self.pk)
+            if need > available:
+                raise ValidationError({
+                    "quantity_returned": (
+                        f"Недостаточно у агента для {self.product.name}: "
+                        f"нужно {need}, доступно {available}."
+                    )
+                })
 
     def save(self, *args, **kwargs):
         if self.cart_id:

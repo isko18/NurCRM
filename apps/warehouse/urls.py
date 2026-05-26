@@ -18,6 +18,13 @@ from .views import (
     AgentRequestCartCreateSaleAPIView,
     AgentRequestItemListCreateAPIView,
     AgentRequestItemDetailAPIView,
+    AgentReturnCartListCreateAPIView,
+    AgentReturnCartRetrieveUpdateDestroyAPIView,
+    AgentReturnCartSubmitAPIView,
+    AgentReturnCartApproveAPIView,
+    AgentReturnCartRejectAPIView,
+    AgentReturnItemListCreateAPIView,
+    AgentReturnItemDetailAPIView,
     AgentMyProductsListAPIView,
     OwnerAgentsProductsListAPIView,
     CompaniesSearchForAgentsAPIView,
@@ -130,6 +137,15 @@ urlpatterns += [
     # agent cart items
     path("agent-cart-items/", AgentRequestItemListCreateAPIView.as_view(), name="warehouse-agent-cart-items"),
     path("agent-cart-items/<uuid:pk>/", AgentRequestItemDetailAPIView.as_view(), name="warehouse-agent-cart-item-detail"),
+
+    # agent return carts
+    path("agent-return-carts/", AgentReturnCartListCreateAPIView.as_view(), name="warehouse-agent-return-carts"),
+    path("agent-return-carts/<uuid:pk>/", AgentReturnCartRetrieveUpdateDestroyAPIView.as_view(), name="warehouse-agent-return-cart-detail"),
+    path("agent-return-carts/<uuid:pk>/submit/", AgentReturnCartSubmitAPIView.as_view(), name="warehouse-agent-return-cart-submit"),
+    path("agent-return-carts/<uuid:pk>/approve/", AgentReturnCartApproveAPIView.as_view(), name="warehouse-agent-return-cart-approve"),
+    path("agent-return-carts/<uuid:pk>/reject/", AgentReturnCartRejectAPIView.as_view(), name="warehouse-agent-return-cart-reject"),
+    path("agent-return-cart-items/", AgentReturnItemListCreateAPIView.as_view(), name="warehouse-agent-return-cart-items"),
+    path("agent-return-cart-items/<uuid:pk>/", AgentReturnItemDetailAPIView.as_view(), name="warehouse-agent-return-cart-item-detail"),
 
     # agent stock
     path("agents/me/products/", AgentMyProductsListAPIView.as_view(), name="warehouse-agent-my-products"),
