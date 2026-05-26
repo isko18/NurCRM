@@ -2181,6 +2181,9 @@ class AgentReturnItem(BaseModelId, BaseModelDate, BaseModelCompanyBranch):
                 self.branch_id = self.cart.branch_id
         self.full_clean()
         super().save(*args, **kwargs)
+
+
+class StockMove(models.Model):
     """Движение товара. Каждое движение — приход или расход."""
 
     class MoveKind(models.TextChoices):
