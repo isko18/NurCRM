@@ -61,6 +61,61 @@ def _cleanup_empty_agent_request_draft(cart_id):
         cart.delete()
 
 
+def _cleanup_empty_agent_return_draft(cart_id):
+    """Удаляет пустой черновик возврата, если добавление позиции не удалось."""
+    if not cart_id:
+        return
+    try:
+        cart = m.AgentReturnCart.objects.get(pk=cart_id, status=m.AgentReturnCart.Status.DRAFT)
+    except (m.AgentReturnCart.DoesNotExist, ValueError, TypeError):
+        return
+    if not cart.items.exists():
+        cart.delete()
+
+
+def _owner_agent_stock_queryset(view, *, agent_id=None):
+    move_subq = m.AgentStockMove.objects.filter(
+        agent=OuterRef("agent"),
+        warehouse=OuterRef("warehouse"),
+        product=OuterRef("product"),
+    ).order_by("-created_at").values("created_at")[:1]
+    qs = (
+        m.AgentStockBalance.objects
+        .select_related("agent", "product", "product__product_group", "product__category", "warehouse")
+        .annotate(last_movement_at=Subquery(move_subq))
+    )
+    qs = view._filter_qs_company_branch_relaxed(qs)
+    if agent_id:
+        qs = qs.filter(agent_id=agent_id)
+    warehouse_id = (view.request.query_params.get("warehouse") or "").strip()
+    if warehouse_id:
+        try:
+            qs = qs.filter(warehouse_id=UUID(warehouse_id))
+        except Exception:
+            raise ValidationError({"warehouse": "Неверный UUID."})
+    search = (view.request.query_params.get("search") or "").strip()
+    if search:
+        qs = qs.filter(
+            Q(product__name__icontains=search)
+            | Q(product__article__icontains=search)
+            | Q(product__barcode__icontains=search)
+        )
+    product_group_raw = (view.request.query_params.get("product_group") or "").strip()
+    if product_group_raw:
+        try:
+            qs = qs.filter(product__product_group_id=UUID(product_group_raw))
+        except Exception:
+            raise ValidationError({"product_group": "Неверный UUID."})
+    order_by = (view.request.query_params.get("order_by") or "").strip().lower()
+    if order_by == "date":
+        qs = qs.order_by("last_movement_at", "product__name", "id")
+    elif order_by == "-date":
+        qs = qs.order_by("-last_movement_at", "product__name", "id")
+    else:
+        qs = qs.order_by("-last_movement_at", "product__name", "id")
+    return qs
+
+
 def _company_ids_for_warehouse_access(user):
     """
     Список id компаний, к складам которых пользователь имеет доступ:
@@ -1137,11 +1192,20 @@ class AgentReturnCartListCreateAPIView(CompanyBranchRestrictedMixin, generics.Li
 
     def perform_create(self, serializer):
         user = self.request.user
-        if _is_owner_like(user):
-            raise ValidationError({"detail": "Владелец/админ не создаёт возврат за агента. Возврат оформляет агент."})
         warehouse = serializer.validated_data.get("warehouse")
         if not warehouse:
             raise ValidationError({"warehouse": "Укажите склад."})
+
+        if _is_owner_like(user):
+            agent = serializer.validated_data.get("agent")
+            if not agent:
+                raise ValidationError({"agent": "Укажите агента, у которого принимаете возврат."})
+            try:
+                m.CompanyWarehouseAgent.ensure_active_for_warehouse(agent, warehouse)
+            except DjangoValidationError as exc:
+                raise ValidationError(getattr(exc, "message_dict", {"detail": str(exc)}))
+        else:
+            agent = user
 
         company_ids = _company_ids_for_warehouse_access(user)
         if company_ids and warehouse.company_id not in company_ids:
@@ -1153,10 +1217,42 @@ class AgentReturnCartListCreateAPIView(CompanyBranchRestrictedMixin, generics.Li
             raise ValidationError({"warehouse": "Склад другого филиала."})
 
         serializer.save(
-            agent=user,
+            agent=agent,
             company=warehouse.company,
             branch=warehouse.branch,
         )
+
+    def create(self, request, *args, **kwargs):
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        items_data = list(serializer.validated_data.pop("items_input", []) or [])
+        try:
+            with transaction.atomic():
+                self.perform_create(serializer)
+                cart = serializer.instance
+                for row in items_data:
+                    item = m.AgentReturnItem(
+                        cart=cart,
+                        product=row["product"],
+                        quantity_returned=row["quantity_returned"],
+                        company=cart.company,
+                        branch=cart.branch,
+                    )
+                    item.full_clean()
+                    item.save()
+        except DjangoValidationError as exc:
+            raise ValidationError(getattr(exc, "message_dict", {"detail": str(exc)}))
+
+        cart = (
+            m.AgentReturnCart.objects
+            .select_related("agent", "warehouse", "approved_by")
+            .prefetch_related("items__product")
+            .get(pk=cart.pk)
+        )
+        out = AgentReturnCartSerializer(cart, context={"request": request}).data
+        headers = self.get_success_headers(out)
+        return Response(out, status=status.HTTP_201_CREATED, headers=headers)
 
 
 class AgentReturnCartRetrieveUpdateDestroyAPIView(CompanyBranchRestrictedMixin, generics.RetrieveUpdateDestroyAPIView):
@@ -1249,6 +1345,32 @@ class AgentReturnCartRejectAPIView(CompanyBranchRestrictedMixin, APIView):
         return Response(out)
 
 
+class AgentReturnCartReceiveAPIView(CompanyBranchRestrictedMixin, APIView):
+    """
+    Владелец/админ принимает возврат от агента без заявки агента.
+
+    POST /api/warehouse/agent-return-carts/<id>/receive/
+    """
+
+    def post(self, request, pk=None, *args, **kwargs):
+        user = request.user
+        if not _is_owner_like(user):
+            return Response({"detail": "Только владелец/админ."}, status=status.HTTP_403_FORBIDDEN)
+
+        qs = self._filter_qs_company_branch_relaxed(
+            m.AgentReturnCart.objects.select_related("agent", "warehouse").prefetch_related("items__product")
+        )
+        cart = get_object_or_404(qs, pk=pk)
+        ser = AgentReturnCartActionSerializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+        try:
+            cart.receive_by_owner(user)
+        except DjangoValidationError as exc:
+            raise ValidationError(getattr(exc, "message_dict", {"detail": str(exc)}))
+        out = AgentReturnCartSerializer(cart, context={"request": request}).data
+        return Response(out)
+
+
 class AgentReturnItemListCreateAPIView(CompanyBranchRestrictedMixin, generics.ListCreateAPIView):
     serializer_class = AgentReturnItemSerializer
 
@@ -1276,10 +1398,22 @@ class AgentReturnItemListCreateAPIView(CompanyBranchRestrictedMixin, generics.Li
         self._ensure_agent_can_access_warehouse(getattr(cart, "warehouse", None), field_name="cart")
         if cart.status != m.AgentReturnCart.Status.DRAFT:
             raise ValidationError("Можно добавлять позиции только в черновик.")
-        serializer.save(
-            company=cart.company,
-            branch=cart.branch,
-        )
+        try:
+            serializer.save(
+                company=cart.company,
+                branch=cart.branch,
+            )
+        except DjangoValidationError as exc:
+            _cleanup_empty_agent_return_draft(getattr(cart, "pk", None))
+            raise ValidationError(getattr(exc, "message_dict", {"detail": str(exc)}))
+
+    def create(self, request, *args, **kwargs):
+        cart_id = request.data.get("cart")
+        try:
+            return super().create(request, *args, **kwargs)
+        except ValidationError:
+            _cleanup_empty_agent_return_draft(cart_id)
+            raise
 
 
 class AgentReturnItemDetailAPIView(CompanyBranchRestrictedMixin, generics.RetrieveUpdateDestroyAPIView):
@@ -1444,31 +1578,60 @@ class AgentMyProductsListAPIView(CompanyBranchRestrictedMixin, APIView):
 
 
 class OwnerAgentsProductsListAPIView(CompanyBranchRestrictedMixin, APIView):
+    """
+    Остатки на руках у агентов (владелец/админ).
+
+    GET /api/warehouse/owner/agents/products/
+    Query: agent, warehouse, search, product_group, order_by, page, page_size
+    """
+
+    class _Paginator(PageNumberPagination):
+        page_size_query_param = "page_size"
+
+    pagination_class = _Paginator
+
     def get(self, request, *args, **kwargs):
         user = request.user
         if not _is_owner_like(user):
             return Response({"detail": "Только владелец/админ."}, status=status.HTTP_403_FORBIDDEN)
-        move_subq = m.AgentStockMove.objects.filter(
-            agent=OuterRef("agent"),
-            warehouse=OuterRef("warehouse"),
-            product=OuterRef("product"),
-        ).order_by("-created_at").values("created_at")[:1]
-        qs = (
-            m.AgentStockBalance.objects
-            .select_related("agent", "product", "product__product_group", "product__category", "warehouse")
-            .annotate(last_movement_at=Subquery(move_subq))
-        )
-        qs = self._filter_qs_company_branch_relaxed(qs)
-        order_by = (request.query_params.get("order_by") or "").strip().lower()
-        if order_by == "date":
-            qs = qs.order_by("last_movement_at", "agent_id", "product__name", "id")
-        elif order_by == "-date":
-            qs = qs.order_by("-last_movement_at", "agent_id", "product__name", "id")
-        else:
-            # по умолчанию — по дате (последнее движение), сначала новые
-            qs = qs.order_by("-last_movement_at", "agent_id", "product__name", "id")
-        data = AgentStockBalanceSerializer(qs, many=True).data
-        return Response(data)
+
+        agent_raw = (request.query_params.get("agent") or "").strip()
+        agent_id = None
+        if agent_raw:
+            try:
+                agent_id = UUID(agent_raw)
+            except Exception:
+                raise ValidationError({"agent": "Неверный UUID."})
+
+        qs = _owner_agent_stock_queryset(self, agent_id=agent_id)
+        paginator = self.pagination_class()
+        page = paginator.paginate_queryset(qs, request, view=self)
+        ser = AgentStockBalanceSerializer(page, many=True)
+        return paginator.get_paginated_response(ser.data)
+
+
+class OwnerAgentProductsListAPIView(CompanyBranchRestrictedMixin, APIView):
+    """
+    Остатки конкретного агента (владелец/админ).
+
+    GET /api/warehouse/owner/agents/<agent_id>/products/
+    """
+
+    class _Paginator(PageNumberPagination):
+        page_size_query_param = "page_size"
+
+    pagination_class = _Paginator
+
+    def get(self, request, agent_id=None, *args, **kwargs):
+        user = request.user
+        if not _is_owner_like(user):
+            return Response({"detail": "Только владелец/админ."}, status=status.HTTP_403_FORBIDDEN)
+
+        qs = _owner_agent_stock_queryset(self, agent_id=agent_id)
+        paginator = self.pagination_class()
+        page = paginator.paginate_queryset(qs, request, view=self)
+        ser = AgentStockBalanceSerializer(page, many=True)
+        return paginator.get_paginated_response(ser.data)
 
 
 # ----------------

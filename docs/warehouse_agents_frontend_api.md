@@ -370,6 +370,16 @@ Flow: `draft -> submitted -> approved / rejected`
 
 **Не путать** с `/api/main/returns/` — тот API для старого manufacture-flow (`ManufactureSubreal`), не для warehouse-агентов.
 
+### 10.1 Владелец: остатки агента и возврат сам
+
+> Подробная документация: **[OWNER_AGENT_RETURN_FRONTEND.md](../apps/warehouse/OWNER_AGENT_RETURN_FRONTEND.md)**
+
+```http
+GET /api/warehouse/owner/agents/{agent_id}/products/
+POST /api/warehouse/agent-return-carts/   { warehouse, agent, items_input? }
+POST /api/warehouse/agent-return-carts/{id}/receive/
+```
+
 ## 11. Контрагенты агента
 
 Контрагенты идут через общий CRUD:

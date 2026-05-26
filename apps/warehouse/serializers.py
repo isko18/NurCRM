@@ -727,9 +727,38 @@ class AgentReturnItemSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSer
         )
         read_only_fields = ("id", "created_date", "updated_date")
 
+    def validate(self, attrs):
+        attrs = super().validate(attrs)
+        cart = attrs.get("cart") or getattr(getattr(self, "instance", None), "cart", None)
+        product = attrs.get("product") or getattr(getattr(self, "instance", None), "product", None)
+        qty = attrs.get("quantity_returned")
+        if qty is None and getattr(self, "instance", None) is not None:
+            qty = getattr(self.instance, "quantity_returned", None)
+        if not cart or not product or qty is None:
+            return attrs
+        if cart.status != m.AgentReturnCart.Status.DRAFT:
+            return attrs
+        need = q_qty(Decimal(qty or 0))
+        exclude_item_id = getattr(getattr(self, "instance", None), "pk", None)
+        available = cart._agent_available_qty(product, exclude_item_id=exclude_item_id)
+        if need > available:
+            raise serializers.ValidationError({
+                "quantity_returned": (
+                    f"Недостаточно у агента для {product.name}: "
+                    f"нужно {need}, доступно {available}."
+                )
+            })
+        return attrs
+
+
+class AgentReturnCartItemInputSerializer(serializers.Serializer):
+    product = serializers.PrimaryKeyRelatedField(queryset=m.WarehouseProduct.objects.all())
+    quantity_returned = serializers.DecimalField(max_digits=18, decimal_places=3)
+
 
 class AgentReturnCartSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
     items = AgentReturnItemSerializer(many=True, read_only=True)
+    items_input = AgentReturnCartItemInputSerializer(many=True, required=False, write_only=True)
     agent_display = serializers.SerializerMethodField()
     note = serializers.CharField(required=False, allow_blank=True)
 
@@ -749,10 +778,10 @@ class AgentReturnCartSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSer
             "created_date",
             "updated_date",
             "items",
+            "items_input",
         )
         read_only_fields = (
             "id",
-            "agent",
             "status",
             "submitted_at",
             "approved_at",
@@ -762,7 +791,26 @@ class AgentReturnCartSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSer
         )
         extra_kwargs = {
             "warehouse": {"required": True},
+            "agent": {"required": False},
         }
+
+    def validate(self, attrs):
+        attrs = super().validate(attrs)
+        request = self.context.get("request")
+        user = getattr(request, "user", None) if request else None
+        if self.instance is not None:
+            return attrs
+        if user and _is_owner_like(user):
+            agent = attrs.get("agent")
+            warehouse = attrs.get("warehouse")
+            if not agent:
+                raise serializers.ValidationError({"agent": "Укажите агента, у которого принимаете возврат."})
+            if warehouse:
+                try:
+                    m.CompanyWarehouseAgent.ensure_active_for_warehouse(agent, warehouse)
+                except DjangoValidationError as exc:
+                    raise serializers.ValidationError(getattr(exc, "message_dict", {"agent": str(exc)}))
+        return attrs
 
     def get_agent_display(self, obj):
         agent = getattr(obj, "agent", None)
@@ -940,6 +988,7 @@ class AgentStockBalanceSerializer(serializers.ModelSerializer):
     product_category_name = serializers.SerializerMethodField()
     agent_display = serializers.SerializerMethodField()
     last_movement_at = serializers.DateTimeField(read_only=True, allow_null=True)
+    qty_available = serializers.SerializerMethodField()
 
     class Meta:
         model = m.AgentStockBalance
@@ -960,9 +1009,23 @@ class AgentStockBalanceSerializer(serializers.ModelSerializer):
             "product_category",
             "product_category_name",
             "qty",
+            "qty_available",
             "last_movement_at",
         )
         read_only_fields = fields
+
+    def get_qty_available(self, obj):
+        from django.db.models import Sum
+
+        on_hand = q_qty(Decimal(getattr(obj, "qty", None) or 0))
+        pending = m.AgentReturnItem.objects.filter(
+            cart__agent_id=obj.agent_id,
+            cart__warehouse_id=obj.warehouse_id,
+            cart__status=m.AgentReturnCart.Status.SUBMITTED,
+            product_id=obj.product_id,
+        ).aggregate(total=Sum("quantity_returned"))["total"]
+        reserved = q_qty(Decimal(pending or 0))
+        return str(max(on_hand - reserved, Decimal("0.000")))
 
     def get_product_price_after_discount(self, obj):
         p = getattr(obj, "product", None)

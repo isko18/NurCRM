@@ -1777,3 +1777,85 @@ class WarehouseComprehensiveTests(TestCase):
         self.assertEqual(warehouse_bal.qty, Decimal("35.000"))
         self.prod1.refresh_from_db()
         self.assertEqual(self.prod1.quantity, Decimal("35.000"))
+
+    def test_owner_can_view_agent_stock_and_receive_return(self):
+        agent = User.objects.create_user(
+            email="owner-return-agent@example.com",
+            password="testpass123",
+            first_name="Owner",
+            last_name="ReturnAgent",
+        )
+        models.CompanyWarehouseAgent.objects.create(
+            company=self.company,
+            user=agent,
+            status=models.CompanyWarehouseAgent.Status.ACTIVE,
+            assigned_warehouse=self.wh1,
+        )
+        models.AgentStockBalance.objects.create(
+            company=self.company,
+            branch=self.branch,
+            agent=agent,
+            warehouse=self.wh1,
+            product=self.prod1,
+            qty=Decimal("25.000"),
+        )
+        models.StockBalance.objects.create(
+            warehouse=self.wh1,
+            product=self.prod1,
+            qty=Decimal("100.000"),
+        )
+        self.prod1.quantity = Decimal("100.000")
+        self.prod1.save(update_fields=["quantity"])
+
+        self.user.role = Roles.OWNER
+        self.user.save(update_fields=["role"])
+        owner_client = APIClient()
+        owner_client.force_authenticate(user=self.user)
+
+        stock_response = owner_client.get(
+            reverse("warehouse-owner-agent-products", kwargs={"agent_id": agent.id}),
+        )
+        self.assertEqual(stock_response.status_code, 200, stock_response.data)
+        payload = stock_response.data.get("results", stock_response.data)
+        self.assertEqual(len(payload), 1)
+        self.assertEqual(payload[0]["qty"], "25.000")
+        self.assertEqual(payload[0]["qty_available"], "25.000")
+
+        cart_response = owner_client.post(
+            reverse("warehouse-agent-return-carts"),
+            {
+                "warehouse": str(self.wh1.id),
+                "agent": str(agent.id),
+                "note": "Возврат от владельца",
+                "items_input": [
+                    {
+                        "product": str(self.prod1.id),
+                        "quantity_returned": "10.000",
+                    }
+                ],
+            },
+            format="json",
+        )
+        self.assertEqual(cart_response.status_code, 201, cart_response.data)
+        cart_id = cart_response.data["id"]
+
+        receive_response = owner_client.post(
+            reverse("warehouse-agent-return-cart-receive", kwargs={"pk": cart_id}),
+            {},
+            format="json",
+        )
+        self.assertEqual(receive_response.status_code, 200, receive_response.data)
+        self.assertEqual(receive_response.data["status"], models.AgentReturnCart.Status.APPROVED)
+
+        agent_bal = models.AgentStockBalance.objects.get(
+            agent=agent,
+            warehouse=self.wh1,
+            product=self.prod1,
+        )
+        self.assertEqual(agent_bal.qty, Decimal("15.000"))
+
+        warehouse_bal = models.StockBalance.objects.get(
+            warehouse=self.wh1,
+            product=self.prod1,
+        )
+        self.assertEqual(warehouse_bal.qty, Decimal("110.000"))

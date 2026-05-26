@@ -23,10 +23,12 @@ from .views import (
     AgentReturnCartSubmitAPIView,
     AgentReturnCartApproveAPIView,
     AgentReturnCartRejectAPIView,
+    AgentReturnCartReceiveAPIView,
     AgentReturnItemListCreateAPIView,
     AgentReturnItemDetailAPIView,
     AgentMyProductsListAPIView,
     OwnerAgentsProductsListAPIView,
+    OwnerAgentProductsListAPIView,
     CompaniesSearchForAgentsAPIView,
     CompanyWarehouseAgentRequestListCreateAPIView,
     CompanyWarehouseAgentAcceptAPIView,
@@ -144,12 +146,14 @@ urlpatterns += [
     path("agent-return-carts/<uuid:pk>/submit/", AgentReturnCartSubmitAPIView.as_view(), name="warehouse-agent-return-cart-submit"),
     path("agent-return-carts/<uuid:pk>/approve/", AgentReturnCartApproveAPIView.as_view(), name="warehouse-agent-return-cart-approve"),
     path("agent-return-carts/<uuid:pk>/reject/", AgentReturnCartRejectAPIView.as_view(), name="warehouse-agent-return-cart-reject"),
+    path("agent-return-carts/<uuid:pk>/receive/", AgentReturnCartReceiveAPIView.as_view(), name="warehouse-agent-return-cart-receive"),
     path("agent-return-cart-items/", AgentReturnItemListCreateAPIView.as_view(), name="warehouse-agent-return-cart-items"),
     path("agent-return-cart-items/<uuid:pk>/", AgentReturnItemDetailAPIView.as_view(), name="warehouse-agent-return-cart-item-detail"),
 
     # agent stock
     path("agents/me/products/", AgentMyProductsListAPIView.as_view(), name="warehouse-agent-my-products"),
     path("owner/agents/products/", OwnerAgentsProductsListAPIView.as_view(), name="warehouse-owner-agents-products"),
+    path("owner/agents/<uuid:agent_id>/products/", OwnerAgentProductsListAPIView.as_view(), name="warehouse-owner-agent-products"),
 
     # агенты: поиск компаний и заявки в компанию
     path("agents/companies/search/", CompaniesSearchForAgentsAPIView.as_view(), name="warehouse-agents-companies-search"),

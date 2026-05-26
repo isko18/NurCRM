@@ -2083,6 +2083,45 @@ class AgentReturnCart(BaseModelId, BaseModelDate, BaseModelCompanyBranch):
         self.full_clean()
         self.save(update_fields=["status", "approved_at", "approved_by", "updated_date"])
 
+    def _validate_items_against_agent_stock(self):
+        totals = {}
+        products = {}
+        for it in self.items.select_related("product"):
+            pid = it.product_id
+            totals[pid] = totals.get(pid, Decimal("0.000")) + q_qty(Decimal(it.quantity_returned or 0))
+            products[pid] = it.product
+        for pid, need in totals.items():
+            if need <= 0:
+                continue
+            prod = products[pid]
+            available = self._agent_available_qty(prod)
+            if need > available:
+                raise ValidationError({
+                    "items": (
+                        f"Недостаточно у агента для {prod.name}: "
+                        f"запрошено {need}, доступно {available}."
+                    )
+                })
+
+    @transaction.atomic
+    def receive_by_owner(self, by_user):
+        """Владелец принимает возврат от агента без заявки агента."""
+        if self.status != self.Status.DRAFT:
+            raise ValidationError("Можно принять возврат только из черновика.")
+        if not self.items.exists():
+            raise ValidationError("Нельзя принять пустой возврат.")
+
+        self._validate_items_against_agent_stock()
+        self._transfer_items_from_agent_to_warehouse()
+
+        now = timezone.now()
+        self.status = self.Status.APPROVED
+        self.submitted_at = now
+        self.approved_at = now
+        self.approved_by = by_user
+        self.full_clean()
+        self.save(update_fields=["status", "submitted_at", "approved_at", "approved_by", "updated_date"])
+
 
 class AgentReturnItem(BaseModelId, BaseModelDate, BaseModelCompanyBranch):
     cart = models.ForeignKey(
@@ -2140,10 +2179,8 @@ class AgentReturnItem(BaseModelId, BaseModelDate, BaseModelCompanyBranch):
                 self.company_id = self.cart.company_id
             if self.branch_id is None:
                 self.branch_id = self.cart.branch_id
+        self.full_clean()
         super().save(*args, **kwargs)
-
-
-class StockMove(models.Model):
     """Движение товара. Каждое движение — приход или расход."""
 
     class MoveKind(models.TextChoices):
