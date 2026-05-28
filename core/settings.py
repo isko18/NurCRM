@@ -380,8 +380,8 @@ CHANNEL_LAYERS = {
         "BACKEND": "channels_redis.core.RedisChannelLayer",
         "CONFIG": {
             "hosts": [os.getenv("REDIS_URL", "redis://127.0.0.1:6379/0")],
-            "capacity": 2000,  # ↑ буфер пачек
-            "expiry": 15,      # ↓ время жизни сообщений в слое
+            "capacity": 2000,
+            "expiry": 30,
         },
     }
 }
@@ -389,6 +389,8 @@ CHANNEL_LAYERS = {
 # ===========================
 # Логирование
 # ===========================
+_WS_LOG_LEVEL = 'DEBUG' if DEBUG else 'WARNING'
+
 LOGGING = {
     'version': 1,
     'disable_existing_loggers': False,
@@ -407,17 +409,17 @@ LOGGING = {
     'loggers': {
         'nurcrm.websocket.auth': {
             'handlers': ['console'],
-            'level': 'INFO',
+            'level': _WS_LOG_LEVEL,
             'propagate': False,
         },
         'nurcrm.websocket.cafe': {
             'handlers': ['console'],
-            'level': 'INFO',
+            'level': _WS_LOG_LEVEL,
             'propagate': False,
         },
         'nurcrm.websocket.consumer': {
             'handlers': ['console'],
-            'level': 'INFO',
+            'level': _WS_LOG_LEVEL,
             'propagate': False,
         },
         'apps.cafe.consumers': {

@@ -26,7 +26,9 @@ JWT_SKIP_PATH_PREFIXES = ("ws/agents/",)
 # Rate-limit repeated failed auth handshakes per client+path (reconnect storm).
 WS_AUTH_FAIL_CACHE_PREFIX = "ws:auth_fail:"
 WS_AUTH_FAIL_WINDOW_SEC = 60
-WS_AUTH_FAIL_MAX = 20
+WS_AUTH_FAIL_MAX = 10
+WS_USER_CACHE_TTL = 300
+WS_USER_CACHE_PREFIX = "ws:user:"
 
 
 def _normalize_ws_path(scope) -> str:
@@ -85,9 +87,15 @@ def _validate_access_token(token: str) -> tuple[str | None, str | None]:
 
 
 @database_sync_to_async
-def _get_user_by_id(user_id):
+def _get_user_by_id_cached(user_id: str):
+    cache_key = WS_USER_CACHE_PREFIX + user_id
+    user = cache.get(cache_key)
+    if user is not None:
+        return user
     try:
-        return User.objects.get(id=user_id)
+        user = User.objects.get(id=user_id)
+        cache.set(cache_key, user, WS_USER_CACHE_TTL)
+        return user
     except User.DoesNotExist:
         return AnonymousUser()
 
@@ -110,15 +118,61 @@ def _clear_auth_failures(scope) -> None:
         pass
 
 
-async def _reject_ws_http(send, *, status: int, body: bytes = b"") -> None:
+async def _reject_ws_http(
+    send,
+    *,
+    status: int,
+    body: bytes = b"",
+    extra_headers: list[tuple[bytes, bytes]] | None = None,
+) -> None:
+    headers = [(b"content-type", b"text/plain; charset=utf-8")]
+    if extra_headers:
+        headers.extend(extra_headers)
     await send(
         {
             "type": "websocket.http.response.start",
             "status": status,
-            "headers": [(b"content-type", b"text/plain; charset=utf-8")],
+            "headers": headers,
         }
     )
     await send({"type": "websocket.http.response.body", "body": body})
+
+
+async def _reject_auth_handshake(scope, send, *, error: str, token: str | None = None, user_id: str | None = None) -> None:
+    fails = _register_auth_failure(scope)
+    if user_id:
+        logger.warning(
+            "websocket auth failed path=%s error=%s user_id=%s fails=%s",
+            scope.get("path"),
+            error,
+            user_id,
+            fails,
+        )
+    else:
+        logger.warning(
+            "websocket auth failed path=%s error=%s token=%s fails=%s",
+            scope.get("path"),
+            error,
+            _token_fingerprint(token),
+            fails,
+        )
+
+    if fails > WS_AUTH_FAIL_MAX:
+        logger.warning(
+            "websocket auth storm blocked path=%s client=%s fails=%s",
+            scope.get("path"),
+            _client_cache_key(scope),
+            fails,
+        )
+        await _reject_ws_http(
+            send,
+            status=429,
+            body=b"Too many failed websocket auth attempts. Retry later.",
+            extra_headers=[(b"retry-after", b"30")],
+        )
+        return
+
+    await _reject_ws_http(send, status=401, body=b"Unauthorized")
 
 
 class JWTAuthMiddleware:
@@ -137,74 +191,23 @@ class JWTAuthMiddleware:
         scope["ws_auth_token_present"] = bool(token)
 
         if not token:
-            scope["user"] = AnonymousUser()
-            scope["ws_auth_error"] = "missing"
-            fails = _register_auth_failure(scope)
-            logger.warning(
-                "websocket auth failed path=%s error=missing token=%s fails=%s",
-                scope.get("path"),
-                _token_fingerprint(token),
-                fails,
-            )
-            if fails > WS_AUTH_FAIL_MAX:
-                logger.warning(
-                    "websocket auth storm blocked path=%s client=%s fails=%s",
-                    scope.get("path"),
-                    _client_cache_key(scope),
-                    fails,
-                )
-                await _reject_ws_http(
-                    send,
-                    status=429,
-                    body=b"Too many failed websocket auth attempts. Retry later.",
-                )
-                return
-            return await self.inner(scope, receive, send)
+            await _reject_auth_handshake(scope, send, error="missing", token=token)
+            return
 
         user_id, error = _validate_access_token(token)
         if error or not user_id:
-            scope["user"] = AnonymousUser()
-            scope["ws_auth_error"] = error or "invalid"
-            fails = _register_auth_failure(scope)
-            logger.warning(
-                "websocket auth failed path=%s error=%s token=%s fails=%s",
-                scope.get("path"),
-                scope["ws_auth_error"],
-                _token_fingerprint(token),
-                fails,
-            )
-            if fails > WS_AUTH_FAIL_MAX:
-                logger.warning(
-                    "websocket auth storm blocked path=%s client=%s fails=%s",
-                    scope.get("path"),
-                    _client_cache_key(scope),
-                    fails,
-                )
-                await _reject_ws_http(
-                    send,
-                    status=429,
-                    body=b"Too many failed websocket auth attempts. Retry later.",
-                )
-                return
-            return await self.inner(scope, receive, send)
+            await _reject_auth_handshake(scope, send, error=error or "invalid", token=token)
+            return
 
-        user = await _get_user_by_id(user_id)
+        user = await _get_user_by_id_cached(user_id)
         if isinstance(user, AnonymousUser):
-            scope["user"] = user
-            scope["ws_auth_error"] = "user_not_found"
-            fails = _register_auth_failure(scope)
-            logger.warning(
-                "websocket auth failed path=%s error=user_not_found user_id=%s fails=%s",
-                scope.get("path"),
-                user_id,
-                fails,
-            )
-            return await self.inner(scope, receive, send)
+            await _reject_auth_handshake(scope, send, error="user_not_found", user_id=user_id)
+            return
 
         scope["user"] = user
         scope.pop("ws_auth_error", None)
         _clear_auth_failures(scope)
-        logger.info(
+        logger.debug(
             "websocket auth ok path=%s user_id=%s",
             scope.get("path"),
             user.id,

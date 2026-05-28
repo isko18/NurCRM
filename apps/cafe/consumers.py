@@ -4,6 +4,7 @@ import logging
 from channels.generic.websocket import AsyncWebsocketConsumer
 from channels.db import database_sync_to_async
 from django.contrib.auth import get_user_model
+from django.core.cache import cache
 
 from core.ws_consumer_utils import (
     is_anonymous_scope_user,
@@ -13,6 +14,77 @@ from core.ws_consumer_utils import (
 
 User = get_user_model()
 logger = logging.getLogger("nurcrm.websocket.cafe")
+
+WS_CTX_CACHE_TTL = 300
+WS_CTX_CACHE_PREFIX = "ws:ctx:"
+
+
+def _resolve_user_company_and_branch_uncached(user):
+    """Получает company и branch из пользователя (без кэша)."""
+    try:
+        company = getattr(user, "owned_company", None) or getattr(user, "company", None)
+        if not company:
+            return None, None
+
+        branch = None
+
+        primary = getattr(user, "primary_branch", None)
+        if primary and getattr(primary, "company_id", None) == company.id:
+            branch = primary
+
+        if not branch:
+            user_branch = getattr(user, "branch", None)
+            if user_branch and getattr(user_branch, "company_id", None) == company.id:
+                branch = user_branch
+
+        if not branch and hasattr(user, "branch_memberships"):
+            membership = user.branch_memberships.filter(
+                branch__company_id=company.id
+            ).select_related("branch").first()
+            if membership and membership.branch:
+                branch = membership.branch
+
+        return company, branch
+    except Exception:
+        return None, None
+
+
+def resolve_user_company_and_branch(user):
+    """Получает company и branch из пользователя с кэшем в Redis."""
+    cache_key = WS_CTX_CACHE_PREFIX + str(user.id)
+    cached = cache.get(cache_key)
+    if cached is not None:
+        from apps.users.models import Branch, Company
+
+        company_id = cached.get("company_id")
+        if not company_id:
+            return None, None
+        try:
+            company = Company.objects.get(id=company_id)
+        except Company.DoesNotExist:
+            cache.delete(cache_key)
+            return _resolve_user_company_and_branch_uncached(user)
+
+        branch = None
+        branch_id = cached.get("branch_id")
+        if branch_id:
+            try:
+                branch = Branch.objects.get(id=branch_id, company_id=company_id)
+            except Branch.DoesNotExist:
+                pass
+        return company, branch
+
+    company, branch = _resolve_user_company_and_branch_uncached(user)
+    if company:
+        cache.set(
+            cache_key,
+            {
+                "company_id": str(company.id),
+                "branch_id": str(branch.id) if branch else None,
+            },
+            WS_CTX_CACHE_TTL,
+        )
+    return company, branch
 
 
 class CafeOrderConsumer(AsyncWebsocketConsumer):
@@ -70,7 +142,7 @@ class CafeOrderConsumer(AsyncWebsocketConsumer):
         await self.channel_layer.group_add(self.group_name, self.channel_name)
         await self.accept()
         
-        logger.info(
+        logger.debug(
             "websocket connected consumer=CafeOrderConsumer user_id=%s company_id=%s branch_id=%s group=%s",
             user.id,
             self.company_id,
@@ -88,7 +160,7 @@ class CafeOrderConsumer(AsyncWebsocketConsumer):
     
     async def disconnect(self, code):
         if hasattr(self, "group_name"):
-            logger.info(
+            logger.debug(
                 "websocket disconnected consumer=CafeOrderConsumer group=%s code=%s",
                 self.group_name,
                 code,
@@ -115,12 +187,12 @@ class CafeOrderConsumer(AsyncWebsocketConsumer):
         """Отправка уведомления о создании заказа"""
         try:
             payload = event.get("payload", {})
-            logger.info(f"[CafeOrderConsumer] Received order_created event: order_id={payload.get('order', {}).get('id')}, group={self.group_name}")
+            logger.debug(f"[CafeOrderConsumer] Received order_created event: order_id={payload.get('order', {}).get('id')}, group={self.group_name}")
             await self.send(json.dumps({
                 "type": "order_created",
                 "data": payload
             }))
-            logger.info(f"[CafeOrderConsumer] Sent order_created notification to client")
+            logger.debug(f"[CafeOrderConsumer] Sent order_created notification to client")
         except Exception as e:
             logger.error(f"[CafeOrderConsumer] Error in order_created: {e}", exc_info=True)
     
@@ -128,12 +200,12 @@ class CafeOrderConsumer(AsyncWebsocketConsumer):
         """Отправка уведомления об обновлении заказа"""
         try:
             payload = event.get("payload", {})
-            logger.info(f"[CafeOrderConsumer] Received order_updated event: order_id={payload.get('order', {}).get('id')}, group={self.group_name}")
+            logger.debug(f"[CafeOrderConsumer] Received order_updated event: order_id={payload.get('order', {}).get('id')}, group={self.group_name}")
             await self.send(json.dumps({
                 "type": "order_updated",
                 "data": payload
             }))
-            logger.info(f"[CafeOrderConsumer] Sent order_updated notification to client")
+            logger.debug(f"[CafeOrderConsumer] Sent order_updated notification to client")
         except Exception as e:
             logger.error(f"[CafeOrderConsumer] Error in order_updated: {e}", exc_info=True)
     
@@ -142,12 +214,12 @@ class CafeOrderConsumer(AsyncWebsocketConsumer):
         try:
             payload = event.get("payload", {})
             table_id = payload.get("table_id") or payload.get("table", {}).get("id")
-            logger.info(f"[CafeOrderConsumer] Received table_status_changed event: table_id={table_id}, status={payload.get('status')}, group={self.group_name}")
+            logger.debug(f"[CafeOrderConsumer] Received table_status_changed event: table_id={table_id}, status={payload.get('status')}, group={self.group_name}")
             await self.send(json.dumps({
                 "type": "table_status_changed",
                 "data": payload
             }))
-            logger.info(f"[CafeOrderConsumer] Sent table_status_changed notification to client")
+            logger.debug(f"[CafeOrderConsumer] Sent table_status_changed notification to client")
         except Exception as e:
             logger.error(f"[CafeOrderConsumer] Error in table_status_changed: {e}", exc_info=True)
 
@@ -156,71 +228,40 @@ class CafeOrderConsumer(AsyncWebsocketConsumer):
         try:
             payload = event.get("payload", {})
             task_id = payload.get("task_id") or payload.get("task", {}).get("id")
-            logger.info(f"[CafeOrderConsumer] Received kitchen_task_ready event: task_id={task_id}, group={self.group_name}")
+            logger.debug(f"[CafeOrderConsumer] Received kitchen_task_ready event: task_id={task_id}, group={self.group_name}")
             await self.send(json.dumps({
                 "type": "kitchen_task_ready",
                 "data": payload
             }))
-            logger.info(f"[CafeOrderConsumer] Sent kitchen_task_ready notification to client")
+            logger.debug(f"[CafeOrderConsumer] Sent kitchen_task_ready notification to client")
         except Exception as e:
             logger.error(f"[CafeOrderConsumer] Error in kitchen_task_ready: {e}", exc_info=True)
     
     @database_sync_to_async
     def _get_user_company_and_branch(self, user):
-        """Получает company и branch из пользователя"""
-        try:
-            # Получаем компанию
-            company = getattr(user, "owned_company", None) or getattr(user, "company", None)
-            if not company:
-                return None, None
-            
-            # Получаем филиал
-            branch = None
-            
-            # 1) primary_branch (property)
-            primary = getattr(user, "primary_branch", None)
-            if primary and getattr(primary, "company_id", None) == company.id:
-                branch = primary
-            
-            # 2) user.branch
-            if not branch:
-                user_branch = getattr(user, "branch", None)
-                if user_branch and getattr(user_branch, "company_id", None) == company.id:
-                    branch = user_branch
-            
-            # 3) первый филиал из branch_memberships
-            if not branch and hasattr(user, "branch_memberships"):
-                membership = user.branch_memberships.filter(
-                    branch__company_id=company.id
-                ).select_related("branch").first()
-                if membership and membership.branch:
-                    branch = membership.branch
-            
-            return company, branch
-        except Exception:
-            return None, None
-    
+        return resolve_user_company_and_branch(user)
+
     @database_sync_to_async
     def _is_owner_like(self, user):
         """Проверяет, является ли пользователь owner/admin"""
         try:
             if getattr(user, "is_superuser", False):
                 return True
-            
+
             if getattr(user, "owned_company", None):
                 return True
-            
+
             if getattr(user, "is_admin", False):
                 return True
-            
+
             role = getattr(user, "role", None)
             if role in ("owner", "admin", "OWNER", "ADMIN", "Владелец", "Администратор"):
                 return True
-            
+
             return False
         except Exception:
             return False
-    
+
     @database_sync_to_async
     def _get_branch_by_id(self, branch_id, company_id):
         """Получает филиал по ID, если он принадлежит компании"""
@@ -285,7 +326,7 @@ class CafeTableConsumer(AsyncWebsocketConsumer):
         await self.channel_layer.group_add(self.group_name, self.channel_name)
         await self.accept()
         
-        logger.info(
+        logger.debug(
             "websocket connected consumer=CafeTableConsumer user_id=%s company_id=%s branch_id=%s group=%s",
             user.id,
             self.company_id,
@@ -303,7 +344,7 @@ class CafeTableConsumer(AsyncWebsocketConsumer):
     
     async def disconnect(self, code):
         if hasattr(self, "group_name"):
-            logger.info(
+            logger.debug(
                 "websocket disconnected consumer=CafeTableConsumer group=%s code=%s",
                 self.group_name,
                 code,
@@ -332,12 +373,12 @@ class CafeTableConsumer(AsyncWebsocketConsumer):
         try:
             payload = event.get("payload", {})
             table_id = payload.get("table_id") or payload.get("table", {}).get("id")
-            logger.info(f"[CafeTableConsumer] Received table_created event: table_id={table_id}, group={self.group_name}")
+            logger.debug(f"[CafeTableConsumer] Received table_created event: table_id={table_id}, group={self.group_name}")
             await self.send(json.dumps({
                 "type": "table_created",
                 "data": payload
             }))
-            logger.info(f"[CafeTableConsumer] Sent table_created notification to client")
+            logger.debug(f"[CafeTableConsumer] Sent table_created notification to client")
         except Exception as e:
             logger.error(f"[CafeTableConsumer] Error in table_created: {e}", exc_info=True)
     
@@ -346,12 +387,12 @@ class CafeTableConsumer(AsyncWebsocketConsumer):
         try:
             payload = event.get("payload", {})
             table_id = payload.get("table_id") or payload.get("table", {}).get("id")
-            logger.info(f"[CafeTableConsumer] Received table_updated event: table_id={table_id}, group={self.group_name}")
+            logger.debug(f"[CafeTableConsumer] Received table_updated event: table_id={table_id}, group={self.group_name}")
             await self.send(json.dumps({
                 "type": "table_updated",
                 "data": payload
             }))
-            logger.info(f"[CafeTableConsumer] Sent table_updated notification to client")
+            logger.debug(f"[CafeTableConsumer] Sent table_updated notification to client")
         except Exception as e:
             logger.error(f"[CafeTableConsumer] Error in table_updated: {e}", exc_info=True)
     
@@ -361,71 +402,40 @@ class CafeTableConsumer(AsyncWebsocketConsumer):
             payload = event.get("payload", {})
             table_id = payload.get("table_id") or payload.get("table", {}).get("id")
             status = payload.get("status")
-            logger.info(f"[CafeTableConsumer] Received table_status_changed event: table_id={table_id}, status={status}, group={self.group_name}")
+            logger.debug(f"[CafeTableConsumer] Received table_status_changed event: table_id={table_id}, status={status}, group={self.group_name}")
             await self.send(json.dumps({
                 "type": "table_status_changed",
                 "data": payload
             }))
-            logger.info(f"[CafeTableConsumer] Sent table_status_changed notification to client")
+            logger.debug(f"[CafeTableConsumer] Sent table_status_changed notification to client")
         except Exception as e:
             logger.error(f"[CafeTableConsumer] Error in table_status_changed: {e}", exc_info=True)
     
     @database_sync_to_async
     def _get_user_company_and_branch(self, user):
-        """Получает company и branch из пользователя"""
-        try:
-            # Получаем компанию
-            company = getattr(user, "owned_company", None) or getattr(user, "company", None)
-            if not company:
-                return None, None
-            
-            # Получаем филиал
-            branch = None
-            
-            # 1) primary_branch (property)
-            primary = getattr(user, "primary_branch", None)
-            if primary and getattr(primary, "company_id", None) == company.id:
-                branch = primary
-            
-            # 2) user.branch
-            if not branch:
-                user_branch = getattr(user, "branch", None)
-                if user_branch and getattr(user_branch, "company_id", None) == company.id:
-                    branch = user_branch
-            
-            # 3) первый филиал из branch_memberships
-            if not branch and hasattr(user, "branch_memberships"):
-                membership = user.branch_memberships.filter(
-                    branch__company_id=company.id
-                ).select_related("branch").first()
-                if membership and membership.branch:
-                    branch = membership.branch
-            
-            return company, branch
-        except Exception:
-            return None, None
-    
+        return resolve_user_company_and_branch(user)
+
     @database_sync_to_async
     def _is_owner_like(self, user):
         """Проверяет, является ли пользователь owner/admin"""
         try:
             if getattr(user, "is_superuser", False):
                 return True
-            
+
             if getattr(user, "owned_company", None):
                 return True
-            
+
             if getattr(user, "is_admin", False):
                 return True
-            
+
             role = getattr(user, "role", None)
             if role in ("owner", "admin", "OWNER", "ADMIN", "Владелец", "Администратор"):
                 return True
-            
+
             return False
         except Exception:
             return False
-    
+
     @database_sync_to_async
     def _get_branch_by_id(self, branch_id, company_id):
         """Получает филиал по ID, если он принадлежит компании"""
@@ -488,7 +498,7 @@ class CafeKitchenConsumer(AsyncWebsocketConsumer):
         await self.channel_layer.group_add(self.group_name, self.channel_name)
         await self.accept()
 
-        logger.info(
+        logger.debug(
             "websocket connected consumer=CafeKitchenConsumer user_id=%s company_id=%s branch_id=%s group=%s",
             user.id,
             self.company_id,
@@ -505,7 +515,7 @@ class CafeKitchenConsumer(AsyncWebsocketConsumer):
 
     async def disconnect(self, code):
         if hasattr(self, "group_name"):
-            logger.info(
+            logger.debug(
                 "websocket disconnected consumer=CafeKitchenConsumer group=%s code=%s",
                 self.group_name,
                 code,
@@ -528,7 +538,7 @@ class CafeKitchenConsumer(AsyncWebsocketConsumer):
         try:
             payload = event.get("payload", {})
             task_id = payload.get("task_id") or payload.get("task", {}).get("id")
-            logger.info(f"[CafeKitchenConsumer] Received kitchen_task_ready event: task_id={task_id}, group={self.group_name}")
+            logger.debug(f"[CafeKitchenConsumer] Received kitchen_task_ready event: task_id={task_id}, group={self.group_name}")
             await self.send(json.dumps({
                 "type": "kitchen_task_ready",
                 "data": payload
@@ -538,33 +548,7 @@ class CafeKitchenConsumer(AsyncWebsocketConsumer):
 
     @database_sync_to_async
     def _get_user_company_and_branch(self, user):
-        """Получает company и branch из пользователя"""
-        try:
-            company = getattr(user, "owned_company", None) or getattr(user, "company", None)
-            if not company:
-                return None, None
-
-            branch = None
-
-            primary = getattr(user, "primary_branch", None)
-            if primary and getattr(primary, "company_id", None) == company.id:
-                branch = primary
-
-            if not branch:
-                user_branch = getattr(user, "branch", None)
-                if user_branch and getattr(user_branch, "company_id", None) == company.id:
-                    branch = user_branch
-
-            if not branch and hasattr(user, "branch_memberships"):
-                membership = user.branch_memberships.filter(
-                    branch__company_id=company.id
-                ).select_related("branch").first()
-                if membership and membership.branch:
-                    branch = membership.branch
-
-            return company, branch
-        except Exception:
-            return None, None
+        return resolve_user_company_and_branch(user)
 
     @database_sync_to_async
     def _is_owner_like(self, user):

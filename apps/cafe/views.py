@@ -2971,39 +2971,43 @@ class KitchenRetrieveUpdateDestroyView(CompanyBranchQuerysetMixin, generics.Retr
 
 
 # ==================== WebSocket уведомления ====================
+def _order_ws_payload(order):
+    return {
+        "id": str(order.id),
+        "status": order.status,
+        "table_id": str(order.table_id) if order.table_id else None,
+        "branch_id": str(order.branch_id) if order.branch_id else None,
+        "total_amount": str(order.total_amount),
+        "guests": order.guests,
+        "updated_at": order.updated_at.isoformat() if order.updated_at else None,
+    }
+
+
 def send_order_created_notification(order):
     """
     Отправляет WebSocket уведомление о создании заказа.
     """
     try:
-        logger.info(f"[send_order_created_notification] Starting: order_id={order.id}")
+        logger.debug(f"[send_order_created_notification] Starting: order_id={order.id}")
         channel_layer = get_channel_layer()
         if not channel_layer:
             logger.warning(f"[send_order_created_notification] Channel layer not configured")
             return
-        
+
         company_id = str(order.company_id)
         branch_id = str(order.branch_id) if order.branch_id else None
-        
-        # Формируем имя группы
+
         if branch_id:
             group_name = f"cafe_orders_{company_id}_{branch_id}"
         else:
             group_name = f"cafe_orders_{company_id}"
-        
-        logger.info(f"[send_order_created_notification] Sending to group: {group_name}, order_id={order.id}")
-        
-        # Сериализуем данные заказа
-        from .serializers import OrderSerializer
-        serializer = OrderSerializer(order)
-        order_data = serializer.data
-        
-        # Конвертируем UUID и Decimal в строки для msgpack сериализации
-        order_data = json.loads(json.dumps(order_data, default=str))
-        
+
+        logger.debug(f"[send_order_created_notification] Sending to group: {group_name}, order_id={order.id}")
+
+        order_data = _order_ws_payload(order)
+
         logger.debug(f"[send_order_created_notification] Order data serialized: {len(str(order_data))} chars")
-        
-        # Отправляем уведомление в группу
+
         async_to_sync(channel_layer.group_send)(
             group_name,
             {
@@ -3015,7 +3019,7 @@ def send_order_created_notification(order):
                 }
             }
         )
-        logger.info(f"[send_order_created_notification] Message sent to channel layer: group={group_name}")
+        logger.debug(f"[send_order_created_notification] Message sent to channel layer: group={group_name}")
     except Exception as e:
         logger.error(f"[send_order_created_notification] Error sending notification: {e}", exc_info=True)
 
@@ -3025,34 +3029,26 @@ def send_order_updated_notification(order):
     Отправляет WebSocket уведомление об обновлении заказа.
     """
     try:
-        logger.info(f"[send_order_updated_notification] Starting: order_id={order.id}")
+        logger.debug(f"[send_order_updated_notification] Starting: order_id={order.id}")
         channel_layer = get_channel_layer()
         if not channel_layer:
             logger.warning(f"[send_order_updated_notification] Channel layer not configured")
             return
-        
+
         company_id = str(order.company_id)
         branch_id = str(order.branch_id) if order.branch_id else None
-        
-        # Формируем имя группы
+
         if branch_id:
             group_name = f"cafe_orders_{company_id}_{branch_id}"
         else:
             group_name = f"cafe_orders_{company_id}"
-        
-        logger.info(f"[send_order_updated_notification] Sending to group: {group_name}, order_id={order.id}")
-        
-        # Сериализуем данные заказа
-        from .serializers import OrderSerializer
-        serializer = OrderSerializer(order)
-        order_data = serializer.data
-        
-        # Конвертируем UUID и Decimal в строки для msgpack сериализации
-        order_data = json.loads(json.dumps(order_data, default=str))
-        
+
+        logger.debug(f"[send_order_updated_notification] Sending to group: {group_name}, order_id={order.id}")
+
+        order_data = _order_ws_payload(order)
+
         logger.debug(f"[send_order_updated_notification] Order data serialized: {len(str(order_data))} chars")
-        
-        # Отправляем уведомление в группу
+
         async_to_sync(channel_layer.group_send)(
             group_name,
             {
@@ -3064,7 +3060,7 @@ def send_order_updated_notification(order):
                 }
             }
         )
-        logger.info(f"[send_order_updated_notification] Message sent to channel layer: group={group_name}")
+        logger.debug(f"[send_order_updated_notification] Message sent to channel layer: group={group_name}")
     except Exception as e:
         logger.error(f"[send_order_updated_notification] Error sending notification: {e}", exc_info=True)
 
