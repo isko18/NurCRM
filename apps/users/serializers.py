@@ -15,7 +15,7 @@ from rest_framework_simplejwt.serializers import TokenObtainPairSerializer
 
 from apps.users.models import (
     User, Company, Roles, Industry, SubscriptionPlan,
-    Feature, Sector, CustomRole, Branch, BranchMembership
+    Feature, Sector, CustomRole, Branch, BranchMembership, KyrgyzstanRegion
 )
 
 
@@ -330,6 +330,11 @@ class OwnerRegisterSerializer(serializers.ModelSerializer):
     password2 = serializers.CharField(write_only=True, style={"input_type": "password"})
     company_name = serializers.CharField(write_only=True, required=True)
     company_sector_id = serializers.UUIDField(write_only=True, required=True)
+    company_region = serializers.ChoiceField(
+        choices=KyrgyzstanRegion.choices,
+        write_only=True,
+        required=True,
+    )
     subscription_plan_id = serializers.UUIDField(write_only=True, required=True)
 
     class Meta:
@@ -338,7 +343,7 @@ class OwnerRegisterSerializer(serializers.ModelSerializer):
             "email", "password", "password2",
             "first_name", "last_name",
             "avatar",
-            "company_name", "company_sector_id", "subscription_plan_id",
+            "company_name", "company_sector_id", "company_region", "subscription_plan_id",
         ]
 
     def validate_email(self, value):
@@ -356,6 +361,7 @@ class OwnerRegisterSerializer(serializers.ModelSerializer):
     def create(self, validated_data):
         company_name = validated_data.pop("company_name")
         sector_id = validated_data.pop("company_sector_id")
+        company_region = validated_data.pop("company_region")
         plan_id = validated_data.pop("subscription_plan_id")
         validated_data.pop("password2")
 
@@ -396,6 +402,7 @@ class OwnerRegisterSerializer(serializers.ModelSerializer):
             name=company_name,
             industry=industry,
             sector=sector,
+            region=company_region,
             subscription_plan=subscription_plan,
             owner=user,
         )
@@ -698,12 +705,14 @@ class CompanySerializer(serializers.ModelSerializer):
     subscription_plan = SubscriptionPlanSerializer(read_only=True)
     owner = UserListSerializer(read_only=True)
     sector = SectorSerializer(read_only=True)
+    region_display = serializers.CharField(source="get_region_display", read_only=True)
 
     class Meta:
         model = Company
         fields = [
             "id", "name","slug",
-            "industry", "sector", "phone", "phones_howcase", "whatsapp_phone", "subscription_plan",
+            "industry", "sector", "region", "region_display",
+            "phone", "phones_howcase", "whatsapp_phone", "subscription_plan",
             "owner",
             "created_at", "start_date", "end_date",
             "can_view_documents", "can_view_whatsapp", "can_view_instagram", "can_view_telegram", "can_view_showcase",
@@ -767,6 +776,7 @@ class CompanyUpdateSerializer(serializers.ModelSerializer):
             "whatsapp_phone",
             "industry",
             "sector",
+            "region",
         ]
 
     def validate(self, attrs):

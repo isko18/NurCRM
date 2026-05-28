@@ -52,6 +52,18 @@ class Roles(models.TextChoices):
     OWNER = "owner", "Владелец"
 
 
+class KyrgyzstanRegion(models.TextChoices):
+    BISHKEK = "bishkek", "г. Бишкек"
+    OSH_CITY = "osh_city", "г. Ош"
+    CHUY = "chuy", "Чуйская область"
+    OSH = "osh", "Ошская область"
+    JALAL_ABAD = "jalal_abad", "Джалал-Абадская область"
+    ISSYK_KUL = "issyk_kul", "Иссык-Кульская область"
+    NARYN = "naryn", "Нарынская область"
+    TALAS = "talas", "Таласская область"
+    BATKEN = "batken", "Баткенская область"
+
+
 class Sector(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     name = models.CharField(max_length=255, unique=True, db_index=True, verbose_name="Название отрасли")
@@ -85,6 +97,13 @@ class Company(models.Model):
     subscription_plan = models.ForeignKey("SubscriptionPlan", on_delete=models.SET_NULL, null=True, blank=True)
     industry = models.ForeignKey("Industry", on_delete=models.SET_NULL, null=True, blank=True, verbose_name="Вид деятельности")
     sector = models.ForeignKey("Sector", on_delete=models.SET_NULL, null=True, blank=True, verbose_name="Отрасль")
+    region = models.CharField(
+        max_length=32,
+        choices=KyrgyzstanRegion.choices,
+        blank=True,
+        null=True,
+        verbose_name="Регион",
+    )
     phone = models.CharField(max_length=60, verbose_name="Номер телефона", null=True, blank=True)
     phones_howcase = models.CharField(max_length=60, verbose_name="Номер для обращения по витрине", null=True, blank=True)
     whatsapp_phone = models.CharField(max_length=60, verbose_name="Номер для WhatsApp", null=True, blank=True)

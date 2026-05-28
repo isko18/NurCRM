@@ -12,6 +12,7 @@ from .views import (
     EmployeeDestroyAPIView, 
     CompanyDetailAPIView,
     SectorListAPIView,
+    RegionListAPIView,
     EmployeeDetailAPIView,
     ChangePasswordView,
     CompanyUpdateAPIView,
@@ -54,6 +55,7 @@ urlpatterns = [
     # 📚 Справочники
     path('industries/', IndustryListAPIView.as_view(), name='industry-list'),
     path('sectors/', SectorListAPIView.as_view(), name='sector-list'),
+    path('regions/', RegionListAPIView.as_view(), name='region-list'),
     path('subscription-plans/', SubscriptionPlanListAPIView.as_view(), name='subscription-plan-list'),
     path('features/', FeatureListAPIView.as_view(), name='feature-list'),
     path('company/', CompanyDetailAPIView.as_view(), name='company-detail'),

@@ -318,6 +318,7 @@ class CompanyAdmin(admin.ModelAdmin):
         "subscription_plan",
         "industry",
         "sector",
+        "region",
         "start_date",
         "end_date",
         "can_view_documents",
@@ -355,6 +356,7 @@ class CompanyAdmin(admin.ModelAdmin):
                     "subscription_plan",
                     "industry",
                     "sector",
+                    "region",
                 )
             },
         ),

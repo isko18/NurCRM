@@ -8,11 +8,12 @@ import logging
 from rest_framework import generics, permissions, status
 from rest_framework.permissions import IsAuthenticated, AllowAny
 from rest_framework.response import Response
+from rest_framework.views import APIView
 from rest_framework.exceptions import NotFound, PermissionDenied, ValidationError
 from rest_framework_simplejwt.views import TokenObtainPairView, TokenRefreshView
 from rest_framework_simplejwt.exceptions import InvalidToken, TokenError
 
-from .models import User, Industry, SubscriptionPlan, Feature, Sector, CustomRole, Company, Branch, BranchMembership
+from .models import User, Industry, SubscriptionPlan, Feature, Sector, CustomRole, Company, Branch, BranchMembership, KyrgyzstanRegion
 from .serializers import (
     UserSerializer,
     OwnerRegisterSerializer,
@@ -357,6 +358,14 @@ class SectorListAPIView(generics.ListAPIView):
     queryset = Sector.objects.all()
     serializer_class = SectorSerializer
     permission_classes = [AllowAny]
+
+
+class RegionListAPIView(APIView):
+    permission_classes = [AllowAny]
+
+    def get(self, request):
+        data = [{"value": value, "label": label} for value, label in KyrgyzstanRegion.choices]
+        return Response(data)
 
 
 class IndustryListAPIView(generics.ListAPIView):
