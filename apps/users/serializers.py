@@ -333,7 +333,9 @@ class OwnerRegisterSerializer(serializers.ModelSerializer):
     company_region = serializers.ChoiceField(
         choices=KyrgyzstanRegion.choices,
         write_only=True,
-        required=True,
+        required=False,
+        allow_null=True,
+        allow_blank=True,
     )
     subscription_plan_id = serializers.UUIDField(write_only=True, required=True)
 
@@ -361,7 +363,7 @@ class OwnerRegisterSerializer(serializers.ModelSerializer):
     def create(self, validated_data):
         company_name = validated_data.pop("company_name")
         sector_id = validated_data.pop("company_sector_id")
-        company_region = validated_data.pop("company_region")
+        company_region = validated_data.pop("company_region", None) or None
         plan_id = validated_data.pop("subscription_plan_id")
         validated_data.pop("password2")
 
