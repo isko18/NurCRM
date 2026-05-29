@@ -27,6 +27,7 @@ from apps.cafe.views import (
     OrderPayView,
     OrderPayDebtView,
     OrderRetrieveUpdateDestroyView,
+    TechCardsExportView,
 )
 from apps.cafe.services.costing import (
     convert_quantity,
@@ -1308,6 +1309,70 @@ class CafeCostingTZTestCase(TransactionTestCase):
 
         prep.refresh_from_db()
         self.assertEqual(prep.stock_quantity, Decimal("1.4"))
+
+    def test_tech_cards_export_by_dish_ids(self):
+        DishIngredient.objects.create(
+            dish=self.dish,
+            ingredient_type=DishIngredient.IngredientType.PRODUCT,
+            product=self.salt,
+            quantity=Decimal("50"),
+            unit="g",
+        )
+        recalculate_dish(self.dish, save=True)
+
+        request = self.api_factory.post(
+            "/api/cafe/tech-cards/export/",
+            {"dish_ids": [str(self.dish.id)], "is_all": False},
+            format="json",
+        )
+        force_authenticate(request, user=self.owner)
+        request.branch = self.branch
+        response = TechCardsExportView.as_view()(request)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["count"], 1)
+        item = response.data["items"][0]
+        self.assertEqual(str(item["id"]), str(self.dish.id))
+        self.assertEqual(item["title"], "Potato dish")
+        self.assertEqual(item["category_title"], "Food")
+        self.assertIn("cost", item)
+        self.assertEqual(Decimal(item["cost"]["cost_price"]), Decimal("2.50"))
+        self.assertEqual(Decimal(item["cost"]["sale_price"]), Decimal("300.000"))
+        self.assertEqual(len(item["ingredients"]), 1)
+        self.assertEqual(item["ingredients"][0]["ingredient_type"], "product")
+
+    def test_tech_cards_export_is_all_with_search(self):
+        MenuItem.objects.create(
+            company=self.company,
+            branch=self.branch,
+            category=self.category,
+            title="Soup special",
+            price=Decimal("150.00"),
+            is_active=True,
+        )
+        request = self.api_factory.post(
+            "/api/cafe/tech-cards/export/",
+            {"is_all": True, "search": "Soup"},
+            format="json",
+        )
+        force_authenticate(request, user=self.owner)
+        request.branch = self.branch
+        response = TechCardsExportView.as_view()(request)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["count"], 1)
+        self.assertEqual(response.data["items"][0]["title"], "Soup special")
+
+    def test_tech_cards_export_requires_dish_ids_or_is_all(self):
+        request = self.api_factory.post(
+            "/api/cafe/tech-cards/export/",
+            {"is_all": False, "dish_ids": []},
+            format="json",
+        )
+        force_authenticate(request, user=self.owner)
+        request.branch = self.branch
+        response = TechCardsExportView.as_view()(request)
+        self.assertEqual(response.status_code, 400)
 
 
 class CafePreparationTechCardTestCase(TransactionTestCase):

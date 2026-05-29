@@ -37,7 +37,7 @@ from .views import (
     ProcessingTypeListCreateView, ProcessingTypeRetrieveUpdateDestroyView,
     DishIngredientCreateForDishView, DishIngredientRetrieveUpdateDestroyView,
     DishIngredientProcessingCreateView, DishIngredientProcessingDeleteView,
-    DishCostView, DishCalculatePreviewView,
+    DishCostView, DishCalculatePreviewView, TechCardsExportView,
 )
 
 from apps.cafe.analytics import (
@@ -138,6 +138,7 @@ urlpatterns = [
 
     path("dishes/<uuid:pk>/cost/", DishCostView.as_view(), name="dish-cost"),
     path("dishes/calculate-preview/", DishCalculatePreviewView.as_view(), name="dish-calc-preview"),
+    path("tech-cards/export/", TechCardsExportView.as_view(), name="tech-cards-export"),
 
     # === Orders ===
     path("orders/", OrderListCreateView.as_view(), name="order-list"),

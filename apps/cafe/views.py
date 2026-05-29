@@ -55,6 +55,7 @@ from .serializers import (
     PreparationTechCardSerializer,
     DishIngredientSerializer, DishIngredientProcessingCreateSerializer,
     DishCostSerializer, DishCalculatePreviewSerializer,
+    TechCardsExportRequestSerializer, TechCardsExportResponseSerializer,
 )
 from apps.utils import _is_owner_like
 
@@ -1497,6 +1498,121 @@ class DishCostView(CompanyBranchQuerysetMixin, APIView):
             "margin_percent": dish.margin_percent,
         }
         return Response(DishCostSerializer(payload).data, status=status.HTTP_200_OK)
+
+
+def _menu_items_queryset_for_user(mixin, company):
+    qs = (
+        MenuItem.objects
+        .select_related("category", "company")
+        .prefetch_related(
+            "ingredients__product",
+            "dish_ingredients__product",
+            "dish_ingredients__preparation",
+            "dish_ingredients__processings__processing_type",
+            "dish_ingredients__processings__preparation_processing",
+        )
+        .filter(company=company)
+    )
+    b = mixin._active_branch()
+    if b is not None:
+        qs = qs.filter(Q(branch=b) | Q(branch__isnull=True))
+    return qs
+
+
+def _menu_item_image_url(dish, request):
+    if dish.image and hasattr(dish.image, "url"):
+        url = dish.image.url
+        return request.build_absolute_uri(url) if request else url
+    return None
+
+
+def _dish_tech_card_ingredients(dish, context):
+    if dish.dish_ingredients.exists():
+        qs = (
+            dish.dish_ingredients
+            .select_related("product", "preparation")
+            .prefetch_related(
+                "processings__processing_type",
+                "processings__preparation_processing",
+            )
+            .order_by("created_at")
+        )
+        return DishIngredientSerializer(qs, many=True, context=context).data
+    legacy = dish.ingredients.select_related("product").order_by("id")
+    return IngredientInlineSerializer(legacy, many=True, context=context).data
+
+
+def _build_dish_tech_card_item(dish, request):
+    recalculate_dish(dish, save=True)
+    category = dish.category
+    return {
+        "id": dish.id,
+        "title": dish.title,
+        "image_url": _menu_item_image_url(dish, request),
+        "category_title": category.title if category else "",
+        "cost": {
+            "cost_price": dish.cost_price,
+            "sale_price": dish.price,
+            "margin_amount": dish.margin_amount,
+            "margin_percent": dish.margin_percent,
+        },
+        "ingredients": _dish_tech_card_ingredients(dish, {"request": request}),
+    }
+
+
+class TechCardsExportView(CompanyBranchQuerysetMixin, APIView):
+    """
+    Полные техкарты блюд для PDF и детального просмотра.
+    POST /cafe/tech-cards/export/
+    """
+
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request):
+        company = self._user_company()
+        if not company:
+            return Response({"detail": "Компания не найдена."}, status=status.HTTP_403_FORBIDDEN)
+
+        ser = TechCardsExportRequestSerializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+        data = ser.validated_data
+
+        qs = _menu_items_queryset_for_user(self, company)
+
+        search = (data.get("search") or "").strip()
+        if search:
+            qs = qs.filter(title__icontains=search)
+
+        category_id = data.get("category_id")
+        if category_id:
+            qs = qs.filter(category_id=category_id)
+
+        if data.get("is_all"):
+            dishes = list(qs.order_by("title"))
+        else:
+            dish_ids = data.get("dish_ids") or []
+            dishes = list(qs.filter(id__in=dish_ids).order_by("title"))
+            if len(dishes) != len(set(dish_ids)):
+                found = {d.id for d in dishes}
+                missing = [str(i) for i in dish_ids if i not in found]
+                if missing:
+                    raise ValidationError(
+                        {"dish_ids": f"Не найдены блюда: {', '.join(missing)}"}
+                    )
+
+        items = []
+        try:
+            with transaction.atomic():
+                for dish in dishes:
+                    items.append(_build_dish_tech_card_item(dish, request))
+        except ValueError as e:
+            raise ValidationError({"detail": str(e)})
+
+        payload = {"count": len(items), "items": items}
+        return Response(
+            TechCardsExportResponseSerializer(payload).data,
+            status=status.HTTP_200_OK,
+        )
 
 
 class DishCalculatePreviewView(CompanyBranchQuerysetMixin, APIView):

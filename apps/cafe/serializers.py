@@ -931,6 +931,48 @@ class DishCostSerializer(serializers.Serializer):
     margin_percent = serializers.DecimalField(max_digits=6, decimal_places=2)
 
 
+class TechCardCostExportSerializer(serializers.Serializer):
+    cost_price = serializers.DecimalField(max_digits=12, decimal_places=2)
+    sale_price = serializers.DecimalField(max_digits=11, decimal_places=3)
+    margin_amount = serializers.DecimalField(max_digits=12, decimal_places=2)
+    margin_percent = serializers.DecimalField(max_digits=6, decimal_places=2)
+
+
+class TechCardsExportRequestSerializer(serializers.Serializer):
+    dish_ids = serializers.ListField(
+        child=serializers.UUIDField(),
+        required=False,
+        allow_empty=True,
+        default=list,
+    )
+    is_all = serializers.BooleanField(required=False, default=False)
+    search = serializers.CharField(required=False, allow_blank=True, default="")
+    category_id = serializers.UUIDField(required=False, allow_null=True, default=None)
+
+    def validate(self, attrs):
+        is_all = attrs.get("is_all") or False
+        dish_ids = attrs.get("dish_ids") or []
+        if not is_all and not dish_ids:
+            raise serializers.ValidationError(
+                {"dish_ids": "Укажите dish_ids или передайте is_all=true."}
+            )
+        return attrs
+
+
+class TechCardExportItemSerializer(serializers.Serializer):
+    id = serializers.UUIDField()
+    title = serializers.CharField()
+    image_url = serializers.CharField(allow_null=True)
+    category_title = serializers.CharField(allow_null=True, allow_blank=True)
+    cost = TechCardCostExportSerializer()
+    ingredients = serializers.ListField(child=serializers.DictField())
+
+
+class TechCardsExportResponseSerializer(serializers.Serializer):
+    count = serializers.IntegerField()
+    items = TechCardExportItemSerializer(many=True)
+
+
 class DishCalculatePreviewSerializer(serializers.Serializer):
     """
     Body:
