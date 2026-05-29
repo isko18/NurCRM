@@ -3189,7 +3189,7 @@ def send_kitchen_task_ready_notification(task):
       - в группу кухни (для поваров/монитора кухни): cafe_kitchen_{company_id}_{branch_id?}
     """
     try:
-        logger.info(f"[send_kitchen_task_ready_notification] Starting: task_id={task.id}")
+        logger.debug(f"[send_kitchen_task_ready_notification] Starting: task_id={task.id}")
         channel_layer = get_channel_layer()
         if not channel_layer:
             logger.warning("[send_kitchen_task_ready_notification] Channel layer not configured")
@@ -3233,11 +3233,11 @@ def send_kitchen_task_ready_notification(task):
 
         # 1) официанты/заказы
         async_to_sync(channel_layer.group_send)(orders_group_name, message)
-        logger.info(f"[send_kitchen_task_ready_notification] Message sent to channel layer: group={orders_group_name}")
+        logger.debug(f"[send_kitchen_task_ready_notification] Message sent to channel layer: group={orders_group_name}")
 
         # 2) кухня/повара
         async_to_sync(channel_layer.group_send)(kitchen_group_name, message)
-        logger.info(f"[send_kitchen_task_ready_notification] Message sent to channel layer: group={kitchen_group_name}")
+        logger.debug(f"[send_kitchen_task_ready_notification] Message sent to channel layer: group={kitchen_group_name}")
     except Exception as e:
         logger.error(f"[send_kitchen_task_ready_notification] Error sending notification: {e}", exc_info=True)
 

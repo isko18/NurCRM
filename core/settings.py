@@ -424,12 +424,12 @@ LOGGING = {
         },
         'apps.cafe.consumers': {
             'handlers': ['console'],
-            'level': 'INFO',
+            'level': _WS_LOG_LEVEL,
             'propagate': False,
         },
         'apps.cafe.views': {
             'handlers': ['console'],
-            'level': 'INFO',
+            'level': _WS_LOG_LEVEL,
             'propagate': False,
         },
     },
