@@ -132,6 +132,8 @@ class CompanyBranchReadOnlyMixin(serializers.ModelSerializer):
 
 
 def _scope_queryset_by_context(qs, serializer: CompanyBranchReadOnlyMixin):
+    if not hasattr(serializer, "_user_company"):
+        return qs.none()
     company = serializer._user_company()
     if not company:
         return qs.none()
@@ -639,11 +641,17 @@ class PreparationIngredientCreateUpdateSerializer(serializers.ModelSerializer):
 
     def get_fields(self):
         fields = super().get_fields()
-        holder = self
-        if "product" in fields:
-            fields["product"].queryset = _scope_queryset_by_context(Warehouse.objects.all(), holder)
-        if "child_preparation" in fields:
-            fields["child_preparation"].queryset = _scope_queryset_by_context(Preparation.objects.all(), holder)
+        holder = getattr(self, "root", None)
+        if isinstance(holder, CompanyBranchReadOnlyMixin):
+            if "product" in fields:
+                fields["product"].queryset = _scope_queryset_by_context(Warehouse.objects.all(), holder)
+            if "child_preparation" in fields:
+                fields["child_preparation"].queryset = _scope_queryset_by_context(Preparation.objects.all(), holder)
+        else:
+            if "product" in fields:
+                fields["product"].queryset = Warehouse.objects.none()
+            if "child_preparation" in fields:
+                fields["child_preparation"].queryset = Preparation.objects.none()
         return fields
 
     def validate(self, attrs):
