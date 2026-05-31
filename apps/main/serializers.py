@@ -2372,11 +2372,17 @@ class ItemMakeSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer
         ]
         read_only_fields = ["kind", "source"]
 
+    def _item_make_instance(self):
+        instance = getattr(self, "instance", None)
+        return instance if isinstance(instance, ItemMake) else None
+
     def get_is_processed(self, obj):
+        if not isinstance(obj, ItemMake):
+            return False
         return obj.kind == ItemMake.Kind.PROCESSED
 
     def validate_needs_processing(self, value):
-        instance = getattr(self, "instance", None)
+        instance = self._item_make_instance()
         if instance and instance.kind == ItemMake.Kind.PROCESSED:
             return False
         return value
@@ -2384,8 +2390,8 @@ class ItemMakeSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer
     def validate(self, attrs):
         company = self._user_company()
         branch = self._auto_branch()
-        supplier = attrs.get("supplier", getattr(self.instance, "supplier", None))
-        instance = getattr(self, "instance", None)
+        instance = self._item_make_instance()
+        supplier = attrs.get("supplier", getattr(instance, "supplier", None))
         kind = getattr(instance, "kind", ItemMake.Kind.RAW) if instance else ItemMake.Kind.RAW
         needs_processing = attrs.get(
             "needs_processing",
@@ -2421,7 +2427,7 @@ class ItemMakeSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer
             supplier_qs = supplier_qs.filter(branch__in=[None, branch])
         self.fields["supplier"].queryset = supplier_qs
 
-        instance = getattr(self, "instance", None)
+        instance = self._item_make_instance()
         if instance and instance.kind == ItemMake.Kind.PROCESSED:
             self.fields["needs_processing"].read_only = True
 
