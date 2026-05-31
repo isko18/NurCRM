@@ -1437,6 +1437,12 @@ class ItemMake(models.Model):
     price = models.DecimalField("Цена", max_digits=10, decimal_places=2, default=0)
     unit = models.CharField("Единица измерения", max_length=50)
     quantity = models.DecimalField("Количество", max_digits=18, decimal_places=3, default=Decimal("0.000"))
+    needs_processing = models.BooleanField(
+        "Нуждается в обработке",
+        default=False,
+        db_index=True,
+        help_text="Только для сырого сырья: если true — в рецепт нельзя, сначала /process/",
+    )
 
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
@@ -1462,6 +1468,8 @@ class ItemMake(models.Model):
                 raise ValidationError({'source': 'Исходное сырьё другой компании.'})
             if (self.source.branch_id or None) != (self.branch_id or None):
                 raise ValidationError({'source': 'Исходное сырьё другого филиала.'})
+        if self.kind == self.Kind.PROCESSED:
+            self.needs_processing = False
 
 
 class ProductRecipeItem(models.Model):

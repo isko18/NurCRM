@@ -638,6 +638,7 @@ class ItemMakeNestedSerializer(serializers.ModelSerializer):
         fields = [
             "id", "name", "price", "unit", "quantity",
             "kind", "kind_display", "source", "source_name",
+            "needs_processing",
         ]
 
 
@@ -2364,6 +2365,7 @@ class ItemMakeSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer
             "id", "company", "branch",
             "kind", "kind_display", "is_processed",
             "source", "source_name",
+            "needs_processing",
             "name", "supplier", "supplier_name", "price", "unit", "quantity",
             "products",
             "created_at", "updated_at",
@@ -2372,6 +2374,40 @@ class ItemMakeSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer
 
     def get_is_processed(self, obj):
         return obj.kind == ItemMake.Kind.PROCESSED
+
+    def validate_needs_processing(self, value):
+        instance = getattr(self, "instance", None)
+        if instance and instance.kind == ItemMake.Kind.PROCESSED:
+            return False
+        return value
+
+    def validate(self, attrs):
+        company = self._user_company()
+        branch = self._auto_branch()
+        supplier = attrs.get("supplier", getattr(self.instance, "supplier", None))
+        instance = getattr(self, "instance", None)
+        kind = getattr(instance, "kind", ItemMake.Kind.RAW) if instance else ItemMake.Kind.RAW
+        needs_processing = attrs.get(
+            "needs_processing",
+            getattr(instance, "needs_processing", False) if instance else False,
+        )
+
+        if kind == ItemMake.Kind.PROCESSED:
+            attrs["needs_processing"] = False
+        elif needs_processing and instance and instance.source_id:
+            raise serializers.ValidationError({
+                "needs_processing": "Обработанная позиция не может требовать обработки.",
+            })
+
+        if supplier is not None:
+            if supplier.type != Client.StatusClient.SUPPLIERS:
+                raise serializers.ValidationError({"supplier": "Выберите клиента с типом 'Поставщики'."})
+            if company and supplier.company_id != company.id:
+                raise serializers.ValidationError({"supplier": "Поставщик другой компании."})
+            if branch and supplier.branch_id not in (None, branch.id):
+                raise serializers.ValidationError({"supplier": "Поставщик другого филиала."})
+
+        return attrs
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -2385,20 +2421,9 @@ class ItemMakeSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer
             supplier_qs = supplier_qs.filter(branch__in=[None, branch])
         self.fields["supplier"].queryset = supplier_qs
 
-    def validate(self, attrs):
-        company = self._user_company()
-        branch = self._auto_branch()
-        supplier = attrs.get("supplier", getattr(self.instance, "supplier", None))
-
-        if supplier is not None:
-            if supplier.type != Client.StatusClient.SUPPLIERS:
-                raise serializers.ValidationError({"supplier": "Выберите клиента с типом 'Поставщики'."})
-            if company and supplier.company_id != company.id:
-                raise serializers.ValidationError({"supplier": "Поставщик другой компании."})
-            if branch and supplier.branch_id not in (None, branch.id):
-                raise serializers.ValidationError({"supplier": "Поставщик другого филиала."})
-
-        return attrs
+        instance = getattr(self, "instance", None)
+        if instance and instance.kind == ItemMake.Kind.PROCESSED:
+            self.fields["needs_processing"].read_only = True
 
 
 class ItemMakeProcessSerializer(serializers.Serializer):

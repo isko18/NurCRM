@@ -10,6 +10,23 @@ _Q2 = Decimal("0.01")
 _Q3 = Decimal("0.001")
 
 
+def item_make_recipe_ready_filter():
+    """Сырьё, доступное для рецепта: обработанное или сырое без обязательной обработки."""
+    from django.db.models import Q
+    return Q(kind=ItemMake.Kind.PROCESSED) | Q(
+        kind=ItemMake.Kind.RAW,
+        needs_processing=False,
+    )
+
+
+def assert_item_make_recipe_ready(im: ItemMake) -> None:
+    if im.kind == ItemMake.Kind.RAW and im.needs_processing:
+        raise ValueError(
+            f"Сырьё «{im.name}» требует обработки. Сначала выполните /items-make/{{id}}/process/ "
+            f"и добавьте в рецепт обработанную позицию."
+        )
+
+
 def calc_recipe_unit_cost(recipe_entries, ims_map) -> Decimal:
     """Себестоимость 1 ед. готового товара по рецепту (sum qty_per_unit × price сырья)."""
     total = Decimal("0")
@@ -67,6 +84,8 @@ def process_raw_item_make(
 
     if source.kind != ItemMake.Kind.RAW:
         raise ValueError("Обрабатывать можно только необработанное сырьё (kind=raw).")
+    if not source.needs_processing:
+        raise ValueError(f"Сырьё «{source.name}» не требует обработки.")
     if input_quantity <= 0:
         raise ValueError("input_quantity должно быть > 0.")
     if output_quantity <= 0:
@@ -118,6 +137,7 @@ def process_raw_item_make(
             branch=source.branch,
             kind=ItemMake.Kind.PROCESSED,
             source=source,
+            needs_processing=False,
             name=(name or f"{source.name} (обработанное)").strip(),
             supplier=source.supplier,
             price=batch_price,

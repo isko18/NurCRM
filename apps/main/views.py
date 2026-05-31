@@ -25,7 +25,12 @@ from django.db.models import DecimalField, ExpressionWrapper
 from rest_framework.pagination import CursorPagination
 
 
-from apps.main.services.item_make_processing import calc_recipe_unit_cost, process_raw_item_make
+from apps.main.services.item_make_processing import (
+    calc_recipe_unit_cost,
+    process_raw_item_make,
+    item_make_recipe_ready_filter,
+    assert_item_make_recipe_ready,
+)
 
 from apps.users.models import Branch, User
 
@@ -1279,6 +1284,11 @@ class ProductCreateManualAPIView(CompanyBranchRestrictedMixin, generics.CreateAP
                     {"recipe": f"Сырьё не найдено или принадлежит другой компании: {missing}"},
                     status=status.HTTP_400_BAD_REQUEST,
                 )
+            for eid in im_ids:
+                try:
+                    assert_item_make_recipe_ready(ims_preview_map[eid])
+                except ValueError as exc:
+                    return Response({"recipe": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
             purchase_price = calc_recipe_unit_cost(recipe_entries, ims_preview_map)
 
         # ====== FIX: двусторонняя логика price <-> markup_percent ======
@@ -1415,6 +1425,12 @@ class ProductCreateManualAPIView(CompanyBranchRestrictedMixin, generics.CreateAP
                     {"recipe": f"Сырьё не найдено или принадлежит другой компании: {missing}"},
                     status=status.HTTP_400_BAD_REQUEST,
                 )
+
+            for entry in recipe_entries:
+                try:
+                    assert_item_make_recipe_ready(ims_map[entry["id"]])
+                except ValueError as exc:
+                    return Response({"recipe": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
 
             product_qty = Decimal(str(product.quantity or 0))
 
@@ -1653,6 +1669,22 @@ class ProductRetrieveUpdateDestroyAPIView(CompanyBranchRestrictedMixin, generics
                     {"recipe": recipe_errors},
                     status=status.HTTP_400_BAD_REQUEST,
                 )
+
+            company = self._company()
+            check_ids = [e["id"] for e in new_recipe_entries]
+            ims_check = ItemMake.objects.filter(id__in=check_ids, company=company)
+            ims_check_map = {str(im.id): im for im in ims_check}
+            for entry in new_recipe_entries:
+                im = ims_check_map.get(entry["id"])
+                if not im:
+                    return Response(
+                        {"recipe": f"Сырьё не найдено: {entry['id']}"},
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
+                try:
+                    assert_item_make_recipe_ready(im)
+                except ValueError as exc:
+                    return Response({"recipe": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
 
         # ---- Read old state ----
         old_quantity = Decimal(str(instance.quantity or 0))
@@ -2842,13 +2874,20 @@ class ItemListCreateAPIView(CompanyBranchRestrictedMixin, generics.ListCreateAPI
     queryset = ItemMake.objects.all()
     filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
     search_fields = ["name", "supplier__full_name", "products__name"]
-    filterset_fields = ["unit", "price", "quantity", "products", "supplier", "kind"]
+    filterset_fields = ["unit", "price", "quantity", "products", "supplier", "kind", "needs_processing"]
     ordering_fields = ["created_at", "updated_at", "price", "quantity", "name"]
     ordering = ["-created_at"]
 
     def get_queryset(self):
         qs = super().get_queryset().select_related("source", "supplier")
-        return self._filter_qs_company_branch(qs).distinct()
+        qs = self._filter_qs_company_branch(qs).distinct()
+
+        req = self.request
+        for_recipe = req.query_params.get("for_recipe") if req else None
+        if for_recipe in ("1", "true", "True", "yes"):
+            qs = qs.filter(item_make_recipe_ready_filter())
+
+        return qs
 
     # perform_create — миксин
 
