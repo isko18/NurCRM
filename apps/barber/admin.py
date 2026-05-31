@@ -153,7 +153,8 @@ class ServiceCategoryAdmin(CompanyScopedAdmin):
 class ServiceAdmin(CompanyScopedAdmin):
     list_display = ("name", "category", "price", "is_active", "branch", "company")
     list_filter = ("is_active", "category")  # branch/company добавятся для суперюзера автоматически
-    search_fields = ("name", "category__name")
+    search_fields = ("name", "category__name", "barbers__first_name", "barbers__last_name", "barbers__email")
+    filter_horizontal = ("barbers",)
     ordering = ("name",)
 
 

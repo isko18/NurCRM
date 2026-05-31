@@ -138,6 +138,12 @@ class Service(models.Model):
     )
     price = models.DecimalField(max_digits=10, decimal_places=2, verbose_name='Цена')
     is_active = models.BooleanField(default=True, verbose_name='Активна')
+    barbers = models.ManyToManyField(
+        settings.AUTH_USER_MODEL,
+        related_name='barber_services',
+        verbose_name='Мастера',
+        blank=True,
+    )
 
     class Meta:
         verbose_name = 'Услуга'
@@ -261,7 +267,7 @@ class ClientDocument(models.Model):
         related_name="documents",
         verbose_name="Клиент",
     )
-    file = models.FileField("Файл", upload_to="client_documents/")
+    file = models.FileField("Файл", upload_to="client_documents/", blank=True, null=True)
     file_comment = models.TextField("Комментарий к файлу", blank=True, null=True)
     file_create_date = models.DateTimeField("Дата создания файла", auto_now_add=True)
 
@@ -275,7 +281,7 @@ class ClientDocument(models.Model):
         ]
 
     def __str__(self):
-        return self.file.name
+        return self.file.name if self.file else str(self.id) if self.file else str(self.id)
 
     def clean(self):
         if self.branch_id and self.branch.company_id != self.company_id:

@@ -1398,11 +1398,31 @@ class ProductImage(models.Model):
 
 
 class ItemMake(models.Model):
+    class Kind(models.TextChoices):
+        RAW = "raw", "Сырьё"
+        PROCESSED = "processed", "Обработанное"
+
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     company = models.ForeignKey(Company, on_delete=models.PROTECT, related_name="item_makes", verbose_name="Компания")
     branch = models.ForeignKey(
         Branch, on_delete=models.CASCADE, related_name='crm_item_makes',
         null=True, blank=True, db_index=True, verbose_name='Филиал'
+    )
+
+    kind = models.CharField(
+        "Тип",
+        max_length=16,
+        choices=Kind.choices,
+        default=Kind.RAW,
+        db_index=True,
+    )
+    source = models.ForeignKey(
+        "self",
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name="processed_items",
+        verbose_name="Исходное сырьё",
     )
 
     name = models.CharField("Название", max_length=255)
@@ -1435,6 +1455,13 @@ class ItemMake(models.Model):
     def clean(self):
         if self.branch_id and self.branch.company_id != self.company_id:
             raise ValidationError({'branch': 'Филиал принадлежит другой компании.'})
+        if self.kind == self.Kind.PROCESSED and not self.source_id:
+            raise ValidationError({'source': 'Для обработанного сырья укажите исходное сырьё.'})
+        if self.source_id:
+            if self.source.company_id != self.company_id:
+                raise ValidationError({'source': 'Исходное сырьё другой компании.'})
+            if (self.source.branch_id or None) != (self.branch_id or None):
+                raise ValidationError({'source': 'Исходное сырьё другого филиала.'})
 
 
 class ProductRecipeItem(models.Model):

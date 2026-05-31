@@ -25,6 +25,8 @@ from django.db.models import DecimalField, ExpressionWrapper
 from rest_framework.pagination import CursorPagination
 
 
+from apps.main.services.item_make_processing import calc_recipe_unit_cost, process_raw_item_make
+
 from apps.users.models import Branch, User
 
 from apps.main.models import (
@@ -55,7 +57,7 @@ from apps.main.serializers import (
     OrderItemSerializer, ClientSerializer, ClientDealSerializer, BidSerializers, SocialApplicationsSerializers,
     TransactionRecordSerializer, ContractorWorkSerializer, DebtSerializer, DebtPaymentSerializer,
     ObjectItemSerializer, ObjectSaleSerializer, ObjectSaleItemSerializer,
-    BulkIdsSerializer, ItemMakeSerializer,
+    BulkIdsSerializer, ItemMakeSerializer, ItemMakeProcessSerializer,
     ManufactureSubrealSerializer, AcceptanceCreateSerializer, ReturnCreateSerializer,
     BulkSubrealCreateSerializer, AcceptanceReadSerializer, ReturnApproveSerializer, ReturnRejectSerializer, ReturnReadSerializer,
     AgentProductOnHandSerializer, AgentWithProductsSerializer, GlobalProductReadSerializer,
@@ -100,6 +102,58 @@ def _calc_markup(purchase_price: Decimal, price: Decimal) -> Decimal:
     # ВАЖНО: наценка хранится точнее (4 знака), иначе при обратном пересчёте цены
     # (purchase_price + markup_percent) будут появляться «копейки» из-за округления процента.
     return mp.quantize(_Q4, rounding=ROUND_HALF_UP)
+
+
+def _parse_recipe_input(recipe_input):
+    """
+    Парсит массив recipe из запроса.
+    Returns (entries, error_response) — error_response = Response или None.
+    """
+    if not recipe_input or not isinstance(recipe_input, list):
+        return [], None
+
+    seen_ids = set()
+    recipe_entries = []
+    for idx, entry in enumerate(recipe_input):
+        if not isinstance(entry, dict):
+            return None, Response(
+                {"recipe": f"Элемент #{idx}: ожидается объект."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        raw_id = entry.get("id")
+        raw_qty = entry.get("qty_per_unit")
+        if not raw_id:
+            return None, Response(
+                {"recipe": f"Элемент #{idx}: отсутствует id."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if raw_qty is None:
+            return None, Response(
+                {"recipe": f"Элемент #{idx}: отсутствует qty_per_unit."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        try:
+            qty_per_unit = Decimal(str(raw_qty))
+        except Exception:
+            return None, Response(
+                {"recipe": f"Элемент #{idx}: qty_per_unit — неверный формат числа."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if qty_per_unit <= 0:
+            return None, Response(
+                {"recipe": f"Элемент #{idx}: qty_per_unit должен быть > 0."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        str_id = str(raw_id)
+        if str_id in seen_ids:
+            return None, Response(
+                {"recipe": f"Элемент #{idx}: дубликат id={raw_id}."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        seen_ids.add(str_id)
+        recipe_entries.append({"id": str_id, "qty_per_unit": qty_per_unit})
+
+    return recipe_entries, None
 
 
 class PublicKnowledgeBaseMixin:
@@ -1199,6 +1253,14 @@ class ProductCreateManualAPIView(CompanyBranchRestrictedMixin, generics.CreateAP
         # kind
         kind_value = _parse_kind(data.get("kind"), Product)
 
+        recipe_input = data.get("recipe")
+        recipe_entries, recipe_err = _parse_recipe_input(recipe_input)
+        if recipe_err is not None:
+            return recipe_err
+
+        calc_from_recipe = _parse_bool_like(data.get("calc_purchase_price_from_recipe", True))
+        purchase_price_explicit = data.get("purchase_price") not in (None, "")
+
         # decimals
         try:
             purchase_price = _parse_decimal(data.get("purchase_price", 0), "purchase_price")
@@ -1206,6 +1268,18 @@ class ProductCreateManualAPIView(CompanyBranchRestrictedMixin, generics.CreateAP
             discount_percent = _parse_decimal(data.get("discount_percent", 0), "discount_percent")
         except ValueError as e:
             return Response({str(e): "Неверный формат числа."}, status=status.HTTP_400_BAD_REQUEST)
+
+        if recipe_entries and calc_from_recipe and not purchase_price_explicit:
+            im_ids = [e["id"] for e in recipe_entries]
+            ims_preview = ItemMake.objects.filter(id__in=im_ids, company=company)
+            ims_preview_map = {str(im.id): im for im in ims_preview}
+            missing = [eid for eid in im_ids if eid not in ims_preview_map]
+            if missing:
+                return Response(
+                    {"recipe": f"Сырьё не найдено или принадлежит другой компании: {missing}"},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            purchase_price = calc_recipe_unit_cost(recipe_entries, ims_preview_map)
 
         # ====== FIX: двусторонняя логика price <-> markup_percent ======
         price_raw = data.get("price", None)
@@ -1330,50 +1404,7 @@ class ProductCreateManualAPIView(CompanyBranchRestrictedMixin, generics.CreateAP
             )
 
         # ====== recipe (приоритет над item_make) ======
-        recipe_input = data.get("recipe")
-        if recipe_input and isinstance(recipe_input, list):
-            # Validate recipe entries
-            seen_ids = set()
-            recipe_entries = []
-            for idx, entry in enumerate(recipe_input):
-                if not isinstance(entry, dict):
-                    return Response(
-                        {"recipe": f"Элемент #{idx}: ожидается объект."},
-                        status=status.HTTP_400_BAD_REQUEST,
-                    )
-                raw_id = entry.get("id")
-                raw_qty = entry.get("qty_per_unit")
-                if not raw_id:
-                    return Response(
-                        {"recipe": f"Элемент #{idx}: отсутствует id."},
-                        status=status.HTTP_400_BAD_REQUEST,
-                    )
-                if raw_qty is None:
-                    return Response(
-                        {"recipe": f"Элемент #{idx}: отсутствует qty_per_unit."},
-                        status=status.HTTP_400_BAD_REQUEST,
-                    )
-                try:
-                    qty_per_unit = Decimal(str(raw_qty))
-                except Exception:
-                    return Response(
-                        {"recipe": f"Элемент #{idx}: qty_per_unit — неверный формат числа."},
-                        status=status.HTTP_400_BAD_REQUEST,
-                    )
-                if qty_per_unit <= 0:
-                    return Response(
-                        {"recipe": f"Элемент #{idx}: qty_per_unit должен быть > 0."},
-                        status=status.HTTP_400_BAD_REQUEST,
-                    )
-                str_id = str(raw_id)
-                if str_id in seen_ids:
-                    return Response(
-                        {"recipe": f"Элемент #{idx}: дубликат id={raw_id}."},
-                        status=status.HTTP_400_BAD_REQUEST,
-                    )
-                seen_ids.add(str_id)
-                recipe_entries.append({"id": str_id, "qty_per_unit": qty_per_unit})
-
+        if recipe_entries:
             # Verify all item_make ids exist and belong to company
             im_ids = [e["id"] for e in recipe_entries]
             ims_qs = ItemMake.objects.filter(id__in=im_ids, company=company).select_for_update()
@@ -2804,19 +2835,19 @@ class ObjectSaleAddItemAPIView(CompanyBranchRestrictedMixin, APIView):
 # ===========================
 class ItemListCreateAPIView(CompanyBranchRestrictedMixin, generics.ListCreateAPIView):
     """
-    GET  /api/main/items/
-    POST /api/main/items/
+    GET  /api/main/items-make/
+    POST /api/main/items-make/
     """
     serializer_class = ItemMakeSerializer
     queryset = ItemMake.objects.all()
     filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
     search_fields = ["name", "supplier__full_name", "products__name"]
-    filterset_fields = ["unit", "price", "quantity", "products", "supplier"]
+    filterset_fields = ["unit", "price", "quantity", "products", "supplier", "kind"]
     ordering_fields = ["created_at", "updated_at", "price", "quantity", "name"]
     ordering = ["-created_at"]
 
     def get_queryset(self):
-        qs = super().get_queryset()
+        qs = super().get_queryset().select_related("source", "supplier")
         return self._filter_qs_company_branch(qs).distinct()
 
     # perform_create — миксин
@@ -2827,8 +2858,58 @@ class ItemRetrieveUpdateDestroyAPIView(CompanyBranchRestrictedMixin, generics.Re
     queryset = ItemMake.objects.all()
 
     def get_queryset(self):
-        qs = super().get_queryset()
+        qs = super().get_queryset().select_related("source", "supplier")
         return qs
+
+
+class ItemMakeProcessAPIView(CompanyBranchRestrictedMixin, APIView):
+    """
+    POST /api/main/items-make/<uuid:pk>/process/
+
+    Обработка сырья: списание input_quantity с исходного сырья и зачисление
+    output_quantity в обработанную позицию (с пересчётом цены за единицу).
+    """
+
+    @transaction.atomic
+    def post(self, request, pk=None):
+        company = self._company()
+        qs = self._filter_qs_company_branch(ItemMake.objects.select_related("source"))
+        source = get_object_or_404(qs, pk=pk)
+
+        ser = ItemMakeProcessSerializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+        vd = ser.validated_data
+
+        target = None
+        target_id = vd.get("target_item_make_id")
+        if target_id:
+            target = qs.filter(pk=target_id, kind=ItemMake.Kind.PROCESSED).first()
+            if not target:
+                return Response(
+                    {"target_item_make_id": "Обработанное сырьё не найдено."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+        try:
+            source, processed = process_raw_item_make(
+                source,
+                input_quantity=vd["input_quantity"],
+                output_quantity=vd["output_quantity"],
+                name=(vd.get("name") or "").strip() or None,
+                processing_cost=vd.get("processing_cost") or Decimal("0"),
+                target=target,
+            )
+        except ValueError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+
+        ctx = {"request": request}
+        return Response(
+            {
+                "source": ItemMakeSerializer(source, context=ctx).data,
+                "processed": ItemMakeSerializer(processed, context=ctx).data,
+            },
+            status=status.HTTP_201_CREATED,
+        )
 
 
 # ===========================

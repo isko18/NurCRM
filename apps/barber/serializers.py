@@ -17,6 +17,7 @@ from .models import (
     OnlineBooking
 )
 from apps.users.models import Branch  # для проверки филиала по ?branch=
+from apps.users.models import User
 from decimal import Decimal, ROUND_HALF_UP
 from datetime import date
 from calendar import monthrange
@@ -181,6 +182,17 @@ class ServiceCategorySerializer(CompanyBranchReadOnlyMixin, serializers.ModelSer
 
         return attrs
     
+class ServiceBarberBriefSerializer(serializers.Serializer):
+    id = serializers.UUIDField()
+    full_name = serializers.SerializerMethodField()
+
+    def get_full_name(self, obj):
+        first = getattr(obj, "first_name", None) or ""
+        last = getattr(obj, "last_name", None) or ""
+        full = f"{first} {last}".strip()
+        return full or getattr(obj, "email", "")
+
+
 class ServiceSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
     company = serializers.ReadOnlyField(source="company.id")
     branch = serializers.ReadOnlyField(source="branch.id")
@@ -195,6 +207,12 @@ class ServiceSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
         source="category.name",
         read_only=True,
     )
+    barbers = serializers.PrimaryKeyRelatedField(
+        queryset=User.objects.all(),
+        many=True,
+        required=False,
+    )
+    barbers_detail = ServiceBarberBriefSerializer(source="barbers", many=True, read_only=True)
 
     class Meta:
         model = Service
@@ -203,11 +221,36 @@ class ServiceSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
             "name", "time",
             "category", "category_name",
             "price", "is_active",
+            "barbers", "barbers_detail",
         ]
-        read_only_fields = ["id", "company", "branch", "category_name"]
+        read_only_fields = ["id", "company", "branch", "category_name", "barbers_detail"]
+
+    def get_fields(self):
+        fields = super().get_fields()
+        company = self._user_company()
+        if company:
+            fields["barbers"].queryset = User.objects.filter(company=company, is_active=True)
+        else:
+            fields["barbers"].queryset = User.objects.none()
+        return fields
 
     def validate_name(self, value):
         return (value or "").strip()
+
+    def _validate_barbers(self, barbers, company_id, target_branch):
+        if not barbers:
+            return
+        for user in barbers:
+            if user.company_id != company_id:
+                raise serializers.ValidationError(
+                    {"barbers": "Один из сотрудников принадлежит другой компании."}
+                )
+            if target_branch is not None:
+                user_branch_ids = set(user.branches.values_list("id", flat=True))
+                if user_branch_ids and target_branch.id not in user_branch_ids:
+                    raise serializers.ValidationError(
+                        {"barbers": f"Сотрудник «{user}» не привязан к этому филиалу."}
+                    )
 
     def validate(self, attrs):
         request = self.context.get("request")
@@ -242,7 +285,26 @@ class ServiceSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
             if target_branch is not None and category.branch_id not in (None, target_branch.id):
                 raise serializers.ValidationError({"category": "Категория принадлежит другому филиалу."})
 
+        barbers = attrs.get("barbers")
+        if barbers is None and self.instance is not None:
+            barbers = list(self.instance.barbers.all())
+        self._validate_barbers(barbers or [], company_id, target_branch)
+
         return attrs
+
+    def create(self, validated_data):
+        barbers = validated_data.pop("barbers", None)
+        instance = super().create(validated_data)
+        if barbers is not None:
+            instance.barbers.set(barbers)
+        return instance
+
+    def update(self, instance, validated_data):
+        barbers = validated_data.pop("barbers", None)
+        instance = super().update(instance, validated_data)
+        if barbers is not None:
+            instance.barbers.set(barbers)
+        return instance
 
 
 # ===========================
@@ -301,6 +363,7 @@ class ClientDocumentSerializer(serializers.ModelSerializer):
     company = serializers.ReadOnlyField(source="company.id")
     branch = serializers.ReadOnlyField(source="branch.id")
     client = serializers.ReadOnlyField(source="client.id")
+    file = serializers.FileField(required=False, allow_null=True)
 
     class Meta:
         ref_name = "BarberClientDocument"
@@ -1182,6 +1245,7 @@ class OnlineBookingStatusUpdateSerializer(serializers.ModelSerializer):
 class PublicServiceSerializer(serializers.ModelSerializer):
     """Публичный сериализатор для услуг (без авторизации)"""
     category_name = serializers.CharField(source="category.name", read_only=True)
+    barbers = serializers.PrimaryKeyRelatedField(many=True, read_only=True)
     
     class Meta:
         model = Service
@@ -1192,6 +1256,7 @@ class PublicServiceSerializer(serializers.ModelSerializer):
             'price',
             'category',
             'category_name',
+            'barbers',
         ]
 
 

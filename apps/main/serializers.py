@@ -629,9 +629,16 @@ class OrderSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
 # ItemMake / Product
 # ===========================
 class ItemMakeNestedSerializer(serializers.ModelSerializer):
+    kind_display = serializers.CharField(source="get_kind_display", read_only=True)
+    source = serializers.UUIDField(source="source_id", read_only=True, allow_null=True)
+    source_name = serializers.CharField(source="source.name", read_only=True, allow_null=True)
+
     class Meta:
         model = ItemMake
-        fields = ["id", "name", "price", "unit", "quantity"]
+        fields = [
+            "id", "name", "price", "unit", "quantity",
+            "kind", "kind_display", "source", "source_name",
+        ]
 
 
 class ProductImageSerializer(serializers.ModelSerializer):
@@ -873,11 +880,19 @@ class RecipeItemReadSerializer(serializers.ModelSerializer):
     id = serializers.CharField(source="item_make_id")
     name = serializers.CharField(source="item_make.name", read_only=True)
     qty_per_unit = serializers.DecimalField(max_digits=12, decimal_places=3)
+    unit = serializers.CharField(source="item_make.unit", read_only=True)
+    unit_price = serializers.DecimalField(source="item_make.price", max_digits=10, decimal_places=2, read_only=True)
+    line_cost = serializers.SerializerMethodField()
 
     class Meta:
         model = ProductRecipeItem
-        fields = ["id", "name", "qty_per_unit"]
+        fields = ["id", "name", "qty_per_unit", "unit", "unit_price", "line_cost"]
         read_only_fields = fields
+
+    def get_line_cost(self, obj):
+        qty = Decimal(str(obj.qty_per_unit or 0))
+        price = Decimal(str(getattr(obj.item_make, "price", 0) or 0))
+        return (qty * price).quantize(Decimal("0.01"))
 
 
 class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
@@ -2338,15 +2353,25 @@ class ItemMakeSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer
     branch = serializers.ReadOnlyField(source="branch.id")
     products = ProductNestedSerializer(many=True, read_only=True)
     supplier_name = serializers.CharField(source="supplier.full_name", read_only=True)
+    kind_display = serializers.CharField(source="get_kind_display", read_only=True)
+    source = serializers.PrimaryKeyRelatedField(read_only=True)
+    source_name = serializers.CharField(source="source.name", read_only=True, allow_null=True)
+    is_processed = serializers.SerializerMethodField()
 
     class Meta:
         model = ItemMake
         fields = [
             "id", "company", "branch",
+            "kind", "kind_display", "is_processed",
+            "source", "source_name",
             "name", "supplier", "supplier_name", "price", "unit", "quantity",
             "products",
             "created_at", "updated_at",
         ]
+        read_only_fields = ["kind", "source"]
+
+    def get_is_processed(self, obj):
+        return obj.kind == ItemMake.Kind.PROCESSED
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -2373,6 +2398,25 @@ class ItemMakeSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer
             if branch and supplier.branch_id not in (None, branch.id):
                 raise serializers.ValidationError({"supplier": "Поставщик другого филиала."})
 
+        return attrs
+
+
+class ItemMakeProcessSerializer(serializers.Serializer):
+    input_quantity = serializers.DecimalField(max_digits=18, decimal_places=3, min_value=Decimal("0.001"))
+    output_quantity = serializers.DecimalField(max_digits=18, decimal_places=3, min_value=Decimal("0.001"))
+    name = serializers.CharField(required=False, allow_blank=True, max_length=255)
+    processing_cost = serializers.DecimalField(
+        max_digits=12, decimal_places=2, required=False, default=Decimal("0.00"), min_value=Decimal("0"),
+    )
+    target_item_make_id = serializers.UUIDField(required=False, allow_null=True)
+
+    def validate(self, attrs):
+        inp = attrs["input_quantity"]
+        out = attrs["output_quantity"]
+        if out > inp:
+            raise serializers.ValidationError({
+                "output_quantity": "Выход не может быть больше входа (потери должны быть ≥ 0).",
+            })
         return attrs
 
 

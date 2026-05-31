@@ -274,7 +274,7 @@ class ServiceCategoryRetrieveUpdateDestroyView(
 
 # ==== Service ====
 class ServiceListCreateView(CompanyQuerysetMixin, generics.ListCreateAPIView):
-    queryset = Service.objects.all()
+    queryset = Service.objects.prefetch_related("barbers").all()
     serializer_class = ServiceSerializer
     permission_classes = [permissions.IsAuthenticated]
     filter_backends = [DjangoFilterBackend, SearchFilter, OrderingFilter]
@@ -285,6 +285,15 @@ class ServiceListCreateView(CompanyQuerysetMixin, generics.ListCreateAPIView):
     search_fields = ["name", "category__name"]
     ordering_fields = ["name", "price", "is_active"]
     ordering = ["name"]
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        barber_id = self.request.query_params.get("barber")
+        if barber_id:
+            qs = qs.annotate(_barber_count=Count("barbers")).filter(
+                Q(_barber_count=0) | Q(barbers__id=barber_id)
+            ).distinct()
+        return qs
 
     def create(self, request, *args, **kwargs):
         try:
@@ -302,7 +311,7 @@ class ServiceListCreateView(CompanyQuerysetMixin, generics.ListCreateAPIView):
 class ServiceRetrieveUpdateDestroyView(
     CompanyQuerysetMixin, generics.RetrieveUpdateDestroyAPIView
 ):
-    queryset = Service.objects.all()
+    queryset = Service.objects.prefetch_related("barbers").all()
     serializer_class = ServiceSerializer
     permission_classes = [permissions.IsAuthenticated]
 
@@ -1217,7 +1226,7 @@ class PublicServiceCategoriesListView(generics.ListAPIView):
                 queryset=Service.objects.filter(
                     is_active=True,
                     company=company
-                ).filter(services_branch_filter).order_by('name')
+                ).filter(services_branch_filter).prefetch_related('barbers').order_by('name')
             )
         ).order_by('name')
         

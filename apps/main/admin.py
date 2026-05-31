@@ -309,9 +309,9 @@ class ItemMakeInline(admin.TabularInline):
 
 @admin.register(ItemMake)
 class ItemMakeAdmin(admin.ModelAdmin):
-    list_display = ("name", "unit", "quantity", "price", "company", "branch", "created_at")
+    list_display = ("name", "kind", "unit", "quantity", "price", "source", "company", "branch", "created_at")
     search_fields = ("name",)
-    list_filter = ("company", "branch", "unit")
+    list_filter = ("company", "branch", "unit", "kind")
     ordering = ("name",)
     list_select_related = ("company", "branch")
     autocomplete_fields = ("company", "branch")
