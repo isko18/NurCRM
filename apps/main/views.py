@@ -63,6 +63,7 @@ from apps.main.serializers import (
     TransactionRecordSerializer, ContractorWorkSerializer, DebtSerializer, DebtPaymentSerializer,
     ObjectItemSerializer, ObjectSaleSerializer, ObjectSaleItemSerializer,
     BulkIdsSerializer, ItemMakeSerializer, ItemMakeProcessSerializer,
+    BidPublicCreateSerializer,
     ManufactureSubrealSerializer, AcceptanceCreateSerializer, ReturnCreateSerializer,
     BulkSubrealCreateSerializer, AcceptanceReadSerializer, ReturnApproveSerializer, ReturnRejectSerializer, ReturnReadSerializer,
     AgentProductOnHandSerializer, AgentWithProductsSerializer, GlobalProductReadSerializer,
@@ -2580,14 +2581,28 @@ class ClientWithDebtsListAPIView(CompanyBranchRestrictedMixin, generics.ListAPIV
 # ===========================
 #  Bids & Social Applications
 # ===========================
-class BidListCreateAPIView(CompanyBranchRestrictedMixin, generics.ListCreateAPIView):
-    serializer_class = BidSerializers
-    queryset = Bid.objects.select_related("company", "branch", "client").all()
+class BidListCreateAPIView(generics.ListCreateAPIView):
+    """
+    GET  — список заявок (только авторизованные).
+    POST — публичная отправка заявки с лендинга (без токена).
+    """
+    queryset = Bid.objects.all()
+
+    def get_permissions(self):
+        if self.request.method == "POST":
+            return [permissions.AllowAny()]
+        return [permissions.IsAuthenticated()]
+
+    def get_serializer_class(self):
+        if self.request.method == "POST":
+            return BidPublicCreateSerializer
+        return BidSerializers
 
 
-class BidRetrieveUpdateDestroyAPIView(CompanyBranchRestrictedMixin, generics.RetrieveUpdateDestroyAPIView):
+class BidRetrieveUpdateDestroyAPIView(generics.RetrieveUpdateDestroyAPIView):
     serializer_class = BidSerializers
-    queryset = Bid.objects.select_related("company", "branch", "client").all()
+    permission_classes = [permissions.IsAuthenticated]
+    queryset = Bid.objects.all()
 
 
 class SocialApplicationsListCreateAPIView(CompanyBranchRestrictedMixin, generics.ListCreateAPIView):

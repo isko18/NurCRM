@@ -212,6 +212,15 @@ class BidSerializers(serializers.ModelSerializer):
         fields = ['id', 'full_name', 'phone', 'text', 'status', 'created_at']
 
 
+class BidPublicCreateSerializer(serializers.ModelSerializer):
+    """Публичная заявка с лендинга — без авторизации."""
+
+    class Meta:
+        model = Bid
+        fields = ['id', 'full_name', 'phone', 'text', 'created_at']
+        read_only_fields = ['id', 'created_at']
+
+
 class PublicKnowledgeBaseLessonSerializer(serializers.ModelSerializer):
     class Meta:
         model = KnowledgeBaseLesson
