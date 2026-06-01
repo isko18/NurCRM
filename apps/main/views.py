@@ -22,7 +22,8 @@ from rest_framework import serializers
 from .filters import TransactionRecordFilter, DebtFilter, DebtPaymentFilter
 from django_filters.rest_framework import DjangoFilterBackend
 from django.db.models import DecimalField, ExpressionWrapper
-from rest_framework.pagination import CursorPagination
+from rest_framework.pagination import CursorPagination, PageNumberPagination
+from django.core.paginator import InvalidPage
 
 
 from apps.main.services.item_make_processing import (
@@ -3005,6 +3006,68 @@ class SupplierProductsListAPIView(CompanyBranchRestrictedMixin, generics.ListAPI
         return prod_qs.filter(Q(suppliers=supplier) | Q(client_id=supplier.id)).distinct()
 
 
+def _supplier_receipt_line_total_expr():
+    return ExpressionWrapper(
+        F("qty") * Coalesce(
+            F("purchase_price"),
+            V(Decimal("0"), output_field=DecimalField(max_digits=11, decimal_places=3)),
+        ),
+        output_field=DecimalField(max_digits=20, decimal_places=3),
+    )
+
+
+def _aggregate_supplier_receipts_total_amount(receipt_qs):
+    total = (
+        SupplierReceiptItem.objects.filter(receipt__in=receipt_qs.values("pk"))
+        .aggregate(total=Sum(_supplier_receipt_line_total_expr()))["total"]
+    )
+    if total is None:
+        return Decimal("0")
+    return total.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+
+class SupplierReceiptLimitPagination(PageNumberPagination):
+    page_size = 20
+    page_size_query_param = "limit"
+    max_page_size = 100
+
+    def paginate_queryset(self, queryset, request, view=None):
+        page_size = self.get_page_size(request)
+        if not page_size:
+            return None
+
+        paginator = self.django_paginator_class(queryset, page_size)
+        page_number = request.query_params.get(self.page_query_param, 1)
+        try:
+            page_number = int(page_number)
+        except (TypeError, ValueError):
+            page_number = 1
+        if page_number < 1:
+            page_number = 1
+
+        try:
+            self.page = paginator.page(page_number)
+        except InvalidPage:
+            if paginator.num_pages:
+                self.page = paginator.page(paginator.num_pages)
+            else:
+                self.page = paginator.page(1)
+
+        self.request = request
+        return list(self.page)
+
+    def get_paginated_response(self, data, *, total_amount):
+        return Response(
+            {
+                "count": self.page.paginator.count,
+                "next": self.get_next_link(),
+                "previous": self.get_previous_link(),
+                "results": data,
+                "meta": {"total_amount": str(total_amount)},
+            }
+        )
+
+
 class SupplierReceiptAPIView(CompanyBranchRestrictedMixin, APIView):
     """
     POST /api/main/suppliers/<uuid:supplier_id>/receipt/
@@ -3095,29 +3158,31 @@ class SupplierReceiptAPIView(CompanyBranchRestrictedMixin, APIView):
         )
 
 
-class SupplierReceiptListAPIView(CompanyBranchRestrictedMixin, generics.ListAPIView):
-    """
-    GET /api/main/suppliers/receipts/?supplier_id=<uuid>&date_from=YYYY-MM-DD&date_to=YYYY-MM-DD
-    """
-
-    permission_classes = [permissions.IsAuthenticated]
-    serializer_class = SupplierReceiptReadSerializer
-    # без глобальной PageNumberPagination: иначе ?page=2 при одной странице даёт 404
-    pagination_class = None
-
-    def get_queryset(self):
-        qs = SupplierReceipt.objects.select_related("supplier", "company", "branch", "created_by").prefetch_related(
-            "items",
-            "items__product",
+class SupplierReceiptQuerysetMixin:
+    def _supplier_receipts_base_queryset(self):
+        line_total = ExpressionWrapper(
+            F("items__qty")
+            * Coalesce(
+                F("items__purchase_price"),
+                V(Decimal("0"), output_field=DecimalField(max_digits=11, decimal_places=3)),
+            ),
+            output_field=DecimalField(max_digits=20, decimal_places=3),
         )
-        qs = self._filter_qs_company_branch(qs)
+        qs = (
+            SupplierReceipt.objects.select_related("supplier", "company", "branch", "created_by")
+            .prefetch_related("items", "items__product")
+            .annotate(total_amount=Sum(line_total))
+        )
+        return self._filter_qs_company_branch(qs)
+
+    def _supplier_receipts_filtered_queryset(self):
+        qs = self._supplier_receipts_base_queryset()
 
         qp = self.request.query_params
         supplier_id = (qp.get("supplier_id") or "").strip()
         if supplier_id:
             qs = qs.filter(supplier_id=supplier_id)
 
-        # date filter (created_at)
         df_raw = (qp.get("date_from") or qp.get("created_from") or "").strip()
         dt_raw = (qp.get("date_to") or qp.get("created_to") or "").strip()
         df = parse_date(df_raw) if df_raw else None
@@ -3128,6 +3193,56 @@ class SupplierReceiptListAPIView(CompanyBranchRestrictedMixin, generics.ListAPIV
             qs = qs.filter(created_at__date__lte=dt)
 
         return qs
+
+
+class SupplierReceiptListAPIView(
+    SupplierReceiptQuerysetMixin,
+    CompanyBranchRestrictedMixin,
+    generics.ListAPIView,
+):
+    """
+    GET /api/main/suppliers/receipts/?page=1&limit=20&supplier_id=<uuid>&date_from=YYYY-MM-DD&date_to=YYYY-MM-DD
+    """
+
+    permission_classes = [permissions.IsAuthenticated]
+    serializer_class = SupplierReceiptReadSerializer
+    pagination_class = SupplierReceiptLimitPagination
+
+    def get_queryset(self):
+        return self._supplier_receipts_filtered_queryset()
+
+    def list(self, request, *args, **kwargs):
+        queryset = self.filter_queryset(self.get_queryset())
+        total_amount = _aggregate_supplier_receipts_total_amount(queryset)
+
+        page = self.paginate_queryset(queryset)
+        serializer = self.get_serializer(page, many=True)
+        return self.paginator.get_paginated_response(serializer.data, total_amount=total_amount)
+
+
+class SupplierReceiptRetrieveAPIView(
+    SupplierReceiptQuerysetMixin,
+    CompanyBranchRestrictedMixin,
+    generics.RetrieveAPIView,
+):
+    """
+    GET /api/main/suppliers/receipts/<uuid:pk>/
+    """
+
+    permission_classes = [permissions.IsAuthenticated]
+    serializer_class = SupplierReceiptReadSerializer
+    lookup_url_kwarg = "pk"
+
+    def get_queryset(self):
+        return self._supplier_receipts_base_queryset()
+
+    def retrieve(self, request, *args, **kwargs):
+        instance = self.get_object()
+        serializer = self.get_serializer(instance)
+        data = serializer.data
+        items = data.get("items") or []
+        data["lines"] = items
+        return Response(data)
 
 
 # ===========================

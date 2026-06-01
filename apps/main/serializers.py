@@ -2683,13 +2683,14 @@ class SupplierReceiptCreateSerializer(serializers.Serializer):
 
 
 class SupplierReceiptItemReadSerializer(serializers.ModelSerializer):
+    product = serializers.UUIDField(source="product.id", read_only=True)
     product_id = serializers.UUIDField(source="product.id", read_only=True)
     product_name = serializers.CharField(source="product.name", read_only=True)
     product_code = serializers.CharField(source="product.code", read_only=True)
 
     class Meta:
         model = SupplierReceiptItem
-        fields = ["id", "product_id", "product_name", "product_code", "qty", "purchase_price"]
+        fields = ["id", "product", "product_id", "product_name", "product_code", "qty", "purchase_price"]
 
 
 class SupplierReceiptReadSerializer(serializers.ModelSerializer):
@@ -2700,6 +2701,7 @@ class SupplierReceiptReadSerializer(serializers.ModelSerializer):
     created_by_id = serializers.UUIDField(read_only=True, allow_null=True)
     created_by_name = serializers.SerializerMethodField()
     items = SupplierReceiptItemReadSerializer(many=True, read_only=True)
+    total_amount = serializers.SerializerMethodField()
 
     class Meta:
         model = SupplierReceipt
@@ -2715,6 +2717,7 @@ class SupplierReceiptReadSerializer(serializers.ModelSerializer):
             "created_by_name",
             "created_at",
             "items",
+            "total_amount",
         ]
 
     def get_created_by_name(self, obj):
@@ -2722,6 +2725,19 @@ class SupplierReceiptReadSerializer(serializers.ModelSerializer):
         if u is None:
             return None
         return getattr(u, "email", None)
+
+    def get_total_amount(self, obj):
+        annotated = getattr(obj, "total_amount", None)
+        if annotated is not None:
+            return str(
+                Decimal(str(annotated)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+            )
+
+        total = Decimal("0")
+        for item in obj.items.all():
+            price = item.purchase_price if item.purchase_price is not None else Decimal("0")
+            total += Decimal(str(item.qty)) * Decimal(str(price))
+        return str(total.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
 
 
 class ReturnCreateSerializer(serializers.ModelSerializer):

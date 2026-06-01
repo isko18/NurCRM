@@ -66,7 +66,7 @@ def _ekassa_checkout_hint(company):
     return None
 from apps.main.services_agent_pos import checkout_agent_cart, AgentNotEnoughStock
 from apps.main.utils_numbers import ensure_sale_doc_number
-from apps.main.views import CompanyBranchRestrictedMixin
+from apps.main.views import CompanyBranchRestrictedMixin, SupplierReceiptLimitPagination
 from apps.construction.models import Cashbox, CashShift
 from .pos_utils import (
     money,
@@ -2772,6 +2772,38 @@ class MobileScannerIngestAPIView(APIView):
         return Response({"ok": True}, status=201)
 
 
+class PosSalesLimitPagination(SupplierReceiptLimitPagination):
+    page_size = 100
+    max_page_size = 500
+
+
+def _apply_sale_date_filters(qs, request):
+    start_raw = (
+        (request.query_params.get("date_from") or "").strip()
+        or (request.query_params.get("start") or "").strip()
+    )
+    end_raw = (
+        (request.query_params.get("date_to") or "").strip()
+        or (request.query_params.get("end") or "").strip()
+    )
+    start_dt = _parse_range_dt(start_raw, end=False) if start_raw else None
+    end_dt = _parse_range_dt(end_raw, end=True) if end_raw else None
+    if start_dt:
+        qs = qs.filter(created_at__gte=start_dt)
+    if end_dt:
+        qs = qs.filter(created_at__lte=end_dt)
+    return qs
+
+
+def _aggregate_pos_sales_total_amount(qs, *, status_filter: str):
+    if status_filter != Sale.Status.CANCELED:
+        qs = qs.exclude(status=Sale.Status.CANCELED)
+    total = qs.aggregate(total=Coalesce(Sum("total"), Decimal("0.00")))["total"]
+    if total is None:
+        return Decimal("0.00")
+    return total.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+
 class SaleListAPIView(MarketCashierOnlyMixin, CompanyBranchRestrictedMixin, generics.ListAPIView):
     serializer_class = SaleListSerializer
     queryset = (
@@ -2784,18 +2816,11 @@ class SaleListAPIView(MarketCashierOnlyMixin, CompanyBranchRestrictedMixin, gene
     search_fields = ("id",)
     ordering_fields = ("created_at", "total", "status")
     ordering = ("-created_at",)
+    pagination_class = PosSalesLimitPagination
 
     def get_queryset(self):
         qs = super().get_queryset()
-
-        # ✅ корректные aware datetime
-        start_dt = _parse_range_dt(self.request.query_params.get("start"), end=False)
-        end_dt = _parse_range_dt(self.request.query_params.get("end"), end=True)
-
-        if start_dt:
-            qs = qs.filter(created_at__gte=start_dt)
-        if end_dt:
-            qs = qs.filter(created_at__lte=end_dt)
+        qs = _apply_sale_date_filters(qs, self.request)
 
         paid_only = self.request.query_params.get("paid")
         if paid_only in ("1", "true", "True"):
@@ -2812,6 +2837,15 @@ class SaleListAPIView(MarketCashierOnlyMixin, CompanyBranchRestrictedMixin, gene
             qs = qs.filter(client_id=client_param)
 
         return qs
+
+    def list(self, request, *args, **kwargs):
+        queryset = self.filter_queryset(self.get_queryset())
+        status_param = (request.query_params.get("status") or "").strip()
+        total_amount = _aggregate_pos_sales_total_amount(queryset, status_filter=status_param)
+
+        page = self.paginate_queryset(queryset)
+        serializer = self.get_serializer(page, many=True)
+        return self.paginator.get_paginated_response(serializer.data, total_amount=total_amount)
 
 
 class SaleRetrieveAPIView(MarketCashierOnlyMixin, CompanyBranchRestrictedMixin, generics.RetrieveUpdateDestroyAPIView):
