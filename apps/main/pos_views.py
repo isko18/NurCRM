@@ -739,15 +739,15 @@ def _party_lines(
 
 def _parse_scale_barcode(barcode: str):
     """
-    Парсим EAN-13 весовой штрихкод формата:
-    PP CCCCC WWWWW K
+    EAN-13 весовой штрихкод весов TM-A/TM-F: FFWWWWWEEEEEC
 
-    - PP     : префикс 20–29 (переменный вес)
-    - CCCCC  : PLU товара (5 цифр)
-    - WWWWW  : вес в граммах (5 цифр, 00312 -> 0.312 кг)
-    - K      : контрольная цифра (игнорируем)
+    - FF (20–29) : префикс весового товара
+    - WWWWW      : PLU (5 цифр)
+    - EEEEE      : сумма в тыйынах (30600 → 306.00 сом)
+    - C          : контрольная цифра
 
     Возвращаем dict или None, если не похоже на весовой штрих.
+    Количество (кг) вычисляется позже в _finalize_scale_data_for_product.
     """
     if not barcode or len(barcode) != 13 or not barcode.isdigit():
         return None
@@ -761,23 +761,56 @@ def _parse_scale_barcode(barcode: str):
         return None
 
     raw_code = barcode[2:7]
-    weight_digits = barcode[7:12]
+    amount_raw = barcode[7:12]
+    check_digit = barcode[12]
 
     try:
         plu = int(raw_code)
-        weight_raw = int(weight_digits)
+        amount_raw_int = int(amount_raw)
     except ValueError:
         return None
 
-    weight_kg = weight_raw / 1000.0
+    amount = (Decimal(amount_raw_int) / Decimal("100")).quantize(Decimal("0.01"))
 
     return {
         "prefix": prefix,
         "plu": plu,
         "raw_code": raw_code,
-        "weight_raw": weight_raw,
-        "weight_kg": weight_kg,
+        "amount_raw": amount_raw,
+        "amount": amount,
+        "check_digit": check_digit,
+        "mode": "amount",
     }
+
+
+def _finalize_scale_data_for_product(product, scale_data: dict) -> Optional[str]:
+    """
+    Для mode=amount дополняет scale_data полем quantity_kg.
+    Возвращает текст ошибки или None.
+    """
+    if not scale_data or scale_data.get("mode") != "amount":
+        return None
+
+    price = Decimal(str(getattr(product, "price", None) or 0))
+    if price <= 0:
+        return "Нельзя вычислить количество: у товара не задана цена (price ≤ 0)."
+
+    amount = scale_data.get("amount")
+    if amount is None:
+        return "Нельзя вычислить количество: в штрихкоде не указана сумма."
+
+    quantity_kg = (Decimal(str(amount)) / price).quantize(Decimal("0.001"), rounding=ROUND_HALF_UP)
+    scale_data["quantity_kg"] = quantity_kg
+    return None
+
+
+def _effective_qty_from_scale_data(scale_data, qty) -> Decimal:
+    if scale_data:
+        if "quantity_kg" in scale_data:
+            return Decimal(str(scale_data["quantity_kg"]))
+        if "weight_kg" in scale_data:
+            return Decimal(str(scale_data["weight_kg"]))
+    return Decimal(str(qty))
 
 
 def _parse_scale_barcode_loose(barcode: str):
@@ -943,6 +976,9 @@ def _lookup_product_for_pos_scan(company_id, barcode: str, *, only_fields=POS_SC
     if scale_data:
         product = _resolve_product_by_plu_or_code_for_pos(company_id, scale_data, only_fields=only_fields)
         if product:
+            finalize_error = _finalize_scale_data_for_product(product, scale_data)
+            if finalize_error:
+                return None, scale_data, finalize_error
             return product, scale_data, None
         plu = scale_data.get("plu")
         raw_code = scale_data.get("raw_code")
@@ -2124,10 +2160,7 @@ class SaleScanAPIView(MarketCashierOnlyMixin, APIView):
         if not product:
             return Response({"not_found": True, "message": lookup_error or "Товар не найден"}, status=404)
 
-        if scale_data:
-            effective_qty = Decimal(str(scale_data["weight_kg"]))
-        else:
-            effective_qty = Decimal(str(qty))
+        effective_qty = _effective_qty_from_scale_data(scale_data, qty)
 
         with transaction.atomic():
             cart = _lock_pos_target_cart(
@@ -2766,9 +2799,11 @@ class MobileScannerIngestAPIView(APIView):
         if not product:
             return Response({"not_found": True, "message": lookup_error or "Товар не найден"}, status=404)
 
+        effective_qty = _effective_qty_from_scale_data(scale_data, qty)
+
         with transaction.atomic():
             cart = Cart.objects.select_for_update().get(id=cart.id)
-            _upsert_scanned_cart_item(cart, product, qty)
+            _upsert_scanned_cart_item(cart, product, effective_qty)
         return Response({"ok": True}, status=201)
 
 
@@ -3416,13 +3451,15 @@ class AgentSaleScanAPIView(MarketCashierOnlyMixin, CompanyBranchRestrictedMixin,
         barcode = ser.validated_data["barcode"].strip()
         qty = ser.validated_data["quantity"]
 
-        product, _scale_data, lookup_error = _lookup_product_for_pos_scan(
+        product, scale_data, lookup_error = _lookup_product_for_pos_scan(
             cart.company_id,
             barcode,
             only_fields=("id", "company_id", "price", "quantity", "barcode", "plu", "code", "is_weight"),
         )
         if not product:
             return Response({"not_found": True, "message": lookup_error or "Товар не найден"}, status=404)
+
+        effective_qty = _effective_qty_from_scale_data(scale_data, qty)
 
         acting_agent = _resolve_acting_agent(request, cart, allow_owner_override=True)
         use_main_stock = _should_use_main_stock_in_agent_sale(user=request.user, acting_agent=acting_agent)
@@ -3437,7 +3474,7 @@ class AgentSaleScanAPIView(MarketCashierOnlyMixin, CompanyBranchRestrictedMixin,
             CartItem.objects.filter(cart=cart, product=product).aggregate(s=Sum("quantity"))["s"] or 0,
             default=Decimal("0"),
         )
-        req = _as_decimal(qty, default=Decimal("0"))
+        req = _as_decimal(effective_qty, default=Decimal("0"))
 
         if req + in_cart > available:
             remaining = max(Decimal("0"), available - in_cart)
@@ -3452,7 +3489,7 @@ class AgentSaleScanAPIView(MarketCashierOnlyMixin, CompanyBranchRestrictedMixin,
                 status=400,
             )
 
-        _upsert_scanned_cart_item(cart, product, qty)
+        _upsert_scanned_cart_item(cart, product, effective_qty)
         cart.recalc()
         return _cart_response(request, cart.id, status_code=status.HTTP_201_CREATED)
 
