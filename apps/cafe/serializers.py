@@ -2187,7 +2187,7 @@ class CafeHouseholdInventorySessionSerializer(CompanyBranchReadOnlyMixin):
         model = CafeHouseholdInventorySession
         fields = [
             "id", "company", "branch", "status", "comment",
-            "created_by", "created_at", "confirmed_at", "lines",
+            "created_by", "created_at", "confirmed_at", "lines", "items",
         ]
         read_only_fields = ["id", "company", "created_by", "created_at", "confirmed_at", "status"]
 
