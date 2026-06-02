@@ -24,44 +24,47 @@ class PosOwnerAgentSaleTests(TestCase):
 
 
 class PosScaleBarcodeTests(TestCase):
-    BARCODE = "2000001306000"
+    BARCODE = "2000001000441"
 
-    def test_parse_scale_barcode_tm_amount_format(self):
+    def test_parse_scale_barcode_amount_in_som(self):
         data = _parse_scale_barcode(self.BARCODE)
         self.assertIsNotNone(data)
         self.assertEqual(data["prefix"], "20")
         self.assertEqual(data["plu"], 1)
         self.assertEqual(data["raw_code"], "00001")
-        self.assertEqual(data["amount_raw"], "30600")
-        self.assertEqual(data["amount"], Decimal("306.00"))
-        self.assertEqual(data["check_digit"], "0")
-        self.assertEqual(data["mode"], "amount")
+        self.assertEqual(data["amount_raw"], "00044")
+        self.assertEqual(data["amount"], Decimal("44"))
+        self.assertEqual(data["check_digit"], "1")
+        self.assertEqual(data["mode"], "amount_plain")
         self.assertNotIn("weight_kg", data)
 
-    def test_quantity_from_amount_price_70(self):
+    def test_quantity_amount_44_price_44(self):
         scale_data = _parse_scale_barcode(self.BARCODE)
-        product = SimpleNamespace(price=Decimal("70.00"))
-        self.assertIsNone(_finalize_scale_data_for_product(product, scale_data))
-        self.assertEqual(scale_data["quantity_kg"], Decimal("4.371"))
-
-    def test_quantity_from_amount_price_equals_label_amount(self):
-        scale_data = _parse_scale_barcode(self.BARCODE)
-        product = SimpleNamespace(price=Decimal("306.00"))
+        product = SimpleNamespace(price=Decimal("44"))
         self.assertIsNone(_finalize_scale_data_for_product(product, scale_data))
         self.assertEqual(scale_data["quantity_kg"], Decimal("1.000"))
+        self.assertEqual(scale_data["mode"], "amount_plain")
+        self.assertEqual(scale_data["amount"], Decimal("44"))
+        self.assertEqual(scale_data["plu"], 1)
 
     def test_finalize_rejects_zero_price(self):
         scale_data = _parse_scale_barcode(self.BARCODE)
         product = SimpleNamespace(price=Decimal("0"))
         err = _finalize_scale_data_for_product(product, scale_data)
-        self.assertIn("цена", err.lower())
+        self.assertEqual(err, "Невозможно рассчитать вес: у товара не указана цена")
         self.assertNotIn("quantity_kg", scale_data)
 
+    def test_finalize_rejects_missing_price(self):
+        scale_data = _parse_scale_barcode(self.BARCODE)
+        product = SimpleNamespace(price=None)
+        err = _finalize_scale_data_for_product(product, scale_data)
+        self.assertEqual(err, "Невозможно рассчитать вес: у товара не указана цена")
+
     def test_effective_qty_prefers_quantity_kg_over_request_qty(self):
-        scale_data = {"quantity_kg": Decimal("4.371"), "mode": "amount"}
+        scale_data = {"quantity_kg": Decimal("1.000"), "mode": "amount_plain"}
         self.assertEqual(
             _effective_qty_from_scale_data(scale_data, Decimal("9.000")),
-            Decimal("4.371"),
+            Decimal("1.000"),
         )
 
     def test_effective_qty_legacy_weight_kg(self):
@@ -72,10 +75,10 @@ class PosScaleBarcodeTests(TestCase):
         )
 
     def test_parse_scale_barcode_rejects_non_weight_prefix(self):
-        self.assertIsNone(_parse_scale_barcode("0100001306000"))
+        self.assertIsNone(_parse_scale_barcode("0100001000441"))
 
     def test_loose_parser_unchanged_weight_mode(self):
-        loose = _parse_scale_barcode_loose("2000001306000")
+        loose = _parse_scale_barcode_loose(self.BARCODE)
         self.assertIsNotNone(loose)
         self.assertEqual(loose["plu"], 1)
         self.assertIn("weight_kg", loose)

@@ -743,10 +743,9 @@ def _parse_scale_barcode(barcode: str):
 
     - FF (20–29) : префикс весового товара
     - WWWWW      : PLU (5 цифр)
-    - EEEEE      : сумма в тыйынах (30600 → 306.00 сом)
+    - EEEEE      : сумма в сомах на этикетке (00044 → 44 сом), без деления на 100
     - C          : контрольная цифра
 
-    Возвращаем dict или None, если не похоже на весовой штрих.
     Количество (кг) вычисляется позже в _finalize_scale_data_for_product.
     """
     if not barcode or len(barcode) != 13 or not barcode.isdigit():
@@ -766,11 +765,10 @@ def _parse_scale_barcode(barcode: str):
 
     try:
         plu = int(raw_code)
-        amount_raw_int = int(amount_raw)
     except ValueError:
         return None
 
-    amount = (Decimal(amount_raw_int) / Decimal("100")).quantize(Decimal("0.01"))
+    amount = Decimal(amount_raw)
 
     return {
         "prefix": prefix,
@@ -779,28 +777,35 @@ def _parse_scale_barcode(barcode: str):
         "amount_raw": amount_raw,
         "amount": amount,
         "check_digit": check_digit,
-        "mode": "amount",
+        "mode": "amount_plain",
     }
 
 
 def _finalize_scale_data_for_product(product, scale_data: dict) -> Optional[str]:
     """
-    Для mode=amount дополняет scale_data полем quantity_kg.
+    Для mode=amount_plain дополняет scale_data полем quantity_kg.
     Возвращает текст ошибки или None.
     """
-    if not scale_data or scale_data.get("mode") != "amount":
+    if not scale_data or scale_data.get("mode") != "amount_plain":
         return None
 
-    price = Decimal(str(getattr(product, "price", None) or 0))
+    price_raw = getattr(product, "price", None)
+    if price_raw is None or price_raw == "":
+        return "Невозможно рассчитать вес: у товара не указана цена"
+
+    price = Decimal(str(price_raw))
     if price <= 0:
-        return "Нельзя вычислить количество: у товара не задана цена (price ≤ 0)."
+        return "Невозможно рассчитать вес: у товара не указана цена"
 
     amount = scale_data.get("amount")
     if amount is None:
-        return "Нельзя вычислить количество: в штрихкоде не указана сумма."
+        return "Невозможно рассчитать вес: в штрихкоде не указана сумма"
 
     quantity_kg = (Decimal(str(amount)) / price).quantize(Decimal("0.001"), rounding=ROUND_HALF_UP)
     scale_data["quantity_kg"] = quantity_kg
+    scale_data["plu"] = scale_data.get("plu")
+    scale_data["amount"] = Decimal(str(amount))
+    scale_data["mode"] = "amount_plain"
     return None
 
 
