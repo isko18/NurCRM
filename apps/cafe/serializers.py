@@ -2191,21 +2191,31 @@ class CafeHouseholdInventorySessionSerializer(CompanyBranchReadOnlyMixin):
         ]
         read_only_fields = ["id", "company", "created_by", "created_at", "confirmed_at", "status"]
 
-    def create(self, validated_data):
+    def _lines_payload_from_data(self, validated_data):
         items_payload = validated_data.pop("items", None)
         lines_data = validated_data.pop("lines", None)
+        if lines_data is not None:
+            return lines_data
+        if items_payload is not None:
+            return items_payload
+        return None
+
+    def _sync_inventory_lines(self, session, lines_data):
         if lines_data is None:
-            lines_data = items_payload or []
-        req = self.context.get("request")
-        if req and req.user.is_authenticated:
-            validated_data["created_by"] = req.user
-        session = super().create(validated_data)
+            return
         company = session.company
+        session.lines.all().delete()
         for row in lines_data:
-            item_id = row.get("item") if isinstance(row, dict) else None
-            qty_counted = row.get("qty_counted") if isinstance(row, dict) else None
+            if not isinstance(row, dict):
+                continue
+            item_id = row.get("item")
             if not item_id:
                 continue
+            qty_counted = row.get("qty_counted")
+            if qty_counted is None:
+                raise serializers.ValidationError(
+                    {"items": "Для каждой строки укажите qty_counted."}
+                )
             item = CafeHouseholdItem.objects.filter(company=company, pk=item_id).first()
             if not item:
                 raise serializers.ValidationError({"items": f"Позиция {item_id} не найдена."})
@@ -2215,6 +2225,27 @@ class CafeHouseholdInventorySessionSerializer(CompanyBranchReadOnlyMixin):
                 qty_book=item.remainder,
                 qty_counted=Decimal(str(qty_counted)),
             )
+
+    def create(self, validated_data):
+        lines_data = self._lines_payload_from_data(validated_data)
+        if lines_data is None:
+            lines_data = []
+        req = self.context.get("request")
+        if req and req.user.is_authenticated:
+            validated_data["created_by"] = req.user
+        session = super().create(validated_data)
+        self._sync_inventory_lines(session, lines_data)
+        return session
+
+    def update(self, instance, validated_data):
+        lines_data = self._lines_payload_from_data(validated_data)
+        session = super().update(instance, validated_data)
+        if lines_data is not None:
+            if session.status != CafeHouseholdInventorySession.Status.DRAFT:
+                raise serializers.ValidationError(
+                    {"detail": "Редактировать строки можно только в черновике."}
+                )
+            self._sync_inventory_lines(session, lines_data)
         return session
 
 
