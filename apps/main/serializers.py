@@ -1055,6 +1055,7 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
             "item_make", "item_make_ids",
             "recipe",
             "quantity",
+            "minimum_quantity",
             "purchase_price",
             "markup_percent",
             "price",

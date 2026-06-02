@@ -717,6 +717,15 @@ class Product(models.Model):
         blank=True,
         help_text="В единицах unit (например пачки или шт.); поштучная продажа из пачки — через ProductPackage и sale_package на кассе.",
     )
+    minimum_quantity = models.DecimalField(
+        "Минимальный остаток",
+        max_digits=12,
+        decimal_places=2,
+        default=Decimal("0"),
+        null=True,
+        blank=True,
+        help_text="Порог для алерта «мало на складе» (фильтр preset=stock_below_min).",
+    )
 
     # ---- Цены / наценка / скидка ----
     purchase_price = models.DecimalField(

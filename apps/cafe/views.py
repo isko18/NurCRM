@@ -28,11 +28,11 @@ from .models import (
     Category, MenuItem, Ingredient,
     Order, OrderItem, CafeClient,
     OrderHistory, OrderItemHistory, OrderDebtPayment,
-    OrderRefund, OrderItemRefund,
+    OrderRefund, OrderItemRefund, OrderCheckoutPayment,
     KitchenTask, NotificationCafe,
     InventorySession, Equipment, EquipmentInventorySession, Kitchen,
     CafeReceiptPrinterSettings,
-    CafeExpense, CafeWaiterPayProfile,
+    CafeExpense, CafeWaiterPayProfile, OrderCheckoutPayment,
     Preparation, PreparationIngredient, PreparationProcessing, ProcessingType,
     DishIngredient, DishIngredientProcessing,
 )
@@ -68,6 +68,10 @@ from .services.costing import (
     calculate_ingredient,
 )
 from .services.stock import consume_dish_for_order, receive_preparation
+from .services.warehouse_expense import (
+    create_warehouse_initial_expense,
+    create_warehouse_receipt_expense,
+)
 
 
 _NUM_RE = re.compile(r"[-+]?\d+(?:[.,]\d+)?")
@@ -612,12 +616,18 @@ class WarehouseListCreateView(CompanyBranchQuerysetMixin, generics.ListCreateAPI
 
     def perform_create(self, serializer):
         try:
-            serializer.save()
+            obj = serializer.save()
         except IntegrityError as e:
             msg = str(e)
             if "uniq_warehouse_title_" in msg:
                 raise ValidationError({"title": "Склад с таким названием уже существует в этой компании или филиале."})
             raise
+        remainder = _decimal_from_warehouse_remainder(obj.remainder)
+        if remainder > 0 and (obj.unit_price or Decimal("0")) >= 0:
+            req = getattr(self, "request", None)
+            user = req.user if req and req.user.is_authenticated else None
+            create_warehouse_initial_expense(warehouse=obj, user=user)
+            invalidate_cafe_analytics_cache(obj.company_id)
 
 
 class WarehouseRetrieveUpdateDestroyView(CompanyBranchQuerysetMixin, generics.RetrieveUpdateDestroyAPIView):
@@ -625,9 +635,9 @@ class WarehouseRetrieveUpdateDestroyView(CompanyBranchQuerysetMixin, generics.Re
     serializer_class = WarehouseSerializer
 
     def perform_update(self, serializer):
-        old_price = None
-        if serializer.instance:
-            old_price = Decimal(serializer.instance.unit_price or 0)
+        inst = serializer.instance
+        old_price = Decimal(inst.unit_price or 0) if inst else Decimal("0")
+        old_remainder = _decimal_from_warehouse_remainder(inst.remainder) if inst else Decimal("0")
         try:
             obj = serializer.save()
         except IntegrityError as e:
@@ -642,6 +652,24 @@ class WarehouseRetrieveUpdateDestroyView(CompanyBranchQuerysetMixin, generics.Re
                     recalculate_preparations_for_warehouse(obj)
                 except ValueError as e:
                     raise ValidationError({"detail": str(e)})
+        new_remainder = _decimal_from_warehouse_remainder(obj.remainder)
+        delta_qty = new_remainder - old_remainder
+        if delta_qty > 0:
+            req = getattr(self, "request", None)
+            user = req.user if req and req.user.is_authenticated else None
+            unit_price = new_price
+            if "unit_price" not in serializer.validated_data:
+                unit_price = new_price
+            create_warehouse_receipt_expense(
+                warehouse=obj,
+                quantity=delta_qty,
+                unit_price=unit_price,
+                user=user,
+                source=CafeExpense.Source.WAREHOUSE_RECEIPT,
+                note=f"Склад: приход {delta_qty} {obj.unit}",
+                skip_remainder_update=True,
+            )
+            invalidate_cafe_analytics_cache(obj.company_id)
 
 
 class WarehouseStockAdjustView(CompanyBranchQuerysetMixin, APIView):
@@ -1954,7 +1982,7 @@ def _cafe_order_checkout_payload(order: Order) -> dict:
     final_amt = (order.total_amount or Decimal("0")) - disc
     pm = order.payment_method or ""
     pm_labels = dict(Order.PaymentMethod.choices)
-    return {
+    payload = {
         "id": str(order.id),
         "status": order.status,
         "is_paid": order.is_paid,
@@ -1972,6 +2000,12 @@ def _cafe_order_checkout_payload(order: Order) -> dict:
         "balance_due": str(order.balance_due),
         "cash_shift_id": str(order.cash_shift_id) if order.cash_shift_id else None,
     }
+    if pm == Order.PaymentMethod.SPLIT:
+        payload["payments"] = [
+            {"method": p.payment_method, "amount": f"{p.amount:.2f}"}
+            for p in order.checkout_payments.order_by("created_at")
+        ]
+    return payload
 
 
 def _cafe_archive_order_snapshot(order: Order):
@@ -2093,6 +2127,7 @@ class OrderPayView(CompanyBranchQuerysetMixin, APIView):
         prepaid_pm = ser.validated_data.get("prepaid_payment_method")
         idem = ser.validated_data.get("idempotency_key")
         cash_shift_id = ser.validated_data.get("cash_shift_id")
+        split_payments = ser.validated_data.get("payments")
 
         with transaction.atomic():
             locked_qs = (
@@ -2175,7 +2210,22 @@ class OrderPayView(CompanyBranchQuerysetMixin, APIView):
                     return True
                 return False
 
-            if payment_method == Order.PaymentMethod.DEBT:
+            split_parts_to_save = None
+
+            if payment_method == Order.PaymentMethod.SPLIT:
+                parts = split_payments or []
+                total_parts = sum(p["amount"] for p in parts).quantize(Decimal("0.01"))
+                if total_parts != final_amt:
+                    return Response(
+                        {"detail": "Сумма payments должна совпадать с итогом к оплате."},
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
+                order.payment_method = Order.PaymentMethod.SPLIT
+                order.paid_amount = final_amt
+                order.is_paid = True
+                order.paid_at = timezone.now()
+                split_parts_to_save = parts
+            elif payment_method == Order.PaymentMethod.DEBT:
                 prepaid = (prepaid_amount if prepaid_amount is not None else Decimal("0")).quantize(Decimal("0.01"))
                 if prepaid < 0 or prepaid > final_amt:
                     return Response(
@@ -2255,6 +2305,17 @@ class OrderPayView(CompanyBranchQuerysetMixin, APIView):
             if order.cash_shift_id:
                 _pay_uf.append("cash_shift_id")
             order.save(update_fields=_pay_uf)
+
+            if split_parts_to_save:
+                OrderCheckoutPayment.objects.filter(order=order).delete()
+                OrderCheckoutPayment.objects.bulk_create([
+                    OrderCheckoutPayment(
+                        order=order,
+                        payment_method=p["method"],
+                        amount=p["amount"].quantize(Decimal("0.01")),
+                    )
+                    for p in split_parts_to_save
+                ])
 
             if close_order:
                 unfinished_tasks = KitchenTask.objects.filter(

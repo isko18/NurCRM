@@ -14,7 +14,8 @@ from apps.cafe.models import (
     Order, OrderItem, CafeClient,
     OrderHistory, OrderItemHistory, KitchenTask, NotificationCafe, InventorySession, InventoryItem, Equipment, EquipmentInventoryItem, EquipmentInventorySession, Kitchen,
     CafeReceiptPrinterSettings,
-    CafeExpense, CafeWaiterPayProfile,
+    CafeExpense, CafeExpenseCategory, CafeWaiterPayProfile,
+    CafeHouseholdItem, CafeHouseholdMovement, CafeHouseholdInventorySession, CafeHouseholdInventoryLine,
     Preparation, PreparationIngredient, PreparationProcessing, ProcessingType,
     DishIngredient, DishIngredientProcessing,
 )
@@ -1680,10 +1681,17 @@ class OrderPaySerializer(serializers.Serializer):
             ("card", "Безналичный (карта)"),
             ("transfer", "Безналичный (перевод)"),
             ("debt", "Долг"),
+            ("split", "Смешанная оплата"),
         ],
         required=False,
         default="cash",
-        help_text="debt — в долг (опционально с предоплатой); иначе нал/безнал.",
+        help_text="debt — в долг; split — payments[] на полную сумму; иначе нал/безнал.",
+    )
+    payments = serializers.ListField(
+        child=serializers.DictField(),
+        required=False,
+        allow_null=True,
+        help_text='При payment_method=split: [{"method":"cash|card|transfer","amount":"100.00"}, ...]',
     )
     discount_amount = serializers.DecimalField(
         max_digits=12, decimal_places=2, required=False, default=Decimal("0"),
@@ -1728,11 +1736,33 @@ class OrderPaySerializer(serializers.Serializer):
         pm = attrs.get("payment_method") or "cash"
         if pm == "debt" and attrs.get("pay_now") is not None:
             raise serializers.ValidationError({"pay_now": "С payment_method=debt используйте prepaid_amount, не pay_now."})
-        if pm != "debt":
+        if pm == "split":
+            if attrs.get("pay_now") is not None or attrs.get("prepaid_amount") is not None:
+                raise serializers.ValidationError({"payments": "При split используйте только payments."})
+            raw = attrs.get("payments") or []
+            if not raw:
+                raise serializers.ValidationError({"payments": "Укажите payments для смешанной оплаты."})
+            normalized = []
+            allowed = {"cash", "card", "transfer"}
+            for i, row in enumerate(raw):
+                method = (row.get("method") or "").strip().lower()
+                if method not in allowed:
+                    raise serializers.ValidationError({f"payments[{i}].method": "Допустимо: cash, card, transfer."})
+                try:
+                    amount = Decimal(str(row.get("amount")).replace(",", "."))
+                except Exception:
+                    raise serializers.ValidationError({f"payments[{i}].amount": "Некорректная сумма."})
+                if amount <= 0:
+                    raise serializers.ValidationError({f"payments[{i}].amount": "Сумма должна быть > 0."})
+                normalized.append({"method": method, "amount": amount})
+            attrs["payments"] = normalized
+        elif pm != "debt":
             if attrs.get("prepaid_amount") is not None:
                 raise serializers.ValidationError({"prepaid_amount": "Только при payment_method=debt."})
             if attrs.get("prepaid_payment_method"):
                 raise serializers.ValidationError({"prepaid_payment_method": "Только при payment_method=debt."})
+            if attrs.get("payments"):
+                raise serializers.ValidationError({"payments": "Только при payment_method=split."})
         prepaid = attrs.get("prepaid_amount")
         if pm == "debt" and prepaid is not None and prepaid > 0 and not attrs.get("prepaid_payment_method"):
             raise serializers.ValidationError(
@@ -2051,20 +2081,141 @@ class CafeReceiptPrinterSettingsSerializer(serializers.ModelSerializer):
 
 class CafeExpenseSerializer(CompanyBranchReadOnlyMixin):
     created_by = serializers.PrimaryKeyRelatedField(read_only=True)
+    category_id = serializers.UUIDField(source="expense_category_id", required=False, allow_null=True)
 
     class Meta:
         model = CafeExpense
         fields = [
-            "id", "company", "branch", "title", "amount", "category",
+            "id", "company", "branch", "title", "amount", "category", "category_slug",
+            "category_id", "source", "source_id",
             "expense_date", "note", "created_by", "created_at",
         ]
-        read_only_fields = ["id", "company", "created_by", "created_at"]
+        read_only_fields = [
+            "id", "company", "created_by", "created_at",
+            "source", "source_id", "category_slug",
+        ]
+
+    def validate(self, attrs):
+        inst = self.instance
+        if inst and inst.source and inst.source != CafeExpense.Source.MANUAL:
+            blocked = {"source", "source_id", "category_slug"}
+            if blocked & set(attrs.keys()):
+                raise serializers.ValidationError(
+                    {"detail": "Автоматический расход нельзя менять (source/category_slug)."}
+                )
+        return attrs
 
     def create(self, validated_data):
         req = self.context.get("request")
         if req and req.user.is_authenticated:
             validated_data["created_by"] = req.user
+        validated_data.setdefault("source", CafeExpense.Source.MANUAL)
         return super().create(validated_data)
+
+
+class CafeExpenseCategorySerializer(CompanyBranchReadOnlyMixin):
+    class Meta:
+        model = CafeExpenseCategory
+        fields = ["id", "company", "branch", "title", "slug", "is_system", "sort_order"]
+        read_only_fields = ["id", "company", "is_system"]
+
+    def get_fields(self):
+        fields = super().get_fields()
+        if self.instance is not None:
+            fields["slug"].read_only = True
+        return fields
+
+
+class WarehouseReceiveSerializer(serializers.Serializer):
+    quantity = serializers.DecimalField(max_digits=12, decimal_places=3)
+    unit_price = serializers.DecimalField(
+        max_digits=12, decimal_places=2, required=False, allow_null=True,
+    )
+    supplier = serializers.UUIDField(required=False, allow_null=True)
+    note = serializers.CharField(required=False, allow_blank=True, default="")
+
+
+class CafeHouseholdItemSerializer(CompanyBranchReadOnlyMixin):
+    class Meta:
+        model = CafeHouseholdItem
+        fields = [
+            "id", "company", "branch", "title", "sku", "unit",
+            "remainder", "minimum", "is_active", "created_at", "updated_at",
+        ]
+        read_only_fields = ["id", "company", "branch", "created_at", "updated_at"]
+
+
+class CafeHouseholdMovementSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = CafeHouseholdMovement
+        fields = [
+            "id", "movement_type", "quantity", "unit_price",
+            "remainder_before", "remainder_after", "note", "created_at",
+        ]
+        read_only_fields = fields
+
+
+class CafeHouseholdReceiveSerializer(serializers.Serializer):
+    quantity = serializers.DecimalField(max_digits=12, decimal_places=3)
+    unit_price = serializers.DecimalField(
+        max_digits=12, decimal_places=2, required=False, allow_null=True,
+    )
+    note = serializers.CharField(required=False, allow_blank=True, default="")
+
+
+class CafeHouseholdWriteOffSerializer(serializers.Serializer):
+    quantity = serializers.DecimalField(max_digits=12, decimal_places=3)
+    note = serializers.CharField(required=False, allow_blank=True, default="")
+
+
+class CafeHouseholdInventoryLineSerializer(serializers.ModelSerializer):
+    difference = serializers.DecimalField(max_digits=12, decimal_places=3, read_only=True)
+    item_title = serializers.CharField(source="item.title", read_only=True)
+
+    class Meta:
+        model = CafeHouseholdInventoryLine
+        fields = ["id", "item", "item_title", "qty_book", "qty_counted", "difference"]
+        read_only_fields = ["id", "qty_book", "difference"]
+
+
+class CafeHouseholdInventorySessionSerializer(CompanyBranchReadOnlyMixin):
+    lines = CafeHouseholdInventoryLineSerializer(many=True, required=False)
+    items = serializers.ListField(write_only=True, required=False)
+    status = serializers.CharField(read_only=True)
+
+    class Meta:
+        model = CafeHouseholdInventorySession
+        fields = [
+            "id", "company", "branch", "status", "comment",
+            "created_by", "created_at", "confirmed_at", "lines",
+        ]
+        read_only_fields = ["id", "company", "created_by", "created_at", "confirmed_at", "status"]
+
+    def create(self, validated_data):
+        items_payload = validated_data.pop("items", None)
+        lines_data = validated_data.pop("lines", None)
+        if lines_data is None:
+            lines_data = items_payload or []
+        req = self.context.get("request")
+        if req and req.user.is_authenticated:
+            validated_data["created_by"] = req.user
+        session = super().create(validated_data)
+        company = session.company
+        for row in lines_data:
+            item_id = row.get("item") if isinstance(row, dict) else None
+            qty_counted = row.get("qty_counted") if isinstance(row, dict) else None
+            if not item_id:
+                continue
+            item = CafeHouseholdItem.objects.filter(company=company, pk=item_id).first()
+            if not item:
+                raise serializers.ValidationError({"items": f"Позиция {item_id} не найдена."})
+            CafeHouseholdInventoryLine.objects.create(
+                session=session,
+                item=item,
+                qty_book=item.remainder,
+                qty_counted=Decimal(str(qty_counted)),
+            )
+        return session
 
 
 class CafeWaiterPayProfileSerializer(CompanyBranchReadOnlyMixin):

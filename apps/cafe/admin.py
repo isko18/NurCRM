@@ -12,7 +12,11 @@ from .models import (
     InventorySession, InventoryItem,
     Equipment, EquipmentInventorySession, EquipmentInventoryItem, Kitchen,
     CafeReceiptPrinterSettings,
-    CafeExpense, CafeWaiterPayProfile,
+    CafeExpense, CafeExpenseCategory, CafeWaiterPayProfile,
+    WarehouseMovement,
+    CafeHouseholdItem, CafeHouseholdMovement,
+    CafeHouseholdInventorySession, CafeHouseholdInventoryLine,
+    OrderCheckoutPayment,
     Preparation, PreparationIngredient, PreparationProcessing,
 )
 
@@ -473,13 +477,51 @@ class WarehouseAdmin(admin.ModelAdmin):
     ordering = ("company", "branch", "title")
 
 
+@admin.register(CafeExpenseCategory)
+class CafeExpenseCategoryAdmin(admin.ModelAdmin):
+    list_display = ("title", "slug", "is_system", "company", "branch", "sort_order")
+    list_filter = ("company", "is_system")
+    search_fields = ("title", "slug")
+
+
 @admin.register(CafeExpense)
 class CafeExpenseAdmin(admin.ModelAdmin):
-    list_display = ("title", "amount", "expense_date", "category", "company", "branch", "created_at")
-    list_filter = ("company", "branch", "expense_date")
+    list_display = ("title", "amount", "expense_date", "category", "source", "company", "branch", "created_at")
+    list_filter = ("company", "branch", "expense_date", "source", "category_slug")
     search_fields = ("title", "category", "note")
     ordering = ("-expense_date", "-created_at")
-    raw_id_fields = ("company", "branch", "created_by")
+    raw_id_fields = ("company", "branch", "created_by", "expense_category")
+
+
+@admin.register(WarehouseMovement)
+class WarehouseMovementAdmin(admin.ModelAdmin):
+    list_display = ("warehouse", "movement_type", "quantity", "unit_price", "created_at")
+    list_filter = ("movement_type",)
+    raw_id_fields = ("warehouse", "expense", "created_by")
+
+
+@admin.register(CafeHouseholdItem)
+class CafeHouseholdItemAdmin(admin.ModelAdmin):
+    list_display = ("title", "unit", "remainder", "minimum", "company", "branch", "is_active")
+    list_filter = ("company", "branch", "is_active")
+    search_fields = ("title", "sku")
+
+
+@admin.register(CafeHouseholdMovement)
+class CafeHouseholdMovementAdmin(admin.ModelAdmin):
+    list_display = ("item", "movement_type", "quantity", "created_at")
+    list_filter = ("movement_type",)
+
+
+@admin.register(CafeHouseholdInventorySession)
+class CafeHouseholdInventorySessionAdmin(admin.ModelAdmin):
+    list_display = ("id", "company", "branch", "status", "created_at", "confirmed_at")
+    list_filter = ("status", "company")
+
+
+@admin.register(OrderCheckoutPayment)
+class OrderCheckoutPaymentAdmin(admin.ModelAdmin):
+    list_display = ("order", "payment_method", "amount", "created_at")
 
 
 @admin.register(CafeWaiterPayProfile)

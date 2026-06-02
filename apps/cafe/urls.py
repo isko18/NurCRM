@@ -42,7 +42,7 @@ from .views import (
 
 from apps.cafe.analytics import (
     KitchenAnalyticsByCookView, KitchenAnalyticsByWaiterView,
-    SalesSummaryView, SalesByMenuItemView, SalesByCategoryView,
+    SalesSummaryView, SalesDynamicsView, SalesByMenuItemView, SalesByCategoryView,
     SalesByKitchenView, RevenueInflowView, RejectionsAnalyticsView,
     CancelledOrdersAnalyticsView,
     CafeExpensesSummaryView, CafeFinanceAnalyticsView, CafeDebtAnalyticsView,
@@ -54,6 +54,20 @@ from apps.cafe.analytics import (
 )
 
 from apps.cafe.showcase.views_public import PublicCafeInfoAPIView, PublicCafeMenuAPIView, PublicCafeMenuItemsAPIView
+
+from apps.cafe.household_views import (
+    CafeExpenseCategoryListCreateView,
+    CafeExpenseCategoryRetrieveUpdateDestroyView,
+    WarehouseReceiveView,
+    CafeHouseholdItemListCreateView,
+    CafeHouseholdItemRetrieveUpdateDestroyView,
+    CafeHouseholdMovementListView,
+    CafeHouseholdReceiveView,
+    CafeHouseholdWriteOffView,
+    CafeHouseholdInventorySessionListCreateView,
+    CafeHouseholdInventorySessionRetrieveUpdateView,
+    CafeHouseholdInventorySessionConfirmView,
+)
 
 app_name = "cafe"
 
@@ -85,6 +99,52 @@ urlpatterns = [
     path("warehouse/", WarehouseListCreateView.as_view(), name="warehouse-list"),
     path("warehouse/<uuid:pk>/", WarehouseRetrieveUpdateDestroyView.as_view(), name="warehouse-detail"),
     path("warehouse/<uuid:pk>/adjust/", WarehouseStockAdjustView.as_view(), name="warehouse-stock-adjust"),
+    path("warehouse/<uuid:pk>/receive/", WarehouseReceiveView.as_view(), name="warehouse-receive"),
+
+    path("expense-categories/", CafeExpenseCategoryListCreateView.as_view(), name="cafe-expense-category-list"),
+    path(
+        "expense-categories/<uuid:pk>/",
+        CafeExpenseCategoryRetrieveUpdateDestroyView.as_view(),
+        name="cafe-expense-category-detail",
+    ),
+
+    path("household-items/", CafeHouseholdItemListCreateView.as_view(), name="cafe-household-item-list"),
+    path(
+        "household-items/<uuid:pk>/",
+        CafeHouseholdItemRetrieveUpdateDestroyView.as_view(),
+        name="cafe-household-item-detail",
+    ),
+    path(
+        "household-items/<uuid:pk>/movements/",
+        CafeHouseholdMovementListView.as_view(),
+        name="cafe-household-item-movements",
+    ),
+    path(
+        "household-items/<uuid:pk>/receive/",
+        CafeHouseholdReceiveView.as_view(),
+        name="cafe-household-item-receive",
+    ),
+    path(
+        "household-items/<uuid:pk>/write-off/",
+        CafeHouseholdWriteOffView.as_view(),
+        name="cafe-household-item-write-off",
+    ),
+
+    path(
+        "household-inventory/sessions/",
+        CafeHouseholdInventorySessionListCreateView.as_view(),
+        name="cafe-household-inventory-session-list",
+    ),
+    path(
+        "household-inventory/sessions/<uuid:pk>/",
+        CafeHouseholdInventorySessionRetrieveUpdateView.as_view(),
+        name="cafe-household-inventory-session-detail",
+    ),
+    path(
+        "household-inventory/sessions/<uuid:pk>/confirm/",
+        CafeHouseholdInventorySessionConfirmView.as_view(),
+        name="cafe-household-inventory-session-confirm",
+    ),
 
     # === Purchases ===
     path("purchases/", PurchaseListCreateView.as_view(), name="purchase-list"),
@@ -199,6 +259,7 @@ urlpatterns = [
     path("kitchen/analytics/waiters/", KitchenAnalyticsByWaiterView.as_view()),
 
     path("analytics/sales/summary/", SalesSummaryView.as_view()),
+    path("analytics/sales/dynamics/", SalesDynamicsView.as_view(), name="cafe-analytics-sales-dynamics"),
     path("analytics/sales/items/", SalesByMenuItemView.as_view()),
     path("analytics/menu/all/", MenuAnalyticsAllView.as_view(), name="cafe-analytics-menu-all"),
     path("analytics/sales/categories/", SalesByCategoryView.as_view(), name="cafe-analytics-sales-categories"),

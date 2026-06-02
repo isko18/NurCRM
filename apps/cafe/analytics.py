@@ -23,7 +23,7 @@ from django.db.models import (
     ExpressionWrapper, DurationField, DecimalField, Value, IntegerField,
     OuterRef, Subquery,
 )
-from django.db.models.functions import Coalesce
+from django.db.models.functions import Coalesce, TruncDate, TruncWeek, TruncMonth
 from django.utils import timezone
 
 from apps.cafe.models import (
@@ -561,6 +561,212 @@ class KitchenAnalyticsByWaiterView(KitchenAnalyticsBaseView):
 # ==========================
 # SALES ANALYTICS
 # ==========================
+def _parse_ymd_param(s: str | None) -> date | None:
+    if not s:
+        return None
+    try:
+        return datetime.strptime(str(s).strip()[:10], "%Y-%m-%d").date()
+    except ValueError:
+        return None
+
+
+def _sales_dynamics_period(df: date, dt: date, period_param: str | None) -> str:
+    if period_param:
+        p = period_param.strip().lower()
+        if p not in ("day", "week", "month"):
+            raise ValueError("invalid_period")
+        return p
+    days = (dt - df).days + 1
+    return "day" if days <= 62 else "week"
+
+
+def _sales_dynamics_buckets(df: date, dt: date, period: str) -> list[tuple[date, date, str]]:
+    """(bucket_start, bucket_end, label) включительно по календарным дням."""
+    out: list[tuple[date, date, str]] = []
+    if period == "day":
+        cur = df
+        while cur <= dt:
+            out.append((cur, cur, str(cur)))
+            cur += timedelta(days=1)
+        return out
+
+    if period == "week":
+        cur = df - timedelta(days=df.weekday())
+        while cur <= dt:
+            end = min(cur + timedelta(days=6), dt)
+            label = str(cur) if cur == end else f"{cur}—{end}"
+            out.append((cur, end, label))
+            cur += timedelta(days=7)
+        return out
+
+    # month
+    cur = df.replace(day=1)
+    while cur <= dt:
+        if cur.month == 12:
+            next_month = cur.replace(year=cur.year + 1, month=1, day=1)
+        else:
+            next_month = cur.replace(month=cur.month + 1, day=1)
+        end = min(next_month - timedelta(days=1), dt)
+        start = max(cur, df)
+        label = cur.strftime("%Y-%m")
+        out.append((start, end, label))
+        cur = next_month
+    return out
+
+
+def _bucket_key_from_trunc(value, period: str) -> date | None:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        d = value.date()
+    elif isinstance(value, date):
+        d = value
+    else:
+        return None
+    if period == "week":
+        return d - timedelta(days=d.weekday())
+    if period == "month":
+        return d.replace(day=1)
+    return d
+
+
+class SalesDynamicsView(CompanyBranchQuerysetMixin, APIView):
+    """
+    GET /api/cafe/analytics/sales/dynamics/
+    Ряд точек для графика «Динамика продаж» + totals за период (как sales/summary/).
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request):
+        qp = _query_params(request)
+        df_s = (qp.get("date_from") or "").strip()
+        dt_s = (qp.get("date_to") or "").strip()
+        if not df_s or not dt_s:
+            return Response({"detail": "Укажите date_from и date_to (YYYY-MM-DD)."}, status=400)
+
+        df = _parse_ymd_param(df_s)
+        dt = _parse_ymd_param(dt_s)
+        if df is None or dt is None:
+            return Response({"detail": "Некорректный формат дат. Используйте YYYY-MM-DD."}, status=400)
+        if df > dt:
+            return Response({"detail": "date_from не может быть позже date_to."}, status=400)
+
+        period_param = (qp.get("period") or "").strip() or None
+        try:
+            period = _sales_dynamics_period(df, dt, period_param)
+        except ValueError:
+            return Response(
+                {"detail": "period должен быть day, week или month."},
+                status=400,
+            )
+
+        span_days = (dt - df).days + 1
+        if period == "day" and span_days > 366:
+            return Response(
+                {"detail": "Слишком большой диапазон для period=day. Укажите period=week."},
+                status=400,
+            )
+
+        company = self._user_company()
+        if not company:
+            return Response({
+                "date_from": df_s,
+                "date_to": dt_s,
+                "period": period,
+                "basis": "paid_at",
+                "totals": {"orders_count": 0, "items_qty": 0, "revenue": "0.00"},
+                "series": [],
+            })
+
+        branch = self._active_branch()
+        waiter_scope_id = _analytics_waiter_scope(request)
+        key = _cache_key(
+            "sales:dynamics",
+            company_id=str(company.id),
+            branch_id=str(branch.id) if branch else None,
+            params={
+                "date_from": df_s,
+                "date_to": dt_s,
+                "period": period,
+                "waiter_scope_id": str(waiter_scope_id) if waiter_scope_id else None,
+            },
+        )
+        hit = _cache_get(key)
+        if hit is not None:
+            return Response(hit)
+
+        oq = Order.objects.filter(company=company, is_paid=True)
+        if branch is not None:
+            oq = oq.filter(branch=branch)
+        else:
+            oq = oq.filter(branch__isnull=True)
+        oq, _ = _apply_waiter_scope(oq, request, "waiter_id")
+        oq = _apply_date_range(oq, "paid_at", df_s, dt_s)
+
+        lq = _paid_order_lines_qs(company, branch)
+        lq, _ = _apply_waiter_scope(lq, request, "order__waiter_id")
+        lq = _apply_date_range(lq, "order__paid_at", df_s, dt_s)
+        net_qty = _line_net_quantity_expr()
+
+        if period == "day":
+            trunc_o, trunc_l = TruncDate("paid_at"), TruncDate("order__paid_at")
+        elif period == "week":
+            trunc_o, trunc_l = TruncWeek("paid_at"), TruncWeek("order__paid_at")
+        else:
+            trunc_o, trunc_l = TruncMonth("paid_at"), TruncMonth("order__paid_at")
+
+        order_by_bucket = {
+            _bucket_key_from_trunc(r["bucket"], period): r
+            for r in oq.annotate(bucket=trunc_o)
+            .values("bucket")
+            .annotate(
+                orders_count=Count("id"),
+                revenue=Sum(_order_net_revenue_expr()),
+            )
+        }
+        line_by_bucket = {
+            _bucket_key_from_trunc(r["bucket"], period): r
+            for r in lq.annotate(bucket=trunc_l)
+            .values("bucket")
+            .annotate(items_qty=Sum(net_qty))
+        }
+
+        order_totals = oq.aggregate(
+            orders_count=Count("id"),
+            revenue=Sum(_order_net_revenue_expr()),
+        )
+        line_totals = lq.aggregate(items_qty=Sum(net_qty))
+
+        buckets = _sales_dynamics_buckets(df, dt, period)
+        series = []
+        for b_start, b_end, label in buckets:
+            o_row = order_by_bucket.get(b_start) or {}
+            l_row = line_by_bucket.get(b_start) or {}
+            series.append({
+                "label": label,
+                "date_from": str(b_start),
+                "date_to": str(b_end),
+                "orders_count": int(o_row.get("orders_count") or 0),
+                "items_qty": int(l_row.get("items_qty") or 0),
+                "revenue": f"{_to_decimal(o_row.get('revenue')):.2f}",
+            })
+
+        payload = {
+            "date_from": df_s,
+            "date_to": dt_s,
+            "period": period,
+            "basis": "paid_at",
+            "totals": {
+                "orders_count": int(order_totals.get("orders_count") or 0),
+                "items_qty": int(line_totals.get("items_qty") or 0),
+                "revenue": f"{_to_decimal(order_totals.get('revenue')):.2f}",
+            },
+            "series": series,
+        }
+        _cache_set(key, payload, _analytics_ttl())
+        return Response(payload)
+
+
 class SalesSummaryView(CompanyBranchQuerysetMixin, APIView):
     permission_classes = [permissions.IsAuthenticated]
 
@@ -1344,6 +1550,8 @@ class CafeExpensesSummaryView(CompanyBranchQuerysetMixin, APIView):
                 "title": e.title,
                 "amount": f"{_to_decimal(e.amount):.2f}",
                 "category": e.category or "",
+                "category_slug": e.category_slug or "",
+                "source": e.source or "",
                 "expense_date": str(e.expense_date),
                 "note": (e.note or "")[:500],
                 "created_by": cb,

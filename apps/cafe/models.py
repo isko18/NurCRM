@@ -451,6 +451,43 @@ class Warehouse(models.Model):
         return f"{self.title} - осталось {self.remainder}"
 
 
+class WarehouseMovement(models.Model):
+    """Журнал движений склада продуктов (оприходование / корректировка)."""
+
+    class MovementType(models.TextChoices):
+        IN = "in", "Приход"
+        ADJUST = "adjust", "Корректировка"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    warehouse = models.ForeignKey(
+        Warehouse, on_delete=models.CASCADE,
+        related_name="movements", verbose_name="Позиция склада",
+    )
+    movement_type = models.CharField(max_length=16, choices=MovementType.choices)
+    quantity = models.DecimalField(max_digits=12, decimal_places=3)
+    unit_price = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal("0"))
+    remainder_before = models.CharField(max_length=255)
+    remainder_after = models.CharField(max_length=255)
+    note = models.TextField(blank=True, default="")
+    expense = models.ForeignKey(
+        "CafeExpense", on_delete=models.SET_NULL,
+        null=True, blank=True, related_name="warehouse_movements",
+    )
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL,
+        null=True, blank=True, related_name="cafe_warehouse_movements",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        verbose_name = "Движение склада кафе"
+        verbose_name_plural = "Движения склада кафе"
+        ordering = ["-created_at"]
+        indexes = [
+            models.Index(fields=["warehouse", "created_at"]),
+        ]
+
+
 class Purchase(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     company = models.ForeignKey(
@@ -1192,6 +1229,7 @@ class Order(models.Model):
         CARD = "card", "Безналичный (карта)"
         TRANSFER = "transfer", "Безналичный (перевод)"
         DEBT = "debt", "Долг"
+        SPLIT = "split", "Смешанная оплата"
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     company = models.ForeignKey(
@@ -1748,8 +1786,54 @@ class OrderRefund(models.Model):
         return f"{self.amount} → order {str(self.order_id)[:8]}"
 
 
+class CafeExpenseCategory(models.Model):
+    """Категории операционных расходов кафе (в т.ч. системные)."""
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    company = models.ForeignKey(
+        Company, on_delete=models.CASCADE,
+        related_name="cafe_expense_categories", verbose_name="Компания",
+    )
+    branch = models.ForeignKey(
+        Branch, on_delete=models.CASCADE,
+        related_name="cafe_expense_categories", verbose_name="Филиал",
+        null=True, blank=True, db_index=True,
+    )
+    title = models.CharField(max_length=128)
+    slug = models.SlugField(max_length=64)
+    is_system = models.BooleanField(default=False, db_index=True)
+    sort_order = models.IntegerField(default=0)
+
+    class Meta:
+        verbose_name = "Категория расхода кафе"
+        verbose_name_plural = "Категории расходов кафе"
+        ordering = ["sort_order", "title"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["company", "slug"],
+                name="uniq_cafe_expense_category_slug_per_company",
+            ),
+        ]
+        indexes = [
+            models.Index(fields=["company", "branch"]),
+        ]
+
+    def clean(self):
+        if self.branch_id and self.branch.company_id != self.company_id:
+            raise ValidationError({"branch": "Филиал другой компании."})
+
+    def __str__(self):
+        return self.title
+
+
 class CafeExpense(models.Model):
     """Операционные расходы кафе (не закупки Purchase)."""
+
+    class Source(models.TextChoices):
+        MANUAL = "manual", "Вручную"
+        WAREHOUSE_RECEIPT = "warehouse_receipt", "Оприходование склада"
+        WAREHOUSE_CREATE = "warehouse_create", "Создание позиции склада"
+        HOUSEHOLD_RECEIPT = "household_receipt", "Оприходование посуды"
+
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     company = models.ForeignKey(
         Company, on_delete=models.CASCADE,
@@ -1766,6 +1850,16 @@ class CafeExpense(models.Model):
         validators=[MinValueValidator(Decimal("0.01"))],
     )
     category = models.CharField("Категория", max_length=128, blank=True, default="")
+    category_slug = models.CharField("Slug категории", max_length=64, blank=True, default="")
+    expense_category = models.ForeignKey(
+        CafeExpenseCategory, on_delete=models.SET_NULL,
+        null=True, blank=True, related_name="expenses", verbose_name="Категория (справочник)",
+    )
+    source = models.CharField(
+        "Источник", max_length=32,
+        choices=Source.choices, default=Source.MANUAL, db_index=True,
+    )
+    source_id = models.UUIDField("ID источника", null=True, blank=True, db_index=True)
     expense_date = models.DateField("Дата расхода", db_index=True)
     note = models.TextField("Примечание", blank=True, default="")
     created_by = models.ForeignKey(
@@ -1781,6 +1875,14 @@ class CafeExpense(models.Model):
         indexes = [
             models.Index(fields=["company", "expense_date"]),
             models.Index(fields=["company", "branch", "expense_date"]),
+            models.Index(fields=["company", "source", "source_id"]),
+        ]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["company", "source", "source_id"],
+                condition=Q(source_id__isnull=False) & ~Q(source="manual"),
+                name="uniq_cafe_expense_auto_source",
+            ),
         ]
 
     def clean(self):
@@ -2239,3 +2341,196 @@ class CafeReceiptPrinterSettings(models.Model):
 
     def __str__(self):
         return f"Принтер кассы: {self.company}"
+
+
+# ==========================
+# Посуда и расходники (household)
+# ==========================
+class CafeHouseholdItem(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    company = models.ForeignKey(
+        Company, on_delete=models.CASCADE,
+        related_name="cafe_household_items", verbose_name="Компания",
+    )
+    branch = models.ForeignKey(
+        Branch, on_delete=models.CASCADE,
+        related_name="cafe_household_items", verbose_name="Филиал",
+        null=True, blank=True, db_index=True,
+    )
+    title = models.CharField(max_length=255)
+    sku = models.CharField(max_length=64, blank=True, default="")
+    unit = models.CharField(max_length=32, default="шт")
+    remainder = models.DecimalField(max_digits=12, decimal_places=3, default=Decimal("0"))
+    minimum = models.DecimalField(max_digits=12, decimal_places=3, default=Decimal("0"))
+    is_active = models.BooleanField(default=True, db_index=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = "Посуда / расходник"
+        verbose_name_plural = "Посуда и расходники"
+        ordering = ["title"]
+        indexes = [
+            models.Index(fields=["company", "branch", "is_active"]),
+            models.Index(fields=["company", "title"]),
+        ]
+
+    def clean(self):
+        if self.branch_id and self.branch.company_id != self.company_id:
+            raise ValidationError({"branch": "Филиал другой компании."})
+
+    def __str__(self):
+        return self.title
+
+
+class CafeHouseholdMovement(models.Model):
+    class MovementType(models.TextChoices):
+        IN = "in", "Приход"
+        OUT = "out", "Списание"
+        ADJUST = "adjust", "Корректировка (инвентаризация)"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    item = models.ForeignKey(
+        CafeHouseholdItem, on_delete=models.CASCADE,
+        related_name="movements", verbose_name="Позиция",
+    )
+    movement_type = models.CharField(max_length=16, choices=MovementType.choices)
+    quantity = models.DecimalField(max_digits=12, decimal_places=3)
+    unit_price = models.DecimalField(
+        max_digits=12, decimal_places=2, null=True, blank=True,
+    )
+    remainder_before = models.DecimalField(max_digits=12, decimal_places=3)
+    remainder_after = models.DecimalField(max_digits=12, decimal_places=3)
+    note = models.TextField(blank=True, default="")
+    expense = models.ForeignKey(
+        CafeExpense, on_delete=models.SET_NULL,
+        null=True, blank=True, related_name="household_movements",
+    )
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL,
+        null=True, blank=True, related_name="cafe_household_movements",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        verbose_name = "Движение посуды"
+        verbose_name_plural = "Движения посуды"
+        ordering = ["-created_at"]
+
+
+class CafeHouseholdInventorySession(models.Model):
+    class Status(models.TextChoices):
+        DRAFT = "draft", "Черновик"
+        CONFIRMED = "confirmed", "Проведён"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    company = models.ForeignKey(
+        Company, on_delete=models.CASCADE,
+        related_name="cafe_household_inventory_sessions", verbose_name="Компания",
+    )
+    branch = models.ForeignKey(
+        Branch, on_delete=models.CASCADE,
+        related_name="cafe_household_inventory_sessions", verbose_name="Филиал",
+        null=True, blank=True, db_index=True,
+    )
+    status = models.CharField(
+        max_length=16, choices=Status.choices, default=Status.DRAFT, db_index=True,
+    )
+    comment = models.TextField(blank=True, default="")
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL,
+        null=True, blank=True, related_name="cafe_household_inventory_created",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    confirmed_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        verbose_name = "Инвентаризация посуды"
+        verbose_name_plural = "Инвентаризации посуды"
+        ordering = ["-created_at"]
+
+    def confirm(self, user=None):
+        if self.status == self.Status.CONFIRMED:
+            return {"lines_total": 0, "adjusted_count": 0}
+        adjusted = 0
+        for line in self.lines.select_related("item"):
+            delta = (line.qty_counted or Decimal("0")) - (line.qty_book or Decimal("0"))
+            if delta == 0:
+                continue
+            item = line.item
+            before = item.remainder
+            after = before + delta
+            if after < 0:
+                raise ValidationError(
+                    {"detail": f"Недостаточный остаток по «{item.title}» после инвентаризации."}
+                )
+            movement = CafeHouseholdMovement.objects.create(
+                item=item,
+                movement_type=CafeHouseholdMovement.MovementType.ADJUST,
+                quantity=abs(delta),
+                remainder_before=before,
+                remainder_after=after,
+                note=f"Инвентаризация {self.id}",
+                created_by=user,
+            )
+            item.remainder = after
+            item.save(update_fields=["remainder", "updated_at"])
+            line.movement = movement
+            line.save(update_fields=["movement"])
+            adjusted += 1
+        self.status = self.Status.CONFIRMED
+        self.confirmed_at = timezone.now()
+        self.save(update_fields=["status", "confirmed_at"])
+        return {
+            "lines_total": self.lines.count(),
+            "adjusted_count": adjusted,
+        }
+
+
+class CafeHouseholdInventoryLine(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    session = models.ForeignKey(
+        CafeHouseholdInventorySession, on_delete=models.CASCADE,
+        related_name="lines", verbose_name="Сессия",
+    )
+    item = models.ForeignKey(
+        CafeHouseholdItem, on_delete=models.CASCADE,
+        related_name="inventory_lines", verbose_name="Позиция",
+    )
+    qty_book = models.DecimalField(max_digits=12, decimal_places=3)
+    qty_counted = models.DecimalField(max_digits=12, decimal_places=3)
+    movement = models.ForeignKey(
+        CafeHouseholdMovement, on_delete=models.SET_NULL,
+        null=True, blank=True, related_name="inventory_lines",
+    )
+
+    class Meta:
+        verbose_name = "Строка инвентаризации посуды"
+        verbose_name_plural = "Строки инвентаризации посуды"
+        constraints = [
+            models.UniqueConstraint(
+                fields=["session", "item"],
+                name="uniq_household_inventory_line_per_session_item",
+            ),
+        ]
+
+    @property
+    def difference(self):
+        return (self.qty_counted or Decimal("0")) - (self.qty_book or Decimal("0"))
+
+
+class OrderCheckoutPayment(models.Model):
+    """Части смешанной оплаты заказа (payment_method=split)."""
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    order = models.ForeignKey(
+        "Order", on_delete=models.CASCADE,
+        related_name="checkout_payments", verbose_name="Заказ",
+    )
+    payment_method = models.CharField(max_length=32)
+    amount = models.DecimalField(max_digits=12, decimal_places=2)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        verbose_name = "Часть оплаты заказа"
+        verbose_name_plural = "Части оплаты заказа"
+        ordering = ["created_at"]

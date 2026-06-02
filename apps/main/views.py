@@ -32,6 +32,7 @@ from apps.main.services.item_make_processing import (
     item_make_recipe_ready_filter,
     assert_item_make_recipe_ready,
 )
+from apps.main.services.product_list_filters import apply_product_list_filters
 
 from apps.users.models import Branch, User
 
@@ -762,6 +763,8 @@ class ProductListView(CompanyBranchRestrictedMixin, generics.ListAPIView):
         hk = (qp.get("hotkey_group") or qp.get("group") or "").strip().upper()
         if hk and any(hk == c[0] for c in Product.HotkeyGroup.choices):
             qs = qs.filter(hotkey_group=hk)
+
+        qs = apply_product_list_filters(qs, qp)
 
         # Всегда: избранные сверху. Дальше — стандартная сортировка (ordering filter / default ordering).
         current = list(qs.query.order_by) or []
