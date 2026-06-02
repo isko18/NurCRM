@@ -1292,6 +1292,27 @@ def has_active_stock_partnership_between_ids(company_id_a, company_id_b) -> bool
     return CompanyStockPartnership.objects.filter(company_a_id=id_lo, company_b_id=id_hi).exists()
 
 
+def list_active_stock_partner_companies(company):
+    """
+    Компании с активным складским партнёрством для `company`.
+    Тот же набор, что возвращает GET /api/warehouse/stock-partnerships/active/.
+    """
+    if not company:
+        return []
+    qs = CompanyStockPartnership.objects.filter(
+        Q(company_a=company) | Q(company_b=company)
+    ).select_related("company_a", "company_b")
+    partners = []
+    seen = set()
+    for row in qs:
+        partner = row.company_b if row.company_a_id == company.id else row.company_a
+        if partner.id in seen:
+            continue
+        seen.add(partner.id)
+        partners.append(partner)
+    return partners
+
+
 class DocumentSequence(models.Model):
     doc_type = models.CharField(max_length=32, verbose_name="Тип документа")
     date = models.DateField(verbose_name="Дата")

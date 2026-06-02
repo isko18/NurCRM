@@ -82,6 +82,8 @@ from .views_analytics import (
     WarehouseOwnerAgentAnalyticsAPIView,
     WarehouseOwnerAgentsSalesAnalyticsAPIView,
     WarehouseOwnerOverallAnalyticsAPIView,
+    WarehouseOwnerPartnersAnalyticsAPIView,
+    WarehouseOwnerPartnerAnalyticsAPIView,
 )
 
 urlpatterns = [
@@ -177,6 +179,12 @@ urlpatterns += [
     path("owner/agents/<uuid:agent_id>/analytics/", WarehouseOwnerAgentAnalyticsAPIView.as_view(), name="warehouse-owner-agent-analytics"),
     path("owner/agents/analytics/", WarehouseOwnerAgentsSalesAnalyticsAPIView.as_view(), name="warehouse-owner-agents-sales-analytics"),
     path("owner/analytics/", WarehouseOwnerOverallAnalyticsAPIView.as_view(), name="warehouse-owner-analytics"),
+    path("owner/partners/analytics/", WarehouseOwnerPartnersAnalyticsAPIView.as_view(), name="warehouse-owner-partners-analytics"),
+    path(
+        "owner/partners/<uuid:partner_company_id>/analytics/",
+        WarehouseOwnerPartnerAnalyticsAPIView.as_view(),
+        name="warehouse-owner-partner-analytics",
+    ),
 ]
 
 urlpatterns += [

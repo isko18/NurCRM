@@ -154,6 +154,15 @@ def _company_display_name(company) -> str:
     return (getattr(company, "llc", None) or getattr(company, "name", None) or "").strip() or "Компания"
 
 
+def _apply_branch_scope(qs, branch, *, path: str = "branch", all_branches: bool = False):
+    """Фильтр по филиалу: один филиал, только глобальные (branch IS NULL) или вся компания."""
+    if all_branches:
+        return qs
+    if branch is not None:
+        return qs.filter(**{path: branch})
+    return qs.filter(**{f"{path}__isnull": True})
+
+
 def _build_agent_counterparty_debts(*, company, branch, agent, limit: int = 200):
     """
     Текущие сальдо по контрагентам агента (проведённые товарные и денежные документы).
@@ -326,7 +335,7 @@ def _build_sales_by_group(*, sales_items_qs, limit: int = 100):
     return rows, top
 
 
-def _build_owner_cash_analytics(*, company, branch, dt_from, dt_to_excl, group_by: str):
+def _build_owner_cash_analytics(*, company, branch, dt_from, dt_to_excl, group_by: str, all_branches: bool = False):
     """
     Аналитика по кассе (MoneyDocument) для owner/admin.
     Считаем только проведённые документы за период: приход/расход, сальдо,
@@ -339,10 +348,7 @@ def _build_owner_cash_analytics(*, company, branch, dt_from, dt_to_excl, group_b
         date__gte=dt_from,
         date__lt=dt_to_excl,
     )
-    if branch is not None:
-        money_qs = money_qs.filter(branch=branch)
-    else:
-        money_qs = money_qs.filter(branch__isnull=True)
+    money_qs = _apply_branch_scope(money_qs, branch, all_branches=all_branches)
 
     totals = money_qs.aggregate(
         receipt=Coalesce(Sum("amount", filter=Q(doc_type=wm.MoneyDocument.DocType.MONEY_RECEIPT)), ZERO_MONEY),
@@ -717,16 +723,14 @@ def build_owner_warehouse_analytics_payload(
     date_from: date,
     date_to: date,
     group_by: str = "day",
+    all_branches: bool = False,
 ):
     company = Company.objects.get(id=company_id)
     branch = Branch.objects.get(id=branch_id) if branch_id else None
     dt_from, dt_to_excl = _dt_range(date_from, date_to)
 
     req_qs = wm.AgentRequestCart.objects.filter(company=company)
-    if branch is not None:
-        req_qs = req_qs.filter(branch=branch)
-    else:
-        req_qs = req_qs.filter(branch__isnull=True)
+    req_qs = _apply_branch_scope(req_qs, branch, all_branches=all_branches)
 
     approved_qs = req_qs.filter(
         approved_at__gte=dt_from,
@@ -747,18 +751,14 @@ def build_owner_warehouse_analytics_payload(
         date__gte=dt_from,
         date__lt=dt_to_excl,
     )
-    if branch is not None:
-        sales_qs = sales_qs.filter(warehouse_from__branch=branch)
-    else:
-        sales_qs = sales_qs.filter(warehouse_from__branch__isnull=True)
+    sales_qs = _apply_branch_scope(
+        sales_qs, branch, path="warehouse_from__branch", all_branches=all_branches
+    )
     sales_count = sales_qs.count()
     sales_amount = sales_qs.aggregate(s=Coalesce(Sum("total"), ZERO_MONEY))["s"] or Decimal("0.00")
 
     on_hand_qs = wm.AgentStockBalance.objects.select_related("product", "agent").filter(company=company)
-    if branch is not None:
-        on_hand_qs = on_hand_qs.filter(branch=branch)
-    else:
-        on_hand_qs = on_hand_qs.filter(branch__isnull=True)
+    on_hand_qs = _apply_branch_scope(on_hand_qs, branch, all_branches=all_branches)
 
     on_hand_qty = on_hand_qs.aggregate(
         s=Coalesce(Sum("qty", output_field=QTY_FIELD), ZERO_QTY)
@@ -906,10 +906,7 @@ def build_owner_warehouse_analytics_payload(
     }
 
     warehouses_qs = wm.Warehouse.objects.filter(company=company)
-    if branch is not None:
-        warehouses_qs = warehouses_qs.filter(branch=branch)
-    else:
-        warehouses_qs = warehouses_qs.filter(branch__isnull=True)
+    warehouses_qs = _apply_branch_scope(warehouses_qs, branch, all_branches=all_branches)
 
     warehouses = []
     for wh in warehouses_qs:
@@ -933,12 +930,15 @@ def build_owner_warehouse_analytics_payload(
         dt_from=dt_from,
         dt_to_excl=dt_to_excl,
         group_by=group_by,
+        all_branches=all_branches,
     )
 
     return {
         "period": period,
         "date_from": str(date_from),
         "date_to": str(date_to),
+        "all_branches": all_branches,
+        "branch_id": str(branch.id) if branch else None,
         "summary": {
             "requests_approved": approved_qs.count(),
             "items_approved": str(items_approved_qty),
@@ -1070,4 +1070,78 @@ def build_owner_agents_sales_analytics_payload(
             "order_by": order_key,
         },
         "agents": agents,
+    }
+
+
+@cached_result(timeout=settings.CACHE_TIMEOUT_ANALYTICS, key_prefix="warehouse_analytics_owner_partners_list")
+def build_owner_partners_warehouse_analytics_list_payload(
+    *,
+    owner_company_id: str,
+    period: str,
+    date_from: date,
+    date_to: date,
+):
+    """
+    Сводная аналитика по всем компаниям-партнёрам (складское партнёрство) за период.
+    По умолчанию агрегирует данные партнёра по всем филиалам.
+    """
+    owner = Company.objects.get(id=owner_company_id)
+    partners = []
+    for company in wm.list_active_stock_partner_companies(owner):
+        partner_id = str(company.id)
+        analytics = build_owner_warehouse_analytics_payload(
+            company_id=partner_id,
+            branch_id=None,
+            period=period,
+            date_from=date_from,
+            date_to=date_to,
+            group_by="day",
+            all_branches=True,
+        )
+        partners.append(
+            {
+                "partner_company_id": partner_id,
+                "partner_company_name": company.name or _company_display_name(company),
+                "summary": analytics.get("summary") or {},
+            }
+        )
+
+    return {
+        "period": period,
+        "date_from": str(date_from),
+        "date_to": str(date_to),
+        "partners_count": len(partners),
+        "partners": partners,
+    }
+
+
+@cached_result(timeout=settings.CACHE_TIMEOUT_ANALYTICS, key_prefix="warehouse_analytics_owner_partner")
+def build_owner_partner_warehouse_analytics_payload(
+    *,
+    owner_company_id: str,
+    partner_company_id: str,
+    branch_id: str | None,
+    period: str,
+    date_from: date,
+    date_to: date,
+    group_by: str = "day",
+    all_branches: bool = True,
+):
+    """Полная аналитика компании-партнёра (проверка партнёрства — в API view)."""
+    partner = Company.objects.get(id=partner_company_id)
+    analytics = build_owner_warehouse_analytics_payload(
+        company_id=partner_company_id,
+        branch_id=branch_id,
+        period=period,
+        date_from=date_from,
+        date_to=date_to,
+        group_by=group_by,
+        all_branches=all_branches,
+    )
+    return {
+        "partner_company": {
+            "id": str(partner.id),
+            "name": partner.name or _company_display_name(partner),
+        },
+        **analytics,
     }

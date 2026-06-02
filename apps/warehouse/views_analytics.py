@@ -3,14 +3,32 @@ from rest_framework.views import APIView
 from rest_framework.exceptions import PermissionDenied
 
 from apps.utils import _is_owner_like
+from apps.users.models import Branch, Company, User
+from apps.warehouse import models as wm
 from apps.warehouse.analytics import (
     _parse_period,
     build_agent_warehouse_analytics_payload,
     build_owner_agents_sales_analytics_payload,
+    build_owner_partners_warehouse_analytics_list_payload,
+    build_owner_partner_warehouse_analytics_payload,
     build_owner_warehouse_analytics_payload,
 )
 from apps.warehouse.views import CompanyBranchRestrictedMixin
-from apps.users.models import User
+
+
+def _resolve_partner_branch_scope(request, partner_company):
+    """
+    partner_branch=<uuid> — один филиал партнёра;
+    без параметра — вся компания-партнёр (все филиалы).
+    """
+    branch_id = (request.query_params.get("partner_branch") or "").strip()
+    if not branch_id:
+        return None, True
+    try:
+        branch = Branch.objects.get(id=branch_id, company=partner_company)
+    except (Branch.DoesNotExist, ValueError):
+        raise PermissionDenied("Филиал партнёра не найден.")
+    return branch, False
 
 
 class WarehouseAgentMyAnalyticsAPIView(CompanyBranchRestrictedMixin, APIView):
@@ -135,5 +153,71 @@ class WarehouseOwnerAgentsSalesAnalyticsAPIView(CompanyBranchRestrictedMixin, AP
             limit=limit,
             offset=offset,
             order_by=order_by,
+        )
+        return Response(data)
+
+
+class WarehouseOwnerPartnersAnalyticsAPIView(CompanyBranchRestrictedMixin, APIView):
+    """
+    GET /api/warehouse/owner/partners/analytics/
+    Сводная аналитика по всем компаниям-партнёрам (складское партнёрство).
+    """
+
+    def get(self, request, *args, **kwargs):
+        if not _is_owner_like(request.user):
+            raise PermissionDenied("Только владелец/админ.")
+
+        company = self._company()
+        if not company:
+            raise PermissionDenied("Компания не найдена.")
+
+        period = _parse_period(request)
+        data = build_owner_partners_warehouse_analytics_list_payload(
+            owner_company_id=str(company.id),
+            period=period["period"],
+            date_from=period["date_from"],
+            date_to=period["date_to"],
+        )
+        return Response(data)
+
+
+class WarehouseOwnerPartnerAnalyticsAPIView(CompanyBranchRestrictedMixin, APIView):
+    """
+    GET /api/warehouse/owner/partners/<partner_company_id>/analytics/
+    Полная аналитика одной компании-партнёра (как owner/analytics, но по данным партнёра).
+    Query: partner_branch=<uuid> — ограничить филиалом партнёра; иначе все филиалы.
+    """
+
+    def get(self, request, partner_company_id, *args, **kwargs):
+        if not _is_owner_like(request.user):
+            raise PermissionDenied("Только владелец/админ.")
+
+        company = self._company()
+        if not company:
+            raise PermissionDenied("Компания не найдена.")
+
+        if str(partner_company_id) == str(company.id):
+            raise PermissionDenied("Укажите компанию-партнёра, не свою.")
+
+        if not wm.has_active_stock_partnership_between_ids(company.id, partner_company_id):
+            raise PermissionDenied("Нет активного партнёрства с этой компанией.")
+
+        partner = Company.objects.filter(pk=partner_company_id).first()
+        if not partner:
+            raise PermissionDenied("Компания-партнёр не найдена.")
+
+        partner_branch, all_branches = _resolve_partner_branch_scope(request, partner)
+        period = _parse_period(request)
+        group_by = (request.query_params.get("group_by") or period.get("group_by") or "day").strip()
+
+        data = build_owner_partner_warehouse_analytics_payload(
+            owner_company_id=str(company.id),
+            partner_company_id=str(partner.id),
+            branch_id=str(partner_branch.id) if partner_branch else None,
+            period=period["period"],
+            date_from=period["date_from"],
+            date_to=period["date_to"],
+            group_by=group_by,
+            all_branches=all_branches,
         )
         return Response(data)

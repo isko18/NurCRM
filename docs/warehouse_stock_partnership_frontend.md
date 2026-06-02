@@ -122,6 +122,8 @@
 }
 ```
 
+**Аналитика по партнёрам (только владелец):** см. [warehouse_partner_analytics_frontend.md](./warehouse_partner_analytics_frontend.md) — `GET /api/warehouse/owner/partners/analytics/` и `GET /api/warehouse/owner/partners/{id}/analytics/`.
+
 ---
 
 ## Каталог партнёра (склады, товары, кассы)

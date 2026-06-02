@@ -7,7 +7,13 @@ from django.core.cache import cache
 from apps.users.models import Company, Branch, User
 from apps.warehouse import models as wm
 from apps.warehouse import services as warehouse_services
-from apps.warehouse.analytics import build_agent_warehouse_analytics_payload, build_owner_warehouse_analytics_payload
+from apps.warehouse.analytics import (
+    build_agent_warehouse_analytics_payload,
+    build_owner_partner_warehouse_analytics_payload,
+    build_owner_partners_warehouse_analytics_list_payload,
+    build_owner_warehouse_analytics_payload,
+)
+from apps.warehouse.models import canonical_company_pair_ids
 
 
 class WarehouseAnalyticsByGroupTests(TestCase):
@@ -203,3 +209,79 @@ class WarehouseAnalyticsByGroupTests(TestCase):
         row = data2["details"]["counterparties_debt"][0]
         self.assertEqual(row["balance"], "60.00")
         self.assertEqual(row["breakdown"]["money_receipt"], "40.00")
+
+
+class WarehousePartnerAnalyticsTests(TestCase):
+    def setUp(self):
+        self.owner = User.objects.create_user(email="owner2@example.com", password="pass123")
+        self.company_a = Company.objects.create(name="Company A", owner=self.owner)
+        self.company_b = Company.objects.create(name="Company B")
+
+        self.branch_b = Branch.objects.create(company=self.company_b, name="B Branch")
+        self.wh_b = wm.Warehouse.objects.create(
+            name="WH B",
+            company=self.company_b,
+            branch=self.branch_b,
+            location="loc",
+            status=wm.Warehouse.Status.active,
+        )
+        self.agent_b = User.objects.create_user(email="agentb@example.com", password="pass123")
+        self.product_b = wm.WarehouseProduct.objects.create(
+            company=self.company_b,
+            branch=self.branch_b,
+            warehouse=self.wh_b,
+            name="Prod B",
+            unit="шт",
+            is_weight=False,
+            purchase_price=Decimal("10.00"),
+            price=Decimal("200.00"),
+            quantity=Decimal("0.000"),
+        )
+        self.client_cp = wm.Counterparty.objects.create(
+            name="Client B",
+            phone="+996700000030",
+            type=wm.Counterparty.Type.CLIENT,
+        )
+        d = wm.Document.objects.create(
+            doc_type=wm.Document.DocType.SALE,
+            status=wm.Document.Status.POSTED,
+            warehouse_from=self.wh_b,
+            counterparty=self.client_cp,
+            agent=self.agent_b,
+        )
+        wm.Document.objects.filter(pk=d.pk).update(date=timezone.now())
+        wm.DocumentItem.objects.create(document=d, product=self.product_b, qty=Decimal("3"), price=Decimal("200.00"))
+
+        id_lo, id_hi = canonical_company_pair_ids(self.company_a.id, self.company_b.id)
+        wm.CompanyStockPartnership.objects.create(company_a_id=id_lo, company_b_id=id_hi)
+
+    def test_partners_list_analytics(self):
+        today = timezone.localdate()
+        data = build_owner_partners_warehouse_analytics_list_payload(
+            owner_company_id=str(self.company_a.id),
+            period="day",
+            date_from=today,
+            date_to=today,
+        )
+        self.assertEqual(data["partners_count"], 1)
+        self.assertEqual(len(data["partners"]), 1)
+        self.assertEqual(data["partners"][0]["partner_company_name"], "Company B")
+        self.assertEqual(data["partners"][0]["summary"]["sales_count"], 1)
+        self.assertEqual(data["partners"][0]["summary"]["sales_amount"], "600.00")
+
+    def test_partner_detail_analytics_all_branches(self):
+        today = timezone.localdate()
+        cache.clear()
+        data = build_owner_partner_warehouse_analytics_payload(
+            owner_company_id=str(self.company_a.id),
+            partner_company_id=str(self.company_b.id),
+            branch_id=None,
+            period="day",
+            date_from=today,
+            date_to=today,
+            all_branches=True,
+        )
+        self.assertEqual(data["partner_company"]["name"], "Company B")
+        self.assertTrue(data["all_branches"])
+        self.assertEqual(data["summary"]["sales_count"], 1)
+        self.assertEqual(data["summary"]["sales_amount"], "600.00")

@@ -1066,6 +1066,53 @@ Body создания заявки владельцем:
 
 ## 8) Аналитика склада (для владельца и агента)
 
+### 7.0 Аналитика компаний-партнёров (складское партнёрство)
+
+> **Полная документация для фронта:** [docs/warehouse_partner_analytics_frontend.md](../../docs/warehouse_partner_analytics_frontend.md)
+
+**Партнёры** — это те же компании, что в `GET /api/warehouse/stock-partnerships/active/` (поле `partners[].id` / `partners[].name`). Аналитика строится только по ним; произвольный `company_id` без записи в этом списке вернёт **403**.
+
+Только **владелец / admin** своей компании.
+
+**Сводка по всем партнёрам**
+
+`GET /api/warehouse/owner/partners/analytics/`
+
+Список `partner_company_id` для UI можно не дублировать: берите из `stock-partnerships/active/`, детали — по эндпоинту ниже.
+
+Параметры периода: `period`, `date`, `date_from`, `date_to` (как у `owner/analytics/`).
+
+Ответ:
+
+```json
+{
+  "period": "month",
+  "date_from": "2026-02-01",
+  "date_to": "2026-02-29",
+  "partners_count": 2,
+  "partners": [
+    {
+      "partner_company_id": "uuid",
+      "partner_company_name": "string",
+      "summary": { "... те же поля, что summary в owner/analytics ..." }
+    }
+  ]
+}
+```
+
+По умолчанию для каждого партнёра считаются **все филиалы** компании.
+
+**Детальная аналитика одного партнёра**
+
+`GET /api/warehouse/owner/partners/<partner_company_id>/analytics/`
+
+- `partner_branch=<uuid>` — только указанный филиал **партнёра**;
+- без `partner_branch` — агрегат по **всей** компании-партнёру.
+
+Тело ответа совпадает с `owner/analytics/` + блок `partner_company` (`id`, `name`).
+
+Ошибки: `403` — не владелец, нет партнёрства, указана своя компания; `403` — неверный `partner_branch`.
+
 ### 7.1 Аналитика владельца (общая)
 `GET /api/warehouse/owner/analytics/`
 

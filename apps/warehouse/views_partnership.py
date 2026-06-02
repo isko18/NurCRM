@@ -196,19 +196,10 @@ class PartnerCompaniesListAPIView(CompanyBranchRestrictedMixin, APIView):
         if not user_can_represent_company(request.user, company):
             raise PermissionDenied()
 
-        qs = models.CompanyStockPartnership.objects.filter(
-            Q(company_a=company) | Q(company_b=company)
-        ).select_related("company_a", "company_b")
-
-        partners = []
-        seen = set()
-        for row in qs:
-            partner = row.company_b if row.company_a_id == company.id else row.company_a
-            if partner.id in seen:
-                continue
-            seen.add(partner.id)
-            partners.append({"id": str(partner.id), "name": partner.name})
-
+        partners = [
+            {"id": str(p.id), "name": p.name}
+            for p in models.list_active_stock_partner_companies(company)
+        ]
         return Response({"partners": partners})
 
 
