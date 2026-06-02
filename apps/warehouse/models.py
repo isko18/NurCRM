@@ -1427,7 +1427,9 @@ class Document(models.Model):
 
         if self.doc_type == self.DocType.COMMERCIAL_OFFER:
             # Коммерческое предложение — только расчет, без проведения/остатков/кассы.
-            if not self.warehouse_from:
+            if not self.warehouse_from and not self.agent_id:
+                pass
+            elif not self.warehouse_from:
                 raise ValidationError("Document requires warehouse_from")
             if prepayment > 0:
                 raise ValidationError({"prepayment_amount": "Предоплата недоступна для коммерческого предложения."})
@@ -1465,7 +1467,11 @@ class Document(models.Model):
 
         if self.doc_type in (self.DocType.SALE, self.DocType.SALE_RETURN, self.DocType.PURCHASE, self.DocType.PURCHASE_RETURN, self.DocType.RECEIPT, self.DocType.WRITE_OFF):
             # require warehouse_from for most operations (warehouse where stock changes).
-            if not self.warehouse_from:
+            owner_multi_warehouse = (
+                self.doc_type in (self.DocType.SALE, self.DocType.SALE_RETURN)
+                and not self.agent_id
+            )
+            if not owner_multi_warehouse and not self.warehouse_from:
                 raise ValidationError("Document requires warehouse_from")
             if self.doc_type in (self.DocType.SALE, self.DocType.PURCHASE, self.DocType.SALE_RETURN, self.DocType.PURCHASE_RETURN) and not self.counterparty:
                 raise ValidationError("Document requires counterparty")
@@ -1541,10 +1547,14 @@ class DocumentItem(models.Model):
         # Проверяем только если document уже сохранен (имеет pk) или передан напрямую
         doc = getattr(self, 'document', None)
         if doc and self.product_id:
+            from apps.warehouse.services import document_allows_multi_warehouse
+
+            multi_warehouse = document_allows_multi_warehouse(doc)
+
             # Если document еще не сохранен, но передан - проверяем по ID
             if hasattr(doc, 'pk') and doc.pk is None:
                 # Документ еще не сохранен - проверяем по warehouse_from_id напрямую
-                if hasattr(doc, 'warehouse_from_id') and doc.warehouse_from_id:
+                if hasattr(doc, 'warehouse_from_id') and doc.warehouse_from_id and not multi_warehouse:
                     prod = self.product
                     if doc.doc_type == doc.DocType.TRANSFER:
                         if prod.warehouse_id != doc.warehouse_from_id:
@@ -1555,24 +1565,30 @@ class DocumentItem(models.Model):
             elif hasattr(doc, 'pk') and doc.pk:
                 # Документ сохранен - полная проверка
                 prod = self.product
-                
-                # Проверка компании
+
+                doc_company_id = None
                 if hasattr(doc, 'warehouse_from') and doc.warehouse_from_id:
-                    # Загружаем warehouse_from если нужно
                     if not hasattr(doc.warehouse_from, 'company_id'):
                         doc.warehouse_from.refresh_from_db()
-                    if prod.company_id != doc.warehouse_from.company_id:
-                        raise ValidationError({"product": "Товар принадлежит другой компании, чем склад документа."})
-                
+                    doc_company_id = doc.warehouse_from.company_id
+                elif multi_warehouse and prod.warehouse_id:
+                    doc_company_id = prod.company_id
+
+                if doc_company_id is not None and prod.company_id != doc_company_id:
+                    raise ValidationError({"product": "Товар принадлежит другой компании, чем склад документа."})
+
                 # Проверка склада для операций с одним складом
-                if doc.doc_type != doc.DocType.TRANSFER:
-                    if doc.warehouse_from_id and prod.warehouse_id != doc.warehouse_from_id:
-                        warehouse_name = doc.warehouse_from.name if hasattr(doc, 'warehouse_from') and doc.warehouse_from else "документа"
-                        raise ValidationError({"product": f"Товар должен принадлежать складу '{warehouse_name}'."})
-                else:
-                    # Для TRANSFER товар должен принадлежать складу-источнику
-                    if doc.warehouse_from_id and prod.warehouse_id != doc.warehouse_from_id:
-                        raise ValidationError({"product": "Товар должен принадлежать складу-источнику перемещения."})
+                if not multi_warehouse:
+                    if doc.doc_type != doc.DocType.TRANSFER:
+                        if doc.warehouse_from_id and prod.warehouse_id != doc.warehouse_from_id:
+                            warehouse_name = doc.warehouse_from.name if hasattr(doc, 'warehouse_from') and doc.warehouse_from else "документа"
+                            raise ValidationError({"product": f"Товар должен принадлежать складу '{warehouse_name}'."})
+                    else:
+                        # Для TRANSFER товар должен принадлежать складу-источнику
+                        if doc.warehouse_from_id and prod.warehouse_id != doc.warehouse_from_id:
+                            raise ValidationError({"product": "Товар должен принадлежать складу-источнику перемещения."})
+                elif not prod.warehouse_id:
+                    raise ValidationError({"product": "Товар должен быть привязан к складу."})
 
             if doc.agent_id and doc.warehouse_from_id:
                 # Для документов агента возможны два режима списания:

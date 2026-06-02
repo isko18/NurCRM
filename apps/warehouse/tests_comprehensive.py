@@ -652,11 +652,11 @@ class WarehouseComprehensiveTests(TestCase):
             doc.clean()
     
     def test_document_item_validates_product_warehouse(self):
-        """Тест: item проверяет соответствие товара складу."""
+        """Тест: для покупки item проверяет соответствие товара складу."""
         doc = models.Document.objects.create(
-            doc_type=models.Document.DocType.SALE,
+            doc_type=models.Document.DocType.PURCHASE,
             warehouse_from=self.wh1,
-            counterparty=self.client
+            counterparty=self.supplier
         )
         
         # Пытаемся добавить товар с другого склада
@@ -669,6 +669,49 @@ class WarehouseComprehensiveTests(TestCase):
         
         with self.assertRaises(ValidationError):
             item.clean()
+
+    def test_sale_allows_items_from_multiple_warehouses(self):
+        """Тест: продажа может включать товары с разных складов."""
+        models.StockBalance.objects.create(
+            warehouse=self.wh1,
+            product=self.prod1,
+            qty=Decimal("50.000")
+        )
+        models.StockBalance.objects.create(
+            warehouse=self.wh2,
+            product=self.prod3,
+            qty=Decimal("30.000")
+        )
+
+        doc = models.Document.objects.create(
+            doc_type=models.Document.DocType.SALE,
+            warehouse_from=self.wh1,
+            counterparty=self.client,
+        )
+        models.DocumentItem.objects.create(
+            document=doc,
+            product=self.prod1,
+            qty=Decimal("10.000"),
+            price=Decimal("150.00"),
+        )
+        models.DocumentItem.objects.create(
+            document=doc,
+            product=self.prod3,
+            qty=Decimal("5.000"),
+            price=Decimal("300.00"),
+        )
+
+        services.post_document(doc)
+
+        bal1 = models.StockBalance.objects.get(warehouse=self.wh1, product=self.prod1)
+        bal2 = models.StockBalance.objects.get(warehouse=self.wh2, product=self.prod3)
+        self.assertEqual(bal1.qty, Decimal("40.000"))
+        self.assertEqual(bal2.qty, Decimal("25.000"))
+
+        moves = {m.warehouse_id: m for m in models.StockMove.objects.filter(document=doc)}
+        self.assertEqual(len(moves), 2)
+        self.assertEqual(moves[self.wh1.id].qty_delta, Decimal("-10.000"))
+        self.assertEqual(moves[self.wh2.id].qty_delta, Decimal("-5.000"))
     
     def test_document_item_validates_quantity_positive(self):
         """Тест: item требует положительное количество."""

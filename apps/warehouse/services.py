@@ -8,6 +8,44 @@ from .models import q_qty
 from .utils import effective_payment_kind
 
 
+MULTI_WAREHOUSE_DOC_TYPES = frozenset({
+    models.Document.DocType.SALE,
+    models.Document.DocType.SALE_RETURN,
+    models.Document.DocType.COMMERCIAL_OFFER,
+})
+
+
+def document_allows_multi_warehouse(document) -> bool:
+    """Продажа/возврат/КП владельца: строки могут списываться с разных складов."""
+    return (
+        document.doc_type in MULTI_WAREHOUSE_DOC_TYPES
+        and not getattr(document, "agent_id", None)
+    )
+
+
+def resolve_item_warehouse(document, item):
+    """Склад для проверки остатков и движения по строке документа."""
+    if document_allows_multi_warehouse(document):
+        product = getattr(item, "product", None)
+        wh = getattr(product, "warehouse", None) if product is not None else None
+        if wh is not None:
+            return wh
+    return document.warehouse_from
+
+
+def resolve_document_context_warehouse(document):
+    """Склад для кассы/предоплаты: warehouse_from или первый склад из строк."""
+    if document.warehouse_from_id:
+        return document.warehouse_from
+    if document_allows_multi_warehouse(document):
+        first = document.items.select_related("product__warehouse").order_by("id").first()
+        if first is not None:
+            wh = resolve_item_warehouse(document, first)
+            if wh is not None:
+                return wh
+    raise ValueError("Для документа нужен warehouse_from или строки с товарами со склада.")
+
+
 def resolve_warehouse_on_hand_qty(*, warehouse, product, balance=None, sync=False):
     """
     Эффективный остаток на складе для проверок и списаний.
@@ -244,9 +282,7 @@ def _create_money_document_for_request(document: models.Document, request_obj: m
     if amount <= 0:
         raise ValueError("Сумма для кассы должна быть больше 0.")
 
-    warehouse = document.warehouse_from
-    if not warehouse:
-        raise ValueError("Для автокассы нужен warehouse_from.")
+    warehouse = resolve_document_context_warehouse(document)
 
     company = warehouse.company
     branch = warehouse.branch
@@ -575,13 +611,19 @@ def post_document(document: models.Document, allow_negative: bool = None) -> mod
                 raise ValueError("Unsupported document type for posting")
             for item in items:
                 delta = sign * Decimal(item.qty)
+                warehouse = resolve_item_warehouse(document, item)
+                if warehouse is None:
+                    raise ValueError(
+                        f"Не удалось определить склад для товара {item.product_id}. "
+                        "Укажите warehouse_from или выберите товар, привязанный к складу."
+                    )
                 if not allow_negative:
                     bal = models.StockBalance.objects.select_for_update().filter(
-                        warehouse=document.warehouse_from,
+                        warehouse=warehouse,
                         product=item.product,
                     ).first()
                     cur, _bal = resolve_warehouse_on_hand_qty(
-                        warehouse=document.warehouse_from,
+                        warehouse=warehouse,
                         product=item.product,
                         balance=bal,
                         sync=True,
@@ -594,12 +636,12 @@ def post_document(document: models.Document, allow_negative: bool = None) -> mod
                                 product_display = f"ID {item.product_id}"
                         else:
                             product_display = f"ID {item.product_id}"
-                        warehouse_name = document.warehouse_from.name if document.warehouse_from else "не указан"
+                        warehouse_name = warehouse.name if warehouse else "не указан"
                         raise ValueError(f"Недостаточно товара '{product_display}' на складе '{warehouse_name}'. Доступно: {cur}, требуется: {abs(delta)}")
                 move_kind = models.StockMove.MoveKind.RECEIPT if delta > 0 else models.StockMove.MoveKind.EXPENSE
                 mv = models.StockMove.objects.create(
                     document=document,
-                    warehouse=document.warehouse_from,
+                    warehouse=warehouse,
                     product=item.product,
                     qty_delta=delta,
                     move_kind=move_kind,
@@ -632,9 +674,7 @@ def post_document(document: models.Document, allow_negative: bool = None) -> mod
             ):
                 raise ValueError("Для предоплаты укажите контрагента в документе.")
 
-            warehouse = document.warehouse_from
-            if not warehouse:
-                raise ValueError("Для предоплаты нужен warehouse_from.")
+            warehouse = resolve_document_context_warehouse(document)
 
             company = warehouse.company
             branch = warehouse.branch

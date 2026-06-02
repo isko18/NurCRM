@@ -57,6 +57,7 @@ class DocumentListCreateView(CompanyBranchRestrictedMixin, generics.ListCreateAP
             "warehouse_from", "warehouse_to", "counterparty", "agent"
         ).prefetch_related(
             "items__product",
+            "items__product__warehouse",
             Prefetch(
                 "items__product__images",
                 queryset=models.WarehouseProductImage.objects.order_by("-is_primary", "created_at"),
@@ -211,6 +212,7 @@ class DocumentDetailView(CompanyBranchRestrictedMixin, generics.RetrieveUpdateDe
             "items__product",
             "items__product__brand",
             "items__product__category",
+            "items__product__warehouse",
             Prefetch(
                 "items__product__images",
                 queryset=models.WarehouseProductImage.objects.order_by("-is_primary", "created_at"),

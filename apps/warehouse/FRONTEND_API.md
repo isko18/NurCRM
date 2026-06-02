@@ -413,7 +413,22 @@
   "discount_percent": "0.00",
   "discount_amount": "0.00",
   "total": "0.00",
-  "items": [...],
+  "items": [
+    {
+      "id": "uuid",
+      "product": "uuid",
+      "product_name": "string",
+      "product_article": "string|null",
+      "warehouse": "uuid (read-only, склад списания — из карточки товара)",
+      "warehouse_name": "string|null (read-only)",
+      "qty": "3.000",
+      "price": "150.00",
+      "discount_percent": "0.00",
+      "discount_amount": "0.00",
+      "effective_discount_percent": "0.00",
+      "line_total": "450.00"
+    }
+  ],
   "moves": [
     {
       "id": "uuid",
@@ -439,6 +454,7 @@
 - `receipts` — подмножество moves с `move_kind=RECEIPT`.
 - `expenses` — подмножество moves с `move_kind=EXPENSE`.
 - Документ TRANSFER содержит и приходы (на склад-приёмник), и расходы (со склада-источника). SALE — только расходы, PURCHASE/RECEIPT — только приходы.
+- **Продажа с нескольких складов:** для `SALE` / `SALE_RETURN` / `COMMERCIAL_OFFER` без агента строки могут списываться с разных складов; подробно — **[docs/warehouse_multi_warehouse_sale_frontend.md](../../docs/warehouse_multi_warehouse_sale_frontend.md)**.
 
 Read-only поля:
 - `number`, `total`, `status`, `date`
@@ -574,12 +590,12 @@ Inbox для кассира (работа с запросами кассы):
 - `TRANSFER`: товар **должен** принадлежать складу-источнику (`warehouse_from`).
 - `TRANSFER`: при проведении создаётся/находится товар на складе-получателе и остаток уходит на него.
 - `INVENTORY`: `items[].qty` — фактический остаток; при проведении создаётся движение на \(\Delta = fact - current\).
-- `SALE`, `WRITE_OFF`, `PURCHASE_RETURN`: уменьшают остаток на `warehouse_from`.
-- `PURCHASE`, `RECEIPT`, `SALE_RETURN`: увеличивают остаток на `warehouse_from`.
-- для `SALE/PURCHASE/SALE_RETURN/PURCHASE_RETURN` обязательны: `warehouse_from` и `counterparty`.
+- `SALE`, `WRITE_OFF`, `PURCHASE_RETURN`: уменьшают остаток (для `SALE` владельца — на складе **каждой строки**, см. [multi-warehouse doc](../../docs/warehouse_multi_warehouse_sale_frontend.md); для остальных типов — на `warehouse_from`).
+- `PURCHASE`, `RECEIPT`, `SALE_RETURN`: увеличивают остаток (`SALE_RETURN` владельца — на складе каждой строки; остальные — на `warehouse_from`).
+- для `SALE/PURCHASE/SALE_RETURN/PURCHASE_RETURN` обязателен `counterparty`; `warehouse_from` обязателен для всех, **кроме** `SALE`/`SALE_RETURN`/`COMMERCIAL_OFFER` владельца (без `agent`) — там подставляется из первой строки.
 - нельзя проводить пустой документ.
 - для “штучных” товаров количество (`qty`) должно быть целым (сервер проверяет; фронту лучше валидировать заранее).
-- если в документе указан `agent`, операции идут по остаткам агента (склад не меняется).
+- если в документе указан `agent`, операции идут по остаткам агента (один склад, multi-warehouse недоступен).
 
 ## 5) Касса и денежные документы (приход/расход)
 

@@ -81,6 +81,8 @@ class StockMoveSerializer(serializers.ModelSerializer):
 class DocumentItemSerializer(serializers.ModelSerializer):
     product_name = serializers.CharField(source="product.name", read_only=True, allow_null=True)
     product_article = serializers.CharField(source="product.article", read_only=True, allow_null=True)
+    warehouse = serializers.UUIDField(source="product.warehouse_id", read_only=True, allow_null=True)
+    warehouse_name = serializers.CharField(source="product.warehouse.name", read_only=True, allow_null=True)
     product_image_url = serializers.SerializerMethodField()
     product_characteristics = WarehouseProductCharacteristicsSerializer(
         source="product.characteristics",
@@ -109,6 +111,8 @@ class DocumentItemSerializer(serializers.ModelSerializer):
             "product",
             "product_name",
             "product_article",
+            "warehouse",
+            "warehouse_name",
             "product_image_url",
             "product_characteristics",
             "product_discount_percent",
@@ -237,6 +241,41 @@ class DocumentSerializer(serializers.ModelSerializer):
         if doc_type == models.Document.DocType.SALE and bool(is_sale_request):
             return models.Document.Status.SALE_REQUEST
         return models.Document.Status.DRAFT
+
+    def _apply_multi_warehouse_defaults(self, attrs):
+        """Для продажи владельца: warehouse_from необязателен, подставляется из первой строки."""
+        doc_type = attrs.get("doc_type") or getattr(self.instance, "doc_type", None)
+        agent = attrs.get("agent")
+        if agent is None and self.instance is not None:
+            agent = getattr(self.instance, "agent", None)
+        if doc_type not in warehouse_services.MULTI_WAREHOUSE_DOC_TYPES or agent:
+            return attrs
+
+        items = attrs.get("items")
+        if not items:
+            return attrs
+
+        if attrs.get("warehouse_from") is not None:
+            wh_company_id = attrs["warehouse_from"].company_id
+            for it in items:
+                product = it.get("product")
+                if product is None:
+                    continue
+                if product.company_id != wh_company_id:
+                    raise serializers.ValidationError(
+                        {"items": "Все товары должны принадлежать той же компании, что и склад документа."}
+                    )
+            return attrs
+
+        first_product = items[0].get("product")
+        if first_product is not None and getattr(first_product, "warehouse_id", None):
+            attrs = dict(attrs)
+            attrs["warehouse_from"] = first_product.warehouse
+        return attrs
+
+    def validate(self, attrs):
+        attrs = self._apply_multi_warehouse_defaults(attrs)
+        return super().validate(attrs) if hasattr(super(), "validate") else attrs
 
     def get_agent_display(self, obj):
         u = getattr(obj, "agent", None)
