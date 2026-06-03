@@ -1695,10 +1695,15 @@ class OrderSerializer(CompanyBranchReadOnlyMixin):
                 for task in KitchenTask.objects.filter(
                     order=instance,
                     status__in=[KitchenTask.Status.IN_PROGRESS, KitchenTask.Status.READY],
-                ).values("menu_item_id", "status", "cook_id", "started_at", "finished_at", "quantity"):
+                ).values(
+                    "menu_item_id", "unit_index", "status",
+                    "cook_id", "started_at", "finished_at", "quantity",
+                ):
                     mid = task["menu_item_id"]
-                    if mid and mid not in active_tasks_by_menu:
-                        active_tasks_by_menu[mid] = task
+                    if not mid:
+                        continue
+                    key = (mid, task["unit_index"])
+                    active_tasks_by_menu[key] = task
 
                 instance.items.all().delete()
 
@@ -1706,25 +1711,38 @@ class OrderSerializer(CompanyBranchReadOnlyMixin):
                     self._upsert_items(instance, items)
 
                 if active_tasks_by_menu:
-                    created_by_menu = {
-                        item.menu_item_id: item
-                        for item in instance.items.select_related("menu_item").all()
-                        if item.menu_item_id
-                    }
+                    created_items_by_menu = {}
+                    for item in instance.items.select_related("menu_item").all():
+                        if not item.menu_item_id:
+                            continue
+                        created_items_by_menu.setdefault(item.menu_item_id, []).append(item)
+
                     tasks_to_restore = []
                     tasks_to_update = []
-                    for menu_item_id, task_data in active_tasks_by_menu.items():
-                        matching_item = created_by_menu.get(menu_item_id)
-                        if not matching_item:
+                    for (menu_item_id, unit_index), task_data in active_tasks_by_menu.items():
+                        matching_items = created_items_by_menu.get(menu_item_id, [])
+                        if not matching_items:
                             continue
-                        existing_task = KitchenTask.objects.filter(order_item=matching_item).first()
+                        matching_item = matching_items[0]
+                        piece_qty = int(Decimal(matching_item.quantity or 0))
+                        if unit_index > piece_qty and not matching_item.menu_item_is_sold_by_weight:
+                            continue
+                        existing_task = KitchenTask.objects.filter(
+                            order_item=matching_item,
+                            unit_index=unit_index,
+                        ).first()
+                        task_qty = (
+                            matching_item.quantity
+                            if matching_item.menu_item_is_sold_by_weight and unit_index == 1
+                            else Decimal("1")
+                        )
                         if existing_task:
                             existing_task.status = task_data["status"]
                             existing_task.cook_id = task_data["cook_id"]
                             existing_task.started_at = task_data["started_at"]
                             existing_task.finished_at = task_data["finished_at"]
                             existing_task.waiter = instance.waiter
-                            existing_task.quantity = matching_item.quantity
+                            existing_task.quantity = task_qty
                             tasks_to_update.append(existing_task)
                         else:
                             tasks_to_restore.append(
@@ -1735,8 +1753,8 @@ class OrderSerializer(CompanyBranchReadOnlyMixin):
                                     order_item=matching_item,
                                     menu_item_id=menu_item_id,
                                     waiter=instance.waiter,
-                                    unit_index=1,
-                                    quantity=matching_item.quantity,
+                                    unit_index=unit_index,
+                                    quantity=task_qty,
                                     status=task_data["status"],
                                     cook_id=task_data["cook_id"],
                                     started_at=task_data["started_at"],

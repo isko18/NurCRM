@@ -120,7 +120,10 @@ class KitchenTask(models.Model):
         verbose_name = 'Задача кухни'
         verbose_name_plural = 'Задачи кухни'
         constraints = [
-            models.UniqueConstraint(fields=['order_item'], name='uniq_kitchen_task_per_order_item'),
+            models.UniqueConstraint(
+                fields=['order_item', 'unit_index'],
+                name='uniq_kitchen_task_per_unit',
+            ),
         ]
         indexes = [
             models.Index(fields=['company', 'branch', 'status', 'created_at']),
@@ -2089,7 +2092,9 @@ def archive_order_before_delete(sender, instance: Order, **kwargs):
 @receiver(post_save, sender=OrderItem)
 def ensure_kitchen_tasks_for_order_item(sender, instance: "OrderItem", created, **kwargs):
     """
-    Одна задача кухни на строку заказа; quantity совпадает с order_item.quantity (в т.ч. дробное).
+    Задачи кухни по строке заказа:
+    - весовое блюдо: одна задача (unit_index=1), quantity = вес строки;
+    - штучное: unit_index 1..N (N = целое quantity), как раньше — дубликаты по unit_index допустимы.
     """
     if instance.line_kind == OrderItem.LineKind.SERVICE or not instance.menu_item_id:
         KitchenTask.objects.filter(order_item=instance).delete()
@@ -2104,28 +2109,63 @@ def ensure_kitchen_tasks_for_order_item(sender, instance: "OrderItem", created, 
         KitchenTask.objects.filter(order_item=instance).delete()
         return
 
-    defaults = {
-        "company": instance.company,
-        "branch": instance.order.branch,
-        "order": instance.order,
-        "menu_item": instance.menu_item,
-        "waiter": instance.order.waiter,
-        "unit_index": 1,
-        "quantity": qty,
-        "status": KitchenTask.Status.PENDING,
-    }
+    sold_by_weight = bool(instance.menu_item_is_sold_by_weight)
+    if not sold_by_weight and instance.menu_item_id:
+        mi = instance.menu_item
+        if mi is not None:
+            sold_by_weight = bool(mi.is_sold_by_weight)
+
     with transaction.atomic():
-        task, was_created = KitchenTask.objects.get_or_create(
+        if sold_by_weight:
+            task, was_created = KitchenTask.objects.get_or_create(
+                order_item=instance,
+                unit_index=1,
+                defaults={
+                    "company": instance.company,
+                    "branch": instance.order.branch,
+                    "order": instance.order,
+                    "menu_item": instance.menu_item,
+                    "waiter": instance.order.waiter,
+                    "quantity": qty,
+                    "status": KitchenTask.Status.PENDING,
+                },
+            )
+            if not was_created:
+                task.quantity = qty
+                task.waiter = instance.order.waiter
+                if task.status == KitchenTask.Status.CANCELLED:
+                    task.status = KitchenTask.Status.PENDING
+                task.save(update_fields=["quantity", "waiter", "status", "menu_item_id"])
+            return
+
+        need = int(qty)
+        if need <= 0:
+            return
+
+        qs = KitchenTask.objects.filter(order_item=instance).only("id", "unit_index", "status")
+        existing = set(qs.values_list("unit_index", flat=True))
+        missing = [idx for idx in range(1, need + 1) if idx not in existing]
+        if missing:
+            to_create = [
+                KitchenTask(
+                    company=instance.company,
+                    branch=instance.order.branch,
+                    order=instance.order,
+                    order_item=instance,
+                    menu_item=instance.menu_item,
+                    waiter=instance.order.waiter,
+                    unit_index=idx,
+                    quantity=Decimal("1"),
+                )
+                for idx in missing
+            ]
+            KitchenTask.objects.bulk_create(to_create, ignore_conflicts=True)
+
+        KitchenTask.objects.filter(
             order_item=instance,
-            defaults=defaults,
-        )
-        if not was_created:
-            task.quantity = qty
-            task.waiter = instance.order.waiter
-            if task.status == KitchenTask.Status.CANCELLED:
-                task.status = KitchenTask.Status.PENDING
-            task.save(update_fields=["quantity", "waiter", "status"])
-        KitchenTask.objects.filter(order_item=instance).exclude(pk=task.pk).delete()
+            unit_index__gt=need,
+            status=KitchenTask.Status.PENDING,
+        ).delete()
 
 
 class InventorySession(models.Model):
