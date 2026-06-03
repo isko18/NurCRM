@@ -226,7 +226,7 @@ def _line_net_quantity_expr():
     """Проданное количество за вычетом возвратов по строке (позиционные возвраты)."""
     return ExpressionWrapper(
         F("quantity") - Coalesce(F("refunded_quantity"), Value(0)),
-        output_field=IntegerField(),
+        output_field=DecimalField(max_digits=14, decimal_places=3),
     )
 
 
@@ -868,16 +868,29 @@ class SalesByMenuItemView(CompanyBranchQuerysetMixin, APIView):
         qs = _apply_date_range(qs, "order__paid_at", df, dt)
         qs = _annotate_allocated_line_revenue(qs)
 
-        data = (qs.values("menu_item_id", "menu_item__title")
-                  .annotate(qty=Sum("_line_net_qty"), revenue=Sum("_alloc_line_revenue"))
-                  .order_by("-revenue", "-qty")[:limit])
+        from .weight import format_quantity_api
+
+        data = (
+            qs.values(
+                "menu_item_id",
+                "menu_item__title",
+                "menu_item__is_sold_by_weight",
+                "menu_item__sale_unit",
+            )
+            .annotate(qty=Sum("_line_net_qty"), revenue=Sum("_alloc_line_revenue"))
+            .order_by("-revenue", "-qty")[:limit]
+        )
 
         result = []
         for row in data:
+            sold = bool(row.get("menu_item__is_sold_by_weight"))
+            sale_unit = (row.get("menu_item__sale_unit") or "kg") if sold else None
             result.append({
                 "menu_item_id": row["menu_item_id"],
                 "title": row["menu_item__title"],
-                "qty": int(row["qty"] or 0),
+                "qty": format_quantity_api(row["qty"] or 0),
+                "is_sold_by_weight": sold,
+                "sale_unit": sale_unit,
                 "revenue": f"{_to_decimal(row['revenue']):.2f}",
             })
 

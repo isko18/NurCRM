@@ -171,13 +171,22 @@ class KitchenTaskSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSeriali
             'status', 'created_at', 'started_at', 'finished_at',
             'order', 'order_item', 'menu_item',
             'table_number', 'guest', 'waiter', 'waiter_label',
-            'cook', 'unit_index', 'menu_item_title', 'price',
+            'cook', 'unit_index', 'quantity', 'menu_item_title', 'price',
+            'menu_item_is_sold_by_weight', 'menu_item_sale_unit',
         ]
         read_only_fields = [
             'id', 'company', 'branch', 'created_at', 'started_at', 'finished_at',
             'order', 'order_item', 'menu_item', 'table_number', 'guest',
-            'waiter', 'waiter_label', 'menu_item_title', 'price'
+            'waiter', 'waiter_label', 'menu_item_title', 'price',
+            'menu_item_is_sold_by_weight', 'menu_item_sale_unit',
         ]
+
+    menu_item_is_sold_by_weight = serializers.BooleanField(
+        source="menu_item.is_sold_by_weight", read_only=True, default=False,
+    )
+    menu_item_sale_unit = serializers.CharField(
+        source="menu_item.sale_unit", read_only=True, default="kg",
+    )
 
     def get_table_number(self, obj):
         return obj.order.table.number if obj.order_id and obj.order.table_id else None
@@ -1044,6 +1053,7 @@ class MenuItemSerializer(CompanyBranchReadOnlyMixin):
             "title", "category",
             "kitchen", "kitchen_title", "kitchen_number",
             "price", "is_active",
+            "is_sold_by_weight", "sale_unit",
             "image", "image_url",
             # Себестоимость и расходы
             "vat_percent", "other_expenses", "cost_price",
@@ -1143,6 +1153,20 @@ class MenuItemSerializer(CompanyBranchReadOnlyMixin):
             raise serializers.ValidationError(
                 {"other_expenses": "Отрицательные прочие расходы доступны только владельцу или администратору."}
             )
+
+        from .weight import normalize_sale_unit
+
+        sold_by_weight = attrs.get(
+            "is_sold_by_weight",
+            getattr(self.instance, "is_sold_by_weight", False) if self.instance else False,
+        )
+        if "sale_unit" in attrs or sold_by_weight:
+            attrs["sale_unit"] = normalize_sale_unit(
+                attrs.get("sale_unit", getattr(self.instance, "sale_unit", None) if self.instance else None),
+                sold_by_weight=bool(sold_by_weight),
+            )
+        elif not sold_by_weight:
+            attrs["sale_unit"] = "kg"
 
         return attrs
 
@@ -1246,6 +1270,11 @@ class OrderItemInlineSerializer(CompanyBranchReadOnlyMixin):
         read_only=True,
         allow_null=True,
     )
+    quantity = serializers.DecimalField(max_digits=12, decimal_places=3, min_value=Decimal("0.001"))
+    menu_item_is_sold_by_weight = serializers.BooleanField(read_only=True)
+    menu_item_sale_unit = serializers.CharField(read_only=True)
+    is_sold_by_weight = serializers.BooleanField(source="menu_item_is_sold_by_weight", read_only=True)
+    sale_unit = serializers.CharField(source="menu_item_sale_unit", read_only=True)
     refundable_quantity = serializers.SerializerMethodField()
 
     class Meta:
@@ -1253,20 +1282,38 @@ class OrderItemInlineSerializer(CompanyBranchReadOnlyMixin):
         fields = [
             "id", "order", "line_kind", "menu_item", "menu_item_title", "menu_item_price",
             "service_title", "unit_price", "quantity", "comment",
+            "menu_item_is_sold_by_weight", "menu_item_sale_unit",
+            "is_sold_by_weight", "sale_unit",
             "refunded_quantity", "refundable_quantity",
             "is_rejected", "rejection_reason", "rejected_at",
         ]
         read_only_fields = [
             "id", "menu_item_title", "menu_item_price", "rejected_at",
+            "menu_item_is_sold_by_weight", "menu_item_sale_unit",
+            "is_sold_by_weight", "sale_unit",
             "refunded_quantity", "refundable_quantity",
         ]
 
     def get_refundable_quantity(self, obj):
-        q = obj.quantity or 0
-        r = getattr(obj, "refunded_quantity", 0) or 0
-        return max(0, int(q - r))
+        from .weight import quantize_quantity
+
+        q = Decimal(obj.quantity or 0)
+        r = Decimal(getattr(obj, "refunded_quantity", 0) or 0)
+        return quantize_quantity(max(Decimal("0"), q - r))
+
+    def _menu_weight_context(self, attrs, inst):
+        menu_item = attrs.get("menu_item") or (inst.menu_item if inst else None)
+        if menu_item:
+            sold = bool(menu_item.is_sold_by_weight)
+            unit = (menu_item.sale_unit or "kg").strip().lower() if sold else "kg"
+            return sold, unit
+        if inst:
+            return bool(inst.menu_item_is_sold_by_weight), (inst.menu_item_sale_unit or "kg")
+        return False, "kg"
 
     def validate(self, attrs):
+        from .weight import validate_order_item_quantity
+
         inst = self.instance
         order = attrs.get("order") or (inst.order if inst else None)
         can_edit_closed_order = _is_owner_like(self._user())
@@ -1299,11 +1346,31 @@ class OrderItemInlineSerializer(CompanyBranchReadOnlyMixin):
             reason = ""
         if rej and not (reason or "").strip():
             raise serializers.ValidationError({"rejection_reason": "Укажите причину отказа."})
+
+        if "quantity" in attrs:
+            sold, unit = self._menu_weight_context(attrs, inst)
+            if line_kind == OrderItem.LineKind.SERVICE:
+                attrs["quantity"] = validate_order_item_quantity(
+                    attrs["quantity"], is_sold_by_weight=False, sale_unit="kg",
+                )
+            else:
+                attrs["quantity"] = validate_order_item_quantity(
+                    attrs["quantity"], is_sold_by_weight=sold, sale_unit=unit,
+                )
         return attrs
+
+    def _apply_weight_snapshot(self, validated_data):
+        menu_item = validated_data.get("menu_item")
+        if menu_item and validated_data.get("line_kind", OrderItem.LineKind.MENU) == OrderItem.LineKind.MENU:
+            validated_data["menu_item_is_sold_by_weight"] = bool(menu_item.is_sold_by_weight)
+            validated_data["menu_item_sale_unit"] = (
+                (menu_item.sale_unit or "kg").strip().lower() if menu_item.is_sold_by_weight else "kg"
+            )
 
     def create(self, validated_data):
         from django.utils import timezone as dj_tz
 
+        self._apply_weight_snapshot(validated_data)
         if validated_data.get("is_rejected"):
             validated_data.setdefault("rejected_at", dj_tz.now())
         return super().create(validated_data)
@@ -1321,7 +1388,24 @@ class OrderItemInlineSerializer(CompanyBranchReadOnlyMixin):
         if validated_data.get("is_rejected") is False:
             validated_data["rejection_reason"] = ""
             validated_data["rejected_at"] = None
+        if "menu_item" in validated_data:
+            self._apply_weight_snapshot(validated_data)
+        elif instance.line_kind == OrderItem.LineKind.MENU:
+            validated_data.setdefault("menu_item_is_sold_by_weight", instance.menu_item_is_sold_by_weight)
+            validated_data.setdefault("menu_item_sale_unit", instance.menu_item_sale_unit)
         return super().update(instance, validated_data)
+
+    def to_representation(self, instance):
+        from .weight import format_quantity_api
+
+        data = super().to_representation(instance)
+        if "quantity" in data and data["quantity"] is not None:
+            data["quantity"] = format_quantity_api(data["quantity"])
+        if "refunded_quantity" in data and data["refunded_quantity"] is not None:
+            data["refunded_quantity"] = format_quantity_api(data["refunded_quantity"])
+        if "refundable_quantity" in data and data["refundable_quantity"] is not None:
+            data["refundable_quantity"] = format_quantity_api(data["refundable_quantity"])
+        return data
 
     def get_fields(self):
         fields = super().get_fields()
@@ -1355,10 +1439,20 @@ class OrderItemHistorySerializer(serializers.ModelSerializer):
         model = OrderItemHistory
         fields = [
             "id", "line_kind", "menu_item", "menu_item_title", "menu_item_price", "quantity",
+            "menu_item_is_sold_by_weight", "menu_item_sale_unit",
             "refunded_quantity",
             "is_rejected", "rejection_reason",
         ]
         read_only_fields = fields
+
+    def to_representation(self, instance):
+        from .weight import format_quantity_api
+
+        data = super().to_representation(instance)
+        for key in ("quantity", "refunded_quantity"):
+            if key in data and data[key] is not None:
+                data[key] = format_quantity_api(data[key])
+        return data
 
 
 class OrderHistorySerializer(serializers.ModelSerializer):
@@ -1522,13 +1616,20 @@ class OrderSerializer(CompanyBranchReadOnlyMixin):
             menu_item = it.get("menu_item")
             if not menu_item:
                 raise serializers.ValidationError({"items": "Для блюда укажите menu_item."})
-            qty = it.get("quantity", 1)
+            from .weight import validate_order_item_quantity
+
+            qty = validate_order_item_quantity(
+                it.get("quantity", 1),
+                is_sold_by_weight=bool(menu_item.is_sold_by_weight),
+                sale_unit=(menu_item.sale_unit or "kg") if menu_item.is_sold_by_weight else "kg",
+            )
+            unit_price = it.get("unit_price")
             existing = order.items.filter(
                 menu_item=menu_item,
                 line_kind=OrderItem.LineKind.MENU,
             ).first()
             if existing:
-                existing.quantity += qty
+                existing.quantity = Decimal(existing.quantity or 0) + qty
                 # Склеиваем комментарии в одну строку: "без лука; остро"
                 if item_comment:
                     cur = (existing.comment or "").strip()
@@ -1536,24 +1637,41 @@ class OrderSerializer(CompanyBranchReadOnlyMixin):
                         existing.comment = item_comment
                     elif item_comment not in [p.strip() for p in cur.split(";") if p.strip()]:
                         existing.comment = f"{cur}; {item_comment}"
+                if unit_price is not None:
+                    existing.unit_price = unit_price
                 if is_rejected:
                     existing.is_rejected = True
                     existing.rejection_reason = rejection_reason
                     existing.rejected_at = existing.rejected_at or rejected_at
-                    existing.save(update_fields=["quantity", "comment", "is_rejected", "rejection_reason", "rejected_at"])
+                    existing.apply_menu_item_weight_snapshot()
+                    existing.save(update_fields=[
+                        "quantity", "unit_price", "comment",
+                        "menu_item_is_sold_by_weight", "menu_item_sale_unit",
+                        "is_rejected", "rejection_reason", "rejected_at",
+                    ])
                 else:
-                    existing.save(update_fields=["quantity", "comment"])
+                    existing.apply_menu_item_weight_snapshot()
+                    existing.save(update_fields=[
+                        "quantity", "unit_price", "comment",
+                        "menu_item_is_sold_by_weight", "menu_item_sale_unit",
+                    ])
             else:
                 OrderItem.objects.create(
                     order=order,
                     menu_item=menu_item,
                     quantity=qty,
+                    unit_price=unit_price,
                     company=order.company,
                     line_kind=OrderItem.LineKind.MENU,
                     comment=item_comment,
                     is_rejected=is_rejected,
                     rejection_reason=rejection_reason,
                     rejected_at=rejected_at,
+                    menu_item_is_sold_by_weight=bool(menu_item.is_sold_by_weight),
+                    menu_item_sale_unit=(
+                        (menu_item.sale_unit or "kg").strip().lower()
+                        if menu_item.is_sold_by_weight else "kg"
+                    ),
                 )
 
     def create(self, validated_data):
@@ -1571,98 +1689,66 @@ class OrderSerializer(CompanyBranchReadOnlyMixin):
         with transaction.atomic():
             instance = super().update(instance, validated_data)
             if items is not None:
-                # Сохраняем KitchenTask, которые уже в работе (IN_PROGRESS или READY)
-                # Группируем по menu_item_id и unit_index для последующего восстановления
                 from .models import KitchenTask
-                active_tasks = KitchenTask.objects.filter(
-                    order=instance,
-                    status__in=[KitchenTask.Status.IN_PROGRESS, KitchenTask.Status.READY]
-                ).select_related('order_item', 'menu_item').values(
-                    'menu_item_id', 'unit_index', 'status', 
-                    'cook_id', 'started_at', 'finished_at'
-                )
-                
-                # Сохраняем активные задачи по menu_item_id и unit_index
+
                 active_tasks_by_menu = {}
-                for task in active_tasks:
+                for task in KitchenTask.objects.filter(
+                    order=instance,
+                    status__in=[KitchenTask.Status.IN_PROGRESS, KitchenTask.Status.READY],
+                ).values("menu_item_id", "status", "cook_id", "started_at", "finished_at", "quantity"):
                     mid = task["menu_item_id"]
-                    if not mid:
-                        continue
-                    key = (mid, task["unit_index"])
-                    active_tasks_by_menu[key] = task
-                
-                # Удаляем все items (каскадом удалятся KitchenTask)
+                    if mid and mid not in active_tasks_by_menu:
+                        active_tasks_by_menu[mid] = task
+
                 instance.items.all().delete()
-                
-                # Создаем новые items
+
                 if items:
                     self._upsert_items(instance, items)
-                
-                # Восстанавливаем KitchenTask для соответствующих menu_item
+
                 if active_tasks_by_menu:
-                    # Получаем созданные items, сгруппированные по menu_item_id
-                    created_items_by_menu = {}
-                    for item in instance.items.select_related('menu_item').all():
-                        if not item.menu_item_id:
-                            continue
-                        if item.menu_item_id not in created_items_by_menu:
-                            created_items_by_menu[item.menu_item_id] = []
-                        created_items_by_menu[item.menu_item_id].append(item)
-                    
-                    # Восстанавливаем активные задачи
+                    created_by_menu = {
+                        item.menu_item_id: item
+                        for item in instance.items.select_related("menu_item").all()
+                        if item.menu_item_id
+                    }
                     tasks_to_restore = []
                     tasks_to_update = []
-                    for (menu_item_id, unit_index), task_data in active_tasks_by_menu.items():
-                        # Ищем соответствующий новый item по menu_item_id
-                        matching_items = created_items_by_menu.get(menu_item_id, [])
-                        if matching_items:
-                            # Берем первый подходящий item (или можно выбрать по другим критериям)
-                            matching_item = matching_items[0]
-                            
-                            # Проверяем, что unit_index не превышает quantity нового item
-                            if unit_index <= matching_item.quantity:
-                                # Проверяем, существует ли уже задача с таким order_item и unit_index
-                                # (она могла быть создана сигналом со статусом PENDING)
-                                existing_task = KitchenTask.objects.filter(
+                    for menu_item_id, task_data in active_tasks_by_menu.items():
+                        matching_item = created_by_menu.get(menu_item_id)
+                        if not matching_item:
+                            continue
+                        existing_task = KitchenTask.objects.filter(order_item=matching_item).first()
+                        if existing_task:
+                            existing_task.status = task_data["status"]
+                            existing_task.cook_id = task_data["cook_id"]
+                            existing_task.started_at = task_data["started_at"]
+                            existing_task.finished_at = task_data["finished_at"]
+                            existing_task.waiter = instance.waiter
+                            existing_task.quantity = matching_item.quantity
+                            tasks_to_update.append(existing_task)
+                        else:
+                            tasks_to_restore.append(
+                                KitchenTask(
+                                    company=instance.company,
+                                    branch=instance.branch,
+                                    order=instance,
                                     order_item=matching_item,
-                                    unit_index=unit_index
-                                ).first()
-                                
-                                if existing_task:
-                                    # Если задача уже существует (создана сигналом), обновляем её
-                                    existing_task.status = task_data['status']
-                                    existing_task.cook_id = task_data['cook_id']
-                                    existing_task.started_at = task_data['started_at']
-                                    existing_task.finished_at = task_data['finished_at']
-                                    existing_task.waiter = instance.waiter
-                                    tasks_to_update.append(existing_task)
-                                else:
-                                    # Если задачи нет, создаем новую
-                                    tasks_to_restore.append(
-                                        KitchenTask(
-                                            company=instance.company,
-                                            branch=instance.branch,
-                                            order=instance,
-                                            order_item=matching_item,
-                                            menu_item_id=menu_item_id,
-                                            waiter=instance.waiter,
-                                            unit_index=unit_index,
-                                            status=task_data['status'],
-                                            cook_id=task_data['cook_id'],
-                                            started_at=task_data['started_at'],
-                                            finished_at=task_data['finished_at'],
-                                        )
-                                    )
-                    
-                    # Обновляем существующие задачи
+                                    menu_item_id=menu_item_id,
+                                    waiter=instance.waiter,
+                                    unit_index=1,
+                                    quantity=matching_item.quantity,
+                                    status=task_data["status"],
+                                    cook_id=task_data["cook_id"],
+                                    started_at=task_data["started_at"],
+                                    finished_at=task_data["finished_at"],
+                                )
+                            )
                     if tasks_to_update:
                         KitchenTask.objects.bulk_update(
                             tasks_to_update,
-                            ['status', 'cook_id', 'started_at', 'finished_at', 'waiter_id'],
-                            batch_size=100
+                            ["status", "cook_id", "started_at", "finished_at", "waiter_id", "quantity"],
+                            batch_size=100,
                         )
-                    
-                    # Создаем новые задачи
                     if tasks_to_restore:
                         KitchenTask.objects.bulk_create(tasks_to_restore, ignore_conflicts=True)
         return instance
@@ -1826,7 +1912,9 @@ class OrderRefundSerializer(serializers.Serializer):
 class OrderItemRefundSerializer(serializers.Serializer):
     """Возврат по строке заказа: POST .../orders/<id>/refund-item/"""
     order_item_id = serializers.UUIDField()
-    quantity = serializers.IntegerField(required=False, allow_null=True, min_value=1)
+    quantity = serializers.DecimalField(
+        required=False, allow_null=True, max_digits=12, decimal_places=3, min_value=Decimal("0.001"),
+    )
     payment_method = serializers.ChoiceField(
         choices=[
             ("cash", "Наличные"),

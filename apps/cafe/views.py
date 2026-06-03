@@ -2063,6 +2063,8 @@ def _cafe_archive_order_snapshot(order: Order):
                     menu_item_title=(it.service_title or "").strip() or "Услуга",
                     menu_item_price=it.unit_price or Decimal("0"),
                     quantity=it.quantity,
+                    menu_item_is_sold_by_weight=False,
+                    menu_item_sale_unit="kg",
                     refunded_quantity=getattr(it, "refunded_quantity", 0) or 0,
                     is_rejected=it.is_rejected,
                     rejection_reason=it.rejection_reason or "",
@@ -2078,6 +2080,8 @@ def _cafe_archive_order_snapshot(order: Order):
                     menu_item_title=mi.title if mi else "",
                     menu_item_price=mi.price if mi else Decimal("0"),
                     quantity=it.quantity,
+                    menu_item_is_sold_by_weight=bool(it.menu_item_is_sold_by_weight),
+                    menu_item_sale_unit=(it.menu_item_sale_unit or "kg"),
                     refunded_quantity=getattr(it, "refunded_quantity", 0) or 0,
                     is_rejected=it.is_rejected,
                     rejection_reason=it.rejection_reason or "",
@@ -2600,19 +2604,30 @@ class OrderItemRefundView(CompanyBranchQuerysetMixin, APIView):
             if item.is_rejected:
                 return Response({"detail": "По отказанной позиции возврат не оформляется."}, status=400)
 
-            remaining = (item.quantity or 0) - (item.refunded_quantity or 0)
+            from .weight import quantize_quantity, validate_refund_quantity
+
+            remaining = quantize_quantity(
+                Decimal(item.quantity or 0) - Decimal(item.refunded_quantity or 0)
+            )
             if remaining <= 0:
                 return Response({"detail": "По этой строке уже всё возвращено."}, status=400)
 
+            sold = bool(item.menu_item_is_sold_by_weight)
+            sale_unit = (item.menu_item_sale_unit or "kg").strip().lower()
             if qty_req is None:
                 qty = remaining
             else:
-                qty = int(qty_req)
-                if qty < 1 or qty > remaining:
-                    return Response(
-                        {"detail": f"Некорректное количество (доступно к возврату: {remaining})."},
-                        status=400,
+                from rest_framework.exceptions import ValidationError as DRFValidationError
+
+                try:
+                    qty = validate_refund_quantity(
+                        qty_req,
+                        is_sold_by_weight=sold,
+                        sale_unit=sale_unit,
+                        remaining=remaining,
                     )
+                except DRFValidationError as exc:
+                    return Response(exc.detail, status=400)
 
             unit = _cafe_order_item_unit_price(item).quantize(Decimal("0.01"))
             line_amt = (unit * Decimal(qty)).quantize(Decimal("0.01"))
@@ -3286,6 +3301,15 @@ def send_kitchen_task_ready_notification(task):
             "table": (task.order.table.number if task.order_id and task.order.table_id else None),
             "menu_item": (task.menu_item.title if task.menu_item_id else None),
             "unit_index": task.unit_index,
+            "quantity": str(task.quantity),
+            "menu_item_is_sold_by_weight": bool(
+                getattr(task.menu_item, "is_sold_by_weight", False) if task.menu_item_id else False
+            ),
+            "menu_item_sale_unit": (
+                (getattr(task.menu_item, "sale_unit", None) or "kg")
+                if task.menu_item_id and getattr(task.menu_item, "is_sold_by_weight", False)
+                else None
+            ),
             "company_id": company_id,
             "branch_id": branch_id,
         }

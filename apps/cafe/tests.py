@@ -1609,3 +1609,63 @@ class CafePreparationTechCardTestCase(TransactionTestCase):
         self.assertEqual(sauce.stock_quantity, Decimal("2"))
         mayo_after = Decimal(str(self.mayo.remainder).replace(",", "."))
         self.assertEqual(mayo_before - mayo_after, Decimal("1"))
+
+
+class CafeWeightedMenuItemTestCase(TestCase):
+    """Весовые блюда: меню, строка заказа, сумма, возврат, задача кухни."""
+
+    def setUp(self):
+        self.owner = User.objects.create_user(email="weight_owner@test.com", password="testpass123")
+        self.company = Company.objects.create(name="Weight Cafe", owner=self.owner)
+        self.branch = Branch.objects.create(name="Main", company=self.company)
+        self.user = User.objects.create_user(email="weight_waiter@test.com", password="testpass123")
+        self.user.company = self.company
+        self.user.save()
+        self.category = Category.objects.create(
+            company=self.company, branch=self.branch, title="Горячее",
+        )
+        self.fish = MenuItem.objects.create(
+            company=self.company,
+            branch=self.branch,
+            category=self.category,
+            title="Рыба на гриле",
+            price=Decimal("1200.00"),
+            is_active=True,
+            is_sold_by_weight=True,
+            sale_unit="kg",
+        )
+        self.api_factory = APIRequestFactory()
+
+    def test_weighted_order_line_total_and_snapshots(self):
+        order = Order.objects.create(
+            company=self.company,
+            branch=self.branch,
+            waiter=self.user,
+            guests=1,
+            status=Order.Status.OPEN,
+        )
+        item = OrderItem.objects.create(
+            company=self.company,
+            order=order,
+            menu_item=self.fish,
+            unit_price=Decimal("1200.00"),
+            quantity=Decimal("1.500"),
+        )
+        item.refresh_from_db()
+        self.assertTrue(item.menu_item_is_sold_by_weight)
+        self.assertEqual(item.menu_item_sale_unit, "kg")
+
+        order.recalc_total()
+        self.assertEqual(order.total_amount, Decimal("1800.00"))
+
+        from apps.cafe.models import KitchenTask
+
+        task = KitchenTask.objects.get(order_item=item)
+        self.assertEqual(task.quantity, Decimal("1.500"))
+
+    def test_piece_menu_rejects_fractional_quantity(self):
+        from rest_framework.exceptions import ValidationError as DRFValidationError
+        from apps.cafe.weight import validate_order_item_quantity
+
+        with self.assertRaises(DRFValidationError):
+            validate_order_item_quantity("1.5", is_sold_by_weight=False)

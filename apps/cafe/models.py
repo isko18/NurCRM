@@ -104,8 +104,12 @@ class KitchenTask(models.Model):
         null=True, blank=True, related_name='kitchen_cook_tasks', verbose_name='Повар'
     )
 
-    # если у OrderItem.quantity > 1 — создаём столько задач, нумеруем:
+    # Одна задача на строку заказа; quantity — порции или вес (кг/г).
     unit_index = models.PositiveSmallIntegerField('Номер порции', default=1, validators=[MinValueValidator(1)])
+    quantity = models.DecimalField(
+        'Количество', max_digits=12, decimal_places=3, default=Decimal('1'),
+        validators=[MinValueValidator(Decimal('0.001'))],
+    )
 
     status = models.CharField('Статус', max_length=16, choices=Status.choices, default=Status.PENDING, db_index=True)
     created_at = models.DateTimeField('Создано', auto_now_add=True)
@@ -116,7 +120,7 @@ class KitchenTask(models.Model):
         verbose_name = 'Задача кухни'
         verbose_name_plural = 'Задачи кухни'
         constraints = [
-            models.UniqueConstraint(fields=['order_item', 'unit_index'], name='uniq_kitchen_task_per_unit'),
+            models.UniqueConstraint(fields=['order_item'], name='uniq_kitchen_task_per_order_item'),
         ]
         indexes = [
             models.Index(fields=['company', 'branch', 'status', 'created_at']),
@@ -581,6 +585,11 @@ class MenuItem(models.Model):
     )
     price = models.DecimalField("Цена продажи", max_digits=11, decimal_places=3)
     is_active = models.BooleanField("Активно в продаже", default=True)
+    is_sold_by_weight = models.BooleanField("Продажа на вес", default=False)
+    sale_unit = models.CharField(
+        "Единица продажи", max_length=8, default="kg",
+        help_text='Только "kg" или "g" для весовых блюд.',
+    )
 
     # Себестоимость и расходы
     cost_price = models.DecimalField(
@@ -654,6 +663,14 @@ class MenuItem(models.Model):
                 raise ValidationError({"kitchen": "Кухня принадлежит другой компании."})
             if (self.kitchen.branch_id or None) != (self.branch_id or None):
                 raise ValidationError({"kitchen": "Кухня другого филиала."})
+
+        if self.is_sold_by_weight:
+            unit = (self.sale_unit or "kg").strip().lower()
+            if unit not in ("kg", "g"):
+                raise ValidationError({"sale_unit": "Допустимые значения: kg, g."})
+            self.sale_unit = unit
+        else:
+            self.sale_unit = "kg"
 
     def __str__(self):
         return f"{self.title} ({self.category or 'Без категории'})"
@@ -1408,15 +1425,25 @@ class OrderItem(models.Model):
     unit_price = models.DecimalField(
         "Цена за ед.", max_digits=12, decimal_places=2, null=True, blank=True,
     )
-    quantity = models.PositiveIntegerField('Кол-во', default=1, validators=[MinValueValidator(1)])
+    quantity = models.DecimalField(
+        'Кол-во', max_digits=12, decimal_places=3, default=Decimal('1'),
+        validators=[MinValueValidator(Decimal('0.001'))],
+    )
+    menu_item_is_sold_by_weight = models.BooleanField(
+        "Весовое (снимок)", default=False, editable=False,
+    )
+    menu_item_sale_unit = models.CharField(
+        "Ед. продажи (снимок)", max_length=8, default="kg", editable=False,
+    )
     comment = models.CharField("Комментарий", max_length=500, blank=True, default="")
 
     is_rejected = models.BooleanField("Отказ гостя", default=False, db_index=True)
     rejection_reason = models.CharField("Причина отказа", max_length=500, blank=True, default="")
     rejected_at = models.DateTimeField("Отказано в", null=True, blank=True)
 
-    refunded_quantity = models.PositiveIntegerField(
-        "Возвращено (шт.)", default=0, validators=[MinValueValidator(0)],
+    refunded_quantity = models.DecimalField(
+        "Возвращено", max_digits=12, decimal_places=3, default=Decimal('0'),
+        validators=[MinValueValidator(Decimal('0'))],
     )
 
     class Meta:
@@ -1453,14 +1480,27 @@ class OrderItem(models.Model):
                     raise ValidationError({'menu_item': 'Позиция меню другого филиала.'})
         if self.is_rejected and not (self.rejection_reason or "").strip():
             raise ValidationError({'rejection_reason': 'Укажите причину отказа.'})
-        if (self.refunded_quantity or 0) > (self.quantity or 0):
+        if Decimal(self.refunded_quantity or 0) > Decimal(self.quantity or 0):
             raise ValidationError({"refunded_quantity": "Возврат не может превышать количество в строке."})
+
+    def apply_menu_item_weight_snapshot(self):
+        if self.line_kind != self.LineKind.MENU or not self.menu_item_id:
+            self.menu_item_is_sold_by_weight = False
+            self.menu_item_sale_unit = "kg"
+            return
+        mi = self.menu_item
+        if mi is None:
+            return
+        self.menu_item_is_sold_by_weight = bool(mi.is_sold_by_weight)
+        self.menu_item_sale_unit = (mi.sale_unit or "kg").strip().lower() if mi.is_sold_by_weight else "kg"
 
     def save(self, *args, **kwargs):
         if self.order_id:
             if self.company_id and self.company_id != self.order.company_id:
                 raise ValueError("company у позиции не совпадает с company заказа.")
             self.company = self.order.company
+        if self.line_kind == self.LineKind.MENU and self.menu_item_id:
+            self.apply_menu_item_weight_snapshot()
         super().save(*args, **kwargs)
 
     def __str__(self):
@@ -1572,8 +1612,14 @@ class OrderItemHistory(models.Model):
     )
     menu_item_title = models.CharField('Название позиции (снапшот)', max_length=255)
     menu_item_price = models.DecimalField('Цена (снапшот)', max_digits=10, decimal_places=2)
-    quantity = models.PositiveIntegerField('Кол-во', default=1)
-    refunded_quantity = models.PositiveIntegerField("Возвращено (шт.)", default=0)
+    quantity = models.DecimalField(
+        'Кол-во', max_digits=12, decimal_places=3, default=Decimal('1'),
+    )
+    menu_item_is_sold_by_weight = models.BooleanField("Весовое (снимок)", default=False)
+    menu_item_sale_unit = models.CharField("Ед. продажи (снимок)", max_length=8, default="kg")
+    refunded_quantity = models.DecimalField(
+        "Возвращено", max_digits=12, decimal_places=3, default=Decimal('0'),
+    )
     is_rejected = models.BooleanField("Отказ", default=False)
     rejection_reason = models.CharField("Причина отказа", max_length=500, blank=True, default="")
 
@@ -1668,7 +1714,10 @@ class OrderItemRefund(models.Model):
     order_item = models.ForeignKey(
         "OrderItem", on_delete=models.CASCADE, related_name="refunds", verbose_name="Позиция заказа"
     )
-    quantity = models.PositiveIntegerField("Кол-во к возврату", validators=[MinValueValidator(1)])
+    quantity = models.DecimalField(
+        "Кол-во к возврату", max_digits=12, decimal_places=3,
+        validators=[MinValueValidator(Decimal('0.001'))],
+    )
     amount = models.DecimalField(
         "Сумма возврата", max_digits=12, decimal_places=2, validators=[MinValueValidator(Decimal("0.01"))]
     )
@@ -2010,6 +2059,8 @@ def archive_order_before_delete(sender, instance: Order, **kwargs):
                         menu_item_title=(it.service_title or "").strip() or "Услуга",
                         menu_item_price=it.unit_price or Decimal("0"),
                         quantity=it.quantity,
+                        menu_item_is_sold_by_weight=False,
+                        menu_item_sale_unit="kg",
                         is_rejected=it.is_rejected,
                         rejection_reason=it.rejection_reason or "",
                     )
@@ -2024,6 +2075,8 @@ def archive_order_before_delete(sender, instance: Order, **kwargs):
                         menu_item_title=mi.title if mi else "",
                         menu_item_price=mi.price if mi else Decimal("0"),
                         quantity=it.quantity,
+                        menu_item_is_sold_by_weight=bool(it.menu_item_is_sold_by_weight),
+                        menu_item_sale_unit=(it.menu_item_sale_unit or "kg"),
                         is_rejected=it.is_rejected,
                         rejection_reason=it.rejection_reason or "",
                     )
@@ -2036,9 +2089,7 @@ def archive_order_before_delete(sender, instance: Order, **kwargs):
 @receiver(post_save, sender=OrderItem)
 def ensure_kitchen_tasks_for_order_item(sender, instance: "OrderItem", created, **kwargs):
     """
-    Гарантируем наличие unit_index=1..quantity для KitchenTask.
-    - Создаём отсутствующие unit_index (не по count).
-    - При уменьшении quantity удаляем лишние только в PENDING.
+    Одна задача кухни на строку заказа; quantity совпадает с order_item.quantity (в т.ч. дробное).
     """
     if instance.line_kind == OrderItem.LineKind.SERVICE or not instance.menu_item_id:
         KitchenTask.objects.filter(order_item=instance).delete()
@@ -2048,37 +2099,33 @@ def ensure_kitchen_tasks_for_order_item(sender, instance: "OrderItem", created, 
         KitchenTask.objects.filter(order_item=instance).update(status=KitchenTask.Status.CANCELLED)
         return
 
-    need = int(instance.quantity or 0)
-    if need <= 0:
+    qty = Decimal(instance.quantity or 0)
+    if qty <= 0:
+        KitchenTask.objects.filter(order_item=instance).delete()
         return
 
-    qs = KitchenTask.objects.filter(order_item=instance).only("id", "unit_index", "status")
-    existing = set(qs.values_list("unit_index", flat=True))
-
-    missing = [idx for idx in range(1, need + 1) if idx not in existing]
-    if missing:
-        to_create = [
-            KitchenTask(
-                company=instance.company,
-                branch=instance.order.branch,
-                order=instance.order,
-                order_item=instance,
-                menu_item=instance.menu_item,
-                waiter=instance.order.waiter,
-                unit_index=idx,
-            )
-            for idx in missing
-        ]
-        # atomic + ignore_conflicts: переживаем гонки
-        with transaction.atomic():
-            KitchenTask.objects.bulk_create(to_create, ignore_conflicts=True)
-
-    # если quantity уменьшили — удаляем лишние PENDING
-    KitchenTask.objects.filter(
-        order_item=instance,
-        unit_index__gt=need,
-        status=KitchenTask.Status.PENDING,
-    ).delete()
+    defaults = {
+        "company": instance.company,
+        "branch": instance.order.branch,
+        "order": instance.order,
+        "menu_item": instance.menu_item,
+        "waiter": instance.order.waiter,
+        "unit_index": 1,
+        "quantity": qty,
+        "status": KitchenTask.Status.PENDING,
+    }
+    with transaction.atomic():
+        task, was_created = KitchenTask.objects.get_or_create(
+            order_item=instance,
+            defaults=defaults,
+        )
+        if not was_created:
+            task.quantity = qty
+            task.waiter = instance.order.waiter
+            if task.status == KitchenTask.Status.CANCELLED:
+                task.status = KitchenTask.Status.PENDING
+            task.save(update_fields=["quantity", "waiter", "status"])
+        KitchenTask.objects.filter(order_item=instance).exclude(pk=task.pk).delete()
 
 
 class InventorySession(models.Model):

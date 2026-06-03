@@ -273,7 +273,7 @@ class OrderHistoryAdmin(admin.ModelAdmin):
 class KitchenTaskAdmin(admin.ModelAdmin):
     list_display = (
         "menu_item", "order_display", "table_number",
-        "company", "branch", "status", "unit_index",
+        "company", "branch", "status", "quantity", "unit_index",
         "cook", "waiter", "created_at", "started_at", "finished_at",
     )
     list_filter = ("company", "branch", "status", "cook", "waiter", "created_at", "finished_at")
