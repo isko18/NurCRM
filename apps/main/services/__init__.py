@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 
 from django.db import transaction
 from django.utils import timezone
@@ -189,6 +189,25 @@ def _parse_decimal(value, field_name):
             return Decimal("0")
         return Decimal(str(value))
     except Exception:
+        raise ValueError(field_name)
+
+
+def _parse_decimal_nonneg(value, field_name="value", *, default=None, decimal_places=3):
+    """
+    Неотрицательное decimal (остаток товара, вес и т.п.).
+    Пустое значение: default или 0.
+    """
+    try:
+        if value in (None, ""):
+            d = Decimal(str(default)) if default is not None else Decimal("0")
+        else:
+            s = str(value).strip().replace(",", ".")
+            d = Decimal(s)
+        if not d.is_finite() or d < 0:
+            raise ValueError(field_name)
+        quant = Decimal(10) ** -int(decimal_places)
+        return d.quantize(quant, rounding=ROUND_HALF_UP)
+    except (InvalidOperation, ValueError, TypeError):
         raise ValueError(field_name)
 
 

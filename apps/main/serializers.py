@@ -1309,6 +1309,7 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
     # ====== PRICE <-> MARKUP helper ======
 
     _Q2 = Decimal("0.01")
+    _Q3 = Decimal("0.001")
     _Q4 = Decimal("0.0001")
 
     @staticmethod
@@ -1351,7 +1352,7 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
     def _sanitize_decimal_fields(self, instance):
         """Чистим потенциально битые Decimal, чтобы DRF не падал на quantize()."""
         for field, quant in (
-            ("quantity", self._Q2),
+            ("quantity", self._Q3),
             ("purchase_price", self._Q2),
             ("markup_percent", self._Q4),
             ("price", self._Q2),

@@ -81,7 +81,14 @@ from django.db.models import ProtectedError
 from apps.utils import product_images_prefetch, _is_owner_like
 from apps.main.analytics_agent import build_agent_analytics_payload, _parse_period, _compute_agent_on_hand
 from apps.main.analytics_owner_production import build_owner_analytics_payload, _dt_range
-from apps.main.services import _parse_bool_like, _parse_date_to_aware_datetime, _parse_kind, _parse_int_nonneg, _parse_decimal
+from apps.main.services import (
+    _parse_bool_like,
+    _parse_date_to_aware_datetime,
+    _parse_kind,
+    _parse_int_nonneg,
+    _parse_decimal,
+    _parse_decimal_nonneg,
+)
     
 
 
@@ -896,9 +903,9 @@ class ProductCreateByBarcodeAPIView(CompanyBranchRestrictedMixin, generics.Creat
             # иначе считаем price из markup_percent
             price = _calc_price(purchase_price, markup_percent)
 
-        # quantity
+        # quantity (дробный остаток, до 3 знаков: 10.200)
         try:
-            quantity = _parse_int_nonneg(data.get("quantity", 0), "quantity")
+            quantity = _parse_decimal_nonneg(data.get("quantity", 0), "quantity")
         except ValueError:
             return Response({"quantity": "Неверное количество."}, status=status.HTTP_400_BAD_REQUEST)
 
@@ -1308,9 +1315,9 @@ class ProductCreateManualAPIView(CompanyBranchRestrictedMixin, generics.CreateAP
         else:
             price = _calc_price(purchase_price, markup_percent)
 
-        # quantity
+        # quantity (дробный остаток, до 3 знаков: 10.200)
         try:
-            quantity = _parse_int_nonneg(data.get("quantity", 0), "quantity")
+            quantity = _parse_decimal_nonneg(data.get("quantity", 0), "quantity")
         except ValueError:
             return Response({"quantity": "Неверное количество."}, status=status.HTTP_400_BAD_REQUEST)
 

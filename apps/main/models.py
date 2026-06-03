@@ -711,7 +711,7 @@ class Product(models.Model):
     quantity = models.DecimalField(
         "Количество/Остаток",
         max_digits=12,
-        decimal_places=2,
+        decimal_places=3,
         default=0,
         null=True,
         blank=True,
@@ -720,7 +720,7 @@ class Product(models.Model):
     minimum_quantity = models.DecimalField(
         "Минимальный остаток",
         max_digits=12,
-        decimal_places=2,
+        decimal_places=3,
         default=Decimal("0"),
         null=True,
         blank=True,
