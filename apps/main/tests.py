@@ -12,7 +12,7 @@ from apps.main.pos_views import (
     _parse_scale_barcode_loose,
     _should_use_main_stock_in_agent_sale,
 )
-from apps.main.views import ProductWarehouseBarcodeAPIView
+from apps.main.views import ProductWarehouseBarcodeAPIView, ProductCreateManualAPIView
 from apps.users.models import Roles, Company, Branch
 from django.contrib.auth import get_user_model
 
@@ -144,3 +144,40 @@ class ProductWarehouseBarcodeAPITestCase(TestCase):
         force_authenticate(req, user=self.owner)
         resp = ProductWarehouseBarcodeAPIView.as_view()(req, barcode="")
         self.assertEqual(resp.status_code, 400)
+
+
+class ProductCreateManualWholesalePriceTestCase(TestCase):
+    def setUp(self):
+        self.owner = User.objects.create_user(email="owner-wholesale@test.com", password="testpass123")
+        self.company = Company.objects.create(name="Wholesale Market Co", owner=self.owner)
+        self.owner.company = self.company
+        self.owner.save(update_fields=["company"])
+        self.api_factory = APIRequestFactory()
+
+    def test_create_manual_saves_wholesale_price(self):
+        req = self.api_factory.post(
+            "/main/products/create-manual/",
+            {
+                "name": "TEST wholesale",
+                "barcode": "8056241343999",
+                "article": "0343",
+                "unit": "шт",
+                "is_weight": False,
+                "price": "12.24",
+                "wholesale_price": "31",
+                "discount_percent": "0",
+                "purchase_price": "12",
+                "markup_percent": "2",
+                "quantity": 10,
+                "stock": False,
+                "packages_input": [],
+                "promotion_rules_input": [],
+            },
+            format="json",
+        )
+        force_authenticate(req, user=self.owner)
+        resp = ProductCreateManualAPIView.as_view()(req)
+        self.assertEqual(resp.status_code, 201, getattr(resp, "data", resp.content))
+        self.assertEqual(Decimal(str(resp.data["wholesale_price"])), Decimal("31"))
+        product = Product.objects.get(pk=resp.data["id"])
+        self.assertEqual(product.wholesale_price, Decimal("31"))

@@ -886,6 +886,7 @@ class ProductCreateByBarcodeAPIView(CompanyBranchRestrictedMixin, generics.Creat
             purchase_price = _parse_decimal(data.get("purchase_price", 0), "purchase_price")
             markup_percent = _parse_decimal(data.get("markup_percent", 0), "markup_percent")
             discount_percent = _parse_decimal(data.get("discount_percent", 0), "discount_percent")
+            wholesale_price = _parse_decimal(data.get("wholesale_price", 0), "wholesale_price")
         except ValueError as e:
             return Response({str(e): "Неверный формат числа."}, status=status.HTTP_400_BAD_REQUEST)
 
@@ -963,6 +964,7 @@ class ProductCreateByBarcodeAPIView(CompanyBranchRestrictedMixin, generics.Creat
             purchase_price=purchase_price,
             markup_percent=markup_percent,
             price=price,
+            wholesale_price=wholesale_price,
             discount_percent=discount_percent,
 
             quantity=quantity,
@@ -1283,6 +1285,7 @@ class ProductCreateManualAPIView(CompanyBranchRestrictedMixin, generics.CreateAP
             purchase_price = _parse_decimal(data.get("purchase_price", 0), "purchase_price")
             markup_percent = _parse_decimal(data.get("markup_percent", 0), "markup_percent")
             discount_percent = _parse_decimal(data.get("discount_percent", 0), "discount_percent")
+            wholesale_price = _parse_decimal(data.get("wholesale_price", 0), "wholesale_price")
         except ValueError as e:
             return Response({str(e): "Неверный формат числа."}, status=status.HTTP_400_BAD_REQUEST)
 
@@ -1391,6 +1394,7 @@ class ProductCreateManualAPIView(CompanyBranchRestrictedMixin, generics.CreateAP
             purchase_price=purchase_price,
             markup_percent=markup_percent,
             price=price,
+            wholesale_price=wholesale_price,
             discount_percent=discount_percent,
 
             quantity=quantity,
