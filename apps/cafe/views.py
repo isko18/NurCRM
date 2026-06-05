@@ -59,6 +59,18 @@ from .serializers import (
 )
 from apps.utils import _is_owner_like
 
+
+def _can_cafe_order_pay(user) -> bool:
+    if _is_owner_like(user):
+        return True
+    return bool(getattr(user, "can_view_cafe_order_pay", False))
+
+
+def _can_cafe_order_return(user) -> bool:
+    if _is_owner_like(user):
+        return True
+    return bool(getattr(user, "can_view_cafe_order_return", False))
+
 from .services.costing import (
     recalculate_dish,
     recalculate_preparation,
@@ -69,8 +81,12 @@ from .services.costing import (
 )
 from .services.stock import consume_dish_for_order, receive_preparation
 from .services.warehouse_expense import (
+    attach_expense_to_response,
     create_warehouse_initial_expense,
     create_warehouse_receipt_expense,
+    equipment_on_create,
+    equipment_on_price_update,
+    equipment_receive,
 )
 
 
@@ -2113,6 +2129,11 @@ class OrderPayView(CompanyBranchQuerysetMixin, APIView):
     ВАЖНО: архивируем в OrderHistory сразу (история НЕ зависит от удаления заказа).
     """
     def post(self, request, pk):
+        if not _can_cafe_order_pay(request.user):
+            return Response(
+                {"detail": "Недостаточно прав для проведения оплаты заказа."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
         company = self._user_company()
         if not company:
             return Response({"detail": "Компания не найдена."}, status=status.HTTP_403_FORBIDDEN)
@@ -2566,6 +2587,11 @@ class OrderItemRefundView(CompanyBranchQuerysetMixin, APIView):
     permission_classes = [permissions.IsAuthenticated]
 
     def post(self, request, pk):
+        if not _can_cafe_order_return(request.user):
+            return Response(
+                {"detail": "Недостаточно прав для возврата по заказу."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
         company = self._user_company()
         if not company:
             return Response({"detail": "Компания не найдена."}, status=status.HTTP_403_FORBIDDEN)
@@ -3081,10 +3107,70 @@ class EquipmentListCreateView(CompanyBranchQuerysetMixin, generics.ListCreateAPI
     search_fields = ["title", "serial_number", "category", "notes"]
     ordering_fields = ["title", "condition", "is_active", "purchase_date", "id"]
 
+    def create(self, request, *args, **kwargs):
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        self.perform_create(serializer)
+        expense = equipment_on_create(equipment=serializer.instance, user=request.user)
+        if expense:
+            invalidate_cafe_analytics_cache(serializer.instance.company_id)
+        data = attach_expense_to_response(dict(serializer.data), expense)
+        return Response(data, status=status.HTTP_201_CREATED)
+
 
 class EquipmentRetrieveUpdateDestroyView(CompanyBranchQuerysetMixin, generics.RetrieveUpdateDestroyAPIView):
     queryset = Equipment.objects.select_related("company", "branch")
     serializer_class = EquipmentSerializer
+
+    def update(self, request, *args, **kwargs):
+        partial = kwargs.pop("partial", False)
+        instance = self.get_object()
+        old_price = instance.price
+        serializer = self.get_serializer(instance, data=request.data, partial=partial)
+        serializer.is_valid(raise_exception=True)
+        self.perform_update(serializer)
+        expense = equipment_on_price_update(
+            equipment=serializer.instance,
+            old_price=old_price,
+            user=request.user,
+        )
+        if expense:
+            invalidate_cafe_analytics_cache(serializer.instance.company_id)
+        data = attach_expense_to_response(dict(serializer.data), expense)
+        return Response(data)
+
+
+class EquipmentReceiveView(CompanyBranchQuerysetMixin, APIView):
+    """POST /cafe/equipment/<uuid:pk>/receive/ — докупка оборудования с авто-расходом «Закупки»."""
+
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request, pk):
+        company = self._user_company()
+        if not company:
+            return Response({"detail": "Компания не найдена."}, status=status.HTTP_403_FORBIDDEN)
+
+        eq = generics.get_object_or_404(Equipment.objects.filter(company=company), pk=pk)
+        active_branch = self._active_branch()
+        if active_branch is not None and eq.branch_id not in (None, active_branch.id):
+            return Response({"detail": "Позиция другого филиала."}, status=status.HTTP_404_NOT_FOUND)
+
+        from .serializers import EquipmentReceiveSerializer
+        ser = EquipmentReceiveSerializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+        expense = equipment_receive(
+            equipment=eq,
+            quantity=ser.validated_data["quantity"],
+            unit_price=ser.validated_data["unit_price"],
+            user=request.user,
+            note=ser.validated_data.get("note") or "",
+        )
+        invalidate_cafe_analytics_cache(company.id)
+        data = attach_expense_to_response(
+            EquipmentSerializer(eq, context={"request": request}).data,
+            expense,
+        )
+        return Response(data, status=status.HTTP_200_OK)
 
 
 class EquipmentInventorySessionListCreateView(CompanyBranchQuerysetMixin, generics.ListCreateAPIView):

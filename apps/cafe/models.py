@@ -1885,6 +1885,11 @@ class CafeExpense(models.Model):
         WAREHOUSE_RECEIPT = "warehouse_receipt", "Оприходование склада"
         WAREHOUSE_CREATE = "warehouse_create", "Создание позиции склада"
         HOUSEHOLD_RECEIPT = "household_receipt", "Оприходование посуды"
+        HOUSEHOLD_CREATE = "household_create", "Создание позиции посуды"
+        EQUIPMENT_CREATE = "equipment_create", "Создание оборудования"
+        EQUIPMENT_PRICE_SET = "equipment_price_set", "Первая цена оборудования"
+        EQUIPMENT_RECEIPT = "equipment_receipt", "Докупка оборудования"
+        INVENTORY_CONFIRM = "inventory_confirm", "Инвентаризация склада (излишек)"
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     company = models.ForeignKey(
@@ -2209,18 +2214,12 @@ class InventorySession(models.Model):
     def confirm(self, user=None):
         """
         Применяет фактические остатки к Warehouse.remainder.
-        ВНИМАНИЕ: у вас remainder=CharField, поэтому пишем строкой Decimal.
+        При излишке — оприходование и авто-расход «Закупки» (см. warehouse_expense).
         """
         if self.is_confirmed:
             return
-        for item in self.items.select_related("product"):
-            # фиксируем актуальный остаток в карточке товара
-            # переводим Decimal -> строка (без форматирования единиц)
-            item.product.remainder = str(item.actual_qty)
-            item.product.save(update_fields=["remainder"])
-        self.is_confirmed = True
-        self.confirmed_at = timezone.now()
-        self.save(update_fields=["is_confirmed", "confirmed_at"])
+        from apps.cafe.services.warehouse_expense import apply_inventory_session_confirm
+        apply_inventory_session_confirm(session=self, user=user)
 
 
 class InventoryItem(models.Model):

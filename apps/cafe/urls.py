@@ -24,7 +24,7 @@ from .views import (
     KitchenTaskListView, KitchenTaskClaimView, KitchenTaskClaimBulkView, KitchenTaskReadyView, KitchenTaskReadyBulkView, KitchenTaskRetrieveUpdateDestroyView, KitchenTaskMonitorView,
     KitchenAnalyticsByCookView, KitchenAnalyticsByWaiterView,
     NotificationListView, InventorySessionListCreateView, InventorySessionRetrieveView, InventorySessionConfirmView,
-    EquipmentListCreateView, EquipmentRetrieveUpdateDestroyView,
+    EquipmentListCreateView, EquipmentRetrieveUpdateDestroyView, EquipmentReceiveView,
     EquipmentInventorySessionListCreateView, EquipmentInventorySessionRetrieveView, EquipmentInventorySessionConfirmView,
 
     KitchenListCreateView, KitchenRetrieveUpdateDestroyView, OrderClosedListView, OrderPayView, OrderPayDebtView,
@@ -248,6 +248,7 @@ urlpatterns = [
     # ==================== INVENTORY: оборудование ====================
     path("equipment/", EquipmentListCreateView.as_view(), name="equipment-list"),
     path("equipment/<uuid:pk>/", EquipmentRetrieveUpdateDestroyView.as_view(), name="equipment-detail"),
+    path("equipment/<uuid:pk>/receive/", EquipmentReceiveView.as_view(), name="equipment-receive"),
     path("equipment/inventory/sessions/", EquipmentInventorySessionListCreateView.as_view(), name="equipment-inventory-session-list"),
     path("equipment/inventory/sessions/<uuid:pk>/", EquipmentInventorySessionRetrieveView.as_view(), name="equipment-inventory-session-detail"),
     path("equipment/inventory/sessions/<uuid:pk>/confirm/", EquipmentInventorySessionConfirmView.as_view(), name="equipment-inventory-session-confirm"),

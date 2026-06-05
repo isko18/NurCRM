@@ -1915,6 +1915,75 @@ class ProductByBarcodeAPIView(CompanyBranchRestrictedMixin, generics.RetrieveAPI
             raise NotFound(detail="Товар с таким штрих-кодом не найден")
         return product
 
+
+class ProductWarehouseBarcodeAPIView(CompanyBranchRestrictedMixin, APIView):
+    """
+    GET /main/products/warehouse-barcode/<barcode>/
+    Поиск товара по штрихкоду для склада маркета (/crm/sklad).
+    Та же логика резолва, что POS scan, без корзины и продажи.
+    """
+
+    def _warehouse_product_queryset(self):
+        qs = (
+            Product.objects
+            .select_related(
+                "company",
+                "branch",
+                "brand",
+                "category",
+                "client",
+                "created_by",
+                "characteristics",
+            )
+            .prefetch_related(
+                "item_make",
+                "packages",
+                "recipe_items__item_make",
+                "promotion_tiers",
+                "alternate_barcodes",
+                product_images_prefetch,
+            )
+        )
+        qs = _filter_products_company_only(self, qs)
+        qs = qs.exclude(status=Product.Status.REJECTED)
+        branch_param = (self.request.query_params.get("branch") or "").strip()
+        if branch_param:
+            try:
+                branch_uuid = UUID(branch_param)
+            except (ValueError, TypeError, AttributeError):
+                raise ValidationError({"branch": "Некорректный UUID филиала."})
+            qs = qs.filter(Q(branch_id=branch_uuid) | Q(branch__isnull=True))
+        return _annotate_product_is_favorite(qs)
+
+    def get(self, request, barcode, *args, **kwargs):
+        from apps.main.pos_views import _lookup_product_for_pos_scan
+
+        barcode = (barcode or "").strip()
+        if not barcode:
+            return Response({"detail": "Пустой штрихкод."}, status=status.HTTP_400_BAD_REQUEST)
+
+        company = self._company()
+        if not company:
+            return Response({"detail": "Компания не найдена."}, status=status.HTTP_403_FORBIDDEN)
+
+        product_stub, _scale_data, lookup_error = _lookup_product_for_pos_scan(company.id, barcode)
+        if not product_stub:
+            return Response(
+                {"detail": lookup_error or "Товар с таким штрих-кодом не найден."},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        product = self._warehouse_product_queryset().filter(pk=product_stub.pk).first()
+        if not product:
+            return Response(
+                {"detail": "Товар с таким штрих-кодом не найден."},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        data = ProductSerializer(product, context={"request": request}).data
+        return Response({"product": data, "matched_barcode": barcode})
+
+
 # ===========================
 #  Reviews
 # ===========================

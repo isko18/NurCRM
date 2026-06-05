@@ -259,6 +259,7 @@ class UserSerializer(serializers.ModelSerializer):
             "can_view_cafe_purchasing", "can_view_cafe_booking",
             "can_view_cafe_clients", "can_view_cafe_tables",
             "can_view_cafe_cook", "can_view_cafe_inventory", "can_view_cafe_calculation",
+            "can_view_cafe_order_pay", "can_view_cafe_order_return",
 
             "can_view_school_students", "can_view_school_groups",
             "can_view_school_lessons", "can_view_school_teachers",

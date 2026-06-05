@@ -2020,13 +2020,23 @@ class InventorySessionSerializer(CompanyBranchReadOnlyMixin):
 # INVENTORY (оборудование)
 # ==========================
 class EquipmentSerializer(CompanyBranchReadOnlyMixin):
+    expense_id = serializers.UUIDField(read_only=True, required=False, allow_null=True)
+    expense_amount = serializers.CharField(read_only=True, required=False, allow_null=True)
+
     class Meta:
         model = Equipment
         fields = [
             "id", "company", "branch", "title", "serial_number",
             "category", "purchase_date", "price", "condition", "is_active", "notes",
+            "expense_id", "expense_amount",
         ]
-        read_only_fields = ["id", "company", "branch"]
+        read_only_fields = ["id", "company", "branch", "expense_id", "expense_amount"]
+
+
+class EquipmentReceiveSerializer(serializers.Serializer):
+    quantity = serializers.DecimalField(max_digits=12, decimal_places=3, min_value=Decimal("0.001"))
+    unit_price = serializers.DecimalField(max_digits=12, decimal_places=2, min_value=Decimal("0.01"))
+    note = serializers.CharField(required=False, allow_blank=True, default="")
 
 
 class EquipmentInventoryItemSerializer(serializers.ModelSerializer):

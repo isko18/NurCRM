@@ -409,6 +409,12 @@ class User(AbstractBaseUser, PermissionsMixin):
     can_view_cafe_cook = models.BooleanField(default=False, blank=True, null=True, verbose_name="Кафе: Кухня")
     can_view_cafe_inventory = models.BooleanField(default=False, blank=True, null=True, verbose_name="Кафе: Инвентаризация")
     can_view_cafe_calculation = models.BooleanField(default=False, blank=True, null=True, verbose_name="Кафе: калькуляция")
+    can_view_cafe_order_pay = models.BooleanField(
+        default=False, blank=True, null=True, verbose_name="Кафе: проведение оплаты заказов"
+    )
+    can_view_cafe_order_return = models.BooleanField(
+        default=False, blank=True, null=True, verbose_name="Кафе: возврат по заказам"
+    )
 
     can_view_school_students = models.BooleanField(default=False, blank=True, null=True, verbose_name="Школа: ученики")
     can_view_school_groups = models.BooleanField(default=False, blank=True, null=True, verbose_name="Школа: группы")

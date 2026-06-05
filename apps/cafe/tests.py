@@ -10,7 +10,7 @@ from rest_framework.test import APIRequestFactory, force_authenticate
 from apps.users.models import Company, Branch
 from apps.cafe.models import (
     Zone, Table, Order, OrderItem, MenuItem, Category, CafeClient, Kitchen, OrderDebtPayment,
-    CafeWaiterPayProfile,
+    CafeWaiterPayProfile, OrderCheckoutPayment, CafeExpense,
     Warehouse, Preparation, PreparationIngredient, ProcessingType,
     DishIngredient, DishIngredientProcessing,
 )
@@ -19,6 +19,8 @@ from apps.cafe.analytics import (
     SalesByMenuItemView,
     CafeWaiterSalaryReportView,
     CafeUnifiedAnalyticsView,
+    RevenueInflowView,
+    CafeFinanceAnalyticsView,
 )
 from apps.cafe.views import (
     send_order_created_notification,
@@ -28,6 +30,7 @@ from apps.cafe.views import (
     OrderPayDebtView,
     OrderRetrieveUpdateDestroyView,
     TechCardsExportView,
+    EquipmentListCreateView,
 )
 from apps.cafe.services.costing import (
     convert_quantity,
@@ -1669,3 +1672,170 @@ class CafeWeightedMenuItemTestCase(TestCase):
 
         with self.assertRaises(DRFValidationError):
             validate_order_item_quantity("1.5", is_sold_by_weight=False)
+
+
+class CafeSplitPaymentAnalyticsTestCase(TestCase):
+    """Смешанная оплата: аналитика по payments[], без строки split на всю сумму."""
+
+    def setUp(self):
+        self.owner = User.objects.create_user(email="owner-split@test.com", password="testpass123")
+        self.company = Company.objects.create(name="Split Cafe", owner=self.owner)
+        self.branch = Branch.objects.create(name="Split Branch", company=self.company)
+        self.zone = Zone.objects.create(company=self.company, branch=self.branch, title="Z")
+        self.table = Table.objects.create(
+            company=self.company, branch=self.branch, zone=self.zone, number=3, places=4
+        )
+        self.category = Category.objects.create(company=self.company, branch=self.branch, title="Food")
+        self.menu_item = MenuItem.objects.create(
+            company=self.company,
+            branch=self.branch,
+            category=self.category,
+            title="Burger",
+            price=Decimal("1000.00"),
+            is_active=True,
+        )
+        self.api_factory = APIRequestFactory()
+        self.paid_at = timezone.now()
+
+    def _make_paid_split_order(self, cash_amt, card_amt):
+        order = Order.objects.create(
+            company=self.company,
+            branch=self.branch,
+            table=self.table,
+            guests=1,
+            status=Order.Status.CLOSED,
+            is_paid=True,
+            paid_at=self.paid_at,
+            payment_method=Order.PaymentMethod.SPLIT,
+            total_amount=Decimal("1000.00"),
+            paid_amount=Decimal("1000.00"),
+        )
+        OrderItem.objects.create(
+            company=self.company, order=order, menu_item=self.menu_item, quantity=1
+        )
+        OrderCheckoutPayment.objects.create(order=order, payment_method="cash", amount=cash_amt)
+        OrderCheckoutPayment.objects.create(order=order, payment_method="card", amount=card_amt)
+        return order
+
+    def test_revenue_inflow_splits_by_checkout_payments(self):
+        self._make_paid_split_order(Decimal("600.00"), Decimal("400.00"))
+        req = self.api_factory.get(
+            "/cafe/analytics/revenue-inflow/",
+            {"date_from": timezone.localdate().isoformat(), "date_to": timezone.localdate().isoformat()},
+        )
+        force_authenticate(req, user=self.owner)
+        resp = RevenueInflowView.as_view()(req)
+        self.assertEqual(resp.status_code, 200)
+        by_method = {row["payment_method"]: row for row in resp.data["by_method"]}
+        self.assertNotIn("split", by_method)
+        self.assertEqual(Decimal(by_method["cash"]["total"]), Decimal("600.00"))
+        self.assertEqual(Decimal(by_method["card"]["total"]), Decimal("400.00"))
+        self.assertEqual(Decimal(resp.data["by_channel"]["cash"]["total"]), Decimal("600.00"))
+        self.assertEqual(Decimal(resp.data["by_channel"]["non_cash"]["total"]), Decimal("400.00"))
+
+    def test_finance_income_breakdown_no_split_row(self):
+        self._make_paid_split_order(Decimal("500.00"), Decimal("500.00"))
+        req = self.api_factory.get(
+            "/cafe/analytics/finance/",
+            {"date_from": timezone.localdate().isoformat(), "date_to": timezone.localdate().isoformat()},
+        )
+        force_authenticate(req, user=self.owner)
+        resp = CafeFinanceAnalyticsView.as_view()(req)
+        self.assertEqual(resp.status_code, 200)
+        methods = {row["method"] for row in resp.data["income_breakdown"]}
+        self.assertNotIn("split", methods)
+        self.assertIn("cash", methods)
+        self.assertIn("card", methods)
+
+
+class CafeEquipmentExpenseTestCase(TestCase):
+    def setUp(self):
+        self.owner = User.objects.create_user(email="owner-eq@test.com", password="testpass123")
+        self.company = Company.objects.create(name="Eq Cafe", owner=self.owner)
+        self.branch = Branch.objects.create(name="Eq Branch", company=self.company)
+        self.api_factory = APIRequestFactory()
+
+    def test_create_equipment_creates_zakupki_expense(self):
+        req = self.api_factory.post(
+            "/cafe/equipment/",
+            {
+                "title": "Холодильник",
+                "price": "45000.00",
+                "purchase_date": timezone.localdate().isoformat(),
+                "condition": "good",
+            },
+            format="json",
+        )
+        force_authenticate(req, user=self.owner)
+        resp = EquipmentListCreateView.as_view()(req)
+        self.assertEqual(resp.status_code, 201, getattr(resp, "data", resp.content))
+        self.assertIsNotNone(resp.data.get("expense_id"))
+        self.assertEqual(resp.data.get("expense_amount"), "45000.00")
+        expense = CafeExpense.objects.get(pk=resp.data["expense_id"])
+        self.assertEqual(expense.source, CafeExpense.Source.EQUIPMENT_CREATE)
+        self.assertEqual(expense.category_slug, "zakupki")
+
+
+class CafeOrderPayPermissionTestCase(TestCase):
+    def setUp(self):
+        self.owner = User.objects.create_user(email="owner-payperm@test.com", password="testpass123")
+        self.company = Company.objects.create(name="Perm Cafe", owner=self.owner)
+        self.branch = Branch.objects.create(name="Perm Branch", company=self.company)
+        self.waiter = User.objects.create_user(email="waiter-payperm@test.com", password="testpass123")
+        self.waiter.company = self.company
+        self.waiter.can_view_cafe_order_pay = False
+        self.waiter.save()
+        self.zone = Zone.objects.create(company=self.company, branch=self.branch, title="Z")
+        self.table = Table.objects.create(
+            company=self.company, branch=self.branch, zone=self.zone, number=1, places=4
+        )
+        self.category = Category.objects.create(company=self.company, branch=self.branch, title="C")
+        self.menu_item = MenuItem.objects.create(
+            company=self.company,
+            branch=self.branch,
+            category=self.category,
+            title="Soup",
+            price=Decimal("100.00"),
+            is_active=True,
+        )
+        self.api_factory = APIRequestFactory()
+
+    def test_pay_forbidden_without_permission(self):
+        order = Order.objects.create(
+            company=self.company,
+            branch=self.branch,
+            table=self.table,
+            waiter=self.waiter,
+            guests=1,
+            status=Order.Status.OPEN,
+        )
+        OrderItem.objects.create(company=self.company, order=order, menu_item=self.menu_item, quantity=1)
+        req = self.api_factory.post(
+            f"/cafe/orders/{order.id}/pay/",
+            {"payment_method": "cash", "close_order": True},
+            format="json",
+        )
+        force_authenticate(req, user=self.waiter)
+        resp = OrderPayView.as_view()(req, pk=str(order.id))
+        self.assertEqual(resp.status_code, 403)
+
+    def test_pay_allowed_with_permission(self):
+        self.waiter.can_view_cafe_order_pay = True
+        self.waiter.save(update_fields=["can_view_cafe_order_pay"])
+        order = Order.objects.create(
+            company=self.company,
+            branch=self.branch,
+            table=self.table,
+            waiter=self.waiter,
+            guests=1,
+            status=Order.Status.OPEN,
+        )
+        OrderItem.objects.create(company=self.company, order=order, menu_item=self.menu_item, quantity=1)
+        req = self.api_factory.post(
+            f"/cafe/orders/{order.id}/pay/",
+            {"payment_method": "cash", "close_order": True},
+            format="json",
+        )
+        force_authenticate(req, user=self.waiter)
+        resp = OrderPayView.as_view()(req, pk=str(order.id))
+        self.assertEqual(resp.status_code, 200)

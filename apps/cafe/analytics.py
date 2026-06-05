@@ -26,6 +26,8 @@ from django.db.models import (
 from django.db.models.functions import Coalesce, TruncDate, TruncWeek, TruncMonth
 from django.utils import timezone
 
+from collections import defaultdict
+
 from apps.cafe.models import (
     KitchenTask, OrderItem, Purchase, Warehouse, Order, MenuItem,
     CafeExpense, CafeWaiterPayProfile, OrderItemRefund, OrderRefund,
@@ -370,6 +372,114 @@ def _apply_waiter_scope(qs, request, field_name: str):
     if waiter_id:
         qs = qs.filter(**{field_name: waiter_id})
     return qs, waiter_id
+
+
+def _payment_channel(method: str) -> str | None:
+    m = (method or "").strip().lower()
+    if m == "cash":
+        return "cash"
+    if m in ("card", "transfer"):
+        return "non_cash"
+    return None
+
+
+def _split_net_by_parts(net: Decimal, parts: list[tuple[str, Decimal]]) -> list[tuple[str, Decimal]]:
+    """Пропорционально распределяет нетто-выручку заказа по частям оплаты."""
+    if net <= 0 or not parts:
+        return []
+    gross = sum((p[1] for p in parts), Decimal("0"))
+    if gross <= 0:
+        return []
+    allocated = Decimal("0")
+    lines = []
+    for i, (method, part_amount) in enumerate(parts):
+        if i == len(parts) - 1:
+            share = (net - allocated).quantize(Decimal("0.01"))
+        else:
+            share = (net * part_amount / gross).quantize(Decimal("0.01"))
+            allocated += share
+        if share > 0:
+            lines.append((method, share))
+    return lines
+
+
+def _alloc_order_payment_lines(order, net: Decimal) -> list[tuple[str, Decimal]]:
+    """
+    Фактические способы оплаты заказа: split → checkout_payments,
+    долг/предоплата → debt_payments, иначе payment_method + net.
+    """
+    pm = (order.payment_method or "").strip().lower()
+    checkout = list(order.checkout_payments.all())
+    debt = list(order.debt_payments.all())
+
+    if pm == "split" and checkout:
+        parts = [(p.payment_method, _to_decimal(p.amount)) for p in checkout]
+        lines = _split_net_by_parts(net, parts)
+        if lines:
+            return lines
+
+    if debt:
+        parts = [(p.payment_method, _to_decimal(p.amount)) for p in debt]
+        lines = _split_net_by_parts(net, parts)
+        if lines:
+            return lines
+
+    method = pm if pm not in ("split", "debt", "") else "unknown"
+    return [(method, net)]
+
+
+def _aggregate_paid_orders_by_payment(oq):
+    """
+  Агрегация оплаченных заказов по фактическим платежам (не по split целиком).
+  Возвращает (by_method, by_channel).
+    """
+    by_method = defaultdict(lambda: {"total": Decimal("0"), "order_ids": set()})
+    by_channel = {
+        "cash": {"total": Decimal("0"), "order_ids": set()},
+        "non_cash": {"total": Decimal("0"), "order_ids": set()},
+    }
+
+    oq = oq.prefetch_related("checkout_payments", "debt_payments").annotate(
+        net_captured=_order_net_revenue_expr()
+    )
+
+    for order in oq.iterator(chunk_size=500):
+        net = _to_decimal(order.net_captured)
+        if net <= 0:
+            continue
+        for method, amount in _alloc_order_payment_lines(order, net):
+            m = (method or "unknown").strip().lower()
+            by_method[m]["total"] += amount
+            by_method[m]["order_ids"].add(order.id)
+            ch = _payment_channel(m)
+            if ch in by_channel:
+                by_channel[ch]["total"] += amount
+                by_channel[ch]["order_ids"].add(order.id)
+
+    pm_labels = dict(Order.PaymentMethod.choices)
+    by_method_out = []
+    for m, data in sorted(by_method.items(), key=lambda x: -x[1]["total"]):
+        t = data["total"].quantize(Decimal("0.01"))
+        ch = _payment_channel(m)
+        by_method_out.append({
+            "payment_method": m,
+            "method": m,
+            "method_label": pm_labels.get(m, m),
+            "amount": f"{t:.2f}",
+            "total": f"{t:.2f}",
+            "orders_count": len(data["order_ids"]),
+            "count": len(data["order_ids"]),
+            "payment_channel": ch,
+        })
+
+    by_channel_out = {
+        ch: {
+            "total": f"{data['total'].quantize(Decimal('0.01')):.2f}",
+            "orders_count": len(data["order_ids"]),
+        }
+        for ch, data in by_channel.items()
+    }
+    return by_method_out, by_channel_out
 
 
 def _scoped_purchase_qs(company, branch):
@@ -1197,26 +1307,18 @@ class RevenueInflowView(CompanyBranchQuerysetMixin, APIView):
         qs, _ = _apply_waiter_scope(qs, request, "waiter_id")
         qs = _apply_date_range(qs, "paid_at", df, dt)
 
-        net_expr = _order_net_revenue_expr()
-        rows = (
-            qs.annotate(net_captured=net_expr)
-            .values("payment_method")
-            .annotate(count=Count("id"), total=Sum("net_captured"))
-            .order_by("-total")
-        )
-
-        methods = []
-        grand = Decimal("0")
-        for row in rows:
-            m = str(row.get("payment_method") or "").strip() or "unknown"
-            t = _to_decimal(row.get("total"))
-            grand += t
-            methods.append({
-                "method": m,
-                "method_label": dict(Order.PaymentMethod.choices).get(m, m),
-                "count": int(row.get("count") or 0),
-                "total": f"{t:.2f}",
-            })
+        by_method, by_channel = _aggregate_paid_orders_by_payment(qs)
+        pm_labels = dict(Order.PaymentMethod.choices)
+        methods = [
+            {
+                "method": row["method"],
+                "method_label": row.get("method_label") or pm_labels.get(row["method"], row["method"]),
+                "count": row["count"],
+                "total": row["total"],
+            }
+            for row in by_method
+        ]
+        grand = sum((_to_decimal(row["total"]) for row in by_method), Decimal("0"))
 
         ir_qs = OrderItemRefund.objects.filter(company=company)
         or_qs = OrderRefund.objects.filter(company=company)
@@ -1239,6 +1341,8 @@ class RevenueInflowView(CompanyBranchQuerysetMixin, APIView):
             "basis": "paid_at",
             "refunds_basis": "refunded_at",
             "payment_methods": methods,
+            "by_method": by_method,
+            "by_channel": by_channel,
             "grand_total": f"{grand:.2f}",
             "refunds_by_method": refunds_by_method,
             "refunds_total": f"{refunds_grand:.2f}",
@@ -1634,22 +1738,19 @@ class CafeFinanceAnalyticsView(CompanyBranchQuerysetMixin, APIView):
         net_profit = gross - expenses_sum
 
         net_expr = _order_net_revenue_expr()
-        pm_rows = (
-            oq.annotate(net_captured=net_expr)
-            .values("payment_method")
-            .annotate(count=Count("id"), total=Sum("net_captured"))
-            .order_by("-total")
-        )
         pm_labels = dict(Order.PaymentMethod.choices)
+        by_method_rows, _by_channel = _aggregate_paid_orders_by_payment(oq)
         income_breakdown = []
-        for row in pm_rows:
-            m = str(row.get("payment_method") or "").strip() or "unknown"
-            t = _to_decimal(row.get("total"))
+        for row in by_method_rows:
+            m = row["method"]
+            if m in ("split", "mixed"):
+                continue
             income_breakdown.append({
                 "method": m,
-                "method_label": pm_labels.get(m, m),
-                "count": int(row.get("count") or 0),
-                "total": f"{t:.2f}",
+                "method_label": row.get("method_label") or pm_labels.get(m, m),
+                "payment_channel": row.get("payment_channel"),
+                "count": row["count"],
+                "total": row["total"],
             })
 
         income_items = []

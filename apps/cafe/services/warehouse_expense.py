@@ -1,6 +1,7 @@
-"""Авто-расходы «Закупки» при движении склада и посуды."""
+"""Авто-расходы «Закупки» при движении склада, посуды и оборудования."""
 from __future__ import annotations
 
+import uuid
 from decimal import Decimal, InvalidOperation
 
 from django.db import IntegrityError, transaction
@@ -11,6 +12,7 @@ from apps.cafe.models import (
     CafeExpenseCategory,
     CafeHouseholdItem,
     CafeHouseholdMovement,
+    Equipment,
     Warehouse,
     WarehouseMovement,
 )
@@ -225,6 +227,156 @@ def household_receive(
                 movement.save(update_fields=["expense"])
 
     return movement, expense
+
+
+def _create_zakupki_expense(
+    *,
+    company,
+    branch,
+    title: str,
+    amount: Decimal,
+    source: str,
+    source_id,
+    user,
+    expense_date=None,
+    note: str = "",
+) -> CafeExpense | None:
+    amount = Decimal(str(amount)).quantize(Decimal("0.01"))
+    if amount < MIN_EXPENSE_AMOUNT:
+        return None
+    existing = _existing_auto_expense(company, source, source_id)
+    if existing:
+        return existing
+    cat = ensure_zakupki_category(company, branch)
+    try:
+        return CafeExpense.objects.create(
+            company=company,
+            branch=branch,
+            title=title,
+            amount=amount,
+            category=ZAKUPKI_TITLE,
+            category_slug=ZAKUPKI_SLUG,
+            expense_category=cat,
+            source=source,
+            source_id=source_id,
+            expense_date=expense_date or timezone.localdate(),
+            note=note or "",
+            created_by=user if user and getattr(user, "is_authenticated", False) else None,
+        )
+    except IntegrityError:
+        return _existing_auto_expense(company, source, source_id)
+
+
+@transaction.atomic
+def apply_inventory_session_confirm(*, session, user=None):
+    """Подтверждение инвентаризации склада: излишки → расход «Закупки»."""
+    if session.is_confirmed:
+        return
+    for item in session.items.select_related("product"):
+        product = item.product
+        surplus = (item.actual_qty or Decimal("0")) - (item.expected_qty or Decimal("0"))
+        if surplus > 0:
+            create_warehouse_receipt_expense(
+                warehouse=product,
+                quantity=surplus,
+                unit_price=Decimal(str(product.unit_price or 0)),
+                user=user,
+                source=CafeExpense.Source.INVENTORY_CONFIRM,
+                note=f"Инвентаризация: излишек {surplus} {product.unit}",
+                skip_remainder_update=True,
+            )
+        product.remainder = str(item.actual_qty)
+        product.save(update_fields=["remainder"])
+    session.is_confirmed = True
+    session.confirmed_at = timezone.now()
+    session.save(update_fields=["is_confirmed", "confirmed_at"])
+
+
+def _equipment_expense_title(equipment: Equipment) -> str:
+    return f"Закупка: {equipment.title}"
+
+
+@transaction.atomic
+def equipment_on_create(*, equipment: Equipment, user) -> CafeExpense | None:
+    price = Decimal(str(equipment.price or 0))
+    if price < MIN_EXPENSE_AMOUNT:
+        return None
+    return _create_zakupki_expense(
+        company=equipment.company,
+        branch=equipment.branch,
+        title=_equipment_expense_title(equipment),
+        amount=price,
+        source=CafeExpense.Source.EQUIPMENT_CREATE,
+        source_id=equipment.id,
+        user=user,
+        expense_date=equipment.purchase_date,
+        note="Создание оборудования",
+    )
+
+
+@transaction.atomic
+def equipment_on_price_update(*, equipment: Equipment, old_price, user) -> CafeExpense | None:
+    new_price = Decimal(str(equipment.price or 0))
+    old = Decimal(str(old_price or 0))
+    if old < MIN_EXPENSE_AMOUNT and new_price >= MIN_EXPENSE_AMOUNT:
+        return _create_zakupki_expense(
+            company=equipment.company,
+            branch=equipment.branch,
+            title=_equipment_expense_title(equipment),
+            amount=new_price,
+            source=CafeExpense.Source.EQUIPMENT_PRICE_SET,
+            source_id=equipment.id,
+            user=user,
+            expense_date=equipment.purchase_date,
+            note="Первая установка цены закупки",
+        )
+    if old >= MIN_EXPENSE_AMOUNT and new_price > old:
+        delta = (new_price - old).quantize(Decimal("0.01"))
+        return _create_zakupki_expense(
+            company=equipment.company,
+            branch=equipment.branch,
+            title=_equipment_expense_title(equipment),
+            amount=delta,
+            source=CafeExpense.Source.EQUIPMENT_RECEIPT,
+            source_id=uuid.uuid4(),
+            user=user,
+            expense_date=equipment.purchase_date,
+            note=f"Увеличение цены закупки: +{delta}",
+        )
+    return None
+
+
+@transaction.atomic
+def equipment_receive(
+    *,
+    equipment: Equipment,
+    quantity: Decimal,
+    unit_price: Decimal,
+    user,
+    note: str = "",
+) -> CafeExpense | None:
+    qty = Decimal(str(quantity))
+    price = Decimal(str(unit_price or 0))
+    amount = (qty * price).quantize(Decimal("0.01"))
+    if amount < MIN_EXPENSE_AMOUNT:
+        return None
+    return _create_zakupki_expense(
+        company=equipment.company,
+        branch=equipment.branch,
+        title=_equipment_expense_title(equipment),
+        amount=amount,
+        source=CafeExpense.Source.EQUIPMENT_RECEIPT,
+        source_id=uuid.uuid4(),
+        user=user,
+        expense_date=equipment.purchase_date,
+        note=note or f"Докупка оборудования: {qty} × {price}",
+    )
+
+
+def attach_expense_to_response(data: dict, expense: CafeExpense | None) -> dict:
+    data["expense_id"] = str(expense.id) if expense else None
+    data["expense_amount"] = f"{expense.amount:.2f}" if expense else None
+    return data
 
 
 @transaction.atomic
