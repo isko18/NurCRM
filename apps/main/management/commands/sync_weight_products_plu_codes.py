@@ -323,6 +323,9 @@ class Command(BaseCommand):
         target_ids = [p.id for p, _, _ in to_apply]
 
         with transaction.atomic():
+            # 1) Снять plu у всех обновляемых (иначе swap 17↔42 ломает unique).
+            Product.objects.filter(id__in=target_ids).update(plu=None)
+            # 2) Снять plu у прочих товаров с конфликтующими номерами.
             Product.objects.filter(
                 company=company, plu__in=target_plu_values
             ).exclude(id__in=target_ids).update(plu=None)
