@@ -89,7 +89,25 @@ class Industry(models.Model):
         verbose_name_plural = "Виды деятельности"
 
 
+class CompanyQuerySet(models.QuerySet):
+    def delete(self):
+        from apps.users.company_deletion import mark_companies_for_deletion, unmark_companies_for_deletion
+
+        company_ids = list(self.values_list("pk", flat=True))
+        mark_companies_for_deletion(company_ids)
+        try:
+            return super().delete()
+        finally:
+            unmark_companies_for_deletion(company_ids)
+
+
+class CompanyManager(models.Manager.from_queryset(CompanyQuerySet)):
+    pass
+
+
 class Company(models.Model):
+    objects = CompanyManager()
+
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     name = models.CharField(max_length=255, verbose_name="Название компании")
     slug = models.SlugField("Slug", max_length=80, unique=True, db_index=True, blank=True)
@@ -198,6 +216,15 @@ class Company(models.Model):
             if len(candidate) > 80:
                 candidate = f"{base[:50]}-{uuid.uuid4().hex[:8]}"
         return candidate
+
+    def delete(self, using=None, keep_parents=False):
+        from apps.users.company_deletion import mark_companies_for_deletion, unmark_companies_for_deletion
+
+        mark_companies_for_deletion([self.pk])
+        try:
+            return super().delete(using=using, keep_parents=keep_parents)
+        finally:
+            unmark_companies_for_deletion([self.pk])
 
     def save(self, *args, **kwargs):
         # даты

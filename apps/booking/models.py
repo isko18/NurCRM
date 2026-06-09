@@ -489,6 +489,11 @@ class Document(models.Model):
 # ---------- Архивация перед удалением ----------
 @receiver(pre_delete, sender=Booking)
 def archive_booking_before_delete(sender, instance: Booking, **kwargs):
+    from apps.users.company_deletion import is_company_being_deleted
+
+    if is_company_being_deleted(instance.company_id):
+        return
+
     if instance.hotel_id:
         target_type = BookingHistory.TargetType.HOTEL
         target_name = instance.hotel.name
