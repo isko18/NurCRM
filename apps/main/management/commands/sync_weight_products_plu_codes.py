@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import re
 from decimal import Decimal, InvalidOperation
+from uuid import UUID
 
 from django.contrib.auth import get_user_model
 from django.core.management.base import BaseCommand, CommandError
@@ -129,14 +130,19 @@ def _expected_prices(table_price: Decimal | None) -> list[Decimal]:
     return out
 
 
-def _price_matches(product: Product, table_price: Decimal | None, tol: Decimal = Decimal("1.5")) -> bool:
+def _price_distance(product: Product, table_price: Decimal | None) -> Decimal | None:
     expected = _expected_prices(table_price)
-    if not expected:
-        return False
     p = _price_decimal(product.price)
-    if p is None:
+    if p is None or not expected:
+        return None
+    return min(abs(p - e) for e in expected)
+
+
+def _price_matches(product: Product, table_price: Decimal | None, tol: Decimal = Decimal("15")) -> bool:
+    dist = _price_distance(product, table_price)
+    if dist is None:
         return False
-    return any(abs(p - e) <= tol for e in expected)
+    return dist <= tol
 
 
 def _pick_product(
@@ -163,6 +169,18 @@ def _pick_product(
         by_price = [p for p in pool if _price_matches(p, table_price)]
         if len(by_price) == 1:
             return by_price[0]
+
+        # Ближайшая цена (например несколько «банан», один ~200 сом/кг)
+        scored: list[tuple[Decimal, Product]] = []
+        for p in pool:
+            dist = _price_distance(p, table_price)
+            if dist is not None:
+                scored.append((dist, p))
+        if scored:
+            scored.sort(key=lambda x: x[0])
+            best_dist, best = scored[0]
+            if len(scored) == 1 or scored[1][0] - best_dist > Decimal("5"):
+                return best
 
     return None
 
@@ -221,6 +239,13 @@ class Command(BaseCommand):
             help="Дополнительно записать code = PLU с ведущими нулями (0001)",
         )
         parser.add_argument("--code-width", type=int, default=4)
+        parser.add_argument(
+            "--set-plu",
+            action="append",
+            default=[],
+            metavar="PLU=UUID",
+            help="Явная привязка, например --set-plu 1=a9056ae4-…",
+        )
 
     def handle(self, *args, **options):
         email = (options["email"] or "").strip().lower()
@@ -243,6 +268,23 @@ class Command(BaseCommand):
                 "id", "name", "code", "plu", "price", "is_weight"
             )
         )
+        by_id = {p.id: p for p in products}
+        plu_overrides: dict[int, Product] = {}
+        for raw in options.get("set_plu") or []:
+            part = (raw or "").strip()
+            if "=" not in part:
+                raise CommandError(f"Неверный --set-plu: «{raw}», нужен формат PLU=UUID")
+            plu_s, pid_s = part.split("=", 1)
+            try:
+                plu_n = int(plu_s.strip())
+                pid = UUID(pid_s.strip())
+            except (ValueError, TypeError):
+                raise CommandError(f"Неверный --set-plu: «{raw}»")
+            product = by_id.get(pid)
+            if product is None:
+                raise CommandError(f"--set-plu {raw}: товар не найден в компании")
+            plu_overrides[plu_n] = product
+
         by_name: dict[str, list[Product]] = {}
         for product in products:
             by_name.setdefault(_norm_name(product.name), []).append(product)
@@ -254,15 +296,17 @@ class Command(BaseCommand):
         seen_ids: set = set()
 
         for plu, raw_name, table_price in _build_plu_jobs():
-            candidates = _find_candidates(by_name, raw_name)
-            if not candidates:
-                not_found.append((plu, raw_name))
-                continue
-
-            product = _pick_product(candidates, plu, table_price)
-            if product is None:
-                ambiguous.append((plu, raw_name, [str(p.id) for p in candidates]))
-                continue
+            if plu in plu_overrides:
+                product = plu_overrides[plu]
+            else:
+                candidates = _find_candidates(by_name, raw_name)
+                if not candidates:
+                    not_found.append((plu, raw_name))
+                    continue
+                product = _pick_product(candidates, plu, table_price)
+                if product is None:
+                    ambiguous.append((plu, raw_name, [str(p.id) for p in candidates]))
+                    continue
 
             if product.id in seen_ids:
                 skipped_same.append((plu, raw_name))

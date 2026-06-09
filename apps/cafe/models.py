@@ -2,7 +2,9 @@ from django.db import models, transaction
 from django.conf import settings
 from django.core.exceptions import ValidationError
 from django.db.models import Q
-from django.db.models.signals import pre_delete, post_save
+import threading
+
+from django.db.models.signals import pre_delete, post_delete, post_save
 from django.dispatch import receiver
 from django.utils import timezone
 from django.core.files.base import ContentFile
@@ -2019,8 +2021,30 @@ class CafeWaiterPayProfile(models.Model):
 # ==========================
 # Сигналы: архив + синхронизация задач кухни
 # ==========================
+_deletion_state = threading.local()
+
+
+def _companies_being_deleted() -> set:
+    if not hasattr(_deletion_state, "company_ids"):
+        _deletion_state.company_ids = set()
+    return _deletion_state.company_ids
+
+
+@receiver(pre_delete, sender=Company)
+def _mark_company_deletion(sender, instance: Company, **kwargs):
+    _companies_being_deleted().add(instance.pk)
+
+
+@receiver(post_delete, sender=Company)
+def _unmark_company_deletion(sender, instance: Company, **kwargs):
+    _companies_being_deleted().discard(instance.pk)
+
+
 @receiver(pre_delete, sender=Order)
 def archive_order_before_delete(sender, instance: Order, **kwargs):
+    if instance.company_id in _companies_being_deleted():
+        return
+
     with transaction.atomic():
         # если уже архив есть — просто выходим
         if OrderHistory.objects.filter(original_order_id=instance.id).exists():
