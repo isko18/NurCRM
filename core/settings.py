@@ -231,6 +231,14 @@ DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 # Настройки rest framework
 AUTH_USER_MODEL = 'users.User'
 
+# ====== Версия десктопного клиента NurCRM (автообновление exe) ======
+# Меняется руками при выкатке новой версии (см. GET /api/version/).
+CLIENT_VERSION = os.getenv("CLIENT_VERSION", "1.0.0")
+CLIENT_ZIP_URL = os.getenv(
+    "CLIENT_ZIP_URL", "https://app.nurcrm.kg/downloads/NurCRM-1.0.0.zip"
+)
+CLIENT_RELEASE_NOTES = os.getenv("CLIENT_RELEASE_NOTES", "Первый релиз")
+
 REST_FRAMEWORK = {
     'DEFAULT_AUTHENTICATION_CLASSES': (
         'rest_framework_simplejwt.authentication.JWTAuthentication',

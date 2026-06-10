@@ -374,6 +374,14 @@ class WarehouseProduct(BaseModelId, BaseModelDate, BaseModelCompanyBranch):
         help_text="Считается автоматически из закупки и наценки (если наценка > 0).",
     )
 
+    wholesale_price = models.DecimalField(
+        "Цена оптовой продажи",
+        max_digits=11,
+        decimal_places=3,
+        default=Decimal("0.00"),
+        help_text="Оптовая цена продажи за учётную единицу. Заполняется вручную (из наценки не считается).",
+    )
+
     discount_percent = models.DecimalField(
         "Скидка, %",
         max_digits=12,
@@ -1071,6 +1079,15 @@ class CompanyWarehouseAgent(models.Model):
         help_text="Склад, по которому агенту открыт общий доступ (если common_access_enabled=true).",
     )
 
+    can_sell_wholesale = models.BooleanField(
+        "Разрешена оптовая продажа",
+        default=False,
+        help_text=(
+            "Выдаётся владельцем. Если включено — агент может оформлять продажи по оптовой цене "
+            "(is_wholesale). Если выключено — агент продаёт только в розницу."
+        ),
+    )
+
     class Meta:
         verbose_name = "Агент склада (заявка в компанию)"
         verbose_name_plural = "Агенты складов (заявки в компании)"
@@ -1413,6 +1430,15 @@ class Document(models.Model):
         "Заявка на продажу",
         default=False,
         help_text="Если включено для документа SALE — статус документа будет 'Заявка на продажу'.",
+    )
+    is_wholesale = models.BooleanField(
+        "Оптовая продажа",
+        default=False,
+        db_index=True,
+        help_text=(
+            "Переключатель опт/розница для документа SALE. Если включено — для строк без явной "
+            "цены подставляется оптовая цена товара (с откатом на розничную, если опт не задана)."
+        ),
     )
 
     comment = models.TextField(blank=True, verbose_name="Комментарий")

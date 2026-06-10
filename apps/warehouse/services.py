@@ -97,6 +97,20 @@ def agent_has_common_access_to_warehouse(*, user, warehouse, company=None) -> bo
     return assigned_warehouse_id in (None, warehouse.id)
 
 
+def agent_can_sell_wholesale(*, user, company=None) -> bool:
+    """Активный агент компании, которому владелец разрешил оптовую продажу (can_sell_wholesale=True)."""
+    if user is None:
+        return False
+    qs = models.CompanyWarehouseAgent.objects.filter(
+        user=user,
+        status=models.CompanyWarehouseAgent.Status.ACTIVE,
+        can_sell_wholesale=True,
+    )
+    if company is not None:
+        qs = qs.filter(company=company)
+    return qs.exists()
+
+
 def effective_document_line_discount_percent(
     line_discount_percent,
     document_discount_percent,

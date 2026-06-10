@@ -1040,6 +1040,13 @@ class AgentRequestCartCreateSaleAPIView(CompanyBranchRestrictedMixin, APIView):
 
         should_post = bool(ser.validated_data.get("post") or False)
         is_sale_request = bool(ser.validated_data.get("is_sale_request") or False)
+        is_wholesale = bool(ser.validated_data.get("is_wholesale") or False)
+
+        # Оптовая продажа доступна, только если владелец выдал агенту флаг can_sell_wholesale.
+        if is_wholesale and not services.agent_can_sell_wholesale(user=cart.agent, company=cart.company):
+            raise ValidationError(
+                {"is_wholesale": "У агента нет доступа к оптовым продажам. Выдайте агенту флаг can_sell_wholesale."}
+            )
 
         with transaction.atomic():
             use_common_stock = services.agent_has_common_access_to_warehouse(
@@ -1055,6 +1062,7 @@ class AgentRequestCartCreateSaleAPIView(CompanyBranchRestrictedMixin, APIView):
                 agent=cart.agent,
                 use_common_stock=use_common_stock,
                 is_sale_request=is_sale_request,
+                is_wholesale=is_wholesale,
                 payment_kind=ser.validated_data.get("payment_kind") or m.Document.PaymentKind.CASH,
                 prepayment_amount=ser.validated_data.get("prepayment_amount") or Decimal("0.00"),
                 discount_percent=ser.validated_data.get("discount_percent") or Decimal("0.00"),
@@ -1064,7 +1072,10 @@ class AgentRequestCartCreateSaleAPIView(CompanyBranchRestrictedMixin, APIView):
 
             for it in cart.items.select_related("product").all():
                 product = it.product
-                price = Decimal(getattr(product, "price", None) or 0).quantize(Decimal("0.01"))
+                retail = Decimal(getattr(product, "price", None) or 0)
+                wholesale = Decimal(getattr(product, "wholesale_price", None) or 0)
+                chosen = wholesale if (is_wholesale and wholesale > 0) else retail
+                price = chosen.quantize(Decimal("0.01"))
                 line_dp = Decimal(getattr(product, "discount_percent", None) or 0).quantize(Decimal("0.01"))
                 item = m.DocumentItem(
                     document=doc,
@@ -1785,6 +1796,7 @@ class CompanyWarehouseAgentCommonAccessUpdateAPIView(APIView):
       - assigned_warehouse: uuid|null
       - common_access_enabled: bool
       - common_warehouse: uuid|null (обязателен если common_access_enabled=true)
+      - can_sell_wholesale: bool (разрешить агенту оптовые продажи)
     """
 
     permission_classes = [permissions.IsAuthenticated]
@@ -1817,6 +1829,7 @@ class CompanyWarehouseAgentAdminAssignAPIView(APIView):
       - assigned_warehouse: uuid|null (опционально)
       - common_access_enabled: bool (опционально)
       - common_warehouse: uuid|null (опционально, обязателен если common_access_enabled=true)
+      - can_sell_wholesale: bool (опционально, разрешить агенту оптовые продажи)
     """
 
     permission_classes = [permissions.IsAuthenticated]
@@ -1853,6 +1866,7 @@ class CompanyWarehouseAgentAdminAssignAPIView(APIView):
             "assigned_warehouse" in request.data
             or "common_access_enabled" in request.data
             or "common_warehouse" in request.data
+            or "can_sell_wholesale" in request.data
         ):
             ser = CompanyWarehouseAgentCommonAccessUpdateSerializer(
                 instance=obj,

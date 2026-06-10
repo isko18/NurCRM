@@ -386,6 +386,7 @@ class WarehouseProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSe
             "purchase_price",
             "markup_percent",
             "price",
+            "wholesale_price",
             "discount_percent",
             "plu",
             "country",
@@ -419,7 +420,7 @@ class WarehouseProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSe
         if "country" in attrs:
             attrs["country"] = (attrs.get("country") or "").strip()
 
-        for f in ("quantity", "purchase_price", "markup_percent", "price", "discount_percent"):
+        for f in ("quantity", "purchase_price", "markup_percent", "price", "wholesale_price", "discount_percent"):
             if f in attrs:
                 attrs[f] = _to_decimal(attrs.get(f), "0")
 
@@ -845,6 +846,7 @@ class CompanyWarehouseAgentSerializer(serializers.ModelSerializer):
     assigned_warehouse = serializers.PrimaryKeyRelatedField(read_only=True)
     common_access_enabled = serializers.BooleanField(read_only=True)
     common_warehouse = serializers.PrimaryKeyRelatedField(read_only=True)
+    can_sell_wholesale = serializers.BooleanField(read_only=True)
 
     class Meta:
         model = m.CompanyWarehouseAgent
@@ -859,6 +861,7 @@ class CompanyWarehouseAgentSerializer(serializers.ModelSerializer):
             "assigned_warehouse",
             "common_access_enabled",
             "common_warehouse",
+            "can_sell_wholesale",
             "created_at",
             "updated_at",
             "decided_at",
@@ -871,6 +874,7 @@ class CompanyWarehouseAgentSerializer(serializers.ModelSerializer):
             "assigned_warehouse",
             "common_access_enabled",
             "common_warehouse",
+            "can_sell_wholesale",
             "created_at",
             "updated_at",
             "decided_at",
@@ -909,10 +913,11 @@ class CompanyWarehouseAgentCommonAccessUpdateSerializer(serializers.ModelSeriali
         required=False,
         allow_null=True,
     )
+    can_sell_wholesale = serializers.BooleanField(required=False)
 
     class Meta:
         model = m.CompanyWarehouseAgent
-        fields = ("assigned_warehouse", "common_access_enabled", "common_warehouse")
+        fields = ("assigned_warehouse", "common_access_enabled", "common_warehouse", "can_sell_wholesale")
 
     def validate(self, attrs):
         attrs = super().validate(attrs)
@@ -957,6 +962,7 @@ class AgentRequestCartCreateSaleSerializer(serializers.Serializer):
     counterparty = serializers.PrimaryKeyRelatedField(queryset=m.Counterparty.objects.all())
     post = serializers.BooleanField(required=False, default=False)
     is_sale_request = serializers.BooleanField(required=False, default=False)
+    is_wholesale = serializers.BooleanField(required=False, default=False)
     payment_kind = serializers.CharField(required=False, allow_null=True, allow_blank=True)
     prepayment_amount = serializers.DecimalField(max_digits=18, decimal_places=2, required=False, default=Decimal("0.00"))
     discount_percent = serializers.DecimalField(max_digits=5, decimal_places=2, required=False, default=Decimal("0.00"))

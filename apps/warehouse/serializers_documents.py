@@ -55,6 +55,43 @@ def _merge_product_discount_into_item(item_data: dict) -> dict:
     return merged
 
 
+def _apply_sale_price_to_item(item_data: dict, doc) -> dict:
+    """
+    Для документа SALE: если цена в строке не задана (поля нет или null) — берём цену
+    с карточки товара. При оптовом документе (doc.is_wholesale) подставляем оптовую цену
+    (с откатом на розничную, если опт не задана), иначе — розничную.
+    Явно переданную цену (в т.ч. 0) не трогаем, как и не-SALE документы.
+    """
+    if item_data.get("price") is not None:
+        return item_data
+    if getattr(doc, "doc_type", None) != models.Document.DocType.SALE:
+        return item_data
+    product = item_data.get("product")
+    if product is None:
+        return item_data
+
+    if hasattr(product, "price"):
+        retail = getattr(product, "price", None) or Decimal("0")
+        wholesale = getattr(product, "wholesale_price", None) or Decimal("0")
+    else:
+        row = (
+            models.WarehouseProduct.objects.filter(pk=product)
+            .values_list("price", "wholesale_price")
+            .first()
+        )
+        retail = (row[0] if row else None) or Decimal("0")
+        wholesale = (row[1] if row else None) or Decimal("0")
+
+    retail = Decimal(str(retail))
+    wholesale = Decimal(str(wholesale))
+    is_wholesale = bool(getattr(doc, "is_wholesale", False))
+    chosen = wholesale if (is_wholesale and wholesale > 0) else retail
+
+    merged = dict(item_data)
+    merged["price"] = chosen.quantize(Decimal("0.01"))
+    return merged
+
+
 class StockMoveSerializer(serializers.ModelSerializer):
     """Сериализатор движения товара с видом: приход или расход."""
 
@@ -95,6 +132,18 @@ class DocumentItemSerializer(serializers.ModelSerializer):
         decimal_places=2,
         read_only=True,
     )
+    product_price = serializers.DecimalField(
+        source="product.price",
+        max_digits=18,
+        decimal_places=3,
+        read_only=True,
+    )
+    product_wholesale_price = serializers.DecimalField(
+        source="product.wholesale_price",
+        max_digits=18,
+        decimal_places=3,
+        read_only=True,
+    )
     product_discount_amount = serializers.SerializerMethodField()
     discount_percent = serializers.DecimalField(
         max_digits=5, decimal_places=2, required=False, allow_null=True
@@ -116,6 +165,8 @@ class DocumentItemSerializer(serializers.ModelSerializer):
             "product_image_url",
             "product_characteristics",
             "product_discount_percent",
+            "product_price",
+            "product_wholesale_price",
             "product_discount_amount",
             "qty",
             "price",
@@ -224,6 +275,7 @@ class DocumentSerializer(serializers.ModelSerializer):
             "agent",
             "agent_display",
             "is_sale_request",
+            "is_wholesale",
             "counterparty_display_name",
             "comment",
             "discount_percent",
@@ -354,6 +406,7 @@ class DocumentSerializer(serializers.ModelSerializer):
         # Валидация и создание items
         for it in items:
             it = _merge_product_discount_into_item(dict(it))
+            it = _apply_sale_price_to_item(it, doc)
             item = models.DocumentItem(document=doc, **it)
             try:
                 item.clean()
@@ -393,6 +446,7 @@ class DocumentSerializer(serializers.ModelSerializer):
             # Валидация и создание новых items
             for it in items:
                 it = _merge_product_discount_into_item(dict(it))
+                it = _apply_sale_price_to_item(it, instance)
                 item = models.DocumentItem(document=instance, **it)
                 try:
                     item.clean()

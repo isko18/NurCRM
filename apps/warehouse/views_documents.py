@@ -71,6 +71,19 @@ class DocumentListCreateView(CompanyBranchRestrictedMixin, generics.ListCreateAP
             qs = qs.filter(agent=user)
         return qs
 
+    def _enforce_wholesale_permission(self, serializer, user):
+        """Агенту (не владельцу) опт доступен только если владелец выдал флаг can_sell_wholesale."""
+        if _is_owner_like(user):
+            return
+        if not serializer.validated_data.get("is_wholesale"):
+            return
+        wh_from = serializer.validated_data.get("warehouse_from")
+        company = getattr(wh_from, "company", None)
+        if not services.agent_can_sell_wholesale(user=user, company=company):
+            raise DRFValidationError(
+                {"is_wholesale": "У агента нет доступа к оптовым продажам. Обратитесь к владельцу."}
+            )
+
     def perform_create(self, serializer):
         user = self.request.user
         if _is_owner_like(user):
@@ -80,6 +93,7 @@ class DocumentListCreateView(CompanyBranchRestrictedMixin, generics.ListCreateAP
             return
         self._ensure_agent_can_access_warehouse(serializer.validated_data.get("warehouse_from"), field_name="warehouse_from")
         self._ensure_agent_can_access_warehouse(serializer.validated_data.get("warehouse_to"), field_name="warehouse_to")
+        self._enforce_wholesale_permission(serializer, user)
         self._save_with_company_branch(serializer, agent=user)
 
 
@@ -95,6 +109,8 @@ class AgentDocumentListCreateView(DocumentListCreateView):
         user = self.request.user
         wh_from = serializer.validated_data.get("warehouse_from")
         self._ensure_agent_can_access_warehouse(wh_from, field_name="warehouse_from")
+
+        self._enforce_wholesale_permission(serializer, user)
 
         use_common_stock = bool(serializer.validated_data.get("use_common_stock", False))
         if not use_common_stock and wh_from is not None:
@@ -134,6 +150,7 @@ class _DocumentTypedListCreateView(DocumentListCreateView):
                 extra["agent"] = None
             self._save_with_company_branch(serializer, **extra)
             return
+        self._enforce_wholesale_permission(serializer, user)
         wh_from = serializer.validated_data.get("warehouse_from")
         use_common_stock = False
         if wh_from is not None and services.agent_has_common_access_to_warehouse(

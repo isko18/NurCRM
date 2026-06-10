@@ -55,6 +55,8 @@ from apps.cafe.analytics import (
 
 from apps.cafe.showcase.views_public import PublicCafeInfoAPIView, PublicCafeMenuAPIView, PublicCafeMenuItemsAPIView
 
+from apps.cafe.offline_views import CafeOfflineSnapshotView, CafeOfflineSyncView
+
 from apps.cafe.household_views import (
     CafeExpenseCategoryListCreateView,
     CafeExpenseCategoryRetrieveUpdateDestroyView,
@@ -199,6 +201,10 @@ urlpatterns = [
     path("dishes/<uuid:pk>/cost/", DishCostView.as_view(), name="dish-cost"),
     path("dishes/calculate-preview/", DishCalculatePreviewView.as_view(), name="dish-calc-preview"),
     path("tech-cards/export/", TechCardsExportView.as_view(), name="tech-cards-export"),
+
+    # === Офлайн-режим (снапшот + синхронизация очереди действий) ===
+    path("offline-snapshot/", CafeOfflineSnapshotView.as_view(), name="cafe-offline-snapshot"),
+    path("offline-sync/", CafeOfflineSyncView.as_view(), name="cafe-offline-sync"),
 
     # === Orders ===
     path("orders/", OrderListCreateView.as_view(), name="order-list"),
