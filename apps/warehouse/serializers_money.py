@@ -83,6 +83,7 @@ class MoneyDocumentSerializer(serializers.ModelSerializer):
             "counterparty_display_name",
             "payment_category",
             "payment_category_title",
+            "payment_method",
             "source_document",
             "amount",
             "comment",

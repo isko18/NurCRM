@@ -1006,6 +1006,38 @@ class Counterparty(models.Model):
             raise ValidationError({"agent": "Агент должен быть сотрудником или активным агентом этой компании."})
 
 
+class CounterpartyBankAccount(models.Model):
+    """
+    Банковский реквизит контрагента: расчётный счёт (Р/С) и БИК создаются парой.
+    У контрагента может быть несколько таких пар.
+    """
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    counterparty = models.ForeignKey(
+        "warehouse.Counterparty",
+        on_delete=models.CASCADE,
+        related_name="bank_accounts",
+        verbose_name="Контрагент",
+    )
+    score = models.CharField("Расчетный счет", max_length=64)
+    bik = models.CharField("БИК", max_length=32)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        verbose_name = "Банковский реквизит контрагента"
+        verbose_name_plural = "Банковские реквизиты контрагентов"
+        ordering = ["created_at"]
+        indexes = [
+            models.Index(fields=["counterparty"]),
+        ]
+
+    def __str__(self):
+        return f"{self.score} / {self.bik}"
+
+    def clean(self):
+        if not self.score or not self.bik:
+            raise ValidationError("Р/С и БИК должны указываться вместе.")
+
+
 class CompanyWarehouseAgent(models.Model):
     """
     Заявка/членство: пользователь как агент склада компании.
@@ -1366,6 +1398,11 @@ class Document(models.Model):
         CREDIT = "credit", "В долг"
         EXTERNAL = "external", "Вне кассы"
 
+    class PaymentMethod(models.TextChoices):
+        """Форма оплаты: наличными или безналичными (для фильтрации на кассе)."""
+        CASH = "cash", "Наличными"
+        CASHLESS = "cashless", "Безналичными"
+
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     doc_type = models.CharField(max_length=32, choices=DocType.choices, verbose_name="Тип документа")
     status = models.CharField(max_length=16, choices=Status.choices, default=Status.DRAFT, verbose_name="Статус")
@@ -1380,6 +1417,16 @@ class Document(models.Model):
         null=True,
         verbose_name="Оплата",
         help_text="Продажа/покупка/возвраты: cash или credit. Приход (RECEIPT): cash, credit или external (приход на склад без кассы).",
+    )
+
+    payment_method = models.CharField(
+        max_length=16,
+        choices=PaymentMethod.choices,
+        default=PaymentMethod.CASH,
+        blank=True,
+        null=True,
+        verbose_name="Форма оплаты",
+        help_text="Наличными или безналичными. Переносится в денежный документ кассы для фильтрации.",
     )
 
     prepayment_amount = models.DecimalField(
@@ -1520,7 +1567,7 @@ class Document(models.Model):
             )
             if not owner_multi_warehouse and not self.warehouse_from:
                 raise ValidationError("Document requires warehouse_from")
-            if self.doc_type in (self.DocType.SALE, self.DocType.PURCHASE, self.DocType.SALE_RETURN, self.DocType.PURCHASE_RETURN) and not self.counterparty:
+            if self.doc_type in (self.DocType.SALE, self.DocType.SALE_RETURN, self.DocType.PURCHASE_RETURN) and not self.counterparty:
                 raise ValidationError("Document requires counterparty")
 
         if self.doc_type in (self.DocType.SALE, self.DocType.PURCHASE, self.DocType.SALE_RETURN, self.DocType.PURCHASE_RETURN):
@@ -2484,6 +2531,16 @@ class MoneyDocument(BaseModelCompanyBranch):
         help_text="Если документ создан автоматически из складского документа — здесь ссылка на него.",
     )
 
+    payment_method = models.CharField(
+        max_length=16,
+        choices=Document.PaymentMethod.choices,
+        default=Document.PaymentMethod.CASH,
+        blank=True,
+        null=True,
+        verbose_name="Форма оплаты",
+        help_text="Наличными или безналичными. Для фильтрации операций на кассе.",
+    )
+
     amount = models.DecimalField(max_digits=18, decimal_places=2, default=Decimal("0.00"), verbose_name="Сумма")
     comment = models.TextField(blank=True, verbose_name="Комментарий")
 
@@ -2499,6 +2556,7 @@ class MoneyDocument(BaseModelCompanyBranch):
             models.Index(fields=["cash_register", "date"]),
             models.Index(fields=["warehouse", "date"]),
             models.Index(fields=["payment_category", "date"]),
+            models.Index(fields=["cash_register", "payment_method", "date"]),
         ]
 
     def __str__(self):

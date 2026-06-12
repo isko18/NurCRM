@@ -7,7 +7,7 @@ from apps.users.models import Company
 from . import models
 from . import services as warehouse_services
 from .serializers import WarehouseProductCharacteristicsSerializer
-from .utils import normalize_payment_kind
+from .utils import normalize_payment_kind, normalize_payment_method
 
 User = get_user_model()
 
@@ -22,6 +22,19 @@ class PaymentKindField(serializers.CharField):
         allowed = {choice for choice, _label in models.Document.PaymentKind.choices}
         if normalized not in allowed:
             raise serializers.ValidationError("Укажите cash, credit (или debt) либо external.")
+        return normalized
+
+
+class PaymentMethodField(serializers.CharField):
+    """Принимает наличные/безналичные (в т.ч. рус.) и нормализует к Document.PaymentMethod."""
+
+    def to_internal_value(self, data):
+        if data is None or data == "":
+            return None
+        normalized = normalize_payment_method(data)
+        allowed = {choice for choice, _label in models.Document.PaymentMethod.choices}
+        if normalized not in allowed:
+            raise serializers.ValidationError("Укажите cash (наличными) или cashless (безналичными).")
         return normalized
 
 
@@ -220,6 +233,7 @@ class DocumentSerializer(serializers.ModelSerializer):
     receipts = serializers.SerializerMethodField()
     expenses = serializers.SerializerMethodField()
     payment_kind = PaymentKindField(required=False, allow_null=True, allow_blank=True)
+    payment_method = PaymentMethodField(required=False, allow_null=True, allow_blank=True)
 
     money_document_id = serializers.SerializerMethodField()
     money_document_number = serializers.SerializerMethodField()
@@ -257,6 +271,7 @@ class DocumentSerializer(serializers.ModelSerializer):
             "number",
             "date",
             "payment_kind",
+            "payment_method",
             "prepayment_amount",
             "warehouse_from",
             "warehouse_to",
@@ -471,6 +486,7 @@ class CashRequestDocumentMiniSerializer(serializers.ModelSerializer):
             "doc_type",
             "status",
             "payment_kind",
+            "payment_method",
             "date",
             "total",
             "warehouse_from",
@@ -550,11 +566,30 @@ class WarehouseSimpleSerializer(serializers.ModelSerializer):
         fields = ("id", "name")
 
 
+class CounterpartyBankAccountSerializer(serializers.ModelSerializer):
+    """Пара реквизитов: Р/С и БИК создаются вместе."""
+
+    class Meta:
+        model = models.CounterpartyBankAccount
+        fields = ("id", "score", "bik")
+        read_only_fields = ("id",)
+
+    def validate(self, attrs):
+        score = (attrs.get("score") or "").strip()
+        bik = (attrs.get("bik") or "").strip()
+        if not score or not bik:
+            raise serializers.ValidationError("Р/С и БИК должны указываться вместе.")
+        attrs["score"] = score
+        attrs["bik"] = bik
+        return attrs
+
+
 class CounterpartySerializer(serializers.ModelSerializer):
     company = serializers.ReadOnlyField(source="company.id")
     branch = serializers.ReadOnlyField(source="branch.id")
     agent_display = serializers.SerializerMethodField()
     analytics = serializers.SerializerMethodField()
+    bank_accounts = CounterpartyBankAccountSerializer(many=True, required=False)
     agent = serializers.PrimaryKeyRelatedField(
         queryset=User.objects.all(),
         allow_null=True,
@@ -573,6 +608,7 @@ class CounterpartySerializer(serializers.ModelSerializer):
             "okpo",
             "score",
             "bik",
+            "bank_accounts",
             "address",
             "company",
             "branch",
@@ -582,8 +618,30 @@ class CounterpartySerializer(serializers.ModelSerializer):
         )
         read_only_fields = ("id", "company", "branch", "analytics")
         extra_kwargs = {
-            "phone": {"required": True},
+            "phone": {"required": False, "allow_blank": True},
         }
+
+    def create(self, validated_data):
+        bank_accounts = validated_data.pop("bank_accounts", None)
+        counterparty = super().create(validated_data)
+        if bank_accounts:
+            models.CounterpartyBankAccount.objects.bulk_create([
+                models.CounterpartyBankAccount(counterparty=counterparty, **acc)
+                for acc in bank_accounts
+            ])
+        return counterparty
+
+    def update(self, instance, validated_data):
+        bank_accounts = validated_data.pop("bank_accounts", None)
+        counterparty = super().update(instance, validated_data)
+        if bank_accounts is not None:
+            # Полная замена набора реквизитов переданным списком.
+            counterparty.bank_accounts.all().delete()
+            models.CounterpartyBankAccount.objects.bulk_create([
+                models.CounterpartyBankAccount(counterparty=counterparty, **acc)
+                for acc in bank_accounts
+            ])
+        return counterparty
 
     def get_agent_display(self, obj):
         u = getattr(obj, "agent", None)

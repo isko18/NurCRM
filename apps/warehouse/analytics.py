@@ -350,14 +350,26 @@ def _build_owner_cash_analytics(*, company, branch, dt_from, dt_to_excl, group_b
     )
     money_qs = _apply_branch_scope(money_qs, branch, all_branches=all_branches)
 
+    # Погашение долга — это документы с системной категорией «Долги» (system_code=debt).
+    # Они НЕ должны попадать в обычный приход/расход (иначе сальдо неверное),
+    # а учитываются отдельной графой «долг».
+    is_debt = Q(payment_category__system_code=wm.PaymentCategory.SystemCode.DEBT)
+    RECEIPT = wm.MoneyDocument.DocType.MONEY_RECEIPT
+    EXPENSE = wm.MoneyDocument.DocType.MONEY_EXPENSE
+
     totals = money_qs.aggregate(
-        receipt=Coalesce(Sum("amount", filter=Q(doc_type=wm.MoneyDocument.DocType.MONEY_RECEIPT)), ZERO_MONEY),
-        expense=Coalesce(Sum("amount", filter=Q(doc_type=wm.MoneyDocument.DocType.MONEY_EXPENSE)), ZERO_MONEY),
+        receipt=Coalesce(Sum("amount", filter=Q(doc_type=RECEIPT) & ~is_debt), ZERO_MONEY),
+        expense=Coalesce(Sum("amount", filter=Q(doc_type=EXPENSE) & ~is_debt), ZERO_MONEY),
+        debt_receipt=Coalesce(Sum("amount", filter=Q(doc_type=RECEIPT) & is_debt), ZERO_MONEY),
+        debt_expense=Coalesce(Sum("amount", filter=Q(doc_type=EXPENSE) & is_debt), ZERO_MONEY),
         docs_count=Count("id"),
     )
     receipt_total = (totals.get("receipt") or Decimal("0.00")).quantize(Decimal("0.01"))
     expense_total = (totals.get("expense") or Decimal("0.00")).quantize(Decimal("0.01"))
     net_total = (receipt_total - expense_total).quantize(Decimal("0.01"))
+    debt_receipt_total = (totals.get("debt_receipt") or Decimal("0.00")).quantize(Decimal("0.01"))
+    debt_expense_total = (totals.get("debt_expense") or Decimal("0.00")).quantize(Decimal("0.01"))
+    debt_net_total = (debt_receipt_total - debt_expense_total).quantize(Decimal("0.01"))
 
     # by cash register (and legacy warehouse account if cash_register is null)
     by_cash_register_qs = (
@@ -370,11 +382,19 @@ def _build_owner_cash_analytics(*, company, branch, dt_from, dt_to_excl, group_b
         .annotate(
             docs_count=Count("id"),
             receipt=Coalesce(
-                Sum("amount", filter=Q(doc_type=wm.MoneyDocument.DocType.MONEY_RECEIPT), output_field=MONEY_FIELD),
+                Sum("amount", filter=Q(doc_type=RECEIPT) & ~is_debt, output_field=MONEY_FIELD),
                 ZERO_MONEY,
             ),
             expense=Coalesce(
-                Sum("amount", filter=Q(doc_type=wm.MoneyDocument.DocType.MONEY_EXPENSE), output_field=MONEY_FIELD),
+                Sum("amount", filter=Q(doc_type=EXPENSE) & ~is_debt, output_field=MONEY_FIELD),
+                ZERO_MONEY,
+            ),
+            debt_receipt=Coalesce(
+                Sum("amount", filter=Q(doc_type=RECEIPT) & is_debt, output_field=MONEY_FIELD),
+                ZERO_MONEY,
+            ),
+            debt_expense=Coalesce(
+                Sum("amount", filter=Q(doc_type=EXPENSE) & is_debt, output_field=MONEY_FIELD),
                 ZERO_MONEY,
             ),
         )
@@ -395,6 +415,8 @@ def _build_owner_cash_analytics(*, company, branch, dt_from, dt_to_excl, group_b
 
         rec = (r.get("receipt") or Decimal("0.00")).quantize(Decimal("0.01"))
         exp = (r.get("expense") or Decimal("0.00")).quantize(Decimal("0.01"))
+        d_rec = (r.get("debt_receipt") or Decimal("0.00")).quantize(Decimal("0.01"))
+        d_exp = (r.get("debt_expense") or Decimal("0.00")).quantize(Decimal("0.01"))
         cash_by_register.append(
             {
                 "kind": kind,
@@ -404,12 +426,16 @@ def _build_owner_cash_analytics(*, company, branch, dt_from, dt_to_excl, group_b
                 "money_receipt_amount": _money_str(rec),
                 "money_expense_amount": _money_str(exp),
                 "money_net_amount": _money_str((rec - exp).quantize(Decimal("0.01"))),
+                "money_debt_receipt_amount": _money_str(d_rec),
+                "money_debt_expense_amount": _money_str(d_exp),
+                "money_debt_net_amount": _money_str((d_rec - d_exp).quantize(Decimal("0.01"))),
             }
         )
 
     def _by_category(doc_type):
         qs = (
             money_qs.filter(doc_type=doc_type)
+            .exclude(is_debt)
             .values("payment_category_id", "payment_category__title")
             .annotate(
                 docs_count=Count("id"),
@@ -439,8 +465,10 @@ def _build_owner_cash_analytics(*, company, branch, dt_from, dt_to_excl, group_b
         money_qs.annotate(period=trunc_money)
         .values("period")
         .annotate(
-            receipt=Coalesce(Sum("amount", filter=Q(doc_type=wm.MoneyDocument.DocType.MONEY_RECEIPT)), ZERO_MONEY),
-            expense=Coalesce(Sum("amount", filter=Q(doc_type=wm.MoneyDocument.DocType.MONEY_EXPENSE)), ZERO_MONEY),
+            receipt=Coalesce(Sum("amount", filter=Q(doc_type=RECEIPT) & ~is_debt), ZERO_MONEY),
+            expense=Coalesce(Sum("amount", filter=Q(doc_type=EXPENSE) & ~is_debt), ZERO_MONEY),
+            debt_receipt=Coalesce(Sum("amount", filter=Q(doc_type=RECEIPT) & is_debt), ZERO_MONEY),
+            debt_expense=Coalesce(Sum("amount", filter=Q(doc_type=EXPENSE) & is_debt), ZERO_MONEY),
             docs_count=Count("id"),
         )
         .order_by("period")
@@ -449,6 +477,8 @@ def _build_owner_cash_analytics(*, company, branch, dt_from, dt_to_excl, group_b
     for row in money_by_date_qs:
         rec = (row.get("receipt") or Decimal("0.00")).quantize(Decimal("0.01"))
         exp = (row.get("expense") or Decimal("0.00")).quantize(Decimal("0.01"))
+        d_rec = (row.get("debt_receipt") or Decimal("0.00")).quantize(Decimal("0.01"))
+        d_exp = (row.get("debt_expense") or Decimal("0.00")).quantize(Decimal("0.01"))
         money_by_date.append(
             {
                 "date": _period_iso(row["period"]),
@@ -456,6 +486,9 @@ def _build_owner_cash_analytics(*, company, branch, dt_from, dt_to_excl, group_b
                 "money_receipt_amount": _money_str(rec),
                 "money_expense_amount": _money_str(exp),
                 "money_net_amount": _money_str((rec - exp).quantize(Decimal("0.01"))),
+                "money_debt_receipt_amount": _money_str(d_rec),
+                "money_debt_expense_amount": _money_str(d_exp),
+                "money_debt_net_amount": _money_str((d_rec - d_exp).quantize(Decimal("0.01"))),
             }
         )
 
@@ -465,6 +498,10 @@ def _build_owner_cash_analytics(*, company, branch, dt_from, dt_to_excl, group_b
             "money_receipt_amount": _money_str(receipt_total),
             "money_expense_amount": _money_str(expense_total),
             "money_net_amount": _money_str(net_total),
+            # Графа «долг»: погашения по системной категории «Долги», вне обычного прихода/расхода.
+            "money_debt_receipt_amount": _money_str(debt_receipt_total),
+            "money_debt_expense_amount": _money_str(debt_expense_total),
+            "money_debt_net_amount": _money_str(debt_net_total),
         },
         "charts": {
             "money_by_date": money_by_date,

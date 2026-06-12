@@ -286,7 +286,6 @@ def _create_money_document_for_request(document: models.Document, request_obj: m
 
     if not document.counterparty_id and document.doc_type in (
         models.Document.DocType.SALE,
-        models.Document.DocType.PURCHASE,
         models.Document.DocType.SALE_RETURN,
         models.Document.DocType.PURCHASE_RETURN,
     ):
@@ -340,6 +339,7 @@ def _create_money_document_for_request(document: models.Document, request_obj: m
         cash_register=cash_register,
         counterparty=document.counterparty,
         payment_category=payment_category,
+        payment_method=document.payment_method,
         amount=amount,
         comment=f"АВТО: {document.doc_type} {document.number or document.id}",
         company=company,
@@ -682,7 +682,6 @@ def post_document(document: models.Document, allow_negative: bool = None) -> mod
 
             if not document.counterparty_id and document.doc_type in (
                 models.Document.DocType.SALE,
-                models.Document.DocType.PURCHASE,
                 models.Document.DocType.SALE_RETURN,
                 models.Document.DocType.PURCHASE_RETURN,
             ):
@@ -718,6 +717,7 @@ def post_document(document: models.Document, allow_negative: bool = None) -> mod
                     cash_register=cash_register,
                     counterparty=document.counterparty,
                     payment_category=payment_category,
+                    payment_method=document.payment_method,
                     amount=prepayment,
                     comment=f"ПРЕДОПЛАТА: {document.doc_type} {document.number or document.id}",
                     company=company,
@@ -734,6 +734,7 @@ def post_document(document: models.Document, allow_negative: bool = None) -> mod
                     money_doc.cash_register = cash_register
                     money_doc.counterparty = document.counterparty
                     money_doc.payment_category = payment_category
+                    money_doc.payment_method = document.payment_method
                     money_doc.amount = prepayment
                     money_doc.comment = f"ПРЕДОПЛАТА: {document.doc_type} {document.number or document.id}"
                     money_doc.company = company

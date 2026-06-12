@@ -4,13 +4,41 @@ import django_filters
 from rest_framework import status, filters
 from rest_framework.response import Response
 from rest_framework import generics
-from rest_framework.exceptions import ValidationError
+from rest_framework.exceptions import ValidationError, PermissionDenied
 from django.db import transaction, IntegrityError
 from django.db.models import Sum, Q
 from django_filters.rest_framework import DjangoFilterBackend
 
+from apps.utils import _is_owner_like
+
 from .views import CompanyBranchRestrictedMixin, filter_qs_company_branch_or_global
 from . import models, serializers_money, services_money
+
+
+def _cash_registers_visible_qs(view):
+    """
+    Кассы, доступные пользователю: своя компания/филиал (как обычно), а для
+    владельца с ?include_partners=1 — ещё и кассы компаний-партнёров
+    (активное складское/кассовое партнёрство).
+    """
+    base = models.CashRegister.objects.select_related("company", "branch")
+    qs = view._filter_qs_company_branch(base.all())
+
+    user = view._user()
+    request = view._request()
+    raw = ""
+    if request is not None:
+        params = getattr(request, "query_params", None) or getattr(request, "GET", None)
+        if params is not None:
+            raw = str(params.get("include_partners", "")).strip().lower()
+    include_partners = raw in ("1", "true", "yes", "on")
+
+    if include_partners and _is_owner_like(user):
+        company = view._company()
+        partner_ids = [p.id for p in models.list_active_stock_partner_companies(company)]
+        if partner_ids:
+            qs = (qs | base.filter(company_id__in=partner_ids)).distinct()
+    return qs
 
 
 class MoneyDocumentFilter(django_filters.FilterSet):
@@ -27,6 +55,7 @@ class MoneyDocumentFilter(django_filters.FilterSet):
             "warehouse": ["exact"],
             "counterparty": ["exact"],
             "payment_category": ["exact"],
+            "payment_method": ["exact"],
         }
 
 
@@ -36,6 +65,9 @@ class CashRegisterListCreateView(CompanyBranchRestrictedMixin, generics.ListCrea
     filter_backends = [DjangoFilterBackend, filters.SearchFilter]
     filterset_fields = ["company", "branch"]
     search_fields = ["name", "location"]
+
+    def get_queryset(self):
+        return _cash_registers_visible_qs(self).order_by("name")
 
     def perform_create(self, serializer):
         company = self._company()
@@ -77,6 +109,23 @@ class CashRegisterDetailView(CompanyBranchRestrictedMixin, generics.RetrieveUpda
     serializer_class = serializers_money.CashRegisterSerializer
     queryset = models.CashRegister.objects.select_related("company", "branch")
 
+    def get_queryset(self):
+        return _cash_registers_visible_qs(self)
+
+    def _ensure_own_company(self, instance):
+        company = self._company()
+        company_id = getattr(company, "id", None)
+        if company_id and instance.company_id != company_id:
+            raise PermissionDenied("Кассу компании-партнёра можно только просматривать.")
+
+    def perform_update(self, serializer):
+        self._ensure_own_company(serializer.instance)
+        serializer.save()
+
+    def perform_destroy(self, instance):
+        self._ensure_own_company(instance)
+        instance.delete()
+
 
 class CashRegisterOperationsView(CompanyBranchRestrictedMixin, generics.RetrieveAPIView):
     """
@@ -85,6 +134,9 @@ class CashRegisterOperationsView(CompanyBranchRestrictedMixin, generics.Retrieve
     """
 
     queryset = models.CashRegister.objects.select_related("company", "branch")
+
+    def get_queryset(self):
+        return _cash_registers_visible_qs(self)
 
     def retrieve(self, request, *args, **kwargs):
         instance = self.get_object()
@@ -302,7 +354,7 @@ class CounterpartyMoneyOperationsView(CompanyBranchRestrictedMixin, generics.Lis
 
     serializer_class = serializers_money.MoneyDocumentSerializer
     filter_backends = [DjangoFilterBackend, filters.SearchFilter]
-    filterset_fields = ["doc_type", "status", "cash_register", "warehouse", "payment_category"]
+    filterset_fields = ["doc_type", "status", "cash_register", "warehouse", "payment_category", "payment_method"]
     search_fields = ["number", "comment"]
 
     def get_queryset(self):

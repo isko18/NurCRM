@@ -25,6 +25,24 @@ def effective_payment_kind(value, *, default="cash"):
     return normalized
 
 
+def normalize_payment_method(value):
+    """
+    Приводит форму оплаты к значениям Document.PaymentMethod:
+    наличные -> cash, безналичные (карта/перевод) -> cashless.
+    """
+    if value is None or value == "":
+        return None
+    raw = str(value).strip().lower().replace("-", "_")
+    if raw in ("cash", "nal", "nalichnye", "наличные", "наличными", "нал"):
+        return "cash"
+    if raw in (
+        "cashless", "beznal", "beznalichnye", "безналичные", "безналичными",
+        "безнал", "card", "карта", "перевод", "transfer", "bank",
+    ):
+        return "cashless"
+    return str(value).strip()
+
+
 def _active_branch(serializer: serializers.Serializer):
     """
     Активный филиал:
