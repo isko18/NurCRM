@@ -19,6 +19,31 @@ from .models import (
     OrderCheckoutPayment,
     Preparation, PreparationIngredient, PreparationProcessing,
 )
+from .fiscal_models import CafeFiscalSettings, CafeFiscalShift, CafeFiscalReceipt
+
+
+@admin.register(CafeFiscalSettings)
+class CafeFiscalSettingsAdmin(admin.ModelAdmin):
+    list_display = ("company", "enabled", "registration_number", "tin", "updated_at")
+    list_filter = ("enabled",)
+    search_fields = ("registration_number", "tin", "login")
+    raw_id_fields = ("company",)
+
+
+@admin.register(CafeFiscalShift)
+class CafeFiscalShiftAdmin(admin.ModelAdmin):
+    list_display = ("id", "company", "branch", "status", "opened_at", "closed_at")
+    list_filter = ("status",)
+    search_fields = ("registration_number",)
+    raw_id_fields = ("company", "branch", "opened_by", "closed_by")
+
+
+@admin.register(CafeFiscalReceipt)
+class CafeFiscalReceiptAdmin(admin.ModelAdmin):
+    list_display = ("id", "company", "kind", "operation_type", "fd_number", "total_sum", "created_at")
+    list_filter = ("kind",)
+    search_fields = ("fd_number", "fn_serial_number")
+    raw_id_fields = ("company", "branch", "order", "shift", "created_by")
 
 @admin.register(CafeReceiptPrinterSettings)
 class CafeReceiptPrinterSettingsAdmin(admin.ModelAdmin):

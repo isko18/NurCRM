@@ -1059,6 +1059,9 @@ class MenuItemSerializer(CompanyBranchReadOnlyMixin):
             "vat_percent", "other_expenses", "cost_price",
             "margin_amount", "margin_percent_value",
             "vat_amount", "profit", "margin_percent", "ingredients_cost",
+            # Фискальные коды (налоговая ГНС КР)
+            "fiscal_vat_code", "fiscal_st_code", "fiscal_calc_item_attr_code",
+            "fiscal_measure", "fiscal_sgtin",
             "created_at", "updated_at", "ingredients",
         ]
         read_only_fields = [

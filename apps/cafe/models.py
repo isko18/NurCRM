@@ -627,6 +627,27 @@ class MenuItem(models.Model):
 
     image = models.ImageField("Изображение", upload_to="menu_items/", blank=True, null=True)
 
+    # --- Фискальные коды (налоговая ГНС КР). None → берётся дефолт компании. ---
+    fiscal_vat_code = models.SmallIntegerField(
+        "Код НДС (фискальный)", null=True, blank=True,
+        help_text="Код ставки НДС для чека. Пусто — дефолт из фискальных настроек компании.",
+    )
+    fiscal_st_code = models.SmallIntegerField(
+        "Код НСП (фискальный)", null=True, blank=True,
+        help_text="Код ставки НСП для чека. Пусто — дефолт из фискальных настроек компании.",
+    )
+    fiscal_calc_item_attr_code = models.IntegerField(
+        "Код признака предмета расчёта", null=True, blank=True,
+        help_text="calcItemAttributeCode для чека. Пусто — дефолт компании.",
+    )
+    fiscal_measure = models.CharField(
+        "Единица измерения (фискальная)", max_length=32, blank=True, default="",
+        help_text="measure для чека (шт, порция…). Пусто — дефолт компании.",
+    )
+    fiscal_sgtin = models.CharField(
+        "ТНВЭД / SGTIN", max_length=64, blank=True, default="",
+    )
+
     created_at = models.DateTimeField("Дата создания", auto_now_add=True)
     updated_at = models.DateTimeField("Дата обновления", auto_now=True)
 
@@ -2624,3 +2645,14 @@ class OrderCheckoutPayment(models.Model):
         verbose_name = "Часть оплаты заказа"
         verbose_name_plural = "Части оплаты заказа"
         ordering = ["created_at"]
+
+
+# ==========================
+# Фискальная интеграция (налоговая ГНС КР) — см. fiscal_models.py
+# Импорт нужен, чтобы Django зарегистрировал модели приложения cafe.
+# ==========================
+from .fiscal_models import (  # noqa: E402,F401
+    CafeFiscalSettings,
+    CafeFiscalShift,
+    CafeFiscalReceipt,
+)

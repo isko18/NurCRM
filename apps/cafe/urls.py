@@ -57,6 +57,19 @@ from apps.cafe.showcase.views_public import PublicCafeInfoAPIView, PublicCafeMen
 
 from apps.cafe.offline_views import CafeOfflineSnapshotView, CafeOfflineSyncView
 
+from apps.cafe.fiscal_views import (
+    CafeFiscalSettingsView,
+    CafeFiscalShiftStateView,
+    CafeFiscalShiftListView,
+    CafeFiscalShiftOpenView,
+    CafeFiscalShiftCloseView,
+    CafeFiscalCashDepositView,
+    CafeFiscalCashWithdrawView,
+    CafeFiscalOrderReceiptPayloadView,
+    CafeFiscalOrderReceiptRecordView,
+    CafeFiscalReceiptListView,
+)
+
 from apps.cafe.household_views import (
     CafeExpenseCategoryListCreateView,
     CafeExpenseCategoryRetrieveUpdateDestroyView,
@@ -288,6 +301,26 @@ urlpatterns = [
 
     path("analytics/warehouse/low-stock/", WarehouseLowStockView.as_view()),
     re_path(r"^analytics/export/?$", CafeAnalyticsExportView.as_view(), name="cafe-analytics-export"),
+
+    # === Фискальная интеграция (налоговая ГНС КР) ===
+    path("fiscal/settings/", CafeFiscalSettingsView.as_view(), name="cafe-fiscal-settings"),
+    path("fiscal/shift/state/", CafeFiscalShiftStateView.as_view(), name="cafe-fiscal-shift-state"),
+    path("fiscal/shift/open/", CafeFiscalShiftOpenView.as_view(), name="cafe-fiscal-shift-open"),
+    path("fiscal/shift/close/", CafeFiscalShiftCloseView.as_view(), name="cafe-fiscal-shift-close"),
+    path("fiscal/shifts/", CafeFiscalShiftListView.as_view(), name="cafe-fiscal-shifts"),
+    path("fiscal/cash/deposit/", CafeFiscalCashDepositView.as_view(), name="cafe-fiscal-cash-deposit"),
+    path("fiscal/cash/withdraw/", CafeFiscalCashWithdrawView.as_view(), name="cafe-fiscal-cash-withdraw"),
+    path(
+        "fiscal/orders/<uuid:pk>/receipt-payload/",
+        CafeFiscalOrderReceiptPayloadView.as_view(),
+        name="cafe-fiscal-order-receipt-payload",
+    ),
+    path(
+        "fiscal/orders/<uuid:pk>/receipt/",
+        CafeFiscalOrderReceiptRecordView.as_view(),
+        name="cafe-fiscal-order-receipt",
+    ),
+    path("fiscal/receipts/", CafeFiscalReceiptListView.as_view(), name="cafe-fiscal-receipts"),
 
     path("public/cafe/<slug:company_slug>/", PublicCafeInfoAPIView.as_view(), name="public_cafe_info"),
     path("public/cafe/<slug:company_slug>/menu/", PublicCafeMenuAPIView.as_view(), name="public_cafe_menu"),
