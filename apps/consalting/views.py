@@ -1,5 +1,9 @@
-from rest_framework import generics, permissions
+from rest_framework import generics, permissions, status
 from rest_framework.exceptions import PermissionDenied
+from rest_framework.response import Response
+from rest_framework.views import APIView
+
+from django.utils import timezone
 
 from django_filters.rest_framework import DjangoFilterBackend
 
@@ -9,6 +13,9 @@ from .models import (
     SalaryConsalting,
     RequestsConsalting,
     BookingConsalting,
+    FunnelConsalting,
+    FunnelStageConsalting,
+    LeadConsalting,
 )
 from .serializers import (
     ServicesConsaltingSerializer,
@@ -16,6 +23,10 @@ from .serializers import (
     SalaryConsaltingSerializer,
     RequestsConsaltingSerializer,
     BookingConsaltingSerializer,
+    FunnelConsaltingSerializer,
+    FunnelStageConsaltingSerializer,
+    LeadConsaltingSerializer,
+    LeadMoveStageSerializer,
 )
 from apps.users.models import Branch
 
@@ -329,3 +340,127 @@ class BookingConsaltingListCreateView(CompanyBranchQuerysetMixin, generics.ListC
 class BookingConsaltingRetrieveUpdateDestroyView(CompanyBranchQuerysetMixin, generics.RetrieveUpdateDestroyAPIView):
     queryset = BookingConsalting.objects.select_related("employee", "company").all()
     serializer_class = BookingConsaltingSerializer
+
+
+# ==========================
+# FunnelConsalting (воронка продаж)
+# ==========================
+class FunnelConsaltingListCreateView(CompanyBranchQuerysetMixin, generics.ListCreateAPIView):
+    queryset = FunnelConsalting.objects.prefetch_related("stages").all()
+    serializer_class = FunnelConsaltingSerializer
+    filter_backends = [DjangoFilterBackend]
+    filterset_fields = ["is_active", "branch"]
+
+
+class FunnelConsaltingRetrieveUpdateDestroyView(CompanyBranchQuerysetMixin, generics.RetrieveUpdateDestroyAPIView):
+    queryset = FunnelConsalting.objects.prefetch_related("stages").all()
+    serializer_class = FunnelConsaltingSerializer
+
+
+class FunnelBoardView(CompanyBranchQuerysetMixin, generics.GenericAPIView):
+    """
+    Канбан-доска воронки: стадии со списком лидов в каждой.
+    GET /api/consalting/funnels/<uuid:pk>/board/
+    """
+    queryset = FunnelConsalting.objects.all()
+    serializer_class = FunnelConsaltingSerializer
+
+    def get(self, request, *args, **kwargs):
+        funnel = self.get_object()
+        leads_qs = LeadConsalting.objects.filter(funnel=funnel).select_related("stage", "owner", "client")
+
+        columns = []
+        for stage in funnel.stages.all():
+            stage_leads = [l for l in leads_qs if l.stage_id == stage.id]
+            columns.append({
+                "stage": FunnelStageConsaltingSerializer(stage, context=self.get_serializer_context()).data,
+                "leads": LeadConsaltingSerializer(stage_leads, many=True, context=self.get_serializer_context()).data,
+            })
+
+        # лиды без стадии
+        no_stage = [l for l in leads_qs if l.stage_id is None]
+
+        return Response({
+            "funnel": FunnelConsaltingSerializer(funnel, context=self.get_serializer_context()).data,
+            "columns": columns,
+            "unassigned": LeadConsaltingSerializer(no_stage, many=True, context=self.get_serializer_context()).data,
+        })
+
+
+# ==========================
+# FunnelStageConsalting (стадии)
+# ==========================
+class FunnelStageConsaltingListCreateView(CompanyBranchQuerysetMixin, generics.ListCreateAPIView):
+    queryset = FunnelStageConsalting.objects.select_related("funnel").all()
+    serializer_class = FunnelStageConsaltingSerializer
+    filter_backends = [DjangoFilterBackend]
+    filterset_fields = ["funnel", "is_final", "is_success", "branch"]
+
+    # company/branch проставляются из воронки в сериализаторе
+    def perform_create(self, serializer):
+        company = self._user_company()
+        if not company:
+            raise PermissionDenied("У пользователя не настроена компания.")
+        serializer.save()
+
+
+class FunnelStageConsaltingRetrieveUpdateDestroyView(CompanyBranchQuerysetMixin, generics.RetrieveUpdateDestroyAPIView):
+    queryset = FunnelStageConsalting.objects.select_related("funnel").all()
+    serializer_class = FunnelStageConsaltingSerializer
+
+    def perform_update(self, serializer):
+        company = self._user_company()
+        if not company:
+            raise PermissionDenied("У пользователя не настроена компания.")
+        serializer.save()
+
+
+# ==========================
+# LeadConsalting (карточки лидов)
+# ==========================
+class LeadConsaltingListCreateView(CompanyBranchQuerysetMixin, generics.ListCreateAPIView):
+    queryset = LeadConsalting.objects.select_related("funnel", "stage", "owner", "client", "company").all()
+    serializer_class = LeadConsaltingSerializer
+    filter_backends = [DjangoFilterBackend]
+    filterset_fields = ["funnel", "stage", "owner", "client", "status", "branch"]
+
+
+class LeadConsaltingRetrieveUpdateDestroyView(CompanyBranchQuerysetMixin, generics.RetrieveUpdateDestroyAPIView):
+    queryset = LeadConsalting.objects.select_related("funnel", "stage", "owner", "client", "company").all()
+    serializer_class = LeadConsaltingSerializer
+
+
+class LeadMoveStageView(CompanyBranchQuerysetMixin, generics.GenericAPIView):
+    """
+    Перемещение лида в другую стадию его воронки.
+    POST /api/consalting/leads/<uuid:pk>/move-stage/  { "stage": "<uuid>" }
+    """
+    queryset = LeadConsalting.objects.select_related("funnel", "stage").all()
+    serializer_class = LeadMoveStageSerializer
+
+    def post(self, request, *args, **kwargs):
+        lead = self.get_object()
+        ser = self.get_serializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+        stage = ser.validated_data["stage"]
+
+        if stage.funnel_id != lead.funnel_id:
+            return Response(
+                {"stage": "Стадия относится к другой воронке."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        lead.stage = stage
+        # синхронизируем статус/дату закрытия по финальной стадии
+        if stage.is_final:
+            lead.status = LeadConsalting.Status.WON if stage.is_success else LeadConsalting.Status.LOST
+            lead.closed_at = timezone.now()
+        else:
+            if lead.status in (LeadConsalting.Status.WON, LeadConsalting.Status.LOST):
+                lead.status = LeadConsalting.Status.IN_WORK
+            lead.closed_at = None
+        lead.save(update_fields=["stage", "status", "closed_at", "updated_at"])
+
+        return Response(
+            LeadConsaltingSerializer(lead, context=self.get_serializer_context()).data
+        )

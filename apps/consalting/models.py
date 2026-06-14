@@ -319,3 +319,242 @@ class BookingConsalting(models.Model):
         if self.branch_id:
             if self.branch.company_id != self.company_id:
                 raise ValidationError({'branch': 'Филиал принадлежит другой компании.'})
+
+
+# ======== Воронка продаж ========
+class FunnelConsalting(TimeStampedModel):
+    """Воронка продаж (набор стадий, по которым движутся лиды)."""
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    company = models.ForeignKey(
+        Company,
+        on_delete=models.CASCADE,
+        related_name='consalting_funnels',
+        related_query_name='consalting_funnel',
+        verbose_name='Компания'
+    )
+    branch = models.ForeignKey(
+        Branch,
+        on_delete=models.CASCADE,
+        null=True, blank=True, db_index=True,
+        related_name='consalting_funnels',
+        related_query_name='consalting_funnel',
+        verbose_name='Филиал',
+    )
+    name = models.CharField(max_length=255, verbose_name='Название воронки')
+    description = models.TextField(blank=True, verbose_name='Описание')
+    is_active = models.BooleanField(default=True, verbose_name='Активна')
+
+    class Meta:
+        verbose_name = 'Воронка продаж'
+        verbose_name_plural = 'Воронки продаж'
+        ordering = ['-created_at']
+        indexes = [
+            models.Index(fields=['company', 'is_active']),
+            models.Index(fields=['company', 'branch', 'is_active']),
+        ]
+        constraints = [
+            models.UniqueConstraint(
+                fields=('branch', 'name'),
+                name='uniq_consalting_funnel_per_branch',
+                condition=models.Q(branch__isnull=False),
+            ),
+            models.UniqueConstraint(
+                fields=('company', 'name'),
+                name='uniq_consalting_funnel_global_per_company',
+                condition=models.Q(branch__isnull=True),
+            ),
+        ]
+
+    def __str__(self):
+        return self.name or str(self.id)
+
+    def clean(self):
+        if self.branch_id and self.branch.company_id != self.company_id:
+            raise ValidationError({'branch': 'Филиал принадлежит другой компании.'})
+
+
+# ======== Стадия воронки ========
+class FunnelStageConsalting(TimeStampedModel):
+    """Стадия (этап) воронки продаж."""
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    company = models.ForeignKey(
+        Company,
+        on_delete=models.CASCADE,
+        related_name='consalting_funnel_stages',
+        related_query_name='consalting_funnel_stage',
+        verbose_name='Компания'
+    )
+    branch = models.ForeignKey(
+        Branch,
+        on_delete=models.CASCADE,
+        null=True, blank=True, db_index=True,
+        related_name='consalting_funnel_stages',
+        related_query_name='consalting_funnel_stage',
+        verbose_name='Филиал',
+    )
+    funnel = models.ForeignKey(
+        FunnelConsalting,
+        on_delete=models.CASCADE,
+        related_name='stages',
+        related_query_name='stage',
+        verbose_name='Воронка'
+    )
+    name = models.CharField(max_length=255, verbose_name='Название стадии')
+    order = models.PositiveIntegerField(default=0, verbose_name='Порядок')
+    color = models.CharField(
+        max_length=7,
+        default='#3498db',
+        verbose_name='Цвет',
+        help_text='HEX-цвет (например, #3498db)'
+    )
+    is_final = models.BooleanField(
+        default=False,
+        verbose_name='Финальная стадия',
+        help_text='Стадия закрытия лида (успех или провал)'
+    )
+    is_success = models.BooleanField(
+        default=False,
+        verbose_name='Успешная стадия',
+        help_text='Стадия успешного закрытия лида'
+    )
+
+    class Meta:
+        verbose_name = 'Стадия воронки'
+        verbose_name_plural = 'Стадии воронки'
+        ordering = ['funnel', 'order']
+        indexes = [
+            models.Index(fields=['company', 'funnel', 'order']),
+        ]
+        constraints = [
+            models.UniqueConstraint(
+                fields=('funnel', 'order'),
+                name='uniq_consalting_stage_order_per_funnel',
+            ),
+        ]
+
+    def __str__(self):
+        return f"{self.funnel.name} — {self.name}"
+
+    def clean(self):
+        if self.funnel_id:
+            if self.company_id and self.funnel.company_id != self.company_id:
+                raise ValidationError({'funnel': 'Воронка принадлежит другой компании.'})
+            if self.funnel.branch_id not in (None, self.branch_id):
+                raise ValidationError({'funnel': 'Воронка относится к другому филиалу.'})
+        if self.branch_id and self.company_id and self.branch.company_id != self.company_id:
+            raise ValidationError({'branch': 'Филиал принадлежит другой компании.'})
+
+
+# ======== Лид (карточка) ========
+class LeadConsalting(TimeStampedModel):
+    """Лид — карточка потенциального клиента, движется по стадиям воронки."""
+    class Status(models.TextChoices):
+        NEW = 'new', 'Новый'
+        IN_WORK = 'in_work', 'В работе'
+        WON = 'won', 'Успешно закрыт'
+        LOST = 'lost', 'Потерян'
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    company = models.ForeignKey(
+        Company,
+        on_delete=models.CASCADE,
+        related_name='consalting_leads',
+        related_query_name='consalting_lead',
+        verbose_name='Компания'
+    )
+    branch = models.ForeignKey(
+        Branch,
+        on_delete=models.CASCADE,
+        null=True, blank=True, db_index=True,
+        related_name='consalting_leads',
+        related_query_name='consalting_lead',
+        verbose_name='Филиал',
+    )
+    funnel = models.ForeignKey(
+        FunnelConsalting,
+        on_delete=models.CASCADE,
+        related_name='leads',
+        related_query_name='lead',
+        verbose_name='Воронка'
+    )
+    stage = models.ForeignKey(
+        FunnelStageConsalting,
+        on_delete=models.SET_NULL,
+        null=True, blank=True,
+        related_name='leads',
+        related_query_name='lead',
+        verbose_name='Текущая стадия'
+    )
+    client = models.ForeignKey(
+        "main.Client",
+        on_delete=models.SET_NULL,
+        null=True, blank=True,
+        related_name='consalting_leads',
+        related_query_name='consalting_lead',
+        verbose_name='Клиент'
+    )
+    owner = models.ForeignKey(
+        User,
+        on_delete=models.SET_NULL,
+        null=True, blank=True,
+        related_name='consalting_leads',
+        related_query_name='consalting_lead',
+        verbose_name='Ответственный'
+    )
+
+    title = models.CharField(max_length=255, verbose_name='Название лида')
+    description = models.TextField(blank=True, verbose_name='Описание')
+
+    # Контактные данные карточки (если ещё нет привязанного клиента)
+    full_name = models.CharField(max_length=255, blank=True, verbose_name='Контактное лицо')
+    phone = models.CharField(max_length=32, blank=True, verbose_name='Телефон')
+    email = models.EmailField(blank=True, verbose_name='Email')
+
+    source = models.CharField(max_length=100, blank=True, verbose_name='Источник')
+    estimated_value = models.DecimalField(
+        max_digits=12, decimal_places=2, default=0, verbose_name='Оценочная стоимость'
+    )
+    probability = models.PositiveIntegerField(default=0, verbose_name='Вероятность закрытия (%)')
+    status = models.CharField(
+        max_length=20, choices=Status.choices, default=Status.NEW, verbose_name='Статус'
+    )
+    closed_at = models.DateTimeField(null=True, blank=True, verbose_name='Дата закрытия')
+
+    class Meta:
+        verbose_name = 'Лид'
+        verbose_name_plural = 'Лиды'
+        ordering = ['-created_at']
+        indexes = [
+            models.Index(fields=['company', 'funnel', 'stage']),
+            models.Index(fields=['company', 'branch', 'status']),
+            models.Index(fields=['company', 'owner']),
+            models.Index(fields=['company', 'created_at']),
+        ]
+
+    def __str__(self):
+        return f"{self.title} ({self.get_status_display()})"
+
+    def clean(self):
+        # company-согласованность
+        if self.company_id:
+            if self.funnel and self.funnel.company_id != self.company_id:
+                raise ValidationError({'funnel': 'Воронка принадлежит другой компании.'})
+            if self.stage and self.stage.company_id != self.company_id:
+                raise ValidationError({'stage': 'Стадия принадлежит другой компании.'})
+            if self.client and getattr(self.client, 'company_id', None) != self.company_id:
+                raise ValidationError({'client': 'Клиент из другой компании.'})
+            if self.owner and getattr(self.owner, 'company_id', None) not in (None, self.company_id):
+                raise ValidationError({'owner': 'Ответственный из другой компании.'})
+
+        # стадия должна принадлежать выбранной воронке
+        if self.stage_id and self.funnel_id and self.stage.funnel_id != self.funnel_id:
+            raise ValidationError({'stage': 'Стадия относится к другой воронке.'})
+
+        # branch-согласованность
+        if self.branch_id:
+            if self.company_id and self.branch.company_id != self.company_id:
+                raise ValidationError({'branch': 'Филиал принадлежит другой компании.'})
+            if self.funnel and self.funnel.branch_id not in (None, self.branch_id):
+                raise ValidationError({'funnel': 'Воронка относится к другому филиалу.'})
+            if self.client and getattr(self.client, 'branch_id', None) not in (None, self.branch_id):
+                raise ValidationError({'client': 'Клиент другого филиала.'})

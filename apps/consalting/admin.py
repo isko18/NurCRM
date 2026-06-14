@@ -9,6 +9,9 @@ from .models import (
     SalaryConsalting,
     RequestsConsalting,
     BookingConsalting,
+    FunnelConsalting,
+    FunnelStageConsalting,
+    LeadConsalting,
 )
 from apps.users.models import Company, User
 
@@ -226,6 +229,62 @@ class RequestsConsaltingAdmin(CompanyBranchScopedAdminMixin, TimeStampedAdminMix
     list_filter = ("company", "branch", "status")
     search_fields = ("name", "description")
     raw_id_fields = ("company", "branch", "client")
+    ordering = ("-created_at",)
+
+    def get_readonly_fields(self, request, obj=None):
+        ro = list(self.readonly_fields)
+        if not request.user.is_superuser:
+            ro.extend(["company", "branch"])
+        return ro
+
+
+# ========= Funnels =========
+class FunnelStageInline(admin.TabularInline):
+    model = FunnelStageConsalting
+    extra = 1
+    fields = ("name", "order", "color", "is_final", "is_success")
+    ordering = ("order",)
+
+
+@admin.register(FunnelConsalting)
+class FunnelConsaltingAdmin(CompanyBranchScopedAdminMixin, TimeStampedAdminMixin, admin.ModelAdmin):
+    list_display = ("name", "company", "branch", "is_active", "created_at")
+    list_filter = ("company", "branch", "is_active")
+    search_fields = ("name", "description")
+    raw_id_fields = ("company", "branch")
+    ordering = ("-created_at",)
+    inlines = [FunnelStageInline]
+
+    def get_readonly_fields(self, request, obj=None):
+        ro = list(self.readonly_fields)
+        if not request.user.is_superuser:
+            ro.extend(["company", "branch"])
+        return ro
+
+
+# ========= Funnel stages =========
+@admin.register(FunnelStageConsalting)
+class FunnelStageConsaltingAdmin(CompanyBranchScopedAdminMixin, TimeStampedAdminMixin, admin.ModelAdmin):
+    list_display = ("name", "funnel", "order", "company", "branch", "is_final", "is_success")
+    list_filter = ("company", "branch", "is_final", "is_success")
+    search_fields = ("name",)
+    raw_id_fields = ("company", "branch", "funnel")
+    ordering = ("funnel", "order")
+
+    def get_readonly_fields(self, request, obj=None):
+        ro = list(self.readonly_fields)
+        if not request.user.is_superuser:
+            ro.extend(["company", "branch"])
+        return ro
+
+
+# ========= Leads =========
+@admin.register(LeadConsalting)
+class LeadConsaltingAdmin(CompanyBranchScopedAdminMixin, TimeStampedAdminMixin, admin.ModelAdmin):
+    list_display = ("title", "company", "branch", "funnel", "stage", "status", "owner", "estimated_value", "created_at")
+    list_filter = ("company", "branch", "funnel", "stage", "status")
+    search_fields = ("title", "description", "full_name", "phone", "email")
+    raw_id_fields = ("company", "branch", "funnel", "stage", "client", "owner")
     ordering = ("-created_at",)
 
     def get_readonly_fields(self, request, obj=None):
