@@ -303,6 +303,29 @@ CELERY_RESULT_BACKEND = 'redis://localhost:6379/0'
 CELERY_ACCEPT_CONTENT = ['json']
 CELERY_TASK_SERIALIZER = 'json'
 
+# Строгий режим машины состояний воронки консалтинга.
+# False (по умолчанию) — недопустимые переходы выполняются, но логируются.
+# True — недопустимые переходы возвращают 400.
+CONSALTING_FUNNEL_STRICT = False
+
+# Периодические сканы воронки консалтинга (требуют запущенного celery beat).
+from celery.schedules import crontab  # noqa: E402
+
+CELERY_BEAT_SCHEDULE = {
+    'consalting-scan-no-activity': {
+        'task': 'apps.consalting.tasks.scan_no_activity',
+        'schedule': crontab(minute='*/30'),
+    },
+    'consalting-scan-overdue-tasks': {
+        'task': 'apps.consalting.tasks.scan_overdue_tasks',
+        'schedule': crontab(minute='*/15'),
+    },
+    'consalting-scan-sla-breach': {
+        'task': 'apps.consalting.tasks.scan_sla_breach',
+        'schedule': crontab(minute='*/30'),
+    },
+}
+
 # ===========================
 # Кэширование (Redis)
 # ===========================

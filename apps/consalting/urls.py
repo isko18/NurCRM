@@ -18,6 +18,17 @@ from .views import (
     LeadConsaltingListCreateView,
     LeadConsaltingRetrieveUpdateDestroyView,
     LeadMoveStageView,
+    LeadAllowedTransitionsView,
+    LeadTimelineView,
+    LeadActivityCreateView,
+    LeadRecalculateScoreView,
+    LeadWinView,
+    LeadLoseView,
+    LeadTaskListCreateView,
+    LeadTaskRetrieveUpdateDestroyView,
+    LossReasonListCreateView,
+    LossReasonRetrieveUpdateDestroyView,
+    FunnelAnalyticsView,
 )
 
 urlpatterns = [
@@ -40,6 +51,7 @@ urlpatterns = [
     path('funnels/', FunnelConsaltingListCreateView.as_view(), name='funnels-list-create'),
     path('funnels/<uuid:pk>/', FunnelConsaltingRetrieveUpdateDestroyView.as_view(), name='funnels-rud'),
     path('funnels/<uuid:pk>/board/', FunnelBoardView.as_view(), name='funnels-board'),
+    path('funnels/<uuid:pk>/analytics/', FunnelAnalyticsView.as_view(), name='funnels-analytics'),
 
     # ===== Стадии воронки =====
     path('funnel-stages/', FunnelStageConsaltingListCreateView.as_view(), name='funnel-stages-list-create'),
@@ -49,4 +61,18 @@ urlpatterns = [
     path('leads/', LeadConsaltingListCreateView.as_view(), name='leads-list-create'),
     path('leads/<uuid:pk>/', LeadConsaltingRetrieveUpdateDestroyView.as_view(), name='leads-rud'),
     path('leads/<uuid:pk>/move-stage/', LeadMoveStageView.as_view(), name='leads-move-stage'),
+    path('leads/<uuid:pk>/allowed-transitions/', LeadAllowedTransitionsView.as_view(), name='leads-allowed-transitions'),
+    path('leads/<uuid:pk>/timeline/', LeadTimelineView.as_view(), name='leads-timeline'),
+    path('leads/<uuid:pk>/activities/', LeadActivityCreateView.as_view(), name='leads-activity-create'),
+    path('leads/<uuid:pk>/recalculate-score/', LeadRecalculateScoreView.as_view(), name='leads-recalculate-score'),
+    path('leads/<uuid:pk>/win/', LeadWinView.as_view(), name='leads-win'),
+    path('leads/<uuid:pk>/lose/', LeadLoseView.as_view(), name='leads-lose'),
+
+    # ===== Задачи по лидам =====
+    path('lead-tasks/', LeadTaskListCreateView.as_view(), name='lead-tasks-list-create'),
+    path('lead-tasks/<uuid:pk>/', LeadTaskRetrieveUpdateDestroyView.as_view(), name='lead-tasks-rud'),
+
+    # ===== Причины проигрыша =====
+    path('loss-reasons/', LossReasonListCreateView.as_view(), name='loss-reasons-list-create'),
+    path('loss-reasons/<uuid:pk>/', LossReasonRetrieveUpdateDestroyView.as_view(), name='loss-reasons-rud'),
 ]

@@ -10,6 +10,9 @@ from .models import (
     FunnelConsalting,
     FunnelStageConsalting,
     LeadConsalting,
+    LossReasonConsalting,
+    LeadActivityConsalting,
+    LeadTaskConsalting,
 )
 from apps.users.models import User, Branch
 
@@ -371,10 +374,16 @@ class FunnelStageConsaltingSerializer(CompanyBranchReadOnlyMixin, serializers.Mo
         model = FunnelStageConsalting
         fields = (
             "id", "company", "branch", "funnel",
-            "name", "order", "color", "is_final", "is_success",
+            "name", "order", "color", "stage_type",
+            "allowed_next", "required_fields", "sla_hours", "allow_skip",
+            "is_final", "is_success",
             "leads_count", "created_at", "updated_at",
         )
-        read_only_fields = ("id", "company", "branch", "leads_count", "created_at", "updated_at")
+        # is_final/is_success выводятся из stage_type в model.save() → только чтение
+        read_only_fields = (
+            "id", "company", "branch", "is_final", "is_success",
+            "leads_count", "created_at", "updated_at",
+        )
 
     def get_leads_count(self, obj):
         # если queryset аннотирован — используем его, иначе считаем
@@ -437,11 +446,17 @@ class LeadConsaltingSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSeri
         queryset=User.objects.all(), required=False, allow_null=True
     )
 
+    loss_reason = serializers.PrimaryKeyRelatedField(
+        queryset=LossReasonConsalting.objects.all(), required=False, allow_null=True
+    )
+
     funnel_name = serializers.CharField(source="funnel.name", read_only=True)
     stage_name = serializers.CharField(source="stage.name", read_only=True)
     stage_color = serializers.CharField(source="stage.color", read_only=True)
+    stage_type = serializers.CharField(source="stage.stage_type", read_only=True)
     owner_display = serializers.SerializerMethodField()
     client_display = serializers.SerializerMethodField()
+    loss_reason_label = serializers.CharField(source="loss_reason.label", read_only=True)
     created_at = serializers.DateTimeField(read_only=True)
     updated_at = serializers.DateTimeField(read_only=True)
 
@@ -450,18 +465,32 @@ class LeadConsaltingSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSeri
         fields = (
             "id", "company", "branch",
             "funnel", "funnel_name",
-            "stage", "stage_name", "stage_color",
+            "stage", "stage_name", "stage_color", "stage_type",
             "client", "client_display",
             "owner", "owner_display",
             "title", "description",
             "full_name", "phone", "email",
             "source", "estimated_value", "probability", "status",
+            # скоринг
+            "score_grade", "score_value", "score_updated_at",
+            "budget_confirmed", "urgency", "decision_maker_engaged", "avg_response_minutes",
+            # следующее действие
+            "next_action_type", "next_action_date", "next_action_note",
+            # риск / тайминги
+            "is_at_risk", "risk_reason", "last_activity_at", "stage_entered_at",
+            # проигрыш
+            "loss_reason", "loss_reason_label", "loss_comment",
+            # lifecycle
+            "first_contact_at", "won_at", "lost_at", "completed_at",
             "closed_at", "created_at", "updated_at",
         )
         read_only_fields = (
             "id", "company", "branch",
-            "funnel_name", "stage_name", "stage_color",
-            "owner_display", "client_display",
+            "funnel_name", "stage_name", "stage_color", "stage_type",
+            "owner_display", "client_display", "loss_reason_label",
+            "score_grade", "score_value", "score_updated_at",
+            "is_at_risk", "risk_reason", "last_activity_at", "stage_entered_at",
+            "won_at", "lost_at", "completed_at", "first_contact_at",
             "created_at", "updated_at",
         )
 
@@ -490,6 +519,18 @@ class LeadConsaltingSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSeri
         if value and company and getattr(value, "company_id", None) not in (None, company.id):
             raise serializers.ValidationError("Ответственный из другой компании.")
         return value
+
+    def validate_loss_reason(self, value):
+        company = self._user_company()
+        if value and company and value.company_id != company.id:
+            raise serializers.ValidationError("Причина проигрыша из другой компании.")
+        return value
+
+    def create(self, validated_data):
+        # фиксируем момент входа в стартовую стадию для аналитики времени
+        from django.utils import timezone
+        validated_data.setdefault("stage_entered_at", timezone.now())
+        return super().create(validated_data)
 
     def validate(self, attrs):
         company = self._user_company()
@@ -533,3 +574,105 @@ class LeadConsaltingSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSeri
 # ==========================
 class LeadMoveStageSerializer(serializers.Serializer):
     stage = serializers.PrimaryKeyRelatedField(queryset=FunnelStageConsalting.objects.all())
+
+
+# ==========================
+# Закрытие лида (win / lose)
+# ==========================
+class LeadLoseSerializer(serializers.Serializer):
+    loss_reason = serializers.PrimaryKeyRelatedField(queryset=LossReasonConsalting.objects.all())
+    loss_comment = serializers.CharField(required=False, allow_blank=True)
+    stage = serializers.PrimaryKeyRelatedField(
+        queryset=FunnelStageConsalting.objects.all(), required=False, allow_null=True,
+        help_text="Финальная LOST-стадия воронки. Если не указать — берётся первая LOST-стадия."
+    )
+
+
+class LeadWinSerializer(serializers.Serializer):
+    stage = serializers.PrimaryKeyRelatedField(
+        queryset=FunnelStageConsalting.objects.all(), required=False, allow_null=True,
+        help_text="Финальная WON-стадия. Если не указать — берётся первая WON-стадия воронки."
+    )
+
+
+# ==========================
+# LossReasonConsalting (справочник)
+# ==========================
+class LossReasonConsaltingSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
+    branch = None  # у справочника нет филиала
+
+    class Meta:
+        model = LossReasonConsalting
+        fields = ("id", "company", "code", "label", "is_active", "created_at", "updated_at")
+        read_only_fields = ("id", "company", "created_at", "updated_at")
+
+    # переопределяем mixin: модель без branch
+    company = serializers.ReadOnlyField(source="company.id")
+
+    def create(self, validated_data):
+        company = self._user_company()
+        if company is not None:
+            validated_data["company"] = company
+        return serializers.ModelSerializer.create(self, validated_data)
+
+    def update(self, instance, validated_data):
+        validated_data.pop("company", None)
+        return serializers.ModelSerializer.update(self, instance, validated_data)
+
+
+# ==========================
+# LeadActivityConsalting (timeline, append-only)
+# ==========================
+class LeadActivityConsaltingSerializer(serializers.ModelSerializer):
+    actor_display = serializers.SerializerMethodField()
+
+    class Meta:
+        model = LeadActivityConsalting
+        fields = (
+            "id", "lead", "actor", "actor_display", "type",
+            "title", "body", "payload", "file", "created_at",
+        )
+        read_only_fields = ("id", "actor", "actor_display", "created_at")
+
+    def get_actor_display(self, obj):
+        if obj.actor and (obj.actor.first_name or obj.actor.last_name):
+            return f"{obj.actor.first_name or ''} {obj.actor.last_name or ''}".strip()
+        return getattr(obj.actor, "email", None) if obj.actor else "Система"
+
+    def validate_type(self, value):
+        # через API можно создавать только «контактные» активности, не системные
+        manual = {
+            LeadActivityConsalting.Type.NOTE,
+            LeadActivityConsalting.Type.CALL,
+            LeadActivityConsalting.Type.MESSAGE,
+            LeadActivityConsalting.Type.EMAIL,
+            LeadActivityConsalting.Type.MEETING,
+            LeadActivityConsalting.Type.FILE,
+        }
+        if value not in manual:
+            raise serializers.ValidationError("Этот тип активности создаётся только системой.")
+        return value
+
+
+# ==========================
+# LeadTaskConsalting (follow-up)
+# ==========================
+class LeadTaskConsaltingSerializer(serializers.ModelSerializer):
+    assignee_display = serializers.SerializerMethodField()
+
+    class Meta:
+        model = LeadTaskConsalting
+        fields = (
+            "id", "lead", "assignee", "assignee_display", "type", "title",
+            "due_date", "status", "created_by", "created_by_automation",
+            "completed_at", "created_at", "updated_at",
+        )
+        read_only_fields = (
+            "id", "assignee_display", "created_by", "created_by_automation",
+            "completed_at", "created_at", "updated_at",
+        )
+
+    def get_assignee_display(self, obj):
+        if obj.assignee and (obj.assignee.first_name or obj.assignee.last_name):
+            return f"{obj.assignee.first_name or ''} {obj.assignee.last_name or ''}".strip()
+        return getattr(obj.assignee, "email", None) if obj.assignee else None

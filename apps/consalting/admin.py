@@ -12,6 +12,12 @@ from .models import (
     FunnelConsalting,
     FunnelStageConsalting,
     LeadConsalting,
+    LossReasonConsalting,
+    LeadActivityConsalting,
+    StageTransitionConsalting,
+    LeadTaskConsalting,
+    AutomationRuleConsalting,
+    AutomationLogConsalting,
 )
 from apps.users.models import Company, User
 
@@ -242,7 +248,7 @@ class RequestsConsaltingAdmin(CompanyBranchScopedAdminMixin, TimeStampedAdminMix
 class FunnelStageInline(admin.TabularInline):
     model = FunnelStageConsalting
     extra = 1
-    fields = ("name", "order", "color", "is_final", "is_success")
+    fields = ("name", "order", "stage_type", "color", "sla_hours", "allow_skip")
     ordering = ("order",)
 
 
@@ -265,14 +271,14 @@ class FunnelConsaltingAdmin(CompanyBranchScopedAdminMixin, TimeStampedAdminMixin
 # ========= Funnel stages =========
 @admin.register(FunnelStageConsalting)
 class FunnelStageConsaltingAdmin(CompanyBranchScopedAdminMixin, TimeStampedAdminMixin, admin.ModelAdmin):
-    list_display = ("name", "funnel", "order", "company", "branch", "is_final", "is_success")
-    list_filter = ("company", "branch", "is_final", "is_success")
+    list_display = ("name", "funnel", "order", "stage_type", "company", "branch", "is_final", "is_success")
+    list_filter = ("company", "branch", "stage_type")
     search_fields = ("name",)
     raw_id_fields = ("company", "branch", "funnel")
     ordering = ("funnel", "order")
 
     def get_readonly_fields(self, request, obj=None):
-        ro = list(self.readonly_fields)
+        ro = list(self.readonly_fields) + ["is_final", "is_success"]
         if not request.user.is_superuser:
             ro.extend(["company", "branch"])
         return ro
@@ -281,17 +287,118 @@ class FunnelStageConsaltingAdmin(CompanyBranchScopedAdminMixin, TimeStampedAdmin
 # ========= Leads =========
 @admin.register(LeadConsalting)
 class LeadConsaltingAdmin(CompanyBranchScopedAdminMixin, TimeStampedAdminMixin, admin.ModelAdmin):
-    list_display = ("title", "company", "branch", "funnel", "stage", "status", "owner", "estimated_value", "created_at")
-    list_filter = ("company", "branch", "funnel", "stage", "status")
+    list_display = ("title", "company", "branch", "funnel", "stage", "status",
+                    "score_grade", "is_at_risk", "owner", "estimated_value", "next_action_date", "created_at")
+    list_filter = ("company", "branch", "funnel", "stage", "status", "score_grade", "is_at_risk", "urgency")
     search_fields = ("title", "description", "full_name", "phone", "email")
-    raw_id_fields = ("company", "branch", "funnel", "stage", "client", "owner")
+    raw_id_fields = ("company", "branch", "funnel", "stage", "client", "owner", "loss_reason")
     ordering = ("-created_at",)
+
+    def get_readonly_fields(self, request, obj=None):
+        ro = list(self.readonly_fields) + [
+            "score_grade", "score_value", "score_updated_at",
+            "is_at_risk", "risk_reason", "last_activity_at", "stage_entered_at",
+            "won_at", "lost_at", "completed_at", "first_contact_at",
+        ]
+        if not request.user.is_superuser:
+            ro.extend(["company", "branch"])
+        return ro
+
+
+# ========= Loss reasons =========
+@admin.register(LossReasonConsalting)
+class LossReasonConsaltingAdmin(CompanyBranchScopedAdminMixin, TimeStampedAdminMixin, admin.ModelAdmin):
+    list_display = ("label", "code", "company", "is_active", "created_at")
+    list_filter = ("company", "is_active")
+    search_fields = ("label", "code")
+    raw_id_fields = ("company",)
+    ordering = ("label",)
+
+    def get_readonly_fields(self, request, obj=None):
+        ro = list(self.readonly_fields)
+        if not request.user.is_superuser:
+            ro.append("company")
+        return ro
+
+
+# ========= Lead activities (read-only audit) =========
+@admin.register(LeadActivityConsalting)
+class LeadActivityConsaltingAdmin(CompanyBranchScopedAdminMixin, TimeStampedAdminMixin, admin.ModelAdmin):
+    list_display = ("type", "title", "lead", "actor", "company", "branch", "created_at")
+    list_filter = ("company", "branch", "type")
+    search_fields = ("title", "body")
+    raw_id_fields = ("company", "branch", "lead", "actor")
+    ordering = ("-created_at",)
+
+    def has_change_permission(self, request, obj=None):
+        return False  # лента неизменяема
+
+    def has_add_permission(self, request):
+        return False
+
+
+# ========= Stage transitions (read-only) =========
+@admin.register(StageTransitionConsalting)
+class StageTransitionConsaltingAdmin(CompanyBranchScopedAdminMixin, TimeStampedAdminMixin, admin.ModelAdmin):
+    list_display = ("lead", "from_type", "to_type", "actor", "automated", "seconds_in_prev", "created_at")
+    list_filter = ("company", "branch", "automated", "to_type")
+    raw_id_fields = ("company", "branch", "lead", "from_stage", "to_stage", "actor")
+    ordering = ("-created_at",)
+
+    def has_change_permission(self, request, obj=None):
+        return False
+
+    def has_add_permission(self, request):
+        return False
+
+
+# ========= Lead tasks =========
+@admin.register(LeadTaskConsalting)
+class LeadTaskConsaltingAdmin(CompanyBranchScopedAdminMixin, TimeStampedAdminMixin, admin.ModelAdmin):
+    list_display = ("title", "lead", "type", "status", "due_date", "assignee", "company", "branch", "created_at")
+    list_filter = ("company", "branch", "status", "type")
+    search_fields = ("title",)
+    raw_id_fields = ("company", "branch", "lead", "assignee", "created_by")
+    ordering = ("due_date",)
 
     def get_readonly_fields(self, request, obj=None):
         ro = list(self.readonly_fields)
         if not request.user.is_superuser:
             ro.extend(["company", "branch"])
         return ro
+
+
+# ========= Automation rules =========
+@admin.register(AutomationRuleConsalting)
+class AutomationRuleConsaltingAdmin(CompanyBranchScopedAdminMixin, TimeStampedAdminMixin, admin.ModelAdmin):
+    list_display = ("name", "trigger", "company", "funnel", "is_active", "priority")
+    list_filter = ("company", "trigger", "is_active")
+    search_fields = ("name",)
+    raw_id_fields = ("company", "funnel")
+    ordering = ("priority", "name")
+    branch_field_name = "__none__"  # у модели нет branch
+
+    def get_readonly_fields(self, request, obj=None):
+        ro = list(self.readonly_fields)
+        if not request.user.is_superuser:
+            ro.append("company")
+        return ro
+
+
+# ========= Automation logs (read-only) =========
+@admin.register(AutomationLogConsalting)
+class AutomationLogConsaltingAdmin(CompanyBranchScopedAdminMixin, TimeStampedAdminMixin, admin.ModelAdmin):
+    list_display = ("trigger", "rule", "lead", "matched", "company", "created_at")
+    list_filter = ("company", "trigger", "matched")
+    raw_id_fields = ("company", "rule", "lead")
+    ordering = ("-created_at",)
+    branch_field_name = "__none__"
+
+    def has_change_permission(self, request, obj=None):
+        return False
+
+    def has_add_permission(self, request):
+        return False
 
 
 # ========= Bookings =========

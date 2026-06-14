@@ -376,6 +376,24 @@ class FunnelConsalting(TimeStampedModel):
 # ======== Стадия воронки ========
 class FunnelStageConsalting(TimeStampedModel):
     """Стадия (этап) воронки продаж."""
+
+    class StageType(models.TextChoices):
+        NEW_LEAD = 'new_lead', 'Новый лид'
+        FIRST_CONTACT = 'first_contact', 'Первый контакт'
+        QUALIFICATION = 'qualification', 'Квалификация'
+        NURTURE = 'nurture', 'Прогрев / в работе'
+        PROPOSAL_SENT = 'proposal_sent', 'КП отправлено'
+        NEGOTIATION = 'negotiation', 'Переговоры'
+        DECISION_PENDING = 'decision_pending', 'Ожидание решения'
+        WON = 'won', 'Оплачено / выиграно'
+        ONBOARDING = 'onboarding', 'Онбординг'
+        COMPLETED = 'completed', 'Завершено'
+        LOST = 'lost', 'Потеряно'
+
+    # стадии, считающиеся «закрытием» (терминальными)
+    TERMINAL_TYPES = {StageType.WON, StageType.COMPLETED, StageType.LOST}
+    SUCCESS_TYPES = {StageType.WON, StageType.COMPLETED}
+
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     company = models.ForeignKey(
         Company,
@@ -407,15 +425,30 @@ class FunnelStageConsalting(TimeStampedModel):
         verbose_name='Цвет',
         help_text='HEX-цвет (например, #3498db)'
     )
+    # Семантический тип стадии — на нём строятся переходы и аналитика
+    stage_type = models.CharField(
+        max_length=20, choices=StageType.choices, default=StageType.NEW_LEAD,
+        db_index=True, verbose_name='Тип стадии'
+    )
+    # переопределение матрицы переходов на уровне воронки (список stage_type).
+    # пусто → берётся каноничная матрица из funnel/state_machine.py
+    allowed_next = models.JSONField(default=list, blank=True, verbose_name='Разрешённые переходы')
+    # поля, которые обязаны быть заполнены перед уходом со стадии
+    required_fields = models.JSONField(default=list, blank=True, verbose_name='Обязательные поля')
+    # порог (часов) бездействия/нахождения в стадии для пометки «at risk»
+    sla_hours = models.PositiveIntegerField(null=True, blank=True, verbose_name='SLA (часов)')
+    allow_skip = models.BooleanField(default=False, verbose_name='Разрешить пропуск стадий')
+
+    # is_final / is_success — выводятся из stage_type (оставлены для совместимости)
     is_final = models.BooleanField(
         default=False,
         verbose_name='Финальная стадия',
-        help_text='Стадия закрытия лида (успех или провал)'
+        help_text='Выводится из типа стадии. Стадия закрытия лида (успех или провал)'
     )
     is_success = models.BooleanField(
         default=False,
         verbose_name='Успешная стадия',
-        help_text='Стадия успешного закрытия лида'
+        help_text='Выводится из типа стадии. Стадия успешного закрытия лида'
     )
 
     class Meta:
@@ -424,6 +457,7 @@ class FunnelStageConsalting(TimeStampedModel):
         ordering = ['funnel', 'order']
         indexes = [
             models.Index(fields=['company', 'funnel', 'order']),
+            models.Index(fields=['funnel', 'stage_type']),
         ]
         constraints = [
             models.UniqueConstraint(
@@ -434,6 +468,12 @@ class FunnelStageConsalting(TimeStampedModel):
 
     def __str__(self):
         return f"{self.funnel.name} — {self.name}"
+
+    def save(self, *args, **kwargs):
+        # синхронизируем устаревшие флаги с семантическим типом
+        self.is_final = self.stage_type in self.TERMINAL_TYPES
+        self.is_success = self.stage_type in self.SUCCESS_TYPES
+        super().save(*args, **kwargs)
 
     def clean(self):
         if self.funnel_id:
@@ -453,6 +493,22 @@ class LeadConsalting(TimeStampedModel):
         IN_WORK = 'in_work', 'В работе'
         WON = 'won', 'Успешно закрыт'
         LOST = 'lost', 'Потерян'
+
+    class Grade(models.TextChoices):
+        A = 'A', 'Горячий'
+        B = 'B', 'Тёплый'
+        C = 'C', 'Холодный'
+
+    class Urgency(models.TextChoices):
+        LOW = 'low', 'Низкая'
+        MEDIUM = 'medium', 'Средняя'
+        HIGH = 'high', 'Высокая'
+
+    class NextAction(models.TextChoices):
+        CALL = 'call', 'Звонок'
+        MESSAGE = 'message', 'Сообщение'
+        MEETING = 'meeting', 'Встреча'
+        FOLLOW_UP = 'follow_up', 'Follow-up'
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     company = models.ForeignKey(
@@ -520,6 +576,51 @@ class LeadConsalting(TimeStampedModel):
     )
     closed_at = models.DateTimeField(null=True, blank=True, verbose_name='Дата закрытия')
 
+    # ----- Скоринг -----
+    score_grade = models.CharField(
+        max_length=1, choices=Grade.choices, default=Grade.C, db_index=True, verbose_name='Грейд'
+    )
+    score_value = models.PositiveIntegerField(default=0, verbose_name='Скоринг (0–100)')
+    score_updated_at = models.DateTimeField(null=True, blank=True, verbose_name='Скоринг обновлён')
+    budget_confirmed = models.BooleanField(default=False, verbose_name='Бюджет подтверждён')
+    urgency = models.CharField(
+        max_length=10, choices=Urgency.choices, default=Urgency.LOW, verbose_name='Срочность'
+    )
+    decision_maker_engaged = models.BooleanField(default=False, verbose_name='ЛПР вовлечён')
+    avg_response_minutes = models.PositiveIntegerField(
+        null=True, blank=True, verbose_name='Среднее время ответа (мин)'
+    )
+
+    # ----- Следующее действие (обязательно в активных стадиях) -----
+    next_action_type = models.CharField(
+        max_length=12, choices=NextAction.choices, null=True, blank=True, verbose_name='Тип след. действия'
+    )
+    next_action_date = models.DateTimeField(
+        null=True, blank=True, db_index=True, verbose_name='Дата след. действия'
+    )
+    next_action_note = models.CharField(max_length=500, blank=True, verbose_name='Заметка к действию')
+
+    # ----- Риск / тайминги -----
+    is_at_risk = models.BooleanField(default=False, db_index=True, verbose_name='Под риском')
+    risk_reason = models.CharField(max_length=255, blank=True, verbose_name='Причина риска')
+    last_activity_at = models.DateTimeField(
+        null=True, blank=True, db_index=True, verbose_name='Последняя активность'
+    )
+    stage_entered_at = models.DateTimeField(null=True, blank=True, verbose_name='Вход в текущую стадию')
+
+    # ----- Проигрыш -----
+    loss_reason = models.ForeignKey(
+        'LossReasonConsalting', on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='leads', verbose_name='Причина проигрыша'
+    )
+    loss_comment = models.TextField(blank=True, verbose_name='Комментарий к проигрышу')
+
+    # ----- Lifecycle -----
+    first_contact_at = models.DateTimeField(null=True, blank=True, verbose_name='Первый контакт')
+    won_at = models.DateTimeField(null=True, blank=True, verbose_name='Дата выигрыша')
+    lost_at = models.DateTimeField(null=True, blank=True, verbose_name='Дата проигрыша')
+    completed_at = models.DateTimeField(null=True, blank=True, verbose_name='Дата завершения')
+
     class Meta:
         verbose_name = 'Лид'
         verbose_name_plural = 'Лиды'
@@ -529,6 +630,9 @@ class LeadConsalting(TimeStampedModel):
             models.Index(fields=['company', 'branch', 'status']),
             models.Index(fields=['company', 'owner']),
             models.Index(fields=['company', 'created_at']),
+            models.Index(fields=['company', 'score_grade', 'next_action_date']),
+            models.Index(fields=['company', 'owner', 'next_action_date']),
+            models.Index(fields=['company', 'is_at_risk']),
         ]
 
     def __str__(self):
@@ -558,3 +662,268 @@ class LeadConsalting(TimeStampedModel):
                 raise ValidationError({'funnel': 'Воронка относится к другому филиалу.'})
             if self.client and getattr(self.client, 'branch_id', None) not in (None, self.branch_id):
                 raise ValidationError({'client': 'Клиент другого филиала.'})
+
+
+# ======== Причина проигрыша (справочник) ========
+class LossReasonConsalting(TimeStampedModel):
+    """Структурированная причина проигрыша сделки (на уровне компании)."""
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    company = models.ForeignKey(
+        Company,
+        on_delete=models.CASCADE,
+        related_name='consalting_loss_reasons',
+        related_query_name='consalting_loss_reason',
+        verbose_name='Компания'
+    )
+    code = models.SlugField(max_length=50, verbose_name='Код')
+    label = models.CharField(max_length=255, verbose_name='Название')
+    is_active = models.BooleanField(default=True, verbose_name='Активна')
+
+    class Meta:
+        verbose_name = 'Причина проигрыша'
+        verbose_name_plural = 'Причины проигрыша'
+        ordering = ['label']
+        constraints = [
+            models.UniqueConstraint(fields=('company', 'code'), name='uniq_consalting_loss_reason_code'),
+        ]
+
+    def __str__(self):
+        return self.label
+
+
+# ======== Лента активностей (audit trail, append-only) ========
+class LeadActivityConsalting(TimeStampedModel):
+    """Неизменяемая лента событий лида. Создаётся только через ActivityLogger."""
+    class Type(models.TextChoices):
+        NOTE = 'note', 'Заметка'
+        CALL = 'call', 'Звонок'
+        MESSAGE = 'message', 'Сообщение'
+        EMAIL = 'email', 'Email'
+        MEETING = 'meeting', 'Встреча'
+        FILE = 'file', 'Файл'
+        STAGE_CHANGE = 'stage_change', 'Смена стадии'
+        SCORE_CHANGE = 'score_change', 'Смена скоринга'
+        TASK = 'task', 'Задача'
+        AUTOMATION = 'automation', 'Автоматизация'
+        SYSTEM = 'system', 'Система'
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    company = models.ForeignKey(
+        Company, on_delete=models.CASCADE,
+        related_name='consalting_lead_activities',
+        related_query_name='consalting_lead_activity', verbose_name='Компания'
+    )
+    branch = models.ForeignKey(
+        Branch, on_delete=models.CASCADE, null=True, blank=True, db_index=True,
+        related_name='consalting_lead_activities',
+        related_query_name='consalting_lead_activity', verbose_name='Филиал'
+    )
+    lead = models.ForeignKey(
+        LeadConsalting, on_delete=models.CASCADE,
+        related_name='activities', related_query_name='activity', verbose_name='Лид'
+    )
+    actor = models.ForeignKey(
+        User, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='consalting_lead_activities', verbose_name='Автор'
+    )
+    type = models.CharField(max_length=20, choices=Type.choices, verbose_name='Тип')
+    title = models.CharField(max_length=255, verbose_name='Заголовок')
+    body = models.TextField(blank=True, verbose_name='Текст')
+    payload = models.JSONField(default=dict, blank=True, verbose_name='Данные')
+    file = models.FileField(upload_to='consalting/lead_activities/', null=True, blank=True, verbose_name='Файл')
+
+    class Meta:
+        verbose_name = 'Активность лида'
+        verbose_name_plural = 'Активности лидов'
+        ordering = ['-created_at']
+        indexes = [
+            models.Index(fields=['company', 'lead', 'created_at']),
+            models.Index(fields=['company', 'type', 'created_at']),
+        ]
+
+    def __str__(self):
+        return f"{self.get_type_display()}: {self.title}"
+
+
+# ======== Лог переходов по стадиям (для аналитики) ========
+class StageTransitionConsalting(TimeStampedModel):
+    """Запись перехода лида между стадиями — основа аналитики времени/конверсии."""
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    company = models.ForeignKey(
+        Company, on_delete=models.CASCADE,
+        related_name='consalting_stage_transitions',
+        related_query_name='consalting_stage_transition', verbose_name='Компания'
+    )
+    branch = models.ForeignKey(
+        Branch, on_delete=models.CASCADE, null=True, blank=True, db_index=True,
+        related_name='consalting_stage_transitions',
+        related_query_name='consalting_stage_transition', verbose_name='Филиал'
+    )
+    lead = models.ForeignKey(
+        LeadConsalting, on_delete=models.CASCADE,
+        related_name='transitions', related_query_name='transition', verbose_name='Лид'
+    )
+    from_stage = models.ForeignKey(
+        FunnelStageConsalting, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='+', verbose_name='Из стадии'
+    )
+    to_stage = models.ForeignKey(
+        FunnelStageConsalting, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='+', verbose_name='В стадию'
+    )
+    from_type = models.CharField(max_length=20, blank=True, verbose_name='Тип (из)')
+    to_type = models.CharField(max_length=20, blank=True, verbose_name='Тип (в)')
+    actor = models.ForeignKey(
+        User, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='consalting_stage_transitions', verbose_name='Автор'
+    )
+    automated = models.BooleanField(default=False, verbose_name='Автоматический')
+    seconds_in_prev = models.PositiveBigIntegerField(
+        null=True, blank=True, verbose_name='Секунд в прошлой стадии'
+    )
+
+    class Meta:
+        verbose_name = 'Переход по стадии'
+        verbose_name_plural = 'Переходы по стадиям'
+        ordering = ['-created_at']
+        indexes = [
+            models.Index(fields=['company', 'lead', 'created_at']),
+            models.Index(fields=['company', 'to_type', 'created_at']),
+        ]
+
+    def __str__(self):
+        return f"{self.from_type or '—'} → {self.to_type}"
+
+
+# ======== Задача по лиду (follow-up) ========
+class LeadTaskConsalting(TimeStampedModel):
+    """Задача/напоминание по лиду. Питает next_action и автоматизацию."""
+    class Status(models.TextChoices):
+        OPEN = 'open', 'Открыта'
+        DONE = 'done', 'Выполнена'
+        OVERDUE = 'overdue', 'Просрочена'
+        CANCELED = 'canceled', 'Отменена'
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    company = models.ForeignKey(
+        Company, on_delete=models.CASCADE,
+        related_name='consalting_lead_tasks',
+        related_query_name='consalting_lead_task', verbose_name='Компания'
+    )
+    branch = models.ForeignKey(
+        Branch, on_delete=models.CASCADE, null=True, blank=True, db_index=True,
+        related_name='consalting_lead_tasks',
+        related_query_name='consalting_lead_task', verbose_name='Филиал'
+    )
+    lead = models.ForeignKey(
+        LeadConsalting, on_delete=models.CASCADE,
+        related_name='tasks', related_query_name='task', verbose_name='Лид'
+    )
+    assignee = models.ForeignKey(
+        User, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='consalting_lead_tasks', verbose_name='Исполнитель'
+    )
+    type = models.CharField(
+        max_length=12, choices=LeadConsalting.NextAction.choices, verbose_name='Тип'
+    )
+    title = models.CharField(max_length=255, verbose_name='Название')
+    due_date = models.DateTimeField(db_index=True, verbose_name='Срок')
+    status = models.CharField(
+        max_length=10, choices=Status.choices, default=Status.OPEN, db_index=True, verbose_name='Статус'
+    )
+    created_by = models.ForeignKey(
+        User, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='consalting_created_lead_tasks', verbose_name='Создал'
+    )
+    created_by_automation = models.BooleanField(default=False, verbose_name='Создано автоматикой')
+    completed_at = models.DateTimeField(null=True, blank=True, verbose_name='Выполнена в')
+
+    class Meta:
+        verbose_name = 'Задача по лиду'
+        verbose_name_plural = 'Задачи по лидам'
+        ordering = ['due_date']
+        indexes = [
+            models.Index(fields=['company', 'status', 'due_date']),
+            models.Index(fields=['company', 'assignee', 'status']),
+            models.Index(fields=['lead', 'status']),
+        ]
+
+    def __str__(self):
+        return f"{self.title} ({self.get_status_display()})"
+
+
+# ======== Правило автоматизации ========
+class AutomationRuleConsalting(TimeStampedModel):
+    """Декларативное правило автоматизации воронки."""
+    class Trigger(models.TextChoices):
+        STAGE_CHANGED = 'stage_changed', 'Смена стадии'
+        ACTIVITY_ADDED = 'activity_added', 'Добавлена активность'
+        NO_ACTIVITY = 'no_activity', 'Нет активности'
+        PROPOSAL_OPENED = 'proposal_opened', 'КП открыто'
+        TASK_OVERDUE = 'task_overdue', 'Задача просрочена'
+        LEAD_WON = 'lead_won', 'Лид выигран'
+        LEAD_LOST = 'lead_lost', 'Лид проигран'
+        SLA_BREACH = 'sla_breach', 'Нарушение SLA'
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    company = models.ForeignKey(
+        Company, on_delete=models.CASCADE,
+        related_name='consalting_automation_rules',
+        related_query_name='consalting_automation_rule', verbose_name='Компания'
+    )
+    funnel = models.ForeignKey(
+        FunnelConsalting, on_delete=models.CASCADE, null=True, blank=True,
+        related_name='automation_rules', verbose_name='Воронка'
+    )
+    name = models.CharField(max_length=255, verbose_name='Название')
+    trigger = models.CharField(max_length=20, choices=Trigger.choices, db_index=True, verbose_name='Триггер')
+    conditions = models.JSONField(default=dict, blank=True, verbose_name='Условия')
+    actions = models.JSONField(default=list, blank=True, verbose_name='Действия')
+    is_active = models.BooleanField(default=True, db_index=True, verbose_name='Активно')
+    priority = models.IntegerField(default=100, verbose_name='Приоритет')
+
+    class Meta:
+        verbose_name = 'Правило автоматизации'
+        verbose_name_plural = 'Правила автоматизации'
+        ordering = ['priority', 'name']
+        indexes = [
+            models.Index(fields=['company', 'trigger', 'is_active']),
+        ]
+
+    def __str__(self):
+        return f"{self.name} [{self.get_trigger_display()}]"
+
+
+# ======== Лог автоматизации ========
+class AutomationLogConsalting(TimeStampedModel):
+    """Аудит срабатываний автоматизации (+ идемпотентность через dedup_key)."""
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    company = models.ForeignKey(
+        Company, on_delete=models.CASCADE,
+        related_name='consalting_automation_logs',
+        related_query_name='consalting_automation_log', verbose_name='Компания'
+    )
+    rule = models.ForeignKey(
+        AutomationRuleConsalting, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='logs', verbose_name='Правило'
+    )
+    lead = models.ForeignKey(
+        LeadConsalting, on_delete=models.CASCADE,
+        related_name='automation_logs', verbose_name='Лид'
+    )
+    trigger = models.CharField(max_length=20, verbose_name='Триггер')
+    matched = models.BooleanField(default=False, verbose_name='Условие выполнено')
+    actions_result = models.JSONField(default=list, blank=True, verbose_name='Результат действий')
+    dedup_key = models.CharField(max_length=255, db_index=True, blank=True, verbose_name='Ключ дедупликации')
+
+    class Meta:
+        verbose_name = 'Лог автоматизации'
+        verbose_name_plural = 'Логи автоматизации'
+        ordering = ['-created_at']
+        indexes = [
+            models.Index(fields=['company', 'lead', 'created_at']),
+            models.Index(fields=['dedup_key']),
+        ]
+
+    def __str__(self):
+        return f"{self.trigger} · {self.lead_id}"

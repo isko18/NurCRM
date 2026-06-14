@@ -4,6 +4,7 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from django.utils import timezone
+from django.shortcuts import get_object_or_404
 
 from django_filters.rest_framework import DjangoFilterBackend
 
@@ -16,6 +17,9 @@ from .models import (
     FunnelConsalting,
     FunnelStageConsalting,
     LeadConsalting,
+    LossReasonConsalting,
+    LeadActivityConsalting,
+    LeadTaskConsalting,
 )
 from .serializers import (
     ServicesConsaltingSerializer,
@@ -27,7 +31,19 @@ from .serializers import (
     FunnelStageConsaltingSerializer,
     LeadConsaltingSerializer,
     LeadMoveStageSerializer,
+    LeadLoseSerializer,
+    LeadWinSerializer,
+    LossReasonConsaltingSerializer,
+    LeadActivityConsaltingSerializer,
+    LeadTaskConsaltingSerializer,
 )
+from .funnel.state_machine import (
+    FunnelStateMachine, StateTransitionError, allowed_next_types,
+)
+from .funnel.activity import ActivityLogger
+from .funnel.scoring import ScoringService
+from .funnel.analytics import PipelineAnalytics
+from .funnel.events import emit as emit_funnel_event
 from apps.users.models import Branch
 
 
@@ -432,8 +448,11 @@ class LeadConsaltingRetrieveUpdateDestroyView(CompanyBranchQuerysetMixin, generi
 
 class LeadMoveStageView(CompanyBranchQuerysetMixin, generics.GenericAPIView):
     """
-    Перемещение лида в другую стадию его воронки.
+    Перемещение лида в другую стадию его воронки — через машину состояний.
     POST /api/consalting/leads/<uuid:pk>/move-stage/  { "stage": "<uuid>" }
+
+    В «мягком» режиме (CONSALTING_FUNNEL_STRICT=False) недопустимые переходы
+    выполняются, но фиксируются как нарушения в timeline. В «строгом» — 400.
     """
     queryset = LeadConsalting.objects.select_related("funnel", "stage").all()
     serializer_class = LeadMoveStageSerializer
@@ -449,18 +468,249 @@ class LeadMoveStageView(CompanyBranchQuerysetMixin, generics.GenericAPIView):
                 {"stage": "Стадия относится к другой воронке."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
-
-        lead.stage = stage
-        # синхронизируем статус/дату закрытия по финальной стадии
-        if stage.is_final:
-            lead.status = LeadConsalting.Status.WON if stage.is_success else LeadConsalting.Status.LOST
-            lead.closed_at = timezone.now()
-        else:
-            if lead.status in (LeadConsalting.Status.WON, LeadConsalting.Status.LOST):
-                lead.status = LeadConsalting.Status.IN_WORK
-            lead.closed_at = None
-        lead.save(update_fields=["stage", "status", "closed_at", "updated_at"])
-
+        try:
+            lead = FunnelStateMachine.transition(lead, stage, actor=request.user)
+        except StateTransitionError as e:
+            return Response(
+                {"detail": "Переход запрещён", "errors": e.errors},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
         return Response(
             LeadConsaltingSerializer(lead, context=self.get_serializer_context()).data
         )
+
+
+class LeadAllowedTransitionsView(CompanyBranchQuerysetMixin, generics.GenericAPIView):
+    """
+    Какие стадии доступны для перехода прямо сейчас (для подсветки колонок в UI).
+    GET /api/consalting/leads/<uuid:pk>/allowed-transitions/
+    """
+    queryset = LeadConsalting.objects.select_related("funnel", "stage").all()
+    serializer_class = LeadConsaltingSerializer
+
+    def get(self, request, *args, **kwargs):
+        lead = self.get_object()
+        allowed = allowed_next_types(lead.stage)
+        stages = FunnelStageConsalting.objects.filter(
+            funnel=lead.funnel, stage_type__in=allowed
+        ).order_by("order")
+        data = [
+            {"id": str(s.id), "name": s.name, "stage_type": s.stage_type,
+             "order": s.order, "color": s.color}
+            for s in stages
+        ]
+        return Response({"current_stage": str(lead.stage_id) if lead.stage_id else None,
+                         "allowed": data})
+
+
+class LeadTimelineView(CompanyBranchQuerysetMixin, generics.ListAPIView):
+    """
+    Лента активностей лида (audit trail).
+    GET /api/consalting/leads/<uuid:pk>/timeline/
+    """
+    serializer_class = LeadActivityConsaltingSerializer
+
+    def get_queryset(self):
+        company = self._user_company()
+        if not company:
+            return LeadActivityConsalting.objects.none()
+        return LeadActivityConsalting.objects.filter(
+            company=company, lead_id=self.kwargs["pk"]
+        ).select_related("actor").order_by("-created_at")
+
+
+class LeadActivityCreateView(CompanyBranchQuerysetMixin, generics.CreateAPIView):
+    """
+    Добавить активность (note/call/message/meeting/email/file) — пишется через ActivityLogger.
+    POST /api/consalting/leads/<uuid:pk>/activities/
+    """
+    serializer_class = LeadActivityConsaltingSerializer
+
+    def get_queryset(self):
+        return LeadActivityConsalting.objects.none()
+
+    def create(self, request, *args, **kwargs):
+        company = self._user_company()
+        if not company:
+            raise PermissionDenied("У пользователя не настроена компания.")
+        lead = get_object_or_404(LeadConsalting, pk=self.kwargs["pk"], company=company)
+
+        ser = self.get_serializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+        v = ser.validated_data
+        activity = ActivityLogger.log(
+            lead, v["type"], actor=request.user,
+            title=v.get("title", ""), body=v.get("body", ""),
+            payload=v.get("payload") or {}, file=v.get("file"),
+        )
+        # триггер автоматизации (фаза 6)
+        emit_funnel_event("activity_added", lead, actor=request.user, activity_type=v["type"])
+        return Response(
+            LeadActivityConsaltingSerializer(activity, context=self.get_serializer_context()).data,
+            status=status.HTTP_201_CREATED,
+        )
+
+
+class LeadRecalculateScoreView(CompanyBranchQuerysetMixin, generics.GenericAPIView):
+    """
+    Пересчитать скоринг лида.
+    POST /api/consalting/leads/<uuid:pk>/recalculate-score/
+    """
+    queryset = LeadConsalting.objects.all()
+    serializer_class = LeadConsaltingSerializer
+
+    def post(self, request, *args, **kwargs):
+        lead = self.get_object()
+        value, grade, changed = ScoringService.recalculate(lead, save=True)
+        if changed:
+            ActivityLogger.log(
+                lead, LeadActivityConsalting.Type.SCORE_CHANGE, actor=request.user,
+                title=f"Скоринг: {grade} ({value})",
+                payload={"score_value": value, "score_grade": grade},
+                touch_last_activity=False,
+            )
+        lead.refresh_from_db()
+        return Response(LeadConsaltingSerializer(lead, context=self.get_serializer_context()).data)
+
+
+class LeadWinView(CompanyBranchQuerysetMixin, generics.GenericAPIView):
+    """Закрыть лид как выигранный. POST /leads/<id>/win/  { "stage": "<won-stage>"? }"""
+    queryset = LeadConsalting.objects.select_related("funnel", "stage").all()
+    serializer_class = LeadWinSerializer
+
+    def post(self, request, *args, **kwargs):
+        lead = self.get_object()
+        ser = self.get_serializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+        stage = ser.validated_data.get("stage") or FunnelStageConsalting.objects.filter(
+            funnel=lead.funnel, stage_type=FunnelStageConsalting.StageType.WON
+        ).order_by("order").first()
+        if not stage:
+            return Response({"detail": "В воронке нет WON-стадии."}, status=status.HTTP_400_BAD_REQUEST)
+
+        lead.budget_confirmed = True  # выигрыш подразумевает подтверждённый бюджет
+        LeadConsalting.objects.filter(pk=lead.pk).update(budget_confirmed=True)
+        try:
+            lead = FunnelStateMachine.transition(lead, stage, actor=request.user)
+        except StateTransitionError as e:
+            return Response({"detail": "Переход запрещён", "errors": e.errors},
+                            status=status.HTTP_400_BAD_REQUEST)
+        return Response(LeadConsaltingSerializer(lead, context=self.get_serializer_context()).data)
+
+
+class LeadLoseView(CompanyBranchQuerysetMixin, generics.GenericAPIView):
+    """Закрыть лид как проигранный (причина обязательна). POST /leads/<id>/lose/"""
+    queryset = LeadConsalting.objects.select_related("funnel", "stage").all()
+    serializer_class = LeadLoseSerializer
+
+    def post(self, request, *args, **kwargs):
+        company = self._user_company()
+        lead = self.get_object()
+        ser = self.get_serializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+        v = ser.validated_data
+
+        loss_reason = v["loss_reason"]
+        if company and loss_reason.company_id != company.id:
+            return Response({"loss_reason": "Причина из другой компании."},
+                            status=status.HTTP_400_BAD_REQUEST)
+
+        stage = v.get("stage") or FunnelStageConsalting.objects.filter(
+            funnel=lead.funnel, stage_type=FunnelStageConsalting.StageType.LOST
+        ).order_by("order").first()
+        if not stage:
+            return Response({"detail": "В воронке нет LOST-стадии."}, status=status.HTTP_400_BAD_REQUEST)
+
+        lead.loss_reason = loss_reason
+        lead.loss_comment = v.get("loss_comment", "")
+        LeadConsalting.objects.filter(pk=lead.pk).update(
+            loss_reason=loss_reason, loss_comment=lead.loss_comment
+        )
+        try:
+            lead = FunnelStateMachine.transition(lead, stage, actor=request.user)
+        except StateTransitionError as e:
+            return Response({"detail": "Переход запрещён", "errors": e.errors},
+                            status=status.HTTP_400_BAD_REQUEST)
+        return Response(LeadConsaltingSerializer(lead, context=self.get_serializer_context()).data)
+
+
+# ==========================
+# LeadTaskConsalting (задачи по лиду)
+# ==========================
+class LeadTaskListCreateView(CompanyBranchQuerysetMixin, generics.ListCreateAPIView):
+    queryset = LeadTaskConsalting.objects.select_related("lead", "assignee").all()
+    serializer_class = LeadTaskConsaltingSerializer
+    filter_backends = [DjangoFilterBackend]
+    filterset_fields = ["lead", "assignee", "status", "type"]
+
+    def perform_create(self, serializer):
+        company = self._user_company()
+        if not company:
+            raise PermissionDenied("У пользователя не настроена компания.")
+        lead = serializer.validated_data["lead"]
+        if lead.company_id != company.id:
+            raise PermissionDenied("Лид из другой компании.")
+        task = serializer.save(
+            company=company, branch=lead.branch, created_by=self.request.user
+        )
+        # задача = следующий шаг по лиду
+        LeadConsalting.objects.filter(pk=lead.pk).update(
+            next_action_type=task.type, next_action_date=task.due_date,
+            next_action_note=task.title,
+        )
+        ActivityLogger.log(
+            lead, LeadActivityConsalting.Type.TASK, actor=self.request.user,
+            title=f"Задача: {task.title}", payload={"task_id": str(task.id)},
+            touch_last_activity=False,
+        )
+
+
+class LeadTaskRetrieveUpdateDestroyView(CompanyBranchQuerysetMixin, generics.RetrieveUpdateDestroyAPIView):
+    queryset = LeadTaskConsalting.objects.select_related("lead", "assignee").all()
+    serializer_class = LeadTaskConsaltingSerializer
+
+    def perform_update(self, serializer):
+        task = serializer.save()
+        # при завершении задачи фиксируем время
+        if task.status == LeadTaskConsalting.Status.DONE and task.completed_at is None:
+            task.completed_at = timezone.now()
+            task.save(update_fields=["completed_at"])
+
+
+# ==========================
+# LossReasonConsalting (справочник причин)
+# ==========================
+class LossReasonListCreateView(CompanyBranchQuerysetMixin, generics.ListCreateAPIView):
+    queryset = LossReasonConsalting.objects.all()
+    serializer_class = LossReasonConsaltingSerializer
+    filter_backends = [DjangoFilterBackend]
+    filterset_fields = ["is_active"]
+
+
+class LossReasonRetrieveUpdateDestroyView(CompanyBranchQuerysetMixin, generics.RetrieveUpdateDestroyAPIView):
+    queryset = LossReasonConsalting.objects.all()
+    serializer_class = LossReasonConsaltingSerializer
+
+
+# ==========================
+# Аналитика воронки
+# ==========================
+class FunnelAnalyticsView(CompanyBranchQuerysetMixin, generics.GenericAPIView):
+    """
+    Метрики воронки: конверсия по стадиям, время в стадии, drop-off, win-rate.
+    GET /api/consalting/funnels/<uuid:pk>/analytics/?date_from=&date_to=&branch=&owner=
+    """
+    queryset = FunnelConsalting.objects.all()
+    serializer_class = FunnelConsaltingSerializer
+
+    def get(self, request, *args, **kwargs):
+        funnel = self.get_object()
+        params = request.query_params
+        data = PipelineAnalytics.compute(
+            funnel,
+            date_from=params.get("date_from") or None,
+            date_to=params.get("date_to") or None,
+            branch=params.get("branch") or None,
+            owner=params.get("owner") or None,
+        )
+        return Response(data)
