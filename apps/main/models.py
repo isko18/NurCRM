@@ -3169,36 +3169,21 @@ class ClientDeal(models.Model):
         if not force and self.payments.exists():
             raise ValidationError("Нельзя пересобрать график: по сделке уже есть платежи.")
 
-        start = self.first_due_date or (timezone.localdate() + timedelta(days=1))
+        due_date = self.first_due_date or (timezone.localdate() + timedelta(days=self.debt_days))
 
-        base = (total / Decimal(self.debt_days)).quantize(
-            Decimal("0.01"),
-            rounding=ROUND_HALF_UP,
+        installment = DealInstallment(
+            company=self.company,
+            branch=self.branch,
+            deal=self,
+            number=1,
+            due_date=due_date,
+            amount=total,
+            balance_after=Decimal("0.00"),
         )
-
-        paid = Decimal("0.00")
-        items = []
-
-        for i in range(1, self.debt_days + 1):
-            amount_i = (total - paid) if i == self.debt_days else base
-            paid += amount_i
-            due = start + timedelta(days=(i - 1))
-
-            items.append(
-                DealInstallment(
-                    company=self.company,
-                    branch=self.branch,
-                    deal=self,
-                    number=i,
-                    due_date=due,
-                    amount=amount_i,
-                    balance_after=(total - paid).quantize(Decimal("0.01")),
-                )
-            )
 
         with transaction.atomic():
             self.installments.all().delete()
-            DealInstallment.objects.bulk_create(items)
+            DealInstallment.objects.bulk_create([installment])
 
     def save(self, *args, **kwargs):
         if self.kind != self.Kind.DEBT:

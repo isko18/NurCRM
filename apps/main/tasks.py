@@ -1,7 +1,18 @@
-from django.db import transaction
+from __future__ import annotations
+
+import logging
+import time
+
 from celery import shared_task
-from apps.main.models import Task, Notification
+from django.db import transaction
+from django.db.models.signals import post_save
+from django.dispatch import receiver
 from django.utils.timezone import localtime
+
+from apps.main.models import Notification, Task
+
+logger = logging.getLogger("crm.webhooks")
+
 
 @shared_task
 def create_task_notification(task_id):
@@ -28,12 +39,67 @@ def create_task_notification(task_id):
         print(f"[ERROR] Unexpected error while creating task notification: {e}")
 
 
-# Пример использования транзакции
-from django.db.models.signals import post_save
-from django.dispatch import receiver
-
 @receiver(post_save, sender=Task)
 def notify_assigned_user_async(sender, instance, created, **kwargs):
     if created and instance.assigned_to:
-        # Убедитесь, что задача сохранена, прежде чем вызывать celery задачу
         transaction.on_commit(lambda: create_task_notification.delay(str(instance.id)))
+
+
+@shared_task(name="apps.main.tasks.catalog_webhook_sync")
+def catalog_webhook_sync():
+    """
+    Periodic full-catalog webhook sync.
+
+    Iterates every product and re-sends it to the external catalog system
+    so that missed signals (network failures, deploys, etc.) can't cause
+    the remote catalog to fall out of sync.
+
+    Products that have no images are logged as warnings so the team knows
+    which items still need photos uploaded.
+    """
+    from apps.main.models import Product
+    from apps.main.services.webhooks import send_product_webhook
+
+    qs = (
+        Product.objects
+        .select_related(
+            "company", "branch", "brand", "category",
+            "client", "created_by", "characteristics",
+        )
+        .prefetch_related("images", "packages", "item_make")
+        .order_by("created_at")
+    )
+
+    total = 0
+    no_image_codes: list[str] = []
+    started = time.time()
+
+    for product in qs.iterator(chunk_size=200):
+        send_product_webhook(product, "product.updated", retries=3, timeout=15, backoff=1.5)
+        total += 1
+
+        # Use prefetch cache — do NOT call .exists() here (bypasses cache → N+1)
+        if not list(product.images.all()):
+            no_image_codes.append(str(getattr(product, "code", None) or product.id))
+
+    elapsed = time.time() - started
+
+    logger.info(
+        "catalog_webhook_sync: sent=%d no_images=%d elapsed=%.1fs",
+        total,
+        len(no_image_codes),
+        elapsed,
+    )
+
+    if no_image_codes:
+        # Log in chunks of 50 so the line doesn't become gigantic
+        for i in range(0, len(no_image_codes), 50):
+            chunk = no_image_codes[i: i + 50]
+            logger.warning(
+                "catalog_webhook_sync: products without images [%d/%d]: %s",
+                i + len(chunk),
+                len(no_image_codes),
+                ", ".join(chunk),
+            )
+
+    return {"total": total, "no_images_count": len(no_image_codes)}

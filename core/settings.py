@@ -324,6 +324,13 @@ CELERY_BEAT_SCHEDULE = {
         'task': 'apps.consalting.tasks.scan_sla_breach',
         'schedule': crontab(minute='*/30'),
     },
+    # Ежедневная полная синхронизация каталога товаров с внешней системой.
+    # Досылает все товары (product.updated), логирует товары без фото.
+    # Запускается каждые 2 дня в 03:00 по Asia/Bishkek.
+    'main-catalog-webhook-sync': {
+        'task': 'apps.main.tasks.catalog_webhook_sync',
+        'schedule': crontab(hour=3, minute=0, day_of_month='*/2'),
+    },
 }
 
 # ===========================
