@@ -1020,6 +1020,11 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
     weight_kg = serializers.SerializerMethodField(read_only=True)
     total_price = serializers.SerializerMethodField(read_only=True)
 
+    # ==== История закупок (партии) ====
+    # Отдаётся только в детальном просмотре товара (флаг include_purchase_batches
+    # в контексте). В списках поле убирается в __init__, чтобы не ловить N+1.
+    purchase_batches = serializers.SerializerMethodField(read_only=True)
+
     # ==== связанные модели ====
     characteristics = ProductCharacteristicsSerializer(read_only=True)
 
@@ -1079,6 +1084,7 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
             "packages_input",
             "weight_kg",
             "total_price",
+            "purchase_batches",
         ]
         read_only_fields = [
             "id", "created_at", "updated_at",
@@ -1093,6 +1099,7 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
             "packages",
             "promotion_rules",
             "weight_kg", "total_price",
+            "purchase_batches",
         ]
         extra_kwargs = {
             "kind": {"required": False, "default": Product.Kind.PRODUCT},
@@ -1113,6 +1120,21 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
         _restrict_pk_queryset_strict(self.fields.get("item_make_ids"), ItemMake.objects.all(), comp, br)
         _restrict_pk_queryset_strict(self.fields.get("client"), Client.objects.all(), comp, br)
         _restrict_pk_queryset_strict(self.fields.get("supplier_ids"), Client.objects.all(), comp, br)
+
+        # История закупок отдаётся только там, где явно попросили (детальный
+        # просмотр товара). В списках/вебхуках поле убираем, чтобы не делать
+        # лишний запрос на каждый товар.
+        if not self.context.get("include_purchase_batches"):
+            self.fields.pop("purchase_batches", None)
+
+    def get_purchase_batches(self, obj):
+        qs = (
+            SupplierReceiptItem.objects
+            .filter(product_id=obj.pk)
+            .select_related("receipt", "receipt__supplier", "receipt__created_by")
+            .order_by("-receipt__created_at")[:50]
+        )
+        return ProductPurchaseBatchSerializer(qs, many=True, context=self.context).data
 
     def get_suppliers(self, obj):
         try:
@@ -2740,6 +2762,52 @@ class SupplierReceiptReadSerializer(serializers.ModelSerializer):
             price = item.purchase_price if item.purchase_price is not None else Decimal("0")
             total += Decimal(str(item.qty)) * Decimal(str(price))
         return str(total.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
+
+
+class ProductPurchaseBatchSerializer(serializers.ModelSerializer):
+    """
+    Партия закупки товара — строка оприходования (SupplierReceiptItem),
+    обогащённая данными самого оприходования (дата, поставщик, кто провёл).
+
+    Используется как «история закупок» товара: каждая партия (своя цена и
+    количество) сохраняется отдельной записью и не перезаписывается следующей.
+    """
+
+    receipt_id = serializers.UUIDField(source="receipt.id", read_only=True)
+    qty = serializers.IntegerField(read_only=True)
+    purchase_price = serializers.DecimalField(
+        max_digits=11, decimal_places=3, read_only=True
+    )
+    line_total = serializers.SerializerMethodField()
+    supplier_id = serializers.UUIDField(source="receipt.supplier_id", read_only=True)
+    supplier_name = serializers.CharField(
+        source="receipt.supplier.full_name", read_only=True
+    )
+    created_at = serializers.DateTimeField(source="receipt.created_at", read_only=True)
+    created_by_name = serializers.SerializerMethodField()
+
+    class Meta:
+        model = SupplierReceiptItem
+        fields = [
+            "id",
+            "receipt_id",
+            "qty",
+            "purchase_price",
+            "line_total",
+            "supplier_id",
+            "supplier_name",
+            "created_at",
+            "created_by_name",
+        ]
+
+    def get_line_total(self, obj):
+        price = obj.purchase_price if obj.purchase_price is not None else Decimal("0")
+        total = Decimal(str(obj.qty)) * Decimal(str(price))
+        return str(total.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
+
+    def get_created_by_name(self, obj):
+        u = getattr(obj.receipt, "created_by", None)
+        return getattr(u, "email", None) if u else None
 
 
 class ReturnCreateSerializer(serializers.ModelSerializer):

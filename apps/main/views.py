@@ -75,6 +75,7 @@ from apps.main.serializers import (
     MarketSaleEmployeePayProfileSerializer,
     SupplierReceiptCreateSerializer,
     SupplierReceiptReadSerializer,
+    ProductPurchaseBatchSerializer,
     PublicKnowledgeBaseCourseSerializer,
 )
 from django.db.models import ProtectedError
@@ -1632,6 +1633,12 @@ class ProductRetrieveUpdateDestroyAPIView(CompanyBranchRestrictedMixin, generics
         return _annotate_product_is_favorite(
             _filter_products_company_only(self, self.queryset.all())
         )
+
+    def get_serializer_context(self):
+        ctx = super().get_serializer_context()
+        # В детальном просмотре товара отдаём историю закупок (партии).
+        ctx["include_purchase_batches"] = True
+        return ctx
 
     @transaction.atomic
     def update(self, request, *args, **kwargs):
@@ -3326,6 +3333,49 @@ class SupplierReceiptRetrieveAPIView(
         items = data.get("items") or []
         data["lines"] = items
         return Response(data)
+
+
+def _aggregate_purchase_batches_total_amount(item_qs):
+    total = item_qs.aggregate(total=Sum(_supplier_receipt_line_total_expr()))["total"]
+    if total is None:
+        return Decimal("0")
+    return total.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+
+class ProductPurchaseBatchListAPIView(CompanyBranchRestrictedMixin, generics.ListAPIView):
+    """
+    GET /api/main/products/<uuid:pk>/purchase-batches/?page=1&limit=20
+
+    История закупок (партий) конкретного товара: каждая партия — отдельная
+    строка оприходования со своей ценой и количеством, новые сверху.
+    """
+
+    permission_classes = [permissions.IsAuthenticated]
+    serializer_class = ProductPurchaseBatchSerializer
+    pagination_class = SupplierReceiptLimitPagination
+    lookup_url_kwarg = "pk"
+
+    def _product(self):
+        prod_qs = self._filter_qs_company_branch(Product.objects.all())
+        return get_object_or_404(prod_qs, id=self.kwargs[self.lookup_url_kwarg])
+
+    def get_queryset(self):
+        product = self._product()
+        return (
+            SupplierReceiptItem.objects
+            .filter(product_id=product.id)
+            .select_related("receipt", "receipt__supplier", "receipt__created_by")
+            .order_by("-receipt__created_at", "-id")
+        )
+
+    def list(self, request, *args, **kwargs):
+        queryset = self.get_queryset()
+        total_amount = _aggregate_purchase_batches_total_amount(queryset)
+        page = self.paginate_queryset(queryset)
+        serializer = self.get_serializer(page, many=True)
+        return self.paginator.get_paginated_response(
+            serializer.data, total_amount=total_amount
+        )
 
 
 # ===========================
