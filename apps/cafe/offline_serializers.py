@@ -61,6 +61,7 @@ class OfflineMenuItemSerializer(serializers.Serializer):
 class OfflineTableSerializer(serializers.Serializer):
     id = serializers.UUIDField()
     name = serializers.SerializerMethodField()
+    number = serializers.IntegerField()
     hall_id = serializers.SerializerMethodField()
     hall_name = serializers.SerializerMethodField()
     capacity = serializers.IntegerField(source="places")
@@ -133,6 +134,61 @@ class OfflineOrderSerializer(serializers.Serializer):
         return money(obj.total_amount)
 
 
+class OfflineKitchenTaskSerializer(serializers.Serializer):
+    id = serializers.UUIDField()
+    status = serializers.CharField()
+    created_at = serializers.DateTimeField()
+    started_at = serializers.DateTimeField(allow_null=True)
+    finished_at = serializers.DateTimeField(allow_null=True)
+    order = serializers.SerializerMethodField()
+    order_item = serializers.SerializerMethodField()
+    menu_item = serializers.SerializerMethodField()
+    menu_item_title = serializers.CharField(source="menu_item.title")
+    table_number = serializers.SerializerMethodField()
+    guest = serializers.SerializerMethodField()
+    waiter = serializers.SerializerMethodField()
+    waiter_label = serializers.SerializerMethodField()
+    cook = serializers.SerializerMethodField()
+    unit_index = serializers.IntegerField()
+    price = serializers.SerializerMethodField()
+
+    def get_order(self, obj):
+        return str(obj.order_id) if obj.order_id else None
+
+    def get_order_item(self, obj):
+        return str(obj.order_item_id) if obj.order_item_id else None
+
+    def get_menu_item(self, obj):
+        return str(obj.menu_item_id) if obj.menu_item_id else None
+
+    def get_table_number(self, obj):
+        if obj.order_id and obj.order.table_id:
+            return obj.order.table.number
+        return None
+
+    def get_guest(self, obj):
+        client = getattr(obj.order, "client", None) if obj.order_id else None
+        if client:
+            return client.name or client.phone or ""
+        return ""
+
+    def get_waiter(self, obj):
+        return obj.waiter_id
+
+    def get_waiter_label(self, obj):
+        if not obj.waiter_id:
+            return ""
+        w = obj.waiter
+        full = (getattr(w, "get_full_name", lambda: "")() or "").strip()
+        return full or getattr(w, "email", "") or str(getattr(w, "id", ""))
+
+    def get_cook(self, obj):
+        return obj.cook_id
+
+    def get_price(self, obj):
+        return money(obj.menu_item.price if obj.menu_item_id else None)
+
+
 # ============================================================
 # SYNC (write — валидация входной очереди)
 # ============================================================
@@ -143,6 +199,8 @@ class OfflineActionSerializer(serializers.Serializer):
         "REMOVE_ITEM_FROM_ORDER",
         "CLOSE_ORDER",
         "CANCEL_ORDER",
+        "CLAIM_TASK",
+        "READY_TASK",
     ]
 
     type = serializers.ChoiceField(choices=TYPES)

@@ -1057,6 +1057,7 @@ def _resolve_pos_cashbox(company, branch, cashbox_id=None):
 def _find_open_shift_for_cashier(*, company, cashier, cashbox=None, branch=None, for_update=False):
     qs = CashShift.objects.filter(
         company=company,
+        cashier=cashier,
         status=CashShift.Status.OPEN,
     )
     if for_update:

@@ -21,6 +21,7 @@ from rest_framework.views import APIView
 from .models import Booking, Category, KitchenTask, MenuItem, Order, OrderItem, Table
 from .offline_serializers import (
     OfflineCategorySerializer,
+    OfflineKitchenTaskSerializer,
     OfflineMenuItemSerializer,
     OfflineOrderSerializer,
     OfflineSyncRequestSerializer,
@@ -108,6 +109,15 @@ class CafeOfflineSnapshotView(CompanyBranchQuerysetMixin, APIView):
         # --- Текущая кассовая смена (construction.CashShift) ---
         current_shift = self._current_shift(company, active_branch)
 
+        # --- Кухонные задачи (pending + in_progress) ---
+        kitchen_tasks = (
+            scope(KitchenTask.objects.filter(
+                status__in=[KitchenTask.Status.PENDING, KitchenTask.Status.IN_PROGRESS]
+            ))
+            .select_related("order__table", "order__client", "menu_item", "waiter", "cook")
+            .order_by("created_at")
+        )
+
         ctx = {"request": request}
         data = {
             "snapshot_at": now,
@@ -118,6 +128,7 @@ class CafeOfflineSnapshotView(CompanyBranchQuerysetMixin, APIView):
             "tables": OfflineTableSerializer(tables, many=True, context=ctx).data,
             "open_orders": OfflineOrderSerializer(open_orders, many=True, context=ctx).data,
             "current_shift": current_shift,
+            "kitchen_tasks": OfflineKitchenTaskSerializer(kitchen_tasks, many=True, context=ctx).data,
         }
         return Response(data, status=status.HTTP_200_OK)
 
@@ -237,6 +248,8 @@ class CafeOfflineSyncView(CompanyBranchQuerysetMixin, APIView):
             "REMOVE_ITEM_FROM_ORDER": self._remove_item,
             "CLOSE_ORDER": self._close_order,
             "CANCEL_ORDER": self._cancel_order,
+            "CLAIM_TASK": self._claim_task,
+            "READY_TASK": self._ready_task,
         }[atype]
 
         with transaction.atomic():
@@ -368,7 +381,37 @@ class CafeOfflineSyncView(CompanyBranchQuerysetMixin, APIView):
         _cafe_archive_order_snapshot(order)
         invalidate_cafe_analytics_cache(order.company_id)
         self._notify(send_order_updated_notification, order)
+
+        # Создаём запись движения по кассе (первая касса компании).
+        self._create_cashflow(company, order, payload)
         return None
+
+    @staticmethod
+    def _create_cashflow(company, order, payload):
+        amount_raw = payload.get("amount")
+        if not amount_raw:
+            return
+        try:
+            amount = Decimal(str(amount_raw))
+        except (InvalidOperation, TypeError, ValueError):
+            return
+        if amount <= 0:
+            return
+        try:
+            from apps.construction.models import Cashbox, CashFlow
+            cashbox = Cashbox.objects.filter(company=company).first()
+            if not cashbox:
+                return
+            table_number = order.table.number if order.table_id else ""
+            CashFlow.objects.create(
+                cashbox=cashbox,
+                type=CashFlow.Type.INCOME,
+                name=f"Оплата стол {table_number}",
+                amount=amount,
+                company=company,
+            )
+        except Exception:  # noqa: BLE001
+            pass
 
     def _cancel_order(self, payload, created_at, company, active_branch, user):
         order = self._order_in_scope(payload.get("order_id"), company, active_branch)
@@ -389,6 +432,46 @@ class CafeOfflineSyncView(CompanyBranchQuerysetMixin, APIView):
         _cafe_archive_order_snapshot(order)
         invalidate_cafe_analytics_cache(order.company_id)
         self._notify(send_order_updated_notification, order)
+        return None
+
+    def _claim_task(self, payload, created_at, company, active_branch, user):
+        task_ids = payload.get("task_ids") or []
+        if not task_ids:
+            raise SyncActionError("task_ids is required")
+        now = timezone.now()
+        cook = user if getattr(user, "is_authenticated", False) else None
+        for task_id in task_ids:
+            qs = KitchenTask.objects.filter(company=company, pk=task_id)
+            if active_branch is not None:
+                qs = qs.filter(branch=active_branch)
+            task = qs.first()
+            if not task:
+                continue
+            if task.status in (KitchenTask.Status.IN_PROGRESS, KitchenTask.Status.READY):
+                continue
+            task.status = KitchenTask.Status.IN_PROGRESS
+            task.cook = cook
+            task.started_at = now
+            task.save(update_fields=["status", "cook", "started_at"])
+        return None
+
+    def _ready_task(self, payload, created_at, company, active_branch, user):
+        task_ids = payload.get("task_ids") or []
+        if not task_ids:
+            raise SyncActionError("task_ids is required")
+        now = timezone.now()
+        for task_id in task_ids:
+            qs = KitchenTask.objects.filter(company=company, pk=task_id)
+            if active_branch is not None:
+                qs = qs.filter(branch=active_branch)
+            task = qs.first()
+            if not task:
+                continue
+            if task.status == KitchenTask.Status.READY:
+                continue
+            task.status = KitchenTask.Status.READY
+            task.finished_at = now
+            task.save(update_fields=["status", "finished_at"])
         return None
 
     # ---------- side effects ----------
