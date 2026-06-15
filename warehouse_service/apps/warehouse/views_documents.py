@@ -1,0 +1,720 @@
+from rest_framework import status, permissions, filters
+from rest_framework.response import Response
+from rest_framework.views import APIView
+from rest_framework import generics
+from django.shortcuts import get_object_or_404
+from django.db.models import Q, Prefetch
+from django_filters.rest_framework import DjangoFilterBackend
+
+from . import models, serializers_documents, services, services_money
+from rest_framework.exceptions import ValidationError as DRFValidationError
+from django.core.exceptions import ValidationError as DjangoValidationError
+from .views import CompanyBranchRestrictedMixin, filter_qs_company_branch_or_global
+from apps.common.utils import _is_owner_like
+
+
+def _agent_allowed_for_company(agent_user, company):
+    """Агент допустим для компании: сотрудник (company_id) или активный агент (CompanyWarehouseAgent)."""
+    if not agent_user or not company:
+        return False
+    if getattr(agent_user, "company_id", None) == getattr(company, "id", None):
+        return True
+    return models.CompanyWarehouseAgent.objects.filter(
+        user=agent_user,
+        company=company,
+        status=models.CompanyWarehouseAgent.Status.ACTIVE,
+    ).exists()
+
+
+class DocumentListCreateView(CompanyBranchRestrictedMixin, generics.ListCreateAPIView):
+    serializer_class = serializers_documents.DocumentSerializer
+    filter_backends = [DjangoFilterBackend, filters.SearchFilter]
+    filterset_fields = ["doc_type", "status", "payment_kind", "warehouse_from", "warehouse_to", "counterparty"]
+    search_fields = ["number", "comment"]
+    
+    def _filter_company_branch(self, qs):
+        company = self._company()
+        if company is None:
+            return qs.none()
+
+        qs = qs.filter(
+            Q(warehouse_from__company=company) | Q(warehouse_to__company=company)
+        )
+
+        branch = self._auto_branch()
+        if branch is not None:
+            qs = qs.filter(
+                Q(warehouse_from__branch=branch) | Q(warehouse_to__branch=branch)
+            )
+        assigned_warehouse_id = self._assigned_agent_warehouse_id(company=company)
+        if assigned_warehouse_id and not _is_owner_like(self.request.user):
+            qs = qs.filter(warehouse_from_id=assigned_warehouse_id)
+        return qs
+
+    def get_queryset(self):
+        # Оптимизация: предзагружаем связанные объекты
+        qs = models.Document.objects.select_related(
+            "warehouse_from", "warehouse_to", "counterparty", "agent"
+        ).prefetch_related(
+            "items__product",
+            "items__product__warehouse",
+            Prefetch(
+                "items__product__images",
+                queryset=models.WarehouseProductImage.objects.order_by("-is_primary", "created_at"),
+            ),
+            "moves__warehouse",
+            "moves__product",
+        ).order_by("-date")
+        qs = self._filter_company_branch(qs)
+        user = self.request.user
+        if not _is_owner_like(user):
+            qs = qs.filter(agent=user)
+        return qs
+
+    def _enforce_wholesale_permission(self, serializer, user):
+        """Агенту (не владельцу) опт доступен только если владелец выдал флаг can_sell_wholesale."""
+        if _is_owner_like(user):
+            return
+        if not serializer.validated_data.get("is_wholesale"):
+            return
+        wh_from = serializer.validated_data.get("warehouse_from")
+        company = getattr(wh_from, "company", None)
+        if not services.agent_can_sell_wholesale(user=user, company=company):
+            raise DRFValidationError(
+                {"is_wholesale": "У агента нет доступа к оптовым продажам. Обратитесь к владельцу."}
+            )
+
+    def perform_create(self, serializer):
+        user = self.request.user
+        if _is_owner_like(user):
+            self._ensure_agent_can_access_warehouse(serializer.validated_data.get("warehouse_from"), field_name="warehouse_from")
+            self._ensure_agent_can_access_warehouse(serializer.validated_data.get("warehouse_to"), field_name="warehouse_to")
+            self._save_with_company_branch(serializer)
+            return
+        self._ensure_agent_can_access_warehouse(serializer.validated_data.get("warehouse_from"), field_name="warehouse_from")
+        self._ensure_agent_can_access_warehouse(serializer.validated_data.get("warehouse_to"), field_name="warehouse_to")
+        self._enforce_wholesale_permission(serializer, user)
+        self._save_with_company_branch(serializer, agent=user)
+
+
+class AgentDocumentListCreateView(DocumentListCreateView):
+    """
+    Документы агента (операции по своим товарам).
+    """
+    def get_queryset(self):
+        qs = super().get_queryset()
+        return qs.filter(agent=self.request.user)
+
+    def perform_create(self, serializer):
+        user = self.request.user
+        wh_from = serializer.validated_data.get("warehouse_from")
+        self._ensure_agent_can_access_warehouse(wh_from, field_name="warehouse_from")
+
+        self._enforce_wholesale_permission(serializer, user)
+
+        use_common_stock = bool(serializer.validated_data.get("use_common_stock", False))
+        if not use_common_stock and wh_from is not None:
+            if services.agent_has_common_access_to_warehouse(
+                user=user,
+                warehouse=wh_from,
+                company=getattr(wh_from, "company", None),
+            ):
+                use_common_stock = True
+
+        serializer.save(agent=user, use_common_stock=use_common_stock)
+
+
+class _DocumentTypedListCreateView(DocumentListCreateView):
+    """
+    Базовый класс для списков по одному типу документа.
+    """
+    DOC_TYPE = None  # override in subclasses
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        if self.DOC_TYPE:
+            qs = qs.filter(doc_type=self.DOC_TYPE)
+        return qs
+
+    def perform_create(self, serializer):
+        extra = {}
+        if self.DOC_TYPE:
+            extra["doc_type"] = self.DOC_TYPE
+        user = self.request.user
+        self._ensure_agent_can_access_warehouse(serializer.validated_data.get("warehouse_from"), field_name="warehouse_from")
+        self._ensure_agent_can_access_warehouse(serializer.validated_data.get("warehouse_to"), field_name="warehouse_to")
+        if _is_owner_like(user):
+            validated_agent = serializer.validated_data.get("agent")
+            if getattr(validated_agent, "id", None) == getattr(user, "id", None):
+                # Owner sale must use warehouse stock even if the client sends agent=self.
+                extra["agent"] = None
+            self._save_with_company_branch(serializer, **extra)
+            return
+        self._enforce_wholesale_permission(serializer, user)
+        wh_from = serializer.validated_data.get("warehouse_from")
+        use_common_stock = False
+        if wh_from is not None and services.agent_has_common_access_to_warehouse(
+            user=user,
+            warehouse=wh_from,
+            company=getattr(wh_from, "company", None),
+        ):
+            use_common_stock = True
+        self._save_with_company_branch(serializer, agent=user, use_common_stock=use_common_stock, **extra)
+
+
+class DocumentSaleListCreateView(_DocumentTypedListCreateView):
+    DOC_TYPE = models.Document.DocType.SALE
+
+
+class DocumentPurchaseListCreateView(_DocumentTypedListCreateView):
+    DOC_TYPE = models.Document.DocType.PURCHASE
+
+
+class DocumentSaleReturnListCreateView(_DocumentTypedListCreateView):
+    DOC_TYPE = models.Document.DocType.SALE_RETURN
+
+
+class DocumentPurchaseReturnListCreateView(_DocumentTypedListCreateView):
+    DOC_TYPE = models.Document.DocType.PURCHASE_RETURN
+
+
+class DocumentInventoryListCreateView(_DocumentTypedListCreateView):
+    DOC_TYPE = models.Document.DocType.INVENTORY
+
+
+class DocumentReceiptListCreateView(_DocumentTypedListCreateView):
+    DOC_TYPE = models.Document.DocType.RECEIPT
+
+
+class DocumentWriteOffListCreateView(_DocumentTypedListCreateView):
+    DOC_TYPE = models.Document.DocType.WRITE_OFF
+
+
+class DocumentCommercialOfferListCreateView(_DocumentTypedListCreateView):
+    """
+    Коммерческие предложения (без проведения/остатков).
+    """
+    DOC_TYPE = models.Document.DocType.COMMERCIAL_OFFER
+
+
+class DocumentTransferListCreateView(_DocumentTypedListCreateView):
+    """
+    Документы перемещения. При создании автоматически проводится —
+    остатки снимаются со склада-источника и добавляются на склад-приёмник.
+    """
+    DOC_TYPE = models.Document.DocType.TRANSFER
+
+    def perform_create(self, serializer):
+        super().perform_create(serializer)
+        doc = serializer.instance
+        if doc and doc.status == doc.Status.DRAFT:
+            try:
+                allow_negative = self.request.data.get("allow_negative", False)
+                if isinstance(allow_negative, str):
+                    allow_negative = allow_negative.lower() in ("true", "1", "yes")
+                services.post_document(doc, allow_negative=allow_negative)
+                doc.refresh_from_db()
+            except Exception as e:
+                raise DRFValidationError({"detail": str(e)})
+
+
+class DocumentDetailView(CompanyBranchRestrictedMixin, generics.RetrieveUpdateDestroyAPIView):
+    serializer_class = serializers_documents.DocumentSerializer
+    
+    def get_queryset(self):
+        # Оптимизация: предзагружаем связанные объекты
+        qs = models.Document.objects.select_related(
+            "warehouse_from", "warehouse_to", "counterparty", "agent"
+        ).prefetch_related(
+            "items__product",
+            "items__product__brand",
+            "items__product__category",
+            "items__product__warehouse",
+            Prefetch(
+                "items__product__images",
+                queryset=models.WarehouseProductImage.objects.order_by("-is_primary", "created_at"),
+            ),
+            "moves__warehouse",
+            "moves__product",
+        )
+        qs = DocumentListCreateView._filter_company_branch(self, qs)
+        user = self.request.user
+        if not _is_owner_like(user):
+            qs = qs.filter(agent=user)
+        return qs
+
+
+class AgentDocumentDetailView(DocumentDetailView):
+    def get_queryset(self):
+        qs = super().get_queryset()
+        return qs.filter(agent=self.request.user)
+
+
+class DocumentPostView(CompanyBranchRestrictedMixin, generics.GenericAPIView):
+    serializer_class = serializers_documents.DocumentSerializer
+    
+    def get_queryset(self):
+        # Оптимизация: предзагружаем items с продуктами
+        qs = models.Document.objects.select_related(
+            "warehouse_from", "warehouse_to", "counterparty", "agent"
+        ).prefetch_related("items__product", "items__product__warehouse")
+        user = self.request.user
+        qs = DocumentListCreateView._filter_company_branch(self, qs)
+        if not _is_owner_like(user):
+            qs = qs.filter(agent=user)
+        return qs
+
+    def post(self, request, pk=None):
+        doc = self.get_object()
+        if doc.status not in (doc.Status.DRAFT, doc.Status.SALE_REQUEST):
+            return Response(
+                {"detail": "Провести можно только черновик или заявку на продажу."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        try:
+            from decimal import Decimal, InvalidOperation
+            from .utils import normalize_payment_kind
+
+            update_fields = []
+            if "payment_kind" in request.data:
+                doc.payment_kind = normalize_payment_kind(request.data.get("payment_kind"))
+                update_fields.append("payment_kind")
+            if "prepayment_amount" in request.data:
+                try:
+                    doc.prepayment_amount = Decimal(str(request.data.get("prepayment_amount") or "0")).quantize(
+                        Decimal("0.01")
+                    )
+                except (InvalidOperation, TypeError, ValueError):
+                    return Response({"prepayment_amount": "Некорректная сумма предоплаты."}, status=status.HTTP_400_BAD_REQUEST)
+                update_fields.append("prepayment_amount")
+            if update_fields:
+                try:
+                    doc.clean()
+                except DjangoValidationError as exc:
+                    raise DRFValidationError(getattr(exc, "message_dict", {"detail": str(exc)}))
+                doc.save(update_fields=update_fields)
+
+            # Позволяем передать allow_negative в теле запроса для обхода проверки остатков
+            allow_negative = request.data.get('allow_negative', False)
+            if isinstance(allow_negative, str):
+                allow_negative = allow_negative.lower() in ('true', '1', 'yes')
+            services.post_document(doc, allow_negative=allow_negative)
+        except Exception as e:
+            return Response({"detail": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+        doc.refresh_from_db()
+        return Response(self.get_serializer(doc).data)
+
+
+class DocumentUnpostView(CompanyBranchRestrictedMixin, generics.GenericAPIView):
+    serializer_class = serializers_documents.DocumentSerializer
+    
+    def get_queryset(self):
+        # Оптимизация: предзагружаем moves с продуктами и складами
+        qs = models.Document.objects.select_related(
+            "warehouse_from", "warehouse_to", "counterparty", "agent"
+        ).prefetch_related("moves__warehouse", "moves__product")
+        qs = DocumentListCreateView._filter_company_branch(self, qs)
+        user = self.request.user
+        if not _is_owner_like(user):
+            qs = qs.filter(agent=user)
+        return qs
+
+    def post(self, request, pk=None):
+        doc = self.get_object()
+        try:
+            services.unpost_document(doc)
+        except Exception as e:
+            return Response({"detail": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+        return Response(self.get_serializer(doc).data)
+
+
+class DocumentCashApproveView(CompanyBranchRestrictedMixin, generics.GenericAPIView):
+    serializer_class = serializers_documents.DocumentSerializer
+
+    def get_queryset(self):
+        qs = models.Document.objects.select_related(
+            "warehouse_from", "warehouse_to", "counterparty", "cash_register", "payment_category", "agent"
+        )
+        qs = DocumentListCreateView._filter_company_branch(self, qs)
+        user = self.request.user
+        if not _is_owner_like(user):
+            qs = qs.filter(agent=user)
+        return qs
+
+    def post(self, request, pk=None):
+        doc = self.get_object()
+        note = (request.data.get("note") or "").strip()
+        try:
+            services.approve_cash_request(doc, decided_by=request.user, note=note)
+        except Exception as e:
+            return Response({"detail": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+        doc.refresh_from_db()
+        return Response(self.get_serializer(doc).data, status=status.HTTP_200_OK)
+
+
+class DocumentCashRejectView(CompanyBranchRestrictedMixin, generics.GenericAPIView):
+    serializer_class = serializers_documents.DocumentSerializer
+
+    def get_queryset(self):
+        qs = models.Document.objects.select_related(
+            "warehouse_from", "warehouse_to", "counterparty", "cash_register", "payment_category", "agent"
+        )
+        qs = DocumentListCreateView._filter_company_branch(self, qs)
+        user = self.request.user
+        if not _is_owner_like(user):
+            qs = qs.filter(agent=user)
+        return qs
+
+    def post(self, request, pk=None):
+        doc = self.get_object()
+        note = (request.data.get("note") or "").strip()
+        try:
+            services.reject_cash_request(doc, decided_by=request.user, note=note)
+        except Exception as e:
+            return Response({"detail": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+        doc.refresh_from_db()
+        return Response(self.get_serializer(doc).data, status=status.HTTP_200_OK)
+
+
+class CashApprovalRequestListView(CompanyBranchRestrictedMixin, generics.ListAPIView):
+    """
+    Входящие запросы кассы (CASH_PENDING) с фильтрами/поиском.
+    """
+    serializer_class = serializers_documents.CashApprovalRequestSerializer
+    filter_backends = [DjangoFilterBackend, filters.SearchFilter]
+    filterset_fields = ["status", "requires_money", "money_doc_type", "document__doc_type", "document__payment_kind"]
+    search_fields = ["document__number", "document__comment", "document__counterparty__name"]
+
+    def get_queryset(self):
+        company = self._company()
+        if company is None:
+            return models.CashApprovalRequest.objects.none()
+
+        branch = self._auto_branch()
+        qs = (
+            models.CashApprovalRequest.objects
+            .select_related(
+                "document",
+                "document__warehouse_from",
+                "document__counterparty",
+                "document__cash_register",
+                "document__payment_category",
+                "money_document",
+                "decided_by",
+            )
+            .filter(
+                Q(document__warehouse_from__company=company) | Q(document__warehouse_to__company=company)
+            )
+            .order_by("-requested_at")
+        )
+        if branch is not None:
+            qs = qs.filter(
+                Q(document__warehouse_from__branch=branch) | Q(document__warehouse_to__branch=branch)
+            )
+        return qs
+
+
+class CashApprovalRequestApproveView(CompanyBranchRestrictedMixin, generics.GenericAPIView):
+    serializer_class = serializers_documents.CashApprovalRequestSerializer
+
+    def get_queryset(self):
+        company = self._company()
+        if company is None:
+            return models.CashApprovalRequest.objects.none()
+
+        branch = self._auto_branch()
+        qs = (
+            models.CashApprovalRequest.objects
+            .select_related("document__warehouse_from", "document__warehouse_to")
+            .filter(
+                Q(document__warehouse_from__company=company) | Q(document__warehouse_to__company=company)
+            )
+        )
+        if branch is not None:
+            qs = qs.filter(
+                Q(document__warehouse_from__branch=branch) | Q(document__warehouse_to__branch=branch)
+            )
+        return qs
+
+    def post(self, request, pk=None):
+        cash_request = self.get_object()
+        ser = serializers_documents.CashApprovalDecisionSerializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+        note = (ser.validated_data.get("note") or "").strip()
+
+        try:
+            services.approve_cash_request(cash_request.document, decided_by=request.user, note=note)
+        except Exception as e:
+            return Response({"detail": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+        cash_request.refresh_from_db()
+        out = serializers_documents.CashApprovalRequestSerializer(cash_request, context={"request": request}).data
+        return Response(out, status=status.HTTP_200_OK)
+
+
+class CashApprovalRequestRejectView(CompanyBranchRestrictedMixin, generics.GenericAPIView):
+    serializer_class = serializers_documents.CashApprovalRequestSerializer
+
+    def get_queryset(self):
+        company = self._company()
+        if company is None:
+            return models.CashApprovalRequest.objects.none()
+
+        branch = self._auto_branch()
+        qs = (
+            models.CashApprovalRequest.objects
+            .select_related("document__warehouse_from", "document__warehouse_to")
+            .filter(
+                Q(document__warehouse_from__company=company) | Q(document__warehouse_to__company=company)
+            )
+        )
+        if branch is not None:
+            qs = qs.filter(
+                Q(document__warehouse_from__branch=branch) | Q(document__warehouse_to__branch=branch)
+            )
+        return qs
+
+    def post(self, request, pk=None):
+        cash_request = self.get_object()
+        ser = serializers_documents.CashApprovalDecisionSerializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+        note = (ser.validated_data.get("note") or "").strip()
+
+        try:
+            services.reject_cash_request(cash_request.document, decided_by=request.user, note=note)
+        except Exception as e:
+            return Response({"detail": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+        cash_request.refresh_from_db()
+        out = serializers_documents.CashApprovalRequestSerializer(cash_request, context={"request": request}).data
+        return Response(out, status=status.HTTP_200_OK)
+
+
+class DocumentTransferCreateAPIView(CompanyBranchRestrictedMixin, APIView):
+    """
+    Быстрое перемещение товара (создает документ TRANSFER и сразу проводит).
+    POST /api/warehouse/transfer/
+    """
+    def post(self, request, *args, **kwargs):
+        ser = serializers_documents.TransferCreateSerializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+
+        company = self._company()
+        branch = self._auto_branch()
+        if not company:
+            raise DRFValidationError({"company": "Компания не найдена."})
+        wh_from = ser.validated_data["warehouse_from"]
+        wh_to = ser.validated_data["warehouse_to"]
+        self._ensure_agent_can_access_warehouse(wh_from, field_name="warehouse_from")
+        self._ensure_agent_can_access_warehouse(wh_to, field_name="warehouse_to")
+
+        if wh_from.company_id != wh_to.company_id:
+            raise DRFValidationError(
+                {
+                    "warehouse": "Межкомпанейское перемещение выполняйте через POST /api/warehouse/stock-partnerships/transfer/ "
+                    "(нужно активное партнёрство между компаниями)."
+                }
+            )
+
+        if company and (wh_from.company_id != company.id or wh_to.company_id != company.id):
+            raise DRFValidationError({"warehouse": "Склад принадлежит другой компании."})
+
+        if branch is not None:
+            if wh_from.branch_id not in (None, branch.id) or wh_to.branch_id not in (None, branch.id):
+                raise DRFValidationError({"warehouse": "Склад другого филиала."})
+        else:
+            if wh_from.branch_id is not None or wh_to.branch_id is not None:
+                raise DRFValidationError({"warehouse": "Склад другого филиала."})
+
+        doc = models.Document.objects.create(
+            doc_type=models.Document.DocType.TRANSFER,
+            warehouse_from=wh_from,
+            warehouse_to=wh_to,
+            comment=ser.validated_data.get("comment") or "",
+        )
+
+        for it in ser.validated_data["items"]:
+            item = models.DocumentItem(document=doc, **it)
+            try:
+                item.clean()
+            except Exception as e:
+                raise DRFValidationError(getattr(e, "message_dict", {"detail": str(e)}))
+            item.save()
+
+        try:
+            services.post_document(doc)
+        except Exception as e:
+            raise DRFValidationError({"detail": str(e)})
+
+        out = serializers_documents.DocumentSerializer(doc, context={"request": request}).data
+        return Response(out, status=status.HTTP_201_CREATED)
+
+
+class ProductListCreateView(CompanyBranchRestrictedMixin, generics.ListCreateAPIView):
+    serializer_class = serializers_documents.ProductSimpleSerializer
+    filter_backends = [filters.SearchFilter]
+    search_fields = ["name", "article", "barcode"]
+    
+    def get_queryset(self):
+        # Оптимизация: предзагружаем связанные объекты
+        qs = (
+            models.WarehouseProduct.objects.select_related(
+                "warehouse", "brand", "category", "company", "branch", "group"
+            )
+            .prefetch_related("alternate_barcodes")
+        )
+        qs = self._filter_qs_company_branch(qs)
+        
+        # Кэширование поиска по barcode
+        search = self.request.query_params.get("search", "").strip()
+        if search and len(search) >= 8:  # Предполагаем, что barcode обычно длиннее 8 символов
+            from django.core.cache import cache
+            company = self._company()
+            if company:
+                cache_key = f"warehouse_product_barcode:{company.id}:{search}"
+                cached_product_id = cache.get(cache_key)
+                if cached_product_id:
+                    # Если найден в кэше - возвращаем только этот товар
+                    return qs.filter(pk=cached_product_id)
+                # Ищем товар и кэшируем его ID
+                product = qs.filter(Q(barcode=search) | Q(alternate_barcodes__barcode=search)).distinct().first()
+                if product:
+                    cache.set(cache_key, product.id, 300)  # Кэш на 5 минут
+        
+        return qs
+
+
+class ProductDetailView(CompanyBranchRestrictedMixin, generics.RetrieveUpdateDestroyAPIView):
+    serializer_class = serializers_documents.ProductSimpleSerializer
+    
+    def get_queryset(self):
+        # Оптимизация: предзагружаем связанные объекты
+        qs = (
+            models.WarehouseProduct.objects.select_related(
+                "warehouse", "brand", "category", "company", "branch"
+            )
+            .prefetch_related("alternate_barcodes")
+        )
+        return self._filter_qs_company_branch(qs)
+
+
+class WarehouseListCreateView(CompanyBranchRestrictedMixin, generics.ListCreateAPIView):
+    serializer_class = serializers_documents.WarehouseSimpleSerializer
+    
+    def get_queryset(self):
+        # Оптимизация: предзагружаем связанные объекты
+        qs = models.Warehouse.objects.select_related("company", "branch")
+        return self._filter_qs_company_branch(qs)
+
+
+class WarehouseDetailView(CompanyBranchRestrictedMixin, generics.RetrieveUpdateDestroyAPIView):
+    serializer_class = serializers_documents.WarehouseSimpleSerializer
+    
+    def get_queryset(self):
+        # Оптимизация: предзагружаем связанные объекты
+        qs = models.Warehouse.objects.select_related("company", "branch")
+        return self._filter_qs_company_branch(qs)
+
+
+class CounterpartyListCreateView(CompanyBranchRestrictedMixin, generics.ListCreateAPIView):
+    queryset = models.Counterparty.objects.all()
+    serializer_class = serializers_documents.CounterpartySerializer
+    filter_backends = [DjangoFilterBackend, filters.SearchFilter]
+    filterset_fields = ["agent", "type"]
+    search_fields = ["name", "phone"]
+
+    def get_serializer_context(self):
+        ctx = super().get_serializer_context()
+        m = getattr(self, "_counterparty_analytics_map", None)
+        if m is not None:
+            ctx["counterparty_analytics_map"] = m
+        return ctx
+
+    def list(self, request, *args, **kwargs):
+        queryset = self.filter_queryset(self.get_queryset())
+        page = self.paginate_queryset(queryset)
+        try:
+            if page is not None:
+                self._counterparty_analytics_map = services_money.bulk_counterparty_mini_analytics(
+                    self, [o.pk for o in page]
+                )
+                serializer = self.get_serializer(page, many=True)
+                return self.get_paginated_response(serializer.data)
+            self._counterparty_analytics_map = services_money.bulk_counterparty_mini_analytics(
+                self, [o.pk for o in queryset]
+            )
+            serializer = self.get_serializer(queryset, many=True)
+            return Response(serializer.data)
+        finally:
+            self._counterparty_analytics_map = None
+
+    def get_queryset(self):
+        qs = filter_qs_company_branch_or_global(self, models.Counterparty.objects.all())
+        user = self.request.user
+        if not _is_owner_like(user):
+            qs = qs.filter(agent=user)
+        date_from, date_to = services_money.get_requested_date_range(self)
+        if date_from or date_to:
+            doc_qs = models.Document.objects.filter(counterparty_id__isnull=False)
+            doc_qs = self._filter_qs_company_branch(
+                doc_qs,
+                company_field="warehouse_from__company_id",
+                branch_field="warehouse_from__branch",
+            )
+            doc_qs = services_money.apply_requested_date_range(doc_qs, "date", self)
+
+            money_qs = self._filter_qs_company_branch(models.MoneyDocument.objects.filter(counterparty_id__isnull=False))
+            money_qs = services_money.apply_requested_date_range(money_qs, "date", self)
+
+            qs = qs.filter(
+                Q(pk__in=doc_qs.values("counterparty_id")) | Q(pk__in=money_qs.values("counterparty_id"))
+            ).distinct()
+        return qs
+
+    def perform_create(self, serializer):
+        user = self.request.user
+        if _is_owner_like(user):
+            company = self._company()
+            agent = serializer.validated_data.get("agent")
+            if agent and company and not _agent_allowed_for_company(agent, company):
+                raise DRFValidationError(
+                    {"agent": "Агент должен быть сотрудником или активным агентом этой компании."}
+                )
+            self._save_with_company_branch(serializer)
+            return
+        self._save_with_company_branch(serializer, agent=user)
+
+
+class CounterpartyDetailView(CompanyBranchRestrictedMixin, generics.RetrieveUpdateDestroyAPIView):
+    queryset = models.Counterparty.objects.all()
+    serializer_class = serializers_documents.CounterpartySerializer
+
+    def get_serializer_context(self):
+        ctx = super().get_serializer_context()
+        if self.request.method == "GET" and self.kwargs.get("pk"):
+            ctx["counterparty_analytics_map"] = services_money.bulk_counterparty_mini_analytics(
+                self, [self.kwargs["pk"]]
+            )
+        return ctx
+
+    def get_queryset(self):
+        qs = filter_qs_company_branch_or_global(self, models.Counterparty.objects.all())
+        user = self.request.user
+        if not _is_owner_like(user):
+            qs = qs.filter(agent=user)
+        return qs
+
+    def perform_update(self, serializer):
+        user = self.request.user
+        instance = serializer.instance
+        if _is_owner_like(user):
+            company = getattr(instance, "company", None) or self._company()
+            agent = serializer.validated_data.get("agent")
+            if agent is not None and company and not _agent_allowed_for_company(agent, company):
+                raise DRFValidationError(
+                    {"agent": "Агент должен быть сотрудником или активным агентом этой компании."}
+                )
+            self._save_with_company_branch(serializer)
+            return
+        serializer.validated_data["agent"] = getattr(instance, "agent", None) or user
+        serializer.save()
