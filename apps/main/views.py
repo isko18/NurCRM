@@ -851,6 +851,7 @@ class ProductCreateByBarcodeAPIView(CompanyBranchRestrictedMixin, generics.Creat
         barcode = (data.get("barcode") or "").strip()
         description = (data.get("description") or "").strip()
         article = (data.get("article") or "").strip()
+        name = (data.get("name") or "").strip()
 
         if not barcode:
             return Response({"barcode": "Укажите штрих-код."}, status=status.HTTP_400_BAD_REQUEST)
@@ -951,7 +952,7 @@ class ProductCreateByBarcodeAPIView(CompanyBranchRestrictedMixin, generics.Creat
             branch=branch,
             kind=kind_value,
 
-            name=gp.name,
+            name=name or gp.name,
             barcode=gp.barcode,
             brand=brand,
             category=category,
