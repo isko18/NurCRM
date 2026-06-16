@@ -3606,7 +3606,7 @@ class ReturnFromAgentListCreateAPIView(CompanyBranchRestrictedMixin, generics.Li
     """
     permission_classes = [permissions.IsAuthenticated]
     filter_backends = [DjangoFilterBackend, filters.OrderingFilter]
-    filterset_fields = ["subreal", "returned_by", "returned_at", "status"]
+    filterset_fields = ["subreal", "returned_by", "returned_at", "status", "is_defect"]
     ordering_fields = ["returned_at", "qty", "id"]
     ordering = ["-returned_at"]
 
@@ -3656,9 +3656,26 @@ class ReturnFromAgentListCreateAPIView(CompanyBranchRestrictedMixin, generics.Li
             pending_count=Count("id"),
             pending_qty=Coalesce(Sum("qty"), 0),
         )
+        # Брак (is_defect=True) и обычные возвраты (is_defect=False).
+        defect = qs.filter(is_defect=True).aggregate(
+            defect_count=Count("id"),
+            defect_qty=Coalesce(Sum("qty"), 0),
+            defect_amount=Coalesce(Sum("amount"), V(Decimal("0.00"), output_field=DecimalField(max_digits=12, decimal_places=2))),
+        )
+        regular = qs.filter(is_defect=False).aggregate(
+            regular_return_count=Count("id"),
+            regular_return_qty=Coalesce(Sum("qty"), 0),
+            regular_return_amount=Coalesce(Sum("amount"), V(Decimal("0.00"), output_field=DecimalField(max_digits=12, decimal_places=2))),
+        )
         summary = {
             "pending_count": pending["pending_count"] or 0,
             "pending_qty": int(pending["pending_qty"] or 0),
+            "defect_count": defect["defect_count"] or 0,
+            "defect_qty": float(defect["defect_qty"] or 0),
+            "defect_amount": float(defect["defect_amount"] or Decimal("0.00")),
+            "regular_return_count": regular["regular_return_count"] or 0,
+            "regular_return_qty": float(regular["regular_return_qty"] or 0),
+            "regular_return_amount": float(regular["regular_return_amount"] or Decimal("0.00")),
         }
         if isinstance(response.data, dict):
             response.data["returns_summary"] = summary
@@ -4954,6 +4971,125 @@ class AgentMyAnalyticsAPIView(CompanyBranchRestrictedMixin, APIView):
             **period_params,
         )
         return Response(data, status=status.HTTP_200_OK)
+
+
+class ClientAgentAnalyticsAPIView(CompanyBranchRestrictedMixin, APIView):
+    """
+    GET /api/main/clients/<uuid:client_id>/agent-analytics/
+
+    Аналитика по контрагенту (клиенту) глазами агента: продажи, брак, возвраты, долг.
+    Считается по текущему пользователю-агенту (request.user).
+
+    Квери: ?period=day|week|month|custom & ?date_from / ?date_to
+    Период влияет на продажи/брак/возвраты. Долг — текущий (на момент запроса).
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request, client_id, *args, **kwargs):
+        company = self._company()
+        branch = self._auto_branch()
+        agent = request.user
+
+        if company is None:
+            company = getattr(agent, "owned_company", None) or getattr(agent, "company", None)
+        if company is None:
+            return Response(
+                {"detail": "Профиль не привязан к компании."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        client = get_object_or_404(Client, id=client_id, company=company)
+
+        period_params = _parse_period(request)
+        date_from = period_params["date_from"]
+        date_to = period_params["date_to"]
+        dt_from = timezone.make_aware(datetime.combine(date_from, datetime.min.time()))
+        dt_to = timezone.make_aware(datetime.combine(date_to, datetime.max.time()))
+
+        ZERO_MONEY = V(Decimal("0.00"), output_field=DecimalField(max_digits=12, decimal_places=2))
+
+        def _branch_filter(qs, field="branch"):
+            if branch is not None:
+                return qs.filter(Q(**{field: branch}) | Q(**{f"{field}__isnull": True}))
+            return qs
+
+        # ---------------- Продажи агента этому клиенту (оплаченные) ----------------
+        sales_qs = Sale.objects.filter(
+            company=company, user=agent, client=client,
+            status=Sale.Status.PAID,
+            created_at__range=(dt_from, dt_to),
+        )
+        sales_qs = _branch_filter(sales_qs)
+        sales_agg = sales_qs.aggregate(
+            count=Count("id"),
+            amount=Coalesce(Sum("total"), ZERO_MONEY),
+        )
+
+        # ---------------- Брак / возвраты по этому клиенту ----------------
+        returns_qs = ReturnFromAgent.objects.filter(
+            company=company, returned_by=agent, client=client,
+            status=ReturnFromAgent.Status.ACCEPTED,
+            returned_at__range=(dt_from, dt_to),
+        )
+        returns_qs = _branch_filter(returns_qs)
+        defects_agg = returns_qs.filter(is_defect=True).aggregate(
+            count=Coalesce(Sum("qty"), V(0)),
+            amount=Coalesce(Sum("amount"), ZERO_MONEY),
+        )
+        regular_agg = returns_qs.filter(is_defect=False).aggregate(
+            count=Count("id"),
+            amount=Coalesce(Sum("amount"), ZERO_MONEY),
+        )
+
+        # ---------------- Долг клиента (текущий) ----------------
+        # 1) POS-продажи в долг
+        pos_debt_qs = Sale.objects.filter(
+            company=company, user=agent, client=client, status=Sale.Status.DEBT,
+        )
+        pos_debt_qs = _branch_filter(pos_debt_qs)
+        pos_sales_debt = pos_debt_qs.aggregate(s=Coalesce(Sum("total"), ZERO_MONEY))["s"] or Decimal("0.00")
+
+        # 2) Сделки-рассрочки (ClientDeal.DEBT): остаток = (amount - prepayment) - sum(paid)
+        deals_qs = ClientDeal.objects.filter(
+            company=company, client=client, kind=ClientDeal.Kind.DEBT,
+        )
+        deals_qs = _branch_filter(deals_qs)
+        paid_subq = (
+            DealInstallment.objects.filter(deal_id=OuterRef("pk"))
+            .values("deal_id").annotate(s=Sum("paid_amount")).values("s")[:1]
+        )
+        client_deals_debt = (
+            deals_qs
+            .annotate(paid=Coalesce(Subquery(paid_subq), ZERO_MONEY))
+            .annotate(remaining=(F("amount") - F("prepayment")) - F("paid"))
+            .aggregate(t=Coalesce(Sum("remaining"), ZERO_MONEY))["t"]
+            or Decimal("0.00")
+        )
+
+        total_debt = (pos_sales_debt or Decimal("0.00")) + (client_deals_debt or Decimal("0.00"))
+
+        return Response({
+            "client_id": str(client.id),
+            "client_name": getattr(client, "full_name", "") or "",
+            "period": {"type": period_params["period"], "date_from": date_from, "date_to": date_to},
+            "sales": {
+                "count": sales_agg["count"] or 0,
+                "amount": float(sales_agg["amount"] or Decimal("0.00")),
+            },
+            "defects": {
+                "count": int(defects_agg["count"] or 0),
+                "amount": float(defects_agg["amount"] or Decimal("0.00")),
+            },
+            "returns": {
+                "count": regular_agg["count"] or 0,
+                "amount": float(regular_agg["amount"] or Decimal("0.00")),
+            },
+            "debt": {
+                "pos_sales_debt": float(pos_sales_debt or Decimal("0.00")),
+                "client_deals_debt": float(client_deals_debt or Decimal("0.00")),
+                "total": float(total_debt),
+            },
+        }, status=status.HTTP_200_OK)
 
 
 class OwnerAgentAnalyticsAPIView(CompanyBranchRestrictedMixin, APIView):

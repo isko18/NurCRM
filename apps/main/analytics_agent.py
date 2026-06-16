@@ -271,7 +271,19 @@ def build_agent_analytics_payload(
     if branch is not None:
         returns_qs = returns_qs.filter(Q(branch=branch) | Q(branch__isnull=True))
     # branch is None → видим всю компанию
-    defective_items_qty = returns_qs.aggregate(s=Coalesce(Sum("qty"), V(0)))["s"] or 0
+
+    # Разделяем брак (is_defect=True) и обычные возвраты (is_defect=False).
+    defect_qs = returns_qs.filter(is_defect=True)
+    regular_returns_qs = returns_qs.filter(is_defect=False)
+
+    defective_items_qty = defect_qs.aggregate(s=Coalesce(Sum("qty"), V(0)))["s"] or 0
+    defective_items_amount = float(
+        defect_qs.aggregate(s=Coalesce(Sum("amount"), ZERO_MONEY))["s"] or Decimal("0.00")
+    )
+    returns_count = regular_returns_qs.count()
+    returns_amount = float(
+        regular_returns_qs.aggregate(s=Coalesce(Sum("amount"), ZERO_MONEY))["s"] or Decimal("0.00")
+    )
 
     # ======================================================
     #              П Р О Д А Ж И
@@ -544,6 +556,9 @@ def build_agent_analytics_payload(
             "acceptances_count": acceptances_count,
             "items_transferred": items_transferred,
             "defective_items": defective_items_qty,
+            "defective_items_amount": defective_items_amount,
+            "returns_count": returns_count,
+            "returns_amount": returns_amount,
             "sales_count": sales_count,
             "sales_amount": sales_amount,
             "discounts_total": discounts_total,

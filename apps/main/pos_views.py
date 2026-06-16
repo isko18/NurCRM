@@ -48,7 +48,7 @@ from apps.main.models import (
     Client,
     ProductImage,
 )
-from apps.main.models import ManufactureSubreal, AgentSaleAllocation
+from apps.main.models import ManufactureSubreal, AgentSaleAllocation, ReturnFromAgent
 from apps.main.cache_utils import invalidate_cache_pattern
 from apps.main.services import checkout_cart, NotEnoughStock
 from apps.main.cart_service import abandon_cart
@@ -2518,30 +2518,82 @@ def _restock_product_for_sale_item_return(item: SaleItem, return_qty: Decimal) -
     Product.objects.filter(pk=item.product_id).update(quantity=F("quantity") + stock_delta)
 
 
-def _release_agent_allocations_for_qty(sale_item: SaleItem, return_qty_int: int) -> None:
+def _release_agent_allocations_for_qty(sale_item: SaleItem, return_qty_int: int) -> List[tuple]:
+    """
+    Снимает агентские привязки (AgentSaleAllocation) по строке чека на указанное
+    количество. Возвращает разбивку [(subreal_id, agent_id, take), ...] — нужна,
+    чтобы зафиксировать возврат/брак по каждой партии (subreal).
+    """
     if return_qty_int <= 0:
-        return
+        return []
     qs = (
         AgentSaleAllocation.objects.select_for_update()
         .filter(sale_item=sale_item)
         .order_by("-id")
     )
     if not qs.exists():
-        return
+        return []
     remaining = return_qty_int
+    breakdown: List[tuple] = []
     for alloc in qs:
         if remaining <= 0:
             break
         take = min(int(alloc.qty), remaining)
+        if take <= 0:
+            continue
         new_q = int(alloc.qty) - take
         if new_q <= 0:
             AgentSaleAllocation.objects.filter(pk=alloc.pk).delete()
         else:
             AgentSaleAllocation.objects.filter(pk=alloc.pk).update(qty=new_q)
+        breakdown.append((alloc.subreal_id, alloc.agent_id, take))
         remaining -= take
     if remaining > 0:
         raise ValidationError(
             {"items": "Недостаточно привязок по строке чека для агентского возврата (рассинхронизация данных)."}
+        )
+    return breakdown
+
+
+def _sale_item_unit_net(item: SaleItem) -> Decimal:
+    """Чистая цена за единицу строки чека: (unit_price*qty - line_discount) / qty."""
+    q = Decimal(str(item.quantity or 0))
+    if q <= 0:
+        return Decimal("0.00")
+    net = Decimal(str(item.unit_price or 0)) * q - Decimal(str(item.line_discount or 0))
+    return net / q
+
+
+def _record_agent_sale_return(*, sale: Sale, breakdown: List[tuple], unit_net: Decimal,
+                              is_defect: bool, user) -> None:
+    """
+    Фиксирует возврат/брак агентской продажи записями ReturnFromAgent (status=accepted)
+    по разбивке снятых привязок.
+
+    - is_defect=False (обычный возврат): товар уже вернулся агенту (привязка снята,
+      «на руках» вырос). Только создаём запись для аналитики.
+    - is_defect=True (брак): товар списывается — дополнительно увеличиваем
+      subreal.qty_returned (уходит с рук агента) и на склад НЕ возвращаем.
+    """
+    now = timezone.now()
+    for subreal_id, agent_id, take in breakdown:
+        if take <= 0:
+            continue
+        amount = (unit_net * Decimal(take)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        if is_defect:
+            ManufactureSubreal.objects.filter(pk=subreal_id).update(
+                qty_returned=F("qty_returned") + take
+            )
+        ReturnFromAgent.objects.create(
+            subreal_id=subreal_id,
+            returned_by_id=agent_id or getattr(user, "id", None),
+            qty=int(take),
+            is_defect=is_defect,
+            amount=amount,
+            client_id=sale.client_id,
+            status=ReturnFromAgent.Status.ACCEPTED,
+            accepted_by=user,
+            accepted_at=now,
         )
 
 
@@ -2576,22 +2628,58 @@ def _recalc_sale_headers_from_items(sale: Sale) -> None:
     sale.save(update_fields=["subtotal", "discount_total", "tax_total", "total", "cash_received"])
 
 
-def _execute_sale_return(sale: Sale, partial_items: Optional[List[tuple]]) -> None:
+def _parse_is_defect(data) -> bool:
+    """Флаг брака на уровне всего запроса возврата."""
+    if not isinstance(data, dict):
+        return False
+    val = data.get("is_defect", False)
+    if isinstance(val, bool):
+        return val
+    if isinstance(val, (int, float)):
+        return bool(val)
+    if isinstance(val, str):
+        return val.strip().lower() in ("1", "true", "yes", "y", "on", "да")
+    return False
+
+
+def _execute_sale_return(
+    sale: Sale,
+    partial_items: Optional[List[tuple]],
+    *,
+    is_defect: bool = False,
+    user=None,
+) -> None:
     """
     partial_items=None — полный возврат (статус canceled, весь товар на склад / снятие аллокаций).
     Иначе — частичный возврат по строкам; чек остаётся paid/debt, пока есть строки.
+
+    is_defect=True — брак: товар списывается, на склад/к агенту не возвращается,
+    фиксируется как брак (для агентских продаж — записью ReturnFromAgent).
     """
     is_agent_sale = sale.agent_allocations.exists()
 
     if not partial_items:
         if is_agent_sale:
-            AgentSaleAllocation.objects.filter(sale=sale).delete()
-        else:
-            for item in sale.items.filter(product_id__isnull=False).select_related("sale_package"):
+            # Полный возврат агентской продажи: по каждой строке снимаем привязки
+            # и фиксируем возврат/брак (для аналитики и склада агента).
+            for item in sale.items.select_related("product", "sale_package"):
                 rq = qty3(Decimal(str(item.quantity or 0)))
                 if rq <= 0:
                     continue
-                _restock_product_for_sale_item_return(item, rq)
+                breakdown = _release_agent_allocations_for_qty(item, int(rq))
+                _record_agent_sale_return(
+                    sale=sale, breakdown=breakdown,
+                    unit_net=_sale_item_unit_net(item),
+                    is_defect=is_defect, user=user,
+                )
+        else:
+            # Обычная касса: при браке товар списываем (на склад не возвращаем).
+            if not is_defect:
+                for item in sale.items.filter(product_id__isnull=False).select_related("sale_package"):
+                    rq = qty3(Decimal(str(item.quantity or 0)))
+                    if rq <= 0:
+                        continue
+                    _restock_product_for_sale_item_return(item, rq)
         sale.status = Sale.Status.CANCELED
         sale.save(update_fields=["status"])
         return
@@ -2618,9 +2706,16 @@ def _execute_sale_return(sale: Sale, partial_items: Optional[List[tuple]]) -> No
         if is_agent_sale:
             if rq != rq.to_integral_value():
                 raise ValidationError({"items": "Для агентского чека количество возврата должно быть целым."})
-            _release_agent_allocations_for_qty(item, int(rq))
+            unit_net = _sale_item_unit_net(item)
+            breakdown = _release_agent_allocations_for_qty(item, int(rq))
+            _record_agent_sale_return(
+                sale=sale, breakdown=breakdown, unit_net=unit_net,
+                is_defect=is_defect, user=user,
+            )
         else:
-            _restock_product_for_sale_item_return(item, rq)
+            # Обычная касса: при браке товар списываем (на склад не возвращаем).
+            if not is_defect:
+                _restock_product_for_sale_item_return(item, rq)
 
         new_q = qty3(old_q - rq)
         old_disc = Decimal(str(item.line_discount or 0))
@@ -2677,7 +2772,8 @@ class SaleReturnAPIView(MarketCashierOnlyMixin, CompanyBranchRestrictedMixin, AP
 
         try:
             partial = _parse_partial_return_items(request.data)
-            _execute_sale_return(sale, partial)
+            is_defect = _parse_is_defect(request.data)
+            _execute_sale_return(sale, partial, is_defect=is_defect, user=request.user)
         except ValidationError as e:
             return Response(e.detail, status=status.HTTP_400_BAD_REQUEST)
 
@@ -2731,7 +2827,8 @@ class AgentSaleReturnAPIView(SaleReturnAPIView):
 
         try:
             partial = _parse_partial_return_items(request.data)
-            _execute_sale_return(sale, partial)
+            is_defect = _parse_is_defect(request.data)
+            _execute_sale_return(sale, partial, is_defect=is_defect, user=request.user)
         except ValidationError as e:
             return Response(e.detail, status=status.HTTP_400_BAD_REQUEST)
 

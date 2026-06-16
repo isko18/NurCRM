@@ -210,6 +210,73 @@ class WarehouseAnalyticsByGroupTests(TestCase):
         self.assertEqual(row["balance"], "60.00")
         self.assertEqual(row["breakdown"]["money_receipt"], "40.00")
 
+    def test_owner_cash_excludes_counterparty_operations_from_saldo(self):
+        cp = wm.Counterparty.objects.create(
+            name="Контрагент",
+            phone="+996700000022",
+            company=self.company,
+            branch=self.branch,
+            type=wm.Counterparty.Type.CLIENT,
+        )
+        cash = wm.CashRegister.objects.create(
+            company=self.company, branch=self.branch, name="Основная касса"
+        )
+
+        # Обычный приход (без контрагента) — формирует сальдо.
+        wm.MoneyDocument.objects.create(
+            company=self.company,
+            branch=self.branch,
+            cash_register=cash,
+            doc_type=wm.MoneyDocument.DocType.MONEY_RECEIPT,
+            status=wm.MoneyDocument.Status.POSTED,
+            amount=Decimal("100.00"),
+        )
+        # Операция с контрагентом — НЕ должна попадать в сальдо, отдельная графа.
+        wm.MoneyDocument.objects.create(
+            company=self.company,
+            branch=self.branch,
+            cash_register=cash,
+            doc_type=wm.MoneyDocument.DocType.MONEY_RECEIPT,
+            status=wm.MoneyDocument.Status.POSTED,
+            counterparty=cp,
+            amount=Decimal("70.00"),
+        )
+        wm.MoneyDocument.objects.create(
+            company=self.company,
+            branch=self.branch,
+            cash_register=cash,
+            doc_type=wm.MoneyDocument.DocType.MONEY_EXPENSE,
+            status=wm.MoneyDocument.Status.POSTED,
+            counterparty=cp,
+            amount=Decimal("30.00"),
+        )
+
+        cache.clear()
+        today = timezone.localdate()
+        data = build_owner_warehouse_analytics_payload(
+            company_id=str(self.company.id),
+            branch_id=str(self.branch.id),
+            period="day",
+            date_from=today,
+            date_to=today,
+            group_by="day",
+        )
+
+        summary = data["summary"]
+        # Сальдо считается только по обычным операциям (без контрагентов).
+        self.assertEqual(summary["money_receipt_amount"], "100.00")
+        self.assertEqual(summary["money_expense_amount"], "0.00")
+        self.assertEqual(summary["money_net_amount"], "100.00")
+        # Операции с контрагентами — в отдельной графе.
+        self.assertEqual(summary["money_counterparty_receipt_amount"], "70.00")
+        self.assertEqual(summary["money_counterparty_expense_amount"], "30.00")
+        self.assertEqual(summary["money_counterparty_net_amount"], "40.00")
+
+        registers = {r["account_name"]: r for r in data["details"]["cash_by_register"]}
+        reg = registers["Основная касса"]
+        self.assertEqual(reg["money_net_amount"], "100.00")
+        self.assertEqual(reg["money_counterparty_net_amount"], "40.00")
+
 
 class WarehousePartnerAnalyticsTests(TestCase):
     def setUp(self):

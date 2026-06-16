@@ -3977,6 +3977,26 @@ class ReturnFromAgent(models.Model):
     qty = models.PositiveIntegerField()
     returned_at = models.DateTimeField(default=timezone.now)
 
+    # Брак vs обычный возврат.
+    # is_defect=False → товар возвращается на склад (при accept Product.quantity += qty).
+    # is_defect=True  → товар списывается как брак, на склад НЕ возвращается.
+    is_defect = models.BooleanField(
+        "Брак", default=False, db_index=True,
+        help_text="True — товар списывается как брак и на склад не возвращается.",
+    )
+    # Денежная сумма возврата/списания (по цене продажи строки чека).
+    # Заполняется для возвратов, созданных из возврата продажи; для возвратов
+    # неproданного остатка остаётся 0.
+    amount = models.DecimalField(
+        "Сумма", max_digits=12, decimal_places=2, default=Decimal("0.00"),
+    )
+    # Контрагент (клиент) из чека, по которому был возврат/брак.
+    # Заполняется только для возвратов, созданных из возврата продажи.
+    client = models.ForeignKey(
+        "main.Client", on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="agent_returns", db_index=True, verbose_name="Клиент",
+    )
+
     status = models.CharField(max_length=10, choices=Status.choices, default=Status.PENDING, db_index=True)
     accepted_by = models.ForeignKey(
         settings.AUTH_USER_MODEL, on_delete=models.PROTECT,
@@ -4066,27 +4086,31 @@ class ReturnFromAgent(models.Model):
                 }
             )
         product = locked_sub.product
-        type(product).objects.select_for_update().filter(pk=product.pk).update(quantity=F("quantity") + self.qty)
         prod_model = type(product)
         prod_id = product.pk
 
-        def _send_webhook():
-            from apps.main.services.webhooks import send_product_webhook
+        # Брак на склад НЕ возвращаем — товар списывается.
+        # Обычный возврат — возвращаем количество на склад (Product.quantity).
+        if not self.is_defect:
+            prod_model.objects.select_for_update().filter(pk=product.pk).update(quantity=F("quantity") + self.qty)
+
+            def _send_webhook():
+                from apps.main.services.webhooks import send_product_webhook
+
+                try:
+                    prod = prod_model.objects.get(pk=prod_id)
+                    send_product_webhook(prod, "product.updated")
+                except Exception:
+                    logging.getLogger("crm.webhooks").error(
+                        "Failed to send product.updated webhook after return accept. product_id=%s",
+                        prod_id,
+                        exc_info=True,
+                    )
 
             try:
-                prod = prod_model.objects.get(pk=prod_id)
-                send_product_webhook(prod, "product.updated")
+                transaction.on_commit(_send_webhook)
             except Exception:
-                logging.getLogger("crm.webhooks").error(
-                    "Failed to send product.updated webhook after return accept. product_id=%s",
-                    prod_id,
-                    exc_info=True,
-                )
-
-        try:
-            transaction.on_commit(_send_webhook)
-        except Exception:
-            _send_webhook()
+                _send_webhook()
         ManufactureSubreal.objects.filter(pk=locked_sub.pk).update(qty_returned=F("qty_returned") + self.qty)
         self.status = self.Status.ACCEPTED
         self.accepted_by = by_user

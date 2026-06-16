@@ -2813,8 +2813,11 @@ class ProductPurchaseBatchSerializer(serializers.ModelSerializer):
 class ReturnCreateSerializer(serializers.ModelSerializer):
     class Meta:
         model = ReturnFromAgent
-        fields = ["subreal", "qty"]
-        extra_kwargs = {"subreal": {"queryset": ManufactureSubreal.objects.all()}}
+        fields = ["subreal", "qty", "is_defect"]
+        extra_kwargs = {
+            "subreal": {"queryset": ManufactureSubreal.objects.all()},
+            "is_defect": {"required": False, "default": False},
+        }
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -2896,6 +2899,7 @@ class ReturnCreateSerializer(serializers.ModelSerializer):
         if not company_id:
             raise serializers.ValidationError({"company": "У пользователя не задана компания."})
         split_plan = validated_data.pop("_split_plan", None) or []
+        is_defect = bool(validated_data.get("is_defect", False))
         qty_total = int(validated_data.get("qty") or 0)
         if qty_total < 1:
             raise serializers.ValidationError({"qty": "Минимум 1."})
@@ -2910,6 +2914,7 @@ class ReturnCreateSerializer(serializers.ModelSerializer):
                 subreal=subreal,
                 returned_by=user,
                 qty=int(take),
+                is_defect=is_defect,
                 status=ReturnFromAgent.Status.PENDING,
             )
             created.append(obj)
@@ -2923,12 +2928,17 @@ class ReturnReadSerializer(serializers.ModelSerializer):
     returned_by_name = serializers.SerializerMethodField()
     accepted_by_name = serializers.SerializerMethodField()
     status_display = serializers.CharField(source="get_status_display", read_only=True)
+    client_name = serializers.CharField(source="client.full_name", read_only=True, default=None)
+
+    product_name = serializers.CharField(source="subreal.product.name", read_only=True)
 
     class Meta:
         model = ReturnFromAgent
         fields = [
-            "id", "company", "subreal_id", "product", "agent",
-            "qty", "status", "status_display",
+            "id", "company", "subreal_id", "product", "product_name", "agent",
+            "qty", "is_defect", "amount",
+            "client", "client_name",
+            "status", "status_display",
             "returned_by", "returned_by_name",
             "accepted_by", "accepted_by_name",
             "returned_at", "accepted_at",
