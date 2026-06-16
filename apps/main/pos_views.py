@@ -2303,7 +2303,17 @@ class SaleAddItemAPIView(MarketCashierOnlyMixin, APIView):
             item.save(skip_full_clean=True)
 
         cart.recalc()
-        return _cart_response(request, cart.id, status_code=status.HTTP_201_CREATED)
+        resp = _cart_response(request, cart.id, status_code=status.HTTP_201_CREATED)
+        # Возвращаем UUID конкретной добавленной/обновлённой строки, чтобы фронт
+        # PATCH-ил именно её (штучную/упаковочную), а не падал в поиск по product_id.
+        if isinstance(resp.data, dict):
+            resp.data["added_item_id"] = str(item.id)
+            resp.data["added_item"] = {
+                "id": str(item.id),
+                "product": str(product.id),
+                "sale_package": str(pkg.id) if pkg else None,
+            }
+        return resp
 
 
 class SaleCheckoutAPIView(MarketCashierOnlyMixin, APIView):

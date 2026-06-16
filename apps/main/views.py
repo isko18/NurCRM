@@ -1356,6 +1356,16 @@ class ProductCreateManualAPIView(CompanyBranchRestrictedMixin, generics.CreateAP
                     status=status.HTTP_400_BAD_REQUEST
                 )
 
+        # hotkey_group (F1…F12 для кассы); пусто/невалидно → None
+        hotkey_group = (data.get("hotkey_group") or "").strip().upper() or None
+        if hotkey_group is not None and not any(
+            hotkey_group == c[0] for c in Product.HotkeyGroup.choices
+        ):
+            return Response(
+                {"hotkey_group": "Недопустимая группа. Используйте F1–F12."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
         # brand/category (через global)
         brand_name = (data.get("brand_name") or "").strip()
         category_name = (data.get("category_name") or "").strip()
@@ -1380,6 +1390,7 @@ class ProductCreateManualAPIView(CompanyBranchRestrictedMixin, generics.CreateAP
             company=company,
             branch=branch,
             kind=kind_value,
+            hotkey_group=hotkey_group,
 
             name=name,
             barcode=barcode,
