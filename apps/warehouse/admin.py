@@ -5,43 +5,46 @@ from . import models
 @admin.register(models.Document)
 class DocumentAdmin(admin.ModelAdmin):
 	list_display = ("number", "doc_type", "status", "date", "warehouse_from", "warehouse_to", "counterparty", "discount_percent", "discount_amount", "total")
-	list_filter = ("doc_type", "status")
+	list_filter = ("doc_type", "status", "warehouse_from__company")
 	search_fields = ("number", "comment")
 
 
 @admin.register(models.DocumentItem)
 class DocumentItemAdmin(admin.ModelAdmin):
 	list_display = ("document", "product", "qty", "price", "discount_percent", "discount_amount", "line_total")
+	list_filter = ("document__warehouse_from__company",)
 	search_fields = ("product__name",)
 
 
 @admin.register(models.StockBalance)
 class StockBalanceAdmin(admin.ModelAdmin):
 	list_display = ("warehouse", "product", "qty")
-	list_filter = ("warehouse",)
+	list_filter = ("warehouse__company", "warehouse")
 
 
 @admin.register(models.StockMove)
 class StockMoveAdmin(admin.ModelAdmin):
 	list_display = ("document", "warehouse", "product", "qty_delta", "created_at")
-	list_filter = ("warehouse",)
+	list_filter = ("warehouse__company", "warehouse")
 
 
 @admin.register(models.Counterparty)
 class CounterpartyAdmin(admin.ModelAdmin):
-	list_display = ("name", "type")
+	list_display = ("name", "type", "company")
+	list_filter = ("company", "type")
 	search_fields = ("name",)
 
 
 @admin.register(models.CompanyStockPartnership)
 class CompanyStockPartnershipAdmin(admin.ModelAdmin):
 	list_display = ("company_a", "company_b", "created_at")
+	list_filter = ("company_a", "company_b")
 
 
 @admin.register(models.CompanyStockPartnershipRequest)
 class CompanyStockPartnershipRequestAdmin(admin.ModelAdmin):
 	list_display = ("from_company", "to_company", "status", "created_at")
-	list_filter = ("status",)
+	list_filter = ("status", "from_company", "to_company")
 
 
 @admin.register(models.CompanyCashIncassation)
@@ -101,5 +104,5 @@ class MoneyDocumentAdmin(admin.ModelAdmin):
 @admin.register(models.CashApprovalRequest)
 class CashApprovalRequestAdmin(admin.ModelAdmin):
     list_display = ("document", "status", "requires_money", "money_doc_type", "amount", "requested_at", "decided_at")
-    list_filter = ("status", "requires_money", "money_doc_type")
+    list_filter = ("status", "requires_money", "money_doc_type", "document__warehouse_from__company")
     search_fields = ("document__number", "decision_note")
