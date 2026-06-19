@@ -46,8 +46,12 @@ from .funnel.scoring import ScoringService
 from .funnel.analytics import PipelineAnalytics
 from .funnel.events import emit as emit_funnel_event
 from .funnel import realtime
-from .access import is_owner_like, apply_lead_visibility, apply_client_visibility
-from apps.users.models import Branch
+from .funnel.provisioning import provision_funnel_for_role
+from .access import (
+    is_owner_like, apply_lead_visibility, apply_client_visibility,
+    visible_funnels_qs, can_view_funnel, can_manage_leads,
+)
+from apps.users.models import Branch, CustomRole
 from apps.main.models import Client
 from apps.main.serializers import ClientSerializer
 
@@ -427,12 +431,39 @@ class FunnelConsaltingListCreateView(CompanyBranchQuerysetMixin, generics.ListCr
     queryset = FunnelConsalting.objects.prefetch_related("stages").all()
     serializer_class = FunnelConsaltingSerializer
     filter_backends = [DjangoFilterBackend]
-    filterset_fields = ["is_active", "branch"]
+    filterset_fields = ["is_active", "branch", "funnel_kind", "is_main", "custom_role"]
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        if getattr(self, "swagger_fake_view", False):
+            return qs
+        # видимость: owner/admin — все; сотрудник — роль + main/grants
+        return visible_funnels_qs(qs, self.request.user)
+
+    def perform_create(self, serializer):
+        # пользовательские воронки создаёт только owner/admin (раздел 1.5)
+        if not is_owner_like(self.request.user):
+            raise PermissionDenied("Создавать воронки может только владелец или администратор.")
+        super().perform_create(serializer)
 
 
 class FunnelConsaltingRetrieveUpdateDestroyView(CompanyBranchQuerysetMixin, generics.RetrieveUpdateDestroyAPIView):
     queryset = FunnelConsalting.objects.prefetch_related("stages").all()
     serializer_class = FunnelConsaltingSerializer
+
+    def perform_update(self, serializer):
+        if serializer.instance.is_protected:
+            raise PermissionDenied("Эту воронку нельзя изменить или удалить.")
+        if not is_owner_like(self.request.user):
+            raise PermissionDenied("Изменять воронки может только владелец или администратор.")
+        super().perform_update(serializer)
+
+    def perform_destroy(self, instance):
+        if instance.is_protected:
+            raise PermissionDenied("Эту воронку нельзя изменить или удалить.")
+        if not is_owner_like(self.request.user):
+            raise PermissionDenied("Удалять воронки может только владелец или администратор.")
+        instance.delete()
 
 
 class FunnelBoardView(CompanyBranchQuerysetMixin, generics.GenericAPIView):
@@ -445,6 +476,8 @@ class FunnelBoardView(CompanyBranchQuerysetMixin, generics.GenericAPIView):
 
     def get(self, request, *args, **kwargs):
         funnel = self.get_object()
+        if not can_view_funnel(request.user, funnel):
+            raise PermissionDenied("Нет доступа к этой воронке.")
         leads_qs = LeadConsalting.objects.filter(funnel=funnel).select_related("stage", "owner", "client")
         # видимость: сотрудник видит общий пул + свои лиды, руководитель — все
         leads_qs = apply_lead_visibility(leads_qs, request.user)
@@ -467,6 +500,37 @@ class FunnelBoardView(CompanyBranchQuerysetMixin, generics.GenericAPIView):
         })
 
 
+class FunnelForRoleView(CompanyBranchQuerysetMixin, generics.GenericAPIView):
+    """
+    Создать (или вернуть существующую) воронку для кастомной роли.
+    POST /api/consalting/funnels/for-role/  { "custom_role": "<uuid>", "name"?: "..." }
+    """
+    queryset = FunnelConsalting.objects.all()
+    serializer_class = FunnelConsaltingSerializer
+
+    def post(self, request, *args, **kwargs):
+        if not is_owner_like(request.user):
+            raise PermissionDenied("Создавать воронку роли может только владелец или администратор.")
+
+        company = self._user_company()
+        if not company:
+            raise PermissionDenied("У пользователя не настроена компания.")
+
+        role_id = request.data.get("custom_role")
+        if not role_id:
+            return Response({"custom_role": "Обязательное поле."}, status=status.HTTP_400_BAD_REQUEST)
+        try:
+            role = CustomRole.objects.get(id=role_id)
+        except (CustomRole.DoesNotExist, ValueError, TypeError):
+            return Response({"custom_role": "Роль не найдена."}, status=status.HTTP_400_BAD_REQUEST)
+        if role.company_id not in (None, company.id):
+            return Response({"custom_role": "Роль не из вашей компании."}, status=status.HTTP_400_BAD_REQUEST)
+
+        funnel, created = provision_funnel_for_role(role, name=request.data.get("name"))
+        data = FunnelConsaltingSerializer(funnel, context=self.get_serializer_context()).data
+        return Response(data, status=status.HTTP_201_CREATED if created else status.HTTP_200_OK)
+
+
 # ==========================
 # FunnelStageConsalting (стадии)
 # ==========================
@@ -481,6 +545,9 @@ class FunnelStageConsaltingListCreateView(CompanyBranchQuerysetMixin, generics.L
         company = self._user_company()
         if not company:
             raise PermissionDenied("У пользователя не настроена компания.")
+        # дополнительные (несистемные) стадии добавляет только owner/admin (раздел 1.2)
+        if not is_owner_like(self.request.user):
+            raise PermissionDenied("Добавлять стадии может только владелец или администратор.")
         serializer.save()
 
 
@@ -492,7 +559,18 @@ class FunnelStageConsaltingRetrieveUpdateDestroyView(CompanyBranchQuerysetMixin,
         company = self._user_company()
         if not company:
             raise PermissionDenied("У пользователя не настроена компания.")
+        if serializer.instance.is_system:
+            raise PermissionDenied("Системную стадию нельзя изменить или удалить.")
+        if not is_owner_like(self.request.user):
+            raise PermissionDenied("Изменять стадии может только владелец или администратор.")
         serializer.save()
+
+    def perform_destroy(self, instance):
+        if instance.is_system:
+            raise PermissionDenied("Системную стадию нельзя изменить или удалить.")
+        if not is_owner_like(self.request.user):
+            raise PermissionDenied("Удалять стадии может только владелец или администратор.")
+        instance.delete()
 
 
 # ==========================

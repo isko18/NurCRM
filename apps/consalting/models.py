@@ -466,6 +466,12 @@ class BookingConsalting(models.Model):
 # ======== Воронка продаж ========
 class FunnelConsalting(TimeStampedModel):
     """Воронка продаж (набор стадий, по которым движутся лиды)."""
+
+    class FunnelKind(models.TextChoices):
+        MAIN = 'main', 'Основная'
+        ROLE = 'role', 'Роль'
+        CUSTOM = 'custom', 'Пользовательская'
+
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     company = models.ForeignKey(
         Company,
@@ -486,6 +492,24 @@ class FunnelConsalting(TimeStampedModel):
     description = models.TextField(blank=True, verbose_name='Описание')
     is_active = models.BooleanField(default=True, verbose_name='Активна')
 
+    # ----- тип воронки и защита -----
+    funnel_kind = models.CharField(
+        max_length=16, choices=FunnelKind.choices, default=FunnelKind.CUSTOM,
+        db_index=True, verbose_name='Тип воронки'
+    )
+    is_main = models.BooleanField(default=False, verbose_name='Основная')
+    is_static = models.BooleanField(
+        default=False, verbose_name='Статичная',
+        help_text='True для основной и ролевых воронок (нельзя удалять/переименовывать).'
+    )
+    custom_role = models.ForeignKey(
+        'users.CustomRole',
+        on_delete=models.SET_NULL,
+        null=True, blank=True,
+        related_name='consalting_funnels',
+        verbose_name='Роль (для воронки роли)'
+    )
+
     class Meta:
         verbose_name = 'Воронка продаж'
         verbose_name_plural = 'Воронки продаж'
@@ -493,6 +517,7 @@ class FunnelConsalting(TimeStampedModel):
         indexes = [
             models.Index(fields=['company', 'is_active']),
             models.Index(fields=['company', 'branch', 'is_active']),
+            models.Index(fields=['company', 'funnel_kind']),
         ]
         constraints = [
             models.UniqueConstraint(
@@ -505,14 +530,31 @@ class FunnelConsalting(TimeStampedModel):
                 name='uniq_consalting_funnel_global_per_company',
                 condition=models.Q(branch__isnull=True),
             ),
+            models.UniqueConstraint(
+                fields=('company', 'custom_role'),
+                name='uniq_consalting_funnel_per_role_per_company',
+                condition=models.Q(custom_role__isnull=False),
+            ),
+            models.UniqueConstraint(
+                fields=('company',),
+                name='uniq_consalting_main_funnel_per_company',
+                condition=models.Q(is_main=True),
+            ),
         ]
 
     def __str__(self):
         return self.name or str(self.id)
 
+    @property
+    def is_protected(self) -> bool:
+        """Основную и ролевые воронки нельзя удалять/переименовывать."""
+        return bool(self.is_main or self.custom_role_id or self.is_static)
+
     def clean(self):
         if self.branch_id and self.branch.company_id != self.company_id:
             raise ValidationError({'branch': 'Филиал принадлежит другой компании.'})
+        if self.custom_role_id and self.custom_role.company_id not in (None, self.company_id):
+            raise ValidationError({'custom_role': 'Роль принадлежит другой компании.'})
 
 
 # ======== Стадия воронки ========
@@ -566,6 +608,13 @@ class FunnelStageConsalting(TimeStampedModel):
         default='#3498db',
         verbose_name='Цвет',
         help_text='HEX-цвет (например, #3498db)'
+    )
+    # системные (неизменяемые) стадии воронки роли: intake / in_progress / completed
+    is_system = models.BooleanField(default=False, verbose_name='Системная стадия')
+    system_key = models.CharField(
+        max_length=32, blank=True, db_index=True,
+        choices=[('intake', 'intake'), ('in_progress', 'in_progress'), ('completed', 'completed')],
+        verbose_name='Системный ключ'
     )
     # Семантический тип стадии — на нём строятся переходы и аналитика
     stage_type = models.CharField(
@@ -1069,3 +1118,48 @@ class AutomationLogConsalting(TimeStampedModel):
 
     def __str__(self):
         return f"{self.trigger} · {self.lead_id}"
+
+
+# ======== Доступ сотрудника к воронке ========
+class EmployeeFunnelGrant(TimeStampedModel):
+    """Доп. доступ сотрудника к воронке (просмотр + опционально управление лидами).
+
+    Воронка роли сотрудника сюда НЕ дублируется — доступ к ней определяется
+    связкой custom_role + флагами can_view_funnel / can_manage_funnel_leads.
+    """
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    employee = models.ForeignKey(
+        User,
+        on_delete=models.CASCADE,
+        related_name='funnel_grants',
+        related_query_name='funnel_grant',
+        verbose_name='Сотрудник'
+    )
+    funnel = models.ForeignKey(
+        FunnelConsalting,
+        on_delete=models.CASCADE,
+        related_name='grants',
+        related_query_name='grant',
+        verbose_name='Воронка'
+    )
+    can_manage_leads = models.BooleanField(
+        default=False, verbose_name='Может управлять лидами в этой воронке'
+    )
+
+    class Meta:
+        verbose_name = 'Доступ к воронке'
+        verbose_name_plural = 'Доступы к воронкам'
+        ordering = ['-created_at']
+        constraints = [
+            models.UniqueConstraint(
+                fields=('employee', 'funnel'),
+                name='uniq_consalting_funnel_grant_per_employee',
+            ),
+        ]
+        indexes = [
+            models.Index(fields=['employee']),
+            models.Index(fields=['funnel']),
+        ]
+
+    def __str__(self):
+        return f"{self.employee_id} → {self.funnel_id} (manage={self.can_manage_leads})"

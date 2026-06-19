@@ -1,11 +1,20 @@
-"""Подписка на события воронки → движок автоматизации + real-time (Фаза 6)."""
+"""Подписка на события воронки → движок автоматизации + real-time (Фаза 6).
+
+Дополнительно: автоматическое создание воронки роли при появлении кастомной роли
+в компании сектора «Консалтинг».
+"""
 import logging
 
+from django.db import transaction
+from django.db.models.signals import post_save
 from django.dispatch import receiver
+
+from apps.users.models import CustomRole
 
 from .funnel.events import funnel_event
 from .funnel.automation.engine import AutomationEngine
 from .funnel import realtime
+from .funnel.provisioning import provision_funnel_for_role
 
 logger = logging.getLogger(__name__)
 
@@ -23,3 +32,21 @@ def on_funnel_event(sender, trigger, lead, actor=None, ctx=None, **kwargs):
 
     if trigger in _REALTIME_TRIGGERS:
         realtime.push(lead, trigger)
+
+
+@receiver(post_save, sender=CustomRole)
+def on_custom_role_created(sender, instance, created, **kwargs):
+    """При создании кастомной роли в консалтинговой компании — создаём воронку роли."""
+    if not created:
+        return
+    company = instance.company
+    if not company or not getattr(company, "is_consulting", None) or not company.is_consulting():
+        return
+
+    def _provision():
+        try:
+            provision_funnel_for_role(instance)
+        except Exception as e:  # provisioning не должен ломать создание роли
+            logger.exception("provision_funnel_for_role failed for role %s: %s", instance.id, e)
+
+    transaction.on_commit(_provision)

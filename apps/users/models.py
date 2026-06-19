@@ -206,6 +206,25 @@ class Company(models.Model):
                 return True
         return False
 
+    def is_consulting(self) -> bool:
+        """True если компания относится к сфере «Консалтинг» (по названию industry/sector)."""
+        names = []
+        try:
+            names.append(getattr(self.industry, "name", None))
+        except Exception:
+            pass
+        try:
+            names.append(getattr(self.sector, "name", None))
+        except Exception:
+            pass
+
+        keywords = ("consult", "консалт", "консалтинг", "consulting")
+        for n in names:
+            s = (n or "").strip().casefold()
+            if s and any(k in s for k in keywords):
+                return True
+        return False
+
     def _generate_unique_slug(self) -> str:
         base = slugify(self.name)[:60] or "company"
         candidate = base
@@ -397,6 +416,10 @@ class User(AbstractBaseUser, PermissionsMixin):
     can_view_brand_category = models.BooleanField(default=False, blank=True, null=True, verbose_name="Доступ к брендам и категориям")
     can_view_settings = models.BooleanField(default=False, blank=True, null=True, verbose_name="Доступ к настройкам")
     can_view_sale = models.BooleanField(default=False, blank=True, null=True, verbose_name="Доступ к продажам")
+
+    # Consulting: воронка продаж
+    can_view_funnel = models.BooleanField(default=False, blank=True, null=True, verbose_name="Консалтинг: страница воронки")
+    can_manage_funnel_leads = models.BooleanField(default=False, blank=True, null=True, verbose_name="Консалтинг: управление лидами своей роли")
 
     # Building permissions (CRM) — ключи для profile, меню Building и роутинга
     can_view_building_analytics = models.BooleanField(default=False, blank=True, null=True, verbose_name="Building: Аналитика")

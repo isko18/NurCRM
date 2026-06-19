@@ -16,7 +16,7 @@ from .models import (
     LeadActivityConsalting,
     LeadTaskConsalting,
 )
-from apps.users.models import User, Branch
+from apps.users.models import User, Branch, CustomRole
 
 
 # ==========================
@@ -483,6 +483,7 @@ class FunnelStageConsaltingSerializer(CompanyBranchReadOnlyMixin, serializers.Mo
         fields = (
             "id", "company", "branch", "funnel",
             "name", "order", "color", "stage_type",
+            "is_system", "system_key",
             "allowed_next", "required_fields", "sla_hours", "allow_skip",
             "is_final", "is_success",
             "leads_count", "created_at", "updated_at",
@@ -525,6 +526,11 @@ class FunnelStageConsaltingSerializer(CompanyBranchReadOnlyMixin, serializers.Mo
 class FunnelConsaltingSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
     stages = FunnelStageConsaltingSerializer(many=True, read_only=True)
     leads_count = serializers.SerializerMethodField()
+    custom_role = serializers.PrimaryKeyRelatedField(
+        queryset=CustomRole.objects.all(), required=False, allow_null=True
+    )
+    custom_role_name = serializers.CharField(source="custom_role.name", read_only=True)
+    is_protected = serializers.BooleanField(read_only=True)
     created_at = serializers.DateTimeField(read_only=True)
     updated_at = serializers.DateTimeField(read_only=True)
 
@@ -533,13 +539,37 @@ class FunnelConsaltingSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSe
         fields = (
             "id", "company", "branch",
             "name", "description", "is_active",
+            "funnel_kind", "is_main", "is_static", "is_protected",
+            "custom_role", "custom_role_name",
             "stages", "leads_count",
             "created_at", "updated_at",
         )
-        read_only_fields = ("id", "company", "branch", "stages", "leads_count", "created_at", "updated_at")
+        read_only_fields = (
+            "id", "company", "branch", "stages", "leads_count",
+            "funnel_kind", "is_main", "is_static", "is_protected", "custom_role_name",
+            "created_at", "updated_at",
+        )
 
     def get_leads_count(self, obj):
         return getattr(obj, "leads_count", None) if hasattr(obj, "leads_count") else obj.leads.count()
+
+    def validate_custom_role(self, value):
+        company = self._user_company()
+        if value and company and value.company_id not in (None, company.id):
+            raise serializers.ValidationError("Роль принадлежит другой компании.")
+        return value
+
+    def create(self, validated_data):
+        # Деривация типа воронки: роль → ROLE+static, иначе CUSTOM (is_main только через provisioning)
+        role = validated_data.get("custom_role")
+        if role is not None:
+            validated_data["funnel_kind"] = FunnelConsalting.FunnelKind.ROLE
+            validated_data["is_static"] = True
+        else:
+            validated_data["funnel_kind"] = FunnelConsalting.FunnelKind.CUSTOM
+            validated_data["is_static"] = False
+        validated_data["is_main"] = False
+        return super().create(validated_data)
 
 
 # ==========================
