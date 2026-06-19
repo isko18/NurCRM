@@ -548,10 +548,9 @@ class LeadConsaltingSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSeri
         if target_branch is not None and client and getattr(client, "branch_id", None) not in (None, target_branch.id):
             raise serializers.ValidationError({"client": "Клиент принадлежит другому филиалу."})
 
-        # автозаполнение ответственного текущим пользователем при создании
-        request = self.context.get("request")
-        if request and getattr(request, "user", None) and not self.instance:
-            attrs.setdefault("owner", request.user)
+        # Новый лид по умолчанию попадает в общий пул (owner=None) и виден всем
+        # сотрудникам, пока кто-то не «возьмёт» его (claim) или руководитель не
+        # назначит ответственного. Поэтому owner здесь НЕ проставляем автоматически.
 
         try:
             temp = LeadConsalting(**{**attrs, "company": company, "branch": target_branch})
@@ -574,6 +573,13 @@ class LeadConsaltingSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSeri
 # ==========================
 class LeadMoveStageSerializer(serializers.Serializer):
     stage = serializers.PrimaryKeyRelatedField(queryset=FunnelStageConsalting.objects.all())
+
+
+# ==========================
+# Назначение ответственного (руководителем)
+# ==========================
+class LeadAssignSerializer(serializers.Serializer):
+    owner = serializers.PrimaryKeyRelatedField(queryset=User.objects.all())
 
 
 # ==========================

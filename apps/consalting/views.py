@@ -31,6 +31,7 @@ from .serializers import (
     FunnelStageConsaltingSerializer,
     LeadConsaltingSerializer,
     LeadMoveStageSerializer,
+    LeadAssignSerializer,
     LeadLoseSerializer,
     LeadWinSerializer,
     LossReasonConsaltingSerializer,
@@ -44,6 +45,8 @@ from .funnel.activity import ActivityLogger
 from .funnel.scoring import ScoringService
 from .funnel.analytics import PipelineAnalytics
 from .funnel.events import emit as emit_funnel_event
+from .funnel import realtime
+from .access import is_owner_like, apply_lead_visibility
 from apps.users.models import Branch
 
 
@@ -384,6 +387,8 @@ class FunnelBoardView(CompanyBranchQuerysetMixin, generics.GenericAPIView):
     def get(self, request, *args, **kwargs):
         funnel = self.get_object()
         leads_qs = LeadConsalting.objects.filter(funnel=funnel).select_related("stage", "owner", "client")
+        # видимость: сотрудник видит общий пул + свои лиды, руководитель — все
+        leads_qs = apply_lead_visibility(leads_qs, request.user)
 
         columns = []
         for stage in funnel.stages.all():
@@ -434,25 +439,63 @@ class FunnelStageConsaltingRetrieveUpdateDestroyView(CompanyBranchQuerysetMixin,
 # ==========================
 # LeadConsalting (карточки лидов)
 # ==========================
-class LeadConsaltingListCreateView(CompanyBranchQuerysetMixin, generics.ListCreateAPIView):
+class LeadVisibilityMixin:
+    """
+    Видимость лидов поверх company/branch:
+      * лид без владельца (owner=None) — общий пул, виден всем;
+      * взятый лид — только владельцу и руководителям (owner/admin компании).
+    """
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        if getattr(self, "swagger_fake_view", False):
+            return qs
+        return apply_lead_visibility(qs, getattr(self.request, "user", None))
+
+
+class LeadConsaltingListCreateView(LeadVisibilityMixin, CompanyBranchQuerysetMixin, generics.ListCreateAPIView):
     queryset = LeadConsalting.objects.select_related("funnel", "stage", "owner", "client", "company").all()
     serializer_class = LeadConsaltingSerializer
     filter_backends = [DjangoFilterBackend]
     filterset_fields = ["funnel", "stage", "owner", "client", "status", "branch"]
 
+    def perform_create(self, serializer):
+        super().perform_create(serializer)
+        realtime.lead_created(serializer.instance)
 
-class LeadConsaltingRetrieveUpdateDestroyView(CompanyBranchQuerysetMixin, generics.RetrieveUpdateDestroyAPIView):
+
+class LeadConsaltingRetrieveUpdateDestroyView(LeadVisibilityMixin, CompanyBranchQuerysetMixin, generics.RetrieveUpdateDestroyAPIView):
     queryset = LeadConsalting.objects.select_related("funnel", "stage", "owner", "client", "company").all()
     serializer_class = LeadConsaltingSerializer
 
+    def perform_update(self, serializer):
+        prev_owner_id = serializer.instance.owner_id
+        super().perform_update(serializer)
+        lead = serializer.instance
+        # смена владельца через обычный PATCH трактуем как взятие/возврат
+        if lead.owner_id != prev_owner_id:
+            if lead.owner_id:
+                realtime.lead_claimed(lead)
+            else:
+                realtime.lead_released(lead)
+        else:
+            realtime.lead_updated(lead)
 
-class LeadMoveStageView(CompanyBranchQuerysetMixin, generics.GenericAPIView):
+    def perform_destroy(self, instance):
+        realtime.lead_deleted(instance)
+        instance.delete()
+
+
+class LeadMoveStageView(LeadVisibilityMixin, CompanyBranchQuerysetMixin, generics.GenericAPIView):
     """
     Перемещение лида в другую стадию его воронки — через машину состояний.
     POST /api/consalting/leads/<uuid:pk>/move-stage/  { "stage": "<uuid>" }
 
     В «мягком» режиме (CONSALTING_FUNNEL_STRICT=False) недопустимые переходы
     выполняются, но фиксируются как нарушения в timeline. В «строгом» — 400.
+
+    Сотрудник может двигать только лиды из общего пула или свои; руководитель —
+    любые. Real-time о перемещении уходит на доску через сигнал stage_changed.
     """
     queryset = LeadConsalting.objects.select_related("funnel", "stage").all()
     serializer_class = LeadMoveStageSerializer
@@ -478,6 +521,83 @@ class LeadMoveStageView(CompanyBranchQuerysetMixin, generics.GenericAPIView):
         return Response(
             LeadConsaltingSerializer(lead, context=self.get_serializer_context()).data
         )
+
+
+class LeadClaimView(LeadVisibilityMixin, CompanyBranchQuerysetMixin, generics.GenericAPIView):
+    """
+    «Взять» лид себе: ставит owner=текущий пользователь.
+    POST /api/consalting/leads/<uuid:pk>/claim/
+
+    Доступны только лиды из общего пула (owner=None) или уже свои (видимость
+    миксина). После взятия карточка пропадает у остальных сотрудников.
+    """
+    queryset = LeadConsalting.objects.select_related("funnel", "stage", "owner").all()
+    serializer_class = LeadConsaltingSerializer
+
+    def post(self, request, *args, **kwargs):
+        lead = self.get_object()
+        if lead.owner_id and lead.owner_id != request.user.id and not is_owner_like(request.user):
+            return Response(
+                {"detail": "Лид уже взят другим сотрудником."},
+                status=status.HTTP_409_CONFLICT,
+            )
+        if lead.owner_id != request.user.id:
+            lead.owner = request.user
+            lead.save(update_fields=["owner", "updated_at"])
+            realtime.lead_claimed(lead)
+        return Response(LeadConsaltingSerializer(lead, context=self.get_serializer_context()).data)
+
+
+class LeadReleaseView(LeadVisibilityMixin, CompanyBranchQuerysetMixin, generics.GenericAPIView):
+    """
+    Вернуть лид в общий пул: снимает owner.
+    POST /api/consalting/leads/<uuid:pk>/release/
+
+    Сотрудник может вернуть только свой лид; руководитель — любой.
+    """
+    queryset = LeadConsalting.objects.select_related("funnel", "stage", "owner").all()
+    serializer_class = LeadConsaltingSerializer
+
+    def post(self, request, *args, **kwargs):
+        lead = self.get_object()
+        if lead.owner_id and lead.owner_id != request.user.id and not is_owner_like(request.user):
+            raise PermissionDenied("Нельзя вернуть чужой лид.")
+        if lead.owner_id is not None:
+            lead.owner = None
+            lead.save(update_fields=["owner", "updated_at"])
+            realtime.lead_released(lead)
+        return Response(LeadConsaltingSerializer(lead, context=self.get_serializer_context()).data)
+
+
+class LeadAssignView(CompanyBranchQuerysetMixin, generics.GenericAPIView):
+    """
+    Назначить ответственного (только руководитель).
+    POST /api/consalting/leads/<uuid:pk>/assign/  { "owner": "<user-uuid>" }
+    """
+    queryset = LeadConsalting.objects.select_related("funnel", "stage", "owner").all()
+    serializer_class = LeadAssignSerializer
+
+    def post(self, request, *args, **kwargs):
+        if not is_owner_like(request.user):
+            raise PermissionDenied("Назначать ответственного может только руководитель.")
+
+        company = self._user_company()
+        lead = self.get_object()
+        ser = self.get_serializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+        owner = ser.validated_data["owner"]
+
+        if company and getattr(owner, "company_id", None) not in (None, company.id):
+            return Response({"owner": "Сотрудник из другой компании."},
+                            status=status.HTTP_400_BAD_REQUEST)
+
+        if lead.owner_id != owner.id:
+            lead.owner = owner
+            lead.save(update_fields=["owner", "updated_at"])
+            realtime.lead_claimed(lead)
+            # персональное уведомление назначенному сотруднику
+            realtime.notify_user(owner.id, "lead.assigned", realtime.serialize_lead(lead))
+        return Response(LeadConsaltingSerializer(lead, context=self.get_serializer_context()).data)
 
 
 class LeadAllowedTransitionsView(CompanyBranchQuerysetMixin, generics.GenericAPIView):
