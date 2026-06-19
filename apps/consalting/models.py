@@ -35,6 +35,10 @@ class ServicesConsalting(TimeStampedModel):
     )
     name = models.CharField(max_length=255, verbose_name="Название")
     price = models.DecimalField(max_digits=12, decimal_places=2, verbose_name="Цена")
+    installation_price = models.DecimalField(
+        max_digits=12, decimal_places=2, default=0,
+        verbose_name="Стоимость установки"
+    )
     description = models.TextField(verbose_name="Описание", blank=True)
 
     class Meta:
@@ -64,6 +68,62 @@ class ServicesConsalting(TimeStampedModel):
 
     def clean(self):
         if self.branch_id and self.branch.company_id != self.company_id:
+            raise ValidationError({'branch': 'Филиал принадлежит другой компании.'})
+
+
+# ======== Тариф услуги ========
+class TariffConsalting(TimeStampedModel):
+    """Тариф (вариант) услуги — у услуги может быть несколько тарифов на выбор."""
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    company = models.ForeignKey(
+        Company,
+        on_delete=models.CASCADE,
+        related_name='consalting_tariffs',
+        related_query_name='consalting_tariff',
+        verbose_name='Компания'
+    )
+    branch = models.ForeignKey(
+        Branch,
+        on_delete=models.CASCADE,
+        null=True, blank=True, db_index=True,
+        related_name='consalting_tariffs',
+        related_query_name='consalting_tariff',
+        verbose_name='Филиал',
+    )
+    service = models.ForeignKey(
+        ServicesConsalting,
+        on_delete=models.CASCADE,
+        related_name='tariffs',
+        related_query_name='tariff',
+        verbose_name='Услуга'
+    )
+    name = models.CharField(max_length=255, verbose_name='Название тарифа')
+    price = models.DecimalField(max_digits=12, decimal_places=2, verbose_name='Цена тарифа')
+
+    class Meta:
+        verbose_name = 'Тариф услуги'
+        verbose_name_plural = 'Тарифы услуг'
+        ordering = ['service', 'price']
+        indexes = [
+            models.Index(fields=['company', 'service']),
+        ]
+        constraints = [
+            models.UniqueConstraint(
+                fields=('service', 'name'),
+                name='uniq_consalting_tariff_per_service',
+            ),
+        ]
+
+    def __str__(self):
+        return f"{self.name} — {self.price}"
+
+    def clean(self):
+        if self.service_id:
+            if self.company_id and self.service.company_id != self.company_id:
+                raise ValidationError({'service': 'Услуга принадлежит другой компании.'})
+            if self.service.branch_id not in (None, self.branch_id):
+                raise ValidationError({'service': 'Услуга относится к другому филиалу.'})
+        if self.branch_id and self.company_id and self.branch.company_id != self.company_id:
             raise ValidationError({'branch': 'Филиал принадлежит другой компании.'})
 
 
@@ -103,6 +163,14 @@ class SaleConsalting(TimeStampedModel):
         related_query_name="sale",
         verbose_name="Услуга"
     )
+    tariff = models.ForeignKey(
+        TariffConsalting,
+        on_delete=models.SET_NULL,
+        null=True, blank=True,
+        related_name="sales",
+        related_query_name="sale",
+        verbose_name="Тариф"
+    )
     client = models.ForeignKey(
         "main.Client",
         on_delete=models.SET_NULL,
@@ -110,6 +178,16 @@ class SaleConsalting(TimeStampedModel):
         related_name="consalting_sales",
         related_query_name="consalting_sale",
         verbose_name="Клиент"
+    )
+    discount = models.DecimalField(
+        max_digits=12, decimal_places=2, default=0, verbose_name="Скидка (сумма)"
+    )
+    markup = models.DecimalField(
+        max_digits=12, decimal_places=2, default=0, verbose_name="Наценка сверху"
+    )
+    total = models.DecimalField(
+        max_digits=12, decimal_places=2, default=0,
+        verbose_name="Итого", help_text="Считается автоматически"
     )
     description = models.TextField(verbose_name="Заметка", blank=True)
 
@@ -127,6 +205,38 @@ class SaleConsalting(TimeStampedModel):
         service_name = self.services.name if self.services else "(без услуги)"
         return f"{service_name} — {self.company}"
 
+    # ----- расчёт итоговой суммы -----
+    def base_price(self):
+        """Цена тарифа, если выбран; иначе базовая цена услуги."""
+        if self.tariff_id:
+            return self.tariff.price or 0
+        if self.services_id:
+            return self.services.price or 0
+        return 0
+
+    def installation_price(self):
+        return (self.services.installation_price or 0) if self.services_id else 0
+
+    def items_total(self):
+        # при пересчёте элементы могут быть ещё не сохранены — используем уже сохранённые
+        return sum((i.price or 0) for i in self.items.all())
+
+    def compute_total(self):
+        """Итого = тариф + установка + доп. товары − скидка + наценка."""
+        return (
+            self.base_price()
+            + self.installation_price()
+            + self.items_total()
+            - (self.discount or 0)
+            + (self.markup or 0)
+        )
+
+    def recalc_total(self, save=True):
+        self.total = self.compute_total()
+        if save:
+            SaleConsalting.objects.filter(pk=self.pk).update(total=self.total)
+        return self.total
+
     def clean(self):
         # company согласованность
         if self.company_id:
@@ -134,8 +244,14 @@ class SaleConsalting(TimeStampedModel):
                 raise ValidationError({'user': 'Пользователь из другой компании.'})
             if self.services and self.services.company_id != self.company_id:
                 raise ValidationError({'services': 'Услуга принадлежит другой компании.'})
+            if self.tariff and self.tariff.company_id != self.company_id:
+                raise ValidationError({'tariff': 'Тариф принадлежит другой компании.'})
             if self.client and getattr(self.client, 'company_id', None) != self.company_id:
                 raise ValidationError({'client': 'Клиент из другой компании.'})
+
+        # тариф должен принадлежать выбранной услуге
+        if self.tariff_id and self.services_id and self.tariff.service_id != self.services_id:
+            raise ValidationError({'tariff': 'Тариф относится к другой услуге.'})
 
         # branch согласованность (если задан)
         if self.branch_id:
@@ -143,6 +259,32 @@ class SaleConsalting(TimeStampedModel):
                 raise ValidationError({'services': 'Услуга другого филиала.'})
             if self.client and getattr(self.client, 'branch_id', None) not in (None, self.branch_id):
                 raise ValidationError({'client': 'Клиент другого филиала.'})
+
+
+# ======== Доп. товар в продаже ========
+class SaleItemConsalting(TimeStampedModel):
+    """Произвольный доп. товар/позиция в продаже (название + цена)."""
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    sale = models.ForeignKey(
+        SaleConsalting,
+        on_delete=models.CASCADE,
+        related_name='items',
+        related_query_name='item',
+        verbose_name='Продажа'
+    )
+    name = models.CharField(max_length=255, verbose_name='Название')
+    price = models.DecimalField(max_digits=12, decimal_places=2, verbose_name='Цена')
+
+    class Meta:
+        verbose_name = 'Доп. товар продажи'
+        verbose_name_plural = 'Доп. товары продаж'
+        ordering = ['created_at']
+        indexes = [
+            models.Index(fields=['sale']),
+        ]
+
+    def __str__(self):
+        return f"{self.name} — {self.price}"
 
 
 # ======== Зарплата/выплата ========

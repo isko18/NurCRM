@@ -206,6 +206,55 @@ POST /api/consalting/leads/<id>/win/    { "stage": "<won_stage|optional>" }
 POST /api/consalting/leads/<id>/lose/   { "loss_reason": "<uuid>", "loss_comment": "", "stage": "<lost_stage|optional>" }
 ```
 
+### Клиенты
+
+Отдельный эндпоинт клиентов в namespace консалтинга (общая модель клиента,
+scope по компании/филиалу). Используйте его для выпадающего списка при создании
+лида и для вкладки «Клиенты».
+
+```
+GET    /api/consalting/clients/
+POST   /api/consalting/clients/
+GET    /api/consalting/clients/<id>/
+PATCH  /api/consalting/clients/<id>/
+DELETE /api/consalting/clients/<id>/
+```
+
+Параметры списка:
+- поиск: `?search=` (по `full_name`, `phone`, `email`, `llc`, `inn`);
+- фильтры: `?status=`, `?type=`, `?date=`, `?salesperson=<uuid>`, `?service=<uuid>`, `?branch=<uuid>`;
+- сортировка: `?ordering=-created_at` (`created_at`, `updated_at`, `date`, `full_name`).
+
+Тело клиента:
+
+```json
+{
+  "id": "uuid",
+  "company": "uuid",
+  "branch": "uuid|null",
+  "type": "client|suppliers|implementers|contractor",
+  "full_name": "ФИО",
+  "phone": "+996...",
+  "email": "",
+  "date": "2026-06-19",
+  "status": "new",
+  "llc": "", "inn": "", "okpo": "", "score": "", "bik": "", "address": "",
+  "salesperson": "uuid|null",
+  "salesperson_display": "Имя Фамилия|null",
+  "service": "uuid|null",
+  "service_display": "Название услуги|null",
+  "created_at": "...", "updated_at": "..."
+}
+```
+
+**Видимость (как у лидов):** сотрудник видит клиентов без продавца (`salesperson=null`,
+общий пул) + своих; руководитель — всех. При создании сотрудником `salesperson`
+проставляется текущим пользователем автоматически (нельзя завести «чужого» клиента);
+руководитель может оставить клиента в пуле или назначить продавца через `salesperson`.
+
+> `company`/`branch`/`*_display`/`created_at`/`updated_at` — read-only, проставляются
+> сервером. Эндпоинт клиентов работает по обычному REST (без WebSocket-событий).
+
 ---
 
 ## 4. Рекомендуемый поток на фронте

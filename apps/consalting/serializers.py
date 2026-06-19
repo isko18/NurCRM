@@ -3,7 +3,9 @@ from django.core.exceptions import ValidationError as DjangoValidationError
 
 from .models import (
     ServicesConsalting,
+    TariffConsalting,
     SaleConsalting,
+    SaleItemConsalting,
     SalaryConsalting,
     RequestsConsalting,
     BookingConsalting,
@@ -116,20 +118,75 @@ class CompanyBranchReadOnlyMixin:
 
 
 # ==========================
+# Тариф услуги (вложенный)
+# ==========================
+class TariffConsaltingSerializer(serializers.ModelSerializer):
+    id = serializers.UUIDField(required=False)
+
+    class Meta:
+        model = TariffConsalting
+        fields = ("id", "name", "price")
+
+
+# ==========================
 # ServicesConsalting
 # ==========================
 class ServicesConsaltingSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
+    tariffs = TariffConsaltingSerializer(many=True, required=False)
     created_at = serializers.DateTimeField(read_only=True)
     updated_at = serializers.DateTimeField(read_only=True)
 
     class Meta:
         model = ServicesConsalting
-        fields = ("id", "company", "branch", "name", "price", "description", "created_at", "updated_at")
+        fields = (
+            "id", "company", "branch", "name", "price", "installation_price",
+            "description", "tariffs", "created_at", "updated_at",
+        )
         read_only_fields = ("id", "company", "branch", "created_at", "updated_at")
 
     def validate(self, attrs):
         # branch мы всё равно проставим из контекста, внешние значения игнорим.
         return attrs
+
+    def _sync_tariffs(self, service, tariffs_data):
+        """Полная замена набора тарифов услуги переданным списком."""
+        if tariffs_data is None:
+            return
+        service.tariffs.all().delete()
+        TariffConsalting.objects.bulk_create([
+            TariffConsalting(
+                company_id=service.company_id,
+                branch_id=service.branch_id,
+                service=service,
+                name=t["name"],
+                price=t["price"],
+            )
+            for t in tariffs_data
+        ])
+
+    def create(self, validated_data):
+        tariffs_data = validated_data.pop("tariffs", None)
+        service = super().create(validated_data)
+        self._sync_tariffs(service, tariffs_data)
+        return service
+
+    def update(self, instance, validated_data):
+        tariffs_data = validated_data.pop("tariffs", None)
+        service = super().update(instance, validated_data)
+        # тарифы заменяем только если поле прислали
+        self._sync_tariffs(service, tariffs_data)
+        return service
+
+
+# ==========================
+# Доп. товар продажи (вложенный)
+# ==========================
+class SaleItemConsaltingSerializer(serializers.ModelSerializer):
+    id = serializers.UUIDField(required=False)
+
+    class Meta:
+        model = SaleItemConsalting
+        fields = ("id", "name", "price")
 
 
 # ==========================
@@ -142,6 +199,18 @@ class SaleConsaltingSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSeri
     client_display = serializers.SerializerMethodField()
     service_display = serializers.CharField(source="services.name", read_only=True)
     service_price = serializers.DecimalField(source="services.price", max_digits=12, decimal_places=2, read_only=True)
+    installation_price = serializers.DecimalField(
+        source="services.installation_price", max_digits=12, decimal_places=2, read_only=True
+    )
+    tariff = serializers.PrimaryKeyRelatedField(
+        queryset=TariffConsalting.objects.all(), required=False, allow_null=True
+    )
+    tariff_display = serializers.CharField(source="tariff.name", read_only=True)
+    tariff_price = serializers.DecimalField(
+        source="tariff.price", max_digits=12, decimal_places=2, read_only=True
+    )
+    items = SaleItemConsaltingSerializer(many=True, required=False)
+    total = serializers.DecimalField(max_digits=12, decimal_places=2, read_only=True)
     created_at = serializers.DateTimeField(read_only=True)
     updated_at = serializers.DateTimeField(read_only=True)
 
@@ -150,14 +219,17 @@ class SaleConsaltingSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSeri
         fields = (
             "id", "company", "branch",
             "user", "user_display",
-            "services", "service_display", "service_price",
+            "services", "service_display", "service_price", "installation_price",
+            "tariff", "tariff_display", "tariff_price",
             "client", "client_display",
+            "items", "discount", "markup", "total",
             "description",
             "created_at", "updated_at",
         )
         read_only_fields = (
             "id", "company", "branch", "user", "user_display",
-            "service_display", "service_price",
+            "service_display", "service_price", "installation_price",
+            "tariff_display", "tariff_price", "total",
             "created_at", "updated_at",
         )
 
@@ -186,11 +258,18 @@ class SaleConsaltingSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSeri
             raise serializers.ValidationError("Услуга принадлежит другому филиалу.")
         return value
 
+    def validate_tariff(self, value):
+        company = self._user_company()
+        if value and company and value.company_id != company.id:
+            raise serializers.ValidationError("Тариф принадлежит другой компании.")
+        return value
+
     def validate(self, attrs):
         company = self._user_company()
         target_branch = self._auto_branch()
 
-        services = attrs.get("services") or getattr(self.instance, "services", None)
+        services = attrs.get("services") if "services" in attrs else getattr(self.instance, "services", None)
+        tariff = attrs.get("tariff") if "tariff" in attrs else getattr(self.instance, "tariff", None)
         client = attrs.get("client") or getattr(self.instance, "client", None)
 
         if company:
@@ -201,14 +280,19 @@ class SaleConsaltingSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSeri
             if client and getattr(client, "branch_id", None) not in (None, target_branch.id):
                 raise serializers.ValidationError({"client": "Клиент принадлежит другому филиалу."})
 
+        # тариф должен относиться к выбранной услуге
+        if tariff and services and tariff.service_id != services.id:
+            raise serializers.ValidationError({"tariff": "Тариф относится к другой услуге."})
+
         # user заполним, если хотим фиксировать текущего оператора автоматически
         request = self.context.get("request")
         if request and getattr(request, "user", None):
             attrs.setdefault("user", request.user)
 
-        # прогон через model.clean() на всякий случай
+        # прогон через model.clean() на всякий случай (items — не поле модели)
         try:
-            temp = SaleConsalting(**{**attrs, "company": company, "branch": target_branch})
+            clean_attrs = {k: v for k, v in attrs.items() if k != "items"}
+            temp = SaleConsalting(**{**clean_attrs, "company": company, "branch": target_branch})
             if self.instance:
                 temp.id = self.instance.id
             temp.clean()
@@ -222,6 +306,30 @@ class SaleConsaltingSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSeri
             )
 
         return attrs
+
+    def _sync_items(self, sale, items_data):
+        """Полная замена доп. товаров продажи переданным списком."""
+        if items_data is None:
+            return
+        sale.items.all().delete()
+        SaleItemConsalting.objects.bulk_create([
+            SaleItemConsalting(sale=sale, name=i["name"], price=i["price"])
+            for i in items_data
+        ])
+
+    def create(self, validated_data):
+        items_data = validated_data.pop("items", None)
+        sale = super().create(validated_data)
+        self._sync_items(sale, items_data)
+        sale.recalc_total(save=True)
+        return sale
+
+    def update(self, instance, validated_data):
+        items_data = validated_data.pop("items", None)
+        sale = super().update(instance, validated_data)
+        self._sync_items(sale, items_data)
+        sale.recalc_total(save=True)
+        return sale
 
 
 # ==========================

@@ -41,6 +41,16 @@ def apply_lead_visibility(queryset, user):
     return queryset.filter(Q(owner__isnull=True) | Q(owner=user))
 
 
+def apply_client_visibility(queryset, user):
+    """Видимость клиентов: продавец видит ничьих (salesperson=None) + своих,
+    руководитель — всех (поверх company/branch). Аналогично видимости лидов."""
+    if is_owner_like(user):
+        return queryset
+    if not user or not getattr(user, "is_authenticated", False):
+        return queryset.none()
+    return queryset.filter(Q(salesperson__isnull=True) | Q(salesperson=user))
+
+
 def can_see_lead_owner(viewer, owner_id) -> bool:
     """Может ли viewer видеть карточку с данным owner_id (для WS-фильтра)."""
     if not owner_id:

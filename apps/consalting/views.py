@@ -1,4 +1,4 @@
-from rest_framework import generics, permissions, status
+from rest_framework import generics, permissions, status, filters
 from rest_framework.exceptions import PermissionDenied
 from rest_framework.response import Response
 from rest_framework.views import APIView
@@ -46,8 +46,10 @@ from .funnel.scoring import ScoringService
 from .funnel.analytics import PipelineAnalytics
 from .funnel.events import emit as emit_funnel_event
 from .funnel import realtime
-from .access import is_owner_like, apply_lead_visibility
+from .access import is_owner_like, apply_lead_visibility, apply_client_visibility
 from apps.users.models import Branch
+from apps.main.models import Client
+from apps.main.serializers import ClientSerializer
 
 
 # ===== helpers =====
@@ -264,7 +266,7 @@ class CompanyBranchQuerysetMixin:
 # ServicesConsalting
 # ==========================
 class ServicesConsaltingListCreateView(CompanyBranchQuerysetMixin, generics.ListCreateAPIView):
-    queryset = ServicesConsalting.objects.all()
+    queryset = ServicesConsalting.objects.prefetch_related("tariffs").all()
     serializer_class = ServicesConsaltingSerializer
     filter_backends = [DjangoFilterBackend]
     filterset_fields = [
@@ -274,7 +276,7 @@ class ServicesConsaltingListCreateView(CompanyBranchQuerysetMixin, generics.List
 
 
 class ServicesConsaltingRetrieveUpdateDestroyView(CompanyBranchQuerysetMixin, generics.RetrieveUpdateDestroyAPIView):
-    queryset = ServicesConsalting.objects.all()
+    queryset = ServicesConsalting.objects.prefetch_related("tariffs").all()
     serializer_class = ServicesConsaltingSerializer
 
 
@@ -282,7 +284,9 @@ class ServicesConsaltingRetrieveUpdateDestroyView(CompanyBranchQuerysetMixin, ge
 # SaleConsalting
 # ==========================
 class SaleConsaltingListCreateView(CompanyBranchQuerysetMixin, generics.ListCreateAPIView):
-    queryset = SaleConsalting.objects.select_related("services", "client", "user", "company").all()
+    queryset = SaleConsalting.objects.select_related(
+        "services", "tariff", "client", "user", "company"
+    ).prefetch_related("items").all()
     serializer_class = SaleConsaltingSerializer
     filter_backends = [DjangoFilterBackend]
     filterset_fields = [
@@ -303,7 +307,9 @@ class SaleConsaltingListCreateView(CompanyBranchQuerysetMixin, generics.ListCrea
 
 
 class SaleConsaltingRetrieveUpdateDestroyView(CompanyBranchQuerysetMixin, generics.RetrieveUpdateDestroyAPIView):
-    queryset = SaleConsalting.objects.select_related("services", "client", "user", "company").all()
+    queryset = SaleConsalting.objects.select_related(
+        "services", "tariff", "client", "user", "company"
+    ).prefetch_related("items").all()
     serializer_class = SaleConsaltingSerializer
 
 
@@ -359,6 +365,59 @@ class BookingConsaltingListCreateView(CompanyBranchQuerysetMixin, generics.ListC
 class BookingConsaltingRetrieveUpdateDestroyView(CompanyBranchQuerysetMixin, generics.RetrieveUpdateDestroyAPIView):
     queryset = BookingConsalting.objects.select_related("employee", "company").all()
     serializer_class = BookingConsaltingSerializer
+
+
+# ==========================
+# Клиенты (consalting namespace)
+# ==========================
+class ClientVisibilityMixin:
+    """
+    Видимость клиентов поверх company/branch (как у лидов):
+      * клиент без продавца (salesperson=None) — общий пул, виден всем;
+      * клиент с продавцом — только своему продавцу и руководителям.
+    """
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        if getattr(self, "swagger_fake_view", False):
+            return qs
+        return apply_client_visibility(qs, getattr(self.request, "user", None))
+
+
+class ClientConsaltingListCreateView(ClientVisibilityMixin, CompanyBranchQuerysetMixin, generics.ListCreateAPIView):
+    """
+    Клиенты консалтинга (общая модель main.Client, scope по компании/филиалу).
+    GET/POST /api/consalting/clients/
+    """
+    queryset = Client.objects.select_related("company", "branch", "salesperson", "service").all()
+    serializer_class = ClientSerializer
+    filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
+    filterset_fields = ["status", "type", "date", "salesperson", "service", "branch"]
+    search_fields = ["full_name", "phone", "email", "llc", "inn"]
+    ordering_fields = ["created_at", "updated_at", "date", "full_name"]
+    ordering = ["-created_at"]
+
+    def perform_create(self, serializer):
+        company = self._user_company()
+        if not company:
+            raise PermissionDenied("У пользователя не настроена компания.")
+        kwargs = {"company": company}
+        active_branch = self._active_branch()
+        if active_branch is not None:
+            kwargs["branch"] = active_branch
+        # сотрудник создаёт клиента всегда «на себя» (нельзя завести чужого);
+        # руководитель может оставить пул или назначить продавца через payload.
+        if not is_owner_like(self.request.user):
+            kwargs["salesperson"] = self.request.user
+        serializer.save(**kwargs)
+
+
+class ClientConsaltingRetrieveUpdateDestroyView(ClientVisibilityMixin, CompanyBranchQuerysetMixin, generics.RetrieveUpdateDestroyAPIView):
+    """
+    GET/PATCH/PUT/DELETE /api/consalting/clients/<uuid:pk>/
+    """
+    queryset = Client.objects.select_related("company", "branch", "salesperson", "service").all()
+    serializer_class = ClientSerializer
 
 
 # ==========================

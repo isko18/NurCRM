@@ -5,7 +5,9 @@ from django.utils.translation import gettext_lazy as _
 
 from .models import (
     ServicesConsalting,
+    TariffConsalting,
     SaleConsalting,
+    SaleItemConsalting,
     SalaryConsalting,
     RequestsConsalting,
     BookingConsalting,
@@ -176,13 +178,20 @@ class CompanyBranchScopedAdminMixin:
 
 
 # ========= Services =========
+class TariffInline(admin.TabularInline):
+    model = TariffConsalting
+    extra = 1
+    fields = ("name", "price")
+
+
 @admin.register(ServicesConsalting)
 class ServicesConsaltingAdmin(CompanyBranchScopedAdminMixin, TimeStampedAdminMixin, admin.ModelAdmin):
-    list_display = ("name", "company", "branch", "price", "created_at", "updated_at")
+    list_display = ("name", "company", "branch", "price", "installation_price", "created_at", "updated_at")
     list_filter = ("company", "branch")
     search_fields = ("name", "description")
     raw_id_fields = ("company", "branch")
     ordering = ("name",)
+    inlines = [TariffInline]
 
     def get_readonly_fields(self, request, obj=None):
         ro = list(self.readonly_fields)
@@ -190,15 +199,43 @@ class ServicesConsaltingAdmin(CompanyBranchScopedAdminMixin, TimeStampedAdminMix
             ro.extend(["company", "branch"])
         return ro
 
+    def save_formset(self, request, form, formset, change):
+        """Проставляем company/branch тарифам из родительской услуги."""
+        if formset.model is TariffConsalting:
+            instances = formset.save(commit=False)
+            service = form.instance
+            for obj in instances:
+                obj.company_id = service.company_id
+                obj.branch_id = service.branch_id
+                obj.save()
+            for obj in formset.deleted_objects:
+                obj.delete()
+            formset.save_m2m()
+        else:
+            super().save_formset(request, form, formset, change)
+
 
 # ========= Sales =========
+class SaleItemInline(admin.TabularInline):
+    model = SaleItemConsalting
+    extra = 1
+    fields = ("name", "price")
+
+
 @admin.register(SaleConsalting)
 class SaleConsaltingAdmin(CompanyBranchScopedAdminMixin, TimeStampedAdminMixin, admin.ModelAdmin):
-    list_display = ("services", "company", "branch", "user", "client", "short_description", "created_at")
+    list_display = ("services", "tariff", "company", "branch", "user", "client",
+                    "discount", "markup", "total", "short_description", "created_at")
     list_filter = ("company", "branch", "services")
     search_fields = ("description",)
-    raw_id_fields = ("company", "branch", "services", "client", "user")
+    raw_id_fields = ("company", "branch", "services", "tariff", "client", "user")
     ordering = ("-created_at",)
+    inlines = [SaleItemInline]
+
+    def save_related(self, request, form, formsets, change):
+        super().save_related(request, form, formsets, change)
+        # пересчёт итога после сохранения доп. товаров
+        form.instance.recalc_total(save=True)
 
     def short_description(self, obj):
         text = obj.description or ""
@@ -206,7 +243,7 @@ class SaleConsaltingAdmin(CompanyBranchScopedAdminMixin, TimeStampedAdminMixin, 
     short_description.short_description = _("Заметка")
 
     def get_readonly_fields(self, request, obj=None):
-        ro = list(self.readonly_fields)
+        ro = list(self.readonly_fields) + ["total"]
         if not request.user.is_superuser:
             ro.extend(["company", "branch", "user"])
         return ro

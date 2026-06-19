@@ -10,6 +10,8 @@ from .views import (
     RequestsConsaltingRetrieveUpdateDestroyView,
     BookingConsaltingListCreateView,
     BookingConsaltingRetrieveUpdateDestroyView,
+    ClientConsaltingListCreateView,
+    ClientConsaltingRetrieveUpdateDestroyView,
     FunnelConsaltingListCreateView,
     FunnelConsaltingRetrieveUpdateDestroyView,
     FunnelBoardView,
@@ -49,6 +51,10 @@ urlpatterns = [
 
     path('bookings/', BookingConsaltingListCreateView.as_view(), name='bookings-list-create'),
     path('bookings/<uuid:pk>/', BookingConsaltingRetrieveUpdateDestroyView.as_view(), name='bookings-detail'),
+
+    # ===== Клиенты =====
+    path('clients/', ClientConsaltingListCreateView.as_view(), name='clients-list-create'),
+    path('clients/<uuid:pk>/', ClientConsaltingRetrieveUpdateDestroyView.as_view(), name='clients-rud'),
 
     # ===== Воронка продаж =====
     path('funnels/', FunnelConsaltingListCreateView.as_view(), name='funnels-list-create'),
