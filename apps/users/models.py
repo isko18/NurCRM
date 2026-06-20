@@ -420,6 +420,7 @@ class User(AbstractBaseUser, PermissionsMixin):
     # Consulting: воронка продаж
     can_view_funnel = models.BooleanField(default=False, blank=True, null=True, verbose_name="Консалтинг: страница воронки")
     can_manage_funnel_leads = models.BooleanField(default=False, blank=True, null=True, verbose_name="Консалтинг: управление лидами своей роли")
+    can_manage_funnel_stages = models.BooleanField(default=False, blank=True, null=True, verbose_name="Консалтинг: управление стадиями своей роли")
 
     # Building permissions (CRM) — ключи для profile, меню Building и роутинга
     can_view_building_analytics = models.BooleanField(default=False, blank=True, null=True, verbose_name="Building: Аналитика")

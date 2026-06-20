@@ -48,6 +48,7 @@ def serialize_lead(lead) -> dict:
         "stage": str(lead.stage_id) if lead.stage_id else None,
         "owner": str(lead.owner_id) if lead.owner_id else None,
         "owner_display": owner_display,
+        "source_lead": str(lead.source_lead_id) if lead.source_lead_id else None,
         "title": lead.title,
         "status": lead.status,
         "score_grade": lead.score_grade,

@@ -587,6 +587,9 @@ class LeadConsaltingSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSeri
     loss_reason = serializers.PrimaryKeyRelatedField(
         queryset=LossReasonConsalting.objects.all(), required=False, allow_null=True
     )
+    source_lead = serializers.PrimaryKeyRelatedField(
+        queryset=LeadConsalting.objects.all(), required=False, allow_null=True
+    )
 
     funnel_name = serializers.CharField(source="funnel.name", read_only=True)
     stage_name = serializers.CharField(source="stage.name", read_only=True)
@@ -621,6 +624,8 @@ class LeadConsaltingSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSeri
             # lifecycle
             "first_contact_at", "won_at", "lost_at", "completed_at",
             "closed_at", "created_at", "updated_at",
+            # передача между воронками
+            "source_lead",
         )
         read_only_fields = (
             "id", "company", "branch",

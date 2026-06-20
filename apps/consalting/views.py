@@ -49,7 +49,7 @@ from .funnel import realtime
 from .funnel.provisioning import provision_funnel_for_role
 from .access import (
     is_owner_like, apply_lead_visibility, apply_client_visibility,
-    visible_funnels_qs, can_view_funnel, can_manage_leads,
+    visible_funnels_qs, can_view_funnel, can_manage_leads, can_manage_stages,
 )
 from apps.users.models import Branch, CustomRole
 from apps.main.models import Client
@@ -440,6 +440,29 @@ class FunnelConsaltingListCreateView(CompanyBranchQuerysetMixin, generics.ListCr
         # видимость: owner/admin — все; сотрудник — роль + main/grants
         return visible_funnels_qs(qs, self.request.user)
 
+    def create(self, request, *args, **kwargs):
+        # Fallback фронта: POST /funnels/ с custom_role должен быть идемпотентным —
+        # воронка роли уже могла быть создана сигналом при создании роли.
+        role_id = request.data.get("custom_role")
+        if role_id:
+            if not is_owner_like(request.user):
+                raise PermissionDenied("Создавать воронки может только владелец или администратор.")
+            company = self._user_company()
+            if not company:
+                raise PermissionDenied("У пользователя не настроена компания.")
+            try:
+                role = CustomRole.objects.get(id=role_id)
+            except (CustomRole.DoesNotExist, ValueError, TypeError):
+                return Response({"custom_role": "Роль не найдена."}, status=status.HTTP_400_BAD_REQUEST)
+            if role.company_id not in (None, company.id):
+                return Response({"custom_role": "Роль не из вашей компании."}, status=status.HTTP_400_BAD_REQUEST)
+
+            funnel, created = provision_funnel_for_role(role, name=request.data.get("name"))
+            data = self.get_serializer(funnel).data
+            return Response(data, status=status.HTTP_201_CREATED if created else status.HTTP_200_OK)
+
+        return super().create(request, *args, **kwargs)
+
     def perform_create(self, serializer):
         # пользовательские воронки создаёт только owner/admin (раздел 1.5)
         if not is_owner_like(self.request.user):
@@ -466,6 +489,28 @@ class FunnelConsaltingRetrieveUpdateDestroyView(CompanyBranchQuerysetMixin, gene
         instance.delete()
 
 
+def _serialize_board(funnel, request, context):
+    """Собирает payload доски воронки (идентичен для одиночного и bulk-эндпоинтов)."""
+    leads_qs = LeadConsalting.objects.filter(funnel=funnel).select_related("stage", "owner", "client")
+    # видимость: сотрудник видит общий пул + свои лиды, руководитель — все
+    leads = list(apply_lead_visibility(leads_qs, request.user))
+
+    columns = []
+    for stage in funnel.stages.all():
+        stage_leads = [l for l in leads if l.stage_id == stage.id]
+        columns.append({
+            "stage": FunnelStageConsaltingSerializer(stage, context=context).data,
+            "leads": LeadConsaltingSerializer(stage_leads, many=True, context=context).data,
+        })
+
+    no_stage = [l for l in leads if l.stage_id is None]
+    return {
+        "funnel": FunnelConsaltingSerializer(funnel, context=context).data,
+        "columns": columns,
+        "unassigned": LeadConsaltingSerializer(no_stage, many=True, context=context).data,
+    }
+
+
 class FunnelBoardView(CompanyBranchQuerysetMixin, generics.GenericAPIView):
     """
     Канбан-доска воронки: стадии со списком лидов в каждой.
@@ -478,26 +523,25 @@ class FunnelBoardView(CompanyBranchQuerysetMixin, generics.GenericAPIView):
         funnel = self.get_object()
         if not can_view_funnel(request.user, funnel):
             raise PermissionDenied("Нет доступа к этой воронке.")
-        leads_qs = LeadConsalting.objects.filter(funnel=funnel).select_related("stage", "owner", "client")
-        # видимость: сотрудник видит общий пул + свои лиды, руководитель — все
-        leads_qs = apply_lead_visibility(leads_qs, request.user)
+        return Response(_serialize_board(funnel, request, self.get_serializer_context()))
 
-        columns = []
-        for stage in funnel.stages.all():
-            stage_leads = [l for l in leads_qs if l.stage_id == stage.id]
-            columns.append({
-                "stage": FunnelStageConsaltingSerializer(stage, context=self.get_serializer_context()).data,
-                "leads": LeadConsaltingSerializer(stage_leads, many=True, context=self.get_serializer_context()).data,
-            })
 
-        # лиды без стадии
-        no_stage = [l for l in leads_qs if l.stage_id is None]
+class FunnelBoardsView(CompanyBranchQuerysetMixin, generics.GenericAPIView):
+    """
+    Доски всех доступных пользователю воронок одним запросом.
+    GET /api/consalting/funnels/boards/
+    """
+    queryset = FunnelConsalting.objects.prefetch_related("stages").all()
+    serializer_class = FunnelConsaltingSerializer
 
-        return Response({
-            "funnel": FunnelConsaltingSerializer(funnel, context=self.get_serializer_context()).data,
-            "columns": columns,
-            "unassigned": LeadConsaltingSerializer(no_stage, many=True, context=self.get_serializer_context()).data,
-        })
+    def get(self, request, *args, **kwargs):
+        funnels = visible_funnels_qs(self.get_queryset(), request.user).filter(is_active=True)
+        context = self.get_serializer_context()
+        boards = {
+            str(funnel.id): _serialize_board(funnel, request, context)
+            for funnel in funnels
+        }
+        return Response({"boards": boards})
 
 
 class FunnelForRoleView(CompanyBranchQuerysetMixin, generics.GenericAPIView):
@@ -540,14 +584,29 @@ class FunnelStageConsaltingListCreateView(CompanyBranchQuerysetMixin, generics.L
     filter_backends = [DjangoFilterBackend]
     filterset_fields = ["funnel", "is_final", "is_success", "branch"]
 
+    def create(self, request, *args, **kwargs):
+        # Fallback фронта: создание системной стадии идемпотентно —
+        # системные стадии уже могли быть созданы provisioning'ом воронки роли.
+        system_key = request.data.get("system_key")
+        funnel_id = request.data.get("funnel")
+        if system_key and funnel_id:
+            existing = FunnelStageConsalting.objects.filter(
+                funnel_id=funnel_id, system_key=system_key
+            ).first()
+            if existing:
+                data = self.get_serializer(existing).data
+                return Response(data, status=status.HTTP_200_OK)
+        return super().create(request, *args, **kwargs)
+
     # company/branch проставляются из воронки в сериализаторе
     def perform_create(self, serializer):
         company = self._user_company()
         if not company:
             raise PermissionDenied("У пользователя не настроена компания.")
-        # дополнительные (несистемные) стадии добавляет только owner/admin (раздел 1.2)
-        if not is_owner_like(self.request.user):
-            raise PermissionDenied("Добавлять стадии может только владелец или администратор.")
+        # несистемные стадии добавляет тот, у кого manage_stages на воронке (раздел 1.5)
+        funnel = serializer.validated_data.get("funnel")
+        if funnel and not can_manage_stages(self.request.user, funnel):
+            raise PermissionDenied("Нет прав управлять стадиями этой воронки.")
         serializer.save()
 
 
@@ -561,15 +620,15 @@ class FunnelStageConsaltingRetrieveUpdateDestroyView(CompanyBranchQuerysetMixin,
             raise PermissionDenied("У пользователя не настроена компания.")
         if serializer.instance.is_system:
             raise PermissionDenied("Системную стадию нельзя изменить или удалить.")
-        if not is_owner_like(self.request.user):
-            raise PermissionDenied("Изменять стадии может только владелец или администратор.")
+        if not can_manage_stages(self.request.user, serializer.instance.funnel):
+            raise PermissionDenied("Нет прав управлять стадиями этой воронки.")
         serializer.save()
 
     def perform_destroy(self, instance):
         if instance.is_system:
             raise PermissionDenied("Системную стадию нельзя изменить или удалить.")
-        if not is_owner_like(self.request.user):
-            raise PermissionDenied("Удалять стадии может только владелец или администратор.")
+        if not can_manage_stages(self.request.user, instance.funnel):
+            raise PermissionDenied("Нет прав управлять стадиями этой воронки.")
         instance.delete()
 
 
@@ -597,6 +656,9 @@ class LeadConsaltingListCreateView(LeadVisibilityMixin, CompanyBranchQuerysetMix
     filterset_fields = ["funnel", "stage", "owner", "client", "status", "branch"]
 
     def perform_create(self, serializer):
+        funnel = serializer.validated_data.get("funnel")
+        if funnel and not can_manage_leads(self.request.user, funnel):
+            raise PermissionDenied("Нет прав создавать лиды в этой воронке.")
         super().perform_create(serializer)
         realtime.lead_created(serializer.instance)
 
@@ -606,6 +668,8 @@ class LeadConsaltingRetrieveUpdateDestroyView(LeadVisibilityMixin, CompanyBranch
     serializer_class = LeadConsaltingSerializer
 
     def perform_update(self, serializer):
+        if not can_manage_leads(self.request.user, serializer.instance.funnel):
+            raise PermissionDenied("Нет прав изменять лиды в этой воронке.")
         prev_owner_id = serializer.instance.owner_id
         super().perform_update(serializer)
         lead = serializer.instance
@@ -639,6 +703,8 @@ class LeadMoveStageView(LeadVisibilityMixin, CompanyBranchQuerysetMixin, generic
 
     def post(self, request, *args, **kwargs):
         lead = self.get_object()
+        if not can_manage_leads(request.user, lead.funnel):
+            raise PermissionDenied("Нет прав двигать лиды в этой воронке.")
         ser = self.get_serializer(data=request.data)
         ser.is_valid(raise_exception=True)
         stage = ser.validated_data["stage"]
@@ -673,6 +739,8 @@ class LeadClaimView(LeadVisibilityMixin, CompanyBranchQuerysetMixin, generics.Ge
 
     def post(self, request, *args, **kwargs):
         lead = self.get_object()
+        if not can_manage_leads(request.user, lead.funnel):
+            raise PermissionDenied("Нет прав брать лиды в этой воронке.")
         if lead.owner_id and lead.owner_id != request.user.id and not is_owner_like(request.user):
             return Response(
                 {"detail": "Лид уже взят другим сотрудником."},
@@ -735,6 +803,103 @@ class LeadAssignView(CompanyBranchQuerysetMixin, generics.GenericAPIView):
             # персональное уведомление назначенному сотруднику
             realtime.notify_user(owner.id, "lead.assigned", realtime.serialize_lead(lead))
         return Response(LeadConsaltingSerializer(lead, context=self.get_serializer_context()).data)
+
+
+class LeadTransferView(LeadVisibilityMixin, CompanyBranchQuerysetMixin, generics.GenericAPIView):
+    """
+    Передать лид в другую воронку: создаёт НОВЫЙ лид в целевой воронке,
+    копируя ключевые поля; исходный лид остаётся без изменений.
+    POST /api/consalting/leads/<uuid:pk>/transfer/
+        { "target_funnel": "<uuid>", "target_stage": "<uuid|null>" }
+    """
+    queryset = LeadConsalting.objects.select_related("funnel", "stage").all()
+    serializer_class = LeadConsaltingSerializer
+
+    _COPY_FIELDS = (
+        "title", "full_name", "phone", "email", "source", "description",
+        "estimated_value", "probability", "urgency",
+    )
+
+    def post(self, request, *args, **kwargs):
+        company = self._user_company()
+        lead = self.get_object()
+
+        # права на исходную воронку
+        if not can_manage_leads(request.user, lead.funnel):
+            raise PermissionDenied("Нет прав управлять лидами в исходной воронке.")
+
+        target_funnel_id = request.data.get("target_funnel")
+        if not target_funnel_id:
+            return Response({"target_funnel": "Обязательное поле."}, status=status.HTTP_400_BAD_REQUEST)
+        try:
+            target_funnel = FunnelConsalting.objects.get(id=target_funnel_id, company=company)
+        except (FunnelConsalting.DoesNotExist, ValueError, TypeError):
+            return Response({"target_funnel": "Воронка не найдена."}, status=status.HTTP_404_NOT_FOUND)
+
+        if target_funnel.id == lead.funnel_id:
+            return Response({"target_funnel": "Нельзя передать в ту же воронку."},
+                            status=status.HTTP_400_BAD_REQUEST)
+
+        # права на целевую воронку
+        if not can_manage_leads(request.user, target_funnel):
+            raise PermissionDenied("Нет прав управлять лидами в целевой воронке.")
+
+        # целевая стадия: переданная (должна быть из target_funnel) или intake
+        target_stage = None
+        target_stage_id = request.data.get("target_stage")
+        if target_stage_id:
+            try:
+                target_stage = FunnelStageConsalting.objects.get(id=target_stage_id)
+            except (FunnelStageConsalting.DoesNotExist, ValueError, TypeError):
+                return Response({"target_stage": "Стадия не найдена."}, status=status.HTTP_400_BAD_REQUEST)
+            if target_stage.funnel_id != target_funnel.id:
+                return Response({"target_stage": "Стадия относится к другой воронке."},
+                                status=status.HTTP_400_BAD_REQUEST)
+        else:
+            target_stage = (
+                FunnelStageConsalting.objects.filter(
+                    funnel=target_funnel, system_key="intake"
+                ).first()
+                or FunnelStageConsalting.objects.filter(funnel=target_funnel).order_by("order").first()
+            )
+
+        # создаём новый лид в целевой воронке
+        data = {f: getattr(lead, f) for f in self._COPY_FIELDS}
+        new_lead = LeadConsalting.objects.create(
+            company=target_funnel.company,
+            branch=target_funnel.branch,
+            funnel=target_funnel,
+            stage=target_stage,
+            owner=None,
+            status=LeadConsalting.Status.NEW,
+            source_lead=lead,
+            stage_entered_at=timezone.now(),
+            **data,
+        )
+
+        # аудит на исходном лиде (best-effort)
+        try:
+            ActivityLogger.log(
+                lead, LeadActivityConsalting.Type.SYSTEM, actor=request.user,
+                title=f"Лид передан в воронку «{target_funnel.name}»",
+                payload={
+                    "type": "lead_transferred",
+                    "from_funnel": str(lead.funnel_id),
+                    "to_funnel": str(target_funnel.id),
+                    "source_lead_id": str(lead.id),
+                    "new_lead_id": str(new_lead.id),
+                    "actor_id": str(request.user.id),
+                },
+                touch_last_activity=False,
+            )
+        except Exception:
+            pass
+
+        realtime.lead_created(new_lead)
+        return Response(
+            LeadConsaltingSerializer(new_lead, context=self.get_serializer_context()).data,
+            status=status.HTTP_201_CREATED,
+        )
 
 
 class LeadAllowedTransitionsView(CompanyBranchQuerysetMixin, generics.GenericAPIView):

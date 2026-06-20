@@ -806,6 +806,13 @@ class LeadConsalting(TimeStampedModel):
     )
     loss_comment = models.TextField(blank=True, verbose_name='Комментарий к проигрышу')
 
+    # ----- Передача лида между воронками -----
+    source_lead = models.ForeignKey(
+        'self', on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='derived_leads', related_query_name='derived_lead',
+        verbose_name='Лид-источник (откуда передан)'
+    )
+
     # ----- Lifecycle -----
     first_contact_at = models.DateTimeField(null=True, blank=True, verbose_name='Первый контакт')
     won_at = models.DateTimeField(null=True, blank=True, verbose_name='Дата выигрыша')
@@ -1144,6 +1151,9 @@ class EmployeeFunnelGrant(TimeStampedModel):
     )
     can_manage_leads = models.BooleanField(
         default=False, verbose_name='Может управлять лидами в этой воронке'
+    )
+    can_manage_stages = models.BooleanField(
+        default=False, verbose_name='Может управлять стадиями в этой воронке'
     )
 
     class Meta:

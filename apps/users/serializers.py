@@ -210,6 +210,20 @@ class UserSerializer(serializers.ModelSerializer):
 
     branch_ids = serializers.SerializerMethodField()
     primary_branch_id = serializers.SerializerMethodField()
+    funnel_grants = serializers.SerializerMethodField()
+
+    def get_funnel_grants(self, obj):
+        try:
+            return [
+                {
+                    "funnel_id": str(g.funnel_id),
+                    "can_manage_leads": g.can_manage_leads,
+                    "can_manage_stages": g.can_manage_stages,
+                }
+                for g in obj.funnel_grants.all()
+            ]
+        except Exception:
+            return []
 
     def _memberships_once(self, obj):
         cache = self.context.setdefault("_branch_memberships_cache", {})
@@ -272,6 +286,9 @@ class UserSerializer(serializers.ModelSerializer):
             "can_view_cashier", "can_view_document", "can_view_market_scales", "can_view_market_label",
             "can_view_market_discount", "can_view_market_edit_price", "can_view_market_delete_cart_item",
             "can_view_market_procurement", "can_view_market_supplier", "can_view_market_employee_return",
+
+            # Consulting: воронка продаж
+            "can_view_funnel", "can_manage_funnel_leads", "can_manage_funnel_stages", "funnel_grants",
 
             "branch_ids", "primary_branch_id",
             "created_at", "updated_at",
@@ -577,6 +594,13 @@ class EmployeeCreateSerializer(serializers.ModelSerializer):
 # Employee update
 # ======================
 
+class FunnelGrantSerializer(serializers.Serializer):
+    """Доступ сотрудника к воронке consalting: {funnel_id, can_manage_leads, can_manage_stages}."""
+    funnel_id = serializers.UUIDField()
+    can_manage_leads = serializers.BooleanField(required=False, default=False)
+    can_manage_stages = serializers.BooleanField(required=False, default=False)
+
+
 class EmployeeUpdateSerializer(serializers.ModelSerializer):
     role_display = serializers.CharField(read_only=True)
     branch_ids = serializers.ListField(
@@ -585,6 +609,10 @@ class EmployeeUpdateSerializer(serializers.ModelSerializer):
         write_only=True,
         help_text="Полный новый список филиалов сотрудника. Если не указано — без изменений.",
     )
+    funnel_grants = FunnelGrantSerializer(
+        many=True, required=False,
+        help_text="Полный новый список доступов к воронкам consalting. Если не указано — без изменений.",
+    )
 
     class Meta:
         model = User
@@ -592,6 +620,9 @@ class EmployeeUpdateSerializer(serializers.ModelSerializer):
             "id", "first_name", "last_name", "track_number", "phone_number", "avatar",
             "role", "custom_role", "role_display",
             *[f.name for f in User._meta.fields if f.name.startswith("can_view_")],
+            "can_manage_funnel_leads",
+            "can_manage_funnel_stages",
+            "funnel_grants",
             "branch_ids",
         ]
         read_only_fields = ["id"]
@@ -621,6 +652,7 @@ class EmployeeUpdateSerializer(serializers.ModelSerializer):
     @transaction.atomic
     def update(self, instance, validated_data):
         branch_ids = validated_data.pop("branch_ids", None)
+        funnel_grants = validated_data.pop("funnel_grants", None)
 
         for attr, value in validated_data.items():
             setattr(instance, attr, value)
@@ -630,7 +662,33 @@ class EmployeeUpdateSerializer(serializers.ModelSerializer):
             branches = _validate_branch_ids_for_company(branch_ids, instance.company)
             _sync_user_branches(instance, branches)
 
+        if funnel_grants is not None:
+            self._sync_funnel_grants(instance, funnel_grants)
+
         return instance
+
+    def _sync_funnel_grants(self, instance, grants):
+        """Полная замена доступов сотрудника к воронкам (только воронки своей компании)."""
+        from apps.consalting.models import EmployeeFunnelGrant, FunnelConsalting
+
+        company = instance.company
+        valid_funnel_ids = set(
+            FunnelConsalting.objects.filter(
+                company=company,
+                id__in=[g["funnel_id"] for g in grants],
+            ).values_list("id", flat=True)
+        )
+        EmployeeFunnelGrant.objects.filter(employee=instance).delete()
+        EmployeeFunnelGrant.objects.bulk_create([
+            EmployeeFunnelGrant(
+                employee=instance,
+                funnel_id=g["funnel_id"],
+                can_manage_leads=bool(g.get("can_manage_leads", False)),
+                can_manage_stages=bool(g.get("can_manage_stages", False)),
+            )
+            for g in grants
+            if g["funnel_id"] in valid_funnel_ids
+        ])
 
 
 # ======================

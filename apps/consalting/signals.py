@@ -14,7 +14,7 @@ from apps.users.models import CustomRole
 from .funnel.events import funnel_event
 from .funnel.automation.engine import AutomationEngine
 from .funnel import realtime
-from .funnel.provisioning import provision_funnel_for_role
+from .funnel.provisioning import provision_funnel_for_role, provision_main_funnel
 
 logger = logging.getLogger(__name__)
 
@@ -45,8 +45,10 @@ def on_custom_role_created(sender, instance, created, **kwargs):
 
     def _provision():
         try:
+            # гарантируем основную воронку компании + воронку роли
+            provision_main_funnel(company)
             provision_funnel_for_role(instance)
         except Exception as e:  # provisioning не должен ломать создание роли
-            logger.exception("provision_funnel_for_role failed for role %s: %s", instance.id, e)
+            logger.exception("provision funnels failed for role %s: %s", instance.id, e)
 
     transaction.on_commit(_provision)

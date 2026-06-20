@@ -76,6 +76,24 @@ def can_manage_leads(user, funnel) -> bool:
     ).exists()
 
 
+def can_manage_stages(user, funnel) -> bool:
+    if is_owner_like(user):
+        return True
+    if not user or not getattr(user, "is_authenticated", False):
+        return False
+    custom_role_id = getattr(user, "custom_role_id", None)
+    if (
+        getattr(user, "can_manage_funnel_stages", False)
+        and custom_role_id
+        and funnel.custom_role_id == custom_role_id
+    ):
+        return True
+    from .models import EmployeeFunnelGrant
+    return EmployeeFunnelGrant.objects.filter(
+        employee=user, funnel=funnel, can_manage_stages=True
+    ).exists()
+
+
 def is_owner_like(user) -> bool:
     """Руководитель компании: видит все лиды независимо от владельца."""
     if not user or not getattr(user, "is_authenticated", False):

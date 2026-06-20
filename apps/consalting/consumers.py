@@ -46,6 +46,8 @@ class ConsaltingFunnelConsumer(AsyncWebsocketConsumer):
         self.company_id = str(company.id)
         self.branch_id = str(branch.id) if branch else None
         self.is_manager = await self._is_owner_like(user)
+        # множество воронок, видимых сотруднику (для фильтра событий доски)
+        self.visible_funnel_ids = await self._visible_funnel_ids(user)
 
         self.company_group = f"consalting_company_{self.company_id}"
         self.user_group = f"consalting_user_{self.user_id}"
@@ -93,6 +95,11 @@ class ConsaltingFunnelConsumer(AsyncWebsocketConsumer):
         ev = event.get("event")
         payload = event.get("payload") or {}
         owner = payload.get("owner")
+        funnel = payload.get("funnel")
+
+        # фильтр по видимости воронки (раздел 1.6): руководитель видит всё
+        if not self.is_manager and funnel and funnel not in self.visible_funnel_ids:
+            return
 
         if owner and not self.is_manager and owner != self.user_id:
             await self.send(json.dumps({
@@ -118,3 +125,12 @@ class ConsaltingFunnelConsumer(AsyncWebsocketConsumer):
     @database_sync_to_async
     def _is_owner_like(self, user):
         return is_owner_like(user)
+
+    @database_sync_to_async
+    def _visible_funnel_ids(self, user):
+        from .access import visible_funnels_qs
+        from .models import FunnelConsalting
+        if is_owner_like(user):
+            return set()  # руководитель видит всё — фильтр не применяется
+        qs = visible_funnels_qs(FunnelConsalting.objects.all(), user)
+        return {str(fid) for fid in qs.values_list("id", flat=True)}
