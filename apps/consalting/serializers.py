@@ -125,7 +125,7 @@ class TariffConsaltingSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = TariffConsalting
-        fields = ("id", "name", "price")
+        fields = ("id", "name", "price", "subscription_amount", "subscription_period")
 
 
 # ==========================
@@ -160,6 +160,8 @@ class ServicesConsaltingSerializer(CompanyBranchReadOnlyMixin, serializers.Model
                 service=service,
                 name=t["name"],
                 price=t["price"],
+                subscription_amount=t.get("subscription_amount") or 0,
+                subscription_period=t.get("subscription_period") or "",
             )
             for t in tariffs_data
         ])
@@ -590,6 +592,16 @@ class LeadConsaltingSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSeri
     source_lead = serializers.PrimaryKeyRelatedField(
         queryset=LeadConsalting.objects.all(), required=False, allow_null=True
     )
+    service = serializers.PrimaryKeyRelatedField(
+        queryset=ServicesConsalting.objects.all(), required=False, allow_null=True
+    )
+    tariff = serializers.PrimaryKeyRelatedField(
+        queryset=TariffConsalting.objects.all(), required=False, allow_null=True
+    )
+    participant_ids = serializers.PrimaryKeyRelatedField(
+        queryset=User.objects.all(), many=True, required=False, write_only=True, source="participants"
+    )
+    participants = serializers.SerializerMethodField(read_only=True)
 
     funnel_name = serializers.CharField(source="funnel.name", read_only=True)
     stage_name = serializers.CharField(source="stage.name", read_only=True)
@@ -626,6 +638,10 @@ class LeadConsaltingSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSeri
             "closed_at", "created_at", "updated_at",
             # передача между воронками
             "source_lead",
+            # услуга/тариф/участники
+            "service", "tariff", "participants", "participant_ids",
+            # архив / оплата
+            "is_archived", "archived_at", "payment_registered", "payment_mode",
         )
         read_only_fields = (
             "id", "company", "branch",
@@ -635,7 +651,16 @@ class LeadConsaltingSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSeri
             "is_at_risk", "risk_reason", "last_activity_at", "stage_entered_at",
             "won_at", "lost_at", "completed_at", "first_contact_at",
             "created_at", "updated_at",
+            "participants", "is_archived", "archived_at",
+            "payment_registered", "payment_mode",
         )
+
+    def get_participants(self, obj):
+        result = []
+        for u in obj.participants.all():
+            name = f"{u.first_name or ''} {u.last_name or ''}".strip() or u.email
+            result.append({"id": str(u.id), "display": name})
+        return result
 
     def get_owner_display(self, obj):
         if obj.owner and (obj.owner.first_name or obj.owner.last_name):
@@ -696,7 +721,9 @@ class LeadConsaltingSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSeri
         # назначит ответственного. Поэтому owner здесь НЕ проставляем автоматически.
 
         try:
-            temp = LeadConsalting(**{**attrs, "company": company, "branch": target_branch})
+            # participants — M2M, нельзя в конструктор модели
+            scalar_attrs = {k: v for k, v in attrs.items() if k != "participants"}
+            temp = LeadConsalting(**{**scalar_attrs, "company": company, "branch": target_branch})
             if self.instance:
                 temp.id = self.instance.id
             temp.clean()

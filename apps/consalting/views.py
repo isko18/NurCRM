@@ -47,11 +47,12 @@ from .funnel.analytics import PipelineAnalytics
 from .funnel.events import emit as emit_funnel_event
 from .funnel import realtime
 from .funnel.provisioning import provision_funnel_for_role
+from .funnel.completion import apply_completion_side_effects
 from .access import (
     is_owner_like, apply_lead_visibility, apply_client_visibility,
     visible_funnels_qs, can_view_funnel, can_manage_leads, can_manage_stages,
 )
-from apps.users.models import Branch, CustomRole
+from apps.users.models import Branch, CustomRole, User
 from apps.main.models import Client
 from apps.main.serializers import ClientSerializer
 
@@ -491,7 +492,10 @@ class FunnelConsaltingRetrieveUpdateDestroyView(CompanyBranchQuerysetMixin, gene
 
 def _serialize_board(funnel, request, context):
     """Собирает payload доски воронки (идентичен для одиночного и bulk-эндпоинтов)."""
-    leads_qs = LeadConsalting.objects.filter(funnel=funnel).select_related("stage", "owner", "client")
+    leads_qs = (
+        LeadConsalting.objects.filter(funnel=funnel, is_archived=False)
+        .select_related("stage", "owner", "client")
+    )
     # видимость: сотрудник видит общий пул + свои лиды, руководитель — все
     leads = list(apply_lead_visibility(leads_qs, request.user))
 
@@ -653,7 +657,8 @@ class LeadConsaltingListCreateView(LeadVisibilityMixin, CompanyBranchQuerysetMix
     queryset = LeadConsalting.objects.select_related("funnel", "stage", "owner", "client", "company").all()
     serializer_class = LeadConsaltingSerializer
     filter_backends = [DjangoFilterBackend]
-    filterset_fields = ["funnel", "stage", "owner", "client", "status", "branch"]
+    filterset_fields = ["funnel", "stage", "owner", "client", "status", "branch",
+                        "is_archived", "service", "tariff"]
 
     def perform_create(self, serializer):
         funnel = serializer.validated_data.get("funnel")
@@ -668,9 +673,14 @@ class LeadConsaltingRetrieveUpdateDestroyView(LeadVisibilityMixin, CompanyBranch
     serializer_class = LeadConsaltingSerializer
 
     def perform_update(self, serializer):
-        if not can_manage_leads(self.request.user, serializer.instance.funnel):
+        lead = serializer.instance
+        if not can_manage_leads(self.request.user, lead.funnel):
             raise PermissionDenied("Нет прав изменять лиды в этой воронке.")
-        prev_owner_id = serializer.instance.owner_id
+        # завершённый лид редактирует только owner/admin
+        if (lead.stage and lead.stage.system_key == "completed"
+                and not is_owner_like(self.request.user)):
+            raise PermissionDenied("Завершённый лид может изменять только владелец или администратор.")
+        prev_owner_id = lead.owner_id
         super().perform_update(serializer)
         lead = serializer.instance
         # смена владельца через обычный PATCH трактуем как взятие/возврат
@@ -705,6 +715,10 @@ class LeadMoveStageView(LeadVisibilityMixin, CompanyBranchQuerysetMixin, generic
         lead = self.get_object()
         if not can_manage_leads(request.user, lead.funnel):
             raise PermissionDenied("Нет прав двигать лиды в этой воронке.")
+        # завершённый лид двигает только owner/admin
+        if (lead.stage and lead.stage.system_key == "completed"
+                and not is_owner_like(request.user)):
+            raise PermissionDenied("Завершённый лид может перемещать только владелец или администратор.")
         ser = self.get_serializer(data=request.data)
         ser.is_valid(raise_exception=True)
         stage = ser.validated_data["stage"]
@@ -721,6 +735,9 @@ class LeadMoveStageView(LeadVisibilityMixin, CompanyBranchQuerysetMixin, generic
                 {"detail": "Переход запрещён", "errors": e.errors},
                 status=status.HTTP_400_BAD_REQUEST,
             )
+        # сайд-эффекты завершения: продажа-аналитика + абонентка (зарплата — отдельно)
+        if stage.system_key == "completed":
+            apply_completion_side_effects(lead, actor=request.user)
         return Response(
             LeadConsaltingSerializer(lead, context=self.get_serializer_context()).data
         )
@@ -898,6 +915,222 @@ class LeadTransferView(LeadVisibilityMixin, CompanyBranchQuerysetMixin, generics
         realtime.lead_created(new_lead)
         return Response(
             LeadConsaltingSerializer(new_lead, context=self.get_serializer_context()).data,
+            status=status.HTTP_201_CREATED,
+        )
+
+
+class FunnelEmployeesView(CompanyBranchQuerysetMixin, generics.GenericAPIView):
+    """
+    Сотрудники, которым доступна воронка (для выбора участников лида).
+    GET /api/consalting/funnels/<uuid:pk>/employees/
+    """
+    queryset = FunnelConsalting.objects.all()
+    serializer_class = FunnelConsaltingSerializer
+
+    def get(self, request, *args, **kwargs):
+        funnel = self.get_object()
+        company = self._user_company()
+        users = User.objects.filter(company=company, is_active=True, deleted_at__isnull=True)
+        data = []
+        for u in users:
+            if can_view_funnel(u, funnel):
+                name = f"{u.first_name or ''} {u.last_name or ''}".strip() or u.email
+                data.append({
+                    "id": str(u.id), "display": name, "email": u.email,
+                    "role": getattr(u, "role", None),
+                    "can_manage_leads": can_manage_leads(u, funnel),
+                })
+        return Response(data)
+
+
+class LeadParticipantsView(LeadVisibilityMixin, CompanyBranchQuerysetMixin, generics.GenericAPIView):
+    """
+    Заменить список участников лида.
+    POST /api/consalting/leads/<uuid:pk>/participants/  { "participant_ids": ["<uuid>"] }
+    """
+    queryset = LeadConsalting.objects.select_related("funnel").all()
+    serializer_class = LeadConsaltingSerializer
+
+    def post(self, request, *args, **kwargs):
+        lead = self.get_object()
+        if not can_manage_leads(request.user, lead.funnel):
+            raise PermissionDenied("Нет прав управлять лидами в этой воронке.")
+        company = self._user_company()
+        ids = request.data.get("participant_ids") or []
+        users = list(User.objects.filter(id__in=ids, company=company))
+        lead.participants.set(users)
+        realtime.lead_updated(lead)
+        return Response(LeadConsaltingSerializer(lead, context=self.get_serializer_context()).data)
+
+
+class LeadArchiveView(LeadVisibilityMixin, CompanyBranchQuerysetMixin, generics.GenericAPIView):
+    """
+    Архивировать завершённый лид (исчезает с доски).
+    POST /api/consalting/leads/<uuid:pk>/archive/
+    """
+    queryset = LeadConsalting.objects.select_related("funnel", "stage").all()
+    serializer_class = LeadConsaltingSerializer
+
+    def post(self, request, *args, **kwargs):
+        lead = self.get_object()
+        if not can_manage_leads(request.user, lead.funnel):
+            raise PermissionDenied("Нет прав управлять лидами в этой воронке.")
+        if not (lead.stage and lead.stage.system_key == "completed"):
+            return Response(
+                {"detail": "Архивировать можно только лид на стадии «Завершено»."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if not lead.is_archived:
+            lead.is_archived = True
+            lead.archived_at = timezone.now()
+            lead.save(update_fields=["is_archived", "archived_at", "updated_at"])
+            # для досок — карточка должна исчезнуть
+            realtime.lead_deleted(lead)
+        return Response(LeadConsaltingSerializer(lead, context=self.get_serializer_context()).data)
+
+
+class LeadArchivedListView(CompanyBranchQuerysetMixin, generics.ListAPIView):
+    """
+    Архивные лиды (видимость по воронкам/владельцу).
+    GET /api/consalting/leads/archived/
+    """
+    serializer_class = LeadConsaltingSerializer
+
+    def get_queryset(self):
+        if getattr(self, "swagger_fake_view", False):
+            return LeadConsalting.objects.none()
+        company = self._user_company()
+        if not company:
+            return LeadConsalting.objects.none()
+        qs = LeadConsalting.objects.filter(
+            company=company, is_archived=True
+        ).select_related("funnel", "stage", "owner", "client")
+        # видимость: сотрудник — только воронки visible(F) + свои/пул
+        if not is_owner_like(self.request.user):
+            visible = visible_funnels_qs(FunnelConsalting.objects.filter(company=company), self.request.user)
+            qs = qs.filter(funnel__in=visible)
+            qs = apply_lead_visibility(qs, self.request.user)
+        return qs.order_by("-archived_at")
+
+
+class LeadCreateClientView(LeadVisibilityMixin, CompanyBranchQuerysetMixin, generics.GenericAPIView):
+    """
+    Создать клиента из лида и привязать к лиду.
+    POST /api/consalting/leads/<uuid:pk>/create-client/
+        { "full_name", "phone", "email", "service"?, "note"? }
+    """
+    queryset = LeadConsalting.objects.select_related("funnel", "service", "client").all()
+    serializer_class = LeadConsaltingSerializer
+
+    def post(self, request, *args, **kwargs):
+        lead = self.get_object()
+        if not can_manage_leads(request.user, lead.funnel):
+            raise PermissionDenied("Нет прав управлять лидами в этой воронке.")
+        company = self._user_company()
+
+        if lead.client_id:
+            client = lead.client
+        else:
+            service = lead.service
+            service_id = request.data.get("service")
+            if service_id:
+                service = ServicesConsalting.objects.filter(id=service_id, company=company).first() or service
+            client = Client.objects.create(
+                company=company,
+                branch=lead.branch,
+                full_name=request.data.get("full_name") or lead.full_name or lead.title,
+                phone=request.data.get("phone") or lead.phone or "",
+                email=request.data.get("email") or lead.email or "",
+                salesperson=request.user,
+                service=service,
+            )
+            lead.client = client
+            lead.save(update_fields=["client", "updated_at"])
+            realtime.lead_updated(lead)
+
+        ctx = self.get_serializer_context()
+        return Response(
+            {
+                "client": ClientSerializer(client, context=ctx).data,
+                "lead": LeadConsaltingSerializer(lead, context=ctx).data,
+            },
+            status=status.HTTP_201_CREATED,
+        )
+
+
+class LeadRegisterPaymentView(LeadVisibilityMixin, CompanyBranchQuerysetMixin, generics.GenericAPIView):
+    """
+    Оформить оплату по лиду → создаёт сделку в main у привязанного клиента.
+    POST /api/consalting/leads/<uuid:pk>/register-payment/
+        { "payment_mode": "cash|transfer|debt|installment",
+          "amount": "...", "debt_months": 6, "prepayment": "...", "note": "" }
+    """
+    queryset = LeadConsalting.objects.select_related("funnel", "client").all()
+    serializer_class = LeadConsaltingSerializer
+
+    def post(self, request, *args, **kwargs):
+        from decimal import Decimal, InvalidOperation
+        from django.core.exceptions import ValidationError as DjangoValidationError
+        from apps.main.models import ClientDeal
+
+        lead = self.get_object()
+        if not can_manage_leads(request.user, lead.funnel):
+            raise PermissionDenied("Нет прав управлять лидами в этой воронке.")
+        if not lead.client_id:
+            return Response({"detail": "Для оплаты нужен привязанный клиент (create-client)."},
+                            status=status.HTTP_400_BAD_REQUEST)
+
+        mode = request.data.get("payment_mode")
+        if mode not in ("cash", "transfer", "debt", "installment"):
+            return Response({"payment_mode": "Допустимо: cash|transfer|debt|installment."},
+                            status=status.HTTP_400_BAD_REQUEST)
+
+        def _dec(v, default="0"):
+            try:
+                return Decimal(str(v)) if v not in (None, "") else Decimal(default)
+            except (InvalidOperation, TypeError):
+                return Decimal(default)
+
+        amount = _dec(request.data.get("amount") if request.data.get("amount") not in (None, "") else lead.estimated_value)
+        prepayment = _dec(request.data.get("prepayment"))
+        debt_months = request.data.get("debt_months")
+        note = request.data.get("note") or ""
+
+        deal = ClientDeal(
+            company=lead.company, branch=lead.branch, client=lead.client,
+            title=lead.title or "Оплата по лиду",
+        )
+        if mode in ("cash", "transfer"):
+            deal.kind = ClientDeal.Kind.SALE
+            deal.amount = amount
+            deal.prepayment = Decimal("0")
+            label = "наличные" if mode == "cash" else "перевод"
+            deal.note = (note + f"\nСпособ оплаты: {label}").strip()
+        else:  # debt / installment → рассрочка с графиком
+            deal.kind = ClientDeal.Kind.DEBT
+            deal.amount = amount
+            deal.prepayment = prepayment  # для installment это первый платёж
+            try:
+                deal.debt_days = int(debt_months) if debt_months else None
+            except (TypeError, ValueError):
+                deal.debt_days = None
+            deal.auto_schedule = True
+            deal.note = (note + ("\nРассрочка" if mode == "installment" else "\nДолг")).strip()
+
+        try:
+            deal.save()  # full_clean + авто-график для DEBT
+        except DjangoValidationError as e:
+            return Response(
+                getattr(e, "message_dict", {"detail": e.messages if hasattr(e, "messages") else str(e)}),
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        lead.payment_registered = True
+        lead.payment_mode = mode
+        lead.save(update_fields=["payment_registered", "payment_mode", "updated_at"])
+
+        return Response(
+            {"deal_id": str(deal.id), "lead": LeadConsaltingSerializer(lead, context=self.get_serializer_context()).data},
             status=status.HTTP_201_CREATED,
         )
 

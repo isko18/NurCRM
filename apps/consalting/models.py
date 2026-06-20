@@ -99,6 +99,15 @@ class TariffConsalting(TimeStampedModel):
     )
     name = models.CharField(max_length=255, verbose_name='Название тарифа')
     price = models.DecimalField(max_digits=12, decimal_places=2, verbose_name='Цена тарифа')
+    # абонентская плата (опционально)
+    subscription_amount = models.DecimalField(
+        max_digits=12, decimal_places=2, default=0, verbose_name='Абонентская плата'
+    )
+    subscription_period = models.CharField(
+        max_length=8, blank=True,
+        choices=[('month', 'Месяц'), ('year', 'Год')],
+        verbose_name='Период абонентки'
+    )
 
     class Meta:
         verbose_name = 'Тариф услуги'
@@ -188,6 +197,22 @@ class SaleConsalting(TimeStampedModel):
     total = models.DecimalField(
         max_digits=12, decimal_places=2, default=0,
         verbose_name="Итого", help_text="Считается автоматически"
+    )
+    # связь с лидом (для продаж, созданных при завершении лида) + абонентка
+    lead = models.ForeignKey(
+        "LeadConsalting", on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="sales", related_query_name="sale", verbose_name="Лид"
+    )
+    subscription_amount = models.DecimalField(
+        max_digits=12, decimal_places=2, default=0, verbose_name="Абонентская плата"
+    )
+    subscription_period = models.CharField(
+        max_length=8, blank=True,
+        choices=[('month', 'Месяц'), ('year', 'Год')],
+        verbose_name="Период абонентки"
+    )
+    subscription_started_at = models.DateTimeField(
+        null=True, blank=True, verbose_name="Старт абонентки"
     )
     description = models.TextField(verbose_name="Заметка", blank=True)
 
@@ -811,6 +836,32 @@ class LeadConsalting(TimeStampedModel):
         'self', on_delete=models.SET_NULL, null=True, blank=True,
         related_name='derived_leads', related_query_name='derived_lead',
         verbose_name='Лид-источник (откуда передан)'
+    )
+
+    # ----- Услуга/тариф и участники -----
+    service = models.ForeignKey(
+        ServicesConsalting, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='leads', related_query_name='lead', verbose_name='Услуга'
+    )
+    tariff = models.ForeignKey(
+        TariffConsalting, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='leads', related_query_name='lead', verbose_name='Тариф'
+    )
+    participants = models.ManyToManyField(
+        User, blank=True,
+        related_name='consalting_participating_leads',
+        verbose_name='Участники лида'
+    )
+
+    # ----- Архив -----
+    is_archived = models.BooleanField(default=False, db_index=True, verbose_name='В архиве')
+    archived_at = models.DateTimeField(null=True, blank=True, verbose_name='Дата архивации')
+
+    # ----- Оплата (фиксация факта; финансовая сделка — в main) -----
+    payment_registered = models.BooleanField(default=False, verbose_name='Оплата оформлена')
+    payment_mode = models.CharField(
+        max_length=16, blank=True, verbose_name='Способ оплаты',
+        help_text='cash | transfer | debt | installment'
     )
 
     # ----- Lifecycle -----

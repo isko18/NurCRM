@@ -163,6 +163,11 @@ urlpatterns = [
         name="client-reconciliation",
     ),
     path("clients/<uuid:client_id>/reconciliation/json/", ClientReconciliationJSONAPIView.as_view()),
+    path(
+        "clients/<uuid:client_id>/subscription-schedule/",
+        ClientSubscriptionScheduleAPIView.as_view(),
+        name="client-subscription-schedule",
+    ),
     
     path("pos/sales/", SaleListAPIView.as_view(), name="pos-sale-list"),
     path("pos/sales/start/", SaleStartAPIView.as_view(), name="pos-sale-start"),

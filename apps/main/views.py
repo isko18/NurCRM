@@ -2311,6 +2311,24 @@ class ClientRetrieveUpdateDestroyAPIView(CompanyBranchRestrictedMixin, generics.
         self._save_with_company_branch(serializer)
 
 
+class ClientSubscriptionScheduleAPIView(APIView):
+    """
+    График абонентских платежей клиента (из consalting-продаж с абонеткой).
+    GET /api/main/clients/<uuid:client_id>/subscription-schedule/
+    """
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, client_id):
+        from apps.consalting.funnel.completion import build_subscription_schedule
+
+        company = _get_company(request.user)
+        qs = Client.objects.all()
+        if company is not None:
+            qs = qs.filter(company=company)
+        client = get_object_or_404(qs, id=client_id)
+        return Response({"items": build_subscription_schedule(client)})
+
+
 def _deal_prefetch():
     return [
         Prefetch("installments", queryset=DealInstallment.objects.order_by("number")),
