@@ -3955,15 +3955,26 @@ class ReturnFromAgentBulkApproveAPIView(APIView, CompanyBranchRestrictedMixin):
         product_id = data.get("product_id")
         agent_id = data.get("agent_id")
 
+        def _as_uuid(value, field):
+            try:
+                return UUID(str(value))
+            except (ValueError, TypeError, AttributeError):
+                raise ValidationError({field: f"Неверный UUID: {value!r}."})
+
         if ids:
+            if not isinstance(ids, (list, tuple)):
+                raise ValidationError({"ids": "Ожидается список UUID."})
+            ids = [_as_uuid(v, "ids") for v in ids]
             qs = ReturnFromAgent.objects.select_for_update().filter(company=company, status=ReturnFromAgent.Status.PENDING, id__in=ids)
         elif product_id:
+            product_id = _as_uuid(product_id, "product_id")
             qs = ReturnFromAgent.objects.select_for_update().filter(
                 company=company,
                 status=ReturnFromAgent.Status.PENDING,
                 subreal__product_id=product_id,
             )
             if agent_id:
+                agent_id = _as_uuid(agent_id, "agent_id")
                 qs = qs.filter(subreal__agent_id=agent_id)
         else:
             raise ValidationError({"detail": "Передай ids[] или product_id."})
