@@ -1743,6 +1743,8 @@ class Cart(models.Model):
         zero = Value(Decimal("0.00"), output_field=calc_field)
         base_unit = Case(
             When(cart__is_wholesale=True, then=F("unit_price")),
+            # piece sale: product.price is the pack price, not per-piece — use unit_price as base
+            When(sale_package__isnull=False, then=F("unit_price")),
             default=Coalesce(F("product__price"), F("unit_price"), output_field=calc_field),
             output_field=calc_field,
         )
