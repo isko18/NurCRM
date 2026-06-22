@@ -133,6 +133,9 @@ class TariffConsaltingSerializer(serializers.ModelSerializer):
 # ==========================
 class ServicesConsaltingSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
     tariffs = TariffConsaltingSerializer(many=True, required=False)
+    custom_role = serializers.PrimaryKeyRelatedField(
+        queryset=CustomRole.objects.all(), required=False, allow_null=True
+    )
     created_at = serializers.DateTimeField(read_only=True)
     updated_at = serializers.DateTimeField(read_only=True)
 
@@ -140,9 +143,15 @@ class ServicesConsaltingSerializer(CompanyBranchReadOnlyMixin, serializers.Model
         model = ServicesConsalting
         fields = (
             "id", "company", "branch", "name", "price", "installation_price",
-            "description", "tariffs", "created_at", "updated_at",
+            "description", "custom_role", "tariffs", "created_at", "updated_at",
         )
         read_only_fields = ("id", "company", "branch", "created_at", "updated_at")
+
+    def validate_custom_role(self, value):
+        company = self._user_company()
+        if value and company and value.company_id not in (None, company.id):
+            raise serializers.ValidationError("Роль принадлежит другой компании.")
+        return value
 
     def validate(self, attrs):
         # branch мы всё равно проставим из контекста, внешние значения игнорим.

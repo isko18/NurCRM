@@ -185,3 +185,159 @@ class FunnelDnDApiTests(TestCase):
         self.funnel2.delete()
         resp = self.client.get("/api/consalting/user-preferences/")
         self.assertEqual(resp.data["funnel_order"], [str(self.funnel.id)])
+
+
+class ServiceRoleApiTests(TestCase):
+    """API: услуги, привязанные к кастомной роли (custom_role)."""
+
+    def setUp(self):
+        from rest_framework.test import APIClient
+        from apps.users.models import CustomRole
+
+        self.owner = User.objects.create(email="o3@x.com", first_name="O", last_name="W")
+        self.company = Company.objects.create(name="Acme3", owner=self.owner)
+        self.owner.company = self.company
+        self.owner.save()
+        self.role = CustomRole.objects.create(company=self.company, name="Менеджер")
+        self.other_owner = User.objects.create(email="o3b@x.com")
+        self.other_company = Company.objects.create(name="Other", owner=self.other_owner)
+        self.other_role = CustomRole.objects.create(company=self.other_company, name="Чужая")
+
+        self.client = APIClient()
+        self.client.force_authenticate(self.owner)
+
+    def test_create_service_with_role_and_get(self):
+        resp = self.client.post(
+            "/api/consalting/services/",
+            {"name": "Консультация", "price": "5000.00", "custom_role": str(self.role.id)},
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 201, resp.content)
+        self.assertEqual(str(resp.data["custom_role"]), str(self.role.id))
+
+        sid = resp.data["id"]
+        resp = self.client.get(f"/api/consalting/services/{sid}/")
+        self.assertEqual(str(resp.data["custom_role"]), str(self.role.id))
+
+    def test_create_service_without_role_is_general(self):
+        resp = self.client.post(
+            "/api/consalting/services/",
+            {"name": "Общая", "price": "100.00"}, format="json")
+        self.assertEqual(resp.status_code, 201, resp.content)
+        self.assertIsNone(resp.data["custom_role"])
+
+    def test_reject_role_from_other_company(self):
+        resp = self.client.post(
+            "/api/consalting/services/",
+            {"name": "X", "price": "1.00", "custom_role": str(self.other_role.id)},
+            format="json")
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("custom_role", resp.data)
+
+    def test_filter_services_by_role(self):
+        self.client.post("/api/consalting/services/",
+                         {"name": "Ролевая", "price": "1.00", "custom_role": str(self.role.id)},
+                         format="json")
+        self.client.post("/api/consalting/services/",
+                         {"name": "Общая2", "price": "1.00"}, format="json")
+        resp = self.client.get(f"/api/consalting/services/?custom_role={self.role.id}")
+        names = {s["name"] for s in resp.data.get("results", resp.data)}
+        self.assertIn("Ролевая", names)
+        self.assertNotIn("Общая2", names)
+
+    def test_role_delete_nulls_service(self):
+        resp = self.client.post(
+            "/api/consalting/services/",
+            {"name": "Сохранится", "price": "1.00", "custom_role": str(self.role.id)},
+            format="json")
+        sid = resp.data["id"]
+        self.role.delete()
+        from apps.consalting.models import ServicesConsalting
+        svc = ServicesConsalting.objects.get(id=sid)
+        self.assertIsNone(svc.custom_role_id)  # услуга осталась, роль обнулилась
+
+
+class SubscriptionScheduleApiTests(TestCase):
+    """API: расписание абонентки (deal/installment_id) + оплата периода."""
+
+    def setUp(self):
+        import uuid as _uuid
+        from rest_framework.test import APIClient
+        from apps.main.models import Client
+        from apps.consalting.models import SaleConsalting
+
+        self.owner = User.objects.create(email="o4@x.com", first_name="O", last_name="W")
+        self.company = Company.objects.create(name="Acme4", owner=self.owner)
+        self.owner.company = self.company
+        self.owner.save()
+
+        self.client_obj = Client.objects.create(
+            company=self.company, full_name="Иван", phone="+700", salesperson=self.owner)
+        self.sale = SaleConsalting.objects.create(
+            company=self.company, client=self.client_obj,
+            subscription_amount=Decimal("5000.00"), subscription_period="month",
+            subscription_started_at=timezone.now(),
+        )
+
+        self.client = APIClient()
+        self.client.force_authenticate(self.owner)
+        self._uuid = _uuid
+
+    def _schedule(self):
+        resp = self.client.get(
+            f"/api/main/clients/{self.client_obj.id}/subscription-schedule/")
+        self.assertEqual(resp.status_code, 200, resp.content)
+        return resp.data["items"]
+
+    def test_schedule_items_have_deal_and_installment(self):
+        items = self._schedule()
+        self.assertTrue(items)
+        for it in items:
+            self.assertIsNotNone(it["deal"])
+            self.assertIsNotNone(it["installment_id"])
+            self.assertIn(it["status"], ("planned", "paid"))
+        # скользящее окно: минимум ~12 периодов вперёд
+        self.assertGreaterEqual(len(items), 12)
+
+    def test_schedule_is_idempotent_no_duplicate_deals(self):
+        from apps.consalting.models import SaleConsalting
+        self._schedule()
+        n1 = len(self._schedule())
+        self.sale.refresh_from_db()
+        self.assertIsNotNone(self.sale.subscription_deal_id)
+        # повторный GET не плодит взносы
+        self.assertEqual(len(self._schedule()), n1)
+
+    def test_pay_marks_period_paid(self):
+        items = self._schedule()
+        target = items[0]
+        deal_id, inst_id = target["deal"], target["installment_id"]
+        self.assertFalse(target["paid"])
+
+        resp = self.client.post(
+            f"/api/main/clients/{self.client_obj.id}/deals/{deal_id}/pay/",
+            {"installment_id": inst_id, "amount": "5000.00",
+             "idempotency_key": str(self._uuid.uuid4())},
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+
+        items = self._schedule()
+        paid = next(i for i in items if i["installment_id"] == inst_id)
+        self.assertTrue(paid["paid"])
+        self.assertEqual(paid["status"], "paid")
+
+    def test_pay_idempotency_key_blocks_double_charge(self):
+        from apps.main.models import DealPayment
+        items = self._schedule()
+        target = items[0]
+        deal_id, inst_id = target["deal"], target["installment_id"]
+        key = str(self._uuid.uuid4())
+        body = {"installment_id": inst_id, "amount": "5000.00", "idempotency_key": key}
+        r1 = self.client.post(
+            f"/api/main/clients/{self.client_obj.id}/deals/{deal_id}/pay/", body, format="json")
+        r2 = self.client.post(
+            f"/api/main/clients/{self.client_obj.id}/deals/{deal_id}/pay/", body, format="json")
+        self.assertEqual(r1.status_code, 200)
+        self.assertEqual(r2.status_code, 200)
+        self.assertEqual(DealPayment.objects.filter(deal_id=deal_id).count(), 1)

@@ -186,10 +186,10 @@ class TariffInline(admin.TabularInline):
 
 @admin.register(ServicesConsalting)
 class ServicesConsaltingAdmin(CompanyBranchScopedAdminMixin, TimeStampedAdminMixin, admin.ModelAdmin):
-    list_display = ("name", "company", "branch", "price", "installation_price", "created_at", "updated_at")
+    list_display = ("name", "company", "branch", "custom_role", "price", "installation_price", "created_at", "updated_at")
     list_filter = ("company", "branch")
     search_fields = ("name", "description")
-    raw_id_fields = ("company", "branch")
+    raw_id_fields = ("company", "branch", "custom_role")
     ordering = ("name",)
     inlines = [TariffInline]
 
@@ -228,7 +228,7 @@ class SaleConsaltingAdmin(CompanyBranchScopedAdminMixin, TimeStampedAdminMixin, 
                     "discount", "markup", "total", "short_description", "created_at")
     list_filter = ("company", "branch", "services")
     search_fields = ("description",)
-    raw_id_fields = ("company", "branch", "services", "tariff", "client", "user")
+    raw_id_fields = ("company", "branch", "services", "tariff", "client", "user", "subscription_deal")
     ordering = ("-created_at",)
     inlines = [SaleItemInline]
 

@@ -40,6 +40,17 @@ class ServicesConsalting(TimeStampedModel):
         verbose_name="Стоимость установки"
     )
     description = models.TextField(verbose_name="Описание", blank=True)
+    # Привязка услуги к кастомной роли: NULL = «общая» услуга (видна во всех
+    # воронках); конкретная роль = услуга показывается только в воронке этой роли.
+    # При удалении роли услуга не удаляется, а становится общей (SET NULL).
+    custom_role = models.ForeignKey(
+        'users.CustomRole',
+        on_delete=models.SET_NULL,
+        null=True, blank=True,
+        related_name='consalting_services',
+        related_query_name='consalting_service',
+        verbose_name='Роль',
+    )
 
     class Meta:
         verbose_name = "Услуга"
@@ -213,6 +224,17 @@ class SaleConsalting(TimeStampedModel):
     )
     subscription_started_at = models.DateTimeField(
         null=True, blank=True, verbose_name="Старт абонентки"
+    )
+    # Сделка-«подложка» для оплаты абонентки: ClientDeal(kind=DEBT) с помесячными
+    # взносами (DealInstallment). Создаётся лениво при запросе расписания; через неё
+    # работает существующий /api/main/clients/{cid}/deals/{did}/pay/.
+    subscription_deal = models.ForeignKey(
+        "main.ClientDeal",
+        on_delete=models.SET_NULL,
+        null=True, blank=True,
+        related_name="consalting_subscription_sales",
+        related_query_name="consalting_subscription_sale",
+        verbose_name="Сделка абонентки",
     )
     description = models.TextField(verbose_name="Заметка", blank=True)
 
