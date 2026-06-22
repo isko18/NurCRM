@@ -1224,3 +1224,34 @@ class EmployeeFunnelGrant(TimeStampedModel):
 
     def __str__(self):
         return f"{self.employee_id} → {self.funnel_id} (manage={self.can_manage_leads})"
+
+
+# ======== Пользовательские предпочтения по воронкам ========
+class FunnelUserPreferenceConsalting(TimeStampedModel):
+    """Персональные настройки пользователя для страницы воронок.
+
+    Сейчас хранит только порядок воронок-строк (drag-and-drop), который
+    раньше жил в localStorage. Порядок — список id воронок (как строки);
+    воронки, отсутствующие в списке, фронт/сервер добавляет в конец, а
+    исчезнувшие — игнорируются при отдаче.
+    """
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    user = models.OneToOneField(
+        User,
+        on_delete=models.CASCADE,
+        related_name='consalting_funnel_preference',
+        verbose_name='Пользователь',
+    )
+    funnel_order = models.JSONField(
+        default=list, blank=True,
+        verbose_name='Порядок воронок',
+        help_text='Упорядоченный список id воронок.',
+    )
+
+    class Meta:
+        verbose_name = 'Предпочтения по воронкам'
+        verbose_name_plural = 'Предпочтения по воронкам'
+
+    def __str__(self):
+        return f"prefs:{self.user_id}"

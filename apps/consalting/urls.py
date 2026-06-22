@@ -20,6 +20,8 @@ from .views import (
     FunnelEmployeesView,
     FunnelStageConsaltingListCreateView,
     FunnelStageConsaltingRetrieveUpdateDestroyView,
+    FunnelStageReorderView,
+    FunnelUserPreferenceView,
     LeadConsaltingListCreateView,
     LeadConsaltingRetrieveUpdateDestroyView,
     LeadMoveStageView,
@@ -76,7 +78,11 @@ urlpatterns = [
 
     # ===== Стадии воронки =====
     path('funnel-stages/', FunnelStageConsaltingListCreateView.as_view(), name='funnel-stages-list-create'),
+    path('funnel-stages/reorder/', FunnelStageReorderView.as_view(), name='funnel-stages-reorder'),
     path('funnel-stages/<uuid:pk>/', FunnelStageConsaltingRetrieveUpdateDestroyView.as_view(), name='funnel-stages-rud'),
+
+    # ===== Пользовательские предпочтения =====
+    path('user-preferences/', FunnelUserPreferenceView.as_view(), name='user-preferences'),
 
     # ===== Лиды (карточки) =====
     path('leads/', LeadConsaltingListCreateView.as_view(), name='leads-list-create'),

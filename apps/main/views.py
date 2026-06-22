@@ -3500,6 +3500,20 @@ class ManufactureSubrealListCreateAPIView(CompanyBranchRestrictedMixin, generics
 
 
 # ===========================
+#  Agent: мои приемки (только свои)
+# ===========================
+class AgentMySubrealsListAPIView(ManufactureSubrealListCreateAPIView):
+    """
+    GET /api/main/agents/me/subreals/
+    Возвращает только субреализации, где agent == авторизованный пользователь.
+    """
+    http_method_names = ["get", "head", "options"]
+
+    def get_queryset(self):
+        return super().get_queryset().filter(agent=self.request.user)
+
+
+# ===========================
 #  Subreal: retrieve/update/destroy
 # ===========================
 class ManufactureSubrealRetrieveUpdateDestroyAPIView(

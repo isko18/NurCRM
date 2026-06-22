@@ -97,3 +97,91 @@ class FunnelFlowTests(TestCase):
         self.assertIn("totals", data)
         self.assertEqual(data["totals"]["won"], 1)
         self.assertTrue(any(s["stage_type"] == T.WON for s in data["stages"]))
+
+
+class FunnelDnDApiTests(TestCase):
+    """API: bulk-reorder стадий и per-user порядок воронок."""
+
+    def setUp(self):
+        from rest_framework.test import APIClient
+
+        self.owner = User.objects.create(email="o2@x.com", first_name="O", last_name="W")
+        self.company = Company.objects.create(name="Acme2", owner=self.owner)
+        self.owner.company = self.company
+        self.owner.save()
+
+        self.funnel = FunnelConsalting.objects.create(company=self.company, name="F1")
+        self.funnel2 = FunnelConsalting.objects.create(company=self.company, name="F2")
+
+        self.s0 = FunnelStageConsalting.objects.create(
+            company=self.company, funnel=self.funnel, name="A", order=0, stage_type=T.NEW_LEAD)
+        self.s1 = FunnelStageConsalting.objects.create(
+            company=self.company, funnel=self.funnel, name="B", order=1, stage_type=T.QUALIFICATION)
+        self.s2 = FunnelStageConsalting.objects.create(
+            company=self.company, funnel=self.funnel, name="C", order=2, stage_type=T.PROPOSAL_SENT)
+        self.sys = FunnelStageConsalting.objects.create(
+            company=self.company, funnel=self.funnel, name="Done", order=3,
+            stage_type=T.COMPLETED, is_system=True, system_key="completed")
+
+        self.client = APIClient()
+        self.client.force_authenticate(self.owner)
+
+    # ---- reorder стадий ----
+    def test_reorder_swaps_orders(self):
+        resp = self.client.post(
+            "/api/consalting/funnel-stages/reorder/",
+            [{"id": str(self.s0.id), "order": 2},
+             {"id": str(self.s1.id), "order": 0},
+             {"id": str(self.s2.id), "order": 1}],
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+        self.assertEqual(resp.data["updated"], 3)
+        self.s0.refresh_from_db(); self.s1.refresh_from_db(); self.s2.refresh_from_db()
+        self.assertEqual((self.s0.order, self.s1.order, self.s2.order), (2, 0, 1))
+
+    def test_reorder_rejects_system_stage(self):
+        resp = self.client.post(
+            "/api/consalting/funnel-stages/reorder/",
+            [{"id": str(self.sys.id), "order": 0}],
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn(str(self.sys.id), resp.data["ids"])
+        self.sys.refresh_from_db()
+        self.assertEqual(self.sys.order, 3)  # не тронули
+
+    def test_reorder_missing_stage_404(self):
+        import uuid as _uuid
+        resp = self.client.post(
+            "/api/consalting/funnel-stages/reorder/",
+            [{"id": str(_uuid.uuid4()), "order": 0}],
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 404)
+
+    # ---- user-preferences ----
+    def test_preferences_empty_get(self):
+        resp = self.client.get("/api/consalting/user-preferences/")
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.data["funnel_order"], [])
+
+    def test_preferences_patch_and_get(self):
+        order = [str(self.funnel2.id), str(self.funnel.id)]
+        resp = self.client.patch(
+            "/api/consalting/user-preferences/",
+            {"funnel_order": order}, format="json")
+        self.assertEqual(resp.status_code, 200, resp.content)
+        self.assertEqual(resp.data["funnel_order"], order)
+
+        resp = self.client.get("/api/consalting/user-preferences/")
+        self.assertEqual(resp.data["funnel_order"], order)
+
+    def test_preferences_drops_deleted_funnels_on_get(self):
+        order = [str(self.funnel2.id), str(self.funnel.id)]
+        self.client.patch(
+            "/api/consalting/user-preferences/",
+            {"funnel_order": order}, format="json")
+        self.funnel2.delete()
+        resp = self.client.get("/api/consalting/user-preferences/")
+        self.assertEqual(resp.data["funnel_order"], [str(self.funnel.id)])

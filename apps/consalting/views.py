@@ -5,6 +5,7 @@ from rest_framework.views import APIView
 
 from django.utils import timezone
 from django.shortcuts import get_object_or_404
+from django.db import transaction, IntegrityError
 
 from django_filters.rest_framework import DjangoFilterBackend
 
@@ -20,6 +21,7 @@ from .models import (
     LossReasonConsalting,
     LeadActivityConsalting,
     LeadTaskConsalting,
+    FunnelUserPreferenceConsalting,
 )
 from .serializers import (
     ServicesConsaltingSerializer,
@@ -37,6 +39,8 @@ from .serializers import (
     LossReasonConsaltingSerializer,
     LeadActivityConsaltingSerializer,
     LeadTaskConsaltingSerializer,
+    FunnelStageReorderItemSerializer,
+    FunnelUserPreferenceConsaltingSerializer,
 )
 from .funnel.state_machine import (
     FunnelStateMachine, StateTransitionError, allowed_next_types,
@@ -634,6 +638,136 @@ class FunnelStageConsaltingRetrieveUpdateDestroyView(CompanyBranchQuerysetMixin,
         if not can_manage_stages(self.request.user, instance.funnel):
             raise PermissionDenied("Нет прав управлять стадиями этой воронки.")
         instance.delete()
+
+
+class FunnelStageReorderView(CompanyBranchQuerysetMixin, generics.GenericAPIView):
+    """
+    Bulk-переупорядочивание стадий одним запросом.
+    POST /api/consalting/funnel-stages/reorder/
+        [ { "id": "<uuid>", "order": 0 }, { "id": "<uuid>", "order": 1 }, ... ]
+
+    Права — те же, что у PATCH /funnel-stages/<id>/: can_manage_stages(funnel)
+    для каждой затронутой воронки. Системные стадии в списке → 400.
+    Можно передавать стадии нескольких воронок сразу.
+    """
+    queryset = FunnelStageConsalting.objects.select_related("funnel").all()
+    serializer_class = FunnelStageReorderItemSerializer
+
+    def post(self, request, *args, **kwargs):
+        company = self._user_company()
+        if not company:
+            raise PermissionDenied("У пользователя не настроена компания.")
+
+        if not isinstance(request.data, list) or not request.data:
+            return Response(
+                {"detail": "Ожидается непустой список объектов {id, order}."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        ser = self.get_serializer(data=request.data, many=True)
+        ser.is_valid(raise_exception=True)
+
+        # последнее значение order для каждого id (на случай дублей)
+        order_map = {str(item["id"]): item["order"] for item in ser.validated_data}
+
+        stages = list(
+            FunnelStageConsalting.objects.select_related("funnel").filter(
+                id__in=order_map.keys(), company=company
+            )
+        )
+        found = {str(s.id) for s in stages}
+        missing = sorted(set(order_map) - found)
+        if missing:
+            return Response(
+                {"detail": "Стадии не найдены или из другой компании.", "ids": missing},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        system_ids = sorted(str(s.id) for s in stages if s.is_system)
+        if system_ids:
+            return Response(
+                {"detail": "Системные стадии нельзя переупорядочивать.", "ids": system_ids},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        # права: те же, что у PATCH — на каждую затронутую воронку
+        funnels = {s.funnel_id: s.funnel for s in stages}
+        for funnel in funnels.values():
+            if not can_manage_stages(request.user, funnel):
+                raise PermissionDenied("Нет прав управлять стадиями этой воронки.")
+
+        # два прохода, чтобы не нарушить UniqueConstraint(funnel, order):
+        # сначала «паркуем» в заведомо свободные значения выше всех существующих
+        # (order — PositiveIntegerField, поэтому только положительные), потом — целевые.
+        from django.db.models import Max
+        max_existing = FunnelStageConsalting.objects.filter(
+            funnel_id__in=funnels.keys()
+        ).aggregate(m=Max("order"))["m"] or 0
+        park_base = max(max_existing, max(order_map.values())) + 1
+        try:
+            with transaction.atomic():
+                for idx, s in enumerate(stages):
+                    s.order = park_base + idx
+                FunnelStageConsalting.objects.bulk_update(stages, ["order"])
+                for s in stages:
+                    s.order = order_map[str(s.id)]
+                FunnelStageConsalting.objects.bulk_update(stages, ["order"])
+        except IntegrityError:
+            return Response(
+                {"detail": "Конфликт порядка стадий: значения order не уникальны в пределах воронки."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        stages.sort(key=lambda s: s.order)
+        data = FunnelStageConsaltingSerializer(
+            stages, many=True, context=self.get_serializer_context()
+        ).data
+        return Response({"updated": len(stages), "stages": data})
+
+
+# ==========================
+# Пользовательские предпочтения по воронкам
+# ==========================
+class FunnelUserPreferenceView(CompanyBranchQuerysetMixin, generics.GenericAPIView):
+    """
+    Персональный порядок воронок-строк (per-user), ранее хранившийся в localStorage.
+    GET   /api/consalting/user-preferences/   → { "funnel_order": [...] }
+    PATCH /api/consalting/user-preferences/   { "funnel_order": [...] }
+
+    GET отдаёт только существующие/видимые пользователю воронки (исчезнувшие
+    игнорируются), сохраняя порядок. Если предпочтений нет — funnel_order: [].
+    """
+    serializer_class = FunnelUserPreferenceConsaltingSerializer
+
+    def get_queryset(self):  # для swagger/DRF
+        return FunnelUserPreferenceConsalting.objects.none()
+
+    def _visible_funnel_ids(self):
+        qs = FunnelConsalting.objects.all()
+        company = self._user_company()
+        if company:
+            qs = qs.filter(company=company)
+        return {str(fid) for fid in visible_funnels_qs(qs, self.request.user).values_list("id", flat=True)}
+
+    def get(self, request, *args, **kwargs):
+        pref = FunnelUserPreferenceConsalting.objects.filter(user=request.user).first()
+        stored = pref.funnel_order if pref else []
+        visible = self._visible_funnel_ids()
+        funnel_order = [fid for fid in stored if fid in visible]
+        return Response({"funnel_order": funnel_order})
+
+    def patch(self, request, *args, **kwargs):
+        ser = self.get_serializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+        funnel_order = ser.validated_data["funnel_order"]
+        pref, _ = FunnelUserPreferenceConsalting.objects.get_or_create(user=request.user)
+        pref.funnel_order = funnel_order
+        pref.save(update_fields=["funnel_order", "updated_at"])
+        return Response({"funnel_order": funnel_order})
+
+    # позволяем и PUT как алиас PATCH (на случай, если фронт пошлёт PUT)
+    def put(self, request, *args, **kwargs):
+        return self.patch(request, *args, **kwargs)
 
 
 # ==========================

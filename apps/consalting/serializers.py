@@ -575,6 +575,36 @@ class FunnelConsaltingSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSe
 
 
 # ==========================
+# Bulk-переупорядочивание стадий
+# ==========================
+class FunnelStageReorderItemSerializer(serializers.Serializer):
+    """Один элемент запроса reorder: { "id": <uuid>, "order": <int> }."""
+    id = serializers.UUIDField()
+    order = serializers.IntegerField(min_value=0)
+
+
+# ==========================
+# Пользовательские предпочтения по воронкам
+# ==========================
+class FunnelUserPreferenceConsaltingSerializer(serializers.Serializer):
+    """Порядок воронок-строк на странице (per-user)."""
+    funnel_order = serializers.ListField(
+        child=serializers.UUIDField(), allow_empty=True
+    )
+
+    def validate_funnel_order(self, value):
+        # нормализуем в строки и убираем дубликаты, сохраняя порядок
+        seen = set()
+        result = []
+        for item in value:
+            key = str(item)
+            if key not in seen:
+                seen.add(key)
+                result.append(key)
+        return result
+
+
+# ==========================
 # LeadConsalting (карточка лида)
 # ==========================
 class LeadConsaltingSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):

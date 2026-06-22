@@ -257,6 +257,7 @@ urlpatterns = [
     # -------------------------
     path("agents/me/products/", AgentMyProductsListAPIView.as_view(), name="agent-my-products"),
     path("agents/me/returns/", AgentMyReturnsListCreateAPIView.as_view(), name="agent-my-returns"),
+    path("agents/me/subreals/", AgentMySubrealsListAPIView.as_view(), name="agent-my-subreals"),
     path(
         "owners/agents/products/",
         OwnerAgentsProductsListAPIView.as_view(),
