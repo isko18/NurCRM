@@ -4,6 +4,7 @@ from .views import (
     ServicesConsaltingRetrieveUpdateDestroyView,
     SaleConsaltingListCreateView,
     SaleConsaltingRetrieveUpdateDestroyView,
+    SaleConsaltingAnalyticsView,
     SalaryConsaltingListCreateView,
     SalaryConsaltingRetrieveUpdateDestroyView,
     RequestsConsaltingListCreateView,
@@ -52,6 +53,7 @@ urlpatterns = [
     path('services/<uuid:pk>/', ServicesConsaltingRetrieveUpdateDestroyView.as_view(), name='services-rud'),
 
     path('sales/', SaleConsaltingListCreateView.as_view(), name='sales-list-create'),
+    path('sales/analytics/', SaleConsaltingAnalyticsView.as_view(), name='sales-analytics'),
     path('sales/<uuid:pk>/', SaleConsaltingRetrieveUpdateDestroyView.as_view(), name='sales-rud'),
 
     path('salaries/', SalaryConsaltingListCreateView.as_view(), name='salaries-list-create'),

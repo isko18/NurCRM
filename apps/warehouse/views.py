@@ -1475,15 +1475,17 @@ class AgentMyProductsListAPIView(CompanyBranchRestrictedMixin, APIView):
 
     pagination_class = _Paginator
 
-    def _paginate_and_respond(self, rows, serializer_class):
+    def _paginate_and_respond(self, rows, serializer_class, context=None):
         paginator = self.pagination_class()
         page = paginator.paginate_queryset(rows, self.request, view=self)
-        ser = serializer_class(page, many=True)
+        ser = serializer_class(page, many=True, context=context or {})
         return paginator.get_paginated_response(ser.data)
 
     def get(self, request, *args, **kwargs):
         user = request.user
         company = self._company()
+        can_sell_wholesale = services.agent_can_sell_wholesale(user=user, company=company)
+        ser_context = {"can_sell_wholesale": can_sell_wholesale}
         product_group_raw = (request.query_params.get("product_group") or "").strip()
         product_group_id = None
         if product_group_raw:
@@ -1517,6 +1519,7 @@ class AgentMyProductsListAPIView(CompanyBranchRestrictedMixin, APIView):
                     "article",
                     "unit",
                     "price",
+                    "wholesale_price",
                     "discount_percent",
                     "quantity",
                     "warehouse_id",
@@ -1553,7 +1556,7 @@ class AgentMyProductsListAPIView(CompanyBranchRestrictedMixin, APIView):
                 )
                 for p in prod_qs
             ]
-            return self._paginate_and_respond(rows, CommonWarehouseBalanceSerializer)
+            return self._paginate_and_respond(rows, CommonWarehouseBalanceSerializer, context=ser_context)
 
         move_subq = m.AgentStockMove.objects.filter(
             agent=OuterRef("agent"),
@@ -1585,7 +1588,7 @@ class AgentMyProductsListAPIView(CompanyBranchRestrictedMixin, APIView):
         else:
             # по умолчанию — по дате (последнее движение), сначала новые
             qs = qs.order_by("-last_movement_at", "product__name", "id")
-        return self._paginate_and_respond(qs, AgentStockBalanceSerializer)
+        return self._paginate_and_respond(qs, AgentStockBalanceSerializer, context=ser_context)
 
 
 class OwnerAgentsProductsListAPIView(CompanyBranchRestrictedMixin, APIView):

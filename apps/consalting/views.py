@@ -47,7 +47,7 @@ from .funnel.state_machine import (
 )
 from .funnel.activity import ActivityLogger
 from .funnel.scoring import ScoringService
-from .funnel.analytics import PipelineAnalytics
+from .funnel.analytics import PipelineAnalytics, SalesAnalytics
 from .funnel.events import emit as emit_funnel_event
 from .funnel import realtime
 from .funnel.provisioning import provision_funnel_for_role
@@ -320,6 +320,29 @@ class SaleConsaltingRetrieveUpdateDestroyView(CompanyBranchQuerysetMixin, generi
         "services", "tariff", "client", "user", "company"
     ).prefetch_related("items").all()
     serializer_class = SaleConsaltingSerializer
+
+
+class SaleConsaltingAnalyticsView(CompanyBranchQuerysetMixin, generics.GenericAPIView):
+    """
+    Агрегированная аналитика продаж консалтинга.
+    GET /api/consalting/sales/analytics/?date_from=&date_to=&branch=&user=
+    """
+    queryset = SaleConsalting.objects.all()
+    serializer_class = SaleConsaltingSerializer
+
+    def get(self, request, *args, **kwargs):
+        company = self._user_company()
+        if not company:
+            raise PermissionDenied("У пользователя не настроена компания.")
+        params = request.query_params
+        data = SalesAnalytics.compute(
+            company,
+            date_from=params.get("date_from") or None,
+            date_to=params.get("date_to") or None,
+            branch=params.get("branch") or None,
+            user=params.get("user") or None,
+        )
+        return Response(data)
 
 
 # ==========================
@@ -899,8 +922,11 @@ class LeadMoveStageView(LeadVisibilityMixin, CompanyBranchQuerysetMixin, generic
                 {"detail": "Переход запрещён", "errors": e.errors},
                 status=status.HTTP_400_BAD_REQUEST,
             )
-        # сайд-эффекты завершения: продажа-аналитика + абонентка (зарплата — отдельно)
-        if stage.system_key == "completed":
+        # сайд-эффекты завершения: продажа-аналитика + абонентка (зарплата — отдельно).
+        # Триггерим на любой успешной терминальной стадии (won/completed), а не только
+        # на системной «completed» — иначе выигрыш в пользовательской воронке или на
+        # WON-стадии не создаёт продажу. Идемпотентно (проверка по lead внутри).
+        if stage.is_success:
             apply_completion_side_effects(lead, actor=request.user)
         return Response(
             LeadConsaltingSerializer(lead, context=self.get_serializer_context()).data
@@ -1291,7 +1317,8 @@ class LeadRegisterPaymentView(LeadVisibilityMixin, CompanyBranchQuerysetMixin, g
 
         lead.payment_registered = True
         lead.payment_mode = mode
-        lead.save(update_fields=["payment_registered", "payment_mode", "updated_at"])
+        lead.payment_deal = deal
+        lead.save(update_fields=["payment_registered", "payment_mode", "payment_deal", "updated_at"])
 
         return Response(
             {"deal_id": str(deal.id), "lead": LeadConsaltingSerializer(lead, context=self.get_serializer_context()).data},
@@ -1414,6 +1441,8 @@ class LeadWinView(CompanyBranchQuerysetMixin, generics.GenericAPIView):
         except StateTransitionError as e:
             return Response({"detail": "Переход запрещён", "errors": e.errors},
                             status=status.HTTP_400_BAD_REQUEST)
+        # выигрыш = закрытая продажа: создаём продажу-аналитику + абонентку (идемпотентно)
+        apply_completion_side_effects(lead, actor=request.user)
         return Response(LeadConsaltingSerializer(lead, context=self.get_serializer_context()).data)
 
 

@@ -885,6 +885,15 @@ class LeadConsalting(TimeStampedModel):
         max_length=16, blank=True, verbose_name='Способ оплаты',
         help_text='cash | transfer | debt | installment'
     )
+    # Сделка из register-payment (для атрибуции «факта оплаты» в аналитике/дашборде).
+    payment_deal = models.ForeignKey(
+        "main.ClientDeal",
+        on_delete=models.SET_NULL,
+        null=True, blank=True,
+        related_name="consalting_payment_leads",
+        related_query_name="consalting_payment_lead",
+        verbose_name="Сделка оплаты",
+    )
 
     # ----- Lifecycle -----
     first_contact_at = models.DateTimeField(null=True, blank=True, verbose_name='Первый контакт')

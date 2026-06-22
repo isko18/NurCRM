@@ -181,6 +181,61 @@ Body: {
 
 ---
 
+## 4. Аналитика продаж + создание продажи на выигрыше
+
+### 4.1. Продажа создаётся при любом выигрыше
+
+Раньше продажа-аналитика (`SaleConsalting`) создавалась **только** при `move-stage`
+на системную стадию `completed`. Теперь — на **любой успешной** терминальной стадии:
+
+- `POST /api/consalting/leads/{id}/move-stage/` на стадию с `is_success=true` (WON/COMPLETED);
+- `POST /api/consalting/leads/{id}/win/`.
+
+Идемпотентно: на один лид создаётся не более одной продажи (повторные переходы не дублируют).
+Продажа берёт сумму из `lead.estimated_value`, услугу/тариф — из лида; абонентка — из тарифа.
+
+### 4.2. Агрегированная аналитика продаж
+
+```
+GET /api/consalting/sales/analytics/?date_from=&date_to=&branch=&user=
+```
+Все параметры опциональны. `date_from`/`date_to` — `YYYY-MM-DD` (по `created_at`),
+`branch`/`user` — uuid. Скоуп — компания текущего пользователя.
+
+**200:**
+```json
+{
+  "totals": {
+    "count": 12,
+    "revenue": 540000.0,
+    "avg_check": 45000.0,
+    "subscription_count": 3,
+    "subscription_total": 15000.0
+  },
+  "by_service":  [ { "service_id": "uuid", "service_name": "Консультация", "count": 5, "revenue": 250000.0 } ],
+  "by_employee": [ { "user_id": "uuid", "user_name": "Иван И.", "count": 7, "revenue": 300000.0 } ],
+  "by_day":      [ { "date": "2026-06-22", "revenue": 50000.0, "count": 2 } ]
+}
+```
+
+### 4.3. Факт оплаты (деньги, реально пришедшие)
+
+В аналитике продаж есть `totals.paid_income` — сумма **фактически полученных** денег
+за период (в отличие от `revenue`, который начисляется при выигрыше). Источники:
+
+- разовые оплаты `register-payment` (cash/transfer) — в момент оформления;
+- оплаченные взносы абонентки и рассрочки (`/deals/{id}/pay/`) — по дате платежа.
+
+Тот же `paid_income` заведён в **общий дашборд компании**
+`GET /api/main/analytics/dashboard/`:
+- входит в `finance.income_month` (и в дневную динамику `dynamics[].income`);
+- отдельной строкой `consalting.paid_income`.
+
+Кассы (как отдельной сущности с операциями/сменами) у консалтинга нет —
+по решению деньги отражаются именно в доходе дашборда.
+
+---
+
 ## Краткий чеклист интеграции для фронта
 
 - [ ] Порядок воронок: при загрузке `GET /user-preferences/`, при drop — `PATCH`.
@@ -190,3 +245,5 @@ Body: {
       автоматически.
 - [ ] Абонентка: брать `deal` + `installment_id` из `items`, неоплаченные плитки —
       кликабельные; оплата через `/deals/{id}/pay/`.
+- [ ] Аналитика продаж: страница аналитики консалтинга читает
+      `GET /api/consalting/sales/analytics/` (totals + by_service + by_employee + by_day).

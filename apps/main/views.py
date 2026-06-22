@@ -3427,7 +3427,11 @@ class ManufactureSubrealListCreateAPIView(CompanyBranchRestrictedMixin, generics
             .select_related("company", "user", "agent", "product")
             .all()
         )
-        return self._filter_qs_company_branch(qs)
+        qs = self._filter_qs_company_branch(qs)
+        # Агент видит только свои приёмки; владелец/админ — все приёмки компании.
+        if not _is_owner_like(self.request.user):
+            qs = qs.filter(agent=self.request.user)
+        return qs
 
     @transaction.atomic
     def perform_create(self, serializer):
@@ -3535,7 +3539,11 @@ class ManufactureSubrealRetrieveUpdateDestroyAPIView(
             .select_related("company", "user", "agent", "product")
             .all()
         )
-        return self._filter_qs_company_branch(qs)
+        qs = self._filter_qs_company_branch(qs)
+        # Агент работает только со своими приёмками; владелец/админ — со всеми.
+        if not _is_owner_like(self.request.user):
+            qs = qs.filter(agent=self.request.user)
+        return qs
 
     def perform_update(self, serializer):
         company = self._company()

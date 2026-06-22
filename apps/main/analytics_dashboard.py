@@ -332,9 +332,21 @@ def build_dashboard_payload(*, company, branch, period_params: dict, user=None, 
     purchases_total = purchases_qs.aggregate(s=Coalesce(Sum("price"), ZERO_MONEY))["s"] or Decimal("0.00")
 
     # ─────────────────────────────────────────────────────────
+    # Consalting: фактически полученные деньги (факт оплаты) за период
+    # ─────────────────────────────────────────────────────────
+    from apps.consalting.funnel.analytics import consalting_paid_income
+    consalting_income, consalting_income_daily = consalting_paid_income(
+        company, date_from=date_from, date_to=date_to, branch=branch, with_daily=True
+    )
+    consalting_income = _money(consalting_income)
+
+    # ─────────────────────────────────────────────────────────
     # Finance totals (month)
     # ─────────────────────────────────────────────────────────
-    income_month = _money((barber_totals["revenue"] or 0) + (sales_revenue or 0) + (flows_income or 0))
+    income_month = _money(
+        (barber_totals["revenue"] or 0) + (sales_revenue or 0)
+        + (flows_income or 0) + (consalting_income or 0)
+    )
     expense_month = _money(flows_expense or 0)
     profit_month = _money(income_month - expense_month)
 
@@ -376,7 +388,10 @@ def build_dashboard_payload(*, company, branch, period_params: dict, user=None, 
 
     dynamics = []
     for d in _date_iter(date_from, date_to):
-        income_d = _money(barber_daily.get(d) + sales_daily.get(d) + flows_income_daily.get(d))
+        income_d = _money(
+            (barber_daily.get(d) or 0) + (sales_daily.get(d) or 0)
+            + (flows_income_daily.get(d) or 0) + (consalting_income_daily.get(d) or 0)
+        )
         expense_d = _money(flows_expense_daily.get(d))
         dynamics.append(
             {
@@ -437,6 +452,9 @@ def build_dashboard_payload(*, company, branch, period_params: dict, user=None, 
             "income": _money_str(sales_revenue + flows_income),
             "expense": _money_str(flows_expense),
             "rows": cashboxes_rows,
+        },
+        "consalting": {
+            "paid_income": _money_str(consalting_income),
         },
         "suppliers": {
             "purchases_total": _money_str(purchases_total),

@@ -963,6 +963,10 @@ Body создания заявки владельцем:
   "product_article": "string|null",
   "product_unit": "string",
   "product_price": "100.000",
+  "product_wholesale_price": "80.000",
+  "product_discount_percent": "0.00",
+  "product_price_after_discount": "100.000",
+  "can_sell_wholesale": false,
   "product_group": "uuid|null",
   "product_group_name": "string|null",
   "product_category": "uuid|null",
@@ -972,6 +976,12 @@ Body создания заявки владельцем:
 }
 ```
 Поля `product_group` / `product_group_name` и `product_category` / `product_category_name` — группа и категория товара (для отображения по папкам).
+
+Цены:
+- `product_price` — розничная цена товара (`WarehouseProduct.price`).
+- `product_wholesale_price` — оптовая цена товара (`WarehouseProduct.wholesale_price`). `0.000`, если опт не задан.
+- `product_price_after_discount` — розничная цена с учётом скидки с карточки товара.
+- `can_sell_wholesale` — разрешил ли владелец данному агенту продавать по оптовой цене (флаг `CompanyWarehouseAgent.can_sell_wholesale`). Если `true` — на продаже можно слать `is_wholesale=true` и тогда подставится `product_wholesale_price`. Поле приходит на эндпойнте агента (`agents/me/products`); во владельческом списке всегда `false`.
 
 Ответ при доступе к общему товару склада (режим common_access): формат тот же (`product_price` берётся из `WarehouseProduct.price`), плюс вместо `last_movement_at` — поля дат товара:
 - `created_date` — дата создания товара (ISO datetime или null)

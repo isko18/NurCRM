@@ -357,3 +357,185 @@ class SubscriptionScheduleApiTests(TestCase):
         self.assertEqual(r1.status_code, 200)
         self.assertEqual(r2.status_code, 200)
         self.assertEqual(DealPayment.objects.filter(deal_id=deal_id).count(), 1)
+
+
+class SalesCompletionAnalyticsApiTests(TestCase):
+    """API: создание продажи на выигрыше (win/move-stage) + аналитика продаж."""
+
+    def setUp(self):
+        from rest_framework.test import APIClient
+        from apps.consalting.models import ServicesConsalting
+
+        self.owner = User.objects.create(email="o5@x.com", first_name="O", last_name="W")
+        self.company = Company.objects.create(name="Acme5", owner=self.owner)
+        self.owner.company = self.company
+        self.owner.save()
+
+        self.funnel = FunnelConsalting.objects.create(company=self.company, name="F")
+        self.new = FunnelStageConsalting.objects.create(
+            company=self.company, funnel=self.funnel, name="New", order=0, stage_type=T.NEW_LEAD)
+        self.won = FunnelStageConsalting.objects.create(
+            company=self.company, funnel=self.funnel, name="Won", order=1, stage_type=T.WON)
+        self.service = ServicesConsalting.objects.create(
+            company=self.company, name="Консультация", price=Decimal("0"))
+
+        self.client = APIClient()
+        self.client.force_authenticate(self.owner)
+
+    def _lead(self):
+        return LeadConsalting.objects.create(
+            company=self.company, funnel=self.funnel, stage=self.new, owner=self.owner,
+            title="Лид", estimated_value=Decimal("50000"), stage_entered_at=timezone.now())
+
+    def _sales_count(self, lead):
+        from apps.consalting.models import SaleConsalting
+        return SaleConsalting.objects.filter(lead=lead).count()
+
+    def test_win_endpoint_creates_sale(self):
+        lead = self._lead()
+        resp = self.client.post(f"/api/consalting/leads/{lead.id}/win/", {}, format="json")
+        self.assertEqual(resp.status_code, 200, resp.content)
+        self.assertEqual(self._sales_count(lead), 1)
+        from apps.consalting.models import SaleConsalting
+        sale = SaleConsalting.objects.get(lead=lead)
+        self.assertEqual(sale.total, Decimal("50000"))
+
+    def test_move_to_won_stage_creates_sale(self):
+        lead = self._lead()
+        resp = self.client.post(
+            f"/api/consalting/leads/{lead.id}/move-stage/",
+            {"stage": str(self.won.id)}, format="json")
+        self.assertEqual(resp.status_code, 200, resp.content)
+        self.assertEqual(self._sales_count(lead), 1)
+
+    def test_sale_creation_is_idempotent(self):
+        lead = self._lead()
+        self.client.post(f"/api/consalting/leads/{lead.id}/win/", {}, format="json")
+        # повторный move-stage на ту же WON-стадию не должен плодить продажу
+        self.client.post(
+            f"/api/consalting/leads/{lead.id}/move-stage/",
+            {"stage": str(self.won.id)}, format="json")
+        self.assertEqual(self._sales_count(lead), 1)
+
+    def test_sales_analytics_aggregates(self):
+        from apps.consalting.models import SaleConsalting
+        SaleConsalting.objects.create(
+            company=self.company, user=self.owner, services=self.service,
+            total=Decimal("30000"))
+        SaleConsalting.objects.create(
+            company=self.company, user=self.owner, services=self.service,
+            total=Decimal("20000"), subscription_amount=Decimal("5000"),
+            subscription_period="month")
+
+        resp = self.client.get("/api/consalting/sales/analytics/")
+        self.assertEqual(resp.status_code, 200, resp.content)
+        t = resp.data["totals"]
+        self.assertEqual(t["count"], 2)
+        self.assertEqual(t["revenue"], 50000.0)
+        self.assertEqual(t["avg_check"], 25000.0)
+        self.assertEqual(t["subscription_count"], 1)
+        self.assertEqual(t["subscription_total"], 5000.0)
+        # топ услуг и сотрудников непустые
+        self.assertTrue(any(s["service_name"] == "Консультация" for s in resp.data["by_service"]))
+        self.assertTrue(resp.data["by_employee"])
+
+
+class ConsaltingPaidIncomeTests(TestCase):
+    """Факт оплаты: register-payment + подписка → аналитика продаж и общий дашборд."""
+
+    def setUp(self):
+        from rest_framework.test import APIClient
+        from apps.main.models import Client
+
+        self.owner = User.objects.create(email="o6@x.com", first_name="O", last_name="W", role="owner")
+        self.company = Company.objects.create(name="Acme6", owner=self.owner)
+        self.owner.company = self.company
+        self.owner.save()
+
+        self.funnel = FunnelConsalting.objects.create(company=self.company, name="F")
+        self.new = FunnelStageConsalting.objects.create(
+            company=self.company, funnel=self.funnel, name="New", order=0, stage_type=T.NEW_LEAD)
+        self.client_obj = Client.objects.create(
+            company=self.company, full_name="Иван", phone="+700", salesperson=self.owner)
+
+        self.client = APIClient()
+        self.client.force_authenticate(self.owner)
+
+    def _paid_income(self):
+        resp = self.client.get("/api/consalting/sales/analytics/")
+        self.assertEqual(resp.status_code, 200, resp.content)
+        return resp.data["totals"]["paid_income"]
+
+    def test_register_payment_cash_counts_as_paid(self):
+        lead = LeadConsalting.objects.create(
+            company=self.company, funnel=self.funnel, stage=self.new, owner=self.owner,
+            title="Лид", client=self.client_obj, estimated_value=Decimal("10000"),
+            stage_entered_at=timezone.now())
+        resp = self.client.post(
+            f"/api/consalting/leads/{lead.id}/register-payment/",
+            {"payment_mode": "cash", "amount": "10000"}, format="json")
+        self.assertEqual(resp.status_code, 201, resp.content)
+        lead.refresh_from_db()
+        self.assertIsNotNone(lead.payment_deal_id)  # сделка привязана к лиду
+        self.assertEqual(self._paid_income(), 10000.0)
+
+    def test_subscription_installment_counts_as_paid(self):
+        from apps.consalting.models import SaleConsalting
+        sale = SaleConsalting.objects.create(
+            company=self.company, client=self.client_obj,
+            subscription_amount=Decimal("5000"), subscription_period="month",
+            subscription_started_at=timezone.now())
+        # GET расписания создаёт подложку-сделку + взносы
+        sch = self.client.get(
+            f"/api/main/clients/{self.client_obj.id}/subscription-schedule/")
+        item = sch.data["items"][0]
+        # факт оплаты ещё ноль
+        self.assertEqual(self._paid_income(), 0.0)
+        # оплачиваем один взнос
+        import uuid as _uuid
+        pay = self.client.post(
+            f"/api/main/clients/{self.client_obj.id}/deals/{item['deal']}/pay/",
+            {"installment_id": item["installment_id"], "amount": "5000",
+             "idempotency_key": str(_uuid.uuid4())}, format="json")
+        self.assertEqual(pay.status_code, 200, pay.content)
+        self.assertEqual(self._paid_income(), 5000.0)
+
+    def test_paid_income_helper_total_and_daily(self):
+        # источник данных для общего дашборда (build_dashboard_payload зовёт этот же хелпер)
+        from apps.consalting.funnel.analytics import consalting_paid_income
+        lead = LeadConsalting.objects.create(
+            company=self.company, funnel=self.funnel, stage=self.new, owner=self.owner,
+            title="Лид", client=self.client_obj, estimated_value=Decimal("7000"),
+            stage_entered_at=timezone.now())
+        self.client.post(
+            f"/api/consalting/leads/{lead.id}/register-payment/",
+            {"payment_mode": "transfer", "amount": "7000"}, format="json")
+
+        total, by_day = consalting_paid_income(self.company, with_daily=True)
+        self.assertEqual(total, Decimal("7000"))
+        today = timezone.localdate()
+        self.assertEqual(by_day.get(today), Decimal("7000"))
+
+    def test_paid_income_excludes_other_company_deals(self):
+        # чужая компания со своей оплатой не попадает в наш paid_income
+        from apps.consalting.funnel.analytics import consalting_paid_income
+        from apps.main.models import Client
+        other_owner = User.objects.create(email="o6b@x.com")
+        other_co = Company.objects.create(name="Other6", owner=other_owner)
+        other_owner.company = other_co
+        other_owner.save()
+        other_funnel = FunnelConsalting.objects.create(company=other_co, name="OF")
+        other_new = FunnelStageConsalting.objects.create(
+            company=other_co, funnel=other_funnel, name="N", order=0, stage_type=T.NEW_LEAD)
+        other_client = Client.objects.create(
+            company=other_co, full_name="Чужой", phone="+701", salesperson=other_owner)
+        oc = __import__("rest_framework.test", fromlist=["APIClient"]).APIClient()
+        oc.force_authenticate(other_owner)
+        olead = LeadConsalting.objects.create(
+            company=other_co, funnel=other_funnel, stage=other_new, owner=other_owner,
+            title="L", client=other_client, estimated_value=Decimal("9999"),
+            stage_entered_at=timezone.now())
+        oc.post(f"/api/consalting/leads/{olead.id}/register-payment/",
+                {"payment_mode": "cash", "amount": "9999"}, format="json")
+        # в нашей компании дохода нет
+        self.assertEqual(consalting_paid_income(self.company), Decimal("0.00"))
