@@ -696,6 +696,33 @@ class FunnelStageReorderView(CompanyBranchQuerysetMixin, generics.GenericAPIView
             if not can_manage_stages(request.user, funnel):
                 raise PermissionDenied("Нет прав управлять стадиями этой воронки.")
 
+        # Запрос может содержать лишь часть стадий (например, одну перетащенную) с
+        # позицией, которую уже занимает другая стадия. Поэтому пересобираем порядок
+        # ЦЕЛИКОМ по каждой затронутой воронке: запрошенные стадии встают на свои
+        # места, остальные сдвигаются, итог — плотная нумерация 0..N-1 без коллизий.
+        all_stages = list(
+            FunnelStageConsalting.objects.filter(funnel_id__in=funnels.keys())
+        )
+        by_funnel = {}
+        for s in all_stages:
+            by_funnel.setdefault(s.funnel_id, []).append(s)
+
+        to_update = []
+        for funnel_id, group in by_funnel.items():
+            # ключ сортировки: запрошенные стадии — по новому order и приоритетом 0
+            # (занимают слот раньше «сдвигаемой» прежней), остальные — по текущему order.
+            def sort_key(s):
+                sid = str(s.id)
+                if sid in order_map:
+                    return (order_map[sid], 0, s.order, sid)
+                return (s.order, 1, s.order, sid)
+
+            ordered = sorted(group, key=sort_key)
+            for new_order, s in enumerate(ordered):
+                if s.order != new_order:
+                    s.order = new_order
+                    to_update.append(s)
+
         # два прохода, чтобы не нарушить UniqueConstraint(funnel, order):
         # сначала «паркуем» в заведомо свободные значения выше всех существующих
         # (order — PositiveIntegerField, поэтому только положительные), потом — целевые.
@@ -703,26 +730,29 @@ class FunnelStageReorderView(CompanyBranchQuerysetMixin, generics.GenericAPIView
         max_existing = FunnelStageConsalting.objects.filter(
             funnel_id__in=funnels.keys()
         ).aggregate(m=Max("order"))["m"] or 0
-        park_base = max(max_existing, max(order_map.values())) + 1
         try:
             with transaction.atomic():
-                for idx, s in enumerate(stages):
-                    s.order = park_base + idx
-                FunnelStageConsalting.objects.bulk_update(stages, ["order"])
-                for s in stages:
-                    s.order = order_map[str(s.id)]
-                FunnelStageConsalting.objects.bulk_update(stages, ["order"])
+                if to_update:
+                    parked = []
+                    for idx, s in enumerate(to_update):
+                        final = s.order
+                        s.order = max_existing + 1 + idx
+                        parked.append((s, final))
+                    FunnelStageConsalting.objects.bulk_update(to_update, ["order"])
+                    for s, final in parked:
+                        s.order = final
+                    FunnelStageConsalting.objects.bulk_update(to_update, ["order"])
         except IntegrityError:
             return Response(
                 {"detail": "Конфликт порядка стадий: значения order не уникальны в пределах воронки."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        stages.sort(key=lambda s: s.order)
+        all_stages.sort(key=lambda s: (str(s.funnel_id), s.order))
         data = FunnelStageConsaltingSerializer(
-            stages, many=True, context=self.get_serializer_context()
+            all_stages, many=True, context=self.get_serializer_context()
         ).data
-        return Response({"updated": len(stages), "stages": data})
+        return Response({"updated": len(to_update), "stages": data})
 
 
 # ==========================

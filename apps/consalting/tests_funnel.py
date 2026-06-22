@@ -140,6 +140,22 @@ class FunnelDnDApiTests(TestCase):
         self.s0.refresh_from_db(); self.s1.refresh_from_db(); self.s2.refresh_from_db()
         self.assertEqual((self.s0.order, self.s1.order, self.s2.order), (2, 0, 1))
 
+    def test_reorder_partial_move_shifts_others(self):
+        # двигаем одну стадию на позицию, которую занимает другая (не из запроса):
+        # остальные должны сдвинуться, без конфликта UniqueConstraint(funnel, order)
+        resp = self.client.post(
+            "/api/consalting/funnel-stages/reorder/",
+            [{"id": str(self.s2.id), "order": 1}],
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+        self.s0.refresh_from_db(); self.s1.refresh_from_db(); self.s2.refresh_from_db()
+        # ожидаем плотную нумерацию: s0=0, s2=1 (на запрошенной позиции), s1=2
+        self.assertEqual((self.s0.order, self.s2.order, self.s1.order), (0, 1, 2))
+        # системная стадия осталась последней и не тронута семантически
+        self.sys.refresh_from_db()
+        self.assertEqual(self.sys.order, 3)
+
     def test_reorder_rejects_system_stage(self):
         resp = self.client.post(
             "/api/consalting/funnel-stages/reorder/",
