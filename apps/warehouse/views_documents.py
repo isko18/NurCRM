@@ -6,10 +6,12 @@ from django.shortcuts import get_object_or_404
 from django.db.models import Q, Prefetch
 from django_filters.rest_framework import DjangoFilterBackend
 
+from decimal import Decimal
+
 from . import models, serializers_documents, services, services_money
 from rest_framework.exceptions import ValidationError as DRFValidationError
 from django.core.exceptions import ValidationError as DjangoValidationError
-from .views import CompanyBranchRestrictedMixin, filter_qs_company_branch_or_global
+from .views import CompanyBranchRestrictedMixin, filter_qs_company_branch_or_global, _parse_scale_barcode
 from apps.utils import _is_owner_like
 
 
@@ -242,6 +244,148 @@ class DocumentDetailView(CompanyBranchRestrictedMixin, generics.RetrieveUpdateDe
         if not _is_owner_like(user):
             qs = qs.filter(agent=user)
         return qs
+
+
+class DocumentScanView(CompanyBranchRestrictedMixin, APIView):
+    """
+    Разрешение штрихкода в строку документа (продажа/возврат/приход и т.п.).
+
+    POST /api/warehouse/documents/scan/
+    Body:
+        {
+          "barcode": "4600...",          # обязательно
+          "warehouse": "<uuid>",          # опционально — уточнить склад при совпадении кода
+          "doc_type": "SALE",             # опционально (по умолчанию SALE) — влияет на цену
+          "is_wholesale": false           # опционально — для SALE подставит оптовую цену
+        }
+
+    Возвращает готовую строку для добавления в `items` документа. Товар НЕ создаётся.
+        200 — найден ровно один товар.
+        404 — товар по штрихкоду не найден.
+        409 — штрихкод есть на нескольких складах, нужно уточнить `warehouse`.
+    """
+
+    def _base_products_qs(self):
+        qs = (
+            models.WarehouseProduct.objects
+            .select_related("warehouse", "company", "branch", "characteristics")
+            .prefetch_related("images", "alternate_barcodes")
+        )
+        return self._filter_qs_company_branch(qs)
+
+    def _resolve_warehouse(self, warehouse_id):
+        if not warehouse_id:
+            return None
+        wh = self._filter_qs_company_branch(models.Warehouse.objects.all()).filter(id=warehouse_id).first()
+        if wh is None:
+            raise DRFValidationError({"warehouse": "Склад не найден или недоступен."})
+        return wh
+
+    def _suggested_price(self, product, doc_type, is_wholesale):
+        retail = Decimal(str(product.price or 0))
+        wholesale = Decimal(str(product.wholesale_price or 0))
+        if doc_type == models.Document.DocType.SALE and is_wholesale and wholesale > 0:
+            chosen = wholesale
+        else:
+            chosen = retail
+        return chosen.quantize(Decimal("0.01"))
+
+    def _product_image_url(self, request, product):
+        img = next(iter(product.images.all()), None)
+        if not img or not getattr(img, "image", None):
+            img = (
+                models.WarehouseProductImage.objects.filter(product=product)
+                .order_by("-is_primary", "created_at")
+                .first()
+            )
+        if not img or not getattr(img, "image", None):
+            return None
+        url = img.image.url
+        return request.build_absolute_uri(url) if request else url
+
+    def _line_payload(self, request, product, *, doc_type, is_wholesale, scan_qty, barcode):
+        qty = scan_qty if scan_qty is not None else Decimal("1")
+        return {
+            "product": str(product.id),
+            "product_name": product.name,
+            "product_article": product.article or "",
+            "warehouse": str(product.warehouse_id) if product.warehouse_id else None,
+            "warehouse_name": getattr(product.warehouse, "name", None),
+            "barcode": barcode,
+            "unit": product.unit,
+            "is_weight": bool(product.is_weight),
+            "available_qty": str(product.quantity),
+            "qty": str(qty.quantize(Decimal("0.001"))),
+            "price": str(self._suggested_price(product, doc_type, is_wholesale)),
+            "product_price": str(product.price),
+            "product_wholesale_price": str(product.wholesale_price),
+            "product_discount_percent": str(product.discount_percent),
+            "product_image_url": self._product_image_url(request, product),
+        }
+
+    def post(self, request, *args, **kwargs):
+        barcode = (request.data.get("barcode") or "").strip()
+        if not barcode:
+            raise DRFValidationError({"barcode": "Обязательное поле."})
+
+        doc_type = (request.data.get("doc_type") or models.Document.DocType.SALE)
+        is_wholesale = request.data.get("is_wholesale", False)
+        if isinstance(is_wholesale, str):
+            is_wholesale = is_wholesale.strip().lower() in ("true", "1", "yes")
+
+        warehouse = self._resolve_warehouse(request.data.get("warehouse"))
+
+        qs = self._base_products_qs()
+        if warehouse is not None:
+            qs = qs.filter(warehouse=warehouse)
+
+        scan_qty = None
+        matches = list(
+            qs.filter(Q(barcode=barcode) | Q(alternate_barcodes__barcode=barcode)).distinct()
+        )
+
+        if not matches:
+            scale_data = _parse_scale_barcode(barcode)
+            if scale_data:
+                scan_qty = models.q_qty(Decimal(scale_data["weight_kg"]))
+                matches = list(qs.filter(plu=scale_data["plu"]))
+
+        if not matches:
+            return Response(
+                {"detail": "Товар по штрихкоду не найден.", "barcode": barcode},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        if len(matches) > 1:
+            return Response(
+                {
+                    "detail": "Штрихкод найден на нескольких складах — уточните warehouse.",
+                    "barcode": barcode,
+                    "candidates": [
+                        {
+                            "product": str(p.id),
+                            "warehouse": str(p.warehouse_id) if p.warehouse_id else None,
+                            "warehouse_name": getattr(p.warehouse, "name", None),
+                            "available_qty": str(p.quantity),
+                        }
+                        for p in matches
+                    ],
+                },
+                status=status.HTTP_409_CONFLICT,
+            )
+
+        product = matches[0]
+        return Response(
+            self._line_payload(
+                request,
+                product,
+                doc_type=doc_type,
+                is_wholesale=is_wholesale,
+                scan_qty=scan_qty,
+                barcode=barcode,
+            ),
+            status=status.HTTP_200_OK,
+        )
 
 
 class AgentDocumentDetailView(DocumentDetailView):

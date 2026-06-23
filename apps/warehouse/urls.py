@@ -42,6 +42,7 @@ from .views_documents import (
     DocumentCashApproveView, DocumentCashRejectView,
     CashApprovalRequestListView, CashApprovalRequestApproveView, CashApprovalRequestRejectView,
     AgentDocumentListCreateView, AgentDocumentDetailView,
+    DocumentScanView,
     DocumentTransferCreateAPIView,
     ProductListCreateView, ProductDetailView as ProductDetailViewCRUD,
     WarehouseListCreateView, WarehouseDetailView as WarehouseDetailViewCRUD,
@@ -190,6 +191,7 @@ urlpatterns += [
 urlpatterns += [
     # documents
     path("documents/", DocumentListCreateView.as_view(), name="warehouse-documents"),
+    path("documents/scan/", DocumentScanView.as_view(), name="warehouse-documents-scan"),
     path("transfer/", DocumentTransferCreateAPIView.as_view(), name="warehouse-transfer"),
     path("stock-partnership-requests/", CompanyStockPartnershipRequestListCreateAPIView.as_view(), name="warehouse-stock-partnership-requests"),
     path("stock-partnership-requests/<uuid:pk>/accept/", CompanyStockPartnershipRequestAcceptAPIView.as_view(), name="warehouse-stock-partnership-request-accept"),
