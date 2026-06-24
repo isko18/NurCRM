@@ -20,6 +20,8 @@ from django.conf.urls.static import static
 from django.conf import settings
 from .views_media_proxy import media_proxy
 from .views_version import ClientVersionView
+from .views_version import ClientVersionView
+from .views_health import health_check
 
 if settings.ENABLE_API_DOCS:
     from rest_framework import permissions
@@ -68,6 +70,7 @@ api_urlpatterns = [
 
 # Основные пути проекта
 urlpatterns = [
+    path('health/', health_check, name='health-check'),
     path('admin/', admin.site.urls),  # Админка
 
     # Подключение API
