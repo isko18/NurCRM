@@ -1604,7 +1604,11 @@ class Document(models.Model):
 class DocumentItem(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     document = models.ForeignKey(Document, on_delete=models.CASCADE, related_name="items", verbose_name="Документ")
-    product = models.ForeignKey("warehouse.WarehouseProduct", on_delete=models.PROTECT, verbose_name="Товар")
+    # SET_NULL: товар можно удалить, строки документов (история) сохраняются.
+    product = models.ForeignKey(
+        "warehouse.WarehouseProduct", on_delete=models.SET_NULL,
+        null=True, blank=True, related_name="document_items", verbose_name="Товар",
+    )
     qty = models.DecimalField(max_digits=18, decimal_places=3, verbose_name="Количество")
     price = models.DecimalField(max_digits=18, decimal_places=2, default=Decimal("0.00"), verbose_name="Цена")
     discount_percent = models.DecimalField(
@@ -1967,7 +1971,9 @@ class AgentRequestItem(BaseModelId, BaseModelDate, BaseModelCompanyBranch):
     )
     product = models.ForeignKey(
         "warehouse.WarehouseProduct",
-        on_delete=models.PROTECT,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
         related_name="agent_request_items",
         verbose_name="Товар",
     )
@@ -2242,7 +2248,9 @@ class AgentReturnItem(BaseModelId, BaseModelDate, BaseModelCompanyBranch):
     )
     product = models.ForeignKey(
         "warehouse.WarehouseProduct",
-        on_delete=models.PROTECT,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
         related_name="agent_return_items",
         verbose_name="Товар",
     )
