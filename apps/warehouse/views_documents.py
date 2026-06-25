@@ -11,7 +11,12 @@ from decimal import Decimal
 from . import models, serializers_documents, services, services_money
 from rest_framework.exceptions import ValidationError as DRFValidationError
 from django.core.exceptions import ValidationError as DjangoValidationError
-from .views import CompanyBranchRestrictedMixin, filter_qs_company_branch_or_global, _parse_scale_barcode
+from .views import (
+    CompanyBranchRestrictedMixin,
+    filter_qs_company_branch_or_global,
+    _parse_scale_barcode,
+    ProtectedProductDeleteMixin,
+)
 from apps.utils import _is_owner_like
 
 
@@ -728,9 +733,9 @@ class ProductListCreateView(CompanyBranchRestrictedMixin, generics.ListCreateAPI
         return qs
 
 
-class ProductDetailView(CompanyBranchRestrictedMixin, generics.RetrieveUpdateDestroyAPIView):
+class ProductDetailView(ProtectedProductDeleteMixin, CompanyBranchRestrictedMixin, generics.RetrieveUpdateDestroyAPIView):
     serializer_class = serializers_documents.ProductSimpleSerializer
-    
+
     def get_queryset(self):
         # Оптимизация: предзагружаем связанные объекты
         qs = (

@@ -22,6 +22,10 @@ from apps.main.models import (
     ProductRecipeItem, ProductPromotionTier, ProductAlternateBarcode, MarketSaleEmployeePayProfile,
     SupplierReceipt, SupplierReceiptItem,
     KnowledgeBaseCourse, KnowledgeBaseLesson,
+    FinishedToRawTransfer,
+    Inventory, InventoryItem,
+    StockShortageEvent,
+    StockMovement,
 )
 
 from apps.consalting.models import ServicesConsalting
@@ -1759,11 +1763,22 @@ class ReviewSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
 class NotificationSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
     company = serializers.ReadOnlyField(source='company.id')
     branch = serializers.ReadOnlyField(source='branch.id')
+    actor_name = serializers.SerializerMethodField()
 
     class Meta:
         model = Notification
-        fields = ['id', 'company', 'branch', 'message', 'is_read', 'created_at']
-        read_only_fields = ['id', 'company', 'branch', 'created_at']
+        fields = [
+            'id', 'company', 'branch', 'type', 'title', 'message', 'url',
+            'level', 'is_read', 'actor_name', 'data', 'created_at',
+        ]
+        read_only_fields = ['id', 'company', 'branch', 'actor_name', 'created_at']
+
+    def get_actor_name(self, obj):
+        actor = getattr(obj, "actor", None)
+        if not actor:
+            return ""
+        full = f"{(actor.first_name or '').strip()} {(actor.last_name or '').strip()}".strip()
+        return full or getattr(actor, "email", "") or ""
 
     def create(self, validated_data):
         user = self._user()
@@ -2463,6 +2478,156 @@ class ItemMakeSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer
         instance = self._item_make_instance()
         if instance and instance.kind == ItemMake.Kind.PROCESSED:
             self.fields["needs_processing"].read_only = True
+
+
+class FinishedToRawTransferSerializer(serializers.ModelSerializer):
+    """Чтение истории перемещений готовой продукции в сырьё."""
+    product_name = serializers.CharField(source="product.name", read_only=True)
+    user_name = serializers.SerializerMethodField()
+
+    class Meta:
+        model = FinishedToRawTransfer
+        fields = [
+            "id", "product", "product_name", "raw_item", "quantity", "reason",
+            "status", "user_name", "created_at", "canceled_at",
+        ]
+
+    def get_user_name(self, obj):
+        u = getattr(obj, "user", None)
+        if not u:
+            return ""
+        full = f"{(u.first_name or '').strip()} {(u.last_name or '').strip()}".strip()
+        return full or getattr(u, "email", "") or "Пользователь"
+
+
+class FinishedToRawMoveInputSerializer(serializers.Serializer):
+    """Вход для POST /main/products/{id}/move-to-raw/."""
+    quantity = serializers.DecimalField(max_digits=14, decimal_places=3)
+    reason = serializers.CharField(required=False, allow_blank=True, default="")
+
+    def validate_quantity(self, value):
+        if value is None or value <= 0:
+            raise serializers.ValidationError("Количество должно быть больше нуля.")
+        return value
+
+
+# ─────────────────────────────────────────────────────────────
+# Инвентаризация (сверка остатков)
+# ─────────────────────────────────────────────────────────────
+class InventoryItemReadSerializer(serializers.ModelSerializer):
+    product = serializers.UUIDField(source="object_id", read_only=True)
+
+    class Meta:
+        model = InventoryItem
+        fields = ["id", "product", "product_name", "qty_system", "qty_fact", "diff"]
+
+
+class InventoryReadSerializer(serializers.ModelSerializer):
+    user_name = serializers.SerializerMethodField()
+    doc_no = serializers.SerializerMethodField()
+    items_count = serializers.SerializerMethodField()
+    items = InventoryItemReadSerializer(many=True, read_only=True)
+
+    class Meta:
+        model = Inventory
+        fields = [
+            "id", "doc_no", "warehouse", "status", "comment", "user_name",
+            "created_at", "confirmed_at", "surplus_qty", "shortage_qty",
+            "items_count", "items",
+        ]
+
+    def get_doc_no(self, obj):
+        return f"INV-{str(obj.id)[:8].upper()}"
+
+    def get_items_count(self, obj):
+        return obj.items.count()
+
+    def get_user_name(self, obj):
+        u = getattr(obj, "user", None)
+        if not u:
+            return ""
+        full = f"{(u.first_name or '').strip()} {(u.last_name or '').strip()}".strip()
+        return full or getattr(u, "email", "") or "Пользователь"
+
+
+class InventoryItemInputSerializer(serializers.Serializer):
+    product = serializers.UUIDField()
+    qty_system = serializers.DecimalField(max_digits=14, decimal_places=3)
+    qty_fact = serializers.DecimalField(max_digits=14, decimal_places=3)
+
+    def validate_qty_fact(self, value):
+        if value is None or value < 0:
+            raise serializers.ValidationError("Количество не может быть отрицательным.")
+        return value
+
+    def validate_qty_system(self, value):
+        if value is None or value < 0:
+            raise serializers.ValidationError("Количество не может быть отрицательным.")
+        return value
+
+
+class InventoryCreateSerializer(serializers.Serializer):
+    warehouse = serializers.ChoiceField(choices=Inventory.Warehouse.choices)
+    comment = serializers.CharField(required=False, allow_blank=True, default="")
+    status = serializers.ChoiceField(
+        choices=[Inventory.Status.DRAFT, Inventory.Status.CONFIRMED],
+        required=False, default=Inventory.Status.DRAFT,
+    )
+    items = InventoryItemInputSerializer(many=True)
+
+    def validate_items(self, value):
+        if not value:
+            raise serializers.ValidationError("Добавьте хотя бы одну позицию.")
+        return value
+
+
+# ─────────────────────────────────────────────────────────────
+# Нехватка готовой продукции (событие + уведомления)
+# ─────────────────────────────────────────────────────────────
+class StockShortageEventReadSerializer(serializers.ModelSerializer):
+    product_name = serializers.CharField(source="product.name", read_only=True, default="")
+    agent_name = serializers.SerializerMethodField()
+
+    class Meta:
+        model = StockShortageEvent
+        fields = [
+            "id", "product", "product_name", "requested_qty", "available_qty",
+            "agent", "agent_name", "source", "created_at",
+        ]
+
+    def get_agent_name(self, obj):
+        u = getattr(obj, "agent", None)
+        if not u:
+            return ""
+        full = f"{(u.first_name or '').strip()} {(u.last_name or '').strip()}".strip()
+        return full or getattr(u, "email", "") or ""
+
+
+class StockShortageEventCreateSerializer(serializers.Serializer):
+    product = serializers.UUIDField()
+    product_name = serializers.CharField(required=False, allow_blank=True, default="")
+    requested_qty = serializers.DecimalField(max_digits=14, decimal_places=3)
+    available_qty = serializers.DecimalField(max_digits=14, decimal_places=3)
+    agent = serializers.UUIDField(required=False, allow_null=True)
+    agent_name = serializers.CharField(required=False, allow_blank=True, default="")
+    source = serializers.ChoiceField(
+        choices=StockShortageEvent.Source.choices, required=False,
+        default=StockShortageEvent.Source.TRANSFER,
+    )
+
+
+class StockMovementReadSerializer(serializers.ModelSerializer):
+    """Read-only журнал движения склада."""
+    class Meta:
+        model = StockMovement
+        fields = [
+            "id", "type", "created_at", "object_id", "product_name", "warehouse",
+            "qty_before", "change", "qty_after",
+            "source_type", "source_id", "source_name",
+            "target_type", "target_id", "target_name",
+            "sender_id", "sender_name", "receiver_id", "receiver_name",
+            "created_by_name", "comment", "ref_type", "ref_id",
+        ]
 
 
 class ItemMakeProcessSerializer(serializers.Serializer):

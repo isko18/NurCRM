@@ -14,6 +14,7 @@ from apps.instagram import routing as ig_routing
 from apps.scale import ws_routing as scale_ws_routing
 from apps.cafe import routing as cafe_routing
 from apps.consalting import routing as consalting_routing
+from apps.main import routing as main_routing
 
 # один общий список всех WS-маршрутов
 websocket_urlpatterns = (
@@ -21,6 +22,7 @@ websocket_urlpatterns = (
     + scale_ws_routing.websocket_urlpatterns
     + cafe_routing.websocket_urlpatterns
     + consalting_routing.websocket_urlpatterns
+    + main_routing.websocket_urlpatterns
 )
 
 

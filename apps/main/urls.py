@@ -52,6 +52,23 @@ urlpatterns = [
     path('products/<uuid:pk>/purchase-batches/', ProductPurchaseBatchListAPIView.as_view(), name='product-purchase-batches'),
     path("products/<uuid:product_id>/favorite/", ProductFavoriteAPIView.as_view(), name="product-favorite"),
     path("products/bulk-delete/", ProductBulkDeleteAPIView.as_view(), name="product-bulk-delete"),
+    path("products/<uuid:product_id>/move-to-raw/", ProductMoveToRawAPIView.as_view(), name="product-move-to-raw"),
+
+    # 🔹 Перемещение готовой продукции в сырьё (история / отмена)
+    path("finished-to-raw-transfers/", FinishedToRawTransferListAPIView.as_view(), name="finished-to-raw-list"),
+    path("finished-to-raw-transfers/<uuid:pk>/cancel/", FinishedToRawTransferCancelAPIView.as_view(), name="finished-to-raw-cancel"),
+
+    # 🔹 Инвентаризация (сверка остатков)
+    path("inventories/", InventoryListCreateAPIView.as_view(), name="inventory-list-create"),
+    path("inventories/<uuid:pk>/", InventoryRetrieveAPIView.as_view(), name="inventory-detail"),
+    path("inventories/<uuid:pk>/confirm/", InventoryConfirmAPIView.as_view(), name="inventory-confirm"),
+
+    # 🔹 Нехватка готовой продукции (событие + уведомления)
+    path("stock-shortages/", StockShortageCreateAPIView.as_view(), name="stock-shortage-create"),
+
+    # 🔹 Журнал движения склада (read-only)
+    path("stock-movements/", StockMovementListAPIView.as_view(), name="stock-movement-list"),
+    path("stock-movements/<uuid:pk>/", StockMovementDetailAPIView.as_view(), name="stock-movement-detail"),
 
     # Инвентаризация товаров (остаток Product.quantity)
     path("inventory/sessions/", ProductInventorySessionListCreateAPIView.as_view(), name="product-inventory-session-list"),
@@ -97,8 +114,9 @@ urlpatterns = [
 
     # 🔹 Уведомления
     path('notifications/', NotificationListView.as_view(), name='notification-list'),
-    path('notifications/<uuid:pk>/', NotificationDetailView.as_view(), name='notification-detail'),
     path('notifications/mark-all-read/', MarkAllNotificationsReadView.as_view(), name='mark-all-notifications-read'),
+    path('notifications/<uuid:pk>/read/', MarkNotificationReadView.as_view(), name='notification-read'),
+    path('notifications/<uuid:pk>/', NotificationDetailView.as_view(), name='notification-detail'),
 
     # 🔹 События
     path('events/', EventListCreateAPIView.as_view(), name='event-list-create'),

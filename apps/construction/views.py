@@ -6,6 +6,7 @@ from django.db.models import Sum, Count, Q, Exists, OuterRef
 from django.db.models import Case, When, Value, CharField
 
 from django.shortcuts import get_object_or_404
+from django.utils.dateparse import parse_date
 
 from rest_framework import generics, permissions
 from rest_framework.views import APIView
@@ -412,6 +413,40 @@ class CashFlowListCreateView(CompanyBranchScopedMixin, generics.ListCreateAPIVie
         category_id = qp.get("category")
         if category_id:
             qs = qs.filter(category_id=category_id)
+
+        # ✅ по типу: ?type=expense|income
+        type_q = (qp.get("type") or "").strip()
+        if type_q:
+            qs = qs.filter(type=type_q)
+
+        # ✅ по периоду (по created_at): ?date_from=YYYY-MM-DD&date_to=YYYY-MM-DD
+        date_from_raw = (qp.get("date_from") or "").strip()
+        if date_from_raw:
+            df = parse_date(date_from_raw)
+            if df is None:
+                raise ValidationError({"date_from": ["Некорректная дата."]})
+            qs = qs.filter(created_at__date__gte=df)
+
+        date_to_raw = (qp.get("date_to") or "").strip()
+        if date_to_raw:
+            dt = parse_date(date_to_raw)
+            if dt is None:
+                raise ValidationError({"date_to": ["Некорректная дата."]})
+            qs = qs.filter(created_at__date__lte=dt)
+
+        # ✅ сортировка: ?ordering=-created_at|amount|category_title|... (whitelist)
+        ordering = (qp.get("ordering") or "").strip()
+        if ordering:
+            allowed = {
+                "created_at": "created_at",
+                "amount": "amount",
+                "type": "type",
+                "category_title": "category__title",
+                "cashbox_name": "cashbox__name",
+            }
+            field = allowed.get(ordering.lstrip("-"))
+            if field:
+                qs = qs.order_by(("-" if ordering.startswith("-") else "") + field)
 
         return qs
 

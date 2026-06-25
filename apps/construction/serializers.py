@@ -440,6 +440,8 @@ class CashFlowSerializer(CompanyBranchReadOnlyMixin):
 
     cashier = serializers.ReadOnlyField(source="cashier.id")
     cashier_display = serializers.SerializerMethodField()
+    # Алиас для аналитики Производства (фронт читает user_name|created_by_name|...).
+    user_name = serializers.SerializerMethodField()
 
     class Meta:
         model = CashFlow
@@ -461,6 +463,7 @@ class CashFlowSerializer(CompanyBranchReadOnlyMixin):
             "category_title",
             "cashier",
             "cashier_display",
+            "user_name",
         ]
         read_only_fields = [
             "id",
@@ -470,6 +473,7 @@ class CashFlowSerializer(CompanyBranchReadOnlyMixin):
             "branch",
             "cashier",
             "cashier_display",
+            "user_name",
             "category_title",
         ]
 
@@ -518,6 +522,10 @@ class CashFlowSerializer(CompanyBranchReadOnlyMixin):
             or getattr(u, "email", None)
             or getattr(u, "username", None)
         )
+
+    def get_user_name(self, obj):
+        # Тот же автор, что и cashier_display — отдельный ключ для аналитики Производства.
+        return self.get_cashier_display(obj)
 
     def validate(self, attrs):
         request = self.context.get("request")

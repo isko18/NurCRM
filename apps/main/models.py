@@ -2523,8 +2523,26 @@ class Notification(models.Model):
     user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='notifications')
 
     message = models.TextField()
-    is_read = models.BooleanField(default=False)
+    is_read = models.BooleanField(default=False, db_index=True)
     created_at = models.DateTimeField(auto_now_add=True)
+
+    # Real-time / типизация (doc 08)
+    class Level(models.TextChoices):
+        INFO = "info", "Инфо"
+        SUCCESS = "success", "Успех"
+        WARNING = "warning", "Предупреждение"
+        HIGH = "high", "Важно"
+        CRITICAL = "critical", "Критично"
+
+    type = models.CharField("Тип события", max_length=40, default="system", db_index=True)
+    title = models.CharField("Заголовок", max_length=255, blank=True, default="")
+    url = models.CharField("Ссылка для перехода", max_length=512, blank=True, default="")
+    level = models.CharField("Важность", max_length=16, choices=Level.choices, default=Level.INFO)
+    actor = models.ForeignKey(
+        User, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='actor_notifications', verbose_name='Инициатор',
+    )
+    data = models.JSONField("Данные для UI", default=dict, blank=True)
 
     class Meta:
         verbose_name = 'Уведомление'
@@ -2533,6 +2551,8 @@ class Notification(models.Model):
         indexes = [
             models.Index(fields=['company', 'created_at']),
             models.Index(fields=['company', 'branch', 'created_at']),
+            models.Index(fields=['user', 'is_read']),
+            models.Index(fields=['created_at']),
         ]
 
     def __str__(self):
@@ -4015,6 +4035,10 @@ class ReturnFromAgent(models.Model):
             models.Index(fields=["company", "branch", "returned_at"]),
             models.Index(fields=["subreal"]),
             models.Index(fields=["status"]),
+            # Раздельная аналитика возвратов/брака: фильтр по is_defect + статусу,
+            # срезы по агенту.
+            models.Index(fields=["company", "is_defect", "status"]),
+            models.Index(fields=["returned_by", "is_defect"]),
         ]
 
     def clean(self):
@@ -4094,7 +4118,24 @@ class ReturnFromAgent(models.Model):
         # Брак на склад НЕ возвращаем — товар списывается.
         # Обычный возврат — возвращаем количество на склад (Product.quantity).
         if not self.is_defect:
+            qty_before = prod_model.objects.filter(pk=product.pk).values_list("quantity", flat=True).first() or Decimal("0")
             prod_model.objects.select_for_update().filter(pk=product.pk).update(quantity=F("quantity") + self.qty)
+
+            # Журнал: возврат от агента (приход на склад готовой продукции)
+            try:
+                record_stock_movement(
+                    company=self.company, branch=self.branch,
+                    type=StockMovement.Type.AGENT_RETURN,
+                    object_id=product.pk, product_name=getattr(product, "name", ""),
+                    warehouse=StockMovement.Warehouse.FINISHED_GOODS,
+                    qty_before=qty_before, change=self.qty, qty_after=qty_before + self.qty,
+                    created_by=by_user, sender=self.returned_by,
+                    ref_type="return", ref_id=self.pk,
+                )
+            except Exception:
+                logging.getLogger("crm.webhooks").error(
+                    "Failed to record stock movement on return accept. return_id=%s", self.pk, exc_info=True,
+                )
 
             def _send_webhook():
                 from apps.main.services.webhooks import send_product_webhook
@@ -4667,3 +4708,364 @@ class KnowledgeBaseLesson(models.Model):
 
     def __str__(self):
         return f"{self.course.title} — {self.title}"
+
+
+class FinishedToRawTransfer(models.Model):
+    """
+    Частичное перемещение готовой продукции обратно в сырьё (переработка/разборка).
+
+    Списывает указанное количество из Product.quantity и добавляет столько же в
+    сопоставленную запись ItemMake (сырьё). Операцию можно отменить (возврат
+    количества в готовую продукцию и списание из сырья).
+    """
+
+    class Status(models.TextChoices):
+        DONE = "done", "Выполнено"
+        CANCELED = "canceled", "Отменено"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    company = models.ForeignKey(
+        Company, on_delete=models.PROTECT, related_name="finished_to_raw_transfers",
+        verbose_name="Компания",
+    )
+    branch = models.ForeignKey(
+        Branch, on_delete=models.CASCADE, related_name="crm_finished_to_raw_transfers",
+        null=True, blank=True, db_index=True, verbose_name="Филиал",
+    )
+    product = models.ForeignKey(
+        Product, on_delete=models.PROTECT, related_name="finished_to_raw_transfers",
+        verbose_name="Готовая продукция",
+    )
+    raw_item = models.ForeignKey(
+        ItemMake, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="finished_to_raw_transfers", verbose_name="Сырьё",
+    )
+    quantity = models.DecimalField(
+        "Количество", max_digits=14, decimal_places=3,
+        validators=[MinValueValidator(Decimal("0.001"))],
+    )
+    reason = models.TextField("Причина", blank=True, default="")
+    status = models.CharField(
+        max_length=16, choices=Status.choices, default=Status.DONE, db_index=True,
+    )
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.PROTECT,
+        related_name="finished_to_raw_transfers", verbose_name="Кто выполнил",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    canceled_at = models.DateTimeField(null=True, blank=True)
+    canceled_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.PROTECT, null=True, blank=True,
+        related_name="canceled_finished_to_raw_transfers", verbose_name="Кто отменил",
+    )
+
+    class Meta:
+        verbose_name = "Перемещение готовой продукции в сырьё"
+        verbose_name_plural = "Перемещения готовой продукции в сырьё"
+        ordering = ["-created_at"]
+        indexes = [
+            models.Index(fields=["product"]),
+            models.Index(fields=["status"]),
+            models.Index(fields=["created_at"]),
+            models.Index(fields=["company", "created_at"]),
+        ]
+
+    def __str__(self):
+        return f"{self.product_id} → сырьё · {self.quantity} ({self.status})"
+
+    def clean(self):
+        if self.branch_id and self.branch.company_id != self.company_id:
+            raise ValidationError({"branch": "Филиал принадлежит другой компании."})
+        if self.product_id and self.product.company_id != self.company_id:
+            raise ValidationError({"product": "Товар принадлежит другой компании."})
+
+
+class Inventory(models.Model):
+    """
+    Сессия инвентаризации (сверка учётного и фактического остатка).
+
+    warehouse = finished_goods → позиции ссылаются на Product;
+    warehouse = raw_materials  → позиции ссылаются на ItemMake.
+    Подтверждение приводит учётный остаток к фактическому.
+    """
+
+    class Warehouse(models.TextChoices):
+        FINISHED_GOODS = "finished_goods", "Готовая продукция"
+        RAW_MATERIALS = "raw_materials", "Сырьё"
+
+    class Status(models.TextChoices):
+        DRAFT = "draft", "Черновик"
+        CONFIRMED = "confirmed", "Подтверждена"
+        CANCELED = "canceled", "Отменена"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    company = models.ForeignKey(
+        Company, on_delete=models.PROTECT, related_name="inventories", verbose_name="Компания",
+    )
+    branch = models.ForeignKey(
+        Branch, on_delete=models.CASCADE, related_name="crm_inventories",
+        null=True, blank=True, db_index=True, verbose_name="Филиал",
+    )
+    warehouse = models.CharField("Склад", max_length=20, choices=Warehouse.choices, db_index=True)
+    status = models.CharField(
+        "Статус", max_length=16, choices=Status.choices, default=Status.DRAFT, db_index=True,
+    )
+    comment = models.TextField("Комментарий", blank=True, default="")
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.PROTECT,
+        related_name="inventories", verbose_name="Ответственный",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    confirmed_at = models.DateTimeField(null=True, blank=True)
+    surplus_qty = models.DecimalField("Излишек", max_digits=14, decimal_places=3, default=Decimal("0.000"))
+    shortage_qty = models.DecimalField("Недостача", max_digits=14, decimal_places=3, default=Decimal("0.000"))
+
+    class Meta:
+        verbose_name = "Инвентаризация"
+        verbose_name_plural = "Инвентаризации"
+        ordering = ["-created_at"]
+        indexes = [
+            models.Index(fields=["warehouse", "status"]),
+            models.Index(fields=["created_at"]),
+            models.Index(fields=["company", "status", "created_at"]),
+        ]
+
+    def __str__(self):
+        return f"Инвентаризация {self.warehouse} · {self.status} · {self.created_at:%Y-%m-%d}"
+
+    def clean(self):
+        if self.branch_id and self.branch.company_id != self.company_id:
+            raise ValidationError({"branch": "Филиал принадлежит другой компании."})
+
+    def recompute_totals(self, *, save=True):
+        agg = self.items.aggregate(
+            surplus=Coalesce(Sum("diff", filter=Q(diff__gt=0)), Value(Decimal("0.000"))),
+            shortage=Coalesce(Sum("diff", filter=Q(diff__lt=0)), Value(Decimal("0.000"))),
+        )
+        self.surplus_qty = agg["surplus"] or Decimal("0.000")
+        # shortage хранится положительным числом
+        self.shortage_qty = abs(agg["shortage"] or Decimal("0.000"))
+        if save:
+            super().save(update_fields=["surplus_qty", "shortage_qty"])
+
+
+class InventoryItem(models.Model):
+    """Строка сверки. object_id ссылается на Product или ItemMake (по Inventory.warehouse)."""
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    inventory = models.ForeignKey(
+        Inventory, on_delete=models.CASCADE, related_name="items", verbose_name="Инвентаризация",
+    )
+    object_id = models.UUIDField("ID товара/сырья", db_index=True)
+    product_name = models.CharField("Название (снимок)", max_length=255, blank=True, default="")
+    qty_system = models.DecimalField("Учётный остаток", max_digits=14, decimal_places=3)
+    qty_fact = models.DecimalField("Фактический остаток", max_digits=14, decimal_places=3)
+    diff = models.DecimalField("Расхождение", max_digits=14, decimal_places=3, default=Decimal("0.000"))
+
+    class Meta:
+        verbose_name = "Позиция инвентаризации"
+        verbose_name_plural = "Позиции инвентаризации"
+        indexes = [
+            models.Index(fields=["inventory"]),
+            models.Index(fields=["object_id"]),
+        ]
+
+    def __str__(self):
+        return f"{self.product_name or self.object_id}: {self.qty_system} → {self.qty_fact} ({self.diff})"
+
+
+class StockShortageEvent(models.Model):
+    """
+    Событие нехватки готовой продукции при попытке выдачи/передачи.
+    Журнал + источник уведомлений ответственным сотрудникам.
+    """
+
+    class Source(models.TextChoices):
+        TRANSFER = "transfer", "Передача"
+        REQUEST = "request", "Заявка"
+        SALE = "sale", "Продажа"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    company = models.ForeignKey(
+        Company, on_delete=models.CASCADE, related_name="stock_shortage_events", verbose_name="Компания",
+    )
+    branch = models.ForeignKey(
+        Branch, on_delete=models.CASCADE, related_name="crm_stock_shortage_events",
+        null=True, blank=True, db_index=True, verbose_name="Филиал",
+    )
+    product = models.ForeignKey(
+        Product, on_delete=models.PROTECT, related_name="stock_shortage_events", verbose_name="Товар",
+    )
+    requested_qty = models.DecimalField("Запрошено", max_digits=14, decimal_places=3)
+    available_qty = models.DecimalField("Доступно", max_digits=14, decimal_places=3)
+    agent = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="stock_shortage_events_as_agent", verbose_name="Агент",
+    )
+    source = models.CharField("Источник", max_length=16, choices=Source.choices, default=Source.TRANSFER)
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.PROTECT,
+        related_name="stock_shortage_events", verbose_name="Инициатор",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        verbose_name = "Событие нехватки склада"
+        verbose_name_plural = "События нехватки склада"
+        ordering = ["-created_at"]
+        indexes = [
+            models.Index(fields=["created_at"]),
+            models.Index(fields=["product"]),
+            models.Index(fields=["company", "created_at"]),
+        ]
+
+    def __str__(self):
+        return f"Нехватка {self.product_id}: запрошено {self.requested_qty}, доступно {self.available_qty}"
+
+    def clean(self):
+        if self.branch_id and self.branch.company_id != self.company_id:
+            raise ValidationError({"branch": "Филиал принадлежит другой компании."})
+        if self.product_id and self.product.company_id != self.company_id:
+            raise ValidationError({"product": "Товар принадлежит другой компании."})
+
+
+class StockMovement(models.Model):
+    """
+    Неизменяемый журнал движения склада (центральный аудит остатков).
+    Записи создаёт бэкенд внутри транзакций операций; UI — только чтение.
+
+    object_id ссылается на Product или ItemMake (по warehouse). Отображаемые
+    имена (product_name/source_name/...) — снимки на момент записи, чтобы журнал
+    оставался самодостаточным и неизменяемым.
+    """
+
+    class Type(models.TextChoices):
+        INCOME = "income", "Приход"
+        EXPENSE = "expense", "Расход"
+        TRANSFER = "transfer", "Перемещение"
+        RETURN = "return", "Возврат"
+        WRITEOFF = "writeoff", "Списание"
+        INVENTORY = "inventory", "Инвентаризация"
+        ADJUSTMENT = "adjustment", "Корректировка"
+        AGENT_TRANSFER = "agent_transfer", "Передача агенту"
+        AGENT_RETURN = "agent_return", "Возврат от агента"
+        STAFF_TRANSFER = "staff_transfer", "Передача между сотрудниками"
+        STAFF_RETURN = "staff_return", "Возврат между сотрудниками"
+
+    class Warehouse(models.TextChoices):
+        FINISHED_GOODS = "finished_goods", "Готовая продукция"
+        RAW_MATERIALS = "raw_materials", "Сырьё"
+        AGENT = "agent", "Агент"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    company = models.ForeignKey(
+        Company, on_delete=models.CASCADE, related_name="stock_movements", verbose_name="Компания",
+    )
+    branch = models.ForeignKey(
+        Branch, on_delete=models.CASCADE, related_name="crm_stock_movements",
+        null=True, blank=True, db_index=True, verbose_name="Филиал",
+    )
+    type = models.CharField("Тип операции", max_length=24, choices=Type.choices, db_index=True)
+
+    object_id = models.UUIDField("ID товара/сырья", db_index=True)
+    product_name = models.CharField("Товар (снимок)", max_length=255, blank=True, default="")
+    warehouse = models.CharField(
+        "Склад", max_length=20, choices=Warehouse.choices, null=True, blank=True, db_index=True,
+    )
+
+    qty_before = models.DecimalField("Остаток до", max_digits=14, decimal_places=3)
+    change = models.DecimalField("Изменение", max_digits=14, decimal_places=3)
+    qty_after = models.DecimalField("Остаток после", max_digits=14, decimal_places=3)
+
+    source_type = models.CharField(max_length=20, null=True, blank=True)
+    source_id = models.UUIDField(null=True, blank=True)
+    source_name = models.CharField(max_length=255, blank=True, default="")
+    target_type = models.CharField(max_length=20, null=True, blank=True)
+    target_id = models.UUIDField(null=True, blank=True)
+    target_name = models.CharField(max_length=255, blank=True, default="")
+
+    sender_id = models.UUIDField(null=True, blank=True, db_index=True)
+    sender_name = models.CharField(max_length=255, blank=True, default="")
+    receiver_id = models.UUIDField(null=True, blank=True, db_index=True)
+    receiver_name = models.CharField(max_length=255, blank=True, default="")
+
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.PROTECT,
+        related_name="stock_movements", verbose_name="Автор",
+    )
+    created_by_name = models.CharField(max_length=255, blank=True, default="")
+    comment = models.TextField("Комментарий", blank=True, default="")
+
+    ref_type = models.CharField("Источник (сущность)", max_length=40, blank=True, default="")
+    ref_id = models.UUIDField("Источник (id)", null=True, blank=True)
+
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        verbose_name = "Движение склада"
+        verbose_name_plural = "Журнал движения склада"
+        ordering = ["-created_at"]
+        indexes = [
+            models.Index(fields=["company", "created_at"]),
+            models.Index(fields=["type"]),
+            models.Index(fields=["object_id"]),
+            models.Index(fields=["warehouse"]),
+            models.Index(fields=["sender_id"]),
+            models.Index(fields=["receiver_id"]),
+        ]
+
+    def __str__(self):
+        return f"{self.type} {self.product_name or self.object_id}: {self.change}"
+
+
+def _user_display_name(user) -> str:
+    if user is None:
+        return ""
+    full = f"{(getattr(user, 'first_name', '') or '').strip()} {(getattr(user, 'last_name', '') or '').strip()}".strip()
+    return full or getattr(user, "email", "") or ""
+
+
+def record_stock_movement(*, company, type, object_id, created_by,
+                          qty_before, change, qty_after,
+                          branch=None, product_name="", warehouse=None,
+                          source_type=None, source_id=None, source_name="",
+                          target_type=None, target_id=None, target_name="",
+                          sender=None, sender_id=None, sender_name="",
+                          receiver=None, receiver_id=None, receiver_name="",
+                          comment="", ref_type="", ref_id=None):
+    """
+    Пишет запись в журнал движения склада. Вызывать ВНУТРИ транзакции операции.
+    sender/receiver можно передать как объект User (тогда id/имя извлекаются).
+    """
+    if sender is not None:
+        sender_id = getattr(sender, "pk", None)
+        sender_name = sender_name or _user_display_name(sender)
+    if receiver is not None:
+        receiver_id = getattr(receiver, "pk", None)
+        receiver_name = receiver_name or _user_display_name(receiver)
+    return StockMovement.objects.create(
+        company=company,
+        branch=branch,
+        type=type,
+        object_id=object_id,
+        product_name=product_name or "",
+        warehouse=warehouse,
+        qty_before=qty_before,
+        change=change,
+        qty_after=qty_after,
+        source_type=source_type,
+        source_id=source_id,
+        source_name=source_name or "",
+        target_type=target_type,
+        target_id=target_id,
+        target_name=target_name or "",
+        sender_id=sender_id,
+        sender_name=sender_name or "",
+        receiver_id=receiver_id,
+        receiver_name=receiver_name or "",
+        created_by=created_by,
+        created_by_name=_user_display_name(created_by),
+        comment=comment or "",
+        ref_type=ref_type or "",
+        ref_id=ref_id,
+    )

@@ -7,7 +7,7 @@ from django.db.models.signals import pre_delete
 from django.db.models.signals import post_save
 from django.dispatch import receiver
 
-from apps.main.models import Product, ProductImage
+from apps.main.models import Product, ProductImage, Notification, ManufactureSubreal, ReturnFromAgent
 
 logger = logging.getLogger("crm.webhooks")
 
@@ -128,3 +128,73 @@ def product_webhook_on_delete(sender, instance: Product, **kwargs):
         transaction.on_commit(_send)
     except Exception:
         _send()
+
+
+# ─────────────────────────────────────────────────────────────
+# Уведомления агенту-пользователю (web-версия агента, колокольчик).
+# Канал доставки — существующий GET /main/notifications/.
+# ─────────────────────────────────────────────────────────────
+def _safe_create_notification(*, company, user, message, branch=None,
+                              type="system", title="", level="info", url=""):
+    """Создаёт уведомление и публикует его в WS; не роняет основную операцию при ошибке."""
+    if not user:
+        return
+    try:
+        from apps.main.realtime import create_and_publish_notification
+
+        create_and_publish_notification(
+            company=company, branch=branch, user=user, message=message,
+            type=type, title=title, level=level, url=url,
+        )
+    except Exception:
+        logger.error(
+            "Failed to create notification for user=%s",
+            getattr(user, "id", None),
+            exc_info=True,
+        )
+
+
+@receiver(post_save, sender=ManufactureSubreal)
+def notify_agent_on_transfer(sender, instance: ManufactureSubreal, created, **kwargs):
+    """Назначена передача (subreal) → уведомление агенту-получателю."""
+    if not created or not instance.agent_id:
+        return
+    product_name = getattr(getattr(instance, "product", None), "name", None) or "товар"
+    message = f"Вам передан товар: {product_name}, {instance.qty_transferred} шт"
+    transaction.on_commit(lambda: _safe_create_notification(
+        company=instance.company,
+        branch=instance.branch,
+        user=instance.agent,
+        message=message,
+        type="agent_transfer",
+        title="Передача товара",
+        level="info",
+    ))
+
+
+@receiver(post_save, sender=ReturnFromAgent)
+def notify_agent_on_return_decision(sender, instance: ReturnFromAgent, created, **kwargs):
+    """Возврат/брак одобрен или отклонён → уведомление агенту-инициатору."""
+    if created:
+        return
+    update_fields = kwargs.get("update_fields")
+    # accept()/reject() сохраняют с update_fields={"status", ...} — реагируем только на смену статуса.
+    if update_fields is not None and "status" not in update_fields:
+        return
+    if instance.status not in (ReturnFromAgent.Status.ACCEPTED, ReturnFromAgent.Status.REJECTED):
+        return
+
+    product = getattr(getattr(instance, "subreal", None), "product", None)
+    product_name = getattr(product, "name", None) or "товар"
+    kind = "Брак" if instance.is_defect else "Возврат"
+    verb = "принят" if instance.status == ReturnFromAgent.Status.ACCEPTED else "отклонён"
+    message = f"{kind} «{product_name}» {verb}"
+    transaction.on_commit(lambda: _safe_create_notification(
+        company=instance.company,
+        branch=instance.branch,
+        user=instance.returned_by,
+        message=message,
+        type="agent_return",
+        title=f"{kind} {verb}",
+        level="success" if instance.status == ReturnFromAgent.Status.ACCEPTED else "warning",
+    ))

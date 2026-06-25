@@ -27,10 +27,15 @@ def create_task_notification(task_id):
             f"срок — {localtime(task.due_date).strftime('%d.%m.%Y %H:%M')}"
         )
 
-        Notification.objects.create(
+        from apps.main.realtime import create_and_publish_notification
+
+        create_and_publish_notification(
             company=task.company,
             user=task.assigned_to,
-            message=message
+            message=message,
+            type="task_created",
+            title="Новая задача",
+            level="info",
         )
 
     except Task.DoesNotExist:

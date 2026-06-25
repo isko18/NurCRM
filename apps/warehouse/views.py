@@ -10,6 +10,7 @@ from django.shortcuts import get_object_or_404
 from decimal import Decimal
 from django.db import IntegrityError, transaction
 from django.db.models import Count, OuterRef, Subquery, Sum, DecimalField, Value as V, Q
+from django.db.models.deletion import ProtectedError
 from django.db.models.functions import Coalesce
 from django.utils import timezone
 from django.contrib.auth import get_user_model
@@ -656,7 +657,25 @@ class ProductView(CompanyBranchRestrictedMixin, generics.ListCreateAPIView):
         )
 
 
-class ProductDetailView(CompanyBranchRestrictedMixin, generics.RetrieveUpdateDestroyAPIView):
+class ProtectedProductDeleteMixin:
+    """Возвращает понятную 409 вместо 500, если товар защищён PROTECT-ссылками
+    (например, DocumentItem.product)."""
+
+    def destroy(self, request, *args, **kwargs):
+        instance = self.get_object()
+        try:
+            with transaction.atomic():
+                self.perform_destroy(instance)
+        except ProtectedError:
+            return Response(
+                {"detail": "Нельзя удалить товар: он используется в документах. "
+                           "Сначала удалите или измените связанные документы."},
+                status=status.HTTP_409_CONFLICT,
+            )
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+class ProductDetailView(ProtectedProductDeleteMixin, CompanyBranchRestrictedMixin, generics.RetrieveUpdateDestroyAPIView):
     serializer_class = WarehouseProductSerializer
     lookup_field = "id"
     lookup_url_kwarg = "product_uuid"

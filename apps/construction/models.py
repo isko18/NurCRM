@@ -487,6 +487,8 @@ class CashFlow(models.Model):
             models.Index(fields=["cashbox", "created_at"]),
             models.Index(fields=["status"]),
             models.Index(fields=["cashbox", "status", "type", "created_at"], name="ix_flow_cb_stat_type_created"),
+            # Аналитика Производства → Расходы: company + type=expense за период.
+            models.Index(fields=["company", "type", "created_at"], name="ix_flow_company_type_created"),
             models.Index(fields=["shift", "created_at"]),
             models.Index(fields=["cashier", "created_at"]),
         ]

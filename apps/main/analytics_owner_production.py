@@ -13,6 +13,7 @@ from .models import (
     ManufactureSubreal,
     Acceptance,
     ReturnFromAgent,
+    Inventory,
     Sale,
     SaleItem,
     Client,
@@ -186,6 +187,93 @@ def build_owner_analytics_payload(*, company, branch, period, date_from, date_to
     # branch is None → видим всю компанию
 
     defective_items_qty = returns_qs.aggregate(s=Coalesce(Sum("qty"), V(0)))["s"] or 0
+
+    # Раздельный учёт: обычные возвраты (на склад) vs брак (списание).
+    # is_defect=False — качественный возврат; is_defect=True — брак.
+    regular_returns_qs = returns_qs.filter(is_defect=False)
+    defects_qs = returns_qs.filter(is_defect=True)
+
+    returns_agg = regular_returns_qs.aggregate(
+        qty=Coalesce(Sum("qty"), V(0)),
+        amount=Coalesce(Sum("amount"), ZERO_MONEY),
+    )
+    defects_agg = defects_qs.aggregate(
+        qty=Coalesce(Sum("qty"), V(0)),
+        amount=Coalesce(Sum("amount"), ZERO_MONEY),
+    )
+    returns_qty = returns_agg["qty"] or 0
+    returns_amount_dec = returns_agg["amount"] or Decimal("0.00")
+    defects_qty = defects_agg["qty"] or 0
+    defects_amount_dec = defects_agg["amount"] or Decimal("0.00")
+
+    # ======================================================
+    # Inventory (инвентаризация, подтверждённая за период)
+    # ======================================================
+    inventory_qs = Inventory.objects.filter(
+        company=company,
+        status=Inventory.Status.CONFIRMED,
+        created_at__gte=dt_from,
+        created_at__lt=dt_to_excl,
+    )
+    if branch is not None:
+        inventory_qs = inventory_qs.filter(Q(branch=branch) | Q(branch__isnull=True))
+    inventory_agg = inventory_qs.aggregate(
+        surplus=Coalesce(Sum("surplus_qty"), ZERO_QTY),
+        shortage=Coalesce(Sum("shortage_qty"), ZERO_QTY),
+    )
+    inventory_surplus_qty = inventory_agg["surplus"] or Decimal("0.000")
+    inventory_shortage_qty = inventory_agg["shortage"] or Decimal("0.000")
+
+    def _returns_by_date(qs):
+        trunc = _trunc_by_group("returned_at", group_by)
+        rows = (
+            qs.annotate(period=trunc)
+            .values("period")
+            .annotate(
+                qty=Coalesce(Sum("qty"), V(0)),
+                amount=Coalesce(Sum("amount"), ZERO_MONEY),
+            )
+            .order_by("period")
+        )
+        return [
+            {
+                "date": r["period"],
+                "qty": r["qty"],
+                "amount": _money_str(r["amount"] or Decimal("0.00")),
+            }
+            for r in rows
+        ]
+
+    def _top_agents(qs):
+        rows = (
+            qs.values(
+                "returned_by_id",
+                "returned_by__first_name",
+                "returned_by__last_name",
+            )
+            .annotate(
+                qty=Coalesce(Sum("qty"), V(0)),
+                amount=Coalesce(Sum("amount"), ZERO_MONEY),
+            )
+            .order_by("-qty")[:10]
+        )
+        return [
+            {
+                "agent_id": str(r["returned_by_id"]) if r.get("returned_by_id") else None,
+                "agent_name": (
+                    f"{(r['returned_by__first_name'] or '').strip()} {(r['returned_by__last_name'] or '').strip()}".strip()
+                    or "Пользователь"
+                ),
+                "qty": r["qty"],
+                "amount": _money_str(r["amount"] or Decimal("0.00")),
+            }
+            for r in rows
+        ]
+
+    returns_by_date = _returns_by_date(regular_returns_qs)
+    defects_by_date = _returns_by_date(defects_qs)
+    top_agents_by_returns = _top_agents(regular_returns_qs)
+    top_agents_by_defects = _top_agents(defects_qs)
 
     # ======================================================
     # Sales (paid, all)
@@ -661,6 +749,14 @@ def build_owner_analytics_payload(*, company, branch, period, date_from, date_to
             "acceptances_count": acceptances_count,
             "items_transferred": items_transferred,
             "defective_items": defective_items_qty,
+            # Раздельно: возвраты (на склад) и брак (списание), только accepted.
+            "returns_qty": returns_qty,
+            "returns_amount": _money_str(returns_amount_dec),
+            "defects_qty": defects_qty,
+            "defects_amount": _money_str(defects_amount_dec),
+            # Инвентаризация: излишки / недостачи за период (подтверждённые)
+            "inventory_surplus_qty": float(inventory_surplus_qty),
+            "inventory_shortage_qty": float(inventory_shortage_qty),
             "sales_count": sales_count,
             "sales_amount": _money_str(sales_amount_dec),
             "discounts_total": _money_str(discounts_total_dec),
@@ -688,6 +784,11 @@ def build_owner_analytics_payload(*, company, branch, period, date_from, date_to
             "sales_by_date": sales_by_date,
             "gross_profit_by_date": gross_profit_by_date,
             "transfers_by_date": transfers_by_date,
+            # Динамика и срезы по агентам для возвратов/брака (раздельно).
+            "returns_by_date": returns_by_date,
+            "defects_by_date": defects_by_date,
+            "top_agents_by_returns": top_agents_by_returns,
+            "top_agents_by_defects": top_agents_by_defects,
             "top_products_by_sales": top_products_by_sales,
             "top_users_by_sales": top_users_by_sales,
             "top_users_by_transfers": top_users_by_transfers,

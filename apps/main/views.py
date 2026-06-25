@@ -22,7 +22,7 @@ from rest_framework import serializers
 from .filters import TransactionRecordFilter, DebtFilter, DebtPaymentFilter
 from django_filters.rest_framework import DjangoFilterBackend
 from django.db.models import DecimalField, ExpressionWrapper
-from rest_framework.pagination import CursorPagination, PageNumberPagination
+from rest_framework.pagination import CursorPagination, PageNumberPagination, LimitOffsetPagination
 from django.core.paginator import InvalidPage
 
 
@@ -53,6 +53,12 @@ from apps.main.models import (
     SupplierReceipt,
     SupplierReceiptItem,
     KnowledgeBaseCourse,
+    FinishedToRawTransfer,
+    Inventory,
+    InventoryItem,
+    StockShortageEvent,
+    StockMovement,
+    record_stock_movement,
 )
 from apps.main.serializers import (
     ContactSerializer, PipelineSerializer, DealSerializer, TaskSerializer,
@@ -77,6 +83,13 @@ from apps.main.serializers import (
     SupplierReceiptReadSerializer,
     ProductPurchaseBatchSerializer,
     PublicKnowledgeBaseCourseSerializer,
+    FinishedToRawTransferSerializer,
+    FinishedToRawMoveInputSerializer,
+    InventoryReadSerializer,
+    InventoryCreateSerializer,
+    StockShortageEventReadSerializer,
+    StockShortageEventCreateSerializer,
+    StockMovementReadSerializer,
 )
 from django.db.models import ProtectedError
 from apps.utils import product_images_prefetch, _is_owner_like
@@ -2030,14 +2043,32 @@ class ReviewRetrieveUpdateDestroyAPIView(CompanyBranchRestrictedMixin, generics.
 # ===========================
 class NotificationListView(CompanyBranchRestrictedMixin, generics.ListAPIView):
     serializer_class = NotificationSerializer
-    queryset = Notification.objects.select_related("company", "branch", "user").all()
+    queryset = Notification.objects.select_related("company", "branch", "user", "actor").all()
+    pagination_class = LimitOffsetPagination
     filter_backends = [DjangoFilterBackend]
-    filterset_fields = "__all__"
+    filterset_fields = ["type", "level", "is_read"]
+
+    def get_queryset(self):
+        # Уведомления персональные: каждый пользователь (в т.ч. агент) видит только свои.
+        return super().get_queryset().filter(user=self.request.user)
+
+    def list(self, request, *args, **kwargs):
+        response = super().list(request, *args, **kwargs)
+        # Точное число непрочитанных (для колокольчика) — независимо от фильтров/пагинации.
+        unread = self.get_queryset().filter(is_read=False).count()
+        if isinstance(response.data, dict):
+            response.data["unread_count"] = unread
+        else:
+            response.data = {"count": len(response.data), "unread_count": unread, "results": response.data}
+        return response
 
 
 class NotificationDetailView(CompanyBranchRestrictedMixin, generics.RetrieveAPIView):
     serializer_class = NotificationSerializer
-    queryset = Notification.objects.select_related("company", "branch", "user").all()
+    queryset = Notification.objects.select_related("company", "branch", "user", "actor").all()
+
+    def get_queryset(self):
+        return super().get_queryset().filter(user=self.request.user)
 
 
 class MarkAllNotificationsReadView(APIView):
@@ -2046,6 +2077,20 @@ class MarkAllNotificationsReadView(APIView):
     def post(self, request, *args, **kwargs):
         Notification.objects.filter(user=request.user, is_read=False).update(is_read=True)
         return Response({"status": "Все уведомления прочитаны"}, status=status.HTTP_200_OK)
+
+
+class MarkNotificationReadView(APIView):
+    """POST /api/main/notifications/<uuid:pk>/read/ — отметить одно прочитанным."""
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request, pk, *args, **kwargs):
+        notification = Notification.objects.filter(pk=pk, user=request.user).first()
+        if notification is None:
+            return Response({"detail": "Уведомление не найдено."}, status=status.HTTP_404_NOT_FOUND)
+        if not notification.is_read:
+            notification.is_read = True
+            notification.save(update_fields=["is_read"])
+        return Response({"id": str(notification.id), "is_read": True}, status=status.HTTP_200_OK)
 
 
 # ===========================
@@ -3433,6 +3478,33 @@ class ManufactureSubrealListCreateAPIView(CompanyBranchRestrictedMixin, generics
             qs = qs.filter(agent=self.request.user)
         return qs
 
+    def create(self, request, *args, **kwargs):
+        # Пред-проверка остатка ВНЕ транзакции выдачи: при нехватке фиксируем
+        # StockShortageEvent + уведомления и отклоняем (defense in depth).
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        company = self._company()
+        branch = self._auto_branch()
+        product = serializer.validated_data.get("product")
+        agent = serializer.validated_data.get("agent")
+        qty = int(serializer.validated_data.get("qty_transferred") or 0)
+        if qty and product and company is not None:
+            avail = type(product).objects.filter(pk=product.pk).values_list("quantity", flat=True).first()
+            avail = avail if avail is not None else 0
+            if avail < qty:
+                report_stock_shortage(
+                    company=company, branch=branch, product=product,
+                    requested_qty=qty, available_qty=avail, agent=agent,
+                    source=StockShortageEvent.Source.TRANSFER, created_by=request.user,
+                )
+                raise serializers.ValidationError({
+                    "detail": f'Недостаточно товара «{product.name}». Запрошено {qty}, доступно {avail}.',
+                    "shortage": {"product": str(product.pk), "requested_qty": qty, "available_qty": avail},
+                })
+        self.perform_create(serializer)
+        headers = self.get_success_headers(serializer.data)
+        return Response(serializer.data, status=status.HTTP_201_CREATED, headers=headers)
+
     @transaction.atomic
     def perform_create(self, serializer):
         company = self._company()
@@ -3464,9 +3536,20 @@ class ManufactureSubrealListCreateAPIView(CompanyBranchRestrictedMixin, generics
 
         # минусуем склад (в той же транзакции)
         if qty and locked_qs is not None:
+            qty_before = current_qty or Decimal("0")
             locked_qs.update(quantity=F("quantity") - qty)
             prod_model = type(product)
             prod_id = product.pk
+
+            # Журнал: передача агенту
+            record_stock_movement(
+                company=company, branch=branch, type=StockMovement.Type.AGENT_TRANSFER,
+                object_id=product.pk, product_name=product.name,
+                warehouse=StockMovement.Warehouse.FINISHED_GOODS,
+                qty_before=qty_before, change=-qty, qty_after=qty_before - qty,
+                created_by=self.request.user, sender=self.request.user, receiver=agent,
+                ref_type="subreal", ref_id=obj.id,
+            )
 
             def _send_webhook():
                 from apps.main.services.webhooks import send_product_webhook
@@ -4042,13 +4125,637 @@ class ReturnFromAgentRejectAPIView(APIView, CompanyBranchRestrictedMixin):
 
 
 # ===========================
+#  Finished goods → raw material (частичное перемещение)
+# ===========================
+def _fmt_qty(value) -> str:
+    """80.000 → '80', 80.500 → '80.5' (для человекочитаемых сообщений)."""
+    d = _to_dec(value, default=Decimal("0"))
+    d = d.normalize()
+    # normalize() у целых даёт экспоненту (8E+1) — приводим обратно
+    if d == d.to_integral():
+        d = d.quantize(Decimal("1"))
+    return format(d, "f")
+
+
+class ProductMoveToRawAPIView(CompanyBranchRestrictedMixin, APIView):
+    """
+    POST /api/main/products/<uuid:product_id>/move-to-raw/
+
+    Частично перемещает готовую продукцию в сырьё (ItemMake).
+    Доступ: как у «Передать товар» — авторизованный сотрудник компании.
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    @transaction.atomic
+    def post(self, request, product_id, *args, **kwargs):
+        company = self._company()
+        if company is None:
+            return Response({"detail": "У вас не задана компания."}, status=status.HTTP_400_BAD_REQUEST)
+
+        ser = FinishedToRawMoveInputSerializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+        qty = ser.validated_data["quantity"]
+        reason = ser.validated_data.get("reason") or ""
+
+        try:
+            product = (
+                Product.objects.select_for_update()
+                .get(pk=product_id, company=company)
+            )
+        except Product.DoesNotExist:
+            return Response({"detail": "Товар не найден."}, status=status.HTTP_404_NOT_FOUND)
+
+        available = product.quantity or Decimal("0")
+        if qty > available:
+            return Response(
+                {"detail": f"Нельзя переместить больше, чем есть. Доступно: {_fmt_qty(available)}."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        # 1) списываем из готовой продукции
+        Product.objects.filter(pk=product.pk).update(quantity=F("quantity") - qty)
+
+        # 2) находим/создаём запись сырья (мэппинг по company+branch+name+kind=raw)
+        raw_item = (
+            ItemMake.objects.select_for_update()
+            .filter(
+                company=company,
+                branch=product.branch,
+                name=product.name,
+                kind=ItemMake.Kind.RAW,
+            )
+            .first()
+        )
+        if raw_item is None:
+            raw_item = ItemMake.objects.create(
+                company=company,
+                branch=product.branch,
+                name=product.name,
+                unit=product.unit or "шт.",
+                price=product.purchase_price or Decimal("0"),
+                quantity=qty,
+                kind=ItemMake.Kind.RAW,
+            )
+        else:
+            ItemMake.objects.filter(pk=raw_item.pk).update(quantity=F("quantity") + qty)
+        raw_item.refresh_from_db(fields=["quantity"])
+
+        # 3) фиксируем перемещение
+        transfer = FinishedToRawTransfer.objects.create(
+            company=company,
+            branch=product.branch,
+            product=product,
+            raw_item=raw_item,
+            quantity=qty,
+            reason=reason,
+            status=FinishedToRawTransfer.Status.DONE,
+            user=request.user,
+        )
+
+        product.refresh_from_db(fields=["quantity"])
+        self._send_product_webhook(product.pk)
+
+        # Журнал: уход из готовой продукции + приход в сырьё
+        raw_before = (raw_item.quantity or Decimal("0")) - qty
+        record_stock_movement(
+            company=company, branch=product.branch, type=StockMovement.Type.TRANSFER,
+            object_id=product.pk, product_name=product.name,
+            warehouse=StockMovement.Warehouse.FINISHED_GOODS,
+            qty_before=available, change=-qty, qty_after=product.quantity,
+            created_by=request.user, comment=reason,
+            ref_type="finished_to_raw_transfer", ref_id=transfer.id,
+        )
+        record_stock_movement(
+            company=company, branch=product.branch, type=StockMovement.Type.TRANSFER,
+            object_id=raw_item.pk, product_name=raw_item.name,
+            warehouse=StockMovement.Warehouse.RAW_MATERIALS,
+            qty_before=raw_before, change=qty, qty_after=raw_item.quantity,
+            created_by=request.user, comment=reason,
+            ref_type="finished_to_raw_transfer", ref_id=transfer.id,
+        )
+
+        data = FinishedToRawTransferSerializer(transfer).data
+        data["product_remaining"] = _fmt_qty(product.quantity)
+        data["raw_total"] = _fmt_qty(raw_item.quantity)
+        return Response(data, status=status.HTTP_201_CREATED)
+
+    @staticmethod
+    def _send_product_webhook(product_id):
+        def _send():
+            try:
+                from apps.main.services.webhooks import send_product_webhook
+                prod = Product.objects.get(pk=product_id)
+                send_product_webhook(prod, "product.updated")
+            except Exception:
+                logging.getLogger("crm.webhooks").error(
+                    "Failed to send product.updated webhook after move-to-raw. product_id=%s",
+                    product_id, exc_info=True,
+                )
+        try:
+            transaction.on_commit(_send)
+        except Exception:
+            _send()
+
+
+class FinishedToRawTransferListAPIView(CompanyBranchRestrictedMixin, generics.ListAPIView):
+    """
+    GET /api/main/finished-to-raw-transfers/
+    Query (опц.): product, status, date_from, date_to, limit, offset.
+    """
+    serializer_class = FinishedToRawTransferSerializer
+    queryset = FinishedToRawTransfer.objects.select_related("product", "user").all()
+    pagination_class = LimitOffsetPagination
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        params = self.request.query_params
+
+        product_id = (params.get("product") or "").strip()
+        if product_id:
+            qs = qs.filter(product_id=product_id)
+
+        status_q = (params.get("status") or "").strip()
+        if status_q in (FinishedToRawTransfer.Status.DONE, FinishedToRawTransfer.Status.CANCELED):
+            qs = qs.filter(status=status_q)
+
+        df_raw = (params.get("date_from") or "").strip()
+        if df_raw and parse_date(df_raw):
+            qs = qs.filter(created_at__date__gte=parse_date(df_raw))
+        dt_raw = (params.get("date_to") or "").strip()
+        if dt_raw and parse_date(dt_raw):
+            qs = qs.filter(created_at__date__lte=parse_date(dt_raw))
+
+        return qs
+
+
+class FinishedToRawTransferCancelAPIView(CompanyBranchRestrictedMixin, APIView):
+    """
+    POST /api/main/finished-to-raw-transfers/<uuid:pk>/cancel/
+    Отмена перемещения: возврат количества в готовую продукцию и списание из сырья.
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    @transaction.atomic
+    def post(self, request, pk, *args, **kwargs):
+        company = self._company()
+        if company is None:
+            return Response({"detail": "У вас не задана компания."}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            transfer = (
+                FinishedToRawTransfer.objects.select_for_update()
+                .select_related("product", "raw_item")
+                .get(pk=pk, company=company)
+            )
+        except FinishedToRawTransfer.DoesNotExist:
+            return Response({"detail": "Перемещение не найдено."}, status=status.HTTP_404_NOT_FOUND)
+
+        if transfer.status == FinishedToRawTransfer.Status.CANCELED:
+            return Response({"detail": "Перемещение уже отменено."}, status=status.HTTP_400_BAD_REQUEST)
+
+        qty = transfer.quantity
+
+        # списываем из сырья (если сырьё израсходовано — конфликт)
+        raw_item = None
+        if transfer.raw_item_id:
+            raw_item = ItemMake.objects.select_for_update().get(pk=transfer.raw_item_id)
+            raw_before = raw_item.quantity or Decimal("0")
+            if raw_before < qty:
+                return Response(
+                    {"detail": "Невозможно отменить: сырьё уже израсходовано."},
+                    status=status.HTTP_409_CONFLICT,
+                )
+            ItemMake.objects.filter(pk=raw_item.pk).update(quantity=F("quantity") - qty)
+
+        # возвращаем количество в готовую продукцию
+        product = Product.objects.select_for_update().get(pk=transfer.product_id)
+        prod_before = product.quantity or Decimal("0")
+        Product.objects.filter(pk=product.pk).update(quantity=F("quantity") + qty)
+
+        transfer.status = FinishedToRawTransfer.Status.CANCELED
+        transfer.canceled_at = timezone.now()
+        transfer.canceled_by = request.user
+        transfer.save(update_fields=["status", "canceled_at", "canceled_by"])
+
+        ProductMoveToRawAPIView._send_product_webhook(transfer.product_id)
+
+        # Журнал отмены: возврат в готовую продукцию + списание из сырья
+        record_stock_movement(
+            company=company, branch=product.branch, type=StockMovement.Type.TRANSFER,
+            object_id=product.pk, product_name=product.name,
+            warehouse=StockMovement.Warehouse.FINISHED_GOODS,
+            qty_before=prod_before, change=qty, qty_after=prod_before + qty,
+            created_by=request.user, comment="Отмена перемещения в сырьё",
+            ref_type="finished_to_raw_transfer", ref_id=transfer.id,
+        )
+        if raw_item is not None:
+            record_stock_movement(
+                company=company, branch=product.branch, type=StockMovement.Type.TRANSFER,
+                object_id=raw_item.pk, product_name=raw_item.name,
+                warehouse=StockMovement.Warehouse.RAW_MATERIALS,
+                qty_before=raw_before, change=-qty, qty_after=raw_before - qty,
+                created_by=request.user, comment="Отмена перемещения в сырьё",
+                ref_type="finished_to_raw_transfer", ref_id=transfer.id,
+            )
+
+        return Response(
+            {"id": str(transfer.id), "status": transfer.status, "canceled_at": transfer.canceled_at},
+            status=status.HTTP_200_OK,
+        )
+
+
+# ===========================
+#  Инвентаризация (сверка остатков)
+# ===========================
+def _inventory_apply_adjustments(inventory, company, by_user=None):
+    """Приводит учётные остатки к фактическим по позициям инвентаризации + журнал."""
+    is_fg = inventory.warehouse == Inventory.Warehouse.FINISHED_GOODS
+    model = Product if is_fg else ItemMake
+    warehouse = (
+        StockMovement.Warehouse.FINISHED_GOODS if is_fg else StockMovement.Warehouse.RAW_MATERIALS
+    )
+    author = by_user or inventory.user
+    for item in inventory.items.all():
+        model.objects.filter(pk=item.object_id, company=company).update(quantity=item.qty_fact)
+        if item.diff:
+            record_stock_movement(
+                company=company, branch=inventory.branch, type=StockMovement.Type.INVENTORY,
+                object_id=item.object_id, product_name=item.product_name,
+                warehouse=warehouse,
+                qty_before=item.qty_system, change=item.diff, qty_after=item.qty_fact,
+                created_by=author, comment=inventory.comment,
+                ref_type="inventory", ref_id=inventory.id,
+            )
+
+
+class InventoryListCreateAPIView(CompanyBranchRestrictedMixin, generics.ListCreateAPIView):
+    """
+    GET  /api/main/inventories/  — история (фильтры warehouse/status/date_from/date_to)
+    POST /api/main/inventories/  — создать (draft | confirmed)
+    """
+    permission_classes = [permissions.IsAuthenticated]
+    queryset = Inventory.objects.select_related("company", "branch", "user").prefetch_related("items")
+    pagination_class = LimitOffsetPagination
+
+    def get_serializer_class(self):
+        if self.request.method == "POST":
+            return InventoryCreateSerializer
+        return InventoryReadSerializer
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        qp = self.request.query_params
+
+        warehouse = (qp.get("warehouse") or "").strip()
+        if warehouse:
+            qs = qs.filter(warehouse=warehouse)
+
+        status_q = (qp.get("status") or "").strip()
+        if status_q:
+            qs = qs.filter(status=status_q)
+
+        df_raw = (qp.get("date_from") or "").strip()
+        if df_raw:
+            df = parse_date(df_raw)
+            if df is None:
+                raise ValidationError({"date_from": ["Некорректная дата."]})
+            qs = qs.filter(created_at__date__gte=df)
+        dt_raw = (qp.get("date_to") or "").strip()
+        if dt_raw:
+            dt = parse_date(dt_raw)
+            if dt is None:
+                raise ValidationError({"date_to": ["Некорректная дата."]})
+            qs = qs.filter(created_at__date__lte=dt)
+
+        return qs
+
+    @transaction.atomic
+    def create(self, request, *args, **kwargs):
+        company = self._company()
+        if company is None:
+            return Response({"detail": "У вас не задана компания."}, status=status.HTTP_400_BAD_REQUEST)
+        branch = self._auto_branch()
+
+        ser = InventoryCreateSerializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+        data = ser.validated_data
+        warehouse = data["warehouse"]
+        rows = data["items"]
+
+        ref_model = Product if warehouse == Inventory.Warehouse.FINISHED_GOODS else ItemMake
+
+        inventory = Inventory.objects.create(
+            company=company,
+            branch=branch,
+            warehouse=warehouse,
+            status=Inventory.Status.DRAFT,
+            comment=data.get("comment") or "",
+            user=request.user,
+        )
+
+        for row in rows:
+            obj = ref_model.objects.filter(pk=row["product"], company=company).first()
+            if obj is None:
+                raise NotFound("Товар не найден.")
+            qty_system = row["qty_system"]
+            qty_fact = row["qty_fact"]
+            InventoryItem.objects.create(
+                inventory=inventory,
+                object_id=obj.pk,
+                product_name=getattr(obj, "name", "") or "",
+                qty_system=qty_system,
+                qty_fact=qty_fact,
+                diff=(qty_fact - qty_system),
+            )
+
+        inventory.recompute_totals()
+
+        # сразу подтверждаем, если запрошено
+        if data.get("status") == Inventory.Status.CONFIRMED:
+            _inventory_apply_adjustments(inventory, company)
+            inventory.status = Inventory.Status.CONFIRMED
+            inventory.confirmed_at = timezone.now()
+            inventory.save(update_fields=["status", "confirmed_at"])
+
+        inventory.refresh_from_db()
+        out = InventoryReadSerializer(inventory, context=self.get_serializer_context())
+        return Response(out.data, status=status.HTTP_201_CREATED)
+
+
+class InventoryRetrieveAPIView(CompanyBranchRestrictedMixin, generics.RetrieveAPIView):
+    """GET /api/main/inventories/<uuid:pk>/"""
+    permission_classes = [permissions.IsAuthenticated]
+    queryset = Inventory.objects.select_related("company", "branch", "user").prefetch_related("items")
+    serializer_class = InventoryReadSerializer
+
+
+class InventoryConfirmAPIView(CompanyBranchRestrictedMixin, APIView):
+    """POST /api/main/inventories/<uuid:pk>/confirm/ — провести корректировку остатков."""
+    permission_classes = [permissions.IsAuthenticated]
+
+    @transaction.atomic
+    def post(self, request, pk, *args, **kwargs):
+        company = self._company()
+        if company is None:
+            return Response({"detail": "У вас не задана компания."}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            inventory = (
+                Inventory.objects.select_for_update()
+                .prefetch_related("items")
+                .get(pk=pk, company=company)
+            )
+        except Inventory.DoesNotExist:
+            return Response({"detail": "Инвентаризация не найдена."}, status=status.HTTP_404_NOT_FOUND)
+
+        if inventory.status != Inventory.Status.DRAFT:
+            return Response(
+                {"detail": "Инвентаризация уже подтверждена."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        _inventory_apply_adjustments(inventory, company, by_user=request.user)
+        inventory.status = Inventory.Status.CONFIRMED
+        inventory.confirmed_at = timezone.now()
+        inventory.save(update_fields=["status", "confirmed_at"])
+
+        return Response(
+            {"id": str(inventory.id), "status": inventory.status, "confirmed_at": inventory.confirmed_at},
+            status=status.HTTP_200_OK,
+        )
+
+
+# ===========================
+#  Нехватка готовой продукции (событие + уведомления)
+# ===========================
+def _shortage_recipients(company, branch=None):
+    """Ответственные сотрудники: владелец(ы) компании + роли owner/admin."""
+    qs = User.objects.filter(
+        Q(owned_company=company) | Q(company=company, role__in=["owner", "admin"])
+    ).distinct()
+    return list(qs)
+
+
+def report_stock_shortage(*, company, branch, product, requested_qty, available_qty,
+                          agent=None, source=StockShortageEvent.Source.TRANSFER, created_by):
+    """
+    Фиксирует событие нехватки и рассылает уведомления ответственным.
+    Возвращает (event, notified_count). Не бросает исключений по уведомлениям.
+    """
+    event = StockShortageEvent.objects.create(
+        company=company,
+        branch=branch,
+        product=product,
+        requested_qty=requested_qty,
+        available_qty=available_qty,
+        agent=agent,
+        source=source,
+        created_by=created_by,
+    )
+
+    product_name = getattr(product, "name", None) or "товар"
+    agent_name = ""
+    if agent is not None:
+        agent_name = (
+            f"{(agent.first_name or '').strip()} {(agent.last_name or '').strip()}".strip()
+            or getattr(agent, "email", "") or ""
+        )
+    when = timezone.localtime(event.created_at).strftime("%d.%m.%Y %H:%M")
+    who = f"Агент {agent_name} запросил" if agent_name else "Запрошен"
+    message = (
+        f"{who} «{product_name}»: {requested_qty} шт, "
+        f"доступно {available_qty} шт. {when}"
+    )
+
+    from apps.main.realtime import create_and_publish_notification
+
+    notified = 0
+    shortage_data = {
+        "product": str(product.pk),
+        "requested_qty": str(requested_qty),
+        "available_qty": str(available_qty),
+        "agent": str(agent.pk) if agent is not None else None,
+    }
+    for recipient in _shortage_recipients(company, branch):
+        try:
+            create_and_publish_notification(
+                company=company, branch=branch, user=recipient, message=message,
+                type="stock_shortage", title="Нехватка товара на складе",
+                level="high", actor=created_by, data=shortage_data,
+            )
+            notified += 1
+        except Exception:
+            logging.getLogger("crm.webhooks").error(
+                "Failed to create stock-shortage notification for user=%s",
+                getattr(recipient, "id", None), exc_info=True,
+            )
+    return event, notified
+
+
+class StockShortageCreateAPIView(CompanyBranchRestrictedMixin, APIView):
+    """
+    POST /api/main/stock-shortages/
+    Фиксирует нехватку (журнал) и уведомляет ответственных.
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    @transaction.atomic
+    def post(self, request, *args, **kwargs):
+        company = self._company()
+        if company is None:
+            return Response({"detail": "У вас не задана компания."}, status=status.HTTP_400_BAD_REQUEST)
+        branch = self._auto_branch()
+
+        ser = StockShortageEventCreateSerializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+        data = ser.validated_data
+
+        product = Product.objects.filter(pk=data["product"], company=company).first()
+        if product is None:
+            return Response({"detail": "Товар не найден."}, status=status.HTTP_404_NOT_FOUND)
+
+        agent = None
+        agent_id = data.get("agent")
+        if agent_id:
+            agent = User.objects.filter(pk=agent_id, company=company).first()
+
+        event, notified = report_stock_shortage(
+            company=company,
+            branch=branch,
+            product=product,
+            requested_qty=data["requested_qty"],
+            available_qty=data["available_qty"],
+            agent=agent,
+            source=data.get("source") or StockShortageEvent.Source.TRANSFER,
+            created_by=request.user,
+        )
+
+        out = StockShortageEventReadSerializer(event).data
+        out["notified"] = notified
+        return Response(out, status=status.HTTP_201_CREATED)
+
+
+# ===========================
+#  Журнал движения склада (read-only)
+# ===========================
+class StockMovementListAPIView(CompanyBranchRestrictedMixin, generics.ListAPIView):
+    """
+    GET /api/main/stock-movements/
+    Фильтры: type, warehouse, date_from, date_to, search, product, employee, agent.
+    """
+    permission_classes = [permissions.IsAuthenticated]
+    serializer_class = StockMovementReadSerializer
+    queryset = StockMovement.objects.select_related("company", "branch").all()
+    pagination_class = LimitOffsetPagination
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        qp = self.request.query_params
+
+        type_q = (qp.get("type") or "").strip()
+        if type_q:
+            if type_q not in StockMovement.Type.values:
+                raise ValidationError({"type": ["Недопустимый тип операции."]})
+            qs = qs.filter(type=type_q)
+
+        warehouse = (qp.get("warehouse") or "").strip()
+        if warehouse:
+            qs = qs.filter(warehouse=warehouse)
+
+        df_raw = (qp.get("date_from") or "").strip()
+        if df_raw:
+            df = parse_date(df_raw)
+            if df is None:
+                raise ValidationError({"date_from": ["Некорректная дата."]})
+            qs = qs.filter(created_at__date__gte=df)
+        dt_raw = (qp.get("date_to") or "").strip()
+        if dt_raw:
+            dt = parse_date(dt_raw)
+            if dt is None:
+                raise ValidationError({"date_to": ["Некорректная дата."]})
+            qs = qs.filter(created_at__date__lte=dt)
+
+        product_id = (qp.get("product") or "").strip()
+        if product_id:
+            qs = qs.filter(object_id=product_id)
+
+        employee_id = (qp.get("employee") or "").strip()
+        if employee_id:
+            qs = qs.filter(Q(sender_id=employee_id) | Q(receiver_id=employee_id) | Q(created_by_id=employee_id))
+
+        agent_id = (qp.get("agent") or "").strip()
+        if agent_id:
+            qs = qs.filter(Q(sender_id=agent_id) | Q(receiver_id=agent_id))
+
+        search = (qp.get("search") or "").strip()
+        if search:
+            qs = qs.filter(
+                Q(product_name__icontains=search)
+                | Q(sender_name__icontains=search)
+                | Q(receiver_name__icontains=search)
+                | Q(source_name__icontains=search)
+                | Q(target_name__icontains=search)
+            )
+
+        return qs
+
+
+class StockMovementDetailAPIView(CompanyBranchRestrictedMixin, generics.RetrieveAPIView):
+    """GET /api/main/stock-movements/<uuid:pk>/"""
+    permission_classes = [permissions.IsAuthenticated]
+    serializer_class = StockMovementReadSerializer
+    queryset = StockMovement.objects.select_related("company", "branch").all()
+
+
+# ===========================
 #  Subreal: bulk create
 # ===========================
 class ManufactureSubrealBulkCreateAPIView(APIView, CompanyBranchRestrictedMixin):
     permission_classes = [permissions.IsAuthenticated]
 
-    @transaction.atomic
     def post(self, request, *args, **kwargs):
+        ser = BulkSubrealCreateSerializer(
+            data=request.data,
+            context={"request": request},
+        )
+        ser.is_valid(raise_exception=True)
+        company = self._company()
+        branch = self._auto_branch()
+        # Защита остатка + фиксация нехватки ВНЕ транзакции выдачи,
+        # чтобы StockShortageEvent сохранился даже при отклонении передачи.
+        self._guard_bulk_stock(
+            request, company, branch,
+            ser.validated_data["agent"], ser.validated_data["items"],
+        )
+        return self._create_transfers(request)
+
+    def _guard_bulk_stock(self, request, company, branch, agent, items):
+        shortages = []
+        for item in items:
+            product = item["product"]
+            qty = int(item["qty_transferred"] or 0)
+            if not qty:
+                continue
+            avail = type(product).objects.filter(pk=product.pk).values_list("quantity", flat=True).first()
+            avail = avail if avail is not None else 0
+            if avail < qty:
+                shortages.append((product, qty, avail))
+        if not shortages:
+            return
+        for product, qty, avail in shortages:
+            report_stock_shortage(
+                company=company, branch=branch, product=product,
+                requested_qty=qty, available_qty=avail, agent=agent,
+                source=StockShortageEvent.Source.TRANSFER, created_by=request.user,
+            )
+        p, q, a = shortages[0]
+        raise serializers.ValidationError({
+            "detail": f'Недостаточно товара «{p.name}». Запрошено {q}, доступно {a}.',
+            "shortage": {"product": str(p.pk), "requested_qty": q, "available_qty": a},
+        })
+
+    @transaction.atomic
+    def _create_transfers(self, request):
         ser = BulkSubrealCreateSerializer(
             data=request.data,
             context={"request": request},
@@ -4111,6 +4818,17 @@ class ManufactureSubrealBulkCreateAPIView(APIView, CompanyBranchRestrictedMixin)
                 is_sawmill=is_sawmill,
             )
             created_objs.append(sub)
+
+            # Журнал: передача агенту
+            qty_before = current_qty or Decimal("0")
+            record_stock_movement(
+                company=company, branch=branch, type=StockMovement.Type.AGENT_TRANSFER,
+                object_id=product.pk, product_name=product.name,
+                warehouse=StockMovement.Warehouse.FINISHED_GOODS,
+                qty_before=qty_before, change=-qty, qty_after=qty_before - qty,
+                created_by=user, sender=user, receiver=agent,
+                ref_type="subreal", ref_id=sub.id,
+            )
 
             # авто-принятие для распила / пилорамы
             if is_sawmill:
@@ -5238,6 +5956,10 @@ class AnalyticsCardDetailsAPIView(CompanyBranchRestrictedMixin, APIView):
       - stock_retail_value
       - raw_material_value
       - defective_items
+      - returns   (is_defect=False, accepted)
+      - defects   (is_defect=True, accepted)
+      - inventory_surplus   (diff > 0, confirmed)
+      - inventory_shortage  (diff < 0, confirmed)
       - discounts_total
       - transfers_count
       - items_transferred
@@ -5469,6 +6191,140 @@ class AnalyticsCardDetailsAPIView(CompanyBranchRestrictedMixin, APIView):
                 "totals": {
                     "qty": total_qty,
                 },
+                "items": items,
+            })
+
+        # ----- returns / defects: принятые возвраты от агентов, раздельно по is_defect -----
+        # card=returns  → is_defect=False (качественный возврат, вернулся на склад)
+        # card=defects  → is_defect=True  (брак, списан)
+        if card in ("returns", "defects"):
+            want_defect = (card == "defects")
+            qs = ReturnFromAgent.objects.filter(
+                company=company,
+                status=ReturnFromAgent.Status.ACCEPTED,
+                is_defect=want_defect,
+            ).select_related("subreal__product", "returned_by", "client")
+
+            # Агент видит только свои возвраты; владелец/админ — все
+            if not _is_owner_like(request.user):
+                qs = qs.filter(returned_by=request.user)
+            elif agent_id:
+                qs = qs.filter(returned_by_id=agent_id)
+
+            if branch is not None:
+                qs = qs.filter(branch=branch)
+            else:
+                qs = qs.filter(branch__isnull=True)
+
+            qs = qs.order_by("-returned_at", "id")
+
+            total_count = qs.count()
+            agg = qs.aggregate(
+                qty=Coalesce(Sum("qty"), V(0)),
+                amount=Coalesce(
+                    Sum("amount"),
+                    V(Decimal("0.00"), output_field=DecimalField(max_digits=14, decimal_places=2)),
+                ),
+            )
+            total_qty = int(agg["qty"] or 0)
+            total_amount = agg["amount"] or Decimal("0.00")
+
+            page = list(qs[offset: offset + limit].values(
+                "subreal__product_id",
+                "subreal__product__name",
+                "returned_by__first_name",
+                "returned_by__last_name",
+                "client__full_name",
+                "qty",
+                "amount",
+                "returned_at",
+            ))
+
+            items = []
+            for r in page:
+                agent_name = (
+                    f"{(r.get('returned_by__first_name') or '').strip()} {(r.get('returned_by__last_name') or '').strip()}".strip()
+                    or "Пользователь"
+                )
+                items.append({
+                    "product_id": str(r["subreal__product_id"]) if r.get("subreal__product_id") else None,
+                    "product_name": r.get("subreal__product__name") or "",
+                    "agent_name": agent_name,
+                    "client_name": r.get("client__full_name") or None,
+                    "qty": int(r.get("qty") or 0),
+                    "amount": str(_to_dec(r.get("amount"), default=Decimal("0.00")).quantize(_Q2, rounding=ROUND_HALF_UP)),
+                    "returned_at": r.get("returned_at"),
+                })
+
+            return Response({
+                "card": card,
+                "branch_id": str(getattr(branch, "id", "")) if branch else None,
+                "count": total_count,
+                "offset": offset,
+                "limit": limit,
+                "totals": {
+                    "qty": total_qty,
+                    "amount": str(total_amount.quantize(_Q2, rounding=ROUND_HALF_UP)),
+                },
+                "items": items,
+            })
+
+        # ----- inventory surplus / shortage: строки подтверждённых инвентаризаций -----
+        # card=inventory_surplus  → diff > 0 (излишек)
+        # card=inventory_shortage → diff < 0 (недостача)
+        if card in ("inventory_surplus", "inventory_shortage"):
+            qs = InventoryItem.objects.filter(
+                inventory__company=company,
+                inventory__status=Inventory.Status.CONFIRMED,
+            ).select_related("inventory", "inventory__user")
+
+            if card == "inventory_surplus":
+                qs = qs.filter(diff__gt=0)
+            else:
+                qs = qs.filter(diff__lt=0)
+
+            if branch is not None:
+                qs = qs.filter(Q(inventory__branch=branch) | Q(inventory__branch__isnull=True))
+            else:
+                qs = qs.filter(inventory__branch__isnull=True)
+
+            qs = qs.order_by("-inventory__created_at", "id")
+
+            total_count = qs.count()
+            page = list(qs[offset: offset + limit].values(
+                "product_name",
+                "qty_system",
+                "qty_fact",
+                "diff",
+                "inventory__comment",
+                "inventory__created_at",
+                "inventory__user__first_name",
+                "inventory__user__last_name",
+            ))
+
+            items = []
+            for r in page:
+                user_name = (
+                    f"{(r.get('inventory__user__first_name') or '').strip()} {(r.get('inventory__user__last_name') or '').strip()}".strip()
+                    or "Пользователь"
+                )
+                items.append({
+                    "product_name": r.get("product_name") or "",
+                    "qty_system": float(r.get("qty_system") or 0),
+                    "qty_fact": float(r.get("qty_fact") or 0),
+                    "diff": float(r.get("diff") or 0),
+                    "user_name": user_name,
+                    "created_at": r.get("inventory__created_at"),
+                    "comment": r.get("inventory__comment") or "",
+                })
+
+            return Response({
+                "card": card,
+                "branch_id": str(getattr(branch, "id", "")) if branch else None,
+                "count": total_count,
+                "offset": offset,
+                "limit": limit,
+                "totals": {},
                 "items": items,
             })
 
@@ -6366,6 +7222,10 @@ class AnalyticsCardDetailsAPIView(CompanyBranchRestrictedMixin, APIView):
                 "raw_material_value",
                 "stock_value",
                 "defective_items",
+                "returns",
+                "defects",
+                "inventory_surplus",
+                "inventory_shortage",
                 "discounts_total",
                 "transfers_count",
                 "items_transferred",
