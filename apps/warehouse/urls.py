@@ -86,6 +86,10 @@ from .views_analytics import (
     WarehouseOwnerPartnersAnalyticsAPIView,
     WarehouseOwnerPartnerAnalyticsAPIView,
 )
+from .views_summaries import WarehouseSalesSummaryViewSet
+
+summary_router = DefaultRouter()
+summary_router.register(r"summaries", WarehouseSalesSummaryViewSet, basename="warehouse-summary")
 
 urlpatterns = [
     # warehouses
@@ -266,3 +270,6 @@ urlpatterns += [
         name="counterparty-reconciliation-json",
     ),
 ]
+
+# Сводки продаж (раздел «Сводка»)
+urlpatterns += summary_router.urls

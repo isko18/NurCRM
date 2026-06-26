@@ -2,6 +2,7 @@ from django.db import models, transaction
 from django.contrib.auth.models import AbstractBaseUser, PermissionsMixin
 from django.core.exceptions import ValidationError
 from django.db.models import Q
+from django.db.models.functions import Lower
 from django.utils import timezone
 from django.utils.text import slugify
 from datetime import timedelta
@@ -267,6 +268,10 @@ class Company(models.Model):
         indexes = [
             models.Index(fields=["created_at"]),
             models.Index(fields=["end_date"]),
+        ]
+        constraints = [
+            # Уникальность slug без учёта регистра (последняя линия защиты от гонок).
+            models.UniqueConstraint(Lower("slug"), name="uniq_company_slug_lower"),
         ]
 
 class CustomRole(models.Model):

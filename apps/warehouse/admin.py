@@ -106,3 +106,22 @@ class CashApprovalRequestAdmin(admin.ModelAdmin):
     list_display = ("document", "status", "requires_money", "money_doc_type", "amount", "requested_at", "decided_at")
     list_filter = ("status", "requires_money", "money_doc_type", "document__warehouse_from__company")
     search_fields = ("document__number", "decision_note")
+
+
+class WarehouseSalesSummaryDocumentInline(admin.TabularInline):
+    model = models.WarehouseSalesSummaryDocument
+    extra = 0
+
+
+class WarehouseSalesSummaryProductInline(admin.TabularInline):
+    model = models.WarehouseSalesSummaryProduct
+    extra = 0
+
+
+@admin.register(models.WarehouseSalesSummary)
+class WarehouseSalesSummaryAdmin(admin.ModelAdmin):
+    list_display = ("number", "name", "type", "date", "warehouse", "company", "documents_count", "products_count", "total_amount", "created_at")
+    list_filter = ("type", "company", "branch", "warehouse")
+    search_fields = ("number", "name", "comment")
+    readonly_fields = ("number", "documents_count", "products_count", "total_quantity", "total_weight", "total_amount", "created_at", "updated_at")
+    inlines = (WarehouseSalesSummaryDocumentInline, WarehouseSalesSummaryProductInline)

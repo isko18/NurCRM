@@ -1176,6 +1176,51 @@ class OnlineBookingCreateSerializer(serializers.ModelSerializer):
         return attrs
 
 
+class BookingAssignmentServiceSerializer(serializers.Serializer):
+    """Услуга внутри назначения мастеру (multi-master бронь)."""
+    service_id = serializers.UUIDField()
+    title = serializers.CharField(required=False, allow_blank=True, default="")
+    price = serializers.DecimalField(max_digits=10, decimal_places=2, required=False, default=Decimal("0"))
+    duration_min = serializers.IntegerField(required=False, default=0, min_value=0)
+
+
+class BookingAssignmentSerializer(serializers.Serializer):
+    """Назначение: один мастер + его услуги + слот времени."""
+    master_id = serializers.UUIDField()
+    services = BookingAssignmentServiceSerializer(many=True)
+    time_start = serializers.TimeField()
+    time_end = serializers.TimeField()
+
+    def validate(self, attrs):
+        if not attrs.get("services"):
+            raise serializers.ValidationError({"services": "Назначение должно содержать хотя бы одну услугу."})
+        if attrs["time_end"] <= attrs["time_start"]:
+            raise serializers.ValidationError({"time_end": "Время окончания должно быть позже времени начала."})
+        return attrs
+
+
+class OnlineBookingMultiCreateSerializer(serializers.Serializer):
+    """
+    Публичный сериализатор multi-master брони: распределение услуг между несколькими мастерами.
+    Записи создаются атомарно во вьюхе.
+    """
+    client_name = serializers.CharField(max_length=255)
+    client_phone = serializers.CharField(max_length=32)
+    client_comment = serializers.CharField(required=False, allow_null=True, allow_blank=True)
+    date = serializers.DateField()
+    payment_method = serializers.ChoiceField(
+        choices=OnlineBooking.PaymentMethod.choices,
+        required=False,
+        default=OnlineBooking.PaymentMethod.CASH,
+    )
+    assignments = BookingAssignmentSerializer(many=True)
+
+    def validate_assignments(self, value):
+        if not value:
+            raise serializers.ValidationError("Укажите хотя бы одно назначение мастеру.")
+        return value
+
+
 class OnlineBookingSerializer(serializers.ModelSerializer):
     """Сериализатор для списка и деталей заявок (с авторизацией)"""
     

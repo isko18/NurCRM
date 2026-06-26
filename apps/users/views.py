@@ -1,5 +1,6 @@
 # views.py
 
+from django.db import transaction, IntegrityError
 from django.db.models import Q, Prefetch
 from django.http import Http404
 from django.db.utils import OperationalError, ProgrammingError
@@ -32,6 +33,10 @@ from .serializers import (
     CompanySubscriptionSerializer,
     BranchSerializer,
     BranchCreateUpdateSerializer,
+    SlugConflict,
+    normalize_slug,
+    slug_format_error,
+    slug_taken_by_other,
 )
 from .permissions import IsCompanyOwner, IsCompanyOwnerOrAdmin
 
@@ -425,6 +430,34 @@ class CompanyUpdateAPIView(generics.RetrieveUpdateAPIView):
         if not company:
             raise Http404("Компания для текущего пользователя не найдена.")
         return company
+
+    def perform_update(self, serializer):
+        # Сохраняем в транзакции; уникальный индекс по lower(slug) — защита от гонок.
+        try:
+            with transaction.atomic():
+                serializer.save()
+        except IntegrityError:
+            raise SlugConflict()
+
+
+class CompanyCheckSlugAPIView(APIView):
+    """
+    GET /users/company/check-slug/?slug=<value>
+    Лёгкая async-проверка доступности slug (без сохранения).
+    """
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, *args, **kwargs):
+        value = normalize_slug(request.query_params.get("slug"))
+        err = slug_format_error(value)
+        if err:
+            return Response({"available": False, "message": err})
+
+        company = _get_company(request.user)
+        exclude_pk = company.pk if company else None
+        if slug_taken_by_other(value, exclude_pk=exclude_pk):
+            return Response({"available": False, "message": "Slug already exists"})
+        return Response({"available": True})
 
 
 # =========================

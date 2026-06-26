@@ -5,9 +5,10 @@ from rest_framework.exceptions import PermissionDenied, ValidationError
 from rest_framework.filters import SearchFilter, OrderingFilter
 from django.utils import timezone
 from django.utils.dateparse import parse_date
+from datetime import time
 from decimal import Decimal
 from django.db.models.deletion import ProtectedError
-from django.db import IntegrityError, models
+from django.db import IntegrityError, models, transaction
 from django.db.models import Q, Prefetch, Count, Sum, Avg, F, Value, DecimalField, ExpressionWrapper
 
 from django_filters import rest_framework as filters
@@ -30,6 +31,7 @@ from .serializers import (
     PayoutSaleSerializer,
     ProductSalePayoutSerializer,
     OnlineBookingCreateSerializer,
+    OnlineBookingMultiCreateSerializer,
     OnlineBookingSerializer,
     OnlineBookingStatusUpdateSerializer,
     PublicServiceSerializer,
@@ -1071,11 +1073,21 @@ class OnlineBookingPublicCreateView(generics.CreateAPIView):
     Публичный эндпоинт для создания заявки на онлайн запись.
     Доступен без авторизации, но требует slug компании в URL.
     URL: /api/barbershop/public/{company_slug}/bookings/
+
+    Поддерживает два формата запроса:
+    - одиночная бронь (старый формат): {services, master_id, master_name, date,
+      time_start, time_end, client_*} → 201 с объектом заявки;
+    - multi-master (новый формат): {client_*, date, assignments: [...]} → записи создаются
+      атомарно, ответ 201 {"bookings": [{"id", "master_id"}, ...]}.
     """
     serializer_class = OnlineBookingCreateSerializer
     permission_classes = [permissions.AllowAny]
     authentication_classes = []
-    
+
+    # Рабочий день (согласовано с PublicMasterScheduleView)
+    WORK_START = time(9, 0)
+    WORK_END = time(21, 0)
+
     def get_company(self):
         """Получаем компанию по slug из URL"""
         slug = self.kwargs.get('company_slug')
@@ -1083,13 +1095,146 @@ class OnlineBookingPublicCreateView(generics.CreateAPIView):
             return Company.objects.get(slug=slug)
         except Company.DoesNotExist:
             raise ValidationError({'detail': 'Компания не найдена'})
-    
+
     def perform_create(self, serializer):
-        """Создаем заявку с автоматическим определением компании"""
+        """Создаем заявку с автоматическим определением компании (одиночная бронь)"""
         company = self.get_company()
         serializer.save(
             company=company,
             status=OnlineBooking.Status.NEW
+        )
+
+    def create(self, request, *args, **kwargs):
+        # Multi-master формат — массив назначений.
+        if isinstance(request.data, dict) and request.data.get('assignments'):
+            return self._create_multi(request)
+        return super().create(request, *args, **kwargs)
+
+    # ---- multi-master ----
+    def _master_busy(self, company, master_id, booking_date, t_start, t_end):
+        """Проверка занятости мастера: существующие онлайн-заявки и записи (appointments)."""
+        ob_overlap = OnlineBooking.objects.filter(
+            company=company,
+            master_id=master_id,
+            date=booking_date,
+            status__in=[OnlineBooking.Status.NEW, OnlineBooking.Status.CONFIRMED],
+            time_start__lt=t_end,
+            time_end__gt=t_start,
+        ).exists()
+        if ob_overlap:
+            return True
+
+        appts = Appointment.objects.filter(
+            company=company,
+            barber_id=master_id,
+            start_at__date=booking_date,
+            status__in=[Appointment.Status.BOOKED, Appointment.Status.CONFIRMED],
+        ).values_list('start_at', 'end_at')
+        for start_at, end_at in appts:
+            s_t = timezone.localtime(start_at).time() if timezone.is_aware(start_at) else start_at.time()
+            e_t = timezone.localtime(end_at).time() if timezone.is_aware(end_at) else end_at.time()
+            if s_t < t_end and e_t > t_start:
+                return True
+        return False
+
+    def _create_multi(self, request):
+        from apps.users.models import User
+
+        company = self.get_company()
+        serializer = OnlineBookingMultiCreateSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+        assignments = data['assignments']
+        booking_date = data['date']
+
+        errors = []
+        prepared = []
+        seen_master_slots = {}  # master_id -> list of (start, end) внутри одного запроса
+
+        for idx, assignment in enumerate(assignments):
+            master_id = assignment['master_id']
+            t_start = assignment['time_start']
+            t_end = assignment['time_end']
+
+            # 1) Рабочий день
+            if t_start < self.WORK_START or t_end > self.WORK_END:
+                errors.append({'index': idx, 'detail': 'Время вне рабочего дня (09:00–21:00).'})
+                continue
+
+            # 2) Мастер существует и принадлежит компании
+            master = User.objects.filter(id=master_id, company=company, is_active=True).first()
+            if master is None:
+                errors.append({'index': idx, 'detail': 'Мастер не найден.'})
+                continue
+
+            # 3) Мастер умеет назначенные услуги (если у услуги заданы мастера)
+            skill_error = None
+            for svc in assignment['services']:
+                service = Service.objects.filter(
+                    id=svc['service_id'], company=company, is_active=True
+                ).prefetch_related('barbers').first()
+                if service is None:
+                    skill_error = f"Услуга {svc['service_id']} не найдена."
+                    break
+                barber_ids = set(service.barbers.values_list('id', flat=True))
+                if barber_ids and master.id not in barber_ids:
+                    skill_error = f"Мастер не выполняет услугу «{service.name}»."
+                    break
+            if skill_error:
+                errors.append({'index': idx, 'detail': skill_error})
+                continue
+
+            # 4) Слот свободен (существующие брони/записи)
+            if self._master_busy(company, master.id, booking_date, t_start, t_end):
+                errors.append({'index': idx, 'detail': 'Слот мастера уже занят.'})
+                continue
+
+            # 5) Пересечения внутри самого запроса (тот же мастер дважды)
+            intra_overlap = any(
+                s < t_end and e > t_start for (s, e) in seen_master_slots.get(master.id, [])
+            )
+            if intra_overlap:
+                errors.append({'index': idx, 'detail': 'Пересечение слотов мастера в запросе.'})
+                continue
+            seen_master_slots.setdefault(master.id, []).append((t_start, t_end))
+
+            services_json = [
+                {
+                    'service_id': str(svc['service_id']),
+                    'title': svc.get('title') or '',
+                    'price': str(svc.get('price') or 0),
+                    'duration_min': int(svc.get('duration_min') or 0),
+                }
+                for svc in assignment['services']
+            ]
+            master_name = f"{master.first_name or ''} {master.last_name or ''}".strip() or master.email
+            prepared.append(OnlineBooking(
+                company=company,
+                services=services_json,
+                master_id=master.id,
+                master_name=master_name,
+                date=booking_date,
+                time_start=t_start,
+                time_end=t_end,
+                client_name=data['client_name'],
+                client_phone=data['client_phone'],
+                client_comment=data.get('client_comment'),
+                payment_method=data.get('payment_method', OnlineBooking.PaymentMethod.CASH),
+                status=OnlineBooking.Status.NEW,
+            ))
+
+        if errors:
+            raise ValidationError({'assignments': errors})
+
+        created = []
+        with transaction.atomic():
+            for booking in prepared:
+                booking.save()
+                created.append(booking)
+
+        return Response(
+            {'bookings': [{'id': str(b.id), 'master_id': str(b.master_id)} for b in created]},
+            status=status.HTTP_201_CREATED,
         )
 
 
@@ -1142,14 +1287,23 @@ class PublicServicesListView(generics.ListAPIView):
     Публичный эндпоинт для получения услуг компании.
     Доступен без авторизации, требует slug компании в URL.
     URL: /api/barbershop/public/{company_slug}/services/
-    
+
+    Возвращает услуги вместе со связями «услуга → мастера» в нормализованном виде
+    (без дублирования сотрудников):
+        {
+          "employees": { "<id>": {"id", "name", "avatar"}, ... },
+          "services":  [ {"id", "name", "category", "category_name",
+                          "price", "time", "employeeIds": [...]}, ... ]
+        }
+
     Query params:
         - branch: UUID филиала (опционально)
     """
     serializer_class = PublicServiceSerializer
     permission_classes = [permissions.AllowAny]
     authentication_classes = []
-    
+    pagination_class = None
+
     def get_company(self):
         """Получаем компанию по slug из URL"""
         slug = self.kwargs.get('company_slug')
@@ -1157,14 +1311,22 @@ class PublicServicesListView(generics.ListAPIView):
             return Company.objects.get(slug=slug)
         except Company.DoesNotExist:
             raise ValidationError({'detail': 'Компания не найдена'})
-    
+
     def get_queryset(self):
+        from apps.users.models import User
+
         company = self.get_company()
+        # Только активные мастера в связях услуг (минимальный набор полей).
+        active_barbers = User.objects.filter(is_active=True).only(
+            'id', 'first_name', 'last_name', 'email', 'avatar'
+        )
         qs = Service.objects.filter(
             company=company,
             is_active=True
-        ).select_related('category').order_by('category__name', 'name')
-        
+        ).select_related('category').prefetch_related(
+            Prefetch('barbers', queryset=active_barbers)
+        ).order_by('category__name', 'name')
+
         # Фильтрация по филиалу (если указан)
         branch_id = self.request.query_params.get('branch')
         if branch_id:
@@ -1175,8 +1337,43 @@ class PublicServicesListView(generics.ListAPIView):
             except (Branch.DoesNotExist, ValueError):
                 # Если филиал не найден - показываем только глобальные
                 qs = qs.filter(branch__isnull=True)
-        
+
         return qs
+
+    @staticmethod
+    def _master_name(user):
+        full = f"{user.first_name or ''} {user.last_name or ''}".strip()
+        return full or getattr(user, 'email', '') or str(user.id)
+
+    def list(self, request, *args, **kwargs):
+        """Нормализованный ответ: employees (словарь) + services (с employeeIds)."""
+        services = list(self.get_queryset())
+
+        employees = {}
+        services_payload = []
+        for service in services:
+            employee_ids = []
+            for barber in service.barbers.all():
+                key = str(barber.id)
+                if key not in employees:
+                    employees[key] = {
+                        'id': key,
+                        'name': self._master_name(barber),
+                        'avatar': barber.avatar or None,
+                    }
+                employee_ids.append(key)
+
+            services_payload.append({
+                'id': str(service.id),
+                'name': service.name,
+                'category': str(service.category_id) if service.category_id else None,
+                'category_name': service.category.name if service.category else None,
+                'price': str(service.price),
+                'time': service.time,
+                'employeeIds': employee_ids,
+            })
+
+        return Response({'employees': employees, 'services': services_payload})
 
 
 class PublicServiceCategoriesListView(generics.ListAPIView):

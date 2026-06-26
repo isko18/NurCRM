@@ -10,8 +10,43 @@ from django.db import transaction
 from django.db.models import Prefetch
 from django.utils import timezone
 
+import re
+
+from django.db.models.functions import Lower
+
 from rest_framework import serializers
+from rest_framework.exceptions import APIException
 from rest_framework_simplejwt.serializers import TokenObtainPairSerializer
+
+# --- slug (формат: ^[a-z0-9]+(?:-[a-z0-9]+)*$, длина 3..50) ---
+SLUG_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
+SLUG_MIN, SLUG_MAX = 3, 50
+
+
+def normalize_slug(value) -> str:
+    return (value or "").strip().lower()
+
+
+def slug_format_error(value):
+    """Возвращает текст ошибки если формат невалиден, иначе None."""
+    if len(value) < SLUG_MIN or len(value) > SLUG_MAX:
+        return f"Slug должен быть от {SLUG_MIN} до {SLUG_MAX} символов."
+    if not SLUG_RE.match(value):
+        return "Разрешены строчные латинские буквы, цифры и дефис (не подряд, не по краям)."
+    return None
+
+
+def slug_taken_by_other(value, exclude_pk=None) -> bool:
+    qs = Company.objects.annotate(_s=Lower("slug")).filter(_s=value)
+    if exclude_pk is not None:
+        qs = qs.exclude(pk=exclude_pk)
+    return qs.exists()
+
+
+class SlugConflict(APIException):
+    status_code = 409
+    default_detail = {"slug": ["Slug already exists"]}
+    default_code = "conflict"
 
 from apps.users.models import (
     User, Company, Roles, Industry, SubscriptionPlan,
@@ -822,10 +857,23 @@ _OPTIONAL_TEXT = (
 
 
 class CompanyUpdateSerializer(serializers.ModelSerializer):
+    slug = serializers.CharField(required=False, max_length=SLUG_MAX)
+
+    def validate_slug(self, value):
+        value = normalize_slug(value)
+        err = slug_format_error(value)
+        if err:
+            raise serializers.ValidationError(err)  # 400
+        exclude_pk = self.instance.pk if self.instance else None
+        if slug_taken_by_other(value, exclude_pk=exclude_pk):
+            raise SlugConflict()  # 409
+        return value
+
     class Meta:
         model = Company
         fields = [
             "name",
+            "slug",
             "llc",
             "inn",
             "okpo",

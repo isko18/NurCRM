@@ -2593,3 +2593,152 @@ class MoneyDocument(BaseModelCompanyBranch):
             wh = self.warehouse
             if wh and self.company_id and wh.company_id != self.company_id:
                 raise ValidationError({"warehouse": "Склад принадлежит другой компании."})
+
+
+# -----------------------
+# Sales summaries (Сводки продаж)
+# -----------------------
+
+
+class WarehouseSalesSummary(BaseModelId, BaseModelCompanyBranch):
+    """
+    Сводка продаж — снапшот накладных продаж (SALE) за конкретную дату по складу,
+    опционально по выбранным агентам. Снапшот фиксируется при создании
+    (`documents`, `products`, `totals`), чтобы документ был воспроизводим.
+    Пересобрать снапшот можно через regenerate.
+    """
+
+    class Type(models.TextChoices):
+        GENERAL = "general", "Общая сводка"
+        BY_AGENTS = "by_agents", "Сводка агентов"
+
+    number = models.CharField(
+        max_length=32, blank=True, null=True, db_index=True,
+        verbose_name="Номер", help_text="Человекочитаемый номер (СВ-000123), генерируется бэком.",
+    )
+    name = models.CharField(max_length=255, verbose_name="Название")
+    comment = models.TextField(blank=True, default="", verbose_name="Комментарий")
+    date = models.DateField(verbose_name="Дата сводки", help_text="День, за который собраны накладные.")
+    type = models.CharField(
+        max_length=16, choices=Type.choices, default=Type.GENERAL, verbose_name="Тип",
+    )
+    warehouse = models.ForeignKey(
+        "warehouse.Warehouse",
+        on_delete=models.CASCADE,
+        related_name="sales_summaries",
+        verbose_name="Склад",
+    )
+    agents = models.ManyToManyField(
+        settings.AUTH_USER_MODEL,
+        blank=True,
+        related_name="warehouse_sales_summaries",
+        verbose_name="Агенты",
+        help_text="Выбранные агенты (только для type=by_agents).",
+    )
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="warehouse_sales_summaries_created",
+        verbose_name="Автор",
+    )
+
+    # Снапшот-итоги (totals)
+    documents_count = models.PositiveIntegerField(default=0, verbose_name="Кол-во накладных")
+    products_count = models.PositiveIntegerField(default=0, verbose_name="Кол-во позиций")
+    total_quantity = models.DecimalField(max_digits=18, decimal_places=3, default=Decimal("0.000"), verbose_name="Итого количество")
+    total_weight = models.DecimalField(max_digits=18, decimal_places=3, default=Decimal("0.000"), verbose_name="Итого вес")
+    total_amount = models.DecimalField(max_digits=18, decimal_places=2, default=Decimal("0.00"), verbose_name="Итого сумма")
+
+    created_at = models.DateTimeField(auto_now_add=True, verbose_name="Дата создания")
+    updated_at = models.DateTimeField(auto_now=True, verbose_name="Дата обновления")
+
+    class Meta:
+        verbose_name = "Сводка продаж"
+        verbose_name_plural = "Сводки продаж"
+        ordering = ["-date", "-created_at"]
+        indexes = [
+            models.Index(fields=["company", "date"]),
+            models.Index(fields=["company", "type"]),
+            models.Index(fields=["company", "created_by"]),
+            models.Index(fields=["company", "name"]),
+            models.Index(fields=["company", "warehouse", "date"]),
+        ]
+
+    def __str__(self):
+        return f"{self.number or self.id} ({self.name})"
+
+    def clean(self):
+        if self.warehouse_id and self.company_id and self.warehouse.company_id != self.company_id:
+            raise ValidationError({"warehouse": "Склад принадлежит другой компании."})
+        if self.branch_id and self.company_id and self.branch.company_id != self.company_id:
+            raise ValidationError({"branch": "Филиал принадлежит другой компании."})
+
+
+class WarehouseSalesSummaryDocument(models.Model):
+    """Снапшот накладной, вошедшей в сводку (значения зафиксированы на момент сборки)."""
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    summary = models.ForeignKey(
+        WarehouseSalesSummary, on_delete=models.CASCADE, related_name="documents", verbose_name="Сводка",
+    )
+    document = models.ForeignKey(
+        "warehouse.Document",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="+",
+        verbose_name="Исходная накладная",
+    )
+    number = models.CharField(max_length=64, blank=True, default="", verbose_name="Номер")
+    date = models.DateField(null=True, blank=True, verbose_name="Дата")
+    agent = models.CharField(max_length=255, blank=True, default="", verbose_name="Агент")
+    client = models.CharField(max_length=255, blank=True, default="", verbose_name="Клиент")
+    address = models.CharField(max_length=255, blank=True, default="", verbose_name="Адрес")
+    quantity = models.DecimalField(max_digits=18, decimal_places=3, default=Decimal("0.000"), verbose_name="Количество")
+    weight = models.DecimalField(max_digits=18, decimal_places=3, default=Decimal("0.000"), verbose_name="Вес")
+    amount = models.DecimalField(max_digits=18, decimal_places=2, default=Decimal("0.00"), verbose_name="Сумма")
+
+    class Meta:
+        verbose_name = "Накладная в сводке"
+        verbose_name_plural = "Накладные в сводке"
+        ordering = ["number"]
+        indexes = [models.Index(fields=["summary"])]
+
+    def __str__(self):
+        return f"{self.number} ({self.summary_id})"
+
+
+class WarehouseSalesSummaryProduct(models.Model):
+    """Строка агрегированной товарной таблицы сводки (GROUP BY номенклатура + единица + цена)."""
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    summary = models.ForeignKey(
+        WarehouseSalesSummary, on_delete=models.CASCADE, related_name="products", verbose_name="Сводка",
+    )
+    product = models.ForeignKey(
+        "warehouse.WarehouseProduct",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="+",
+        verbose_name="Исходный товар",
+    )
+    name = models.CharField(max_length=255, blank=True, default="", verbose_name="Название")
+    unit = models.CharField(max_length=32, blank=True, default="", verbose_name="Единица")
+    packages = models.DecimalField(max_digits=18, decimal_places=3, default=Decimal("0.000"), verbose_name="Упаковок")
+    per_package = models.DecimalField(max_digits=18, decimal_places=3, default=Decimal("0.000"), verbose_name="В упаковке")
+    quantity = models.DecimalField(max_digits=18, decimal_places=3, default=Decimal("0.000"), verbose_name="Количество")
+    price = models.DecimalField(max_digits=18, decimal_places=2, default=Decimal("0.00"), verbose_name="Цена")
+    amount = models.DecimalField(max_digits=18, decimal_places=2, default=Decimal("0.00"), verbose_name="Сумма")
+    weight = models.DecimalField(max_digits=18, decimal_places=3, default=Decimal("0.000"), verbose_name="Вес")
+
+    class Meta:
+        verbose_name = "Товар в сводке"
+        verbose_name_plural = "Товары в сводке"
+        ordering = ["name"]
+        indexes = [models.Index(fields=["summary"])]
+
+    def __str__(self):
+        return f"{self.name} ({self.summary_id})"
