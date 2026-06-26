@@ -106,6 +106,19 @@ class CompanyManager(models.Manager.from_queryset(CompanyQuerySet)):
     pass
 
 
+# Режим чтения штрихкода весов (ШТРИХ-ПРИНТ и т.п.).
+# В EAN-13 весов поле EEEEE может означать ВЕС (граммы) или СУММУ (сомы) —
+# зависит от модели/настройки весов. Этот переключатель задаёт трактовку.
+SCALE_BARCODE_MODE_AUTO = "auto"      # по префиксу: 20 = вес, 25 = сумма
+SCALE_BARCODE_MODE_WEIGHT = "weight"  # всегда вес (граммы / 1000)
+SCALE_BARCODE_MODE_AMOUNT = "amount"  # всегда сумма (сомы)
+SCALE_BARCODE_MODE_CHOICES = [
+    (SCALE_BARCODE_MODE_AUTO, "Авто (по префиксу ШК: 20=вес, 25=сумма)"),
+    (SCALE_BARCODE_MODE_WEIGHT, "По весу"),
+    (SCALE_BARCODE_MODE_AMOUNT, "По сумме"),
+]
+
+
 class Company(models.Model):
     objects = CompanyManager()
 
@@ -162,6 +175,17 @@ class Company(models.Model):
         null=True,
         verbose_name="Токен для весов/агентов",
         help_text="Постоянный токен, которым подключаются весы к API",
+    )
+
+    scale_barcode_mode = models.CharField(
+        max_length=10,
+        choices=SCALE_BARCODE_MODE_CHOICES,
+        default=SCALE_BARCODE_MODE_AUTO,
+        verbose_name="Режим штрихкода весов",
+        help_text=(
+            "Как трактовать поле в штрихкоде весов: «По весу» (граммы), "
+            "«По сумме» (сомы) или «Авто» по префиксу (20=вес, 25=сумма)."
+        ),
     )
 
     def ensure_scale_api_token(self):

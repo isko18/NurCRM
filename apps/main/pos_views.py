@@ -34,7 +34,14 @@ from django.conf import settings
 import requests
 import qrcode
 
-from apps.users.models import Roles, User, Company
+from apps.users.models import (
+    Roles,
+    User,
+    Company,
+    SCALE_BARCODE_MODE_AUTO,
+    SCALE_BARCODE_MODE_WEIGHT,
+    SCALE_BARCODE_MODE_AMOUNT,
+)
 from apps.main.models import (
     Cart,
     CartItem,
@@ -737,16 +744,39 @@ def _party_lines(
     ]
 
 
-def _parse_scale_barcode(barcode: str):
-    """
-    EAN-13 весовой штрихкод весов TM-A/TM-F: FFWWWWWEEEEEC
+# Префиксы EAN-13 весов ШТРИХ-ПРИНТ (см. «Префикс штрих-кода» в драйвере весов):
+#   весовой товар  -> в поле EEEEE зашит ВЕС (граммы): 00214 = 0.214 кг
+#   итоговый       -> в поле EEEEE зашита СТОИМОСТЬ в сомах: 00044 = 44 сом
+# По умолчанию весовой = 20, итоговый = 25 (заводская настройка ШТРИХ).
+# Если на весах префиксы перенастроены — поправьте эти множества.
+SCALE_WEIGHT_PREFIXES = {"20"}
+SCALE_AMOUNT_PREFIXES = {"25"}
 
-    - FF (20–29) : префикс весового товара
+
+def _company_scale_barcode_mode(company_id) -> str:
+    """Режим чтения штрихкода весов для компании (Company.scale_barcode_mode)."""
+    mode = (
+        Company.objects.filter(id=company_id)
+        .values_list("scale_barcode_mode", flat=True)
+        .first()
+    )
+    return mode or SCALE_BARCODE_MODE_AUTO
+
+
+def _parse_scale_barcode(barcode: str, mode: str = SCALE_BARCODE_MODE_AUTO):
+    """
+    EAN-13 штрихкод весов ШТРИХ-ПРИНТ / TM-A/TM-F: FF WWWWW EEEEE C
+
+    - FF (20–29) : префикс (весовой / итоговый / штучный)
     - WWWWW      : PLU (5 цифр)
-    - EEEEE      : сумма в сомах на этикетке (00044 → 44 сом), без деления на 100
+    - EEEEE      : вес ИЛИ стоимость — в зависимости от режима (см. ниже)
     - C          : контрольная цифра
 
-    Количество (кг) вычисляется позже в _finalize_scale_data_for_product.
+    Трактовка поля EEEEE задаётся `mode` (Company.scale_barcode_mode):
+      - "weight" : всегда вес в граммах -> weight_kg = EEEEE / 1000.
+      - "amount" : всегда сумма в сомах (без деления на 100); вес считается
+                   позже в _finalize_scale_data_for_product как сумма / цена.
+      - "auto"   : по префиксу — весовой (20) -> вес, иначе -> сумма.
     """
     if not barcode or len(barcode) != 13 or not barcode.isdigit():
         return None
@@ -760,7 +790,7 @@ def _parse_scale_barcode(barcode: str):
         return None
 
     raw_code = barcode[2:7]
-    amount_raw = barcode[7:12]
+    value_raw = barcode[7:12]
     check_digit = barcode[12]
 
     try:
@@ -768,13 +798,37 @@ def _parse_scale_barcode(barcode: str):
     except ValueError:
         return None
 
-    amount = Decimal(amount_raw)
+    if mode == SCALE_BARCODE_MODE_WEIGHT:
+        as_weight = True
+    elif mode == SCALE_BARCODE_MODE_AMOUNT:
+        as_weight = False
+    else:  # auto — по префиксу
+        as_weight = prefix in SCALE_WEIGHT_PREFIXES
+
+    # Весовой штрихкод: в поле зашит ВЕС (граммы), а не сумма.
+    if as_weight:
+        try:
+            weight_raw = int(value_raw)
+        except ValueError:
+            return None
+        return {
+            "prefix": prefix,
+            "plu": plu,
+            "raw_code": raw_code,
+            "weight_raw": weight_raw,
+            "weight_kg": Decimal(weight_raw) / Decimal(1000),
+            "check_digit": check_digit,
+            "mode": "weight",
+        }
+
+    # Итоговый/прочие префиксы: в поле зашита СТОИМОСТЬ в сомах.
+    amount = Decimal(value_raw)
 
     return {
         "prefix": prefix,
         "plu": plu,
         "raw_code": raw_code,
-        "amount_raw": amount_raw,
+        "amount_raw": value_raw,
         "amount": amount,
         "check_digit": check_digit,
         "mode": "amount_plain",
@@ -977,7 +1031,8 @@ def _lookup_product_for_pos_scan(company_id, barcode: str, *, only_fields=POS_SC
         except ValueError:
             pass
 
-    scale_data = _parse_scale_barcode(barcode)
+    scale_mode = _company_scale_barcode_mode(company_id)
+    scale_data = _parse_scale_barcode(barcode, scale_mode)
     if scale_data:
         product = _resolve_product_by_plu_or_code_for_pos(company_id, scale_data, only_fields=only_fields)
         if product:

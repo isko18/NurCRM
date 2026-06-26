@@ -30,12 +30,15 @@ class PosOwnerAgentSaleTests(TestCase):
 
 
 class PosScaleBarcodeTests(TestCase):
-    BARCODE = "2000001000441"
+    # Итоговый префикс (25): в ШК зашита СТОИМОСТЬ в сомах.
+    BARCODE = "2500001000441"
+    # Весовой префикс (20): в ШК зашит ВЕС в граммах.
+    WEIGHT_BARCODE = "2004626002149"
 
     def test_parse_scale_barcode_amount_in_som(self):
         data = _parse_scale_barcode(self.BARCODE)
         self.assertIsNotNone(data)
-        self.assertEqual(data["prefix"], "20")
+        self.assertEqual(data["prefix"], "25")
         self.assertEqual(data["plu"], 1)
         self.assertEqual(data["raw_code"], "00001")
         self.assertEqual(data["amount_raw"], "00044")
@@ -43,6 +46,29 @@ class PosScaleBarcodeTests(TestCase):
         self.assertEqual(data["check_digit"], "1")
         self.assertEqual(data["mode"], "amount_plain")
         self.assertNotIn("weight_kg", data)
+
+    def test_parse_weight_barcode_grams_to_kg(self):
+        # Весовой штрихкод ШТРИХ: поле = вес в граммах, без деления на цену.
+        data = _parse_scale_barcode(self.WEIGHT_BARCODE)
+        self.assertIsNotNone(data)
+        self.assertEqual(data["prefix"], "20")
+        self.assertEqual(data["plu"], 4626)
+        self.assertEqual(data["mode"], "weight")
+        self.assertEqual(data["weight_raw"], 214)
+        self.assertEqual(data["weight_kg"], Decimal("0.214"))
+        self.assertNotIn("amount", data)
+
+    def test_weight_barcode_effective_qty_independent_of_price(self):
+        # 0.214 кг берётся напрямую из ШК; цена за кг не влияет на вес.
+        scale_data = _parse_scale_barcode(self.WEIGHT_BARCODE)
+        product = SimpleNamespace(price=Decimal("100"))
+        # Для весового режима finalize — no-op (не делит на цену).
+        self.assertIsNone(_finalize_scale_data_for_product(product, scale_data))
+        self.assertNotIn("quantity_kg", scale_data)
+        self.assertEqual(
+            _effective_qty_from_scale_data(scale_data, Decimal("9.000")),
+            Decimal("0.214"),
+        )
 
     def test_quantity_amount_44_price_44(self):
         scale_data = _parse_scale_barcode(self.BARCODE)

@@ -814,6 +814,7 @@ class CompanySerializer(serializers.ModelSerializer):
             "can_view_documents", "can_view_whatsapp", "can_view_instagram", "can_view_telegram", "can_view_showcase",
             "cashier_password",
             "llc", "inn", "okpo", "score", "bik", "address",
+            "scale_barcode_mode",
         ]
 
 
@@ -886,6 +887,7 @@ class CompanyUpdateSerializer(serializers.ModelSerializer):
             "industry",
             "sector",
             "region",
+            "scale_barcode_mode",
         ]
 
     def validate(self, attrs):
