@@ -1407,7 +1407,13 @@ class Document(models.Model):
     doc_type = models.CharField(max_length=32, choices=DocType.choices, verbose_name="Тип документа")
     status = models.CharField(max_length=16, choices=Status.choices, default=Status.DRAFT, verbose_name="Статус")
     number = models.CharField(max_length=64, unique=True, null=True, blank=True, verbose_name="Номер")
-    date = models.DateTimeField(auto_now_add=True, verbose_name="Дата")
+    date = models.DateTimeField(
+        default=timezone.now,
+        verbose_name="Дата",
+        help_text="Операционная дата документа (для печати, списков и аналитики). "
+                  "Задаётся пользователем; по умолчанию — текущий момент. "
+                  "Не путать с created_at (момент создания записи).",
+    )
 
     payment_kind = models.CharField(
         max_length=16,
@@ -2486,12 +2492,19 @@ class MoneyDocument(BaseModelCompanyBranch):
     class Status(models.TextChoices):
         DRAFT = "DRAFT", "Черновик"
         POSTED = "POSTED", "Проведен"
+        REJECTED = "REJECTED", "Отказан"
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     doc_type = models.CharField(max_length=32, choices=DocType.choices, verbose_name="Тип документа")
     status = models.CharField(max_length=16, choices=Status.choices, default=Status.DRAFT, verbose_name="Статус")
     number = models.CharField(max_length=64, unique=True, null=True, blank=True, verbose_name="Номер")
-    date = models.DateTimeField(auto_now_add=True, verbose_name="Дата")
+    date = models.DateTimeField(
+        default=timezone.now,
+        verbose_name="Дата",
+        help_text="Операционная дата документа (для кассовых отчётов за день). "
+                  "Задаётся пользователем; по умолчанию — текущий момент. "
+                  "Не путать с created_at (момент создания записи).",
+    )
 
     cash_register = models.ForeignKey(
         "warehouse.CashRegister",
@@ -2742,3 +2755,34 @@ class WarehouseSalesSummaryProduct(models.Model):
 
     def __str__(self):
         return f"{self.name} ({self.summary_id})"
+
+
+class WarehouseSalesSummaryDocumentItem(models.Model):
+    """
+    Снапшот позиции конкретной накладной в сводке (детализация по накладным для PDF).
+    В отличие от WarehouseSalesSummaryProduct (агрегат по всем накладным),
+    хранит строки отдельной накладной как есть на момент сборки снапшота.
+    """
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    summary_document = models.ForeignKey(
+        WarehouseSalesSummaryDocument, on_delete=models.CASCADE,
+        related_name="items", verbose_name="Накладная в сводке",
+    )
+    name = models.CharField(max_length=255, blank=True, default="", verbose_name="Наименование")
+    unit = models.CharField(max_length=32, blank=True, default="", verbose_name="Единица")
+    quantity = models.DecimalField(max_digits=18, decimal_places=3, default=Decimal("0.000"), verbose_name="Количество")
+    price = models.DecimalField(max_digits=18, decimal_places=2, default=Decimal("0.00"), verbose_name="Цена (до скидки)")
+    discount_percent = models.DecimalField(max_digits=5, decimal_places=2, default=Decimal("0.00"), verbose_name="Скидка, %")
+    discount_amount = models.DecimalField(max_digits=18, decimal_places=2, default=Decimal("0.00"), verbose_name="Скидка, сумма")
+    amount = models.DecimalField(max_digits=18, decimal_places=2, default=Decimal("0.00"), verbose_name="Сумма (со скидкой)")
+    weight = models.DecimalField(max_digits=18, decimal_places=3, default=Decimal("0.000"), verbose_name="Вес")
+
+    class Meta:
+        verbose_name = "Позиция накладной в сводке"
+        verbose_name_plural = "Позиции накладных в сводке"
+        ordering = ["name"]
+        indexes = [models.Index(fields=["summary_document"])]
+
+    def __str__(self):
+        return f"{self.name} ({self.summary_document_id})"

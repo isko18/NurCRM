@@ -13,6 +13,7 @@ from django.db import transaction
 from django.db.models import Sum
 
 from . import models
+from .services import effective_document_line_discount_percent
 
 # Какие накладные считаем «продажами за день»: все, кроме отклонённых.
 # (соответствует тому, что пользователь видит в списке продаж склада.)
@@ -104,6 +105,7 @@ def build_summary_snapshot(summary):
     summary.products.all().delete()
 
     docs = list(_documents_queryset(summary))
+    doc_by_id = {doc.id: doc for doc in docs}
 
     # --- Накладные (снапшот построчно) ---
     item_totals = (
@@ -124,6 +126,8 @@ def build_summary_snapshot(summary):
     )
     # Группировка товаров: (product_id, unit, price) -> агрегаты
     product_groups = {}
+    # Позиции по накладным (детализация для PDF): document_id -> [snapshot dict]
+    items_by_doc = {}
     for item in items:
         product = item.product
         qty = Decimal(item.qty or 0)
@@ -135,6 +139,23 @@ def build_summary_snapshot(summary):
 
         unit = (getattr(product, "unit", "") or "").strip()
         price = Decimal(item.price or 0)
+
+        # Эффективная скидка строки = % на товар, иначе общая скидка документа
+        # (совпадает с тем, как считается line_total в DocumentItem.save).
+        doc = doc_by_id.get(item.document_id)
+        doc_dp = Decimal(getattr(doc, "discount_percent", None) or 0)
+        eff_pct = effective_document_line_discount_percent(item.discount_percent, doc_dp)
+        items_by_doc.setdefault(item.document_id, []).append({
+            "name": getattr(product, "name", "") or "",
+            "unit": unit,
+            "quantity": _q3(qty),
+            "price": _q2(price),
+            "discount_percent": Decimal(eff_pct).quantize(TWOPLACES),
+            "discount_amount": _q2(item.discount_amount),
+            "amount": _q2(amount),
+            "weight": _q3(weight),
+        })
+
         key = (item.product_id, unit, price)
         group = product_groups.get(key)
         if group is None:
@@ -168,6 +189,29 @@ def build_summary_snapshot(summary):
             amount=_q2(doc.total or 0),
         ))
     models.WarehouseSalesSummaryDocument.objects.bulk_create(summary_doc_rows)
+
+    # --- Позиции накладных (детализация для PDF) ---
+    # summary_doc_rows получили id (UUID) ещё до bulk_create, поэтому связь по document_id надёжна.
+    doc_row_by_docid = {row.document_id: row for row in summary_doc_rows}
+    summary_item_rows = []
+    for doc_id, item_list in items_by_doc.items():
+        summary_doc = doc_row_by_docid.get(doc_id)
+        if summary_doc is None:
+            continue
+        for it in item_list:
+            summary_item_rows.append(models.WarehouseSalesSummaryDocumentItem(
+                summary_document=summary_doc,
+                name=it["name"],
+                unit=it["unit"],
+                quantity=it["quantity"],
+                price=it["price"],
+                discount_percent=it["discount_percent"],
+                discount_amount=it["discount_amount"],
+                amount=it["amount"],
+                weight=it["weight"],
+            ))
+    if summary_item_rows:
+        models.WarehouseSalesSummaryDocumentItem.objects.bulk_create(summary_item_rows)
 
     # --- Товары (агрегированная таблица) ---
     summary_product_rows = []

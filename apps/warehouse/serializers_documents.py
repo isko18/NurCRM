@@ -12,6 +12,24 @@ from .utils import normalize_payment_kind, normalize_payment_method
 User = get_user_model()
 
 
+class DocumentDateField(serializers.DateTimeField):
+    """Операционная дата документа.
+
+    На вход принимает календарную дату ``YYYY-MM-DD`` (трактуется как начало дня
+    в текущей таймзоне) либо ISO-8601 datetime. На выходе — ISO datetime, как и
+    хранится в БД. Поле необязательное: при создании без даты модель подставит
+    текущий момент, при обновлении без даты — значение не меняется.
+    """
+
+    def __init__(self, **kwargs):
+        kwargs.setdefault("input_formats", ["%Y-%m-%d", "iso-8601"])
+        kwargs.setdefault("required", False)
+        kwargs.setdefault("error_messages", {
+            "invalid": "Неверный формат даты. Ожидается YYYY-MM-DD.",
+        })
+        super().__init__(**kwargs)
+
+
 class PaymentKindField(serializers.CharField):
     """Принимает credit/debt/cash и нормализует к Document.PaymentKind."""
 
@@ -234,6 +252,7 @@ class DocumentSerializer(serializers.ModelSerializer):
     expenses = serializers.SerializerMethodField()
     payment_kind = PaymentKindField(required=False, allow_null=True, allow_blank=True)
     payment_method = PaymentMethodField(required=False, allow_null=True, allow_blank=True)
+    date = DocumentDateField(required=False)
 
     money_document_id = serializers.SerializerMethodField()
     money_document_number = serializers.SerializerMethodField()
@@ -301,7 +320,7 @@ class DocumentSerializer(serializers.ModelSerializer):
             "receipts",
             "expenses",
         )
-        read_only_fields = ("number", "total", "status", "date", "cash_request_status")
+        read_only_fields = ("number", "total", "status", "cash_request_status")
 
     @staticmethod
     def _resolve_sale_status(doc_type, is_sale_request):

@@ -73,6 +73,9 @@ class DocumentListCreateView(CompanyBranchRestrictedMixin, generics.ListCreateAP
             "moves__product",
         ).order_by("-date")
         qs = self._filter_company_branch(qs)
+        # Необязательная фильтрация по операционной дате документа:
+        # ?date_from=YYYY-MM-DD&date_to=YYYY-MM-DD (по полю date, не created_at).
+        qs = services_money.apply_requested_date_range(qs, "date", self)
         user = self.request.user
         if not _is_owner_like(user):
             qs = qs.filter(agent=user)
@@ -867,3 +870,55 @@ class CounterpartyDetailView(CompanyBranchRestrictedMixin, generics.RetrieveUpda
             return
         serializer.validated_data["agent"] = getattr(instance, "agent", None) or user
         serializer.save()
+
+
+class CounterpartyBalanceSummaryView(CompanyBranchRestrictedMixin, APIView):
+    """
+    GET /api/warehouse/counterparties/balance-summary/
+
+    Сводка по контрагентам за период: сальдо на начало, оборот, сальдо на конец —
+    каждое с разбивкой на дебет и кредит. Агрегат по всем контрагентам выбранного
+    типа в рамках компании пользователя. Дебет/кредит — как в акте сверки.
+
+    Query: type=client|supplier (опц.), date_from=YYYY-MM-DD, date_to=YYYY-MM-DD.
+    """
+
+    permission_classes = [permissions.IsAuthenticated]
+
+    _TYPE_MAP = {
+        "client": models.Counterparty.Type.CLIENT,
+        "supplier": models.Counterparty.Type.SUPPLIER,
+    }
+
+    def get(self, request, *args, **kwargs):
+        from django.utils.dateparse import parse_date
+
+        date_from = parse_date(request.query_params.get("date_from") or "")
+        date_to = parse_date(request.query_params.get("date_to") or "")
+        if not date_from or not date_to:
+            return Response(
+                {"detail": "Укажите параметры date_from и date_to (YYYY-MM-DD)."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if date_to < date_from:
+            date_from, date_to = date_to, date_from
+
+        type_raw = (request.query_params.get("type") or "").strip().lower()
+        counterparty_type = None
+        if type_raw and type_raw != "both":
+            counterparty_type = self._TYPE_MAP.get(type_raw)
+            if counterparty_type is None:
+                return Response(
+                    {"detail": "Параметр type должен быть client или supplier."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+        row = services_money.counterparty_period_balances(
+            self, date_from=date_from, date_to=date_to,
+            counterparty_type=counterparty_type, per_counterparty=False,
+        )
+        return Response({
+            "opening": {"debit": str(row["opening_debit"]), "credit": str(row["opening_credit"])},
+            "turnover": {"debit": str(row["turnover_debit"]), "credit": str(row["turnover_credit"])},
+            "closing": {"debit": str(row["closing_debit"]), "credit": str(row["closing_credit"])},
+        }, status=status.HTTP_200_OK)

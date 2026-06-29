@@ -66,6 +66,112 @@ def apply_requested_date_range(qs, field_name: str, mixin):
     return qs
 
 
+# Дебет/кредит — единая трактовка с актом сверки (views_reconciliation):
+#   Дебет  — задолженность контрагента перед компанией (отгрузки в долг, расход денег контрагенту).
+#   Кредит — задолженность компании перед контрагентом (приходы товара, поступления денег).
+DOC_DEBIT_TYPES = (models.Document.DocType.SALE, models.Document.DocType.PURCHASE_RETURN)
+DOC_CREDIT_TYPES = (models.Document.DocType.PURCHASE, models.Document.DocType.SALE_RETURN)
+
+
+def _empty_period_balance() -> dict:
+    z = Decimal("0.00")
+    return {
+        "opening_debit": z, "opening_credit": z,
+        "turnover_debit": z, "turnover_credit": z,
+        "closing_debit": z, "closing_credit": z,
+    }
+
+
+def _period_sums(qs, amount_field, debit_types, credit_types, date_from, date_to, *, group):
+    """
+    Условные суммы по стороне (дебет/кредит) и по периоду (до date_from / внутри [date_from, date_to]).
+    group=True → словарь {counterparty_id: row}; group=False → один aggregate-row.
+    """
+    _dec_field = DecimalField(max_digits=18, decimal_places=2)
+    zero = Value(Decimal("0.00"), output_field=_dec_field)
+    ann = dict(
+        opening_debit=Coalesce(Sum(amount_field, filter=Q(doc_type__in=debit_types, date__date__lt=date_from)), zero),
+        opening_credit=Coalesce(Sum(amount_field, filter=Q(doc_type__in=credit_types, date__date__lt=date_from)), zero),
+        turnover_debit=Coalesce(Sum(amount_field, filter=Q(doc_type__in=debit_types, date__date__gte=date_from, date__date__lte=date_to)), zero),
+        turnover_credit=Coalesce(Sum(amount_field, filter=Q(doc_type__in=credit_types, date__date__gte=date_from, date__date__lte=date_to)), zero),
+    )
+    if group:
+        return {r["counterparty_id"]: r for r in qs.values("counterparty_id").annotate(**ann)}
+    return qs.aggregate(**ann)
+
+
+def _combine_period_rows(doc_row, money_row) -> dict:
+    doc_row = doc_row or {}
+    money_row = money_row or {}
+    od = _dec_q2(doc_row.get("opening_debit")) + _dec_q2(money_row.get("opening_debit"))
+    oc = _dec_q2(doc_row.get("opening_credit")) + _dec_q2(money_row.get("opening_credit"))
+    td = _dec_q2(doc_row.get("turnover_debit")) + _dec_q2(money_row.get("turnover_debit"))
+    tc = _dec_q2(doc_row.get("turnover_credit")) + _dec_q2(money_row.get("turnover_credit"))
+    return {
+        "opening_debit": _dec_q2(od), "opening_credit": _dec_q2(oc),
+        "turnover_debit": _dec_q2(td), "turnover_credit": _dec_q2(tc),
+        "closing_debit": _dec_q2(od + td), "closing_credit": _dec_q2(oc + tc),
+    }
+
+
+def counterparty_period_balances(
+    mixin, *, date_from, date_to,
+    counterparty_type=None, counterparty_ids=None, per_counterparty=False,
+):
+    """
+    Сальдо на начало / оборот / сальдо на конец по дебету и кредиту за период.
+
+    Трактовка дебета/кредита — как в акте сверки (см. DOC_DEBIT_TYPES/CREDIT_TYPES,
+    деньги: MONEY_EXPENSE → дебет, MONEY_RECEIPT → кредит), чтобы цифры сходились.
+
+    - opening_* — накоплено строго до date_from;
+    - turnover_* — внутри [date_from, date_to] включительно;
+    - closing_* = opening_* + turnover_*.
+
+    per_counterparty=False → один словарь-итог по всем подходящим контрагентам;
+    per_counterparty=True  → {counterparty_id: словарь}.
+    """
+    Doc = models.Document
+    MD = models.MoneyDocument
+    f = mixin._filter_qs_company_branch
+
+    docs = Doc.objects.filter(
+        status=Doc.Status.POSTED,
+        doc_type__in=DOC_DEBIT_TYPES + DOC_CREDIT_TYPES,
+        counterparty_id__isnull=False,
+    )
+    docs = f(docs, company_field="warehouse_from__company_id", branch_field="warehouse_from__branch")
+
+    money = MD.objects.filter(
+        status=MD.Status.POSTED,
+        doc_type__in=(MD.DocType.MONEY_RECEIPT, MD.DocType.MONEY_EXPENSE),
+        counterparty_id__isnull=False,
+    )
+    money = f(money)
+
+    if counterparty_type:
+        docs = docs.filter(counterparty__type=counterparty_type)
+        money = money.filter(counterparty__type=counterparty_type)
+    if counterparty_ids is not None:
+        docs = docs.filter(counterparty_id__in=counterparty_ids)
+        money = money.filter(counterparty_id__in=counterparty_ids)
+
+    money_debit = (MD.DocType.MONEY_EXPENSE,)
+    money_credit = (MD.DocType.MONEY_RECEIPT,)
+
+    if per_counterparty:
+        doc_map = _period_sums(docs, "total", DOC_DEBIT_TYPES, DOC_CREDIT_TYPES, date_from, date_to, group=True)
+        money_map = _period_sums(money, "amount", money_debit, money_credit, date_from, date_to, group=True)
+        out = {}
+        for cid in set(doc_map) | set(money_map):
+            out[cid] = _combine_period_rows(doc_map.get(cid), money_map.get(cid))
+        return out
+
+    doc_row = _period_sums(docs, "total", DOC_DEBIT_TYPES, DOC_CREDIT_TYPES, date_from, date_to, group=False)
+    money_row = _period_sums(money, "amount", money_debit, money_credit, date_from, date_to, group=False)
+    return _combine_period_rows(doc_row, money_row)
+
+
 def bulk_counterparty_mini_analytics(mixin, counterparty_ids) -> dict:
     """
     Та же сводка, что CounterpartyMoneyOperationsView._counterparty_mini_analytics,
@@ -175,6 +281,18 @@ def bulk_counterparty_mini_analytics(mixin, counterparty_ids) -> dict:
             "company_owes_counterparty": str(_dec_q2((-balance) if balance < 0 else 0)),
         }
 
+    # При выбранном периоде добавляем сальдо на начало/оборот/сальдо на конец
+    # (явные opening_*/turnover_*/closing_*), которые предпочитает фронт.
+    date_from, date_to = get_requested_date_range(mixin)
+    if date_from and date_to:
+        period_map = counterparty_period_balances(
+            mixin, date_from=date_from, date_to=date_to,
+            counterparty_ids=ids, per_counterparty=True,
+        )
+        for cid in ids:
+            row = period_map.get(cid) or _empty_period_balance()
+            out[cid]["debts"].update({k: str(v) for k, v in row.items()})
+
     return out
 
 
@@ -217,6 +335,22 @@ def unpost_money_document(doc: models.MoneyDocument) -> models.MoneyDocument:
 
     with transaction.atomic():
         doc.status = doc.Status.DRAFT
+        doc.save(update_fields=["status"])
+
+    return doc
+
+
+def reject_money_document(doc: models.MoneyDocument) -> models.MoneyDocument:
+    """
+    Отказ проведённого денежного документа: POSTED → REJECTED.
+    Движение по кассе откатывается так же, как при unpost (баланс кассы считается
+    только по POSTED-документам), но документ остаётся в системе как «Отказан».
+    """
+    if doc.status != doc.Status.POSTED:
+        raise ValueError("Отказать можно только проведённый документ.")
+
+    with transaction.atomic():
+        doc.status = doc.Status.REJECTED
         doc.save(update_fields=["status"])
 
     return doc

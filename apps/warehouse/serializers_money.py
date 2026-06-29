@@ -65,6 +65,13 @@ class MoneyDocumentSerializer(serializers.ModelSerializer):
         allow_null=True,
     )
 
+    # Операционная дата: принимаем YYYY-MM-DD (модалка) или ISO-datetime.
+    # Не передана при создании → используется текущий момент (default модели).
+    date = serializers.DateTimeField(
+        required=False,
+        input_formats=["iso-8601", "%Y-%m-%d"],
+    )
+
     class Meta:
         model = models.MoneyDocument
         fields = (
@@ -90,7 +97,7 @@ class MoneyDocumentSerializer(serializers.ModelSerializer):
             "created_at",
             "updated_at",
         )
-        read_only_fields = ("number", "status", "date", "created_at", "updated_at", "source_document")
+        read_only_fields = ("number", "status", "created_at", "updated_at", "source_document")
         ref_name = "WarehouseMoneyDocumentSerializer"
 
     def validate(self, attrs):

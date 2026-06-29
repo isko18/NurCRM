@@ -63,7 +63,10 @@ class WarehouseSalesSummaryViewSet(CompanyBranchRestrictedMixin, viewsets.ModelV
         qs = self._base_queryset()
         if self.action == "retrieve":
             qs = qs.prefetch_related(
-                Prefetch("documents", queryset=models.WarehouseSalesSummaryDocument.objects.all()),
+                Prefetch(
+                    "documents",
+                    queryset=models.WarehouseSalesSummaryDocument.objects.prefetch_related("items"),
+                ),
                 Prefetch("products", queryset=models.WarehouseSalesSummaryProduct.objects.all()),
             )
         if self.action == "list":
@@ -120,7 +123,7 @@ class WarehouseSalesSummaryViewSet(CompanyBranchRestrictedMixin, viewsets.ModelV
         summary = (
             self.get_queryset().model.objects
             .select_related("warehouse", "created_by")
-            .prefetch_related("agents", "documents", "products")
+            .prefetch_related("agents", "documents__items", "products")
             .get(pk=summary.pk)
         )
         serializer = SummaryDetailSerializer(summary, context=self.get_serializer_context())

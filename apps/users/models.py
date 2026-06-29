@@ -590,10 +590,40 @@ class User(AbstractBaseUser, PermissionsMixin):
         membership = self.branch_memberships.select_related("branch").filter(is_primary=True).first()
         return membership.branch if membership else None
 
+    def _close_open_cash_shifts(self, by_user=None):
+        """
+        Автозакрытие открытых кассовых смен сотрудника при его удалении.
+        Закрытие идентично штатному (итоги/время/статус), выполняется в той же
+        транзакции, что и soft_delete: ошибка закрытия откатывает удаление.
+        """
+        import logging
+
+        # Локальный импорт во избежание циклической зависимости (construction → users).
+        from apps.construction.models import CashShift
+
+        logger = logging.getLogger(__name__)
+
+        open_shifts = list(
+            CashShift.objects
+            .select_for_update()
+            .filter(cashier_id=self.pk, status=CashShift.Status.OPEN)
+        )
+        for shift in open_shifts:
+            # Закрываем «по ожидаемому остатку», чтобы расхождение по кассе было нулевым.
+            expected_cash = shift.calc_live_totals()["expected_cash"]
+            shift.close(closing_cash=expected_cash, close_reason="employee_deleted")
+            logger.info(
+                "Автозакрытие смены %s кассира %s (касса %s) при удалении сотрудника; инициатор=%s",
+                shift.pk, self.pk, shift.cashbox_id, getattr(by_user, "pk", None),
+            )
+
     @transaction.atomic
     def soft_delete(self, by_user=None):
         if self.deleted_at:
             return
+
+        # До деактивации закрываем открытые смены (в той же транзакции).
+        self._close_open_cash_shifts(by_user=by_user)
 
         old_email = self.email or ""
         stamp = uuid.uuid4().hex

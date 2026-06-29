@@ -1,5 +1,8 @@
 # apps/products/views_public.py
-from django.db.models import Q
+from decimal import Decimal
+
+from django.db.models import Q, F, Value, ExpressionWrapper, DecimalField
+from django.db.models.functions import Coalesce
 from rest_framework import generics
 from rest_framework.permissions import AllowAny
 from rest_framework.exceptions import NotFound
@@ -25,7 +28,9 @@ class PublicCompanyShowcaseAPIView(generics.ListAPIView):
     filter_backends = [DjangoFilterBackend, SearchFilter, OrderingFilter]
     filterset_fields = ["category", "brand", "is_weight", "stock"]
     search_fields = ["name", "barcode", "article", "code"]
-    ordering_fields = ["created_at", "price", "name"]
+    # final_price — цена с учётом скидки (как на витрине), доступна через аннотацию ниже.
+    # Неизвестные значения ordering DRF игнорирует → откат к ordering по умолчанию (без 400).
+    ordering_fields = ["created_at", "price", "name", "final_price", "discount_percent"]
     ordering = ["-created_at"]
 
     def get_company(self) -> Company:
@@ -38,11 +43,20 @@ class PublicCompanyShowcaseAPIView(generics.ListAPIView):
     def get_queryset(self):
         company = self.get_company()
 
+        # Аннотация final_price = price * (1 - discount_percent/100) на уровне БД,
+        # чтобы OrderingFilter сортировал по всей выборке (до пагинации), а не по странице.
+        final_price_expr = ExpressionWrapper(
+            Coalesce(F("price"), Value(Decimal("0")))
+            * (Value(Decimal("1")) - Coalesce(F("discount_percent"), Value(Decimal("0"))) / Value(Decimal("100"))),
+            output_field=DecimalField(max_digits=20, decimal_places=4),
+        )
+
         qs = (
             Product.objects
             .filter(company=company)  # ✅ без status фильтра
             .select_related("brand", "category")
             .prefetch_related("images", "packages", "characteristics")
+            .annotate(final_price=final_price_expr)
         )
 
         branch_id = self.request.query_params.get("branch")

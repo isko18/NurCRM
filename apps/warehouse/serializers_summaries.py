@@ -45,12 +45,25 @@ class SummaryWarehouseSerializer(serializers.Serializer):
     name = serializers.CharField(read_only=True)
 
 
+class SummaryDocumentItemSerializer(serializers.ModelSerializer):
+    """Позиция конкретной накладной (детализация для PDF)."""
+
+    class Meta:
+        model = models.WarehouseSalesSummaryDocumentItem
+        fields = (
+            "name", "unit", "quantity", "price",
+            "discount_percent", "discount_amount", "amount", "weight",
+        )
+
+
 class SummaryDocumentSerializer(serializers.ModelSerializer):
+    items = SummaryDocumentItemSerializer(many=True, read_only=True)
+
     class Meta:
         model = models.WarehouseSalesSummaryDocument
         fields = (
             "id", "number", "date", "agent", "client", "address",
-            "quantity", "weight", "amount",
+            "quantity", "weight", "amount", "items",
         )
 
 

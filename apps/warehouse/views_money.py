@@ -285,6 +285,14 @@ class MoneyDocumentDetailView(CompanyBranchRestrictedMixin, generics.RetrieveUpd
     def get_queryset(self):
         return filter_qs_company_branch_or_global(self, self.queryset.all())
 
+    def perform_destroy(self, instance):
+        # Удалять можно только черновики и отказанные; проведённый — сначала unpost/reject.
+        if instance.status == models.MoneyDocument.Status.POSTED:
+            raise ValidationError(
+                {"detail": "Нельзя удалить проведённый документ. Сначала отмените проведение или откажите."}
+            )
+        instance.delete()
+
     def update(self, request, *args, **kwargs):
         partial = kwargs.pop("partial", False)
         instance = self.get_object()
@@ -340,6 +348,26 @@ class MoneyDocumentUnpostView(CompanyBranchRestrictedMixin, generics.GenericAPIV
         doc = self.get_object()
         try:
             services_money.unpost_money_document(doc)
+        except Exception as e:
+            return Response({"detail": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+        return Response(self.get_serializer(doc).data)
+
+
+class MoneyDocumentRejectView(CompanyBranchRestrictedMixin, generics.GenericAPIView):
+    """POST {id}/reject/ — отказ проведённого документа (POSTED → REJECTED), откат кассы."""
+
+    serializer_class = serializers_money.MoneyDocumentSerializer
+
+    def get_queryset(self):
+        qs = models.MoneyDocument.objects.select_related(
+            "cash_register", "warehouse", "counterparty", "payment_category", "company", "branch"
+        )
+        return filter_qs_company_branch_or_global(self, qs)
+
+    def post(self, request, pk=None):
+        doc = self.get_object()
+        try:
+            services_money.reject_money_document(doc)
         except Exception as e:
             return Response({"detail": str(e)}, status=status.HTTP_400_BAD_REQUEST)
         return Response(self.get_serializer(doc).data)

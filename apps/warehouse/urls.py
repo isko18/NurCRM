@@ -47,6 +47,7 @@ from .views_documents import (
     ProductListCreateView, ProductDetailView as ProductDetailViewCRUD,
     WarehouseListCreateView, WarehouseDetailView as WarehouseDetailViewCRUD,
     CounterpartyListCreateView, CounterpartyDetailView,
+    CounterpartyBalanceSummaryView,
     DocumentSaleListCreateView, DocumentPurchaseListCreateView,
     DocumentSaleReturnListCreateView, DocumentPurchaseReturnListCreateView,
     DocumentInventoryListCreateView, DocumentReceiptListCreateView,
@@ -62,6 +63,7 @@ from .views_money import (
     MoneyDocumentDetailView,
     MoneyDocumentPostView,
     MoneyDocumentUnpostView,
+    MoneyDocumentRejectView,
     CounterpartyMoneyOperationsView,
 )
 from .views_reconciliation import (
@@ -248,12 +250,22 @@ urlpatterns += [
     path("money/documents/<uuid:pk>/", MoneyDocumentDetailView.as_view(), name="money-document-detail"),
     path("money/documents/<uuid:pk>/post/", MoneyDocumentPostView.as_view(), name="money-document-post"),
     path("money/documents/<uuid:pk>/unpost/", MoneyDocumentUnpostView.as_view(), name="money-document-unpost"),
+    path("money/documents/<uuid:pk>/reject/", MoneyDocumentRejectView.as_view(), name="money-document-reject"),
 
     # money operations by counterparty
     path(
         "money/counterparties/<uuid:counterparty_id>/operations/",
         CounterpartyMoneyOperationsView.as_view(),
         name="money-operations-by-counterparty",
+    ),
+]
+
+urlpatterns += [
+    # сводка по контрагентам за период (сальдо/оборот)
+    path(
+        "counterparties/balance-summary/",
+        CounterpartyBalanceSummaryView.as_view(),
+        name="counterparties-balance-summary",
     ),
 ]
 

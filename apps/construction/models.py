@@ -230,6 +230,11 @@ class CashShift(models.Model):
     status = models.CharField(max_length=10, choices=Status.choices, default=Status.OPEN, db_index=True, verbose_name="Статус")
     opened_at = models.DateTimeField(auto_now_add=True, verbose_name="Дата открытия")
     closed_at = models.DateTimeField(null=True, blank=True, verbose_name="Дата закрытия")
+    close_reason = models.CharField(
+        max_length=64, blank=True, default="",
+        verbose_name="Причина закрытия",
+        help_text="Пусто — обычное закрытие; например employee_deleted — автозакрытие при удалении кассира.",
+    )
 
     opening_cash = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal("0.00"), verbose_name="Начальная сумма")
     closing_cash = models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True, verbose_name="Конечная сумма")
@@ -390,12 +395,14 @@ class CashShift(models.Model):
         self.cash_sales_total = t["cash_sales_total"]
         self.noncash_sales_total = t["noncash_sales_total"]
 
-    def close(self, closing_cash: Decimal):
+    def close(self, closing_cash: Decimal, close_reason: str = ""):
         if self.status != self.Status.OPEN:
             raise ValidationError({"status": "Смена уже закрыта."})
 
         self.closing_cash = closing_cash
         self.closed_at = timezone.now()
+        if close_reason:
+            self.close_reason = close_reason
         self.recalc_totals_for_close()
 
         self.status = self.Status.CLOSED
@@ -403,6 +410,7 @@ class CashShift(models.Model):
             update_fields=[
                 "closing_cash",
                 "closed_at",
+                "close_reason",
                 "income_total",
                 "expense_total",
                 "sales_count",
