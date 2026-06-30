@@ -2,6 +2,34 @@
 
 Документация API модуля Building для фронтенда: ЖК, квартиры, договора, закупки, склад, касса, зарплата, задачи и процесс работ.
 
+---
+
+## Staging (тестовый стенд) — куда слать запросы
+
+| Назначение | URL |
+|------------|-----|
+| **API стройки** | `https://stroyapp.nurcrm.kg/api/building/` |
+| **Логин / профиль** | `https://stage.api.nurcrm.kg/api/users/...` |
+| **Фронт стройки** | https://stroy.nurcrm.kg |
+| **Swagger** | https://stroyapp.nurcrm.kg/swagger/ |
+
+```env
+# .env staging
+VITE_API_URL=https://stage.api.nurcrm.kg/api
+VITE_BUILDING_API_URL=https://stroyapp.nurcrm.kg/api/building
+```
+
+Логин:
+```http
+POST https://stage.api.nurcrm.kg/api/users/auth/login/
+```
+
+Все запросы к Building — с заголовком `Authorization: Bearer <access>`.
+
+Пути ниже указаны **относительно** `/api/building/` (полный URL = `https://stroyapp.nurcrm.kg` + путь).
+
+---
+
 **Связанные спецификации:**
 - `building_cash_register_backend_spec.md` — backend-спецификация кассы (заявки, CashFlow, файлы, подрядчики, поставщики)
 - `building_backend_salary_and_stock.md` — backend API: зарплата + склад (кратко)

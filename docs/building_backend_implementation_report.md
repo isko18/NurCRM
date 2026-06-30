@@ -240,3 +240,31 @@ API:
 - ✅ Пункт 6: barter items/files + `payment_mode` для договоров
 - ✅ Пункт 8: автосоздание/поднятие договора из файлов (двухшаговый вариант)
 
+## 10) Доведение backend до 100% (без 1С) — 2026-06
+
+### 10.1 Сервисный слой (`services.py`)
+- `default_currency()` — единая валюта через `BUILDING_DEFAULT_CURRENCY` (по умолчанию `KGS`)
+- `create_procurement_debt_entries` / `create_work_entry_debt_entries` — идемпотентность, barter/mixed split
+- `ensure_treaty_from_procurement_file` / `ensure_treaty_from_work_entry_files` — номер договора, company_id, логирование ошибок
+- `on_work_entry_completed` — АВР, долги, кассовая заявка только для cash/mixed
+- `decrement_stock_item` — `select_for_update` + проверка остатка
+- `cancel_cash_register_request`, `approve/reject_warehouse_request`, `set_reconciliation_act_status`, `void_payroll_payment`
+
+### 10.2 Новые API-эндпоинты
+- `POST /cash-register/requests/{id}/cancel/`
+- `POST /work-entries/warehouse-requests/{id}/approve|reject/`
+- `GET /work-entries/{id}/reconciliation-acts/`
+- `POST /reconciliation-acts/{id}/approve|reject/`
+- `POST /salary/payments/{id}/void/`
+- `GET|PATCH /debts/ledger/{id}/`
+- `GET /barter/{source_type}/{source_id}/items/`
+
+### 10.3 Валидация
+- Закупка/процесс работ: supplier/contractor обязателен при debt/barter/mixed
+- Фильтр `include_descendants` по группам договоров — 400 вместо silent fail
+
+### 10.4 Тесты
+- `apps/building/tests/test_building_services.py` — unit-тесты хелперов
+
+> Интеграция 1С (`apps/onec`) — вне scope, делается отдельно.
+

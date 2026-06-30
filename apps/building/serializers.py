@@ -961,6 +961,13 @@ class BuildingProcurementSerializer(serializers.ModelSerializer):
         full_name = f"{getattr(user, 'first_name', '')} {getattr(user, 'last_name', '')}".strip()
         return full_name or getattr(user, "email", None) or str(getattr(user, "id", ""))
 
+    def validate(self, attrs):
+        payment_mode = attrs.get("payment_mode") or getattr(self.instance, "payment_mode", None)
+        supplier = attrs.get("supplier") if "supplier" in attrs else getattr(self.instance, "supplier", None)
+        if payment_mode in ("debt", "barter", "mixed") and not supplier:
+            raise serializers.ValidationError({"supplier": "Для режима оплаты в долг/бартер/смешанный укажите поставщика."})
+        return attrs
+
 
 class BuildingWorkflowEventSerializer(serializers.ModelSerializer):
     actor_display = serializers.SerializerMethodField()
@@ -1538,6 +1545,17 @@ class BuildingDebtLedgerEntryCreateSerializer(serializers.ModelSerializer):
             "comment",
             "occurred_at",
         ]
+
+    def validate_currency(self, value):
+        from . import services
+
+        return (value or services.default_currency()).strip() or services.default_currency()
+
+
+class BuildingDebtLedgerEntryUpdateSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = BuildingDebtLedgerEntry
+        fields = ["status", "comment", "occurred_at"]
 
 
 class BuildingDebtLedgerFileCreateSerializer(serializers.Serializer):
@@ -2131,6 +2149,18 @@ class BuildingPayrollPaymentApproveSerializer(serializers.Serializer):
     paid_at = serializers.DateTimeField(required=False, allow_null=True)
 
 
+class BuildingPayrollPaymentVoidSerializer(serializers.Serializer):
+    reason = serializers.CharField(required=True, allow_blank=False)
+
+
+class BuildingWarehouseRequestRejectSerializer(serializers.Serializer):
+    reason = serializers.CharField(required=True, allow_blank=False)
+
+
+class BuildingReconciliationActRejectSerializer(serializers.Serializer):
+    reason = serializers.CharField(required=True, allow_blank=False)
+
+
 class BuildingPayrollMyLineSerializer(serializers.ModelSerializer):
     payroll_title = serializers.CharField(source="payroll.title", read_only=True)
     payroll_period_start = serializers.DateField(source="payroll.period_start", read_only=True)
@@ -2241,6 +2271,18 @@ class BuildingWorkEntrySerializer(serializers.ModelSerializer):
             return None
         full_name = f"{getattr(user, 'first_name', '')} {getattr(user, 'last_name', '')}".strip()
         return full_name or getattr(user, "email", None) or str(getattr(user, "id", ""))
+
+    def validate(self, attrs):
+        payment_mode = attrs.get("payment_mode") or getattr(self.instance, "payment_mode", None)
+        contractor = attrs.get("contractor") if "contractor" in attrs else getattr(self.instance, "contractor", None)
+        contract_amount = attrs.get("contract_amount") if "contract_amount" in attrs else getattr(self.instance, "contract_amount", None)
+        work_status = attrs.get("work_status") or getattr(self.instance, "work_status", None)
+        if payment_mode in ("debt", "barter", "mixed"):
+            if not contractor:
+                raise serializers.ValidationError({"contractor": "Для режима оплаты в долг/бартер/смешанный укажите подрядчика."})
+            if work_status == BuildingWorkEntry.WorkStatus.COMPLETED and not contract_amount:
+                raise serializers.ValidationError({"contract_amount": "Укажите сумму договора перед завершением работ."})
+        return attrs
 
 
 class BuildingWorkEntryPhotoCreateSerializer(serializers.Serializer):

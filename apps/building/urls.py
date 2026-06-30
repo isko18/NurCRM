@@ -112,6 +112,14 @@ from .views import (
     BuildingBarterItemsUpsertView,
     BuildingBarterItemDetailView,
     BuildingBarterFileAddView,
+    CashRegisterRequestCancelView,
+    BuildingWarehouseRequestApproveView,
+    BuildingWarehouseRequestRejectView,
+    BuildingWorkEntryReconciliationActListView,
+    BuildingReconciliationActApproveView,
+    BuildingReconciliationActRejectView,
+    BuildingPayrollPaymentVoidView,
+    BuildingDebtsLedgerDetailView,
 )
 
 app_name = "building"
@@ -129,6 +137,7 @@ urlpatterns = [
     path("cash-register/requests/<uuid:pk>/", CashRegisterRequestDetailView.as_view(), name="cash-register-request-detail"),
     path("cash-register/requests/<uuid:pk>/approve/", CashRegisterRequestApproveView.as_view(), name="cash-register-request-approve"),
     path("cash-register/requests/<uuid:pk>/reject/", CashRegisterRequestRejectView.as_view(), name="cash-register-request-reject"),
+    path("cash-register/requests/<uuid:pk>/cancel/", CashRegisterRequestCancelView.as_view(), name="cash-register-request-cancel"),
     path("cash-register/requests/<uuid:pk>/files/", CashRegisterRequestFileAddView.as_view(), name="cash-register-request-files"),
     path("cash-register/cashflows/<uuid:pk>/files/", CashFlowFileAddView.as_view(), name="cash-register-cashflow-files"),
 
@@ -183,7 +192,12 @@ urlpatterns = [
     path("work-entries/<uuid:pk>/warehouse-requests/", BuildingWorkEntryWarehouseRequestCreateView.as_view(), name="building-work-entry-warehouse-request"),
     path("work-entries/warehouse-requests/", BuildingWarehouseRequestListView.as_view(), name="building-warehouse-request-list"),
     path("work-entries/warehouse-requests/<uuid:pk>/", BuildingWarehouseRequestDetailView.as_view(), name="building-warehouse-request-detail"),
+    path("work-entries/warehouse-requests/<uuid:pk>/approve/", BuildingWarehouseRequestApproveView.as_view(), name="building-warehouse-request-approve"),
+    path("work-entries/warehouse-requests/<uuid:pk>/reject/", BuildingWarehouseRequestRejectView.as_view(), name="building-warehouse-request-reject"),
     path("work-entries/<uuid:pk>/reconciliation-act/", BuildingWorkEntryReconciliationActCreateView.as_view(), name="building-work-entry-reconciliation-act"),
+    path("work-entries/<uuid:pk>/reconciliation-acts/", BuildingWorkEntryReconciliationActListView.as_view(), name="building-work-entry-reconciliation-acts"),
+    path("reconciliation-acts/<uuid:pk>/approve/", BuildingReconciliationActApproveView.as_view(), name="building-reconciliation-act-approve"),
+    path("reconciliation-acts/<uuid:pk>/reject/", BuildingReconciliationActRejectView.as_view(), name="building-reconciliation-act-reject"),
 
     path("warehouse-movements/write-off/", BuildingWarehouseMovementWriteOffView.as_view(), name="building-warehouse-movement-write-off"),
     path("warehouse-movements/transfer-to-contractor/", BuildingWarehouseMovementTransferToContractorView.as_view(), name="building-warehouse-movement-transfer-contractor"),
@@ -229,6 +243,7 @@ urlpatterns = [
 
     # debts ledger
     path("debts/ledger/", BuildingDebtsLedgerListCreateView.as_view(), name="building-debts-ledger"),
+    path("debts/ledger/<uuid:pk>/", BuildingDebtsLedgerDetailView.as_view(), name="building-debts-ledger-detail"),
     path("debts/ledger/<uuid:pk>/files/", BuildingDebtsLedgerFileAddView.as_view(), name="building-debts-ledger-files"),
     path("debts/summary/", BuildingDebtsSummaryView.as_view(), name="building-debts-summary"),
     path(
@@ -270,6 +285,7 @@ urlpatterns = [
     path("salary/payroll-adjustments/<uuid:pk>/", BuildingPayrollAdjustmentDetailView.as_view(), name="building-salary-payroll-adjustment-detail"),
     path("salary/payroll-lines/<uuid:pk>/payments/", BuildingPayrollPaymentListCreateView.as_view(), name="building-salary-payroll-payments"),
     path("salary/payments/<uuid:pk>/approve/", BuildingPayrollPaymentApproveView.as_view(), name="building-salary-payment-approve"),
+    path("salary/payments/<uuid:pk>/void/", BuildingPayrollPaymentVoidView.as_view(), name="building-salary-payment-void"),
     path("salary/my/lines/", BuildingPayrollMyLinesView.as_view(), name="building-salary-my-lines"),
     path("salary/advance-requests/", AdvanceRequestListView.as_view(), name="building-salary-advance-requests"),
     path("salary/advance-requests/<uuid:pk>/approve/", AdvanceRequestApproveView.as_view(), name="building-salary-advance-request-approve"),

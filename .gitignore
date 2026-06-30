@@ -16,6 +16,7 @@ media
 **/migrations/*.py
 !**/migrations/__init__.py
 !apps/ekassa/migrations/0001_initial.py
+!apps/building/migrations/*.py
 **/migrations/*.pyc
 
 

@@ -101,6 +101,7 @@ from .serializers import (
     BuildingTreatyMoveSerializer,
     BuildingDebtLedgerEntrySerializer,
     BuildingDebtLedgerEntryCreateSerializer,
+    BuildingDebtLedgerEntryUpdateSerializer,
     BuildingDebtLedgerFileCreateSerializer,
     BuildingBarterItemSerializer,
     BuildingBarterItemUpsertSerializer,
@@ -154,6 +155,9 @@ from .serializers import (
     BuildingWarehouseMovementWriteOffSerializer,
     BuildingWarehouseMovementTransferSerializer,
     BuildingPayrollPaymentApproveSerializer,
+    BuildingPayrollPaymentVoidSerializer,
+    BuildingWarehouseRequestRejectSerializer,
+    BuildingReconciliationActRejectSerializer,
 )
 from . import services
 
@@ -743,45 +747,14 @@ class BuildingProcurementFileAddView(CompanyQuerysetMixin, generics.GenericAPIVi
             created_by=user,
         )
         # Автосоздание договора из файлов (двухшаговый сценарий)
-        try:
-            if getattr(procurement, "treaty_auto_create", False) and not procurement.treaty_id:
-                t_type = (getattr(procurement, "treaty_type", "") or "").strip() or BuildingTreaty.TreatyType.PROCUREMENT
-                t_title = (getattr(procurement, "treaty_title", "") or "").strip() or (procurement.title or "Договор закупки")
-                treaty = BuildingTreaty.objects.create(
-                    residential_complex=procurement.residential_complex,
-                    client=None,
-                    title=t_title,
-                    description="",
-                    amount=Decimal(procurement.total_amount or 0).quantize(Decimal("0.01")),
-                    treaty_type=t_type,
-                    operation_type=BuildingTreaty.OperationType.OTHER,
-                    payment_type=BuildingTreaty.PaymentType.FULL,
-                    payment_mode=BuildingTreaty.PaymentMode.CASH,
-                    created_by=user,
-                )
-                BuildingTreatyFile.objects.create(
-                    treaty=treaty,
-                    file=pf.file,
-                    title=pf.title or "",
-                    created_by=user,
-                )
-                procurement.treaty = treaty
-                procurement.save(update_fields=["treaty", "updated_at"])
-            elif procurement.treaty_id:
-                # Если договор уже выбран/создан — поднимаем файл в договор (для аудита)
-                BuildingTreatyFile.objects.create(
-                    treaty=procurement.treaty,
-                    file=pf.file,
-                    title=pf.title or "",
-                    created_by=user,
-                )
-        except Exception:
-            pass
+        treaty_meta = services.ensure_treaty_from_procurement_file(procurement, pf, user)
         procurement.refresh_from_db()
-        return Response(
-            BuildingProcurementSerializer(procurement, context={"request": request}).data,
-            status=status.HTTP_201_CREATED,
-        )
+        data = BuildingProcurementSerializer(procurement, context={"request": request}).data
+        if treaty_meta.get("treaty_error"):
+            data["treaty_warning"] = treaty_meta["treaty_error"]
+        if treaty_meta.get("treaty_created"):
+            data["treaty_created"] = True
+        return Response(data, status=status.HTTP_201_CREATED)
 
 
 class BuildingProcurementItemListCreateView(CompanyQuerysetMixin, generics.ListCreateAPIView):
@@ -1369,7 +1342,7 @@ class BuildingSupplierBarterSettlementConfirmView(CompanyQuerysetMixin, generics
                 counterparty_id=counterparty_id,
                 entry_type=BuildingDebtLedgerEntry.EntryType.BARTER,
                 amount=Decimal(str(settlement.amount_total)).quantize(Decimal("0.01")),
-                currency=(settlement.currency or "KGS")[:8],
+                currency=(settlement.currency or services.default_currency())[:8],
                 status=BuildingDebtLedgerEntry.Status.APPROVED,
                 residential_complex=settlement.residential_complex,
                 source_type="barter_settlement",
@@ -1721,61 +1694,7 @@ class BuildingWorkEntryDetailView(CompanyQuerysetMixin, generics.RetrieveUpdateD
         old_status = obj.work_status
         serializer.save()
 
-        new_status = serializer.instance.work_status
-        if (
-            old_status != BuildingWorkEntry.WorkStatus.COMPLETED
-            and new_status == BuildingWorkEntry.WorkStatus.COMPLETED
-            and serializer.instance.contractor_id
-            and serializer.instance.contract_amount
-        ):
-            # Автоматически создаём черновик АВР
-            try:
-                BuildingWorkEntryAcceptance.objects.get_or_create(work_entry=serializer.instance)
-            except Exception:
-                pass
-
-            # Процесс работ "в долг": создаём запись долга (мы должны подрядчику)
-            try:
-                if getattr(serializer.instance, "payment_mode", None) in ("debt", "mixed", "barter"):
-                    BuildingDebtLedgerEntry.objects.create(
-                        company_id=rc.company_id,
-                        direction=BuildingDebtLedgerEntry.Direction.PAYABLE,
-                        counterparty_type=BuildingDebtLedgerEntry.CounterpartyType.CONTRACTOR,
-                        counterparty_id=serializer.instance.contractor_id,
-                        entry_type=BuildingDebtLedgerEntry.EntryType.CHARGE,
-                        amount=serializer.instance.contract_amount,
-                        currency="KGS",
-                        status=BuildingDebtLedgerEntry.Status.APPROVED,
-                        residential_complex=rc,
-                        source_type="work_entry",
-                        source_id=serializer.instance.id,
-                        comment=f"Работы в долг: {serializer.instance.title or serializer.instance.id}",
-                        occurred_at=timezone.now(),
-                        created_by=user,
-                    )
-            except Exception:
-                pass
-
-            if getattr(serializer.instance, "payment_mode", None) != "barter" and not BuildingCashRegisterRequest.objects.filter(
-                work_entry=serializer.instance,
-                request_type=BuildingCashRegisterRequest.RequestType.CONTRACTOR_PAYMENT,
-            ).exists():
-                cashbox = rc.salary_cashbox or BuildingCashbox.objects.filter(
-                    company_id=rc.company_id
-                ).first()
-                if cashbox:
-                    BuildingCashRegisterRequest.objects.create(
-                        company_id=rc.company_id,
-                        work_entry=serializer.instance,
-                        request_type=BuildingCashRegisterRequest.RequestType.CONTRACTOR_PAYMENT,
-                        status=BuildingCashRegisterRequest.Status.PENDING,
-                        amount=serializer.instance.contract_amount,
-                        comment=f"Оплата подрядчику по процессу работ: {serializer.instance.title or serializer.instance.id}",
-                        cashbox=cashbox,
-                        contractor=serializer.instance.contractor,
-                        residential_complex=rc,
-                        created_by=user,
-                    )
+        services.on_work_entry_completed(serializer.instance, user, old_status)
 
     def perform_destroy(self, instance):
         user = self.request.user
@@ -1866,34 +1785,14 @@ class BuildingWorkEntryFileAddView(CompanyQuerysetMixin, generics.GenericAPIView
         for f in uploaded:
             created_files.append(BuildingWorkEntryFile.objects.create(entry=entry, file=f, title="", created_by=user))
 
-        # Автосоздание/поднятие договора из файлов
-        try:
-            if getattr(entry, "treaty_auto_create", False) and not entry.treaty_id:
-                t_type = (getattr(entry, "treaty_type", "") or "").strip() or BuildingTreaty.TreatyType.CONSTRUCTION_DEPARTMENT
-                t_title = (getattr(entry, "treaty_title", "") or "").strip() or (entry.title or "Договор по работам")
-                treaty = BuildingTreaty.objects.create(
-                    residential_complex=entry.residential_complex,
-                    client=entry.client,
-                    title=t_title,
-                    description="",
-                    amount=Decimal(entry.contract_amount or 0).quantize(Decimal("0.01")) if entry.contract_amount else Decimal("0.00"),
-                    treaty_type=t_type,
-                    operation_type=BuildingTreaty.OperationType.OTHER,
-                    payment_type=BuildingTreaty.PaymentType.FULL,
-                    payment_mode=BuildingTreaty.PaymentMode.CASH,
-                    created_by=user,
-                )
-                for wf in created_files:
-                    BuildingTreatyFile.objects.create(treaty=treaty, file=wf.file, title=wf.title or "", created_by=user)
-                entry.treaty = treaty
-                entry.save(update_fields=["treaty", "updated_at"])
-            elif entry.treaty_id:
-                for wf in created_files:
-                    BuildingTreatyFile.objects.create(treaty=entry.treaty, file=wf.file, title=wf.title or "", created_by=user)
-        except Exception:
-            pass
+        treaty_meta = services.ensure_treaty_from_work_entry_files(entry, created_files, user)
         entry.refresh_from_db()
-        return Response(BuildingWorkEntrySerializer(entry, context={"request": request}).data, status=status.HTTP_201_CREATED)
+        data = BuildingWorkEntrySerializer(entry, context={"request": request}).data
+        if treaty_meta.get("treaty_error"):
+            data["treaty_warning"] = treaty_meta["treaty_error"]
+        if treaty_meta.get("treaty_created"):
+            data["treaty_created"] = True
+        return Response(data, status=status.HTTP_201_CREATED)
 
 
 class BuildingWorkEntryWarehouseRequestCreateView(CompanyQuerysetMixin, generics.GenericAPIView):
@@ -2112,19 +2011,17 @@ class BuildingWarehouseMovementWriteOffView(CompanyQuerysetMixin, generics.Gener
                 created_by=request.user,
             )
             for item in ser.validated_data["items"]:
-                stock_item = BuildingWarehouseStockItem.objects.get(id=item["stock_item"])
-                if stock_item.warehouse_id != warehouse.id:
-                    raise ValidationError({"items": f"Позиция {stock_item.name} не принадлежит выбранному складу."})
+                stock_item = services.decrement_stock_item(
+                    stock_item_id=item["stock_item"],
+                    warehouse_id=warehouse.id,
+                    qty=Decimal(item["quantity"]),
+                )
                 qty = Decimal(item["quantity"])
-                if qty <= 0:
-                    raise ValidationError({"items": "Количество должно быть положительным."})
                 BuildingWarehouseMovementItem.objects.create(
                     movement=movement,
                     stock_item=stock_item,
                     quantity=qty,
                 )
-                stock_item.quantity -= qty
-                stock_item.save(update_fields=["quantity", "updated_at"])
                 BuildingWarehouseStockMove.objects.create(
                     warehouse=warehouse,
                     stock_item=stock_item,
@@ -2134,6 +2031,12 @@ class BuildingWarehouseMovementWriteOffView(CompanyQuerysetMixin, generics.Gener
                     price=stock_item.last_price,
                     created_by=request.user,
                 )
+            services.log_event(
+                action="warehouse_write_off",
+                actor=request.user,
+                warehouse=warehouse,
+                payload={"movement_id": str(movement.id)},
+            )
         movement.refresh_from_db()
         return Response(
             BuildingWarehouseMovementSerializer(movement, context={"request": request}).data,
@@ -2186,15 +2089,13 @@ class BuildingWarehouseMovementTransferToContractorView(CompanyQuerysetMixin, ge
                 created_by=request.user,
             )
             for item in ser.validated_data["items"]:
-                stock_item = BuildingWarehouseStockItem.objects.get(id=item["stock_item"])
-                if stock_item.warehouse_id != warehouse.id:
-                    raise ValidationError({"items": f"Позиция {stock_item.name} не принадлежит выбранному складу."})
+                stock_item = services.decrement_stock_item(
+                    stock_item_id=item["stock_item"],
+                    warehouse_id=warehouse.id,
+                    qty=Decimal(item["quantity"]),
+                )
                 qty = Decimal(item["quantity"])
-                if qty <= 0:
-                    raise ValidationError({"items": "Количество должно быть положительным."})
                 BuildingWarehouseMovementItem.objects.create(movement=movement, stock_item=stock_item, quantity=qty)
-                stock_item.quantity -= qty
-                stock_item.save(update_fields=["quantity", "updated_at"])
                 BuildingWarehouseStockMove.objects.create(
                     warehouse=warehouse,
                     stock_item=stock_item,
@@ -2205,6 +2106,12 @@ class BuildingWarehouseMovementTransferToContractorView(CompanyQuerysetMixin, ge
                     price=stock_item.last_price,
                     created_by=request.user,
                 )
+            services.log_event(
+                action="warehouse_transfer_to_contractor",
+                actor=request.user,
+                warehouse=warehouse,
+                payload={"movement_id": str(movement.id), "contractor_id": str(contractor.id)},
+            )
         movement.refresh_from_db()
         return Response(
             BuildingWarehouseMovementSerializer(movement, context={"request": request}).data,
@@ -2334,9 +2241,12 @@ class BuildingWarehouseMovementTransferToWorkEntryView(CompanyQuerysetMixin, gen
                             {"items": f"Нельзя выдать больше остатка по заявке для {stock_item.name} (осталось {remaining})."}
                         )
 
+                stock_item = services.decrement_stock_item(
+                    stock_item_id=item["stock_item"],
+                    warehouse_id=warehouse.id,
+                    qty=qty,
+                )
                 BuildingWarehouseMovementItem.objects.create(movement=movement, stock_item=stock_item, quantity=qty)
-                stock_item.quantity -= qty
-                stock_item.save(update_fields=["quantity", "updated_at"])
                 BuildingWarehouseStockMove.objects.create(
                     warehouse=warehouse,
                     stock_item=stock_item,
@@ -2374,6 +2284,12 @@ class BuildingWarehouseMovementTransferToWorkEntryView(CompanyQuerysetMixin, gen
                     warehouse_request.status = BuildingWarehouseRequest.Status.PARTIALLY_APPROVED
                 warehouse_request.decided_by = request.user
                 warehouse_request.save(update_fields=["status", "decided_by", "updated_at"])
+            services.log_event(
+                action="warehouse_transfer_to_work_entry",
+                actor=request.user,
+                warehouse=warehouse,
+                payload={"movement_id": str(movement.id), "work_entry_id": str(work_entry.id)},
+            )
         movement.refresh_from_db()
         return Response(
             BuildingWarehouseMovementSerializer(movement, context={"request": request}).data,
@@ -2547,13 +2463,11 @@ class BuildingTreatyListCreateView(CompanyQuerysetMixin, generics.ListCreateAPIV
             group_id = self.request.query_params.get("group")
             include_desc = (self.request.query_params.get("include_descendants") or "").lower() in ("1", "true", "yes")
             if group_id and include_desc:
-                try:
-                    grp = BuildingTreatyGroup.objects.filter(id=group_id, company_id=user.company_id).first()
-                    if grp:
-                        ids = list(grp.get_descendants(include_self=True).values_list("id", flat=True))
-                        qs = qs.filter(group_id__in=ids)
-                except Exception:
-                    pass
+                grp = BuildingTreatyGroup.objects.filter(id=group_id, company_id=user.company_id).first()
+                if not grp:
+                    raise ValidationError({"group": "Группа договоров не найдена."})
+                ids = list(grp.get_descendants(include_self=True).values_list("id", flat=True))
+                qs = qs.filter(group_id__in=ids)
             return qs
         if not getattr(user, "is_staff", False) and not getattr(user, "is_superuser", False):
             return qs.none()
@@ -4681,6 +4595,11 @@ class BuildingDebtsLedgerListCreateView(CompanyQuerysetMixin, generics.ListCreat
         if not company_id and not getattr(user, "is_superuser", False):
             raise PermissionDenied("У пользователя не указана компания.")
         serializer.save(company_id=company_id, created_by=user)
+        services.log_event(
+            action="debt_ledger_created",
+            actor=user,
+            payload={"entry_id": str(serializer.instance.id)},
+        )
 
 
 class BuildingDebtsLedgerFileAddView(CompanyQuerysetMixin, generics.GenericAPIView):
@@ -4789,6 +4708,14 @@ class BuildingDebtsCounterpartySummaryView(CompanyQuerysetMixin, generics.Generi
 class BuildingBarterItemsUpsertView(CompanyQuerysetMixin, generics.GenericAPIView):
     permission_classes = [permissions.IsAuthenticated]
 
+    def get(self, request, source_type: str, source_id: str):
+        user = request.user
+        company_id = getattr(user, "company_id", None)
+        if not company_id and not getattr(user, "is_superuser", False):
+            raise PermissionDenied("У пользователя не указана компания.")
+        items = BuildingBarterItem.objects.filter(company_id=company_id, source_type=source_type, source_id=source_id)
+        return Response(BuildingBarterItemSerializer(items, many=True, context={"request": request}).data)
+
     @transaction.atomic
     def post(self, request, source_type: str, source_id: str):
         user = request.user
@@ -4814,7 +4741,7 @@ class BuildingBarterItemsUpsertView(CompanyQuerysetMixin, generics.GenericAPIVie
                     unit=(v.get("unit") or "").strip() or None,
                     unit_price=v.get("unit_price"),
                     total_price=v["total_price"],
-                    currency=(v.get("currency") or "KGS").strip() or "KGS",
+                    currency=(v.get("currency") or services.default_currency()).strip() or services.default_currency(),
                     comment=(v.get("comment") or "").strip(),
                 )
             )
@@ -4866,4 +4793,132 @@ class BuildingBarterFileAddView(CompanyQuerysetMixin, generics.GenericAPIView):
             created_by=user,
         )
         return Response(BuildingBarterFileSerializer(obj, context={"request": request}).data, status=status.HTTP_201_CREATED)
+
+
+class CashRegisterRequestCancelView(CompanyQuerysetMixin, generics.GenericAPIView):
+    permission_classes = [permissions.IsAuthenticated]
+    serializer_class = BuildingCashRegisterRequestRejectSerializer
+    queryset = BuildingCashRegisterRequest.objects.all()
+
+    def post(self, request, pk=None):
+        _require_cash_register_perm(request.user)
+        req = self.get_object()
+        ser = self.get_serializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+        req = services.cancel_cash_register_request(req, request.user, ser.validated_data.get("reason", ""))
+        return Response(BuildingCashRegisterRequestSerializer(req, context={"request": request}).data)
+
+
+class BuildingWarehouseRequestApproveView(CompanyQuerysetMixin, generics.GenericAPIView):
+    permission_classes = [permissions.IsAuthenticated]
+    queryset = BuildingWarehouseRequest.objects.select_related("work_entry__residential_complex")
+
+    def post(self, request, pk=None):
+        req = self.get_object()
+        approved_items = request.data.get("items")
+        req = services.approve_warehouse_request(req, request.user, approved_items)
+        return Response(BuildingWarehouseRequestSerializer(req, context={"request": request}).data)
+
+
+class BuildingWarehouseRequestRejectView(CompanyQuerysetMixin, generics.GenericAPIView):
+    permission_classes = [permissions.IsAuthenticated]
+    serializer_class = BuildingWarehouseRequestRejectSerializer
+    queryset = BuildingWarehouseRequest.objects.select_related("work_entry__residential_complex")
+
+    def post(self, request, pk=None):
+        req = self.get_object()
+        ser = self.get_serializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+        req = services.reject_warehouse_request(req, request.user, ser.validated_data["reason"])
+        return Response(BuildingWarehouseRequestSerializer(req, context={"request": request}).data)
+
+
+class BuildingWorkEntryReconciliationActListView(CompanyQuerysetMixin, generics.ListAPIView):
+    permission_classes = [permissions.IsAuthenticated]
+    serializer_class = BuildingReconciliationActSerializer
+    queryset = BuildingReconciliationAct.objects.select_related("work_entry")
+
+    def get_queryset(self):
+        work_entry_id = self.kwargs.get("pk")
+        return super().get_queryset().filter(work_entry_id=work_entry_id)
+
+
+class BuildingReconciliationActApproveView(CompanyQuerysetMixin, generics.GenericAPIView):
+    permission_classes = [permissions.IsAuthenticated]
+    queryset = BuildingReconciliationAct.objects.select_related("work_entry__residential_complex")
+
+    def post(self, request, pk=None):
+        act = self.get_object()
+        act = services.set_reconciliation_act_status(act, request.user, BuildingReconciliationAct.Status.APPROVED)
+        return Response(BuildingReconciliationActSerializer(act, context={"request": request}).data)
+
+
+class BuildingReconciliationActRejectView(CompanyQuerysetMixin, generics.GenericAPIView):
+    permission_classes = [permissions.IsAuthenticated]
+    serializer_class = BuildingReconciliationActRejectSerializer
+    queryset = BuildingReconciliationAct.objects.select_related("work_entry__residential_complex")
+
+    def post(self, request, pk=None):
+        act = self.get_object()
+        ser = self.get_serializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+        act = services.set_reconciliation_act_status(
+            act, request.user, BuildingReconciliationAct.Status.REJECTED, ser.validated_data["reason"]
+        )
+        return Response(BuildingReconciliationActSerializer(act, context={"request": request}).data)
+
+
+class BuildingPayrollPaymentVoidView(CompanyQuerysetMixin, generics.GenericAPIView):
+    permission_classes = [permissions.IsAuthenticated]
+    serializer_class = BuildingPayrollPaymentVoidSerializer
+    queryset = BuildingPayrollPayment.objects.select_related("line", "line__payroll")
+
+    def post(self, request, pk=None):
+        _require_salary_perm(request.user)
+        _require_cash_register_perm(request.user)
+        payment = self.get_object()
+        ser = self.get_serializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+        payment = services.void_payroll_payment(payment, request.user, ser.validated_data["reason"])
+        return Response(BuildingPayrollPaymentSerializer(payment, context={"request": request}).data)
+
+
+class BuildingDebtsLedgerDetailView(CompanyQuerysetMixin, generics.RetrieveUpdateAPIView):
+    permission_classes = [permissions.IsAuthenticated]
+    queryset = BuildingDebtLedgerEntry.objects.all().prefetch_related("files")
+
+    def get_serializer_class(self):
+        if self.request.method in ("PUT", "PATCH"):
+            return BuildingDebtLedgerEntryUpdateSerializer
+        return BuildingDebtLedgerEntrySerializer
+
+    def get_queryset(self):
+        user = self.request.user
+        if not (_is_owner_like(user) or getattr(user, "can_view_building_procurement", False) or getattr(user, "can_view_building_work_process", False)):
+            raise PermissionDenied("Нет прав на долги (Building).")
+        qs = super().get_queryset()
+        if getattr(user, "is_superuser", False):
+            return qs
+        company_id = getattr(user, "company_id", None)
+        return qs.filter(company_id=company_id) if company_id else qs.none()
+
+    def perform_update(self, serializer):
+        user = self.request.user
+        obj = self.get_object()
+        new_status = serializer.validated_data.get("status")
+        if new_status and new_status != obj.status:
+            allowed = {
+                BuildingDebtLedgerEntry.Status.DRAFT: {BuildingDebtLedgerEntry.Status.APPROVED, BuildingDebtLedgerEntry.Status.CANCELLED},
+                BuildingDebtLedgerEntry.Status.APPROVED: {BuildingDebtLedgerEntry.Status.CANCELLED},
+            }
+            if new_status not in allowed.get(obj.status, set()):
+                raise ValidationError({"status": f"Нельзя перевести запись из {obj.status} в {new_status}."})
+            services.log_event(
+                action="debt_ledger_status_changed",
+                actor=user,
+                from_status=obj.status,
+                to_status=new_status,
+                payload={"entry_id": str(obj.id)},
+            )
+        serializer.save()
 
