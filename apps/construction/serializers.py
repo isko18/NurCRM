@@ -219,6 +219,9 @@ class CashShiftOpenSerializer(serializers.ModelSerializer):
             attrs["_existing_shift"] = existing
             return attrs
 
+        # Закрываем «зависшие» смены удалённых/деактивированных кассиров до проверки лимита.
+        CashShift.close_orphan_open_shifts(company=company)
+
         open_shifts_count = (
             CashShift.objects
             .filter(company=company, status=CashShift.Status.OPEN)

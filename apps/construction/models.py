@@ -1,4 +1,5 @@
 from decimal import Decimal
+import logging
 import uuid
 
 from django.conf import settings
@@ -394,6 +395,51 @@ class CashShift(models.Model):
         self.sales_total = t["sales_total"]
         self.cash_sales_total = t["cash_sales_total"]
         self.noncash_sales_total = t["noncash_sales_total"]
+
+    @classmethod
+    def close_open_shifts_for_cashier(cls, cashier, *, close_reason: str = "employee_deleted"):
+        """Закрыть все OPEN-смены конкретного кассира (при soft_delete сотрудника)."""
+        logger = logging.getLogger(__name__)
+        shifts = list(
+            cls.objects
+            .select_for_update()
+            .filter(cashier_id=getattr(cashier, "pk", cashier), status=cls.Status.OPEN)
+        )
+        for shift in shifts:
+            expected_cash = shift.calc_live_totals()["expected_cash"]
+            shift.close(closing_cash=expected_cash, close_reason=close_reason)
+            logger.info(
+                "Автозакрытие смены %s кассира %s (касса %s); причина=%s",
+                shift.pk, shift.cashier_id, shift.cashbox_id, close_reason,
+            )
+        return len(shifts)
+
+    @classmethod
+    def close_orphan_open_shifts(cls, *, company=None):
+        """
+        Закрыть OPEN-смены удалённых или деактивированных кассиров.
+        Нужно для «зависших» смен (удаление до появления автозакрытия и т.п.).
+        """
+        logger = logging.getLogger(__name__)
+        qs = (
+            cls.objects
+            .select_for_update()
+            .filter(status=cls.Status.OPEN)
+            .filter(Q(cashier__deleted_at__isnull=False) | Q(cashier__is_active=False))
+        )
+        if company is not None:
+            qs = qs.filter(company=company)
+
+        closed = 0
+        for shift in qs:
+            expected_cash = shift.calc_live_totals()["expected_cash"]
+            shift.close(closing_cash=expected_cash, close_reason="employee_deleted")
+            closed += 1
+            logger.info(
+                "Автозакрытие «осиротевшей» смены %s кассира %s (касса %s, компания %s)",
+                shift.pk, shift.cashier_id, shift.cashbox_id, shift.company_id,
+            )
+        return closed
 
     def close(self, closing_cash: Decimal, close_reason: str = ""):
         if self.status != self.Status.OPEN:

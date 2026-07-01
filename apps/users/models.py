@@ -596,26 +596,10 @@ class User(AbstractBaseUser, PermissionsMixin):
         Закрытие идентично штатному (итоги/время/статус), выполняется в той же
         транзакции, что и soft_delete: ошибка закрытия откатывает удаление.
         """
-        import logging
-
         # Локальный импорт во избежание циклической зависимости (construction → users).
         from apps.construction.models import CashShift
 
-        logger = logging.getLogger(__name__)
-
-        open_shifts = list(
-            CashShift.objects
-            .select_for_update()
-            .filter(cashier_id=self.pk, status=CashShift.Status.OPEN)
-        )
-        for shift in open_shifts:
-            # Закрываем «по ожидаемому остатку», чтобы расхождение по кассе было нулевым.
-            expected_cash = shift.calc_live_totals()["expected_cash"]
-            shift.close(closing_cash=expected_cash, close_reason="employee_deleted")
-            logger.info(
-                "Автозакрытие смены %s кассира %s (касса %s) при удалении сотрудника; инициатор=%s",
-                shift.pk, self.pk, shift.cashbox_id, getattr(by_user, "pk", None),
-            )
+        CashShift.close_open_shifts_for_cashier(self, close_reason="employee_deleted")
 
     @transaction.atomic
     def soft_delete(self, by_user=None):
