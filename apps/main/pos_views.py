@@ -48,6 +48,7 @@ from apps.main.models import (
     CartItemDeletionLog,
     Sale,
     SaleItem,
+    SalePayment,
     Product,
     ProductPackage,
     ProductPromotionTier,
@@ -2652,6 +2653,53 @@ def _record_agent_sale_return(*, sale: Sale, breakdown: List[tuple], unit_net: D
         )
 
 
+def _rescale_sale_payments_after_partial_return(sale: Sale, old_total: Decimal, new_total: Decimal) -> None:
+    """
+    После частичного возврата приводим строки оплаты (SalePayment) в соответствие
+    с новой суммой чека.
+
+    Зачем: «живой» expected_cash смены считается по сумме SalePayment.amount
+    оплаченных продаж (см. CashShift.calc_live_totals). Если строки оплаты не
+    уменьшать, наличная касса смены после возврата остаётся завышенной.
+
+    Поведение:
+    - наличная строка уменьшается пропорционально → expected_cash смены падает;
+    - безналичная строка тоже уменьшается, но на наличную кассу не влияет;
+    - инвариант: sum(SalePayment.amount) == sale.total.
+    Долговые чеки строк оплаты не имеют — тогда функция ничего не делает.
+    """
+    if not old_total or old_total <= 0 or new_total < 0:
+        return
+
+    payments = list(sale.payments.order_by("created_at", "id"))
+    if not payments:
+        # legacy-чек без строк оплаты: наличные считаются по sale.total, он уже пересчитан.
+        return
+
+    scale = Decimal(new_total) / Decimal(old_total)
+    residual = money(new_total)
+    survivors: List[SalePayment] = []
+    for p in payments:
+        scaled = money(Decimal(str(p.amount or 0)) * scale)
+        if scaled <= 0:
+            p.delete()
+            continue
+        p.amount = scaled
+        survivors.append(p)
+        residual = money(residual - scaled)
+
+    # Копеечную погрешность округления вешаем на самую крупную строку,
+    # чтобы сумма оплат точно совпала с новой суммой чека.
+    if survivors and residual != 0:
+        biggest = max(survivors, key=lambda x: x.amount)
+        adjusted = money(biggest.amount + residual)
+        if adjusted > 0:
+            biggest.amount = adjusted
+
+    for p in survivors:
+        p.save(update_fields=["amount"])
+
+
 def _recalc_sale_headers_from_items(sale: Sale) -> None:
     """Пересчитать суммы шапки чека по оставшимся строкам."""
     rows = list(SaleItem.objects.filter(sale=sale).order_by("id"))
@@ -2681,6 +2729,10 @@ def _recalc_sale_headers_from_items(sale: Sale) -> None:
         cr = sale.cash_received or d0
         sale.cash_received = money(cr * (new_total / old_total))
     sale.save(update_fields=["subtotal", "discount_total", "tax_total", "total", "cash_received"])
+
+    # Синхронизируем строки оплаты с новой суммой чека, чтобы «живой» расчёт смены
+    # (expected_cash) уменьшался симметрично частичному возврату.
+    _rescale_sale_payments_after_partial_return(sale, old_total, new_total)
 
 
 def _parse_is_defect(data) -> bool:
