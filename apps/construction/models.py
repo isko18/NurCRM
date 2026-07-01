@@ -231,7 +231,7 @@ class CashShift(models.Model):
     opened_at = models.DateTimeField(auto_now_add=True, verbose_name="Дата открытия")
     closed_at = models.DateTimeField(null=True, blank=True, verbose_name="Дата закрытия")
     close_reason = models.CharField(
-        max_length=64, blank=True, default="",
+        max_length=64, blank=True, null=True, default="",
         verbose_name="Причина закрытия",
         help_text="Пусто — обычное закрытие; например employee_deleted — автозакрытие при удалении кассира.",
     )
