@@ -331,6 +331,12 @@ CELERY_BEAT_SCHEDULE = {
         'task': 'apps.main.tasks.catalog_webhook_sync',
         'schedule': crontab(hour=3, minute=0, day_of_month='*/2'),
     },
+    # Автозакрытие кассовых смен, открытых дольше суток (+ подстраховка по удалённым кассирам).
+    # Запускается ежечасно (требует запущенного celery beat).
+    'construction-auto-close-stale-shifts': {
+        'task': 'apps.construction.tasks.auto_close_stale_shifts',
+        'schedule': crontab(minute=0),
+    },
 }
 
 # ===========================
