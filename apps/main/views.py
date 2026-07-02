@@ -2296,12 +2296,23 @@ class OrderAnalyticsView(APIView, CompanyBranchRestrictedMixin):
 # ===========================
 #  Clients
 # ===========================
+def _is_agent(user) -> bool:
+    """
+    Пользователь-агент — единственная роль, которая видит только "своих" клиентов
+    (по полю salesperson). Все остальные сотрудники (кассир, менеджер, админ,
+    владелец) работают с общим списком клиентов компании.
+    """
+    return getattr(user, "role", None) == "agent"
+
+
 def _filter_clients_visible_for_user(qs, user):
     """
-    Agents (не owner/admin) видят только своих клиентов.
-    Owner/admin видят всех клиентов компании/филиала (фильтр CompanyBranchRestrictedMixin остаётся).
+    Только агенты (role == "agent") видят исключительно своих клиентов.
+    Все остальные сотрудники компании видят всех клиентов компании/филиала —
+    ограничение выдачи делает только CompanyBranchRestrictedMixin (по компании),
+    а не автор записи (created_by/salesperson).
     """
-    if user and not _is_owner_like(user):
+    if user and _is_agent(user):
         return qs.filter(salesperson=user)
     return qs
 

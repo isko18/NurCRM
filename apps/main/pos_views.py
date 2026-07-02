@@ -6,6 +6,7 @@ from django.shortcuts import get_object_or_404
 from django.utils.dateparse import parse_datetime, parse_date
 from django.utils import timezone
 from django_filters.rest_framework import DjangoFilterBackend
+from rest_framework.pagination import _positive_int
 
 from reportlab.pdfgen import canvas
 from reportlab.lib.units import mm
@@ -18,7 +19,7 @@ from django.http import FileResponse
 from django.http import Http404
 from rest_framework.exceptions import NotFound, PermissionDenied, ValidationError
 
-from decimal import Decimal, ROUND_HALF_UP
+from decimal import Decimal, ROUND_HALF_UP, InvalidOperation
 from datetime import timedelta, datetime, date, time as dtime
 import io, os, uuid
 
@@ -1233,8 +1234,11 @@ class ClientReconciliationJSONAPIView(APIView):
         credit_before = Decimal("0.00")
 
         if source in ("both", "sales"):
+            # Отменённые продажи (полный возврат) не создают задолженности —
+            # исключаем их, чтобы возврат корректно уменьшал долг в акте сверки.
             sales_before = (
                 Sale.objects.filter(company=company, client=client, created_at__lt=start_dt)
+                .exclude(status=Sale.Status.CANCELED)
                 .aggregate(s=Sum("total"))
                 .get("s")
                 or Decimal("0")
@@ -1306,6 +1310,7 @@ class ClientReconciliationJSONAPIView(APIView):
                     created_at__gte=start_dt,
                     created_at__lte=end_dt,
                 )
+                .exclude(status=Sale.Status.CANCELED)
                 .order_by("created_at")
             )
             for srow in qs:
@@ -1515,10 +1520,12 @@ class ClientReconciliationClassicAPIView(APIView):
         credit_before = Decimal("0.00")
 
         if source in ("both", "sales"):
+            # Отменённые продажи (полный возврат) не создают задолженности —
+            # исключаем их, чтобы возврат корректно уменьшал долг в акте сверки.
             sales_before = (
-                Sale.objects.filter(company=company, client=client, created_at__lt=start_dt).aggregate(s=Sum("total"))[
-                    "s"
-                ]
+                Sale.objects.filter(company=company, client=client, created_at__lt=start_dt)
+                .exclude(status=Sale.Status.CANCELED)
+                .aggregate(s=Sum("total"))["s"]
                 or Decimal("0")
             )
             debit_before += sales_before
@@ -1566,7 +1573,9 @@ class ClientReconciliationClassicAPIView(APIView):
                     client=client,
                     created_at__gte=start_dt,
                     created_at__lte=end_dt,
-                ).order_by("created_at")
+                )
+                .exclude(status=Sale.Status.CANCELED)
+                .order_by("created_at")
             ):
                 if q2(s.total) > 0:
                     entries.append(
@@ -3031,6 +3040,28 @@ class PosSalesLimitPagination(SupplierReceiptLimitPagination):
     page_size = 100
     max_page_size = 500
 
+    def get_page_size(self, request):
+        # Размер страницы можно задать как `limit` (историческое имя),
+        # так и `page_size` (используется фильтром аналитики).
+        for param in (self.page_size_query_param, "page_size"):
+            raw = request.query_params.get(param)
+            if raw:
+                try:
+                    return _positive_int(raw, strict=True, cutoff=self.max_page_size)
+                except (KeyError, ValueError):
+                    pass
+        return self.page_size
+
+
+def _parse_decimal_param(raw):
+    raw = (raw or "").strip().replace(",", ".")
+    if not raw:
+        return None
+    try:
+        return Decimal(raw)
+    except (InvalidOperation, TypeError):
+        return None
+
 
 def _apply_sale_date_filters(qs, request):
     start_raw = (
@@ -3090,6 +3121,27 @@ class SaleListAPIView(MarketCashierOnlyMixin, CompanyBranchRestrictedMixin, gene
         client_param = (self.request.query_params.get("client") or "").strip()
         if client_param:
             qs = qs.filter(client_id=client_param)
+
+        # Аналитический фильтр (страница /crm/market/analytics → «Транзакции»)
+        payment_method = (self.request.query_params.get("payment_method") or "").strip()
+        if payment_method:
+            qs = qs.filter(payment_method=payment_method)
+
+        cashbox_param = (self.request.query_params.get("cashbox") or "").strip()
+        if cashbox_param:
+            qs = qs.filter(cashbox_id=cashbox_param)
+
+        cashier_param = (self.request.query_params.get("cashier") or "").strip()
+        if cashier_param:
+            qs = qs.filter(user_id=cashier_param)
+
+        min_total = _parse_decimal_param(self.request.query_params.get("min_total"))
+        if min_total is not None:
+            qs = qs.filter(total__gte=min_total)
+
+        max_total = _parse_decimal_param(self.request.query_params.get("max_total"))
+        if max_total is not None:
+            qs = qs.filter(total__lte=max_total)
 
         return qs
 

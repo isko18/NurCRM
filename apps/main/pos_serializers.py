@@ -605,6 +605,7 @@ class SaleListSerializer(serializers.ModelSerializer):
     shift = serializers.PrimaryKeyRelatedField(read_only=True)
     cashbox = serializers.PrimaryKeyRelatedField(read_only=True)
     cashbox_name = serializers.SerializerMethodField(read_only=True)
+    debt_amount = serializers.SerializerMethodField(read_only=True)
 
     class Meta:
         model = Sale
@@ -627,6 +628,7 @@ class SaleListSerializer(serializers.ModelSerializer):
             "cashbox",
             "cashbox_name",
             "first_item_name",
+            "debt_amount",
         )
 
     def get_user_display(self, obj):
@@ -652,6 +654,16 @@ class SaleListSerializer(serializers.ModelSerializer):
         if getattr(cb, "branch", None):
             return f"Касса филиала {cb.branch.name}"
         return cb.name or "Касса компании"
+
+    def get_debt_amount(self, obj):
+        is_debt = (
+            obj.status == Sale.Status.DEBT
+            or obj.payment_method == Sale.PaymentMethod.DEBT
+        )
+        if not is_debt:
+            return money(Decimal("0.00"))
+        remaining = (obj.total or Decimal("0.00")) - (obj.cash_received or Decimal("0.00"))
+        return money(remaining if remaining > Decimal("0.00") else Decimal("0.00"))
 
 
 class SaleItemReadSerializer(serializers.ModelSerializer):
