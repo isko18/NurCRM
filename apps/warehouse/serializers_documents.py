@@ -570,10 +570,32 @@ class ProductSimpleSerializer(serializers.ModelSerializer):
     group = serializers.UUIDField(source="group.id", read_only=True)
     group_name = serializers.CharField(source="group.name", read_only=True)
     alternate_barcodes = serializers.SerializerMethodField()
+    supplier_name = serializers.CharField(source="supplier.name", read_only=True, allow_null=True)
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        if "supplier" in self.fields:
+            supplier_qs = models.Counterparty.objects.filter(
+                type__in=[models.Counterparty.Type.SUPPLIER, models.Counterparty.Type.BOTH]
+            )
+            req = self.context.get("request")
+            user = getattr(req, "user", None) if req else None
+            company = getattr(user, "company", None) or getattr(user, "owned_company", None)
+            if company is not None:
+                supplier_qs = supplier_qs.filter(company=company)
+            self.fields["supplier"].queryset = supplier_qs
 
     class Meta:
         model = models.WarehouseProduct
-        fields = ("id", "name", "article", "barcode", "unit", "quantity", "group", "group_name", "alternate_barcodes")
+        fields = (
+            "id", "name", "article", "barcode", "unit", "quantity",
+            "minimum_quantity", "supplier", "supplier_name",
+            "group", "group_name", "alternate_barcodes",
+        )
+        extra_kwargs = {
+            "supplier": {"required": False, "allow_null": True},
+            "minimum_quantity": {"required": False, "allow_null": True},
+        }
 
     def get_alternate_barcodes(self, obj):
         return list(obj.alternate_barcodes.order_by("barcode").values_list("barcode", flat=True))

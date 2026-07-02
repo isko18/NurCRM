@@ -711,12 +711,12 @@ class ProductListCreateView(CompanyBranchRestrictedMixin, generics.ListCreateAPI
         # Оптимизация: предзагружаем связанные объекты
         qs = (
             models.WarehouseProduct.objects.select_related(
-                "warehouse", "brand", "category", "company", "branch", "group"
+                "warehouse", "brand", "category", "company", "branch", "group", "supplier"
             )
             .prefetch_related("alternate_barcodes")
         )
         qs = self._filter_qs_company_branch(qs)
-        
+
         # Кэширование поиска по barcode
         search = self.request.query_params.get("search", "").strip()
         if search and len(search) >= 8:  # Предполагаем, что barcode обычно длиннее 8 символов
@@ -743,7 +743,7 @@ class ProductDetailView(ProtectedProductDeleteMixin, CompanyBranchRestrictedMixi
         # Оптимизация: предзагружаем связанные объекты
         qs = (
             models.WarehouseProduct.objects.select_related(
-                "warehouse", "brand", "category", "company", "branch"
+                "warehouse", "brand", "category", "company", "branch", "supplier"
             )
             .prefetch_related("alternate_barcodes")
         )
