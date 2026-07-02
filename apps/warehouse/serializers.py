@@ -363,12 +363,21 @@ class WarehouseProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSe
         required=False,
         write_only=True,
     )
+    supplier_name = serializers.CharField(source="supplier.name", read_only=True, allow_null=True)
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         warehouse = self.context.get("warehouse")
         if warehouse and "product_group" in self.fields:
             self.fields["product_group"].queryset = m.WarehouseProductGroup.objects.filter(warehouse=warehouse)
+        if "supplier" in self.fields:
+            supplier_qs = m.Counterparty.objects.filter(
+                type__in=[m.Counterparty.Type.SUPPLIER, m.Counterparty.Type.BOTH]
+            )
+            company = self._user_company()
+            if company is not None:
+                supplier_qs = supplier_qs.filter(company=company)
+            self.fields["supplier"].queryset = supplier_qs
 
     class Meta:
         ref_name = "WarehouseProductSerializer"
@@ -383,6 +392,7 @@ class WarehouseProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSe
             "unit",
             "is_weight",
             "quantity",
+            "minimum_quantity",
             "purchase_price",
             "markup_percent",
             "price",
@@ -397,6 +407,8 @@ class WarehouseProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSe
             "category",
             "product_group",
             "warehouse",
+            "supplier",
+            "supplier_name",
             "characteristics",
             "images",
             "packages",
@@ -408,6 +420,7 @@ class WarehouseProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSe
             "article": {"required": False, "allow_null": True},
             "country": {"required": False, "allow_null": True},
             "characteristics": {"required": False, "allow_null": True},
+            "supplier": {"required": False, "allow_null": True},
         }
 
     def validate(self, attrs):
@@ -420,7 +433,7 @@ class WarehouseProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSe
         if "country" in attrs:
             attrs["country"] = (attrs.get("country") or "").strip()
 
-        for f in ("quantity", "purchase_price", "markup_percent", "price", "wholesale_price", "discount_percent"):
+        for f in ("quantity", "minimum_quantity", "purchase_price", "markup_percent", "price", "wholesale_price", "discount_percent"):
             if f in attrs:
                 attrs[f] = _to_decimal(attrs.get(f), "0")
 

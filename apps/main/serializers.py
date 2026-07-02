@@ -1517,6 +1517,7 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
             discount_percent=discount_percent,
 
             quantity=validated_data.get("quantity", 0),
+            minimum_quantity=validated_data.get("minimum_quantity", 0),
 
             country=country,
             expiration_date=expiration_date,
@@ -1639,6 +1640,7 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
             "barcode",
             "description",
             "quantity",
+            "minimum_quantity",
             "discount_percent",
             "article",
             "unit",

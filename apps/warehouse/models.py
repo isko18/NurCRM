@@ -317,6 +317,16 @@ class WarehouseProduct(BaseModelId, BaseModelDate, BaseModelCompanyBranch):
         related_name="products",
     )
 
+    supplier = models.ForeignKey(
+        "warehouse.Counterparty",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="supplied_products",
+        limit_choices_to=Q(type__in=["SUPPLIER", "BOTH"]),
+        verbose_name="Поставщик",
+    )
+
     article = models.CharField("Артикул", max_length=64, blank=True)
     name = models.CharField("Название", max_length=255)
     description = models.TextField("Описание", blank=True, null=True)
@@ -350,6 +360,16 @@ class WarehouseProduct(BaseModelId, BaseModelDate, BaseModelCompanyBranch):
         max_digits=12,
         decimal_places=3,
         default=Decimal("0.000"),
+    )
+
+    minimum_quantity = models.DecimalField(
+        "Минимальный остаток",
+        max_digits=12,
+        decimal_places=3,
+        default=Decimal("0.000"),
+        null=True,
+        blank=True,
+        help_text="Порог для алерта «мало на складе».",
     )
 
     purchase_price = models.DecimalField(
@@ -1573,7 +1593,7 @@ class Document(models.Model):
             )
             if not owner_multi_warehouse and not self.warehouse_from:
                 raise ValidationError("Document requires warehouse_from")
-            if self.doc_type in (self.DocType.SALE, self.DocType.SALE_RETURN, self.DocType.PURCHASE_RETURN) and not self.counterparty:
+            if self.doc_type in (self.DocType.SALE_RETURN, self.DocType.PURCHASE_RETURN) and not self.counterparty:
                 raise ValidationError("Document requires counterparty")
 
         if self.doc_type in (self.DocType.SALE, self.DocType.PURCHASE, self.DocType.SALE_RETURN, self.DocType.PURCHASE_RETURN):
