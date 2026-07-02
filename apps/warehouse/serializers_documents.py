@@ -567,8 +567,12 @@ class TransferCreateSerializer(serializers.Serializer):
 
 
 class ProductSimpleSerializer(serializers.ModelSerializer):
-    group = serializers.UUIDField(source="group.id", read_only=True)
-    group_name = serializers.CharField(source="group.name", read_only=True)
+    # NOTE: модельное поле называется product_group (поля `group` в модели нет).
+    group = serializers.UUIDField(source="product_group.id", read_only=True)
+    group_name = serializers.CharField(source="product_group.name", read_only=True)
+    product_group_name = serializers.CharField(source="product_group.name", read_only=True, allow_null=True)
+    brand_name = serializers.CharField(source="brand.name", read_only=True, allow_null=True)
+    warehouse_name = serializers.CharField(source="warehouse.name", read_only=True, allow_null=True)
     alternate_barcodes = serializers.SerializerMethodField()
     supplier_name = serializers.CharField(source="supplier.name", read_only=True, allow_null=True)
 
@@ -588,13 +592,25 @@ class ProductSimpleSerializer(serializers.ModelSerializer):
     class Meta:
         model = models.WarehouseProduct
         fields = (
-            "id", "name", "article", "barcode", "unit", "quantity",
-            "minimum_quantity", "supplier", "supplier_name",
+            "id", "name", "article", "barcode",
+            "unit", "is_weight",
+            "quantity", "minimum_quantity",
+            "purchase_price", "price", "wholesale_price", "discount_percent",
+            "brand", "brand_name",
+            "category",
+            "product_group", "product_group_name",
+            "warehouse", "warehouse_name",
+            "supplier", "supplier_name",
+            "status",
             "group", "group_name", "alternate_barcodes",
         )
         extra_kwargs = {
             "supplier": {"required": False, "allow_null": True},
             "minimum_quantity": {"required": False, "allow_null": True},
+            "brand": {"required": False, "allow_null": True},
+            "category": {"required": False, "allow_null": True},
+            "product_group": {"required": False, "allow_null": True},
+            "warehouse": {"required": False},
         }
 
     def get_alternate_barcodes(self, obj):

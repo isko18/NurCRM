@@ -25,6 +25,7 @@ from .serializers import (
     CategorySerializer,
     WarehouseProductGroupSerializer,
     WarehouseProductSerializer,
+    WarehouseProductCatalogSerializer,
     WarehouseProductImageSerializer,
     WarehouseProductPackageSerializer,
     AgentRequestCartSerializer,
@@ -625,10 +626,18 @@ class ProductGroupDetailView(CompanyBranchRestrictedMixin, generics.RetrieveUpda
 
 
 # ==== Products ====
+class ProductCatalogPagination(PageNumberPagination):
+    """Пагинация каталога товаров: клиент может задать ?page_size= (для страницы
+    создания документа фронт грузит page_size=1000)."""
+    page_size_query_param = "page_size"
+    max_page_size = 2000
+
+
 class ProductView(CompanyBranchRestrictedMixin, generics.ListCreateAPIView):
     serializer_class = WarehouseProductSerializer
     filterset_class = ProductFilter
     filter_backends = [DjangoFilterBackend]
+    pagination_class = ProductCatalogPagination
 
     def _get_warehouse(self):
         qs = self._filter_qs_company_branch(m.Warehouse.objects.all())
@@ -700,6 +709,30 @@ class ProductDetailView(ProtectedProductDeleteMixin, CompanyBranchRestrictedMixi
         serializer.validated_data.pop("company", None)
         serializer.validated_data.pop("branch", None)
         serializer.save()
+
+
+class WarehouseProductCatalogListView(CompanyBranchRestrictedMixin, generics.ListAPIView):
+    """
+    Глобальный каталог товаров по всем складам компании (страница создания документа,
+    multi-warehouse SALE). Возвращает остаток (quantity) и поддерживает фильтры:
+    ?search= (name/article/barcode), ?brand=, ?product_group=, ?warehouse=.
+
+    GET /api/warehouse/products/
+    """
+    serializer_class = WarehouseProductCatalogSerializer
+    filter_backends = [DjangoFilterBackend]
+    filterset_class = ProductFilter
+    pagination_class = ProductCatalogPagination
+
+    def get_queryset(self):
+        qs = (
+            m.WarehouseProduct.objects
+            .select_related(
+                "brand", "category", "product_group", "warehouse", "company", "branch", "supplier"
+            )
+            .order_by("name")
+        )
+        return self._filter_qs_company_branch(qs)
 
 
 class ProductScanView(CompanyBranchRestrictedMixin, APIView):

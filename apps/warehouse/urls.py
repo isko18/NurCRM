@@ -6,6 +6,7 @@ from .views import (
     CategoryView, CategoryDetailView,
     ProductGroupView, ProductGroupDetailView,
     ProductView, ProductDetailView,
+    WarehouseProductCatalogListView,
     ProductScanView,
     ProductImagesView, ProductImageDetailView,
     ProductPackagesView, ProductPackageDetailView,
@@ -113,6 +114,9 @@ urlpatterns = [
     # products in warehouse
     path("<uuid:warehouse_uuid>/products/", ProductView.as_view(), name="warehouse-products"),
     path("<uuid:warehouse_uuid>/products/scan/", ProductScanView.as_view(), name="warehouse-products-scan"),
+
+    # global product catalog across all company warehouses (list only)
+    path("products/", WarehouseProductCatalogListView.as_view(), name="warehouse-products-catalog"),
 
     # product detail (global by product uuid)
     path("products/<uuid:product_uuid>/", ProductDetailView.as_view(), name="warehouse-product-detail"),

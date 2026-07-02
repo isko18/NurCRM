@@ -533,6 +533,46 @@ class WarehouseProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSe
         return instance
 
 
+class WarehouseProductCatalogSerializer(serializers.ModelSerializer):
+    """
+    Лёгкий сериализатор для каталога товаров (списки на странице создания документа).
+    Без вложенных images/packages/characteristics — только поля, нужные каталогу.
+    FK (brand/category/product_group/warehouse/supplier) отдаются как id (uuid) + *_name.
+    """
+    brand_name = serializers.CharField(source="brand.name", read_only=True, allow_null=True)
+    product_group_name = serializers.CharField(source="product_group.name", read_only=True, allow_null=True)
+    warehouse_name = serializers.CharField(source="warehouse.name", read_only=True, allow_null=True)
+    supplier_name = serializers.CharField(source="supplier.name", read_only=True, allow_null=True)
+
+    class Meta:
+        ref_name = "WarehouseProductCatalogSerializer"
+        model = m.WarehouseProduct
+        fields = (
+            "id",
+            "name",
+            "article",
+            "barcode",
+            "unit",
+            "is_weight",
+            "quantity",
+            "minimum_quantity",
+            "purchase_price",
+            "price",
+            "wholesale_price",
+            "discount_percent",
+            "brand",
+            "brand_name",
+            "category",
+            "product_group",
+            "product_group_name",
+            "warehouse",
+            "warehouse_name",
+            "supplier",
+            "supplier_name",
+            "status",
+        )
+
+
 # ----------------
 # Agent flows
 # ----------------

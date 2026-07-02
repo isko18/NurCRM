@@ -16,7 +16,9 @@ from .views import (
     filter_qs_company_branch_or_global,
     _parse_scale_barcode,
     ProtectedProductDeleteMixin,
+    ProductCatalogPagination,
 )
+from .filters import ProductFilter
 from apps.utils import _is_owner_like
 
 
@@ -704,14 +706,15 @@ class DocumentTransferCreateAPIView(CompanyBranchRestrictedMixin, APIView):
 
 class ProductListCreateView(CompanyBranchRestrictedMixin, generics.ListCreateAPIView):
     serializer_class = serializers_documents.ProductSimpleSerializer
-    filter_backends = [filters.SearchFilter]
-    search_fields = ["name", "article", "barcode"]
+    filter_backends = [DjangoFilterBackend]
+    filterset_class = ProductFilter
+    pagination_class = ProductCatalogPagination
     
     def get_queryset(self):
         # Оптимизация: предзагружаем связанные объекты
         qs = (
             models.WarehouseProduct.objects.select_related(
-                "warehouse", "brand", "category", "company", "branch", "group", "supplier"
+                "warehouse", "brand", "category", "company", "branch", "product_group", "supplier"
             )
             .prefetch_related("alternate_barcodes")
         )
