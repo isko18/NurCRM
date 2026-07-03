@@ -277,6 +277,114 @@ class WarehouseAnalyticsByGroupTests(TestCase):
         self.assertEqual(reg["money_net_amount"], "100.00")
         self.assertEqual(reg["money_counterparty_net_amount"], "40.00")
 
+    def test_owner_cash_counts_debt_operations_separately(self):
+        cp = wm.Counterparty.objects.create(
+            name="Должник по кассе",
+            phone="+996700000023",
+            company=self.company,
+            branch=self.branch,
+            type=wm.Counterparty.Type.CLIENT,
+        )
+        cash = wm.CashRegister.objects.create(
+            company=self.company, branch=self.branch, name="Основная касса"
+        )
+        debt_cat, _ = wm.PaymentCategory.objects.get_or_create(
+            company=self.company,
+            branch=self.branch,
+            system_code=wm.PaymentCategory.SystemCode.DEBT,
+            defaults={"title": "Долги"},
+        )
+
+        # Обычный приход/расход — формируют сальдо кассы.
+        wm.MoneyDocument.objects.create(
+            company=self.company,
+            branch=self.branch,
+            cash_register=cash,
+            doc_type=wm.MoneyDocument.DocType.MONEY_RECEIPT,
+            status=wm.MoneyDocument.Status.POSTED,
+            amount=Decimal("500.00"),
+        )
+        wm.MoneyDocument.objects.create(
+            company=self.company,
+            branch=self.branch,
+            cash_register=cash,
+            doc_type=wm.MoneyDocument.DocType.MONEY_EXPENSE,
+            status=wm.MoneyDocument.Status.POSTED,
+            amount=Decimal("200.00"),
+        )
+        # Долги без контрагента — графа «долг».
+        wm.MoneyDocument.objects.create(
+            company=self.company,
+            branch=self.branch,
+            cash_register=cash,
+            doc_type=wm.MoneyDocument.DocType.MONEY_EXPENSE,
+            status=wm.MoneyDocument.Status.POSTED,
+            payment_category=debt_cat,
+            amount=Decimal("80.00"),
+        )
+        # Долги с контрагентом — тоже графа «долг», а не расход и не «операции с контрагентами».
+        wm.MoneyDocument.objects.create(
+            company=self.company,
+            branch=self.branch,
+            cash_register=cash,
+            doc_type=wm.MoneyDocument.DocType.MONEY_EXPENSE,
+            status=wm.MoneyDocument.Status.POSTED,
+            payment_category=debt_cat,
+            counterparty=cp,
+            amount=Decimal("50.00"),
+        )
+        wm.MoneyDocument.objects.create(
+            company=self.company,
+            branch=self.branch,
+            cash_register=cash,
+            doc_type=wm.MoneyDocument.DocType.MONEY_RECEIPT,
+            status=wm.MoneyDocument.Status.POSTED,
+            payment_category=debt_cat,
+            counterparty=cp,
+            amount=Decimal("30.00"),
+        )
+
+        cache.clear()
+        today = timezone.localdate()
+        data = build_owner_warehouse_analytics_payload(
+            company_id=str(self.company.id),
+            branch_id=str(self.branch.id),
+            period="day",
+            date_from=today,
+            date_to=today,
+            group_by="day",
+        )
+
+        summary = data["summary"]
+        # Долги не попадают в обычный приход/расход.
+        self.assertEqual(summary["money_receipt_amount"], "500.00")
+        self.assertEqual(summary["money_expense_amount"], "200.00")
+        self.assertEqual(summary["money_net_amount"], "300.00")
+        # Все операции по категории «Долги» — в отдельной графе.
+        self.assertEqual(summary["money_debt_receipt_amount"], "30.00")
+        self.assertEqual(summary["money_debt_expense_amount"], "130.00")
+        self.assertEqual(summary["money_debt_net_amount"], "-100.00")
+        # В графу «операции с контрагентами» долги не попадают.
+        self.assertEqual(summary["money_counterparty_receipt_amount"], "0.00")
+        self.assertEqual(summary["money_counterparty_expense_amount"], "0.00")
+
+        # Долги не должны попадать в расход по категориям.
+        exp_categories = {r["category_title"] for r in data["details"]["money_expenses_by_category"]}
+        self.assertNotIn("Долги", exp_categories)
+
+        registers = {r["account_name"]: r for r in data["details"]["cash_by_register"]}
+        reg = registers["Основная касса"]
+        self.assertEqual(reg["money_expense_amount"], "200.00")
+        self.assertEqual(reg["money_debt_expense_amount"], "130.00")
+        self.assertEqual(reg["money_debt_receipt_amount"], "30.00")
+        self.assertEqual(reg["money_counterparty_expense_amount"], "0.00")
+
+        by_date = data["charts"]["money_by_date"]
+        self.assertEqual(len(by_date), 1)
+        self.assertEqual(by_date[0]["money_expense_amount"], "200.00")
+        self.assertEqual(by_date[0]["money_debt_expense_amount"], "130.00")
+        self.assertEqual(by_date[0]["money_counterparty_expense_amount"], "0.00")
+
 
 class WarehousePartnerAnalyticsTests(TestCase):
     def setUp(self):

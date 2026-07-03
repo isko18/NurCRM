@@ -350,14 +350,15 @@ def _build_owner_cash_analytics(*, company, branch, dt_from, dt_to_excl, group_b
     )
     money_qs = _apply_branch_scope(money_qs, branch, all_branches=all_branches)
 
-    # Денежные операции с контрагентом (counterparty задан) — это взаиморасчёты по сальдо
-    # (оплата долга контрагенту / приход от контрагента). Они НЕ должны попадать в обычный
+    # Долги — все документы с системной категорией «Долги» (system_code=debt), с контрагентом
+    # или без. Они НЕ должны попадать ни в обычный приход/расход, ни в графу «операции с
+    # контрагентами» — считаются отдельной графой «долг» (money_debt_*).
+    is_debt = Q(payment_category__system_code=wm.PaymentCategory.SystemCode.DEBT)
+    # Денежные операции с контрагентом (counterparty задан, кроме «Долги») — это взаиморасчёты
+    # по сальдо (оплата контрагенту / приход от контрагента). Они НЕ должны попадать в обычный
     # приход/расход кассы (иначе сальдо кассы искажается), а учитываются отдельной графой
     # «операции с контрагентами».
-    is_cp = Q(counterparty_id__isnull=False)
-    # Погашение долга — это документы с системной категорией «Долги» (system_code=debt) без
-    # контрагента. Они НЕ должны попадать в обычный приход/расход, а учитываются графой «долг».
-    is_debt = Q(payment_category__system_code=wm.PaymentCategory.SystemCode.DEBT) & ~is_cp
+    is_cp = Q(counterparty_id__isnull=False) & ~is_debt
     # Обычный приход/расход (формирует сальдо кассы): без контрагента и не «долг».
     is_regular = ~is_cp & ~is_debt
     RECEIPT = wm.MoneyDocument.DocType.MONEY_RECEIPT
@@ -528,7 +529,8 @@ def _build_owner_cash_analytics(*, company, branch, dt_from, dt_to_excl, group_b
             "money_receipt_amount": _money_str(receipt_total),
             "money_expense_amount": _money_str(expense_total),
             "money_net_amount": _money_str(net_total),
-            # Графа «долг»: погашения по системной категории «Долги», вне обычного прихода/расхода.
+            # Графа «долг»: все операции по системной категории «Долги» (с контрагентом и без),
+            # вне обычного прихода/расхода и вне графы «операции с контрагентами».
             "money_debt_receipt_amount": _money_str(debt_receipt_total),
             "money_debt_expense_amount": _money_str(debt_expense_total),
             "money_debt_net_amount": _money_str(debt_net_total),
