@@ -115,11 +115,69 @@ def _resolve_leaf_field(model, field_path: str):
     return model._meta.get_field(parts[-1])
 
 
-def _apply_date_range(qs, field_name: str, date_from: str | None, date_to: str | None):
+def _parse_hhmm(value: str | None) -> time | None:
+    """
+    'HH:MM' (24ч, допускается и 'HH:MM:SS') -> datetime.time.
+    Некорректный формат -> None: параметр игнорируется (обратная совместимость).
+    """
+    if value is None:
+        return None
+    s = str(value).strip()
+    if not s:
+        return None
+    parts = s.split(":")
+    if len(parts) < 2:
+        return None
+    try:
+        hh = int(parts[0])
+        mm = int(parts[1])
+        ss = int(parts[2]) if len(parts) >= 3 else 0
+    except (TypeError, ValueError):
+        return None
+    if not (0 <= hh <= 23 and 0 <= mm <= 59 and 0 <= ss <= 59):
+        return None
+    return time(hh, mm, ss)
+
+
+def _time_params(request):
+    """(time_from, time_to) как HH:MM из query-параметров (могут быть None)."""
+    qp = _query_params(request)
+    return qp.get("time_from"), qp.get("time_to")
+
+
+def _apply_time_of_day_range(qs, field_name: str, time_from=None, time_to=None):
+    """
+    Сужает выборку по времени суток внутри каждого дня периода (в текущей TZ компании).
+    Работает по datetime-полю/выражению через lookup __time (Django приводит к активной TZ).
+    Границы включительны по HH:MM. Некорректное время игнорируется.
+    time_from > time_to трактуется как ночное окно через полночь: [time_from..24:00) OR [00:00..time_to].
+    """
+    tf = _parse_hhmm(time_from)
+    tt = _parse_hhmm(time_to)
+    if tf is None and tt is None:
+        return qs
+
+    tkey = f"{field_name}__time"
+    if tf is not None and tt is not None:
+        if tf <= tt:
+            qs = qs.filter(**{f"{tkey}__gte": tf, f"{tkey}__lte": tt})
+        else:
+            qs = qs.filter(Q(**{f"{tkey}__gte": tf}) | Q(**{f"{tkey}__lte": tt}))
+    elif tf is not None:
+        qs = qs.filter(**{f"{tkey}__gte": tf})
+    else:
+        qs = qs.filter(**{f"{tkey}__lte": tt})
+    return qs
+
+
+def _apply_date_range(qs, field_name: str, date_from: str | None, date_to: str | None,
+                      time_from=None, time_to=None):
     """
     Фильтр по календарным дням YYYY-MM-DD.
     Для DateTimeField — lookup __date (как раньше).
     Для DateField — прямое __gte/__lte: __date на DateField на части бэкендов даёт неверный SQL / ошибку.
+    Опционально сужает по времени суток (time_from/time_to) — только для DateTimeField,
+    у DateField времени нет, поэтому фильтр по времени игнорируется.
     """
     from django.db.models import DateTimeField
 
@@ -136,37 +194,40 @@ def _apply_date_range(qs, field_name: str, date_from: str | None, date_to: str |
     if date_to:
         suf = "__date__lte" if use_date_transform else "__lte"
         qs = qs.filter(**{f"{field_name}{suf}": date_to})
+    if use_date_transform:
+        qs = _apply_time_of_day_range(qs, field_name, time_from, time_to)
     return qs
 
 
-def _apply_datetime_range_calendar_days(qs, field_name: str, date_from: str | None, date_to: str | None):
+def _apply_datetime_range_calendar_days(qs, field_name: str, date_from: str | None, date_to: str | None,
+                                        time_from=None, time_to=None):
     """
     DateTimeField: включительно по календарным дням YYYY-MM-DD в TIME_ZONE проекта (начало дня … конец дня).
     Устраняет сдвиг границ при lookup вида __date__ на aware-datetime в другой TZ.
-    Без обоих параметров — фильтр не накладывается.
+    Опционально сужает выборку по времени суток (time_from/time_to) внутри периода.
     """
     df = (date_from or "").strip() or None
     dt = (date_to or "").strip() or None
-    if not df and not dt:
-        return qs
 
-    tz = timezone.get_current_timezone()
+    if df or dt:
+        tz = timezone.get_current_timezone()
 
-    def _parse_ymd(s: str):
-        return datetime.strptime(s.strip()[:10], "%Y-%m-%d").date()
+        def _parse_ymd(s: str):
+            return datetime.strptime(s.strip()[:10], "%Y-%m-%d").date()
 
-    try:
-        if df:
-            lo = _parse_ymd(df)
-            start = timezone.make_aware(datetime.combine(lo, time.min), tz)
-            qs = qs.filter(**{f"{field_name}__gte": start})
-        if dt:
-            hi = _parse_ymd(dt)
-            end_exclusive = timezone.make_aware(datetime.combine(hi + timedelta(days=1), time.min), tz)
-            qs = qs.filter(**{f"{field_name}__lt": end_exclusive})
-    except ValueError:
-        pass
-    return qs
+        try:
+            if df:
+                lo = _parse_ymd(df)
+                start = timezone.make_aware(datetime.combine(lo, time.min), tz)
+                qs = qs.filter(**{f"{field_name}__gte": start})
+            if dt:
+                hi = _parse_ymd(dt)
+                end_exclusive = timezone.make_aware(datetime.combine(hi + timedelta(days=1), time.min), tz)
+                qs = qs.filter(**{f"{field_name}__lt": end_exclusive})
+        except ValueError:
+            pass
+
+    return _apply_time_of_day_range(qs, field_name, time_from, time_to)
 
 
 def _rejections_row_sort_key(row: dict):
@@ -509,7 +570,8 @@ def _cogs_sold_sum(company, branch, date_from, date_to, request) -> Decimal:
         menu_item_id__isnull=False,
     )
     qs, _ = _apply_waiter_scope(qs, request, "order__waiter_id")
-    qs = _apply_date_range(qs, "order__paid_at", date_from, date_to)
+    tf, tt = _time_params(request)
+    qs = _apply_date_range(qs, "order__paid_at", date_from, date_to, tf, tt)
     nq = _line_net_quantity_expr()
     cp = Coalesce(
         F("menu_item__cost_price"),
@@ -604,6 +666,7 @@ class KitchenAnalyticsBaseView(CompanyBranchQuerysetMixin, APIView):
 
         df = _query_params(request).get("date_from")
         dt = _query_params(request).get("date_to")
+        tf, tt = _time_params(request)
         waiter_scope_id = _analytics_waiter_scope(request) if self.group_field == "waiter" else None
 
         branch = self._active_branch()
@@ -614,6 +677,8 @@ class KitchenAnalyticsBaseView(CompanyBranchQuerysetMixin, APIView):
             params={
                 "date_from": df,
                 "date_to": dt,
+                "time_from": tf,
+                "time_to": tt,
                 "waiter_scope_id": str(waiter_scope_id) if waiter_scope_id else None,
             },
         )
@@ -625,7 +690,7 @@ class KitchenAnalyticsBaseView(CompanyBranchQuerysetMixin, APIView):
         qs = _apply_branch_scope_for_kitchen_tasks(qs, self)
         if waiter_scope_id:
             qs = qs.filter(waiter_id=waiter_scope_id)
-        qs = _apply_date_range(qs, "created_at", df, dt)
+        qs = _apply_date_range(qs, "created_at", df, dt, tf, tt)
 
         lead_time = ExpressionWrapper(F("finished_at") - F("started_at"), output_field=DurationField())
 
@@ -788,6 +853,7 @@ class SalesDynamicsView(CompanyBranchQuerysetMixin, APIView):
                 "series": [],
             })
 
+        tf, tt = _time_params(request)
         branch = self._active_branch()
         waiter_scope_id = _analytics_waiter_scope(request)
         key = _cache_key(
@@ -797,6 +863,8 @@ class SalesDynamicsView(CompanyBranchQuerysetMixin, APIView):
             params={
                 "date_from": df_s,
                 "date_to": dt_s,
+                "time_from": tf,
+                "time_to": tt,
                 "period": period,
                 "waiter_scope_id": str(waiter_scope_id) if waiter_scope_id else None,
             },
@@ -811,11 +879,11 @@ class SalesDynamicsView(CompanyBranchQuerysetMixin, APIView):
         else:
             oq = oq.filter(branch__isnull=True)
         oq, _ = _apply_waiter_scope(oq, request, "waiter_id")
-        oq = _apply_date_range(oq, "paid_at", df_s, dt_s)
+        oq = _apply_date_range(oq, "paid_at", df_s, dt_s, tf, tt)
 
         lq = _paid_order_lines_qs(company, branch)
         lq, _ = _apply_waiter_scope(lq, request, "order__waiter_id")
-        lq = _apply_date_range(lq, "order__paid_at", df_s, dt_s)
+        lq = _apply_date_range(lq, "order__paid_at", df_s, dt_s, tf, tt)
         net_qty = _line_net_quantity_expr()
 
         if period == "day":
@@ -864,6 +932,8 @@ class SalesDynamicsView(CompanyBranchQuerysetMixin, APIView):
         payload = {
             "date_from": df_s,
             "date_to": dt_s,
+            "time_from": tf,
+            "time_to": tt,
             "period": period,
             "basis": "paid_at",
             "totals": {
@@ -887,6 +957,7 @@ class SalesSummaryView(CompanyBranchQuerysetMixin, APIView):
 
         df = _query_params(request).get("date_from")
         dt = _query_params(request).get("date_to")
+        tf, tt = _time_params(request)
         waiter_scope_id = _analytics_waiter_scope(request)
 
         branch = self._active_branch()
@@ -897,6 +968,8 @@ class SalesSummaryView(CompanyBranchQuerysetMixin, APIView):
             params={
                 "date_from": df,
                 "date_to": dt,
+                "time_from": tf,
+                "time_to": tt,
                 "waiter_scope_id": str(waiter_scope_id) if waiter_scope_id else None,
             },
         )
@@ -910,11 +983,11 @@ class SalesSummaryView(CompanyBranchQuerysetMixin, APIView):
         else:
             oq = oq.filter(branch__isnull=True)
         oq, _ = _apply_waiter_scope(oq, request, "waiter_id")
-        oq = _apply_date_range(oq, "paid_at", df, dt)
+        oq = _apply_date_range(oq, "paid_at", df, dt, tf, tt)
 
         qs = _paid_order_lines_qs(company, branch)
         qs, _ = _apply_waiter_scope(qs, request, "order__waiter_id")
-        qs = _apply_date_range(qs, "order__paid_at", df, dt)
+        qs = _apply_date_range(qs, "order__paid_at", df, dt, tf, tt)
         net_qty = _line_net_quantity_expr()
 
         order_agg = oq.aggregate(
@@ -927,6 +1000,8 @@ class SalesSummaryView(CompanyBranchQuerysetMixin, APIView):
         payload = {
             "date_from": df,
             "date_to": dt,
+            "time_from": tf,
+            "time_to": tt,
             "basis": "paid_at",
             "orders_count": int(order_agg.get("orders_count") or 0),
             "items_qty": int(line_agg.get("items_qty") or 0),
@@ -947,6 +1022,7 @@ class SalesByMenuItemView(CompanyBranchQuerysetMixin, APIView):
 
         df = _query_params(request).get("date_from")
         dt = _query_params(request).get("date_to")
+        tf, tt = _time_params(request)
         limit_raw = _query_params(request).get("limit")
         try:
             limit = max(1, min(int(limit_raw or 10), 200))
@@ -962,6 +1038,8 @@ class SalesByMenuItemView(CompanyBranchQuerysetMixin, APIView):
             params={
                 "date_from": df,
                 "date_to": dt,
+                "time_from": tf,
+                "time_to": tt,
                 "limit": limit,
                 "waiter_scope_id": str(waiter_scope_id) if waiter_scope_id else None,
             },
@@ -975,7 +1053,7 @@ class SalesByMenuItemView(CompanyBranchQuerysetMixin, APIView):
             menu_item_id__isnull=False,
         )
         qs, _ = _apply_waiter_scope(qs, request, "order__waiter_id")
-        qs = _apply_date_range(qs, "order__paid_at", df, dt)
+        qs = _apply_date_range(qs, "order__paid_at", df, dt, tf, tt)
         qs = _annotate_allocated_line_revenue(qs)
 
         from .weight import format_quantity_api
@@ -1038,6 +1116,7 @@ class MenuAnalyticsAllView(CompanyBranchQuerysetMixin, APIView):
 
         df = _query_params(request).get("date_from")
         dt = _query_params(request).get("date_to")
+        tf, tt = _time_params(request)
         include_inactive = str(_query_params(request).get("include_inactive") or "").strip() in ("1", "true", "yes", "on")
         limit_raw = _query_params(request).get("limit")
         offset_raw = _query_params(request).get("offset")
@@ -1060,6 +1139,8 @@ class MenuAnalyticsAllView(CompanyBranchQuerysetMixin, APIView):
             params={
                 "date_from": df,
                 "date_to": dt,
+                "time_from": tf,
+                "time_to": tt,
                 "limit": limit,
                 "offset": offset,
                 "include_inactive": include_inactive,
@@ -1087,7 +1168,7 @@ class MenuAnalyticsAllView(CompanyBranchQuerysetMixin, APIView):
         )
         if waiter_scope_id:
             line_qs = line_qs.filter(order__waiter_id=waiter_scope_id)
-        line_qs = _apply_date_range(line_qs, "order__paid_at", df, dt)
+        line_qs = _apply_date_range(line_qs, "order__paid_at", df, dt, tf, tt)
         line_qs = _annotate_allocated_line_revenue(line_qs)
         stats_rows = (
             line_qs.values("menu_item_id")
@@ -1130,6 +1211,8 @@ class MenuAnalyticsAllView(CompanyBranchQuerysetMixin, APIView):
         payload = {
             "date_from": df,
             "date_to": dt,
+            "time_from": tf,
+            "time_to": tt,
             "basis": "paid_at",
             "offset": offset,
             "limit": limit,
@@ -1152,6 +1235,7 @@ class SalesByCategoryView(CompanyBranchQuerysetMixin, APIView):
 
         df = _query_params(request).get("date_from")
         dt = _query_params(request).get("date_to")
+        tf, tt = _time_params(request)
         limit_raw = _query_params(request).get("limit")
         try:
             limit = max(1, min(int(limit_raw or 50), 200))
@@ -1167,6 +1251,8 @@ class SalesByCategoryView(CompanyBranchQuerysetMixin, APIView):
             params={
                 "date_from": df,
                 "date_to": dt,
+                "time_from": tf,
+                "time_to": tt,
                 "limit": limit,
                 "waiter_scope_id": str(waiter_scope_id) if waiter_scope_id else None,
             },
@@ -1180,7 +1266,7 @@ class SalesByCategoryView(CompanyBranchQuerysetMixin, APIView):
             menu_item_id__isnull=False,
         )
         qs, _ = _apply_waiter_scope(qs, request, "order__waiter_id")
-        qs = _apply_date_range(qs, "order__paid_at", df, dt)
+        qs = _apply_date_range(qs, "order__paid_at", df, dt, tf, tt)
         qs = _annotate_allocated_line_revenue(qs)
 
         data = (qs.values("menu_item__category_id", "menu_item__category__title")
@@ -1212,6 +1298,7 @@ class SalesByKitchenView(CompanyBranchQuerysetMixin, APIView):
 
         df = _query_params(request).get("date_from")
         dt = _query_params(request).get("date_to")
+        tf, tt = _time_params(request)
         waiter_scope_id = _analytics_waiter_scope(request)
         branch = self._active_branch()
         key = _cache_key(
@@ -1221,6 +1308,8 @@ class SalesByKitchenView(CompanyBranchQuerysetMixin, APIView):
             params={
                 "date_from": df,
                 "date_to": dt,
+                "time_from": tf,
+                "time_to": tt,
                 "waiter_scope_id": str(waiter_scope_id) if waiter_scope_id else None,
             },
         )
@@ -1233,7 +1322,7 @@ class SalesByKitchenView(CompanyBranchQuerysetMixin, APIView):
             menu_item_id__isnull=False,
         )
         qs, _ = _apply_waiter_scope(qs, request, "order__waiter_id")
-        qs = _apply_date_range(qs, "order__paid_at", df, dt)
+        qs = _apply_date_range(qs, "order__paid_at", df, dt, tf, tt)
         qs = _annotate_allocated_line_revenue(qs)
 
         data = (
@@ -1297,6 +1386,7 @@ class RevenueInflowView(CompanyBranchQuerysetMixin, APIView):
 
         df = (_query_params(request).get("date_from") or "").strip() or None
         dt = (_query_params(request).get("date_to") or "").strip() or None
+        tf, tt = _time_params(request)
         branch = self._active_branch()
 
         qs = Order.objects.filter(company=company, is_paid=True)
@@ -1305,7 +1395,7 @@ class RevenueInflowView(CompanyBranchQuerysetMixin, APIView):
         else:
             qs = qs.filter(branch__isnull=True)
         qs, _ = _apply_waiter_scope(qs, request, "waiter_id")
-        qs = _apply_date_range(qs, "paid_at", df, dt)
+        qs = _apply_date_range(qs, "paid_at", df, dt, tf, tt)
 
         by_method, by_channel = _aggregate_paid_orders_by_payment(qs)
         pm_labels = dict(Order.PaymentMethod.choices)
@@ -1330,14 +1420,16 @@ class RevenueInflowView(CompanyBranchQuerysetMixin, APIView):
             or_qs = or_qs.filter(order__branch__isnull=True)
         ir_qs, _ = _apply_waiter_scope(ir_qs, request, "order__waiter_id")
         or_qs, _ = _apply_waiter_scope(or_qs, request, "order__waiter_id")
-        ir_qs = _apply_datetime_range_calendar_days(ir_qs, "refunded_at", df, dt)
-        or_qs = _apply_datetime_range_calendar_days(or_qs, "refunded_at", df, dt)
+        ir_qs = _apply_datetime_range_calendar_days(ir_qs, "refunded_at", df, dt, tf, tt)
+        or_qs = _apply_datetime_range_calendar_days(or_qs, "refunded_at", df, dt, tf, tt)
 
         refunds_by_method, refunds_grand = _refund_rows_by_payment_method(ir_qs, or_qs)
 
         return Response({
             "date_from": df,
             "date_to": dt,
+            "time_from": tf,
+            "time_to": tt,
             "basis": "paid_at",
             "refunds_basis": "refunded_at",
             "payment_methods": methods,
@@ -1383,6 +1475,7 @@ class RejectionsAnalyticsView(CompanyBranchQuerysetMixin, APIView):
 
         df = (qp.get("date_from") or "").strip() or None
         dt = (qp.get("date_to") or "").strip() or None
+        tf, tt = _time_params(request)
         branch = self._active_branch()
 
         qs = OrderItem.objects.select_related(
@@ -1397,7 +1490,7 @@ class RejectionsAnalyticsView(CompanyBranchQuerysetMixin, APIView):
             qs = qs.filter(order__branch__isnull=True)
         qs, _waiter_scope_id = _apply_waiter_scope(qs, request, "order__waiter_id")
         qs = qs.annotate(_rejection_event_at=Coalesce(F("rejected_at"), F("order__updated_at")))
-        qs = _apply_datetime_range_calendar_days(qs, "_rejection_event_at", df, dt)
+        qs = _apply_datetime_range_calendar_days(qs, "_rejection_event_at", df, dt, tf, tt)
 
         line_total = _line_revenue_expr()
         qs = qs.annotate(line_revenue=line_total)
@@ -1421,7 +1514,7 @@ class RejectionsAnalyticsView(CompanyBranchQuerysetMixin, APIView):
         else:
             ir_qs = ir_qs.filter(order__branch__isnull=True)
         ir_qs, _ = _apply_waiter_scope(ir_qs, request, "order__waiter_id")
-        ir_qs = _apply_datetime_range_calendar_days(ir_qs, "refunded_at", df, dt)
+        ir_qs = _apply_datetime_range_calendar_days(ir_qs, "refunded_at", df, dt, tf, tt)
 
         or_qs = OrderRefund.objects.select_related(
             "order",
@@ -1434,7 +1527,7 @@ class RejectionsAnalyticsView(CompanyBranchQuerysetMixin, APIView):
         else:
             or_qs = or_qs.filter(order__branch__isnull=True)
         or_qs, _ = _apply_waiter_scope(or_qs, request, "order__waiter_id")
-        or_qs = _apply_datetime_range_calendar_days(or_qs, "refunded_at", df, dt)
+        or_qs = _apply_datetime_range_calendar_days(or_qs, "refunded_at", df, dt, tf, tt)
 
         rows = [
             {
@@ -1517,6 +1610,8 @@ class RejectionsAnalyticsView(CompanyBranchQuerysetMixin, APIView):
         payload = {
             "date_from": df,
             "date_to": dt,
+            "time_from": tf,
+            "time_to": tt,
             "basis": "rejected_at / refunded_at",
             "totals": {
                 "guest_rejections_lost": f"{guest_lost_total:.2f}",
@@ -1551,6 +1646,7 @@ class CancelledOrdersAnalyticsView(CompanyBranchQuerysetMixin, APIView):
 
         df = _query_params(request).get("date_from")
         dt = _query_params(request).get("date_to")
+        tf, tt = _time_params(request)
         limit_raw = _query_params(request).get("limit")
         offset_raw = _query_params(request).get("offset")
         try:
@@ -1580,6 +1676,9 @@ class CancelledOrdersAnalyticsView(CompanyBranchQuerysetMixin, APIView):
             qs = qs.filter(Q(canceled_at__date__gte=df) | Q(canceled_at__isnull=True, updated_at__date__gte=df))
         if dt:
             qs = qs.filter(Q(canceled_at__date__lte=dt) | Q(canceled_at__isnull=True, updated_at__date__lte=dt))
+        # Время суток применяем к тому же событию (canceled_at, для legacy — updated_at).
+        qs = qs.annotate(_cancel_event_at=Coalesce(F("canceled_at"), F("updated_at")))
+        qs = _apply_time_of_day_range(qs, "_cancel_event_at", tf, tt)
 
         rows = []
         for o in qs.order_by("-canceled_at", "-updated_at")[offset: offset + limit]:
@@ -1610,6 +1709,8 @@ class CancelledOrdersAnalyticsView(CompanyBranchQuerysetMixin, APIView):
         return Response({
             "date_from": df,
             "date_to": dt,
+            "time_from": tf,
+            "time_to": tt,
             "basis": "canceled_at",
             "offset": offset,
             "limit": limit,
@@ -1629,6 +1730,7 @@ class CafeExpensesSummaryView(CompanyBranchQuerysetMixin, APIView):
         qp = _query_params(request)
         df = qp.get("date_from")
         dt = qp.get("date_to")
+        tf, tt = _time_params(request)
         try:
             limit = max(1, min(int(qp.get("limit") or 500), 2000))
         except Exception:
@@ -1636,7 +1738,7 @@ class CafeExpensesSummaryView(CompanyBranchQuerysetMixin, APIView):
 
         branch = self._active_branch()
         qs = _scoped_cafe_expense_qs(company, branch)
-        qs = _apply_date_range(qs, "expense_date", df, dt)
+        qs = _apply_date_range(qs, "expense_date", df, dt, tf, tt)
 
         agg = qs.aggregate(c=Count("id"), s=Sum("amount"))
         expenses_sum = _to_decimal(agg.get("s"))
@@ -1677,6 +1779,8 @@ class CafeExpensesSummaryView(CompanyBranchQuerysetMixin, APIView):
         return Response({
             "date_from": df,
             "date_to": dt,
+            "time_from": tf,
+            "time_to": tt,
             "basis": "expense_date",
             "expenses_count": expenses_count,
             "expenses_sum": f"{expenses_sum:.2f}",
@@ -1706,6 +1810,7 @@ class CafeFinanceAnalyticsView(CompanyBranchQuerysetMixin, APIView):
         qp = _query_params(request)
         df = (qp.get("date_from") or "").strip() or None
         dt = (qp.get("date_to") or "").strip() or None
+        tf, tt = _time_params(request)
         try:
             limit = max(1, min(int(qp.get("limit") or 500), 2000))
         except Exception:
@@ -1719,7 +1824,7 @@ class CafeFinanceAnalyticsView(CompanyBranchQuerysetMixin, APIView):
         else:
             oq = oq.filter(branch__isnull=True)
         oq, _ = _apply_waiter_scope(oq, request, "waiter_id")
-        oq = _apply_date_range(oq, "paid_at", df, dt)
+        oq = _apply_date_range(oq, "paid_at", df, dt, tf, tt)
 
         revenue = _to_decimal(oq.aggregate(s=Sum(_order_net_revenue_expr()))["s"])
         cogs = _cogs_sold_sum(company, branch, df, dt, request)
@@ -1727,12 +1832,12 @@ class CafeFinanceAnalyticsView(CompanyBranchQuerysetMixin, APIView):
         margin_pct = float((gross / revenue * Decimal("100")).quantize(Decimal("0.01"))) if revenue > 0 else 0.0
 
         pqs = _scoped_purchase_qs(company, branch)
-        pqs = _apply_date_range(pqs, "created_at", df, dt)
+        pqs = _apply_date_range(pqs, "created_at", df, dt, tf, tt)
         purchases_sum = _to_decimal(pqs.aggregate(s=Sum("price"))["s"])
         purchases_count = int(pqs.aggregate(c=Count("id"))["c"] or 0)
 
         eqs = _scoped_cafe_expense_qs(company, branch)
-        eqs = _apply_date_range(eqs, "expense_date", df, dt)
+        eqs = _apply_date_range(eqs, "expense_date", df, dt, tf, tt)
         expenses_sum = _to_decimal(eqs.aggregate(s=Sum("amount"))["s"])
         expenses_count = int(eqs.aggregate(c=Count("id"))["c"] or 0)
         net_profit = gross - expenses_sum
@@ -1817,8 +1922,8 @@ class CafeFinanceAnalyticsView(CompanyBranchQuerysetMixin, APIView):
             or_qs = or_qs.filter(order__branch__isnull=True)
         ir_qs, _ = _apply_waiter_scope(ir_qs, request, "order__waiter_id")
         or_qs, _ = _apply_waiter_scope(or_qs, request, "order__waiter_id")
-        ir_qs = _apply_datetime_range_calendar_days(ir_qs, "refunded_at", df, dt)
-        or_qs = _apply_datetime_range_calendar_days(or_qs, "refunded_at", df, dt)
+        ir_qs = _apply_datetime_range_calendar_days(ir_qs, "refunded_at", df, dt, tf, tt)
+        or_qs = _apply_datetime_range_calendar_days(or_qs, "refunded_at", df, dt, tf, tt)
 
         refund_items = []
         for r in or_qs.select_related("order").order_by("-refunded_at")[:limit]:
@@ -1850,6 +1955,8 @@ class CafeFinanceAnalyticsView(CompanyBranchQuerysetMixin, APIView):
             "tab": "finance",
             "date_from": df,
             "date_to": dt,
+            "time_from": tf,
+            "time_to": tt,
             "basis": "paid_at",
             "refunds_basis": "refunded_at",
             "cards": {
@@ -2038,8 +2145,9 @@ class CafeWaiterSalaryReportView(CompanyBranchQuerysetMixin, APIView):
         company = self._user_company()
         df = _query_params(request).get("date_from")
         dt = _query_params(request).get("date_to")
+        tf, tt = _time_params(request)
         if not company:
-            return Response({"date_from": df, "date_to": dt, "rows": []})
+            return Response({"date_from": df, "date_to": dt, "time_from": tf, "time_to": tt, "rows": []})
 
         if not df or not dt:
             return Response({"detail": "Нужны date_from и date_to (YYYY-MM-DD)."}, status=400)
@@ -2083,7 +2191,7 @@ class CafeWaiterSalaryReportView(CompanyBranchQuerysetMixin, APIView):
                 oq = oq.filter(branch=branch)
             else:
                 oq = oq.filter(branch__isnull=True)
-            oq = _apply_date_range(oq, "paid_at", df, dt)
+            oq = _apply_date_range(oq, "paid_at", df, dt, tf, tt)
             agg = oq.annotate(_nr=_order_net_revenue_expr()).aggregate(s=Sum("_nr"))
             waiter_rev = _to_decimal(agg.get("s"))
             base_part = (prof.monthly_base_salary or Decimal("0")) * Decimal(days) / Decimal("30")
@@ -2107,7 +2215,7 @@ class CafeWaiterSalaryReportView(CompanyBranchQuerysetMixin, APIView):
                 "total": f"{total_pay:.2f}",
             })
 
-        return Response({"date_from": df, "date_to": dt, "rows": out})
+        return Response({"date_from": df, "date_to": dt, "time_from": tf, "time_to": tt, "rows": out})
 
 
 class CafeUnifiedAnalyticsView(CompanyBranchQuerysetMixin, APIView):
@@ -2168,6 +2276,7 @@ class CafeWaiterSalesView(CompanyBranchQuerysetMixin, APIView):
 
         df = _query_params(request).get("date_from")
         dt = _query_params(request).get("date_to")
+        tf, tt = _time_params(request)
         branch = self._active_branch()
 
         qs = Order.objects.filter(company=company, is_paid=True)
@@ -2176,7 +2285,7 @@ class CafeWaiterSalesView(CompanyBranchQuerysetMixin, APIView):
         else:
             qs = qs.filter(branch__isnull=True)
         qs, _ = _apply_waiter_scope(qs, request, "waiter_id")
-        qs = _apply_date_range(qs, "paid_at", df, dt)
+        qs = _apply_date_range(qs, "paid_at", df, dt, tf, tt)
 
         net_expr = _order_net_revenue_expr()
         data = (
@@ -2214,20 +2323,21 @@ class PurchasesSummaryView(CompanyBranchQuerysetMixin, APIView):
 
         df = _query_params(request).get("date_from")
         dt = _query_params(request).get("date_to")
+        tf, tt = _time_params(request)
 
         branch = self._active_branch()
         key = _cache_key(
             "purchases:summary",
             company_id=str(company.id),
             branch_id=str(branch.id) if branch else None,
-            params={"date_from": df, "date_to": dt},
+            params={"date_from": df, "date_to": dt, "time_from": tf, "time_to": tt},
         )
         hit = _cache_get(key)
         if hit is not None:
             return Response(hit)
 
         qs = _scoped_purchase_qs(company, branch)
-        qs = _apply_date_range(qs, "created_at", df, dt)
+        qs = _apply_date_range(qs, "created_at", df, dt, tf, tt)
 
         agg = qs.aggregate(
             purchases_count=Count("id"),
@@ -2237,6 +2347,8 @@ class PurchasesSummaryView(CompanyBranchQuerysetMixin, APIView):
         payload = {
             "date_from": df,
             "date_to": dt,
+            "time_from": tf,
+            "time_to": tt,
             "purchases_count": int(agg.get("purchases_count") or 0),
             "purchases_sum": f"{_to_decimal(agg.get('purchases_sum')):.2f}",
         }
@@ -2255,6 +2367,7 @@ class PurchasesBySupplierView(CompanyBranchQuerysetMixin, APIView):
 
         df = _query_params(request).get("date_from")
         dt = _query_params(request).get("date_to")
+        tf, tt = _time_params(request)
         limit_raw = _query_params(request).get("limit")
         try:
             limit = max(1, min(int(limit_raw or 10), 200))
@@ -2266,14 +2379,14 @@ class PurchasesBySupplierView(CompanyBranchQuerysetMixin, APIView):
             "purchases:suppliers",
             company_id=str(company.id),
             branch_id=str(branch.id) if branch else None,
-            params={"date_from": df, "date_to": dt, "limit": limit},
+            params={"date_from": df, "date_to": dt, "time_from": tf, "time_to": tt, "limit": limit},
         )
         hit = _cache_get(key)
         if hit is not None:
             return Response(hit)
 
         qs = _scoped_purchase_qs(company, branch)
-        qs = _apply_date_range(qs, "created_at", df, dt)
+        qs = _apply_date_range(qs, "created_at", df, dt, tf, tt)
 
         data = (qs.values("supplier")
                   .annotate(total=Sum("price"), count=Count("id"))
@@ -2512,12 +2625,14 @@ class CafeAnalyticsExportView(CompanyBranchQuerysetMixin, APIView):
             or_qs = or_qs.filter(order__branch__isnull=True)
         ir_qs, _ = _apply_waiter_scope(ir_qs, request, "order__waiter_id")
         or_qs, _ = _apply_waiter_scope(or_qs, request, "order__waiter_id")
-        ir_qs = _apply_datetime_range_calendar_days(ir_qs, "refunded_at", date_from, date_to)
-        or_qs = _apply_datetime_range_calendar_days(or_qs, "refunded_at", date_from, date_to)
+        tf, tt = _time_params(request)
+        ir_qs = _apply_datetime_range_calendar_days(ir_qs, "refunded_at", date_from, date_to, tf, tt)
+        or_qs = _apply_datetime_range_calendar_days(or_qs, "refunded_at", date_from, date_to, tf, tt)
         return ir_qs, or_qs
 
     def _analytics_payload(self, company, branch, date_from, date_to, request):
         lim = self._export_row_limit
+        tf, tt = _time_params(request)
         qs_items = _paid_order_lines_qs(company, branch)
         qs_items, _ = _apply_waiter_scope(qs_items, request, "order__waiter_id")
         qs_purchases = _scoped_purchase_qs(company, branch)
@@ -2527,9 +2642,9 @@ class CafeAnalyticsExportView(CompanyBranchQuerysetMixin, APIView):
         if branch is not None:
             qs_warehouse = qs_warehouse.filter(branch=branch)
 
-        qs_items = _apply_date_range(qs_items, "order__paid_at", date_from, date_to)
-        qs_purchases = _apply_date_range(qs_purchases, "created_at", date_from, date_to)
-        qs_exp = _apply_date_range(qs_exp, "expense_date", date_from, date_to)
+        qs_items = _apply_date_range(qs_items, "order__paid_at", date_from, date_to, tf, tt)
+        qs_purchases = _apply_date_range(qs_purchases, "created_at", date_from, date_to, tf, tt)
+        qs_exp = _apply_date_range(qs_exp, "expense_date", date_from, date_to, tf, tt)
 
         oq = Order.objects.filter(company=company, is_paid=True)
         if branch is not None:
@@ -2537,7 +2652,7 @@ class CafeAnalyticsExportView(CompanyBranchQuerysetMixin, APIView):
         else:
             oq = oq.filter(branch__isnull=True)
         oq, _ = _apply_waiter_scope(oq, request, "waiter_id")
-        oq = _apply_date_range(oq, "paid_at", date_from, date_to)
+        oq = _apply_date_range(oq, "paid_at", date_from, date_to, tf, tt)
 
         net_qty = _line_net_quantity_expr()
         line_part = qs_items.aggregate(items_qty=Sum(net_qty))
@@ -2651,6 +2766,8 @@ class CafeAnalyticsExportView(CompanyBranchQuerysetMixin, APIView):
         return {
             "date_from": date_from or "",
             "date_to": date_to or "",
+            "time_from": tf or "",
+            "time_to": tt or "",
             "basis": "paid_at",
             "orders_count": int(sales_agg.get("orders_count") or 0),
             "items_qty": int(sales_agg.get("items_qty") or 0),
@@ -2683,13 +2800,14 @@ class CafeAnalyticsExportView(CompanyBranchQuerysetMixin, APIView):
 
     def _cash_payload(self, company, branch, date_from, date_to, request):
         lim = self._export_row_limit
+        tf, tt = _time_params(request)
         qs = Order.objects.filter(company=company, is_paid=True)
         if branch is not None:
             qs = qs.filter(branch=branch)
         else:
             qs = qs.filter(branch__isnull=True)
         qs, _ = _apply_waiter_scope(qs, request, "waiter_id")
-        qs = _apply_date_range(qs, "paid_at", date_from, date_to)
+        qs = _apply_date_range(qs, "paid_at", date_from, date_to, tf, tt)
 
         orders_qs = (
             qs.annotate(row_net=_order_net_revenue_expr())
@@ -2751,6 +2869,8 @@ class CafeAnalyticsExportView(CompanyBranchQuerysetMixin, APIView):
         return {
             "date_from": date_from or "",
             "date_to": date_to or "",
+            "time_from": tf or "",
+            "time_to": tt or "",
             "totals": {k: f"{v:.2f}" for k, v in totals.items()},
             "rows": rows,
             "refunds_total": f"{refunds_grand:.2f}",
