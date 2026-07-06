@@ -1573,9 +1573,14 @@ class Document(models.Model):
                         )
 
         if self.agent_id:
+            from apps.warehouse.services import AGENT_MULTI_WAREHOUSE_DOC_TYPES
+
             if self.doc_type in (self.DocType.TRANSFER, self.DocType.INVENTORY):
                 raise ValidationError("Agent documents cannot be TRANSFER or INVENTORY")
-            if not self.warehouse_from:
+            # Для мультискладских документов агента единый warehouse_from
+            # необязателен — склад берётся из каждой позиции.
+            agent_multi = self.doc_type in AGENT_MULTI_WAREHOUSE_DOC_TYPES
+            if not self.warehouse_from and not agent_multi:
                 raise ValidationError("Agent document requires warehouse_from")
             if getattr(self.agent, "company_id", None) and self.warehouse_from:
                 if self.agent.company_id != self.warehouse_from.company_id:
@@ -1586,12 +1591,16 @@ class Document(models.Model):
                     raise ValidationError({"counterparty": "Контрагент не принадлежит агенту."})
 
         if self.doc_type in (self.DocType.SALE, self.DocType.SALE_RETURN, self.DocType.PURCHASE, self.DocType.PURCHASE_RETURN, self.DocType.RECEIPT, self.DocType.WRITE_OFF):
+            from apps.warehouse.services import AGENT_MULTI_WAREHOUSE_DOC_TYPES
+
             # require warehouse_from for most operations (warehouse where stock changes).
-            owner_multi_warehouse = (
-                self.doc_type in (self.DocType.SALE, self.DocType.SALE_RETURN)
-                and not self.agent_id
+            # Мультисклад (владелец: продажа/возврат; агент: продажа/возвраты/списание)
+            # допускает пустой warehouse_from — склад берётся из позиций.
+            multi_warehouse_no_from = (
+                (self.doc_type in (self.DocType.SALE, self.DocType.SALE_RETURN) and not self.agent_id)
+                or (self.agent_id and self.doc_type in AGENT_MULTI_WAREHOUSE_DOC_TYPES)
             )
-            if not owner_multi_warehouse and not self.warehouse_from:
+            if not multi_warehouse_no_from and not self.warehouse_from:
                 raise ValidationError("Document requires warehouse_from")
             if self.doc_type in (self.DocType.SALE_RETURN, self.DocType.PURCHASE_RETURN) and not self.counterparty:
                 raise ValidationError("Document requires counterparty")
@@ -1714,14 +1723,17 @@ class DocumentItem(models.Model):
                 elif not prod.warehouse_id:
                     raise ValidationError({"product": "Товар должен быть привязан к складу."})
 
-            if doc.agent_id and doc.warehouse_from_id:
+            # Склад позиции: в мультискладском документе агента — склад товара
+            # (product.warehouse), иначе — единый warehouse_from документа.
+            item_warehouse_id = self.product.warehouse_id if multi_warehouse else doc.warehouse_from_id
+            if doc.agent_id and item_warehouse_id:
                 # Для документов агента возможны два режима списания:
                 # - use_common_stock=True: списываем со склада (общий товар) — не требуем AgentStockBalance
                 # - use_common_stock=False: списываем с остатков агента — требуем AgentStockBalance
                 if not bool(getattr(doc, "use_common_stock", False)):
                     has_balance = AgentStockBalance.objects.filter(
                         agent_id=doc.agent_id,
-                        warehouse_id=doc.warehouse_from_id,
+                        warehouse_id=item_warehouse_id,
                         product_id=self.product_id,
                     ).exists()
                     if not has_balance:

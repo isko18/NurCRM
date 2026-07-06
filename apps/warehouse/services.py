@@ -14,13 +14,27 @@ MULTI_WAREHOUSE_DOC_TYPES = frozenset({
     models.Document.DocType.COMMERCIAL_OFFER,
 })
 
+# Типы документов агента ("Мои остатки"), где строки могут ссылаться на разные
+# склады: списание/зачисление идёт со склада каждой позиции (product.warehouse),
+# а единый warehouse_from на уровне документа необязателен.
+AGENT_MULTI_WAREHOUSE_DOC_TYPES = frozenset({
+    models.Document.DocType.SALE,
+    models.Document.DocType.SALE_RETURN,
+    models.Document.DocType.PURCHASE_RETURN,
+    models.Document.DocType.WRITE_OFF,
+})
+
 
 def document_allows_multi_warehouse(document) -> bool:
-    """Продажа/возврат/КП владельца: строки могут списываться с разных складов."""
-    return (
-        document.doc_type in MULTI_WAREHOUSE_DOC_TYPES
-        and not getattr(document, "agent_id", None)
-    )
+    """Строки документа могут списываться/зачисляться с разных складов.
+
+    Владелец: продажа/возврат/КП. Агент ("Мои остатки"): продажа, возвраты и
+    списание — склад берётся из каждой позиции (product.warehouse), а не из
+    единого warehouse_from документа.
+    """
+    if getattr(document, "agent_id", None):
+        return document.doc_type in AGENT_MULTI_WAREHOUSE_DOC_TYPES
+    return document.doc_type in MULTI_WAREHOUSE_DOC_TYPES
 
 
 def resolve_item_warehouse(document, item):
@@ -410,14 +424,22 @@ def post_document(document: models.Document, allow_negative: bool = None) -> mod
 
             for item in items:
                 delta = sign * Decimal(item.qty)
+                # Мультисклад: списываем/зачисляем по складу каждой позиции
+                # (product.warehouse), с откатом на общий warehouse_from документа.
+                item_wh = resolve_item_warehouse(document, item)
+                if item_wh is None:
+                    raise ValueError(
+                        f"Не удалось определить склад для товара {item.product_id}. "
+                        "Укажите warehouse_from или выберите товар, привязанный к складу."
+                    )
                 bal, _ = models.AgentStockBalance.objects.select_for_update().get_or_create(
                     agent_id=document.agent_id,
-                    warehouse=document.warehouse_from,
+                    warehouse=item_wh,
                     product=item.product,
                     defaults={
                         "qty": Decimal("0.000"),
-                        "company": document.warehouse_from.company,
-                        "branch": document.warehouse_from.branch,
+                        "company": item_wh.company,
+                        "branch": item_wh.branch,
                     },
                 )
                 cur = Decimal(bal.qty or 0)
@@ -433,7 +455,7 @@ def post_document(document: models.Document, allow_negative: bool = None) -> mod
                 mv = models.AgentStockMove.objects.create(
                     document=document,
                     agent_id=document.agent_id,
-                    warehouse=document.warehouse_from,
+                    warehouse=item_wh,
                     product=item.product,
                     qty_delta=delta,
                     move_kind=move_kind,

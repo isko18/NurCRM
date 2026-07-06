@@ -207,6 +207,22 @@ class DocumentItemSerializer(serializers.ModelSerializer):
             "line_total",
         )
 
+    def to_internal_value(self, data):
+        ret = super().to_internal_value(data)
+        # Необязательный склад позиции (мультискладские "Мои остатки"): если клиент
+        # прислал `warehouse`, товар должен принадлежать этому складу. Само значение
+        # не храним — склад строки берётся из product.warehouse при проведении.
+        if isinstance(data, dict):
+            wh_raw = data.get("warehouse")
+            if wh_raw not in (None, ""):
+                product = ret.get("product")
+                prod_wh_id = getattr(product, "warehouse_id", None) if product is not None else None
+                if prod_wh_id is not None and str(prod_wh_id) != str(wh_raw):
+                    raise serializers.ValidationError(
+                        {"warehouse": "Товар не принадлежит указанному складу."}
+                    )
+        return ret
+
     def get_effective_discount_percent(self, obj):
         doc = getattr(obj, "document", None)
         doc_dp = Decimal(getattr(doc, "discount_percent", None) or 0) if doc else Decimal("0")
@@ -272,6 +288,8 @@ class DocumentSerializer(serializers.ModelSerializer):
     warehouse_to_name = serializers.CharField(
         source="warehouse_to.name", read_only=True, allow_null=True
     )
+    warehouse_from_display_name = serializers.SerializerMethodField()
+    warehouses = serializers.SerializerMethodField()
     agent = serializers.PrimaryKeyRelatedField(
         queryset=User.objects.all(),
         allow_null=True,
@@ -296,6 +314,8 @@ class DocumentSerializer(serializers.ModelSerializer):
             "warehouse_to",
             "warehouse_from_name",
             "warehouse_to_name",
+            "warehouse_from_display_name",
+            "warehouses",
             "counterparty",
             "cash_register",
             "cash_register_name",
@@ -363,6 +383,62 @@ class DocumentSerializer(serializers.ModelSerializer):
         attrs = self._apply_multi_warehouse_defaults(attrs)
         return super().validate(attrs) if hasattr(super(), "validate") else attrs
 
+    @staticmethod
+    def _anchor_agent_warehouse_from(*, agent, doc_type, warehouse_from, items):
+        """Склад-якорь для мультискладского документа агента.
+
+        Когда единый ``warehouse_from`` не задан (клиент шлёт товары с разных складов
+        своих остатков), берём его из первой позиции. Это нужно только как привязка
+        документа к компании/филиалу/кассе и для фильтров списка — само списание идёт
+        по складу каждой позиции (см. ``services.resolve_item_warehouse``).
+        Возвращает выбранный склад или ``None``.
+        """
+        if not agent or warehouse_from is not None:
+            return None
+        if doc_type not in warehouse_services.AGENT_MULTI_WAREHOUSE_DOC_TYPES:
+            return None
+        if not items:
+            return None
+        first_product = items[0].get("product")
+        if first_product is not None and getattr(first_product, "warehouse_id", None):
+            return first_product.warehouse
+        return None
+
+    def _item_warehouses(self, obj):
+        """Уникальные склады, задействованные в позициях мультискладского документа.
+
+        Список пар (id, name) в порядке появления. Для одно-складского документа
+        (не мультисклад) возвращает пусто — актуален единый warehouse_from.
+        """
+        if not warehouse_services.document_allows_multi_warehouse(obj):
+            return []
+        seen_ids = set()
+        result = []
+        for it in obj.items.all():
+            p = getattr(it, "product", None)
+            wh = getattr(p, "warehouse", None) if p is not None else None
+            if wh is None or wh.id in seen_ids:
+                continue
+            seen_ids.add(wh.id)
+            result.append((wh.id, wh.name))
+        return result
+
+    def get_warehouses(self, obj):
+        return [{"id": str(wid), "name": name} for wid, name in self._item_warehouses(obj)]
+
+    def get_warehouse_from_display_name(self, obj):
+        """Название склада для отображения.
+
+        Для смешанного мультискладского документа — список складов из позиций,
+        иначе — имя единого склада-источника.
+        """
+        warehouses = self._item_warehouses(obj)
+        if len(warehouses) > 1:
+            return ", ".join(name for _wid, name in warehouses if name)
+        if len(warehouses) == 1:
+            return warehouses[0][1]
+        return getattr(obj.warehouse_from, "name", None)
+
     def get_agent_display(self, obj):
         u = getattr(obj, "agent", None)
         if not u:
@@ -427,7 +503,19 @@ class DocumentSerializer(serializers.ModelSerializer):
         doc_type = validated_data.get("doc_type")
         is_sale_request = validated_data.get("is_sale_request", False)
         validated_data["status"] = self._resolve_sale_status(doc_type, is_sale_request)
-        
+
+        # Мультисклад агента: если единый склад не задан, привязываем документ к
+        # складу первой позиции (компания/филиал/касса/фильтры). Движение по строкам
+        # всё равно идёт со склада каждой позиции.
+        anchor = self._anchor_agent_warehouse_from(
+            agent=validated_data.get("agent"),
+            doc_type=doc_type,
+            warehouse_from=validated_data.get("warehouse_from"),
+            items=items,
+        )
+        if anchor is not None:
+            validated_data["warehouse_from"] = anchor
+
         # Валидация документа перед созданием
         doc = models.Document(**validated_data)
         try:
@@ -466,6 +554,19 @@ class DocumentSerializer(serializers.ModelSerializer):
             setattr(instance, key, value)
         if ("is_sale_request" in validated_data) or ("doc_type" in validated_data):
             instance.status = self._resolve_sale_status(instance.doc_type, instance.is_sale_request)
+
+        # Мультисклад агента: привязываем документ к складу первой позиции, если
+        # единый склад не задан (аналогично созданию).
+        if items:
+            anchor = self._anchor_agent_warehouse_from(
+                agent=instance.agent,
+                doc_type=instance.doc_type,
+                warehouse_from=instance.warehouse_from,
+                items=items,
+            )
+            if anchor is not None:
+                instance.warehouse_from = anchor
+
         try:
             instance.clean()
         except DjangoValidationError as e:
