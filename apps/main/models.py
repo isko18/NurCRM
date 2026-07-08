@@ -1677,8 +1677,22 @@ class Cart(models.Model):
             if self.branch_id is not None and (self.shift.branch_id or None) != (self.branch_id or None):
                 raise ValidationError({"shift": "Смена другого филиала."})
 
+    # Поля, которые пишет recalc(): это вычисляемые суммы, они не участвуют
+    # ни в одном UniqueConstraint и не проверяются в clean().
+    _TOTALS_ONLY_UPDATE_FIELDS = frozenset(
+        {"subtotal", "discount_total", "tax_total", "total", "updated_at"}
+    )
+
     def save(self, *args, **kwargs):
         update_fields = kwargs.get("update_fields")
+
+        # Быстрый путь для recalc(): обновляем только суммы.
+        # Пропускаем full_clean()/validate_unique() (3 SELECT'а по partial-индексам)
+        # и sync полей из смены — company/branch/user существующей корзины тут не меняются.
+        # Это горячий путь POS (scan/add-item/start/checkout), вызывается на каждое действие.
+        if update_fields is not None and set(update_fields) <= self._TOTALS_ONLY_UPDATE_FIELDS:
+            return super().save(*args, **kwargs)
+
         touched = set()
 
         # shift есть → всё берём из смены
@@ -1773,12 +1787,25 @@ class Cart(models.Model):
 
         discount_total = _money(line_discount_total + extra_discount)
         taxable_base = subtotal - discount_total
-        tax_total = self._calc_tax(taxable_base)
+        tax_total = _money(self._calc_tax(taxable_base))
+        total = _money(subtotal - discount_total + tax_total)
+
+        # Частый случай (переключение вкладок корзин): суммы не изменились —
+        # не трогаем БД, не бампим updated_at, не шлём лишний UPDATE.
+        unchanged = (
+            self.subtotal == subtotal
+            and self.discount_total == discount_total
+            and self.tax_total == tax_total
+            and self.total == total
+        )
 
         self.subtotal = subtotal
         self.discount_total = discount_total
-        self.tax_total = _money(tax_total)
-        self.total = _money(self.subtotal - self.discount_total + self.tax_total)
+        self.tax_total = tax_total
+        self.total = total
+
+        if unchanged:
+            return
 
         self.save(update_fields=["subtotal", "discount_total", "tax_total", "total", "updated_at"])
 

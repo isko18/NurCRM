@@ -2137,8 +2137,8 @@ class SaleStartAPIView(MarketCashierOnlyMixin, CompanyBranchRestrictedMixin, API
                     cart.is_default = True
                     cart.save(update_fields=["is_default", "updated_at"])
 
-            cart.recalc()
-
+            # recalc() делаем один раз — в конце (после применения скидок/опта).
+            # Раньше здесь был лишний recalc() на каждый start.
             update_f = []
             wholesale_changed = False
 

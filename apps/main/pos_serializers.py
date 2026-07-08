@@ -118,7 +118,8 @@ class SaleItemSerializer(serializers.ModelSerializer):
     line_total = serializers.SerializerMethodField()
     display_name = serializers.SerializerMethodField()
     primary_image_url = serializers.SerializerMethodField(read_only=True)
-    images = ProductImageReadSerializer(many=True, read_only=True, source="product.images")
+    # Полный массив images[] в POS не нужен: на строке корзины показывается одна
+    # миниатюра (primary_image_url). Массив раздувал payload и CPU сериализации.
     # line_discount — поле модели (хранится отдельно от unit_price)
 
     # ✅ важно: quantity должен быть Decimal(3), а не int
@@ -137,12 +138,11 @@ class SaleItemSerializer(serializers.ModelSerializer):
             "sale_package",
             "display_name",
             "primary_image_url",
-            "images",
         )
         read_only_fields = (
             "id", "product_name", "barcode",
             "stock", "promotion_rules", "line_total",
-            "display_name", "primary_image_url", "images",
+            "display_name", "primary_image_url",
             "sale_package",
         )
 
