@@ -742,6 +742,10 @@ class ProductListView(CompanyBranchRestrictedMixin, generics.ListAPIView):
                 "item_make",
                 "packages",
                 "recipe_items__item_make",
+                # Раньше сериализовались на каждый товар без prefetch → N+1
+                # (по ~100 доп. запросов на страницу): промо-ступени и поставщики.
+                "promotion_tiers",
+                Prefetch("suppliers", queryset=Client.objects.only("id", "full_name")),
                 product_images_prefetch,
             )
         )
@@ -787,11 +791,13 @@ class ProductListView(CompanyBranchRestrictedMixin, generics.ListAPIView):
 
         qs = apply_product_list_filters(qs, qp)
 
-        # Всегда: избранные сверху. Дальше — стандартная сортировка (ordering filter / default ordering).
-        current = list(qs.query.order_by) or []
-        # если уже есть сортировка по is_favorite — не дублируем
-        if not any("is_favorite" in o for o in current):
-            qs = qs.order_by("-is_favorite", *current)
+        # Всегда: избранные сверху, затем «сначала новые».
+        # Явно фиксируем -created_at как fallback: если ordering-фильтр не проставил
+        # сортировку (query.order_by пуст), порядок «новые первыми» не должен теряться.
+        current = [o for o in (list(qs.query.order_by) or []) if "is_favorite" not in o]
+        if not current:
+            current = ["-created_at"]
+        qs = qs.order_by("-is_favorite", *current)
         return qs
 
 
