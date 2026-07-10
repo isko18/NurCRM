@@ -982,8 +982,14 @@ class AgentRequestCartSubmitAPIView(CompanyBranchRestrictedMixin, APIView):
             return Response({"detail": "Нет доступа."}, status=status.HTTP_403_FORBIDDEN)
         ser = AgentRequestCartActionSerializer(data=request.data)
         ser.is_valid(raise_exception=True)
+
+        # Право «продажа без одобрения» читается в момент submit (а не при создании
+        # заявки): активное членство автора заявки в компании склада + включённый
+        # флаг + совпадение назначенного склада (если он задан).
+        auto_approve = self._agent_can_sell_without_approval(cart)
+
         try:
-            cart.submit()
+            cart.submit(auto_approve=auto_approve)
         except DjangoValidationError as exc:
             err = getattr(exc, "message_dict", {})
             if "items" in err:
@@ -991,6 +997,19 @@ class AgentRequestCartSubmitAPIView(CompanyBranchRestrictedMixin, APIView):
             raise ValidationError(err or {"detail": str(exc)})
         out = AgentRequestCartSerializer(cart, context={"request": request}).data
         return Response(out)
+
+    @staticmethod
+    def _agent_can_sell_without_approval(cart) -> bool:
+        membership = m.CompanyWarehouseAgent.objects.filter(
+            company_id=cart.warehouse.company_id,
+            user_id=cart.agent_id,
+            status=m.CompanyWarehouseAgent.Status.ACTIVE,
+        ).only("can_sell_without_approval", "assigned_warehouse").first()
+        if not membership or not membership.can_sell_without_approval:
+            return False
+        assigned_id = membership.assigned_warehouse_id
+        # Если агенту назначен конкретный склад — автоодобрение только по нему.
+        return not assigned_id or assigned_id == cart.warehouse_id
 
 
 class AgentRequestCartApproveAPIView(CompanyBranchRestrictedMixin, APIView):
@@ -1852,6 +1871,7 @@ class CompanyWarehouseAgentCommonAccessUpdateAPIView(APIView):
       - common_access_enabled: bool
       - common_warehouse: uuid|null (обязателен если common_access_enabled=true)
       - can_sell_wholesale: bool (разрешить агенту оптовые продажи)
+      - can_sell_without_approval: bool (заявки агента одобряются автоматически на submit)
     """
 
     permission_classes = [permissions.IsAuthenticated]
@@ -1885,6 +1905,7 @@ class CompanyWarehouseAgentAdminAssignAPIView(APIView):
       - common_access_enabled: bool (опционально)
       - common_warehouse: uuid|null (опционально, обязателен если common_access_enabled=true)
       - can_sell_wholesale: bool (опционально, разрешить агенту оптовые продажи)
+      - can_sell_without_approval: bool (опционально, автоодобрение заявок агента на submit)
     """
 
     permission_classes = [permissions.IsAuthenticated]
@@ -1922,6 +1943,7 @@ class CompanyWarehouseAgentAdminAssignAPIView(APIView):
             or "common_access_enabled" in request.data
             or "common_warehouse" in request.data
             or "can_sell_wholesale" in request.data
+            or "can_sell_without_approval" in request.data
         ):
             ser = CompanyWarehouseAgentCommonAccessUpdateSerializer(
                 instance=obj,

@@ -814,6 +814,11 @@ def post_document(document: models.Document, allow_negative: bool = None) -> mod
             document.status = document.Status.POSTED
             document.save(update_fields=["status"])
 
+        # Начисления зарплаты агенту (процент с продажи со склада-источника).
+        # В той же транзакции, что и проведение продажи.
+        from apps.warehouse import salary_services
+        salary_services.create_accruals_for_document(document)
+
     return document
 
 
@@ -902,6 +907,10 @@ def unpost_document(document: models.Document) -> models.Document:
 
         document.status = document.Status.DRAFT
         document.save()
+
+        # Распроведение продажи агента → отмена/корректировка начислений зарплаты.
+        from apps.warehouse import salary_services
+        salary_services.cancel_accruals_for_document(document)
 
     return document
 

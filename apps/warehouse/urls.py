@@ -289,3 +289,20 @@ urlpatterns += [
 
 # Сводки продаж (раздел «Сводка»)
 urlpatterns += summary_router.urls
+
+# Зарплата агентов (раздел «Зарплата»)
+from .salary_views import (
+    SalaryRateListAPIView,
+    SalaryRateUpdateAPIView,
+    SalaryAccrualListAPIView,
+    SalarySummaryAPIView,
+    SalaryPayoutListCreateAPIView,
+)
+
+urlpatterns += [
+    path("salary/rates/", SalaryRateListAPIView.as_view(), name="warehouse-salary-rates"),
+    path("salary/rates/<uuid:warehouse_id>/", SalaryRateUpdateAPIView.as_view(), name="warehouse-salary-rate-update"),
+    path("salary/accruals/", SalaryAccrualListAPIView.as_view(), name="warehouse-salary-accruals"),
+    path("salary/summary/", SalarySummaryAPIView.as_view(), name="warehouse-salary-summary"),
+    path("salary/payouts/", SalaryPayoutListCreateAPIView.as_view(), name="warehouse-salary-payouts"),
+]

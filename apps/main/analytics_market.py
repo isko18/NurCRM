@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from dataclasses import dataclass
-from datetime import datetime, timedelta, time
+from datetime import datetime, timedelta, time, date as _date
 from decimal import Decimal
 import hashlib
 import json
@@ -26,7 +26,7 @@ from django.conf import settings
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework import permissions
-from rest_framework.exceptions import PermissionDenied
+from rest_framework.exceptions import PermissionDenied, ValidationError
 
 from apps.users.models import Branch
 from apps.construction.models import CashShift
@@ -148,16 +148,75 @@ def _calc_margin_pack(revenue: Decimal, cogs: Decimal):
     return cg, profit, margin
 
 
-def _parse_dt(s: str | None) -> datetime | None:
+def _parse_period_value(raw) -> tuple[datetime | None, bool]:
+    """
+    Разбирает одну границу периода из query-параметра.
+
+    Возвращает кортеж (naive_datetime | None, is_date_only):
+      • None / ""               -> (None, False)  — параметр не задан;
+      • "YYYY-MM-DD"            -> (datetime 00:00, True)  — дата без времени;
+      • "YYYY-MM-DDTHH:MM[:SS]" -> (точный datetime, False) — местное время.
+
+    Значение трактуется как МЕСТНОЕ время компании (таймзона проекта, Asia/Bishkek);
+    если во входе вдруг оказалась таймзона — она отбрасывается (никаких «как будто UTC»).
+
+    Бросает ValueError, если непустое значение не парсится — вызывающий превращает
+    это в HTTP 400 (rule #6 спецификации).
+    """
+    if raw is None:
+        return None, False
+    s = str(raw).strip()
     if not s:
-        return None
+        return None, False
+    if len(s) == 10:  # YYYY-MM-DD
+        d = _date.fromisoformat(s)  # ValueError при мусоре
+        return datetime.combine(d, time.min), True
+    dt = datetime.fromisoformat(s)  # ValueError при мусоре
+    if dt.tzinfo is not None:
+        dt = dt.replace(tzinfo=None)
+    return dt, False
+
+
+def _aware_start(naive: datetime, tz) -> datetime:
+    """Нижняя граница (включительная): naive местное → aware."""
+    return timezone.make_aware(naive, tz) if timezone.is_naive(naive) else naive
+
+
+def _exclusive_end(naive: datetime, is_date_only: bool, tz) -> datetime:
+    """
+    Верхняя граница периода. На входе — включительная граница (местное время),
+    на выходе — ЭКСКЛЮЗИВНАЯ (для фильтров `__lt`), чтобы конец периода
+    учитывался включительно (rule #2):
+      • дата без времени  → весь день: +1 день (00:00 следующего дня);
+      • точное время      → эта секунда включительно: +1 секунда.
+    """
+    aware = timezone.make_aware(naive, tz) if timezone.is_naive(naive) else naive
+    return aware + (timedelta(days=1) if is_date_only else timedelta(seconds=1))
+
+
+def _parse_bounds(raw_from, raw_to, *, param_hint: str):
+    """
+    Разбирает пару границ (from, to) и приводит их к (aware_start | None, aware_end_excl | None).
+    На невалидном непустом значении бросает DRF ValidationError → HTTP 400.
+    """
+    tz = timezone.get_current_timezone()
     try:
-        if len(s) == 10:  # YYYY-MM-DD
-            d = datetime.fromisoformat(s)
-            return datetime.combine(d.date(), time.min)
-        return datetime.fromisoformat(s)
-    except Exception:
-        return None
+        start_naive, _ = _parse_period_value(raw_from)
+    except ValueError:
+        raise ValidationError({
+            "detail": f"Некорректный {param_hint}_start/date_from: {raw_from!r}. "
+                      f"Ожидается YYYY-MM-DD или YYYY-MM-DDTHH:MM:SS."
+        })
+    try:
+        end_naive, end_is_date_only = _parse_period_value(raw_to)
+    except ValueError:
+        raise ValidationError({
+            "detail": f"Некорректный {param_hint}_end/date_to: {raw_to!r}. "
+                      f"Ожидается YYYY-MM-DD или YYYY-MM-DDTHH:MM:SS."
+        })
+    start = _aware_start(start_naive, tz) if start_naive else None
+    end = _exclusive_end(end_naive, end_is_date_only, tz) if end_naive else None
+    return start, end
 
 
 @dataclass
@@ -177,21 +236,12 @@ def _get_period(request) -> Period:
     raw_from = qp.get("date_from") or qp.get("period_start")
     raw_to = qp.get("date_to") or qp.get("period_end")
 
-    df = _parse_dt(raw_from)
-    dt = _parse_dt(raw_to)
+    start, end = _parse_bounds(raw_from, raw_to, param_hint="period")
 
-    if df and timezone.is_naive(df):
-        df = timezone.make_aware(df, tz)
-    if dt and timezone.is_naive(dt):
-        dt = timezone.make_aware(dt, tz)
+    if start and end:
+        return Period(start=start, end=end)
 
-    if df and dt:
-        # если date_to пришёл как дата — делаем +1 день (exclusive)
-        # (поддерживаем и period_end)
-        if raw_to and len(raw_to) == 10:
-            dt = dt + timedelta(days=1)
-        return Period(start=df, end=dt)
-
+    # период не задан (или задана лишь одна из границ) → текущий месяц
     first = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
     if first.month == 12:
         nxt = first.replace(year=first.year + 1, month=1)
@@ -1123,14 +1173,11 @@ class AnalyticsView(APIView):
         raw_from = (qp.get("purchase_date_from") or qp.get("date_from") or "").strip() or None
         raw_to = (qp.get("purchase_date_to") or qp.get("date_to") or "").strip() or None
 
-        df = _parse_dt(raw_from) if raw_from else period.start
-        dt = _parse_dt(raw_to) if raw_to else period.end
-        if df and timezone.is_naive(df):
-            df = timezone.make_aware(df, timezone.get_current_timezone())
-        if dt and timezone.is_naive(dt):
-            dt = timezone.make_aware(dt, timezone.get_current_timezone())
-        if dt and raw_to and len(raw_to) == 10:
-            dt = dt + timedelta(days=1)
+        # Границы закупок трактуем так же, как основной период (местное время,
+        # конец периода включительно). Если не заданы — берём общий период вкладки.
+        bound_from, bound_to = _parse_bounds(raw_from, raw_to, param_hint="purchase_date")
+        df = bound_from if bound_from else period.start
+        dt = bound_to if bound_to else period.end
 
         pqs = self._market_products_queryset(request, company, branch)
         if pqs is None:
@@ -2082,14 +2129,8 @@ class AnalyticsView(APIView):
 
         purchase_raw_from = (qp.get("purchase_date_from") or qp.get("procurement_date_from") or "").strip() or None
         purchase_raw_to = (qp.get("purchase_date_to") or qp.get("procurement_date_to") or "").strip() or None
-        purchase_df = _parse_dt(purchase_raw_from) if purchase_raw_from else None
-        purchase_dt = _parse_dt(purchase_raw_to) if purchase_raw_to else None
-        if purchase_df and timezone.is_naive(purchase_df):
-            purchase_df = timezone.make_aware(purchase_df, timezone.get_current_timezone())
-        if purchase_dt and timezone.is_naive(purchase_dt):
-            purchase_dt = timezone.make_aware(purchase_dt, timezone.get_current_timezone())
-        if purchase_dt and purchase_raw_to and len(purchase_raw_to) == 10:
-            purchase_dt = purchase_dt + timedelta(days=1)
+        # Границы закупок: местное время, конец периода включительно (см. _parse_bounds).
+        purchase_df, purchase_dt = _parse_bounds(purchase_raw_from, purchase_raw_to, param_hint="purchase_date")
 
         def _dec_qty(v) -> Decimal:
             if isinstance(v, Decimal):

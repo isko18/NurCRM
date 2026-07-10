@@ -689,6 +689,7 @@ class AgentRequestCartSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSe
             "submitted_at",
             "approved_at",
             "approved_by",
+            "auto_approved",
             "sale_document",
             "sale_document_number",
             "created_date",
@@ -702,6 +703,7 @@ class AgentRequestCartSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSe
             "submitted_at",
             "approved_at",
             "approved_by",
+            "auto_approved",
             "sale_document",
             "sale_document_number",
             "created_date",
@@ -900,6 +902,7 @@ class CompanyWarehouseAgentSerializer(serializers.ModelSerializer):
     common_access_enabled = serializers.BooleanField(read_only=True)
     common_warehouse = serializers.PrimaryKeyRelatedField(read_only=True)
     can_sell_wholesale = serializers.BooleanField(read_only=True)
+    can_sell_without_approval = serializers.BooleanField(read_only=True)
 
     class Meta:
         model = m.CompanyWarehouseAgent
@@ -915,6 +918,7 @@ class CompanyWarehouseAgentSerializer(serializers.ModelSerializer):
             "common_access_enabled",
             "common_warehouse",
             "can_sell_wholesale",
+            "can_sell_without_approval",
             "created_at",
             "updated_at",
             "decided_at",
@@ -928,6 +932,7 @@ class CompanyWarehouseAgentSerializer(serializers.ModelSerializer):
             "common_access_enabled",
             "common_warehouse",
             "can_sell_wholesale",
+            "can_sell_without_approval",
             "created_at",
             "updated_at",
             "decided_at",
@@ -967,10 +972,17 @@ class CompanyWarehouseAgentCommonAccessUpdateSerializer(serializers.ModelSeriali
         allow_null=True,
     )
     can_sell_wholesale = serializers.BooleanField(required=False)
+    can_sell_without_approval = serializers.BooleanField(required=False)
 
     class Meta:
         model = m.CompanyWarehouseAgent
-        fields = ("assigned_warehouse", "common_access_enabled", "common_warehouse", "can_sell_wholesale")
+        fields = (
+            "assigned_warehouse",
+            "common_access_enabled",
+            "common_warehouse",
+            "can_sell_wholesale",
+            "can_sell_without_approval",
+        )
 
     def validate(self, attrs):
         attrs = super().validate(attrs)

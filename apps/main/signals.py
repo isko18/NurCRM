@@ -12,6 +12,34 @@ from apps.main.models import Product, ProductImage, Notification, ManufactureSub
 logger = logging.getLogger("crm.webhooks")
 
 
+@receiver(pre_delete, sender=Product)
+def product_deletion_audit(sender, instance: Product, **kwargs):
+    """
+    ДИАГНОСТИКА «товары исчезают»: логируем КАЖДОЕ удаление Product вместе с
+    цепочкой вызовов. По стеку сразу видно, ЧТО удалило товар — каскад от
+    Branch/Company (on_delete=CASCADE), management-команда, вьюха API или
+    прямой ORM/SQL. Пишем в тот же logger, что и вебхуки (гарантированно
+    попадает в логи). Никогда не бросает исключение.
+
+    После следующего инцидента: grep 'PRODUCT_DELETE_AUDIT' по логам —
+    в стеке будет источник (напр. cascade из users/models Branch.delete,
+    либо конкретная management-команда/скрипт).
+    """
+    try:
+        import traceback
+
+        logger.warning(
+            "PRODUCT_DELETE_AUDIT id=%s code=%s company=%s branch=%s\nCALL_STACK:\n%s",
+            getattr(instance, "id", None),
+            getattr(instance, "code", None),
+            getattr(instance, "company_id", None),
+            getattr(instance, "branch_id", None),
+            "".join(traceback.format_stack(limit=20)),
+        )
+    except Exception:
+        pass
+
+
 @receiver(post_save, sender=Product)
 def product_webhook_on_save(sender, instance: Product, created: bool, **kwargs):
     event = "product.created" if created else "product.updated"

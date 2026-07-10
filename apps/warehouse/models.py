@@ -1140,6 +1140,16 @@ class CompanyWarehouseAgent(models.Model):
         ),
     )
 
+    can_sell_without_approval = models.BooleanField(
+        "Продажа без одобрения",
+        default=False,
+        help_text=(
+            "Выдаётся владельцем доверенному агенту. Если включено — заявка агента одобряется "
+            "автоматически в момент отправки (submit): товар сразу списывается со склада и "
+            "зачисляется агенту, без участия владельца."
+        ),
+    )
+
     class Meta:
         verbose_name = "Агент склада (заявка в компанию)"
         verbose_name_plural = "Агенты складов (заявки в компании)"
@@ -1800,6 +1810,15 @@ class AgentRequestCart(BaseModelId, BaseModelDate, BaseModelCompanyBranch):
         related_name="warehouse_approved_agent_carts",
         verbose_name="Кем одобрено",
     )
+    auto_approved = models.BooleanField(
+        "Автоодобрено",
+        default=False,
+        help_text=(
+            "True — заявка одобрена автоматически по праву агента "
+            "can_sell_without_approval (в момент submit, без участия владельца). "
+            "В этом случае approved_by = NULL."
+        ),
+    )
 
     sale_document = models.OneToOneField(
         "warehouse.Document",
@@ -1901,16 +1920,41 @@ class AgentRequestCart(BaseModelId, BaseModelDate, BaseModelCompanyBranch):
                 })
 
     @transaction.atomic
-    def submit(self):
+    def submit(self, *, auto_approve=False):
+        """
+        Отправка заявки агентом (draft → submitted).
+
+        Если auto_approve=True (агент с правом can_sell_without_approval),
+        в той же транзакции выполняется логика approve: остатки проверяются и
+        блокируются, товар списывается со склада и зачисляется агенту, а заявка
+        сразу переходит в approved (approved_by=NULL, auto_approved=True).
+        """
         if self.status != self.Status.DRAFT:
             raise ValidationError("Можно отправить только черновик.")
         if not self.items.exists():
             raise ValidationError("Нельзя отправить пустую заявку.")
         self._validate_items_against_warehouse_stock()
-        self.status = self.Status.SUBMITTED
-        self.submitted_at = timezone.now()
+
+        now = timezone.now()
+        self.submitted_at = now
+
+        if not auto_approve:
+            self.status = self.Status.SUBMITTED
+            self.full_clean()
+            self.save(update_fields=["status", "submitted_at", "updated_date"])
+            return
+
+        # Автоодобрение: та же логика, что и approve, но без участия владельца.
+        self._transfer_items_to_agent()
+        self.status = self.Status.APPROVED
+        self.approved_at = now
+        self.approved_by = None
+        self.auto_approved = True
         self.full_clean()
-        self.save(update_fields=["status", "submitted_at", "updated_date"])
+        self.save(update_fields=[
+            "status", "submitted_at", "approved_at", "approved_by",
+            "auto_approved", "updated_date",
+        ])
 
     def _transfer_items_to_agent(self):
         from apps.warehouse import services as warehouse_services
@@ -2818,3 +2862,166 @@ class WarehouseSalesSummaryDocumentItem(models.Model):
 
     def __str__(self):
         return f"{self.name} ({self.summary_document_id})"
+
+
+# ─────────────────────────────────────────────────────────────
+# Зарплата агентов: процент с продаж по складам
+# ─────────────────────────────────────────────────────────────
+class WarehouseSalaryRate(models.Model):
+    """
+    Ставка вознаграждения агента для конкретного склада-источника.
+    Отдельно для розничных и оптовых продаж. Отсутствие записи = нули.
+    """
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    company = models.ForeignKey(
+        "users.Company", on_delete=models.CASCADE,
+        related_name="warehouse_salary_rates", verbose_name="Компания",
+    )
+    warehouse = models.OneToOneField(
+        "warehouse.Warehouse", on_delete=models.CASCADE,
+        related_name="salary_rate", verbose_name="Склад",
+    )
+    retail_percent = models.DecimalField(
+        max_digits=5, decimal_places=2, default=Decimal("0.00"),
+        verbose_name="Процент с розницы",
+    )
+    wholesale_percent = models.DecimalField(
+        max_digits=5, decimal_places=2, default=Decimal("0.00"),
+        verbose_name="Процент с опта",
+    )
+    updated_at = models.DateTimeField(auto_now=True, verbose_name="Обновлено")
+    updated_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="+", verbose_name="Кем обновлено",
+    )
+
+    class Meta:
+        verbose_name = "Ставка зарплаты по складу"
+        verbose_name_plural = "Ставки зарплаты по складам"
+        indexes = [models.Index(fields=["company"])]
+
+    def __str__(self):
+        return f"SalaryRate {self.warehouse_id}: retail={self.retail_percent} wholesale={self.wholesale_percent}"
+
+    def clean(self):
+        for field in ("retail_percent", "wholesale_percent"):
+            val = getattr(self, field, None)
+            if val is None:
+                continue
+            if val < Decimal("0") or val > Decimal("100"):
+                raise ValidationError({field: "Процент должен быть от 0 до 100"})
+        if self.warehouse_id and self.company_id and self.warehouse.company_id != self.company_id:
+            raise ValidationError({"warehouse": "Склад принадлежит другой компании."})
+
+    def percent_for(self, *, is_wholesale: bool) -> Decimal:
+        return Decimal(self.wholesale_percent if is_wholesale else self.retail_percent or Decimal("0.00"))
+
+
+class AgentSalaryAccrual(models.Model):
+    """
+    Начисление вознаграждения агенту за продажу со склада-источника.
+    percent — снимок ставки в момент продажи; amount = sale_amount * percent / 100.
+    """
+    class Status(models.TextChoices):
+        PENDING = "pending", "Ожидает оплаты (долг)"
+        ACCRUED = "accrued", "Начислено (к выплате)"
+        PAID = "paid", "Выплачено"
+        CANCELED = "canceled", "Отменено"
+
+    class SaleType(models.TextChoices):
+        RETAIL = "retail", "Розница"
+        WHOLESALE = "wholesale", "Опт"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    company = models.ForeignKey(
+        "users.Company", on_delete=models.CASCADE,
+        related_name="agent_salary_accruals", verbose_name="Компания",
+    )
+    agent = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.CASCADE,
+        related_name="warehouse_salary_accruals", verbose_name="Агент",
+    )
+    sale = models.ForeignKey(
+        "warehouse.Document", on_delete=models.CASCADE,
+        related_name="salary_accruals", verbose_name="Продажа (документ)",
+    )
+    warehouse = models.ForeignKey(
+        "warehouse.Warehouse", on_delete=models.PROTECT,
+        related_name="salary_accruals", verbose_name="Склад-источник",
+    )
+    sale_type = models.CharField(max_length=16, choices=SaleType.choices, verbose_name="Тип продажи")
+    sale_amount = models.DecimalField(max_digits=12, decimal_places=2, verbose_name="База начисления")
+    percent = models.DecimalField(max_digits=5, decimal_places=2, verbose_name="Ставка (снимок), %")
+    amount = models.DecimalField(max_digits=12, decimal_places=2, verbose_name="Сумма начисления")
+    status = models.CharField(
+        max_length=16, choices=Status.choices,
+        default=Status.ACCRUED, db_index=True, verbose_name="Статус",
+    )
+    is_correction = models.BooleanField(
+        default=False, verbose_name="Корректирующее начисление",
+        help_text="True — запись-корректировка (напр. отрицательная при возврате уже выплаченного).",
+    )
+    payout = models.ForeignKey(
+        "warehouse.AgentSalaryPayout", null=True, blank=True,
+        on_delete=models.SET_NULL, related_name="accruals", verbose_name="Выплата",
+    )
+    created_at = models.DateTimeField(auto_now_add=True, db_index=True, verbose_name="Создано")
+    updated_at = models.DateTimeField(auto_now=True, verbose_name="Обновлено")
+
+    class Meta:
+        verbose_name = "Начисление зарплаты агента"
+        verbose_name_plural = "Начисления зарплаты агентов"
+        ordering = ["-created_at"]
+        constraints = [
+            # Идемпотентность: одно активное базовое начисление на пару
+            # (продажа, склад-источник). Отменённые (canceled) слот не занимают —
+            # это позволяет пересоздать начисление после распроведения/повторного
+            # проведения документа. Корректирующие записи не ограничиваем.
+            models.UniqueConstraint(
+                fields=["sale", "warehouse"],
+                condition=Q(is_correction=False) & ~Q(status="canceled"),
+                name="uq_agent_salary_accrual_sale_warehouse_base",
+            ),
+        ]
+        indexes = [
+            models.Index(fields=["company", "agent", "status"]),
+            models.Index(fields=["company", "status"]),
+            models.Index(fields=["agent", "status"]),
+            models.Index(fields=["company", "created_at"]),
+        ]
+
+    def __str__(self):
+        return f"Accrual {self.agent_id} {self.amount} [{self.status}]"
+
+
+class AgentSalaryPayout(models.Model):
+    """
+    Выплата агенту. Закрывает начисления в статусе accrued по FIFO.
+    """
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    company = models.ForeignKey(
+        "users.Company", on_delete=models.CASCADE,
+        related_name="agent_salary_payouts", verbose_name="Компания",
+    )
+    agent = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.CASCADE,
+        related_name="warehouse_salary_payouts", verbose_name="Агент",
+    )
+    amount = models.DecimalField(max_digits=12, decimal_places=2, verbose_name="Сумма выплаты")
+    comment = models.CharField(max_length=255, blank=True, default="", verbose_name="Комментарий")
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True,
+        related_name="+", verbose_name="Кем создано",
+    )
+    created_at = models.DateTimeField(auto_now_add=True, db_index=True, verbose_name="Создано")
+
+    class Meta:
+        verbose_name = "Выплата зарплаты агенту"
+        verbose_name_plural = "Выплаты зарплаты агентам"
+        ordering = ["-created_at"]
+        indexes = [
+            models.Index(fields=["company", "agent", "created_at"]),
+        ]
+
+    def __str__(self):
+        return f"Payout {self.agent_id} {self.amount}"
