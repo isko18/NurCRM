@@ -11,6 +11,17 @@ from apps.main.inventory_views import (
     ProductInventorySessionApplyAPIView,
     ProductInventorySessionCancelAPIView,
 )
+from apps.main.production_salary_views import (
+    ProductionRateListAPIView,
+    ProductionRateDetailAPIView,
+    ProductionPieceRateListAPIView,
+    ProductionPieceRateDetailAPIView,
+    ProductionWorkSessionListCreateAPIView,
+    ProductionWorkSessionDetailAPIView,
+    ProductionAccrualListAPIView,
+    ProductionSalarySummaryAPIView,
+    ProductionPayoutListCreateAPIView,
+)
 
 
 urlpatterns = [
@@ -69,6 +80,18 @@ urlpatterns = [
     # 🔹 Журнал движения склада (read-only)
     path("stock-movements/", StockMovementListAPIView.as_view(), name="stock-movement-list"),
     path("stock-movements/<uuid:pk>/", StockMovementDetailAPIView.as_view(), name="stock-movement-detail"),
+    path("production/report/", ProductionReportListAPIView.as_view(), name="production-report"),
+
+    # Зарплата в производстве
+    path("production/salary/rates/", ProductionRateListAPIView.as_view(), name="production-salary-rates"),
+    path("production/salary/rates/<uuid:employee_id>/", ProductionRateDetailAPIView.as_view(), name="production-salary-rate-detail"),
+    path("production/salary/piece-rates/", ProductionPieceRateListAPIView.as_view(), name="production-salary-piece-rates"),
+    path("production/salary/piece-rates/<uuid:product_id>/", ProductionPieceRateDetailAPIView.as_view(), name="production-salary-piece-rate-detail"),
+    path("production/salary/work-sessions/", ProductionWorkSessionListCreateAPIView.as_view(), name="production-salary-work-sessions"),
+    path("production/salary/work-sessions/<uuid:pk>/", ProductionWorkSessionDetailAPIView.as_view(), name="production-salary-work-session-detail"),
+    path("production/salary/accruals/", ProductionAccrualListAPIView.as_view(), name="production-salary-accruals"),
+    path("production/salary/summary/", ProductionSalarySummaryAPIView.as_view(), name="production-salary-summary"),
+    path("production/salary/payouts/", ProductionPayoutListCreateAPIView.as_view(), name="production-salary-payouts"),
 
     # Инвентаризация товаров (остаток Product.quantity)
     path("inventory/sessions/", ProductInventorySessionListCreateAPIView.as_view(), name="product-inventory-session-list"),
@@ -239,6 +262,7 @@ urlpatterns = [
     
     path("items-make/", ItemListCreateAPIView.as_view(), name="item-make-list-create"),
     path("items-make/<uuid:pk>/process/", ItemMakeProcessAPIView.as_view(), name="item-make-process"),
+    path("items-make/<uuid:pk>/purchase/", ItemMakePurchaseAPIView.as_view(), name="item-make-purchase"),
     path("items-make/<uuid:pk>/", ItemRetrieveUpdateDestroyAPIView.as_view(), name="item-make-detail"),
 
     # -------------------------
@@ -248,6 +272,7 @@ urlpatterns = [
     path("suppliers/receipts/", SupplierReceiptListAPIView.as_view(), name="supplier-receipts"),
     path("suppliers/receipts/<uuid:pk>/", SupplierReceiptRetrieveAPIView.as_view(), name="supplier-receipt-detail"),
     path("suppliers/<uuid:supplier_id>/products/", SupplierProductsListAPIView.as_view(), name="supplier-products"),
+    path("suppliers/<uuid:supplier_id>/purchases/", SupplierPurchasesListAPIView.as_view(), name="supplier-purchases"),
     path("suppliers/<uuid:supplier_id>/receipt/", SupplierReceiptAPIView.as_view(), name="supplier-receipt"),
     
     

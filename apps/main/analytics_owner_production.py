@@ -727,12 +727,27 @@ def build_owner_analytics_payload(*, company, branch, period, date_from, date_to
         for r in expense_breakdown_qs
     ]
 
+    # ======================================================
+    # Прочие расходы и чистая прибыль: gross_profit − расходы кассы за период.
+    # Закупки не вычитаются повторно: в производстве они не проводятся через кассу
+    # (SupplierReceipt / Acceptance не создают CashFlow), поэтому в COGS и в cfqs
+    # не может попасть одна и та же сумма.
+    # ======================================================
+    other_expenses_dec = cfqs.aggregate(
+        s=Coalesce(Sum("amount"), ZERO_MONEY)
+    )["s"] or Decimal("0.00")
+    net_profit_dec = gross_profit_dec - other_expenses_dec
+    net_margin_pct = Decimal("0.00")
+    if revenue_dec and revenue_dec > 0:
+        net_margin_pct = (net_profit_dec / revenue_dec * Decimal("100")).quantize(Decimal("0.01"))
+
     users_count = User.objects.filter(company=company).count()
 
     # summary — ключи для карточек дашборда (подписи UI):
     # users_count — пользователи компании; transfers_count / items_transferred — перемещения за период;
     # acceptances_count — приёмки; defective_items — брак (возвраты агента, принятые); sales_count / sales_amount / discounts_total — продажи;
     # revenue, cost_of_goods_sold, gross_profit, gross_margin_percent — выручка по строкам чека − COGS, маржа %;
+    # other_expenses_total — расходы кассы (approved) за период; net_profit / net_margin_percent — валовая − эти расходы;
     # stock_value (=stock_purchase_value), stock_retail_value — Σ(quantity×цена) по Product (без kind=service);
     # raw_material_value — Σ(quantity×price) по ItemMake; accounts_receivable (+ разбивка *_client_deals / *_pos_sales);
     # accounts_payable — кредиторская (склад + building); total_debt — остаток рассрочки ClientDeal(kind=debt).
@@ -765,6 +780,10 @@ def build_owner_analytics_payload(*, company, branch, period, date_from, date_to
             "cost_of_goods_sold": _money_str(cogs_dec),
             "gross_profit": _money_str(gross_profit_dec),
             "gross_margin_percent": _money_str(gross_margin_pct),
+            # Чистая прибыль: валовая − прочие расходы кассы (аренда, ЗП, транспорт и т.п.)
+            "other_expenses_total": _money_str(other_expenses_dec),
+            "net_profit": _money_str(net_profit_dec),
+            "net_margin_percent": _money_str(net_margin_pct),
             # склад
             "stock_value": _money_str(stock_value_dec),  # закупочная стоимость остатков
             "stock_purchase_value": _money_str(stock_value_dec),  # alias для новой карточки

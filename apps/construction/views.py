@@ -371,6 +371,8 @@ class CashboxDetailView(CompanyBranchScopedMixin, generics.RetrieveUpdateDestroy
 # ─────────────────────────────────────────────────────────────
 class CashFlowListPagination(PageNumberPagination):
     page_size_query_param = "page_size"
+    # Без верхней границы ?page_size=100000 выгружает всю кассу одним запросом.
+    max_page_size = 200
 
 
 class CashFlowListCreateView(CompanyBranchScopedMixin, generics.ListCreateAPIView):
@@ -446,9 +448,12 @@ class CashFlowListCreateView(CompanyBranchScopedMixin, generics.ListCreateAPIVie
             }
             field = allowed.get(ordering.lstrip("-"))
             if field:
-                qs = qs.order_by(("-" if ordering.startswith("-") else "") + field)
+                qs = qs.order_by(("-" if ordering.startswith("-") else "") + field, "-id")
+                return qs
 
-        return qs
+        # Пагинация требует полного порядка: created_at у операций одной секунды
+        # совпадает, и без тай-брейка по id строки «прыгают» между страницами.
+        return qs.order_by("-created_at", "-id")
 
     def perform_create(self, serializer):
         self._inject_company_branch_on_save(serializer)

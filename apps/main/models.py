@@ -2,7 +2,7 @@ from django.db import models
 from django.core.exceptions import ValidationError
 from django.utils import timezone
 from django.conf import settings
-from django.core.validators import MinValueValidator
+from django.core.validators import MinValueValidator, MaxValueValidator
 from decimal import Decimal, ROUND_HALF_UP
 from datetime import timedelta
 from dateutil.relativedelta import relativedelta
@@ -5092,3 +5092,415 @@ def record_stock_movement(*, company, type, object_id, created_by,
         ref_type=ref_type or "",
         ref_id=ref_id,
     )
+
+
+class ProductionRecord(models.Model):
+    """
+    Журнал производства ГП из сырья (вкладка «Производство» на складе).
+
+    Записи создаёт бэкенд при изготовлении товара по рецепту; UI — только чтение.
+    Имена товара/автора — снимки на момент производства, чтобы журнал оставался
+    самодостаточным при переименовании и удалении.
+
+    Закупка готового товара (без рецепта) производством не считается и сюда не пишется.
+    """
+
+    class Shift(models.TextChoices):
+        DAY = "day", "День"
+        NIGHT = "night", "Ночь"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    company = models.ForeignKey(
+        Company, on_delete=models.CASCADE, related_name="production_records", verbose_name="Компания",
+    )
+    branch = models.ForeignKey(
+        Branch, on_delete=models.CASCADE, related_name="crm_production_records",
+        null=True, blank=True, db_index=True, verbose_name="Филиал",
+    )
+
+    product = models.ForeignKey(
+        "main.Product", on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="production_records", verbose_name="Товар",
+    )
+    product_name = models.CharField("Товар (снимок)", max_length=255, blank=True, default="")
+
+    quantity = models.DecimalField("Произведено", max_digits=14, decimal_places=3)
+    unit = models.CharField("Единица", max_length=32, blank=True, default="")
+    cost_total = models.DecimalField(
+        "Себестоимость (сумма списанного сырья)", max_digits=12, decimal_places=2,
+        default=Decimal("0.00"),
+    )
+
+    produced_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="production_records", verbose_name="Автор",
+    )
+    produced_by_name = models.CharField("Автор (снимок)", max_length=255, blank=True, default="")
+
+    produced_at = models.DateTimeField("Дата производства", default=timezone.now, db_index=True)
+    shift = models.CharField("Смена", max_length=8, choices=Shift.choices, db_index=True)
+
+    class Meta:
+        verbose_name = "Производство"
+        verbose_name_plural = "Журнал производства"
+        ordering = ["-produced_at"]
+        indexes = [
+            models.Index(fields=["company", "produced_at"]),
+            models.Index(fields=["company", "shift"]),
+        ]
+
+    def __str__(self):
+        return f"{self.product_name or self.product_id}: {self.quantity} ({self.get_shift_display()})"
+
+
+# Границы смен в местном времени компании: день 08:00:00–19:59:59, остальное — ночь.
+DAY_SHIFT_START_HOUR = 8
+DAY_SHIFT_END_HOUR = 20
+
+
+def production_shift_for(dt) -> str:
+    """Смена по местному времени: 08:00–19:59:59 — день, иначе ночь."""
+    local_hour = timezone.localtime(dt).hour
+    if DAY_SHIFT_START_HOUR <= local_hour < DAY_SHIFT_END_HOUR:
+        return ProductionRecord.Shift.DAY
+    return ProductionRecord.Shift.NIGHT
+
+
+def record_production(*, company, product, quantity, produced_by,
+                      branch=None, unit="", cost_total=Decimal("0.00"), produced_at=None):
+    """
+    Пишет запись в журнал производства. Вызывать ВНУТРИ транзакции операции.
+    Смена вычисляется от produced_at по местному времени.
+
+    Здесь же начисляется сдельная зарплата: это единственная точка, через которую
+    проходит любое производство, поэтому хук стоит тут, а не в каждой вьюхе.
+    """
+    moment = produced_at or timezone.now()
+    record = ProductionRecord.objects.create(
+        company=company,
+        branch=branch,
+        product=product,
+        product_name=getattr(product, "name", "") or "",
+        quantity=quantity,
+        unit=unit or getattr(product, "unit", "") or "",
+        cost_total=cost_total or Decimal("0.00"),
+        produced_by=produced_by,
+        produced_by_name=_user_display_name(produced_by),
+        produced_at=moment,
+        shift=production_shift_for(moment),
+    )
+
+    # Локальный импорт: services зависят от models, обратная связь только здесь.
+    from apps.main.production_salary_services import create_piece_accrual
+
+    create_piece_accrual(record)
+    return record
+
+
+class SupplierPurchase(models.Model):
+    """
+    Журнал закупок у поставщика (история отношений в карточке поставщика).
+
+    Пишется в момент операции снимком: сырьё (ItemMake), докупка сырья,
+    закупка готового товара (create-manual с поставщиком), оприходование магазина.
+    Последующее изменение товара историю не меняет.
+    """
+
+    class PaymentType(models.TextChoices):
+        CASH = "cash", "Наличные"
+        TRANSFER = "transfer", "Перевод"
+        DEBT = "debt", "Долг"
+        PREPAYMENT = "prepayment", "Предоплата"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    company = models.ForeignKey(
+        Company, on_delete=models.CASCADE, related_name="supplier_purchases", verbose_name="Компания",
+    )
+    branch = models.ForeignKey(
+        Branch, on_delete=models.CASCADE, related_name="crm_supplier_purchases",
+        null=True, blank=True, db_index=True, verbose_name="Филиал",
+    )
+    supplier = models.ForeignKey(
+        "main.Client", on_delete=models.CASCADE, related_name="purchases",
+        db_index=True, verbose_name="Поставщик",
+    )
+
+    # Что закуплено: товар или сырьё (одно из двух; имя — снимок).
+    product = models.ForeignKey(
+        "main.Product", on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="supplier_purchases", verbose_name="Товар",
+    )
+    item_make = models.ForeignKey(
+        "main.ItemMake", on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="supplier_purchases", verbose_name="Сырьё",
+    )
+    product_name = models.CharField("Наименование (снимок)", max_length=255, blank=True, default="")
+
+    quantity = models.DecimalField("Количество", max_digits=14, decimal_places=3)
+    unit = models.CharField("Единица", max_length=50, blank=True, default="")
+    unit_price = models.DecimalField("Цена за единицу", max_digits=12, decimal_places=2, default=Decimal("0.00"))
+    amount = models.DecimalField("Сумма", max_digits=14, decimal_places=2, default=Decimal("0.00"))
+
+    payment_type = models.CharField(
+        "Тип оплаты", max_length=12, choices=PaymentType.choices,
+        default=PaymentType.CASH, db_index=True,
+    )
+    purchased_at = models.DateTimeField("Дата закупки", default=timezone.now, db_index=True)
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="supplier_purchases_created", verbose_name="Кто оформил",
+    )
+
+    class Meta:
+        verbose_name = "Закупка у поставщика"
+        verbose_name_plural = "История закупок у поставщиков"
+        ordering = ["-purchased_at"]
+        indexes = [
+            models.Index(fields=["company", "supplier", "purchased_at"]),
+        ]
+
+    def __str__(self):
+        return f"{self.product_name}: {self.quantity} × {self.unit_price}"
+
+
+def record_supplier_purchase(*, company, supplier, quantity, unit_price, created_by,
+                             branch=None, product=None, item_make=None, product_name="",
+                             unit="", payment_type=None, purchased_at=None):
+    """
+    Пишет строку в журнал закупок. Вызывать ВНУТРИ транзакции операции.
+    Без поставщика или с нулевым количеством запись не создаётся.
+    """
+    if supplier is None:
+        return None
+
+    qty = Decimal(str(quantity or 0))
+    if qty <= 0:
+        return None
+
+    price = Decimal(str(unit_price or 0)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    source = product or item_make
+    return SupplierPurchase.objects.create(
+        company=company,
+        branch=branch,
+        supplier=supplier,
+        product=product,
+        item_make=item_make,
+        product_name=product_name or getattr(source, "name", "") or "",
+        quantity=qty,
+        unit=unit or getattr(source, "unit", "") or "",
+        unit_price=price,
+        amount=(qty * price).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP),
+        payment_type=payment_type or SupplierPurchase.PaymentType.CASH,
+        purchased_at=purchased_at or timezone.now(),
+        created_by=created_by,
+    )
+
+
+# ─────────────────────────────────────────────────────────────
+# Зарплата в производстве: почасовой оклад + сдельная оплата
+# ─────────────────────────────────────────────────────────────
+class ProductionEmployeeRate(models.Model):
+    """Почасовая ставка сотрудника (сом/час)."""
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    company = models.ForeignKey(
+        Company, on_delete=models.CASCADE, related_name="production_employee_rates", verbose_name="Компания",
+    )
+    employee = models.OneToOneField(
+        settings.AUTH_USER_MODEL, on_delete=models.CASCADE,
+        related_name="production_rate", verbose_name="Сотрудник",
+    )
+    hourly_rate = models.DecimalField(
+        "Ставка, сом/час", max_digits=10, decimal_places=2, default=Decimal("0.00"),
+        validators=[MinValueValidator(Decimal("0"))],
+    )
+    updated_at = models.DateTimeField(auto_now=True)
+    updated_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="production_rates_updated", verbose_name="Кем изменено",
+    )
+
+    class Meta:
+        verbose_name = "Ставка сотрудника (производство)"
+        verbose_name_plural = "Ставки сотрудников (производство)"
+
+    def __str__(self):
+        return f"{_user_display_name(self.employee)}: {self.hourly_rate}/час"
+
+
+class ProductionPieceRate(models.Model):
+    """Сдельная ставка за единицу произведённого товара (сом/шт)."""
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    company = models.ForeignKey(
+        Company, on_delete=models.CASCADE, related_name="production_piece_rates", verbose_name="Компания",
+    )
+    product = models.ForeignKey(
+        "main.Product", on_delete=models.CASCADE, related_name="piece_rates", verbose_name="Товар",
+    )
+    amount_per_unit = models.DecimalField(
+        "Сдельно, сом/ед.", max_digits=10, decimal_places=2, default=Decimal("0.00"),
+        validators=[MinValueValidator(Decimal("0"))],
+    )
+    updated_at = models.DateTimeField(auto_now=True)
+    updated_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="production_piece_rates_updated", verbose_name="Кем изменено",
+    )
+
+    class Meta:
+        verbose_name = "Сдельная ставка (производство)"
+        verbose_name_plural = "Сдельные ставки (производство)"
+        constraints = [
+            models.UniqueConstraint(fields=["company", "product"], name="uq_production_piece_rate"),
+        ]
+
+    def __str__(self):
+        return f"{self.product_id}: {self.amount_per_unit}/ед."
+
+
+class ProductionWorkSession(models.Model):
+    """Табель: сколько часов сотрудник отработал в конкретный день."""
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    company = models.ForeignKey(
+        Company, on_delete=models.CASCADE, related_name="production_work_sessions", verbose_name="Компания",
+    )
+    employee = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.CASCADE,
+        related_name="production_work_sessions", verbose_name="Сотрудник",
+    )
+    date = models.DateField("Рабочий день", db_index=True)
+    hours = models.DecimalField(
+        "Отработано часов", max_digits=6, decimal_places=2,
+        validators=[MinValueValidator(Decimal("0.01")), MaxValueValidator(Decimal("24"))],
+    )
+    comment = models.CharField("Комментарий", max_length=255, blank=True, default="")
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="production_work_sessions_created", verbose_name="Кто внёс",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = "Табель (производство)"
+        verbose_name_plural = "Табель (производство)"
+        ordering = ["-date", "-created_at"]
+        constraints = [
+            models.UniqueConstraint(fields=["company", "employee", "date"], name="uq_production_work_session_day"),
+        ]
+        indexes = [
+            models.Index(fields=["company", "date"]),
+        ]
+
+    def __str__(self):
+        return f"{_user_display_name(self.employee)} {self.date}: {self.hours} ч"
+
+
+class ProductionSalaryAccrual(models.Model):
+    """
+    Начисление зарплаты: за часы (hourly) или за выработку (piece).
+
+    Ставки хранятся снимком на момент начисления — изменение ставки
+    не пересчитывает прошлые начисления.
+    """
+
+    class Kind(models.TextChoices):
+        HOURLY = "hourly", "За часы"
+        PIECE = "piece", "Сдельно"
+
+    class Status(models.TextChoices):
+        ACCRUED = "accrued", "Начислено"
+        PAID = "paid", "Выплачено"
+        CANCELED = "canceled", "Отменено"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    company = models.ForeignKey(
+        Company, on_delete=models.CASCADE, related_name="production_salary_accruals", verbose_name="Компания",
+    )
+    employee = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.CASCADE,
+        related_name="production_salary_accruals", verbose_name="Сотрудник",
+    )
+    kind = models.CharField("Тип", max_length=10, choices=Kind.choices, db_index=True)
+
+    # hourly
+    work_session = models.ForeignKey(
+        ProductionWorkSession, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="accruals", verbose_name="Табель",
+    )
+    hours = models.DecimalField("Часы", max_digits=6, decimal_places=2, null=True, blank=True)
+    rate = models.DecimalField("Ставка, сом/час (снимок)", max_digits=10, decimal_places=2, null=True, blank=True)
+
+    # piece
+    production_record = models.ForeignKey(
+        ProductionRecord, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="salary_accruals", verbose_name="Производство",
+    )
+    product = models.ForeignKey(
+        "main.Product", on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="production_salary_accruals", verbose_name="Товар",
+    )
+    quantity = models.DecimalField("Количество", max_digits=12, decimal_places=3, null=True, blank=True)
+    amount_per_unit = models.DecimalField(
+        "Сдельно, сом/ед. (снимок)", max_digits=10, decimal_places=2, null=True, blank=True,
+    )
+
+    amount = models.DecimalField("Сумма", max_digits=12, decimal_places=2, default=Decimal("0.00"))
+    status = models.CharField(
+        "Статус", max_length=10, choices=Status.choices, default=Status.ACCRUED, db_index=True,
+    )
+    payout = models.ForeignKey(
+        "main.ProductionSalaryPayout", on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="accruals", verbose_name="Выплата",
+    )
+    created_at = models.DateTimeField(auto_now_add=True, db_index=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = "Начисление зарплаты (производство)"
+        verbose_name_plural = "Начисления зарплаты (производство)"
+        ordering = ["-created_at"]
+        indexes = [
+            models.Index(fields=["company", "employee", "status"]),
+            models.Index(fields=["company", "created_at"]),
+        ]
+
+    def __str__(self):
+        return f"{self.get_kind_display()} {_user_display_name(self.employee)}: {self.amount}"
+
+
+class ProductionSalaryPayout(models.Model):
+    """Выплата зарплаты: закрывает начисления FIFO и создаёт расход кассы."""
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    company = models.ForeignKey(
+        Company, on_delete=models.CASCADE, related_name="production_salary_payouts", verbose_name="Компания",
+    )
+    employee = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.CASCADE,
+        related_name="production_salary_payouts", verbose_name="Сотрудник",
+    )
+    amount = models.DecimalField("Сумма", max_digits=12, decimal_places=2)
+    cashbox = models.ForeignKey(
+        "construction.Cashbox", on_delete=models.PROTECT,
+        related_name="production_salary_payouts", verbose_name="Касса",
+    )
+    comment = models.CharField("Комментарий", max_length=255, blank=True, default="")
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="production_salary_payouts_created", verbose_name="Кто выплатил",
+    )
+    created_at = models.DateTimeField(auto_now_add=True, db_index=True)
+
+    class Meta:
+        verbose_name = "Выплата зарплаты (производство)"
+        verbose_name_plural = "Выплаты зарплаты (производство)"
+        ordering = ["-created_at"]
+        indexes = [
+            models.Index(fields=["company", "employee", "created_at"]),
+        ]
+
+    def __str__(self):
+        return f"Зарплата {_user_display_name(self.employee)}: {self.amount}"

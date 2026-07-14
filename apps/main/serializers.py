@@ -26,6 +26,8 @@ from apps.main.models import (
     Inventory, InventoryItem,
     StockShortageEvent,
     StockMovement,
+    ProductionRecord,
+    SupplierPurchase,
 )
 
 from apps.consalting.models import ServicesConsalting
@@ -2630,6 +2632,41 @@ class StockMovementReadSerializer(serializers.ModelSerializer):
             "sender_id", "sender_name", "receiver_id", "receiver_name",
             "created_by_name", "comment", "ref_type", "ref_id",
         ]
+
+
+class SupplierPurchaseReadSerializer(serializers.ModelSerializer):
+    """Read-only история закупок в карточке поставщика."""
+    purchased_at = serializers.SerializerMethodField()
+
+    class Meta:
+        model = SupplierPurchase
+        fields = [
+            "id", "product_name", "quantity", "unit", "amount",
+            "payment_type", "purchased_at",
+        ]
+
+    def get_purchased_at(self, obj) -> str | None:
+        if not obj.purchased_at:
+            return None
+        return timezone.localtime(obj.purchased_at).strftime("%Y-%m-%dT%H:%M:%S")
+
+
+class ProductionRecordReadSerializer(serializers.ModelSerializer):
+    """Read-only журнал производства (вкладка «Производство»)."""
+    produced_at = serializers.SerializerMethodField()
+
+    class Meta:
+        model = ProductionRecord
+        fields = [
+            "id", "product", "product_name", "quantity", "unit", "cost_total",
+            "produced_by", "produced_by_name", "produced_at", "shift",
+        ]
+
+    def get_produced_at(self, obj) -> str | None:
+        # Местное время компании без смещения — договорённость docs/market/analytics.md.
+        if not obj.produced_at:
+            return None
+        return timezone.localtime(obj.produced_at).strftime("%Y-%m-%dT%H:%M:%S")
 
 
 class ItemMakeProcessSerializer(serializers.Serializer):

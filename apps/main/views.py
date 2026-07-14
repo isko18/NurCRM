@@ -1,4 +1,4 @@
-from decimal import Decimal, ROUND_HALF_UP
+from decimal import Decimal, ROUND_HALF_UP, InvalidOperation
 from uuid import UUID, uuid4
 
 from django.db import transaction, IntegrityError
@@ -59,6 +59,10 @@ from apps.main.models import (
     StockShortageEvent,
     StockMovement,
     record_stock_movement,
+    ProductionRecord,
+    record_production,
+    SupplierPurchase,
+    record_supplier_purchase,
 )
 from apps.main.serializers import (
     ContactSerializer, PipelineSerializer, DealSerializer, TaskSerializer,
@@ -90,6 +94,8 @@ from apps.main.serializers import (
     StockShortageEventReadSerializer,
     StockShortageEventCreateSerializer,
     StockMovementReadSerializer,
+    ProductionRecordReadSerializer,
+    SupplierPurchaseReadSerializer,
 )
 from django.db.models import ProtectedError
 from apps.utils import product_images_prefetch, _is_owner_like
@@ -131,6 +137,17 @@ def _calc_markup(purchase_price: Decimal, price: Decimal) -> Decimal:
     # ВАЖНО: наценка хранится точнее (4 знака), иначе при обратном пересчёте цены
     # (purchase_price + markup_percent) будут появляться «копейки» из-за округления процента.
     return mp.quantize(_Q4, rounding=ROUND_HALF_UP)
+
+
+def _parse_payment_type(raw):
+    """
+    payment_type закупки: cash | transfer | debt | prepayment.
+    Не передан или не распознан → cash (фронт шлёт поле не везде).
+    """
+    v = str(raw or "").strip().lower()
+    if v in SupplierPurchase.PaymentType.values:
+        return v
+    return SupplierPurchase.PaymentType.CASH
 
 
 def _parse_recipe_input(recipe_input):
@@ -1514,6 +1531,21 @@ class ProductCreateManualAPIView(CompanyBranchRestrictedMixin, generics.CreateAP
             # Also set the M2M item_make for backward compat
             product.item_make.set(list(ims_map.values()))
 
+            # Журнал производства: ГП изготовлена из сырья (закупка готового товара сюда не попадает).
+            # Себестоимость — стоимость фактически списанного сырья.
+            if product_qty > 0:
+                record_production(
+                    company=company,
+                    branch=branch,
+                    product=product,
+                    quantity=product_qty,
+                    unit=product.unit or "",
+                    cost_total=(
+                        calc_recipe_unit_cost(recipe_entries, ims_map) * product_qty
+                    ).quantize(_Q2, rounding=ROUND_HALF_UP),
+                    produced_by=request.user,
+                )
+
         else:
             # Backward compatibility: handle old item_make field (no recipe)
             item_make_input = data.get("item_make") or data.get("item_make_ids")
@@ -1532,6 +1564,38 @@ class ProductCreateManualAPIView(CompanyBranchRestrictedMixin, generics.CreateAP
                         status=status.HTTP_400_BAD_REQUEST,
                     )
                 product.item_make.set(ims)
+
+                # Legacy-поток без рецепта: сырьё не списывается, но товар изготовлен из сырья —
+                # для отчёта это производство. Себестоимость берём из закупочной цены товара.
+                legacy_qty = Decimal(str(product.quantity or 0))
+                if legacy_qty > 0:
+                    record_production(
+                        company=company,
+                        branch=branch,
+                        product=product,
+                        quantity=legacy_qty,
+                        unit=product.unit or "",
+                        cost_total=(
+                            Decimal(str(product.purchase_price or 0)) * legacy_qty
+                        ).quantize(_Q2, rounding=ROUND_HALF_UP),
+                        produced_by=request.user,
+                    )
+
+        # Закупка готового товара у поставщика (без рецепта и без сырья) — в историю закупок.
+        # Товар, изготовленный из сырья, закупкой не является: за него платили при закупке сырья.
+        is_produced = bool(recipe_entries) or bool(data.get("item_make") or data.get("item_make_ids"))
+        if client is not None and not is_produced:
+            record_supplier_purchase(
+                company=company,
+                branch=branch,
+                supplier=client,
+                product=product,
+                quantity=product.quantity,
+                unit=product.unit or "",
+                unit_price=product.purchase_price,
+                payment_type=_parse_payment_type(data.get("payment_type")),
+                created_by=request.user,
+            )
 
         # packages
         packages_to_create = []
@@ -3087,7 +3151,23 @@ class ItemListCreateAPIView(CompanyBranchRestrictedMixin, generics.ListCreateAPI
 
         return qs
 
-    # perform_create — миксин
+    def perform_create(self, serializer):
+        # company/branch проставит миксин
+        super().perform_create(serializer)
+
+        # Новая позиция сырья с поставщиком — это закупка: пишем в историю поставщика.
+        item = serializer.instance
+        record_supplier_purchase(
+            company=item.company,
+            branch=item.branch,
+            supplier=item.supplier,
+            item_make=item,
+            quantity=item.quantity,
+            unit=item.unit or "",
+            unit_price=item.price,
+            payment_type=_parse_payment_type(self.request.data.get("payment_type")),
+            created_by=self.request.user,
+        )
 
 
 class ItemRetrieveUpdateDestroyAPIView(CompanyBranchRestrictedMixin, generics.RetrieveUpdateDestroyAPIView):
@@ -3097,6 +3177,71 @@ class ItemRetrieveUpdateDestroyAPIView(CompanyBranchRestrictedMixin, generics.Re
     def get_queryset(self):
         qs = super().get_queryset().select_related("source", "supplier")
         return qs
+
+
+class ItemMakePurchaseAPIView(CompanyBranchRestrictedMixin, APIView):
+    """
+    POST /api/main/items-make/<uuid:pk>/purchase/
+
+    Докупка существующего сырья: увеличивает остаток и пишет строку в историю
+    закупок поставщика. Body: {quantity, unit_price?, payment_type?, supplier?}
+
+    Отдельный эндпоинт, а не PATCH: правка карточки (в т.ч. ручная корректировка
+    остатка) не должна попадать в историю закупок.
+    """
+
+    @transaction.atomic
+    def post(self, request, pk=None):
+        company = self._company()
+        qs = self._filter_qs_company_branch(ItemMake.objects.select_related("supplier"))
+        item = get_object_or_404(qs.select_for_update(), pk=pk)
+
+        try:
+            quantity = Decimal(str(request.data.get("quantity")))
+        except (TypeError, ValueError, InvalidOperation):
+            return Response({"quantity": "Обязательное поле (число > 0)."}, status=status.HTTP_400_BAD_REQUEST)
+        if quantity <= 0:
+            return Response({"quantity": "Количество должно быть больше нуля."}, status=status.HTTP_400_BAD_REQUEST)
+
+        raw_price = request.data.get("unit_price", request.data.get("price"))
+        if raw_price in (None, ""):
+            unit_price = Decimal(str(item.price or 0))
+        else:
+            try:
+                unit_price = Decimal(str(raw_price))
+            except (TypeError, ValueError, InvalidOperation):
+                return Response({"unit_price": "Неверный формат цены."}, status=status.HTTP_400_BAD_REQUEST)
+            if unit_price < 0:
+                return Response({"unit_price": "Цена не может быть отрицательной."}, status=status.HTTP_400_BAD_REQUEST)
+
+        supplier = item.supplier
+        supplier_id = request.data.get("supplier")
+        if supplier_id:
+            supplier = get_object_or_404(Client, id=supplier_id, company=company)
+
+        item.quantity = Decimal(str(item.quantity or 0)) + quantity
+        update_fields = ["quantity", "updated_at"]
+        if raw_price not in (None, ""):
+            item.price = unit_price.quantize(_Q2, rounding=ROUND_HALF_UP)
+            update_fields.append("price")
+        if supplier is not None and supplier.id != item.supplier_id:
+            item.supplier = supplier
+            update_fields.append("supplier")
+        item.save(update_fields=update_fields)
+
+        record_supplier_purchase(
+            company=company,
+            branch=item.branch,
+            supplier=supplier,
+            item_make=item,
+            quantity=quantity,
+            unit=item.unit or "",
+            unit_price=unit_price,
+            payment_type=_parse_payment_type(request.data.get("payment_type")),
+            created_by=request.user,
+        )
+
+        return Response(ItemMakeSerializer(item, context={"request": request}).data, status=status.HTTP_200_OK)
 
 
 class ItemMakeProcessAPIView(CompanyBranchRestrictedMixin, APIView):
@@ -3186,6 +3331,69 @@ class SupplierProductsListAPIView(CompanyBranchRestrictedMixin, generics.ListAPI
 
         prod_qs = self._filter_qs_company_branch(Product.objects.all())
         return prod_qs.filter(Q(suppliers=supplier) | Q(client_id=supplier.id)).distinct()
+
+
+class SupplierPurchasesListAPIView(CompanyBranchRestrictedMixin, generics.ListAPIView):
+    """
+    GET /api/main/suppliers/<uuid:supplier_id>/purchases/
+    История закупок у поставщика. Фильтры: date_from, date_to (включительно).
+    summary — по всему периоду с учётом фильтров, не по странице.
+    """
+    permission_classes = [permissions.IsAuthenticated]
+    serializer_class = SupplierPurchaseReadSerializer
+    pagination_class = LimitOffsetPagination
+
+    def get_queryset(self):
+        supplier_id = self.kwargs.get("supplier_id")
+        sup_qs = self._filter_qs_company_branch(Client.objects.all())
+        # Не поставщик или чужая компания → 404.
+        supplier = get_object_or_404(sup_qs, id=supplier_id, type=Client.StatusClient.SUPPLIERS)
+
+        qs = SupplierPurchase.objects.filter(company=supplier.company_id, supplier=supplier)
+
+        qp = self.request.query_params
+        df_raw = (qp.get("date_from") or "").strip()
+        if df_raw:
+            df = parse_date(df_raw)
+            if df is None:
+                raise ValidationError({"date_from": ["Некорректная дата."]})
+            qs = qs.filter(purchased_at__date__gte=df)
+
+        dt_raw = (qp.get("date_to") or "").strip()
+        if dt_raw:
+            dt = parse_date(dt_raw)
+            if dt is None:
+                raise ValidationError({"date_to": ["Некорректная дата."]})
+            qs = qs.filter(purchased_at__date__lte=dt)
+
+        return qs.order_by("-purchased_at", "-id")
+
+    def list(self, request, *args, **kwargs):
+        qs = self.filter_queryset(self.get_queryset())
+
+        money = DecimalField(max_digits=14, decimal_places=2)
+        agg = qs.aggregate(
+            total_amount=Coalesce(
+                Sum("amount", output_field=money),
+                V(Decimal("0.00"), output_field=money),
+            ),
+        )
+        summary = {
+            "total_amount": str(agg["total_amount"]),
+            "total_count": qs.count(),
+        }
+
+        page = self.paginate_queryset(qs)
+        if page is not None:
+            response = self.get_paginated_response(self.get_serializer(page, many=True).data)
+            response.data["summary"] = summary
+            return response
+
+        return Response({
+            "count": summary["total_count"],
+            "summary": summary,
+            "results": self.get_serializer(qs, many=True).data,
+        })
 
 
 def _supplier_receipt_line_total_expr():
@@ -3305,6 +3513,7 @@ class SupplierReceiptAPIView(CompanyBranchRestrictedMixin, APIView):
             supplier=supplier,
             created_by=getattr(request, "user", None),
         )
+        payment_type = _parse_payment_type(request.data.get("payment_type"))
 
         # обновляем цены (если переданы) и увеличиваем остатки
         receipt_items = []
@@ -3323,6 +3532,23 @@ class SupplierReceiptAPIView(CompanyBranchRestrictedMixin, APIView):
                     qty=qty,
                     purchase_price=it.get("purchase_price"),
                 )
+            )
+
+            # История закупок поставщика: цена из строки, иначе текущая закупочная товара.
+            record_supplier_purchase(
+                company=company,
+                branch=branch,
+                supplier=supplier,
+                product=by_id[pid],
+                quantity=qty,
+                unit=getattr(by_id[pid], "unit", "") or "",
+                unit_price=(
+                    it.get("purchase_price")
+                    if it.get("purchase_price") is not None
+                    else by_id[pid].purchase_price
+                ),
+                payment_type=payment_type,
+                created_by=getattr(request, "user", None),
             )
 
         if receipt_items:
@@ -4724,6 +4950,88 @@ class StockMovementDetailAPIView(CompanyBranchRestrictedMixin, generics.Retrieve
     queryset = StockMovement.objects.select_related("company", "branch").all()
 
 
+class ProductionReportListAPIView(CompanyBranchRestrictedMixin, generics.ListAPIView):
+    """
+    GET /api/main/production/report/
+    Что произведено за период. Фильтры: date_from, date_to, shift (day|night), search.
+
+    summary считается по всему периоду с учётом фильтров, а не по текущей странице.
+    """
+    permission_classes = [permissions.IsAuthenticated]
+    serializer_class = ProductionRecordReadSerializer
+    queryset = ProductionRecord.objects.select_related("company", "branch", "product").all()
+    pagination_class = LimitOffsetPagination
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        qp = self.request.query_params
+
+        df_raw = (qp.get("date_from") or "").strip()
+        if df_raw:
+            df = parse_date(df_raw)
+            if df is None:
+                raise ValidationError({"date_from": ["Некорректная дата."]})
+            qs = qs.filter(produced_at__date__gte=df)
+
+        dt_raw = (qp.get("date_to") or "").strip()
+        if dt_raw:
+            dt = parse_date(dt_raw)
+            if dt is None:
+                raise ValidationError({"date_to": ["Некорректная дата."]})
+            qs = qs.filter(produced_at__date__lte=dt)
+
+        shift = (qp.get("shift") or "").strip().lower()
+        if shift:
+            if shift not in ProductionRecord.Shift.values:
+                raise ValidationError({"shift": ["Допустимые значения: day, night."]})
+            qs = qs.filter(shift=shift)
+
+        search = (qp.get("search") or "").strip()
+        if search:
+            qs = qs.filter(product_name__icontains=search)
+
+        return qs.order_by("-produced_at", "-id")
+
+    def _summary(self, qs) -> dict:
+        qty_field = DecimalField(max_digits=14, decimal_places=3)
+        zero_qty = V(Decimal("0.000"), output_field=qty_field)
+        money_field = DecimalField(max_digits=12, decimal_places=2)
+        zero_money = V(Decimal("0.00"), output_field=money_field)
+
+        agg = qs.aggregate(
+            total_quantity=Coalesce(Sum("quantity", output_field=qty_field), zero_qty),
+            day_quantity=Coalesce(
+                Sum("quantity", filter=Q(shift=ProductionRecord.Shift.DAY), output_field=qty_field),
+                zero_qty,
+            ),
+            night_quantity=Coalesce(
+                Sum("quantity", filter=Q(shift=ProductionRecord.Shift.NIGHT), output_field=qty_field),
+                zero_qty,
+            ),
+            total_cost=Coalesce(Sum("cost_total", output_field=money_field), zero_money),
+        )
+        return {
+            "total_quantity": str(agg["total_quantity"]),
+            "day_quantity": str(agg["day_quantity"]),
+            "night_quantity": str(agg["night_quantity"]),
+            "total_cost": str(agg["total_cost"]),
+        }
+
+    def list(self, request, *args, **kwargs):
+        qs = self.filter_queryset(self.get_queryset())
+        summary = self._summary(qs)
+
+        page = self.paginate_queryset(qs)
+        if page is not None:
+            data = self.get_serializer(page, many=True).data
+            response = self.get_paginated_response(data)
+            response.data["summary"] = summary
+            return response
+
+        data = self.get_serializer(qs, many=True).data
+        return Response({"count": qs.count(), "summary": summary, "results": data})
+
+
 # ===========================
 #  Subreal: bulk create
 # ===========================
@@ -5989,6 +6297,7 @@ class AnalyticsCardDetailsAPIView(CompanyBranchRestrictedMixin, APIView):
       - cost_of_goods_sold
       - gross_profit
       - gross_margin_percent
+      - other_expenses (alias: other_expenses_total) — только владелец/админ
       - accounts_receivable
       - accounts_payable
       - total_debt
@@ -6553,6 +6862,75 @@ class AnalyticsCardDetailsAPIView(CompanyBranchRestrictedMixin, APIView):
                 "limit": limit,
                 "totals": {
                     "sales_amount": str(sales_amount_total.quantize(_Q2, rounding=ROUND_HALF_UP)),
+                },
+                "items": items,
+            })
+
+        # ----- прочие расходы кассы (карточки other_expenses_total / net_profit) -----
+        if card in ("other_expenses", "other_expenses_total"):
+            if not _is_owner_like(request.user):
+                return Response({"detail": "Forbidden"}, status=status.HTTP_403_FORBIDDEN)
+
+            from apps.construction.models import CashFlow
+
+            p = _parse_period(request)
+            date_from = p["date_from"]
+            date_to = p["date_to"]
+            dt_from, dt_to_excl = _dt_range(date_from, date_to)
+
+            # Фильтр обязан совпадать с cfqs в build_owner_analytics_payload,
+            # иначе сумма в модалке не сойдётся с карточкой.
+            qs = CashFlow.objects.filter(
+                company=company,
+                type=CashFlow.Type.EXPENSE,
+                status=CashFlow.Status.APPROVED,
+                created_at__gte=dt_from,
+                created_at__lt=dt_to_excl,
+            )
+            if branch is not None:
+                qs = qs.filter(Q(branch=branch) | Q(branch__isnull=True))
+
+            money_field = DecimalField(max_digits=12, decimal_places=2)
+            zero_money = V(Decimal("0.00"), output_field=money_field)
+            expenses_total = qs.aggregate(s=Coalesce(Sum("amount"), zero_money))["s"] or Decimal("0.00")
+
+            qs = qs.select_related("category", "cashier", "cashbox").order_by("-created_at", "-id")
+            total_count = qs.count()
+            page = qs[offset: offset + limit]
+
+            items = []
+            for flow in page:
+                c = flow.cashier
+                cashier_name = (
+                    f"{(getattr(c, 'first_name', None) or '').strip()} {(getattr(c, 'last_name', None) or '').strip()}".strip()
+                    or getattr(c, "email", None)
+                    or ""
+                ) if c else ""
+                items.append({
+                    "id": str(flow.id),
+                    "created_at": timezone.localtime(flow.created_at).isoformat() if flow.created_at else None,
+                    "name": flow.name or "Без названия",
+                    "amount": str((flow.amount or Decimal("0.00")).quantize(_Q2, rounding=ROUND_HALF_UP)),
+                    "category": (
+                        {"id": str(flow.category_id), "title": flow.category.title}
+                        if flow.category_id else None
+                    ),
+                    "cashbox": (
+                        {"id": str(flow.cashbox_id), "name": getattr(flow.cashbox, "name", "") or ""}
+                        if flow.cashbox_id else None
+                    ),
+                    "cashier": {"id": str(flow.cashier_id), "name": cashier_name} if flow.cashier_id else None,
+                })
+
+            return Response({
+                "card": card,
+                "branch_id": str(getattr(branch, "id", "")) if branch else None,
+                "period": {"type": p["period"], "date_from": date_from, "date_to": date_to},
+                "count": total_count,
+                "offset": offset,
+                "limit": limit,
+                "totals": {
+                    "other_expenses_total": str(expenses_total.quantize(_Q2, rounding=ROUND_HALF_UP)),
                 },
                 "items": items,
             })
