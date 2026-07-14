@@ -1,0 +1,11 @@
+# Вывод collectstatic: вендорные бандлы Django admin / drf-yasg / jazzmin / rest_framework.
+# Не наш код, но давал самые жирные хабы графа (redoc.min — 482 связи) и топил query в шуме.
+static/
+
+# Одноразовые скрипты в корне, не часть архитектуры.
+a.py
+check_websocket.py
+check_prod_websocket.py
+test_websocket.py
+test_send_notification.py
+export_products.py

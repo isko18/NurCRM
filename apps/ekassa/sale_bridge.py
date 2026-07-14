@@ -107,7 +107,11 @@ def try_fiscalize_pos_sale(sale_id) -> None:
         "goods": goods,
     }
 
-    disc_ty = _som_to_tyiyun_int(Decimal(str(sale.discount_total or 0)))
+    # В goods цена строки уже нетто (line_total / qty), т.е. построчные скидки в неё зашиты.
+    # Фискально скидкой отдаём только скидку на чек, иначе строчная вычитается второй раз.
+    line_disc_sum = sum((Decimal(str(it.line_discount or 0)) for it in items), Decimal("0"))
+    order_disc = Decimal(str(sale.discount_total or 0)) - line_disc_sum
+    disc_ty = _som_to_tyiyun_int(order_disc) if order_disc > 0 else 0
     if disc_ty > 0:
         body["discount"] = str(disc_ty)
 

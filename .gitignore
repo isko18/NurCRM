@@ -183,3 +183,12 @@ cython_debug/
 #.idea/
 
 # End of https://www.toptal.com/developers/gitignore/api/django
+
+graphify-out/
+
+graphify-out/
+
+# Claude Code
+.claude/
+.claudeignore
+CLAUDE.md

@@ -64,6 +64,17 @@ def _parse_int(raw) -> int | None:
         return None
 
 
+def _parse_bool(raw) -> bool | None:
+    if raw is None:
+        return None
+    s = str(raw).strip().lower()
+    if s in ("1", "true", "yes", "on"):
+        return True
+    if s in ("0", "false", "no", "off"):
+        return False
+    return None
+
+
 def _parse_kind_list(query_params) -> list[str]:
     raw: list[str] = []
     raw.extend(query_params.getlist("kind"))
@@ -168,6 +179,10 @@ def apply_product_list_filters(qs, query_params):
     brand_id = (query_params.get("brand") or "").strip()
     if brand_id:
         qs = qs.filter(brand_id=brand_id)
+
+    is_weight = _parse_bool(query_params.get("is_weight"))
+    if is_weight is not None:
+        qs = qs.filter(is_weight=is_weight)
 
     preset = _normalize_preset(query_params.get("preset"))
     if preset:

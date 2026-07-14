@@ -12,7 +12,7 @@ from mptt.models import MPTTModel, TreeForeignKey
 import uuid, secrets
 from django.core.files.base import ContentFile
 from PIL import Image
-from django.db.models.functions import Cast, Coalesce, Greatest
+from django.db.models.functions import Cast, Coalesce, Greatest, Least
 import io
 import logging
 import json
@@ -1755,23 +1755,19 @@ class Cart(models.Model):
 
         calc_field = models.DecimalField(max_digits=24, decimal_places=6)
         zero = Value(Decimal("0.00"), output_field=calc_field)
-        base_unit = Case(
-            When(cart__is_wholesale=True, then=F("unit_price")),
-            # piece sale: product.price is the pack price, not per-piece — use unit_price as base
-            When(sale_package__isnull=False, then=F("unit_price")),
-            default=Coalesce(F("product__price"), F("unit_price"), output_field=calc_field),
+        # Подытог считается по цене продажи (unit_price), которую видит кассир.
+        # Отклонение unit_price от каталожной product.price — это не скидка,
+        # в discount_total и в чек оно попадать не должно.
+        line_base = ExpressionWrapper(F("unit_price") * F("quantity"), output_field=calc_field)
+        line_disc = Least(
+            Greatest(Coalesce(F("line_discount"), zero, output_field=calc_field), zero),
+            line_base,
             output_field=calc_field,
         )
-        line_base = ExpressionWrapper(base_unit * F("quantity"), output_field=calc_field)
-        line_actual = ExpressionWrapper(
-            (F("unit_price") * F("quantity")) - Coalesce(F("line_discount"), zero, output_field=calc_field),
-            output_field=calc_field,
-        )
-        line_diff = ExpressionWrapper(line_base - line_actual, output_field=calc_field)
 
         aggregated = self.items.aggregate(
-            subtotal=Sum(Greatest(line_base, line_actual)),
-            line_discount_total=Sum(Greatest(line_diff, zero)),
+            subtotal=Sum(line_base),
+            line_discount_total=Sum(line_disc),
         )
         subtotal = _money(aggregated.get("subtotal") or Decimal("0"))
         line_discount_total = _money(aggregated.get("line_discount_total") or Decimal("0"))
