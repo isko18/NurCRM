@@ -1,4 +1,4 @@
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 
 from django.apps import apps
 from django.db import transaction
@@ -375,6 +375,41 @@ class CashFlowListPagination(PageNumberPagination):
     max_page_size = 200
 
 
+def _csv_choices(qp, single_key: str, multi_key: str, allowed, *, error: str) -> list:
+    """
+    ?key=a или ?keys=a,b → список значений из allowed.
+    Неизвестное значение — 400, а не молча пустой список.
+    """
+    raw = (qp.get(multi_key) or qp.get(single_key) or "").strip()
+    if not raw:
+        return []
+
+    values = []
+    for chunk in raw.split(","):
+        v = chunk.strip().lower()
+        if not v:
+            continue
+        if v not in allowed:
+            raise ValidationError({single_key: [error]})
+        if v not in values:
+            values.append(v)
+    return values
+
+
+def _parse_amount(raw, field: str):
+    """Сумма для фильтра: число ≥ 0, иначе 400. Пусто → None."""
+    s = str(raw or "").strip().replace(",", ".")
+    if not s:
+        return None
+    try:
+        value = Decimal(s)
+    except (InvalidOperation, ValueError):
+        raise ValidationError({field: ["Некорректная сумма."]})
+    if value < 0:
+        raise ValidationError({field: ["Сумма не может быть отрицательной."]})
+    return value
+
+
 class CashFlowListCreateView(CompanyBranchScopedMixin, generics.ListCreateAPIView):
     queryset = CashFlow.objects.select_related(
         "company", "branch",
@@ -416,10 +451,37 @@ class CashFlowListCreateView(CompanyBranchScopedMixin, generics.ListCreateAPIVie
         if category_id:
             qs = qs.filter(category_id=category_id)
 
-        # ✅ по типу: ?type=expense|income
-        type_q = (qp.get("type") or "").strip()
-        if type_q:
-            qs = qs.filter(type=type_q)
+        # ✅ по типу: ?type=expense|income (или ?types=expense,income)
+        types = _csv_choices(
+            qp, "type", "types", CashFlow.Type.values,
+            error="Допустимые значения: income, expense.",
+        )
+        if types:
+            qs = qs.filter(type__in=types)
+
+        # ✅ по статусу: ?status=pending|approved|rejected (или ?statuses=...)
+        # pending — это «Заявки» (ожидают подтверждения).
+        statuses = _csv_choices(
+            qp, "status", "statuses", CashFlow.Status.values,
+            error="Допустимые значения: pending, approved, rejected.",
+        )
+        if statuses:
+            qs = qs.filter(status__in=statuses)
+
+        # ✅ поиск: ?search=<текст> — по названию операции и названию категории
+        search = (qp.get("search") or "").strip()
+        if search:
+            qs = qs.filter(
+                Q(name__icontains=search) | Q(category__title__icontains=search)
+            )
+
+        # ✅ по сумме: ?amount_min=100&amount_max=5000
+        amount_min = _parse_amount(qp.get("amount_min"), "amount_min")
+        if amount_min is not None:
+            qs = qs.filter(amount__gte=amount_min)
+        amount_max = _parse_amount(qp.get("amount_max"), "amount_max")
+        if amount_max is not None:
+            qs = qs.filter(amount__lte=amount_max)
 
         # ✅ по периоду (по created_at): ?date_from=YYYY-MM-DD&date_to=YYYY-MM-DD
         date_from_raw = (qp.get("date_from") or "").strip()
