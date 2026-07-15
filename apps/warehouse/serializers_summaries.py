@@ -80,6 +80,7 @@ class SummaryDetailSerializer(serializers.ModelSerializer):
     """Полный объект сводки (GET by id, POST/PATCH/regenerate ответы)."""
 
     warehouse = SummaryWarehouseSerializer(read_only=True)
+    warehouses = SummaryWarehouseSerializer(many=True, read_only=True)
     created_by = SummaryCreatedBySerializer(read_only=True)
     agents = SummaryAgentSerializer(many=True, read_only=True)
     documents = SummaryDocumentSerializer(many=True, read_only=True)
@@ -90,7 +91,8 @@ class SummaryDetailSerializer(serializers.ModelSerializer):
         model = models.WarehouseSalesSummary
         fields = (
             "id", "number", "name", "comment", "date", "type",
-            "warehouse", "created_by", "created_at", "updated_at",
+            "warehouse", "warehouses", "all_warehouses",
+            "created_by", "created_at", "updated_at",
             "agents", "documents", "products", "totals",
         )
 
@@ -125,23 +127,30 @@ class SummaryListSerializer(serializers.ModelSerializer):
 class SummaryWriteSerializer(serializers.ModelSerializer):
     """Создание/обновление сводки. Снапшот собирается во вьюхе."""
 
-    warehouse = serializers.PrimaryKeyRelatedField(queryset=models.Warehouse.objects.all())
+    # Legacy: один склад. Оставлен для совместимости со старым фронтом.
+    warehouse = serializers.PrimaryKeyRelatedField(
+        queryset=models.Warehouse.objects.all(), required=False, allow_null=True,
+    )
+    # Новое: набор складов (когда all_warehouses=false).
+    warehouses = serializers.PrimaryKeyRelatedField(
+        queryset=models.Warehouse.objects.all(), many=True, required=False,
+    )
+    all_warehouses = serializers.BooleanField(required=False)
     agents = serializers.PrimaryKeyRelatedField(
         queryset=User.objects.all(), many=True, required=False,
     )
 
     class Meta:
         model = models.WarehouseSalesSummary
-        fields = ("name", "comment", "type", "date", "warehouse", "agents")
+        fields = ("name", "comment", "type", "date", "warehouse", "warehouses", "all_warehouses", "agents")
         extra_kwargs = {
             "comment": {"required": False},
         }
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        # warehouse/date нельзя менять при обновлении (снапшот привязан к ним).
+        # date нельзя менять при обновлении (снапшот привязан к ней).
         if self.instance is not None:
-            self.fields["warehouse"].required = False
             self.fields["date"].required = False
 
     def validate(self, attrs):
@@ -149,4 +158,66 @@ class SummaryWriteSerializer(serializers.ModelSerializer):
         if summary_type == models.WarehouseSalesSummary.Type.GENERAL:
             # agents игнорируется для общей сводки
             attrs["agents"] = []
+
+        inst = self.instance
+        all_wh = attrs.get("all_warehouses", getattr(inst, "all_warehouses", False))
+
+        # Разрешаем итоговый набор складов: приоритет warehouses, затем legacy warehouse,
+        # затем (при обновлении) текущее состояние записи.
+        if "warehouses" in attrs:
+            resolved = list(attrs.get("warehouses") or [])
+        elif "warehouse" in attrs:
+            single = attrs.get("warehouse")
+            resolved = [single] if single is not None else []
+        elif inst is not None:
+            resolved = list(models.Warehouse.objects.filter(id__in=inst.warehouse_ids())) if not all_wh else []
+        else:
+            resolved = []
+
+        if all_wh:
+            # По всем складам компании — явный список не нужен.
+            resolved = []
+        elif not resolved:
+            raise serializers.ValidationError(
+                {"warehouses": "Укажите хотя бы один склад или включите all_warehouses."}
+            )
+
+        # Проверка принадлежности складов компании (компания придёт из контекста создания).
+        company_id = getattr(getattr(inst, "company", None), "id", None) or self.context.get("company_id")
+        if company_id is not None:
+            for wh in resolved:
+                if getattr(wh, "company_id", None) != company_id:
+                    raise serializers.ValidationError(
+                        {"warehouses": f"Склад {wh.id} принадлежит другой компании."}
+                    )
+
+        # Агенты — любой сотрудник компании; чужие компании отсекаем.
+        if company_id is not None and attrs.get("agents"):
+            for agent in attrs["agents"]:
+                if getattr(agent, "company_id", None) not in (None, company_id):
+                    raise serializers.ValidationError(
+                        {"agents": f"Пользователь {agent.id} из другой компании."}
+                    )
+
+        attrs["_resolved_warehouses"] = resolved
+        attrs["all_warehouses"] = all_wh
+        # FK warehouse держим синхронным: первый из набора либо None (для all_warehouses).
+        attrs["warehouse"] = resolved[0] if resolved else None
+        attrs.pop("warehouses", None)
         return attrs
+
+    def _apply_warehouses(self, instance, warehouses):
+        instance.warehouses.set(warehouses)
+
+    def create(self, validated_data):
+        warehouses = validated_data.pop("_resolved_warehouses", [])
+        instance = super().create(validated_data)
+        self._apply_warehouses(instance, warehouses)
+        return instance
+
+    def update(self, instance, validated_data):
+        warehouses = validated_data.pop("_resolved_warehouses", None)
+        instance = super().update(instance, validated_data)
+        if warehouses is not None:
+            self._apply_warehouses(instance, warehouses)
+        return instance

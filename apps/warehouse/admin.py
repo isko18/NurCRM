@@ -121,8 +121,9 @@ class WarehouseSalesSummaryProductInline(admin.TabularInline):
 
 @admin.register(models.WarehouseSalesSummary)
 class WarehouseSalesSummaryAdmin(admin.ModelAdmin):
-    list_display = ("number", "name", "type", "date", "warehouse", "company", "documents_count", "products_count", "total_amount", "created_at")
-    list_filter = ("type", "company", "branch", "warehouse")
+    list_display = ("number", "name", "type", "date", "warehouse", "all_warehouses", "company", "documents_count", "products_count", "total_amount", "created_at")
+    list_filter = ("type", "company", "branch", "warehouse", "all_warehouses")
     search_fields = ("number", "name", "comment")
     readonly_fields = ("number", "documents_count", "products_count", "total_quantity", "total_weight", "total_amount", "created_at", "updated_at")
+    filter_horizontal = ("warehouses",)
     inlines = (WarehouseSalesSummaryDocumentInline, WarehouseSalesSummaryProductInline)

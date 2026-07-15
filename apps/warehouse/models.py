@@ -2732,7 +2732,22 @@ class WarehouseSalesSummary(BaseModelId, BaseModelCompanyBranch):
         "warehouse.Warehouse",
         on_delete=models.CASCADE,
         related_name="sales_summaries",
-        verbose_name="Склад",
+        null=True,
+        blank=True,
+        verbose_name="Склад (основной)",
+        help_text="Первый из складов сводки. Оставлен для совместимости; полный набор — в warehouses.",
+    )
+    warehouses = models.ManyToManyField(
+        "warehouse.Warehouse",
+        blank=True,
+        related_name="sales_summaries_multi",
+        verbose_name="Склады",
+        help_text="Склады, накладные которых входят в сводку (если all_warehouses=false).",
+    )
+    all_warehouses = models.BooleanField(
+        default=False,
+        verbose_name="По всем складам",
+        help_text="Если включено — в сводку попадают накладные всех складов компании за дату.",
     )
     agents = models.ManyToManyField(
         settings.AUTH_USER_MODEL,
@@ -2774,6 +2789,21 @@ class WarehouseSalesSummary(BaseModelId, BaseModelCompanyBranch):
 
     def __str__(self):
         return f"{self.number or self.id} ({self.name})"
+
+    def warehouse_ids(self):
+        """
+        Итоговый набор складов сводки:
+        - all_warehouses=true → все склады компании;
+        - иначе из M2M warehouses, с откатом на legacy-FK warehouse (для старых записей).
+        """
+        if self.all_warehouses:
+            return list(
+                Warehouse.objects.filter(company_id=self.company_id).values_list("id", flat=True)
+            )
+        ids = list(self.warehouses.values_list("id", flat=True))
+        if not ids and self.warehouse_id:
+            ids = [self.warehouse_id]
+        return ids
 
     def clean(self):
         if self.warehouse_id and self.company_id and self.warehouse.company_id != self.company_id:

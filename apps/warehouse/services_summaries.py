@@ -57,16 +57,19 @@ def next_summary_number(company) -> str:
 
 def _documents_queryset(summary):
     """Накладные продаж, попадающие в снапшот сводки."""
+    warehouse_ids = summary.warehouse_ids()
     qs = (
         models.Document.objects
         .filter(
             doc_type=models.Document.DocType.SALE,
-            warehouse_from=summary.warehouse_id,
+            warehouse_from_id__in=warehouse_ids,
             date__date=summary.date,
         )
         .exclude(status__in=EXCLUDED_SALE_STATUSES)
         .select_related("counterparty", "agent")
     )
+    if not warehouse_ids:
+        return qs.none()
     if summary.type == models.WarehouseSalesSummary.Type.BY_AGENTS:
         agent_ids = list(summary.agents.values_list("id", flat=True))
         qs = qs.filter(agent_id__in=agent_ids) if agent_ids else qs.none()

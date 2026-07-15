@@ -55,7 +55,7 @@ class WarehouseSalesSummaryViewSet(CompanyBranchRestrictedMixin, viewsets.ModelV
         qs = (
             models.WarehouseSalesSummary.objects
             .select_related("warehouse", "created_by")
-            .prefetch_related("agents")
+            .prefetch_related("agents", "warehouses")
         )
         return self._filter_qs_company_branch(qs)
 
@@ -119,11 +119,17 @@ class WarehouseSalesSummaryViewSet(CompanyBranchRestrictedMixin, viewsets.ModelV
             return SummaryWriteSerializer
         return SummaryDetailSerializer
 
+    def get_serializer_context(self):
+        ctx = super().get_serializer_context()
+        company = self._company()
+        ctx["company_id"] = getattr(company, "id", None)
+        return ctx
+
     def _detail_response(self, summary, status_code=status.HTTP_200_OK):
         summary = (
             self.get_queryset().model.objects
             .select_related("warehouse", "created_by")
-            .prefetch_related("agents", "documents__items", "products")
+            .prefetch_related("agents", "warehouses", "documents__items", "products")
             .get(pk=summary.pk)
         )
         serializer = SummaryDetailSerializer(summary, context=self.get_serializer_context())
@@ -139,10 +145,13 @@ class WarehouseSalesSummaryViewSet(CompanyBranchRestrictedMixin, viewsets.ModelV
         company = self._company()
         if company is None:
             raise ValidationError("Не удалось определить компанию пользователя.")
-        warehouse = serializer.validated_data.get("warehouse")
-        self._ensure_agent_can_access_warehouse(warehouse, field_name="warehouse")
-        if warehouse is not None and warehouse.company_id != company.id:
-            raise ValidationError({"warehouse": "Склад принадлежит другой компании."})
+
+        # Проверяем доступ и принадлежность каждого склада набора.
+        # (для all_warehouses набор пуст — накладные соберутся по всем складам компании.)
+        for warehouse in serializer.validated_data.get("_resolved_warehouses", []):
+            self._ensure_agent_can_access_warehouse(warehouse, field_name="warehouses")
+            if warehouse.company_id != company.id:
+                raise ValidationError({"warehouses": "Склад принадлежит другой компании."})
 
         summary = serializer.save(
             company=company,
@@ -160,13 +169,21 @@ class WarehouseSalesSummaryViewSet(CompanyBranchRestrictedMixin, viewsets.ModelV
         instance = self.get_object()
         prev_type = instance.type
         prev_agents = set(instance.agents.values_list("id", flat=True))
+        prev_warehouses = set(instance.warehouse_ids())
+        prev_all = instance.all_warehouses
 
         serializer = self.get_serializer(instance, data=request.data, partial=partial)
         serializer.is_valid(raise_exception=True)
         summary = serializer.save()
 
         new_agents = set(summary.agents.values_list("id", flat=True))
-        if summary.type != prev_type or new_agents != prev_agents:
+        new_warehouses = set(summary.warehouse_ids())
+        if (
+            summary.type != prev_type
+            or new_agents != prev_agents
+            or summary.all_warehouses != prev_all
+            or new_warehouses != prev_warehouses
+        ):
             build_summary_snapshot(summary)
         return self._detail_response(summary)
 
