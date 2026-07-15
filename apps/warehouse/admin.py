@@ -69,6 +69,7 @@ class CompanyWarehouseAgentAdmin(admin.ModelAdmin):
     list_filter = ("status", "company")
     search_fields = ("user__email", "company__name", "note")
     raw_id_fields = ("user", "company", "assigned_warehouse", "common_warehouse", "decided_by")
+    filter_horizontal = ("common_warehouses",)
 
 
 @admin.register(models.WarehouseProductGroup)

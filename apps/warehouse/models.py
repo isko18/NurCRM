@@ -1127,9 +1127,26 @@ class CompanyWarehouseAgent(models.Model):
         null=True,
         blank=True,
         related_name="common_access_agents",
-        verbose_name="Склад общего доступа",
-        help_text="Склад, по которому агенту открыт общий доступ (если common_access_enabled=true).",
+        verbose_name="Склад общего доступа (основной)",
+        help_text=(
+            "Первый из складов общего доступа. Оставлен для обратной совместимости; "
+            "полный набор — в common_warehouses."
+        ),
     )
+    common_warehouses = models.ManyToManyField(
+        "warehouse.Warehouse",
+        blank=True,
+        related_name="common_access_agents_multi",
+        verbose_name="Склады общего доступа",
+        help_text="Склады, по которым агенту открыт общий доступ (если common_access_enabled=true).",
+    )
+
+    def common_warehouse_ids(self):
+        """Все склады общего доступа: из M2M, с откатом на legacy-FK (для старых записей)."""
+        ids = list(self.common_warehouses.values_list("id", flat=True))
+        if not ids and self.common_warehouse_id:
+            ids = [self.common_warehouse_id]
+        return ids
 
     can_sell_wholesale = models.BooleanField(
         "Разрешена оптовая продажа",

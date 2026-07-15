@@ -100,15 +100,15 @@ def agent_has_common_access_to_warehouse(*, user, warehouse, company=None) -> bo
         user=user,
         status=models.CompanyWarehouseAgent.Status.ACTIVE,
         common_access_enabled=True,
-        common_warehouse=warehouse,
     )
     if company is not None:
         qs = qs.filter(company=company)
-    membership = qs.only("assigned_warehouse_id").first()
-    if membership is None:
-        return False
-    assigned_warehouse_id = getattr(membership, "assigned_warehouse_id", None)
-    return assigned_warehouse_id in (None, warehouse.id)
+    # Доступ есть, если склад входит в набор общего доступа (M2M) либо совпадает
+    # с legacy-FK common_warehouse (для записей, ещё не переведённых на M2M).
+    qs = qs.filter(
+        models.Q(common_warehouses=warehouse) | models.Q(common_warehouse=warehouse)
+    )
+    return qs.exists()
 
 
 def agent_can_sell_wholesale(*, user, company=None) -> bool:
