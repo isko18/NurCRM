@@ -1237,8 +1237,11 @@ class PreparationReceiveView(CompanyBranchQuerysetMixin, APIView):
         ser.is_valid(raise_exception=True)
 
         with transaction.atomic():
+            # of=("self",): FOR UPDATE только по строке Preparation. Без этого Postgres
+            # падает — select_related("source_product") даёт LEFT JOIN по nullable FK,
+            # а FOR UPDATE нельзя наложить на nullable-сторону outer join.
             prep: Preparation = generics.get_object_or_404(
-                qs.prefetch_related("ingredients").select_for_update(), pk=pk
+                qs.prefetch_related("ingredients").select_for_update(of=("self",)), pk=pk
             )
             vd = ser.validated_data
             try:
