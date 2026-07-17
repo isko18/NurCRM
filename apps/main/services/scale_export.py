@@ -140,6 +140,76 @@ def _ensure_plu_for_weight_products(company_id, products: list[Product]) -> None
         next_plu = plu_value + 1
 
 
+def _txp_line(plu, name, price, *, barcode_type, unit_code, department, shelf_life_days):
+    """Одна строка .TXP (24 поля, TAB-разделитель) — как в экспорте PLU-менеджера весов."""
+    code = 1000 + (int(plu) - 1) * 10
+    price_x100 = int((Decimal(str(price or 0)) * 100).quantize(Decimal("1")))
+    fields = [
+        str(int(plu)),          # 0  PLU
+        name,                   # 1  название (латиница)
+        str(int(plu)),          # 2  LF код = PLU
+        str(code),              # 3  Код = 1000 + (plu-1)*10
+        str(barcode_type),      # 4  тип штрихкода
+        str(price_x100),        # 5  цена ×100
+        str(unit_code),         # 6  единица (код; 4 = kg)
+        str(department),        # 7  отдел
+        " 0,000",               # 8  вес PT
+        str(shelf_life_days),   # 9  срок годности
+        "0",                    # 10
+        " 0,000",               # 11 тара
+        "0", "0", "0", "0", "0", "0", "0",  # 12–18
+        "",                     # 19 (пустое поле)
+        "0", "0", "0",          # 20–22
+        "0,0",                  # 23
+    ]
+    return "\t".join(fields)
+
+
+def build_weight_products_txp(
+    company,
+    *,
+    product_ids=None,
+    barcode_type: int = DEFAULT_BARCODE_TYPE,
+    unit_code: int = 4,
+    department: int = DEFAULT_DEPARTMENT,
+    shelf_life_days: int = DEFAULT_SHELF_LIFE_DAYS,
+    translit_name: bool = True,
+    assign_plu: bool = True,
+) -> tuple[bytes, int]:
+    """
+    Собирает .TXP (TAB-разделитель, CRLF, без заголовка) — формат импорта PLU-менеджера
+    весов Rongta RLS. Возвращает (bytes, count). Пустой набор → (b"", 0).
+
+    Кодировка cp1251 с заменой непредставимых символов на '?', как делает само ПО
+    (поэтому названия лучше слать латиницей — translit_name=True).
+    """
+    qs = Product.objects.filter(company=company, is_weight=True)
+    if product_ids:
+        qs = qs.filter(id__in=product_ids)
+    products = list(qs.order_by("plu", "name", "id"))
+    if not products:
+        return b"", 0
+
+    if assign_plu:
+        _ensure_plu_for_weight_products(company.id, products)
+        products.sort(key=lambda p: (p.plu if p.plu is not None else 0, p.name or ""))
+
+    lines = []
+    for idx, product in enumerate(products):
+        plu = int(product.plu) if product.plu is not None else (idx + 1)
+        name = _translit(product.name) if translit_name else (product.name or "")
+        lines.append(_txp_line(
+            plu, name, product.price,
+            barcode_type=barcode_type,
+            unit_code=unit_code,
+            department=department,
+            shelf_life_days=shelf_life_days,
+        ))
+
+    text = "\r\n".join(lines) + "\r\n"
+    return text.encode("cp1251", errors="replace"), len(products)
+
+
 def build_weight_products_xls(
     company,
     *,
@@ -153,10 +223,14 @@ def build_weight_products_xls(
     packing_type: str = DEFAULT_PACKING_TYPE,
     translit_name: bool = True,
     assign_plu: bool = True,
+    include_header: bool = True,
 ) -> tuple[bytes, int]:
     """
     Собирает .xls весовых товаров компании под PLU-менеджер весов.
     Возвращает (bytes, count). Пустой набор → (b"", 0).
+
+    include_header=False — без строки заголовков (данные с первой строки). Нужно,
+    если импорт ПО весов позиционный и трактует первую строку как данные.
     """
     if xlwt is None:
         raise XlwtNotInstalled("Библиотека xlwt не установлена: pip install xlwt==1.3.0")
@@ -174,15 +248,21 @@ def build_weight_products_xls(
 
     workbook = xlwt.Workbook(encoding="utf-8")
     sheet = workbook.add_sheet("PLU")
-    header_style = xlwt.easyxf("font: bold on;")
-    for col_idx, title in enumerate(XLS_COLUMNS):
-        sheet.write(0, col_idx, title, header_style)
 
-    for row_idx, product in enumerate(products, start=1):
-        plu = int(product.plu) if product.plu is not None else row_idx
+    row_offset = 0
+    if include_header:
+        header_style = xlwt.easyxf("font: bold on;")
+        for col_idx, title in enumerate(XLS_COLUMNS):
+            sheet.write(0, col_idx, title, header_style)
+        row_offset = 1
+
+    for idx, product in enumerate(products):
+        row_idx = idx + row_offset
+        hotkey = idx + 1               # порядковый 1..N, не зависит от строки листа
+        plu = int(product.plu) if product.plu is not None else hotkey
         name = _translit(product.name) if translit_name else (product.name or "")
         row_data = [
-            row_idx,                       # 1 Порядковая клавиша
+            hotkey,                        # 1 Порядковая клавиша
             name,                          # 2 Название
             plu,                           # 3 LF код = PLU
             plu,                           # 4 Код = PLU
