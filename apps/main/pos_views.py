@@ -782,9 +782,9 @@ def _parse_scale_barcode(barcode: str, mode: str = SCALE_BARCODE_MODE_AUTO,
     - "plu"  (по умолчанию): FF PPPPP EEEEE C
         FF (20–29) префикс, PPPPP PLU (5 цифр), EEEEE вес/сумма (5 цифр), C — чек.
         Товар ищется по Product.plu.
-    - "code" : FF CCCCCC WWWW C
-        FF префикс, CCCCCC «Код» (6 цифр = Product.code), WWWW вес (4 цифры, граммы),
-        C — чек. Товар ищется по Product.code; значение всегда трактуется как вес.
+    - "code" : FF PPPPPP WWWW C
+        FF префикс, PPPPPP PLU (6 цифр — в экспорте «Код»=PLU), WWWW вес (4 цифры,
+        граммы), C — чек. Товар ищется по Product.plu; значение всегда трактуется как вес.
 
     Трактовка поля значения (для layout=plu) задаётся `mode`
     (Company.scale_barcode_mode): weight | amount | auto (по префиксу).
@@ -802,18 +802,18 @@ def _parse_scale_barcode(barcode: str, mode: str = SCALE_BARCODE_MODE_AUTO,
 
     check_digit = barcode[12]
 
-    # --- Раскладка «по коду»: префикс(2) + Код(6) + вес(4) + чек ---
-    # PLU не выводим — товар ищется по Product.code (raw_code) в резолвере.
+    # --- Раскладка «по коду»: префикс(2) + PLU(6) + вес(4) + чек ---
+    # В экспорте «Код»=PLU, поэтому 6-значное поле — это PLU; ищем по Product.plu.
     if layout == SCALE_BARCODE_LAYOUT_CODE:
         try:
-            code = int(barcode[2:8])
+            plu = int(barcode[2:8])
             weight_raw = int(barcode[8:12])
         except ValueError:
             return None
         return {
             "prefix": prefix,
-            "plu": None,
-            "raw_code": str(code),
+            "plu": plu,
+            "raw_code": str(plu),
             "weight_raw": weight_raw,
             "weight_kg": Decimal(weight_raw) / Decimal(1000),
             "check_digit": check_digit,
