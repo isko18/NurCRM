@@ -237,6 +237,35 @@ class CompanyBranchRestrictedMixin:
             return None
         return getattr(membership, "assigned_warehouse_id", None)
 
+    def _warehouse_access_membership(self, company=None):
+        """
+        Активное членство, ограничивающее доступ пользователя к складам
+        (общий доступ и/или назначенный склад). В отличие от _agent_membership,
+        применяется и к сотрудникам компании (company_id) — важно, когда сотруднику
+        выдали агентский доступ к конкретному складу. Владельцев/админов не трогает.
+        """
+        user = self._user()
+        if not user or not getattr(user, "is_authenticated", False):
+            return None
+        if _is_owner_like(user):
+            return None
+        company = company or self._company()
+        if company is None:
+            return None
+        return (
+            m.CompanyWarehouseAgent.objects
+            .filter(
+                user=user,
+                company=company,
+                status=m.CompanyWarehouseAgent.Status.ACTIVE,
+            )
+            .filter(
+                Q(common_access_enabled=True) | Q(assigned_warehouse__isnull=False)
+            )
+            .select_related("assigned_warehouse")
+            .first()
+        )
+
     def _ensure_agent_can_access_warehouse(self, warehouse, *, field_name="warehouse"):
         user = self._user()
         if warehouse is None or not user or _is_owner_like(user) or getattr(user, "company_id", None):
@@ -375,9 +404,10 @@ class CompanyBranchRestrictedMixin:
         elif self._model_has_field(model, "company"):
             qs = qs.filter(company_id__in=company_ids)
 
-        # Агент: видимость определяется его складами (общий доступ + назначенный),
-        # а не активным филиалом. Для owner/сотрудника membership=None → обычный branch-скоуп.
-        membership = self._agent_membership(company=company)
+        # Агент (в т.ч. сотрудник с агентским доступом): видимость определяется его
+        # складами (общий доступ + назначенный), а не активным филиалом.
+        # Для owner/admin и пользователей без ограничивающего членства → обычный branch-скоуп.
+        membership = self._warehouse_access_membership(company=company)
         if membership is not None:
             allowed_ids = (
                 set(membership.common_warehouse_ids())
