@@ -761,6 +761,7 @@ class WeightProductsScaleExportAPIView(CompanyBranchRestrictedMixin, APIView):
 
     def get(self, request, *args, **kwargs):
         from apps.main.services.scale_export import (
+            build_weight_products_txp,
             build_weight_products_xls,
             XlwtNotInstalled,
         )
@@ -799,30 +800,54 @@ class WeightProductsScaleExportAPIView(CompanyBranchRestrictedMixin, APIView):
                 raise ValidationError({name: [f"Допустимо от {lo} до {hi}."]})
             return value
 
+        fmt = (qp.get("format") or "txp").strip().lower()
+        if fmt not in ("txp", "xls"):
+            raise ValidationError({"format": ["Допустимо: txp, xls."]})
+
         barcode_type = _int_param("barcode_type", 5, 0, 99)
         department = _int_param("department", 21, 0, 99)
         shelf_life_days = _int_param("shelf_life_days", 15, 0, 100000)
-        tare = _int_param("tare", 0, 0, 100000)
-        label_number = _int_param("label_number", 0, 0, 100000)
-        unit = (qp.get("unit") or "Kg").strip() or "Kg"
-        packing_type = (qp.get("packing_type") or "Нормальный").strip() or "Нормальный"
+        unit_code = _int_param("unit_code", 4, 0, 99)
         translit_name = (qp.get("translit") or "1").strip().lower() not in ("0", "false", "no", "off")
         assign_plu = (qp.get("assign_plu") or "1").strip().lower() not in ("0", "false", "no", "off")
 
         try:
-            content, count = build_weight_products_xls(
-                company,
-                product_ids=product_ids,
-                barcode_type=barcode_type,
-                department=department,
-                shelf_life_days=shelf_life_days,
-                tare=tare,
-                label_number=label_number,
-                unit=unit,
-                packing_type=packing_type,
-                translit_name=translit_name,
-                assign_plu=assign_plu,
-            )
+            if fmt == "txp":
+                # Формат импорта PLU-менеджера весов Rongta RLS (TAB, CRLF, без заголовка).
+                content, count = build_weight_products_txp(
+                    company,
+                    product_ids=product_ids,
+                    barcode_type=barcode_type,
+                    unit_code=unit_code,
+                    department=department,
+                    shelf_life_days=shelf_life_days,
+                    translit_name=translit_name,
+                    assign_plu=assign_plu,
+                )
+                content_type = "text/plain; charset=windows-1251"
+                filename = "scale_weight_products.TXP"
+            else:
+                tare = _int_param("tare", 0, 0, 100000)
+                label_number = _int_param("label_number", 0, 0, 100000)
+                unit = (qp.get("unit") or "Kg").strip() or "Kg"
+                packing_type = (qp.get("packing_type") or "Нормальный").strip() or "Нормальный"
+                include_header = (qp.get("header") or "1").strip().lower() not in ("0", "false", "no", "off")
+                content, count = build_weight_products_xls(
+                    company,
+                    product_ids=product_ids,
+                    barcode_type=barcode_type,
+                    department=department,
+                    shelf_life_days=shelf_life_days,
+                    tare=tare,
+                    label_number=label_number,
+                    unit=unit,
+                    packing_type=packing_type,
+                    translit_name=translit_name,
+                    assign_plu=assign_plu,
+                    include_header=include_header,
+                )
+                content_type = "application/vnd.ms-excel"
+                filename = "scale_weight_products.xls"
         except XlwtNotInstalled as exc:
             return Response(
                 {"detail": str(exc)},
@@ -835,11 +860,8 @@ class WeightProductsScaleExportAPIView(CompanyBranchRestrictedMixin, APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        response = HttpResponse(
-            content,
-            content_type="application/vnd.ms-excel",
-        )
-        response["Content-Disposition"] = 'attachment; filename="scale_weight_products.xls"'
+        response = HttpResponse(content, content_type=content_type)
+        response["Content-Disposition"] = f'attachment; filename="{filename}"'
         response["X-Scale-Products-Count"] = str(count)
         return response
 
