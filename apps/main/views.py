@@ -816,12 +816,16 @@ class WeightProductsScaleExportAPIView(CompanyBranchRestrictedMixin, APIView):
                 raise ValidationError({name: [f"Допустимо от {lo} до {hi}."]})
             return value
 
+        # Рабочий формат весов (UTF-16 текст, имя .xls) — под всеми привычными алиасами,
+        # чтобы фронт с ?format=xls/txp/txt всё равно получал именно его.
+        # Настоящий бинарный Excel (для просмотра человеком) — только под ?format=excel.
         fmt = (qp.get("format") or "txt").strip().lower()
-        # txt/txp — рабочий текстовый формат импорта весов; xls — обычный Excel (запасной)
-        if fmt in ("txp",):
+        if fmt in ("txt", "txp", "xls", "rls"):
             fmt = "txt"
-        if fmt not in ("txt", "xls"):
-            raise ValidationError({"format": ["Допустимо: txt, xls."]})
+        elif fmt in ("excel", "xlsx"):
+            fmt = "excel"
+        else:
+            raise ValidationError({"format": ["Допустимо: txt (для весов), excel (обычный Excel)."]})
 
         barcode_type = _int_param("barcode_type", 5, 0, 99)
         department = _int_param("department", 21, 0, 99)
@@ -846,7 +850,7 @@ class WeightProductsScaleExportAPIView(CompanyBranchRestrictedMixin, APIView):
                 )
                 content_type = "application/vnd.ms-excel"
                 filename = "scale_weight_products.xls"
-            else:
+            else:  # excel — настоящий бинарный Excel, для просмотра, НЕ для весов
                 tare = _int_param("tare", 0, 0, 100000)
                 label_number = _int_param("label_number", 0, 0, 100000)
                 unit = (qp.get("unit") or "Kg").strip() or "Kg"
@@ -867,7 +871,7 @@ class WeightProductsScaleExportAPIView(CompanyBranchRestrictedMixin, APIView):
                     include_header=include_header,
                 )
                 content_type = "application/vnd.ms-excel"
-                filename = "scale_weight_products.xls"
+                filename = "scale_weight_products_view.xls"
         except XlwtNotInstalled as exc:
             return Response(
                 {"detail": str(exc)},
