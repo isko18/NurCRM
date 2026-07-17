@@ -118,6 +118,17 @@ SCALE_BARCODE_MODE_CHOICES = [
     (SCALE_BARCODE_MODE_AMOUNT, "По сумме"),
 ]
 
+# Раскладка полей EAN-13 весов — что стоит между префиксом и контрольной цифрой:
+#   "plu"  : префикс(2) + PLU(5) + значение(5) + чек   — товар ищется по Product.plu
+#   "code" : префикс(2) + Код(6) + вес(4) + чек         — весы кладут «Код» (1000+(plu-1)*10),
+#            PLU восстанавливается из Кода; вес в граммах / 1000
+SCALE_BARCODE_LAYOUT_PLU = "plu"
+SCALE_BARCODE_LAYOUT_CODE = "code"
+SCALE_BARCODE_LAYOUT_CHOICES = [
+    (SCALE_BARCODE_LAYOUT_PLU, "По PLU (префикс+PLU(5)+вес(5))"),
+    (SCALE_BARCODE_LAYOUT_CODE, "По коду (префикс+Код(6)+вес(4))"),
+]
+
 
 class Company(models.Model):
     objects = CompanyManager()
@@ -185,6 +196,17 @@ class Company(models.Model):
         help_text=(
             "Как трактовать поле в штрихкоде весов: «По весу» (граммы), "
             "«По сумме» (сомы) или «Авто» по префиксу (20=вес, 25=сумма)."
+        ),
+    )
+
+    scale_barcode_layout = models.CharField(
+        max_length=10,
+        choices=SCALE_BARCODE_LAYOUT_CHOICES,
+        default=SCALE_BARCODE_LAYOUT_PLU,
+        verbose_name="Раскладка штрихкода весов",
+        help_text=(
+            "Как разбирать штрихкод: «По PLU» — префикс+PLU(5)+вес(5); "
+            "«По коду» — префикс+Код(6)+вес(4), где Код=1000+(PLU−1)×10."
         ),
     )
 
