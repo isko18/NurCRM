@@ -15,6 +15,7 @@ from .models import (
     LossReasonConsalting,
     LeadActivityConsalting,
     LeadTaskConsalting,
+    WhatsAppMessageConsalting,
 )
 from apps.users.models import User, Branch, CustomRole
 
@@ -891,3 +892,21 @@ class LeadTaskConsaltingSerializer(serializers.ModelSerializer):
         if obj.assignee and (obj.assignee.first_name or obj.assignee.last_name):
             return f"{obj.assignee.first_name or ''} {obj.assignee.last_name or ''}".strip()
         return getattr(obj.assignee, "email", None) if obj.assignee else None
+
+
+# ==========================
+# WhatsAppMessageConsalting
+# ==========================
+class WhatsAppMessageConsaltingSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = WhatsAppMessageConsalting
+        fields = (
+            "id", "company", "branch", "lead", "message_id",
+            "direction", "text", "status", "created_at", "updated_at"
+        )
+        read_only_fields = ("id", "company", "branch", "created_at", "updated_at")
+
+
+class WhatsAppSendSerializer(serializers.Serializer):
+    text = serializers.CharField(required=True, help_text="Текст сообщения для отправки")
+

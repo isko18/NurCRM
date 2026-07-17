@@ -870,7 +870,7 @@ class Product(models.Model):
         Защита от гонок при генерации max()+1.
         В Postgres pg_advisory_xact_lock принимает BIGINT (int8).
         """
-        if not self.company_id:
+        if not self.company_id or connection.vendor == "sqlite":
             return
 
         # 64-bit key (0..2^63-1)

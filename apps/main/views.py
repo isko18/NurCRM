@@ -1892,6 +1892,16 @@ class ProductRetrieveUpdateDestroyAPIView(CompanyBranchRestrictedMixin, generics
         ctx["include_purchase_batches"] = True
         return ctx
 
+    def destroy(self, request, *args, **kwargs):
+        try:
+            return super().destroy(request, *args, **kwargs)
+        except ProtectedError:
+            return Response(
+                {"detail": "Невозможно удалить товар, так как на него ссылаются другие объекты (например, заказы или передачи)."},
+                status=status.HTTP_409_CONFLICT
+            )
+
+
     @transaction.atomic
     def update(self, request, *args, **kwargs):
         partial = kwargs.pop("partial", False)
@@ -3350,7 +3360,7 @@ class ItemMakePurchaseAPIView(CompanyBranchRestrictedMixin, APIView):
     @transaction.atomic
     def post(self, request, pk=None):
         company = self._company()
-        qs = self._filter_qs_company_branch(ItemMake.objects.select_related("supplier"))
+        qs = self._filter_qs_company_branch(ItemMake.objects.all())
         item = get_object_or_404(qs.select_for_update(), pk=pk)
 
         try:

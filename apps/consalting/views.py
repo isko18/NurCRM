@@ -1562,3 +1562,127 @@ class FunnelAnalyticsView(CompanyBranchQuerysetMixin, generics.GenericAPIView):
             owner=params.get("owner") or None,
         )
         return Response(data)
+
+
+# ==========================
+# WhatsApp Integration (каркас)
+# ==========================
+from django.conf import settings
+from .funnel.whatsapp import WhatsAppConsaltingService
+from .serializers import WhatsAppMessageConsaltingSerializer, WhatsAppSendSerializer
+from .models import WhatsAppMessageConsalting
+
+class LeadWhatsAppSendView(CompanyBranchQuerysetMixin, generics.GenericAPIView):
+    """
+    Отправка сообщения клиенту через WhatsApp в контексте лида.
+    POST /leads/<id>/whatsapp/send/
+    """
+    queryset = LeadConsalting.objects.all()
+    serializer_class = WhatsAppSendSerializer
+
+    def post(self, request, *args, **kwargs):
+        lead = self.get_object()
+        ser = self.get_serializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+        text = ser.validated_data["text"]
+
+        try:
+            wa_message = WhatsAppConsaltingService.send_message(
+                lead=lead,
+                text=text,
+                user=request.user
+            )
+            return Response(
+                WhatsAppMessageConsaltingSerializer(wa_message).data,
+                status=status.HTTP_201_CREATED
+            )
+        except Exception as e:
+            return Response(
+                {"detail": str(e)},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+
+class LeadWhatsAppHistoryView(CompanyBranchQuerysetMixin, generics.ListAPIView):
+    """
+    Получение истории переписки по WhatsApp для конкретного лида.
+    GET /leads/<id>/whatsapp/history/
+    """
+    serializer_class = WhatsAppMessageConsaltingSerializer
+
+    def get_queryset(self):
+        lead_id = self.kwargs.get("pk")
+        company = self._user_company()
+        return WhatsAppMessageConsalting.objects.filter(
+            lead_id=lead_id,
+            company=company
+        ).order_by("created_at")
+
+
+class WhatsAppConsaltingWebhookView(APIView):
+    """
+    Прием входящих сообщений и обновлений статуса от шлюза WhatsApp (Node.js).
+    POST /whatsapp/webhook/
+    """
+    permission_classes = []
+    authentication_classes = []
+
+    def post(self, request, *args, **kwargs):
+        token = request.headers.get("X-WA-TOKEN")
+        if token != getattr(settings, "WHATSAPP_NODE_TOKEN", "change-me"):
+            return Response({"detail": "Forbidden"}, status=status.HTTP_403_FORBIDDEN)
+
+        event_type = request.data.get("event")
+        
+        if event_type == "message":
+            company_id = request.data.get("company_id")
+            phone = request.data.get("phone")
+            text = request.data.get("text")
+            message_id = request.data.get("message_id")
+            
+            if not all([company_id, phone, text, message_id]):
+                return Response(
+                    {"detail": "Недостаточно данных для обработки сообщения"},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+                
+            try:
+                lead = WhatsAppConsaltingService.handle_incoming_message(
+                    company_id=company_id,
+                    phone=phone,
+                    text=text,
+                    message_id=message_id
+                )
+                return Response(
+                    {
+                        "status": "success",
+                        "lead_id": str(lead.id)
+                    },
+                    status=status.HTTP_200_OK
+                )
+            except Exception as e:
+                return Response(
+                    {"detail": str(e)},
+                    status=status.HTTP_500_INTERNAL_SERVER_ERROR
+                )
+                
+        elif event_type == "status":
+            message_id = request.data.get("message_id")
+            status_str = request.data.get("status")
+            
+            if not message_id or not status_str:
+                return Response(
+                    {"detail": "Недостаточно данных для обновления статуса"},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+                
+            WhatsAppConsaltingService.update_message_status(
+                message_id=message_id,
+                status_str=status_str
+            )
+            return Response({"status": "success"}, status=status.HTTP_200_OK)
+            
+        return Response(
+            {"detail": "Неподдерживаемый тип события"},
+            status=status.HTTP_400_BAD_REQUEST
+        )
