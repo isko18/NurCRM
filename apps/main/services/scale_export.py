@@ -174,18 +174,30 @@ def _scale_price(price) -> str:
     return f"{d}".replace(".", ",")
 
 
-def _scale_line(plu, name, price, *, barcode_type, unit_code, department, shelf_life_days):
+def _scale_code(product_code, plu) -> str:
+    """
+    «Код» для весов = реальный Product.code (если это цифры). Иначе запасной вариант
+    1000+(PLU−1)×10. Именно этот код весы кодируют в штрихкод, и по нему касса
+    ищет товар (Product.code) в режиме раскладки «по коду».
+    """
+    s = str(product_code or "").strip()
+    if s.isdigit():
+        return s
+    return str(1000 + (int(plu) - 1) * 10)
+
+
+def _scale_line(plu, name, price, product_code, *, barcode_type, unit_code, department, shelf_life_days):
     """
     Одна строка данных рабочего файла весов — 23 поля, TAB-разделитель.
     Порядок и константы совпадают с экспортом PLU-менеджера весов Rongta RLS.
     """
-    code = 1000 + (int(plu) - 1) * 10
+    code = _scale_code(product_code, plu)
     safe_name = (name or "").replace("\t", " ").replace("\r", " ").replace("\n", " ")[:SCALE_NAME_MAX]
     return "\t".join([
         str(int(plu)),          # 0  Горячая клавиша (= PLU)
         safe_name,              # 1  Название
         str(int(plu)),          # 2  LF код (= PLU)
-        str(code),              # 3  Код = 1000 + (plu-1)*10
+        code,                   # 3  Код = Product.code (реальный)
         str(barcode_type),      # 4  Тип штрихкода
         _scale_price(price),    # 5  Цена единицы (X,XXX)
         str(unit_code),         # 6  Вес единицы (код; 4 = kg)
@@ -242,7 +254,7 @@ def build_weight_products_scale_txt(
         plu = int(product.plu) if product.plu is not None else (idx + 1)
         name = _scale_name(product.name, plu, translit=translit_name)
         lines.append(_scale_line(
-            plu, name, product.price,
+            plu, name, product.price, product.code,
             barcode_type=barcode_type,
             unit_code=unit_code,
             department=department,

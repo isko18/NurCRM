@@ -774,16 +774,6 @@ def _company_scale_barcode_mode(company_id) -> str:
     return _company_scale_barcode_settings(company_id)[0]
 
 
-def _plu_from_scale_code(code: int):
-    """
-    PLU из «Кода» весов. Экспорт кладёт Код = 1000 + (PLU−1)×10, значит
-    PLU = (Код − 1000) / 10 + 1. Если Код не по этой схеме — используем как есть.
-    """
-    if code >= 1000 and (code - 1000) % 10 == 0:
-        return (code - 1000) // 10 + 1
-    return code
-
-
 def _parse_scale_barcode(barcode: str, mode: str = SCALE_BARCODE_MODE_AUTO,
                          layout: str = SCALE_BARCODE_LAYOUT_PLU):
     """
@@ -791,9 +781,10 @@ def _parse_scale_barcode(barcode: str, mode: str = SCALE_BARCODE_MODE_AUTO,
 
     - "plu"  (по умолчанию): FF PPPPP EEEEE C
         FF (20–29) префикс, PPPPP PLU (5 цифр), EEEEE вес/сумма (5 цифр), C — чек.
+        Товар ищется по Product.plu.
     - "code" : FF CCCCCC WWWW C
-        FF префикс, CCCCCC «Код» (6 цифр, = 1000+(PLU−1)×10), WWWW вес (4 цифры,
-        граммы), C — чек. PLU восстанавливается из Кода. Всегда трактуется как вес.
+        FF префикс, CCCCCC «Код» (6 цифр = Product.code), WWWW вес (4 цифры, граммы),
+        C — чек. Товар ищется по Product.code; значение всегда трактуется как вес.
 
     Трактовка поля значения (для layout=plu) задаётся `mode`
     (Company.scale_barcode_mode): weight | amount | auto (по префиксу).
@@ -812,16 +803,16 @@ def _parse_scale_barcode(barcode: str, mode: str = SCALE_BARCODE_MODE_AUTO,
     check_digit = barcode[12]
 
     # --- Раскладка «по коду»: префикс(2) + Код(6) + вес(4) + чек ---
+    # PLU не выводим — товар ищется по Product.code (raw_code) в резолвере.
     if layout == SCALE_BARCODE_LAYOUT_CODE:
         try:
             code = int(barcode[2:8])
             weight_raw = int(barcode[8:12])
         except ValueError:
             return None
-        plu = _plu_from_scale_code(code)
         return {
             "prefix": prefix,
-            "plu": plu,
+            "plu": None,
             "raw_code": str(code),
             "weight_raw": weight_raw,
             "weight_kg": Decimal(weight_raw) / Decimal(1000),
