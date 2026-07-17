@@ -1140,9 +1140,25 @@ class CompanyWarehouseAgent(models.Model):
         verbose_name="Склады общего доступа",
         help_text="Склады, по которым агенту открыт общий доступ (если common_access_enabled=true).",
     )
+    common_all_warehouses = models.BooleanField(
+        "Доступ ко всем складам",
+        default=False,
+        help_text=(
+            "Если включено — общий доступ ко всем складам компании (и всем их товарам). "
+            "Явный список common_warehouses при этом игнорируется."
+        ),
+    )
 
     def common_warehouse_ids(self):
-        """Все склады общего доступа: из M2M, с откатом на legacy-FK (для старых записей)."""
+        """
+        Все склады общего доступа:
+        - common_all_warehouses=true → все склады компании;
+        - иначе из M2M common_warehouses, с откатом на legacy-FK (для старых записей).
+        """
+        if self.common_all_warehouses:
+            return list(
+                Warehouse.objects.filter(company_id=self.company_id).values_list("id", flat=True)
+            )
         ids = list(self.common_warehouses.values_list("id", flat=True))
         if not ids and self.common_warehouse_id:
             ids = [self.common_warehouse_id]

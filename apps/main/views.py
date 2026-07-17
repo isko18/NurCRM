@@ -18,6 +18,7 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 from rest_framework.exceptions import NotFound, PermissionDenied, ValidationError
 from django.shortcuts import get_object_or_404
+from django.http import HttpResponse
 from rest_framework import serializers
 from .filters import TransactionRecordFilter, DebtFilter, DebtPaymentFilter
 from django_filters.rest_framework import DjangoFilterBackend
@@ -731,6 +732,116 @@ def _filter_products_company_only(view, qs):
     if company is not None:
         qs = qs.filter(company=company)
     return qs
+
+
+class WeightProductsScaleExportAPIView(CompanyBranchRestrictedMixin, APIView):
+    """
+    GET /api/main/products/scale-export/
+
+    Выгрузка весовых товаров компании (Product.is_weight=True) в .xls под PLU-менеджер
+    весов Rongta RLS1100, затем импорт через SDK/ПО весов.
+
+    PLU (Product.plu) пишется в поля «LF код» и «Код» — тот же номер, что касса читает
+    из штрихкода весов, поэтому напечатанные весами штрихкоды находятся при сканировании.
+
+    Query-параметры (все необязательны, дефолты — как в PLU-менеджере весов):
+      - product_ids=<uuid,uuid>  экспорт только выбранных товаров
+      - barcode_type=5           номер шаблона штрихкода на весах
+      - department=21            отдел (участвует в префиксе штрихкода)
+      - shelf_life_days=15       срок годности
+      - tare=0                   тара
+      - label_number=0           номер этикетки
+      - unit=Kg                  единица измерения
+      - packing_type=Нормальный  тип упаковки
+      - translit=1               транслитерировать название в латиницу (весы часто печатают только ASCII)
+      - assign_plu=1             присвоить plu весовым товарам без него
+    """
+
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request, *args, **kwargs):
+        from apps.main.services.scale_export import (
+            build_weight_products_xls,
+            XlwtNotInstalled,
+        )
+
+        company = self._company()
+        if company is None:
+            return Response(
+                {"detail": "Пользователь не привязан к компании."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        qp = request.query_params
+
+        product_ids = None
+        raw_ids = (qp.get("product_ids") or "").strip()
+        if raw_ids:
+            product_ids = []
+            for chunk in raw_ids.split(","):
+                s = chunk.strip()
+                if not s:
+                    continue
+                try:
+                    product_ids.append(UUID(s))
+                except (ValueError, TypeError):
+                    raise ValidationError({"product_ids": [f"Неверный UUID: {s}"]})
+
+        def _int_param(name, default, lo, hi):
+            raw = (qp.get(name) or "").strip()
+            if not raw:
+                return default
+            try:
+                value = int(raw)
+            except (TypeError, ValueError):
+                raise ValidationError({name: ["Ожидается целое число."]})
+            if not (lo <= value <= hi):
+                raise ValidationError({name: [f"Допустимо от {lo} до {hi}."]})
+            return value
+
+        barcode_type = _int_param("barcode_type", 5, 0, 99)
+        department = _int_param("department", 21, 0, 99)
+        shelf_life_days = _int_param("shelf_life_days", 15, 0, 100000)
+        tare = _int_param("tare", 0, 0, 100000)
+        label_number = _int_param("label_number", 0, 0, 100000)
+        unit = (qp.get("unit") or "Kg").strip() or "Kg"
+        packing_type = (qp.get("packing_type") or "Нормальный").strip() or "Нормальный"
+        translit_name = (qp.get("translit") or "1").strip().lower() not in ("0", "false", "no", "off")
+        assign_plu = (qp.get("assign_plu") or "1").strip().lower() not in ("0", "false", "no", "off")
+
+        try:
+            content, count = build_weight_products_xls(
+                company,
+                product_ids=product_ids,
+                barcode_type=barcode_type,
+                department=department,
+                shelf_life_days=shelf_life_days,
+                tare=tare,
+                label_number=label_number,
+                unit=unit,
+                packing_type=packing_type,
+                translit_name=translit_name,
+                assign_plu=assign_plu,
+            )
+        except XlwtNotInstalled as exc:
+            return Response(
+                {"detail": str(exc)},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+
+        if count == 0:
+            return Response(
+                {"detail": "У компании нет весовых товаров (Product.is_weight=True) для выгрузки."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        response = HttpResponse(
+            content,
+            content_type="application/vnd.ms-excel",
+        )
+        response["Content-Disposition"] = 'attachment; filename="scale_weight_products.xls"'
+        response["X-Scale-Products-Count"] = str(count)
+        return response
 
 
 # ===========================

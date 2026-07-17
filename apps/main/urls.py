@@ -57,6 +57,7 @@ urlpatterns = [
     # 🔹 Продукты, категории, бренды
     path('products/list/', ProductListView.as_view(), name='product-list'),
     path('products/compact-list/', ProductCompactListView.as_view(), name='product-compact-list'),
+    path('products/scale-export/', WeightProductsScaleExportAPIView.as_view(), name='product-scale-export'),
     path('products/create-by-barcode/', ProductCreateByBarcodeAPIView.as_view(), name='product-create-by-barcode'),
     path('products/create-manual/', ProductCreateManualAPIView.as_view(), name='product-create-manual'),
     path('products/<uuid:pk>/', ProductRetrieveUpdateDestroyAPIView.as_view(), name='product-detail'),

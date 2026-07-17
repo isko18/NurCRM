@@ -1572,7 +1572,9 @@ class AgentMyProductsListAPIView(CompanyBranchRestrictedMixin, APIView):
             status=m.CompanyWarehouseAgent.Status.ACTIVE,
             common_access_enabled=True,
         ).filter(
-            Q(common_warehouses__isnull=False) | Q(common_warehouse__isnull=False)
+            Q(common_all_warehouses=True)
+            | Q(common_warehouses__isnull=False)
+            | Q(common_warehouse__isnull=False)
         ).distinct()
         # Если _company() определена, по возможности предпочитаем её.
         if company is not None:
@@ -1620,7 +1622,12 @@ class AgentMyProductsListAPIView(CompanyBranchRestrictedMixin, APIView):
             else:
                 # по умолчанию — по дате создания (сначала новые)
                 prod_qs = prod_qs.order_by("-created_date", "id")
-            prod_qs = self._filter_qs_company_branch_relaxed(prod_qs)
+            # common_wh_ids — уже авторитетный набор складов общего доступа (все в компании
+            # агента). Общий _filter_qs_company_branch здесь применять нельзя: он повторно
+            # сужает по активному филиалу и по assigned_warehouse — и режет часть складов
+            # общего доступа (особенно при common_all_warehouses и складах в разных филиалах).
+            # Достаточно защитного скоупа по компании членства.
+            prod_qs = prod_qs.filter(warehouse__company_id=membership.company_id)
             rows = [
                 CommonWarehouseBalanceSerializer.make_row(
                     agent_id=user.id,
@@ -1871,7 +1878,8 @@ class CompanyWarehouseAgentCommonAccessUpdateAPIView(APIView):
     body:
       - assigned_warehouse: uuid|null
       - common_access_enabled: bool
-      - common_warehouses: [uuid, ...] (обязателен непустой если common_access_enabled=true)
+      - common_all_warehouses: bool (доступ ко всем складам компании и всем их товарам; список не нужен)
+      - common_warehouses: [uuid, ...] (обязателен непустой, если common_access_enabled=true и не all)
       - common_warehouse: uuid|null (legacy, один склад; эквивалентно common_warehouses=[uuid])
       - can_sell_wholesale: bool (разрешить агенту оптовые продажи)
       - can_sell_without_approval: bool (заявки агента одобряются автоматически на submit)
@@ -1906,7 +1914,8 @@ class CompanyWarehouseAgentAdminAssignAPIView(APIView):
       - user: uuid пользователя
       - assigned_warehouse: uuid|null (опционально)
       - common_access_enabled: bool (опционально)
-      - common_warehouses: [uuid, ...] (опционально, непустой если common_access_enabled=true)
+      - common_all_warehouses: bool (опционально, доступ ко всем складам и всем товарам)
+      - common_warehouses: [uuid, ...] (опционально, непустой если common_access_enabled=true и не all)
       - common_warehouse: uuid|null (legacy, один склад)
       - can_sell_wholesale: bool (опционально, разрешить агенту оптовые продажи)
       - can_sell_without_approval: bool (опционально, автоодобрение заявок агента на submit)
@@ -1947,6 +1956,7 @@ class CompanyWarehouseAgentAdminAssignAPIView(APIView):
             or "common_access_enabled" in request.data
             or "common_warehouse" in request.data
             or "common_warehouses" in request.data
+            or "common_all_warehouses" in request.data
             or "can_sell_wholesale" in request.data
             or "can_sell_without_approval" in request.data
         ):

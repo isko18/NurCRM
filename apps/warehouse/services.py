@@ -103,10 +103,13 @@ def agent_has_common_access_to_warehouse(*, user, warehouse, company=None) -> bo
     )
     if company is not None:
         qs = qs.filter(company=company)
-    # Доступ есть, если склад входит в набор общего доступа (M2M) либо совпадает
-    # с legacy-FK common_warehouse (для записей, ещё не переведённых на M2M).
+    # Доступ есть, если: включён доступ ко всем складам компании; либо склад входит
+    # в набор общего доступа (M2M); либо совпадает с legacy-FK common_warehouse
+    # (для записей, ещё не переведённых на M2M).
     qs = qs.filter(
-        models.Q(common_warehouses=warehouse) | models.Q(common_warehouse=warehouse)
+        models.Q(common_all_warehouses=True, company_id=warehouse.company_id)
+        | models.Q(common_warehouses=warehouse)
+        | models.Q(common_warehouse=warehouse)
     )
     return qs.exists()
 

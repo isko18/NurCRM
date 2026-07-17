@@ -902,6 +902,7 @@ class CompanyWarehouseAgentSerializer(serializers.ModelSerializer):
     common_access_enabled = serializers.BooleanField(read_only=True)
     common_warehouse = serializers.PrimaryKeyRelatedField(read_only=True)
     common_warehouses = serializers.PrimaryKeyRelatedField(many=True, read_only=True)
+    common_all_warehouses = serializers.BooleanField(read_only=True)
     can_sell_wholesale = serializers.BooleanField(read_only=True)
     can_sell_without_approval = serializers.BooleanField(read_only=True)
 
@@ -919,6 +920,7 @@ class CompanyWarehouseAgentSerializer(serializers.ModelSerializer):
             "common_access_enabled",
             "common_warehouse",
             "common_warehouses",
+            "common_all_warehouses",
             "can_sell_wholesale",
             "can_sell_without_approval",
             "created_at",
@@ -934,6 +936,7 @@ class CompanyWarehouseAgentSerializer(serializers.ModelSerializer):
             "common_access_enabled",
             "common_warehouse",
             "common_warehouses",
+            "common_all_warehouses",
             "can_sell_wholesale",
             "can_sell_without_approval",
             "created_at",
@@ -981,6 +984,8 @@ class CompanyWarehouseAgentCommonAccessUpdateSerializer(serializers.ModelSeriali
         many=True,
         required=False,
     )
+    # Доступ ко всем складам компании (и всем товарам) — без перечисления складов.
+    common_all_warehouses = serializers.BooleanField(required=False)
     can_sell_wholesale = serializers.BooleanField(required=False)
     can_sell_without_approval = serializers.BooleanField(required=False)
 
@@ -991,6 +996,7 @@ class CompanyWarehouseAgentCommonAccessUpdateSerializer(serializers.ModelSeriali
             "common_access_enabled",
             "common_warehouse",
             "common_warehouses",
+            "common_all_warehouses",
             "can_sell_wholesale",
             "can_sell_without_approval",
         )
@@ -999,6 +1005,7 @@ class CompanyWarehouseAgentCommonAccessUpdateSerializer(serializers.ModelSeriali
         attrs = super().validate(attrs)
         inst = getattr(self, "instance", None)
         enabled = attrs.get("common_access_enabled", getattr(inst, "common_access_enabled", False))
+        all_warehouses = attrs.get("common_all_warehouses", getattr(inst, "common_all_warehouses", False))
         assigned_warehouse = attrs.get("assigned_warehouse", getattr(inst, "assigned_warehouse", None))
 
         # Собираем итоговый набор складов: приоритет у common_warehouses (список),
@@ -1008,19 +1015,24 @@ class CompanyWarehouseAgentCommonAccessUpdateSerializer(serializers.ModelSeriali
         elif "common_warehouse" in attrs:
             single = attrs.get("common_warehouse")
             warehouses = [single] if single is not None else []
-        elif inst is not None:
+        elif inst is not None and not inst.common_all_warehouses:
             warehouses = [
                 w for w in m.Warehouse.objects.filter(id__in=inst.common_warehouse_ids())
             ]
         else:
             warehouses = []
 
-        if enabled and not warehouses:
-            raise serializers.ValidationError(
-                {"common_warehouses": "Укажите хотя бы один склад, если включён общий доступ."}
-            )
         if not enabled:
+            # Доступ выключен — сбрасываем и набор, и флаг «все склады».
             warehouses = []
+            all_warehouses = False
+        elif all_warehouses:
+            # Доступ ко всем складам — явный список не нужен и очищается.
+            warehouses = []
+        elif not warehouses:
+            raise serializers.ValidationError(
+                {"common_warehouses": "Укажите хотя бы один склад или включите common_all_warehouses."}
+            )
 
         company = getattr(inst, "company", None)
         company_id = getattr(company, "id", None)
@@ -1038,6 +1050,7 @@ class CompanyWarehouseAgentCommonAccessUpdateSerializer(serializers.ModelSeriali
 
         # Итоговый набор кладём в attrs; сохранение M2M — в update()/create().
         # common_warehouse (FK) держим синхронным: первый из набора либо None.
+        attrs["common_all_warehouses"] = all_warehouses
         attrs["_resolved_common_warehouses"] = warehouses
         attrs["common_warehouse"] = warehouses[0] if warehouses else None
         attrs.pop("common_warehouses", None)

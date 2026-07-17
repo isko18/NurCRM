@@ -61,12 +61,13 @@ class CompanyWarehouseAgentAdmin(admin.ModelAdmin):
         "status",
         "assigned_warehouse",
         "common_access_enabled",
+        "common_all_warehouses",
         "common_warehouse",
         "created_at",
         "decided_at",
         "decided_by",
     )
-    list_filter = ("status", "company")
+    list_filter = ("status", "company", "common_all_warehouses")
     search_fields = ("user__email", "company__name", "note")
     raw_id_fields = ("user", "company", "assigned_warehouse", "common_warehouse", "decided_by")
     filter_horizontal = ("common_warehouses",)
