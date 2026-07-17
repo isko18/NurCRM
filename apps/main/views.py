@@ -761,7 +761,7 @@ class WeightProductsScaleExportAPIView(CompanyBranchRestrictedMixin, APIView):
 
     def get(self, request, *args, **kwargs):
         from apps.main.services.scale_export import (
-            build_weight_products_txp,
+            build_weight_products_scale_txt,
             build_weight_products_xls,
             XlwtNotInstalled,
         )
@@ -800,9 +800,12 @@ class WeightProductsScaleExportAPIView(CompanyBranchRestrictedMixin, APIView):
                 raise ValidationError({name: [f"Допустимо от {lo} до {hi}."]})
             return value
 
-        fmt = (qp.get("format") or "txp").strip().lower()
-        if fmt not in ("txp", "xls"):
-            raise ValidationError({"format": ["Допустимо: txp, xls."]})
+        fmt = (qp.get("format") or "txt").strip().lower()
+        # txt/txp — рабочий текстовый формат импорта весов; xls — обычный Excel (запасной)
+        if fmt in ("txp",):
+            fmt = "txt"
+        if fmt not in ("txt", "xls"):
+            raise ValidationError({"format": ["Допустимо: txt, xls."]})
 
         barcode_type = _int_param("barcode_type", 5, 0, 99)
         department = _int_param("department", 21, 0, 99)
@@ -812,9 +815,10 @@ class WeightProductsScaleExportAPIView(CompanyBranchRestrictedMixin, APIView):
         assign_plu = (qp.get("assign_plu") or "1").strip().lower() not in ("0", "false", "no", "off")
 
         try:
-            if fmt == "txp":
-                # Формат импорта PLU-менеджера весов Rongta RLS (TAB, CRLF, без заголовка).
-                content, count = build_weight_products_txp(
+            if fmt == "txt":
+                # Рабочий формат импорта PLU-менеджера весов Rongta RLS:
+                # UTF-16 LE, TAB, CRLF, с заголовком. Файл именуется .xls (как экспорт ПО).
+                content, count = build_weight_products_scale_txt(
                     company,
                     product_ids=product_ids,
                     barcode_type=barcode_type,
@@ -824,8 +828,8 @@ class WeightProductsScaleExportAPIView(CompanyBranchRestrictedMixin, APIView):
                     translit_name=translit_name,
                     assign_plu=assign_plu,
                 )
-                content_type = "text/plain; charset=windows-1251"
-                filename = "scale_weight_products.TXP"
+                content_type = "application/vnd.ms-excel"
+                filename = "scale_weight_products.xls"
             else:
                 tare = _int_param("tare", 0, 0, 100000)
                 label_number = _int_param("label_number", 0, 0, 100000)

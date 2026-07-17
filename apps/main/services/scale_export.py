@@ -140,53 +140,75 @@ def _ensure_plu_for_weight_products(company_id, products: list[Product]) -> None
         next_plu = plu_value + 1
 
 
-# Длина поля имени PLU на весах Rongta RLS (в эталонном экспорте имена ≤ 36 симв.).
+# Длина поля имени PLU на весах Rongta RLS (в рабочем экспорте имена ≤ 36 симв.).
 # Превышение переполняет буфер при передаче на весы → Access violation в RTPLU.exe.
-TXP_NAME_MAX = 36
+SCALE_NAME_MAX = 36
+
+# Заголовок рабочего файла импорта (24 колонки) — точно как экспорт PLU-менеджера весов.
+SCALE_TXT_HEADER = [
+    "Горячая клавиша", "Название", "LF код", "Код", "Тип штрихкода", "Цена единицы",
+    "Вес единицы", "Количество единиц", "Отдел", "Вес PT", "Срок годности",
+    "Тип упаковки", "Тара", "Ошибка(%)", "Сообщение 1", "Сообщение 2", "Этикетка",
+    "Таблица скидок", "Учётная запись", "sPluFieldTitle20", "Учётная запись",
+    "Recommend days", "nutrition", "Ice(%)",
+]
 
 
-def _txp_name(name, plu, *, translit: bool) -> str:
+def _scale_name(name, plu, *, translit: bool) -> str:
     """
-    Готовит имя для .TXP: транслит (опц.), вырезание TAB/переносов/управляющих
-    символов (иначе поля TAB-формата «съезжают»), схлопывание пробелов и обрезка
-    до TXP_NAME_MAX. Пустое имя → плейсхолдер PLU<номер>.
+    Имя для файла весов: транслит (опц.), вырезание TAB/переносов/управляющих
+    символов, схлопывание пробелов, обрезка до SCALE_NAME_MAX.
+    Пустое имя → плейсхолдер PLU<номер>.
     """
     s = _translit(name) if translit else (name or "")
-    # Любой TAB/CR/LF/управляющий символ → пробел (в т.ч. чтобы не ломать разделители).
     s = "".join(ch if (ch >= " " and ch != "\t") else " " for ch in s)
     s = " ".join(s.split()).strip()
     if not s:
         s = f"PLU{int(plu)}"
-    return s[:TXP_NAME_MAX]
+    return s[:SCALE_NAME_MAX]
 
 
-def _txp_line(plu, name, price, *, barcode_type, unit_code, department, shelf_life_days):
-    """Одна строка .TXP (24 поля, TAB-разделитель) — как в экспорте PLU-менеджера весов."""
+def _scale_price(price) -> str:
+    """Цена как в рабочем файле: 3 знака, десятичный разделитель — запятая (160 → '160,000')."""
+    d = Decimal(str(price or 0)).quantize(Decimal("0.001"))
+    return f"{d}".replace(".", ",")
+
+
+def _scale_line(plu, name, price, *, barcode_type, unit_code, department, shelf_life_days):
+    """
+    Одна строка данных рабочего файла весов — 23 поля, TAB-разделитель.
+    Порядок и константы совпадают с экспортом PLU-менеджера весов Rongta RLS.
+    """
     code = 1000 + (int(plu) - 1) * 10
-    price_x100 = int((Decimal(str(price or 0)) * 100).quantize(Decimal("1")))
-    safe_name = (name or "").replace("\t", " ").replace("\r", " ").replace("\n", " ")[:TXP_NAME_MAX]
-    fields = [
-        str(int(plu)),          # 0  PLU
-        safe_name,              # 1  название (латиница, ≤ 36, без TAB)
-        str(int(plu)),          # 2  LF код = PLU
+    safe_name = (name or "").replace("\t", " ").replace("\r", " ").replace("\n", " ")[:SCALE_NAME_MAX]
+    return "\t".join([
+        str(int(plu)),          # 0  Горячая клавиша (= PLU)
+        safe_name,              # 1  Название
+        str(int(plu)),          # 2  LF код (= PLU)
         str(code),              # 3  Код = 1000 + (plu-1)*10
-        str(barcode_type),      # 4  тип штрихкода
-        str(price_x100),        # 5  цена ×100
-        str(unit_code),         # 6  единица (код; 4 = kg)
-        str(department),        # 7  отдел
-        " 0,000",               # 8  вес PT
-        str(shelf_life_days),   # 9  срок годности
-        "0",                    # 10
-        " 0,000",               # 11 тара
-        "0", "0", "0", "0", "0", "0", "0",  # 12–18
-        "",                     # 19 (пустое поле)
-        "0", "0", "0",          # 20–22
-        "0,0",                  # 23
-    ]
-    return "\t".join(fields)
+        str(barcode_type),      # 4  Тип штрихкода
+        _scale_price(price),    # 5  Цена единицы (X,XXX)
+        str(unit_code),         # 6  Вес единицы (код; 4 = kg)
+        "0",                    # 7  Количество единиц
+        str(department),        # 8  Отдел
+        " 0,000",               # 9  Вес PT
+        str(shelf_life_days),   # 10 Срок годности
+        "0",                    # 11 Тип упаковки
+        " 0,000",               # 12 Тара
+        "0",                    # 13 Ошибка(%)
+        "0",                    # 14 Сообщение 1
+        "0",                    # 15 Сообщение 2
+        "0",                    # 16 Этикетка
+        "0",                    # 17 Таблица скидок
+        "0",                    # 18 Учётная запись
+        "",                     # 19 sPluFieldTitle20 (пустое)
+        "0",                    # 20 Учётная запись
+        "0",                    # 21 Recommend days
+        "0",                    # 22 nutrition
+    ])
 
 
-def build_weight_products_txp(
+def build_weight_products_scale_txt(
     company,
     *,
     product_ids=None,
@@ -198,11 +220,11 @@ def build_weight_products_txp(
     assign_plu: bool = True,
 ) -> tuple[bytes, int]:
     """
-    Собирает .TXP (TAB-разделитель, CRLF, без заголовка) — формат импорта PLU-менеджера
-    весов Rongta RLS. Возвращает (bytes, count). Пустой набор → (b"", 0).
+    Рабочий формат импорта PLU-менеджера весов Rongta RLS: UTF-16 LE (+BOM), CRLF,
+    TAB-разделитель, строка заголовков (24 колонки) + строки данных (23 поля),
+    цена как X,XXX с запятой. Файл именуется .xls, но это UTF-16 текст (как экспорт ПО).
 
-    Кодировка cp1251 с заменой непредставимых символов на '?', как делает само ПО
-    (поэтому названия лучше слать латиницей — translit_name=True).
+    Возвращает (bytes, count). Пустой набор → (b"", 0).
     """
     qs = Product.objects.filter(company=company, is_weight=True)
     if product_ids:
@@ -215,11 +237,11 @@ def build_weight_products_txp(
         _ensure_plu_for_weight_products(company.id, products)
         products.sort(key=lambda p: (p.plu if p.plu is not None else 0, p.name or ""))
 
-    lines = []
+    lines = ["\t".join(SCALE_TXT_HEADER)]
     for idx, product in enumerate(products):
         plu = int(product.plu) if product.plu is not None else (idx + 1)
-        name = _txp_name(product.name, plu, translit=translit_name)
-        lines.append(_txp_line(
+        name = _scale_name(product.name, plu, translit=translit_name)
+        lines.append(_scale_line(
             plu, name, product.price,
             barcode_type=barcode_type,
             unit_code=unit_code,
@@ -228,7 +250,8 @@ def build_weight_products_txp(
         ))
 
     text = "\r\n".join(lines) + "\r\n"
-    return text.encode("cp1251", errors="replace"), len(products)
+    # UTF-16 LE с BOM — как в рабочем файле (\xff\xfe...), кириллица сохраняется.
+    return b"\xff\xfe" + text.encode("utf-16-le"), len(products)
 
 
 def build_weight_products_xls(
