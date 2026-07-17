@@ -126,7 +126,7 @@ SCALE_BARCODE_LAYOUT_PLU = "plu"
 SCALE_BARCODE_LAYOUT_CODE = "code"
 SCALE_BARCODE_LAYOUT_CHOICES = [
     (SCALE_BARCODE_LAYOUT_PLU, "По PLU (префикс+PLU(5)+вес(5))"),
-    (SCALE_BARCODE_LAYOUT_CODE, "По коду (префикс+Код(6)+вес(4))"),
+    (SCALE_BARCODE_LAYOUT_CODE, "По коду (префикс+PLU(6)+вес(4))"),
 ]
 
 
@@ -206,7 +206,8 @@ class Company(models.Model):
         verbose_name="Раскладка штрихкода весов",
         help_text=(
             "Как разбирать штрихкод: «По PLU» — префикс+PLU(5)+вес(5); "
-            "«По коду» — префикс+Код(6)+вес(4), где Код=1000+(PLU−1)×10."
+            "«По коду» — префикс+PLU(6)+вес(4). В обоих товар ищется по Product.plu "
+            "(в выгрузке «Код»=PLU)."
         ),
     )
 
