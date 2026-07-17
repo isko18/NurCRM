@@ -140,13 +140,34 @@ def _ensure_plu_for_weight_products(company_id, products: list[Product]) -> None
         next_plu = plu_value + 1
 
 
+# Длина поля имени PLU на весах Rongta RLS (в эталонном экспорте имена ≤ 36 симв.).
+# Превышение переполняет буфер при передаче на весы → Access violation в RTPLU.exe.
+TXP_NAME_MAX = 36
+
+
+def _txp_name(name, plu, *, translit: bool) -> str:
+    """
+    Готовит имя для .TXP: транслит (опц.), вырезание TAB/переносов/управляющих
+    символов (иначе поля TAB-формата «съезжают»), схлопывание пробелов и обрезка
+    до TXP_NAME_MAX. Пустое имя → плейсхолдер PLU<номер>.
+    """
+    s = _translit(name) if translit else (name or "")
+    # Любой TAB/CR/LF/управляющий символ → пробел (в т.ч. чтобы не ломать разделители).
+    s = "".join(ch if (ch >= " " and ch != "\t") else " " for ch in s)
+    s = " ".join(s.split()).strip()
+    if not s:
+        s = f"PLU{int(plu)}"
+    return s[:TXP_NAME_MAX]
+
+
 def _txp_line(plu, name, price, *, barcode_type, unit_code, department, shelf_life_days):
     """Одна строка .TXP (24 поля, TAB-разделитель) — как в экспорте PLU-менеджера весов."""
     code = 1000 + (int(plu) - 1) * 10
     price_x100 = int((Decimal(str(price or 0)) * 100).quantize(Decimal("1")))
+    safe_name = (name or "").replace("\t", " ").replace("\r", " ").replace("\n", " ")[:TXP_NAME_MAX]
     fields = [
         str(int(plu)),          # 0  PLU
-        name,                   # 1  название (латиница)
+        safe_name,              # 1  название (латиница, ≤ 36, без TAB)
         str(int(plu)),          # 2  LF код = PLU
         str(code),              # 3  Код = 1000 + (plu-1)*10
         str(barcode_type),      # 4  тип штрихкода
@@ -197,7 +218,7 @@ def build_weight_products_txp(
     lines = []
     for idx, product in enumerate(products):
         plu = int(product.plu) if product.plu is not None else (idx + 1)
-        name = _translit(product.name) if translit_name else (product.name or "")
+        name = _txp_name(product.name, plu, translit=translit_name)
         lines.append(_txp_line(
             plu, name, product.price,
             barcode_type=barcode_type,
