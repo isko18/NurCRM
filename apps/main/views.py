@@ -17,6 +17,7 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 from rest_framework.exceptions import NotFound, PermissionDenied, ValidationError
+from rest_framework.negotiation import DefaultContentNegotiation
 from django.shortcuts import get_object_or_404
 from django.http import HttpResponse
 from rest_framework import serializers
@@ -734,6 +735,20 @@ def _filter_products_company_only(view, qs):
     return qs
 
 
+class _IgnoreFormatNegotiation(DefaultContentNegotiation):
+    """
+    Игнорирует ?format= в content-negotiation DRF.
+
+    По умолчанию DRF трактует ?format=<x> как выбор рендерера и отдаёт 404, если
+    рендерера с таким именем нет. У scale-export параметр format=txt|xls — свой,
+    прикладной, поэтому стандартную негоциацию по нему отключаем (иначе ?format=xls
+    даёт 404 ещё до вьюхи).
+    """
+
+    def select_renderer(self, request, renderers, format_suffix=None):
+        return (renderers[0], renderers[0].media_type)
+
+
 class WeightProductsScaleExportAPIView(CompanyBranchRestrictedMixin, APIView):
     """
     GET /api/main/products/scale-export/
@@ -758,6 +773,7 @@ class WeightProductsScaleExportAPIView(CompanyBranchRestrictedMixin, APIView):
     """
 
     permission_classes = [permissions.IsAuthenticated]
+    content_negotiation_class = _IgnoreFormatNegotiation
 
     def get(self, request, *args, **kwargs):
         from apps.main.services.scale_export import (
