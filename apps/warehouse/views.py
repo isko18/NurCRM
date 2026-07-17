@@ -375,18 +375,31 @@ class CompanyBranchRestrictedMixin:
         elif self._model_has_field(model, "company"):
             qs = qs.filter(company_id__in=company_ids)
 
+        # Агент: видимость определяется его складами (общий доступ + назначенный),
+        # а не активным филиалом. Для owner/сотрудника membership=None → обычный branch-скоуп.
+        membership = self._agent_membership(company=company)
+        if membership is not None:
+            allowed_ids = (
+                set(membership.common_warehouse_ids())
+                if membership.common_access_enabled
+                else set()
+            )
+            if membership.assigned_warehouse_id:
+                allowed_ids.add(membership.assigned_warehouse_id)
+            if allowed_ids:
+                # Ограничение по складам — только для моделей со складом.
+                if self._model_has_field(model, "warehouse"):
+                    return qs.filter(warehouse_id__in=allowed_ids)
+                if model is m.Warehouse:
+                    return qs.filter(id__in=allowed_ids)
+            # Модели без склада, либо агент без ограничений по складам —
+            # падаем в общий branch-скоуп ниже (прежнее поведение).
+
         if branch_field:
             if branch is not None:
                 qs = qs.filter(**{branch_field: branch})
         elif self._model_has_field(model, "branch") and branch is not None:
             qs = qs.filter(branch=branch)
-
-        assigned_warehouse_id = self._assigned_agent_warehouse_id(company=company)
-        if assigned_warehouse_id:
-            if self._model_has_field(model, "warehouse"):
-                qs = qs.filter(warehouse_id=assigned_warehouse_id)
-            elif model is m.Warehouse:
-                qs = qs.filter(id=assigned_warehouse_id)
 
         return qs
 
@@ -732,6 +745,8 @@ class WarehouseProductCatalogListView(CompanyBranchRestrictedMixin, generics.Lis
             )
             .order_by("name")
         )
+        # _filter_qs_company_branch ограничивает агента его складами общего доступа
+        # (общий доступ + назначенный), без сужения по филиалу — см. миксин.
         return self._filter_qs_company_branch(qs)
 
 
