@@ -815,6 +815,7 @@ class CompanySerializer(serializers.ModelSerializer):
             "cashier_password",
             "llc", "inn", "okpo", "score", "bik", "address",
             "scale_barcode_mode",
+            "scale_barcode_layout",
         ]
 
 
@@ -888,6 +889,7 @@ class CompanyUpdateSerializer(serializers.ModelSerializer):
             "sector",
             "region",
             "scale_barcode_mode",
+            "scale_barcode_layout",
         ]
 
     def validate(self, attrs):
