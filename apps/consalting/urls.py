@@ -46,6 +46,9 @@ from .views import (
     LossReasonListCreateView,
     LossReasonRetrieveUpdateDestroyView,
     FunnelAnalyticsView,
+    LeadWhatsAppSendView,
+    LeadWhatsAppHistoryView,
+    WhatsAppConsaltingWebhookView,
 )
 
 urlpatterns = [
@@ -113,4 +116,9 @@ urlpatterns = [
     # ===== Причины проигрыша =====
     path('loss-reasons/', LossReasonListCreateView.as_view(), name='loss-reasons-list-create'),
     path('loss-reasons/<uuid:pk>/', LossReasonRetrieveUpdateDestroyView.as_view(), name='loss-reasons-rud'),
+
+    # ===== WhatsApp Интеграция (каркас) =====
+    path('leads/<uuid:pk>/whatsapp/send/', LeadWhatsAppSendView.as_view(), name='lead-whatsapp-send'),
+    path('leads/<uuid:pk>/whatsapp/history/', LeadWhatsAppHistoryView.as_view(), name='lead-whatsapp-history'),
+    path('whatsapp/webhook/', WhatsAppConsaltingWebhookView.as_view(), name='whatsapp-consalting-webhook'),
 ]

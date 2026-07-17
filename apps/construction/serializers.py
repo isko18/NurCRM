@@ -165,7 +165,7 @@ class CashShiftOpenSerializer(serializers.ModelSerializer):
 
         # cashiers
         if company:
-            self.fields["cashier"].queryset = User.objects.filter(company=company)
+            self.fields["cashier"].queryset = User.objects.filter(Q(company=company) | Q(owned_company=company))
         else:
             self.fields["cashier"].queryset = User.objects.none()
 

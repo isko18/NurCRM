@@ -1286,3 +1286,70 @@ class FunnelUserPreferenceConsalting(TimeStampedModel):
 
     def __str__(self):
         return f"prefs:{self.user_id}"
+
+
+# ======== WhatsApp сообщения консалтинга (каркас) ========
+class WhatsAppMessageConsalting(TimeStampedModel):
+    """Модель для хранения сообщений WhatsApp, привязанных к лиду консалтинга."""
+    class Direction(models.TextChoices):
+        INBOUND = 'inbound', 'Входящее'
+        OUTBOUND = 'outbound', 'Исходящее'
+
+    class Status(models.TextChoices):
+        PENDING = 'pending', 'Ожидает отправки'
+        SENT = 'sent', 'Отправлено'
+        DELIVERED = 'delivered', 'Доставлено'
+        READ = 'read', 'Прочитано'
+        FAILED = 'failed', 'Ошибка отправки'
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    company = models.ForeignKey(
+        Company,
+        on_delete=models.CASCADE,
+        related_name='consalting_whatsapp_messages',
+        verbose_name='Компания'
+    )
+    branch = models.ForeignKey(
+        Branch,
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
+        related_name='consalting_whatsapp_messages',
+        verbose_name='Филиал'
+    )
+    lead = models.ForeignKey(
+        LeadConsalting,
+        on_delete=models.CASCADE,
+        related_name='whatsapp_messages',
+        verbose_name='Лид'
+    )
+    message_id = models.CharField(
+        max_length=255,
+        unique=True,
+        db_index=True,
+        verbose_name='ID сообщения WhatsApp'
+    )
+    direction = models.CharField(
+        max_length=10,
+        choices=Direction.choices,
+        verbose_name='Направление'
+    )
+    text = models.TextField(verbose_name='Текст сообщения')
+    status = models.CharField(
+        max_length=20,
+        choices=Status.choices,
+        default=Status.PENDING,
+        verbose_name='Статус'
+    )
+
+    class Meta:
+        verbose_name = 'WhatsApp сообщение консалтинга'
+        verbose_name_plural = 'WhatsApp сообщения консалтинга'
+        ordering = ['created_at']
+        indexes = [
+            models.Index(fields=['company', 'lead', 'created_at']),
+        ]
+
+    def __str__(self):
+        return f"{self.direction} - {self.message_id} ({self.status})"
+
