@@ -1672,3 +1672,401 @@ class PublicMastersAvailabilityView(generics.GenericAPIView):
             'date': target_date.isoformat(),
             'masters': result
         })
+
+
+# ===========================
+# Master Salary Views (salary.md)
+# ===========================
+from django.shortcuts import get_object_or_404
+from rest_framework.views import APIView
+from django.contrib.auth import get_user_model
+from decimal import ROUND_HALF_UP
+
+from .models import ServiceSalaryRate, MasterSalaryPayout, MasterSalaryAccrual
+from .serializers import (
+    ServiceSalaryRateSerializer, MasterSalaryPayoutSerializer, MasterSalaryAccrualSerializer
+)
+
+class IsOwnerOrAdmin(permissions.BasePermission):
+    """
+    Разрешает доступ только владельцам компании (owner) или администраторам (admin).
+    """
+    def has_permission(self, request, view):
+        if not request.user or not request.user.is_authenticated:
+            return False
+        if request.user.is_superuser:
+            return True
+        role = str(getattr(request.user, "role", "") or "").strip().lower()
+        return role in ["admin", "owner"]
+
+
+class ServiceSalaryRateListView(CompanyQuerysetMixin, generics.ListAPIView):
+    """
+    GET /api/barbershop/salary/rates/
+    Возвращает все услуги компании (включая неактивные) с их процентными ставками.
+    """
+    queryset = Service.objects.select_related("salary_rate").all()
+    serializer_class = ServiceSalaryRateSerializer
+    permission_classes = [permissions.IsAuthenticated, IsOwnerOrAdmin]
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        search = self.request.query_params.get("search")
+        if search:
+            qs = qs.filter(name__icontains=search)
+        return qs
+
+
+class ServiceSalaryRateUpdateView(APIView):
+    """
+    PUT /api/barbershop/salary/rates/{service_id}/
+    Изменяет процентную ставку вознаграждения для конкретной услуги.
+    """
+    permission_classes = [permissions.IsAuthenticated, IsOwnerOrAdmin]
+
+    def put(self, request, service_id):
+        user = request.user
+        company = getattr(user, "owned_company", None) or getattr(user, "company", None)
+        if not company:
+            return Response({"detail": "У пользователя не задана компания."}, status=status.HTTP_400_BAD_REQUEST)
+
+        service = get_object_or_404(Service, id=service_id, company=company)
+
+        percent_str = request.data.get("percent")
+        if percent_str is None:
+            return Response({"percent": ["Обязательное поле."]}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            percent = Decimal(str(percent_str))
+        except (ValueError, TypeError):
+            return Response({"percent": ["Процент должен быть числом."]}, status=status.HTTP_400_BAD_REQUEST)
+
+        if percent < 0 or percent > 100:
+            return Response({"percent": ["Процент должен быть от 0 до 100."]}, status=status.HTTP_400_BAD_REQUEST)
+
+        rate, created = ServiceSalaryRate.objects.get_or_create(
+            company=company,
+            service=service,
+            defaults={"percent": percent, "updated_by": user}
+        )
+        if not created:
+            rate.percent = percent
+            rate.updated_by = user
+            rate.save(update_fields=["percent", "updated_by", "updated_at"])
+
+        serializer = ServiceSalaryRateSerializer(service)
+        return Response(serializer.data, status=status.HTTP_200_OK)
+
+
+class MasterSalaryAccrualListView(CompanyQuerysetMixin, generics.ListAPIView):
+    """
+    GET /api/barbershop/salary/accruals/
+    История начислений. Мастер видит только свои (при наличии can_view_salary).
+    """
+    serializer_class = MasterSalaryAccrualSerializer
+    queryset = MasterSalaryAccrual.objects.select_related("master", "service", "appointment").all()
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get_queryset(self):
+        user = self.request.user
+        role = str(getattr(user, "role", "") or "").strip().lower()
+        is_admin_or_owner = (role in ["admin", "owner"]) or user.is_superuser
+
+        if not is_admin_or_owner and not getattr(user, "can_view_salary", False):
+            raise PermissionDenied("У вас нет доступа к разделу Зарплата.")
+
+        qs = super().get_queryset()
+
+        if not is_admin_or_owner:
+            qs = qs.filter(master=user)
+        else:
+            master_id = self.request.query_params.get("master")
+            if master_id:
+                qs = qs.filter(master_id=master_id)
+
+        # Фильтрация по датам
+        date_from = self.request.query_params.get("date_from")
+        if date_from:
+            qs = qs.filter(created_at__date__gte=date_from)
+
+        date_to = self.request.query_params.get("date_to")
+        if date_to:
+            qs = qs.filter(created_at__date__lte=date_to)
+
+        # Фильтрация по услуге
+        service_id = self.request.query_params.get("service")
+        if service_id:
+            qs = qs.filter(service_id=service_id)
+
+        # Фильтрация по статусу
+        status_param = self.request.query_params.get("status")
+        if status_param:
+            qs = qs.filter(status=status_param)
+
+        # Поиск по номеру записи (в нашей денормализации это UUID записи)
+        search = self.request.query_params.get("search")
+        if search:
+            qs = qs.filter(appointment_id__icontains=search)
+
+        return qs
+
+
+class MasterSalarySummaryView(APIView):
+    """
+    GET /api/barbershop/salary/summary/
+    Сводка (totals + by_master).
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request):
+        user = request.user
+        role = str(getattr(user, "role", "") or "").strip().lower()
+        is_admin_or_owner = (role in ["admin", "owner"]) or user.is_superuser
+
+        if not is_admin_or_owner and not getattr(user, "can_view_salary", False):
+            return Response({"detail": "У вас нет доступа к разделу Зарплата."}, status=status.HTTP_403_FORBIDDEN)
+
+        company = getattr(user, "owned_company", None) or getattr(user, "company", None)
+        if not company:
+            return Response({"detail": "У пользователя не задана компания."}, status=status.HTTP_400_BAD_REQUEST)
+
+        # Собираем параметры
+        date_from = request.query_params.get("date_from")
+        date_to = request.query_params.get("date_to")
+        service_id = request.query_params.get("service")
+
+        if not is_admin_or_owner:
+            master_param = user.id
+        else:
+            master_param = request.query_params.get("master")
+
+        # Базовые квери
+        accruals_period = MasterSalaryAccrual.objects.filter(company=company)
+        payouts_period = MasterSalaryPayout.objects.filter(company=company)
+        accruals_balance = MasterSalaryAccrual.objects.filter(company=company, status=MasterSalaryAccrual.Status.ACCRUED)
+
+        if master_param:
+            accruals_period = accruals_period.filter(master_id=master_param)
+            payouts_period = payouts_period.filter(master_id=master_param)
+            accruals_balance = accruals_balance.filter(master_id=master_param)
+
+        if service_id:
+            accruals_period = accruals_period.filter(service_id=service_id)
+            accruals_balance = accruals_balance.filter(service_id=service_id)
+
+        if date_from:
+            accruals_period = accruals_period.filter(created_at__date__gte=date_from)
+            payouts_period = payouts_period.filter(created_at__date__gte=date_from)
+
+        if date_to:
+            accruals_period = accruals_period.filter(created_at__date__lte=date_to)
+            payouts_period = payouts_period.filter(created_at__date__lte=date_to)
+
+        # Рассчитываем Totals
+        accrued_total = accruals_period.filter(
+            status__in=[MasterSalaryAccrual.Status.ACCRUED, MasterSalaryAccrual.Status.PAID]
+        ).aggregate(sum=Sum('amount'))['sum'] or Decimal('0.00')
+
+        paid_total = payouts_period.aggregate(sum=Sum('amount'))['sum'] or Decimal('0.00')
+        balance = accruals_balance.aggregate(sum=Sum('amount'))['sum'] or Decimal('0.00')
+        accruals_count = accruals_period.count()
+
+        # Собираем ID мастеров для by_master
+        master_ids = set()
+        if master_param:
+            master_ids.add(master_param)
+        else:
+            accrual_masters = MasterSalaryAccrual.objects.filter(company=company).values_list("master_id", flat=True).distinct()
+            payout_masters = MasterSalaryPayout.objects.filter(company=company).values_list("master_id", flat=True).distinct()
+            master_ids.update(accrual_masters)
+            master_ids.update(payout_masters)
+
+        UserObj = get_user_model()
+        masters = UserObj.objects.filter(id__in=master_ids, company=company)
+
+        by_master = []
+        for m in masters:
+            m_accruals_period = accruals_period.filter(master=m)
+            m_payouts_period = payouts_period.filter(master=m)
+            m_accruals_balance = accruals_balance.filter(master=m)
+
+            m_accruals_count = m_accruals_period.count()
+            m_service_amount = m_accruals_period.aggregate(sum=Sum('service_amount'))['sum'] or Decimal('0.00')
+            m_accrued_total = m_accruals_period.filter(
+                status__in=[MasterSalaryAccrual.Status.ACCRUED, MasterSalaryAccrual.Status.PAID]
+            ).aggregate(sum=Sum('amount'))['sum'] or Decimal('0.00')
+            m_paid_total = m_payouts_period.aggregate(sum=Sum('amount'))['sum'] or Decimal('0.00')
+            m_balance = m_accruals_balance.aggregate(sum=Sum('amount'))['sum'] or Decimal('0.00')
+
+            if m.first_name or m.last_name:
+                master_name = f"{m.first_name or ''} {m.last_name or ''}".strip()
+            else:
+                master_name = m.email
+
+            by_master.append({
+                "master": str(m.id),
+                "master_name": master_name,
+                "accruals_count": m_accruals_count,
+                "service_amount": str(m_service_amount),
+                "accrued_total": str(m_accrued_total),
+                "paid_total": str(m_paid_total),
+                "balance": str(m_balance),
+            })
+
+        return Response({
+            "totals": {
+                "accrued_total": str(accrued_total),
+                "paid_total": str(paid_total),
+                "balance": str(balance),
+                "accruals_count": accruals_count
+            },
+            "by_master": by_master
+        }, status=status.HTTP_200_OK)
+
+
+class MasterSalaryPayoutListCreateView(CompanyQuerysetMixin, generics.ListCreateAPIView):
+    """
+    GET /api/barbershop/salary/payouts/ (История выплат)
+    POST /api/barbershop/salary/payouts/ (Создать выплату мастеру)
+    """
+    serializer_class = MasterSalaryPayoutSerializer
+    queryset = MasterSalaryPayout.objects.select_related("master", "created_by").all()
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get_queryset(self):
+        user = self.request.user
+        role = str(getattr(user, "role", "") or "").strip().lower()
+        is_admin_or_owner = (role in ["admin", "owner"]) or user.is_superuser
+
+        if not is_admin_or_owner and not getattr(user, "can_view_salary", False):
+            raise PermissionDenied("У вас нет доступа к разделу Зарплата.")
+
+        qs = super().get_queryset()
+
+        if not is_admin_or_owner:
+            qs = qs.filter(master=user)
+        else:
+            master_id = self.request.query_params.get("master")
+            if master_id:
+                qs = qs.filter(master_id=master_id)
+
+        date_from = self.request.query_params.get("date_from")
+        if date_from:
+            qs = qs.filter(created_at__date__gte=date_from)
+
+        date_to = self.request.query_params.get("date_to")
+        if date_to:
+            qs = qs.filter(created_at__date__lte=date_to)
+
+        return qs
+
+    def create(self, request, *args, **kwargs):
+        user = request.user
+        role = str(getattr(user, "role", "") or "").strip().lower()
+        is_admin_or_owner = (role in ["admin", "owner"]) or user.is_superuser
+
+        if not is_admin_or_owner:
+            return Response({"detail": "Forbidden"}, status=status.HTTP_403_FORBIDDEN)
+
+        company = getattr(user, "owned_company", None) or getattr(user, "company", None)
+        if not company:
+            return Response({"detail": "У пользователя не задана компания."}, status=status.HTTP_400_BAD_REQUEST)
+
+        master_id = request.data.get("master")
+        amount_val = request.data.get("amount")
+        comment = request.data.get("comment", "")
+
+        if not master_id:
+            return Response({"master": ["Обязательное поле."]}, status=status.HTTP_400_BAD_REQUEST)
+        if amount_val is None:
+            return Response({"amount": ["Обязательное поле."]}, status=status.HTTP_400_BAD_REQUEST)
+
+        UserObj = get_user_model()
+        try:
+            master = UserObj.objects.get(id=master_id, company=company, is_active=True)
+        except (UserObj.DoesNotExist, ValueError):
+            return Response({"master": ["Мастер не найден или неактивен в компании"]}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            amount = Decimal(str(amount_val))
+        except (ValueError, TypeError):
+            return Response({"amount": ["Сумма должна быть числом."]}, status=status.HTTP_400_BAD_REQUEST)
+
+        if amount <= 0:
+            return Response({"amount": ["Сумма должна быть больше нуля."]}, status=status.HTTP_400_BAD_REQUEST)
+
+        # Вычисляем текущий баланс мастера
+        balance = MasterSalaryAccrual.objects.filter(
+            company=company,
+            master=master,
+            status=MasterSalaryAccrual.Status.ACCRUED
+        ).aggregate(sum=Sum('amount'))['sum'] or Decimal('0.00')
+
+        if amount > balance:
+            return Response({"amount": [f"Сумма превышает баланс мастера ({balance})"]}, status=status.HTTP_400_BAD_REQUEST)
+
+        with transaction.atomic():
+            payout = MasterSalaryPayout.objects.create(
+                company=company,
+                master=master,
+                amount=amount,
+                comment=comment,
+                created_by=user
+            )
+
+            # FIFO закрытие начислений
+            accrueds = list(MasterSalaryAccrual.objects.filter(
+                company=company,
+                master=master,
+                status=MasterSalaryAccrual.Status.ACCRUED
+            ).order_by("created_at"))
+
+            remaining = amount
+            for accrual in accrueds:
+                if remaining <= 0:
+                    break
+
+                acc_amount = accrual.amount
+                if acc_amount <= 0:
+                    # Отрицательное начисление закрываем выплатой
+                    accrual.status = MasterSalaryAccrual.Status.PAID
+                    accrual.payout = payout
+                    accrual.save(update_fields=["status", "payout", "updated_at"])
+                    remaining -= acc_amount
+                else:
+                    if acc_amount <= remaining:
+                        # Полное покрытие положительного начисления
+                        accrual.status = MasterSalaryAccrual.Status.PAID
+                        accrual.payout = payout
+                        accrual.save(update_fields=["status", "payout", "updated_at"])
+                        remaining -= acc_amount
+                    else:
+                        unpaid_amount = acc_amount - remaining
+                        unpaid_service_amount = (accrual.service_amount * unpaid_amount / acc_amount).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+                        if unpaid_service_amount > accrual.service_amount:
+                            unpaid_service_amount = accrual.service_amount
+
+                        # Текущее начисление на оплаченную часть (сохраняем сначала, освобождая UNIQUE статус)
+                        accrual.amount = remaining
+                        accrual.service_amount = accrual.service_amount - unpaid_service_amount
+                        accrual.status = MasterSalaryAccrual.Status.PAID
+                        accrual.payout = payout
+                        accrual.save(update_fields=["amount", "service_amount", "status", "payout", "updated_at"])
+
+                        # Новое начисление на неоплаченную часть
+                        MasterSalaryAccrual.objects.create(
+                            company_id=accrual.company_id,
+                            master=accrual.master,
+                            appointment=accrual.appointment,
+                            service=accrual.service,
+                            service_amount=unpaid_service_amount,
+                            percent=accrual.percent,
+                            amount=unpaid_amount,
+                            status=MasterSalaryAccrual.Status.ACCRUED
+                        )
+
+                        remaining = Decimal("0.00")
+                        break
+
+        serializer = self.get_serializer(payout)
+        return Response(serializer.data, status=status.HTTP_201_CREATED)
