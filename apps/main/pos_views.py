@@ -42,6 +42,8 @@ from apps.users.models import (
     SCALE_BARCODE_MODE_AUTO,
     SCALE_BARCODE_MODE_WEIGHT,
     SCALE_BARCODE_MODE_AMOUNT,
+    SCALE_BARCODE_LAYOUT_PLU,
+    SCALE_BARCODE_LAYOUT_CODE,
 )
 from apps.main.models import (
     Cart,
@@ -755,30 +757,37 @@ SCALE_WEIGHT_PREFIXES = {"20"}
 SCALE_AMOUNT_PREFIXES = {"25"}
 
 
-def _company_scale_barcode_mode(company_id) -> str:
-    """Режим чтения штрихкода весов для компании (Company.scale_barcode_mode)."""
-    mode = (
+def _company_scale_barcode_settings(company_id):
+    """(mode, layout) чтения штрихкода весов для компании."""
+    row = (
         Company.objects.filter(id=company_id)
-        .values_list("scale_barcode_mode", flat=True)
+        .values("scale_barcode_mode", "scale_barcode_layout")
         .first()
-    )
-    return mode or SCALE_BARCODE_MODE_AUTO
+    ) or {}
+    mode = row.get("scale_barcode_mode") or SCALE_BARCODE_MODE_AUTO
+    layout = row.get("scale_barcode_layout") or SCALE_BARCODE_LAYOUT_PLU
+    return mode, layout
 
 
-def _parse_scale_barcode(barcode: str, mode: str = SCALE_BARCODE_MODE_AUTO):
+def _company_scale_barcode_mode(company_id) -> str:
+    """Режим чтения штрихкода весов (обратная совместимость)."""
+    return _company_scale_barcode_settings(company_id)[0]
+
+
+def _parse_scale_barcode(barcode: str, mode: str = SCALE_BARCODE_MODE_AUTO,
+                         layout: str = SCALE_BARCODE_LAYOUT_PLU):
     """
-    EAN-13 штрихкод весов ШТРИХ-ПРИНТ / TM-A/TM-F: FF WWWWW EEEEE C
+    EAN-13 штрихкод весов. Раскладка полей задаётся `layout`:
 
-    - FF (20–29) : префикс (весовой / итоговый / штучный)
-    - WWWWW      : PLU (5 цифр)
-    - EEEEE      : вес ИЛИ стоимость — в зависимости от режима (см. ниже)
-    - C          : контрольная цифра
+    - "plu"  (по умолчанию): FF PPPPP EEEEE C
+        FF (20–29) префикс, PPPPP PLU (5 цифр), EEEEE вес/сумма (5 цифр), C — чек.
+        Товар ищется по Product.plu.
+    - "code" : FF PPPPPP WWWW C
+        FF префикс, PPPPPP PLU (6 цифр — в экспорте «Код»=PLU), WWWW вес (4 цифры,
+        граммы), C — чек. Товар ищется по Product.plu; значение всегда трактуется как вес.
 
-    Трактовка поля EEEEE задаётся `mode` (Company.scale_barcode_mode):
-      - "weight" : всегда вес в граммах -> weight_kg = EEEEE / 1000.
-      - "amount" : всегда сумма в сомах (без деления на 100); вес считается
-                   позже в _finalize_scale_data_for_product как сумма / цена.
-      - "auto"   : по префиксу — весовой (20) -> вес, иначе -> сумма.
+    Трактовка поля значения (для layout=plu) задаётся `mode`
+    (Company.scale_barcode_mode): weight | amount | auto (по префиксу).
     """
     if not barcode or len(barcode) != 13 or not barcode.isdigit():
         return None
@@ -791,9 +800,29 @@ def _parse_scale_barcode(barcode: str, mode: str = SCALE_BARCODE_MODE_AUTO):
     if not (20 <= prefix_num <= 29):
         return None
 
+    check_digit = barcode[12]
+
+    # --- Раскладка «по коду»: префикс(2) + PLU(6) + вес(4) + чек ---
+    # В экспорте «Код»=PLU, поэтому 6-значное поле — это PLU; ищем по Product.plu.
+    if layout == SCALE_BARCODE_LAYOUT_CODE:
+        try:
+            plu = int(barcode[2:8])
+            weight_raw = int(barcode[8:12])
+        except ValueError:
+            return None
+        return {
+            "prefix": prefix,
+            "plu": plu,
+            "raw_code": str(plu),
+            "weight_raw": weight_raw,
+            "weight_kg": Decimal(weight_raw) / Decimal(1000),
+            "check_digit": check_digit,
+            "mode": "weight",
+        }
+
+    # --- Раскладка «по PLU»: префикс(2) + PLU(5) + значение(5) + чек ---
     raw_code = barcode[2:7]
     value_raw = barcode[7:12]
-    check_digit = barcode[12]
 
     try:
         plu = int(raw_code)
@@ -1033,8 +1062,8 @@ def _lookup_product_for_pos_scan(company_id, barcode: str, *, only_fields=POS_SC
         except ValueError:
             pass
 
-    scale_mode = _company_scale_barcode_mode(company_id)
-    scale_data = _parse_scale_barcode(barcode, scale_mode)
+    scale_mode, scale_layout = _company_scale_barcode_settings(company_id)
+    scale_data = _parse_scale_barcode(barcode, scale_mode, scale_layout)
     if scale_data:
         product = _resolve_product_by_plu_or_code_for_pos(company_id, scale_data, only_fields=only_fields)
         if product:

@@ -178,14 +178,17 @@ def _scale_line(plu, name, price, *, barcode_type, unit_code, department, shelf_
     """
     Одна строка данных рабочего файла весов — 23 поля, TAB-разделитель.
     Порядок и константы совпадают с экспортом PLU-менеджера весов Rongta RLS.
+
+    «Код» = PLU: реальные Product.code бывают большими/длинными и не влезают в поле
+    штрихкода. PLU маленький (1..N) и всегда помещается; касса ищет товар по PLU.
     """
-    code = 1000 + (int(plu) - 1) * 10
+    code = str(int(plu))
     safe_name = (name or "").replace("\t", " ").replace("\r", " ").replace("\n", " ")[:SCALE_NAME_MAX]
     return "\t".join([
         str(int(plu)),          # 0  Горячая клавиша (= PLU)
         safe_name,              # 1  Название
         str(int(plu)),          # 2  LF код (= PLU)
-        str(code),              # 3  Код = 1000 + (plu-1)*10
+        code,                   # 3  Код = Product.code (реальный)
         str(barcode_type),      # 4  Тип штрихкода
         _scale_price(price),    # 5  Цена единицы (X,XXX)
         str(unit_code),         # 6  Вес единицы (код; 4 = kg)
