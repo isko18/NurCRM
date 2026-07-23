@@ -415,6 +415,18 @@ class Appointment(models.Model):
                 raise ValidationError({"client": "Клиент принадлежит другому филиалу."})
         # ВАЖНО: услуги НЕ проверяем здесь — M2M ещё не проставлен при create()
 
+    def save(self, *args, **kwargs):
+        old_status = None
+        if self.pk:
+            try:
+                old_status = Appointment.objects.filter(pk=self.pk).values_list("status", flat=True).first()
+            except Exception:
+                pass
+        self.full_clean()
+        super().save(*args, **kwargs)
+        from .services import BarberSalaryService
+        BarberSalaryService.handle_appointment_status_change(self, old_status, self.status)
+
 
 # Позиция услуги в записи (одна и та же услуга может быть несколько раз — каждая отдельной позицией)
 class AppointmentService(models.Model):
@@ -949,3 +961,77 @@ class OnlineBooking(models.Model):
             )
         self.full_clean()
         super().save(*args, **kwargs)
+
+
+# ===========================
+# Salary Models (Master's salary)
+# ===========================
+
+class ServiceSalaryRate(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    company = models.ForeignKey(Company, on_delete=models.CASCADE, related_name="service_salary_rates")
+    service = models.OneToOneField(Service, on_delete=models.CASCADE, related_name="salary_rate")
+    percent = models.DecimalField(max_digits=5, decimal_places=2, default=Decimal("0.00"))
+    updated_at = models.DateTimeField(auto_now=True)
+    updated_by = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.SET_NULL, related_name="+")
+
+    class Meta:
+        verbose_name = 'Ставка вознаграждения услуги'
+        verbose_name_plural = 'Ставки вознаграждения услуг'
+
+    def __str__(self):
+        return f"{self.service.name}: {self.percent}%"
+
+
+class MasterSalaryPayout(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    company = models.ForeignKey(Company, on_delete=models.CASCADE, related_name="master_salary_payouts")
+    master = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="salary_payouts")
+    amount = models.DecimalField(max_digits=12, decimal_places=2)
+    comment = models.CharField(max_length=255, blank=True, default="")
+    created_by = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.SET_NULL, related_name="+")
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        verbose_name = 'Выплата мастеру'
+        verbose_name_plural = 'Выплаты мастерам'
+        ordering = ["-created_at"]
+
+    def __str__(self):
+        return f"Payout {self.amount} to {self.master}"
+
+
+class MasterSalaryAccrual(models.Model):
+    class Status(models.TextChoices):
+        PENDING = "pending", "Ожидает оплаты"
+        ACCRUED = "accrued", "Начислено"
+        PAID = "paid", "Выплачено"
+        CANCELED = "canceled", "Отменено"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    company = models.ForeignKey(Company, on_delete=models.CASCADE, related_name="master_salary_accruals")
+    master = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="salary_accruals")
+    appointment = models.ForeignKey(Appointment, on_delete=models.CASCADE, related_name="salary_accruals")
+    service = models.ForeignKey(Service, on_delete=models.PROTECT, related_name="salary_accruals")
+    service_amount = models.DecimalField(max_digits=12, decimal_places=2)
+    percent = models.DecimalField(max_digits=5, decimal_places=2)
+    amount = models.DecimalField(max_digits=12, decimal_places=2)
+    status = models.CharField(max_length=20, choices=Status.choices)
+    payout = models.ForeignKey(MasterSalaryPayout, null=True, blank=True, on_delete=models.SET_NULL, related_name="accruals")
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = 'Начисление зарплаты мастеру'
+        verbose_name_plural = 'Начисления зарплаты мастерам'
+        ordering = ["-created_at"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["appointment", "service"],
+                condition=models.Q(status__in=["accrued", "pending"]),
+                name="uniq_active_accrual_per_appointment_service",
+            )
+        ]
+
+    def __str__(self):
+        return f"Accrual {self.amount} for {self.master} (Service: {self.service.name})"

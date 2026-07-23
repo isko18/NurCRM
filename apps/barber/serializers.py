@@ -14,7 +14,10 @@ from .models import (
     Payout,
     PayoutSale,
     ProductSalePayout,
-    OnlineBooking
+    OnlineBooking,
+    ServiceSalaryRate,
+    MasterSalaryPayout,
+    MasterSalaryAccrual
 )
 from apps.users.models import Branch  # для проверки филиала по ?branch=
 from apps.users.models import User
@@ -1384,3 +1387,80 @@ class BarberAnalyticsResponseSerializer(serializers.Serializer):
     totals = BarberAnalyticsTotalsSerializer()
     services = BarberAnalyticsServiceRowSerializer(many=True)
     masters = BarberAnalyticsMasterRowSerializer(many=True, required=False)
+
+
+# ===========================
+# Salary Serializers (Master's salary)
+# ===========================
+
+class ServiceSalaryRateSerializer(serializers.ModelSerializer):
+    service = serializers.UUIDField(source="id", read_only=True)
+    service_name = serializers.CharField(source="name", read_only=True)
+    price = serializers.DecimalField(max_digits=10, decimal_places=2, read_only=True)
+    percent = serializers.SerializerMethodField()
+    updated_at = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Service
+        fields = ["service", "service_name", "price", "percent", "updated_at"]
+
+    def get_percent(self, obj):
+        rate = getattr(obj, "salary_rate", None)
+        return rate.percent if rate else Decimal("0.00")
+
+    def get_updated_at(self, obj):
+        rate = getattr(obj, "salary_rate", None)
+        return rate.updated_at if rate else None
+
+
+class MasterSalaryPayoutSerializer(serializers.ModelSerializer):
+    master_name = serializers.SerializerMethodField()
+    created_by_name = serializers.SerializerMethodField()
+
+    class Meta:
+        model = MasterSalaryPayout
+        fields = [
+            "id", "created_at", "master", "master_name",
+            "amount", "comment", "created_by", "created_by_name"
+        ]
+        read_only_fields = ["id", "created_at", "created_by"]
+
+    def get_master_name(self, obj):
+        if not obj.master:
+            return ""
+        if obj.master.first_name or obj.master.last_name:
+            return f"{obj.master.first_name or ''} {obj.master.last_name or ''}".strip()
+        return obj.master.email
+
+    def get_created_by_name(self, obj):
+        if not obj.created_by:
+            return ""
+        if obj.created_by.first_name or obj.created_by.last_name:
+            return f"{obj.created_by.first_name or ''} {obj.created_by.last_name or ''}".strip()
+        return obj.created_by.email
+
+
+class MasterSalaryAccrualSerializer(serializers.ModelSerializer):
+    master_name = serializers.SerializerMethodField()
+    appointment_number = serializers.SerializerMethodField()
+    service_name = serializers.CharField(source="service.name", read_only=True)
+
+    class Meta:
+        model = MasterSalaryAccrual
+        fields = [
+            "id", "created_at", "master", "master_name",
+            "appointment", "appointment_number", "service", "service_name",
+            "service_amount", "percent", "amount", "status"
+        ]
+
+    def get_master_name(self, obj):
+        if not obj.master:
+            return ""
+        if obj.master.first_name or obj.master.last_name:
+            return f"{obj.master.first_name or ''} {obj.master.last_name or ''}".strip()
+        return obj.master.email
+
+    def get_appointment_number(self, obj):
+        if not obj.appointment_id:
+            return ""
+        return f"A-{obj.appointment_id.hex[:6].upper()}"

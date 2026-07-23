@@ -159,12 +159,14 @@ def build_summary_snapshot(summary):
             "weight": _q3(weight),
         })
 
-        key = (item.product_id, unit, price)
+        unit_lower = unit.lower()
+        name_clean = (getattr(product, "name", "") or "").strip()
+        key = (name_clean, unit_lower, price)
         group = product_groups.get(key)
         if group is None:
             group = {
                 "product": product,
-                "name": getattr(product, "name", "") or "",
+                "name": name_clean,
                 "unit": unit,
                 "price": price,
                 "quantity": Decimal("0"),
@@ -239,9 +241,9 @@ def build_summary_snapshot(summary):
     # --- Итоги ---
     summary.documents_count = len(summary_doc_rows)
     summary.products_count = len(summary_product_rows)
-    summary.total_quantity = _q3(sum((row.quantity for row in summary_doc_rows), Decimal("0")))
-    summary.total_weight = _q3(sum((row.weight for row in summary_doc_rows), Decimal("0")))
-    summary.total_amount = _q2(sum((row.amount for row in summary_doc_rows), Decimal("0")))
+    summary.total_quantity = _q3(sum((row.quantity for row in summary_product_rows), Decimal("0")))
+    summary.total_weight = _q3(sum((row.weight for row in summary_product_rows), Decimal("0")))
+    summary.total_amount = _q2(sum((row.amount for row in summary_product_rows), Decimal("0")))
     summary.save(update_fields=[
         "documents_count", "products_count",
         "total_quantity", "total_weight", "total_amount", "updated_at",

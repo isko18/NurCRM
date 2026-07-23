@@ -3,9 +3,11 @@ from rest_framework.exceptions import PermissionDenied
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
+from django.http import HttpResponse
 from django.utils import timezone
 from django.shortcuts import get_object_or_404
 from django.db import transaction, IntegrityError
+from apps.main.models import Company
 
 from django_filters.rest_framework import DjangoFilterBackend
 
@@ -1562,3 +1564,194 @@ class FunnelAnalyticsView(CompanyBranchQuerysetMixin, generics.GenericAPIView):
             owner=params.get("owner") or None,
         )
         return Response(data)
+
+
+# ==========================
+# WhatsApp Integration (каркас)
+# ==========================
+from django.conf import settings
+from .funnel.whatsapp import WhatsAppConsaltingService
+from .serializers import WhatsAppMessageConsaltingSerializer, WhatsAppSendSerializer
+from .models import WhatsAppMessageConsalting
+
+class LeadWhatsAppSendView(CompanyBranchQuerysetMixin, generics.GenericAPIView):
+    """
+    Отправка сообщения клиенту через WhatsApp в контексте лида.
+    POST /leads/<id>/whatsapp/send/
+    """
+    queryset = LeadConsalting.objects.all()
+    serializer_class = WhatsAppSendSerializer
+
+    def post(self, request, *args, **kwargs):
+        lead = self.get_object()
+        ser = self.get_serializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+        text = ser.validated_data["text"]
+
+        try:
+            wa_message = WhatsAppConsaltingService.send_message(
+                lead=lead,
+                text=text,
+                user=request.user
+            )
+            return Response(
+                WhatsAppMessageConsaltingSerializer(wa_message).data,
+                status=status.HTTP_201_CREATED
+            )
+        except Exception as e:
+            return Response(
+                {"detail": str(e)},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+
+class LeadWhatsAppHistoryView(CompanyBranchQuerysetMixin, generics.ListAPIView):
+    """
+    Получение истории переписки по WhatsApp для конкретного лида.
+    GET /leads/<id>/whatsapp/history/
+    """
+    serializer_class = WhatsAppMessageConsaltingSerializer
+
+    def get_queryset(self):
+        lead_id = self.kwargs.get("pk")
+        company = self._user_company()
+        return WhatsAppMessageConsalting.objects.filter(
+            lead_id=lead_id,
+            company=company
+        ).order_by("created_at")
+
+
+class WhatsAppConsaltingWebhookView(APIView):
+    """
+    Прием входящих сообщений и обновлений статуса от шлюза WhatsApp (Meta Cloud API или Node.js).
+    GET /whatsapp/webhook/ -> Верификация Webhook Meta (hub.mode, hub.verify_token, hub.challenge)
+    POST /whatsapp/webhook/ -> Обработка событий сообщения/статуса от Meta Cloud API или Node.js
+    """
+    permission_classes = []
+    authentication_classes = []
+
+    def get(self, request, *args, **kwargs):
+        """
+        Верификация вебхука от Meta WhatsApp Cloud API.
+        """
+        mode = request.query_params.get("hub.mode")
+        token = request.query_params.get("hub.verify_token")
+        challenge = request.query_params.get("hub.challenge")
+
+        verify_token = (
+            getattr(settings, "WHATSAPP_VERIFY_TOKEN", None)
+            or getattr(settings, "META_WA_VERIFY_TOKEN", None)
+            or getattr(settings, "WHATSAPP_NODE_TOKEN", "change-me")
+        )
+
+        if mode == "subscribe" and token == verify_token:
+            return HttpResponse(challenge or "", content_type="text/plain", status=200)
+        return Response({"detail": "Forbidden verification token"}, status=status.HTTP_403_FORBIDDEN)
+
+    def post(self, request, *args, **kwargs):
+        # 1. Проверяем payload Meta WhatsApp Cloud API (object/entry)
+        if "object" in request.data and "entry" in request.data:
+            entries = request.data.get("entry", [])
+            processed_count = 0
+            for entry in entries:
+                changes = entry.get("changes", [])
+                for change in changes:
+                    val = change.get("value", {})
+                    # Сообщения
+                    messages = val.get("messages", [])
+                    for msg in messages:
+                        phone = msg.get("from")
+                        msg_id = msg.get("id")
+                        msg_type = msg.get("type")
+                        text_body = ""
+                        if msg_type == "text":
+                            text_body = msg.get("text", {}).get("body", "")
+                        elif msg_type in ["image", "document", "audio", "video"]:
+                            text_body = msg.get(msg_type, {}).get("caption", f"[{msg_type.upper()}]")
+
+                        if phone and msg_id:
+                            company_id = request.query_params.get("company_id")
+                            if not company_id:
+                                company = Company.objects.first()
+                                company_id = company.id if company else None
+
+                            if company_id:
+                                WhatsAppConsaltingService.handle_incoming_message(
+                                    company_id=company_id,
+                                    phone=phone,
+                                    text=text_body or "[Входящее сообщение]",
+                                    message_id=msg_id
+                                )
+                                processed_count += 1
+
+                    # Статусы
+                    statuses = val.get("statuses", [])
+                    for st in statuses:
+                        st_id = st.get("id")
+                        st_val = st.get("status")
+                        if st_id and st_val:
+                            WhatsAppConsaltingService.update_message_status(st_id, st_val)
+                            processed_count += 1
+
+            return Response({"status": "success", "processed": processed_count}, status=status.HTTP_200_OK)
+
+        # 2. Формат Node.js / Кастомного шлюза
+        token = request.headers.get("X-WA-TOKEN")
+        expected_token = getattr(settings, "WHATSAPP_NODE_TOKEN", "change-me")
+        if token and token != expected_token:
+            return Response({"detail": "Forbidden"}, status=status.HTTP_403_FORBIDDEN)
+
+        event_type = request.data.get("event")
+        
+        if event_type == "message":
+            company_id = request.data.get("company_id")
+            phone = request.data.get("phone")
+            text = request.data.get("text")
+            message_id = request.data.get("message_id")
+            
+            if not all([company_id, phone, text, message_id]):
+                return Response(
+                    {"detail": "Недостаточно данных для обработки сообщения"},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+                
+            try:
+                lead = WhatsAppConsaltingService.handle_incoming_message(
+                    company_id=company_id,
+                    phone=phone,
+                    text=text,
+                    message_id=message_id
+                )
+                return Response(
+                    {
+                        "status": "success",
+                        "lead_id": str(lead.id)
+                    },
+                    status=status.HTTP_200_OK
+                )
+            except Exception as e:
+                return Response(
+                    {"detail": str(e)},
+                    status=status.HTTP_500_INTERNAL_SERVER_ERROR
+                )
+                
+        elif event_type == "status":
+            message_id = request.data.get("message_id")
+            status_str = request.data.get("status")
+            
+            if not message_id or not status_str:
+                return Response(
+                    {"detail": "Недостаточно данных для обновления статуса"},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+                
+            WhatsAppConsaltingService.update_message_status(
+                message_id=message_id,
+                status_str=status_str
+            )
+            return Response({"status": "success"}, status=status.HTTP_200_OK)
+            
+        return Response(
+            {"detail": "Неподдерживаемый тип события"},
+            status=status.HTTP_400_BAD_REQUEST
+        )
