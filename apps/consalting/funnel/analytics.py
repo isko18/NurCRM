@@ -1,7 +1,7 @@
 """Аналитика воронки: конверсия, время в стадии, drop-off, win-rate."""
 from decimal import Decimal
 
-from django.db.models import Sum, Count, Avg, F, Case, When, DurationField, ExpressionWrapper
+from django.db.models import Sum, Count, Avg, F, Case, When, DurationField, ExpressionWrapper, Q
 from django.db.models.functions import TruncDate
 
 from ..models import (
@@ -163,18 +163,22 @@ class PipelineAnalytics:
 class SalesAnalytics:
     """Агрегированная аналитика продаж консалтинга (SaleConsalting).
 
-    Закрывает дыру «продажи не попадают в аналитику»: суммирует выручку, средний чек,
-    абонентку, топ услуг и продажи по сотрудникам. Скоуп — компания (+ опц. филиал),
-    с фильтрами по периоду и сотруднику.
+    Реализация по спецификации docs-consaltion/analytics.md:
+    KPIs (доход, продажи, заявки, средний чек, уникальные/повторные клиенты, MRR, факт оплаты),
+    детализация по услугам с разбивкой по тарифам, рейтинг сотрудников, заявки по статусам.
     """
 
     @staticmethod
-    def compute(company, date_from=None, date_to=None, branch=None, user=None):
+    def compute(company, date_from=None, date_to=None, branch=None, user=None, service=None):
+        from ..models import RequestsConsalting
+
         qs = SaleConsalting.objects.filter(company=company)
         if branch:
             qs = qs.filter(branch_id=branch)
         if user:
             qs = qs.filter(user_id=user)
+        if service:
+            qs = qs.filter(services_id=service)
         if date_from:
             qs = qs.filter(created_at__date__gte=date_from)
         if date_to:
@@ -189,35 +193,137 @@ class SalesAnalytics:
         revenue = float(agg["revenue"] or 0)
         sub_count = qs.filter(subscription_amount__gt=0).count()
 
-        by_service = [
-            {
-                "service_id": str(r["services__id"]) if r["services__id"] else None,
-                "service_name": r["services__name"] or "(без услуги)",
-                "count": r["count"],
-                "revenue": float(r["revenue"] or 0),
-            }
-            for r in (
-                qs.values("services__id", "services__name")
-                .annotate(count=Count("id"), revenue=Sum("total"))
-                .order_by("-revenue")[:10]
-            )
-        ]
+        # 1. Заявки на консультацию (RequestsConsalting)
+        req_qs = RequestsConsalting.objects.filter(company=company)
+        if branch:
+            req_qs = req_qs.filter(branch_id=branch)
+        if date_from:
+            req_qs = req_qs.filter(created_at__date__gte=date_from)
+        if date_to:
+            req_qs = req_qs.filter(created_at__date__lte=date_to)
 
-        by_employee = [
-            {
-                "user_id": str(r["user__id"]) if r["user__id"] else None,
-                "user_name": (f"{r['user__first_name'] or ''} {r['user__last_name'] or ''}".strip()
-                              or r["user__email"]) if r["user__id"] else "(не указан)",
-                "count": r["count"],
-                "revenue": float(r["revenue"] or 0),
-            }
-            for r in (
-                qs.values("user__id", "user__first_name", "user__last_name", "user__email")
-                .annotate(count=Count("id"), revenue=Sum("total"))
-                .order_by("-revenue")[:10]
-            )
-        ]
+        req_counts = dict(req_qs.values("status").annotate(c=Count("id")).values_list("status", "c"))
+        requests_count = req_qs.count()
+        requests_by_status = {
+            "new": req_counts.get("new", 0),
+            "in_work": req_counts.get("in_work", 0),
+            "done": req_counts.get("done", 0),
+            "canceled": req_counts.get("canceled", 0),
+        }
 
+        # 2. Уникальные и повторные клиенты
+        clients_qs = (
+            qs.filter(client__isnull=False)
+            .values("client_id")
+            .annotate(sales_cnt=Count("id"))
+        )
+        unique_clients = len(clients_qs)
+        repeat_clients = sum(1 for c in clients_qs if c["sales_cnt"] > 1)
+
+        # 3. Расчёт MRR (абонентская плата)
+        sub_mrr = Decimal("0.00")
+        sub_sales = qs.select_related("tariff").filter(
+            Q(subscription_amount__gt=0) | Q(tariff__subscription_amount__gt=0)
+        )
+        for sale in sub_sales:
+            amt = sale.subscription_amount or (sale.tariff.subscription_amount if sale.tariff else Decimal("0.00"))
+            period = sale.subscription_period or (sale.tariff.subscription_period if sale.tariff else "month")
+            if amt > 0:
+                if period == "year":
+                    sub_mrr += amt / Decimal("12")
+                else:
+                    sub_mrr += amt
+        subscription_mrr = float(round(sub_mrr, 2))
+
+        # 4. Детализация по услугам и тарифам
+        service_groups = {}
+        for sale in qs.select_related("services", "tariff").all():
+            srv_id = str(sale.services.id) if sale.services else None
+            srv_name = sale.services.name if sale.services else "(без услуги)"
+            if srv_id not in service_groups:
+                service_groups[srv_id] = {
+                    "service_id": srv_id,
+                    "service_name": srv_name,
+                    "count": 0,
+                    "revenue": Decimal("0.00"),
+                    "clients_set": set(),
+                    "tariffs_dict": {},
+                }
+            sg = service_groups[srv_id]
+            sg["count"] += 1
+            sale_amt = sale.total or Decimal("0.00")
+            sg["revenue"] += sale_amt
+            if sale.client_id:
+                sg["clients_set"].add(sale.client_id)
+
+            t_name = sale.tariff.name if sale.tariff else "(без тарифа)"
+            t_id = str(sale.tariff.id) if sale.tariff else None
+            if t_name not in sg["tariffs_dict"]:
+                sg["tariffs_dict"][t_name] = {
+                    "tariff_id": t_id,
+                    "tariff_name": t_name,
+                    "count": 0,
+                    "revenue": Decimal("0.00"),
+                }
+            td = sg["tariffs_dict"][t_name]
+            td["count"] += 1
+            td["revenue"] += sale_amt
+
+        by_service = []
+        for srv_id, sg in service_groups.items():
+            s_rev = float(sg["revenue"])
+            s_cnt = sg["count"]
+            tariffs_list = [
+                {
+                    "tariff_id": td["tariff_id"],
+                    "tariff_name": td["tariff_name"],
+                    "count": td["count"],
+                    "revenue": float(td["revenue"]),
+                }
+                for td in sg["tariffs_dict"].values()
+            ]
+            tariffs_list.sort(key=lambda x: x["revenue"], reverse=True)
+
+            by_service.append({
+                "service_id": sg["service_id"],
+                "service_name": sg["service_name"],
+                "count": s_cnt,
+                "revenue": s_rev,
+                "avg_check": round(s_rev / s_cnt, 2) if s_cnt else 0.0,
+                "clients": len(sg["clients_set"]),
+                "share": round((s_rev / revenue * 100), 1) if revenue > 0 else 0.0,
+                "tariffs": tariffs_list,
+            })
+        by_service.sort(key=lambda x: x["revenue"], reverse=True)
+
+        # 5. Детализация по сотрудникам
+        emp_groups = {}
+        for sale in qs.select_related("user").all():
+            u_id = str(sale.user.id) if sale.user else None
+            u_name = (f"{sale.user.first_name or ''} {sale.user.last_name or ''}".strip() or sale.user.email) if sale.user else "(не указан)"
+            if u_id not in emp_groups:
+                emp_groups[u_id] = {
+                    "user_id": u_id,
+                    "name": u_name,
+                    "count": 0,
+                    "revenue": Decimal("0.00"),
+                }
+            eg = emp_groups[u_id]
+            eg["count"] += 1
+            eg["revenue"] += (sale.total or Decimal("0.00"))
+
+        by_employee = []
+        for eg in emp_groups.values():
+            by_employee.append({
+                "user_id": eg["user_id"],
+                "name": eg["name"],
+                "user_name": eg["name"],
+                "count": eg["count"],
+                "revenue": float(eg["revenue"]),
+            })
+        by_employee.sort(key=lambda x: x["revenue"], reverse=True)
+
+        # 6. Динамика по дням
         by_day = [
             {"date": r["d"].isoformat() if r["d"] else None, "revenue": float(r["v"] or 0), "count": r["c"]}
             for r in (
@@ -226,10 +332,22 @@ class SalesAnalytics:
             )
         ]
 
-        # факт оплаты (деньги, реально полученные за период)
+        # 7. Зарегистрированный факт оплаты
         paid_income = consalting_paid_income(company, date_from=date_from, date_to=date_to, branch=branch)
 
+        kpis = {
+            "revenue": revenue,
+            "sales_count": count,
+            "requests_count": requests_count,
+            "avg_check": round(revenue / count, 2) if count else 0.0,
+            "unique_clients": unique_clients,
+            "repeat_clients": repeat_clients,
+            "subscription_mrr": subscription_mrr,
+            "paid_income": float(paid_income),
+        }
+
         return {
+            "kpis": kpis,
             "totals": {
                 "count": count,
                 "revenue": revenue,
@@ -241,4 +359,6 @@ class SalesAnalytics:
             "by_service": by_service,
             "by_employee": by_employee,
             "by_day": by_day,
+            "requests_by_status": requests_by_status,
         }
+

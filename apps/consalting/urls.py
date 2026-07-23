@@ -49,12 +49,41 @@ from .views import (
     LeadWhatsAppSendView,
     LeadWhatsAppHistoryView,
     WhatsAppConsaltingWebhookView,
+    ServiceSalaryRateListView,
+    ServiceSalaryRateUpdateView,
+    SalaryAccrualListView,
+    SalarySummaryView,
+    SalaryPayoutListCreateView,
+    InboundLeadListCreateView,
+    InboundLeadRetrieveUpdateView,
+    InboundLeadAssignView,
+    LeadDistributionSettingsView,
+    WhatsAppInboundWebhookView,
+    SubscriptionMatrixView,
 )
 
 urlpatterns = [
+    # ===== Клиенты & Абонентская матрица =====
+    path('subscription-matrix/', SubscriptionMatrixView.as_view(), name='subscription-matrix'),
+    path('clients/subscription-matrix/', SubscriptionMatrixView.as_view(), name='clients-subscription-matrix'),
+    # ===== Входящие лиды и авто-распределение =====
+    path('inbound-leads/', InboundLeadListCreateView.as_view(), name='inbound-leads-list-create'),
+    path('inbound-leads/<uuid:pk>/', InboundLeadRetrieveUpdateView.as_view(), name='inbound-leads-detail'),
+    path('inbound-leads/<uuid:pk>/assign/', InboundLeadAssignView.as_view(), name='inbound-leads-assign'),
+    path('lead-distribution/', LeadDistributionSettingsView.as_view(), name='lead-distribution'),
+    path('integrations/whatsapp/webhook/', WhatsAppInboundWebhookView.as_view(), name='whatsapp-inbound-webhook'),
+
+    # ===== Зарплатная система =====
+    path('salary/rates/', ServiceSalaryRateListView.as_view(), name='salary-rates-list'),
+    path('salary/rates/<uuid:service_id>/', ServiceSalaryRateUpdateView.as_view(), name='salary-rates-update'),
+    path('salary/accruals/', SalaryAccrualListView.as_view(), name='salary-accruals-list'),
+    path('salary/summary/', SalarySummaryView.as_view(), name='salary-summary'),
+    path('salary/payouts/', SalaryPayoutListCreateView.as_view(), name='salary-payouts-list-create'),
+
     path('services/', ServicesConsaltingListCreateView.as_view(), name='services-list-create'),
     path('services/<uuid:pk>/', ServicesConsaltingRetrieveUpdateDestroyView.as_view(), name='services-rud'),
 
+    path('analytics/', SaleConsaltingAnalyticsView.as_view(), name='consulting-analytics'),
     path('sales/', SaleConsaltingListCreateView.as_view(), name='sales-list-create'),
     path('sales/analytics/', SaleConsaltingAnalyticsView.as_view(), name='sales-analytics'),
     path('sales/<uuid:pk>/', SaleConsaltingRetrieveUpdateDestroyView.as_view(), name='sales-rud'),

@@ -125,7 +125,40 @@ def lead_deleted(lead):
 def notify_user(user_id, event_type, payload):
     if not user_id:
         return
-    _send([user_group(user_id)], event_type, payload, _NOTIFY_HANDLER)
+    import uuid
+    from django.utils import timezone
+
+    notif_id = str(uuid.uuid4())
+    event_name = f"consulting.{event_type}" if not event_type.startswith("consulting.") else event_type
+
+    title = "Уведомление консалтинга"
+    message = "Обновлены данные в консалтинге"
+    if isinstance(payload, dict):
+        if payload.get("title"):
+            title = payload["title"]
+        elif payload.get("full_name"):
+            title = f"Вам назначен лид: {payload['full_name']}"
+
+        if payload.get("message"):
+            message = payload["message"]
+        elif payload.get("phone"):
+            message = f"Тел: {payload.get('phone', '')}"
+
+    envelope = {
+        "type": event_name,
+        "data": {
+            "id": notif_id,
+            "title": title,
+            "message": message,
+            "type": event_name,
+            "is_read": False,
+            "created_at": timezone.now().isoformat(),
+            "meta": payload if isinstance(payload, dict) else {"payload": payload}
+        }
+    }
+
+    groups = [f"consalting_user_{user_id}", f"user_{user_id}"]
+    _send(groups, event_name, envelope, _NOTIFY_HANDLER)
 
 
 # ===== обратная совместимость: вызывается из signals.py для событий воронки =====
