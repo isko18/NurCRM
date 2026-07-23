@@ -3,9 +3,11 @@ from rest_framework.exceptions import PermissionDenied
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
+from django.http import HttpResponse
 from django.utils import timezone
 from django.shortcuts import get_object_or_404
 from django.db import transaction, IntegrityError
+from apps.main.models import Company
 
 from django_filters.rest_framework import DjangoFilterBackend
 
@@ -1621,15 +1623,82 @@ class LeadWhatsAppHistoryView(CompanyBranchQuerysetMixin, generics.ListAPIView):
 
 class WhatsAppConsaltingWebhookView(APIView):
     """
-    Прием входящих сообщений и обновлений статуса от шлюза WhatsApp (Node.js).
-    POST /whatsapp/webhook/
+    Прием входящих сообщений и обновлений статуса от шлюза WhatsApp (Meta Cloud API или Node.js).
+    GET /whatsapp/webhook/ -> Верификация Webhook Meta (hub.mode, hub.verify_token, hub.challenge)
+    POST /whatsapp/webhook/ -> Обработка событий сообщения/статуса от Meta Cloud API или Node.js
     """
     permission_classes = []
     authentication_classes = []
 
+    def get(self, request, *args, **kwargs):
+        """
+        Верификация вебхука от Meta WhatsApp Cloud API.
+        """
+        mode = request.query_params.get("hub.mode")
+        token = request.query_params.get("hub.verify_token")
+        challenge = request.query_params.get("hub.challenge")
+
+        verify_token = (
+            getattr(settings, "WHATSAPP_VERIFY_TOKEN", None)
+            or getattr(settings, "META_WA_VERIFY_TOKEN", None)
+            or getattr(settings, "WHATSAPP_NODE_TOKEN", "change-me")
+        )
+
+        if mode == "subscribe" and token == verify_token:
+            return HttpResponse(challenge or "", content_type="text/plain", status=200)
+        return Response({"detail": "Forbidden verification token"}, status=status.HTTP_403_FORBIDDEN)
+
     def post(self, request, *args, **kwargs):
+        # 1. Проверяем payload Meta WhatsApp Cloud API (object/entry)
+        if "object" in request.data and "entry" in request.data:
+            entries = request.data.get("entry", [])
+            processed_count = 0
+            for entry in entries:
+                changes = entry.get("changes", [])
+                for change in changes:
+                    val = change.get("value", {})
+                    # Сообщения
+                    messages = val.get("messages", [])
+                    for msg in messages:
+                        phone = msg.get("from")
+                        msg_id = msg.get("id")
+                        msg_type = msg.get("type")
+                        text_body = ""
+                        if msg_type == "text":
+                            text_body = msg.get("text", {}).get("body", "")
+                        elif msg_type in ["image", "document", "audio", "video"]:
+                            text_body = msg.get(msg_type, {}).get("caption", f"[{msg_type.upper()}]")
+
+                        if phone and msg_id:
+                            company_id = request.query_params.get("company_id")
+                            if not company_id:
+                                company = Company.objects.first()
+                                company_id = company.id if company else None
+
+                            if company_id:
+                                WhatsAppConsaltingService.handle_incoming_message(
+                                    company_id=company_id,
+                                    phone=phone,
+                                    text=text_body or "[Входящее сообщение]",
+                                    message_id=msg_id
+                                )
+                                processed_count += 1
+
+                    # Статусы
+                    statuses = val.get("statuses", [])
+                    for st in statuses:
+                        st_id = st.get("id")
+                        st_val = st.get("status")
+                        if st_id and st_val:
+                            WhatsAppConsaltingService.update_message_status(st_id, st_val)
+                            processed_count += 1
+
+            return Response({"status": "success", "processed": processed_count}, status=status.HTTP_200_OK)
+
+        # 2. Формат Node.js / Кастомного шлюза
         token = request.headers.get("X-WA-TOKEN")
-        if token != getattr(settings, "WHATSAPP_NODE_TOKEN", "change-me"):
+        expected_token = getattr(settings, "WHATSAPP_NODE_TOKEN", "change-me")
+        if token and token != expected_token:
             return Response({"detail": "Forbidden"}, status=status.HTTP_403_FORBIDDEN)
 
         event_type = request.data.get("event")
