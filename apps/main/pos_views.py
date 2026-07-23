@@ -21,7 +21,7 @@ from rest_framework.exceptions import NotFound, PermissionDenied, ValidationErro
 
 from decimal import Decimal, ROUND_HALF_UP, InvalidOperation
 from datetime import timedelta, datetime, date, time as dtime
-import io, os, uuid
+import io, os, uuid, logging
 
 from django.db.models import Q, F, Value as V, Sum, Prefetch, Count
 from django.db.models.functions import Coalesce
@@ -55,6 +55,7 @@ from apps.main.models import (
     Product,
     ProductPackage,
     ProductPromotionTier,
+    ProductAlternateBarcode,
     MobileScannerToken,
     Client,
     ProductImage,
@@ -974,31 +975,103 @@ def _product_pk_from_cache(value):
     return value
 
 
+pos_scan_logger = logging.getLogger("crm.pos.scan")
+
+
+class AmbiguousBarcode(Exception):
+    """Штрихкод (с учётом нормализации/альт-кодов) найден у нескольких разных товаров.
+
+    Раньше в таких случаях брался произвольный `.first()` — в чек мог уйти не тот
+    товар. Теперь бэкенд не угадывает: касса получает 409 и просит выбрать вручную.
+    """
+
+    def __init__(self, barcode: str, matches):
+        self.barcode = barcode
+        self.matches = matches  # [(id_str, name), ...]
+        super().__init__(f"Штрихкод {barcode} найден у нескольких товаров.")
+
+
+def _ambiguous_barcode_response(exc: "AmbiguousBarcode") -> Response:
+    return Response(
+        {
+            "ambiguous": True,
+            "message": (
+                f"Штрихкод {exc.barcode} найден у нескольких товаров — "
+                f"выберите нужный вручную."
+            ),
+            "matches": [{"id": mid, "name": name} for mid, name in exc.matches],
+        },
+        status=status.HTTP_409_CONFLICT,
+    )
+
+
+def _product_matches_candidates(product, candidates, company_id) -> bool:
+    """Проверка, что найденный (в т.ч. из кэша) товар действительно содержит один
+    из кандидатов-штрихкодов — защита от протухшего/чужого кэша."""
+    if (getattr(product, "barcode", None) or "") in candidates:
+        return True
+    return ProductAlternateBarcode.objects.filter(
+        product_id=product.pk, company_id=company_id, barcode__in=candidates
+    ).exists()
+
+
 def _resolve_product_by_barcode_for_pos(company_id, barcode: str, *, only_fields):
-    """Товар по основному или дополнительному штрихкоду. В кэше хранится только UUID."""
+    """Товар по основному или дополнительному штрихкоду. В кэше хранится только UUID.
+
+    Приоритет — точное совпадение основного `barcode` (это и есть напечатанный код),
+    затем кэш (с проверкой), затем нормализованные кандидаты и альт-коды. Если после
+    нормализации/альтов под скан подходят РАЗНЫЕ товары — поднимаем AmbiguousBarcode,
+    а не берём произвольный.
+    """
     candidates = _pos_barcode_lookup_candidates(barcode)
     if not candidates:
         return None
+    raw = (barcode or "").strip()
 
+    # 1) Точное совпадение основного штрихкода — вне конкуренции.
+    exact = (
+        Product.objects.only(*only_fields)
+        .filter(company_id=company_id, barcode=raw)
+        .first()
+    )
+    if exact:
+        pos_scan_logger.info("scan barcode=%s company=%s -> product=%s (exact)", raw, company_id, exact.pk)
+        return exact
+
+    # 2) Кэш — но проверяем, что товар всё ещё несёт этот штрихкод.
     for candidate in candidates:
         cache_key = f"product_barcode:{company_id}:{candidate}"
         cached_id = _product_pk_from_cache(cache.get(cache_key))
         if cached_id:
-            try:
-                return Product.objects.only(*only_fields).get(pk=cached_id, company_id=company_id)
-            except (Product.DoesNotExist, TypeError, ValueError):
-                cache.delete(cache_key)
+            p = (
+                Product.objects.only(*only_fields)
+                .filter(pk=cached_id, company_id=company_id)
+                .first()
+            )
+            if p and _product_matches_candidates(p, candidates, company_id):
+                pos_scan_logger.info("scan barcode=%s company=%s -> product=%s (cache)", raw, company_id, p.pk)
+                return p
+            cache.delete(cache_key)
 
-    product = (
+    # 3) Полный поиск по кандидатам (основной + альтернативные), детерминированно.
+    matches = list(
         Product.objects.only(*only_fields)
         .filter(company_id=company_id)
         .filter(Q(barcode__in=candidates) | Q(alternate_barcodes__barcode__in=candidates))
         .distinct()
-        .first()
+        .order_by("created_at", "id")
     )
-    if product:
-        for candidate in candidates:
-            cache.set(f"product_barcode:{company_id}:{candidate}", str(product.pk), 300)
+    if not matches:
+        return None
+    if len(matches) > 1:
+        pairs = [(str(m.pk), getattr(m, "name", "")) for m in matches]
+        pos_scan_logger.warning("scan barcode=%s company=%s AMBIGUOUS -> %s", raw, company_id, pairs)
+        raise AmbiguousBarcode(raw, pairs)
+
+    product = matches[0]
+    for candidate in candidates:
+        cache.set(f"product_barcode:{company_id}:{candidate}", str(product.pk), 300)
+    pos_scan_logger.info("scan barcode=%s company=%s -> product=%s", raw, company_id, product.pk)
     return product
 
 
@@ -2256,7 +2329,10 @@ class SaleScanAPIView(MarketCashierOnlyMixin, APIView):
         barcode = ser.validated_data["barcode"].strip()
         qty = ser.validated_data["quantity"]
 
-        product, scale_data, lookup_error = _lookup_product_for_pos_scan(url_cart.company_id, barcode)
+        try:
+            product, scale_data, lookup_error = _lookup_product_for_pos_scan(url_cart.company_id, barcode)
+        except AmbiguousBarcode as exc:
+            return _ambiguous_barcode_response(exc)
         if not product:
             return Response({"not_found": True, "message": lookup_error or "Товар не найден"}, status=404)
 
@@ -3008,11 +3084,14 @@ class ProductFindByBarcodeAPIView(MarketCashierOnlyMixin, APIView):
         if not barcode:
             return Response([], status=200)
 
-        product = _resolve_product_by_barcode_for_pos(
-            request.user.company_id,
-            barcode,
-            only_fields=("id", "name", "barcode", "price"),
-        )
+        try:
+            product = _resolve_product_by_barcode_for_pos(
+                request.user.company_id,
+                barcode,
+                only_fields=("id", "name", "barcode", "price"),
+            )
+        except AmbiguousBarcode as exc:
+            return _ambiguous_barcode_response(exc)
 
         if not product:
             return Response([], status=200)
@@ -3049,11 +3128,14 @@ class MobileScannerIngestAPIView(APIView):
         if cart.status != Cart.Status.ACTIVE:
             return Response({"detail": "cart is not active"}, status=409)
 
-        product, scale_data, lookup_error = _lookup_product_for_pos_scan(
-            cart.company_id,
-            barcode,
-            only_fields=("id", "company_id", "price", "barcode"),
-        )
+        try:
+            product, scale_data, lookup_error = _lookup_product_for_pos_scan(
+                cart.company_id,
+                barcode,
+                only_fields=("id", "company_id", "price", "barcode"),
+            )
+        except AmbiguousBarcode as exc:
+            return _ambiguous_barcode_response(exc)
         if not product:
             return Response({"not_found": True, "message": lookup_error or "Товар не найден"}, status=404)
 
@@ -3752,11 +3834,14 @@ class AgentSaleScanAPIView(MarketCashierOnlyMixin, CompanyBranchRestrictedMixin,
         barcode = ser.validated_data["barcode"].strip()
         qty = ser.validated_data["quantity"]
 
-        product, scale_data, lookup_error = _lookup_product_for_pos_scan(
-            cart.company_id,
-            barcode,
-            only_fields=("id", "company_id", "price", "quantity", "barcode", "plu", "code", "is_weight"),
-        )
+        try:
+            product, scale_data, lookup_error = _lookup_product_for_pos_scan(
+                cart.company_id,
+                barcode,
+                only_fields=("id", "company_id", "price", "quantity", "barcode", "plu", "code", "is_weight"),
+            )
+        except AmbiguousBarcode as exc:
+            return _ambiguous_barcode_response(exc)
         if not product:
             return Response({"not_found": True, "message": lookup_error or "Товар не найден"}, status=404)
 

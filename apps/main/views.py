@@ -893,12 +893,31 @@ class WeightProductsScaleExportAPIView(CompanyBranchRestrictedMixin, APIView):
 # ===========================
 #  Product create by barcode (ручной view)
 # ===========================
+class ProductBarcodeAwareSearchFilter(filters.SearchFilter):
+    """Разделяет точное сканирование ШК и обычный текстовый поиск.
+
+    Если строка поиска выглядит как цельный штрихкод (только цифры, длина ≥ 8),
+    ищем ТОЧНО по `barcode`, не подмешивая коинцидентные совпадения по имени.
+    Это гасит эффект «сканер утёк в поле поиска и подменил сетку»: раньше
+    `search=460…` через icontains вытаскивал любые товары, где эти цифры есть
+    подстрокой в name/barcode.
+    """
+
+    def get_search_fields(self, view, request):
+        term = (request.query_params.get(self.search_param) or "").strip()
+        if term.isdigit() and len(term) >= 8:
+            return ["=barcode"]  # `=` в DRF → точное совпадение
+        return getattr(view, "search_fields", None)
+
+
 class ProductListView(CompanyBranchRestrictedMixin, generics.ListAPIView):
     serializer_class = ProductSerializer
-    filter_backends = [filters.SearchFilter, filters.OrderingFilter]
+    filter_backends = [ProductBarcodeAwareSearchFilter, filters.OrderingFilter]
     search_fields = ["name", "barcode"]
     ordering_fields = ["created_at", "updated_at", "price"]
-    ordering = ["-created_at"]
+    # По умолчанию — по монотонному seq: детерминированный порядок «сначала новые»
+    # без переупорядочивания строк с одинаковым created_at (fallback ниже — тоже -seq).
+    ordering = ["-seq"]
 
     def get_queryset(self):
         qs = (
@@ -970,21 +989,24 @@ class ProductListView(CompanyBranchRestrictedMixin, generics.ListAPIView):
         # сортировку (query.order_by пуст), порядок «новые первыми» не должен теряться.
         current = [o for o in (list(qs.query.order_by) or []) if "is_favorite" not in o]
         if not current:
-            current = ["-created_at"]
+            current = ["-seq"]
         qs = qs.order_by("-is_favorite", *current)
         return qs
 
 
 class CompactProductCursorPagination(CursorPagination):
     page_size = 30
-    ordering = "-created_at"
+    # Курсор по монотонному уникальному seq (не по created_at!): created_at не
+    # уникален, и при массовом создании товары с одинаковым временем проскакивали
+    # мимо границы курсора и «исчезали» из бесконечного скролла.
+    ordering = "-seq"
 
 
 class ProductCompactListView(CompanyBranchRestrictedMixin, generics.ListAPIView):
     """Компактный список товаров для бесконечного скролла — лёгкий сериализатор + курсорная пагинация."""
     serializer_class = ProductListSerializer
     pagination_class = CompactProductCursorPagination
-    filter_backends = [filters.SearchFilter, filters.OrderingFilter]
+    filter_backends = [ProductBarcodeAwareSearchFilter, filters.OrderingFilter]
     search_fields = ["name", "barcode"]
     ordering_fields = ["created_at", "updated_at", "price"]
     ordering = ["-created_at"]
@@ -1005,6 +1027,7 @@ class ProductCompactListView(CompanyBranchRestrictedMixin, generics.ListAPIView)
                 "article",
                 "company_id",
                 "hotkey_group",
+                "seq",  # нужен курсорной пагинации (ordering="-seq")
             )
             .prefetch_related(
                 Prefetch(
@@ -2229,7 +2252,11 @@ class ProductWarehouseBarcodeAPIView(CompanyBranchRestrictedMixin, APIView):
         return _annotate_product_is_favorite(qs)
 
     def get(self, request, barcode, *args, **kwargs):
-        from apps.main.pos_views import _lookup_product_for_pos_scan
+        from apps.main.pos_views import (
+            _lookup_product_for_pos_scan,
+            AmbiguousBarcode,
+            _ambiguous_barcode_response,
+        )
 
         barcode = (barcode or "").strip()
         if not barcode:
@@ -2239,7 +2266,10 @@ class ProductWarehouseBarcodeAPIView(CompanyBranchRestrictedMixin, APIView):
         if not company:
             return Response({"detail": "Компания не найдена."}, status=status.HTTP_403_FORBIDDEN)
 
-        product_stub, _scale_data, lookup_error = _lookup_product_for_pos_scan(company.id, barcode)
+        try:
+            product_stub, _scale_data, lookup_error = _lookup_product_for_pos_scan(company.id, barcode)
+        except AmbiguousBarcode as exc:
+            return _ambiguous_barcode_response(exc)
         if not product_stub:
             return Response(
                 {"detail": lookup_error or "Товар с таким штрих-кодом не найден."},

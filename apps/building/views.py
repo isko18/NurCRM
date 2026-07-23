@@ -156,6 +156,7 @@ from .serializers import (
     BuildingPayrollPaymentApproveSerializer,
 )
 from . import services
+from .onec_bridge import sync_cashflow
 
 User = get_user_model()
 
@@ -4067,12 +4068,14 @@ class BuildingCashFlowListCreateView(CompanyQuerysetMixin, generics.ListCreateAP
         return qs.order_by("-created_at")
 
     def perform_create(self, serializer):
-        user = self.request.user
-        cashbox = serializer.validated_data.get("cashbox")
-        if cashbox:
-            serializer.save(company=cashbox.company, branch=cashbox.branch)
-        else:
-            serializer.save()
+        with transaction.atomic():
+            cashbox = serializer.validated_data.get("cashbox")
+            if cashbox:
+                instance = serializer.save(company=cashbox.company, branch=cashbox.branch)
+            else:
+                instance = serializer.save()
+            # Проведённое движение → ПКО/РКО в 1С (no-op, если интеграция выключена).
+            sync_cashflow(instance, operation="create")
 
 
 class BuildingCashFlowDetailView(CompanyQuerysetMixin, generics.RetrieveUpdateDestroyAPIView):
@@ -4122,6 +4125,12 @@ class BuildingCashFlowBulkStatusUpdateView(CompanyQuerysetMixin, generics.Generi
 
         whens = [When(id=_id, then=Value(id_to_status[_id])) for _id in ids]
         qs.update(status=Case(*whens, output_field=CharField()))
+
+        # Одобренные движения → выгрузка в 1С (ПКО/РКО).
+        approved_ids = [i for i in ids if id_to_status[i] == BuildingCashFlow.Status.APPROVED]
+        if approved_ids:
+            for cf in BuildingCashFlow.objects.filter(id__in=approved_ids).select_related("company", "cashbox"):
+                sync_cashflow(cf, operation="create")
 
         return Response(
             {"count": len(ids), "updated_ids": [str(x) for x in ids]},
