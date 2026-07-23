@@ -254,25 +254,32 @@ class SaleConsalting(TimeStampedModel):
 
     # ----- расчёт итоговой суммы -----
     def base_price(self):
-        """Цена тарифа, если выбран; иначе базовая цена услуги."""
+        """Цена тарифа, если выбран; иначе базовая цена услуги (с учетом ролевого переопределения)."""
+        seller_role = getattr(self.user, 'custom_role', None) if self.user else None
         if self.tariff_id:
-            return self.tariff.price or 0
+            if seller_role:
+                rp = self.tariff.role_prices.filter(custom_role=seller_role).first()
+                if rp:
+                    return rp.price
+            return self.tariff.price or Decimal("0.00")
         if self.services_id:
-            return self.services.price or 0
-        return 0
+            if seller_role:
+                rp = self.services.role_prices.filter(custom_role=seller_role).first()
+                if rp:
+                    return rp.price
+            return self.services.price or Decimal("0.00")
+        return Decimal("0.00")
 
     def installation_price(self):
-        return (self.services.installation_price or 0) if self.services_id else 0
+        return Decimal("0.00")
 
     def items_total(self):
-        # при пересчёте элементы могут быть ещё не сохранены — используем уже сохранённые
         return sum((i.price or 0) for i in self.items.all())
 
     def compute_total(self):
-        """Итого = тариф + установка + доп. товары − скидка + наценка."""
+        """Итого = цена по роли + доп. товары − скидка + наценка."""
         return (
             self.base_price()
-            + self.installation_price()
             + self.items_total()
             - (self.discount or 0)
             + (self.markup or 0)
@@ -705,7 +712,60 @@ class FunnelStageConsalting(TimeStampedModel):
         ]
 
     def __str__(self):
-        return f"{self.funnel.name} — {self.name}"
+        return f"{self.service.name} — {self.name}"
+
+
+class ServiceRolePriceConsalting(TimeStampedModel):
+    """Переопределение цены услуги для конкретной роли."""
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    service = models.ForeignKey(
+        ServicesConsalting, on_delete=models.CASCADE,
+        related_name="role_prices", verbose_name="Услуга"
+    )
+    custom_role = models.ForeignKey(
+        'users.CustomRole', on_delete=models.CASCADE, verbose_name="Кастомная роль"
+    )
+    price = models.DecimalField(max_digits=12, decimal_places=2, verbose_name="Переопределённая цена")
+
+    class Meta:
+        verbose_name = "Цена услуги по роли"
+        verbose_name_plural = "Цены услуг по ролям"
+        constraints = [
+            models.UniqueConstraint(
+                fields=["service", "custom_role"],
+                name="uniq_consalting_service_role_price"
+            )
+        ]
+
+    def __str__(self):
+        return f"{self.service.name} ({self.custom_role}): {self.price}"
+
+
+class TariffRolePriceConsalting(TimeStampedModel):
+    """Переопределение цены тарифа для конкретной роли."""
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    tariff = models.ForeignKey(
+        TariffConsalting, on_delete=models.CASCADE,
+        related_name="role_prices", verbose_name="Тариф"
+    )
+    custom_role = models.ForeignKey(
+        'users.CustomRole', on_delete=models.CASCADE, verbose_name="Кастомная роль"
+    )
+    price = models.DecimalField(max_digits=12, decimal_places=2, verbose_name="Переопределённая цена")
+
+    class Meta:
+        verbose_name = "Цена тарифа по роли"
+        verbose_name_plural = "Цены тарифов по ролям"
+        constraints = [
+            models.UniqueConstraint(
+                fields=["tariff", "custom_role"],
+                name="uniq_consalting_tariff_role_price"
+            )
+        ]
+
+    def __str__(self):
+        return f"{self.tariff.name} ({self.custom_role}): {self.price}"
+
 
     def save(self, *args, **kwargs):
         # синхронизируем устаревшие флаги с семантическим типом
@@ -1352,4 +1412,191 @@ class WhatsAppMessageConsalting(TimeStampedModel):
 
     def __str__(self):
         return f"{self.direction} - {self.message_id} ({self.status})"
+
+
+# ======== Зарплатная система консалтинга (ставки, авто-начисления, выплаты) ========
+class ServiceSalaryRateConsalting(TimeStampedModel):
+    """Ставка авто-начисления % зарплаты продавца по конкретной услуге."""
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    company = models.ForeignKey(
+        Company, on_delete=models.CASCADE,
+        related_name="consalting_salary_rates", verbose_name="Компания"
+    )
+    service = models.OneToOneField(
+        ServicesConsalting, on_delete=models.CASCADE,
+        related_name="consulting_salary_rate", verbose_name="Услуга"
+    )
+    percent = models.DecimalField(
+        max_digits=5, decimal_places=2, default=0, verbose_name="Процент начисления (%)"
+    )
+
+    class Meta:
+        verbose_name = "Ставка зарплаты по услуге"
+        verbose_name_plural = "Ставки зарплаты по услугам"
+
+    def __str__(self):
+        return f"{self.service.name}: {self.percent}%"
+
+
+class SalaryPayoutConsalting(TimeStampedModel):
+    """Выплата зарплаты сотруднику."""
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    company = models.ForeignKey(
+        Company, on_delete=models.CASCADE,
+        related_name="consalting_salary_payouts", verbose_name="Компания"
+    )
+    user = models.ForeignKey(
+        User, on_delete=models.CASCADE,
+        related_name="consalting_salary_payouts", verbose_name="Сотрудник"
+    )
+    amount = models.DecimalField(max_digits=12, decimal_places=2, verbose_name="Сумма выплаты")
+    comment = models.CharField(max_length=255, blank=True, verbose_name="Комментарий")
+
+    class Meta:
+        verbose_name = "Выплата зарплаты"
+        verbose_name_plural = "Выплаты зарплаты"
+        ordering = ['-created_at']
+
+    def __str__(self):
+        return f"Выплата {self.user}: {self.amount}"
+
+
+class SalaryAccrualConsalting(TimeStampedModel):
+    """Автоматическое начисление зарплаты продавцу с закрытой продажи / лида."""
+    class Status(models.TextChoices):
+        ACCRUED = "accrued", "Начислено"
+        PAID = "paid", "Выплачено"
+        CANCELED = "canceled", "Отменено"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    company = models.ForeignKey(
+        Company, on_delete=models.CASCADE,
+        related_name="consalting_salary_accruals", verbose_name="Компания"
+    )
+    user = models.ForeignKey(
+        User, on_delete=models.CASCADE,
+        related_name="consalting_salary_accruals", verbose_name="Продавец"
+    )
+    service = models.ForeignKey(
+        ServicesConsalting, on_delete=models.PROTECT,
+        null=True, blank=True, related_name="salary_accruals", verbose_name="Услуга"
+    )
+    sale = models.ForeignKey(
+        "SaleConsalting", null=True, blank=True, on_delete=models.CASCADE,
+        related_name="salary_accruals", verbose_name="Продажа"
+    )
+    lead = models.ForeignKey(
+        "LeadConsalting", null=True, blank=True, on_delete=models.SET_NULL,
+        related_name="salary_accruals", verbose_name="Лид"
+    )
+    base_amount = models.DecimalField(
+        max_digits=12, decimal_places=2, default=0, verbose_name="Базовая сумма сделки"
+    )
+    percent = models.DecimalField(
+        max_digits=5, decimal_places=2, default=0, verbose_name="Снимок ставки (%)"
+    )
+    amount = models.DecimalField(
+        max_digits=12, decimal_places=2, default=0, verbose_name="Сумма начисления"
+    )
+    status = models.CharField(
+        max_length=16, choices=Status.choices, default=Status.ACCRUED, verbose_name="Статус"
+    )
+    payout = models.ForeignKey(
+        SalaryPayoutConsalting, null=True, blank=True, on_delete=models.SET_NULL,
+        related_name="accruals", verbose_name="Выплата"
+    )
+
+    class Meta:
+        verbose_name = "Начисление зарплаты"
+        verbose_name_plural = "Начисления зарплаты"
+        ordering = ['-created_at']
+        constraints = [
+            models.UniqueConstraint(
+                fields=["sale"],
+                condition=~models.Q(status="canceled"),
+                name="uniq_consalting_accrual_per_sale"
+            )
+        ]
+
+    def __str__(self):
+        return f"Начисление {self.user}: {self.amount} ({self.status})"
+
+
+# ======== Входящие лиды из WhatsApp и авто-распределение по ролям ========
+class InboundLeadConsalting(TimeStampedModel):
+    """Входящий лид (WhatsApp / ручной ввод) до авто-распределения или создания воронки."""
+    class Status(models.TextChoices):
+        NEW = "new", "Новый"
+        ASSIGNED = "assigned", "Назначен"
+        IN_WORK = "in_work", "В работе"
+        CONVERTED = "converted", "Конвертирован"
+        REJECTED = "rejected", "Отклонён"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    company = models.ForeignKey(
+        Company, on_delete=models.CASCADE,
+        related_name="consalting_inbound_leads", verbose_name="Компания"
+    )
+    full_name = models.CharField(max_length=255, blank=True, verbose_name="Имя клиента")
+    phone = models.CharField(max_length=32, blank=True, verbose_name="Телефон")
+    source = models.CharField(max_length=32, default="whatsapp", verbose_name="Источник")
+    external_id = models.CharField(max_length=128, blank=True, verbose_name="ID сообщения провайдера")
+    message = models.TextField(blank=True, verbose_name="Текст сообщения")
+    owner = models.ForeignKey(
+        User, null=True, blank=True, on_delete=models.SET_NULL,
+        related_name="consalting_inbound_leads", verbose_name="Владелец"
+    )
+    status = models.CharField(
+        max_length=16, choices=Status.choices, default=Status.NEW, verbose_name="Статус"
+    )
+    lead = models.ForeignKey(
+        "LeadConsalting", null=True, blank=True, on_delete=models.SET_NULL,
+        related_name="inbound_leads", verbose_name="Карточка воронки"
+    )
+
+    class Meta:
+        verbose_name = "Входящий лид WhatsApp"
+        verbose_name_plural = "Входящие лиды WhatsApp"
+        ordering = ['-created_at']
+        constraints = [
+            models.UniqueConstraint(
+                fields=["company", "source", "external_id"],
+                condition=~models.Q(external_id=""),
+                name="uniq_consalting_inbound_external"
+            )
+        ]
+
+    def __str__(self):
+        return f"{self.full_name or self.phone} ({self.status})"
+
+
+class LeadDistributionSettingsConsalting(TimeStampedModel):
+    """Правила авто-распределения входящих лидов между сотрудниками компании."""
+    class Strategy(models.TextChoices):
+        ROUND_ROBIN = "round_robin", "Поровну (Round-Robin)"
+        LEAST_LOADED = "least_loaded", "По наименьшей загрузке"
+        MANUAL = "manual", "Вручную"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    company = models.OneToOneField(
+        Company, on_delete=models.CASCADE,
+        related_name="consalting_lead_distribution", verbose_name="Компания"
+    )
+    enabled = models.BooleanField(default=True, verbose_name="Авто-распределение включено")
+    strategy = models.CharField(
+        max_length=16, choices=Strategy.choices, default=Strategy.ROUND_ROBIN, verbose_name="Стратегия"
+    )
+    roles = models.ManyToManyField(
+        "users.CustomRole", blank=True, related_name="consalting_distribution_settings", verbose_name="Роли-получатели"
+    )
+    _rr_cursor = models.IntegerField(default=0, verbose_name="Указатель Round-Robin")
+
+    class Meta:
+        verbose_name = "Настройки распределения лидов"
+        verbose_name_plural = "Настройки распределения лидов"
+
+    def __str__(self):
+        return f"Распределение {self.company}: {self.strategy} (enabled={self.enabled})"
+
+
 

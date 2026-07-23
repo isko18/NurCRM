@@ -7,6 +7,7 @@ from django.http import HttpResponse
 from django.utils import timezone
 from django.shortcuts import get_object_or_404
 from django.db import transaction, IntegrityError
+from django.db.models import Sum, Count, Q
 from apps.main.models import Company
 
 from django_filters.rest_framework import DjangoFilterBackend
@@ -24,6 +25,11 @@ from .models import (
     LeadActivityConsalting,
     LeadTaskConsalting,
     FunnelUserPreferenceConsalting,
+    ServiceSalaryRateConsalting,
+    SalaryAccrualConsalting,
+    SalaryPayoutConsalting,
+    InboundLeadConsalting,
+    LeadDistributionSettingsConsalting,
 )
 from .serializers import (
     ServicesConsaltingSerializer,
@@ -43,6 +49,11 @@ from .serializers import (
     LeadTaskConsaltingSerializer,
     FunnelStageReorderItemSerializer,
     FunnelUserPreferenceConsaltingSerializer,
+    ServiceSalaryRateConsaltingSerializer,
+    SalaryAccrualConsaltingSerializer,
+    SalaryPayoutConsaltingSerializer,
+    InboundLeadConsaltingSerializer,
+    LeadDistributionSettingsConsaltingSerializer,
 )
 from .funnel.state_machine import (
     FunnelStateMachine, StateTransitionError, allowed_next_types,
@@ -53,7 +64,9 @@ from .funnel.analytics import PipelineAnalytics, SalesAnalytics
 from .funnel.events import emit as emit_funnel_event
 from .funnel import realtime
 from .funnel.provisioning import provision_funnel_for_role
-from .funnel.completion import apply_completion_side_effects
+from .funnel.completion import (
+    apply_completion_side_effects, ensure_subscription_deal, _add_months, accrue_salary_for_sale
+)
 from .access import (
     is_owner_like, apply_lead_visibility, apply_client_visibility,
     visible_funnels_qs, can_view_funnel, can_manage_leads, can_manage_stages,
@@ -312,9 +325,10 @@ class SaleConsaltingListCreateView(CompanyBranchQuerysetMixin, generics.ListCrea
             raise PermissionDenied("У пользователя не настроена компания.")
         model = self.get_queryset().model
         if _has_field(model, "branch"):
-            serializer.save(company=company, branch=self._active_branch(), user=self.request.user)
+            sale = serializer.save(company=company, branch=self._active_branch(), user=self.request.user)
         else:
-            serializer.save(company=company, user=self.request.user)
+            sale = serializer.save(company=company, user=self.request.user)
+        accrue_salary_for_sale(sale, seller=self.request.user)
 
 
 class SaleConsaltingRetrieveUpdateDestroyView(CompanyBranchQuerysetMixin, generics.RetrieveUpdateDestroyAPIView):
@@ -326,8 +340,15 @@ class SaleConsaltingRetrieveUpdateDestroyView(CompanyBranchQuerysetMixin, generi
 
 class SaleConsaltingAnalyticsView(CompanyBranchQuerysetMixin, generics.GenericAPIView):
     """
-    Агрегированная аналитика продаж консалтинга.
-    GET /api/consalting/sales/analytics/?date_from=&date_to=&branch=&user=
+    Агрегированная аналитика продаж консалтинга (согласно docs-consaltion/analytics.md).
+    GET /api/consalting/analytics/
+    GET /api/consalting/sales/analytics/
+    Поддерживаемые параметры:
+      * period_start / date_from
+      * period_end / date_to
+      * branch
+      * user / employee
+      * service
     """
     queryset = SaleConsalting.objects.all()
     serializer_class = SaleConsaltingSerializer
@@ -337,14 +358,22 @@ class SaleConsaltingAnalyticsView(CompanyBranchQuerysetMixin, generics.GenericAP
         if not company:
             raise PermissionDenied("У пользователя не настроена компания.")
         params = request.query_params
+        date_from = params.get("period_start") or params.get("date_from") or None
+        date_to = params.get("period_end") or params.get("date_to") or None
+        user = params.get("user") or params.get("employee") or None
+        service = params.get("service") or None
+        branch = params.get("branch") or None
+
         data = SalesAnalytics.compute(
             company,
-            date_from=params.get("date_from") or None,
-            date_to=params.get("date_to") or None,
-            branch=params.get("branch") or None,
-            user=params.get("user") or None,
+            date_from=date_from,
+            date_to=date_to,
+            branch=branch,
+            user=user,
+            service=service,
         )
         return Response(data)
+
 
 
 # ==========================
@@ -1269,7 +1298,7 @@ class LeadRegisterPaymentView(LeadVisibilityMixin, CompanyBranchQuerysetMixin, g
         if not can_manage_leads(request.user, lead.funnel):
             raise PermissionDenied("Нет прав управлять лидами в этой воронке.")
         if not lead.client_id:
-            return Response({"detail": "Для оплаты нужен привязанный клиент (create-client)."},
+            return Response({"detail": "У лида должен быть указан или создан клиент перед регистрацией оплаты."},
                             status=status.HTTP_400_BAD_REQUEST)
 
         mode = request.data.get("payment_mode")
@@ -1513,6 +1542,17 @@ class LeadTaskListCreateView(CompanyBranchQuerysetMixin, generics.ListCreateAPIV
             title=f"Задача: {task.title}", payload={"task_id": str(task.id)},
             touch_last_activity=False,
         )
+        if task.assignee_id:
+            realtime.notify_user(
+                task.assignee_id,
+                "consulting.lead.task.assigned",
+                {
+                    "title": f"Поручена задача: {task.title}",
+                    "message": f"Срок: {task.due_date.strftime('%Y-%m-%d %H:%M') if task.due_date else 'Не указан'}",
+                    "lead_id": str(lead.id),
+                    "task_id": str(task.id),
+                }
+            )
 
 
 class LeadTaskRetrieveUpdateDestroyView(CompanyBranchQuerysetMixin, generics.RetrieveUpdateDestroyAPIView):
@@ -1755,3 +1795,531 @@ class WhatsAppConsaltingWebhookView(APIView):
             {"detail": "Неподдерживаемый тип события"},
             status=status.HTTP_400_BAD_REQUEST
         )
+
+
+# ==========================
+# Salary Auto-Accrual Views (docs-consaltion/salary-auto-accrual.md)
+# ==========================
+class ServiceSalaryRateListView(CompanyBranchQuerysetMixin, generics.GenericAPIView):
+    """GET /api/consalting/salary/rates/  — список ставок по услугам."""
+    def get(self, request, *args, **kwargs):
+        company = self._user_company()
+        if not company:
+            raise PermissionDenied("У пользователя не настроена компания.")
+
+        services = ServicesConsalting.objects.filter(company=company)
+        search = request.query_params.get("search")
+        if search:
+            services = services.filter(name__icontains=search)
+
+        rates_dict = {
+            r.service_id: r for r in ServiceSalaryRateConsalting.objects.filter(company=company)
+        }
+
+        results = []
+        for svc in services:
+            rate = rates_dict.get(svc.id)
+            results.append({
+                "service": str(svc.id),
+                "service_name": svc.name,
+                "price": float(svc.price or 0),
+                "percent": str(rate.percent) if rate else "0.00",
+                "updated_at": rate.updated_at.isoformat() if rate else None,
+            })
+        return Response({"results": results})
+
+
+class ServiceSalaryRateUpdateView(CompanyBranchQuerysetMixin, generics.GenericAPIView):
+    """PUT /api/consalting/salary/rates/<service_id>/ — установить процент ставки."""
+    def put(self, request, service_id, *args, **kwargs):
+        company = self._user_company()
+        if not company:
+            raise PermissionDenied("У пользователя не настроена компания.")
+        if not is_owner_like(request.user):
+            raise PermissionDenied("Управлять ставками может только руководитель.")
+
+        svc = get_object_or_404(ServicesConsalting, pk=service_id, company=company)
+        percent = request.data.get("percent", 0)
+        try:
+            percent_dec = Decimal(str(percent))
+            if percent_dec < 0 or percent_dec > 100:
+                raise ValueError()
+        except (ValueError, TypeError, InvalidOperation):
+            return Response({"percent": "Значение процента должно быть от 0 до 100."}, status=status.HTTP_400_BAD_REQUEST)
+
+        rate, _ = ServiceSalaryRateConsalting.objects.get_or_create(
+            company=company, service=svc, defaults={"percent": percent_dec}
+        )
+        if rate.percent != percent_dec:
+            rate.percent = percent_dec
+            rate.save(update_fields=["percent", "updated_at"])
+
+        return Response({
+            "service": str(svc.id),
+            "service_name": svc.name,
+            "price": float(svc.price or 0),
+            "percent": str(rate.percent),
+            "updated_at": rate.updated_at.isoformat()
+        })
+
+
+class SalaryAccrualListView(CompanyBranchQuerysetMixin, generics.ListAPIView):
+    """GET /api/consalting/salary/accruals/ — список начислений зарплаты."""
+    serializer_class = SalaryAccrualConsaltingSerializer
+    filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
+    filterset_fields = ["service", "status", "user"]
+    search_fields = ["user__first_name", "user__last_name", "user__email", "service__name"]
+    ordering_fields = ["created_at", "amount"]
+    ordering = ["-created_at"]
+
+    def get_queryset(self):
+        company = self._user_company()
+        if not company:
+            return SalaryAccrualConsalting.objects.none()
+        qs = SalaryAccrualConsalting.objects.filter(company=company).select_related("user", "service", "sale", "lead")
+        if not is_owner_like(self.request.user):
+            qs = qs.filter(user=self.request.user)
+
+        date_from = self.request.query_params.get("date_from") or self.request.query_params.get("period_start")
+        date_to = self.request.query_params.get("date_to") or self.request.query_params.get("period_end")
+        if date_from:
+            qs = qs.filter(created_at__date__gte=date_from)
+        if date_to:
+            qs = qs.filter(created_at__date__lte=date_to)
+        return qs
+
+
+class SalarySummaryView(CompanyBranchQuerysetMixin, generics.GenericAPIView):
+    """GET /api/consalting/salary/summary/ — сводка по зарплате за период."""
+    def get(self, request, *args, **kwargs):
+        company = self._user_company()
+        if not company:
+            raise PermissionDenied("У пользователя не настроена компания.")
+
+        qs = SalaryAccrualConsalting.objects.filter(company=company)
+        payouts_qs = SalaryPayoutConsalting.objects.filter(company=company)
+
+        if not is_owner_like(request.user):
+            qs = qs.filter(user=request.user)
+            payouts_qs = payouts_qs.filter(user=request.user)
+
+        date_from = request.query_params.get("date_from") or request.query_params.get("period_start")
+        date_to = request.query_params.get("date_to") or request.query_params.get("period_end")
+        if date_from:
+            qs = qs.filter(created_at__date__gte=date_from)
+            payouts_qs = payouts_qs.filter(created_at__date__gte=date_from)
+        if date_to:
+            qs = qs.filter(created_at__date__lte=date_to)
+            payouts_qs = payouts_qs.filter(created_at__date__lte=date_to)
+
+        accrued = float(qs.filter(status__in=["accrued", "paid"]).aggregate(s=Sum("amount"))["s"] or 0)
+        paid = float(payouts_qs.aggregate(s=Sum("amount"))["s"] or 0)
+        remaining = max(0.0, accrued - paid)
+
+        by_user_dict = {}
+        for r in qs.filter(status__in=["accrued", "paid"]).values("user_id", "user__first_name", "user__last_name", "user__email").annotate(a=Sum("amount")):
+            uid = str(r["user_id"])
+            uname = f"{r['user__first_name'] or ''} {r['user__last_name'] or ''}".strip() or r["user__email"]
+            by_user_dict[uid] = {"user": uid, "name": uname, "accrued": float(r["a"] or 0), "paid": 0.0, "remaining": float(r["a"] or 0)}
+
+        for r in payouts_qs.values("user_id", "user__first_name", "user__last_name", "user__email").annotate(p=Sum("amount")):
+            uid = str(r["user_id"])
+            uname = f"{r['user__first_name'] or ''} {r['user__last_name'] or ''}".strip() or r["user__email"]
+            if uid not in by_user_dict:
+                by_user_dict[uid] = {"user": uid, "name": uname, "accrued": 0.0, "paid": 0.0, "remaining": 0.0}
+            by_user_dict[uid]["paid"] = float(r["p"] or 0)
+            by_user_dict[uid]["remaining"] = max(0.0, by_user_dict[uid]["accrued"] - by_user_dict[uid]["paid"])
+
+        return Response({
+            "totals": {"accrued": accrued, "paid": paid, "remaining": remaining},
+            "by_user": list(by_user_dict.values())
+        })
+
+
+class SalaryPayoutListCreateView(CompanyBranchQuerysetMixin, generics.ListCreateAPIView):
+    """
+    GET /api/consalting/salary/payouts/ — список выплат.
+    POST /api/consalting/salary/payouts/ — создание выплаты (закрывает начисления по FIFO).
+    """
+    serializer_class = SalaryPayoutConsaltingSerializer
+
+    def get_queryset(self):
+        company = self._user_company()
+        if not company:
+            return SalaryPayoutConsalting.objects.none()
+        qs = SalaryPayoutConsalting.objects.filter(company=company).select_related("user")
+        if not is_owner_like(self.request.user):
+            qs = qs.filter(user=self.request.user)
+        return qs
+
+    def create(self, request, *args, **kwargs):
+        company = self._user_company()
+        if not company:
+            raise PermissionDenied("У пользователя не настроена компания.")
+        if not is_owner_like(request.user):
+            raise PermissionDenied("Выплачивать зарплату может только руководитель.")
+
+        ser = self.get_serializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+        user = ser.validated_data["user"]
+        amount = ser.validated_data["amount"]
+
+        if amount <= 0:
+            return Response({"amount": "Сумма выплаты должна быть больше 0."}, status=status.HTTP_400_BAD_REQUEST)
+
+        accrued_qs = SalaryAccrualConsalting.objects.filter(
+            company=company, user=user, status=SalaryAccrualConsalting.Status.ACCRUED
+        ).order_by("created_at")
+
+        total_accrued = accrued_qs.aggregate(s=Sum("amount"))["s"] or Decimal("0.00")
+        if amount > total_accrued:
+            return Response(
+                {"detail": f"Сумма выплаты ({amount}) превышает доступные начисления ({total_accrued})."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        with transaction.atomic():
+            payout = ser.save(company=company)
+            remaining_to_pay = amount
+            for accrual in accrued_qs:
+                if remaining_to_pay <= 0:
+                    break
+                if accrual.amount <= remaining_to_pay:
+                    remaining_to_pay -= accrual.amount
+                    accrual.status = SalaryAccrualConsalting.Status.PAID
+                    accrual.payout = payout
+                    accrual.save(update_fields=["status", "payout", "updated_at"])
+
+        return Response(
+            SalaryPayoutConsaltingSerializer(payout, context=self.get_serializer_context()).data,
+            status=status.HTTP_201_CREATED
+        )
+
+
+# ==========================
+# Inbound Leads & Lead Distribution (docs-consaltion/leads-whatsapp.md)
+# ==========================
+def distribute_inbound_lead(inbound_lead):
+    """Автоматическое распределение лида сотрудникам по правилам компании (§5)."""
+    try:
+        company = inbound_lead.company
+        settings, _ = LeadDistributionSettingsConsalting.objects.get_or_create(company=company)
+
+        if not settings.enabled or settings.strategy == LeadDistributionSettingsConsalting.Strategy.MANUAL:
+            return inbound_lead
+
+        with transaction.atomic():
+            settings = LeadDistributionSettingsConsalting.objects.select_for_update().get(pk=settings.pk)
+
+            target_roles = list(settings.roles.values_list("id", flat=True))
+            if not target_roles:
+                return inbound_lead
+
+            pool_qs = User.objects.filter(
+                company=company, is_active=True, custom_role_id__in=target_roles
+            ).order_by("id")
+            pool = list(pool_qs)
+
+            if not pool:
+                return inbound_lead
+
+            chosen_owner = None
+            if settings.strategy == LeadDistributionSettingsConsalting.Strategy.ROUND_ROBIN:
+                cursor = settings._rr_cursor
+                chosen_owner = pool[cursor % len(pool)]
+                settings._rr_cursor = cursor + 1
+                settings.save(update_fields=["_rr_cursor"])
+
+            elif settings.strategy == LeadDistributionSettingsConsalting.Strategy.LEAST_LOADED:
+                active_statuses = [
+                    InboundLeadConsalting.Status.NEW,
+                    InboundLeadConsalting.Status.ASSIGNED,
+                    InboundLeadConsalting.Status.IN_WORK,
+                ]
+                counts = (
+                    InboundLeadConsalting.objects.filter(
+                        company=company, owner__in=pool, status__in=active_statuses
+                    )
+                    .values("owner_id")
+                    .annotate(c=Count("id"))
+                )
+                counts_dict = {r["owner_id"]: r["c"] for r in counts}
+
+                min_cnt = min(counts_dict.get(u.id, 0) for u in pool)
+                candidates = [u for u in pool if counts_dict.get(u.id, 0) == min_cnt]
+
+                cursor = settings._rr_cursor
+                chosen_owner = candidates[cursor % len(candidates)]
+                settings._rr_cursor = cursor + 1
+                settings.save(update_fields=["_rr_cursor"])
+
+            if chosen_owner:
+                inbound_lead.owner = chosen_owner
+                inbound_lead.status = InboundLeadConsalting.Status.ASSIGNED
+                inbound_lead.save(update_fields=["owner", "status", "updated_at"])
+
+                realtime.notify_user(
+                    chosen_owner.id,
+                    "lead.assigned",
+                    {
+                        "id": str(inbound_lead.id),
+                        "full_name": inbound_lead.full_name,
+                        "phone": inbound_lead.phone,
+                        "source": inbound_lead.source,
+                        "message": inbound_lead.message,
+                        "status": inbound_lead.status,
+                        "created_at": inbound_lead.created_at.isoformat(),
+                    }
+                )
+
+        return inbound_lead
+    except Exception as e:
+        logger.exception("Inbound lead distribution failed: %s", e)
+        return inbound_lead
+
+
+class InboundLeadListCreateView(CompanyBranchQuerysetMixin, generics.ListCreateAPIView):
+    """
+    GET /api/consalting/inbound-leads/ — список входящих лидов.
+    POST /api/consalting/inbound-leads/ — ручное создание лида.
+    """
+    serializer_class = InboundLeadConsaltingSerializer
+    filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
+    filterset_fields = ["status", "owner", "source"]
+    search_fields = ["full_name", "phone", "message"]
+    ordering_fields = ["created_at", "status"]
+    ordering = ["-created_at"]
+
+    def get_queryset(self):
+        company = self._user_company()
+        if not company:
+            return InboundLeadConsalting.objects.none()
+        qs = InboundLeadConsalting.objects.filter(company=company).select_related("owner")
+        if not is_owner_like(self.request.user):
+            qs = qs.filter(owner=self.request.user)
+        return qs
+
+    def perform_create(self, serializer):
+        company = self._user_company()
+        if not company:
+            raise PermissionDenied("У пользователя не настроена компания.")
+        inbound_lead = serializer.save(company=company)
+        distribute_inbound_lead(inbound_lead)
+
+
+class InboundLeadRetrieveUpdateView(CompanyBranchQuerysetMixin, generics.RetrieveUpdateAPIView):
+    """
+    GET/PATCH /api/consalting/inbound-leads/<id>/ — детализация и смена статуса/полей.
+    """
+    serializer_class = InboundLeadConsaltingSerializer
+
+    def get_queryset(self):
+        company = self._user_company()
+        if not company:
+            return InboundLeadConsalting.objects.none()
+        qs = InboundLeadConsalting.objects.filter(company=company).select_related("owner")
+        if not is_owner_like(self.request.user):
+            qs = qs.filter(owner=self.request.user)
+        return qs
+
+
+class InboundLeadAssignView(CompanyBranchQuerysetMixin, generics.GenericAPIView):
+    """
+    POST /api/consalting/inbound-leads/<id>/assign/ — ручное назначение владельца лида.
+    """
+    serializer_class = InboundLeadConsaltingSerializer
+
+    def post(self, request, pk, *args, **kwargs):
+        company = self._user_company()
+        if not company:
+            raise PermissionDenied("У пользователя не настроена компания.")
+        if not is_owner_like(request.user):
+            raise PermissionDenied("Назначать лиды может только руководитель.")
+
+        inbound_lead = get_object_or_404(InboundLeadConsalting, pk=pk, company=company)
+        owner_id = request.data.get("owner")
+        if not owner_id:
+            return Response({"owner": "Обязательное поле."}, status=status.HTTP_400_BAD_REQUEST)
+
+        new_owner = get_object_or_404(User, pk=owner_id, company=company)
+        inbound_lead.owner = new_owner
+        inbound_lead.status = InboundLeadConsalting.Status.ASSIGNED
+        inbound_lead.save(update_fields=["owner", "status", "updated_at"])
+
+        realtime.notify_user(
+            new_owner.id,
+            "lead.assigned",
+            {
+                "id": str(inbound_lead.id),
+                "full_name": inbound_lead.full_name,
+                "phone": inbound_lead.phone,
+                "source": inbound_lead.source,
+                "message": inbound_lead.message,
+                "status": inbound_lead.status,
+                "created_at": inbound_lead.created_at.isoformat(),
+            }
+        )
+        return Response(InboundLeadConsaltingSerializer(inbound_lead, context=self.get_serializer_context()).data)
+
+
+class LeadDistributionSettingsView(CompanyBranchQuerysetMixin, generics.GenericAPIView):
+    """
+    GET/PUT /api/consalting/lead-distribution/ — настройки авто-распределения лидов.
+    """
+    serializer_class = LeadDistributionSettingsConsaltingSerializer
+
+    def get(self, request, *args, **kwargs):
+        company = self._user_company()
+        if not company:
+            raise PermissionDenied("У пользователя не настроена компания.")
+        settings, _ = LeadDistributionSettingsConsalting.objects.get_or_create(company=company)
+        return Response(LeadDistributionSettingsConsaltingSerializer(settings).data)
+
+    def put(self, request, *args, **kwargs):
+        company = self._user_company()
+        if not company:
+            raise PermissionDenied("У пользователя не настроена компания.")
+        if not is_owner_like(request.user):
+            raise PermissionDenied("Настройки распределения может менять только руководитель.")
+
+        settings, _ = LeadDistributionSettingsConsalting.objects.get_or_create(company=company)
+        ser = LeadDistributionSettingsConsaltingSerializer(settings, data=request.data, partial=True)
+        ser.is_valid(raise_exception=True)
+        ser.save()
+        return Response(ser.data)
+
+
+class WhatsAppInboundWebhookView(APIView):
+    """
+    POST /api/consalting/integrations/whatsapp/webhook/
+    Webhook от WhatsApp провайдера: регистрация сообщения, защита от дублей, авто-распределение.
+    """
+    permission_classes = [permissions.AllowAny]
+
+    def post(self, request, *args, **kwargs):
+        data = request.data or {}
+        external_id = str(data.get("external_id") or data.get("id") or data.get("message_id") or "").strip()
+        phone = str(data.get("phone") or data.get("from") or "").strip()
+        full_name = str(data.get("full_name") or data.get("name") or data.get("contact_name") or "").strip()
+        message = str(data.get("message") or data.get("text") or data.get("body") or "").strip()
+        company_id = data.get("company_id")
+
+        if not phone and not message:
+            return Response({"detail": "Пустые данные webhook."}, status=status.HTTP_400_BAD_REQUEST)
+
+        company = Company.objects.filter(id=company_id).first() if company_id else Company.objects.first()
+        if not company:
+            return Response({"detail": "Компания не найдена."}, status=status.HTTP_400_BAD_REQUEST)
+
+        if external_id:
+            existing = InboundLeadConsalting.objects.filter(
+                company=company, source="whatsapp", external_id=external_id
+            ).first()
+            if existing:
+                return Response({"status": "duplicate_ignored", "id": str(existing.id)}, status=status.HTTP_200_OK)
+
+        inbound_lead = InboundLeadConsalting.objects.create(
+            company=company,
+            full_name=full_name or phone or "WhatsApp Лид",
+            phone=phone,
+            source="whatsapp",
+            external_id=external_id,
+            message=message,
+            status=InboundLeadConsalting.Status.NEW
+        )
+
+        distribute_inbound_lead(inbound_lead)
+        return Response({"status": "success", "id": str(inbound_lead.id)}, status=status.HTTP_200_OK)
+
+
+class SubscriptionMatrixView(CompanyBranchQuerysetMixin, generics.GenericAPIView):
+    """
+    GET /api/consalting/clients/subscription-matrix/
+    Абонентская матрица клиентов «ФИО × услуга × месяцы».
+    """
+    def get(self, request, *args, **kwargs):
+        from datetime import date
+        company = self._user_company()
+        if not company:
+            raise PermissionDenied("У пользователя не настроена компания.")
+
+        month_from = request.query_params.get("month_from")
+        month_to = request.query_params.get("month_to")
+        search = request.query_params.get("search")
+
+        today = timezone.localdate()
+        if not month_from or not month_to:
+            d_end = today.replace(day=1)
+            d_start = _add_months(d_end, -5)
+            month_from = f"{d_start.year:04d}-{d_start.month:02d}"
+            month_to = f"{d_end.year:04d}-{d_end.month:02d}"
+
+        try:
+            y1, m1 = map(int, month_from.split("-"))
+            y2, m2 = map(int, month_to.split("-"))
+            d_from = date(y1, m1, 1)
+            d_to = date(y2, m2, 1)
+        except Exception:
+            return Response({"detail": "Некорректный формат month_from/month_to (YYYY-MM)."}, status=status.HTTP_400_BAD_REQUEST)
+
+        months_list = []
+        d_curr = d_from
+        while d_curr <= d_to:
+            months_list.append(f"{d_curr.year:04d}-{d_curr.month:02d}")
+            d_curr = _add_months(d_curr, 1)
+
+        sales_qs = SaleConsalting.objects.filter(
+            company=company, subscription_amount__gt=0, client__isnull=False
+        ).select_related("client", "services", "subscription_deal")
+
+        if not is_owner_like(request.user):
+            sales_qs = sales_qs.filter(user=request.user)
+
+        if search:
+            sales_qs = sales_qs.filter(
+                Q(client__full_name__icontains=search) | Q(services__name__icontains=search)
+            )
+
+        rows = []
+        for sale in sales_qs:
+            deal = ensure_subscription_deal(sale)
+            if not deal:
+                continue
+
+            cells = {}
+            for inst in deal.installments.order_by("number"):
+                d = inst.due_date
+                m_str = f"{d.year:04d}-{d.month:02d}"
+                if m_str not in months_list:
+                    continue
+
+                paid = (inst.paid_amount or Decimal("0")) >= inst.amount
+                if paid:
+                    st_val = "paid"
+                elif d < today:
+                    st_val = "overdue"
+                else:
+                    st_val = "planned"
+
+                cells[m_str] = {
+                    "amount": float(inst.amount),
+                    "status": st_val
+                }
+
+            rows.append({
+                "client_id": str(sale.client_id),
+                "client_name": sale.client.full_name or "Без имени",
+                "service_id": str(sale.services_id) if sale.services_id else None,
+                "service_name": sale.services.name if sale.services else "Услуга",
+                "subscription_amount": float(sale.subscription_amount or 0),
+                "subscription_period": sale.subscription_period or "month",
+                "cells": cells,
+            })
+
+        return Response({
+            "months": months_list,
+            "rows": rows
+        })
+
+
+

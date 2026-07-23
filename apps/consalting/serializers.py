@@ -16,6 +16,13 @@ from .models import (
     LeadActivityConsalting,
     LeadTaskConsalting,
     WhatsAppMessageConsalting,
+    ServiceSalaryRateConsalting,
+    SalaryAccrualConsalting,
+    SalaryPayoutConsalting,
+    InboundLeadConsalting,
+    LeadDistributionSettingsConsalting,
+    ServiceRolePriceConsalting,
+    TariffRolePriceConsalting,
 )
 from apps.users.models import User, Branch, CustomRole
 
@@ -119,14 +126,27 @@ class CompanyBranchReadOnlyMixin:
 
 
 # ==========================
-# Тариф услуги (вложенный)
+# Тариф и цены по ролям
 # ==========================
+class ServiceRolePriceConsaltingSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = ServiceRolePriceConsalting
+        fields = ("custom_role", "price")
+
+
+class TariffRolePriceConsaltingSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = TariffRolePriceConsalting
+        fields = ("custom_role", "price")
+
+
 class TariffConsaltingSerializer(serializers.ModelSerializer):
     id = serializers.UUIDField(required=False)
+    role_prices = TariffRolePriceConsaltingSerializer(many=True, required=False)
 
     class Meta:
         model = TariffConsalting
-        fields = ("id", "name", "price", "subscription_amount", "subscription_period")
+        fields = ("id", "name", "price", "subscription_amount", "subscription_period", "role_prices")
 
 
 # ==========================
@@ -134,6 +154,7 @@ class TariffConsaltingSerializer(serializers.ModelSerializer):
 # ==========================
 class ServicesConsaltingSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
     tariffs = TariffConsaltingSerializer(many=True, required=False)
+    role_prices = ServiceRolePriceConsaltingSerializer(many=True, required=False)
     custom_role = serializers.PrimaryKeyRelatedField(
         queryset=CustomRole.objects.all(), required=False, allow_null=True
     )
@@ -143,8 +164,8 @@ class ServicesConsaltingSerializer(CompanyBranchReadOnlyMixin, serializers.Model
     class Meta:
         model = ServicesConsalting
         fields = (
-            "id", "company", "branch", "name", "price", "installation_price",
-            "description", "custom_role", "tariffs", "created_at", "updated_at",
+            "id", "company", "branch", "name", "price",
+            "description", "custom_role", "role_prices", "tariffs", "created_at", "updated_at",
         )
         read_only_fields = ("id", "company", "branch", "created_at", "updated_at")
 
@@ -155,16 +176,29 @@ class ServicesConsaltingSerializer(CompanyBranchReadOnlyMixin, serializers.Model
         return value
 
     def validate(self, attrs):
-        # branch мы всё равно проставим из контекста, внешние значения игнорим.
         return attrs
 
+    def _sync_service_role_prices(self, service, role_prices_data):
+        if role_prices_data is None:
+            return
+        service.role_prices.all().delete()
+        new_objs = []
+        for item in role_prices_data:
+            role = item.get("custom_role")
+            price = item.get("price")
+            if role and price is not None:
+                role_obj = role if isinstance(role, CustomRole) else CustomRole.objects.filter(pk=role).first()
+                if role_obj:
+                    new_objs.append(ServiceRolePriceConsalting(service=service, custom_role=role_obj, price=price))
+        if new_objs:
+            ServiceRolePriceConsalting.objects.bulk_create(new_objs)
+
     def _sync_tariffs(self, service, tariffs_data):
-        """Полная замена набора тарифов услуги переданным списком."""
         if tariffs_data is None:
             return
         service.tariffs.all().delete()
-        TariffConsalting.objects.bulk_create([
-            TariffConsalting(
+        for t in tariffs_data:
+            tariff = TariffConsalting.objects.create(
                 company_id=service.company_id,
                 branch_id=service.branch_id,
                 service=service,
@@ -173,19 +207,32 @@ class ServicesConsaltingSerializer(CompanyBranchReadOnlyMixin, serializers.Model
                 subscription_amount=t.get("subscription_amount") or 0,
                 subscription_period=t.get("subscription_period") or "",
             )
-            for t in tariffs_data
-        ])
+            rp_data = t.get("role_prices")
+            if rp_data:
+                rp_objs = []
+                for item in rp_data:
+                    role = item.get("custom_role")
+                    price = item.get("price")
+                    if role and price is not None:
+                        role_obj = role if isinstance(role, CustomRole) else CustomRole.objects.filter(pk=role).first()
+                        if role_obj:
+                            rp_objs.append(TariffRolePriceConsalting(tariff=tariff, custom_role=role_obj, price=price))
+                if rp_objs:
+                    TariffRolePriceConsalting.objects.bulk_create(rp_objs)
 
     def create(self, validated_data):
         tariffs_data = validated_data.pop("tariffs", None)
+        role_prices_data = validated_data.pop("role_prices", None)
         service = super().create(validated_data)
+        self._sync_service_role_prices(service, role_prices_data)
         self._sync_tariffs(service, tariffs_data)
         return service
 
     def update(self, instance, validated_data):
         tariffs_data = validated_data.pop("tariffs", None)
+        role_prices_data = validated_data.pop("role_prices", None)
         service = super().update(instance, validated_data)
-        # тарифы заменяем только если поле прислали
+        self._sync_service_role_prices(service, role_prices_data)
         self._sync_tariffs(service, tariffs_data)
         return service
 
@@ -211,9 +258,6 @@ class SaleConsaltingSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSeri
     client_display = serializers.SerializerMethodField()
     service_display = serializers.CharField(source="services.name", read_only=True)
     service_price = serializers.DecimalField(source="services.price", max_digits=12, decimal_places=2, read_only=True)
-    installation_price = serializers.DecimalField(
-        source="services.installation_price", max_digits=12, decimal_places=2, read_only=True
-    )
     tariff = serializers.PrimaryKeyRelatedField(
         queryset=TariffConsalting.objects.all(), required=False, allow_null=True
     )
@@ -231,7 +275,7 @@ class SaleConsaltingSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSeri
         fields = (
             "id", "company", "branch",
             "user", "user_display",
-            "services", "service_display", "service_price", "installation_price",
+            "services", "service_display", "service_price",
             "tariff", "tariff_display", "tariff_price",
             "client", "client_display",
             "items", "discount", "markup", "total",
@@ -240,7 +284,7 @@ class SaleConsaltingSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSeri
         )
         read_only_fields = (
             "id", "company", "branch", "user", "user_display",
-            "service_display", "service_price", "installation_price",
+            "service_display", "service_price",
             "tariff_display", "tariff_price", "total",
             "created_at", "updated_at",
         )
@@ -909,4 +953,98 @@ class WhatsAppMessageConsaltingSerializer(serializers.ModelSerializer):
 
 class WhatsAppSendSerializer(serializers.Serializer):
     text = serializers.CharField(required=True, help_text="Текст сообщения для отправки")
+
+
+# ==========================
+# Salary Auto-Accrual System
+# ==========================
+class ServiceSalaryRateConsaltingSerializer(serializers.ModelSerializer):
+    service_name = serializers.CharField(source="service.name", read_only=True)
+    price = serializers.DecimalField(source="service.price", max_digits=12, decimal_places=2, read_only=True)
+
+    class Meta:
+        model = ServiceSalaryRateConsalting
+        fields = ("id", "company", "service", "service_name", "price", "percent", "updated_at")
+        read_only_fields = ("id", "company", "service_name", "price", "updated_at")
+
+
+class SalaryAccrualConsaltingSerializer(serializers.ModelSerializer):
+    user_display = serializers.SerializerMethodField()
+    service_name = serializers.CharField(source="service.name", read_only=True)
+
+    class Meta:
+        model = SalaryAccrualConsalting
+        fields = (
+            "id", "company", "user", "user_display", "service", "service_name",
+            "sale", "lead", "base_amount", "percent", "amount", "status", "payout", "created_at"
+        )
+        read_only_fields = (
+            "id", "company", "user_display", "service_name", "created_at"
+        )
+
+    def get_user_display(self, obj):
+        if obj.user and (obj.user.first_name or obj.user.last_name):
+            return f"{obj.user.first_name or ''} {obj.user.last_name or ''}".strip()
+        return getattr(obj.user, "email", None) if obj.user else None
+
+
+class SalaryPayoutConsaltingSerializer(serializers.ModelSerializer):
+    user_display = serializers.SerializerMethodField()
+
+    class Meta:
+        model = SalaryPayoutConsalting
+        fields = ("id", "company", "user", "user_display", "amount", "comment", "created_at")
+        read_only_fields = ("id", "company", "user_display", "created_at")
+
+    def get_user_display(self, obj):
+        if obj.user and (obj.user.first_name or obj.user.last_name):
+            return f"{obj.user.first_name or ''} {obj.user.last_name or ''}".strip()
+        return getattr(obj.user, "email", None) if obj.user else None
+
+
+# ==========================
+# Inbound Leads & Lead Distribution
+# ==========================
+class InboundLeadConsaltingSerializer(serializers.ModelSerializer):
+    owner_display = serializers.SerializerMethodField()
+
+    class Meta:
+        model = InboundLeadConsalting
+        fields = (
+            "id", "company", "full_name", "phone", "source", "external_id",
+            "message", "owner", "owner_display", "status", "lead", "created_at"
+        )
+        read_only_fields = ("id", "company", "owner_display", "created_at")
+
+    def get_owner_display(self, obj):
+        if obj.owner and (obj.owner.first_name or obj.owner.last_name):
+            return f"{obj.owner.first_name or ''} {obj.owner.last_name or ''}".strip()
+        return getattr(obj.owner, "email", None) if obj.owner else None
+
+
+class LeadDistributionSettingsConsaltingSerializer(serializers.ModelSerializer):
+    role_ids = serializers.PrimaryKeyRelatedField(
+        source="roles", many=True, queryset=CustomRole.objects.all(), required=False
+    )
+    recipients = serializers.SerializerMethodField()
+
+    class Meta:
+        model = LeadDistributionSettingsConsalting
+        fields = ("enabled", "strategy", "role_ids", "recipients")
+
+    def get_recipients(self, obj):
+        from apps.users.models import User
+        role_ids = list(obj.roles.values_list("id", flat=True))
+        if not role_ids:
+            return []
+        users = User.objects.filter(company=obj.company, is_active=True, custom_role_id__in=role_ids)
+        return [
+            {
+                "id": str(u.id),
+                "name": f"{u.first_name or ''} {u.last_name or ''}".strip() or u.email
+            }
+            for u in users
+        ]
+
+
 

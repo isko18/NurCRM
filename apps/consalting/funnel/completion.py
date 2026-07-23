@@ -20,38 +20,134 @@ SUBSCRIPTION_WINDOW = 12
 
 
 def apply_completion_side_effects(lead, actor=None):
-    """Создаёт (идемпотентно) продажу-аналитику из завершённого лида.
-
-    Возвращает SaleConsalting (новую или существующую) либо None при ошибке.
+    """Атомарное исполнение сайд-эффектов при завершении лида (выигрыш/WON):
+    1. Поиск/создание клиента при его отсутствии.
+    2. Создание продажи SaleConsalting (идемпотентно).
+    3. Авто-начисление зарплаты по ставке услуги (ServiceSalaryRateConsalting).
+    4. Рассылка реалтайм уведомлений владельцу и обновления доски.
     """
-    from ..models import SaleConsalting
+    from django.db import transaction
+    from apps.main.models import Client
+    from ..models import SaleConsalting, ServiceSalaryRateConsalting, SalaryAccrualConsalting
+    from . import realtime
 
     try:
-        existing = SaleConsalting.objects.filter(lead=lead).first()
-        if existing:
-            return existing
+        with transaction.atomic():
+            # 1. Поиск или создание клиента
+            client = lead.client
+            if not client and (lead.full_name or lead.phone or lead.email):
+                client = Client.objects.filter(
+                    company_id=lead.company_id,
+                    phone=lead.phone
+                ).first() if lead.phone else None
 
-        tariff = lead.tariff
-        sub_amount = tariff.subscription_amount if tariff else 0
-        sub_period = (tariff.subscription_period if tariff else "") or ""
-        sub_started = timezone.now() if (sub_amount or 0) > 0 else None
+                if not client:
+                    client = Client.objects.create(
+                        company_id=lead.company_id,
+                        branch_id=lead.branch_id,
+                        full_name=lead.full_name or lead.title or "Клиент из лида",
+                        phone=lead.phone or "",
+                        email=lead.email or "",
+                        salesperson=lead.owner or actor,
+                    )
+                lead.client = client
+                lead.save(update_fields=["client", "updated_at"])
 
-        return SaleConsalting.objects.create(
-            company_id=lead.company_id,
-            branch_id=lead.branch_id,
-            user=lead.owner or actor,
-            services=lead.service,
-            tariff=tariff,
-            client=lead.client,
-            lead=lead,
-            total=lead.estimated_value or 0,
-            description=f"Завершение лида: {lead.title}",
-            subscription_amount=sub_amount or 0,
-            subscription_period=sub_period if (sub_amount or 0) > 0 else "",
-            subscription_started_at=sub_started,
-        )
-    except Exception as e:  # сайд-эффект не должен ломать переход стадии
+            # 2. Создание продажи SaleConsalting (идемпотентно)
+            existing_sale = SaleConsalting.objects.filter(lead=lead).first()
+            if not existing_sale:
+                tariff = lead.tariff
+                sub_amount = tariff.subscription_amount if tariff else 0
+                sub_period = (tariff.subscription_period if tariff else "") or ""
+                sub_started = timezone.now() if (sub_amount or 0) > 0 else None
+
+                sale = SaleConsalting.objects.create(
+                    company_id=lead.company_id,
+                    branch_id=lead.branch_id,
+                    user=lead.owner or actor,
+                    services=lead.service,
+                    tariff=tariff,
+                    client=lead.client,
+                    lead=lead,
+                    total=lead.estimated_value or 0,
+                    description=f"Завершение лида: {lead.title}",
+                    subscription_amount=sub_amount or 0,
+                    subscription_period=sub_period if (sub_amount or 0) > 0 else "",
+                    subscription_started_at=sub_started,
+                )
+            else:
+                sale = existing_sale
+
+            # 3. Авто-начисление зарплаты продавцу по ставке услуги
+            seller = lead.owner or actor
+            accrue_salary_for_sale(sale, seller=seller)
+
+            # 4. Реалтайм-уведомления
+            realtime.lead_moved(lead)
+            if lead.owner_id:
+                realtime.notify_user(
+                    lead.owner_id,
+                    "lead.won",
+                    realtime.serialize_lead(lead)
+                )
+
+            return sale
+    except Exception as e:
         logger.exception("completion side-effects failed for lead %s: %s", lead.id, e)
+        return None
+
+
+def accrue_salary_for_sale(sale, seller=None):
+    """Автоматическое начисление зарплаты продавцу при создании/закрытии продажи."""
+    from ..models import ServiceSalaryRateConsalting, SalaryAccrualConsalting
+    from . import realtime
+
+    if not sale or not sale.services_id:
+        return None
+
+    seller = seller or sale.user
+    if not seller:
+        return None
+
+    try:
+        rate = ServiceSalaryRateConsalting.objects.filter(
+            company_id=sale.company_id, service_id=sale.services_id
+        ).first()
+        if not rate or rate.percent <= 0:
+            return None
+
+        base_amt = sale.total or Decimal("0.00")
+        accrual_amt = round(base_amt * rate.percent / Decimal("100"), 2)
+        if accrual_amt <= 0:
+            return None
+
+        accrual, created = SalaryAccrualConsalting.objects.get_or_create(
+            sale=sale,
+            defaults={
+                "company_id": sale.company_id,
+                "user": seller,
+                "service": sale.services,
+                "lead": sale.lead,
+                "base_amount": base_amt,
+                "percent": rate.percent,
+                "amount": accrual_amt,
+                "status": SalaryAccrualConsalting.Status.ACCRUED,
+            }
+        )
+        if created:
+            realtime.notify_user(
+                seller.id,
+                "consulting.salary.accrued",
+                {
+                    "title": f"Начислена зарплата: {accrual_amt}",
+                    "message": f"Продажа: {sale.description or (sale.services.name if sale.services else 'Услуга')}",
+                    "amount": str(accrual_amt),
+                    "sale_id": str(sale.id),
+                }
+            )
+        return accrual
+    except Exception as e:
+        logger.warning("accrue_salary_for_sale failed for sale %s: %s", sale.id, e)
         return None
 
 
