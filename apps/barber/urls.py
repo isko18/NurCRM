@@ -52,4 +52,11 @@ urlpatterns = [
     path("bookings/", views.OnlineBookingListView.as_view(), name="online-booking-list"),
     path("bookings/<uuid:pk>/", views.OnlineBookingDetailView.as_view(), name="online-booking-detail"),
     path("bookings/<uuid:pk>/status/", views.OnlineBookingStatusUpdateView.as_view(), name="online-booking-status-update"),
+
+    # ===== Зарплата мастеров (salary.md) =====
+    path('salary/rates/', views.ServiceSalaryRateListView.as_view(), name='salary-rates'),
+    path('salary/rates/<uuid:service_id>/', views.ServiceSalaryRateUpdateView.as_view(), name='salary-rate-update'),
+    path('salary/accruals/', views.MasterSalaryAccrualListView.as_view(), name='salary-accruals'),
+    path('salary/summary/', views.MasterSalarySummaryView.as_view(), name='salary-summary'),
+    path('salary/payouts/', views.MasterSalaryPayoutListCreateView.as_view(), name='salary-payouts'),
 ]
