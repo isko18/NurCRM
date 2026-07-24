@@ -343,7 +343,9 @@ class DocumentSerializer(serializers.ModelSerializer):
         read_only_fields = ("number", "total", "status", "cash_request_status")
 
     @staticmethod
-    def _resolve_sale_status(doc_type, is_sale_request):
+    def _resolve_sale_status(doc_type, is_sale_request, current_status=None):
+        if current_status in (models.Document.Status.POSTED, models.Document.Status.CASH_PENDING):
+            return current_status
         if doc_type == models.Document.DocType.SALE and bool(is_sale_request):
             return models.Document.Status.SALE_REQUEST
         return models.Document.Status.DRAFT
@@ -553,7 +555,7 @@ class DocumentSerializer(serializers.ModelSerializer):
         for key, value in validated_data.items():
             setattr(instance, key, value)
         if ("is_sale_request" in validated_data) or ("doc_type" in validated_data):
-            instance.status = self._resolve_sale_status(instance.doc_type, instance.is_sale_request)
+            instance.status = self._resolve_sale_status(instance.doc_type, instance.is_sale_request, current_status=instance.status)
 
         # Мультисклад агента: привязываем документ к складу первой позиции, если
         # единый склад не задан (аналогично созданию).
