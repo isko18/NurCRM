@@ -50,7 +50,8 @@ class SlugConflict(APIException):
 
 from apps.users.models import (
     User, Company, Roles, Industry, SubscriptionPlan,
-    Feature, Sector, CustomRole, Branch, BranchMembership, KyrgyzstanRegion
+    Feature, Sector, CustomRole, Branch, BranchMembership, KyrgyzstanRegion,
+    SCALE_BARCODE_LAYOUT_PLU,
 )
 
 
