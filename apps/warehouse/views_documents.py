@@ -720,6 +720,10 @@ class ProductListCreateView(CompanyBranchRestrictedMixin, generics.ListCreateAPI
         )
         qs = self._filter_qs_company_branch(qs)
 
+        wh_id = self.request.query_params.get("warehouse") or self.request.query_params.get("warehouse_id")
+        if wh_id:
+            qs = qs.filter(warehouse_id=wh_id)
+
         # Кэширование поиска по barcode
         search = self.request.query_params.get("search", "").strip()
         if search and len(search) >= 8:  # Предполагаем, что barcode обычно длиннее 8 символов

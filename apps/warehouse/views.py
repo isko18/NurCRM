@@ -775,9 +775,11 @@ class WarehouseProductCatalogListView(CompanyBranchRestrictedMixin, generics.Lis
             )
             .order_by("name")
         )
-        # _filter_qs_company_branch ограничивает агента его складами общего доступа
-        # (общий доступ + назначенный), без сужения по филиалу — см. миксин.
-        return self._filter_qs_company_branch(qs)
+        qs = self._filter_qs_company_branch(qs)
+        wh_id = self.request.query_params.get("warehouse") or self.request.query_params.get("warehouse_id")
+        if wh_id:
+            qs = qs.filter(warehouse_id=wh_id)
+        return qs
 
 
 class ProductScanView(CompanyBranchRestrictedMixin, APIView):

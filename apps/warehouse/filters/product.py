@@ -32,6 +32,7 @@ class ProductFilter(django_filters.FilterSet):
     brand = django_filters.ModelChoiceFilter(queryset=WarehouseProductBrand.objects.all())
     category = django_filters.ModelChoiceFilter(queryset=WarehouseProductCategory.objects.all())
     warehouse = django_filters.ModelChoiceFilter(queryset=Warehouse.objects.all())
+    warehouse_id = django_filters.UUIDFilter(field_name="warehouse_id")
     product_group = django_filters.UUIDFilter(field_name="product_group_id")
     
     # Прочее
@@ -48,6 +49,7 @@ class ProductFilter(django_filters.FilterSet):
             "brand",
             "category",
             "warehouse",
+            "warehouse_id",
             "product_group",
             "status",
             "stock",
