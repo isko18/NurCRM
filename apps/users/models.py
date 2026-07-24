@@ -300,6 +300,10 @@ class Company(models.Model):
         if not self.end_date and self.start_date:
             self.end_date = self.start_date + timedelta(days=10)
 
+        # весы
+        if not self.scale_barcode_layout:
+            self.scale_barcode_layout = SCALE_BARCODE_LAYOUT_PLU
+
         # slug
         if not self.slug:
             self.slug = self._generate_unique_slug()

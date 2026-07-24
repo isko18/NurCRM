@@ -460,6 +460,7 @@ class OwnerRegisterSerializer(serializers.ModelSerializer):
             region=company_region,
             subscription_plan=subscription_plan,
             owner=user,
+            scale_barcode_layout=SCALE_BARCODE_LAYOUT_PLU,
         )
 
         user.company = company
