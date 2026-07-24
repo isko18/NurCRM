@@ -478,13 +478,34 @@ def delete_company_cascade(company):
                 "DELETE FROM warehouse_document WHERE warehouse_from_id IN (SELECT id FROM warehouse_warehouse WHERE company_id = %s) OR warehouse_to_id IN (SELECT id FROM warehouse_warehouse WHERE company_id = %s)",
                 "DELETE FROM warehouse_moneydocument WHERE company_id = %s",
 
-                # 4. Модуль main (POS, розница, кассы, смены, корзины, продажи)
+                # 4. Модуль main (POS, розница, производство, сырье, рецепты, кассы, смены, корзины, продажи)
+                "DELETE FROM main_productrecipeitem WHERE item_make_id IN (SELECT id FROM main_itemmake WHERE company_id = %s)",
+                "DELETE FROM main_itemmake WHERE company_id = %s",
+                "DELETE FROM main_manufacturesubreal WHERE company_id = %s",
+                "DELETE FROM main_acceptance WHERE company_id = %s",
+                "DELETE FROM main_supplierreceiptitem WHERE receipt_id IN (SELECT id FROM main_supplierreceipt WHERE company_id = %s)",
+                "DELETE FROM main_supplierreceipt WHERE company_id = %s",
+                "DELETE FROM main_dealpayment WHERE deal_id IN (SELECT id FROM main_clientdeal WHERE company_id = %s)",
+                "DELETE FROM main_dealinstallment WHERE deal_id IN (SELECT id FROM main_clientdeal WHERE company_id = %s)",
+                "DELETE FROM main_clientdeal WHERE company_id = %s",
+                "DELETE FROM main_contractorwork WHERE company_id = %s",
+                "DELETE FROM main_debtpayment WHERE debt_id IN (SELECT id FROM main_debt WHERE company_id = %s)",
+                "DELETE FROM main_debt WHERE company_id = %s",
+                "DELETE FROM main_objectsaleitem WHERE sale_id IN (SELECT id FROM main_objectsale WHERE company_id = %s)",
+                "DELETE FROM main_objectsale WHERE company_id = %s",
+                "DELETE FROM main_objectitem WHERE company_id = %s",
                 "DELETE FROM main_saleitem WHERE sale_id IN (SELECT id FROM main_sale WHERE company_id = %s)",
                 "DELETE FROM main_sale WHERE company_id = %s",
                 "DELETE FROM main_cartitem WHERE cart_id IN (SELECT id FROM main_cart WHERE company_id = %s)",
                 "DELETE FROM main_cart WHERE company_id = %s",
                 "DELETE FROM main_cashshift WHERE company_id = %s",
                 "DELETE FROM main_cashbox WHERE company_id = %s",
+                "DELETE FROM main_productpromotiontier WHERE product_id IN (SELECT id FROM main_product WHERE company_id = %s)",
+                "DELETE FROM main_productalternatebarcode WHERE product_id IN (SELECT id FROM main_product WHERE company_id = %s)",
+                "DELETE FROM main_productcharacteristics WHERE company_id = %s",
+                "DELETE FROM main_productpackage WHERE product_id IN (SELECT id FROM main_product WHERE company_id = %s)",
+                "DELETE FROM main_productimage WHERE product_id IN (SELECT id FROM main_product WHERE company_id = %s)",
+                "DELETE FROM main_productfavorite WHERE company_id = %s",
                 "DELETE FROM main_product WHERE company_id = %s",
                 "DELETE FROM main_category WHERE company_id = %s",
                 "DELETE FROM main_brand WHERE company_id = %s",
@@ -551,6 +572,24 @@ def delete_company_cascade(company):
                     num_params = query.count('%s')
                     params = [company_id] * num_params
                     cursor.execute(query, params)
+                    transaction.savepoint_commit(sid)
+                except Exception:
+                    transaction.savepoint_rollback(sid)
+
+        # 10. Динамическая очистка любых оставшихся моделей с полем 'company'
+        from django.apps import apps
+        for model in apps.get_models():
+            field_name = None
+            for f in model._meta.fields:
+                if f.is_relation and f.related_model == company.__class__:
+                    field_name = f.name
+                    break
+            if field_name:
+                sid = transaction.savepoint()
+                try:
+                    qs = model.objects.filter(**{field_name: company})
+                    if qs.exists():
+                        qs.delete()
                     transaction.savepoint_commit(sid)
                 except Exception:
                     transaction.savepoint_rollback(sid)
