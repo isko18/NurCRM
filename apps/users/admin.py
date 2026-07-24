@@ -343,6 +343,26 @@ class CompanyAdmin(admin.ModelAdmin):
     search_fields = ("name", "slug", "owner__email", "phone", "phones_howcase", "whatsapp_phone", "llc", "inn", "address")
     readonly_fields = ("created_at",)
     autocomplete_fields = ("owner", "subscription_plan", "industry", "sector")
+    actions = ["delete_selected_cascade"]
+
+    def get_actions(self, request):
+        actions = super().get_actions(request)
+        if "delete_selected" in actions:
+            del actions["delete_selected"]
+        return actions
+
+    @admin.action(description="Удалить выбранные компании (каскадно)")
+    def delete_selected_cascade(self, request, queryset):
+        from django.contrib import messages
+        count = 0
+        for company in queryset:
+            try:
+                delete_company_cascade(company)
+                count += 1
+            except Exception as e:
+                self.message_user(request, f"Ошибка при удалении компании {company.name}: {e}", level=messages.ERROR)
+        if count > 0:
+            self.message_user(request, f"Успешно удалено компаний: {count}.", level=messages.SUCCESS)
 
     fieldsets = (
         (
