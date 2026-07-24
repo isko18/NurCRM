@@ -393,27 +393,40 @@ class CompanyAdmin(admin.ModelAdmin):
         from django.http import HttpResponseRedirect
         from django.urls import reverse
         from django.contrib import messages
+        from django.shortcuts import render
 
         obj = self.get_object(request, unquote(object_id))
+        if obj is None:
+            return HttpResponseRedirect(reverse("admin:users_company_changelist"))
+
         if request.method == "POST":
-            if obj is not None:
-                company_name = obj.name
-                try:
-                    delete_company_cascade(obj)
-                    self.message_user(
-                        request,
-                        f"Компания '{company_name}' и все привязанные данные успешно удалены.",
-                        level=messages.SUCCESS,
-                    )
-                    return HttpResponseRedirect(reverse("admin:users_company_changelist"))
-                except Exception as exc:
-                    self.message_user(
-                        request,
-                        f"Ошибка при удалении компании: {exc}",
-                        level=messages.ERROR,
-                    )
-                    return HttpResponseRedirect(request.path)
-        return super().delete_view(request, object_id, extra_context=extra_context)
+            company_name = obj.name
+            try:
+                delete_company_cascade(obj)
+                self.message_user(
+                    request,
+                    f"Компания '{company_name}' и все привязанные данные успешно удалены.",
+                    level=messages.SUCCESS,
+                )
+                return HttpResponseRedirect(reverse("admin:users_company_changelist"))
+            except Exception as exc:
+                self.message_user(
+                    request,
+                    f"Ошибка при удалении компании: {exc}",
+                    level=messages.ERROR,
+                )
+                return HttpResponseRedirect(request.path)
+
+        context = {
+            **self.admin_site.each_context(request),
+            "object_name": self.model._meta.verbose_name,
+            "object": obj,
+            "opts": self.model._meta,
+            "app_label": self.model._meta.app_label,
+            "title": f"Удалить компанию {obj.name}?",
+            **(extra_context or {}),
+        }
+        return render(request, "admin/users/company/delete_confirmation.html", context)
 
 
 def delete_company_cascade(company):
