@@ -7,6 +7,7 @@ Token sources (in order):
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 from urllib.parse import parse_qs
 
@@ -157,6 +158,7 @@ async def _reject_auth_handshake(scope, send, *, error: str, token: str | None =
             fails,
         )
 
+    close_code = 4401
     if fails > WS_AUTH_FAIL_MAX:
         logger.warning(
             "websocket auth storm blocked path=%s client=%s fails=%s",
@@ -164,15 +166,17 @@ async def _reject_auth_handshake(scope, send, *, error: str, token: str | None =
             _client_cache_key(scope),
             fails,
         )
-        await _reject_ws_http(
-            send,
-            status=429,
-            body=b"Too many failed websocket auth attempts. Retry later.",
-            extra_headers=[(b"retry-after", b"30")],
-        )
-        return
+        close_code = 4408
 
-    await _reject_ws_http(send, status=401, body=b"Unauthorized")
+    if fails > 2:
+        # Throttle rapid reconnect storms from clients with expired tokens to prevent browser tab freezing
+        await asyncio.sleep(min((fails - 2) * 0.5, 3.0))
+
+    # Daphne/nginx can turn ASGI HTTP denial responses into 502 for websocket
+    # handshakes. Accept and immediately close so clients receive a websocket
+    # auth close code while nginx sees a valid upstream response.
+    await send({"type": "websocket.accept"})
+    await send({"type": "websocket.close", "code": close_code})
 
 
 class JWTAuthMiddleware:
