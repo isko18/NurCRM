@@ -461,13 +461,24 @@ def delete_company_cascade(company):
 
         with connection.cursor() as cursor:
             tables_sql = [
-                # 1. Запросы одобрения и денежные документы
+                # 1. Сначала запросы одобрения (ссылаются на document и money_document)
                 "DELETE FROM warehouse_cashapprovalrequest WHERE money_document_id IN (SELECT id FROM warehouse_moneydocument WHERE company_id = %s)",
                 "DELETE FROM warehouse_cashapprovalrequest WHERE document_id IN (SELECT id FROM warehouse_document WHERE warehouse_from_id IN (SELECT id FROM warehouse_warehouse WHERE company_id = %s) OR warehouse_to_id IN (SELECT id FROM warehouse_warehouse WHERE company_id = %s))",
-                "DELETE FROM warehouse_moneydocument WHERE company_id = %s",
+                
+                # 2. Складские движения (ссылаются на document и warehouse)
+                "DELETE FROM warehouse_stockmove WHERE document_id IN (SELECT id FROM warehouse_document WHERE warehouse_from_id IN (SELECT id FROM warehouse_warehouse WHERE company_id = %s) OR warehouse_to_id IN (SELECT id FROM warehouse_warehouse WHERE company_id = %s))",
+                "DELETE FROM warehouse_stockmove WHERE warehouse_id IN (SELECT id FROM warehouse_warehouse WHERE company_id = %s)",
+                "DELETE FROM warehouse_agentstockmove WHERE document_id IN (SELECT id FROM warehouse_document WHERE warehouse_from_id IN (SELECT id FROM warehouse_warehouse WHERE company_id = %s) OR warehouse_to_id IN (SELECT id FROM warehouse_warehouse WHERE company_id = %s))",
+                "DELETE FROM warehouse_agentstockmove WHERE warehouse_id IN (SELECT id FROM warehouse_warehouse WHERE company_id = %s)",
+                "DELETE FROM warehouse_stockbalance WHERE warehouse_id IN (SELECT id FROM warehouse_warehouse WHERE company_id = %s)",
+                "DELETE FROM warehouse_agentstockbalance WHERE warehouse_id IN (SELECT id FROM warehouse_warehouse WHERE company_id = %s)",
+
+                # 3. Элементы документов и сами документы
                 "DELETE FROM warehouse_documentitem WHERE document_id IN (SELECT id FROM warehouse_document WHERE warehouse_from_id IN (SELECT id FROM warehouse_warehouse WHERE company_id = %s) OR warehouse_to_id IN (SELECT id FROM warehouse_warehouse WHERE company_id = %s))",
                 "DELETE FROM warehouse_document WHERE warehouse_from_id IN (SELECT id FROM warehouse_warehouse WHERE company_id = %s) OR warehouse_to_id IN (SELECT id FROM warehouse_warehouse WHERE company_id = %s)",
-                # 2. Модуль main (POS, розница, кассы, смены, корзины, продажи)
+                "DELETE FROM warehouse_moneydocument WHERE company_id = %s",
+
+                # 4. Модуль main (POS, розница, кассы, смены, корзины, продажи)
                 "DELETE FROM main_saleitem WHERE sale_id IN (SELECT id FROM main_sale WHERE company_id = %s)",
                 "DELETE FROM main_sale WHERE company_id = %s",
                 "DELETE FROM main_cartitem WHERE cart_id IN (SELECT id FROM main_cart WHERE company_id = %s)",
@@ -479,11 +490,8 @@ def delete_company_cascade(company):
                 "DELETE FROM main_brand WHERE company_id = %s",
                 "DELETE FROM main_client WHERE company_id = %s",
                 "DELETE FROM main_shiftreceipt WHERE company_id = %s",
-                # 3. Склад / Движения / Товарные остатки
-                "DELETE FROM warehouse_stockmove WHERE warehouse_id IN (SELECT id FROM warehouse_warehouse WHERE company_id = %s)",
-                "DELETE FROM warehouse_agentstockmove WHERE warehouse_id IN (SELECT id FROM warehouse_warehouse WHERE company_id = %s)",
-                "DELETE FROM warehouse_stockbalance WHERE warehouse_id IN (SELECT id FROM warehouse_warehouse WHERE company_id = %s)",
-                "DELETE FROM warehouse_agentstockbalance WHERE warehouse_id IN (SELECT id FROM warehouse_warehouse WHERE company_id = %s)",
+
+                # 5. Товары и склады
                 "DELETE FROM warehouse_warehouseproductalternatebarcode WHERE product_id IN (SELECT id FROM warehouse_warehouseproduct WHERE company_id = %s)",
                 "DELETE FROM warehouse_warehouseproductcharasteristics WHERE company_id = %s",
                 "DELETE FROM warehouse_warehouseproductpackage WHERE product_id IN (SELECT id FROM warehouse_warehouseproduct WHERE company_id = %s)",
@@ -498,14 +506,16 @@ def delete_company_cascade(company):
                 "DELETE FROM warehouse_counterparty WHERE company_id = %s",
                 "DELETE FROM warehouse_agentrequestitem WHERE cart_id IN (SELECT id FROM warehouse_agentcart WHERE company_id = %s)",
                 "DELETE FROM warehouse_agentcart WHERE company_id = %s",
-                # 4. Кафе
+
+                # 6. Кафе
                 "DELETE FROM cafe_orderitem WHERE order_id IN (SELECT id FROM cafe_order WHERE company_id = %s)",
                 "DELETE FROM cafe_order WHERE company_id = %s",
                 "DELETE FROM cafe_table WHERE company_id = %s",
                 "DELETE FROM cafe_menuitem WHERE company_id = %s",
                 "DELETE FROM cafe_category WHERE company_id = %s",
                 "DELETE FROM cafe_cafeshift WHERE company_id = %s",
-                # 5. Застройщики и Здания
+
+                # 7. Застройщики и Здания
                 "DELETE FROM construction_cashflow WHERE company_id = %s",
                 "DELETE FROM construction_cashbox WHERE company_id = %s",
                 "DELETE FROM construction_shiftitem WHERE company_id = %s",
@@ -518,7 +528,8 @@ def delete_company_cascade(company):
                 "DELETE FROM building_apartment WHERE object_id IN (SELECT id FROM building_constructionobject WHERE company_id = %s)",
                 "DELETE FROM building_objectcost WHERE company_id = %s",
                 "DELETE FROM building_constructionobject WHERE company_id = %s",
-                # 6. Барбер
+
+                # 8. Барбер
                 "DELETE FROM barber_appointment WHERE company_id = %s",
                 "DELETE FROM barber_mastersalarypayout WHERE company_id = %s",
                 "DELETE FROM barber_mastersalaryaccrual WHERE company_id = %s",
@@ -527,7 +538,8 @@ def delete_company_cascade(company):
                 "DELETE FROM barber_service WHERE company_id = %s",
                 "DELETE FROM barber_servicecategory WHERE company_id = %s",
                 "DELETE FROM barber_client WHERE company_id = %s",
-                # 7. Пользователи и Филиалы
+
+                # 9. Пользователи и Филиалы
                 "DELETE FROM users_branchmembership WHERE branch_id IN (SELECT id FROM users_branch WHERE company_id = %s)",
                 "DELETE FROM users_branch WHERE company_id = %s",
                 "DELETE FROM users_user WHERE company_id = %s",
