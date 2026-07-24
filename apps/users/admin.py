@@ -381,6 +381,138 @@ class CompanyAdmin(admin.ModelAdmin):
         ("Срок действия", {"fields": ("start_date", "end_date", "created_at")}),
     )
 
+    def delete_model(self, request, obj):
+        delete_company_cascade(obj)
+
+    def delete_queryset(self, request, queryset):
+        for obj in queryset:
+            delete_company_cascade(obj)
+
+    def delete_view(self, request, object_id, extra_context=None):
+        from django.contrib.admin.utils import unquote
+        from django.http import HttpResponseRedirect
+        from django.urls import reverse
+        from django.contrib import messages
+
+        obj = self.get_object(request, unquote(object_id))
+        if request.method == "POST":
+            if obj is not None:
+                company_name = obj.name
+                try:
+                    delete_company_cascade(obj)
+                    self.message_user(
+                        request,
+                        f"Компания '{company_name}' и все привязанные данные успешно удалены.",
+                        level=messages.SUCCESS,
+                    )
+                    return HttpResponseRedirect(reverse("admin:users_company_changelist"))
+                except Exception as exc:
+                    self.message_user(
+                        request,
+                        f"Ошибка при удалении компании: {exc}",
+                        level=messages.ERROR,
+                    )
+                    return HttpResponseRedirect(request.path)
+        return super().delete_view(request, object_id, extra_context=extra_context)
+
+
+def delete_company_cascade(company):
+    """
+    Безопасное каскадное удаление компании и всех связанных данных со всех модулей CRM.
+    Обходит ограничения Foreign Key (on_delete=models.PROTECT).
+    """
+    from django.db import transaction, connection
+    from django.apps import apps
+
+    with transaction.atomic():
+        company_id = str(company.id)
+
+        # 1. Ручная очистка связанных таблиц во избежание ProtectedError
+        with connection.cursor() as cursor:
+            tables_to_clean = [
+                # Склад / Документы / Товары
+                ("warehouse_stockmove", "warehouse_id IN (SELECT id FROM warehouse_warehouse WHERE company_id = %s)"),
+                ("warehouse_agentstockmove", "warehouse_id IN (SELECT id FROM warehouse_warehouse WHERE company_id = %s)"),
+                ("warehouse_stockbalance", "warehouse_id IN (SELECT id FROM warehouse_warehouse WHERE company_id = %s)"),
+                ("warehouse_agentstockbalance", "warehouse_id IN (SELECT id FROM warehouse_warehouse WHERE company_id = %s)"),
+                ("warehouse_documentitem", "document_id IN (SELECT id FROM warehouse_document WHERE company_id = %s)"),
+                ("warehouse_document", "company_id = %s"),
+                ("warehouse_moneydocument", "company_id = %s"),
+                ("warehouse_cashapprovalrequest", "company_id = %s"),
+                ("warehouse_warehouseproductalternatebarcode", "product_id IN (SELECT id FROM warehouse_warehouseproduct WHERE company_id = %s)"),
+                ("warehouse_warehouseproductcharasteristics", "company_id = %s"),
+                ("warehouse_warehouseproductpackage", "product_id IN (SELECT id FROM warehouse_warehouseproduct WHERE company_id = %s)"),
+                ("warehouse_warehouseproductimage", "product_id IN (SELECT id FROM warehouse_warehouseproduct WHERE company_id = %s)"),
+                ("warehouse_warehouseproduct", "company_id = %s"),
+                ("warehouse_warehouseproductbrand", "company_id = %s"),
+                ("warehouse_warehouseproductcategory", "company_id = %s"),
+                ("warehouse_warehouseproductgroup", "company_id = %s"),
+                ("warehouse_warehouse", "company_id = %s"),
+                ("warehouse_cashregister", "company_id = %s"),
+                ("warehouse_paymentcategory", "company_id = %s"),
+                ("warehouse_counterparty", "company_id = %s"),
+                ("warehouse_agentrequestitem", "cart_id IN (SELECT id FROM warehouse_agentcart WHERE company_id = %s)"),
+                ("warehouse_agentcart", "company_id = %s"),
+                # Кафе
+                ("cafe_orderitem", "order_id IN (SELECT id FROM cafe_order WHERE company_id = %s)"),
+                ("cafe_order", "company_id = %s"),
+                ("cafe_table", "company_id = %s"),
+                ("cafe_menuitem", "company_id = %s"),
+                ("cafe_category", "company_id = %s"),
+                ("cafe_cafeshift", "company_id = %s"),
+                # Строительство / Застройщики
+                ("construction_cashflow", "company_id = %s"),
+                ("construction_cashbox", "company_id = %s"),
+                ("construction_shiftitem", "company_id = %s"),
+                ("construction_shift", "company_id = %s"),
+                ("construction_clientpayment", "company_id = %s"),
+                ("construction_clientoffer", "company_id = %s"),
+                ("construction_supplierinvoice", "company_id = %s"),
+                # Здания / Объекты
+                ("building_apartmentpayment", "company_id = %s"),
+                ("building_apartmentcontract", "company_id = %s"),
+                ("building_apartment", "object_id IN (SELECT id FROM building_constructionobject WHERE company_id = %s)"),
+                ("building_objectcost", "company_id = %s"),
+                ("building_constructionobject", "company_id = %s"),
+                # Барбер
+                ("barber_appointment", "company_id = %s"),
+                ("barber_mastersalarypayout", "company_id = %s"),
+                ("barber_mastersalaryaccrual", "company_id = %s"),
+                ("barber_servicesalaryrate", "company_id = %s"),
+                ("barber_barberprofile", "company_id = %s"),
+                ("barber_service", "company_id = %s"),
+                ("barber_servicecategory", "company_id = %s"),
+                ("barber_client", "company_id = %s"),
+                # Пользователи и Филиалы
+                ("users_branchmembership", "branch_id IN (SELECT id FROM users_branch WHERE company_id = %s)"),
+                ("users_branch", "company_id = %s"),
+                ("users_user", "company_id = %s"),
+            ]
+
+            for table, clause in tables_to_clean:
+                try:
+                    cursor.execute(f"DELETE FROM {table} WHERE {clause}", [company_id])
+                except Exception:
+                    pass
+
+        # 2. Динамическая очистка любых оставшихся моделей с полем 'company'
+        for model in apps.get_models():
+            field_name = None
+            for f in model._meta.fields:
+                if f.is_relation and f.related_model == company.__class__:
+                    field_name = f.name
+                    break
+            if field_name:
+                try:
+                    qs = model.objects.filter(**{field_name: company})
+                    if qs.exists():
+                        qs.delete()
+                except Exception:
+                    pass
+
+        # 3. Удаляем саму компанию
+        company.delete()
+
 
 # -------------------- Branch --------------------
 
