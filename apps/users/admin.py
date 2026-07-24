@@ -455,95 +455,94 @@ def delete_company_cascade(company):
     Обходит ограничения Foreign Key (on_delete=models.PROTECT).
     """
     from django.db import transaction, connection
-    from django.apps import apps
 
     with transaction.atomic():
         company_id = str(company.id)
 
-        # 1. Ручная очистка связанных таблиц во избежание ProtectedError
         with connection.cursor() as cursor:
-            tables_to_clean = [
-                # Склад / Документы / Товары
-                ("warehouse_stockmove", "warehouse_id IN (SELECT id FROM warehouse_warehouse WHERE company_id = %s)"),
-                ("warehouse_agentstockmove", "warehouse_id IN (SELECT id FROM warehouse_warehouse WHERE company_id = %s)"),
-                ("warehouse_stockbalance", "warehouse_id IN (SELECT id FROM warehouse_warehouse WHERE company_id = %s)"),
-                ("warehouse_agentstockbalance", "warehouse_id IN (SELECT id FROM warehouse_warehouse WHERE company_id = %s)"),
-                ("warehouse_documentitem", "document_id IN (SELECT id FROM warehouse_document WHERE company_id = %s)"),
-                ("warehouse_document", "company_id = %s"),
-                ("warehouse_moneydocument", "company_id = %s"),
-                ("warehouse_cashapprovalrequest", "company_id = %s"),
-                ("warehouse_warehouseproductalternatebarcode", "product_id IN (SELECT id FROM warehouse_warehouseproduct WHERE company_id = %s)"),
-                ("warehouse_warehouseproductcharasteristics", "company_id = %s"),
-                ("warehouse_warehouseproductpackage", "product_id IN (SELECT id FROM warehouse_warehouseproduct WHERE company_id = %s)"),
-                ("warehouse_warehouseproductimage", "product_id IN (SELECT id FROM warehouse_warehouseproduct WHERE company_id = %s)"),
-                ("warehouse_warehouseproduct", "company_id = %s"),
-                ("warehouse_warehouseproductbrand", "company_id = %s"),
-                ("warehouse_warehouseproductcategory", "company_id = %s"),
-                ("warehouse_warehouseproductgroup", "company_id = %s"),
-                ("warehouse_warehouse", "company_id = %s"),
-                ("warehouse_cashregister", "company_id = %s"),
-                ("warehouse_paymentcategory", "company_id = %s"),
-                ("warehouse_counterparty", "company_id = %s"),
-                ("warehouse_agentrequestitem", "cart_id IN (SELECT id FROM warehouse_agentcart WHERE company_id = %s)"),
-                ("warehouse_agentcart", "company_id = %s"),
-                # Кафе
-                ("cafe_orderitem", "order_id IN (SELECT id FROM cafe_order WHERE company_id = %s)"),
-                ("cafe_order", "company_id = %s"),
-                ("cafe_table", "company_id = %s"),
-                ("cafe_menuitem", "company_id = %s"),
-                ("cafe_category", "company_id = %s"),
-                ("cafe_cafeshift", "company_id = %s"),
-                # Строительство / Застройщики
-                ("construction_cashflow", "company_id = %s"),
-                ("construction_cashbox", "company_id = %s"),
-                ("construction_shiftitem", "company_id = %s"),
-                ("construction_shift", "company_id = %s"),
-                ("construction_clientpayment", "company_id = %s"),
-                ("construction_clientoffer", "company_id = %s"),
-                ("construction_supplierinvoice", "company_id = %s"),
-                # Здания / Объекты
-                ("building_apartmentpayment", "company_id = %s"),
-                ("building_apartmentcontract", "company_id = %s"),
-                ("building_apartment", "object_id IN (SELECT id FROM building_constructionobject WHERE company_id = %s)"),
-                ("building_objectcost", "company_id = %s"),
-                ("building_constructionobject", "company_id = %s"),
-                # Барбер
-                ("barber_appointment", "company_id = %s"),
-                ("barber_mastersalarypayout", "company_id = %s"),
-                ("barber_mastersalaryaccrual", "company_id = %s"),
-                ("barber_servicesalaryrate", "company_id = %s"),
-                ("barber_barberprofile", "company_id = %s"),
-                ("barber_service", "company_id = %s"),
-                ("barber_servicecategory", "company_id = %s"),
-                ("barber_client", "company_id = %s"),
-                # Пользователи и Филиалы
-                ("users_branchmembership", "branch_id IN (SELECT id FROM users_branch WHERE company_id = %s)"),
-                ("users_branch", "company_id = %s"),
-                ("users_user", "company_id = %s"),
+            tables_sql = [
+                # 1. Запросы одобрения и денежные документы
+                "DELETE FROM warehouse_cashapprovalrequest WHERE money_document_id IN (SELECT id FROM warehouse_moneydocument WHERE company_id = %s)",
+                "DELETE FROM warehouse_cashapprovalrequest WHERE document_id IN (SELECT id FROM warehouse_document WHERE warehouse_from_id IN (SELECT id FROM warehouse_warehouse WHERE company_id = %s) OR warehouse_to_id IN (SELECT id FROM warehouse_warehouse WHERE company_id = %s))",
+                "DELETE FROM warehouse_moneydocument WHERE company_id = %s",
+                "DELETE FROM warehouse_documentitem WHERE document_id IN (SELECT id FROM warehouse_document WHERE warehouse_from_id IN (SELECT id FROM warehouse_warehouse WHERE company_id = %s) OR warehouse_to_id IN (SELECT id FROM warehouse_warehouse WHERE company_id = %s))",
+                "DELETE FROM warehouse_document WHERE warehouse_from_id IN (SELECT id FROM warehouse_warehouse WHERE company_id = %s) OR warehouse_to_id IN (SELECT id FROM warehouse_warehouse WHERE company_id = %s)",
+                # 2. Модуль main (POS, розница, кассы, смены, корзины, продажи)
+                "DELETE FROM main_saleitem WHERE sale_id IN (SELECT id FROM main_sale WHERE company_id = %s)",
+                "DELETE FROM main_sale WHERE company_id = %s",
+                "DELETE FROM main_cartitem WHERE cart_id IN (SELECT id FROM main_cart WHERE company_id = %s)",
+                "DELETE FROM main_cart WHERE company_id = %s",
+                "DELETE FROM main_cashshift WHERE company_id = %s",
+                "DELETE FROM main_cashbox WHERE company_id = %s",
+                "DELETE FROM main_product WHERE company_id = %s",
+                "DELETE FROM main_category WHERE company_id = %s",
+                "DELETE FROM main_brand WHERE company_id = %s",
+                "DELETE FROM main_client WHERE company_id = %s",
+                "DELETE FROM main_shiftreceipt WHERE company_id = %s",
+                # 3. Склад / Движения / Товарные остатки
+                "DELETE FROM warehouse_stockmove WHERE warehouse_id IN (SELECT id FROM warehouse_warehouse WHERE company_id = %s)",
+                "DELETE FROM warehouse_agentstockmove WHERE warehouse_id IN (SELECT id FROM warehouse_warehouse WHERE company_id = %s)",
+                "DELETE FROM warehouse_stockbalance WHERE warehouse_id IN (SELECT id FROM warehouse_warehouse WHERE company_id = %s)",
+                "DELETE FROM warehouse_agentstockbalance WHERE warehouse_id IN (SELECT id FROM warehouse_warehouse WHERE company_id = %s)",
+                "DELETE FROM warehouse_warehouseproductalternatebarcode WHERE product_id IN (SELECT id FROM warehouse_warehouseproduct WHERE company_id = %s)",
+                "DELETE FROM warehouse_warehouseproductcharasteristics WHERE company_id = %s",
+                "DELETE FROM warehouse_warehouseproductpackage WHERE product_id IN (SELECT id FROM warehouse_warehouseproduct WHERE company_id = %s)",
+                "DELETE FROM warehouse_warehouseproductimage WHERE product_id IN (SELECT id FROM warehouse_warehouseproduct WHERE company_id = %s)",
+                "DELETE FROM warehouse_warehouseproduct WHERE company_id = %s",
+                "DELETE FROM warehouse_warehouseproductbrand WHERE company_id = %s",
+                "DELETE FROM warehouse_warehouseproductcategory WHERE company_id = %s",
+                "DELETE FROM warehouse_warehouseproductgroup WHERE company_id = %s",
+                "DELETE FROM warehouse_warehouse WHERE company_id = %s",
+                "DELETE FROM warehouse_cashregister WHERE company_id = %s",
+                "DELETE FROM warehouse_paymentcategory WHERE company_id = %s",
+                "DELETE FROM warehouse_counterparty WHERE company_id = %s",
+                "DELETE FROM warehouse_agentrequestitem WHERE cart_id IN (SELECT id FROM warehouse_agentcart WHERE company_id = %s)",
+                "DELETE FROM warehouse_agentcart WHERE company_id = %s",
+                # 4. Кафе
+                "DELETE FROM cafe_orderitem WHERE order_id IN (SELECT id FROM cafe_order WHERE company_id = %s)",
+                "DELETE FROM cafe_order WHERE company_id = %s",
+                "DELETE FROM cafe_table WHERE company_id = %s",
+                "DELETE FROM cafe_menuitem WHERE company_id = %s",
+                "DELETE FROM cafe_category WHERE company_id = %s",
+                "DELETE FROM cafe_cafeshift WHERE company_id = %s",
+                # 5. Застройщики и Здания
+                "DELETE FROM construction_cashflow WHERE company_id = %s",
+                "DELETE FROM construction_cashbox WHERE company_id = %s",
+                "DELETE FROM construction_shiftitem WHERE company_id = %s",
+                "DELETE FROM construction_shift WHERE company_id = %s",
+                "DELETE FROM construction_clientpayment WHERE company_id = %s",
+                "DELETE FROM construction_clientoffer WHERE company_id = %s",
+                "DELETE FROM construction_supplierinvoice WHERE company_id = %s",
+                "DELETE FROM building_apartmentpayment WHERE company_id = %s",
+                "DELETE FROM building_apartmentcontract WHERE company_id = %s",
+                "DELETE FROM building_apartment WHERE object_id IN (SELECT id FROM building_constructionobject WHERE company_id = %s)",
+                "DELETE FROM building_objectcost WHERE company_id = %s",
+                "DELETE FROM building_constructionobject WHERE company_id = %s",
+                # 6. Барбер
+                "DELETE FROM barber_appointment WHERE company_id = %s",
+                "DELETE FROM barber_mastersalarypayout WHERE company_id = %s",
+                "DELETE FROM barber_mastersalaryaccrual WHERE company_id = %s",
+                "DELETE FROM barber_servicesalaryrate WHERE company_id = %s",
+                "DELETE FROM barber_barberprofile WHERE company_id = %s",
+                "DELETE FROM barber_service WHERE company_id = %s",
+                "DELETE FROM barber_servicecategory WHERE company_id = %s",
+                "DELETE FROM barber_client WHERE company_id = %s",
+                # 7. Пользователи и Филиалы
+                "DELETE FROM users_branchmembership WHERE branch_id IN (SELECT id FROM users_branch WHERE company_id = %s)",
+                "DELETE FROM users_branch WHERE company_id = %s",
+                "DELETE FROM users_user WHERE company_id = %s",
             ]
 
-            for table, clause in tables_to_clean:
+            for query in tables_sql:
+                sid = transaction.savepoint()
                 try:
-                    cursor.execute(f"DELETE FROM {table} WHERE {clause}", [company_id])
+                    num_params = query.count('%s')
+                    params = [company_id] * num_params
+                    cursor.execute(query, params)
+                    transaction.savepoint_commit(sid)
                 except Exception:
-                    pass
+                    transaction.savepoint_rollback(sid)
 
-        # 2. Динамическая очистка любых оставшихся моделей с полем 'company'
-        for model in apps.get_models():
-            field_name = None
-            for f in model._meta.fields:
-                if f.is_relation and f.related_model == company.__class__:
-                    field_name = f.name
-                    break
-            if field_name:
-                try:
-                    qs = model.objects.filter(**{field_name: company})
-                    if qs.exists():
-                        qs.delete()
-                except Exception:
-                    pass
-
-        # 3. Удаляем саму компанию
         company.delete()
 
 
