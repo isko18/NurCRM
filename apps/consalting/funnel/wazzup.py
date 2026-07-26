@@ -82,6 +82,11 @@ class WazzupConsaltingService:
         if not lead.phone:
             raise ValueError("У лида не указан номер телефона.")
 
+        if user:
+            from apps.consalting.access import is_owner_like
+            if lead.owner_id and lead.owner_id != user.id and not is_owner_like(user):
+                raise ValueError("Отправлять сообщения лиду может только назначенный сотрудник или руководитель.")
+
         clean_phone = "".join(filter(str.isdigit, lead.phone))
         message_id = f"wz_out_{uuid.uuid4().hex[:12]}_{int(timezone.now().timestamp())}"
 

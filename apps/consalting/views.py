@@ -894,6 +894,9 @@ class LeadConsaltingRetrieveUpdateDestroyView(LeadVisibilityMixin, CompanyBranch
         lead = serializer.instance
         if not can_manage_leads(self.request.user, lead.funnel):
             raise PermissionDenied("Нет прав изменять лиды в этой воронке.")
+        # Ток назначенный сотрудник или руководитель может взаимодействовать с лидом
+        if lead.owner_id and lead.owner_id != self.request.user.id and not is_owner_like(self.request.user):
+            raise PermissionDenied("С этим лидом может взаимодействовать только назначенный сотрудник.")
         # завершённый лид редактирует только owner/admin
         if (lead.stage and lead.stage.system_key == "completed"
                 and not is_owner_like(self.request.user)):
@@ -911,6 +914,8 @@ class LeadConsaltingRetrieveUpdateDestroyView(LeadVisibilityMixin, CompanyBranch
             realtime.lead_updated(lead)
 
     def perform_destroy(self, instance):
+        if instance.owner_id and instance.owner_id != self.request.user.id and not is_owner_like(self.request.user):
+            raise PermissionDenied("Удалять лид может только назначенный сотрудник или руководитель.")
         realtime.lead_deleted(instance)
         instance.delete()
 
@@ -923,8 +928,7 @@ class LeadMoveStageView(LeadVisibilityMixin, CompanyBranchQuerysetMixin, generic
     В «мягком» режиме (CONSALTING_FUNNEL_STRICT=False) недопустимые переходы
     выполняются, но фиксируются как нарушения в timeline. В «строгом» — 400.
 
-    Сотрудник может двигать только лиды из общего пула или свои; руководитель —
-    любые. Real-time о перемещении уходит на доску через сигнал stage_changed.
+    Сотрудник может двигать только свои лиды или ничьи из общего пула; руководитель — любых.
     """
     queryset = LeadConsalting.objects.select_related("funnel", "stage").all()
     serializer_class = LeadMoveStageSerializer
@@ -933,6 +937,8 @@ class LeadMoveStageView(LeadVisibilityMixin, CompanyBranchQuerysetMixin, generic
         lead = self.get_object()
         if not can_manage_leads(request.user, lead.funnel):
             raise PermissionDenied("Нет прав двигать лиды в этой воронке.")
+        if lead.owner_id and lead.owner_id != request.user.id and not is_owner_like(request.user):
+            raise PermissionDenied("С этим лидом может взаимодействовать только назначенный сотрудник.")
         # завершённый лид двигает только owner/admin
         if (lead.stage and lead.stage.system_key == "completed"
                 and not is_owner_like(request.user)):
@@ -1040,6 +1046,66 @@ class LeadAssignView(CompanyBranchQuerysetMixin, generics.GenericAPIView):
             realtime.lead_claimed(lead)
             # персональное уведомление назначенному сотруднику
             realtime.notify_user(owner.id, "lead.assigned", realtime.serialize_lead(lead))
+        return Response(LeadConsaltingSerializer(lead, context=self.get_serializer_context()).data)
+
+
+class LeadTransferOwnerView(LeadVisibilityMixin, CompanyBranchQuerysetMixin, generics.GenericAPIView):
+    """
+    Передать лид другому сотруднику компании.
+    POST /api/consalting/leads/<uuid:pk>/transfer-owner/
+    Body: { "new_owner_id": "<uuid>" } или { "owner": "<uuid>" }
+
+    Права:
+      - Текущий назначенный сотрудник (lead.owner)
+      - Руководитель / Владелец компании (is_owner_like)
+    """
+    queryset = LeadConsalting.objects.select_related("funnel", "stage", "owner").all()
+    serializer_class = LeadConsaltingSerializer
+
+    def post(self, request, *args, **kwargs):
+        lead = self.get_object()
+
+        if lead.owner_id and lead.owner_id != request.user.id and not is_owner_like(request.user):
+            raise PermissionDenied("Передать лид может только его текущий ответственный или руководитель.")
+
+        new_owner_id = request.data.get("new_owner_id") or request.data.get("owner_id") or request.data.get("owner")
+        if not new_owner_id:
+            return Response({"detail": "Укажите ID нового сотрудника ('new_owner_id' или 'owner')."}, status=status.HTTP_400_BAD_REQUEST)
+
+        company = self._user_company()
+        new_owner = get_object_or_404(User, id=new_owner_id, company=company)
+
+        old_owner_name = lead.owner.full_name if lead.owner else "Не назначен"
+
+        if lead.owner_id != new_owner.id:
+            lead.owner = new_owner
+            lead.save(update_fields=["owner", "updated_at"])
+
+            ActivityLogger.log(
+                lead,
+                activity_type=LeadActivityConsalting.Type.MESSAGE,
+                actor=request.user,
+                title="Передача лида сотруднику",
+                body=f"Лид передан сотруднику {new_owner.full_name or new_owner.email} (ранее: {old_owner_name})."
+            )
+
+            realtime.lead_claimed(lead)
+
+            try:
+                from apps.main.realtime import create_and_publish_notification
+                create_and_publish_notification(
+                    company=company,
+                    user=new_owner,
+                    title=f"📥 Вам передан лид: {lead.full_name}",
+                    message=f"Лид передан от сотрудника {request.user.full_name or request.user.email}.",
+                    type="lead_assigned",
+                    level="info",
+                    url=f"/consalting/leads/{lead.id}",
+                    data={"lead_id": str(lead.id), "phone": lead.phone}
+                )
+            except Exception as e:
+                logger.warning("Failed to publish lead_assigned notification: %s", e)
+
         return Response(LeadConsaltingSerializer(lead, context=self.get_serializer_context()).data)
 
 
