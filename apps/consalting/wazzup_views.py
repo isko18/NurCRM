@@ -249,8 +249,8 @@ class WazzupChatListView(APIView):
 
 class WazzupCredentialsView(APIView):
     """
-    Эндпоинт получения ключей интеграции Wazzup для фронтенда.
-    Данные заполняются только из админки Django.
+    Эндпоинт получения ключей интеграций Wazzup (WhatsApp, Instagram, Telegram) для фронтенда.
+    Возвращает МАССИВ объектов всех каналов компании, настроенных в админке Django.
     GET /api/consalting/wazzup/credentials/
     GET /api/consalting/wazzup-credentials/
     """
@@ -259,30 +259,19 @@ class WazzupCredentialsView(APIView):
     def get(self, request):
         company = getattr(request.user, "company", None)
         if not company:
-            return Response({
-                "api_key": "",
-                "channel_id": "",
-                "integration_type": "whatsapp",
-                "is_active": False
-            }, status=status.HTTP_200_OK)
+            return Response([], status=status.HTTP_200_OK)
 
-        account = WazzupAccountConsalting.objects.filter(company=company, is_active=True).first()
-        if not account:
-            account = WazzupAccountConsalting.objects.filter(company=company).first()
+        accounts = WazzupAccountConsalting.objects.filter(company=company)
+        result = []
+        for acc in accounts:
+            result.append({
+                "id": str(acc.id),
+                "api_key": acc.api_key or "",
+                "channel_id": acc.channel_id or "",
+                "integration_type": acc.integration_type or "whatsapp",
+                "api_url": acc.api_url or "https://api.wazzup24.com",
+                "is_active": acc.is_active,
+            })
 
-        if not account:
-            return Response({
-                "api_key": "",
-                "channel_id": "",
-                "integration_type": "whatsapp",
-                "is_active": False
-            }, status=status.HTTP_200_OK)
-
-        return Response({
-            "api_key": account.api_key or "",
-            "channel_id": account.channel_id or "",
-            "integration_type": account.integration_type or "whatsapp",
-            "api_url": account.api_url or "https://api.wazzup24.com",
-            "is_active": account.is_active,
-        }, status=status.HTTP_200_OK)
+        return Response(result, status=status.HTTP_200_OK)
 
