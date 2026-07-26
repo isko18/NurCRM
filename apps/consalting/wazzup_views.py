@@ -109,6 +109,7 @@ class WhatsAppMessageConsaltingViewSet(viewsets.ReadOnlyModelViewSet):
     """
     permission_classes = [permissions.IsAuthenticated]
     serializer_class = WhatsAppMessageConsaltingSerializer
+    pagination_class = None
 
     def get_queryset(self):
         from .models import WhatsAppMessageConsalting
@@ -125,6 +126,7 @@ class WazzupChatListView(APIView):
     Объединяет все диалоги из WhatsAppMessageConsalting, LeadConsalting и InboundLeadConsalting.
     """
     permission_classes = [permissions.IsAuthenticated]
+    pagination_class = None
 
     def get(self, request):
         from .access import is_owner_like

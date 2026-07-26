@@ -2176,6 +2176,7 @@ class InboundLeadListCreateView(CompanyBranchQuerysetMixin, generics.ListCreateA
     POST /api/consalting/inbound-leads/ — ручное создание лида.
     """
     serializer_class = InboundLeadConsaltingSerializer
+    pagination_class = None
     filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
     filterset_fields = ["status", "owner", "source"]
     search_fields = ["full_name", "phone", "message"]
