@@ -51,7 +51,7 @@ class WazzupClient:
             }
         }
         try:
-            response = requests.post(endpoint, json=payload, headers=self.headers, timeout=15)
+            response = requests.patch(endpoint, json=payload, headers=self.headers, timeout=15)
             response.raise_for_status()
             return response.json()
         except requests.RequestException as e:

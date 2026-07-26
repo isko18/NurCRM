@@ -43,7 +43,7 @@ class WazzupAccountConsaltingViewSet(viewsets.ModelViewSet):
             }
         }
         try:
-            res = requests.post(url, json=payload, headers=headers, timeout=12.0)
+            res = requests.patch(url, json=payload, headers=headers, timeout=12.0)
             res.raise_for_status()
             account.is_connected = True
             account.save(update_fields=['is_connected'])
