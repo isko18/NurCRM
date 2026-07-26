@@ -75,6 +75,33 @@ class WazzupConsaltingService:
     """
 
     @staticmethod
+    def mark_chat_read(account: WazzupAccountConsalting, phone: str):
+        """
+        Сброс непрочитанных в Wazzup API (PATCH /v3/chats unread=0).
+        Проставляет синие галочки в WhatsApp и снимает счётчик непрочитанных на телефоне.
+        """
+        if not phone:
+            return
+        clean_phone = "".join(filter(str.isdigit, phone))
+        url = f"{account.api_url.rstrip('/')}/v3/chats"
+        headers = {
+            "Authorization": f"Bearer {account.api_key}",
+            "Content-Type": "application/json"
+        }
+        payload = [
+            {
+                "chatId": clean_phone,
+                "chatType": account.integration_type or "whatsapp",
+                "unread": 0
+            }
+        ]
+        try:
+            res = requests.patch(url, json=payload, headers=headers, timeout=5.0)
+            logger.info(f"Wazzup chat {clean_phone} marked read (unread=0): status={res.status_code}")
+        except Exception as e:
+            logger.warning(f"Failed to mark chat read in Wazzup: {e}")
+
+    @staticmethod
     def send_message(account: WazzupAccountConsalting, lead: LeadConsalting, text: str, user: User = None, content_uri: str = None) -> WhatsAppMessageConsalting:
         """
         Отправка исходящего сообщения в Wazzup API (POST /v3/message)
@@ -142,6 +169,8 @@ class WazzupConsaltingService:
                     wa_message.message_id = str(wz_id)
                 wa_message.status = WhatsAppMessageConsalting.Status.SENT
                 wa_message.save(update_fields=["message_id", "status"])
+                # Сбрасываем счётчик непрочитанных в Wazzup для галочек в WhatsApp
+                WazzupConsaltingService.mark_chat_read(account, clean_phone)
             else:
                 logger.error(f"Wazzup API Error: {res.status_code} {res.text}")
                 wa_message.status = WhatsAppMessageConsalting.Status.FAILED

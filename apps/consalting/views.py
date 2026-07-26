@@ -1118,12 +1118,19 @@ class LeadMarkMessagesReadView(LeadVisibilityMixin, CompanyBranchQuerysetMixin, 
 
     def post(self, request, *args, **kwargs):
         lead = self.get_object()
-        from .models import WhatsAppMessageConsalting
+        from .models import WhatsAppMessageConsalting, WazzupAccountConsalting
+        from .funnel.wazzup import WazzupConsaltingService
+
         updated = WhatsAppMessageConsalting.objects.filter(
             lead=lead, direction=WhatsAppMessageConsalting.Direction.INBOUND
         ).exclude(status=WhatsAppMessageConsalting.Status.READ).update(
             status=WhatsAppMessageConsalting.Status.READ
         )
+
+        account = WazzupAccountConsalting.objects.filter(company=lead.company, is_active=True).first()
+        if account and lead.phone:
+            WazzupConsaltingService.mark_chat_read(account, lead.phone)
+
         realtime.lead_updated(lead)
         return Response({"status": "ok", "marked_read_count": updated})
 
