@@ -140,6 +140,12 @@ class WazzupChatListView(APIView):
 
         qs = LeadConsalting.objects.filter(company=company).select_related("owner")
         qs = apply_lead_visibility(qs, user)
+
+        integration_type = request.query_params.get("integration_type") or request.query_params.get("source")
+        if integration_type:
+            from django.db.models import Q
+            qs = qs.filter(Q(source__icontains=integration_type) | Q(title__icontains=integration_type))
+
         qs = qs.exclude(phone="").order_by("-updated_at")
 
         chats = []
@@ -161,6 +167,10 @@ class WazzupChatListView(APIView):
                     "created_at": last_msg.created_at.isoformat() if last_msg.created_at else None,
                 }
 
+            owner_name = None
+            if lead.owner:
+                owner_name = f"{(lead.owner.first_name or '').strip()} {(lead.owner.last_name or '').strip()}".strip() or getattr(lead.owner, "email", "")
+
             chats.append({
                 "id": str(lead.id),
                 "lead_id": str(lead.id),
@@ -170,7 +180,7 @@ class WazzupChatListView(APIView):
                 "phone": lead.phone,
                 "owner": {
                     "id": str(lead.owner.id),
-                    "name": lead.owner.full_name or lead.owner.email
+                    "name": owner_name
                 } if lead.owner else None,
                 "last_message": last_msg_data,
                 "last_message_text": last_msg.text if last_msg else "",
