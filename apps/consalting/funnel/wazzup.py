@@ -34,12 +34,19 @@ def _broadcast_consalting_message(company_id, lead, wa_message, is_inbound, text
     if not layer:
         return
 
+    content_uri = getattr(wa_message, "content_uri", None)
+    media_type = getattr(wa_message, "media_type", None)
+
     msg_payload = {
         "id": str(wa_message.id),
         "message_id": wa_message.message_id,
         "lead_id": str(lead.id),
         "chat_id": phone,
         "text": text,
+        "content_uri": content_uri,
+        "contentUri": content_uri,
+        "media_type": media_type,
+        "type": media_type or "text",
         "is_incoming": is_inbound,
         "direction": "inbound" if is_inbound else "outbound",
         "status": wa_message.status,
@@ -117,6 +124,10 @@ class WazzupConsaltingService:
         clean_phone = "".join(filter(str.isdigit, lead.phone))
         message_id = f"wz_out_{uuid.uuid4().hex[:12]}_{int(timezone.now().timestamp())}"
 
+        effective_text = text or ""
+        if not effective_text and content_uri:
+            effective_text = "📎 [Медиа-файл]"
+
         with transaction.atomic():
             wa_message = WhatsAppMessageConsalting.objects.create(
                 company_id=lead.company_id,
@@ -124,7 +135,8 @@ class WazzupConsaltingService:
                 lead=lead,
                 message_id=message_id,
                 direction=WhatsAppMessageConsalting.Direction.OUTBOUND,
-                text=text,
+                text=effective_text,
+                content_uri=content_uri,
                 status=WhatsAppMessageConsalting.Status.PENDING
             )
 
@@ -225,8 +237,25 @@ class WazzupConsaltingService:
             message_id = str(item.get("messageId") or "").strip()
             chat_id = item.get("chatId") or item.get("author") or ""
             text = item.get("text") or ""
+            content_uri = item.get("contentUri") or item.get("content_uri") or ""
+            media_type = item.get("type") or ""
             is_inbound = item.get("isInbound", True)
             author_name = item.get("authorName") or ""
+
+            # Обработка медиафайлов (фото, видео, голосовые, документы), если текст сообщения пустой
+            if not text:
+                if media_type in ["image", "photo"]:
+                    text = "📷 [Фотография]"
+                elif media_type in ["video"]:
+                    text = "🎥 [Видеозапись]"
+                elif media_type in ["audio", "voice", "ptt"]:
+                    text = "🎙 [Голосовое сообщение]"
+                elif media_type in ["document", "file"]:
+                    text = "📄 [Документ]"
+                elif content_uri:
+                    text = "📎 [Вложение]"
+                else:
+                    text = "[Сообщение]"
 
             # Защита от дублей по message_id
             if message_id and WhatsAppMessageConsalting.objects.filter(message_id=message_id).exists():
@@ -353,6 +382,8 @@ class WazzupConsaltingService:
                         "lead": lead,
                         "direction": direction,
                         "text": text,
+                        "content_uri": content_uri,
+                        "media_type": media_type,
                         "status": WhatsAppMessageConsalting.Status.READ if is_inbound else WhatsAppMessageConsalting.Status.SENT
                     }
                 )

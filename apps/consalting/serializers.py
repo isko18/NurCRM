@@ -971,17 +971,21 @@ class LeadTaskConsaltingSerializer(serializers.ModelSerializer):
 # WhatsAppMessageConsalting
 # ==========================
 class WhatsAppMessageConsaltingSerializer(serializers.ModelSerializer):
+    contentUri = serializers.CharField(source="content_uri", read_only=True)
+
     class Meta:
         model = WhatsAppMessageConsalting
         fields = (
             "id", "company", "branch", "lead", "message_id",
-            "direction", "text", "status", "created_at", "updated_at"
+            "direction", "text", "content_uri", "contentUri", "media_type", "status", "created_at", "updated_at"
         )
         read_only_fields = ("id", "company", "branch", "created_at", "updated_at")
 
 
 class WhatsAppSendSerializer(serializers.Serializer):
-    text = serializers.CharField(required=True, help_text="Текст сообщения для отправки")
+    text = serializers.CharField(required=False, allow_blank=True, default="", help_text="Текст сообщения")
+    content_uri = serializers.CharField(required=False, allow_blank=True, default="", help_text="URL медиафайла")
+    contentUri = serializers.CharField(required=False, allow_blank=True, default="", help_text="URL медиафайла")
 
 
 # ==========================

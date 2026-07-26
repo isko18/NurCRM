@@ -59,7 +59,7 @@ class WazzupAccountConsaltingViewSet(viewsets.ModelViewSet):
         account = self.get_object()
         lead_id = request.data.get('lead_id')
         text = request.data.get('message') or request.data.get('text') or ""
-        media_url = request.data.get('media_url')
+        media_url = request.data.get('content_uri') or request.data.get('contentUri') or request.data.get('media_url') or request.data.get('file_url')
 
         if not lead_id:
             return Response({"detail": "Укажите lead_id"}, status=status.HTTP_400_BAD_REQUEST)

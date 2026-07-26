@@ -1395,6 +1395,17 @@ class WhatsAppMessageConsalting(TimeStampedModel):
         verbose_name='Направление'
     )
     text = models.TextField(verbose_name='Текст сообщения')
+    content_uri = models.TextField(
+        null=True,
+        blank=True,
+        verbose_name='URL медиа-файла'
+    )
+    media_type = models.CharField(
+        max_length=50,
+        null=True,
+        blank=True,
+        verbose_name='Тип медиа'
+    )
     status = models.CharField(
         max_length=20,
         choices=Status.choices,
