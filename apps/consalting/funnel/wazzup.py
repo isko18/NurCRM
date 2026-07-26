@@ -75,6 +75,56 @@ def _broadcast_consalting_message(company_id, lead, wa_message, is_inbound, text
             logger.warning("Failed to broadcast websocket event to %s: %s", g, e)
 
 
+def _broadcast_fast_wazzup_message(company_id, phone, message_id, text, content_uri=None, media_type=None, is_inbound=True, author_name=None):
+    """
+    Ультрабыстрая пред-трансляция события сообщения по WebSocket (до 10 мс) до начала тяжелых операций с базой данных.
+    """
+    from channels.layers import get_channel_layer
+    from asgiref.sync import async_to_sync
+
+    layer = get_channel_layer()
+    if not layer:
+        return
+
+    msg_payload = {
+        "id": message_id or f"msg_{uuid.uuid4().hex[:12]}",
+        "message_id": message_id,
+        "lead_id": "",
+        "chat_id": f"+{phone}" if not str(phone).startswith("+") else str(phone),
+        "text": text,
+        "content_uri": content_uri,
+        "contentUri": content_uri,
+        "media_type": media_type,
+        "type": media_type or "text",
+        "is_incoming": is_inbound,
+        "direction": "inbound" if is_inbound else "outbound",
+        "status": "read" if is_inbound else "sent",
+        "timestamp": timezone.now().isoformat(),
+        "contact_name": author_name or (f"+{phone}" if not str(phone).startswith("+") else str(phone)),
+    }
+
+    event_envelope = {
+        "type": "wazzup_event",
+        "event": {
+            "type": "new_message",
+            "data": msg_payload
+        }
+    }
+
+    groups = [
+        f"consalting_company_{company_id}",
+        f"wazzup_company_{company_id}",
+        f"wazzup_chat_+{phone}",
+        f"wazzup_chat_{phone}"
+    ]
+
+    for g in groups:
+        try:
+            async_to_sync(layer.group_send)(g, event_envelope)
+        except Exception:
+            pass
+
+
 class WazzupConsaltingService:
     """
     Интеграционный сервис Wazzup API v3 для воронки консалтинга.
@@ -270,6 +320,18 @@ class WazzupConsaltingService:
 
             phone = f"+{clean_phone}" if not clean_phone.startswith("+") else clean_phone
             source_name = f"Wazzup ({account.integration_type})"
+
+            # ⚡ Ультрабыстрая предварительная сокет-трансляция (до 10 мс задержки!)
+            _broadcast_fast_wazzup_message(
+                company_id=account.company_id,
+                phone=clean_phone,
+                message_id=message_id,
+                text=text,
+                content_uri=content_uri,
+                media_type=media_type,
+                is_inbound=is_inbound,
+                author_name=author_name
+            )
 
             with transaction.atomic():
                 # Идемпотентная привязка/обновление входящей заявки (InboundLeadConsalting) по номеру телефона
