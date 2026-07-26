@@ -45,4 +45,8 @@ urlpatterns = [
     
     # Обмен authorization code на access_token
     path('oauth/meta/exchange/', MetaOAuthExchangeView.as_view(), name='meta-oauth-exchange'),
+
+    # Wazzup интеграция
+    path('', include('apps.crm.wazzup.urls')),
 ]
+

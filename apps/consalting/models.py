@@ -1414,6 +1414,62 @@ class WhatsAppMessageConsalting(TimeStampedModel):
         return f"{self.direction} - {self.message_id} ({self.status})"
 
 
+# ======== Wazzup аккаунт консалтинга ========
+class WazzupAccountConsalting(TimeStampedModel):
+    """Аккаунт Wazzup для интеграции воронки консалтинга с WhatsApp, Instagram, Telegram."""
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    company = models.ForeignKey(
+        Company,
+        on_delete=models.CASCADE,
+        related_name='consalting_wazzup_accounts',
+        verbose_name='Компания'
+    )
+    branch = models.ForeignKey(
+        Branch,
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
+        related_name='consalting_wazzup_accounts',
+        verbose_name='Филиал'
+    )
+    api_key = models.CharField(
+        max_length=255,
+        verbose_name='API Ключ Wazzup',
+        help_text='Ключ API из личного кабинета Wazzup'
+    )
+    api_url = models.URLField(
+        default='https://api.wazzup24.com',
+        verbose_name='API URL'
+    )
+    channel_id = models.CharField(
+        max_length=255,
+        verbose_name='Channel ID (ID Канала)',
+        help_text='ID канала WhatsApp/Instagram из Wazzup'
+    )
+    INTEGRATION_TYPES = [
+        ('whatsapp', 'WhatsApp'),
+        ('instagram', 'Instagram'),
+        ('telegram', 'Telegram'),
+    ]
+    integration_type = models.CharField(
+        max_length=20,
+        choices=INTEGRATION_TYPES,
+        default='whatsapp',
+        verbose_name='Тип интеграции'
+    )
+    is_active = models.BooleanField(default=True, verbose_name='Активен')
+    is_connected = models.BooleanField(default=False, verbose_name='Подключен')
+
+    class Meta:
+        verbose_name = 'Wazzup аккаунт консалтинга'
+        verbose_name_plural = 'Wazzup аккаунты консалтинга'
+        ordering = ['-created_at']
+
+    def __str__(self):
+        return f"Wazzup Consalting ({self.get_integration_type_display()}): {self.channel_id}"
+
+
+
 # ======== Зарплатная система консалтинга (ставки, авто-начисления, выплаты) ========
 class ServiceSalaryRateConsalting(TimeStampedModel):
     """Ставка авто-начисления % зарплаты продавца по конкретной услуге."""

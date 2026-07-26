@@ -1047,4 +1047,24 @@ class LeadDistributionSettingsConsaltingSerializer(serializers.ModelSerializer):
         ]
 
 
+# ==========================
+# WazzupAccountConsaltingSerializer
+# ==========================
+from .models import WazzupAccountConsalting
+
+
+class WazzupAccountConsaltingSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
+    integration_type_display = serializers.CharField(source='get_integration_type_display', read_only=True)
+
+    class Meta:
+        model = WazzupAccountConsalting
+        fields = (
+            "id", "company", "branch", "api_key", "api_url", "channel_id",
+            "integration_type", "integration_type_display",
+            "is_active", "is_connected", "created_at", "updated_at",
+        )
+        read_only_fields = ("id", "company", "branch", "created_at", "updated_at")
+
+
+
 

@@ -241,3 +241,26 @@ class MessageTemplateAdmin(admin.ModelAdmin):
             'classes': ('collapse',),
         }),
     )
+
+
+# ==================== WAZZUP INTEGRATION ADMIN ====================
+
+
+from .models import WazzupAccount, WazzupMessage
+
+
+@admin.register(WazzupAccount)
+class WazzupAccountAdmin(admin.ModelAdmin):
+    list_display = ['channel_id', 'integration_type', 'company', 'is_active', 'is_connected', 'created_at']
+    list_filter = ['integration_type', 'is_active', 'is_connected', 'created_at']
+    search_fields = ['channel_id', 'api_key', 'company__name']
+    readonly_fields = ['id', 'created_at', 'updated_at']
+
+
+@admin.register(WazzupMessage)
+class WazzupMessageAdmin(admin.ModelAdmin):
+    list_display = ['chat_id', 'is_incoming', 'status', 'account', 'timestamp']
+    list_filter = ['is_incoming', 'status', 'chat_type', 'timestamp']
+    search_fields = ['chat_id', 'message_id', 'text']
+    readonly_fields = ['id', 'created_at']
+

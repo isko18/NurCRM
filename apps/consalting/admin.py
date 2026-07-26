@@ -452,3 +452,17 @@ class BookingConsaltingAdmin(CompanyBranchScopedAdminMixin, TimeStampedAdminMixi
         if not request.user.is_superuser:
             ro.extend(["company", "branch"])
         return ro
+
+
+# ========= Wazzup Accounts =========
+from .models import WazzupAccountConsalting
+
+
+@admin.register(WazzupAccountConsalting)
+class WazzupAccountConsaltingAdmin(CompanyBranchScopedAdminMixin, TimeStampedAdminMixin, admin.ModelAdmin):
+    list_display = ("channel_id", "integration_type", "company", "branch", "is_active", "is_connected", "created_at")
+    list_filter = ("company", "branch", "integration_type", "is_active", "is_connected")
+    search_fields = ("channel_id", "api_key")
+    raw_id_fields = ("company", "branch")
+    ordering = ("-created_at",)
+

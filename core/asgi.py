@@ -15,6 +15,7 @@ from apps.scale import ws_routing as scale_ws_routing
 from apps.cafe import routing as cafe_routing
 from apps.consalting import routing as consalting_routing
 from apps.main import routing as main_routing
+from apps.crm.wazzup import routing as wazzup_routing
 
 # один общий список всех WS-маршрутов
 websocket_urlpatterns = (
@@ -23,7 +24,9 @@ websocket_urlpatterns = (
     + cafe_routing.websocket_urlpatterns
     + consalting_routing.websocket_urlpatterns
     + main_routing.websocket_urlpatterns
+    + wazzup_routing.websocket_urlpatterns
 )
+
 
 
 def _ws_allowed_origins():

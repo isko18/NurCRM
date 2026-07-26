@@ -1,0 +1,297 @@
+import logging
+import uuid
+import requests
+from django.utils import timezone
+from django.db import transaction
+from django.shortcuts import get_object_or_404
+
+from apps.main.models import Company
+from apps.users.models import User, Branch
+from ..models import (
+    LeadConsalting,
+    InboundLeadConsalting,
+    WhatsAppMessageConsalting,
+    WazzupAccountConsalting,
+    LeadActivityConsalting,
+    FunnelConsalting,
+    FunnelStageConsalting,
+)
+from .activity import ActivityLogger
+from . import events
+from . import realtime
+
+logger = logging.getLogger(__name__)
+
+
+class WazzupConsaltingService:
+    """
+    Интеграционный сервис Wazzup API v3 для воронки консалтинга.
+    https://api.wazzup24.com/v3
+    """
+
+    @staticmethod
+    def send_message(account: WazzupAccountConsalting, lead: LeadConsalting, text: str, user: User = None, content_uri: str = None) -> WhatsAppMessageConsalting:
+        """
+        Отправка исходящего сообщения в Wazzup API (POST /v3/message)
+        """
+        if not lead.phone:
+            raise ValueError("У лида не указан номер телефона.")
+
+        clean_phone = "".join(filter(str.isdigit, lead.phone))
+        message_id = f"wz_out_{uuid.uuid4().hex[:12]}_{int(timezone.now().timestamp())}"
+
+        with transaction.atomic():
+            wa_message = WhatsAppMessageConsalting.objects.create(
+                company_id=lead.company_id,
+                branch_id=lead.branch_id,
+                lead=lead,
+                message_id=message_id,
+                direction=WhatsAppMessageConsalting.Direction.OUTBOUND,
+                text=text,
+                status=WhatsAppMessageConsalting.Status.PENDING
+            )
+
+            ActivityLogger.log(
+                lead=lead,
+                activity_type=LeadActivityConsalting.Type.MESSAGE,
+                actor=user,
+                title="Wazzup (исходящее)",
+                body=text,
+                payload={
+                    "direction": "outbound",
+                    "message_id": message_id,
+                    "status": "pending",
+                    "channel_id": account.channel_id,
+                }
+            )
+
+        # Вызов Wazzup API /v3/message
+        url = f"{account.api_url.rstrip('/')}/v3/message"
+        headers = {
+            "Authorization": f"Bearer {account.api_key}",
+            "Content-Type": "application/json"
+        }
+        payload = {
+            "channelId": account.channel_id,
+            "chatId": clean_phone,
+            "chatType": account.integration_type,
+            "text": text,
+        }
+        if content_uri:
+            payload["contentUri"] = content_uri
+
+        try:
+            res = requests.post(url, json=payload, headers=headers, timeout=12.0)
+            if res.status_code in (200, 201):
+                data = res.json()
+                wz_id = data.get("messageId") or data.get("id")
+                if wz_id:
+                    wa_message.message_id = str(wz_id)
+                wa_message.status = WhatsAppMessageConsalting.Status.SENT
+                wa_message.save(update_fields=["message_id", "status"])
+            else:
+                logger.error(f"Wazzup API Error: {res.status_code} {res.text}")
+                wa_message.status = WhatsAppMessageConsalting.Status.FAILED
+                wa_message.save(update_fields=["status"])
+        except Exception as e:
+            logger.error(f"Ошибка вызова Wazzup API: {e}")
+            wa_message.status = WhatsAppMessageConsalting.Status.FAILED
+            wa_message.save(update_fields=["status"])
+
+        # Обновляем канбан воронку через WebSocket
+        realtime.lead_updated(lead)
+
+        return wa_message
+
+    @staticmethod
+    def handle_wazzup_webhook(payload: dict):
+        """
+        Обработка входящих сообщений и статусов от Wazzup Webhook.
+        Атомарность, идемпотентность (external_id), автораспределение (Round-Robin/Least-Loaded) и персональные WS-уведомления.
+        """
+        from apps.consalting.views import distribute_inbound_lead
+
+        messages = payload.get("messages") or []
+        statuses = payload.get("statuses") or []
+
+        # 1. Обработка входящих/исходящих сообщений
+        for item in messages:
+            channel_id = item.get("channelId")
+            account = WazzupAccountConsalting.objects.filter(channel_id=channel_id, is_active=True).first()
+            if not account:
+                logger.warning(f"Wazzup account not found or inactive for channelId={channel_id}")
+                continue
+
+            message_id = str(item.get("messageId") or "").strip()
+            chat_id = item.get("chatId") or item.get("author") or ""
+            text = item.get("text") or ""
+            is_inbound = item.get("isInbound", True)
+            author_name = item.get("authorName") or ""
+
+            # Защита от дублей по message_id
+            if message_id and WhatsAppMessageConsalting.objects.filter(message_id=message_id).exists():
+                logger.info(f"Wazzup duplicate webhook ignored for message_id={message_id}")
+                continue
+
+            clean_phone = "".join(filter(str.isdigit, chat_id))
+            if clean_phone.startswith("8") and len(clean_phone) == 11:
+                clean_phone = "7" + clean_phone[1:]
+            elif not clean_phone.startswith("7") and len(clean_phone) == 10:
+                clean_phone = "7" + clean_phone
+
+            phone = f"+{clean_phone}" if not clean_phone.startswith("+") else clean_phone
+            source_name = f"Wazzup ({account.integration_type})"
+
+            with transaction.atomic():
+                # Идемпотентная регистрация входящего лида (InboundLeadConsalting)
+                inbound_lead = None
+                inbound_created = False
+                if message_id:
+                    inbound_lead = InboundLeadConsalting.objects.filter(
+                        company=account.company, external_id=message_id
+                    ).first()
+
+                if not inbound_lead:
+                    inbound_lead = InboundLeadConsalting.objects.create(
+                        company=account.company,
+                        external_id=message_id if message_id else f"wz_{uuid.uuid4().hex[:12]}",
+                        full_name=author_name or phone or "Wazzup Клиент",
+                        phone=phone,
+                        source=source_name,
+                        message=text,
+                        status=InboundLeadConsalting.Status.NEW,
+                    )
+                    inbound_created = True
+
+                # Автораспределение лида (Round-Robin / Least-Loaded)
+                assigned_owner = None
+                if inbound_created:
+                    distributed_lead = distribute_inbound_lead(inbound_lead)
+                    if distributed_lead and distributed_lead.owner:
+                        assigned_owner = distributed_lead.owner
+
+                # Поиск или создание активного лида в воронке консалтинга
+                lead = LeadConsalting.objects.filter(
+                    company_id=account.company_id,
+                    phone__icontains=clean_phone[-10:] if len(clean_phone) >= 10 else clean_phone
+                ).exclude(
+                    stage__stage_type__in=[
+                        FunnelStageConsalting.StageType.WON,
+                        FunnelStageConsalting.StageType.COMPLETED,
+                        FunnelStageConsalting.StageType.LOST
+                    ]
+                ).order_by("-updated_at").first()
+
+                created_lead = False
+                if not lead:
+                    funnel = FunnelConsalting.objects.filter(company_id=account.company_id).first()
+                    if not funnel:
+                        funnel = FunnelConsalting.objects.create(
+                            company_id=account.company_id,
+                            branch_id=account.branch_id,
+                            name="Воронка консалтинга"
+                        )
+
+                    stage = FunnelStageConsalting.objects.filter(funnel=funnel).order_by("order").first()
+                    if not stage:
+                        stage = FunnelStageConsalting.objects.create(
+                            company_id=account.company_id,
+                            funnel=funnel,
+                            name="Новый лид",
+                            stage_type=FunnelStageConsalting.StageType.NEW_LEAD,
+                            order=100
+                        )
+
+                    lead = LeadConsalting.objects.create(
+                        company_id=account.company_id,
+                        branch_id=account.branch_id,
+                        funnel=funnel,
+                        stage=stage,
+                        owner=assigned_owner,
+                        title=f"Заявка из {account.get_integration_type_display()} ({phone})",
+                        phone=phone,
+                        full_name=author_name or f"Клиент {phone}",
+                        status=LeadConsalting.Status.NEW
+                    )
+                    created_lead = True
+
+                direction = (
+                    WhatsAppMessageConsalting.Direction.INBOUND
+                    if is_inbound else
+                    WhatsAppMessageConsalting.Direction.OUTBOUND
+                )
+
+                effective_msg_id = message_id if message_id else f"msg_{uuid.uuid4().hex[:12]}"
+                wa_message, msg_created = WhatsAppMessageConsalting.objects.get_or_create(
+                    message_id=effective_msg_id,
+                    defaults={
+                        "company_id": lead.company_id,
+                        "branch_id": lead.branch_id,
+                        "lead": lead,
+                        "direction": direction,
+                        "text": text,
+                        "status": WhatsAppMessageConsalting.Status.READ if is_inbound else WhatsAppMessageConsalting.Status.SENT
+                    }
+                )
+
+                if msg_created:
+                    ActivityLogger.log(
+                        lead=lead,
+                        activity_type=LeadActivityConsalting.Type.MESSAGE,
+                        actor=None,
+                        title=f"Wazzup ({'входящее' if is_inbound else 'исходящее'})",
+                        body=text,
+                        payload={
+                            "direction": "inbound" if is_inbound else "outbound",
+                            "message_id": effective_msg_id,
+                            "channel_id": channel_id,
+                        }
+                    )
+
+            # Вызовы трансляций в реальном времени после завершения транзакции
+            events.emit(
+                trigger="activity_added" if not created_lead else "stage_changed",
+                lead=lead,
+                actor=None,
+                ctx={"is_wazzup": True, "message_id": effective_msg_id}
+            )
+
+            if created_lead:
+                realtime.lead_created(lead)
+            else:
+                realtime.lead_updated(lead)
+
+            if assigned_owner:
+                realtime.notify_user(
+                    assigned_owner.id,
+                    "lead.assigned",
+                    {
+                        "id": str(lead.id),
+                        "full_name": lead.full_name,
+                        "phone": lead.phone,
+                        "source": source_name,
+                        "message": text,
+                        "status": lead.status,
+                        "created_at": lead.created_at.isoformat(),
+                    }
+                )
+
+        # 2. Обработка обновлений статусов сообщений
+        for item in statuses:
+            message_id = item.get("messageId")
+            status_str = item.get("status")
+            if message_id and status_str:
+                status_map = {
+                    "sent": WhatsAppMessageConsalting.Status.SENT,
+                    "delivered": WhatsAppMessageConsalting.Status.DELIVERED,
+                    "read": WhatsAppMessageConsalting.Status.READ,
+                    "failed": WhatsAppMessageConsalting.Status.FAILED,
+                }
+                st = status_map.get(status_str.lower())
+                if st:
+                    msg = WhatsAppMessageConsalting.objects.filter(message_id=message_id).first()
+                    if msg:
+                        msg.status = st
+                        msg.save(update_fields=["status"])
+                        if msg.lead:
+                            realtime.lead_updated(msg.lead)

@@ -497,3 +497,9 @@ EKASSA_REQUEST_TIMEOUT = _get_int_env("EKASSA_REQUEST_TIMEOUT", 45)
 EKASSA_TOKEN_CACHE_SECONDS = _get_int_env("EKASSA_TOKEN_CACHE_SECONDS", 300)
 # Тестовый чек POST /api/ekassa/test-receipt/ — по умолчанию разрешён при DEBUG; на бою задайте EKASSA_ALLOW_TEST_RECEIPT=1
 EKASSA_ALLOW_TEST_RECEIPT = _get_bool_env("EKASSA_ALLOW_TEST_RECEIPT", DEBUG)
+
+# Wazzup Integration
+WAZZUP_API_URL = os.getenv("WAZZUP_API_URL", "https://api.wazzup24.com")
+WAZZUP_DEFAULT_API_KEY = os.getenv("WAZZUP_DEFAULT_API_KEY", "")
+WAZZUP_DEFAULT_CHANNEL_ID = os.getenv("WAZZUP_DEFAULT_CHANNEL_ID", "")
+

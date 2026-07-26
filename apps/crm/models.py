@@ -1053,3 +1053,138 @@ class Activity(models.Model):
 
     def __str__(self):
         return f"{self.get_activity_type_display()}: {self.title}"
+
+
+# ==================== WAZZUP INTEGRATION ====================
+
+
+class WazzupAccount(models.Model):
+    """
+    Аккаунт Wazzup для интеграции с WhatsApp, Instagram, Telegram.
+    Документация: https://wazzup24.com/help/api-ru/
+    """
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    company = models.ForeignKey(
+        Company,
+        on_delete=models.CASCADE,
+        related_name='wazzup_accounts',
+        verbose_name='Компания'
+    )
+    api_key = models.CharField(
+        max_length=255,
+        verbose_name='API Ключ Wazzup',
+        help_text='Ключ API из личного кабинета Wazzup'
+    )
+    api_url = models.URLField(
+        default='https://api.wazzup24.com',
+        verbose_name='API URL'
+    )
+    channel_id = models.CharField(
+        max_length=255,
+        verbose_name='Channel ID (ID Канала)',
+        help_text='ID канала WhatsApp/Instagram из Wazzup'
+    )
+    INTEGRATION_TYPES = [
+        ('whatsapp', 'WhatsApp'),
+        ('instagram', 'Instagram'),
+        ('telegram', 'Telegram'),
+    ]
+    integration_type = models.CharField(
+        max_length=20,
+        choices=INTEGRATION_TYPES,
+        default='whatsapp',
+        verbose_name='Тип интеграции'
+    )
+    is_active = models.BooleanField(default=True, verbose_name='Активен')
+    is_connected = models.BooleanField(default=False, verbose_name='Подключен')
+
+    created_at = models.DateTimeField(auto_now_add=True, verbose_name='Дата создания')
+    updated_at = models.DateTimeField(auto_now=True, verbose_name='Дата обновления')
+
+    class Meta:
+        verbose_name = 'Wazzup Аккаунт'
+        verbose_name_plural = 'Wazzup Аккаунты'
+        ordering = ['-created_at']
+
+    def __str__(self):
+        return f"Wazzup ({self.get_integration_type_display()}): {self.channel_id} ({self.company.name})"
+
+
+class WazzupMessage(models.Model):
+    """
+    Сообщение Wazzup.
+    """
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    account = models.ForeignKey(
+        WazzupAccount,
+        on_delete=models.CASCADE,
+        related_name='messages',
+        verbose_name='Wazzup Аккаунт'
+    )
+    contact = models.ForeignKey(
+        Contact,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='wazzup_messages',
+        verbose_name='Контакт'
+    )
+    lead = models.ForeignKey(
+        Lead,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='wazzup_messages',
+        verbose_name='Лид'
+    )
+    deal = models.ForeignKey(
+        Deal,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='wazzup_messages',
+        verbose_name='Сделка'
+    )
+    message_id = models.CharField(
+        max_length=255,
+        unique=True,
+        db_index=True,
+        verbose_name='Wazzup Message ID'
+    )
+    chat_id = models.CharField(
+        max_length=255,
+        verbose_name='Chat ID / Телефон'
+    )
+    chat_type = models.CharField(
+        max_length=50,
+        default='whatsapp',
+        verbose_name='Тип чата'
+    )
+    is_incoming = models.BooleanField(default=True, verbose_name='Входящее')
+    text = models.TextField(blank=True, null=True, verbose_name='Текст сообщения')
+    media_url = models.URLField(blank=True, null=True, verbose_name='URL медиа')
+
+    STATUS_CHOICES = [
+        ('sent', 'Отправлено'),
+        ('delivered', 'Доставлено'),
+        ('read', 'Прочитано'),
+        ('failed', 'Ошибка'),
+    ]
+    status = models.CharField(
+        max_length=20,
+        choices=STATUS_CHOICES,
+        default='sent',
+        verbose_name='Статус'
+    )
+    timestamp = models.DateTimeField(default=timezone.now, verbose_name='Время сообщения')
+    created_at = models.DateTimeField(auto_now_add=True, verbose_name='Дата создания')
+
+    class Meta:
+        verbose_name = 'Wazzup Сообщение'
+        verbose_name_plural = 'Wazzup Сообщения'
+        ordering = ['-timestamp']
+
+    def __str__(self):
+        direction = "←" if self.is_incoming else "→"
+        return f"{direction} {self.chat_id}: {self.text[:30] if self.text else 'Медиа'}"
+

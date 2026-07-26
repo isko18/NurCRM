@@ -439,3 +439,37 @@ class MessageTemplateSerializer(serializers.ModelSerializer):
             'created_at', 'updated_at'
         ]
         read_only_fields = ['id', 'created_at', 'updated_at']
+
+
+# ==================== WAZZUP SERIALIZERS ====================
+
+
+from .models import WazzupAccount, WazzupMessage
+
+
+class WazzupAccountSerializer(serializers.ModelSerializer):
+    integration_type_display = serializers.CharField(source='get_integration_type_display', read_only=True)
+
+    class Meta:
+        model = WazzupAccount
+        fields = [
+            'id', 'company', 'api_key', 'api_url', 'channel_id',
+            'integration_type', 'integration_type_display',
+            'is_active', 'is_connected', 'created_at', 'updated_at'
+        ]
+        read_only_fields = ['id', 'created_at', 'updated_at']
+
+
+class WazzupMessageSerializer(serializers.ModelSerializer):
+    status_display = serializers.CharField(source='get_status_display', read_only=True)
+
+    class Meta:
+        model = WazzupMessage
+        fields = [
+            'id', 'account', 'contact', 'lead', 'deal',
+            'message_id', 'chat_id', 'chat_type', 'is_incoming',
+            'text', 'media_url', 'status', 'status_display',
+            'timestamp', 'created_at'
+        ]
+        read_only_fields = ['id', 'created_at']
+

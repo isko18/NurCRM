@@ -61,6 +61,8 @@ from .views import (
     WhatsAppInboundWebhookView,
     SubscriptionMatrixView,
 )
+from .wazzup_views import WazzupAccountConsaltingViewSet, WazzupWebhookConsaltingView
+
 
 urlpatterns = [
     # ===== Клиенты & Абонентская матрица =====
@@ -150,4 +152,12 @@ urlpatterns = [
     path('leads/<uuid:pk>/whatsapp/send/', LeadWhatsAppSendView.as_view(), name='lead-whatsapp-send'),
     path('leads/<uuid:pk>/whatsapp/history/', LeadWhatsAppHistoryView.as_view(), name='lead-whatsapp-history'),
     path('whatsapp/webhook/', WhatsAppConsaltingWebhookView.as_view(), name='whatsapp-consalting-webhook'),
+
+    # ===== Wazzup Интеграция (Консалтинг) =====
+    path('wazzup/webhook/', WazzupWebhookConsaltingView.as_view(), name='wazzup-consalting-webhook'),
+    path('wazzup-accounts/', WazzupAccountConsaltingViewSet.as_view({'get': 'list', 'post': 'create'}), name='wazzup-consalting-accounts'),
+    path('wazzup-accounts/<uuid:pk>/', WazzupAccountConsaltingViewSet.as_view({'get': 'retrieve', 'put': 'update', 'delete': 'destroy'}), name='wazzup-consalting-account-detail'),
+    path('wazzup-accounts/<uuid:pk>/setup-webhook/', WazzupAccountConsaltingViewSet.as_view({'post': 'setup_webhook'}), name='wazzup-consalting-account-setup-webhook'),
+    path('wazzup-accounts/<uuid:pk>/send-message/', WazzupAccountConsaltingViewSet.as_view({'post': 'send_message'}), name='wazzup-consalting-account-send-message'),
 ]
+
