@@ -68,6 +68,7 @@ from .wazzup_views import (
     WazzupWebhookConsaltingView,
     WhatsAppMessageConsaltingViewSet,
     WazzupChatListView,
+    WazzupCredentialsView,
 )
 
 
@@ -174,6 +175,8 @@ urlpatterns = [
     path('whatsapp/webhook/', WhatsAppConsaltingWebhookView.as_view(), name='whatsapp-consalting-webhook'),
 
     # ===== Wazzup Интеграция (Консалтинг) =====
+    path('wazzup/credentials/', WazzupCredentialsView.as_view(), name='wazzup-credentials'),
+    path('wazzup-credentials/', WazzupCredentialsView.as_view(), name='wazzup-credentials-alias'),
     path('wazzup/webhook/', WazzupWebhookConsaltingView.as_view(), name='wazzup-consalting-webhook'),
     path('wazzup-accounts/', WazzupAccountConsaltingViewSet.as_view({'get': 'list', 'post': 'create'}), name='wazzup-consalting-accounts'),
     path('wazzup-accounts/<uuid:pk>/', WazzupAccountConsaltingViewSet.as_view({'get': 'retrieve', 'put': 'update', 'delete': 'destroy'}), name='wazzup-consalting-account-detail'),

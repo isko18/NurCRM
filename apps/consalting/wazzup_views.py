@@ -246,3 +246,43 @@ class WazzupChatListView(APIView):
         chats.sort(key=lambda c: c["last_message_time"] or "", reverse=True)
         return Response(chats, status=status.HTTP_200_OK)
 
+
+class WazzupCredentialsView(APIView):
+    """
+    Эндпоинт получения ключей интеграции Wazzup для фронтенда.
+    Данные заполняются только из админки Django.
+    GET /api/consalting/wazzup/credentials/
+    GET /api/consalting/wazzup-credentials/
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request):
+        company = getattr(request.user, "company", None)
+        if not company:
+            return Response({
+                "api_key": "",
+                "channel_id": "",
+                "integration_type": "whatsapp",
+                "is_active": False
+            }, status=status.HTTP_200_OK)
+
+        account = WazzupAccountConsalting.objects.filter(company=company, is_active=True).first()
+        if not account:
+            account = WazzupAccountConsalting.objects.filter(company=company).first()
+
+        if not account:
+            return Response({
+                "api_key": "",
+                "channel_id": "",
+                "integration_type": "whatsapp",
+                "is_active": False
+            }, status=status.HTTP_200_OK)
+
+        return Response({
+            "api_key": account.api_key or "",
+            "channel_id": account.channel_id or "",
+            "integration_type": account.integration_type or "whatsapp",
+            "api_url": account.api_url or "https://api.wazzup24.com",
+            "is_active": account.is_active,
+        }, status=status.HTTP_200_OK)
+
