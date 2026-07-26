@@ -114,7 +114,10 @@ def create_and_publish_notification(*, company, user, message, title="", type="s
         publish_notification(notification)
 
     try:
-        transaction.on_commit(_publish)
+        if transaction.get_connection().in_atomic_block:
+            transaction.on_commit(_publish)
+        else:
+            _publish()
     except Exception:
         _publish()
 
