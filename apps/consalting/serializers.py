@@ -726,6 +726,8 @@ class LeadConsaltingSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSeri
             "service", "tariff", "participants", "participant_ids",
             # архив / оплата
             "is_archived", "archived_at", "payment_registered", "payment_mode",
+            # данные WhatsApp чата
+            "last_message", "unread_count", "has_unread",
         )
         read_only_fields = (
             "id", "company", "branch",
@@ -738,6 +740,33 @@ class LeadConsaltingSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSeri
             "participants", "is_archived", "archived_at",
             "payment_registered", "payment_mode",
         )
+
+    last_message = serializers.SerializerMethodField(read_only=True)
+    unread_count = serializers.SerializerMethodField(read_only=True)
+    has_unread = serializers.SerializerMethodField(read_only=True)
+
+    def get_last_message(self, obj):
+        last_msg = obj.whatsapp_messages.order_by("-created_at").first()
+        if not last_msg:
+            return None
+        return {
+            "id": str(last_msg.id),
+            "message_id": last_msg.message_id,
+            "text": last_msg.text,
+            "direction": last_msg.direction,
+            "status": last_msg.status,
+            "is_incoming": last_msg.direction == "inbound",
+            "created_at": last_msg.created_at.isoformat() if last_msg.created_at else None,
+        }
+
+    def get_unread_count(self, obj):
+        from .models import WhatsAppMessageConsalting
+        return obj.whatsapp_messages.filter(
+            direction=WhatsAppMessageConsalting.Direction.INBOUND
+        ).exclude(status=WhatsAppMessageConsalting.Status.READ).count()
+
+    def get_has_unread(self, obj):
+        return self.get_unread_count(obj) > 0
 
     def get_participants(self, obj):
         result = []

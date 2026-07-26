@@ -1109,6 +1109,25 @@ class LeadTransferOwnerView(LeadVisibilityMixin, CompanyBranchQuerysetMixin, gen
         return Response(LeadConsaltingSerializer(lead, context=self.get_serializer_context()).data)
 
 
+class LeadMarkMessagesReadView(LeadVisibilityMixin, CompanyBranchQuerysetMixin, generics.GenericAPIView):
+    """
+    Пометить сообщения лида как прочитанные (сбросить счётчик непрочитанных).
+    POST /api/consalting/leads/<uuid:pk>/mark-read/
+    """
+    queryset = LeadConsalting.objects.all()
+
+    def post(self, request, *args, **kwargs):
+        lead = self.get_object()
+        from .models import WhatsAppMessageConsalting
+        updated = WhatsAppMessageConsalting.objects.filter(
+            lead=lead, direction=WhatsAppMessageConsalting.Direction.INBOUND
+        ).exclude(status=WhatsAppMessageConsalting.Status.READ).update(
+            status=WhatsAppMessageConsalting.Status.READ
+        )
+        realtime.lead_updated(lead)
+        return Response({"status": "ok", "marked_read_count": updated})
+
+
 class LeadTransferView(LeadVisibilityMixin, CompanyBranchQuerysetMixin, generics.GenericAPIView):
     """
     Передать лид в другую воронку: создаёт НОВЫЙ лид в целевой воронке,
