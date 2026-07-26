@@ -97,7 +97,7 @@ def scan_unanswered_leads():
     from apps.main.realtime import create_and_publish_notification
 
     now = timezone.now()
-    threshold = now - timedelta(minutes=15)
+    threshold = now - timedelta(minutes=1)
     fired = 0
 
     leads = _active_open_leads().select_related("company", "owner").iterator()
@@ -116,8 +116,8 @@ def scan_unanswered_leads():
                         create_and_publish_notification(
                             company=lead.company,
                             user=target_user,
-                            title="⏰ Внимание: Лид без ответа > 15 мин!",
-                            message=f"Клиент {lead.full_name} ({lead.phone}) ожидает вашего ответа более 15 минут.",
+                            title="⏰ Внимание: Лид без ответа > 1 мин!",
+                            message=f"Клиент {lead.full_name} ({lead.phone}) ожидает вашего ответа более 1 минуты.",
                             type="unanswered_lead_alert",
                             level="warning",
                             url=f"/consalting/leads/{lead.id}",

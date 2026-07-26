@@ -327,7 +327,7 @@ CELERY_BEAT_SCHEDULE = {
     },
     'consalting-scan-unanswered-leads': {
         'task': 'apps.consalting.tasks.scan_unanswered_leads',
-        'schedule': crontab(minute='*/5'),
+        'schedule': crontab(minute='*'),
     },
     # Ежедневная полная синхронизация каталога товаров с внешней системой.
     # Досылает все товары (product.updated), логирует товары без фото.
