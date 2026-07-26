@@ -72,9 +72,17 @@ def publish_notification(notification) -> None:
 
         layer = get_channel_layer()
         if layer is None:
+            logger.warning("Channel layer is None, cannot publish notification %s", notification.id)
             return
+
+        group = user_group_name(notification.user_id)
+        logger.info(
+            "[REALTIME NOTIFICATION] Sending WS notification id=%s to group=%s for user_id=%s title='%s'",
+            notification.id, group, notification.user_id, notification.title
+        )
+
         async_to_sync(layer.group_send)(
-            user_group_name(notification.user_id),
+            group,
             {"type": "notify", "data": notification_payload(notification)},
         )
     except Exception:

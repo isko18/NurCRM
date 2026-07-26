@@ -326,9 +326,14 @@ class WazzupConsaltingService:
             # Персональное системное уведомление менеджеру ("Сообщение от лида ...")
             if is_inbound:
                 target_owner = assigned_owner or lead.owner
+                from apps.main.realtime import create_and_publish_notification
+
                 if target_owner:
+                    logger.info(
+                        "[WAZZUP NOTIF] Inbound msg lead_id=%s, target_user_id=%s, group=notif_user_%s",
+                        lead.id, target_owner.id, target_owner.id
+                    )
                     try:
-                        from apps.main.realtime import create_and_publish_notification
                         create_and_publish_notification(
                             company=account.company,
                             user=target_owner,
@@ -344,6 +349,29 @@ class WazzupConsaltingService:
                         )
                     except Exception as e:
                         logger.warning("Failed to publish lead message system notification: %s", e)
+                else:
+                    company_users = User.objects.filter(company=account.company, is_active=True)
+                    logger.info(
+                        "[WAZZUP NOTIF] Unassigned lead_id=%s, broadcasting notification to %d company users",
+                        lead.id, company_users.count()
+                    )
+                    for u in company_users:
+                        try:
+                            create_and_publish_notification(
+                                company=account.company,
+                                user=u,
+                                title=f"📩 Сообщение от лида: {lead.full_name}",
+                                message=text[:120] if text else "Входящее медиасообщение",
+                                type="lead_message",
+                                level="info",
+                                url=f"/consalting/leads/{lead.id}",
+                                data={
+                                    "lead_id": str(lead.id),
+                                    "phone": phone
+                                }
+                            )
+                        except Exception as e:
+                            logger.warning("Failed to publish unassigned lead notification to user %s: %s", u.id, e)
 
                     realtime.notify_user(
                         target_owner.id,
