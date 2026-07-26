@@ -236,8 +236,9 @@ class WazzupConsaltingService:
 
                 inbound_created = False
                 if inbound_lead:
-                    # Обновляем последнее сообщение в имеющейся заявке
+                    # Обновляем последнее сообщение в имеющейся заявке и поднимаем наверх (-updated_at)
                     inbound_lead.message = text
+                    inbound_lead.updated_at = timezone.now()
                     if author_name and author_name != phone:
                         inbound_lead.full_name = author_name
                     if message_id:

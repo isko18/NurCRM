@@ -2179,8 +2179,8 @@ class InboundLeadListCreateView(CompanyBranchQuerysetMixin, generics.ListCreateA
     filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
     filterset_fields = ["status", "owner", "source"]
     search_fields = ["full_name", "phone", "message"]
-    ordering_fields = ["created_at", "status"]
-    ordering = ["-created_at"]
+    ordering_fields = ["created_at", "updated_at", "status"]
+    ordering = ["-updated_at", "-created_at"]
 
     def get_queryset(self):
         company = self._user_company()
