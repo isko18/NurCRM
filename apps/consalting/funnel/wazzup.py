@@ -311,10 +311,28 @@ class WazzupConsaltingService:
             else:
                 realtime.lead_updated(lead)
 
-            # 2. Персональное уведомление ответственному менеджеру ("Сообщение от лида ...")
+            # 2. Персональное системное уведомление менеджеру ("Сообщение от лида ...")
             if is_inbound:
                 target_owner = assigned_owner or lead.owner
                 if target_owner:
+                    try:
+                        from apps.main.realtime import create_and_publish_notification
+                        create_and_publish_notification(
+                            company=account.company,
+                            user=target_owner,
+                            title=f"📩 Сообщение от лида: {lead.full_name}",
+                            message=text[:120] if text else "Входящее медиасообщение",
+                            type="lead_message",
+                            level="info",
+                            url=f"/consalting/leads/{lead.id}",
+                            data={
+                                "lead_id": str(lead.id),
+                                "phone": phone
+                            }
+                        )
+                    except Exception as e:
+                        logger.warning("Failed to publish lead message system notification: %s", e)
+
                     realtime.notify_user(
                         target_owner.id,
                         "lead.message_received",

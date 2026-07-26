@@ -33,6 +33,29 @@ def on_funnel_event(sender, trigger, lead, actor=None, ctx=None, **kwargs):
     if trigger in _REALTIME_TRIGGERS:
         realtime.push(lead, trigger)
 
+    # Уведомления об отсутствии ответа / превышении SLA по лиду
+    if trigger in {"no_activity", "sla_breach", "task_overdue"} and getattr(lead, "owner", None):
+        try:
+            from apps.main.realtime import create_and_publish_notification
+            title_map = {
+                "no_activity": f"⏳ Нет активности по лиду: {lead.full_name}",
+                "sla_breach": f"⏰ Превышено время ответа по лиду: {lead.full_name}",
+                "task_overdue": f"🚨 Просрочена задача по лиду: {lead.full_name}"
+            }
+            if trigger in title_map:
+                create_and_publish_notification(
+                    company=lead.company,
+                    user=lead.owner,
+                    title=title_map[trigger],
+                    message=f"Клиент долго ожидает ответа! (Тел: {lead.phone})",
+                    type="lead_alert",
+                    level="warning",
+                    url=f"/consalting/leads/{lead.id}",
+                    data={"lead_id": str(lead.id)}
+                )
+        except Exception as e:
+            logger.warning("Failed to publish SLA/no_activity notification: %s", e)
+
 
 @receiver(post_save, sender=CustomRole)
 def on_custom_role_created(sender, instance, created, **kwargs):
