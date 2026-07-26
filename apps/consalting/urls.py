@@ -61,7 +61,11 @@ from .views import (
     WhatsAppInboundWebhookView,
     SubscriptionMatrixView,
 )
-from .wazzup_views import WazzupAccountConsaltingViewSet, WazzupWebhookConsaltingView
+from .wazzup_views import (
+    WazzupAccountConsaltingViewSet,
+    WazzupWebhookConsaltingView,
+    WhatsAppMessageConsaltingViewSet
+)
 
 
 urlpatterns = [
@@ -148,7 +152,15 @@ urlpatterns = [
     path('loss-reasons/', LossReasonListCreateView.as_view(), name='loss-reasons-list-create'),
     path('loss-reasons/<uuid:pk>/', LossReasonRetrieveUpdateDestroyView.as_view(), name='loss-reasons-rud'),
 
-    # ===== WhatsApp Интеграция (каркас) =====
+    # ===== WhatsApp / Wazzup Сообщения (Устранение 404) =====
+    path('wazzup-messages/', WhatsAppMessageConsaltingViewSet.as_view({'get': 'list'}), name='wazzup-consalting-messages-list'),
+    path('wazzup-messages/<uuid:pk>/', WhatsAppMessageConsaltingViewSet.as_view({'get': 'retrieve'}), name='wazzup-consalting-messages-detail'),
+    path('whatsapp-messages/', WhatsAppMessageConsaltingViewSet.as_view({'get': 'list'}), name='whatsapp-consalting-messages-list'),
+    path('whatsapp-messages/<uuid:pk>/', WhatsAppMessageConsaltingViewSet.as_view({'get': 'retrieve'}), name='whatsapp-consalting-messages-detail'),
+    path('messages/', WhatsAppMessageConsaltingViewSet.as_view({'get': 'list'}), name='messages-consalting-list'),
+    path('messages/<uuid:pk>/', WhatsAppMessageConsaltingViewSet.as_view({'get': 'retrieve'}), name='messages-consalting-detail'),
+
+    # ===== WhatsApp Интеграция =====
     path('leads/<uuid:pk>/whatsapp/send/', LeadWhatsAppSendView.as_view(), name='lead-whatsapp-send'),
     path('leads/<uuid:pk>/whatsapp/history/', LeadWhatsAppHistoryView.as_view(), name='lead-whatsapp-history'),
     path('whatsapp/webhook/', WhatsAppConsaltingWebhookView.as_view(), name='whatsapp-consalting-webhook'),
@@ -160,4 +172,5 @@ urlpatterns = [
     path('wazzup-accounts/<uuid:pk>/setup-webhook/', WazzupAccountConsaltingViewSet.as_view({'post': 'setup_webhook'}), name='wazzup-consalting-account-setup-webhook'),
     path('wazzup-accounts/<uuid:pk>/send-message/', WazzupAccountConsaltingViewSet.as_view({'post': 'send_message'}), name='wazzup-consalting-account-send-message'),
 ]
+
 

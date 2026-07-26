@@ -100,3 +100,21 @@ class WazzupWebhookConsaltingView(APIView):
             return Response({"status": "ok"}, status=status.HTTP_200_OK)
         except Exception as e:
             return Response({"detail": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+
+class WhatsAppMessageConsaltingViewSet(viewsets.ReadOnlyModelViewSet):
+    """
+    Просмотр сообщений Wazzup/WhatsApp воронки консалтинга.
+    Поддерживает фильтрацию по ?lead=<lead_id> или ?lead_id=<lead_id>
+    """
+    permission_classes = [permissions.IsAuthenticated]
+    serializer_class = WhatsAppMessageConsaltingSerializer
+
+    def get_queryset(self):
+        from .models import WhatsAppMessageConsalting
+        qs = WhatsAppMessageConsalting.objects.filter(company=self.request.user.company)
+        lead_id = self.request.query_params.get('lead') or self.request.query_params.get('lead_id')
+        if lead_id:
+            qs = qs.filter(lead_id=lead_id)
+        return qs.order_by('created_at')
+
