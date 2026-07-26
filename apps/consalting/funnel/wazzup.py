@@ -23,6 +23,51 @@ from . import realtime
 logger = logging.getLogger(__name__)
 
 
+def _broadcast_consalting_message(company_id, lead, wa_message, is_inbound, text, phone):
+    """
+    Мгновенная трансляция события сообщения по WebSocket без задержек.
+    """
+    from channels.layers import get_channel_layer
+    from asgiref.sync import async_to_sync
+
+    layer = get_channel_layer()
+    if not layer:
+        return
+
+    msg_payload = {
+        "id": str(wa_message.id),
+        "message_id": wa_message.message_id,
+        "lead_id": str(lead.id),
+        "chat_id": phone,
+        "text": text,
+        "is_incoming": is_inbound,
+        "direction": "inbound" if is_inbound else "outbound",
+        "status": wa_message.status,
+        "timestamp": timezone.now().isoformat(),
+        "contact_name": lead.full_name,
+    }
+
+    event_envelope = {
+        "type": "wazzup_event",
+        "event": {
+            "type": "new_message",
+            "data": msg_payload
+        }
+    }
+
+    groups = [
+        f"consalting_company_{company_id}",
+        f"wazzup_company_{company_id}",
+        f"wazzup_chat_{phone}"
+    ]
+
+    for g in groups:
+        try:
+            async_to_sync(layer.group_send)(g, event_envelope)
+        except Exception as e:
+            logger.warning("Failed to broadcast websocket event to %s: %s", g, e)
+
+
 class WazzupConsaltingService:
     """
     Интеграционный сервис Wazzup API v3 для воронки консалтинга.
@@ -97,6 +142,9 @@ class WazzupConsaltingService:
             logger.error(f"Ошибка вызова Wazzup API: {e}")
             wa_message.status = WhatsAppMessageConsalting.Status.FAILED
             wa_message.save(update_fields=["status"])
+
+        # Мгновенная трансляция исходящего сообщения по WebSocket (0ms задержка)
+        _broadcast_consalting_message(account.company_id, lead, wa_message, False, text, clean_phone)
 
         # Обновляем канбан воронку через WebSocket
         realtime.lead_updated(lead)
@@ -248,7 +296,9 @@ class WazzupConsaltingService:
                         }
                     )
 
-            # Вызовы трансляций в реальном времени после завершения транзакции
+            # 1. Мгновенная трансляция нового сообщения по WebSocket (0ms задержка)
+            _broadcast_consalting_message(account.company_id, lead, wa_message, is_inbound, text, phone)
+
             events.emit(
                 trigger="activity_added" if not created_lead else "stage_changed",
                 lead=lead,
@@ -261,22 +311,25 @@ class WazzupConsaltingService:
             else:
                 realtime.lead_updated(lead)
 
-            if assigned_owner:
-                realtime.notify_user(
-                    assigned_owner.id,
-                    "lead.assigned",
-                    {
-                        "id": str(lead.id),
-                        "full_name": lead.full_name,
-                        "phone": lead.phone,
-                        "source": source_name,
-                        "message": text,
-                        "status": lead.status,
-                        "created_at": lead.created_at.isoformat(),
-                    }
-                )
+            # 2. Персональное уведомление ответственному менеджеру ("Сообщение от лида ...")
+            if is_inbound:
+                target_owner = assigned_owner or lead.owner
+                if target_owner:
+                    realtime.notify_user(
+                        target_owner.id,
+                        "lead.message_received",
+                        {
+                            "id": str(lead.id),
+                            "title": f"📩 Сообщение от лида: {lead.full_name}",
+                            "message": text[:120] if text else "Входящее медиасообщение",
+                            "full_name": lead.full_name,
+                            "phone": lead.phone,
+                            "lead_id": str(lead.id),
+                            "created_at": timezone.now().isoformat(),
+                        }
+                    )
 
-        # 2. Обработка обновлений статусов сообщений
+        # 3. Обработка обновлений статусов сообщений
         for item in statuses:
             message_id = item.get("messageId")
             status_str = item.get("status")
