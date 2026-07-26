@@ -136,12 +136,8 @@ class WazzupChatListView(APIView):
         if not company:
             return Response([], status=status.HTTP_200_OK)
 
-        is_manager = is_owner_like(user)
-
+        # Берём абсолютно ВСЕ лиды компании без каких-либо ограничений
         leads_qs = LeadConsalting.objects.filter(company=company).select_related("owner")
-        if not is_manager:
-            leads_qs = leads_qs.filter(Q(owner=user) | Q(owner__isnull=True))
-
         leads_by_phone = {}
         for lead in leads_qs:
             if lead.phone:
@@ -149,10 +145,8 @@ class WazzupChatListView(APIView):
                 if clean_phone and clean_phone not in leads_by_phone:
                     leads_by_phone[clean_phone] = lead
 
+        # Берём абсолютно ВСЕ входящие заявки компании
         inbound_qs = InboundLeadConsalting.objects.filter(company=company).select_related("owner")
-        if not is_manager:
-            inbound_qs = inbound_qs.filter(Q(owner=user) | Q(owner__isnull=True))
-
         inbounds_by_phone = {}
         for ib in inbound_qs:
             if ib.phone:
