@@ -2332,6 +2332,8 @@ class SubscriptionMatrixView(CompanyBranchQuerysetMixin, generics.GenericAPIView
     """
     def get(self, request, *args, **kwargs):
         from datetime import date
+        from decimal import Decimal
+        from django.db.models import Q
         company = self._user_company()
         if not company:
             raise PermissionDenied("У пользователя не настроена компания.")
