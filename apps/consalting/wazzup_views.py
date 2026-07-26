@@ -118,3 +118,68 @@ class WhatsAppMessageConsaltingViewSet(viewsets.ReadOnlyModelViewSet):
             qs = qs.filter(lead_id=lead_id)
         return qs.order_by('created_at')
 
+
+class WazzupChatListView(APIView):
+    """
+    Список диалогов/чатов WhatsApp воронки консалтинга (как в интерфейсе WhatsApp Web).
+    Сортировка по времени последнего сообщения.
+    Эндпоинты:
+      GET /api/consalting/chats/
+      GET /api/consalting/wazzup-chats/
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request):
+        from .access import apply_lead_visibility
+        from .models import LeadConsalting, WhatsAppMessageConsalting
+
+        user = request.user
+        company = getattr(user, "company", None)
+        if not company:
+            return Response([], status=status.HTTP_200_OK)
+
+        qs = LeadConsalting.objects.filter(company=company).select_related("owner")
+        qs = apply_lead_visibility(qs, user)
+        qs = qs.exclude(phone="").order_by("-updated_at")
+
+        chats = []
+        for lead in qs:
+            last_msg = lead.whatsapp_messages.order_by("-created_at").first()
+            unread_cnt = lead.whatsapp_messages.filter(
+                direction=WhatsAppMessageConsalting.Direction.INBOUND
+            ).exclude(status=WhatsAppMessageConsalting.Status.READ).count()
+
+            last_msg_data = None
+            if last_msg:
+                last_msg_data = {
+                    "id": str(last_msg.id),
+                    "message_id": last_msg.message_id,
+                    "text": last_msg.text,
+                    "direction": last_msg.direction,
+                    "status": last_msg.status,
+                    "is_incoming": last_msg.direction == "inbound",
+                    "created_at": last_msg.created_at.isoformat() if last_msg.created_at else None,
+                }
+
+            chats.append({
+                "id": str(lead.id),
+                "lead_id": str(lead.id),
+                "chat_id": lead.phone,
+                "name": lead.full_name or lead.title or lead.phone,
+                "full_name": lead.full_name,
+                "phone": lead.phone,
+                "owner": {
+                    "id": str(lead.owner.id),
+                    "name": lead.owner.full_name or lead.owner.email
+                } if lead.owner else None,
+                "last_message": last_msg_data,
+                "last_message_text": last_msg.text if last_msg else "",
+                "last_message_time": last_msg.created_at.isoformat() if (last_msg and last_msg.created_at) else lead.updated_at.isoformat(),
+                "unread_count": unread_cnt,
+                "has_unread": unread_cnt > 0,
+                "updated_at": lead.updated_at.isoformat(),
+            })
+
+        chats.sort(key=lambda c: c["last_message_time"] or "", reverse=True)
+        return Response(chats, status=status.HTTP_200_OK)
+

@@ -66,7 +66,8 @@ from .views import (
 from .wazzup_views import (
     WazzupAccountConsaltingViewSet,
     WazzupWebhookConsaltingView,
-    WhatsAppMessageConsaltingViewSet
+    WhatsAppMessageConsaltingViewSet,
+    WazzupChatListView,
 )
 
 
@@ -163,6 +164,9 @@ urlpatterns = [
     path('whatsapp-messages/<uuid:pk>/', WhatsAppMessageConsaltingViewSet.as_view({'get': 'retrieve'}), name='whatsapp-consalting-messages-detail'),
     path('messages/', WhatsAppMessageConsaltingViewSet.as_view({'get': 'list'}), name='messages-consalting-list'),
     path('messages/<uuid:pk>/', WhatsAppMessageConsaltingViewSet.as_view({'get': 'retrieve'}), name='messages-consalting-detail'),
+
+    path('chats/', WazzupChatListView.as_view(), name='wazzup-chats-list'),
+    path('wazzup-chats/', WazzupChatListView.as_view(), name='wazzup-chats-list-alias'),
 
     # ===== WhatsApp Интеграция =====
     path('leads/<uuid:pk>/whatsapp/send/', LeadWhatsAppSendView.as_view(), name='lead-whatsapp-send'),
