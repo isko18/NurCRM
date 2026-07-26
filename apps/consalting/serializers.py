@@ -1036,14 +1036,15 @@ class SalaryPayoutConsaltingSerializer(serializers.ModelSerializer):
 # ==========================
 class InboundLeadConsaltingSerializer(serializers.ModelSerializer):
     owner_display = serializers.SerializerMethodField()
+    updated_at = serializers.DateTimeField(read_only=True)
 
     class Meta:
         model = InboundLeadConsalting
         fields = (
             "id", "company", "full_name", "phone", "source", "external_id",
-            "message", "owner", "owner_display", "status", "lead", "created_at"
+            "message", "owner", "owner_display", "status", "lead", "created_at", "updated_at"
         )
-        read_only_fields = ("id", "company", "owner_display", "created_at")
+        read_only_fields = ("id", "company", "owner_display", "created_at", "updated_at")
 
     def get_owner_display(self, obj):
         if obj.owner and (obj.owner.first_name or obj.owner.last_name):
