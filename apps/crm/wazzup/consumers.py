@@ -8,10 +8,8 @@ logger = logging.getLogger(__name__)
 
 @database_sync_to_async
 def _handle_ws_send_message(user, data):
-    from apps.crm.models import WazzupAccount
     from apps.consalting.models import WazzupAccountConsalting, LeadConsalting
     from apps.consalting.funnel.wazzup import WazzupConsaltingService
-    from .services import send_message_service
 
     lead_id = data.get("lead_id") or data.get("lead")
     text = data.get("text") or data.get("message") or ""
@@ -48,26 +46,32 @@ def _handle_ws_send_message(user, data):
             "lead_id": str(lead.id),
         }
 
-    # 2. Отправка по номеру телефона / CRM аккаунту
-    if not phone:
-        raise ValueError("Укажите 'lead_id' или номер телефона 'to'")
+    # 2. Безопасная обработка для базового CRM (если приложение подключено)
+    try:
+        from apps.crm.models import WazzupAccount
+        from .services import send_message_service
 
-    if account_id:
-        account = WazzupAccount.objects.filter(company=user.company, id=account_id).first()
-    else:
-        account = WazzupAccount.objects.filter(company=user.company, is_active=True).first()
+        if not phone:
+            raise ValueError("Укажите 'lead_id' или номер телефона 'to'")
 
-    if not account:
-        raise ValueError("Активный аккаунт Wazzup не найден.")
+        if account_id:
+            account = WazzupAccount.objects.filter(company=user.company, id=account_id).first()
+        else:
+            account = WazzupAccount.objects.filter(company=user.company, is_active=True).first()
 
-    msg = send_message_service(account, phone, text, media_url)
-    return {
-        "id": str(msg.id),
-        "message_id": msg.message_id,
-        "chat_id": msg.chat_id,
-        "text": msg.text,
-        "status": msg.status,
-    }
+        if not account:
+            raise ValueError("Активный аккаунт Wazzup не найден.")
+
+        msg = send_message_service(account, phone, text, media_url)
+        return {
+            "id": str(msg.id),
+            "message_id": msg.message_id,
+            "chat_id": msg.chat_id,
+            "text": msg.text,
+            "status": msg.status,
+        }
+    except Exception as e:
+        raise ValueError(f"Ошибка отправки сообщения: {e}")
 
 
 class WazzupChatConsumer(AsyncWebsocketConsumer):
