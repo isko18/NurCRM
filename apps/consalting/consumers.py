@@ -118,6 +118,19 @@ class ConsaltingFunnelConsumer(AsyncWebsocketConsumer):
             "data": event.get("payload") or {},
         }))
 
+    # ---- события Wazzup сообщений ----
+    async def wazzup_event(self, event):
+        """Доставка событий Wazzup чата (новые сообщения и статусы)."""
+        ev_data = event.get("event") or {}
+        await self.send(json.dumps(ev_data))
+
+    # ---- системные уведомления ----
+    async def notify(self, event):
+        await self.send(json.dumps({
+            "type": "notification",
+            "data": event.get("data") or {},
+        }))
+
     @database_sync_to_async
     def _get_company_and_branch(self, user):
         return resolve_user_company_and_branch(user)
