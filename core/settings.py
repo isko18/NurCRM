@@ -109,6 +109,7 @@ INSTALLED_APPS = [
     # "apps.instagram_mcp",
     'apps.consalting',
     'apps.ekassa',
+    'apps.onec',
     'apps.releases',
     # 'apps.crm',
 ]

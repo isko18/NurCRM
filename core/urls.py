@@ -58,6 +58,7 @@ apps_includes = [
     path('instagram/', include('apps.instagram.urls')),   
     path('warehouse/', include("apps.warehouse.urls")),
     path('ekassa/', include('apps.ekassa.urls')),
+    path('onec/', include('apps.onec.urls')),
     # path('crm/', include('apps.crm.urls')),
 ]
 

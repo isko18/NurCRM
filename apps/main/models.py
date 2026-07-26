@@ -585,8 +585,39 @@ class PromoRule(models.Model):
 # ==========================
 # Product
 # ==========================
+def _pg_advisory_xact_lock_company(company_id):
+    """Транзакционный advisory-lock на компанию (Postgres). На других СУБД — no-op."""
+    if not company_id or connection.vendor != "postgresql":
+        return
+    key = int(str(company_id).replace("-", "")[:16], 16) & 0x7FFFFFFFFFFFFFFF
+    with connection.cursor() as cur:
+        cur.execute("SELECT pg_advisory_xact_lock(%s::bigint);", [key])
+
+
+def assert_barcode_unique_in_company(company_id, barcode, *, exclude_product_id=None):
+    """Перекрёстная уникальность штрихкода в рамках компании.
+
+    Значение не должно принадлежать ДРУГОМУ товару ни как основной `Product.barcode`,
+    ни как дополнительный `ProductAlternateBarcode.barcode`. Одним DB-constraint это не
+    покрыть (разные таблицы), поэтому проверяем в save() — так закрыты все пути записи
+    (ручное создание, импорт из Excel, POS, админка).
+    """
+    bc = (barcode or "").strip()
+    if not bc or not company_id:
+        return
+    prod_qs = Product.objects.filter(company_id=company_id, barcode=bc)
+    alt_qs = ProductAlternateBarcode.objects.filter(company_id=company_id, barcode=bc)
+    if exclude_product_id:
+        prod_qs = prod_qs.exclude(pk=exclude_product_id)
+        alt_qs = alt_qs.exclude(product_id=exclude_product_id)
+    if prod_qs.exists() or alt_qs.exists():
+        raise ValidationError(
+            {"barcode": f"Штрихкод «{bc}» уже используется другим товаром в этой компании."}
+        )
+
+
 class Product(models.Model):
-    
+
     class Status(models.TextChoices):
         PENDING = "pending", "Ожидание"
         ACCEPTED = "accepted", "Принят"
@@ -828,6 +859,21 @@ class Product(models.Model):
     created_at = models.DateTimeField("Создан", auto_now_add=True)
     updated_at = models.DateTimeField("Обновлён", auto_now=True)
 
+    # ---- Порядковый номер для стабильной пагинации ----
+    # Монотонно возрастает в рамках компании (как code/plu), присваивается под тем же
+    # advisory-lock в save(). Нужен курсорной пагинации списка товаров: created_at не
+    # уникален, и при массовом создании товары с одинаковым created_at проскакивали
+    # мимо курсора («исчезали» из бесконечного скролла). seq уникален и монотонен —
+    # курсор по нему не пропускает и не дублирует строки.
+    seq = models.BigIntegerField(
+        "Порядковый номер",
+        null=True,
+        blank=True,
+        editable=False,
+        db_index=True,
+        help_text="Автоинкремент внутри компании для стабильной сортировки/пагинации.",
+    )
+
     class Meta:
         verbose_name = "Товар"
         verbose_name_plural = "Товары"
@@ -839,6 +885,8 @@ class Product(models.Model):
             models.Index(fields=["company", "plu"]),
             # Оптимизация для сканирования по штрих-коду
             models.Index(fields=["company", "barcode"], name="idx_product_company_barcode"),
+            # Курсорная/стабильная пагинация «сначала новые» внутри компании.
+            models.Index(fields=["company", "seq"], name="idx_product_company_seq"),
         ]
         constraints = [
             # ✅ штрихкод уникален в рамках компании, только если задан и не пустой
@@ -858,6 +906,12 @@ class Product(models.Model):
                 fields=("company", "plu"),
                 condition=Q(plu__isnull=False),
                 name="uq_company_plu_not_null",
+            ),
+            # Порядковый номер уникален в рамках компании (гарантия для курсора)
+            models.UniqueConstraint(
+                fields=("company", "seq"),
+                condition=Q(seq__isnull=False),
+                name="uq_company_seq_not_null",
             ),
         ]
 
@@ -912,6 +966,20 @@ class Product(models.Model):
         last_num = qs.aggregate(max_num=Max("code_int"))["max_num"] or 0
         self.code = f"{last_num + 1:04d}"
 
+    def _auto_generate_seq(self):
+        # Монотонный порядковый номер внутри компании. Вызывается под advisory-lock
+        # в save(), поэтому max()+1 не гонится. Для существующих строк проставляется
+        # бэкфилл-командой backfill_product_seq.
+        if self.seq is not None or not self.company_id:
+            return
+        max_seq = (
+            Product.objects
+            .filter(company_id=self.company_id, seq__isnull=False)
+            .aggregate(m=Max("seq"))
+            .get("m") or 0
+        )
+        self.seq = max_seq + 1
+
     def _recalc_price(self):
         base = self.purchase_price or Decimal("0")
         percent = self.markup_percent or Decimal("0")
@@ -962,6 +1030,15 @@ class Product(models.Model):
             self._pg_lock_company()
             self._auto_generate_code()
             self._auto_generate_plu()
+            self._auto_generate_seq()
+            # Перекрёстная уникальность ШК: значение не должно принадлежать другому
+            # товару ни как основной, ни как дополнительный код (под advisory-lock).
+            # Проверяем только при создании/смене ШК, чтобы не блокировать
+            # редактирование легаси-товаров с уже существующей коллизией.
+            if self.barcode and self.barcode != old_barcode:
+                assert_barcode_unique_in_company(
+                    self.company_id, self.barcode, exclude_product_id=self.pk
+                )
             super().save(*args, **kwargs)
             
         # Инвалидация кэша после сохранения
@@ -1108,7 +1185,14 @@ class ProductAlternateBarcode(models.Model):
             self.company_id = getattr(p, "company_id", None) or Product.objects.filter(
                 pk=self.product_id
             ).values_list("company_id", flat=True).first()
-        super().save(*args, **kwargs)
+        with transaction.atomic():
+            _pg_advisory_xact_lock_company(self.company_id)
+            # Перекрёстная уникальность: доп. ШК не должен совпасть с основным/доп.
+            # кодом ДРУГОГО товара (свой товар исключаем).
+            assert_barcode_unique_in_company(
+                self.company_id, self.barcode, exclude_product_id=self.product_id
+            )
+            super().save(*args, **kwargs)
         from django.core.cache import cache
 
         if self.company_id and (self.barcode or "").strip():
