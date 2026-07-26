@@ -6,7 +6,7 @@ import requests
 
 from .models import WazzupAccountConsalting, LeadConsalting
 from .funnel.wazzup import WazzupConsaltingService
-from .serializers import WazzupAccountConsaltingSerializer
+from .serializers import WazzupAccountConsaltingSerializer, WhatsAppMessageConsaltingSerializer
 
 
 class WazzupAccountConsaltingViewSet(viewsets.ModelViewSet):
