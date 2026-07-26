@@ -145,6 +145,24 @@ class WazzupConsaltingService:
                 }
             )
 
+            # Перевод статуса в работу ("in_work") при ответе менеджера
+            from apps.consalting.models import InboundLeadConsalting
+            clean_phone_10 = clean_phone[-10:] if len(clean_phone) >= 10 else clean_phone
+            inbound_lead = InboundLeadConsalting.objects.filter(
+                company_id=lead.company_id,
+                phone__icontains=clean_phone_10
+            ).exclude(
+                status__in=[InboundLeadConsalting.Status.CONVERTED, InboundLeadConsalting.Status.REJECTED]
+            ).first()
+
+            if inbound_lead and inbound_lead.status in [InboundLeadConsalting.Status.NEW, InboundLeadConsalting.Status.ASSIGNED]:
+                inbound_lead.status = InboundLeadConsalting.Status.IN_WORK
+                inbound_lead.save(update_fields=["status", "updated_at"])
+
+            if lead.status in ["new", "NEW"]:
+                lead.status = "in_work"
+                lead.save(update_fields=["status", "updated_at"])
+
         # Вызов Wazzup API /v3/message
         url = f"{account.api_url.rstrip('/')}/v3/message"
         headers = {
