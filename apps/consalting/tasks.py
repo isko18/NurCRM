@@ -86,3 +86,44 @@ def scan_sla_breach():
             emit("sla_breach", lead, sla_hours=sla)
             fired += 1
     return fired
+
+
+@shared_task
+def scan_unanswered_leads():
+    """
+    Проверка лидов, которым не ответили в течение 15 минут после входящего сообщения.
+    """
+    from .models import WhatsAppMessageConsalting
+    from apps.main.realtime import create_and_publish_notification
+
+    now = timezone.now()
+    threshold = now - timedelta(minutes=15)
+    fired = 0
+
+    leads = _active_open_leads().select_related("company", "owner").iterator()
+
+    for lead in leads:
+        last_msg = (
+            WhatsAppMessageConsalting.objects.filter(lead=lead)
+            .order_by("-created_at")
+            .first()
+        )
+        if last_msg and last_msg.direction == WhatsAppMessageConsalting.Direction.INBOUND:
+            if last_msg.created_at <= threshold:
+                target_user = lead.owner
+                if target_user:
+                    try:
+                        create_and_publish_notification(
+                            company=lead.company,
+                            user=target_user,
+                            title="⏰ Внимание: Лид без ответа > 15 мин!",
+                            message=f"Клиент {lead.full_name} ({lead.phone}) ожидает вашего ответа более 15 минут.",
+                            type="unanswered_lead_alert",
+                            level="warning",
+                            url=f"/consalting/leads/{lead.id}",
+                            data={"lead_id": str(lead.id), "phone": lead.phone}
+                        )
+                    except Exception:
+                        pass
+                fired += 1
+    return fired
