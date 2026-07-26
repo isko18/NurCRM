@@ -225,15 +225,25 @@ class WazzupConsaltingService:
             source_name = f"Wazzup ({account.integration_type})"
 
             with transaction.atomic():
-                # Идемпотентная регистрация входящего лида (InboundLeadConsalting)
-                inbound_lead = None
-                inbound_created = False
-                if message_id:
-                    inbound_lead = InboundLeadConsalting.objects.filter(
-                        company=account.company, external_id=message_id
-                    ).first()
+                # Идемпотентная привязка/обновление входящей заявки (InboundLeadConsalting) по номеру телефона
+                clean_phone_10 = clean_phone[-10:] if len(clean_phone) >= 10 else clean_phone
+                inbound_lead = InboundLeadConsalting.objects.filter(
+                    company=account.company,
+                    phone__icontains=clean_phone_10
+                ).exclude(
+                    status__in=[InboundLeadConsalting.Status.CONVERTED, InboundLeadConsalting.Status.REJECTED]
+                ).order_by("-created_at").first()
 
-                if not inbound_lead:
+                inbound_created = False
+                if inbound_lead:
+                    # Обновляем последнее сообщение в имеющейся заявке
+                    inbound_lead.message = text
+                    if author_name and author_name != phone:
+                        inbound_lead.full_name = author_name
+                    if message_id:
+                        inbound_lead.external_id = message_id
+                    inbound_lead.save(update_fields=["message", "full_name", "external_id", "updated_at"])
+                else:
                     inbound_lead = InboundLeadConsalting.objects.create(
                         company=account.company,
                         external_id=message_id if message_id else f"wz_{uuid.uuid4().hex[:12]}",
