@@ -96,6 +96,9 @@ class WazzupConsaltingService:
                 status=WhatsAppMessageConsalting.Status.PENDING
             )
 
+            # Мгновенная сокет-трансляция (0ms)
+            _broadcast_consalting_message(account.company_id, lead, wa_message, False, text, clean_phone)
+
             ActivityLogger.log(
                 lead=lead,
                 activity_type=LeadActivityConsalting.Type.MESSAGE,
@@ -142,9 +145,6 @@ class WazzupConsaltingService:
             logger.error(f"Ошибка вызова Wazzup API: {e}")
             wa_message.status = WhatsAppMessageConsalting.Status.FAILED
             wa_message.save(update_fields=["status"])
-
-        # Мгновенная трансляция исходящего сообщения по WebSocket (0ms задержка)
-        _broadcast_consalting_message(account.company_id, lead, wa_message, False, text, clean_phone)
 
         # Обновляем канбан воронку через WebSocket
         realtime.lead_updated(lead)
@@ -218,10 +218,10 @@ class WazzupConsaltingService:
                     if distributed_lead and distributed_lead.owner:
                         assigned_owner = distributed_lead.owner
 
-                # Поиск или создание активного лида в воронке консалтинга
+                # Быстрый поиск лида по точному совпадению телефона (индексированный запрос)
                 lead = LeadConsalting.objects.filter(
                     company_id=account.company_id,
-                    phone__icontains=clean_phone[-10:] if len(clean_phone) >= 10 else clean_phone
+                    phone=phone
                 ).exclude(
                     stage__stage_type__in=[
                         FunnelStageConsalting.StageType.WON,
@@ -229,6 +229,18 @@ class WazzupConsaltingService:
                         FunnelStageConsalting.StageType.LOST
                     ]
                 ).order_by("-updated_at").first()
+
+                if not lead and len(clean_phone) >= 10:
+                    lead = LeadConsalting.objects.filter(
+                        company_id=account.company_id,
+                        phone__endswith=clean_phone[-10:]
+                    ).exclude(
+                        stage__stage_type__in=[
+                            FunnelStageConsalting.StageType.WON,
+                            FunnelStageConsalting.StageType.COMPLETED,
+                            FunnelStageConsalting.StageType.LOST
+                        ]
+                    ).order_by("-updated_at").first()
 
                 created_lead = False
                 if not lead:
@@ -282,6 +294,9 @@ class WazzupConsaltingService:
                     }
                 )
 
+                # Мгновенная трансляция нового сообщения по WebSocket (0ms задержка)
+                _broadcast_consalting_message(account.company_id, lead, wa_message, is_inbound, text, phone)
+
                 if msg_created:
                     ActivityLogger.log(
                         lead=lead,
@@ -296,9 +311,6 @@ class WazzupConsaltingService:
                         }
                     )
 
-            # 1. Мгновенная трансляция нового сообщения по WebSocket (0ms задержка)
-            _broadcast_consalting_message(account.company_id, lead, wa_message, is_inbound, text, phone)
-
             events.emit(
                 trigger="activity_added" if not created_lead else "stage_changed",
                 lead=lead,
@@ -311,7 +323,7 @@ class WazzupConsaltingService:
             else:
                 realtime.lead_updated(lead)
 
-            # 2. Персональное системное уведомление менеджеру ("Сообщение от лида ...")
+            # Персональное системное уведомление менеджеру ("Сообщение от лида ...")
             if is_inbound:
                 target_owner = assigned_owner or lead.owner
                 if target_owner:
@@ -347,7 +359,7 @@ class WazzupConsaltingService:
                         }
                     )
 
-        # 3. Обработка обновлений статусов сообщений
+        # Обработка обновлений статусов сообщений
         for item in statuses:
             message_id = item.get("messageId")
             status_str = item.get("status")
