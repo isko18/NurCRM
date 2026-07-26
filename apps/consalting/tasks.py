@@ -89,20 +89,26 @@ def scan_sla_breach():
 
 
 @shared_task
-def scan_unanswered_leads():
+def scan_unanswered_leads(threshold_minutes=15):
     """
-    Проверка лидов, которым не ответили в течение 15 минут после входящего сообщения.
+    Проверка лидов, которым не ответили в течение N минут после входящего сообщения.
     """
     from .models import WhatsAppMessageConsalting
+    from apps.main.models import Notification
+    from apps.users.models import User
     from apps.main.realtime import create_and_publish_notification
 
     now = timezone.now()
-    threshold = now - timedelta(minutes=1)
+    threshold = now - timedelta(minutes=threshold_minutes)
     fired = 0
 
-    leads = _active_open_leads().select_related("company", "owner").iterator()
+    open_leads = LeadConsalting.objects.filter(
+        closed_at__isnull=True
+    ).exclude(
+        status__in=[LeadConsalting.Status.WON, LeadConsalting.Status.LOST]
+    ).select_related("company", "owner").iterator()
 
-    for lead in leads:
+    for lead in open_leads:
         last_msg = (
             WhatsAppMessageConsalting.objects.filter(lead=lead)
             .order_by("-created_at")
@@ -110,14 +116,30 @@ def scan_unanswered_leads():
         )
         if last_msg and last_msg.direction == WhatsAppMessageConsalting.Direction.INBOUND:
             if last_msg.created_at <= threshold:
-                target_user = lead.owner
-                if target_user:
+                # Исключаем спам: проверяем, не отправлялось ли аналогичное алерт-уведомление за последние 15 мин
+                recent_notif = Notification.objects.filter(
+                    company=lead.company,
+                    type="unanswered_lead_alert",
+                    data__lead_id=str(lead.id),
+                    created_at__gte=now - timedelta(minutes=15)
+                ).exists()
+
+                if recent_notif:
+                    continue
+
+                target_users = []
+                if lead.owner:
+                    target_users = [lead.owner]
+                else:
+                    target_users = list(User.objects.filter(company=lead.company, is_active=True))
+
+                for u in target_users:
                     try:
                         create_and_publish_notification(
                             company=lead.company,
-                            user=target_user,
-                            title="⏰ Внимание: Лид без ответа > 1 мин!",
-                            message=f"Клиент {lead.full_name} ({lead.phone}) ожидает вашего ответа более 1 минуты.",
+                            user=u,
+                            title=f"⏰ Внимание: Лид без ответа > {threshold_minutes} мин!",
+                            message=f"Клиент {lead.full_name} ({lead.phone}) ожидает вашего ответа более {threshold_minutes} минут.",
                             type="unanswered_lead_alert",
                             level="warning",
                             url=f"/consalting/leads/{lead.id}",
