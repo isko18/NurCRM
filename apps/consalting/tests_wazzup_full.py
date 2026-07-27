@@ -1,7 +1,7 @@
 from django.test import TestCase
 from rest_framework.test import APIClient
 from rest_framework import status
-from unittest.mock import patch
+from unittest.mock import patch, MagicMock
 
 from apps.main.models import Company
 from apps.users.models import User, CustomRole
@@ -56,8 +56,10 @@ class WazzupConsaltingIntegrationTestCase(TestCase):
         self.client = APIClient()
         self.client.force_authenticate(user=self.user1)
 
-    def test_wazzup_webhook_creates_lead_and_distributes(self):
-        """Тест 1: Входящий вебхук Wazzup автоматически создает лид и распределяет по Round-Robin"""
+    @patch("apps.consalting.funnel.realtime.reliable_group_send")
+    @patch("apps.consalting.tasks.process_wazzup_webhook_side_effects.delay")
+    def test_wazzup_webhook_realtime_path_without_celery(self, mock_celery_delay, mock_group_send):
+        """Тест 1: Входящий вебхук Wazzup синхронно создает запись в БД и шлет WS даже при отключенном/замоканном Celery"""
         payload = {
             "messages": [
                 {
@@ -71,27 +73,32 @@ class WazzupConsaltingIntegrationTestCase(TestCase):
             ]
         }
 
-        response = self.client.post("/api/consalting/wazzup/webhook/", payload, format="json")
+        with self.captureOnCommitCallbacks(execute=True):
+            response = self.client.post("/api/consalting/wazzup/webhook/", payload, format="json")
         self.assertEqual(response.status_code, status.HTTP_200_OK)
 
-        # Проверяем InboundLeadConsalting
-        inbound = InboundLeadConsalting.objects.filter(external_id="wz_msg_1001").first()
-        self.assertIsNotNone(inbound)
-        self.assertEqual(inbound.phone, "+79991112233")
-        self.assertIsNotNone(inbound.owner)
+        # Подтверждаем, что Celery task была вызвана в фоновом режиме
+        self.assertTrue(mock_celery_delay.called)
 
-        # Проверяем LeadConsalting в воронке
-        lead = LeadConsalting.objects.filter(phone="+79991112233").first()
-        self.assertIsNotNone(lead)
-        self.assertEqual(lead.owner, inbound.owner)
-
-        # Проверяем WhatsAppMessageConsalting
+        # Проверяем, что WhatsAppMessageConsalting мгновенно создан в БД во время HTTP-запроса
         wa_msg = WhatsAppMessageConsalting.objects.filter(message_id="wz_msg_1001").first()
         self.assertIsNotNone(wa_msg)
         self.assertEqual(wa_msg.text, "Здравствуйте! Хочу узнать стоимость ваших услуг.")
 
-    def test_wazzup_webhook_idempotency(self):
-        """Тест 2: Повторный вебхук с тем же messageId игнорируется (идемпотентность)"""
+        # Проверяем, что WebSocket broadcast с new_message ушел по каналу после commit
+        self.assertTrue(mock_group_send.called)
+        found_new_msg = False
+        for call in mock_group_send.call_args_list:
+            groups_and_events = call[0][0]
+            for group, envelope in groups_and_events:
+                if envelope.get("type") == "wazzup_event" and envelope.get("event", {}).get("type") == "new_message":
+                    found_new_msg = True
+                    self.assertEqual(envelope["event"]["data"]["message_id"], "wz_msg_1001")
+        self.assertTrue(found_new_msg, "WebSocket new_message broadcast was not triggered")
+
+    @patch("apps.consalting.funnel.realtime.reliable_group_send")
+    def test_wazzup_webhook_idempotency(self, mock_group_send):
+        """Тест 2: Повторный вебхук с тем же messageId игнорируется и не шлет дублирующий WS"""
         payload = {
             "messages": [
                 {
@@ -105,20 +112,74 @@ class WazzupConsaltingIntegrationTestCase(TestCase):
         }
 
         # Первый вызов
-        r1 = self.client.post("/api/consalting/wazzup/webhook/", payload, format="json")
+        with self.captureOnCommitCallbacks(execute=True):
+            r1 = self.client.post("/api/consalting/wazzup/webhook/", payload, format="json")
         self.assertEqual(r1.status_code, status.HTTP_200_OK)
         count_before = WhatsAppMessageConsalting.objects.filter(message_id="wz_msg_duplicate_check").count()
         self.assertEqual(count_before, 1)
 
+        mock_group_send.reset_mock()
+
         # Повторный вызов дубликата
-        r2 = self.client.post("/api/consalting/wazzup/webhook/", payload, format="json")
+        with self.captureOnCommitCallbacks(execute=True):
+            r2 = self.client.post("/api/consalting/wazzup/webhook/", payload, format="json")
         self.assertEqual(r2.status_code, status.HTTP_200_OK)
         count_after = WhatsAppMessageConsalting.objects.filter(message_id="wz_msg_duplicate_check").count()
-        self.assertEqual(count_after, 1)  # Сообщение не продублировалось!
+        self.assertEqual(count_after, 1)
+        # Дубликат не должен отправлять второй new_message по WebSocket
+        self.assertFalse(mock_group_send.called)
+
+    @patch("apps.consalting.funnel.realtime.reliable_group_send")
+    def test_wazzup_webhook_statuses_broadcasts_message_status(self, mock_group_send):
+        """Тест 3: Вебхук statuses обновляет статус сообщения и шлет message_status по WS с data.id = wa_message.id"""
+        funnel = FunnelConsalting.objects.create(company=self.company, name="Воронка 1")
+        stage = FunnelStageConsalting.objects.create(company=self.company, funnel=funnel, name="Стадия 1", order=1)
+        lead = LeadConsalting.objects.create(
+            company=self.company,
+            funnel=funnel,
+            stage=stage,
+            title="Лид для статусов",
+            phone="+79997778899"
+        )
+        wa_msg = WhatsAppMessageConsalting.objects.create(
+            company=self.company,
+            lead=lead,
+            message_id="wz_msg_status_test",
+            direction=WhatsAppMessageConsalting.Direction.OUTBOUND,
+            text="Тест статуса",
+            status=WhatsAppMessageConsalting.Status.PENDING
+        )
+
+        status_payload = {
+            "statuses": [
+                {
+                    "messageId": "wz_msg_status_test",
+                    "status": "delivered"
+                }
+            ]
+        }
+
+        with self.captureOnCommitCallbacks(execute=True):
+            response = self.client.post("/api/consalting/wazzup/webhook/", status_payload, format="json")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        wa_msg.refresh_from_db()
+        self.assertEqual(wa_msg.status, WhatsAppMessageConsalting.Status.DELIVERED)
+
+        # Проверяем WebSocket broadcast события message_status
+        found_msg_status = False
+        for call in mock_group_send.call_args_list:
+            groups_and_events = call[0][0]
+            for group, envelope in groups_and_events:
+                if envelope.get("type") == "wazzup_event" and envelope.get("event", {}).get("type") == "message_status":
+                    found_msg_status = True
+                    self.assertEqual(envelope["event"]["data"]["id"], str(wa_msg.id))
+                    self.assertEqual(envelope["event"]["data"]["status"], "delivered")
+        self.assertTrue(found_msg_status, "WebSocket message_status broadcast was not triggered")
 
     @patch("requests.post")
     def test_wazzup_send_message_api(self, mock_post):
-        """Тест 3: Отправка сообщения из CRM воронки консалтинга через Wazzup API"""
+        """Тест 4: Отправка сообщения из CRM воронки консалтинга через Wazzup API"""
         mock_post.return_value.status_code = 200
         mock_post.return_value.json.return_value = {"messageId": "wz_out_resp_123"}
 
@@ -137,8 +198,6 @@ class WazzupConsaltingIntegrationTestCase(TestCase):
             "message": "Приветствуем Вас!"
         }
 
-        # Отправка теперь оптимистичная: ответ приходит со статусом "pending",
-        # реальный вызов Wazzup API уходит в Celery-таску после коммита.
         with self.captureOnCommitCallbacks(execute=True):
             response = self.client.post(
                 f"/api/consalting/wazzup-accounts/{self.account.id}/send-message/",
@@ -148,14 +207,12 @@ class WazzupConsaltingIntegrationTestCase(TestCase):
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
         self.assertEqual(response.data["status"], "pending")
 
-        # После выполнения on_commit-колбэков (Celery в eager-режиме) статус — "sent",
-        # а message_id заменён ответом Wazzup.
         wa_msg = WhatsAppMessageConsalting.objects.get(id=response.data["id"])
         self.assertEqual(wa_msg.status, "sent")
         self.assertEqual(wa_msg.message_id, "wz_out_resp_123")
 
     def test_wazzup_upload_media_api(self):
-        """Тест 4: Загрузка медиафайла менеджером через POST /upload/"""
+        """Тест 5: Загрузка медиафайла менеджером через POST /upload/"""
         from django.core.files.uploadedfile import SimpleUploadedFile
         test_file = SimpleUploadedFile("photo.jpg", b"file_bytes_content", content_type="image/jpeg")
 
@@ -167,3 +224,4 @@ class WazzupConsaltingIntegrationTestCase(TestCase):
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
         self.assertIn("url", response.data)
         self.assertIn("content_uri", response.data)
+

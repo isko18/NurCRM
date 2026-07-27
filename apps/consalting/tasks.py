@@ -20,9 +20,16 @@ CLOSED_STATUSES = (LeadConsalting.Status.WON, LeadConsalting.Status.LOST)
 
 @shared_task
 def process_wazzup_webhook(payload):
-    """Обработка вебхука Wazzup вне HTTP-запроса (БД + единственная сокет-трансляция)."""
+    """Обработка вебхука Wazzup вне HTTP-запроса (совместимый режим)."""
     from .funnel.wazzup import WazzupConsaltingService
     WazzupConsaltingService.handle_wazzup_webhook(payload)
+
+
+@shared_task
+def process_wazzup_webhook_side_effects(payload, realtime_result=None):
+    """Фоновая обработка тяжелых сайд-эффектов вебхука Wazzup (автораспределение, логгер, уведомления)."""
+    from .funnel.wazzup import WazzupConsaltingService
+    WazzupConsaltingService.handle_wazzup_webhook_side_effects(payload, realtime_result)
 
 
 @shared_task(bind=True, acks_late=True, max_retries=3, default_retry_delay=5)

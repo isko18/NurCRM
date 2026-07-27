@@ -27,3 +27,7 @@ PASSWORD_HASHERS = [
 # Celery-таски выполняются синхронно в тестах (без брокера Redis).
 CELERY_TASK_ALWAYS_EAGER = True
 CELERY_TASK_EAGER_PROPAGATES = True
+
+# Настройки безопасности для тестового окружения
+SECURE_SSL_REDIRECT = False
+ALLOWED_HOSTS = ["*"]

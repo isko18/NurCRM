@@ -165,9 +165,10 @@ class WazzupWebhookConsaltingView(APIView):
     def post(self, request):
         payload = request.data
         try:
-            # Мгновенные сокеты + тяжёлая обработка в Celery: отдаём 200 сразу,
-            # чтобы Wazzup не придерживал следующие вебхуки.
-            WazzupConsaltingService.enqueue_webhook(payload)
+            # 1. Быстрый синхронный путь прямо в HTTP-запросе (сохранение в БД + WS на transaction.on_commit)
+            realtime_res = WazzupConsaltingService.handle_wazzup_webhook_realtime(payload)
+            # 2. Постановка тяжелых сайд-эффектов в Celery
+            WazzupConsaltingService.enqueue_webhook_side_effects(payload, realtime_res)
             return Response({"status": "ok"}, status=status.HTTP_200_OK)
         except Exception as e:
             return Response({"detail": str(e)}, status=status.HTTP_400_BAD_REQUEST)

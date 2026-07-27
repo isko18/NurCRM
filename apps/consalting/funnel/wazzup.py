@@ -214,12 +214,19 @@ class WazzupConsaltingService:
                 status=WhatsAppMessageConsalting.Status.PENDING
             )
 
-            # Мгновенная сокет-трансляция всем, КРОМЕ самого отправителя (у него
-            # уже есть локальное эхо: ack сокета / ответ REST). Реальный вызов
-            # Wazzup API уходит в Celery — HTTP-воркер не блокируется сетью.
-            _broadcast_consalting_message(
-                account.company_id, lead, wa_message, False, text, clean_phone,
-                origin_user_id=user.id if user else None,
+            # Трансляция по WebSocket после коммита транзакции всем, КРОМЕ самого отправителя.
+            acc_company_id = account.company_id
+            lead_obj = lead
+            wa_msg_obj = wa_message
+            out_text = text
+            c_phone = clean_phone
+            orig_user_id = user.id if user else None
+
+            transaction.on_commit(
+                lambda: _broadcast_consalting_message(
+                    acc_company_id, lead_obj, wa_msg_obj, False, out_text, c_phone,
+                    origin_user_id=orig_user_id,
+                )
             )
 
             ActivityLogger.log(
@@ -254,49 +261,48 @@ class WazzupConsaltingService:
                 lead.status = "in_work"
                 lead.save(update_fields=["status", "updated_at"])
 
-            # Обновляем канбан воронку через WebSocket (оптимистично)
-            realtime.lead_updated(lead)
+            # Обновляем канбан воронку через WebSocket после коммита
+            transaction.on_commit(lambda: realtime.lead_updated(lead_obj))
 
             # Реальная отправка в Wazzup — в фоне, после коммита транзакции.
             from apps.consalting.tasks import send_wazzup_message
             wa_id = str(wa_message.id)
             acc_id = str(account.id)
-            out_text = text or ""
-            out_uri = content_uri or ""
+            out_t = text or ""
+            out_u = content_uri or ""
             transaction.on_commit(
-                lambda: send_wazzup_message.delay(wa_id, acc_id, out_text, out_uri)
+                lambda: send_wazzup_message.delay(wa_id, acc_id, out_t, out_u)
             )
 
         return wa_message
 
     @staticmethod
     def enqueue_webhook(payload: dict):
-        """Быстрый приём вебхука: постановка обработки в Celery и мгновенный возврат.
-
-        Возвращает управление за единицы миллисекунд, чтобы Wazzup сразу получил
-        ``200`` и не придерживал следующие вебхуки. Вся обработка (БД,
-        автораспределение, уведомления и единственная сокет-трансляция каждого
-        сообщения) выполняется в ``process_wazzup_webhook``.
-        """
-        from apps.consalting.tasks import process_wazzup_webhook
-        process_wazzup_webhook.delay(payload)
+        """Быстрый приём вебхука: вызов realtime-обработки в HTTP и постановка фоновых задач."""
+        realtime_res = WazzupConsaltingService.handle_wazzup_webhook_realtime(payload)
+        WazzupConsaltingService.enqueue_webhook_side_effects(payload, realtime_res)
 
     @staticmethod
-    def handle_wazzup_webhook(payload: dict):
-        """
-        Обработка входящих сообщений и статусов от Wazzup Webhook.
-        Атомарность, идемпотентность (external_id), автораспределение (Round-Robin/Least-Loaded) и персональные WS-уведомления.
+    def enqueue_webhook_side_effects(payload: dict, realtime_result: dict = None):
+        """Постановка тяжелых сайд-эффектов вебхука в Celery."""
+        from apps.consalting.tasks import process_wazzup_webhook_side_effects
+        process_wazzup_webhook_side_effects.delay(payload, realtime_result or {})
 
-        Каждое сообщение транслируется по WebSocket РОВНО один раз (см.
-        ``_broadcast_consalting_message`` ниже) — без отдельной пред-трансляции,
-        чтобы у клиента не появлялись дубликаты.
+    @staticmethod
+    def handle_wazzup_webhook_realtime(payload: dict) -> dict:
         """
-        from apps.consalting.views import distribute_inbound_lead
-
+        Быстрый синхронный путь Wazzup webhook прямо в HTTP-запросе:
+        1. Распарсить messages и statuses
+        2. Идемпотентно создать/найти Lead и WhatsAppMessageConsalting
+        3. Зарегистрировать WebSocket broadcast (new_message / message_status) на transaction.on_commit
+        4. Вернуть данные для фоновых сайд-эффектов
+        """
         messages = payload.get("messages") or []
         statuses = payload.get("statuses") or []
 
-        # 1. Обработка входящих/исходящих сообщений
+        processed_messages = []
+        processed_statuses = []
+
         for item in messages:
             channel_id = item.get("channelId")
             account = WazzupAccountConsalting.objects.filter(channel_id=channel_id, is_active=True).first()
@@ -311,10 +317,8 @@ class WazzupConsaltingService:
             media_type = item.get("type") or ""
             is_inbound = item.get("isInbound", True)
             author_name = item.get("authorName") or ""
-            # Истинное время сообщения от Wazzup — для сортировки на фронте
             event_dt = item.get("dateTime") or item.get("dateTimeUtc") or ""
 
-            # Обработка медиафайлов (фото, видео, голосовые, документы), если текст сообщения пустой
             text = _media_placeholder(text, media_type, content_uri)
 
             # Защита от дублей по message_id
@@ -327,7 +331,6 @@ class WazzupConsaltingService:
             source_name = f"Wazzup ({account.integration_type})"
 
             with transaction.atomic():
-                # Идемпотентная привязка/обновление входящей заявки (InboundLeadConsalting) по номеру телефона
                 clean_phone_10 = clean_phone[-10:] if len(clean_phone) >= 10 else clean_phone
                 inbound_lead = InboundLeadConsalting.objects.filter(
                     company=account.company,
@@ -346,7 +349,6 @@ class WazzupConsaltingService:
 
                 inbound_created = False
                 if inbound_lead:
-                    # Обновляем последнее сообщение в имеющейся заявке и поднимаем наверх (-updated_at)
                     inbound_lead.message = text
                     inbound_lead.updated_at = timezone.now()
                     if author_name and author_name != phone:
@@ -366,14 +368,6 @@ class WazzupConsaltingService:
                     )
                     inbound_created = True
 
-                # Автораспределение лида (Round-Robin / Least-Loaded)
-                assigned_owner = None
-                if inbound_created:
-                    distributed_lead = distribute_inbound_lead(inbound_lead)
-                    if distributed_lead and distributed_lead.owner:
-                        assigned_owner = distributed_lead.owner
-
-                # Быстрый поиск лида по точному совпадению телефона (индексированный запрос)
                 lead = LeadConsalting.objects.filter(
                     company_id=account.company_id,
                     phone=phone
@@ -422,7 +416,6 @@ class WazzupConsaltingService:
                         branch_id=account.branch_id,
                         funnel=funnel,
                         stage=stage,
-                        owner=assigned_owner,
                         title=f"Заявка из {account.get_integration_type_display()} ({phone})",
                         phone=phone,
                         full_name=author_name or f"Клиент {phone}",
@@ -437,39 +430,149 @@ class WazzupConsaltingService:
                 )
 
                 effective_msg_id = message_id if message_id else f"msg_{uuid.uuid4().hex[:12]}"
-                wa_message, msg_created = WhatsAppMessageConsalting.objects.get_or_create(
-                    message_id=effective_msg_id,
-                    defaults={
-                        "company_id": lead.company_id,
-                        "branch_id": lead.branch_id,
-                        "lead": lead,
-                        "direction": direction,
-                        "text": text,
-                        "content_uri": content_uri,
-                        "media_type": media_type,
-                        "status": WhatsAppMessageConsalting.Status.READ if is_inbound else WhatsAppMessageConsalting.Status.SENT
-                    }
-                )
-
-                # Мгновенная трансляция нового сообщения по WebSocket (0ms задержка)
-                _broadcast_consalting_message(
-                    account.company_id, lead, wa_message, is_inbound, text, phone,
-                    event_ts=event_dt or None,
-                )
-
-                if msg_created:
-                    ActivityLogger.log(
-                        lead=lead,
-                        activity_type=LeadActivityConsalting.Type.MESSAGE,
-                        actor=None,
-                        title=f"Wazzup ({'входящее' if is_inbound else 'исходящее'})",
-                        body=text,
-                        payload={
-                            "direction": "inbound" if is_inbound else "outbound",
-                            "message_id": effective_msg_id,
-                            "channel_id": channel_id,
+                try:
+                    wa_message, msg_created = WhatsAppMessageConsalting.objects.get_or_create(
+                        message_id=effective_msg_id,
+                        defaults={
+                            "company_id": lead.company_id,
+                            "branch_id": lead.branch_id,
+                            "lead": lead,
+                            "direction": direction,
+                            "text": text,
+                            "content_uri": content_uri,
+                            "media_type": media_type,
+                            "status": WhatsAppMessageConsalting.Status.READ if is_inbound else WhatsAppMessageConsalting.Status.SENT
                         }
                     )
+                except Exception as exc:
+                    logger.warning("WhatsAppMessageConsalting create duplicate exception: %s", exc)
+                    wa_message = WhatsAppMessageConsalting.objects.filter(message_id=effective_msg_id).first()
+                    msg_created = False
+
+                if wa_message and msg_created:
+                    # Трансляция по WebSocket мгновенно ПОСЛЕ коммита транзакции
+                    acc_cid = account.company_id
+                    l_obj = lead
+                    wa_m = wa_message
+                    ib_val = is_inbound
+                    txt_val = text
+                    ph_val = phone
+                    dt_val = event_dt or None
+
+                    transaction.on_commit(
+                        lambda c_id=acc_cid, l=l_obj, m=wa_m, ib=ib_val, t=txt_val, p=ph_val, d=dt_val: _broadcast_consalting_message(
+                            c_id, l, m, ib, t, p, event_ts=d
+                        )
+                    )
+
+                    processed_messages.append({
+                        "account_id": str(account.id),
+                        "lead_id": str(lead.id),
+                        "inbound_lead_id": str(inbound_lead.id) if inbound_lead else None,
+                        "inbound_created": inbound_created,
+                        "created_lead": created_lead,
+                        "message_id": effective_msg_id,
+                        "wa_message_id": str(wa_message.id),
+                        "text": text,
+                        "is_inbound": is_inbound,
+                        "phone": phone,
+                        "channel_id": channel_id,
+                    })
+
+        for item in statuses:
+            message_id = item.get("messageId")
+            status_str = item.get("status")
+            if message_id and status_str:
+                status_map = {
+                    "sent": WhatsAppMessageConsalting.Status.SENT,
+                    "delivered": WhatsAppMessageConsalting.Status.DELIVERED,
+                    "read": WhatsAppMessageConsalting.Status.READ,
+                    "failed": WhatsAppMessageConsalting.Status.FAILED,
+                }
+                st = status_map.get(status_str.lower())
+                if st:
+                    with transaction.atomic():
+                        msg = WhatsAppMessageConsalting.objects.filter(message_id=message_id).first()
+                        if not msg:
+                            try:
+                                msg = WhatsAppMessageConsalting.objects.filter(id=message_id).first()
+                            except Exception:
+                                msg = None
+                        if msg:
+                            msg.status = st
+                            msg.save(update_fields=["status"])
+
+                            acc_cid = msg.company_id
+                            wa_m = msg
+                            ph_val = _normalize_phone(msg.lead.phone) if msg.lead else ""
+                            transaction.on_commit(
+                                lambda c_id=acc_cid, m=wa_m, p=ph_val: _broadcast_message_status(c_id, m, p)
+                            )
+                            processed_statuses.append({
+                                "message_id": message_id,
+                                "wa_message_id": str(msg.id),
+                                "lead_id": str(msg.lead_id) if msg.lead_id else None,
+                                "status": st,
+                            })
+
+        return {
+            "processed_messages": processed_messages,
+            "processed_statuses": processed_statuses,
+        }
+
+    @staticmethod
+    def handle_wazzup_webhook_side_effects(payload: dict, realtime_result: dict = None):
+        """
+        Фоновое выполнение тяжелых сайд-эффектов Wazzup webhook:
+        - Автораспределение лидов (Round-Robin)
+        - Запись логов активности ActivityLogger
+        - Вызов событий воронки events.emit и realtime
+        - Создание системных уведомлений менеджерам
+        """
+        from apps.consalting.views import distribute_inbound_lead
+        from apps.main.realtime import create_and_publish_notification
+
+        processed_messages = (realtime_result or {}).get("processed_messages") or []
+        processed_statuses = (realtime_result or {}).get("processed_statuses") or []
+
+        # 1. Тяжелая обработка для созданных/обновленных сообщений
+        for item in processed_messages:
+            lead = LeadConsalting.objects.filter(id=item["lead_id"]).first()
+            if not lead:
+                continue
+
+            inbound_lead = None
+            if item.get("inbound_lead_id"):
+                inbound_lead = InboundLeadConsalting.objects.filter(id=item["inbound_lead_id"]).first()
+
+            inbound_created = item.get("inbound_created", False)
+            created_lead = item.get("created_lead", False)
+            effective_msg_id = item["message_id"]
+            text = item["text"]
+            is_inbound = item["is_inbound"]
+            phone = item["phone"]
+
+            assigned_owner = None
+            if inbound_created and inbound_lead:
+                distributed_lead = distribute_inbound_lead(inbound_lead)
+                if distributed_lead and distributed_lead.owner:
+                    assigned_owner = distributed_lead.owner
+                    if lead and not lead.owner:
+                        lead.owner = assigned_owner
+                        lead.save(update_fields=["owner", "updated_at"])
+
+            ActivityLogger.log(
+                lead=lead,
+                activity_type=LeadActivityConsalting.Type.MESSAGE,
+                actor=None,
+                title=f"Wazzup ({'входящее' if is_inbound else 'исходящее'})",
+                body=text,
+                payload={
+                    "direction": "inbound" if is_inbound else "outbound",
+                    "message_id": effective_msg_id,
+                    "channel_id": item.get("channel_id"),
+                }
+            )
 
             events.emit(
                 trigger="activity_added" if not created_lead else "stage_changed",
@@ -483,87 +586,50 @@ class WazzupConsaltingService:
             else:
                 realtime.lead_updated(lead)
 
-            # Персональное системное уведомление менеджеру ("Сообщение от лида ...")
+            # Системное уведомление менеджеру
             if is_inbound:
                 target_owner = assigned_owner or lead.owner
-                from apps.main.realtime import create_and_publish_notification
-
+                account = WazzupAccountConsalting.objects.filter(company=lead.company, is_active=True).first()
                 if target_owner:
-                    logger.info(
-                        "[WAZZUP NOTIF] Inbound msg lead_id=%s, target_user_id=%s, group=notif_user_%s",
-                        lead.id, target_owner.id, target_owner.id
-                    )
                     try:
                         create_and_publish_notification(
-                            company=account.company,
+                            company=lead.company,
                             user=target_owner,
                             title=f"📩 Сообщение от лида: {lead.full_name}",
                             message=text[:120] if text else "Входящее медиасообщение",
                             type="lead_message",
                             level="info",
                             url=f"/consalting/leads/{lead.id}",
-                            data={
-                                "lead_id": str(lead.id),
-                                "phone": phone
-                            }
+                            data={"lead_id": str(lead.id), "phone": phone}
                         )
                     except Exception as e:
                         logger.warning("Failed to publish lead message system notification: %s", e)
                 else:
-                    company_users = User.objects.filter(company=account.company, is_active=True)
-                    logger.info(
-                        "[WAZZUP NOTIF] Unassigned lead_id=%s, broadcasting notification to %d company users",
-                        lead.id, company_users.count()
-                    )
+                    company_users = User.objects.filter(company=lead.company, is_active=True)
                     for u in company_users:
                         try:
                             create_and_publish_notification(
-                                company=account.company,
+                                company=lead.company,
                                 user=u,
                                 title=f"📩 Сообщение от лида: {lead.full_name}",
                                 message=text[:120] if text else "Входящее медиасообщение",
                                 type="lead_message",
                                 level="info",
                                 url=f"/consalting/leads/{lead.id}",
-                                data={
-                                    "lead_id": str(lead.id),
-                                    "phone": phone
-                                }
+                                data={"lead_id": str(lead.id), "phone": phone}
                             )
                         except Exception as e:
                             logger.warning("Failed to publish unassigned lead notification to user %s: %s", u.id, e)
 
-                    if target_owner:
-                        realtime.notify_user(
-                            target_owner.id,
-                            "lead.message_received",
-                            {
-                                "id": str(lead.id),
-                                "title": f"📩 Сообщение от лида: {lead.full_name}",
-                                "message": text[:120] if text else "Входящее медиасообщение",
-                                "full_name": lead.full_name,
-                                "phone": lead.phone,
-                                "lead_id": str(lead.id),
-                                "created_at": timezone.now().isoformat(),
-                            }
-                        )
+        # 2. Обновление статусов
+        for st_item in processed_statuses:
+            if st_item.get("lead_id"):
+                l_obj = LeadConsalting.objects.filter(id=st_item["lead_id"]).first()
+                if l_obj:
+                    realtime.lead_updated(l_obj)
 
-        # Обработка обновлений статусов сообщений
-        for item in statuses:
-            message_id = item.get("messageId")
-            status_str = item.get("status")
-            if message_id and status_str:
-                status_map = {
-                    "sent": WhatsAppMessageConsalting.Status.SENT,
-                    "delivered": WhatsAppMessageConsalting.Status.DELIVERED,
-                    "read": WhatsAppMessageConsalting.Status.READ,
-                    "failed": WhatsAppMessageConsalting.Status.FAILED,
-                }
-                st = status_map.get(status_str.lower())
-                if st:
-                    msg = WhatsAppMessageConsalting.objects.filter(message_id=message_id).first()
-                    if msg:
-                        msg.status = st
-                        msg.save(update_fields=["status"])
-                        if msg.lead:
-                            realtime.lead_updated(msg.lead)
+    @staticmethod
+    def handle_wazzup_webhook(payload: dict):
+        """Совместимый метод: полная обработка realtime + side_effects."""
+        realtime_res = WazzupConsaltingService.handle_wazzup_webhook_realtime(payload)
+        WazzupConsaltingService.handle_wazzup_webhook_side_effects(payload, realtime_res)
