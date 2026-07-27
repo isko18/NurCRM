@@ -110,10 +110,11 @@ def _broadcast_consalting_message(company_id, lead, wa_message, is_inbound, text
         else timezone.now().isoformat()
     )
 
-    # Dedup-ключ: для входящих — стабильный message_id от Wazzup, для исходящих —
-    # uuid строки (совпадает с последующим message_status; message_id исходящего
-    # меняется после ответа API).
-    dedup_id = (wa_message.message_id if is_inbound else str(wa_message.id)) or str(wa_message.id)
+    # id == uuid строки для ВСЕХ сообщений (входящих и исходящих) — совпадает с
+    # `id` из REST-истории (сериализатор отдаёт pk) и с последующим
+    # message_status, чтобы фронт мёржил сокет и REST по одному ключу без дублей.
+    # (Wazzup message_id идёт отдельным полем `message_id`.)
+    dedup_id = str(wa_message.id)
     msg_payload = {
         "id": dedup_id,
         "message_id": wa_message.message_id,
