@@ -106,7 +106,11 @@ class WazzupChatConsumer(AsyncWebsocketConsumer):
         await self.channel_layer.group_add(self.consalting_company_group, self.channel_name)
 
         if self.chat_id:
-            self.chat_group = f"wazzup_chat_{self.chat_id}"
+            # Имя группы Channels не допускает "+" и иные не-[a-zA-Z0-9_.-] символы,
+            # а рассылка использует только цифры номера (см. _chat_group в
+            # apps/consalting/funnel/wazzup.py) — санитизируем, чтобы подписка совпала.
+            chat_digits = "".join(filter(str.isdigit, str(self.chat_id))) or self.chat_id
+            self.chat_group = f"wazzup_chat_{chat_digits}"
             await self.channel_layer.group_add(self.chat_group, self.channel_name)
         else:
             self.chat_group = None
@@ -155,8 +159,14 @@ class WazzupChatConsumer(AsyncWebsocketConsumer):
 
     async def wazzup_event(self, event):
         """
-        Пересылка события клиенту
+        Пересылка события клиенту.
+
+        Исходящее сообщение НЕ отправляем обратно его же автору — у отправителя
+        уже есть локальное эхо (ack), иначе он увидит своё сообщение дважды.
         """
+        origin = event.get("origin_user_id")
+        if origin and str(origin) == str(getattr(self.user, "id", "")):
+            return
         await self.send(text_data=json.dumps(event.get("event", {})))
 
     async def consalting_event(self, event):

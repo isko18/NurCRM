@@ -137,13 +137,22 @@ class WazzupConsaltingIntegrationTestCase(TestCase):
             "message": "Приветствуем Вас!"
         }
 
-        response = self.client.post(
-            f"/api/consalting/wazzup-accounts/{self.account.id}/send-message/",
-            send_payload,
-            format="json"
-        )
+        # Отправка теперь оптимистичная: ответ приходит со статусом "pending",
+        # реальный вызов Wazzup API уходит в Celery-таску после коммита.
+        with self.captureOnCommitCallbacks(execute=True):
+            response = self.client.post(
+                f"/api/consalting/wazzup-accounts/{self.account.id}/send-message/",
+                send_payload,
+                format="json"
+            )
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
-        self.assertEqual(response.data["status"], "sent")
+        self.assertEqual(response.data["status"], "pending")
+
+        # После выполнения on_commit-колбэков (Celery в eager-режиме) статус — "sent",
+        # а message_id заменён ответом Wazzup.
+        wa_msg = WhatsAppMessageConsalting.objects.get(id=response.data["id"])
+        self.assertEqual(wa_msg.status, "sent")
+        self.assertEqual(wa_msg.message_id, "wz_out_resp_123")
 
     def test_wazzup_upload_media_api(self):
         """Тест 4: Загрузка медиафайла менеджером через POST /upload/"""

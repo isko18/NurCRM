@@ -1,9 +1,12 @@
 """Celery-сканы воронки (Фаза 5): риск бездействия, просроченные задачи, SLA."""
+import logging
 from datetime import timedelta
 
 from celery import shared_task
 from django.db.models import Q
 from django.utils import timezone
+
+logger = logging.getLogger(__name__)
 
 from .models import (
     LeadConsalting, LeadTaskConsalting, AutomationRuleConsalting,
@@ -13,6 +16,82 @@ from .funnel.events import emit
 from .funnel.state_machine import ACTIVE_TYPES
 
 CLOSED_STATUSES = (LeadConsalting.Status.WON, LeadConsalting.Status.LOST)
+
+
+@shared_task
+def process_wazzup_webhook(payload):
+    """Обработка вебхука Wazzup вне HTTP-запроса (БД + единственная сокет-трансляция)."""
+    from .funnel.wazzup import WazzupConsaltingService
+    WazzupConsaltingService.handle_wazzup_webhook(payload)
+
+
+@shared_task
+def send_wazzup_message(wa_message_id, account_id, text, content_uri):
+    """Реальная отправка исходящего сообщения в Wazzup API вне HTTP-запроса.
+
+    Сообщение уже создано в статусе PENDING и оптимистично разослано по сокетам.
+    Здесь дергаем внешний API, фиксируем итоговый статус (SENT/FAILED) и шлём
+    ``message_status`` фронту.
+    """
+    import requests
+    from .models import WhatsAppMessageConsalting, WazzupAccountConsalting
+    from .funnel.wazzup import WazzupConsaltingService, _broadcast_message_status
+    from .funnel import realtime
+
+    wa_message = (
+        WhatsAppMessageConsalting.objects.select_related("lead")
+        .filter(id=wa_message_id)
+        .first()
+    )
+    account = WazzupAccountConsalting.objects.filter(id=account_id).first()
+    if not wa_message or not account:
+        logger.warning(
+            "send_wazzup_message: missing wa_message=%s or account=%s", wa_message_id, account_id
+        )
+        return
+
+    lead = wa_message.lead
+    clean_phone = "".join(filter(str.isdigit, lead.phone or "")) if lead else ""
+
+    url = f"{account.api_url.rstrip('/')}/v3/message"
+    headers = {
+        "Authorization": f"Bearer {account.api_key}",
+        "Content-Type": "application/json",
+    }
+    api_payload = {
+        "channelId": account.channel_id,
+        "chatId": clean_phone,
+        "chatType": account.integration_type,
+        "text": text or "",
+    }
+    if content_uri:
+        api_payload["contentUri"] = content_uri
+
+    try:
+        res = requests.post(url, json=api_payload, headers=headers, timeout=10.0)
+        if res.status_code in (200, 201):
+            data = res.json()
+            wz_id = data.get("messageId") or data.get("id")
+            if wz_id:
+                wa_message.message_id = str(wz_id)
+            wa_message.status = WhatsAppMessageConsalting.Status.SENT
+            wa_message.save(update_fields=["message_id", "status"])
+            try:
+                WazzupConsaltingService.mark_chat_read(account, clean_phone)
+            except Exception as e:
+                logger.warning("mark_chat_read failed: %s", e)
+        else:
+            logger.error("Wazzup API Error: %s %s", res.status_code, res.text)
+            wa_message.status = WhatsAppMessageConsalting.Status.FAILED
+            wa_message.save(update_fields=["status"])
+    except Exception as e:
+        logger.error("Ошибка вызова Wazzup API: %s", e)
+        wa_message.status = WhatsAppMessageConsalting.Status.FAILED
+        wa_message.save(update_fields=["status"])
+
+    _broadcast_message_status(account.company_id, wa_message, clean_phone)
+    if lead:
+        realtime.lead_updated(lead)
 
 
 def _active_open_leads():

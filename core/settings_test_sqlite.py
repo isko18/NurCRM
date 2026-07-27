@@ -23,3 +23,7 @@ CHANNEL_LAYERS = {
 PASSWORD_HASHERS = [
     "django.contrib.auth.hashers.MD5PasswordHasher",
 ]
+
+# Celery-таски выполняются синхронно в тестах (без брокера Redis).
+CELERY_TASK_ALWAYS_EAGER = True
+CELERY_TASK_EAGER_PROPAGATES = True
