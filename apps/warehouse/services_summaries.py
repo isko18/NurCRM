@@ -15,13 +15,7 @@ from django.db.models import Sum
 from . import models
 from .services import effective_document_line_discount_percent
 
-# Какие накладные НЕ считаем «продажами за день»: отклонённые, заявки на продажу и черновики.
-EXCLUDED_SALE_STATUSES = (
-    models.Document.Status.REJECTED,
-    models.Document.Status.SALE_REQUEST,
-    models.Document.Status.DRAFT,
-)
-
+# В сводку продаж попадают только документы со статусом «Проведен» (POSTED).
 TWOPLACES = Decimal("0.01")
 THREEPLACES = Decimal("0.001")
 
@@ -59,16 +53,16 @@ def next_summary_number(company) -> str:
 
 
 def _documents_queryset(summary):
-    """Накладные продаж, попадающие в снапшот сводки."""
+    """Накладные продаж, попадающие в снапшот сводки (только со статусом «Проведен»)."""
     warehouse_ids = summary.warehouse_ids()
     qs = (
         models.Document.objects
         .filter(
             doc_type=models.Document.DocType.SALE,
+            status=models.Document.Status.POSTED,
             warehouse_from_id__in=warehouse_ids,
             date__date=summary.date,
         )
-        .exclude(status__in=EXCLUDED_SALE_STATUSES)
         .select_related("counterparty", "agent")
     )
     if not warehouse_ids:
