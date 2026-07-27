@@ -144,3 +144,17 @@ class WazzupConsaltingIntegrationTestCase(TestCase):
         )
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
         self.assertEqual(response.data["status"], "sent")
+
+    def test_wazzup_upload_media_api(self):
+        """Тест 4: Загрузка медиафайла менеджером через POST /upload/"""
+        from django.core.files.uploadedfile import SimpleUploadedFile
+        test_file = SimpleUploadedFile("photo.jpg", b"file_bytes_content", content_type="image/jpeg")
+
+        response = self.client.post(
+            f"/api/consalting/wazzup-accounts/{self.account.id}/upload/",
+            {"file": test_file},
+            format="multipart"
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertIn("url", response.data)
+        self.assertIn("content_uri", response.data)

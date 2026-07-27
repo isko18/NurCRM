@@ -143,6 +143,7 @@ realtime.lead_updated(lead)
 | Метод | URL | Назначение |Время откликов |
 | :--- | :--- | :--- | :--- |
 | `POST` | `/api/consalting/wazzup/webhook/` | Прием входящих сообщений и статусов от Wazzup | ~10–50 мс |
+| `POST` | `/api/consalting/wazzup-accounts/{id}/upload/` | Загрузка фото/файла менеджером | ~50–150 мс |
 | `POST` | `/api/consalting/wazzup-accounts/{id}/send-message/` | Отправка сообщения клиенту (текст / `media_url`) | ~0.4–1.2 сек |
 | `GET` | `/api/consalting/wazzup-messages/?lead={lead_id}` | История сообщений по лиду | ~15–30 мс |
 | `GET` | `/api/consalting/wazzup-chats/` | Полный список всех чатов с клиентами | ~20–50 мс |

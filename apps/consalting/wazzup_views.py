@@ -2,6 +2,7 @@ from rest_framework import viewsets, permissions, status
 from rest_framework.decorators import action
 from rest_framework.response import Response
 from rest_framework.views import APIView
+from rest_framework.parsers import MultiPartParser, FormParser, JSONParser
 import requests
 
 from .models import WazzupAccountConsalting, LeadConsalting
@@ -15,6 +16,7 @@ class WazzupAccountConsaltingViewSet(viewsets.ModelViewSet):
     """
     permission_classes = [permissions.IsAuthenticated]
     serializer_class = WazzupAccountConsaltingSerializer
+    parser_classes = [MultiPartParser, FormParser, JSONParser]
 
 
     def get_queryset(self):
@@ -22,6 +24,60 @@ class WazzupAccountConsaltingViewSet(viewsets.ModelViewSet):
 
     def perform_create(self, serializer):
         serializer.save(company=self.request.user.company)
+
+    @action(detail=True, methods=['post'], url_path='upload')
+    def upload_media_detail(self, request, pk=None):
+        return self._handle_file_upload(request)
+
+    @action(detail=False, methods=['post'], url_path='upload')
+    def upload_media_list(self, request):
+        return self._handle_file_upload(request)
+
+    def _handle_file_upload(self, request):
+        """
+        Загрузка медиафайла/изображения менеджером для отправки клиенту в Wazzup.
+        Принимает multipart/form-data файл (поле 'file', 'image', 'media', 'document').
+        Сохраняет в MEDIA_ROOT/wazzup/uploads/ и возвращает публичную ссылку.
+        """
+        import os
+        import uuid
+        from django.core.files.storage import default_storage
+        from django.core.files.base import ContentFile
+        from django.conf import settings
+
+        file_obj = None
+        for key in ['file', 'image', 'media', 'document', 'content', 'attachment']:
+            if key in request.FILES:
+                file_obj = request.FILES[key]
+                break
+
+        if not file_obj and request.FILES:
+            file_obj = list(request.FILES.values())[0]
+
+        if not file_obj:
+            return Response({"detail": "Файл не передан (ожидается поле file)"}, status=status.HTTP_400_BAD_REQUEST)
+
+        clean_filename = "".join(c for c in file_obj.name if c.isalnum() or c in "._-")
+        if not clean_filename:
+            clean_filename = "upload.jpg"
+
+        filename = f"wazzup/uploads/{uuid.uuid4().hex[:12]}_{clean_filename}"
+        saved_path = default_storage.save(filename, ContentFile(file_obj.read()))
+
+        media_url_prefix = getattr(settings, 'MEDIA_URL', '/media/')
+        relative_url = f"{media_url_prefix.rstrip('/')}/{saved_path.lstrip('/')}"
+
+        absolute_url = request.build_absolute_uri(relative_url)
+        if "http://" in absolute_url and not "localhost" in absolute_url and not "127.0.0.1" in absolute_url:
+            absolute_url = absolute_url.replace("http://", "https://")
+
+        return Response({
+            "url": absolute_url,
+            "content_uri": absolute_url,
+            "contentUri": absolute_url,
+            "file_url": absolute_url,
+            "name": file_obj.name,
+        }, status=status.HTTP_201_CREATED)
 
     @action(detail=True, methods=['post'], url_path='setup-webhook')
     def setup_webhook(self, request, pk=None):
