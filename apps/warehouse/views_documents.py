@@ -421,9 +421,20 @@ class DocumentPostView(CompanyBranchRestrictedMixin, generics.GenericAPIView):
 
     def post(self, request, pk=None):
         doc = self.get_object()
+
+        # Если документ уже находится в статусе CASH_PENDING (ожидает решения кассы), 
+        # повторное нажатие на «Провести» доводит его статус до POSTED (Проведен).
+        if doc.status == doc.Status.CASH_PENDING:
+            try:
+                services.approve_cash_request(doc, decided_by=request.user)
+            except Exception as e:
+                return Response({"detail": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+            doc.refresh_from_db()
+            return Response(self.get_serializer(doc).data)
+
         if doc.status not in (doc.Status.DRAFT, doc.Status.SALE_REQUEST):
             return Response(
-                {"detail": "Провести можно только черновик или заявку на продажу."},
+                {"detail": "Провести можно только черновик, заявку на продажу или документ, ожидающий кассу."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
         try:
@@ -454,6 +465,21 @@ class DocumentPostView(CompanyBranchRestrictedMixin, generics.GenericAPIView):
             if isinstance(allow_negative, str):
                 allow_negative = allow_negative.lower() in ('true', '1', 'yes')
             services.post_document(doc, allow_negative=allow_negative)
+            doc.refresh_from_db()
+
+            # Если при проведении наличной продажи документ перешёл в CASH_PENDING,
+            # но запрос отправлен администратором/менеджером или указан auto_approve_cash,
+            # автоматически переводим статус в POSTED.
+            auto_approve_cash = request.data.get("auto_approve_cash", True)
+            if isinstance(auto_approve_cash, str):
+                auto_approve_cash = auto_approve_cash.lower() in ("true", "1", "yes")
+
+            if doc.status == doc.Status.CASH_PENDING and (auto_approve_cash or _is_owner_like(request.user)):
+                try:
+                    services.approve_cash_request(doc, decided_by=request.user)
+                except Exception as e:
+                    logger.warning("Auto approve cash request failed: %s", e)
+
         except Exception as e:
             return Response({"detail": str(e)}, status=status.HTTP_400_BAD_REQUEST)
         doc.refresh_from_db()

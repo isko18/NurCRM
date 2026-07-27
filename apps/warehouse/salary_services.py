@@ -51,6 +51,7 @@ def _is_agent_sale(document) -> bool:
     return (
         document is not None
         and document.doc_type == m.Document.DocType.SALE
+        and document.status == m.Document.Status.POSTED
         and bool(document.agent_id)
     )
 
