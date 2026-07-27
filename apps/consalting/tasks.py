@@ -25,73 +25,113 @@ def process_wazzup_webhook(payload):
     WazzupConsaltingService.handle_wazzup_webhook(payload)
 
 
-@shared_task
-def send_wazzup_message(wa_message_id, account_id, text, content_uri):
+@shared_task(bind=True, acks_late=True, max_retries=3, default_retry_delay=5)
+def send_wazzup_message(self, wa_message_id, account_id, text, content_uri):
     """Реальная отправка исходящего сообщения в Wazzup API вне HTTP-запроса.
 
-    Сообщение уже создано в статусе PENDING и оптимистично разослано по сокетам.
-    Здесь дергаем внешний API, фиксируем итоговый статус (SENT/FAILED) и шлём
-    ``message_status`` фронту.
+    Гарантии:
+      * идемпотентность — при повторной доставке (acks_late) уже обработанное
+        сообщение (не PENDING) пропускается, второй раз в Wazzup не уходит;
+      * статус ВСЕГДА разрешается в SENT/FAILED и транслируется как
+        ``message_status`` — сообщение не остаётся вечно PENDING;
+      * сетевые сбои и 5xx ретраятся, 4xx — сразу FAILED;
+      * валидный payload — Wazzup требует непустой text ЛИБО contentUri
+        (иначе 400 INVALID_MESSAGE_DATA).
     """
     import requests
     from .models import WhatsAppMessageConsalting, WazzupAccountConsalting
     from .funnel.wazzup import WazzupConsaltingService, _broadcast_message_status
     from .funnel import realtime
 
+    S = WhatsAppMessageConsalting.Status
     wa_message = (
         WhatsAppMessageConsalting.objects.select_related("lead")
         .filter(id=wa_message_id)
         .first()
     )
-    account = WazzupAccountConsalting.objects.filter(id=account_id).first()
-    if not wa_message or not account:
-        logger.warning(
-            "send_wazzup_message: missing wa_message=%s or account=%s", wa_message_id, account_id
-        )
+    if not wa_message:
+        logger.warning("send_wazzup_message: message %s no longer exists", wa_message_id)
         return
 
+    # Идемпотентность: повторная доставка задачи после уже обработанного сообщения
+    if wa_message.status != S.PENDING:
+        logger.info("send_wazzup_message: %s already %s, skip", wa_message_id, wa_message.status)
+        return
+
+    account = WazzupAccountConsalting.objects.filter(id=account_id).first()
     lead = wa_message.lead
-    clean_phone = "".join(filter(str.isdigit, lead.phone or "")) if lead else ""
+    clean_phone = "".join(filter(str.isdigit, (lead.phone if lead else "") or ""))
+
+    def _finalize(status):
+        wa_message.status = status
+        wa_message.save(update_fields=["message_id", "status"])
+        cid = account.company_id if account else wa_message.company_id
+        try:
+            _broadcast_message_status(cid, wa_message, clean_phone)
+        except Exception as e:
+            logger.warning("broadcast message_status failed: %s", e)
+        if wa_message.lead_id:
+            try:
+                realtime.lead_updated(wa_message.lead)
+            except Exception:
+                pass
+
+    # Предусловия: без аккаунта/телефона/содержимого отправить нельзя → FAILED
+    body = (text or "").strip()
+    if not account or not getattr(account, "api_url", None) or not clean_phone:
+        logger.error("send_wazzup_message: bad preconditions (account/phone) for %s → FAILED", wa_message_id)
+        _finalize(S.FAILED)
+        return
+    if not body and not content_uri:
+        logger.error("send_wazzup_message: empty text and no media for %s → FAILED", wa_message_id)
+        _finalize(S.FAILED)
+        return
+
+    api_payload = {
+        "channelId": account.channel_id,
+        "chatId": clean_phone,
+        "chatType": account.integration_type,
+    }
+    if body:
+        api_payload["text"] = body
+    if content_uri:
+        api_payload["contentUri"] = content_uri
 
     url = f"{account.api_url.rstrip('/')}/v3/message"
     headers = {
         "Authorization": f"Bearer {account.api_key}",
         "Content-Type": "application/json",
     }
-    api_payload = {
-        "channelId": account.channel_id,
-        "chatId": clean_phone,
-        "chatType": account.integration_type,
-        "text": text or "",
-    }
-    if content_uri:
-        api_payload["contentUri"] = content_uri
 
     try:
         res = requests.post(url, json=api_payload, headers=headers, timeout=10.0)
-        if res.status_code in (200, 201):
-            data = res.json()
-            wz_id = data.get("messageId") or data.get("id")
-            if wz_id:
-                wa_message.message_id = str(wz_id)
-            wa_message.status = WhatsAppMessageConsalting.Status.SENT
-            wa_message.save(update_fields=["message_id", "status"])
-            try:
-                WazzupConsaltingService.mark_chat_read(account, clean_phone)
-            except Exception as e:
-                logger.warning("mark_chat_read failed: %s", e)
-        else:
-            logger.error("Wazzup API Error: %s %s", res.status_code, res.text)
-            wa_message.status = WhatsAppMessageConsalting.Status.FAILED
-            wa_message.save(update_fields=["status"])
-    except Exception as e:
-        logger.error("Ошибка вызова Wazzup API: %s", e)
-        wa_message.status = WhatsAppMessageConsalting.Status.FAILED
-        wa_message.save(update_fields=["status"])
+    except requests.RequestException as e:
+        try:
+            raise self.retry(exc=e)
+        except self.MaxRetriesExceededError:
+            logger.error("send_wazzup_message: network failure (final) for %s: %s", wa_message_id, e)
+            _finalize(S.FAILED)
+            return
 
-    _broadcast_message_status(account.company_id, wa_message, clean_phone)
-    if lead:
-        realtime.lead_updated(lead)
+    if res.status_code in (200, 201):
+        data = res.json() if res.content else {}
+        wz_id = data.get("messageId") or data.get("id")
+        if wz_id:
+            wa_message.message_id = str(wz_id)
+        _finalize(S.SENT)
+        try:
+            WazzupConsaltingService.mark_chat_read(account, clean_phone)
+        except Exception as e:
+            logger.warning("mark_chat_read failed: %s", e)
+    elif res.status_code >= 500:
+        try:
+            raise self.retry(exc=Exception(f"Wazzup {res.status_code}"))
+        except self.MaxRetriesExceededError:
+            logger.error("send_wazzup_message: 5xx (final) for %s: %s", wa_message_id, res.text)
+            _finalize(S.FAILED)
+    else:
+        logger.error("Wazzup API Error %s for %s: %s", res.status_code, wa_message_id, res.text)
+        _finalize(S.FAILED)
 
 
 def _active_open_leads():
