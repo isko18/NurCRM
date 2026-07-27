@@ -436,3 +436,46 @@ class DocumentsTests(TestCase):
         results = response.data.get("results", [])
         self.assertEqual(len(results), 105)
 
+    def test_document_post_view_handles_sale_request_and_posted_status(self):
+        """
+        Проверяет, что проведение Заявки на продажу через API переводит документ в статус POSTED,
+        а повторный вызов идемпотентно возвращает HTTP 200.
+        """
+        models.StockBalance.objects.create(warehouse=self.wh, product=self.prod, qty=Decimal("10.000"))
+        cp = models.Counterparty.objects.create(
+            name="Client Sale Request",
+            phone="+996700000099",
+            type=models.Counterparty.Type.CLIENT,
+            company=self.company,
+            branch=self.branch,
+        )
+        doc = models.Document.objects.create(
+            doc_type=models.Document.DocType.SALE,
+            status=models.Document.Status.SALE_REQUEST,
+            is_sale_request=True,
+            warehouse_from=self.wh,
+            counterparty=cp,
+        )
+        models.DocumentItem.objects.create(document=doc, product=self.prod, qty=Decimal("2"), price=Decimal("15.00"))
+
+        from rest_framework.test import APIRequestFactory, force_authenticate
+        from apps.warehouse.views_documents import DocumentPostView
+
+        factory = APIRequestFactory()
+        request = factory.post(f"/api/warehouse/documents/{doc.id}/post/", {}, format="json")
+        force_authenticate(request, user=self.user)
+
+        view = DocumentPostView.as_view()
+        response = view(request, pk=str(doc.id))
+        self.assertEqual(response.status_code, 200)
+
+        doc.refresh_from_db()
+        self.assertEqual(doc.status, models.Document.Status.POSTED)
+
+        # Повторный вызов /post/ на уже проведённом документе также возвращает 200 OK (идемпотентно)
+        request_repeat = factory.post(f"/api/warehouse/documents/{doc.id}/post/", {}, format="json")
+        force_authenticate(request_repeat, user=self.user)
+        response_repeat = view(request_repeat, pk=str(doc.id))
+        self.assertEqual(response_repeat.status_code, 200)
+
+

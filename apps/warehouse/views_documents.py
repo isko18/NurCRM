@@ -422,21 +422,26 @@ class DocumentPostView(CompanyBranchRestrictedMixin, generics.GenericAPIView):
     def post(self, request, pk=None):
         doc = self.get_object()
 
-        # Если документ уже находится в статусе CASH_PENDING (ожидает решения кассы), 
-        # повторное нажатие на «Провести» доводит его статус до POSTED (Проведен).
+        # 1. Если документ уже проведен (POSTED), возвращаем 200 OK (идемпотентно)
+        if doc.status == doc.Status.POSTED:
+            return Response(self.get_serializer(doc).data, status=status.HTTP_200_OK)
+
+        # 2. Если документ ожидает решения кассы (CASH_PENDING), утверждаем кассовый запрос до POSTED
         if doc.status == doc.Status.CASH_PENDING:
             try:
                 services.approve_cash_request(doc, decided_by=request.user)
             except Exception as e:
                 return Response({"detail": str(e)}, status=status.HTTP_400_BAD_REQUEST)
             doc.refresh_from_db()
-            return Response(self.get_serializer(doc).data)
+            return Response(self.get_serializer(doc).data, status=status.HTTP_200_OK)
 
+        # 3. Разрешены только черновики (DRAFT) и заявки на продажу (SALE_REQUEST)
         if doc.status not in (doc.Status.DRAFT, doc.Status.SALE_REQUEST):
             return Response(
                 {"detail": "Провести можно только черновик, заявку на продажу или документ, ожидающий кассу."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
+
         try:
             from decimal import Decimal, InvalidOperation
             from .utils import normalize_payment_kind
