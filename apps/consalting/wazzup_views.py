@@ -68,8 +68,15 @@ class WazzupAccountConsaltingViewSet(viewsets.ModelViewSet):
         relative_url = f"{media_url_prefix.rstrip('/')}/{saved_path.lstrip('/')}"
 
         absolute_url = request.build_absolute_uri(relative_url)
-        if "http://" in absolute_url and not "localhost" in absolute_url and not "127.0.0.1" in absolute_url:
-            absolute_url = absolute_url.replace("http://", "https://")
+        if "localhost" in absolute_url or "127.0.0.1" in absolute_url or absolute_url.startswith("http://"):
+            domain = "app.nurcrm.kg"
+            try:
+                host_header = request.get_host().split(":")[0]
+                if host_header and host_header not in ["127.0.0.1", "localhost"]:
+                    domain = host_header
+            except Exception:
+                pass
+            absolute_url = f"https://{domain}{relative_url}"
 
         return Response({
             "url": absolute_url,
