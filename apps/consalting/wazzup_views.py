@@ -183,9 +183,30 @@ class WhatsAppMessageConsaltingViewSet(viewsets.ReadOnlyModelViewSet):
     pagination_class = None
 
     def get_queryset(self):
-        from .models import WhatsAppMessageConsalting
-        qs = WhatsAppMessageConsalting.objects.filter(company=self.request.user.company)
+        from .models import WhatsAppMessageConsalting, LeadConsalting
+        company = self.request.user.company
+        qs = WhatsAppMessageConsalting.objects.filter(company=company)
+
         lead_id = self.request.query_params.get('lead') or self.request.query_params.get('lead_id')
+        phone = self.request.query_params.get('phone') or self.request.query_params.get('chat_id')
+
+        # История отдаётся по ДИАЛОГУ (номеру), а не по конкретному лиду.
+        # У одного номера может быть несколько лидов (повторные обращения,
+        # закрытые сделки), и сообщения оказываются раскиданы по ним: чат,
+        # открытый на «пустом» лиде, показывал 0 сообщений, хотя переписка есть.
+        if lead_id and not phone:
+            lead = LeadConsalting.objects.filter(company=company, id=lead_id).only("phone").first()
+            phone = lead.phone if lead else None
+            if not phone:
+                return qs.filter(lead_id=lead_id).order_by('created_at')
+
+        if phone:
+            digits = "".join(filter(str.isdigit, str(phone)))
+            if len(digits) >= 10:
+                return qs.filter(lead__phone__endswith=digits[-10:]).order_by('created_at')
+            if digits:
+                return qs.filter(lead__phone__contains=digits).order_by('created_at')
+
         if lead_id:
             qs = qs.filter(lead_id=lead_id)
         return qs.order_by('created_at')
@@ -209,8 +230,12 @@ class WazzupChatListView(APIView):
         if not company:
             return Response([], status=status.HTTP_200_OK)
 
-        # Берём абсолютно ВСЕ лиды компании без каких-либо ограничений
-        leads_qs = LeadConsalting.objects.filter(company=company).select_related("owner")
+        # Берём абсолютно ВСЕ лиды компании без каких-либо ограничений.
+        # Порядок важен: у одного номера может быть несколько лидов, и чат должен
+        # указывать на ТОТ ЖЕ лид, к которому вебхук привязывает новые сообщения
+        # (см. handle_wazzup_webhook — там выбор идёт по "-updated_at"). Иначе чат
+        # открывается на «пустом» лиде.
+        leads_qs = LeadConsalting.objects.filter(company=company).select_related("owner").order_by("-updated_at")
         leads_by_phone = {}
         for lead in leads_qs:
             if lead.phone:
@@ -219,7 +244,7 @@ class WazzupChatListView(APIView):
                     leads_by_phone[clean_phone] = lead
 
         # Берём абсолютно ВСЕ входящие заявки компании
-        inbound_qs = InboundLeadConsalting.objects.filter(company=company).select_related("owner")
+        inbound_qs = InboundLeadConsalting.objects.filter(company=company).select_related("owner").order_by("-updated_at")
         inbounds_by_phone = {}
         for ib in inbound_qs:
             if ib.phone:
