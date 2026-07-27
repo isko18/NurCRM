@@ -166,32 +166,47 @@ class WazzupChatListView(APIView):
                 if cp:
                     all_phones.add(cp)
 
+        # Пакетная загрузка всех последних сообщений в 1 запрос (убираем N+1)
+        all_msgs = WhatsAppMessageConsalting.objects.filter(company=company).order_by("created_at")
+        last_msg_map = {}
+        for m in all_msgs:
+            if m.lead_id:
+                last_msg_map[str(m.lead_id)] = m
+            if m.lead and m.lead.phone:
+                cp = "".join(filter(str.isdigit, m.lead.phone))
+                if cp:
+                    last_msg_map[cp] = m
+
+        # Пакетный подсчёт непрочитанных сообщений по всем лидам в 1 запрос (убираем N+1)
+        from django.db.models import Count
+        unread_counts = WhatsAppMessageConsalting.objects.filter(
+            company=company,
+            direction=WhatsAppMessageConsalting.Direction.INBOUND
+        ).exclude(
+            status=WhatsAppMessageConsalting.Status.READ
+        ).values("lead_id").annotate(cnt=Count("id"))
+
+        unread_map = {str(item["lead_id"]): item["cnt"] for item in unread_counts if item["lead_id"]}
+
         chats = []
         for cp in all_phones:
             lead = leads_by_phone.get(cp)
             inbound = inbounds_by_phone.get(cp)
 
+            lead_id = str(lead.id) if lead else None
             last_msg = None
-            if lead:
-                last_msg = lead.whatsapp_messages.order_by("-created_at").first()
-            elif inbound:
-                last_msg = WhatsAppMessageConsalting.objects.filter(
-                    company=company, lead__phone__icontains=cp[-10:]
-                ).order_by("-created_at").first()
+            if lead_id and lead_id in last_msg_map:
+                last_msg = last_msg_map[lead_id]
+            elif cp in last_msg_map:
+                last_msg = last_msg_map[cp]
 
-            unread_cnt = 0
-            if lead:
-                unread_cnt = lead.whatsapp_messages.filter(
-                    direction=WhatsAppMessageConsalting.Direction.INBOUND
-                ).exclude(status=WhatsAppMessageConsalting.Status.READ).count()
+            unread_cnt = unread_map.get(lead_id, 0) if lead_id else 0
 
             contact_name = None
             phone_num = None
-            lead_id = None
             owner_data = None
 
             if lead:
-                lead_id = str(lead.id)
                 phone_num = lead.phone
                 contact_name = lead.full_name or lead.title or lead.phone
                 if lead.owner:

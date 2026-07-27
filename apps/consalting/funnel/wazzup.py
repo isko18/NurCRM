@@ -241,7 +241,7 @@ class WazzupConsaltingService:
             payload["contentUri"] = content_uri
 
         try:
-            res = requests.post(url, json=payload, headers=headers, timeout=12.0)
+            res = requests.post(url, json=payload, headers=headers, timeout=4.0)
             if res.status_code in (200, 201):
                 data = res.json()
                 wz_id = data.get("messageId") or data.get("id")
@@ -249,8 +249,13 @@ class WazzupConsaltingService:
                     wa_message.message_id = str(wz_id)
                 wa_message.status = WhatsAppMessageConsalting.Status.SENT
                 wa_message.save(update_fields=["message_id", "status"])
-                # Сбрасываем счётчик непрочитанных в Wazzup для галочек в WhatsApp
-                WazzupConsaltingService.mark_chat_read(account, clean_phone)
+                # Сбрасываем счётчик непрочитанных в Wazzup асинхронно в фоновом потоке (0ms задержки для пользователя)
+                import threading
+                threading.Thread(
+                    target=WazzupConsaltingService.mark_chat_read,
+                    args=(account, clean_phone),
+                    daemon=True
+                ).start()
             else:
                 logger.error(f"Wazzup API Error: {res.status_code} {res.text}")
                 wa_message.status = WhatsAppMessageConsalting.Status.FAILED
@@ -338,10 +343,18 @@ class WazzupConsaltingService:
                 clean_phone_10 = clean_phone[-10:] if len(clean_phone) >= 10 else clean_phone
                 inbound_lead = InboundLeadConsalting.objects.filter(
                     company=account.company,
-                    phone__icontains=clean_phone_10
+                    phone=phone
                 ).exclude(
                     status__in=[InboundLeadConsalting.Status.CONVERTED, InboundLeadConsalting.Status.REJECTED]
                 ).order_by("-created_at").first()
+
+                if not inbound_lead and len(clean_phone_10) >= 10:
+                    inbound_lead = InboundLeadConsalting.objects.filter(
+                        company=account.company,
+                        phone__icontains=clean_phone_10
+                    ).exclude(
+                        status__in=[InboundLeadConsalting.Status.CONVERTED, InboundLeadConsalting.Status.REJECTED]
+                    ).order_by("-created_at").first()
 
                 inbound_created = False
                 if inbound_lead:
@@ -529,19 +542,20 @@ class WazzupConsaltingService:
                         except Exception as e:
                             logger.warning("Failed to publish unassigned lead notification to user %s: %s", u.id, e)
 
-                    realtime.notify_user(
-                        target_owner.id,
-                        "lead.message_received",
-                        {
-                            "id": str(lead.id),
-                            "title": f"📩 Сообщение от лида: {lead.full_name}",
-                            "message": text[:120] if text else "Входящее медиасообщение",
-                            "full_name": lead.full_name,
-                            "phone": lead.phone,
-                            "lead_id": str(lead.id),
-                            "created_at": timezone.now().isoformat(),
-                        }
-                    )
+                    if target_owner:
+                        realtime.notify_user(
+                            target_owner.id,
+                            "lead.message_received",
+                            {
+                                "id": str(lead.id),
+                                "title": f"📩 Сообщение от лида: {lead.full_name}",
+                                "message": text[:120] if text else "Входящее медиасообщение",
+                                "full_name": lead.full_name,
+                                "phone": lead.phone,
+                                "lead_id": str(lead.id),
+                                "created_at": timezone.now().isoformat(),
+                            }
+                        )
 
         # Обработка обновлений статусов сообщений
         for item in statuses:

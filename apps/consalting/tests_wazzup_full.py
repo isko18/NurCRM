@@ -18,7 +18,10 @@ from apps.consalting.models import (
 
 class WazzupConsaltingIntegrationTestCase(TestCase):
     def setUp(self):
-        self.company = Company.objects.create(name="Test Company Wazzup")
+        self.owner = User.objects.create(email="owner@wazzup.test", first_name="Owner")
+        self.company = Company.objects.create(name="Test Company Wazzup", owner=self.owner)
+        self.owner.company = self.company
+        self.owner.save()
         self.role = CustomRole.objects.create(name="Менеджер продаж", company=self.company)
 
         self.user1 = User.objects.create_user(

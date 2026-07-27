@@ -861,7 +861,7 @@ class LeadConsalting(TimeStampedModel):
 
     # Контактные данные карточки (если ещё нет привязанного клиента)
     full_name = models.CharField(max_length=255, blank=True, verbose_name='Контактное лицо')
-    phone = models.CharField(max_length=32, blank=True, verbose_name='Телефон')
+    phone = models.CharField(max_length=32, blank=True, db_index=True, verbose_name='Телефон')
     email = models.EmailField(blank=True, verbose_name='Email')
 
     source = models.CharField(max_length=100, blank=True, verbose_name='Источник')
@@ -1419,6 +1419,7 @@ class WhatsAppMessageConsalting(TimeStampedModel):
         ordering = ['created_at']
         indexes = [
             models.Index(fields=['company', 'lead', 'created_at']),
+            models.Index(fields=['company', 'direction', 'status']),
         ]
 
     def __str__(self):
@@ -1605,7 +1606,7 @@ class InboundLeadConsalting(TimeStampedModel):
         related_name="consalting_inbound_leads", verbose_name="Компания"
     )
     full_name = models.CharField(max_length=255, blank=True, verbose_name="Имя клиента")
-    phone = models.CharField(max_length=32, blank=True, verbose_name="Телефон")
+    phone = models.CharField(max_length=32, blank=True, db_index=True, verbose_name="Телефон")
     source = models.CharField(max_length=32, default="whatsapp", verbose_name="Источник")
     external_id = models.CharField(max_length=128, blank=True, verbose_name="ID сообщения провайдера")
     message = models.TextField(blank=True, verbose_name="Текст сообщения")
