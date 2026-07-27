@@ -25,14 +25,12 @@ class WazzupConsaltingIntegrationTestCase(TestCase):
         self.role = CustomRole.objects.create(name="Менеджер продаж", company=self.company)
 
         self.user1 = User.objects.create_user(
-            username="manager1",
             email="mgr1@wazzup.test",
             password="pass",
             company=self.company,
             custom_role=self.role
         )
         self.user2 = User.objects.create_user(
-            username="manager2",
             email="mgr2@wazzup.test",
             password="pass",
             company=self.company,
