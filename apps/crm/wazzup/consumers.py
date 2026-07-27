@@ -106,7 +106,11 @@ class WazzupChatConsumer(AsyncWebsocketConsumer):
         await self.channel_layer.group_add(self.consalting_company_group, self.channel_name)
 
         if self.chat_id:
-            self.chat_group = f"wazzup_chat_{self.chat_id}"
+            # Имя группы Channels не допускает "+" и иные не-[a-zA-Z0-9_.-] символы,
+            # а рассылка использует только цифры номера (см. _chat_group в
+            # apps/consalting/funnel/wazzup.py) — санитизируем, чтобы подписка совпала.
+            chat_digits = "".join(filter(str.isdigit, str(self.chat_id))) or self.chat_id
+            self.chat_group = f"wazzup_chat_{chat_digits}"
             await self.channel_layer.group_add(self.chat_group, self.channel_name)
         else:
             self.chat_group = None

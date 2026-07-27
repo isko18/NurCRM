@@ -165,7 +165,9 @@ class WazzupWebhookConsaltingView(APIView):
     def post(self, request):
         payload = request.data
         try:
-            WazzupConsaltingService.handle_wazzup_webhook(payload)
+            # Мгновенные сокеты + тяжёлая обработка в Celery: отдаём 200 сразу,
+            # чтобы Wazzup не придерживал следующие вебхуки.
+            WazzupConsaltingService.enqueue_webhook(payload)
             return Response({"status": "ok"}, status=status.HTTP_200_OK)
         except Exception as e:
             return Response({"detail": str(e)}, status=status.HTTP_400_BAD_REQUEST)
