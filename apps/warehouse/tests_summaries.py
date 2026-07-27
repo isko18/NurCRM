@@ -186,8 +186,81 @@ class WarehouseSummariesTests(TestCase):
         summary.warehouses.add(self.wh)
 
         url = reverse("warehouse-summary-regenerate", kwargs={"pk": str(summary.id)})
-        response = self.client.post(url)
+        if not url.endswith("/"):
+            url += "/"
+        response = self.client.post(url, secure=True)
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         
         summary.refresh_from_db()
         self.assertEqual(summary.products_count, 0) # так как нет документов
+
+    def test_summary_excludes_sale_requests_and_drafts(self):
+        """
+        Проверяет, что документы со статусом SALE_REQUEST (Заявка на продажу)
+        и DRAFT (Черновик) не отображаются в сводке.
+        """
+        today = datetime.date.today()
+
+        # Документ SALE_REQUEST
+        doc_request = models.Document.objects.create(
+            warehouse_from=self.wh,
+            doc_type=models.Document.DocType.SALE,
+            date=datetime.datetime.now(),
+            status=models.Document.Status.SALE_REQUEST,
+            total=Decimal("1000.00")
+        )
+        models.DocumentItem.objects.create(
+            document=doc_request,
+            product=self.product_a,
+            qty=Decimal("1"),
+            price=Decimal("1000.00"),
+            line_total=Decimal("1000.00")
+        )
+
+        # Документ DRAFT
+        doc_draft = models.Document.objects.create(
+            warehouse_from=self.wh,
+            doc_type=models.Document.DocType.SALE,
+            date=datetime.datetime.now(),
+            status=models.Document.Status.DRAFT,
+            total=Decimal("500.00")
+        )
+        models.DocumentItem.objects.create(
+            document=doc_draft,
+            product=self.product_b,
+            qty=Decimal("1"),
+            price=Decimal("500.00"),
+            line_total=Decimal("500.00")
+        )
+
+        # Документ POSTED (должен попасть)
+        doc_posted = models.Document.objects.create(
+            warehouse_from=self.wh,
+            doc_type=models.Document.DocType.SALE,
+            date=datetime.datetime.now(),
+            status=models.Document.Status.POSTED,
+            total=Decimal("2000.00")
+        )
+        models.DocumentItem.objects.create(
+            document=doc_posted,
+            product=self.product_a,
+            qty=Decimal("2"),
+            price=Decimal("1000.00"),
+            line_total=Decimal("2000.00")
+        )
+
+        summary = models.WarehouseSalesSummary.objects.create(
+            company=self.company,
+            branch=self.branch,
+            date=today,
+            name="Сводка со статусами"
+        )
+        summary.warehouses.add(self.wh)
+
+        build_summary_snapshot(summary)
+
+        # В сводку должен попасть только POSTED документ (1 документ, а не 3)
+        self.assertEqual(summary.documents.count(), 1)
+        self.assertEqual(summary.documents.first().document_id, doc_posted.id)
+        self.assertEqual(summary.total_amount, Decimal("2000.00"))
+

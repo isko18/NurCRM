@@ -402,3 +402,37 @@ class DocumentsTests(TestCase):
 
         with self.assertRaises(Exception):
             services.post_document(doc)
+
+    def test_counterparty_pagination_supports_over_100_items(self):
+        """
+        Проверяет, что список контрагентов не обрезается на 100 элементах
+        и пагинация выводит более 100 записей (до 1000 по умолчанию).
+        """
+        # Создаем 105 контрагентов
+        counterparties = [
+            models.Counterparty(
+                name=f"Counterparty {i}",
+                phone=f"+99670000{i:04d}",
+                type=models.Counterparty.Type.CLIENT,
+                company=self.company,
+                branch=self.branch,
+            )
+            for i in range(105)
+        ]
+        models.Counterparty.objects.bulk_create(counterparties)
+
+        from rest_framework.test import APIRequestFactory
+        from apps.warehouse.views_documents import CounterpartyListCreateView
+
+        factory = APIRequestFactory()
+        request = factory.get("/api/warehouse/crud/counterparties/")
+        request.user = self.user
+
+        view = CounterpartyListCreateView.as_view()
+        response = view(request)
+
+        self.assertEqual(response.status_code, 200)
+        # Так как всего 105 контрагентов, они все должны поместиться на 1 странице (page_size=1000)
+        results = response.data.get("results", [])
+        self.assertEqual(len(results), 105)
+

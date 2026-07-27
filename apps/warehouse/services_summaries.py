@@ -15,9 +15,12 @@ from django.db.models import Sum
 from . import models
 from .services import effective_document_line_discount_percent
 
-# Какие накладные считаем «продажами за день»: все, кроме отклонённых.
-# (соответствует тому, что пользователь видит в списке продаж склада.)
-EXCLUDED_SALE_STATUSES = (models.Document.Status.REJECTED,)
+# Какие накладные НЕ считаем «продажами за день»: отклонённые, заявки на продажу и черновики.
+EXCLUDED_SALE_STATUSES = (
+    models.Document.Status.REJECTED,
+    models.Document.Status.SALE_REQUEST,
+    models.Document.Status.DRAFT,
+)
 
 TWOPLACES = Decimal("0.01")
 THREEPLACES = Decimal("0.001")

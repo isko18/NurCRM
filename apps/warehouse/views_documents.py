@@ -775,9 +775,29 @@ class WarehouseDetailView(CompanyBranchRestrictedMixin, generics.RetrieveUpdateD
         return self._filter_qs_company_branch(qs)
 
 
+class CounterpartyPagination(PageNumberPagination):
+    """
+    Пагинация для контрагентов (Склад -> Вкладка Контрагенты).
+    Позволяет передавать ?page_size= (до 10000) или ?page_size=all / 0 / -1.
+    По умолчанию отдаёт 1000 контрагентов на страницу (вместо системного ограничения в 100),
+    чтобы в списке на фронтенде отображались все контрагенты компании/агента (100+).
+    """
+    page_size = 1000
+    page_size_query_param = "page_size"
+    max_page_size = 10000
+
+    def get_page_size(self, request):
+        if self.page_size_query_param:
+            val = request.query_params.get(self.page_size_query_param)
+            if val in ("all", "0", "-1"):
+                return self.max_page_size
+        return super().get_page_size(request)
+
+
 class CounterpartyListCreateView(CompanyBranchRestrictedMixin, generics.ListCreateAPIView):
     queryset = models.Counterparty.objects.all()
     serializer_class = serializers_documents.CounterpartySerializer
+    pagination_class = CounterpartyPagination
     filter_backends = [DjangoFilterBackend, filters.SearchFilter]
     filterset_fields = ["agent", "type"]
     search_fields = ["name", "phone"]
