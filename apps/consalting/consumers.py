@@ -120,7 +120,14 @@ class ConsaltingFunnelConsumer(AsyncWebsocketConsumer):
 
     # ---- события Wazzup сообщений ----
     async def wazzup_event(self, event):
-        """Доставка событий Wazzup чата (новые сообщения и статусы)."""
+        """Доставка событий Wazzup чата (новые сообщения и статусы).
+
+        Исходящее сообщение не возвращаем его автору — у него уже есть локальное
+        эхо (ответ REST/ack), иначе получится дубликат.
+        """
+        origin = event.get("origin_user_id")
+        if origin and str(origin) == str(self.user_id):
+            return
         ev_data = event.get("event") or {}
         await self.send(json.dumps(ev_data))
 

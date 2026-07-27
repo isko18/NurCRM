@@ -159,8 +159,14 @@ class WazzupChatConsumer(AsyncWebsocketConsumer):
 
     async def wazzup_event(self, event):
         """
-        Пересылка события клиенту
+        Пересылка события клиенту.
+
+        Исходящее сообщение НЕ отправляем обратно его же автору — у отправителя
+        уже есть локальное эхо (ack), иначе он увидит своё сообщение дважды.
         """
+        origin = event.get("origin_user_id")
+        if origin and str(origin) == str(getattr(self.user, "id", "")):
+            return
         await self.send(text_data=json.dumps(event.get("event", {})))
 
     async def consalting_event(self, event):

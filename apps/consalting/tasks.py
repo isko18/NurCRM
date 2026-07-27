@@ -20,13 +20,9 @@ CLOSED_STATUSES = (LeadConsalting.Status.WON, LeadConsalting.Status.LOST)
 
 @shared_task
 def process_wazzup_webhook(payload):
-    """Тяжёлая обработка вебхука Wazzup вне HTTP-запроса.
-
-    Быстрая пред-трансляция сокетов уже выполнена синхронно в
-    ``WazzupConsaltingService.enqueue_webhook`` — здесь её пропускаем.
-    """
+    """Обработка вебхука Wazzup вне HTTP-запроса (БД + единственная сокет-трансляция)."""
     from .funnel.wazzup import WazzupConsaltingService
-    WazzupConsaltingService.handle_wazzup_webhook(payload, skip_fast_broadcast=True)
+    WazzupConsaltingService.handle_wazzup_webhook(payload)
 
 
 @shared_task

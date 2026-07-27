@@ -99,9 +99,14 @@ def _broadcast_message_status(company_id, wa_message, phone):
             pass
 
 
-def _broadcast_consalting_message(company_id, lead, wa_message, is_inbound, text, phone):
+def _broadcast_consalting_message(company_id, lead, wa_message, is_inbound, text, phone, origin_user_id=None):
     """
     Мгновенная трансляция события сообщения по WebSocket без задержек.
+
+    ``origin_user_id`` — id сотрудника, отправившего сообщение из CRM. Его
+    собственные соединения НЕ должны получить этот broadcast: у отправителя уже
+    есть локальное эхо (ack сокета / ответ REST), иначе он видит сообщение дважды.
+    Консьюмер отфильтровывает по этому полю (см. wazzup_event).
     """
     from channels.layers import get_channel_layer
     from asgiref.sync import async_to_sync
@@ -113,9 +118,9 @@ def _broadcast_consalting_message(company_id, lead, wa_message, is_inbound, text
     content_uri = getattr(wa_message, "content_uri", None)
     media_type = getattr(wa_message, "media_type", None)
 
-    # Dedup-ключ: для входящих — стабильный message_id от Wazzup (совпадает с
-    # быстрой пред-трансляцией), для исходящих — uuid строки (совпадает с
-    # последующим message_status; message_id исходящего меняется после ответа API).
+    # Dedup-ключ: для входящих — стабильный message_id от Wazzup, для исходящих —
+    # uuid строки (совпадает с последующим message_status; message_id исходящего
+    # меняется после ответа API).
     dedup_id = (wa_message.message_id if is_inbound else str(wa_message.id)) or str(wa_message.id)
     msg_payload = {
         "id": dedup_id,
@@ -136,6 +141,7 @@ def _broadcast_consalting_message(company_id, lead, wa_message, is_inbound, text
 
     event_envelope = {
         "type": "wazzup_event",
+        "origin_user_id": str(origin_user_id) if origin_user_id else None,
         "event": {
             "type": "new_message",
             "data": msg_payload
@@ -153,55 +159,6 @@ def _broadcast_consalting_message(company_id, lead, wa_message, is_inbound, text
             async_to_sync(layer.group_send)(g, event_envelope)
         except Exception as e:
             logger.warning("Failed to broadcast websocket event to %s: %s", g, e)
-
-
-def _broadcast_fast_wazzup_message(company_id, phone, message_id, text, content_uri=None, media_type=None, is_inbound=True, author_name=None):
-    """
-    Ультрабыстрая пред-трансляция события сообщения по WebSocket (до 10 мс) до начала тяжелых операций с базой данных.
-    """
-    from channels.layers import get_channel_layer
-    from asgiref.sync import async_to_sync
-
-    layer = get_channel_layer()
-    if not layer:
-        return
-
-    msg_payload = {
-        "id": message_id or f"msg_{uuid.uuid4().hex[:12]}",
-        "message_id": message_id,
-        "lead_id": "",
-        "chat_id": f"+{phone}" if not str(phone).startswith("+") else str(phone),
-        "text": text,
-        "content_uri": content_uri,
-        "contentUri": content_uri,
-        "media_type": media_type,
-        "type": media_type or "text",
-        "is_incoming": is_inbound,
-        "direction": "inbound" if is_inbound else "outbound",
-        "status": "read" if is_inbound else "sent",
-        "timestamp": timezone.now().isoformat(),
-        "contact_name": author_name or (f"+{phone}" if not str(phone).startswith("+") else str(phone)),
-    }
-
-    event_envelope = {
-        "type": "wazzup_event",
-        "event": {
-            "type": "new_message",
-            "data": msg_payload
-        }
-    }
-
-    groups = [
-        f"consalting_company_{company_id}",
-        f"wazzup_company_{company_id}",
-        _chat_group(phone),
-    ]
-
-    for g in groups:
-        try:
-            async_to_sync(layer.group_send)(g, event_envelope)
-        except Exception:
-            pass
 
 
 class WazzupConsaltingService:
@@ -269,9 +226,13 @@ class WazzupConsaltingService:
                 status=WhatsAppMessageConsalting.Status.PENDING
             )
 
-            # Мгновенная оптимистичная сокет-трансляция (0ms). Реальный вызов
+            # Мгновенная сокет-трансляция всем, КРОМЕ самого отправителя (у него
+            # уже есть локальное эхо: ack сокета / ответ REST). Реальный вызов
             # Wazzup API уходит в Celery — HTTP-воркер не блокируется сетью.
-            _broadcast_consalting_message(account.company_id, lead, wa_message, False, text, clean_phone)
+            _broadcast_consalting_message(
+                account.company_id, lead, wa_message, False, text, clean_phone,
+                origin_user_id=user.id if user else None,
+            )
 
             ActivityLogger.log(
                 lead=lead,
@@ -322,52 +283,25 @@ class WazzupConsaltingService:
 
     @staticmethod
     def enqueue_webhook(payload: dict):
-        """Быстрый приём вебхука: мгновенные сокеты + постановка тяжёлой обработки в Celery.
+        """Быстрый приём вебхука: постановка обработки в Celery и мгновенный возврат.
 
         Возвращает управление за единицы миллисекунд, чтобы Wazzup сразу получил
-        ``200`` и не придерживал следующие вебхуки. Полная обработка (БД,
-        автораспределение, уведомления) выполняется в ``process_wazzup_webhook``.
+        ``200`` и не придерживал следующие вебхуки. Вся обработка (БД,
+        автораспределение, уведомления и единственная сокет-трансляция каждого
+        сообщения) выполняется в ``process_wazzup_webhook``.
         """
         from apps.consalting.tasks import process_wazzup_webhook
-
-        for item in (payload.get("messages") or []):
-            try:
-                account = WazzupAccountConsalting.objects.filter(
-                    channel_id=item.get("channelId"), is_active=True
-                ).only("id", "company_id").first()
-                if not account:
-                    continue
-                message_id = str(item.get("messageId") or "").strip()
-                chat_id = item.get("chatId") or item.get("author") or ""
-                text = _media_placeholder(
-                    item.get("text") or "",
-                    item.get("type") or "",
-                    item.get("contentUri") or item.get("content_uri") or "",
-                )
-                _broadcast_fast_wazzup_message(
-                    company_id=account.company_id,
-                    phone=_normalize_phone(chat_id),
-                    message_id=message_id,
-                    text=text,
-                    content_uri=item.get("contentUri") or item.get("content_uri") or "",
-                    media_type=item.get("type") or "",
-                    is_inbound=item.get("isInbound", True),
-                    author_name=item.get("authorName") or "",
-                )
-            except Exception as e:
-                logger.warning("Wazzup fast pre-broadcast failed: %s", e)
-
         process_wazzup_webhook.delay(payload)
 
     @staticmethod
-    def handle_wazzup_webhook(payload: dict, skip_fast_broadcast: bool = False):
+    def handle_wazzup_webhook(payload: dict):
         """
         Обработка входящих сообщений и статусов от Wazzup Webhook.
         Атомарность, идемпотентность (external_id), автораспределение (Round-Robin/Least-Loaded) и персональные WS-уведомления.
 
-        ``skip_fast_broadcast=True`` — пропустить ультрабыструю пред-трансляцию
-        (она уже выполнена синхронно в :meth:`enqueue_webhook` перед постановкой
-        в очередь), чтобы не слать её дважды.
+        Каждое сообщение транслируется по WebSocket РОВНО один раз (см.
+        ``_broadcast_consalting_message`` ниже) — без отдельной пред-трансляции,
+        чтобы у клиента не появлялись дубликаты.
         """
         from apps.consalting.views import distribute_inbound_lead
 
@@ -401,19 +335,6 @@ class WazzupConsaltingService:
             clean_phone = _normalize_phone(chat_id)
             phone = f"+{clean_phone}" if not clean_phone.startswith("+") else clean_phone
             source_name = f"Wazzup ({account.integration_type})"
-
-            # ⚡ Ультрабыстрая предварительная сокет-трансляция (до 10 мс задержки!)
-            if not skip_fast_broadcast:
-                _broadcast_fast_wazzup_message(
-                    company_id=account.company_id,
-                    phone=clean_phone,
-                    message_id=message_id,
-                    text=text,
-                    content_uri=content_uri,
-                    media_type=media_type,
-                    is_inbound=is_inbound,
-                    author_name=author_name
-                )
 
             with transaction.atomic():
                 # Идемпотентная привязка/обновление входящей заявки (InboundLeadConsalting) по номеру телефона
