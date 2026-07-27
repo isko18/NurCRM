@@ -4068,14 +4068,13 @@ class BuildingCashFlowListCreateView(CompanyQuerysetMixin, generics.ListCreateAP
         return qs.order_by("-created_at")
 
     def perform_create(self, serializer):
-        with transaction.atomic():
-            cashbox = serializer.validated_data.get("cashbox")
-            if cashbox:
-                instance = serializer.save(company=cashbox.company, branch=cashbox.branch)
-            else:
-                instance = serializer.save()
-            # Проведённое движение → ПКО/РКО в 1С (no-op, если интеграция выключена).
-            sync_cashflow(instance, operation="create")
+        # Выгрузку в 1С делает post_save-сигнал на BuildingCashFlow (см. apps.py),
+        # он ловит все пути создания/одобрения кассы. Здесь только сохранение.
+        cashbox = serializer.validated_data.get("cashbox")
+        if cashbox:
+            serializer.save(company=cashbox.company, branch=cashbox.branch)
+        else:
+            serializer.save()
 
 
 class BuildingCashFlowDetailView(CompanyQuerysetMixin, generics.RetrieveUpdateDestroyAPIView):
@@ -4126,7 +4125,8 @@ class BuildingCashFlowBulkStatusUpdateView(CompanyQuerysetMixin, generics.Generi
         whens = [When(id=_id, then=Value(id_to_status[_id])) for _id in ids]
         qs.update(status=Case(*whens, output_field=CharField()))
 
-        # Одобренные движения → выгрузка в 1С (ПКО/РКО).
+        # qs.update() НЕ триггерит post_save-сигнал, поэтому одобренные движения
+        # выгружаем в 1С здесь явно (в остальных путях это делает сигнал в apps.py).
         approved_ids = [i for i in ids if id_to_status[i] == BuildingCashFlow.Status.APPROVED]
         if approved_ids:
             for cf in BuildingCashFlow.objects.filter(id__in=approved_ids).select_related("company", "cashbox"):

@@ -1,8 +1,5 @@
 import calendar
-import os
 from decimal import Decimal
-
-import httpx
 
 from django.db import transaction
 from django.utils import timezone
@@ -443,66 +440,34 @@ def reject_transfer(transfer: BuildingTransferRequest, actor, reason: str):
 @transaction.atomic
 def request_treaty_create_in_erp(treaty: BuildingTreaty, actor):
     """
-    Запросить создание договора в ERP.
+    Запросить создание договора в 1С через модуль интеграции (apps/onec).
 
-    Интеграция сделана безопасно: если ERP не настроена, просто фиксируем статус и ошибку.
+    Раньше это был синхронный HTTP-вызов по env BUILDING_ERP_*. Теперь договор
+    ставится в outbox 1С (идемпотентно, с ретраями), а поля treaty.erp_* остаются
+    как «представление» статуса выгрузки для фронта:
+      - REQUESTED       — поставлено в очередь на выгрузку в 1С;
+      - NOT_CONFIGURED  — интеграция с 1С выключена/не настроена для компании.
+    Финальный SYNCED проставит входящий callback проведения (этап inbound).
     """
     _require_treaty_perm(actor)
-    _same_company_or_raise(actor, treaty.residential_complex.company_id)
+    company_id = treaty.company_id or (
+        treaty.residential_complex.company_id if treaty.residential_complex_id else None
+    )
+    _same_company_or_raise(actor, company_id)
 
-    endpoint = (os.getenv("BUILDING_ERP_TREATY_ENDPOINT") or "").strip()
-    token = (os.getenv("BUILDING_ERP_TOKEN") or "").strip()
+    from .onec_bridge import sync_treaty
+
     now = timezone.now()
-
     treaty.erp_requested_at = now
-    if not endpoint:
+    rec = sync_treaty(treaty)
+    if rec is None:
         treaty.erp_sync_status = BuildingTreaty.ErpSyncStatus.NOT_CONFIGURED
-        treaty.erp_last_error = "ERP endpoint не настроен (env BUILDING_ERP_TREATY_ENDPOINT)."
-        treaty.save(update_fields=["erp_requested_at", "erp_sync_status", "erp_last_error", "updated_at"])
-        return treaty
-
-    # Помечаем как "requested" до попытки вызова
-    treaty.erp_sync_status = BuildingTreaty.ErpSyncStatus.REQUESTED
-    treaty.erp_last_error = ""
-    treaty.save(update_fields=["erp_requested_at", "erp_sync_status", "erp_last_error", "updated_at"])
-
-    payload = {
-        "id": str(treaty.id),
-        "number": treaty.number,
-        "title": treaty.title,
-        "description": treaty.description,
-        "amount": str(treaty.amount),
-        "status": treaty.status,
-        "residential_complex_id": str(treaty.residential_complex_id),
-        "residential_complex_name": getattr(treaty.residential_complex, "name", ""),
-        "client_id": str(treaty.client_id) if treaty.client_id else None,
-        "client_name": getattr(treaty.client, "name", None) if treaty.client_id else None,
-    }
-
-    headers = {"Content-Type": "application/json"}
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
-
-    try:
-        resp = httpx.post(endpoint, json=payload, headers=headers, timeout=30.0)
-        resp.raise_for_status()
-        data = {}
-        try:
-            data = resp.json() or {}
-        except Exception:
-            data = {}
-
-        treaty.erp_sync_status = BuildingTreaty.ErpSyncStatus.SYNCED
-        treaty.erp_external_id = (data.get("external_id") or data.get("id") or treaty.erp_external_id or "").strip()
+        treaty.erp_last_error = "Интеграция с 1С выключена или не настроена для компании."
+    else:
+        treaty.erp_sync_status = BuildingTreaty.ErpSyncStatus.REQUESTED
         treaty.erp_last_error = ""
-        treaty.erp_synced_at = now
-        treaty.save(update_fields=["erp_sync_status", "erp_external_id", "erp_last_error", "erp_synced_at", "updated_at"])
-        return treaty
-    except Exception as e:
-        treaty.erp_sync_status = BuildingTreaty.ErpSyncStatus.FAILED
-        treaty.erp_last_error = str(e)
-        treaty.save(update_fields=["erp_sync_status", "erp_last_error", "updated_at"])
-        return treaty
+    treaty.save(update_fields=["erp_requested_at", "erp_sync_status", "erp_last_error", "updated_at"])
+    return treaty
 
 
 @transaction.atomic

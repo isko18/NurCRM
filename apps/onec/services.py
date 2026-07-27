@@ -3,7 +3,9 @@ from __future__ import annotations
 import logging
 
 from django.db import transaction
+from django.utils import timezone
 
+from .events import document_posted
 from .models import OneCIntegration, OneCSyncRecord
 
 logger = logging.getLogger(__name__)
@@ -68,6 +70,26 @@ def enqueue_push(
 
     transaction.on_commit(lambda: _dispatch(rec.id))
     return rec
+
+
+def mark_posted(record: OneCSyncRecord, *, onec_id: str = "", number: str = "", posted_at=None) -> OneCSyncRecord:
+    """
+    Отметить запись как проведённую в 1С (по входящему callback'у) и уведомить
+    источник (сигнал document_posted) для write-back в его объект.
+    """
+    record.status = OneCSyncRecord.Status.POSTED
+    if onec_id:
+        record.onec_external_id = onec_id
+    if number:
+        record.onec_number = number
+    record.onec_posted_at = posted_at or timezone.now()
+    record.last_error = ""
+    record.save(update_fields=["status", "onec_external_id", "onec_number", "onec_posted_at", "last_error", "updated_at"])
+    try:
+        document_posted.send(sender=OneCSyncRecord, sync_record=record)
+    except Exception:
+        logger.exception("onec: обработчик document_posted упал для %s", record.id)
+    return record
 
 
 def _dispatch(sync_id):

@@ -80,3 +80,100 @@ def sync_cashflow(cashflow, *, operation: str = "create") -> None:
         operation=operation,
         onec_doc_type="ПКО" if is_income else "РКО",
     )
+
+
+def _treaty_company_id(treaty):
+    if getattr(treaty, "company_id", None):
+        return treaty.company_id
+    rc = getattr(treaty, "residential_complex", None)
+    return getattr(rc, "company_id", None)
+
+
+def sync_treaty(treaty, *, operation: str = "create"):
+    """
+    Договор → документ «Договор/Реализация» в 1С.
+
+    Возвращает OneCSyncRecord (или None, если интеграция выключена) — вызывающий код
+    использует это, чтобы выставить treaty.erp_sync_status (REQUESTED / NOT_CONFIGURED).
+    """
+    try:
+        from apps.onec.services import enqueue_push, get_active_integration
+    except Exception:
+        return None
+
+    company_id = _treaty_company_id(treaty)
+    integration = get_active_integration(company_id)
+    if not integration:
+        return None
+
+    rc = getattr(treaty, "residential_complex", None)
+    apartment = getattr(treaty, "apartment", None)
+    client = getattr(treaty, "client", None)
+    counterparty_name = (
+        getattr(client, "name", None) if treaty.client_id else (treaty.client_name or "")
+    )
+
+    payload = {
+        "external_id": str(treaty.id),
+        "source_type": "treaty",
+        "operation": operation,
+        "occurred_at": _iso(getattr(treaty, "signed_at", None) or treaty.created_at),
+        "number": treaty.number or "",
+        "title": treaty.title or "",
+        "description": treaty.description or "",
+        "amount": str(treaty.amount),
+        "currency": integration.currency,
+        "status": treaty.status,
+        "operation_type": treaty.operation_type,
+        "payment_type": treaty.payment_type,
+        "payment_mode": treaty.payment_mode,
+        "down_payment": str(treaty.down_payment),
+        "company": {"id": str(company_id) if company_id else None,
+                    "name": getattr(getattr(treaty, "company", None), "name", "")},
+        "residential_complex": (
+            {"id": str(treaty.residential_complex_id), "name": getattr(rc, "name", "")}
+            if treaty.residential_complex_id else None
+        ),
+        "apartment": (
+            {"id": str(treaty.apartment_id), "number": getattr(apartment, "number", "")}
+            if treaty.apartment_id else None
+        ),
+        "counterparty": {
+            "type": "client",
+            "id": str(treaty.client_id) if treaty.client_id else None,
+            "name": counterparty_name or "",
+        },
+    }
+
+    return enqueue_push(
+        company_id=company_id,
+        source_type="treaty",
+        source_id=treaty.id,
+        payload=payload,
+        endpoint="/documents/treaty",
+        operation=operation,
+        onec_doc_type="Договор",
+    )
+
+
+def on_document_posted(sender, sync_record=None, **kwargs):
+    """
+    Обработчик сигнала onec.document_posted: 1С подтвердила проведение документа.
+    Пишем результат обратно в building-объект (пока — договоры: erp_* → SYNCED).
+    """
+    if not sync_record:
+        return
+    if sync_record.source_type != "treaty":
+        return
+    try:
+        from .models import BuildingTreaty
+    except Exception:
+        return
+    treaty = BuildingTreaty.objects.filter(id=sync_record.source_id).first()
+    if not treaty:
+        return
+    treaty.erp_sync_status = BuildingTreaty.ErpSyncStatus.SYNCED
+    treaty.erp_external_id = sync_record.onec_external_id or treaty.erp_external_id
+    treaty.erp_synced_at = sync_record.onec_posted_at
+    treaty.erp_last_error = ""
+    treaty.save(update_fields=["erp_sync_status", "erp_external_id", "erp_synced_at", "erp_last_error", "updated_at"])

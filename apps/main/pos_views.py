@@ -853,8 +853,12 @@ def _parse_scale_barcode(barcode: str, mode: str = SCALE_BARCODE_MODE_AUTO,
             "mode": "weight",
         }
 
-    # Итоговый/прочие префиксы: в поле зашита СТОИМОСТЬ в сомах.
-    amount = Decimal(value_raw)
+    # Итоговый/прочие префиксы: в поле зашита СТОИМОСТЬ.
+    # Весы кодируют сумму как целое число тыйын (2 знака после запятой):
+    # на этикетке 38.00 сом → в штрихкоде поле «03800». Делим на 100.
+    amount = (Decimal(value_raw) / Decimal(100)).quantize(
+        Decimal("0.01"), rounding=ROUND_HALF_UP
+    )
 
     return {
         "prefix": prefix,
