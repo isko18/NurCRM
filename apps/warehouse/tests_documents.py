@@ -441,6 +441,11 @@ class DocumentsTests(TestCase):
         Проверяет, что проведение Заявки на продажу через API переводит документ в статус POSTED,
         а повторный вызов идемпотентно возвращает HTTP 200.
         """
+        self.user.company = self.company
+        self.user.branch = self.branch
+        self.user.role = "owner"
+        self.user.save()
+
         models.StockBalance.objects.create(warehouse=self.wh, product=self.prod, qty=Decimal("10.000"))
         cp = models.Counterparty.objects.create(
             name="Client Sale Request",

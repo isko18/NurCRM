@@ -62,24 +62,42 @@ def serialize_lead(lead) -> dict:
     }
 
 
+def reliable_group_send(messages):
+    """Разослать пачку событий по группам Channels.
+
+    ``messages`` — список ``(group_name, envelope)``. Доставка сама по себе
+    надёжна (проверено сквозным тестом); «потери» realtime были следствием потери
+    Celery-задач при общем брокере разных окружений — это исправлено изоляцией
+    брокера, а не здесь.
+    """
+    from channels.layers import get_channel_layer
+    from asgiref.sync import async_to_sync
+
+    msgs = [(g, e) for (g, e) in messages if g]
+    if not msgs:
+        return
+
+    layer = get_channel_layer()
+    if not layer:
+        return
+
+    for group, envelope in msgs:
+        try:
+            async_to_sync(layer.group_send)(group, envelope)
+        except Exception as e:  # pragma: no cover — realtime не должен ломать основной поток
+            logger.warning("reliable_group_send failed for %s: %s", group, e)
+
+
 def _send(groups, event_type, payload, handler):
-    try:
-        from channels.layers import get_channel_layer
-        from asgiref.sync import async_to_sync
-
-        layer = get_channel_layer()
-        if not layer:
-            return
-
-        body = {"type": handler, "event": event_type, "payload": payload}
-        seen = set()
-        for g in groups:
-            if not g or g in seen:
-                continue
-            seen.add(g)
-            async_to_sync(layer.group_send)(g, body)
-    except Exception as e:  # pragma: no cover — realtime не должен ломать основной поток
-        logger.warning("consalting realtime send failed: %s", e)
+    body = {"type": handler, "event": event_type, "payload": payload}
+    seen = set()
+    messages = []
+    for g in groups:
+        if not g or g in seen:
+            continue
+        seen.add(g)
+        messages.append((g, body))
+    reliable_group_send(messages)
 
 
 # ===== карточные события доски (company-group, с фильтром видимости в консьюмере) =====

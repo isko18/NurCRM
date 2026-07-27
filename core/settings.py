@@ -299,8 +299,12 @@ SIMPLE_JWT = {
 }
 
 
-CELERY_BROKER_URL = 'redis://localhost:6379/0'
-CELERY_RESULT_BACKEND = 'redis://localhost:6379/0'
+# ВАЖНО: у каждого окружения ДОЛЖЕН быть свой broker (отдельная Redis-БД).
+# Prod/staging/onec раньше делили db0 и одну очередь `celery` — задачи
+# раздавались по кругу воркерам разных кодовых баз, которые их не знают, и
+# терялись ~50% (pending навсегда, сообщения не отправлялись). Задаётся через env.
+CELERY_BROKER_URL = os.getenv('CELERY_BROKER_URL', 'redis://localhost:6379/0')
+CELERY_RESULT_BACKEND = os.getenv('CELERY_RESULT_BACKEND', CELERY_BROKER_URL)
 CELERY_ACCEPT_CONTENT = ['json']
 CELERY_TASK_SERIALIZER = 'json'
 
