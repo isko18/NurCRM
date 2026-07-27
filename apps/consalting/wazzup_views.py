@@ -75,6 +75,7 @@ class WazzupAccountConsaltingViewSet(viewsets.ModelViewSet):
             "url": absolute_url,
             "content_uri": absolute_url,
             "contentUri": absolute_url,
+            "media_url": absolute_url,
             "file_url": absolute_url,
             "name": file_obj.name,
         }, status=status.HTTP_201_CREATED)
@@ -116,6 +117,11 @@ class WazzupAccountConsaltingViewSet(viewsets.ModelViewSet):
         lead_id = request.data.get('lead_id')
         text = request.data.get('message') or request.data.get('text') or ""
         media_url = request.data.get('content_uri') or request.data.get('contentUri') or request.data.get('media_url') or request.data.get('file_url')
+
+        if not media_url and request.FILES:
+            upload_resp = self._handle_file_upload(request)
+            if upload_resp.status_code == status.HTTP_201_CREATED:
+                media_url = upload_resp.data.get('url')
 
         if not lead_id:
             return Response({"detail": "Укажите lead_id"}, status=status.HTTP_400_BAD_REQUEST)

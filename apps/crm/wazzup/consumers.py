@@ -13,7 +13,7 @@ def _handle_ws_send_message(user, data):
 
     lead_id = data.get("lead_id") or data.get("lead")
     text = data.get("text") or data.get("message") or ""
-    media_url = data.get("media_url")
+    media_url = data.get("media_url") or data.get("content_uri") or data.get("contentUri")
     account_id = data.get("account_id")
     phone = data.get("to") or data.get("phone")
 
