@@ -178,10 +178,13 @@ urlpatterns = [
     path('wazzup/credentials/', WazzupCredentialsView.as_view(), name='wazzup-credentials'),
     path('wazzup-credentials/', WazzupCredentialsView.as_view(), name='wazzup-credentials-alias'),
     path('wazzup/webhook/', WazzupWebhookConsaltingView.as_view(), name='wazzup-consalting-webhook'),
+    path('wazzup/upload/', WazzupAccountConsaltingViewSet.as_view({'post': 'upload_media_list'}), name='wazzup-upload-alias'),
+    path('wazzup-accounts/upload/', WazzupAccountConsaltingViewSet.as_view({'post': 'upload_media_list'}), name='wazzup-consalting-account-upload-list'),
     path('wazzup-accounts/', WazzupAccountConsaltingViewSet.as_view({'get': 'list', 'post': 'create'}), name='wazzup-consalting-accounts'),
     path('wazzup-accounts/<uuid:pk>/', WazzupAccountConsaltingViewSet.as_view({'get': 'retrieve', 'put': 'update', 'delete': 'destroy'}), name='wazzup-consalting-account-detail'),
     path('wazzup-accounts/<uuid:pk>/setup-webhook/', WazzupAccountConsaltingViewSet.as_view({'post': 'setup_webhook'}), name='wazzup-consalting-account-setup-webhook'),
     path('wazzup-accounts/<uuid:pk>/send-message/', WazzupAccountConsaltingViewSet.as_view({'post': 'send_message'}), name='wazzup-consalting-account-send-message'),
+    path('wazzup-accounts/<uuid:pk>/upload/', WazzupAccountConsaltingViewSet.as_view({'post': 'upload_media_detail'}), name='wazzup-consalting-account-upload-detail'),
 ]
 
 
