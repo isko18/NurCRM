@@ -67,6 +67,7 @@ api_urlpatterns = [
     path("api/media-proxy/", media_proxy, name="media-proxy"),
     path("api/version/", ClientVersionView.as_view(), name="client-version"),
     path('api/', include(apps_includes)),
+    path('', include(apps_includes)),
 ]
 
 # Основные пути проекта
