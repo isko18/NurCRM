@@ -66,13 +66,6 @@ def _broadcast_message_status(company_id, wa_message, phone):
     Матчится фронтом по ``id`` = uuid строки сообщения (стабилен, в отличие от
     ``message_id``, который после ответа Wazzup меняется на серверный id).
     """
-    from channels.layers import get_channel_layer
-    from asgiref.sync import async_to_sync
-
-    layer = get_channel_layer()
-    if not layer:
-        return
-
     event_envelope = {
         "type": "wazzup_event",
         "event": {
@@ -92,14 +85,10 @@ def _broadcast_message_status(company_id, wa_message, phone):
         f"wazzup_company_{company_id}",
         _chat_group(phone),
     ]
-    for g in groups:
-        try:
-            async_to_sync(layer.group_send)(g, event_envelope)
-        except Exception:
-            pass
+    realtime.reliable_group_send([(g, event_envelope) for g in groups])
 
 
-def _broadcast_consalting_message(company_id, lead, wa_message, is_inbound, text, phone, origin_user_id=None):
+def _broadcast_consalting_message(company_id, lead, wa_message, is_inbound, text, phone, origin_user_id=None, event_ts=None):
     """
     Мгновенная трансляция события сообщения по WebSocket без задержек.
 
@@ -107,16 +96,19 @@ def _broadcast_consalting_message(company_id, lead, wa_message, is_inbound, text
     собственные соединения НЕ должны получить этот broadcast: у отправителя уже
     есть локальное эхо (ack сокета / ответ REST), иначе он видит сообщение дважды.
     Консьюмер отфильтровывает по этому полю (см. wazzup_event).
+
+    ``event_ts`` — истинное время события (для входящих — ``dateTime`` из Wazzup),
+    чтобы фронт сортировал по нему и порядок не зависел от порядка обработки
+    (при concurrency несколько вебхуков обрабатываются параллельно). По умолчанию —
+    ``created_at`` записи (стабильнее, чем «сейчас» в момент рассылки).
     """
-    from channels.layers import get_channel_layer
-    from asgiref.sync import async_to_sync
-
-    layer = get_channel_layer()
-    if not layer:
-        return
-
     content_uri = getattr(wa_message, "content_uri", None)
     media_type = getattr(wa_message, "media_type", None)
+
+    ts = event_ts or (
+        wa_message.created_at.isoformat() if getattr(wa_message, "created_at", None)
+        else timezone.now().isoformat()
+    )
 
     # Dedup-ключ: для входящих — стабильный message_id от Wazzup, для исходящих —
     # uuid строки (совпадает с последующим message_status; message_id исходящего
@@ -135,7 +127,8 @@ def _broadcast_consalting_message(company_id, lead, wa_message, is_inbound, text
         "is_incoming": is_inbound,
         "direction": "inbound" if is_inbound else "outbound",
         "status": wa_message.status,
-        "timestamp": timezone.now().isoformat(),
+        "timestamp": ts,
+        "created_at": ts,
         "contact_name": lead.full_name,
     }
 
@@ -153,12 +146,7 @@ def _broadcast_consalting_message(company_id, lead, wa_message, is_inbound, text
         f"wazzup_company_{company_id}",
         _chat_group(phone),
     ]
-
-    for g in groups:
-        try:
-            async_to_sync(layer.group_send)(g, event_envelope)
-        except Exception as e:
-            logger.warning("Failed to broadcast websocket event to %s: %s", g, e)
+    realtime.reliable_group_send([(g, event_envelope) for g in groups])
 
 
 class WazzupConsaltingService:
@@ -323,6 +311,8 @@ class WazzupConsaltingService:
             media_type = item.get("type") or ""
             is_inbound = item.get("isInbound", True)
             author_name = item.get("authorName") or ""
+            # Истинное время сообщения от Wazzup — для сортировки на фронте
+            event_dt = item.get("dateTime") or item.get("dateTimeUtc") or ""
 
             # Обработка медиафайлов (фото, видео, голосовые, документы), если текст сообщения пустой
             text = _media_placeholder(text, media_type, content_uri)
@@ -462,7 +452,10 @@ class WazzupConsaltingService:
                 )
 
                 # Мгновенная трансляция нового сообщения по WebSocket (0ms задержка)
-                _broadcast_consalting_message(account.company_id, lead, wa_message, is_inbound, text, phone)
+                _broadcast_consalting_message(
+                    account.company_id, lead, wa_message, is_inbound, text, phone,
+                    event_ts=event_dt or None,
+                )
 
                 if msg_created:
                     ActivityLogger.log(

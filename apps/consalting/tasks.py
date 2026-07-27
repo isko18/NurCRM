@@ -114,20 +114,24 @@ def send_wazzup_message(self, wa_message_id, account_id, text, content_uri):
             return
 
     if res.status_code in (200, 201):
-        data = res.json() if res.content else {}
-        wz_id = data.get("messageId") or data.get("id")
-        if wz_id:
-            wa_message.message_id = str(wz_id)
+        try:
+            data = res.json() if res.content else {}
+            wz_id = data.get("messageId") or data.get("id")
+            if wz_id:
+                wa_message.message_id = str(wz_id)
+        except Exception as e:
+            logger.warning("send_wazzup_message: bad 200 body for %s: %s", wa_message_id, e)
         _finalize(S.SENT)
         try:
             WazzupConsaltingService.mark_chat_read(account, clean_phone)
         except Exception as e:
             logger.warning("mark_chat_read failed: %s", e)
-    elif res.status_code >= 500:
+    elif res.status_code == 429 or res.status_code >= 500:
+        # Rate limit / временный сбой Wazzup — ретраим, затем FAILED
         try:
             raise self.retry(exc=Exception(f"Wazzup {res.status_code}"))
         except self.MaxRetriesExceededError:
-            logger.error("send_wazzup_message: 5xx (final) for %s: %s", wa_message_id, res.text)
+            logger.error("send_wazzup_message: %s (final) for %s: %s", res.status_code, wa_message_id, res.text)
             _finalize(S.FAILED)
     else:
         logger.error("Wazzup API Error %s for %s: %s", res.status_code, wa_message_id, res.text)
