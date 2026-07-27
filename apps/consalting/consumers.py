@@ -51,9 +51,14 @@ class ConsaltingFunnelConsumer(AsyncWebsocketConsumer):
 
         self.company_group = f"consalting_company_{self.company_id}"
         self.user_group = f"consalting_user_{self.user_id}"
+        # Чат-события (new_message/message_status) шлются ровно в одну группу —
+        # см. chat_events_group() в funnel/wazzup.py. Подписываемся на неё, иначе
+        # доска не увидит сообщений.
+        self.chat_events_group = f"wazzup_company_{self.company_id}"
 
         await self.channel_layer.group_add(self.company_group, self.channel_name)
         await self.channel_layer.group_add(self.user_group, self.channel_name)
+        await self.channel_layer.group_add(self.chat_events_group, self.channel_name)
         await self.accept()
 
         logger.debug(
@@ -70,7 +75,11 @@ class ConsaltingFunnelConsumer(AsyncWebsocketConsumer):
         }))
 
     async def disconnect(self, code):
-        for group in (getattr(self, "company_group", None), getattr(self, "user_group", None)):
+        for group in (
+            getattr(self, "company_group", None),
+            getattr(self, "user_group", None),
+            getattr(self, "chat_events_group", None),
+        ):
             if group:
                 await self.channel_layer.group_discard(group, self.channel_name)
 

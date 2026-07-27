@@ -40,14 +40,18 @@ def _media_placeholder(text, media_type, content_uri):
     return "[Сообщение]"
 
 
-def _chat_group(phone):
-    """Имя группы канала для чата по номеру.
+def chat_events_group(company_id) -> str:
+    """ЕДИНСТВЕННАЯ группа для чат-событий (new_message / message_status).
 
-    В именах групп Channels допустимы только ASCII-буквоцифры, дефис,
-    подчёркивание и точка — символ ``+`` запрещён, и рассылка в
-    ``wazzup_chat_+7...`` молча падает. Поэтому всегда используем только цифры.
+    Раньше каждое сообщение слалось в три группы (``consalting_company_``,
+    ``wazzup_company_``, ``wazzup_chat_``), а чат-консьюмер подписан на все три —
+    и получал ОДНО сообщение ТРИЖДЫ (проверено: 3 копии на кадр). Это давало
+    тройной трафик и тройной ре-рендер на фронте, из-за чего переписка «тормозила».
+
+    Теперь чат-события идут ровно в одну группу, на которую подписаны оба
+    консьюмера (чат и канбан-воронка) → каждый сокет получает ровно одну копию.
     """
-    return f"wazzup_chat_{''.join(filter(str.isdigit, str(phone or '')))}"
+    return f"wazzup_company_{company_id}"
 
 
 def _normalize_phone(chat_id):
@@ -80,12 +84,7 @@ def _broadcast_message_status(company_id, wa_message, phone):
         },
     }
 
-    groups = [
-        f"consalting_company_{company_id}",
-        f"wazzup_company_{company_id}",
-        _chat_group(phone),
-    ]
-    realtime.reliable_group_send([(g, event_envelope) for g in groups])
+    realtime.reliable_group_send([(chat_events_group(company_id), event_envelope)])
 
 
 def _broadcast_consalting_message(company_id, lead, wa_message, is_inbound, text, phone, origin_user_id=None, event_ts=None):
@@ -142,12 +141,7 @@ def _broadcast_consalting_message(company_id, lead, wa_message, is_inbound, text
         }
     }
 
-    groups = [
-        f"consalting_company_{company_id}",
-        f"wazzup_company_{company_id}",
-        _chat_group(phone),
-    ]
-    realtime.reliable_group_send([(g, event_envelope) for g in groups])
+    realtime.reliable_group_send([(chat_events_group(company_id), event_envelope)])
 
 
 class WazzupConsaltingService:
@@ -223,49 +217,21 @@ class WazzupConsaltingService:
                 origin_user_id=user.id if user else None,
             )
 
-            ActivityLogger.log(
-                lead=lead,
-                activity_type=LeadActivityConsalting.Type.MESSAGE,
-                actor=user,
-                title="Wazzup (исходящее)",
-                body=text,
-                payload={
-                    "direction": "outbound",
-                    "message_id": message_id,
-                    "status": "pending",
-                    "channel_id": account.channel_id,
-                }
-            )
-
-            # Перевод статуса в работу ("in_work") при ответе менеджера
-            from apps.consalting.models import InboundLeadConsalting
-            clean_phone_10 = clean_phone[-10:] if len(clean_phone) >= 10 else clean_phone
-            inbound_lead = InboundLeadConsalting.objects.filter(
-                company_id=lead.company_id,
-                phone__icontains=clean_phone_10
-            ).exclude(
-                status__in=[InboundLeadConsalting.Status.CONVERTED, InboundLeadConsalting.Status.REJECTED]
-            ).first()
-
-            if inbound_lead and inbound_lead.status in [InboundLeadConsalting.Status.NEW, InboundLeadConsalting.Status.ASSIGNED]:
-                inbound_lead.status = InboundLeadConsalting.Status.IN_WORK
-                inbound_lead.save(update_fields=["status", "updated_at"])
-
-            if lead.status in ["new", "NEW"]:
-                lead.status = "in_work"
-                lead.save(update_fields=["status", "updated_at"])
-
-            # Обновляем канбан воронку через WebSocket (оптимистично)
-            realtime.lead_updated(lead)
-
-            # Реальная отправка в Wazzup — в фоне, после коммита транзакции.
-            from apps.consalting.tasks import send_wazzup_message
+            # Всё остальное (лента активности, перевод лида в «в работе»,
+            # обновление карточки канбана) НЕ нужно для мгновенной отрисовки чата
+            # и уходит в фон — критический путь до ack остаётся минимальным:
+            # одна вставка + одна рассылка + постановка задач.
+            from apps.consalting.tasks import send_wazzup_message, outbound_bookkeeping
             wa_id = str(wa_message.id)
             acc_id = str(account.id)
             out_text = text or ""
             out_uri = content_uri or ""
+            actor_id = str(user.id) if user else None
             transaction.on_commit(
                 lambda: send_wazzup_message.delay(wa_id, acc_id, out_text, out_uri)
+            )
+            transaction.on_commit(
+                lambda: outbound_bookkeeping.delay(wa_id, actor_id, account.channel_id or "")
             )
 
         return wa_message
@@ -484,70 +450,19 @@ class WazzupConsaltingService:
             else:
                 realtime.lead_updated(lead)
 
-            # Персональное системное уведомление менеджеру ("Сообщение от лида ...")
+            # Персональные системные уведомления — отдельной задачей.
+            # Для нераспределённого лида здесь создаётся Notification + WS-рассылка
+            # НА КАЖДОГО сотрудника компании; в горячем пути это занимало воркер и
+            # задерживало обработку следующих входящих сообщений.
             if is_inbound:
+                from apps.consalting.tasks import notify_inbound_message
                 target_owner = assigned_owner or lead.owner
-                from apps.main.realtime import create_and_publish_notification
-
-                if target_owner:
-                    logger.info(
-                        "[WAZZUP NOTIF] Inbound msg lead_id=%s, target_user_id=%s, group=notif_user_%s",
-                        lead.id, target_owner.id, target_owner.id
-                    )
-                    try:
-                        create_and_publish_notification(
-                            company=account.company,
-                            user=target_owner,
-                            title=f"📩 Сообщение от лида: {lead.full_name}",
-                            message=text[:120] if text else "Входящее медиасообщение",
-                            type="lead_message",
-                            level="info",
-                            url=f"/consalting/leads/{lead.id}",
-                            data={
-                                "lead_id": str(lead.id),
-                                "phone": phone
-                            }
-                        )
-                    except Exception as e:
-                        logger.warning("Failed to publish lead message system notification: %s", e)
-                else:
-                    company_users = User.objects.filter(company=account.company, is_active=True)
-                    logger.info(
-                        "[WAZZUP NOTIF] Unassigned lead_id=%s, broadcasting notification to %d company users",
-                        lead.id, company_users.count()
-                    )
-                    for u in company_users:
-                        try:
-                            create_and_publish_notification(
-                                company=account.company,
-                                user=u,
-                                title=f"📩 Сообщение от лида: {lead.full_name}",
-                                message=text[:120] if text else "Входящее медиасообщение",
-                                type="lead_message",
-                                level="info",
-                                url=f"/consalting/leads/{lead.id}",
-                                data={
-                                    "lead_id": str(lead.id),
-                                    "phone": phone
-                                }
-                            )
-                        except Exception as e:
-                            logger.warning("Failed to publish unassigned lead notification to user %s: %s", u.id, e)
-
-                    if target_owner:
-                        realtime.notify_user(
-                            target_owner.id,
-                            "lead.message_received",
-                            {
-                                "id": str(lead.id),
-                                "title": f"📩 Сообщение от лида: {lead.full_name}",
-                                "message": text[:120] if text else "Входящее медиасообщение",
-                                "full_name": lead.full_name,
-                                "phone": lead.phone,
-                                "lead_id": str(lead.id),
-                                "created_at": timezone.now().isoformat(),
-                            }
-                        )
+                notify_inbound_message.delay(
+                    str(lead.id),
+                    str(target_owner.id) if target_owner else None,
+                    (text or "")[:120],
+                    phone,
+                )
 
         # Обработка обновлений статусов сообщений
         for item in statuses:
