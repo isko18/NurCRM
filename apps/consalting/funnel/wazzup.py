@@ -403,6 +403,13 @@ class WazzupConsaltingService:
                     WhatsAppMessageConsalting.Direction.OUTBOUND
                 )
 
+                # Связываем входящую заявку с карточкой воронки. Без этого поле
+                # InboundLeadConsalting.lead оставалось пустым у всех заявок, и
+                # конверсия «источник → лид → сделка» не считалась в принципе.
+                if inbound_lead and not inbound_lead.lead_id:
+                    inbound_lead.lead = lead
+                    inbound_lead.save(update_fields=["lead", "updated_at"])
+
                 effective_msg_id = message_id if message_id else f"msg_{uuid.uuid4().hex[:12]}"
                 wa_message, msg_created = WhatsAppMessageConsalting.objects.get_or_create(
                     message_id=effective_msg_id,
