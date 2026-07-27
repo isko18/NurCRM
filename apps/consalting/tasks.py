@@ -26,10 +26,126 @@ def process_wazzup_webhook(payload):
 
 
 @shared_task
-def process_wazzup_webhook_side_effects(payload, realtime_result=None):
-    """Фоновая обработка тяжелых сайд-эффектов вебхука Wazzup (автораспределение, логгер, уведомления)."""
-    from .funnel.wazzup import WazzupConsaltingService
-    WazzupConsaltingService.handle_wazzup_webhook_side_effects(payload, realtime_result)
+def notify_inbound_message(lead_id, owner_id=None, text="", phone=""):
+    """Системные уведомления о входящем сообщении — вне горячего пути вебхука.
+
+    Если у лида есть владелец — уведомляем только его; иначе рассылаем всем
+    сотрудникам компании (это и есть дорогая часть: N вставок + N WS-рассылок).
+    """
+    from .models import LeadConsalting
+    from .funnel import realtime
+    from apps.users.models import User
+    from apps.main.realtime import create_and_publish_notification
+
+    lead = LeadConsalting.objects.select_related("company").filter(id=lead_id).first()
+    if not lead:
+        return
+
+    title = f"📩 Сообщение от лида: {lead.full_name}"
+    body = text or "Входящее медиасообщение"
+    common = dict(
+        company=lead.company,
+        title=title,
+        message=body,
+        type="lead_message",
+        level="info",
+        url=f"/consalting/leads/{lead.id}",
+        data={"lead_id": str(lead.id), "phone": phone},
+    )
+
+    owner = User.objects.filter(id=owner_id).first() if owner_id else None
+    if owner:
+        try:
+            create_and_publish_notification(user=owner, **common)
+        except Exception as e:
+            logger.warning("notify_inbound_message: owner notify failed: %s", e)
+        try:
+            realtime.notify_user(
+                owner.id,
+                "lead.message_received",
+                {
+                    "id": str(lead.id),
+                    "title": title,
+                    "message": body,
+                    "full_name": lead.full_name,
+                    "phone": lead.phone,
+                    "lead_id": str(lead.id),
+                    "created_at": timezone.now().isoformat(),
+                },
+            )
+        except Exception:
+            pass
+        return
+
+    for u in User.objects.filter(company=lead.company, is_active=True).iterator():
+        try:
+            create_and_publish_notification(user=u, **common)
+        except Exception as e:
+            logger.warning("notify_inbound_message: notify user %s failed: %s", u.id, e)
+
+
+@shared_task
+def outbound_bookkeeping(wa_message_id, user_id=None, channel_id=""):
+    """Побочный учёт исходящего сообщения — вне критического пути отправки.
+
+    Лента активности, перевод входящей заявки и лида в «в работе», обновление
+    карточки канбана. Ничего из этого не нужно, чтобы чат мгновенно показал
+    сообщение, поэтому выполняется фоном (иначе задерживало ack на десятки мс).
+    """
+    from .models import (
+        WhatsAppMessageConsalting, InboundLeadConsalting, LeadActivityConsalting,
+    )
+    from .funnel.activity import ActivityLogger
+    from .funnel import realtime
+    from apps.users.models import User
+
+    wa_message = (
+        WhatsAppMessageConsalting.objects.select_related("lead").filter(id=wa_message_id).first()
+    )
+    if not wa_message or not wa_message.lead:
+        return
+    lead = wa_message.lead
+    actor = User.objects.filter(id=user_id).first() if user_id else None
+
+    try:
+        ActivityLogger.log(
+            lead=lead,
+            activity_type=LeadActivityConsalting.Type.MESSAGE,
+            actor=actor,
+            title="Wazzup (исходящее)",
+            body=wa_message.text,
+            payload={
+                "direction": "outbound",
+                "message_id": wa_message.message_id,
+                "status": wa_message.status,
+                "channel_id": channel_id,
+            },
+        )
+    except Exception as e:
+        logger.warning("outbound_bookkeeping: activity log failed: %s", e)
+
+    clean_phone = "".join(filter(str.isdigit, lead.phone or ""))
+    clean_phone_10 = clean_phone[-10:] if len(clean_phone) >= 10 else clean_phone
+    if clean_phone_10:
+        inbound_lead = InboundLeadConsalting.objects.filter(
+            company_id=lead.company_id, phone__icontains=clean_phone_10
+        ).exclude(
+            status__in=[InboundLeadConsalting.Status.CONVERTED, InboundLeadConsalting.Status.REJECTED]
+        ).first()
+        if inbound_lead and inbound_lead.status in [
+            InboundLeadConsalting.Status.NEW, InboundLeadConsalting.Status.ASSIGNED
+        ]:
+            inbound_lead.status = InboundLeadConsalting.Status.IN_WORK
+            inbound_lead.save(update_fields=["status", "updated_at"])
+
+    if lead.status in ["new", "NEW"]:
+        lead.status = "in_work"
+        lead.save(update_fields=["status", "updated_at"])
+
+    try:
+        realtime.lead_updated(lead)
+    except Exception:
+        pass
 
 
 @shared_task(bind=True, acks_late=True, max_retries=3, default_retry_delay=5)

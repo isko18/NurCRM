@@ -16,6 +16,10 @@
   --dry-run    Только показать, что будет импортировано, без записи в БД
   --skip-duplicates Пропускать если товар с таким штрихкодом уже есть (по умолчанию True)
   --default-qty Количество по умолчанию для каждого товара (по умолчанию 50)
+  --merge-by-name   Один товар на наименование: первый ШК — основной, остальные уходят
+                    в доп. штрихкоды (main.ProductAlternateBarcode)
+  --merge-ignore-price  При группировке не учитывать цену (по умолчанию строки с одним
+                    наименованием, но разной ценой считаются разными товарами)
 """
 import re
 from decimal import Decimal, InvalidOperation
@@ -23,20 +27,32 @@ from decimal import Decimal, InvalidOperation
 from django.core.management.base import BaseCommand
 from django.db import transaction
 
-from apps.main.models import Product, Company
+from apps.main.models import Product, ProductAlternateBarcode, Company
 from apps.users.models import Branch
 
 
-def _col_index(headers, names, fallback_col=None):
-    """Найти индекс колонки по заголовку или вернуть fallback."""
+def _col_index(headers, names, fallback_col=None, exclude=()):
+    """
+    Найти индекс колонки по заголовку или вернуть fallback.
+    exclude — индексы уже занятых колонок: заголовки пересекаются («Штрих код»
+    содержит «код», «Цена закупки» содержит «цена»), и без этого одна и та же
+    колонка утекает сразу в два поля.
+    """
     if fallback_col is not None:
         return fallback_col
     headers_lower = [str(h).strip().lower() if h is not None else "" for h in headers]
     for name in names:
         for i, h in enumerate(headers_lower):
+            if i in exclude or not h:
+                continue
             if name in h or h in name:
                 return i
     return None
+
+
+def _norm_name(name):
+    """Ключ группировки по наименованию: регистр и лишние пробелы не различаем."""
+    return re.sub(r"\s+", " ", str(name or "").strip()).casefold()
 
 
 def _val(row, col, default=""):
@@ -78,6 +94,16 @@ class Command(BaseCommand):
         parser.add_argument("--skip-duplicates", action="store_true", default=True, help="Пропускать дубликаты по штрихкоду")
         parser.add_argument("--no-skip-duplicates", action="store_false", dest="skip_duplicates", help="Не пропускать дубликаты")
         parser.add_argument("--default-qty", type=float, default=50, help="Количество по умолчанию для каждого товара (по умолчанию 50)")
+        parser.add_argument(
+            "--merge-by-name",
+            action="store_true",
+            help="Один товар на наименование: первый ШК основной, остальные — доп. штрихкоды",
+        )
+        parser.add_argument(
+            "--merge-ignore-price",
+            action="store_true",
+            help="При --merge-by-name склеивать строки с одним именем даже при разной цене",
+        )
 
     def _extract_1c_binary_text(self, file_path):
         """Извлечь текст из бинарного дампа 1С (формат L\\x00). Возвращает rows или []."""
@@ -255,6 +281,8 @@ class Command(BaseCommand):
         dry_run = options["dry_run"]
         skip_duplicates = options["skip_duplicates"]
         default_qty = Decimal(str(options.get("default_qty", 50)))
+        merge_by_name = options.get("merge_by_name", False)
+        merge_ignore_price = options.get("merge_ignore_price", False)
 
         rows, wb_to_close = self._load_excel_rows(file_path)
         if rows is None:
@@ -283,30 +311,47 @@ class Command(BaseCommand):
             ["name", "название", "наименование", "товар"],
             options.get("name_col"),
         )
-        article_col = _col_index(
-            headers,
-            ["article", "артикул", "код"],
-            options.get("article_col"),
-        )
+        used = {c for c in (barcode_col, name_col) if c is not None}
+
         price_col = _col_index(
             headers,
             ["price", "цена", "цена продажи"],
             options.get("price_col"),
+            exclude=used,
         )
+        used |= {c for c in (price_col,) if c is not None}
+
         purchase_price_col = _col_index(
             headers,
-            ["purchase_price", "закупка", "цена закупки", "себестоимость"],
+            # Основы слов, а не полные формы: в выгрузках встречается и
+            # «Себестоимость», и «Закупочная», и «Цена закупки».
+            ["purchase_price", "себестоим", "закуп"],
             options.get("purchase_price_col"),
+            exclude=used,
         )
+        used |= {c for c in (purchase_price_col,) if c is not None}
+
+        article_col = _col_index(
+            headers,
+            ["article", "артикул", "код"],
+            options.get("article_col"),
+            exclude=used,
+        )
+        used |= {c for c in (article_col,) if c is not None}
+
         quantity_col = _col_index(
             headers,
             ["quantity", "количество", "остаток", "qty"],
             options.get("quantity_col"),
+            exclude=used,
         )
+        used |= {c for c in (quantity_col,) if c is not None}
+
         unit_col = _col_index(
             headers,
             ["unit", "единица", "ед. изм", "ед"],
             options.get("unit_col"),
+            exclude=used,
         )
 
         if barcode_col is None:
@@ -325,7 +370,11 @@ class Command(BaseCommand):
             )
             return
 
-        self.stdout.write(f"Колонки: barcode={barcode_col}, name={name_col}, article={article_col}, price={price_col}")
+        self.stdout.write(
+            f"Колонки: barcode={barcode_col}, name={name_col}, article={article_col}, "
+            f"price={price_col}, purchase_price={purchase_price_col}, "
+            f"quantity={quantity_col}, unit={unit_col}"
+        )
 
         try:
             company = Company.objects.get(id=company_id)
@@ -340,14 +389,21 @@ class Command(BaseCommand):
             except Branch.DoesNotExist:
                 self.stderr.write(self.style.WARNING(f"Филиал не найден: {branch_id}, импорт без филиала"))
 
-        existing_barcodes = set(
-            Product.objects.filter(company=company).exclude(barcode__in=(None, "")).values_list("barcode", flat=True)
-        )
+        # Занятые в компании штрихкоды: и основные, и дополнительные — товар ищем по обоим.
+        owner_by_barcode = {}
+        for bc, pid in Product.objects.filter(company=company).exclude(
+            barcode__in=(None, "")
+        ).values_list("barcode", "id"):
+            owner_by_barcode[bc] = pid
+        for bc, pid in ProductAlternateBarcode.objects.filter(company=company).values_list(
+            "barcode", "product_id"
+        ):
+            owner_by_barcode.setdefault(bc, pid)
 
-        created = 0
         skipped_no_barcode = 0
-        skipped_duplicate = 0
-        errors = []
+        seen_in_file = {}      # штрихкод -> ключ группы, куда он уже попал
+        groups = []            # порядок как в файле
+        by_key = {}
 
         for row_idx, row in enumerate(data_rows):
             row_num = header_row + 2 + row_idx
@@ -357,53 +413,163 @@ class Command(BaseCommand):
                 continue
 
             barcode = str(barcode).strip()
-            if skip_duplicates and barcode in existing_barcodes:
-                skipped_duplicate += 1
-                continue
-
             name = _val(row, name_col) if name_col is not None else barcode
             if not name:
                 name = f"Товар {barcode}"
 
-            article = _val(row, article_col) if article_col is not None else ""
             price = _decimal_val(row, price_col) if price_col is not None else Decimal("0")
-            purchase_price = _decimal_val(row, purchase_price_col) if purchase_price_col is not None else price
-            quantity = default_qty
-            unit = _val(row, unit_col) if unit_col is not None else "шт."
-            if not unit:
-                unit = "шт."
+
+            if merge_by_name:
+                key = (_norm_name(name),) if merge_ignore_price else (_norm_name(name), str(price))
+            else:
+                key = ("row", row_idx)
+
+            if barcode in seen_in_file:
+                # Один и тот же ШК в файле дважды — вторую строку игнорируем.
+                continue
+            seen_in_file[barcode] = key
+
+            group = by_key.get(key)
+            if group is None:
+                unit = _val(row, unit_col) if unit_col is not None else "шт."
+                group = {
+                    "row_num": row_num,
+                    "name": name,
+                    "article": _val(row, article_col) if article_col is not None else "",
+                    "price": price,
+                    "purchase_price": (
+                        _decimal_val(row, purchase_price_col)
+                        if purchase_price_col is not None
+                        else price
+                    ),
+                    "quantity": (
+                        _decimal_val(row, quantity_col, default_qty)
+                        if quantity_col is not None
+                        else default_qty
+                    ),
+                    "unit": unit or "шт.",
+                    "barcodes": [],
+                }
+                by_key[key] = group
+                groups.append(group)
+            elif quantity_col is not None:
+                # Остатки одного товара, разнесённые по строкам, складываем.
+                group["quantity"] += _decimal_val(row, quantity_col, Decimal("0"))
+
+            group["barcodes"].append(barcode)
+
+        merged_groups = sum(1 for g in groups if len(g["barcodes"]) > 1)
+        if merge_by_name:
+            self.stdout.write(
+                f"Группировка по наименованию{'' if merge_ignore_price else ' + цене'}: "
+                f"{len(groups)} товаров, из них {merged_groups} с несколькими штрихкодами"
+            )
+
+        created = 0
+        alt_created = 0
+        skipped_duplicate = 0
+        conflicts = []
+        errors = []
+
+        for group in groups:
+            codes = group["barcodes"]
+            name = group["name"]
+            row_num = group["row_num"]
+
+            # Уже есть товар с одним из этих кодов?
+            product_id = next((owner_by_barcode[b] for b in codes if b in owner_by_barcode), None)
+
+            if product_id is not None and skip_duplicates:
+                skipped_duplicate += 1
+                extra = [b for b in codes if b not in owner_by_barcode]
+                if extra:
+                    if dry_run:
+                        self.stdout.write(f"  [dry-run] +доп.ШК к существующему {name[:40]}: {', '.join(extra)}")
+                        alt_created += len(extra)
+                        for b in extra:
+                            owner_by_barcode[b] = product_id
+                    else:
+                        try:
+                            with transaction.atomic():
+                                ProductAlternateBarcode.objects.bulk_create(
+                                    [
+                                        ProductAlternateBarcode(
+                                            product_id=product_id, company=company, barcode=b
+                                        )
+                                        for b in extra
+                                    ]
+                                )
+                            alt_created += len(extra)
+                            for b in extra:
+                                owner_by_barcode[b] = product_id
+                        except Exception as e:
+                            errors.append((row_num, ", ".join(extra), str(e)))
+                continue
+
+            main_bc = codes[0]
+            alt_bcs = [b for b in codes[1:] if b not in owner_by_barcode]
+            taken = [b for b in codes[1:] if b in owner_by_barcode]
+            if taken:
+                conflicts.append((row_num, name, taken))
 
             if dry_run:
-                self.stdout.write(f"  [dry-run] {barcode} | {name[:40]} | {price}")
+                suffix = f" | доп.ШК: {', '.join(alt_bcs)}" if alt_bcs else ""
+                self.stdout.write(f"  [dry-run] {main_bc} | {name[:40]} | {group['price']}{suffix}")
                 created += 1
+                alt_created += len(alt_bcs)
+                for b in codes:
+                    owner_by_barcode[b] = "dry-run"
                 continue
+
+            price = group["price"]
+            purchase_price = group["purchase_price"]
+            article = group["article"]
+            unit = group["unit"]
 
             try:
                 with transaction.atomic():
-                    Product.objects.create(
+                    product = Product.objects.create(
                         company=company,
                         branch=branch,
                         name=name[:255],
-                        barcode=barcode,
+                        barcode=main_bc,
                         article=article[:64] if article else "",
                         price=price,
                         purchase_price=purchase_price,
                         markup_percent=Decimal("0") if purchase_price == 0 else ((price - purchase_price) / purchase_price * 100).quantize(Decimal("0.01")),
-                        quantity=quantity,
+                        quantity=group["quantity"],
                         unit=unit[:32] if unit else "шт.",
                         kind=Product.Kind.PRODUCT,
                     )
+                    if alt_bcs:
+                        ProductAlternateBarcode.objects.bulk_create(
+                            [
+                                ProductAlternateBarcode(product=product, company=company, barcode=b)
+                                for b in alt_bcs
+                            ]
+                        )
                 created += 1
-                existing_barcodes.add(barcode)
+                alt_created += len(alt_bcs)
+                for b in [main_bc] + alt_bcs:
+                    owner_by_barcode[b] = product.id
                 if created % 100 == 0:
                     self.stdout.write(f"  Импортировано: {created}")
             except Exception as e:
-                errors.append((row_num, barcode, str(e)))
+                errors.append((row_num, main_bc, str(e)))
 
         self.stdout.write(self.style.SUCCESS(f"\nИмпорт завершён."))
-        self.stdout.write(f"  Создано: {created}")
+        self.stdout.write(f"  Создано товаров: {created}")
+        self.stdout.write(f"  Доп. штрихкодов: {alt_created}")
         self.stdout.write(f"  Пропущено (нет штрихкода): {skipped_no_barcode}")
         self.stdout.write(f"  Пропущено (дубликат): {skipped_duplicate}")
+        if conflicts:
+            self.stderr.write(
+                self.style.WARNING(f"  ШК заняты другими товарами (не добавлены): {len(conflicts)}")
+            )
+            for rn, nm, bcs in conflicts[:10]:
+                self.stderr.write(f"    Строка {rn}, {nm[:40]}: {', '.join(bcs)}")
+            if len(conflicts) > 10:
+                self.stderr.write(f"    ... и ещё {len(conflicts) - 10}")
         if errors:
             self.stderr.write(self.style.WARNING(f"  Ошибок: {len(errors)}"))
             for rn, bc, err in errors[:10]:

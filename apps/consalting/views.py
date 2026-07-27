@@ -375,6 +375,72 @@ class SaleConsaltingAnalyticsView(CompanyBranchQuerysetMixin, generics.GenericAP
         return Response(data)
 
 
+class _ConsaltingAnalyticsBase(CompanyBranchQuerysetMixin, generics.GenericAPIView):
+    """Общий разбор параметров для операционных отчётов консалтинга."""
+    queryset = LeadConsalting.objects.all()
+    serializer_class = LeadConsaltingSerializer
+
+    def _params(self, request):
+        company = self._user_company()
+        if not company:
+            raise PermissionDenied("У пользователя не настроена компания.")
+        p = request.query_params
+        return company, {
+            "date_from": p.get("period_start") or p.get("date_from") or None,
+            "date_to": p.get("period_end") or p.get("date_to") or None,
+            "branch": p.get("branch") or None,
+        }
+
+
+class ConsaltingDashboardAnalyticsView(_ConsaltingAnalyticsBase):
+    """Сводная аналитика консалтинга + сравнение с предыдущим периодом.
+
+    GET /api/consalting/analytics/dashboard/?date_from=&date_to=&branch=
+    """
+
+    def get(self, request, *args, **kwargs):
+        from .funnel.analytics_ops import DashboardAnalytics
+        company, kw = self._params(request)
+        return Response(DashboardAnalytics.compute(company, **kw))
+
+
+class ConsaltingMessengerAnalyticsView(_ConsaltingAnalyticsBase):
+    """Аналитика переписки WhatsApp/Wazzup: скорость ответа, объём, неотвеченные.
+
+    GET /api/consalting/analytics/messenger/?date_from=&date_to=&branch=&owner=
+    """
+
+    def get(self, request, *args, **kwargs):
+        from .funnel.analytics_ops import MessengerAnalytics
+        company, kw = self._params(request)
+        kw["owner"] = request.query_params.get("owner") or None
+        return Response(MessengerAnalytics.compute(company, **kw))
+
+
+class ConsaltingSourceAnalyticsView(_ConsaltingAnalyticsBase):
+    """Источники заявок и их конверсия в лид/сделку.
+
+    GET /api/consalting/analytics/sources/?date_from=&date_to=&branch=
+    """
+
+    def get(self, request, *args, **kwargs):
+        from .funnel.analytics_ops import SourceAnalytics
+        company, kw = self._params(request)
+        return Response(SourceAnalytics.compute(company, **kw))
+
+
+class ConsaltingManagerAnalyticsView(_ConsaltingAnalyticsBase):
+    """Нагрузка и результативность сотрудников по лидам.
+
+    GET /api/consalting/analytics/managers/?date_from=&date_to=&branch=
+    """
+
+    def get(self, request, *args, **kwargs):
+        from .funnel.analytics_ops import ManagerAnalytics
+        company, kw = self._params(request)
+        return Response(ManagerAnalytics.compute(company, **kw))
+
+
 
 # ==========================
 # SalaryConsalting

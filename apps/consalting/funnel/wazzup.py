@@ -40,14 +40,18 @@ def _media_placeholder(text, media_type, content_uri):
     return "[Сообщение]"
 
 
-def _chat_group(phone):
-    """Имя группы канала для чата по номеру.
+def chat_events_group(company_id) -> str:
+    """ЕДИНСТВЕННАЯ группа для чат-событий (new_message / message_status).
 
-    В именах групп Channels допустимы только ASCII-буквоцифры, дефис,
-    подчёркивание и точка — символ ``+`` запрещён, и рассылка в
-    ``wazzup_chat_+7...`` молча падает. Поэтому всегда используем только цифры.
+    Раньше каждое сообщение слалось в три группы (``consalting_company_``,
+    ``wazzup_company_``, ``wazzup_chat_``), а чат-консьюмер подписан на все три —
+    и получал ОДНО сообщение ТРИЖДЫ (проверено: 3 копии на кадр). Это давало
+    тройной трафик и тройной ре-рендер на фронте, из-за чего переписка «тормозила».
+
+    Теперь чат-события идут ровно в одну группу, на которую подписаны оба
+    консьюмера (чат и канбан-воронка) → каждый сокет получает ровно одну копию.
     """
-    return f"wazzup_chat_{''.join(filter(str.isdigit, str(phone or '')))}"
+    return f"wazzup_company_{company_id}"
 
 
 def _normalize_phone(chat_id):
@@ -80,12 +84,7 @@ def _broadcast_message_status(company_id, wa_message, phone):
         },
     }
 
-    groups = [
-        f"consalting_company_{company_id}",
-        f"wazzup_company_{company_id}",
-        _chat_group(phone),
-    ]
-    realtime.reliable_group_send([(g, event_envelope) for g in groups])
+    realtime.reliable_group_send([(chat_events_group(company_id), event_envelope)])
 
 
 def _broadcast_consalting_message(company_id, lead, wa_message, is_inbound, text, phone, origin_user_id=None, event_ts=None):
@@ -110,10 +109,11 @@ def _broadcast_consalting_message(company_id, lead, wa_message, is_inbound, text
         else timezone.now().isoformat()
     )
 
-    # Dedup-ключ: для входящих — стабильный message_id от Wazzup, для исходящих —
-    # uuid строки (совпадает с последующим message_status; message_id исходящего
-    # меняется после ответа API).
-    dedup_id = (wa_message.message_id if is_inbound else str(wa_message.id)) or str(wa_message.id)
+    # id == uuid строки для ВСЕХ сообщений (входящих и исходящих) — совпадает с
+    # `id` из REST-истории (сериализатор отдаёт pk) и с последующим
+    # message_status, чтобы фронт мёржил сокет и REST по одному ключу без дублей.
+    # (Wazzup message_id идёт отдельным полем `message_id`.)
+    dedup_id = str(wa_message.id)
     msg_payload = {
         "id": dedup_id,
         "message_id": wa_message.message_id,
@@ -141,12 +141,7 @@ def _broadcast_consalting_message(company_id, lead, wa_message, is_inbound, text
         }
     }
 
-    groups = [
-        f"consalting_company_{company_id}",
-        f"wazzup_company_{company_id}",
-        _chat_group(phone),
-    ]
-    realtime.reliable_group_send([(g, event_envelope) for g in groups])
+    realtime.reliable_group_send([(chat_events_group(company_id), event_envelope)])
 
 
 class WazzupConsaltingService:
@@ -229,6 +224,7 @@ class WazzupConsaltingService:
                 )
             )
 
+<<<<<<< HEAD
             ActivityLogger.log(
                 lead=lead,
                 activity_type=LeadActivityConsalting.Type.MESSAGE,
@@ -270,8 +266,23 @@ class WazzupConsaltingService:
             acc_id = str(account.id)
             out_t = text or ""
             out_u = content_uri or ""
+=======
+            # Всё остальное (лента активности, перевод лида в «в работе»,
+            # обновление карточки канбана) НЕ нужно для мгновенной отрисовки чата
+            # и уходит в фон — критический путь до ack остаётся минимальным:
+            # одна вставка + одна рассылка + постановка задач.
+            from apps.consalting.tasks import send_wazzup_message, outbound_bookkeeping
+            wa_id = str(wa_message.id)
+            acc_id = str(account.id)
+            out_text = text or ""
+            out_uri = content_uri or ""
+            actor_id = str(user.id) if user else None
+>>>>>>> 84508700187a114ed6bd3ec3296663776f91387d
             transaction.on_commit(
                 lambda: send_wazzup_message.delay(wa_id, acc_id, out_t, out_u)
+            )
+            transaction.on_commit(
+                lambda: outbound_bookkeeping.delay(wa_id, actor_id, account.channel_id or "")
             )
 
         return wa_message
@@ -428,6 +439,13 @@ class WazzupConsaltingService:
                     if is_inbound else
                     WhatsAppMessageConsalting.Direction.OUTBOUND
                 )
+
+                # Связываем входящую заявку с карточкой воронки. Без этого поле
+                # InboundLeadConsalting.lead оставалось пустым у всех заявок, и
+                # конверсия «источник → лид → сделка» не считалась в принципе.
+                if inbound_lead and not inbound_lead.lead_id:
+                    inbound_lead.lead = lead
+                    inbound_lead.save(update_fields=["lead", "updated_at"])
 
                 effective_msg_id = message_id if message_id else f"msg_{uuid.uuid4().hex[:12]}"
                 try:
@@ -586,47 +604,19 @@ class WazzupConsaltingService:
             else:
                 realtime.lead_updated(lead)
 
-            # Системное уведомление менеджеру
+            # Персональные системные уведомления — отдельной задачей.
+            # Для нераспределённого лида здесь создаётся Notification + WS-рассылка
+            # НА КАЖДОГО сотрудника компании; в горячем пути это занимало воркер и
+            # задерживало обработку следующих входящих сообщений.
             if is_inbound:
+                from apps.consalting.tasks import notify_inbound_message
                 target_owner = assigned_owner or lead.owner
-                account = WazzupAccountConsalting.objects.filter(company=lead.company, is_active=True).first()
-                if target_owner:
-                    try:
-                        create_and_publish_notification(
-                            company=lead.company,
-                            user=target_owner,
-                            title=f"📩 Сообщение от лида: {lead.full_name}",
-                            message=text[:120] if text else "Входящее медиасообщение",
-                            type="lead_message",
-                            level="info",
-                            url=f"/consalting/leads/{lead.id}",
-                            data={"lead_id": str(lead.id), "phone": phone}
-                        )
-                    except Exception as e:
-                        logger.warning("Failed to publish lead message system notification: %s", e)
-                else:
-                    company_users = User.objects.filter(company=lead.company, is_active=True)
-                    for u in company_users:
-                        try:
-                            create_and_publish_notification(
-                                company=lead.company,
-                                user=u,
-                                title=f"📩 Сообщение от лида: {lead.full_name}",
-                                message=text[:120] if text else "Входящее медиасообщение",
-                                type="lead_message",
-                                level="info",
-                                url=f"/consalting/leads/{lead.id}",
-                                data={"lead_id": str(lead.id), "phone": phone}
-                            )
-                        except Exception as e:
-                            logger.warning("Failed to publish unassigned lead notification to user %s: %s", u.id, e)
-
-        # 2. Обновление статусов
-        for st_item in processed_statuses:
-            if st_item.get("lead_id"):
-                l_obj = LeadConsalting.objects.filter(id=st_item["lead_id"]).first()
-                if l_obj:
-                    realtime.lead_updated(l_obj)
+                notify_inbound_message.delay(
+                    str(lead.id),
+                    str(target_owner.id) if target_owner else None,
+                    (text or "")[:120],
+                    phone,
+                )
 
     @staticmethod
     def handle_wazzup_webhook(payload: dict):

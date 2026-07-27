@@ -5,6 +5,10 @@ from .views import (
     SaleConsaltingListCreateView,
     SaleConsaltingRetrieveUpdateDestroyView,
     SaleConsaltingAnalyticsView,
+    ConsaltingDashboardAnalyticsView,
+    ConsaltingMessengerAnalyticsView,
+    ConsaltingSourceAnalyticsView,
+    ConsaltingManagerAnalyticsView,
     SalaryConsaltingListCreateView,
     SalaryConsaltingRetrieveUpdateDestroyView,
     RequestsConsaltingListCreateView,
@@ -94,6 +98,11 @@ urlpatterns = [
     path('services/<uuid:pk>/', ServicesConsaltingRetrieveUpdateDestroyView.as_view(), name='services-rud'),
 
     path('analytics/', SaleConsaltingAnalyticsView.as_view(), name='consulting-analytics'),
+    # операционная аналитика (мессенджер, источники, менеджеры, сводка)
+    path('analytics/dashboard/', ConsaltingDashboardAnalyticsView.as_view(), name='consalting-analytics-dashboard'),
+    path('analytics/messenger/', ConsaltingMessengerAnalyticsView.as_view(), name='consalting-analytics-messenger'),
+    path('analytics/sources/', ConsaltingSourceAnalyticsView.as_view(), name='consalting-analytics-sources'),
+    path('analytics/managers/', ConsaltingManagerAnalyticsView.as_view(), name='consalting-analytics-managers'),
     path('sales/', SaleConsaltingListCreateView.as_view(), name='sales-list-create'),
     path('sales/analytics/', SaleConsaltingAnalyticsView.as_view(), name='sales-analytics'),
     path('sales/<uuid:pk>/', SaleConsaltingRetrieveUpdateDestroyView.as_view(), name='sales-rud'),
