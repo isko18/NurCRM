@@ -1997,6 +1997,8 @@ class ServiceSalaryRateUpdateView(CompanyBranchQuerysetMixin, generics.GenericAP
             raise PermissionDenied("Управлять ставками может только руководитель.")
 
         svc = get_object_or_404(ServicesConsalting, pk=service_id, company=company)
+        from decimal import Decimal, InvalidOperation
+
         percent = request.data.get("percent", 0)
         try:
             percent_dec = Decimal(str(percent))
