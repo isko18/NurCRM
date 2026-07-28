@@ -224,7 +224,6 @@ class WazzupConsaltingService:
                 )
             )
 
-<<<<<<< HEAD
             ActivityLogger.log(
                 lead=lead,
                 activity_type=LeadActivityConsalting.Type.MESSAGE,
@@ -266,23 +265,8 @@ class WazzupConsaltingService:
             acc_id = str(account.id)
             out_t = text or ""
             out_u = content_uri or ""
-=======
-            # Всё остальное (лента активности, перевод лида в «в работе»,
-            # обновление карточки канбана) НЕ нужно для мгновенной отрисовки чата
-            # и уходит в фон — критический путь до ack остаётся минимальным:
-            # одна вставка + одна рассылка + постановка задач.
-            from apps.consalting.tasks import send_wazzup_message, outbound_bookkeeping
-            wa_id = str(wa_message.id)
-            acc_id = str(account.id)
-            out_text = text or ""
-            out_uri = content_uri or ""
-            actor_id = str(user.id) if user else None
->>>>>>> 84508700187a114ed6bd3ec3296663776f91387d
             transaction.on_commit(
                 lambda: send_wazzup_message.delay(wa_id, acc_id, out_t, out_u)
-            )
-            transaction.on_commit(
-                lambda: outbound_bookkeeping.delay(wa_id, actor_id, account.channel_id or "")
             )
 
         return wa_message
