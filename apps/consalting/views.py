@@ -2027,7 +2027,7 @@ class SalaryAccrualListView(CompanyBranchQuerysetMixin, generics.ListAPIView):
     """GET /api/consalting/salary/accruals/ — список начислений зарплаты."""
     serializer_class = SalaryAccrualConsaltingSerializer
     filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
-    filterset_fields = ["service", "status", "user"]
+    filterset_fields = ["service", "user"]  # status обрабатывается вручную (см. get_queryset)
     search_fields = ["user__first_name", "user__last_name", "user__email", "service__name"]
     ordering_fields = ["created_at", "amount"]
     ordering = ["-created_at"]
@@ -2040,13 +2040,33 @@ class SalaryAccrualListView(CompanyBranchQuerysetMixin, generics.ListAPIView):
         if not is_owner_like(self.request.user):
             qs = qs.filter(user=self.request.user)
 
+        # Фильтр по дате
         date_from = self.request.query_params.get("date_from") or self.request.query_params.get("period_start")
         date_to = self.request.query_params.get("date_to") or self.request.query_params.get("period_end")
         if date_from:
             qs = qs.filter(created_at__date__gte=date_from)
         if date_to:
             qs = qs.filter(created_at__date__lte=date_to)
+
+        # Фильтр по статусу — обрабатываем вручную, чтобы поддержать значение "pending"
+        # Фронтенд отправляет "pending" для фильтра "Ожидает".
+        # В БД старые записи хранятся как "accrued" (до добавления статуса pending),
+        # поэтому "pending" включает оба значения.
+        status = self.request.query_params.get("status")
+        if status:
+            valid_statuses = {s.value for s in SalaryAccrualConsalting.Status}
+            if status == SalaryAccrualConsalting.Status.PENDING:
+                # "Ожидает" = записи со статусом pending или accrued (ещё не выплачено)
+                qs = qs.filter(status__in=[
+                    SalaryAccrualConsalting.Status.PENDING,
+                    SalaryAccrualConsalting.Status.ACCRUED,
+                ])
+            elif status in valid_statuses:
+                qs = qs.filter(status=status)
+            # Если пришло невалидное значение — игнорируем (не возвращаем 400)
+
         return qs
+
 
 
 class SalarySummaryView(CompanyBranchQuerysetMixin, generics.GenericAPIView):

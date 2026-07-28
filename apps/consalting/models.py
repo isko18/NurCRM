@@ -1532,6 +1532,7 @@ class SalaryPayoutConsalting(TimeStampedModel):
 class SalaryAccrualConsalting(TimeStampedModel):
     """Автоматическое начисление зарплаты продавцу с закрытой продажи / лида."""
     class Status(models.TextChoices):
+        PENDING = "pending", "Ожидает"
         ACCRUED = "accrued", "Начислено"
         PAID = "paid", "Выплачено"
         CANCELED = "canceled", "Отменено"
