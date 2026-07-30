@@ -333,6 +333,10 @@ CELERY_BEAT_SCHEDULE = {
         'task': 'apps.consalting.tasks.scan_unanswered_leads',
         'schedule': crontab(minute='*'),
     },
+    'consalting-send-inbound-lead-reminders': {
+        'task': 'apps.consalting.tasks.send_inbound_lead_reminders',
+        'schedule': crontab(minute='*/5'),
+    },
     # Ежедневная полная синхронизация каталога товаров с внешней системой.
     # Досылает все товары (product.updated), логирует товары без фото.
     # Запускается каждые 2 дня в 03:00 по Asia/Bishkek.

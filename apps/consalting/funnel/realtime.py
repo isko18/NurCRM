@@ -117,6 +117,15 @@ def lead_updated(lead):
     _broadcast(lead, "lead.updated")
 
 
+def lead_moved(lead):
+    _broadcast(lead, "lead.moved")
+
+
+def broadcast_board_update(funnel_id_or_lead):
+    if hasattr(funnel_id_or_lead, "company_id"):
+        _broadcast(funnel_id_or_lead, "board.updated")
+
+
 def lead_claimed(lead):
     """Лид «взят» сотрудником: owner назначен → у остальных карточка исчезает."""
     _broadcast(lead, "lead.claimed")

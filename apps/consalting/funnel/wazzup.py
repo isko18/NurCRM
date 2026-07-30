@@ -40,6 +40,23 @@ def _media_placeholder(text, media_type, content_uri):
     return "[Сообщение]"
 
 
+def check_and_set_first_reply(phone=None, lead=None, company_id=None):
+    """Фиксирует время первого исходящего ответа по входящему лиду."""
+    try:
+        from apps.consalting.models import InboundLeadConsalting
+        from django.utils import timezone
+        now = timezone.now()
+        qs = InboundLeadConsalting.objects.filter(first_reply_at__isnull=True)
+        if company_id:
+            qs = qs.filter(company_id=company_id)
+        if lead:
+            qs.filter(lead=lead).update(first_reply_at=now)
+        if phone:
+            qs.filter(phone=phone).update(first_reply_at=now)
+    except Exception as e:
+        logger.warning("check_and_set_first_reply error: %s", e)
+
+
 def chat_events_group(company_id) -> str:
     """ЕДИНСТВЕННАЯ группа для чат-событий (new_message / message_status).
 
@@ -208,6 +225,7 @@ class WazzupConsaltingService:
                 content_uri=content_uri,
                 status=WhatsAppMessageConsalting.Status.PENDING
             )
+            check_and_set_first_reply(phone=clean_phone, lead=lead, company_id=account.company_id)
 
             # Трансляция по WebSocket после коммита транзакции всем, КРОМЕ самого отправителя.
             acc_company_id = account.company_id
@@ -452,6 +470,8 @@ class WazzupConsaltingService:
                     msg_created = False
 
                 if wa_message and msg_created:
+                    if not is_inbound:
+                        check_and_set_first_reply(phone=phone, lead=lead, company_id=account.company_id)
                     # Трансляция по WebSocket мгновенно ПОСЛЕ коммита транзакции
                     acc_cid = account.company_id
                     l_obj = lead

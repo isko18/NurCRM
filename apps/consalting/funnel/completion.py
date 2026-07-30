@@ -75,14 +75,49 @@ def apply_completion_side_effects(lead, actor=None):
                     subscription_period=sub_period if (sub_amount or 0) > 0 else "",
                     subscription_started_at=sub_started,
                 )
+
+                from .cash_confirmation import needs_confirmation
+                from ..models import CashRequestConsalting, CashOperationConsalting
+
+                payment_mode = getattr(lead, "payment_mode", None) or "cash"
+                author = lead.owner or actor
+                if needs_confirmation(lead.company, payment_mode, author):
+                    sale.status = SaleConsalting.Status.PENDING_CONFIRMATION
+                    sale.save(update_fields=["status"])
+                    CashRequestConsalting.objects.create(
+                        company=lead.company,
+                        sale=sale,
+                        user=author,
+                        client=lead.client,
+                        kind=CashRequestConsalting.Kind.SALE,
+                        direction="income",
+                        amount=sale.total,
+                        payment_method=payment_mode,
+                        status=CashRequestConsalting.Status.PENDING,
+                    )
+                else:
+                    sale.status = SaleConsalting.Status.COMPLETED
+                    sale.save(update_fields=["status"])
+                    CashOperationConsalting.objects.create(
+                        company=lead.company,
+                        user=author,
+                        kind=CashOperationConsalting.Kind.SALE,
+                        direction=CashOperationConsalting.Direction.INCOME,
+                        amount=sale.total,
+                        payment_method=payment_mode,
+                        comment=f"Продажа из лида: {lead.title}",
+                    )
             else:
                 sale = existing_sale
 
-            # 3. Авто-начисление зарплаты продавцу по ставке услуги
+            # 3. Авто-создание абонентской подписки и графика платежей (§5.3)
+            create_sale_side_effects(sale)
+
+            # 4. Авто-начисление зарплаты продавцу по ставке услуги
             seller = lead.owner or actor
             accrue_salary_for_sale(sale, seller=seller)
 
-            # 4. Реалтайм-уведомления
+            # 5. Реалтайм-уведомления
             realtime.lead_moved(lead)
             if lead.owner_id:
                 realtime.notify_user(
@@ -97,12 +132,114 @@ def apply_completion_side_effects(lead, actor=None):
         return None
 
 
+def generate_schedule(sub, horizon_months=12):
+    """Плановые платежи вперёд на горизонт (§5.3). Продлевается ежедневной задачей."""
+    from dateutil.relativedelta import relativedelta
+    from ..models import SubscriptionPaymentConsalting
+
+    step = relativedelta(months=1) if sub.period == "month" else relativedelta(years=1)
+    count = horizon_months if sub.period == "month" else 3  # для года — 3 периода
+    due = sub.start_date
+    rows = []
+    for _ in range(count):
+        month_str = due.strftime("%Y-%m")
+        if not SubscriptionPaymentConsalting.objects.filter(subscription=sub, period_month=month_str).exists():
+            rows.append(SubscriptionPaymentConsalting(
+                subscription=sub,
+                due_date=due,
+                period_month=month_str,
+                amount=sub.amount,
+                status=SubscriptionPaymentConsalting.Status.PLANNED,
+            ))
+        due += step
+    if rows:
+        SubscriptionPaymentConsalting.objects.bulk_create(rows, ignore_conflicts=True)
+
+
+def create_sale_side_effects(sale, *, subscription_enabled=True,
+                             subscription_start=None, subscription_amount=None,
+                             subscription_period=None):
+    """Единая точка вызова при создании продажи / согласовании оплаты (§5.3)."""
+    from django.db import transaction
+    from ..models import SubscriptionConsalting
+
+    with transaction.atomic():
+        tariff = sale.tariff
+        amount = subscription_amount if subscription_amount is not None else (
+            tariff.subscription_amount if tariff else 0
+        )
+        service = getattr(sale, "services", None) or getattr(sale, "service", None)
+        if subscription_enabled and amount and float(amount) > 0 and sale.client and service:
+            period = subscription_period or (tariff.subscription_period if tariff else "month")
+            start = subscription_start or timezone.localdate()
+            if isinstance(start, str):
+                from datetime import datetime
+                try:
+                    start = datetime.strptime(start, "%Y-%m-%d").date()
+                except ValueError:
+                    start = timezone.localdate()
+
+            sub, created = SubscriptionConsalting.objects.get_or_create(
+                sale=sale, service=service,
+                defaults=dict(
+                    company=sale.company,
+                    client=sale.client,
+                    tariff=tariff,
+                    lead=sale.lead,
+                    amount=amount,
+                    period=period,
+                    start_date=start,
+                    created_by=sale.user,
+                ),
+            )
+            if created:
+                generate_schedule(sub, horizon_months=12)
+            return sub
+        return None
+
+
+def resolve_rate(user, service):
+    """
+    Приоритет ставок:
+    1. сотрудник + услуга (SalarySchemeServiceOverrideConsalting)
+    2. сотрудник (SalarySchemeConsalting)
+    3. услуга (ServiceSalaryRateConsalting)
+    4. компания (SalaryDefaultsConsalting)
+    """
+    from ..models import (
+        SalarySchemeConsalting, SalarySchemeServiceOverrideConsalting,
+        ServiceSalaryRateConsalting, SalaryDefaultsConsalting
+    )
+
+    scheme = SalarySchemeConsalting.objects.filter(user=user, company_id=user.company_id).first()
+    if scheme:
+        if service:
+            override = SalarySchemeServiceOverrideConsalting.objects.filter(scheme=scheme, service=service).first()
+            if override and (override.percent > 0 or override.fixed_amount > 0):
+                return override.percent, override.fixed_amount
+        if scheme.percent_enabled or scheme.fixed_enabled:
+            pct = scheme.percent if scheme.percent_enabled else Decimal("0")
+            fix = scheme.fixed_amount if scheme.fixed_enabled else Decimal("0")
+            return pct, fix
+
+    if service:
+        rate = ServiceSalaryRateConsalting.objects.filter(company_id=user.company_id, service=service).first()
+        if rate and (rate.percent > 0 or rate.fixed_amount > 0):
+            return rate.percent, rate.fixed_amount
+
+    defaults = SalaryDefaultsConsalting.objects.filter(company_id=user.company_id).first()
+    if defaults:
+        return defaults.percent, defaults.fixed_amount
+
+    return Decimal("0"), Decimal("0")
+
+
 def accrue_salary_for_sale(sale, seller=None):
     """Автоматическое начисление зарплаты продавцу при создании/закрытии продажи."""
-    from ..models import ServiceSalaryRateConsalting, SalaryAccrualConsalting
+    from ..models import SalaryAccrualConsalting
     from . import realtime
 
-    if not sale or not sale.services_id:
+    if not sale:
         return None
 
     seller = seller or sale.user
@@ -110,42 +247,69 @@ def accrue_salary_for_sale(sale, seller=None):
         return None
 
     try:
-        rate = ServiceSalaryRateConsalting.objects.filter(
-            company_id=sale.company_id, service_id=sale.services_id
-        ).first()
-        if not rate or rate.percent <= 0:
-            return None
-
+        percent, fixed = resolve_rate(seller, sale.services)
         base_amt = sale.total or Decimal("0.00")
-        accrual_amt = round(base_amt * rate.percent / Decimal("100"), 2)
-        if accrual_amt <= 0:
-            return None
+        last_accrual = None
 
-        accrual, created = SalaryAccrualConsalting.objects.get_or_create(
-            sale=sale,
-            defaults={
-                "company_id": sale.company_id,
-                "user": seller,
-                "service": sale.services,
-                "lead": sale.lead,
-                "base_amount": base_amt,
-                "percent": rate.percent,
-                "amount": accrual_amt,
-                "status": SalaryAccrualConsalting.Status.ACCRUED,
-            }
-        )
-        if created:
-            realtime.notify_user(
-                seller.id,
-                "consulting.salary.accrued",
-                {
-                    "title": f"Начислена зарплата: {accrual_amt}",
-                    "message": f"Продажа: {sale.description or (sale.services.name if sale.services else 'Услуга')}",
-                    "amount": str(accrual_amt),
-                    "sale_id": str(sale.id),
+        if percent and percent > 0:
+            accrual_amt = (base_amt * percent / Decimal("100")).quantize(Decimal("0.01"))
+            if accrual_amt > 0:
+                accrual, created = SalaryAccrualConsalting.objects.get_or_create(
+                    sale=sale,
+                    kind=SalaryAccrualConsalting.Kind.PERCENT,
+                    defaults={
+                        "company_id": sale.company_id,
+                        "user": seller,
+                        "service": sale.services,
+                        "lead": sale.lead,
+                        "base_amount": base_amt,
+                        "percent": percent,
+                        "amount": accrual_amt,
+                        "status": SalaryAccrualConsalting.Status.ACCRUED,
+                    }
+                )
+                last_accrual = accrual
+                if created:
+                    realtime.notify_user(
+                        seller.id,
+                        "consulting.salary.accrued",
+                        {
+                            "title": f"Начислена зарплата (%): {accrual_amt}",
+                            "message": f"Продажа: {sale.description or (sale.services.name if sale.services else 'Услуга')}",
+                            "amount": str(accrual_amt),
+                            "sale_id": str(sale.id),
+                        }
+                    )
+
+        if fixed and fixed > 0:
+            accrual, created = SalaryAccrualConsalting.objects.get_or_create(
+                sale=sale,
+                kind=SalaryAccrualConsalting.Kind.FIXED,
+                defaults={
+                    "company_id": sale.company_id,
+                    "user": seller,
+                    "service": sale.services,
+                    "lead": sale.lead,
+                    "base_amount": base_amt,
+                    "percent": Decimal("0"),
+                    "amount": fixed,
+                    "status": SalaryAccrualConsalting.Status.ACCRUED,
                 }
             )
-        return accrual
+            last_accrual = accrual
+            if created:
+                realtime.notify_user(
+                    seller.id,
+                    "consulting.salary.accrued",
+                    {
+                        "title": f"Начислено фикс за сделку: {fixed}",
+                        "message": f"Продажа: {sale.description or (sale.services.name if sale.services else 'Услуга')}",
+                        "amount": str(fixed),
+                        "sale_id": str(sale.id),
+                    }
+                )
+
+        return last_accrual
     except Exception as e:
         logger.warning("accrue_salary_for_sale failed for sale %s: %s", sale.id, e)
         return None

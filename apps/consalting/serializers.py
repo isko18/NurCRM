@@ -19,10 +19,25 @@ from .models import (
     ServiceSalaryRateConsalting,
     SalaryAccrualConsalting,
     SalaryPayoutConsalting,
+    SalarySchemeConsalting,
+    SalarySchemeServiceOverrideConsalting,
+    SalaryDefaultsConsalting,
+    BonusRuleConsalting,
+    BonusTierConsalting,
+    SalaryAdjustmentConsalting,
     InboundLeadConsalting,
     LeadDistributionSettingsConsalting,
     ServiceRolePriceConsalting,
     TariffRolePriceConsalting,
+    LeadFunnelHistoryConsalting,
+    SubscriptionConsalting,
+    SubscriptionPaymentConsalting,
+    SalesPlanConsalting,
+    KpiWeightsConsalting,
+    CashOperationConsalting,
+    CashRequestConsalting,
+    CashConfirmationSettingsConsalting,
+    SaleRefundConsalting,
 )
 from apps.users.models import User, Branch, CustomRole
 
@@ -279,6 +294,7 @@ class SaleConsaltingSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSeri
             "tariff", "tariff_display", "tariff_price",
             "client", "client_display",
             "items", "discount", "markup", "total",
+            "status", "canceled_at", "canceled_by", "cancel_reason", "cancel_comment", "refunded_amount",
             "description",
             "created_at", "updated_at",
         )
@@ -286,6 +302,7 @@ class SaleConsaltingSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSeri
             "id", "company", "branch", "user", "user_display",
             "service_display", "service_price",
             "tariff_display", "tariff_price", "total",
+            "status", "canceled_at", "canceled_by", "cancel_reason", "cancel_comment", "refunded_amount",
             "created_at", "updated_at",
         )
 
@@ -586,6 +603,10 @@ class FunnelConsaltingSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSe
         queryset=CustomRole.objects.all(), required=False, allow_null=True
     )
     custom_role_name = serializers.CharField(source="custom_role.name", read_only=True)
+    next_funnel_display = serializers.CharField(source="next_funnel.name", read_only=True)
+    next_stage_display = serializers.CharField(source="next_stage.name", read_only=True)
+    next_assign_display = serializers.CharField(source="get_next_assign_display", read_only=True)
+    next_assign_user_display = serializers.SerializerMethodField()
     is_protected = serializers.BooleanField(read_only=True)
     created_at = serializers.DateTimeField(read_only=True)
     updated_at = serializers.DateTimeField(read_only=True)
@@ -597,17 +618,28 @@ class FunnelConsaltingSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSe
             "name", "description", "is_active",
             "funnel_kind", "is_main", "is_static", "is_protected",
             "custom_role", "custom_role_name",
+            "next_funnel", "next_funnel_display",
+            "next_stage", "next_stage_display",
+            "next_assign", "next_assign_display",
+            "next_assign_user", "next_assign_user_display",
+            "is_final", "stage_sla_hours",
             "stages", "leads_count",
             "created_at", "updated_at",
         )
         read_only_fields = (
             "id", "company", "branch", "stages", "leads_count",
             "funnel_kind", "is_main", "is_static", "is_protected", "custom_role_name",
+            "next_funnel_display", "next_stage_display", "next_assign_display", "next_assign_user_display",
             "created_at", "updated_at",
         )
 
     def get_leads_count(self, obj):
         return getattr(obj, "leads_count", None) if hasattr(obj, "leads_count") else obj.leads.count()
+
+    def get_next_assign_user_display(self, obj):
+        if obj.next_assign_user:
+            return f"{obj.next_assign_user.first_name or ''} {obj.next_assign_user.last_name or ''}".strip() or obj.next_assign_user.email
+        return None
 
     def validate_custom_role(self, value):
         company = self._user_company()
@@ -615,8 +647,34 @@ class FunnelConsaltingSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSe
             raise serializers.ValidationError("Роль принадлежит другой компании.")
         return value
 
+    def validate(self, attrs):
+        next_funnel = attrs.get("next_funnel", getattr(self.instance, "next_funnel", None))
+        next_stage = attrs.get("next_stage", getattr(self.instance, "next_stage", None))
+        next_assign = attrs.get("next_assign", getattr(self.instance, "next_assign", FunnelConsalting.NextAssign.KEEP))
+        next_assign_user = attrs.get("next_assign_user", getattr(self.instance, "next_assign_user", None))
+
+        instance_id = self.instance.id if self.instance else None
+        if next_funnel:
+            if instance_id and next_funnel.id == instance_id:
+                raise serializers.ValidationError({"next_funnel": "Воронка не может быть следующей для самой себя."})
+            visited = {instance_id} if instance_id else set()
+            curr = next_funnel
+            while curr:
+                if curr.id in visited:
+                    raise serializers.ValidationError({"next_funnel": "Цепочка воронок зациклена."})
+                visited.add(curr.id)
+                curr = curr.next_funnel
+
+        if next_stage and next_funnel:
+            if next_stage.funnel_id != next_funnel.id:
+                raise serializers.ValidationError({"next_stage": "Следующая стадия должна принадлежать следующей воронке."})
+
+        if next_assign == FunnelConsalting.NextAssign.USER and not next_assign_user:
+            raise serializers.ValidationError({"next_assign_user": "Укажите сотрудника для назначения."})
+
+        return super().validate(attrs)
+
     def create(self, validated_data):
-        # Деривация типа воронки: роль → ROLE+static, иначе CUSTOM (is_main только через provisioning)
         role = validated_data.get("custom_role")
         if role is not None:
             validated_data["funnel_kind"] = FunnelConsalting.FunnelKind.ROLE
@@ -714,7 +772,7 @@ class LeadConsaltingSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSeri
             # следующее действие
             "next_action_type", "next_action_date", "next_action_note",
             # риск / тайминги
-            "is_at_risk", "risk_reason", "last_activity_at", "stage_entered_at",
+            "is_at_risk", "risk_reason", "last_activity_at", "stage_entered_at", "is_sla_overdue",
             # проигрыш
             "loss_reason", "loss_reason_label", "loss_comment",
             # lifecycle
@@ -734,7 +792,7 @@ class LeadConsaltingSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSeri
             "funnel_name", "stage_name", "stage_color", "stage_type",
             "owner_display", "client_display", "loss_reason_label",
             "score_grade", "score_value", "score_updated_at",
-            "is_at_risk", "risk_reason", "last_activity_at", "stage_entered_at",
+            "is_at_risk", "risk_reason", "last_activity_at", "stage_entered_at", "is_sla_overdue",
             "won_at", "lost_at", "completed_at", "first_contact_at",
             "created_at", "updated_at",
             "participants", "is_archived", "archived_at",
@@ -744,6 +802,17 @@ class LeadConsaltingSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSeri
     last_message = serializers.SerializerMethodField(read_only=True)
     unread_count = serializers.SerializerMethodField(read_only=True)
     has_unread = serializers.SerializerMethodField(read_only=True)
+    is_sla_overdue = serializers.SerializerMethodField(read_only=True)
+
+    def get_is_sla_overdue(self, obj):
+        if not obj.stage_entered_at:
+            return False
+        effective_sla = (obj.stage.sla_hours if obj.stage else None) or (obj.funnel.stage_sla_hours if obj.funnel else None)
+        if not effective_sla:
+            return False
+        from django.utils import timezone
+        from datetime import timedelta
+        return (timezone.now() - obj.stage_entered_at) > timedelta(hours=effective_sla)
 
     def get_last_message(self, obj):
         last_msg = obj.whatsapp_messages.order_by("-created_at").first()
@@ -788,6 +857,32 @@ class LeadConsaltingSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSeri
             or getattr(obj.client, "name", None)
             or getattr(obj.client, "phone", None)
         )
+
+
+class LeadFunnelHistoryConsaltingSerializer(serializers.ModelSerializer):
+    funnel_display = serializers.CharField(source="funnel.name", read_only=True)
+    stage_display = serializers.CharField(source="stage.name", default="", read_only=True)
+    owner_display = serializers.SerializerMethodField()
+    duration_hours = serializers.SerializerMethodField()
+
+    class Meta:
+        model = LeadFunnelHistoryConsalting
+        fields = (
+            "id", "funnel", "funnel_display", "stage", "stage_display",
+            "owner", "owner_display", "entered_at", "left_at", "duration_hours", "transition"
+        )
+        read_only_fields = ("id", "funnel_display", "stage_display", "owner_display", "duration_hours")
+
+    def get_owner_display(self, obj):
+        if obj.owner:
+            return f"{obj.owner.first_name or ''} {obj.owner.last_name or ''}".strip() or obj.owner.email
+        return None
+
+    def get_duration_hours(self, obj):
+        from django.utils import timezone
+        end_time = obj.left_at or timezone.now()
+        diff = (end_time - obj.entered_at).total_seconds() / 3600.0
+        return round(max(0.0, diff), 1)
 
     def validate_funnel(self, value):
         company = self._user_company()
@@ -989,7 +1084,7 @@ class WhatsAppSendSerializer(serializers.Serializer):
 
 
 # ==========================
-# Salary Auto-Accrual System
+# Salary System (02-salary.md)
 # ==========================
 class ServiceSalaryRateConsaltingSerializer(serializers.ModelSerializer):
     service_name = serializers.CharField(source="service.name", read_only=True)
@@ -997,22 +1092,137 @@ class ServiceSalaryRateConsaltingSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = ServiceSalaryRateConsalting
-        fields = ("id", "company", "service", "service_name", "price", "percent", "updated_at")
+        fields = ("id", "company", "service", "service_name", "price", "percent", "fixed_amount", "updated_at")
         read_only_fields = ("id", "company", "service_name", "price", "updated_at")
+
+
+class SalarySchemeServiceOverrideConsaltingSerializer(serializers.ModelSerializer):
+    service_name = serializers.CharField(source="service.name", read_only=True)
+
+    class Meta:
+        model = SalarySchemeServiceOverrideConsalting
+        fields = ("id", "service", "service_name", "percent", "fixed_amount")
+        read_only_fields = ("id", "service_name")
+
+
+class SalarySchemeConsaltingSerializer(serializers.ModelSerializer):
+    user_display = serializers.SerializerMethodField()
+    service_overrides = SalarySchemeServiceOverrideConsaltingSerializer(many=True, required=False)
+
+    class Meta:
+        model = SalarySchemeConsalting
+        fields = (
+            "id", "company", "user", "user_display",
+            "base_salary_enabled", "base_salary", "base_salary_period",
+            "percent_enabled", "percent",
+            "fixed_enabled", "fixed_amount",
+            "service_overrides", "updated_at"
+        )
+        read_only_fields = ("id", "company", "user", "user_display", "updated_at")
+
+    def get_user_display(self, obj):
+        if obj.user and (obj.user.first_name or obj.user.last_name):
+            return f"{obj.user.first_name or ''} {obj.user.last_name or ''}".strip()
+        return getattr(obj.user, "email", None) if obj.user else None
+
+
+class SalaryDefaultsConsaltingSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = SalaryDefaultsConsalting
+        fields = ("id", "company", "percent", "fixed_amount", "base_salary", "base_salary_period", "updated_at")
+        read_only_fields = ("id", "company", "updated_at")
+
+
+class BonusTierConsaltingSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = BonusTierConsalting
+        fields = ("id", "from_amount", "to_amount", "percent")
+        read_only_fields = ("id",)
+
+
+class BonusRuleConsaltingSerializer(serializers.ModelSerializer):
+    condition_display = serializers.CharField(source="get_condition_display", read_only=True)
+    service_name = serializers.CharField(source="service.name", read_only=True)
+    role_name = serializers.CharField(source="role.name", read_only=True)
+    user_name = serializers.SerializerMethodField()
+    tiers = BonusTierConsaltingSerializer(many=True, required=False)
+
+    class Meta:
+        model = BonusRuleConsalting
+        fields = (
+            "id", "company", "name", "condition", "condition_display",
+            "service", "service_name", "threshold",
+            "reward_type", "reward_value", "period", "applies_to",
+            "role", "role_name", "user", "user_name",
+            "valid_from", "valid_to", "is_active", "tiers", "created_at"
+        )
+        read_only_fields = ("id", "company", "condition_display", "service_name", "role_name", "user_name", "created_at")
+
+    def get_user_name(self, obj):
+        if obj.user:
+            return f"{obj.user.first_name or ''} {obj.user.last_name or ''}".strip() or obj.user.email
+        return None
+
+    def create(self, validated_data):
+        tiers_data = validated_data.pop("tiers", [])
+        rule = BonusRuleConsalting.objects.create(**validated_data)
+        for tier in tiers_data:
+            BonusTierConsalting.objects.create(rule=rule, **tier)
+        return rule
+
+    def update(self, instance, validated_data):
+        tiers_data = validated_data.pop("tiers", None)
+        for attr, value in validated_data.items():
+            setattr(instance, attr, value)
+        instance.save()
+
+        if tiers_data is not None:
+            instance.tiers.all().delete()
+            for tier in tiers_data:
+                BonusTierConsalting.objects.create(rule=instance, **tier)
+        return instance
+
+
+class SalaryAdjustmentConsaltingSerializer(serializers.ModelSerializer):
+    user_display = serializers.SerializerMethodField()
+    created_by_display = serializers.SerializerMethodField()
+    kind_display = serializers.CharField(source="get_kind_display", read_only=True)
+    reason_display = serializers.CharField(source="get_reason_display", read_only=True)
+
+    class Meta:
+        model = SalaryAdjustmentConsalting
+        fields = (
+            "id", "company", "user", "user_display", "kind", "kind_display",
+            "amount", "reason", "reason_display", "comment", "date",
+            "status", "source_sale", "created_by", "created_by_display", "created_at"
+        )
+        read_only_fields = ("id", "company", "user_display", "kind_display", "reason_display", "created_by", "created_by_display", "created_at")
+
+    def get_user_display(self, obj):
+        if obj.user and (obj.user.first_name or obj.user.last_name):
+            return f"{obj.user.first_name or ''} {obj.user.last_name or ''}".strip()
+        return getattr(obj.user, "email", None) if obj.user else None
+
+    def get_created_by_display(self, obj):
+        if obj.created_by:
+            return f"{obj.created_by.first_name or ''} {obj.created_by.last_name or ''}".strip() or obj.created_by.email
+        return None
 
 
 class SalaryAccrualConsaltingSerializer(serializers.ModelSerializer):
     user_display = serializers.SerializerMethodField()
     service_name = serializers.CharField(source="service.name", read_only=True)
+    kind_display = serializers.CharField(source="get_kind_display", read_only=True)
 
     class Meta:
         model = SalaryAccrualConsalting
         fields = (
             "id", "company", "user", "user_display", "service", "service_name",
-            "sale", "lead", "base_amount", "percent", "amount", "status", "payout", "created_at"
+            "sale", "lead", "kind", "kind_display", "rule", "period_month",
+            "base_amount", "percent", "amount", "status", "payout", "created_at"
         )
         read_only_fields = (
-            "id", "company", "user_display", "service_name", "created_at"
+            "id", "company", "user_display", "service_name", "kind_display", "created_at"
         )
 
     def get_user_display(self, obj):
@@ -1040,20 +1250,40 @@ class SalaryPayoutConsaltingSerializer(serializers.ModelSerializer):
 # ==========================
 class InboundLeadConsaltingSerializer(serializers.ModelSerializer):
     owner_display = serializers.SerializerMethodField()
+    status_display = serializers.CharField(source="get_status_display", read_only=True)
+    defer_reason_display = serializers.CharField(source="get_defer_reason_display", read_only=True)
+    reject_reason_display = serializers.CharField(source="get_reject_reason_display", read_only=True)
+    is_overdue = serializers.SerializerMethodField()
     updated_at = serializers.DateTimeField(read_only=True)
 
     class Meta:
         model = InboundLeadConsalting
         fields = (
             "id", "company", "full_name", "phone", "source", "external_id",
-            "message", "owner", "owner_display", "status", "lead", "created_at", "updated_at"
+            "message", "owner", "owner_display", "status", "status_display", "lead",
+            "remind_at", "defer_reason", "defer_reason_display", "defer_comment", "defer_count",
+            "deferred_at", "reminded_at", "is_overdue",
+            "reject_reason", "reject_reason_display", "reject_comment",
+            "first_reply_at", "converted_at", "closed_at", "sale",
+            "created_at", "updated_at"
         )
-        read_only_fields = ("id", "company", "owner_display", "created_at", "updated_at")
+        read_only_fields = (
+            "id", "company", "owner_display", "status_display", "defer_reason_display",
+            "reject_reason_display", "defer_count", "deferred_at", "reminded_at",
+            "is_overdue", "first_reply_at", "converted_at", "closed_at",
+            "created_at", "updated_at"
+        )
 
     def get_owner_display(self, obj):
         if obj.owner and (obj.owner.first_name or obj.owner.last_name):
             return f"{obj.owner.first_name or ''} {obj.owner.last_name or ''}".strip()
         return getattr(obj.owner, "email", None) if obj.owner else None
+
+    def get_is_overdue(self, obj):
+        if obj.status == InboundLeadConsalting.Status.DEFERRED and obj.remind_at:
+            from django.utils import timezone
+            return obj.remind_at <= timezone.now()
+        return False
 
 
 class LeadDistributionSettingsConsaltingSerializer(serializers.ModelSerializer):
@@ -1098,6 +1328,179 @@ class WazzupAccountConsaltingSerializer(CompanyBranchReadOnlyMixin, serializers.
             "is_active", "is_connected", "created_at", "updated_at",
         )
         read_only_fields = ("id", "company", "branch", "created_at", "updated_at")
+
+
+# ==========================
+# Subscription Serializers (§5.5)
+# ==========================
+class SubscriptionPaymentConsaltingSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = SubscriptionPaymentConsalting
+        fields = ("id", "period_month", "due_date", "amount", "status", "paid_at", "cashbox_id", "payment_method")
+        read_only_fields = ("id", "period_month", "due_date", "amount")
+
+
+class SubscriptionConsaltingSerializer(serializers.ModelSerializer):
+    service_display = serializers.CharField(source="service.name", read_only=True)
+    tariff_display = serializers.CharField(source="tariff.name", default="", read_only=True)
+    period_display = serializers.CharField(source="get_period_display", read_only=True)
+    next_payment = serializers.SerializerMethodField()
+    payments = SubscriptionPaymentConsaltingSerializer(many=True, read_only=True)
+
+    class Meta:
+        model = SubscriptionConsalting
+        fields = (
+            "id", "service", "service_display", "tariff", "tariff_display",
+            "amount", "period", "period_display", "status", "start_date",
+            "next_payment", "payments", "created_at"
+        )
+        read_only_fields = (
+            "id", "service_display", "tariff_display", "period_display", "next_payment", "payments", "created_at"
+        )
+
+    def get_next_payment(self, obj):
+        next_p = obj.payments.filter(
+            status__in=[SubscriptionPaymentConsalting.Status.PLANNED, SubscriptionPaymentConsalting.Status.OVERDUE]
+        ).order_by("due_date").first()
+        if not next_p:
+            return None
+        return SubscriptionPaymentConsaltingSerializer(next_p).data
+
+
+# ==========================
+# SalesPlanConsaltingSerializer (§6.4)
+# ==========================
+class SalesPlanConsaltingSerializer(serializers.ModelSerializer):
+    user_display = serializers.SerializerMethodField()
+
+    class Meta:
+        model = SalesPlanConsalting
+        fields = ("id", "user", "user_display", "period_month", "amount", "created_at")
+        read_only_fields = ("id", "user_display", "created_at")
+
+    def get_user_display(self, obj):
+        if obj.user:
+            return f"{obj.user.first_name or ''} {obj.user.last_name or ''}".strip() or obj.user.email
+        return ""
+
+
+# ==========================
+# CashOperation & CashRequest Serializers (§7.2, §7.4)
+# ==========================
+class CashOperationConsaltingSerializer(serializers.ModelSerializer):
+    user_display = serializers.SerializerMethodField()
+    confirmed_by_display = serializers.SerializerMethodField()
+
+    class Meta:
+        model = CashOperationConsalting
+        fields = (
+            "id", "user", "user_display", "confirmed_by", "confirmed_by_display",
+            "sale", "kind", "direction", "amount", "payment_method", "comment", "created_at"
+        )
+        read_only_fields = ("id", "user_display", "confirmed_by_display", "created_at")
+
+    def get_user_display(self, obj):
+        if obj.user:
+            return f"{obj.user.first_name or ''} {obj.user.last_name or ''}".strip() or obj.user.email
+        return ""
+
+    def get_confirmed_by_display(self, obj):
+        if obj.confirmed_by:
+            return f"{obj.confirmed_by.first_name or ''} {obj.confirmed_by.last_name or ''}".strip() or obj.confirmed_by.email
+        return ""
+
+
+class CashRequestConsaltingSerializer(serializers.ModelSerializer):
+    user_display = serializers.SerializerMethodField()
+    confirmed_by_display = serializers.SerializerMethodField()
+    client_display = serializers.SerializerMethodField()
+    source_display = serializers.SerializerMethodField()
+    kind_display = serializers.CharField(source="get_kind_display", read_only=True)
+    status_display = serializers.CharField(source="get_status_display", read_only=True)
+    payment_method_display = serializers.SerializerMethodField()
+    reject_reason_display = serializers.CharField(source="get_reject_reason_display", read_only=True)
+    is_overdue = serializers.SerializerMethodField()
+
+    class Meta:
+        model = CashRequestConsalting
+        fields = (
+            "id", "user", "user_display", "client", "client_display",
+            "sale", "subscription_payment", "source_display",
+            "kind", "kind_display", "direction", "amount",
+            "payment_method", "payment_method_display",
+            "status", "status_display", "comment",
+            "reject_reason", "reject_reason_display", "reject_comment",
+            "confirmed_by", "confirmed_by_display", "confirmed_at",
+            "is_overdue", "created_at"
+        )
+        read_only_fields = (
+            "id", "user_display", "client_display", "source_display",
+            "kind_display", "status_display", "payment_method_display",
+            "reject_reason_display", "confirmed_by_display", "confirmed_at",
+            "is_overdue", "created_at"
+        )
+
+    def get_user_display(self, obj):
+        if obj.user:
+            return f"{obj.user.first_name or ''} {obj.user.last_name or ''}".strip() or obj.user.email
+        return ""
+
+    def get_confirmed_by_display(self, obj):
+        if obj.confirmed_by:
+            return f"{obj.confirmed_by.first_name or ''} {obj.confirmed_by.last_name or ''}".strip() or obj.confirmed_by.email
+        return ""
+
+    def get_client_display(self, obj):
+        if obj.client:
+            return obj.client.full_name
+        if obj.sale and obj.sale.client:
+            return obj.sale.client.full_name
+        return "—"
+
+    def get_source_display(self, obj):
+        if obj.sale:
+            s_name = obj.sale.services.name if obj.sale.services else "Продажа"
+            t_name = obj.sale.tariff.name if obj.sale.tariff else ""
+            return f"{s_name} / {t_name}".strip(" /")
+        return obj.get_kind_display()
+
+    def get_payment_method_display(self, obj):
+        pm = obj.payment_method or "cash"
+        return "Наличными" if pm == "cash" else ("Перевод" if pm == "transfer" else "Карта")
+
+    def get_is_overdue(self, obj):
+        if obj.status != CashRequestConsalting.Status.PENDING:
+            return False
+        from django.utils import timezone
+        from datetime import timedelta
+        overdue_hrs = 24
+        if obj.company and hasattr(obj.company, "consalting_cash_confirmation"):
+            overdue_hrs = obj.company.consalting_cash_confirmation.overdue_hours
+        return (timezone.now() - obj.created_at) > timedelta(hours=overdue_hrs)
+
+
+class CashConfirmationSettingsConsaltingSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = CashConfirmationSettingsConsalting
+        fields = ("id", "company", "mode", "skip_for_cashier", "overdue_hours")
+        read_only_fields = ("id", "company")
+
+
+# ==========================
+# SaleRefundConsaltingSerializer (§8.3)
+# ==========================
+class SaleRefundConsaltingSerializer(serializers.ModelSerializer):
+    created_by_display = serializers.SerializerMethodField()
+
+    class Meta:
+        model = SaleRefundConsalting
+        fields = ("id", "sale", "amount", "reason", "comment", "refund_mode", "created_by", "created_by_display", "created_at")
+        read_only_fields = ("id", "created_by", "created_by_display", "created_at")
+
+    def get_created_by_display(self, obj):
+        if obj.created_by:
+            return f"{obj.created_by.first_name or ''} {obj.created_by.last_name or ''}".strip() or obj.created_by.email
+        return ""
 
 
 

@@ -10,7 +10,7 @@ logger = logging.getLogger(__name__)
 
 from .models import (
     LeadConsalting, LeadTaskConsalting, AutomationRuleConsalting,
-    FunnelStageConsalting,
+    FunnelStageConsalting, SubscriptionConsalting, SubscriptionPaymentConsalting,
 )
 from .funnel.events import emit
 from .funnel.state_machine import ACTIVE_TYPES
@@ -395,3 +395,102 @@ def scan_unanswered_leads(threshold_minutes=15):
                         pass
                 fired += 1
     return fired
+
+
+@shared_task
+def send_inbound_lead_reminders():
+    """
+    Периодическая задача (Celery beat):
+    Напоминания владельцам по отложенным лидам, срок которых наступил.
+    """
+    from apps.consalting.models import InboundLeadConsalting
+    from apps.consalting.funnel import realtime
+    from django.utils import timezone
+
+    now = timezone.now()
+    qs = InboundLeadConsalting.objects.filter(
+        status=InboundLeadConsalting.Status.DEFERRED,
+        remind_at__lte=now,
+        reminded_at__isnull=True,
+    ).select_related("owner")
+
+    count = 0
+    for lead in qs:
+        if lead.owner_id:
+            try:
+                realtime.notify_user(
+                    lead.owner_id,
+                    "consulting.lead.remind",
+                    {
+                        "id": str(lead.id),
+                        "full_name": lead.full_name,
+                        "phone": lead.phone,
+                        "status": lead.status,
+                        "remind_at": lead.remind_at.isoformat() if lead.remind_at else None,
+                        "defer_reason": lead.defer_reason,
+                        "defer_comment": lead.defer_comment,
+                    }
+                )
+            except Exception as e:
+                logger.warning("Failed to notify user for lead remind %s: %s", lead.id, e)
+        lead.reminded_at = now
+        lead.save(update_fields=["reminded_at", "updated_at"])
+        count += 1
+    return f"Sent {count} lead reminders"
+
+
+@shared_task
+def accrue_base_salaries(month_str=None):
+    """Ежемесячное авто-начисление окладов сотрудникам с enabled base_salary (§2.5)."""
+    from .models import SalarySchemeConsalting, SalaryAccrualConsalting
+    from django.utils import timezone
+
+    now = timezone.now()
+    if not month_str:
+        month_str = now.strftime("%Y-%m")
+
+    schemes = SalarySchemeConsalting.objects.filter(base_salary_enabled=True, base_salary__gt=0).select_related("user", "company")
+    count = 0
+    for scheme in schemes:
+        accrual, created = SalaryAccrualConsalting.objects.get_or_create(
+            user=scheme.user,
+            kind=SalaryAccrualConsalting.Kind.SALARY,
+            period_month=month_str,
+            defaults={
+                "company": scheme.company,
+                "base_amount": scheme.base_salary,
+                "percent": 0,
+                "amount": scheme.base_salary,
+                "status": SalaryAccrualConsalting.Status.ACCRUED,
+            }
+        )
+        if created:
+            count += 1
+    return f"Accrued {count} base salaries for {month_str}"
+
+
+@shared_task
+def process_subscription_schedules():
+    """Ежедневное обслуживание графиков абонентской платы (§5.3)."""
+    from .models import SubscriptionConsalting, SubscriptionPaymentConsalting
+    from .funnel.completion import generate_schedule
+
+    today = timezone.localdate()
+
+    # 1. Перевод planned -> overdue если due_date < today
+    overdue_updated = SubscriptionPaymentConsalting.objects.filter(
+        status=SubscriptionPaymentConsalting.Status.PLANNED,
+        due_date__lt=today
+    ).update(status=SubscriptionPaymentConsalting.Status.OVERDUE)
+
+    logger.info("process_subscription_schedules: marked %s payments overdue", overdue_updated)
+
+    # 2. Продление подписок (если менее 3 planned периодов)
+    active_subs = SubscriptionConsalting.objects.filter(status=SubscriptionConsalting.Status.ACTIVE)
+    for sub in active_subs:
+        planned_cnt = sub.payments.filter(status=SubscriptionPaymentConsalting.Status.PLANNED).count()
+        if planned_cnt < 3:
+            generate_schedule(sub, horizon_months=12)
+
+    return f"Processed subscriptions: {overdue_updated} overdue marked"
+

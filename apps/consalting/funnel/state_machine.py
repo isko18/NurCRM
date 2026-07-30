@@ -160,17 +160,23 @@ class FunnelStateMachine:
             touch_last_activity=False,
         )
 
-        # сигнал для движка автоматизации (фаза 6) — подключается опционально
+        # Сигнал и саму завершающую логику
         try:
             from .events import emit
+            from .hierarchy import move_lead_to_next_funnel
+            from .completion import apply_completion_side_effects
+
             emit("stage_changed", lead, actor=actor, automated=automated,
                  to_type=target_stage.stage_type)
             if target_stage.stage_type == T.WON:
                 emit("lead_won", lead, actor=actor)
+                if lead.funnel and not lead.funnel.is_final:
+                    move_lead_to_next_funnel(lead, lead.funnel, user=actor, transition="auto")
+                else:
+                    apply_completion_side_effects(lead, actor=actor)
             elif target_stage.stage_type == T.LOST:
                 emit("lead_lost", lead, actor=actor)
-        except Exception:
-            # отсутствие/ошибка движка не должна ломать переход
-            pass
+        except Exception as e:
+            logger.warning("Event/hierarchy trigger failed: %s", e)
 
         return lead
