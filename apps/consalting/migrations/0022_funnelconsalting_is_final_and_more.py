@@ -10,7 +10,7 @@ from django.db import migrations, models
 class Migration(migrations.Migration):
 
     dependencies = [
-        ('consalting', '0021_bonusruleconsalting_bonustierconsalting_and_more'),
+        ('consalting', '0023_alter_salaryaccrualconsalting_status'),
         migrations.swappable_dependency(settings.AUTH_USER_MODEL),
     ]
 
