@@ -1250,9 +1250,9 @@ class SalaryPayoutConsaltingSerializer(serializers.ModelSerializer):
 # ==========================
 class InboundLeadConsaltingSerializer(serializers.ModelSerializer):
     owner_display = serializers.SerializerMethodField()
-    status_display = serializers.CharField(source="get_status_display", read_only=True)
-    defer_reason_display = serializers.CharField(source="get_defer_reason_display", read_only=True)
-    reject_reason_display = serializers.CharField(source="get_reject_reason_display", read_only=True)
+    status_display = serializers.CharField(source="get_status_display", read_only=True, default="")
+    defer_reason_display = serializers.SerializerMethodField()
+    reject_reason_display = serializers.SerializerMethodField()
     is_overdue = serializers.SerializerMethodField()
     updated_at = serializers.DateTimeField(read_only=True)
 
@@ -1278,6 +1278,16 @@ class InboundLeadConsaltingSerializer(serializers.ModelSerializer):
         if obj.owner and (obj.owner.first_name or obj.owner.last_name):
             return f"{obj.owner.first_name or ''} {obj.owner.last_name or ''}".strip()
         return getattr(obj.owner, "email", None) if obj.owner else None
+
+    def get_defer_reason_display(self, obj):
+        if hasattr(obj, "get_defer_reason_display"):
+            return obj.get_defer_reason_display() or obj.defer_reason or ""
+        return obj.defer_reason or ""
+
+    def get_reject_reason_display(self, obj):
+        if hasattr(obj, "get_reject_reason_display"):
+            return obj.get_reject_reason_display() or obj.reject_reason or ""
+        return obj.reject_reason or ""
 
     def get_is_overdue(self, obj):
         if obj.status == InboundLeadConsalting.Status.DEFERRED and obj.remind_at:

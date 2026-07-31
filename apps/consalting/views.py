@@ -2844,6 +2844,7 @@ class InboundLeadListCreateView(CompanyBranchQuerysetMixin, generics.ListCreateA
     pagination_class = InboundLeadPagination
 
     def get_queryset(self):
+        import uuid
         company = self._user_company()
         if not company:
             return InboundLeadConsalting.objects.none()
@@ -2856,10 +2857,17 @@ class InboundLeadListCreateView(CompanyBranchQuerysetMixin, generics.ListCreateA
         else:
             owner_param = self.request.query_params.get("owner")
             if owner_param:
-                if owner_param.lower() in ("none", "null"):
+                op_lower = owner_param.lower().strip()
+                if op_lower in ("none", "null", "unassigned"):
                     qs = qs.filter(owner__isnull=True)
-                else:
-                    qs = qs.filter(owner_id=owner_param)
+                elif op_lower in ("mine", "my"):
+                    qs = qs.filter(owner=user)
+                elif op_lower not in ("all", ""):
+                    try:
+                        uuid_val = uuid.UUID(owner_param)
+                        qs = qs.filter(owner_id=uuid_val)
+                    except ValueError:
+                        pass
 
         status_param = self.request.query_params.get("status")
         if status_param:
@@ -2881,10 +2889,21 @@ class InboundLeadListCreateView(CompanyBranchQuerysetMixin, generics.ListCreateA
 
         date_from = self.request.query_params.get("date_from")
         if date_from:
-            qs = qs.filter(created_at__date__gte=date_from)
+            try:
+                from datetime import datetime
+                df = datetime.strptime(date_from.strip(), "%Y-%m-%d").date()
+                qs = qs.filter(created_at__date__gte=df)
+            except ValueError:
+                pass
+
         date_to = self.request.query_params.get("date_to")
         if date_to:
-            qs = qs.filter(created_at__date__lte=date_to)
+            try:
+                from datetime import datetime
+                dt = datetime.strptime(date_to.strip(), "%Y-%m-%d").date()
+                qs = qs.filter(created_at__date__lte=dt)
+            except ValueError:
+                pass
 
         overdue_param = self.request.query_params.get("overdue")
         if overdue_param and overdue_param.lower() in ("true", "1"):
@@ -2894,10 +2913,20 @@ class InboundLeadListCreateView(CompanyBranchQuerysetMixin, generics.ListCreateA
             )
 
         ordering = self.request.query_params.get("ordering", "-created_at")
-        if ordering:
-            qs = qs.order_by(ordering)
-        else:
-            qs = qs.order_by("-created_at")
+        allowed_orderings = {
+            "created_at": "created_at",
+            "-created_at": "-created_at",
+            "updated_at": "updated_at",
+            "-updated_at": "-updated_at",
+            "remind_at": "remind_at",
+            "-remind_at": "-remind_at",
+            "full_name": "full_name",
+            "-full_name": "-full_name",
+            "status": "status",
+            "-status": "-status",
+        }
+        ord_field = allowed_orderings.get(ordering, "-created_at")
+        qs = qs.order_by(ord_field)
 
         return qs
 
@@ -3158,6 +3187,8 @@ class InboundLeadCountersView(CompanyBranchQuerysetMixin, generics.GenericAPIVie
     GET /api/consalting/inbound-leads/counters/ — счётчики табов лидов.
     """
     def get(self, request, *args, **kwargs):
+        import uuid
+        from datetime import datetime
         company = self._user_company()
         if not company:
             return Response({"all": 0, "new": 0, "in_work": 0, "deferred": 0, "converted": 0, "rejected": 0, "overdue": 0})
@@ -3170,10 +3201,17 @@ class InboundLeadCountersView(CompanyBranchQuerysetMixin, generics.GenericAPIVie
         else:
             owner_param = request.query_params.get("owner")
             if owner_param:
-                if owner_param.lower() in ("none", "null"):
+                op_lower = owner_param.lower().strip()
+                if op_lower in ("none", "null", "unassigned"):
                     qs = qs.filter(owner__isnull=True)
-                else:
-                    qs = qs.filter(owner_id=owner_param)
+                elif op_lower in ("mine", "my"):
+                    qs = qs.filter(owner=user)
+                elif op_lower not in ("all", ""):
+                    try:
+                        uuid_val = uuid.UUID(owner_param)
+                        qs = qs.filter(owner_id=uuid_val)
+                    except ValueError:
+                        pass
 
         source_param = request.query_params.get("source")
         if source_param:
@@ -3189,10 +3227,19 @@ class InboundLeadCountersView(CompanyBranchQuerysetMixin, generics.GenericAPIVie
 
         date_from = request.query_params.get("date_from")
         if date_from:
-            qs = qs.filter(created_at__date__gte=date_from)
+            try:
+                df = datetime.strptime(date_from.strip(), "%Y-%m-%d").date()
+                qs = qs.filter(created_at__date__gte=df)
+            except ValueError:
+                pass
+
         date_to = request.query_params.get("date_to")
         if date_to:
-            qs = qs.filter(created_at__date__lte=date_to)
+            try:
+                dt = datetime.strptime(date_to.strip(), "%Y-%m-%d").date()
+                qs = qs.filter(created_at__date__lte=dt)
+            except ValueError:
+                pass
 
         now = timezone.now()
         counts = qs.aggregate(
@@ -3214,6 +3261,8 @@ class InboundLeadAnalyticsView(CompanyBranchQuerysetMixin, generics.GenericAPIVi
     Когортный принцип по created_at.
     """
     def get(self, request, *args, **kwargs):
+        import uuid
+        from datetime import datetime
         company = self._user_company()
         if not company:
             return Response({})
@@ -3228,10 +3277,17 @@ class InboundLeadAnalyticsView(CompanyBranchQuerysetMixin, generics.GenericAPIVi
         else:
             owner_param = request.query_params.get("owner")
             if owner_param:
-                if owner_param.lower() in ("none", "null"):
+                op_lower = owner_param.lower().strip()
+                if op_lower in ("none", "null", "unassigned"):
                     qs = qs.filter(owner__isnull=True)
-                else:
-                    qs = qs.filter(owner_id=owner_param)
+                elif op_lower in ("mine", "my"):
+                    qs = qs.filter(owner=user)
+                elif op_lower not in ("all", ""):
+                    try:
+                        uuid_val = uuid.UUID(owner_param)
+                        qs = qs.filter(owner_id=uuid_val)
+                    except ValueError:
+                        pass
 
         source_param = request.query_params.get("source")
         if source_param:
@@ -3241,9 +3297,18 @@ class InboundLeadAnalyticsView(CompanyBranchQuerysetMixin, generics.GenericAPIVi
         date_to_str = request.query_params.get("date_to")
 
         if date_from_str:
-            qs = qs.filter(created_at__date__gte=date_from_str)
+            try:
+                df = datetime.strptime(date_from_str.strip(), "%Y-%m-%d").date()
+                qs = qs.filter(created_at__date__gte=df)
+            except ValueError:
+                pass
+
         if date_to_str:
-            qs = qs.filter(created_at__date__lte=date_to_str)
+            try:
+                dt = datetime.strptime(date_to_str.strip(), "%Y-%m-%d").date()
+                qs = qs.filter(created_at__date__lte=dt)
+            except ValueError:
+                pass
 
         now = timezone.now()
 
