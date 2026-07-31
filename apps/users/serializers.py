@@ -818,7 +818,16 @@ class CompanySerializer(serializers.ModelSerializer):
             "llc", "inn", "okpo", "score", "bik", "address",
             "scale_barcode_mode",
             "scale_barcode_layout",
+            "max_discount_percent",
         ]
+
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        request = self.context.get("request")
+        if request and request.user.is_authenticated:
+            if getattr(request.user, "role", None) not in ["owner", "admin"]:
+                data.pop("cashier_password", None)
+        return data
 
 
 class ChangePasswordSerializer(serializers.Serializer):

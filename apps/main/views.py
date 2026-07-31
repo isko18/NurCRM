@@ -897,23 +897,20 @@ class ProductBarcodeAwareSearchFilter(filters.SearchFilter):
     """Разделяет точное сканирование ШК и обычный текстовый поиск.
 
     Если строка поиска выглядит как цельный штрихкод (только цифры, длина ≥ 8),
-    ищем ТОЧНО по `barcode`, не подмешивая коинцидентные совпадения по имени.
-    Это гасит эффект «сканер утёк в поле поиска и подменил сетку»: раньше
-    `search=460…` через icontains вытаскивал любые товары, где эти цифры есть
-    подстрокой в name/barcode.
+    ищем ТОЧНО по `barcode` и `alternate_barcodes__barcode`.
     """
 
     def get_search_fields(self, view, request):
         term = (request.query_params.get(self.search_param) or "").strip()
         if term.isdigit() and len(term) >= 8:
-            return ["=barcode"]  # `=` в DRF → точное совпадение
+            return ["=barcode", "=alternate_barcodes__barcode"]  # `=` в DRF → точное совпадение
         return getattr(view, "search_fields", None)
 
 
 class ProductListView(CompanyBranchRestrictedMixin, generics.ListAPIView):
     serializer_class = ProductSerializer
     filter_backends = [ProductBarcodeAwareSearchFilter, filters.OrderingFilter]
-    search_fields = ["name", "barcode"]
+    search_fields = ["name", "barcode", "alternate_barcodes__barcode"]
     ordering_fields = ["created_at", "updated_at", "price"]
     # По умолчанию — по монотонному seq: детерминированный порядок «сначала новые»
     # без переупорядочивания строк с одинаковым created_at (fallback ниже — тоже -seq).
@@ -2109,6 +2106,164 @@ class ProductRetrieveUpdateDestroyAPIView(CompanyBranchRestrictedMixin, generics
             self.get_serializer(instance).data,
             status=status.HTTP_200_OK,
         )
+
+
+
+class ProductBulkUpdateAPIView(CompanyBranchRestrictedMixin, APIView):
+    """
+    PATCH /api/main/products/bulk-update/
+    Body:
+    {
+      "ids": [...],
+      "brand_name": "Name",
+      "category_name": "Name",
+      "client": "UUID",
+      "require_all": false
+    }
+    """
+    def patch(self, request, *args, **kwargs):
+        return self._bulk_update(request)
+        
+    def post(self, request, *args, **kwargs):
+        return self._bulk_update(request)
+
+    def _bulk_update(self, request):
+        serializer = BulkIdsSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        ids = serializer.validated_data["ids"]
+        require_all = serializer.validated_data.get("require_all", False)
+        
+        if len(ids) > 1000:
+            return Response(
+                {"detail": "За один запрос можно изменить не более 1000 товаров"}, 
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        data = request.data
+        has_brand = "brand_name" in data or "brand" in data
+        has_category = "category_name" in data or "category" in data
+        has_client = "client" in data
+
+        if not (has_brand or has_category or has_client):
+            return Response(
+                {"detail": "Не передано ни одного поля для изменения"}, 
+                status=status.HTTP_400_BAD_REQUEST
+            )
+            
+        company = self._company()
+        update_fields = {}
+        applied = {}
+
+        # 1. Resolve brand
+        if has_brand:
+            brand_val = str(data.get("brand_name") or data.get("brand") or "").strip()
+            if not brand_val or brand_val.lower() == "null":
+                update_fields["brand"] = None
+                applied["brand"] = None
+            else:
+                try:
+                    import uuid
+                    uuid_val = uuid.UUID(brand_val)
+                    brand_obj = ProductBrand.objects.get(id=uuid_val, company=company)
+                except ValueError:
+                    brand_obj = ProductBrand.objects.filter(name__iexact=brand_val, company=company).first()
+                except ProductBrand.DoesNotExist:
+                    brand_obj = None
+                    
+                if not brand_obj:
+                    return Response({"detail": f"Бренд «{brand_val}» не найден"}, status=status.HTTP_400_BAD_REQUEST)
+                update_fields["brand"] = brand_obj
+                applied["brand"] = {"id": brand_obj.id, "name": brand_obj.name}
+
+        # 2. Resolve category
+        if has_category:
+            cat_val = str(data.get("category_name") or data.get("category") or "").strip()
+            if not cat_val or cat_val.lower() == "null":
+                update_fields["category"] = None
+                applied["category"] = None
+            else:
+                try:
+                    import uuid
+                    uuid_val = uuid.UUID(cat_val)
+                    cat_obj = ProductCategory.objects.get(id=uuid_val, company=company)
+                except ValueError:
+                    cat_obj = ProductCategory.objects.filter(name__iexact=cat_val, company=company).first()
+                except ProductCategory.DoesNotExist:
+                    cat_obj = None
+                    
+                if not cat_obj:
+                    return Response({"detail": f"Категория «{cat_val}» не найдена"}, status=status.HTTP_400_BAD_REQUEST)
+                update_fields["category"] = cat_obj
+                applied["category"] = {"id": cat_obj.id, "name": cat_obj.name}
+
+        # 3. Resolve client
+        if has_client:
+            client_val = data.get("client")
+            if not client_val or str(client_val).strip().lower() == "null":
+                update_fields["client"] = None
+                applied["client"] = None
+            else:
+                try:
+                    client_obj = Client.objects.get(id=client_val, company=company, type=Client.StatusClient.SUPPLIERS)
+                except Client.DoesNotExist:
+                    return Response({"detail": "Поставщик не найден"}, status=status.HTTP_400_BAD_REQUEST)
+                update_fields["client"] = client_obj
+                applied["client"] = {"id": client_obj.id, "full_name": client_obj.full_name}
+
+        # 4. Filter products
+        # We need to categorize them as required by docs
+        branch = getattr(request, "_cached_auto_branch", None)
+        if branch is None:
+            branch = self._branch()
+            
+        all_requested_products = Product.objects.filter(id__in=ids)
+        
+        valid_ids = []
+        skipped = []
+        
+        for p in all_requested_products:
+            if p.company_id != company.id:
+                skipped.append({"id": str(p.id), "reason": "forbidden"})
+            elif getattr(p, "is_active", True) == False:
+                skipped.append({"id": str(p.id), "reason": "deleted"})
+            elif branch is not None and p.branch_id and p.branch_id != branch.id:
+                # If branch restriction applies and it's not global nor matching branch
+                skipped.append({"id": str(p.id), "reason": "other_branch"})
+            else:
+                valid_ids.append(p.id)
+                
+        found_ids_set = {str(p.id) for p in all_requested_products}
+        for req_id in ids:
+            req_str = str(req_id)
+            if req_str not in found_ids_set:
+                skipped.append({"id": req_str, "reason": "not_found"})
+
+        if require_all and skipped:
+            return Response(
+                {"detail": "Некоторые товары недоступны или не найдены", "skipped": skipped},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+            
+        # 5. Bulk Update
+        if valid_ids:
+            with transaction.atomic():
+                Product.objects.filter(id__in=valid_ids).update(**update_fields)
+                
+            try:
+                from apps.main.cache_utils import invalidate_cache_pattern
+                invalidate_cache_pattern(f"analytics:market:{company.id}:")
+                invalidate_cache_pattern(f"products:list:{company.id}:")
+            except ImportError:
+                pass
+                
+        return Response({
+            "updated": len(valid_ids),
+            "failed": len(skipped),
+            "requested": len(ids),
+            "updated_ids": [str(v) for v in valid_ids],
+            "skipped": skipped,
+            "applied": applied
+        }, status=status.HTTP_200_OK)
 
 
 class ProductBulkDeleteAPIView(CompanyBranchRestrictedMixin, APIView):

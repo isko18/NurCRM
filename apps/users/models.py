@@ -177,6 +177,13 @@ class Company(models.Model):
         blank=True,
         default=None,
     )
+    max_discount_percent = models.DecimalField(
+        "Максимальная скидка (%)",
+        max_digits=5,
+        decimal_places=2,
+        null=True,
+        blank=True
+    )
 
 
     scale_api_token = models.CharField(

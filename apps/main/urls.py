@@ -63,6 +63,7 @@ urlpatterns = [
     path('products/<uuid:pk>/', ProductRetrieveUpdateDestroyAPIView.as_view(), name='product-detail'),
     path('products/<uuid:pk>/purchase-batches/', ProductPurchaseBatchListAPIView.as_view(), name='product-purchase-batches'),
     path("products/<uuid:product_id>/favorite/", ProductFavoriteAPIView.as_view(), name="product-favorite"),
+    path("products/bulk-update/", ProductBulkUpdateAPIView.as_view(), name="product-bulk-update"),
     path("products/bulk-delete/", ProductBulkDeleteAPIView.as_view(), name="product-bulk-delete"),
     path("products/<uuid:product_id>/move-to-raw/", ProductMoveToRawAPIView.as_view(), name="product-move-to-raw"),
 
@@ -212,6 +213,8 @@ urlpatterns = [
     ),
     
     path("pos/sales/", SaleListAPIView.as_view(), name="pos-sale-list"),
+    path("pos/cashier-settings/", MarketCashierSettingsAPIView.as_view(), name="pos-cashier-settings"),
+    path("pos/cashier-settings/verify-delete-code/", VerifyDeleteCodeAPIView.as_view(), name="pos-verify-delete-code"),
     path("pos/sales/start/", SaleStartAPIView.as_view(), name="pos-sale-start"),
     path("pos/carts/<uuid:pk>/custom-item/", SaleAddCustomItemAPIView.as_view(), name="pos-cart-add-custom-item"),
     path("pos/carts/<uuid:pk>/", CartDetailAPIView.as_view(), name="pos-cart-detail"),

@@ -2257,6 +2257,16 @@ class SaleStartAPIView(MarketCashierOnlyMixin, CompanyBranchRestrictedMixin, API
             ):
                 order_disc_total = opts.validated_data.get("order_discount_total")
                 order_disc_percent = opts.validated_data.get("order_discount_percent")
+                
+                is_admin = getattr(request.user, "role", None) in ["owner", "admin"]
+                max_dp = request.user.company.max_discount_percent
+                if max_dp is not None and not is_admin:
+                    if order_disc_percent is not None and Decimal(str(order_disc_percent)) > max_dp:
+                        return Response({"detail": f"Максимальная скидка — {max_dp}%", "max_discount_percent": str(max_dp)}, status=400)
+                    if order_disc_total is not None and getattr(cart, "total_price", 0) > 0: # Approximation before recalc or skip
+                        pass # Validated on recalc or here if subtotal available, but CartStart creates cart, maybe no subtotal yet.
+                        # Actually CartStart sets discount on empty cart, so total is 0. Skip total check here.
+                
                 if order_disc_percent is not None:
                     cart.order_discount_percent = _q2(Decimal(str(order_disc_percent)))
                     cart.order_discount_total = Decimal("0.00")
@@ -2301,6 +2311,19 @@ class CartDetailAPIView(MarketCashierOnlyMixin, generics.RetrieveAPIView):
         opts.is_valid(raise_exception=True)
         order_disc_total = opts.validated_data.get("order_discount_total")
         order_disc_percent = opts.validated_data.get("order_discount_percent")
+        
+        is_admin = getattr(request.user, "role", None) in ["owner", "admin"]
+        max_dp = request.user.company.max_discount_percent
+        if max_dp is not None and not is_admin:
+            if order_disc_percent is not None and Decimal(str(order_disc_percent)) > max_dp:
+                return Response({"detail": f"Максимальная скидка — {max_dp}%", "max_discount_percent": str(max_dp)}, status=400)
+            if order_disc_total is not None:
+                # We need subtotal to check limit
+                subtotal = cart.total_price + (cart.order_discount_total or 0)
+                limit = subtotal * (max_dp / Decimal("100.0"))
+                if Decimal(str(order_disc_total)) > limit:
+                    return Response({"detail": f"Максимальная скидка — {max_dp}%", "max_discount_percent": str(max_dp)}, status=400)
+                    
         if order_disc_percent is not None:
             cart.order_discount_percent = _q2(Decimal(str(order_disc_percent)))
             cart.order_discount_total = Decimal("0.00")
@@ -3305,6 +3328,12 @@ class SaleRetrieveAPIView(MarketCashierOnlyMixin, CompanyBranchRestrictedMixin, 
 
         cart = _get_pos_open_cart_for_cashier(company=company, user=user, cart_id=pk)
         if cart:
+            is_admin = getattr(request.user, "role", None) in ["owner", "admin"]
+            if not is_admin and getattr(company, "cashier_password", None):
+                from django.core.cache import cache
+                if not cache.get(f"delete_verified_{request.user.id}"):
+                    return Response({"detail": "Требуется код удаления или время проверки истекло"}, status=status.HTTP_403_FORBIDDEN)
+                    
             shift = _abandon_pos_open_cart(company=company, user=user, cart=cart)
             ordered = list(_shift_active_carts_qs(company, user, shift))
             if not ordered:
@@ -3457,6 +3486,95 @@ class AgentMySaleRetrieveAPIView(MarketCashierOnlyMixin, CompanyBranchRestricted
         return self._filter_qs_company_branch(qs)
 
 
+
+
+# ========================
+# Cashier Settings
+# ========================
+class MarketCashierSettingsAPIView(CompanyBranchRestrictedMixin, APIView):
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request, *args, **kwargs):
+        company = request.user.company
+        is_admin = getattr(request.user, "role", None) in ["owner", "admin"]
+
+        data = {
+            "delete_item_code_required": bool(company.cashier_password),
+            "max_discount_percent": str(company.max_discount_percent) if company.max_discount_percent is not None else None,
+        }
+        
+        if is_admin:
+            data["delete_item_code"] = company.cashier_password
+            
+        return Response(data, status=status.HTTP_200_OK)
+
+    def patch(self, request, *args, **kwargs):
+        company = request.user.company
+        is_admin = getattr(request.user, "role", None) in ["owner", "admin"]
+        if not is_admin:
+            return Response({"detail": "Недостаточно прав"}, status=status.HTTP_403_FORBIDDEN)
+            
+        data = request.data
+        if "delete_item_code" in data:
+            code = data["delete_item_code"]
+            if code in (None, ""):
+                company.cashier_password = None
+            else:
+                code_str = str(code).strip()
+                if not code_str.isdigit() or not (4 <= len(code_str) <= 8):
+                    return Response({"delete_item_code": ["Код должен состоять из 4–8 цифр"]}, status=status.HTTP_400_BAD_REQUEST)
+                company.cashier_password = code_str
+
+        if "max_discount_percent" in data:
+            mdp = data["max_discount_percent"]
+            if mdp in (None, ""):
+                company.max_discount_percent = None
+            else:
+                try:
+                    from decimal import Decimal
+                    val = Decimal(str(mdp))
+                    if not (0 <= val <= 100):
+                        raise ValueError
+                    company.max_discount_percent = val
+                except (ValueError, TypeError, ArithmeticError):
+                    return Response({"max_discount_percent": ["Значение должно быть от 0 до 100"]}, status=status.HTTP_400_BAD_REQUEST)
+
+        company.save(update_fields=["cashier_password", "max_discount_percent"])
+        
+        resp = {
+            "delete_item_code_required": bool(company.cashier_password),
+            "max_discount_percent": str(company.max_discount_percent) if company.max_discount_percent is not None else None,
+            "delete_item_code": company.cashier_password
+        }
+        return Response(resp, status=status.HTTP_200_OK)
+
+
+class VerifyDeleteCodeAPIView(CompanyBranchRestrictedMixin, APIView):
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request, *args, **kwargs):
+        company = request.user.company
+        
+        if not company.cashier_password:
+            return Response({"valid": True}, status=status.HTTP_200_OK)
+            
+        code = request.data.get("code", "")
+        
+        from django.core.cache import cache
+        throttle_key = f"verify_delete_throttle_{request.user.id}"
+        attempts = cache.get(throttle_key, 0)
+        if attempts >= 10:
+            return Response({"detail": "Слишком много попыток. Попробуйте позже."}, status=status.HTTP_429_TOO_MANY_REQUESTS)
+        
+        cache.set(throttle_key, attempts + 1, timeout=60)
+        
+        import secrets
+        if secrets.compare_digest(str(code).strip(), company.cashier_password):
+            cache.set(f"delete_verified_{request.user.id}", True, timeout=120)
+            return Response({"valid": True}, status=status.HTTP_200_OK)
+            
+        return Response({"valid": False}, status=status.HTTP_200_OK)
+
 class CartItemUpdateDestroyAPIView(MarketCashierOnlyMixin, APIView):
     permission_classes = [permissions.IsAuthenticated]
 
@@ -3500,11 +3618,19 @@ class CartItemUpdateDestroyAPIView(MarketCashierOnlyMixin, APIView):
         data = ser.validated_data
 
         qty = data.get("quantity")
+        
+        is_admin = getattr(request.user, "role", None) in ["owner", "admin"]
+        
         if qty is not None:
             qty = qty3(qty)
             if qty < 0:
                 return Response({"quantity": "Количество не может быть отрицательным."}, status=400)
             if qty == 0:
+                if not is_admin and getattr(request.user.company, "cashier_password", None):
+                    from django.core.cache import cache
+                    if not cache.get(f"delete_verified_{request.user.id}"):
+                        return Response({"detail": "Требуется код удаления или время проверки истекло"}, status=status.HTTP_403_FORBIDDEN)
+                
                 log_cart_item_deletion(item=item, deleted_by=request.user)
                 item.delete()
                 cart.recalc()
@@ -3518,6 +3644,13 @@ class CartItemUpdateDestroyAPIView(MarketCashierOnlyMixin, APIView):
         if unit_price is not None:
             item.unit_price = self._apply_min_price(item, _q2(unit_price))
         if line_discount is not None:
+            max_dp = request.user.company.max_discount_percent
+            if max_dp is not None and not is_admin:
+                current_qty = qty if qty is not None else item.quantity
+                current_price = item.unit_price if unit_price is None else (unit_price if not hasattr(self, '_apply_min_price') else self._apply_min_price(item, _q2(unit_price)))
+                limit = (current_price * current_qty) * (max_dp / Decimal("100.0"))
+                if Decimal(str(line_discount)) > limit:
+                    return Response({"detail": f"Максимальная скидка — {max_dp}%", "max_discount_percent": str(max_dp)}, status=status.HTTP_400_BAD_REQUEST)
             item.line_discount = _q2(Decimal(str(line_discount)))
 
         update_fields = []
@@ -3538,6 +3671,12 @@ class CartItemUpdateDestroyAPIView(MarketCashierOnlyMixin, APIView):
     def delete(self, request, cart_id, item_id, *args, **kwargs):
         cart = self._get_active_cart(request, cart_id)
         item = self._get_item_in_cart(cart, item_id)
+        is_admin = getattr(request.user, "role", None) in ["owner", "admin"]
+        if not is_admin and getattr(request.user.company, "cashier_password", None):
+            from django.core.cache import cache
+            if not cache.get(f"delete_verified_{request.user.id}"):
+                return Response({"detail": "Требуется код удаления или время проверки истекло"}, status=status.HTTP_403_FORBIDDEN)
+
         log_cart_item_deletion(item=item, deleted_by=request.user)
         item.delete()
         cart.recalc()
@@ -4204,11 +4343,19 @@ class AgentCartItemUpdateDestroyAPIView(MarketCashierOnlyMixin, APIView):
         data = ser.validated_data
 
         qty = data.get("quantity")
+        
+        is_admin = getattr(request.user, "role", None) in ["owner", "admin"]
+        
         if qty is not None:
             qty = qty3(qty)
             if qty < 0:
                 return Response({"quantity": "Количество не может быть отрицательным."}, status=400)
             if qty == 0:
+                if not is_admin and getattr(request.user.company, "cashier_password", None):
+                    from django.core.cache import cache
+                    if not cache.get(f"delete_verified_{request.user.id}"):
+                        return Response({"detail": "Требуется код удаления или время проверки истекло"}, status=status.HTTP_403_FORBIDDEN)
+                
                 log_cart_item_deletion(item=item, deleted_by=request.user)
                 item.delete()
                 cart.recalc()
@@ -4222,6 +4369,13 @@ class AgentCartItemUpdateDestroyAPIView(MarketCashierOnlyMixin, APIView):
         if unit_price is not None:
             item.unit_price = _q2(unit_price)
         if line_discount is not None:
+            max_dp = request.user.company.max_discount_percent
+            if max_dp is not None and not is_admin:
+                current_qty = qty if qty is not None else item.quantity
+                current_price = item.unit_price if unit_price is None else (unit_price if not hasattr(self, '_apply_min_price') else self._apply_min_price(item, _q2(unit_price)))
+                limit = (current_price * current_qty) * (max_dp / Decimal("100.0"))
+                if Decimal(str(line_discount)) > limit:
+                    return Response({"detail": f"Максимальная скидка — {max_dp}%", "max_discount_percent": str(max_dp)}, status=status.HTTP_400_BAD_REQUEST)
             item.line_discount = _q2(Decimal(str(line_discount)))
 
         update_fields = []
