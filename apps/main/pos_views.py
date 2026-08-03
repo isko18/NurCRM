@@ -871,6 +871,39 @@ def _parse_scale_barcode(barcode: str, mode: str = SCALE_BARCODE_MODE_AUTO,
     }
 
 
+def _scale_barcode_variants(barcode: str, mode: str, layout: str) -> list[dict]:
+    """
+    Разборы весового штрихкода: сначала раскладка из настроек компании, затем запасная.
+
+    Раскладки дают РАЗНЫЙ PLU для одного и того же кода:
+        2 00453 00054 9  →  layout=plu → PLU 453 (вес 54 г)
+                            layout=code → PLU 4530 (вес 54 г)
+    Если в `Company.scale_barcode_layout` указана не та раскладка, которую реально
+    печатают весы, товар не находится («Товар с PLU 4530 … не найден»). Поэтому после
+    промаха по основной раскладке пробуем альтернативную.
+    """
+    primary = _parse_scale_barcode(barcode, mode, layout)
+    if not primary:
+        return []
+
+    variants = [primary]
+    alt_layout = (
+        SCALE_BARCODE_LAYOUT_PLU
+        if layout == SCALE_BARCODE_LAYOUT_CODE
+        else SCALE_BARCODE_LAYOUT_CODE
+    )
+    # Раскладка `code` всегда трактует поле значения как ВЕС. Для суммового штрихкода
+    # (mode=amount / префикс 25) такой запасной разбор дал бы неверное количество —
+    # не подставляем его.
+    if alt_layout == SCALE_BARCODE_LAYOUT_CODE and primary.get("mode") != "weight":
+        return variants
+
+    alt = _parse_scale_barcode(barcode, mode, alt_layout)
+    if alt and alt.get("plu") != primary.get("plu"):
+        variants.append(alt)
+    return variants
+
+
 def _finalize_scale_data_for_product(product, scale_data: dict) -> Optional[str]:
     """
     Для mode=amount_plain дополняет scale_data полем quantity_kg.
@@ -1140,17 +1173,33 @@ def _lookup_product_for_pos_scan(company_id, barcode: str, *, only_fields=POS_SC
             pass
 
     scale_mode, scale_layout = _company_scale_barcode_settings(company_id)
-    scale_data = _parse_scale_barcode(barcode, scale_mode, scale_layout)
-    if scale_data:
-        product = _resolve_product_by_plu_or_code_for_pos(company_id, scale_data, only_fields=only_fields)
-        if product:
+    scale_variants = _scale_barcode_variants(barcode, scale_mode, scale_layout)
+    if scale_variants:
+        for idx, scale_data in enumerate(scale_variants):
+            product = _resolve_product_by_plu_or_code_for_pos(
+                company_id, scale_data, only_fields=only_fields
+            )
+            if not product:
+                continue
+            if idx > 0:
+                pos_scan_logger.warning(
+                    "scan barcode=%s company=%s: товар найден по ЗАПАСНОЙ раскладке весов "
+                    "(plu=%s вместо %s) — проверьте Company.scale_barcode_layout",
+                    barcode, company_id, scale_data.get("plu"), scale_variants[0].get("plu"),
+                )
             finalize_error = _finalize_scale_data_for_product(product, scale_data)
             if finalize_error:
                 return None, scale_data, finalize_error
             return product, scale_data, None
-        plu = scale_data.get("plu")
-        raw_code = scale_data.get("raw_code")
-        return None, scale_data, f"Товар с PLU {plu} / кодом {raw_code} не найден"
+
+        primary = scale_variants[0]
+        plu = primary.get("plu")
+        raw_code = primary.get("raw_code")
+        message = f"Товар с PLU {plu} / кодом {raw_code} не найден"
+        if len(scale_variants) > 1:
+            tried = " / ".join(str(v.get("plu")) for v in scale_variants)
+            message = f"Товар не найден: проверены PLU {tried} (штрихкод {barcode})"
+        return None, primary, message
 
     # Fallback как на складе: 13 цифр → PLU из середины штрихкода
     scale_loose = _parse_scale_barcode_loose(barcode)

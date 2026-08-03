@@ -10,10 +10,18 @@ from apps.main.pos_views import (
     _finalize_scale_data_for_product,
     _parse_scale_barcode,
     _parse_scale_barcode_loose,
+    _scale_barcode_variants,
     _should_use_main_stock_in_agent_sale,
 )
 from apps.main.views import ProductWarehouseBarcodeAPIView, ProductCreateManualAPIView
-from apps.users.models import Roles, Company, Branch
+from apps.users.models import (
+    Roles,
+    Company,
+    Branch,
+    SCALE_BARCODE_LAYOUT_CODE,
+    SCALE_BARCODE_LAYOUT_PLU,
+    SCALE_BARCODE_MODE_AUTO,
+)
 from django.contrib.auth import get_user_model
 
 User = get_user_model()
@@ -115,6 +123,42 @@ class PosScaleBarcodeTests(TestCase):
         self.assertEqual(loose["plu"], 1)
         self.assertIn("weight_kg", loose)
         self.assertNotIn("mode", loose)
+
+
+class PosScaleBarcodeVariantsTests(TestCase):
+    """Запасной разбор весового ШК, когда scale_barcode_layout настроен не так,
+    как печатают весы: 2 00453 00054 9 → PLU 453 (plu) либо 4530 (code)."""
+
+    BARCODE = "2000453000549"
+
+    def test_code_layout_falls_back_to_plu_layout(self):
+        variants = _scale_barcode_variants(
+            self.BARCODE, SCALE_BARCODE_MODE_AUTO, SCALE_BARCODE_LAYOUT_CODE
+        )
+        self.assertEqual([v["plu"] for v in variants], [4530, 453])
+        self.assertEqual(variants[0]["weight_kg"], Decimal("0.054"))
+        self.assertEqual(variants[1]["weight_kg"], Decimal("0.054"))
+
+    def test_plu_layout_falls_back_to_code_layout(self):
+        variants = _scale_barcode_variants(
+            self.BARCODE, SCALE_BARCODE_MODE_AUTO, SCALE_BARCODE_LAYOUT_PLU
+        )
+        self.assertEqual([v["plu"] for v in variants], [453, 4530])
+
+    def test_amount_barcode_has_no_weight_fallback(self):
+        # Префикс 25 → в поле зашита сумма; раскладка `code` трактовала бы её как вес.
+        variants = _scale_barcode_variants(
+            "2500001000441", SCALE_BARCODE_MODE_AUTO, SCALE_BARCODE_LAYOUT_PLU
+        )
+        self.assertEqual(len(variants), 1)
+        self.assertEqual(variants[0]["mode"], "amount_plain")
+
+    def test_non_scale_barcode_has_no_variants(self):
+        self.assertEqual(
+            _scale_barcode_variants("0100001000441", SCALE_BARCODE_MODE_AUTO,
+                                    SCALE_BARCODE_LAYOUT_PLU),
+            [],
+        )
 
 
 class ProductWarehouseBarcodeAPITestCase(TestCase):

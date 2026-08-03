@@ -526,9 +526,17 @@ class Command(BaseCommand):
             article = group["article"]
             unit = group["unit"]
 
+            # Наценка — с точностью поля (4 знака), иначе Product._recalc_price()
+            # пересчитает цену из округлённого процента и она уедет (650 -> 650.03).
+            markup = (
+                Decimal("0")
+                if purchase_price == 0
+                else ((price - purchase_price) / purchase_price * 100).quantize(Decimal("0.0001"))
+            )
+
             try:
                 with transaction.atomic():
-                    product = Product.objects.create(
+                    product = Product(
                         company=company,
                         branch=branch,
                         name=name[:255],
@@ -536,11 +544,14 @@ class Command(BaseCommand):
                         article=article[:64] if article else "",
                         price=price,
                         purchase_price=purchase_price,
-                        markup_percent=Decimal("0") if purchase_price == 0 else ((price - purchase_price) / purchase_price * 100).quantize(Decimal("0.01")),
+                        markup_percent=markup,
                         quantity=group["quantity"],
                         unit=unit[:32] if unit else "шт.",
                         kind=Product.Kind.PRODUCT,
                     )
+                    # Цена берётся из файла как есть, а не выводится из наценки.
+                    product._manual_price = True
+                    product.save()
                     if alt_bcs:
                         ProductAlternateBarcode.objects.bulk_create(
                             [
