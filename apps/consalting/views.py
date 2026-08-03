@@ -632,16 +632,12 @@ class FunnelConsaltingRetrieveUpdateDestroyView(CompanyBranchQuerysetMixin, gene
     serializer_class = FunnelConsaltingSerializer
 
     def perform_update(self, serializer):
-        if serializer.instance.is_protected:
-            raise PermissionDenied("Эту воронку нельзя изменить или удалить.")
-        if not is_owner_like(self.request.user):
+        if not (is_owner_like(self.request.user) or can_manage_stages(self.request.user, serializer.instance)):
             raise PermissionDenied("Изменять воронки может только владелец или администратор.")
         super().perform_update(serializer)
 
     def perform_destroy(self, instance):
-        if instance.is_protected:
-            raise PermissionDenied("Эту воронку нельзя изменить или удалить.")
-        if not is_owner_like(self.request.user):
+        if not (is_owner_like(self.request.user) or can_manage_stages(self.request.user, instance)):
             raise PermissionDenied("Удалять воронки может только владелец или администратор.")
         instance.delete()
 

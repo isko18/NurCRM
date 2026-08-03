@@ -675,8 +675,8 @@ class FunnelConsalting(TimeStampedModel):
 
     @property
     def is_protected(self) -> bool:
-        """Основную и ролевые воронки нельзя удалять/переименовывать."""
-        return bool(self.is_main or self.custom_role_id or self.is_static)
+        """Разрешено изменять и удалять воронку."""
+        return False
 
     def clean(self):
         if self.branch_id and self.branch.company_id != self.company_id:
