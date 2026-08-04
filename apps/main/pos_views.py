@@ -22,6 +22,7 @@ from rest_framework.exceptions import NotFound, PermissionDenied, ValidationErro
 from decimal import Decimal, ROUND_HALF_UP, InvalidOperation
 from datetime import timedelta, datetime, date, time as dtime
 import io, os, uuid, logging
+from django.db import IntegrityError
 
 from django.db.models import Q, F, Value as V, Sum, Prefetch, Count
 from django.db.models.functions import Coalesce
@@ -2226,16 +2227,23 @@ class SaleStartAPIView(MarketCashierOnlyMixin, CompanyBranchRestrictedMixin, API
             else:
                 cart = _find_locked_shift_cart(company=company, user=user, shift=shift)
                 if cart is None:
-                    cart = Cart.objects.create(
-                        company=company,
-                        user=user,
-                        status=Cart.Status.ACTIVE,
-                        branch=branch or shift.branch,
-                        shift=shift,
-                        is_default=True,
-                        is_wholesale=bool(is_wholesale_req) if is_wholesale_req is not None else False,
-                    )
-                    created = True
+                    try:
+                        with transaction.atomic():
+                            cart = Cart.objects.create(
+                                company=company,
+                                user=user,
+                                status=Cart.Status.ACTIVE,
+                                branch=branch or shift.branch,
+                                shift=shift,
+                                is_default=True,
+                                is_wholesale=bool(is_wholesale_req) if is_wholesale_req is not None else False,
+                            )
+                            created = True
+                    except IntegrityError:
+                        # Race condition fallback
+                        cart = _find_locked_shift_cart(company=company, user=user, shift=shift)
+                        if cart is None:
+                            raise ValidationError({"detail": "Ошибка при создании корзины. Попробуйте еще раз."})
                 elif (branch or shift.branch) and cart.branch_id != getattr(shift.branch, "id", None):
                     cart.branch = branch or shift.branch
                     cart.save(update_fields=["branch"])
