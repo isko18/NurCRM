@@ -30,39 +30,54 @@ def _parse_period(request):
         if not v:
             return None
         try:
-            return date.fromisoformat(v)
+            s = str(v).strip()
+            if "T" in s:
+                s = s.split("T")[0]
+            elif " " in s:
+                s = s.split(" ")[0]
+            return date.fromisoformat(s)
         except Exception:
             return None
 
-    period = (q.get("period") or "month").lower()
+    raw_period = (q.get("period") or "").strip().lower()
+    group_by = (q.get("group_by") or "").strip().lower() or "day"
+
     raw_date = _parse("date")
     raw_from = _parse("date_from")
     raw_to = _parse("date_to")
 
+    if not raw_period:
+        if raw_from or raw_to:
+            period = "custom"
+        else:
+            period = "month"
+    else:
+        period = raw_period
+
     if period == "day":
         d = raw_date or raw_from or raw_to or today
-        return {"period": "day", "date_from": d, "date_to": d, "group_by": "day"}
+        return {"period": "day", "date_from": d, "date_to": d, "group_by": group_by}
 
     if period == "week":
         date_to = raw_to or raw_date or today
         date_from = raw_from or (date_to - timedelta(days=6))
         if date_from > date_to:
             date_from, date_to = date_to, date_from
-        return {"period": "week", "date_from": date_from, "date_to": date_to, "group_by": "day"}
+        return {"period": "week", "date_from": date_from, "date_to": date_to, "group_by": group_by}
 
     if period == "custom":
         date_to = raw_to or today
         date_from = raw_from or (date_to - timedelta(days=29))
         if date_from > date_to:
             date_from, date_to = date_to, date_from
-        return {"period": "custom", "date_from": date_from, "date_to": date_to, "group_by": "day"}
+        return {"period": "custom", "date_from": date_from, "date_to": date_to, "group_by": group_by}
 
     date_to = raw_to or today
     date_from = raw_from or (date_to - timedelta(days=29))
     if date_from > date_to:
         date_from, date_to = date_to, date_from
 
-    return {"period": "month", "date_from": date_from, "date_to": date_to, "group_by": "day"}
+    return {"period": "month", "date_from": date_from, "date_to": date_to, "group_by": group_by}
 
 
 def _trunc_by_group(field_name: str, group_by: str):
@@ -1052,6 +1067,7 @@ def build_owner_agents_sales_analytics_payload(
     limit: int = 200,
     offset: int = 0,
     order_by: str = "sales_amount",
+    all_branches: bool = False,
 ):
     """
     Агентская аналитика для владельца: список агентов с продажами за период.
@@ -1069,10 +1085,9 @@ def build_owner_agents_sales_analytics_payload(
         date__gte=dt_from,
         date__lt=dt_to_excl,
     )
-    if branch is not None:
-        sales_qs = sales_qs.filter(warehouse_from__branch=branch)
-    else:
-        sales_qs = sales_qs.filter(warehouse_from__branch__isnull=True)
+    sales_qs = _apply_branch_scope(
+        sales_qs, branch, path="warehouse_from__branch", all_branches=all_branches
+    )
 
     summary_sales_count = sales_qs.count()
     summary_sales_amount = sales_qs.aggregate(s=Coalesce(Sum("total"), ZERO_MONEY))["s"] or Decimal("0.00")

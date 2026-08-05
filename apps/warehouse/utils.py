@@ -139,27 +139,30 @@ def ensure_system_payment_categories(company, branch=None):
     Идемпотентно создаёт системные категории «Продажа», «Долги» и «Инкассация» для компании или филиала.
     Если уже есть запись с тем же title и без system_code — присваивает ей системный код.
     """
-    from . import models
+    try:
+        from . import models
 
-    for member in models.PaymentCategory.SystemCode:
-        code = member.value
-        title = member.label
-        qs = models.PaymentCategory.objects.filter(company=company, branch=branch)
-        existing = qs.filter(system_code=code).first()
-        if existing:
-            if existing.title != title:
-                existing.title = title
-                existing.save(update_fields=["title"])
-            continue
-        orphan = qs.filter(system_code__isnull=True, title=title).first()
-        if orphan:
-            orphan.system_code = code
-            orphan.save(update_fields=["system_code"])
-            continue
-        models.PaymentCategory.objects.create(
-            company=company,
-            branch=branch,
-            system_code=code,
-            title=title,
-        )
+        for member in models.PaymentCategory.SystemCode:
+            code = member.value
+            title = member.label
+            qs = models.PaymentCategory.objects.filter(company=company, branch=branch)
+            existing = qs.filter(system_code=code).first()
+            if existing:
+                if existing.title != title:
+                    existing.title = title
+                    existing.save(update_fields=["title"])
+                continue
+            orphan = qs.filter(system_code__isnull=True, title=title).first()
+            if orphan:
+                orphan.system_code = code
+                orphan.save(update_fields=["system_code"])
+                continue
+            models.PaymentCategory.objects.create(
+                company=company,
+                branch=branch,
+                system_code=code,
+                title=title,
+            )
+    except Exception:
+        pass
 

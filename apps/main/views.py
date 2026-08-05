@@ -1004,7 +1004,7 @@ class ProductCompactListView(CompanyBranchRestrictedMixin, generics.ListAPIView)
     serializer_class = ProductListSerializer
     pagination_class = CompactProductCursorPagination
     filter_backends = [ProductBarcodeAwareSearchFilter, filters.OrderingFilter]
-    search_fields = ["name", "barcode"]
+    search_fields = ["name", "barcode", "alternate_barcodes__barcode"]
     ordering_fields = ["created_at", "updated_at", "price"]
     ordering = ["-created_at"]
 
@@ -1014,6 +1014,7 @@ class ProductCompactListView(CompanyBranchRestrictedMixin, generics.ListAPIView)
             .select_related("brand", "category")  # Оптимизация: загружаем brand и category одним запросом (на случай будущего использования)
             .only(
                 "id",
+                "kind",
                 "name",
                 "price",
                 "wholesale_price",
@@ -1534,10 +1535,13 @@ class ProductCreateManualAPIView(CompanyBranchRestrictedMixin, generics.CreateAP
             price = _calc_price(purchase_price, markup_percent)
 
         # quantity (дробный остаток, до 3 знаков: 10.200)
-        try:
-            quantity = _parse_decimal_nonneg(data.get("quantity", 0), "quantity")
-        except ValueError:
-            return Response({"quantity": "Неверное количество."}, status=status.HTTP_400_BAD_REQUEST)
+        if kind_value == Product.Kind.SERVICE:
+            quantity = Decimal("0.000")
+        else:
+            try:
+                quantity = _parse_decimal_nonneg(data.get("quantity", 0), "quantity")
+            except ValueError:
+                return Response({"quantity": "Неверное количество."}, status=status.HTTP_400_BAD_REQUEST)
 
         # status
         try:

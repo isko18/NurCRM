@@ -124,6 +124,16 @@ def _apply_preset(qs, preset: str):
 
     if preset == "discounted":
         return qs.filter(Q(discount_percent__gt=0) | Q(stock=True))
+    if preset in (
+        "shelf_life_expires_7d",
+        "zero_cost",
+        "shelf_life_expired",
+        "out_of_stock",
+        "negative_stock",
+        "stock_below_min",
+    ):
+        qs = qs.exclude(kind=Product.Kind.SERVICE)
+
     if preset == "shelf_life_expires_7d":
         end = today + timedelta(days=7)
         return qs.filter(

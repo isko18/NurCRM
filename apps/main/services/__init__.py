@@ -67,6 +67,8 @@ def checkout_cart(
     if not allow_negative_stock:
         for pid, need in consume_by_pid.items():
             p = products[pid]
+            if getattr(p, "kind", None) == Product.Kind.SERVICE:
+                continue
             have = Decimal(str(p.quantity or 0))
             if need > have:
                 raise NotEnoughStock(
@@ -119,6 +121,8 @@ def checkout_cart(
     changed = []
     for pid, qty_need in consume_by_pid.items():
         p = products[pid]
+        if getattr(p, "kind", None) == Product.Kind.SERVICE:
+            continue
         p.quantity = Decimal(str(p.quantity or 0)) - qty_need
         changed.append(p)
     if changed:
