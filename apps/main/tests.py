@@ -251,3 +251,94 @@ class ProductCreateManualWholesalePriceTestCase(TestCase):
         self.assertEqual(Decimal(str(resp.data["wholesale_price"])), Decimal("31"))
         product = Product.objects.get(pk=resp.data["id"])
         self.assertEqual(product.wholesale_price, Decimal("31"))
+
+
+class ServiceKindTestCase(TestCase):
+    def setUp(self):
+        from apps.construction.models import Cashbox, CashShift
+        from apps.main.models import Cart, CartItem
+        from apps.main.services import checkout_cart, apply_product_list_filters
+
+        self.owner = User.objects.create_user(email="service-owner@test.com", password="testpass123")
+        self.company = Company.objects.create(name="Service Test Co", owner=self.owner)
+        self.owner.company = self.company
+        self.owner.save(update_fields=["company"])
+        self.cashbox = Cashbox.objects.create(name="Main Cashbox", company=self.company)
+        self.shift = CashShift.objects.create(cashbox=self.cashbox, cashier=self.owner, status=CashShift.Status.OPEN)
+        self.api_factory = APIRequestFactory()
+
+    def test_create_service_manual_sets_quantity_zero(self):
+        req = self.api_factory.post(
+            "/main/products/create-manual/",
+            {
+                "name": "Стрижка модельная",
+                "kind": "service",
+                "barcode": "2000000000015",
+                "price": "800",
+                "quantity": 0,
+            },
+            format="json",
+        )
+        force_authenticate(req, user=self.owner)
+        resp = ProductCreateManualAPIView.as_view()(req)
+        self.assertEqual(resp.status_code, 201, getattr(resp, "data", resp.content))
+        self.assertEqual(resp.data["kind"], "service")
+        self.assertEqual(Decimal(str(resp.data["quantity"])), Decimal("0"))
+
+    def test_checkout_service_does_not_check_or_decrement_stock(self):
+        from apps.main.models import Cart, CartItem, Sale
+        from apps.main.services import checkout_cart
+
+        service_prod = Product.objects.create(
+            company=self.company,
+            name="Консультация",
+            kind=Product.Kind.SERVICE,
+            price=Decimal("1500"),
+            quantity=Decimal("0"),
+        )
+        cart = Cart.objects.create(
+            company=self.company,
+            user=self.owner,
+            shift=self.shift,
+            cashbox=self.cashbox,
+            status=Cart.Status.ACTIVE,
+        )
+        CartItem.objects.create(
+            cart=cart,
+            company=self.company,
+            product=service_prod,
+            quantity=Decimal("5"),
+            unit_price=Decimal("1500"),
+        )
+
+        sale = checkout_cart(cart)
+        self.assertEqual(sale.status, Sale.Status.NEW)
+        service_prod.refresh_from_db()
+        # Quantity remains 0, stock not checked or decremented
+        self.assertEqual(service_prod.quantity, Decimal("0"))
+
+    def test_preset_filters_exclude_services(self):
+        from apps.main.services.product_list_filters import apply_product_list_filters
+
+        service_prod = Product.objects.create(
+            company=self.company,
+            name="Услуга 1",
+            kind=Product.Kind.SERVICE,
+            price=Decimal("500"),
+            quantity=Decimal("0"),
+        )
+        physical_prod = Product.objects.create(
+            company=self.company,
+            name="Товар 1",
+            kind=Product.Kind.PRODUCT,
+            price=Decimal("100"),
+            quantity=Decimal("0"),
+        )
+
+        qs = Product.objects.filter(company=self.company)
+        filtered_qs = apply_product_list_filters(qs, {"preset": "out_of_stock"})
+
+        res_ids = list(filtered_qs.values_list("id", flat=True))
+        self.assertIn(physical_prod.id, res_ids)
+        self.assertNotIn(service_prod.id, res_ids)
+

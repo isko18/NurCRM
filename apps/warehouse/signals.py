@@ -10,11 +10,17 @@ from .utils import ensure_system_payment_categories
 def create_system_payment_categories_for_company(sender, instance: Company, created, **kwargs):
     if not created:
         return
-    ensure_system_payment_categories(instance, branch=None)
+    try:
+        ensure_system_payment_categories(instance, branch=None)
+    except Exception:
+        pass
 
 
 @receiver(post_save, sender=Branch)
 def create_system_payment_categories_for_branch(sender, instance: Branch, created, **kwargs):
     if not created:
         return
-    ensure_system_payment_categories(instance.company, branch=instance)
+    try:
+        ensure_system_payment_categories(instance.company, branch=instance)
+    except Exception:
+        pass

@@ -978,7 +978,8 @@ class AnalyticsView(APIView):
             price_field = "price" if _model_has_field(Product, "price") else None
 
             if qty_field:
-                sum_row = pqs.aggregate(
+                stock_pqs = pqs.exclude(kind=Product.Kind.SERVICE) if _model_has_field(Product, "kind") else pqs
+                sum_row = stock_pqs.aggregate(
                     s=Coalesce(
                         Sum(qty_field),
                         Value(Z_QTY, output_field=QTY_FIELD),

@@ -127,10 +127,13 @@ class SaleItemSerializer(serializers.ModelSerializer):
 
     sale_package = serializers.UUIDField(source="sale_package_id", read_only=True, allow_null=True)
 
+    kind = serializers.CharField(source="product.kind", read_only=True, default="product")
+
     class Meta:
         model = CartItem
         fields = (
             "id", "cart", "product",
+            "kind",
             "product_name", "barcode",
             "is_weight",
             "stock", "promotion_rules",
@@ -140,7 +143,7 @@ class SaleItemSerializer(serializers.ModelSerializer):
             "primary_image_url",
         )
         read_only_fields = (
-            "id", "product_name", "barcode",
+            "id", "kind", "product_name", "barcode",
             "stock", "promotion_rules", "line_total",
             "display_name", "primary_image_url",
             "sale_package",
@@ -668,6 +671,7 @@ class SaleListSerializer(serializers.ModelSerializer):
 
 class SaleItemReadSerializer(serializers.ModelSerializer):
     product_name = serializers.SerializerMethodField()
+    kind = serializers.CharField(source="product.kind", read_only=True, default="product")
     line_total = serializers.SerializerMethodField()
 
     class Meta:
@@ -675,6 +679,7 @@ class SaleItemReadSerializer(serializers.ModelSerializer):
         fields = (
             "id",
             "product",
+            "kind",
             "product_name",
             "name_snapshot",
             "barcode_snapshot",

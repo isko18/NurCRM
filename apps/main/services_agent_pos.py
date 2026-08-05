@@ -208,7 +208,7 @@ def checkout_agent_cart(
         pid = str(v["product"].id)
         need = int(v["qty"] or 0)
         if use_main_stock:
-            if allow_negative_stock:
+            if allow_negative_stock or getattr(v["product"], "kind", None) == Product.Kind.SERVICE:
                 continue
             p = products_by_id.get(v["product"].id)
             have = int(Decimal(str(getattr(p, "quantity", 0) or 0)))
@@ -331,6 +331,8 @@ def checkout_agent_cart(
         changed_products = []
         for k, v in needs.items():
             if k.startswith("custom:"):
+                continue
+            if getattr(v["product"], "kind", None) == Product.Kind.SERVICE:
                 continue
             p = products_by_id.get(v["product"].id)
             if p is None:

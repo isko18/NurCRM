@@ -31,6 +31,35 @@ def _resolve_partner_branch_scope(request, partner_company):
     return branch, False
 
 
+def _resolve_owner_branch_scope(request, view_instance, company):
+    """
+    Определяет филиал и флаг all_branches для аналитики владельца компании.
+    - If ?all_branches=true / 1 -> all_branches = True, branch = None
+    - If ?branch=<uuid> -> branch = Branch.objects.get(...), all_branches = False
+    - If user has fixed branch -> branch = fixed_branch, all_branches = False
+    - Otherwise (no ?branch= in params and no fixed branch) -> all_branches = True, branch = None
+    """
+    raw_all = (request.query_params.get("all_branches") or request.query_params.get("include_all") or "").strip().lower()
+    if raw_all in ("1", "true", "yes"):
+        return None, True
+
+    raw_branch = (request.query_params.get("branch") or "").strip()
+    if raw_branch:
+        if raw_branch.lower() in ("null", "all", "none"):
+            return None, True
+        try:
+            br = Branch.objects.get(id=raw_branch, company=company)
+            return br, False
+        except (Branch.DoesNotExist, ValueError):
+            raise PermissionDenied("Указанный филиал не найден.")
+
+    fixed_branch = view_instance._fixed_branch_from_user(company)
+    if fixed_branch is not None:
+        return fixed_branch, False
+
+    return None, True
+
+
 class WarehouseAgentMyAnalyticsAPIView(CompanyBranchRestrictedMixin, APIView):
     """
     GET /api/warehouse/agents/me/analytics/
@@ -96,11 +125,12 @@ class WarehouseOwnerOverallAnalyticsAPIView(CompanyBranchRestrictedMixin, APIVie
             raise PermissionDenied("Только владелец/админ.")
 
         company = self._company()
-        branch = self._auto_branch()
         if not company:
             raise PermissionDenied("Компания не найдена.")
 
+        branch, all_branches = _resolve_owner_branch_scope(request, self, company)
         period = _parse_period(request)
+
         data = build_owner_warehouse_analytics_payload(
             company_id=str(company.id),
             branch_id=str(branch.id) if branch else None,
@@ -108,6 +138,7 @@ class WarehouseOwnerOverallAnalyticsAPIView(CompanyBranchRestrictedMixin, APIVie
             date_from=period["date_from"],
             date_to=period["date_to"],
             group_by=period["group_by"],
+            all_branches=all_branches,
         )
         return Response(data)
 
@@ -124,10 +155,10 @@ class WarehouseOwnerAgentsSalesAnalyticsAPIView(CompanyBranchRestrictedMixin, AP
             raise PermissionDenied("Только владелец/админ.")
 
         company = self._company()
-        branch = self._auto_branch()
         if not company:
             raise PermissionDenied("Компания не найдена.")
 
+        branch, all_branches = _resolve_owner_branch_scope(request, self, company)
         period = _parse_period(request)
 
         def _int(name: str, default: int):
@@ -153,6 +184,7 @@ class WarehouseOwnerAgentsSalesAnalyticsAPIView(CompanyBranchRestrictedMixin, AP
             limit=limit,
             offset=offset,
             order_by=order_by,
+            all_branches=all_branches,
         )
         return Response(data)
 
