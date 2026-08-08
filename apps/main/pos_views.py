@@ -44,6 +44,8 @@ from apps.users.models import (
     SCALE_BARCODE_MODE_AMOUNT,
     SCALE_BARCODE_LAYOUT_PLU,
     SCALE_BARCODE_LAYOUT_CODE,
+    SCALE_BARCODE_AMOUNT_UNIT_TIYIN,
+    SCALE_BARCODE_AMOUNT_UNIT_SOM,
 )
 from apps.main.models import (
     Cart,
@@ -759,15 +761,16 @@ SCALE_AMOUNT_PREFIXES = {"25"}
 
 
 def _company_scale_barcode_settings(company_id):
-    """(mode, layout) чтения штрихкода весов для компании."""
+    """(mode, layout, amount_unit) чтения штрихкода весов для компании."""
     row = (
         Company.objects.filter(id=company_id)
-        .values("scale_barcode_mode", "scale_barcode_layout")
+        .values("scale_barcode_mode", "scale_barcode_layout", "scale_barcode_amount_unit")
         .first()
     ) or {}
     mode = row.get("scale_barcode_mode") or SCALE_BARCODE_MODE_AUTO
     layout = row.get("scale_barcode_layout") or SCALE_BARCODE_LAYOUT_PLU
-    return mode, layout
+    amount_unit = row.get("scale_barcode_amount_unit") or SCALE_BARCODE_AMOUNT_UNIT_TIYIN
+    return mode, layout, amount_unit
 
 
 def _company_scale_barcode_mode(company_id) -> str:
@@ -776,19 +779,21 @@ def _company_scale_barcode_mode(company_id) -> str:
 
 
 def _parse_scale_barcode(barcode: str, mode: str = SCALE_BARCODE_MODE_AUTO,
-                         layout: str = SCALE_BARCODE_LAYOUT_PLU):
+                         layout: str = SCALE_BARCODE_LAYOUT_PLU,
+                         amount_unit: str = SCALE_BARCODE_AMOUNT_UNIT_TIYIN):
     """
     EAN-13 штрихкод весов. Раскладка полей задаётся `layout`:
 
     - "plu"  (по умолчанию): FF PPPPP EEEEE C
         FF (20–29) префикс, PPPPP PLU (5 цифр), EEEEE вес/сумма (5 цифр), C — чек.
         Товар ищется по Product.plu.
-    - "code" : FF PPPPPP WWWW C
-        FF префикс, PPPPPP PLU (6 цифр — в экспорте «Код»=PLU), WWWW вес (4 цифры,
-        граммы), C — чек. Товар ищется по Product.plu; значение всегда трактуется как вес.
+    - "code" : FF PPPPPP EEEE C
+        FF префикс, PPPPPP PLU (6 цифр — в экспорте «Код»=PLU), EEEE вес/сумма
+        (4 цифры), C — чек. Товар ищется по Product.plu.
 
-    Трактовка поля значения (для layout=plu) задаётся `mode`
-    (Company.scale_barcode_mode): weight | amount | auto (по префиксу).
+    Трактовка поля значения задаётся `mode` (Company.scale_barcode_mode):
+    weight | amount | auto (по префиксу). Единица суммы — `amount_unit`
+    (Company.scale_barcode_amount_unit): tiyin (÷100) | som (целые сомы).
     """
     if not barcode or len(barcode) != 13 or not barcode.isdigit():
         return None
@@ -803,27 +808,11 @@ def _parse_scale_barcode(barcode: str, mode: str = SCALE_BARCODE_MODE_AUTO,
 
     check_digit = barcode[12]
 
-    # --- Раскладка «по коду»: префикс(2) + PLU(6) + вес(4) + чек ---
-    # В экспорте «Код»=PLU, поэтому 6-значное поле — это PLU; ищем по Product.plu.
+    # Границы полей: «по коду» — PLU(6)+значение(4), «по PLU» — PLU(5)+значение(5).
     if layout == SCALE_BARCODE_LAYOUT_CODE:
-        try:
-            plu = int(barcode[2:8])
-            weight_raw = int(barcode[8:12])
-        except ValueError:
-            return None
-        return {
-            "prefix": prefix,
-            "plu": plu,
-            "raw_code": str(plu),
-            "weight_raw": weight_raw,
-            "weight_kg": Decimal(weight_raw) / Decimal(1000),
-            "check_digit": check_digit,
-            "mode": "weight",
-        }
-
-    # --- Раскладка «по PLU»: префикс(2) + PLU(5) + значение(5) + чек ---
-    raw_code = barcode[2:7]
-    value_raw = barcode[7:12]
+        raw_code, value_raw = barcode[2:8], barcode[8:12]
+    else:
+        raw_code, value_raw = barcode[2:7], barcode[7:12]
 
     try:
         plu = int(raw_code)
@@ -846,32 +835,36 @@ def _parse_scale_barcode(barcode: str, mode: str = SCALE_BARCODE_MODE_AUTO,
         return {
             "prefix": prefix,
             "plu": plu,
-            "raw_code": raw_code,
+            # Раскладка «по коду» исторически отдавала код без ведущих нулей.
+            "raw_code": str(plu) if layout == SCALE_BARCODE_LAYOUT_CODE else raw_code,
             "weight_raw": weight_raw,
             "weight_kg": Decimal(weight_raw) / Decimal(1000),
             "check_digit": check_digit,
             "mode": "weight",
         }
 
-    # Итоговый/прочие префиксы: в поле зашита СТОИМОСТЬ.
-    # Весы кодируют сумму как целое число тыйын (2 знака после запятой):
-    # на этикетке 38.00 сом → в штрихкоде поле «03800». Делим на 100.
-    amount = (Decimal(value_raw) / Decimal(100)).quantize(
+    # Итоговый/прочие префиксы: в поле зашита СТОИМОСТЬ. Единица зависит от весов:
+    #   tiyin — сумма в тыйынах: на этикетке 38.00 сом → поле «03800» (делим на 100);
+    #   som   — сумма целыми сомами: на этикетке 36 сом → поле «00036» (как есть).
+    divisor = Decimal(1) if amount_unit == SCALE_BARCODE_AMOUNT_UNIT_SOM else Decimal(100)
+    amount = (Decimal(value_raw) / divisor).quantize(
         Decimal("0.01"), rounding=ROUND_HALF_UP
     )
 
     return {
         "prefix": prefix,
         "plu": plu,
-        "raw_code": raw_code,
+        "raw_code": str(plu) if layout == SCALE_BARCODE_LAYOUT_CODE else raw_code,
         "amount_raw": value_raw,
         "amount": amount,
+        "amount_unit": amount_unit,
         "check_digit": check_digit,
         "mode": "amount_plain",
     }
 
 
-def _scale_barcode_variants(barcode: str, mode: str, layout: str) -> list[dict]:
+def _scale_barcode_variants(barcode: str, mode: str, layout: str,
+                            amount_unit: str = SCALE_BARCODE_AMOUNT_UNIT_TIYIN) -> list[dict]:
     """
     Разборы весового штрихкода: сначала раскладка из настроек компании, затем запасная.
 
@@ -881,8 +874,11 @@ def _scale_barcode_variants(barcode: str, mode: str, layout: str) -> list[dict]:
     Если в `Company.scale_barcode_layout` указана не та раскладка, которую реально
     печатают весы, товар не находится («Товар с PLU 4530 … не найден»). Поэтому после
     промаха по основной раскладке пробуем альтернативную.
+
+    Обе раскладки трактуют поле значения одинаково (вес или сумма — по `mode`),
+    поэтому запасной разбор безопасен и для суммового штрихкода.
     """
-    primary = _parse_scale_barcode(barcode, mode, layout)
+    primary = _parse_scale_barcode(barcode, mode, layout, amount_unit)
     if not primary:
         return []
 
@@ -892,13 +888,8 @@ def _scale_barcode_variants(barcode: str, mode: str, layout: str) -> list[dict]:
         if layout == SCALE_BARCODE_LAYOUT_CODE
         else SCALE_BARCODE_LAYOUT_CODE
     )
-    # Раскладка `code` всегда трактует поле значения как ВЕС. Для суммового штрихкода
-    # (mode=amount / префикс 25) такой запасной разбор дал бы неверное количество —
-    # не подставляем его.
-    if alt_layout == SCALE_BARCODE_LAYOUT_CODE and primary.get("mode") != "weight":
-        return variants
 
-    alt = _parse_scale_barcode(barcode, mode, alt_layout)
+    alt = _parse_scale_barcode(barcode, mode, alt_layout, amount_unit)
     if alt and alt.get("plu") != primary.get("plu"):
         variants.append(alt)
     return variants
@@ -1172,8 +1163,8 @@ def _lookup_product_for_pos_scan(company_id, barcode: str, *, only_fields=POS_SC
         except ValueError:
             pass
 
-    scale_mode, scale_layout = _company_scale_barcode_settings(company_id)
-    scale_variants = _scale_barcode_variants(barcode, scale_mode, scale_layout)
+    scale_mode, scale_layout, scale_amount_unit = _company_scale_barcode_settings(company_id)
+    scale_variants = _scale_barcode_variants(barcode, scale_mode, scale_layout, scale_amount_unit)
     if scale_variants:
         for idx, scale_data in enumerate(scale_variants):
             product = _resolve_product_by_plu_or_code_for_pos(

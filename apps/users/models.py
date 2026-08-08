@@ -129,6 +129,17 @@ SCALE_BARCODE_LAYOUT_CHOICES = [
     (SCALE_BARCODE_LAYOUT_CODE, "По коду (префикс+PLU(6)+вес(4))"),
 ]
 
+# Единица суммы в поле ШК — применяется, когда поле трактуется как СУММА
+# (mode=amount либо auto с «суммовым» префиксом). Разные весы кодируют по-разному:
+#   "tiyin" : сумма в тыйынах, 2 знака после запятой — 03800 → 38.00 сом
+#   "som"   : сумма целыми сомами                    — 00036 → 36 сом
+SCALE_BARCODE_AMOUNT_UNIT_TIYIN = "tiyin"
+SCALE_BARCODE_AMOUNT_UNIT_SOM = "som"
+SCALE_BARCODE_AMOUNT_UNIT_CHOICES = [
+    (SCALE_BARCODE_AMOUNT_UNIT_TIYIN, "Тыйын (03800 = 38.00 сом)"),
+    (SCALE_BARCODE_AMOUNT_UNIT_SOM, "Сом (00036 = 36 сом)"),
+]
+
 
 class Company(models.Model):
     objects = CompanyManager()
@@ -215,6 +226,17 @@ class Company(models.Model):
             "Как разбирать штрихкод: «По PLU» — префикс+PLU(5)+вес(5); "
             "«По коду» — префикс+PLU(6)+вес(4). В обоих товар ищется по Product.plu "
             "(в выгрузке «Код»=PLU)."
+        ),
+    )
+
+    scale_barcode_amount_unit = models.CharField(
+        max_length=10,
+        choices=SCALE_BARCODE_AMOUNT_UNIT_CHOICES,
+        default=SCALE_BARCODE_AMOUNT_UNIT_TIYIN,
+        verbose_name="Единица суммы в штрихкоде весов",
+        help_text=(
+            "Работает только когда поле ШК трактуется как СУММА. "
+            "«Тыйын» — 03800 = 38.00 сом; «Сом» — 00036 = 36 сом."
         ),
     )
 
@@ -310,6 +332,8 @@ class Company(models.Model):
         # весы
         if not self.scale_barcode_layout:
             self.scale_barcode_layout = SCALE_BARCODE_LAYOUT_PLU
+        if not self.scale_barcode_amount_unit:
+            self.scale_barcode_amount_unit = SCALE_BARCODE_AMOUNT_UNIT_TIYIN
 
         # slug
         if not self.slug:
