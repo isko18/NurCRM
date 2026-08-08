@@ -2641,6 +2641,13 @@ class Notification(models.Model):
         HIGH = "high", "Важно"
         CRITICAL = "critical", "Критично"
 
+    class Category(models.TextChoices):
+        TARIFF = "tariff", "Тариф"
+        SYSTEM = "system", "Системные"
+        NEWS = "news", "Новости"
+        OTHER = "other", "Другое"
+
+    category = models.CharField("Категория", max_length=40, choices=Category.choices, default=Category.OTHER, db_index=True)
     type = models.CharField("Тип события", max_length=40, default="system", db_index=True)
     title = models.CharField("Заголовок", max_length=255, blank=True, default="")
     url = models.CharField("Ссылка для перехода", max_length=512, blank=True, default="")

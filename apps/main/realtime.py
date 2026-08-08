@@ -52,6 +52,7 @@ def notification_payload(notification) -> dict:
         )
     return {
         "id": str(notification.id),
+        "category": getattr(notification, "category", "other"),
         "type": notification.type,
         "title": notification.title or "",
         "message": notification.message or "",
@@ -89,7 +90,7 @@ def publish_notification(notification) -> None:
         logger.error("Failed to publish notification id=%s over WS", getattr(notification, "id", None), exc_info=True)
 
 
-def create_and_publish_notification(*, company, user, message, title="", type="system",
+def create_and_publish_notification(*, company, user, message, title="", category="other", type="system",
                                     level="info", url="", actor=None, branch=None, data=None):
     """
     Создаёт Notification и публикует его в WS после коммита транзакции.
@@ -97,12 +98,15 @@ def create_and_publish_notification(*, company, user, message, title="", type="s
     """
     from apps.main.models import Notification
 
+    cat = category if category != "other" else (type if type in ("tariff", "system", "news") else "other")
+
     notification = Notification.objects.create(
         company=company,
         branch=branch,
         user=user,
         message=message,
         title=title or "",
+        category=cat,
         type=type or "system",
         level=level or "info",
         url=url or "",
@@ -122,3 +126,49 @@ def create_and_publish_notification(*, company, user, message, title="", type="s
         _publish()
 
     return notification
+
+
+def check_and_create_tariff_notifications():
+    """
+    Проверяет даты окончания подписок компаний (Company.end_date)
+    и создаёт уведомления категории 'tariff' за 7, 3 и 1 день до окончания.
+    """
+    from apps.users.models import Company
+    from apps.main.models import Notification
+    from django.utils import timezone
+
+    now = timezone.now()
+    today = now.date()
+
+    companies = Company.objects.filter(end_date__isnull=False, owner__isnull=False)
+    created_list = []
+    for company in companies:
+        days_left = (company.end_date.date() - today).days
+        if days_left in (7, 3, 1):
+            title = f"Срок подписки истекает через {days_left} дн."
+            already_sent = Notification.objects.filter(
+                company=company,
+                user=company.owner,
+                category="tariff",
+                created_at__date=today,
+                title=title,
+            ).exists()
+            if not already_sent:
+                notif = create_and_publish_notification(
+                    company=company,
+                    user=company.owner,
+                    title=title,
+                    message=f"До окончания подписки компании '{company.name}' осталось {days_left} дн. Пожалуйста, продлите тариф.",
+                    category="tariff",
+                    type="tariff",
+                    level=Notification.Level.HIGH if days_left <= 3 else Notification.Level.WARNING,
+                    url="/crm/subscription",
+                    data={
+                        "days_left": days_left,
+                        "cta_label": "Продлить",
+                        "cta_url": "/crm/subscription",
+                    },
+                )
+                if notif:
+                    created_list.append(notif)
+    return created_list

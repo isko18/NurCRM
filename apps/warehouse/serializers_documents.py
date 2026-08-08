@@ -344,10 +344,8 @@ class DocumentSerializer(serializers.ModelSerializer):
 
     @staticmethod
     def _resolve_sale_status(doc_type, is_sale_request, current_status=None):
-        if current_status in (models.Document.Status.POSTED, models.Document.Status.CASH_PENDING):
+        if current_status in (models.Document.Status.POSTED, models.Document.Status.CASH_PENDING, models.Document.Status.REJECTED):
             return current_status
-        if doc_type == models.Document.DocType.SALE and bool(is_sale_request):
-            return models.Document.Status.SALE_REQUEST
         return models.Document.Status.DRAFT
 
     def _apply_multi_warehouse_defaults(self, attrs):

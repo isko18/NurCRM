@@ -472,14 +472,20 @@ class DocumentPostView(CompanyBranchRestrictedMixin, generics.GenericAPIView):
             services.post_document(doc, allow_negative=allow_negative)
             doc.refresh_from_db()
 
-            # Если при проведении наличной продажи документ перешёл в CASH_PENDING,
-            # но запрос отправлен администратором/менеджером или указан auto_approve_cash,
-            # автоматически переводим статус в POSTED.
-            auto_approve_cash = request.data.get("auto_approve_cash", True)
-            if isinstance(auto_approve_cash, str):
-                auto_approve_cash = auto_approve_cash.lower() in ("true", "1", "yes")
+            # Если при проведении наличной продажи документ перешёл в CASH_PENDING:
+            # - Для владельца/админа по умолчанию auto_approve = True
+            # - Для агента по умолчанию auto_approve = False (нужно решение кассы)
+            # - Если в запросе передан auto_approve_cash, учитываем его значение.
+            raw_auto_approve = request.data.get("auto_approve_cash", None)
+            if raw_auto_approve is not None:
+                if isinstance(raw_auto_approve, str):
+                    auto_approve_cash = raw_auto_approve.lower() in ("true", "1", "yes")
+                else:
+                    auto_approve_cash = bool(raw_auto_approve)
+            else:
+                auto_approve_cash = _is_owner_like(request.user)
 
-            if doc.status == doc.Status.CASH_PENDING and (auto_approve_cash or _is_owner_like(request.user)):
+            if doc.status == doc.Status.CASH_PENDING and auto_approve_cash:
                 try:
                     services.approve_cash_request(doc, decided_by=request.user)
                 except Exception as e:

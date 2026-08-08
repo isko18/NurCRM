@@ -2354,11 +2354,21 @@ class ProductByBarcodeAPIView(CompanyBranchRestrictedMixin, generics.RetrieveAPI
         return _annotate_product_is_favorite(_filter_products_company_only(self, qs))
 
     def get_object(self):
+        import re
         from rest_framework.exceptions import NotFound
 
         barcode = self.kwargs.get("barcode")
         if not barcode:
             raise NotFound(detail="Штрих-код не указан")
+            
+        barcode = barcode.replace(' ', '')
+        if 'Alt' in barcode:
+            alt_codes = re.findall(r'Alt(\d+)', barcode)
+            if alt_codes:
+                try:
+                    barcode = ''.join(chr(int(code)) for code in alt_codes)
+                except ValueError:
+                    pass
 
         product = (
             self.get_queryset()
@@ -2472,16 +2482,20 @@ class NotificationListView(CompanyBranchRestrictedMixin, generics.ListAPIView):
     queryset = Notification.objects.select_related("company", "branch", "user", "actor").all()
     pagination_class = LimitOffsetPagination
     filter_backends = [DjangoFilterBackend]
-    filterset_fields = ["type", "level", "is_read"]
+    filterset_fields = ["category", "type", "level", "is_read"]
 
     def get_queryset(self):
         # Уведомления персональные: каждый пользователь (в т.ч. агент) видит только свои.
-        return super().get_queryset().filter(user=self.request.user)
+        qs = super().get_queryset().filter(user=self.request.user)
+        cat = (self.request.query_params.get("category") or "").strip()
+        if cat:
+            qs = qs.filter(Q(category=cat) | Q(type=cat))
+        return qs
 
     def list(self, request, *args, **kwargs):
         response = super().list(request, *args, **kwargs)
         # Точное число непрочитанных (для колокольчика) — независимо от фильтров/пагинации.
-        unread = self.get_queryset().filter(is_read=False).count()
+        unread = Notification.objects.filter(user=self.request.user, is_read=False).count()
         if isinstance(response.data, dict):
             response.data["unread_count"] = unread
         else:
@@ -2489,7 +2503,7 @@ class NotificationListView(CompanyBranchRestrictedMixin, generics.ListAPIView):
         return response
 
 
-class NotificationDetailView(CompanyBranchRestrictedMixin, generics.RetrieveAPIView):
+class NotificationDetailView(CompanyBranchRestrictedMixin, generics.RetrieveDestroyAPIView):
     serializer_class = NotificationSerializer
     queryset = Notification.objects.select_related("company", "branch", "user", "actor").all()
 
@@ -2501,7 +2515,11 @@ class MarkAllNotificationsReadView(APIView):
     permission_classes = [permissions.IsAuthenticated]
 
     def post(self, request, *args, **kwargs):
-        Notification.objects.filter(user=request.user, is_read=False).update(is_read=True)
+        cat = (request.query_params.get("category") or (request.data and request.data.get("category")) or "").strip()
+        qs = Notification.objects.filter(user=request.user, is_read=False)
+        if cat:
+            qs = qs.filter(Q(category=cat) | Q(type=cat))
+        qs.update(is_read=True)
         return Response({"status": "Все уведомления прочитаны"}, status=status.HTTP_200_OK)
 
 
@@ -2517,6 +2535,59 @@ class MarkNotificationReadView(APIView):
             notification.is_read = True
             notification.save(update_fields=["is_read"])
         return Response({"id": str(notification.id), "is_read": True}, status=status.HTTP_200_OK)
+
+
+class POSQuickSlotsAPIView(CompanyBranchRestrictedMixin, APIView):
+    """
+    Управление быстрыми слотами кассы (F3 + 0..9):
+    GET /api/main/pos/quick-slots/
+    PUT /api/main/pos/quick-slots/
+    """
+    def get(self, request, *args, **kwargs):
+        company = self._company()
+        if not company:
+            return Response({"slots": {str(i): None for i in range(10)}}, status=status.HTTP_200_OK)
+
+        data = getattr(company, "pos_quick_slots", None) or {}
+        if not isinstance(data, dict):
+            data = {}
+        slots = {str(i): data.get(str(i)) for i in range(10)}
+        return Response({"slots": slots}, status=status.HTTP_200_OK)
+
+    def put(self, request, *args, **kwargs):
+        company = self._company()
+        if not company:
+            raise ValidationError({"detail": "Компания не определена."})
+
+        new_slots = request.data.get("slots")
+        if new_slots is None and isinstance(request.data, dict):
+            new_slots = request.data
+
+        if not isinstance(new_slots, dict):
+            raise ValidationError({"slots": "Слоты должны быть объектом с ключами 0..9."})
+
+        current_slots = getattr(company, "pos_quick_slots", None) or {}
+        if not isinstance(current_slots, dict):
+            current_slots = {}
+
+        for k in range(10):
+            key = str(k)
+            if key in new_slots:
+                val = new_slots[key]
+                if val is not None and str(val).strip():
+                    try:
+                        val = str(UUID(str(val)))
+                    except Exception:
+                        raise ValidationError({"slots": f"Слот {key}: некорректный UUID товара."})
+                else:
+                    val = None
+                current_slots[key] = val
+
+        company.pos_quick_slots = current_slots
+        company.save(update_fields=["pos_quick_slots"])
+
+        slots = {str(i): current_slots.get(str(i)) for i in range(10)}
+        return Response({"slots": slots}, status=status.HTTP_200_OK)
 
 
 # ===========================
@@ -2656,9 +2727,19 @@ class ProductByGlobalBarcodeAPIView(CompanyBranchRestrictedMixin, generics.Retri
     queryset = GlobalProduct.objects.select_related("brand", "category").all()
 
     def get_object(self):
+        import re
         barcode = self.kwargs.get("barcode")
         if not barcode:
             raise NotFound(detail="Штрих-код не указан")
+            
+        barcode = barcode.replace(' ', '')
+        if 'Alt' in barcode:
+            alt_codes = re.findall(r'Alt(\d+)', barcode)
+            if alt_codes:
+                try:
+                    barcode = ''.join(chr(int(code)) for code in alt_codes)
+                except ValueError:
+                    pass
         obj = self.get_queryset().filter(barcode=barcode).first()
         if not obj:
             raise NotFound(detail="Товар с таким штрих-кодом не найден в глобальной базе")

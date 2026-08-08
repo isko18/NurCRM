@@ -240,6 +240,13 @@ class Company(models.Model):
         ),
     )
 
+    pos_quick_slots = models.JSONField(
+        "Быстрые слоты кассы F3",
+        default=dict,
+        blank=True,
+        help_text="Слоты быстрых товаров F3+0..9: {\"0\": \"product_uuid\", ...}",
+    )
+
     def ensure_scale_api_token(self):
         if not self.scale_api_token:
             self.scale_api_token = str(uuid.uuid4())
