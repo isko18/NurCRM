@@ -22,6 +22,7 @@ from rest_framework.exceptions import NotFound, PermissionDenied, ValidationErro
 from decimal import Decimal, ROUND_HALF_UP, InvalidOperation
 from datetime import timedelta, datetime, date, time as dtime
 import io, os, uuid, logging
+from django.db import IntegrityError
 
 from django.db.models import Q, F, Value as V, Sum, Prefetch, Count
 from django.db.models.functions import Coalesce
@@ -991,6 +992,7 @@ POS_SCAN_PRODUCT_FIELDS = (
     "plu",
     "code",
     "is_weight",
+    "kind",
 )
 
 
@@ -1056,32 +1058,7 @@ def _resolve_product_by_barcode_for_pos(company_id, barcode: str, *, only_fields
         return None
     raw = (barcode or "").strip()
 
-    # 1) Точное совпадение основного штрихкода — вне конкуренции.
-    exact = (
-        Product.objects.only(*only_fields)
-        .filter(company_id=company_id, barcode=raw)
-        .first()
-    )
-    if exact:
-        pos_scan_logger.info("scan barcode=%s company=%s -> product=%s (exact)", raw, company_id, exact.pk)
-        return exact
-
-    # 2) Кэш — но проверяем, что товар всё ещё несёт этот штрихкод.
-    for candidate in candidates:
-        cache_key = f"product_barcode:{company_id}:{candidate}"
-        cached_id = _product_pk_from_cache(cache.get(cache_key))
-        if cached_id:
-            p = (
-                Product.objects.only(*only_fields)
-                .filter(pk=cached_id, company_id=company_id)
-                .first()
-            )
-            if p and _product_matches_candidates(p, candidates, company_id):
-                pos_scan_logger.info("scan barcode=%s company=%s -> product=%s (cache)", raw, company_id, p.pk)
-                return p
-            cache.delete(cache_key)
-
-    # 3) Полный поиск по кандидатам (основной + альтернативные), детерминированно.
+    # 1) Полный поиск по кандидатам (основной + альтернативные).
     matches = list(
         Product.objects.only(*only_fields)
         .filter(company_id=company_id)
@@ -2266,16 +2243,23 @@ class SaleStartAPIView(MarketCashierOnlyMixin, CompanyBranchRestrictedMixin, API
             else:
                 cart = _find_locked_shift_cart(company=company, user=user, shift=shift)
                 if cart is None:
-                    cart = Cart.objects.create(
-                        company=company,
-                        user=user,
-                        status=Cart.Status.ACTIVE,
-                        branch=branch or shift.branch,
-                        shift=shift,
-                        is_default=True,
-                        is_wholesale=bool(is_wholesale_req) if is_wholesale_req is not None else False,
-                    )
-                    created = True
+                    try:
+                        with transaction.atomic():
+                            cart = Cart.objects.create(
+                                company=company,
+                                user=user,
+                                status=Cart.Status.ACTIVE,
+                                branch=branch or shift.branch,
+                                shift=shift,
+                                is_default=True,
+                                is_wholesale=bool(is_wholesale_req) if is_wholesale_req is not None else False,
+                            )
+                            created = True
+                    except IntegrityError:
+                        # Race condition fallback
+                        cart = _find_locked_shift_cart(company=company, user=user, shift=shift)
+                        if cart is None:
+                            raise ValidationError({"detail": "Ошибка при создании корзины. Попробуйте еще раз."})
                 elif (branch or shift.branch) and cart.branch_id != getattr(shift.branch, "id", None):
                     cart.branch = branch or shift.branch
                     cart.save(update_fields=["branch"])
@@ -2502,7 +2486,7 @@ class SaleAddItemAPIView(MarketCashierOnlyMixin, APIView):
         else:
             combined_consume = line_qty_consume_units(qty, pkg)
         have = Decimal(str(product.quantity or 0))
-        if (not can_minus) and qty3(other + combined_consume) > have:
+        if product.kind != Product.Kind.SERVICE and (not can_minus) and qty3(other + combined_consume) > have:
             return Response(
                 {
                     "detail": (
@@ -2749,10 +2733,12 @@ def _parse_partial_return_items(data) -> Optional[List[tuple]]:
 def _restock_product_for_sale_item_return(item: SaleItem, return_qty: Decimal) -> None:
     if not item.product_id:
         return
+    if item.product and item.product.kind == Product.Kind.SERVICE:
+        return
     stock_delta = line_qty_consume_units(return_qty, getattr(item, "sale_package", None))
     if stock_delta <= 0:
         return
-    Product.objects.filter(pk=item.product_id).update(quantity=F("quantity") + stock_delta)
+    Product.objects.filter(pk=item.product_id).exclude(kind=Product.Kind.SERVICE).update(quantity=F("quantity") + stock_delta)
 
 
 def _release_agent_allocations_for_qty(sale_item: SaleItem, return_qty_int: int) -> List[tuple]:
@@ -3638,8 +3624,10 @@ class CartItemUpdateDestroyAPIView(MarketCashierOnlyMixin, APIView):
         raise Http404("CartItem not found in this cart.")
 
     def _apply_min_price(self, item, unit_price):
-        """Цена продажи не ниже закупочной. Со скидкой (line_discount > 0) можно ниже."""
+        """Цена продажи не ниже закупочной. Со скидкой (line_discount > 0) можно ниже. Для услуг ограничение отменено."""
         if not item.product_id:
+            return unit_price
+        if getattr(getattr(item, "product", None), "kind", None) == Product.Kind.SERVICE:
             return unit_price
         if Decimal(str(getattr(item, "line_discount", None) or 0)) > 0:
             return unit_price

@@ -1208,6 +1208,13 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
         return value_int
 
     def validate(self, attrs):
+        kind = attrs.get("kind")
+        if kind is None and self.instance is not None:
+            kind = getattr(self.instance, "kind", None)
+        if kind == Product.Kind.SERVICE:
+            attrs["quantity"] = Decimal("0.000")
+            attrs["stock"] = False
+
         data = self.initial_data if isinstance(getattr(self, "initial_data", None), dict) else {}
         promo_in = "promotion_rules_input" in data or "promotion_rules" in data
         raw = None
@@ -2377,7 +2384,7 @@ class ProductListSerializer(serializers.ModelSerializer):
     class Meta:
         model = Product
         fields = [
-            "id", "name", "code", "article",
+            "id", "kind", "name", "code", "article",
             "price", "wholesale_price", "purchase_price",
             "quantity", "brand", "category",
             "hotkey_group",
