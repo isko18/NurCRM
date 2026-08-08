@@ -142,6 +142,7 @@ urlpatterns = [
     path('notifications/mark-all-read/', MarkAllNotificationsReadView.as_view(), name='mark-all-notifications-read'),
     path('notifications/<uuid:pk>/read/', MarkNotificationReadView.as_view(), name='notification-read'),
     path('notifications/<uuid:pk>/', NotificationDetailView.as_view(), name='notification-detail'),
+    path('pos/quick-slots/', POSQuickSlotsAPIView.as_view(), name='pos-quick-slots'),
 
     # 🔹 События
     path('events/', EventListCreateAPIView.as_view(), name='event-list-create'),

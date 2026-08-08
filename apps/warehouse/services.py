@@ -246,7 +246,10 @@ def _pick_single(qs, *, what: str, allow_multiple_take_first: bool = False):
     if len(objs) == 0:
         return None
     if allow_multiple_take_first:
-        return qs.first()
+        try:
+            return qs.order_by("id").first()
+        except Exception:
+            return qs.first()
     raise ValueError(f"Найдено несколько объектов ({what}). Укажите явно в документе.")
 
 

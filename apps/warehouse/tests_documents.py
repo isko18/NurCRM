@@ -1,4 +1,5 @@
 from django.test import TestCase
+from rest_framework.test import APITestCase
 from decimal import Decimal
 from django.contrib.auth import get_user_model
 
@@ -482,5 +483,259 @@ class DocumentsTests(TestCase):
         force_authenticate(request_repeat, user=self.user)
         response_repeat = view(request_repeat, pk=str(doc.id))
         self.assertEqual(response_repeat.status_code, 200)
+
+
+class BackendChecklistTests(APITestCase):
+    def setUp(self):
+        Company = apps.get_model("users", "Company")
+        Branch = apps.get_model("users", "Branch")
+        User = get_user_model()
+        self.owner_user = User.objects.create_user(email="owner_test_check@example.com", password="password123", role="owner")
+        self.company = Company.objects.create(name="Company Check", owner=self.owner_user)
+        self.branch = Branch.objects.create(name="Branch 1", company=self.company)
+        self.whA = models.Warehouse.objects.create(name="Warehouse A", company=self.company, branch=self.branch)
+        self.whB = models.Warehouse.objects.create(name="Warehouse B", company=self.company, branch=self.branch)
+
+        self.agent_user = User.objects.create_user(email="agent_test_check@example.com", password="password123", role="employee")
+        Membership = apps.get_model("users", "Membership")
+        Membership.objects.create(
+            user=self.agent_user,
+            company=self.company,
+            branch=self.branch,
+            is_active=True,
+        )
+        self.agent_membership = models.CompanyWarehouseAgent.objects.create(
+            user=self.agent_user,
+            company=self.company,
+            assigned_warehouse=self.whA,
+            status=models.CompanyWarehouseAgent.Status.ACTIVE,
+            common_access_enabled=False,
+        )
+
+        self.prod_a = models.WarehouseProduct.objects.create(
+            name="Prod A", company=self.company, branch=self.branch, warehouse=self.whA, quantity=Decimal("100")
+        )
+        self.prod_b = models.WarehouseProduct.objects.create(
+            name="Prod B", company=self.company, branch=self.branch, warehouse=self.whB, quantity=Decimal("100")
+        )
+
+    def test_block1_agent_me_products_returns_all_warehouses(self):
+        models.AgentStockBalance.objects.create(
+            agent=self.agent_user, warehouse=self.whA, product=self.prod_a, qty=Decimal("10"), company=self.company
+        )
+        models.AgentStockBalance.objects.create(
+            agent=self.agent_user, warehouse=self.whB, product=self.prod_b, qty=Decimal("20"), company=self.company
+        )
+
+        self.client.force_authenticate(user=self.agent_user)
+        res = self.client.get("/api/warehouse/agents/me/products/")
+        self.assertEqual(res.status_code, 200)
+        results = res.data.get("results", [])
+        self.assertEqual(len(results), 2)
+
+        res_b = self.client.get(f"/api/warehouse/agents/me/products/?warehouse={self.whB.id}")
+        self.assertEqual(res_b.status_code, 200)
+        results_b = res_b.data.get("results", [])
+        self.assertEqual(len(results_b), 1)
+        self.assertEqual(str(results_b[0]["warehouse"]), str(self.whB.id))
+
+    def test_block2_post_insufficient_stock_rollback(self):
+        bal = models.AgentStockBalance.objects.create(
+            agent=self.agent_user, warehouse=self.whB, product=self.prod_b, qty=Decimal("5"), company=self.company
+        )
+        doc = models.Document.objects.create(
+            doc_type=models.Document.DocType.SALE,
+            status=models.Document.Status.DRAFT,
+            warehouse_from=self.whB,
+            agent=self.agent_user,
+            payment_kind=models.Document.PaymentKind.CASH,
+        )
+        models.DocumentItem.objects.create(document=doc, product=self.prod_b, qty=Decimal("10"), price=Decimal("10"))
+
+        self.client.force_authenticate(user=self.agent_user)
+        res = self.client.post(f"/api/warehouse/documents/{doc.id}/post/")
+        self.assertEqual(res.status_code, 400)
+
+        doc.refresh_from_db()
+        self.assertEqual(doc.status, models.Document.Status.DRAFT)
+        bal.refresh_from_db()
+        self.assertEqual(bal.qty, Decimal("5"))
+        self.assertEqual(doc.agent_moves.count(), 0)
+
+    def test_block3_cash_post_cash_pending_workflow(self):
+        bal = models.AgentStockBalance.objects.create(
+            agent=self.agent_user, warehouse=self.whB, product=self.prod_b, qty=Decimal("50"), company=self.company
+        )
+        doc = models.Document.objects.create(
+            doc_type=models.Document.DocType.SALE,
+            status=models.Document.Status.DRAFT,
+            warehouse_from=self.whB,
+            agent=self.agent_user,
+            payment_kind=models.Document.PaymentKind.CASH,
+        )
+        models.DocumentItem.objects.create(document=doc, product=self.prod_b, qty=Decimal("10"), price=Decimal("10"))
+
+        self.client.force_authenticate(user=self.agent_user)
+        res_post = self.client.post(f"/api/warehouse/documents/{doc.id}/post/")
+        self.assertEqual(res_post.status_code, 200)
+        doc.refresh_from_db()
+        self.assertEqual(doc.status, models.Document.Status.CASH_PENDING)
+        bal.refresh_from_db()
+        self.assertEqual(bal.qty, Decimal("40"))
+
+        res_app = self.client.post(f"/api/warehouse/documents/{doc.id}/cash/approve/")
+        self.assertEqual(res_app.status_code, 200)
+        doc.refresh_from_db()
+        self.assertEqual(doc.status, models.Document.Status.POSTED)
+        bal.refresh_from_db()
+        self.assertEqual(bal.qty, Decimal("40"))
+
+    def test_block3_cash_reject_restores_qty(self):
+        bal = models.AgentStockBalance.objects.create(
+            agent=self.agent_user, warehouse=self.whB, product=self.prod_b, qty=Decimal("50"), company=self.company
+        )
+        doc = models.Document.objects.create(
+            doc_type=models.Document.DocType.SALE,
+            status=models.Document.Status.DRAFT,
+            warehouse_from=self.whB,
+            agent=self.agent_user,
+            payment_kind=models.Document.PaymentKind.CASH,
+        )
+        models.DocumentItem.objects.create(document=doc, product=self.prod_b, qty=Decimal("10"), price=Decimal("10"))
+
+        self.client.force_authenticate(user=self.agent_user)
+        self.client.post(f"/api/warehouse/documents/{doc.id}/post/")
+        doc.refresh_from_db()
+        self.assertEqual(doc.status, models.Document.Status.CASH_PENDING)
+
+        res_rej = self.client.post(f"/api/warehouse/documents/{doc.id}/cash/reject/")
+        self.assertEqual(res_rej.status_code, 200)
+        doc.refresh_from_db()
+        self.assertEqual(doc.status, models.Document.Status.REJECTED)
+        bal.refresh_from_db()
+        self.assertEqual(bal.qty, Decimal("50"))
+
+    def test_block3_unpost_from_cash_pending_restores_qty(self):
+        bal = models.AgentStockBalance.objects.create(
+            agent=self.agent_user, warehouse=self.whB, product=self.prod_b, qty=Decimal("50"), company=self.company
+        )
+        doc = models.Document.objects.create(
+            doc_type=models.Document.DocType.SALE,
+            status=models.Document.Status.DRAFT,
+            warehouse_from=self.whB,
+            agent=self.agent_user,
+            payment_kind=models.Document.PaymentKind.CASH,
+        )
+        models.DocumentItem.objects.create(document=doc, product=self.prod_b, qty=Decimal("10"), price=Decimal("10"))
+
+        self.client.force_authenticate(user=self.agent_user)
+        self.client.post(f"/api/warehouse/documents/{doc.id}/post/")
+        doc.refresh_from_db()
+        self.assertEqual(doc.status, models.Document.Status.CASH_PENDING)
+
+        res_unpost = self.client.post(f"/api/warehouse/documents/{doc.id}/unpost/")
+        self.assertEqual(res_unpost.status_code, 200)
+        doc.refresh_from_db()
+        self.assertEqual(doc.status, models.Document.Status.DRAFT)
+        self.assertEqual(bal.qty, Decimal("50"))
+
+
+class TZAug2026Tests(APITestCase):
+    def setUp(self):
+        Company = apps.get_model("users", "Company")
+        Branch = apps.get_model("users", "Branch")
+        User = get_user_model()
+        self.owner_user = User.objects.create_user(email="owner_tz_aug@example.com", password="password123", role="owner")
+        self.company = Company.objects.create(name="Company TZ Aug", owner=self.owner_user)
+        self.branch = Branch.objects.create(name="Branch TZ Aug", company=self.company)
+        self.warehouse = models.Warehouse.objects.create(name="Main WH", company=self.company, branch=self.branch)
+
+        self.prod1 = models.WarehouseProduct.objects.create(
+            name="Juice 1L",
+            barcode="460000000001",
+            company=self.company,
+            branch=self.branch,
+            warehouse=self.warehouse,
+            quantity=Decimal("50"),
+            price=Decimal("120.00"),
+        )
+        models.StockBalance.objects.create(
+            warehouse=self.warehouse, product=self.prod1, qty=Decimal("50")
+        )
+
+        self.prod_catalog = models.WarehouseProduct.objects.create(
+            name="Catalog Soda",
+            barcode="460000000002",
+            company=self.company,
+            branch=self.branch,
+            warehouse=self.warehouse,
+            quantity=Decimal("0"),
+            price=Decimal("80.00"),
+        )
+
+        self.client.force_authenticate(user=self.owner_user)
+
+    def test_barcode_check_in_stock(self):
+        res = self.client.get(f"/api/warehouse/{self.warehouse.id}/barcode-check/460000000001/")
+        self.assertEqual(res.status_code, 200)
+        self.assertEqual(res.data["status"], "IN_STOCK")
+        self.assertEqual(res.data["product"]["id"], str(self.prod1.id))
+        self.assertFalse(res.data["ambiguous"])
+
+    def test_barcode_check_in_catalog(self):
+        res = self.client.get(f"/api/warehouse/{self.warehouse.id}/barcode-check/460000000002/")
+        self.assertEqual(res.status_code, 200)
+        self.assertEqual(res.data["status"], "IN_CATALOG")
+
+    def test_barcode_check_unknown(self):
+        res = self.client.get(f"/api/warehouse/{self.warehouse.id}/barcode-check/999999999999/")
+        self.assertEqual(res.status_code, 200)
+        self.assertEqual(res.data["status"], "UNKNOWN")
+
+    def test_mass_incoming(self):
+        payload = {
+            "items": [
+                {"product_id": str(self.prod1.id), "quantity": "10", "price": "100.00"},
+                {"product_id": str(self.prod_catalog.id), "quantity": "20", "price": "75.00"}
+            ],
+            "comment": "Тестовый массовый приход"
+        }
+        res = self.client.post(f"/api/warehouse/{self.warehouse.id}/mass-incoming/", payload, format="json")
+        self.assertEqual(res.status_code, 201)
+        self.assertEqual(res.data["items_count"], 2)
+
+        bal1 = models.StockBalance.objects.get(warehouse=self.warehouse, product=self.prod1)
+        self.assertEqual(bal1.qty, Decimal("60"))
+
+    def test_notification_category_and_delete(self):
+        from apps.main.models import Notification
+        notif = Notification.objects.create(
+            company=self.company,
+            user=self.owner_user,
+            title="Тариф истекает",
+            message="Остался 1 день",
+            category="tariff",
+            type="tariff",
+        )
+        res = self.client.get("/api/main/notifications/?category=tariff")
+        self.assertEqual(res.status_code, 200)
+        results = res.data.get("results") or res.data
+        if isinstance(results, list):
+            self.assertTrue(any(n["id"] == str(notif.id) for n in results))
+
+        res_del = self.client.delete(f"/api/main/notifications/{notif.id}/")
+        self.assertIn(res_del.status_code, [200, 204])
+        self.assertFalse(Notification.objects.filter(id=notif.id).exists())
+
+    def test_pos_quick_slots(self):
+        res_get = self.client.get("/api/main/pos/quick-slots/")
+        self.assertEqual(res_get.status_code, 200)
+        self.assertIn("slots", res_get.data)
+
+        payload = {"slots": {"0": str(self.prod1.id), "1": str(self.prod_catalog.id)}}
+        res_put = self.client.put("/api/main/pos/quick-slots/", payload, format="json")
+        self.assertEqual(res_put.status_code, 200)
+        self.assertEqual(res_put.data["slots"]["0"], str(self.prod1.id))
+
 
 

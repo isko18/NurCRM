@@ -417,8 +417,12 @@ class CompanyBranchRestrictedMixin:
             if membership.assigned_warehouse_id:
                 allowed_ids.add(membership.assigned_warehouse_id)
             if allowed_ids:
-                # Ограничение по складам — только для моделей со складом.
-                if self._model_has_field(model, "warehouse"):
+                # Ограничение по складам — только для моделей со складом,
+                # кроме персонального остатка/движения агента (AgentStockBalance, AgentStockMove)
+                if (
+                    self._model_has_field(model, "warehouse")
+                    and model not in (m.AgentStockBalance, m.AgentStockMove)
+                ):
                     return qs.filter(warehouse_id__in=allowed_ids)
                 if model is m.Warehouse:
                     return qs.filter(id__in=allowed_ids)
@@ -837,6 +841,183 @@ class ProductScanView(CompanyBranchRestrictedMixin, APIView):
         )
 
 
+class WarehouseBarcodeCheckAPIView(CompanyBranchRestrictedMixin, APIView):
+    """
+    Проверка штрихкода для массового сканирования на складе:
+    GET /api/warehouse/<uuid:warehouse_id>/barcode-check/<str:code>/
+    GET /api/warehouse/<uuid:warehouse_id>/barcode-check/?code=<str>
+
+    Возвращает:
+    - status: "IN_STOCK" | "IN_CATALOG" | "UNKNOWN"
+    - barcode: запрошенный штрихкод
+    - product: данные товара (id, name, article, barcode, unit, price, stock_qty) или null
+    - ambiguous: boolean
+    - matches: список альтернативных совпадений если ambiguous=true
+    """
+    def get(self, request, warehouse_id=None, code=None, *args, **kwargs):
+        target_wh_id = warehouse_id or kwargs.get("warehouse_uuid")
+        barcode = (code or request.query_params.get("code") or "").strip()
+        if not barcode:
+            raise ValidationError({"code": "Укажите штрихкод в URL или параметре ?code="})
+
+        company = self._company()
+        warehouse_qs = self._filter_qs_company_branch(m.Warehouse.objects.all())
+        warehouse = get_object_or_404(warehouse_qs, id=target_wh_id)
+
+        # 1. Поиск по текущему складу
+        stock_qs = (
+            m.WarehouseProduct.objects
+            .filter(warehouse=warehouse)
+            .filter(
+                Q(barcode=barcode)
+                | Q(code=barcode)
+                | Q(article=barcode)
+                | Q(alternate_barcodes__barcode=barcode)
+            )
+            .distinct()
+        )
+
+        matches_stock = list(stock_qs)
+
+        # 2. Если на текущем складе не найден, ищем в каталоге компании
+        if not matches_stock:
+            company_id = company.id if company else warehouse.company_id
+            catalog_qs = (
+                m.WarehouseProduct.objects
+                .filter(company_id=company_id)
+                .filter(
+                    Q(barcode=barcode)
+                    | Q(code=barcode)
+                    | Q(article=barcode)
+                    | Q(alternate_barcodes__barcode=barcode)
+                )
+                .distinct()
+            )
+            matches_catalog = list(catalog_qs)
+        else:
+            matches_catalog = matches_stock
+
+        if not matches_catalog:
+            return Response({
+                "status": "UNKNOWN",
+                "barcode": barcode,
+                "product": None,
+                "ambiguous": False,
+                "matches": []
+            }, status=status.HTTP_200_OK)
+
+        def _format_product(p):
+            bal = m.StockBalance.objects.filter(warehouse=warehouse, product=p).first()
+            stock_qty = float(bal.qty) if bal and bal.qty is not None else float(p.quantity or 0)
+            return {
+                "id": str(p.id),
+                "name": p.name,
+                "article": p.article or "",
+                "barcode": p.barcode or barcode,
+                "unit": p.unit or "pcs",
+                "price": str(p.price or "0.00"),
+                "stock_qty": stock_qty,
+                "warehouse_id": str(p.warehouse_id),
+            }
+
+        formatted_matches = [_format_product(p) for p in matches_catalog]
+
+        if len(formatted_matches) > 1:
+            has_stock = any(m_item["stock_qty"] > 0 for m_item in formatted_matches)
+            return Response({
+                "status": "IN_STOCK" if has_stock else "IN_CATALOG",
+                "barcode": barcode,
+                "product": formatted_matches[0],
+                "ambiguous": True,
+                "matches": formatted_matches
+            }, status=status.HTTP_200_OK)
+
+        prod = formatted_matches[0]
+        res_status = "IN_STOCK" if (prod["warehouse_id"] == str(warehouse.id) and prod["stock_qty"] > 0) else "IN_CATALOG"
+
+        return Response({
+            "status": res_status,
+            "barcode": barcode,
+            "product": prod,
+            "ambiguous": False,
+            "matches": []
+        }, status=status.HTTP_200_OK)
+
+
+class WarehouseMassIncomingAPIView(CompanyBranchRestrictedMixin, APIView):
+    """
+    Атомарный массовый приход товаров на склад:
+    POST /api/warehouse/<uuid:warehouse_id>/mass-incoming/
+
+    Тело запроса:
+    {
+      "items": [
+        { "product_id": "<uuid>", "quantity": "10", "price": "100.00" },
+        ...
+      ],
+      "comment": "Опциональный комментарий"
+    }
+    """
+    def post(self, request, warehouse_id=None, *args, **kwargs):
+        target_wh_id = warehouse_id or kwargs.get("warehouse_uuid")
+        warehouse_qs = self._filter_qs_company_branch(m.Warehouse.objects.all())
+        warehouse = get_object_or_404(warehouse_qs, id=target_wh_id)
+
+        items_data = request.data.get("items")
+        if not items_data or not isinstance(items_data, list):
+            raise ValidationError({"items": "Список товаров обязателен."})
+
+        comment = request.data.get("comment") or "Массовый приход товара"
+
+        with transaction.atomic():
+            doc = m.Document.objects.create(
+                doc_type=m.Document.DocType.RECEIPT,
+                status=m.Document.Status.DRAFT,
+                warehouse_from=warehouse,
+                comment=comment,
+            )
+
+            for idx, item in enumerate(items_data):
+                product_id_raw = item.get("product_id")
+                qty_raw = item.get("quantity") or item.get("qty")
+                if not product_id_raw or not qty_raw:
+                    raise ValidationError({"items": f"Строка #{idx+1}: укажите product_id и quantity."})
+                try:
+                    product_id = UUID(str(product_id_raw))
+                    qty = Decimal(str(qty_raw))
+                except Exception:
+                    raise ValidationError({"items": f"Строка #{idx+1}: некорректный product_id или quantity."})
+
+                if qty <= 0:
+                    raise ValidationError({"items": f"Строка #{idx+1}: количество должно быть больше 0."})
+
+                product = m.WarehouseProduct.objects.filter(id=product_id).first()
+                if not product:
+                    raise ValidationError({"items": f"Товар с ID '{product_id}' не найден."})
+
+                price = Decimal(str(item.get("price") or product.price or "0.00"))
+
+                m.DocumentItem.objects.create(
+                    document=doc,
+                    product=product,
+                    qty=qty,
+                    price=price,
+                    line_total=qty * price,
+                )
+
+            services.post_document(doc)
+            doc.refresh_from_db()
+
+        return Response({
+            "detail": "Массовый приход успешно проведен.",
+            "document_id": str(doc.id),
+            "number": doc.number,
+            "status": doc.status,
+            "items_count": doc.items.count(),
+            "total": str(doc.total or "0.00"),
+        }, status=status.HTTP_201_CREATED)
+
+
 class ProductImagesView(CompanyBranchRestrictedMixin, generics.ListCreateAPIView):
     serializer_class = WarehouseProductImageSerializer
 
@@ -1174,7 +1355,7 @@ class AgentRequestCartCreateSaleAPIView(CompanyBranchRestrictedMixin, APIView):
             )
             doc = m.Document.objects.create(
                 doc_type=m.Document.DocType.SALE,
-                status=(m.Document.Status.SALE_REQUEST if is_sale_request else m.Document.Status.DRAFT),
+                status=m.Document.Status.DRAFT,
                 warehouse_from=cart.warehouse,
                 counterparty=counterparty,
                 agent=cart.agent,
@@ -1611,6 +1792,13 @@ class AgentMyProductsListAPIView(CompanyBranchRestrictedMixin, APIView):
                 product_group_id = UUID(product_group_raw)
             except Exception:
                 raise ValidationError({"product_group": "Неверный UUID."})
+        warehouse_raw = (request.query_params.get("warehouse") or "").strip()
+        warehouse_id = None
+        if warehouse_raw:
+            try:
+                warehouse_id = UUID(warehouse_raw)
+            except Exception:
+                raise ValidationError({"warehouse": "Неверный UUID."})
         # Пытаемся найти настройку общего доступа к складу для агента.
         # Не ограничиваемся только "текущей" компанией, чтобы работать
         # даже если у пользователя несколько компаний/ролей.
@@ -1653,6 +1841,8 @@ class AgentMyProductsListAPIView(CompanyBranchRestrictedMixin, APIView):
             )
             if product_group_id:
                 prod_qs = prod_qs.filter(product_group_id=product_group_id)
+            if warehouse_id:
+                prod_qs = prod_qs.filter(warehouse_id=warehouse_id)
             # Поиск по товарам общего склада
             search = (request.query_params.get("search") or "").strip()
             if search:
@@ -1699,6 +1889,8 @@ class AgentMyProductsListAPIView(CompanyBranchRestrictedMixin, APIView):
         qs = self._filter_qs_company_branch_relaxed(qs)
         if product_group_id:
             qs = qs.filter(product__product_group_id=product_group_id)
+        if warehouse_id:
+            qs = qs.filter(warehouse_id=warehouse_id)
         # Поиск по товарам агента
         search = (request.query_params.get("search") or "").strip()
         if search:

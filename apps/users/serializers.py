@@ -818,6 +818,7 @@ class CompanySerializer(serializers.ModelSerializer):
             "llc", "inn", "okpo", "score", "bik", "address",
             "scale_barcode_mode",
             "scale_barcode_layout",
+            "scale_barcode_amount_unit",
             "max_discount_percent",
         ]
 
@@ -901,6 +902,7 @@ class CompanyUpdateSerializer(serializers.ModelSerializer):
             "region",
             "scale_barcode_mode",
             "scale_barcode_layout",
+            "scale_barcode_amount_unit",
         ]
 
     def validate(self, attrs):

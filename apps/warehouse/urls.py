@@ -8,6 +8,8 @@ from .views import (
     ProductView, ProductDetailView,
     WarehouseProductCatalogListView,
     ProductScanView,
+    WarehouseBarcodeCheckAPIView,
+    WarehouseMassIncomingAPIView,
     ProductImagesView, ProductImageDetailView,
     ProductPackagesView, ProductPackageDetailView,
     AgentRequestCartListCreateAPIView,
@@ -114,6 +116,9 @@ urlpatterns = [
     # products in warehouse
     path("<uuid:warehouse_uuid>/products/", ProductView.as_view(), name="warehouse-products"),
     path("<uuid:warehouse_uuid>/products/scan/", ProductScanView.as_view(), name="warehouse-products-scan"),
+    path("<uuid:warehouse_uuid>/barcode-check/<str:code>/", WarehouseBarcodeCheckAPIView.as_view(), name="warehouse-barcode-check-code"),
+    path("<uuid:warehouse_uuid>/barcode-check/", WarehouseBarcodeCheckAPIView.as_view(), name="warehouse-barcode-check"),
+    path("<uuid:warehouse_uuid>/mass-incoming/", WarehouseMassIncomingAPIView.as_view(), name="warehouse-mass-incoming"),
 
     # global product catalog across all company warehouses (list only)
     path("products/", WarehouseProductCatalogListView.as_view(), name="warehouse-products-catalog"),

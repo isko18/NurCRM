@@ -1779,7 +1779,7 @@ class NotificationSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerial
     class Meta:
         model = Notification
         fields = [
-            'id', 'company', 'branch', 'type', 'title', 'message', 'url',
+            'id', 'company', 'branch', 'category', 'type', 'title', 'message', 'url',
             'level', 'is_read', 'actor_name', 'data', 'created_at',
         ]
         read_only_fields = ['id', 'company', 'branch', 'actor_name', 'created_at']

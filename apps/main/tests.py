@@ -18,8 +18,11 @@ from apps.users.models import (
     Roles,
     Company,
     Branch,
+    SCALE_BARCODE_AMOUNT_UNIT_SOM,
+    SCALE_BARCODE_AMOUNT_UNIT_TIYIN,
     SCALE_BARCODE_LAYOUT_CODE,
     SCALE_BARCODE_LAYOUT_PLU,
+    SCALE_BARCODE_MODE_AMOUNT,
     SCALE_BARCODE_MODE_AUTO,
 )
 from django.contrib.auth import get_user_model
@@ -43,17 +46,30 @@ class PosScaleBarcodeTests(TestCase):
     # Весовой префикс (20): в ШК зашит ВЕС в граммах.
     WEIGHT_BARCODE = "2004626002149"
 
-    def test_parse_scale_barcode_amount_in_som(self):
+    def test_parse_scale_barcode_amount_in_tiyin(self):
+        # По умолчанию сумма в ШК считается тыйынами: «00044» → 0.44 сом.
         data = _parse_scale_barcode(self.BARCODE)
         self.assertIsNotNone(data)
         self.assertEqual(data["prefix"], "25")
         self.assertEqual(data["plu"], 1)
         self.assertEqual(data["raw_code"], "00001")
         self.assertEqual(data["amount_raw"], "00044")
-        self.assertEqual(data["amount"], Decimal("44"))
+        self.assertEqual(data["amount"], Decimal("0.44"))
         self.assertEqual(data["check_digit"], "1")
         self.assertEqual(data["mode"], "amount_plain")
         self.assertNotIn("weight_kg", data)
+
+    def test_parse_scale_barcode_amount_in_som(self):
+        # Переключатель «Сом»: поле читается как целые сомы, «00044» → 44 сом.
+        data = _parse_scale_barcode(
+            self.BARCODE,
+            SCALE_BARCODE_MODE_AUTO,
+            SCALE_BARCODE_LAYOUT_PLU,
+            SCALE_BARCODE_AMOUNT_UNIT_SOM,
+        )
+        self.assertEqual(data["amount"], Decimal("44"))
+        self.assertEqual(data["amount_unit"], SCALE_BARCODE_AMOUNT_UNIT_SOM)
+        self.assertEqual(data["mode"], "amount_plain")
 
     def test_parse_weight_barcode_grams_to_kg(self):
         # Весовой штрихкод ШТРИХ: поле = вес в граммах, без деления на цену.
@@ -79,7 +95,12 @@ class PosScaleBarcodeTests(TestCase):
         )
 
     def test_quantity_amount_44_price_44(self):
-        scale_data = _parse_scale_barcode(self.BARCODE)
+        scale_data = _parse_scale_barcode(
+            self.BARCODE,
+            SCALE_BARCODE_MODE_AUTO,
+            SCALE_BARCODE_LAYOUT_PLU,
+            SCALE_BARCODE_AMOUNT_UNIT_SOM,
+        )
         product = SimpleNamespace(price=Decimal("44"))
         self.assertIsNone(_finalize_scale_data_for_product(product, scale_data))
         self.assertEqual(scale_data["quantity_kg"], Decimal("1.000"))
@@ -145,13 +166,45 @@ class PosScaleBarcodeVariantsTests(TestCase):
         )
         self.assertEqual([v["plu"] for v in variants], [453, 4530])
 
-    def test_amount_barcode_has_no_weight_fallback(self):
-        # Префикс 25 → в поле зашита сумма; раскладка `code` трактовала бы её как вес.
+    def test_amount_barcode_fallback_stays_amount(self):
+        # Префикс 25 → в поле зашита сумма. Запасная раскладка даёт другой PLU,
+        # но поле по-прежнему читается как сумма (а не как вес).
         variants = _scale_barcode_variants(
             "2500001000441", SCALE_BARCODE_MODE_AUTO, SCALE_BARCODE_LAYOUT_PLU
         )
-        self.assertEqual(len(variants), 1)
+        self.assertEqual([v["plu"] for v in variants], [1, 10])
+        self.assertEqual([v["mode"] for v in variants], ["amount_plain", "amount_plain"])
+
+    def test_prefix_20_amount_in_som_reads_36(self):
+        """Этикетка «Банан вес»: 2 00001 00036 6 — префикс 20, но в поле зашита
+        СУММА целыми сомами (36), а не вес. Читается переключателями
+        scale_barcode_mode=amount + scale_barcode_amount_unit=som."""
+        variants = _scale_barcode_variants(
+            "2000001000366",
+            SCALE_BARCODE_MODE_AMOUNT,
+            SCALE_BARCODE_LAYOUT_PLU,
+            SCALE_BARCODE_AMOUNT_UNIT_SOM,
+        )
+        self.assertEqual([v["plu"] for v in variants], [1, 10])
+        self.assertEqual([v["amount"] for v in variants], [Decimal("36"), Decimal("36")])
         self.assertEqual(variants[0]["mode"], "amount_plain")
+
+        # 36 сом при цене 190 сом/кг → 0.189 кг (на этикетке 0.190).
+        product = SimpleNamespace(price=Decimal("190"))
+        self.assertIsNone(_finalize_scale_data_for_product(product, variants[0]))
+        self.assertEqual(
+            _effective_qty_from_scale_data(variants[0], Decimal("1.000")),
+            Decimal("0.189"),
+        )
+
+    def test_prefix_20_default_settings_still_weight(self):
+        # Без переключателей поведение прежнее: префикс 20 = вес в граммах.
+        variants = _scale_barcode_variants(
+            "2000001000366", SCALE_BARCODE_MODE_AUTO, SCALE_BARCODE_LAYOUT_PLU,
+            SCALE_BARCODE_AMOUNT_UNIT_TIYIN,
+        )
+        self.assertEqual(variants[0]["mode"], "weight")
+        self.assertEqual(variants[0]["weight_kg"], Decimal("0.036"))
 
     def test_non_scale_barcode_has_no_variants(self):
         self.assertEqual(
