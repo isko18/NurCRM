@@ -9,9 +9,9 @@ class BuildingConfig(AppConfig):
     def ready(self):
         from django.db.models.signals import post_save
 
-        from .models import BuildingCashFlow
+        from .models import BuildingCashFlow, BuildingDebtLedgerEntry
         from .salary_cash import on_cashflow_approved
-        from .onec_bridge import sync_cashflow
+        from .onec_bridge import sync_cashflow, sync_debt
 
         def _on_cashflow_save(sender, instance, **kwargs):
             if instance.status != BuildingCashFlow.Status.APPROVED:
@@ -23,9 +23,15 @@ class BuildingConfig(AppConfig):
             # уходит как ПКО/РКО. Идемпотентно, no-op если интеграция выключена.
             sync_cashflow(instance)
 
-        # weak=False обязателен: _on_cashflow_save — локальное замыкание, при слабой
-        # ссылке (default) оно собирается GC после ready() и сигнал молча отваливается.
+        def _on_debt_save(sender, instance, **kwargs):
+            # Единая точка для долгов и бартера → КорректировкаДолга.
+            # sync_debt сам отфильтрует оплаты (они покрыты кассой).
+            sync_debt(instance)
+
+        # weak=False обязателен: обработчики — локальные замыкания, при слабой ссылке
+        # (default) они собираются GC после ready() и сигнал молча отваливается.
         post_save.connect(_on_cashflow_save, sender=BuildingCashFlow, weak=False)
+        post_save.connect(_on_debt_save, sender=BuildingDebtLedgerEntry, weak=False)
 
         # Write-back проведения из 1С (inbound callback) → BuildingTreaty.erp_*.
         try:

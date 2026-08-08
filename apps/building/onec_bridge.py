@@ -156,6 +156,64 @@ def sync_treaty(treaty, *, operation: str = "create"):
     )
 
 
+def sync_debt(entry, *, operation: str = "create"):
+    """
+    Запись реестра долгов → «КорректировкаДолга» в 1С.
+
+    Покрывает и долги, и бартер (подтверждение бартерного зачёта создаёт запись
+    реестра с entry_type=barter). Оплаты (entry_type=payment) НЕ выгружаются: они
+    уже уходят в 1С как ПКО/РКО через кассу — иначе задвоили бы уменьшение долга.
+    """
+    try:
+        from apps.onec.services import enqueue_push, get_active_integration
+        from .models import BuildingDebtLedgerEntry
+    except Exception:
+        return None
+
+    if entry.status != BuildingDebtLedgerEntry.Status.APPROVED:
+        return None
+    if entry.entry_type == BuildingDebtLedgerEntry.EntryType.PAYMENT:
+        return None  # оплаты покрыты кассой (ПКО/РКО), не дублируем
+
+    integration = get_active_integration(entry.company_id)
+    if not integration:
+        return None
+
+    rc = getattr(entry, "residential_complex", None)
+    payload = {
+        "external_id": str(entry.id),
+        "source_type": "debt",
+        "operation": operation,
+        "occurred_at": _iso(entry.occurred_at),
+        "direction": entry.direction,          # payable | receivable
+        "entry_type": entry.entry_type,        # charge | barter | adjustment | writeoff
+        "counterparty": {
+            "type": entry.counterparty_type,   # client | supplier | contractor
+            "id": str(entry.counterparty_id),
+        },
+        "amount": str(entry.amount),
+        "currency": entry.currency or integration.currency,
+        "company": {"id": str(entry.company_id),
+                    "name": getattr(getattr(entry, "company", None), "name", "")},
+        "residential_complex": (
+            {"id": str(entry.residential_complex_id), "name": getattr(rc, "name", "")}
+            if entry.residential_complex_id else None
+        ),
+        "source": {"type": entry.source_type or "", "id": str(entry.source_id) if entry.source_id else None},
+        "comment": entry.comment or "",
+    }
+
+    return enqueue_push(
+        company_id=entry.company_id,
+        source_type="debt",
+        source_id=entry.id,
+        payload=payload,
+        endpoint="/documents/debt-adjustment",
+        operation=operation,
+        onec_doc_type="КорректировкаДолга",
+    )
+
+
 def on_document_posted(sender, sync_record=None, **kwargs):
     """
     Обработчик сигнала onec.document_posted: 1С подтвердила проведение документа.
