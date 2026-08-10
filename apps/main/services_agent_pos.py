@@ -101,6 +101,9 @@ def checkout_agent_cart(
     allow_negative_stock: bool = False,
     cashbox_id=None,
     client=None,
+    consultant=None,
+    consultant_commission_enabled: bool = False,
+    consultant_commission_percent=None,
 ):
     """
     Чекаут корзины от лица АГЕНТА.
@@ -252,10 +255,20 @@ def checkout_agent_cart(
     if model_has_field(Sale, "cashbox") and cashbox is not None:
         create_kwargs["cashbox"] = cashbox
 
-    # ⚠️ ВАЖНО: если в модели Sale.shift null=False или Sale.clean требует shift всегда,
-    # этот create упадёт. Тогда нужно сделать Sale.shift nullable или ослабить clean для agent-sales.
-    if model_has_field(Sale, "shift"):
-        create_kwargs["shift"] = None
+    comm_enabled = bool(consultant and consultant_commission_enabled)
+    comm_pct = (
+        Decimal(str(consultant_commission_percent))
+        if (consultant and consultant_commission_percent not in (None, "", "null"))
+        else None
+    )
+    comm_amount = Decimal("0.00")
+    if consultant and comm_enabled and comm_pct is not None and comm_pct > 0:
+        comm_amount = (cart.total * comm_pct / Decimal("100")).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+    create_kwargs["consultant"] = consultant if consultant else None
+    create_kwargs["consultant_commission_enabled"] = comm_enabled
+    create_kwargs["consultant_commission_percent"] = comm_pct
+    create_kwargs["consultant_commission_amount"] = comm_amount
 
     # убираем None для полей, которые могут быть not-null
     create_kwargs = {k: v for k, v in create_kwargs.items() if not (v is None and k in ("branch", "client", "department", "cashbox", "shift"))}

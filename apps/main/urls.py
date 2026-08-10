@@ -214,6 +214,7 @@ urlpatterns = [
     ),
     
     path("pos/sales/", SaleListAPIView.as_view(), name="pos-sale-list"),
+    path("pos/sale-consultants/", SaleConsultantsAPIView.as_view(), name="pos-sale-consultants"),
     path("pos/cashier-settings/", MarketCashierSettingsAPIView.as_view(), name="pos-cashier-settings"),
     path("pos/cashier-settings/verify-delete-code/", VerifyDeleteCodeAPIView.as_view(), name="pos-verify-delete-code"),
     path("pos/sales/start/", SaleStartAPIView.as_view(), name="pos-sale-start"),

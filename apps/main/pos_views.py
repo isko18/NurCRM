@@ -227,6 +227,15 @@ def _build_physical_receipt_text(sale, *, payment_method=None, cash_received=Non
     )
     if cashier_name:
         lines.append(f"Кассир: {cashier_name}")
+    if getattr(sale, "consultant", None):
+        cons_name = (
+            getattr(sale.consultant, "get_full_name", lambda: "")()
+            or getattr(sale.consultant, "full_name", None)
+            or getattr(sale.consultant, "username", None)
+            or ""
+        )
+        if cons_name:
+            lines.append(f"Консультант: {cons_name}")
     if include_shift and getattr(sale, "shift_id", None):
         lines.append(f"Смена: {sale.shift_id}")
     if getattr(sale, "cashbox_id", None):
@@ -2604,6 +2613,10 @@ class SaleCheckoutAPIView(MarketCashierOnlyMixin, APIView):
             if client_id:
                 client_obj = get_object_or_404(Client, id=client_id, company=request.user.company)
 
+            consultant_obj = ser.validated_data.get("consultant_obj")
+            consultant_comm_enabled = ser.validated_data.get("consultant_commission_enabled", False)
+            consultant_comm_pct = ser.validated_data.get("consultant_commission_percent")
+
             try:
                 sale = checkout_cart(
                     cart,
@@ -2612,11 +2625,22 @@ class SaleCheckoutAPIView(MarketCashierOnlyMixin, APIView):
                     payment_method=None if payments else payment_method,
                     cash_received=cash_received,
                     client=client_obj,
+                    consultant=consultant_obj,
+                    consultant_commission_enabled=consultant_comm_enabled,
+                    consultant_commission_percent=consultant_comm_pct,
                 )
             except NotEnoughStock as e:
                 return Response({"detail": str(e)}, status=status.HTTP_400_BAD_REQUEST)
             except ValueError as e:
                 return Response({"detail": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+            cons_name = None
+            if sale.consultant:
+                cons_name = (
+                    getattr(sale.consultant, "get_full_name", lambda: "")()
+                    or getattr(sale.consultant, "full_name", None)
+                    or getattr(sale.consultant, "username", None)
+                )
 
             payload = {
                 "sale_id": str(sale.id),
@@ -2625,6 +2649,17 @@ class SaleCheckoutAPIView(MarketCashierOnlyMixin, APIView):
                 "discount_total": fmt_money(sale.discount_total),
                 "tax_total": fmt_money(sale.tax_total),
                 "total": fmt_money(sale.total),
+                "user": str(sale.user_id) if sale.user_id else None,
+                "user_display": (
+                    getattr(sale.user, "get_full_name", lambda: "")()
+                    or getattr(sale.user, "email", None)
+                    or getattr(sale.user, "username", None)
+                ) if sale.user else None,
+                "consultant": str(sale.consultant_id) if sale.consultant_id else None,
+                "consultant_display": cons_name,
+                "consultant_commission_enabled": sale.consultant_commission_enabled,
+                "consultant_commission_percent": fmt_money(sale.consultant_commission_percent) if sale.consultant_commission_percent is not None else None,
+                "consultant_commission_amount": fmt_money(sale.consultant_commission_amount or Decimal("0.00")),
                 "client": str(sale.client_id) if sale.client_id else None,
                 "client_name": getattr(sale.client, "full_name", None) if sale.client else None,
                 "payment_method": sale.payment_method,
@@ -2895,7 +2930,15 @@ def _recalc_sale_headers_from_items(sale: Sale) -> None:
     if old_total and old_total > 0:
         cr = sale.cash_received or d0
         sale.cash_received = money(cr * (new_total / old_total))
-    sale.save(update_fields=["subtotal", "discount_total", "tax_total", "total", "cash_received"])
+    if sale.consultant_id and getattr(sale, "consultant_commission_enabled", False) and getattr(sale, "consultant_commission_percent", None):
+        comm_pct = Decimal(str(sale.consultant_commission_percent))
+        if comm_pct > 0:
+            sale.consultant_commission_amount = money(new_total * comm_pct / Decimal("100"))
+        else:
+            sale.consultant_commission_amount = Decimal("0.00")
+    else:
+        sale.consultant_commission_amount = Decimal("0.00")
+    sale.save(update_fields=["subtotal", "discount_total", "tax_total", "total", "cash_received", "consultant_commission_amount"])
 
     # Синхронизируем строки оплаты с новой суммой чека, чтобы «живой» расчёт смены
     # (expected_cash) уменьшался симметрично частичному возврату.
@@ -3254,15 +3297,62 @@ def _aggregate_pos_sales_total_amount(qs, *, status_filter: str):
     return total.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
 
 
+class SaleConsultantsAPIView(MarketCashierOnlyMixin, CompanyBranchRestrictedMixin, APIView):
+    """
+    Список возможных консультантов для кассы (активные сотрудники компании).
+    GET /api/main/pos/sale-consultants/
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request, *args, **kwargs):
+        company = self._company() or request.user.company
+        branch = self._auto_branch()
+
+        from django.contrib.auth import get_user_model
+        User = get_user_model()
+        users = User.objects.filter(company=company, is_active=True).order_by("first_name", "last_name", "email")
+
+        from apps.main.models import MarketSaleEmployeePayProfile
+        profiles = MarketSaleEmployeePayProfile.objects.filter(company=company)
+        if branch is not None:
+            profiles = profiles.filter(Q(branch=branch) | Q(branch__isnull=True))
+        else:
+            profiles = profiles.filter(branch__isnull=True)
+
+        prof_map = {}
+        for p in profiles.order_by("user_id", "-branch_id"):
+            if p.user_id not in prof_map or p.branch_id is not None:
+                prof_map[p.user_id] = p
+
+        result = []
+        for u in users:
+            prof = prof_map.get(u.id)
+            pct_str = "0.00"
+            if prof and prof.pay_scheme in (MarketSaleEmployeePayProfile.PayScheme.PERCENT, MarketSaleEmployeePayProfile.PayScheme.SALARY_PLUS_PERCENT):
+                if prof.sales_percent is not None:
+                    pct_str = str(prof.sales_percent)
+
+            fn = (getattr(u, "get_full_name", lambda: "")() or getattr(u, "full_name", None) or getattr(u, "email", "") or str(u.id)).strip()
+            result.append({
+                "id": str(u.id),
+                "full_name": fn,
+                "first_name": getattr(u, "first_name", "") or "",
+                "last_name": getattr(u, "last_name", "") or "",
+                "default_commission_percent": pct_str,
+            })
+
+        return Response(result, status=status.HTTP_200_OK)
+
+
 class SaleListAPIView(MarketCashierOnlyMixin, CompanyBranchRestrictedMixin, generics.ListAPIView):
     serializer_class = SaleListSerializer
     queryset = (
-        Sale.objects.select_related("user")
+        Sale.objects.select_related("user", "consultant")
         .prefetch_related("items__product")
         .all()
     )
     filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
-    filterset_fields = ("status", "user")
+    filterset_fields = ("status", "user", "consultant")
     search_fields = ("id",)
     ordering_fields = ("created_at", "total", "status")
     ordering = ("-created_at",)
@@ -3285,6 +3375,10 @@ class SaleListAPIView(MarketCashierOnlyMixin, CompanyBranchRestrictedMixin, gene
         client_param = (self.request.query_params.get("client") or "").strip()
         if client_param:
             qs = qs.filter(client_id=client_param)
+
+        consultant_param = (self.request.query_params.get("consultant") or "").strip()
+        if consultant_param:
+            qs = qs.filter(consultant_id=consultant_param)
 
         # Аналитический фильтр (страница /crm/market/analytics → «Транзакции»)
         payment_method = (self.request.query_params.get("payment_method") or "").strip()
@@ -4267,6 +4361,10 @@ class AgentSaleCheckoutAPIView(MarketCashierOnlyMixin, CompanyBranchRestrictedMi
             if payment_method == Sale.PaymentMethod.CASH and cash_received < cart.total:
                 raise ValidationError({"detail": "Сумма, полученная наличными, меньше суммы продажи."})
 
+            consultant_obj = ser.validated_data.get("consultant_obj")
+            consultant_comm_enabled = ser.validated_data.get("consultant_commission_enabled", False)
+            consultant_comm_pct = ser.validated_data.get("consultant_commission_percent")
+
             # ✅ ВАЖНО: checkout_agent_cart должен НЕ требовать shift
             try:
                 sale = checkout_agent_cart(
@@ -4276,6 +4374,9 @@ class AgentSaleCheckoutAPIView(MarketCashierOnlyMixin, CompanyBranchRestrictedMi
                     allow_negative_stock=bool(can_minus and use_main_stock),
                     cashbox_id=cashbox_id,  # можно сохранить кассу в Sale, но без смен
                     client=resolved_client,
+                    consultant=consultant_obj,
+                    consultant_commission_enabled=consultant_comm_enabled,
+                    consultant_commission_percent=consultant_comm_pct,
                 )
             except Exception as e:
                 raise ValidationError({"detail": str(e)})

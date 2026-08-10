@@ -155,6 +155,9 @@ def build_receipt_payload(sale, cashier_name=None, *, ensure_number: bool = True
     cash_received_val = _to_float(getattr(sale, "cash_received", 0))
     cash_portion = _to_float(sale.cash_payment_amount()) if hasattr(sale, "cash_payment_amount") else paid_cash
 
+    consultant_user = getattr(sale, "consultant", None)
+    consultant_name = _user_display_name(consultant_user) if consultant_user else None
+
     payload = {
         # метка кодировки для фронта (браузерный клиент сможет выбрать UTF-8)
         "encoding": "utf-8",
@@ -165,6 +168,9 @@ def build_receipt_payload(sale, cashier_name=None, *, ensure_number: bool = True
         "address": vh.get("address") or None,
         "created_at": localtime(created_at).strftime("%Y-%m-%d %H:%M:%S") if created_at else None,
         "cashier_name": resolved_cashier,
+        "consultant_name": consultant_name,
+        "cashier": {"id": str(sale.user_id) if getattr(sale, "user_id", None) else None, "name": resolved_cashier},
+        "consultant": {"id": str(sale.consultant_id), "name": consultant_name} if consultant_user else None,
 
         "items": items,
 

@@ -379,6 +379,11 @@ class CheckoutSerializer(serializers.Serializer):
     # Разрешить списание "в минус" при закрытии чека (только owner/admin).
     allow_minus = serializers.BooleanField(required=False, default=False)
 
+    # Консультант и его комиссия
+    consultant_id = OptionalUUIDField(required=False, allow_null=True)
+    consultant_commission_enabled = serializers.BooleanField(required=False, default=False)
+    consultant_commission_percent = serializers.DecimalField(max_digits=5, decimal_places=2, required=False, allow_null=True)
+
     # если смены нет — можно передать кассу (или автоподбор)
     cashbox_id = OptionalUUIDField(required=False, allow_null=True)
 
@@ -465,6 +470,32 @@ class CheckoutSerializer(serializers.Serializer):
 
         request = self.context.get("request")
         user = getattr(request, "user", None) if request else None
+
+        consultant_id = attrs.get("consultant_id")
+        comm_enabled = attrs.get("consultant_commission_enabled", False)
+        comm_pct = attrs.get("consultant_commission_percent")
+
+        company = getattr(cart, "company", None)
+        if company and getattr(company, "consultant_required_on_sale", False) and not consultant_id:
+            raise serializers.ValidationError({"consultant_id": "Указание консультанта обязательно при оформлении чека."})
+
+        if consultant_id:
+            from django.contrib.auth import get_user_model
+            User = get_user_model()
+            consultant_user = User.objects.filter(id=consultant_id, company_id=cart.company_id, is_active=True).first()
+            if not consultant_user:
+                raise serializers.ValidationError({"consultant_id": "Консультант не найден или не активен в данной компании."})
+            attrs["consultant_obj"] = consultant_user
+        else:
+            attrs["consultant_obj"] = None
+
+        if comm_enabled:
+            if not consultant_id:
+                raise serializers.ValidationError({"consultant_id": "Нельзя включить комиссию без указания консультанта."})
+            if comm_pct is None:
+                raise serializers.ValidationError({"consultant_commission_percent": "Укажите процент комиссии консультанта."})
+            if comm_pct < 0 or comm_pct > 100:
+                raise serializers.ValidationError({"consultant_commission_percent": "Процент комиссии должен быть от 0 до 100."})
 
         payments = attrs.get("payments") or []
         cart.recalc()
@@ -601,6 +632,7 @@ class CartItemDeletionLogSerializer(serializers.ModelSerializer):
 
 class SaleListSerializer(serializers.ModelSerializer):
     user_display = serializers.SerializerMethodField()
+    consultant_display = serializers.SerializerMethodField(read_only=True)
     client_name = serializers.CharField(source="client.full_name", read_only=True)
     change = serializers.DecimalField(max_digits=12, decimal_places=2, read_only=True)
     first_item_name = serializers.SerializerMethodField(read_only=True)
@@ -622,6 +654,11 @@ class SaleListSerializer(serializers.ModelSerializer):
             "created_at",
             "paid_at",
             "user_display",
+            "consultant",
+            "consultant_display",
+            "consultant_commission_enabled",
+            "consultant_commission_percent",
+            "consultant_commission_amount",
             "client",
             "client_name",
             "payment_method",
@@ -640,6 +677,17 @@ class SaleListSerializer(serializers.ModelSerializer):
             return None
         return (
             getattr(u, "get_full_name", lambda: "")()
+            or getattr(u, "email", None)
+            or getattr(u, "username", None)
+        )
+
+    def get_consultant_display(self, obj):
+        u = getattr(obj, "consultant", None)
+        if not u:
+            return None
+        return (
+            getattr(u, "get_full_name", lambda: "")()
+            or getattr(u, "full_name", None)
             or getattr(u, "email", None)
             or getattr(u, "username", None)
         )
@@ -707,6 +755,7 @@ class SalePaymentReadSerializer(serializers.Serializer):
 
 class SaleDetailSerializer(serializers.ModelSerializer):
     user_display = serializers.SerializerMethodField(read_only=True)
+    consultant_display = serializers.SerializerMethodField(read_only=True)
     items = SaleItemReadSerializer(many=True, read_only=True)
     client_name = serializers.CharField(source="client.full_name", read_only=True)
     change = serializers.DecimalField(max_digits=12, decimal_places=2, read_only=True)
@@ -728,6 +777,11 @@ class SaleDetailSerializer(serializers.ModelSerializer):
             "created_at",
             "paid_at",
             "user_display",
+            "consultant",
+            "consultant_display",
+            "consultant_commission_enabled",
+            "consultant_commission_percent",
+            "consultant_commission_amount",
             "client",
             "client_name",
             "items",
@@ -741,6 +795,17 @@ class SaleDetailSerializer(serializers.ModelSerializer):
             "ekassa_fiscal",
         )
         read_only_fields = fields
+
+    def get_consultant_display(self, obj):
+        u = getattr(obj, "consultant", None)
+        if not u:
+            return None
+        return (
+            getattr(u, "get_full_name", lambda: "")()
+            or getattr(u, "full_name", None)
+            or getattr(u, "email", None)
+            or getattr(u, "username", None)
+        )
 
     def get_payments(self, obj):
         from apps.main.pos_utils import fmt_money
@@ -815,6 +880,11 @@ class AgentCheckoutSerializer(serializers.Serializer):
     # Разрешить "в минус" при оформлении агентской продажи (только owner/admin).
     allow_minus = serializers.BooleanField(required=False, default=False)
 
+    # Консультант и его комиссия
+    consultant_id = OptionalUUIDField(required=False, allow_null=True)
+    consultant_commission_enabled = serializers.BooleanField(required=False, default=False)
+    consultant_commission_percent = serializers.DecimalField(max_digits=5, decimal_places=2, required=False, allow_null=True)
+
     payment_method = serializers.ChoiceField(
         choices=Sale.PaymentMethod.choices,
         default=Sale.PaymentMethod.CASH,
@@ -830,6 +900,33 @@ class AgentCheckoutSerializer(serializers.Serializer):
             attrs["client_id"] = attrs.pop("client")
         elif "client" in attrs:
             attrs.pop("client", None)
+
+        consultant_id = attrs.get("consultant_id")
+        comm_enabled = attrs.get("consultant_commission_enabled", False)
+        comm_pct = attrs.get("consultant_commission_percent")
+
+        if consultant_id:
+            from django.contrib.auth import get_user_model
+            User = get_user_model()
+            request = self.context.get("request")
+            company_id = getattr(request.user, "company_id", None) if request and getattr(request, "user", None) else None
+            user_qs = User.objects.filter(id=consultant_id, is_active=True)
+            if company_id:
+                user_qs = user_qs.filter(company_id=company_id)
+            consultant_user = user_qs.first()
+            if not consultant_user:
+                raise serializers.ValidationError({"consultant_id": "Консультант не найден или не активен."})
+            attrs["consultant_obj"] = consultant_user
+        else:
+            attrs["consultant_obj"] = None
+
+        if comm_enabled:
+            if not consultant_id:
+                raise serializers.ValidationError({"consultant_id": "Нельзя включить комиссию без указания консультанта."})
+            if comm_pct is None:
+                raise serializers.ValidationError({"consultant_commission_percent": "Укажите процент комиссии консультанта."})
+            if comm_pct < 0 or comm_pct > 100:
+                raise serializers.ValidationError({"consultant_commission_percent": "Процент комиссии должен быть от 0 до 100."})
 
         pm = attrs.get("payment_method") or Sale.PaymentMethod.CASH
         cr = attrs.get("cash_received")
