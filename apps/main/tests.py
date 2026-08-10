@@ -395,3 +395,211 @@ class ServiceKindTestCase(TestCase):
         self.assertIn(physical_prod.id, res_ids)
         self.assertNotIn(service_prod.id, res_ids)
 
+
+class SaleConsultantCommissionTests(TestCase):
+    def setUp(self):
+        from apps.construction.models import Cashbox, CashShift
+        from apps.main.models import Cart, CartItem, MarketSaleEmployeePayProfile
+        from apps.main.services import checkout_cart
+
+        self.owner = User.objects.create_user(
+            email="owner@test.com",
+            password="pass",
+            first_name="Владелец",
+            last_name="Тест",
+        )
+        self.company = Company.objects.create(name="Тест Маркет Компани", owner=self.owner)
+        self.owner.company = self.company
+        self.owner.save()
+
+        self.branch = Branch.objects.create(company=self.company, name="Филиал 1")
+
+        self.cashier = User.objects.create_user(
+            email="cashier@test.com",
+            password="pass",
+            company=self.company,
+            first_name="Кассир",
+            last_name="Кассович",
+        )
+        self.consultant = User.objects.create_user(
+            email="consultant@test.com",
+            password="pass",
+            company=self.company,
+            first_name="Консультант",
+            last_name="Тестовый",
+        )
+
+        MarketSaleEmployeePayProfile.objects.create(
+            company=self.company,
+            user=self.consultant,
+            pay_scheme=MarketSaleEmployeePayProfile.PayScheme.PERCENT,
+            sales_percent=Decimal("5.00"),
+        )
+        MarketSaleEmployeePayProfile.objects.create(
+            company=self.company,
+            user=self.cashier,
+            pay_scheme=MarketSaleEmployeePayProfile.PayScheme.SALARY_PLUS_PERCENT,
+            monthly_base_salary=Decimal("15000.00"),
+            sales_percent=Decimal("3.00"),
+        )
+
+        self.cashbox = Cashbox.objects.create(company=self.company, branch=self.branch, name="Касса 1")
+        self.shift = CashShift.objects.create(
+            company=self.company,
+            branch=self.branch,
+            cashbox=self.cashbox,
+            cashier=self.cashier,
+            status=CashShift.Status.OPEN,
+        )
+
+        self.product = Product.objects.create(
+            company=self.company,
+            name="Консультационный товар",
+            price=Decimal("1000.00"),
+            quantity=Decimal("100"),
+        )
+
+    def test_checkout_with_consultant_commission_calculates_amount(self):
+        from apps.main.models import Cart, CartItem, Sale
+        from apps.main.services import checkout_cart
+
+        cart = Cart.objects.create(
+            company=self.company,
+            branch=self.branch,
+            user=self.cashier,
+            shift=self.shift,
+            status=Cart.Status.ACTIVE,
+        )
+        CartItem.objects.create(
+            cart=cart,
+            company=self.company,
+            product=self.product,
+            quantity=Decimal("2"),
+            unit_price=Decimal("1000.00"),
+        )
+
+        sale = checkout_cart(
+            cart,
+            consultant=self.consultant,
+            consultant_commission_enabled=True,
+            consultant_commission_percent=Decimal("5.00"),
+        )
+
+        self.assertEqual(sale.consultant, self.consultant)
+        self.assertTrue(sale.consultant_commission_enabled)
+        self.assertEqual(sale.consultant_commission_percent, Decimal("5.00"))
+        self.assertEqual(sale.total, Decimal("2000.00"))
+        self.assertEqual(sale.consultant_commission_amount, Decimal("100.00"))
+
+    def test_checkout_with_consultant_commission_disabled(self):
+        from apps.main.models import Cart, CartItem, Sale
+        from apps.main.services import checkout_cart
+
+        cart = Cart.objects.create(
+            company=self.company,
+            branch=self.branch,
+            user=self.cashier,
+            shift=self.shift,
+            status=Cart.Status.ACTIVE,
+        )
+        CartItem.objects.create(
+            cart=cart,
+            company=self.company,
+            product=self.product,
+            quantity=Decimal("2"),
+            unit_price=Decimal("1000.00"),
+        )
+
+        sale = checkout_cart(
+            cart,
+            consultant=self.consultant,
+            consultant_commission_enabled=False,
+            consultant_commission_percent=Decimal("5.00"),
+        )
+
+        self.assertEqual(sale.consultant, self.consultant)
+        self.assertFalse(sale.consultant_commission_enabled)
+        self.assertEqual(sale.consultant_commission_amount, Decimal("0.00"))
+
+    def test_salary_analytics_calculates_commission(self):
+        from apps.main.models import Cart, CartItem, Sale
+        from apps.main.services import checkout_cart
+        from apps.main.analytics_market import AnalyticsView, Period
+        from django.utils import timezone
+        import datetime
+
+        # Продажа 1: с консультантом и 5% комиссией на 2000
+        cart1 = Cart.objects.create(
+            company=self.company, branch=self.branch, user=self.cashier, shift=self.shift, status=Cart.Status.ACTIVE
+        )
+        CartItem.objects.create(cart=cart1, company=self.company, product=self.product, quantity=Decimal("2"), unit_price=Decimal("1000.00"))
+        sale1 = checkout_cart(cart1, consultant=self.consultant, consultant_commission_enabled=True, consultant_commission_percent=Decimal("5.00"))
+        sale1.mark_paid()
+
+        # Продажа 2: без консультанта на 1000 (только кассир)
+        cart2 = Cart.objects.create(
+            company=self.company, branch=self.branch, user=self.cashier, shift=self.shift, status=Cart.Status.ACTIVE
+        )
+        CartItem.objects.create(cart=cart2, company=self.company, product=self.product, quantity=Decimal("1"), unit_price=Decimal("1000.00"))
+        sale2 = checkout_cart(cart2)
+        sale2.mark_paid()
+
+        now = timezone.now()
+        period = Period(start=now - datetime.timedelta(days=1), end=now + datetime.timedelta(days=1))
+
+        rf = APIRequestFactory()
+        req = rf.get("/main/analytics/market/?tab=salary")
+        req.user = self.cashier
+
+        res = AnalyticsView()._salary(req, self.company, self.branch, period)
+        rows = res["rows"] if "rows" in res else res["tables"]["rows"]
+        row_map = {r["user_id"]: r for r in rows}
+
+        cashier_row = row_map[str(self.cashier.id)]
+        consultant_row = row_map[str(self.consultant.id)]
+
+        # База для % кассира (3%) — только продажа 2 (1000.00), т.к. продажа 1 перешла на консультанта
+        self.assertEqual(cashier_row["cashier_sales_period"], "3000.00")
+        self.assertEqual(cashier_row["employee_sales_period"], "1000.00")
+
+        # Для консультанта: комиссия за период = 100.00
+        self.assertEqual(consultant_row["consultant_sales_period"], "2000.00")
+        self.assertEqual(consultant_row["consultant_commission_period"], "100.00")
+        self.assertEqual(consultant_row["percent_bonus"], "100.00")
+
+    def test_partial_return_recalculates_commission(self):
+        from apps.main.models import Cart, CartItem, Sale, SaleItem
+        from apps.main.services import checkout_cart
+        from apps.main.pos_views import _execute_sale_return
+
+        cart = Cart.objects.create(
+            company=self.company, branch=self.branch, user=self.cashier, shift=self.shift, status=Cart.Status.ACTIVE
+        )
+        CartItem.objects.create(cart=cart, company=self.company, product=self.product, quantity=Decimal("2"), unit_price=Decimal("1000.00"))
+        sale = checkout_cart(cart, consultant=self.consultant, consultant_commission_enabled=True, consultant_commission_percent=Decimal("5.00"))
+        sale.mark_paid()
+
+        item = sale.items.first()
+        # Возврат 1 штуки из 2
+        _execute_sale_return(sale, [(item.id, Decimal("1"))], user=self.cashier)
+
+        sale.refresh_from_db()
+        self.assertEqual(sale.total, Decimal("1000.00"))
+        # Комиссия от 1000 @ 5% должна стать 50.00
+        self.assertEqual(sale.consultant_commission_amount, Decimal("50.00"))
+
+    def test_sale_consultants_endpoint(self):
+        rf = APIRequestFactory()
+        req = rf.get("/main/pos/sale-consultants/")
+        force_authenticate(req, user=self.cashier)
+
+        from apps.main.pos_views import SaleConsultantsAPIView
+        view = SaleConsultantsAPIView.as_view()
+        res = view(req)
+
+        self.assertEqual(res.status_code, 200)
+        c_map = {item["id"]: item for item in res.data}
+        self.assertIn(str(self.consultant.id), c_map)
+        self.assertEqual(c_map[str(self.consultant.id)]["default_commission_percent"], "5.00")
+
+

@@ -2116,6 +2116,23 @@ class Sale(models.Model):
 
     client = models.ForeignKey("main.Client", on_delete=models.SET_NULL, null=True, blank=True, related_name="sale")
 
+    # Консультант и комиссия от выручки
+    consultant = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="consultant_sales",
+        verbose_name="Консультант",
+    )
+    consultant_commission_enabled = models.BooleanField(default=False, verbose_name="Начислять процент консультанту")
+    consultant_commission_percent = models.DecimalField(
+        max_digits=5, decimal_places=2, null=True, blank=True, verbose_name="Процент комиссии консультанта"
+    )
+    consultant_commission_amount = models.DecimalField(
+        max_digits=12, decimal_places=2, null=True, blank=True, default=Decimal("0.00"), verbose_name="Сумма комиссии консультанта"
+    )
+
     status = models.CharField(max_length=16, choices=Status.choices, default=Status.NEW)
     doc_number = models.PositiveIntegerField(null=True, blank=True, db_index=True)
 
@@ -2144,6 +2161,7 @@ class Sale(models.Model):
             models.Index(fields=["company", "branch", "created_at"]),
             models.Index(fields=["shift", "created_at"]),
             models.Index(fields=["cashbox", "created_at"]),
+            models.Index(fields=["company", "consultant", "paid_at"]),
         ]
 
     def clean(self):
@@ -2156,6 +2174,11 @@ class Sale(models.Model):
             user_company_id = getattr(self.user, "company_id", None)
             if user_company_id and user_company_id != self.company_id:
                 raise ValidationError({"user": "Пользователь другой компании."})
+
+        if self.consultant_id and self.company_id:
+            consultant_company_id = getattr(self.consultant, "company_id", None)
+            if consultant_company_id and consultant_company_id != self.company_id:
+                raise ValidationError({"consultant": "Консультант другой компании."})
 
         if self.client_id and self.company_id and self.client.company_id != self.company_id:
             raise ValidationError({"client": "Клиент другой компании."})

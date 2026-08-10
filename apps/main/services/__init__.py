@@ -27,6 +27,9 @@ def checkout_cart(
     cash_received=None,
     payments=None,
     client=None,
+    consultant=None,
+    consultant_commission_enabled: bool = False,
+    consultant_commission_percent=None,
 ) -> Sale:
     """
     Перенос корзины в Sale (статус NEW) и списание остатков.
@@ -76,12 +79,26 @@ def checkout_cart(
                     f"Требуется {need} (в учётных единицах склада), доступно {have}."
                 )
 
+    comm_enabled = bool(consultant and consultant_commission_enabled)
+    comm_pct = (
+        Decimal(str(consultant_commission_percent))
+        if (consultant and consultant_commission_percent not in (None, "", "null"))
+        else None
+    )
+    comm_amount = Decimal("0.00")
+    if consultant and comm_enabled and comm_pct is not None and comm_pct > 0:
+        comm_amount = (cart.total * comm_pct / Decimal("100")).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
     sale = Sale.objects.create(
         company=cart.company,
         branch=branch,
         user=shift.cashier,
         shift=shift,
         cashbox=cashbox,
+        consultant=consultant if consultant else None,
+        consultant_commission_enabled=comm_enabled,
+        consultant_commission_percent=comm_pct,
+        consultant_commission_amount=comm_amount,
         status=Sale.Status.NEW,
         subtotal=cart.subtotal,
         discount_total=cart.discount_total,

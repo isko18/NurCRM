@@ -105,6 +105,14 @@ class SaleReceiptAPIView(APIView):
                 "id": str(sale.user_id) if getattr(sale, "user_id", None) else None,
                 "name": safe_str(_user_display_name(sale.user), dash="") if getattr(sale, "user", None) else "",
             },
+            "consultant": (
+                {
+                    "id": str(sale.consultant_id),
+                    "name": safe_str(_user_display_name(sale.consultant), dash=""),
+                }
+                if getattr(sale, "consultant_id", None) and getattr(sale, "consultant", None)
+                else None
+            ),
             "client": (
                 {
                     "id": str(client.id),

@@ -528,7 +528,8 @@ class AnalyticsView(APIView):
     permission_classes = [permissions.IsAuthenticated]
 
     def _include_global(self, request) -> bool:
-        return (request.query_params.get("include_global") or "").strip() in ("1", "true", "yes", "on")
+        qp = getattr(request, "query_params", None) or getattr(request, "GET", {})
+        return (qp.get("include_global") or "").strip() in ("1", "true", "yes", "on")
 
     def _apply_sale_filters(self, request, qs, SaleModel):
         cashbox_id = request.query_params.get("cashbox")
@@ -545,6 +546,10 @@ class AnalyticsView(APIView):
                 qs = qs.filter(user_id=cashier_id)
             elif _model_has_field(SaleModel, "shift"):
                 qs = qs.filter(shift__cashier_id=cashier_id)
+
+        consultant_id = request.query_params.get("consultant")
+        if consultant_id and _model_has_field(SaleModel, "consultant"):
+            qs = qs.filter(consultant_id=consultant_id)
 
         pm = request.query_params.get("payment_method")
         if pm and _model_has_field(SaleModel, "payment_method"):
@@ -2935,54 +2940,97 @@ class AnalyticsView(APIView):
             if prof.user_id not in effective_profiles or prof.branch_id is not None:
                 effective_profiles[prof.user_id] = prof
 
-        payroll_user_ids = list(effective_profiles.keys())
+        period_sales_qs = _sale_qs_period()
+        cashier_user_ids = set(period_sales_qs.exclude(user_id__isnull=True).values_list("user_id", flat=True))
+        consultant_user_ids = set(period_sales_qs.exclude(consultant_id__isnull=True).values_list("consultant_id", flat=True))
+        profile_user_ids = set(effective_profiles.keys())
+        all_user_ids = list(profile_user_ids | cashier_user_ids | consultant_user_ids)
+        payroll_user_ids = all_user_ids
+
+        from django.contrib.auth import get_user_model
+        User = get_user_model()
+        users_by_id = {u.id: u for u in User.objects.filter(id__in=all_user_ids)}
 
         rows = []
-        for prof in effective_profiles.values():
-            sq = _sale_qs_period().filter(user_id=prof.user_id)
+        for uid in all_user_ids:
+            prof = effective_profiles.get(uid)
+            user_obj = users_by_id.get(uid)
+            if not user_obj and not prof:
+                continue
 
-            agg = sq.aggregate(
-                s=Coalesce(
-                    Sum("total"),
-                    Value(Z_MONEY, output_field=MONEY_FIELD),
-                    output_field=MONEY_FIELD,
-                ),
-                c=Count("id"),
+            user_label = _user_label(user_obj) if user_obj else (_user_label(prof.user) if prof else "Неизвестный")
+
+            sq_cashier = period_sales_qs.filter(user_id=uid)
+            cashier_agg = sq_cashier.aggregate(
+                total_sum=Coalesce(Sum("total"), Value(Z_MONEY, output_field=MONEY_FIELD), output_field=MONEY_FIELD),
+                cnt=Count("id"),
             )
-            sales_total = agg["s"] or Z_MONEY
-            sale_count = int(agg["c"] or 0)
+            cashier_sales_period = cashier_agg["total_sum"] or Z_MONEY
+            cashier_sales_count = int(cashier_agg["cnt"] or 0)
 
-            base_part = ((prof.monthly_base_salary or Z_MONEY) * Decimal(days) / Decimal("30")).quantize(
-                Decimal("0.01")
+            sq_consultant = period_sales_qs.filter(consultant_id=uid)
+            consultant_agg = sq_consultant.aggregate(
+                total_sum=Coalesce(Sum("total"), Value(Z_MONEY, output_field=MONEY_FIELD), output_field=MONEY_FIELD),
+                comm_sum=Coalesce(Sum("consultant_commission_amount"), Value(Z_MONEY, output_field=MONEY_FIELD), output_field=MONEY_FIELD),
+                cnt=Count("id"),
             )
-            pct = (prof.sales_percent or Z_MONEY) / Decimal("100")
-            bonus = (sales_total * pct).quantize(Decimal("0.01"))
+            consultant_sales_period = consultant_agg["total_sum"] or Z_MONEY
+            consultant_commission_period = consultant_agg["comm_sum"] or Z_MONEY
+            consultant_sales_count = int(consultant_agg["cnt"] or 0)
 
-            scheme = prof.pay_scheme
-            if scheme == MarketSaleEmployeePayProfile.PayScheme.SALARY:
-                total_pay = base_part
-            elif scheme == MarketSaleEmployeePayProfile.PayScheme.PERCENT:
-                total_pay = bonus
+            sq_cashier_eligible = sq_cashier.filter(
+                Q(consultant__isnull=True)
+                | Q(consultant_commission_enabled=False)
+                | Q(consultant_commission_amount=Decimal("0.00"))
+                | Q(consultant_commission_amount__isnull=True)
+            )
+            eligible_agg = sq_cashier_eligible.aggregate(
+                total_sum=Coalesce(Sum("total"), Value(Z_MONEY, output_field=MONEY_FIELD), output_field=MONEY_FIELD),
+            )
+            employee_sales_period = eligible_agg["total_sum"] or Z_MONEY
+
+            monthly_base_salary = prof.monthly_base_salary if prof else Z_MONEY
+            sales_percent = prof.sales_percent if prof else Z_MONEY
+            pay_scheme = prof.pay_scheme if prof else MarketSaleEmployeePayProfile.PayScheme.SALARY
+            pay_scheme_label = prof.get_pay_scheme_display() if prof else "Оклад"
+
+            base_part = ((monthly_base_salary or Z_MONEY) * Decimal(days) / Decimal("30")).quantize(Decimal("0.01"))
+
+            pct = (sales_percent or Z_MONEY) / Decimal("100")
+            if pay_scheme in (MarketSaleEmployeePayProfile.PayScheme.PERCENT, MarketSaleEmployeePayProfile.PayScheme.SALARY_PLUS_PERCENT):
+                cashier_bonus = (employee_sales_period * pct).quantize(Decimal("0.01"))
             else:
-                total_pay = (base_part + bonus).quantize(Decimal("0.01"))
+                cashier_bonus = Z_MONEY
 
-            user = prof.user
-            label = _user_label(user)
+            percent_bonus = (cashier_bonus + consultant_commission_period).quantize(Decimal("0.01"))
+
+            if pay_scheme == MarketSaleEmployeePayProfile.PayScheme.SALARY:
+                total_pay = (base_part + consultant_commission_period).quantize(Decimal("0.01"))
+            elif pay_scheme == MarketSaleEmployeePayProfile.PayScheme.PERCENT:
+                total_pay = percent_bonus
+            else:
+                total_pay = (base_part + percent_bonus).quantize(Decimal("0.01"))
+
             rows.append(
                 {
-                    "user_id": str(prof.user_id),
-                    "employee_label": label,
-                    "profile_scope": "branch" if prof.branch_id else "global",
-                    "pay_scheme": prof.pay_scheme,
-                    "pay_scheme_label": prof.get_pay_scheme_display(),
-                    "monthly_base_salary": str(prof.monthly_base_salary),
-                    "sales_percent": str(prof.sales_percent),
+                    "user_id": str(uid),
+                    "employee_label": user_label,
+                    "profile_scope": ("branch" if prof.branch_id else "global") if prof else "none",
+                    "pay_scheme": pay_scheme,
+                    "pay_scheme_label": pay_scheme_label,
+                    "monthly_base_salary": str(monthly_base_salary or Z_MONEY),
+                    "sales_percent": str(sales_percent or Z_MONEY),
                     "period_days": days,
                     "base_prorated": str(base_part),
-                    "employee_sales_period": str(_money(sales_total)),
-                    "percent_bonus": str(bonus),
-                    "total": str(total_pay),
-                    "sales_count": sale_count,
+                    "cashier_sales_period": str(_money(cashier_sales_period)),
+                    "consultant_sales_period": str(_money(consultant_sales_period)),
+                    "consultant_commission_period": str(_money(consultant_commission_period)),
+                    "employee_sales_period": str(_money(employee_sales_period)),
+                    "percent_bonus": str(_money(percent_bonus)),
+                    "total": str(_money(total_pay)),
+                    "sales_count": cashier_sales_count,
+                    "cashier_sales_count": cashier_sales_count,
+                    "consultant_sales_count": consultant_sales_count,
                 }
             )
 
