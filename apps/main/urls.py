@@ -103,6 +103,7 @@ urlpatterns = [
     path('products/barcode/<str:barcode>/', ProductByBarcodeAPIView.as_view(), name='product-by-barcode'),
     path('products/warehouse-barcode/<str:barcode>/', ProductWarehouseBarcodeAPIView.as_view(), name='product-warehouse-barcode'),
     path('products/global-barcode/<str:barcode>/', ProductByGlobalBarcodeAPIView.as_view(), name='product-by-barcode'),
+    path('products/form-layout/', ProductFormLayoutAPIView.as_view(), name='product-form-layout'),
     
     #photo
     path("products/<uuid:product_id>/images/",

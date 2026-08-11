@@ -57,6 +57,7 @@ from apps.main.models import (
     SupplierReceiptItem,
     SupplierReturn,
     SupplierReturnItem,
+    MarketProductFormLayout,
     KnowledgeBaseCourse,
     FinishedToRawTransfer,
     Inventory,
@@ -4792,6 +4793,71 @@ class SupplierReturnCreateAPIView(CompanyBranchRestrictedMixin, APIView):
 
         resp_serializer = SupplierReturnReadSerializer(sup_return, context={"request": request})
         return Response(resp_serializer.data, status=status.HTTP_201_CREATED)
+
+
+# ===========================
+#  Product Form Layout (Маркет: Раскладка формы товара)
+# ===========================
+ALLOWED_PRODUCT_FORM_LAYOUT_FIELDS = {
+    "code", "barcode", "alternateBarcodes", "article", "hotkey", "images",
+    "category", "brand",
+    "unit", "pieceSale", "weight", "adult", "packaging",
+    "markup", "wholesale", "discount",
+    "supplier", "debt", "minStock", "country", "expiry",
+    "promotion", "characteristics", "description", "plu"
+}
+
+
+class ProductFormLayoutAPIView(CompanyBranchRestrictedMixin, APIView):
+    """
+    GET /api/main/products/form-layout/ — прочитать раскладку компании
+    PATCH /api/main/products/form-layout/ — сохранить раскладку (owner/admin)
+    """
+
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request, *args, **kwargs):
+        company = self._company()
+        if not company:
+            return Response({"detail": "Компания не найдена."}, status=status.HTTP_400_BAD_REQUEST)
+
+        layout = MarketProductFormLayout.objects.filter(company=company).first()
+        hidden = layout.hidden if (layout and isinstance(layout.hidden, list)) else []
+        updated_at = layout.updated_at.isoformat() if (layout and layout.updated_at) else None
+
+        return Response({"hidden": hidden, "updated_at": updated_at}, status=status.HTTP_200_OK)
+
+    def patch(self, request, *args, **kwargs):
+        company = self._company()
+        if not company:
+            return Response({"detail": "Компания не найдена."}, status=status.HTTP_400_BAD_REQUEST)
+
+        is_admin = getattr(request.user, "role", None) in ["owner", "admin"]
+        if not is_admin:
+            return Response({"detail": "Недостаточно прав. Настройка формы доступна только администраторам и владельцу."}, status=status.HTTP_403_FORBIDDEN)
+
+        hidden_raw = request.data.get("hidden")
+        if hidden_raw is None or not isinstance(hidden_raw, list):
+            return Response({"hidden": ["Поле 'hidden' должно быть массивом строк."]}, status=status.HTTP_400_BAD_REQUEST)
+
+        normalized_hidden = []
+        seen = set()
+        for item in hidden_raw:
+            if isinstance(item, str):
+                item_str = item.strip()
+                if item_str in ALLOWED_PRODUCT_FORM_LAYOUT_FIELDS and item_str not in seen:
+                    seen.add(item_str)
+                    normalized_hidden.append(item_str)
+
+        layout, _ = MarketProductFormLayout.objects.get_or_create(company=company)
+        layout.hidden = normalized_hidden
+        layout.updated_by = request.user
+        layout.save()
+
+        return Response({
+            "hidden": layout.hidden,
+            "updated_at": layout.updated_at.isoformat() if layout.updated_at else None,
+        }, status=status.HTTP_200_OK)
 
 
 # ===========================

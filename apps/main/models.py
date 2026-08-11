@@ -3261,6 +3261,38 @@ class SupplierReturnItem(models.Model):
         ]
 
 
+class MarketProductFormLayout(models.Model):
+    """
+    Раскладка формы создания/редактирования товара (Маркет).
+    Одна запись на компанию (singleton).
+    """
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    company = models.OneToOneField(
+        Company,
+        on_delete=models.CASCADE,
+        related_name="product_form_layout",
+        verbose_name="Компания",
+    )
+    hidden = models.JSONField("Скрытые блоки формы", default=list, blank=True)
+    updated_at = models.DateTimeField("Обновлено", auto_now=True)
+    updated_by = models.ForeignKey(
+        User,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="updated_product_form_layouts",
+        verbose_name="Кто обновил",
+    )
+
+    class Meta:
+        verbose_name = "Раскладка формы товара"
+        verbose_name_plural = "Раскладки форм товаров"
+
+    def __str__(self):
+        return f"FormLayout ({getattr(self.company, 'name', self.company_id)})"
+
+
 class ClientDeal(models.Model):
     class Kind(models.TextChoices):
         AMOUNT = "amount", "Сумма договора"
