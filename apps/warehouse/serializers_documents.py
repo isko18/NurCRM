@@ -1,5 +1,6 @@
 from decimal import Decimal
 from rest_framework import serializers
+from django.db import transaction
 from django.core.exceptions import ValidationError as DjangoValidationError
 from django.core.exceptions import ObjectDoesNotExist
 from django.contrib.auth import get_user_model
@@ -542,54 +543,71 @@ class DocumentSerializer(serializers.ModelSerializer):
 
     def update(self, instance, validated_data):
         items = validated_data.pop("items", None)
-        
-        # Проверяем, что документ не проведен
-        if instance.status in (instance.Status.POSTED, instance.Status.CASH_PENDING):
-            raise serializers.ValidationError(
-                {"status": "Нельзя изменять проведенный/ожидающий кассу документ. Сначала отмените проведение."}
+
+        with transaction.atomic():
+            # Блокируем строку документа и перечитываем статус из БД.
+            # instance прочитан в начале запроса: если параллельно шло проведение,
+            # в памяти всё ещё DRAFT, и полное сохранение ниже вернуло бы документу
+            # устаревший статус, оставив уже созданные складские движения
+            # (документ выглядит черновиком, а товар со склада списан).
+            current_status = (
+                models.Document.objects.select_for_update()
+                .filter(pk=instance.pk)
+                .values_list("status", flat=True)
+                .first()
             )
-        
-        # Валидация документа перед обновлением
-        for key, value in validated_data.items():
-            setattr(instance, key, value)
-        if ("is_sale_request" in validated_data) or ("doc_type" in validated_data):
-            instance.status = self._resolve_sale_status(instance.doc_type, instance.is_sale_request, current_status=instance.status)
+            if current_status is None:
+                raise serializers.ValidationError({"detail": "Документ не найден."})
+            instance.status = current_status
 
-        # Мультисклад агента: привязываем документ к складу первой позиции, если
-        # единый склад не задан (аналогично созданию).
-        if items:
-            anchor = self._anchor_agent_warehouse_from(
-                agent=instance.agent,
-                doc_type=instance.doc_type,
-                warehouse_from=instance.warehouse_from,
-                items=items,
-            )
-            if anchor is not None:
-                instance.warehouse_from = anchor
+            # Проверяем, что документ не проведен
+            if current_status in (instance.Status.POSTED, instance.Status.CASH_PENDING):
+                raise serializers.ValidationError(
+                    {"status": "Нельзя изменять проведенный/ожидающий кассу документ. Сначала отмените проведение."}
+                )
 
-        try:
-            instance.clean()
-        except DjangoValidationError as e:
-            raise serializers.ValidationError(getattr(e, "message_dict", {"detail": str(e)}))
-        
-        instance = super().update(instance, validated_data)
-        
-        if items is not None:
-            # Удаляем старые items
-            instance.items.all().delete()
-            
-            # Валидация и создание новых items
-            for it in items:
-                it = _merge_product_discount_into_item(dict(it))
-                it = _apply_sale_price_to_item(it, instance)
-                item = models.DocumentItem(document=instance, **it)
-                try:
-                    item.clean()
-                except DjangoValidationError as e:
-                    raise serializers.ValidationError(getattr(e, "message_dict", {"detail": str(e)}))
-                item.save()
+            # Валидация документа перед обновлением
+            for key, value in validated_data.items():
+                setattr(instance, key, value)
+            if ("is_sale_request" in validated_data) or ("doc_type" in validated_data):
+                instance.status = self._resolve_sale_status(instance.doc_type, instance.is_sale_request, current_status=current_status)
 
-        warehouse_services.recalc_document_totals(instance)
+            # Мультисклад агента: привязываем документ к складу первой позиции, если
+            # единый склад не задан (аналогично созданию).
+            if items:
+                anchor = self._anchor_agent_warehouse_from(
+                    agent=instance.agent,
+                    doc_type=instance.doc_type,
+                    warehouse_from=instance.warehouse_from,
+                    items=items,
+                )
+                if anchor is not None:
+                    instance.warehouse_from = anchor
+
+            try:
+                instance.clean()
+            except DjangoValidationError as e:
+                raise serializers.ValidationError(getattr(e, "message_dict", {"detail": str(e)}))
+
+            instance = super().update(instance, validated_data)
+
+            if items is not None:
+                # Удаляем старые items
+                instance.items.all().delete()
+
+                # Валидация и создание новых items
+                for it in items:
+                    it = _merge_product_discount_into_item(dict(it))
+                    it = _apply_sale_price_to_item(it, instance)
+                    item = models.DocumentItem(document=instance, **it)
+                    try:
+                        item.clean()
+                    except DjangoValidationError as e:
+                        raise serializers.ValidationError(getattr(e, "message_dict", {"detail": str(e)}))
+                    item.save()
+
+            warehouse_services.recalc_document_totals(instance)
+
         instance.refresh_from_db()
         return instance
 
