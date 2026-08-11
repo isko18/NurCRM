@@ -9,6 +9,7 @@ from decimal import Decimal
 from django.apps import apps
 from django.contrib.auth import get_user_model
 from django.test import TestCase
+from rest_framework.exceptions import ValidationError as DRFValidationError
 
 from apps.warehouse import models
 from apps.warehouse import services
@@ -114,6 +115,46 @@ class StockConsistencyTests(TestCase):
         self.assertEqual(bal_qty, Decimal("90.000"))
         self.assertEqual(prod_qty, Decimal("90.000"))
         self.assertEqual(models.StockMove.objects.filter(document=doc).count(), 1)
+
+    def test_edit_with_stale_instance_cannot_revert_posted_status(self):
+        """
+        Реальный инцидент SALE-20260808-0041: PUT ушёл одновременно с проведением.
+
+        Экземпляр документа в запросе на редактирование прочитан до того, как
+        проведение закоммитилось, поэтому в памяти статус ещё DRAFT. Полное
+        сохранение возвращало документу DRAFT, а созданные движения оставались:
+        товар списан, а документ выглядит черновиком.
+        """
+        from apps.warehouse import serializers_documents
+
+        doc = models.Document.objects.create(
+            doc_type=models.Document.DocType.SALE,
+            warehouse_from=self.wh,
+            counterparty=self.client_cp,
+            payment_kind=models.Document.PaymentKind.CREDIT,
+        )
+        models.DocumentItem.objects.create(
+            document=doc, product=self.product, qty=Decimal("10.000"), price=Decimal("150.00"),
+        )
+        # копия «параллельного запроса на редактирование», прочитанная до проведения
+        stale = models.Document.objects.get(pk=doc.pk)
+        self.assertEqual(stale.status, models.Document.Status.DRAFT)
+
+        services.post_document(doc)
+        doc.refresh_from_db()
+        self.assertEqual(doc.status, models.Document.Status.POSTED)
+
+        ser = serializers_documents.DocumentSerializer()
+        with self.assertRaises(DRFValidationError) as ctx:
+            ser.update(stale, {"comment": "правка вдогонку", "doc_type": doc.doc_type})
+        self.assertIn("проведенный", str(ctx.exception))
+
+        doc.refresh_from_db()
+        self.assertEqual(doc.status, models.Document.Status.POSTED)
+        self.assertEqual(doc.moves.count(), 1)
+        bal_qty, prod_qty = self._on_hand()
+        self.assertEqual(bal_qty, Decimal("90.000"))
+        self.assertEqual(prod_qty, Decimal("90.000"))
 
     def test_recalc_totals_on_document_without_items(self):
         """Пересчёт пустого документа не должен падать."""
