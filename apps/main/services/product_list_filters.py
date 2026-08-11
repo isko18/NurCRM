@@ -194,6 +194,10 @@ def apply_product_list_filters(qs, query_params):
     if is_weight is not None:
         qs = qs.filter(is_weight=is_weight)
 
+    is_adult = _parse_bool(query_params.get("is_adult"))
+    if is_adult is not None:
+        qs = qs.filter(is_adult=is_adult)
+
     preset = _normalize_preset(query_params.get("preset"))
     if preset:
         qs = _apply_preset(qs, preset)

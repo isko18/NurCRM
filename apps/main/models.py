@@ -738,6 +738,12 @@ class Product(models.Model):
         default=False,
         help_text="Если товар продаётся по весу (обычно кг)",
     )
+    is_adult = models.BooleanField(
+        "Товар 18+",
+        default=False,
+        help_text="Флаг 18+ для товаров (алкоголь, табак и т.д.)",
+    )
+
 
     quantity = models.DecimalField(
         "Количество/Остаток",
@@ -999,8 +1005,12 @@ class Product(models.Model):
         self.price = result.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
 
     def clean(self):
+        if self.kind != self.Kind.PRODUCT:
+            self.is_adult = False
+
         if self.branch_id and self.branch.company_id != self.company_id:
             raise ValidationError({"branch": "Филиал принадлежит другой компании."})
+
 
         for rel, name in [(self.brand, "brand"), (self.category, "category"), (self.client, "client")]:
             if rel and getattr(rel, "company_id", None) != self.company_id:

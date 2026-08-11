@@ -354,6 +354,12 @@ class WarehouseProduct(BaseModelId, BaseModelDate, BaseModelCompanyBranch):
         default=False,
         help_text="Если товар продаётся по весу (обычно кг).",
     )
+    is_adult = models.BooleanField(
+        "Товар 18+",
+        default=False,
+        help_text="Флаг 18+ для товаров (алкоголь, табак и т.д.).",
+    )
+
 
     quantity = models.DecimalField(
         "Количество",
@@ -1692,6 +1698,8 @@ class DocumentItem(models.Model):
     discount_percent = models.DecimalField(
         max_digits=5, decimal_places=2, default=Decimal("0.00"), verbose_name="Скидка на товар, %"
     )
+    # Применяется, только если процент скидки не действует (ни свой, ни общий по документу):
+    # процент и сумму не суммируем, см. services.compute_document_line_total.
     discount_amount = models.DecimalField(
         max_digits=18, decimal_places=2, default=Decimal("0.00"),
         verbose_name="Скидка на товар, сумма", help_text="Фиксированная скидка по строке"
@@ -1794,17 +1802,17 @@ class DocumentItem(models.Model):
                 raise ValidationError({"qty": "Quantity must be integer for piece items"})
 
     def save(self, *args, **kwargs):
-        from apps.warehouse.services import effective_document_line_discount_percent
+        from apps.warehouse.services import compute_document_line_total
 
-        q = Decimal(self.qty or 0)
-        p = Decimal(self.price or 0)
         doc = getattr(self, "document", None)
         doc_dp = Decimal(getattr(doc, "discount_percent", None) or 0) if doc is not None else Decimal("0")
-        eff_pct = effective_document_line_discount_percent(self.discount_percent, doc_dp)
-        dp = eff_pct / Decimal("100")
-        da = Decimal(self.discount_amount or 0)
-        subtotal = (p * q * (Decimal("1") - dp)).quantize(Decimal("0.01"))
-        self.line_total = max(Decimal("0.00"), (subtotal - da).quantize(Decimal("0.01")))
+        self.line_total = compute_document_line_total(
+            price=self.price,
+            qty=self.qty,
+            line_discount_percent=self.discount_percent,
+            line_discount_amount=self.discount_amount,
+            document_discount_percent=doc_dp,
+        )
         super().save(*args, **kwargs)
 
 

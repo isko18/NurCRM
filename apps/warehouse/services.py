@@ -60,6 +60,21 @@ def resolve_document_context_warehouse(document):
     raise ValueError("Для документа нужен warehouse_from или строки с товарами со склада.")
 
 
+def product_card_qty(product) -> Decimal:
+    """
+    Количество из карточки товара, прочитанное из БД.
+
+    Внутри проведения документа карточка обновляется через QuerySet.update(), поэтому
+    экземпляр в памяти остаётся со старым количеством. Если сверять остаток с ним,
+    вторая строка по тому же товару «поднимет» остаток обратно и списание потеряется.
+    """
+    pk = getattr(product, "pk", None)
+    if pk is None:
+        return q_qty(Decimal(getattr(product, "quantity", None) or 0))
+    row = type(product).objects.filter(pk=pk).values_list("quantity", flat=True).first()
+    return q_qty(Decimal(row or 0))
+
+
 def resolve_warehouse_on_hand_qty(*, warehouse, product, balance=None, sync=False):
     """
     Эффективный остаток на складе для проверок и списаний.
@@ -69,7 +84,7 @@ def resolve_warehouse_on_hand_qty(*, warehouse, product, balance=None, sync=Fals
     берём max(...) для товара, привязанного к этому складу.
     """
     product_on_warehouse = getattr(product, "warehouse_id", None) == getattr(warehouse, "id", None)
-    prod_qty = q_qty(Decimal(getattr(product, "quantity", None) or 0)) if product_on_warehouse else Decimal("0.000")
+    prod_qty = product_card_qty(product) if product_on_warehouse else Decimal("0.000")
 
     if balance is not None:
         bal_qty = q_qty(Decimal(getattr(balance, "qty", None) or 0))
@@ -142,6 +157,37 @@ def effective_document_line_discount_percent(
     return Decimal(document_discount_percent or 0)
 
 
+def effective_document_line_discount_amount(
+    line_discount_amount,
+    effective_discount_percent,
+) -> Decimal:
+    """
+    Сумма скидки по строке применяется, только если процент скидки по строке не действует.
+    Клиенты присылают одну и ту же скидку двумя полями (5% и её сумму в сомах) —
+    вычитать оба нельзя: товар за 100 сом с 5% давал бы 90 вместо 95.
+    """
+    if Decimal(effective_discount_percent or 0) > 0:
+        return Decimal("0.00")
+    return Decimal(line_discount_amount or 0)
+
+
+def compute_document_line_total(
+    *,
+    price,
+    qty,
+    line_discount_percent,
+    line_discount_amount,
+    document_discount_percent,
+) -> Decimal:
+    """Единая формула line_total: одна скидка на строку — либо процент, либо сумма."""
+    p = Decimal(price or 0)
+    q = Decimal(qty or 0)
+    eff_pct = effective_document_line_discount_percent(line_discount_percent, document_discount_percent)
+    da = effective_document_line_discount_amount(line_discount_amount, eff_pct)
+    subtotal = (p * q * (Decimal("1") - eff_pct / Decimal("100"))).quantize(Decimal("0.01"))
+    return max(Decimal("0.00"), (subtotal - da).quantize(Decimal("0.01")))
+
+
 def _ensure_number(document: models.Document):
     # generate number like TYPE-YYYYMMDD-0001 per day+type
     today = timezone.now().date()
@@ -156,24 +202,25 @@ def _ensure_number(document: models.Document):
 
 
 def recalc_document_totals(document: models.Document) -> models.Document:
-    # line_total: один процент скидки — строковый или (если 0) общий по документу; затем минус discount_amount строки
+    # line_total: одна скидка на строку — процент (строковый или общий по документу),
+    # а если процента нет — сумма скидки строки. Оба сразу не вычитаем.
     doc_dp = Decimal(document.discount_percent or 0)
     for item in document.items.select_related("product").all():
-        q = Decimal(item.qty or 0)
-        p = Decimal(item.price or 0)
-        eff_pct = effective_document_line_discount_percent(item.discount_percent, doc_dp)
-        dp = eff_pct / Decimal("100")
-        da = Decimal(item.discount_amount or 0)
-        subtotal = (p * q * (Decimal("1") - dp)).quantize(Decimal("0.01"))
-        new_line_total = max(Decimal("0.00"), (subtotal - da).quantize(Decimal("0.01")))
+        new_line_total = compute_document_line_total(
+            price=item.price,
+            qty=item.qty,
+            line_discount_percent=item.discount_percent,
+            line_discount_amount=item.discount_amount,
+            document_discount_percent=doc_dp,
+        )
         if item.line_total != new_line_total:
             item.line_total = new_line_total
             item.save(update_fields=["line_total"])
 
     # Процент общей скидки уже учтён в строках (fallback для позиций без своего %); итог = сумма строк минус сумма документа
     subtotal = sum(
-        (item.line_total or Decimal("0.00"))
-        for item in document.items.all()
+        ((item.line_total or Decimal("0.00")) for item in document.items.all()),
+        Decimal("0.00"),
     )
     subtotal = subtotal.quantize(Decimal("0.01"))
 
@@ -191,7 +238,9 @@ def _apply_move(move: models.StockMove):
         warehouse=move.warehouse, product=move.product, defaults={"qty": Decimal("0.000")}
     )
     if move.product.warehouse_id == move.warehouse_id:
-        prod_qty = q_qty(Decimal(move.product.quantity or 0))
+        # Количество читаем из БД, а не из move.product: в цикле проведения карточка
+        # уже могла быть обновлена предыдущей строкой по этому же товару.
+        prod_qty = product_card_qty(move.product)
         bal_qty = q_qty(Decimal(bal.qty or 0))
         if created or (bal_qty <= 0 and prod_qty > 0) or (prod_qty > bal_qty):
             bal.qty = prod_qty
@@ -393,11 +442,6 @@ def post_document(document: models.Document, allow_negative: bool = None) -> mod
         except Exception as e:
             raise ValueError(f"Item validation failed for product {item.product_id}: {str(e)}")
 
-    if not document.number:
-        _ensure_number(document)
-
-    recalc_document_totals(document)
-
     # Если allow_negative не передан явно, берем из настроек
     if allow_negative is None:
         allow_negative = getattr(settings, "ALLOW_NEGATIVE_STOCK", False)
@@ -406,6 +450,25 @@ def post_document(document: models.Document, allow_negative: bool = None) -> mod
         allow_negative = False
 
     with transaction.atomic():
+        # Блокируем строку документа и перечитываем статус из БД. Проверка выше сделана
+        # по экземпляру в памяти: без блокировки два параллельных запроса на проведение
+        # (двойной клик по «Провести», ретрай после таймаута) спишут остаток дважды.
+        current_status = (
+            models.Document.objects.select_for_update()
+            .filter(pk=document.pk)
+            .values_list("status", flat=True)
+            .first()
+        )
+        if current_status is None:
+            raise ValueError("Document not found")
+        if current_status in (document.Status.CASH_PENDING, document.Status.POSTED):
+            raise ValueError("Document already posted")
+
+        if not document.number:
+            _ensure_number(document)
+
+        recalc_document_totals(document)
+
         # Оптимизация: предзагружаем items с продуктами
         items = list(document.items.select_related("product", "product__warehouse", "product__brand", "product__category").all())
 
@@ -567,7 +630,7 @@ def post_document(document: models.Document, allow_negative: bool = None) -> mod
                     else:
                         # Если StockBalance нет, проверяем quantity товара (если товар принадлежит этому складу)
                         if item.product.warehouse_id == document.warehouse_from_id:
-                            cur_from = Decimal(item.product.quantity) if item.product.quantity else Decimal("0")
+                            cur_from = product_card_qty(item.product)
                         else:
                             cur_from = Decimal("0")
                     qty_to_move = Decimal(item.qty)
@@ -612,7 +675,7 @@ def post_document(document: models.Document, allow_negative: bool = None) -> mod
                 else:
                     # Если StockBalance нет, проверяем quantity товара (если товар принадлежит этому складу)
                     if item.product.warehouse_id == document.warehouse_from_id:
-                        cur = Decimal(item.product.quantity) if item.product.quantity else Decimal("0")
+                        cur = product_card_qty(item.product)
                     else:
                         cur = Decimal("0")
                 delta = Decimal(item.qty) - cur

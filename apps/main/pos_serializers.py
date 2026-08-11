@@ -112,6 +112,7 @@ class SaleItemSerializer(serializers.ModelSerializer):
     product_name = serializers.CharField(source="product.name", read_only=True)
     barcode = serializers.CharField(source="product.barcode", read_only=True)
     is_weight = serializers.BooleanField(source="product.is_weight", read_only=True)
+    is_adult = serializers.BooleanField(source="product.is_adult", read_only=True, default=False)
     # Product.stock в карточке товара — «Акционный товар» (как в ProductSerializer)
     stock = serializers.SerializerMethodField()
     promotion_rules = serializers.SerializerMethodField()
@@ -135,7 +136,7 @@ class SaleItemSerializer(serializers.ModelSerializer):
             "id", "cart", "product",
             "kind",
             "product_name", "barcode",
-            "is_weight",
+            "is_weight", "is_adult",
             "stock", "promotion_rules",
             "quantity", "unit_price", "line_discount", "line_total",
             "sale_package",

@@ -3770,6 +3770,387 @@ class SupplierProductsListAPIView(CompanyBranchRestrictedMixin, generics.ListAPI
         return prod_qs.filter(Q(suppliers=supplier) | Q(client_id=supplier.id)).distinct()
 
 
+class SupplierRecommendationsAPIView(CompanyBranchRestrictedMixin, APIView):
+    """
+    GET /api/main/suppliers/<uuid:supplier_id>/recommendations/
+    Маркет — Рекомендуемый заказ
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request, supplier_id, *args, **kwargs):
+        import math
+        from datetime import timedelta
+
+        qp = request.query_params
+
+        # 1. Валидация параметров
+        raw_analysis_days = qp.get("analysis_days", "30")
+        try:
+            analysis_days = int(raw_analysis_days)
+            if analysis_days not in (7, 14, 30):
+                return Response(
+                    {"detail": "analysis_days должен быть 7, 14 или 30."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+        except (ValueError, TypeError):
+            return Response(
+                {"detail": "Некорректное значение analysis_days."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        raw_coverage_days = qp.get("coverage_days", "7")
+        try:
+            coverage_days = int(raw_coverage_days)
+            if coverage_days < 0:
+                return Response(
+                    {"detail": "coverage_days не может быть отрицательным."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+        except (ValueError, TypeError):
+            return Response(
+                {"detail": "Некорректное значение coverage_days."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        raw_safety_days = qp.get("safety_days", "2")
+        try:
+            safety_days = int(raw_safety_days)
+            if safety_days < 0:
+                return Response(
+                    {"detail": "safety_days не может быть отрицательным."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+        except (ValueError, TypeError):
+            return Response(
+                {"detail": "Некорректное значение safety_days."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        raw_page_size = qp.get("page_size", "500")
+        try:
+            page_size = int(raw_page_size)
+            if page_size <= 0:
+                page_size = 500
+            elif page_size > 500:
+                return Response(
+                    {"detail": "page_size не может быть больше 500."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+        except (ValueError, TypeError):
+            return Response(
+                {"detail": "Некорректное значение page_size."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        raw_page = qp.get("page", "1")
+        try:
+            page = int(raw_page)
+            if page <= 0:
+                page = 1
+        except (ValueError, TypeError):
+            page = 1
+
+        search = (qp.get("search") or "").strip()
+        only_required = (qp.get("only_required") or "").strip().lower() in ("true", "1")
+        stock_status_filter = (qp.get("stock_status") or "").strip().lower()
+        if stock_status_filter and stock_status_filter not in ("critical", "ending", "low", "ok"):
+            return Response(
+                {"detail": "stock_status должен быть одним из: critical, ending, low, ok."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        # 2. Поставщик и компания
+        sup_qs = self._filter_qs_company_branch(Client.objects.all())
+        supplier = get_object_or_404(sup_qs, id=supplier_id, type=Client.StatusClient.SUPPLIERS)
+        company = self._company()
+
+        # 3. Товары поставщика
+        prod_qs = self._filter_qs_company_branch(Product.objects.all())
+        prod_qs = prod_qs.filter(
+            Q(suppliers=supplier) | Q(client_id=supplier.id)
+        ).exclude(kind=Product.Kind.SERVICE).distinct()
+
+        if search:
+            prod_qs = prod_qs.filter(
+                Q(name__icontains=search)
+                | Q(barcode__icontains=search)
+                | Q(article__icontains=search)
+                | Q(code__icontains=search)
+            )
+
+        all_products = list(prod_qs)
+        product_ids = [p.id for p in all_products]
+
+        # 4. Временные окна (Asia/Bishkek, UTC+6)
+        try:
+            import zoneinfo
+            tz = zoneinfo.ZoneInfo("Asia/Bishkek")
+        except Exception:
+            import datetime as dt
+            tz = dt.timezone(dt.timedelta(hours=6))
+
+        now_local = datetime.now(tz)
+        today_local = now_local.date()
+
+        def get_window(days_count, offset_days=0):
+            end_date = today_local - timedelta(days=offset_days)
+            start_date = end_date - timedelta(days=days_count - 1)
+            start_dt = datetime.combine(start_date, datetime.min.time(), tzinfo=tz)
+            end_dt = datetime.combine(end_date, datetime.max.time(), tzinfo=tz)
+            return start_dt, end_dt
+
+        cur_7_start, cur_7_end = get_window(7, 0)
+        cur_14_start, cur_14_end = get_window(14, 0)
+        cur_30_start, cur_30_end = get_window(30, 0)
+
+        prev_7_start, prev_7_end = get_window(7, 7)
+        prev_14_start, prev_14_end = get_window(14, 14)
+        prev_30_start, prev_30_end = get_window(30, 30)
+
+        max_past_start = prev_30_start
+
+        # 5. Агрегация продаж
+        sales_agg = {}
+        if product_ids:
+            sale_items = SaleItem.objects.filter(
+                product_id__in=product_ids,
+                sale__status__in=[Sale.Status.PAID, Sale.Status.DEBT],
+            )
+            if company:
+                sale_items = sale_items.filter(sale__company=company)
+
+            branch_id_param = qp.get("branch_id")
+            if branch_id_param:
+                sale_items = sale_items.filter(sale__branch_id=branch_id_param)
+
+            sale_items = sale_items.annotate(
+                sale_time=Coalesce("sale__paid_at", "sale__created_at"),
+                eff_qty=Case(
+                    When(
+                        sale_package__isnull=False,
+                        sale_package__quantity_in_package__gt=0,
+                        then=ExpressionWrapper(
+                            F("quantity") / F("sale_package__quantity_in_package"),
+                            output_field=DecimalField(max_digits=12, decimal_places=3),
+                        ),
+                    ),
+                    default=F("quantity"),
+                    output_field=DecimalField(max_digits=12, decimal_places=3),
+                ),
+            ).filter(sale_time__gte=max_past_start)
+
+            agg_qs = sale_items.values("product_id").annotate(
+                cur_7=Sum(Case(When(sale_time__gte=cur_7_start, sale_time__lte=cur_7_end, then=F("eff_qty")), default=V(0), output_field=DecimalField())),
+                cur_14=Sum(Case(When(sale_time__gte=cur_14_start, sale_time__lte=cur_14_end, then=F("eff_qty")), default=V(0), output_field=DecimalField())),
+                cur_30=Sum(Case(When(sale_time__gte=cur_30_start, sale_time__lte=cur_30_end, then=F("eff_qty")), default=V(0), output_field=DecimalField())),
+                prev_7=Sum(Case(When(sale_time__gte=prev_7_start, sale_time__lte=prev_7_end, then=F("eff_qty")), default=V(0), output_field=DecimalField())),
+                prev_14=Sum(Case(When(sale_time__gte=prev_14_start, sale_time__lte=prev_14_end, then=F("eff_qty")), default=V(0), output_field=DecimalField())),
+                prev_30=Sum(Case(When(sale_time__gte=prev_30_start, sale_time__lte=prev_30_end, then=F("eff_qty")), default=V(0), output_field=DecimalField())),
+            )
+
+            for row in agg_qs:
+                sales_agg[row["product_id"]] = {
+                    "last_7_days": float(row["cur_7"] or 0),
+                    "last_14_days": float(row["cur_14"] or 0),
+                    "last_30_days": float(row["cur_30"] or 0),
+                    "previous_7_days": float(row["prev_7"] or 0),
+                    "previous_14_days": float(row["prev_14"] or 0),
+                    "previous_30_days": float(row["prev_30"] or 0),
+                }
+
+        # 6. Упаковки
+        pack_size_map = {}
+        if product_ids:
+            pkgs = ProductPackage.objects.filter(product_id__in=product_ids, quantity_in_package__gt=1)
+            for pkg in pkgs:
+                if pkg.product_id not in pack_size_map:
+                    pack_size_map[pkg.product_id] = float(pkg.quantity_in_package)
+
+        # 7. Последняя закупка
+        last_purchase_map = {}
+        if product_ids:
+            rcpt_items = (
+                SupplierReceiptItem.objects.filter(
+                    receipt__supplier=supplier,
+                    product_id__in=product_ids,
+                )
+                .select_related("receipt")
+                .order_by("product_id", "-receipt__created_at")
+            )
+            if company:
+                rcpt_items = rcpt_items.filter(receipt__company=company)
+
+            for item in rcpt_items:
+                if item.product_id not in last_purchase_map:
+                    last_purchase_map[item.product_id] = {
+                        "date": item.receipt.created_at.isoformat() if item.receipt and item.receipt.created_at else None,
+                        "quantity": float(item.qty or 0),
+                        "purchase_price": float(item.purchase_price) if item.purchase_price is not None else None,
+                    }
+
+        # 8. Формирование строк рекомендации
+        items_result = []
+        recommended_products_count = 0
+        critical_products_count = 0
+        estimated_total_sum = Decimal("0")
+        has_estimated_total_price = False
+
+        for prod in all_products:
+            p_id = prod.id
+            s_data = sales_agg.get(p_id, {
+                "last_7_days": 0.0,
+                "last_14_days": 0.0,
+                "last_30_days": 0.0,
+                "previous_7_days": 0.0,
+                "previous_14_days": 0.0,
+                "previous_30_days": 0.0,
+            })
+
+            cur_sales = s_data.get(f"last_{analysis_days}_days", 0.0)
+            prev_sales = s_data.get(f"previous_{analysis_days}_days", 0.0)
+
+            avg_per_day = (cur_sales / analysis_days) if analysis_days > 0 else 0.0
+
+            if prev_sales == 0 and cur_sales == 0:
+                trend_percent = 0.0
+            elif prev_sales == 0 and cur_sales > 0:
+                trend_percent = None
+            else:
+                trend_percent = round(((cur_sales - prev_sales) / prev_sales) * 100, 2)
+
+            sales_payload = {
+                "last_7_days": s_data["last_7_days"],
+                "last_14_days": s_data["last_14_days"],
+                "last_30_days": s_data["last_30_days"],
+                "previous_7_days": s_data["previous_7_days"],
+                "previous_14_days": s_data["previous_14_days"],
+                "previous_30_days": s_data["previous_30_days"],
+                "previous_period": prev_sales,
+                "average_per_day": round(avg_per_day, 2),
+                "trend_percent": trend_percent,
+            }
+
+            stock = float(max(Decimal("0"), prod.quantity or Decimal("0")))
+
+            if avg_per_day <= 0:
+                days_remaining = None
+            else:
+                days_remaining = round(stock / avg_per_day, 2)
+
+            req_stock = avg_per_day * (coverage_days + safety_days)
+            raw_rec = max(0.0, req_stock - stock)
+
+            is_weight = bool(prod.is_weight)
+            pack_size = pack_size_map.get(p_id)
+
+            if is_weight:
+                rec_qty = round(raw_rec, 3)
+            else:
+                raw_ceil = math.ceil(raw_rec)
+                if pack_size and pack_size > 1:
+                    rec_qty = math.ceil(raw_rec / pack_size) * pack_size
+                else:
+                    rec_qty = raw_ceil
+
+            if stock <= 0:
+                st_status = "critical"
+            elif avg_per_day <= 0:
+                st_status = "ok"
+            elif days_remaining is not None and days_remaining < 2:
+                st_status = "critical"
+            elif days_remaining is not None and days_remaining < 4:
+                st_status = "ending"
+            elif rec_qty > 0:
+                st_status = "low"
+            else:
+                st_status = "ok"
+
+            if st_status == "critical":
+                critical_products_count += 1
+
+            p_price = float(prod.purchase_price) if prod.purchase_price is not None else None
+
+            if rec_qty > 0:
+                recommended_products_count += 1
+                if p_price is not None and p_price > 0:
+                    estimated_total_sum += Decimal(str(rec_qty)) * Decimal(str(p_price))
+                    has_estimated_total_price = True
+
+            last_pur = last_purchase_map.get(p_id)
+
+            row_data = {
+                "product_id": str(p_id),
+                "product_name": prod.name,
+                "barcode": prod.barcode or None,
+                "article": prod.article or None,
+                "code": prod.code or None,
+                "unit": prod.unit or "шт",
+                "is_weight": is_weight,
+                "scale_type": "weight" if is_weight else "piece",
+                "current_stock": stock,
+                "purchase_price": p_price,
+                "pack_size": pack_size,
+                "sales": sales_payload,
+                "stock_forecast": {
+                    "days_remaining": days_remaining,
+                    "status": st_status,
+                },
+                "last_purchase": last_pur,
+                "recommended_quantity": rec_qty,
+            }
+
+            if only_required and rec_qty <= 0:
+                continue
+            if stock_status_filter and st_status != stock_status_filter:
+                continue
+
+            items_result.append(row_data)
+
+        # 9. Пагинация
+        total_count = len(items_result)
+        start_idx = (page - 1) * page_size
+        end_idx = start_idx + page_size
+        paginated_results = items_result[start_idx:end_idx]
+
+        base_url = request.build_absolute_uri(request.path)
+        def make_page_url(p_num):
+            params = request.query_params.copy()
+            params["page"] = str(p_num)
+            return f"{base_url}?{params.urlencode()}"
+
+        next_url = make_page_url(page + 1) if end_idx < total_count else None
+        prev_url = make_page_url(page - 1) if page > 1 and start_idx < total_count else None
+
+        estimated_total = float(estimated_total_sum) if has_estimated_total_price else None
+        supplier_name = supplier.full_name or supplier.llc or str(supplier)
+
+        response_data = {
+            "supplier": {
+                "id": str(supplier.id),
+                "name": supplier_name,
+            },
+            "settings": {
+                "analysis_days": analysis_days,
+                "coverage_days": coverage_days,
+                "safety_days": safety_days,
+            },
+            "summary": {
+                "products_count": len(all_products),
+                "recommended_products_count": recommended_products_count,
+                "critical_products_count": critical_products_count,
+                "estimated_total": estimated_total,
+            },
+            "count": total_count,
+            "page": page,
+            "page_size": page_size,
+            "next": next_url,
+            "previous": prev_url,
+            "results": paginated_results,
+        }
+
+        return Response(response_data, status=status.HTTP_200_OK)
+
+
 class SupplierPurchasesListAPIView(CompanyBranchRestrictedMixin, generics.ListAPIView):
     """
     GET /api/main/suppliers/<uuid:supplier_id>/purchases/
