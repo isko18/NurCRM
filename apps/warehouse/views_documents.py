@@ -47,8 +47,8 @@ class DocumentListCreateView(CompanyBranchRestrictedMixin, generics.ListCreateAP
         "counterparty__phone",
         "agent__first_name",
         "agent__last_name",
-        "agent__username",
-        "agent__phone",
+        "agent__email",
+        "agent__phone_number",
     ]
 
     def filter_queryset(self, queryset):
