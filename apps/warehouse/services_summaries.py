@@ -13,7 +13,10 @@ from django.db import transaction
 from django.db.models import Sum
 
 from . import models
-from .services import effective_document_line_discount_percent
+from .services import (
+    effective_document_line_discount_amount,
+    effective_document_line_discount_percent,
+)
 
 # В сводку продаж попадают только документы со статусом «Проведен» (POSTED).
 TWOPLACES = Decimal("0.01")
@@ -145,13 +148,14 @@ def build_summary_snapshot(summary):
         doc = doc_by_id.get(item.document_id)
         doc_dp = Decimal(getattr(doc, "discount_percent", None) or 0)
         eff_pct = effective_document_line_discount_percent(item.discount_percent, doc_dp)
+        eff_da = effective_document_line_discount_amount(item.discount_amount, eff_pct)
         items_by_doc.setdefault(item.document_id, []).append({
             "name": getattr(product, "name", "") or "",
             "unit": unit,
             "quantity": _q3(qty),
             "price": _q2(price),
             "discount_percent": Decimal(eff_pct).quantize(TWOPLACES),
-            "discount_amount": _q2(item.discount_amount),
+            "discount_amount": _q2(eff_da),
             "amount": _q2(amount),
             "weight": _q3(weight),
         })

@@ -848,6 +848,87 @@ class WarehouseComprehensiveTests(TestCase):
         self.assertEqual(item.line_total, expected_line)
         self.assertEqual(doc.total, expected_line)
 
+    def test_line_discount_percent_and_amount_are_not_summed(self):
+        """Процент и сумма скидки по строке — одна скидка: 100 сом с 5% дают 95, а не 90."""
+        doc = models.Document.objects.create(
+            doc_type=models.Document.DocType.SALE,
+            warehouse_from=self.wh1,
+            counterparty=self.client,
+        )
+        item = models.DocumentItem.objects.create(
+            document=doc,
+            product=self.prod1,
+            qty=Decimal("1.000"),
+            price=Decimal("100.00"),
+            discount_percent=Decimal("5.00"),
+            discount_amount=Decimal("5.00"),  # клиент прислал ту же скидку второй раз
+        )
+        self.assertEqual(item.line_total, Decimal("95.00"))
+
+        services.recalc_document_totals(doc)
+        item.refresh_from_db()
+        doc.refresh_from_db()
+        self.assertEqual(item.line_total, Decimal("95.00"))
+        self.assertEqual(doc.total, Decimal("95.00"))
+
+    def test_line_discount_amount_applies_without_percent(self):
+        """Без процента сумма скидки по строке работает как раньше."""
+        doc = models.Document.objects.create(
+            doc_type=models.Document.DocType.SALE,
+            warehouse_from=self.wh1,
+            counterparty=self.client,
+        )
+        item = models.DocumentItem.objects.create(
+            document=doc,
+            product=self.prod1,
+            qty=Decimal("1.000"),
+            price=Decimal("100.00"),
+            discount_percent=Decimal("0.00"),
+            discount_amount=Decimal("5.00"),
+        )
+        self.assertEqual(item.line_total, Decimal("95.00"))
+
+    def test_document_discount_percent_disables_line_discount_amount(self):
+        """Общая скидка документа тоже отключает сумму скидки строки (не суммируем)."""
+        doc = models.Document.objects.create(
+            doc_type=models.Document.DocType.SALE,
+            warehouse_from=self.wh1,
+            counterparty=self.client,
+            discount_percent=Decimal("5.00"),
+        )
+        item = models.DocumentItem.objects.create(
+            document=doc,
+            product=self.prod1,
+            qty=Decimal("1.000"),
+            price=Decimal("100.00"),
+            discount_percent=Decimal("0.00"),
+            discount_amount=Decimal("5.00"),
+        )
+        services.recalc_document_totals(doc)
+        item.refresh_from_db()
+        doc.refresh_from_db()
+        self.assertEqual(item.line_total, Decimal("95.00"))
+        self.assertEqual(doc.total, Decimal("95.00"))
+
+    def test_document_discount_amount_still_applies_on_top(self):
+        """Фиксированная скидка на документ — отдельное поле, вычитается из суммы строк."""
+        doc = models.Document.objects.create(
+            doc_type=models.Document.DocType.SALE,
+            warehouse_from=self.wh1,
+            counterparty=self.client,
+            discount_amount=Decimal("10.00"),
+        )
+        models.DocumentItem.objects.create(
+            document=doc,
+            product=self.prod1,
+            qty=Decimal("1.000"),
+            price=Decimal("100.00"),
+            discount_percent=Decimal("5.00"),
+        )
+        services.recalc_document_totals(doc)
+        doc.refresh_from_db()
+        self.assertEqual(doc.total, Decimal("85.00"))
+
     # ==================== ТЕСТЫ НОМЕРАЦИИ ДОКУМЕНТОВ ====================
     
     def test_document_number_generation(self):
