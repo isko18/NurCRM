@@ -2,7 +2,7 @@ from decimal import Decimal, ROUND_HALF_UP, InvalidOperation
 from uuid import UUID, uuid4
 
 from django.db import transaction, IntegrityError
-from django.db.models import Sum, Count, Avg, F, Q, Prefetch, Value as V, Exists, OuterRef, Subquery
+from django.db.models import Sum, Count, Avg, F, Q, Prefetch, Value as V, Exists, OuterRef, Subquery, Case, When
 from django.utils.dateparse import parse_date, parse_datetime
 from django.utils import timezone
 from itertools import groupby
