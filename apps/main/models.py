@@ -3219,6 +3219,23 @@ class ClientDeal(models.Model):
         null=True,
         db_column="debt_months",
     )
+    schedule_version = models.CharField(
+        "Версия графика",
+        max_length=8,
+        default="v1",
+        choices=[("v1", "v1"), ("v2", "v2")],
+    )
+    debt_months = models.PositiveSmallIntegerField("Срок (мес.)", blank=True, null=True, db_column="debt_months_v2")
+    interval_days = models.PositiveSmallIntegerField("Интервал (дни)", default=1, blank=True, null=True)
+    interval_months = models.PositiveSmallIntegerField("Интервал (месяцы)", default=1, blank=True, null=True)
+    sale = models.ForeignKey(
+        "Sale",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="deals",
+        verbose_name="Связанная продажа",
+    )
     first_due_date = models.DateField("Первая дата оплаты", blank=True, null=True)
 
     auto_schedule = models.BooleanField(
@@ -3266,9 +3283,10 @@ class ClientDeal(models.Model):
 
     @property
     def daily_payment(self) -> Decimal:
-        if not self.debt_days or self.debt_days <= 0:
+        cnt = self.debt_days or self.debt_months
+        if not cnt or cnt <= 0:
             return Decimal("0.00")
-        return (self.debt_amount / Decimal(self.debt_days)).quantize(
+        return (self.debt_amount / Decimal(cnt)).quantize(
             Decimal("0.01"),
             rounding=ROUND_HALF_UP,
         )
@@ -3317,16 +3335,23 @@ class ClientDeal(models.Model):
         if self.kind == self.Kind.DEBT:
             if (a - p) <= 0:
                 raise ValidationError({"prepayment": 'Для типа "Долг" сумма договора должна быть больше предоплаты.'})
-            if not self.debt_days or self.debt_days <= 0:
-                raise ValidationError({"debt_days": "Укажите срок (в днях) для рассрочки."})
+            if self.debt_days and self.debt_months:
+                raise ValidationError({"debt_months": "Нельзя одновременно указывать debt_days и debt_months."})
+            if self.schedule_version == "v2":
+                if not self.debt_days and not self.debt_months:
+                    raise ValidationError({"debt_days": "Укажите количество платежей (debt_days или debt_months) для v2."})
+            else:
+                if not self.debt_days or self.debt_days <= 0:
+                    raise ValidationError({"debt_days": "Укажите срок (в днях) для рассрочки."})
         else:
             self.debt_days = None
+            self.debt_months = None
             self.first_due_date = None
             self.auto_schedule = False
 
     # ===== schedule =====
-    def rebuild_installments(self, force: bool = False):
-        if self.kind != self.Kind.DEBT or not self.debt_days or self.debt_days <= 0:
+    def rebuild_installments(self, force: bool = False, custom_installments: list = None):
+        if self.kind != self.Kind.DEBT:
             self.installments.all().delete()
             return
 
@@ -3338,25 +3363,94 @@ class ClientDeal(models.Model):
         if not force and self.payments.exists():
             raise ValidationError("Нельзя пересобрать график: по сделке уже есть платежи.")
 
-        due_date = self.first_due_date or (timezone.localdate() + timedelta(days=self.debt_days))
+        installments_to_create = []
 
-        installment = DealInstallment(
-            company=self.company,
-            branch=self.branch,
-            deal=self,
-            number=1,
-            due_date=due_date,
-            amount=total,
-            balance_after=Decimal("0.00"),
-        )
+        if custom_installments:
+            import calendar
+            balance = total
+            for idx, inst in enumerate(custom_installments, start=1):
+                amt = Decimal(str(inst.get("amount", "0")))
+                d_date = inst.get("due_date")
+                if isinstance(d_date, str):
+                    d_date = parse_date(d_date)
+                balance = (balance - amt).quantize(Decimal("0.01"))
+                installments_to_create.append(
+                    DealInstallment(
+                        company=self.company,
+                        branch=self.branch,
+                        deal=self,
+                        number=inst.get("number", idx),
+                        due_date=d_date,
+                        amount=amt,
+                        balance_after=max(Decimal("0.00"), balance),
+                    )
+                )
+        elif self.schedule_version == "v2":
+            import calendar
+            def _add_months(d, months: int):
+                new_month = d.month - 1 + months
+                new_year = d.year + new_month // 12
+                new_month = new_month % 12 + 1
+                max_days = calendar.monthrange(new_year, new_month)[1]
+                new_day = min(d.day, max_days)
+                return d.replace(year=new_year, month=new_month, day=new_day)
+
+            count = self.debt_days or self.debt_months or 1
+            step_days = self.interval_days or 1
+            step_months = self.interval_months or 1
+            is_months = bool(self.debt_months)
+
+            total_cents = int(round(total * Decimal("100")))
+            base_cents = total_cents // count
+            remainder_cents = total_cents - (base_cents * count)
+
+            start_date = self.first_due_date or timezone.localdate()
+            balance = total
+
+            for i in range(count):
+                if is_months:
+                    due_date = _add_months(start_date, i * step_months)
+                else:
+                    due_date = start_date + timedelta(days=i * step_days)
+
+                cents = base_cents + (remainder_cents if i == count - 1 else 0)
+                amt = (Decimal(cents) / Decimal("100")).quantize(Decimal("0.01"))
+                balance = (balance - amt).quantize(Decimal("0.01"))
+
+                installments_to_create.append(
+                    DealInstallment(
+                        company=self.company,
+                        branch=self.branch,
+                        deal=self,
+                        number=i + 1,
+                        due_date=due_date,
+                        amount=amt,
+                        balance_after=max(Decimal("0.00"), balance),
+                    )
+                )
+        else:
+            due_date = self.first_due_date or (timezone.localdate() + timedelta(days=self.debt_days or 30))
+            installments_to_create.append(
+                DealInstallment(
+                    company=self.company,
+                    branch=self.branch,
+                    deal=self,
+                    number=1,
+                    due_date=due_date,
+                    amount=total,
+                    balance_after=Decimal("0.00"),
+                )
+            )
 
         with transaction.atomic():
             self.installments.all().delete()
-            DealInstallment.objects.bulk_create([installment])
+            DealInstallment.objects.bulk_create(installments_to_create)
 
     def save(self, *args, **kwargs):
+        custom_installments = getattr(self, "_custom_installments", None)
         if self.kind != self.Kind.DEBT:
             self.debt_days = None
+            self.debt_months = None
             self.first_due_date = None
             self.auto_schedule = False
 
@@ -3367,8 +3461,8 @@ class ClientDeal(models.Model):
             self.installments.all().delete()
             return
 
-        if self.auto_schedule:
-            self.rebuild_installments()
+        if self.auto_schedule or custom_installments:
+            self.rebuild_installments(custom_installments=custom_installments)
 
 
 class DealInstallment(models.Model):

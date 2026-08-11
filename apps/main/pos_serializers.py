@@ -399,6 +399,10 @@ class CheckoutSerializer(serializers.Serializer):
     cash_received = MoneyField(required=False, allow_null=True)
     payments = CheckoutPaymentLineSerializer(many=True, required=False)
 
+    # v2 отсрочка (extra-поля для кассы, не ведут к 400)
+    schedule_version = serializers.CharField(required=False, allow_null=True, allow_blank=True)
+    debt_schedule = serializers.JSONField(required=False, allow_null=True)
+
     def _resolve_cashbox(self, cart: Cart, cashbox_id):
         if not cashbox_id:
             cb = (

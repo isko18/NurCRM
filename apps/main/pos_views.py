@@ -3628,9 +3628,15 @@ class MarketCashierSettingsAPIView(CompanyBranchRestrictedMixin, APIView):
         company = request.user.company
         is_admin = getattr(request.user, "role", None) in ["owner", "admin"]
 
+        debt_ver = getattr(company, "debt_schedule_version", "v1")
+        if debt_ver not in ("v1", "v2"):
+            debt_ver = "v1"
+
         data = {
             "delete_item_code_required": bool(company.cashier_password),
             "max_discount_percent": str(company.max_discount_percent) if company.max_discount_percent is not None else None,
+            "debt_schedule_version": debt_ver,
+            "deferred_schedule_version": debt_ver,
         }
         
         if is_admin:
@@ -3645,6 +3651,8 @@ class MarketCashierSettingsAPIView(CompanyBranchRestrictedMixin, APIView):
             return Response({"detail": "Недостаточно прав"}, status=status.HTTP_403_FORBIDDEN)
             
         data = request.data
+        updated_fields = []
+
         if "delete_item_code" in data:
             code = data["delete_item_code"]
             if code in (None, ""):
@@ -3654,6 +3662,7 @@ class MarketCashierSettingsAPIView(CompanyBranchRestrictedMixin, APIView):
                 if not code_str.isdigit() or not (4 <= len(code_str) <= 8):
                     return Response({"delete_item_code": ["Код должен состоять из 4–8 цифр"]}, status=status.HTTP_400_BAD_REQUEST)
                 company.cashier_password = code_str
+            updated_fields.append("cashier_password")
 
         if "max_discount_percent" in data:
             mdp = data["max_discount_percent"]
@@ -3668,13 +3677,30 @@ class MarketCashierSettingsAPIView(CompanyBranchRestrictedMixin, APIView):
                     company.max_discount_percent = val
                 except (ValueError, TypeError, ArithmeticError):
                     return Response({"max_discount_percent": ["Значение должно быть от 0 до 100"]}, status=status.HTTP_400_BAD_REQUEST)
+            updated_fields.append("max_discount_percent")
 
-        company.save(update_fields=["cashier_password", "max_discount_percent"])
-        
+        ver_val = data.get("debt_schedule_version") or data.get("deferred_schedule_version")
+        if ver_val is not None:
+            raw_ver = str(ver_val).strip().lower()
+            if raw_ver in ("v2", "2"):
+                company.debt_schedule_version = "v2"
+            else:
+                company.debt_schedule_version = "v1"
+            updated_fields.append("debt_schedule_version")
+
+        if updated_fields:
+            company.save(update_fields=updated_fields)
+
+        debt_ver = getattr(company, "debt_schedule_version", "v1") or "v1"
+        if debt_ver not in ("v1", "v2"):
+            debt_ver = "v1"
+
         resp = {
             "delete_item_code_required": bool(company.cashier_password),
             "max_discount_percent": str(company.max_discount_percent) if company.max_discount_percent is not None else None,
-            "delete_item_code": company.cashier_password
+            "delete_item_code": company.cashier_password,
+            "debt_schedule_version": debt_ver,
+            "deferred_schedule_version": debt_ver,
         }
         return Response(resp, status=status.HTTP_200_OK)
 
