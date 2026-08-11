@@ -3166,6 +3166,101 @@ class SupplierReceiptItem(models.Model):
                 raise ValidationError({"product": "Товар не принадлежит выбранному поставщику."})
 
 
+class SupplierReturn(models.Model):
+    """
+    Документ возврата товара поставщику (Маркет).
+    """
+
+    class Reason(models.TextChoices):
+        DEFECT = "defect", "Брак"
+        SURPLUS = "surplus", "Излишек"
+        WRONG_ITEM = "wrong_item", "Ошибка поставки"
+        EXPIRED = "expired", "Просрочка"
+        OTHER = "other", "Другое"
+
+    class Compensation(models.TextChoices):
+        CASH = "cash", "Приход в кассу"
+        DEBT_OFFSET = "debt_offset", "Списание долга"
+        NONE = "none", "Без движения денег"
+
+    class Status(models.TextChoices):
+        POSTED = "posted", "Проведён"
+        CANCELLED = "cancelled", "Отменён"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    company = models.ForeignKey(Company, on_delete=models.CASCADE, related_name="supplier_returns", db_index=True)
+    branch = models.ForeignKey(
+        Branch,
+        on_delete=models.CASCADE,
+        related_name="supplier_returns",
+        null=True,
+        blank=True,
+        db_index=True,
+    )
+    supplier = models.ForeignKey(
+        Client,
+        on_delete=models.CASCADE,
+        related_name="supplier_returns",
+        db_index=True,
+        limit_choices_to=Q(type=Client.StatusClient.SUPPLIERS),
+    )
+    receipt = models.ForeignKey(
+        SupplierReceipt,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="returns",
+        db_index=True,
+    )
+    created_by = models.ForeignKey(
+        User,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="created_supplier_returns",
+    )
+    reason = models.CharField(max_length=32, choices=Reason.choices, default=Reason.DEFECT, db_index=True)
+    comment = models.TextField(blank=True)
+    compensation = models.CharField(max_length=32, choices=Compensation.choices, default=Compensation.NONE, db_index=True)
+    status = models.CharField(max_length=16, choices=Status.choices, default=Status.POSTED, db_index=True)
+    cashbox = models.ForeignKey("construction.Cashbox", on_delete=models.SET_NULL, null=True, blank=True, related_name="supplier_returns")
+    created_at = models.DateTimeField(auto_now_add=True, db_index=True)
+
+    class Meta:
+        verbose_name = "Возврат поставщику"
+        verbose_name_plural = "Возвраты поставщику"
+        ordering = ["-created_at"]
+        indexes = [
+            models.Index(fields=["company", "supplier", "created_at"]),
+            models.Index(fields=["company", "branch", "created_at"]),
+        ]
+
+    def clean(self):
+        if self.supplier_id and self.company_id and self.supplier.company_id != self.company_id:
+            raise ValidationError({"supplier": "Поставщик другой компании."})
+        if self.branch_id and self.company_id and self.branch.company_id != self.company_id:
+            raise ValidationError({"branch": "Филиал принадлежит другой компании."})
+        if self.receipt_id and self.supplier_id and self.receipt.supplier_id != self.supplier_id:
+            raise ValidationError({"receipt": "Приход принадлежит другому поставщику."})
+
+
+class SupplierReturnItem(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    supplier_return = models.ForeignKey(SupplierReturn, on_delete=models.CASCADE, related_name="items", db_index=True)
+    product = models.ForeignKey(Product, on_delete=models.CASCADE, related_name="supplier_return_items", db_index=True)
+    receipt_item = models.ForeignKey(SupplierReceiptItem, on_delete=models.SET_NULL, null=True, blank=True, related_name="returns", db_index=True)
+    qty = models.DecimalField(max_digits=12, decimal_places=3)
+    purchase_price = models.DecimalField(max_digits=12, decimal_places=3, null=True, blank=True)
+
+    class Meta:
+        verbose_name = "Строка возврата поставщику"
+        verbose_name_plural = "Строки возврата поставщику"
+        indexes = [
+            models.Index(fields=["supplier_return", "product"]),
+            models.Index(fields=["receipt_item"]),
+        ]
+
+
 class ClientDeal(models.Model):
     class Kind(models.TextChoices):
         AMOUNT = "amount", "Сумма договора"

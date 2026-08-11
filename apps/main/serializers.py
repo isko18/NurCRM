@@ -21,6 +21,7 @@ from apps.main.models import (
     ProductPackage, ProductCharacteristics, DealPayment, AgentSaleAllocation,
     ProductRecipeItem, ProductPromotionTier, ProductAlternateBarcode, MarketSaleEmployeePayProfile,
     SupplierReceipt, SupplierReceiptItem,
+    SupplierReturn, SupplierReturnItem,
     KnowledgeBaseCourse, KnowledgeBaseLesson,
     FinishedToRawTransfer,
     Inventory, InventoryItem,
@@ -3000,10 +3001,32 @@ class SupplierReceiptItemReadSerializer(serializers.ModelSerializer):
     product_id = serializers.UUIDField(source="product.id", read_only=True)
     product_name = serializers.CharField(source="product.name", read_only=True)
     product_code = serializers.CharField(source="product.code", read_only=True)
+    unit = serializers.CharField(source="product.unit", read_only=True, default="шт")
+    returned_qty = serializers.SerializerMethodField()
+    returnable_qty = serializers.SerializerMethodField()
 
     class Meta:
         model = SupplierReceiptItem
-        fields = ["id", "product", "product_id", "product_name", "product_code", "qty", "purchase_price"]
+        fields = [
+            "id", "product", "product_id", "product_name", "product_code",
+            "qty", "purchase_price", "returned_qty", "returnable_qty", "unit",
+        ]
+
+    def get_returned_qty(self, obj):
+        from apps.main.models import SupplierReturnItem
+        ret = SupplierReturnItem.objects.filter(receipt_item=obj, supplier_return__status="posted").aggregate(s=Sum("qty"))["s"]
+        if ret is None:
+            return "0"
+        return str(Decimal(str(ret)).quantize(Decimal("0.001"), rounding=ROUND_HALF_UP))
+
+    def get_returnable_qty(self, obj):
+        from apps.main.models import SupplierReturnItem
+        ret = SupplierReturnItem.objects.filter(receipt_item=obj, supplier_return__status="posted").aggregate(s=Sum("qty"))["s"] or Decimal("0")
+        purchased = Decimal(str(obj.qty))
+        stock = Decimal(str(getattr(obj.product, "quantity", 0) or 0))
+        rem = max(Decimal("0"), purchased - Decimal(str(ret)))
+        returnable = max(Decimal("0"), min(stock, rem))
+        return str(returnable.quantize(Decimal("0.001"), rounding=ROUND_HALF_UP))
 
 
 class SupplierReceiptReadSerializer(serializers.ModelSerializer):
@@ -3015,6 +3038,10 @@ class SupplierReceiptReadSerializer(serializers.ModelSerializer):
     created_by_name = serializers.SerializerMethodField()
     items = SupplierReceiptItemReadSerializer(many=True, read_only=True)
     total_amount = serializers.SerializerMethodField()
+    items_count = serializers.SerializerMethodField()
+    returned_amount = serializers.SerializerMethodField()
+    returned_qty = serializers.SerializerMethodField()
+    has_returns = serializers.SerializerMethodField()
 
     class Meta:
         model = SupplierReceipt
@@ -3029,15 +3056,19 @@ class SupplierReceiptReadSerializer(serializers.ModelSerializer):
             "created_by_id",
             "created_by_name",
             "created_at",
-            "items",
+            "items_count",
             "total_amount",
+            "returned_amount",
+            "returned_qty",
+            "has_returns",
+            "items",
         ]
 
     def get_created_by_name(self, obj):
         u = obj.created_by
         if u is None:
             return None
-        return getattr(u, "email", None)
+        return getattr(u, "first_name", None) or getattr(u, "email", None)
 
     def get_total_amount(self, obj):
         annotated = getattr(obj, "total_amount", None)
@@ -3051,6 +3082,128 @@ class SupplierReceiptReadSerializer(serializers.ModelSerializer):
             price = item.purchase_price if item.purchase_price is not None else Decimal("0")
             total += Decimal(str(item.qty)) * Decimal(str(price))
         return str(total.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
+
+    def get_items_count(self, obj):
+        return obj.items.count()
+
+    def get_returned_amount(self, obj):
+        from apps.main.models import SupplierReturnItem
+        qs = SupplierReturnItem.objects.filter(receipt_item__receipt=obj, supplier_return__status="posted")
+        expr = ExpressionWrapper(F("qty") * F("purchase_price"), output_field=DecimalField(max_digits=12, decimal_places=3))
+        res = qs.aggregate(s=Sum(expr))["s"]
+        if res is None:
+            return "0.00"
+        return str(Decimal(str(res)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
+
+    def get_returned_qty(self, obj):
+        from apps.main.models import SupplierReturnItem
+        res = SupplierReturnItem.objects.filter(receipt_item__receipt=obj, supplier_return__status="posted").aggregate(s=Sum("qty"))["s"]
+        if res is None:
+            return "0"
+        return str(Decimal(str(res)).quantize(Decimal("0.001"), rounding=ROUND_HALF_UP))
+
+    def get_has_returns(self, obj):
+        from apps.main.models import SupplierReturnItem
+        return SupplierReturnItem.objects.filter(receipt_item__receipt=obj, supplier_return__status="posted").exists()
+
+
+# ===========================
+#  Supplier Returns Serializers
+# ===========================
+class SupplierReturnItemReadSerializer(serializers.ModelSerializer):
+    product_id = serializers.UUIDField(source="product.id", read_only=True)
+    product_name = serializers.CharField(source="product.name", read_only=True)
+    product_code = serializers.CharField(source="product.code", read_only=True)
+    unit = serializers.CharField(source="product.unit", read_only=True, default="шт")
+    receipt_item_id = serializers.UUIDField(source="receipt_item.id", read_only=True, allow_null=True)
+    line_total = serializers.SerializerMethodField()
+
+    class Meta:
+        model = SupplierReturnItem
+        fields = [
+            "id", "product_id", "product_name", "product_code", "unit",
+            "qty", "purchase_price", "line_total", "receipt_item_id",
+        ]
+
+    def get_line_total(self, obj):
+        p = obj.purchase_price if obj.purchase_price is not None else Decimal("0")
+        tot = Decimal(str(obj.qty)) * Decimal(str(p))
+        return str(tot.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
+
+
+class SupplierReturnReadSerializer(serializers.ModelSerializer):
+    supplier_id = serializers.UUIDField(source="supplier.id", read_only=True)
+    supplier_name = serializers.CharField(source="supplier.full_name", read_only=True)
+    receipt_id = serializers.UUIDField(source="receipt.id", read_only=True, allow_null=True)
+    created_by_name = serializers.SerializerMethodField()
+    items_count = serializers.SerializerMethodField()
+    total_amount = serializers.SerializerMethodField()
+    items = SupplierReturnItemReadSerializer(many=True, read_only=True)
+
+    class Meta:
+        model = SupplierReturn
+        fields = [
+            "id", "supplier_id", "supplier_name", "receipt_id",
+            "created_at", "created_by_name", "reason", "comment",
+            "compensation", "status", "items_count", "total_amount",
+            "items",
+        ]
+
+    def to_representation(self, instance):
+        ret = super().to_representation(instance)
+        ret["uuid"] = ret["id"]
+        ret["supplierId"] = ret["supplier_id"]
+        ret["compensation_type"] = ret["compensation"]
+        ret["lines"] = ret["items"]
+        return ret
+
+    def get_created_by_name(self, obj):
+        u = obj.created_by
+        if u is None:
+            return None
+        return getattr(u, "first_name", None) or getattr(u, "email", None)
+
+    def get_items_count(self, obj):
+        return obj.items.count()
+
+    def get_total_amount(self, obj):
+        annotated = getattr(obj, "total_amount", None)
+        if annotated is not None:
+            return str(Decimal(str(annotated)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
+
+        total = Decimal("0")
+        for item in obj.items.all():
+            price = item.purchase_price if item.purchase_price is not None else Decimal("0")
+            total += Decimal(str(item.qty)) * Decimal(str(price))
+        return str(total.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
+
+
+class SupplierReturnCreateItemSerializer(serializers.Serializer):
+    product_id = serializers.UUIDField(required=True)
+    qty = serializers.DecimalField(max_digits=12, decimal_places=3, required=True)
+    purchase_price = serializers.DecimalField(max_digits=12, decimal_places=3, required=False, allow_null=True)
+    receipt_item_id = serializers.UUIDField(required=False, allow_null=True)
+
+
+class SupplierReturnCreateSerializer(serializers.Serializer):
+    receipt_id = serializers.UUIDField(required=False, allow_null=True)
+    reason = serializers.ChoiceField(choices=SupplierReturn.Reason.choices, required=True)
+    comment = serializers.CharField(required=False, allow_blank=True, default="")
+    compensation = serializers.ChoiceField(choices=SupplierReturn.Compensation.choices, required=True)
+    cashbox_id = serializers.UUIDField(required=False, allow_null=True)
+    items = SupplierReturnCreateItemSerializer(many=True, required=True)
+
+    def validate_items(self, items):
+        if not items:
+            raise serializers.ValidationError("Укажите хотя бы одну позицию.")
+        return items
+
+    def validate(self, attrs):
+        reason = attrs.get("reason")
+        comment = (attrs.get("comment") or "").strip()
+        if reason == SupplierReturn.Reason.OTHER and not comment:
+            raise serializers.ValidationError({"comment": "Укажите комментарий при выборе причины 'Другое'."})
+        return attrs
 
 
 class ProductPurchaseBatchSerializer(serializers.ModelSerializer):
