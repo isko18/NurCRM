@@ -2065,7 +2065,14 @@ class ClientDealSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializ
     daily_payment = serializers.DecimalField(max_digits=12, decimal_places=2, read_only=True)
     remaining_debt = serializers.DecimalField(max_digits=12, decimal_places=2, read_only=True)
 
-    installments = DealInstallmentSerializer(many=True, read_only=True)
+    schedule_version = serializers.CharField(required=False, default="v1")
+    debt_months = serializers.IntegerField(required=False, allow_null=True)
+    interval_days = serializers.IntegerField(required=False, default=1, allow_null=True)
+    interval_months = serializers.IntegerField(required=False, default=1, allow_null=True)
+    sale = serializers.PrimaryKeyRelatedField(queryset=Sale.objects.all(), required=False, allow_null=True)
+    sale_id = serializers.UUIDField(source="sale_id", required=False, allow_null=True)
+
+    installments = serializers.JSONField(required=False, write_only=True)
     payments = DealPaymentSerializer(many=True, read_only=True)
 
     auto_schedule = serializers.BooleanField(required=False)
@@ -2077,7 +2084,8 @@ class ClientDealSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializ
             "client", "client_full_name",
             "title", "kind",
             "amount", "prepayment",
-            "debt_days", "first_due_date",
+            "debt_days", "debt_months", "interval_days", "interval_months",
+            "first_due_date", "schedule_version", "sale", "sale_id",
             "debt_amount", "daily_payment", "remaining_debt",
             "installments",
             "payments",
@@ -2089,8 +2097,15 @@ class ClientDealSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializ
             "created_at", "updated_at",
             "client_full_name",
             "debt_amount", "daily_payment", "remaining_debt",
-            "installments", "payments",
+            "payments",
         ]
+
+    def to_representation(self, instance):
+        ret = super().to_representation(instance)
+        ret["installments"] = DealInstallmentSerializer(
+            instance.installments.order_by("number"), many=True, context=self.context
+        ).data
+        return ret
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -2101,6 +2116,12 @@ class ClientDealSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializ
         _restrict_pk_queryset_strict(
             self.fields.get("client"),
             Client.objects.all(),
+            comp,
+            br,
+        )
+        _restrict_pk_queryset_strict(
+            self.fields.get("sale"),
+            Sale.objects.all(),
             comp,
             br,
         )
@@ -2145,6 +2166,13 @@ class ClientDealSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializ
         prepayment = attrs.get("prepayment", getattr(instance, "prepayment", None))
         kind = attrs.get("kind", getattr(instance, "kind", None))
         debt_days = attrs.get("debt_days", getattr(instance, "debt_days", None))
+        debt_months = attrs.get("debt_months", getattr(instance, "debt_months", None))
+
+        sch_ver = attrs.get("schedule_version") or (instance.schedule_version if instance else "v1")
+        if str(sch_ver).strip().lower() in ("v2", "2"):
+            attrs["schedule_version"] = "v2"
+        else:
+            attrs["schedule_version"] = "v1"
 
         errors = {}
 
@@ -2159,11 +2187,26 @@ class ClientDealSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializ
             debt_amt = (amount or Decimal("0")) - (prepayment or Decimal("0"))
             if debt_amt <= 0:
                 errors["prepayment"] = 'Для типа "Долг" сумма договора должна быть больше предоплаты.'
-            if not debt_days or debt_days <= 0:
-                errors["debt_days"] = "Укажите срок (в днях) для рассрочки."
+
+            if debt_days and debt_months:
+                errors["debt_months"] = "Нельзя одновременно указывать debt_days и debt_months."
+
+            if attrs["schedule_version"] == "v2":
+                if not debt_days and not debt_months:
+                    errors["debt_days"] = "Укажите количество платежей (debt_days или debt_months) для v2."
+
+                inst_input = attrs.get("installments")
+                if inst_input and isinstance(inst_input, (list, tuple)):
+                    sum_inst = sum(Decimal(str(item.get("amount", "0"))) for item in inst_input if isinstance(item, dict))
+                    if abs(sum_inst - debt_amt) > Decimal("0.05"):
+                        errors["installments"] = f"Сумма графика платежей ({sum_inst}) должна совпадать с остатком долга ({debt_amt})."
+            else:
+                if not debt_days or debt_days <= 0:
+                    errors["debt_days"] = "Укажите срок (в днях) для рассрочки."
         else:
             # не долг -> чистим всё, как в модели
             attrs["debt_days"] = None
+            attrs["debt_months"] = None
             attrs["first_due_date"] = None
             attrs["auto_schedule"] = False
 
@@ -2171,6 +2214,22 @@ class ClientDealSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializ
             raise serializers.ValidationError(errors)
 
         return attrs
+
+    def create(self, validated_data):
+        custom_inst = validated_data.pop("installments", None)
+        instance = super().create(validated_data)
+        if custom_inst and isinstance(custom_inst, (list, tuple)):
+            instance._custom_installments = custom_inst
+            instance.rebuild_installments(custom_installments=custom_inst)
+        return instance
+
+    def update(self, instance, validated_data):
+        custom_inst = validated_data.pop("installments", None)
+        instance = super().update(instance, validated_data)
+        if custom_inst and isinstance(custom_inst, (list, tuple)):
+            instance._custom_installments = custom_inst
+            instance.rebuild_installments(custom_installments=custom_inst)
+        return instance
 
 
 # ===== Inputs for pay/refund endpoints =====
