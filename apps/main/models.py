@@ -893,6 +893,8 @@ class Product(models.Model):
             models.Index(fields=["company", "barcode"], name="idx_product_company_barcode"),
             # Курсорная/стабильная пагинация «сначала новые» внутри компании.
             models.Index(fields=["company", "seq"], name="idx_product_company_seq"),
+            models.Index(fields=["company", "date"], name="idx_product_company_date"),
+            models.Index(fields=["company", "client"], name="idx_product_company_client"),
         ]
         constraints = [
             # ✅ штрихкод уникален в рамках компании, только если задан и не пустой
