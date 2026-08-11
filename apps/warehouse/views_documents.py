@@ -40,7 +40,27 @@ class DocumentListCreateView(CompanyBranchRestrictedMixin, generics.ListCreateAP
     serializer_class = serializers_documents.DocumentSerializer
     filter_backends = [DjangoFilterBackend, filters.SearchFilter]
     filterset_fields = ["doc_type", "status", "payment_kind", "warehouse_from", "warehouse_to", "counterparty"]
-    search_fields = ["number", "comment"]
+    search_fields = [
+        "number",
+        "comment",
+        "counterparty__name",
+        "counterparty__phone",
+        "agent__first_name",
+        "agent__last_name",
+        "agent__username",
+        "agent__phone",
+    ]
+
+    def filter_queryset(self, queryset):
+        if "search" in self.request.query_params:
+            raw_search = self.request.query_params.get("search", "")
+            cleaned_search = raw_search.strip()
+            if cleaned_search != raw_search:
+                q = self.request.query_params.copy()
+                q["search"] = cleaned_search
+                self.request._request.GET = q
+        return super().filter_queryset(queryset)
+
     
     def _filter_company_branch(self, qs):
         company = self._company()
