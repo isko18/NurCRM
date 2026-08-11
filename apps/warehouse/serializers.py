@@ -391,6 +391,7 @@ class WarehouseProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSe
             "code",
             "unit",
             "is_weight",
+            "is_adult",
             "quantity",
             "minimum_quantity",
             "purchase_price",

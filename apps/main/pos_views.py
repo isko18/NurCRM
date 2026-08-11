@@ -1001,6 +1001,7 @@ POS_SCAN_PRODUCT_FIELDS = (
     "plu",
     "code",
     "is_weight",
+    "is_adult",
     "kind",
 )
 
@@ -1026,11 +1027,20 @@ class AmbiguousBarcode(Exception):
 
     def __init__(self, barcode: str, matches):
         self.barcode = barcode
-        self.matches = matches  # [(id_str, name), ...]
+        self.matches = matches  # [(id_str, name, is_adult), ...]
         super().__init__(f"Штрихкод {barcode} найден у нескольких товаров.")
 
 
 def _ambiguous_barcode_response(exc: "AmbiguousBarcode") -> Response:
+    formatted_matches = []
+    for item in exc.matches:
+        if len(item) == 3:
+            mid, name, is_adult = item
+        else:
+            mid, name = item[0], item[1]
+            is_adult = False
+        formatted_matches.append({"id": mid, "name": name, "is_adult": is_adult})
+
     return Response(
         {
             "ambiguous": True,
@@ -1038,7 +1048,7 @@ def _ambiguous_barcode_response(exc: "AmbiguousBarcode") -> Response:
                 f"Штрихкод {exc.barcode} найден у нескольких товаров — "
                 f"выберите нужный вручную."
             ),
-            "matches": [{"id": mid, "name": name} for mid, name in exc.matches],
+            "matches": formatted_matches,
         },
         status=status.HTTP_409_CONFLICT,
     )
@@ -1078,7 +1088,7 @@ def _resolve_product_by_barcode_for_pos(company_id, barcode: str, *, only_fields
     if not matches:
         return None
     if len(matches) > 1:
-        pairs = [(str(m.pk), getattr(m, "name", "")) for m in matches]
+        pairs = [(str(m.pk), getattr(m, "name", ""), bool(getattr(m, "is_adult", False))) for m in matches]
         pos_scan_logger.warning("scan barcode=%s company=%s AMBIGUOUS -> %s", raw, company_id, pairs)
         raise AmbiguousBarcode(raw, pairs)
 

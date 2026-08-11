@@ -280,7 +280,7 @@ urlpatterns = [
     path("suppliers/<uuid:supplier_id>/products/", SupplierProductsListAPIView.as_view(), name="supplier-products"),
     path("suppliers/<uuid:supplier_id>/purchases/", SupplierPurchasesListAPIView.as_view(), name="supplier-purchases"),
     path("suppliers/<uuid:supplier_id>/receipt/", SupplierReceiptAPIView.as_view(), name="supplier-receipt"),
-    
+    path("suppliers/<uuid:supplier_id>/recommendations/", SupplierRecommendationsAPIView.as_view(), name="supplier-recommendations"),
     
     path("subreals/", ManufactureSubrealListCreateAPIView.as_view(), name="subreal-list-create"),
     path("subreals/<uuid:pk>/", ManufactureSubrealRetrieveUpdateDestroyAPIView.as_view(), name="subreal-detail"),

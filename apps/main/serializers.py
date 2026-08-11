@@ -990,6 +990,7 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
 
     unit = serializers.CharField(required=False, allow_blank=True)
     is_weight = serializers.BooleanField(required=False)
+    is_adult = serializers.BooleanField(required=False, default=False)
 
     # allow_null=True чтобы PATCH мог "очищать" значения
     purchase_price = serializers.DecimalField(
@@ -1062,7 +1063,7 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
             "name", "description", "barcode",
             "brand", "brand_name",
             "category", "category_name",
-            "unit", "is_weight",
+            "unit", "is_weight", "is_adult",
             "item_make", "item_make_ids",
             "recipe",
             "quantity",
@@ -1115,6 +1116,7 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
             "quantity": {"required": False, "default": 0},
             "unit": {"required": False, "default": "шт."},
             "is_weight": {"required": False, "default": False},
+            "is_adult": {"required": False, "default": False},
             "price": {"required": False, "allow_null": True},
             "description": {"required": False, "allow_blank": True, "allow_null": True},
         }
@@ -1459,6 +1461,7 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
         article = (validated_data.pop("article", "") or "").strip()
         unit = (validated_data.pop("unit", None) or "шт.").strip()
         is_weight = validated_data.pop("is_weight", False)
+        is_adult = validated_data.pop("is_adult", False)
 
         description = (validated_data.pop("description", "") or "").strip()
 
@@ -1518,6 +1521,7 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
             description=description,
             unit=unit,
             is_weight=is_weight,
+            is_adult=is_adult,
 
             purchase_price=purchase_price,
             markup_percent=markup_percent,
@@ -1654,6 +1658,7 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
             "article",
             "unit",
             "is_weight",
+            "is_adult",
             "plu",
             "country",
             "expiration_date",
@@ -1776,13 +1781,26 @@ class NotificationSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerial
     branch = serializers.ReadOnlyField(source='branch.id')
     actor_name = serializers.SerializerMethodField()
 
+    body = serializers.CharField(source='message', read_only=True)
+    cta_url = serializers.CharField(source='url', read_only=True)
+    cta_label = serializers.SerializerMethodField()
+    meta = serializers.JSONField(source='data', read_only=True)
+
     class Meta:
         model = Notification
         fields = [
-            'id', 'company', 'branch', 'category', 'type', 'title', 'message', 'url',
-            'level', 'is_read', 'actor_name', 'data', 'created_at',
+            'id', 'company', 'branch', 'category', 'type', 'title', 'message', 'body',
+            'url', 'cta_url', 'cta_label', 'level', 'is_read', 'actor_name',
+            'data', 'meta', 'created_at',
         ]
         read_only_fields = ['id', 'company', 'branch', 'actor_name', 'created_at']
+
+    def get_cta_label(self, obj):
+        if isinstance(obj.data, dict) and obj.data.get("cta_label"):
+            return obj.data.get("cta_label")
+        if obj.category == Notification.Category.TARIFF:
+            return "Продлить"
+        return ""
 
     def get_actor_name(self, obj):
         actor = getattr(obj, "actor", None)
@@ -1796,6 +1814,7 @@ class NotificationSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerial
         if user:
             validated_data.setdefault("user", user)
         return super().create(validated_data)
+
 
 
 # ===========================
