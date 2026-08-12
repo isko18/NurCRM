@@ -1206,7 +1206,7 @@ class AnalyticsView(APIView):
 
             if rc_qs.exists():
                 val_expr = ExpressionWrapper(
-                    F("qty") * Coalesce(F("purchase_price"), V(Decimal("0.00"), output_field=MONEY_FIELD)),
+                    F("qty") * Coalesce(F("purchase_price"), Value(Decimal("0.00"), output_field=MONEY_FIELD)),
                     output_field=MONEY_FIELD,
                 )
                 agg = rc_qs.aggregate(
