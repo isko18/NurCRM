@@ -158,6 +158,11 @@ urlpatterns = [
         name="client-agent-analytics",
     ),
     path(
+        "clients/<uuid:client_id>/kpis/",
+        ClientKPIsAPIView.as_view(),
+        name="client-kpis",
+    ),
+    path(
         "clients/<uuid:client_id>/deals/",
         ClientDealListCreateAPIView.as_view(),
         name="client-deals-list-create",

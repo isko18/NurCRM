@@ -2910,6 +2910,66 @@ def _deal_prefetch():
 
 # ===== Deals list/create =====
 
+class ClientKPIsAPIView(CompanyBranchRestrictedMixin, APIView):
+    """
+    GET /api/main/clients/<client_id>/kpis/
+    Вычисляет 3 KPI по сделкам клиента: debt, prepayment, sale
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request, client_id, *args, **kwargs):
+        company = self._company()
+        branch = self._auto_branch()
+        user = request.user
+
+        if not company:
+            raise serializers.ValidationError({"company": "У пользователя не задана компания."})
+
+        client_qs = Client.objects.filter(company=company)
+        if branch is not None:
+            client_qs = client_qs.filter(Q(branch=branch) | Q(branch__isnull=True))
+        if not _is_owner_like(user):
+            client_qs = client_qs.filter(salesperson=user)
+
+        client = get_object_or_404(client_qs, id=client_id)
+
+        deals = ClientDeal.objects.filter(company=company, client=client).prefetch_related("installments")
+
+        debt_amount = Decimal("0.00")
+        debt_count = 0
+
+        prepayment_amount = Decimal("0.00")
+        prepayment_count = 0
+
+        sale_amount = Decimal("0.00")
+        sale_count = 0
+
+        for d in deals:
+            kind = d.kind
+            if kind == ClientDeal.Kind.DEBT:
+                debt_count += 1
+                debt_amount += d.remaining_debt
+                if d.prepayment and d.prepayment > Decimal("0.00"):
+                    prepayment_amount += d.prepayment
+                    prepayment_count += 1
+            elif kind == ClientDeal.Kind.PREPAYMENT:
+                prepayment_count += 1
+                prepayment_amount += (d.amount or Decimal("0.00"))
+            else:
+                sale_count += 1
+                sale_amount += (d.amount or Decimal("0.00"))
+
+        debt_amount = max(Decimal("0.00"), debt_amount).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        prepayment_amount = max(Decimal("0.00"), prepayment_amount).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        sale_amount = max(Decimal("0.00"), sale_amount).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+        return Response({
+            "debt": {"amount": str(debt_amount), "count": debt_count},
+            "prepayment": {"amount": str(prepayment_amount), "count": prepayment_count},
+            "sale": {"amount": str(sale_amount), "count": sale_count},
+        }, status=status.HTTP_200_OK)
+
+
 class ClientDealListCreateAPIView(CompanyBranchRestrictedMixin, generics.ListCreateAPIView):
     """
       GET  /api/main/deals/
