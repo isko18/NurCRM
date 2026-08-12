@@ -2071,7 +2071,7 @@ class ClientDealSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializ
     interval_days = serializers.IntegerField(required=False, default=1, allow_null=True)
     interval_months = serializers.IntegerField(required=False, default=1, allow_null=True)
     sale = serializers.PrimaryKeyRelatedField(queryset=Sale.objects.all(), required=False, allow_null=True)
-    sale_id = serializers.UUIDField(source="sale_id", required=False, allow_null=True)
+    sale_id = serializers.UUIDField(required=False, allow_null=True)
 
     installments = serializers.JSONField(required=False, write_only=True)
     payments = DealPaymentSerializer(many=True, read_only=True)
