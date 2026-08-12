@@ -1,5 +1,6 @@
 from rest_framework import serializers
 from django.db import transaction
+from django.core.exceptions import ValidationError as DjangoValidationError
 from django.utils import timezone
 from django.db.models import Q, Sum, F, ExpressionWrapper, DecimalField, Value as V, Prefetch, ProtectedError
 from django.db.models.functions import Coalesce
@@ -2151,6 +2152,21 @@ class ClientDealSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializ
             if branch is not None and client.branch_id not in (None, branch.id):
                 raise serializers.ValidationError({"client": "Клиент другого филиала."})
 
+        # проверка sale / sale_id
+        sale = attrs.get("sale")
+        sale_id = attrs.get("sale_id")
+        if sale_id and not sale:
+            try:
+                s_obj = Sale.objects.get(id=sale_id)
+                if company and s_obj.company_id != company.id:
+                    raise serializers.ValidationError({"sale_id": "Продажа принадлежит другой компании."})
+                attrs["sale"] = s_obj
+            except Sale.DoesNotExist:
+                raise serializers.ValidationError({"sale_id": "Указанная продажа не найдена."})
+        elif sale:
+            if company and sale.company_id != company.id:
+                raise serializers.ValidationError({"sale": "Продажа принадлежит другой компании."})
+
         # прод: если уже есть платежи — условия сделки нельзя менять
         if instance and instance.pk and instance.payments.exists():
             allowed = {"title", "note"}  # максимально безопасно
@@ -2218,7 +2234,13 @@ class ClientDealSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializ
 
     def create(self, validated_data):
         custom_inst = validated_data.pop("installments", None)
-        instance = super().create(validated_data)
+        validated_data.pop("sale_id", None)
+        try:
+            instance = super().create(validated_data)
+        except DjangoValidationError as e:
+            msg = e.message_dict if hasattr(e, "message_dict") else (e.messages if hasattr(e, "messages") else str(e))
+            raise serializers.ValidationError(msg)
+
         if custom_inst and isinstance(custom_inst, (list, tuple)):
             instance._custom_installments = custom_inst
             instance.rebuild_installments(custom_installments=custom_inst)
@@ -2226,7 +2248,13 @@ class ClientDealSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializ
 
     def update(self, instance, validated_data):
         custom_inst = validated_data.pop("installments", None)
-        instance = super().update(instance, validated_data)
+        validated_data.pop("sale_id", None)
+        try:
+            instance = super().update(instance, validated_data)
+        except DjangoValidationError as e:
+            msg = e.message_dict if hasattr(e, "message_dict") else (e.messages if hasattr(e, "messages") else str(e))
+            raise serializers.ValidationError(msg)
+
         if custom_inst and isinstance(custom_inst, (list, tuple)):
             instance._custom_installments = custom_inst
             instance.rebuild_installments(custom_installments=custom_inst)
