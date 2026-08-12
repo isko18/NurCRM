@@ -103,6 +103,7 @@ class CashShiftListSerializer(serializers.ModelSerializer):
             "noncash_sales_total",
             "expected_cash",
             "cash_diff",
+            "payment_breakdown",
         ]
         read_only_fields = fields
 
@@ -137,6 +138,8 @@ class CashShiftListSerializer(serializers.ModelSerializer):
 
             data["expected_cash"] = str(t["expected_cash"])
             data["cash_diff"] = "0.00"
+
+        data["payment_breakdown"] = obj.calc_payment_breakdown()
 
         return data
 

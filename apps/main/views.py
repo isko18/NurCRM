@@ -26,6 +26,7 @@ from django_filters.rest_framework import DjangoFilterBackend
 from django.db.models import DecimalField, ExpressionWrapper
 from rest_framework.pagination import CursorPagination, PageNumberPagination, LimitOffsetPagination
 from django.core.paginator import InvalidPage
+from apps.construction.models import Cashbox
 
 
 from apps.main.services.item_make_processing import (
@@ -54,6 +55,9 @@ from apps.main.models import (
     SaleItem,
     SupplierReceipt,
     SupplierReceiptItem,
+    SupplierReturn,
+    SupplierReturnItem,
+    MarketProductFormLayout,
     KnowledgeBaseCourse,
     FinishedToRawTransfer,
     Inventory,
@@ -87,6 +91,8 @@ from apps.main.serializers import (
     MarketSaleEmployeePayProfileSerializer,
     SupplierReceiptCreateSerializer,
     SupplierReceiptReadSerializer,
+    SupplierReturnReadSerializer,
+    SupplierReturnCreateSerializer,
     ProductPurchaseBatchSerializer,
     PublicKnowledgeBaseCourseSerializer,
     FinishedToRawTransferSerializer,
@@ -4512,6 +4518,346 @@ class ProductPurchaseBatchListAPIView(CompanyBranchRestrictedMixin, generics.Lis
         return self.paginator.get_paginated_response(
             serializer.data, total_amount=total_amount
         )
+
+
+# ===========================
+#  Supplier Returns (Маркет: Возвраты поставщикам)
+# ===========================
+def _aggregate_supplier_returns_total_amount(qs):
+    sub_qs = SupplierReturnItem.objects.filter(supplier_return__in=qs)
+    expr = ExpressionWrapper(
+        F("qty") * Coalesce(F("purchase_price"), V(Decimal("0"), output_field=DecimalField(max_digits=11, decimal_places=3))),
+        output_field=DecimalField(max_digits=20, decimal_places=3),
+    )
+    total = sub_qs.aggregate(total=Sum(expr))["total"]
+    if total is None:
+        return Decimal("0.00")
+    return total.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+
+class SupplierReturnListAPIView(CompanyBranchRestrictedMixin, generics.ListAPIView):
+    """
+    GET /api/main/suppliers/returns/?page=1&limit=20&supplier_id=&date_from=&date_to=&reason=&search=&receipt_id=
+    Alias: GET /api/main/supplier-returns/
+    """
+
+    permission_classes = [permissions.IsAuthenticated]
+    serializer_class = SupplierReturnReadSerializer
+    pagination_class = SupplierReceiptLimitPagination
+
+    def get_queryset(self):
+        qs = SupplierReturn.objects.select_related("supplier", "receipt", "created_by", "company", "branch").prefetch_related("items", "items__product")
+        qs = self._filter_qs_company_branch(qs)
+
+        qp = self.request.query_params
+        supplier_id = (qp.get("supplier_id") or "").strip()
+        if supplier_id:
+            qs = qs.filter(supplier_id=supplier_id)
+
+        receipt_id = (qp.get("receipt_id") or "").strip()
+        if receipt_id:
+            qs = qs.filter(receipt_id=receipt_id)
+
+        reason = (qp.get("reason") or "").strip()
+        if reason:
+            qs = qs.filter(reason=reason)
+
+        df_raw = (qp.get("date_from") or "").strip()
+        dt_raw = (qp.get("date_to") or "").strip()
+        df = parse_date(df_raw) if df_raw else None
+        dt = parse_date(dt_raw) if dt_raw else None
+        if df:
+            qs = qs.filter(created_at__date__gte=df)
+        if dt:
+            qs = qs.filter(created_at__date__lte=dt)
+
+        search = (qp.get("search") or "").strip()
+        if search:
+            qs = qs.filter(
+                Q(supplier__full_name__icontains=search)
+                | Q(supplier__name__icontains=search)
+                | Q(comment__icontains=search)
+                | Q(items__product__name__icontains=search)
+                | Q(items__product__code__icontains=search)
+                | Q(items__product__barcode__icontains=search)
+            ).distinct()
+
+        return qs
+
+    def list(self, request, *args, **kwargs):
+        queryset = self.filter_queryset(self.get_queryset())
+        total_amount = _aggregate_supplier_returns_total_amount(queryset)
+
+        page = self.paginate_queryset(queryset)
+        serializer = self.get_serializer(page, many=True)
+        return self.paginator.get_paginated_response(serializer.data, total_amount=total_amount)
+
+
+class SupplierReturnRetrieveAPIView(CompanyBranchRestrictedMixin, generics.RetrieveAPIView):
+    """
+    GET /api/main/suppliers/returns/<uuid:pk>/
+    Alias: GET /api/main/supplier-returns/<uuid:pk>/
+    """
+
+    permission_classes = [permissions.IsAuthenticated]
+    serializer_class = SupplierReturnReadSerializer
+    lookup_url_kwarg = "pk"
+
+    def get_queryset(self):
+        qs = SupplierReturn.objects.select_related("supplier", "receipt", "created_by", "company", "branch").prefetch_related("items", "items__product")
+        return self._filter_qs_company_branch(qs)
+
+    def retrieve(self, request, *args, **kwargs):
+        instance = self.get_object()
+        serializer = self.get_serializer(instance)
+        data = serializer.data
+        data["lines"] = data.get("items") or []
+        return Response(data)
+
+
+class SupplierReturnCreateAPIView(CompanyBranchRestrictedMixin, APIView):
+    """
+    POST /api/main/suppliers/<uuid:supplier_id>/returns/
+    POST /api/main/suppliers/returns/
+    """
+
+    permission_classes = [permissions.IsAuthenticated]
+
+    @transaction.atomic
+    def post(self, request, supplier_id=None):
+        company = self._company()
+        branch = self._auto_branch()
+
+        sup_id = supplier_id or request.data.get("supplier_id") or request.data.get("supplierId")
+        if not sup_id:
+            return Response({"detail": "Укажите поставщика."}, status=status.HTTP_400_BAD_REQUEST)
+
+        sup_qs = self._filter_qs_company_branch(Client.objects.all())
+        supplier = get_object_or_404(sup_qs, id=sup_id, type=Client.StatusClient.SUPPLIERS)
+
+        ser = SupplierReturnCreateSerializer(data=request.data)
+        if not ser.is_valid():
+            return Response(ser.errors, status=status.HTTP_400_BAD_REQUEST)
+
+        vdata = ser.validated_data
+        receipt_id = vdata.get("receipt_id")
+        receipt = None
+        if receipt_id:
+            rc_qs = self._filter_qs_company_branch(SupplierReceipt.objects.all())
+            receipt = rc_qs.filter(id=receipt_id, supplier=supplier).first()
+            if not receipt:
+                return Response({"detail": "Оприходование не найдено или принадлежит другому поставщику."}, status=status.HTTP_400_BAD_REQUEST)
+
+        items_data = vdata["items"]
+        product_ids = [it["product_id"] for it in items_data]
+
+        prod_qs = self._filter_qs_company_branch(Product.objects.all()).select_for_update()
+        products = {p.id: p for p in prod_qs.filter(id__in=product_ids)}
+
+        missing = [str(pid) for pid in product_ids if pid not in products]
+        if missing:
+            return Response({"detail": f"Товары не найдены: {', '.join(missing)}"}, status=status.HTTP_400_BAD_REQUEST)
+
+        # Валидация позиций
+        total_return_amount = Decimal("0.00")
+        validated_lines = []
+
+        for item in items_data:
+            product = products[item["product_id"]]
+            qty = Decimal(str(item["qty"]))
+            if qty <= Decimal("0"):
+                return Response({"detail": "Количество должно быть больше 0."}, status=status.HTTP_400_BAD_REQUEST)
+
+            # Для штучных товаров проверяем целое число
+            is_weight = getattr(product, "is_weight", False) or getattr(product, "scale_type", None) == "weight"
+            if not is_weight and qty % Decimal("1") != Decimal("0"):
+                return Response({"detail": f"Для штучного товара '{product.name}' количество должно быть целым числом."}, status=status.HTTP_400_BAD_REQUEST)
+
+            # Проверка складского остатка
+            current_stock = Decimal(str(product.quantity or 0))
+            if qty > current_stock:
+                return Response(
+                    {"detail": f"Нельзя вернуть больше остатка по товару '{product.name}' (доступно: {current_stock}, запрошено: {qty})."},
+                    status=status.HTTP_409_CONFLICT,
+                )
+
+            receipt_item = None
+            r_item_id = item.get("receipt_item_id")
+            if r_item_id:
+                receipt_item = SupplierReceiptItem.objects.filter(id=r_item_id, receipt__supplier=supplier).first()
+                if not receipt_item:
+                    return Response({"detail": f"Строка оприходования '{r_item_id}' не найдена."}, status=status.HTTP_400_BAD_REQUEST)
+
+            # Проверка лимита возврата по приходу
+            if receipt_item:
+                purchased_qty = Decimal(str(receipt_item.qty))
+                already_ret = SupplierReturnItem.objects.filter(
+                    receipt_item=receipt_item, supplier_return__status="posted"
+                ).aggregate(s=Sum("qty"))["s"] or Decimal("0")
+                returnable = max(Decimal("0"), purchased_qty - already_ret)
+                if qty > returnable:
+                    return Response(
+                        {"detail": f"По товару '{product.name}' уже возвращено {already_ret} из {purchased_qty}. Максимум к возврату по приходу: {returnable}."},
+                        status=status.HTTP_409_CONFLICT,
+                    )
+
+            price = item.get("purchase_price")
+            if price is None:
+                if receipt_item and receipt_item.purchase_price is not None:
+                    price = receipt_item.purchase_price
+                else:
+                    price = product.purchase_price or Decimal("0.00")
+            else:
+                price = Decimal(str(price))
+
+            line_sum = qty * price
+            total_return_amount += line_sum
+
+            validated_lines.append({
+                "product": product,
+                "receipt_item": receipt_item,
+                "qty": qty,
+                "purchase_price": price,
+            })
+
+        compensation = vdata["compensation"]
+        cashbox = None
+
+        if compensation == SupplierReturn.Compensation.CASH and total_return_amount > Decimal("0"):
+            cashbox_id = vdata.get("cashbox_id")
+            if not cashbox_id:
+                cashbox = Cashbox.objects.filter(company=company, branch=branch).order_by("-created_at").first() or Cashbox.objects.filter(company=company).order_by("-created_at").first()
+                if not cashbox:
+                    return Response({"detail": "Для компенсации наличными требуется указать кассу."}, status=status.HTTP_400_BAD_REQUEST)
+            else:
+                cashbox = Cashbox.objects.filter(id=cashbox_id, company=company).first()
+                if not cashbox:
+                    return Response({"detail": "Касса не найдена."}, status=status.HTTP_400_BAD_REQUEST)
+
+        # Создаем документ возврата
+        sup_return = SupplierReturn.objects.create(
+            company=company,
+            branch=branch,
+            supplier=supplier,
+            receipt=receipt,
+            created_by=request.user,
+            reason=vdata["reason"],
+            comment=vdata.get("comment", ""),
+            compensation=compensation,
+            cashbox=cashbox,
+            status=SupplierReturn.Status.POSTED,
+        )
+
+        # Создаем строки возврата и списываем остаток
+        return_items = []
+        for line in validated_lines:
+            p = line["product"]
+            q = line["qty"]
+            Product.objects.filter(id=p.id).update(quantity=F("quantity") - q)
+
+            return_items.append(
+                SupplierReturnItem(
+                    supplier_return=sup_return,
+                    product=p,
+                    receipt_item=line["receipt_item"],
+                    qty=q,
+                    purchase_price=line["purchase_price"],
+                )
+            )
+
+        SupplierReturnItem.objects.bulk_create(return_items)
+
+        # Проводка денежных средств
+        if compensation == SupplierReturn.Compensation.CASH and cashbox and total_return_amount > Decimal("0"):
+            try:
+                TransactionRecord.objects.create(
+                    company=company,
+                    branch=branch,
+                    cashbox=cashbox,
+                    type=TransactionRecord.Type.INCOME if hasattr(TransactionRecord, "Type") else "income",
+                    amount=total_return_amount,
+                    note=f"Возврат поставщику: {supplier.full_name}",
+                    created_by=request.user,
+                )
+            except Exception:
+                pass
+        elif compensation == SupplierReturn.Compensation.DEBT_OFFSET and total_return_amount > Decimal("0"):
+            try:
+                deal = ClientDeal.objects.filter(company=company, client=supplier, kind=ClientDeal.Kind.DEBT).order_by("-created_at").first()
+                if deal:
+                    new_pre = (deal.prepayment or Decimal("0")) + total_return_amount
+                    deal.prepayment = min(deal.amount, new_pre)
+                    deal.save(update_fields=["prepayment"])
+            except Exception:
+                pass
+
+        resp_serializer = SupplierReturnReadSerializer(sup_return, context={"request": request})
+        return Response(resp_serializer.data, status=status.HTTP_201_CREATED)
+
+
+# ===========================
+#  Product Form Layout (Маркет: Раскладка формы товара)
+# ===========================
+ALLOWED_PRODUCT_FORM_LAYOUT_FIELDS = {
+    "code", "barcode", "alternateBarcodes", "article", "hotkey", "images",
+    "category", "brand",
+    "unit", "pieceSale", "weight", "adult", "packaging",
+    "markup", "wholesale", "discount",
+    "supplier", "debt", "minStock", "country", "expiry",
+    "promotion", "characteristics", "description", "plu"
+}
+
+
+class ProductFormLayoutAPIView(CompanyBranchRestrictedMixin, APIView):
+    """
+    GET /api/main/products/form-layout/ — прочитать раскладку компании
+    PATCH /api/main/products/form-layout/ — сохранить раскладку (owner/admin)
+    """
+
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request, *args, **kwargs):
+        company = self._company()
+        if not company:
+            return Response({"detail": "Компания не найдена."}, status=status.HTTP_400_BAD_REQUEST)
+
+        layout = MarketProductFormLayout.objects.filter(company=company).first()
+        hidden = layout.hidden if (layout and isinstance(layout.hidden, list)) else []
+        updated_at = layout.updated_at.isoformat() if (layout and layout.updated_at) else None
+
+        return Response({"hidden": hidden, "updated_at": updated_at}, status=status.HTTP_200_OK)
+
+    def patch(self, request, *args, **kwargs):
+        company = self._company()
+        if not company:
+            return Response({"detail": "Компания не найдена."}, status=status.HTTP_400_BAD_REQUEST)
+
+        is_admin = getattr(request.user, "role", None) in ["owner", "admin"]
+        if not is_admin:
+            return Response({"detail": "Недостаточно прав. Настройка формы доступна только администраторам и владельцу."}, status=status.HTTP_403_FORBIDDEN)
+
+        hidden_raw = request.data.get("hidden")
+        if hidden_raw is None or not isinstance(hidden_raw, list):
+            return Response({"hidden": ["Поле 'hidden' должно быть массивом строк."]}, status=status.HTTP_400_BAD_REQUEST)
+
+        normalized_hidden = []
+        seen = set()
+        for item in hidden_raw:
+            if isinstance(item, str):
+                item_str = item.strip()
+                if item_str in ALLOWED_PRODUCT_FORM_LAYOUT_FIELDS and item_str not in seen:
+                    seen.add(item_str)
+                    normalized_hidden.append(item_str)
+
+        layout, _ = MarketProductFormLayout.objects.get_or_create(company=company)
+        layout.hidden = normalized_hidden
+        layout.updated_by = request.user
+        layout.save()
+
+        return Response({
+            "hidden": layout.hidden,
+            "updated_at": layout.updated_at.isoformat() if layout.updated_at else None,
+        }, status=status.HTTP_200_OK)
 
 
 # ===========================
