@@ -19,7 +19,13 @@ from django.http import FileResponse
 from django.http import Http404
 from rest_framework.exceptions import NotFound, PermissionDenied, ValidationError
 
-from decimal import Decimal, ROUND_HALF_UP, InvalidOperation
+from decimal import (
+    Decimal,
+    ROUND_CEILING,
+    ROUND_FLOOR,
+    ROUND_HALF_UP,
+    InvalidOperation,
+)
 from datetime import timedelta, datetime, date, time as dtime
 import io, os, uuid, logging
 from django.db import IntegrityError
@@ -905,6 +911,43 @@ def _scale_barcode_variants(barcode: str, mode: str, layout: str,
     return variants
 
 
+# Шаг дискретности торговых весов (поверочное деление e). У весов 6/15 кг это
+# обычно 2/5 г; берём 5 г — веса с шагом 10 г и крупнее тоже лежат на этой сетке.
+SCALE_WEIGHT_STEP_KG = Decimal("0.005")
+
+
+def _weight_from_amount(amount: Decimal, price: Decimal, amount_unit: str) -> Decimal:
+    """
+    Вес из суммы, напечатанной на этикетке весов.
+
+    Весы печатают ОКРУГЛЁННУЮ сумму, поэтому простое `amount / price` систематически
+    промахивается: цена 390 сом/кг, вес 0.170 кг → 66.30 сом → на этикетке «66» →
+    66/390 = 0.16923 → касса показывала 0.169 вместо 0.170. Чем крупнее шаг суммы
+    (целые сомы) и чем ниже цена, тем больше промах.
+
+    Восстанавливаем так: сумма на этикетке допускает целый интервал весов
+    (±половина шага суммы, пересчитанная в кг). Если в этот интервал попадает вес
+    с сетки весов (кратный SCALE_WEIGHT_STEP_KG) — берём ближайший такой; именно его
+    весы и взвесили. Если не попадает ни один (сумма точная — например в тыйынах,
+    интервал узкий) — обычное деление, округлённое до грамма.
+    """
+    exact = amount / price
+
+    # Шаг суммы на этикетке: целые сомы либо тыйыны (2 знака).
+    unit = Decimal(1) if amount_unit == SCALE_BARCODE_AMOUNT_UNIT_SOM else Decimal("0.01")
+    tolerance = (unit / 2) / price
+
+    step = SCALE_WEIGHT_STEP_KG
+    low = ((exact - tolerance) / step).to_integral_value(rounding=ROUND_CEILING)
+    high = ((exact + tolerance) / step).to_integral_value(rounding=ROUND_FLOOR)
+    if low <= high:
+        nearest = (exact / step).to_integral_value(rounding=ROUND_HALF_UP)
+        snapped = min(max(nearest, low), high) * step
+        return snapped.quantize(Decimal("0.001"))
+
+    return exact.quantize(Decimal("0.001"), rounding=ROUND_HALF_UP)
+
+
 def _finalize_scale_data_for_product(product, scale_data: dict) -> Optional[str]:
     """
     Для mode=amount_plain дополняет scale_data полем quantity_kg.
@@ -925,7 +968,11 @@ def _finalize_scale_data_for_product(product, scale_data: dict) -> Optional[str]
     if amount is None:
         return "Невозможно рассчитать вес: в штрихкоде не указана сумма"
 
-    quantity_kg = (Decimal(str(amount)) / price).quantize(Decimal("0.001"), rounding=ROUND_HALF_UP)
+    quantity_kg = _weight_from_amount(
+        Decimal(str(amount)),
+        price,
+        scale_data.get("amount_unit") or SCALE_BARCODE_AMOUNT_UNIT_TIYIN,
+    )
     scale_data["quantity_kg"] = quantity_kg
     scale_data["plu"] = scale_data.get("plu")
     scale_data["amount"] = Decimal(str(amount))
