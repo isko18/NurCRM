@@ -942,10 +942,21 @@ def _weight_from_amount(amount: Decimal, price: Decimal, amount_unit: str) -> De
     high = ((exact + tolerance) / step).to_integral_value(rounding=ROUND_FLOOR)
     if low <= high:
         nearest = (exact / step).to_integral_value(rounding=ROUND_HALF_UP)
-        snapped = min(max(nearest, low), high) * step
-        return snapped.quantize(Decimal("0.001"))
+        snapped = (min(max(nearest, low), high) * step).quantize(Decimal("0.001"))
+        pos_scan_logger.info(
+            "weight from amount=%s price=%s unit=%s: %s -> %s (сетка %s кг)",
+            amount, price, amount_unit, exact.quantize(Decimal("0.00001")), snapped, step,
+        )
+        return snapped
 
-    return exact.quantize(Decimal("0.001"), rounding=ROUND_HALF_UP)
+    # Ни один вес с сетки весов не даёт эту сумму: сумма точная (тыйыны), либо цена
+    # в карточке не та, по которой печатали этикетку, либо не тот amount_unit.
+    plain = exact.quantize(Decimal("0.001"), rounding=ROUND_HALF_UP)
+    pos_scan_logger.info(
+        "weight from amount=%s price=%s unit=%s: %s -> %s (без привязки к сетке)",
+        amount, price, amount_unit, exact.quantize(Decimal("0.00001")), plain,
+    )
+    return plain
 
 
 def _finalize_scale_data_for_product(product, scale_data: dict) -> Optional[str]:
