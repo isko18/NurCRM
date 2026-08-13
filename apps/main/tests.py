@@ -11,9 +11,11 @@ from apps.main.pos_views import (
     _parse_scale_barcode,
     _parse_scale_barcode_loose,
     _scale_barcode_variants,
+    _scale_line_unit_price,
     _should_use_main_stock_in_agent_sale,
     _weight_from_amount,
 )
+from apps.main.pos_utils import money
 from apps.main.views import ProductWarehouseBarcodeAPIView, ProductCreateManualAPIView
 from apps.users.models import (
     Roles,
@@ -274,6 +276,32 @@ class PosWeightFromAmountTests(TestCase):
         self.assertEqual(
             self._weight("0.168", "190", SCALE_BARCODE_AMOUNT_UNIT_TIYIN),
             Decimal("0.168"),
+        )
+
+    def test_line_unit_price_reproduces_label_sum(self):
+        """Сумма строки = сумма на этикетке: 91 / 0.170 → 535.29, и 535.29 × 0.170
+        после округления до копеек даёт ровно 91.00."""
+        scale_data = {"mode": "amount_plain", "amount": Decimal("91")}
+        cart = SimpleNamespace(is_wholesale=False)
+        unit_price = _scale_line_unit_price(scale_data, Decimal("0.170"), cart=cart)
+        self.assertEqual(unit_price, Decimal("535.29"))
+        self.assertEqual(money(unit_price * Decimal("0.170")), Decimal("91.00"))
+
+    def test_line_unit_price_skipped_without_amount(self):
+        # Весовой ШК (в поле граммы) и обычный товар — цену строки не трогаем.
+        cart = SimpleNamespace(is_wholesale=False)
+        self.assertIsNone(
+            _scale_line_unit_price({"mode": "weight", "weight_kg": Decimal("0.170")},
+                                   Decimal("0.170"), cart=cart)
+        )
+        self.assertIsNone(_scale_line_unit_price(None, Decimal("1.000"), cart=cart))
+
+    def test_line_unit_price_skipped_for_wholesale_cart(self):
+        # В оптовой корзине своя цена — сумма с розничной этикетки не навязывается.
+        scale_data = {"mode": "amount_plain", "amount": Decimal("91")}
+        self.assertIsNone(
+            _scale_line_unit_price(scale_data, Decimal("0.170"),
+                                   cart=SimpleNamespace(is_wholesale=True))
         )
 
     def test_ambiguous_stays_plain_division(self):
