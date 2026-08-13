@@ -11,6 +11,7 @@ import logging
 
 from apps.main.models import Cart, CartItem, Sale, SaleItem, Product
 from apps.main.pos_utils import cart_item_stock_consume_units, money as pos_money
+from apps.main.services.product_list_filters import apply_product_list_filters  # noqa: F401
 
 
 class NotEnoughStock(Exception):

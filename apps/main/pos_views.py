@@ -69,6 +69,7 @@ from apps.main.models import (
     ProductImage,
 )
 from apps.main.models import ManufactureSubreal, AgentSaleAllocation, ReturnFromAgent
+from apps.main.models import cart_line_base, scale_amount_step
 from apps.main.cache_utils import invalidate_cache_pattern
 from apps.main.services import checkout_cart, NotEnoughStock
 from apps.main.cart_service import abandon_cart
@@ -646,13 +647,7 @@ def _cart_response(request, cart_id, *, status_code=status.HTTP_200_OK, multi_ca
     )
 
 
-def _upsert_scanned_cart_item(cart, product, quantity, unit_price=None):
-    """Кладёт отсканированную позицию в корзину.
-
-    `unit_price` задаётся только для весовых этикеток с суммой — чтобы сумма строки
-    совпала с напечатанной (см. `_scale_line_unit_price`). При повторном скане того же
-    товара цена пересчитывается так, чтобы сумма строки осталась суммой этикеток.
-    """
+def _upsert_scanned_cart_item(cart, product, quantity):
     scanned_qty = qty3(quantity)
     item = (
         CartItem.objects.select_for_update()
@@ -660,22 +655,9 @@ def _upsert_scanned_cart_item(cart, product, quantity, unit_price=None):
         .first()
     )
     if item:
-        merged_qty = qty3(item.quantity + scanned_qty)
-        fields = ["quantity"]
-        if unit_price is not None and merged_qty > 0:
-            already = Decimal(str(item.unit_price or 0)) * Decimal(str(item.quantity or 0))
-            item.unit_price = money((already + unit_price * scanned_qty) / merged_qty)
-            fields.append("unit_price")
-        item.quantity = merged_qty
-        item.save(update_fields=fields, skip_full_clean=True)
+        item.quantity = qty3(item.quantity + scanned_qty)
+        item.save(update_fields=["quantity"], skip_full_clean=True)
         return item
-
-    if unit_price is None:
-        unit_price = (
-            (product.wholesale_price or product.price)
-            if getattr(cart, "is_wholesale", False)
-            else product.price
-        )
 
     item = CartItem(
         cart=cart,
@@ -683,7 +665,11 @@ def _upsert_scanned_cart_item(cart, product, quantity, unit_price=None):
         branch=getattr(cart, "branch", None),
         product=product,
         quantity=scanned_qty,
-        unit_price=unit_price,
+        unit_price=(
+            (product.wholesale_price or product.price)
+            if getattr(cart, "is_wholesale", False)
+            else product.price
+        ),
     )
     item.save(skip_full_clean=True)
     return item
@@ -1014,39 +1000,6 @@ def _effective_qty_from_scale_data(scale_data, qty) -> Decimal:
         if "weight_kg" in scale_data:
             return Decimal(str(scale_data["weight_kg"]))
     return Decimal(str(qty))
-
-
-def _scale_line_amount(scale_data) -> Optional[Decimal]:
-    """Сумма с этикетки весов, если она там была (mode=amount), иначе None."""
-    if not scale_data or scale_data.get("mode") != "amount_plain":
-        return None
-    amount = scale_data.get("amount")
-    if amount is None:
-        return None
-    amount = Decimal(str(amount))
-    return amount if amount > 0 else None
-
-
-def _scale_line_unit_price(scale_data, quantity: Decimal, *, cart) -> Optional[Decimal]:
-    """
-    Цена строки, при которой сумма позиции совпадёт с суммой на этикетке весов.
-
-    Весы отбрасывают дробную часть суммы, поэтому «цена × вес» её не воспроизводит:
-    0.170 кг × 540 сом/кг = 91.80, а на этикетке 91. Покупатель платит по этикетке,
-    поэтому цену строки подгоняем под неё: 91 / 0.170 = 535.29.
-
-    Отклонение хранится именно в unit_price, а не в line_discount: по договорённости
-    Cart.recalc() отклонение unit_price от каталожной цены скидкой не считает и в
-    discount_total не включает, а line_discount пересчитывается ступенями акций.
-
-    Для оптовой корзины не применяем — там своя цена, не та, что печатали весы.
-    """
-    if getattr(cart, "is_wholesale", False):
-        return None
-    amount = _scale_line_amount(scale_data)
-    if amount is None or quantity <= 0:
-        return None
-    return money(amount / quantity)
 
 
 def _parse_scale_barcode_loose(barcode: str):
@@ -2187,14 +2140,17 @@ class SaleInvoiceDownloadAPIView(APIView):
         y -= 10
 
         _set_font(p, "DejaVu", 10, fallback="Helvetica")
-        for it in sale.items.all():
+        amount_step = scale_amount_step(sale.company)
+        for it in sale.items.select_related("product"):
             p.drawString(20 * mm, y, (it.name_snapshot or "")[:60])
             p.drawRightString(140 * mm, y, str(it.quantity))
             p.drawRightString(160 * mm, y, fmt_money(it.unit_price))
             p.drawRightString(
                 190 * mm,
                 y,
-                fmt_money((it.unit_price * it.quantity) - (getattr(it, "line_discount", None) or 0)),
+                fmt_money(
+                    cart_line_base(it, amount_step) - (getattr(it, "line_discount", None) or 0)
+                ),
             )
             y -= 7 * mm
             if y < 60 * mm:
@@ -2522,12 +2478,7 @@ class SaleScanAPIView(MarketCashierOnlyMixin, APIView):
                 shift=url_cart.shift,
                 sale_id=sale_id,
             )
-            _upsert_scanned_cart_item(
-                cart,
-                product,
-                effective_qty,
-                unit_price=_scale_line_unit_price(scale_data, effective_qty, cart=cart),
-            )
+            _upsert_scanned_cart_item(cart, product, effective_qty)
             cart.recalc()
             cart_id = cart.id
 
@@ -2936,11 +2887,16 @@ def _release_agent_allocations_for_qty(sale_item: SaleItem, return_qty_int: int)
 
 
 def _sale_item_unit_net(item: SaleItem) -> Decimal:
-    """Чистая цена за единицу строки чека: (unit_price*qty - line_discount) / qty."""
+    """Чистая цена за единицу строки чека: (сумма строки - line_discount) / qty.
+
+    Сумма строки берётся через cart_line_base — для весовых позиций она округлена
+    вниз как на весах, поэтому возврат считается от той же суммы, что и продажа.
+    """
     q = Decimal(str(item.quantity or 0))
     if q <= 0:
         return Decimal("0.00")
-    net = Decimal(str(item.unit_price or 0)) * q - Decimal(str(item.line_discount or 0))
+    base = cart_line_base(item, scale_amount_step(item.company))
+    net = base - Decimal(str(item.line_discount or 0))
     return net / q
 
 
@@ -3361,12 +3317,7 @@ class MobileScannerIngestAPIView(APIView):
 
         with transaction.atomic():
             cart = Cart.objects.select_for_update().get(id=cart.id)
-            _upsert_scanned_cart_item(
-                cart,
-                product,
-                effective_qty,
-                unit_price=_scale_line_unit_price(scale_data, effective_qty, cart=cart),
-            )
+            _upsert_scanned_cart_item(cart, product, effective_qty)
         return Response({"ok": True}, status=201)
 
 
@@ -4293,12 +4244,7 @@ class AgentSaleScanAPIView(MarketCashierOnlyMixin, CompanyBranchRestrictedMixin,
                 status=400,
             )
 
-        _upsert_scanned_cart_item(
-            cart,
-            product,
-            effective_qty,
-            unit_price=_scale_line_unit_price(scale_data, effective_qty, cart=cart),
-        )
+        _upsert_scanned_cart_item(cart, product, effective_qty)
         cart.recalc()
         return _cart_response(request, cart.id, status_code=status.HTTP_201_CREATED)
 

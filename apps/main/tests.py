@@ -4,18 +4,17 @@ from types import SimpleNamespace
 from django.test import TestCase
 from rest_framework.test import APIRequestFactory, force_authenticate
 
-from apps.main.models import Product, ProductAlternateBarcode
+from apps.main.models import Cart, CartItem, Product, ProductAlternateBarcode
 from apps.main.pos_views import (
     _effective_qty_from_scale_data,
     _finalize_scale_data_for_product,
     _parse_scale_barcode,
     _parse_scale_barcode_loose,
     _scale_barcode_variants,
-    _scale_line_unit_price,
     _should_use_main_stock_in_agent_sale,
     _weight_from_amount,
 )
-from apps.main.pos_utils import money
+from apps.main.models import cart_line_base, scale_amount_step
 from apps.main.views import ProductWarehouseBarcodeAPIView, ProductCreateManualAPIView
 from apps.users.models import (
     Roles,
@@ -278,32 +277,6 @@ class PosWeightFromAmountTests(TestCase):
             Decimal("0.168"),
         )
 
-    def test_line_unit_price_reproduces_label_sum(self):
-        """Сумма строки = сумма на этикетке: 91 / 0.170 → 535.29, и 535.29 × 0.170
-        после округления до копеек даёт ровно 91.00."""
-        scale_data = {"mode": "amount_plain", "amount": Decimal("91")}
-        cart = SimpleNamespace(is_wholesale=False)
-        unit_price = _scale_line_unit_price(scale_data, Decimal("0.170"), cart=cart)
-        self.assertEqual(unit_price, Decimal("535.29"))
-        self.assertEqual(money(unit_price * Decimal("0.170")), Decimal("91.00"))
-
-    def test_line_unit_price_skipped_without_amount(self):
-        # Весовой ШК (в поле граммы) и обычный товар — цену строки не трогаем.
-        cart = SimpleNamespace(is_wholesale=False)
-        self.assertIsNone(
-            _scale_line_unit_price({"mode": "weight", "weight_kg": Decimal("0.170")},
-                                   Decimal("0.170"), cart=cart)
-        )
-        self.assertIsNone(_scale_line_unit_price(None, Decimal("1.000"), cart=cart))
-
-    def test_line_unit_price_skipped_for_wholesale_cart(self):
-        # В оптовой корзине своя цена — сумма с розничной этикетки не навязывается.
-        scale_data = {"mode": "amount_plain", "amount": Decimal("91")}
-        self.assertIsNone(
-            _scale_line_unit_price(scale_data, Decimal("0.170"),
-                                   cart=SimpleNamespace(is_wholesale=True))
-        )
-
     def test_ambiguous_stays_plain_division(self):
         """Дешёвый товар: 44 сом при цене 44 сом/кг допускает веса 1.000…1.020 кг.
         Не гадаем — отдаём обычное деление, как было до фикса."""
@@ -311,6 +284,141 @@ class PosWeightFromAmountTests(TestCase):
             _weight_from_amount(Decimal("44"), Decimal("44"), SCALE_BARCODE_AMOUNT_UNIT_SOM),
             Decimal("1.000"),
         )
+
+
+class CartLineBaseTests(TestCase):
+    """Сумма строки для весового товара считается как на весах — с отбрасыванием
+    дробной части. Цена и вес при этом не трогаются и скидка не начисляется."""
+
+    def _item(self, unit_price, quantity, is_weight):
+        return SimpleNamespace(
+            unit_price=Decimal(unit_price),
+            quantity=Decimal(quantity),
+            product=SimpleNamespace(is_weight=is_weight),
+        )
+
+    def test_weight_line_truncated_to_som(self):
+        # Этикетка: 0.170 кг × 540 сом/кг = 91.80, напечатано 91.
+        item = self._item("540", "0.170", True)
+        self.assertEqual(cart_line_base(item, Decimal("1")), Decimal("91"))
+
+    def test_non_weight_line_untouched(self):
+        item = self._item("540", "0.170", False)
+        self.assertEqual(cart_line_base(item, Decimal("1")), Decimal("91.80"))
+
+    def test_line_without_product_untouched(self):
+        item = SimpleNamespace(unit_price=Decimal("19.99"), quantity=Decimal("3"), product=None)
+        self.assertEqual(cart_line_base(item, Decimal("1")), Decimal("59.97"))
+
+    def test_tiyin_step_keeps_kopeks(self):
+        # Весы в тыйынах печатают 91.80 — отбрасывать нечего.
+        item = self._item("540", "0.170", True)
+        self.assertEqual(cart_line_base(item, Decimal("0.01")), Decimal("91.80"))
+
+    def test_exact_sum_not_reduced(self):
+        # 0.200 кг × 540 = 108.00 ровно — отбрасывание ничего не меняет.
+        item = self._item("540", "0.200", True)
+        self.assertEqual(cart_line_base(item, Decimal("1")), Decimal("108"))
+
+    def test_step_from_company_setting(self):
+        self.assertEqual(
+            scale_amount_step(SimpleNamespace(scale_barcode_amount_unit=SCALE_BARCODE_AMOUNT_UNIT_SOM)),
+            Decimal("1"),
+        )
+        self.assertEqual(
+            scale_amount_step(SimpleNamespace(scale_barcode_amount_unit=SCALE_BARCODE_AMOUNT_UNIT_TIYIN)),
+            Decimal("0.01"),
+        )
+
+
+class CartRecalcWeightRoundingTestCase(TestCase):
+    """Пересчёт корзины целиком: весовая строка даёт сумму как на этикетке."""
+
+    def setUp(self):
+        self.owner = User.objects.create_user(email="owner-scale@test.com", password="testpass123")
+        self.company = Company.objects.create(
+            name="Scale Market",
+            owner=self.owner,
+            scale_barcode_amount_unit=SCALE_BARCODE_AMOUNT_UNIT_SOM,
+        )
+        self.branch = Branch.objects.create(name="Scale Branch", company=self.company)
+        self.owner.company = self.company
+        self.owner.save(update_fields=["company"])
+        self.sausage = Product.objects.create(
+            company=self.company,
+            branch=self.branch,
+            name="Колбаса Сервелат Салих",
+            code="S-1",
+            unit="кг",
+            is_weight=True,
+            quantity=Decimal("50.000"),
+            price=Decimal("540.00"),
+            purchase_price=Decimal("400.00"),
+        )
+        self.cart = Cart.objects.create(
+            company=self.company, branch=self.branch, user=self.owner
+        )
+
+    def _add(self, product, quantity):
+        item = CartItem(
+            cart=self.cart,
+            company=self.company,
+            branch=self.branch,
+            product=product,
+            quantity=Decimal(quantity),
+            unit_price=product.price,
+        )
+        item.save(skip_full_clean=True)
+        return item
+
+    def test_weight_line_total_matches_label(self):
+        # Этикетка: 0.170 кг × 540 сом/кг = 91.80 → напечатано 91.
+        self._add(self.sausage, "0.170")
+        self.cart.recalc()
+        self.assertEqual(self.cart.subtotal, Decimal("91.00"))
+        self.assertEqual(self.cart.total, Decimal("91.00"))
+        self.assertEqual(self.cart.discount_total, Decimal("0.00"))
+
+    def test_price_and_quantity_are_untouched(self):
+        item = self._add(self.sausage, "0.170")
+        self.cart.recalc()
+        item.refresh_from_db()
+        self.assertEqual(item.unit_price, Decimal("540.00"))
+        self.assertEqual(item.quantity, Decimal("0.170"))
+        self.assertEqual(item.line_discount, Decimal("0.00"))
+
+    def test_non_weight_product_keeps_kopeks(self):
+        piece = Product.objects.create(
+            company=self.company,
+            branch=self.branch,
+            name="Сок",
+            code="J-1",
+            unit="шт",
+            is_weight=False,
+            quantity=Decimal("10.000"),
+            price=Decimal("99.90"),
+            purchase_price=Decimal("70.00"),
+        )
+        self._add(piece, "3")
+        self.cart.recalc()
+        self.assertEqual(self.cart.subtotal, Decimal("299.70"))
+
+    def test_mixed_cart_rounds_only_weight_line(self):
+        piece = Product.objects.create(
+            company=self.company,
+            branch=self.branch,
+            name="Сок",
+            code="J-2",
+            unit="шт",
+            is_weight=False,
+            quantity=Decimal("10.000"),
+            price=Decimal("99.90"),
+            purchase_price=Decimal("70.00"),
+        )
+        self._add(self.sausage, "0.170")
+        self._add(piece, "1")
+        self.cart.recalc()
+        self.assertEqual(self.cart.subtotal, Decimal("190.90"))  # 91 + 99.90
 
 
 class ProductWarehouseBarcodeAPITestCase(TestCase):

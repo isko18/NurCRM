@@ -3,22 +3,27 @@ from django.core.exceptions import ValidationError
 from django.utils import timezone
 from django.conf import settings
 from django.core.validators import MinValueValidator, MaxValueValidator
-from decimal import Decimal, ROUND_HALF_UP
+from decimal import Decimal, ROUND_FLOOR, ROUND_HALF_UP
 from datetime import timedelta
 from dateutil.relativedelta import relativedelta
 from django.utils.dateparse import parse_date, parse_datetime
 from django.db import transaction, connection
-from django.db.models import Sum, F, Q, Max, IntegerField, Value, ExpressionWrapper, Case, When
+from django.db.models import Sum, F, Q, Max, IntegerField, Value, Case, When
 from mptt.models import MPTTModel, TreeForeignKey
 import uuid, secrets
 from django.core.files.base import ContentFile
 from PIL import Image
-from django.db.models.functions import Cast, Coalesce, Greatest, Least
+from django.db.models.functions import Cast, Coalesce
 import io
 import logging
 import json
 
-from apps.users.models import Company, User, Branch
+from apps.users.models import (
+    Company,
+    User,
+    Branch,
+    SCALE_BARCODE_AMOUNT_UNIT_SOM,
+)
 from apps.consalting.models import ServicesConsalting
 # from apps.construction.models import Department   # УДАЛЕНО: отделы больше не используются
 
@@ -1625,6 +1630,30 @@ class ProductRecipeItem(models.Model):
         return f"{self.product.name} <- {self.item_make.name} x{self.qty_per_unit}"
 
 
+def scale_amount_step(company) -> Decimal:
+    """Шаг, которым весы печатают сумму: целые сомы либо тыйыны (2 знака)."""
+    unit = getattr(company, "scale_barcode_amount_unit", None)
+    return Decimal("1") if unit == SCALE_BARCODE_AMOUNT_UNIT_SOM else Decimal("0.01")
+
+
+def cart_line_base(item, amount_step: Decimal) -> Decimal:
+    """
+    Сумма строки корзины/чека — так же, как её считают весы.
+
+    Для весового товара весы отбрасывают дробную часть суммы: 0.170 кг × 540 сом/кг
+    = 91.80, а на этикетке напечатано «91». Покупатель платит по этикетке, поэтому
+    сумма весовой строки округляется вниз с тем же шагом, что и на весах
+    (Company.scale_barcode_amount_unit). Цену за кг и вес это не трогает и скидкой
+    не оформляется — просто сумма считается как на весах.
+
+    Невесовые позиции считаются как раньше: цена × количество.
+    """
+    base = Decimal(str(item.unit_price or 0)) * Decimal(str(item.quantity or 0))
+    if amount_step > 0 and getattr(getattr(item, "product", None), "is_weight", False):
+        return base.quantize(amount_step, rounding=ROUND_FLOOR)
+    return base
+
+
 def _cart_item_promotion_line_discount(product, unit_price: Decimal, quantity: Decimal) -> Decimal:
     """
     Скидка по акции (Product.stock + ProductPromotionTier) для строки корзины.
@@ -1849,25 +1878,24 @@ class Cart(models.Model):
             new_d = _money(promo_d)
             if new_d != cur:
                 CartItem.objects.filter(pk=item.pk).update(line_discount=new_d)
+                item.line_discount = new_d
 
-        calc_field = models.DecimalField(max_digits=24, decimal_places=6)
-        zero = Value(Decimal("0.00"), output_field=calc_field)
         # Подытог считается по цене продажи (unit_price), которую видит кассир.
         # Отклонение unit_price от каталожной product.price — это не скидка,
         # в discount_total и в чек оно попадать не должно.
-        line_base = ExpressionWrapper(F("unit_price") * F("quantity"), output_field=calc_field)
-        line_disc = Least(
-            Greatest(Coalesce(F("line_discount"), zero, output_field=calc_field), zero),
-            line_base,
-            output_field=calc_field,
-        )
+        # Весовые строки округляются вниз как на весах — см. cart_line_base().
+        amount_step = scale_amount_step(self.company)
+        subtotal_raw = Decimal("0")
+        line_discount_raw = Decimal("0")
+        for item in items:
+            base = cart_line_base(item, amount_step)
+            disc = Decimal(str(item.line_discount or 0))
+            disc = min(max(disc, Decimal("0")), base)
+            subtotal_raw += base
+            line_discount_raw += disc
 
-        aggregated = self.items.aggregate(
-            subtotal=Sum(line_base),
-            line_discount_total=Sum(line_disc),
-        )
-        subtotal = _money(aggregated.get("subtotal") or Decimal("0"))
-        line_discount_total = _money(aggregated.get("line_discount_total") or Decimal("0"))
+        subtotal = _money(subtotal_raw)
+        line_discount_total = _money(line_discount_raw)
 
         # Скидка на чек: либо % от subtotal, либо фиксированная сумма
         order_percent = getattr(self, "order_discount_percent", None)
