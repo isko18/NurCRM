@@ -22,7 +22,6 @@ from rest_framework.exceptions import NotFound, PermissionDenied, ValidationErro
 from decimal import (
     Decimal,
     ROUND_CEILING,
-    ROUND_FLOOR,
     ROUND_HALF_UP,
     InvalidOperation,
 )
@@ -920,41 +919,43 @@ def _weight_from_amount(amount: Decimal, price: Decimal, amount_unit: str) -> De
     """
     Вес из суммы, напечатанной на этикетке весов.
 
-    Весы печатают ОКРУГЛЁННУЮ сумму, поэтому простое `amount / price` систематически
-    промахивается: цена 390 сом/кг, вес 0.170 кг → 66.30 сом → на этикетке «66» →
-    66/390 = 0.16923 → касса показывала 0.169 вместо 0.170. Чем крупнее шаг суммы
-    (целые сомы) и чем ниже цена, тем больше промах.
+    Весы ОТБРАСЫВАЮТ дробную часть суммы (проверено по этикетке: 0.170 кг × 540 сом/кг
+    = 91.80 → на этикетке «91»). Поэтому простое `amount / price` систематически
+    занижает вес: 91/540 = 0.16852 → касса показывала 0.169 вместо 0.170.
 
-    Восстанавливаем так: сумма на этикетке допускает целый интервал весов
-    (±половина шага суммы, пересчитанная в кг). Если в этот интервал попадает вес
-    с сетки весов (кратный SCALE_WEIGHT_STEP_KG) — берём ближайший такой; именно его
-    весы и взвесили. Если не попадает ни один (сумма точная — например в тыйынах,
-    интервал узкий) — обычное деление, округлённое до грамма.
+    Восстанавливаем так: напечатанная сумма A допускает интервал весов
+    [A/цена, (A+шаг суммы)/цена). Если ровно один вес с сетки весов (кратный
+    SCALE_WEIGHT_STEP_KG) попадает в этот интервал — его весы и взвесили, берём его.
+    Если подходящих весов несколько (дешёвый товар: при цене ниже ~200 сом/кг шаг
+    в 1 сом грубее шага весов) или ни одного (точная сумма в тыйынах) — не гадаем
+    и возвращаем обычное деление, округлённое до грамма.
     """
     exact = amount / price
 
     # Шаг суммы на этикетке: целые сомы либо тыйыны (2 знака).
     unit = Decimal(1) if amount_unit == SCALE_BARCODE_AMOUNT_UNIT_SOM else Decimal("0.01")
-    tolerance = (unit / 2) / price
 
+    # Интервал возможных весов — полуоткрытый [exact, upper): сумма отброшена вниз.
     step = SCALE_WEIGHT_STEP_KG
-    low = ((exact - tolerance) / step).to_integral_value(rounding=ROUND_CEILING)
-    high = ((exact + tolerance) / step).to_integral_value(rounding=ROUND_FLOOR)
-    if low <= high:
-        nearest = (exact / step).to_integral_value(rounding=ROUND_HALF_UP)
-        snapped = (min(max(nearest, low), high) * step).quantize(Decimal("0.001"))
+    upper = (amount + unit) / price
+    n_min = (exact / step).to_integral_value(rounding=ROUND_CEILING)
+    # Наибольшее n, при котором n*step строго меньше upper.
+    n_max = (upper / step).to_integral_value(rounding=ROUND_CEILING) - 1
+
+    if n_min == n_max:
+        snapped = (n_min * step).quantize(Decimal("0.001"))
         pos_scan_logger.info(
             "weight from amount=%s price=%s unit=%s: %s -> %s (сетка %s кг)",
             amount, price, amount_unit, exact.quantize(Decimal("0.00001")), snapped, step,
         )
         return snapped
 
-    # Ни один вес с сетки весов не даёт эту сумму: сумма точная (тыйыны), либо цена
-    # в карточке не та, по которой печатали этикетку, либо не тот amount_unit.
+    # Однозначно восстановить нельзя — отдаём деление как есть (прежнее поведение).
     plain = exact.quantize(Decimal("0.001"), rounding=ROUND_HALF_UP)
     pos_scan_logger.info(
-        "weight from amount=%s price=%s unit=%s: %s -> %s (без привязки к сетке)",
+        "weight from amount=%s price=%s unit=%s: %s -> %s (подходящих весов на сетке: %s)",
         amount, price, amount_unit, exact.quantize(Decimal("0.00001")), plain,
+        max(n_max - n_min + 1, 0),
     )
     return plain
 

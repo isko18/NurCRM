@@ -1,4 +1,4 @@
-from decimal import Decimal, ROUND_HALF_UP
+from decimal import Decimal, ROUND_FLOOR
 from types import SimpleNamespace
 
 from django.test import TestCase
@@ -219,42 +219,55 @@ class PosScaleBarcodeVariantsTests(TestCase):
 class PosWeightFromAmountTests(TestCase):
     """Восстановление веса из суммы на этикетке (mode=amount).
 
-    Весы округляют сумму, поэтому amount/price «недобирает» несколько грамм:
-    фактические 0.170 кг показывались как 0.169. Вес возвращается на сетку весов.
+    Весы ОТБРАСЫВАЮТ дробную часть суммы, поэтому amount/price «недобирает»
+    несколько грамм: фактические 0.170 кг показывались как 0.169.
     """
 
+    def _printed_amount(self, weight_kg, price, amount_unit):
+        """Сумма так, как её печатают весы: дробная часть отбрасывается.
+
+        Проверено по этикетке «Колбаса Сервелат»: 0.170 кг × 540 сом/кг = 91.80,
+        на этикетке — 91 (а не 92, как было бы при округлении).
+        """
+        exact = Decimal(weight_kg) * Decimal(price)
+        places = Decimal("1") if amount_unit == SCALE_BARCODE_AMOUNT_UNIT_SOM else Decimal("0.01")
+        return exact.quantize(places, rounding=ROUND_FLOOR)
+
     def _weight(self, weight_kg, price, amount_unit=SCALE_BARCODE_AMOUNT_UNIT_SOM):
-        """Считает сумму так, как её напечатали бы весы, и восстанавливает вес обратно."""
-        price = Decimal(price)
-        exact_amount = Decimal(weight_kg) * price
-        if amount_unit == SCALE_BARCODE_AMOUNT_UNIT_SOM:
-            printed = exact_amount.quantize(Decimal("1"), rounding=ROUND_HALF_UP)
-        else:
-            printed = exact_amount.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
-        return _weight_from_amount(printed, price, amount_unit)
+        """Печатает сумму как весы и восстанавливает вес обратно."""
+        printed = self._printed_amount(weight_kg, price, amount_unit)
+        return _weight_from_amount(printed, Decimal(price), amount_unit)
+
+    def test_label_from_photo(self):
+        # Этикетка из жалобы: 0.170 кг, 540 сом/кг, сумма 91 (ШК 2000093000916).
+        self.assertEqual(
+            self._printed_amount("0.170", "540", SCALE_BARCODE_AMOUNT_UNIT_SOM),
+            Decimal("91"),
+        )
+        self.assertEqual(
+            _weight_from_amount(Decimal("91"), Decimal("540"), SCALE_BARCODE_AMOUNT_UNIT_SOM),
+            Decimal("0.170"),
+        )
 
     def test_reported_case_170_grams(self):
-        # Жалоба кассира: фактические 0.170 кг превращались в 0.169.
-        for price in ("390", "350", "250", "190", "199"):
+        for price in ("540", "390", "350", "250", "199", "190"):
             with self.subTest(price=price):
                 self.assertEqual(self._weight("0.170", price), Decimal("0.170"))
 
     def test_grid_weights_survive_round_trip_in_som(self):
-        # Шаг суммы 1 сом задаёт интервал весов шириной 1/цена. При цене > 200 сом/кг
-        # он уже шага весов (5 г), поэтому вес восстанавливается однозначно.
+        # Интервал весов, допускаемый суммой, имеет ширину 1/цена. При цене от
+        # 200 сом/кг он не шире шага весов (5 г) — вес восстанавливается однозначно.
         for weight in ("0.050", "0.185", "0.190", "0.500", "1.245", "2.000"):
-            for price in ("250", "390", "755"):
+            for price in ("200", "250", "390", "540", "755"):
                 with self.subTest(weight=weight, price=price):
                     self.assertEqual(self._weight(weight, price), Decimal(weight))
 
-    def test_cheap_goods_stay_ambiguous_within_one_step(self):
-        """Предел режима «Сом»: при цене ≤ 200 сом/кг одну и ту же сумму даёт
-        несколько весов с сетки (0.050 и 0.055 кг при 190 сом/кг → оба 10 сом).
-        Точный вес там невосстановим — гарантируем лишь промах не больше шага."""
-        for weight, price in (("0.050", "190"), ("1.245", "120")):
-            with self.subTest(weight=weight, price=price):
-                got = self._weight(weight, price)
-                self.assertLessEqual(abs(got - Decimal(weight)), Decimal("0.005"))
+    def test_cheap_goods_fall_back_to_plain_division(self):
+        """Ниже ~200 сом/кг шаг в 1 сом грубее шага весов: сумму 22 при цене
+        120 сом/кг дают и 0.185, и 0.190 кг. Не гадаем — обычное деление."""
+        for weight in ("0.185", "0.190"):
+            with self.subTest(weight=weight):
+                self.assertEqual(self._weight(weight, "120"), Decimal("0.183"))
 
     def test_tiyin_amounts_keep_off_grid_weights(self):
         # Сумма в тыйынах точная → интервал узкий, вес с шага 1 г не «примагничивается».
@@ -263,8 +276,9 @@ class PosWeightFromAmountTests(TestCase):
             Decimal("0.168"),
         )
 
-    def test_exact_division_unchanged(self):
-        # 44 сом при цене 44 сом/кг → ровно 1 кг (как и раньше).
+    def test_ambiguous_stays_plain_division(self):
+        """Дешёвый товар: 44 сом при цене 44 сом/кг допускает веса 1.000…1.020 кг.
+        Не гадаем — отдаём обычное деление, как было до фикса."""
         self.assertEqual(
             _weight_from_amount(Decimal("44"), Decimal("44"), SCALE_BARCODE_AMOUNT_UNIT_SOM),
             Decimal("1.000"),
