@@ -1,4 +1,4 @@
-from decimal import Decimal
+from decimal import Decimal, ROUND_HALF_UP
 import uuid
 
 from django.conf import settings
@@ -385,6 +385,72 @@ class CashShift(models.Model):
         if self.closing_cash is None:
             return Decimal("0.00")
         return (self.closing_cash or 0) - (self.expected_cash or 0)
+
+    def calc_payment_breakdown(self) -> list:
+        Sale = self.sales.model
+        from apps.main.models import SalePayment
+
+        excluded_statuses = ["cancelled", "canceled", "refunded", "returned"]
+        sales_qs = Sale.objects.filter(shift_id=self.id).exclude(status__in=excluded_statuses)
+
+        METHOD_LABELS = {
+            "cash": "Наличные",
+            "mbank": "МБанк",
+            "optima": "Оптима Банк",
+            "obank": "О!Деньги",
+            "bakai": "Бакай Банк",
+            "demir": "Демир Банк",
+            "transfer": "Перевод",
+            "card": "Карта",
+            "split": "Смешанная",
+            "mixed": "Смешанная",
+            "debt": "Отсрочка",
+            "deferred": "Отсрочка",
+        }
+
+        breakdown_data = {}
+
+        payments_qs = SalePayment.objects.filter(sale__in=sales_qs)
+        sale_payments_map = {}
+        for p in payments_qs:
+            sale_payments_map.setdefault(p.sale_id, set()).add(p.method)
+
+        for sale in sales_qs:
+            pm_set = sale_payments_map.get(sale.id, set())
+
+            if len(pm_set) >= 2:
+                m_code = "split"
+            elif len(pm_set) == 1:
+                m_code = list(pm_set)[0]
+            else:
+                m_code = sale.payment_method or "cash"
+
+            if m_code in ("deferred", "debt"):
+                m_code = "debt"
+            elif m_code in ("mixed", "split"):
+                m_code = "split"
+
+            label = METHOD_LABELS.get(m_code, str(m_code).title() if m_code else "Другое")
+            tot = sale.total or Decimal("0.00")
+
+            if m_code not in breakdown_data:
+                breakdown_data[m_code] = {"method": m_code, "label": label, "count": 0, "amount": Decimal("0.00")}
+
+            breakdown_data[m_code]["count"] += 1
+            breakdown_data[m_code]["amount"] += tot
+
+        sorted_items = sorted(breakdown_data.values(), key=lambda x: (x["amount"], x["count"]), reverse=True)
+
+        res = []
+        for item in sorted_items:
+            res.append({
+                "method": item["method"],
+                "label": item["label"],
+                "count": item["count"],
+                "amount": str(item["amount"].quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)),
+            })
+
+        return res
 
     def recalc_totals_for_close(self):
         t = self.calc_live_totals()

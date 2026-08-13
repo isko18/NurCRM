@@ -2,7 +2,7 @@ from decimal import Decimal, ROUND_HALF_UP, InvalidOperation
 from uuid import UUID, uuid4
 
 from django.db import transaction, IntegrityError
-from django.db.models import Sum, Count, Avg, F, Q, Prefetch, Value as V, Exists, OuterRef, Subquery
+from django.db.models import Sum, Count, Avg, F, Q, Prefetch, Value as V, Exists, OuterRef, Subquery, Case, When
 from django.utils.dateparse import parse_date, parse_datetime
 from django.utils import timezone
 from itertools import groupby
@@ -26,6 +26,7 @@ from django_filters.rest_framework import DjangoFilterBackend
 from django.db.models import DecimalField, ExpressionWrapper
 from rest_framework.pagination import CursorPagination, PageNumberPagination, LimitOffsetPagination
 from django.core.paginator import InvalidPage
+from apps.construction.models import Cashbox
 
 
 from apps.main.services.item_make_processing import (
@@ -54,6 +55,9 @@ from apps.main.models import (
     SaleItem,
     SupplierReceipt,
     SupplierReceiptItem,
+    SupplierReturn,
+    SupplierReturnItem,
+    MarketProductFormLayout,
     KnowledgeBaseCourse,
     FinishedToRawTransfer,
     Inventory,
@@ -87,6 +91,8 @@ from apps.main.serializers import (
     MarketSaleEmployeePayProfileSerializer,
     SupplierReceiptCreateSerializer,
     SupplierReceiptReadSerializer,
+    SupplierReturnReadSerializer,
+    SupplierReturnCreateSerializer,
     ProductPurchaseBatchSerializer,
     PublicKnowledgeBaseCourseSerializer,
     FinishedToRawTransferSerializer,
@@ -2904,6 +2910,66 @@ def _deal_prefetch():
 
 # ===== Deals list/create =====
 
+class ClientKPIsAPIView(CompanyBranchRestrictedMixin, APIView):
+    """
+    GET /api/main/clients/<client_id>/kpis/
+    Вычисляет 3 KPI по сделкам клиента: debt, prepayment, sale
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request, client_id, *args, **kwargs):
+        company = self._company()
+        branch = self._auto_branch()
+        user = request.user
+
+        if not company:
+            raise serializers.ValidationError({"company": "У пользователя не задана компания."})
+
+        client_qs = Client.objects.filter(company=company)
+        if branch is not None:
+            client_qs = client_qs.filter(Q(branch=branch) | Q(branch__isnull=True))
+        if not _is_owner_like(user):
+            client_qs = client_qs.filter(salesperson=user)
+
+        client = get_object_or_404(client_qs, id=client_id)
+
+        deals = ClientDeal.objects.filter(company=company, client=client).prefetch_related("installments")
+
+        debt_amount = Decimal("0.00")
+        debt_count = 0
+
+        prepayment_amount = Decimal("0.00")
+        prepayment_count = 0
+
+        sale_amount = Decimal("0.00")
+        sale_count = 0
+
+        for d in deals:
+            kind = d.kind
+            if kind == ClientDeal.Kind.DEBT:
+                debt_count += 1
+                debt_amount += d.remaining_debt
+                if d.prepayment and d.prepayment > Decimal("0.00"):
+                    prepayment_amount += d.prepayment
+                    prepayment_count += 1
+            elif kind == ClientDeal.Kind.PREPAYMENT:
+                prepayment_count += 1
+                prepayment_amount += (d.amount or Decimal("0.00"))
+            else:
+                sale_count += 1
+                sale_amount += (d.amount or Decimal("0.00"))
+
+        debt_amount = max(Decimal("0.00"), debt_amount).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        prepayment_amount = max(Decimal("0.00"), prepayment_amount).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        sale_amount = max(Decimal("0.00"), sale_amount).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+        return Response({
+            "debt": {"amount": str(debt_amount), "count": debt_count},
+            "prepayment": {"amount": str(prepayment_amount), "count": prepayment_count},
+            "sale": {"amount": str(sale_amount), "count": sale_count},
+        }, status=status.HTTP_200_OK)
+
+
 class ClientDealListCreateAPIView(CompanyBranchRestrictedMixin, generics.ListCreateAPIView):
     """
       GET  /api/main/deals/
@@ -3770,6 +3836,387 @@ class SupplierProductsListAPIView(CompanyBranchRestrictedMixin, generics.ListAPI
         return prod_qs.filter(Q(suppliers=supplier) | Q(client_id=supplier.id)).distinct()
 
 
+class SupplierRecommendationsAPIView(CompanyBranchRestrictedMixin, APIView):
+    """
+    GET /api/main/suppliers/<uuid:supplier_id>/recommendations/
+    Маркет — Рекомендуемый заказ
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request, supplier_id, *args, **kwargs):
+        import math
+        from datetime import timedelta
+
+        qp = request.query_params
+
+        # 1. Валидация параметров
+        raw_analysis_days = qp.get("analysis_days", "30")
+        try:
+            analysis_days = int(raw_analysis_days)
+            if analysis_days not in (7, 14, 30):
+                return Response(
+                    {"detail": "analysis_days должен быть 7, 14 или 30."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+        except (ValueError, TypeError):
+            return Response(
+                {"detail": "Некорректное значение analysis_days."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        raw_coverage_days = qp.get("coverage_days", "7")
+        try:
+            coverage_days = int(raw_coverage_days)
+            if coverage_days < 0:
+                return Response(
+                    {"detail": "coverage_days не может быть отрицательным."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+        except (ValueError, TypeError):
+            return Response(
+                {"detail": "Некорректное значение coverage_days."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        raw_safety_days = qp.get("safety_days", "2")
+        try:
+            safety_days = int(raw_safety_days)
+            if safety_days < 0:
+                return Response(
+                    {"detail": "safety_days не может быть отрицательным."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+        except (ValueError, TypeError):
+            return Response(
+                {"detail": "Некорректное значение safety_days."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        raw_page_size = qp.get("page_size", "500")
+        try:
+            page_size = int(raw_page_size)
+            if page_size <= 0:
+                page_size = 500
+            elif page_size > 500:
+                return Response(
+                    {"detail": "page_size не может быть больше 500."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+        except (ValueError, TypeError):
+            return Response(
+                {"detail": "Некорректное значение page_size."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        raw_page = qp.get("page", "1")
+        try:
+            page = int(raw_page)
+            if page <= 0:
+                page = 1
+        except (ValueError, TypeError):
+            page = 1
+
+        search = (qp.get("search") or "").strip()
+        only_required = (qp.get("only_required") or "").strip().lower() in ("true", "1")
+        stock_status_filter = (qp.get("stock_status") or "").strip().lower()
+        if stock_status_filter and stock_status_filter not in ("critical", "ending", "low", "ok"):
+            return Response(
+                {"detail": "stock_status должен быть одним из: critical, ending, low, ok."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        # 2. Поставщик и компания
+        sup_qs = self._filter_qs_company_branch(Client.objects.all())
+        supplier = get_object_or_404(sup_qs, id=supplier_id, type=Client.StatusClient.SUPPLIERS)
+        company = self._company()
+
+        # 3. Товары поставщика
+        prod_qs = self._filter_qs_company_branch(Product.objects.all())
+        prod_qs = prod_qs.filter(
+            Q(suppliers=supplier) | Q(client_id=supplier.id)
+        ).exclude(kind=Product.Kind.SERVICE).distinct()
+
+        if search:
+            prod_qs = prod_qs.filter(
+                Q(name__icontains=search)
+                | Q(barcode__icontains=search)
+                | Q(article__icontains=search)
+                | Q(code__icontains=search)
+            )
+
+        all_products = list(prod_qs)
+        product_ids = [p.id for p in all_products]
+
+        # 4. Временные окна (Asia/Bishkek, UTC+6)
+        try:
+            import zoneinfo
+            tz = zoneinfo.ZoneInfo("Asia/Bishkek")
+        except Exception:
+            import datetime as dt
+            tz = dt.timezone(dt.timedelta(hours=6))
+
+        now_local = datetime.now(tz)
+        today_local = now_local.date()
+
+        def get_window(days_count, offset_days=0):
+            end_date = today_local - timedelta(days=offset_days)
+            start_date = end_date - timedelta(days=days_count - 1)
+            start_dt = datetime.combine(start_date, datetime.min.time(), tzinfo=tz)
+            end_dt = datetime.combine(end_date, datetime.max.time(), tzinfo=tz)
+            return start_dt, end_dt
+
+        cur_7_start, cur_7_end = get_window(7, 0)
+        cur_14_start, cur_14_end = get_window(14, 0)
+        cur_30_start, cur_30_end = get_window(30, 0)
+
+        prev_7_start, prev_7_end = get_window(7, 7)
+        prev_14_start, prev_14_end = get_window(14, 14)
+        prev_30_start, prev_30_end = get_window(30, 30)
+
+        max_past_start = prev_30_start
+
+        # 5. Агрегация продаж
+        sales_agg = {}
+        if product_ids:
+            sale_items = SaleItem.objects.filter(
+                product_id__in=product_ids,
+                sale__status__in=[Sale.Status.PAID, Sale.Status.DEBT],
+            )
+            if company:
+                sale_items = sale_items.filter(sale__company=company)
+
+            branch_id_param = qp.get("branch_id")
+            if branch_id_param:
+                sale_items = sale_items.filter(sale__branch_id=branch_id_param)
+
+            sale_items = sale_items.annotate(
+                sale_time=Coalesce("sale__paid_at", "sale__created_at"),
+                eff_qty=Case(
+                    When(
+                        sale_package__isnull=False,
+                        sale_package__quantity_in_package__gt=0,
+                        then=ExpressionWrapper(
+                            F("quantity") / F("sale_package__quantity_in_package"),
+                            output_field=DecimalField(max_digits=12, decimal_places=3),
+                        ),
+                    ),
+                    default=F("quantity"),
+                    output_field=DecimalField(max_digits=12, decimal_places=3),
+                ),
+            ).filter(sale_time__gte=max_past_start)
+
+            agg_qs = sale_items.values("product_id").annotate(
+                cur_7=Sum(Case(When(sale_time__gte=cur_7_start, sale_time__lte=cur_7_end, then=F("eff_qty")), default=V(0), output_field=DecimalField())),
+                cur_14=Sum(Case(When(sale_time__gte=cur_14_start, sale_time__lte=cur_14_end, then=F("eff_qty")), default=V(0), output_field=DecimalField())),
+                cur_30=Sum(Case(When(sale_time__gte=cur_30_start, sale_time__lte=cur_30_end, then=F("eff_qty")), default=V(0), output_field=DecimalField())),
+                prev_7=Sum(Case(When(sale_time__gte=prev_7_start, sale_time__lte=prev_7_end, then=F("eff_qty")), default=V(0), output_field=DecimalField())),
+                prev_14=Sum(Case(When(sale_time__gte=prev_14_start, sale_time__lte=prev_14_end, then=F("eff_qty")), default=V(0), output_field=DecimalField())),
+                prev_30=Sum(Case(When(sale_time__gte=prev_30_start, sale_time__lte=prev_30_end, then=F("eff_qty")), default=V(0), output_field=DecimalField())),
+            )
+
+            for row in agg_qs:
+                sales_agg[row["product_id"]] = {
+                    "last_7_days": float(row["cur_7"] or 0),
+                    "last_14_days": float(row["cur_14"] or 0),
+                    "last_30_days": float(row["cur_30"] or 0),
+                    "previous_7_days": float(row["prev_7"] or 0),
+                    "previous_14_days": float(row["prev_14"] or 0),
+                    "previous_30_days": float(row["prev_30"] or 0),
+                }
+
+        # 6. Упаковки
+        pack_size_map = {}
+        if product_ids:
+            pkgs = ProductPackage.objects.filter(product_id__in=product_ids, quantity_in_package__gt=1)
+            for pkg in pkgs:
+                if pkg.product_id not in pack_size_map:
+                    pack_size_map[pkg.product_id] = float(pkg.quantity_in_package)
+
+        # 7. Последняя закупка
+        last_purchase_map = {}
+        if product_ids:
+            rcpt_items = (
+                SupplierReceiptItem.objects.filter(
+                    receipt__supplier=supplier,
+                    product_id__in=product_ids,
+                )
+                .select_related("receipt")
+                .order_by("product_id", "-receipt__created_at")
+            )
+            if company:
+                rcpt_items = rcpt_items.filter(receipt__company=company)
+
+            for item in rcpt_items:
+                if item.product_id not in last_purchase_map:
+                    last_purchase_map[item.product_id] = {
+                        "date": item.receipt.created_at.isoformat() if item.receipt and item.receipt.created_at else None,
+                        "quantity": float(item.qty or 0),
+                        "purchase_price": float(item.purchase_price) if item.purchase_price is not None else None,
+                    }
+
+        # 8. Формирование строк рекомендации
+        items_result = []
+        recommended_products_count = 0
+        critical_products_count = 0
+        estimated_total_sum = Decimal("0")
+        has_estimated_total_price = False
+
+        for prod in all_products:
+            p_id = prod.id
+            s_data = sales_agg.get(p_id, {
+                "last_7_days": 0.0,
+                "last_14_days": 0.0,
+                "last_30_days": 0.0,
+                "previous_7_days": 0.0,
+                "previous_14_days": 0.0,
+                "previous_30_days": 0.0,
+            })
+
+            cur_sales = s_data.get(f"last_{analysis_days}_days", 0.0)
+            prev_sales = s_data.get(f"previous_{analysis_days}_days", 0.0)
+
+            avg_per_day = (cur_sales / analysis_days) if analysis_days > 0 else 0.0
+
+            if prev_sales == 0 and cur_sales == 0:
+                trend_percent = 0.0
+            elif prev_sales == 0 and cur_sales > 0:
+                trend_percent = None
+            else:
+                trend_percent = round(((cur_sales - prev_sales) / prev_sales) * 100, 2)
+
+            sales_payload = {
+                "last_7_days": s_data["last_7_days"],
+                "last_14_days": s_data["last_14_days"],
+                "last_30_days": s_data["last_30_days"],
+                "previous_7_days": s_data["previous_7_days"],
+                "previous_14_days": s_data["previous_14_days"],
+                "previous_30_days": s_data["previous_30_days"],
+                "previous_period": prev_sales,
+                "average_per_day": round(avg_per_day, 2),
+                "trend_percent": trend_percent,
+            }
+
+            stock = float(max(Decimal("0"), prod.quantity or Decimal("0")))
+
+            if avg_per_day <= 0:
+                days_remaining = None
+            else:
+                days_remaining = round(stock / avg_per_day, 2)
+
+            req_stock = avg_per_day * (coverage_days + safety_days)
+            raw_rec = max(0.0, req_stock - stock)
+
+            is_weight = bool(prod.is_weight)
+            pack_size = pack_size_map.get(p_id)
+
+            if is_weight:
+                rec_qty = round(raw_rec, 3)
+            else:
+                raw_ceil = math.ceil(raw_rec)
+                if pack_size and pack_size > 1:
+                    rec_qty = math.ceil(raw_rec / pack_size) * pack_size
+                else:
+                    rec_qty = raw_ceil
+
+            if stock <= 0:
+                st_status = "critical"
+            elif avg_per_day <= 0:
+                st_status = "ok"
+            elif days_remaining is not None and days_remaining < 2:
+                st_status = "critical"
+            elif days_remaining is not None and days_remaining < 4:
+                st_status = "ending"
+            elif rec_qty > 0:
+                st_status = "low"
+            else:
+                st_status = "ok"
+
+            if st_status == "critical":
+                critical_products_count += 1
+
+            p_price = float(prod.purchase_price) if prod.purchase_price is not None else None
+
+            if rec_qty > 0:
+                recommended_products_count += 1
+                if p_price is not None and p_price > 0:
+                    estimated_total_sum += Decimal(str(rec_qty)) * Decimal(str(p_price))
+                    has_estimated_total_price = True
+
+            last_pur = last_purchase_map.get(p_id)
+
+            row_data = {
+                "product_id": str(p_id),
+                "product_name": prod.name,
+                "barcode": prod.barcode or None,
+                "article": prod.article or None,
+                "code": prod.code or None,
+                "unit": prod.unit or "шт",
+                "is_weight": is_weight,
+                "scale_type": "weight" if is_weight else "piece",
+                "current_stock": stock,
+                "purchase_price": p_price,
+                "pack_size": pack_size,
+                "sales": sales_payload,
+                "stock_forecast": {
+                    "days_remaining": days_remaining,
+                    "status": st_status,
+                },
+                "last_purchase": last_pur,
+                "recommended_quantity": rec_qty,
+            }
+
+            if only_required and rec_qty <= 0:
+                continue
+            if stock_status_filter and st_status != stock_status_filter:
+                continue
+
+            items_result.append(row_data)
+
+        # 9. Пагинация
+        total_count = len(items_result)
+        start_idx = (page - 1) * page_size
+        end_idx = start_idx + page_size
+        paginated_results = items_result[start_idx:end_idx]
+
+        base_url = request.build_absolute_uri(request.path)
+        def make_page_url(p_num):
+            params = request.query_params.copy()
+            params["page"] = str(p_num)
+            return f"{base_url}?{params.urlencode()}"
+
+        next_url = make_page_url(page + 1) if end_idx < total_count else None
+        prev_url = make_page_url(page - 1) if page > 1 and start_idx < total_count else None
+
+        estimated_total = float(estimated_total_sum) if has_estimated_total_price else None
+        supplier_name = supplier.full_name or supplier.llc or str(supplier)
+
+        response_data = {
+            "supplier": {
+                "id": str(supplier.id),
+                "name": supplier_name,
+            },
+            "settings": {
+                "analysis_days": analysis_days,
+                "coverage_days": coverage_days,
+                "safety_days": safety_days,
+            },
+            "summary": {
+                "products_count": len(all_products),
+                "recommended_products_count": recommended_products_count,
+                "critical_products_count": critical_products_count,
+                "estimated_total": estimated_total,
+            },
+            "count": total_count,
+            "page": page,
+            "page_size": page_size,
+            "next": next_url,
+            "previous": prev_url,
+            "results": paginated_results,
+        }
+
+        return Response(response_data, status=status.HTTP_200_OK)
+
+
 class SupplierPurchasesListAPIView(CompanyBranchRestrictedMixin, generics.ListAPIView):
     """
     GET /api/main/suppliers/<uuid:supplier_id>/purchases/
@@ -4131,6 +4578,346 @@ class ProductPurchaseBatchListAPIView(CompanyBranchRestrictedMixin, generics.Lis
         return self.paginator.get_paginated_response(
             serializer.data, total_amount=total_amount
         )
+
+
+# ===========================
+#  Supplier Returns (Маркет: Возвраты поставщикам)
+# ===========================
+def _aggregate_supplier_returns_total_amount(qs):
+    sub_qs = SupplierReturnItem.objects.filter(supplier_return__in=qs)
+    expr = ExpressionWrapper(
+        F("qty") * Coalesce(F("purchase_price"), V(Decimal("0"), output_field=DecimalField(max_digits=11, decimal_places=3))),
+        output_field=DecimalField(max_digits=20, decimal_places=3),
+    )
+    total = sub_qs.aggregate(total=Sum(expr))["total"]
+    if total is None:
+        return Decimal("0.00")
+    return total.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+
+class SupplierReturnListAPIView(CompanyBranchRestrictedMixin, generics.ListAPIView):
+    """
+    GET /api/main/suppliers/returns/?page=1&limit=20&supplier_id=&date_from=&date_to=&reason=&search=&receipt_id=
+    Alias: GET /api/main/supplier-returns/
+    """
+
+    permission_classes = [permissions.IsAuthenticated]
+    serializer_class = SupplierReturnReadSerializer
+    pagination_class = SupplierReceiptLimitPagination
+
+    def get_queryset(self):
+        qs = SupplierReturn.objects.select_related("supplier", "receipt", "created_by", "company", "branch").prefetch_related("items", "items__product")
+        qs = self._filter_qs_company_branch(qs)
+
+        qp = self.request.query_params
+        supplier_id = (qp.get("supplier_id") or "").strip()
+        if supplier_id:
+            qs = qs.filter(supplier_id=supplier_id)
+
+        receipt_id = (qp.get("receipt_id") or "").strip()
+        if receipt_id:
+            qs = qs.filter(receipt_id=receipt_id)
+
+        reason = (qp.get("reason") or "").strip()
+        if reason:
+            qs = qs.filter(reason=reason)
+
+        df_raw = (qp.get("date_from") or "").strip()
+        dt_raw = (qp.get("date_to") or "").strip()
+        df = parse_date(df_raw) if df_raw else None
+        dt = parse_date(dt_raw) if dt_raw else None
+        if df:
+            qs = qs.filter(created_at__date__gte=df)
+        if dt:
+            qs = qs.filter(created_at__date__lte=dt)
+
+        search = (qp.get("search") or "").strip()
+        if search:
+            qs = qs.filter(
+                Q(supplier__full_name__icontains=search)
+                | Q(supplier__name__icontains=search)
+                | Q(comment__icontains=search)
+                | Q(items__product__name__icontains=search)
+                | Q(items__product__code__icontains=search)
+                | Q(items__product__barcode__icontains=search)
+            ).distinct()
+
+        return qs
+
+    def list(self, request, *args, **kwargs):
+        queryset = self.filter_queryset(self.get_queryset())
+        total_amount = _aggregate_supplier_returns_total_amount(queryset)
+
+        page = self.paginate_queryset(queryset)
+        serializer = self.get_serializer(page, many=True)
+        return self.paginator.get_paginated_response(serializer.data, total_amount=total_amount)
+
+
+class SupplierReturnRetrieveAPIView(CompanyBranchRestrictedMixin, generics.RetrieveAPIView):
+    """
+    GET /api/main/suppliers/returns/<uuid:pk>/
+    Alias: GET /api/main/supplier-returns/<uuid:pk>/
+    """
+
+    permission_classes = [permissions.IsAuthenticated]
+    serializer_class = SupplierReturnReadSerializer
+    lookup_url_kwarg = "pk"
+
+    def get_queryset(self):
+        qs = SupplierReturn.objects.select_related("supplier", "receipt", "created_by", "company", "branch").prefetch_related("items", "items__product")
+        return self._filter_qs_company_branch(qs)
+
+    def retrieve(self, request, *args, **kwargs):
+        instance = self.get_object()
+        serializer = self.get_serializer(instance)
+        data = serializer.data
+        data["lines"] = data.get("items") or []
+        return Response(data)
+
+
+class SupplierReturnCreateAPIView(CompanyBranchRestrictedMixin, APIView):
+    """
+    POST /api/main/suppliers/<uuid:supplier_id>/returns/
+    POST /api/main/suppliers/returns/
+    """
+
+    permission_classes = [permissions.IsAuthenticated]
+
+    @transaction.atomic
+    def post(self, request, supplier_id=None):
+        company = self._company()
+        branch = self._auto_branch()
+
+        sup_id = supplier_id or request.data.get("supplier_id") or request.data.get("supplierId")
+        if not sup_id:
+            return Response({"detail": "Укажите поставщика."}, status=status.HTTP_400_BAD_REQUEST)
+
+        sup_qs = self._filter_qs_company_branch(Client.objects.all())
+        supplier = get_object_or_404(sup_qs, id=sup_id, type=Client.StatusClient.SUPPLIERS)
+
+        ser = SupplierReturnCreateSerializer(data=request.data)
+        if not ser.is_valid():
+            return Response(ser.errors, status=status.HTTP_400_BAD_REQUEST)
+
+        vdata = ser.validated_data
+        receipt_id = vdata.get("receipt_id")
+        receipt = None
+        if receipt_id:
+            rc_qs = self._filter_qs_company_branch(SupplierReceipt.objects.all())
+            receipt = rc_qs.filter(id=receipt_id, supplier=supplier).first()
+            if not receipt:
+                return Response({"detail": "Оприходование не найдено или принадлежит другому поставщику."}, status=status.HTTP_400_BAD_REQUEST)
+
+        items_data = vdata["items"]
+        product_ids = [it["product_id"] for it in items_data]
+
+        prod_qs = self._filter_qs_company_branch(Product.objects.all()).select_for_update()
+        products = {p.id: p for p in prod_qs.filter(id__in=product_ids)}
+
+        missing = [str(pid) for pid in product_ids if pid not in products]
+        if missing:
+            return Response({"detail": f"Товары не найдены: {', '.join(missing)}"}, status=status.HTTP_400_BAD_REQUEST)
+
+        # Валидация позиций
+        total_return_amount = Decimal("0.00")
+        validated_lines = []
+
+        for item in items_data:
+            product = products[item["product_id"]]
+            qty = Decimal(str(item["qty"]))
+            if qty <= Decimal("0"):
+                return Response({"detail": "Количество должно быть больше 0."}, status=status.HTTP_400_BAD_REQUEST)
+
+            # Для штучных товаров проверяем целое число
+            is_weight = getattr(product, "is_weight", False) or getattr(product, "scale_type", None) == "weight"
+            if not is_weight and qty % Decimal("1") != Decimal("0"):
+                return Response({"detail": f"Для штучного товара '{product.name}' количество должно быть целым числом."}, status=status.HTTP_400_BAD_REQUEST)
+
+            # Проверка складского остатка
+            current_stock = Decimal(str(product.quantity or 0))
+            if qty > current_stock:
+                return Response(
+                    {"detail": f"Нельзя вернуть больше остатка по товару '{product.name}' (доступно: {current_stock}, запрошено: {qty})."},
+                    status=status.HTTP_409_CONFLICT,
+                )
+
+            receipt_item = None
+            r_item_id = item.get("receipt_item_id")
+            if r_item_id:
+                receipt_item = SupplierReceiptItem.objects.filter(id=r_item_id, receipt__supplier=supplier).first()
+                if not receipt_item:
+                    return Response({"detail": f"Строка оприходования '{r_item_id}' не найдена."}, status=status.HTTP_400_BAD_REQUEST)
+
+            # Проверка лимита возврата по приходу
+            if receipt_item:
+                purchased_qty = Decimal(str(receipt_item.qty))
+                already_ret = SupplierReturnItem.objects.filter(
+                    receipt_item=receipt_item, supplier_return__status="posted"
+                ).aggregate(s=Sum("qty"))["s"] or Decimal("0")
+                returnable = max(Decimal("0"), purchased_qty - already_ret)
+                if qty > returnable:
+                    return Response(
+                        {"detail": f"По товару '{product.name}' уже возвращено {already_ret} из {purchased_qty}. Максимум к возврату по приходу: {returnable}."},
+                        status=status.HTTP_409_CONFLICT,
+                    )
+
+            price = item.get("purchase_price")
+            if price is None:
+                if receipt_item and receipt_item.purchase_price is not None:
+                    price = receipt_item.purchase_price
+                else:
+                    price = product.purchase_price or Decimal("0.00")
+            else:
+                price = Decimal(str(price))
+
+            line_sum = qty * price
+            total_return_amount += line_sum
+
+            validated_lines.append({
+                "product": product,
+                "receipt_item": receipt_item,
+                "qty": qty,
+                "purchase_price": price,
+            })
+
+        compensation = vdata["compensation"]
+        cashbox = None
+
+        if compensation == SupplierReturn.Compensation.CASH and total_return_amount > Decimal("0"):
+            cashbox_id = vdata.get("cashbox_id")
+            if not cashbox_id:
+                cashbox = Cashbox.objects.filter(company=company, branch=branch).order_by("-created_at").first() or Cashbox.objects.filter(company=company).order_by("-created_at").first()
+                if not cashbox:
+                    return Response({"detail": "Для компенсации наличными требуется указать кассу."}, status=status.HTTP_400_BAD_REQUEST)
+            else:
+                cashbox = Cashbox.objects.filter(id=cashbox_id, company=company).first()
+                if not cashbox:
+                    return Response({"detail": "Касса не найдена."}, status=status.HTTP_400_BAD_REQUEST)
+
+        # Создаем документ возврата
+        sup_return = SupplierReturn.objects.create(
+            company=company,
+            branch=branch,
+            supplier=supplier,
+            receipt=receipt,
+            created_by=request.user,
+            reason=vdata["reason"],
+            comment=vdata.get("comment", ""),
+            compensation=compensation,
+            cashbox=cashbox,
+            status=SupplierReturn.Status.POSTED,
+        )
+
+        # Создаем строки возврата и списываем остаток
+        return_items = []
+        for line in validated_lines:
+            p = line["product"]
+            q = line["qty"]
+            Product.objects.filter(id=p.id).update(quantity=F("quantity") - q)
+
+            return_items.append(
+                SupplierReturnItem(
+                    supplier_return=sup_return,
+                    product=p,
+                    receipt_item=line["receipt_item"],
+                    qty=q,
+                    purchase_price=line["purchase_price"],
+                )
+            )
+
+        SupplierReturnItem.objects.bulk_create(return_items)
+
+        # Проводка денежных средств
+        if compensation == SupplierReturn.Compensation.CASH and cashbox and total_return_amount > Decimal("0"):
+            try:
+                TransactionRecord.objects.create(
+                    company=company,
+                    branch=branch,
+                    cashbox=cashbox,
+                    type=TransactionRecord.Type.INCOME if hasattr(TransactionRecord, "Type") else "income",
+                    amount=total_return_amount,
+                    note=f"Возврат поставщику: {supplier.full_name}",
+                    created_by=request.user,
+                )
+            except Exception:
+                pass
+        elif compensation == SupplierReturn.Compensation.DEBT_OFFSET and total_return_amount > Decimal("0"):
+            try:
+                deal = ClientDeal.objects.filter(company=company, client=supplier, kind=ClientDeal.Kind.DEBT).order_by("-created_at").first()
+                if deal:
+                    new_pre = (deal.prepayment or Decimal("0")) + total_return_amount
+                    deal.prepayment = min(deal.amount, new_pre)
+                    deal.save(update_fields=["prepayment"])
+            except Exception:
+                pass
+
+        resp_serializer = SupplierReturnReadSerializer(sup_return, context={"request": request})
+        return Response(resp_serializer.data, status=status.HTTP_201_CREATED)
+
+
+# ===========================
+#  Product Form Layout (Маркет: Раскладка формы товара)
+# ===========================
+ALLOWED_PRODUCT_FORM_LAYOUT_FIELDS = {
+    "code", "barcode", "alternateBarcodes", "article", "hotkey", "images",
+    "category", "brand",
+    "unit", "pieceSale", "weight", "adult", "packaging",
+    "markup", "wholesale", "discount",
+    "supplier", "debt", "minStock", "country", "expiry",
+    "promotion", "characteristics", "description", "plu"
+}
+
+
+class ProductFormLayoutAPIView(CompanyBranchRestrictedMixin, APIView):
+    """
+    GET /api/main/products/form-layout/ — прочитать раскладку компании
+    PATCH /api/main/products/form-layout/ — сохранить раскладку (owner/admin)
+    """
+
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request, *args, **kwargs):
+        company = self._company()
+        if not company:
+            return Response({"detail": "Компания не найдена."}, status=status.HTTP_400_BAD_REQUEST)
+
+        layout = MarketProductFormLayout.objects.filter(company=company).first()
+        hidden = layout.hidden if (layout and isinstance(layout.hidden, list)) else []
+        updated_at = layout.updated_at.isoformat() if (layout and layout.updated_at) else None
+
+        return Response({"hidden": hidden, "updated_at": updated_at}, status=status.HTTP_200_OK)
+
+    def patch(self, request, *args, **kwargs):
+        company = self._company()
+        if not company:
+            return Response({"detail": "Компания не найдена."}, status=status.HTTP_400_BAD_REQUEST)
+
+        is_admin = getattr(request.user, "role", None) in ["owner", "admin"]
+        if not is_admin:
+            return Response({"detail": "Недостаточно прав. Настройка формы доступна только администраторам и владельцу."}, status=status.HTTP_403_FORBIDDEN)
+
+        hidden_raw = request.data.get("hidden")
+        if hidden_raw is None or not isinstance(hidden_raw, list):
+            return Response({"hidden": ["Поле 'hidden' должно быть массивом строк."]}, status=status.HTTP_400_BAD_REQUEST)
+
+        normalized_hidden = []
+        seen = set()
+        for item in hidden_raw:
+            if isinstance(item, str):
+                item_str = item.strip()
+                if item_str in ALLOWED_PRODUCT_FORM_LAYOUT_FIELDS and item_str not in seen:
+                    seen.add(item_str)
+                    normalized_hidden.append(item_str)
+
+        layout, _ = MarketProductFormLayout.objects.get_or_create(company=company)
+        layout.hidden = normalized_hidden
+        layout.updated_by = request.user
+        layout.save()
+
+        return Response({
+            "hidden": layout.hidden,
+            "updated_at": layout.updated_at.isoformat() if layout.updated_at else None,
+        }, status=status.HTTP_200_OK)
 
 
 # ===========================

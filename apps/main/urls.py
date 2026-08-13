@@ -103,6 +103,7 @@ urlpatterns = [
     path('products/barcode/<str:barcode>/', ProductByBarcodeAPIView.as_view(), name='product-by-barcode'),
     path('products/warehouse-barcode/<str:barcode>/', ProductWarehouseBarcodeAPIView.as_view(), name='product-warehouse-barcode'),
     path('products/global-barcode/<str:barcode>/', ProductByGlobalBarcodeAPIView.as_view(), name='product-by-barcode'),
+    path('products/form-layout/', ProductFormLayoutAPIView.as_view(), name='product-form-layout'),
     
     #photo
     path("products/<uuid:product_id>/images/",
@@ -155,6 +156,11 @@ urlpatterns = [
         "clients/<uuid:client_id>/agent-analytics/",
         ClientAgentAnalyticsAPIView.as_view(),
         name="client-agent-analytics",
+    ),
+    path(
+        "clients/<uuid:client_id>/kpis/",
+        ClientKPIsAPIView.as_view(),
+        name="client-kpis",
     ),
     path(
         "clients/<uuid:client_id>/deals/",
@@ -277,10 +283,15 @@ urlpatterns = [
     path("suppliers/", SupplierListAPIView.as_view(), name="supplier-list"),
     path("suppliers/receipts/", SupplierReceiptListAPIView.as_view(), name="supplier-receipts"),
     path("suppliers/receipts/<uuid:pk>/", SupplierReceiptRetrieveAPIView.as_view(), name="supplier-receipt-detail"),
+    path("suppliers/returns/", SupplierReturnListAPIView.as_view(), name="supplier-returns-list"),
+    path("suppliers/returns/<uuid:pk>/", SupplierReturnRetrieveAPIView.as_view(), name="supplier-returns-detail"),
+    path("suppliers/<uuid:supplier_id>/returns/", SupplierReturnCreateAPIView.as_view(), name="supplier-returns-create"),
+    path("supplier-returns/", SupplierReturnListAPIView.as_view(), name="supplier-returns-list-alias"),
+    path("supplier-returns/<uuid:pk>/", SupplierReturnRetrieveAPIView.as_view(), name="supplier-returns-detail-alias"),
     path("suppliers/<uuid:supplier_id>/products/", SupplierProductsListAPIView.as_view(), name="supplier-products"),
     path("suppliers/<uuid:supplier_id>/purchases/", SupplierPurchasesListAPIView.as_view(), name="supplier-purchases"),
     path("suppliers/<uuid:supplier_id>/receipt/", SupplierReceiptAPIView.as_view(), name="supplier-receipt"),
-    
+    path("suppliers/<uuid:supplier_id>/recommendations/", SupplierRecommendationsAPIView.as_view(), name="supplier-recommendations"),
     
     path("subreals/", ManufactureSubrealListCreateAPIView.as_view(), name="subreal-list-create"),
     path("subreals/<uuid:pk>/", ManufactureSubrealRetrieveUpdateDestroyAPIView.as_view(), name="subreal-detail"),

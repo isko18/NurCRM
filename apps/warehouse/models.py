@@ -354,6 +354,12 @@ class WarehouseProduct(BaseModelId, BaseModelDate, BaseModelCompanyBranch):
         default=False,
         help_text="Если товар продаётся по весу (обычно кг).",
     )
+    is_adult = models.BooleanField(
+        "Товар 18+",
+        default=False,
+        help_text="Флаг 18+ для товаров (алкоголь, табак и т.д.).",
+    )
+
 
     quantity = models.DecimalField(
         "Количество",

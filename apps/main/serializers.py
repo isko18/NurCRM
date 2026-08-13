@@ -1,7 +1,8 @@
 from rest_framework import serializers
 from django.db import transaction
+from django.core.exceptions import ValidationError as DjangoValidationError
 from django.utils import timezone
-from django.db.models import Q, Sum, Value as V, Prefetch, ProtectedError
+from django.db.models import Q, Sum, F, ExpressionWrapper, DecimalField, Value as V, Prefetch, ProtectedError
 from django.db.models.functions import Coalesce
 from decimal import Decimal, ROUND_HALF_UP, InvalidOperation
 from typing import Any, Dict, List
@@ -21,6 +22,7 @@ from apps.main.models import (
     ProductPackage, ProductCharacteristics, DealPayment, AgentSaleAllocation,
     ProductRecipeItem, ProductPromotionTier, ProductAlternateBarcode, MarketSaleEmployeePayProfile,
     SupplierReceipt, SupplierReceiptItem,
+    SupplierReturn, SupplierReturnItem,
     KnowledgeBaseCourse, KnowledgeBaseLesson,
     FinishedToRawTransfer,
     Inventory, InventoryItem,
@@ -990,6 +992,7 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
 
     unit = serializers.CharField(required=False, allow_blank=True)
     is_weight = serializers.BooleanField(required=False)
+    is_adult = serializers.BooleanField(required=False, default=False)
 
     # allow_null=True чтобы PATCH мог "очищать" значения
     purchase_price = serializers.DecimalField(
@@ -1062,7 +1065,7 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
             "name", "description", "barcode",
             "brand", "brand_name",
             "category", "category_name",
-            "unit", "is_weight",
+            "unit", "is_weight", "is_adult",
             "item_make", "item_make_ids",
             "recipe",
             "quantity",
@@ -1115,6 +1118,7 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
             "quantity": {"required": False, "default": 0},
             "unit": {"required": False, "default": "шт."},
             "is_weight": {"required": False, "default": False},
+            "is_adult": {"required": False, "default": False},
             "price": {"required": False, "allow_null": True},
             "description": {"required": False, "allow_blank": True, "allow_null": True},
         }
@@ -1459,6 +1463,7 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
         article = (validated_data.pop("article", "") or "").strip()
         unit = (validated_data.pop("unit", None) or "шт.").strip()
         is_weight = validated_data.pop("is_weight", False)
+        is_adult = validated_data.pop("is_adult", False)
 
         description = (validated_data.pop("description", "") or "").strip()
 
@@ -1518,6 +1523,7 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
             description=description,
             unit=unit,
             is_weight=is_weight,
+            is_adult=is_adult,
 
             purchase_price=purchase_price,
             markup_percent=markup_percent,
@@ -1654,6 +1660,7 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
             "article",
             "unit",
             "is_weight",
+            "is_adult",
             "plu",
             "country",
             "expiration_date",
@@ -1776,13 +1783,26 @@ class NotificationSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerial
     branch = serializers.ReadOnlyField(source='branch.id')
     actor_name = serializers.SerializerMethodField()
 
+    body = serializers.CharField(source='message', read_only=True)
+    cta_url = serializers.CharField(source='url', read_only=True)
+    cta_label = serializers.SerializerMethodField()
+    meta = serializers.JSONField(source='data', read_only=True)
+
     class Meta:
         model = Notification
         fields = [
-            'id', 'company', 'branch', 'category', 'type', 'title', 'message', 'url',
-            'level', 'is_read', 'actor_name', 'data', 'created_at',
+            'id', 'company', 'branch', 'category', 'type', 'title', 'message', 'body',
+            'url', 'cta_url', 'cta_label', 'level', 'is_read', 'actor_name',
+            'data', 'meta', 'created_at',
         ]
         read_only_fields = ['id', 'company', 'branch', 'actor_name', 'created_at']
+
+    def get_cta_label(self, obj):
+        if isinstance(obj.data, dict) and obj.data.get("cta_label"):
+            return obj.data.get("cta_label")
+        if obj.category == Notification.Category.TARIFF:
+            return "Продлить"
+        return ""
 
     def get_actor_name(self, obj):
         actor = getattr(obj, "actor", None)
@@ -1796,6 +1816,7 @@ class NotificationSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerial
         if user:
             validated_data.setdefault("user", user)
         return super().create(validated_data)
+
 
 
 # ===========================
@@ -2046,7 +2067,14 @@ class ClientDealSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializ
     daily_payment = serializers.DecimalField(max_digits=12, decimal_places=2, read_only=True)
     remaining_debt = serializers.DecimalField(max_digits=12, decimal_places=2, read_only=True)
 
-    installments = DealInstallmentSerializer(many=True, read_only=True)
+    schedule_version = serializers.CharField(required=False, default="v1")
+    debt_months = serializers.IntegerField(required=False, allow_null=True)
+    interval_days = serializers.IntegerField(required=False, default=1, allow_null=True)
+    interval_months = serializers.IntegerField(required=False, default=1, allow_null=True)
+    sale = serializers.PrimaryKeyRelatedField(queryset=Sale.objects.all(), required=False, allow_null=True)
+    sale_id = serializers.UUIDField(required=False, allow_null=True)
+
+    installments = serializers.JSONField(required=False, write_only=True)
     payments = DealPaymentSerializer(many=True, read_only=True)
 
     auto_schedule = serializers.BooleanField(required=False)
@@ -2058,7 +2086,8 @@ class ClientDealSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializ
             "client", "client_full_name",
             "title", "kind",
             "amount", "prepayment",
-            "debt_days", "first_due_date",
+            "debt_days", "debt_months", "interval_days", "interval_months",
+            "first_due_date", "schedule_version", "sale", "sale_id",
             "debt_amount", "daily_payment", "remaining_debt",
             "installments",
             "payments",
@@ -2070,8 +2099,15 @@ class ClientDealSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializ
             "created_at", "updated_at",
             "client_full_name",
             "debt_amount", "daily_payment", "remaining_debt",
-            "installments", "payments",
+            "payments",
         ]
+
+    def to_representation(self, instance):
+        ret = super().to_representation(instance)
+        ret["installments"] = DealInstallmentSerializer(
+            instance.installments.order_by("number"), many=True, context=self.context
+        ).data
+        return ret
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -2082,6 +2118,12 @@ class ClientDealSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializ
         _restrict_pk_queryset_strict(
             self.fields.get("client"),
             Client.objects.all(),
+            comp,
+            br,
+        )
+        _restrict_pk_queryset_strict(
+            self.fields.get("sale"),
+            Sale.objects.all(),
             comp,
             br,
         )
@@ -2110,6 +2152,21 @@ class ClientDealSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializ
             if branch is not None and client.branch_id not in (None, branch.id):
                 raise serializers.ValidationError({"client": "Клиент другого филиала."})
 
+        # проверка sale / sale_id
+        sale = attrs.get("sale")
+        sale_id = attrs.get("sale_id")
+        if sale_id and not sale:
+            try:
+                s_obj = Sale.objects.get(id=sale_id)
+                if company and s_obj.company_id != company.id:
+                    raise serializers.ValidationError({"sale_id": "Продажа принадлежит другой компании."})
+                attrs["sale"] = s_obj
+            except Sale.DoesNotExist:
+                raise serializers.ValidationError({"sale_id": "Указанная продажа не найдена."})
+        elif sale:
+            if company and sale.company_id != company.id:
+                raise serializers.ValidationError({"sale": "Продажа принадлежит другой компании."})
+
         # прод: если уже есть платежи — условия сделки нельзя менять
         if instance and instance.pk and instance.payments.exists():
             allowed = {"title", "note"}  # максимально безопасно
@@ -2126,6 +2183,13 @@ class ClientDealSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializ
         prepayment = attrs.get("prepayment", getattr(instance, "prepayment", None))
         kind = attrs.get("kind", getattr(instance, "kind", None))
         debt_days = attrs.get("debt_days", getattr(instance, "debt_days", None))
+        debt_months = attrs.get("debt_months", getattr(instance, "debt_months", None))
+
+        sch_ver = attrs.get("schedule_version") or (instance.schedule_version if instance else "v1")
+        if str(sch_ver).strip().lower() in ("v2", "2"):
+            attrs["schedule_version"] = "v2"
+        else:
+            attrs["schedule_version"] = "v1"
 
         errors = {}
 
@@ -2140,11 +2204,26 @@ class ClientDealSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializ
             debt_amt = (amount or Decimal("0")) - (prepayment or Decimal("0"))
             if debt_amt <= 0:
                 errors["prepayment"] = 'Для типа "Долг" сумма договора должна быть больше предоплаты.'
-            if not debt_days or debt_days <= 0:
-                errors["debt_days"] = "Укажите срок (в днях) для рассрочки."
+
+            if debt_days and debt_months:
+                errors["debt_months"] = "Нельзя одновременно указывать debt_days и debt_months."
+
+            if attrs["schedule_version"] == "v2":
+                if not debt_days and not debt_months:
+                    errors["debt_days"] = "Укажите количество платежей (debt_days или debt_months) для v2."
+
+                inst_input = attrs.get("installments")
+                if inst_input and isinstance(inst_input, (list, tuple)):
+                    sum_inst = sum(Decimal(str(item.get("amount", "0"))) for item in inst_input if isinstance(item, dict))
+                    if abs(sum_inst - debt_amt) > Decimal("0.05"):
+                        errors["installments"] = f"Сумма графика платежей ({sum_inst}) должна совпадать с остатком долга ({debt_amt})."
+            else:
+                if not debt_days or debt_days <= 0:
+                    errors["debt_days"] = "Укажите срок (в днях) для рассрочки."
         else:
             # не долг -> чистим всё, как в модели
             attrs["debt_days"] = None
+            attrs["debt_months"] = None
             attrs["first_due_date"] = None
             attrs["auto_schedule"] = False
 
@@ -2152,6 +2231,34 @@ class ClientDealSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializ
             raise serializers.ValidationError(errors)
 
         return attrs
+
+    def create(self, validated_data):
+        custom_inst = validated_data.pop("installments", None)
+        validated_data.pop("sale_id", None)
+        try:
+            instance = super().create(validated_data)
+        except DjangoValidationError as e:
+            msg = e.message_dict if hasattr(e, "message_dict") else (e.messages if hasattr(e, "messages") else str(e))
+            raise serializers.ValidationError(msg)
+
+        if custom_inst and isinstance(custom_inst, (list, tuple)):
+            instance._custom_installments = custom_inst
+            instance.rebuild_installments(custom_installments=custom_inst)
+        return instance
+
+    def update(self, instance, validated_data):
+        custom_inst = validated_data.pop("installments", None)
+        validated_data.pop("sale_id", None)
+        try:
+            instance = super().update(instance, validated_data)
+        except DjangoValidationError as e:
+            msg = e.message_dict if hasattr(e, "message_dict") else (e.messages if hasattr(e, "messages") else str(e))
+            raise serializers.ValidationError(msg)
+
+        if custom_inst and isinstance(custom_inst, (list, tuple)):
+            instance._custom_installments = custom_inst
+            instance.rebuild_installments(custom_installments=custom_inst)
+        return instance
 
 
 # ===== Inputs for pay/refund endpoints =====
@@ -2922,10 +3029,32 @@ class SupplierReceiptItemReadSerializer(serializers.ModelSerializer):
     product_id = serializers.UUIDField(source="product.id", read_only=True)
     product_name = serializers.CharField(source="product.name", read_only=True)
     product_code = serializers.CharField(source="product.code", read_only=True)
+    unit = serializers.CharField(source="product.unit", read_only=True, default="шт")
+    returned_qty = serializers.SerializerMethodField()
+    returnable_qty = serializers.SerializerMethodField()
 
     class Meta:
         model = SupplierReceiptItem
-        fields = ["id", "product", "product_id", "product_name", "product_code", "qty", "purchase_price"]
+        fields = [
+            "id", "product", "product_id", "product_name", "product_code",
+            "qty", "purchase_price", "returned_qty", "returnable_qty", "unit",
+        ]
+
+    def get_returned_qty(self, obj):
+        from apps.main.models import SupplierReturnItem
+        ret = SupplierReturnItem.objects.filter(receipt_item=obj, supplier_return__status="posted").aggregate(s=Sum("qty"))["s"]
+        if ret is None:
+            return "0"
+        return str(Decimal(str(ret)).quantize(Decimal("0.001"), rounding=ROUND_HALF_UP))
+
+    def get_returnable_qty(self, obj):
+        from apps.main.models import SupplierReturnItem
+        ret = SupplierReturnItem.objects.filter(receipt_item=obj, supplier_return__status="posted").aggregate(s=Sum("qty"))["s"] or Decimal("0")
+        purchased = Decimal(str(obj.qty))
+        stock = Decimal(str(getattr(obj.product, "quantity", 0) or 0))
+        rem = max(Decimal("0"), purchased - Decimal(str(ret)))
+        returnable = max(Decimal("0"), min(stock, rem))
+        return str(returnable.quantize(Decimal("0.001"), rounding=ROUND_HALF_UP))
 
 
 class SupplierReceiptReadSerializer(serializers.ModelSerializer):
@@ -2937,6 +3066,10 @@ class SupplierReceiptReadSerializer(serializers.ModelSerializer):
     created_by_name = serializers.SerializerMethodField()
     items = SupplierReceiptItemReadSerializer(many=True, read_only=True)
     total_amount = serializers.SerializerMethodField()
+    items_count = serializers.SerializerMethodField()
+    returned_amount = serializers.SerializerMethodField()
+    returned_qty = serializers.SerializerMethodField()
+    has_returns = serializers.SerializerMethodField()
 
     class Meta:
         model = SupplierReceipt
@@ -2951,15 +3084,19 @@ class SupplierReceiptReadSerializer(serializers.ModelSerializer):
             "created_by_id",
             "created_by_name",
             "created_at",
-            "items",
+            "items_count",
             "total_amount",
+            "returned_amount",
+            "returned_qty",
+            "has_returns",
+            "items",
         ]
 
     def get_created_by_name(self, obj):
         u = obj.created_by
         if u is None:
             return None
-        return getattr(u, "email", None)
+        return getattr(u, "first_name", None) or getattr(u, "email", None)
 
     def get_total_amount(self, obj):
         annotated = getattr(obj, "total_amount", None)
@@ -2973,6 +3110,128 @@ class SupplierReceiptReadSerializer(serializers.ModelSerializer):
             price = item.purchase_price if item.purchase_price is not None else Decimal("0")
             total += Decimal(str(item.qty)) * Decimal(str(price))
         return str(total.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
+
+    def get_items_count(self, obj):
+        return obj.items.count()
+
+    def get_returned_amount(self, obj):
+        from apps.main.models import SupplierReturnItem
+        qs = SupplierReturnItem.objects.filter(receipt_item__receipt=obj, supplier_return__status="posted")
+        expr = ExpressionWrapper(F("qty") * F("purchase_price"), output_field=DecimalField(max_digits=12, decimal_places=3))
+        res = qs.aggregate(s=Sum(expr))["s"]
+        if res is None:
+            return "0.00"
+        return str(Decimal(str(res)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
+
+    def get_returned_qty(self, obj):
+        from apps.main.models import SupplierReturnItem
+        res = SupplierReturnItem.objects.filter(receipt_item__receipt=obj, supplier_return__status="posted").aggregate(s=Sum("qty"))["s"]
+        if res is None:
+            return "0"
+        return str(Decimal(str(res)).quantize(Decimal("0.001"), rounding=ROUND_HALF_UP))
+
+    def get_has_returns(self, obj):
+        from apps.main.models import SupplierReturnItem
+        return SupplierReturnItem.objects.filter(receipt_item__receipt=obj, supplier_return__status="posted").exists()
+
+
+# ===========================
+#  Supplier Returns Serializers
+# ===========================
+class SupplierReturnItemReadSerializer(serializers.ModelSerializer):
+    product_id = serializers.UUIDField(source="product.id", read_only=True)
+    product_name = serializers.CharField(source="product.name", read_only=True)
+    product_code = serializers.CharField(source="product.code", read_only=True)
+    unit = serializers.CharField(source="product.unit", read_only=True, default="шт")
+    receipt_item_id = serializers.UUIDField(source="receipt_item.id", read_only=True, allow_null=True)
+    line_total = serializers.SerializerMethodField()
+
+    class Meta:
+        model = SupplierReturnItem
+        fields = [
+            "id", "product_id", "product_name", "product_code", "unit",
+            "qty", "purchase_price", "line_total", "receipt_item_id",
+        ]
+
+    def get_line_total(self, obj):
+        p = obj.purchase_price if obj.purchase_price is not None else Decimal("0")
+        tot = Decimal(str(obj.qty)) * Decimal(str(p))
+        return str(tot.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
+
+
+class SupplierReturnReadSerializer(serializers.ModelSerializer):
+    supplier_id = serializers.UUIDField(source="supplier.id", read_only=True)
+    supplier_name = serializers.CharField(source="supplier.full_name", read_only=True)
+    receipt_id = serializers.UUIDField(source="receipt.id", read_only=True, allow_null=True)
+    created_by_name = serializers.SerializerMethodField()
+    items_count = serializers.SerializerMethodField()
+    total_amount = serializers.SerializerMethodField()
+    items = SupplierReturnItemReadSerializer(many=True, read_only=True)
+
+    class Meta:
+        model = SupplierReturn
+        fields = [
+            "id", "supplier_id", "supplier_name", "receipt_id",
+            "created_at", "created_by_name", "reason", "comment",
+            "compensation", "status", "items_count", "total_amount",
+            "items",
+        ]
+
+    def to_representation(self, instance):
+        ret = super().to_representation(instance)
+        ret["uuid"] = ret["id"]
+        ret["supplierId"] = ret["supplier_id"]
+        ret["compensation_type"] = ret["compensation"]
+        ret["lines"] = ret["items"]
+        return ret
+
+    def get_created_by_name(self, obj):
+        u = obj.created_by
+        if u is None:
+            return None
+        return getattr(u, "first_name", None) or getattr(u, "email", None)
+
+    def get_items_count(self, obj):
+        return obj.items.count()
+
+    def get_total_amount(self, obj):
+        annotated = getattr(obj, "total_amount", None)
+        if annotated is not None:
+            return str(Decimal(str(annotated)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
+
+        total = Decimal("0")
+        for item in obj.items.all():
+            price = item.purchase_price if item.purchase_price is not None else Decimal("0")
+            total += Decimal(str(item.qty)) * Decimal(str(price))
+        return str(total.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
+
+
+class SupplierReturnCreateItemSerializer(serializers.Serializer):
+    product_id = serializers.UUIDField(required=True)
+    qty = serializers.DecimalField(max_digits=12, decimal_places=3, required=True)
+    purchase_price = serializers.DecimalField(max_digits=12, decimal_places=3, required=False, allow_null=True)
+    receipt_item_id = serializers.UUIDField(required=False, allow_null=True)
+
+
+class SupplierReturnCreateSerializer(serializers.Serializer):
+    receipt_id = serializers.UUIDField(required=False, allow_null=True)
+    reason = serializers.ChoiceField(choices=SupplierReturn.Reason.choices, required=True)
+    comment = serializers.CharField(required=False, allow_blank=True, default="")
+    compensation = serializers.ChoiceField(choices=SupplierReturn.Compensation.choices, required=True)
+    cashbox_id = serializers.UUIDField(required=False, allow_null=True)
+    items = SupplierReturnCreateItemSerializer(many=True, required=True)
+
+    def validate_items(self, items):
+        if not items:
+            raise serializers.ValidationError("Укажите хотя бы одну позицию.")
+        return items
+
+    def validate(self, attrs):
+        reason = attrs.get("reason")
+        comment = (attrs.get("comment") or "").strip()
+        if reason == SupplierReturn.Reason.OTHER and not comment:
+            raise serializers.ValidationError({"comment": "Укажите комментарий при выборе причины 'Другое'."})
+        return attrs
 
 
 class ProductPurchaseBatchSerializer(serializers.ModelSerializer):

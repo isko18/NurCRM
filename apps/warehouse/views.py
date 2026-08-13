@@ -918,6 +918,7 @@ class WarehouseBarcodeCheckAPIView(CompanyBranchRestrictedMixin, APIView):
                 "price": str(p.price or "0.00"),
                 "stock_qty": stock_qty,
                 "warehouse_id": str(p.warehouse_id),
+                "is_adult": bool(getattr(p, "is_adult", False)),
             }
 
         formatted_matches = [_format_product(p) for p in matches_catalog]

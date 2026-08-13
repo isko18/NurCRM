@@ -246,6 +246,15 @@ class Company(models.Model):
         blank=True,
         help_text="Слоты быстрых товаров F3+0..9: {\"0\": \"product_uuid\", ...}",
     )
+    debt_schedule_version = models.CharField(
+        "Версия графика отсрочки",
+        max_length=8,
+        default="v1",
+        choices=[("v1", "v1"), ("v2", "v2")],
+        blank=True,
+        null=True,
+        help_text="Версия графика рассрочки на кассе ('v1' или 'v2')",
+    )
 
     def ensure_scale_api_token(self):
         if not self.scale_api_token:

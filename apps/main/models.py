@@ -6,6 +6,7 @@ from django.core.validators import MinValueValidator, MaxValueValidator
 from decimal import Decimal, ROUND_HALF_UP
 from datetime import timedelta
 from dateutil.relativedelta import relativedelta
+from django.utils.dateparse import parse_date, parse_datetime
 from django.db import transaction, connection
 from django.db.models import Sum, F, Q, Max, IntegerField, Value, ExpressionWrapper, Case, When
 from mptt.models import MPTTModel, TreeForeignKey
@@ -738,6 +739,12 @@ class Product(models.Model):
         default=False,
         help_text="Если товар продаётся по весу (обычно кг)",
     )
+    is_adult = models.BooleanField(
+        "Товар 18+",
+        default=False,
+        help_text="Флаг 18+ для товаров (алкоголь, табак и т.д.)",
+    )
+
 
     quantity = models.DecimalField(
         "Количество/Остаток",
@@ -887,6 +894,8 @@ class Product(models.Model):
             models.Index(fields=["company", "barcode"], name="idx_product_company_barcode"),
             # Курсорная/стабильная пагинация «сначала новые» внутри компании.
             models.Index(fields=["company", "seq"], name="idx_product_company_seq"),
+            models.Index(fields=["company", "date"], name="idx_product_company_date"),
+            models.Index(fields=["company", "client"], name="idx_product_company_client"),
         ]
         constraints = [
             # ✅ штрихкод уникален в рамках компании, только если задан и не пустой
@@ -999,8 +1008,12 @@ class Product(models.Model):
         self.price = result.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
 
     def clean(self):
+        if self.kind != self.Kind.PRODUCT:
+            self.is_adult = False
+
         if self.branch_id and self.branch.company_id != self.company_id:
             raise ValidationError({"branch": "Филиал принадлежит другой компании."})
+
 
         for rel, name in [(self.brand, "brand"), (self.category, "category"), (self.client, "client")]:
             if rel and getattr(rel, "company_id", None) != self.company_id:
@@ -3156,6 +3169,133 @@ class SupplierReceiptItem(models.Model):
                 raise ValidationError({"product": "Товар не принадлежит выбранному поставщику."})
 
 
+class SupplierReturn(models.Model):
+    """
+    Документ возврата товара поставщику (Маркет).
+    """
+
+    class Reason(models.TextChoices):
+        DEFECT = "defect", "Брак"
+        SURPLUS = "surplus", "Излишек"
+        WRONG_ITEM = "wrong_item", "Ошибка поставки"
+        EXPIRED = "expired", "Просрочка"
+        OTHER = "other", "Другое"
+
+    class Compensation(models.TextChoices):
+        CASH = "cash", "Приход в кассу"
+        DEBT_OFFSET = "debt_offset", "Списание долга"
+        NONE = "none", "Без движения денег"
+
+    class Status(models.TextChoices):
+        POSTED = "posted", "Проведён"
+        CANCELLED = "cancelled", "Отменён"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    company = models.ForeignKey(Company, on_delete=models.CASCADE, related_name="supplier_returns", db_index=True)
+    branch = models.ForeignKey(
+        Branch,
+        on_delete=models.CASCADE,
+        related_name="supplier_returns",
+        null=True,
+        blank=True,
+        db_index=True,
+    )
+    supplier = models.ForeignKey(
+        Client,
+        on_delete=models.CASCADE,
+        related_name="supplier_returns",
+        db_index=True,
+        limit_choices_to=Q(type=Client.StatusClient.SUPPLIERS),
+    )
+    receipt = models.ForeignKey(
+        SupplierReceipt,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="returns",
+        db_index=True,
+    )
+    created_by = models.ForeignKey(
+        User,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="created_supplier_returns",
+    )
+    reason = models.CharField(max_length=32, choices=Reason.choices, default=Reason.DEFECT, db_index=True)
+    comment = models.TextField(blank=True)
+    compensation = models.CharField(max_length=32, choices=Compensation.choices, default=Compensation.NONE, db_index=True)
+    status = models.CharField(max_length=16, choices=Status.choices, default=Status.POSTED, db_index=True)
+    cashbox = models.ForeignKey("construction.Cashbox", on_delete=models.SET_NULL, null=True, blank=True, related_name="supplier_returns")
+    created_at = models.DateTimeField(auto_now_add=True, db_index=True)
+
+    class Meta:
+        verbose_name = "Возврат поставщику"
+        verbose_name_plural = "Возвраты поставщику"
+        ordering = ["-created_at"]
+        indexes = [
+            models.Index(fields=["company", "supplier", "created_at"]),
+            models.Index(fields=["company", "branch", "created_at"]),
+        ]
+
+    def clean(self):
+        if self.supplier_id and self.company_id and self.supplier.company_id != self.company_id:
+            raise ValidationError({"supplier": "Поставщик другой компании."})
+        if self.branch_id and self.company_id and self.branch.company_id != self.company_id:
+            raise ValidationError({"branch": "Филиал принадлежит другой компании."})
+        if self.receipt_id and self.supplier_id and self.receipt.supplier_id != self.supplier_id:
+            raise ValidationError({"receipt": "Приход принадлежит другому поставщику."})
+
+
+class SupplierReturnItem(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    supplier_return = models.ForeignKey(SupplierReturn, on_delete=models.CASCADE, related_name="items", db_index=True)
+    product = models.ForeignKey(Product, on_delete=models.CASCADE, related_name="supplier_return_items", db_index=True)
+    receipt_item = models.ForeignKey(SupplierReceiptItem, on_delete=models.SET_NULL, null=True, blank=True, related_name="returns", db_index=True)
+    qty = models.DecimalField(max_digits=12, decimal_places=3)
+    purchase_price = models.DecimalField(max_digits=12, decimal_places=3, null=True, blank=True)
+
+    class Meta:
+        verbose_name = "Строка возврата поставщику"
+        verbose_name_plural = "Строки возврата поставщику"
+        indexes = [
+            models.Index(fields=["supplier_return", "product"]),
+            models.Index(fields=["receipt_item"]),
+        ]
+
+
+class MarketProductFormLayout(models.Model):
+    """
+    Раскладка формы создания/редактирования товара (Маркет).
+    Одна запись на компанию (singleton).
+    """
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    company = models.OneToOneField(
+        Company,
+        on_delete=models.CASCADE,
+        related_name="product_form_layout",
+        verbose_name="Компания",
+    )
+    hidden = models.JSONField("Скрытые блоки формы", default=list, blank=True)
+    updated_at = models.DateTimeField("Обновлено", auto_now=True)
+    updated_by = models.ForeignKey(
+        User,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="updated_product_form_layouts",
+        verbose_name="Кто обновил",
+    )
+
+    class Meta:
+        verbose_name = "Раскладка формы товара"
+        verbose_name_plural = "Раскладки форм товаров"
+
+    def __str__(self):
+        return f"FormLayout ({getattr(self.company, 'name', self.company_id)})"
+
+
 class ClientDeal(models.Model):
     class Kind(models.TextChoices):
         AMOUNT = "amount", "Сумма договора"
@@ -3209,6 +3349,23 @@ class ClientDeal(models.Model):
         null=True,
         db_column="debt_months",
     )
+    schedule_version = models.CharField(
+        "Версия графика",
+        max_length=8,
+        default="v1",
+        choices=[("v1", "v1"), ("v2", "v2")],
+    )
+    debt_months = models.PositiveSmallIntegerField("Срок (мес.)", blank=True, null=True, db_column="debt_months_v2")
+    interval_days = models.PositiveSmallIntegerField("Интервал (дни)", default=1, blank=True, null=True)
+    interval_months = models.PositiveSmallIntegerField("Интервал (месяцы)", default=1, blank=True, null=True)
+    sale = models.ForeignKey(
+        "Sale",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="deals",
+        verbose_name="Связанная продажа",
+    )
     first_due_date = models.DateField("Первая дата оплаты", blank=True, null=True)
 
     auto_schedule = models.BooleanField(
@@ -3256,9 +3413,10 @@ class ClientDeal(models.Model):
 
     @property
     def daily_payment(self) -> Decimal:
-        if not self.debt_days or self.debt_days <= 0:
+        cnt = self.debt_days or self.debt_months
+        if not cnt or cnt <= 0:
             return Decimal("0.00")
-        return (self.debt_amount / Decimal(self.debt_days)).quantize(
+        return (self.debt_amount / Decimal(cnt)).quantize(
             Decimal("0.01"),
             rounding=ROUND_HALF_UP,
         )
@@ -3307,16 +3465,23 @@ class ClientDeal(models.Model):
         if self.kind == self.Kind.DEBT:
             if (a - p) <= 0:
                 raise ValidationError({"prepayment": 'Для типа "Долг" сумма договора должна быть больше предоплаты.'})
-            if not self.debt_days or self.debt_days <= 0:
-                raise ValidationError({"debt_days": "Укажите срок (в днях) для рассрочки."})
+            if self.debt_days and self.debt_months:
+                raise ValidationError({"debt_months": "Нельзя одновременно указывать debt_days и debt_months."})
+            if self.schedule_version == "v2":
+                if not self.debt_days and not self.debt_months:
+                    raise ValidationError({"debt_days": "Укажите количество платежей (debt_days или debt_months) для v2."})
+            else:
+                if not self.debt_days or self.debt_days <= 0:
+                    raise ValidationError({"debt_days": "Укажите срок (в днях) для рассрочки."})
         else:
             self.debt_days = None
+            self.debt_months = None
             self.first_due_date = None
             self.auto_schedule = False
 
     # ===== schedule =====
-    def rebuild_installments(self, force: bool = False):
-        if self.kind != self.Kind.DEBT or not self.debt_days or self.debt_days <= 0:
+    def rebuild_installments(self, force: bool = False, custom_installments: list = None):
+        if self.kind != self.Kind.DEBT:
             self.installments.all().delete()
             return
 
@@ -3328,25 +3493,94 @@ class ClientDeal(models.Model):
         if not force and self.payments.exists():
             raise ValidationError("Нельзя пересобрать график: по сделке уже есть платежи.")
 
-        due_date = self.first_due_date or (timezone.localdate() + timedelta(days=self.debt_days))
+        installments_to_create = []
 
-        installment = DealInstallment(
-            company=self.company,
-            branch=self.branch,
-            deal=self,
-            number=1,
-            due_date=due_date,
-            amount=total,
-            balance_after=Decimal("0.00"),
-        )
+        if custom_installments:
+            import calendar
+            balance = total
+            for idx, inst in enumerate(custom_installments, start=1):
+                amt = Decimal(str(inst.get("amount", "0")))
+                d_date = inst.get("due_date")
+                if isinstance(d_date, str):
+                    d_date = parse_date(d_date)
+                balance = (balance - amt).quantize(Decimal("0.01"))
+                installments_to_create.append(
+                    DealInstallment(
+                        company=self.company,
+                        branch=self.branch,
+                        deal=self,
+                        number=inst.get("number", idx),
+                        due_date=d_date,
+                        amount=amt,
+                        balance_after=max(Decimal("0.00"), balance),
+                    )
+                )
+        elif self.schedule_version == "v2":
+            import calendar
+            def _add_months(d, months: int):
+                new_month = d.month - 1 + months
+                new_year = d.year + new_month // 12
+                new_month = new_month % 12 + 1
+                max_days = calendar.monthrange(new_year, new_month)[1]
+                new_day = min(d.day, max_days)
+                return d.replace(year=new_year, month=new_month, day=new_day)
+
+            count = self.debt_days or self.debt_months or 1
+            step_days = self.interval_days or 1
+            step_months = self.interval_months or 1
+            is_months = bool(self.debt_months)
+
+            total_cents = int(round(total * Decimal("100")))
+            base_cents = total_cents // count
+            remainder_cents = total_cents - (base_cents * count)
+
+            start_date = self.first_due_date or timezone.localdate()
+            balance = total
+
+            for i in range(count):
+                if is_months:
+                    due_date = _add_months(start_date, i * step_months)
+                else:
+                    due_date = start_date + timedelta(days=i * step_days)
+
+                cents = base_cents + (remainder_cents if i == count - 1 else 0)
+                amt = (Decimal(cents) / Decimal("100")).quantize(Decimal("0.01"))
+                balance = (balance - amt).quantize(Decimal("0.01"))
+
+                installments_to_create.append(
+                    DealInstallment(
+                        company=self.company,
+                        branch=self.branch,
+                        deal=self,
+                        number=i + 1,
+                        due_date=due_date,
+                        amount=amt,
+                        balance_after=max(Decimal("0.00"), balance),
+                    )
+                )
+        else:
+            due_date = self.first_due_date or (timezone.localdate() + timedelta(days=self.debt_days or 30))
+            installments_to_create.append(
+                DealInstallment(
+                    company=self.company,
+                    branch=self.branch,
+                    deal=self,
+                    number=1,
+                    due_date=due_date,
+                    amount=total,
+                    balance_after=Decimal("0.00"),
+                )
+            )
 
         with transaction.atomic():
             self.installments.all().delete()
-            DealInstallment.objects.bulk_create([installment])
+            DealInstallment.objects.bulk_create(installments_to_create)
 
     def save(self, *args, **kwargs):
+        custom_installments = getattr(self, "_custom_installments", None)
         if self.kind != self.Kind.DEBT:
             self.debt_days = None
+            self.debt_months = None
             self.first_due_date = None
             self.auto_schedule = False
 
@@ -3357,8 +3591,8 @@ class ClientDeal(models.Model):
             self.installments.all().delete()
             return
 
-        if self.auto_schedule:
-            self.rebuild_installments()
+        if self.auto_schedule or custom_installments:
+            self.rebuild_installments(custom_installments=custom_installments)
 
 
 class DealInstallment(models.Model):

@@ -1185,6 +1185,86 @@ class AnalyticsView(APIView):
         df = bound_from if bound_from else period.start
         dt = bound_to if bound_to else period.end
 
+        # 1. Попытка использования данных из журнала оприходований (SupplierReceiptItem)
+        SupplierReceiptItem = None
+        try:
+            SupplierReceiptItem = apps.get_model("main.SupplierReceiptItem")
+        except Exception:
+            pass
+
+        if SupplierReceiptItem is not None:
+            rc_qs = SupplierReceiptItem.objects.filter(
+                receipt__company=company,
+                receipt__created_at__gte=df,
+                receipt__created_at__lte=dt,
+            )
+            if branch is not None and _model_has_field(apps.get_model("main.SupplierReceipt"), "branch"):
+                if self._include_global(request):
+                    rc_qs = rc_qs.filter(Q(receipt__branch=branch) | Q(receipt__branch__isnull=True))
+                else:
+                    rc_qs = rc_qs.filter(receipt__branch=branch)
+
+            if rc_qs.exists():
+                val_expr = ExpressionWrapper(
+                    F("qty") * Coalesce(F("purchase_price"), Value(Decimal("0.00"), output_field=MONEY_FIELD)),
+                    output_field=MONEY_FIELD,
+                )
+                agg = rc_qs.aggregate(
+                    sku_count=Count("product_id", distinct=True),
+                    units=Coalesce(Sum("qty"), Value(Z_QTY, output_field=QTY_FIELD), output_field=QTY_FIELD),
+                    value=Coalesce(Sum(val_expr), Value(Z_MONEY, output_field=MONEY_FIELD), output_field=MONEY_FIELD),
+                )
+
+                purchased_sku_count = int(agg["sku_count"] or 0)
+                purchased_units = agg["units"] or Z_QTY
+                purchased_value = agg["value"] or Z_MONEY
+
+                sup_rows = (
+                    rc_qs.values(
+                        "receipt__supplier_id",
+                        "receipt__supplier__full_name",
+                        "receipt__supplier__llc",
+                        "receipt__supplier__phone",
+                    )
+                    .annotate(
+                        sku_count=Count("product_id", distinct=True),
+                        units=Coalesce(Sum("qty"), Value(Z_QTY, output_field=QTY_FIELD), output_field=QTY_FIELD),
+                        value=Coalesce(Sum(val_expr), Value(Z_MONEY, output_field=MONEY_FIELD), output_field=MONEY_FIELD),
+                    )
+                    .order_by("-value", "-units")
+                )
+
+                by_supplier = []
+                for r in sup_rows:
+                    by_supplier.append(
+                        {
+                            "supplier_id": str(r.get("receipt__supplier_id")) if r.get("receipt__supplier_id") else None,
+                            "supplier": (r.get("receipt__supplier__full_name") or r.get("receipt__supplier__llc") or "—").strip() or "—",
+                            "phone": r.get("receipt__supplier__phone"),
+                            "sku_count": int(r.get("sku_count") or 0),
+                            "units": _qty_str(r.get("units") or Z_QTY),
+                            "value": str(_money(r.get("value") or Z_MONEY)),
+                        }
+                    )
+
+                return {
+                    "tab": "purchases",
+                    "period": {"from": df.isoformat(), "to": dt.isoformat()},
+                    "filters": {
+                        "branch": str(getattr(branch, "id", "")) if branch else None,
+                        "include_global": self._include_global(request),
+                        "purchase_date_from": raw_from,
+                        "purchase_date_to": raw_to,
+                    },
+                    "cards": {
+                        "purchased_sku_count": purchased_sku_count,
+                        "purchased_units": _qty_str(purchased_units),
+                        "purchased_value": str(_money(purchased_value)),
+                    },
+                    "tables": {"by_supplier": by_supplier},
+                }
+
+        # 2. Фолбэк на Product.date (одиночный агрегированный запрос)
         pqs = self._market_products_queryset(request, company, branch)
         if pqs is None:
             return {
@@ -1222,34 +1302,17 @@ class AnalyticsView(APIView):
 
         pqs2 = pqs.filter(date__gte=df, date__lt=dt)
 
-        purchased_sku_count = int(pqs2.count() or 0)
-        purchased_units = Z_QTY
-        purchased_value = Z_MONEY
-
+        agg_kwargs = {"sku_count": Count("id")}
         if qty_field:
-            purchased_units = (
-                pqs2.aggregate(
-                    s=Coalesce(
-                        Sum(qty_field),
-                        Value(Z_QTY, output_field=QTY_FIELD),
-                        output_field=QTY_FIELD,
-                    )
-                )["s"]
-                or Z_QTY
-            )
-
+            agg_kwargs["units"] = Coalesce(Sum(qty_field), Value(Z_QTY, output_field=QTY_FIELD), output_field=QTY_FIELD)
         if qty_field and pp_field:
             val_expr = ExpressionWrapper(F(qty_field) * F(pp_field), output_field=MONEY_FIELD)
-            purchased_value = (
-                pqs2.aggregate(
-                    s=Coalesce(
-                        Sum(val_expr),
-                        Value(Z_MONEY, output_field=MONEY_FIELD),
-                        output_field=MONEY_FIELD,
-                    )
-                )["s"]
-                or Z_MONEY
-            )
+            agg_kwargs["value"] = Coalesce(Sum(val_expr), Value(Z_MONEY, output_field=MONEY_FIELD), output_field=MONEY_FIELD)
+
+        agg = pqs2.aggregate(**agg_kwargs)
+        purchased_sku_count = int(agg.get("sku_count") or 0)
+        purchased_units = agg.get("units") or Z_QTY
+        purchased_value = agg.get("value") or Z_MONEY
 
         by_supplier = []
         if _model_has_field(Product, "client"):

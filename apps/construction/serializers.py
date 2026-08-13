@@ -79,6 +79,7 @@ class CashShiftListSerializer(serializers.ModelSerializer):
 
     expected_cash = serializers.DecimalField(max_digits=12, decimal_places=2, read_only=True)
     cash_diff = serializers.DecimalField(max_digits=12, decimal_places=2, read_only=True)
+    payment_breakdown = serializers.SerializerMethodField()
 
     class Meta:
         model = CashShift
@@ -103,6 +104,7 @@ class CashShiftListSerializer(serializers.ModelSerializer):
             "noncash_sales_total",
             "expected_cash",
             "cash_diff",
+            "payment_breakdown",
         ]
         read_only_fields = fields
 
@@ -120,6 +122,9 @@ class CashShiftListSerializer(serializers.ModelSerializer):
             or getattr(u, "email", None)
             or getattr(u, "username", None)
         )
+
+    def get_payment_breakdown(self, obj):
+        return obj.calc_payment_breakdown()
 
     def to_representation(self, obj):
         data = super().to_representation(obj)

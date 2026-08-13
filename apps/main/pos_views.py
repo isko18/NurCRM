@@ -19,7 +19,13 @@ from django.http import FileResponse
 from django.http import Http404
 from rest_framework.exceptions import NotFound, PermissionDenied, ValidationError
 
-from decimal import Decimal, ROUND_HALF_UP, InvalidOperation
+from decimal import (
+    Decimal,
+    ROUND_CEILING,
+    ROUND_FLOOR,
+    ROUND_HALF_UP,
+    InvalidOperation,
+)
 from datetime import timedelta, datetime, date, time as dtime
 import io, os, uuid, logging
 from django.db import IntegrityError
@@ -905,6 +911,43 @@ def _scale_barcode_variants(barcode: str, mode: str, layout: str,
     return variants
 
 
+# Шаг дискретности торговых весов (поверочное деление e). У весов 6/15 кг это
+# обычно 2/5 г; берём 5 г — веса с шагом 10 г и крупнее тоже лежат на этой сетке.
+SCALE_WEIGHT_STEP_KG = Decimal("0.005")
+
+
+def _weight_from_amount(amount: Decimal, price: Decimal, amount_unit: str) -> Decimal:
+    """
+    Вес из суммы, напечатанной на этикетке весов.
+
+    Весы печатают ОКРУГЛЁННУЮ сумму, поэтому простое `amount / price` систематически
+    промахивается: цена 390 сом/кг, вес 0.170 кг → 66.30 сом → на этикетке «66» →
+    66/390 = 0.16923 → касса показывала 0.169 вместо 0.170. Чем крупнее шаг суммы
+    (целые сомы) и чем ниже цена, тем больше промах.
+
+    Восстанавливаем так: сумма на этикетке допускает целый интервал весов
+    (±половина шага суммы, пересчитанная в кг). Если в этот интервал попадает вес
+    с сетки весов (кратный SCALE_WEIGHT_STEP_KG) — берём ближайший такой; именно его
+    весы и взвесили. Если не попадает ни один (сумма точная — например в тыйынах,
+    интервал узкий) — обычное деление, округлённое до грамма.
+    """
+    exact = amount / price
+
+    # Шаг суммы на этикетке: целые сомы либо тыйыны (2 знака).
+    unit = Decimal(1) if amount_unit == SCALE_BARCODE_AMOUNT_UNIT_SOM else Decimal("0.01")
+    tolerance = (unit / 2) / price
+
+    step = SCALE_WEIGHT_STEP_KG
+    low = ((exact - tolerance) / step).to_integral_value(rounding=ROUND_CEILING)
+    high = ((exact + tolerance) / step).to_integral_value(rounding=ROUND_FLOOR)
+    if low <= high:
+        nearest = (exact / step).to_integral_value(rounding=ROUND_HALF_UP)
+        snapped = min(max(nearest, low), high) * step
+        return snapped.quantize(Decimal("0.001"))
+
+    return exact.quantize(Decimal("0.001"), rounding=ROUND_HALF_UP)
+
+
 def _finalize_scale_data_for_product(product, scale_data: dict) -> Optional[str]:
     """
     Для mode=amount_plain дополняет scale_data полем quantity_kg.
@@ -925,7 +968,11 @@ def _finalize_scale_data_for_product(product, scale_data: dict) -> Optional[str]
     if amount is None:
         return "Невозможно рассчитать вес: в штрихкоде не указана сумма"
 
-    quantity_kg = (Decimal(str(amount)) / price).quantize(Decimal("0.001"), rounding=ROUND_HALF_UP)
+    quantity_kg = _weight_from_amount(
+        Decimal(str(amount)),
+        price,
+        scale_data.get("amount_unit") or SCALE_BARCODE_AMOUNT_UNIT_TIYIN,
+    )
     scale_data["quantity_kg"] = quantity_kg
     scale_data["plu"] = scale_data.get("plu")
     scale_data["amount"] = Decimal(str(amount))
@@ -1001,6 +1048,7 @@ POS_SCAN_PRODUCT_FIELDS = (
     "plu",
     "code",
     "is_weight",
+    "is_adult",
     "kind",
 )
 
@@ -1026,11 +1074,20 @@ class AmbiguousBarcode(Exception):
 
     def __init__(self, barcode: str, matches):
         self.barcode = barcode
-        self.matches = matches  # [(id_str, name), ...]
+        self.matches = matches  # [(id_str, name, is_adult), ...]
         super().__init__(f"Штрихкод {barcode} найден у нескольких товаров.")
 
 
 def _ambiguous_barcode_response(exc: "AmbiguousBarcode") -> Response:
+    formatted_matches = []
+    for item in exc.matches:
+        if len(item) == 3:
+            mid, name, is_adult = item
+        else:
+            mid, name = item[0], item[1]
+            is_adult = False
+        formatted_matches.append({"id": mid, "name": name, "is_adult": is_adult})
+
     return Response(
         {
             "ambiguous": True,
@@ -1038,7 +1095,7 @@ def _ambiguous_barcode_response(exc: "AmbiguousBarcode") -> Response:
                 f"Штрихкод {exc.barcode} найден у нескольких товаров — "
                 f"выберите нужный вручную."
             ),
-            "matches": [{"id": mid, "name": name} for mid, name in exc.matches],
+            "matches": formatted_matches,
         },
         status=status.HTTP_409_CONFLICT,
     )
@@ -1078,7 +1135,7 @@ def _resolve_product_by_barcode_for_pos(company_id, barcode: str, *, only_fields
     if not matches:
         return None
     if len(matches) > 1:
-        pairs = [(str(m.pk), getattr(m, "name", "")) for m in matches]
+        pairs = [(str(m.pk), getattr(m, "name", ""), bool(getattr(m, "is_adult", False))) for m in matches]
         pos_scan_logger.warning("scan barcode=%s company=%s AMBIGUOUS -> %s", raw, company_id, pairs)
         raise AmbiguousBarcode(raw, pairs)
 
@@ -3618,9 +3675,15 @@ class MarketCashierSettingsAPIView(CompanyBranchRestrictedMixin, APIView):
         company = request.user.company
         is_admin = getattr(request.user, "role", None) in ["owner", "admin"]
 
+        debt_ver = getattr(company, "debt_schedule_version", "v1")
+        if debt_ver not in ("v1", "v2"):
+            debt_ver = "v1"
+
         data = {
             "delete_item_code_required": bool(company.cashier_password),
             "max_discount_percent": str(company.max_discount_percent) if company.max_discount_percent is not None else None,
+            "debt_schedule_version": debt_ver,
+            "deferred_schedule_version": debt_ver,
         }
         
         if is_admin:
@@ -3635,6 +3698,8 @@ class MarketCashierSettingsAPIView(CompanyBranchRestrictedMixin, APIView):
             return Response({"detail": "Недостаточно прав"}, status=status.HTTP_403_FORBIDDEN)
             
         data = request.data
+        updated_fields = []
+
         if "delete_item_code" in data:
             code = data["delete_item_code"]
             if code in (None, ""):
@@ -3644,6 +3709,7 @@ class MarketCashierSettingsAPIView(CompanyBranchRestrictedMixin, APIView):
                 if not code_str.isdigit() or not (4 <= len(code_str) <= 8):
                     return Response({"delete_item_code": ["Код должен состоять из 4–8 цифр"]}, status=status.HTTP_400_BAD_REQUEST)
                 company.cashier_password = code_str
+            updated_fields.append("cashier_password")
 
         if "max_discount_percent" in data:
             mdp = data["max_discount_percent"]
@@ -3658,13 +3724,30 @@ class MarketCashierSettingsAPIView(CompanyBranchRestrictedMixin, APIView):
                     company.max_discount_percent = val
                 except (ValueError, TypeError, ArithmeticError):
                     return Response({"max_discount_percent": ["Значение должно быть от 0 до 100"]}, status=status.HTTP_400_BAD_REQUEST)
+            updated_fields.append("max_discount_percent")
 
-        company.save(update_fields=["cashier_password", "max_discount_percent"])
-        
+        ver_val = data.get("debt_schedule_version") or data.get("deferred_schedule_version")
+        if ver_val is not None:
+            raw_ver = str(ver_val).strip().lower()
+            if raw_ver in ("v2", "2"):
+                company.debt_schedule_version = "v2"
+            else:
+                company.debt_schedule_version = "v1"
+            updated_fields.append("debt_schedule_version")
+
+        if updated_fields:
+            company.save(update_fields=updated_fields)
+
+        debt_ver = getattr(company, "debt_schedule_version", "v1") or "v1"
+        if debt_ver not in ("v1", "v2"):
+            debt_ver = "v1"
+
         resp = {
             "delete_item_code_required": bool(company.cashier_password),
             "max_discount_percent": str(company.max_discount_percent) if company.max_discount_percent is not None else None,
-            "delete_item_code": company.cashier_password
+            "delete_item_code": company.cashier_password,
+            "debt_schedule_version": debt_ver,
+            "deferred_schedule_version": debt_ver,
         }
         return Response(resp, status=status.HTTP_200_OK)
 
