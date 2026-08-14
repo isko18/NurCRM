@@ -2167,6 +2167,12 @@ class ClientDealSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializ
             if company and sale.company_id != company.id:
                 raise serializers.ValidationError({"sale": "Продажа принадлежит другой компании."})
 
+        target_sale = attrs.get("sale")
+        if target_sale and not instance:
+            existing = ClientDeal.objects.filter(sale=target_sale).first()
+            if existing:
+                raise serializers.ValidationError({"sale_id": f"По этой продаже уже создана сделка (ID: {existing.id})."})
+
         # прод: если уже есть платежи — условия сделки нельзя менять
         if instance and instance.pk and instance.payments.exists():
             allowed = {"title", "note"}  # максимально безопасно

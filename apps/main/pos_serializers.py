@@ -520,6 +520,9 @@ class CheckoutSerializer(serializers.Serializer):
                 raise serializers.ValidationError(
                     {"payments": f"Сумма оплат ({paid_total}) должна равняться сумме чека ({sale_total})."}
                 )
+            has_debt = any(p.get("method") == Sale.PaymentMethod.DEBT for p in payments)
+            if has_debt and not attrs.get("client_id"):
+                raise serializers.ValidationError({"client_id": "При продаже в долг выбор клиента обязателен."})
             cash_portion = sum(
                 (p["amount"] for p in payments if p["method"] == Sale.PaymentMethod.CASH),
                 Decimal("0.00"),
@@ -538,6 +541,9 @@ class CheckoutSerializer(serializers.Serializer):
             # --- оплата одним способом ---
             payment_method = attrs.get("payment_method") or Sale.PaymentMethod.CASH
             cash_received = attrs.get("cash_received")
+
+            if payment_method == Sale.PaymentMethod.DEBT and not attrs.get("client_id"):
+                raise serializers.ValidationError({"client_id": "При продаже в долг выбор клиента обязателен."})
 
             if payment_method == Sale.PaymentMethod.CASH:
                 if cash_received is None:
@@ -765,6 +771,8 @@ class SaleDetailSerializer(serializers.ModelSerializer):
     client_name = serializers.CharField(source="client.full_name", read_only=True)
     change = serializers.DecimalField(max_digits=12, decimal_places=2, read_only=True)
     payments = serializers.SerializerMethodField(read_only=True)
+    deal_id = serializers.SerializerMethodField(read_only=True)
+    remaining_debt = serializers.SerializerMethodField(read_only=True)
 
     shift = serializers.PrimaryKeyRelatedField(read_only=True)
     cashbox = serializers.PrimaryKeyRelatedField(read_only=True)
@@ -794,12 +802,32 @@ class SaleDetailSerializer(serializers.ModelSerializer):
             "cash_received",
             "change",
             "payments",
+            "deal_id",
+            "remaining_debt",
             "shift",
             "cashbox",
             "cashbox_name",
             "ekassa_fiscal",
         )
         read_only_fields = fields
+
+    def get_deal_id(self, obj):
+        deal = obj.deals.first() if hasattr(obj, "deals") else None
+        if deal:
+            return str(deal.id)
+        legacy = getattr(obj, "legacy_debts", None)
+        if legacy and legacy.exists():
+            return str(legacy.first().id)
+        return None
+
+    def get_remaining_debt(self, obj):
+        deal = obj.deals.first() if hasattr(obj, "deals") else None
+        if deal:
+            return str(deal.remaining_debt)
+        legacy = getattr(obj, "legacy_debts", None)
+        if legacy and legacy.exists():
+            return str(legacy.first().balance)
+        return None
 
     def get_consultant_display(self, obj):
         u = getattr(obj, "consultant", None)
@@ -935,6 +963,9 @@ class AgentCheckoutSerializer(serializers.Serializer):
 
         pm = attrs.get("payment_method") or Sale.PaymentMethod.CASH
         cr = attrs.get("cash_received")
+
+        if pm == Sale.PaymentMethod.DEBT and not attrs.get("client_id"):
+            raise serializers.ValidationError({"client_id": "При продаже в долг выбор клиента обязателен."})
 
         if pm == Sale.PaymentMethod.CASH:
             if cr is None:

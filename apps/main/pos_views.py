@@ -67,6 +67,9 @@ from apps.main.models import (
     MobileScannerToken,
     Client,
     ProductImage,
+    ClientDeal,
+    DealInstallment,
+    Debt,
 )
 from apps.main.models import ManufactureSubreal, AgentSaleAllocation, ReturnFromAgent
 from apps.main.models import cart_line_base, scale_amount_step
@@ -3037,23 +3040,151 @@ def _parse_is_defect(data) -> bool:
     return False
 
 
+def adjust_sale_debt_on_return(
+    sale: Sale,
+    returned_money: Decimal,
+    *,
+    is_full_return: bool = False,
+) -> Optional[Dict]:
+    """
+    Корректировка / аннулирование долга по продаже (ClientDeal или legacy Debt).
+    Выполняется внутри общей транзакции @transaction.atomic.
+    """
+    if returned_money is None or Decimal(str(returned_money)) <= 0:
+        return None
+
+    returned_money = money(Decimal(str(returned_money)))
+
+    # 1. Проверяем связанную ClientDeal
+    deal = (
+        ClientDeal.objects.select_for_update()
+        .filter(sale=sale)
+        .first()
+    )
+
+    if deal:
+        remaining_before = deal.remaining_debt
+        debt_reduce = min(remaining_before, returned_money)
+        cash_refund_due = max(Decimal("0.00"), returned_money - debt_reduce)
+        insts_updated = 0
+        today = timezone.localdate()
+
+        if debt_reduce > 0:
+            deal.amount = max(Decimal("0.00"), (deal.amount or Decimal("0.00")) - debt_reduce)
+
+            # Корректировка неоплаченных взносов (алгоритм from_end: с конца)
+            unpaid_insts = list(
+                deal.installments.select_for_update()
+                .filter(paid_on__isnull=True)
+                .order_by("-number")
+            )
+            rem = debt_reduce
+
+            for inst in unpaid_insts:
+                if rem <= 0:
+                    break
+                unpaid_part = (inst.amount or Decimal("0.00")) - (inst.paid_amount or Decimal("0.00"))
+                if unpaid_part <= 0:
+                    continue
+                insts_updated += 1
+                if unpaid_part <= rem:
+                    rem -= unpaid_part
+                    inst.amount = inst.paid_amount or Decimal("0.00")
+                    inst.paid_on = today
+                    inst.save(update_fields=["amount", "paid_on"])
+                else:
+                    inst.amount = inst.amount - rem
+                    rem = Decimal("0.00")
+                    inst.save(update_fields=["amount"])
+
+            if is_full_return or deal.remaining_debt <= 0:
+                deal.installments.filter(paid_on__isnull=True).update(
+                    paid_on=today,
+                    amount=F("paid_amount"),
+                )
+
+            # Пересчитываем balance_after у всех взносов
+            running_balance = deal.debt_amount
+            for inst in deal.installments.order_by("number"):
+                running_balance = max(Decimal("0.00"), running_balance - (inst.amount or Decimal("0.00")))
+                inst.balance_after = running_balance
+                inst.save(update_fields=["balance_after"])
+
+            deal.save(update_fields=["amount", "updated_at"])
+
+        remaining_after = deal.remaining_debt
+        if is_full_return and deal.paid_total == 0:
+            deal_status = "canceled"
+        elif remaining_after <= 0:
+            deal_status = "closed"
+        else:
+            deal_status = "open"
+
+        return {
+            "deal_id": str(deal.id),
+            "legacy_debt_id": None,
+            "reduced_by": str(debt_reduce),
+            "remaining_debt_before": str(remaining_before),
+            "remaining_debt": str(remaining_after),
+            "deal_status": deal_status,
+            "installments_updated": insts_updated if debt_reduce > 0 else 0,
+            "cash_refund_due": str(cash_refund_due),
+            "reason": "sale_return",
+        }
+
+    # 2. Проверяем legacy Debt
+    legacy_debt = (
+        Debt.objects.select_for_update()
+        .filter(sale=sale)
+        .first()
+    )
+    if legacy_debt:
+        remaining_before = legacy_debt.balance
+        debt_reduce = min(remaining_before, returned_money)
+        cash_refund_due = max(Decimal("0.00"), returned_money - debt_reduce)
+
+        if debt_reduce > 0:
+            legacy_debt.amount = max(Decimal("0.00"), (legacy_debt.amount or Decimal("0.00")) - debt_reduce)
+            legacy_debt.save(update_fields=["amount", "updated_at"])
+
+        remaining_after = legacy_debt.balance
+        deal_status = "closed" if remaining_after <= 0 else "open"
+
+        return {
+            "deal_id": None,
+            "legacy_debt_id": str(legacy_debt.id),
+            "reduced_by": str(debt_reduce),
+            "remaining_debt_before": str(remaining_before),
+            "remaining_debt": str(remaining_after),
+            "deal_status": deal_status,
+            "installments_updated": 0,
+            "cash_refund_due": str(cash_refund_due),
+            "reason": "sale_return",
+        }
+
+    return None
+
+
 def _execute_sale_return(
     sale: Sale,
     partial_items: Optional[List[tuple]],
     *,
     is_defect: bool = False,
     user=None,
-) -> None:
+) -> Optional[Dict]:
     """
     partial_items=None — полный возврат (статус canceled, весь товар на склад / снятие аллокаций).
     Иначе — частичный возврат по строкам; чек остаётся paid/debt, пока есть строки.
 
     is_defect=True — брак: товар списывается, на склад/к агенту не возвращается,
     фиксируется как брак (для агентских продаж — записью ReturnFromAgent).
+
+    Возвращает debt_adjustment dict (или None), если у чека был связанный долг.
     """
     is_agent_sale = sale.agent_allocations.exists()
 
     if not partial_items:
+        returned_money = sale.total or Decimal("0.00")
         if is_agent_sale:
             # Полный возврат агентской продажи: по каждой строке снимаем привязки
             # и фиксируем возврат/брак (для аналитики и склада агента).
@@ -3077,13 +3208,16 @@ def _execute_sale_return(
                     _restock_product_for_sale_item_return(item, rq)
         sale.status = Sale.Status.CANCELED
         sale.save(update_fields=["status"])
-        return
+        debt_adj = adjust_sale_debt_on_return(sale, returned_money, is_full_return=True)
+        return debt_adj
 
     item_ids = [uid for uid, _ in partial_items]
     found = set(SaleItem.objects.filter(sale=sale, id__in=item_ids).values_list("id", flat=True))
     missing = set(item_ids) - found
     if missing:
         raise ValidationError({"items": "Есть позиции не из этого чека или несуществующие sale_item_id."})
+
+    total_returned_money = Decimal("0.00")
 
     for sid, rq in partial_items:
         # FOR UPDATE только по sale_item: иначе PostgreSQL ругается на nullable side of outer join
@@ -3097,6 +3231,12 @@ def _execute_sale_return(
         rq = qty3(rq)
         if rq > old_q or rq <= 0:
             raise ValidationError({"items": f"Некорректное количество возврата для позиции {sid}."})
+
+        unit_price = item.unit_price or Decimal("0.00")
+        old_disc = Decimal(str(item.line_discount or 0))
+        item_disc = money(old_disc * (rq / old_q)) if old_q > 0 else Decimal("0.00")
+        item_returned_money = money((unit_price * rq) - item_disc)
+        total_returned_money += item_returned_money
 
         if is_agent_sale:
             if rq != rq.to_integral_value():
@@ -3113,8 +3253,7 @@ def _execute_sale_return(
                 _restock_product_for_sale_item_return(item, rq)
 
         new_q = qty3(old_q - rq)
-        old_disc = Decimal(str(item.line_discount or 0))
-        new_disc = money(old_disc * (new_q / old_q)) if old_q > 0 else old_disc
+        new_disc = money(old_disc - item_disc) if old_q > 0 else old_disc
 
         if new_q <= 0:
             item.delete()
@@ -3123,11 +3262,15 @@ def _execute_sale_return(
             item.line_discount = new_disc
             item.save(update_fields=["quantity", "line_discount"])
 
-    if not SaleItem.objects.filter(sale=sale).exists():
+    is_full = not SaleItem.objects.filter(sale=sale).exists()
+    if is_full:
         sale.status = Sale.Status.CANCELED
         sale.save(update_fields=["status"])
     else:
         _recalc_sale_headers_from_items(sale)
+
+    debt_adj = adjust_sale_debt_on_return(sale, total_returned_money, is_full_return=is_full)
+    return debt_adj
 
 
 class SaleReturnAPIView(MarketCashierOnlyMixin, CompanyBranchRestrictedMixin, APIView):
@@ -3168,7 +3311,7 @@ class SaleReturnAPIView(MarketCashierOnlyMixin, CompanyBranchRestrictedMixin, AP
         try:
             partial = _parse_partial_return_items(request.data)
             is_defect = _parse_is_defect(request.data)
-            _execute_sale_return(sale, partial, is_defect=is_defect, user=request.user)
+            debt_adj = _execute_sale_return(sale, partial, is_defect=is_defect, user=request.user)
         except ValidationError as e:
             return Response(e.detail, status=status.HTTP_400_BAD_REQUEST)
 
@@ -3179,8 +3322,10 @@ class SaleReturnAPIView(MarketCashierOnlyMixin, CompanyBranchRestrictedMixin, AP
         invalidate_cache_pattern(f"products:list:{sale.company_id}:")
 
         sale.refresh_from_db()
+        data = SaleDetailSerializer(sale, context={"request": request}).data
+        data["debt_adjustment"] = debt_adj
         return Response(
-            SaleDetailSerializer(sale, context={"request": request}).data,
+            data,
             status=status.HTTP_200_OK,
         )
 
@@ -3223,15 +3368,17 @@ class AgentSaleReturnAPIView(SaleReturnAPIView):
         try:
             partial = _parse_partial_return_items(request.data)
             is_defect = _parse_is_defect(request.data)
-            _execute_sale_return(sale, partial, is_defect=is_defect, user=request.user)
+            debt_adj = _execute_sale_return(sale, partial, is_defect=is_defect, user=request.user)
         except ValidationError as e:
             return Response(e.detail, status=status.HTTP_400_BAD_REQUEST)
 
         invalidate_cache_pattern(f"analytics:market:{sale.company_id}:")
         invalidate_cache_pattern(f"products:list:{sale.company_id}:")
         sale.refresh_from_db()
+        data = SaleDetailSerializer(sale, context={"request": request}).data
+        data["debt_adjustment"] = debt_adj
         return Response(
-            SaleDetailSerializer(sale, context={"request": request}).data,
+            data,
             status=status.HTTP_200_OK,
         )
 
