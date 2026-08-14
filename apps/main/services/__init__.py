@@ -194,18 +194,36 @@ def checkout_cart(
         )
     if sale.client_id and debt_amt > Decimal("0.00"):
         from apps.main.models import ClientDeal
+        from datetime import timedelta
         if not ClientDeal.objects.filter(sale=sale).exists():
-            ClientDeal.objects.create(
-                company=sale.company,
-                branch=sale.branch,
-                client=sale.client,
-                sale=sale,
-                title=f"Продажа в долг №{sale.id}",
-                kind=ClientDeal.Kind.DEBT,
-                amount=debt_amt,
-                prepayment=Decimal("0.00"),
-                debt_days=30,
+            unlinked_deal = (
+                ClientDeal.objects.filter(
+                    company=sale.company,
+                    client=sale.client,
+                    kind=ClientDeal.Kind.DEBT,
+                    sale__isnull=True,
+                    created_at__gte=timezone.now() - timedelta(seconds=60),
+                )
+                .order_by("-created_at")
+                .first()
             )
+            if unlinked_deal and (abs((unlinked_deal.amount or Decimal("0.00")) - debt_amt) <= Decimal("0.01") or unlinked_deal.amount == Decimal("0.00")):
+                unlinked_deal.sale = sale
+                if not unlinked_deal.amount or unlinked_deal.amount == Decimal("0.00"):
+                    unlinked_deal.amount = debt_amt
+                unlinked_deal.save(update_fields=["sale", "amount", "updated_at"])
+            else:
+                ClientDeal.objects.create(
+                    company=sale.company,
+                    branch=sale.branch,
+                    client=sale.client,
+                    sale=sale,
+                    title=f"Продажа в долг №{sale.id}",
+                    kind=ClientDeal.Kind.DEBT,
+                    amount=debt_amt,
+                    prepayment=Decimal("0.00"),
+                    debt_days=30,
+                )
 
     return sale
 

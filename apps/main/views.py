@@ -3011,29 +3011,53 @@ class ClientDealListCreateAPIView(CompanyBranchRestrictedMixin, generics.ListCre
         if not company:
             raise serializers.ValidationError({"company": "У пользователя не задана компания."})
 
+        client = None
         if client_id:
             client_qs = Client.objects.filter(company=company)
             if not _is_owner_like(user):
                 client_qs = client_qs.filter(salesperson=user)
             client = get_object_or_404(client_qs, id=client_id)
-
-            # клиент может быть общий (branch=None)
+            if branch is not None and client.branch_id not in (None, branch.id):
+                raise serializers.ValidationError({"client": "Клиент другого филиала."})
+        else:
+            client = serializer.validated_data.get("client")
+            if not client or client.company_id != company.id:
+                raise serializers.ValidationError({"client": "Клиент не найден в вашей компании."})
+            if not _is_owner_like(user) and client.salesperson_id != user.id:
+                raise serializers.ValidationError({"client": "Доступ запрещён: это не ваш клиент."})
             if branch is not None and client.branch_id not in (None, branch.id):
                 raise serializers.ValidationError({"client": "Клиент другого филиала."})
 
+        # ✅ Защита от дублирования сделок при продаже в долг (если фронтенд вызывает POST /deals/ сразу после checkout):
+        kind = serializer.validated_data.get("kind")
+        sale = serializer.validated_data.get("sale")
+        if kind == ClientDeal.Kind.DEBT and not sale and client:
+            from datetime import timedelta
+            amt = serializer.validated_data.get("amount") or Decimal("0.00")
+            recent_deal = (
+                ClientDeal.objects.filter(
+                    company=company,
+                    client=client,
+                    kind=ClientDeal.Kind.DEBT,
+                    sale__isnull=False,
+                    created_at__gte=timezone.now() - timedelta(seconds=60),
+                )
+                .order_by("-created_at")
+                .first()
+            )
+            if recent_deal:
+                if abs((recent_deal.amount or Decimal("0.00")) - amt) <= Decimal("0.01") or amt == Decimal("0.00"):
+                    title = serializer.validated_data.get("title")
+                    if title:
+                        recent_deal.title = title
+                        recent_deal.save(update_fields=["title"])
+                    serializer.instance = recent_deal
+                    return
+
+        if client_id:
             serializer.save(company=company, branch=branch, client=client)
-            return
-
-        client = serializer.validated_data.get("client")
-        if not client or client.company_id != company.id:
-            raise serializers.ValidationError({"client": "Клиент не найден в вашей компании."})
-        if not _is_owner_like(user) and client.salesperson_id != user.id:
-            raise serializers.ValidationError({"client": "Доступ запрещён: это не ваш клиент."})
-
-        if branch is not None and client.branch_id not in (None, branch.id):
-            raise serializers.ValidationError({"client": "Клиент другого филиала."})
-
-        serializer.save(company=company, branch=branch)
+        else:
+            serializer.save(company=company, branch=branch)
 
 
 # ===== Deals retrieve/update/destroy =====
