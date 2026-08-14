@@ -810,3 +810,239 @@ class SaleConsultantCommissionTests(TestCase):
         self.assertEqual(c_map[str(self.consultant.id)]["default_commission_percent"], "5.00")
 
 
+class DebtSaleReturnTests(TestCase):
+    def setUp(self):
+        self.company = Company.objects.create(name="Test Company Debt", is_active=True)
+        self.branch = Branch.objects.create(name="Main Branch Debt", company=self.company)
+        self.cashier = User.objects.create_user(
+            username="cashier_debt",
+            company=self.company,
+            branch=self.branch,
+            role=Roles.CASHIER,
+        )
+        self.client = Client.objects.create(
+            company=self.company,
+            branch=self.branch,
+            full_name="Иванов Иван",
+            phone="+996555111222",
+        )
+        self.product = Product.objects.create(
+            company=self.company,
+            name="Товар 1",
+            price=Decimal("1000.00"),
+            quantity=Decimal("100"),
+        )
+        from apps.main.models import Cashbox, CashShift
+        self.cashbox = Cashbox.objects.create(company=self.company, branch=self.branch, name="Касса 1")
+        self.shift = CashShift.objects.create(
+            company=self.company,
+            branch=self.branch,
+            cashbox=self.cashbox,
+            cashier=self.cashier,
+            status=CashShift.Status.OPEN,
+        )
+
+    def test_checkout_debt_requires_client_id(self):
+        from apps.main.models import Cart, CartItem
+        from apps.main.pos_serializers import CheckoutSerializer
+
+        cart = Cart.objects.create(
+            company=self.company,
+            branch=self.branch,
+            user=self.cashier,
+            shift=self.shift,
+            status=Cart.Status.ACTIVE,
+        )
+        CartItem.objects.create(
+            cart=cart,
+            company=self.company,
+            product=self.product,
+            quantity=Decimal("2"),
+            unit_price=Decimal("1000.00"),
+        )
+
+        # 1. Без client_id при payment_method=debt -> ValidationError
+        ser = CheckoutSerializer(
+            data={"payment_method": "debt"},
+            context={"cart": cart},
+        )
+        self.assertFalse(ser.is_valid())
+        self.assertIn("client_id", ser.errors)
+
+        # 2. С client_id -> валидно
+        ser_valid = CheckoutSerializer(
+            data={"payment_method": "debt", "client_id": str(self.client.id)},
+            context={"cart": cart},
+        )
+        self.assertTrue(ser_valid.is_valid(), ser_valid.errors)
+
+    def test_full_return_debt_sale_annuls_client_deal(self):
+        from apps.main.models import Cart, CartItem, ClientDeal
+        from apps.main.services import checkout_cart
+        from apps.main.pos_views import _execute_sale_return
+
+        cart = Cart.objects.create(
+            company=self.company,
+            branch=self.branch,
+            user=self.cashier,
+            shift=self.shift,
+            status=Cart.Status.ACTIVE,
+        )
+        CartItem.objects.create(
+            cart=cart,
+            company=self.company,
+            product=self.product,
+            quantity=Decimal("2"),
+            unit_price=Decimal("1000.00"),
+        )
+        sale = checkout_cart(
+            cart,
+            client=self.client,
+            payment_method="debt",
+        )
+
+        # Создаём связанную сделку (долг 2000)
+        deal = ClientDeal.objects.create(
+            company=self.company,
+            branch=self.branch,
+            client=self.client,
+            sale=sale,
+            title="Продажа в долг",
+            kind=ClientDeal.Kind.DEBT,
+            amount=Decimal("2000.00"),
+            prepayment=Decimal("0.00"),
+            debt_days=30,
+        )
+        self.assertEqual(deal.remaining_debt, Decimal("2000.00"))
+
+        # Полный возврат чека
+        debt_adj = _execute_sale_return(sale, None, user=self.cashier)
+
+        self.assertIsNotNone(debt_adj)
+        self.assertEqual(debt_adj["deal_id"], str(deal.id))
+        self.assertEqual(debt_adj["reduced_by"], "2000.00")
+        self.assertEqual(debt_adj["remaining_debt"], "0.00")
+        self.assertEqual(debt_adj["deal_status"], "canceled")
+        self.assertEqual(debt_adj["cash_refund_due"], "0.00")
+
+        deal.refresh_from_db()
+        self.assertEqual(deal.remaining_debt, Decimal("0.00"))
+        # Все взносы должны быть закрыты
+        self.assertFalse(deal.installments.filter(paid_on__isnull=True).exists())
+
+    def test_full_return_with_prepayment_returns_cash_refund_due(self):
+        from apps.main.models import Cart, CartItem, ClientDeal
+        from apps.main.services import checkout_cart
+        from apps.main.pos_views import _execute_sale_return
+
+        cart = Cart.objects.create(
+            company=self.company,
+            branch=self.branch,
+            user=self.cashier,
+            shift=self.shift,
+            status=Cart.Status.ACTIVE,
+        )
+        CartItem.objects.create(
+            cart=cart,
+            company=self.company,
+            product=self.product,
+            quantity=Decimal("2"),
+            unit_price=Decimal("1000.00"),
+        )
+        sale = checkout_cart(
+            cart,
+            client=self.client,
+            payments=[
+                {"method": "cash", "amount": Decimal("500.00")},
+                {"method": "debt", "amount": Decimal("1500.00")},
+            ],
+            cash_received=Decimal("500.00"),
+        )
+
+        # Сделка: сумма 2000, предоплата 500 -> долг 1500
+        deal = ClientDeal.objects.create(
+            company=self.company,
+            branch=self.branch,
+            client=self.client,
+            sale=sale,
+            title="Продажа с предоплатой",
+            kind=ClientDeal.Kind.DEBT,
+            amount=Decimal("2000.00"),
+            prepayment=Decimal("500.00"),
+            debt_days=30,
+        )
+        self.assertEqual(deal.remaining_debt, Decimal("1500.00"))
+
+        # Полный возврат чека (2000)
+        debt_adj = _execute_sale_return(sale, None, user=self.cashier)
+
+        self.assertIsNotNone(debt_adj)
+        self.assertEqual(debt_adj["reduced_by"], "1500.00")
+        self.assertEqual(debt_adj["remaining_debt"], "0.00")
+        self.assertEqual(debt_adj["cash_refund_due"], "500.00")
+        self.assertEqual(debt_adj["deal_status"], "closed")
+
+    def test_partial_return_reduces_debt_from_end(self):
+        from apps.main.models import Cart, CartItem, ClientDeal
+        from apps.main.services import checkout_cart
+        from apps.main.pos_views import _execute_sale_return
+
+        cart = Cart.objects.create(
+            company=self.company,
+            branch=self.branch,
+            user=self.cashier,
+            shift=self.shift,
+            status=Cart.Status.ACTIVE,
+        )
+        CartItem.objects.create(
+            cart=cart,
+            company=self.company,
+            product=self.product,
+            quantity=Decimal("2"),
+            unit_price=Decimal("1000.00"),
+        )
+        sale = checkout_cart(
+            cart,
+            client=self.client,
+            payment_method="debt",
+        )
+
+        # 2 взноса по 1000 (v2: debt_months=2, interval_months=1)
+        deal = ClientDeal.objects.create(
+            company=self.company,
+            branch=self.branch,
+            client=self.client,
+            sale=sale,
+            title="График на 2 месяца",
+            kind=ClientDeal.Kind.DEBT,
+            amount=Decimal("2000.00"),
+            prepayment=Decimal("0.00"),
+            schedule_version="v2",
+            debt_months=2,
+            interval_months=1,
+        )
+        self.assertEqual(deal.installments.count(), 2)
+
+        # Частичный возврат 1 штуки (1000 сом)
+        item = sale.items.first()
+        debt_adj = _execute_sale_return(sale, [(item.id, Decimal("1"))], user=self.cashier)
+
+        self.assertIsNotNone(debt_adj)
+        self.assertEqual(debt_adj["reduced_by"], "1000.00")
+        self.assertEqual(debt_adj["remaining_debt"], "1000.00")
+        self.assertEqual(debt_adj["deal_status"], "open")
+        self.assertEqual(debt_adj["cash_refund_due"], "0.00")
+
+        deal.refresh_from_db()
+        self.assertEqual(deal.remaining_debt, Decimal("1000.00"))
+        # Последний взнос (№2) должен быть закрыт (paid_on set, amount=0)
+        inst2 = deal.installments.get(number=2)
+        self.assertIsNotNone(inst2.paid_on)
+        self.assertEqual(inst2.amount, Decimal("0.00"))
+        # Первый взнос (№1) остаётся активным на 1000
+        inst1 = deal.installments.get(number=1)
+        self.assertIsNone(inst1.paid_on)
+        self.assertEqual(inst1.amount, Decimal("1000.00"))
+
+
+
