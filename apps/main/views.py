@@ -2947,8 +2947,9 @@ class ClientKPIsAPIView(CompanyBranchRestrictedMixin, APIView):
         for d in deals:
             kind = d.kind
             if kind == ClientDeal.Kind.DEBT:
-                debt_count += 1
-                debt_amount += d.remaining_debt
+                if d.remaining_debt > Decimal("0.00"):
+                    debt_count += 1
+                    debt_amount += d.remaining_debt
                 if d.prepayment and d.prepayment > Decimal("0.00"):
                     prepayment_amount += d.prepayment
                     prepayment_count += 1
