@@ -2946,6 +2946,8 @@ class ClientKPIsAPIView(CompanyBranchRestrictedMixin, APIView):
 
         for d in deals:
             kind = d.kind
+            if kind == ClientDeal.Kind.CANCELED:
+                continue
             if kind == ClientDeal.Kind.DEBT:
                 if d.remaining_debt > Decimal("0.00"):
                     debt_count += 1
@@ -2956,7 +2958,7 @@ class ClientKPIsAPIView(CompanyBranchRestrictedMixin, APIView):
             elif kind == ClientDeal.Kind.PREPAYMENT:
                 prepayment_count += 1
                 prepayment_amount += (d.amount or Decimal("0.00"))
-            else:
+            elif kind in (ClientDeal.Kind.SALE, ClientDeal.Kind.AMOUNT):
                 sale_count += 1
                 sale_amount += (d.amount or Decimal("0.00"))
 

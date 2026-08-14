@@ -3330,6 +3330,7 @@ class ClientDeal(models.Model):
         SALE = "sale", "Продажа"
         DEBT = "debt", "Долг"
         PREPAYMENT = "prepayment", "Предоплата"
+        CANCELED = "canceled", "Отменён"
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
 

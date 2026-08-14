@@ -2078,13 +2078,14 @@ class ClientDealSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializ
     payments = DealPaymentSerializer(many=True, read_only=True)
 
     auto_schedule = serializers.BooleanField(required=False)
+    kind_display = serializers.CharField(source="get_kind_display", read_only=True)
 
     class Meta:
         model = ClientDeal
         fields = [
             "id", "company", "branch",
             "client", "client_full_name",
-            "title", "kind",
+            "title", "kind", "kind_display",
             "amount", "prepayment",
             "debt_days", "debt_months", "interval_days", "interval_months",
             "first_due_date", "schedule_version", "sale", "sale_id",
@@ -2097,7 +2098,7 @@ class ClientDealSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializ
         read_only_fields = [
             "id", "company", "branch",
             "created_at", "updated_at",
-            "client_full_name",
+            "client_full_name", "kind_display",
             "debt_amount", "daily_payment", "remaining_debt",
             "payments",
         ]

@@ -3112,10 +3112,14 @@ def adjust_sale_debt_on_return(
 
             deal.auto_schedule = False
             deal._is_return_adjustment = True
-            deal.save(update_fields=["amount", "auto_schedule", "updated_at"])
+            if is_full_return or (sale and sale.status == Sale.Status.CANCELED):
+                deal.kind = ClientDeal.Kind.CANCELED
+                deal.save(update_fields=["amount", "auto_schedule", "kind", "updated_at"])
+            else:
+                deal.save(update_fields=["amount", "auto_schedule", "updated_at"])
 
         remaining_after = deal.remaining_debt
-        if is_full_return and deal.paid_total == 0:
+        if (is_full_return and deal.paid_total == 0) or deal.kind == ClientDeal.Kind.CANCELED:
             deal_status = "canceled"
         elif remaining_after <= 0:
             deal_status = "closed"
