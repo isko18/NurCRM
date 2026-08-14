@@ -3110,7 +3110,9 @@ def adjust_sale_debt_on_return(
                 inst.balance_after = running_balance
                 inst.save(update_fields=["balance_after"])
 
-            deal.save(update_fields=["amount", "updated_at"])
+            deal.auto_schedule = False
+            deal._is_return_adjustment = True
+            deal.save(update_fields=["amount", "auto_schedule", "updated_at"])
 
         remaining_after = deal.remaining_debt
         if is_full_return and deal.paid_total == 0:

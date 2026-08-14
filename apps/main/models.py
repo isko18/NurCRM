@@ -3487,19 +3487,21 @@ class ClientDeal(models.Model):
                     or (self.debt_days != old["debt_days"])
                     or (self.first_due_date != old["first_due_date"])
                 )
-                if has_payments and changed_terms:
+                if has_payments and changed_terms and not getattr(self, "_is_return_adjustment", False):
                     raise ValidationError("Нельзя менять тип/суммы/срок/дату: по сделке уже есть платежи.")
 
         if self.kind == self.Kind.DEBT:
-            if (a - p) <= 0:
+            if not self.pk and (a - p) <= 0:
                 raise ValidationError({"prepayment": 'Для типа "Долг" сумма договора должна быть больше предоплаты.'})
+            if (a - p) < 0:
+                raise ValidationError({"prepayment": 'Предоплата не может превышать сумму договора.'})
             if self.debt_days and self.debt_months:
                 raise ValidationError({"debt_months": "Нельзя одновременно указывать debt_days и debt_months."})
             if self.schedule_version == "v2":
                 if not self.debt_days and not self.debt_months:
                     raise ValidationError({"debt_days": "Укажите количество платежей (debt_days или debt_months) для v2."})
             else:
-                if not self.debt_days or self.debt_days <= 0:
+                if (not self.debt_days or self.debt_days <= 0) and not self.pk:
                     raise ValidationError({"debt_days": "Укажите срок (в днях) для рассрочки."})
         else:
             self.debt_days = None
