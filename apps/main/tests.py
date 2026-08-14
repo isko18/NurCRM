@@ -901,19 +901,11 @@ class DebtSaleReturnTests(TestCase):
             payment_method="debt",
         )
 
-        # Создаём связанную сделку (долг 2000)
-        deal = ClientDeal.objects.create(
-            company=self.company,
-            branch=self.branch,
-            client=self.client,
-            sale=sale,
-            title="Продажа в долг",
-            kind=ClientDeal.Kind.DEBT,
-            amount=Decimal("2000.00"),
-            prepayment=Decimal("0.00"),
-            debt_days=30,
-        )
+        # Сделка создаётся автоматически при чекауте
+        deal = ClientDeal.objects.filter(sale=sale).first()
+        self.assertIsNotNone(deal)
         self.assertEqual(deal.remaining_debt, Decimal("2000.00"))
+        self.assertTrue(deal.installments.filter(paid_on__isnull=True).exists())
 
         # Полный возврат чека
         debt_adj = _execute_sale_return(sale, None, user=self.cashier)
@@ -1043,6 +1035,201 @@ class DebtSaleReturnTests(TestCase):
         inst1 = deal.installments.get(number=1)
         self.assertIsNone(inst1.paid_on)
         self.assertEqual(inst1.amount, Decimal("1000.00"))
+
+
+class SupplierReceiptSellingPriceTests(TestCase):
+    def setUp(self):
+        self.company = Company.objects.create(name="Receipt Test Co", is_active=True)
+        self.branch = Branch.objects.create(name="Receipt Branch", company=self.company)
+        self.admin = User.objects.create_user(
+            username="receipt_admin",
+            company=self.company,
+            branch=self.branch,
+            role=Roles.COMPANY_OWNER,
+        )
+        self.supplier = Client.objects.create(
+            company=self.company,
+            branch=self.branch,
+            type=Client.StatusClient.SUPPLIERS,
+            full_name="Поставщик ООО",
+            phone="+996777000111",
+        )
+
+    def test_scenario_1_markup_recalculates_price_on_new_purchase_price(self):
+        prod = Product.objects.create(
+            company=self.company,
+            name="Товар с наценкой",
+            client=self.supplier,
+            purchase_price=Decimal("100.00"),
+            markup_percent=Decimal("10.0000"),
+            price=Decimal("110.00"),
+            quantity=Decimal("10"),
+        )
+        rf = APIRequestFactory()
+        req = rf.post(
+            f"/main/suppliers/{self.supplier.id}/receipt/",
+            data={
+                "items": [
+                    {"product": str(prod.id), "qty": 5, "purchase_price": 120}
+                ],
+                "payment_type": "cash",
+            },
+            format="json",
+        )
+        force_authenticate(req, user=self.admin)
+        from apps.main.views import SupplierReceiptAPIView
+        view = SupplierReceiptAPIView.as_view()
+        res = view(req, supplier_id=self.supplier.id)
+        self.assertEqual(res.status_code, 200)
+
+        prod.refresh_from_db()
+        self.assertEqual(prod.quantity, Decimal("15"))
+        self.assertEqual(prod.purchase_price, Decimal("120.000"))
+        self.assertEqual(prod.markup_percent, Decimal("10.0000"))
+        self.assertEqual(prod.price, Decimal("132.000"))
+
+    def test_scenario_2_same_purchase_price_preserves_price(self):
+        prod = Product.objects.create(
+            company=self.company,
+            name="Товар без изменения закупки",
+            client=self.supplier,
+            purchase_price=Decimal("100.00"),
+            markup_percent=Decimal("10.0000"),
+            price=Decimal("110.00"),
+            quantity=Decimal("10"),
+        )
+        rf = APIRequestFactory()
+        req = rf.post(
+            f"/main/suppliers/{self.supplier.id}/receipt/",
+            data={
+                "items": [
+                    {"product": str(prod.id), "qty": 5, "purchase_price": 100}
+                ],
+                "payment_type": "cash",
+            },
+            format="json",
+        )
+        force_authenticate(req, user=self.admin)
+        from apps.main.views import SupplierReceiptAPIView
+        view = SupplierReceiptAPIView.as_view()
+        res = view(req, supplier_id=self.supplier.id)
+        self.assertEqual(res.status_code, 200)
+
+        prod.refresh_from_db()
+        self.assertEqual(prod.quantity, Decimal("15"))
+        self.assertEqual(prod.purchase_price, Decimal("100.000"))
+        self.assertEqual(prod.markup_percent, Decimal("10.0000"))
+        self.assertEqual(prod.price, Decimal("110.000"))
+
+    def test_scenario_3_no_markup_preserves_manual_selling_price(self):
+        prod = Product.objects.create(
+            company=self.company,
+            name="Товар с ручной ценой без наценки",
+            client=self.supplier,
+            purchase_price=Decimal("100.00"),
+            markup_percent=Decimal("0.0000"),
+            price=Decimal("150.00"),
+            quantity=Decimal("10"),
+        )
+        rf = APIRequestFactory()
+        req = rf.post(
+            f"/main/suppliers/{self.supplier.id}/receipt/",
+            data={
+                "items": [
+                    {"product": str(prod.id), "qty": 5, "purchase_price": 120}
+                ],
+                "payment_type": "cash",
+            },
+            format="json",
+        )
+        force_authenticate(req, user=self.admin)
+        from apps.main.views import SupplierReceiptAPIView
+        view = SupplierReceiptAPIView.as_view()
+        res = view(req, supplier_id=self.supplier.id)
+        self.assertEqual(res.status_code, 200)
+
+        prod.refresh_from_db()
+        self.assertEqual(prod.quantity, Decimal("15"))
+        self.assertEqual(prod.purchase_price, Decimal("120.000"))
+        self.assertEqual(prod.price, Decimal("150.000"))
+
+    def test_scenario_4_mixed_products_in_receipt(self):
+        prod_a = Product.objects.create(
+            company=self.company,
+            name="Товар A (с наценкой 10%)",
+            client=self.supplier,
+            purchase_price=Decimal("100.00"),
+            markup_percent=Decimal("10.0000"),
+            price=Decimal("110.00"),
+            quantity=Decimal("10"),
+        )
+        prod_b = Product.objects.create(
+            company=self.company,
+            name="Товар B (без наценки)",
+            client=self.supplier,
+            purchase_price=Decimal("100.00"),
+            markup_percent=Decimal("0.0000"),
+            price=Decimal("150.00"),
+            quantity=Decimal("10"),
+        )
+        rf = APIRequestFactory()
+        req = rf.post(
+            f"/main/suppliers/{self.supplier.id}/receipt/",
+            data={
+                "items": [
+                    {"product": str(prod_a.id), "qty": 5, "purchase_price": 120},
+                    {"product": str(prod_b.id), "qty": 5, "purchase_price": 120},
+                ],
+                "payment_type": "cash",
+            },
+            format="json",
+        )
+        force_authenticate(req, user=self.admin)
+        from apps.main.views import SupplierReceiptAPIView
+        view = SupplierReceiptAPIView.as_view()
+        res = view(req, supplier_id=self.supplier.id)
+        self.assertEqual(res.status_code, 200)
+
+        prod_a.refresh_from_db()
+        prod_b.refresh_from_db()
+
+        self.assertEqual(prod_a.purchase_price, Decimal("120.000"))
+        self.assertEqual(prod_a.price, Decimal("132.000"))
+        self.assertEqual(prod_b.purchase_price, Decimal("120.000"))
+        self.assertEqual(prod_b.price, Decimal("150.000"))
+
+    def test_scenario_5_receipt_without_purchase_price(self):
+        prod = Product.objects.create(
+            company=self.company,
+            name="Товар без указания закупки",
+            client=self.supplier,
+            purchase_price=Decimal("100.00"),
+            markup_percent=Decimal("10.0000"),
+            price=Decimal("110.00"),
+            quantity=Decimal("10"),
+        )
+        rf = APIRequestFactory()
+        req = rf.post(
+            f"/main/suppliers/{self.supplier.id}/receipt/",
+            data={
+                "items": [
+                    {"product": str(prod.id), "qty": 5}
+                ],
+                "payment_type": "cash",
+            },
+            format="json",
+        )
+        force_authenticate(req, user=self.admin)
+        from apps.main.views import SupplierReceiptAPIView
+        view = SupplierReceiptAPIView.as_view()
+        res = view(req, supplier_id=self.supplier.id)
+        self.assertEqual(res.status_code, 200)
+
+        prod.refresh_from_db()
+        self.assertEqual(prod.quantity, Decimal("15"))
+        self.assertEqual(prod.purchase_price, Decimal("100.000"))
+        self.assertEqual(prod.price, Decimal("110.000"))
+
 
 
 

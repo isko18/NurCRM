@@ -4664,6 +4664,20 @@ class AgentSaleCheckoutAPIView(MarketCashierOnlyMixin, CompanyBranchRestrictedMi
                 if updates:
                     sale.save(update_fields=updates)
 
+            if sale.client_id and pm == Sale.PaymentMethod.DEBT:
+                if not ClientDeal.objects.filter(sale=sale).exists():
+                    ClientDeal.objects.create(
+                        company=sale.company,
+                        branch=sale.branch,
+                        client=sale.client,
+                        sale=sale,
+                        title=f"Агентская продажа в долг №{sale.id}",
+                        kind=ClientDeal.Kind.DEBT,
+                        amount=sale.total or Decimal("0.00"),
+                        prepayment=Decimal("0.00"),
+                        debt_days=30,
+                    )
+
             payload = {
                 "sale_id": str(sale.id),
                 "status": sale.status,

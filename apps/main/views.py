@@ -4404,15 +4404,33 @@ class SupplierReceiptAPIView(CompanyBranchRestrictedMixin, APIView):
         for it in items:
             pid = it["product"].id
             qty = int(it["qty"])
+            prod = by_id[pid]
             upd = {"quantity": F("quantity") + qty}
-            if "purchase_price" in it and it["purchase_price"] is not None:
-                upd["purchase_price"] = it["purchase_price"]
-            type(by_id[pid]).objects.filter(id=pid).update(**upd)
+            raw_pp = it.get("purchase_price")
+            if raw_pp is not None:
+                new_purchase_price = Decimal(str(raw_pp))
+                upd["purchase_price"] = new_purchase_price
+
+                # Пересчёт цены продажи по наценке (markup_percent) до обновления закупки
+                # selling = purchase_price * (1 + markup_percent / 100)
+                # product.price = round(selling * 100) / 100
+                mp = getattr(prod, "markup_percent", None)
+                if mp is not None and str(mp).strip() not in ("", "null", "None"):
+                    try:
+                        mp_dec = Decimal(str(mp))
+                    except (InvalidOperation, ValueError, TypeError):
+                        mp_dec = Decimal("0")
+                    if mp_dec > Decimal("0") and new_purchase_price >= Decimal("0"):
+                        selling = new_purchase_price * (Decimal("1") + mp_dec / Decimal("100"))
+                        new_price = selling.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+                        upd["price"] = new_price
+
+            type(prod).objects.filter(id=pid).update(**upd)
 
             receipt_items.append(
                 SupplierReceiptItem(
                     receipt=receipt,
-                    product=by_id[pid],
+                    product=prod,
                     qty=qty,
                     purchase_price=it.get("purchase_price"),
                 )
@@ -4423,13 +4441,13 @@ class SupplierReceiptAPIView(CompanyBranchRestrictedMixin, APIView):
                 company=company,
                 branch=branch,
                 supplier=supplier,
-                product=by_id[pid],
+                product=prod,
                 quantity=qty,
-                unit=getattr(by_id[pid], "unit", "") or "",
+                unit=getattr(prod, "unit", "") or "",
                 unit_price=(
                     it.get("purchase_price")
                     if it.get("purchase_price") is not None
-                    else by_id[pid].purchase_price
+                    else prod.purchase_price
                 ),
                 payment_type=payment_type,
                 created_by=getattr(request, "user", None),
@@ -4437,6 +4455,11 @@ class SupplierReceiptAPIView(CompanyBranchRestrictedMixin, APIView):
 
         if receipt_items:
             SupplierReceiptItem.objects.bulk_create(receipt_items)
+
+        # Инвалидируем кэши товаров и аналитики
+        from apps.main.cache_utils import invalidate_cache_pattern
+        invalidate_cache_pattern(f"products:list:{company.id}:")
+        invalidate_cache_pattern(f"analytics:market:{company.id}:")
 
         # вернём актуальные данные по товарам
         refreshed = list(self._filter_qs_company_branch(Product.objects.all()).filter(id__in=product_ids))

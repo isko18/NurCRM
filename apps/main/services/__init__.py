@@ -183,6 +183,30 @@ def checkout_cart(
     elif payment_method is not None:
         sale.mark_paid(payment_method=payment_method, cash_received=cash_received)
 
+    # Автоматическое создание долговой сделки (ClientDeal) при продаже в долг
+    debt_amt = Decimal("0.00")
+    if sale.payment_method == Sale.PaymentMethod.DEBT:
+        debt_amt = sale.total or Decimal("0.00")
+    elif payments:
+        debt_amt = sum(
+            (Decimal(str(p.get("amount") or 0)) for p in payments if p.get("method") == Sale.PaymentMethod.DEBT),
+            Decimal("0.00"),
+        )
+    if sale.client_id and debt_amt > Decimal("0.00"):
+        from apps.main.models import ClientDeal
+        if not ClientDeal.objects.filter(sale=sale).exists():
+            ClientDeal.objects.create(
+                company=sale.company,
+                branch=sale.branch,
+                client=sale.client,
+                sale=sale,
+                title=f"Продажа в долг №{sale.id}",
+                kind=ClientDeal.Kind.DEBT,
+                amount=debt_amt,
+                prepayment=Decimal("0.00"),
+                debt_days=30,
+            )
+
     return sale
 
 
