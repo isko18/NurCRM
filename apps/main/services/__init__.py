@@ -225,6 +225,13 @@ def checkout_cart(
                     debt_days=30,
                 )
 
+    try:
+        from apps.main.cache_utils import invalidate_cache_pattern
+        invalidate_cache_pattern(f"analytics:market:{sale.company_id}:")
+        invalidate_cache_pattern(f"products:list:{sale.company_id}:")
+    except Exception:
+        pass
+
     return sale
 
 

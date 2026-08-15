@@ -4703,6 +4703,12 @@ class AgentSaleCheckoutAPIView(MarketCashierOnlyMixin, CompanyBranchRestrictedMi
                             debt_days=30,
                         )
 
+            try:
+                invalidate_cache_pattern(f"analytics:market:{sale.company_id}:")
+                invalidate_cache_pattern(f"products:list:{sale.company_id}:")
+            except Exception:
+                pass
+
             payload = {
                 "sale_id": str(sale.id),
                 "status": sale.status,
