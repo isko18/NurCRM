@@ -239,6 +239,34 @@ def _get_period(request) -> Period:
     start, end = _parse_bounds(raw_from, raw_to, param_hint="period")
 
     if start and end:
+        user = getattr(request, "user", None)
+        company = _get_company(user) if user else None
+        if company:
+            cur_first = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+            if cur_first.month == 12:
+                cur_nxt = cur_first.replace(year=cur_first.year + 1, month=1)
+            else:
+                cur_nxt = cur_first.replace(month=cur_first.month + 1)
+
+            if start < cur_first:
+                Sale, _ = get_sale_models()
+                if Sale is not None:
+                    dt_field = "paid_at" if _model_has_field(Sale, "paid_at") else "created_at"
+                    paid_val = _choice_value(Sale, "Status", "PAID", "paid")
+                    has_in_req = Sale.objects.filter(
+                        company=company,
+                        status=paid_val,
+                        **{f"{dt_field}__gte": start, f"{dt_field}__lt": end},
+                    ).exists()
+                    if not has_in_req:
+                        has_in_cur = Sale.objects.filter(
+                            company=company,
+                            status=paid_val,
+                            **{f"{dt_field}__gte": cur_first, f"{dt_field}__lt": cur_nxt},
+                        ).exists()
+                        if has_in_cur:
+                            return Period(start=cur_first, end=cur_nxt)
+
         return Period(start=start, end=end)
 
     # период не задан (или задана лишь одна из границ) → текущий месяц
