@@ -123,14 +123,14 @@ def invalidate_cache_pattern(pattern: str) -> int:
         from django_redis import get_redis_connection
         redis_client = get_redis_connection("default")
 
-        # мы явно используем "nurcrm:" в ключах -> матчим его
-        match = f"nurcrm:{pattern}*"
+        # django-redis добавляет префикс версии (например nurcrm:1:), поэтому ищем с *
+        clean_pattern = pattern.lstrip("*")
+        match = f"*{clean_pattern}*"
 
         keys = list(redis_client.scan_iter(match=match, count=1000))
         if not keys:
             return 0
 
-        # delete принимает *keys
         deleted = redis_client.delete(*keys)
         return int(deleted or 0)
     except Exception:
