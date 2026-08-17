@@ -1,8 +1,13 @@
 # apps/users/admin.py
+import logging
+from contextlib import contextmanager
+
+from django.apps import apps
 from django.contrib import admin
 from django.contrib.auth.admin import UserAdmin as BaseUserAdmin
 from django.db import models as dj_models
 from django.db.models import Prefetch
+from django.db.models.deletion import CASCADE, PROTECT, RESTRICT
 
 from .models import (
     User,
@@ -16,6 +21,8 @@ from .models import (
     CustomRole,
     ScaleDevice,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class CompanyScopedFKMixin:
@@ -580,7 +587,12 @@ def delete_company_cascade(company):
                 # 9. Пользователи и Филиалы
                 "DELETE FROM users_branchmembership WHERE branch_id IN (SELECT id FROM users_branch WHERE company_id = %s)",
                 "DELETE FROM users_branch WHERE company_id = %s",
-                "DELETE FROM users_user WHERE company_id = %s",
+                # users_user здесь НЕ трогаем: на него ссылаются десятки таблиц
+                # по всем модулям (created_by, waiter, master, cashier, ...),
+                # и часть из них в этот список не входит. Сырой DELETE оставил бы
+                # битые ссылки, а FK у Django DEFERRABLE INITIALLY DEFERRED —
+                # упало бы только на COMMIT. Сотрудников удаляет коллектор Django
+                # на шаге 11 (Company.employees → on_delete=CASCADE).
             ]
 
             for query in tables_sql:
@@ -590,28 +602,106 @@ def delete_company_cascade(company):
                     params = [company_id] * num_params
                     cursor.execute(query, params)
                     transaction.savepoint_commit(sid)
-                except Exception:
+                except Exception as exc:
                     transaction.savepoint_rollback(sid)
+                    logger.warning(
+                        "delete_company_cascade: пропущен запрос %r для компании %s: %s",
+                        query, company_id, exc,
+                    )
 
-        # 10. Динамическая очистка любых оставшихся моделей с полем 'company'
-        from django.apps import apps
-        for model in apps.get_models():
-            field_name = None
-            for f in model._meta.fields:
-                if f.is_relation and f.related_model == company.__class__:
-                    field_name = f.name
-                    break
-            if field_name:
-                sid = transaction.savepoint()
-                try:
-                    qs = model.objects.filter(**{field_name: company})
-                    if qs.exists():
-                        qs.delete()
-                    transaction.savepoint_commit(sid)
-                except Exception:
-                    transaction.savepoint_rollback(sid)
+        # 10. Таблицы, которые ссылаются на users_company, но не известны
+        # Django: приложение отключено в INSTALLED_APPS, а таблицы в БД от него
+        # остались (например crm_* — apps.crm закомментировано, но миграции
+        # применялись). Коллектор их не видит, FK у Django DEFERRABLE INITIALLY
+        # DEFERRED — и удаление падает уже на COMMIT с невнятным
+        # ForeignKeyViolation. Проверяем заранее и говорим, что именно мешает.
+        _assert_no_unmanaged_company_rows(company_id)
 
-        company.delete()
+        # 11. Всё, что осталось, удаляем штатным коллектором Django — он сам
+        # обходит граф связей в правильном порядке. PROTECT/RESTRICT на время
+        # операции превращаем в CASCADE: это внутренние справочники компании
+        # (кафе: продукты ↔ заготовки ↔ ингредиенты блюд, обработки), и при
+        # сносе всего тенанта их нужно удалять вместе с ним.
+        with _protect_as_cascade():
+            company.delete()
+
+
+# Прямые FK на users_company: имя дочерней таблицы и её колонки.
+_COMPANY_FK_SQL = """
+    SELECT con.conrelid::regclass::text, att.attname
+    FROM pg_constraint con
+    JOIN pg_attribute att
+      ON att.attrelid = con.conrelid AND att.attnum = con.conkey[1]
+    WHERE con.contype = 'f'
+      AND con.confrelid = 'users_company'::regclass
+      AND array_length(con.conkey, 1) = 1
+"""
+
+
+def _assert_no_unmanaged_company_rows(company_id):
+    """
+    Проверяет, что у компании не осталось строк в таблицах, о которых Django
+    не знает. Такие строки коллектор не удалит, а FK-нарушение всплывёт только
+    на COMMIT — уже без указания, какая таблица виновата.
+    """
+    from django.db import connection, transaction
+
+    if connection.vendor != "postgresql":
+        return
+
+    known_tables = {model._meta.db_table for model in apps.get_models()}
+    blocking = []
+
+    with connection.cursor() as cursor:
+        cursor.execute(_COMPANY_FK_SQL)
+        for table, column in cursor.fetchall():
+            bare_table = table.split(".")[-1].strip('"')
+            if bare_table in known_tables:
+                continue
+            sid = transaction.savepoint()
+            try:
+                cursor.execute(f'SELECT COUNT(*) FROM {table} WHERE "{column}" = %s', [company_id])
+                count = cursor.fetchone()[0]
+                transaction.savepoint_commit(sid)
+            except Exception:
+                transaction.savepoint_rollback(sid)
+                continue
+            if count:
+                blocking.append(f"{bare_table}.{column} — {count} строк")
+
+    if blocking:
+        raise RuntimeError(
+            "Удаление остановлено: в БД остались таблицы со ссылками на компанию, "
+            "не известные Django (приложение отключено в INSTALLED_APPS, а таблицы "
+            "от него не удалены): " + "; ".join(sorted(blocking)) + ". "
+            "Дропните эти таблицы или верните приложение в INSTALLED_APPS."
+        )
+
+
+@contextmanager
+def _protect_as_cascade():
+    """
+    Временно подменяет on_delete=PROTECT/RESTRICT на CASCADE во всех моделях.
+
+    Нужно только для полного удаления компании: без этого коллектор Django
+    падает с ProtectedError на внутренних ссылках компании
+    (например cafe.DishIngredient.product → cafe.Warehouse).
+
+    ВНИМАНИЕ: подмена глобальная для процесса на время блока, поэтому
+    вызывать её можно только из административного удаления тенанта.
+    """
+    patched = []
+    for model in apps.get_models():
+        for field in model._meta.local_fields:
+            remote = field.remote_field
+            if remote is not None and getattr(remote, "on_delete", None) in (PROTECT, RESTRICT):
+                patched.append((remote, remote.on_delete))
+                remote.on_delete = CASCADE
+    try:
+        yield
+    finally:
+        for remote, original in patched:
+            remote.on_delete = original
 
 
 # -------------------- Branch --------------------
