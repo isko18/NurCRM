@@ -458,172 +458,39 @@ class CompanyAdmin(admin.ModelAdmin):
 
 def delete_company_cascade(company):
     """
-    Безопасное каскадное удаление компании и всех связанных данных со всех модулей CRM.
-    Обходит ограничения Foreign Key (on_delete=models.PROTECT).
+    Полное удаление компании и всех связанных данных по всем модулям CRM.
+
+    Всю работу делает штатный коллектор Django: он строит граф связей по
+    зарегистрированным моделям и удаляет строки в правильном порядке. Мешает
+    ему только on_delete=PROTECT/RESTRICT на внутренних справочниках компании,
+    поэтому на время операции они превращаются в CASCADE.
+
+    Раньше здесь был список из ~120 сырых DELETE. Он по определению отставал от
+    моделей: каждая новая таблица (cafe_ordercheckoutpayment, cafe_dishingredient,
+    onec_*) в него не попадала, её строки оставались висеть на уже удалённом
+    родителе — и всё падало. Причём падало не на самом запросе, а на COMMIT:
+    FK у Django создаются как DEFERRABLE INITIALLY DEFERRED, так что savepoint
+    вокруг каждого DELETE такие нарушения не ловил, а сообщение об ошибке
+    приходило уже без указания виноватого запроса.
     """
-    from django.db import transaction, connection
+    from django.db import transaction
+
+    company_id = str(company.id)
 
     with transaction.atomic():
-        company_id = str(company.id)
-
-        with connection.cursor() as cursor:
-            tables_sql = [
-                # 1. Сначала запросы одобрения (ссылаются на document и money_document)
-                "DELETE FROM warehouse_cashapprovalrequest WHERE money_document_id IN (SELECT id FROM warehouse_moneydocument WHERE company_id = %s)",
-                "DELETE FROM warehouse_cashapprovalrequest WHERE document_id IN (SELECT id FROM warehouse_document WHERE warehouse_from_id IN (SELECT id FROM warehouse_warehouse WHERE company_id = %s) OR warehouse_to_id IN (SELECT id FROM warehouse_warehouse WHERE company_id = %s))",
-                
-                # 2. Складские движения (ссылаются на document и warehouse)
-                "DELETE FROM warehouse_stockmove WHERE document_id IN (SELECT id FROM warehouse_document WHERE warehouse_from_id IN (SELECT id FROM warehouse_warehouse WHERE company_id = %s) OR warehouse_to_id IN (SELECT id FROM warehouse_warehouse WHERE company_id = %s))",
-                "DELETE FROM warehouse_stockmove WHERE warehouse_id IN (SELECT id FROM warehouse_warehouse WHERE company_id = %s)",
-                "DELETE FROM warehouse_agentstockmove WHERE document_id IN (SELECT id FROM warehouse_document WHERE warehouse_from_id IN (SELECT id FROM warehouse_warehouse WHERE company_id = %s) OR warehouse_to_id IN (SELECT id FROM warehouse_warehouse WHERE company_id = %s))",
-                "DELETE FROM warehouse_agentstockmove WHERE warehouse_id IN (SELECT id FROM warehouse_warehouse WHERE company_id = %s)",
-                "DELETE FROM warehouse_stockbalance WHERE warehouse_id IN (SELECT id FROM warehouse_warehouse WHERE company_id = %s)",
-                "DELETE FROM warehouse_agentstockbalance WHERE warehouse_id IN (SELECT id FROM warehouse_warehouse WHERE company_id = %s)",
-
-                # 3. Элементы документов и сами документы
-                "DELETE FROM warehouse_documentitem WHERE document_id IN (SELECT id FROM warehouse_document WHERE warehouse_from_id IN (SELECT id FROM warehouse_warehouse WHERE company_id = %s) OR warehouse_to_id IN (SELECT id FROM warehouse_warehouse WHERE company_id = %s))",
-                "DELETE FROM warehouse_document WHERE warehouse_from_id IN (SELECT id FROM warehouse_warehouse WHERE company_id = %s) OR warehouse_to_id IN (SELECT id FROM warehouse_warehouse WHERE company_id = %s)",
-                "DELETE FROM warehouse_moneydocument WHERE company_id = %s",
-
-                # 4. Модуль main (POS, розница, производство, сырье, рецепты, кассы, смены, корзины, продажи)
-                "DELETE FROM main_product_item_make WHERE itemmake_id IN (SELECT id FROM main_itemmake WHERE company_id = %s)",
-                "DELETE FROM main_product_item_make WHERE product_id IN (SELECT id FROM main_product WHERE company_id = %s)",
-                "DELETE FROM main_productrecipeitem WHERE item_make_id IN (SELECT id FROM main_itemmake WHERE company_id = %s)",
-                "DELETE FROM main_productrecipeitem WHERE product_id IN (SELECT id FROM main_product WHERE company_id = %s)",
-                "DELETE FROM main_finishedtorawtransfer WHERE raw_item_id IN (SELECT id FROM main_itemmake WHERE company_id = %s)",
-                "DELETE FROM main_finishedtorawtransfer WHERE product_id IN (SELECT id FROM main_product WHERE company_id = %s)",
-                "DELETE FROM main_supplierpurchase WHERE item_make_id IN (SELECT id FROM main_itemmake WHERE company_id = %s)",
-                "DELETE FROM main_supplierpurchase WHERE product_id IN (SELECT id FROM main_product WHERE company_id = %s)",
-                "DELETE FROM main_productionrecord WHERE product_id IN (SELECT id FROM main_product WHERE company_id = %s)",
-                "DELETE FROM main_productionsalaryaccrual WHERE product_id IN (SELECT id FROM main_product WHERE company_id = %s)",
-                "DELETE FROM main_productionpiecerate WHERE product_id IN (SELECT id FROM main_product WHERE company_id = %s)",
-                "DELETE FROM main_stockshortageevent WHERE product_id IN (SELECT id FROM main_product WHERE company_id = %s)",
-                "DELETE FROM main_productinventoryitem WHERE product_id IN (SELECT id FROM main_product WHERE company_id = %s)",
-                "DELETE FROM main_product_suppliers WHERE product_id IN (SELECT id FROM main_product WHERE company_id = %s)",
-                "DELETE FROM main_agentrequestitem WHERE product_id IN (SELECT id FROM main_product WHERE company_id = %s)",
-                "DELETE FROM main_agentsaleallocation WHERE product_id IN (SELECT id FROM main_product WHERE company_id = %s)",
-                "DELETE FROM main_cartitemdeletionlog WHERE product_id IN (SELECT id FROM main_product WHERE company_id = %s)",
-                "DELETE FROM barber_productsalepayout WHERE product_id IN (SELECT id FROM main_product WHERE company_id = %s)",
-                "DELETE FROM main_itemmake WHERE company_id = %s",
-                "DELETE FROM main_manufacturesubreal WHERE company_id = %s",
-                "DELETE FROM main_acceptance WHERE company_id = %s",
-                "DELETE FROM main_supplierreceiptitem WHERE receipt_id IN (SELECT id FROM main_supplierreceipt WHERE company_id = %s)",
-                "DELETE FROM main_supplierreceipt WHERE company_id = %s",
-                "DELETE FROM main_dealpayment WHERE deal_id IN (SELECT id FROM main_clientdeal WHERE company_id = %s)",
-                "DELETE FROM main_dealinstallment WHERE deal_id IN (SELECT id FROM main_clientdeal WHERE company_id = %s)",
-                "DELETE FROM main_clientdeal WHERE company_id = %s",
-                "DELETE FROM main_contractorwork WHERE company_id = %s",
-                "DELETE FROM main_debtpayment WHERE debt_id IN (SELECT id FROM main_debt WHERE company_id = %s)",
-                "DELETE FROM main_debt WHERE company_id = %s",
-                "DELETE FROM main_objectsaleitem WHERE sale_id IN (SELECT id FROM main_objectsale WHERE company_id = %s)",
-                "DELETE FROM main_objectsale WHERE company_id = %s",
-                "DELETE FROM main_objectitem WHERE company_id = %s",
-                "DELETE FROM main_saleitem WHERE sale_id IN (SELECT id FROM main_sale WHERE company_id = %s)",
-                "DELETE FROM main_sale WHERE company_id = %s",
-                "DELETE FROM main_cartitem WHERE cart_id IN (SELECT id FROM main_cart WHERE company_id = %s)",
-                "DELETE FROM main_cart WHERE company_id = %s",
-                "DELETE FROM main_cashshift WHERE company_id = %s",
-                "DELETE FROM main_cashbox WHERE company_id = %s",
-                "DELETE FROM main_productpromotiontier WHERE product_id IN (SELECT id FROM main_product WHERE company_id = %s)",
-                "DELETE FROM main_productalternatebarcode WHERE product_id IN (SELECT id FROM main_product WHERE company_id = %s)",
-                "DELETE FROM main_productcharacteristics WHERE company_id = %s",
-                "DELETE FROM main_productpackage WHERE product_id IN (SELECT id FROM main_product WHERE company_id = %s)",
-                "DELETE FROM main_productimage WHERE product_id IN (SELECT id FROM main_product WHERE company_id = %s)",
-                "DELETE FROM main_productfavorite WHERE company_id = %s",
-                "DELETE FROM main_product WHERE company_id = %s",
-                "DELETE FROM main_category WHERE company_id = %s",
-                "DELETE FROM main_brand WHERE company_id = %s",
-                "DELETE FROM main_client WHERE company_id = %s",
-                "DELETE FROM main_shiftreceipt WHERE company_id = %s",
-
-                # 5. Товары и склады
-                "DELETE FROM warehouse_warehouseproductalternatebarcode WHERE product_id IN (SELECT id FROM warehouse_warehouseproduct WHERE company_id = %s)",
-                "DELETE FROM warehouse_warehouseproductcharasteristics WHERE company_id = %s",
-                "DELETE FROM warehouse_warehouseproductpackage WHERE product_id IN (SELECT id FROM warehouse_warehouseproduct WHERE company_id = %s)",
-                "DELETE FROM warehouse_warehouseproductimage WHERE product_id IN (SELECT id FROM warehouse_warehouseproduct WHERE company_id = %s)",
-                "DELETE FROM warehouse_warehouseproduct WHERE company_id = %s",
-                "DELETE FROM warehouse_warehouseproductbrand WHERE company_id = %s",
-                "DELETE FROM warehouse_warehouseproductcategory WHERE company_id = %s",
-                "DELETE FROM warehouse_warehouseproductgroup WHERE company_id = %s",
-                "DELETE FROM warehouse_warehouse WHERE company_id = %s",
-                "DELETE FROM warehouse_cashregister WHERE company_id = %s",
-                "DELETE FROM warehouse_paymentcategory WHERE company_id = %s",
-                "DELETE FROM warehouse_counterparty WHERE company_id = %s",
-                "DELETE FROM warehouse_agentrequestitem WHERE cart_id IN (SELECT id FROM warehouse_agentcart WHERE company_id = %s)",
-                "DELETE FROM warehouse_agentcart WHERE company_id = %s",
-
-                # 6. Кафе
-                "DELETE FROM cafe_orderitem WHERE order_id IN (SELECT id FROM cafe_order WHERE company_id = %s)",
-                "DELETE FROM cafe_order WHERE company_id = %s",
-                "DELETE FROM cafe_table WHERE company_id = %s",
-                "DELETE FROM cafe_menuitem WHERE company_id = %s",
-                "DELETE FROM cafe_category WHERE company_id = %s",
-                "DELETE FROM cafe_cafeshift WHERE company_id = %s",
-
-                # 7. Застройщики и Здания
-                "DELETE FROM construction_cashflow WHERE company_id = %s",
-                "DELETE FROM construction_cashbox WHERE company_id = %s",
-                "DELETE FROM construction_shiftitem WHERE company_id = %s",
-                "DELETE FROM construction_shift WHERE company_id = %s",
-                "DELETE FROM construction_clientpayment WHERE company_id = %s",
-                "DELETE FROM construction_clientoffer WHERE company_id = %s",
-                "DELETE FROM construction_supplierinvoice WHERE company_id = %s",
-                "DELETE FROM building_apartmentpayment WHERE company_id = %s",
-                "DELETE FROM building_apartmentcontract WHERE company_id = %s",
-                "DELETE FROM building_apartment WHERE object_id IN (SELECT id FROM building_constructionobject WHERE company_id = %s)",
-                "DELETE FROM building_objectcost WHERE company_id = %s",
-                "DELETE FROM building_constructionobject WHERE company_id = %s",
-
-                # 8. Барбер
-                "DELETE FROM barber_appointment WHERE company_id = %s",
-                "DELETE FROM barber_mastersalarypayout WHERE company_id = %s",
-                "DELETE FROM barber_mastersalaryaccrual WHERE company_id = %s",
-                "DELETE FROM barber_servicesalaryrate WHERE company_id = %s",
-                "DELETE FROM barber_barberprofile WHERE company_id = %s",
-                "DELETE FROM barber_service WHERE company_id = %s",
-                "DELETE FROM barber_servicecategory WHERE company_id = %s",
-                "DELETE FROM barber_client WHERE company_id = %s",
-
-                # 9. Пользователи и Филиалы
-                "DELETE FROM users_branchmembership WHERE branch_id IN (SELECT id FROM users_branch WHERE company_id = %s)",
-                "DELETE FROM users_branch WHERE company_id = %s",
-                # users_user здесь НЕ трогаем: на него ссылаются десятки таблиц
-                # по всем модулям (created_by, waiter, master, cashier, ...),
-                # и часть из них в этот список не входит. Сырой DELETE оставил бы
-                # битые ссылки, а FK у Django DEFERRABLE INITIALLY DEFERRED —
-                # упало бы только на COMMIT. Сотрудников удаляет коллектор Django
-                # на шаге 11 (Company.employees → on_delete=CASCADE).
-            ]
-
-            for query in tables_sql:
-                sid = transaction.savepoint()
-                try:
-                    num_params = query.count('%s')
-                    params = [company_id] * num_params
-                    cursor.execute(query, params)
-                    transaction.savepoint_commit(sid)
-                except Exception as exc:
-                    transaction.savepoint_rollback(sid)
-                    logger.warning(
-                        "delete_company_cascade: пропущен запрос %r для компании %s: %s",
-                        query, company_id, exc,
-                    )
-
-        # 10. Таблицы, которые ссылаются на users_company, но не известны
-        # Django: приложение отключено в INSTALLED_APPS, а таблицы в БД от него
-        # остались (например crm_* — apps.crm закомментировано, но миграции
-        # применялись). Коллектор их не видит, FK у Django DEFERRABLE INITIALLY
-        # DEFERRED — и удаление падает уже на COMMIT с невнятным
-        # ForeignKeyViolation. Проверяем заранее и говорим, что именно мешает.
+        # Таблицы, которые ссылаются на users_company, но не известны Django:
+        # приложение отключено в INSTALLED_APPS, а таблицы в БД от него остались
+        # (например crm_* — apps.crm закомментировано, но миграции применялись).
+        # Коллектор их не видит, и удаление упало бы на COMMIT.
         _assert_no_unmanaged_company_rows(company_id)
 
-        # 11. Всё, что осталось, удаляем штатным коллектором Django — он сам
-        # обходит граф связей в правильном порядке. PROTECT/RESTRICT на время
-        # операции превращаем в CASCADE: это внутренние справочники компании
-        # (кафе: продукты ↔ заготовки ↔ ингредиенты блюд, обработки), и при
-        # сносе всего тенанта их нужно удалять вместе с ним.
         with _protect_as_cascade():
-            company.delete()
+            total, per_model = company.delete()
+
+    logger.info(
+        "delete_company_cascade: компания %s удалена, объектов %s: %s",
+        company_id, total, per_model,
+    )
 
 
 # Прямые FK на users_company: имя дочерней таблицы и её колонки.
