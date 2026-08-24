@@ -31,3 +31,26 @@ CELERY_TASK_EAGER_PROPAGATES = True
 # Настройки безопасности для тестового окружения
 SECURE_SSL_REDIRECT = False
 ALLOWED_HOSTS = ["*"]
+
+
+class DisableMigrations:
+    def __contains__(self, item):
+        return True
+
+    def __getitem__(self, item):
+        return None
+
+
+MIGRATION_MODULES = DisableMigrations()
+
+from django.db.backends.signals import connection_created
+from django.dispatch import receiver
+
+
+@receiver(connection_created)
+def extend_sqlite(sender, connection, **kwargs):
+    if connection.vendor == "sqlite":
+        connection.connection.create_function("lower", 1, lambda s: s.lower() if s is not None else None, deterministic=True)
+
+
+

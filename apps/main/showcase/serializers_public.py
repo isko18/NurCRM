@@ -31,11 +31,13 @@ class PublicProductCharacteristicsSerializer(serializers.ModelSerializer):
 
 
 class PublicProductSerializer(serializers.ModelSerializer):
+    title = serializers.CharField(source="name", read_only=True)
     category_title = serializers.CharField(source="category.name", read_only=True)
     brand_title = serializers.CharField(source="brand.name", read_only=True)
 
     image_url = serializers.SerializerMethodField()
     final_price = serializers.SerializerMethodField()
+    is_new = serializers.SerializerMethodField()
 
     characteristics = PublicProductCharacteristicsSerializer(read_only=True)
     packages = PublicProductPackageSerializer(many=True, read_only=True)
@@ -46,10 +48,12 @@ class PublicProductSerializer(serializers.ModelSerializer):
             "id",
             "kind",
             "name",
+            "title",
             "description",
             "unit",
             "is_weight",
             "stock",
+            "is_new",
             "country",
             "barcode",
             "article",
@@ -82,5 +86,13 @@ class PublicProductSerializer(serializers.ModelSerializer):
         price = obj.price or Decimal("0")
         disc = obj.discount_percent or Decimal("0")
         if disc <= 0:
-            return price
+            return price.quantize(Decimal("0.01")) if hasattr(price, "quantize") else price
         return (price * (Decimal("1") - disc / Decimal("100"))).quantize(Decimal("0.01"))
+
+    def get_is_new(self, obj: Product) -> bool:
+        if not getattr(obj, "created_at", None):
+            return False
+        from django.utils import timezone
+        from datetime import timedelta
+        return (timezone.now() - obj.created_at) <= timedelta(days=14)
+
