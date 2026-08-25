@@ -122,7 +122,13 @@ class CompanyBranchScopedMixin:
         if self._model_has_field(qs, "branch"):
             br = self._active_branch()
             if br is not None:
-                qs = qs.filter(branch=br)
+                include_global = False
+                if hasattr(self.request, "query_params"):
+                    include_global = (self.request.query_params.get("include_global") or "").strip().lower() in ("1", "true", "yes", "on")
+                if include_global:
+                    qs = qs.filter(Q(branch=br) | Q(branch__isnull=True))
+                else:
+                    qs = qs.filter(branch=br)
 
         return qs
 

@@ -139,6 +139,7 @@ class SaleItemSerializer(serializers.ModelSerializer):
             "is_weight", "is_adult",
             "stock", "promotion_rules",
             "quantity", "unit_price", "line_discount", "line_total",
+            "price_manually_edited",
             "sale_package",
             "display_name",
             "primary_image_url",
@@ -146,6 +147,7 @@ class SaleItemSerializer(serializers.ModelSerializer):
         read_only_fields = (
             "id", "kind", "product_name", "barcode",
             "stock", "promotion_rules", "line_total",
+            "price_manually_edited",
             "display_name", "primary_image_url",
             "sale_package",
         )
@@ -650,6 +652,7 @@ class SaleListSerializer(serializers.ModelSerializer):
 
     shift = serializers.PrimaryKeyRelatedField(read_only=True)
     cashbox = serializers.PrimaryKeyRelatedField(read_only=True)
+    branch = serializers.PrimaryKeyRelatedField(read_only=True)
     cashbox_name = serializers.SerializerMethodField(read_only=True)
     debt_amount = serializers.SerializerMethodField(read_only=True)
 
@@ -657,6 +660,7 @@ class SaleListSerializer(serializers.ModelSerializer):
         model = Sale
         fields = (
             "id",
+            "branch",
             "status",
             "subtotal",
             "discount_total",
@@ -732,11 +736,19 @@ class SaleItemReadSerializer(serializers.ModelSerializer):
     product_name = serializers.SerializerMethodField()
     kind = serializers.CharField(source="product.kind", read_only=True, default="product")
     line_total = serializers.SerializerMethodField()
+    item_id = serializers.UUIDField(source="id", read_only=True)
+    line_id = serializers.UUIDField(source="id", read_only=True)
+    sale_item_id = serializers.UUIDField(source="id", read_only=True)
+    price_manually_edited = serializers.BooleanField(read_only=True)
+    price_override_reason = serializers.SerializerMethodField()
 
     class Meta:
         model = SaleItem
         fields = (
             "id",
+            "item_id",
+            "line_id",
+            "sale_item_id",
             "product",
             "kind",
             "product_name",
@@ -746,6 +758,8 @@ class SaleItemReadSerializer(serializers.ModelSerializer):
             "line_discount",
             "quantity",
             "line_total",
+            "price_manually_edited",
+            "price_override_reason",
         )
         read_only_fields = fields
 
@@ -756,6 +770,13 @@ class SaleItemReadSerializer(serializers.ModelSerializer):
         base = (obj.unit_price or Decimal("0")) * Decimal(obj.quantity or 0)
         disc = Decimal(str(getattr(obj, "line_discount", None) or 0))
         return money(base - disc)
+
+    def get_price_override_reason(self, obj):
+        if getattr(obj, "price_manually_edited", False):
+            return "manual"
+        if (getattr(obj, "line_discount", None) or Decimal("0")) > Decimal("0"):
+            return "discount"
+        return None
 
 
 class SalePaymentReadSerializer(serializers.Serializer):
@@ -776,12 +797,14 @@ class SaleDetailSerializer(serializers.ModelSerializer):
 
     shift = serializers.PrimaryKeyRelatedField(read_only=True)
     cashbox = serializers.PrimaryKeyRelatedField(read_only=True)
+    branch = serializers.PrimaryKeyRelatedField(read_only=True)
     cashbox_name = serializers.SerializerMethodField(read_only=True)
 
     class Meta:
         model = Sale
         fields = (
             "id",
+            "branch",
             "status",
             "subtotal",
             "discount_total",

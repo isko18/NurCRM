@@ -52,6 +52,7 @@ def _sale_item_to_good(item) -> dict:
         eff = Decimal("0")
     price_ty = _som_to_tyiyun_int(eff)
     return {
+        "item_id": str(item.id),
         "calcItemAttributeCode": calc,
         "name": (item.name_snapshot or "Позиция")[:255],
         "sgtin": str(code),
@@ -61,6 +62,44 @@ def _sale_item_to_good(item) -> dict:
         "st": 0,
         "vat": 0,
     }
+
+
+def enrich_ekassa_fiscal_with_item_ids(ekassa_fiscal: dict, sale) -> dict:
+    """
+    Гарантирует наличие стабильного item_id / line_id / sale_item_id у каждого элемента тега 1059
+    (позиции фискального чека), чтобы фронт мог безошибочно сопоставить построчные скидки с позициями.
+    """
+    if not isinstance(ekassa_fiscal, dict):
+        return ekassa_fiscal
+    fields = ekassa_fiscal.get("fields")
+    if not isinstance(fields, dict):
+        return ekassa_fiscal
+
+    tag_1059 = fields.get("1059")
+    if not isinstance(tag_1059, list) or not tag_1059:
+        return ekassa_fiscal
+
+    ekassa_copy = dict(ekassa_fiscal)
+    fields_copy = dict(fields)
+    new_1059 = []
+
+    items = list(sale.items.all().order_by("id")) if hasattr(sale, "items") else []
+    for idx, pos in enumerate(tag_1059):
+        if isinstance(pos, dict):
+            pos_copy = dict(pos)
+            if idx < len(items):
+                item_id = str(items[idx].id)
+                pos_copy.setdefault("item_id", item_id)
+                pos_copy.setdefault("line_id", item_id)
+                pos_copy.setdefault("sale_item_id", item_id)
+                pos_copy.setdefault("id", item_id)
+            new_1059.append(pos_copy)
+        else:
+            new_1059.append(pos)
+
+    fields_copy["1059"] = new_1059
+    ekassa_copy["fields"] = fields_copy
+    return ekassa_copy
 
 
 def try_fiscalize_pos_sale(sale_id) -> None:
@@ -160,6 +199,17 @@ def try_fiscalize_pos_sale(sale_id) -> None:
             fd_int = int(fd)
         except (TypeError, ValueError):
             fd_int = None
+
+    # Гарантируем стабильный item_id в позициях 1059
+    tag_1059 = fields.get("1059")
+    if isinstance(tag_1059, list):
+        for idx, pos in enumerate(tag_1059):
+            if isinstance(pos, dict) and idx < len(items):
+                item_id = str(items[idx].id)
+                pos.setdefault("item_id", item_id)
+                pos.setdefault("line_id", item_id)
+                pos.setdefault("sale_item_id", item_id)
+                pos.setdefault("id", item_id)
 
     # Ключевые реквизиты для печати (см. PDF «Интеграция_1.14», раздел «Отправка чека»):
     # 1037 — РН ККМ, 1041 — ФМ, 1040 — ФД, 1077 — ФПД; link — ссылка для проверки (QR)

@@ -425,12 +425,22 @@ class CompanyBranchRestrictedMixin:
 
         return None
 
+    def _include_global(self) -> bool:
+        req = self._request()
+        if not req:
+            return False
+        qp = getattr(req, "query_params", None) or getattr(req, "GET", {})
+        return (qp.get("include_global") or "").strip().lower() in ("1", "true", "yes", "on")
+
     def _auto_branch(self) -> Optional[Branch]:
         """
         Активный филиал:
-          1) «Жёсткий» филиал сотрудника (primary / branch / branch_ids / memberships / request.branch)
-          2) ?branch=<uuid> в запросе (если принадлежит компании и НЕТ жёсткого филиала)
-          3) None (нет филиала — глобальный режим по всей компании, но только записи без branch)
+          1) ?branch=<uuid> в запросе:
+             - проверка валидности UUID -> 400
+             - проверка принадлежности компании -> 404
+             - проверка прав сотрудника с branch_ids -> 403
+          2) «Жёсткий» филиал сотрудника (primary / branch / branch_ids / memberships / request.branch)
+          3) None (нет филиала — глобальный режим по всей компании)
         """
         req = self._request()
         user = self._user()
@@ -445,29 +455,59 @@ class CompanyBranchRestrictedMixin:
         company = self._company()
         company_id = getattr(company, "id", None)
 
-        # 1) сначала ищем жёстко назначенный филиал
-        fixed_branch = self._fixed_branch_from_user(company)
-        if fixed_branch is not None:
-            setattr(req, "branch", fixed_branch)
-            setattr(req, "_cached_auto_branch", fixed_branch)
-            return fixed_branch
-
-        # 2) если у пользователя НЕТ назначенного филиала — позволяем выбирать через ?branch
         branch_id = None
         if hasattr(req, "query_params"):
             branch_id = req.query_params.get("branch")
         elif hasattr(req, "GET"):
             branch_id = req.GET.get("branch")
 
-        if branch_id and company_id:
+        if branch_id:
+            try:
+                UUID(str(branch_id))
+            except (ValueError, TypeError, AttributeError):
+                raise ValidationError({"branch": ["Некорректный UUID филиала."]})
+
             try:
                 br = Branch.objects.get(id=branch_id, company_id=company_id)
-                setattr(req, "branch", br)
-                setattr(req, "_cached_auto_branch", br)
-                return br
-            except (Branch.DoesNotExist, ValueError):
-                # чужой/битый UUID — игнорируем
-                pass
+            except Branch.DoesNotExist:
+                raise NotFound({"detail": "Филиал не найден."})
+
+            # Check employee branch access
+            is_owner = (
+                getattr(user, "is_superuser", False)
+                or bool(getattr(user, "owned_company", None))
+                or getattr(user, "is_admin", False)
+                or getattr(user, "role", None) in ("owner", "admin", "OWNER", "ADMIN", "Владелец", "Администратор")
+            )
+            if not is_owner:
+                allowed_branches = set()
+                branch_ids = getattr(user, "branch_ids", None)
+                if isinstance(branch_ids, (list, tuple)):
+                    allowed_branches.update(str(x) for x in branch_ids)
+                if hasattr(user, "branch_memberships"):
+                    allowed_branches.update(
+                        str(x) for x in user.branch_memberships.values_list("branch_id", flat=True)
+                    )
+                if hasattr(user, "branches"):
+                    allowed_branches.update(
+                        str(x) for x in user.branches.values_list("id", flat=True)
+                    )
+                if getattr(user, "branch_id", None):
+                    allowed_branches.add(str(user.branch_id))
+
+                if allowed_branches and str(br.id) not in allowed_branches:
+                    raise PermissionDenied("У вас нет доступа к этому филиалу.")
+
+            setattr(req, "branch", br)
+            setattr(req, "_cached_auto_branch", br)
+            return br
+
+        # 2) если параметр не передан — ищем жёстко назначенный филиал
+        fixed_branch = self._fixed_branch_from_user(company)
+        if fixed_branch is not None:
+            setattr(req, "branch", fixed_branch)
+            setattr(req, "_cached_auto_branch", fixed_branch)
+            return fixed_branch
 
         # 3) никакого филиала → None (работаем по компании, но без филиалов)
         setattr(req, "_cached_auto_branch", None)
@@ -489,24 +529,11 @@ class CompanyBranchRestrictedMixin:
         """
         Ограничение queryset текущей company / branch.
 
-        По умолчанию смотрим на поля самой модели:
-            company / branch
-
-        Но если данные живут не на самой модели, а через FK (например,
-        AgentRequestItem -> cart -> company/branch), можно передать:
-            company_field="cart__company"
-            branch_field="cart__branch"
-
-        Логика выборки (унифицирована с другими модулями: cafe/barber/warehouse,
-        а также с `_restrict_pk_queryset_strict` в serializers.py):
-            - если branch определён → показываем записи этого филиала
-              И глобальные записи без филиала (Q(branch=branch) | Q(branch__isnull=True));
-            - если branch is None → не фильтруем по branch вообще (вся компания).
-
-        Так старые аккаунты (где все данные с branch=NULL) продолжают видеть всё,
-        а новые аккаунты с филиалами не теряют видимость глобальных записей.
+        - если branch передан / активен:
+            * по умолчанию строгая изоляция по филиалу: branch=branch;
+            * если запрошен include_global=1: Q(branch=branch) | Q(branch__isnull=True);
+        - если branch is None: не фильтруем по branch (вся компания).
         """
-
         company = self._company()
         branch = self._auto_branch()
         model = qs.model
@@ -521,14 +548,20 @@ class CompanyBranchRestrictedMixin:
         # branch
         if branch_field:
             if branch is not None:
-                qs = qs.filter(
-                    Q(**{branch_field: branch})
-                    | Q(**{f"{branch_field}__isnull": True})
-                )
+                if self._include_global():
+                    qs = qs.filter(
+                        Q(**{branch_field: branch})
+                        | Q(**{f"{branch_field}__isnull": True})
+                    )
+                else:
+                    qs = qs.filter(**{branch_field: branch})
             # branch is None → не фильтруем по branch
         elif self._model_has_field(model, "branch"):
             if branch is not None:
-                qs = qs.filter(Q(branch=branch) | Q(branch__isnull=True))
+                if self._include_global():
+                    qs = qs.filter(Q(branch=branch) | Q(branch__isnull=True))
+                else:
+                    qs = qs.filter(branch=branch)
             # branch is None → не фильтруем по branch
 
         return qs
@@ -731,13 +764,40 @@ def _annotate_product_is_favorite(qs):
 
 def _filter_products_company_only(view, qs):
     """
-    Products in main are company-level catalog items.
-    Do not restrict them by branch, otherwise products with branch_id disappear
-    for users whose active branch differs from the product branch.
+    Products in main:
+    - по умолчанию отдаем каталог компании (company-level items);
+    - если передан ?branch=<uuid> или у пользователя активный филиал -> фильтруем по филиалу.
     """
     company = view._company()
     if company is not None:
         qs = qs.filter(company=company)
+
+    branch = view._auto_branch()
+    req = view._request()
+    branch_param = req.query_params.get("branch") if (req and hasattr(req, "query_params")) else None
+
+    if branch_param:
+        if branch is not None:
+            if view._include_global():
+                qs = qs.filter(Q(branch=branch) | Q(branch__isnull=True))
+            else:
+                qs = qs.filter(branch=branch)
+        else:
+            qs = qs.none()
+    elif branch is not None:
+        user = view._user()
+        is_owner = (
+            getattr(user, "is_superuser", False)
+            or bool(getattr(user, "owned_company", None))
+            or getattr(user, "is_admin", False)
+            or getattr(user, "role", None) in ("owner", "admin", "OWNER", "ADMIN", "Владелец", "Администратор")
+        )
+        if not is_owner:
+            if view._include_global():
+                qs = qs.filter(Q(branch=branch) | Q(branch__isnull=True))
+            else:
+                qs = qs.filter(branch=branch)
+
     return qs
 
 

@@ -124,13 +124,24 @@ def build_receipt_payload(sale, cashier_name=None, *, ensure_number: bool = True
         ))
         line_disc = _to_float(getattr(it, "line_discount", 0))
         line_total = qty * price - line_disc
+        price_manually_edited = bool(getattr(it, "price_manually_edited", False))
+        price_override_reason = "manual" if price_manually_edited else ("discount" if line_disc > 0 else None)
         items.append(
             {
+                "id": str(it.id),
+                "item_id": str(it.id),
+                "line_id": str(it.id),
+                "sale_item_id": str(it.id),
                 "name": str(name),
                 "qty": qty,
+                "quantity": qty,
                 "price": price,
+                "unit_price": price,
                 "line_discount": line_disc,
                 "line_total": line_total,
+                "total": line_total,
+                "price_manually_edited": price_manually_edited,
+                "price_override_reason": price_override_reason,
             }
         )
 
@@ -191,9 +202,10 @@ def build_receipt_payload(sale, cashier_name=None, *, ensure_number: bool = True
 
     # eKassa: отдаём то, что уже сохранено в Sale.ekassa_fiscal (если есть)
     try:
-        ekassa_meta = getattr(sale, "ekassa_fiscal", None)
+        from apps.ekassa.sale_bridge import enrich_ekassa_fiscal_with_item_ids
+        ekassa_meta = enrich_ekassa_fiscal_with_item_ids(getattr(sale, "ekassa_fiscal", None), sale)
     except Exception:
-        ekassa_meta = None
+        ekassa_meta = getattr(sale, "ekassa_fiscal", None)
     if ekassa_meta:
         payload["ekassa"] = ekassa_meta
 

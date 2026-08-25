@@ -30,6 +30,7 @@ from apps.main.models import (
     StockMovement,
     ProductionRecord,
     SupplierPurchase,
+    PosPrinterSetting,
 )
 
 from apps.consalting.models import ServicesConsalting
@@ -4104,3 +4105,24 @@ class ProductInventorySessionReadSerializer(serializers.ModelSerializer):
             "lines",
         )
         read_only_fields = fields
+
+
+class PosPrinterSettingSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
+    device_key = serializers.CharField(max_length=128, required=True)
+    settings = serializers.JSONField(required=False, default=dict)
+    cashbox_id = serializers.UUIDField(source="cashbox.id", read_only=True, allow_null=True)
+
+    class Meta:
+        model = PosPrinterSetting
+        fields = (
+            "id",
+            "company",
+            "branch",
+            "cashbox",
+            "cashbox_id",
+            "device_key",
+            "settings",
+            "created_at",
+            "updated_at",
+        )
+        read_only_fields = ("id", "company", "created_at", "updated_at")

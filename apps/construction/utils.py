@@ -148,19 +148,47 @@ def get_active_branch(request):
 
     company_id = getattr(company, "id", None)
 
-    if not is_owner_like(user):
-        fixed = fixed_branch_from_user(user, company)
-        setattr(request, "branch", fixed if fixed else None)
-        return fixed if fixed else None
+    import uuid
+    from rest_framework.exceptions import NotFound, PermissionDenied, ValidationError
 
     branch_id = request.query_params.get("branch") if hasattr(request, "query_params") else request.GET.get("branch")
     if branch_id:
         try:
+            uuid.UUID(str(branch_id))
+        except (ValueError, TypeError, AttributeError):
+            raise ValidationError({"branch": ["Некорректный UUID филиала."]})
+
+        try:
             br = Branch.objects.get(id=branch_id, company_id=company_id)
-            setattr(request, "branch", br)
-            return br
-        except (Branch.DoesNotExist, ValueError):
-            pass
+        except Branch.DoesNotExist:
+            raise NotFound({"detail": "Филиал не найден."})
+
+        if not is_owner_like(user):
+            allowed_branches = set()
+            branch_ids = getattr(user, "branch_ids", None)
+            if isinstance(branch_ids, (list, tuple)):
+                allowed_branches.update(str(x) for x in branch_ids)
+            if hasattr(user, "branch_memberships"):
+                allowed_branches.update(
+                    str(x) for x in user.branch_memberships.values_list("branch_id", flat=True)
+                )
+            if hasattr(user, "branches"):
+                allowed_branches.update(
+                    str(x) for x in user.branches.values_list("id", flat=True)
+                )
+            if getattr(user, "branch_id", None):
+                allowed_branches.add(str(user.branch_id))
+
+            if allowed_branches and str(br.id) not in allowed_branches:
+                raise PermissionDenied("У вас нет доступа к этому филиалу.")
+
+        setattr(request, "branch", br)
+        return br
+
+    if not is_owner_like(user):
+        fixed = fixed_branch_from_user(user, company)
+        setattr(request, "branch", fixed if fixed else None)
+        return fixed if fixed else None
 
     if hasattr(request, "branch"):
         b = getattr(request, "branch")

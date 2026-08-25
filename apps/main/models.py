@@ -1943,6 +1943,10 @@ class CartItem(models.Model):
     unit_price = models.DecimalField(max_digits=12, decimal_places=2)
     # Скидка на строку (хранится отдельно от цены — можно менять цену и скидку независимо)
     line_discount = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal("0.00"))
+    price_manually_edited = models.BooleanField(
+        default=False,
+        verbose_name="Цена изменена вручную",
+    )
     # Продажа поштучно из пачки: quantity — в штуках, списание остатка = quantity / quantity_in_package
     sale_package = models.ForeignKey(
         "main.ProductPackage",
@@ -2496,6 +2500,10 @@ class SaleItem(models.Model):
     quantity = models.DecimalField(max_digits=12, decimal_places=3, default=Decimal("1.000"))
     # Скидка на строку (сумма). Храним отдельно от unit_price, как и в CartItem.
     line_discount = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal("0.00"))
+    price_manually_edited = models.BooleanField(
+        default=False,
+        verbose_name="Цена изменена вручную",
+    )
 
     sale_package = models.ForeignKey(
         "main.ProductPackage",
@@ -5891,3 +5899,66 @@ class ProductionSalaryPayout(models.Model):
 
     def __str__(self):
         return f"Зарплата {_user_display_name(self.employee)}: {self.amount}"
+
+
+class PosPrinterSetting(models.Model):
+    """
+    POS: синхронизация ESC/POS-конфига принтера чеков per-device (или per-branch workstation).
+    Хранит настройки шрифта, ширины бумаги, code page, денежного ящика и т.д.
+    """
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    company = models.ForeignKey(
+        Company,
+        on_delete=models.CASCADE,
+        related_name="pos_printer_settings",
+        verbose_name="Компания",
+        db_index=True,
+    )
+    branch = models.ForeignKey(
+        Branch,
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
+        related_name="pos_printer_settings",
+        verbose_name="Филиал",
+        db_index=True,
+    )
+    cashbox = models.ForeignKey(
+        "construction.Cashbox",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="pos_printer_settings",
+        verbose_name="Касса",
+        db_index=True,
+    )
+    device_key = models.CharField(
+        max_length=128,
+        db_index=True,
+        verbose_name="Идентификатор устройства",
+    )
+    settings = models.JSONField(
+        default=dict,
+        blank=True,
+        verbose_name="Настройки ESC/POS принтера",
+    )
+    created_at = models.DateTimeField(auto_now_add=True, verbose_name="Создано")
+    updated_at = models.DateTimeField(auto_now=True, verbose_name="Обновлено")
+
+    class Meta:
+        verbose_name = "Настройка POS-принтера"
+        verbose_name_plural = "Настройки POS-принтеров"
+        constraints = [
+            models.UniqueConstraint(
+                fields=["company", "device_key"],
+                name="uq_pos_printer_setting_company_device_key",
+            )
+        ]
+        indexes = [
+            models.Index(fields=["company", "device_key"]),
+            models.Index(fields=["company", "branch"]),
+        ]
+
+    def __str__(self):
+        return f"POS Printer {self.device_key} ({self.company.name})"
+

@@ -132,6 +132,7 @@ def checkout_cart(
                 line_discount=getattr(it, "line_discount", None) or Decimal("0.00"),
                 sale_package_id=it.sale_package_id,
                 purchase_price_snapshot=snap,
+                price_manually_edited=bool(getattr(it, "price_manually_edited", False)),
             )
         )
     SaleItem.objects.bulk_create(sale_items)

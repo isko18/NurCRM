@@ -134,12 +134,38 @@ def _get_active_branch(request, company):
         branch_id = request.GET.get("branch")
 
     if branch_id:
+        import uuid
+        try:
+            uuid.UUID(str(branch_id))
+        except (ValueError, TypeError, AttributeError):
+            raise ValidationError({"branch": ["Некорректный UUID филиала."]})
+
         try:
             br = Branch.objects.get(id=branch_id, company=company)
-            setattr(request, "branch", br)
-            return br
-        except (Branch.DoesNotExist, ValueError):
-            pass
+        except Branch.DoesNotExist:
+            raise NotFound({"detail": "Филиал не найден."})
+
+        if user and not _is_owner_like(user):
+            allowed_branches = set()
+            b_ids = getattr(user, "branch_ids", None)
+            if isinstance(b_ids, (list, tuple)):
+                allowed_branches.update(str(x) for x in b_ids)
+            if hasattr(user, "branch_memberships"):
+                allowed_branches.update(
+                    str(x) for x in user.branch_memberships.values_list("branch_id", flat=True)
+                )
+            if hasattr(user, "branches"):
+                allowed_branches.update(
+                    str(x) for x in user.branches.values_list("id", flat=True)
+                )
+            if getattr(user, "branch_id", None):
+                allowed_branches.add(str(user.branch_id))
+
+            if allowed_branches and str(br.id) not in allowed_branches:
+                raise PermissionDenied("У вас нет доступа к этому филиалу.")
+
+        setattr(request, "branch", br)
+        return br
 
     # если где-то ранее уже установили request.branch
     b = getattr(request, "branch", None)
@@ -153,7 +179,7 @@ def _get_active_branch(request, company):
 def _apply_branch_filter_to_users(request, company, base_qs):
     """
     branch=None -> весь base_qs
-    branch!=None -> (membership в branch) ИЛИ (нет membership вообще)
+    branch!=None -> membership в branch (и без membership только если include_global=1)
     """
     if not company:
         return base_qs.none()
@@ -162,12 +188,21 @@ def _apply_branch_filter_to_users(request, company, base_qs):
     if not branch:
         return base_qs
 
+    qp = getattr(request, "query_params", None) or getattr(request, "GET", {})
+    include_global = (qp.get("include_global") or "").strip().lower() in ("1", "true", "yes", "on")
+
+    if include_global:
+        return (
+            base_qs.filter(
+                Q(branch_memberships__branch=branch) |
+                Q(branch_memberships__isnull=True)
+            )
+            .distinct()
+        )
+
     # ВАЖНО: distinct нужен, потому что join на memberships
     return (
-        base_qs.filter(
-            Q(branch_memberships__branch=branch) |
-            Q(branch_memberships__isnull=True)
-        )
+        base_qs.filter(branch_memberships__branch=branch)
         .distinct()
     )
 

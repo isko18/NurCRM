@@ -70,6 +70,7 @@ from apps.main.models import (
     ClientDeal,
     DealInstallment,
     Debt,
+    PosPrinterSetting,
 )
 from apps.main.models import ManufactureSubreal, AgentSaleAllocation, ReturnFromAgent
 from apps.main.models import cart_line_base, scale_amount_step
@@ -4111,6 +4112,7 @@ class CartItemUpdateDestroyAPIView(MarketCashierOnlyMixin, APIView):
         # Цена и скидка меняются независимо. Со скидкой можно продавать ниже закупочной.
         if unit_price is not None:
             item.unit_price = self._apply_min_price(item, _q2(unit_price))
+            item.price_manually_edited = True
         if line_discount is not None:
             max_dp = request.user.company.max_discount_percent
             if max_dp is not None and not is_admin:
@@ -4126,6 +4128,7 @@ class CartItemUpdateDestroyAPIView(MarketCashierOnlyMixin, APIView):
             update_fields.append("quantity")
         if unit_price is not None:
             update_fields.append("unit_price")
+            update_fields.append("price_manually_edited")
         if line_discount is not None:
             update_fields.append("line_discount")
         if update_fields:
@@ -4926,6 +4929,7 @@ class AgentCartItemUpdateDestroyAPIView(MarketCashierOnlyMixin, APIView):
         # Цена и скидка меняются независимо.
         if unit_price is not None:
             item.unit_price = _q2(unit_price)
+            item.price_manually_edited = True
         if line_discount is not None:
             max_dp = request.user.company.max_discount_percent
             if max_dp is not None and not is_admin:
@@ -4941,6 +4945,7 @@ class AgentCartItemUpdateDestroyAPIView(MarketCashierOnlyMixin, APIView):
             update_fields.append("quantity")
         if unit_price is not None:
             update_fields.append("unit_price")
+            update_fields.append("price_manually_edited")
         if line_discount is not None:
             update_fields.append("line_discount")
         if update_fields:
@@ -4958,3 +4963,110 @@ class AgentCartItemUpdateDestroyAPIView(MarketCashierOnlyMixin, APIView):
         item.delete()
         cart.recalc()
         return Response(SaleCartSerializer(cart).data, status=200)
+
+
+class PosPrinterSettingAPIView(CompanyBranchRestrictedMixin, APIView):
+    """
+    GET /api/main/pos/printer-settings/?device_key=<device_key>
+    PUT / PATCH / POST /api/main/pos/printer-settings/
+    DELETE /api/main/pos/printer-settings/?device_key=<device_key>
+
+    Синхронизация ESC/POS-конфигурации принтера чеков per-device (или per-branch workstation).
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request, *args, **kwargs):
+        from apps.main.serializers import PosPrinterSettingSerializer
+
+        company = self._company()
+        if not company:
+            raise PermissionDenied("У пользователя не настроена компания.")
+
+        device_key = (request.query_params.get("device_key") or "").strip()
+        if device_key:
+            try:
+                setting = PosPrinterSetting.objects.select_related("branch", "cashbox").get(
+                    company=company, device_key=device_key
+                )
+                return Response(PosPrinterSettingSerializer(setting, context={"request": request}).data, status=status.HTTP_200_OK)
+            except PosPrinterSetting.DoesNotExist:
+                raise NotFound({"detail": "Конфигурация принтера для данного устройства не найдена."})
+
+        qs = self._filter_qs_company_branch(
+            PosPrinterSetting.objects.select_related("branch", "cashbox").all()
+        )
+        serializer = PosPrinterSettingSerializer(qs, many=True, context={"request": request})
+        return Response(serializer.data, status=status.HTTP_200_OK)
+
+    def _save_setting(self, request):
+        from apps.main.serializers import PosPrinterSettingSerializer
+        from apps.users.models import Branch
+        from apps.construction.models import Cashbox
+
+        company = self._company()
+        if not company:
+            raise PermissionDenied("У пользователя не настроена компания.")
+
+        data = request.data or {}
+        device_key = (data.get("device_key") or request.query_params.get("device_key") or "").strip()
+        if not device_key:
+            raise ValidationError({"device_key": ["Поле device_key обязательно."]})
+
+        settings_dict = data.get("settings")
+        if settings_dict is None:
+            settings_dict = {}
+        elif not isinstance(settings_dict, dict):
+            raise ValidationError({"settings": ["Поле settings должно быть JSON-объектом (словарем)."]})
+
+        branch = self._auto_branch()
+        branch_id = data.get("branch")
+        if branch_id:
+            try:
+                branch = Branch.objects.get(id=branch_id, company=company)
+            except (Branch.DoesNotExist, ValueError):
+                raise ValidationError({"branch": ["Некорректный филиал."]})
+
+        cashbox = None
+        cashbox_id = data.get("cashbox")
+        if cashbox_id:
+            try:
+                cashbox = Cashbox.objects.get(id=cashbox_id, company=company)
+            except (Cashbox.DoesNotExist, ValueError):
+                raise ValidationError({"cashbox": ["Некорректная касса."]})
+
+        setting, created = PosPrinterSetting.objects.update_or_create(
+            company=company,
+            device_key=device_key,
+            defaults={
+                "branch": branch,
+                "cashbox": cashbox,
+                "settings": settings_dict,
+            },
+        )
+        serializer = PosPrinterSettingSerializer(setting, context={"request": request})
+        return Response(serializer.data, status=status.HTTP_201_CREATED if created else status.HTTP_200_OK)
+
+    def post(self, request, *args, **kwargs):
+        return self._save_setting(request)
+
+    def put(self, request, *args, **kwargs):
+        return self._save_setting(request)
+
+    def patch(self, request, *args, **kwargs):
+        return self._save_setting(request)
+
+    def delete(self, request, *args, **kwargs):
+        company = self._company()
+        if not company:
+            raise PermissionDenied("У пользователя не настроена компания.")
+
+        device_key = (request.query_params.get("device_key") or (request.data or {}).get("device_key") or "").strip()
+        if not device_key:
+            raise ValidationError({"device_key": ["Поле device_key обязательно для удаления."]})
+
+        deleted_count, _ = PosPrinterSetting.objects.filter(company=company, device_key=device_key).delete()
+        if deleted_count == 0:
+            raise NotFound({"detail": "Конфигурация принтера для данного устройства не найдена."})
+
+        return Response(status=status.HTTP_204_NO_CONTENT)
+

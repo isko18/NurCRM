@@ -64,6 +64,8 @@ class SaleReceiptAPIView(APIView):
 
         vh = receipt_vendor_header(sale)
 
+        from apps.ekassa.sale_bridge import enrich_ekassa_fiscal_with_item_ids
+
         items = []
         for it in sale.items.all():
             qty = q_qty(getattr(it, "quantity", 0))
@@ -71,19 +73,29 @@ class SaleReceiptAPIView(APIView):
             line_disc = q2(getattr(it, "line_discount", 0))
             line_base = q2(unit_price * qty)
             total = q2(line_base - line_disc)
+            price_manually_edited = bool(getattr(it, "price_manually_edited", False))
+            price_override_reason = "manual" if price_manually_edited else ("discount" if line_disc > Decimal("0") else None)
 
             items.append(
                 {
                     "id": str(it.id),
+                    "item_id": str(it.id),
+                    "line_id": str(it.id),
+                    "sale_item_id": str(it.id),
                     "product_id": str(it.product_id) if getattr(it, "product_id", None) else None,
                     "name": safe_str(
                         getattr(it, "name_snapshot", None) or getattr(it, "custom_name", None),
                         dash="",
                     ),
                     "qty": fmt_decimal(qty),
+                    "quantity": fmt_decimal(qty),
                     "unit_price": fmt_decimal(unit_price),
+                    "price": fmt_decimal(unit_price),
                     "line_discount": fmt_decimal(line_disc),
+                    "line_total": fmt_decimal(total),
                     "total": fmt_decimal(total),
+                    "price_manually_edited": price_manually_edited,
+                    "price_override_reason": price_override_reason,
                 }
             )
 
@@ -140,7 +152,7 @@ class SaleReceiptAPIView(APIView):
                 "change": fmt_decimal(q2(getattr(sale, "change", 0))),
                 "paid_at": timezone.localtime(sale.paid_at).isoformat() if getattr(sale, "paid_at", None) else None,
             },
-            "ekassa": getattr(sale, "ekassa_fiscal", None),
+            "ekassa": enrich_ekassa_fiscal_with_item_ids(getattr(sale, "ekassa_fiscal", None), sale),
         }
 
         return Response(payload, status=200)
@@ -171,18 +183,29 @@ class SaleInvoiceAPIView(APIView):
             line_base = q2(unit_price * qty)
             line_total = q2(line_base - line_disc)
 
+            price_manually_edited = bool(getattr(it, "price_manually_edited", False))
+            price_override_reason = "manual" if price_manually_edited else ("discount" if line_disc > Decimal("0") else None)
+
             items.append(
                 {
                     "id": str(it.id),
+                    "item_id": str(it.id),
+                    "line_id": str(it.id),
+                    "sale_item_id": str(it.id),
                     "product_id": str(it.product_id) if getattr(it, "product_id", None) else None,
                     "name": safe_str(
                         getattr(it, "name_snapshot", None) or getattr(it, "custom_name", None),
                         dash="",
                     ),
                     "qty": fmt_decimal(qty),
+                    "quantity": fmt_decimal(qty),
                     "unit_price": fmt_decimal(unit_price),
+                    "price": fmt_decimal(unit_price),
                     "line_discount": fmt_decimal(line_disc),
+                    "line_total": fmt_decimal(line_total),
                     "total": fmt_decimal(line_total),
+                    "price_manually_edited": price_manually_edited,
+                    "price_override_reason": price_override_reason,
                 }
             )
 

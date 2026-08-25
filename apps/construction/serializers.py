@@ -312,11 +312,36 @@ class CashboxWithFlowsSerializer(CompanyBranchReadOnlyMixin):
 class CashboxSerializer(CompanyBranchReadOnlyMixin):
     analytics = serializers.SerializerMethodField()
     is_consumption = serializers.BooleanField(read_only=True)
+    balance = serializers.SerializerMethodField()
+    current_balance = serializers.SerializerMethodField()
+    currency = serializers.CharField(default="KGS", read_only=True)
+    is_active = serializers.BooleanField(default=True, read_only=True)
 
     class Meta:
         model = Cashbox
-        fields = ["id", "company", "branch", "name", "is_consumption", "analytics"]
-        read_only_fields = ["id", "company", "branch", "analytics", "is_consumption"]
+        fields = [
+            "id", "company", "branch", "name",
+            "is_consumption", "balance", "current_balance", "currency", "is_active",
+            "analytics",
+        ]
+        read_only_fields = [
+            "id", "company", "branch", "analytics", "is_consumption",
+            "balance", "current_balance", "currency", "is_active",
+        ]
+
+    def get_balance(self, obj):
+        amap = self.context.get("analytics_map")
+        if amap and str(obj.id) in amap:
+            a = amap[str(obj.id)]
+            inc = Decimal(str(a.get("income_total") or "0.00"))
+            exp = Decimal(str(a.get("expense_total") or "0.00"))
+            return f"{(inc - exp):.2f}"
+        inc = obj.flows.filter(status="approved", type="income").aggregate(s=Sum("amount"))["s"] or Decimal("0.00")
+        exp = obj.flows.filter(status="approved", type="expense").aggregate(s=Sum("amount"))["s"] or Decimal("0.00")
+        return f"{(inc - exp):.2f}"
+
+    def get_current_balance(self, obj):
+        return self.get_balance(obj)
     def to_representation(self, instance):
         data = super().to_representation(instance)
 

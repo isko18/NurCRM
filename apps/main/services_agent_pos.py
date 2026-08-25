@@ -287,6 +287,7 @@ def checkout_agent_cart(
                 barcode_snapshot=None,
                 unit_price=price,
                 quantity=qty,
+                price_manually_edited=bool(v.get("price_manually_edited", False)),
             )
             continue
 
@@ -301,6 +302,7 @@ def checkout_agent_cart(
             barcode_snapshot=getattr(product, "barcode", None),
             unit_price=price,
             quantity=qty,
+            price_manually_edited=bool(v.get("price_manually_edited", False)),
         )
 
         if not use_main_stock:
