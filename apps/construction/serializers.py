@@ -463,6 +463,8 @@ class CashFlowSerializer(CompanyBranchReadOnlyMixin):
             "status",
             "source_cashbox_flow_id",
             "source_business_operation_id",
+            "source_kind",
+            "source_id",
             "shift",
             "category",
             "category_title",

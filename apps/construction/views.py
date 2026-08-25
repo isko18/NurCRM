@@ -533,6 +533,17 @@ class CashFlowDetailView(CompanyBranchScopedMixin, generics.RetrieveUpdateDestro
     def get_queryset(self):
         return self._scoped_queryset(super().get_queryset())
 
+    @transaction.atomic
+    def update(self, request, *args, **kwargs):
+        instance = self.get_object()
+        old_status = instance.status
+        resp = super().update(request, *args, **kwargs)
+        instance.refresh_from_db()
+        if old_status != CashFlow.Status.REJECTED and instance.status == CashFlow.Status.REJECTED:
+            from apps.construction.auto_cashflow import handle_cashflow_reject
+            handle_cashflow_reject(instance, user=request.user)
+        return resp
+
 
 class CashFlowCategoryListCreateView(CompanyBranchScopedMixin, generics.ListCreateAPIView):
     queryset = CashFlowCategory.objects.select_related("company", "branch")
@@ -738,6 +749,7 @@ class CashFlowBulkStatusUpdateView(CompanyBranchScopedMixin, generics.GenericAPI
         if missing:
             raise ValidationError({"missing_ids": missing})
 
+        old_flows = list(qs)
         updated_ids = []
         updated_count = 0
 
@@ -755,6 +767,13 @@ class CashFlowBulkStatusUpdateView(CompanyBranchScopedMixin, generics.GenericAPI
                 status=Case(*whens, output_field=CharField())
             )
             updated_ids.extend([str(x) for x in chunk_ids])
+
+        from apps.construction.auto_cashflow import handle_cashflow_reject
+        for cf in old_flows:
+            new_st = id_to_status.get(cf.id)
+            if cf.status != CashFlow.Status.REJECTED and new_st == CashFlow.Status.REJECTED:
+                cf.status = CashFlow.Status.REJECTED
+                handle_cashflow_reject(cf, user=request.user)
 
         return Response(
             {"count": updated_count, "updated_ids": updated_ids},

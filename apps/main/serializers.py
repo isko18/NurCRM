@@ -1054,6 +1054,7 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
         allow_null=True,
         allow_blank=True,
     )
+    cashflows = serializers.SerializerMethodField(read_only=True)
 
     class Meta:
         model = Product
@@ -1094,6 +1095,7 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
             "weight_kg",
             "total_price",
             "purchase_batches",
+            "cashflows",
         ]
         read_only_fields = [
             "id", "created_at", "updated_at",
@@ -1109,7 +1111,14 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
             "promotion_rules",
             "weight_kg", "total_price",
             "purchase_batches",
+            "cashflows",
         ]
+
+    def get_cashflows(self, obj):
+        from apps.construction.models import CashFlow
+        from apps.construction.auto_cashflow import serialize_auto_cashflows
+        cfs = CashFlow.objects.filter(company_id=obj.company_id, source_id=str(obj.id))
+        return serialize_auto_cashflows(cfs)
         extra_kwargs = {
             "kind": {"required": False, "default": Product.Kind.PRODUCT},
             "purchase_price": {"required": False, "default": 0, "allow_null": True},
@@ -2079,6 +2088,7 @@ class ClientDealSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializ
 
     auto_schedule = serializers.BooleanField(required=False)
     kind_display = serializers.CharField(source="get_kind_display", read_only=True)
+    cashflows = serializers.SerializerMethodField()
 
     class Meta:
         model = ClientDeal
@@ -2092,6 +2102,7 @@ class ClientDealSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializ
             "debt_amount", "daily_payment", "remaining_debt",
             "installments",
             "payments",
+            "cashflows",
             "auto_schedule",
             "note", "created_at", "updated_at",
         ]
@@ -2101,7 +2112,14 @@ class ClientDealSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializ
             "client_full_name", "kind_display",
             "debt_amount", "daily_payment", "remaining_debt",
             "payments",
+            "cashflows",
         ]
+
+    def get_cashflows(self, obj):
+        from apps.construction.models import CashFlow
+        from apps.construction.auto_cashflow import serialize_auto_cashflows
+        cfs = CashFlow.objects.filter(company=obj.company, source_id=str(obj.id))
+        return serialize_auto_cashflows(cfs)
 
     def to_representation(self, instance):
         ret = super().to_representation(instance)
@@ -2275,6 +2293,7 @@ class DealPayInputSerializer(serializers.Serializer):
     date = serializers.DateField(required=False)
     idempotency_key = serializers.UUIDField(required=True)
     note = serializers.CharField(required=False, allow_blank=True)
+    cashbox_id = serializers.UUIDField(required=False, allow_null=True)
 
 
 class DealRefundInputSerializer(serializers.Serializer):
@@ -2364,6 +2383,7 @@ class DebtSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
 
     paid_total = serializers.SerializerMethodField()
     balance = serializers.SerializerMethodField()
+    cashflows = serializers.SerializerMethodField()
 
     class Meta:
         model = Debt
@@ -2371,9 +2391,16 @@ class DebtSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
             "id", "company", "branch",
             "name", "phone", "amount", "due_date",
             "paid_total", "balance",
+            "cashflows",
             "created_at", "updated_at",
         ]
-        read_only_fields = ["id", "company", "branch", "paid_total", "balance", "created_at", "updated_at"]
+        read_only_fields = ["id", "company", "branch", "paid_total", "balance", "cashflows", "created_at", "updated_at"]
+
+    def get_cashflows(self, obj):
+        from apps.construction.models import CashFlow
+        from apps.construction.auto_cashflow import serialize_auto_cashflows
+        cfs = CashFlow.objects.filter(company=obj.company, source_id=str(obj.id))
+        return serialize_auto_cashflows(cfs)
 
     def get_paid_total(self, obj) -> Decimal:
         # берём из queryset-аннотации если она есть

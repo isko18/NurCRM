@@ -501,6 +501,16 @@ class CashFlow(models.Model):
         APPROVED = "approved", "Успешно"
         REJECTED = "rejected", "Отклонено"
 
+    class SourceKind(models.TextChoices):
+        POS_SALE = "pos_sale", "POS продажа"
+        POS_PREPAYMENT = "pos_prepayment", "POS предоплата"
+        DEBT_REPAYMENT = "debt_repayment", "Погашение долга"
+        WAREHOUSE_PURCHASE = "warehouse_purchase", "Закупка товара"
+        PROCUREMENT_RECEIPT = "procurement_receipt", "Приход поставщика"
+        SUPPLIER_RETURN = "supplier_return", "Возврат поставщику"
+        DEFECT_WRITEOFF = "defect_writeoff", "Списание брака"
+        PRODUCT_RETURN = "product_return", "Возврат товара"
+
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
 
     company = models.ForeignKey(Company, on_delete=models.CASCADE, related_name="cash_cashflows", verbose_name="Компания")
@@ -524,6 +534,22 @@ class CashFlow(models.Model):
 
     source_cashbox_flow_id = models.CharField(max_length=36, null=True, blank=True, verbose_name="ID исходного движения кассы")
     source_business_operation_id = models.CharField(max_length=36, null=True, blank=True, verbose_name="ID бизнес-операции")
+
+    source_kind = models.CharField(
+        max_length=50,
+        choices=SourceKind.choices,
+        null=True,
+        blank=True,
+        db_index=True,
+        verbose_name="Тип источника",
+    )
+    source_id = models.CharField(
+        max_length=100,
+        null=True,
+        blank=True,
+        db_index=True,
+        verbose_name="ID источника",
+    )
 
     shift = models.ForeignKey(
         "construction.CashShift",
@@ -565,6 +591,7 @@ class CashFlow(models.Model):
             models.Index(fields=["company", "type", "created_at"], name="ix_flow_company_type_created"),
             models.Index(fields=["shift", "created_at"]),
             models.Index(fields=["cashier", "created_at"]),
+            models.Index(fields=["company", "source_kind", "source_id"], name="ix_flow_comp_src_kind_id"),
         ]
         constraints = [
             models.CheckConstraint(check=Q(amount__gt=0), name="ck_cashflow_amount_positive"),

@@ -882,6 +882,7 @@ def post_document(document: models.Document, allow_negative: bool = None) -> mod
 
             document.status = document.Status.POSTED
             document.save(update_fields=["status"])
+            sync_document_auto_cashflow(document)
 
         # Начисления зарплаты агенту (процент с продажи со склада-источника).
         # В той же транзакции, что и проведение продажи.
@@ -984,6 +985,51 @@ def unpost_document(document: models.Document) -> models.Document:
     return document
 
 
+def sync_document_auto_cashflow(document: models.Document, user=None):
+    from apps.construction.auto_cashflow import create_auto_cashflow
+    from apps.construction.models import CashFlow
+
+    total = Decimal(document.total or 0).quantize(Decimal("0.01"))
+    if total <= 0:
+        return None
+
+    kind_type_map = {
+        models.Document.DocType.PURCHASE: (CashFlow.SourceKind.PROCUREMENT_RECEIPT, CashFlow.Type.EXPENSE, "Закупки"),
+        models.Document.DocType.RECEIPT: (CashFlow.SourceKind.PROCUREMENT_RECEIPT, CashFlow.Type.EXPENSE, "Закупки"),
+        models.Document.DocType.PURCHASE_RETURN: (CashFlow.SourceKind.SUPPLIER_RETURN, CashFlow.Type.INCOME, "Возврат поставщику"),
+        models.Document.DocType.WRITE_OFF: (CashFlow.SourceKind.DEFECT_WRITEOFF, CashFlow.Type.EXPENSE, "Списание брака"),
+        models.Document.DocType.SALE_RETURN: (CashFlow.SourceKind.PRODUCT_RETURN, CashFlow.Type.INCOME, "Возврат товара"),
+    }
+
+    if document.doc_type not in kind_type_map:
+        return None
+
+    src_kind, flow_type, default_name = kind_type_map[document.doc_type]
+    warehouse = resolve_document_context_warehouse(document)
+    company = warehouse.company if warehouse else (document.warehouse_from.company if document.warehouse_from else getattr(document, "company", None))
+    branch = warehouse.branch if warehouse else (document.warehouse_from.branch if document.warehouse_from else None)
+    if not company:
+        return None
+
+    try:
+        cf = create_auto_cashflow(
+            company=company,
+            branch=branch,
+            user=user or getattr(document, "agent", None),
+            type=flow_type,
+            amount=total,
+            source_kind=src_kind,
+            source_id=str(document.id),
+            name=f"{default_name}: {document.number or document.id}",
+            source_business_operation_id=default_name,
+        )
+        return cf
+    except Exception as exc:
+        import logging
+        logging.getLogger(__name__).warning("Failed to create auto cashflow for document %s: %s", document.id, exc)
+        return None
+
+
 def approve_cash_request(document: models.Document, *, decided_by=None, note: str = "") -> models.Document:
     if document.status != document.Status.CASH_PENDING:
         raise ValueError("Документ не ожидает решения кассы.")
@@ -1005,6 +1051,7 @@ def approve_cash_request(document: models.Document, *, decided_by=None, note: st
 
         document.status = document.Status.POSTED
         document.save(update_fields=["status"])
+        sync_document_auto_cashflow(document, user=decided_by)
 
     return document
 

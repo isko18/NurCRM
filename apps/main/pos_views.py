@@ -2746,6 +2746,74 @@ class SaleCheckoutAPIView(MarketCashierOnlyMixin, APIView):
                 "cashbox_id": str(sale.cashbox_id) if sale.cashbox_id else None,
             }
 
+            from apps.construction.auto_cashflow import create_auto_cashflow, serialize_auto_cashflows
+            from apps.construction.models import CashFlow
+
+            auto_flows = []
+            if payments:
+                for p_part in payments:
+                    p_amt = Decimal(str(p_part.get("amount") or 0))
+                    if p_amt > 0:
+                        p_method = p_part.get("method") or "cash"
+                        p_title = dict(Sale.PaymentMethod.choices).get(p_method, p_method)
+                        cf = create_auto_cashflow(
+                            company=sale.company,
+                            branch=sale.branch,
+                            cashbox=sale.cashbox,
+                            cashbox_id=cashbox_id,
+                            user=request.user,
+                            shift=sale.shift,
+                            type=CashFlow.Type.INCOME,
+                            amount=p_amt,
+                            source_kind=CashFlow.SourceKind.POS_SALE,
+                            source_id=str(sale.id),
+                            name=f"Продажа ({p_title})",
+                            source_business_operation_id="Продажа",
+                        )
+                        if cf:
+                            auto_flows.append(cf)
+            elif sale.payment_method == Sale.PaymentMethod.DEBT:
+                prepay_amt = sale.cash_received or Decimal("0.00")
+                if prepay_amt > 0:
+                    cf = create_auto_cashflow(
+                        company=sale.company,
+                        branch=sale.branch,
+                        cashbox=sale.cashbox,
+                        cashbox_id=cashbox_id,
+                        user=request.user,
+                        shift=sale.shift,
+                        type=CashFlow.Type.INCOME,
+                        amount=prepay_amt,
+                        source_kind=CashFlow.SourceKind.POS_PREPAYMENT,
+                        source_id=str(sale.id),
+                        name="Предоплата (долг)",
+                        source_business_operation_id="Продажа",
+                    )
+                    if cf:
+                        auto_flows.append(cf)
+            else:
+                if (sale.total or 0) > 0:
+                    method_title = sale.get_payment_method_display() if hasattr(sale, "get_payment_method_display") else sale.payment_method
+                    cf_name = f"Продажа ({method_title})" if sale.payment_method != Sale.PaymentMethod.CASH else "Продажа"
+                    cf = create_auto_cashflow(
+                        company=sale.company,
+                        branch=sale.branch,
+                        cashbox=sale.cashbox,
+                        cashbox_id=cashbox_id,
+                        user=request.user,
+                        shift=sale.shift,
+                        type=CashFlow.Type.INCOME,
+                        amount=sale.total,
+                        source_kind=CashFlow.SourceKind.POS_SALE,
+                        source_id=str(sale.id),
+                        name=cf_name,
+                        source_business_operation_id="Продажа",
+                    )
+                    if cf:
+                        auto_flows.append(cf)
+
+            payload["cashflows"] = serialize_auto_cashflows(auto_flows)
+
             if print_receipt:
                 payload["receipt_print_path"] = (
                     f"/api/main/pos/sales/{sale.id}/receipt/?wait_ekassa=1&receipt_text=1"
@@ -2802,8 +2870,29 @@ class SalePayDebtAPIView(MarketCashierOnlyMixin, CompanyBranchRestrictedMixin, A
             cash_received=ser.validated_data.get("cash_received"),
         )
 
+        cashbox_id = request.data.get("cashbox_id")
+        from apps.construction.auto_cashflow import create_auto_cashflow, serialize_auto_cashflows
+        from apps.construction.models import CashFlow
+
+        cf = create_auto_cashflow(
+            company=sale.company,
+            branch=sale.branch,
+            cashbox=sale.cashbox,
+            cashbox_id=cashbox_id,
+            user=request.user,
+            shift=sale.shift,
+            type=CashFlow.Type.INCOME,
+            amount=sale.total,
+            source_kind=CashFlow.SourceKind.DEBT_REPAYMENT,
+            source_id=str(sale.id),
+            name=f"Оплата долга по продаже №{sale.id}",
+            source_business_operation_id="Оплата долга",
+        )
+
         sale.refresh_from_db()
-        return Response(SaleDetailSerializer(sale, context={"request": request}).data, status=status.HTTP_200_OK)
+        resp_data = SaleDetailSerializer(sale, context={"request": request}).data
+        resp_data["cashflows"] = serialize_auto_cashflows([cf]) if cf else []
+        return Response(resp_data, status=status.HTTP_200_OK)
 
 
 def _parse_partial_return_items(data) -> Optional[List[tuple]]:
@@ -4720,10 +4809,54 @@ class AgentSaleCheckoutAPIView(MarketCashierOnlyMixin, CompanyBranchRestrictedMi
                 "client_name": getattr(sale.client, "full_name", None) if sale.client else None,
                 "payment_method": getattr(sale, "payment_method", payment_method),
                 "cash_received": f"{getattr(sale, 'cash_received', cash_received):.2f}",
-                "change": f"{getattr(sale, 'change', Decimal('0.00')):.2f}",
                 "shift_id": None,  # ✅ нет смен у агента
                 "cashbox_id": str(getattr(sale, "cashbox_id", None)) if getattr(sale, "cashbox_id", None) else None,
             }
+
+            from apps.construction.auto_cashflow import create_auto_cashflow, serialize_auto_cashflows
+            from apps.construction.models import CashFlow
+
+            auto_flows = []
+            pm_val = getattr(sale, "payment_method", payment_method)
+            if pm_val == Sale.PaymentMethod.DEBT:
+                prepay_amt = getattr(sale, "cash_received", None) or Decimal("0.00")
+                if prepay_amt > 0:
+                    cf = create_auto_cashflow(
+                        company=sale.company,
+                        branch=sale.branch,
+                        cashbox=getattr(sale, "cashbox", None),
+                        cashbox_id=cashbox_id,
+                        user=request.user,
+                        type=CashFlow.Type.INCOME,
+                        amount=prepay_amt,
+                        source_kind=CashFlow.SourceKind.POS_PREPAYMENT,
+                        source_id=str(sale.id),
+                        name="Предоплата (долг)",
+                        source_business_operation_id="Продажа",
+                    )
+                    if cf:
+                        auto_flows.append(cf)
+            else:
+                if (sale.total or 0) > 0:
+                    method_title = sale.get_payment_method_display() if hasattr(sale, "get_payment_method_display") else pm_val
+                    cf_name = f"Продажа ({method_title})" if pm_val != Sale.PaymentMethod.CASH else "Продажа"
+                    cf = create_auto_cashflow(
+                        company=sale.company,
+                        branch=sale.branch,
+                        cashbox=getattr(sale, "cashbox", None),
+                        cashbox_id=cashbox_id,
+                        user=request.user,
+                        type=CashFlow.Type.INCOME,
+                        amount=sale.total,
+                        source_kind=CashFlow.SourceKind.POS_SALE,
+                        source_id=str(sale.id),
+                        name=cf_name,
+                        source_business_operation_id="Продажа",
+                    )
+                    if cf:
+                        auto_flows.append(cf)
+
+            payload["cashflows"] = serialize_auto_cashflows(auto_flows)
 
             if print_receipt:
                 payload["receipt_print_path"] = (

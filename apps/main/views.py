@@ -1314,6 +1314,39 @@ class ProductCreateByBarcodeAPIView(CompanyBranchRestrictedMixin, generics.Creat
             )
             .get()
         )
+
+        # auto-cashflow for warehouse purchase
+        cashbox_id = data.get("cashbox_id")
+        cashflow_amount_raw = data.get("cashflow_amount")
+        cashflow_type = (data.get("cashflow_type") or "expense").strip().lower()
+
+        from apps.construction.auto_cashflow import create_auto_cashflow
+        from apps.construction.models import CashFlow, CashShift
+
+        purchase_amt = None
+        if cashflow_amount_raw not in (None, ""):
+            try:
+                purchase_amt = Decimal(str(cashflow_amount_raw))
+            except Exception:
+                purchase_amt = None
+        elif data.get("payment_type") != "debt":
+            if product.purchase_price and product.quantity and product.purchase_price > 0 and product.quantity > 0:
+                purchase_amt = (Decimal(str(product.purchase_price)) * Decimal(str(product.quantity))).quantize(Decimal("0.01"))
+
+        if purchase_amt and purchase_amt > 0 and (cashbox_id or CashShift.objects.filter(company=company, cashier=request.user, status=CashShift.Status.OPEN).exists()):
+            create_auto_cashflow(
+                company=company,
+                branch=branch,
+                cashbox_id=cashbox_id,
+                user=request.user,
+                type=CashFlow.Type.EXPENSE if cashflow_type == "expense" else CashFlow.Type.INCOME,
+                amount=purchase_amt,
+                source_kind=CashFlow.SourceKind.WAREHOUSE_PURCHASE,
+                source_id=str(product.id),
+                name=f"Закупка товара: {product.name}",
+                source_business_operation_id="Склад",
+            )
+
         ser = self.get_serializer(product, context=self.get_serializer_context())
         return Response(ser.data, status=status.HTTP_201_CREATED)
 
@@ -1882,6 +1915,39 @@ class ProductCreateManualAPIView(CompanyBranchRestrictedMixin, generics.CreateAP
             )
             .get()
         )
+
+        # auto-cashflow for warehouse purchase
+        cashbox_id = data.get("cashbox_id")
+        cashflow_amount_raw = data.get("cashflow_amount")
+        cashflow_type = (data.get("cashflow_type") or "expense").strip().lower()
+
+        from apps.construction.auto_cashflow import create_auto_cashflow
+        from apps.construction.models import CashFlow, CashShift
+
+        purchase_amt = None
+        if cashflow_amount_raw not in (None, ""):
+            try:
+                purchase_amt = Decimal(str(cashflow_amount_raw))
+            except Exception:
+                purchase_amt = None
+        elif not is_produced and data.get("payment_type") != "debt":
+            if product.purchase_price and product.quantity and product.purchase_price > 0 and product.quantity > 0:
+                purchase_amt = (Decimal(str(product.purchase_price)) * Decimal(str(product.quantity))).quantize(Decimal("0.01"))
+
+        if purchase_amt and purchase_amt > 0 and (cashbox_id or CashShift.objects.filter(company=company, cashier=request.user, status=CashShift.Status.OPEN).exists()):
+            create_auto_cashflow(
+                company=company,
+                branch=branch,
+                cashbox_id=cashbox_id,
+                user=request.user,
+                type=CashFlow.Type.EXPENSE if cashflow_type == "expense" else CashFlow.Type.INCOME,
+                amount=purchase_amt,
+                source_kind=CashFlow.SourceKind.WAREHOUSE_PURCHASE,
+                source_id=str(product.id),
+                name=f"Закупка товара: {product.name}",
+                source_business_operation_id="Склад",
+            )
+
         ser = self.get_serializer(product, context=self.get_serializer_context())
         return Response(ser.data, status=status.HTTP_201_CREATED)
 
@@ -3216,6 +3282,23 @@ class ClientDealPayAPIView(APIView, CompanyBranchRestrictedMixin):
             fresh = ClientDeal.objects.select_related("client").prefetch_related(*_deal_prefetch()).get(pk=deal.pk)
             return Response(ClientDealSerializer(fresh, context={"request": request}).data, status=status.HTTP_200_OK)
 
+        # auto-cashflow
+        cashbox_id = data.get("cashbox_id")
+        from apps.construction.auto_cashflow import create_auto_cashflow
+        from apps.construction.models import CashFlow
+        create_auto_cashflow(
+            company=deal.company,
+            branch=deal.branch,
+            cashbox_id=cashbox_id,
+            user=request.user,
+            type=CashFlow.Type.INCOME,
+            amount=pay_amt,
+            source_kind=CashFlow.SourceKind.DEBT_REPAYMENT,
+            source_id=str(deal.id),
+            name=f"Оплата долга: {deal.title or (deal.client.full_name if deal.client else 'Сделка')}",
+            source_business_operation_id="Оплата долга",
+        )
+
         # update installment
         new_paid = (current_paid + pay_amt).quantize(Decimal("0.01"))
         if new_paid >= total:
@@ -3562,6 +3645,24 @@ class DebtPayAPIView(APIView, CompanyBranchRestrictedMixin):
             paid_at=ser.validated_data.get("paid_at"),
             note=ser.validated_data.get("note", ""),
         )
+
+        cashbox_id = request.data.get("cashbox_id")
+        from apps.construction.auto_cashflow import create_auto_cashflow
+        from apps.construction.models import CashFlow
+
+        create_auto_cashflow(
+            company=debt.company,
+            branch=debt.branch,
+            cashbox_id=cashbox_id,
+            user=request.user,
+            type=CashFlow.Type.INCOME,
+            amount=ser.validated_data["amount"],
+            source_kind=CashFlow.SourceKind.DEBT_REPAYMENT,
+            source_id=str(debt.id),
+            name=f"Оплата долга: {debt.name or 'Долг'}",
+            source_business_operation_id="Оплата долга",
+        )
+
         return Response(DebtSerializer(debt, context={"request": request}).data, status=status.HTTP_201_CREATED)
 
 

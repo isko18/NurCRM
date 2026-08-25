@@ -279,6 +279,7 @@ class DocumentSerializer(serializers.ModelSerializer):
     cash_register_name = serializers.CharField(source="cash_register.name", read_only=True, allow_null=True)
     payment_category_title = serializers.CharField(source="payment_category.title", read_only=True, allow_null=True)
     cash_request_status = serializers.SerializerMethodField()
+    cashflows = serializers.SerializerMethodField(read_only=True)
 
     counterparty_display_name = serializers.CharField(
         source="counterparty.name", read_only=True, allow_null=True
@@ -340,8 +341,15 @@ class DocumentSerializer(serializers.ModelSerializer):
             "moves",
             "receipts",
             "expenses",
+            "cashflows",
         )
-        read_only_fields = ("number", "total", "status", "cash_request_status")
+        read_only_fields = ("number", "total", "status", "cash_request_status", "cashflows")
+
+    def get_cashflows(self, obj):
+        from apps.construction.models import CashFlow
+        from apps.construction.auto_cashflow import serialize_auto_cashflows
+        cfs = CashFlow.objects.filter(company=obj.company, source_id=str(obj.id))
+        return serialize_auto_cashflows(cfs)
 
     @staticmethod
     def _resolve_sale_status(doc_type, is_sale_request, current_status=None):
