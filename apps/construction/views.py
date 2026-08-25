@@ -302,7 +302,15 @@ class CashboxListCreateView(CompanyBranchScopedMixin, generics.ListCreateAPIView
                     .filter(shift_id__in=all_open_ids, status=CashFlow.Status.APPROVED)
                     .values("shift_id")
                     .annotate(
-                        income=Sum("amount", filter=Q(type=CashFlow.Type.INCOME)),
+                        income=Sum(
+                            "amount",
+                            filter=Q(type=CashFlow.Type.INCOME).exclude(
+                                source_kind__in=[
+                                    CashFlow.SourceKind.POS_SALE,
+                                    CashFlow.SourceKind.POS_PREPAYMENT,
+                                ]
+                            ),
+                        ),
                         expense=Sum("amount", filter=Q(type=CashFlow.Type.EXPENSE)),
                     )
                 )
