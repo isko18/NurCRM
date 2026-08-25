@@ -5,7 +5,7 @@ from django.db import migrations, models
 class Migration(migrations.Migration):
 
     dependencies = [
-        ('main', '0110_posprintersetting'),
+        ('main', '0113_posprintersetting'),
     ]
 
     operations = [
