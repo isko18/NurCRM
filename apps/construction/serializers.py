@@ -174,15 +174,13 @@ class CashShiftOpenSerializer(serializers.ModelSerializer):
         else:
             self.fields["cashier"].queryset = User.objects.none()
 
-        # cashboxes: строго по выбранному branch
+        # cashboxes: кассы компании
         if company:
             target_branch = _resolve_branch_for_request(request) if request else None
             qs = Cashbox.objects.filter(company=company)
 
-            if target_branch is not None:
-                qs = qs.filter(branch=target_branch)
-            else:
-                qs = qs.filter(branch__isnull=True)
+            if target_branch is not None and not _is_owner_like(user):
+                qs = qs.filter(Q(branch__isnull=True) | Q(branch=target_branch))
 
             self.fields["cashbox"].queryset = qs
         else:
