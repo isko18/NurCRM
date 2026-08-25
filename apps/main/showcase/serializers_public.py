@@ -36,6 +36,7 @@ class PublicProductSerializer(serializers.ModelSerializer):
     brand_title = serializers.CharField(source="brand.name", read_only=True)
 
     image_url = serializers.SerializerMethodField()
+    images = serializers.SerializerMethodField()
     final_price = serializers.SerializerMethodField()
     is_new = serializers.SerializerMethodField()
 
@@ -71,16 +72,48 @@ class PublicProductSerializer(serializers.ModelSerializer):
             "created_at",
 
             "image_url",
+            "images",
             "characteristics",
             "packages",
         ]
 
-    def get_image_url(self, obj: Product):
-        img = obj.images.filter(is_primary=True).first() or obj.images.first()
-        if not img or not img.image:
-            return None
+    def _get_sorted_images(self, obj: Product):
+        # Используем предзагруженные связанные объекты obj.images.all() без .filter(),
+        # чтобы избежать N+1 запросов к базе данных.
+        imgs = [img for img in obj.images.all() if getattr(img, "image", None)]
+        return sorted(
+            imgs,
+            key=lambda x: (
+                not bool(getattr(x, "is_primary", False)),
+                getattr(x, "created_at", None) or "",
+            ),
+        )
+
+    def get_images(self, obj: Product):
         request = self.context.get("request")
-        return request.build_absolute_uri(img.image.url) if request else img.image.url
+        sorted_imgs = self._get_sorted_images(obj)
+        result = []
+        for img in sorted_imgs:
+            url = request.build_absolute_uri(img.image.url) if request else img.image.url
+            result.append(
+                {
+                    "id": str(img.id),
+                    "image": url,
+                    "image_url": url,
+                    "alt": getattr(img, "alt", "") or "",
+                    "is_primary": bool(getattr(img, "is_primary", False)),
+                    "created_at": img.created_at.isoformat() if getattr(img, "created_at", None) else None,
+                }
+            )
+        return result
+
+    def get_image_url(self, obj: Product):
+        sorted_imgs = self._get_sorted_images(obj)
+        if not sorted_imgs:
+            return None
+        primary_img = sorted_imgs[0]
+        request = self.context.get("request")
+        return request.build_absolute_uri(primary_img.image.url) if request else primary_img.image.url
 
     def get_final_price(self, obj: Product):
         price = obj.price or Decimal("0")
