@@ -348,7 +348,18 @@ class DocumentSerializer(serializers.ModelSerializer):
     def get_cashflows(self, obj):
         from apps.construction.models import CashFlow
         from apps.construction.auto_cashflow import serialize_auto_cashflows
-        cfs = CashFlow.objects.filter(company=obj.company, source_id=str(obj.id))
+        company = (
+            getattr(obj, "company", None)
+            or getattr(getattr(obj, "warehouse_from", None), "company", None)
+            or getattr(getattr(obj, "warehouse_to", None), "company", None)
+            or getattr(getattr(obj, "agent", None), "company", None)
+            or getattr(getattr(obj, "counterparty", None), "company", None)
+            or getattr(getattr(obj, "cash_register", None), "company", None)
+        )
+        if company:
+            cfs = CashFlow.objects.filter(company=company, source_id=str(obj.id))
+        else:
+            cfs = CashFlow.objects.filter(source_id=str(obj.id))
         return serialize_auto_cashflows(cfs)
 
     @staticmethod
