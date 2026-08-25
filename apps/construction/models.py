@@ -310,7 +310,7 @@ class CashShift(models.Model):
         fa = flows.aggregate(
             income=Sum(
                 "amount",
-                filter=Q(type=CashFlow.Type.INCOME).exclude(
+                filter=Q(type=CashFlow.Type.INCOME) & ~Q(
                     source_kind__in=[
                         CashFlow.SourceKind.POS_SALE,
                         CashFlow.SourceKind.POS_PREPAYMENT,
