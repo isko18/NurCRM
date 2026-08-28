@@ -20,7 +20,6 @@ from django.conf.urls.static import static
 from django.conf import settings
 from .views_media_proxy import media_proxy
 from .views_version import ClientVersionView
-from .views_version import ClientVersionView
 from .views_health import health_check
 
 if settings.ENABLE_API_DOCS:
@@ -45,6 +44,7 @@ if settings.ENABLE_API_DOCS:
 apps_includes = [
     path('main/', include('apps.main.urls')),  
     path('users/', include('apps.users.urls')),  
+    path('platform-admin/', include('apps.users.platform_admin_urls')),
     path('construction/', include('apps.construction.urls')),  
     path('building/', include('apps.building.urls')),
     path('booking/', include('apps.booking.urls')),  

@@ -4,6 +4,7 @@ from django.db import transaction, IntegrityError
 from django.db.models import Q, Prefetch
 from django.http import Http404
 from django.db.utils import OperationalError, ProgrammingError
+from django.utils.text import slugify
 import logging
 
 from rest_framework import generics, permissions, status
@@ -13,8 +14,22 @@ from rest_framework.views import APIView
 from rest_framework.exceptions import NotFound, PermissionDenied, ValidationError
 from rest_framework_simplejwt.views import TokenObtainPairView, TokenRefreshView
 from rest_framework_simplejwt.exceptions import InvalidToken, TokenError
+from rest_framework_simplejwt.tokens import RefreshToken
 
-from .models import User, Industry, SubscriptionPlan, Feature, Sector, CustomRole, Company, Branch, BranchMembership, KyrgyzstanRegion
+from .models import (
+    User,
+    Industry,
+    SubscriptionPlan,
+    Feature,
+    Sector,
+    CustomRole,
+    Company,
+    Branch,
+    BranchMembership,
+    KyrgyzstanRegion,
+    Roles,
+    PlatformAdminAuditLog,
+)
 from .serializers import (
     UserSerializer,
     OwnerRegisterSerializer,
@@ -38,7 +53,7 @@ from .serializers import (
     slug_format_error,
     slug_taken_by_other,
 )
-from .permissions import IsCompanyOwner, IsCompanyOwnerOrAdmin
+from .permissions import IsCompanyOwner, IsCompanyOwnerOrAdmin, IsPlatformAdmin
 
 logger = logging.getLogger(__name__)
 
@@ -249,9 +264,34 @@ class CustomTokenRefreshView(TokenRefreshView):
 
     def post(self, request, *args, **kwargs):
         try:
+            raw_token = request.data.get("refresh")
+            if raw_token:
+                try:
+                    token = RefreshToken(raw_token)
+                    user_id = token.payload.get("user_id")
+                    if user_id:
+                        user = User.objects.filter(pk=user_id).select_related("company").first()
+                        if (
+                            user
+                            and user.company
+                            and not getattr(user.company, "is_active", True)
+                            and not getattr(user, "is_platform_admin", False)
+                        ):
+                            return Response(
+                                {"detail": "Компания заблокирована. Обратитесь в поддержку NUR."},
+                                status=status.HTTP_403_FORBIDDEN,
+                            )
+                except (TokenError, InvalidToken):
+                    pass
+
             return super().post(request, *args, **kwargs)
         except (TokenError, InvalidToken):
             return Response({"detail": "Token is invalid or expired"}, status=status.HTTP_401_UNAUTHORIZED)
+        except PermissionDenied as exc:
+            return Response(
+                {"detail": str(exc.detail) if hasattr(exc, "detail") else str(exc)},
+                status=status.HTTP_403_FORBIDDEN,
+            )
         except ValidationError as exc:
             return Response(exc.detail, status=status.HTTP_400_BAD_REQUEST)
         except (ProgrammingError, OperationalError) as exc:
@@ -393,6 +433,9 @@ class EmployeeDetailAPIView(generics.RetrieveUpdateDestroyAPIView):
 # =========================
 # dictionaries
 # =========================
+
+from .platform_admin_views import PlatformAdminMetaAPIView
+
 
 class SectorListAPIView(generics.ListAPIView):
     queryset = Sector.objects.all()

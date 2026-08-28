@@ -82,3 +82,15 @@ class IsCompanyOwnerOrAdmin(permissions.BasePermission):
                 return False
 
         return True
+
+
+class IsPlatformAdmin(permissions.BasePermission):
+    message = "Требуются права платформенного администратора."
+
+    def has_permission(self, request, view):
+        u = request.user
+        return bool(
+            u
+            and u.is_authenticated
+            and getattr(u, "is_platform_admin", False) is True
+        )

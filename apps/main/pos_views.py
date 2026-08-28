@@ -200,14 +200,8 @@ def _build_physical_receipt_text(sale, *, payment_method=None, cash_received=Non
     created_at = timezone.localtime(sale.created_at) if getattr(sale, "created_at", None) else timezone.localtime()
     vh = receipt_vendor_header(sale)
     company_name = vh.get("brand") or "Компания"
-    cashier_name = ""
-    if getattr(sale, "user", None):
-        cashier_name = (
-            getattr(sale.user, "get_full_name", lambda: "")()
-            or getattr(sale.user, "full_name", None)
-            or getattr(sale.user, "username", None)
-            or ""
-        )
+    from apps.main.printers import _user_display_name
+    cashier_name = _user_display_name(getattr(sale, "user", None)) or ""
 
     payment_method_value = payment_method or getattr(sale, "payment_method", None)
     payment_label = None

@@ -23,16 +23,19 @@ def _pick(*vals, default=None):
 
 
 def _user_display_name(user) -> Optional[str]:
-    """Имя для чека: ФИО, иначе full_name / email / username."""
+    """Имя для чека: ФИО, иначе email / username."""
     if not user:
         return None
+    full = f"{(getattr(user, 'first_name', '') or '').strip()} {(getattr(user, 'last_name', '') or '').strip()}".strip()
+    if full:
+        return full
     try:
         fn = (user.get_full_name() or "").strip()
+        if fn and fn != getattr(user, "email", ""):
+            return fn
     except Exception:
-        fn = ""
-    if fn:
-        return fn
-    for attr in ("full_name", "email", "username"):
+        pass
+    for attr in ("email", "username", "full_name"):
         v = getattr(user, attr, None)
         if v and str(v).strip():
             return str(v).strip()

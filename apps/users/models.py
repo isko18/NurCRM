@@ -174,6 +174,8 @@ class Company(models.Model):
     created_at = models.DateTimeField(auto_now_add=True, verbose_name="Дата создания")
     start_date = models.DateTimeField(verbose_name="Дата начала", blank=True, null=True)
     end_date = models.DateTimeField(verbose_name="Дата окончания", blank=True, null=True)
+    is_active = models.BooleanField(default=True, db_index=True, verbose_name="Активна")
+    support_note = models.TextField(blank=True, null=True, verbose_name="Заметка поддержки")
 
     can_view_documents = models.BooleanField(default=False, verbose_name="Доступ к документам")
     can_view_whatsapp = models.BooleanField(default=False, verbose_name="Доступ к whatsapp")
@@ -340,10 +342,11 @@ class Company(models.Model):
 
     def save(self, *args, **kwargs):
         # даты
-        if not self.start_date:
-            self.start_date = timezone.now()
-        if not self.end_date and self.start_date:
-            self.end_date = self.start_date + timedelta(days=10)
+        if self._state.adding:
+            if not self.start_date:
+                self.start_date = timezone.now()
+            if not self.end_date and self.start_date:
+                self.end_date = self.start_date + timedelta(days=10)
 
         # весы
         if not self.scale_barcode_layout:
@@ -366,6 +369,8 @@ class Company(models.Model):
         indexes = [
             models.Index(fields=["created_at"]),
             models.Index(fields=["end_date"]),
+            models.Index(fields=["is_active"]),
+            models.Index(fields=["is_active", "end_date"]),
         ]
         constraints = [
             # Уникальность slug без учёта регистра (последняя линия защиты от гонок).
@@ -611,6 +616,11 @@ class User(AbstractBaseUser, PermissionsMixin):
 
     is_active = models.BooleanField(default=True)
     is_staff = models.BooleanField(default=False)
+    is_platform_admin = models.BooleanField(
+        default=False,
+        verbose_name="Платформенный администратор NUR",
+        help_text="Доступ к /platform-admin/*. Клиентские owner/admin роли этот флаг не получают автоматически.",
+    )
 
     deleted_at = models.DateTimeField(null=True, blank=True, verbose_name="Удалён")
     deleted_by = models.ForeignKey(
@@ -706,12 +716,63 @@ class User(AbstractBaseUser, PermissionsMixin):
         self.set_unusable_password()
         self.save(update_fields=["is_active", "deleted_at", "deleted_by", "email", "password"])
 
+    def get_full_name(self):
+        full_name = f"{(self.first_name or '').strip()} {(self.last_name or '').strip()}".strip()
+        return full_name or self.email or ""
+
+    def get_short_name(self):
+        return (self.first_name or "").strip() or self.email or ""
+
+    def __str__(self):
+        full_name = self.get_full_name()
+        return f"{full_name} ({self.email})" if full_name and full_name != self.email else self.email
+
     def save(self, *args, **kwargs):
         # Доступ к кассе разрешён только для компаний со сферой "Маркет".
         company = getattr(self, "company", None)
         if not (company and getattr(company, "is_market", None) and company.is_market()):
             self.can_view_cashier = False
         super().save(*args, **kwargs)
+
+
+class PlatformAdminAuditLog(models.Model):
+    class Action(models.TextChoices):
+        COMPANY_PATCH = "company.patch", "Правка компании"
+        COMPANY_SUBSCRIPTION = "company.subscription", "Подписка компании"
+        USER_CREATE = "user.create", "Создание пользователя"
+        USER_PATCH = "user.patch", "Правка пользователя"
+        USER_DELETE = "user.delete", "Удаление пользователя"
+        USER_RESET_PASSWORD = "user.reset_password", "Сброс пароля"
+        USER_IMPERSONATE = "user.impersonate", "Вход под пользователем"
+
+    actor = models.ForeignKey(
+        "User",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="platform_admin_audit_logs",
+        verbose_name="Исполнитель",
+    )
+    action = models.CharField(max_length=64, choices=Action.choices, db_index=True, verbose_name="Действие")
+    object_type = models.CharField(max_length=64, db_index=True, verbose_name="Тип объекта")
+    object_id = models.CharField(max_length=64, db_index=True, verbose_name="ID объекта")
+    company_id = models.CharField(max_length=64, null=True, blank=True, db_index=True, verbose_name="ID компании")
+    payload = models.JSONField(default=dict, blank=True, verbose_name="Данные")
+    ip = models.GenericIPAddressField(null=True, blank=True, verbose_name="IP")
+    created_at = models.DateTimeField(auto_now_add=True, db_index=True, verbose_name="Создано")
+
+    class Meta:
+        verbose_name = "Аудит платформенной админки"
+        verbose_name_plural = "Аудит платформенной админки"
+        ordering = ["-created_at"]
+        indexes = [
+            models.Index(fields=["action", "created_at"]),
+            models.Index(fields=["object_type", "object_id"]),
+            models.Index(fields=["company_id", "created_at"]),
+        ]
+
+    def __str__(self):
+        return f"{self.action} {self.object_type}:{self.object_id}"
 
 
 class BranchMembership(models.Model):

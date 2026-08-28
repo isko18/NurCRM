@@ -15,7 +15,7 @@ import re
 from django.db.models.functions import Lower
 
 from rest_framework import serializers
-from rest_framework.exceptions import APIException
+from rest_framework.exceptions import APIException, PermissionDenied, ValidationError
 from rest_framework_simplejwt.serializers import TokenObtainPairSerializer
 
 # --- slug (формат: ^[a-z0-9]+(?:-[a-z0-9]+)*$, длина 3..50) ---
@@ -164,7 +164,14 @@ class CustomTokenObtainPairSerializer(TokenObtainPairSerializer):
         self.user = user
 
         if not getattr(user, "is_active", True):
-            raise serializers.ValidationError("Аккаунт деактивирован.")
+            raise ValidationError("Аккаунт деактивирован.")
+
+        if (
+            user.company
+            and not getattr(user.company, "is_active", True)
+            and not getattr(user, "is_platform_admin", False)
+        ):
+            raise PermissionDenied("Компания заблокирована. Обратитесь в поддержку NUR.")
 
         branch_ids = []
         primary_branch_id = None
@@ -183,6 +190,7 @@ class CustomTokenObtainPairSerializer(TokenObtainPairSerializer):
             "track_number": user.track_number,
             "company": user.company.name if user.company else None,
             "role": user.role_display,
+            "is_platform_admin": bool(getattr(user, "is_platform_admin", False)),
             "branch_ids": branch_ids,
             "primary_branch_id": primary_branch_id,
         })
@@ -282,7 +290,7 @@ class UserSerializer(serializers.ModelSerializer):
         fields = [
             "id", "email", "password",
             "first_name", "last_name", "track_number", "phone_number", "avatar",
-            "company", "role", "custom_role", "role_display",
+            "company", "role", "custom_role", "role_display", "is_platform_admin",
 
             "can_view_dashboard", "can_view_cashbox", "can_view_departments",
             "can_view_orders", "can_view_analytics", "can_view_department_analytics",
@@ -329,7 +337,7 @@ class UserSerializer(serializers.ModelSerializer):
             "branch_ids", "primary_branch_id",
             "created_at", "updated_at",
         ]
-        read_only_fields = ["id", "created_at", "updated_at", "company"]
+        read_only_fields = ["id", "created_at", "updated_at", "company", "is_platform_admin"]
 
     def validate_email(self, value):
         value = (value or "").strip().lower()

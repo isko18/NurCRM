@@ -20,6 +20,7 @@ from .models import (
     Industry,
     CustomRole,
     ScaleDevice,
+    PlatformAdminAuditLog,
 )
 
 logger = logging.getLogger(__name__)
@@ -192,10 +193,11 @@ class UserAdmin(CompanyScopedFKMixin, BaseUserAdmin):
         "can_view_market_edit_price",
         "can_view_market_delete_cart_item",
         "can_view_market_employee_return",
+        "is_platform_admin",
         "is_staff",
         "is_active",
     )
-    list_filter = ("role", "custom_role", "company", "is_staff", "is_active")
+    list_filter = ("role", "custom_role", "company", "is_platform_admin", "is_staff", "is_active")
     search_fields = ("email", "first_name", "last_name", "phone_number", "track_number")
     ordering = ("email",)
     readonly_fields = ("created_at", "updated_at")
@@ -239,7 +241,7 @@ class UserAdmin(CompanyScopedFKMixin, BaseUserAdmin):
         ("Разрешения — прочие", {"fields": EXTRA_PERMS}),
         (
             "Права доступа",
-            {"fields": ("is_active", "is_staff", "is_superuser", "groups", "user_permissions")},
+            {"fields": ("is_active", "is_platform_admin", "is_staff", "is_superuser", "groups", "user_permissions")},
         ),
         ("Даты", {"fields": ("last_login", "created_at", "updated_at")}),
     )
@@ -283,6 +285,12 @@ class UserAdmin(CompanyScopedFKMixin, BaseUserAdmin):
             form.base_fields["password"].required = False
         return form
 
+    def get_readonly_fields(self, request, obj=None):
+        fields = list(super().get_readonly_fields(request, obj))
+        if not request.user.is_superuser and "is_platform_admin" not in fields:
+            fields.append("is_platform_admin")
+        return tuple(fields)
+
     def save_model(self, request, obj, form, change):
         # Для owner/admin включаем все can_* флаги автоматически
         if obj.role in ["owner", "admin"]:
@@ -313,6 +321,23 @@ class UserAdmin(CompanyScopedFKMixin, BaseUserAdmin):
     branches_display.short_description = "Филиалы"
 
 
+# -------------------- Platform admin audit --------------------
+
+@admin.register(PlatformAdminAuditLog)
+class PlatformAdminAuditLogAdmin(admin.ModelAdmin):
+    list_display = ("created_at", "actor", "action", "object_type", "object_id", "company_id", "ip")
+    list_filter = ("action", "object_type", "created_at")
+    search_fields = ("actor__email", "object_type", "object_id", "company_id")
+    readonly_fields = ("actor", "action", "object_type", "object_id", "company_id", "payload", "ip", "created_at")
+    ordering = ("-created_at",)
+
+    def has_add_permission(self, request):
+        return False
+
+    def has_change_permission(self, request, obj=None):
+        return False
+
+
 # -------------------- Company --------------------
 
 @admin.register(Company)
@@ -320,6 +345,7 @@ class CompanyAdmin(admin.ModelAdmin):
     list_display = (
         "name",
         "slug",
+        "is_active",
         "owner",
         "phone",
         "phones_howcase",
@@ -338,6 +364,7 @@ class CompanyAdmin(admin.ModelAdmin):
         "created_at",
     )
     list_filter = (
+        "is_active",
         "subscription_plan",
         "industry",
         "sector",
@@ -378,6 +405,7 @@ class CompanyAdmin(admin.ModelAdmin):
                 "fields": (
                     "name",
                     "slug",
+                    "is_active",
                     "phone",
                     "phones_howcase",
                     "whatsapp_phone",
@@ -405,7 +433,7 @@ class CompanyAdmin(admin.ModelAdmin):
                 )
             },
         ),
-        ("Срок действия", {"fields": ("start_date", "end_date", "created_at")}),
+        ("Срок действия и поддержка", {"fields": ("start_date", "end_date", "support_note", "created_at")}),
     )
 
     def delete_model(self, request, obj):
