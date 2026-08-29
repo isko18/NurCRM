@@ -18,6 +18,7 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 from rest_framework.exceptions import NotFound, PermissionDenied, ValidationError
 from rest_framework.negotiation import DefaultContentNegotiation
+from rest_framework.parsers import JSONParser, FormParser, MultiPartParser
 from django.shortcuts import get_object_or_404
 from django.http import HttpResponse
 from rest_framework import serializers
@@ -39,6 +40,7 @@ from apps.main.services.product_list_filters import apply_product_list_filters
 
 from apps.users.models import Branch, User
 
+from apps.main.bracket_parser import unflatten_bracket_data
 from apps.main.models import (
     Contact, Pipeline, Deal, Task, Integration, Analytics,
     Order, Product, Review, Notification, Event,
@@ -213,6 +215,8 @@ def _parse_recipe_input(recipe_input):
 class PublicKnowledgeBaseMixin:
     permission_classes = [permissions.AllowAny]
     serializer_class = PublicKnowledgeBaseCourseSerializer
+    # multipart нужен для загрузки файлов превью уроков
+    parser_classes = [JSONParser, FormParser, MultiPartParser]
 
     def get_queryset(self):
         return (
@@ -220,6 +224,13 @@ class PublicKnowledgeBaseMixin:
             .all()
             .prefetch_related("lessons")
         )
+
+    def get_serializer(self, *args, **kwargs):
+        # Фронт шлёт вложенные уроки в bracket-notation: lessons[0][title],
+        # lessons[0][thumbnail] и т.д. Собираем их обратно во вложенный dict.
+        if "data" in kwargs:
+            kwargs["data"] = unflatten_bracket_data(kwargs["data"])
+        return super().get_serializer(*args, **kwargs)
 
 
 class PublicKnowledgeBaseCourseListCreateAPIView(PublicKnowledgeBaseMixin, generics.ListCreateAPIView):

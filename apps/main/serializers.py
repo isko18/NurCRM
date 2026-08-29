@@ -1,6 +1,7 @@
 from rest_framework import serializers
 from django.db import transaction
 from django.core.exceptions import ValidationError as DjangoValidationError
+from django.core.validators import URLValidator
 from django.utils import timezone
 from django.db.models import Q, Sum, F, ExpressionWrapper, DecimalField, Value as V, Prefetch, ProtectedError
 from django.db.models.functions import Coalesce
@@ -230,11 +231,91 @@ class BidPublicCreateSerializer(serializers.ModelSerializer):
         read_only_fields = ['id', 'created_at']
 
 
+# Ограничения на файл превью урока (согласованы с фронтом).
+LESSON_THUMBNAIL_MAX_BYTES = 5 * 1024 * 1024
+LESSON_THUMBNAIL_CONTENT_TYPES = ("image/jpeg", "image/png", "image/webp", "image/gif")
+
+
+class LessonThumbnailField(serializers.Field):
+    """
+    Одно поле `thumbnail` на два модельных: файл (`thumbnail`) и ссылку (`thumbnail_url`).
+
+    Приём:
+      - файл          -> сохраняем в thumbnail, ссылку чистим;
+      - строка-URL    -> сохраняем в thumbnail_url, файл чистим;
+      - "" или null   -> явная очистка обоих;
+      - поле не пришло -> значение не трогаем (важно для PATCH без файла).
+
+    Отдача: абсолютный URL файла, иначе ссылка, иначе "".
+    """
+
+    default_error_messages = {
+        "invalid": "Передайте файл изображения или ссылку на него.",
+        "too_large": "Файл превью больше 5 МБ.",
+        "bad_type": "Допустимые форматы превью: JPEG, PNG, WebP, GIF.",
+    }
+
+    def __init__(self, **kwargs):
+        kwargs.setdefault("source", "*")
+        kwargs.setdefault("required", False)
+        super().__init__(**kwargs)
+        self._image_field = serializers.ImageField()
+
+    def to_representation(self, lesson):
+        file = getattr(lesson, "thumbnail", None)
+        if file:
+            request = self.context.get("request")
+            return request.build_absolute_uri(file.url) if request else file.url
+        return getattr(lesson, "thumbnail_url", "") or ""
+
+    def to_internal_value(self, data):
+        if isinstance(data, (list, tuple)):
+            data = data[0] if data else ""
+
+        # Явная очистка превью
+        if data is None or (isinstance(data, str) and not data.strip()):
+            return {"thumbnail": None, "thumbnail_url": ""}
+
+        # Загруженный файл
+        if hasattr(data, "read"):
+            content_type = (getattr(data, "content_type", "") or "").lower()
+            if content_type and content_type not in LESSON_THUMBNAIL_CONTENT_TYPES:
+                self.fail("bad_type")
+            if (getattr(data, "size", 0) or 0) > LESSON_THUMBNAIL_MAX_BYTES:
+                self.fail("too_large")
+            # Проверяем, что это действительно изображение (нужен Pillow).
+            # DRF ImageField пробрасывает наружу Django-ошибку — приводим её к DRF,
+            # чтобы поле возвращало корректный 400 независимо от контекста вызова.
+            try:
+                file = self._image_field.to_internal_value(data)
+            except DjangoValidationError as exc:
+                raise serializers.ValidationError(list(exc.messages))
+            return {"thumbnail": file, "thumbnail_url": ""}
+
+        # Ссылка на изображение
+        if isinstance(data, str):
+            value = data.strip()
+            try:
+                URLValidator()(value)
+            except DjangoValidationError:
+                self.fail("invalid")
+            if len(value) > 500:
+                raise serializers.ValidationError("Ссылка на превью длиннее 500 символов.")
+            return {"thumbnail": None, "thumbnail_url": value}
+
+        self.fail("invalid")
+
+
 class PublicKnowledgeBaseLessonSerializer(serializers.ModelSerializer):
+    # id приходит с фронта при обновлении существующего урока, поэтому он
+    # writable, но необязателен: без него урок считается новым.
+    id = serializers.UUIDField(required=False)
+    thumbnail = LessonThumbnailField()
+
     class Meta:
         model = KnowledgeBaseLesson
-        fields = ["id", "title", "description", "url", "order", "created_at"]
-        read_only_fields = ["id", "order", "created_at"]
+        fields = ["id", "title", "description", "url", "thumbnail", "order", "created_at"]
+        read_only_fields = ["order", "created_at"]
 
 
 class PublicKnowledgeBaseCourseSerializer(serializers.ModelSerializer):
@@ -262,10 +343,10 @@ class PublicKnowledgeBaseCourseSerializer(serializers.ModelSerializer):
     def create(self, validated_data):
         lessons_data = validated_data.pop("lessons")
         course = KnowledgeBaseCourse.objects.create(**validated_data)
-        KnowledgeBaseLesson.objects.bulk_create(
-            KnowledgeBaseLesson(course=course, order=index, **lesson_data)
-            for index, lesson_data in enumerate(lessons_data)
-        )
+        for index, lesson_data in enumerate(lessons_data):
+            lesson_data.pop("id", None)
+            # .save() вместо bulk_create: нужен корректный сейв файла превью
+            KnowledgeBaseLesson(course=course, order=index, **lesson_data).save()
         return course
 
     @transaction.atomic
@@ -277,18 +358,71 @@ class PublicKnowledgeBaseCourseSerializer(serializers.ModelSerializer):
             instance.title = validated_data["title"]
             update_fields.extend(["title", "updated_at"])
 
+        # lessons отсутствует в теле (PATCH только с названием) — уроки не трогаем
         if lessons_data is not None:
-            instance.lessons.all().delete()
-            KnowledgeBaseLesson.objects.bulk_create(
-                KnowledgeBaseLesson(course=instance, order=index, **lesson_data)
-                for index, lesson_data in enumerate(lessons_data)
-            )
+            self._replace_lessons(instance, lessons_data)
             if "updated_at" not in update_fields:
                 update_fields.append("updated_at")
 
         if update_fields:
             instance.save(update_fields=update_fields)
         return instance
+
+    @staticmethod
+    def _replace_lessons(course, lessons_data):
+        """
+        Полная замена списка уроков с сохранением уже загруженных превью.
+
+        Урок из тела сопоставляется с существующим по `id`, а если фронт его не
+        прислал — по совпадению `url`. Найденный урок обновляется на месте, так
+        что превью, которое не перезагружали, остаётся. Не сопоставленные уроки
+        удаляются вместе со своими файлами.
+        """
+        existing = list(course.lessons.all())
+        by_id = {str(lesson.id): lesson for lesson in existing}
+        by_url = {}
+        for lesson in existing:
+            by_url.setdefault(lesson.url, lesson)
+
+        matched_ids = set()
+
+        for index, lesson_data in enumerate(lessons_data):
+            data = dict(lesson_data)
+            lesson_id = data.pop("id", None)
+
+            lesson = None
+            if lesson_id is not None:
+                candidate = by_id.get(str(lesson_id))
+                if candidate is not None and str(candidate.id) not in matched_ids:
+                    lesson = candidate
+            if lesson is None:
+                candidate = by_url.get(data.get("url"))
+                if candidate is not None and str(candidate.id) not in matched_ids:
+                    lesson = candidate
+
+            if lesson is None:
+                KnowledgeBaseLesson(course=course, order=index, **data).save()
+                continue
+
+            matched_ids.add(str(lesson.id))
+
+            # Файл превью заменяем только если поле реально пришло в запросе
+            if "thumbnail" in data or "thumbnail_url" in data:
+                new_file = data.get("thumbnail")
+                if lesson.thumbnail and lesson.thumbnail != new_file:
+                    lesson.thumbnail.delete(save=False)
+
+            for field, value in data.items():
+                setattr(lesson, field, value)
+            lesson.order = index
+            lesson.save()
+
+        for lesson in existing:
+            if str(lesson.id) in matched_ids:
+                continue
+            if lesson.thumbnail:
+                lesson.thumbnail.delete(save=False)
+            lesson.delete()
 
 
 # ===========================

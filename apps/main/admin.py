@@ -158,7 +158,7 @@ class OrderItemInline(admin.TabularInline):
 class KnowledgeBaseLessonInline(admin.TabularInline):
     model = KnowledgeBaseLesson
     extra = 0
-    fields = ("title", "description", "url", "order")
+    fields = ("title", "description", "url", "thumbnail", "thumbnail_url", "order")
 
 
 @admin.register(KnowledgeBaseCourse)
@@ -172,7 +172,7 @@ class KnowledgeBaseCourseAdmin(admin.ModelAdmin):
 
 @admin.register(KnowledgeBaseLesson)
 class KnowledgeBaseLessonAdmin(admin.ModelAdmin):
-    list_display = ("title", "course", "order", "created_at")
+    list_display = ("title", "course", "order", "preview_url", "created_at")
     list_filter = ("created_at",)
     search_fields = ("title", "description", "course__title")
     list_select_related = ("course",)

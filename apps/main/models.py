@@ -5112,9 +5112,32 @@ class KnowledgeBaseLesson(models.Model):
     title = models.CharField("Название урока", max_length=255)
     description = models.TextField("Описание", blank=True)
     url = models.URLField("Ссылка на урок", max_length=500)
+
+    # Кастомное превью. Хранится либо файлом (админ загрузил картинку), либо
+    # ссылкой (админ указал URL). Если оба пустые — фронт строит превью сам
+    # из YouTube/Vimeo по полю url.
+    thumbnail = models.ImageField(
+        "Превью (файл)",
+        upload_to="knowledge-base/thumbnails/%Y/%m/",
+        blank=True,
+        null=True,
+    )
+    thumbnail_url = models.URLField(
+        "Превью (ссылка)",
+        max_length=500,
+        blank=True,
+        default="",
+    )
+
     order = models.PositiveIntegerField("Порядок", default=0)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
+
+    def preview_url(self) -> str:
+        """Готовая ссылка на превью или пустая строка."""
+        if self.thumbnail:
+            return self.thumbnail.url
+        return self.thumbnail_url or ""
 
     class Meta:
         verbose_name = "Урок базы знаний"
