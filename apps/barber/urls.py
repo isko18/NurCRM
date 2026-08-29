@@ -1,6 +1,7 @@
 # barber_crm/urls.py
 from django.urls import path
 from apps.barber import views
+from apps.barber.analytics_dashboard import BarberAnalyticsDashboardView
 
 urlpatterns = [
     path('services/', views.ServiceListCreateView.as_view(), name='service-list'),
@@ -18,6 +19,7 @@ urlpatterns = [
     path('appointments/my/', views.MyAppointmentListView.as_view(), name='my-appointment-list'),
     path('appointments/my/<uuid:pk>/', views.MyAppointmentDetailView.as_view(), name='my-appointment-detail'),
 
+    path('analytics/dashboard/', BarberAnalyticsDashboardView.as_view(), name='barber-analytics-dashboard'),
     path('analytics/', views.BarberAnalyticsView.as_view(), name='barber-analytics'),
     path('analytics/my/', views.MyBarberAnalyticsView.as_view(), name='barber-analytics-my'),
      
