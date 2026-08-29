@@ -192,6 +192,13 @@ def _is_market_company(company: Company) -> bool:
         return False
 
 
+def _company_can_use_cashier(company: Company) -> bool:
+    try:
+        return bool(company and getattr(company, "can_use_cashier", None) and company.can_use_cashier())
+    except Exception:
+        return False
+
+
 def _build_physical_receipt_text(sale, *, payment_method=None, cash_received=None, change=None, include_shift=True) -> str:
     from apps.main.receipt_header import receipt_vendor_header
 
@@ -3531,8 +3538,8 @@ class MobileScannerIngestAPIView(APIView):
             return Response({"detail": "token expired"}, status=410)
 
         cart = mt.cart
-        # POS доступен только для сферы Маркет
-        if not _is_market_company(getattr(cart, "company", None)):
+        # POS доступен сферам Маркет и Услуги
+        if not _company_can_use_cashier(getattr(cart, "company", None)):
             return Response({"detail": "invalid token"}, status=404)
 
         # ✅ защита: нельзя сканить в уже закрытую/неактивную корзину

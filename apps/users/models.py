@@ -264,6 +264,43 @@ class Company(models.Model):
             self.save(update_fields=["scale_api_token"])
         return self.scale_api_token
 
+    # Ключевые слова, которые на практике встречаются в названии сферы "Маркет".
+    # (сфера хранится текстом в справочниках, поэтому проверяем "по смыслу")
+    MARKET_SECTOR_KEYWORDS = (
+        "market", "маркет", "marketing", "маркетинг",
+        "shop", "store", "retail", "ритейл",
+        "магазин", "продукт", "супермаркет", "гипермаркет", "торгов",
+    )
+
+    # Сфера услуг: барбершоп / салон красоты / стоматология / общий "услуги".
+    SERVICES_SECTOR_KEYWORDS = (
+        "услуг", "service",
+        "барбер", "barber", "парикмахер",
+        "салон", "beauty", "красот",
+        "стоматолог", "dental", "dentistry", "клиник", "clinic",
+    )
+
+    def _sector_names(self) -> list:
+        """
+        Названия сферы компании: Company.industry (вид деятельности) и Company.sector (отрасль).
+        """
+        names = []
+        for attr in ("industry", "sector"):
+            try:
+                names.append(getattr(getattr(self, attr, None), "name", None))
+            except Exception:
+                pass
+        return names
+
+    def _sector_matches(self, keywords) -> bool:
+        for n in self._sector_names():
+            s = (n or "").strip().casefold()
+            if not s:
+                continue
+            if any(k in s for k in keywords):
+                return True
+        return False
+
     def is_market(self) -> bool:
         """
         True если компания относится к сфере "Маркет".
@@ -275,31 +312,21 @@ class Company(models.Model):
         Чтобы не зависеть от точного написания в БД, используем поиск по подстроке
         ("market"/"маркет") в названии industry/sector.
         """
-        names = []
-        try:
-            names.append(getattr(self.industry, "name", None))
-        except Exception:
-            pass
-        try:
-            names.append(getattr(self.sector, "name", None))
-        except Exception:
-            pass
+        return self._sector_matches(self.MARKET_SECTOR_KEYWORDS)
 
-        # Ключевые слова, которые на практике встречаются в названии сферы "Маркет".
-        # (у вас сфера хранится текстом в справочниках, поэтому делаем проверку "по смыслу")
-        keywords = (
-            "market", "маркет", "marketing", "маркетинг",
-            "shop", "store", "retail", "ритейл",
-            "магазин", "продукт", "супермаркет", "гипермаркет", "торгов",
-        )
+    def is_services(self) -> bool:
+        """
+        True если компания относится к сфере услуг (барбершоп/салон/стоматология и т.п.).
+        """
+        return self._sector_matches(self.SERVICES_SECTOR_KEYWORDS)
 
-        for n in names:
-            s = (n or "").strip().casefold()
-            if not s:
-                continue
-            if any(k in s for k in keywords):
-                return True
-        return False
+    def can_use_cashier(self) -> bool:
+        """
+        Доступен ли компании интерфейс кассы (User.can_view_cashier).
+
+        Сейчас: сфера "Маркет" и сфера услуг.
+        """
+        return self.is_market() or self.is_services()
 
     def is_consulting(self) -> bool:
         """True если компания относится к сфере «Консалтинг» (по названию industry/sector)."""
@@ -728,9 +755,9 @@ class User(AbstractBaseUser, PermissionsMixin):
         return f"{full_name} ({self.email})" if full_name and full_name != self.email else self.email
 
     def save(self, *args, **kwargs):
-        # Доступ к кассе разрешён только для компаний со сферой "Маркет".
+        # Доступ к кассе разрешён только для сфер "Маркет" и "Услуги".
         company = getattr(self, "company", None)
-        if not (company and getattr(company, "is_market", None) and company.is_market()):
+        if not (company and getattr(company, "can_use_cashier", None) and company.can_use_cashier()):
             self.can_view_cashier = False
         super().save(*args, **kwargs)
 

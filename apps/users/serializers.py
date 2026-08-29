@@ -73,13 +73,19 @@ def _is_market_company(company: Company) -> bool:
     except Exception:
         return False
 
-def _apply_market_cashier_gate(rep: dict, user: User):
+def _company_can_use_cashier(company: Company) -> bool:
+    try:
+        return bool(company and getattr(company, "can_use_cashier", None) and company.can_use_cashier())
+    except Exception:
+        return False
+
+def _apply_cashier_sector_gate(rep: dict, user: User):
     """
-    Гейт "интерфейс кассира доступен только для сферы Маркет":
-    - если компания НЕ market -> can_view_cashier всегда False (даже если флаг True в БД)
+    Гейт "интерфейс кассира доступен только сферам Маркет и Услуги":
+    - если сфера компании не разрешена -> can_view_cashier всегда False (даже если флаг True в БД)
     """
     company = _get_user_company(user)
-    if not _is_market_company(company):
+    if not _company_can_use_cashier(company):
         rep["can_view_cashier"] = False
     return rep
 
@@ -379,7 +385,7 @@ class UserSerializer(serializers.ModelSerializer):
 
     def to_representation(self, instance):
         rep = super().to_representation(instance)
-        return _apply_market_cashier_gate(rep, instance)
+        return _apply_cashier_sector_gate(rep, instance)
 
 
 # ======================
@@ -756,7 +762,7 @@ class UserListSerializer(serializers.ModelSerializer):
 
     def to_representation(self, instance):
         rep = super().to_representation(instance)
-        return _apply_market_cashier_gate(rep, instance)
+        return _apply_cashier_sector_gate(rep, instance)
 
 
 class UserWithPermissionsSerializer(serializers.ModelSerializer):
@@ -775,7 +781,7 @@ class UserWithPermissionsSerializer(serializers.ModelSerializer):
 
     def to_representation(self, instance):
         rep = super().to_representation(instance)
-        return _apply_market_cashier_gate(rep, instance)
+        return _apply_cashier_sector_gate(rep, instance)
 
 
 class SectorSerializer(serializers.ModelSerializer):
