@@ -2434,6 +2434,9 @@ class DealPayInputSerializer(serializers.Serializer):
     idempotency_key = serializers.UUIDField(required=True)
     note = serializers.CharField(required=False, allow_blank=True)
     cashbox_id = serializers.UUIDField(required=False, allow_null=True)
+    branch_id = serializers.UUIDField(required=False, allow_null=True)
+    cashbox_role = serializers.CharField(required=False, allow_blank=True, allow_null=True)
+    shift_id = serializers.UUIDField(required=False, allow_null=True)
 
 
 class DealRefundInputSerializer(serializers.Serializer):

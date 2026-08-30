@@ -60,6 +60,12 @@ class CashFlowCategory(models.Model):
 
 
 class Cashbox(models.Model):
+    class CashboxRole(models.TextChoices):
+        POS_MAIN = "pos_main", "Основная касса (POS)"
+        POS_BRANCH = "pos_branch", "Касса филиала (POS)"
+        EXPENSE_VARIABLE = "expense_variable", "Переменные расходы"
+        EXPENSE_FIXED = "expense_fixed", "Постоянные расходы"
+
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
 
     company = models.ForeignKey(
@@ -79,6 +85,14 @@ class Cashbox(models.Model):
     )
 
     name = models.CharField(max_length=255, blank=True, null=True, verbose_name="Название кассы")
+    role = models.CharField(
+        max_length=32,
+        choices=CashboxRole.choices,
+        null=True,
+        blank=True,
+        db_index=True,
+        verbose_name="Роль кассы",
+    )
     # ⛔ лучше без null=True на boolean, но я оставлю как есть, чтобы не ломать миграции
     is_consumption = models.BooleanField(verbose_name="Расход", default=False, blank=True, null=True)
 
@@ -91,6 +105,8 @@ class Cashbox(models.Model):
         indexes = [
             models.Index(fields=["company"]),
             models.Index(fields=["company", "branch"]),
+            models.Index(fields=["company", "role"]),
+            models.Index(fields=["company", "role", "branch"]),
         ]
         constraints = [
             models.UniqueConstraint(
@@ -104,6 +120,20 @@ class Cashbox(models.Model):
                 condition=Q(branch__isnull=True) & Q(name__isnull=False),
             ),
         ]
+
+    def get_inferred_role(self) -> str:
+        if self.role:
+            return self.role
+        n = (self.name or "").lower().strip()
+        if "филиал" in n or self.branch_id:
+            return self.CashboxRole.POS_BRANCH
+        if "переменн" in n:
+            return self.CashboxRole.EXPENSE_VARIABLE
+        if "постоянн" in n:
+            return self.CashboxRole.EXPENSE_FIXED
+        if "основн" in n:
+            return self.CashboxRole.POS_MAIN
+        return self.CashboxRole.POS_MAIN
 
     def clean(self):
         if self.branch_id and self.branch.company_id != self.company_id:
@@ -317,7 +347,10 @@ class CashShift(models.Model):
                     ]
                 ),
             ),
-            expense=Sum("amount", filter=Q(type=CashFlow.Type.EXPENSE)),
+            expense=Sum(
+                "amount",
+                filter=Q(type=CashFlow.Type.EXPENSE) & Q(affects_shift_drawer=True),
+            ),
         )
 
         Sale = self.sales.model
@@ -372,7 +405,26 @@ class CashShift(models.Model):
         cash_sales_total = (pay_agg["cash_sum"] or z) + (legacy_agg["cash_sum"] or z)
         noncash_sales_total = (pay_agg["noncash_sum"] or z) + (legacy_agg["noncash_sum"] or z)
 
-        expected_cash = (self.opening_cash or z) + cash_sales_total + income_total - expense_total
+        drawer_expected_cash = (self.opening_cash or z) + cash_sales_total + income_total - expense_total
+        expected_cash = drawer_expected_cash
+
+        # non_drawer_expenses_total: закупки/расходы за период смены, не влияющие на ящик
+        non_drawer_expenses_total = (
+            CashFlow.objects.filter(
+                company_id=self.company_id,
+                created_at__gte=self.opened_at,
+                created_at__lte=self.closed_at or timezone.now(),
+                type=CashFlow.Type.EXPENSE,
+                affects_shift_drawer=False,
+                source_kind__in=[
+                    CashFlow.SourceKind.WAREHOUSE_PURCHASE,
+                    CashFlow.SourceKind.PROCUREMENT_RECEIPT,
+                    CashFlow.SourceKind.DEFECT_WRITEOFF,
+                    CashFlow.SourceKind.SUPPLIER_DEBT_PAYMENT,
+                ],
+            ).aggregate(total=Sum("amount"))["total"]
+            or z
+        )
 
         return {
             "income_total": income_total,
@@ -382,24 +434,43 @@ class CashShift(models.Model):
             "cash_sales_total": cash_sales_total,
             "noncash_sales_total": noncash_sales_total,
             "expected_cash": expected_cash,
+            "drawer_expected_cash": drawer_expected_cash,
+            "ledger_expected_cash": drawer_expected_cash,
+            "non_drawer_expenses_total": non_drawer_expenses_total,
         }
 
     @property
+    def drawer_expected_cash(self) -> Decimal:
+        return self.calc_live_totals().get("expected_cash", Decimal("0.00"))
+
+    @property
     def expected_cash(self) -> Decimal:
-        return (self.opening_cash or 0) + (self.cash_sales_total or 0) + (self.income_total or 0) - (self.expense_total or 0)
+        return self.drawer_expected_cash
+
+    @property
+    def ledger_expected_cash(self) -> Decimal:
+        return self.drawer_expected_cash
+
+    @property
+    def non_drawer_expenses_total(self) -> Decimal:
+        return self.calc_live_totals().get("non_drawer_expenses_total", Decimal("0.00"))
 
     @property
     def cash_diff(self) -> Decimal:
         if self.closing_cash is None:
             return Decimal("0.00")
-        return (self.closing_cash or 0) - (self.expected_cash or 0)
+        return (self.closing_cash or Decimal("0.00")) - (self.expected_cash or Decimal("0.00"))
 
     def calc_payment_breakdown(self) -> list:
         Sale = self.sales.model
         from apps.main.models import SalePayment
 
         excluded_statuses = ["cancelled", "canceled", "refunded", "returned"]
-        sales_qs = Sale.objects.filter(shift_id=self.id).exclude(status__in=excluded_statuses)
+        sales_qs = (
+            Sale.objects.filter(shift_id=self.id)
+            .exclude(status__in=excluded_statuses)
+            .prefetch_related("payments")
+        )
 
         METHOD_LABELS = {
             "cash": "Наличные",
@@ -414,31 +485,30 @@ class CashShift(models.Model):
             "mixed": "Смешанная",
             "debt": "Отсрочка",
             "deferred": "Отсрочка",
+            "other": "Другое",
         }
 
         breakdown_data = {}
 
-        payments_qs = SalePayment.objects.filter(sale__in=sales_qs)
-        sale_payments_map = {}
-        for p in payments_qs:
-            sale_payments_map.setdefault(p.sale_id, set()).add(p.method)
-
         for sale in sales_qs:
-            pm_set = sale_payments_map.get(sale.id, set())
+            payments = [p for p in sale.payments.all() if (p.amount or Decimal("0")) > 0]
+            methods = {str(p.method).lower().strip() for p in payments}
 
-            if len(pm_set) >= 2:
+            if len(methods) >= 2:
                 m_code = "split"
-            elif len(pm_set) == 1:
-                m_code = list(pm_set)[0]
+            elif sale.payment_method in ("deferred", "debt"):
+                m_code = "debt"
+            elif len(methods) == 1:
+                m_code = list(methods)[0]
             else:
-                m_code = sale.payment_method or "cash"
+                m_code = str(sale.payment_method or "cash").lower().strip()
 
             if m_code in ("deferred", "debt"):
                 m_code = "debt"
             elif m_code in ("mixed", "split"):
                 m_code = "split"
 
-            label = METHOD_LABELS.get(m_code, str(m_code).title() if m_code else "Другое")
+            label = METHOD_LABELS.get(m_code, m_code.title() if m_code else "Другое")
             tot = sale.total or Decimal("0.00")
 
             if m_code not in breakdown_data:
@@ -513,11 +583,14 @@ class CashFlow(models.Model):
         POS_SALE = "pos_sale", "POS продажа"
         POS_PREPAYMENT = "pos_prepayment", "POS предоплата"
         DEBT_REPAYMENT = "debt_repayment", "Погашение долга"
+        SUPPLIER_DEBT_PAYMENT = "supplier_debt_payment", "Оплата долга поставщику"
         WAREHOUSE_PURCHASE = "warehouse_purchase", "Закупка товара"
         PROCUREMENT_RECEIPT = "procurement_receipt", "Приход поставщика"
         SUPPLIER_RETURN = "supplier_return", "Возврат поставщику"
         DEFECT_WRITEOFF = "defect_writeoff", "Списание брака"
         PRODUCT_RETURN = "product_return", "Возврат товара"
+        SHIFT_DRAWER_OUTFLOW = "shift_drawer_outflow", "Расход из ящика смены"
+        MANUAL = "manual", "Ручная операция"
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
 
@@ -539,6 +612,12 @@ class CashFlow(models.Model):
     created_at = models.DateTimeField(auto_now_add=True, verbose_name="Дата создания")
 
     status = models.CharField(max_length=10, choices=Status.choices, default=Status.PENDING, db_index=True, verbose_name="Статус")
+
+    affects_shift_drawer = models.BooleanField(
+        default=False,
+        db_index=True,
+        verbose_name="Влияет на ящик смены",
+    )
 
     source_cashbox_flow_id = models.CharField(max_length=36, null=True, blank=True, verbose_name="ID исходного движения кассы")
     source_business_operation_id = models.CharField(max_length=36, null=True, blank=True, verbose_name="ID бизнес-операции")
@@ -627,6 +706,9 @@ class CashFlow(models.Model):
                 raise ValidationError({"category": "Категория другого филиала (или укажите общую категорию без филиала)."})
 
     def save(self, *args, **kwargs):
+        if self.source_kind == self.SourceKind.SHIFT_DRAWER_OUTFLOW:
+            self.affects_shift_drawer = True
+
         if self.cashbox_id:
             self.company_id = self.cashbox.company_id
             self.branch_id = self.cashbox.branch_id

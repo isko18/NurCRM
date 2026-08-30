@@ -78,8 +78,13 @@ class CashShiftListSerializer(serializers.ModelSerializer):
     cashier_display = serializers.SerializerMethodField()
 
     expected_cash = serializers.DecimalField(max_digits=12, decimal_places=2, read_only=True)
+    drawer_expected_cash = serializers.DecimalField(max_digits=12, decimal_places=2, read_only=True)
+    ledger_expected_cash = serializers.DecimalField(max_digits=12, decimal_places=2, read_only=True)
+    non_drawer_expenses_total = serializers.DecimalField(max_digits=12, decimal_places=2, read_only=True)
     cash_diff = serializers.DecimalField(max_digits=12, decimal_places=2, read_only=True)
     payment_breakdown = serializers.SerializerMethodField()
+    resolved_cashbox_id = serializers.SerializerMethodField()
+    resolved_cashbox_name = serializers.SerializerMethodField()
 
     class Meta:
         model = CashShift
@@ -89,6 +94,8 @@ class CashShiftListSerializer(serializers.ModelSerializer):
             "branch",
             "cashbox",
             "cashbox_name",
+            "resolved_cashbox_id",
+            "resolved_cashbox_name",
             "cashier",
             "cashier_display",
             "status",
@@ -103,6 +110,9 @@ class CashShiftListSerializer(serializers.ModelSerializer):
             "cash_sales_total",
             "noncash_sales_total",
             "expected_cash",
+            "drawer_expected_cash",
+            "ledger_expected_cash",
+            "non_drawer_expenses_total",
             "cash_diff",
             "payment_breakdown",
         ]
@@ -112,6 +122,12 @@ class CashShiftListSerializer(serializers.ModelSerializer):
         if obj.cashbox and obj.cashbox.branch:
             return f"Касса филиала {obj.cashbox.branch.name}"
         return getattr(obj.cashbox, "name", None) or "Касса"
+
+    def get_resolved_cashbox_id(self, obj):
+        return str(obj.cashbox_id) if obj.cashbox_id else None
+
+    def get_resolved_cashbox_name(self, obj):
+        return self.get_cashbox_name(obj)
 
     def get_cashier_display(self, obj):
         u = obj.cashier
@@ -124,12 +140,11 @@ class CashShiftListSerializer(serializers.ModelSerializer):
         )
 
     def get_payment_breakdown(self, obj):
-        return obj.calc_payment_breakdown()
+        return obj.calc_payment_breakdown() or []
 
     def to_representation(self, obj):
         data = super().to_representation(obj)
 
-        # ✅ OPEN: live-цифры без записи в БД
         if obj.status == CashShift.Status.OPEN:
             t = obj.calc_live_totals()
 
@@ -141,7 +156,20 @@ class CashShiftListSerializer(serializers.ModelSerializer):
             data["noncash_sales_total"] = str(t["noncash_sales_total"])
 
             data["expected_cash"] = str(t["expected_cash"])
+            data["drawer_expected_cash"] = str(t["drawer_expected_cash"])
+            data["ledger_expected_cash"] = str(t["ledger_expected_cash"])
+            data["non_drawer_expenses_total"] = str(t["non_drawer_expenses_total"])
             data["cash_diff"] = "0.00"
+        else:
+            data["drawer_expected_cash"] = str(obj.drawer_expected_cash)
+            data["ledger_expected_cash"] = str(obj.ledger_expected_cash)
+            data["non_drawer_expenses_total"] = str(obj.non_drawer_expenses_total)
+            data["expected_cash"] = str(obj.expected_cash)
+            data["cash_diff"] = str(obj.cash_diff)
+
+        data["resolved_cashbox_id"] = str(obj.cashbox_id) if obj.cashbox_id else None
+        data["resolved_cashbox_name"] = self.get_cashbox_name(obj)
+        data["payment_breakdown"] = obj.calc_payment_breakdown() or []
 
         return data
 
@@ -150,15 +178,18 @@ class CashShiftOpenSerializer(serializers.ModelSerializer):
     """
     ✅ Разрешаем несколько OPEN смен на одну кассу.
     ✅ Запрещаем только повторную OPEN смену этому же кассиру на этой кассе.
+    ✅ Авто-резолв кассы по branch_id / cashbox_role, если cashbox не передан.
     """
     MAX_OPEN_COMPANY_SHIFTS = 3
 
     cashier = serializers.PrimaryKeyRelatedField(required=False, allow_null=True, queryset=User.objects.none())
-    cashbox = serializers.PrimaryKeyRelatedField(queryset=Cashbox.objects.none())
+    cashbox = serializers.PrimaryKeyRelatedField(required=False, allow_null=True, queryset=Cashbox.objects.none())
+    branch_id = serializers.UUIDField(required=False, allow_null=True, write_only=True)
+    cashbox_role = serializers.CharField(required=False, allow_blank=True, allow_null=True, write_only=True)
 
     class Meta:
         model = CashShift
-        fields = ["id", "cashbox", "cashier", "opening_cash"]
+        fields = ["id", "cashbox", "cashier", "opening_cash", "branch_id", "cashbox_role"]
         read_only_fields = ["id"]
 
     def __init__(self, *args, **kwargs):
@@ -191,12 +222,8 @@ class CashShiftOpenSerializer(serializers.ModelSerializer):
         user = getattr(request, "user", None) if request else None
         company = _get_company_from_user(user)
 
-        cashbox = attrs.get("cashbox")
-        if not (company and cashbox):
-            raise serializers.ValidationError("Нет company/cashbox.")
-
-        if cashbox.company_id != company.id:
-            raise serializers.ValidationError({"cashbox": "Касса другой компании."})
+        if not company:
+            raise serializers.ValidationError("Нет компании у пользователя.")
 
         # cashier
         chosen_cashier = attrs.get("cashier") or None
@@ -209,6 +236,23 @@ class CashShiftOpenSerializer(serializers.ModelSerializer):
                 raise serializers.ValidationError({"cashier": "Нельзя открыть смену на другого кассира."})
 
         cashier = attrs["cashier"]
+
+        # resolve cashbox if not provided
+        cashbox = attrs.get("cashbox")
+        if not cashbox:
+            from apps.construction.auto_cashflow import resolve_cashbox
+            ctx = {
+                "branch_id": attrs.get("branch_id") or (request.data.get("branch_id") if request else None),
+                "cashbox_role": attrs.get("cashbox_role") or (request.data.get("cashbox_role") if request else None),
+                "user": cashier,
+            }
+            cashbox = resolve_cashbox(company=company, context=ctx, source_kind=None, require_cashbox=False)
+            if not cashbox:
+                raise serializers.ValidationError({"cashbox": "Не удалось определить кассу для смены."})
+            attrs["cashbox"] = cashbox
+
+        if cashbox.company_id != company.id:
+            raise serializers.ValidationError({"cashbox": "Касса другой компании."})
 
         # ✅ теперь проверяем только "есть ли уже OPEN смена этого кассира на этой кассе"
         existing = (
@@ -235,6 +279,8 @@ class CashShiftOpenSerializer(serializers.ModelSerializer):
         return attrs
 
     def create(self, validated_data):
+        validated_data.pop("branch_id", None)
+        validated_data.pop("cashbox_role", None)
         existing = validated_data.pop("_existing_shift", None)
         if existing:
             return existing
@@ -300,16 +346,18 @@ class CashFlowInsideCashboxSerializer(serializers.ModelSerializer):
 class CashboxWithFlowsSerializer(CompanyBranchReadOnlyMixin):
     cashflows = CashFlowInsideCashboxSerializer(source="flows", many=True, read_only=True)
     is_consumption = serializers.BooleanField(read_only=True)
+    role = serializers.CharField(read_only=True)
 
     class Meta:
         model = Cashbox
-        fields = ["id", "company", "branch", "name", "is_consumption", "cashflows"]
-        read_only_fields = ["id", "company", "branch", "cashflows", "is_consumption"]
+        fields = ["id", "company", "branch", "name", "role", "is_consumption", "cashflows"]
+        read_only_fields = ["id", "company", "branch", "role", "cashflows", "is_consumption"]
 
 
 class CashboxSerializer(CompanyBranchReadOnlyMixin):
     analytics = serializers.SerializerMethodField()
     is_consumption = serializers.BooleanField(read_only=True)
+    role = serializers.CharField(required=False, allow_null=True)
     balance = serializers.SerializerMethodField()
     current_balance = serializers.SerializerMethodField()
     currency = serializers.CharField(default="KGS", read_only=True)
@@ -318,7 +366,7 @@ class CashboxSerializer(CompanyBranchReadOnlyMixin):
     class Meta:
         model = Cashbox
         fields = [
-            "id", "company", "branch", "name",
+            "id", "company", "branch", "name", "role",
             "is_consumption", "balance", "current_balance", "currency", "is_active",
             "analytics",
         ]
@@ -340,6 +388,7 @@ class CashboxSerializer(CompanyBranchReadOnlyMixin):
 
     def get_current_balance(self, obj):
         return self.get_balance(obj)
+
     def to_representation(self, instance):
         data = super().to_representation(instance)
 
@@ -355,6 +404,9 @@ class CashboxSerializer(CompanyBranchReadOnlyMixin):
 
             if instance.id == first_cashbox_id:
                 data["name"] = "Основная касса компании"
+
+        if not data.get("role"):
+            data["role"] = instance.get_inferred_role()
 
         return data
     def get_analytics(self, obj):

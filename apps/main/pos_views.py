@@ -2815,6 +2815,10 @@ class SaleCheckoutAPIView(MarketCashierOnlyMixin, APIView):
                         auto_flows.append(cf)
 
             payload["cashflows"] = serialize_auto_cashflows(auto_flows)
+            cb_resolved_id = str(sale.cashbox_id) if sale.cashbox_id else None
+            cb_resolved_name = getattr(sale.cashbox, "name", None) or ("Касса филиала" if getattr(sale.cashbox, "branch_id", None) else "Касса") if sale.cashbox else "Касса"
+            payload["resolved_cashbox_id"] = cb_resolved_id
+            payload["resolved_cashbox_name"] = cb_resolved_name
 
             if print_receipt:
                 payload["receipt_print_path"] = (
@@ -4861,6 +4865,11 @@ class AgentSaleCheckoutAPIView(MarketCashierOnlyMixin, CompanyBranchRestrictedMi
                         auto_flows.append(cf)
 
             payload["cashflows"] = serialize_auto_cashflows(auto_flows)
+            cb_obj = getattr(sale, "cashbox", None)
+            cb_resolved_id = str(cb_obj.id) if cb_obj else None
+            cb_resolved_name = getattr(cb_obj, "name", None) or ("Касса филиала" if getattr(cb_obj, "branch_id", None) else "Касса") if cb_obj else "Касса"
+            payload["resolved_cashbox_id"] = cb_resolved_id
+            payload["resolved_cashbox_name"] = cb_resolved_name
 
             if print_receipt:
                 payload["receipt_print_path"] = (

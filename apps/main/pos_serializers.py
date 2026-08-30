@@ -389,6 +389,8 @@ class CheckoutSerializer(serializers.Serializer):
 
     # если смены нет — можно передать кассу (или автоподбор)
     cashbox_id = OptionalUUIDField(required=False, allow_null=True)
+    branch_id = OptionalUUIDField(required=False, allow_null=True)
+    cashbox_role = serializers.CharField(required=False, allow_blank=True, allow_null=True)
 
     # ✅ НОВОЕ: можно явно указать смену (нужно, когда 2 смены на 1 кассу)
     shift_id = OptionalUUIDField(required=False, allow_null=True)
@@ -405,31 +407,17 @@ class CheckoutSerializer(serializers.Serializer):
     schedule_version = serializers.CharField(required=False, allow_null=True, allow_blank=True)
     debt_schedule = serializers.JSONField(required=False, allow_null=True)
 
-    def _resolve_cashbox(self, cart: Cart, cashbox_id):
-        if not cashbox_id:
-            cb = (
-                Cashbox.objects
-                .filter(company_id=cart.company_id, branch_id=cart.branch_id)
-                .order_by("-created_at")
-                .first()
-                or Cashbox.objects
-                .filter(company_id=cart.company_id, branch__isnull=True)
-                .order_by("-created_at")
-                .first()
-            )
-            if cb:
-                return cb
-            raise serializers.ValidationError({"cashbox_id": "Нет кассы для этого филиала/компании."})
-
-        cb = Cashbox.objects.filter(id=cashbox_id).first()
-        if not cb:
-            raise serializers.ValidationError({"cashbox_id": "Касса не найдена."})
-        if cb.company_id != cart.company_id:
-            raise serializers.ValidationError({"cashbox_id": "Касса другой компании."})
-        if (cb.branch_id or None) != (cart.branch_id or None):
-            raise serializers.ValidationError({"cashbox_id": "Касса другого филиала."})
-
-        return cb
+    def _resolve_cashbox(self, cart: Cart, cashbox_id, branch_id=None, cashbox_role=None):
+        from apps.construction.auto_cashflow import resolve_cashbox
+        ctx = {
+            "cashbox_id": cashbox_id,
+            "branch_id": branch_id or cart.branch_id,
+            "cashbox_role": cashbox_role,
+        }
+        cb = resolve_cashbox(company=cart.company, context=ctx, source_kind="pos_sale", require_cashbox=False)
+        if cb:
+            return cb
+        raise serializers.ValidationError({"cashbox_id": "Нет кассы для этого филиала/компании."})
 
     def _resolve_shift(self, cart: Cart, cashbox: Cashbox, user, shift_id):
         # 1) если shift_id явно передали — валидируем
@@ -565,7 +553,12 @@ class CheckoutSerializer(serializers.Serializer):
             attrs["shift_id"] = None
             return attrs
 
-        cb = self._resolve_cashbox(cart, attrs.get("cashbox_id"))
+        cb = self._resolve_cashbox(
+            cart,
+            attrs.get("cashbox_id"),
+            branch_id=attrs.get("branch_id"),
+            cashbox_role=attrs.get("cashbox_role"),
+        )
         sh = self._resolve_shift(cart, cb, user, attrs.get("shift_id"))
 
         attrs["cashbox_id"] = cb.id
