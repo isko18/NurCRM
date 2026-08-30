@@ -1182,6 +1182,7 @@ class ProductAlternateBarcode(models.Model):
         verbose_name="Компания",
     )
     barcode = models.CharField("Штрихкод", max_length=64)
+    name = models.CharField("Название / Описание", max_length=255, blank=True, default="")
 
     class Meta:
         verbose_name = "Дополнительный штрихкод товара"

@@ -319,12 +319,26 @@ def _get_characteristics_model():
 
 def _sync_warehouse_product_alternate_barcodes(product: m.WarehouseProduct, codes):
     """
-    Полная замена доп. штрихкодов для товара. codes — список строк (уже нормализованных уникальных).
+    Полная замена доп. штрихкодов для товара. codes — список строк или словарей {barcode, name}.
     """
     company = product.company
     warehouse = product.warehouse
     main = _norm_str(product.barcode)
-    for b in codes:
+    norm = []
+    seen = set()
+    for x in codes or []:
+        if isinstance(x, dict):
+            b = _norm_str(x.get("barcode"))
+            n = str(x.get("name") or "").strip()
+        else:
+            b = _norm_str(x)
+            n = ""
+        if not b or b in seen:
+            continue
+        seen.add(b)
+        norm.append((b, n))
+
+    for b, n in norm:
         if main and b == main:
             raise serializers.ValidationError(
                 {"alternate_barcodes": f"Код «{b}» совпадает с основным штрихкодом товара — оставьте его только в поле barcode."}
@@ -350,8 +364,8 @@ def _sync_warehouse_product_alternate_barcodes(product: m.WarehouseProduct, code
                 {"alternate_barcodes": f"Штрихкод «{b}» уже привязан к другому товару на этом складе."}
             )
     product.alternate_barcodes.all().delete()
-    for b in codes:
-        m.WarehouseProductAlternateBarcode.objects.create(product=product, barcode=b)
+    for b, n in norm:
+        m.WarehouseProductAlternateBarcode.objects.create(product=product, barcode=b, name=n)
 
 
 class WarehouseProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
@@ -359,9 +373,9 @@ class WarehouseProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSe
     images = WarehouseProductImageSerializer(many=True, read_only=True)
     packages = WarehouseProductPackageSerializer(many=True, read_only=True)
     alternate_barcodes = serializers.ListField(
-        child=serializers.CharField(max_length=64),
         required=False,
         write_only=True,
+        allow_null=True,
     )
     supplier_name = serializers.CharField(source="supplier.name", read_only=True, allow_null=True)
 
@@ -453,9 +467,10 @@ class WarehouseProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSe
 
     def to_representation(self, instance):
         data = super().to_representation(instance)
-        data["alternate_barcodes"] = list(
-            instance.alternate_barcodes.order_by("barcode").values_list("barcode", flat=True)
-        )
+        data["alternate_barcodes"] = [
+            {"barcode": item.barcode, "name": item.name}
+            for item in instance.alternate_barcodes.order_by("barcode")
+        ]
         return data
 
     def _upsert_characteristics(self, product: m.WarehouseProduct, characteristics_data):

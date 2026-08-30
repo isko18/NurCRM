@@ -987,7 +987,7 @@ class ProductBarcodeAwareSearchFilter(filters.SearchFilter):
 class ProductListView(CompanyBranchRestrictedMixin, generics.ListAPIView):
     serializer_class = ProductSerializer
     filter_backends = [ProductBarcodeAwareSearchFilter, filters.OrderingFilter]
-    search_fields = ["name", "barcode", "alternate_barcodes__barcode"]
+    search_fields = ["name", "barcode", "alternate_barcodes__barcode", "alternate_barcodes__name"]
     ordering_fields = ["created_at", "updated_at", "price"]
     # По умолчанию — по монотонному seq: детерминированный порядок «сначала новые»
     # без переупорядочивания строк с одинаковым created_at (fallback ниже — тоже -seq).
@@ -1081,7 +1081,7 @@ class ProductCompactListView(CompanyBranchRestrictedMixin, generics.ListAPIView)
     serializer_class = ProductListSerializer
     pagination_class = CompactProductCursorPagination
     filter_backends = [ProductBarcodeAwareSearchFilter, filters.OrderingFilter]
-    search_fields = ["name", "barcode", "alternate_barcodes__barcode"]
+    search_fields = ["name", "barcode", "alternate_barcodes__barcode", "alternate_barcodes__name"]
     ordering_fields = ["created_at", "updated_at", "price"]
     ordering = ["-created_at"]
 
@@ -1353,17 +1353,8 @@ class ProductCreateByBarcodeAPIView(CompanyBranchRestrictedMixin, generics.Creat
 
         if "alternate_barcodes" in data:
             raw_alts = data.get("alternate_barcodes")
-            if not isinstance(raw_alts, (list, tuple)):
-                raw_alts = []
-            seen_a = set()
-            alt_norm = []
-            for x in raw_alts:
-                b = (str(x or "").strip())
-                if b and b not in seen_a:
-                    seen_a.add(b)
-                    alt_norm.append(b)
             try:
-                sync_product_alternate_barcodes(product, alt_norm)
+                sync_product_alternate_barcodes(product, raw_alts)
             except serializers.ValidationError as ve:
                 return Response(
                     ve.detail if isinstance(ve.detail, dict) else {"detail": ve.detail},
@@ -1566,34 +1557,7 @@ class ProductCreateManualAPIView(CompanyBranchRestrictedMixin, generics.CreateAP
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        alt_payload = None
-        if "alternate_barcodes" in data:
-            raw_alts = data.get("alternate_barcodes")
-            if not isinstance(raw_alts, (list, tuple)):
-                raw_alts = []
-            seen_a = set()
-            alt_payload = []
-            for x in raw_alts:
-                b = (str(x or "").strip())
-                if b and b not in seen_a:
-                    seen_a.add(b)
-                    alt_payload.append(b)
-            if barcode and barcode in seen_a:
-                return Response(
-                    {"alternate_barcodes": "Дополнительный штрих-код не может совпадать с основным."},
-                    status=status.HTTP_400_BAD_REQUEST,
-                )
-            for b in alt_payload:
-                if Product.objects.filter(company=company, barcode=b).exists():
-                    return Response(
-                        {"alternate_barcodes": f"Штрихкод «{b}» уже основной у другого товара."},
-                        status=status.HTTP_400_BAD_REQUEST,
-                    )
-                if ProductAlternateBarcode.objects.filter(company=company, barcode=b).exists():
-                    return Response(
-                        {"alternate_barcodes": f"Штрихкод «{b}» уже дополнительный у другого товара."},
-                        status=status.HTTP_400_BAD_REQUEST,
-                    )
+        alt_payload = data.get("alternate_barcodes") if "alternate_barcodes" in data else None
 
         # kind
         kind_value = _parse_kind(data.get("kind"), Product)
@@ -4141,7 +4105,9 @@ class SupplierRecommendationsAPIView(CompanyBranchRestrictedMixin, APIView):
                 | Q(barcode__icontains=search)
                 | Q(article__icontains=search)
                 | Q(code__icontains=search)
-            )
+                | Q(alternate_barcodes__barcode__icontains=search)
+                | Q(alternate_barcodes__name__icontains=search)
+            ).distinct()
 
         all_products = list(prod_qs)
         product_ids = [p.id for p in all_products]

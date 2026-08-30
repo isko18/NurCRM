@@ -975,6 +975,7 @@ class WarehouseMassIncomingAPIView(CompanyBranchRestrictedMixin, APIView):
                 doc_type=m.Document.DocType.RECEIPT,
                 status=m.Document.Status.DRAFT,
                 warehouse_from=warehouse,
+                branch=warehouse.branch,
                 comment=comment,
             )
 

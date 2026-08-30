@@ -752,7 +752,10 @@ class ProductSimpleSerializer(serializers.ModelSerializer):
         }
 
     def get_alternate_barcodes(self, obj):
-        return list(obj.alternate_barcodes.order_by("barcode").values_list("barcode", flat=True))
+        return [
+            {"barcode": b.barcode, "name": b.name}
+            for b in obj.alternate_barcodes.order_by("barcode")
+        ]
 
 
 class WarehouseSimpleSerializer(serializers.ModelSerializer):

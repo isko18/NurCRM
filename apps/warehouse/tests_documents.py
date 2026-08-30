@@ -549,6 +549,7 @@ class BackendChecklistTests(APITestCase):
             warehouse_from=self.whB,
             agent=self.agent_user,
             payment_kind=models.Document.PaymentKind.CASH,
+            company=self.company,
         )
         models.DocumentItem.objects.create(document=doc, product=self.prod_b, qty=Decimal("10"), price=Decimal("10"))
 
@@ -572,6 +573,7 @@ class BackendChecklistTests(APITestCase):
             warehouse_from=self.whB,
             agent=self.agent_user,
             payment_kind=models.Document.PaymentKind.CASH,
+            company=self.company,
         )
         models.DocumentItem.objects.create(document=doc, product=self.prod_b, qty=Decimal("10"), price=Decimal("10"))
 
@@ -600,6 +602,7 @@ class BackendChecklistTests(APITestCase):
             warehouse_from=self.whB,
             agent=self.agent_user,
             payment_kind=models.Document.PaymentKind.CASH,
+            company=self.company,
         )
         models.DocumentItem.objects.create(document=doc, product=self.prod_b, qty=Decimal("10"), price=Decimal("10"))
 
@@ -625,6 +628,7 @@ class BackendChecklistTests(APITestCase):
             warehouse_from=self.whB,
             agent=self.agent_user,
             payment_kind=models.Document.PaymentKind.CASH,
+            company=self.company,
         )
         models.DocumentItem.objects.create(document=doc, product=self.prod_b, qty=Decimal("10"), price=Decimal("10"))
 

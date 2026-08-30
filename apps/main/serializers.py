@@ -970,7 +970,7 @@ def sync_product_promotion_tiers(product, raw, *, stock_enabled: bool, partial: 
 def sync_product_alternate_barcodes(product: Product, raw):
     """
     Полная замена списка доп. штрихкодов для товара.
-    raw — list[str] | None (пустой список очищает).
+    raw — list[str | dict] | None (пустой список очищает).
     """
     from django.core.cache import cache
 
@@ -979,7 +979,12 @@ def sync_product_alternate_barcodes(product: Product, raw):
     seen = set()
     norm = []
     for x in raw or []:
-        b = (str(x or "").strip())
+        if isinstance(x, dict):
+            b = str(x.get("barcode") or "").strip()
+            n = str(x.get("name") or "").strip()
+        else:
+            b = str(x or "").strip()
+            n = ""
         if not b:
             continue
         if b in seen:
@@ -987,9 +992,9 @@ def sync_product_alternate_barcodes(product: Product, raw):
                 "alternate_barcodes": f"Дубликат в списке: {b}.",
             })
         seen.add(b)
-        norm.append(b)
+        norm.append((b, n))
 
-    for b in norm:
+    for b, n in norm:
         if main and b == main:
             raise serializers.ValidationError({
                 "alternate_barcodes": f"Доп. штрихкод «{b}» совпадает с основным штрихкодом товара.",
@@ -1010,14 +1015,14 @@ def sync_product_alternate_barcodes(product: Product, raw):
     if norm:
         ProductAlternateBarcode.objects.bulk_create(
             [
-                ProductAlternateBarcode(product=product, company_id=company_id, barcode=b)
-                for b in norm
+                ProductAlternateBarcode(product=product, company_id=company_id, barcode=b, name=n)
+                for b, n in norm
             ]
         )
     for old in old_codes:
         if old:
             cache.delete(f"product_barcode:{company_id}:{old}")
-    for b in norm:
+    for b, _ in norm:
         cache.delete(f"product_barcode:{company_id}:{b}")
 
 
@@ -1114,7 +1119,6 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
         allow_null=True,
     )
     alternate_barcodes = serializers.ListField(
-        child=serializers.CharField(max_length=64),
         write_only=True,
         required=False,
         allow_null=True,
@@ -1577,9 +1581,10 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
             self._sanitize_decimal_fields(instance)
             data = super().to_representation(instance)
         try:
-            data["alternate_barcodes"] = list(
-                instance.alternate_barcodes.order_by("barcode").values_list("barcode", flat=True)
-            )
+            data["alternate_barcodes"] = [
+                {"barcode": item.barcode, "name": item.name}
+                for item in instance.alternate_barcodes.order_by("barcode")
+            ]
         except Exception:
             data["alternate_barcodes"] = []
         return data

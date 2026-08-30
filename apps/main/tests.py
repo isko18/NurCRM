@@ -475,6 +475,33 @@ class ProductWarehouseBarcodeAPITestCase(TestCase):
         resp = ProductWarehouseBarcodeAPIView.as_view()(req, barcode="")
         self.assertEqual(resp.status_code, 400)
 
+    def test_sync_and_search_by_alternate_barcode_name(self):
+        from apps.main.serializers import sync_product_alternate_barcodes, ProductSerializer
+        from apps.main.views import ProductListView
+
+        sync_product_alternate_barcodes(
+            self.product,
+            [{"barcode": "0693888888888", "name": "Упаковка 10 шт"}]
+        )
+        self.product.refresh_from_db()
+        alt = self.product.alternate_barcodes.first()
+        self.assertIsNotNone(alt)
+        self.assertEqual(alt.barcode, "0693888888888")
+        self.assertEqual(alt.name, "Упаковка 10 шт")
+
+        serializer = ProductSerializer(self.product)
+        self.assertEqual(
+            serializer.data["alternate_barcodes"],
+            [{"barcode": "0693888888888", "name": "Упаковка 10 шт"}]
+        )
+
+        req = self.api_factory.get("/main/products/?search=Упаковка")
+        force_authenticate(req, user=self.owner)
+        resp = ProductListView.as_view()(req)
+        self.assertEqual(resp.status_code, 200)
+        found_ids = [p["id"] for p in resp.data.get("results", [])]
+        self.assertIn(str(self.product.id), found_ids)
+
 
 class ProductCreateManualWholesalePriceTestCase(TestCase):
     def setUp(self):
