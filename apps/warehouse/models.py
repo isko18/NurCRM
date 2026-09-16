@@ -657,6 +657,7 @@ class WarehouseProductAlternateBarcode(BaseModelId):
     )
     barcode = models.CharField("Штрихкод", max_length=64)
     name = models.CharField("Название / Описание", max_length=255, blank=True, default="")
+    quantity = models.PositiveIntegerField("Количество в упаковке", null=True, blank=True)
 
     class Meta:
         verbose_name = "Дополнительный штрихкод товара"

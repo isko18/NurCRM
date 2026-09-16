@@ -492,7 +492,7 @@ class ProductWarehouseBarcodeAPITestCase(TestCase):
         serializer = ProductSerializer(self.product)
         self.assertEqual(
             serializer.data["alternate_barcodes"],
-            [{"barcode": "0693888888888", "name": "Упаковка 10 шт"}]
+            [{"barcode": "0693888888888", "name": "Упаковка 10 шт", "quantity": None}]
         )
 
         req = self.api_factory.get("/main/products/?search=Упаковка")
@@ -501,6 +501,45 @@ class ProductWarehouseBarcodeAPITestCase(TestCase):
         self.assertEqual(resp.status_code, 200)
         found_ids = [p["id"] for p in resp.data.get("results", [])]
         self.assertIn(str(self.product.id), found_ids)
+
+    def test_sync_alternate_barcode_quantity(self):
+        from apps.main.serializers import sync_product_alternate_barcodes, ProductSerializer
+        from rest_framework.exceptions import ValidationError
+
+        sync_product_alternate_barcodes(
+            self.product,
+            [{"barcode": "0693888888889", "name": "Коробка 24 шт", "quantity": 24}]
+        )
+        self.product.refresh_from_db()
+        alt = self.product.alternate_barcodes.get(barcode="0693888888889")
+        self.assertEqual(alt.quantity, 24)
+
+        serializer = ProductSerializer(self.product)
+        self.assertEqual(
+            serializer.data["alternate_barcodes"],
+            [{"barcode": "0693888888889", "name": "Коробка 24 шт", "quantity": 24}]
+        )
+
+        # Non-positive or non-integer quantity must raise validation error
+        with self.assertRaises(ValidationError) as ctx:
+            sync_product_alternate_barcodes(
+                self.product,
+                [{"barcode": "0693888888890", "name": "Неверно", "quantity": 0}]
+            )
+        self.assertIn(
+            "Количество в доп. штрихкоде '069388888890' должно быть положительным числом.",
+            str(ctx.exception.detail.get("alternate_barcodes"))
+        )
+
+        with self.assertRaises(ValidationError) as ctx2:
+            sync_product_alternate_barcodes(
+                self.product,
+                [{"barcode": "0693888888891", "name": "Дробное", "quantity": 2.5}]
+            )
+        self.assertIn(
+            "Количество в доп. штрихкоде '069388888891' должно быть положительным числом.",
+            str(ctx2.exception.detail.get("alternate_barcodes"))
+        )
 
 
 class ProductCreateManualWholesalePriceTestCase(TestCase):

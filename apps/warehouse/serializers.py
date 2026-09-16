@@ -319,7 +319,7 @@ def _get_characteristics_model():
 
 def _sync_warehouse_product_alternate_barcodes(product: m.WarehouseProduct, codes):
     """
-    Полная замена доп. штрихкодов для товара. codes — список строк или словарей {barcode, name}.
+    Полная замена доп. штрихкодов для товара. codes — список строк или словарей {barcode, name, quantity}.
     """
     company = product.company
     warehouse = product.warehouse
@@ -330,15 +330,28 @@ def _sync_warehouse_product_alternate_barcodes(product: m.WarehouseProduct, code
         if isinstance(x, dict):
             b = _norm_str(x.get("barcode"))
             n = str(x.get("name") or "").strip()
+            raw_qty = x.get("quantity")
         else:
             b = _norm_str(x)
             n = ""
+            raw_qty = None
         if not b or b in seen:
             continue
         seen.add(b)
-        norm.append((b, n))
+        qty = None
+        if raw_qty is not None and str(raw_qty).strip() != "":
+            try:
+                val = float(raw_qty)
+                if val <= 0 or not val.is_integer():
+                    raise ValueError()
+                qty = int(val)
+            except (ValueError, TypeError):
+                raise serializers.ValidationError(
+                    {"alternate_barcodes": f"Количество в доп. штрихкоде '{b}' должно быть положительным числом."}
+                )
+        norm.append((b, n, qty))
 
-    for b, n in norm:
+    for b, n, _ in norm:
         if main and b == main:
             raise serializers.ValidationError(
                 {"alternate_barcodes": f"Код «{b}» совпадает с основным штрихкодом товара — оставьте его только в поле barcode."}
@@ -364,8 +377,8 @@ def _sync_warehouse_product_alternate_barcodes(product: m.WarehouseProduct, code
                 {"alternate_barcodes": f"Штрихкод «{b}» уже привязан к другому товару на этом складе."}
             )
     product.alternate_barcodes.all().delete()
-    for b, n in norm:
-        m.WarehouseProductAlternateBarcode.objects.create(product=product, barcode=b, name=n)
+    for b, n, q in norm:
+        m.WarehouseProductAlternateBarcode.objects.create(product=product, barcode=b, name=n, quantity=q)
 
 
 class WarehouseProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
@@ -456,11 +469,29 @@ class WarehouseProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSe
             seen = set()
             norm_list = []
             for raw in attrs["alternate_barcodes"]:
-                b = _norm_str(raw)
+                if isinstance(raw, dict):
+                    b = _norm_str(raw.get("barcode"))
+                    n = str(raw.get("name") or "").strip()
+                    raw_qty = raw.get("quantity")
+                else:
+                    b = _norm_str(raw)
+                    n = ""
+                    raw_qty = None
                 if not b or b in seen:
                     continue
                 seen.add(b)
-                norm_list.append(b)
+                qty = None
+                if raw_qty is not None and str(raw_qty).strip() != "":
+                    try:
+                        val = float(raw_qty)
+                        if val <= 0 or not val.is_integer():
+                            raise ValueError()
+                        qty = int(val)
+                    except (ValueError, TypeError):
+                        raise serializers.ValidationError({
+                            "alternate_barcodes": f"Количество в доп. штрихкоде '{b}' должно быть положительным числом."
+                        })
+                norm_list.append({"barcode": b, "name": n, "quantity": qty})
             attrs["alternate_barcodes"] = norm_list
 
         return attrs
@@ -468,7 +499,7 @@ class WarehouseProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSe
     def to_representation(self, instance):
         data = super().to_representation(instance)
         data["alternate_barcodes"] = [
-            {"barcode": item.barcode, "name": item.name}
+            {"barcode": item.barcode, "name": item.name, "quantity": item.quantity}
             for item in instance.alternate_barcodes.order_by("barcode")
         ]
         return data

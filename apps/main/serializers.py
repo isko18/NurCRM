@@ -982,9 +982,11 @@ def sync_product_alternate_barcodes(product: Product, raw):
         if isinstance(x, dict):
             b = str(x.get("barcode") or "").strip()
             n = str(x.get("name") or "").strip()
+            raw_qty = x.get("quantity")
         else:
             b = str(x or "").strip()
             n = ""
+            raw_qty = None
         if not b:
             continue
         if b in seen:
@@ -992,9 +994,22 @@ def sync_product_alternate_barcodes(product: Product, raw):
                 "alternate_barcodes": f"Дубликат в списке: {b}.",
             })
         seen.add(b)
-        norm.append((b, n))
 
-    for b, n in norm:
+        qty = None
+        if raw_qty is not None and str(raw_qty).strip() != "":
+            try:
+                val = float(raw_qty)
+                if val <= 0 or not val.is_integer():
+                    raise ValueError()
+                qty = int(val)
+            except (ValueError, TypeError):
+                raise serializers.ValidationError({
+                    "alternate_barcodes": f"Количество в доп. штрихкоде '{b}' должно быть положительным числом."
+                })
+
+        norm.append((b, n, qty))
+
+    for b, n, _ in norm:
         if main and b == main:
             raise serializers.ValidationError({
                 "alternate_barcodes": f"Доп. штрихкод «{b}» совпадает с основным штрихкодом товара.",
@@ -1015,14 +1030,14 @@ def sync_product_alternate_barcodes(product: Product, raw):
     if norm:
         ProductAlternateBarcode.objects.bulk_create(
             [
-                ProductAlternateBarcode(product=product, company_id=company_id, barcode=b, name=n)
-                for b, n in norm
+                ProductAlternateBarcode(product=product, company_id=company_id, barcode=b, name=n, quantity=q)
+                for b, n, q in norm
             ]
         )
     for old in old_codes:
         if old:
             cache.delete(f"product_barcode:{company_id}:{old}")
-    for b, _ in norm:
+    for b, _, _ in norm:
         cache.delete(f"product_barcode:{company_id}:{b}")
 
 
@@ -1592,7 +1607,7 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
             data = super().to_representation(instance)
         try:
             data["alternate_barcodes"] = [
-                {"barcode": item.barcode, "name": item.name}
+                {"barcode": item.barcode, "name": item.name, "quantity": item.quantity}
                 for item in instance.alternate_barcodes.order_by("barcode")
             ]
         except Exception:
