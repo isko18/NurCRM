@@ -3097,3 +3097,23 @@ class AgentSalaryPayout(models.Model):
 
     def __str__(self):
         return f"Payout {self.agent_id} {self.amount}"
+
+
+class WarehouseCashConfirmationSettings(BaseModelId, BaseModelDate):
+    company = models.OneToOneField(
+        "users.Company",
+        on_delete=models.CASCADE,
+        related_name="warehouse_cash_confirmation",
+        verbose_name="Компания",
+    )
+    enabled = models.BooleanField(
+        default=False,
+        verbose_name="Требовать подтверждение наличных операций",
+    )
+
+    class Meta:
+        verbose_name = "Настройка подтверждения кассы склада"
+        verbose_name_plural = "Настройки подтверждения кассы склада"
+
+    def __str__(self):
+        return f"WarehouseCashConfirmationSettings({self.company_id}: enabled={self.enabled})"

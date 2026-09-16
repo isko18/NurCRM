@@ -53,7 +53,7 @@ from .serializers import (
     slug_format_error,
     slug_taken_by_other,
 )
-from .permissions import IsCompanyOwner, IsCompanyOwnerOrAdmin, IsPlatformAdmin
+from .permissions import IsCompanyOwner, IsCompanyOwnerOrAdmin, IsCompanyOwnerOrAdminOrSupervisor, IsPlatformAdmin
 
 logger = logging.getLogger(__name__)
 
@@ -334,6 +334,19 @@ class EmployeeListAPIView(generics.ListAPIView):
             return User.objects.none()
 
         base_qs = _employees_qs(company).filter(is_active=True, deleted_at__isnull=True)
+        if getattr(user, "is_consulting_salesperson", False):
+            base_qs = base_qs.filter(id=user.id)
+        elif getattr(user, "is_consulting_supervisor", False):
+            my_regions = user.get_consulting_region_codes()
+            if not my_regions:
+                base_qs = base_qs.filter(id=user.id)
+            else:
+                matching_ids = [
+                    u.id for u in base_qs
+                    if u.id == user.id or any(r in my_regions for r in u.get_consulting_region_codes())
+                ]
+                base_qs = base_qs.filter(id__in=matching_ids)
+
         return _apply_branch_filter_to_users(self.request, company, base_qs)
 
 
@@ -354,7 +367,7 @@ class CurrentUserAPIView(generics.RetrieveUpdateAPIView):
 class EmployeeCreateAPIView(generics.CreateAPIView):
     queryset = User.objects.all()
     serializer_class = EmployeeCreateSerializer
-    permission_classes = [IsAuthenticated, IsCompanyOwner]
+    permission_classes = [IsAuthenticated, IsCompanyOwnerOrAdminOrSupervisor]
 
     def perform_create(self, serializer):
         serializer.save()
@@ -396,7 +409,7 @@ class EmployeeDestroyAPIView(generics.DestroyAPIView):
 class EmployeeDetailAPIView(generics.RetrieveUpdateDestroyAPIView):
     queryset = User.objects.all()
     serializer_class = EmployeeUpdateSerializer
-    permission_classes = [IsAuthenticated, IsCompanyOwnerOrAdmin]
+    permission_classes = [IsAuthenticated, IsCompanyOwnerOrAdminOrSupervisor]
 
     def get_queryset(self):
         if getattr(self, "swagger_fake_view", False):
@@ -412,9 +425,22 @@ class EmployeeDetailAPIView(generics.RetrieveUpdateDestroyAPIView):
             .filter(is_active=True, deleted_at__isnull=True)
             .exclude(id=user.id)
         )
+        if getattr(user, "is_consulting_supervisor", False):
+            my_regions = user.get_consulting_region_codes()
+            matching_ids = [
+                u.id for u in base_qs
+                if any(r in my_regions for r in u.get_consulting_region_codes())
+            ]
+            base_qs = base_qs.filter(id__in=matching_ids)
+        elif getattr(user, "is_consulting_salesperson", False):
+            return User.objects.none()
+
         return _apply_branch_filter_to_users(self.request, company, base_qs)
 
     def destroy(self, request, *args, **kwargs):
+        if getattr(request.user, "role", None) == "supervisor":
+            return Response({"detail": "Руководитель региона не может удалять сотрудников."}, status=status.HTTP_403_FORBIDDEN)
+
         employee = self.get_object()
 
         if employee == request.user:
@@ -485,6 +511,30 @@ class CompanyDetailAPIView(generics.RetrieveAPIView):
         if company is None:
             raise NotFound("Вы не принадлежите ни к одной компании.")
         return company
+
+
+class CompanySubscriptionDetailAPIView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, *args, **kwargs):
+        if getattr(self, "swagger_fake_view", False):
+            return Response({})
+
+        company = _get_company(request.user)
+        if company is None:
+            raise NotFound("Вы не принадлежите ни к одной компании.")
+
+        from apps.users.services_subscription import (
+            build_company_subscription_panel_payload,
+            is_user_owner,
+        )
+
+        if not is_user_owner(request.user, company):
+            raise PermissionDenied("Доступ к информации о подписке разрешён только владельцу компании.")
+
+        payload = build_company_subscription_panel_payload(company, is_owner=True)
+        return Response(payload, status=status.HTTP_200_OK)
+
 
 
 class ChangePasswordView(generics.UpdateAPIView):

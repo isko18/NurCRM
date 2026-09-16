@@ -65,6 +65,7 @@ class Cashbox(models.Model):
         POS_BRANCH = "pos_branch", "Касса филиала (POS)"
         EXPENSE_VARIABLE = "expense_variable", "Переменные расходы"
         EXPENSE_FIXED = "expense_fixed", "Постоянные расходы"
+        DEBT = "debt", "Для долгов"
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
 
@@ -96,6 +97,25 @@ class Cashbox(models.Model):
     # ⛔ лучше без null=True на boolean, но я оставлю как есть, чтобы не ломать миграции
     is_consumption = models.BooleanField(verbose_name="Расход", default=False, blank=True, null=True)
 
+    is_active = models.BooleanField(verbose_name="Активна", default=True, db_index=True)
+    archived_at = models.DateTimeField(verbose_name="Дата архивации", null=True, blank=True)
+    archived_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="archived_cashboxes",
+        verbose_name="Кто архивировал",
+    )
+    merged_into = models.ForeignKey(
+        "self",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="merged_from",
+        verbose_name="Объединена с кассой",
+    )
+
     created_at = models.DateTimeField(auto_now_add=True, db_index=True, null=True, blank=True, verbose_name="Дата создания")
     updated_at = models.DateTimeField(auto_now=True, null=True, blank=True, verbose_name="Дата обновления")
 
@@ -107,6 +127,8 @@ class Cashbox(models.Model):
             models.Index(fields=["company", "branch"]),
             models.Index(fields=["company", "role"]),
             models.Index(fields=["company", "role", "branch"]),
+            models.Index(fields=["company", "is_active"]),
+            models.Index(fields=["company", "role", "is_active"]),
         ]
         constraints = [
             models.UniqueConstraint(
@@ -336,11 +358,13 @@ class CashShift(models.Model):
     def calc_live_totals(self) -> dict:
         z = Decimal("0.00")
 
-        flows = self.shift_flows.filter(status=CashFlow.Status.APPROVED)
+        flows = self.shift_flows.filter(status=CashFlow.Status.APPROVED, request_kind__isnull=True)
         fa = flows.aggregate(
             income=Sum(
                 "amount",
-                filter=Q(type=CashFlow.Type.INCOME) & ~Q(
+                filter=Q(type=CashFlow.Type.INCOME)
+                & Q(affects_shift_drawer=True)
+                & ~Q(
                     source_kind__in=[
                         CashFlow.SourceKind.POS_SALE,
                         CashFlow.SourceKind.POS_PREPAYMENT,
@@ -416,6 +440,7 @@ class CashShift(models.Model):
                 created_at__lte=self.closed_at or timezone.now(),
                 type=CashFlow.Type.EXPENSE,
                 affects_shift_drawer=False,
+                request_kind__isnull=True,
                 source_kind__in=[
                     CashFlow.SourceKind.WAREHOUSE_PURCHASE,
                     CashFlow.SourceKind.PROCUREMENT_RECEIPT,
@@ -517,6 +542,24 @@ class CashShift(models.Model):
             breakdown_data[m_code]["count"] += 1
             breakdown_data[m_code]["amount"] += tot
 
+        # Погашения долгов в рамках смены
+        debt_flows = self.shift_flows.filter(
+            status=CashFlow.Status.APPROVED,
+            type=CashFlow.Type.INCOME,
+            source_kind=CashFlow.SourceKind.DEBT_REPAYMENT,
+            request_kind__isnull=True,
+        )
+        for cf in debt_flows:
+            m_code = str(getattr(cf, "payment_method", None) or "cash").lower().strip()
+            if m_code in ("mixed", "split"):
+                m_code = "split"
+            label = METHOD_LABELS.get(m_code, m_code.title() if m_code else "Другое")
+            tot = cf.amount or Decimal("0.00")
+            if m_code not in breakdown_data:
+                breakdown_data[m_code] = {"method": m_code, "label": label, "count": 0, "amount": Decimal("0.00")}
+            breakdown_data[m_code]["count"] += 1
+            breakdown_data[m_code]["amount"] += tot
+
         sorted_items = sorted(breakdown_data.values(), key=lambda x: (x["amount"], x["count"]), reverse=True)
 
         res = []
@@ -590,7 +633,13 @@ class CashFlow(models.Model):
         DEFECT_WRITEOFF = "defect_writeoff", "Списание брака"
         PRODUCT_RETURN = "product_return", "Возврат товара"
         SHIFT_DRAWER_OUTFLOW = "shift_drawer_outflow", "Расход из ящика смены"
+        POS_SALE_RETURN = "pos_sale_return", "Возврат продажи"
+        CASHFLOW_CANCEL = "cashflow_cancel", "Отмена движения"
         MANUAL = "manual", "Ручная операция"
+
+    class RequestKind(models.TextChoices):
+        EDIT = "edit", "Редактирование"
+        CANCEL = "cancel", "Отмена"
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
 
@@ -612,6 +661,58 @@ class CashFlow(models.Model):
     created_at = models.DateTimeField(auto_now_add=True, verbose_name="Дата создания")
 
     status = models.CharField(max_length=10, choices=Status.choices, default=Status.PENDING, db_index=True, verbose_name="Статус")
+
+    request_kind = models.CharField(
+        max_length=16,
+        choices=RequestKind.choices,
+        null=True,
+        blank=True,
+        db_index=True,
+        verbose_name="Тип заявки",
+    )
+    target_flow = models.ForeignKey(
+        "self",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="change_requests",
+        db_index=True,
+        verbose_name="Целевое движение",
+    )
+    proposed = models.JSONField(
+        default=dict,
+        blank=True,
+        null=True,
+        verbose_name="Предлагаемые изменения",
+    )
+    reason = models.TextField(
+        default="",
+        blank=True,
+        verbose_name="Причина заявки",
+    )
+    requested_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="cashflow_change_requests",
+        db_index=True,
+        verbose_name="Кем запрошено",
+    )
+    resolved_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="cashflow_resolved_requests",
+        db_index=True,
+        verbose_name="Кем разрешено",
+    )
+    resolved_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        verbose_name="Когда разрешено",
+    )
 
     affects_shift_drawer = models.BooleanField(
         default=False,
@@ -636,6 +737,20 @@ class CashFlow(models.Model):
         blank=True,
         db_index=True,
         verbose_name="ID источника",
+    )
+    idempotency_key = models.CharField(
+        max_length=128,
+        null=True,
+        blank=True,
+        db_index=True,
+        verbose_name="Ключ идемпотентности",
+    )
+    payment_method = models.CharField(
+        max_length=32,
+        null=True,
+        blank=True,
+        db_index=True,
+        verbose_name="Способ оплаты",
     )
 
     shift = models.ForeignKey(
@@ -679,6 +794,8 @@ class CashFlow(models.Model):
             models.Index(fields=["shift", "created_at"]),
             models.Index(fields=["cashier", "created_at"]),
             models.Index(fields=["company", "source_kind", "source_id"], name="ix_flow_comp_src_kind_id"),
+            models.Index(fields=["target_flow", "status"], name="ix_flow_target_status"),
+            models.Index(fields=["request_kind"], name="ix_flow_request_kind"),
         ]
         constraints = [
             models.CheckConstraint(check=Q(amount__gt=0), name="ck_cashflow_amount_positive"),

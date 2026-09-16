@@ -8,71 +8,118 @@ logger = logging.getLogger(__name__)
 
 @database_sync_to_async
 def _handle_ws_send_message(user, data):
-    from apps.consalting.models import WazzupAccountConsalting, LeadConsalting
+    from apps.consalting.models import WazzupAccountConsalting, LeadConsalting, FunnelConsalting, FunnelStageConsalting
     from apps.consalting.funnel.wazzup import WazzupConsaltingService
+    import uuid as _uuid_mod
 
     lead_id = data.get("lead_id") or data.get("lead")
     text = data.get("text") or data.get("message") or ""
     media_url = data.get("media_url") or data.get("content_uri") or data.get("contentUri")
+    media_type = data.get("media_type") or data.get("type") or ""
+    content_type = data.get("content_type") or data.get("mimetype") or ""
     account_id = data.get("account_id")
     phone = data.get("to") or data.get("phone")
 
-    # 1. Отправка по lead_id (Воронка Консалтинга)
+    if lead_id and str(lead_id).startswith("phone_"):
+        phone = str(lead_id).replace("phone_", "")
+        lead_id = None
+
+    lead = None
     if lead_id:
-        lead = LeadConsalting.objects.filter(company=user.company, id=lead_id).first()
-        if not lead:
-            raise ValueError("Лид не найден.")
+        try:
+            _uuid_mod.UUID(str(lead_id))
+            lead = LeadConsalting.objects.filter(company=user.company, id=lead_id).first()
+        except ValueError:
+            digits = "".join(filter(str.isdigit, str(lead_id)))
+            if digits:
+                phone = digits
+            lead_id = None
 
-        if account_id:
-            account = WazzupAccountConsalting.objects.filter(company=user.company, id=account_id).first()
-        else:
-            account = WazzupAccountConsalting.objects.filter(company=user.company, is_active=True).first()
+    if not lead and phone:
+        clean_phone = "".join(filter(str.isdigit, str(phone)))
+        if len(clean_phone) >= 9:
+            core_9 = clean_phone[-9:]
+            lead = LeadConsalting.objects.filter(
+                company=user.company, phone__icontains=core_9
+            ).first()
+        if not lead and clean_phone:
+            from apps.consalting.funnel.regional_routing import resolve_funnel_and_assignee
+            reg_funnel, reg_stage, reg_rule, reg_user = resolve_funnel_and_assignee(
+                user.company, phone=f"+{clean_phone}", source="whatsapp"
+            )
+            funnel = reg_funnel or FunnelConsalting.objects.filter(company=user.company, is_active=True).first() or FunnelConsalting.objects.filter(company=user.company).first()
+            stage = reg_stage or (FunnelStageConsalting.objects.filter(funnel=funnel).order_by("order").first() if funnel else None)
+            owner = reg_user or user
+            lead = LeadConsalting.objects.create(
+                company=user.company,
+                funnel=funnel,
+                stage=stage,
+                region_code=reg_rule.region_code if reg_rule else None,
+                title=f"+{clean_phone}",
+                full_name=f"+{clean_phone}",
+                phone=f"+{clean_phone}",
+                owner=owner,
+                source="Ватсап",
+                channel="whatsapp"
+            )
 
-        if not account:
-            raise ValueError("Активный аккаунт Wazzup для консалтинга не найден.")
+    if not lead:
+        raise ValueError("Не удалось определить лид для отправки сообщения.")
 
-        wa_msg = WazzupConsaltingService.send_message(
-            account=account,
-            lead=lead,
-            text=text,
-            user=user,
-            content_uri=media_url
-        )
-        return {
-            "id": str(wa_msg.id),
-            "message_id": wa_msg.message_id,
-            "status": wa_msg.status,
-            "text": wa_msg.text,
-            "lead_id": str(lead.id),
-        }
+    if account_id:
+        account = WazzupAccountConsalting.objects.filter(company=user.company, id=account_id).first()
+    else:
+        account = WazzupAccountConsalting.objects.filter(company=user.company, is_active=True).first()
 
-    # 2. Безопасная обработка для базового CRM (если приложение подключено)
-    try:
-        from apps.crm.models import WazzupAccount
-        from .services import send_message_service
+    if not account:
+        account = WazzupAccountConsalting.objects.filter(company=user.company).first()
 
-        if not phone:
-            raise ValueError("Укажите 'lead_id' или номер телефона 'to'")
+    if not account:
+        raise ValueError("Активный аккаунт Wazzup/GREEN-API не найден.")
 
-        if account_id:
-            account = WazzupAccount.objects.filter(company=user.company, id=account_id).first()
-        else:
-            account = WazzupAccount.objects.filter(company=user.company, is_active=True).first()
+    wa_msg = WazzupConsaltingService.send_message(
+        account=account,
+        lead=lead,
+        text=text,
+        user=user,
+        content_uri=media_url,
+        media_type=media_type,
+        content_type=content_type,
+    )
+    return {
+        "id": str(wa_msg.id),
+        "message_id": wa_msg.message_id,
+        "status": wa_msg.status,
+        "text": wa_msg.text,
+        "lead_id": str(lead.id),
+    }
 
-        if not account:
-            raise ValueError("Активный аккаунт Wazzup не найден.")
 
-        msg = send_message_service(account, phone, text, media_url)
-        return {
-            "id": str(msg.id),
-            "message_id": msg.message_id,
-            "chat_id": msg.chat_id,
-            "text": msg.text,
-            "status": msg.status,
-        }
-    except Exception as e:
-        raise ValueError(f"Ошибка отправки сообщения: {e}")
+@database_sync_to_async
+def _handle_ws_edit_message(user, message_id, text):
+    from apps.consalting.funnel.wazzup import WazzupConsaltingService
+    msg = WazzupConsaltingService.edit_message(
+        message_id=message_id,
+        new_text=text,
+        user=user,
+        company_id=getattr(user, "company_id", None)
+    )
+    return {
+        "id": str(msg.id),
+        "message_id": msg.message_id,
+        "text": msg.text,
+        "lead_id": str(msg.lead_id) if msg.lead_id else None,
+    }
 
+
+@database_sync_to_async
+def _handle_ws_delete_message(user, message_id):
+    from apps.consalting.funnel.wazzup import WazzupConsaltingService
+    return WazzupConsaltingService.delete_message(
+        message_id=message_id,
+        user=user,
+        company_id=getattr(user, "company_id", None)
+    )
 
 class WazzupChatConsumer(AsyncWebsocketConsumer):
     """
@@ -139,6 +186,41 @@ class WazzupChatConsumer(AsyncWebsocketConsumer):
                 return
 
             # 2. Отправка исходящего сообщения прямо через WebSocket
+                        # 3. Редактирование сообщения через сокет
+            if action == "edit_message":
+                try:
+                    msg_id = data.get("message_id") or data.get("id")
+                    new_text = data.get("text") or data.get("message") or ""
+                    edited = await _handle_ws_edit_message(self.user, msg_id, new_text)
+                    await self.send(text_data=json.dumps({
+                        "action": "edit_message_ack",
+                        "status": "success",
+                        "data": edited
+                    }))
+                except Exception as err:
+                    await self.send(text_data=json.dumps({
+                        "action": "edit_message_ack",
+                        "status": "error",
+                        "detail": str(err)
+                    }))
+
+            # 4. Удаление сообщения через сокет
+            if action == "delete_message":
+                try:
+                    msg_id = data.get("message_id") or data.get("id")
+                    await _handle_ws_delete_message(self.user, msg_id)
+                    await self.send(text_data=json.dumps({
+                        "action": "delete_message_ack",
+                        "status": "success",
+                        "id": msg_id
+                    }))
+                except Exception as err:
+                    await self.send(text_data=json.dumps({
+                        "action": "delete_message_ack",
+                        "status": "error",
+                        "detail": str(err)
+                    }))
+
             if action == "send_message":
                 try:
                     result = await _handle_ws_send_message(self.user, data)

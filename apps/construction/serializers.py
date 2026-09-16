@@ -1,7 +1,8 @@
 from decimal import Decimal
 
-from django.db.models import Q
+from django.db.models import Q, Sum
 from rest_framework import serializers
+from rest_framework.exceptions import ValidationError as DRFValidationError
 from django.contrib.auth import get_user_model
 
 from apps.construction.models import Cashbox, CashFlow, CashFlowCategory, CashShift
@@ -347,33 +348,69 @@ class CashboxWithFlowsSerializer(CompanyBranchReadOnlyMixin):
     cashflows = CashFlowInsideCashboxSerializer(source="flows", many=True, read_only=True)
     is_consumption = serializers.BooleanField(read_only=True)
     role = serializers.CharField(read_only=True)
+    balance = serializers.SerializerMethodField()
+    current_balance = serializers.SerializerMethodField()
+    is_active = serializers.BooleanField(read_only=True)
+    archived_at = serializers.DateTimeField(read_only=True, allow_null=True)
+    archived_by = serializers.PrimaryKeyRelatedField(read_only=True, allow_null=True)
+    merged_into = serializers.PrimaryKeyRelatedField(read_only=True, allow_null=True)
 
     class Meta:
         model = Cashbox
-        fields = ["id", "company", "branch", "name", "role", "is_consumption", "cashflows"]
-        read_only_fields = ["id", "company", "branch", "role", "cashflows", "is_consumption"]
+        fields = [
+            "id", "company", "branch", "name", "role", "is_consumption",
+            "balance", "current_balance", "is_active", "archived_at", "archived_by", "merged_into", "cashflows",
+        ]
+        read_only_fields = [
+            "id", "company", "branch", "role", "cashflows", "is_consumption",
+            "balance", "current_balance", "is_active", "archived_at", "archived_by", "merged_into",
+        ]
+
+    def get_balance(self, obj):
+        inc = obj.flows.filter(status="approved", type="income", request_kind__isnull=True).aggregate(s=Sum("amount"))["s"] or Decimal("0.00")
+        exp = obj.flows.filter(status="approved", type="expense", request_kind__isnull=True).aggregate(s=Sum("amount"))["s"] or Decimal("0.00")
+        return f"{(inc - exp):.2f}"
+
+    def get_current_balance(self, obj):
+        return self.get_balance(obj)
+
 
 
 class CashboxSerializer(CompanyBranchReadOnlyMixin):
     analytics = serializers.SerializerMethodField()
-    is_consumption = serializers.BooleanField(read_only=True)
-    role = serializers.CharField(required=False, allow_null=True)
+    is_consumption = serializers.BooleanField(required=False, default=False)
+    role = serializers.ChoiceField(choices=Cashbox.CashboxRole.choices, required=False, allow_null=True)
     balance = serializers.SerializerMethodField()
     current_balance = serializers.SerializerMethodField()
     currency = serializers.CharField(default="KGS", read_only=True)
     is_active = serializers.BooleanField(default=True, read_only=True)
+    archived_at = serializers.DateTimeField(read_only=True, allow_null=True)
+    archived_by = serializers.PrimaryKeyRelatedField(read_only=True, allow_null=True)
+    merged_into = serializers.PrimaryKeyRelatedField(read_only=True, allow_null=True)
 
     class Meta:
         model = Cashbox
         fields = [
             "id", "company", "branch", "name", "role",
             "is_consumption", "balance", "current_balance", "currency", "is_active",
+            "archived_at", "archived_by", "merged_into",
             "analytics",
         ]
         read_only_fields = [
-            "id", "company", "branch", "analytics", "is_consumption",
+            "id", "company", "branch", "analytics",
             "balance", "current_balance", "currency", "is_active",
+            "archived_at", "archived_by", "merged_into",
         ]
+
+    def validate(self, attrs):
+        attrs = super().validate(attrs)
+        role = attrs.get("role")
+        branch = attrs.get("branch", getattr(self.instance, "branch", None))
+        if role == Cashbox.CashboxRole.POS_BRANCH and not branch:
+            raise serializers.ValidationError({"role": "Для роли pos_branch требуется branch_id."})
+        if attrs.get("is_consumption") and not attrs.get("role"):
+            attrs["role"] = Cashbox.CashboxRole.EXPENSE_VARIABLE
+        return attrs
 
     def get_balance(self, obj):
         amap = self.context.get("analytics_map")
@@ -382,8 +419,8 @@ class CashboxSerializer(CompanyBranchReadOnlyMixin):
             inc = Decimal(str(a.get("income_total") or "0.00"))
             exp = Decimal(str(a.get("expense_total") or "0.00"))
             return f"{(inc - exp):.2f}"
-        inc = obj.flows.filter(status="approved", type="income").aggregate(s=Sum("amount"))["s"] or Decimal("0.00")
-        exp = obj.flows.filter(status="approved", type="expense").aggregate(s=Sum("amount"))["s"] or Decimal("0.00")
+        inc = obj.flows.filter(status="approved", type="income", request_kind__isnull=True).aggregate(s=Sum("amount"))["s"] or Decimal("0.00")
+        exp = obj.flows.filter(status="approved", type="expense", request_kind__isnull=True).aggregate(s=Sum("amount"))["s"] or Decimal("0.00")
         return f"{(inc - exp):.2f}"
 
     def get_current_balance(self, obj):
@@ -499,9 +536,14 @@ class CashFlowCategorySerializer(CompanyBranchReadOnlyMixin):
         return serializers.ModelSerializer.update(self, instance, validated_data)
 
 
-# ─────────────────────────────────────────────────────────────
-# CashFlow
-# ─────────────────────────────────────────────────────────────
+class TargetFlowBriefSerializer(serializers.ModelSerializer):
+    amount = serializers.DecimalField(max_digits=12, decimal_places=2, coerce_to_string=True)
+
+    class Meta:
+        model = CashFlow
+        fields = ["id", "name", "amount", "type", "created_at"]
+
+
 class CashFlowSerializer(CompanyBranchReadOnlyMixin):
     cashbox = serializers.PrimaryKeyRelatedField(queryset=Cashbox.objects.all())
     cashbox_name = serializers.SerializerMethodField()
@@ -522,6 +564,15 @@ class CashFlowSerializer(CompanyBranchReadOnlyMixin):
     cashier_display = serializers.SerializerMethodField()
     # Алиас для аналитики Производства (фронт читает user_name|created_by_name|...).
     user_name = serializers.SerializerMethodField()
+
+    request_kind = serializers.CharField(read_only=True, allow_null=True)
+    target_flow = TargetFlowBriefSerializer(read_only=True, allow_null=True)
+    proposed = serializers.JSONField(read_only=True)
+    reason = serializers.CharField(read_only=True)
+    requested_by = serializers.SerializerMethodField()
+    resolved_by = serializers.SerializerMethodField()
+    resolved_at = serializers.DateTimeField(read_only=True, allow_null=True)
+    idempotency_key = serializers.CharField(read_only=True, allow_null=True)
 
     class Meta:
         model = CashFlow
@@ -546,6 +597,15 @@ class CashFlowSerializer(CompanyBranchReadOnlyMixin):
             "cashier",
             "cashier_display",
             "user_name",
+            "request_kind",
+            "target_flow",
+            "proposed",
+            "reason",
+            "requested_by",
+            "resolved_by",
+            "resolved_at",
+            "idempotency_key",
+            "payment_method",
         ]
         read_only_fields = [
             "id",
@@ -557,6 +617,14 @@ class CashFlowSerializer(CompanyBranchReadOnlyMixin):
             "cashier_display",
             "user_name",
             "category_title",
+            "request_kind",
+            "target_flow",
+            "proposed",
+            "reason",
+            "requested_by",
+            "resolved_by",
+            "resolved_at",
+            "idempotency_key",
         ]
 
     def __init__(self, *args, **kwargs):
@@ -609,11 +677,31 @@ class CashFlowSerializer(CompanyBranchReadOnlyMixin):
         # Тот же автор, что и cashier_display — отдельный ключ для аналитики Производства.
         return self.get_cashier_display(obj)
 
+    def get_requested_by(self, obj):
+        if not obj.requested_by_id:
+            return None
+        u = getattr(obj, "requested_by", None)
+        if not u:
+            return None
+        name = (getattr(u, "get_full_name", lambda: "")() or getattr(u, "email", None) or getattr(u, "username", "") or str(u.id))
+        return {"id": str(u.id), "name": name.strip()}
+
+    def get_resolved_by(self, obj):
+        if not obj.resolved_by_id:
+            return None
+        u = getattr(obj, "resolved_by", None)
+        if not u:
+            return None
+        name = (getattr(u, "get_full_name", lambda: "")() or getattr(u, "email", None) or getattr(u, "username", "") or str(u.id))
+        return {"id": str(u.id), "name": name.strip()}
+
     def validate(self, attrs):
         request = self.context.get("request")
         user = getattr(request, "user", None) if request else None
 
         cashbox = attrs.get("cashbox") or getattr(self.instance, "cashbox", None)
+        if cashbox and not getattr(cashbox, "is_active", True):
+            raise DRFValidationError({"detail": "Касса находится в архиве.", "code": "cashbox_inactive"})
 
         category = attrs.get("category") if "category" in attrs else getattr(self.instance, "category", None)
         if category is not None:
@@ -678,6 +766,17 @@ class CashFlowSerializer(CompanyBranchReadOnlyMixin):
         if user and "cashier" not in validated_data:
             validated_data["cashier"] = user
 
+        company = validated_data.get("company") or (getattr(user, "company", None) if user else None)
+        req_enabled = bool(getattr(company, "cashflow_requests_enabled", False))
+
+        if not req_enabled:
+            validated_data["status"] = CashFlow.Status.APPROVED
+        elif "status" not in validated_data:
+            if _is_owner_like(user):
+                validated_data["status"] = CashFlow.Status.APPROVED
+            else:
+                validated_data["status"] = CashFlow.Status.PENDING
+
         return super().create(validated_data)
 
 class CashFlowBulkStatusItemSerializer(serializers.Serializer):
@@ -694,3 +793,33 @@ class CashFlowBulkStatusSerializer(serializers.Serializer):
         if len(items) > 50000:
             raise serializers.ValidationError("Слишком много. Максимум 50 000 за раз.")
         return items
+
+
+class CashFlowEditRequestSerializer(serializers.Serializer):
+    proposed = serializers.DictField(required=True)
+    reason = serializers.CharField(required=False, allow_blank=True, default="")
+    idempotency_key = serializers.CharField(required=False, allow_blank=True, max_length=128, default="")
+
+    def validate_proposed(self, val):
+        if not isinstance(val, dict) or not val:
+            raise serializers.ValidationError("Параметр 'proposed' должен быть непустым объектом.")
+        if "amount" in val:
+            try:
+                amt = Decimal(str(val["amount"]))
+                if amt <= 0:
+                    raise serializers.ValidationError("Сумма в 'proposed.amount' должна быть больше нуля.")
+            except (ValueError, TypeError):
+                raise serializers.ValidationError("Некорректный формат суммы в 'proposed.amount'.")
+        else:
+            raise serializers.ValidationError("Поле 'proposed.amount' обязательно.")
+
+        if "type" in val:
+            t = str(val["type"]).strip().lower()
+            if t not in (CashFlow.Type.INCOME, CashFlow.Type.EXPENSE):
+                raise serializers.ValidationError(f"Недопустимый тип '{t}'. Ожидается 'income' или 'expense'.")
+        return val
+
+
+class CashFlowCancelRequestSerializer(serializers.Serializer):
+    reason = serializers.CharField(required=False, allow_blank=True, default="")
+    idempotency_key = serializers.CharField(required=False, allow_blank=True, max_length=128, default="")

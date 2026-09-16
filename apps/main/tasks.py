@@ -108,3 +108,16 @@ def catalog_webhook_sync():
             )
 
     return {"total": total, "no_images_count": len(no_image_codes)}
+
+
+@shared_task(name="apps.main.tasks.product_expiry_digest")
+def product_expiry_digest():
+    """
+    Daily digest for products that are expired or expiring soon (within 14 days).
+    Sends aggregated notification to company owner / WS groups.
+    """
+    from apps.main.services_expiry import send_product_expiry_digest_for_all_companies
+
+    count = send_product_expiry_digest_for_all_companies()
+    logger.info("product_expiry_digest finished: created %d notifications", count)
+    return {"created_notifications_count": count}

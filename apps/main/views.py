@@ -1,8 +1,8 @@
 from decimal import Decimal, ROUND_HALF_UP, InvalidOperation
-from uuid import UUID, uuid4
+from uuid import UUID, uuid4, uuid5
 
 from django.db import transaction, IntegrityError
-from django.db.models import Sum, Count, Avg, F, Q, Prefetch, Value as V, Exists, OuterRef, Subquery, Case, When
+from django.db.models import Sum, Count, Avg, F, Q, Prefetch, Value as V, Value, BooleanField, Exists, OuterRef, Subquery, Case, When
 from django.utils.dateparse import parse_date, parse_datetime
 from django.utils import timezone
 from itertools import groupby
@@ -44,7 +44,7 @@ from apps.main.bracket_parser import unflatten_bracket_data
 from apps.main.models import (
     Contact, Pipeline, Deal, Task, Integration, Analytics,
     Order, Product, Review, Notification, Event,
-    ProductBrand, ProductCategory, Warehouse, WarehouseEvent, Client,
+    ProductBrand, ProductCategory, Warehouse, WarehouseEvent, Client, ClientDebtBulkPayment,
     GlobalProduct, GlobalBrand, GlobalCategory, ClientDeal, Bid, SocialApplications, TransactionRecord,
     ContractorWork, DealInstallment, DebtPayment, Debt, ObjectSaleItem, ObjectSale, ObjectItem, ItemMake,
     ManufactureSubreal, Acceptance, ReturnFromAgent, AgentSaleAllocation, ProductImage,
@@ -57,6 +57,7 @@ from apps.main.models import (
     SaleItem,
     SupplierReceipt,
     SupplierReceiptItem,
+    ProductExpiryBatch,
     SupplierReturn,
     SupplierReturnItem,
     MarketProductFormLayout,
@@ -89,13 +90,14 @@ from apps.main.serializers import (
     AgentProductOnHandSerializer, AgentWithProductsSerializer, GlobalProductReadSerializer,
     ProductImageSerializer,
     AgentRequestCartApproveSerializer, AgentRequestCartRejectSerializer,
-    AgentRequestCartSerializer, AgentRequestCartSubmitSerializer, AgentRequestItemSerializer, DealPayInputSerializer, DealRefundInputSerializer,
+    AgentRequestCartSerializer, AgentRequestCartSubmitSerializer, AgentRequestItemSerializer, DealPayInputSerializer, DealPayAnyInputSerializer, DealRefundInputSerializer,
     MarketSaleEmployeePayProfileSerializer,
     SupplierReceiptCreateSerializer,
     SupplierReceiptReadSerializer,
     SupplierReturnReadSerializer,
     SupplierReturnCreateSerializer,
     ProductPurchaseBatchSerializer,
+    ProductExpiryBatchSerializer,
     PublicKnowledgeBaseCourseSerializer,
     FinishedToRawTransferSerializer,
     FinishedToRawMoveInputSerializer,
@@ -327,19 +329,22 @@ class CompanyBranchRestrictedMixin:
     def _company(self):
         """
         Компания текущего пользователя.
-        Для суперюзера -> None (без ограничения по company).
+        Если у юзера привязана компания (owned_company / company) — возвращаем её,
+        даже для суперюзера, чтобы в стандартных CRM-списках отображались данные его компании.
+        Для суперюзера БЕЗ компании -> None (без ограничения по компании).
 
         Если у юзера нет company, но есть филиал с company — берём её.
         """
         u = self._user()
         if not u or not getattr(u, "is_authenticated", False):
             return None
-        if getattr(u, "is_superuser", False):
-            return None
 
         company = getattr(u, "owned_company", None) or getattr(u, "company", None)
         if company:
             return company
+
+        if getattr(u, "is_superuser", False):
+            return None
 
         # fallback: пробуем достать компанию из его филиала (если есть связь)
         br = getattr(u, "branch", None)
@@ -761,16 +766,20 @@ class OrderRetrieveUpdateDestroyAPIView(CompanyBranchRestrictedMixin, generics.R
     queryset = Order.objects.all().prefetch_related("items__product")
 
 
-def _annotate_product_is_favorite(qs):
-    """is_favorite: избранное привязано к компании товара (общее для всех сотрудников)."""
-    return qs.annotate(
-        is_favorite=Exists(
-            ProductFavorite.objects.filter(
-                product_id=OuterRef("pk"),
-                company_id=OuterRef("company_id"),
+def _annotate_product_is_favorite(qs, company_id=None):
+    if company_id:
+        fav_ids = list(ProductFavorite.objects.filter(company_id=company_id).values_list('product_id', flat=True))
+    else:
+        fav_ids = list(ProductFavorite.objects.values_list('product_id', flat=True))
+    if fav_ids:
+        return qs.annotate(
+            is_favorite=Case(
+                When(id__in=fav_ids, then=Value(True)),
+                default=Value(False),
+                output_field=BooleanField(),
             )
         )
-    )
+    return qs.annotate(is_favorite=Value(False, output_field=BooleanField()))
 
 
 def _filter_products_company_only(view, qs):
@@ -1102,6 +1111,7 @@ class ProductCompactListView(CompanyBranchRestrictedMixin, generics.ListAPIView)
                 "article",
                 "company_id",
                 "hotkey_group",
+                "expiration_date",
                 "seq",  # нужен курсорной пагинации (ordering="-seq")
             )
             .prefetch_related(
@@ -2232,9 +2242,9 @@ class ProductBulkUpdateAPIView(CompanyBranchRestrictedMixin, APIView):
     Body:
     {
       "ids": [...],
-      "brand_name": "Name",
-      "category_name": "Name",
-      "client": "UUID",
+      "brand_name": "Name", "brand": "UUID/Name", "brand_id": "UUID",
+      "category_name": "Name", "category": "UUID/Name", "category_id": "UUID",
+      "client": "UUID", "client_id": "UUID", "supplier_id": "UUID", "supplier": "UUID/Name",
       "require_all": false
     }
     """
@@ -2257,9 +2267,9 @@ class ProductBulkUpdateAPIView(CompanyBranchRestrictedMixin, APIView):
             )
 
         data = request.data
-        has_brand = "brand_name" in data or "brand" in data
-        has_category = "category_name" in data or "category" in data
-        has_client = "client" in data
+        has_brand = "brand_name" in data or "brand" in data or "brand_id" in data
+        has_category = "category_name" in data or "category" in data or "category_id" in data
+        has_client = "client" in data or "client_id" in data or "supplier_id" in data or "supplier" in data
 
         if not (has_brand or has_category or has_client):
             return Response(
@@ -2267,84 +2277,132 @@ class ProductBulkUpdateAPIView(CompanyBranchRestrictedMixin, APIView):
                 status=status.HTTP_400_BAD_REQUEST
             )
             
-        company = self._company()
+        all_requested_products = Product.objects.filter(id__in=ids)
+        user = self._user()
+        company = self._company() or (all_requested_products.first().company if all_requested_products.exists() else None)
+        branch = getattr(request, "_cached_auto_branch", None)
+        if branch is None:
+            branch = self._auto_branch()
+
+        is_owner = (
+            not user
+            or getattr(user, "is_superuser", False)
+            or bool(getattr(user, "owned_company", None))
+            or getattr(user, "is_admin", False)
+            or str(getattr(user, "role", "")).lower() in ("owner", "admin", "rop", "владелец", "администратор")
+        )
+
+        company_kw = {"company": company} if company else {}
         update_fields = {}
         applied = {}
 
         # 1. Resolve brand
         if has_brand:
-            brand_val = str(data.get("brand_name") or data.get("brand") or "").strip()
-            if not brand_val or brand_val.lower() == "null":
+            brand_val = data.get("brand_name") or data.get("brand") or data.get("brand_id")
+            if brand_val is None or str(brand_val).strip() == "" or str(brand_val).strip().lower() in ("null", "none"):
                 update_fields["brand"] = None
                 applied["brand"] = None
             else:
+                brand_val_str = str(brand_val).strip()
+                brand_obj = None
                 try:
                     import uuid
-                    uuid_val = uuid.UUID(brand_val)
-                    brand_obj = ProductBrand.objects.get(id=uuid_val, company=company)
+                    uuid_val = uuid.UUID(brand_val_str)
+                    brand_obj = ProductBrand.objects.filter(id=uuid_val, **company_kw).first()
+                    if not brand_obj:
+                        brand_obj = ProductBrand.objects.filter(id=uuid_val).first()
                 except ValueError:
-                    brand_obj = ProductBrand.objects.filter(name__iexact=brand_val, company=company).first()
-                except ProductBrand.DoesNotExist:
-                    brand_obj = None
+                    pass
                     
                 if not brand_obj:
-                    return Response({"detail": f"Бренд «{brand_val}» не найден"}, status=status.HTTP_400_BAD_REQUEST)
+                    brand_obj = ProductBrand.objects.filter(name__iexact=brand_val_str, **company_kw).first()
+                    
+                if not brand_obj and company:
+                    brand_obj, _ = ProductBrand.objects.get_or_create(
+                        name=brand_val_str,
+                        company=company,
+                        defaults={"branch": branch if not is_owner else None}
+                    )
+                    
+                if not brand_obj:
+                    return Response({"detail": f"Бренд «{brand_val_str}» не найден"}, status=status.HTTP_400_BAD_REQUEST)
+
                 update_fields["brand"] = brand_obj
-                applied["brand"] = {"id": brand_obj.id, "name": brand_obj.name}
+                applied["brand"] = {"id": str(brand_obj.id), "name": brand_obj.name}
 
         # 2. Resolve category
         if has_category:
-            cat_val = str(data.get("category_name") or data.get("category") or "").strip()
-            if not cat_val or cat_val.lower() == "null":
+            cat_val = data.get("category_name") or data.get("category") or data.get("category_id")
+            if cat_val is None or str(cat_val).strip() == "" or str(cat_val).strip().lower() in ("null", "none"):
                 update_fields["category"] = None
                 applied["category"] = None
             else:
+                cat_val_str = str(cat_val).strip()
+                cat_obj = None
                 try:
                     import uuid
-                    uuid_val = uuid.UUID(cat_val)
-                    cat_obj = ProductCategory.objects.get(id=uuid_val, company=company)
+                    uuid_val = uuid.UUID(cat_val_str)
+                    cat_obj = ProductCategory.objects.filter(id=uuid_val, **company_kw).first()
+                    if not cat_obj:
+                        cat_obj = ProductCategory.objects.filter(id=uuid_val).first()
                 except ValueError:
-                    cat_obj = ProductCategory.objects.filter(name__iexact=cat_val, company=company).first()
-                except ProductCategory.DoesNotExist:
-                    cat_obj = None
+                    pass
                     
                 if not cat_obj:
-                    return Response({"detail": f"Категория «{cat_val}» не найдена"}, status=status.HTTP_400_BAD_REQUEST)
-                update_fields["category"] = cat_obj
-                applied["category"] = {"id": cat_obj.id, "name": cat_obj.name}
+                    cat_obj = ProductCategory.objects.filter(name__iexact=cat_val_str, **company_kw).first()
+                    
+                if not cat_obj and company:
+                    cat_obj, _ = ProductCategory.objects.get_or_create(
+                        name=cat_val_str,
+                        company=company,
+                        defaults={"branch": branch if not is_owner else None}
+                    )
+                    
+                if not cat_obj:
+                    return Response({"detail": f"Категория «{cat_val_str}» не найдена"}, status=status.HTTP_400_BAD_REQUEST)
 
-        # 3. Resolve client
+                update_fields["category"] = cat_obj
+                applied["category"] = {"id": str(cat_obj.id), "name": cat_obj.name}
+
+        # 3. Resolve client / supplier
         if has_client:
-            client_val = data.get("client")
-            if not client_val or str(client_val).strip().lower() == "null":
+            client_val = data.get("client") or data.get("client_id") or data.get("supplier_id") or data.get("supplier")
+            if client_val is None or str(client_val).strip() == "" or str(client_val).strip().lower() in ("null", "none"):
                 update_fields["client"] = None
                 applied["client"] = None
             else:
+                client_val_str = str(client_val).strip()
+                client_obj = None
                 try:
-                    client_obj = Client.objects.get(id=client_val, company=company, type=Client.StatusClient.SUPPLIERS)
-                except Client.DoesNotExist:
-                    return Response({"detail": "Поставщик не найден"}, status=status.HTTP_400_BAD_REQUEST)
+                    import uuid
+                    uuid_val = uuid.UUID(client_val_str)
+                    client_obj = Client.objects.filter(id=uuid_val, **company_kw).first()
+                    if not client_obj:
+                        client_obj = Client.objects.filter(id=uuid_val).first()
+                except ValueError:
+                    pass
+                    
+                if not client_obj:
+                    client_obj = Client.objects.filter(full_name__iexact=client_val_str, **company_kw).first()
+                    
+                if not client_obj:
+                    return Response({"detail": f"Поставщик «{client_val_str}» не найден"}, status=status.HTTP_400_BAD_REQUEST)
+
                 update_fields["client"] = client_obj
-                applied["client"] = {"id": client_obj.id, "full_name": client_obj.full_name}
+                applied["client"] = {"id": str(client_obj.id), "full_name": client_obj.full_name}
 
         # 4. Filter products
-        # We need to categorize them as required by docs
-        branch = getattr(request, "_cached_auto_branch", None)
-        if branch is None:
-            branch = self._branch()
-            
         all_requested_products = Product.objects.filter(id__in=ids)
         
         valid_ids = []
         skipped = []
         
         for p in all_requested_products:
-            if p.company_id != company.id:
+            if company and p.company_id and p.company_id != company.id:
                 skipped.append({"id": str(p.id), "reason": "forbidden"})
             elif getattr(p, "is_active", True) == False:
                 skipped.append({"id": str(p.id), "reason": "deleted"})
-            elif branch is not None and p.branch_id and p.branch_id != branch.id:
-                # If branch restriction applies and it's not global nor matching branch
+            elif not is_owner and branch is not None and p.branch_id and p.branch_id != branch.id:
                 skipped.append({"id": str(p.id), "reason": "other_branch"})
             else:
                 valid_ids.append(p.id)
@@ -2365,12 +2423,18 @@ class ProductBulkUpdateAPIView(CompanyBranchRestrictedMixin, APIView):
         if valid_ids:
             with transaction.atomic():
                 Product.objects.filter(id__in=valid_ids).update(**update_fields)
+                if has_client and update_fields.get("client"):
+                    c_obj = update_fields["client"]
+                    for p in Product.objects.filter(id__in=valid_ids):
+                        p.suppliers.add(c_obj)
                 
             try:
                 from apps.main.cache_utils import invalidate_cache_pattern
-                invalidate_cache_pattern(f"analytics:market:{company.id}:")
-                invalidate_cache_pattern(f"products:list:{company.id}:")
-            except ImportError:
+                cid = company.id if company else "*"
+                invalidate_cache_pattern(f"analytics:market:{cid}:")
+                invalidate_cache_pattern(f"products:list:{cid}:")
+                invalidate_cache_pattern(f"products:*")
+            except Exception:
                 pass
                 
         return Response({
@@ -2944,7 +3008,7 @@ class ClientListCreateAPIView(CompanyBranchRestrictedMixin, generics.ListCreateA
     """
     serializer_class = ClientSerializer
     filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
-    filterset_fields = ["status", "date", "type"]
+    filterset_fields = ["status", "date", "type", "sector"]
     search_fields = ["full_name", "phone", "email"]
     ordering_fields = ["created_at", "updated_at", "date"]
     ordering = ["-created_at"]
@@ -2953,15 +3017,18 @@ class ClientListCreateAPIView(CompanyBranchRestrictedMixin, generics.ListCreateA
         qs = self._filter_qs_company_branch(
             Client.objects.select_related("company", "branch").all()
         )
+        sector_param = self.request.query_params.get("sector")
+        if sector_param and sector_param != "all":
+            qs = qs.filter(sector__in=[sector_param, "all"])
         return _filter_clients_visible_for_user(qs, self.request.user)
 
     def perform_create(self, serializer):
-        # Агенту нельзя создавать "чужих" клиентов — привязываем к нему.
+        kwargs = {}
+        if not serializer.validated_data.get("sector"):
+            kwargs["sector"] = "market"
         if not _is_owner_like(self.request.user):
-            self._save_with_company_branch(serializer, salesperson=self.request.user)
-            return
-        # owner/admin может назначать salesperson через payload (или оставить пустым)
-        self._save_with_company_branch(serializer)
+            kwargs["salesperson"] = self.request.user
+        self._save_with_company_branch(serializer, **kwargs)
 
 
 class ClientRetrieveUpdateDestroyAPIView(CompanyBranchRestrictedMixin, generics.RetrieveUpdateDestroyAPIView):
@@ -3107,18 +3174,34 @@ class ClientDealListCreateAPIView(CompanyBranchRestrictedMixin, generics.ListCre
         client_id = self.kwargs.get("client_id")
         if client_id:
             qs = qs.filter(client_id=client_id)
-
         return qs
+
+
+    def create(self, request, *args, **kwargs):
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        self.perform_create(serializer)
+
+        fresh_instance = serializer.instance
+        if fresh_instance:
+            fresh_instance.refresh_from_db()
+            output_serializer = self.get_serializer(fresh_instance)
+            headers = self.get_success_headers(output_serializer.data)
+            return Response(output_serializer.data, status=status.HTTP_201_CREATED, headers=headers)
+
+        headers = self.get_success_headers(serializer.data)
+        return Response(serializer.data, status=status.HTTP_201_CREATED, headers=headers)
 
     @transaction.atomic
     def perform_create(self, serializer):
-        company = self._company()
+        user = self.request.user
+        company = getattr(user, "company", None) or getattr(user, "owned_company", None) or self._company()
         branch = self._auto_branch()
         client_id = self.kwargs.get("client_id")
-        user = self.request.user
 
         if not company:
             raise serializers.ValidationError({"company": "У пользователя не задана компания."})
+
 
         client = None
         if client_id:
@@ -3142,26 +3225,26 @@ class ClientDealListCreateAPIView(CompanyBranchRestrictedMixin, generics.ListCre
         sale = serializer.validated_data.get("sale")
         if kind == ClientDeal.Kind.DEBT and not sale and client:
             from datetime import timedelta
-            amt = serializer.validated_data.get("amount") or Decimal("0.00")
             recent_deal = (
                 ClientDeal.objects.filter(
-                    company=company,
                     client=client,
                     kind=ClientDeal.Kind.DEBT,
-                    sale__isnull=False,
-                    created_at__gte=timezone.now() - timedelta(seconds=60),
                 )
                 .order_by("-created_at")
                 .first()
             )
-            if recent_deal:
-                if abs((recent_deal.amount or Decimal("0.00")) - amt) <= Decimal("0.01") or amt == Decimal("0.00"):
-                    title = serializer.validated_data.get("title")
-                    if title:
-                        recent_deal.title = title
-                        recent_deal.save(update_fields=["title"])
-                    serializer.instance = recent_deal
-                    return
+            if recent_deal and abs((timezone.now() - recent_deal.created_at).total_seconds()) <= 120:
+                serializer.update(recent_deal, serializer.validated_data.copy())
+                serializer.instance = recent_deal
+                return
+
+
+
+
+
+
+
+
 
         if client_id:
             serializer.save(company=company, branch=branch, client=client)
@@ -3305,6 +3388,10 @@ class ClientDealPayAPIView(APIView, CompanyBranchRestrictedMixin):
         if pay_amt > remaining:
             return Response({"amount": f"Сумма оплаты превышает остаток. Максимум: {remaining}."}, status=status.HTTP_400_BAD_REQUEST)
 
+        raw_pm = data.get("payment_method")
+        from apps.main.services_debt import normalize_debt_payment_method
+        pm = normalize_debt_payment_method(raw_pm)
+
         # audit
         try:
             DealPayment.objects.create(
@@ -3318,6 +3405,7 @@ class ClientDealPayAPIView(APIView, CompanyBranchRestrictedMixin):
                 idempotency_key=idem,
                 created_by=request.user,
                 note=note,
+                payment_method=pm,
             )
         except IntegrityError:
             fresh = ClientDeal.objects.select_related("client").prefetch_related(*_deal_prefetch()).get(pk=deal.pk)
@@ -3348,6 +3436,7 @@ class ClientDealPayAPIView(APIView, CompanyBranchRestrictedMixin):
                 source_id=str(deal.id),
                 name=f"Оплата долга поставщику: {deal.title or (deal.client.full_name if deal.client else 'Сделка')}",
                 source_business_operation_id="Оплата долга",
+                payment_method=pm,
                 affects_shift_drawer=False,
             )
         else:
@@ -3364,6 +3453,8 @@ class ClientDealPayAPIView(APIView, CompanyBranchRestrictedMixin):
                 source_id=str(deal.id),
                 name=f"Оплата долга: {deal.title or (deal.client.full_name if deal.client else 'Сделка')}",
                 source_business_operation_id="Оплата долга",
+                payment_method=pm,
+                affects_shift_drawer=(pm == "cash"),
             )
 
         # update installment
@@ -3378,6 +3469,139 @@ class ClientDealPayAPIView(APIView, CompanyBranchRestrictedMixin):
 
         fresh = ClientDeal.objects.select_related("client").prefetch_related(*_deal_prefetch()).get(pk=deal.pk)
         return Response(ClientDealSerializer(fresh, context={"request": request}).data, status=status.HTTP_200_OK)
+
+
+class ClientDealsPayAnyAPIView(APIView, CompanyBranchRestrictedMixin):
+    """Atomically distribute one payment across a client's debt installments.
+
+    Deals are processed by their earliest still-unpaid due date, then by creation
+    time.  A separate cashflow is recorded for every affected installment, so the
+    audit trail remains linked to the exact DealPayment.
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    @staticmethod
+    def _serialize_deals(request, deals):
+        return ClientDealSerializer(deals, many=True, context={"request": request}).data
+
+    @transaction.atomic
+    def post(self, request, client_id, *args, **kwargs):
+        inp = DealPayAnyInputSerializer(data=request.data)
+        inp.is_valid(raise_exception=True)
+        data = inp.validated_data
+        amount = Decimal(str(data["amount"])).quantize(Decimal("0.01"))
+        if amount <= 0:
+            return Response({"amount": "Сумма оплаты должна быть больше нуля."}, status=status.HTTP_400_BAD_REQUEST)
+
+        client_qs = self._filter_qs_company_branch(Client.objects.all())
+        if not _is_owner_like(request.user):
+            client_qs = client_qs.filter(salesperson=request.user)
+        client = get_object_or_404(client_qs.select_for_update(), id=client_id)
+        idem = data["idempotency_key"]
+
+        # A key is scoped to the client.  This separate operation record is
+        # needed because one operation can create several payments in one deal.
+        prior_operation = ClientDebtBulkPayment.objects.filter(
+            client=client, idempotency_key=idem
+        ).first()
+        if prior_operation:
+            prior_deal_ids = [UUID(str(deal_id)) for deal_id in prior_operation.affected_deal_ids]
+            prior_deals = list(
+                ClientDeal.objects.filter(id__in=prior_deal_ids)
+                .select_related("client")
+                .prefetch_related(*_deal_prefetch())
+            )
+            by_id = {deal.id: deal for deal in prior_deals}
+            ordered = [by_id[deal_id] for deal_id in prior_deal_ids if deal_id in by_id]
+            return Response({"paid_total": str(prior_operation.amount), "deals": self._serialize_deals(request, ordered)})
+
+        operation = ClientDebtBulkPayment.objects.create(
+            company=client.company,
+            client=client,
+            idempotency_key=idem,
+            amount=amount,
+        )
+
+        installments = list(
+            DealInstallment.objects.select_for_update()
+            .select_related("deal", "deal__client")
+            .filter(deal__client=client, deal__kind=ClientDeal.Kind.DEBT, paid_amount__lt=F("amount"))
+            .order_by("due_date", "deal__created_at", "number")
+        )
+        if not installments:
+            return Response({"detail": "У клиента нет непогашенных долгов."}, status=status.HTTP_400_BAD_REQUEST)
+
+        total_remaining = sum((inst.remaining_for_period for inst in installments), Decimal("0.00")).quantize(Decimal("0.01"))
+        if amount > total_remaining:
+            return Response(
+                {"amount": f"Сумма оплаты превышает суммарный остаток. Максимум: {total_remaining}."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        from apps.main.services_debt import normalize_debt_payment_method
+        from apps.construction.auto_cashflow import create_auto_cashflow
+        from apps.construction.models import CashFlow
+
+        pm = normalize_debt_payment_method(data.get("payment_method"))
+        paid_date = data.get("date") or timezone.localdate()
+        note = data.get("note", "") or ""
+        left = amount
+        affected_ids = []
+        for inst in installments:
+            if left <= 0:
+                break
+            pay_amount = min(left, inst.remaining_for_period).quantize(Decimal("0.01"))
+            if pay_amount <= 0:
+                continue
+            deal = inst.deal
+            payment = DealPayment.objects.create(
+                company=deal.company,
+                branch=deal.branch,
+                deal=deal,
+                installment=inst,
+                kind=DealPayment.Kind.PAY,
+                amount=pay_amount,
+                paid_date=paid_date,
+                idempotency_key=uuid5(idem, f"{deal.id}:{inst.id}"),
+                created_by=request.user,
+                note=note,
+                payment_method=pm,
+            )
+            new_paid = (inst.paid_amount + pay_amount).quantize(Decimal("0.01"))
+            inst.paid_amount = min(new_paid, inst.amount)
+            inst.paid_on = paid_date if inst.paid_amount >= inst.amount else None
+            inst.save(update_fields=["paid_amount", "paid_on"])
+
+            create_auto_cashflow(
+                company=deal.company,
+                branch=deal.branch,
+                cashbox_id=data.get("cashbox_id"),
+                cashbox_role=data.get("cashbox_role") or "pos_branch",
+                shift_id=data.get("shift_id"),
+                user=request.user,
+                type=CashFlow.Type.INCOME,
+                amount=pay_amount,
+                source_kind=CashFlow.SourceKind.DEBT_REPAYMENT,
+                source_id=str(payment.id),
+                name=f"Оплата долга: {deal.title or client.full_name}",
+                source_business_operation_id="Оплата долга",
+                payment_method=pm,
+                affects_shift_drawer=(pm == "cash"),
+            )
+            if deal.id not in affected_ids:
+                affected_ids.append(deal.id)
+            left = (left - pay_amount).quantize(Decimal("0.01"))
+
+        fresh_deals = list(
+            ClientDeal.objects.filter(id__in=affected_ids)
+            .select_related("client")
+            .prefetch_related(*_deal_prefetch())
+        )
+        by_id = {deal.id: deal for deal in fresh_deals}
+        ordered = [by_id[deal_id] for deal_id in affected_ids]
+        operation.affected_deal_ids = [str(deal_id) for deal_id in affected_ids]
+        operation.save(update_fields=["affected_deal_ids"])
+        return Response({"paid_total": str(amount), "deals": self._serialize_deals(request, ordered)})
 
 
 # ===== REFUND (создаём DealPayment refund + уменьшаем paid_amount) =====
@@ -3459,6 +3683,10 @@ class ClientDealRefundAPIView(APIView, CompanyBranchRestrictedMixin):
         if refund_amt > current_paid:
             return Response({"amount": f"Сумма возврата больше оплаченного. Максимум: {current_paid}."}, status=status.HTTP_400_BAD_REQUEST)
 
+        raw_pm = data.get("payment_method")
+        from apps.main.services_debt import normalize_debt_payment_method
+        pm = normalize_debt_payment_method(raw_pm)
+
         try:
             DealPayment.objects.create(
                 company=deal.company,
@@ -3471,6 +3699,7 @@ class ClientDealRefundAPIView(APIView, CompanyBranchRestrictedMixin):
                 idempotency_key=idem,
                 created_by=request.user,
                 note=note,
+                payment_method=pm,
             )
         except IntegrityError:
             fresh = ClientDeal.objects.select_related("client").prefetch_related(*_deal_prefetch()).get(pk=deal.pk)
@@ -3689,11 +3918,58 @@ class DebtRetrieveUpdateDestroyAPIView(CompanyBranchRestrictedMixin, generics.Re
             Debt.objects.select_related("company", "branch").all()
         )
 
+    @transaction.atomic
+    def perform_update(self, serializer):
+        old_amount = serializer.instance.amount
+        instance = serializer.save()
+        new_amount = instance.amount
+
+        raw_pm = self.request.data.get("payment_method")
+        from apps.main.services_debt import normalize_debt_payment_method
+        pm = normalize_debt_payment_method(raw_pm)
+
+        if raw_pm is not None or not instance.payment_method:
+            instance.payment_method = pm
+            instance.save(update_fields=["payment_method"])
+
+        # Если остаток долга уменьшился (погашение)
+        if old_amount is not None and new_amount is not None and new_amount < old_amount:
+            repaid_amount = (old_amount - new_amount).quantize(Decimal("0.01"))
+            if repaid_amount > Decimal("0.00"):
+                instance.add_payment(
+                    amount=repaid_amount,
+                    paid_at=timezone.localdate(),
+                    note=f"Погашение долга ({pm})",
+                    payment_method=pm,
+                )
+                cashbox_id = self.request.data.get("cashbox_id")
+                cashbox_role = self.request.data.get("cashbox_role") or "pos_main"
+                shift_id = self.request.data.get("shift_id")
+                from apps.construction.auto_cashflow import create_auto_cashflow
+                from apps.construction.models import CashFlow
+
+                create_auto_cashflow(
+                    company=instance.company,
+                    branch=instance.branch,
+                    cashbox_id=cashbox_id,
+                    cashbox_role=cashbox_role,
+                    shift_id=shift_id,
+                    user=self.request.user,
+                    type=CashFlow.Type.INCOME,
+                    amount=repaid_amount,
+                    source_kind=CashFlow.SourceKind.DEBT_REPAYMENT,
+                    source_id=str(instance.id),
+                    name=f"Оплата долга: {instance.name or 'Долг'}",
+                    source_business_operation_id="Оплата долга",
+                    payment_method=pm,
+                    affects_shift_drawer=(pm == "cash"),
+                )
+
 
 class DebtPayAPIView(APIView, CompanyBranchRestrictedMixin):
     """
     POST /api/main/debts/<uuid:pk>/pay/
-    Body: { "amount": "235.00", "paid_at": "2025-09-12", "note": "оплата с карты" }
+    Body: { "amount": "235.00", "paid_at": "2025-09-12", "note": "оплата с карты", "payment_method": "mbank" }
     """
     permission_classes = [permissions.IsAuthenticated]
 
@@ -3703,19 +3979,29 @@ class DebtPayAPIView(APIView, CompanyBranchRestrictedMixin):
         qs = self._filter_qs_company_branch(Debt.objects.all())
         debt = get_object_or_404(qs, pk=pk)
 
-        ser = DebtPaymentSerializer(data=request.data, context={"request": request})
+        ser = DebtPaymentSerializer(data=request.data, context={"request": request, "debt": debt})
         ser.is_valid(raise_exception=True)
-        DebtPayment.objects.create(
+
+        raw_pm = request.data.get("payment_method")
+        from apps.main.services_debt import normalize_debt_payment_method
+        pm = normalize_debt_payment_method(raw_pm)
+
+        payment = DebtPayment.objects.create(
             company=debt.company,
+            branch=debt.branch,
             debt=debt,
             amount=ser.validated_data["amount"],
-            paid_at=ser.validated_data.get("paid_at"),
+            paid_at=ser.validated_data.get("paid_at") or timezone.localdate(),
             note=ser.validated_data.get("note", ""),
+            payment_method=pm,
         )
+        debt.payment_method = pm
+        debt.save(update_fields=["payment_method"])
 
         cashbox_id = request.data.get("cashbox_id")
         cashbox_role = request.data.get("cashbox_role") or "pos_main"
         branch_id = request.data.get("branch_id") or (debt.branch_id if debt.branch_id else None)
+        shift_id = request.data.get("shift_id")
         from apps.construction.auto_cashflow import create_auto_cashflow
         from apps.construction.models import CashFlow
 
@@ -3724,6 +4010,7 @@ class DebtPayAPIView(APIView, CompanyBranchRestrictedMixin):
             branch=debt.branch,
             cashbox_id=cashbox_id,
             cashbox_role=cashbox_role,
+            shift_id=shift_id,
             user=request.user,
             type=CashFlow.Type.INCOME,
             amount=ser.validated_data["amount"],
@@ -3731,6 +4018,8 @@ class DebtPayAPIView(APIView, CompanyBranchRestrictedMixin):
             source_id=str(debt.id),
             name=f"Оплата долга: {debt.name or 'Долг'}",
             source_business_operation_id="Оплата долга",
+            payment_method=pm,
+            affects_shift_drawer=(pm == "cash"),
         )
 
         return Response(DebtSerializer(debt, context={"request": request}).data, status=status.HTTP_201_CREATED)
@@ -4577,18 +4866,15 @@ class SupplierReceiptAPIView(CompanyBranchRestrictedMixin, APIView):
         if missing:
             raise ValidationError({"items": [f"Товары не найдены/не доступны: {', '.join(missing)}"]})
 
-        # проверим принадлежность поставщику
-        wrong_supplier = []
+        # Привязываем поставщика к товарам (suppliers M2M) и фиксируем primary client
         for p in products:
-            ok = False
             try:
-                ok = (p.client_id == supplier.id) or p.suppliers.filter(id=supplier.id).exists()
+                p.suppliers.add(supplier)
             except Exception:
-                ok = (p.client_id == supplier.id)
-            if not ok:
-                wrong_supplier.append(str(p.id))
-        if wrong_supplier:
-            raise ValidationError({"items": [f"Товары не принадлежат выбранному поставщику: {', '.join(wrong_supplier)}"]})
+                pass
+            if p.client_id != supplier.id:
+                p.client = supplier
+                p.save(update_fields=["client", "updated_at"])
 
         # лог оприходования
         receipt = SupplierReceipt.objects.create(
@@ -4607,10 +4893,27 @@ class SupplierReceiptAPIView(CompanyBranchRestrictedMixin, APIView):
             prod = by_id[pid]
             upd = {"quantity": F("quantity") + qty}
             raw_pp = it.get("purchase_price")
+            new_purchase_price = None
             if raw_pp is not None:
                 new_purchase_price = Decimal(str(raw_pp))
                 upd["purchase_price"] = new_purchase_price
 
+            # Опциональная розничная цена (price / selling_price), переданная напрямую в строке прихода
+            custom_price = it.get("price") if it.get("price") is not None else it.get("selling_price")
+            if custom_price is not None:
+                new_price = Decimal(str(custom_price)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+                upd["price"] = new_price
+                effective_pp = new_purchase_price if raw_pp is not None else getattr(prod, "purchase_price", None)
+                if effective_pp is not None:
+                    try:
+                        eff_dec = Decimal(str(effective_pp))
+                        if eff_dec > Decimal("0"):
+                            upd["markup_percent"] = (
+                                (new_price - eff_dec) / eff_dec * Decimal("100")
+                            ).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+                    except Exception:
+                        pass
+            elif raw_pp is not None:
                 # Пересчёт цены продажи по наценке (markup_percent) до обновления закупки
                 # selling = purchase_price * (1 + markup_percent / 100)
                 # product.price = round(selling * 100) / 100
@@ -4626,6 +4929,9 @@ class SupplierReceiptAPIView(CompanyBranchRestrictedMixin, APIView):
                         upd["price"] = new_price
 
             type(prod).objects.filter(id=pid).update(**upd)
+            # The batch retains the shelf-life configuration at the receipt moment.
+            from apps.main.services.product_expiry_batches import receive_stock
+            receive_stock(prod, qty, source_kind="purchase", source_id=receipt.id, user=request.user)
 
             receipt_items.append(
                 SupplierReceiptItem(
@@ -4696,8 +5002,9 @@ class SupplierReceiptAPIView(CompanyBranchRestrictedMixin, APIView):
         # вернём актуальные данные по товарам
         refreshed = list(self._filter_qs_company_branch(Product.objects.all()).filter(id__in=product_ids))
         resp_data = {
-            "supplier": str(supplier.id),
+            "id": str(receipt.id),
             "receipt_id": str(receipt.id),
+            "supplier": str(supplier.id),
             "products": ProductListSerializer(refreshed, many=True, context={"request": request}).data,
             "cashflows": serialize_auto_cashflows(receipt_cashflows),
         }
@@ -4832,6 +5139,20 @@ class ProductPurchaseBatchListAPIView(CompanyBranchRestrictedMixin, generics.Lis
         return self.paginator.get_paginated_response(
             serializer.data, total_amount=total_amount
         )
+
+
+class ProductExpiryBatchListAPIView(CompanyBranchRestrictedMixin, generics.ListAPIView):
+    permission_classes = [permissions.IsAuthenticated]
+    serializer_class = ProductExpiryBatchSerializer
+    pagination_class = SupplierReceiptLimitPagination
+
+    def get_queryset(self):
+        product = get_object_or_404(self._filter_qs_company_branch(Product.objects.all()), id=self.kwargs["pk"])
+        return ProductExpiryBatch.objects.filter(product=product).order_by(F("expires_at").asc(nulls_last=True), "received_at")
+
+    def list(self, request, *args, **kwargs):
+        page = self.paginate_queryset(self.get_queryset())
+        return self.paginator.get_paginated_response(self.get_serializer(page, many=True).data, total_amount=Decimal("0"))
 
 
 # ===========================

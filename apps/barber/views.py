@@ -1,12 +1,14 @@
 from rest_framework import generics, permissions, status
+from rest_framework.pagination import PageNumberPagination
+from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework.parsers import MultiPartParser, FormParser
 from rest_framework.exceptions import PermissionDenied, ValidationError
 from rest_framework.filters import SearchFilter, OrderingFilter
 from django.utils import timezone
 from django.utils.dateparse import parse_date
-from datetime import time
-from decimal import Decimal
+from datetime import time, datetime
+from decimal import Decimal, ROUND_HALF_UP
 from django.db.models.deletion import ProtectedError
 from django.db import IntegrityError, models, transaction
 from django.db.models import Q, Prefetch, Count, Sum, Avg, F, Value, DecimalField, ExpressionWrapper
@@ -472,7 +474,7 @@ class ClientVisitHistoryListView(CompanyQuerysetMixin, generics.ListAPIView):
 
     queryset = (
         Appointment.objects
-        .select_related("client", "barber")
+        .select_related("client", "barber", "company", "branch")
         .prefetch_related(
             Prefetch(
                 "appointment_services",
@@ -511,6 +513,18 @@ class ClientVisitHistoryListView(CompanyQuerysetMixin, generics.ListAPIView):
                 Appointment.Status.NO_SHOW,
             ])
 
+        user = self.request.user
+        if user and user.is_authenticated:
+            role = str(getattr(user, "role", "") or "").strip().lower()
+            is_owner_or_admin = (
+                role in ("admin", "owner")
+                or user.is_superuser
+                or (company and getattr(company, "owner_id", None) == user.id)
+                or getattr(user, "is_owner_or_admin", False)
+            )
+            if not is_owner_or_admin:
+                qs = qs.exclude(status=Appointment.Status.DELETED)
+
         return qs
 
 
@@ -527,7 +541,7 @@ class VisitHistoryListView(CompanyQuerysetMixin, generics.ListAPIView):
 
     queryset = (
         Appointment.objects
-        .select_related("client", "barber")
+        .select_related("client", "barber", "company", "branch")
         .all()
     )
     serializer_class = AppointmentHistoryRowSerializer
@@ -558,14 +572,259 @@ class VisitHistoryListView(CompanyQuerysetMixin, generics.ListAPIView):
                 Appointment.Status.NO_SHOW,
             ])
 
+        user = self.request.user
+        if user and user.is_authenticated:
+            role = str(getattr(user, "role", "") or "").strip().lower()
+            is_owner_or_admin = (
+                role in ("admin", "owner")
+                or user.is_superuser
+                or (company and getattr(company, "owner_id", None) == user.id)
+                or getattr(user, "is_owner_or_admin", False)
+            )
+            if not is_owner_or_admin:
+                qs = qs.exclude(status=Appointment.Status.DELETED)
+
         return qs
+
+
+def compute_appointment_expected_price(appt: Appointment) -> Decimal:
+    """
+    Сумма одной записи согласно правилам (§3.2):
+    1. Если appointment.price задан и > 0 -> берётся он (уже с учётом ручной правки и скидки на фронте).
+    2. Иначе — сумма базовых цен услуг из appointment.services на момент расчёта,
+       с учётом appointment.discount (%).
+    3. Если итог <= 0 -> 0.00.
+    """
+    price = getattr(appt, "price", None)
+    if price is not None and price > 0:
+        return Decimal(str(price)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+    base_sum = Decimal("0.00")
+    rel = getattr(appt, "appointment_services", None)
+    if rel is not None and hasattr(rel, "all"):
+        for item in rel.all():
+            svc = getattr(item, "service", None)
+            if svc and getattr(svc, "price", None):
+                base_sum += Decimal(str(svc.price))
+    elif hasattr(appt, "services"):
+        for svc in appt.services.all():
+            if svc.price:
+                base_sum += Decimal(str(svc.price))
+
+    if base_sum <= 0:
+        return Decimal("0.00")
+
+    discount = getattr(appt, "discount", None) or Decimal("0")
+    if discount > 0:
+        disc_dec = Decimal(str(discount))
+        total = base_sum * (Decimal("1") - (disc_dec / Decimal("100")))
+    else:
+        total = base_sum
+
+    if total <= 0:
+        return Decimal("0.00")
+
+    return total.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+
+class AppointmentSummaryView(CompanyQuerysetMixin, APIView):
+    """
+    Эндпоинт сводки ожидаемой суммы по записям (appointment-day-summary.md §2):
+    GET /api/barbershop/appointments/summary/
+
+    1. Scope day (календарь):
+       - date: YYYY-MM-DD (обязательный)
+       - barber: UUID (опционально)
+       - status: string (опционально; по умолчанию booked, confirmed, completed)
+       - Response: { "date": "...", "scope": "day", "expected_count": N, "expected_total": "..." }
+
+    2. Scope deleted (раздел «Удалённые»):
+       - scope: deleted (обязательный)
+       - barber: UUID (опционально)
+       - Response: { "scope": "deleted", "records_count": N, "expected_total": "..." }
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request, *args, **kwargs):
+        company = self._user_company()
+        if not company:
+            return Response(
+                {"detail": "Компания не найдена."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        scope = (request.query_params.get("scope") or "day").strip().lower()
+        barber_id = request.query_params.get("barber")
+        status_param = request.query_params.get("status")
+
+        # Базовый кверисет с учетом компании и филиала
+        qs = Appointment.objects.filter(company=company)
+        active_branch = self._active_branch()
+        if active_branch is not None:
+            qs = qs.filter(branch=active_branch)
+
+        if barber_id:
+            qs = qs.filter(barber_id=barber_id)
+
+        # Режим 1: Сводка удаленных записей (scope=deleted)
+        if scope == "deleted":
+            role = str(getattr(request.user, "role", "") or "").strip().lower()
+            is_owner_or_admin = (
+                role in ("admin", "owner")
+                or request.user.is_superuser
+                or (getattr(company, "owner_id", None) == request.user.id)
+                or getattr(request.user, "is_owner_or_admin", False)
+            )
+            if not is_owner_or_admin:
+                raise PermissionDenied("Просмотр сводки удаленных записей доступен только администраторам и владельцам.")
+
+            qs = qs.filter(status=Appointment.Status.DELETED)
+
+            appts = qs.select_related("client").prefetch_related(
+                Prefetch(
+                    "appointment_services",
+                    queryset=AppointmentService.objects.select_related("service"),
+                )
+            )
+
+            records_count = qs.count()
+            total = Decimal("0.00")
+            client_map = {}
+            for appt in appts:
+                appt_total = compute_appointment_expected_price(appt)
+                total += appt_total
+
+                client = getattr(appt, "client", None)
+                if client:
+                    client_id = str(client.id)
+                    client_name = client.full_name or client.phone or "Клиент"
+                else:
+                    client_id = None
+                    client_name = "Без клиента"
+
+                client_key = client_id or "__none__"
+                if client_key not in client_map:
+                    client_map[client_key] = {
+                        "client_id": client_id,
+                        "client_name": client_name,
+                        "records_count": 0,
+                        "expected_total": Decimal("0.00"),
+                    }
+                client_map[client_key]["records_count"] += 1
+                client_map[client_key]["expected_total"] += appt_total
+
+            by_client = [
+                {
+                    "client_id": c["client_id"],
+                    "client_name": c["client_name"],
+                    "records_count": c["records_count"],
+                    "expected_total": f"{c['expected_total']:.2f}",
+                }
+                for c in client_map.values()
+            ]
+
+            return Response({
+                "scope": "deleted",
+                "records_count": records_count,
+                "expected_total": f"{total:.2f}",
+                "by_client": by_client,
+            }, status=status.HTTP_200_OK)
+
+        # Режим 2: Сводка за день (scope=day)
+        date_param = request.query_params.get("date")
+        if not date_param:
+            return Response(
+                {"detail": "Параметр 'date' обязателен при scope=day в формате YYYY-MM-DD."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        try:
+            target_date = datetime.strptime(date_param.strip(), "%Y-%m-%d").date()
+        except (ValueError, TypeError):
+            return Response(
+                {"detail": "Неверный формат параметра 'date'. Ожидается YYYY-MM-DD."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        qs = qs.filter(start_at__date=target_date)
+
+        # Никогда не включаем deleted в day-сводку
+        qs = qs.exclude(status=Appointment.Status.DELETED)
+
+        if status_param:
+            qs = qs.filter(status=status_param.strip().lower())
+        else:
+            qs = qs.filter(
+                status__in=[
+                    Appointment.Status.BOOKED,
+                    Appointment.Status.CONFIRMED,
+                    Appointment.Status.COMPLETED,
+                ]
+            )
+
+        appts = qs.select_related("client").prefetch_related(
+            Prefetch(
+                "appointment_services",
+                queryset=AppointmentService.objects.select_related("service"),
+            )
+        )
+
+        expected_count = qs.count()
+        total = Decimal("0.00")
+        client_map = {}
+        for appt in appts:
+            appt_total = compute_appointment_expected_price(appt)
+            total += appt_total
+
+            client = getattr(appt, "client", None)
+            if client:
+                client_id = str(client.id)
+                client_name = client.full_name or client.phone or "Клиент"
+            else:
+                client_id = None
+                client_name = "Без клиента"
+
+            client_key = client_id or "__none__"
+            if client_key not in client_map:
+                client_map[client_key] = {
+                    "client_id": client_id,
+                    "client_name": client_name,
+                    "records_count": 0,
+                    "expected_total": Decimal("0.00"),
+                }
+            client_map[client_key]["records_count"] += 1
+            client_map[client_key]["expected_total"] += appt_total
+
+        by_client = [
+            {
+                "client_id": c["client_id"],
+                "client_name": c["client_name"],
+                "records_count": c["records_count"],
+                "expected_total": f"{c['expected_total']:.2f}",
+            }
+            for c in client_map.values()
+        ]
+
+        return Response({
+            "date": date_param.strip(),
+            "scope": "day",
+            "expected_count": expected_count,
+            "expected_total": f"{total:.2f}",
+            "by_client": by_client,
+        }, status=status.HTTP_200_OK)
+
+
+class AppointmentPagination(PageNumberPagination):
+    page_size = 100
+    page_size_query_param = "page_size"
+    max_page_size = 1000
 
 
 # ==== Appointment ====
 class AppointmentListCreateView(CompanyQuerysetMixin, generics.ListCreateAPIView):
     queryset = (
         Appointment.objects
-        .select_related("client", "barber")
+        .select_related("client", "barber", "company", "branch")
         .prefetch_related(
             Prefetch(
                 "appointment_services",
@@ -576,6 +835,7 @@ class AppointmentListCreateView(CompanyQuerysetMixin, generics.ListCreateAPIView
     )
     serializer_class = AppointmentSerializer
     permission_classes = [permissions.IsAuthenticated]
+    pagination_class = AppointmentPagination
     filter_backends = [DjangoFilterBackend, SearchFilter, OrderingFilter]
     filterset_fields = [
         f.name for f in Appointment._meta.get_fields() if not f.is_relation or f.many_to_one
@@ -588,6 +848,49 @@ class AppointmentListCreateView(CompanyQuerysetMixin, generics.ListCreateAPIView
     ]
     ordering_fields = ["start_at", "end_at", "status", "created_at"]
     ordering = ["-start_at"]
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        user = self.request.user
+        if user and user.is_authenticated:
+            role = str(getattr(user, "role", "") or "").strip().lower()
+            company = self._user_company()
+            is_owner_or_admin = (
+                role in ("admin", "owner")
+                or user.is_superuser
+                or (company and getattr(company, "owner_id", None) == user.id)
+                or getattr(user, "is_owner_or_admin", False)
+            )
+            status_filter = self.request.query_params.get("status")
+            if not is_owner_or_admin and status_filter != "deleted":
+                qs = qs.exclude(status=Appointment.Status.DELETED)
+
+        qp = self.request.query_params
+        date_param = qp.get("date")
+        if date_param:
+            try:
+                d = datetime.strptime(date_param.strip(), "%Y-%m-%d").date()
+                qs = qs.filter(start_at__date=d)
+            except (ValueError, TypeError):
+                pass
+
+        date_from = qp.get("date_from") or qp.get("start_date")
+        if date_from:
+            try:
+                df = datetime.strptime(date_from.strip(), "%Y-%m-%d").date()
+                qs = qs.filter(start_at__date__gte=df)
+            except (ValueError, TypeError):
+                pass
+
+        date_to = qp.get("date_to") or qp.get("end_date")
+        if date_to:
+            try:
+                dt = datetime.strptime(date_to.strip(), "%Y-%m-%d").date()
+                qs = qs.filter(start_at__date__lte=dt)
+            except (ValueError, TypeError):
+                pass
+
+        return qs
 
     def create(self, request, *args, **kwargs):
         """После создания перезагружаем запись с prefetch appointment_services, чтобы в ответе были services и services_names."""
@@ -609,7 +912,7 @@ class AppointmentRetrieveUpdateDestroyView(
 ):
     queryset = (
         Appointment.objects
-        .select_related("client", "barber")
+        .select_related("client", "barber", "company", "branch")
         .prefetch_related(
             Prefetch(
                 "appointment_services",
@@ -621,13 +924,78 @@ class AppointmentRetrieveUpdateDestroyView(
     serializer_class = AppointmentSerializer
     permission_classes = [permissions.IsAuthenticated]
 
+    def get_queryset(self):
+        qs = super().get_queryset()
+        user = self.request.user
+        if user and user.is_authenticated:
+            role = str(getattr(user, "role", "") or "").strip().lower()
+            company = self._user_company()
+            is_owner_or_admin = (
+                role in ("admin", "owner")
+                or user.is_superuser
+                or (company and getattr(company, "owner_id", None) == user.id)
+                or getattr(user, "is_owner_or_admin", False)
+            )
+            if not is_owner_or_admin:
+                qs = qs.exclude(status=Appointment.Status.DELETED)
+        return qs
+
     def update(self, request, *args, **kwargs):
         """После PATCH перезагружаем запись с prefetch appointment_services для полного ответа."""
-        response = super().update(request, *args, **kwargs)
+        partial = kwargs.pop("partial", False)
         instance = self.get_object()
+        new_status = request.data.get("status")
+
+        user = request.user
+        role = str(getattr(user, "role", "") or "").strip().lower()
+        company = self._user_company()
+        is_owner_or_admin = (
+            role in ("admin", "owner")
+            or user.is_superuser
+            or (company and getattr(company, "owner_id", None) == user.id)
+            or getattr(user, "is_owner_or_admin", False)
+        )
+
+        # 1. Проверка прав на установку status=deleted (§4.2)
+        if new_status == Appointment.Status.DELETED and not is_owner_or_admin:
+            raise PermissionDenied("У вас нет прав на удаление записей.")
+
+        # 2. Проверка начислений зарплаты при удалении (§5.2)
+        if new_status == Appointment.Status.DELETED:
+            from .models import MasterSalaryAccrual
+            has_paid_accruals = MasterSalaryAccrual.objects.filter(
+                appointment=instance,
+                status=MasterSalaryAccrual.Status.PAID
+            ).exists()
+            if has_paid_accruals:
+                return Response(
+                    {"detail": "Нельзя удалить запись с выплаченным начислением. Измените статус вручную."},
+                    status=status.HTTP_409_CONFLICT
+                )
+
+        serializer = self.get_serializer(instance, data=request.data, partial=partial)
+        serializer.is_valid(raise_exception=True)
+        self.perform_update(serializer)
+
+        updated_instance = serializer.instance
+        qs = self.get_queryset().filter(pk=updated_instance.pk)
+        instance = qs.first() or updated_instance
         output_serializer = AppointmentSerializer(instance, context=self.get_serializer_context())
-        response.data = output_serializer.data
-        return response
+        return Response(output_serializer.data, status=status.HTTP_200_OK)
+
+    def destroy(self, request, *args, **kwargs):
+        user = request.user
+        role = str(getattr(user, "role", "") or "").strip().lower()
+        company = self._user_company()
+        is_owner_or_admin = (
+            role in ("admin", "owner")
+            or user.is_superuser
+            or (company and getattr(company, "owner_id", None) == user.id)
+            or getattr(user, "is_owner_or_admin", False)
+        )
+        if not is_owner_or_admin:
+            raise PermissionDenied("Физическое удаление записей запрещено. Используйте мягкое удаление (status=deleted).")
+        return super().destroy(request, *args, **kwargs)
 
 
 class MyAppointmentListView(CompanyQuerysetMixin, generics.ListAPIView):
@@ -637,7 +1005,7 @@ class MyAppointmentListView(CompanyQuerysetMixin, generics.ListAPIView):
 
     queryset = (
         Appointment.objects
-        .select_related("client", "barber")
+        .select_related("client", "barber", "company", "branch")
         .prefetch_related(
             Prefetch(
                 "appointment_services",
@@ -662,7 +1030,7 @@ class MyAppointmentListView(CompanyQuerysetMixin, generics.ListAPIView):
     def get_queryset(self):
         qs = super().get_queryset()
         user = getattr(self.request, "user", None)
-        return qs.filter(barber=user)
+        return qs.filter(barber=user).exclude(status=Appointment.Status.DELETED)
 
 
 class MyAppointmentDetailView(CompanyQuerysetMixin, generics.RetrieveAPIView):
@@ -672,7 +1040,7 @@ class MyAppointmentDetailView(CompanyQuerysetMixin, generics.RetrieveAPIView):
 
     queryset = (
         Appointment.objects
-        .select_related("client", "barber")
+        .select_related("client", "barber", "company", "branch")
         .prefetch_related(
             Prefetch(
                 "appointment_services",
@@ -687,7 +1055,7 @@ class MyAppointmentDetailView(CompanyQuerysetMixin, generics.RetrieveAPIView):
     def get_queryset(self):
         qs = super().get_queryset()
         user = getattr(self.request, "user", None)
-        return qs.filter(barber=user)
+        return qs.filter(barber=user).exclude(status=Appointment.Status.DELETED)
 
 
 # ==== Folder ====

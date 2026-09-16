@@ -77,8 +77,9 @@ def _parse_bool(raw) -> bool | None:
 
 def _parse_kind_list(query_params) -> list[str]:
     raw: list[str] = []
-    raw.extend(query_params.getlist("kind"))
-    raw.extend(query_params.getlist("kind[]"))
+    if hasattr(query_params, "getlist"):
+        raw.extend(query_params.getlist("kind"))
+        raw.extend(query_params.getlist("kind[]"))
     single = (query_params.get("kind") or "").strip()
     if single:
         if "," in single:
@@ -220,7 +221,19 @@ def apply_product_list_filters(qs, query_params):
     shelf_cond = (query_params.get("shelf_life_condition") or "").strip().lower()
     shelf_days = _parse_int(query_params.get("shelf_life_value"))
     today = timezone.localdate()
-    if shelf_cond == "expires_within" and shelf_days is not None and shelf_days >= 0:
+    expiring_only = _parse_bool(query_params.get("expiring_only"))
+    expired_only = _parse_bool(query_params.get("expired_only"))
+
+    if expired_only:
+        qs = qs.filter(expiration_date__isnull=False, expiration_date__lt=today)
+    elif expiring_only:
+        qs = qs.filter(
+            expiration_date__isnull=False,
+            expiration_date__lte=today + timedelta(days=14),
+        )
+        if _parse_bool(query_params.get("exclude_expired")):
+            qs = qs.filter(expiration_date__gte=today)
+    elif shelf_cond == "expires_within" and shelf_days is not None and shelf_days >= 0:
         end = today + timedelta(days=shelf_days)
         qs = qs.filter(
             expiration_date__isnull=False,

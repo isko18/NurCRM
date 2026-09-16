@@ -1,21 +1,41 @@
 # apps/construction/serializers/sale_history.py
+from decimal import Decimal
+
 from rest_framework import serializers
 
 from apps.main.models import Sale, SaleItem
 
 
 class SaleItemHistorySerializer(serializers.ModelSerializer):
+    product_name = serializers.SerializerMethodField()
+    qty = serializers.DecimalField(source="quantity", max_digits=12, decimal_places=3, read_only=True)
+    price = serializers.DecimalField(source="unit_price", max_digits=12, decimal_places=2, read_only=True)
+    line_total = serializers.SerializerMethodField()
+
     class Meta:
         model = SaleItem
         fields = [
             "id",
             "product",
+            "product_name",
             "name_snapshot",
             "barcode_snapshot",
             "unit_price",
             "quantity",
+            "qty",
+            "price",
+            "line_total",
         ]
         read_only_fields = fields
+
+    def get_product_name(self, obj):
+        return getattr(getattr(obj, "product", None), "name", None) or obj.name_snapshot
+
+    def get_line_total(self, obj):
+        quantity = obj.quantity or Decimal("0")
+        price = obj.unit_price or Decimal("0")
+        discount = getattr(obj, "line_discount", None) or Decimal("0")
+        return (price * quantity - discount).quantize(Decimal("0.01"))
 
 
 class SaleHistorySerializer(serializers.ModelSerializer):

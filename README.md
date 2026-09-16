@@ -21,7 +21,15 @@
       python manage.py makemigrations
       python manage.py migrate
       ```
-   5. **Запуск**
-      ```python
-      python manage.py runserver
-      ```
+    5. **Запуск**
+       ```python2
+       python manage.py runserver
+       ```
+
+## Документация
+
+- [Документация по работе с весами (Rongta, CAS, PLU, POS)](docs/SCALES_DOCUMENTATION_RU.md)
+- [Настройки разбора весовых штрихкодов](docs/scale_barcode_settings_frontend.md)
+- [Экспорт весовых товаров под весы Rongta](docs/scale_export_frontend_api.md)
+- [Документация кассы (POS)](apps/main/README_MARKET_POS.md)
+

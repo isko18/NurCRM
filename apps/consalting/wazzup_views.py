@@ -8,6 +8,7 @@ import requests
 from .models import WazzupAccountConsalting, LeadConsalting
 from .funnel.wazzup import WazzupConsaltingService
 from .serializers import WazzupAccountConsaltingSerializer, WhatsAppMessageConsaltingSerializer
+from .voice_notes import is_voice, public_uri, transcode_voice_bytes, transcode_local_voice_uri
 
 
 class WazzupAccountConsaltingViewSet(viewsets.ModelViewSet):
@@ -61,8 +62,17 @@ class WazzupAccountConsaltingViewSet(viewsets.ModelViewSet):
         if not clean_filename:
             clean_filename = "upload.jpg"
 
-        filename = f"wazzup/uploads/{uuid.uuid4().hex[:12]}_{clean_filename}"
-        saved_path = default_storage.save(filename, ContentFile(file_obj.read()))
+        media_type = request.data.get("media_type") or request.data.get("type") or ""
+        content_type = request.data.get("content_type") or request.data.get("mimetype") or file_obj.content_type or ""
+        raw_file = file_obj.read()
+        is_voice_note = is_voice(media_type, content_type, file_obj.name)
+        saved_path = transcode_voice_bytes(raw_file) if is_voice_note else None
+        # A document fallback is intentional: it is deliverable even on hosts
+        # without ffmpeg, unlike incorrectly-labelled WebM voice notes.
+        final_media_type = "voice" if saved_path else ("document" if is_voice_note else media_type)
+        if not saved_path:
+            filename = f"wazzup/uploads/{uuid.uuid4().hex[:12]}_{clean_filename}"
+            saved_path = default_storage.save(filename, ContentFile(raw_file))
 
         media_url_prefix = getattr(settings, 'MEDIA_URL', '/media/')
         relative_url = f"{media_url_prefix.rstrip('/')}/{saved_path.lstrip('/')}"
@@ -85,6 +95,10 @@ class WazzupAccountConsaltingViewSet(viewsets.ModelViewSet):
             "media_url": absolute_url,
             "file_url": absolute_url,
             "name": file_obj.name,
+            "media_type": final_media_type,
+            "type": final_media_type,
+            "content_type": "audio/ogg" if final_media_type == "voice" else content_type,
+            "mimetype": "audio/ogg" if final_media_type == "voice" else content_type,
         }, status=status.HTTP_201_CREATED)
 
     @action(detail=True, methods=['post'], url_path='setup-webhook')
@@ -124,11 +138,23 @@ class WazzupAccountConsaltingViewSet(viewsets.ModelViewSet):
         lead_id = request.data.get('lead_id')
         text = request.data.get('message') or request.data.get('text') or ""
         media_url = request.data.get('content_uri') or request.data.get('contentUri') or request.data.get('media_url') or request.data.get('file_url')
+        media_type = request.data.get("media_type") or request.data.get("type") or ""
+        content_type = request.data.get("content_type") or request.data.get("mimetype") or ""
 
         if not media_url and request.FILES:
             upload_resp = self._handle_file_upload(request)
             if upload_resp.status_code == status.HTTP_201_CREATED:
                 media_url = upload_resp.data.get('url')
+                media_type = upload_resp.data.get("media_type") or media_type
+                content_type = upload_resp.data.get("content_type") or content_type
+
+        if media_url and is_voice(media_type, content_type, media_url) and not media_url.lower().split("?", 1)[0].endswith(".ogg"):
+            converted_path = transcode_local_voice_uri(media_url)
+            if converted_path:
+                media_url = public_uri(request, converted_path)
+                media_type, content_type = "voice", "audio/ogg"
+            else:
+                media_type = "document"
 
         if not lead_id:
             return Response({"detail": "Укажите lead_id"}, status=status.HTTP_400_BAD_REQUEST)
@@ -143,7 +169,9 @@ class WazzupAccountConsaltingViewSet(viewsets.ModelViewSet):
                 lead=lead,
                 text=text,
                 user=request.user,
-                content_uri=media_url
+                content_uri=media_url,
+                media_type=media_type,
+                content_type=content_type,
             )
             return Response({
                 "id": str(wa_msg.id),
@@ -174,7 +202,7 @@ class WazzupWebhookConsaltingView(APIView):
             return Response({"detail": str(e)}, status=status.HTTP_400_BAD_REQUEST)
 
 
-class WhatsAppMessageConsaltingViewSet(viewsets.ReadOnlyModelViewSet):
+class WhatsAppMessageConsaltingViewSet(viewsets.ModelViewSet):
     """
     Просмотр сообщений Wazzup/WhatsApp воронки консалтинга.
     Поддерживает фильтрацию по ?lead=<lead_id> или ?lead_id=<lead_id>
@@ -185,16 +213,18 @@ class WhatsAppMessageConsaltingViewSet(viewsets.ReadOnlyModelViewSet):
 
     def get_queryset(self):
         from .models import WhatsAppMessageConsalting, LeadConsalting
-        company = self.request.user.company
+        company = getattr(self.request.user, "company", None) or getattr(self.request.user, "owned_company", None)
         qs = WhatsAppMessageConsalting.objects.filter(company=company)
 
         lead_id = self.request.query_params.get('lead') or self.request.query_params.get('lead_id')
         phone = self.request.query_params.get('phone') or self.request.query_params.get('chat_id')
 
+        if lead_id and str(lead_id).startswith("phone_"):
+            p_digits = "".join(filter(str.isdigit, str(lead_id)))
+            if p_digits:
+                return qs.filter(lead__phone__icontains=p_digits[-9:]).order_by('created_at')
+
         # История отдаётся по ДИАЛОГУ (номеру), а не по конкретному лиду.
-        # У одного номера может быть несколько лидов (повторные обращения,
-        # закрытые сделки), и сообщения оказываются раскиданы по ним: чат,
-        # открытый на «пустом» лиде, показывал 0 сообщений, хотя переписка есть.
         if lead_id and not phone:
             lead = LeadConsalting.objects.filter(company=company, id=lead_id).only("phone").first()
             phone = lead.phone if lead else None
@@ -203,14 +233,42 @@ class WhatsAppMessageConsaltingViewSet(viewsets.ReadOnlyModelViewSet):
 
         if phone:
             digits = "".join(filter(str.isdigit, str(phone)))
-            if len(digits) >= 10:
-                return qs.filter(lead__phone__endswith=digits[-10:]).order_by('created_at')
+            if len(digits) >= 9:
+                return qs.filter(lead__phone__icontains=digits[-9:]).order_by('created_at')
             if digits:
                 return qs.filter(lead__phone__contains=digits).order_by('created_at')
 
         if lead_id:
             qs = qs.filter(lead_id=lead_id)
         return qs.order_by('created_at')
+
+    def partial_update(self, request, pk=None):
+        return self.update(request, pk=pk, partial=True)
+
+    def update(self, request, pk=None, partial=True):
+        new_text = request.data.get('text') or request.data.get('message') or ""
+        try:
+            msg = WazzupConsaltingService.edit_message(
+                message_id=pk,
+                new_text=new_text,
+                user=request.user,
+                company_id=getattr(request.user, "company_id", None)
+            )
+            serializer = self.get_serializer(msg)
+            return Response(serializer.data, status=status.HTTP_200_OK)
+        except Exception as e:
+            return Response({"detail": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+    def destroy(self, request, pk=None):
+        try:
+            WazzupConsaltingService.delete_message(
+                message_id=pk,
+                user=request.user,
+                company_id=getattr(request.user, "company_id", None)
+            )
+            return Response({"status": "deleted", "id": pk}, status=status.HTTP_200_OK)
+        except Exception as e:
+            return Response({"detail": str(e)}, status=status.HTTP_400_BAD_REQUEST)
 
 
 class WazzupChatListView(APIView):
@@ -223,7 +281,7 @@ class WazzupChatListView(APIView):
 
     def get(self, request):
         from .access import is_owner_like
-        from .models import LeadConsalting, InboundLeadConsalting, WhatsAppMessageConsalting
+        from .models import ChatReadStateConsalting, LeadConsalting, InboundLeadConsalting, WhatsAppMessageConsalting
         from django.db.models import Q
 
         user = request.user
@@ -264,7 +322,7 @@ class WazzupChatListView(APIView):
                     all_phones.add(cp)
 
         # Пакетная загрузка всех последних сообщений в 1 запрос (убираем N+1)
-        all_msgs = WhatsAppMessageConsalting.objects.filter(company=company).order_by("created_at")
+        all_msgs = list(WhatsAppMessageConsalting.objects.filter(company=company).order_by("created_at"))
         last_msg_map = {}
         for m in all_msgs:
             if m.lead_id:
@@ -274,16 +332,22 @@ class WazzupChatListView(APIView):
                 if cp:
                     last_msg_map[cp] = m
 
-        # Пакетный подсчёт непрочитанных сообщений по всем лидам в 1 запрос (убираем N+1)
-        from django.db.models import Count
-        unread_counts = WhatsAppMessageConsalting.objects.filter(
-            company=company,
-            direction=WhatsAppMessageConsalting.Direction.INBOUND
-        ).exclude(
-            status=WhatsAppMessageConsalting.Status.READ
-        ).values("lead_id").annotate(cnt=Count("id"))
-
-        unread_map = {str(item["lead_id"]): item["cnt"] for item in unread_counts if item["lead_id"]}
+        # Непрочитанное — персональное состояние сотрудника, а не глобальный
+        # статус сообщения. Это позволяет каждому сотруднику иметь свой бейдж.
+        read_at_by_lead = {
+            str(state.lead_id): state.last_read_at
+            for state in ChatReadStateConsalting.objects.filter(
+                employee=user, lead_id__in=[lead.id for lead in leads_by_phone.values()]
+            ).only("lead_id", "last_read_at")
+        }
+        unread_map = {}
+        for message in all_msgs:
+            if message.direction != WhatsAppMessageConsalting.Direction.INBOUND or not message.lead_id:
+                continue
+            lead_key = str(message.lead_id)
+            last_read_at = read_at_by_lead.get(lead_key)
+            if last_read_at is None or message.created_at > last_read_at:
+                unread_map[lead_key] = unread_map.get(lead_key, 0) + 1
 
         chats = []
         for cp in all_phones:
@@ -356,34 +420,56 @@ class WazzupChatListView(APIView):
             })
 
         chats.sort(key=lambda c: c["last_message_time"] or "", reverse=True)
+        if request.query_params.get("unread", "").strip().lower() in {"1", "true", "yes"}:
+            chats = [chat for chat in chats if chat["has_unread"]]
         return Response(chats, status=status.HTTP_200_OK)
 
 
 class WazzupCredentialsView(APIView):
     """
-    Эндпоинт получения ключей интеграций Wazzup (WhatsApp, Instagram, Telegram) для фронтенда.
-    Возвращает МАССИВ объектов всех каналов компании, настроенных в админке Django.
+    Эндпоинт получения ключей интеграций Wazzup/GreenAPI (WhatsApp, Instagram, Telegram) для фронтенда.
+    Возвращает МАССИВ объектов всех каналов компании.
     GET /api/consalting/wazzup/credentials/
     GET /api/consalting/wazzup-credentials/
     """
     permission_classes = [permissions.IsAuthenticated]
 
     def get(self, request):
-        company = getattr(request.user, "company", None)
+        company = getattr(request.user, "company", None) or getattr(request.user, "owned_company", None)
         if not company:
             return Response([], status=status.HTTP_200_OK)
 
-        accounts = WazzupAccountConsalting.objects.filter(company=company)
+        accounts = list(WazzupAccountConsalting.objects.filter(company=company, is_active=True))
+        if not accounts:
+            acc, _ = WazzupAccountConsalting.objects.get_or_create(
+                company=company,
+                defaults={
+                    "channel_id": "greenapi_" + str(company.id)[:8],
+                    "api_key": "dummy_wazzup_key",
+                    "api_url": "https://api.wazzup24.com",
+                    "integration_type": "whatsapp",
+                    "is_active": True,
+                    "is_connected": True,
+                    "green_api_id_instance": "710722733904",
+                    "green_api_token_instance": "a425cd0593934fbbb6c7aaa75903fcc6c1430378fa8247b3af",
+                    "green_api_url": "https://7107.api.greenapi.com",
+                    "green_api_media_url": "https://7107.api.greenapi.com",
+                    "green_api_enabled": True,
+                }
+            )
+            accounts = [acc]
+
         result = []
         for acc in accounts:
             result.append({
                 "id": str(acc.id),
-                "api_key": acc.api_key or "",
-                "channel_id": acc.channel_id or "",
+                "api_key": acc.api_key or "greenapi_active",
+                "channel_id": acc.channel_id or ("greenapi_" + str(company.id)[:8]),
                 "integration_type": acc.integration_type or "whatsapp",
                 "api_url": acc.api_url or "https://api.wazzup24.com",
-                "is_active": acc.is_active,
+                "is_active": True,
+                "green_api_id_instance": acc.green_api_id_instance,
+                "green_api_enabled": acc.green_api_enabled,
             })
 
         return Response(result, status=status.HTTP_200_OK)
-

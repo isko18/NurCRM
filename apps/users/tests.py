@@ -45,6 +45,13 @@ class PlatformAdminAccessTests(APITestCase):
         self.assertFalse(self.user.is_platform_admin)
         self.assertFalse(response.data["is_platform_admin"])
 
+    def test_profile_includes_can_view_leads_inbox(self):
+        self.client.force_authenticate(self.user)
+        response = self.client.get("/users/profile/")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertIn("can_view_leads_inbox", response.data)
+        self.assertFalse(response.data["can_view_leads_inbox"])
+
     def test_platform_admin_meta_requires_platform_admin_flag(self):
         response = self.client.get("/platform-admin/meta/")
         self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)

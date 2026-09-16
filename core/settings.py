@@ -13,6 +13,7 @@ https://docs.djangoproject.com/en/5.2/ref/settings/
 from pathlib import Path
 from datetime import timedelta
 import os
+import sys
 from typing import List
 
 from dotenv import load_dotenv
@@ -49,21 +50,33 @@ def _get_list_env(name: str, default: List[str]) -> List[str]:
 
 
 DEBUG = _get_bool_env("DJANGO_DEBUG", False)
-DEV_ALLOWED_HOSTS = ["127.0.0.1", "localhost"]
+DEV_ALLOWED_HOSTS = ["*"]
 DEV_CORS_ORIGINS = [
+    "https://nurcrm.kg",
+    "https://www.nurcrm.kg",
+    "https://app.nurcrm.kg",
+    "https://www.app.nurcrm.kg",
+    "https://stage.nurcrm.kg",
+    "https://stageapp.nurcrm.kg",
+    "https://stroy.nurcrm.kg",
+    "https://www.stroy.nurcrm.kg",
+    "https://stroyapp.nurcrm.kg",
+    "https://buildos.kg",
+    "https://www.buildos.kg",
+    "https://beshtashta.kg",
+    "https://www.beshtashta.kg",
+    "https://nur-tech.kg",
+    "https://www.nur-tech.kg",
+    "https://app.nur-tech.kg",
+    "https://onec.nurcrm.kg",
     "http://localhost:3000",
     "http://localhost:5173",
+    "http://localhost:5174",
     "http://127.0.0.1:8000",
+    "http://127.0.0.1:5173",
 ]
-DEFAULT_ALLOWED_HOSTS = DEV_ALLOWED_HOSTS if DEBUG else ["nurcrm.kg", "app.nurcrm.kg"]
-DEFAULT_CORS_ORIGINS = (
-    DEV_CORS_ORIGINS
-    if DEBUG
-    else [
-        "https://nurcrm.kg",
-        "https://app.nurcrm.kg",
-    ]
-)
+DEFAULT_ALLOWED_HOSTS = ["*"]
+DEFAULT_CORS_ORIGINS = DEV_CORS_ORIGINS
 
 
 # Quick-start development settings - unsuitable for production
@@ -116,8 +129,8 @@ INSTALLED_APPS = [
 ]
 
 MIDDLEWARE = [
-    'django.middleware.security.SecurityMiddleware',
     'corsheaders.middleware.CorsMiddleware',
+    'django.middleware.security.SecurityMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
     'django.middleware.common.CommonMiddleware',
     'django.middleware.csrf.CsrfViewMiddleware',
@@ -351,6 +364,11 @@ CELERY_BEAT_SCHEDULE = {
         'task': 'apps.construction.tasks.auto_close_stale_shifts',
         'schedule': crontab(minute=0),
     },
+    # Ежедневный дайджест товаров с истекающим/истёкшим сроком годности (08:00 Asia/Bishkek).
+    'main-product-expiry-digest': {
+        'task': 'apps.main.tasks.product_expiry_digest',
+        'schedule': crontab(hour=8, minute=0),
+    },
 }
 
 # ===========================
@@ -390,10 +408,19 @@ CACHE_TIMEOUT_LONG = 3600  # 1 час - для статических данны
 CACHE_TIMEOUT_ANALYTICS = 600  # 10 минут - для аналитики агентов
 
 
-CORS_ORIGIN_ALLOW_ALL = _get_bool_env('CORS_ALLOW_ALL', False)
+CORS_ALLOW_ALL_ORIGINS = True
+CORS_ORIGIN_ALLOW_ALL = True
 CORS_ALLOW_CREDENTIALS = _get_bool_env('CORS_ALLOW_CREDENTIALS', True)
 
 CORS_ALLOWED_ORIGINS = _get_list_env('CORS_ALLOWED_ORIGINS', DEFAULT_CORS_ORIGINS)
+CORS_ALLOWED_ORIGIN_REGEXES = [
+    r"^https://.*\.nurcrm\.kg$",
+    r"^https://.*\.buildos\.kg$",
+    r"^https://.*\.beshtashta\.kg$",
+    r"^https://.*\.nur-tech\.kg$",
+    r"^http://localhost:\d+$",
+    r"^http://127\.0\.0\.1:\d+$",
+]
 
 SESSION_COOKIE_SAMESITE = os.getenv('SESSION_COOKIE_SAMESITE', 'Lax' if DEBUG else 'None')
 SESSION_COOKIE_SECURE = _get_bool_env('SESSION_COOKIE_SECURE', not DEBUG)
@@ -404,7 +431,7 @@ CSRF_COOKIE_SECURE = _get_bool_env('CSRF_COOKIE_SECURE', not DEBUG)
 CORS_ALLOW_HEADERS = (
     'content-disposition', 'accept-encoding',
     'content-type', 'accept', 'origin', 'Authorization', 'access-control-allow-methods',
-    'Access-Control-Allow-Origin'
+    'Access-Control-Allow-Origin', 'x-csrftoken', 'x-requested-with',
 )
 
 CORS_ALLOW_METHODS = (
@@ -416,7 +443,7 @@ CORS_ALLOW_METHODS = (
     "PUT",
 )
 SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
-SECURE_SSL_REDIRECT = _get_bool_env('SECURE_SSL_REDIRECT', not DEBUG)
+SECURE_SSL_REDIRECT = False if 'test' in sys.argv else _get_bool_env('SECURE_SSL_REDIRECT', not DEBUG)
 SECURE_HSTS_SECONDS = _get_int_env('SECURE_HSTS_SECONDS', 0 if DEBUG else 31536000)
 SECURE_HSTS_INCLUDE_SUBDOMAINS = _get_bool_env('SECURE_HSTS_INCLUDE_SUBDOMAINS', not DEBUG)
 SECURE_HSTS_PRELOAD = _get_bool_env('SECURE_HSTS_PRELOAD', not DEBUG)
@@ -515,3 +542,7 @@ EKASSA_ALLOW_TEST_RECEIPT = _get_bool_env("EKASSA_ALLOW_TEST_RECEIPT", DEBUG)
 WAZZUP_API_URL = os.getenv("WAZZUP_API_URL", "https://api.wazzup24.com")
 WAZZUP_DEFAULT_API_KEY = os.getenv("WAZZUP_DEFAULT_API_KEY", "")
 WAZZUP_DEFAULT_CHANNEL_ID = os.getenv("WAZZUP_DEFAULT_CHANNEL_ID", "")
+
+# Consulting CRM tenant provision default sector (Sector 'Магазин' / 'Маркет')
+CONSULTING_DEFAULT_CRM_SECTOR_ID = os.getenv("CONSULTING_DEFAULT_CRM_SECTOR_ID", "e9f05beb-5e14-4153-b523-4e1600c9b2e0")
+

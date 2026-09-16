@@ -1883,6 +1883,9 @@ class AnalyticsView(APIView):
         stock_value = Z_MONEY
         low_stock_count = 0
         low_stock_products = []  # НОВОЕ: полный список товаров с низким остатком
+        expiring_products = []
+        expiring_products_count = 0
+        expired_products_count = 0
         sales_without_product = []
         sales_without_product_line_count = 0
         rejected_catalog_products = []
@@ -2147,6 +2150,49 @@ class AnalyticsView(APIView):
                     for p in low_stock_qs
                 ]
 
+            if _model_has_field(Product, "expiration_date"):
+                today = timezone.localdate()
+                max_date = today + timedelta(days=14)
+                exp_candidates = list(
+                    pqs.filter(expiration_date__isnull=False, expiration_date__lte=max_date)
+                    .select_related("category", "brand")
+                )
+                expiring_items = []
+                for p in exp_candidates:
+                    days_left = (p.expiration_date - today).days
+                    if days_left < 0:
+                        st = "expired"
+                        expired_products_count += 1
+                    elif 0 <= days_left <= 3:
+                        st = "critical"
+                        expiring_products_count += 1
+                    elif 3 < days_left <= 14:
+                        st = "warning"
+                        expiring_products_count += 1
+                    else:
+                        continue
+
+                    raw_qty = getattr(p, qty_field, 0) if qty_field else 0
+                    try:
+                        q_dec = Decimal(str(raw_qty or 0))
+                        qty_val = int(q_dec) if q_dec % 1 == 0 else float(q_dec)
+                    except Exception:
+                        qty_val = 0
+
+                    expiring_items.append({
+                        "id": str(p.id),
+                        "code": getattr(p, "code", None),
+                        "name": p.name,
+                        "quantity": qty_val,
+                        "expiration_date": p.expiration_date.isoformat(),
+                        "days_left": days_left,
+                        "status": st,
+                    })
+
+                expiring_items.sort(key=lambda item: (0 if item["status"] == "expired" else 1, item["days_left"]))
+                exp_limit = limit if limit is not None else 100
+                expiring_products = expiring_items[:exp_limit]
+
         catalog_products_count = 0
         pqs_scope = self._market_products_queryset(request, company, branch)
         if pqs_scope is not None and supplier_ids is not None and _model_has_field(pqs_scope.model, "client"):
@@ -2200,6 +2246,8 @@ class AnalyticsView(APIView):
                 "catalog_products_count": catalog_products_count,
                 "sales_lines_missing_product_count": sales_without_product_line_count,
                 "rejected_products_count": rejected_products_count,
+                "expiring_products_count": expiring_products_count,
+                "expired_products_count": expired_products_count,
             },
             "tables": {
                 "top_by_revenue": top_products_by_revenue,
@@ -2209,6 +2257,7 @@ class AnalyticsView(APIView):
                 "low_stock_products": low_stock_products,  # НОВОЕ: полный список с деталями
                 "sales_without_catalog_product": sales_without_product,
                 "rejected_products": rejected_catalog_products,
+                "expiring_products": expiring_products,
             },
         }
 

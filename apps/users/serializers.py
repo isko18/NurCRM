@@ -197,6 +197,7 @@ class CustomTokenObtainPairSerializer(TokenObtainPairSerializer):
             "company": user.company.name if user.company else None,
             "role": user.role_display,
             "is_platform_admin": bool(getattr(user, "is_platform_admin", False)),
+            "can_manage_lead_ad_spend": bool(getattr(user, "can_manage_lead_ad_spend", False)),
             "branch_ids": branch_ids,
             "primary_branch_id": primary_branch_id,
         })
@@ -254,13 +255,58 @@ class BranchCreateUpdateSerializer(serializers.ModelSerializer):
 # User (current user)
 # ======================
 
+def _get_user_consulting_regions(user):
+    codes = user.get_consulting_region_codes() if hasattr(user, "get_consulting_region_codes") else []
+    if not codes:
+        return []
+    try:
+        from apps.consalting.models import RegionalFunnelRuleConsalting, REGION_LABELS
+        company = getattr(user, "company", None) or getattr(user, "owned_company", None)
+        if not company:
+            return [{"code": c, "label": REGION_LABELS.get(c, c), "funnel_id": None} for c in codes]
+        rules = RegionalFunnelRuleConsalting.objects.filter(
+            routing__company=company,
+            region_code__in=codes,
+            is_active=True,
+        ).select_related("funnel")
+        rule_map = {r.region_code: r for r in rules}
+        result = []
+        for code in codes:
+            r = rule_map.get(code)
+            label = (r.label if r and r.label else REGION_LABELS.get(code, code)) if r else REGION_LABELS.get(code, code)
+            funnel_id = str(r.funnel_id) if (r and r.funnel_id) else None
+            result.append({
+                "code": code,
+                "label": label,
+                "funnel_id": funnel_id,
+            })
+        return result
+    except Exception:
+        return []
+
+
 class UserSerializer(serializers.ModelSerializer):
+    can_view_showcase = serializers.SerializerMethodField()
+
+    def get_can_view_showcase(self, obj):
+        if getattr(obj, "company", None):
+            return bool(getattr(obj.company, "can_view_showcase", False))
+        return False
+
     password = serializers.CharField(write_only=True, required=False, min_length=8, style={"input_type": "password"})
     role_display = serializers.CharField(read_only=True)
 
     branch_ids = serializers.SerializerMethodField()
     primary_branch_id = serializers.SerializerMethodField()
     funnel_grants = serializers.SerializerMethodField()
+    consulting_region_codes = serializers.SerializerMethodField()
+    consulting_regions = serializers.SerializerMethodField()
+
+    def get_consulting_region_codes(self, obj):
+        return obj.get_consulting_region_codes()
+
+    def get_consulting_regions(self, obj):
+        return _get_user_consulting_regions(obj)
 
     def get_funnel_grants(self, obj):
         try:
@@ -297,6 +343,7 @@ class UserSerializer(serializers.ModelSerializer):
             "id", "email", "password",
             "first_name", "last_name", "track_number", "phone_number", "avatar",
             "company", "role", "custom_role", "role_display", "is_platform_admin",
+            "consulting_region_codes", "consulting_regions",
 
             "can_view_dashboard", "can_view_cashbox", "can_view_departments",
             "can_view_orders", "can_view_analytics", "can_view_department_analytics",
@@ -329,7 +376,7 @@ class UserSerializer(serializers.ModelSerializer):
             "can_view_school_lessons", "can_view_school_teachers",
             "can_view_school_leads", "can_view_school_invoices",
 
-            "can_view_client_requests", "can_view_salary",
+            "can_view_showcase", "can_view_client_requests", "can_view_salary",
             "can_view_sales", "can_view_services",
             "can_view_agent", "can_view_catalog",
             "can_view_branch", "can_view_logistics", "can_view_request", "can_view_shifts",
@@ -338,7 +385,7 @@ class UserSerializer(serializers.ModelSerializer):
             "can_view_market_procurement", "can_view_market_supplier", "can_view_market_employee_return",
 
             # Consulting: воронка продаж
-            "can_view_funnel", "can_manage_funnel_leads", "can_manage_funnel_stages", "funnel_grants",
+            "can_view_funnel", "can_manage_funnel_leads", "can_manage_funnel_stages", "can_create_funnel", "can_manage_lead_ad_spend", "can_view_leads_inbox", "funnel_grants",
 
             "branch_ids", "primary_branch_id",
             "created_at", "updated_at",
@@ -504,15 +551,23 @@ class EmployeeCreateSerializer(serializers.ModelSerializer):
         write_only=True,
         help_text="Список UUID филиалов, к которым нужно прикрепить сотрудника",
     )
+    region_code = serializers.CharField(required=False, allow_blank=True, write_only=True)
+    consulting_region_codes = serializers.ListField(
+        child=serializers.CharField(),
+        required=False,
+        write_only=True,
+    )
 
     class Meta:
         model = User
         fields = [
             "email", "first_name", "last_name", "track_number", "phone_number", "avatar",
             "role", "custom_role", "role_display",
+            "region_code", "consulting_region_codes",
 
             # все can_view_* которые ты раньше использовал
             *[f.name for f in User._meta.fields if f.name.startswith("can_view_")],
+            "can_manage_funnel_leads", "can_manage_funnel_stages", "can_create_funnel", "can_manage_lead_ad_spend",
 
             "primary_branch", "branches",
         ]
@@ -527,12 +582,12 @@ class EmployeeCreateSerializer(serializers.ModelSerializer):
         request = self.context["request"]
         current_user = request.user
 
-        if getattr(current_user, "role", None) == "manager":
+        if getattr(current_user, "role", None) in ("manager", "salesperson"):
             raise serializers.ValidationError("У вас нет прав для создания сотрудников.")
 
-        company = getattr(current_user, "owned_company", None)
+        company = getattr(current_user, "owned_company", None) or getattr(current_user, "company", None)
         if not company:
-            raise serializers.ValidationError("Только владелец может создавать сотрудников.")
+            raise serializers.ValidationError("Компания не определена.")
 
         primary_branch_id = data.get("primary_branch")
         branch_ids = list(data.get("branches") or [])
@@ -542,25 +597,61 @@ class EmployeeCreateSerializer(serializers.ModelSerializer):
             branch_ids = [primary_branch_id] + branch_ids
 
         branches = _validate_branch_ids_for_company(branch_ids, company)
-        data["_branches_objects"] = branches  # локально, без self-полей
+        data["_branches_objects"] = branches
 
-        # если primary передали — проверим что он реально в компании (уже проверено выше)
+        # Supervisor clamping (§6)
+        if getattr(current_user, "role", None) == "supervisor":
+            my_regions = current_user.get_consulting_region_codes()
+            if not my_regions:
+                raise serializers.ValidationError("У руководителя не настроены регионы.")
+            req_region = (data.get("region_code") or "").strip().lower()
+            if not req_region and data.get("consulting_region_codes"):
+                req_region = str(data.get("consulting_region_codes")[0]).strip().lower()
+
+            if len(my_regions) == 1:
+                target_region = my_regions[0]
+                if req_region and req_region != target_region:
+                    raise serializers.ValidationError({"region_code": f"Руководитель может создавать сотрудников только своего региона ({target_region})."})
+            else:
+                if not req_region or req_region not in my_regions:
+                    raise serializers.ValidationError({"region_code": "Необходимо указать допустимый region_code из ваших регионов."})
+                target_region = req_region
+
+            data["role"] = "salesperson"
+            data["consulting_region_codes"] = [target_region]
+            data["_target_region"] = target_region
+
+            for f in [x.name for x in User._meta.fields if x.name.startswith("can_view_")]:
+                data[f] = False
+        else:
+            req_region = (data.get("region_code") or "").strip().lower()
+            if req_region and not data.get("consulting_region_codes"):
+                data["consulting_region_codes"] = [req_region]
+            elif data.get("consulting_region_codes"):
+                data["consulting_region_codes"] = [str(x).strip().lower() for x in data.get("consulting_region_codes")]
+            if data.get("consulting_region_codes"):
+                data["_target_region"] = data["consulting_region_codes"][0]
+
         return data
 
     @transaction.atomic
     def create(self, validated_data):
         request = self.context["request"]
-        owner = request.user
-        company = owner.owned_company
+        creator = request.user
+        company = getattr(creator, "owned_company", None) or getattr(creator, "company", None)
 
         primary_branch_id = validated_data.pop("primary_branch", None)
         validated_data.pop("branches", None)
-
         branches_objects = validated_data.pop("_branches_objects", [])
+
+        region_code = validated_data.pop("region_code", None)
+        target_region = validated_data.pop("_target_region", None)
+        consulting_region_codes = validated_data.pop("consulting_region_codes", [])
+        if target_region and not consulting_region_codes:
+            consulting_region_codes = [target_region]
 
         generated_password = _generate_password()
 
-        # заберём все can_view_* (опциональные) и не дадим им попасть в User.objects.create если хочешь
         access_flags = {}
         for f in [x.name for x in User._meta.fields if x.name.startswith("can_view_")]:
             access_flags[f] = validated_data.pop(f, None)
@@ -574,13 +665,16 @@ class EmployeeCreateSerializer(serializers.ModelSerializer):
             avatar=validated_data.get("avatar"),
             role=validated_data.get("role"),
             custom_role=validated_data.get("custom_role"),
+            consulting_region_codes=consulting_region_codes,
             company=company,
             is_active=True,
         )
         user.set_password(generated_password)
 
-        # автоназначение прав (как у тебя)
-        if all(v is None for v in access_flags.values()):
+        if getattr(creator, "role", None) == "supervisor":
+            for k in access_flags.keys():
+                setattr(user, k, False)
+        elif all(v is None for v in access_flags.values()):
             if user.role in ["owner", "admin"]:
                 for k in access_flags.keys():
                     setattr(user, k, True)
@@ -597,20 +691,33 @@ class EmployeeCreateSerializer(serializers.ModelSerializer):
 
         user.save()
 
+        # Funnel grant for region
+        if target_region:
+            try:
+                from apps.consalting.models import RegionalFunnelRuleConsalting, EmployeeFunnelGrant
+                rule = RegionalFunnelRuleConsalting.objects.filter(
+                    routing__company=company,
+                    region_code=target_region,
+                ).first()
+                if rule and rule.funnel:
+                    EmployeeFunnelGrant.objects.update_or_create(
+                        employee=user,
+                        funnel=rule.funnel,
+                        defaults={"can_manage_leads": True, "can_manage_stages": False},
+                    )
+            except Exception:
+                pass
+
         # memberships
         if branches_objects:
             BranchMembership.objects.bulk_create(
                 [BranchMembership(user=user, branch=b, is_primary=False) for b in branches_objects],
                 ignore_conflicts=True,
             )
-
-            # primary: если не передали — сделаем первый филиал primary
             if primary_branch_id is None:
                 primary_branch_id = branches_objects[0].id
-
             _set_primary_branch(user, primary_branch_id)
 
-        # почта не должна ломать создание
         try:
             send_mail(
                 subject="Добро пожаловать в CRM",
@@ -634,6 +741,8 @@ class EmployeeCreateSerializer(serializers.ModelSerializer):
     def to_representation(self, instance):
         rep = super().to_representation(instance)
         rep["generated_password"] = getattr(self, "_generated_password", None)
+        rep["consulting_region_codes"] = instance.get_consulting_region_codes()
+        rep["consulting_regions"] = _get_user_consulting_regions(instance)
         rep["branches_attached"] = [
             {"id": str(m.branch_id), "name": m.branch.name, "is_primary": m.is_primary}
             for m in instance.branch_memberships.select_related("branch").all()
@@ -664,15 +773,23 @@ class EmployeeUpdateSerializer(serializers.ModelSerializer):
         many=True, required=False,
         help_text="Полный новый список доступов к воронкам consalting. Если не указано — без изменений.",
     )
+    consulting_region_codes = serializers.ListField(
+        child=serializers.CharField(),
+        required=False,
+        help_text="Коды регионов (только для руководителя/администратора)",
+    )
 
     class Meta:
         model = User
         fields = [
             "id", "first_name", "last_name", "track_number", "phone_number", "avatar",
             "role", "custom_role", "role_display",
+            "consulting_region_codes",
             *[f.name for f in User._meta.fields if f.name.startswith("can_view_")],
             "can_manage_funnel_leads",
             "can_manage_funnel_stages",
+            "can_create_funnel",
+            "can_manage_lead_ad_spend",
             "funnel_grants",
             "branch_ids",
         ]
@@ -693,6 +810,21 @@ class EmployeeUpdateSerializer(serializers.ModelSerializer):
             if "role" in data and data["role"] != "owner":
                 raise serializers.ValidationError("Вы не можете изменить роль владельца компании.")
 
+        # Supervisor restrictions (§5, §6)
+        if getattr(current_user, "role", None) == "supervisor":
+            my_regions = current_user.get_consulting_region_codes()
+            target_regions = target_user.get_consulting_region_codes()
+            if not any(r in my_regions for r in target_regions):
+                raise serializers.ValidationError("Вы можете редактировать только сотрудников своего региона.")
+            if "role" in data and data["role"] != target_user.role:
+                raise serializers.ValidationError("Руководитель не может изменять роль сотрудника.")
+            if any(k.startswith("can_view_") for k in data.keys()) or data.get("can_manage_funnel_stages") or data.get("can_create_funnel"):
+                raise serializers.ValidationError("Руководитель не может изменять расширенные права доступа.")
+            if "consulting_region_codes" in data:
+                new_codes = [str(x).strip().lower() for x in data["consulting_region_codes"]]
+                if not set(new_codes).issubset(set(my_regions)):
+                    raise serializers.ValidationError("Нельзя привязать сотрудника к чужому региону.")
+
         branch_ids = data.get("branch_ids", None)
         if branch_ids is not None:
             company = target_user.company
@@ -704,9 +836,14 @@ class EmployeeUpdateSerializer(serializers.ModelSerializer):
     def update(self, instance, validated_data):
         branch_ids = validated_data.pop("branch_ids", None)
         funnel_grants = validated_data.pop("funnel_grants", None)
+        consulting_region_codes = validated_data.pop("consulting_region_codes", None)
 
         for attr, value in validated_data.items():
             setattr(instance, attr, value)
+
+        if consulting_region_codes is not None:
+            instance.consulting_region_codes = [str(x).strip().lower() for x in consulting_region_codes]
+
         instance.save()
 
         if branch_ids is not None:
@@ -717,6 +854,12 @@ class EmployeeUpdateSerializer(serializers.ModelSerializer):
             self._sync_funnel_grants(instance, funnel_grants)
 
         return instance
+
+    def to_representation(self, instance):
+        rep = super().to_representation(instance)
+        rep["consulting_region_codes"] = instance.get_consulting_region_codes()
+        rep["consulting_regions"] = _get_user_consulting_regions(instance)
+        return rep
 
     def _sync_funnel_grants(self, instance, grants):
         """Полная замена доступов сотрудника к воронкам (только воронки своей компании)."""
@@ -750,13 +893,23 @@ class UserListSerializer(serializers.ModelSerializer):
     role_display = serializers.CharField(read_only=True)
     branch_ids = serializers.ListField(child=serializers.UUIDField(), read_only=True, source="allowed_branch_ids")
     primary_branch_id = serializers.UUIDField(read_only=True, source="primary_branch.id")
+    consulting_region_codes = serializers.SerializerMethodField()
+    consulting_regions = serializers.SerializerMethodField()
+
+    def get_consulting_region_codes(self, obj):
+        return obj.get_consulting_region_codes()
+
+    def get_consulting_regions(self, obj):
+        return _get_user_consulting_regions(obj)
 
     class Meta:
         model = User
         fields = [
             "id", "email", "first_name", "last_name", "track_number", "phone_number",
             "role", "custom_role", "role_display", "avatar",
+            "consulting_region_codes", "consulting_regions",
             *[f.name for f in User._meta.fields if f.name.startswith("can_view_")],
+            "can_manage_funnel_leads", "can_manage_funnel_stages", "can_create_funnel", "can_manage_lead_ad_spend",
             "branch_ids", "primary_branch_id",
         ]
 
@@ -769,13 +922,23 @@ class UserWithPermissionsSerializer(serializers.ModelSerializer):
     role_display = serializers.CharField(read_only=True)
     branch_ids = serializers.ListField(child=serializers.UUIDField(), read_only=True, source="allowed_branch_ids")
     primary_branch_id = serializers.UUIDField(read_only=True, source="primary_branch.id")
+    consulting_region_codes = serializers.SerializerMethodField()
+    consulting_regions = serializers.SerializerMethodField()
+
+    def get_consulting_region_codes(self, obj):
+        return obj.get_consulting_region_codes()
+
+    def get_consulting_regions(self, obj):
+        return _get_user_consulting_regions(obj)
 
     class Meta:
         model = User
         fields = [
             "id", "email", "first_name", "last_name", "track_number", "phone_number",
             "role", "custom_role", "role_display", "avatar",
+            "consulting_region_codes", "consulting_regions",
             *[f.name for f in User._meta.fields if f.name.startswith("can_view_")],
+            "can_manage_funnel_leads", "can_manage_funnel_stages", "can_create_funnel", "can_manage_lead_ad_spend",
             "branch_ids", "primary_branch_id",
         ]
 
@@ -805,11 +968,16 @@ class FeatureSerializer(serializers.ModelSerializer):
 
 
 class SubscriptionPlanSerializer(serializers.ModelSerializer):
-    features = FeatureSerializer(many=True)
+    features = FeatureSerializer(many=True, read_only=True)
+    code = serializers.SerializerMethodField()
 
     class Meta:
         model = SubscriptionPlan
-        fields = ["id", "name", "price", "description", "features"]
+        fields = ["id", "code", "name", "price", "description", "features"]
+
+    def get_code(self, obj):
+        from apps.users.services_subscription import resolve_plan_code
+        return resolve_plan_code(obj)
 
 
 class CompanySerializer(serializers.ModelSerializer):
@@ -834,15 +1002,48 @@ class CompanySerializer(serializers.ModelSerializer):
             "scale_barcode_layout",
             "scale_barcode_amount_unit",
             "max_discount_percent",
+            "appointment_work_start",
+            "appointment_work_end",
         ]
 
     def to_representation(self, instance):
+        from apps.users.services_subscription import (
+            build_subscription_payload,
+            get_company_limits,
+            get_bishkek_date,
+            get_bishkek_datetime_str,
+            is_user_owner,
+        )
+
         data = super().to_representation(instance)
         request = self.context.get("request")
-        if request and request.user.is_authenticated:
-            if getattr(request.user, "role", None) not in ["owner", "admin"]:
-                data.pop("cashier_password", None)
+        user = getattr(request, "user", None) if request else None
+        is_owner = is_user_owner(user, instance)
+
+        if not is_owner:
+            data.pop("cashier_password", None)
+            if isinstance(data.get("subscription_plan"), dict):
+                data["subscription_plan"].pop("price", None)
+
+        if instance.created_at:
+            data["created_at"] = get_bishkek_datetime_str(instance.created_at)
+
+        start_date_local = get_bishkek_date(instance.start_date)
+        data["start_date"] = start_date_local.isoformat() if start_date_local else None
+
+        end_date_local = get_bishkek_date(instance.end_date)
+        end_date_str = end_date_local.isoformat() if end_date_local else None
+        data["end_date"] = end_date_str
+        data["subscription_end_date"] = end_date_str
+
+        sub = build_subscription_payload(instance, is_owner=is_owner)
+        data["subscription"] = sub
+
+        plan_code = sub["plan"]["code"] if sub.get("plan") else None
+        data["limits"] = get_company_limits(instance, plan_code=plan_code)
+
         return data
+
 
 
 class ChangePasswordSerializer(serializers.Serializer):
@@ -897,6 +1098,24 @@ class CompanyUpdateSerializer(serializers.ModelSerializer):
             raise SlugConflict()  # 409
         return value
 
+    def validate_appointment_work_start(self, value):
+        if not value:
+            return "09:00"
+        value = str(value).strip()
+        import re
+        if not re.match(r"^([01]\d|2[0-3]):[0-5]\d$", value):
+            raise serializers.ValidationError("Формат времени должен быть HH:MM (например, 08:00).")
+        return value
+
+    def validate_appointment_work_end(self, value):
+        if not value:
+            return "21:00"
+        value = str(value).strip()
+        import re
+        if not re.match(r"^([01]\d|2[0-3]):[0-5]\d$", value):
+            raise serializers.ValidationError("Формат времени должен быть HH:MM (например, 20:00).")
+        return value
+
     class Meta:
         model = Company
         fields = [
@@ -917,6 +1136,8 @@ class CompanyUpdateSerializer(serializers.ModelSerializer):
             "scale_barcode_mode",
             "scale_barcode_layout",
             "scale_barcode_amount_unit",
+            "appointment_work_start",
+            "appointment_work_end",
         ]
 
     def validate(self, attrs):

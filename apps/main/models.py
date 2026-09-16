@@ -867,6 +867,7 @@ class Product(models.Model):
     date = models.DateTimeField("Дата", blank=True, null=True)
 
     expiration_date = models.DateField("Срок годности", null=True, blank=True)
+    shelf_life_days = models.PositiveIntegerField("Срок хранения (дней)", null=True, blank=True)
 
     created_at = models.DateTimeField("Создан", auto_now_add=True)
     updated_at = models.DateTimeField("Обновлён", auto_now=True)
@@ -1078,6 +1079,33 @@ class Product(models.Model):
             cache.delete(f"product_code:{self.company_id}:{code_str}")
             if code_str.isdigit():
                 cache.delete(f"product_code:{self.company_id}:{code_str.zfill(4)}")
+
+
+class ProductExpiryBatch(models.Model):
+    class Status(models.TextChoices):
+        ACTIVE = "active", "Активна"
+        CONSUMED = "consumed", "Израсходована"
+        EXPIRED = "expired", "Просрочена"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    company = models.ForeignKey(Company, on_delete=models.CASCADE, related_name="product_expiry_batches")
+    product = models.ForeignKey(Product, on_delete=models.CASCADE, related_name="expiry_batches")
+    quantity = models.DecimalField(max_digits=12, decimal_places=3)
+    remaining_quantity = models.DecimalField(max_digits=12, decimal_places=3)
+    received_at = models.DateTimeField()
+    expires_at = models.DateField(null=True, blank=True)
+    status = models.CharField(max_length=16, choices=Status.choices, default=Status.ACTIVE)
+    source_kind = models.CharField(max_length=32)
+    source_id = models.CharField(max_length=64, null=True, blank=True)
+    created_by = models.ForeignKey(User, null=True, blank=True, on_delete=models.SET_NULL)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["expires_at", "received_at"]
+        indexes = [
+            models.Index(fields=["product", "status", "expires_at"]),
+            models.Index(fields=["company", "expires_at"]),
+        ]
 
 
 class ProductFavorite(models.Model):
@@ -1898,13 +1926,14 @@ class Cart(models.Model):
         subtotal = _money(subtotal_raw)
         line_discount_total = _money(line_discount_raw)
 
-        # Скидка на чек: либо % от subtotal, либо фиксированная сумма
+        # Скидка на чек: либо % от остатка суммы чека (после скидок на товары), либо фиксированная сумма
+        discountable_subtotal = max(Decimal("0"), subtotal - line_discount_total)
         order_percent = getattr(self, "order_discount_percent", None)
         if order_percent is not None and Decimal(str(order_percent)) > 0:
-            requested_extra = _money(subtotal * Decimal(str(order_percent)) / Decimal("100"))
+            requested_extra = _money(discountable_subtotal * Decimal(str(order_percent)) / Decimal("100"))
         else:
             requested_extra = _money(self.order_discount_total or Decimal("0"))
-        max_extra = max(Decimal("0"), subtotal - line_discount_total)
+        max_extra = discountable_subtotal
         extra_discount = min(requested_extra, max_extra)
 
         discount_total = _money(line_discount_total + extra_discount)
@@ -2122,6 +2151,7 @@ class Sale(models.Model):
         PAID = "paid", "Оплачен"
         DEBT = "debt", "Долг"
         CANCELED = "canceled", "Отменён"
+        PARTIALLY_RETURNED = "partially_returned", "Частичный возврат"
 
     class PaymentMethod(models.TextChoices):
         CASH = "cash", "Наличные"
@@ -2179,7 +2209,7 @@ class Sale(models.Model):
         max_digits=12, decimal_places=2, null=True, blank=True, default=Decimal("0.00"), verbose_name="Сумма комиссии консультанта"
     )
 
-    status = models.CharField(max_length=16, choices=Status.choices, default=Status.NEW)
+    status = models.CharField(max_length=32, choices=Status.choices, default=Status.NEW)
     doc_number = models.PositiveIntegerField(null=True, blank=True, db_index=True)
 
     subtotal = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal("0.00"))
@@ -2470,6 +2500,47 @@ class SalePayment(models.Model):
             self.company_id = self.sale.company_id
         self.full_clean()
         return super().save(*args, **kwargs)
+
+
+class SaleReturn(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    sale = models.ForeignKey(
+        Sale,
+        on_delete=models.CASCADE,
+        related_name="returns",
+        verbose_name="Продажа",
+    )
+    company = models.ForeignKey(
+        Company,
+        on_delete=models.CASCADE,
+        related_name="sale_returns",
+        verbose_name="Компания",
+    )
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="processed_sale_returns",
+        verbose_name="Кассир/пользователь",
+    )
+    idempotency_key = models.CharField(max_length=128, db_index=True, verbose_name="Ключ идемпотентности")
+    returned_amount = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal("0.00"), verbose_name="Возвращённая сумма")
+    is_defect = models.BooleanField(default=False, verbose_name="Брак")
+    is_full = models.BooleanField(default=True, verbose_name="Полный возврат")
+    items_payload = models.JSONField(null=True, blank=True, verbose_name="Спецификация возврата")
+    response_data = models.JSONField(null=True, blank=True, verbose_name="Ответ API")
+    created_at = models.DateTimeField(auto_now_add=True, verbose_name="Дата возврата")
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(fields=["company", "idempotency_key"], name="uniq_sale_return_idempotency")
+        ]
+        indexes = [
+            models.Index(fields=["sale", "created_at"]),
+        ]
+        verbose_name = "Возврат продажи"
+        verbose_name_plural = "Возвраты продаж"
 
 
 class SaleItem(models.Model):
@@ -3069,12 +3140,19 @@ class Client(models.Model):
         IMPLEMENTERS = "implementers", "Реализаторы"
         CONTRACTOR = "contractor", "Подрядчик"
 
+    class Sector(models.TextChoices):
+        ALL = "all", "Общий"
+        MARKET = "market", "Маркет"
+        CONSALTING = "consalting", "Консалтинг"
+
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False, verbose_name="ID клиента")
     company = models.ForeignKey(Company, on_delete=models.CASCADE, related_name="clients", verbose_name="Компания")
     branch = models.ForeignKey(
         Branch, on_delete=models.CASCADE, related_name='crm_clients',
         null=True, blank=True, db_index=True, verbose_name='Филиал'
     )
+    sector = models.CharField("Сектор", max_length=16, choices=Sector.choices,
+                            default=Sector.ALL, db_index=True, blank=True, null=True)
     type = models.CharField("Тип клиента", max_length=16, choices=StatusClient.choices,
                             default=StatusClient.CLIENT, null=True, blank=True)
     enterprise = models.CharField("Предприятие O", max_length=255, blank=True, null=True)
@@ -3095,6 +3173,22 @@ class Client(models.Model):
                                     related_name="clients_as_salesperson", verbose_name="Продавец")
     service = models.ForeignKey(ServicesConsalting, on_delete=models.SET_NULL, null=True, blank=True,
                                 related_name="clients_using_service", verbose_name="Услуга")
+
+    class ProvisionStatus(models.TextChoices):
+        NONE = "none", "Не требуется"
+        PENDING = "pending", "Ожидает оплаты"
+        CREATED = "created", "Аккаунт создан"
+        FAILED = "failed", "Ошибка создания"
+
+    nur_company = models.ForeignKey(
+        Company, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="consalting_clients", verbose_name="CRM-аккаунт (tenant)"
+    )
+    provision_status = models.CharField(
+        "Статус создания CRM", max_length=16, choices=ProvisionStatus.choices, default=ProvisionStatus.NONE
+    )
+    provision_error = models.TextField("Ошибка создания CRM", blank=True, default="")
+    provisioned_at = models.DateTimeField("Дата создания CRM", null=True, blank=True)
 
     created_at = models.DateTimeField("Создано", auto_now_add=True)
     updated_at = models.DateTimeField("Обновлено", auto_now=True)
@@ -3390,9 +3484,10 @@ class ClientDeal(models.Model):
     schedule_version = models.CharField(
         "Версия графика",
         max_length=8,
-        default="v1",
+        default="v2",
         choices=[("v1", "v1"), ("v2", "v2")],
     )
+
     debt_months = models.PositiveSmallIntegerField("Срок (мес.)", blank=True, null=True, db_column="debt_months_v2")
     interval_days = models.PositiveSmallIntegerField("Интервал (дни)", default=1, blank=True, null=True)
     interval_months = models.PositiveSmallIntegerField("Интервал (месяцы)", default=1, blank=True, null=True)
@@ -3772,6 +3867,7 @@ class DealPayment(models.Model):
     )
 
     note = models.TextField("Комментарий", blank=True)
+    payment_method = models.CharField("Способ оплаты", max_length=32, null=True, blank=True)
     created_at = models.DateTimeField("Создано", auto_now_add=True)
 
     class Meta:
@@ -3815,6 +3911,26 @@ class DealPayment(models.Model):
 
         self.full_clean()
         super().save(*args, **kwargs)
+
+
+class ClientDebtBulkPayment(models.Model):
+    """Idempotency record for one payment distributed across a client's debts."""
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    company = models.ForeignKey(Company, on_delete=models.CASCADE, related_name="client_debt_bulk_payments")
+    client = models.ForeignKey(Client, on_delete=models.CASCADE, related_name="debt_bulk_payments")
+    idempotency_key = models.UUIDField()
+    amount = models.DecimalField(max_digits=12, decimal_places=2)
+    affected_deal_ids = models.JSONField(default=list, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["client", "idempotency_key"],
+                name="uniq_client_bulk_debt_payment_idempotency",
+            ),
+        ]
+        indexes = [models.Index(fields=["company", "client", "created_at"])]
             
 class Bid(models.Model):
     class Status(models.TextChoices):
@@ -3988,6 +4104,7 @@ class Debt(models.Model):
     phone = models.CharField("Телефон", max_length=32)
     amount = models.DecimalField("Сумма долга", max_digits=12, decimal_places=2, validators=[MinValueValidator(Decimal("0"))])
     due_date = models.DateTimeField(verbose_name="дата возвращения", null=True, blank=True)
+    payment_method = models.CharField("Способ оплаты", max_length=32, null=True, blank=True)
     sale = models.ForeignKey(
         "Sale",
         on_delete=models.SET_NULL,
@@ -4020,10 +4137,11 @@ class Debt(models.Model):
     def balance(self) -> Decimal:
         return (self.amount - self.paid_total).quantize(Decimal("0.01"))
 
-    def add_payment(self, amount: Decimal, paid_at=None, note: str = ""):
+    def add_payment(self, amount: Decimal, paid_at=None, note: str = "", payment_method: str = "cash"):
         payment = DebtPayment(
             debt=self, company=self.company, branch=self.branch, amount=amount,
-            paid_at=paid_at or timezone.now().date(), note=note
+            paid_at=paid_at or timezone.now().date(), note=note,
+            payment_method=payment_method,
         )
         payment.full_clean()
         payment.save()
@@ -4046,6 +4164,7 @@ class DebtPayment(models.Model):
     amount = models.DecimalField("Сумма оплаты", max_digits=12, decimal_places=2, validators=[MinValueValidator(Decimal("0.01"))])
     paid_at = models.DateField("Дата оплаты", default=timezone.localdate)
     note = models.CharField("Комментарий", max_length=255, blank=True)
+    payment_method = models.CharField("Способ оплаты", max_length=32, null=True, blank=True)
 
     created_at = models.DateTimeField("Создано", auto_now_add=True)
 
@@ -5985,4 +6104,3 @@ class PosPrinterSetting(models.Model):
 
     def __str__(self):
         return f"POS Printer {self.device_key} ({self.company.name})"
-

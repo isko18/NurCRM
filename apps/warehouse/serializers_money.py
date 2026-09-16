@@ -182,3 +182,10 @@ class CompanyCashIncassationSerializer(serializers.ModelSerializer):
             "created_at",
         )
 
+
+class WarehouseCashConfirmationSettingsSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = models.WarehouseCashConfirmationSettings
+        fields = ("enabled",)
+
+

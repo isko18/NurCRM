@@ -22,6 +22,7 @@ from apps.main.production_salary_views import (
     ProductionSalarySummaryAPIView,
     ProductionPayoutListCreateAPIView,
 )
+from apps.construction.views import CashFlowListCreateView
 
 
 urlpatterns = [
@@ -60,8 +61,10 @@ urlpatterns = [
     path('products/scale-export/', WeightProductsScaleExportAPIView.as_view(), name='product-scale-export'),
     path('products/create-by-barcode/', ProductCreateByBarcodeAPIView.as_view(), name='product-create-by-barcode'),
     path('products/create-manual/', ProductCreateManualAPIView.as_view(), name='product-create-manual'),
+    path('products/bulk-update/', ProductBulkUpdateAPIView.as_view(), name='product-bulk-update'),
     path('products/<uuid:pk>/', ProductRetrieveUpdateDestroyAPIView.as_view(), name='product-detail'),
     path('products/<uuid:pk>/purchase-batches/', ProductPurchaseBatchListAPIView.as_view(), name='product-purchase-batches'),
+    path('products/<uuid:pk>/expiry-batches/', ProductExpiryBatchListAPIView.as_view(), name='product-expiry-batches'),
     path("products/<uuid:product_id>/favorite/", ProductFavoriteAPIView.as_view(), name="product-favorite"),
     path("products/bulk-update/", ProductBulkUpdateAPIView.as_view(), name="product-bulk-update"),
     path("products/bulk-delete/", ProductBulkDeleteAPIView.as_view(), name="product-bulk-delete"),
@@ -172,6 +175,11 @@ urlpatterns = [
         ClientDealRetrieveUpdateDestroyAPIView.as_view(),
         name="client-deals-detail",
     ),
+    path(
+        "clients/<uuid:client_id>/deals/pay-any/",
+        ClientDealsPayAnyAPIView.as_view(),
+        name="client-deals-pay-any",
+    ),
 
     # pay/refund (nested)
     path(
@@ -265,6 +273,7 @@ urlpatterns = [
     path("debts/<uuid:pk>/", DebtRetrieveUpdateDestroyAPIView.as_view(), name="debt-detail"),
     path("debts/<uuid:pk>/pay/", DebtPayAPIView.as_view(), name="debt-pay"),
     path("debts/<uuid:pk>/payments/", DebtPaymentListAPIView.as_view(), name="debt-payments"),
+    path("cashflows/", CashFlowListCreateView.as_view(), name="main-cashflows-alias"),
     
     path("object-items/", ObjectItemListCreateAPIView.as_view()),
     path("object-items/<uuid:pk>/", ObjectItemRetrieveUpdateDestroyAPIView.as_view()),
@@ -372,5 +381,3 @@ urlpatterns = [
     path("public/knowledge-base/<uuid:course_id>/", PublicKnowledgeBaseCourseRetrieveAPIView.as_view()),
 
 ]
-
-

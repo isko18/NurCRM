@@ -68,6 +68,7 @@ from .views_money import (
     MoneyDocumentUnpostView,
     MoneyDocumentRejectView,
     CounterpartyMoneyOperationsView,
+    WarehouseCashConfirmationSettingsView,
 )
 from .views_reconciliation import (
     CounterpartyReconciliationClassicAPIView,
@@ -233,6 +234,7 @@ urlpatterns += [
     path("cash/requests/", CashApprovalRequestListView.as_view(), name="warehouse-cash-requests"),
     path("cash/requests/<uuid:pk>/approve/", CashApprovalRequestApproveView.as_view(), name="warehouse-cash-request-approve"),
     path("cash/requests/<uuid:pk>/reject/", CashApprovalRequestRejectView.as_view(), name="warehouse-cash-request-reject"),
+    path("cash/confirmation-settings/", WarehouseCashConfirmationSettingsView.as_view(), name="warehouse-cash-confirmation-settings"),
 
     # simple CRUD for products/warehouses/counterparties
     path("crud/products/", ProductListCreateView.as_view(), name="warehouse-products-crud"),

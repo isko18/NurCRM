@@ -1,6 +1,6 @@
 from datetime import timedelta
 from decimal import Decimal
-from django.test import TestCase
+from django.test import TestCase, override_settings
 from django.utils import timezone
 from rest_framework.test import APIClient
 from rest_framework import status
@@ -15,6 +15,7 @@ from apps.consalting.models import (
 from apps.consalting.funnel.completion import create_sale_side_effects
 
 
+@override_settings(ALLOWED_HOSTS=["*"], SECURE_SSL_REDIRECT=False)
 class SaleCancelTests(TestCase):
     def setUp(self):
         self.owner = User.objects.create(
@@ -152,3 +153,42 @@ class SaleCancelTests(TestCase):
             "reason": "client_refused"
         })
         self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_canceled_sale_cannot_be_edited(self):
+        sale = SaleConsalting.objects.create(
+            company=self.company, user=self.owner, services=self.service,
+            client=self.client_entity, total=Decimal("40000.00"),
+            status=SaleConsalting.Status.CANCELED
+        )
+        res = self.mgr_client.patch(f"/api/consalting/sales/{sale.id}/", {"description": "Новое описание"})
+        self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_cancellations_report_endpoint(self):
+        sale = SaleConsalting.objects.create(
+            company=self.company, user=self.emp, services=self.service,
+            client=self.client_entity, total=Decimal("60000.00")
+        )
+        self.mgr_client.post(f"/api/consalting/sales/{sale.id}/cancel/", {
+            "reason": "client_refused",
+            "comment": "Отказ"
+        })
+
+        res = self.mgr_client.get("/api/consalting/sales/cancellations/")
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        self.assertGreaterEqual(res.data["count"], 1)
+        item = next(r for r in res.data["results"] if r["id"] == str(sale.id))
+        self.assertEqual(item["reason"], "client_refused")
+        self.assertEqual(item["total"], 60000.0)
+
+    def test_refund_amount_exceeding_total_fails(self):
+        sale = SaleConsalting.objects.create(
+            company=self.company, user=self.emp, services=self.service,
+            client=self.client_entity, total=Decimal("50000.00")
+        )
+        res = self.mgr_client.post(f"/api/consalting/sales/{sale.id}/refund/", {
+            "amount": 60000,
+            "reason": "warranty"
+        })
+        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("больше остатка", res.data["detail"])
+

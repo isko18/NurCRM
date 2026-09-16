@@ -1,3 +1,4 @@
+from decimal import Decimal, InvalidOperation
 from rest_framework import generics, permissions, status, filters
 from rest_framework.exceptions import PermissionDenied
 from rest_framework.response import Response
@@ -7,7 +8,8 @@ from rest_framework.pagination import PageNumberPagination
 from django.http import HttpResponse
 from django.utils import timezone
 from django.utils.dateparse import parse_datetime, parse_date
-from datetime import timedelta, datetime
+from datetime import timedelta, datetime, date
+from dateutil.relativedelta import relativedelta
 from django.shortcuts import get_object_or_404
 from django.db import transaction, IntegrityError
 from django.db.models import Sum, Count, Q, Avg
@@ -23,6 +25,7 @@ from .models import (
     BookingConsalting,
     FunnelConsalting,
     FunnelStageConsalting,
+    EmployeeFunnelGrant,
     LeadConsalting,
     LossReasonConsalting,
     LeadActivityConsalting,
@@ -48,6 +51,9 @@ from .models import (
     CashRequestConsalting,
     CashConfirmationSettingsConsalting,
     SaleRefundConsalting,
+    RegionalFunnelRoutingConsalting,
+    RegionalFunnelRuleConsalting,
+    LeadAdSpend,
 )
 from .serializers import (
     ServicesConsaltingSerializer,
@@ -86,6 +92,9 @@ from .serializers import (
     CashRequestConsaltingSerializer,
     CashConfirmationSettingsConsaltingSerializer,
     SaleRefundConsaltingSerializer,
+    RegionalFunnelRoutingConsaltingSerializer,
+    RegionalFunnelRuleConsaltingSerializer,
+    LeadAdSpendSerializer,
 )
 from .funnel.state_machine import (
     FunnelStateMachine, StateTransitionError, allowed_next_types,
@@ -97,11 +106,14 @@ from .funnel.events import emit as emit_funnel_event
 from .funnel import realtime
 from .funnel.provisioning import provision_funnel_for_role
 from .funnel.completion import (
-    apply_completion_side_effects, ensure_subscription_deal, _add_months, accrue_salary_for_sale
+    apply_completion_side_effects, ensure_subscription_deal, _add_months, accrue_salary_for_sale,
+    generate_schedule,
 )
 from .access import (
-    is_owner_like, apply_lead_visibility, apply_client_visibility,
+    is_owner_like, is_consulting_supervisor, is_consulting_salesperson, get_user_region_codes,
+    apply_lead_visibility, apply_client_visibility,
     visible_funnels_qs, can_view_funnel, can_manage_leads, can_manage_stages,
+    can_manage_lead_ad_spend, CanManageLeadAdSpend,
 )
 from apps.users.models import Branch, CustomRole, User
 from apps.main.models import Client
@@ -265,6 +277,10 @@ class CompanyBranchQuerysetMixin:
             setattr(request, "branch", None)
         return None
 
+    def _auto_branch(self):
+        """Алиас для _active_branch для совместимости."""
+        return self._active_branch()
+
     # --- queryset / save hooks ---
 
     def get_queryset(self):
@@ -330,6 +346,23 @@ class ServicesConsaltingListCreateView(CompanyBranchQuerysetMixin, generics.List
         if not f.is_relation or f.many_to_one
     ]
 
+    def perform_create(self, serializer):
+        from django.db import IntegrityError
+        from rest_framework.exceptions import ValidationError as DRFValidationError
+        company = self._user_company()
+        if not company:
+            raise PermissionDenied("У пользователя не настроена компания.")
+        model = self.get_queryset().model
+        kwargs = {"company": company}
+        if _has_field(model, "branch"):
+            active_branch = self._active_branch()
+            if active_branch is not None:
+                kwargs["branch"] = active_branch
+        try:
+            serializer.save(**kwargs)
+        except IntegrityError:
+            raise DRFValidationError({"name": ["Услуга с таким названием уже существует в этой компании."]})
+
 
 class ServicesConsaltingRetrieveUpdateDestroyView(CompanyBranchQuerysetMixin, generics.RetrieveUpdateDestroyAPIView):
     queryset = ServicesConsalting.objects.prefetch_related("tariffs").all()
@@ -350,6 +383,32 @@ class SaleConsaltingListCreateView(CompanyBranchQuerysetMixin, generics.ListCrea
         if not f.is_relation or f.many_to_one
     ]
 
+    def get_queryset(self):
+        qs = super().get_queryset()
+        user = self._user()
+        from .access import is_owner_like, is_consulting_supervisor, is_consulting_salesperson
+        from apps.users.models import User
+
+        if is_consulting_supervisor(user):
+            my_regions = user.get_consulting_region_codes()
+            region_user_ids = [
+                u.id for u in User.objects.filter(company=user.company, is_active=True)
+                if u.id == user.id or any(r in my_regions for r in u.get_consulting_region_codes())
+            ]
+            qs = qs.filter(Q(user_id__in=region_user_ids) | Q(lead__region_code__in=my_regions))
+            region_param = self.request.query_params.get("region")
+            if region_param and region_param in my_regions:
+                qs = qs.filter(lead__region_code=region_param)
+        elif is_consulting_salesperson(user):
+            qs = qs.filter(user=user)
+        elif not is_owner_like(user) and not getattr(user, "can_view_all_sales", False):
+            qs = qs.filter(user=user)
+        else:
+            region_param = self.request.query_params.get("region")
+            if region_param:
+                qs = qs.filter(lead__region_code=region_param)
+        return qs
+
     def perform_create(self, serializer):
         # company/branch — миксин; user — текущий оператор
         company = self._user_company()
@@ -360,7 +419,39 @@ class SaleConsaltingListCreateView(CompanyBranchQuerysetMixin, generics.ListCrea
             sale = serializer.save(company=company, branch=self._active_branch(), user=self.request.user)
         else:
             sale = serializer.save(company=company, user=self.request.user)
-        accrue_salary_for_sale(sale, seller=self.request.user)
+
+        from .funnel.cash_confirmation import needs_confirmation
+        from .models import CashRequestConsalting, CashOperationConsalting
+
+        payment_method = getattr(sale, "payment_method", None) or self.request.data.get("payment_method") or "cash"
+        if needs_confirmation(company, payment_method, self.request.user):
+            sale.status = SaleConsalting.Status.PENDING_CONFIRMATION
+            sale.save(update_fields=["status"])
+            CashRequestConsalting.objects.create(
+                company=company,
+                sale=sale,
+                user=self.request.user,
+                client=sale.client,
+                kind=CashRequestConsalting.Kind.SALE,
+                direction="income",
+                amount=sale.total,
+                payment_method=payment_method,
+                status=CashRequestConsalting.Status.PENDING,
+            )
+        else:
+            CashOperationConsalting.objects.create(
+                company=company,
+                user=self.request.user,
+                sale=sale,
+                kind=CashOperationConsalting.Kind.SALE,
+                direction=CashOperationConsalting.Direction.INCOME,
+                amount=sale.total,
+                payment_method=payment_method,
+                comment=f"Прямая продажа: {sale.services.name if sale.services else 'Услуга'}",
+            )
+            from .funnel.completion import create_sale_side_effects
+            create_sale_side_effects(sale)
+            accrue_salary_for_sale(sale, seller=self.request.user)
 
 
 class SaleConsaltingRetrieveUpdateDestroyView(CompanyBranchQuerysetMixin, generics.RetrieveUpdateDestroyAPIView):
@@ -368,6 +459,33 @@ class SaleConsaltingRetrieveUpdateDestroyView(CompanyBranchQuerysetMixin, generi
         "services", "tariff", "client", "user", "company"
     ).prefetch_related("items").all()
     serializer_class = SaleConsaltingSerializer
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        user = self._user()
+        from .access import is_owner_like
+        if not is_owner_like(user) and not getattr(user, "can_view_all_sales", False):
+            qs = qs.filter(user=user)
+        return qs
+
+    def perform_update(self, serializer):
+        instance = self.get_object()
+        if instance.status == SaleConsalting.Status.CANCELED:
+            raise PermissionDenied("Отменённую продажу нельзя редактировать.")
+        if instance.status == SaleConsalting.Status.PENDING_CONFIRMATION:
+            raise PermissionDenied("Продажу, ожидающую подтверждения кассы, нельзя редактировать.")
+        serializer.save()
+
+    def perform_destroy(self, instance):
+        if not is_owner_like(self.request.user):
+            raise PermissionDenied("Удаление продажи доступно только руководителю.")
+        if instance.status != SaleConsalting.Status.CANCELED:
+            from apps.consalting.models import SubscriptionConsalting, CashRequestConsalting
+            has_sub = SubscriptionConsalting.objects.filter(sale=instance).exists()
+            has_cash = CashRequestConsalting.objects.filter(sale=instance).exists()
+            if has_sub or has_cash:
+                raise PermissionDenied("Продажу с оформленными подписками или кассовыми операциями необходимо отменять через отмену, а не удалять.")
+        instance.delete()
 
 
 class SaleConsaltingAnalyticsView(CompanyBranchQuerysetMixin, generics.GenericAPIView):
@@ -473,6 +591,62 @@ class ConsaltingManagerAnalyticsView(_ConsaltingAnalyticsBase):
         return Response(ManagerAnalytics.compute(company, **kw))
 
 
+class ConsaltingDebtsAnalyticsView(_ConsaltingAnalyticsBase):
+    """Current subscription arrears and subscription sales made on credit."""
+    def get(self, request, *args, **kwargs):
+        company, kw = self._params(request)
+        today = timezone.localdate()
+        branch = kw.get("branch")
+        subscriptions = SubscriptionConsalting.objects.filter(company=company)
+        if branch:
+            subscriptions = subscriptions.filter(client__branch_id=branch)
+
+        overdue = []
+        debtor_map = {}
+        def person(client):
+            return (getattr(client, "full_name", "") or getattr(client, "title", "") or "—", getattr(client, "phone", "") or "")
+        def add_debt(client, amount, days):
+            if not client:
+                return
+            row = debtor_map.setdefault(str(client.id), {"client_id": str(client.id), "client_name": person(client)[0], "phone": person(client)[1], "total_debt": Decimal("0"), "max_days_overdue": 0})
+            row["total_debt"] += amount
+            row["max_days_overdue"] = max(row["max_days_overdue"], max(days or 0, 0))
+
+        for p in SubscriptionPaymentConsalting.objects.filter(subscription__in=subscriptions, status=SubscriptionPaymentConsalting.Status.OVERDUE).select_related("subscription__client", "subscription__service", "subscription__tariff", "subscription__lead__owner"):
+            sub, client = p.subscription, p.subscription.client
+            days = max((today - p.due_date).days, 0)
+            overdue.append({"payment_id": str(p.id), "subscription_id": str(sub.id), "client_id": str(client.id), "client_name": person(client)[0], "phone": person(client)[1], "service_display": getattr(sub.service, "name", None), "tariff_display": getattr(sub.tariff, "name", None), "amount": p.amount, "due_date": p.due_date, "days_overdue": days, "owner": (sub.lead.owner.get_full_name() if sub.lead_id and sub.lead.owner_id else None)})
+            add_debt(client, p.amount, days)
+
+        debt_rows = []
+        active = subscriptions.filter(status=SubscriptionConsalting.Status.ACTIVE, sale__payment_mode__in=["debt", "installment"], sale__status=SaleConsalting.Status.COMPLETED).select_related("sale", "client", "service", "tariff", "lead__owner")
+        for sub in active:
+            sale = sub.sale
+            paid = CashOperationConsalting.objects.filter(sale=sale, direction=CashOperationConsalting.Direction.INCOME).aggregate(v=Sum("amount"))["v"] or Decimal("0")
+            # An operation may not yet exist for a recorded prepayment.
+            paid = max(paid, Decimal("0"))
+            total = Decimal(str(sale.total or 0))
+            remaining = max(total - paid, Decimal("0"))
+            if not remaining:
+                continue
+            due = sale.created_at.date() + relativedelta(months=sale.debt_months or 0)
+            days = max((today - due).days, 0)
+            client = sub.client
+            debt_rows.append({"subscription_id": str(sub.id), "sale_id": str(sale.id), "client_id": str(client.id), "client_name": person(client)[0], "phone": person(client)[1], "service_display": getattr(sub.service, "name", None), "tariff_display": getattr(sub.tariff, "name", None), "payment_mode": sale.payment_mode, "debt_months": sale.debt_months, "amount_total": total, "amount_paid": paid, "amount_remaining": remaining, "start_date": sale.created_at.date(), "due_date": due, "days_overdue": days, "owner": (sale.user.get_full_name() if sale.user_id else (sub.lead.owner.get_full_name() if sub.lead_id and sub.lead.owner_id else None))})
+            add_debt(client, remaining, days)
+
+        overdue.sort(key=lambda x: x["days_overdue"], reverse=True)
+        debt_rows.sort(key=lambda x: x["amount_remaining"], reverse=True)
+        overdue_total = sum((x["amount"] for x in overdue), Decimal("0")); debt_total = sum((x["amount_remaining"] for x in debt_rows), Decimal("0"))
+        buckets = {"0-30": [Decimal("0"), 0], "31-60": [Decimal("0"), 0], "61-90": [Decimal("0"), 0], "90+": [Decimal("0"), 0]}
+        for amount, days in [(x["amount"], x["days_overdue"]) for x in overdue] + [(x["amount_remaining"], x["days_overdue"]) for x in debt_rows]:
+            key = "90+" if days > 90 else "61-90" if days > 60 else "31-60" if days > 30 else "0-30"; buckets[key][0] += amount; buckets[key][1] += 1
+        kpis = {"debtors_count": {"current": len(debtor_map), "previous": 0, "diff": len(debtor_map), "percent": 0}, "total_debt": {"current": overdue_total + debt_total, "previous": 0, "diff": overdue_total + debt_total, "percent": 0}, "overdue_amount": {"current": overdue_total, "previous": 0, "diff": overdue_total, "percent": 0}, "overdue_count": {"current": len(overdue)}, "debt_mode_amount": {"current": debt_total, "previous": 0, "diff": debt_total, "percent": 0}, "debt_mode_count": {"current": len(debt_rows)}}
+        labels = {"0-30":"0–30 дн.", "31-60":"31–60 дн.", "61-90":"61–90 дн.", "90+":"90+ дн."}
+        for key, value in buckets.items(): kpis["bucket_" + key.replace("-", "_").replace("+", "_plus")] = value[0]
+        return Response({"kpis": kpis, "aging": [{"bucket": k, "bucket_label": labels[k], "amount": v[0], "count": v[1]} for k,v in buckets.items()], "overdue_subscriptions": overdue, "debt_subscriptions": debt_rows, "top_debtors": sorted(debtor_map.values(), key=lambda x: x["total_debt"], reverse=True)[:50]})
+
+
 
 # ==========================
 # SalaryConsalting
@@ -492,11 +666,41 @@ class SalaryConsaltingRetrieveUpdateDestroyView(CompanyBranchQuerysetMixin, gene
     serializer_class = SalaryConsaltingSerializer
 
 
+def _notify_request_assigned(request_obj):
+    """Отправить WebSocket-уведомление сотруднику о назначении заявки."""
+    try:
+        user = request_obj.assigned_to
+        if not user:
+            return
+        client_display = ""
+        if request_obj.client:
+            client_display = (
+                getattr(request_obj.client, "full_name", None)
+                or getattr(request_obj.client, "name", None)
+                or getattr(request_obj.client, "phone", None)
+                or ""
+            )
+        client_name = client_display or "клиента"
+        payload = {
+            "id": str(request_obj.id),
+            "title": f"Вам назначена заявка от {client_name}",
+            "message": request_obj.name or "Заявка клиента",
+            "request_id": str(request_obj.id),
+            "client_id": str(request_obj.client_id) if request_obj.client_id else None,
+            "url": "/crm/consulting/client-requests",
+        }
+        from .funnel.realtime import notify_user
+        notify_user(str(user.id), "request.assigned", payload)
+    except Exception as e:
+        import logging
+        logging.getLogger("nurcrm").warning("_notify_request_assigned error: %s", e)
+
+
 # ==========================
 # RequestsConsalting
 # ==========================
 class RequestsConsaltingListCreateView(CompanyBranchQuerysetMixin, generics.ListCreateAPIView):
-    queryset = RequestsConsalting.objects.select_related("client", "company").all()
+    queryset = RequestsConsalting.objects.select_related("client", "company", "assigned_to").all()
     serializer_class = RequestsConsaltingSerializer
     filter_backends = [DjangoFilterBackend]
     filterset_fields = [
@@ -504,10 +708,165 @@ class RequestsConsaltingListCreateView(CompanyBranchQuerysetMixin, generics.List
         if not f.is_relation or f.many_to_one
     ]
 
+    def get_queryset(self):
+        qs = super().get_queryset().select_related("client", "company", "assigned_to")
+        assigned_to_param = self.request.query_params.get("assigned_to")
+        if assigned_to_param:
+            val = assigned_to_param.strip().lower()
+            if val in ("none", "null", "unassigned"):
+                qs = qs.filter(assigned_to__isnull=True)
+            else:
+                qs = qs.filter(assigned_to_id=assigned_to_param)
+        return qs
+
+    def perform_create(self, serializer):
+        company = self._user_company()
+        if not company:
+            raise PermissionDenied("У пользователя не настроена компания.")
+        target_branch = self._active_branch()
+        kwargs = {"company": company}
+        if target_branch:
+            kwargs["branch"] = target_branch
+        obj = serializer.save(**kwargs)
+        if obj.assigned_to_id:
+            _notify_request_assigned(obj)
+
 
 class RequestsConsaltingRetrieveUpdateDestroyView(CompanyBranchQuerysetMixin, generics.RetrieveUpdateDestroyAPIView):
-    queryset = RequestsConsalting.objects.select_related("client", "company").all()
+    queryset = RequestsConsalting.objects.select_related("client", "company", "assigned_to").all()
     serializer_class = RequestsConsaltingSerializer
+
+    def get_queryset(self):
+        return super().get_queryset().select_related("client", "company", "assigned_to")
+
+    def perform_update(self, serializer):
+        old_assigned = serializer.instance.assigned_to_id
+        obj = serializer.save()
+        if obj.assigned_to_id and obj.assigned_to_id != old_assigned:
+            _notify_request_assigned(obj)
+
+
+def _get_target_user_ids_for_request(request_obj):
+    user_ids = set()
+    if hasattr(request_obj, "owner_id") and request_obj.owner_id:
+        user_ids.add(str(request_obj.owner_id))
+    if hasattr(request_obj, "created_by_id") and request_obj.created_by_id:
+        user_ids.add(str(request_obj.created_by_id))
+    if not user_ids and request_obj.company_id:
+        company = request_obj.company
+        if hasattr(company, "owner_id") and company.owner_id:
+            user_ids.add(str(company.owner_id))
+        else:
+            from apps.users.models import User
+            owners = User.objects.filter(company_id=request_obj.company_id, role__in=["owner", "admin", "ROP"]).values_list("id", flat=True)
+            for uid in owners:
+                user_ids.add(str(uid))
+    return user_ids
+
+
+def _notify_request_accepted(request_obj, acceptor):
+    try:
+        from .funnel.realtime import notify_user
+        user_display = f"{acceptor.first_name or ''} {acceptor.last_name or ''}".strip() or getattr(acceptor, "email", "Сотрудник")
+        payload = {
+            "id": str(request_obj.id),
+            "title": f"{user_display} принял заявку",
+            "message": request_obj.name or "Заявка клиента",
+            "request_id": str(request_obj.id),
+            "client_id": str(request_obj.client_id) if request_obj.client_id else None,
+            "url": "/crm/consulting/client-requests",
+        }
+        target_ids = _get_target_user_ids_for_request(request_obj)
+        for uid in target_ids:
+            if uid != str(acceptor.id):
+                notify_user(uid, "request.accepted", payload)
+    except Exception as e:
+        import logging
+        logging.getLogger("nurcrm").warning("_notify_request_accepted error: %s", e)
+
+
+def _notify_request_declined(request_obj, decliner, reason):
+    try:
+        from .funnel.realtime import notify_user
+        user_display = f"{decliner.first_name or ''} {decliner.last_name or ''}".strip() or getattr(decliner, "email", "Сотрудник")
+        payload = {
+            "id": str(request_obj.id),
+            "title": f"{user_display} отказался от заявки",
+            "message": f"Причина: {reason}",
+            "request_id": str(request_obj.id),
+            "decline_reason": reason,
+            "client_id": str(request_obj.client_id) if request_obj.client_id else None,
+            "url": "/crm/consulting/client-requests",
+        }
+        target_ids = _get_target_user_ids_for_request(request_obj)
+        for uid in target_ids:
+            if uid != str(decliner.id):
+                notify_user(uid, "request.declined", payload)
+    except Exception as e:
+        import logging
+        logging.getLogger("nurcrm").warning("_notify_request_declined error: %s", e)
+
+
+class RequestsConsaltingAcceptView(CompanyBranchQuerysetMixin, generics.GenericAPIView):
+    """
+    POST /api/consalting/requests/<id>/accept/ — сотрудник принимает заявку.
+    """
+    serializer_class = RequestsConsaltingSerializer
+
+    def post(self, request, pk, *args, **kwargs):
+        company = self._user_company()
+        if not company:
+            raise PermissionDenied("У пользователя не настроена компания.")
+
+        request_obj = get_object_or_404(RequestsConsalting, pk=pk, company=company)
+
+        if request_obj.assigned_to_id != request.user.id:
+            raise PermissionDenied("Принять заявку может только назначенный сотрудник.")
+
+        if request_obj.acceptance != RequestsConsalting.Acceptance.PENDING:
+            return Response({"error": "Заявка уже обработана."}, status=status.HTTP_409_CONFLICT)
+
+        request_obj.acceptance = RequestsConsalting.Acceptance.ACCEPTED
+        request_obj.status = RequestsConsalting.Status.IN_WORK
+        request_obj.save(update_fields=["acceptance", "status", "updated_at"])
+
+        _notify_request_accepted(request_obj, request.user)
+
+        return Response(RequestsConsaltingSerializer(request_obj, context=self.get_serializer_context()).data, status=status.HTTP_200_OK)
+
+
+class RequestsConsaltingDeclineView(CompanyBranchQuerysetMixin, generics.GenericAPIView):
+    """
+    POST /api/consalting/requests/<id>/decline/ — сотрудник отказывается от заявки.
+    """
+    serializer_class = RequestsConsaltingSerializer
+
+    def post(self, request, pk, *args, **kwargs):
+        company = self._user_company()
+        if not company:
+            raise PermissionDenied("У пользователя не настроена компания.")
+
+        request_obj = get_object_or_404(RequestsConsalting, pk=pk, company=company)
+
+        if request_obj.assigned_to_id != request.user.id:
+            raise PermissionDenied("Отказаться от заявки может только назначенный сотрудник.")
+
+        if request_obj.acceptance != RequestsConsalting.Acceptance.PENDING:
+            return Response({"error": "Заявка уже обработана."}, status=status.HTTP_409_CONFLICT)
+
+        reason = (request.data.get("reason") or "").strip()
+        if not reason:
+            return Response({"reason": ["Обязательное поле."]}, status=status.HTTP_400_BAD_REQUEST)
+
+        request_obj.decline_reason = reason
+        request_obj.acceptance = RequestsConsalting.Acceptance.DECLINED
+        request_obj.assigned_to = None
+        request_obj.status = RequestsConsalting.Status.NEW
+        request_obj.save(update_fields=["decline_reason", "acceptance", "assigned_to", "status", "updated_at"])
+
+        _notify_request_declined(request_obj, request.user, reason)
+
+        return Response(RequestsConsaltingSerializer(request_obj, context=self.get_serializer_context()).data, status=status.HTTP_200_OK)
 
 
 # ==========================
@@ -542,6 +901,9 @@ class ClientVisibilityMixin:
         qs = super().get_queryset()
         if getattr(self, "swagger_fake_view", False):
             return qs
+        sector_param = self.request.query_params.get("sector")
+        if sector_param and sector_param != "all":
+            qs = qs.filter(sector__in=[sector_param, "all"])
         return apply_client_visibility(qs, getattr(self.request, "user", None))
 
 
@@ -553,7 +915,7 @@ class ClientConsaltingListCreateView(ClientVisibilityMixin, CompanyBranchQueryse
     queryset = Client.objects.select_related("company", "branch", "salesperson", "service").all()
     serializer_class = ClientSerializer
     filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
-    filterset_fields = ["status", "type", "date", "salesperson", "service", "branch"]
+    filterset_fields = ["status", "type", "date", "salesperson", "service", "branch", "sector"]
     search_fields = ["full_name", "phone", "email", "llc", "inn"]
     ordering_fields = ["created_at", "updated_at", "date", "full_name"]
     ordering = ["-created_at"]
@@ -563,6 +925,8 @@ class ClientConsaltingListCreateView(ClientVisibilityMixin, CompanyBranchQueryse
         if not company:
             raise PermissionDenied("У пользователя не настроена компания.")
         kwargs = {"company": company}
+        if not serializer.validated_data.get("sector"):
+            kwargs["sector"] = "consalting"
         active_branch = self._active_branch()
         if active_branch is not None:
             kwargs["branch"] = active_branch
@@ -579,6 +943,171 @@ class ClientConsaltingRetrieveUpdateDestroyView(ClientVisibilityMixin, CompanyBr
     """
     queryset = Client.objects.select_related("company", "branch", "salesperson", "service").all()
     serializer_class = ClientSerializer
+
+
+def serialize_tenant_account(client):
+    """The common response shape for tenant creation, lookup-linking and status."""
+    nur_comp = client.nur_company
+    sub_plan = nur_comp.subscription_plan if nur_comp else None
+    sector = nur_comp.sector if nur_comp else None
+    end_date = None
+    if nur_comp and nur_comp.end_date:
+        end_date = nur_comp.end_date.date().isoformat() if hasattr(nur_comp.end_date, "date") else str(nur_comp.end_date)
+    return {
+        "provision_status": client.provision_status,
+        "provision_status_display": client.get_provision_status_display(),
+        "provision_error": client.provision_error or None,
+        "provisioned_at": client.provisioned_at.isoformat() if client.provisioned_at else None,
+        "nur_company_id": str(client.nur_company_id) if client.nur_company_id else None,
+        "company_name": nur_comp.name if nur_comp else None,
+        "owner_email": nur_comp.owner.email if (nur_comp and nur_comp.owner) else None,
+        "end_date": end_date,
+        "subscription_plan": {"id": str(sub_plan.id), "name": sub_plan.name} if sub_plan else None,
+        "sector": {"id": str(sector.id), "name": sector.name} if sector else None,
+    }
+
+
+class TenantAccountLookupView(CompanyBranchQuerysetMixin, generics.GenericAPIView):
+    """Find a minimal, safe representation of an existing NurCRM account by email."""
+
+    def get(self, request, *args, **kwargs):
+        if not is_owner_like(request.user):
+            raise PermissionDenied("Искать CRM-аккаунты может только руководитель.")
+
+        email = (request.query_params.get("email") or "").strip()
+        company = None
+        if email:
+            company = Company.objects.select_related("owner", "sector").filter(
+                owner__email__iexact=email
+            ).first()
+
+        if not company:
+            return Response({"match": None})
+
+        end_date = company.end_date.date().isoformat() if company.end_date else None
+        return Response({"match": {
+            "nur_company_id": str(company.id),
+            "company_name": company.name,
+            "owner_email": company.owner.email,
+            "sector": {"id": str(company.sector_id), "name": company.sector.name} if company.sector_id else None,
+            "end_date": end_date,
+        }})
+
+
+class ClientTenantAccountView(ClientVisibilityMixin, CompanyBranchQuerysetMixin, generics.GenericAPIView):
+    """
+    Информация о CRM-аккаунте клиента (§10.5).
+    GET /api/consalting/clients/<uuid:pk>/tenant-account/
+    """
+    queryset = Client.objects.select_related("nur_company", "nur_company__owner", "nur_company__sector", "nur_company__subscription_plan").all()
+
+    def get(self, request, *args, **kwargs):
+        client = self.get_object()
+        company = self._user_company()
+        if company and client.company_id != company.id:
+            raise PermissionDenied("Нет доступа к клиенту.")
+
+        nur_comp = client.nur_company
+        sector = nur_comp.sector if nur_comp else None
+
+        if not sector:
+            from .funnel.tenant_lifecycle import resolve_provision_sector_id
+            from apps.users.models import Sector
+            sale = SaleConsalting.objects.filter(client=client).order_by("-created_at").first()
+            lead = LeadConsalting.objects.filter(client=client).order_by("-created_at").first()
+            tariff = (sale.tariff if sale else None) or (lead.tariff if lead else None)
+            try:
+                exp_sec_id = resolve_provision_sector_id(tariff=tariff)
+                sector = Sector.objects.filter(id=exp_sec_id).first()
+            except Exception:
+                pass
+
+        data = serialize_tenant_account(client)
+        # Until an account is provisioned the UI still needs the proposed sector.
+        if not nur_comp and sector:
+            data["sector"] = {"id": str(sector.id), "name": sector.name}
+        return Response(data)
+
+
+class ClientLinkTenantView(ClientVisibilityMixin, CompanyBranchQuerysetMixin, generics.GenericAPIView):
+    """Attach this consulting client to an existing NurCRM tenant account."""
+    queryset = Client.objects.select_related("nur_company", "nur_company__owner", "nur_company__sector", "nur_company__subscription_plan").all()
+
+    def post(self, request, *args, **kwargs):
+        client = self.get_object()
+        company = self._user_company()
+        if company and client.company_id != company.id:
+            raise PermissionDenied("Нет доступа к клиенту.")
+        if not is_owner_like(request.user):
+            raise PermissionDenied("Привязывать CRM-аккаунты может только руководитель.")
+
+        nur_company_id = request.data.get("nur_company_id")
+        if not nur_company_id:
+            return Response({"detail": "Укажите nur_company_id."}, status=status.HTTP_400_BAD_REQUEST)
+
+        from django.core.exceptions import ValidationError as DjangoValidationError
+        from .funnel.tenant_lifecycle import TenantLinkConflict, link_existing_tenant
+        try:
+            link_existing_tenant(client=client, nur_company_id=nur_company_id, actor=request.user)
+        except TenantLinkConflict as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_409_CONFLICT)
+        except DjangoValidationError as exc:
+            detail = getattr(exc, "message_dict", None) or {"detail": exc.messages[0]}
+            return Response(detail, status=status.HTTP_400_BAD_REQUEST)
+
+        client.refresh_from_db()
+        return Response(serialize_tenant_account(client))
+
+
+class ClientProvisionTenantView(ClientVisibilityMixin, CompanyBranchQuerysetMixin, generics.GenericAPIView):
+    """
+    Ручной запуск/повтор создания CRM-аккаунта клиента (§10.5).
+    POST /api/consalting/clients/<uuid:pk>/provision-tenant/
+    """
+    queryset = Client.objects.select_related("nur_company").all()
+
+    def post(self, request, *args, **kwargs):
+        client = self.get_object()
+        company = self._user_company()
+        if company and client.company_id != company.id:
+            raise PermissionDenied("Нет доступа к клиенту.")
+
+        if not is_owner_like(request.user):
+            raise PermissionDenied("Создавать CRM-аккаунты может только руководитель.")
+
+        if client.nur_company_id and client.provision_status == Client.ProvisionStatus.CREATED:
+            return Response({"detail": "Аккаунт уже создан."}, status=status.HTTP_400_BAD_REQUEST)
+
+        # Ищем последнюю подтверждённую продажу / лид клиента
+        sale = SaleConsalting.objects.filter(client=client).order_by("-created_at").first()
+        lead = LeadConsalting.objects.filter(client=client).order_by("-created_at").first()
+        tariff = (sale.tariff if sale else None) or (lead.tariff if lead else None)
+
+        from django.core.exceptions import ValidationError as DjangoValidationError
+        from .funnel.tenant_lifecycle import provision_tenant_account
+
+        crm_sector = request.data.get("crm_sector")
+
+        try:
+            res = provision_tenant_account(
+                client=client,
+                sale=sale,
+                lead=lead,
+                tariff=tariff,
+                actor=request.user,
+                crm_sector=crm_sector,
+            )
+        except DjangoValidationError as e:
+            err_payload = getattr(e, "message_dict", None)
+            if not err_payload:
+                msg = e.messages[0] if hasattr(e, "messages") and e.messages else str(e)
+                err_payload = {"detail": msg}
+            return Response(err_payload, status=status.HTTP_400_BAD_REQUEST)
+
+        client.refresh_from_db()
+        data = serialize_tenant_account(client)
+        data["generated_password"] = res.generated_password
+        return Response(data, status=status.HTTP_200_OK)
 
 
 # ==========================
@@ -621,10 +1150,91 @@ class FunnelConsaltingListCreateView(CompanyBranchQuerysetMixin, generics.ListCr
         return super().create(request, *args, **kwargs)
 
     def perform_create(self, serializer):
-        # пользовательские воронки создаёт только owner/admin (раздел 1.5)
-        if not is_owner_like(self.request.user):
-            raise PermissionDenied("Создавать воронки может только владелец или администратор.")
-        super().perform_create(serializer)
+        user = self.request.user
+        is_mgr = is_owner_like(user)
+        is_sup = is_consulting_supervisor(user)
+        can_create = getattr(user, "can_create_funnel", False)
+
+        if not is_mgr and not is_sup and not can_create:
+            raise PermissionDenied("Нет права на создание воронок.")
+
+        parent = serializer.validated_data.get("parent_funnel")
+        company = self._user_company()
+        if not company:
+            raise PermissionDenied("У пользователя не настроена компания.")
+
+        kwargs = {"company": company}
+        target_branch = self._active_branch()
+        if target_branch:
+            kwargs["branch"] = target_branch
+
+        if is_mgr:
+            if parent:
+                parent_region = getattr(parent, "region_code", "") or (parent.regional_rules.first().region_code if parent.regional_rules.exists() else "")
+                kwargs["region_code"] = parent_region
+                kwargs["funnel_kind"] = FunnelConsalting.FunnelKind.CUSTOM
+            else:
+                kwargs["funnel_kind"] = FunnelConsalting.FunnelKind.CUSTOM
+        elif is_sup:
+            sup_regions = get_user_region_codes(user)
+            if parent:
+                parent_region = getattr(parent, "region_code", "") or (parent.regional_rules.first().region_code if parent.regional_rules.exists() else "")
+                if parent_region and parent_region not in sup_regions:
+                    raise PermissionDenied("Регион вне вашей зоны.")
+                kwargs["region_code"] = parent_region
+            else:
+                reg_code = sup_regions[0] if sup_regions else ""
+                parent = FunnelConsalting.objects.filter(company=company, region_code=reg_code, funnel_kind=FunnelConsalting.FunnelKind.REGION).first()
+                if not parent and reg_code:
+                    parent = FunnelConsalting.objects.filter(company=company, regional_rules__region_code=reg_code).first()
+                kwargs["parent_funnel"] = parent
+                parent_region = getattr(parent, "region_code", "") or (parent.regional_rules.first().region_code if parent and parent.regional_rules.exists() else "")
+                kwargs["region_code"] = parent_region or reg_code
+            kwargs["funnel_kind"] = FunnelConsalting.FunnelKind.EMPLOYEE
+            kwargs["owner_user"] = user
+        else:
+            emp_regions = get_user_region_codes(user)
+            reg_code = emp_regions[0] if emp_regions else ""
+            parent = None
+            if reg_code:
+                parent = FunnelConsalting.objects.filter(company=company, region_code=reg_code, funnel_kind=FunnelConsalting.FunnelKind.REGION).first()
+                if not parent:
+                    parent = FunnelConsalting.objects.filter(company=company, regional_rules__region_code=reg_code).first()
+            kwargs["parent_funnel"] = parent
+            parent_region = getattr(parent, "region_code", "") or (parent.regional_rules.first().region_code if parent and parent.regional_rules.exists() else "")
+            kwargs["region_code"] = parent_region or reg_code
+            kwargs["funnel_kind"] = FunnelConsalting.FunnelKind.EMPLOYEE
+            kwargs["owner_user"] = user
+
+        funnel = serializer.save(**kwargs)
+
+        if not funnel.stages.exists():
+            FunnelStageConsalting.objects.create(
+                company=company, funnel=funnel, name="Новый", order=1, system_key="intake",
+                is_system=True, stage_type=FunnelStageConsalting.StageType.NEW_LEAD, color="#3498db"
+            )
+            FunnelStageConsalting.objects.create(
+                company=company, funnel=funnel, name="В работе", order=2, system_key="in_progress",
+                is_system=True, stage_type=FunnelStageConsalting.StageType.NURTURE, color="#f39c12"
+            )
+            FunnelStageConsalting.objects.create(
+                company=company, funnel=funnel, name="Завершено", order=3, system_key="completed",
+                is_system=True, stage_type=FunnelStageConsalting.StageType.COMPLETED,
+                is_final=True, is_success=True, color="#2ecc71"
+            )
+
+        if funnel.owner_user:
+            EmployeeFunnelGrant.objects.get_or_create(
+                employee=funnel.owner_user,
+                funnel=funnel,
+                defaults={"can_manage_leads": True, "can_manage_stages": True}
+            )
+
+        try:
+            from .funnel.realtime import notify_company
+            notify_company(company.id, "funnel.created", serializer.data)
+        except Exception:
+            pass
 
 
 class FunnelConsaltingRetrieveUpdateDestroyView(CompanyBranchQuerysetMixin, generics.RetrieveUpdateDestroyAPIView):
@@ -632,14 +1242,91 @@ class FunnelConsaltingRetrieveUpdateDestroyView(CompanyBranchQuerysetMixin, gene
     serializer_class = FunnelConsaltingSerializer
 
     def perform_update(self, serializer):
-        if not (is_owner_like(self.request.user) or can_manage_stages(self.request.user, serializer.instance)):
-            raise PermissionDenied("Изменять воронки может только владелец или администратор.")
-        super().perform_update(serializer)
+        user = self.request.user
+        funnel = serializer.instance
+        is_mgr = is_owner_like(user)
+        is_sup = is_consulting_supervisor(user)
+        is_owner_user = (funnel.owner_user_id == user.id)
 
-    def perform_destroy(self, instance):
-        if not (is_owner_like(self.request.user) or can_manage_stages(self.request.user, instance)):
-            raise PermissionDenied("Удалять воронки может только владелец или администратор.")
-        instance.delete()
+        if not (is_mgr or is_sup or is_owner_user or can_manage_stages(user, funnel)):
+            raise PermissionDenied("Изменять воронку может только владелец, руководитель или автор.")
+
+        if not is_mgr and not is_sup:
+            if "parent_funnel" in serializer.validated_data:
+                serializer.validated_data.pop("parent_funnel")
+        elif is_sup and "parent_funnel" in serializer.validated_data:
+            parent = serializer.validated_data["parent_funnel"]
+            if parent:
+                sup_regions = get_user_region_codes(user)
+                parent_region = getattr(parent, "region_code", "") or (parent.regional_rules.first().region_code if parent.regional_rules.exists() else "")
+                if parent_region and parent_region not in sup_regions:
+                    raise PermissionDenied("Регион вне вашей зоны.")
+                serializer.validated_data["region_code"] = parent_region
+        elif is_mgr and "parent_funnel" in serializer.validated_data:
+            parent = serializer.validated_data["parent_funnel"]
+            if parent:
+                parent_region = getattr(parent, "region_code", "") or (parent.regional_rules.first().region_code if parent.regional_rules.exists() else "")
+                serializer.validated_data["region_code"] = parent_region
+
+        if "owner_user" in serializer.validated_data:
+            serializer.validated_data.pop("owner_user")
+
+        funnel = serializer.save()
+
+        try:
+            from .funnel.realtime import notify_company
+            notify_company(funnel.company_id, "funnel.updated", serializer.data)
+        except Exception:
+            pass
+
+    def destroy(self, request, *args, **kwargs):
+        instance = self.get_object()
+        user = request.user
+        is_mgr = is_owner_like(user)
+        is_owner_user = (instance.owner_user_id == user.id)
+
+        # Main/static funnels are routing infrastructure and can never be
+        # removed.  A role funnel, however, may be removed by management;
+        # regular employees must not delete it even if they happen to be set
+        # as its owner.
+        if instance.is_main or instance.is_static or instance.funnel_kind == FunnelConsalting.FunnelKind.MAIN:
+            raise PermissionDenied("Нет прав на удаление этой воронки.")
+
+        if not is_mgr and (
+            not is_owner_user
+            or instance.funnel_kind == FunnelConsalting.FunnelKind.ROLE
+            or instance.custom_role_id is not None
+        ):
+            raise PermissionDenied("Нет прав на удаление этой воронки.")
+
+        open_leads_count = instance.leads.exclude(
+            queue_status__in=(
+                LeadConsalting.QueueStatus.CONVERTED,
+                LeadConsalting.QueueStatus.REJECTED,
+            )
+        ).count()
+        if open_leads_count > 0:
+            return Response(
+                {
+                    "detail": (
+                        f"В воронке есть {open_leads_count} незакрытых лид(ов). "
+                        "Перенесите или закройте их перед удалением."
+                    )
+                },
+                status=status.HTTP_409_CONFLICT
+            )
+
+        company_id = instance.company_id
+        funnel_id = instance.id
+        response = super().destroy(request, *args, **kwargs)
+
+        try:
+            from .funnel.realtime import notify_company
+            notify_company(company_id, "funnel.deleted", {"id": str(funnel_id)})
+        except Exception:
+            pass
+
+        return response
 
 
 def _serialize_board(funnel, request, context):
@@ -647,14 +1334,31 @@ def _serialize_board(funnel, request, context):
     from django.db.models import Q, Count, Sum
     from datetime import timedelta
     from apps.consalting.models import WhatsAppMessageConsalting
+    from .access import is_owner_like, is_consulting_supervisor, is_consulting_salesperson, get_user_region_codes
 
     user = request.user
     is_mgr = is_owner_like(user)
+    is_sup = is_consulting_supervisor(user)
+    is_sales = is_consulting_salesperson(user)
 
-    base_qs = LeadConsalting.objects.filter(funnel=funnel, is_archived=False)
+    # Основная воронка является общей доской компании. Региональная маршрутизация
+    # физически оставляет лид в воронке региона, однако руководитель должен видеть
+    # такой лид и на общей доске. Не меняем ``lead.funnel``: это представление, а не
+    # перенос лида между воронками.
+    if funnel.is_main:
+        base_qs = LeadConsalting.objects.filter(
+            company=funnel.company,
+            is_archived=False,
+        )
+    else:
+        base_qs = LeadConsalting.objects.filter(funnel=funnel, is_archived=False)
 
-    # 1. Защита доступа на уровне строки
-    if not is_mgr:
+    # 1. Защита доступа на уровне строки (§1, §5)
+    if is_mgr or is_sup:
+        pass
+    elif is_sales:
+        base_qs = base_qs.filter(owner=user)
+    else:
         base_qs = base_qs.filter(Q(owner=user) | Q(owner__isnull=True))
 
     # 2. Фильтры поиска, грейда, риска, неотвеченных и ответственного
@@ -678,7 +1382,7 @@ def _serialize_board(funnel, request, context):
         ).exclude(whatsapp_messages__status=WhatsAppMessageConsalting.Status.READ)
 
     specific_owner = request.GET.get("owner")
-    if specific_owner and is_mgr:
+    if specific_owner and (is_mgr or is_sup):
         base_qs = base_qs.filter(owner_id=specific_owner)
 
     # 3. Счётчики по всем скоупам (mine, pool, all) с учётом фильтров
@@ -689,15 +1393,18 @@ def _serialize_board(funnel, request, context):
     )
     scope_counts = {
         "mine": scope_agg["mine_cnt"] or 0,
-        "pool": scope_agg["pool_cnt"] or 0,
-        "all": (scope_agg["all_cnt"] or 0) if is_mgr else None,
+        "pool": (scope_agg["pool_cnt"] or 0) if not is_sales else 0,
+        "all": (scope_agg["all_cnt"] or 0) if (is_mgr or is_sup) else None,
     }
 
     # 4. Применение запрошенного скоупа (owner_scope)
+    can_see_all = is_mgr or is_sup
     owner_scope = request.GET.get("owner_scope")
     if not owner_scope:
-        owner_scope = "all" if is_mgr else "mine"
-    elif not is_mgr and owner_scope == "all":
+        owner_scope = "all" if can_see_all else "mine"
+    elif not can_see_all and owner_scope == "all":
+        owner_scope = "mine"
+    elif is_sales and owner_scope == "pool":
         owner_scope = "mine"
 
     scoped_qs = base_qs
@@ -718,9 +1425,30 @@ def _serialize_board(funnel, request, context):
 
     columns = []
     now = timezone.now()
+    board_stages = list(funnel.stages.all().order_by("order", "created_at"))
+    # A funnel may contain several custom stages with the same semantic type.
+    # Route external (regional) cards only into the first such column, otherwise
+    # a card would be duplicated on the aggregate board.
+    canonical_stage_ids = {}
+    if funnel.is_main:
+        for board_stage in board_stages:
+            canonical_stage_ids.setdefault(board_stage.stage_type, board_stage.id)
 
-    for stage in funnel.stages.all():
-        stage_qs = scoped_qs.filter(stage=stage).select_related("stage", "owner", "client")
+    for stage in board_stages:
+        # У региональных воронок свои объекты стадий. На общей доске объединяем
+        # лиды по типу стадии (new_lead, in_work, won, ...), а не по UUID стадии.
+        # Поэтому лид из «Ош» на стадии new_lead отображается в «Новый лид»
+        # основной воронки, но остаётся лидом воронки «Ош».
+        if funnel.is_main:
+            stage_filter = Q(stage=stage)
+            if canonical_stage_ids[stage.stage_type] == stage.id:
+                stage_filter |= (
+                    Q(stage__stage_type=stage.stage_type) & ~Q(funnel=funnel)
+                )
+            stage_qs = scoped_qs.filter(stage_filter)
+        else:
+            stage_qs = scoped_qs.filter(stage=stage)
+        stage_qs = stage_qs.select_related("stage", "owner", "client")
         stage_count = stage_qs.count()
         stage_amount = float(stage_qs.aggregate(s=Sum("estimated_value"))["s"] or 0)
 
@@ -742,8 +1470,14 @@ def _serialize_board(funnel, request, context):
     no_stage_qs = scoped_qs.filter(stage__isnull=True).select_related("owner", "client")
     unassigned_leads = list(no_stage_qs)
 
+    funnel_data = FunnelConsaltingSerializer(funnel, context=context).data
+    # The board can apply owner/search/status filters.  Reuse its exact
+    # aggregate for the badge so ``funnel.leads_count`` and ``totals.count``
+    # never describe different sets of cards in one response.
+    funnel_data["leads_count"] = totals["count"]
+
     return {
-        "funnel": FunnelConsaltingSerializer(funnel, context=context).data,
+        "funnel": funnel_data,
         "scope_counts": scope_counts,
         "totals": totals,
         "columns": columns,
@@ -1019,7 +1753,12 @@ class FunnelUserPreferenceView(CompanyBranchQuerysetMixin, generics.GenericAPIVi
         return Response({"funnel_order": funnel_order})
 
     def patch(self, request, *args, **kwargs):
-        ser = self.get_serializer(data=request.data)
+        payload = request.data.copy() if hasattr(request.data, 'copy') else dict(request.data)
+        if "owner" not in payload:
+            oid = payload.get("owner_id") or payload.get("new_owner_id")
+            if oid:
+                payload["owner"] = oid
+        ser = self.get_serializer(data=payload)
         ser.is_valid(raise_exception=True)
         funnel_order = ser.validated_data["funnel_order"]
         pref, _ = FunnelUserPreferenceConsalting.objects.get_or_create(user=request.user)
@@ -1049,19 +1788,366 @@ class LeadVisibilityMixin:
         return apply_lead_visibility(qs, getattr(self.request, "user", None))
 
 
+class LeadPagination(PageNumberPagination):
+    page_size = 50
+    page_size_query_param = 'page_size'
+    max_page_size = 500
+
+
 class LeadConsaltingListCreateView(LeadVisibilityMixin, CompanyBranchQuerysetMixin, generics.ListCreateAPIView):
     queryset = LeadConsalting.objects.select_related("funnel", "stage", "owner", "client", "company").all()
     serializer_class = LeadConsaltingSerializer
-    filter_backends = [DjangoFilterBackend]
-    filterset_fields = ["funnel", "stage", "owner", "client", "status", "branch",
-                        "is_archived", "service", "tariff"]
+    pagination_class = LeadPagination
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        company = self._user_company()
+        if not company:
+            return LeadConsalting.objects.none()
+
+        qp = self.request.query_params
+
+        queue_param = qp.get("queue")
+        if queue_param:
+            qp_lower = queue_param.lower().strip()
+            if qp_lower == "new":
+                qs = qs.filter(queue_status__in=["new", "assigned"])
+            elif qp_lower in ("in_work", "deferred", "converted", "rejected"):
+                qs = qs.filter(queue_status=qp_lower)
+
+        status_param = qp.get("status")
+        if status_param and not queue_param:
+            statuses = [s.strip() for s in status_param.split(",") if s.strip()]
+            if statuses:
+                qs = qs.filter(queue_status__in=statuses)
+
+        owner_param = qp.get("owner")
+        if owner_param:
+            op_lower = owner_param.lower().strip()
+            if op_lower in ("none", "null", "unassigned"):
+                qs = qs.filter(owner__isnull=True)
+            elif op_lower in ("mine", "my"):
+                qs = qs.filter(owner=self.request.user)
+            elif op_lower not in ("all", ""):
+                try:
+                    import uuid
+                    qs = qs.filter(owner_id=uuid.UUID(owner_param))
+                except ValueError:
+                    pass
+
+        channel_param = qp.get("channel")
+        if channel_param:
+            qs = qs.filter(channel=channel_param)
+
+        region_param = qp.get("region")
+        if region_param:
+            qs = qs.filter(region_code=region_param)
+
+        search_param = qp.get("search")
+        if search_param:
+            s = search_param.strip()
+            qs = qs.filter(
+                Q(title__icontains=s) |
+                Q(full_name__icontains=s) |
+                Q(phone__icontains=s) |
+                Q(description__icontains=s)
+            )
+
+        date_from = qp.get("date_from")
+        if date_from:
+            try:
+                from datetime import datetime
+                df = datetime.strptime(date_from.strip(), "%Y-%m-%d").date()
+                qs = qs.filter(created_at__date__gte=df)
+            except ValueError:
+                pass
+
+        date_to = qp.get("date_to")
+        if date_to:
+            try:
+                from datetime import datetime
+                dt = datetime.strptime(date_to.strip(), "%Y-%m-%d").date()
+                qs = qs.filter(created_at__date__lte=dt)
+            except ValueError:
+                pass
+
+        overdue_param = qp.get("overdue")
+        if overdue_param and overdue_param.lower() in ("true", "1"):
+            qs = qs.filter(
+                queue_status="deferred",
+                remind_at__lte=timezone.now()
+            )
+
+        funnel_param = qp.get("funnel")
+        if funnel_param:
+            try:
+                import uuid
+                qs = qs.filter(funnel_id=uuid.UUID(funnel_param))
+            except ValueError:
+                pass
+
+        ordering = qp.get("ordering", "-created_at")
+        allowed_orderings = {
+            "created_at": "created_at",
+            "-created_at": "-created_at",
+            "updated_at": "updated_at",
+            "-updated_at": "-updated_at",
+            "remind_at": "remind_at",
+            "-remind_at": "-remind_at",
+            "full_name": "full_name",
+            "-full_name": "-full_name",
+            "title": "title",
+            "-title": "-title",
+            "queue_status": "queue_status",
+            "-queue_status": "-queue_status",
+        }
+        ord_field = allowed_orderings.get(ordering, "-created_at")
+        qs = qs.order_by(ord_field)
+        return qs
 
     def perform_create(self, serializer):
+        company = self._user_company()
+        if not company:
+            raise PermissionDenied("У пользователя не настроена компания.")
+
         funnel = serializer.validated_data.get("funnel")
+        if not funnel:
+            funnel = FunnelConsalting.objects.filter(company=company, is_main=True).first() or FunnelConsalting.objects.filter(company=company).first()
+            if not funnel:
+                funnel = FunnelConsalting.objects.create(company=company, name="Основная воронка", is_main=True)
+
+        stage = serializer.validated_data.get("stage")
+        if not stage and funnel:
+            stage = funnel.stages.order_by("order").first()
+            if not stage:
+                stage = FunnelStageConsalting.objects.create(company=company, funnel=funnel, name="Новый", order=1, system_key="intake")
+
         if funnel and not can_manage_leads(self.request.user, funnel):
             raise PermissionDenied("Нет прав создавать лиды в этой воронке.")
-        super().perform_create(serializer)
-        realtime.lead_created(serializer.instance)
+
+        channel = serializer.validated_data.get("channel") or "manual"
+        queue_status = serializer.validated_data.get("queue_status") or "new"
+
+        lead = serializer.save(
+            company=company,
+            funnel=funnel,
+            stage=stage,
+            channel=channel,
+            queue_status=queue_status,
+            address=serializer.validated_data.get("address") or "",
+        )
+
+        try:
+            InboundLeadConsalting.objects.create(
+                company=company,
+                lead=lead,
+                full_name=lead.full_name or lead.title,
+                phone=lead.phone,
+                email=lead.email,
+                source=lead.channel or "manual",
+                message=lead.description,
+                status=lead.queue_status,
+                owner=lead.owner,
+                remind_at=lead.remind_at,
+                defer_reason=lead.defer_reason,
+                defer_comment=lead.defer_comment,
+                defer_count=lead.defer_count,
+                deferred_at=lead.deferred_at,
+                reminded_at=lead.reminded_at,
+                reject_reason=lead.reject_reason,
+                reject_comment=lead.reject_comment,
+                first_reply_at=lead.first_reply_at,
+                converted_at=lead.converted_at,
+                closed_at=lead.closed_at,
+                external_id=lead.inbound_external_id or f"lead:{lead.id}",
+            )
+        except Exception:
+            pass
+
+        realtime.lead_created(lead)
+
+
+class LeadConsaltingCountersView(LeadVisibilityMixin, CompanyBranchQuerysetMixin, generics.GenericAPIView):
+    """
+    GET /api/consalting/leads/counters/ — Счётчики по статусам очереди единой базы лидов.
+    """
+    queryset = LeadConsalting.objects.all()
+
+    def get(self, request, *args, **kwargs):
+        company = self._user_company()
+        if not company:
+            return Response({"all": 0, "new": 0, "in_work": 0, "deferred": 0, "converted": 0, "rejected": 0, "overdue": 0})
+
+        qs = self.filter_queryset(self.get_queryset()).filter(company=company)
+        qp = request.query_params
+
+        owner_param = qp.get("owner")
+        if owner_param:
+            op_lower = owner_param.lower().strip()
+            if op_lower in ("none", "null", "unassigned"):
+                qs = qs.filter(owner__isnull=True)
+            elif op_lower in ("mine", "my"):
+                qs = qs.filter(owner=request.user)
+            elif op_lower not in ("all", ""):
+                try:
+                    import uuid
+                    qs = qs.filter(owner_id=uuid.UUID(owner_param))
+                except ValueError:
+                    pass
+
+        channel_param = qp.get("channel")
+        if channel_param:
+            qs = qs.filter(channel=channel_param)
+
+        region_param = qp.get("region")
+        if region_param:
+            qs = qs.filter(region_code=region_param)
+
+        search_param = qp.get("search")
+        if search_param:
+            s = search_param.strip()
+            qs = qs.filter(
+                Q(title__icontains=s) |
+                Q(full_name__icontains=s) |
+                Q(phone__icontains=s) |
+                Q(description__icontains=s)
+            )
+
+        date_from = qp.get("date_from")
+        if date_from:
+            try:
+                from datetime import datetime
+                df = datetime.strptime(date_from.strip(), "%Y-%m-%d").date()
+                qs = qs.filter(created_at__date__gte=df)
+            except ValueError:
+                pass
+
+        date_to = qp.get("date_to")
+        if date_to:
+            try:
+                from datetime import datetime
+                dt = datetime.strptime(date_to.strip(), "%Y-%m-%d").date()
+                qs = qs.filter(created_at__date__lte=dt)
+            except ValueError:
+                pass
+
+        funnel_param = qp.get("funnel")
+        if funnel_param:
+            try:
+                import uuid
+                qs = qs.filter(funnel_id=uuid.UUID(funnel_param))
+            except ValueError:
+                pass
+
+        now = timezone.now()
+        return Response({
+            "all": qs.count(),
+            "new": qs.filter(queue_status__in=["new", "assigned"]).count(),
+            "in_work": qs.filter(queue_status="in_work").count(),
+            "deferred": qs.filter(queue_status="deferred").count(),
+            "converted": qs.filter(queue_status="converted").count(),
+            "rejected": qs.filter(queue_status="rejected").count(),
+            "overdue": qs.filter(queue_status="deferred", remind_at__lte=now).count(),
+        })
+
+
+class LeadConsaltingAnalyticsView(LeadVisibilityMixin, CompanyBranchQuerysetMixin, generics.GenericAPIView):
+    """
+    GET /api/consalting/leads/analytics/ — Аналитика единой базы лидов.
+    """
+    queryset = LeadConsalting.objects.all()
+
+    def get(self, request, *args, **kwargs):
+        company = self._user_company()
+        if not company:
+            return Response({})
+
+        qs = self.filter_queryset(self.get_queryset()).filter(company=company)
+        qp = request.query_params
+
+        date_from = qp.get("date_from")
+        if date_from:
+            try:
+                from datetime import datetime
+                df = datetime.strptime(date_from.strip(), "%Y-%m-%d").date()
+                qs = qs.filter(created_at__date__gte=df)
+            except ValueError:
+                pass
+
+        date_to = qp.get("date_to")
+        if date_to:
+            try:
+                from datetime import datetime
+                dt = datetime.strptime(date_to.strip(), "%Y-%m-%d").date()
+                qs = qs.filter(created_at__date__lte=dt)
+            except ValueError:
+                pass
+
+        owner_param = qp.get("owner")
+        if owner_param and owner_param not in ("all", ""):
+            try:
+                import uuid
+                qs = qs.filter(owner_id=uuid.UUID(owner_param))
+            except ValueError:
+                pass
+
+        channel_param = qp.get("channel")
+        if channel_param:
+            qs = qs.filter(channel=channel_param)
+
+        region_param = qp.get("region")
+        if region_param:
+            qs = qs.filter(region_code=region_param)
+
+        total = qs.count()
+        converted = qs.filter(queue_status="converted").count()
+        rejected = qs.filter(queue_status="rejected").count()
+        conversion_rate = round((converted / total * 100), 2) if total > 0 else 0.0
+
+        by_channel = list(
+            qs.values("channel")
+              .annotate(count=Count("id"))
+              .order_by("-count")
+        )
+
+        by_user = list(
+            qs.values("owner_id", "owner__first_name", "owner__last_name", "owner__email")
+              .annotate(count=Count("id"))
+              .order_by("-count")
+        )
+
+        by_day = list(
+            qs.extra(select={'day': "DATE(created_at)"})
+              .values('day')
+              .annotate(count=Count("id"))
+              .order_by("day")
+        )
+
+        defer_reasons = list(
+            qs.filter(queue_status="deferred")
+              .values("defer_reason")
+              .annotate(count=Count("id"))
+              .order_by("-count")
+        )
+
+        reject_reasons = list(
+            qs.filter(queue_status="rejected")
+              .values("reject_reason")
+              .annotate(count=Count("id"))
+              .order_by("-count")
+        )
+
+        return Response({
+            "total_leads": total,
+            "converted_leads": converted,
+            "rejected_leads": rejected,
+            "conversion_rate": conversion_rate,
+            "by_channel": by_channel,
+            "by_user": by_user,
+            "by_day": by_day,
+            "defer_reasons": defer_reasons,
+            "reject_reasons": reject_reasons,
+        })
 
 
 class LeadConsaltingRetrieveUpdateDestroyView(LeadVisibilityMixin, CompanyBranchQuerysetMixin, generics.RetrieveUpdateDestroyAPIView):
@@ -1148,21 +2234,44 @@ class LeadMoveStageView(LeadVisibilityMixin, CompanyBranchQuerysetMixin, generic
         )
 
 
-class LeadClaimView(LeadVisibilityMixin, CompanyBranchQuerysetMixin, generics.GenericAPIView):
+class LeadClaimView(CompanyBranchQuerysetMixin, generics.GenericAPIView):
     """
     «Взять» лид себе: ставит owner=текущий пользователь.
     POST /api/consalting/leads/<uuid:pk>/claim/
 
-    Доступны только лиды из общего пула (owner=None) или уже свои (видимость
-    миксина). После взятия карточка пропадает у остальных сотрудников.
+    Доступны лиды из общего пула (owner=None) или уже свои в пределах разрешённого региона.
     """
     queryset = LeadConsalting.objects.select_related("funnel", "stage", "owner").all()
     serializer_class = LeadConsaltingSerializer
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        if getattr(self, "swagger_fake_view", False):
+            return qs
+        user = getattr(self.request, "user", None)
+        if is_owner_like(user):
+            return qs
+        if not user or not getattr(user, "is_authenticated", False):
+            return qs.none()
+        if is_consulting_supervisor(user):
+            user_regions = get_user_region_codes(user)
+            return qs.filter(region_code__in=user_regions)
+        if is_consulting_salesperson(user):
+            user_regions = get_user_region_codes(user)
+            q = Q(owner=user) | Q(owner__isnull=True)
+            if user_regions:
+                q &= Q(region_code__in=user_regions)
+            return qs.filter(q)
+        return qs.filter(Q(owner__isnull=True) | Q(owner=user))
 
     def post(self, request, *args, **kwargs):
         lead = self.get_object()
         if not can_manage_leads(request.user, lead.funnel):
             raise PermissionDenied("Нет прав брать лиды в этой воронке.")
+        if is_consulting_salesperson(request.user):
+            user_regions = get_user_region_codes(request.user)
+            if user_regions and lead.region_code and lead.region_code not in user_regions:
+                raise PermissionDenied("Нельзя брать лиды из чужого региона.")
         if lead.owner_id and lead.owner_id != request.user.id and not is_owner_like(request.user):
             return Response(
                 {"detail": "Лид уже взят другим сотрудником."},
@@ -1205,11 +2314,23 @@ class LeadAssignView(CompanyBranchQuerysetMixin, generics.GenericAPIView):
     serializer_class = LeadAssignSerializer
 
     def post(self, request, *args, **kwargs):
-        if not is_owner_like(request.user):
+        is_mgr = is_owner_like(request.user)
+        is_sup = is_consulting_supervisor(request.user)
+        if not is_mgr and not is_sup:
             raise PermissionDenied("Назначать ответственного может только руководитель.")
 
         company = self._user_company()
         lead = self.get_object()
+
+        if is_sup:
+            my_regions = request.user.get_consulting_region_codes()
+            lead_region = lead.region_code
+            if not lead_region and lead.funnel:
+                rule = lead.funnel.regional_rules.filter(is_active=True).first()
+                lead_region = rule.region_code if rule else ""
+            if lead_region not in my_regions:
+                raise PermissionDenied("Нет доступа к лидам вне вашего региона.")
+
         ser = self.get_serializer(data=request.data)
         ser.is_valid(raise_exception=True)
         owner = ser.validated_data["owner"]
@@ -1218,12 +2339,98 @@ class LeadAssignView(CompanyBranchQuerysetMixin, generics.GenericAPIView):
             return Response({"owner": "Сотрудник из другой компании."},
                             status=status.HTTP_400_BAD_REQUEST)
 
+        if is_sup:
+            owner_regions = owner.get_consulting_region_codes()
+            lead_reg = lead.region_code
+            if not lead_reg and lead.funnel:
+                rule = lead.funnel.regional_rules.filter(is_active=True).first()
+                lead_reg = rule.region_code if rule else ""
+            if lead_reg and lead_reg not in owner_regions:
+                raise PermissionDenied("Назначить можно только сотрудника этого региона.")
+
         if lead.owner_id != owner.id:
             lead.owner = owner
-            lead.save(update_fields=["owner", "updated_at"])
+            if lead.queue_status in ("new", None, ""):
+                lead.queue_status = "assigned"
+            lead.save(update_fields=["owner", "queue_status", "updated_at"])
             realtime.lead_claimed(lead)
             # персональное уведомление назначенному сотруднику
             realtime.notify_user(owner.id, "lead.assigned", realtime.serialize_lead(lead))
+        return Response(LeadConsaltingSerializer(lead, context=self.get_serializer_context()).data)
+
+
+class LeadDeferView(LeadVisibilityMixin, CompanyBranchQuerysetMixin, generics.GenericAPIView):
+    """
+    POST /api/consalting/leads/<uuid:pk>/defer/ — отложить лид.
+    Body: { "remind_at": "ISO-8601", "reason": "...", "comment": "..." }
+    """
+    queryset = LeadConsalting.objects.select_related("funnel", "stage", "owner").all()
+
+    def post(self, request, *args, **kwargs):
+        lead = self.get_object()
+        remind_at_str = request.data.get("remind_at")
+        reason = (request.data.get("reason") or "").strip()
+        comment = (request.data.get("comment") or "").strip()
+
+        if not remind_at_str:
+            return Response({"remind_at": "Укажите дату и время напоминания."}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            from django.utils.dateparse import parse_datetime, parse_date
+            remind_at = parse_datetime(str(remind_at_str).strip())
+            if not remind_at:
+                d = parse_date(str(remind_at_str).strip())
+                if d:
+                    import datetime
+                    remind_at = timezone.make_aware(datetime.datetime.combine(d, datetime.time.min))
+            if not remind_at:
+                return Response({"remind_at": "Неверный формат даты."}, status=status.HTTP_400_BAD_REQUEST)
+        except Exception:
+            return Response({"remind_at": "Неверный формат даты."}, status=status.HTTP_400_BAD_REQUEST)
+
+        now = timezone.now()
+        lead.queue_status = "deferred"
+        lead.remind_at = remind_at
+        lead.defer_reason = reason
+        lead.defer_comment = comment
+        lead.deferred_at = now
+        lead.defer_count = (lead.defer_count or 0) + 1
+        lead.save()
+
+        InboundLeadConsalting.objects.filter(lead=lead).update(
+            status="deferred",
+            remind_at=remind_at,
+            defer_reason=reason,
+            defer_comment=comment,
+            deferred_at=now,
+            defer_count=lead.defer_count,
+        )
+
+        realtime.lead_updated(lead)
+        return Response(LeadConsaltingSerializer(lead, context=self.get_serializer_context()).data)
+
+
+class LeadResumeView(LeadVisibilityMixin, CompanyBranchQuerysetMixin, generics.GenericAPIView):
+    """
+    POST /api/consalting/leads/<uuid:pk>/resume/ — вернуть лид в работу.
+    """
+    queryset = LeadConsalting.objects.select_related("funnel", "stage", "owner").all()
+
+    def post(self, request, *args, **kwargs):
+        lead = self.get_object()
+        now = timezone.now()
+        lead.queue_status = "in_work"
+        lead.remind_at = None
+        lead.reminded_at = now
+        lead.save()
+
+        InboundLeadConsalting.objects.filter(lead=lead).update(
+            status="in_work",
+            remind_at=None,
+            reminded_at=now,
+        )
+
+        realtime.lead_updated(lead)
         return Response(LeadConsaltingSerializer(lead, context=self.get_serializer_context()).data)
 
 
@@ -1296,43 +2503,50 @@ class LeadMarkMessagesReadView(LeadVisibilityMixin, CompanyBranchQuerysetMixin, 
 
     def post(self, request, *args, **kwargs):
         lead = self.get_object()
-        from .models import WhatsAppMessageConsalting, WazzupAccountConsalting
+        from .models import ChatReadStateConsalting, WhatsAppMessageConsalting, WazzupAccountConsalting
         from .funnel.wazzup import WazzupConsaltingService
 
-        updated = WhatsAppMessageConsalting.objects.filter(
+        now = timezone.now()
+        unread_qs = WhatsAppMessageConsalting.objects.filter(
             lead=lead, direction=WhatsAppMessageConsalting.Direction.INBOUND
-        ).exclude(status=WhatsAppMessageConsalting.Status.READ).update(
-            status=WhatsAppMessageConsalting.Status.READ
         )
+        state, created = ChatReadStateConsalting.objects.get_or_create(
+            lead=lead,
+            employee=request.user,
+            defaults={"last_read_at": now},
+        )
+        if created:
+            marked_read_count = unread_qs.count()
+        else:
+            marked_read_count = (
+                unread_qs.filter(created_at__gt=state.last_read_at).count()
+                if state.last_read_at else unread_qs.count()
+            )
+            state.last_read_at = now
+            state.save(update_fields=["last_read_at"])
 
         account = WazzupAccountConsalting.objects.filter(company=lead.company, is_active=True).first()
         if account and lead.phone:
             WazzupConsaltingService.mark_chat_read(account, lead.phone)
 
         realtime.lead_updated(lead)
-        return Response({"status": "ok", "marked_read_count": updated})
+        return Response({"status": "ok", "marked_read_count": marked_read_count})
 
 
 class LeadTransferView(LeadVisibilityMixin, CompanyBranchQuerysetMixin, generics.GenericAPIView):
     """
-    Передать лид в другую воронку: создаёт НОВЫЙ лид в целевой воронке,
-    копируя ключевые поля; исходный лид остаётся без изменений.
+    Передать лид в другую воронку: обновляет funnel, stage и опционально owner у существующего лида.
     POST /api/consalting/leads/<uuid:pk>/transfer/
-        { "target_funnel": "<uuid>", "target_stage": "<uuid|null>" }
+        { "target_funnel": "<uuid>", "target_stage": "<uuid|null>", "owner": "<uuid|null>" }
     """
-    queryset = LeadConsalting.objects.select_related("funnel", "stage").all()
+    queryset = LeadConsalting.objects.select_related("funnel", "stage", "owner").all()
     serializer_class = LeadConsaltingSerializer
-
-    _COPY_FIELDS = (
-        "title", "full_name", "phone", "email", "source", "description",
-        "estimated_value", "probability", "urgency",
-    )
 
     def post(self, request, *args, **kwargs):
         company = self._user_company()
         lead = self.get_object()
 
-        # права на исходную воронку
+        # Права на исходную воронку
         if not can_manage_leads(request.user, lead.funnel):
             raise PermissionDenied("Нет прав управлять лидами в исходной воронке.")
 
@@ -1344,18 +2558,19 @@ class LeadTransferView(LeadVisibilityMixin, CompanyBranchQuerysetMixin, generics
         except (FunnelConsalting.DoesNotExist, ValueError, TypeError):
             return Response({"target_funnel": "Воронка не найдена."}, status=status.HTTP_404_NOT_FOUND)
 
-        if target_funnel.id == lead.funnel_id:
+        new_owner_id = request.data.get("owner") or request.data.get("owner_id")
+        if target_funnel.id == lead.funnel_id and not new_owner_id:
             return Response({"target_funnel": "Нельзя передать в ту же воронку."},
                             status=status.HTTP_400_BAD_REQUEST)
 
-        # права на целевую воронку
+        # Права на целевую воронку
         if not can_manage_leads(request.user, target_funnel):
             raise PermissionDenied("Нет прав управлять лидами в целевой воронке.")
 
-        # целевая стадия: переданная (должна быть из target_funnel) или intake
+        # Целевая стадия: переданная (должна быть из target_funnel) или intake / первая стадия по порядку
         target_stage = None
         target_stage_id = request.data.get("target_stage")
-        if target_stage_id:
+        if target_stage_id and str(target_stage_id).strip().lower() != "null":
             try:
                 target_stage = FunnelStageConsalting.objects.get(id=target_stage_id)
             except (FunnelStageConsalting.DoesNotExist, ValueError, TypeError):
@@ -1371,42 +2586,57 @@ class LeadTransferView(LeadVisibilityMixin, CompanyBranchQuerysetMixin, generics
                 or FunnelStageConsalting.objects.filter(funnel=target_funnel).order_by("order").first()
             )
 
-        # создаём новый лид в целевой воронке
-        data = {f: getattr(lead, f) for f in self._COPY_FIELDS}
-        new_lead = LeadConsalting.objects.create(
-            company=target_funnel.company,
-            branch=target_funnel.branch,
-            funnel=target_funnel,
-            stage=target_stage,
-            owner=None,
-            status=LeadConsalting.Status.NEW,
-            source_lead=lead,
-            stage_entered_at=timezone.now(),
-            **data,
-        )
+        target_rule = target_funnel.regional_rules.filter(is_active=True).first()
+        target_region = target_rule.region_code if target_rule and target_rule.region_code else lead.region_code
 
-        # аудит на исходном лиде (best-effort)
+        new_owner = None
+        if new_owner_id and str(new_owner_id).strip().lower() != "null":
+            try:
+                new_owner = User.objects.get(id=new_owner_id, company=company)
+                if is_consulting_supervisor(request.user):
+                    owner_regions = new_owner.get_consulting_region_codes()
+                    if target_region and target_region not in owner_regions:
+                        raise PermissionDenied(
+                            "Назначить можно только сотрудника этого региона."
+                        )
+            except (User.DoesNotExist, ValueError, TypeError):
+                return Response({"owner": "Сотрудник не найден."}, status=status.HTTP_400_BAD_REQUEST)
+
+        old_funnel = lead.funnel
+        lead.funnel = target_funnel
+        lead.stage = target_stage
+        lead.region_code = target_region
+        lead.stage_entered_at = timezone.now()
+        if new_owner:
+            lead.owner = new_owner
+            if lead.queue_status in ("new", None, ""):
+                lead.queue_status = "assigned"
+        lead.save(update_fields=["funnel", "stage", "region_code", "owner", "queue_status", "stage_entered_at", "updated_at"])
+
         try:
             ActivityLogger.log(
-                lead, LeadActivityConsalting.Type.SYSTEM, actor=request.user,
+                lead,
+                activity_type=LeadActivityConsalting.Type.SYSTEM,
+                actor=request.user,
                 title=f"Лид передан в воронку «{target_funnel.name}»",
+                body=f"Лид перенесён из воронки «{old_funnel.name if old_funnel else ''}» в «{target_funnel.name}»."
+                     + (f" Ответственный: {lead.owner.email}." if lead.owner else ""),
                 payload={
                     "type": "lead_transferred",
-                    "from_funnel": str(lead.funnel_id),
+                    "from_funnel": str(old_funnel.id) if old_funnel else None,
                     "to_funnel": str(target_funnel.id),
-                    "source_lead_id": str(lead.id),
-                    "new_lead_id": str(new_lead.id),
+                    "lead_id": str(lead.id),
                     "actor_id": str(request.user.id),
                 },
                 touch_last_activity=False,
             )
-        except Exception:
+        except Exception as e:
             pass
 
-        realtime.lead_created(new_lead)
+        realtime.lead_updated(lead)
         return Response(
-            LeadConsaltingSerializer(new_lead, context=self.get_serializer_context()).data,
-            status=status.HTTP_201_CREATED,
+            LeadConsaltingSerializer(lead, context=self.get_serializer_context()).data,
+            status=status.HTTP_200_OK,
         )
 
 
@@ -1506,9 +2736,9 @@ class LeadArchivedListView(CompanyBranchQuerysetMixin, generics.ListAPIView):
 
 class LeadCreateClientView(LeadVisibilityMixin, CompanyBranchQuerysetMixin, generics.GenericAPIView):
     """
-    Создать клиента из лида и привязать к лиду.
+    Создать клиента из лида или найти существующего (§8.3, §8.5).
     POST /api/consalting/leads/<uuid:pk>/create-client/
-        { "full_name", "phone", "email", "service"?, "note"? }
+        { "full_name"?, "phone"?, "email"?, "service"?, "force_merge"?: bool }
     """
     queryset = LeadConsalting.objects.select_related("funnel", "service", "client").all()
     serializer_class = LeadConsaltingSerializer
@@ -1519,34 +2749,46 @@ class LeadCreateClientView(LeadVisibilityMixin, CompanyBranchQuerysetMixin, gene
             raise PermissionDenied("Нет прав управлять лидами в этой воронке.")
         company = self._user_company()
 
-        if lead.client_id:
-            client = lead.client
-        else:
-            service = lead.service
-            service_id = request.data.get("service")
-            if service_id:
-                service = ServicesConsalting.objects.filter(id=service_id, company=company).first() or service
-            client = Client.objects.create(
-                company=company,
-                branch=lead.branch,
-                full_name=request.data.get("full_name") or lead.full_name or lead.title,
-                phone=request.data.get("phone") or lead.phone or "",
-                email=request.data.get("email") or lead.email or "",
-                salesperson=request.user,
-                service=service,
+        had_client = bool(lead.client_id)
+        fn = request.data.get("full_name")
+        if fn:
+            lead.full_name = fn
+        ph = request.data.get("phone")
+        if ph:
+            lead.phone = ph
+        em = request.data.get("email")
+        if em:
+            lead.email = em
+        srv_id = request.data.get("service")
+        if srv_id:
+            lead.service_id = srv_id
+
+        from .funnel.lead_conversion import resolve_client_from_lead
+        from django.core.exceptions import ValidationError as DjangoValidationError
+
+        try:
+            client, merged, warning = resolve_client_from_lead(
+                lead, user=request.user, force_create=True, return_meta=True
             )
-            lead.client = client
-            lead.save(update_fields=["client", "updated_at"])
-            realtime.lead_updated(lead)
+        except DjangoValidationError as e:
+            return Response(
+                getattr(e, "message_dict", {"detail": e.messages if hasattr(e, "messages") else str(e)}),
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        lead.refresh_from_db()
+        realtime.lead_updated(lead)
 
         ctx = self.get_serializer_context()
-        return Response(
-            {
-                "client": ClientSerializer(client, context=ctx).data,
-                "lead": LeadConsaltingSerializer(lead, context=ctx).data,
-            },
-            status=status.HTTP_201_CREATED,
-        )
+        data = {
+            "client_id": str(client.id),
+            "merged": merged,
+            "client_display": client.full_name or "Клиент",
+            "duplicate_warning": warning,
+            "client": ClientSerializer(client, context=ctx).data,
+            "lead": LeadConsaltingSerializer(lead, context=ctx).data,
+        }
+        return Response(data, status=status.HTTP_200_OK if had_client else status.HTTP_201_CREATED)
 
 
 class LeadRegisterPaymentView(LeadVisibilityMixin, CompanyBranchQuerysetMixin, generics.GenericAPIView):
@@ -1567,9 +2809,23 @@ class LeadRegisterPaymentView(LeadVisibilityMixin, CompanyBranchQuerysetMixin, g
         lead = self.get_object()
         if not can_manage_leads(request.user, lead.funnel):
             raise PermissionDenied("Нет прав управлять лидами в этой воронке.")
+
         if not lead.client_id:
-            return Response({"detail": "У лида должен быть указан или создан клиент перед регистрацией оплаты."},
-                            status=status.HTTP_400_BAD_REQUEST)
+            from .funnel.lead_conversion import resolve_client_from_lead
+            try:
+                resolve_client_from_lead(lead, user=request.user)
+            except DjangoValidationError as e:
+                return Response(
+                    getattr(e, "message_dict", {"detail": e.messages if hasattr(e, "messages") else str(e)}),
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+        if lead.tariff and getattr(lead.tariff, "provisions_crm_account", False):
+            if not (lead.email or (lead.client and lead.client.email)):
+                return Response(
+                    {"detail": "Сначала создайте клиента из лида или укажите email для автосоздания аккаунта."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
 
         mode = request.data.get("payment_mode")
         if mode not in ("cash", "transfer", "debt", "installment"):
@@ -1622,34 +2878,119 @@ class LeadRegisterPaymentView(LeadVisibilityMixin, CompanyBranchQuerysetMixin, g
         lead.save(update_fields=["payment_registered", "payment_mode", "payment_deal", "updated_at"])
 
         # Абонентская подписка и график платежей (§5.3, §5.6)
-        sub_enabled = request.data.get("subscription_enabled")
-        if sub_enabled is None:
-            sub_enabled = True if (lead.tariff and (lead.tariff.subscription_amount or 0) > 0) else False
+        from .models import ServicesConsalting, TariffConsalting
+        service_id = request.data.get("services")
+        if service_id and not lead.service_id:
+            lead.service = ServicesConsalting.objects.filter(id=service_id, company=lead.company).first()
+        tariff_id = request.data.get("tariff")
+        if tariff_id and not lead.tariff_id:
+            lead.tariff = TariffConsalting.objects.filter(id=tariff_id, company=lead.company).first()
 
+        paid_months_val = request.data.get("paid_months")
+        try:
+            paid_months = max(1, int(paid_months_val)) if paid_months_val is not None else 1
+        except (ValueError, TypeError):
+            paid_months = 1
+
+        sub_enabled = request.data.get("subscription_enabled")
         sub_amount = request.data.get("subscription_amount")
         sub_period = request.data.get("subscription_period")
         sub_start = request.data.get("subscription_start")
+        prepaid_periods = request.data.get("subscription_prepaid_periods")
+
+        tariff = lead.tariff
+        if sub_enabled is None:
+            sub_enabled = True if ((tariff and (tariff.subscription_amount or 0) > 0) or (sub_amount and float(sub_amount) > 0)) else False
+
+        service = lead.service or (tariff.service if tariff else None)
+        if not service and lead.company:
+            service = ServicesConsalting.objects.filter(company=lead.company).first()
+
+        effective_sub_amount = sub_amount if sub_amount not in (None, "") else (tariff.subscription_amount if tariff else 0)
+        effective_sub_period = sub_period if sub_period not in (None, "") else (tariff.subscription_period if tariff else "month")
 
         sale = SaleConsalting.objects.filter(lead=lead).first()
-        if not sale and (sub_enabled or (lead.tariff and (lead.tariff.subscription_amount or 0) > 0)):
-            tariff = lead.tariff
+        if not sale:
             sale = SaleConsalting.objects.create(
                 company=lead.company, branch=lead.branch, user=lead.owner or request.user,
-                services=lead.service, tariff=tariff, client=lead.client, lead=lead,
+                services=service, tariff=tariff, client=lead.client, lead=lead,
                 total=amount,
-                subscription_amount=sub_amount or (tariff.subscription_amount if tariff else 0),
-                subscription_period=sub_period or (tariff.subscription_period if tariff else "month"),
+                paid_months=paid_months,
+                subscription_amount=effective_sub_amount or 0,
+                subscription_period=effective_sub_period or "month",
+                status=SaleConsalting.Status.COMPLETED,
             )
+        else:
+            sale.paid_months = paid_months
+            sale.subscription_amount = effective_sub_amount or 0
+            sale.subscription_period = effective_sub_period or "month"
+            sale.save(update_fields=["paid_months", "subscription_amount", "subscription_period"])
 
-        if sale:
+        from .funnel.cash_confirmation import needs_confirmation
+        from .models import CashRequestConsalting, CashOperationConsalting
+
+        if needs_confirmation(lead.company, mode, request.user):
+            sale.status = SaleConsalting.Status.PENDING_CONFIRMATION
+            sale.save(update_fields=["status"])
+            CashRequestConsalting.objects.create(
+                company=lead.company,
+                sale=sale,
+                user=request.user,
+                client=lead.client,
+                kind=CashRequestConsalting.Kind.SALE,
+                direction="income",
+                amount=amount,
+                payment_method=mode,
+                status=CashRequestConsalting.Status.PENDING,
+            )
             from .funnel.completion import create_sale_side_effects
             create_sale_side_effects(
                 sale,
                 subscription_enabled=sub_enabled,
                 subscription_start=sub_start,
-                subscription_amount=sub_amount,
-                subscription_period=sub_period,
+                subscription_amount=effective_sub_amount,
+                subscription_period=effective_sub_period,
+                subscription_prepaid_periods=prepaid_periods,
+                payment_method=mode,
+                actor=request.user,
             )
+        else:
+            CashOperationConsalting.objects.create(
+                company=lead.company,
+                user=request.user,
+                sale=sale,
+                kind=CashOperationConsalting.Kind.SALE,
+                direction=CashOperationConsalting.Direction.INCOME,
+                amount=amount,
+                payment_method=mode,
+                comment=f"Оплата по лиду: {lead.title or 'Лид'}",
+            )
+            from .funnel.completion import create_sale_side_effects, accrue_salary_for_sale
+            create_sale_side_effects(
+                sale,
+                subscription_enabled=sub_enabled,
+                subscription_start=sub_start,
+                subscription_amount=effective_sub_amount,
+                subscription_period=effective_sub_period,
+                subscription_prepaid_periods=prepaid_periods,
+                payment_method=mode,
+                actor=request.user,
+            )
+            accrue_salary_for_sale(sale, seller=sale.user)
+            if tariff and getattr(tariff, "provisions_crm_account", False):
+                from .funnel.tenant_lifecycle import provision_tenant_account
+                try:
+                    provision_tenant_account(client=lead.client, sale=sale, lead=lead, tariff=tariff, actor=request.user)
+                except Exception as ex:
+                    import logging
+                    logging.getLogger("nurcrm.consalting").warning("Auto-provision failed: %s", ex)
+
+        # Цепочка «регион -> внедрение» (§5.1, §5.3)
+        funnel = lead.funnel
+        if funnel and funnel.next_funnel_id and not funnel.is_final:
+            from .funnel.hierarchy import move_lead_to_next_funnel
+            move_lead_to_next_funnel(lead, funnel, user=request.user, transition="payment")
+            lead.refresh_from_db()
 
         return Response(
             {"deal_id": str(deal.id), "lead": LeadConsaltingSerializer(lead, context=self.get_serializer_context()).data},
@@ -1765,8 +3106,17 @@ class LeadWinView(CompanyBranchQuerysetMixin, generics.GenericAPIView):
         if not stage:
             return Response({"detail": "В воронке нет WON-стадии."}, status=status.HTTP_400_BAD_REQUEST)
 
+        now = timezone.now()
         lead.budget_confirmed = True  # выигрыш подразумевает подтверждённый бюджет
-        LeadConsalting.objects.filter(pk=lead.pk).update(budget_confirmed=True)
+        lead.queue_status = "converted"
+        lead.converted_at = now
+        lead.closed_at = now
+        LeadConsalting.objects.filter(pk=lead.pk).update(
+            budget_confirmed=True, queue_status="converted", converted_at=now, closed_at=now
+        )
+        InboundLeadConsalting.objects.filter(lead=lead).update(
+            status="converted", converted_at=now, closed_at=now
+        )
         try:
             lead = FunnelStateMachine.transition(lead, stage, actor=request.user)
         except StateTransitionError as e:
@@ -1798,10 +3148,26 @@ class LeadLoseView(CompanyBranchQuerysetMixin, generics.GenericAPIView):
         if not stage:
             return Response({"detail": "В воронке нет LOST-стадии."}, status=status.HTTP_400_BAD_REQUEST)
 
+        now = timezone.now()
         lead.loss_reason = loss_reason
         lead.loss_comment = v.get("loss_comment", "")
+        lead.queue_status = "rejected"
+        lead.reject_reason = loss_reason.label if loss_reason else ""
+        lead.reject_comment = v.get("loss_comment", "")
+        lead.closed_at = now
         LeadConsalting.objects.filter(pk=lead.pk).update(
-            loss_reason=loss_reason, loss_comment=lead.loss_comment
+            loss_reason=loss_reason,
+            loss_comment=lead.loss_comment,
+            queue_status="rejected",
+            reject_reason=lead.reject_reason,
+            reject_comment=lead.reject_comment,
+            closed_at=now,
+        )
+        InboundLeadConsalting.objects.filter(lead=lead).update(
+            status="rejected",
+            reject_reason=lead.reject_reason,
+            reject_comment=lead.reject_comment,
+            closed_at=now,
         )
         try:
             lead = FunnelStateMachine.transition(lead, stage, actor=request.user)
@@ -2848,9 +4214,36 @@ class InboundLeadListCreateView(CompanyBranchQuerysetMixin, generics.ListCreateA
         qs = InboundLeadConsalting.objects.filter(company=company).select_related("owner", "sale", "lead")
 
         user = self.request.user
-        if not is_owner_like(user):
+        is_mgr = is_owner_like(user)
+        is_sup = is_consulting_supervisor(user)
+
+        if is_sup:
+            my_regions = user.get_consulting_region_codes()
+            qs = qs.filter(region_code__in=my_regions)
+            region_param = self.request.query_params.get("region")
+            if region_param and region_param in my_regions:
+                qs = qs.filter(region_code=region_param)
+            owner_param = self.request.query_params.get("owner")
+            if owner_param:
+                op_lower = owner_param.lower().strip()
+                if op_lower in ("none", "null", "unassigned"):
+                    qs = qs.filter(owner__isnull=True)
+                elif op_lower in ("mine", "my"):
+                    qs = qs.filter(owner=user)
+                elif op_lower not in ("all", ""):
+                    try:
+                        uuid_val = uuid.UUID(owner_param)
+                        qs = qs.filter(owner_id=uuid_val)
+                    except ValueError:
+                        pass
+        elif not is_mgr:
+            if not getattr(user, "can_view_leads_inbox", False):
+                raise PermissionDenied("У вас нет доступа к входящим лидам.")
             qs = qs.filter(owner=user)
         else:
+            region_param = self.request.query_params.get("region")
+            if region_param:
+                qs = qs.filter(region_code=region_param)
             owner_param = self.request.query_params.get("owner")
             if owner_param:
                 op_lower = owner_param.lower().strip()
@@ -2931,6 +4324,11 @@ class InboundLeadListCreateView(CompanyBranchQuerysetMixin, generics.ListCreateA
         if not company:
             raise PermissionDenied("У пользователя не настроена компания.")
         inbound_lead = serializer.save(company=company)
+        if is_consulting_supervisor(self.request.user):
+            my_regions = self.request.user.get_consulting_region_codes()
+            if my_regions and not inbound_lead.region_code:
+                inbound_lead.region_code = my_regions[0]
+                inbound_lead.save(update_fields=["region_code"])
         distribute_inbound_lead(inbound_lead)
 
 
@@ -2945,7 +4343,9 @@ class InboundLeadRetrieveUpdateView(CompanyBranchQuerysetMixin, generics.Retriev
         if not company:
             return InboundLeadConsalting.objects.none()
         qs = InboundLeadConsalting.objects.filter(company=company).select_related("owner")
-        if not is_owner_like(self.request.user):
+        if is_consulting_supervisor(self.request.user):
+            qs = qs.filter(region_code__in=self.request.user.get_consulting_region_codes())
+        elif not is_owner_like(self.request.user):
             qs = qs.filter(owner=self.request.user)
         return qs
 
@@ -2960,15 +4360,29 @@ class InboundLeadAssignView(CompanyBranchQuerysetMixin, generics.GenericAPIView)
         company = self._user_company()
         if not company:
             raise PermissionDenied("У пользователя не настроена компания.")
-        if not is_owner_like(request.user):
+        is_mgr = is_owner_like(request.user)
+        is_sup = is_consulting_supervisor(request.user)
+        if not is_mgr and not is_sup:
             raise PermissionDenied("Назначать лиды может только руководитель.")
 
         inbound_lead = get_object_or_404(InboundLeadConsalting, pk=pk, company=company)
+
+        if is_sup:
+            my_regions = request.user.get_consulting_region_codes()
+            if inbound_lead.region_code not in my_regions:
+                raise PermissionDenied("Нет доступа к лидам вне вашего региона.")
+
         owner_id = request.data.get("owner")
         if not owner_id:
             return Response({"owner": "Обязательное поле."}, status=status.HTTP_400_BAD_REQUEST)
 
         new_owner = get_object_or_404(User, pk=owner_id, company=company)
+
+        if is_sup:
+            new_owner_regions = new_owner.get_consulting_region_codes()
+            if inbound_lead.region_code and inbound_lead.region_code not in new_owner_regions:
+                raise PermissionDenied("Назначить можно только сотрудника этого региона.")
+
         inbound_lead.owner = new_owner
         inbound_lead.status = InboundLeadConsalting.Status.ASSIGNED
         inbound_lead.save(update_fields=["owner", "status", "updated_at"])
@@ -3489,6 +4903,41 @@ class InboundLeadAnalyticsView(CompanyBranchQuerysetMixin, generics.GenericAPIVi
         )
         reject_reasons = [{"reason": item["reject_reason"], "count": item["count"]} for item in reject_reasons_qs]
 
+        # §8.7 Рекламные затраты (LeadAdSpend)
+        ad_qs = LeadAdSpend.objects.filter(company=company)
+        if date_from_str:
+            try:
+                ad_df = datetime.strptime(date_from_str.strip(), "%Y-%m-%d").date()
+                ad_qs = ad_qs.filter(date__gte=ad_df)
+            except ValueError:
+                pass
+        if date_to_str:
+            try:
+                ad_dt = datetime.strptime(date_to_str.strip(), "%Y-%m-%d").date()
+                ad_qs = ad_qs.filter(date__lte=ad_dt)
+            except ValueError:
+                pass
+        ad_agg = ad_qs.aggregate(
+            total_spend=Sum("spend"),
+            total_impressions=Sum("impressions"),
+            reported_leads=Sum("leads"),
+        )
+        total_spend = Decimal(str(ad_agg["total_spend"] or "0.00"))
+        total_impressions = int(ad_agg["total_impressions"] or 0)
+        reported_leads = int(ad_agg["reported_leads"] or 0)
+        actual_leads = leads_count
+        cost_per_lead = (total_spend / Decimal(str(reported_leads))).quantize(Decimal("0.01")) if reported_leads > 0 else Decimal("0.00")
+        cost_per_actual_lead = (total_spend / Decimal(str(actual_leads))).quantize(Decimal("0.01")) if actual_leads > 0 else Decimal("0.00")
+
+        ad_spend_data = {
+            "total_spend": f"{total_spend:.2f}",
+            "total_impressions": total_impressions,
+            "reported_leads": reported_leads,
+            "actual_leads": actual_leads,
+            "cost_per_lead": f"{cost_per_lead:.2f}",
+            "cost_per_actual_lead": f"{cost_per_actual_lead:.2f}",
+        }
+
         return Response({
             "totals": totals,
             "by_source": by_source_list,
@@ -3496,6 +4945,7 @@ class InboundLeadAnalyticsView(CompanyBranchQuerysetMixin, generics.GenericAPIVi
             "by_day": by_day_list,
             "defer_reasons": defer_reasons,
             "reject_reasons": reject_reasons,
+            "ad_spend": ad_spend_data,
         })
 
 
@@ -3565,7 +5015,18 @@ class WhatsAppInboundWebhookView(APIView):
             status=InboundLeadConsalting.Status.NEW
         )
 
-        distribute_inbound_lead(inbound_lead)
+        from .funnel.regional_routing import resolve_funnel_and_assignee
+        reg_funnel, reg_stage, reg_rule, reg_user = resolve_funnel_and_assignee(
+            company=company,
+            phone=phone,
+            source="whatsapp"
+        )
+        if reg_user:
+            inbound_lead.owner = reg_user
+            inbound_lead.status = InboundLeadConsalting.Status.ASSIGNED
+            inbound_lead.save(update_fields=["owner", "status", "updated_at"])
+        else:
+            distribute_inbound_lead(inbound_lead)
         return Response({"status": "success", "id": str(inbound_lead.id)}, status=status.HTTP_200_OK)
 
 
@@ -3584,22 +5045,281 @@ class SubscriptionPaymentPayView(CompanyBranchQuerysetMixin, generics.GenericAPI
             raise PermissionDenied("Нет доступа к платежу данной компании.")
 
         if payment.status == SubscriptionPaymentConsalting.Status.PAID:
-            return Response({"detail": "Платёж уже оплачен."}, status=status.HTTP_400_BAD_REQUEST)
+            return Response({"detail": "Период уже оплачен."}, status=status.HTTP_400_BAD_REQUEST)
 
-        cashbox = request.data.get("cashbox")
         payment_method = request.data.get("payment_method") or "cash"
+        cashbox = request.data.get("cashbox")
+        pay_amount = request.data.get("amount")
+        if pay_amount is not None:
+            try:
+                pay_amount = Decimal(str(pay_amount))
+                if pay_amount < payment.amount:
+                    return Response({"detail": "Частичная оплата не поддерживается."}, status=status.HTTP_400_BAD_REQUEST)
+            except Exception:
+                pass
+
+        from .funnel.cash_confirmation import needs_confirmation
+        from .models import CashRequestConsalting, CashOperationConsalting
+
+        if needs_confirmation(company, payment_method, request.user):
+            CashRequestConsalting.objects.create(
+                company=company,
+                user=request.user,
+                client=payment.subscription.client if hasattr(payment, "subscription") and payment.subscription else None,
+                subscription_payment=payment,
+                kind=CashRequestConsalting.Kind.SUBSCRIPTION,
+                direction="income",
+                amount=payment.amount,
+                payment_method=payment_method,
+                status=CashRequestConsalting.Status.PENDING,
+            )
+            return Response(SubscriptionPaymentConsaltingSerializer(payment).data)
 
         payment.status = SubscriptionPaymentConsalting.Status.PAID
         payment.paid_at = timezone.now()
         if cashbox:
+            import uuid
             try:
                 payment.cashbox_id = uuid.UUID(str(cashbox))
-            except ValueError:
+            except (ValueError, TypeError):
                 pass
         payment.payment_method = payment_method
         payment.save()
 
+        CashOperationConsalting.objects.create(
+            company=company,
+            user=request.user,
+            kind=CashOperationConsalting.Kind.SUBSCRIPTION,
+            direction=CashOperationConsalting.Direction.INCOME,
+            amount=payment.amount,
+            payment_method=payment_method,
+            comment=f"Оплата абонентской платы ({payment.period_month})",
+        )
+
+        if hasattr(payment, "subscription") and payment.subscription and payment.subscription.client:
+            from .funnel.tenant_lifecycle import extend_tenant_subscription
+            extend_tenant_subscription(
+                client=payment.subscription.client,
+                subscription_payment=payment,
+                actor=request.user,
+            )
+
         return Response(SubscriptionPaymentConsaltingSerializer(payment).data)
+
+
+class SubscriptionPayPeriodsView(CompanyBranchQuerysetMixin, generics.GenericAPIView):
+    """
+    Оплата нескольких периодов абонентской платы сразу (§5.4a).
+    POST /api/consalting/subscriptions/<uuid:pk>/pay-periods/
+    { "count": 3, "cashbox": "uuid|null", "payment_method": "cash|transfer", "note": "" }
+    """
+    queryset = SubscriptionConsalting.objects.select_related("company", "client", "service").all()
+    serializer_class = SubscriptionConsaltingSerializer
+
+    def post(self, request, *args, **kwargs):
+        sub = self.get_object()
+        company = self._user_company()
+        if company and sub.company_id != company.id:
+            raise PermissionDenied("Нет доступа к подписке данной компании.")
+
+        try:
+            count = int(request.data.get("count") or 1)
+        except (ValueError, TypeError):
+            count = 1
+        if count < 1:
+            count = 1
+
+        payment_method = request.data.get("payment_method") or "cash"
+        cashbox = request.data.get("cashbox")
+        note = request.data.get("note") or ""
+
+        # Find unpaid periods
+        unpaid_qs = sub.payments.filter(
+            status__in=[SubscriptionPaymentConsalting.Status.PLANNED, SubscriptionPaymentConsalting.Status.OVERDUE]
+        ).order_by("due_date")
+
+        # If needed, extend schedule
+        if unpaid_qs.count() < count:
+            needed_months = (count - unpaid_qs.count()) + 12
+            generate_schedule(sub, horizon_months=needed_months)
+            unpaid_qs = sub.payments.filter(
+                status__in=[SubscriptionPaymentConsalting.Status.PLANNED, SubscriptionPaymentConsalting.Status.OVERDUE]
+            ).order_by("due_date")
+
+        selected_payments = list(unpaid_qs[:count])
+        if not selected_payments:
+            return Response({"detail": "Нет доступных периодов для оплаты."}, status=status.HTTP_400_BAD_REQUEST)
+
+        first_period = selected_payments[0].period_month
+        last_period = selected_payments[-1].period_month
+        period_range = first_period if len(selected_payments) == 1 else f"{first_period}..{last_period}"
+        actual_count = len(selected_payments)
+        total_amount = sum(p.amount for p in selected_payments)
+
+        # Idempotency: within 24h
+        from datetime import timedelta
+        from .funnel.cash_confirmation import needs_confirmation
+        cutoff = timezone.now() - timedelta(hours=24)
+        existing_req = CashRequestConsalting.objects.filter(
+            company=sub.company,
+            subscription=sub,
+            period_month=period_range,
+            prepaid_count=actual_count,
+            status=CashRequestConsalting.Status.PENDING,
+            created_at__gte=cutoff,
+        ).first()
+        if existing_req:
+            return Response({
+                "detail": "Заявка на оплату уже создана.",
+                "cash_request_id": str(existing_req.id),
+                "periods_count": actual_count,
+                "amount": float(existing_req.amount),
+                "period_range": period_range,
+            }, status=status.HTTP_200_OK)
+
+        cashbox_uuid = None
+        if cashbox:
+            import uuid
+            try:
+                cashbox_uuid = uuid.UUID(str(cashbox))
+            except (ValueError, TypeError):
+                pass
+
+        if needs_confirmation(sub.company, payment_method, request.user):
+            req = CashRequestConsalting.objects.create(
+                company=sub.company,
+                user=request.user,
+                client=sub.client,
+                subscription=sub,
+                subscription_payment=selected_payments[0],
+                kind=CashRequestConsalting.Kind.SUBSCRIPTION,
+                direction="income",
+                amount=total_amount,
+                payment_method=payment_method,
+                comment=note or f"Оплата {actual_count} периодов абонентской платы ({period_range})",
+                cashbox_id=cashbox_uuid,
+                period_month=period_range,
+                prepaid_count=actual_count,
+                status=CashRequestConsalting.Status.PENDING,
+            )
+            return Response({
+                "detail": "Заявка на оплату создана.",
+                "cash_request_id": str(req.id),
+                "periods_count": actual_count,
+                "amount": float(total_amount),
+                "period_range": period_range,
+            }, status=status.HTTP_201_CREATED)
+
+        now = timezone.now()
+        for p in selected_payments:
+            p.status = SubscriptionPaymentConsalting.Status.PAID
+            p.paid_at = now
+            p.paid_via = "batch_pay"
+            p.payment_method = payment_method
+            p.cashbox_id = cashbox_uuid
+            p.save(update_fields=["status", "paid_at", "paid_via", "payment_method", "cashbox_id"])
+
+        sub.paid_through = selected_payments[-1].due_date
+        sub.save(update_fields=["paid_through"])
+
+        CashOperationConsalting.objects.create(
+            company=sub.company,
+            user=request.user,
+            subscription=sub,
+            kind=CashOperationConsalting.Kind.SUBSCRIPTION,
+            direction=CashOperationConsalting.Direction.INCOME,
+            amount=total_amount,
+            payment_method=payment_method,
+            cashbox_id=cashbox_uuid,
+            comment=note or f"Оплата {actual_count} периодов абонентской платы ({period_range})",
+        )
+
+        if sub.client:
+            from .funnel.tenant_lifecycle import extend_tenant_subscription
+            extend_tenant_subscription(client=sub.client, subscription_payment=selected_payments[-1], actor=request.user)
+
+        return Response({
+            "detail": f"Оплачено {actual_count} периодов.",
+            "periods_count": actual_count,
+            "amount": float(total_amount),
+            "period_range": period_range,
+            "paid_through": str(sub.paid_through),
+        }, status=status.HTTP_200_OK)
+
+
+class SubscriptionExtendView(CompanyBranchQuerysetMixin, generics.GenericAPIView):
+    """Manually append periods to a subscription schedule (§5.8.2)."""
+    queryset = SubscriptionConsalting.objects.select_related("company", "client", "service", "tariff").all()
+    serializer_class = SubscriptionConsaltingSerializer
+
+    def post(self, request, *args, **kwargs):
+        if not can_manage_lead_ad_spend(request.user):
+            raise PermissionDenied("Нет прав управлять графиком абонентской платы.")
+        sub = self.get_object()
+        company = self._user_company()
+        if company and sub.company_id != company.id:
+            raise PermissionDenied("Нет доступа к подписке данной компании.")
+        if sub.status in (SubscriptionConsalting.Status.CANCELED, SubscriptionConsalting.Status.FINISHED):
+            raise PermissionDenied("Нельзя продлить отменённую или завершённую подписку.")
+
+        try:
+            periods = int(request.data.get("periods"))
+        except (TypeError, ValueError):
+            periods = 0
+        if periods < 1:
+            return Response({"periods": "Укажите целое число не меньше 1."}, status=status.HTTP_400_BAD_REQUEST)
+
+        new_amount = request.data.get("amount")
+        if new_amount not in (None, ""):
+            try:
+                new_amount = Decimal(str(new_amount))
+            except Exception:
+                return Response({"amount": "Укажите корректную сумму."}, status=status.HTTP_400_BAD_REQUEST)
+            if new_amount <= 0:
+                return Response({"amount": "Сумма должна быть больше нуля."}, status=status.HTTP_400_BAD_REQUEST)
+
+        with transaction.atomic():
+            if new_amount is not None and new_amount != "":
+                sub.amount = new_amount
+                sub.save(update_fields=["amount"])
+            # generate_schedule starts immediately after the actual tail of the
+            # schedule, so it cannot create gaps or duplicate period months.
+            generate_schedule(sub, horizon_months=periods)
+
+        return Response(SubscriptionConsaltingSerializer(sub).data)
+
+
+class SubscriptionAmountUpdateView(CompanyBranchQuerysetMixin, generics.GenericAPIView):
+    """Change the price of unpaid subscription periods without rewriting history (§5.8.3)."""
+    queryset = SubscriptionConsalting.objects.select_related("company", "client", "service", "tariff").all()
+    serializer_class = SubscriptionConsaltingSerializer
+
+    def patch(self, request, *args, **kwargs):
+        if not can_manage_lead_ad_spend(request.user):
+            raise PermissionDenied("Нет прав управлять графиком абонентской платы.")
+        sub = self.get_object()
+        company = self._user_company()
+        if company and sub.company_id != company.id:
+            raise PermissionDenied("Нет доступа к подписке данной компании.")
+
+        try:
+            amount = Decimal(str(request.data.get("amount")))
+        except Exception:
+            return Response({"amount": "Укажите корректную сумму."}, status=status.HTTP_400_BAD_REQUEST)
+        if amount <= 0:
+            return Response({"amount": "Сумма должна быть больше нуля."}, status=status.HTTP_400_BAD_REQUEST)
+
+        with transaction.atomic():
+            sub.amount = amount
+            sub.save(update_fields=["amount"])
+            sub.payments.filter(
+                status__in=[
+                    SubscriptionPaymentConsalting.Status.PLANNED,
+                    SubscriptionPaymentConsalting.Status.OVERDUE,
+                ]
+            ).update(amount=amount)
+
+        return Response(SubscriptionConsaltingSerializer(sub).data)
 
 
 class ClientSubscriptionsListView(CompanyBranchQuerysetMixin, generics.ListAPIView):
@@ -4373,6 +6093,15 @@ class SaleCancellationsReportView(CompanyBranchQuerysetMixin, generics.GenericAP
 # ==========================
 # Подтверждение поступлений в кассе (§9.4, §9.5, §9.6)
 # ==========================
+def _can_manage_cash(user):
+    if not user or not getattr(user, "is_authenticated", False):
+        return False
+    if is_owner_like(user):
+        return True
+    role = str(getattr(user, "role", "")).lower()
+    return role in ("cashier", "кассир") or getattr(user, "is_cashier", False)
+
+
 class CashRequestsListView(CompanyBranchQuerysetMixin, generics.ListAPIView):
     """
     Список заявок на кассовые операции (§9.4).
@@ -4390,7 +6119,7 @@ class CashRequestsListView(CompanyBranchQuerysetMixin, generics.ListAPIView):
         )
 
         # Обычный сотрудник видит только свои заявки (§9.6)
-        if not is_owner_like(self.request.user):
+        if not _can_manage_cash(self.request.user):
             qs = qs.filter(user=self.request.user)
 
         status_param = self.request.query_params.get("status")
@@ -4402,7 +6131,7 @@ class CashRequestsListView(CompanyBranchQuerysetMixin, generics.ListAPIView):
             qs = qs.filter(kind=kind_param)
 
         user_param = self.request.query_params.get("user")
-        if user_param and is_owner_like(self.request.user):
+        if user_param and _can_manage_cash(self.request.user):
             qs = qs.filter(user_id=user_param)
 
         cashbox_param = self.request.query_params.get("cashbox")
@@ -4436,7 +6165,7 @@ class CashRequestsCountersView(CompanyBranchQuerysetMixin, generics.GenericAPIVi
             raise PermissionDenied("У пользователя не настроена компания.")
 
         qs = CashRequestConsalting.objects.filter(company=company)
-        if not is_owner_like(request.user):
+        if not _can_manage_cash(request.user):
             qs = qs.filter(user=request.user)
 
         pending_qs = qs.filter(status=CashRequestConsalting.Status.PENDING)
@@ -4471,7 +6200,7 @@ class CashRequestConfirmView(CompanyBranchQuerysetMixin, generics.GenericAPIView
         if company and req_obj.company_id != company.id:
             raise PermissionDenied("Нет доступа к заявке данной компании.")
 
-        if not is_owner_like(request.user):
+        if not _can_manage_cash(request.user):
             raise PermissionDenied("Подтверждать заявки может только руководитель или кассир.")
 
         # Проверка skip_for_cashier: если false, сам автор не может подтвердить себя (§9.6)
@@ -4509,7 +6238,7 @@ class CashRequestRejectView(CompanyBranchQuerysetMixin, generics.GenericAPIView)
         if company and req_obj.company_id != company.id:
             raise PermissionDenied("Нет доступа к заявке данной компании.")
 
-        if not is_owner_like(request.user):
+        if not _can_manage_cash(request.user):
             raise PermissionDenied("Отклонять заявки может только руководитель или кассир.")
 
         reason = request.data.get("reason")
@@ -4543,11 +6272,11 @@ class CashOperationsListView(CompanyBranchQuerysetMixin, generics.ListAPIView):
 
         qs = CashOperationConsalting.objects.filter(company=company).select_related("user", "confirmed_by")
 
-        if not is_owner_like(self.request.user):
+        if not _can_manage_cash(self.request.user):
             qs = qs.filter(user=self.request.user)
 
         user_param = self.request.query_params.get("user")
-        if user_param and is_owner_like(self.request.user):
+        if user_param and _can_manage_cash(self.request.user):
             qs = qs.filter(user_id=user_param)
 
         from .funnel.employee_stats import parse_date_range
@@ -4585,5 +6314,656 @@ class CashConfirmationSettingsView(CompanyBranchQuerysetMixin, generics.GenericA
         serializer.save()
         return Response(serializer.data)
 
+    def post(self, request, *args, **kwargs):
+        """Фронт шлет POST для сохранения настроек кассы (§9.0 п.2)."""
+        return self.put(request, *args, **kwargs)
 
 
+class RegionalFunnelRoutingView(CompanyBranchQuerysetMixin, generics.GenericAPIView):
+    """
+    Настройки региональной маршрутизации входящих лидов (§4.3).
+    GET /PUT /api/consalting/regional-funnel-routing/
+    """
+    serializer_class = RegionalFunnelRoutingConsaltingSerializer
+
+    def get_object(self):
+        company = self._user_company()
+        if not company:
+            raise PermissionDenied("У пользователя не настроена компания.")
+        routing, _ = RegionalFunnelRoutingConsalting.objects.get_or_create(company=company)
+        return routing
+
+    def get(self, request, *args, **kwargs):
+        from .access import is_owner_like, is_consulting_supervisor, is_consulting_salesperson
+        if is_consulting_salesperson(request.user):
+            raise PermissionDenied("У вас нет доступа к настройкам маршрутизации.")
+        routing = self.get_object()
+        return Response(RegionalFunnelRoutingConsaltingSerializer(routing).data)
+
+    def put(self, request, *args, **kwargs):
+        from .access import is_owner_like, is_consulting_supervisor, is_consulting_salesperson
+        if not is_owner_like(request.user):
+            raise PermissionDenied("Изменять маршрутизацию воронок может только руководитель.")
+
+        routing = self.get_object()
+        data = request.data or {}
+
+        enabled = data.get("enabled")
+        if enabled is not None:
+            routing.enabled = bool(enabled)
+
+        fallback_strategy = data.get("fallback_strategy")
+        if fallback_strategy in ("round_robin", "default_funnel"):
+            routing.fallback_strategy = fallback_strategy
+
+        balance_strategy = data.get("balance_strategy")
+        if balance_strategy in ("least_loaded", "round_robin"):
+            routing.balance_strategy = balance_strategy
+
+        if "default_funnel_id" in data:
+            df_id = data.get("default_funnel_id")
+            if df_id:
+                df = FunnelConsalting.objects.filter(company=routing.company, id=df_id).first()
+                if not df:
+                    return Response({"default_funnel_id": "Указанная воронка не найдена в компании."}, status=status.HTTP_400_BAD_REQUEST)
+                routing.default_funnel = df
+            else:
+                routing.default_funnel = None
+
+        routing.save()
+
+        # Правила
+        rules_data = data.get("rules")
+        if rules_data is not None and isinstance(rules_data, list):
+            with transaction.atomic():
+                existing_rules = {str(r.id): r for r in routing.rules.all()}
+                kept_rule_ids = set()
+
+                for order, r_item in enumerate(rules_data):
+                    funnel_id = r_item.get("funnel_id")
+                    if not funnel_id:
+                        continue
+                    funnel = FunnelConsalting.objects.filter(company=routing.company, id=funnel_id).first()
+                    if not funnel:
+                        continue
+
+                    rule_id = str(r_item.get("id") or "")
+                    rule_obj = existing_rules.get(rule_id)
+                    if not rule_obj:
+                        rule_obj = RegionalFunnelRuleConsalting(routing=routing, funnel=funnel)
+
+                    rule_obj.funnel = funnel
+                    rule_obj.region_code = r_item.get("region_code") or "other"
+                    rule_obj.label = r_item.get("label") or ""
+                    rule_obj.is_active = bool(r_item.get("is_active", True))
+                    rule_obj.phone_prefixes = r_item.get("phone_prefixes") or []
+                    rule_obj.wazzup_account_ids = r_item.get("wazzup_account_ids") or []
+                    rule_obj.source_channels = r_item.get("source_channels") or []
+                    rule_obj.assign_role_ids = r_item.get("assign_role_ids") or []
+                    rule_obj.assign_strategy = r_item.get("assign_strategy") or "round_robin"
+                    rule_obj.order = r_item.get("order", order)
+                    rule_obj.save()
+                    kept_rule_ids.add(str(rule_obj.id))
+
+                # Удаляем правила, которых нет в новом списке
+                for r_id, r_obj in existing_rules.items():
+                    if r_id not in kept_rule_ids:
+                        r_obj.delete()
+
+        routing.refresh_from_db()
+        return Response(RegionalFunnelRoutingConsaltingSerializer(routing).data)
+
+
+class RegionalFunnelRegionsListView(CompanyBranchQuerysetMixin, generics.GenericAPIView):
+    """
+    Список активных регионов с числом открытых лидов и сотрудников (§7.2).
+    GET /api/consalting/regions/
+    """
+    def get(self, request, *args, **kwargs):
+        company = self._user_company()
+        if not company:
+            raise PermissionDenied("У пользователя не настроена компания.")
+
+        user = request.user
+        routing = getattr(company, "consalting_regional_routing", None)
+        if not routing:
+            routing = RegionalFunnelRoutingConsalting.objects.filter(company=company).first()
+
+        if not routing:
+            return Response([])
+
+        rules_qs = routing.rules.filter(is_active=True).select_related("funnel").order_by("order", "created_at")
+
+        if is_consulting_supervisor(user) or is_consulting_salesperson(user):
+            my_regions = user.get_consulting_region_codes()
+            rules_qs = rules_qs.filter(region_code__in=my_regions)
+
+        from .funnel.regional_routing import REGION_LABELS
+        from apps.users.models import User
+        active_employees = list(User.objects.filter(company=company, is_active=True, deleted_at__isnull=True))
+
+        result = []
+        for r in rules_qs:
+            open_leads = LeadConsalting.objects.filter(
+                company=company
+            ).filter(
+                Q(region_code=r.region_code) | Q(funnel=r.funnel)
+            ).exclude(
+                status__in=[LeadConsalting.Status.WON, LeadConsalting.Status.LOST]
+            ).distinct().count()
+
+            emp_cnt = sum(1 for u in active_employees if r.region_code in u.get_consulting_region_codes())
+
+            result.append({
+                "code": r.region_code,
+                "label": r.label or REGION_LABELS.get(r.region_code, r.region_code),
+                "funnel_id": str(r.funnel_id) if r.funnel_id else None,
+                "is_active": r.is_active,
+                "open_leads": open_leads,
+                "employees_count": emp_cnt,
+            })
+
+        return Response(result)
+
+
+class RegionalFunnelRedistributeView(CompanyBranchQuerysetMixin, generics.GenericAPIView):
+    """
+    Разовое выравнивание базы лидов по регионам (§4.2).
+    POST /api/consalting/regional-funnel-routing/redistribute/
+    """
+    def post(self, request, *args, **kwargs):
+        if not is_owner_like(request.user):
+            raise PermissionDenied("Разделять лиды по регионам может только руководитель.")
+
+        company = self._user_company()
+        if not company:
+            raise PermissionDenied("У пользователя не настроена компания.")
+
+        data = request.data or {}
+        scope = data.get("scope", "main_unassigned")
+        regions = data.get("regions", None)
+        dry_run = bool(data.get("dry_run", False))
+
+        from .funnel.regional_routing import redistribute_leads
+        try:
+            res = redistribute_leads(company, request.user, scope=scope, regions=regions, dry_run=dry_run)
+            return Response(res, status=status.HTTP_200_OK)
+        except ValueError as e:
+            return Response({"detail": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+
+class ConsultingCashboxListCreateView(CompanyBranchQuerysetMixin, generics.ListCreateAPIView):
+    """
+    GET /api/consalting/cashbox/cashboxes/ — список касс компании с аналитикой
+    POST /api/consalting/cashbox/cashboxes/ — создание кассы
+    """
+    def get_queryset(self):
+        from apps.construction.models import Cashbox
+        company = self._user_company()
+        if not company:
+            return Cashbox.objects.none()
+        return Cashbox.objects.filter(company=company).order_by("created_at")
+
+    def list(self, request, *args, **kwargs):
+        from apps.construction.models import Cashbox
+        from apps.consalting.models import CashOperationConsalting, CashRequestConsalting
+        qs = self.get_queryset()
+        data = []
+        for cb in qs:
+            ops = CashOperationConsalting.objects.filter(company=cb.company, cashbox_id=cb.id)
+            income_total = ops.filter(direction=CashOperationConsalting.Direction.INCOME).aggregate(s=Sum("amount"))["s"] or 0
+            expense_total = ops.filter(direction=CashOperationConsalting.Direction.OUTCOME).aggregate(s=Sum("amount"))["s"] or 0
+            pending_amt = CashRequestConsalting.objects.filter(
+                company=cb.company, cashbox_id=cb.id, status=CashRequestConsalting.Status.PENDING
+            ).aggregate(s=Sum("amount"))["s"] or 0
+
+            data.append({
+                "id": str(cb.id),
+                "name": cb.name or "Касса",
+                "role": getattr(cb, "role", None),
+                "is_consumption": getattr(cb, "is_consumption", False),
+                "is_active": getattr(cb, "is_active", True),
+                "income_total": float(income_total),
+                "expense_total": float(expense_total),
+                "balance": float(income_total - expense_total),
+                "pending_amount": float(pending_amt),
+                "created_at": cb.created_at.isoformat() if hasattr(cb, "created_at") and cb.created_at else None,
+            })
+        return Response(data)
+
+    def create(self, request, *args, **kwargs):
+        from apps.construction.models import Cashbox
+        company = self._user_company()
+        if not company:
+            raise PermissionDenied("У пользователя не настроена компания.")
+        name = str(request.data.get("name") or "").strip()
+        if not name:
+            return Response({"name": "Название кассы обязательно."}, status=status.HTTP_400_BAD_REQUEST)
+        cb = Cashbox.objects.create(company=company, name=name, is_active=True)
+        return Response({
+            "id": str(cb.id),
+            "name": cb.name,
+            "role": getattr(cb, "role", None),
+            "is_consumption": getattr(cb, "is_consumption", False),
+            "is_active": cb.is_active,
+            "income_total": 0.0,
+            "expense_total": 0.0,
+            "balance": 0.0,
+            "pending_amount": 0.0,
+        }, status=status.HTTP_201_CREATED)
+
+
+class ConsultingCashboxDetailView(CompanyBranchQuerysetMixin, generics.RetrieveAPIView):
+    """
+    GET /api/consalting/cashbox/cashboxes/<uuid:pk>/ — касса компании с аналитикой
+    """
+    def get_queryset(self):
+        from apps.construction.models import Cashbox
+        company = self._user_company()
+        if not company:
+            return Cashbox.objects.none()
+        return Cashbox.objects.filter(company=company)
+
+    def retrieve(self, request, *args, **kwargs):
+        from apps.consalting.models import CashOperationConsalting, CashRequestConsalting
+        cb = self.get_object()
+        ops = CashOperationConsalting.objects.filter(company=cb.company, cashbox_id=cb.id)
+        income_total = ops.filter(direction=CashOperationConsalting.Direction.INCOME).aggregate(s=Sum("amount"))["s"] or 0
+        expense_total = ops.filter(direction=CashOperationConsalting.Direction.OUTCOME).aggregate(s=Sum("amount"))["s"] or 0
+        pending_amt = CashRequestConsalting.objects.filter(
+            company=cb.company, cashbox_id=cb.id, status=CashRequestConsalting.Status.PENDING
+        ).aggregate(s=Sum("amount"))["s"] or 0
+
+        return Response({
+            "id": str(cb.id),
+            "name": cb.name or "Касса",
+            "role": getattr(cb, "role", None),
+            "is_consumption": getattr(cb, "is_consumption", False),
+            "income_total": float(income_total),
+            "expense_total": float(expense_total),
+            "balance": float(income_total - expense_total),
+            "pending_amount": float(pending_amt),
+        })
+
+
+class ClientLookupView(CompanyBranchQuerysetMixin, generics.GenericAPIView):
+    """
+    Поиск дублей клиентов по телефону и/или email (§8.5).
+    GET /api/consalting/clients/lookup/?phone=&email=
+    """
+    def get(self, request, *args, **kwargs):
+        company = self._user_company()
+        if not company:
+            raise PermissionDenied("У пользователя не настроена компания.")
+
+        phone = request.query_params.get("phone")
+        email = request.query_params.get("email")
+
+        from .funnel.lead_conversion import find_client_duplicates
+        matches = find_client_duplicates(company, phone=phone, email=email)
+        return Response({"matches": matches})
+
+
+# =====================================================================
+# Финансы лидов: рекламный отчёт (§8)
+# =====================================================================
+
+class LeadAdSpendPagination(PageNumberPagination):
+    page_size = 50
+    page_size_query_param = "page_size"
+    max_page_size = 1000
+
+
+class LeadAdSpendListCreateView(CompanyBranchQuerysetMixin, generics.ListCreateAPIView):
+    """
+    GET  /api/consalting/lead-ad-spend/ — список строк рекламного отчёта компании
+    POST /api/consalting/lead-ad-spend/ — создать одну строку
+    """
+    permission_classes = [permissions.IsAuthenticated, CanManageLeadAdSpend]
+    serializer_class = LeadAdSpendSerializer
+    pagination_class = LeadAdSpendPagination
+
+    def get_queryset(self):
+        company = self._user_company()
+        if not company:
+            return LeadAdSpend.objects.none()
+
+        qs = LeadAdSpend.objects.filter(company=company)
+
+        date_from = self.request.query_params.get("date_from")
+        date_to = self.request.query_params.get("date_to")
+        if date_from:
+            try:
+                df = datetime.strptime(date_from.strip(), "%Y-%m-%d").date()
+                qs = qs.filter(date__gte=df)
+            except ValueError:
+                pass
+        if date_to:
+            try:
+                dt = datetime.strptime(date_to.strip(), "%Y-%m-%d").date()
+                qs = qs.filter(date__lte=dt)
+            except ValueError:
+                pass
+
+        ordering = self.request.query_params.get("ordering")
+        allowed_orderings = {
+            "date", "-date",
+            "impressions", "-impressions",
+            "leads", "-leads",
+            "spend", "-spend",
+            "created_at", "-created_at",
+            "updated_at", "-updated_at",
+        }
+        if ordering and ordering in allowed_orderings:
+            qs = qs.order_by(ordering)
+        else:
+            qs = qs.order_by("-date")
+
+        return qs
+
+    def create(self, request, *args, **kwargs):
+        company = self._user_company()
+        if not company:
+            raise PermissionDenied("У пользователя не настроена компания.")
+
+        raw_date = request.data.get("date")
+        if not raw_date:
+            return Response({"detail": "Укажите дату строки.", "date": ["Укажите дату строки."]}, status=status.HTTP_400_BAD_REQUEST)
+        try:
+            if isinstance(raw_date, str):
+                d = datetime.strptime(raw_date.strip(), "%Y-%m-%d").date()
+            else:
+                d = raw_date
+        except ValueError:
+            return Response({"detail": "Укажите дату строки.", "date": ["Укажите дату строки."]}, status=status.HTTP_400_BAD_REQUEST)
+
+        today = timezone.localdate()
+        if d > today:
+            return Response({"detail": "Дата не может быть в будущем.", "date": ["Дата не может быть в будущем."]}, status=status.HTTP_400_BAD_REQUEST)
+
+        if LeadAdSpend.objects.filter(company=company, date=d).exists():
+            d_fmt = d.strftime("%d.%m.%Y")
+            return Response({"detail": f"За {d_fmt} отчёт уже заведён — измените существующую строку."}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            raw_imp = request.data.get("impressions", 0)
+            raw_leads = request.data.get("leads", 0)
+            impressions = int(raw_imp if raw_imp is not None else 0)
+            leads = int(raw_leads if raw_leads is not None else 0)
+        except (ValueError, TypeError):
+            return Response({"detail": "Показы и лиды не могут быть отрицательными."}, status=status.HTTP_400_BAD_REQUEST)
+
+        if impressions < 0 or leads < 0:
+            return Response({"detail": "Показы и лиды не могут быть отрицательными."}, status=status.HTTP_400_BAD_REQUEST)
+
+        if impressions > 0 and leads > 0 and leads > impressions:
+            return Response({"detail": "Лидов больше, чем показов — проверьте цифры."}, status=status.HTTP_400_BAD_REQUEST)
+
+        raw_spend = request.data.get("spend", 0)
+        try:
+            spend = Decimal(str(raw_spend if raw_spend is not None else 0))
+        except (InvalidOperation, TypeError):
+            return Response({"detail": "Сумма затрат указана неверно."}, status=status.HTTP_400_BAD_REQUEST)
+
+        if spend < 0 or spend > Decimal("999999999.99"):
+            return Response({"detail": "Сумма затрат указана неверно."}, status=status.HTTP_400_BAD_REQUEST)
+
+        return super().create(request, *args, **kwargs)
+
+    def perform_create(self, serializer):
+        company = self._user_company()
+        if not company:
+            raise PermissionDenied("У пользователя не настроена компания.")
+        serializer.save(company=company, created_by=self.request.user)
+
+
+class LeadAdSpendDetailView(CompanyBranchQuerysetMixin, generics.RetrieveUpdateDestroyAPIView):
+    """
+    GET    /api/consalting/lead-ad-spend/<uuid:pk>/ — одна строка
+    PUT    /api/consalting/lead-ad-spend/<uuid:pk>/ — заменить строку
+    PATCH  /api/consalting/lead-ad-spend/<uuid:pk>/ — частично изменить
+    DELETE /api/consalting/lead-ad-spend/<uuid:pk>/ — удалить строку
+    """
+    permission_classes = [permissions.IsAuthenticated, CanManageLeadAdSpend]
+    serializer_class = LeadAdSpendSerializer
+    queryset = LeadAdSpend.objects.all()
+
+    def get_queryset(self):
+        company = self._user_company()
+        if not company:
+            return LeadAdSpend.objects.none()
+        return LeadAdSpend.objects.filter(company=company)
+
+
+class LeadAdSpendBulkView(CompanyBranchQuerysetMixin, generics.GenericAPIView):
+    """
+    PUT /api/consalting/lead-ad-spend/bulk/
+    Полная синхронизация набора строк компании: upsert по (company, date) + удаление отсутствующих (§8.4).
+    """
+    permission_classes = [permissions.IsAuthenticated, CanManageLeadAdSpend]
+    serializer_class = LeadAdSpendSerializer
+
+    def put(self, request, *args, **kwargs):
+        company = self._user_company()
+        if not company:
+            raise PermissionDenied("У пользователя не настроена компания.")
+
+        data = request.data
+        if not isinstance(data, dict) or "items" not in data:
+            return Response(
+                {"detail": "Ожидается объект с полем 'items'."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        raw_items = data.get("items")
+        if not isinstance(raw_items, list):
+            return Response(
+                {"detail": "Поле 'items' должно быть списком."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        raw_df = data.get("date_from")
+        raw_dt = data.get("date_to")
+        date_from = None
+        date_to = None
+        if raw_df:
+            try:
+                date_from = datetime.strptime(str(raw_df).strip(), "%Y-%m-%d").date()
+            except ValueError:
+                return Response(
+                    {"detail": "Укажите верный формат date_from (YYYY-MM-DD)."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+        if raw_dt:
+            try:
+                date_to = datetime.strptime(str(raw_dt).strip(), "%Y-%m-%d").date()
+            except ValueError:
+                return Response(
+                    {"detail": "Укажите верный формат date_to (YYYY-MM-DD)."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+        import uuid
+        parsed_items = []
+        seen_dates = set()
+        today = timezone.localdate()
+
+        for item in raw_items:
+            if not isinstance(item, dict):
+                return Response(
+                    {"detail": "Элемент списка должен быть объектом."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            # 1. Валидация даты
+            raw_date = item.get("date")
+            if not raw_date:
+                return Response(
+                    {"detail": "Укажите дату строки.", "date": ["Укажите дату строки."]},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            if isinstance(raw_date, str):
+                try:
+                    d = datetime.strptime(raw_date.strip(), "%Y-%m-%d").date()
+                except ValueError:
+                    return Response(
+                        {"detail": "Укажите дату строки.", "date": ["Укажите дату строки."]},
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
+            elif isinstance(raw_date, date):
+                d = raw_date
+            else:
+                return Response(
+                    {"detail": "Укажите дату строки.", "date": ["Укажите дату строки."]},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            if d > today:
+                return Response(
+                    {"detail": "Дата не может быть в будущем.", "date": ["Дата не может быть в будущем."]},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            if date_from and date_to:
+                if d < date_from or d > date_to:
+                    return Response(
+                        {"detail": f"Дата {d.isoformat()} вне диапазона {date_from.isoformat()} — {date_to.isoformat()}."},
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
+
+            d_str = d.isoformat()
+            if d_str in seen_dates:
+                return Response(
+                    {"detail": f"Дата {d_str} встречается дважды."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            seen_dates.add(d_str)
+
+            # 2. Валидация показов и лидов
+            try:
+                raw_imp = item.get("impressions", 0)
+                raw_leads = item.get("leads", 0)
+                impressions = int(raw_imp if raw_imp is not None else 0)
+                leads = int(raw_leads if raw_leads is not None else 0)
+            except (ValueError, TypeError):
+                return Response(
+                    {"detail": "Показы и лиды не могут быть отрицательными."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            if impressions < 0 or leads < 0:
+                return Response(
+                    {"detail": "Показы и лиды не могут быть отрицательными."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            if impressions > 0 and leads > 0 and leads > impressions:
+                return Response(
+                    {"detail": "Лидов больше, чем показов — проверьте цифры."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            # 3. Валидация spend
+            raw_spend = item.get("spend", 0)
+            try:
+                spend = Decimal(str(raw_spend if raw_spend is not None else 0))
+            except (InvalidOperation, TypeError):
+                return Response(
+                    {"detail": "Сумма затрат указана неверно."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            if spend < 0 or spend > Decimal("999999999.99"):
+                return Response(
+                    {"detail": "Сумма затрат указана неверно."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            # 4. Валидация note
+            note = str(item.get("note") or "")
+            if len(note) > 255:
+                return Response(
+                    {"detail": "Комментарий слишком длинный."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            # 5. Валидация id если передан
+            item_id = item.get("id")
+            uuid_id = None
+            if item_id:
+                try:
+                    uuid_id = uuid.UUID(str(item_id))
+                except (ValueError, TypeError):
+                    return Response(
+                        {"detail": f"Запись {item_id} не найдена или принадлежит другой компании."},
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
+                if not LeadAdSpend.objects.filter(id=uuid_id, company=company).exists():
+                    return Response(
+                        {"detail": f"Запись {item_id} не найдена или принадлежит другой компании."},
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
+
+            parsed_items.append({
+                "id": uuid_id,
+                "date": d,
+                "impressions": impressions,
+                "leads": leads,
+                "spend": spend,
+                "note": note,
+            })
+
+        # Применяем изменения в единой транзакции
+        with transaction.atomic():
+            kept_dates = [pi["date"] for pi in parsed_items]
+            if date_from and date_to:
+                LeadAdSpend.objects.filter(company=company, date__gte=date_from, date__lte=date_to).exclude(date__in=kept_dates).delete()
+            else:
+                LeadAdSpend.objects.filter(company=company).exclude(date__in=kept_dates).delete()
+
+            for pi in parsed_items:
+                item_id = pi["id"]
+                if item_id:
+                    rec = LeadAdSpend.objects.filter(id=item_id, company=company).first()
+                    if rec:
+                        rec.date = pi["date"]
+                        rec.impressions = pi["impressions"]
+                        rec.leads = pi["leads"]
+                        rec.spend = pi["spend"]
+                        rec.note = pi["note"]
+                        rec.save()
+                    else:
+                        LeadAdSpend.objects.create(
+                            company=company,
+                            date=pi["date"],
+                            impressions=pi["impressions"],
+                            leads=pi["leads"],
+                            spend=pi["spend"],
+                            note=pi["note"],
+                            created_by=request.user,
+                        )
+                else:
+                    existing = LeadAdSpend.objects.filter(company=company, date=pi["date"]).first()
+                    if existing:
+                        existing.impressions = pi["impressions"]
+                        existing.leads = pi["leads"]
+                        existing.spend = pi["spend"]
+                        existing.note = pi["note"]
+                        existing.save()
+                    else:
+                        LeadAdSpend.objects.create(
+                            company=company,
+                            date=pi["date"],
+                            impressions=pi["impressions"],
+                            leads=pi["leads"],
+                            spend=pi["spend"],
+                            note=pi["note"],
+                            created_by=request.user,
+                        )
+
+        final_qs = LeadAdSpend.objects.filter(company=company)
+        if date_from and date_to:
+            final_qs = final_qs.filter(date__gte=date_from, date__lte=date_to)
+        final_qs = final_qs.order_by("-date")
+        serializer = self.get_serializer(final_qs, many=True)
+        return Response({"results": serializer.data}, status=status.HTTP_200_OK)

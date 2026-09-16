@@ -5,13 +5,16 @@ from django.db import transaction
 from django.db.models import Sum, Count, Q, Exists, OuterRef
 from django.db.models import Case, When, Value, CharField
 
+from django.conf import settings
+from django.http import QueryDict
 from django.shortcuts import get_object_or_404
+from django.utils import timezone
 from django.utils.dateparse import parse_date
 
-from rest_framework import generics, permissions
+from rest_framework import generics, permissions, status
 from rest_framework.views import APIView
 from rest_framework.response import Response
-from rest_framework.exceptions import PermissionDenied, ValidationError
+from rest_framework.exceptions import PermissionDenied, ValidationError, NotFound
 from rest_framework.pagination import PageNumberPagination
 
 from apps.construction.models import Cashbox, CashFlow, CashFlowCategory, CashShift
@@ -31,7 +34,9 @@ from apps.construction.serializers import (
     CashShiftListSerializer,
     CashShiftOpenSerializer,
     CashShiftCloseSerializer,
-    CashFlowBulkStatusSerializer
+    CashFlowBulkStatusSerializer,
+    CashFlowEditRequestSerializer,
+    CashFlowCancelRequestSerializer,
 )
 
 from apps.construction.utils import (
@@ -175,11 +180,14 @@ class CompanyBranchScopedMixin:
 # CASHBOXES
 # ─────────────────────────────────────────────────────────────
 class CashboxListCreateView(CompanyBranchScopedMixin, generics.ListCreateAPIView):
-    queryset = Cashbox.objects.select_related("company", "branch")
+    queryset = Cashbox.objects.select_related("company", "branch").order_by("-created_at")
     serializer_class = CashboxSerializer
 
     def get_queryset(self):
         qs = self._scoped_queryset(super().get_queryset())
+        include_archived = (self.request.query_params.get("include_archived") or "").strip().lower() in ("1", "true", "yes")
+        if not include_archived:
+            qs = qs.filter(is_active=True)
         users_param = self.request.query_params.get("users")
         if not users_param:
             return qs
@@ -377,7 +385,184 @@ class CashboxDetailView(CompanyBranchScopedMixin, generics.RetrieveUpdateDestroy
     serializer_class = CashboxWithFlowsSerializer
 
     def get_queryset(self):
-        return self._scoped_queryset(super().get_queryset())
+        qs = super().get_queryset()
+        company = self._company()
+        if not company:
+            return qs.none()
+        return qs.filter(company=company)
+
+    def perform_update(self, serializer):
+        """Changing a role must not remove the last required active route."""
+        cashbox = serializer.instance
+        new_role = serializer.validated_data.get("role", cashbox.role)
+        if new_role != cashbox.role and cashbox.is_active:
+            old_role = cashbox.role or cashbox.get_inferred_role()
+            if old_role in (Cashbox.CashboxRole.POS_MAIN, Cashbox.CashboxRole.POS_BRANCH, Cashbox.CashboxRole.EXPENSE_VARIABLE):
+                qs = Cashbox.objects.filter(company=cashbox.company, is_active=True)
+                if old_role == Cashbox.CashboxRole.POS_BRANCH:
+                    qs = qs.filter(role=old_role, branch_id=cashbox.branch_id)
+                else:
+                    qs = qs.filter(role=old_role)
+                if qs.count() <= 1:
+                    raise ValidationError({"detail": "Нельзя изменить роль последней обязательной кассы.", "code": "cashbox_role_required"})
+        serializer.save()
+
+    def destroy(self, request, *args, **kwargs):
+        company = self._company()
+        if not company:
+            raise PermissionDenied("У пользователя не настроена компания.")
+
+        # 1. Belong to request.user.company, else 404
+        cashbox = Cashbox.objects.filter(id=kwargs.get("pk"), company=company).first()
+        if not cashbox:
+            raise NotFound({"detail": "Касса не найдена — возможно, уже удалена."})
+
+        # 2. Permissions: request.user must be owner or admin, else 403
+        if not _is_owner_like(request.user):
+            raise PermissionDenied("Удаление кассы разрешено только владельцу или администратору.")
+
+        # 3. Idempotency: repeated delete of already archived cashbox -> 204
+        if not cashbox.is_active:
+            return Response(status=status.HTTP_204_NO_CONTENT)
+
+        merge_into_id = request.query_params.get("merge_into")
+        target = None
+        if merge_into_id:
+            target = Cashbox.objects.filter(id=merge_into_id, company=company, is_active=True).first()
+            if not target or target.id == cashbox.id:
+                return Response(
+                    {"detail": "Касса-наследник недоступна.", "code": "merge_target_invalid"},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+        # 4. Open shift on this cashbox -> 409 cashbox_has_open_shift
+        if CashShift.objects.filter(cashbox=cashbox, status=CashShift.Status.OPEN).exists():
+            return Response(
+                {
+                    "detail": "По кассе есть открытая смена. Закройте смену перед удалением.",
+                    "code": "cashbox_has_open_shift",
+                },
+                status=status.HTTP_409_CONFLICT,
+            )
+
+        # 5. Pending movements or change requests on cashbox -> 409 cashbox_has_pending
+        if CashFlow.objects.filter(cashbox_id=cashbox.id, status=CashFlow.Status.PENDING).exists():
+            return Response(
+                {
+                    "detail": "По кассе есть неодобренные операции или заявки. Разберите их перед удалением.",
+                    "code": "cashbox_has_pending",
+                },
+                status=status.HTTP_409_CONFLICT,
+            )
+
+        # 6. Role required for auto-operations if AUTO_CASHFLOWS is enabled
+        auto_cashflows_enabled = getattr(company, "auto_cashflows", getattr(settings, "AUTO_CASHFLOWS", True))
+        if auto_cashflows_enabled:
+            role = cashbox.role
+            if not role:
+                if cashbox.is_consumption:
+                    role = Cashbox.CashboxRole.EXPENSE_VARIABLE
+                else:
+                    role = cashbox.get_inferred_role()
+
+            if role == Cashbox.CashboxRole.EXPENSE_VARIABLE:
+                active_expense_count = (
+                    Cashbox.objects.filter(company=company, is_active=True)
+                    .filter(
+                        Q(role=Cashbox.CashboxRole.EXPENSE_VARIABLE)
+                        | (Q(role__isnull=True) & (Q(is_consumption=True) | Q(name__icontains="переменн")))
+                    )
+                    .count()
+                )
+                if active_expense_count <= 1:
+                    return Response(
+                        {
+                            "detail": "Это последняя касса для расходов. Создайте другую, затем удалите эту.",
+                            "code": "cashbox_role_required",
+                        },
+                        status=status.HTTP_409_CONFLICT,
+                    )
+            elif role in (Cashbox.CashboxRole.POS_MAIN, Cashbox.CashboxRole.POS_BRANCH):
+                active_pos_count = (
+                    Cashbox.objects.filter(company=company, is_active=True)
+                    .filter(
+                        Q(role__in=[Cashbox.CashboxRole.POS_MAIN, Cashbox.CashboxRole.POS_BRANCH])
+                        | (Q(role__isnull=True) & ~Q(is_consumption=True) & ~Q(name__icontains="расход") & ~Q(name__icontains="переменн") & ~Q(name__icontains="постоянн"))
+                    )
+                    .count()
+                )
+                if active_pos_count <= 1:
+                    return Response(
+                        {
+                            "detail": "Это последняя активная POS-касса. Создайте другую, затем удалите эту.",
+                            "code": "cashbox_role_required",
+                        },
+                        status=status.HTTP_409_CONFLICT,
+                    )
+
+        # 7. Decide archive or physical delete
+        had_activity = (
+            CashFlow.objects.filter(cashbox_id=cashbox.id).exists()
+            or CashShift.objects.filter(cashbox_id=cashbox.id).exists()
+        )
+
+        if had_activity or target:
+            with transaction.atomic():
+                if target:
+                    # History belongs to the surviving cashbox; shifts retain their
+                    # original cashbox for immutable closed-shift reconciliation.
+                    CashFlow.objects.filter(cashbox_id=cashbox.id).update(cashbox_id=target.id)
+                    cashbox.merged_into = target
+                cashbox.is_active = False
+                cashbox.archived_at = timezone.now()
+                cashbox.archived_by = request.user
+                cashbox.save(update_fields=["is_active", "archived_at", "archived_by", "merged_into"])
+        else:
+            cashbox.delete()
+
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+class CashboxBulkDeleteView(CompanyBranchScopedMixin, APIView):
+    """Archive/delete each requested cashbox independently.
+
+    A failed item never rolls back successfully processed items, which is the
+    documented contract for the bulk UI.
+    """
+
+    def post(self, request, *args, **kwargs):
+        if not _is_owner_like(request.user):
+            raise PermissionDenied("Удаление кассы разрешено только владельцу или администратору.")
+        ids = request.data.get("ids") if isinstance(request.data, dict) else None
+        if not isinstance(ids, list) or not ids:
+            raise ValidationError({"ids": "Передайте непустой список идентификаторов касс."})
+        ids = list(dict.fromkeys(str(item) for item in ids))
+        merge_into = request.data.get("merge_into")
+        if merge_into and str(merge_into) in ids:
+            raise ValidationError({"detail": "Касса-наследник не может удаляться.", "code": "merge_target_invalid"})
+
+        succeeded, failed = [], []
+        original_get = request._request.GET
+        try:
+            for cashbox_id in ids:
+                try:
+                    request._request.GET = QueryDict(f"merge_into={merge_into}") if merge_into else QueryDict("")
+                    response = CashboxDetailView().destroy(request, pk=cashbox_id)
+                except NotFound as exc:
+                    failed.append({"id": cashbox_id, "code": "not_found", "detail": str(exc.detail)})
+                    continue
+                if response.status_code in (status.HTTP_200_OK, status.HTTP_204_NO_CONTENT):
+                    succeeded.append(cashbox_id)
+                else:
+                    body = getattr(response, "data", {}) or {}
+                    failed.append({
+                        "id": cashbox_id,
+                        "code": body.get("code", "cashbox_delete_failed"),
+                        "detail": body.get("detail", "Не удалось удалить кассу."),
+                    })
+        finally:
+            request._request.GET = original_get
+        return Response({"succeeded": succeeded, "failed": failed}, status=status.HTTP_200_OK)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -482,6 +667,15 @@ class CashFlowListCreateView(CompanyBranchScopedMixin, generics.ListCreateAPIVie
         if statuses:
             qs = qs.filter(status__in=statuses)
 
+        request_kind_param = (qp.get("request_kind") or "").strip().lower()
+        if request_kind_param == "all":
+            pass
+        elif request_kind_param:
+            qs = qs.filter(request_kind=request_kind_param)
+        elif statuses == [CashFlow.Status.APPROVED]:
+            # В ленту «Приход/Расход» (approved) попадают только реальные движения
+            qs = qs.filter(request_kind__isnull=True)
+
         # ✅ поиск: ?search=<текст> — по названию операции и названию категории
         search = (qp.get("search") or "").strip()
         if search:
@@ -531,6 +725,17 @@ class CashFlowListCreateView(CompanyBranchScopedMixin, generics.ListCreateAPIVie
         # совпадает, и без тай-брейка по id строки «прыгают» между страницами.
         return qs.order_by("-created_at", "-id")
 
+    def create(self, request, *args, **kwargs):
+        cashbox_id = request.data.get("cashbox")
+        if cashbox_id:
+            cb = Cashbox.objects.filter(id=cashbox_id).first()
+            if cb and not cb.is_active:
+                return Response(
+                    {"detail": "Касса находится в архиве.", "code": "cashbox_inactive"},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+        return super().create(request, *args, **kwargs)
+
     def perform_create(self, serializer):
         self._inject_company_branch_on_save(serializer)
 
@@ -551,12 +756,239 @@ class CashFlowDetailView(CompanyBranchScopedMixin, generics.RetrieveUpdateDestro
     def update(self, request, *args, **kwargs):
         instance = self.get_object()
         old_status = instance.status
+
+        # Если это заявка на редактирование или отмену
+        if instance.request_kind in (CashFlow.RequestKind.EDIT, CashFlow.RequestKind.CANCEL):
+            new_st = request.data.get("status")
+            if new_st in (CashFlow.Status.APPROVED, CashFlow.Status.REJECTED):
+                from apps.construction.services_change_requests import resolve_change_request
+                resolve_change_request(instance, new_status=new_st, user=request.user)
+                instance.refresh_from_db()
+                return Response(self.get_serializer(instance).data)
+
         resp = super().update(request, *args, **kwargs)
         instance.refresh_from_db()
         if old_status != CashFlow.Status.REJECTED and instance.status == CashFlow.Status.REJECTED:
             from apps.construction.auto_cashflow import handle_cashflow_reject
             handle_cashflow_reject(instance, user=request.user)
         return resp
+
+
+class CashFlowEditRequestView(CompanyBranchScopedMixin, APIView):
+    permission_classes = [permissions.IsAuthenticated]
+
+    @transaction.atomic
+    def post(self, request, pk, *args, **kwargs):
+        qs = self._scoped_queryset(CashFlow.objects.select_for_update())
+        target_flow = qs.filter(id=pk).first()
+        if not target_flow:
+            raise NotFound({"detail": "Движение кассы не найдено."})
+
+        if target_flow.request_kind:
+            return Response(
+                {"detail": "Нельзя создавать заявку на изменение для другой заявки."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        if target_flow.status != CashFlow.Status.APPROVED:
+            return Response(
+                {"detail": "Редактировать можно только одобренные движения."},
+                status=status.HTTP_409_CONFLICT,
+            )
+
+        if target_flow.shift_id and target_flow.shift.status == CashShift.Status.CLOSED:
+            return Response(
+                {"detail": "Движение относится к закрытой смене. Изменения по закрытым сменам запрещены."},
+                status=422,
+            )
+
+        ser = CashFlowEditRequestSerializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+        proposed = ser.validated_data["proposed"]
+        reason = ser.validated_data.get("reason", "").strip()
+        idempotency_key = ser.validated_data.get("idempotency_key", "").strip() or None
+
+        if idempotency_key:
+            existing = CashFlow.objects.filter(
+                company=target_flow.company,
+                idempotency_key=idempotency_key,
+            ).first()
+            if existing:
+                serializer = CashFlowSerializer(existing, context={"request": request})
+                return Response(serializer.data, status=status.HTTP_200_OK)
+
+        if not getattr(target_flow.company, "cashflow_requests_enabled", False):
+            if not _is_owner_like(request.user):
+                raise PermissionDenied("У вас нет прав на редактирование одобренного движения.")
+
+            prop_type = proposed.get("type", target_flow.type)
+            prop_amount = Decimal(str(proposed.get("amount", target_flow.amount)))
+            prop_name = proposed.get("name") or target_flow.name
+
+            target_flow.type = prop_type
+            target_flow.amount = prop_amount
+            target_flow.name = prop_name
+            target_flow.save(update_fields=["type", "amount", "name"])
+
+            from apps.construction.services_change_requests import send_cashflow_ws_notification
+            send_cashflow_ws_notification(
+                target_flow.company_id,
+                "market.cashflow.updated",
+                {
+                    "cashflow_id": str(target_flow.id),
+                    "type": target_flow.type,
+                    "amount": str(target_flow.amount),
+                    "cashbox_id": str(target_flow.cashbox_id) if target_flow.cashbox_id else None,
+                    "status": target_flow.status,
+                },
+            )
+            serializer = CashFlowSerializer(target_flow, context={"request": request})
+            return Response(serializer.data, status=status.HTTP_200_OK)
+
+        open_req = CashFlow.objects.filter(
+            company=target_flow.company,
+            target_flow=target_flow,
+            status=CashFlow.Status.PENDING,
+        ).first()
+        if open_req:
+            return Response(
+                {
+                    "detail": "По этому движению уже есть открытая заявка.",
+                    "existing_request_id": str(open_req.id),
+                },
+                status=status.HTTP_409_CONFLICT,
+            )
+
+        prop_type = proposed.get("type", target_flow.type)
+        prop_amount = Decimal(str(proposed.get("amount", target_flow.amount)))
+        prop_name = proposed.get("name") or target_flow.name
+
+        req_flow = CashFlow.objects.create(
+            company=target_flow.company,
+            branch=target_flow.branch,
+            cashbox=target_flow.cashbox,
+            shift=target_flow.shift if (target_flow.shift and target_flow.shift.status == CashShift.Status.OPEN) else None,
+            status=CashFlow.Status.PENDING,
+            request_kind=CashFlow.RequestKind.EDIT,
+            target_flow=target_flow,
+            proposed=proposed,
+            reason=reason,
+            requested_by=request.user,
+            cashier=request.user,
+            type=prop_type,
+            amount=prop_amount,
+            name=prop_name,
+            idempotency_key=idempotency_key,
+        )
+
+        serializer = CashFlowSerializer(req_flow, context={"request": request})
+        return Response(serializer.data, status=status.HTTP_201_CREATED)
+
+
+class CashFlowCancelRequestView(CompanyBranchScopedMixin, APIView):
+    permission_classes = [permissions.IsAuthenticated]
+
+    @transaction.atomic
+    def post(self, request, pk, *args, **kwargs):
+        qs = self._scoped_queryset(CashFlow.objects.select_for_update())
+        target_flow = qs.filter(id=pk).first()
+        if not target_flow:
+            raise NotFound({"detail": "Движение кассы не найдено."})
+
+        if target_flow.request_kind:
+            return Response(
+                {"detail": "Нельзя создавать заявку на отмену для другой заявки."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        if target_flow.status != CashFlow.Status.APPROVED:
+            return Response(
+                {"detail": "Отменять можно только одобренные движения."},
+                status=status.HTTP_409_CONFLICT,
+            )
+
+        if target_flow.shift_id and target_flow.shift.status == CashShift.Status.CLOSED:
+            return Response(
+                {"detail": "Движение относится к закрытой смене. Изменения по закрытым сменам запрещены."},
+                status=422,
+            )
+
+        ser = CashFlowCancelRequestSerializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+        reason = ser.validated_data.get("reason", "").strip()
+        idempotency_key = ser.validated_data.get("idempotency_key", "").strip() or None
+
+        if idempotency_key:
+            existing = CashFlow.objects.filter(
+                company=target_flow.company,
+                idempotency_key=idempotency_key,
+            ).first()
+            if existing:
+                serializer = CashFlowSerializer(existing, context={"request": request})
+                return Response(serializer.data, status=status.HTTP_200_OK)
+
+        if not getattr(target_flow.company, "cashflow_requests_enabled", False):
+            if not _is_owner_like(request.user):
+                raise PermissionDenied("У вас нет прав на отмену одобренного движения.")
+
+            target_flow.status = CashFlow.Status.REJECTED
+            target_flow.save(update_fields=["status"])
+
+            from apps.construction.services_change_requests import send_cashflow_ws_notification
+            send_cashflow_ws_notification(
+                target_flow.company_id,
+                "market.cashflow.deleted",
+                {
+                    "cashflow_id": str(target_flow.id),
+                    "cashbox_id": str(target_flow.cashbox_id) if target_flow.cashbox_id else None,
+                    "status": target_flow.status,
+                },
+            )
+            serializer = CashFlowSerializer(target_flow, context={"request": request})
+            return Response(serializer.data, status=status.HTTP_200_OK)
+
+        open_req = CashFlow.objects.filter(
+            company=target_flow.company,
+            target_flow=target_flow,
+            status=CashFlow.Status.PENDING,
+        ).first()
+        if open_req:
+            return Response(
+                {
+                    "detail": "По этому движению уже есть открытая заявка.",
+                    "existing_request_id": str(open_req.id),
+                },
+                status=status.HTTP_409_CONFLICT,
+            )
+
+        rev_type = (
+            CashFlow.Type.EXPENSE
+            if target_flow.type == CashFlow.Type.INCOME
+            else CashFlow.Type.INCOME
+        )
+        name = f"Отмена: {target_flow.name or ''}".strip()
+
+        req_flow = CashFlow.objects.create(
+            company=target_flow.company,
+            branch=target_flow.branch,
+            cashbox=target_flow.cashbox,
+            shift=target_flow.shift if (target_flow.shift and target_flow.shift.status == CashShift.Status.OPEN) else None,
+            status=CashFlow.Status.PENDING,
+            request_kind=CashFlow.RequestKind.CANCEL,
+            target_flow=target_flow,
+            proposed={},
+            reason=reason,
+            requested_by=request.user,
+            cashier=request.user,
+            type=rev_type,
+            amount=target_flow.amount,
+            name=name,
+            source_kind=CashFlow.SourceKind.CASHFLOW_CANCEL,
+            idempotency_key=idempotency_key,
+        )
+
+        serializer = CashFlowSerializer(req_flow, context={"request": request})
+        return Response(serializer.data, status=status.HTTP_201_CREATED)
 
 
 class CashFlowCategoryListCreateView(CompanyBranchScopedMixin, generics.ListCreateAPIView):
@@ -767,29 +1199,341 @@ class CashFlowBulkStatusUpdateView(CompanyBranchScopedMixin, generics.GenericAPI
         updated_ids = []
         updated_count = 0
 
-        for i in range(0, len(ids), self.CHUNK_SIZE):
-            chunk_ids = ids[i:i + self.CHUNK_SIZE]
-
-            whens = [
-                When(id=_id, then=Value(id_to_status[_id]))
-                for _id in chunk_ids
-            ]
-
-            chunk_qs = qs.filter(id__in=chunk_ids)
-
-            updated_count += chunk_qs.update(
-                status=Case(*whens, output_field=CharField())
-            )
-            updated_ids.extend([str(x) for x in chunk_ids])
-
+        from apps.construction.services_change_requests import resolve_change_request
         from apps.construction.auto_cashflow import handle_cashflow_reject
-        for cf in old_flows:
+
+        change_reqs = [cf for cf in old_flows if cf.request_kind in (CashFlow.RequestKind.EDIT, CashFlow.RequestKind.CANCEL)]
+        normal_flows = [cf for cf in old_flows if cf.request_kind not in (CashFlow.RequestKind.EDIT, CashFlow.RequestKind.CANCEL)]
+
+        for cf in change_reqs:
             new_st = id_to_status.get(cf.id)
-            if cf.status != CashFlow.Status.REJECTED and new_st == CashFlow.Status.REJECTED:
-                cf.status = CashFlow.Status.REJECTED
-                handle_cashflow_reject(cf, user=request.user)
+            if new_st in (CashFlow.Status.APPROVED, CashFlow.Status.REJECTED):
+                resolve_change_request(cf, new_status=new_st, user=request.user)
+                updated_count += 1
+                updated_ids.append(str(cf.id))
+
+        if normal_flows:
+            normal_ids = [cf.id for cf in normal_flows]
+            for i in range(0, len(normal_ids), self.CHUNK_SIZE):
+                chunk_ids = normal_ids[i:i + self.CHUNK_SIZE]
+
+                whens = [
+                    When(id=_id, then=Value(id_to_status[_id]))
+                    for _id in chunk_ids
+                ]
+
+                chunk_qs = qs.filter(id__in=chunk_ids)
+
+                updated_count += chunk_qs.update(
+                    status=Case(*whens, output_field=CharField())
+                )
+                updated_ids.extend([str(x) for x in chunk_ids])
+
+            for cf in normal_flows:
+                new_st = id_to_status.get(cf.id)
+                if cf.status != CashFlow.Status.REJECTED and new_st == CashFlow.Status.REJECTED:
+                    cf.status = CashFlow.Status.REJECTED
+                    handle_cashflow_reject(cf, user=request.user)
 
         return Response(
             {"count": updated_count, "updated_ids": updated_ids},
             status=200
         )
+
+
+import zoneinfo
+from datetime import datetime, date, timedelta, time
+import calendar
+from django.utils import timezone
+from rest_framework.exceptions import NotFound, PermissionDenied, ValidationError
+
+
+def _parse_date_param(val, param_name="date"):
+    if not val:
+        raise ValidationError({"detail": f"Query param '{param_name}' is required."})
+    try:
+        return datetime.strptime(str(val).strip(), "%Y-%m-%d").date()
+    except (ValueError, AttributeError):
+        raise ValidationError({"detail": f"Invalid date format for '{param_name}'. Expected YYYY-MM-DD."})
+
+
+def _parse_month_param(val):
+    if not val:
+        raise ValidationError({"detail": "Query param 'month' is required when period=month."})
+    try:
+        parts = str(val).strip().split("-")
+        if len(parts) != 2:
+            raise ValueError
+        year, month = int(parts[0]), int(parts[1])
+        if not (1 <= month <= 12):
+            raise ValueError
+        return year, month
+    except Exception:
+        raise ValidationError({"detail": "Invalid month format. Expected YYYY-MM."})
+
+
+class CashboxReportView(CompanyBranchScopedMixin, APIView):
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request, cashbox_id, *args, **kwargs):
+        cashboxes = self._scoped_queryset(Cashbox.objects.all())
+        cashbox = cashboxes.filter(id=cashbox_id).first()
+        if not cashbox:
+            company = self._company()
+            if company and Cashbox.objects.filter(id=cashbox_id, company=company).exists():
+                raise PermissionDenied("У вас нет доступа к этой кассе.")
+            raise NotFound({"detail": "Касса не найдена."})
+
+        period = (request.query_params.get("period") or "").strip().lower()
+        if period not in ("day", "month"):
+            raise ValidationError({"detail": "Query param 'period' must be 'day' or 'month'."})
+
+        status_param = (request.query_params.get("status") or "approved").strip().lower()
+
+        tz = zoneinfo.ZoneInfo("Asia/Bishkek")
+
+        flows_qs = CashFlow.objects.filter(cashbox=cashbox)
+        if status_param in ("approved", "true"):
+            flows_qs = flows_qs.filter(status__in=["approved", "true"], request_kind__isnull=True)
+        elif status_param == "pending":
+            flows_qs = flows_qs.filter(status="pending")
+
+        if period == "day":
+            raw_date = request.query_params.get("date")
+            target_date = _parse_date_param(raw_date, "date")
+
+            start_dt = datetime.combine(target_date, time.min, tzinfo=tz)
+            end_dt = datetime.combine(target_date, time.max, tzinfo=tz)
+
+            day_flows_qs = flows_qs.filter(created_at__gte=start_dt, created_at__lte=end_dt).order_by("created_at")
+
+            inc = day_flows_qs.filter(type="income").aggregate(s=Sum("amount"))["s"] or Decimal("0.00")
+            exp = day_flows_qs.filter(type="expense").aggregate(s=Sum("amount"))["s"] or Decimal("0.00")
+            cnt = day_flows_qs.count()
+            net = inc - exp
+
+            truncated = cnt > 5000
+            flows_list = day_flows_qs[:5000] if truncated else day_flows_qs
+
+            serialized_flows = [
+                {
+                    "id": str(cf.id),
+                    "type": cf.type,
+                    "amount": f"{cf.amount:.2f}",
+                    "name": cf.name or "",
+                    "title": cf.name or "",
+                    "created_at": cf.created_at.isoformat(),
+                    "status": cf.status,
+                }
+                for cf in flows_list
+            ]
+
+            return Response({
+                "cashbox_id": str(cashbox.id),
+                "is_active": cashbox.is_active,
+                "period": "day",
+                "date": target_date.isoformat(),
+                "date_from": target_date.isoformat(),
+                "date_to": target_date.isoformat(),
+                "status_filter": status_param,
+                "summary": {
+                    "total_income": f"{inc:.2f}",
+                    "total_expense": f"{exp:.2f}",
+                    "net": f"{net:.2f}",
+                    "operations_count": cnt,
+                },
+                "flows": serialized_flows,
+                "truncated": truncated,
+                "complete": not truncated,
+            }, status=200)
+
+        else:
+            raw_month = request.query_params.get("month")
+            year, month = _parse_month_param(raw_month)
+
+            first_day = date(year, month, 1)
+            last_day_num = calendar.monthrange(year, month)[1]
+            last_day = date(year, month, last_day_num)
+
+            start_dt = datetime.combine(first_day, time.min, tzinfo=tz)
+            end_dt = datetime.combine(last_day, time.max, tzinfo=tz)
+
+            month_flows_qs = flows_qs.filter(created_at__gte=start_dt, created_at__lte=end_dt)
+
+            total_inc = month_flows_qs.filter(type="income").aggregate(s=Sum("amount"))["s"] or Decimal("0.00")
+            total_exp = month_flows_qs.filter(type="expense").aggregate(s=Sum("amount"))["s"] or Decimal("0.00")
+            total_cnt = month_flows_qs.count()
+            total_net = total_inc - total_exp
+
+            truncated = total_cnt > 5000
+
+            all_flows = list(month_flows_qs.order_by("created_at"))
+            flows_by_day = {}
+            for cf in all_flows:
+                cf_date = cf.created_at.astimezone(tz).date()
+                if cf_date not in flows_by_day:
+                    flows_by_day[cf_date] = []
+                flows_by_day[cf_date].append(cf)
+
+            days_result = []
+            curr_date = first_day
+            total_serialized = 0
+            while curr_date <= last_day:
+                cfs = flows_by_day.get(curr_date, [])
+                day_inc = sum((cf.amount for cf in cfs if cf.type == "income"), Decimal("0.00"))
+                day_exp = sum((cf.amount for cf in cfs if cf.type == "expense"), Decimal("0.00"))
+                day_net = day_inc - day_exp
+                day_cnt = len(cfs)
+
+                day_flows_serialized = []
+                for cf in cfs:
+                    if total_serialized < 5000:
+                        day_flows_serialized.append({
+                            "id": str(cf.id),
+                            "type": cf.type,
+                            "amount": f"{cf.amount:.2f}",
+                            "name": cf.name or "",
+                            "title": cf.name or "",
+                            "created_at": cf.created_at.isoformat(),
+                            "status": cf.status,
+                        })
+                        total_serialized += 1
+
+                days_result.append({
+                    "date": curr_date.isoformat(),
+                    "summary": {
+                        "total_income": f"{day_inc:.2f}",
+                        "total_expense": f"{day_exp:.2f}",
+                        "net": f"{day_net:.2f}",
+                        "operations_count": day_cnt,
+                    },
+                    "flows": day_flows_serialized,
+                })
+                curr_date += timedelta(days=1)
+
+            month_str = f"{year:04d}-{month:02d}"
+            return Response({
+                "cashbox_id": str(cashbox.id),
+                "is_active": cashbox.is_active,
+                "period": "month",
+                "month": month_str,
+                "date_from": first_day.isoformat(),
+                "date_to": last_day.isoformat(),
+                "status_filter": status_param,
+                "summary": {
+                    "total_income": f"{total_inc:.2f}",
+                    "total_expense": f"{total_exp:.2f}",
+                    "net": f"{total_net:.2f}",
+                    "operations_count": total_cnt,
+                },
+                "days": days_result,
+                "truncated": truncated,
+                "complete": not truncated,
+            }, status=200)
+
+
+RU_MONTHS = ["Янв", "Фев", "Мар", "Апр", "Май", "Июн", "Июл", "Авг", "Сен", "Окт", "Ноя", "Дек"]
+
+
+class CashboxReportAnalyticsView(CompanyBranchScopedMixin, APIView):
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request, *args, **kwargs):
+        company = self._company()
+        if not company:
+            raise PermissionDenied("Компания не найдена.")
+
+        tz = zoneinfo.ZoneInfo("Asia/Bishkek")
+        now_bishkek = timezone.now().astimezone(tz)
+
+        raw_df = request.query_params.get("date_from")
+        raw_dt = request.query_params.get("date_to")
+
+        if raw_df:
+            d_from = _parse_date_param(raw_df, "date_from")
+        else:
+            d_from = date(now_bishkek.year, 1, 1)
+
+        if raw_dt:
+            d_to = _parse_date_param(raw_dt, "date_to")
+        else:
+            d_to = now_bishkek.date()
+
+        cashbox_id = request.query_params.get("cashbox")
+        status_param = (request.query_params.get("status") or "approved").strip().lower()
+
+        flows_qs = CashFlow.objects.filter(company=company)
+        if cashbox_id:
+            flows_qs = flows_qs.filter(cashbox_id=cashbox_id)
+        else:
+            flows_qs = flows_qs.filter(cashbox__is_active=True)
+
+        if status_param in ("approved", "true"):
+            flows_qs = flows_qs.filter(status__in=["approved", "true"], request_kind__isnull=True)
+        elif status_param == "pending":
+            flows_qs = flows_qs.filter(status="pending")
+
+        start_dt = datetime.combine(d_from, time.min, tzinfo=tz)
+        end_dt = datetime.combine(d_to, time.max, tzinfo=tz)
+
+        flows_qs = flows_qs.filter(created_at__gte=start_dt, created_at__lte=end_dt)
+
+        total_inc = flows_qs.filter(type="income").aggregate(s=Sum("amount"))["s"] or Decimal("0.00")
+        total_exp = flows_qs.filter(type="expense").aggregate(s=Sum("amount"))["s"] or Decimal("0.00")
+        total_cnt = flows_qs.count()
+        total_net = total_inc - total_exp
+
+        all_flows = list(flows_qs.order_by("created_at"))
+        month_buckets = {}
+
+        curr_y, curr_m = d_from.year, d_from.month
+        end_y, end_m = d_to.year, d_to.month
+        while (curr_y, curr_m) <= (end_y, end_m):
+            m_key = f"{curr_y:04d}-{curr_m:02d}"
+            label = f"{RU_MONTHS[curr_m - 1]} {curr_y}"
+            month_buckets[m_key] = {"period": m_key, "label": label, "income": Decimal("0.00"), "expense": Decimal("0.00"), "cnt": 0}
+            curr_m += 1
+            if curr_m > 12:
+                curr_m = 1
+                curr_y += 1
+
+        for cf in all_flows:
+            cf_dt = cf.created_at.astimezone(tz)
+            m_key = f"{cf_dt.year:04d}-{cf_dt.month:02d}"
+            if m_key in month_buckets:
+                if cf.type == "income":
+                    month_buckets[m_key]["income"] += cf.amount
+                elif cf.type == "expense":
+                    month_buckets[m_key]["expense"] += cf.amount
+                month_buckets[m_key]["cnt"] += 1
+
+        groups_result = []
+        for m_key in sorted(month_buckets.keys()):
+            b = month_buckets[m_key]
+            inc = b["income"]
+            exp = b["expense"]
+            groups_result.append({
+                "period": b["period"],
+                "label": b["label"],
+                "income": f"{inc:.2f}",
+                "expense": f"{exp:.2f}",
+                "net": f"{(inc - exp):.2f}",
+                "operations_count": b["cnt"],
+            })
+
+        return Response({
+            "cashbox_id": str(cashbox_id) if cashbox_id else None,
+            "date_from": d_from.isoformat(),
+            "date_to": d_to.isoformat(),
+            "group_by": "month",
+            "status_filter": status_param,
+            "summary": {
+                "total_income": f"{total_inc:.2f}",
+                "total_expense": f"{total_exp:.2f}",
+                "net": f"{total_net:.2f}",
+                "operations_count": total_cnt,
+            },
+            "groups": groups_result,
+            "truncated": False,
+            "complete": True,
+        }, status=200)

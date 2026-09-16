@@ -17,10 +17,11 @@ def create_cashbox_for_company(sender, instance: Company, created, **kwargs):
     if Cashbox.objects.filter(company=instance, branch__isnull=True).exists():
         return
 
-    Cashbox.objects.create(
+    Cashbox.objects.get_or_create(
         company=instance,
         branch=None,
         name="Основная касса компании",
+        defaults={"is_active": True},
     )
 
 
@@ -36,8 +37,9 @@ def create_cashbox_for_branch(sender, instance: Branch, created, **kwargs):
     if Cashbox.objects.filter(company=instance.company, branch=instance).exists():
         return
 
-    Cashbox.objects.create(
+    Cashbox.objects.get_or_create(
         company=instance.company,
         branch=instance,
         name=f"Касса филиала {instance.name}",
+        defaults={"is_active": True},
     )

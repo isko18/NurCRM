@@ -297,6 +297,7 @@ class ShiftReconciliationTests(TestCase):
             title="Procurement Deal",
             kind=ClientDeal.Kind.DEBT,
             amount=Decimal("2000.00"),
+            debt_months=1,
         )
         inst = deal.installments.first()
         if not inst:

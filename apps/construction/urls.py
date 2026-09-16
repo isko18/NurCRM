@@ -2,6 +2,7 @@ from django.urls import path
 from apps.construction.views import (
     CashboxListCreateView,
     CashboxDetailView,
+    CashboxBulkDeleteView,
     CashFlowListCreateView,
     CashFlowDetailView,
     CashFlowCategoryListCreateView,
@@ -12,15 +13,25 @@ from apps.construction.views import (
     CashShiftDetailView,
     CashShiftOpenView,
     CashShiftCloseView,
-    CashFlowBulkStatusUpdateView
+    CashFlowBulkStatusUpdateView,
+    CashFlowEditRequestView,
+    CashFlowCancelRequestView,
+    CashboxReportView,
+    CashboxReportAnalyticsView,
 )
 from apps.construction.sale_history_views import CashShiftSalesListView
 urlpatterns = [
     path("cashboxes/", CashboxListCreateView.as_view(), name="cashbox-list-create"),
     path("cashboxes/<uuid:pk>/", CashboxDetailView.as_view(), name="cashbox-detail"),
+    path("cashboxes/bulk-delete/", CashboxBulkDeleteView.as_view(), name="cashbox-bulk-delete"),
+
+    path("cashboxes/<uuid:cashbox_id>/report/", CashboxReportView.as_view(), name="cashbox-report"),
+    path("cashbox-reports/analytics/", CashboxReportAnalyticsView.as_view(), name="cashbox-reports-analytics"),
 
     path("cashflows/", CashFlowListCreateView.as_view(), name="cashflow-list-create"),
     path("cashflows/<uuid:pk>/", CashFlowDetailView.as_view(), name="cashflow-detail"),
+    path("cashflows/<uuid:pk>/edit-request/", CashFlowEditRequestView.as_view(), name="cashflow-edit-request"),
+    path("cashflows/<uuid:pk>/cancel-request/", CashFlowCancelRequestView.as_view(), name="cashflow-cancel-request"),
     path("cashflows/bulk/status/", CashFlowBulkStatusUpdateView.as_view(), name="cashflow-bulk-status"),
 
     path("cashflow-categories/", CashFlowCategoryListCreateView.as_view(), name="cashflow-category-list-create"),
@@ -33,5 +44,5 @@ urlpatterns = [
     path("shifts/open/", CashShiftOpenView.as_view(), name="cashshift-open"),
     path("shifts/<uuid:pk>/", CashShiftDetailView.as_view(), name="cashshift-detail"),
     path("shifts/<uuid:pk>/close/", CashShiftCloseView.as_view(), name="cashshift-close"),
-    path("cash/shifts/<uuid:pk>/sales/", CashShiftSalesListView.as_view(), name="cash-shift-sales",),
+    path("cash/shifts/<uuid:pk>/sales/", CashShiftSalesListView.as_view(), name="cash-shift-sales"),
 ]

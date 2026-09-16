@@ -138,8 +138,19 @@ def generate_schedule(sub, horizon_months=12):
     from ..models import SubscriptionPaymentConsalting
 
     step = relativedelta(months=1) if sub.period == "month" else relativedelta(years=1)
-    count = horizon_months if sub.period == "month" else 3  # для года — 3 периода
-    due = sub.start_date
+    if sub.period == "month":
+        count = horizon_months
+    else:
+        count = horizon_months if not getattr(sub, "autorenew", True) else 3
+    last_p = sub.payments.order_by("-due_date").first()
+    due = (last_p.due_date + step) if last_p else sub.start_date
+    if isinstance(due, str):
+        from datetime import datetime
+        try:
+            due = datetime.strptime(due.strip(), "%Y-%m-%d").date()
+        except ValueError:
+            from django.utils import timezone
+            due = timezone.localdate()
     rows = []
     for _ in range(count):
         month_str = due.strftime("%Y-%m")
@@ -158,19 +169,41 @@ def generate_schedule(sub, horizon_months=12):
 
 def create_sale_side_effects(sale, *, subscription_enabled=True,
                              subscription_start=None, subscription_amount=None,
-                             subscription_period=None):
-    """Единая точка вызова при создании продажи / согласовании оплаты (§5.3)."""
+                             subscription_period=None, subscription_prepaid_periods=None,
+                             subscription_autorenew=True,
+                             payment_method="cash", actor=None):
+    """Единая точка вызова при создании продажи / согласовании оплаты (§5.3, §5.6)."""
+    from decimal import Decimal
     from django.db import transaction
-    from ..models import SubscriptionConsalting
+    from ..models import SubscriptionConsalting, SubscriptionPaymentConsalting, ServicesConsalting
 
     with transaction.atomic():
         tariff = sale.tariff
         amount = subscription_amount if subscription_amount is not None else (
-            tariff.subscription_amount if tariff else 0
+            getattr(sale, "subscription_amount", None) or (tariff.subscription_amount if tariff else 0)
         )
         service = getattr(sale, "services", None) or getattr(sale, "service", None)
+        if not service and sale.company:
+            service = ServicesConsalting.objects.filter(company=sale.company).first()
+
+        prepaid_N = 0
+        if subscription_prepaid_periods is not None:
+            try:
+                prepaid_N = max(1, int(subscription_prepaid_periods))
+            except (ValueError, TypeError):
+                prepaid_N = 1
+        elif not subscription_autorenew:
+            try:
+                prepaid_N = max(1, int(getattr(sale, "paid_months", 1) or 1))
+            except (ValueError, TypeError):
+                prepaid_N = 1
+
+        if (prepaid_N > 1 or not subscription_autorenew) and (amount is None or float(amount) <= 0) and getattr(sale, "total", 0):
+            count_for_div = max(1, prepaid_N)
+            amount = (sale.total / count_for_div).quantize(Decimal("0.01"))
+
         if subscription_enabled and amount and float(amount) > 0 and sale.client and service:
-            period = subscription_period or (tariff.subscription_period if tariff else "month")
+            period = subscription_period or getattr(sale, "subscription_period", None) or (tariff.subscription_period if tariff else "month") or "month"
             start = subscription_start or timezone.localdate()
             if isinstance(start, str):
                 from datetime import datetime
@@ -189,11 +222,110 @@ def create_sale_side_effects(sale, *, subscription_enabled=True,
                     amount=amount,
                     period=period,
                     start_date=start,
+                    autorenew=subscription_autorenew,
                     created_by=sale.user,
                 ),
             )
+            if not created and sub.autorenew != subscription_autorenew:
+                sub.autorenew = subscription_autorenew
+                sub.save(update_fields=["autorenew"])
+
+            # Идемпотентность (§5.6, пункт 5): повторный register-payment не оплачивает периоды повторно
+            if not created and sub.payments.filter(status=SubscriptionPaymentConsalting.Status.PAID).exists():
+                return sub
+
+            # Сценарий C: Фиксированный график ровно на N периодов (§5.6)
+            if not subscription_autorenew:
+                count = max(1, prepaid_N)
+                if created:
+                    generate_schedule(sub, horizon_months=count)
+                payments = list(sub.payments.order_by("due_date")[:count])
+                now = timezone.now()
+                for p in payments:
+                    p.status = SubscriptionPaymentConsalting.Status.PAID
+                    p.paid_at = now
+                    p.paid_via = "lead_prepayment"
+                    p.payment_method = payment_method or "cash"
+                    p.save(update_fields=["status", "paid_at", "paid_via", "payment_method"])
+                if payments:
+                    sub.paid_through = payments[-1].due_date
+                    sub.save(update_fields=["paid_through"])
+                return sub
+
+            # Сценарии A и B: Полноценная подписка на 12 месяцев
             if created:
                 generate_schedule(sub, horizon_months=12)
+
+            if prepaid_N >= 1:
+                unpaid = sub.payments.filter(
+                    status__in=[SubscriptionPaymentConsalting.Status.PLANNED, SubscriptionPaymentConsalting.Status.OVERDUE]
+                ).order_by("due_date")
+                if unpaid.count() < prepaid_N:
+                    generate_schedule(sub, horizon_months=prepaid_N + 12)
+                    unpaid = sub.payments.filter(
+                        status__in=[SubscriptionPaymentConsalting.Status.PLANNED, SubscriptionPaymentConsalting.Status.OVERDUE]
+                    ).order_by("due_date")
+
+                to_pay = list(unpaid[:prepaid_N])
+                if to_pay:
+                    from .cash_confirmation import needs_confirmation
+                    from ..models import CashRequestConsalting, CashOperationConsalting
+                    author = actor or sale.user
+                    pay_mode = payment_method or "cash"
+                    prepay_total = sum(p.amount for p in to_pay)
+                    p_first = to_pay[0].period_month
+                    p_last = to_pay[-1].period_month
+                    p_range = p_first if len(to_pay) == 1 else f"{p_first}..{p_last}"
+
+                    already_done = CashRequestConsalting.objects.filter(
+                        subscription=sub, period_month=p_range, status=CashRequestConsalting.Status.PENDING
+                    ).exists() or CashOperationConsalting.objects.filter(
+                        subscription=sub, comment__icontains=p_range
+                    ).exists()
+
+                    if not already_done:
+                        if needs_confirmation(sale.company, pay_mode, author):
+                            CashRequestConsalting.objects.create(
+                                company=sale.company,
+                                user=author,
+                                client=sale.client,
+                                sale=sale,
+                                subscription=sub,
+                                subscription_payment=to_pay[0],
+                                kind=CashRequestConsalting.Kind.SUBSCRIPTION,
+                                direction="income",
+                                amount=prepay_total,
+                                payment_method=pay_mode,
+                                comment=f"Предоплата абонентской платы ({p_range}) при оплате лида",
+                                period_month=p_range,
+                                prepaid_count=len(to_pay),
+                                status=CashRequestConsalting.Status.PENDING,
+                            )
+                        else:
+                            now = timezone.now()
+                            for p in to_pay:
+                                p.status = SubscriptionPaymentConsalting.Status.PAID
+                                p.paid_at = now
+                                p.paid_via = "lead_prepayment"
+                                p.payment_method = pay_mode
+                                p.save(update_fields=["status", "paid_at", "paid_via", "payment_method"])
+                            sub.paid_through = to_pay[-1].due_date
+                            sub.save(update_fields=["paid_through"])
+                            CashOperationConsalting.objects.create(
+                                company=sale.company,
+                                user=author,
+                                sale=sale,
+                                subscription=sub,
+                                kind=CashOperationConsalting.Kind.SUBSCRIPTION,
+                                direction=CashOperationConsalting.Direction.INCOME,
+                                amount=prepay_total,
+                                payment_method=pay_mode,
+                                comment=f"Предоплата абонентской платы ({p_range}) при оплате лида",
+                            )
+                            if sub.client and subscription_autorenew:
+                                from .tenant_lifecycle import extend_tenant_subscription
+                                extend_tenant_subscription(client=sub.client, subscription_payment=to_pay[-1], actor=author)
+
             return sub
         return None
 

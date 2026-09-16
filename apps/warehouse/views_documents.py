@@ -489,13 +489,11 @@ class DocumentPostView(CompanyBranchRestrictedMixin, generics.GenericAPIView):
             allow_negative = request.data.get('allow_negative', False)
             if isinstance(allow_negative, str):
                 allow_negative = allow_negative.lower() in ('true', '1', 'yes')
-            services.post_document(doc, allow_negative=allow_negative)
+            services.post_document(doc, allow_negative=allow_negative, user=request.user)
             doc.refresh_from_db()
 
-            # Если при проведении наличной продажи документ перешёл в CASH_PENDING:
-            # - Для владельца/админа по умолчанию auto_approve = True
-            # - Для агента по умолчанию auto_approve = False (нужно решение кассы)
-            # - Если в запросе передан auto_approve_cash, учитываем его значение.
+            # Если при проведении наличной продажи документ перешёл в CASH_PENDING (включено подтверждение кассы):
+            # Если в запросе явно передан auto_approve_cash, учитываем его значение.
             raw_auto_approve = request.data.get("auto_approve_cash", None)
             if raw_auto_approve is not None:
                 if isinstance(raw_auto_approve, str):
@@ -503,7 +501,7 @@ class DocumentPostView(CompanyBranchRestrictedMixin, generics.GenericAPIView):
                 else:
                     auto_approve_cash = bool(raw_auto_approve)
             else:
-                auto_approve_cash = _is_owner_like(request.user)
+                auto_approve_cash = False
 
             if doc.status == doc.Status.CASH_PENDING and auto_approve_cash:
                 try:

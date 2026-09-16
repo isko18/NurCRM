@@ -11,6 +11,7 @@ from .views import (
     FeatureListAPIView,
     EmployeeDestroyAPIView, 
     CompanyDetailAPIView,
+    CompanySubscriptionDetailAPIView,
     SectorListAPIView,
     RegionListAPIView,
     EmployeeDetailAPIView,
@@ -60,6 +61,7 @@ urlpatterns = [
     path('regions/', RegionListAPIView.as_view(), name='region-list'),
     path('subscription-plans/', SubscriptionPlanListAPIView.as_view(), name='subscription-plan-list'),
     path('features/', FeatureListAPIView.as_view(), name='feature-list'),
+    path('company/subscription/', CompanySubscriptionDetailAPIView.as_view(), name='company-subscription-detail'),
     path('company/', CompanyDetailAPIView.as_view(), name='company-detail'),
     
     path("branches/", BranchListCreateAPIView.as_view(), name="branch-list"),

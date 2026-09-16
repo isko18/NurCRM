@@ -15,9 +15,9 @@ from reportlab.lib.utils import ImageReader
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 
-from django.http import FileResponse
-from django.http import Http404
+from django.http import FileResponse, Http404
 from rest_framework.exceptions import NotFound, PermissionDenied, ValidationError
+from django.core.exceptions import ValidationError as DjangoValidationError
 
 from decimal import (
     Decimal,
@@ -29,7 +29,7 @@ from datetime import timedelta, datetime, date, time as dtime
 import io, os, uuid, logging
 from django.db import IntegrityError
 
-from django.db.models import Q, F, Value as V, Sum, Prefetch, Count
+from django.db.models import Q, F, Value as V, Sum, Prefetch, Count, OuterRef, Subquery
 from django.db.models.functions import Coalesce
 from django.utils.timezone import is_aware, make_aware, get_current_timezone
 
@@ -599,6 +599,15 @@ def _serialize_pos_sale(request, cart):
     if data.get("shift"):
         data["shift"] = str(data["shift"])
     return data
+
+
+def _line_discount_from_request(base_price, quantity, discount_total=None, discount_percent=None) -> Decimal:
+    if discount_percent is not None:
+        line_base = Decimal(str(base_price or 0)) * Decimal(str(quantity or 0))
+        return _q2(line_base * Decimal(str(discount_percent)) / Decimal("100"))
+    if discount_total is not None:
+        return _q2(Decimal(str(discount_total)))
+    return Decimal("0.00")
 
 
 def _pos_multi_cart_response(request, active_cart, *, status_code=status.HTTP_200_OK):
@@ -2516,6 +2525,7 @@ class SaleAddItemAPIView(MarketCashierOnlyMixin, APIView):
 
         unit_price = ser.validated_data.get("unit_price")
         line_discount = ser.validated_data.get("discount_total")
+        discount_percent = ser.validated_data.get("discount_percent")
         sale_package_id = ser.validated_data.get("sale_package_id")
         pkg = None
         if sale_package_id:
@@ -2542,7 +2552,7 @@ class SaleAddItemAPIView(MarketCashierOnlyMixin, APIView):
                     base_price = _q2(pack_price)
             else:
                 base_price = _q2(default_unit_price_for_package(product, pkg))
-        disc_total = _q2(Decimal(str(line_discount))) if line_discount is not None else Decimal("0.00")
+        disc_total = _line_discount_from_request(base_price, qty, line_discount, discount_percent)
 
         # Цена продажи не ниже закупочной, кроме случая со скидкой (со скидкой можно ниже)
         if disc_total <= 0:
@@ -2589,12 +2599,12 @@ class SaleAddItemAPIView(MarketCashierOnlyMixin, APIView):
             item.quantity = qty3(item.quantity + qty)
             if unit_price is not None:
                 item.unit_price = base_price
-            if line_discount is not None:
+            if line_discount is not None or discount_percent is not None:
                 item.line_discount = (Decimal(str(item.line_discount or 0)) + disc_total)
             update_f = ["quantity"]
             if unit_price is not None:
                 update_f.append("unit_price")
-            if line_discount is not None:
+            if line_discount is not None or discount_percent is not None:
                 update_f.append("line_discount")
             item.save(update_fields=update_f, skip_full_clean=True)
         else:
@@ -2883,7 +2893,8 @@ class SalePayDebtAPIView(MarketCashierOnlyMixin, CompanyBranchRestrictedMixin, A
         cf = create_auto_cashflow(
             company=sale.company,
             branch=sale.branch,
-            cashbox=sale.cashbox,
+            # Let resolve_cashbox select the debt cashbox when one is configured.
+            cashbox=None,
             cashbox_id=cashbox_id,
             user=request.user,
             shift=sale.shift,
@@ -2893,6 +2904,7 @@ class SalePayDebtAPIView(MarketCashierOnlyMixin, CompanyBranchRestrictedMixin, A
             source_id=str(sale.id),
             name=f"Оплата долга по продаже №{sale.id}",
             source_business_operation_id="Оплата долга",
+            payment_method=ser.validated_data["payment_method"],
         )
 
         sale.refresh_from_db()
@@ -3266,29 +3278,140 @@ def adjust_sale_debt_on_return(
     return None
 
 
+def _resolve_return_cashbox(sale: Sale, payload: Optional[Dict] = None):
+    from apps.construction.models import Cashbox, CashFlow
+    from apps.construction.auto_cashflow import resolve_cashbox
+
+    payload = payload or {}
+
+    # 0. Явно переданная касса в payload
+    cb_id = payload.get("cashbox_id")
+    if cb_id:
+        cb = Cashbox.objects.filter(id=cb_id, company=sale.company).first()
+        if cb:
+            return cb
+
+    # 1. Если у чека зафиксирована касса — возвращаем её!
+    if sale.cashbox:
+        return sale.cashbox
+
+    # 2. Если у чека зафиксирована смена с кассой — возвращаем кассу этой смены
+    if sale.shift and sale.shift.cashbox:
+        return sale.shift.cashbox
+
+    # 3. Попытка разрешить по контексту из payload (§6)
+    b_id = payload.get("branch_id") or (str(sale.branch_id) if sale.branch_id else None)
+    cb_role = payload.get("cashbox_role")
+    ctx = {}
+    if b_id:
+        ctx["branch_id"] = b_id
+    if cb_role:
+        ctx["cashbox_role"] = cb_role
+    if ctx:
+        cb = resolve_cashbox(
+            company=sale.company,
+            context=ctx,
+            source_kind=CashFlow.SourceKind.POS_SALE_RETURN,
+            require_cashbox=False,
+        )
+        if cb:
+            return cb
+
+    # 4. Fallback: POS_MAIN компании, затем POS_BRANCH, затем любая доступная касса
+    cb = Cashbox.objects.filter(company=sale.company, role=Cashbox.CashboxRole.POS_MAIN).first()
+    if not cb and sale.branch_id:
+        cb = Cashbox.objects.filter(company=sale.company, branch_id=sale.branch_id, role=Cashbox.CashboxRole.POS_BRANCH).first()
+    if not cb:
+        cb = Cashbox.objects.filter(company=sale.company).first()
+    return cb
+
+
+def _resolve_return_shift(sale: Sale, user, cashbox, payload: Optional[Dict] = None):
+    from apps.construction.models import CashShift
+    payload = payload or {}
+    shift_id = payload.get("shift_id")
+    if shift_id:
+        sh = CashShift.objects.filter(id=shift_id, company=sale.company, status=CashShift.Status.OPEN).first()
+        if sh and (not cashbox or sh.cashbox_id == cashbox.id):
+            return sh
+
+    # Если смена чека ещё открыта и относится к той же кассе (§6)
+    if sale.shift and sale.shift.status == CashShift.Status.OPEN:
+        if not cashbox or sale.shift.cashbox_id == cashbox.id:
+            return sale.shift
+
+    # Если у текущего кассира открыта смена на этой кассе (§6)
+    if user and getattr(user, "is_authenticated", False) and cashbox:
+        sh = CashShift.objects.filter(cashbox=cashbox, cashier=user, status=CashShift.Status.OPEN).first()
+        if sh:
+            return sh
+
+    # Иначе смена null (§6)
+    return None
+
+
+def _broadcast_return_realtime(sale: Sale, created_flows, shift=None):
+    try:
+        from asgiref.sync import async_to_sync
+        from channels.layers import get_channel_layer
+        channel_layer = get_channel_layer()
+        if not channel_layer:
+            return
+        company_group = f"notif_company_{sale.company_id}"
+        for cf in created_flows:
+            async_to_sync(channel_layer.group_send)(
+                company_group,
+                {
+                    "type": "market.notification",
+                    "event": "market.cashflow.created",
+                    "data": {
+                        "cashflow_id": str(cf.id),
+                        "type": cf.type,
+                        "amount": str(cf.amount),
+                        "cashbox_id": str(cf.cashbox_id) if cf.cashbox_id else None,
+                        "source_kind": cf.source_kind or "",
+                        "source_id": str(cf.source_id or ""),
+                    },
+                },
+            )
+        if shift and any(getattr(cf, "affects_shift_drawer", False) for cf in created_flows):
+            totals = shift.calc_live_totals()
+            async_to_sync(channel_layer.group_send)(
+                company_group,
+                {
+                    "type": "market.notification",
+                    "event": "market.shift.updated",
+                    "data": {
+                        "shift_id": str(shift.id),
+                        "drawer_expected_cash": str(totals.get("drawer_expected_cash", "0.00")),
+                        "cash_sales_total": str(totals.get("cash_sales_total", "0.00")),
+                    },
+                },
+            )
+    except Exception as exc:
+        logging.getLogger("crm.pos.return").warning("WebSocket return notification error: %s", exc)
+
+
 def _execute_sale_return(
     sale: Sale,
     partial_items: Optional[List[tuple]],
     *,
     is_defect: bool = False,
     user=None,
+    payload: Optional[Dict] = None,
 ) -> Optional[Dict]:
     """
-    partial_items=None — полный возврат (статус canceled, весь товар на склад / снятие аллокаций).
-    Иначе — частичный возврат по строкам; чек остаётся paid/debt, пока есть строки.
-
-    is_defect=True — брак: товар списывается, на склад/к агенту не возвращается,
-    фиксируется как брак (для агентских продаж — записью ReturnFromAgent).
-
-    Возвращает debt_adjustment dict (или None), если у чека был связанный долг.
+    Выполняет возврат продажи (полный или частичный).
+    Создаёт компенсирующие движения расхода CashFlow (§3, §9, §10).
+    Гарантирует идемпотентность по idempotency_key (§5).
     """
     is_agent_sale = sale.agent_allocations.exists()
+    payload = payload or {}
+    idempotency_key = payload.get("idempotency_key")
 
     if not partial_items:
         returned_money = sale.total or Decimal("0.00")
         if is_agent_sale:
-            # Полный возврат агентской продажи: по каждой строке снимаем привязки
-            # и фиксируем возврат/брак (для аналитики и склада агента).
             for item in sale.items.select_related("product", "sale_package"):
                 rq = qty3(Decimal(str(item.quantity or 0)))
                 if rq <= 0:
@@ -3300,7 +3423,6 @@ def _execute_sale_return(
                     is_defect=is_defect, user=user,
                 )
         else:
-            # Обычная касса: при браке товар списываем (на склад не возвращаем).
             if not is_defect:
                 for item in sale.items.filter(product_id__isnull=False).select_related("sale_package"):
                     rq = qty3(Decimal(str(item.quantity or 0)))
@@ -3310,90 +3432,200 @@ def _execute_sale_return(
         sale.status = Sale.Status.CANCELED
         sale.save(update_fields=["status"])
         debt_adj = adjust_sale_debt_on_return(sale, returned_money, is_full_return=True)
-        return debt_adj
-
-    item_ids = [uid for uid, _ in partial_items]
-    found = set(SaleItem.objects.filter(sale=sale, id__in=item_ids).values_list("id", flat=True))
-    missing = set(item_ids) - found
-    if missing:
-        raise ValidationError({"items": "Есть позиции не из этого чека или несуществующие sale_item_id."})
-
-    total_returned_money = Decimal("0.00")
-
-    for sid, rq in partial_items:
-        # FOR UPDATE только по sale_item: иначе PostgreSQL ругается на nullable side of outer join
-        # при select_related(product, sale_package).
-        item = (
-            SaleItem.objects.select_for_update(of=("self",))
-            .select_related("product", "sale_package")
-            .get(pk=sid, sale=sale)
-        )
-        old_q = qty3(Decimal(str(item.quantity or 0)))
-        rq = qty3(rq)
-        if rq > old_q or rq <= 0:
-            raise ValidationError({"items": f"Некорректное количество возврата для позиции {sid}."})
-
-        unit_price = item.unit_price or Decimal("0.00")
-        old_disc = Decimal(str(item.line_discount or 0))
-        item_disc = money(old_disc * (rq / old_q)) if old_q > 0 else Decimal("0.00")
-        item_returned_money = money((unit_price * rq) - item_disc)
-        total_returned_money += item_returned_money
-
-        if is_agent_sale:
-            if rq != rq.to_integral_value():
-                raise ValidationError({"items": "Для агентского чека количество возврата должно быть целым."})
-            unit_net = _sale_item_unit_net(item)
-            breakdown = _release_agent_allocations_for_qty(item, int(rq))
-            _record_agent_sale_return(
-                sale=sale, breakdown=breakdown, unit_net=unit_net,
-                is_defect=is_defect, user=user,
-            )
-        else:
-            # Обычная касса: при браке товар списываем (на склад не возвращаем).
-            if not is_defect:
-                _restock_product_for_sale_item_return(item, rq)
-
-        new_q = qty3(old_q - rq)
-        new_disc = money(old_disc - item_disc) if old_q > 0 else old_disc
-
-        if new_q <= 0:
-            item.delete()
-        else:
-            item.quantity = new_q
-            item.line_discount = new_disc
-            item.save(update_fields=["quantity", "line_discount"])
-
-    is_full = not SaleItem.objects.filter(sale=sale).exists()
-    if is_full:
-        sale.status = Sale.Status.CANCELED
-        sale.save(update_fields=["status"])
+        is_full = True
     else:
-        _recalc_sale_headers_from_items(sale)
+        item_ids = [uid for uid, _ in partial_items]
+        found = set(SaleItem.objects.filter(sale=sale, id__in=item_ids).values_list("id", flat=True))
+        missing = set(item_ids) - found
+        if missing:
+            raise ValidationError({"items": "Есть позиции не из этого чека или несуществующие sale_item_id."})
 
-    debt_adj = adjust_sale_debt_on_return(sale, total_returned_money, is_full_return=is_full)
+        total_returned_money = Decimal("0.00")
+
+        for sid, rq in partial_items:
+            item = (
+                SaleItem.objects.select_for_update(of=("self",))
+                .select_related("product", "sale_package")
+                .get(pk=sid, sale=sale)
+            )
+            old_q = qty3(Decimal(str(item.quantity or 0)))
+            rq = qty3(rq)
+            if rq > old_q or rq <= 0:
+                raise ValidationError({"items": f"Некорректное количество возврата для позиции {sid}."})
+
+            unit_price = item.unit_price or Decimal("0.00")
+            old_disc = Decimal(str(item.line_discount or 0))
+            item_disc = money(old_disc * (rq / old_q)) if old_q > 0 else Decimal("0.00")
+            item_returned_money = money((unit_price * rq) - item_disc)
+            total_returned_money += item_returned_money
+
+            if is_agent_sale:
+                if rq != rq.to_integral_value():
+                    raise ValidationError({"items": "Для агентского чека количество возврата должно быть целым."})
+                unit_net = _sale_item_unit_net(item)
+                breakdown = _release_agent_allocations_for_qty(item, int(rq))
+                _record_agent_sale_return(
+                    sale=sale, breakdown=breakdown, unit_net=unit_net,
+                    is_defect=is_defect, user=user,
+                )
+            else:
+                if not is_defect:
+                    _restock_product_for_sale_item_return(item, rq)
+
+            new_q = qty3(old_q - rq)
+            new_disc = money(old_disc - item_disc) if old_q > 0 else old_disc
+
+            if new_q <= 0:
+                item.delete()
+            else:
+                item.quantity = new_q
+                item.line_discount = new_disc
+                item.save(update_fields=["quantity", "line_discount"])
+
+        is_full = not SaleItem.objects.filter(sale=sale).exists()
+        if is_full:
+            sale.status = Sale.Status.CANCELED
+        else:
+            sale.status = getattr(Sale.Status, "PARTIALLY_RETURNED", "partially_returned")
+        sale.save(update_fields=["status"])
+
+        if not is_full:
+            _recalc_sale_headers_from_items(sale)
+
+        returned_money = total_returned_money
+        debt_adj = adjust_sale_debt_on_return(sale, total_returned_money, is_full_return=is_full)
+
+    # --- Создание компенсирующего движения CashFlow (§3, §9, §10) ---
+    if sale.payment_method == Sale.PaymentMethod.DEBT:
+        cash_to_refund = Decimal(str(debt_adj.get("cash_refund_due") or "0.00")) if debt_adj else Decimal("0.00")
+    else:
+        cash_to_refund = returned_money
+
+    created_flows = []
+    actual_shift = None
+    if cash_to_refund > Decimal("0.00"):
+        from apps.construction.models import CashFlow
+        from apps.construction.auto_cashflow import create_auto_cashflow
+
+        cashbox = _resolve_return_cashbox(sale, payload)
+        actual_shift = _resolve_return_shift(sale, user, cashbox, payload)
+
+        payments = list(sale.payments.filter(amount__gt=0))
+        if payments:
+            if is_full:
+                for p in payments:
+                    p_amt = p.amount
+                    p_m = str(p.method or "cash").lower()
+                    affects_drawer = (p_m == "cash") and (actual_shift is not None)
+                    ik = f"{idempotency_key}:{p_m}" if idempotency_key else None
+                    cf = create_auto_cashflow(
+                        company=sale.company,
+                        branch=sale.branch,
+                        cashbox=cashbox,
+                        user=user,
+                        shift=actual_shift,
+                        type=CashFlow.Type.EXPENSE,
+                        amount=p_amt,
+                        source_kind=CashFlow.SourceKind.POS_SALE_RETURN,
+                        source_id=str(sale.id),
+                        idempotency_key=ik,
+                        affects_shift_drawer=affects_drawer,
+                        name=f"Возврат по чеку №{sale.doc_number or sale.id} ({p.get_method_display() if hasattr(p, 'get_method_display') else p_m})",
+                        source_business_operation_id="pos_sale_return",
+                    )
+                    if cf:
+                        created_flows.append(cf)
+            else:
+                total_orig = sum(p.amount for p in payments) or sale.total
+                ratio = (cash_to_refund / total_orig) if total_orig > 0 else Decimal("0")
+                for p in payments:
+                    part_amt = money(p.amount * ratio)
+                    if part_amt > Decimal("0.00"):
+                        p_m = str(p.method or "cash").lower()
+                        affects_drawer = (p_m == "cash") and (actual_shift is not None)
+                        ik = f"{idempotency_key}:{p_m}" if idempotency_key else None
+                        cf = create_auto_cashflow(
+                            company=sale.company,
+                            branch=sale.branch,
+                            cashbox=cashbox,
+                            user=user,
+                            shift=actual_shift,
+                            type=CashFlow.Type.EXPENSE,
+                            amount=part_amt,
+                            source_kind=CashFlow.SourceKind.POS_SALE_RETURN,
+                            source_id=str(sale.id),
+                            idempotency_key=ik,
+                            affects_shift_drawer=affects_drawer,
+                            name=f"Возврат по чеку №{sale.doc_number or sale.id} ({p.get_method_display() if hasattr(p, 'get_method_display') else p_m})",
+                            source_business_operation_id="pos_sale_return",
+                        )
+                        if cf:
+                            created_flows.append(cf)
+        else:
+            p_m = str(sale.payment_method or "cash").lower()
+            if p_m == "debt":
+                p_m = "cash"
+            affects_drawer = (p_m == "cash") and (actual_shift is not None)
+            cf = create_auto_cashflow(
+                company=sale.company,
+                branch=sale.branch,
+                cashbox=cashbox,
+                user=user,
+                shift=actual_shift,
+                type=CashFlow.Type.EXPENSE,
+                amount=cash_to_refund,
+                source_kind=CashFlow.SourceKind.POS_SALE_RETURN,
+                source_id=str(sale.id),
+                idempotency_key=str(idempotency_key) if idempotency_key else None,
+                affects_shift_drawer=affects_drawer,
+                name=f"Возврат по чеку №{sale.doc_number or sale.id}",
+                source_business_operation_id="pos_sale_return",
+            )
+            if cf:
+                created_flows.append(cf)
+
+    if idempotency_key:
+        from apps.main.models import SaleReturn
+        import json
+        from django.core.serializers.json import DjangoJSONEncoder
+        items_payload_safe = json.loads(json.dumps(partial_items, cls=DjangoJSONEncoder)) if partial_items else None
+        SaleReturn.objects.get_or_create(
+            company=sale.company,
+            idempotency_key=str(idempotency_key),
+            defaults={
+                "sale": sale,
+                "user": user if (user and getattr(user, "is_authenticated", False)) else None,
+                "returned_amount": returned_money,
+                "is_defect": is_defect,
+                "is_full": is_full,
+                "items_payload": items_payload_safe,
+            }
+        )
+
+    _broadcast_return_realtime(sale, created_flows, actual_shift)
     return debt_adj
 
 
 class SaleReturnAPIView(MarketCashierOnlyMixin, CompanyBranchRestrictedMixin, APIView):
     """
-    Возврат продажи (владелец и агент).
+    Возврат продажи (владелец и кассир).
     POST /api/main/pos/sales/<pk>/return/
-
-    Отменяет оплаченную или долговую продажу:
-    - для обычных продаж: возвращает товар на склад (Product.quantity)
-    - для агентских продаж: удаляет AgentSaleAllocation (товар снова у агента)
     """
 
     permission_classes = [permissions.IsAuthenticated]
 
     @transaction.atomic
     def post(self, request, pk, *args, **kwargs):
-        # Важно: `select_for_update()` нельзя применять к queryset'у с `select_related`/`prefetch_related`,
-        # потому что Django может сгенерировать `LEFT OUTER JOIN` на nullable связях,
-        # а PostgreSQL запрещает `FOR UPDATE` на nullable стороне такого join.
-        #
-        # Поэтому сначала блокируем только строку Sale без join'ов,
-        # а связанные объекты подтягиваем уже обычными запросами.
+        payload = request.data or {}
+        idempotency_key = payload.get("idempotency_key")
+        if idempotency_key:
+            from apps.main.models import SaleReturn
+            existing_ret = SaleReturn.objects.filter(
+                sale_id=pk, idempotency_key=str(idempotency_key)
+            ).first()
+            if existing_ret and existing_ret.response_data:
+                return Response(existing_ret.response_data, status=status.HTTP_200_OK)
+
         locked_qs = Sale.objects.select_for_update()
         locked_qs = self._filter_qs_company_branch(locked_qs)
         sale = get_object_or_404(locked_qs, id=pk)
@@ -3403,7 +3635,12 @@ class SaleReturnAPIView(MarketCashierOnlyMixin, CompanyBranchRestrictedMixin, AP
                 {"detail": "Продажа уже отменена."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
-        if sale.status not in (Sale.Status.PAID, Sale.Status.DEBT):
+        valid_return_statuses = (
+            Sale.Status.PAID,
+            Sale.Status.DEBT,
+            getattr(Sale.Status, "PARTIALLY_RETURNED", "partially_returned")
+        )
+        if sale.status not in valid_return_statuses:
             return Response(
                 {"detail": "Возврат возможен только для оплаченных или долговых продаж."},
                 status=status.HTTP_400_BAD_REQUEST,
@@ -3412,19 +3649,31 @@ class SaleReturnAPIView(MarketCashierOnlyMixin, CompanyBranchRestrictedMixin, AP
         try:
             partial = _parse_partial_return_items(request.data)
             is_defect = _parse_is_defect(request.data)
-            debt_adj = _execute_sale_return(sale, partial, is_defect=is_defect, user=request.user)
-        except ValidationError as e:
-            return Response(e.detail, status=status.HTTP_400_BAD_REQUEST)
+            debt_adj = _execute_sale_return(
+                sale, partial, is_defect=is_defect, user=request.user, payload=request.data
+            )
+        except (ValidationError, DjangoValidationError) as e:
+            detail = getattr(e, "detail", None) or getattr(e, "message_dict", None) or getattr(e, "messages", None) or str(e)
+            return Response(detail, status=status.HTTP_400_BAD_REQUEST)
 
-        # Инвалидируем кэши аналитики/списков, чтобы цифры обновлялись сразу после возврата.
-        # (market analytics кэшируется по ключам nurcrm:analytics:market:... )
         invalidate_cache_pattern(f"analytics:market:{sale.company_id}:")
-        # списки товаров/остатков тоже могут быть кэшированы
         invalidate_cache_pattern(f"products:list:{sale.company_id}:")
 
         sale.refresh_from_db()
         data = SaleDetailSerializer(sale, context={"request": request}).data
         data["debt_adjustment"] = debt_adj
+
+        if idempotency_key:
+            from apps.main.models import SaleReturn
+            import json
+            from django.core.serializers.json import DjangoJSONEncoder
+            ret_obj = SaleReturn.objects.filter(
+                sale=sale, idempotency_key=str(idempotency_key)
+            ).first()
+            if ret_obj:
+                ret_obj.response_data = json.loads(json.dumps(data, cls=DjangoJSONEncoder))
+                ret_obj.save(update_fields=["response_data"])
+
         return Response(
             data,
             status=status.HTTP_200_OK,
@@ -3439,7 +3688,16 @@ class AgentSaleReturnAPIView(SaleReturnAPIView):
 
     @transaction.atomic
     def post(self, request, pk, *args, **kwargs):
-        # Проверка доступа без select_for_update (DISTINCT + FOR UPDATE несовместимы в PostgreSQL)
+        payload = request.data or {}
+        idempotency_key = payload.get("idempotency_key")
+        if idempotency_key:
+            from apps.main.models import SaleReturn
+            existing_ret = SaleReturn.objects.filter(
+                sale_id=pk, idempotency_key=str(idempotency_key)
+            ).first()
+            if existing_ret and existing_ret.response_data:
+                return Response(existing_ret.response_data, status=status.HTTP_200_OK)
+
         allowed_qs = (
             Sale.objects.filter(
                 Q(agent_allocations__agent=request.user) | Q(user=request.user)
@@ -3451,8 +3709,6 @@ class AgentSaleReturnAPIView(SaleReturnAPIView):
         if not allowed_qs.exists():
             raise Http404("Продажа не найдена или не принадлежит агенту.")
 
-        # Важно: блокируем только саму Sale без join'ов, чтобы избежать
-        # ошибок БД вида "FOR UPDATE cannot be applied to the nullable side of an outer join".
         sale = Sale.objects.select_for_update().get(id=pk)
 
         if sale.status == Sale.Status.CANCELED:
@@ -3460,7 +3716,12 @@ class AgentSaleReturnAPIView(SaleReturnAPIView):
                 {"detail": "Продажа уже отменена."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
-        if sale.status not in (Sale.Status.PAID, Sale.Status.DEBT):
+        valid_return_statuses = (
+            Sale.Status.PAID,
+            Sale.Status.DEBT,
+            getattr(Sale.Status, "PARTIALLY_RETURNED", "partially_returned")
+        )
+        if sale.status not in valid_return_statuses:
             return Response(
                 {"detail": "Возврат возможен только для оплаченных или долговых продаж."},
                 status=status.HTTP_400_BAD_REQUEST,
@@ -3469,15 +3730,30 @@ class AgentSaleReturnAPIView(SaleReturnAPIView):
         try:
             partial = _parse_partial_return_items(request.data)
             is_defect = _parse_is_defect(request.data)
-            debt_adj = _execute_sale_return(sale, partial, is_defect=is_defect, user=request.user)
-        except ValidationError as e:
-            return Response(e.detail, status=status.HTTP_400_BAD_REQUEST)
+            debt_adj = _execute_sale_return(
+                sale, partial, is_defect=is_defect, user=request.user, payload=request.data
+            )
+        except (ValidationError, DjangoValidationError) as e:
+            detail = getattr(e, "detail", None) or getattr(e, "message_dict", None) or getattr(e, "messages", None) or str(e)
+            return Response(detail, status=status.HTTP_400_BAD_REQUEST)
 
         invalidate_cache_pattern(f"analytics:market:{sale.company_id}:")
         invalidate_cache_pattern(f"products:list:{sale.company_id}:")
         sale.refresh_from_db()
         data = SaleDetailSerializer(sale, context={"request": request}).data
         data["debt_adjustment"] = debt_adj
+
+        if idempotency_key:
+            from apps.main.models import SaleReturn
+            import json
+            from django.core.serializers.json import DjangoJSONEncoder
+            ret_obj = SaleReturn.objects.filter(
+                sale=sale, idempotency_key=str(idempotency_key)
+            ).first()
+            if ret_obj:
+                ret_obj.response_data = json.loads(json.dumps(data, cls=DjangoJSONEncoder))
+                ret_obj.save(update_fields=["response_data"])
+
         return Response(
             data,
             status=status.HTTP_200_OK,
@@ -3727,6 +4003,19 @@ class SaleListAPIView(MarketCashierOnlyMixin, CompanyBranchRestrictedMixin, gene
         if max_total is not None:
             qs = qs.filter(total__lte=max_total)
 
+        barcode = (self.request.query_params.get("barcode") or "").strip()
+        if barcode:
+            matched_items = SaleItem.objects.filter(sale_id=OuterRef("pk")).filter(
+                Q(barcode_snapshot=barcode)
+                | Q(product__barcode=barcode)
+                | Q(product__alternate_barcodes__barcode=barcode)
+            ).order_by("id")
+            qs = qs.filter(
+                Q(items__barcode_snapshot=barcode)
+                | Q(items__product__barcode=barcode)
+                | Q(items__product__alternate_barcodes__barcode=barcode)
+            ).annotate(matched_item_name=Subquery(matched_items.values("name_snapshot")[:1])).distinct()
+
         return qs
 
     def list(self, request, *args, **kwargs):
@@ -3774,11 +4063,8 @@ class SaleRetrieveAPIView(MarketCashierOnlyMixin, CompanyBranchRestrictedMixin, 
 
         cart = _get_pos_open_cart_for_cashier(company=company, user=user, cart_id=pk)
         if cart:
-            is_admin = getattr(request.user, "role", None) in ["owner", "admin"]
-            if not is_admin and getattr(company, "cashier_password", None):
-                from django.core.cache import cache
-                if not cache.get(f"delete_verified_{request.user.id}"):
-                    return Response({"detail": "Требуется код удаления или время проверки истекло"}, status=status.HTTP_403_FORBIDDEN)
+            if not _is_cart_deletion_authorized(request, company=company):
+                return Response({"detail": "Требуется код удаления или время проверки истекло"}, status=status.HTTP_403_FORBIDDEN)
                     
             shift = _abandon_pos_open_cart(company=company, user=user, cart=cart)
             ordered = list(_shift_active_carts_qs(company, user, shift))
@@ -3944,7 +4230,7 @@ class MarketCashierSettingsAPIView(CompanyBranchRestrictedMixin, APIView):
         company = request.user.company
         is_admin = getattr(request.user, "role", None) in ["owner", "admin"]
 
-        debt_ver = getattr(company, "debt_schedule_version", "v1")
+        debt_ver = getattr(company, "debt_schedule_version", None) or "v1"
         if debt_ver not in ("v1", "v2"):
             debt_ver = "v1"
 
@@ -3953,6 +4239,7 @@ class MarketCashierSettingsAPIView(CompanyBranchRestrictedMixin, APIView):
             "max_discount_percent": str(company.max_discount_percent) if company.max_discount_percent is not None else None,
             "debt_schedule_version": debt_ver,
             "deferred_schedule_version": debt_ver,
+            "cashflow_requests_enabled": bool(getattr(company, "cashflow_requests_enabled", False)),
         }
         
         if is_admin:
@@ -3968,6 +4255,23 @@ class MarketCashierSettingsAPIView(CompanyBranchRestrictedMixin, APIView):
             
         data = request.data
         updated_fields = []
+
+        if "cashflow_requests_enabled" in data:
+            cf_val = data["cashflow_requests_enabled"]
+            if isinstance(cf_val, bool):
+                company.cashflow_requests_enabled = cf_val
+                updated_fields.append("cashflow_requests_enabled")
+            elif str(cf_val).strip().lower() in ("true", "1"):
+                company.cashflow_requests_enabled = True
+                updated_fields.append("cashflow_requests_enabled")
+            elif str(cf_val).strip().lower() in ("false", "0"):
+                company.cashflow_requests_enabled = False
+                updated_fields.append("cashflow_requests_enabled")
+            else:
+                return Response(
+                    {"cashflow_requests_enabled": ["Значение должно быть булевым (true/false)"]},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
 
         if "delete_item_code" in data:
             code = data["delete_item_code"]
@@ -4007,7 +4311,7 @@ class MarketCashierSettingsAPIView(CompanyBranchRestrictedMixin, APIView):
         if updated_fields:
             company.save(update_fields=updated_fields)
 
-        debt_ver = getattr(company, "debt_schedule_version", "v1") or "v1"
+        debt_ver = getattr(company, "debt_schedule_version", None) or "v1"
         if debt_ver not in ("v1", "v2"):
             debt_ver = "v1"
 
@@ -4017,6 +4321,7 @@ class MarketCashierSettingsAPIView(CompanyBranchRestrictedMixin, APIView):
             "delete_item_code": company.cashier_password,
             "debt_schedule_version": debt_ver,
             "deferred_schedule_version": debt_ver,
+            "cashflow_requests_enabled": bool(getattr(company, "cashflow_requests_enabled", False)),
         }
         return Response(resp, status=status.HTTP_200_OK)
 
@@ -4041,11 +4346,53 @@ class VerifyDeleteCodeAPIView(CompanyBranchRestrictedMixin, APIView):
         cache.set(throttle_key, attempts + 1, timeout=60)
         
         import secrets
-        if secrets.compare_digest(str(code).strip(), company.cashier_password):
+        is_valid = secrets.compare_digest(str(code).strip(), company.cashier_password)
+        
+        # Аудит попытки ввода кода (сам код НЕ логируется согласно §3.5)
+        import logging
+        audit_logger = logging.getLogger("crm.pos.cashier_settings")
+        audit_logger.info(
+            "Verify delete code attempt: user_id=%s company_id=%s valid=%s ip=%s",
+            request.user.id,
+            company.id if company else None,
+            is_valid,
+            request.META.get("REMOTE_ADDR"),
+        )
+
+        if is_valid:
             cache.set(f"delete_verified_{request.user.id}", True, timeout=120)
             return Response({"valid": True}, status=status.HTTP_200_OK)
             
         return Response({"valid": False}, status=status.HTTP_200_OK)
+
+
+def _is_cart_deletion_authorized(request, company=None) -> bool:
+    """
+    Проверка авторизации на удаление позиции или корзины:
+    - owner / admin -> всегда разрешено
+    - код не задан на компании -> разрешено
+    - передан заголовок X-Delete-Code с верным кодом -> разрешено
+    - есть активный токен верификации (cache delete_verified_{user_id}, 120 сек) -> разрешено
+    """
+    user = getattr(request, "user", None)
+    if not user or not user.is_authenticated:
+        return False
+    is_admin = getattr(user, "role", None) in ["owner", "admin"]
+    if is_admin:
+        return True
+    comp = company or getattr(user, "company", None)
+    code_req = getattr(comp, "cashier_password", None) if comp else None
+    if not code_req:
+        return True
+
+    header_code = request.headers.get("X-Delete-Code") or request.META.get("HTTP_X_DELETE_CODE")
+    if header_code:
+        import secrets
+        if secrets.compare_digest(str(header_code).strip(), str(code_req)):
+            return True
+
+    from django.core.cache import cache
+    return bool(cache.get(f"delete_verified_{user.id}"))
 
 class CartItemUpdateDestroyAPIView(MarketCashierOnlyMixin, APIView):
     permission_classes = [permissions.IsAuthenticated]
@@ -4100,10 +4447,8 @@ class CartItemUpdateDestroyAPIView(MarketCashierOnlyMixin, APIView):
             if qty < 0:
                 return Response({"quantity": "Количество не может быть отрицательным."}, status=400)
             if qty == 0:
-                if not is_admin and getattr(request.user.company, "cashier_password", None):
-                    from django.core.cache import cache
-                    if not cache.get(f"delete_verified_{request.user.id}"):
-                        return Response({"detail": "Требуется код удаления или время проверки истекло"}, status=status.HTTP_403_FORBIDDEN)
+                if not _is_cart_deletion_authorized(request):
+                    return Response({"detail": "Требуется код удаления или время проверки истекло"}, status=status.HTTP_403_FORBIDDEN)
                 
                 log_cart_item_deletion(item=item, deleted_by=request.user)
                 item.delete()
@@ -4113,20 +4458,31 @@ class CartItemUpdateDestroyAPIView(MarketCashierOnlyMixin, APIView):
 
         unit_price = data.get("unit_price")
         line_discount = data.get("discount_total")
+        discount_percent = data.get("discount_percent")
 
         # Цена и скидка меняются независимо. Со скидкой можно продавать ниже закупочной.
         if unit_price is not None:
             item.unit_price = self._apply_min_price(item, _q2(unit_price))
             item.price_manually_edited = True
-        if line_discount is not None:
+        if line_discount is not None or discount_percent is not None:
+            current_qty = qty if qty is not None else item.quantity
+            current_price = (
+                item.unit_price
+                if unit_price is None
+                else self._apply_min_price(item, _q2(unit_price))
+            )
+            new_discount = _line_discount_from_request(
+                current_price,
+                current_qty,
+                line_discount,
+                discount_percent,
+            )
             max_dp = request.user.company.max_discount_percent
             if max_dp is not None and not is_admin:
-                current_qty = qty if qty is not None else item.quantity
-                current_price = item.unit_price if unit_price is None else (unit_price if not hasattr(self, '_apply_min_price') else self._apply_min_price(item, _q2(unit_price)))
                 limit = (current_price * current_qty) * (max_dp / Decimal("100.0"))
-                if Decimal(str(line_discount)) > limit:
+                if new_discount > limit:
                     return Response({"detail": f"Максимальная скидка — {max_dp}%", "max_discount_percent": str(max_dp)}, status=status.HTTP_400_BAD_REQUEST)
-            item.line_discount = _q2(Decimal(str(line_discount)))
+            item.line_discount = new_discount
 
         update_fields = []
         if qty is not None:
@@ -4134,7 +4490,7 @@ class CartItemUpdateDestroyAPIView(MarketCashierOnlyMixin, APIView):
         if unit_price is not None:
             update_fields.append("unit_price")
             update_fields.append("price_manually_edited")
-        if line_discount is not None:
+        if line_discount is not None or discount_percent is not None:
             update_fields.append("line_discount")
         if update_fields:
             item.save(update_fields=update_fields)
@@ -4147,11 +4503,8 @@ class CartItemUpdateDestroyAPIView(MarketCashierOnlyMixin, APIView):
     def delete(self, request, cart_id, item_id, *args, **kwargs):
         cart = self._get_active_cart(request, cart_id)
         item = self._get_item_in_cart(cart, item_id)
-        is_admin = getattr(request.user, "role", None) in ["owner", "admin"]
-        if not is_admin and getattr(request.user.company, "cashier_password", None):
-            from django.core.cache import cache
-            if not cache.get(f"delete_verified_{request.user.id}"):
-                return Response({"detail": "Требуется код удаления или время проверки истекло"}, status=status.HTTP_403_FORBIDDEN)
+        if not _is_cart_deletion_authorized(request):
+            return Response({"detail": "Требуется код удаления или время проверки истекло"}, status=status.HTTP_403_FORBIDDEN)
 
         log_cart_item_deletion(item=item, deleted_by=request.user)
         item.delete()
@@ -4539,13 +4892,14 @@ class AgentSaleAddItemAPIView(MarketCashierOnlyMixin, CompanyBranchRestrictedMix
 
         unit_price = ser.validated_data.get("unit_price")
         line_discount = ser.validated_data.get("discount_total")
+        discount_percent = ser.validated_data.get("discount_percent")
 
         base_price = (
             money(unit_price)
             if unit_price is not None
             else money(getattr(product, "price", None) or Decimal("0"))
         )
-        disc_total = money(Decimal(str(line_discount))) if line_discount is not None else Decimal("0.00")
+        disc_total = _line_discount_from_request(base_price, qty, line_discount, discount_percent)
 
         if disc_total <= 0:
             min_price = money(Decimal(str(getattr(product, "purchase_price", None) or 0)))
@@ -4605,12 +4959,12 @@ class AgentSaleAddItemAPIView(MarketCashierOnlyMixin, CompanyBranchRestrictedMix
             item.quantity = qty3(item.quantity + qty)
             if unit_price is not None:
                 item.unit_price = base_price
-            if line_discount is not None:
+            if line_discount is not None or discount_percent is not None:
                 item.line_discount = (Decimal(str(getattr(item, "line_discount", 0) or 0)) + disc_total)
             update_f = ["quantity"]
             if unit_price is not None:
                 update_f.append("unit_price")
-            if line_discount is not None:
+            if line_discount is not None or discount_percent is not None:
                 update_f.append("line_discount")
             item.save(update_fields=update_f, skip_full_clean=True)
         else:
@@ -4782,23 +5136,45 @@ class AgentSaleCheckoutAPIView(MarketCashierOnlyMixin, CompanyBranchRestrictedMi
                         .order_by("-created_at")
                         .first()
                     )
+
+                    v2_sch_ver = request.data.get("schedule_version")
+                    debt_sched = request.data.get("debt_schedule") if isinstance(request.data.get("debt_schedule"), dict) else {}
+                    is_v1_req = str(v2_sch_ver).strip().lower() in ("v1", "1") or str(debt_sched.get("schedule_version")).strip().lower() in ("v1", "1")
+                    sch_version = "v1" if is_v1_req else "v2"
+
                     if unlinked_deal and (abs((unlinked_deal.amount or Decimal("0.00")) - debt_amt) <= Decimal("0.01") or unlinked_deal.amount == Decimal("0.00")):
                         unlinked_deal.sale = sale
                         if not unlinked_deal.amount or unlinked_deal.amount == Decimal("0.00"):
                             unlinked_deal.amount = debt_amt
                         unlinked_deal.save(update_fields=["sale", "amount", "updated_at"])
                     else:
-                        ClientDeal.objects.create(
+                        d_days = request.data.get("debt_days") or debt_sched.get("count")
+                        d_months = request.data.get("debt_months")
+                        first_due = request.data.get("first_due_date") or debt_sched.get("first_due_date")
+                        int_days = request.data.get("interval_days") or debt_sched.get("interval_days") or 1
+                        int_months = request.data.get("interval_months") or debt_sched.get("interval_months") or 1
+                        custom_inst = request.data.get("installments") or debt_sched.get("installments")
+
+                        new_deal = ClientDeal(
                             company=sale.company,
                             branch=sale.branch,
                             client=sale.client,
                             sale=sale,
-                            title=f"Агентская продажа в долг №{sale.id}",
+                            title=f"Продажа в долг №{sale.id}",
                             kind=ClientDeal.Kind.DEBT,
                             amount=debt_amt,
                             prepayment=Decimal("0.00"),
-                            debt_days=30,
+                            schedule_version=sch_version,
+                            debt_days=int(d_days) if d_days else (None if d_months else 30),
+                            debt_months=int(d_months) if d_months else None,
+                            interval_days=int(int_days),
+                            interval_months=int(int_months),
+                            first_due_date=first_due,
                         )
+                        if custom_inst and isinstance(custom_inst, (list, tuple)):
+                            new_deal._custom_installments = custom_inst
+                        new_deal.save()
+
 
             try:
                 invalidate_cache_pattern(f"analytics:market:{sale.company_id}:")
@@ -4922,10 +5298,8 @@ class AgentCartItemUpdateDestroyAPIView(MarketCashierOnlyMixin, APIView):
             if qty < 0:
                 return Response({"quantity": "Количество не может быть отрицательным."}, status=400)
             if qty == 0:
-                if not is_admin and getattr(request.user.company, "cashier_password", None):
-                    from django.core.cache import cache
-                    if not cache.get(f"delete_verified_{request.user.id}"):
-                        return Response({"detail": "Требуется код удаления или время проверки истекло"}, status=status.HTTP_403_FORBIDDEN)
+                if not _is_cart_deletion_authorized(request):
+                    return Response({"detail": "Требуется код удаления или время проверки истекло"}, status=status.HTTP_403_FORBIDDEN)
                 
                 log_cart_item_deletion(item=item, deleted_by=request.user)
                 item.delete()
@@ -4935,20 +5309,27 @@ class AgentCartItemUpdateDestroyAPIView(MarketCashierOnlyMixin, APIView):
 
         unit_price = data.get("unit_price")
         line_discount = data.get("discount_total")
+        discount_percent = data.get("discount_percent")
 
         # Цена и скидка меняются независимо.
         if unit_price is not None:
             item.unit_price = _q2(unit_price)
             item.price_manually_edited = True
-        if line_discount is not None:
+        if line_discount is not None or discount_percent is not None:
+            current_qty = qty if qty is not None else item.quantity
+            current_price = item.unit_price if unit_price is None else _q2(unit_price)
+            new_discount = _line_discount_from_request(
+                current_price,
+                current_qty,
+                line_discount,
+                discount_percent,
+            )
             max_dp = request.user.company.max_discount_percent
             if max_dp is not None and not is_admin:
-                current_qty = qty if qty is not None else item.quantity
-                current_price = item.unit_price if unit_price is None else (unit_price if not hasattr(self, '_apply_min_price') else self._apply_min_price(item, _q2(unit_price)))
                 limit = (current_price * current_qty) * (max_dp / Decimal("100.0"))
-                if Decimal(str(line_discount)) > limit:
+                if new_discount > limit:
                     return Response({"detail": f"Максимальная скидка — {max_dp}%", "max_discount_percent": str(max_dp)}, status=status.HTTP_400_BAD_REQUEST)
-            item.line_discount = _q2(Decimal(str(line_discount)))
+            item.line_discount = new_discount
 
         update_fields = []
         if qty is not None:
@@ -4956,7 +5337,7 @@ class AgentCartItemUpdateDestroyAPIView(MarketCashierOnlyMixin, APIView):
         if unit_price is not None:
             update_fields.append("unit_price")
             update_fields.append("price_manually_edited")
-        if line_discount is not None:
+        if line_discount is not None or discount_percent is not None:
             update_fields.append("line_discount")
         if update_fields:
             item.save(update_fields=update_fields, skip_full_clean=True)
@@ -4969,6 +5350,8 @@ class AgentCartItemUpdateDestroyAPIView(MarketCashierOnlyMixin, APIView):
     def delete(self, request, cart_id, item_id, *args, **kwargs):
         cart = self._get_active_cart(request, cart_id)
         item = self._get_item_in_cart(cart, item_id)
+        if not _is_cart_deletion_authorized(request):
+            return Response({"detail": "Требуется код удаления или время проверки истекло"}, status=status.HTTP_403_FORBIDDEN)
         log_cart_item_deletion(item=item, deleted_by=request.user)
         item.delete()
         cart.recalc()
@@ -5079,4 +5462,3 @@ class PosPrinterSettingAPIView(CompanyBranchRestrictedMixin, APIView):
             raise NotFound({"detail": "Конфигурация принтера для данного устройства не найдена."})
 
         return Response(status=status.HTTP_204_NO_CONTENT)
-

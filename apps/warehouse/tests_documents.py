@@ -31,7 +31,29 @@ class DocumentsTests(TestCase):
             name="P1", code="P1", unit="pcs", quantity=Decimal("0"), purchase_price=Decimal("10.00"), price=Decimal("15.00")
         )
 
+    def test_post_sale_with_confirmation_disabled_by_default_posts_immediately(self):
+        models.StockBalance.objects.create(warehouse=self.wh, product=self.prod, qty=Decimal("10.000"))
+        cp = models.Counterparty.objects.create(
+            name="C1",
+            phone="+996700000001",
+            type=models.Counterparty.Type.CLIENT,
+        )
+        doc = models.Document.objects.create(
+            doc_type=models.Document.DocType.SALE,
+            warehouse_from=self.wh,
+            counterparty=cp,
+            payment_kind=models.Document.PaymentKind.CASH,
+        )
+        models.DocumentItem.objects.create(document=doc, product=self.prod, qty=Decimal("3"), price=Decimal("15"))
+        services.post_document(doc)
+        doc.refresh_from_db()
+        self.assertEqual(doc.status, models.Document.Status.POSTED)
+        money_doc = models.MoneyDocument.objects.filter(source_document=doc).first()
+        self.assertIsNotNone(money_doc)
+        self.assertEqual(money_doc.status, models.MoneyDocument.Status.POSTED)
+
     def test_post_sale_creates_cash_request_and_approve_posts_money(self):
+        models.WarehouseCashConfirmationSettings.objects.create(company=self.company, enabled=True)
         # seed balance 10
         models.StockBalance.objects.create(warehouse=self.wh, product=self.prod, qty=Decimal("10.000"))
 
@@ -76,6 +98,7 @@ class DocumentsTests(TestCase):
         self.assertEqual(doc.status, models.Document.Status.DRAFT)
 
     def test_reject_cash_request_sets_document_rejected(self):
+        models.WarehouseCashConfirmationSettings.objects.create(company=self.company, enabled=True)
         models.StockBalance.objects.create(warehouse=self.wh, product=self.prod, qty=Decimal("10.000"))
         cp = models.Counterparty.objects.create(
             name="C1",
@@ -492,6 +515,7 @@ class BackendChecklistTests(APITestCase):
         User = get_user_model()
         self.owner_user = User.objects.create_user(email="owner_test_check@example.com", password="password123", role="owner")
         self.company = Company.objects.create(name="Company Check", owner=self.owner_user)
+        models.WarehouseCashConfirmationSettings.objects.create(company=self.company, enabled=True)
         self.branch = Branch.objects.create(name="Branch 1", company=self.company)
         self.whA = models.Warehouse.objects.create(name="Warehouse A", company=self.company, branch=self.branch)
         self.whB = models.Warehouse.objects.create(name="Warehouse B", company=self.company, branch=self.branch)

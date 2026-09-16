@@ -38,21 +38,30 @@ class AutoCashflowUnitTests(TestCase):
             pass
 
     def test_status_resolution_start_plan(self):
+        self.company.cashflow_requests_enabled = True
         plan_start = SubscriptionPlan.objects.create(name="Старт", price=Decimal("0.00"))
         self.company.subscription_plan = plan_start
         self.company.save()
         self.assertEqual(resolve_auto_cashflow_status(self.company), CashFlow.Status.APPROVED)
 
     def test_status_resolution_other_plan(self):
+        self.company.cashflow_requests_enabled = True
         plan_pro = SubscriptionPlan.objects.create(name="Бизнес", price=Decimal("500.00"))
         self.company.subscription_plan = plan_pro
         self.company.save()
         self.assertEqual(resolve_auto_cashflow_status(self.company), CashFlow.Status.PENDING)
 
     def test_status_resolution_no_plan(self):
+        self.company.cashflow_requests_enabled = True
         self.company.subscription_plan = None
         self.company.save()
         self.assertEqual(resolve_auto_cashflow_status(self.company), CashFlow.Status.PENDING)
+
+    def test_status_resolution_requests_disabled_default(self):
+        self.company.cashflow_requests_enabled = False
+        self.company.subscription_plan = None
+        self.company.save()
+        self.assertEqual(resolve_auto_cashflow_status(self.company), CashFlow.Status.APPROVED)
 
     def test_cashbox_resolution_explicit(self):
         res = resolve_auto_cashbox(self.company, cashbox_id=self.cashbox.id)
@@ -75,6 +84,8 @@ class AutoCashflowUnitTests(TestCase):
         self.assertIn("cashbox_id", ctx.exception.detail)
 
     def test_create_auto_cashflow_and_idempotency(self):
+        self.company.cashflow_requests_enabled = True
+        self.company.save()
         cf1 = create_auto_cashflow(
             company=self.company,
             branch=self.branch,
@@ -165,6 +176,7 @@ class AutoCashflowUnitTests(TestCase):
             title="Deal 1",
             kind=ClientDeal.Kind.DEBT,
             amount=Decimal("1000.00"),
+            debt_days=2,
         )
         inst = deal.installments.first()
         if not inst:

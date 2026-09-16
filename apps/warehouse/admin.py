@@ -128,3 +128,10 @@ class WarehouseSalesSummaryAdmin(admin.ModelAdmin):
     readonly_fields = ("number", "documents_count", "products_count", "total_quantity", "total_weight", "total_amount", "created_at", "updated_at")
     filter_horizontal = ("warehouses",)
     inlines = (WarehouseSalesSummaryDocumentInline, WarehouseSalesSummaryProductInline)
+
+
+@admin.register(models.WarehouseCashConfirmationSettings)
+class WarehouseCashConfirmationSettingsAdmin(admin.ModelAdmin):
+    list_display = ("company", "enabled", "created_date", "updated_date")
+    list_filter = ("enabled",)
+    search_fields = ("company__name",)

@@ -118,7 +118,8 @@ class CashShiftSalesListView(generics.ListAPIView):
             .only(
                 "id", "sale_id", "product_id",
                 "name_snapshot", "barcode_snapshot",
-                "unit_price", "quantity",
+                "unit_price", "quantity", "line_discount",
+                "product__name",
             )
             .order_by("id")
         )

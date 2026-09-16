@@ -51,6 +51,9 @@ class SubscriptionPlan(models.Model):
 class Roles(models.TextChoices):
     ADMIN = "admin", "Администратор"
     OWNER = "owner", "Владелец"
+    ROP = "rop", "РОП"
+    SUPERVISOR = "supervisor", "Руководитель региона"
+    SALESPERSON = "salesperson", "Сотрудник"
 
 
 class KyrgyzstanRegion(models.TextChoices):
@@ -251,12 +254,35 @@ class Company(models.Model):
     debt_schedule_version = models.CharField(
         "Версия графика отсрочки",
         max_length=8,
-        default="v1",
+        default="v2",
         choices=[("v1", "v1"), ("v2", "v2")],
         blank=True,
         null=True,
         help_text="Версия графика рассрочки на кассе ('v1' или 'v2')",
     )
+    cashflow_requests_enabled = models.BooleanField(
+        default=False,
+        verbose_name="Запросы на подтверждение движений кассы",
+        help_text="True — ручные записи не-владельца, компенсация возврата и правка/отмена одобренного движения создают pending-заявку. False — проводятся немедленно.",
+    )
+
+    appointment_work_start = models.CharField(
+        "Начало рабочего дня для записей",
+        max_length=5,
+        default="09:00",
+        blank=True,
+        null=True,
+        help_text="Время начала рабочего дня для календаря записей (формат HH:MM)",
+    )
+    appointment_work_end = models.CharField(
+        "Конец рабочего дня для записей",
+        max_length=5,
+        default="21:00",
+        blank=True,
+        null=True,
+        help_text="Время окончания рабочего дня для календаря записей (формат HH:MM)",
+    )
+
 
     def ensure_scale_api_token(self):
         if not self.scale_api_token:
@@ -537,6 +563,31 @@ class User(AbstractBaseUser, PermissionsMixin):
         verbose_name="Кастомная роль",
     )
 
+    consulting_region_codes = models.JSONField(
+        default=list,
+        blank=True,
+        verbose_name="Коды регионов (консалтинг)",
+    )
+
+    def get_consulting_region_codes(self) -> list[str]:
+        val = self.consulting_region_codes
+        if isinstance(val, list):
+            return [str(x).strip().lower() for x in val if str(x).strip()]
+        return []
+
+    @property
+    def is_consulting_supervisor(self) -> bool:
+        return str(getattr(self, "role", "") or "").lower() == "supervisor"
+
+    @property
+    def is_consulting_salesperson(self) -> bool:
+        return str(getattr(self, "role", "") or "").lower() == "salesperson"
+
+    @property
+    def is_consulting_manager(self) -> bool:
+        r = str(getattr(self, "role", "") or "").lower()
+        return r in ("owner", "admin", "rop") or bool(getattr(self, "is_superuser", False)) or bool(getattr(self, "owned_company_id", None))
+
     # ===== Права доступа =====
     can_view_dashboard = models.BooleanField(default=False, blank=True, null=True, verbose_name="Доступ к обзору")
     can_view_cashbox = models.BooleanField(default=False, blank=True, null=True, verbose_name="Доступ к кассе")
@@ -556,6 +607,9 @@ class User(AbstractBaseUser, PermissionsMixin):
     can_view_funnel = models.BooleanField(default=False, blank=True, null=True, verbose_name="Консалтинг: страница воронки")
     can_manage_funnel_leads = models.BooleanField(default=False, blank=True, null=True, verbose_name="Консалтинг: управление лидами своей роли")
     can_manage_funnel_stages = models.BooleanField(default=False, blank=True, null=True, verbose_name="Консалтинг: управление стадиями своей роли")
+    can_create_funnel = models.BooleanField(default=False, blank=True, null=True, verbose_name="Консалтинг: создание собственных воронок")
+    can_manage_lead_ad_spend = models.BooleanField(default=False, blank=True, null=True, verbose_name="Консалтинг: управление рекламным бюджетом лидов")
+    can_view_leads_inbox = models.BooleanField(default=False, blank=True, null=True, verbose_name="Консалтинг: доступ к входящим лидам")
 
     # Building permissions (CRM) — ключи для profile, меню Building и роутинга
     can_view_building_analytics = models.BooleanField(default=False, blank=True, null=True, verbose_name="Building: Аналитика")

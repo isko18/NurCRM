@@ -332,9 +332,43 @@ def _create_or_reset_cash_request(document: models.Document):
     return req
 
 
-def _create_money_document_for_request(document: models.Document, request_obj: models.CashApprovalRequest):
-    if not request_obj.requires_money:
-        return None
+def resolve_document_company(document):
+    try:
+        wh = resolve_document_context_warehouse(document)
+        if wh and wh.company:
+            return wh.company
+    except Exception:
+        pass
+    if getattr(document, "warehouse_from", None) and document.warehouse_from.company:
+        return document.warehouse_from.company
+    if getattr(document, "warehouse_to", None) and document.warehouse_to.company:
+        return document.warehouse_to.company
+    return getattr(document, "company", None)
+
+
+def is_cash_confirmation_enabled(company) -> bool:
+    if not company:
+        return False
+    company_id = getattr(company, "id", company)
+    conf = getattr(company, "warehouse_cash_confirmation", None)
+    if conf is not None:
+        return bool(conf.enabled)
+    conf = models.WarehouseCashConfirmationSettings.objects.filter(company_id=company_id).first()
+    return bool(conf.enabled) if conf else False
+
+
+def _create_or_post_money_document(
+    document: models.Document,
+    money_doc_type: str = None,
+    amount: Decimal = None,
+):
+    money_doc_type = money_doc_type or _resolve_money_doc_type(document.doc_type)
+    if not money_doc_type:
+        raise ValueError("Не удалось определить тип денежного документа.")
+
+    amount = Decimal(amount if amount is not None else (document.total or 0)).quantize(Decimal("0.01"))
+    if amount <= 0:
+        raise ValueError("Сумма для кассы должна быть больше 0.")
 
     # Идемпотентность: если денежный документ по этому складу уже есть — не создаём дубликат
     existing = getattr(document, "money_document", None)
@@ -346,12 +380,17 @@ def _create_money_document_for_request(document: models.Document, request_obj: m
     if existing is not None:
         from . import services_money
         if existing.status == models.MoneyDocument.Status.DRAFT:
+            existing.doc_type = money_doc_type
+            existing.amount = amount
+            existing.payment_method = document.payment_method
+            existing.counterparty = document.counterparty
+            if getattr(document, "cash_register", None):
+                existing.cash_register = document.cash_register
+            if getattr(document, "payment_category", None):
+                existing.payment_category = document.payment_category
+            existing.save()
             services_money.post_money_document(existing)
         return existing
-
-    money_doc_type = request_obj.money_doc_type
-    if not money_doc_type:
-        raise ValueError("Не удалось определить тип денежного документа.")
 
     if not document.counterparty_id and document.doc_type in (
         models.Document.DocType.SALE,
@@ -359,10 +398,6 @@ def _create_money_document_for_request(document: models.Document, request_obj: m
         models.Document.DocType.PURCHASE_RETURN,
     ):
         raise ValueError("Для проведения в кассу укажите контрагента в документе.")
-
-    amount = Decimal(request_obj.amount or 0).quantize(Decimal("0.01"))
-    if amount <= 0:
-        raise ValueError("Сумма для кассы должна быть больше 0.")
 
     warehouse = resolve_document_context_warehouse(document)
 
@@ -403,7 +438,7 @@ def _create_money_document_for_request(document: models.Document, request_obj: m
     from . import services_money
 
     money_doc = models.MoneyDocument.objects.create(
-        doc_type=request_obj.money_doc_type,
+        doc_type=money_doc_type,
         status=models.MoneyDocument.Status.DRAFT,
         cash_register=cash_register,
         counterparty=document.counterparty,
@@ -419,9 +454,56 @@ def _create_money_document_for_request(document: models.Document, request_obj: m
     return money_doc
 
 
-def post_document(document: models.Document, allow_negative: bool = None) -> models.Document:
+def _create_money_document_for_request(document: models.Document, request_obj: models.CashApprovalRequest):
+    if not request_obj.requires_money:
+        return None
+    return _create_or_post_money_document(
+        document,
+        money_doc_type=request_obj.money_doc_type,
+        amount=request_obj.amount,
+    )
+
+
+def apply_cash_request_effects(document: models.Document, *, user=None, note: str = ""):
+    """
+    Применяет денежные эффекты проведения наличного документа:
+    - Создает и сразу проводит MoneyDocument (зачисление/списание в кассу)
+    - Если у документа уже был CashApprovalRequest, обновляет его статус до APPROVED
+    - Синхронизирует автоматический cashflow
+    """
+    money_doc_type = _resolve_money_doc_type(document.doc_type)
+    amount = Decimal(document.total or 0).quantize(Decimal("0.01"))
+    money_doc = _create_or_post_money_document(document, money_doc_type=money_doc_type, amount=amount)
+
+    request_obj = getattr(document, "cash_request", None)
+    if request_obj is not None:
+        request_obj.status = models.CashApprovalRequest.Status.APPROVED
+        request_obj.requires_money = True
+        request_obj.money_doc_type = money_doc_type
+        request_obj.amount = amount
+        request_obj.decision_note = note or request_obj.decision_note or "Авто: подтверждение кассы отключено."
+        request_obj.decided_at = timezone.now()
+        request_obj.decided_by = user
+        request_obj.money_document = money_doc
+        request_obj.save(update_fields=[
+            "status",
+            "requires_money",
+            "money_doc_type",
+            "amount",
+            "decision_note",
+            "decided_at",
+            "decided_by",
+            "money_document",
+        ])
+
+    sync_document_auto_cashflow(document, user=user)
+    return money_doc
+
+
+def post_document(document: models.Document, allow_negative: bool = None, user=None) -> models.Document:
     if document.status in (document.Status.CASH_PENDING, document.Status.POSTED):
         raise ValueError("Document already posted")
+
 
     if document.doc_type == document.DocType.COMMERCIAL_OFFER:
         raise ValueError("Commercial offer cannot be posted")
@@ -847,10 +929,17 @@ def post_document(document: models.Document, allow_negative: bool = None) -> mod
         )
 
         if requires_money:
-            document.status = document.Status.CASH_PENDING
-            document.save(update_fields=["status"])
-            # На этапе post создаем запрос на решение по кассе.
-            _create_or_reset_cash_request(document)
+            company = resolve_document_company(document)
+            confirmation_enabled = is_cash_confirmation_enabled(company)
+            if confirmation_enabled:
+                document.status = document.Status.CASH_PENDING
+                document.save(update_fields=["status"])
+                # На этапе post создаем запрос на решение по кассе.
+                _create_or_reset_cash_request(document)
+            else:
+                document.status = document.Status.POSTED
+                document.save(update_fields=["status"])
+                apply_cash_request_effects(document, user=user)
         else:
             # Если по документу раньше был кассовый запрос (например, сменили payment_kind),
             # помечаем его как обработанный, чтобы не висел в PENDING.
@@ -882,7 +971,7 @@ def post_document(document: models.Document, allow_negative: bool = None) -> mod
 
             document.status = document.Status.POSTED
             document.save(update_fields=["status"])
-            sync_document_auto_cashflow(document)
+            sync_document_auto_cashflow(document, user=user)
 
         # Начисления зарплаты агенту (процент с продажи со склада-источника).
         # В той же транзакции, что и проведение продажи.
@@ -1041,19 +1130,12 @@ def approve_cash_request(document: models.Document, *, decided_by=None, note: st
         raise ValueError("Запрос в кассу уже обработан.")
 
     with transaction.atomic():
-        money_doc = _create_money_document_for_request(document, request_obj)
-        request_obj.status = models.CashApprovalRequest.Status.APPROVED
-        request_obj.decision_note = note or ""
-        request_obj.decided_at = timezone.now()
-        request_obj.decided_by = decided_by
-        request_obj.money_document = money_doc
-        request_obj.save(update_fields=["status", "decision_note", "decided_at", "decided_by", "money_document"])
-
+        apply_cash_request_effects(document, user=decided_by, note=note)
         document.status = document.Status.POSTED
         document.save(update_fields=["status"])
-        sync_document_auto_cashflow(document, user=decided_by)
 
     return document
+
 
 
 def reject_cash_request(document: models.Document, *, decided_by=None, note: str = "") -> models.Document:

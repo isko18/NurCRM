@@ -550,3 +550,42 @@ class CounterpartyMoneyOperationsView(CompanyBranchRestrictedMixin, generics.Lis
             headers=getattr(money_resp, "headers", None),
         )
 
+
+class WarehouseCashConfirmationSettingsView(CompanyBranchRestrictedMixin, generics.GenericAPIView):
+    """
+    Настройки подтверждения кассы склада:
+    GET /warehouse/cash/confirmation-settings/ -> {"enabled": false}
+    PATCH /warehouse/cash/confirmation-settings/ -> {"enabled": true|false}
+    """
+    serializer_class = serializers_money.WarehouseCashConfirmationSettingsSerializer
+
+    def get_object(self):
+        company = self._company()
+        if not company:
+            raise PermissionDenied("У пользователя не настроена компания.")
+        settings, _ = models.WarehouseCashConfirmationSettings.objects.get_or_create(
+            company=company,
+            defaults={"enabled": False},
+        )
+        return settings
+
+    def get(self, request, *args, **kwargs):
+        settings = self.get_object()
+        return Response(self.get_serializer(settings).data)
+
+    def patch(self, request, *args, **kwargs):
+        if not _is_owner_like(request.user):
+            raise PermissionDenied("Изменять настройки кассы может только владелец или администратор.")
+        settings = self.get_object()
+        serializer = self.get_serializer(settings, data=request.data, partial=True)
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+        return Response(serializer.data)
+
+    def put(self, request, *args, **kwargs):
+        return self.patch(request, *args, **kwargs)
+
+    def post(self, request, *args, **kwargs):
+        return self.patch(request, *args, **kwargs)
+
+

@@ -205,7 +205,7 @@ class BarberSalaryTests(APITestCase):
         appointment.status = Appointment.Status.COMPLETED
         appointment.save()
 
-        url = reverse("salary-summary")
+        url = "/barbershop/salary/summary/"
 
         # 1. Мастер без прав -> 403
         self.client.force_authenticate(user=self.master_no_permission)

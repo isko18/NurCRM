@@ -84,6 +84,47 @@ class IsCompanyOwnerOrAdmin(permissions.BasePermission):
         return True
 
 
+class IsCompanyOwnerOrAdminOrSupervisor(permissions.BasePermission):
+    """
+    Пускает владельца, администратора, РОП или руководителя региона (supervisor).
+    Для объектов User запрещает редактировать самого себя.
+    Для supervisor доступ разрешён только к сотрудникам своего региона.
+    """
+
+    def has_permission(self, request, view):
+        u = request.user
+        if not (u and u.is_authenticated):
+            return False
+        if getattr(u, "is_superuser", False) or getattr(u, "owned_company_id", None):
+            return True
+        return getattr(u, "role", None) in ("owner", "admin", "rop", "supervisor")
+
+    def has_object_permission(self, request, view, obj):
+        u = request.user
+        if getattr(u, "is_superuser", False):
+            return True
+
+        obj_company_id = _company_id_of(obj)
+        user_company_id = getattr(u, "company_id", None) or getattr(u, "owned_company_id", None)
+        if obj_company_id not in (None, user_company_id):
+            return False
+
+        if request.method not in permissions.SAFE_METHODS and isinstance(obj, User):
+            if obj.pk == u.pk:
+                return False
+
+        if getattr(u, "role", None) in ("owner", "admin", "rop") or bool(getattr(u, "owned_company_id", None)):
+            return True
+
+        if getattr(u, "role", None) == "supervisor":
+            if isinstance(obj, User):
+                my_regions = u.get_consulting_region_codes()
+                return any(r in my_regions for r in obj.get_consulting_region_codes())
+            return True
+
+        return False
+
+
 class IsPlatformAdmin(permissions.BasePermission):
     message = "Требуются права платформенного администратора."
 

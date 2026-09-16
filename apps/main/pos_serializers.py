@@ -301,6 +301,7 @@ class AddItemSerializer(serializers.Serializer):
     quantity = QtyField(required=False, default=Decimal("1.000"))
     unit_price = MoneyField(required=False)
     discount_total = MoneyField(required=False)
+    discount_percent = serializers.DecimalField(max_digits=5, decimal_places=2, required=False)
     # Продажа поштучно из пачки: id упаковки ProductPackage (quantity_in_package = шт в пачке)
     sale_package_id = serializers.UUIDField(required=False, allow_null=True)
     # Разрешить продажу "в минус" (игнорировать проверку остатка).
@@ -310,12 +311,21 @@ class AddItemSerializer(serializers.Serializer):
     def validate(self, attrs):
         up = attrs.get("unit_price")
         disc = attrs.get("discount_total")
+        percent = attrs.get("discount_percent")
         qty = attrs.get("quantity", Decimal("1.000"))
 
         if up is not None and up < 0:
             raise serializers.ValidationError({"unit_price": "Должна быть ≥ 0."})
         if disc is not None and disc < 0:
             raise serializers.ValidationError({"discount_total": "Должна быть ≥ 0."})
+        if percent is not None and percent < 0:
+            raise serializers.ValidationError({"discount_percent": "Должна быть ≥ 0."})
+        if percent is not None and percent > 100:
+            raise serializers.ValidationError({"discount_percent": "Не больше 100%."})
+        if disc is not None and percent is not None:
+            raise serializers.ValidationError(
+                "Выберите либо фиксированную скидку (discount_total), либо скидку в процентах (discount_percent)."
+            )
 
         qty = qty3(Decimal(str(qty)))
         if qty <= 0:
@@ -332,14 +342,24 @@ class CartItemPatchSerializer(serializers.Serializer):
     )
     unit_price = MoneyField(required=False)
     discount_total = MoneyField(required=False)
+    discount_percent = serializers.DecimalField(max_digits=5, decimal_places=2, required=False)
 
     def validate(self, attrs):
         up = attrs.get("unit_price")
         disc = attrs.get("discount_total")
+        percent = attrs.get("discount_percent")
         if up is not None and up < 0:
             raise serializers.ValidationError({"unit_price": "Должна быть ≥ 0."})
         if disc is not None and disc < 0:
             raise serializers.ValidationError({"discount_total": "Должна быть ≥ 0."})
+        if percent is not None and percent < 0:
+            raise serializers.ValidationError({"discount_percent": "Должна быть ≥ 0."})
+        if percent is not None and percent > 100:
+            raise serializers.ValidationError({"discount_percent": "Не больше 100%."})
+        if disc is not None and percent is not None:
+            raise serializers.ValidationError(
+                "Выберите либо фиксированную скидку (discount_total), либо скидку в процентах (discount_percent)."
+            )
         return attrs
 
 
@@ -642,6 +662,7 @@ class SaleListSerializer(serializers.ModelSerializer):
     client_name = serializers.CharField(source="client.full_name", read_only=True)
     change = serializers.DecimalField(max_digits=12, decimal_places=2, read_only=True)
     first_item_name = serializers.SerializerMethodField(read_only=True)
+    matched_item_name = serializers.CharField(read_only=True, allow_null=True)
 
     shift = serializers.PrimaryKeyRelatedField(read_only=True)
     cashbox = serializers.PrimaryKeyRelatedField(read_only=True)
@@ -676,6 +697,7 @@ class SaleListSerializer(serializers.ModelSerializer):
             "cashbox",
             "cashbox_name",
             "first_item_name",
+            "matched_item_name",
             "debt_amount",
         )
 

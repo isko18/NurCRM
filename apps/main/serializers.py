@@ -22,7 +22,7 @@ from apps.main.models import (
     ReturnFromAgent, ProductImage, PromoRule, AgentRequestCart, AgentRequestItem,
     ProductPackage, ProductCharacteristics, DealPayment, AgentSaleAllocation,
     ProductRecipeItem, ProductPromotionTier, ProductAlternateBarcode, MarketSaleEmployeePayProfile,
-    SupplierReceipt, SupplierReceiptItem,
+    SupplierReceipt, SupplierReceiptItem, ProductExpiryBatch,
     SupplierReturn, SupplierReturnItem,
     KnowledgeBaseCourse, KnowledgeBaseLesson,
     FinishedToRawTransfer,
@@ -1160,6 +1160,8 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
 
     country = serializers.CharField(required=False, allow_blank=True)
     expiration_date = serializers.DateField(required=False, allow_null=True)
+    shelf_life_days = serializers.IntegerField(required=False, allow_null=True, min_value=1)
+    expiry_batches = serializers.SerializerMethodField(read_only=True)
 
     # ==== ПЛУ ====
     plu = serializers.IntegerField(required=False, allow_null=True)
@@ -1218,6 +1220,7 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
             "plu",
             "country",
             "expiration_date",
+            "shelf_life_days", "expiry_batches",
             "status", "status_display",
             "client", "client_name",
             "supplier_ids", "suppliers",
@@ -1236,6 +1239,7 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
             "purchase_batches",
             "cashflows",
         ]
+
         read_only_fields = [
             "id", "created_at", "updated_at",
             "company", "branch",
@@ -1270,6 +1274,12 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
             "price": {"required": False, "allow_null": True},
             "description": {"required": False, "allow_blank": True, "allow_null": True},
         }
+
+    def get_expiry_batches(self, obj):
+        batches = obj.expiry_batches.filter(
+            status=ProductExpiryBatch.Status.ACTIVE, remaining_quantity__gt=0
+        ).order_by(F("expires_at").asc(nulls_last=True), "received_at")[:10]
+        return ProductExpiryBatchSerializer(batches, many=True).data
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -1864,6 +1874,11 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
 
         if supplier_ids is not None:
             instance.suppliers.set(supplier_ids)
+        elif instance.client_id:
+            try:
+                instance.suppliers.add(instance.client)
+            except Exception:
+                pass
 
         # PACKAGES перезаписываем ТОЛЬКО если реально пришли в PATCH
         if packages_data is not None:
@@ -2115,7 +2130,7 @@ class ClientSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
     class Meta:
         model = Client
         fields = [
-            'id', 'company', 'branch',
+            'id', 'company', 'branch', 'sector',
             'type', 'full_name', 'phone', 'email', 'date', 'status',
             'llc', 'inn', 'okpo', 'score', 'bik', 'address',
             'salesperson', 'salesperson_display',
@@ -2198,6 +2213,7 @@ class DealPaymentSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSeriali
             "idempotency_key",
             "created_by",
             "note",
+            "payment_method",
             "created_at",
         )
         read_only_fields = fields
@@ -2216,7 +2232,7 @@ class ClientDealSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializ
     daily_payment = serializers.DecimalField(max_digits=12, decimal_places=2, read_only=True)
     remaining_debt = serializers.DecimalField(max_digits=12, decimal_places=2, read_only=True)
 
-    schedule_version = serializers.CharField(required=False, default="v1")
+    schedule_version = serializers.CharField(required=False, default="v2")
     debt_months = serializers.IntegerField(required=False, allow_null=True)
     interval_days = serializers.IntegerField(required=False, default=1, allow_null=True)
     interval_months = serializers.IntegerField(required=False, default=1, allow_null=True)
@@ -2350,11 +2366,11 @@ class ClientDealSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializ
         debt_days = attrs.get("debt_days", getattr(instance, "debt_days", None))
         debt_months = attrs.get("debt_months", getattr(instance, "debt_months", None))
 
-        sch_ver = attrs.get("schedule_version") or (instance.schedule_version if instance else "v1")
-        if str(sch_ver).strip().lower() in ("v2", "2"):
-            attrs["schedule_version"] = "v2"
-        else:
+        sch_ver = attrs.get("schedule_version") or (instance.schedule_version if instance else "v2")
+        if str(sch_ver).strip().lower() in ("v1", "1"):
             attrs["schedule_version"] = "v1"
+        else:
+            attrs["schedule_version"] = "v2"
 
         errors = {}
 
@@ -2400,30 +2416,37 @@ class ClientDealSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializ
     def create(self, validated_data):
         custom_inst = validated_data.pop("installments", None)
         validated_data.pop("sale_id", None)
+
+        instance = ClientDeal(**validated_data)
+        if custom_inst and isinstance(custom_inst, (list, tuple)):
+            instance._custom_installments = custom_inst
+
         try:
-            instance = super().create(validated_data)
+            instance.save()
         except DjangoValidationError as e:
             msg = e.message_dict if hasattr(e, "message_dict") else (e.messages if hasattr(e, "messages") else str(e))
             raise serializers.ValidationError(msg)
 
-        if custom_inst and isinstance(custom_inst, (list, tuple)):
-            instance._custom_installments = custom_inst
-            instance.rebuild_installments(custom_installments=custom_inst)
         return instance
 
     def update(self, instance, validated_data):
         custom_inst = validated_data.pop("installments", None)
         validated_data.pop("sale_id", None)
+
+        if custom_inst and isinstance(custom_inst, (list, tuple)):
+            instance._custom_installments = custom_inst
+
+        for attr, val in validated_data.items():
+            setattr(instance, attr, val)
+
         try:
-            instance = super().update(instance, validated_data)
+            instance.save()
         except DjangoValidationError as e:
             msg = e.message_dict if hasattr(e, "message_dict") else (e.messages if hasattr(e, "messages") else str(e))
             raise serializers.ValidationError(msg)
 
-        if custom_inst and isinstance(custom_inst, (list, tuple)):
-            instance._custom_installments = custom_inst
-            instance.rebuild_installments(custom_installments=custom_inst)
         return instance
+
 
 
 # ===== Inputs for pay/refund endpoints =====
@@ -2433,6 +2456,20 @@ class DealPayInputSerializer(serializers.Serializer):
     date = serializers.DateField(required=False)
     idempotency_key = serializers.UUIDField(required=True)
     note = serializers.CharField(required=False, allow_blank=True)
+    payment_method = serializers.CharField(required=False, allow_blank=True, allow_null=True, default="cash")
+    cashbox_id = serializers.UUIDField(required=False, allow_null=True)
+    branch_id = serializers.UUIDField(required=False, allow_null=True)
+    cashbox_role = serializers.CharField(required=False, allow_blank=True, allow_null=True)
+    shift_id = serializers.UUIDField(required=False, allow_null=True)
+
+
+class DealPayAnyInputSerializer(serializers.Serializer):
+    """Input for one atomic payment distributed across a client's debts."""
+    amount = serializers.DecimalField(max_digits=12, decimal_places=2)
+    date = serializers.DateField(required=False)
+    idempotency_key = serializers.UUIDField(required=True)
+    note = serializers.CharField(required=False, allow_blank=True)
+    payment_method = serializers.CharField(required=False, allow_blank=True, allow_null=True, default="cash")
     cashbox_id = serializers.UUIDField(required=False, allow_null=True)
     branch_id = serializers.UUIDField(required=False, allow_null=True)
     cashbox_role = serializers.CharField(required=False, allow_blank=True, allow_null=True)
@@ -2445,6 +2482,7 @@ class DealRefundInputSerializer(serializers.Serializer):
     date = serializers.DateField(required=False)
     idempotency_key = serializers.UUIDField(required=True)
     note = serializers.CharField(required=False, allow_blank=True)
+    payment_method = serializers.CharField(required=False, allow_blank=True, allow_null=True, default="cash")
 
 # ===========================
 # TransactionRecord
@@ -2535,6 +2573,7 @@ class DebtSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
             "name", "phone", "amount", "due_date",
             "paid_total", "balance",
             "cashflows",
+            "payment_method",
             "created_at", "updated_at",
         ]
         read_only_fields = ["id", "company", "branch", "paid_total", "balance", "cashflows", "created_at", "updated_at"]
@@ -2569,7 +2608,7 @@ class DebtPaymentSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = DebtPayment
-        fields = ["id", "company", "branch", "debt", "amount", "paid_at", "note", "created_at"]
+        fields = ["id", "company", "branch", "debt", "amount", "paid_at", "note", "payment_method", "created_at"]
         read_only_fields = ["id", "company", "branch", "debt", "created_at"]
 
     def create(self, validated_data):
@@ -2585,8 +2624,9 @@ class DebtPaymentSerializer(serializers.ModelSerializer):
         amount = validated_data["amount"]
         paid_at = validated_data.get("paid_at")
         note = validated_data.get("note", "")
+        pm = validated_data.get("payment_method", "cash")
 
-        return debt.add_payment(amount=amount, paid_at=paid_at, note=note)
+        return debt.add_payment(amount=amount, paid_at=paid_at, note=note, payment_method=pm)
 
 # ===========================
 # ObjectItem / ObjectSale / ObjectSaleItem
@@ -2664,6 +2704,7 @@ class ProductNestedSerializer(serializers.ModelSerializer):
 class ProductListSerializer(serializers.ModelSerializer):
     image_url = serializers.SerializerMethodField()
     is_favorite = serializers.BooleanField(read_only=True)
+    shelf_life_days = serializers.IntegerField(read_only=True)
 
     class Meta:
         model = Product
@@ -2673,6 +2714,8 @@ class ProductListSerializer(serializers.ModelSerializer):
             "quantity", "brand", "category",
             "hotkey_group",
             "image_url", "is_favorite",
+            "expiration_date",
+            "shelf_life_days",
         ]
 
     def get_image_url(self, obj):
@@ -3190,6 +3233,18 @@ class SupplierReceiptItemSerializer(serializers.Serializer):
         required=False,
         allow_null=True,
     )
+    price = serializers.DecimalField(
+        max_digits=11,
+        decimal_places=2,
+        required=False,
+        allow_null=True,
+    )
+    selling_price = serializers.DecimalField(
+        max_digits=11,
+        decimal_places=2,
+        required=False,
+        allow_null=True,
+    )
 
 
 class SupplierReceiptCreateSerializer(serializers.Serializer):
@@ -3409,6 +3464,27 @@ class SupplierReturnCreateSerializer(serializers.Serializer):
         if reason == SupplierReturn.Reason.OTHER and not comment:
             raise serializers.ValidationError({"comment": "Укажите комментарий при выборе причины 'Другое'."})
         return attrs
+
+
+class ProductExpiryBatchSerializer(serializers.ModelSerializer):
+    days_left = serializers.SerializerMethodField()
+    supplier_name = serializers.SerializerMethodField()
+    created_by_name = serializers.CharField(source="created_by.get_full_name", read_only=True)
+
+    class Meta:
+        model = ProductExpiryBatch
+        fields = ["id", "quantity", "remaining_quantity", "received_at", "expires_at", "days_left", "status", "source_kind", "source_id", "supplier_name", "created_by_name"]
+
+    def get_days_left(self, obj):
+        return (obj.expires_at - timezone.localdate()).days if obj.expires_at else None
+
+    def get_supplier_name(self, obj):
+        if obj.source_kind != "purchase" or not obj.source_id:
+            return None
+        try:
+            return SupplierReceipt.objects.select_related("supplier").get(id=obj.source_id).supplier.full_name
+        except (SupplierReceipt.DoesNotExist, ValueError):
+            return None
 
 
 class ProductPurchaseBatchSerializer(serializers.ModelSerializer):
