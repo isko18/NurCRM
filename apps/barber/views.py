@@ -1121,7 +1121,7 @@ def _build_barber_analytics(base_qs, date_from, date_to, include_masters: bool):
     qs = base_qs.filter(start_at__date__gte=date_from, start_at__date__lte=date_to)
 
     effective_price = ExpressionWrapper(
-        F("price") * (Value(Decimal("1")) - (F("discount") / Value(Decimal("100")))),
+        F("price"),
         output_field=DecimalField(max_digits=14, decimal_places=6),
     )
 

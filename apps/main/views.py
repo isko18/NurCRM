@@ -1023,10 +1023,25 @@ class ProductListView(CompanyBranchRestrictedMixin, generics.ListAPIView):
                 "promotion_tiers",
                 Prefetch("suppliers", queryset=Client.objects.only("id", "full_name")),
                 product_images_prefetch,
+                # Ещё три N+1 по ~100 запросов на страницу: доп. штрихкоды и
+                # активные партии сроков годности.
+                Prefetch(
+                    "alternate_barcodes",
+                    queryset=ProductAlternateBarcode.objects.order_by("barcode"),
+                ),
+                Prefetch(
+                    "expiry_batches",
+                    queryset=ProductExpiryBatch.objects.filter(
+                        status=ProductExpiryBatch.Status.ACTIVE,
+                        remaining_quantity__gt=0,
+                    ).order_by(F("expires_at").asc(nulls_last=True), "received_at"),
+                    to_attr="active_expiry_batches",
+                ),
             )
         )
         qs = _filter_products_company_only(self, qs)
-        return _annotate_product_is_favorite(qs)
+        company = self._company()
+        return _annotate_product_is_favorite(qs, company_id=company.id if company else None)
 
     def filter_queryset(self, queryset):
         qs = super().filter_queryset(queryset)
@@ -1122,7 +1137,8 @@ class ProductCompactListView(CompanyBranchRestrictedMixin, generics.ListAPIView)
             )
         )
         qs = _filter_products_company_only(self, qs)
-        return _annotate_product_is_favorite(qs)
+        company = self._company()
+        return _annotate_product_is_favorite(qs, company_id=company.id if company else None)
 
     def filter_queryset(self, queryset):
         qs = super().filter_queryset(queryset)
@@ -2595,7 +2611,8 @@ class ProductWarehouseBarcodeAPIView(CompanyBranchRestrictedMixin, APIView):
             except (ValueError, TypeError, AttributeError):
                 raise ValidationError({"branch": "Некорректный UUID филиала."})
             qs = qs.filter(Q(branch_id=branch_uuid) | Q(branch__isnull=True))
-        return _annotate_product_is_favorite(qs)
+        company = self._company()
+        return _annotate_product_is_favorite(qs, company_id=company.id if company else None)
 
     def get(self, request, barcode, *args, **kwargs):
         from apps.main.pos_views import (

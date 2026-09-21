@@ -1077,8 +1077,20 @@ class CashboxOwnerDetailSingleView(CompanyBranchScopedMixin, generics.RetrieveAP
 # ─────────────────────────────────────────────────────────────
 # CASHSHIFTS (СМЕНЫ)
 # ─────────────────────────────────────────────────────────────
+class CashShiftPagination(PageNumberPagination):
+    """
+    Каждая смена считается агрегатами по продажам и движениям — размер страницы
+    дорогой. Дефолт оставлен прежним (100), чтобы не менять поведение клиентов,
+    но теперь его можно уменьшить через ?page_size=.
+    """
+    page_size = 100
+    page_size_query_param = "page_size"
+    max_page_size = 100
+
+
 class CashShiftListView(CompanyBranchScopedMixin, generics.ListAPIView):
     serializer_class = CashShiftListSerializer
+    pagination_class = CashShiftPagination
 
     def get_queryset(self):
         qs = CashShift.objects.select_related(

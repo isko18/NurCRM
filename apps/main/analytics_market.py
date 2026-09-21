@@ -716,6 +716,8 @@ class AnalyticsView(APIView):
         clients = 0
         daily = []
         top_products = []
+        returns_count = 0
+        returns_amount = Z_MONEY
 
         cogs = None
         gross_profit = None
@@ -782,8 +784,14 @@ class AnalyticsView(APIView):
                 else:
                     qs = qs.filter(branch=branch)
 
+            # Частичный возврат уменьшает total чека, но переводит его из PAID
+            # в PARTIALLY_RETURNED. Такой чек всё ещё является продажей на
+            # оставшуюся сумму и не должен пропадать из отчёта.
             paid_value = _choice_value(Sale, "Status", "PAID", "paid")
-            qs = qs.filter(status=paid_value)
+            partial_returned_value = _choice_value(
+                Sale, "Status", "PARTIALLY_RETURNED", "partially_returned"
+            )
+            qs = qs.filter(status__in=(paid_value, partial_returned_value))
 
             dt_field = "paid_at" if _model_has_field(Sale, "paid_at") else "created_at"
             qs = qs.filter(**{f"{dt_field}__gte": period.start, f"{dt_field}__lt": period.end})
@@ -911,12 +919,42 @@ class AnalyticsView(APIView):
                     for r in item_rows
                 ]
 
+            # Полные возвраты переводят исходный чек в CANCELED и поэтому не
+            # входят в выручку. Показываем их отдельной строкой документов по
+            # дате самого возврата, а не по дате исходной продажи.
+            try:
+                SaleReturn = apps.get_model("main.SaleReturn")
+                returns_qs = SaleReturn.objects.filter(
+                    company=company,
+                    created_at__gte=period.start,
+                    created_at__lt=period.end,
+                )
+                if branch is not None and _model_has_field(Sale, "branch"):
+                    branch_filter = Q(sale__branch=branch)
+                    if self._include_global(request):
+                        branch_filter |= Q(sale__branch__isnull=True)
+                    returns_qs = returns_qs.filter(branch_filter)
+                returns_agg = returns_qs.aggregate(
+                    count=Count("id"),
+                    amount=Coalesce(
+                        Sum("returned_amount"),
+                        Value(Z_MONEY, output_field=MONEY_FIELD),
+                        output_field=MONEY_FIELD,
+                    ),
+                )
+                returns_count = returns_agg["count"] or 0
+                returns_amount = returns_agg["amount"] or Z_MONEY
+            except Exception:
+                # Аналитика остаётся доступна в старых инсталляциях без модели
+                # возврата; в актуальной схеме этот блок всегда отрабатывает.
+                pass
+
         avg_check = _safe_div(_money(revenue), tx)
 
         documents = [
             {"name": "Продажа", "count": tx, "sum": str(_money(revenue)), "stock": None},
             {"name": "Закупка", "count": 0, "sum": "0.00", "stock": None},
-            {"name": "Возврат продажи", "count": 0, "sum": "0.00", "stock": None},
+            {"name": "Возврат продажи", "count": returns_count, "sum": str(_money(returns_amount)), "stock": None},
             {"name": "Возврат закупки", "count": 0, "sum": "0.00", "stock": None},
         ]
 

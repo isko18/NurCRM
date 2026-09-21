@@ -1928,12 +1928,17 @@ class LeadConsaltingListCreateView(LeadVisibilityMixin, CompanyBranchQuerysetMix
         channel = serializer.validated_data.get("channel") or "manual"
         queue_status = serializer.validated_data.get("queue_status") or "new"
 
+        owner = serializer.validated_data.get("owner")
+        if not owner:
+            owner = self.request.user
+
         lead = serializer.save(
             company=company,
             funnel=funnel,
             stage=stage,
             channel=channel,
             queue_status=queue_status,
+            owner=owner,
             address=serializer.validated_data.get("address") or "",
         )
 
@@ -1943,7 +1948,6 @@ class LeadConsaltingListCreateView(LeadVisibilityMixin, CompanyBranchQuerysetMix
                 lead=lead,
                 full_name=lead.full_name or lead.title,
                 phone=lead.phone,
-                email=lead.email,
                 source=lead.channel or "manual",
                 message=lead.description,
                 status=lead.queue_status,
@@ -2576,13 +2580,10 @@ class LeadTransferView(LeadVisibilityMixin, CompanyBranchQuerysetMixin, generics
             except (FunnelStageConsalting.DoesNotExist, ValueError, TypeError):
                 return Response({"target_stage": "Стадия не найдена."}, status=status.HTTP_400_BAD_REQUEST)
             if target_stage.funnel_id != target_funnel.id:
-                return Response({"target_stage": "Стадия относится к другой воронке."},
-                                status=status.HTTP_400_BAD_REQUEST)
+                return Response({"target_stage": "Стадия относится к другой воронке."}, status=status.HTTP_400_BAD_REQUEST)
         else:
             target_stage = (
-                FunnelStageConsalting.objects.filter(
-                    funnel=target_funnel, system_key="intake"
-                ).first()
+                FunnelStageConsalting.objects.filter(funnel=target_funnel, system_key="intake").first()
                 or FunnelStageConsalting.objects.filter(funnel=target_funnel).order_by("order").first()
             )
 
@@ -4266,7 +4267,13 @@ class InboundLeadListCreateView(CompanyBranchQuerysetMixin, generics.ListCreateA
 
         source_param = self.request.query_params.get("source")
         if source_param:
-            qs = qs.filter(source=source_param)
+            if str(source_param).lower() in ("whatsapp", "ватсап"):
+                qs = qs.filter(
+                    Q(source__icontains="whatsapp") |
+                    Q(source__icontains="ватсап")
+                )
+            else:
+                qs = qs.filter(source=source_param)
 
         search_param = self.request.query_params.get("search")
         if search_param:

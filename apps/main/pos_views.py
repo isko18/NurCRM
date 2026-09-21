@@ -3375,7 +3375,7 @@ def _broadcast_return_realtime(sale: Sale, created_flows, shift=None):
                 },
             )
         if shift and any(getattr(cf, "affects_shift_drawer", False) for cf in created_flows):
-            totals = shift.calc_live_totals()
+            totals = shift.calc_live_totals(refresh=True)
             async_to_sync(channel_layer.group_send)(
                 company_group,
                 {

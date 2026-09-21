@@ -5,7 +5,7 @@ from rest_framework.views import APIView
 from rest_framework.parsers import MultiPartParser, FormParser, JSONParser
 import requests
 
-from .models import WazzupAccountConsalting, LeadConsalting
+from .models import WazzupAccountConsalting, LeadConsalting, WhatsAppMessageConsalting
 from .funnel.wazzup import WazzupConsaltingService
 from .serializers import WazzupAccountConsaltingSerializer, WhatsAppMessageConsaltingSerializer
 from .voice_notes import is_voice, public_uri, transcode_voice_bytes, transcode_local_voice_uri
@@ -239,7 +239,17 @@ class WhatsAppMessageConsaltingViewSet(viewsets.ModelViewSet):
                 return qs.filter(lead__phone__contains=digits).order_by('created_at')
 
         if lead_id:
-            qs = qs.filter(lead_id=lead_id)
+            if str(lead_id).startswith("phone_"):
+                p_digits = "".join(filter(str.isdigit, str(lead_id)))
+                if p_digits:
+                    qs = qs.filter(lead__phone__icontains=p_digits[-9:])
+            else:
+                qs = qs.filter(lead_id=lead_id)
+        elif phone:
+            p_digits = "".join(filter(str.isdigit, str(phone)))
+            if p_digits:
+                qs = qs.filter(lead__phone__icontains=p_digits[-9:])
+
         return qs.order_by('created_at')
 
     def partial_update(self, request, pk=None):

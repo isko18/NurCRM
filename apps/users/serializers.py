@@ -152,6 +152,13 @@ def _generate_password(length=6):
 
 class CustomTokenObtainPairSerializer(TokenObtainPairSerializer):
     def validate(self, attrs):
+        email_val = attrs.get("email") or attrs.get("username")
+        if isinstance(email_val, str):
+            clean_email = email_val.strip().lower()
+            if "email" in attrs:
+                attrs["email"] = clean_email
+            if "username" in attrs:
+                attrs["username"] = clean_email
         data = super().validate(attrs)
 
         user = (
@@ -411,7 +418,9 @@ class UserSerializer(serializers.ModelSerializer):
 
         if current_user and getattr(current_user, "role", None) == "manager":
             # менеджеру запрещаем менять любые permission-флаги
-            if any(k.startswith("can_view_") for k in data.keys()):
+            restricted_admin_permissions = {"can_view_settings", "can_manage_funnel_stages", "can_create_funnel"}
+            for p in restricted_admin_permissions:
+                data[p] = False
                 raise serializers.ValidationError("Менеджеру запрещено изменять права доступа.")
 
         # проверка типов только для тех флагов, которые реально прислали
@@ -621,8 +630,9 @@ class EmployeeCreateSerializer(serializers.ModelSerializer):
             data["consulting_region_codes"] = [target_region]
             data["_target_region"] = target_region
 
-            for f in [x.name for x in User._meta.fields if x.name.startswith("can_view_")]:
-                data[f] = False
+            restricted_admin_permissions = {"can_view_settings", "can_manage_funnel_stages", "can_create_funnel"}
+            for p in restricted_admin_permissions:
+                data[p] = False
         else:
             req_region = (data.get("region_code") or "").strip().lower()
             if req_region and not data.get("consulting_region_codes"):
@@ -672,8 +682,16 @@ class EmployeeCreateSerializer(serializers.ModelSerializer):
         user.set_password(generated_password)
 
         if getattr(creator, "role", None) == "supervisor":
-            for k in access_flags.keys():
-                setattr(user, k, False)
+            restricted_admin_permissions = {"can_view_settings", "can_manage_funnel_stages", "can_create_funnel"}
+            for k, v in access_flags.items():
+                if k in restricted_admin_permissions:
+                    setattr(user, k, False)
+                elif v is not None:
+                    setattr(user, k, v)
+            if not any(bool(getattr(user, k, False)) for k in access_flags.keys()):
+                user.can_view_funnel = True
+                user.can_manage_funnel_leads = True
+                user.can_view_sale = True
         elif all(v is None for v in access_flags.values()):
             if user.role in ["owner", "admin"]:
                 for k in access_flags.keys():
@@ -818,8 +836,9 @@ class EmployeeUpdateSerializer(serializers.ModelSerializer):
                 raise serializers.ValidationError("Вы можете редактировать только сотрудников своего региона.")
             if "role" in data and data["role"] != target_user.role:
                 raise serializers.ValidationError("Руководитель не может изменять роль сотрудника.")
-            if any(k.startswith("can_view_") for k in data.keys()) or data.get("can_manage_funnel_stages") or data.get("can_create_funnel"):
-                raise serializers.ValidationError("Руководитель не может изменять расширенные права доступа.")
+            restricted_admin_permissions = {"can_view_settings", "can_manage_funnel_stages", "can_create_funnel"}
+            for p in restricted_admin_permissions:
+                data[p] = False
             if "consulting_region_codes" in data:
                 new_codes = [str(x).strip().lower() for x in data["consulting_region_codes"]]
                 if not set(new_codes).issubset(set(my_regions)):

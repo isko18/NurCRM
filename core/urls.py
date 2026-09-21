@@ -1,3 +1,4 @@
+import traceback
 """
 URL configuration for core project.
 
@@ -87,3 +88,22 @@ if settings.ENABLE_API_DOCS:
 
 # Статические и медиафайлы
 urlpatterns += static(settings.MEDIA_URL, document_root=settings.MEDIA_ROOT)
+
+
+from django.http import JsonResponse
+
+def custom_handler404(request, exception=None):
+    if request.path.startswith('/api/'):
+        return JsonResponse({"detail": "Запрашиваемый ресурс или страница не найдена (404)."}, status=404)
+    from django.views.defaults import page_not_found
+    return page_not_found(request, exception)
+
+def custom_handler500(request):
+    traceback.print_exc()
+    if request.path.startswith('/api/'):
+        return JsonResponse({"detail": "Внутренняя ошибка сервера (500)."}, status=500)
+    from django.views.defaults import server_error
+    return server_error(request)
+
+handler404 = 'core.urls.custom_handler404'
+handler500 = 'core.urls.custom_handler500'

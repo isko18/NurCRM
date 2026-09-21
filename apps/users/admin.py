@@ -173,10 +173,119 @@ class BranchMembershipInlineForBranch(admin.TabularInline):
 
 # -------------------- User --------------------
 
+
+
+
+class DateRangePickerFilter(admin.SimpleListFilter):
+    title = "Календарь (Дата создания)"
+    parameter_name = "created_at__date__gte"
+    template = "admin/date_range_filter.html"
+
+    def lookups(self, request, model_admin):
+        return (("dummy", "dummy"),)
+
+    def expected_parameters(self):
+        return ["created_at__date__gte", "created_at__date__lte"]
+
+    def choices(self, changelist):
+        return []
+
+    def queryset(self, request, queryset):
+        date_gte = request.GET.get("created_at__date__gte")
+        date_lte = request.GET.get("created_at__date__lte")
+
+        if date_gte:
+            try:
+                queryset = queryset.filter(created_at__date__gte=date_gte)
+            except Exception:
+                pass
+        if date_lte:
+            try:
+                queryset = queryset.filter(created_at__date__lte=date_lte)
+            except Exception:
+                pass
+
+        return queryset
+
+
+class CompanyUserActivityFilter(admin.SimpleListFilter):
+    title = "Статус активности (вход за 7 дней)"
+    parameter_name = "user_activity_status"
+
+    def lookups(self, request, model_admin):
+        return (
+            ("active", "🟢 Активные (заходили в течение 7 дней)"),
+            ("inactive", "🔴 Неактивные (не заходили более 7 дней)"),
+        )
+
+    def queryset(self, request, queryset):
+        from datetime import timedelta
+        from django.utils import timezone
+        val = self.value()
+        seven_days_ago = timezone.now() - timedelta(days=7)
+        
+        if val == "active":
+            return queryset.filter(employees__last_login__gte=seven_days_ago).distinct()
+        elif val == "inactive":
+            return queryset.exclude(employees__last_login__gte=seven_days_ago)
+        return queryset
+
+
+class CompanyConsaltingFilter(admin.SimpleListFilter):
+    title = "Добавлен через Консалтинг"
+    parameter_name = "is_consalting_client"
+
+    def lookups(self, request, model_admin):
+        return (
+            ("yes", "✓ Да (через Консалтинг)"),
+            ("no", "Нет"),
+        )
+
+    @staticmethod
+    def get_consalting_company_ids():
+        from django.db import connection
+        consulting_company_id = 'e3dbc253-8edc-411d-b335-fdf46cd3f60e'
+        ids = set()
+        with connection.cursor() as cur:
+            # 1. Direct nur_company_id from Consulting clients of Nurcrmkg@gmail.com
+            cur.execute('''
+                SELECT DISTINCT nur_company_id 
+                FROM main_client 
+                WHERE company_id = %s AND nur_company_id IS NOT NULL;
+            ''', (consulting_company_id,))
+            ids.update(str(r[0]) for r in cur.fetchall())
+
+            # 2. Match company owner email with Consulting clients' emails
+            cur.execute('''
+                SELECT DISTINCT c.id
+                FROM users_company c
+                JOIN users_user u ON c.owner_id = u.id
+                WHERE u.email IS NOT NULL AND u.email != '' AND LOWER(u.email) IN (
+                    SELECT DISTINCT LOWER(email) 
+                    FROM main_client 
+                    WHERE company_id = %s AND email IS NOT NULL AND email != ''
+                );
+            ''', (consulting_company_id,))
+            ids.update(str(r[0]) for r in cur.fetchall())
+
+        return ids
+
+    def queryset(self, request, queryset):
+        val = self.value()
+        if val in ("yes", "no"):
+            consalting_ids = self.get_consalting_company_ids()
+            if val == "yes":
+                return queryset.filter(id__in=consalting_ids)
+            elif val == "no":
+                return queryset.exclude(id__in=consalting_ids)
+        return queryset
+
 @admin.register(User)
 class UserAdmin(CompanyScopedFKMixin, BaseUserAdmin):
+    date_hierarchy = "created_at"
     list_display = (
         "email",
+        "created_at",
         "first_name",
         "last_name",
         "company",
@@ -197,7 +306,15 @@ class UserAdmin(CompanyScopedFKMixin, BaseUserAdmin):
         "is_staff",
         "is_active",
     )
-    list_filter = ("role", "custom_role", "company", "is_platform_admin", "is_staff", "is_active")
+    list_filter = (
+        DateRangePickerFilter,
+        "role",
+        "custom_role",
+        "company",
+        "is_platform_admin",
+        "is_staff",
+        "is_active",
+    )
     search_fields = ("email", "first_name", "last_name", "phone_number", "track_number")
     ordering = ("email",)
     readonly_fields = ("created_at", "updated_at")
@@ -342,9 +459,12 @@ class PlatformAdminAuditLogAdmin(admin.ModelAdmin):
 
 @admin.register(Company)
 class CompanyAdmin(admin.ModelAdmin):
+    date_hierarchy = "created_at"
     list_display = (
         "name",
-        "slug",
+        "created_at",
+        "user_activity_display",
+        "is_consalting_display",
         "is_active",
         "owner",
         "phone",
@@ -361,9 +481,11 @@ class CompanyAdmin(admin.ModelAdmin):
         "can_view_instagram",
         "can_view_telegram",
         "can_view_showcase",
-        "created_at",
     )
     list_filter = (
+        DateRangePickerFilter,
+        CompanyUserActivityFilter,
+        CompanyConsaltingFilter,
         "is_active",
         "subscription_plan",
         "industry",
@@ -374,6 +496,19 @@ class CompanyAdmin(admin.ModelAdmin):
         "can_view_telegram",
         "can_view_showcase",
     )
+
+    @admin.display(description="Вход за 7 дней", boolean=True)
+    def user_activity_display(self, obj):
+        from datetime import timedelta
+        from django.utils import timezone
+        seven_days_ago = timezone.now() - timedelta(days=7)
+        return obj.employees.filter(last_login__gte=seven_days_ago).exists()
+
+    @admin.display(description="Консалтинг", boolean=True)
+    def is_consalting_display(self, obj):
+        if not hasattr(self, '_consalting_ids_cache'):
+            self._consalting_ids_cache = CompanyConsaltingFilter.get_consalting_company_ids()
+        return obj.id in self._consalting_ids_cache or str(obj.id) in self._consalting_ids_cache
     search_fields = ("name", "slug", "owner__email", "phone", "phones_howcase", "whatsapp_phone", "llc", "inn", "address")
     readonly_fields = ("created_at",)
     autocomplete_fields = ("owner", "subscription_plan", "industry", "sector")
