@@ -2213,7 +2213,8 @@ class Sale(models.Model):
     status = models.CharField(max_length=32, choices=Status.choices, default=Status.NEW)
     doc_number = models.PositiveIntegerField(null=True, blank=True, db_index=True)
     bonus_redeemed = models.DecimalField(
-        max_digits=12, decimal_places=2, default=Decimal("0.00"), verbose_name="Оплачено бонусами"
+        max_digits=12, decimal_places=2, default=Decimal("0.00"), db_default=Decimal("0.00"),
+        verbose_name="Оплачено бонусами",
     )
     idempotency_key = models.CharField(
         max_length=128, null=True, blank=True, verbose_name="Ключ идемпотентности кассы"
@@ -2599,7 +2600,7 @@ class SaleReturn(models.Model):
         verbose_name="Смена возврата",
     )
     returned_items = models.JSONField(null=True, blank=True, verbose_name="Возвращённые позиции")
-    reason = models.CharField(max_length=255, blank=True, default="", verbose_name="Причина")
+    reason = models.CharField(max_length=255, blank=True, default="", db_default="", verbose_name="Причина")
     created_at = models.DateTimeField(auto_now_add=True, verbose_name="Дата возврата")
 
     class Meta:
@@ -3262,7 +3263,7 @@ class Client(models.Model):
 
     telegram_chat_id = models.CharField("Telegram chat id", max_length=64, null=True, blank=True)
     bonus_balance = models.DecimalField(
-        "Баланс бонусов", max_digits=12, decimal_places=2, default=Decimal("0.00")
+        "Баланс бонусов", max_digits=12, decimal_places=2, default=Decimal("0.00"), db_default=Decimal("0.00")
     )
 
     created_at = models.DateTimeField("Создано", auto_now_add=True)
