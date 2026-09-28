@@ -815,6 +815,14 @@ class Product(models.Model):
         help_text="Скидка в процентах от цены продажи",
     )
 
+    # ---- Услуги: длительность и процент мастера ----
+    duration_min = models.PositiveIntegerField(
+        "Длительность услуги, мин", null=True, blank=True
+    )
+    performer_commission_percent = models.DecimalField(
+        "Процент мастеру", max_digits=5, decimal_places=2, null=True, blank=True
+    )
+
     # ---- ПЛУ для весов ----
     plu = models.PositiveIntegerField(
         "ПЛУ",
@@ -1987,13 +1995,34 @@ class CartItem(models.Model):
         related_name="cart_items",
         verbose_name="Упаковка (поштучно)",
     )
+    variant = models.ForeignKey(
+        "main.ProductVariant",
+        null=True,
+        blank=True,
+        on_delete=models.PROTECT,
+        related_name="cart_items",
+        verbose_name="Вариант (размер/цвет)",
+    )
+    performer = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="+",
+        verbose_name="Мастер",
+    )
 
     class Meta:
         constraints = [
             models.UniqueConstraint(
                 fields=["cart", "product"],
-                condition=models.Q(sale_package__isnull=True, product__isnull=False),
+                condition=models.Q(sale_package__isnull=True, product__isnull=False, variant__isnull=True),
                 name="uniq_cartitem_cart_product_pack_sale",
+            ),
+            models.UniqueConstraint(
+                fields=["cart", "variant"],
+                condition=models.Q(variant__isnull=False),
+                name="uniq_cartitem_cart_variant",
             ),
             models.UniqueConstraint(
                 fields=["cart", "product", "sale_package"],
@@ -2163,6 +2192,7 @@ class Sale(models.Model):
         OBANK = "obank", "Обанк"
         BAKAI = "bakai", "Бакай"
         MIXED = "mixed", "Смешанная"
+        OFFSET = "offset", "Зачёт (предоплата/обмен)"
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
 
@@ -2655,6 +2685,29 @@ class SaleItem(models.Model):
         on_delete=models.SET_NULL,
         related_name="sale_items",
         verbose_name="Упаковка (поштучно)",
+    )
+    variant = models.ForeignKey(
+        "main.ProductVariant",
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="sale_items",
+        verbose_name="Вариант (размер/цвет)",
+    )
+    performer = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="performed_sale_items",
+        verbose_name="Мастер",
+    )
+    performer_commission_amount = models.DecimalField(
+        "Начислено мастеру",
+        max_digits=12,
+        decimal_places=2,
+        default=Decimal("0.00"),
+        db_default=Decimal("0.00"),
     )
 
     # ✅ себестоимость единицы на момент продажи (для маржи)
@@ -6218,3 +6271,218 @@ class ClientBonusTransaction(models.Model):
         ]
         verbose_name = "Движение бонусов"
         verbose_name_plural = "Движения бонусов"
+
+
+# =====================================================================
+#  Касса NurMarket, этап 3: варианты, склады, запись, заказ-наряды, обмен
+# =====================================================================
+
+class ProductVariant(models.Model):
+    """Размер/цвет товара. Если у товара есть варианты, Product.quantity = сумма их остатков."""
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    company = models.ForeignKey(Company, on_delete=models.CASCADE, related_name="product_variants")
+    product = models.ForeignKey(Product, on_delete=models.CASCADE, related_name="variants")
+    size = models.CharField("Размер", max_length=32, blank=True, default="")
+    color = models.CharField("Цвет", max_length=64, blank=True, default="")
+    barcode = models.CharField("Штрихкод", max_length=64, null=True, blank=True)
+    quantity = models.DecimalField("Остаток", max_digits=12, decimal_places=3, default=Decimal("0"))
+    price = models.DecimalField("Цена", max_digits=12, decimal_places=2, null=True, blank=True)
+    is_active = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ("product", "size", "color")
+        verbose_name = "Вариант товара"
+        verbose_name_plural = "Варианты товаров"
+        constraints = [
+            models.UniqueConstraint(
+                fields=["company", "barcode"],
+                condition=models.Q(barcode__isnull=False) & ~models.Q(barcode=""),
+                name="uniq_variant_company_barcode",
+            ),
+            models.UniqueConstraint(fields=["product", "size", "color"], name="uniq_variant_product_size_color"),
+        ]
+
+    @property
+    def effective_price(self):
+        return self.price if self.price is not None else self.product.price
+
+    def __str__(self):
+        return f"{self.product_id} {self.size} {self.color}".strip()
+
+
+class ProductStock(models.Model):
+    """Остаток товара (или варианта) на складе компании. Остаток «в магазине» — Product.quantity."""
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    company = models.ForeignKey(Company, on_delete=models.CASCADE, related_name="product_stocks")
+    warehouse = models.ForeignKey(Warehouse, on_delete=models.CASCADE, related_name="product_stocks")
+    product = models.ForeignKey(Product, on_delete=models.CASCADE, related_name="warehouse_stocks")
+    variant = models.ForeignKey(
+        ProductVariant, on_delete=models.CASCADE, null=True, blank=True, related_name="warehouse_stocks"
+    )
+    quantity = models.DecimalField(max_digits=12, decimal_places=3, default=Decimal("0"))
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = "Остаток на складе"
+        verbose_name_plural = "Остатки на складах"
+        constraints = [
+            models.UniqueConstraint(
+                fields=["warehouse", "product"],
+                condition=models.Q(variant__isnull=True),
+                name="uniq_stock_warehouse_product",
+            ),
+            models.UniqueConstraint(
+                fields=["warehouse", "variant"],
+                condition=models.Q(variant__isnull=False),
+                name="uniq_stock_warehouse_variant",
+            ),
+        ]
+
+
+class MarketStockTransfer(models.Model):
+    """Перемещение между складами. from/to = null — торговый зал магазина (Product.quantity)."""
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    company = models.ForeignKey(Company, on_delete=models.CASCADE, related_name="market_stock_transfers")
+    from_warehouse = models.ForeignKey(
+        Warehouse, on_delete=models.PROTECT, null=True, blank=True, related_name="transfers_out"
+    )
+    to_warehouse = models.ForeignKey(
+        Warehouse, on_delete=models.PROTECT, null=True, blank=True, related_name="transfers_in"
+    )
+    note = models.CharField(max_length=255, blank=True, default="")
+    idempotency_key = models.CharField(max_length=128, null=True, blank=True)
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True, related_name="+"
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ("-created_at",)
+        verbose_name = "Перемещение товара"
+        verbose_name_plural = "Перемещения товара"
+        constraints = [
+            models.UniqueConstraint(
+                fields=["company", "idempotency_key"],
+                condition=models.Q(idempotency_key__isnull=False),
+                name="uniq_stock_transfer_idempotency",
+            )
+        ]
+
+
+class MarketStockTransferItem(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    transfer = models.ForeignKey(MarketStockTransfer, on_delete=models.CASCADE, related_name="items")
+    product = models.ForeignKey(Product, on_delete=models.PROTECT, related_name="+")
+    variant = models.ForeignKey(ProductVariant, on_delete=models.PROTECT, null=True, blank=True, related_name="+")
+    quantity = models.DecimalField(max_digits=12, decimal_places=3)
+
+
+class MarketAppointment(models.Model):
+    """Запись клиента на услугу к мастеру (салоны, мастерские)."""
+
+    class Status(models.TextChoices):
+        BOOKED = "booked", "Записан"
+        CAME = "came", "Пришёл"
+        CANCELED = "canceled", "Отменена"
+        NO_SHOW = "no_show", "Не пришёл"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    company = models.ForeignKey(Company, on_delete=models.CASCADE, related_name="market_appointments")
+    branch = models.ForeignKey(Branch, on_delete=models.SET_NULL, null=True, blank=True, related_name="+")
+    client = models.ForeignKey(Client, on_delete=models.SET_NULL, null=True, blank=True, related_name="market_appointments")
+    service = models.ForeignKey(Product, on_delete=models.PROTECT, related_name="appointments")
+    performer = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True, related_name="market_appointments"
+    )
+    start = models.DateTimeField()
+    end = models.DateTimeField()
+    status = models.CharField(max_length=16, choices=Status.choices, default=Status.BOOKED)
+    note = models.CharField(max_length=500, blank=True, default="")
+    cart = models.ForeignKey(Cart, on_delete=models.SET_NULL, null=True, blank=True, related_name="+")
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True, related_name="+"
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ("start",)
+        indexes = [
+            models.Index(fields=["company", "start"]),
+            models.Index(fields=["performer", "start"]),
+        ]
+        verbose_name = "Запись на услугу"
+        verbose_name_plural = "Записи на услуги"
+
+
+class WorkOrder(models.Model):
+    """Заказ-наряд (ремонт/мастерская): приём → в работе → готов → выдан (продажа)."""
+
+    class Status(models.TextChoices):
+        ACCEPTED = "accepted", "Принят"
+        IN_WORK = "in_work", "В работе"
+        READY = "ready", "Готов"
+        ISSUED = "issued", "Выдан"
+        CANCELED = "canceled", "Отменён"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    company = models.ForeignKey(Company, on_delete=models.CASCADE, related_name="work_orders")
+    branch = models.ForeignKey(Branch, on_delete=models.SET_NULL, null=True, blank=True, related_name="+")
+    number = models.PositiveIntegerField()
+    client = models.ForeignKey(Client, on_delete=models.SET_NULL, null=True, blank=True, related_name="work_orders")
+    status = models.CharField(max_length=16, choices=Status.choices, default=Status.ACCEPTED)
+    items = models.JSONField(default=list, help_text="[{product|custom,name,qty,price,discount,performer}]")
+    description = models.TextField(blank=True, default="")
+    total = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal("0.00"))
+    prepayment = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal("0.00"))
+    prepayment_method = models.CharField(max_length=32, blank=True, default="")
+    sale = models.ForeignKey(Sale, on_delete=models.SET_NULL, null=True, blank=True, related_name="work_orders")
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True, related_name="+"
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    issued_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ("-created_at",)
+        constraints = [
+            models.UniqueConstraint(fields=["company", "number"], name="uniq_work_order_number"),
+        ]
+        verbose_name = "Заказ-наряд"
+        verbose_name_plural = "Заказ-наряды"
+
+
+class SaleExchange(models.Model):
+    """Обмен: возврат части чека + новый чек, деньгами проходит только разница."""
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    company = models.ForeignKey(Company, on_delete=models.CASCADE, related_name="sale_exchanges")
+    original_sale = models.ForeignKey(Sale, on_delete=models.PROTECT, related_name="exchanges_out")
+    new_sale = models.ForeignKey(Sale, on_delete=models.PROTECT, null=True, blank=True, related_name="exchanges_in")
+    sale_return = models.ForeignKey(SaleReturn, on_delete=models.SET_NULL, null=True, blank=True, related_name="+")
+    returned_amount = models.DecimalField(max_digits=12, decimal_places=2)
+    new_amount = models.DecimalField(max_digits=12, decimal_places=2)
+    difference = models.DecimalField(max_digits=12, decimal_places=2)
+    idempotency_key = models.CharField(max_length=128, null=True, blank=True)
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True, related_name="+"
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ("-created_at",)
+        constraints = [
+            models.UniqueConstraint(
+                fields=["company", "idempotency_key"],
+                condition=models.Q(idempotency_key__isnull=False),
+                name="uniq_sale_exchange_idempotency",
+            )
+        ]
+        verbose_name = "Обмен"
+        verbose_name_plural = "Обмены"

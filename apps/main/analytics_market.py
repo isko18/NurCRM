@@ -3155,8 +3155,21 @@ class AnalyticsView(APIView):
         period_sales_qs = _sale_qs_period()
         cashier_user_ids = set(period_sales_qs.exclude(user_id__isnull=True).values_list("user_id", flat=True))
         consultant_user_ids = set(period_sales_qs.exclude(consultant_id__isnull=True).values_list("consultant_id", flat=True))
+        # Мастера услуг: процент со строк чека (SaleItem.performer_commission_amount)
+        performer_rows = {}
+        if _sale_item is not None and _model_has_field(_sale_item, "performer"):
+            for r in (
+                _sale_item.objects.filter(sale__in=period_sales_qs.values("id"), performer_id__isnull=False)
+                .values("performer_id")
+                .annotate(
+                    comm=Coalesce(Sum("performer_commission_amount"), Value(Z_MONEY, output_field=MONEY_FIELD), output_field=MONEY_FIELD),
+                    cnt=Count("id"),
+                )
+            ):
+                performer_rows[r["performer_id"]] = r
+        performer_user_ids = set(performer_rows)
         profile_user_ids = set(effective_profiles.keys())
-        all_user_ids = list(profile_user_ids | cashier_user_ids | consultant_user_ids)
+        all_user_ids = list(profile_user_ids | cashier_user_ids | consultant_user_ids | performer_user_ids)
         payroll_user_ids = all_user_ids
 
         from django.contrib.auth import get_user_model
@@ -3214,10 +3227,12 @@ class AnalyticsView(APIView):
             else:
                 cashier_bonus = Z_MONEY
 
-            percent_bonus = (cashier_bonus + consultant_commission_period).quantize(Decimal("0.01"))
+            performer_commission_period = (performer_rows.get(uid) or {}).get("comm") or Z_MONEY
+            performer_services_count = int((performer_rows.get(uid) or {}).get("cnt") or 0)
+            percent_bonus = (cashier_bonus + consultant_commission_period + performer_commission_period).quantize(Decimal("0.01"))
 
             if pay_scheme == MarketSaleEmployeePayProfile.PayScheme.SALARY:
-                total_pay = (base_part + consultant_commission_period).quantize(Decimal("0.01"))
+                total_pay = (base_part + consultant_commission_period + performer_commission_period).quantize(Decimal("0.01"))
             elif pay_scheme == MarketSaleEmployeePayProfile.PayScheme.PERCENT:
                 total_pay = percent_bonus
             else:
@@ -3243,6 +3258,8 @@ class AnalyticsView(APIView):
                     "sales_count": cashier_sales_count,
                     "cashier_sales_count": cashier_sales_count,
                     "consultant_sales_count": consultant_sales_count,
+                    "performer_commission_period": str(_money(performer_commission_period)),
+                    "performer_services_count": performer_services_count,
                 }
             )
 

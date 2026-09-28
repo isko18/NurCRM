@@ -1,6 +1,19 @@
 from django.urls import path
 from .views import *
 from .pos_views import *
+from .kassa_stage3 import (
+    AppointmentDetailAPIView,
+    AppointmentListCreateAPIView,
+    AppointmentToSaleAPIView,
+    ProductStocksAPIView,
+    ProductVariantDetailAPIView,
+    ProductVariantListCreateAPIView,
+    SaleExchangeAPIView,
+    StockTransferListCreateAPIView,
+    WorkOrderDetailAPIView,
+    WorkOrderIssueAPIView,
+    WorkOrderListCreateAPIView,
+)
 from .kassa_views import (
     ClientBonusAPIView,
     ClientBonusHistoryAPIView,
@@ -244,6 +257,17 @@ urlpatterns = [
     path("pos/sales/", SaleListAPIView.as_view(), name="pos-sale-list"),
     path("pos/checkout/", PosQuickCheckoutAPIView.as_view(), name="pos-quick-checkout"),
     path("pos/returns/", SaleReturnListAPIView.as_view(), name="pos-return-list"),
+    path("pos/sales/<uuid:pk>/exchange/", SaleExchangeAPIView.as_view(), name="pos-sale-exchange"),
+    path("products/<uuid:pk>/variants/", ProductVariantListCreateAPIView.as_view(), name="product-variants"),
+    path("products/<uuid:pk>/variants/<uuid:vid>/", ProductVariantDetailAPIView.as_view(), name="product-variant-detail"),
+    path("products/<uuid:pk>/stocks/", ProductStocksAPIView.as_view(), name="product-stocks"),
+    path("stock-transfers/", StockTransferListCreateAPIView.as_view(), name="stock-transfers"),
+    path("appointments/", AppointmentListCreateAPIView.as_view(), name="market-appointments"),
+    path("appointments/<uuid:pk>/", AppointmentDetailAPIView.as_view(), name="market-appointment-detail"),
+    path("appointments/<uuid:pk>/to-sale/", AppointmentToSaleAPIView.as_view(), name="market-appointment-to-sale"),
+    path("work-orders/", WorkOrderListCreateAPIView.as_view(), name="work-orders"),
+    path("work-orders/<uuid:pk>/", WorkOrderDetailAPIView.as_view(), name="work-order-detail"),
+    path("work-orders/<uuid:pk>/issue/", WorkOrderIssueAPIView.as_view(), name="work-order-issue"),
     path("pos/sale-consultants/", SaleConsultantsAPIView.as_view(), name="pos-sale-consultants"),
     path("pos/cashier-settings/", MarketCashierSettingsAPIView.as_view(), name="pos-cashier-settings"),
     path("pos/cashier-settings/verify-delete-code/", VerifyDeleteCodeAPIView.as_view(), name="pos-verify-delete-code"),

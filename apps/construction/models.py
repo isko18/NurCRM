@@ -423,7 +423,7 @@ class CashShift(models.Model):
             ),
             noncash_sum=Sum(
                 "amount",
-                filter=~Q(method__in=[Sale.PaymentMethod.CASH, Sale.PaymentMethod.DEBT]),
+                filter=~Q(method__in=[Sale.PaymentMethod.CASH, Sale.PaymentMethod.DEBT, Sale.PaymentMethod.OFFSET]),
             ),
         )
 
@@ -832,6 +832,7 @@ class CashFlow(models.Model):
         PRODUCT_RETURN = "product_return", "Возврат товара"
         SHIFT_DRAWER_OUTFLOW = "shift_drawer_outflow", "Расход из ящика смены"
         SHIFT_DRAWER_INFLOW = "shift_drawer_inflow", "Внесение в ящик смены"
+        WORK_ORDER_PREPAYMENT = "work_order_prepayment", "Предоплата заказ-наряда"
         POS_SALE_RETURN = "pos_sale_return", "Возврат продажи"
         CASHFLOW_CANCEL = "cashflow_cancel", "Отмена движения"
         MANUAL = "manual", "Ручная операция"

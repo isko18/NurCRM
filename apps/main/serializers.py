@@ -1233,6 +1233,8 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
             "wholesale_price",
             "discount_percent",
             "plu",
+            "duration_min",
+            "performer_commission_percent",
             "country",
             "expiration_date",
             "shelf_life_days", "expiry_batches",

@@ -9,7 +9,7 @@ from django.utils.dateparse import parse_date, parse_datetime
 
 import logging
 
-from apps.main.models import Cart, CartItem, Sale, SaleItem, Product
+from apps.main.models import Cart, CartItem, Sale, SaleItem, Product, ProductVariant
 from apps.main.pos_utils import cart_item_stock_consume_units, money as pos_money
 from apps.main.services.product_list_filters import apply_product_list_filters  # noqa: F401
 
@@ -19,6 +19,15 @@ class NotEnoughStock(Exception):
 
 
 @transaction.atomic
+def _performer_commission(item) -> Decimal:
+    """Процент мастеру с суммы строки (процент задаётся у услуги)."""
+    pct = getattr(getattr(item, "product", None), "performer_commission_percent", None)
+    if not item.performer_id or not pct:
+        return Decimal("0.00")
+    line = (item.unit_price or Decimal("0")) * (item.quantity or Decimal("0")) - (item.line_discount or Decimal("0"))
+    return pos_money(max(line, Decimal("0")) * Decimal(str(pct)) / Decimal("100"))
+
+
 def checkout_cart(
     cart: Cart,
     department=None,
@@ -41,7 +50,7 @@ def checkout_cart(
     cart.recalc()
 
     items = list(
-        cart.items.select_related("product", "sale_package")
+        cart.items.select_related("product", "sale_package", "variant")
     )
     if not items:
         raise ValueError("Корзина пуста.")
@@ -67,6 +76,24 @@ def checkout_cart(
         except ValueError as e:
             raise ValueError(str(e)) from e
         consume_by_pid[it.product_id] += item_consume
+
+    # Остаток по вариантам (размер/цвет)
+    variant_ids = [it.variant_id for it in items if it.variant_id]
+    variants = {v.id: v for v in ProductVariant.objects.select_for_update().filter(id__in=variant_ids)}
+    consume_by_vid: dict = defaultdict(lambda: Decimal("0"))
+    for it in items:
+        if it.variant_id:
+            if it.variant_id not in variants or variants[it.variant_id].product_id != it.product_id:
+                raise ValueError("Вариант позиции не найден.")
+            consume_by_vid[it.variant_id] += cart_item_stock_consume_units(it)
+    if not allow_negative_stock:
+        for vid, need in consume_by_vid.items():
+            v = variants[vid]
+            if need > Decimal(str(v.quantity or 0)):
+                raise NotEnoughStock(
+                    f"Недостаточно остатка «{products[v.product_id].name}» {v.size} {v.color}".strip()
+                    + f". Требуется {need}, доступно {v.quantity}."
+                )
 
     if not allow_negative_stock:
         for pid, need in consume_by_pid.items():
@@ -133,9 +160,17 @@ def checkout_cart(
                 sale_package_id=it.sale_package_id,
                 purchase_price_snapshot=snap,
                 price_manually_edited=bool(getattr(it, "price_manually_edited", False)),
+                variant_id=it.variant_id,
+                performer_id=it.performer_id,
+                performer_commission_amount=_performer_commission(it),
             )
         )
     SaleItem.objects.bulk_create(sale_items)
+    for vid, need in consume_by_vid.items():
+        v = variants[vid]
+        v.quantity = Decimal(str(v.quantity or 0)) - need
+    if consume_by_vid:
+        ProductVariant.objects.bulk_update([variants[vid] for vid in consume_by_vid], ["quantity"])
 
     changed = []
     low_stock = []

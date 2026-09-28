@@ -129,6 +129,8 @@ class SaleItemSerializer(serializers.ModelSerializer):
     sale_package = serializers.UUIDField(source="sale_package_id", read_only=True, allow_null=True)
 
     kind = serializers.CharField(source="product.kind", read_only=True, default="product")
+    variant_size = serializers.CharField(source="variant.size", read_only=True, default=None)
+    variant_color = serializers.CharField(source="variant.color", read_only=True, default=None)
 
     class Meta:
         model = CartItem
@@ -141,11 +143,14 @@ class SaleItemSerializer(serializers.ModelSerializer):
             "quantity", "unit_price", "line_discount", "line_total",
             "price_manually_edited",
             "sale_package",
+            "variant", "variant_size", "variant_color",
+            "performer",
             "display_name",
             "primary_image_url",
         )
         read_only_fields = (
             "id", "kind", "product_name", "barcode",
+            "variant", "variant_size", "variant_color", "performer",
             "stock", "promotion_rules", "line_total",
             "price_manually_edited",
             "display_name", "primary_image_url",
@@ -296,6 +301,7 @@ class ScanRequestSerializer(serializers.Serializer):
     sale_id = serializers.UUIDField(required=False, allow_null=True)
 
 class AddItemSerializer(serializers.Serializer):
+    variant_id = serializers.UUIDField(required=False, allow_null=True)
     product_id = serializers.UUIDField()
     # ✅ было IntegerField → стало Decimal 3 знака
     quantity = QtyField(required=False, default=Decimal("1.000"))
@@ -343,6 +349,7 @@ class CartItemPatchSerializer(serializers.Serializer):
     unit_price = MoneyField(required=False)
     discount_total = MoneyField(required=False)
     discount_percent = serializers.DecimalField(max_digits=5, decimal_places=2, required=False)
+    performer = serializers.UUIDField(required=False, allow_null=True)
 
     def validate(self, attrs):
         up = attrs.get("unit_price")
@@ -393,6 +400,12 @@ class CheckoutPaymentLineSerializer(serializers.Serializer):
         choices=[c for c in Sale.PaymentMethod.choices if c[0] not in (Sale.PaymentMethod.DEBT, Sale.PaymentMethod.MIXED)],
     )
     amount = MoneyField()
+
+    def validate_method(self, value):
+        # «Зачёт» ставит только сервер (обмен, выдача заказ-наряда).
+        if value == Sale.PaymentMethod.OFFSET and not self.root.context.get("allow_offset"):
+            raise serializers.ValidationError("Способ оплаты недоступен.")
+        return value
 
 
 def _mixed_split_to_payments(attrs):
@@ -459,7 +472,9 @@ class CheckoutSerializer(serializers.Serializer):
     card_method = serializers.ChoiceField(
         choices=[
             c for c in Sale.PaymentMethod.choices
-            if c[0] not in (Sale.PaymentMethod.DEBT, Sale.PaymentMethod.MIXED, Sale.PaymentMethod.CASH)
+            if c[0] not in (
+                Sale.PaymentMethod.DEBT, Sale.PaymentMethod.MIXED, Sale.PaymentMethod.CASH, Sale.PaymentMethod.OFFSET
+            )
         ],
         required=False,
         default=Sale.PaymentMethod.TRANSFER,
@@ -554,6 +569,8 @@ class CheckoutSerializer(serializers.Serializer):
             if comm_pct < 0 or comm_pct > 100:
                 raise serializers.ValidationError({"consultant_commission_percent": "Процент комиссии должен быть от 0 до 100."})
 
+        if attrs.get("payment_method") == Sale.PaymentMethod.OFFSET:
+            raise serializers.ValidationError({"payment_method": "Способ оплаты недоступен."})
         split_payments = _mixed_split_to_payments(attrs)
         if split_payments is not None:
             attrs["payments"] = split_payments
@@ -644,7 +661,7 @@ class PayDebtSerializer(serializers.Serializer):
     """
 
     payment_method = serializers.ChoiceField(
-        choices=[c for c in Sale.PaymentMethod.choices if c[0] != Sale.PaymentMethod.DEBT],
+        choices=[c for c in Sale.PaymentMethod.choices if c[0] not in (Sale.PaymentMethod.DEBT, Sale.PaymentMethod.OFFSET)],
         required=True,
     )
     cash_received = MoneyField(required=False, allow_null=True)
@@ -823,6 +840,8 @@ class SaleListSerializer(serializers.ModelSerializer):
 
 
 class SaleItemReadSerializer(serializers.ModelSerializer):
+    variant_size = serializers.CharField(source="variant.size", read_only=True, default=None)
+    variant_color = serializers.CharField(source="variant.color", read_only=True, default=None)
     product_name = serializers.SerializerMethodField()
     kind = serializers.CharField(source="product.kind", read_only=True, default="product")
     line_total = serializers.SerializerMethodField()
@@ -841,6 +860,11 @@ class SaleItemReadSerializer(serializers.ModelSerializer):
             "line_id",
             "sale_item_id",
             "product",
+            "variant",
+            "variant_size",
+            "variant_color",
+            "performer",
+            "performer_commission_amount",
             "kind",
             "product_name",
             "name_snapshot",
@@ -1058,7 +1082,7 @@ class AgentCheckoutSerializer(serializers.Serializer):
     consultant_commission_percent = serializers.DecimalField(max_digits=5, decimal_places=2, required=False, allow_null=True)
 
     payment_method = serializers.ChoiceField(
-        choices=Sale.PaymentMethod.choices,
+        choices=[c for c in Sale.PaymentMethod.choices if c[0] != Sale.PaymentMethod.OFFSET],
         default=Sale.PaymentMethod.CASH,
         required=False,
     )

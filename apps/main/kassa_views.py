@@ -30,6 +30,7 @@ from apps.main.models import (
     DealInstallment,
     Product,
     ProductPackage,
+    ProductVariant,
     Sale,
     SaleReturn,
 )
@@ -65,6 +66,8 @@ class QuickCheckoutItemSerializer(serializers.Serializer):
     custom = serializers.BooleanField(required=False, default=False)
     product = serializers.UUIDField(required=False, allow_null=True)
     sale_package = serializers.UUIDField(required=False, allow_null=True)
+    variant = serializers.UUIDField(required=False, allow_null=True)
+    performer = serializers.UUIDField(required=False, allow_null=True)
     name = serializers.CharField(required=False, allow_blank=True, max_length=255)
     qty = QtyField()
     price = MoneyField(required=False, allow_null=True)
@@ -129,6 +132,23 @@ def _quick_result(sale: Sale) -> dict:
         "shift": str(sale.shift_id) if sale.shift_id else None,
         "client": str(sale.client_id) if sale.client_id else None,
     }
+
+
+def resolve_performers(company_id, ids):
+    """{uuid: User} активных сотрудников компании; чужой/несуществующий id — 400."""
+    from django.contrib.auth import get_user_model
+
+    wanted = {i for i in ids if i}
+    if not wanted:
+        return {}
+    users = {
+        u.id: u
+        for u in get_user_model().objects.filter(id__in=wanted, company_id=company_id, is_active=True)
+    }
+    missing = wanted - set(users)
+    if missing:
+        raise ValidationError({"performer": "Мастер не найден в компании."})
+    return users
 
 
 def _is_admin_for_discounts(user) -> bool:
@@ -252,8 +272,10 @@ class PosQuickCheckoutAPIView(APIView):
 
         product_ids = [it["product"] for it in items if not it.get("custom")]
         products = {p.id: p for p in Product.objects.filter(company_id=cart.company_id, id__in=product_ids)}
+        performers = resolve_performers(cart.company_id, [it.get("performer") for it in items])
         for idx, it in enumerate(items):
             qty = qty3(it["qty"])
+            performer = performers.get(it.get("performer"))
             discount = money(it.get("discount") or ZERO)
             if it.get("custom"):
                 price = _q2(it["price"])
@@ -268,6 +290,7 @@ class PosQuickCheckoutAPIView(APIView):
                     unit_price=price,
                     quantity=qty,
                     line_discount=discount,
+                    performer=performer,
                 ).save(skip_full_clean=True)
                 continue
 
@@ -281,7 +304,14 @@ class PosQuickCheckoutAPIView(APIView):
                 ).first()
                 if pkg is None:
                     raise ValidationError({"items": {idx: "Упаковка не найдена."}})
-            default_price = _q2(default_unit_price_for_package(product, pkg))
+            variant = None
+            if it.get("variant"):
+                variant = ProductVariant.objects.filter(
+                    id=it["variant"], product_id=product.id, company_id=cart.company_id
+                ).first()
+                if variant is None:
+                    raise ValidationError({"items": {idx: "Вариант не найден."}})
+            default_price = _q2(variant.effective_price) if variant else _q2(default_unit_price_for_package(product, pkg))
             price = _q2(it["price"]) if it.get("price") is not None else default_price
             base = money(price * qty)
             if discount > base:
@@ -303,6 +333,8 @@ class PosQuickCheckoutAPIView(APIView):
                 cart=cart,
                 product=product,
                 sale_package=pkg,
+                variant=variant,
+                performer=performer,
                 quantity=qty,
                 unit_price=price,
                 line_discount=discount,

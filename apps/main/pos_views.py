@@ -74,6 +74,7 @@ from apps.main.models import (
 )
 from apps.main.models import ManufactureSubreal, AgentSaleAllocation, ReturnFromAgent
 from apps.main.models import cart_line_base, scale_amount_step
+from apps.main.models import ProductVariant
 from apps.main.cache_utils import invalidate_cache_pattern
 from apps.main.services import checkout_cart, NotEnoughStock
 from apps.main.cart_service import abandon_cart
@@ -386,7 +387,7 @@ def _cart_queryset_for_response():
         "id", "product_id", "position", "min_amount", "discount_percent", "promo_quantity"
     ).order_by("position", "id")
     item_qs = (
-        CartItem.objects.select_related("product")
+        CartItem.objects.select_related("product", "variant")
         .only(
             "id",
             "cart_id",
@@ -396,6 +397,11 @@ def _cart_queryset_for_response():
             "unit_price",
             "line_discount",
             "sale_package_id",
+            "performer_id",
+            "variant_id",
+            "variant__id",
+            "variant__size",
+            "variant__color",
             "product__id",
             "product__name",
             "product__barcode",
@@ -662,11 +668,11 @@ def _cart_response(request, cart_id, *, status_code=status.HTTP_200_OK, multi_ca
     )
 
 
-def _upsert_scanned_cart_item(cart, product, quantity):
+def _upsert_scanned_cart_item(cart, product, quantity, variant=None):
     scanned_qty = qty3(quantity)
     item = (
         CartItem.objects.select_for_update()
-        .filter(cart=cart, product=product, sale_package__isnull=True)
+        .filter(cart=cart, product=product, sale_package__isnull=True, variant=variant)
         .first()
     )
     if item:
@@ -679,9 +685,12 @@ def _upsert_scanned_cart_item(cart, product, quantity):
         company=cart.company,
         branch=getattr(cart, "branch", None),
         product=product,
+        variant=variant,
         quantity=scanned_qty,
         unit_price=(
-            (product.wholesale_price or product.price)
+            variant.effective_price
+            if variant is not None
+            else (product.wholesale_price or product.price)
             if getattr(cart, "is_wholesale", False)
             else product.price
         ),
@@ -2495,12 +2504,20 @@ class SaleScanAPIView(MarketCashierOnlyMixin, APIView):
         barcode = ser.validated_data["barcode"].strip()
         qty = ser.validated_data["quantity"]
 
-        try:
-            product, scale_data, lookup_error = _lookup_product_for_pos_scan(url_cart.company_id, barcode)
-        except AmbiguousBarcode as exc:
-            return _ambiguous_barcode_response(exc)
-        if not product:
-            return Response({"not_found": True, "message": lookup_error or "Товар не найден"}, status=404)
+        variant = (
+            ProductVariant.objects.select_related("product")
+            .filter(company_id=url_cart.company_id, barcode=barcode, is_active=True)
+            .first()
+        )
+        if variant is not None:
+            product, scale_data = variant.product, None
+        else:
+            try:
+                product, scale_data, lookup_error = _lookup_product_for_pos_scan(url_cart.company_id, barcode)
+            except AmbiguousBarcode as exc:
+                return _ambiguous_barcode_response(exc)
+            if not product:
+                return Response({"not_found": True, "message": lookup_error or "Товар не найден"}, status=404)
 
         effective_qty = _effective_qty_from_scale_data(scale_data, qty)
 
@@ -2511,7 +2528,7 @@ class SaleScanAPIView(MarketCashierOnlyMixin, APIView):
                 shift=url_cart.shift,
                 sale_id=sale_id,
             )
-            _upsert_scanned_cart_item(cart, product, effective_qty)
+            _upsert_scanned_cart_item(cart, product, effective_qty, variant=variant)
             cart.recalc()
             cart_id = cart.id
 
@@ -2541,8 +2558,15 @@ class SaleAddItemAPIView(MarketCashierOnlyMixin, APIView):
         qty = ser.validated_data["quantity"]
         allow_minus = bool(ser.validated_data.get("allow_minus"))
         can_minus = allow_minus and _is_owner_like(request.user)
+        variant = None
+        if ser.validated_data.get("variant_id"):
+            variant = get_object_or_404(
+                ProductVariant, id=ser.validated_data["variant_id"], product_id=product.id, company_id=cart.company_id
+            )
 
         unit_price = ser.validated_data.get("unit_price")
+        if unit_price is None and variant is not None and variant.price is not None:
+            unit_price = variant.price
         line_discount = ser.validated_data.get("discount_total")
         discount_percent = ser.validated_data.get("discount_percent")
         sale_package_id = ser.validated_data.get("sale_package_id")
@@ -2593,7 +2617,7 @@ class SaleAddItemAPIView(MarketCashierOnlyMixin, APIView):
         other = total_cart_consume_packs_for_product(cart.id, product.id)
         target = (
             CartItem.objects.select_for_update()
-            .filter(cart=cart, product=product, sale_package=pkg)
+            .filter(cart=cart, product=product, sale_package=pkg, variant=variant)
             .first()
         )
         if target:
@@ -2633,6 +2657,7 @@ class SaleAddItemAPIView(MarketCashierOnlyMixin, APIView):
                 branch=getattr(cart, "branch", None),
                 product=product,
                 sale_package=pkg,
+                variant=variant,
                 quantity=qty3(qty),
                 unit_price=base_price,
                 line_discount=disc_total,
@@ -2659,7 +2684,7 @@ class SaleCheckoutAPIView(MarketCashierOnlyMixin, APIView):
     def post(self, request, pk, *args, **kwargs):
         return self.checkout(request, pk, request.data)
 
-    def checkout(self, request, pk, data):
+    def checkout(self, request, pk, data, *, allow_offset=False):
         with transaction.atomic():
             cart = get_object_or_404(
                 Cart.objects.select_related("company", "branch", "user", "shift"),
@@ -2668,7 +2693,9 @@ class SaleCheckoutAPIView(MarketCashierOnlyMixin, APIView):
                 status=Cart.Status.ACTIVE,
             )
 
-            ser = CheckoutSerializer(data=data, context={"request": request, "cart": cart})
+            ser = CheckoutSerializer(
+                data=data, context={"request": request, "cart": cart, "allow_offset": allow_offset}
+            )
             ser.is_valid(raise_exception=True)
 
             print_receipt = ser.validated_data["print_receipt"]
@@ -2981,6 +3008,8 @@ def _restock_product_for_sale_item_return(item: SaleItem, return_qty: Decimal) -
     if stock_delta <= 0:
         return
     Product.objects.filter(pk=item.product_id).exclude(kind=Product.Kind.SERVICE).update(quantity=F("quantity") + stock_delta)
+    if getattr(item, "variant_id", None):
+        ProductVariant.objects.filter(pk=item.variant_id).update(quantity=F("quantity") + stock_delta)
 
 
 def _release_agent_allocations_for_qty(sale_item: SaleItem, return_qty_int: int) -> List[tuple]:
@@ -4659,6 +4688,11 @@ class CartItemUpdateDestroyAPIView(MarketCashierOnlyMixin, APIView):
             update_fields.append("price_manually_edited")
         if line_discount is not None or discount_percent is not None:
             update_fields.append("line_discount")
+        if "performer" in data:
+            from apps.main.kassa_views import resolve_performers
+
+            item.performer = resolve_performers(cart.company_id, [data["performer"]]).get(data["performer"])
+            update_fields.append("performer")
         if update_fields:
             item.save(update_fields=update_fields)
         cart.recalc()
