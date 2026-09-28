@@ -188,7 +188,7 @@ class CashShiftOpenSerializer(serializers.ModelSerializer):
     ✅ Запрещаем только повторную OPEN смену этому же кассиру на этой кассе.
     ✅ Авто-резолв кассы по branch_id / cashbox_role, если cashbox не передан.
     """
-    MAX_OPEN_COMPANY_SHIFTS = 3
+    MAX_OPEN_COMPANY_SHIFTS = 20
 
     cashier = serializers.PrimaryKeyRelatedField(required=False, allow_null=True, queryset=User.objects.none())
     cashbox = serializers.PrimaryKeyRelatedField(required=False, allow_null=True, queryset=Cashbox.objects.none())
@@ -266,7 +266,7 @@ class CashShiftOpenSerializer(serializers.ModelSerializer):
         existing = (
             CashShift.objects
             .select_for_update()
-            .filter(company=company, cashbox=cashbox, cashier=cashier, status=CashShift.Status.OPEN)
+            .filter(company=company, cashier=cashier, status=CashShift.Status.OPEN)
             .order_by("-opened_at")
             .first()
         )

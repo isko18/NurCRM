@@ -321,17 +321,42 @@ class ServiceRetrieveUpdateDestroyView(
 
 
 # ==== Client ====
+class BarberClientPagination(PageNumberPagination):
+    page_size = 5000
+    page_size_query_param = "page_size"
+    max_page_size = 10000
+
+
 class ClientListCreateView(CompanyQuerysetMixin, generics.ListCreateAPIView):
     queryset = Client.objects.all()
     serializer_class = ClientSerializer
     permission_classes = [permissions.IsAuthenticated]
-    filter_backends = [DjangoFilterBackend, SearchFilter, OrderingFilter]
+    pagination_class = BarberClientPagination
+    filter_backends = [DjangoFilterBackend, OrderingFilter]
     filterset_fields = [
         f.name for f in Client._meta.get_fields() if not f.is_relation or f.many_to_one
     ]
-    search_fields = ["full_name", "phone", "email", "notes"]
     ordering_fields = ["full_name", "created_at", "status"]
     ordering = ["-created_at"]
+
+    def filter_queryset(self, queryset):
+        queryset = super().filter_queryset(queryset)
+        search_val = self.request.query_params.get("search")
+        if search_val:
+            search_val = search_val.strip()
+            digits = "".join(c for c in search_val if c.isdigit())
+            from django.db.models import Q
+            q_filter = (
+                Q(full_name__icontains=search_val)
+                | Q(phone__icontains=search_val)
+                | Q(email__icontains=search_val)
+                | Q(notes__icontains=search_val)
+            )
+            if len(digits) >= 6:
+                last9 = digits[-9:]
+                q_filter |= Q(phone__endswith=last9)
+            queryset = queryset.filter(q_filter)
+        return queryset
 
     def get_serializer_context(self):
         context = super().get_serializer_context()
@@ -1121,7 +1146,7 @@ def _build_barber_analytics(base_qs, date_from, date_to, include_masters: bool):
     qs = base_qs.filter(start_at__date__gte=date_from, start_at__date__lte=date_to)
 
     effective_price = ExpressionWrapper(
-        F("price") * (Value(Decimal("1")) - (F("discount") / Value(Decimal("100")))),
+        F("price"),
         output_field=DecimalField(max_digits=14, decimal_places=6),
     )
 

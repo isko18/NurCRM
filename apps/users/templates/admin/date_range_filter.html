@@ -1,0 +1,78 @@
+{% load i18n %}
+
+<div class="form-group mr-2 mb-2 d-inline-flex align-items-center bg-white px-3 py-2 rounded border shadow-sm" style="border: 1px solid #ced4da !important; font-family: inherit;">
+    <span class="mr-2 font-weight-bold text-dark" style="font-size: 13px; white-space: nowrap;">
+        📅 {{ title }}:
+    </span>
+    
+    <span class="small text-secondary mr-1 font-weight-bold">с</span>
+    <input type="date" 
+           id="created_at_from_input"
+           class="form-control form-control-sm mr-2" 
+           style="width: 145px; display: inline-block; cursor: pointer; border-radius: 4px; font-size: 13px;" 
+           value="{{ request.GET.created_at__date__gte|default:'' }}"
+           onchange="applyAdminDateFilter()">
+           
+    <span class="small text-secondary mr-1 font-weight-bold">по</span>
+    <input type="date" 
+           id="created_at_to_input"
+           class="form-control form-control-sm mr-2" 
+           style="width: 145px; display: inline-block; cursor: pointer; border-radius: 4px; font-size: 13px;" 
+           value="{{ request.GET.created_at__date__lte|default:'' }}"
+           onchange="applyAdminDateFilter()">
+           
+    <button type="button" 
+            class="btn btn-sm btn-primary font-weight-bold px-3 mr-1" 
+            style="border-radius: 4px; font-size: 12px; height: 31px;"
+            onclick="applyAdminDateFilter()">
+        Применить
+    </button>
+    
+    {% if request.GET.created_at__date__gte or request.GET.created_at__date__lte %}
+        <button type="button" 
+                class="btn btn-sm btn-outline-danger px-2" 
+                style="border-radius: 4px; font-size: 12px; height: 31px;"
+                title="Сбросить фильтр даты"
+                onclick="clearAdminDateFilter()">
+            Сбросить ✕
+        </button>
+    {% endif %}
+</div>
+
+<script>
+function applyAdminDateFilter() {
+    var fromInput = document.getElementById('created_at_from_input');
+    var toInput = document.getElementById('created_at_to_input');
+    
+    var fromVal = fromInput ? fromInput.value : '';
+    var toVal = toInput ? toInput.value : '';
+    
+    var search = new URLSearchParams(window.location.search);
+    
+    if (fromVal) {
+        search.set('created_at__date__gte', fromVal);
+    } else {
+        search.delete('created_at__date__gte');
+    }
+    
+    if (toVal) {
+        search.set('created_at__date__lte', toVal);
+    } else {
+        search.delete('created_at__date__lte');
+    }
+    
+    search.delete('created_from');
+    search.delete('created_to');
+    
+    window.location.search = search.toString();
+}
+
+function clearAdminDateFilter() {
+    var search = new URLSearchParams(window.location.search);
+    search.delete('created_at__date__gte');
+    search.delete('created_at__date__lte');
+    search.delete('created_from');
+    search.delete('created_to');
+    window.location.search = search.toString();
+}
+</script>

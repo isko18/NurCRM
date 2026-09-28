@@ -28,6 +28,9 @@ urlpatterns = [
     path("cashboxes/<uuid:cashbox_id>/report/", CashboxReportView.as_view(), name="cashbox-report"),
     path("cashbox-reports/analytics/", CashboxReportAnalyticsView.as_view(), name="cashbox-reports-analytics"),
 
+    path("cashboxes/<uuid:cashbox_id>/report/", CashboxReportView.as_view(), name="cashbox-report"),
+    path("cashbox-reports/analytics/", CashboxReportAnalyticsView.as_view(), name="cashbox-reports-analytics"),
+
     path("cashflows/", CashFlowListCreateView.as_view(), name="cashflow-list-create"),
     path("cashflows/<uuid:pk>/", CashFlowDetailView.as_view(), name="cashflow-detail"),
     path("cashflows/<uuid:pk>/edit-request/", CashFlowEditRequestView.as_view(), name="cashflow-edit-request"),
@@ -46,3 +49,4 @@ urlpatterns = [
     path("shifts/<uuid:pk>/close/", CashShiftCloseView.as_view(), name="cashshift-close"),
     path("cash/shifts/<uuid:pk>/sales/", CashShiftSalesListView.as_view(), name="cash-shift-sales"),
 ]
+

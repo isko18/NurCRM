@@ -29,7 +29,7 @@ def close_shift_as_system(shift: CashShift, reason: str, *, by_user=None) -> Cas
     Закрыть одну открытую смену «по ожидаемому остатку» (расхождение по кассе = 0),
     штатным образом (итоги/время/статус). Ошибки НЕ подавляются — пусть решает вызывающий.
     """
-    expected_cash = shift.calc_live_totals()["expected_cash"]
+    expected_cash = shift.calc_live_totals(refresh=True)["expected_cash"]
     shift.close(closing_cash=expected_cash, close_reason=reason)
     logger.info(
         "Автозакрытие смены %s (кассир=%s, касса=%s), причина=%s, инициатор=%s",

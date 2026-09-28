@@ -149,15 +149,9 @@ def counterparty_period_balances(
     Трактовка дебета/кредита — как в акте сверки (см. DOC_DEBIT_TYPES/CREDIT_TYPES,
     деньги: MONEY_EXPENSE → дебет, MONEY_RECEIPT → кредит), чтобы цифры сходились.
 
-    - opening_* — свёрнутое сальдо строго до date_from (дебет = старый долг,
-      кредит = предоплата; одновременно заполнена только одна сторона);
-    - turnover_* — обороты внутри [date_from, date_to] включительно, НЕ
-      сворачиваются: дебет = новые отгрузки, кредит = поступившие оплаты;
-    - closing_* — свёрнутое сальдо (opening_net + turnover_debit − turnover_credit):
-      дебет = сколько остались должны, кредит = переплата.
-
-    Итог по нескольким контрагентам — сумма свёрнутых сальдо каждого, поэтому
-    переплата одного не гасит долг другого.
+    - opening_* — накоплено строго до date_from;
+    - turnover_* — внутри [date_from, date_to] включительно;
+    - closing_* = opening_* + turnover_*.
 
     per_counterparty=False → один словарь-итог по всем подходящим контрагентам;
     per_counterparty=True  → {counterparty_id: словарь}.
@@ -338,9 +332,8 @@ def bulk_counterparty_mini_analytics(mixin, counterparty_ids) -> dict:
             # показывался бы с нулевым долгом, хотя должен с прошлых месяцев.
             balance = _dec_q2(row["closing_debit"] - row["closing_credit"])
             out[cid]["debts"].update({
-                # Явные имена под три колонки таблицы контрагентов.
-                # Сальдо свёрнутое, поэтому «начислено» — это старый долг плюс
-                # новые отгрузки, а «погашено» — предоплаты плюс оплаты периода.
+                # Явные имена под три колонки таблицы контрагентов:
+                # общий долг / оплачено / сколько в итоге должен.
                 "debt_total": str(_dec_q2(row["opening_debit"] + row["turnover_debit"])),
                 "paid_total": str(_dec_q2(row["opening_credit"] + row["turnover_credit"])),
                 "debt_remaining": str(balance),

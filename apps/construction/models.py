@@ -355,7 +355,16 @@ class CashShift(models.Model):
         self.full_clean()
         return super().save(*args, **kwargs)
 
-    def calc_live_totals(self) -> dict:
+    def calc_live_totals(self, *, refresh: bool = False) -> dict:
+        # Свойства expected_cash / drawer_expected_cash / ledger_expected_cash /
+        # non_drawer_expenses_total / cash_diff вызывают этот метод каждое по разу,
+        # а сериализатор списка читает их все — без мемоизации это ~60 SQL-запросов
+        # на одну смену. Кэшируем на время жизни экземпляра.
+        if not refresh:
+            cached = getattr(self, "_live_totals_cache", None)
+            if cached is not None:
+                return cached
+
         z = Decimal("0.00")
 
         flows = self.shift_flows.filter(status=CashFlow.Status.APPROVED, request_kind__isnull=True)
@@ -380,7 +389,24 @@ class CashShift(models.Model):
         Sale = self.sales.model
         sales_qs = Sale.objects.filter(shift_id=self.id, status=Sale.Status.PAID)
 
-        from apps.main.models import SalePayment
+        from apps.main.models import SaleItem, Product, SalePayment
+        from django.db.models import ExpressionWrapper, F
+
+        service_sales = (
+            SaleItem.objects.filter(
+                sale__shift_id=self.id,
+                sale__status=Sale.Status.PAID,
+                product__kind=Product.Kind.SERVICE,
+            ).aggregate(
+                total=Sum(
+                    ExpressionWrapper(
+                        F("unit_price") * F("quantity") - F("line_discount"),
+                        output_field=DecimalField(max_digits=12, decimal_places=2),
+                    )
+                )
+            )["total"]
+            or z
+        )
 
         sa = sales_qs.aggregate(
             cnt=Count("id"),
@@ -422,26 +448,26 @@ class CashShift(models.Model):
             ),
         )
 
-        income_total = fa["income"] or z
+        non_sale_income = fa["income"] or z
+        income_total = non_sale_income + service_sales
         expense_total = fa["expense"] or z
         sales_count = sa["cnt"] or 0
         sales_total = sa["total_sum"] or z
         cash_sales_total = (pay_agg["cash_sum"] or z) + (legacy_agg["cash_sum"] or z)
         noncash_sales_total = (pay_agg["noncash_sum"] or z) + (legacy_agg["noncash_sum"] or z)
 
-        # Наличные, реально осевшие в ящике. Отличается от cash_sales_total (витрина,
-        # только status=paid) двумя вещами:
-        #   * частично возвращённые чеки учитываются — их строки оплат уже уменьшены
-        #     до остатка (_rescale_sale_payments_after_partial_return), значит там
-        #     лежит именно та наличность, что осталась в ящике;
-        #   * полностью отменённые НЕ учитываются — деньги вернули покупателю.
-        # Компенсирующее движение pos_sale_return при этом из ящика НЕ вычитается
-        # (affects_shift_drawer=False): возврат уже учтён здесь, иначе сумма
-        # снималась бы дважды.
+        # Наличные, реально осевшие в ящике. Отличается от cash_sales_total
+        # (витрина, только status=paid) двумя вещами:
+        #   * частично возвращённые чеки учитываются — их строки оплат уже
+        #     уменьшены до остатка, значит там именно та наличность, что осталась;
+        #   * полностью отменённые не учитываются — деньги вернули покупателю.
+        # Компенсирующее движение pos_sale_return из ящика НЕ вычитается
+        # (affects_shift_drawer=False), иначе сумма снималась бы дважды.
+        drawer_statuses = [Sale.Status.PAID, Sale.Status.PARTIALLY_RETURNED]
         drawer_cash_in = (
             SalePayment.objects.filter(
                 sale__shift_id=self.id,
-                sale__status__in=[Sale.Status.PAID, Sale.Status.PARTIALLY_RETURNED],
+                sale__status__in=drawer_statuses,
                 method=Sale.PaymentMethod.CASH,
             ).aggregate(s=Sum("amount"))["s"]
             or z
@@ -449,7 +475,7 @@ class CashShift(models.Model):
         drawer_legacy_cash = (
             Sale.objects.filter(
                 shift_id=self.id,
-                status__in=[Sale.Status.PAID, Sale.Status.PARTIALLY_RETURNED],
+                status__in=drawer_statuses,
                 payment_method=Sale.PaymentMethod.CASH,
             )
             .annotate(pay_cnt=Count("payments"))
@@ -459,7 +485,7 @@ class CashShift(models.Model):
         )
 
         drawer_expected_cash = (
-            (self.opening_cash or z) + drawer_cash_in + drawer_legacy_cash + income_total - expense_total
+            (self.opening_cash or z) + drawer_cash_in + drawer_legacy_cash + non_sale_income - expense_total
         )
         expected_cash = drawer_expected_cash
 
@@ -482,7 +508,7 @@ class CashShift(models.Model):
             or z
         )
 
-        return {
+        totals = {
             "income_total": income_total,
             "expense_total": expense_total,
             "sales_count": sales_count,
@@ -494,6 +520,18 @@ class CashShift(models.Model):
             "ledger_expected_cash": drawer_expected_cash,
             "non_drawer_expenses_total": non_drawer_expenses_total,
         }
+
+        # Приводим деньги к 2 знакам. Произведение numeric(12,2) * numeric(…,3)
+        # приходит из БД с 5 знаками после запятой (service_sales), а денежные
+        # поля смены — DecimalField(decimal_places=2): full_clean() при закрытии
+        # смены отклонял такое значение, и касса получала 400.
+        totals = {
+            key: (value.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+                  if isinstance(value, Decimal) else value)
+            for key, value in totals.items()
+        }
+        self._live_totals_cache = totals
+        return totals
 
     @property
     def drawer_expected_cash(self) -> Decimal:
@@ -517,7 +555,13 @@ class CashShift(models.Model):
             return Decimal("0.00")
         return (self.closing_cash or Decimal("0.00")) - (self.expected_cash or Decimal("0.00"))
 
-    def calc_payment_breakdown(self) -> list:
+    def calc_payment_breakdown(self, *, refresh: bool = False) -> list:
+        # Сериализатор списка обращается к разбивке дважды на объект — кэшируем.
+        if not refresh:
+            cached = getattr(self, "_payment_breakdown_cache", None)
+            if cached is not None:
+                return cached
+
         Sale = self.sales.model
         from apps.main.models import SalePayment
 
@@ -602,6 +646,7 @@ class CashShift(models.Model):
                 "amount": str(item["amount"].quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)),
             })
 
+        self._payment_breakdown_cache = res
         return res
 
     def other_open_shifts_on_cashbox(self) -> list:
@@ -707,7 +752,7 @@ class CashShift(models.Model):
         return res
 
     def recalc_totals_for_close(self):
-        t = self.calc_live_totals()
+        t = self.calc_live_totals(refresh=True)
         self.income_total = t["income_total"]
         self.expense_total = t["expense_total"]
         self.sales_count = t["sales_count"]

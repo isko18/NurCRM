@@ -876,18 +876,6 @@ def _wants_only_unpaid(request) -> bool:
     return raw in _UNPAID_FLAGS
 
 
-def _shown_in_unpaid_mode(row) -> bool:
-    """
-    Режим одного дня (only_unpaid): контрагент виден, если на конец дня
-    остался долг, ИЛИ в этот день было погашение (оплата/возврат) — чтобы
-    в день оплаты она была видна. На следующий день без долга и движений
-    контрагент из списка уходит.
-    """
-    has_debt = (row["closing_debit"] - row["closing_credit"]) > 0
-    paid_today = row["turnover_credit"] > 0
-    return has_debt or paid_today
-
-
 class CounterpartyListCreateView(CompanyBranchRestrictedMixin, generics.ListCreateAPIView):
     queryset = models.Counterparty.objects.all()
     serializer_class = serializers_documents.CounterpartySerializer
@@ -923,13 +911,16 @@ class CounterpartyListCreateView(CompanyBranchRestrictedMixin, generics.ListCrea
 
     def _unpaid_counterparty_ids(self, on_date):
         """
-        Контрагенты с непогашенным долгом на дату (сальдо на конец по дебету
-        больше, чем по кредиту — как в акте сверки) или с погашением в этот день.
+        Контрагенты с непогашенным долгом на дату: сальдо на конец периода
+        по дебету больше, чем по кредиту (трактовка — как в акте сверки).
         """
         period_map = services_money.counterparty_period_balances(
             self, date_from=on_date, date_to=on_date, per_counterparty=True,
         )
-        return [cid for cid, row in period_map.items() if _shown_in_unpaid_mode(row)]
+        return [
+            cid for cid, row in period_map.items()
+            if (row["closing_debit"] - row["closing_credit"]) > 0
+        ]
 
     def get_queryset(self):
         qs = filter_qs_company_branch_or_global(self, models.Counterparty.objects.all())
@@ -939,9 +930,8 @@ class CounterpartyListCreateView(CompanyBranchRestrictedMixin, generics.ListCrea
         date_from, date_to = services_money.get_requested_date_range(self)
         only_unpaid = _wants_only_unpaid(self.request)
         if only_unpaid:
-            # Режим одного дня: показываем тех, кто не оплатил (есть долг на конец
-            # выбранной даты, даже без движений в этот день), и тех, кто погасил
-            # долг именно в этот день.
+            # Режим одного дня: показываем только тех, кто не оплатил (есть долг
+            # на конец выбранной даты), включая тех, у кого в этот день движений не было.
             on_date = date_to or date_from or timezone.localdate()
             return qs.filter(pk__in=self._unpaid_counterparty_ids(on_date)).distinct()
         # Период НЕ сужает состав списка: страница «Контрагенты» — это ещё и
@@ -1063,14 +1053,17 @@ class CounterpartyBalanceSummaryView(CompanyBranchRestrictedMixin, APIView):
                 )
 
         if _wants_only_unpaid(request):
-            # Тот же режим, что и в списке контрагентов: не оплатившие
-            # и те, кто погасил долг в этот день.
+            # Тот же режим, что и в списке контрагентов: только не оплатившие
+            # (сальдо на конец периода по дебету больше, чем по кредиту).
             per_cp = services_money.counterparty_period_balances(
                 self, date_from=date_to, date_to=date_to,
                 counterparty_type=counterparty_type, counterparty_ids=counterparty_ids,
                 per_counterparty=True,
             )
-            counterparty_ids = [cid for cid, r in per_cp.items() if _shown_in_unpaid_mode(r)]
+            counterparty_ids = [
+                cid for cid, r in per_cp.items()
+                if (r["closing_debit"] - r["closing_credit"]) > 0
+            ]
 
         row = services_money.counterparty_period_balances(
             self, date_from=date_from, date_to=date_to,

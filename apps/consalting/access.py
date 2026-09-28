@@ -152,6 +152,10 @@ def can_manage_leads(user, funnel) -> bool:
     if EmployeeFunnelGrant.objects.filter(employee=user, funnel=funnel, can_manage_leads=True).exists():
         return True
 
+    if getattr(funnel, "company_id", None) and getattr(funnel, "company_id", None) == getattr(user, "company_id", None):
+        if getattr(user, "can_manage_funnel_leads", False) or getattr(user, "can_view_funnel", False):
+            return True
+
     if is_consulting_supervisor(user):
         user_regions = get_user_region_codes(user)
         if getattr(funnel, "region_code", "") in user_regions:

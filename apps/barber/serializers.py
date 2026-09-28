@@ -348,6 +348,20 @@ class ServiceSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
 # ===========================
 # Client
 # ===========================
+def normalize_barber_phone(phone):
+    if not phone:
+        return None
+    phone = phone.strip()
+    digits = "".join(c for c in phone if c.isdigit())
+    if not digits:
+        return phone
+    if len(digits) == 10 and digits.startswith("0"):
+        return "996" + digits[1:]
+    elif len(digits) == 9 and not digits.startswith("996"):
+        return "996" + digits
+    return digits
+
+
 class ClientSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
     company = serializers.ReadOnlyField(source="company.id")
     branch = serializers.ReadOnlyField(source="branch.id")
@@ -363,24 +377,29 @@ class ClientSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
         ref_name = "BarberClient"
 
     def validate(self, attrs):
-        """
-        Клиент создаётся глобально или в текущем филиале пользователя.
-        Поле branch read-only, поэтому клиент не может его подменить.
-        Проверяем уникальность телефона в рамках компании (глобально или по филиалу).
-        """
-        phone = (attrs.get("phone") or "").strip() if attrs.get("phone") else None
+        raw_phone = attrs.get("phone")
+        if raw_phone:
+            norm_phone = normalize_barber_phone(raw_phone)
+            attrs["phone"] = norm_phone or raw_phone
+            phone = attrs["phone"]
+        else:
+            phone = None
+
         if not phone:
             return attrs
 
         company = self._user_company()
-        # Use branch from view context (ClientListCreateView) so validation matches save()
         branch = self.context.get("active_branch")
         if branch is None:
             branch = self._auto_branch()
         if not company:
             return attrs
 
-        qs = Client.objects.filter(company=company, phone=phone)
+        from django.db.models import Q
+        last9 = phone[-9:] if len(phone) >= 9 else phone
+        qs = Client.objects.filter(company=company).filter(
+            Q(phone=phone) | Q(phone__endswith=last9)
+        )
         if branch is not None:
             qs = qs.filter(branch=branch)
         else:
@@ -394,9 +413,6 @@ class ClientSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
         return attrs
 
 
-# ===========================
-# ClientDocument
-# ===========================
 class ClientDocumentSerializer(serializers.ModelSerializer):
     company = serializers.ReadOnlyField(source="company.id")
     branch = serializers.ReadOnlyField(source="branch.id")
@@ -467,12 +483,13 @@ class AppointmentServicesListField(serializers.Field):
         # value — manager (appointment_services) или prefetched list
         if value is None:
             return []
-        if hasattr(value, "order_by"):
-            qs = value.order_by("position")
-            if hasattr(qs, "values_list"):
-                return list(qs.values_list("service_id", flat=True))
+        mgr_inst = getattr(value, "instance", None)
+        if mgr_inst and hasattr(mgr_inst, "_prefetched_objects_cache") and "appointment_services" in mgr_inst._prefetched_objects_cache:
+            return [item.service_id for item in mgr_inst._prefetched_objects_cache["appointment_services"]]
         if hasattr(value, "__iter__") and not hasattr(value, "values_list"):
             return [getattr(item, "service_id", None) for item in value]
+        if hasattr(value, "all"):
+            return [getattr(item, "service_id", None) for item in value.all()]
         return []
 
     def to_internal_value(self, data):
@@ -544,12 +561,14 @@ class AppointmentSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSeriali
         return obj.barber.email
 
     def _get_appointment_services_ordered(self, obj):
-        """Возвращает список AppointmentService по порядку position (всегда из БД при необходимости)."""
+        """Возвращает список AppointmentService по порядку position."""
+        if hasattr(obj, "_prefetched_objects_cache") and "appointment_services" in obj._prefetched_objects_cache:
+            return list(obj._prefetched_objects_cache["appointment_services"])
         rel = getattr(obj, "appointment_services", None)
         if rel is None:
             return []
-        if hasattr(rel, "order_by"):
-            return list(rel.order_by("position").select_related("service", "service__category"))
+        if hasattr(rel, "all"):
+            return list(rel.all())
         return list(rel) if hasattr(rel, "__iter__") else []
 
     def get_services_names(self, obj):
@@ -698,11 +717,24 @@ class AppointmentSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSeriali
         price = attrs.get("price", None)
         discount = attrs.get("discount", None)
 
-        # если цена не передана — суммируем цены услуг
-        if price is None and services:
-            total_price = sum((s.price or 0) for s in services)
-            attrs["price"] = total_price
-            price = total_price
+        # Если цена не передана в запросе
+        if price is None:
+            if not self.instance:
+                if services:
+                    base_price = sum((s.price or Decimal("0.00")) for s in services)
+                    disc = Decimal(str(discount or "0.00")) if discount is not None else Decimal("0.00")
+                    if disc > 0:
+                        attrs["price"] = (base_price * (Decimal("1") - disc / Decimal("100"))).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+                    else:
+                        attrs["price"] = base_price
+            else:
+                if "appointment_services" in attrs or "services" in attrs or "discount" in attrs:
+                    disc = Decimal(str(discount if discount is not None else getattr(self.instance, "discount", Decimal("0.00")) or "0.00"))
+                    base_price = sum((s.price or Decimal("0.00")) for s in services)
+                    if disc > 0:
+                        attrs["price"] = (base_price * (Decimal("1") - disc / Decimal("100"))).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+                    else:
+                        attrs["price"] = base_price
 
         # скидка: 0–100
         if discount is not None:

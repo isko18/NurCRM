@@ -239,6 +239,34 @@ def _get_period(request) -> Period:
     start, end = _parse_bounds(raw_from, raw_to, param_hint="period")
 
     if start and end:
+        user = getattr(request, "user", None)
+        company = _get_company(user) if user else None
+        if company:
+            cur_first = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+            if cur_first.month == 12:
+                cur_nxt = cur_first.replace(year=cur_first.year + 1, month=1)
+            else:
+                cur_nxt = cur_first.replace(month=cur_first.month + 1)
+
+            if start < cur_first:
+                Sale, _ = get_sale_models()
+                if Sale is not None:
+                    dt_field = "paid_at" if _model_has_field(Sale, "paid_at") else "created_at"
+                    paid_val = _choice_value(Sale, "Status", "PAID", "paid")
+                    has_in_req = Sale.objects.filter(
+                        company=company,
+                        status=paid_val,
+                        **{f"{dt_field}__gte": start, f"{dt_field}__lt": end},
+                    ).exists()
+                    if not has_in_req:
+                        has_in_cur = Sale.objects.filter(
+                            company=company,
+                            status=paid_val,
+                            **{f"{dt_field}__gte": cur_first, f"{dt_field}__lt": cur_nxt},
+                        ).exists()
+                        if has_in_cur:
+                            return Period(start=cur_first, end=cur_nxt)
+
         return Period(start=start, end=end)
 
     # период не задан (или задана лишь одна из границ) → текущий месяц
@@ -688,6 +716,8 @@ class AnalyticsView(APIView):
         clients = 0
         daily = []
         top_products = []
+        returns_count = 0
+        returns_amount = Z_MONEY
 
         cogs = None
         gross_profit = None
@@ -754,13 +784,14 @@ class AnalyticsView(APIView):
                 else:
                     qs = qs.filter(branch=branch)
 
+            # Частичный возврат уменьшает total чека, но переводит его из PAID
+            # в PARTIALLY_RETURNED. Такой чек всё ещё является продажей на
+            # оставшуюся сумму и не должен пропадать из отчёта.
             paid_value = _choice_value(Sale, "Status", "PAID", "paid")
-            # A partial return changes the sale status, but its remaining
-            # amount is still earned revenue and must remain in analytics.
-            partially_returned_value = _choice_value(
+            partial_returned_value = _choice_value(
                 Sale, "Status", "PARTIALLY_RETURNED", "partially_returned"
             )
-            qs = qs.filter(status__in=[paid_value, partially_returned_value])
+            qs = qs.filter(status__in=(paid_value, partial_returned_value))
 
             dt_field = "paid_at" if _model_has_field(Sale, "paid_at") else "created_at"
             qs = qs.filter(**{f"{dt_field}__gte": period.start, f"{dt_field}__lt": period.end})
@@ -888,12 +919,42 @@ class AnalyticsView(APIView):
                     for r in item_rows
                 ]
 
+            # Полные возвраты переводят исходный чек в CANCELED и поэтому не
+            # входят в выручку. Показываем их отдельной строкой документов по
+            # дате самого возврата, а не по дате исходной продажи.
+            try:
+                SaleReturn = apps.get_model("main.SaleReturn")
+                returns_qs = SaleReturn.objects.filter(
+                    company=company,
+                    created_at__gte=period.start,
+                    created_at__lt=period.end,
+                )
+                if branch is not None and _model_has_field(Sale, "branch"):
+                    branch_filter = Q(sale__branch=branch)
+                    if self._include_global(request):
+                        branch_filter |= Q(sale__branch__isnull=True)
+                    returns_qs = returns_qs.filter(branch_filter)
+                returns_agg = returns_qs.aggregate(
+                    count=Count("id"),
+                    amount=Coalesce(
+                        Sum("returned_amount"),
+                        Value(Z_MONEY, output_field=MONEY_FIELD),
+                        output_field=MONEY_FIELD,
+                    ),
+                )
+                returns_count = returns_agg["count"] or 0
+                returns_amount = returns_agg["amount"] or Z_MONEY
+            except Exception:
+                # Аналитика остаётся доступна в старых инсталляциях без модели
+                # возврата; в актуальной схеме этот блок всегда отрабатывает.
+                pass
+
         avg_check = _safe_div(_money(revenue), tx)
 
         documents = [
             {"name": "Продажа", "count": tx, "sum": str(_money(revenue)), "stock": None},
             {"name": "Закупка", "count": 0, "sum": "0.00", "stock": None},
-            {"name": "Возврат продажи", "count": 0, "sum": "0.00", "stock": None},
+            {"name": "Возврат продажи", "count": returns_count, "sum": str(_money(returns_amount)), "stock": None},
             {"name": "Возврат закупки", "count": 0, "sum": "0.00", "stock": None},
         ]
 
@@ -3101,6 +3162,11 @@ class AnalyticsView(APIView):
                 | Q(consultant_commission_amount=Decimal("0.00"))
                 | Q(consultant_commission_amount__isnull=True)
             )
+            eligible_agg = sq_cashier_eligible.aggregate(
+                total_sum=Coalesce(Sum("total"), Value(Z_MONEY, output_field=MONEY_FIELD), output_field=MONEY_FIELD),
+            )
+            employee_sales_period = eligible_agg["total_sum"] or Z_MONEY
+
             monthly_base_salary = prof.monthly_base_salary if prof else Z_MONEY
             sales_percent = prof.sales_percent if prof else Z_MONEY
             pay_scheme = prof.pay_scheme if prof else MarketSaleEmployeePayProfile.PayScheme.SALARY
@@ -3109,43 +3175,10 @@ class AnalyticsView(APIView):
             base_part = ((monthly_base_salary or Z_MONEY) * Decimal(days) / Decimal("30")).quantize(Decimal("0.01"))
 
             pct = (sales_percent or Z_MONEY) / Decimal("100")
-            percent_enabled = pay_scheme in (
-                MarketSaleEmployeePayProfile.PayScheme.PERCENT,
-                MarketSaleEmployeePayProfile.PayScheme.SALARY_PLUS_PERCENT,
-            )
-
-            # Процент считается с каждой продажи отдельно (с округлением до копеек),
-            # затем суммируется — а не один раз от общей суммы за период.
-            sales_breakdown = []
-            employee_sales_period = Z_MONEY
-            cashier_bonus = Z_MONEY
-            for s in sq_cashier_eligible.values("id", "total", dt_field).order_by(dt_field):
-                s_total = s["total"] or Z_MONEY
-                s_comm = (s_total * pct).quantize(Decimal("0.01")) if percent_enabled else Z_MONEY
-                employee_sales_period += s_total
-                cashier_bonus += s_comm
-                sales_breakdown.append(
-                    {
-                        "sale_id": str(s["id"]),
-                        "date": s[dt_field].isoformat() if s[dt_field] else None,
-                        "role": "cashier",
-                        "sale_total": str(_money(s_total)),
-                        "percent": str(sales_percent or Z_MONEY) if percent_enabled else "0.00",
-                        "commission": str(_money(s_comm)),
-                    }
-                )
-            for s in sq_consultant.values("id", "total", "consultant_commission_percent", "consultant_commission_amount", dt_field):
-                sales_breakdown.append(
-                    {
-                        "sale_id": str(s["id"]),
-                        "date": s[dt_field].isoformat() if s[dt_field] else None,
-                        "role": "consultant",
-                        "sale_total": str(_money(s["total"] or Z_MONEY)),
-                        "percent": str(s["consultant_commission_percent"] or Z_MONEY),
-                        "commission": str(_money(s["consultant_commission_amount"] or Z_MONEY)),
-                    }
-                )
-            sales_breakdown.sort(key=lambda x: x["date"] or "")
+            if pay_scheme in (MarketSaleEmployeePayProfile.PayScheme.PERCENT, MarketSaleEmployeePayProfile.PayScheme.SALARY_PLUS_PERCENT):
+                cashier_bonus = (employee_sales_period * pct).quantize(Decimal("0.01"))
+            else:
+                cashier_bonus = Z_MONEY
 
             percent_bonus = (cashier_bonus + consultant_commission_period).quantize(Decimal("0.01"))
 
@@ -3176,7 +3209,6 @@ class AnalyticsView(APIView):
                     "sales_count": cashier_sales_count,
                     "cashier_sales_count": cashier_sales_count,
                     "consultant_sales_count": consultant_sales_count,
-                    "sales": sales_breakdown,
                 }
             )
 
