@@ -186,3 +186,57 @@ class ServiceTests(KassaBase):
         }, format="json")
         self.api.patch(f"/api/main/work-orders/{r.data['id']}/", {"status": "canceled"}, format="json")
         self.assertEqual(self.shift.calc_live_totals(refresh=True)["expected_cash"], Decimal("1000.00"))
+
+
+class RentalTests(KassaBase):
+    def setUp(self):
+        super().setUp()
+        self.dress = Product.objects.create(company=self.company, name="Платье", price=Decimal("3000"), quantity=0)
+        self.m = ProductVariant.objects.create(company=self.company, product=self.dress, size="M", quantity=Decimal("2"))
+        self.dress.quantity = Decimal("2")
+        self.dress.save()
+
+    def _rent(self, **extra):
+        today = timezone.localdate()
+        body = {"client": str(self.client_obj.id), "items": [{"variant": str(self.m.id)}],
+                "date_from": today.isoformat(), "date_to": (today + timedelta(days=2)).isoformat(),
+                "tariff": "сутки", "deposit_type": "money", "deposit_amount": "5000.00"}
+        body.update(extra)
+        r = self.api.post("/api/rentals/", body, format="json")
+        self.assertEqual(r.status_code, 201, r.data)
+        return r.data
+
+    def test_rent_and_return_ok(self):
+        rent = self._rent()
+        self.m.refresh_from_db()
+        self.assertEqual(self.m.quantity, Decimal("1"))
+        self.assertEqual(self.shift.calc_live_totals(refresh=True)["expected_cash"], Decimal("6000.00"))
+        self.assertEqual(len(self.api.get("/api/rentals/?status=active").data), 1)
+
+        r = self.api.post(f"/api/rentals/{rent['id']}/return/", {"condition": "ok"}, format="json")
+        self.assertEqual(r.status_code, 200, r.data)
+        self.assertEqual((r.data["status"], r.data["deposit_refunded"]), ("returned", "5000.00"))
+        self.m.refresh_from_db()
+        self.assertEqual(self.m.quantity, Decimal("2"))
+        self.assertEqual(self.shift.calc_live_totals(refresh=True)["expected_cash"], Decimal("1000.00"))
+        self.assertTrue(self.api.post(f"/api/rentals/{rent['id']}/return/", {}, format="json").data["replayed"])
+
+    def test_damaged_penalty_withheld_from_deposit(self):
+        rent = self._rent()
+        r = self.api.post(f"/api/rentals/{rent['id']}/return/", {"condition": "damaged", "penalty": "1500"},
+                          format="json")
+        self.assertEqual(r.status_code, 200, r.data)
+        self.assertEqual((r.data["deposit_withheld"], r.data["deposit_refunded"]), ("1500.00", "3500.00"))
+        sale = Sale.objects.get(pk=r.data["penalty_sale"])
+        self.assertEqual({p.method: p.amount for p in sale.payments.all()}, {"offset": Decimal("1500.00")})
+        # в ящике остались 1000 + 1500 удержанного штрафа
+        self.assertEqual(self.shift.calc_live_totals(refresh=True)["expected_cash"], Decimal("2500.00"))
+
+    def test_overdue_filter_and_document_deposit(self):
+        past = timezone.localdate() - timedelta(days=5)
+        self._rent(deposit_type="document", deposit_document="паспорт AN123",
+                   date_from=past.isoformat(), date_to=(past + timedelta(days=1)).isoformat())
+        rows = self.api.get("/api/rentals/?status=overdue").data
+        self.assertEqual(len(rows), 1)
+        self.assertTrue(rows[0]["overdue"])
+        self.assertEqual(rows[0]["deposit_amount"], "0.00")

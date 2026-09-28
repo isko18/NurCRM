@@ -6486,3 +6486,57 @@ class SaleExchange(models.Model):
         ]
         verbose_name = "Обмен"
         verbose_name_plural = "Обмены"
+
+
+class Rental(models.Model):
+    """Прокат вещей с залогом (деньги или документ)."""
+
+    class Status(models.TextChoices):
+        ACTIVE = "active", "Выдан"
+        RETURNED = "returned", "Возвращён"
+
+    class DepositType(models.TextChoices):
+        MONEY = "money", "Деньги"
+        DOCUMENT = "document", "Документ"
+
+    class Condition(models.TextChoices):
+        OK = "ok", "Без повреждений"
+        DAMAGED = "damaged", "Повреждено"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    company = models.ForeignKey(Company, on_delete=models.CASCADE, related_name="rentals")
+    branch = models.ForeignKey(Branch, on_delete=models.SET_NULL, null=True, blank=True, related_name="+")
+    number = models.PositiveIntegerField()
+    client = models.ForeignKey(Client, on_delete=models.PROTECT, related_name="rentals")
+    status = models.CharField(max_length=16, choices=Status.choices, default=Status.ACTIVE)
+    date_from = models.DateField()
+    date_to = models.DateField()
+    tariff = models.CharField(max_length=255, blank=True, default="")
+    deposit_type = models.CharField(max_length=16, choices=DepositType.choices, default=DepositType.MONEY)
+    deposit_amount = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal("0.00"))
+    deposit_method = models.CharField(max_length=32, blank=True, default="cash")
+    deposit_document = models.CharField(max_length=255, blank=True, default="")
+    condition = models.CharField(max_length=16, choices=Condition.choices, blank=True, default="")
+    penalty = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal("0.00"))
+    penalty_sale = models.ForeignKey(Sale, on_delete=models.SET_NULL, null=True, blank=True, related_name="+")
+    note = models.CharField(max_length=500, blank=True, default="")
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True, related_name="+"
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    returned_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ("-created_at",)
+        constraints = [models.UniqueConstraint(fields=["company", "number"], name="uniq_rental_number")]
+        indexes = [models.Index(fields=["company", "status", "date_to"])]
+        verbose_name = "Прокат"
+        verbose_name_plural = "Прокаты"
+
+
+class RentalItem(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    rental = models.ForeignKey(Rental, on_delete=models.CASCADE, related_name="items")
+    product = models.ForeignKey(Product, on_delete=models.PROTECT, related_name="+")
+    variant = models.ForeignKey(ProductVariant, on_delete=models.PROTECT, null=True, blank=True, related_name="+")
+    quantity = models.DecimalField(max_digits=12, decimal_places=3, default=Decimal("1"))

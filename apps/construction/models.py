@@ -833,6 +833,7 @@ class CashFlow(models.Model):
         SHIFT_DRAWER_OUTFLOW = "shift_drawer_outflow", "Расход из ящика смены"
         SHIFT_DRAWER_INFLOW = "shift_drawer_inflow", "Внесение в ящик смены"
         WORK_ORDER_PREPAYMENT = "work_order_prepayment", "Предоплата заказ-наряда"
+        RENTAL_DEPOSIT = "rental_deposit", "Залог за прокат"
         POS_SALE_RETURN = "pos_sale_return", "Возврат продажи"
         CASHFLOW_CANCEL = "cashflow_cancel", "Отмена движения"
         MANUAL = "manual", "Ручная операция"
