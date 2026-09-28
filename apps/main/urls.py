@@ -1,6 +1,14 @@
 from django.urls import path
 from .views import *
 from .pos_views import *
+from .kassa_views import (
+    ClientBonusAPIView,
+    ClientBonusHistoryAPIView,
+    ClientDebtorsAPIView,
+    ClientPayDebtAPIView,
+    PosQuickCheckoutAPIView,
+    SaleReturnListAPIView,
+)
 from .analytics_market import *
 from .analytics_dashboard import *
 from .document import SaleReceiptAPIView, SaleInvoiceAPIView
@@ -217,6 +225,10 @@ urlpatterns = [
 
     # ===== extra =====
     path("clients/with-debts/", ClientWithDebtsListAPIView.as_view(), name="clients-with-debts"),
+    path("clients/debtors/", ClientDebtorsAPIView.as_view(), name="clients-debtors"),
+    path("clients/<uuid:pk>/pay-debt/", ClientPayDebtAPIView.as_view(), name="client-pay-debt"),
+    path("clients/<uuid:pk>/bonus/", ClientBonusAPIView.as_view(), name="client-bonus"),
+    path("clients/<uuid:pk>/bonus/history/", ClientBonusHistoryAPIView.as_view(), name="client-bonus-history"),
     path(
         "clients/<uuid:client_id>/reconciliation/",
         ClientReconciliationClassicAPIView.as_view(),
@@ -230,6 +242,8 @@ urlpatterns = [
     ),
     
     path("pos/sales/", SaleListAPIView.as_view(), name="pos-sale-list"),
+    path("pos/checkout/", PosQuickCheckoutAPIView.as_view(), name="pos-quick-checkout"),
+    path("pos/returns/", SaleReturnListAPIView.as_view(), name="pos-return-list"),
     path("pos/sale-consultants/", SaleConsultantsAPIView.as_view(), name="pos-sale-consultants"),
     path("pos/cashier-settings/", MarketCashierSettingsAPIView.as_view(), name="pos-cashier-settings"),
     path("pos/cashier-settings/verify-delete-code/", VerifyDeleteCodeAPIView.as_view(), name="pos-verify-delete-code"),

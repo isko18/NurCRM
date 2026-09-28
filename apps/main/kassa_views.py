@@ -1,0 +1,716 @@
+"""
+Эндпоинты для кассы NurMarket (BACKEND_API.md):
+
+    POST /api/main/pos/checkout/                 — продажа одним запросом (Idempotency-Key)
+    GET  /api/main/pos/returns/                  — список возвратов
+    GET  /api/main/clients/debtors/              — сводка по должникам
+    POST /api/main/clients/{id}/pay-debt/        — погашение долга клиента одной суммой
+    POST /api/main/clients/{id}/bonus/           — начислить/списать бонусы
+    GET  /api/main/clients/{id}/bonus/history/   — история бонусов
+"""
+import uuid
+from collections import defaultdict
+from decimal import Decimal
+
+from django.db import IntegrityError, transaction
+from django.db.models import DecimalField, OuterRef, Subquery, Sum, Value
+from django.db.models.functions import Coalesce
+from django.shortcuts import get_object_or_404
+from rest_framework import permissions, serializers, status
+from rest_framework.exceptions import ValidationError
+from rest_framework.response import Response
+from rest_framework.views import APIView
+
+from apps.main.models import (
+    Cart,
+    CartItem,
+    Client,
+    ClientBonusTransaction,
+    ClientDeal,
+    DealInstallment,
+    Product,
+    ProductPackage,
+    Sale,
+    SaleReturn,
+)
+from apps.main.pos_serializers import MoneyField, QtyField, _is_owner_like
+from apps.main.pos_utils import money, qty3
+from apps.main.views import CompanyBranchRestrictedMixin, _filter_clients_visible_for_user
+
+Q2 = Decimal("0.01")
+ZERO = Decimal("0.00")
+
+
+def _idempotency_key(request, required=True):
+    key = (request.headers.get("Idempotency-Key") or request.data.get("idempotency_key") or "").strip()
+    if not key and required:
+        raise ValidationError({"Idempotency-Key": "Заголовок Idempotency-Key обязателен."})
+    if len(key) > 128:
+        raise ValidationError({"Idempotency-Key": "Не длиннее 128 символов."})
+    return key or None
+
+
+def _company(request):
+    company = getattr(request.user, "owned_company", None) or getattr(request.user, "company", None)
+    if company is None:
+        raise ValidationError({"detail": "Пользователь не привязан к компании."})
+    return company
+
+
+# ======================================================================
+# Продажа одним запросом
+# ======================================================================
+
+class QuickCheckoutItemSerializer(serializers.Serializer):
+    custom = serializers.BooleanField(required=False, default=False)
+    product = serializers.UUIDField(required=False, allow_null=True)
+    sale_package = serializers.UUIDField(required=False, allow_null=True)
+    name = serializers.CharField(required=False, allow_blank=True, max_length=255)
+    qty = QtyField()
+    price = MoneyField(required=False, allow_null=True)
+    discount = MoneyField(required=False, allow_null=True, default=ZERO)
+
+    def validate(self, attrs):
+        if attrs["qty"] <= 0:
+            raise serializers.ValidationError({"qty": "Количество должно быть больше нуля."})
+        if (attrs.get("discount") or ZERO) < 0:
+            raise serializers.ValidationError({"discount": "Скидка не может быть отрицательной."})
+        if attrs.get("custom"):
+            if not (attrs.get("name") or "").strip():
+                raise serializers.ValidationError({"name": "Укажите название позиции."})
+            if attrs.get("price") is None or attrs["price"] < 0:
+                raise serializers.ValidationError({"price": "Укажите цену позиции."})
+        elif not attrs.get("product"):
+            raise serializers.ValidationError({"product": "Укажите товар."})
+        return attrs
+
+
+class QuickCheckoutPaymentSerializer(serializers.Serializer):
+    method = serializers.ChoiceField(choices=Sale.PaymentMethod.choices, default=Sale.PaymentMethod.CASH)
+    received = MoneyField(required=False, allow_null=True)
+    cash_amount = MoneyField(required=False, allow_null=True)
+    card_amount = MoneyField(required=False, allow_null=True)
+    card_method = serializers.CharField(required=False, allow_blank=True)
+    payments = serializers.ListField(child=serializers.DictField(), required=False)
+
+
+class QuickCheckoutSerializer(serializers.Serializer):
+    shift = serializers.UUIDField(required=False, allow_null=True)
+    client = serializers.UUIDField(required=False, allow_null=True)
+    items = QuickCheckoutItemSerializer(many=True, allow_empty=False)
+    order_discount_total = MoneyField(required=False, allow_null=True)
+    order_discount_percent = serializers.DecimalField(
+        max_digits=5, decimal_places=2, required=False, allow_null=True, min_value=0, max_value=100
+    )
+    bonus_redeemed = MoneyField(required=False, allow_null=True)
+    payment = QuickCheckoutPaymentSerializer()
+    consultant_id = serializers.UUIDField(required=False, allow_null=True)
+    consultant_commission_enabled = serializers.BooleanField(required=False, default=False)
+    consultant_commission_percent = serializers.DecimalField(
+        max_digits=5, decimal_places=2, required=False, allow_null=True
+    )
+    print_receipt = serializers.BooleanField(required=False, default=False)
+    allow_minus = serializers.BooleanField(required=False, default=False)
+    is_wholesale = serializers.BooleanField(required=False, default=False)
+
+
+def _quick_result(sale: Sale) -> dict:
+    return {
+        "id": str(sale.id),
+        "number": sale.doc_number,
+        "status": sale.status,
+        "subtotal": str(money(sale.subtotal or ZERO)),
+        "discount_total": str(money(sale.discount_total or ZERO)),
+        "bonus_redeemed": str(money(sale.bonus_redeemed or ZERO)),
+        "total": str(money(sale.total or ZERO)),
+        "payment_method": sale.payment_method,
+        "cash_received": str(money(sale.cash_received or ZERO)),
+        "change": str(money(sale.change or ZERO)),
+        "shift": str(sale.shift_id) if sale.shift_id else None,
+        "client": str(sale.client_id) if sale.client_id else None,
+    }
+
+
+def _is_admin_for_discounts(user) -> bool:
+    # как в остальных проверках max_discount_percent
+    return getattr(user, "role", None) in ("owner", "admin")
+
+
+class PosQuickCheckoutAPIView(APIView):
+    """
+    POST /api/main/pos/checkout/
+    Idempotency-Key: <uuid кассы>
+
+    Корзина, позиции, скидки и оплата — одним запросом. Повтор с тем же ключом
+    возвращает уже созданную продажу (200), дубль не создаётся.
+    """
+
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request, *args, **kwargs):
+        from apps.main.pos_views import (
+            SaleCheckoutAPIView,
+            _discount_limit_error,
+            _find_open_shift_for_cashier,
+            _resolve_requested_open_shift,
+        )
+
+        key = _idempotency_key(request)
+        company = _company(request)
+
+        existing = Sale.objects.filter(company=company, idempotency_key=key).first()
+        if existing:
+            return Response({**_quick_result(existing), "replayed": True}, status=status.HTTP_200_OK)
+
+        ser = QuickCheckoutSerializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+        data = ser.validated_data
+        user = request.user
+
+        try:
+            with transaction.atomic():
+                if data.get("shift"):
+                    shift = _resolve_requested_open_shift(company=company, cashier=user, shift_id=data["shift"])
+                    if shift.cashier_id != user.id and not _is_owner_like(user):
+                        raise ValidationError({"shift": "Это не ваша смена."})
+                else:
+                    shift = _find_open_shift_for_cashier(company=company, cashier=user)
+                if shift is None:
+                    raise ValidationError(
+                        {"detail": "Смена не открыта. Сначала откройте смену на кассе, затем завершите продажу."}
+                    )
+
+                cart = Cart.objects.create(
+                    company=company,
+                    user=user,
+                    status=Cart.Status.ACTIVE,
+                    branch=shift.branch,
+                    shift=shift,
+                    is_default=False,
+                    is_wholesale=bool(data.get("is_wholesale")),
+                )
+                max_dp = getattr(company, "max_discount_percent", None)
+                limit_discounts = max_dp is not None and not _is_admin_for_discounts(user)
+                self._add_items(cart, data["items"], limit_discounts, max_dp)
+
+                bonus = money(data.get("bonus_redeemed") or ZERO)
+                self._apply_order_discount(cart, data, bonus, limit_discounts, max_dp)
+
+                client = None
+                if data.get("client"):
+                    client = get_object_or_404(Client, id=data["client"], company=company)
+                if bonus > 0:
+                    if client is None:
+                        raise ValidationError({"bonus_redeemed": "Списать бонусы можно только у клиента."})
+                    if bonus > (client.bonus_balance or ZERO):
+                        raise ValidationError({"bonus_redeemed": "Недостаточно бонусов у клиента."})
+
+                resp = SaleCheckoutAPIView().checkout(request, cart.id, self._checkout_data(data, cart))
+                if resp.status_code >= 400:
+                    transaction.set_rollback(True)
+                    return resp
+
+                sale = Sale.objects.select_for_update().get(pk=resp.data["sale_id"])
+                if bonus > 0:
+                    # Бонусы — отдельное поле: total = subtotal - discount_total - bonus_redeemed
+                    sale.discount_total = money((sale.discount_total or ZERO) - bonus)
+                    sale.bonus_redeemed = bonus
+                    change_bonus(
+                        client=client,
+                        delta=-bonus,
+                        reason=ClientBonusTransaction.Reason.REDEEM,
+                        sale=sale,
+                        user=user,
+                    )
+                sale.idempotency_key = key
+                Sale.objects.filter(pk=sale.pk).update(
+                    idempotency_key=key,
+                    bonus_redeemed=sale.bonus_redeemed,
+                    discount_total=sale.discount_total,
+                )
+        except IntegrityError:
+            existing = Sale.objects.filter(company=company, idempotency_key=key).first()
+            if existing:
+                return Response({**_quick_result(existing), "replayed": True}, status=status.HTTP_200_OK)
+            raise
+        except ValidationError as e:
+            if isinstance(e.detail, dict) and e.detail.get("_discount_limit"):
+                return Response(_discount_limit_error(max_dp), status=status.HTTP_400_BAD_REQUEST)
+            raise
+
+        sale.refresh_from_db()
+        body = _quick_result(sale)
+        for k in ("cashflows", "receipt_print_path", "ekassa", "payments"):
+            if k in resp.data:
+                body[k] = resp.data[k]
+        return Response(body, status=status.HTTP_201_CREATED)
+
+    # --- helpers ---
+
+    def _add_items(self, cart, items, limit_discounts, max_dp):
+        from apps.main.pos_views import _q2, default_unit_price_for_package
+
+        product_ids = [it["product"] for it in items if not it.get("custom")]
+        products = {p.id: p for p in Product.objects.filter(company_id=cart.company_id, id__in=product_ids)}
+        for idx, it in enumerate(items):
+            qty = qty3(it["qty"])
+            discount = money(it.get("discount") or ZERO)
+            if it.get("custom"):
+                price = _q2(it["price"])
+                if discount > price * qty:
+                    raise ValidationError({"items": {idx: "Скидка больше суммы позиции."}})
+                CartItem(
+                    company=cart.company,
+                    branch=cart.branch,
+                    cart=cart,
+                    product=None,
+                    custom_name=it["name"].strip(),
+                    unit_price=price,
+                    quantity=qty,
+                    line_discount=discount,
+                ).save(skip_full_clean=True)
+                continue
+
+            product = products.get(it["product"])
+            if product is None:
+                raise ValidationError({"items": {idx: "Товар не найден."}})
+            pkg = None
+            if it.get("sale_package"):
+                pkg = ProductPackage.objects.filter(
+                    id=it["sale_package"], product_id=product.id, company_id=cart.company_id
+                ).first()
+                if pkg is None:
+                    raise ValidationError({"items": {idx: "Упаковка не найдена."}})
+            default_price = _q2(default_unit_price_for_package(product, pkg))
+            price = _q2(it["price"]) if it.get("price") is not None else default_price
+            base = money(price * qty)
+            if discount > base:
+                raise ValidationError({"items": {idx: "Скидка больше суммы позиции."}})
+            if limit_discounts and discount > money(base * Decimal(str(max_dp)) / Decimal("100")):
+                raise ValidationError({"_discount_limit": True})
+            if discount <= 0:
+                min_price = _q2(Decimal(str(getattr(product, "purchase_price", None) or 0)))
+                if pkg:
+                    ipp = Decimal(str(pkg.quantity_in_package or 0))
+                    min_price = _q2(min_price / ipp) if ipp > 0 else min_price
+                if price < min_price:
+                    raise ValidationError(
+                        {"items": {idx: f"Цена продажи не может быть ниже закупочной ({min_price})."}}
+                    )
+            CartItem(
+                company=cart.company,
+                branch=cart.branch,
+                cart=cart,
+                product=product,
+                sale_package=pkg,
+                quantity=qty,
+                unit_price=price,
+                line_discount=discount,
+                price_manually_edited=price != default_price,
+            ).save(skip_full_clean=True)
+        cart.recalc()
+
+    def _apply_order_discount(self, cart, data, bonus, limit_discounts, max_dp):
+        from apps.main.pos_views import _cart_line_discounts_total, _order_discount_over_limit
+
+        pct = data.get("order_discount_percent")
+        total = money(data.get("order_discount_total") or ZERO)
+        if pct is not None and pct > 0:
+            if limit_discounts and Decimal(str(pct)) > Decimal(str(max_dp)):
+                raise ValidationError({"_discount_limit": True})
+            base = (cart.subtotal or ZERO) - _cart_line_discounts_total(cart)
+            total = money(max(base, ZERO) * Decimal(str(pct)) / Decimal("100"))
+        elif total > 0 and limit_discounts and _order_discount_over_limit(cart, total, max_dp):
+            raise ValidationError({"_discount_limit": True})
+
+        combined = money(total + bonus)
+        if combined > 0:
+            cart.order_discount_percent = None
+            cart.order_discount_total = combined
+            cart.save(update_fields=["order_discount_total", "order_discount_percent", "updated_at"])
+            cart.recalc()
+            applied = (cart.discount_total or ZERO) - _cart_line_discounts_total(cart)
+            if money(applied) < combined:
+                raise ValidationError({"order_discount_total": "Скидка и бонусы больше суммы чека."})
+
+    def _checkout_data(self, data, cart):
+        pay = data["payment"]
+        out = {
+            "print_receipt": data.get("print_receipt", False),
+            "client_id": str(data["client"]) if data.get("client") else None,
+            "allow_minus": data.get("allow_minus", False),
+            "consultant_id": str(data["consultant_id"]) if data.get("consultant_id") else None,
+            "consultant_commission_enabled": data.get("consultant_commission_enabled", False),
+            "consultant_commission_percent": data.get("consultant_commission_percent"),
+        }
+        if pay.get("payments"):
+            out["payments"] = pay["payments"]
+            if pay.get("received") is not None:
+                out["cash_received"] = pay["received"]
+            return out
+        out["payment_method"] = pay["method"]
+        if pay["method"] == Sale.PaymentMethod.MIXED:
+            out["cash_amount"] = pay.get("cash_amount")
+            out["card_amount"] = pay.get("card_amount")
+            if pay.get("card_method"):
+                out["card_method"] = pay["card_method"]
+            if pay.get("received") is not None:
+                out["cash_received"] = pay["received"]
+        elif pay["method"] == Sale.PaymentMethod.CASH:
+            cart.recalc()
+            out["cash_received"] = pay["received"] if pay.get("received") is not None else cart.total
+        elif pay.get("received") is not None:
+            # для долга received — предоплата наличными
+            out["cash_received"] = pay["received"]
+        return out
+
+
+# ======================================================================
+# Бонусы
+# ======================================================================
+
+def change_bonus(*, client, delta, reason, sale=None, user=None, note="", idempotency_key=None):
+    """Меняет баланс бонусов клиента под блокировкой строки. Баланс не уходит в минус."""
+    delta = money(Decimal(str(delta)))
+    with transaction.atomic():
+        locked = Client.objects.select_for_update().get(pk=client.pk)
+        new_balance = money((locked.bonus_balance or ZERO) + delta)
+        if new_balance < 0:
+            raise ValidationError({"delta": "Недостаточно бонусов у клиента."})
+        Client.objects.filter(pk=locked.pk).update(bonus_balance=new_balance)
+        client.bonus_balance = new_balance
+        return ClientBonusTransaction.objects.create(
+            company_id=locked.company_id,
+            client=locked,
+            sale=sale,
+            delta=delta,
+            balance_after=new_balance,
+            reason=reason,
+            note=note[:255],
+            idempotency_key=idempotency_key,
+            user=user if getattr(user, "is_authenticated", False) else None,
+        )
+
+
+class BonusChangeSerializer(serializers.Serializer):
+    delta = MoneyField()
+    reason = serializers.ChoiceField(choices=ClientBonusTransaction.Reason.choices)
+    sale = serializers.UUIDField(required=False, allow_null=True)
+    note = serializers.CharField(required=False, allow_blank=True, max_length=255)
+
+    def validate(self, attrs):
+        delta = attrs["delta"]
+        if delta == 0:
+            raise serializers.ValidationError({"delta": "Изменение не может быть нулевым."})
+        if attrs["reason"] == ClientBonusTransaction.Reason.EARN and delta < 0:
+            raise serializers.ValidationError({"delta": "Начисление — положительное число."})
+        if attrs["reason"] == ClientBonusTransaction.Reason.REDEEM and delta > 0:
+            raise serializers.ValidationError({"delta": "Списание — отрицательное число."})
+        return attrs
+
+
+def _bonus_tx_payload(tx):
+    return {
+        "id": str(tx.id),
+        "delta": str(tx.delta),
+        "balance_after": str(tx.balance_after),
+        "reason": tx.reason,
+        "sale": str(tx.sale_id) if tx.sale_id else None,
+        "note": tx.note,
+        "user": str(tx.user_id) if tx.user_id else None,
+        "created_at": tx.created_at.isoformat() if tx.created_at else None,
+    }
+
+
+class _ClientScopedMixin(CompanyBranchRestrictedMixin):
+    def _client(self, request, pk, *, for_update=False):
+        qs = self._filter_qs_company_branch(Client.objects.all())
+        qs = _filter_clients_visible_for_user(qs, request.user)
+        if for_update:
+            qs = qs.select_for_update()
+        return get_object_or_404(qs, pk=pk)
+
+
+class ClientBonusAPIView(_ClientScopedMixin, APIView):
+    """POST /api/main/clients/{id}/bonus/ {"delta": "-100.00", "sale": "…", "reason": "redeem"}"""
+
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request, pk, *args, **kwargs):
+        client = self._client(request, pk)
+        ser = BonusChangeSerializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+        data = ser.validated_data
+        if data["reason"] == ClientBonusTransaction.Reason.MANUAL and not _is_owner_like(request.user):
+            return Response({"detail": "Ручная корректировка — только владелец."}, status=status.HTTP_403_FORBIDDEN)
+        sale = None
+        if data.get("sale"):
+            sale = get_object_or_404(Sale, pk=data["sale"], company_id=client.company_id)
+        key = _idempotency_key(request, required=False)
+        if key:
+            prior = ClientBonusTransaction.objects.filter(company_id=client.company_id, idempotency_key=key).first()
+            if prior:
+                return Response({"bonus_balance": str(prior.balance_after), "transaction": _bonus_tx_payload(prior)})
+        try:
+            tx = change_bonus(
+                client=client,
+                delta=data["delta"],
+                reason=data["reason"],
+                sale=sale,
+                user=request.user,
+                note=data.get("note") or "",
+                idempotency_key=key,
+            )
+        except IntegrityError:
+            prior = ClientBonusTransaction.objects.get(company_id=client.company_id, idempotency_key=key)
+            return Response({"bonus_balance": str(prior.balance_after), "transaction": _bonus_tx_payload(prior)})
+        return Response(
+            {"bonus_balance": str(tx.balance_after), "transaction": _bonus_tx_payload(tx)},
+            status=status.HTTP_201_CREATED,
+        )
+
+
+class ClientBonusHistoryAPIView(_ClientScopedMixin, APIView):
+    """GET /api/main/clients/{id}/bonus/history/"""
+
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request, pk, *args, **kwargs):
+        client = self._client(request, pk)
+        txs = ClientBonusTransaction.objects.filter(client=client).order_by("-created_at")[:500]
+        return Response(
+            {"bonus_balance": str(client.bonus_balance), "results": [_bonus_tx_payload(t) for t in txs]}
+        )
+
+
+# ======================================================================
+# Должники и погашение долга
+# ======================================================================
+
+def _open_debts(company_ids, clients_qs):
+    """
+    Непогашенные долги: (client_id, sale_id|None, remaining, created_at).
+
+    Источник — долговые сделки (ClientDeal kind=debt) с остатком; сделка по чеку,
+    оплаченному целиком через pos/sales/{id}/pay-debt/, не считается. Долговые
+    чеки без сделки считаются как total - cash_received.
+    """
+    money_field = DecimalField(max_digits=14, decimal_places=2)
+    paid_sq = (
+        DealInstallment.objects.filter(deal=OuterRef("pk"))
+        .values("deal")
+        .annotate(s=Sum("paid_amount"))
+        .values("s")
+    )
+    deals = (
+        ClientDeal.objects.filter(
+            company_id__in=company_ids, kind=ClientDeal.Kind.DEBT, client__in=clients_qs
+        )
+        .exclude(sale__status=Sale.Status.PAID)
+        .annotate(paid=Coalesce(Subquery(paid_sq, output_field=money_field), Value(ZERO), output_field=money_field))
+        .values("client_id", "sale_id", "amount", "prepayment", "paid", "created_at")
+    )
+    rows = []
+    for d in deals:
+        remaining = money((d["amount"] or ZERO) - (d["prepayment"] or ZERO) - (d["paid"] or ZERO))
+        if remaining > 0:
+            rows.append((d["client_id"], d["sale_id"], remaining, d["created_at"]))
+
+    orphan_sales = (
+        Sale.objects.filter(
+            company_id__in=company_ids, status=Sale.Status.DEBT, client__in=clients_qs, deals__isnull=True
+        )
+        .values("client_id", "id", "total", "cash_received", "created_at")
+    )
+    for s in orphan_sales:
+        remaining = money((s["total"] or ZERO) - (s["cash_received"] or ZERO))
+        if remaining > 0:
+            rows.append((s["client_id"], s["id"], remaining, s["created_at"]))
+    return rows
+
+
+class ClientDebtorsAPIView(_ClientScopedMixin, APIView):
+    """
+    GET /api/main/clients/debtors/?min_amount=0&ordering=-debt_total
+    → [{client, full_name, phone, debt_total, sales_count, oldest_debt_at}]
+    """
+
+    permission_classes = [permissions.IsAuthenticated]
+    ORDERINGS = {"debt_total", "-debt_total", "oldest_debt_at", "-oldest_debt_at", "full_name", "-full_name"}
+
+    def get(self, request, *args, **kwargs):
+        try:
+            min_amount = Decimal(str(request.query_params.get("min_amount") or "0"))
+        except Exception:
+            raise ValidationError({"min_amount": "Число."})
+        ordering = request.query_params.get("ordering") or "-debt_total"
+        if ordering not in self.ORDERINGS:
+            raise ValidationError({"ordering": f"Допустимо: {', '.join(sorted(self.ORDERINGS))}."})
+
+        clients_qs = _filter_clients_visible_for_user(
+            self._filter_qs_company_branch(Client.objects.all()), request.user
+        )
+        company = _company(request)
+        agg = defaultdict(lambda: {"debt_total": ZERO, "sales_count": 0, "oldest": None})
+        for client_id, _sale_id, remaining, created_at in _open_debts([company.id], clients_qs.values("id")):
+            a = agg[client_id]
+            a["debt_total"] += remaining
+            a["sales_count"] += 1
+            if a["oldest"] is None or created_at < a["oldest"]:
+                a["oldest"] = created_at
+
+        clients = {c.id: c for c in Client.objects.filter(id__in=list(agg)).only("id", "full_name", "phone", "telegram_chat_id")}
+        out = []
+        for cid, a in agg.items():
+            if a["debt_total"] < min_amount or cid not in clients:
+                continue
+            c = clients[cid]
+            out.append({
+                "client": str(cid),
+                "full_name": c.full_name,
+                "phone": c.phone,
+                "telegram_chat_id": c.telegram_chat_id,
+                "debt_total": str(money(a["debt_total"])),
+                "sales_count": a["sales_count"],
+                "oldest_debt_at": a["oldest"].date().isoformat() if a["oldest"] else None,
+            })
+        field = ordering.lstrip("-")
+        keyfn = {
+            "debt_total": lambda r: Decimal(r["debt_total"]),
+            "oldest_debt_at": lambda r: r["oldest_debt_at"] or "",
+            "full_name": lambda r: (r["full_name"] or "").lower(),
+        }[field]
+        out.sort(key=keyfn, reverse=ordering.startswith("-"))
+        return Response(out)
+
+
+class ClientPayDebtSerializer(serializers.Serializer):
+    amount = MoneyField()
+    method = serializers.CharField(required=False, allow_blank=True, default="cash")
+    shift = serializers.UUIDField(required=False, allow_null=True)
+    cashbox = serializers.UUIDField(required=False, allow_null=True)
+    note = serializers.CharField(required=False, allow_blank=True)
+
+
+class ClientPayDebtAPIView(APIView):
+    """
+    POST /api/main/clients/{id}/pay-debt/
+    Idempotency-Key: …
+    {"amount": "5000.00", "method": "cash", "shift": "…"}
+    → {"paid", "left", "applied": [{"sale", "deal", "amount"}]}
+
+    Гасит от старых долгов к новым (по сроку взноса), как clients/{id}/deals/pay-any/.
+    """
+
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request, pk, *args, **kwargs):
+        from apps.main.views import ClientDealsPayAnyAPIView
+
+        key = _idempotency_key(request)
+        ser = ClientPayDebtSerializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+        data = ser.validated_data
+        try:
+            idem = uuid.UUID(key)
+        except ValueError:
+            idem = uuid.uuid5(uuid.NAMESPACE_URL, f"nurcrm-pay-debt:{pk}:{key}")
+
+        payload = {
+            "amount": str(data["amount"]),
+            "idempotency_key": str(idem),
+            "payment_method": data.get("method") or "cash",
+            "note": data.get("note") or "",
+        }
+        if data.get("shift"):
+            payload["shift_id"] = str(data["shift"])
+        if data.get("cashbox"):
+            payload["cashbox_id"] = str(data["cashbox"])
+
+        view = ClientDealsPayAnyAPIView()
+        view.request = request
+        view.args, view.kwargs = (), {"client_id": pk}
+        view.format_kwarg = None
+        with transaction.atomic():
+            resp = view.pay(request, pk, payload)
+            if resp.status_code >= 400:
+                transaction.set_rollback(True)
+                return resp
+            applied = [
+                {
+                    "sale": str(deal.sale_id) if deal.sale_id else None,
+                    "deal": str(deal.id),
+                    "amount": str(money(amount)),
+                }
+                for deal, amount in getattr(view, "applied", [])
+            ]
+        client = get_object_or_404(Client, pk=pk)
+        left = sum(
+            (r[2] for r in _open_debts([client.company_id], Client.objects.filter(pk=pk).values("id"))),
+            ZERO,
+        )
+        return Response(
+            {
+                "paid": resp.data.get("paid_total"),
+                "left": str(money(left)),
+                "applied": applied,
+                "replayed": not applied,
+            },
+            status=status.HTTP_200_OK,
+        )
+
+
+# ======================================================================
+# Возвраты
+# ======================================================================
+
+class SaleReturnListAPIView(CompanyBranchRestrictedMixin, APIView):
+    """
+    GET /api/main/pos/returns/?date_from=2026-09-01&date_to=2026-09-28&shift=…&sale=…
+    """
+
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request, *args, **kwargs):
+        from django.utils.dateparse import parse_date
+
+        company = _company(request)
+        qs = SaleReturn.objects.filter(company=company).select_related("sale", "user")
+        branch = self._auto_branch()
+        if branch is not None:
+            qs = qs.filter(sale__branch=branch)
+        qp = request.query_params
+        for param, lookup in (("date_from", "created_at__date__gte"), ("date_to", "created_at__date__lte")):
+            if qp.get(param):
+                d = parse_date(qp[param])
+                if d is None:
+                    raise ValidationError({param: "Формат YYYY-MM-DD."})
+                qs = qs.filter(**{lookup: d})
+        for param, field in (("shift", "shift_id"), ("sale", "sale_id"), ("cashier", "user_id")):
+            if qp.get(param):
+                try:
+                    qs = qs.filter(**{field: uuid.UUID(qp[param])})
+                except ValueError:
+                    raise ValidationError({param: "Некорректный UUID."})
+        qs = qs.order_by("-created_at")[:1000]
+
+        out = []
+        for r in qs:
+            items = r.returned_items or []
+            out.append({
+                "id": str(r.id),
+                "sale": str(r.sale_id),
+                "sale_number": r.sale.doc_number,
+                "amount": str(money(r.returned_amount or ZERO)),
+                "is_full": r.is_full,
+                "is_defect": r.is_defect,
+                "items": [
+                    {"product": i.get("product"), "name": i.get("name"), "qty": i.get("qty"), "amount": i.get("amount")}
+                    for i in items
+                ],
+                "reason": r.reason,
+                "cashier": str(r.user_id) if r.user_id else None,
+                "shift": str(r.shift_id) if r.shift_id else None,
+                "created_at": r.created_at.isoformat() if r.created_at else None,
+            })
+        return Response(out)

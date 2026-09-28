@@ -1,5 +1,6 @@
 from django.urls import path
 from .views import (
+    CompanyAddonListAPIView,
     RegisterAPIView,
     CustomTokenObtainPairView,
     CustomTokenRefreshView,
@@ -29,6 +30,13 @@ from .views import (
     CompanySubscriptionAdminAPIView,
 )
 
+from apps.integrations.views import (
+    ApiKeyListCreateAPIView,
+    ApiKeyRevokeAPIView,
+    WebhookDetailAPIView,
+    WebhookEventsAPIView,
+    WebhookListCreateAPIView,
+)
 from apps.users.scale_views import send_products_to_scale, get_scale_api_token, register_scale
 
 urlpatterns = [
@@ -38,6 +46,11 @@ urlpatterns = [
     path('auth/refresh/', CustomTokenRefreshView.as_view(), name='token_refresh'),
     
     path("scales/token/", get_scale_api_token, name="scale-api-token"),
+    path("api-keys/", ApiKeyListCreateAPIView.as_view(), name="api-key-list"),
+    path("api-keys/<uuid:pk>/", ApiKeyRevokeAPIView.as_view(), name="api-key-revoke"),
+    path("webhooks/", WebhookListCreateAPIView.as_view(), name="webhook-list"),
+    path("webhooks/events/", WebhookEventsAPIView.as_view(), name="webhook-events"),
+    path("webhooks/<uuid:pk>/", WebhookDetailAPIView.as_view(), name="webhook-detail"),
     path("scales/register/", register_scale, name="scale-api-register"),
     
 
@@ -45,6 +58,7 @@ urlpatterns = [
     path('settings/change-password/', ChangePasswordView.as_view(), name='change-password'),
     path('settings/company/', CompanyUpdateAPIView.as_view(), name='company-update'),
     path('company/check-slug/', CompanyCheckSlugAPIView.as_view(), name='company-check-slug'),
+    path('company/addons/', CompanyAddonListAPIView.as_view(), name='company-addons'),
 
     # 👥 Работа с сотрудниками
     path('employees/', EmployeeListAPIView.as_view(), name='employee-list'),

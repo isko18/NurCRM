@@ -219,6 +219,28 @@ def _parse_bounds(raw_from, raw_to, *, param_hint: str):
     return start, end
 
 
+def _mixed_payment_split(sales_qs):
+    """Сумма наличной и безналичной частей смешанных оплат (по строкам SalePayment)."""
+    from apps.main.models import Sale, SalePayment
+
+    rows = (
+        SalePayment.objects.filter(
+            sale__in=sales_qs.filter(payment_method=Sale.PaymentMethod.MIXED).values("id")
+        )
+        .exclude(method=Sale.PaymentMethod.MIXED)
+        .values("method")
+        .annotate(v=Sum("amount"))
+    )
+    cash = Decimal("0.00")
+    card = Decimal("0.00")
+    for r in rows:
+        if r["method"] == Sale.PaymentMethod.CASH:
+            cash += r["v"] or Decimal("0.00")
+        else:
+            card += r["v"] or Decimal("0.00")
+    return {"cash": cash, "card": card}
+
+
 @dataclass
 class Period:
     start: datetime
@@ -874,6 +896,11 @@ class AnalyticsView(APIView):
                     }
                     for r in payment_rows
                 ]
+                mixed_split = _mixed_payment_split(qs)
+                for row in payment_breakdown:
+                    if row["method"] == "mixed":
+                        row["cash"] = str(_money(mixed_split["cash"]))
+                        row["card"] = str(_money(mixed_split["card"]))
 
             if SaleItem is not None and _model_has_field(SaleItem, "sale"):
                 item_qs = SaleItem.objects.filter(sale__in=qs)
@@ -1538,6 +1565,13 @@ class AnalyticsView(APIView):
                         output_field=MONEY_FIELD,
                     )
                 )["v"] or Z_MONEY
+                # наличная часть смешанных оплат тоже лежит в ящике
+                cash_in_box = Decimal(cash_in_box) + _mixed_payment_split(qs)["cash"]
+                for row in pay_detail:
+                    if row["method"] == "mixed":
+                        split = _mixed_payment_split(qs)
+                        row["cash"] = str(_money(split["cash"]))
+                        row["card"] = str(_money(split["card"]))
 
             hour_rows = (
                 qs.annotate(h=ExtractHour(dt_field))

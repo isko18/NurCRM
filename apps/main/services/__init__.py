@@ -138,12 +138,33 @@ def checkout_cart(
     SaleItem.objects.bulk_create(sale_items)
 
     changed = []
+    low_stock = []
     for pid, qty_need in consume_by_pid.items():
         p = products[pid]
         if getattr(p, "kind", None) == Product.Kind.SERVICE:
             continue
-        p.quantity = Decimal(str(p.quantity or 0)) - qty_need
+        before = Decimal(str(p.quantity or 0))
+        p.quantity = before - qty_need
         changed.append(p)
+        threshold = getattr(p, "minimum_quantity", None)
+        if threshold is not None and threshold > 0 and before > threshold >= p.quantity:
+            low_stock.append(p)
+    if low_stock:
+        from apps.integrations.events import emit_event
+
+        for p in low_stock:
+            emit_event(
+                p.company_id,
+                "stock.low",
+                {
+                    "product": p.id,
+                    "name": p.name,
+                    "barcode": getattr(p, "barcode", None),
+                    "quantity": p.quantity,
+                    "minimum_quantity": p.minimum_quantity,
+                    "branch": getattr(p, "branch_id", None),
+                },
+            )
     if changed:
         Product.objects.bulk_update(changed, ["quantity"])
         changed_ids = [p.id for p in changed if getattr(p, "id", None)]

@@ -786,6 +786,26 @@ class CashShift(models.Model):
             ]
         )
 
+        from apps.integrations.events import emit_event
+
+        emit_event(
+            self.company_id,
+            "shift.closed",
+            {
+                "shift": self.pk,
+                "cashbox": self.cashbox_id,
+                "cashier": self.cashier_id,
+                "opened_at": self.opened_at,
+                "closed_at": self.closed_at,
+                "sales_count": self.sales_count,
+                "sales_total": self.sales_total,
+                "cash_sales_total": self.cash_sales_total,
+                "noncash_sales_total": self.noncash_sales_total,
+                "expected_cash": self.expected_cash,
+                "closing_cash": self.closing_cash,
+            },
+        )
+
     def __str__(self):
         return f"Смена {self.cashier} / {self.cashbox} ({self.status})"
 
@@ -811,6 +831,7 @@ class CashFlow(models.Model):
         DEFECT_WRITEOFF = "defect_writeoff", "Списание брака"
         PRODUCT_RETURN = "product_return", "Возврат товара"
         SHIFT_DRAWER_OUTFLOW = "shift_drawer_outflow", "Расход из ящика смены"
+        SHIFT_DRAWER_INFLOW = "shift_drawer_inflow", "Внесение в ящик смены"
         POS_SALE_RETURN = "pos_sale_return", "Возврат продажи"
         CASHFLOW_CANCEL = "cashflow_cancel", "Отмена движения"
         MANUAL = "manual", "Ручная операция"
@@ -1001,7 +1022,7 @@ class CashFlow(models.Model):
                 raise ValidationError({"category": "Категория другого филиала (или укажите общую категорию без филиала)."})
 
     def save(self, *args, **kwargs):
-        if self.source_kind == self.SourceKind.SHIFT_DRAWER_OUTFLOW:
+        if self.source_kind in (self.SourceKind.SHIFT_DRAWER_OUTFLOW, self.SourceKind.SHIFT_DRAWER_INFLOW):
             self.affects_shift_drawer = True
 
         if self.cashbox_id:

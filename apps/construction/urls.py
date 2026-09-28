@@ -1,5 +1,6 @@
 from django.urls import path
 from apps.construction.views import (
+    CashShiftReportView,
     CashboxListCreateView,
     CashboxDetailView,
     CashboxBulkDeleteView,
@@ -47,6 +48,7 @@ urlpatterns = [
     path("shifts/open/", CashShiftOpenView.as_view(), name="cashshift-open"),
     path("shifts/<uuid:pk>/", CashShiftDetailView.as_view(), name="cashshift-detail"),
     path("shifts/<uuid:pk>/close/", CashShiftCloseView.as_view(), name="cashshift-close"),
+    path("shifts/<uuid:pk>/report/", CashShiftReportView.as_view(), name="cash-shift-report"),
     path("cash/shifts/<uuid:pk>/sales/", CashShiftSalesListView.as_view(), name="cash-shift-sales"),
 ]
 

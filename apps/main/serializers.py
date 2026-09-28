@@ -2168,11 +2168,12 @@ class ClientSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
             'llc', 'inn', 'okpo', 'score', 'bik', 'address',
             'salesperson', 'salesperson_display',
             'service', 'service_display',
+            'telegram_chat_id', 'bonus_balance',
             'created_at', 'updated_at'
         ]
         read_only_fields = [
             'id', 'company', 'branch', 'created_at', 'updated_at',
-            'salesperson_display', 'service_display'
+            'salesperson_display', 'service_display', 'bonus_balance'
         ]
 
     def __init__(self, *args, **kwargs):

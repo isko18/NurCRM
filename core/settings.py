@@ -125,6 +125,7 @@ INSTALLED_APPS = [
     'apps.ekassa',
     'apps.onec',
     'apps.releases',
+    'apps.integrations',
     # 'apps.crm',
 ]
 
@@ -259,6 +260,7 @@ CLIENT_RELEASE_NOTES = os.getenv("CLIENT_RELEASE_NOTES", "Первый рели�
 REST_FRAMEWORK = {
     'DEFAULT_AUTHENTICATION_CLASSES': (
         'rest_framework_simplejwt.authentication.JWTAuthentication',
+        'apps.integrations.authentication.ApiKeyAuthentication',
     ),
     'DEFAULT_THROTTLE_CLASSES': [
         'rest_framework.throttling.AnonRateThrottle',

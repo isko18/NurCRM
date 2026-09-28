@@ -641,6 +641,17 @@ class CashFlowListCreateView(CompanyBranchScopedMixin, generics.ListCreateAPIVie
         if shift_id:
             qs = qs.filter(shift_id=shift_id)
 
+        # ✅ по источнику: ?source_kind=shift_drawer_inflow&source_id=<id операции кассы>
+        source_kinds = _csv_choices(
+            qp, "source_kind", "source_kinds", CashFlow.SourceKind.values,
+            error="Недопустимое значение source_kind.",
+        )
+        if source_kinds:
+            qs = qs.filter(source_kind__in=source_kinds)
+        source_id = qp.get("source_id")
+        if source_id:
+            qs = qs.filter(source_id=source_id)
+
         # ✅ по кассиру: ?cashier=<uuid>
         cashier_id = qp.get("cashier")
         if cashier_id:
@@ -1112,6 +1123,93 @@ class CashShiftListView(CompanyBranchScopedMixin, generics.ListAPIView):
 
         # Новые смены сверху
         return qs.order_by("-opened_at", "-id")
+
+
+def build_shift_report(shift: CashShift) -> dict:
+    """Сводка смены для владельца/кассы: продажи по способам оплаты, скидки, возвраты, внесения, изъятия."""
+    from apps.main.models import Sale, SalePayment, SaleReturn
+
+    z = Decimal("0.00")
+    q2 = lambda v: str((v or z).quantize(Decimal("0.01")))  # noqa: E731
+
+    totals = shift.calc_live_totals(refresh=True)
+    revenue_statuses = [Sale.Status.PAID, Sale.Status.PARTIALLY_RETURNED]
+    sales = Sale.objects.filter(shift=shift)
+    revenue = sales.filter(status__in=revenue_statuses)
+
+    by_payment = {}
+    for row in (
+        SalePayment.objects.filter(sale__in=revenue.exclude(payment_method=Sale.PaymentMethod.MIXED))
+        .values("method")
+        .annotate(v=Sum("amount"))
+    ):
+        by_payment[row["method"]] = by_payment.get(row["method"], z) + (row["v"] or z)
+    mixed_cash = mixed_card = z
+    for row in (
+        SalePayment.objects.filter(sale__in=revenue.filter(payment_method=Sale.PaymentMethod.MIXED))
+        .values("method")
+        .annotate(v=Sum("amount"))
+    ):
+        if row["method"] == Sale.PaymentMethod.CASH:
+            mixed_cash += row["v"] or z
+        else:
+            mixed_card += row["v"] or z
+    debt = z
+    for row in sales.filter(status=Sale.Status.DEBT).values("total", "cash_received"):
+        debt += max((row["total"] or z) - (row["cash_received"] or z), z)
+
+    returns = SaleReturn.objects.filter(shift=shift).aggregate(s=Sum("returned_amount"), c=Count("id"))
+    drawer = (
+        CashFlow.objects.filter(shift=shift, status=CashFlow.Status.APPROVED, request_kind__isnull=True)
+        .values("source_kind")
+        .annotate(v=Sum("amount"))
+    )
+    drawer = {r["source_kind"]: r["v"] or z for r in drawer}
+
+    expected = totals.get("expected_cash", shift.expected_cash)
+    counted = shift.closing_cash if shift.status == CashShift.Status.CLOSED else None
+    return {
+        "shift": str(shift.id),
+        "status": shift.status,
+        "cashbox": str(shift.cashbox_id),
+        "cashier": str(shift.cashier_id),
+        "opened_at": shift.opened_at.isoformat() if shift.opened_at else None,
+        "closed_at": shift.closed_at.isoformat() if shift.closed_at else None,
+        "opening_cash": q2(shift.opening_cash),
+        "sales_count": totals.get("sales_count", 0),
+        "sales_total": q2(totals.get("sales_total")),
+        "by_payment": {
+            **{k: q2(v) for k, v in sorted(by_payment.items())},
+            "mixed_cash": q2(mixed_cash),
+            "mixed_card": q2(mixed_card),
+            "debt": q2(debt),
+        },
+        "discounts": q2(sales.exclude(status=Sale.Status.CANCELED).aggregate(s=Sum("discount_total"))["s"]),
+        "bonus_redeemed": q2(sales.exclude(status=Sale.Status.CANCELED).aggregate(s=Sum("bonus_redeemed"))["s"]),
+        "returns_total": q2(returns["s"]),
+        "returns_count": returns["c"] or 0,
+        "deposits": q2(drawer.get(CashFlow.SourceKind.SHIFT_DRAWER_INFLOW)),
+        "withdrawals": q2(drawer.get(CashFlow.SourceKind.SHIFT_DRAWER_OUTFLOW)),
+        "income_total": q2(totals.get("income_total")),
+        "expense_total": q2(totals.get("expense_total")),
+        "expected_cash": q2(expected),
+        "counted_cash": q2(counted) if counted is not None else None,
+        "difference": q2(counted - expected) if counted is not None else None,
+    }
+
+
+class CashShiftReportView(CompanyBranchScopedMixin, generics.GenericAPIView):
+    """GET /api/construction/shifts/{id}/report/"""
+
+    def get_queryset(self):
+        qs = self._scoped_queryset(CashShift.objects.select_related("cashbox", "cashier"))
+        user = self.request.user
+        if not _is_owner_like(user):
+            qs = qs.filter(Q(status=CashShift.Status.OPEN) | Q(cashier=user))
+        return qs
+
+    def get(self, request, *args, **kwargs):
+        return Response(build_shift_report(self.get_object()))
 
 
 class CashShiftDetailView(CompanyBranchScopedMixin, generics.RetrieveAPIView):

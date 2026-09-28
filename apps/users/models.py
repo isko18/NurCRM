@@ -201,6 +201,20 @@ class Company(models.Model):
         blank=True
     )
 
+    class MarketSphere(models.TextChoices):
+        GROCERY = "grocery", "Продукты"
+        CLOTHING = "clothing", "Одежда"
+        SERVICES = "services", "Услуги"
+
+    market_sphere = models.CharField(
+        "Вид магазина",
+        max_length=16,
+        choices=MarketSphere.choices,
+        null=True,
+        blank=True,
+        help_text="Под него перестраиваются кассы: каталог, карточка товара, запись, прокат.",
+    )
+
 
     scale_api_token = models.CharField(
         max_length=64,
@@ -925,3 +939,32 @@ class ScaleDevice(models.Model):
         if self.branch:
             return f"{self.company.name} / {self.branch.name} / {self.name}"
         return f"{self.company.name} / {self.name}"
+
+
+class CompanyAddon(models.Model):
+    """Платная функция компании (голос, лояльность и т.п.). Включается администратором платформы."""
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    company = models.ForeignKey(Company, on_delete=models.CASCADE, related_name="addons")
+    code = models.SlugField(max_length=64)
+    active = models.BooleanField(default=True)
+    until = models.DateField(null=True, blank=True, help_text="Пусто — бессрочно")
+    note = models.CharField(max_length=255, blank=True, default="")
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = "Платная функция компании"
+        verbose_name_plural = "Платные функции компаний"
+        constraints = [
+            models.UniqueConstraint(fields=["company", "code"], name="uniq_company_addon_code"),
+        ]
+
+    def is_effective(self, today=None) -> bool:
+        from django.utils import timezone
+
+        today = today or timezone.localdate()
+        return self.active and (self.until is None or self.until >= today)
+
+    def __str__(self):
+        return f"{self.company_id}: {self.code}"

@@ -2212,6 +2212,12 @@ class Sale(models.Model):
 
     status = models.CharField(max_length=32, choices=Status.choices, default=Status.NEW)
     doc_number = models.PositiveIntegerField(null=True, blank=True, db_index=True)
+    bonus_redeemed = models.DecimalField(
+        max_digits=12, decimal_places=2, default=Decimal("0.00"), verbose_name="Оплачено бонусами"
+    )
+    idempotency_key = models.CharField(
+        max_length=128, null=True, blank=True, verbose_name="Ключ идемпотентности кассы"
+    )
 
     subtotal = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal("0.00"))
     discount_total = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal("0.00"))
@@ -2239,6 +2245,14 @@ class Sale(models.Model):
             models.Index(fields=["shift", "created_at"]),
             models.Index(fields=["cashbox", "created_at"]),
             models.Index(fields=["company", "consultant", "paid_at"]),
+            models.Index(fields=["company", "doc_number"]),
+        ]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["company", "idempotency_key"],
+                condition=models.Q(idempotency_key__isnull=False),
+                name="uniq_sale_idempotency_key",
+            )
         ]
 
     def clean(self):
@@ -2366,6 +2380,27 @@ class Sale(models.Model):
             ]
         return []
 
+    def _emit_paid_event(self):
+        from apps.integrations.events import emit_event
+
+        lines = self.payment_lines()
+        emit_event(
+            self.company_id,
+            "sale.paid",
+            {
+                "sale": self.pk,
+                "number": self.doc_number,
+                "total": self.total,
+                "discount_total": self.discount_total,
+                "payment_method": self.payment_method,
+                "payments": [{"method": p.method, "amount": p.amount} for p in lines],
+                "shift": self.shift_id,
+                "cashier": self.user_id,
+                "client": self.client_id,
+                "paid_at": self.paid_at,
+            },
+        )
+
     def mark_paid(
         self,
         payment_method=None,
@@ -2374,6 +2409,11 @@ class Sale(models.Model):
         payments=None,
         skip_ekassa_schedule=False,
     ):
+        if not self.doc_number and self.pk:
+            from apps.main.utils_numbers import ensure_sale_doc_number
+
+            ensure_sale_doc_number(self)
+
         if payments:
             total_paid = sum((p.get("amount") or Decimal("0.00") for p in payments), Decimal("0.00"))
             sale_total = (self.total or Decimal("0.00")).quantize(_Q2, rounding=ROUND_HALF_UP)
@@ -2452,6 +2492,8 @@ class Sale(models.Model):
             self.paid_at = timezone.now()
             self.save(update_fields=["status", "paid_at"])
 
+        self._emit_paid_event()
+
         if skip_ekassa_schedule:
             return
 
@@ -2461,6 +2503,22 @@ class Sale(models.Model):
         from apps.ekassa.sale_bridge import try_fiscalize_pos_sale
 
         schedule_after_commit(try_fiscalize_pos_sale, sale_pk)
+
+
+class SaleDocCounter(models.Model):
+    """Последний выданный номер чека компании (Sale.doc_number). Строку блокируем при выдаче."""
+
+    company = models.OneToOneField(
+        Company,
+        on_delete=models.CASCADE,
+        primary_key=True,
+        related_name="sale_doc_counter",
+    )
+    last_number = models.PositiveIntegerField(default=0)
+
+    class Meta:
+        verbose_name = "Счётчик номеров чеков"
+        verbose_name_plural = "Счётчики номеров чеков"
 
 
 class SalePayment(models.Model):
@@ -2532,6 +2590,16 @@ class SaleReturn(models.Model):
     is_full = models.BooleanField(default=True, verbose_name="Полный возврат")
     items_payload = models.JSONField(null=True, blank=True, verbose_name="Спецификация возврата")
     response_data = models.JSONField(null=True, blank=True, verbose_name="Ответ API")
+    shift = models.ForeignKey(
+        "construction.CashShift",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="sale_returns",
+        verbose_name="Смена возврата",
+    )
+    returned_items = models.JSONField(null=True, blank=True, verbose_name="Возвращённые позиции")
+    reason = models.CharField(max_length=255, blank=True, default="", verbose_name="Причина")
     created_at = models.DateTimeField(auto_now_add=True, verbose_name="Дата возврата")
 
     class Meta:
@@ -3191,6 +3259,11 @@ class Client(models.Model):
     )
     provision_error = models.TextField("Ошибка создания CRM", blank=True, default="")
     provisioned_at = models.DateTimeField("Дата создания CRM", null=True, blank=True)
+
+    telegram_chat_id = models.CharField("Telegram chat id", max_length=64, null=True, blank=True)
+    bonus_balance = models.DecimalField(
+        "Баланс бонусов", max_digits=12, decimal_places=2, default=Decimal("0.00")
+    )
 
     created_at = models.DateTimeField("Создано", auto_now_add=True)
     updated_at = models.DateTimeField("Обновлено", auto_now=True)
@@ -6106,3 +6179,41 @@ class PosPrinterSetting(models.Model):
 
     def __str__(self):
         return f"POS Printer {self.device_key} ({self.company.name})"
+
+
+class ClientBonusTransaction(models.Model):
+    """Движение бонусов клиента. Баланс — Client.bonus_balance (меняется только здесь)."""
+
+    class Reason(models.TextChoices):
+        EARN = "earn", "Начисление"
+        REDEEM = "redeem", "Списание"
+        MANUAL = "manual", "Ручная корректировка"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    company = models.ForeignKey(Company, on_delete=models.CASCADE, related_name="bonus_transactions")
+    client = models.ForeignKey(Client, on_delete=models.CASCADE, related_name="bonus_transactions")
+    sale = models.ForeignKey(
+        Sale, on_delete=models.SET_NULL, null=True, blank=True, related_name="bonus_transactions"
+    )
+    delta = models.DecimalField(max_digits=12, decimal_places=2)
+    balance_after = models.DecimalField(max_digits=12, decimal_places=2)
+    reason = models.CharField(max_length=16, choices=Reason.choices)
+    note = models.CharField(max_length=255, blank=True, default="")
+    idempotency_key = models.CharField(max_length=128, null=True, blank=True)
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True, related_name="+"
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ("-created_at",)
+        indexes = [models.Index(fields=["client", "created_at"])]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["company", "idempotency_key"],
+                condition=models.Q(idempotency_key__isnull=False),
+                name="uniq_bonus_tx_idempotency",
+            )
+        ]
+        verbose_name = "Движение бонусов"
+        verbose_name_plural = "Движения бонусов"

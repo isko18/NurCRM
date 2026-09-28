@@ -2416,6 +2416,28 @@ class SaleStartAPIView(MarketCashierOnlyMixin, CompanyBranchRestrictedMixin, API
         return _pos_multi_cart_response(request, cart, status_code=status.HTTP_201_CREATED)
 
 
+def _cart_line_discounts_total(cart) -> Decimal:
+    return cart.items.aggregate(s=Sum("line_discount"))["s"] or Decimal("0.00")
+
+
+def _order_discount_over_limit(cart, order_discount_total, max_dp) -> bool:
+    """Скидка на чек суммой больше max_dp% от суммы после скидок по строкам."""
+    if max_dp is None:
+        return False
+    cart.recalc()
+    base = (cart.subtotal or Decimal("0.00")) - _cart_line_discounts_total(cart)
+    limit = money(max(base, Decimal("0.00")) * Decimal(str(max_dp)) / Decimal("100"))
+    return Decimal(str(order_discount_total)) > limit
+
+
+def _discount_limit_error(max_dp) -> dict:
+    pct = format(Decimal(str(max_dp)).normalize(), "f")
+    return {
+        "detail": f"Скидка больше {pct}%, нужно разрешение владельца",
+        "max_discount_percent": str(max_dp),
+    }
+
+
 class CartDetailAPIView(MarketCashierOnlyMixin, generics.RetrieveAPIView):
     serializer_class = SaleCartSerializer
     permission_classes = [permissions.IsAuthenticated]
@@ -2438,12 +2460,8 @@ class CartDetailAPIView(MarketCashierOnlyMixin, generics.RetrieveAPIView):
         if max_dp is not None and not is_admin:
             if order_disc_percent is not None and Decimal(str(order_disc_percent)) > max_dp:
                 return Response({"detail": f"Максимальная скидка — {max_dp}%", "max_discount_percent": str(max_dp)}, status=400)
-            if order_disc_total is not None:
-                # We need subtotal to check limit
-                subtotal = cart.total_price + (cart.order_discount_total or 0)
-                limit = subtotal * (max_dp / Decimal("100.0"))
-                if Decimal(str(order_disc_total)) > limit:
-                    return Response({"detail": f"Максимальная скидка — {max_dp}%", "max_discount_percent": str(max_dp)}, status=400)
+            if order_disc_total is not None and _order_discount_over_limit(cart, order_disc_total, max_dp):
+                return Response(_discount_limit_error(max_dp), status=400)
                     
         if order_disc_percent is not None:
             cart.order_discount_percent = _q2(Decimal(str(order_disc_percent)))
@@ -2639,6 +2657,9 @@ class SaleCheckoutAPIView(MarketCashierOnlyMixin, APIView):
     permission_classes = [permissions.IsAuthenticated]
 
     def post(self, request, pk, *args, **kwargs):
+        return self.checkout(request, pk, request.data)
+
+    def checkout(self, request, pk, data):
         with transaction.atomic():
             cart = get_object_or_404(
                 Cart.objects.select_related("company", "branch", "user", "shift"),
@@ -2647,7 +2668,7 @@ class SaleCheckoutAPIView(MarketCashierOnlyMixin, APIView):
                 status=Cart.Status.ACTIVE,
             )
 
-            ser = CheckoutSerializer(data=request.data, context={"request": request, "cart": cart})
+            ser = CheckoutSerializer(data=data, context={"request": request, "cart": cart})
             ser.is_valid(raise_exception=True)
 
             print_receipt = ser.validated_data["print_receipt"]
@@ -3474,8 +3495,17 @@ def _execute_sale_return(
     # Чем деньги фактически отдали: "cash" | "original" (по умолчанию) | способ безнала.
     refund_method = payload.get("refund_method")
 
+    returned_lines = []
     if not partial_items:
         returned_money = sale.total or Decimal("0.00")
+        for item in sale.items.all():
+            returned_lines.append({
+                "sale_item": str(item.id),
+                "product": str(item.product_id) if item.product_id else None,
+                "name": item.name_snapshot,
+                "qty": str(qty3(Decimal(str(item.quantity or 0)))),
+                "amount": str(money((item.unit_price or Decimal("0.00")) * (item.quantity or 0) - (item.line_discount or 0))),
+            })
         if is_agent_sale:
             for item in sale.items.select_related("product", "sale_package"):
                 rq = qty3(Decimal(str(item.quantity or 0)))
@@ -3523,6 +3553,13 @@ def _execute_sale_return(
             item_disc = money(old_disc * (rq / old_q)) if old_q > 0 else Decimal("0.00")
             item_returned_money = money((unit_price * rq) - item_disc)
             total_returned_money += item_returned_money
+            returned_lines.append({
+                "sale_item": str(item.id),
+                "product": str(item.product_id) if item.product_id else None,
+                "name": item.name_snapshot,
+                "qty": str(rq),
+                "amount": str(item_returned_money),
+            })
 
             if is_agent_sale:
                 if rq != rq.to_integral_value():
@@ -3685,23 +3722,45 @@ def _execute_sale_return(
                 if adj:
                     created_flows.append(adj)
 
-    if idempotency_key:
-        from apps.main.models import SaleReturn
-        import json
-        from django.core.serializers.json import DjangoJSONEncoder
-        items_payload_safe = json.loads(json.dumps(partial_items, cls=DjangoJSONEncoder)) if partial_items else None
-        SaleReturn.objects.get_or_create(
-            company=sale.company,
-            idempotency_key=str(idempotency_key),
-            defaults={
-                "sale": sale,
-                "user": user if (user and getattr(user, "is_authenticated", False)) else None,
-                "returned_amount": returned_money,
-                "is_defect": is_defect,
-                "is_full": is_full,
-                "items_payload": items_payload_safe,
-            }
-        )
+    from apps.main.models import SaleReturn
+    import json
+    from django.core.serializers.json import DjangoJSONEncoder
+    items_payload_safe = json.loads(json.dumps(partial_items, cls=DjangoJSONEncoder)) if partial_items else None
+    # Запись о возврате ведём всегда (список возвратов, отчёт смены);
+    # без ключа от кассы — служебный уникальный ключ.
+    ret_key = str(idempotency_key) if idempotency_key else f"auto:{uuid.uuid4()}"
+    sale_return, _ = SaleReturn.objects.get_or_create(
+        company=sale.company,
+        idempotency_key=ret_key,
+        defaults={
+            "sale": sale,
+            "user": user if (user and getattr(user, "is_authenticated", False)) else None,
+            "shift": actual_shift,
+            "returned_amount": returned_money,
+            "is_defect": is_defect,
+            "is_full": is_full,
+            "items_payload": items_payload_safe,
+            "returned_items": returned_lines,
+            "reason": str(payload.get("reason") or "")[:255],
+        }
+    )
+
+    from apps.integrations.events import emit_event
+
+    emit_event(
+        sale.company_id,
+        "sale.returned",
+        {
+            "return": sale_return.pk,
+            "sale": sale.pk,
+            "sale_number": sale.doc_number,
+            "amount": returned_money,
+            "is_full": is_full,
+            "items": returned_lines,
+            "shift": getattr(actual_shift, "pk", None),
+            "cashier": getattr(user, "pk", None),
+        },
+    )
 
     _broadcast_return_realtime(sale, created_flows, actual_shift)
     return debt_adj
@@ -4051,19 +4110,26 @@ class SaleListAPIView(MarketCashierOnlyMixin, CompanyBranchRestrictedMixin, gene
     serializer_class = SaleListSerializer
     queryset = (
         Sale.objects.select_related("user", "consultant")
-        .prefetch_related("items__product")
+        .prefetch_related("items__product", "payments")
         .all()
     )
     filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
     filterset_fields = ("status", "user", "consultant")
     search_fields = ("id",)
-    ordering_fields = ("created_at", "total", "status")
-    ordering = ("-created_at",)
+    ordering_fields = ("created_at", "total", "status", "doc_number")
+    # id — стабильный порядок при равном created_at, иначе страницы пересекаются.
+    ordering = ("-created_at", "-id")
     pagination_class = PosSalesLimitPagination
 
     def get_queryset(self):
         qs = super().get_queryset()
         qs = _apply_sale_date_filters(qs, self.request)
+
+        number = (self.request.query_params.get("number") or "").strip()
+        if number:
+            if not number.isdigit():
+                raise ValidationError({"number": "Номер чека — целое число."})
+            qs = qs.filter(doc_number=int(number))
 
         paid_only = self.request.query_params.get("paid")
         if paid_only in ("1", "true", "True"):

@@ -199,6 +199,23 @@ def apply_product_list_filters(qs, query_params):
     if is_adult is not None:
         qs = qs.filter(is_adult=is_adult)
 
+    # Касса/бот: ?is_service=false&quantity_lte=5
+    is_service = _parse_bool(query_params.get("is_service"))
+    if is_service is True:
+        qs = qs.filter(kind="service")
+    elif is_service is False:
+        qs = qs.exclude(kind="service")
+
+    for param, lookup in (("quantity_lte", "quantity__lte"), ("quantity_gte", "quantity__gte")):
+        raw = query_params.get(param)
+        if raw not in (None, ""):
+            value = _parse_decimal(raw)
+            if value is None:
+                from rest_framework.exceptions import ValidationError
+
+                raise ValidationError({param: "Число."})
+            qs = qs.filter(**{lookup: value})
+
     preset = _normalize_preset(query_params.get("preset"))
     if preset:
         qs = _apply_preset(qs, preset)

@@ -3547,7 +3547,12 @@ class ClientDealsPayAnyAPIView(APIView, CompanyBranchRestrictedMixin):
 
     @transaction.atomic
     def post(self, request, client_id, *args, **kwargs):
-        inp = DealPayAnyInputSerializer(data=request.data)
+        return self.pay(request, client_id, request.data)
+
+    def pay(self, request, client_id, raw_data):
+        """Распределяет оплату; распределение по сделкам кладёт в self.applied [(deal, amount)]."""
+        self.applied = []
+        inp = DealPayAnyInputSerializer(data=raw_data)
         inp.is_valid(raise_exception=True)
         data = inp.validated_data
         amount = Decimal(str(data["amount"])).quantize(Decimal("0.01"))
@@ -3651,6 +3656,7 @@ class ClientDealsPayAnyAPIView(APIView, CompanyBranchRestrictedMixin):
             )
             if deal.id not in affected_ids:
                 affected_ids.append(deal.id)
+            self.applied.append((deal, pay_amount))
             left = (left - pay_amount).quantize(Decimal("0.01"))
 
         fresh_deals = list(

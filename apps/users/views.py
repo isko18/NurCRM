@@ -499,9 +499,44 @@ class FeatureListAPIView(generics.ListAPIView):
 # company
 # =========================
 
-class CompanyDetailAPIView(generics.RetrieveAPIView):
+def _emit_company_updated(company, changed_fields):
+    from apps.integrations.events import emit_event
+
+    if changed_fields:
+        emit_event(
+            company.pk,
+            "company.updated",
+            {
+                "fields": sorted(changed_fields),
+                "market_sphere": company.market_sphere,
+                "name": company.name,
+            },
+        )
+
+
+class CompanyDetailAPIView(generics.RetrieveUpdateAPIView):
+    """
+    GET   /api/users/company/
+    PATCH /api/users/company/  — только владелец (например {"market_sphere": "clothing"})
+    """
+
     serializer_class = CompanySerializer
     permission_classes = [IsAuthenticated]
+    http_method_names = ["get", "patch", "head", "options"]
+
+    def update(self, request, *args, **kwargs):
+        if not _is_owner_like(request.user):
+            raise PermissionDenied("Изменять данные компании может только владелец.")
+        company = self.get_object()
+        ser = CompanyUpdateSerializer(company, data=request.data, partial=True, context={"request": request})
+        ser.is_valid(raise_exception=True)
+        try:
+            with transaction.atomic():
+                ser.save()
+        except IntegrityError:
+            raise SlugConflict()
+        _emit_company_updated(company, set(ser.validated_data))
+        return Response(CompanySerializer(company, context={"request": request}).data)
 
     def get_object(self):
         if getattr(self, "swagger_fake_view", False):
@@ -566,6 +601,21 @@ class CompanyUpdateAPIView(generics.RetrieveUpdateAPIView):
                 serializer.save()
         except IntegrityError:
             raise SlugConflict()
+        _emit_company_updated(serializer.instance, set(serializer.validated_data))
+
+
+class CompanyAddonListAPIView(APIView):
+    """GET /api/users/company/addons/ — платные функции компании."""
+
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, *args, **kwargs):
+        from apps.users.serializers import company_addons_payload
+
+        company = _get_company(request.user)
+        if company is None:
+            raise NotFound("Вы не принадлежите ни к одной компании.")
+        return Response(company_addons_payload(company))
 
 
 class CompanyCheckSlugAPIView(APIView):

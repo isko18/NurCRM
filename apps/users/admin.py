@@ -838,7 +838,7 @@ class CustomRoleAdmin(CompanyScopedFKMixin, admin.ModelAdmin):
     list_display = ("name", "company")
     list_filter = ("company",)
     search_fields = ("name", "company__name")
-    autocomplete_fields = ("company",)
+    raw_id_fields = ("company",)
 
 
 # -------------------- ScaleDevice --------------------
@@ -859,3 +859,14 @@ class ScaleDeviceAdmin(CompanyScopedFKMixin, admin.ModelAdmin):
     search_fields = ("name", "ip_address", "company__name", "branch__name")
     readonly_fields = ("created_at", "updated_at")
     autocomplete_fields = ("company", "branch")
+
+
+from apps.users.models import CompanyAddon  # noqa: E402
+
+
+@admin.register(CompanyAddon)
+class CompanyAddonAdmin(admin.ModelAdmin):
+    list_display = ("company", "code", "active", "until", "updated_at")
+    list_filter = ("active", "code")
+    search_fields = ("company__name", "code")
+    raw_id_fields = ("company",)

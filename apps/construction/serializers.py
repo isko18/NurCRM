@@ -551,6 +551,12 @@ class TargetFlowBriefSerializer(serializers.ModelSerializer):
         fields = ["id", "name", "amount", "type", "created_at"]
 
 
+DRAWER_SOURCE_KINDS = (
+    CashFlow.SourceKind.SHIFT_DRAWER_OUTFLOW,
+    CashFlow.SourceKind.SHIFT_DRAWER_INFLOW,
+)
+
+
 class CashFlowSerializer(CompanyBranchReadOnlyMixin):
     cashbox = serializers.PrimaryKeyRelatedField(queryset=Cashbox.objects.all())
     cashbox_name = serializers.SerializerMethodField()
@@ -768,11 +774,15 @@ class CashFlowSerializer(CompanyBranchReadOnlyMixin):
         # признака проставляем по явному source_kind, чтобы не менять поведение
         # остальных ручных операций кассы. Сам флаг выставляет CashFlow.save().
         source_kind = attrs.get("source_kind") or getattr(self.instance, "source_kind", None)
-        if source_kind == CashFlow.SourceKind.SHIFT_DRAWER_OUTFLOW:
+        if source_kind in DRAWER_SOURCE_KINDS:
             flow_type = attrs.get("type") or getattr(self.instance, "type", None)
-            if flow_type != CashFlow.Type.EXPENSE:
+            if source_kind == CashFlow.SourceKind.SHIFT_DRAWER_OUTFLOW and flow_type != CashFlow.Type.EXPENSE:
                 raise serializers.ValidationError(
                     {"type": "Списание из кассы смены возможно только расходом."}
+                )
+            if source_kind == CashFlow.SourceKind.SHIFT_DRAWER_INFLOW and flow_type != CashFlow.Type.INCOME:
+                raise serializers.ValidationError(
+                    {"type": "Внесение в кассу смены возможно только приходом."}
                 )
             if not cashbox:
                 raise serializers.ValidationError({"cashbox": "Укажите кассу смены."})
@@ -784,7 +794,7 @@ class CashFlowSerializer(CompanyBranchReadOnlyMixin):
                 candidates = list(open_qs.order_by("-opened_at")[:2])
                 if not candidates:
                     raise serializers.ValidationError(
-                        {"shift": "На этой кассе нет открытой смены — списывать из ящика нечего."}
+                        {"shift": "На этой кассе нет открытой смены — операция по ящику невозможна."}
                     )
                 if len(candidates) > 1:
                     # Общая касса на несколько смен: угадывать, из чьего ящика
@@ -800,6 +810,24 @@ class CashFlowSerializer(CompanyBranchReadOnlyMixin):
     def create(self, validated_data):
         request = self.context.get("request")
         user = getattr(request, "user", None) if request else None
+
+        # Повторная отправка внесения/изъятия кассой (тот же source_id) — не дублируем.
+        source_kind = validated_data.get("source_kind")
+        source_id = (validated_data.get("source_id") or "").strip()
+        if source_kind in DRAWER_SOURCE_KINDS and source_id:
+            cashbox = validated_data.get("cashbox")
+            existing = (
+                CashFlow.objects.filter(
+                    company_id=getattr(cashbox, "company_id", None),
+                    source_kind=source_kind,
+                    source_id=source_id,
+                    request_kind__isnull=True,
+                )
+                .order_by("created_at")
+                .first()
+            )
+            if existing is not None:
+                return existing
 
         # ✅ НИКАКОГО авто-поиска смены. Если shift нет — создаём общий cashflow.
         if user and "cashier" not in validated_data:

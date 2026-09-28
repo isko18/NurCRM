@@ -395,6 +395,35 @@ class CheckoutPaymentLineSerializer(serializers.Serializer):
     amount = MoneyField()
 
 
+def _mixed_split_to_payments(attrs):
+    """
+    payment_method="mixed" + cash_amount/card_amount → строки payments[].
+    None — если разбивку не прислали (старое поведение).
+    """
+    if attrs.get("payment_method") != Sale.PaymentMethod.MIXED:
+        return None
+    cash_amount = attrs.get("cash_amount")
+    card_amount = attrs.get("card_amount")
+    if cash_amount is None and card_amount is None:
+        return None
+    if attrs.get("payments"):
+        raise serializers.ValidationError(
+            "Передайте либо payments[], либо cash_amount/card_amount, но не оба варианта."
+        )
+    cash_amount = cash_amount or Decimal("0.00")
+    card_amount = card_amount or Decimal("0.00")
+    if cash_amount < 0 or card_amount < 0:
+        raise serializers.ValidationError({"cash_amount": "Суммы не могут быть отрицательными."})
+    lines = []
+    if cash_amount > 0:
+        lines.append({"method": Sale.PaymentMethod.CASH, "amount": cash_amount})
+    if card_amount > 0:
+        lines.append({"method": attrs.get("card_method") or Sale.PaymentMethod.TRANSFER, "amount": card_amount})
+    if not lines:
+        raise serializers.ValidationError({"cash_amount": "Укажите суммы смешанной оплаты."})
+    return lines
+
+
 class CheckoutSerializer(serializers.Serializer):
     print_receipt = serializers.BooleanField(default=False)
     client_id = OptionalUUIDField(required=False, allow_null=True)
@@ -424,6 +453,17 @@ class CheckoutSerializer(serializers.Serializer):
     prepayment = MoneyField(required=False, allow_null=True)
     prepayment_amount = MoneyField(required=False, allow_null=True)
     payments = CheckoutPaymentLineSerializer(many=True, required=False)
+    # Смешанная оплата одной строкой: payment_method="mixed" + cash_amount + card_amount
+    cash_amount = MoneyField(required=False, allow_null=True)
+    card_amount = MoneyField(required=False, allow_null=True)
+    card_method = serializers.ChoiceField(
+        choices=[
+            c for c in Sale.PaymentMethod.choices
+            if c[0] not in (Sale.PaymentMethod.DEBT, Sale.PaymentMethod.MIXED, Sale.PaymentMethod.CASH)
+        ],
+        required=False,
+        default=Sale.PaymentMethod.TRANSFER,
+    )
 
     # v2 отсрочка (extra-поля для кассы, не ведут к 400)
     schedule_version = serializers.CharField(required=False, allow_null=True, allow_blank=True)
@@ -514,11 +554,20 @@ class CheckoutSerializer(serializers.Serializer):
             if comm_pct < 0 or comm_pct > 100:
                 raise serializers.ValidationError({"consultant_commission_percent": "Процент комиссии должен быть от 0 до 100."})
 
+        split_payments = _mixed_split_to_payments(attrs)
+        if split_payments is not None:
+            attrs["payments"] = split_payments
+            attrs["payment_method"] = None
+
         payments = attrs.get("payments") or []
         cart.recalc()
         sale_total = (cart.total or Decimal("0.00")).quantize(Decimal("0.01"))
         raw = getattr(self, "initial_data", None) or {}
-        payment_method_in_request = "payment_method" in raw and raw.get("payment_method") not in (None, "", "null")
+        payment_method_in_request = (
+            split_payments is None
+            and "payment_method" in raw
+            and raw.get("payment_method") not in (None, "", "null")
+        )
 
         if payments:
             if payment_method_in_request:
@@ -658,6 +707,18 @@ class CartItemDeletionLogSerializer(serializers.ModelSerializer):
         return getattr(u, "email", None) or str(getattr(u, "pk", ""))
 
 
+def _sale_payment_split(sale):
+    """(cash_amount, card_amount) по строкам оплаты; None, если разбивка неизвестна."""
+    if sale.status == Sale.Status.DEBT:
+        return None, None
+    lines = sale.payment_lines()
+    if not lines or any(line.method == Sale.PaymentMethod.MIXED for line in lines):
+        return None, None
+    cash = sum((line.amount for line in lines if line.method == Sale.PaymentMethod.CASH), Decimal("0.00"))
+    card = sum((line.amount for line in lines if line.method != Sale.PaymentMethod.CASH), Decimal("0.00"))
+    return str(money(cash)), str(money(card))
+
+
 class SaleListSerializer(serializers.ModelSerializer):
     user_display = serializers.SerializerMethodField()
     consultant_display = serializers.SerializerMethodField(read_only=True)
@@ -671,11 +732,15 @@ class SaleListSerializer(serializers.ModelSerializer):
     branch = serializers.PrimaryKeyRelatedField(read_only=True)
     cashbox_name = serializers.SerializerMethodField(read_only=True)
     debt_amount = serializers.SerializerMethodField(read_only=True)
+    number = serializers.IntegerField(source="doc_number", read_only=True)
+    cash_amount = serializers.SerializerMethodField(read_only=True)
+    card_amount = serializers.SerializerMethodField(read_only=True)
 
     class Meta:
         model = Sale
         fields = (
             "id",
+            "number",
             "branch",
             "status",
             "subtotal",
@@ -701,7 +766,15 @@ class SaleListSerializer(serializers.ModelSerializer):
             "first_item_name",
             "matched_item_name",
             "debt_amount",
+            "cash_amount",
+            "card_amount",
         )
+
+    def get_cash_amount(self, obj):
+        return _sale_payment_split(obj)[0]
+
+    def get_card_amount(self, obj):
+        return _sale_payment_split(obj)[1]
 
     def get_user_display(self, obj):
         u = obj.user
@@ -830,11 +903,15 @@ class SaleDetailSerializer(serializers.ModelSerializer):
     cashbox = serializers.PrimaryKeyRelatedField(read_only=True)
     branch = serializers.PrimaryKeyRelatedField(read_only=True)
     cashbox_name = serializers.SerializerMethodField(read_only=True)
+    number = serializers.IntegerField(source="doc_number", read_only=True)
+    cash_amount = serializers.SerializerMethodField(read_only=True)
+    card_amount = serializers.SerializerMethodField(read_only=True)
 
     class Meta:
         model = Sale
         fields = (
             "id",
+            "number",
             "branch",
             "status",
             "subtotal",
@@ -862,8 +939,16 @@ class SaleDetailSerializer(serializers.ModelSerializer):
             "cashbox",
             "cashbox_name",
             "ekassa_fiscal",
+            "cash_amount",
+            "card_amount",
         )
         read_only_fields = fields
+
+    def get_cash_amount(self, obj):
+        return _sale_payment_split(obj)[0]
+
+    def get_card_amount(self, obj):
+        return _sale_payment_split(obj)[1]
 
     def get_deal_id(self, obj):
         deal = obj.deals.first() if hasattr(obj, "deals") else None

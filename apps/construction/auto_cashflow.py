@@ -438,7 +438,7 @@ def create_auto_cashflow(
         drawer_flag = False
     elif affects_shift_drawer is not None:
         drawer_flag = affects_shift_drawer
-    elif source_kind == CashFlow.SourceKind.SHIFT_DRAWER_OUTFLOW:
+    elif source_kind in (CashFlow.SourceKind.SHIFT_DRAWER_OUTFLOW, CashFlow.SourceKind.SHIFT_DRAWER_INFLOW):
         drawer_flag = True
     elif source_kind == CashFlow.SourceKind.DEBT_REPAYMENT:
         drawer_flag = (pm_clean == "cash" or pm_clean is None)
@@ -458,6 +458,7 @@ def create_auto_cashflow(
         CashFlow.SourceKind.DEFECT_WRITEOFF: "Списание брака",
         CashFlow.SourceKind.PRODUCT_RETURN: "Возврат товара",
         CashFlow.SourceKind.SHIFT_DRAWER_OUTFLOW: "Расход из кассы",
+        CashFlow.SourceKind.SHIFT_DRAWER_INFLOW: "Внесение в кассу",
         CashFlow.SourceKind.POS_SALE_RETURN: "Возврат продажи",
         CashFlow.SourceKind.MANUAL: "Ручная операция",
     }

@@ -999,6 +999,25 @@ class SubscriptionPlanSerializer(serializers.ModelSerializer):
         return resolve_plan_code(obj)
 
 
+def company_addons_payload(company):
+    from apps.users.models import CompanyAddon
+
+    return [
+        {"code": a.code, "active": a.is_effective(), "until": a.until.isoformat() if a.until else None}
+        for a in CompanyAddon.objects.filter(company=company).order_by("code")
+    ]
+
+
+def company_feature_codes(company):
+    """Возможности тарифа (Feature.name из тарифа компании) + действующие платные функции."""
+    codes = []
+    plan = getattr(company, "subscription_plan", None)
+    if plan is not None:
+        codes.extend(plan.features.order_by("name").values_list("name", flat=True))
+    codes.extend(a["code"] for a in company_addons_payload(company) if a["active"])
+    return list(dict.fromkeys(c for c in codes if c))
+
+
 class CompanySerializer(serializers.ModelSerializer):
     industry = IndustrySerializer(read_only=True)
     subscription_plan = SubscriptionPlanSerializer(read_only=True)
@@ -1023,6 +1042,7 @@ class CompanySerializer(serializers.ModelSerializer):
             "max_discount_percent",
             "appointment_work_start",
             "appointment_work_end",
+            "market_sphere",
         ]
 
     def to_representation(self, instance):
@@ -1060,6 +1080,7 @@ class CompanySerializer(serializers.ModelSerializer):
 
         plan_code = sub["plan"]["code"] if sub.get("plan") else None
         data["limits"] = get_company_limits(instance, plan_code=plan_code)
+        data["features"] = company_feature_codes(instance)
 
         return data
 
@@ -1157,6 +1178,7 @@ class CompanyUpdateSerializer(serializers.ModelSerializer):
             "scale_barcode_amount_unit",
             "appointment_work_start",
             "appointment_work_end",
+            "market_sphere",
         ]
 
     def validate(self, attrs):
